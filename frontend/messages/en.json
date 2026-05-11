@@ -34,7 +34,8 @@
     "verify_loading": "Verifying…",
     "verify_invalid": "Invalid or expired token",
     "verify_request_new": "Request a new link",
-    "logout_confirm": "Sign out?"
+    "logout_confirm": "Sign out?",
+    "logout": "Sign out"
   },
   "comparison": {
     "title": "🔍 Price comparison",

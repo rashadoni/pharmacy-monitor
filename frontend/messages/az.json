@@ -34,7 +34,8 @@
     "verify_loading": "Yoxlanılır…",
     "verify_invalid": "Yararsız və ya müddəti bitmiş token",
     "verify_request_new": "Yeni link tələb edin",
-    "logout_confirm": "Sistemdən çıxmaq istəyirsiniz?"
+    "logout_confirm": "Sistemdən çıxmaq istəyirsiniz?",
+    "logout": "Çıxış"
   },
   "comparison": {
     "title": "🔍 Qiymət müqayisəsi",

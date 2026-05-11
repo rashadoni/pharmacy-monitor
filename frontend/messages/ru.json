@@ -34,7 +34,8 @@
     "verify_loading": "Verifying…",
     "verify_invalid": "Invalid or expired token",
     "verify_request_new": "Запросить новую ссылку",
-    "logout_confirm": "Выйти из системы?"
+    "logout_confirm": "Выйти из системы?",
+    "logout": "Выйти"
   },
   "comparison": {
     "title": "🔍 Сравнение цен",
