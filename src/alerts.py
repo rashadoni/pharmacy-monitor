@@ -258,12 +258,24 @@ def _detect_price_raise_opportunity(
     return out
 
 
+def _noop_detector(*_args, **_kwargs) -> list[CandidateEvent]:
+    """No-op detector для правил, у которых события создаются вне dispatcher'а.
+
+    `site_drop_smoke` — пример: events эмитятся напрямую из
+    `_smoke_test_per_site_coverage` в `src/main.py` сразу после persist'а.
+    Регистрируем no-op чтобы `evaluate_rules` не логировал
+    `alerts_unknown_rule_type` warning'ом на каждый прогон.
+    """
+    return []
+
+
 DETECTORS: dict[str, Callable[[Session, int, dict], list[CandidateEvent]]] = {
     "undercut_threshold": _detect_undercut_threshold,
     "price_drop_pct": _detect_price_drop,
     "new_product": _detect_new_product,
     "promo_started": _detect_promo_started,
     "price_raise_opportunity": _detect_price_raise_opportunity,
+    "site_drop_smoke": _noop_detector,
 }
 
 

@@ -2,7 +2,7 @@
 
 This file is auto-loaded in every Claude Code session. Read it first.
 
-## Current production state (last updated: 2026-05-08)
+## Current production state (last updated: 2026-05-11)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
 **Login**: `admin` / `pharmacy2026`
@@ -45,21 +45,36 @@ This file is auto-loaded in every Claude Code session. Read it first.
 - **aloe.az is Next.js 13+ App Router with RSC streaming**, not Meteor.
 - **pharmonline.az is server-rendered Bootstrap + jQuery**, not Meteor. Existing Playwright DOM scraper [src/scrapers/pharmonline.py](src/scrapers/pharmonline.py) works correctly; no hydration parser needed.
 
-**Just finished (2026-05-08)**: bulk-persist refactor в [src/main.py:293 `persist_results`](src/main.py#L293). Первый Mac launchd прогон (run_id=40) растянулся на **~5 часов** для **98 536 продуктов** — N+1 SELECT + per-row `session.flush()` через SSH-туннель к prod Postgres. Фикс: pre-fetch existing одной SELECT на категорию (`.in_(external_ids)` чанками по 500), batch `session.add_all()` + единый `flush()` для новых, bulk add snapshots, **commit per result** (bounds транзакции, разгружает WAL). 8 регрессионных тестов в [tests/test_persist_results.py](tests/test_persist_results.py), включая anti-N+1 счётчик SELECT'ов. Развёрнуто на проде. Ожидаемая скорость: 5–10 мин на полный full scrape вместо 5 часов.
+**Just finished (2026-05-09 → 2026-05-11)**: **Diff-only persist + analyzer refactor**. После того как первый Mac прогон (run_45) длился 2ч45 с full persist (100066 snapshots) и потом отчёт ronyalsya N+1 lazy-load'ом, переехали на:
+
+- **`src/main.py:persist_results`** — chunked (`_PERSIST_CHUNK=200`) + diff-only через `_snapshot_payload_changed(last, sp)`. Snapshot пишется **только если цена/discount/promo реально изменились**. `Product.last_seen_at` обновляется всегда — это и есть «видели в этом прогоне».
+- **`src/storage.py`** — два общих query helper'а:
+  - `latest_snapshots_per_product(session, product_ids) → dict[int, PriceSnapshot]`: текущая цена per product, не привязанная к run_id. Замена `WHERE run_id == last_run` после diff-only.
+  - `curr_and_prev_snapshots_for_run(session, current_run) → (curr_snaps, prev_by_product)`: стандартный паттерн для diff-детекторов. Фильтр `Run.started_at < current.started_at` устойчив к близким timestamp'ам.
+- **`src/analyzer.py`** — `_detect_price_changes`, `_detect_new_products`, `_detect_undercuts` переписаны под `curr_and_prev_snapshots_for_run` и `latest_snapshots_per_product`. «Новый продукт» = нет snapshot до `run.started_at`. «Текущая цена» = latest globally.
+- **Consumers обновлены** под ту же семантику: `src/api.py` (`/dash/comparison`, `/comparisons`), `src/alerts.py` (`_detect_price_drop`, `_detect_new_product`, `_prices_for_match`), `src/roi.py` (`_preload_snapshots`, `_assortment_gaps`), `src/health.py` (`_check_site_drops`, `_check_brand_coverage_drop` — через `Product.last_seen_at`).
+- **`src/main.py:_smoke_test_per_site_coverage`** — baseline через `Run.products_scraped` (стабильный счётчик независимо от persist-режима), не `COUNT(snapshots) per run` (после diff-only давал ложные site_drop). Фикс orphan-баг: `AlertEvent` не имеет поля `run_id` — `dedup_key` уже содержит `run={run.id}`.
+- **`src/alerts.py:DETECTORS`** — добавлен `"site_drop_smoke": _noop_detector` (events эмитятся из smoke_test напрямую, dispatcher просто пропускает).
+
+Результат на live проде (run_48, 2026-05-09): **1965 snapshots vs 100066 (51× экономия)**, total прогон **1ч15 vs 2ч45**, report_saved без crash, dashboard `/comparison` отрисовывает цены через `latest_snapshots_per_product`. Daily Mac launchd (14:00 UTC) автономно отрабатывает, последние 3 ok-runs подтверждены.
+
+8 diff-only regression-тестов в [tests/test_persist_results.py](tests/test_persist_results.py) + [tests/test_analyzer.py](tests/test_analyzer.py) — **252 теста проходят**.
+
+**Just finished (2026-05-08)**: bulk-persist refactor в [src/main.py `persist_results`](src/main.py). Первый Mac launchd прогон (run_id=40) растянулся на **~5 часов** для **98 536 продуктов** — N+1 SELECT + per-row `session.flush()` через SSH-туннель к prod Postgres. Фикс: pre-fetch existing одной SELECT на категорию (`.in_(external_ids)` чанками по 500), batch `session.add_all()` + единый `flush()` для новых, bulk add snapshots, **commit per result** (bounds транзакции, разгружает WAL). 8 регрессионных тестов в [tests/test_persist_results.py](tests/test_persist_results.py), включая anti-N+1 счётчик SELECT'ов. Развёрнуто на проде. **Этот фикс был промежуточным шагом перед diff-only выше.**
 
 **Just finished (2026-05-07)**: aptekonline JSON API rewrite + split runtime (Mac + prod).
 - Aptekonline.az ввёл reCAPTCHA на любые headless-браузеры (даже с Baku-IP). Reverse-engineered backend endpoint `GET https://www.aptekonline.az/shop/productList?categoryId[]=N&lang=az&page=N` (Laravel paginator, 100 items/page) — endpoint найден в `https://www.aptekonline.az/assets/js/main.js?v=35`, работает с заголовком `checkus: $2y$10$...` (статичный bcrypt-токен).
 - [src/scrapers/aptekonline.py](src/scrapers/aptekonline.py) полностью переписан: Playwright → httpx (~250 строк). 0.23s/page вместо 30+s. 12 unit-тестов в [tests/test_aptekonline_api.py](tests/test_aptekonline_api.py).
 - Hetzner-IP **забанен и на JSON API** aptekonline тоже (HTTP 403 от прода). Поэтому **aptekonline тоже скрейпится с Mac**.
 
-### Runtime layout (split prod + Mac, обновлено 2026-05-08)
+### Runtime layout (split prod + Mac, обновлено 2026-05-11)
 
-Гибрид: aloe + pharmonline на проде через systemd, aptekonline с Mac через launchd (ScraperAPI default pool возвращает 403 на aptekonline). Mac также дублирует pharmonline как failsafe.
+Гибрид: **aloe** на проде (direct, 03:00 UTC), **pharmonline + aptekonline** с Mac launchd (14:00 UTC = 18:00 Asia/Baku). Прод-таймер pharmonline отключён 2026-05-11 (ScraperAPI default pool стабильно отдавал 0 продуктов — фантомные runs шумели в логах). Aptekonline-таймер на проде отключён 2026-05-08 (HTTP 403 от ScraperAPI default pool — нужен residential = Hobby $49/мес).
 
 | Сайт | Где | Чем | Расписание |
 |---|---|---|---|
 | **aloe.az** | Hetzner prod | Playwright DOM (см. [src/scrapers/aloe.py](src/scrapers/aloe.py)) | systemd timer `pharmacy-monitor-scrape@aloe` 03:00 UTC, direct |
-| **pharmonline.az** | Hetzner prod (+ Mac failsafe) | Playwright DOM (см. [src/scrapers/pharmonline.py](src/scrapers/pharmonline.py)) | systemd timer 01:00 UTC через ScraperAPI ([base.py](src/scrapers/base.py)). Дублируется Mac launchd 18:00 Asia/Baku — пишет в ту же прод-БД через SSH-туннель. |
+| **pharmonline.az** | **Mac launchd только** | Playwright DOM (см. [src/scrapers/pharmonline.py](src/scrapers/pharmonline.py)) | Mac launchd `com.pharmacy-monitor.scrape` 18:00 Asia/Baku. **Прод-таймер отключён 2026-05-11** — ScraperAPI default pool стабильно возвращал 0 продуктов (run_46, 50, 53 — все пустые), создавал шум в логах. С Mac (Baku-IP) скрейп стабильно даёт ~9-10K продуктов. |
 | **aptekonline.az** | **Mac launchd только** | httpx JSON API (см. [src/scrapers/aptekonline.py](src/scrapers/aptekonline.py)) | Mac launchd `com.pharmacy-monitor.scrape` 18:00 Asia/Baku. **Прод-таймер отключён 2026-05-08** (`systemctl disable --now pharmacy-monitor-scrape@aptekonline.timer`) — ScraperAPI default pool отдаёт HTTP 403, нужен residential (Hobby $49/мес). Endpoint: `GET /shop/productList?categoryId[]=N&lang=az&page=N` (Laravel paginator), header `checkus: $2y$10$...` из `main.js`. 12 тестов в [tests/test_aptekonline_api.py](tests/test_aptekonline_api.py). |
 
 Systemd unit на проде: `/etc/systemd/system/pharmacy-monitor-scrape@.service`, ExecStart=`pharmacy-monitor run --site %i --mode category`. Активны таймеры **pharmonline + aloe** (aptekonline отключён 2026-05-08).
@@ -75,7 +90,9 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
 - Sentry DSN not configured (errors only in journald)
 - ~~22317 AZN bug in aptekonline price parser~~ FIXED 2026-05-07. Root cause: aptekonline's Angular template `'<del>' + price + 'AZN </del>' + p.discount_price + ' AZN '` renders with no separator, so `inner_text` of `.new-price` returns e.g. `"22AZN 317 AZN"` for a discounted product. Old `parse_price` stripped non-digits → `"22317"`. Fix: extract only the FIRST digit-run-with-dots/commas via regex. Existing bad rows перезатираются следующим aptekonline-прогоном (Mac launchd 18:00 Asia/Baku ежедневно); для немедленной очистки: `DELETE FROM price_snapshots WHERE site='aptekonline' AND price > 5000;`
 - pharmonline.az has NO `/sitemap.xml` (returns SPA HTML); aptekonline returns empty `<urlset>` — both need BFS fallback (regular Playwright scrapers continue to work via category pages)
-- **Hetzner DE IP banned by pharmonline.az + aptekonline.az** (since ~2026-04-29). MITIGATED: pharmonline через ScraperAPI default pool (работает), aptekonline с Mac launchd (Baku-IP, ScraperAPI default pool отдаёт 403). См. "Runtime layout" выше.
+- **Hetzner DE IP banned by pharmonline.az + aptekonline.az** (since ~2026-04-29). MITIGATED 2026-05-11: оба сайта переехали на Mac launchd 18:00 Asia/Baku (Baku-IP не банится). Прод-таймеры pharmonline/aptekonline disabled. Aloe остался на проде (direct работает). См. "Runtime layout" выше.
+- Project under git с 2026-05-11. Initial commit `c7fde84` зафиксировал diff-only state. Remote ещё не настроен (`git remote add origin …`).
+- forecast.py не рефакторен под diff-only — JOIN'ы по `Run.started_at` валидны, но coverage упадёт: продукты со стабильной ценой получат < min_points (3) → forecast вернёт None. Семантически корректно, но trend-графиков станет меньше. Доделать когда станет нужен trend для широкого среза.
 - 7 false matches in matcher (Friso 3 Gold ↔ Friso Prematures etc) — needs manual reject via UI on /comparison
 - `admin off` in `/etc/caddy/Caddyfile` — `systemctl reload caddy` fails, use `restart` instead
 - Caddy backup config: `/etc/caddy/Caddyfile.bak.20260506-2038` (pre-HTTPS)
@@ -139,8 +156,10 @@ SELECT COUNT(*) FROM products;
 [✓] Deployed    Hetzner production live with 17288 rows of pilot data
 [✓] HTTPS       leaddrive.cloud + www, Let's Encrypt auto-renew (2026-05-07)
 [✓] AI crawler  CLI shipped, sitemap works, aloe extraction working (RSC JSON-LD + Playwright JSON-LD), 25/50 products on dry-run smoke
-[✓] Nightly     Hybrid runtime: aloe+pharmonline на проде, aptekonline с Mac launchd 18:00 Baku (2026-05-08)
-[ ] Next        SMTP (Resend), Telegram bot token, Sentry DSN, ScraperAPI Hobby ($49) для возврата aptekonline на прод, BFS fallback для pharmonline/aptekonline
+[✓] Nightly     Hybrid runtime: aloe на проде (03:00 UTC), pharmonline+aptekonline с Mac launchd 18:00 Baku
+[✓] Diff-only   persist + analyzer + 5 consumers под новую семантику (2026-05-09 → 11). 51× экономия snapshots, 2× быстрее прогон.
+[✓] Git         project under VCS с 2026-05-11 (initial commit c7fde84). Remote: TODO
+[ ] Next        Remote git origin, SMTP (Resend), Telegram bot token, Sentry DSN, forecast.py diff-only refactor (опционально), ScraperAPI Hobby ($49) для возврата aptekonline на прод (опционально)
 ```
 
 ### Out of scope (decided 2026-05-07 by client)
@@ -153,5 +172,5 @@ SELECT COUNT(*) FROM products;
 1. Read this file (you already are)
 2. Check `docs/PRODUCTION_OVERVIEW.md` for full architecture
 3. Check `docs/GO_LIVE.md` for deployment runbook
-4. Check `~/.claude/plans/users-rashadrahimov-documents-compariso-swirling-dream.md` for last plan
-5. Run `git log` if there are commits (currently no git initialized)
+4. Check `~/.claude/plans/buzzing-greeting-wilkes.md` — audit от 2026-05-11
+5. `git log --oneline` — история коммитов (initial snapshot `c7fde84` 2026-05-11)

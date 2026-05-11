@@ -219,36 +219,38 @@ def _smoke_test_per_site_coverage(
 
     Защита от silent regressions типа run #18 где pharmonline собрал 96 vs обычные 231.
     Не валит run, только записывает warning в alert_events.
+
+    Baseline berëт `Run.products_scraped` по historical ok-runs того же сайта.
+    `products_scraped` стабильный счётчик «обработанных ScrapedProduct'ов» — он
+    не зависит от того, full persist или diff-only writing snapshots. (Раньше
+    считали `COUNT(snapshots) per run, site` через JOIN — после diff-only
+    (2026-05-09) historical days с full persist давали ~100K, а текущий
+    day = 1-5K → ложные срабатывания site_drop. Текущая версия использует
+    products_scraped, который стабилен между режимами.)
     """
-    from src.storage import AlertEvent, AlertRule, Run, PriceSnapshot
-    from sqlalchemy import select, func, desc
+    from src.storage import AlertEvent, AlertRule, Run
+    from sqlalchemy import select, desc
 
     for result in results:
         site = result.site
         current = len(result.products) if hasattr(result, "products") else 0
         if current == 0:
             continue
-        # Среднее за прошлые 5 успешных runs того же site
+        # Среднее `products_scraped` за прошлые 5 ok-runs, где этот сайт
+        # участвовал. `products_scraped` — это общий счётчик по run'у, поэтому
+        # фильтр `sites_completed` ставит точное «только runs с этим сайтом».
+        # Несовершенно для multi-site runs, но в проде Mac launchd обычно
+        # фигачит pharmonline+aptekonline вместе, а aloe — solo на prod-cron.
         prev_runs = session.scalars(
-            select(Run.id)
+            select(Run)
             .where(Run.status == "ok", Run.id < run.id, Run.sites_completed.contains(site))
             .order_by(desc(Run.id))
             .limit(5)
         ).all()
-        if len(prev_runs) < 2:
+        prev_counts = [r.products_scraped or 0 for r in prev_runs if (r.products_scraped or 0) > 0]
+        if len(prev_counts) < 2:
             continue  # недостаточно истории
-        # Считаем сколько было snapshots на этот site в каждом из этих runs.
-        # (Раньше тут было `avg(count(...))` одним SQL — Postgres не принимает
-        # aggregate-of-aggregate, ломал транзакцию и роняли persist+matcher.)
-        ps_rows = session.execute(
-            select(PriceSnapshot.run_id, func.count(PriceSnapshot.id))
-            .join(storage.Product, storage.Product.id == PriceSnapshot.product_id)
-            .where(PriceSnapshot.run_id.in_(prev_runs), storage.Product.site == site)
-            .group_by(PriceSnapshot.run_id)
-        ).all()
-        if not ps_rows:
-            continue
-        avg = sum(c for _, c in ps_rows) / len(ps_rows)
+        avg = sum(prev_counts) / len(prev_counts)
         if avg <= 0:
             continue
         ratio = current / avg
@@ -272,15 +274,18 @@ def _smoke_test_per_site_coverage(
                 )
                 session.add(rule)
                 session.flush()
+            # NOTE: AlertEvent НЕ имеет поля `run_id` — раньше тут падало
+            # `'run_id' is an invalid keyword argument`. run_id зашит в
+            # `dedup_key`, этого достаточно для трассируемости.
             session.add(AlertEvent(
                 rule_id=rule.id,
-                run_id=run.id,
+                rule_type="site_drop_smoke",
                 dedup_key=f"site_drop_smoke|run={run.id}|site={site}",
                 severity="warning",
                 title=f"Site {site} собрал на {round((1-ratio)*100)}% меньше обычного",
                 detail=(
                     f"В этом прогоне site={site} собрал {current} товаров. "
-                    f"Среднее за прошлые {len(ps_rows)} ok-runs: {round(avg)}. "
+                    f"Среднее за прошлые {len(prev_counts)} ok-runs: {round(avg)}. "
                     f"Возможно сменилась вёрстка или rate-limit."
                 ),
                 payload={"site": site, "current": current, "avg": round(avg, 1)},
