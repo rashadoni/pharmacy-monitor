@@ -225,7 +225,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
   const queryClient = useQueryClient();
   const requestsQ = useQuery({
     queryKey: ["scrape-requests"],
-    queryFn: () => api.scrapeRequests(3),
+    queryFn: () => api.scrapeRequests(5),
     refetchInterval: (q) => {
       const data = q.state.data;
       const hasActive = data?.some((r) => r.status === "pending" || r.status === "running");
@@ -240,53 +240,70 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
           : { mode: "all" }
       ),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["scrape-requests"] }),
+    onError: (e: Error) => alert(e.message),
   });
 
-  const active = requestsQ.data?.find(
-    (r) => r.status === "pending" || r.status === "running"
+  // Активный = running ИЛИ pending. Может быть несколько (до 5 в очереди).
+  const activeAll = requestsQ.data?.find(
+    (r) => (r.status === "pending" || r.status === "running") && r.mode === "all"
   );
-  // Для глобальной кнопки: показываем итог последнего завершённого прогона
-  // (status='ok' / 'failed') ещё ~10 минут — чтобы клиент успел увидеть «Готово ✓ — N товаров».
-  const lastCompleted = !categoryId
+  const activeThis = categoryId
     ? requestsQ.data?.find(
-        (r) => r.status === "ok" || r.status === "failed",
+        (r) =>
+          (r.status === "pending" || r.status === "running") &&
+          r.mode === "category" &&
+          r.category_id === categoryId,
       )
+    : undefined;
+  const lastCompleted = !categoryId
+    ? requestsQ.data?.find((r) => r.status === "ok" || r.status === "failed")
     : undefined;
   const completedFreshlyMs = lastCompleted?.completed_at
     ? Date.now() - new Date(lastCompleted.completed_at).getTime()
     : Infinity;
   const showCompleted = lastCompleted && completedFreshlyMs < 10 * 60 * 1000;
 
-  // Skip rendering inline (per-row) кнопку если есть глобальный pending
-  if (categoryId && active) return null;
-
-  if (active) {
-    return (
-      <div className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm">
-        <Play className="h-4 w-4 animate-pulse" />
-        <span className="font-medium">
-          {active.status === "pending" ? "В очереди…" : "Сканируем…"}
-        </span>
-        <span className="text-xs text-muted-foreground">
-          (#{active.id} {active.mode === "category" ? `cat ${active.category_id}` : "все"})
-        </span>
-      </div>
-    );
-  }
-
+  // === Per-row кнопка ====================================================
   if (categoryId) {
+    if (activeThis) {
+      // Эта же категория уже в очереди — показываем статус
+      return (
+        <span className="inline-flex items-center gap-1 text-xs text-warning whitespace-nowrap">
+          <Play className="h-3 w-3 animate-pulse" />
+          {activeThis.status === "pending" ? "в очереди" : "сканируем"} #{activeThis.id}
+        </span>
+      );
+    }
+    const blockedByAll = !!activeAll;
     return (
       <button
         onClick={() => triggerMut.mutate()}
-        disabled={triggerMut.isPending}
-        className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-primary hover:bg-primary/10 disabled:opacity-50"
-        title="Запустить scan только этой категории"
+        disabled={triggerMut.isPending || blockedByAll}
+        className="inline-flex items-center gap-1 rounded border border-border bg-background px-2 py-1 text-xs font-medium hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
+        title={
+          blockedByAll
+            ? `Идёт полное сканирование #${activeAll.id} — оно уже включает эту категорию`
+            : "Запустить сканирование только этой категории"
+        }
       >
-        <Play className="h-3.5 w-3.5" />
+        <Play className="h-3 w-3" />
+        Сканировать
       </button>
     );
   }
 
+  // === Глобальная кнопка (mode=all) ======================================
+  if (activeAll) {
+    return (
+      <div className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm">
+        <Play className="h-4 w-4 animate-pulse" />
+        <span className="font-medium">
+          {activeAll.status === "pending" ? "В очереди…" : "Сканируем все…"}
+        </span>
+        <span className="text-xs text-muted-foreground">#{activeAll.id}</span>
+      </div>
+    );
+  }
   return (
     <div className="inline-flex flex-col items-end gap-1">
       <button
@@ -296,7 +313,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
         title="Запустить scan всех активных категорий"
       >
         <Play className="h-4 w-4" />
-        {triggerMut.isPending ? "Отправляем…" : "Сканировать сейчас"}
+        {triggerMut.isPending ? "Отправляем…" : "Сканировать все"}
       </button>
       {showCompleted && lastCompleted && (
         <ScrapeResultBadge req={lastCompleted} />

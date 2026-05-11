@@ -63,7 +63,7 @@ import structlog
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Header, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from src import inventory as inv_mod
@@ -572,21 +572,56 @@ def dash_scrape_trigger(
     if payload.mode == "category" and not payload.category_id:
         raise HTTPException(400, "category_id required for mode='category'")
 
-    # Анти-spam: не более одной pending заявки на tenant одновременно
-    existing_pending = db.scalar(
-        select(storage.ScrapeRequest)
+    # Анти-spam #1: не более 5 pending заявок одновременно (watcher разгребёт серийно).
+    pending_count = db.scalar(
+        select(func.count(storage.ScrapeRequest.id))
         .where(
             storage.ScrapeRequest.tenant_id == user.tenant_id,
             storage.ScrapeRequest.status.in_(("pending", "running")),
         )
-        .limit(1)
-    )
-    if existing_pending:
+    ) or 0
+    MAX_PENDING = 5
+    if pending_count >= MAX_PENDING:
         raise HTTPException(
             409,
-            f"Уже в очереди запрос #{existing_pending.id} (status={existing_pending.status}). "
-            "Дождись его завершения.",
+            f"В очереди уже {pending_count} запросов. Дождитесь их завершения.",
         )
+
+    # Анти-spam #2: дубликат тех же mode+category_id — отбиваем (нет смысла
+    # ставить две одинаковые задачи).
+    same_pending = db.scalar(
+        select(storage.ScrapeRequest)
+        .where(
+            storage.ScrapeRequest.tenant_id == user.tenant_id,
+            storage.ScrapeRequest.status.in_(("pending", "running")),
+            storage.ScrapeRequest.mode == payload.mode,
+            storage.ScrapeRequest.category_id == payload.category_id,
+        )
+        .limit(1)
+    )
+    if same_pending:
+        raise HTTPException(
+            409,
+            f"Такой же запрос #{same_pending.id} уже {same_pending.status}.",
+        )
+
+    # Анти-spam #3: если уже идёт mode='all' — нет смысла добавлять конкретную
+    # категорию (она уже включена в all).
+    if payload.mode == "category":
+        all_pending = db.scalar(
+            select(storage.ScrapeRequest)
+            .where(
+                storage.ScrapeRequest.tenant_id == user.tenant_id,
+                storage.ScrapeRequest.status.in_(("pending", "running")),
+                storage.ScrapeRequest.mode == "all",
+            )
+            .limit(1)
+        )
+        if all_pending:
+            raise HTTPException(
+                409,
+                f"Идёт полное сканирование #{all_pending.id} — оно включает эту категорию.",
+            )
 
     req = storage.ScrapeRequest(
         tenant_id=user.tenant_id,
