@@ -170,6 +170,11 @@ class TenantUser(Base):
     email: Mapped[str] = mapped_column(String(200), index=True)
     name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     role: Mapped[str] = mapped_column(String(20), default="admin")  # admin/viewer
+    # Per-user password hash (2026-05-11). Если NULL — auth.login использует
+    # global ADMIN_PASSWORD_HASH из /etc/pharmacy-monitor/env (bootstrap mode).
+    # Когда пользователь меняет пароль через UI — пишется сюда, и далее auth
+    # сначала проверяет DB-hash, фолбэк на env только если DB-hash NULL.
+    password_hash: Mapped[str | None] = mapped_column(String(200), nullable=True)
     magic_token: Mapped[str | None] = mapped_column(String(100), nullable=True)
     magic_token_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
@@ -512,6 +517,8 @@ def _apply_lightweight_migrations(engine) -> None:
             ("runs", "products_per_site", "JSON"),
             # 2026-05-11 (вечер): per-(site,category) breakdown для UI coverage panel
             ("runs", "products_per_site_category", "JSON"),
+            # 2026-05-11 (ночь): password в DB (вместо global env-hash)
+            ("tenant_users", "password_hash", "VARCHAR(200)"),
         ]
         for table, column, coltype in migrations:
             try:

@@ -3,7 +3,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
-import { Bell, CheckCircle2, Globe, LogOut, MessageCircle, Send, User, XCircle, Zap } from "lucide-react";
+import { Bell, CheckCircle2, Globe, Key, LogOut, MessageCircle, Send, User, XCircle, Zap } from "lucide-react";
+import { useState } from "react";
 import { api, type NotifPrefs } from "@/lib/api";
 import { LocaleSwitcher } from "@/components/locale-switcher";
 
@@ -43,6 +44,8 @@ export default function SettingsPage() {
 
       <NotificationsSection email={meQ.data?.email} />
 
+      <ChangePasswordSection />
+
       <IntegrationsStatusSection />
 
       <Section title={t("language")} icon={Globe}>
@@ -61,6 +64,79 @@ export default function SettingsPage() {
     </div>
   );
 }
+
+function ChangePasswordSection() {
+  const [curr, setCurr] = useState("");
+  const [next1, setNext1] = useState("");
+  const [next2, setNext2] = useState("");
+  const [done, setDone] = useState(false);
+
+  const mut = useMutation({
+    mutationFn: () => api.changePassword(curr, next1),
+    onSuccess: () => {
+      setDone(true);
+      setCurr(""); setNext1(""); setNext2("");
+      setTimeout(() => setDone(false), 5000);
+    },
+  });
+
+  const mismatch = next1 && next2 && next1 !== next2;
+  const tooShort = next1 && next1.length < 6;
+  const canSubmit = curr && next1 && next2 && next1 === next2 && next1.length >= 6;
+
+  return (
+    <Section title="Сменить пароль" icon={Key}>
+      <div className="space-y-3 max-w-md">
+        <label className="block">
+          <span className="text-xs font-medium block mb-1">Текущий пароль</span>
+          <input
+            type="password"
+            value={curr}
+            onChange={(e) => setCurr(e.target.value)}
+            autoComplete="current-password"
+            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+          />
+        </label>
+        <label className="block">
+          <span className="text-xs font-medium block mb-1">Новый пароль (мин. 6 символов)</span>
+          <input
+            type="password"
+            value={next1}
+            onChange={(e) => setNext1(e.target.value)}
+            autoComplete="new-password"
+            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+          />
+          {tooShort && <span className="text-xs text-destructive">Минимум 6 символов</span>}
+        </label>
+        <label className="block">
+          <span className="text-xs font-medium block mb-1">Повтори новый пароль</span>
+          <input
+            type="password"
+            value={next2}
+            onChange={(e) => setNext2(e.target.value)}
+            autoComplete="new-password"
+            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+          />
+          {mismatch && <span className="text-xs text-destructive">Пароли не совпадают</span>}
+        </label>
+        <button
+          onClick={() => mut.mutate()}
+          disabled={!canSubmit || mut.isPending}
+          className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
+        >
+          {mut.isPending ? "Сохраняем…" : "Сменить пароль"}
+        </button>
+        {done && <div className="text-sm text-success">✓ Пароль изменён. Следующий вход — с новым.</div>}
+        {mut.isError && (
+          <div className="text-sm text-destructive">
+            {(mut.error as any)?.message || "Не удалось сохранить — проверь текущий пароль"}
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
+
 
 function IntegrationsStatusSection() {
   const q = useQuery({ queryKey: ["integrations"], queryFn: api.integrations });

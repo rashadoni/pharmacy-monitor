@@ -195,6 +195,11 @@ export const api = {
     request<void>("/api/v1/dash/me/notifications/telegram", { method: "DELETE" }),
   integrations: () =>
     request<IntegrationsStatus>("/api/v1/dash/integrations"),
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ ok: true }>("/api/v1/dash/me/password", {
+      method: "POST",
+      body: JSON.stringify({ current_password, new_password }),
+    }),
 };
 
 export interface IntegrationsStatus {

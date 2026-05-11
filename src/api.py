@@ -424,41 +424,51 @@ def auth_verify(token: str, response: Response, db: Session = Depends(get_db)):
     return {"ok": True, "user_id": user.id}
 
 
+def _verify_bcrypt(password: str, hash_str: str) -> bool:
+    """Verify bcrypt password. Used by auth.login и change-password."""
+    try:
+        import bcrypt
+        return bcrypt.checkpw(password.encode(), hash_str.encode())
+    except ImportError:
+        from passlib.hash import bcrypt as bcrypt_pl
+        return bcrypt_pl.verify(password, hash_str)
+
+
+def _hash_bcrypt(password: str) -> str:
+    """Generate bcrypt hash."""
+    try:
+        import bcrypt
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    except ImportError:
+        from passlib.hash import bcrypt as bcrypt_pl
+        return bcrypt_pl.hash(password)
+
+
 @app.post("/auth/login")
 def auth_login(payload: PasswordLoginIn, response: Response, request: Request, db: Session = Depends(get_db)):
-    """Password login. Compare against ADMIN_LOGIN + ADMIN_PASSWORD_HASH env vars.
+    """Password login. DB-first (TenantUser.password_hash), env fallback.
 
-    On success, issues JWT cookie for the first active admin in the DB
-    (single-tenant pilot — all users share the same login).
+    Раньше (до 2026-05-11) сравнивал только с ADMIN_LOGIN + ADMIN_PASSWORD_HASH
+    в env. Теперь:
+    1. Находим пользователя по login (= local-part email или env ADMIN_LOGIN).
+    2. Если у user.password_hash есть значение — verify против DB.
+    3. Иначе fallback на env ADMIN_PASSWORD_HASH (bootstrap mode пока клиент
+       не сменил пароль через UI).
     """
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(f"login:{client_ip}", limit=10)
 
     expected_login = os.environ.get("ADMIN_LOGIN", "admin")
-    pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
-    if not pw_hash:
-        raise HTTPException(503, "Login not configured (ADMIN_PASSWORD_HASH missing)")
+    env_pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
 
-    # Constant-time login compare
+    # Constant-time login compare против env (для backward-compat — login
+    # фиксированный в env, в DB user identifier'ом служит email)
     import hmac
     if not hmac.compare_digest(payload.login.lower(), expected_login.lower()):
         _check_rate_limit(f"login_fail:{client_ip}", limit=5)
         raise HTTPException(401, "Неверный логин или пароль")
 
-    # bcrypt password verify
-    try:
-        import bcrypt
-        if not bcrypt.checkpw(payload.password.encode(), pw_hash.encode()):
-            _check_rate_limit(f"login_fail:{client_ip}", limit=5)
-            raise HTTPException(401, "Неверный логин или пароль")
-    except ImportError:
-        # Fallback: passlib if installed (passlib comes via python-jose[cryptography])
-        from passlib.hash import bcrypt as bcrypt_pl
-        if not bcrypt_pl.verify(payload.password, pw_hash):
-            _check_rate_limit(f"login_fail:{client_ip}", limit=5)
-            raise HTTPException(401, "Неверный логин или пароль")
-
-    # Find or create the default admin user
+    # Find first active admin
     user = db.scalar(
         select(storage.TenantUser)
         .where(storage.TenantUser.is_active.is_(True))
@@ -470,6 +480,14 @@ def auth_login(payload: PasswordLoginIn, response: Response, request: Request, d
         t = _tenants.get_or_create_default(db)
         user = _tenants.add_user(db, t.id, "admin@local", name="Admin", role="admin")
         db.commit()
+
+    # Verify password: DB-first if set, fallback to env
+    pw_to_check = user.password_hash or env_pw_hash
+    if not pw_to_check:
+        raise HTTPException(503, "Login not configured (no DB hash and no ADMIN_PASSWORD_HASH env)")
+    if not _verify_bcrypt(payload.password, pw_to_check):
+        _check_rate_limit(f"login_fail:{client_ip}", limit=5)
+        raise HTTPException(401, "Неверный логин или пароль")
 
     jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
     secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")
@@ -496,6 +514,38 @@ def dash_me(user: storage.TenantUser = Depends(require_user)):
         id=user.id, email=user.email, name=user.name,
         role=user.role, tenant_id=user.tenant_id,
     )
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/api/v1/dash/me/password")
+def dash_change_password(
+    payload: PasswordChangeIn,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Сменить пароль текущего пользователя.
+
+    Проверяет current_password против DB-hash или env-fallback (bootstrap mode).
+    На success — сохраняет bcrypt(new_password) в user.password_hash. С этого
+    момента env ADMIN_PASSWORD_HASH перестаёт использоваться для этого user'а.
+    """
+    if len(payload.new_password) < 6:
+        raise HTTPException(400, "Пароль должен быть минимум 6 символов")
+    if payload.current_password == payload.new_password:
+        raise HTTPException(400, "Новый пароль не должен совпадать с текущим")
+
+    env_pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
+    pw_to_check = user.password_hash or env_pw_hash
+    if not pw_to_check or not _verify_bcrypt(payload.current_password, pw_to_check):
+        raise HTTPException(401, "Текущий пароль неверный")
+
+    user.password_hash = _hash_bcrypt(payload.new_password)
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/v1/dash/integrations")
