@@ -193,4 +193,16 @@ export const api = {
     }),
   notifUnbindTelegram: () =>
     request<void>("/api/v1/dash/me/notifications/telegram", { method: "DELETE" }),
+  integrations: () =>
+    request<IntegrationsStatus>("/api/v1/dash/integrations"),
 };
+
+export interface IntegrationsStatus {
+  smtp: boolean;
+  smtp_from: string | null;
+  telegram: boolean;
+  telegram_bot_username: string | null;
+  sentry: boolean;
+  scraperapi: boolean;
+  scraperapi_sites: string[];
+}

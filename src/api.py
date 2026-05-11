@@ -498,6 +498,28 @@ def dash_me(user: storage.TenantUser = Depends(require_user)):
     )
 
 
+@app.get("/api/v1/dash/integrations")
+def dash_integrations(user: storage.TenantUser = Depends(require_user)):
+    """Статус серверных интеграций. Фронт показывает в /settings — клиент
+    видит явно что настроено, что нет. Раньше клиент не понимал почему
+    «привязал Telegram, а уведомления не идут» — теперь видно «❌ нет токена».
+
+    Не возвращаем сами секреты — только bool.
+    """
+    import os
+
+    return {
+        "smtp": bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_PASSWORD")),
+        "smtp_from": os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER") or None,
+        "telegram": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+        "telegram_bot_username": os.environ.get("TELEGRAM_BOT_USERNAME") or None,
+        "sentry": bool(os.environ.get("SENTRY_DSN")),
+        "scraperapi": bool(os.environ.get("SCRAPER_API_KEY")),
+        "scraperapi_sites": (os.environ.get("SCRAPER_API_SITES") or "").split(",")
+            if os.environ.get("SCRAPER_API_SITES") else [],
+    }
+
+
 # ─── Notification preferences (W9) ───────────────────────────────────────────
 
 

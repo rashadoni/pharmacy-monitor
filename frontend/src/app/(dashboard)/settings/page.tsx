@@ -3,7 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
-import { Bell, Globe, LogOut, MessageCircle, Send, User } from "lucide-react";
+import { Bell, CheckCircle2, Globe, LogOut, MessageCircle, Send, User, XCircle, Zap } from "lucide-react";
 import { api, type NotifPrefs } from "@/lib/api";
 import { LocaleSwitcher } from "@/components/locale-switcher";
 
@@ -41,7 +41,9 @@ export default function SettingsPage() {
         )}
       </Section>
 
-      <NotificationsSection />
+      <NotificationsSection email={meQ.data?.email} />
+
+      <IntegrationsStatusSection />
 
       <Section title={t("language")} icon={Globe}>
         <LocaleSwitcher />
@@ -60,11 +62,85 @@ export default function SettingsPage() {
   );
 }
 
-function NotificationsSection() {
+function IntegrationsStatusSection() {
+  const q = useQuery({ queryKey: ["integrations"], queryFn: api.integrations });
+
+  if (q.isLoading || !q.data) {
+    return null;
+  }
+
+  const items: { key: string; label: string; ok: boolean; hint: string }[] = [
+    {
+      key: "smtp",
+      label: "SMTP (email-уведомления, отчёты, magic-link)",
+      ok: q.data.smtp,
+      hint: q.data.smtp ? `Активен (FROM: ${q.data.smtp_from ?? "—"})` : "Нужен SMTP_HOST + SMTP_PASSWORD",
+    },
+    {
+      key: "telegram",
+      label: "Telegram (push-алерты)",
+      ok: q.data.telegram,
+      hint: q.data.telegram
+        ? `Bot готов${q.data.telegram_bot_username ? ` (@${q.data.telegram_bot_username})` : ""}`
+        : "Нужен TELEGRAM_BOT_TOKEN от @BotFather",
+    },
+    {
+      key: "sentry",
+      label: "Sentry (error tracking)",
+      ok: q.data.sentry,
+      hint: q.data.sentry ? "Ошибки логируются" : "Нужен SENTRY_DSN от sentry.io",
+    },
+    {
+      key: "scraperapi",
+      label: "ScraperAPI (proxy для забаненных IP)",
+      ok: q.data.scraperapi,
+      hint: q.data.scraperapi
+        ? `Активен для: ${q.data.scraperapi_sites.join(", ") || "(нет sites в env)"}`
+        : "Опционально — для aptekonline на проде нужен Hobby $49/мес residential",
+    },
+  ];
+
+  const okCount = items.filter((i) => i.ok).length;
+
+  return (
+    <Section title="Интеграции сервера" icon={Zap}>
+      <div className="text-xs text-muted-foreground mb-3">
+        Внешние сервисы, настроенные в <code className="font-mono">/etc/pharmacy-monitor/env</code>.
+        Готово: <span className="font-semibold">{okCount} / {items.length}</span>.
+        Полная настройка одной командой: <code className="font-mono">bash scripts/configure-integrations.sh</code>
+      </div>
+      <div className="space-y-2">
+        {items.map((it) => (
+          <div
+            key={it.key}
+            className={`flex items-start gap-2 rounded-md border px-3 py-2 text-sm ${
+              it.ok ? "bg-success/5 border-success/30" : "bg-muted/40 border-border"
+            }`}
+          >
+            {it.ok ? (
+              <CheckCircle2 className="h-4 w-4 text-success mt-0.5 shrink-0" />
+            ) : (
+              <XCircle className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+            )}
+            <div className="min-w-0 flex-1">
+              <div className="font-medium">{it.label}</div>
+              <div className="text-xs text-muted-foreground">{it.hint}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+
+function NotificationsSection({ email }: { email?: string }) {
   const queryClient = useQueryClient();
   const t = useTranslations("settings");
   const tCommon = useTranslations("common");
   const prefsQ = useQuery({ queryKey: ["notif-prefs"], queryFn: api.notifPrefs });
+  const integrationsQ = useQuery({ queryKey: ["integrations"], queryFn: api.integrations });
+  const bindEmail = email ?? "your-email@example.com";
   const updateMutation = useMutation({
     mutationFn: (patch: Partial<NotifPrefs>) => api.notifPrefsUpdate(patch),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notif-prefs"] }),
@@ -118,14 +194,29 @@ function NotificationsSection() {
                   </button>
                 </div>
               </div>
+            ) : !integrationsQ.data?.telegram ? (
+              <div className="rounded-md bg-warning/10 border border-warning/40 p-3 text-sm">
+                <div className="font-medium text-warning mb-1">⚠️ Telegram-бот не настроен на сервере</div>
+                <div className="text-xs text-muted-foreground">
+                  Чтобы привязать Telegram нужно сначала добавить <code className="font-mono">TELEGRAM_BOT_TOKEN</code> в
+                  <code className="font-mono"> /etc/pharmacy-monitor/env</code>. Запусти:
+                </div>
+                <code className="block mt-2 font-mono text-xs bg-secondary/50 p-2 rounded">
+                  bash scripts/configure-integrations.sh
+                </code>
+              </div>
             ) : (
               <div className="rounded-md bg-secondary/50 border border-border p-3 text-sm">
                 <div>
                   {t("telegram_bind_hint")}{" "}
-                  <code className="font-mono">/start your-email@example.com</code>
+                  <code className="font-mono">/start {bindEmail}</code>
                 </div>
                 <a
-                  href={`https://t.me/${process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME ?? "your_bot"}`}
+                  href={`https://t.me/${
+                    integrationsQ.data?.telegram_bot_username ??
+                    process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME ??
+                    "your_bot"
+                  }`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-xs text-primary hover:underline mt-1 inline-block"
