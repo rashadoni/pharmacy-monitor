@@ -2,6 +2,30 @@
 
 This file is auto-loaded in every Claude Code session. Read it first.
 
+## Verification Protocol (CRITICAL)
+
+Before starting any task that involves code changes, you MUST:
+
+1. **Analyze the request** and provide a brief summary of what you understood.
+2. **Define a Verification Plan**: List a specific checklist of how you (and the user) will verify the changes.
+3. **Wait for implicit or explicit confirmation** (or proceed if the plan is exhaustive).
+
+If you cannot define a clear checklist for verification, **stop and ask for clarification**. Inability to define a checklist is a signal that the task requirements are ambiguous.
+
+### Checklist Requirements
+
+The Verification Plan must enumerate:
+
+- **Unit tests** to run or write (e.g., `pytest tests/test_<module>.py -v`).
+- **Manual verification steps** the user can perform (e.g., "open https://leaddrive.cloud/comparison and check prices show on all 3 sites").
+- **Edge cases** to consider (e.g., empty input, network failures, concurrent runs, diff-only vs full-persist data).
+- **Production impact** if any (DB migrations, systemd restarts, schema changes).
+- **Rollback plan** for irreversible operations.
+
+### When to skip
+
+This protocol applies to tasks that change code. Trivial read-only operations (status checks, file reads, exploration) don't need a Verification Plan. Trivial doc updates (typos, minor wording) don't need one either, but anything affecting prod systems or business logic does.
+
 ## Current production state (last updated: 2026-05-11)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
