@@ -1,12 +1,71 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { api, type CategoryRow } from "@/lib/api";
+
+/**
+ * Извлечь slug категории из URL для каждого сайта.
+ *
+ * Поддерживаемые форматы:
+ * - pharmonline: `https://pharmonline.az/products?category=ushaq-qidasi`
+ * - aptekonline: `https://www.aptekonline.az/shop/productList?categoryId[]=252&lang=az`
+ * - aloe: `https://aloe.az/catalog/filters/?category_slug=u%C5%9Faq-qidas%C4%B1`
+ *
+ * Если не parsится — возвращает исходный input (клиент мог ввести голый slug).
+ */
+function extractSlug(site: "pharmonline" | "aptekonline" | "aloe", input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return "";
+  // Если не похоже на URL — это уже slug
+  if (!trimmed.startsWith("http")) return trimmed;
+  try {
+    const u = new URL(trimmed);
+    if (site === "pharmonline") {
+      return u.searchParams.get("category") ?? trimmed;
+    }
+    if (site === "aptekonline") {
+      // categoryId[]=252 — array param
+      const v = u.searchParams.get("categoryId[]") ?? u.searchParams.get("categoryId");
+      return v ?? trimmed;
+    }
+    if (site === "aloe") {
+      const v = u.searchParams.get("category_slug");
+      return v ? decodeURIComponent(v) : trimmed;
+    }
+  } catch {
+    return trimmed;
+  }
+  return trimmed;
+}
+
+/**
+ * Слаг из label: «Витамины» → `vitaminy`.
+ * Простой ASCII-only fallback; кириллица транслитерируется по таблице.
+ */
+function slugify(s: string): string {
+  const map: Record<string, string> = {
+    а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "yo", ж: "zh", з: "z",
+    и: "i", й: "y", к: "k", л: "l", м: "m", н: "n", о: "o", п: "p", р: "r",
+    с: "s", т: "t", у: "u", ф: "f", х: "kh", ц: "ts", ч: "ch", ш: "sh", щ: "sch",
+    ъ: "", ы: "y", ь: "", э: "e", ю: "yu", я: "ya",
+  };
+  return s
+    .toLowerCase()
+    .split("")
+    .map((ch) => map[ch] ?? ch)
+    .join("")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
 
 export default function CategoriesPage() {
   const [search, setSearch] = useState("");
   const [siteFilter, setSiteFilter] = useState<"" | "pharmonline" | "aptekonline" | "aloe">("");
+  const [activeOnly, setActiveOnly] = useState(false);
+  const [showAdd, setShowAdd] = useState(false);
+  const queryClient = useQueryClient();
 
   const { data, isLoading } = useQuery({
     queryKey: ["categories"],
@@ -20,12 +79,14 @@ export default function CategoriesPage() {
     if (siteFilter === "pharmonline" && !c.pharmonline_slug) return false;
     if (siteFilter === "aptekonline" && !c.aptekonline_slug) return false;
     if (siteFilter === "aloe" && !c.aloe_slug) return false;
+    if (activeOnly && !c.is_active) return false;
     return true;
   });
 
   const stats = {
     total: data?.length ?? 0,
     active: data?.filter((c) => c.is_active).length ?? 0,
+    cross3: data?.filter((c) => c.pharmonline_slug && c.aptekonline_slug && c.aloe_slug).length ?? 0,
     pharmonline: data?.filter((c) => c.pharmonline_slug).length ?? 0,
     aptekonline: data?.filter((c) => c.aptekonline_slug).length ?? 0,
     aloe: data?.filter((c) => c.aloe_slug).length ?? 0,
@@ -33,17 +94,29 @@ export default function CategoriesPage() {
 
   return (
     <div className="space-y-4">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">🗂️ Категории</h1>
-        <p className="text-sm text-muted-foreground">
-          Категории для скрейпинга. Каждая row — slug на одном из 3 сайтов.
-        </p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">🗂️ Категории</h1>
+          <p className="text-sm text-muted-foreground">
+            Категории для скрейпинга. ON-категории идут в next-run; OFF — пропускаются.
+          </p>
+        </div>
+        <button
+          onClick={() => setShowAdd(true)}
+          className="inline-flex items-center gap-1.5 rounded-md bg-primary text-primary-foreground px-3 py-2 text-sm font-medium hover:bg-primary/90"
+        >
+          <Plus className="h-4 w-4" />
+          Добавить
+        </button>
       </div>
 
+      {showAdd && <AddForm onClose={() => setShowAdd(false)} />}
+
       {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
         <Stat label="Всего" value={stats.total} />
         <Stat label="Active" value={stats.active} />
+        <Stat label="Cross-3" value={stats.cross3} highlight />
         <Stat label="pharmonline" value={stats.pharmonline} />
         <Stat label="aptekonline" value={stats.aptekonline} />
         <Stat label="aloe" value={stats.aloe} />
@@ -68,6 +141,15 @@ export default function CategoriesPage() {
           <option value="aptekonline">aptekonline</option>
           <option value="aloe">aloe</option>
         </select>
+        <label className="inline-flex items-center gap-2 px-3 text-sm">
+          <input
+            type="checkbox"
+            checked={activeOnly}
+            onChange={(e) => setActiveOnly(e.target.checked)}
+            className="rounded"
+          />
+          Только Active
+        </label>
       </div>
 
       {isLoading && <div className="text-muted-foreground">Загрузка…</div>}
@@ -82,11 +164,14 @@ export default function CategoriesPage() {
               <th className="px-3 py-2 text-left">aptekonline</th>
               <th className="px-3 py-2 text-left">aloe</th>
               <th className="px-3 py-2 text-center">Active</th>
+              <th className="px-3 py-2 text-center"></th>
             </tr>
           </thead>
           <tbody>
             {filtered.map((cat) => (
-              <CategoryRowDesktop key={cat.id} cat={cat} />
+              <CategoryRowDesktop key={cat.id} cat={cat} onChanged={() =>
+                queryClient.invalidateQueries({ queryKey: ["categories"] })
+              } />
             ))}
           </tbody>
         </table>
@@ -101,7 +186,28 @@ export default function CategoriesPage() {
   );
 }
 
-function CategoryRowDesktop({ cat }: { cat: CategoryRow }) {
+function CategoryRowDesktop({ cat, onChanged }: { cat: CategoryRow; onChanged: () => void }) {
+  const queryClient = useQueryClient();
+
+  const toggleActive = useMutation({
+    mutationFn: () =>
+      api.categoryUpdate(cat.id, {
+        key: cat.key,
+        label_ru: cat.label_ru,
+        label_az: cat.label_az,
+        pharmonline_slug: cat.pharmonline_slug,
+        aptekonline_slug: cat.aptekonline_slug,
+        aloe_slug: cat.aloe_slug,
+        is_active: !cat.is_active,
+      }),
+    onSuccess: onChanged,
+  });
+
+  const remove = useMutation({
+    mutationFn: () => api.categoryDelete(cat.id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["categories"] }),
+  });
+
   return (
     <tr className="border-t border-border hover:bg-muted/30">
       <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{cat.key}</td>
@@ -128,25 +234,218 @@ function CategoryRowDesktop({ cat }: { cat: CategoryRow }) {
         )}
       </td>
       <td className="px-3 py-2 text-center">
-        {cat.is_active ? (
-          <span className="inline-flex rounded px-2 py-0.5 text-xs bg-success/10 text-success">
-            ON
-          </span>
-        ) : (
-          <span className="inline-flex rounded px-2 py-0.5 text-xs bg-muted text-muted-foreground">
-            OFF
-          </span>
-        )}
+        <button
+          onClick={() => toggleActive.mutate()}
+          disabled={toggleActive.isPending}
+          className={`inline-flex rounded px-2 py-0.5 text-xs font-medium transition-opacity ${
+            cat.is_active
+              ? "bg-success/10 text-success hover:bg-success/20"
+              : "bg-muted text-muted-foreground hover:bg-muted/80"
+          } ${toggleActive.isPending ? "opacity-50" : ""}`}
+        >
+          {cat.is_active ? "ON" : "OFF"}
+        </button>
+      </td>
+      <td className="px-3 py-2 text-center">
+        <button
+          onClick={() => {
+            if (confirm(`Удалить категорию «${cat.label_ru}»?`)) remove.mutate();
+          }}
+          disabled={remove.isPending}
+          className="text-muted-foreground hover:text-destructive disabled:opacity-50"
+          title="Удалить"
+        >
+          <Trash2 className="h-4 w-4" />
+        </button>
       </td>
     </tr>
   );
 }
 
-function Stat({ label, value }: { label: string; value: number }) {
+function Stat({ label, value, highlight }: { label: string; value: number; highlight?: boolean }) {
   return (
-    <div className="rounded-md border border-border bg-card p-3">
-      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className="text-xl font-semibold mt-0.5 tabular-nums">{value}</div>
+    <div
+      className={`rounded-lg border bg-card px-3 py-2 ${
+        highlight ? "border-success/40 bg-success/5" : "border-border"
+      }`}
+    >
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="text-lg font-semibold">{value}</div>
     </div>
+  );
+}
+
+function AddForm({ onClose }: { onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const [form, setForm] = useState({
+    label_ru: "",
+    label_az: "",
+    pharmonline_url: "",
+    aptekonline_url: "",
+    aloe_url: "",
+  });
+  const [error, setError] = useState<string | null>(null);
+
+  const phmSlug = extractSlug("pharmonline", form.pharmonline_url);
+  const aptSlug = extractSlug("aptekonline", form.aptekonline_url);
+  const aloeSlug = extractSlug("aloe", form.aloe_url);
+  const key = slugify(form.label_ru || form.label_az);
+
+  const create = useMutation({
+    mutationFn: () =>
+      api.categoryCreate({
+        key,
+        label_ru: form.label_ru,
+        label_az: form.label_az || null,
+        pharmonline_slug: phmSlug || null,
+        aptekonline_slug: aptSlug || null,
+        aloe_slug: aloeSlug || null,
+        is_active: true,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["categories"] });
+      onClose();
+    },
+    onError: (e: any) => setError(e?.message || "Не удалось сохранить"),
+  });
+
+  const canSubmit =
+    form.label_ru.trim().length > 0 && (phmSlug || aptSlug || aloeSlug);
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="font-semibold">Новая категория</h3>
+        <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Вставь URL категории с каждого сайта — slug извлечётся автоматически. Можно ввести голый slug, если уже знаешь.
+      </p>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <Field
+          label="Название (RU)"
+          required
+          value={form.label_ru}
+          onChange={(v) => setForm({ ...form, label_ru: v })}
+          placeholder="Витамины"
+        />
+        <Field
+          label="Название (AZ)"
+          value={form.label_az}
+          onChange={(v) => setForm({ ...form, label_az: v })}
+          placeholder="Vitaminlər"
+        />
+      </div>
+
+      <div className="space-y-2 pt-2 border-t border-border">
+        <UrlField
+          label="pharmonline.az"
+          value={form.pharmonline_url}
+          extractedSlug={phmSlug}
+          onChange={(v) => setForm({ ...form, pharmonline_url: v })}
+          placeholder="https://pharmonline.az/products?category=…"
+        />
+        <UrlField
+          label="aptekonline.az"
+          value={form.aptekonline_url}
+          extractedSlug={aptSlug}
+          onChange={(v) => setForm({ ...form, aptekonline_url: v })}
+          placeholder="https://www.aptekonline.az/shop/productList?categoryId[]=…"
+        />
+        <UrlField
+          label="aloe.az"
+          value={form.aloe_url}
+          extractedSlug={aloeSlug}
+          onChange={(v) => setForm({ ...form, aloe_url: v })}
+          placeholder="https://aloe.az/catalog/filters/?category_slug=…"
+        />
+      </div>
+
+      {key && (
+        <div className="text-xs text-muted-foreground">
+          Key (автоматически): <span className="font-mono">{key}</span>
+        </div>
+      )}
+
+      <div className="flex gap-2 pt-2">
+        <button
+          onClick={() => create.mutate()}
+          disabled={!canSubmit || create.isPending}
+          className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
+        >
+          {create.isPending ? "Сохраняем…" : "Сохранить"}
+        </button>
+        <button onClick={onClose} className="text-sm text-muted-foreground hover:text-foreground">
+          Отмена
+        </button>
+      </div>
+      {error && <div className="text-sm text-destructive">{error}</div>}
+    </div>
+  );
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  placeholder,
+  required,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  required?: boolean;
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs font-medium block mb-1">
+        {label}
+        {required && <span className="text-destructive ml-0.5">*</span>}
+      </span>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        required={required}
+        className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      />
+    </label>
+  );
+}
+
+function UrlField({
+  label,
+  value,
+  extractedSlug,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  extractedSlug: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  return (
+    <label className="block">
+      <div className="flex items-baseline justify-between mb-1">
+        <span className="text-xs font-medium">{label}</span>
+        {extractedSlug && (
+          <span className="text-xs text-success font-mono">→ {extractedSlug}</span>
+        )}
+      </div>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring font-mono"
+      />
+    </label>
   );
 }

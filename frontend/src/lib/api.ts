@@ -155,6 +155,18 @@ export const api = {
   brandShare: (top_n = 30) => request<BrandShareRow[]>(`/api/v1/dash/brand-share?top_n=${top_n}`),
   runs: (limit = 30) => request<RunRow[]>(`/api/v1/dash/runs?limit=${limit}`),
   categories: () => request<CategoryRow[]>("/api/v1/dash/categories"),
+  categoryCreate: (payload: Omit<CategoryRow, "id">) =>
+    request<CategoryRow>("/api/v1/dash/categories", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  categoryUpdate: (id: number, payload: Omit<CategoryRow, "id">) =>
+    request<{ ok: true }>(`/api/v1/dash/categories/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  categoryDelete: (id: number) =>
+    request<void>(`/api/v1/dash/categories/${id}`, { method: "DELETE" }),
   rejectMatch: (id: number) =>
     request<void>(`/api/v1/dash/matches/${id}/reject`, { method: "POST" }),
 
