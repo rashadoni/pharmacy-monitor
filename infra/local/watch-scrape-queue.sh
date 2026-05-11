@@ -4,10 +4,18 @@
 #
 # Каждые 60 секунд (тикает launchd) опрашивает прод API:
 #   GET /api/v1/internal/pending-scrape
-# Если есть pending — исполняет `pharmacy-monitor run` с указанными параметрами,
-# затем PATCH'ит запрос как 'ok' или 'failed'.
 #
-# Использует тот же SSH-tunnel к prod Postgres что и run-scrape.sh.
+# Архитектура (refactored 2026-05-11):
+#   1. Pgrep guard: если другой `pharmacy-monitor run` уже работает (queue
+#      или daily cron), watcher выходит сразу — избегаем DB-race.
+#   2. Detached spawn: pharmacy-monitor запускается в отдельной подоболочке
+#      (subshell + `&` + `disown`), watcher сам выходит за секунды. Launchd
+#      ticks больше НЕ блокируются на 60+ мин matcher-фазах.
+#   3. --request-id N: pharmacy-monitor пометит ScrapeRequest как 'ok' сам,
+#      сразу после persist (не дожидаясь matcher/analyzer). Watcher здесь
+#      больше НЕ дёргает /scrape-complete на успех — только на ранние ошибки.
+#   4. Subshell держит SSH-tunnel живым до завершения pharmacy-monitor и
+#      сам же его убирает.
 #
 # Запуск через launchd:
 #   cp infra/local/com.pharmacy-monitor.watch.plist ~/Library/LaunchAgents/
@@ -22,7 +30,7 @@ LOCAL_PG_PORT="${LOCAL_PG_PORT:-5433}"
 API_BASE="${API_BASE:-https://leaddrive.cloud}"
 KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-pharmacy-monitor-db}"
 KEYCHAIN_ACCOUNT="${KEYCHAIN_ACCOUNT:-pm}"
-API_KEY="${API_KEY:-}"  # X-Pharmacy-API-Key
+API_KEY="${API_KEY:-}"  # X-API-Key
 LOG_FILE="${LOG_FILE:-$HOME/Library/Logs/pharmacy-monitor-watch.log}"
 
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -30,6 +38,17 @@ exec >>"$LOG_FILE" 2>&1
 echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | watch-scrape-queue tick ====="
 
 cd "$PROJECT_DIR"
+
+# === Pgrep guard ============================================================
+# Если уже бежит ANY `pharmacy-monitor run` (queue, daily cron, или ручной
+# запуск) — откладываем тик. Запускать второй scrape параллельно нельзя:
+# конкурентные UPSERT'ы в `products`/`price_snapshots` пораждают конфликты
+# на уникальном (site, external_id), а matcher одновременно с persist
+# создаёт дубликаты Match'ей. Launchd попробует ещё раз через 60 секунд.
+if pgrep -f "pharmacy-monitor run" >/dev/null 2>&1; then
+    echo "  pharmacy-monitor run already in progress, deferring tick"
+    exit 0
+fi
 
 # Pull API_KEY from Keychain if not set in env
 if [[ -z "$API_KEY" ]]; then
@@ -40,9 +59,9 @@ if [[ -z "$API_KEY" ]]; then
     exit 1
 fi
 
-# Poll for pending request.
+# === Poll for pending request ===============================================
 # require_api_key() в src/api.py принимает header X-API-Key (FastAPI alias из
-# параметра `x_api_key`). Не путать с `X-Pharmacy-API-Key`.
+# параметра `x_api_key`).
 resp=$(curl -s -m 10 -w "\n__HTTP_STATUS:%{http_code}" \
     -H "X-API-Key: $API_KEY" \
     "$API_BASE/api/v1/internal/pending-scrape")
@@ -100,58 +119,56 @@ if [[ -z "$PG_PASS" ]]; then
     exit 1
 fi
 
-# Open SSH tunnel
-ssh -i "$SSH_KEY" -N -L "$LOCAL_PG_PORT:localhost:5432" \
-    -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ConnectTimeout=15 \
-    "root@$PROD_HOST" &
-TUNNEL_PID=$!
-cleanup() { kill $TUNNEL_PID 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
-sleep 3
-
-export DATABASE_URL="postgresql+psycopg://pm:${PG_PASS}@localhost:${LOCAL_PG_PORT}/pharmacy_monitor"
-
-# Build CLI args
+# === Build CLI args ==========================================================
 # --request-id заставит pharmacy-monitor пометить ScrapeRequest как 'ok' сразу
-# после persist phase (через несколько минут), не дожидаясь matcher/analyzer —
-# UI получит «Готово — N товаров» как только scrape физически завершился.
+# после persist phase (через ~30 мин), не дожидаясь matcher/analyzer (которые
+# работают ещё ~30-60 мин в фоне). UI получает «Готово — N товаров» в три раза
+# быстрее, чем при подходе «watcher ждёт всё».
 ARGS=("run" "--mode" "category" "--no-alerts" "--request-id" "$req_id")
-# Sites
 IFS=',' read -ra SITE_ARR <<< "$sites"
 for s in "${SITE_ARR[@]}"; do
     [[ -n "$s" ]] && ARGS+=("--site" "$s")
 done
-# Category-id если есть
 [[ -n "$category_id" ]] && ARGS+=("--category-id" "$category_id")
 
-echo "  running: pharmacy-monitor ${ARGS[*]}"
-run_id=""
-error_msg=""
-if .venv/bin/pharmacy-monitor "${ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-    # Try to extract run_id из последней SQL queries
-    run_id=$(.venv/bin/python -c "
-from src.storage import make_session, Run
-from sqlalchemy import select, desc
-S = make_session()
-with S() as s:
-    r = s.scalar(select(Run).order_by(desc(Run.id)).limit(1))
-    print(r.id if r else '')
-" 2>/dev/null || true)
-    echo "  done, run_id=$run_id"
-else
-    error_msg="pharmacy-monitor run exit non-zero"
-    echo "  FAILED: $error_msg"
-fi
+echo "  spawning detached: pharmacy-monitor ${ARGS[*]}"
 
-# Notify backend
-payload="{}"
-if [[ -n "$run_id" ]]; then
-    payload="{\"run_id\":$run_id}"
-fi
-if [[ -n "$error_msg" ]]; then
-    payload="{\"error_message\":\"$error_msg\"}"
-fi
-curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-    -d "$payload" "$API_BASE/api/v1/internal/scrape-complete/$req_id"
+# === Detached subshell ======================================================
+# Subshell:
+#   - открывает SSH-tunnel (со своим trap-cleanup)
+#   - запускает pharmacy-monitor синхронно
+#   - на не-zero exit вызывает /scrape-complete с error_message
+#     (на success ничего не нужно — pharmacy-monitor сам пометит ok через
+#     --request-id сразу после persist)
+#   - убивает tunnel
+#
+# Snake `setsid` нет на macOS, используем nohup-стиль через `&` + `disown`
+# + редирект stdin/out/err. После `disown` watcher теряет связь с subshell,
+# subshell живёт независимо до своего собственного выхода.
+(
+    cd "$PROJECT_DIR"
+    ssh -i "$SSH_KEY" -N -L "$LOCAL_PG_PORT:localhost:5432" \
+        -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ConnectTimeout=15 \
+        "root@$PROD_HOST" &
+    TUNNEL_PID=$!
+    trap 'kill $TUNNEL_PID 2>/dev/null || true' EXIT
+    sleep 3
 
-echo "  ===== request #$req_id complete ====="
+    export DATABASE_URL="postgresql+psycopg://pm:${PG_PASS}@localhost:${LOCAL_PG_PORT}/pharmacy_monitor"
+
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | bg-run for request #$req_id starting"
+    if .venv/bin/pharmacy-monitor "${ARGS[@]}" 2>&1; then
+        echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | bg-run for request #$req_id finished cleanly"
+    else
+        echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | bg-run for request #$req_id FAILED, marking via API"
+        # Idempotent — endpoint оставит 'ok' если --request-id уже пометил,
+        # иначе пометит 'failed'.
+        curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+            -d '{"error_message":"pharmacy-monitor run exit non-zero"}' \
+            "$API_BASE/api/v1/internal/scrape-complete/$req_id"
+    fi
+) </dev/null >>"$LOG_FILE" 2>&1 &
+BG_PID=$!
+disown $BG_PID
+
+echo "  spawned bg-subshell PID=$BG_PID for request #$req_id, watcher exiting"
