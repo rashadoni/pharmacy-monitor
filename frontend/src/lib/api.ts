@@ -98,8 +98,20 @@ export interface RunRow {
   finished_at: string | null;
   status: string;
   products_scraped: number;
+  products_per_site: Record<string, number> | null;
   sites_completed: string | null;
   error_message: string | null;
+}
+
+export interface RunBreakdown {
+  run_id: number;
+  started_at: string | null;
+  finished_at: string | null;
+  status: string;
+  products_scraped: number;
+  products_per_site: Record<string, number>;
+  products_per_site_category: Record<string, Record<string, number>>;
+  sites_completed: string | null;
 }
 
 export interface CategoryRow {
@@ -154,6 +166,8 @@ export const api = {
   matchQuality: () => request<MatchQuality>("/api/v1/dash/match-quality"),
   brandShare: (top_n = 30) => request<BrandShareRow[]>(`/api/v1/dash/brand-share?top_n=${top_n}`),
   runs: (limit = 30) => request<RunRow[]>(`/api/v1/dash/runs?limit=${limit}`),
+  runBreakdown: (id: number) =>
+    request<RunBreakdown>(`/api/v1/dash/runs/${id}/breakdown`),
   categories: () => request<CategoryRow[]>("/api/v1/dash/categories"),
   categoryCreate: (payload: Omit<CategoryRow, "id">) =>
     request<CategoryRow>("/api/v1/dash/categories", {

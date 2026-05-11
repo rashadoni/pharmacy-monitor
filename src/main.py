@@ -212,6 +212,22 @@ def auto_match_watchlist(session) -> int:
     return linked
 
 
+def _per_category_breakdown(results: list) -> dict[str, int]:
+    """Из списка ScrapeResult вернуть {category_label: count_products}.
+
+    Используется для заполнения `Run.products_per_site_category` — клиент
+    видит «по каким category-маршрутам скрейпер ходил, сколько товаров увидел».
+    Если у product'а нет `category` (редкий случай), он попадает в `'(uncategorized)'`.
+    """
+    from collections import Counter
+
+    breakdown: Counter[str] = Counter()
+    for result in results:
+        for sp in result.products:
+            breakdown[sp.category or "(uncategorized)"] += 1
+    return dict(breakdown)
+
+
 def _smoke_test_per_site_coverage(
     session: Session, results: list, run: storage.Run, drop_threshold: float = 0.5
 ) -> None:
@@ -1229,6 +1245,9 @@ def ai_crawl_cmd(
             count = persist_results(session, run, [result])
             run.products_scraped = count
             run.products_per_site = {site: len(result.products)}
+            run.products_per_site_category = {
+                site: _per_category_breakdown([result])
+            }
             run.sites_completed = site
             run.status = "ok"
             run.finished_at = utcnow()
@@ -1357,6 +1376,9 @@ def run_cmd(
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
+            run.products_per_site_category = {
+                r.site: _per_category_breakdown([r]) for r in results
+            }
             run.sites_completed = ",".join(sites)
             session.commit()
 
@@ -1448,6 +1470,9 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...]) -> None:
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
+            run.products_per_site_category = {
+                r.site: _per_category_breakdown([r]) for r in results
+            }
             run.status = "ok"
             run.finished_at = utcnow()
             session.commit()

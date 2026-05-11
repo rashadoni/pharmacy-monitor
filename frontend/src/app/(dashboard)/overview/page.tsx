@@ -1,13 +1,16 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { api, type RoiAction } from "@/lib/api";
+import { ChevronDown, ChevronRight } from "lucide-react";
+import { useState } from "react";
+import { api, type RoiAction, type RunRow } from "@/lib/api";
 import { formatPrice } from "@/lib/utils";
 
 export default function OverviewPage() {
   const matchQ = useQuery({ queryKey: ["match-quality"], queryFn: api.matchQuality });
   const actionsQ = useQuery({ queryKey: ["roi-actions"], queryFn: api.roiActions });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
+  const [expandedRun, setExpandedRun] = useState<number | null>(null);
 
   return (
     <div className="space-y-6">
@@ -61,10 +64,14 @@ export default function OverviewPage() {
       {/* Recent runs */}
       <div>
         <h2 className="text-lg font-semibold mb-3">Последние прогоны</h2>
+        <p className="text-xs text-muted-foreground mb-2">
+          Кликни на строку чтобы увидеть breakdown — сколько товаров на каждом сайте по каждой категории.
+        </p>
         <div className="rounded-lg border border-border overflow-hidden">
           <table className="w-full text-sm">
             <thead className="bg-muted/50 text-muted-foreground">
               <tr>
+                <th className="px-3 py-2 w-6"></th>
                 <th className="px-3 py-2 text-left">ID</th>
                 <th className="px-3 py-2 text-left">Started</th>
                 <th className="px-3 py-2 text-left">Status</th>
@@ -74,25 +81,142 @@ export default function OverviewPage() {
             </thead>
             <tbody>
               {runsQ.data?.map((r) => (
-                <tr key={r.id} className="border-t border-border">
-                  <td className="px-3 py-2 font-mono text-xs">{r.id}</td>
-                  <td className="px-3 py-2 text-muted-foreground">
-                    {r.started_at?.slice(0, 16).replace("T", " ")}
-                  </td>
-                  <td className="px-3 py-2">
-                    <StatusBadge status={r.status} />
-                  </td>
-                  <td className="px-3 py-2 text-right tabular-nums">
-                    {r.products_scraped}
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground hidden md:table-cell">
-                    {r.sites_completed}
-                  </td>
-                </tr>
+                <RunRowExpandable
+                  key={r.id}
+                  run={r}
+                  isExpanded={expandedRun === r.id}
+                  onToggle={() =>
+                    setExpandedRun(expandedRun === r.id ? null : r.id)
+                  }
+                />
               ))}
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function RunRowExpandable({
+  run,
+  isExpanded,
+  onToggle,
+}: {
+  run: RunRow;
+  isExpanded: boolean;
+  onToggle: () => void;
+}) {
+  const breakdownQ = useQuery({
+    queryKey: ["run-breakdown", run.id],
+    queryFn: () => api.runBreakdown(run.id),
+    enabled: isExpanded,
+  });
+
+  return (
+    <>
+      <tr
+        className="border-t border-border cursor-pointer hover:bg-muted/30"
+        onClick={onToggle}
+      >
+        <td className="px-3 py-2">
+          {isExpanded ? (
+            <ChevronDown className="h-4 w-4 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="h-4 w-4 text-muted-foreground" />
+          )}
+        </td>
+        <td className="px-3 py-2 font-mono text-xs">{run.id}</td>
+        <td className="px-3 py-2 text-muted-foreground">
+          {run.started_at?.slice(0, 16).replace("T", " ")}
+        </td>
+        <td className="px-3 py-2">
+          <StatusBadge status={run.status} />
+        </td>
+        <td className="px-3 py-2 text-right tabular-nums">{run.products_scraped}</td>
+        <td className="px-3 py-2 text-muted-foreground hidden md:table-cell">
+          {run.sites_completed}
+        </td>
+      </tr>
+      {isExpanded && (
+        <tr className="border-t border-border bg-muted/10">
+          <td colSpan={6} className="px-3 py-3">
+            {breakdownQ.isLoading && (
+              <div className="text-xs text-muted-foreground">Загружаю breakdown…</div>
+            )}
+            {breakdownQ.data && (
+              <RunBreakdownPanel data={breakdownQ.data} />
+            )}
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function RunBreakdownPanel({
+  data,
+}: {
+  data: {
+    products_per_site: Record<string, number>;
+    products_per_site_category: Record<string, Record<string, number>>;
+  };
+}) {
+  const sites = Object.keys(data.products_per_site_category).sort();
+  if (sites.length === 0) {
+    return (
+      <div className="text-xs text-muted-foreground">
+        Нет breakdown-данных. Этот прогон был до 2026-05-11 (тогда поле
+        products_per_site_category ещё не сохранялось). Новые runs будут иметь подробности.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap gap-2">
+        {sites.map((site) => (
+          <div
+            key={site}
+            className="rounded-md border border-border bg-card px-3 py-1.5 text-xs"
+          >
+            <span className="font-medium">{site}:</span>{" "}
+            <span className="tabular-nums font-semibold">
+              {data.products_per_site[site] ?? 0}
+            </span>{" "}
+            <span className="text-muted-foreground">всего</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        {sites.map((site) => {
+          const cats = data.products_per_site_category[site] || {};
+          const sorted = Object.entries(cats).sort(([, a], [, b]) => b - a);
+          return (
+            <div key={site} className="rounded-md border border-border bg-card p-3">
+              <div className="font-medium text-sm mb-2">{site}</div>
+              <div className="space-y-1">
+                {sorted.map(([cat, count]) => (
+                  <div
+                    key={cat}
+                    className="flex items-center justify-between text-xs"
+                  >
+                    <span className="truncate text-muted-foreground mr-2" title={cat}>
+                      {cat}
+                    </span>
+                    <span className="font-mono tabular-nums">{count}</span>
+                  </div>
+                ))}
+                {sorted.length === 0 && (
+                  <div className="text-xs text-muted-foreground">
+                    Нет данных
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

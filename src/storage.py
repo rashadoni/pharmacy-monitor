@@ -55,6 +55,11 @@ class Run(Base):
     # runs (до 2026-05-11). Используется smoke_test'ом для точной per-site
     # baseline в multi-site прогонах (Mac launchd pharmonline+aptekonline).
     products_per_site: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Per-(site,category) breakdown {site: {category_label: count}}. Заполняется
+    # после persist'а: показывает сколько товаров скрейпер увидел по каждому
+    # category-маршруту на каждом сайте. Используется в UI «Coverage» панели и
+    # для debug — клиент видит «pharm scraped 100 vitamins, apt scraped 320».
+    products_per_site_category: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     snapshots: Mapped[list[PriceSnapshot]] = relationship(back_populates="run")
 
@@ -505,6 +510,8 @@ def _apply_lightweight_migrations(engine) -> None:
             ("supplier_prices", "tenant_id", "INTEGER DEFAULT 1"),
             # 2026-05-11: per-site breakdown для smoke_test (multi-site Mac runs)
             ("runs", "products_per_site", "JSON"),
+            # 2026-05-11 (вечер): per-(site,category) breakdown для UI coverage panel
+            ("runs", "products_per_site_category", "JSON"),
         ]
         for table, column, coltype in migrations:
             try:

@@ -807,11 +807,43 @@ def dash_runs(
             "finished_at": r.finished_at.isoformat() if r.finished_at else None,
             "status": r.status,
             "products_scraped": r.products_scraped,
+            "products_per_site": r.products_per_site,
             "sites_completed": r.sites_completed,
             "error_message": r.error_message,
         }
         for r in runs
     ]
+
+
+@app.get("/api/v1/dash/runs/{run_id}/breakdown")
+def dash_run_breakdown(
+    run_id: int,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Подробный breakdown прогона: сколько товаров на каждом сайте по каждой
+    категории. Используется UI «Coverage» панелью на /overview и для debug.
+
+    Returns: {
+      "run_id": int, "started_at": iso, "finished_at": iso, "status": str,
+      "products_scraped": int,
+      "products_per_site": {site: total_count},
+      "products_per_site_category": {site: {category: count}}
+    }
+    """
+    run = db.scalar(select(storage.Run).where(storage.Run.id == run_id))
+    if not run:
+        raise HTTPException(404, "Run not found")
+    return {
+        "run_id": run.id,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+        "status": run.status,
+        "products_scraped": run.products_scraped or 0,
+        "products_per_site": run.products_per_site or {},
+        "products_per_site_category": run.products_per_site_category or {},
+        "sites_completed": run.sites_completed,
+    }
 
 
 @app.get("/api/v1/dash/categories")
