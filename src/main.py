@@ -236,18 +236,24 @@ def _smoke_test_per_site_coverage(
         current = len(result.products) if hasattr(result, "products") else 0
         if current == 0:
             continue
-        # Среднее `products_scraped` за прошлые 5 ok-runs, где этот сайт
-        # участвовал. `products_scraped` — это общий счётчик по run'у, поэтому
-        # фильтр `sites_completed` ставит точное «только runs с этим сайтом».
-        # Несовершенно для multi-site runs, но в проде Mac launchd обычно
-        # фигачит pharmonline+aptekonline вместе, а aloe — solo на prod-cron.
+        # Среднее за прошлые 5 ok-runs, где этот сайт участвовал. Берём
+        # `products_per_site.get(site)` если есть (точная per-site метрика,
+        # добавлена 2026-05-11), иначе fallback на `products_scraped`.
         prev_runs = session.scalars(
             select(Run)
             .where(Run.status == "ok", Run.id < run.id, Run.sites_completed.contains(site))
             .order_by(desc(Run.id))
             .limit(5)
         ).all()
-        prev_counts = [r.products_scraped or 0 for r in prev_runs if (r.products_scraped or 0) > 0]
+        prev_counts: list[int] = []
+        for r in prev_runs:
+            per_site = (r.products_per_site or {}).get(site)
+            if per_site is not None and per_site > 0:
+                prev_counts.append(per_site)
+            elif (r.products_scraped or 0) > 0:
+                # legacy run без products_per_site — берём total как
+                # лучшее приближение (точнее sites_completed fail-safe-фильтр уже)
+                prev_counts.append(r.products_scraped)
         if len(prev_counts) < 2:
             continue  # недостаточно истории
         avg = sum(prev_counts) / len(prev_counts)
@@ -1222,6 +1228,7 @@ def ai_crawl_cmd(
         try:
             count = persist_results(session, run, [result])
             run.products_scraped = count
+            run.products_per_site = {site: len(result.products)}
             run.sites_completed = site
             run.status = "ok"
             run.finished_at = utcnow()
@@ -1349,6 +1356,7 @@ def run_cmd(
                 results = asyncio.run(scrape_all(slugs_by_site, limit))
             count = persist_results(session, run, results)
             run.products_scraped = count
+            run.products_per_site = {r.site: len(r.products) for r in results}
             run.sites_completed = ",".join(sites)
             session.commit()
 
@@ -1439,6 +1447,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...]) -> None:
             results = asyncio.run(scrape_all(slugs_by_site, limit))
             count = persist_results(session, run, results)
             run.products_scraped = count
+            run.products_per_site = {r.site: len(r.products) for r in results}
             run.status = "ok"
             run.finished_at = utcnow()
             session.commit()

@@ -51,6 +51,10 @@ class Run(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     products_scraped: Mapped[int] = mapped_column(Integer, default=0)
     sites_completed: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Per-site breakdown {site: count}. Nullable для backward-compat со старыми
+    # runs (до 2026-05-11). Используется smoke_test'ом для точной per-site
+    # baseline в multi-site прогонах (Mac launchd pharmonline+aptekonline).
+    products_per_site: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     snapshots: Mapped[list[PriceSnapshot]] = relationship(back_populates="run")
 
@@ -499,6 +503,8 @@ def _apply_lightweight_migrations(engine) -> None:
             ("tracked_products", "tenant_id", "INTEGER DEFAULT 1"),
             ("stock_levels", "tenant_id", "INTEGER DEFAULT 1"),
             ("supplier_prices", "tenant_id", "INTEGER DEFAULT 1"),
+            # 2026-05-11: per-site breakdown для smoke_test (multi-site Mac runs)
+            ("runs", "products_per_site", "JSON"),
         ]
         for table, column, coltype in migrations:
             try:

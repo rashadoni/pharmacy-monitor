@@ -102,7 +102,14 @@ def compute_trend(
     days_window: int = 30,
     min_points: int = 3,
 ) -> PriceTrend | None:
-    """Тренд по конкретному product_id за последние days_window дней."""
+    """Тренд по конкретному product_id за последние days_window дней.
+
+    Diff-only-aware (2026-05-11): после оптимизации persist'а большинство
+    продуктов имеют 0-2 snapshot'а в окне (цена стабильна → snapshot не
+    пишется). Для них возвращаем тривиальный "stable" тренд если продукт
+    действительно скрейпился недавно (`Product.last_seen_at` в окне), а
+    не просто исчез с сайта.
+    """
     cutoff = utcnow() - timedelta(days=days_window)
     snaps = session.scalars(
         select(PriceSnapshot)
@@ -123,11 +130,33 @@ def compute_trend(
         prices.append(p)
         timestamps.append(s.run.started_at)
 
-    if len(prices) < min_points:
-        return None
-
     product = session.get(Product, product_id)
     if not product:
+        return None
+
+    # === Diff-only fast-path: продукт скрейпился, но цена не менялась ===
+    if len(prices) < min_points:
+        # «Stable» возможен только если продукт действительно виден в окне
+        # (last_seen_at в окне), иначе это просто dead SKU без свежих данных.
+        if (
+            product.last_seen_at >= cutoff
+            and prices
+            and len(set(round(p, 2) for p in prices)) == 1
+        ):
+            p = prices[0]
+            return PriceTrend(
+                product_id=product_id,
+                site=product.site,
+                name=product.name,
+                n_points=len(prices),
+                first_price=round(p, 2),
+                last_price=round(p, 2),
+                change_pct=0.0,
+                direction="stable",
+                forecast_7d_price=round(p, 2),
+                # Confidence=medium: цена стабильна, но мало точек подтверждения
+                confidence="medium",
+            )
         return None
 
     first_p = prices[0]
@@ -234,7 +263,11 @@ def top_movers(
 
     trends: list[PriceTrend] = []
     for pid, points in history.items():
-        if len(points) < 3:
+        # Diff-only-aware (2026-05-11): 2 точки достаточно для (last-first)/first.
+        # Раньше 3 ставилось для устойчивости регрессии, но top_movers фильтрует
+        # по `min_change_pct`, так что слабые шумы и так отсеются. После
+        # diff-only product с одним big change имеет 2 точки — мы хотим его поймать.
+        if len(points) < 2:
             continue
         product = products.get(pid)
         if not product:
