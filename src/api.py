@@ -864,6 +864,17 @@ def dash_categories_update(
     cat = db.scalar(select(storage.Category).where(storage.Category.id == cat_id))
     if not cat:
         raise HTTPException(404, "Category not found")
+    # Если key меняется, проверяем что не конфликтует с другой строкой
+    # (key — UNIQUE в БД; raw IntegrityError даёт 500, отдадим 409 явно).
+    if payload.key != cat.key:
+        existing = db.scalar(
+            select(storage.Category).where(
+                storage.Category.key == payload.key,
+                storage.Category.id != cat_id,
+            )
+        )
+        if existing:
+            raise HTTPException(409, f"Category with key '{payload.key}' already exists")
     for k, v in payload.model_dump().items():
         setattr(cat, k, v)
     db.commit()

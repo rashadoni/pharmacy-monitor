@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, X } from "lucide-react";
+import { Pencil, Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { api, type CategoryRow } from "@/lib/api";
 
@@ -65,6 +65,7 @@ export default function CategoriesPage() {
   const [siteFilter, setSiteFilter] = useState<"" | "pharmonline" | "aptekonline" | "aloe">("");
   const [activeOnly, setActiveOnly] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
+  const [editing, setEditing] = useState<CategoryRow | null>(null);
   const queryClient = useQueryClient();
 
   const { data, isLoading } = useQuery({
@@ -110,7 +111,13 @@ export default function CategoriesPage() {
         </button>
       </div>
 
-      {showAdd && <AddForm onClose={() => setShowAdd(false)} />}
+      {showAdd && <CategoryForm onClose={() => setShowAdd(false)} />}
+      {editing && (
+        <CategoryForm
+          editing={editing}
+          onClose={() => setEditing(null)}
+        />
+      )}
 
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
@@ -169,9 +176,14 @@ export default function CategoriesPage() {
           </thead>
           <tbody>
             {filtered.map((cat) => (
-              <CategoryRowDesktop key={cat.id} cat={cat} onChanged={() =>
-                queryClient.invalidateQueries({ queryKey: ["categories"] })
-              } />
+              <CategoryRowDesktop
+                key={cat.id}
+                cat={cat}
+                onEdit={() => setEditing(cat)}
+                onChanged={() =>
+                  queryClient.invalidateQueries({ queryKey: ["categories"] })
+                }
+              />
             ))}
           </tbody>
         </table>
@@ -186,7 +198,15 @@ export default function CategoriesPage() {
   );
 }
 
-function CategoryRowDesktop({ cat, onChanged }: { cat: CategoryRow; onChanged: () => void }) {
+function CategoryRowDesktop({
+  cat,
+  onEdit,
+  onChanged,
+}: {
+  cat: CategoryRow;
+  onEdit: () => void;
+  onChanged: () => void;
+}) {
   const queryClient = useQueryClient();
 
   const toggleActive = useMutation({
@@ -247,16 +267,25 @@ function CategoryRowDesktop({ cat, onChanged }: { cat: CategoryRow; onChanged: (
         </button>
       </td>
       <td className="px-3 py-2 text-center">
-        <button
-          onClick={() => {
-            if (confirm(`Удалить категорию «${cat.label_ru}»?`)) remove.mutate();
-          }}
-          disabled={remove.isPending}
-          className="text-muted-foreground hover:text-destructive disabled:opacity-50"
-          title="Удалить"
-        >
-          <Trash2 className="h-4 w-4" />
-        </button>
+        <div className="inline-flex items-center gap-2">
+          <button
+            onClick={onEdit}
+            className="text-muted-foreground hover:text-foreground"
+            title="Редактировать"
+          >
+            <Pencil className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => {
+              if (confirm(`Удалить категорию «${cat.label_ru}»?`)) remove.mutate();
+            }}
+            disabled={remove.isPending}
+            className="text-muted-foreground hover:text-destructive disabled:opacity-50"
+            title="Удалить"
+          >
+            <Trash2 className="h-4 w-4" />
+          </button>
+        </div>
       </td>
     </tr>
   );
@@ -275,33 +304,48 @@ function Stat({ label, value, highlight }: { label: string; value: number; highl
   );
 }
 
-function AddForm({ onClose }: { onClose: () => void }) {
+function CategoryForm({
+  onClose,
+  editing,
+}: {
+  onClose: () => void;
+  editing?: CategoryRow;
+}) {
   const queryClient = useQueryClient();
+  const isEdit = Boolean(editing);
   const [form, setForm] = useState({
-    label_ru: "",
-    label_az: "",
-    pharmonline_url: "",
-    aptekonline_url: "",
-    aloe_url: "",
+    label_ru: editing?.label_ru ?? "",
+    label_az: editing?.label_az ?? "",
+    // В edit-режиме pre-fill голым slug (без URL) — пусть пользователь видит
+    // что было записано и при желании поверх вставит новый URL.
+    pharmonline_url: editing?.pharmonline_slug ?? "",
+    aptekonline_url: editing?.aptekonline_slug ?? "",
+    aloe_url: editing?.aloe_slug ?? "",
   });
   const [error, setError] = useState<string | null>(null);
 
   const phmSlug = extractSlug("pharmonline", form.pharmonline_url);
   const aptSlug = extractSlug("aptekonline", form.aptekonline_url);
   const aloeSlug = extractSlug("aloe", form.aloe_url);
-  const key = slugify(form.label_ru || form.label_az);
+  // В edit оставляем существующий key (его менять рискованно и обычно не нужно).
+  // В add — генерируем slug из label_ru.
+  const key = isEdit ? editing!.key : slugify(form.label_ru || form.label_az);
 
-  const create = useMutation({
-    mutationFn: () =>
-      api.categoryCreate({
+  const save = useMutation({
+    mutationFn: () => {
+      const payload = {
         key,
         label_ru: form.label_ru,
         label_az: form.label_az || null,
         pharmonline_slug: phmSlug || null,
         aptekonline_slug: aptSlug || null,
         aloe_slug: aloeSlug || null,
-        is_active: true,
-      }),
+        is_active: editing?.is_active ?? true,
+      };
+      return isEdit
+        ? api.categoryUpdate(editing!.id, payload).then(() => payload)
+        : api.categoryCreate(payload);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["categories"] });
       onClose();
@@ -315,13 +359,17 @@ function AddForm({ onClose }: { onClose: () => void }) {
   return (
     <div className="rounded-lg border border-border bg-card p-4 space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold">Новая категория</h3>
+        <h3 className="font-semibold">
+          {isEdit ? `Редактировать категорию #${editing!.id}` : "Новая категория"}
+        </h3>
         <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
           <X className="h-4 w-4" />
         </button>
       </div>
       <p className="text-xs text-muted-foreground">
-        Вставь URL категории с каждого сайта — slug извлечётся автоматически. Можно ввести голый slug, если уже знаешь.
+        {isEdit
+          ? "Можно поправить название или slug на любом сайте. Изменение slug повлияет только на следующий scrape — существующие продукты не удалятся."
+          : "Вставь URL категории с каждого сайта — slug извлечётся автоматически. Можно ввести голый slug, если уже знаешь."}
       </p>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -366,17 +414,18 @@ function AddForm({ onClose }: { onClose: () => void }) {
 
       {key && (
         <div className="text-xs text-muted-foreground">
-          Key (автоматически): <span className="font-mono">{key}</span>
+          Key {isEdit ? "(read-only при редактировании)" : "(автоматически)"}:{" "}
+          <span className="font-mono">{key}</span>
         </div>
       )}
 
       <div className="flex gap-2 pt-2">
         <button
-          onClick={() => create.mutate()}
-          disabled={!canSubmit || create.isPending}
+          onClick={() => save.mutate()}
+          disabled={!canSubmit || save.isPending}
           className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
         >
-          {create.isPending ? "Сохраняем…" : "Сохранить"}
+          {save.isPending ? "Сохраняем…" : isEdit ? "Применить" : "Сохранить"}
         </button>
         <button onClick={onClose} className="text-sm text-muted-foreground hover:text-foreground">
           Отмена
