@@ -162,6 +162,21 @@ function RunBreakdownPanel({
     products_per_site_category: Record<string, Record<string, number>>;
   };
 }) {
+  // Load categories один раз — нужно для маппинга slug → label_ru.
+  // Slug на каждом сайте свой (pharm: 'vitamin-ve-mineral-kompleks',
+  // apt: '78', aloe: 'uşaq-qidası'), поэтому строим lookup-table per site.
+  const catsQ = useQuery({ queryKey: ["categories"], queryFn: api.categories });
+  const labelLookup = (site: string, slugOrId: string): string | null => {
+    const cats = catsQ.data ?? [];
+    const match = cats.find((c) => {
+      if (site === "pharmonline") return c.pharmonline_slug === slugOrId;
+      if (site === "aptekonline") return c.aptekonline_slug === slugOrId;
+      if (site === "aloe") return c.aloe_slug === slugOrId;
+      return false;
+    });
+    return match?.label_ru ?? null;
+  };
+
   const sites = Object.keys(data.products_per_site_category).sort();
   if (sites.length === 0) {
     return (
@@ -196,18 +211,34 @@ function RunBreakdownPanel({
           return (
             <div key={site} className="rounded-md border border-border bg-card p-3">
               <div className="font-medium text-sm mb-2">{site}</div>
-              <div className="space-y-1">
-                {sorted.map(([cat, count]) => (
-                  <div
-                    key={cat}
-                    className="flex items-center justify-between text-xs"
-                  >
-                    <span className="truncate text-muted-foreground mr-2" title={cat}>
-                      {cat}
-                    </span>
-                    <span className="font-mono tabular-nums">{count}</span>
-                  </div>
-                ))}
+              <div className="space-y-1.5">
+                {sorted.map(([cat, count]) => {
+                  const label = labelLookup(site, cat);
+                  return (
+                    <div
+                      key={cat}
+                      className="flex items-start justify-between gap-2 text-xs"
+                    >
+                      <div className="min-w-0 flex-1">
+                        {label ? (
+                          <>
+                            <div className="truncate font-medium" title={label}>
+                              {label}
+                            </div>
+                            <div className="truncate text-muted-foreground/70 font-mono text-[10px]">
+                              {cat}
+                            </div>
+                          </>
+                        ) : (
+                          <div className="truncate text-muted-foreground" title={cat}>
+                            {cat}
+                          </div>
+                        )}
+                      </div>
+                      <span className="font-mono tabular-nums shrink-0">{count}</span>
+                    </div>
+                  );
+                })}
                 {sorted.length === 0 && (
                   <div className="text-xs text-muted-foreground">
                     Нет данных
