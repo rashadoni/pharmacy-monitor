@@ -84,9 +84,12 @@ export default function CategoriesPage() {
     return true;
   });
 
+  // Категория «cross-2» — у неё есть pharm+apt-slug'и (двусторонний кейс).
+  // «cross-3» — pharm+apt+aloe (полный треугольник, редко).
   const stats = {
     total: data?.length ?? 0,
     active: data?.filter((c) => c.is_active).length ?? 0,
+    cross2: data?.filter((c) => c.pharmonline_slug && c.aptekonline_slug).length ?? 0,
     cross3: data?.filter((c) => c.pharmonline_slug && c.aptekonline_slug && c.aloe_slug).length ?? 0,
     pharmonline: data?.filter((c) => c.pharmonline_slug).length ?? 0,
     aptekonline: data?.filter((c) => c.aptekonline_slug).length ?? 0,
@@ -120,9 +123,10 @@ export default function CategoriesPage() {
       )}
 
       {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-7 gap-3">
         <Stat label="Всего" value={stats.total} />
         <Stat label="Active" value={stats.active} />
+        <Stat label="Cross-2" value={stats.cross2} highlight />
         <Stat label="Cross-3" value={stats.cross3} highlight />
         <Stat label="pharmonline" value={stats.pharmonline} />
         <Stat label="aptekonline" value={stats.aptekonline} />
