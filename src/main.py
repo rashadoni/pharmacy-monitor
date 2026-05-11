@@ -1318,9 +1318,18 @@ def seed_demo_cmd(force: bool) -> None:
     "--no-alerts", is_flag=True,
     help="Пропустить evaluation алертов после прогона (по умолчанию запускается)",
 )
+@click.option(
+    "--request-id",
+    type=int,
+    default=None,
+    help="ID строки в scrape_requests. Если задан — после persist (но ДО matcher) "
+         "немедленно проставляем status='ok' + run_id, чтобы UI показал «Готово — N "
+         "товаров» не дожидаясь медленных matcher/analyzer фаз.",
+)
 def run_cmd(
     dry_run: bool, limit: int | None, site: tuple[str, ...], mode: str,
     category_id: int | None, hourly: bool, no_alerts: bool,
+    request_id: int | None,
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
     storage.init_db()
@@ -1381,6 +1390,26 @@ def run_cmd(
             }
             run.sites_completed = ",".join(sites)
             session.commit()
+
+            # === Early-complete для UI-triggered scrape (job queue) ===
+            # Если запущены через `pharmacy-monitor run --request-id N`, помечаем
+            # ScrapeRequest как 'ok' СРАЗУ после persist. Это даёт UI feedback
+            # «Готово — N товаров» в течение секунды после scrape phase, не
+            # заставляя клиента ждать 10-30 мин на matcher через SSH tunnel.
+            # Matcher/analyzer запустятся дальше, но клиент уже видит результат.
+            if request_id is not None:
+                req = session.get(storage.ScrapeRequest, request_id)
+                if req is not None:
+                    req.run_id = run.id
+                    req.status = "ok"
+                    req.completed_at = datetime.utcnow()
+                    session.commit()
+                    log.info(
+                        "scrape_request_marked_ok_early",
+                        request_id=request_id,
+                        run_id=run.id,
+                        products_scraped=count,
+                    )
 
             # === Smoke-test: per-site coverage drop ===
             # Если конкретный сайт собрал <50% от среднего за последние 5 ok-runs —

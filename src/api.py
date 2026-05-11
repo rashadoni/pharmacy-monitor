@@ -693,13 +693,29 @@ def internal_scrape_complete(
     payload: ScrapeCompleteIn,
     db: Session = Depends(get_db),
 ):
-    """Mac watcher вызывает после завершения. status → 'ok' или 'failed'."""
+    """Mac watcher вызывает после завершения. status → 'ok' или 'failed'.
+
+    Идемпотентность: если запрос уже помечен 'ok' (через `pharmacy-monitor run
+    --request-id` сразу после persist phase) — НЕ откатываем обратно в 'failed',
+    даже если pharmacy-monitor позже упал в matcher/analyzer. UI уже показал
+    клиенту «Готово — N товаров», менять статус задним числом некорректно.
+    """
     req = db.scalar(select(storage.ScrapeRequest).where(storage.ScrapeRequest.id == request_id))
     if not req:
         raise HTTPException(404, "Request not found")
+    if req.status == "ok" and payload.error_message:
+        # Уже завершено успешно (early-complete от pharmacy-monitor); ошибка в
+        # post-persist фазе (matcher/analyzer) логируется в error_message но не
+        # меняет статус.
+        req.error_message = (
+            f"{req.error_message or ''} | post-persist: {payload.error_message}"
+        ).strip(" |")
+        db.commit()
+        return {"ok": True, "noop": "already ok"}
     req.status = "failed" if payload.error_message else "ok"
     req.completed_at = datetime.utcnow()
-    req.run_id = payload.run_id
+    if payload.run_id is not None:
+        req.run_id = payload.run_id
     req.error_message = payload.error_message
     db.commit()
     return {"ok": True}

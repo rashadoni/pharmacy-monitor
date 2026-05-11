@@ -112,7 +112,10 @@ sleep 3
 export DATABASE_URL="postgresql+psycopg://pm:${PG_PASS}@localhost:${LOCAL_PG_PORT}/pharmacy_monitor"
 
 # Build CLI args
-ARGS=("run" "--mode" "category" "--no-alerts")
+# --request-id заставит pharmacy-monitor пометить ScrapeRequest как 'ok' сразу
+# после persist phase (через несколько минут), не дожидаясь matcher/analyzer —
+# UI получит «Готово — N товаров» как только scrape физически завершился.
+ARGS=("run" "--mode" "category" "--no-alerts" "--request-id" "$req_id")
 # Sites
 IFS=',' read -ra SITE_ARR <<< "$sites"
 for s in "${SITE_ARR[@]}"; do
