@@ -1,0 +1,25 @@
+[Unit]
+Description=Pharmacy Monitor — Telegram long-polling bot
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=pm
+Group=pm
+WorkingDirectory=/opt/pharmacy-monitor
+EnvironmentFile=/etc/pharmacy-monitor/env
+ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor telegram run-bot --timeout 30
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/pharmacy-monitor/data /opt/pharmacy-monitor/logs
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

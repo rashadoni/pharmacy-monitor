@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily scrape timer for %i
+
+[Timer]
+# Stagger sites: pharmonline 01:00, aptekonline 02:00, aloe 03:00
+# Override per instance via /etc/systemd/system/pharmacy-monitor-scrape@<site>.timer.d/override.conf
+OnCalendar=*-*-* 01:00:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

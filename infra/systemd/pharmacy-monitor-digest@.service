@@ -1,0 +1,22 @@
+[Unit]
+Description=Pharmacy Monitor — %i digest (daily / weekly)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=pm
+Group=pm
+WorkingDirectory=/opt/pharmacy-monitor
+EnvironmentFile=/etc/pharmacy-monitor/env
+ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor notify digest %i
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/pharmacy-monitor/data /opt/pharmacy-monitor/logs
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

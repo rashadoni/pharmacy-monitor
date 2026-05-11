@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Environment / secrets
+.env
+.env.local
+data/.prod-secrets-DO-NOT-COMMIT
+data/*.secrets
+*.pem
+*.key
+
+# Data & logs
+data/*.sqlite
+data/*.sqlite-journal
+data/snapshots/
+logs/*.log
+reports/
+
+# Playwright
+playwright-report/
+test-results/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -1,0 +1,225 @@
+"""Tests для AptekonlineScraper после миграции с Playwright на JSON API.
+
+Проверяем:
+  - _build_product_from_api маппит реальный API-ответ в ScrapedProduct
+    с правильными полями (price/discount/image/dosage/etc).
+  - scrape_category итерирует постранично, мокая HTTP-вызовы фикстурой.
+  - Edge cases: пустой data, отсутствие url_id/name, malformed price.
+
+Никаких сетевых запросов или браузера — все ответы мокаются.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+from src.scrapers.aptekonline import (
+    AptekonlineScraper,
+    _build_product_from_api,
+)
+
+
+def _mock_httpx_client(payload: dict | list[dict] | None = None, status: int = 200):
+    """Контекстный менеджер: подменяет httpx.AsyncClient на mock-транспорт.
+
+    payload может быть:
+      - dict — один и тот же ответ для каждого запроса
+      - list[dict] — последовательность ответов (по 1 на запрос, остаток повторяется)
+      - None — Response(status, b"") без JSON
+    """
+    payloads = payload if isinstance(payload, list) else [payload]
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        idx = min(call_count["n"], len(payloads) - 1)
+        call_count["n"] += 1
+        body = payloads[idx]
+        if body is None:
+            return httpx.Response(status)
+        return httpx.Response(status, json=body)
+
+    transport = httpx.MockTransport(handler)
+    real_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        return real_init(self, *args, **kwargs)
+
+    return patch.object(httpx.AsyncClient, "__init__", patched_init), call_count
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _load_fixture() -> dict:
+    return json.loads(
+        (FIXTURES / "aptekonline_api_response.json").read_text(encoding="utf-8")
+    )
+
+
+# ─── _build_product_from_api ────────────────────────────────────────────────
+
+
+def test_build_product_basic_fields():
+    payload = _load_fixture()
+    item = payload["data"][0]
+    thumb = payload["thumb_folder"]
+
+    product = _build_product_from_api(
+        item, "114", thumb, "https://www.aptekonline.az"
+    )
+
+    assert product is not None
+    assert product.site == "aptekonline"
+    assert product.external_id == item["url_id"]
+    assert product.url == f"https://www.aptekonline.az/product/{item['url_id']}"
+    assert product.name == item["name"]
+    assert product.price == item["price"]
+    assert product.image_url and product.image_url.startswith(thumb)
+    assert product.image_url.endswith(item["thumb1"])
+    assert product.category == "114"
+    assert product.manufacturer == item["olke"]
+    assert product.description == item["terkib"]
+
+
+def test_build_product_no_discount_when_discount_price_is_null():
+    item = {
+        "url_id": "X-1",
+        "name": "Test",
+        "price": 5.28,
+        "discount_price": None,
+        "thumb1": None,
+        "olke": None,
+        "terkib": None,
+        "cashback_percent": None,
+    }
+    product = _build_product_from_api(item, "1", "", "https://x.az")
+    assert product is not None
+    assert product.is_on_sale is False
+    assert product.discount_price is None
+    assert product.discount_percent is None
+
+
+def test_build_product_handles_active_discount():
+    item = {
+        "url_id": "X-2",
+        "name": "Test discounted",
+        "price": 10.0,
+        "discount_price": 7.5,
+        "thumb1": "x.jpg",
+        "olke": "Türkiye",
+        "terkib": "Param",
+        "cashback_percent": None,
+    }
+    product = _build_product_from_api(item, "1", "https://thumb.x/", "https://x.az")
+    assert product is not None
+    assert product.is_on_sale is True
+    assert product.discount_price == 7.5
+    assert product.price == 10.0
+    assert product.discount_percent == 25.0
+
+
+def test_build_product_skips_invalid_discount_price_higher_than_price():
+    """API иногда отдаёт discount_price >= price (мусор) — игнорируем."""
+    item = {
+        "url_id": "X-3", "name": "X", "price": 5.0,
+        "discount_price": 10.0, "thumb1": None, "olke": None,
+        "terkib": None, "cashback_percent": None,
+    }
+    product = _build_product_from_api(item, "1", "", "https://x.az")
+    assert product is not None
+    assert product.is_on_sale is False
+    assert product.discount_price is None
+
+
+def test_build_product_returns_none_without_url_id_or_name():
+    assert _build_product_from_api({"name": "n"}, "1", "", "https://x.az") is None
+    assert _build_product_from_api({"url_id": "u"}, "1", "", "https://x.az") is None
+    assert _build_product_from_api({"url_id": "u", "name": ""}, "1", "", "https://x.az") is None
+
+
+def test_build_product_promo_label_from_cashback_percent():
+    item = {
+        "url_id": "X-4", "name": "X", "price": 10.0,
+        "discount_price": None, "thumb1": None, "olke": None,
+        "terkib": None, "cashback_percent": 5,
+    }
+    product = _build_product_from_api(item, "1", "", "https://x.az")
+    assert product is not None
+    assert product.promo_label == "5% kəşbək"
+
+
+def test_build_product_handles_string_prices():
+    """Иногда API отдаёт цены как строки — должны парситься."""
+    item = {
+        "url_id": "X-5", "name": "X", "price": "10.50",
+        "discount_price": "8.25", "thumb1": None, "olke": None,
+        "terkib": None, "cashback_percent": None,
+    }
+    product = _build_product_from_api(item, "1", "", "https://x.az")
+    assert product is not None
+    assert product.price == 10.50
+    assert product.discount_price == 8.25
+
+
+# ─── scrape_category (httpx подменяется на MockTransport) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_yields_products_from_api():
+    payload = _load_fixture()
+    # last_page=1 в фикстуре чтобы scrape остановился сразу после первой страницы
+    payload["last_page"] = 1
+    payload["next_page_url"] = None
+    patcher, _ = _mock_httpx_client(payload)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+    assert len(products) == len(payload["data"])
+    assert all(p.site == "aptekonline" for p in products)
+    assert all(p.external_id for p in products)
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_skips_non_numeric_slug():
+    """Старые .slug категории (текстовые) не подходят для API — silently skip."""
+    patcher, calls = _mock_httpx_client({"data": [], "last_page": 1, "next_page_url": None})
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("baby-food")]
+    assert products == []
+    assert calls["n"] == 0  # ни одного запроса
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_respects_limit():
+    payload = _load_fixture()
+    payload["last_page"] = 1
+    payload["next_page_url"] = None
+    patcher, _ = _mock_httpx_client(payload)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114", limit=2)]
+    assert len(products) == 2
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_handles_http_error_gracefully():
+    patcher, _ = _mock_httpx_client(None, status=500)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+    assert products == []
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_stops_on_empty_data():
+    patcher, _ = _mock_httpx_client({"data": [], "current_page": 1, "last_page": 1})
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+    assert products == []

@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd config для ежедневного pharmonline-скрейпа с ноута (Baku-IP).
+  Aloe и aptekonline крутятся на проде, см. CLAUDE.md → "Runtime layout".
+
+  Установка (один раз):
+    cp infra/local/com.pharmacy-monitor.scrape.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.pharmacy-monitor.scrape.plist
+
+  Снять:
+    launchctl unload -w ~/Library/LaunchAgents/com.pharmacy-monitor.scrape.plist
+
+  Запустить вручную (минуя расписание):
+    launchctl start com.pharmacy-monitor.scrape
+
+  Проверить статус последнего запуска:
+    launchctl list | grep pharmacy-monitor
+    tail -100 ~/Library/Logs/pharmacy-monitor.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pharmacy-monitor.scrape</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/rashadrahimov/pharmacy-monitor/infra/local/run-scrape.sh</string>
+    </array>
+
+    <!-- 18:00 Asia/Baku ежедневно. macOS launchd использует local-time устройства. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>18</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Если Mac был выключен в 18:00, запустить при следующем wake-up. -->
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StartOnMount</key>
+    <false/>
+
+    <!-- Один экземпляр одновременно. -->
+    <key>AbandonProcessGroup</key>
+    <false/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/rashadrahimov/pharmacy-monitor</string>
+
+    <!-- Environment-переменные для скрипта. PATH должен включать /usr/bin для security/ssh/nc. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/rashadrahimov</string>
+    </dict>
+
+    <!-- Логи дублируются stdout/stderr → файл (script сам тоже лог пишет). -->
+    <key>StandardOutPath</key>
+    <string>/Users/rashadrahimov/Library/Logs/pharmacy-monitor-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/rashadrahimov/Library/Logs/pharmacy-monitor-launchd.log</string>
+</dict>
+</plist>

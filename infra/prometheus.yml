@@ -1,0 +1,34 @@
+# Minimal Prometheus config for Pharmacy Monitor.
+# Place at /etc/prometheus/prometheus.yml on the same VM (or remote scrape).
+#
+# Install Prometheus on Hetzner:
+#   apt install prometheus
+#   cp infra/prometheus.yml /etc/prometheus/prometheus.yml
+#   systemctl restart prometheus
+#
+# Default port 9090. Add to Caddyfile if you want external access (with basic auth).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: pharmacy-monitor
+    env: production
+
+scrape_configs:
+  - job_name: pharmacy-monitor-api
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+
+  # Self-scrape (Prometheus's own metrics)
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+# (Optional) Alertmanager — out of scope for pilot, can be added later
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["127.0.0.1:9093"]

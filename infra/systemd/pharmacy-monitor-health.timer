@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly health check timer
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

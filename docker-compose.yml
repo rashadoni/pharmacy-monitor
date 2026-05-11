@@ -1,0 +1,49 @@
+# Local dev environment for pharmacy-monitor
+#
+# Usage:
+#   docker compose up -d        # start postgres + redis
+#   docker compose logs -f      # tail logs
+#   docker compose down         # stop, keep data
+#   docker compose down -v      # nuke volumes
+#
+# Connection strings (also see .env.example):
+#   DATABASE_URL=postgresql+psycopg://pm:pm@localhost:5432/pharmacy_monitor
+#   REDIS_URL=redis://localhost:6379/0
+
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pm
+      POSTGRES_PASSWORD: pm
+      POSTGRES_DB: pharmacy_monitor
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pm -d pharmacy_monitor"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pg_data:
+  redis_data:

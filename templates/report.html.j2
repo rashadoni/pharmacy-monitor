@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Pharmacy Monitor — {{ run_started_at.strftime('%d.%m.%Y') }}</title>
+</head>
+<body style="margin:0;padding:0;background:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#1d1d1f;">
+<div style="max-width:760px;margin:24px auto;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06);">
+
+<div style="padding:28px 32px;border-bottom:1px solid #f0f0f3;">
+  <div style="font-size:13px;color:#86868b;letter-spacing:.4px;text-transform:uppercase;">Pharmacy Monitor</div>
+  <h1 style="margin:6px 0 0;font-size:24px;font-weight:600;">Отчёт за {{ run_started_at.strftime('%d.%m.%Y') }}</h1>
+  {% if prev_run_at %}
+  <div style="font-size:13px;color:#86868b;margin-top:4px;">Сравнение с прогоном от {{ prev_run_at.strftime('%d.%m.%Y %H:%M') }}</div>
+  {% else %}
+  <div style="font-size:13px;color:#86868b;margin-top:4px;">Первый прогон — данных для сравнения ещё нет</div>
+  {% endif %}
+</div>
+
+{% if summary_counts %}
+<div style="padding:20px 32px;border-bottom:1px solid #f0f0f3;display:flex;gap:18px;flex-wrap:wrap;">
+  {% if summary_counts.undercuts is defined %}
+    <div><div style="font-size:11px;color:#86868b;text-transform:uppercase;letter-spacing:.5px;">Конкурент дешевле</div><div style="font-size:22px;font-weight:600;color:{% if summary_counts.undercuts > 0 %}#d70015{% else %}#1d1d1f{% endif %};">{{ summary_counts.undercuts }}</div></div>
+  {% endif %}
+  {% if summary_counts.price_changes is defined %}
+    <div><div style="font-size:11px;color:#86868b;text-transform:uppercase;letter-spacing:.5px;">Изменений цен</div><div style="font-size:22px;font-weight:600;">{{ summary_counts.price_changes }}</div></div>
+  {% endif %}
+  {% if summary_counts.new_products is defined %}
+    <div><div style="font-size:11px;color:#86868b;text-transform:uppercase;letter-spacing:.5px;">Новых SKU</div><div style="font-size:22px;font-weight:600;">{{ summary_counts.new_products }}</div></div>
+  {% endif %}
+  {% if summary_counts.promo_changes is defined %}
+    <div><div style="font-size:11px;color:#86868b;text-transform:uppercase;letter-spacing:.5px;">Промо</div><div style="font-size:22px;font-weight:600;">{{ summary_counts.promo_changes }}</div></div>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if undercuts %}
+<div style="padding:24px 32px;border-bottom:1px solid #f0f0f3;">
+  <h2 style="margin:0 0 12px;font-size:17px;font-weight:600;">🔴 Конкурент опустил цену ниже клиента</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead><tr style="text-align:left;color:#86868b;border-bottom:1px solid #f0f0f3;">
+      <th style="padding:8px 6px;font-weight:500;">Товар</th>
+      <th style="padding:8px 6px;font-weight:500;">Клиент</th>
+      <th style="padding:8px 6px;font-weight:500;">Конкурент</th>
+      <th style="padding:8px 6px;font-weight:500;text-align:right;">Дельта</th>
+    </tr></thead>
+    <tbody>
+    {% for u in undercuts[:30] %}
+      <tr style="border-bottom:1px solid #f5f5f7;">
+        <td style="padding:8px 6px;"><a href="{{ u.client_url }}" style="color:#0066cc;text-decoration:none;">{{ u.canonical_name }}</a></td>
+        <td style="padding:8px 6px;">{{ "%.2f"|format(u.client_price) }} ₼</td>
+        <td style="padding:8px 6px;"><a href="{{ u.competitor_url }}" style="color:#0066cc;text-decoration:none;">{{ "%.2f"|format(u.competitor_price) }} ₼</a> <span style="color:#86868b;font-size:11px;">{{ u.competitor_site }}</span></td>
+        <td style="padding:8px 6px;text-align:right;color:#d70015;font-weight:600;">−{{ "%.1f"|format(u.diff_pct) }}%</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if undercuts|length > 30 %}<div style="font-size:12px;color:#86868b;margin-top:8px;">+{{ undercuts|length - 30 }} ещё в Excel-вложении</div>{% endif %}
+</div>
+{% endif %}
+
+{% if price_changes %}
+<div style="padding:24px 32px;border-bottom:1px solid #f0f0f3;">
+  <h2 style="margin:0 0 12px;font-size:17px;font-weight:600;">📊 Существенные изменения цен</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead><tr style="text-align:left;color:#86868b;border-bottom:1px solid #f0f0f3;">
+      <th style="padding:8px 6px;font-weight:500;">Сайт</th>
+      <th style="padding:8px 6px;font-weight:500;">Товар</th>
+      <th style="padding:8px 6px;font-weight:500;">Было</th>
+      <th style="padding:8px 6px;font-weight:500;">Стало</th>
+      <th style="padding:8px 6px;font-weight:500;text-align:right;">Δ</th>
+    </tr></thead>
+    <tbody>
+    {% for c in price_changes[:25] %}
+      <tr style="border-bottom:1px solid #f5f5f7;">
+        <td style="padding:8px 6px;color:#86868b;">{{ c.site }}</td>
+        <td style="padding:8px 6px;"><a href="{{ c.url }}" style="color:#0066cc;text-decoration:none;">{{ c.product_name }}</a></td>
+        <td style="padding:8px 6px;color:#86868b;">{{ "%.2f"|format(c.prev_price) }} ₼</td>
+        <td style="padding:8px 6px;">{{ "%.2f"|format(c.curr_price) }} ₼</td>
+        <td style="padding:8px 6px;text-align:right;color:{% if c.delta_pct < 0 %}#34c759{% else %}#d70015{% endif %};font-weight:600;">{{ "%+.1f"|format(c.delta_pct) }}%</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if new_products %}
+<div style="padding:24px 32px;border-bottom:1px solid #f0f0f3;">
+  <h2 style="margin:0 0 12px;font-size:17px;font-weight:600;">🆕 Новые товары на конкурентах</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead><tr style="text-align:left;color:#86868b;border-bottom:1px solid #f0f0f3;">
+      <th style="padding:8px 6px;font-weight:500;">Сайт</th>
+      <th style="padding:8px 6px;font-weight:500;">Товар</th>
+      <th style="padding:8px 6px;font-weight:500;">Категория</th>
+      <th style="padding:8px 6px;font-weight:500;text-align:right;">Цена</th>
+    </tr></thead>
+    <tbody>
+    {% for n in new_products[:25] %}
+      <tr style="border-bottom:1px solid #f5f5f7;">
+        <td style="padding:8px 6px;color:#86868b;">{{ n.site }}</td>
+        <td style="padding:8px 6px;"><a href="{{ n.url }}" style="color:#0066cc;text-decoration:none;">{{ n.name }}</a></td>
+        <td style="padding:8px 6px;color:#86868b;">{{ n.category or '—' }}</td>
+        <td style="padding:8px 6px;text-align:right;">{% if n.price %}{{ "%.2f"|format(n.price) }} ₼{% else %}—{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if promo_changes %}
+<div style="padding:24px 32px;border-bottom:1px solid #f0f0f3;">
+  <h2 style="margin:0 0 12px;font-size:17px;font-weight:600;">🎯 Изменения промо-кампаний</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead><tr style="text-align:left;color:#86868b;border-bottom:1px solid #f0f0f3;">
+      <th style="padding:8px 6px;font-weight:500;">Сайт</th>
+      <th style="padding:8px 6px;font-weight:500;">Промо</th>
+      <th style="padding:8px 6px;font-weight:500;">Статус</th>
+    </tr></thead>
+    <tbody>
+    {% for p in promo_changes[:20] %}
+      <tr style="border-bottom:1px solid #f5f5f7;">
+        <td style="padding:8px 6px;color:#86868b;">{{ p.site }}</td>
+        <td style="padding:8px 6px;">{% if p.landing_url %}<a href="{{ p.landing_url }}" style="color:#0066cc;text-decoration:none;">{{ p.title }}</a>{% else %}{{ p.title }}{% endif %}</td>
+        <td style="padding:8px 6px;">{% if p.is_new %}<span style="color:#34c759;">+ новая</span>{% else %}<span style="color:#86868b;">— завершилась</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<div style="padding:18px 32px;font-size:12px;color:#86868b;background:#fafafc;">
+  Сгенерировано Pharmacy Monitor • Run #{{ run_id }} • {{ run_started_at.strftime('%Y-%m-%d %H:%M:%S') }}<br>
+  Полные данные — в прикреплённом Excel-файле.
+</div>
+
+</div>
+</body>
+</html>

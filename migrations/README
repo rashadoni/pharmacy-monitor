@@ -1,0 +1,14 @@
+Alembic migrations for pharmacy-monitor.
+
+Quick reference:
+  alembic upgrade head                    Apply all migrations
+  alembic revision --autogenerate -m msg  Create new migration from models
+  alembic downgrade -1                    Rollback one
+  alembic history                         Show migration tree
+  alembic current                         Show current DB revision
+
+Migration strategy:
+  - Initial migration (versions/0001_initial.py) captures the entire current
+    schema as exported from src/storage.py models.
+  - For SQLite → PostgreSQL migration, run: scripts/sqlite_to_pg.py AFTER
+    `alembic upgrade head` against the empty Postgres DB.

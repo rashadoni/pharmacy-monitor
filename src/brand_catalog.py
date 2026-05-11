@@ -1,0 +1,309 @@
+"""Каталог известных брендов в категории baby food / детские смеси / молочные продукты.
+
+Используется в `extract_brand()` (normalize.py) и в скрейперах pharmonline/aptekonline,
+которые не могут вытащить brand из вёрстки сайтов (поля просто нет в карточке).
+
+Структура:
+    BRANDS: dict[canonical_name, list[alias_lowercase]]
+
+Каноническое имя — то, что попадёт в БД (`products.brand`). Алиасы — все встреченные
+варианты в реальных названиях (включая кирилличные и азербайджанские транслитерации).
+
+Правило сопоставления: alias matches as a whole word (re.escape + word boundaries).
+"""
+
+from __future__ import annotations
+
+import re
+from functools import lru_cache
+
+BRANDS: dict[str, list[str]] = {
+    # Baby formula (молочные смеси)
+    "Friso":        ["friso", "friso pep", "friso gold"],
+    "Frisolac":     ["frisolac", "frisolak"],
+    "Vinni":        ["vinni", "винни"],
+    "Humana":       ["humana"],
+    "Nanny":        ["nanny", "нэнни"],
+    "Bebevit":      ["bebevit"],
+    "Sahha":        ["sahha"],
+    "Gipopo":       ["gipopo"],
+    "Kogda Ya Vyrastu": ["когда я вырасту", "kогда я вырасту", "kogda ya vyrastu"],
+    "Bibikol":      ["бибиколь", "bibikol"],
+    "Aqusha":       ["aquşa", "aqusha"],
+    "Dlya Lyalya":  ["для ляль", "для ляли", "dlya lyalya"],
+    "Aptamil":      ["aptamil"],
+    "Nutrilon":     ["nutrilon"],
+    "Nutrilak":     ["nutrilak"],
+    "Nutriben":     ["nutriben"],
+    "Malyutka":     ["malyutka", "malutka", "малютка", "malyuk", "maluk"],
+    # Nestle umbrella: NAN, Nestogen, Gerber, Cicibebe — все продуктовые линейки Nestle.
+    # Объединяем чтобы matcher грузил их в один bucket по brand.
+    # Gerber оставляем отдельно (узнаваемый standalone бренд).
+    "Nestle":       ["nestle", "нестле", "nan", "нан", "nestogen", "şaqayka", "shaqayka"],
+    "Kabrita":      ["kabrita", "кабрита"],
+    "Similac":      ["similac", "similak", "симилак"],
+    "Bellakt":      ["bellakt", "беллакт"],
+    "Hipp":         ["hipp", "хипп"],
+    "Mamako":       ["mamako", "мамако"],
+    "Kendamil":     ["kendamil"],
+    "Hero Baby":    ["hero baby"],
+    "PediaSure":    ["pediasure"],
+    "Danalac":      ["danalac"],
+    "Bebi":         ["bebi"],
+    "Heinz":        ["heinz", "хайнц"],
+    "Arilac":       ["arilac"],
+    "Frutonyanya":  ["fruto nyanya", "frutonyanya", "fruto-nyanya", "фруто няня", "фрутоняня"],
+    "Gerber":       ["gerber", "гербер"],
+    "Baby Goat":    ["baby goat"],
+    "Cicibebe":     ["cicibebe", "eti cicibebe"],
+    "Agusha":       ["agusha", "агуша"],
+    "HAH":          ["hah"],
+    "Kent Boringer": ["kent boringer"],
+    # ─── Pharma — top производители на az рынке ───────────────────────────
+    "Bayer":         ["bayer"],
+    "Sandoz":        ["sandoz"],
+    "Sanofi":        ["sanofi"],
+    "Berlin Chemie": ["berlin chemie", "berlin-chemie"],
+    "Darnitsa":      ["darnitsa", "дарница"],
+    "GSK":           ["gsk", "glaxosmithkline", "glaxo"],
+    "Pfizer":        ["pfizer"],
+    "Roche":         ["roche"],
+    "Novartis":      ["novartis"],
+    "Egis":          ["egis"],
+    "Krka":          ["krka"],
+    "Servier":       ["servier"],
+    "Boehringer":    ["boehringer", "boehringer ingelheim"],
+    "Teva":          ["teva"],
+    "Stada":         ["stada"],
+    "Reckitt":       ["reckitt", "reckitt benckiser"],
+    "Bionorica":     ["bionorica"],
+    "Gedeon Richter": ["gedeon richter", "richter", "gedeon"],
+    "Torrent":       ["torrent"],
+    "Cipla":         ["cipla"],
+    "Sun Pharma":    ["sun pharma", "sun-pharma"],
+    "Lupin":         ["lupin"],
+    "Abbott":        ["abbott"],
+    "Mylan":         ["mylan"],
+    "Mepha":         ["mepha"],
+    "Polpharma":     ["polpharma"],
+    "Adamed":        ["adamed"],
+    "Apotex":        ["apotex"],
+    "Dr.Reddy's":    ["dr.reddy", "dr reddy", "dr.reddy's", "dr reddys"],
+    "Adipharm":      ["adipharm"],
+    "Ferrer":        ["ferrer"],
+    "Aurobindo":     ["aurobindo"],
+    "Hetero":        ["hetero"],
+    "Galena":        ["galena"],
+    # ─── Витамины / БАДы ─────────────────────────────────────────────────
+    "Solgar":        ["solgar"],
+    "Now Foods":     ["now foods", "now"],
+    "NaturesPlus":   ["naturesplus", "nature's plus", "natures plus"],
+    "Doppelherz":    ["doppelherz"],
+    "Centrum":       ["centrum"],
+    "Supradyn":      ["supradyn"],
+    "Berocca":       ["berocca"],
+    "Vitrum":        ["vitrum"],
+    "Multi-Tabs":    ["multi-tabs", "multi tabs", "multitabs"],
+    "Nordic Naturals": ["nordic naturals"],
+    "Garden of Life": ["garden of life"],
+    "Jamieson":      ["jamieson"],
+    "Webber Naturals": ["webber naturals"],
+    "Swanson":       ["swanson"],
+    "Country Life":  ["country life"],
+    # ─── Косметика / гигиена / уход ──────────────────────────────────────
+    "Nivea":         ["nivea"],
+    "L'Oreal":       ["l'oreal", "loreal", "l oreal"],
+    "Garnier":       ["garnier"],
+    "Vichy":         ["vichy"],
+    "La Roche-Posay": ["la roche-posay", "la roche posay", "laroche-posay"],
+    "Bioderma":      ["bioderma"],
+    "Avene":         ["avene", "avène"],
+    "Eucerin":       ["eucerin"],
+    "CeraVe":        ["cerave"],
+    "Neutrogena":    ["neutrogena"],
+    "Olay":          ["olay"],
+    "Dove":          ["dove"],
+    "Pantene":       ["pantene"],
+    "Head & Shoulders": ["head & shoulders", "head and shoulders"],
+    "Schwarzkopf":   ["schwarzkopf"],
+    "Wella":         ["wella"],
+    # ─── Детская гигиена ─────────────────────────────────────────────────
+    "Pampers":       ["pampers"],
+    "Huggies":       ["huggies"],
+    "Libero":        ["libero"],
+    "Bella Baby":    ["bella baby"],
+    "Naty":          ["naty"],
+    "Chicco":        ["chicco"],
+    "Avent":         ["avent", "philips avent"],
+    "Tommee Tippee": ["tommee tippee"],
+    # ─── Турецкие фарма-производители (популярны в AZ) ───────────────────
+    "Abdi İbrahim":  ["abdi ibrahim", "abdi i̇brahim", "abdi ibrahım", "abdi"],
+    "Bilim":         ["bilim", "bilim pharma", "bilim ilac"],
+    "Sanovel":       ["sanovel"],
+    "Atabay":        ["atabay"],
+    "Drogsan":       ["drogsan"],
+    "Mustafa Nevzat": ["mustafa nevzat", "nevzat"],
+    "Eczacıbaşı":    ["eczacıbaşı", "eczacibasi", "eczaci"],
+    "Deva":          ["deva holding", "deva"],
+    "Nobel İlaç":    ["nobel ilac", "nobel ilaç"],
+    "Recordati":     ["recordati"],
+    "Generica":      ["generica"],
+    # ─── Российские/локальные фарма ───────────────────────────────────────
+    "Биосинтез":     ["биосинтез", "biosintez"],
+    "Вертекс":       ["вертекс", "vertex"],
+    "Озон":          ["озон", "ozon"],
+    "Канонфарма":    ["канонфарма", "kanonfarma"],
+    "Фармстандарт":  ["фармстандарт", "farmstandart"],
+    "Валента":       ["валента", "valenta"],
+    "Эвалар":        ["эвалар", "evalar"],
+    "Биокад":        ["биокад", "biocad"],
+    "Polens":        ["polens"],
+    # ─── OTC и популярные препараты как отдельные «бренды» ───────────────
+    "Kreon":         ["kreon"],
+    "Espumisan":     ["espumisan"],
+    "Mezym":         ["mezym", "mezim"],
+    "No-Spa":        ["no-spa", "no spa", "nospa"],
+    "Nurofen":       ["nurofen"],
+    "Cardiomagnyl":  ["cardiomagnyl", "кардиомагнил"],
+    "Magne B6":      ["magne b6", "magne-b6"],
+    "Calcium D3":    ["calcium d3", "calcium-d3", "kalsium d3"],
+    "Linex":         ["linex"],
+    "Smecta":        ["smecta", "smekta"],
+    "Lazolvan":      ["lazolvan"],
+    "Theraflu":      ["theraflu"],
+    "Faringosept":   ["faringosept"],
+    "Strepsils":     ["strepsils"],
+    "Lugol":         ["lugol"],
+    "Otipax":        ["otipax"],
+    "Sumamed":       ["sumamed", "sumamed forte"],
+    "Augmentin":     ["augmentin"],
+    "Amoxil":        ["amoxil"],
+    "Ciprofloxacin": ["ciprofloxacin", "siprofloxasin"],
+    "Voltaren":      ["voltaren"],
+    "Diclofenac":    ["diclofenac", "diklofenak"],
+    "Ibuprofen":     ["ibuprofen"],
+    "Aspirin":       ["aspirin"],
+    "Panadol":       ["panadol"],
+    "Coldrex":       ["coldrex"],
+    "Fervex":        ["fervex"],
+    # ─── БАДы / спорт / витамины (популярны в AZ) ────────────────────────
+    "Vplab":         ["vplab", "vp lab"],
+    "Maxler":        ["maxler"],
+    "Optimum Nutrition": ["optimum nutrition", "on"],
+    "Vitabiotics":   ["vitabiotics"],
+    "BioGaia":       ["biogaia"],
+    # ─── Местные AZ (на всякий случай) ───────────────────────────────────
+    "Akva-Norm":     ["akva-norm", "akva norm", "aqva-norm"],
+    "Tibmedical":    ["tibmedical"],
+}
+
+
+# Сетка от пропусков: если строка содержит ALL-CAPS Latin word длиной 4+
+# и он не часть category-префикса — это вероятно бренд (например INDIVID, KINOJEL).
+# Используется как fallback в extract_brand если catalog не нашёл совпадение.
+_ALLCAPS_RE = re.compile(r"\b([A-Z][A-Z0-9\-]{3,})\b")
+_BLOCKLIST_ALLCAPS = {
+    "GOLD", "PRO", "PRE", "AC", "HA", "AR", "FORTE", "NEW", "BIO", "ECO",
+    "OPT", "OPTI", "PLUS", "MAX", "MIN", "PREMIUM", "EXPERT", "COMFORT",
+    "ULTRA", "CLASSIC", "ORIGINAL", "SUPER", "MEGA", "EXTRA", "TOTAL",
+    "BL", "PEP", "VOM", "HD", "UV", "ML", "MG", "AZN", "USD",
+}
+
+# First-word fallback (для pharma названий типа `Çetirizin №10`, `Fomaksi 30`)
+# Берём первое значимое слово как brand если catalog не нашёл и оно не в blocklist.
+_FIRST_WORD_RE = re.compile(r"^([A-ZÇŞĞÖÜİƏ][a-zçşğöüıəA-ZÇŞĞÖÜİƏ\-]{3,})\b")
+_BLOCKLIST_FIRST_WORD = {
+    # Префиксы baby food (хоть и в strip, может остаться при разных написаниях)
+    "uşaq", "uşağ", "usaq", "usaqlar", "usaq",
+    "südlü", "südsüz", "sudlu", "sudsuz",
+    "peçenye", "pecenye", "südlüsiyiq",
+    # Generic vitamin / drug forms
+    "vitamin", "vitamins", "vitamini", "kompleks",
+    "tablet", "tabletka", "tableti", "tabletlər", "tabletkalar",
+    "kapsul", "kapsulalar", "kapsulları",
+    "ampul", "ampullar", "ampulalar",
+    "şərbət", "serbet", "məhlul", "mehlul",
+    "krem", "məlhəm", "melhem", "gel", "geli",
+    "sirop", "drops", "damla", "damlar",
+    "spray", "sprey", "sprayi",
+    # Описательные слова
+    "premium", "forte", "extra", "plus", "active", "max", "ultra",
+    "natural", "original", "classic", "gold", "silver",
+    "düyü", "duyu", "süd", "sud", "məhsul", "mehsul",
+    "tibbi", "vasitə", "vasitesi", "vasiteler",
+    # Bottle / packaging
+    "bottle", "şüşe", "buterılka",
+}
+
+
+def _first_word_brand(name: str) -> str | None:
+    """Берём первое слово как brand если оно длиннее 3 символов и не в blocklist."""
+    if not name:
+        return None
+    s = name.strip()
+    # Удалить leading non-alpha
+    s = re.sub(r"^[\"'«»\(\[]+", "", s)
+    m = _FIRST_WORD_RE.match(s)
+    if not m:
+        return None
+    word = m.group(1)
+    if word.lower() in _BLOCKLIST_FIRST_WORD:
+        return None
+    # Не возвращать просто numeric/short
+    if len(word) < 4:
+        return None
+    return word.title()  # Çetirizin, Fomaksi
+
+
+@lru_cache(maxsize=1)
+def _compiled_patterns() -> list[tuple[str, re.Pattern[str]]]:
+    """Скомпилировать regex для каждого алиаса. Сортируем алиасы по длине desc,
+    чтобы 'friso pep' матчился раньше 'friso' (избежать ложных срабатываний)."""
+    patterns: list[tuple[str, re.Pattern[str]]] = []
+    aliases = []
+    for canonical, alist in BRANDS.items():
+        for alias in alist:
+            aliases.append((alias, canonical))
+    aliases.sort(key=lambda x: len(x[0]), reverse=True)
+    for alias, canonical in aliases:
+        # \b не работает с кириллицей в Python без re.UNICODE, используем lookarounds
+        pat = re.compile(
+            r"(?<![\w])" + re.escape(alias) + r"(?![\w])",
+            re.IGNORECASE | re.UNICODE,
+        )
+        patterns.append((canonical, pat))
+    return patterns
+
+
+def extract_brand(name: str | None) -> str | None:
+    """Найти бренд в названии товара.
+
+    Возвращает каноническое имя бренда (как в BRANDS keys) или None.
+    Если совпало несколько — берём первый по позиции в строке (самый ранний).
+
+    Fallback: если catalog не нашёл, ищем ALL-CAPS Latin слово (вероятно бренд).
+    Это спасает от пропусков для редких брендов на категориях лекарств.
+    """
+    if not name:
+        return None
+    text = name.lower()
+    best_canonical: str | None = None
+    best_pos = len(text) + 1
+    for canonical, pat in _compiled_patterns():
+        m = pat.search(text)
+        if m and m.start() < best_pos:
+            best_pos = m.start()
+            best_canonical = canonical
+    if best_canonical:
+        return best_canonical
+    # Fallback 1: ALL-CAPS слово как бренд (если не в blocklist)
+    for m in _ALLCAPS_RE.finditer(name):
+        word = m.group(1)
+        if word in _BLOCKLIST_ALLCAPS:
+            continue
+        return word.title()  # KINOJEL → Kinojel
+    # Fallback 2: первое слово (для pharma имён типа `Çetirizin №10`)
+    fw = _first_word_brand(name)
+    if fw:
+        return fw
+    return None

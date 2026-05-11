@@ -1,0 +1,22 @@
+[Unit]
+Description=Pharmacy Monitor — daily Postgres backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=pm
+Group=pm
+WorkingDirectory=/opt/pharmacy-monitor
+EnvironmentFile=/etc/pharmacy-monitor/env
+ExecStart=/opt/pharmacy-monitor/infra/scripts/backup.sh
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/pharmacy-monitor
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

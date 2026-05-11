@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly digest Mondays at 08:30
+
+[Timer]
+OnCalendar=Mon *-*-* 08:30:00
+RandomizedDelaySec=60
+Persistent=true
+Unit=pharmacy-monitor-digest@weekly.service
+
+[Install]
+WantedBy=timers.target

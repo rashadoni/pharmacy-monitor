@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily digest at 08:00 local time
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+RandomizedDelaySec=60
+Persistent=true
+Unit=pharmacy-monitor-digest@daily.service
+
+[Install]
+WantedBy=timers.target

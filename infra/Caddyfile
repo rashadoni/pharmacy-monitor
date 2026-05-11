@@ -1,0 +1,54 @@
+# Caddy reverse proxy for pharmacy-monitor.
+#
+# Auto-SSL via Let's Encrypt. DNS A record for leaddrive.cloud + www
+# points to the Hetzner host.
+#
+# Install on Hetzner:
+#   apt install caddy
+#   cp infra/Caddyfile /etc/caddy/Caddyfile
+#   systemctl reload caddy
+
+{
+    # Global options
+    email rashadrahimov@gmail.com  # for Let's Encrypt
+    admin off                      # disable Caddy admin API on public iface
+}
+
+# === Production frontend (Next.js on :3000) + API (FastAPI on :8080) ===
+leaddrive.cloud, www.leaddrive.cloud {
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+        # Remove server fingerprinting
+        -Server
+    }
+
+    # API → FastAPI on 8080
+    @api path /api/* /docs /openapi.json /auth/*
+    handle @api {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    # Everything else → Next.js on 3000
+    handle {
+        reverse_proxy 127.0.0.1:3000
+    }
+
+    # Logs (rotate via systemd-journald)
+    log {
+        output stderr
+        format console
+        level INFO
+    }
+}
+
+# === Optional: Streamlit pilot dashboard during transition (Month 1-2) ===
+# Remove this block once Next.js is live.
+# pilot.DOMAIN.example.com {
+#     reverse_proxy 127.0.0.1:8501
+#     header X-Frame-Options DENY
+# }

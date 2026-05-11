@@ -1,0 +1,2144 @@
+[
+  {
+    "site": "pharmonline",
+    "slug": "tibbi-vasiteler",
+    "name": "Tibbi vasitələr",
+    "source_url": "/products?category=tibbi-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "burun-boghaz-qulaq-xestelikleri",
+    "name": "Burun, boğaz, qulaq xəstəlikləri",
+    "source_url": "/products?category=burun-boghaz-qulaq-xestelikleri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "immunitet-stimule-eden-vasiteler",
+    "name": "İmmunitet stimulə edən vasitələr",
+    "source_url": "/products?category=immunitet-stimule-eden-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "metabolizm-pozghunlughu-zamani",
+    "name": "Metabolizm pozğunluğu zamanı",
+    "source_url": "/products?category=metabolizm-pozghunlughu-zamani"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "sinir-sistemi-xestelikeri",
+    "name": "Sinir sistemi xəstəlikəri",
+    "source_url": "/products?category=sinir-sistemi-xestelikeri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "sumuk-ezele-sistemin-xestelikleri",
+    "name": "Sümük-əzələ sistemin xəstəlikləri",
+    "source_url": "/products?category=sumuk-ezele-sistemin-xestelikleri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "virus-infeksiyalar-zamani",
+    "name": "Virus infeksiyalar zamanı",
+    "source_url": "/products?category=virus-infeksiyalar-zamani"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "vitamin-ve-mineral-kompleks",
+    "name": "Vitamin və mineral kompleks",
+    "source_url": "/products?category=vitamin-ve-mineral-kompleks"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "endokrinoloji-xestelikleri",
+    "name": "Endokrinoloji xəstəlikləri",
+    "source_url": "/products?category=endokrinoloji-xestelikleri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "goz-xestelikleri-uchun-vasiteler",
+    "name": "Göz xəstəlikləri üçün vasitələr",
+    "source_url": "/products?category=goz-xestelikleri-uchun-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "gobelek-infeksiya-zamani",
+    "name": "Göbələk infeksiya zamanı",
+    "source_url": "/products?category=gobelek-infeksiya-zamani"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "tibbi-avadanliq",
+    "name": "Tibbi avadanlıq",
+    "source_url": "/products?category=tibbi-avadanliq"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "deriye-qulluq-vasiteler",
+    "name": "Dəriyə qulluq vasitələr",
+    "source_url": "/products?category=deriye-qulluq-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "sacha-qulluq-mehsullari",
+    "name": "Saça qulluq məhsulları",
+    "source_url": "/products?category=sacha-qulluq-mehsullari"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "intim-vasiteler",
+    "name": "İntim vasitələr",
+    "source_url": "/products?category=intim-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "tebii-vasiteler",
+    "name": "Təbii vasitələr",
+    "source_url": "/products?category=tebii-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "ushaqlar-uchun-vasiteler",
+    "name": "Uşaqlar üçün vasitələr",
+    "source_url": "/products?category=ushaqlar-uchun-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "gigiyenik-vasiteler",
+    "name": "Gigiyenik vasitələr",
+    "source_url": "/products?category=gigiyenik-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "aghiz-boshlughunun-qullughu",
+    "name": "Ağız boşluğunun qulluğu",
+    "source_url": "/products?category=aghiz-boshlughunun-qullughu"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "qrip-zamani-istifade-olunan-vasiteler",
+    "name": "Qrip zamanı istifadə olunan vasitələr",
+    "source_url": "/products?category=qrip-zamani-istifade-olunan-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "aghrikesiciler-ve-iltihabeleyhine-vasiteler",
+    "name": "Ağrıkəsicilər və İltihabəleyhinə vasitələr",
+    "source_url": "/products?category=aghrikesiciler-ve-iltihabeleyhine-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "antiparazitar-vasiteler",
+    "name": "Antiparazitar vasitələr",
+    "source_url": "/products?category=antiparazitar-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "cerrahiye",
+    "name": "Cərrahiyə",
+    "source_url": "/products?category=cerrahiye"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "deri-xestelikleri",
+    "name": "Dəri xəstəlikləri",
+    "source_url": "/products?category=deri-xestelikleri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "hamilelik-ve-laktasiya-dovru",
+    "name": "Hamiləlik və laktasiya dövrü",
+    "source_url": "/products?category=hamilelik-ve-laktasiya-dovru"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "homeopatik-vasiteler",
+    "name": "Homeopatik vasitələr",
+    "source_url": "/products?category=homeopatik-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "hezm-sistemin-xestelikleri",
+    "name": "Həzm sistemin xəstəlikləri",
+    "source_url": "/products?category=hezm-sistemin-xestelikleri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "miorelaksantlar-ve-spazmolitikler",
+    "name": "Miorelaksantlar və Spazmolitiklər",
+    "source_url": "/products?category=miorelaksantlar-ve-spazmolitikler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "anemiya-eleyhine-vasiteler",
+    "name": "Anemiya əleyhinə vasitələr",
+    "source_url": "/products?category=anemiya-eleyhine-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "antiallergik-vasiteler",
+    "name": "Antiallergik vasitələr",
+    "source_url": "/products?category=antiallergik-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "sidik-ifrazat-sistemin-xestelikleri",
+    "name": "Sidik ifrazat sistemin xəstəlikləri",
+    "source_url": "/products?category=sidik-ifrazat-sistemin-xestelikleri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "teneffus-sistemin-xestelikleri",
+    "name": "Tənəffüs sistemin xəstəlikləri",
+    "source_url": "/products?category=teneffus-sistemin-xestelikleri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "urek-damar-sistemin-xestelikleri",
+    "name": "Ürək-damar sistemin xəstəlikləri",
+    "source_url": "/products?category=urek-damar-sistemin-xestelikleri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "onkoloji-xestelikler",
+    "name": "Onkoloji xəstəliklər",
+    "source_url": "/products?category=onkoloji-xestelikler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "qadin-saghlamlighi",
+    "name": "Qadın Sağlamlığı",
+    "source_url": "/products?category=qadin-saghlamlighi"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "antiseptik-ve-dezinfeksiya-vasiteleri",
+    "name": "Antiseptik və dezinfeksiya vasitələri",
+    "source_url": "/products?category=antiseptik-ve-dezinfeksiya-vasiteleri"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "varikoz-ve-babasil-uchun-vasiteler",
+    "name": "Varikoz və babasil üçün vasitələr",
+    "source_url": "/products?category=varikoz-ve-babasil-uchun-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "bakterial-infeksiyalar-zamani",
+    "name": "Bakterial infeksiyalar zamanı",
+    "source_url": "/products?category=bakterial-infeksiyalar-zamani"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "shampunlar",
+    "name": "Şampunlar",
+    "source_url": "/products?category=shampunlar"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "sach-uchun-diger-vasiteler",
+    "name": "Saç üçün digər vasitələr",
+    "source_url": "/products?category=sach-uchun-diger-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "ushaq-qidasi",
+    "name": "Uşaq qidası",
+    "source_url": "/products?category=ushaq-qidasi"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "diger-gigiyenik-vasiteler",
+    "name": "Digər gigiyenik vasitələr",
+    "source_url": "/products?category=diger-gigiyenik-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "uz-derisine-qulluq",
+    "name": "Üz dərisinə qulluq",
+    "source_url": "/products?category=uz-derisine-qulluq"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "quru-goz-sindromu-zamani-oftalmoprotektorlar",
+    "name": "Quru göz sindromu zamanı, Oftalmoprotektorlar",
+    "source_url": "/products?category=quru-goz-sindromu-zamani-oftalmoprotektorlar"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "beyin-qan-dovrani-uchun-vasiteler",
+    "name": "Beyin qan dövranı üçün vasitələr",
+    "source_url": "/products?category=beyin-qan-dovrani-uchun-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "antihipertenziv-dermanlar",
+    "name": "Antihipertenziv dərmanlar",
+    "source_url": "/products?category=antihipertenziv-dermanlar"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "shamlar-2",
+    "name": "Şamlar",
+    "source_url": "/products?category=shamlar-2"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "oskurek-zamani-istifade-olunan-vasiteler",
+    "name": "Öskürək zamanı istifadə olunan vasitələr",
+    "source_url": "/products?category=oskurek-zamani-istifade-olunan-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "inyeksiyalar-8",
+    "name": "İnyeksiyalar",
+    "source_url": "/products?category=inyeksiyalar-8"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "hezm-uchun-ve-kop-eleyhine-vasiteler",
+    "name": "Həzm üçün və köp əleyhinə vasitələr",
+    "source_url": "/products?category=hezm-uchun-ve-kop-eleyhine-vasiteler"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "dish-mecunlar",
+    "name": "Diş məcunlar",
+    "source_url": "/products?category=dish-mecunlar"
+  },
+  {
+    "site": "pharmonline",
+    "slug": "aghiz-boshlughu-uchun-mehlullar",
+    "name": "Ağız boşluğu üçün məhlullar",
+    "source_url": "/products?category=aghiz-boshlughu-uchun-mehlullar"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "114",
+    "name": "Bakterial xəstəliklər əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/114"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "55",
+    "name": "Cinsi yolla keçən infeksiyaların müalicə və profilaktikası üçün vasitələr",
+    "source_url": "https://www.aptekonline.az/products/55"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "340",
+    "name": "Protozoy infeksiyası əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/340"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "106",
+    "name": "Qoturluq və pedikulyoz zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/106"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "113",
+    "name": "Qurd xəstəliklərində istifadə olunan (antihelmint) vasitələr",
+    "source_url": "https://www.aptekonline.az/products/113"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "116",
+    "name": "Göbələk əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/116"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "117",
+    "name": "Virus infeksiyası əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/117"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "121",
+    "name": "Şiş xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/121"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "23",
+    "name": "Sinir oyanıqlığında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/23"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "348",
+    "name": "Nikotin asılılığı zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/348"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "247",
+    "name": "Xroniki yorğunluq sindromu və asteniya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/247"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "266",
+    "name": "Nevralgiyalarda istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/266"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "22",
+    "name": "Yuxu pozğunluğu zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/22"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "24",
+    "name": "Depressiya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/24"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "30",
+    "name": "Neyrosirkulyator distoniya  (NSD)",
+    "source_url": "https://www.aptekonline.az/products/30"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "186",
+    "name": "Epilepsiyada istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/186"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "187",
+    "name": "Şizofreniya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/187"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "188",
+    "name": "Parkinson xəstəliyində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/188"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "216",
+    "name": "Alkohol asılılığı zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/216"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "430",
+    "name": "Miqren",
+    "source_url": "https://www.aptekonline.az/products/430"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "431",
+    "name": "Neyropatiya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/431"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "433",
+    "name": "Beyin fəaliyyətini və yaddaşı möhkəmləndirən vasitələr",
+    "source_url": "https://www.aptekonline.az/products/433"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "434",
+    "name": "Aktiv fiziki və zehni inkişaf zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/434"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "330",
+    "name": "Ezofagit zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/330"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "183",
+    "name": "Mədə və 12 barmaq bağırsaq xorasında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/183"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "20",
+    "name": "Qastrit zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/20"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "35",
+    "name": "Köp əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/35"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "36",
+    "name": "Disbakterioz zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/36"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "242",
+    "name": "Digər həzm pozğunluqları zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/242"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "18",
+    "name": "Qaraciyər xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/18"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "19",
+    "name": "Öd xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/19"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "37",
+    "name": "Ferment çatışmamazlığı zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/37"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "38",
+    "name": "İshalda istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/38"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "39",
+    "name": "Qəbizlik zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/39"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "41",
+    "name": "Babasil (hemorroy) zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/41"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "43",
+    "name": "Mədəaltı vəzin xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/43"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "414",
+    "name": "Antibiotiklə birgə istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/414"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "184",
+    "name": "Kolit zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/184"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "250",
+    "name": "Ürəkbulanma və qusma zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/250"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "251",
+    "name": "Ağız boşluğu xəstəlikləri zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/251"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "423",
+    "name": "Qıcıqlanmış bağırsaq sindromu zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/423"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "435",
+    "name": "Bağırsağın hazırlanması üçün vasitələr",
+    "source_url": "https://www.aptekonline.az/products/435"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "397",
+    "name": "Sidik-cinsiyyət sistemi xəstəliklərinin profilaktikası zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/397"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "45",
+    "name": "Böyrək və sidik  yollarının  iltihabında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/45"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "46",
+    "name": "Böyrək daşı xəstəliyində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/46"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "261",
+    "name": "Sidik ifrazatı xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/261"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "47",
+    "name": "Prostat vəzin adenomasında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/47"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "191",
+    "name": "Prostatit zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/191"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "350",
+    "name": "Kişi sonsuzluğunda istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/350"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "196",
+    "name": "Mastopatiya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/196"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "48",
+    "name": "Potensiya zəifliyi zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/48"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "54",
+    "name": "Klimaks və menopauzada istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/54"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "56",
+    "name": "Menstruasiya pozğunluqları zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/56"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "143",
+    "name": "Böyrək çatmamazlığı zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/143"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "195",
+    "name": "Qadın çanaq orqanlarının iltihabı xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/195"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "307",
+    "name": "Qadın sonsuzluğunda istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/307"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "197",
+    "name": "Doğuş fəaliyyətinin pozğunluğu",
+    "source_url": "https://www.aptekonline.az/products/197"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "239",
+    "name": "Dölün hipoksiyası zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/239"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "61",
+    "name": "Hamiləlikdən qorunma vasitələri (kontraseptivlər)",
+    "source_url": "https://www.aptekonline.az/products/61"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "63",
+    "name": "Uşaqlığın hipertonusu zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/63"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "68",
+    "name": "Hamiləliyi və ovulyasiya vaxtini təyin etmək üçün testlər",
+    "source_url": "https://www.aptekonline.az/products/68"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "198",
+    "name": "Hamiləlik toksikozu zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/198"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "258",
+    "name": "Həlledicilər",
+    "source_url": "https://www.aptekonline.az/products/258"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "259",
+    "name": "Köməkçi maddələr",
+    "source_url": "https://www.aptekonline.az/products/259"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "264",
+    "name": "Anestetiklər",
+    "source_url": "https://www.aptekonline.az/products/264"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "308",
+    "name": "Narkoz üçün vasitələr",
+    "source_url": "https://www.aptekonline.az/products/308"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "341",
+    "name": "Cərrahi vasitələr",
+    "source_url": "https://www.aptekonline.az/products/341"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "343",
+    "name": "Mövsümi virus infeksiyalarına qarşı mübarizə",
+    "source_url": "https://www.aptekonline.az/products/343"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "33",
+    "name": "Öskürək əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/33"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "181",
+    "name": "Allergik boğulmalar və bronxial astmada istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/181"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "34",
+    "name": "Qrip zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/34"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "71",
+    "name": "Rinit, sinusit zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/71"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "200",
+    "name": "Bronxit, pnevmoniya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/200"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "210",
+    "name": "Angina, faringit, laringit zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/210"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "235",
+    "name": "Yuxarı tənəffüs yollarının digər xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/235"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "236",
+    "name": "Aşağı tənəffüs yollarının digər xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/236"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "12",
+    "name": "Travmatik ağrılarda istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/12"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "14",
+    "name": "Oynaq və əzələ ağrılarında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/14"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "13",
+    "name": "Spazmolitiklər",
+    "source_url": "https://www.aptekonline.az/products/13"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "15",
+    "name": "Menstrual ağrılar zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/15"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "16",
+    "name": "Baş, diş və qulaq ağrılarında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/16"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "182",
+    "name": "Daxili orqanlarda ağrılar zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/182"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "291",
+    "name": "Qadınlar üçün bezlər",
+    "source_url": "https://www.aptekonline.az/products/291"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "292",
+    "name": "Böyüklər üçün bezlər",
+    "source_url": "https://www.aptekonline.az/products/292"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "293",
+    "name": "Yataq xəstələrinə istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/293"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "309",
+    "name": "Digər gigiyenik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/309"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "26",
+    "name": "Osteoporoz zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/26"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "27",
+    "name": "Raxit zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/27"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "118",
+    "name": "Artrit zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/118"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "119",
+    "name": "Artroz zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/119"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "177",
+    "name": "Podaqra əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/177"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "120",
+    "name": "Yumşaq toxumaların zədələnmələri",
+    "source_url": "https://www.aptekonline.az/products/120"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "401",
+    "name": "Dayaq-hərəkət sisteminin fəaliyyətini yaxşılaşdırıcı vasitələr",
+    "source_url": "https://www.aptekonline.az/products/401"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "166",
+    "name": "Kalsium defisitli xəstəliklər",
+    "source_url": "https://www.aptekonline.az/products/166"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "189",
+    "name": "Sınıqlar",
+    "source_url": "https://www.aptekonline.az/products/189"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "327",
+    "name": "Qulaq xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/327"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "429",
+    "name": "Vestibulyar funksiyanın pozğunluğu",
+    "source_url": "https://www.aptekonline.az/products/429"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "269",
+    "name": "Kəllə-beyin və digər travmalar",
+    "source_url": "https://www.aptekonline.az/products/269"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "70",
+    "name": "Allergik reaksiya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/70"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "249",
+    "name": "Zəhərlənmələr zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/249"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "410",
+    "name": "Köçürülmüş orqan və toxumaların rədd edilməsi",
+    "source_url": "https://www.aptekonline.az/products/410"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "201",
+    "name": "Anafilaktik şok zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/201"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "77",
+    "name": "Ana və uşaq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/77"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "252",
+    "name": "Uşaq qidaları",
+    "source_url": "https://www.aptekonline.az/products/252"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "361",
+    "name": "Uşaqlar üçün ağız boşluğuna qulluq",
+    "source_url": "https://www.aptekonline.az/products/361"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "294",
+    "name": "Uşaq bezləri",
+    "source_url": "https://www.aptekonline.az/products/294"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "80",
+    "name": "Uşaq dərisinə qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/80"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "407",
+    "name": "Uşaq oyuncaqları",
+    "source_url": "https://www.aptekonline.az/products/407"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "346",
+    "name": "Aşağı ətraflar üçün ortopedik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/346"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "347",
+    "name": "Hamilələr üçün ortopedik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/347"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "362",
+    "name": "Yuxarı ətraflar üçün ortopedik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/362"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "363",
+    "name": "Çanaq nahiyəsi üçün ortopedik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/363"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "364",
+    "name": "Qadınlar üçün ortopedik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/364"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "366",
+    "name": "Döş qəfəsi nahiyəsi üçün ortopedik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/366"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "367",
+    "name": "Boyun nahiyəsi üçün ortopedik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/367"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "360",
+    "name": "Bel-qarın nahiyəsi üçün ortopedik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/360"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "365",
+    "name": "Qaməti korreksiyaedici bandajlar",
+    "source_url": "https://www.aptekonline.az/products/365"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "384",
+    "name": "Digər ortopedik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/384"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "353",
+    "name": "Optik çərçivələr",
+    "source_url": "https://www.aptekonline.az/products/353"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "395",
+    "name": "Uşaqlar üçün optik çərçivələr",
+    "source_url": "https://www.aptekonline.az/products/395"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "354",
+    "name": "Qadınlar üçün günəş eynəkləri",
+    "source_url": "https://www.aptekonline.az/products/354"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "355",
+    "name": "Kişilər üçün günəş eynəkləri",
+    "source_url": "https://www.aptekonline.az/products/355"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "356",
+    "name": "Uşaqlar üçün günəş eynəkləri",
+    "source_url": "https://www.aptekonline.az/products/356"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "357",
+    "name": "Qarışıq günəş eynəkləri",
+    "source_url": "https://www.aptekonline.az/products/357"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "402",
+    "name": "Optik kontakt linzalar",
+    "source_url": "https://www.aptekonline.az/products/402"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "403",
+    "name": "Kosmetik kontakt linzalar",
+    "source_url": "https://www.aptekonline.az/products/403"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "396",
+    "name": "Xizək eynəkləri",
+    "source_url": "https://www.aptekonline.az/products/396"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "412",
+    "name": "Linza məhlulu",
+    "source_url": "https://www.aptekonline.az/products/412"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "416",
+    "name": "Digər optiki vasitələr",
+    "source_url": "https://www.aptekonline.az/products/416"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "419",
+    "name": "Optik şüşə",
+    "source_url": "https://www.aptekonline.az/products/419"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "422",
+    "name": "Dırnaq xəstləlikləri zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/422"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "111",
+    "name": "Göbələk mənşəli səpkilərdə istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/111"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "263",
+    "name": "Psoriaz zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/263"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "305",
+    "name": "Saç xəstəlikləri zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/305"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "105",
+    "name": "Yanıq zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/105"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "108",
+    "name": "Dermatit və ekzema zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/108"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "109",
+    "name": "Dəri infeksiyaları zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/109"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "206",
+    "name": "Dəmrov zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/206"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "342",
+    "name": "Sızanaqlar əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/342"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "389",
+    "name": "Döyənək əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/389"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "99",
+    "name": "Tonometrlər, stetoskoplar",
+    "source_url": "https://www.aptekonline.az/products/99"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "319",
+    "name": "Termometrlər",
+    "source_url": "https://www.aptekonline.az/products/319"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "351",
+    "name": "Masaj aparatları",
+    "source_url": "https://www.aptekonline.az/products/351"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "100",
+    "name": "Qlükometrlər",
+    "source_url": "https://www.aptekonline.az/products/100"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "101",
+    "name": "İnhalyatorlar",
+    "source_url": "https://www.aptekonline.az/products/101"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "103",
+    "name": "Tərəzilər",
+    "source_url": "https://www.aptekonline.az/products/103"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "376",
+    "name": "Pulsoksimetrlər",
+    "source_url": "https://www.aptekonline.az/products/376"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "377",
+    "name": "Eşitmə cihazları",
+    "source_url": "https://www.aptekonline.az/products/377"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "378",
+    "name": "Hava təmizləyici cihazlar",
+    "source_url": "https://www.aptekonline.az/products/378"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "381",
+    "name": "Digər cihazlar",
+    "source_url": "https://www.aptekonline.az/products/381"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "386",
+    "name": "İsidici vasitələr",
+    "source_url": "https://www.aptekonline.az/products/386"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "318",
+    "name": "Tibbi maskalar və respiratorlar",
+    "source_url": "https://www.aptekonline.az/products/318"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "373",
+    "name": "Tibbi kişi xalatları",
+    "source_url": "https://www.aptekonline.az/products/373"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "374",
+    "name": "Tibbi qadın xalatları",
+    "source_url": "https://www.aptekonline.az/products/374"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "375",
+    "name": "Tibbi kostyumlar",
+    "source_url": "https://www.aptekonline.az/products/375"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "379",
+    "name": "Tibbi ayaqqabılar, baxillər",
+    "source_url": "https://www.aptekonline.az/products/379"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "380",
+    "name": "Tibbi papaqlar",
+    "source_url": "https://www.aptekonline.az/products/380"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "382",
+    "name": "Tibbi əlcəklər",
+    "source_url": "https://www.aptekonline.az/products/382"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "306",
+    "name": "Yumurtalıqların polikistozu sindromunda istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/306"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "127",
+    "name": "Qalxanabənzər vəzi (zob) xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/127"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "128",
+    "name": "Diabet xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/128"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "141",
+    "name": "Digər hormonal xəstəliklərin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/141"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "145",
+    "name": "Stenokardiya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/145"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "214",
+    "name": "Ürəyin digər xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/214"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "176",
+    "name": "Beyin qan dövranı pozğunluğunda istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/176"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "124",
+    "name": "Venaların varikoz genişlənməsi zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/124"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "212",
+    "name": "Tromboflebit zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/212"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "260",
+    "name": "Aritmiya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/260"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "262",
+    "name": "Ürək revmatizmi zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/262"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "125",
+    "name": "Qan dövranının digər xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/125"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "146",
+    "name": "Hipertoniya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/146"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "174",
+    "name": "Qanaxmalarda istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/174"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "211",
+    "name": "Miokard infarktı zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/211"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "213",
+    "name": "Hipotoniya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/213"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "215",
+    "name": "Ürək çatmamazlığı zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/215"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "238",
+    "name": "Ateroskleroz zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/238"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "253",
+    "name": "İnsult zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/253"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "153",
+    "name": "Əl, dəri və selikli qişalar üçün antiseptik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/153"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "156",
+    "name": "Tibbi avadanlıqlar üçün",
+    "source_url": "https://www.aptekonline.az/products/156"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "222",
+    "name": "Dezinfeksiyaedici vasitələr",
+    "source_url": "https://www.aptekonline.az/products/222"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "226",
+    "name": "Quru göz sindromu zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/226"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "267",
+    "name": "Görmə zəifliyi zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/267"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "349",
+    "name": "Kataraktada istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/349"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "164",
+    "name": "Gözün virus mənşəli xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/164"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "424",
+    "name": "Gözün diaqnostikası zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/424"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "207",
+    "name": "Gözün allergik xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/207"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "208",
+    "name": "Gözün iltihabi xəstəliklərində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/208"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "209",
+    "name": "Qlaukomada istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/209"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "87",
+    "name": "Qidalanma pozğunluğu zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/87"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "78",
+    "name": "Vitamin və mineral çatmamazlığı",
+    "source_url": "https://www.aptekonline.az/products/78"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "32",
+    "name": "Piylənmədə istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/32"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "167",
+    "name": "Metabolik pozulmalar zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/167"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "273",
+    "name": "Saç üçün maskalar, yağlar, kremlər",
+    "source_url": "https://www.aptekonline.az/products/273"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "276",
+    "name": "Saç üçün laklar, musslar",
+    "source_url": "https://www.aptekonline.az/products/276"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "271",
+    "name": "Şampunlar",
+    "source_url": "https://www.aptekonline.az/products/271"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "272",
+    "name": "Balzamlar",
+    "source_url": "https://www.aptekonline.az/products/272"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "274",
+    "name": "Saç boyaları",
+    "source_url": "https://www.aptekonline.az/products/274"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "344",
+    "name": "Saç üçün digər vasitələr",
+    "source_url": "https://www.aptekonline.az/products/344"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "225",
+    "name": "Homeopatik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/225"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "227",
+    "name": "Uşaqlıq yoluna daraldıcı təsir göstərən vasitələr",
+    "source_url": "https://www.aptekonline.az/products/227"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "144",
+    "name": "Ginekoloji vasitələr",
+    "source_url": "https://www.aptekonline.az/products/144"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "179",
+    "name": "Qoruyucu məmulatlar",
+    "source_url": "https://www.aptekonline.az/products/179"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "229",
+    "name": "İntim gellər",
+    "source_url": "https://www.aptekonline.az/products/229"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "234",
+    "name": "Anemiya zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/234"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "240",
+    "name": "İmmunçatışmazlığı zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/240"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "279",
+    "name": "Əllərə qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/279"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "280",
+    "name": "Ayaqlara qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/280"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "281",
+    "name": "Bədənə qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/281"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "282",
+    "name": "Tər əleyhinə vasitələr",
+    "source_url": "https://www.aptekonline.az/products/282"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "295",
+    "name": "Epilyasiya və depilyasiya",
+    "source_url": "https://www.aptekonline.az/products/295"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "299",
+    "name": "Zərdablar",
+    "source_url": "https://www.aptekonline.az/products/299"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "304",
+    "name": "Üzə qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/304"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "313",
+    "name": "Yaşlanma əleyhinə qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/313"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "277",
+    "name": "Duş gelləri",
+    "source_url": "https://www.aptekonline.az/products/277"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "278",
+    "name": "Sabunlar",
+    "source_url": "https://www.aptekonline.az/products/278"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "283",
+    "name": "Təmizləyici vasitələr",
+    "source_url": "https://www.aptekonline.az/products/283"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "298",
+    "name": "Nəmləndirici vasitələr",
+    "source_url": "https://www.aptekonline.az/products/298"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "300",
+    "name": "Günəş vannası üçün kremlər",
+    "source_url": "https://www.aptekonline.az/products/300"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "385",
+    "name": "Kişilər üçün təraş vasitələri",
+    "source_url": "https://www.aptekonline.az/products/385"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "390",
+    "name": "Gözətrafı dəriyə qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/390"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "391",
+    "name": "Tonal vasitələr",
+    "source_url": "https://www.aptekonline.az/products/391"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "421",
+    "name": "Dodaqlara qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/421"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "426",
+    "name": "Çapıqlar üçün vasitələr",
+    "source_url": "https://www.aptekonline.az/products/426"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "310",
+    "name": "Saqqızlar",
+    "source_url": "https://www.aptekonline.az/products/310"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "290",
+    "name": "Diş sapları",
+    "source_url": "https://www.aptekonline.az/products/290"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "415",
+    "name": "Diş protezləri üçün vasitələr",
+    "source_url": "https://www.aptekonline.az/products/415"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "284",
+    "name": "Diş fırçaları",
+    "source_url": "https://www.aptekonline.az/products/284"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "285",
+    "name": "Diş məcunları",
+    "source_url": "https://www.aptekonline.az/products/285"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "286",
+    "name": "Diş tozları",
+    "source_url": "https://www.aptekonline.az/products/286"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "287",
+    "name": "Ağız boşluğu üçün məhlullar",
+    "source_url": "https://www.aptekonline.az/products/287"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "289",
+    "name": "Ağız boşluğu üçün gellər",
+    "source_url": "https://www.aptekonline.az/products/289"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "427",
+    "name": "Ağız boşluğu üçün digər vasitələr",
+    "source_url": "https://www.aptekonline.az/products/427"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "301",
+    "name": "La Roche-Posay",
+    "source_url": "https://www.aptekonline.az/products/301"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "150",
+    "name": "Vichy",
+    "source_url": "https://www.aptekonline.az/products/150"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "392",
+    "name": "Biolane",
+    "source_url": "https://www.aptekonline.az/products/392"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "190",
+    "name": "Artıq bədən çəkisi zamanı istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/190"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "388",
+    "name": "Zondlar, kateterlər",
+    "source_url": "https://www.aptekonline.az/products/388"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "383",
+    "name": "Yuyucu vasitələr",
+    "source_url": "https://www.aptekonline.az/products/383"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "265",
+    "name": "Sarğı materialları",
+    "source_url": "https://www.aptekonline.az/products/265"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "387",
+    "name": "İnfuziya sistemləri, şprislər, iynələr",
+    "source_url": "https://www.aptekonline.az/products/387"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "228",
+    "name": "Test üçün vasitələr",
+    "source_url": "https://www.aptekonline.az/products/228"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "248",
+    "name": "Digər vasitələr",
+    "source_url": "https://www.aptekonline.az/products/248"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "303",
+    "name": "Kosmetoloji alətlər",
+    "source_url": "https://www.aptekonline.az/products/303"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "217",
+    "name": "Qidalandırıcı kremlər",
+    "source_url": "https://www.aptekonline.az/products/217"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "151",
+    "name": "Yumşaldıcı vasitələr",
+    "source_url": "https://www.aptekonline.az/products/151"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "417",
+    "name": "Digər kosmetik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/417"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "246",
+    "name": "Günəşdən qoruyucu vasitələr",
+    "source_url": "https://www.aptekonline.az/products/246"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "255",
+    "name": "İdmançılar üçün digər vasitələr",
+    "source_url": "https://www.aptekonline.az/products/255"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "157",
+    "name": "İdmançılar üçün qidalar",
+    "source_url": "https://www.aptekonline.az/products/157"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "158",
+    "name": "İdman zədələnmələrində istifadə olunan vasitələr",
+    "source_url": "https://www.aptekonline.az/products/158"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "311",
+    "name": "Mineral sular, meyvə şirələri",
+    "source_url": "https://www.aptekonline.az/products/311"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "219",
+    "name": "Bitki yağları",
+    "source_url": "https://www.aptekonline.az/products/219"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "358",
+    "name": "Qəhvələr",
+    "source_url": "https://www.aptekonline.az/products/358"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "159",
+    "name": "Bitki çayları",
+    "source_url": "https://www.aptekonline.az/products/159"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "218",
+    "name": "Dərman bitkiləri",
+    "source_url": "https://www.aptekonline.az/products/218"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "394",
+    "name": "Berdoues",
+    "source_url": "https://www.aptekonline.az/products/394"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "411",
+    "name": "Uşaq ətirləri",
+    "source_url": "https://www.aptekonline.az/products/411"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "413",
+    "name": "Ətirli sular",
+    "source_url": "https://www.aptekonline.az/products/413"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "418",
+    "name": "Eau De Toilette",
+    "source_url": "https://www.aptekonline.az/products/418"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "406",
+    "name": "Neylon corablar",
+    "source_url": "https://www.aptekonline.az/products/406"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "405",
+    "name": "Kalqotkalar",
+    "source_url": "https://www.aptekonline.az/products/405"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "409",
+    "name": "Pastalar",
+    "source_url": "https://www.aptekonline.az/products/409"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "425",
+    "name": "Şirniyyat",
+    "source_url": "https://www.aptekonline.az/products/425"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "112",
+    "name": "İnfeksion və parazitar xəstəliklər",
+    "source_url": "https://www.aptekonline.az/products/112"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "122",
+    "name": "Onkoloji xəstəliklər",
+    "source_url": "https://www.aptekonline.az/products/122"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "21",
+    "name": "Sinir sistemi xəstəlikləri",
+    "source_url": "https://www.aptekonline.az/products/21"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "17",
+    "name": "Həzm sistemi  xəstəlikləri",
+    "source_url": "https://www.aptekonline.az/products/17"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "44",
+    "name": "Sidik-cinsiyyət sistemi xəstəlikləri",
+    "source_url": "https://www.aptekonline.az/products/44"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "60",
+    "name": "Hamiləlik",
+    "source_url": "https://www.aptekonline.az/products/60"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "256",
+    "name": "Cərrahiyə",
+    "source_url": "https://www.aptekonline.az/products/256"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "7",
+    "name": "Tənəffüs sistemi xəstəlikləri",
+    "source_url": "https://www.aptekonline.az/products/7"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "11",
+    "name": "Ağrıkəsicilər",
+    "source_url": "https://www.aptekonline.az/products/11"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "268",
+    "name": "Gigiyenik  bezlər",
+    "source_url": "https://www.aptekonline.az/products/268"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "25",
+    "name": "Sümük-əzələ sisteminin xəstəlikləri",
+    "source_url": "https://www.aptekonline.az/products/25"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "322",
+    "name": "Qulaq xəstəlikləri",
+    "source_url": "https://www.aptekonline.az/products/322"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "69",
+    "name": "Travmalar, zəhərlənmələr və digər xarici təsirlər",
+    "source_url": "https://www.aptekonline.az/products/69"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "76",
+    "name": "Ana və uşaq",
+    "source_url": "https://www.aptekonline.az/products/76"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "345",
+    "name": "Ortopediya vasitələri",
+    "source_url": "https://www.aptekonline.az/products/345"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "352",
+    "name": "Optika məhsulları",
+    "source_url": "https://www.aptekonline.az/products/352"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "104",
+    "name": "Dəri xəstəlikləri",
+    "source_url": "https://www.aptekonline.az/products/104"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "369",
+    "name": "Tibbi avadanlıqlar",
+    "source_url": "https://www.aptekonline.az/products/369"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "372",
+    "name": "Tibbi geyimlər",
+    "source_url": "https://www.aptekonline.az/products/372"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "126",
+    "name": "Endokrinoloji xəstəliklər",
+    "source_url": "https://www.aptekonline.az/products/126"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "129",
+    "name": "Qan dövranı sisteminin xəstəlikləri",
+    "source_url": "https://www.aptekonline.az/products/129"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "131",
+    "name": "Antiseptiklər və dezinfeksiyaedicilər",
+    "source_url": "https://www.aptekonline.az/products/131"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "136",
+    "name": "Göz xəstəlikləri",
+    "source_url": "https://www.aptekonline.az/products/136"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "139",
+    "name": "Maddələr mübadiləsinin pozğunluğu",
+    "source_url": "https://www.aptekonline.az/products/139"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "152",
+    "name": "Saça qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/152"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "168",
+    "name": "Homeopatiya",
+    "source_url": "https://www.aptekonline.az/products/168"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "178",
+    "name": "İntim vasitələr",
+    "source_url": "https://www.aptekonline.az/products/178"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "233",
+    "name": "Qan xəstəlikləri və immun sistemin çatışmazlıqları",
+    "source_url": "https://www.aptekonline.az/products/233"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "254",
+    "name": "Dəriyə qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/254"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "9",
+    "name": "Ağız boşluğunun qulluğu",
+    "source_url": "https://www.aptekonline.az/products/9"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "270",
+    "name": "Kosmetik vasitələr",
+    "source_url": "https://www.aptekonline.az/products/270"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "31",
+    "name": "Dieta",
+    "source_url": "https://www.aptekonline.az/products/31"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "98",
+    "name": "Tibbi vasitələr",
+    "source_url": "https://www.aptekonline.az/products/98"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "130",
+    "name": "Kosmetoloji və dəriyə qulluq vasitələri",
+    "source_url": "https://www.aptekonline.az/products/130"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "132",
+    "name": "İdman",
+    "source_url": "https://www.aptekonline.az/products/132"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "133",
+    "name": "Təbii vasitələr",
+    "source_url": "https://www.aptekonline.az/products/133"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "393",
+    "name": "Ətirlər",
+    "source_url": "https://www.aptekonline.az/products/393"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "404",
+    "name": "Qadın guşəsi",
+    "source_url": "https://www.aptekonline.az/products/404"
+  },
+  {
+    "site": "aptekonline",
+    "slug": "408",
+    "name": "Qida",
+    "source_url": "https://www.aptekonline.az/products/408"
+  },
+  {
+    "site": "aloe",
+    "slug": "dermanlar/",
+    "name": "Daha çox",
+    "source_url": "/catalog/filters/?category_slug=dermanlar/"
+  },
+  {
+    "site": "aloe",
+    "slug": "bad/",
+    "name": "Daha çox",
+    "source_url": "/catalog/filters/?category_slug=bad/"
+  },
+  {
+    "site": "aloe",
+    "slug": "usaq-dunyasi/",
+    "name": "Daha çox",
+    "source_url": "/catalog/filters/?category_slug=usaq-dunyasi/"
+  }
+]

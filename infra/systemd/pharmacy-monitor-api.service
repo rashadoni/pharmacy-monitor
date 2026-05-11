@@ -1,0 +1,32 @@
+[Unit]
+Description=Pharmacy Monitor — FastAPI backend
+After=network.target postgresql.service redis.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=pm
+Group=pm
+WorkingDirectory=/opt/pharmacy-monitor
+EnvironmentFile=/etc/pharmacy-monitor/env
+ExecStart=/opt/pharmacy-monitor/.venv/bin/uvicorn src.api:app \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --workers 2 \
+    --proxy-headers \
+    --forwarded-allow-ips '127.0.0.1'
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/pharmacy-monitor/data /opt/pharmacy-monitor/logs /opt/pharmacy-monitor/reports
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

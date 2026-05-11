@@ -1,0 +1,36 @@
+name: Deploy to Hetzner
+
+# Triggered on push to main, after CI passes.
+# Required GitHub secrets:
+#   HETZNER_HOST           — IP or domain of the VM
+#   HETZNER_SSH_USER       — usually 'pm' or 'deploy'
+#   HETZNER_SSH_KEY        — private SSH key (RSA/ED25519)
+#   HETZNER_SSH_KNOWN_HOSTS — output of `ssh-keyscan` for the host
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: SSH deploy
+    runs-on: ubuntu-latest
+    needs: []
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HETZNER_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.HETZNER_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+      - name: Deploy
+        run: |
+          ssh -i ~/.ssh/id_ed25519 \
+              ${{ secrets.HETZNER_SSH_USER }}@${{ secrets.HETZNER_HOST }} \
+              'cd /opt/pharmacy-monitor && bash infra/deploy.sh'

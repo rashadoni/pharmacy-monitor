@@ -1,0 +1,204 @@
+"""Helper-операции для ручной коррекции матчей.
+
+Используется UI Сравнения цен для трёх действий:
+- ✓ Подтвердить матч (защита от пересматчивания)
+- ✗ Не один товар (отвязать Product от кластера + создать MatchRejection)
+- 🔍 Заменить (swap Product на другой кандидат с того же сайта)
+"""
+
+from __future__ import annotations
+
+import structlog
+from rapidfuzz import fuzz
+from sqlalchemy import or_, select
+from sqlalchemy.orm import Session
+
+from src.storage import Match, MatchRejection, Product
+
+log = structlog.get_logger()
+
+
+def _ordered(a: int, b: int) -> tuple[int, int]:
+    """Канонический порядок пары: (min, max). Делает таблицу симметричной."""
+    return (a, b) if a < b else (b, a)
+
+
+def add_rejection(
+    session: Session, product_a_id: int, product_b_id: int, reason: str | None = None
+) -> MatchRejection:
+    """Создать (или вернуть существующую) запись отрицания пары."""
+    if product_a_id == product_b_id:
+        raise ValueError("Cannot reject pair with self")
+    a, b = _ordered(product_a_id, product_b_id)
+    existing = session.scalar(
+        select(MatchRejection).where(
+            MatchRejection.product_a_id == a, MatchRejection.product_b_id == b
+        )
+    )
+    if existing:
+        return existing
+    rej = MatchRejection(product_a_id=a, product_b_id=b, reason=reason)
+    session.add(rej)
+    session.flush()
+    return rej
+
+
+def is_rejected(session: Session, product_a_id: int, product_b_id: int) -> bool:
+    """Проверить — помечена ли пара как анти-матч."""
+    if product_a_id == product_b_id:
+        return False
+    a, b = _ordered(product_a_id, product_b_id)
+    return (
+        session.scalar(
+            select(MatchRejection.id).where(
+                MatchRejection.product_a_id == a, MatchRejection.product_b_id == b
+            )
+        )
+        is not None
+    )
+
+
+def confirm_match(session: Session, match_id: int) -> Match | None:
+    """Пометить Match как ручной — auto-matcher больше его не тронет."""
+    m = session.get(Match, match_id)
+    if not m:
+        return None
+    m.is_manual = True
+    session.commit()
+    log.info("match_confirmed", match_id=match_id)
+    return m
+
+
+def break_match(
+    session: Session,
+    match_id: int,
+    detach_product_id: int,
+    reason: str | None = None,
+) -> int:
+    """Отвязать конкретный Product от Match-кластера.
+
+    - Создаёт MatchRejection между detach_product и каждым из оставшихся в кластере
+    - Снимает canonical_id с detach_product
+    - Если в кластере остался <2 Product'ов — Match удаляется
+
+    Возвращает количество созданных rejection-записей.
+    """
+    m = session.get(Match, match_id)
+    if not m:
+        return 0
+    detach = session.get(Product, detach_product_id)
+    if not detach or detach.canonical_id != match_id:
+        log.warning(
+            "break_match_skip", reason="product_not_in_match", product=detach_product_id
+        )
+        return 0
+
+    others = [p for p in m.products if p.id != detach_product_id]
+    rej_count = 0
+    for other in others:
+        add_rejection(session, detach_product_id, other.id, reason=reason or "manual break")
+        rej_count += 1
+
+    detach.canonical_id = None
+    session.flush()
+
+    # Если осталось <2 продукта в кластере — Match теряет смысл
+    remaining = [p for p in m.products if p.id != detach_product_id]
+    if len(remaining) < 2:
+        for p in remaining:
+            p.canonical_id = None
+        session.delete(m)
+        log.info("match_dissolved", match_id=match_id, reason="cluster_too_small")
+    else:
+        log.info(
+            "match_partial_break",
+            match_id=match_id,
+            detached=detach_product_id,
+            remaining=len(remaining),
+        )
+
+    session.commit()
+    return rej_count
+
+
+def find_alternatives(
+    session: Session, match_id: int, site: str, limit: int = 50
+) -> list[tuple[Product, int]]:
+    """Найти unmatched Product'ы на site, отсортированные по похожести на canonical_name.
+
+    Возвращает список (Product, score) где score 0..100 от rapidfuzz.token_set_ratio.
+    """
+    m = session.get(Match, match_id)
+    if not m:
+        return []
+    candidates = session.scalars(
+        select(Product).where(
+            Product.site == site,
+            Product.canonical_id.is_(None),
+        )
+    ).all()
+    if not candidates:
+        return []
+
+    scored = []
+    name = m.canonical_name or ""
+    for p in candidates:
+        score = fuzz.token_set_ratio(name, p.name or "")
+        scored.append((p, int(score)))
+    scored.sort(key=lambda t: -t[1])
+    return scored[:limit]
+
+
+def swap_alternative(
+    session: Session, match_id: int, site: str, new_product_id: int
+) -> bool:
+    """Заменить Product этого site в Match на другой.
+
+    - Существующий Product этого site → отвязывается + rejection с new_product
+    - Новый Product получает canonical_id = match_id
+    """
+    m = session.get(Match, match_id)
+    if not m:
+        return False
+    new_p = session.get(Product, new_product_id)
+    if not new_p or new_p.site != site:
+        return False
+
+    # Найти текущий Product этого site в кластере
+    current = next((p for p in m.products if p.site == site), None)
+    if current and current.id == new_product_id:
+        return False  # уже этот
+
+    if current:
+        # Создаём rejection между текущим и новым (чтобы matcher не вернул)
+        add_rejection(session, current.id, new_product_id, reason="manual swap")
+        current.canonical_id = None
+
+    new_p.canonical_id = match_id
+    # Помечаем match как manual чтобы auto-matcher не пересматчил
+    m.is_manual = True
+    session.commit()
+    log.info(
+        "match_swapped",
+        match_id=match_id,
+        site=site,
+        old=current.id if current else None,
+        new=new_product_id,
+    )
+    return True
+
+
+def list_rejections_for_product(session: Session, product_id: int) -> list[int]:
+    """Список product_id'ов с которыми этот product НЕ должен матчиться."""
+    rows = session.scalars(
+        select(MatchRejection).where(
+            or_(
+                MatchRejection.product_a_id == product_id,
+                MatchRejection.product_b_id == product_id,
+            )
+        )
+    ).all()
+    out = []
+    for r in rows:
+        out.append(r.product_b_id if r.product_a_id == product_id else r.product_a_id)
+    return out
