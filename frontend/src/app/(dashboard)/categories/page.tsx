@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2, X } from "lucide-react";
+import { Pencil, Play, Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { api, type CategoryRow } from "@/lib/api";
 
@@ -112,13 +112,16 @@ export default function CategoriesPage() {
             Категории для скрейпинга. ON-категории идут в next-run; OFF — пропускаются.
           </p>
         </div>
-        <button
-          onClick={() => setShowAdd(true)}
-          className="inline-flex items-center gap-1.5 rounded-md bg-primary text-primary-foreground px-3 py-2 text-sm font-medium hover:bg-primary/90"
-        >
-          <Plus className="h-4 w-4" />
-          Добавить
-        </button>
+        <div className="flex gap-2">
+          <TriggerScrapeButton />
+          <button
+            onClick={() => setShowAdd(true)}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary text-primary-foreground px-3 py-2 text-sm font-medium hover:bg-primary/90"
+          >
+            <Plus className="h-4 w-4" />
+            Добавить
+          </button>
+        </div>
       </div>
 
       {showAdd && <CategoryForm onClose={() => setShowAdd(false)} />}
@@ -218,6 +221,114 @@ export default function CategoriesPage() {
   );
 }
 
+function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
+  const queryClient = useQueryClient();
+  const requestsQ = useQuery({
+    queryKey: ["scrape-requests"],
+    queryFn: () => api.scrapeRequests(3),
+    refetchInterval: (q) => {
+      const data = q.state.data;
+      const hasActive = data?.some((r) => r.status === "pending" || r.status === "running");
+      return hasActive ? 5_000 : 30_000;
+    },
+  });
+  const triggerMut = useMutation({
+    mutationFn: () =>
+      api.scrapeTrigger(
+        categoryId
+          ? { mode: "category", category_id: categoryId }
+          : { mode: "all" }
+      ),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["scrape-requests"] }),
+  });
+
+  const active = requestsQ.data?.find(
+    (r) => r.status === "pending" || r.status === "running"
+  );
+  // Для глобальной кнопки: показываем итог последнего завершённого прогона
+  // (status='ok' / 'failed') ещё ~10 минут — чтобы клиент успел увидеть «Готово ✓ — N товаров».
+  const lastCompleted = !categoryId
+    ? requestsQ.data?.find(
+        (r) => r.status === "ok" || r.status === "failed",
+      )
+    : undefined;
+  const completedFreshlyMs = lastCompleted?.completed_at
+    ? Date.now() - new Date(lastCompleted.completed_at).getTime()
+    : Infinity;
+  const showCompleted = lastCompleted && completedFreshlyMs < 10 * 60 * 1000;
+
+  // Skip rendering inline (per-row) кнопку если есть глобальный pending
+  if (categoryId && active) return null;
+
+  if (active) {
+    return (
+      <div className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm">
+        <Play className="h-4 w-4 animate-pulse" />
+        <span className="font-medium">
+          {active.status === "pending" ? "В очереди…" : "Сканируем…"}
+        </span>
+        <span className="text-xs text-muted-foreground">
+          (#{active.id} {active.mode === "category" ? `cat ${active.category_id}` : "все"})
+        </span>
+      </div>
+    );
+  }
+
+  if (categoryId) {
+    return (
+      <button
+        onClick={() => triggerMut.mutate()}
+        disabled={triggerMut.isPending}
+        className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-primary hover:bg-primary/10 disabled:opacity-50"
+        title="Запустить scan только этой категории"
+      >
+        <Play className="h-3.5 w-3.5" />
+      </button>
+    );
+  }
+
+  return (
+    <div className="inline-flex flex-col items-end gap-1">
+      <button
+        onClick={() => triggerMut.mutate()}
+        disabled={triggerMut.isPending}
+        className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium hover:bg-secondary disabled:opacity-50"
+        title="Запустить scan всех активных категорий"
+      >
+        <Play className="h-4 w-4" />
+        {triggerMut.isPending ? "Отправляем…" : "Сканировать сейчас"}
+      </button>
+      {showCompleted && lastCompleted && (
+        <ScrapeResultBadge req={lastCompleted} />
+      )}
+    </div>
+  );
+}
+
+function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow }) {
+  if (req.status === "failed") {
+    return (
+      <div className="text-xs text-destructive max-w-[280px] truncate" title={req.error_message ?? "Без сообщения об ошибке"}>
+        ✗ Сбой #{req.id}: {req.error_message ?? "—"}
+      </div>
+    );
+  }
+  // status === 'ok'
+  const total = req.products_scraped ?? 0;
+  const perSite = req.products_per_site ?? {};
+  const siteParts = Object.entries(perSite)
+    .filter(([, n]) => n > 0)
+    .map(([site, n]) => `${site}: ${n}`)
+    .join(", ");
+  return (
+    <div className="text-xs text-success" title={`run_id=${req.run_id}, завершено ${req.completed_at}`}>
+      ✓ Готово #{req.id} — <span className="font-medium">{total.toLocaleString("ru-RU")}</span> товаров
+      {siteParts && <span className="text-muted-foreground"> ({siteParts})</span>}
+    </div>
+  );
+}
+
+
 function CategoryRowDesktop({
   cat,
   onEdit,
@@ -288,6 +399,9 @@ function CategoryRowDesktop({
       </td>
       <td className="px-3 py-2 text-center">
         <div className="inline-flex items-center gap-2">
+          {cat.is_active && (cat.pharmonline_slug || cat.aptekonline_slug || cat.aloe_slug) && (
+            <TriggerScrapeButton categoryId={cat.id} />
+          )}
           <button
             onClick={onEdit}
             className="text-muted-foreground hover:text-foreground"

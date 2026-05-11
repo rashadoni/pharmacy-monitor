@@ -61,7 +61,43 @@ class Run(Base):
     # для debug — клиент видит «pharm scraped 100 vitamins, apt scraped 320».
     products_per_site_category: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
-    snapshots: Mapped[list[PriceSnapshot]] = relationship(back_populates="run")
+    snapshots: Mapped[list["PriceSnapshot"]] = relationship(back_populates="run")
+
+
+class ScrapeRequest(Base):
+    """Очередь scrape-запросов, запущенных пользователем через UI.
+
+    Клиент жмёт «▶️ Запустить scan сейчас» → backend создаёт row здесь со
+    status='pending'. Mac launchd-watcher (плистом com.pharmacy-monitor.watch,
+    тикает каждые 60 секунд) polls API на pending → если есть, исполняет
+    `pharmacy-monitor run ...` через SSH-tunnel → PATCH запись status='ok'+run_id.
+
+    Зачем не выполнять сразу на проде: pharmonline+aptekonline бенят Hetzner-IP,
+    реально scrape идёт только с Mac (Baku-IP). Поэтому очередь.
+    """
+
+    __tablename__ = "scrape_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    requested_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tenant_users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Scope: 'all' (все active categories), 'category' (--category-id), 'site' (--site X)
+    mode: Mapped[str] = mapped_column(String(20), default="all")
+    category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("categories.id", ondelete="SET NULL"), nullable=True
+    )
+    sites: Mapped[str | None] = mapped_column(String(200), nullable=True)  # CSV
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    # pending → running → ok/failed
+    requested_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Product(Base):

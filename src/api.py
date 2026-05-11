@@ -548,6 +548,163 @@ def dash_change_password(
     return {"ok": True}
 
 
+class ScrapeTriggerIn(BaseModel):
+    mode: str = "all"  # 'all' | 'category'
+    category_id: int | None = None
+    sites: list[str] | None = None  # ["pharmonline", "aptekonline"] etc
+
+
+@app.post("/api/v1/dash/scrape/trigger", status_code=202)
+def dash_scrape_trigger(
+    payload: ScrapeTriggerIn,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Поставить scrape-запрос в очередь. Mac launchd-watcher подберёт в течение ~60 секунд.
+
+    Использует таблицу `scrape_requests`. Возвращает 202 + id запроса —
+    UI polls статус до status='ok'/'failed'.
+    """
+    if user.role not in ("admin", "owner"):
+        raise HTTPException(403, "Admin role required")
+    if payload.mode not in ("all", "category"):
+        raise HTTPException(400, "mode must be 'all' or 'category'")
+    if payload.mode == "category" and not payload.category_id:
+        raise HTTPException(400, "category_id required for mode='category'")
+
+    # Анти-spam: не более одной pending заявки на tenant одновременно
+    existing_pending = db.scalar(
+        select(storage.ScrapeRequest)
+        .where(
+            storage.ScrapeRequest.tenant_id == user.tenant_id,
+            storage.ScrapeRequest.status.in_(("pending", "running")),
+        )
+        .limit(1)
+    )
+    if existing_pending:
+        raise HTTPException(
+            409,
+            f"Уже в очереди запрос #{existing_pending.id} (status={existing_pending.status}). "
+            "Дождись его завершения.",
+        )
+
+    req = storage.ScrapeRequest(
+        tenant_id=user.tenant_id,
+        requested_by_user_id=user.id,
+        mode=payload.mode,
+        category_id=payload.category_id,
+        sites=",".join(payload.sites) if payload.sites else None,
+        status="pending",
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    return {"id": req.id, "status": "pending"}
+
+
+@app.get("/api/v1/dash/scrape/requests")
+def dash_scrape_requests(
+    limit: int = 10,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Последние scrape-запросы tenant'а. UI polls этот endpoint для статуса.
+
+    Для request'ов со status='ok' (то есть scrape завершился успешно и есть run_id)
+    подмешиваем агрегаты из Run: products_scraped (total) + products_per_site
+    ({site: count}). UI показывает «Готово ✓ — N товаров (pharm: X, apt: Y)».
+    """
+    reqs = db.scalars(
+        select(storage.ScrapeRequest)
+        .where(storage.ScrapeRequest.tenant_id == user.tenant_id)
+        .order_by(desc(storage.ScrapeRequest.id))
+        .limit(limit)
+    ).all()
+
+    # Pre-fetch runs одним запросом по run_id'ам (избегаем N+1)
+    run_ids = [r.run_id for r in reqs if r.run_id]
+    runs_map: dict[int, storage.Run] = {}
+    if run_ids:
+        rows = db.scalars(
+            select(storage.Run).where(storage.Run.id.in_(run_ids))
+        ).all()
+        runs_map = {run.id: run for run in rows}
+
+    out = []
+    for r in reqs:
+        run = runs_map.get(r.run_id) if r.run_id else None
+        out.append({
+            "id": r.id,
+            "mode": r.mode,
+            "category_id": r.category_id,
+            "sites": r.sites,
+            "status": r.status,
+            "requested_at": r.requested_at.isoformat() if r.requested_at else None,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "run_id": r.run_id,
+            "error_message": r.error_message,
+            "products_scraped": run.products_scraped if run else None,
+            "products_per_site": run.products_per_site if run else None,
+        })
+    return out
+
+
+# ─── Internal endpoints для Mac launchd-watcher ─────────────────────────────
+
+
+@app.get("/api/v1/internal/pending-scrape", dependencies=[Depends(require_api_key)])
+def internal_pending_scrape(db: Session = Depends(get_db)):
+    """Возвращает старейший pending запрос (для Mac watcher'а).
+
+    Auth via X-API-Key header (require_api_key, same as legacy ERP endpoints).
+    """
+    req = db.scalar(
+        select(storage.ScrapeRequest)
+        .where(storage.ScrapeRequest.status == "pending")
+        .order_by(storage.ScrapeRequest.id)
+        .limit(1)
+    )
+    if not req:
+        return {"pending": None}
+    # Mark as running immediately, чтобы не подобрать дважды
+    req.status = "running"
+    req.started_at = datetime.utcnow()
+    db.commit()
+    return {
+        "pending": {
+            "id": req.id,
+            "mode": req.mode,
+            "category_id": req.category_id,
+            "sites": (req.sites.split(",") if req.sites else None),
+        }
+    }
+
+
+class ScrapeCompleteIn(BaseModel):
+    run_id: int | None = None
+    error_message: str | None = None
+
+
+@app.post("/api/v1/internal/scrape-complete/{request_id}",
+          dependencies=[Depends(require_api_key)])
+def internal_scrape_complete(
+    request_id: int,
+    payload: ScrapeCompleteIn,
+    db: Session = Depends(get_db),
+):
+    """Mac watcher вызывает после завершения. status → 'ok' или 'failed'."""
+    req = db.scalar(select(storage.ScrapeRequest).where(storage.ScrapeRequest.id == request_id))
+    if not req:
+        raise HTTPException(404, "Request not found")
+    req.status = "failed" if payload.error_message else "ok"
+    req.completed_at = datetime.utcnow()
+    req.run_id = payload.run_id
+    req.error_message = payload.error_message
+    db.commit()
+    return {"ok": True}
+
+
 @app.get("/api/v1/dash/integrations")
 def dash_integrations(user: storage.TenantUser = Depends(require_user)):
     """Статус серверных интеграций. Фронт показывает в /settings — клиент

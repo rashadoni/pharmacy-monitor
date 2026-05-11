@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd config для polling scrape-requests из UI.
+  Тикает раз в 60 секунд, опрашивает прод API, исполняет если есть pending.
+
+  Установка:
+    cp infra/local/com.pharmacy-monitor.watch.plist ~/Library/LaunchAgents/
+    # API_KEY: один раз положить в Keychain
+    security add-generic-password -a pm -s pharmacy-monitor-api-key -w '<API_KEY из /etc/pharmacy-monitor/env>'
+    launchctl load -w ~/Library/LaunchAgents/com.pharmacy-monitor.watch.plist
+
+  Снять:
+    launchctl unload -w ~/Library/LaunchAgents/com.pharmacy-monitor.watch.plist
+
+  Логи:
+    tail -100 ~/Library/Logs/pharmacy-monitor-watch.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pharmacy-monitor.watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/rashadrahimov/pharmacy-monitor/infra/local/watch-scrape-queue.sh</string>
+    </array>
+
+    <!-- Каждые 60 секунд -->
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/rashadrahimov/pharmacy-monitor</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/rashadrahimov</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/rashadrahimov/Library/Logs/pharmacy-monitor-watch-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/rashadrahimov/Library/Logs/pharmacy-monitor-watch-launchd.log</string>
+</dict>
+</plist>
+</parameter>

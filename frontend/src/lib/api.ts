@@ -200,7 +200,31 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ current_password, new_password }),
     }),
+  scrapeTrigger: (payload: { mode: "all" | "category"; category_id?: number }) =>
+    request<{ id: number; status: string }>("/api/v1/dash/scrape/trigger", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  scrapeRequests: (limit = 10) =>
+    request<ScrapeRequestRow[]>(`/api/v1/dash/scrape/requests?limit=${limit}`),
 };
+
+export interface ScrapeRequestRow {
+  id: number;
+  mode: string;
+  category_id: number | null;
+  sites: string | null;
+  status: "pending" | "running" | "ok" | "failed";
+  requested_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  run_id: number | null;
+  error_message: string | null;
+  /** Total products across all sites in the run (filled when status=ok). */
+  products_scraped: number | null;
+  /** Per-site breakdown {site: count} from runs.products_per_site (filled when status=ok). */
+  products_per_site: Record<string, number> | null;
+}
 
 export interface IntegrationsStatus {
   smtp: boolean;
