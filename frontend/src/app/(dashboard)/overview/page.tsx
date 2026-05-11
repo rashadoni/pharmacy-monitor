@@ -74,6 +74,7 @@ export default function OverviewPage() {
                 <th className="px-3 py-2 w-6"></th>
                 <th className="px-3 py-2 text-left">ID</th>
                 <th className="px-3 py-2 text-left">Started</th>
+                <th className="px-3 py-2 text-left hidden sm:table-cell">Длительность</th>
                 <th className="px-3 py-2 text-left">Status</th>
                 <th className="px-3 py-2 text-right">Products</th>
                 <th className="px-3 py-2 text-left hidden md:table-cell">Sites</th>
@@ -129,6 +130,9 @@ function RunRowExpandable({
         <td className="px-3 py-2 font-mono text-xs">{run.id}</td>
         <td className="px-3 py-2 text-muted-foreground">
           {run.started_at?.slice(0, 16).replace("T", " ")}
+        </td>
+        <td className="px-3 py-2 text-muted-foreground hidden sm:table-cell tabular-nums">
+          {formatDuration(run.started_at, run.finished_at)}
         </td>
         <td className="px-3 py-2">
           <StatusBadge status={run.status} />
@@ -299,6 +303,25 @@ function ActionRow({ action }: { action: RoiAction }) {
       </div>
     </div>
   );
+}
+
+function formatDuration(
+  startedAt: string | null,
+  finishedAt: string | null,
+): string {
+  if (!startedAt) return "—";
+  const start = new Date(startedAt).getTime();
+  const end = finishedAt ? new Date(finishedAt).getTime() : Date.now();
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  if (seconds < 60) return `${seconds}с`;
+  const mins = Math.floor(seconds / 60);
+  if (mins < 60) {
+    const s = seconds % 60;
+    return s > 0 ? `${mins}м ${s}с` : `${mins}м`;
+  }
+  const hours = Math.floor(mins / 60);
+  const m = mins % 60;
+  return `${hours}ч ${m}м`;
 }
 
 function StatusBadge({ status }: { status: string }) {
