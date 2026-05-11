@@ -239,6 +239,12 @@ def _detect_undercuts(
             comp_price = comp_snap.discount_price or comp_snap.price
             if comp_price is None:
                 continue
+            # Price-sanity filter (2026-05-11): aptekonline.az иногда
+            # листингует single-piece SKU за 0.20 ₼ против pack за 28 ₼
+            # (опечатка в их БД). Пропускаем явные outlier'ы — конкурент
+            # «дешевле на 99%» это не реальный undercut, а data error.
+            if comp_price < client_price * 0.1:
+                continue
             diff_pct = round((client_price - comp_price) / client_price * 100, 2)
             if diff_pct > threshold_pct:
                 undercuts.append(

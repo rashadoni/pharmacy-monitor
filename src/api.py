@@ -630,17 +630,33 @@ def dash_comparison(
 
     out: list[ComparisonRowOut] = []
     for m in matches:
-        prices: dict[str, dict[str, Any]] = {}
+        raw_prices: dict[str, dict[str, Any]] = {}
         for p in m.products:
             snap = snaps_by_pid.get(p.id)
             price = (snap.discount_price or snap.price) if snap else None
             if price is not None and price > 0:
-                prices[p.site] = {
+                raw_prices[p.site] = {
                     "price": price,
                     "is_on_sale": snap.is_on_sale if snap else False,
                     "url": p.url,
                     "product_id": p.id,
                 }
+
+        # Price-sanity filter (2026-05-11): на aptekonline.az встречаются
+        # явные опечатки — товар стоит 0.20 ₼ против 28 ₼ на других сайтах
+        # (вероятно single-piece price вместо pack-price). Если в кластере
+        # есть цена < 10% медианы — это data error, не реальный undercut.
+        # Filterим такой outlier, чтобы клиент не видел false-undercut алерты.
+        prices = raw_prices
+        if len(raw_prices) >= 2:
+            vals = sorted(d["price"] for d in raw_prices.values())
+            median = vals[len(vals) // 2]
+            outlier_threshold = median * 0.1  # 10× cheaper than median
+            prices = {
+                site: data for site, data in raw_prices.items()
+                if data["price"] >= outlier_threshold
+            }
+
         sites_with_price = len(prices)
         if sites_with_price < min_sites:
             continue

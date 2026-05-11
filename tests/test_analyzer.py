@@ -201,6 +201,32 @@ def test_diff_only_undercut_uses_latest_snapshot_globally(db_session):
     assert u.competitor_price == 80.0
 
 
+def test_undercut_skips_obvious_data_error_prices(db_session):
+    """Конкурент с ценой < 10% клиента — пропускаем как data error.
+
+    Регрессия 2026-05-11: aptekonline.az имеет SKU с typo ценой 0.20 ₼
+    при реальной цене ~28 ₼ на других сайтах. Эти fake undercuts
+    замусоривали /comparison и алерты. Фильтр в _detect_undercuts.
+    """
+    m = storage.Match(canonical_name="Foo", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    client = _add_product(db_session, "pharmonline", "Foo", "ph-1", canonical_id=m.id)
+    comp_bad = _add_product(db_session, "aloe", "Foo", "al-1", canonical_id=m.id)
+    comp_good = _add_product(db_session, "aptekonline", "Foo", "apt-1", canonical_id=m.id)
+    run = _add_run(db_session, utcnow())
+    _add_snapshot(db_session, run, client, 28.0)
+    _add_snapshot(db_session, run, comp_bad, 0.20)   # data error — должен пропуститься
+    _add_snapshot(db_session, run, comp_good, 25.0)  # legitimate undercut
+    db_session.commit()
+
+    report = analyzer.analyze(db_session, run.id)
+    sites = {u.competitor_site for u in report.undercuts}
+    assert sites == {"aptekonline"}, (
+        f"Должен попасть только aptekonline (25₼ < 28₼). aloe 0.20₼ — outlier. Got: {sites}"
+    )
+
+
 def test_no_undercut_when_competitor_more_expensive(db_session):
     m = storage.Match(canonical_name="Foo", confidence=1.0)
     db_session.add(m)
