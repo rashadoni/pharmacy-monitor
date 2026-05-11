@@ -28,7 +28,11 @@ function extractSlug(site: "pharmonline" | "aptekonline" | "aloe", input: string
     if (site === "aptekonline") {
       // categoryId[]=252 — array param
       const v = u.searchParams.get("categoryId[]") ?? u.searchParams.get("categoryId");
-      return v ?? trimmed;
+      if (v) return v;
+      // Path-style: /products/292 или /category/N
+      const m = u.pathname.match(/\/(?:products|category)\/(\d+)/);
+      if (m) return m[1];
+      return trimmed;
     }
     if (site === "aloe") {
       const v = u.searchParams.get("category_slug");

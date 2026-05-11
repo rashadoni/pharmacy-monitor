@@ -7833,3 +7833,5 @@ HTTP Request: GET https://www.aptekonline.az/shop/productList?categoryId%5B%5D=7
 HTTP Request: GET https://www.aptekonline.az/shop/productList?categoryId%5B%5D=78&lang=az&page=18 "HTTP/1.1 200 OK"
 HTTP Request: GET https://www.aptekonline.az/shop/productList?categoryId%5B%5D=78&lang=az&page=19 "HTTP/1.1 200 OK"
 HTTP Request: GET https://www.aptekonline.az/shop/productList?categoryId%5B%5D=78&lang=az&page=20 "HTTP/1.1 200 OK"
+HTTP Request: GET https://www.aptekonline.az/shop/productList?categoryId%5B%5D=292&lang=az&page=1 "HTTP/1.1 200 OK"
+HTTP Request: GET https://www.aptekonline.az/shop/productList?categoryId%5B%5D=292&lang=az&page=2 "HTTP/1.1 200 OK"
