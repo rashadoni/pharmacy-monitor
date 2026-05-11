@@ -152,31 +152,98 @@ function PriceIndexSection() {
   );
 }
 
+interface ForecastMover {
+  product_id: number;
+  site: string;
+  name: string;
+  n_points: number;
+  first_price: number;
+  last_price: number;
+  change_pct: number;
+  direction: "rising" | "falling" | "stable";
+  forecast_7d_price: number;
+  confidence: "low" | "medium" | "high";
+}
+
 function ForecastSection() {
-  const { data, isLoading } = useQuery({
+  const { data, isLoading } = useQuery<ForecastMover[]>({
     queryKey: ["forecast"],
     queryFn: () =>
       fetch("/api/v1/dash/forecast/movers", { credentials: "include" }).then((r) => r.json()),
   });
 
+  // Скрываем "битые" продукты с явными data-error ценами:
+  // - first_price > 500 ₼ для аптечных товаров — почти всегда concat bug
+  //   («"11.35 AZN 88 AZN"» → 1135.88)
+  // - change_pct < -95 за 30 дней — нереалистично для лекарств/детпит'а
+  // - change_pct > 500 — то же самое, артефакт парсера
+  const clean = (data ?? []).filter(
+    (m) =>
+      m.first_price < 500 &&
+      m.last_price < 500 &&
+      m.change_pct > -95 &&
+      m.change_pct < 500,
+  );
+
   return (
     <Card title="Top movers (forecast)">
+      <div className="text-xs text-muted-foreground mb-3">
+        Товары с самыми большими движениями цены за последние 30 дней.
+        Сортировка по абс. величине изменения.
+      </div>
       {isLoading && <Skeleton />}
-      {data && data.length === 0 && (
+      {!isLoading && clean.length === 0 && (
         <div className="text-muted-foreground text-center py-8">
-          Forecast требует ≥3 daily run'ов. Через несколько дней появится.
+          Forecast требует ≥3 daily run&apos;ов. Через несколько дней появится.
         </div>
       )}
-      {data && data.length > 0 && (
-        <ul className="space-y-1 text-sm">
-          {data.slice(0, 10).map((m: any, i: number) => (
-            <li key={i} className="rounded border border-border p-2">
-              <pre className="text-xs">{JSON.stringify(m, null, 2)}</pre>
-            </li>
+      {clean.length > 0 && (
+        <div className="space-y-2">
+          {clean.slice(0, 10).map((m) => (
+            <ForecastRow key={m.product_id} mover={m} />
           ))}
-        </ul>
+        </div>
       )}
     </Card>
+  );
+}
+
+function ForecastRow({ mover }: { mover: ForecastMover }) {
+  const dirColor =
+    mover.direction === "falling"
+      ? "text-destructive"
+      : mover.direction === "rising"
+        ? "text-success"
+        : "text-muted-foreground";
+  const arrow =
+    mover.direction === "falling" ? "↓" : mover.direction === "rising" ? "↑" : "→";
+
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium truncate" title={mover.name}>
+            {mover.name}
+          </div>
+          <div className="text-xs text-muted-foreground mt-0.5">
+            {mover.site} · {mover.n_points} замеров за 30д · confidence: {mover.confidence}
+          </div>
+        </div>
+        <div className={`text-right shrink-0 ${dirColor}`}>
+          <div className="text-base font-semibold tabular-nums">
+            {arrow} {mover.change_pct.toFixed(1)}%
+          </div>
+          <div className="text-xs text-muted-foreground tabular-nums">
+            {mover.first_price.toFixed(2)} → {mover.last_price.toFixed(2)} ₼
+          </div>
+        </div>
+      </div>
+      {mover.forecast_7d_price > 0 && (
+        <div className="text-xs text-muted-foreground mt-1.5 pt-1.5 border-t border-border/50">
+          Прогноз через 7д: <span className="font-mono">{mover.forecast_7d_price.toFixed(2)} ₼</span>
+        </div>
+      )}
+    </div>
   );
 }
 

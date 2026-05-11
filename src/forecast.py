@@ -280,6 +280,15 @@ def top_movers(
         change_pct = (last_p - first_p) / first_p * 100 if first_p else 0.0
         if abs(change_pct) < min_change_pct:
             continue
+        # Data-quality guard (2026-05-11): отсекаем артефакты старого aptekonline
+        # parser bug'а — цена концатенировалась как «11 AZN 35.88 AZN» → 1135.88.
+        # Реальные аптечные товары:
+        # - стоят < 500 ₼ (есть исключения — мед.оборудование, но они не в movers)
+        # - не падают/растут на > 95% за 30 дней (только если был typo).
+        if first_p > 500 or last_p > 500:
+            continue
+        if abs(change_pct) > 95:
+            continue
 
         base_t = timestamps[0]
         xs = [(t - base_t).total_seconds() / 3600 for t in timestamps]
