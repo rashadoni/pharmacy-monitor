@@ -53,6 +53,27 @@ def test_extract_pack_size():
     assert extract_pack_size("Bottle 100ml") == "100ml"
 
 
+def test_extract_pack_size_prefers_count_over_weight():
+    """Регрессия false-match (2026-05-11): для diapers «Huggies-4 8-14kg N66»
+    раньше возвращалось '14kg' (вес ребёнка), теперь должно вернуть n66
+    (=кол-во в упаковке). Это разделяет разные упаковки одного бренда
+    в matcher.py bucket_key.
+    """
+    # Diaper kg означает ВЕС РЕБЁНКА, не размер упаковки. N66 — реальный pack.
+    assert extract_pack_size("Diapers Huggies - 4 8-14kg Elit Soft №54") == "n54"
+    assert extract_pack_size("Huggies-4 Elit Soft uşaq bezi 8-14 kq N66") == "n66"
+    assert extract_pack_size("Huggies-3 Elite Soft 5-9 kq 21 əd") == "n21"
+    assert extract_pack_size("Huggies-5 Mega Elit Soft 12-22 kq 42 əd") == "n42"
+
+
+def test_extract_pack_size_volume_fallback():
+    """Если pack-count отсутствует — возвращаем volume/weight как раньше."""
+    assert extract_pack_size("Nestle baby food 200gr") == "200g"
+    assert extract_pack_size("Friso Gold 1 800g") == "800g"
+    assert extract_pack_size("Bottle 100ml") == "100ml"
+    assert extract_pack_size("just random text") is None
+
+
 def test_parse_price_simple():
     assert parse_price("24.50 AZN") == 24.50
     assert parse_price("24,50 ₼") == 24.50

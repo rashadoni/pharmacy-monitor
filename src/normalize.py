@@ -58,9 +58,30 @@ _DOSAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Размер упаковки: N tab, 30 шт, 100ml, 400 q, etc.
+# Размер упаковки. Двухэтапно (фикс 2026-05-11): сначала ищем «КОЛИЧЕСТВО
+# в упаковке» (N66, 30 tab, 54 əd) — это specifically отличает разные SKU
+# одного бренда. Только если не нашли — фолбэк на объём/вес (100ml, 400q).
+#
+# Старый _PACK_RE брал первое совпадение слева → для «Huggies-4 8-14kg N66»
+# возвращал «14kg» (вес РЕБЁНКА!), а N66 терялся → разные упаковки сливались
+# в один false match (match_id=447, 0.20 AZN ↔ 28.90 AZN).
+_PACK_COUNT_RE = re.compile(
+    r"\bN\s*(\d+)"                                                                   # N20, N 20 (ASCII N)
+    r"|№\s*(\d+)"                                                                    # №20 (Unicode № — \b не работает с non-word)
+    r"|(\d+)\s*(?:tab|tabletka|kapsul|capsules|kaps|şt|шт|adet|amp|pieces|əd)",      # 30 tab, 54 əd
+    re.IGNORECASE,
+)
+# Vol unit list: ml, kg, kq, qr, qrm, q, gr, g. Используем lookahead вместо \b
+# чтобы matchать "200gr" (g + r — оба word-char, обычный \b не пройдёт).
+_PACK_VOLUME_RE = re.compile(
+    r"\b(\d+\s*(?:ml|kg|kq|qrm|qr|gr|q|g))(?=\b|[^a-zA-Z])",
+    re.IGNORECASE,
+)
+# Backward-compat: оставляем _PACK_RE для других мест (normalize_name использует
+# его для удаления pack-токенов из имени).
 _PACK_RE = re.compile(
-    r"\b(\d+\s*(?:tab|tabletka|kapsul|capsules|kaps|şt|шт|adet|amp|pieces|шт\.?|n\d+)|n\s*\d+|\d+\s*(?:ml|kg|kq|qr|qrm|q|g)\b)",
+    r"\b(\d+\s*(?:tab|tabletka|kapsul|capsules|kaps|şt|шт|adet|amp|pieces|əd|n\d+)"
+    r"|n\s*\d+|№\s*\d+|\d+\s*(?:ml|kg|kq|qr|qrm|q|g))\b",
     re.IGNORECASE,
 )
 
@@ -134,12 +155,13 @@ def _unify_brand_spelling(s: str) -> str:
 
 
 def _normalize_units(unit_str: str | None) -> str | None:
-    """qr→q, kq→kg на извлечённой dosage/pack строке. Возвращает None если пусто."""
+    """qr→q, kq→kg, gr→g на извлечённой dosage/pack строке. Возвращает None если пусто."""
     if not unit_str:
         return None
     s = unit_str.lower().strip()
     s = re.sub(r"(\d)\s*qr\b", r"\1q", s)
     s = re.sub(r"(\d)\s*kq\b", r"\1kg", s)
+    s = re.sub(r"(\d)\s*gr\b", r"\1g", s)
     return s or None
 
 
@@ -189,14 +211,32 @@ def extract_dosage(name: str) -> str | None:
 
 
 def extract_pack_size(name: str) -> str | None:
-    """Вытащить размер упаковки (30 tab, N20, 100ml, 400 q). qr→q нормализуется."""
+    """Вытащить размер упаковки. qr→q нормализуется.
+
+    Приоритет (фикс 2026-05-11):
+    1. КОЛИЧЕСТВО в упаковке: «N66», «№ 20», «30 tab», «54 əd» —
+       это разделяет SKU одного бренда (Huggies-4 N54 vs N66).
+    2. Объём/вес (фолбэк): «100ml», «400q», «8-14kg» —
+       только если pack-count не найден.
+
+    Раньше единая regex брала левое первое совпадение, поэтому
+    для diapers «Huggies-4 8-14kg N66» получали «14kg» (= вес ребёнка!)
+    вместо «N66» (= кол-во в упаковке) → false matches.
+    """
     if not name:
         return None
-    m = _PACK_RE.search(name)
-    if not m:
-        return None
-    raw = re.sub(r"\s+", "", m.group(1).lower())
-    return _normalize_units(raw)
+    # Этап 1: пытаемся достать count
+    m = _PACK_COUNT_RE.search(name)
+    if m:
+        count = next((g for g in m.groups() if g), None)
+        if count:
+            return f"n{count}"
+    # Этап 2: фолбэк на vol/weight
+    m = _PACK_VOLUME_RE.search(name)
+    if m:
+        raw = re.sub(r"\s+", "", m.group(1).lower())
+        return _normalize_units(raw)
+    return None
 
 
 _PRICE_TOKEN_RE = re.compile(r"\d[\d,.]*")
