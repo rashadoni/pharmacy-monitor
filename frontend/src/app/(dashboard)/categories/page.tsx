@@ -64,6 +64,7 @@ export default function CategoriesPage() {
   const [search, setSearch] = useState("");
   const [siteFilter, setSiteFilter] = useState<"" | "pharmonline" | "aptekonline" | "aloe">("");
   const [activeOnly, setActiveOnly] = useState(false);
+  const [crossFilter, setCrossFilter] = useState<"" | "cross2" | "cross3">("");
   const [showAdd, setShowAdd] = useState(false);
   const [editing, setEditing] = useState<CategoryRow | null>(null);
   const queryClient = useQueryClient();
@@ -81,6 +82,8 @@ export default function CategoriesPage() {
     if (siteFilter === "aptekonline" && !c.aptekonline_slug) return false;
     if (siteFilter === "aloe" && !c.aloe_slug) return false;
     if (activeOnly && !c.is_active) return false;
+    if (crossFilter === "cross2" && !(c.pharmonline_slug && c.aptekonline_slug)) return false;
+    if (crossFilter === "cross3" && !(c.pharmonline_slug && c.aptekonline_slug && c.aloe_slug)) return false;
     return true;
   });
 
@@ -151,6 +154,15 @@ export default function CategoriesPage() {
           <option value="pharmonline">pharmonline</option>
           <option value="aptekonline">aptekonline</option>
           <option value="aloe">aloe</option>
+        </select>
+        <select
+          value={crossFilter}
+          onChange={(e) => setCrossFilter(e.target.value as any)}
+          className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+        >
+          <option value="">Любой охват</option>
+          <option value="cross2">Только Cross-2 (pharm+apt)</option>
+          <option value="cross3">Только Cross-3 (все 3 сайта)</option>
         </select>
         <label className="inline-flex items-center gap-2 px-3 text-sm">
           <input
