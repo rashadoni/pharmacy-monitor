@@ -192,6 +192,18 @@ SELECT COUNT(*) FROM products;
 - **ERP интеграция клиента** — не требуется. Не предлагать в будущих сессиях.
 - **PWA / native mobile app** — не требуется. Текущий Next.js mobile-first дашборд достаточен.
 
+## Integration setup (one-shot)
+
+Для настройки SMTP / Telegram / Sentry / GitHub remote / ScraperAPI Hobby:
+
+```bash
+bash scripts/configure-integrations.sh
+```
+
+Интерактивный скрипт — 5 блоков, каждый можно пропустить. Обновляет
+`/etc/pharmacy-monitor/env` на проде, рестартит `pharmacy-monitor-api`.
+Ссылки на signup-страницы каждого сервиса встроены в подсказки.
+
 ## How to continue work
 
 1. Read this file (you already are)
