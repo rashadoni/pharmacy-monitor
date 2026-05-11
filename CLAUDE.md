@@ -120,7 +120,7 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
 - 7 false matches in matcher (Friso 3 Gold ↔ Friso Prematures etc) — needs manual reject via UI on /comparison
 - `admin off` in `/etc/caddy/Caddyfile` — `systemctl reload caddy` fails, use `restart` instead
 - Caddy backup config: `/etc/caddy/Caddyfile.bak.20260506-2038` (pre-HTTPS)
-- **Next.js standalone deploy gotcha (2026-05-11)**: после `pnpm build` на проде НУЖНО руками копировать static в standalone. Иначе все страницы возвращают blank screen с `ChunkLoadError`. Команда после каждого frontend-деплоя: `cd /opt/pharmacy-monitor/frontend && rm -rf .next/standalone/.next/static && cp -r .next/static .next/standalone/.next/static && systemctl restart pharmacy-monitor-frontend`. TODO: добавить `ExecStartPre` в `/etc/systemd/system/pharmacy-monitor-frontend.service` чтобы автоматизировать.
+- ~~**Next.js standalone deploy gotcha (2026-05-11)**: после `pnpm build` руками копировать static в standalone~~ **FIXED 2026-05-11**: `ExecStartPre` в `/etc/systemd/system/pharmacy-monitor-frontend.service` теперь автоматически копирует `.next/static/` → `.next/standalone/.next/static/` при каждом restart. Деплой свёлся к: `tar czf - <files> | ssh ... 'tar xzf -' && ssh ... 'cd frontend && pnpm build && systemctl restart pharmacy-monitor-frontend'`. **Важно: владелец `.next/` должен быть `pm:pm`** (chown'нили 2026-05-11) — иначе ExecStartPre упадёт на `Permission denied`.
 
 ## Useful commands
 
