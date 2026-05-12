@@ -26,7 +26,7 @@ export default function AnalyticsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">📈 Аналитика</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Аналитика</h1>
         <p className="text-sm text-muted-foreground">
           Match quality, brand share, price index, forecast
         </p>
@@ -172,31 +172,27 @@ function ForecastSection() {
       fetch("/api/v1/dash/forecast/movers", { credentials: "include" }).then((r) => r.json()),
   });
 
-  // Скрываем "битые" продукты с явными data-error ценами:
-  // - first_price > 500 ₼ для аптечных товаров — почти всегда concat bug
-  //   («"11.35 AZN 88 AZN"» → 1135.88)
-  // - change_pct < -95 за 30 дней — нереалистично для лекарств/детпит'а
-  // - change_pct > 500 — то же самое, артефакт парсера
+  // Фильтр аномальных движений: ±50% за 30 дней — крайний предел разумного для
+  // аптечных товаров. Всё что вышло за этот диапазон практически всегда либо
+  // артефакт парсера (concat AZN-bug, e.g. "11.35 AZN 88 AZN" → 1135.88) либо
+  // ошибочный matching. Показывать клиенту нет смысла — будет вопросы.
   const clean = (data ?? []).filter(
-    (m) =>
-      m.first_price < 500 &&
-      m.last_price < 500 &&
-      m.change_pct > -95 &&
-      m.change_pct < 500,
+    (m) => Math.abs(m.change_pct) <= 50 && m.first_price > 0 && m.last_price > 0,
   );
 
+  // Если данных вовсе нет — не рендерим раздел, чтобы не было placeholder'а
+  // «появится через N дней». Forecast вернётся когда наберётся ≥3 прогона.
+  if (!isLoading && clean.length === 0) {
+    return null;
+  }
+
   return (
-    <Card title="Top movers (forecast)">
+    <Card title="Топ движений цены за 30 дней">
       <div className="text-xs text-muted-foreground mb-3">
-        Товары с самыми большими движениями цены за последние 30 дней.
-        Сортировка по абс. величине изменения.
+        Товары с самыми большими движениями цены. Отфильтрованы артефакты
+        парсинга (изменения вне ±50%).
       </div>
       {isLoading && <Skeleton />}
-      {!isLoading && clean.length === 0 && (
-        <div className="text-muted-foreground text-center py-8">
-          Forecast требует ≥3 daily run&apos;ов. Через несколько дней появится.
-        </div>
-      )}
       {clean.length > 0 && (
         <div className="space-y-2">
           {clean.slice(0, 10).map((m) => (

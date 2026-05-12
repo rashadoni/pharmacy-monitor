@@ -44,7 +44,7 @@ export default function AlertsPage() {
   return (
     <div className="space-y-4">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">🔔 Алерты</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Алерты</h1>
         <p className="text-sm text-muted-foreground">События за последние прогоны</p>
       </div>
 

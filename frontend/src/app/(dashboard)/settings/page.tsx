@@ -148,42 +148,46 @@ function IntegrationsStatusSection() {
   const items: { key: string; label: string; ok: boolean; hint: string }[] = [
     {
       key: "smtp",
-      label: "SMTP (email-уведомления, отчёты, magic-link)",
+      label: "Email-уведомления",
       ok: q.data.smtp,
-      hint: q.data.smtp ? `Активен (FROM: ${q.data.smtp_from ?? "—"})` : "Нужен SMTP_HOST + SMTP_PASSWORD",
+      hint: q.data.smtp
+        ? `Подключено (отправка с ${q.data.smtp_from ?? "—"})`
+        : "Не подключено · можно включить через 5 минут (Resend / SendGrid)",
     },
     {
       key: "telegram",
-      label: "Telegram (push-алерты)",
+      label: "Telegram push-алерты",
       ok: q.data.telegram,
       hint: q.data.telegram
-        ? `Bot готов${q.data.telegram_bot_username ? ` (@${q.data.telegram_bot_username})` : ""}`
-        : "Нужен TELEGRAM_BOT_TOKEN от @BotFather",
+        ? `Подключено${q.data.telegram_bot_username ? ` (@${q.data.telegram_bot_username})` : ""}`
+        : "Не подключено · нужен бот-токен от @BotFather (бесплатно)",
     },
     {
       key: "sentry",
-      label: "Sentry (error tracking)",
+      label: "Мониторинг ошибок (Sentry)",
       ok: q.data.sentry,
-      hint: q.data.sentry ? "Ошибки логируются" : "Нужен SENTRY_DSN от sentry.io",
+      hint: q.data.sentry
+        ? "Подключено · ошибки и performance отслеживаются"
+        : "Не подключено · опционально, free-tier 5K событий/мес",
     },
     {
       key: "scraperapi",
-      label: "ScraperAPI (proxy для забаненных IP)",
+      label: "Резервный прокси (ScraperAPI)",
       ok: q.data.scraperapi,
       hint: q.data.scraperapi
-        ? `Активен для: ${q.data.scraperapi_sites.join(", ") || "(нет sites в env)"}`
-        : "Опционально — для aptekonline на проде нужен Hobby $49/мес residential",
+        ? `Подключено для: ${q.data.scraperapi_sites.join(", ") || "—"}`
+        : "Не подключено · опционально для обхода IP-блокировок",
     },
   ];
 
   const okCount = items.filter((i) => i.ok).length;
 
   return (
-    <Section title="Интеграции сервера" icon={Zap}>
+    <Section title="Интеграции" icon={Zap}>
       <div className="text-xs text-muted-foreground mb-3">
-        Внешние сервисы, настроенные в <code className="font-mono">/etc/pharmacy-monitor/env</code>.
-        Готово: <span className="font-semibold">{okCount} / {items.length}</span>.
-        Полная настройка одной командой: <code className="font-mono">bash scripts/configure-integrations.sh</code>
+        Внешние сервисы для уведомлений и мониторинга.
+        Подключено: <span className="font-semibold">{okCount} / {items.length}</span>.
+        Каждый из них опционален — ядро системы работает и без них.
       </div>
       <div className="space-y-2">
         {items.map((it) => (

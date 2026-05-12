@@ -59,7 +59,7 @@ export default function ComparisonPage() {
   return (
     <div className="space-y-4">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">🔍 Сравнение цен</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Сравнение цен</h1>
         <p className="text-sm text-muted-foreground">
           Cross-site matched товары. Зелёным — самая низкая цена, красным — самая высокая.
         </p>

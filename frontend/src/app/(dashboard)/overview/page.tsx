@@ -185,8 +185,8 @@ function RunBreakdownPanel({
   if (sites.length === 0) {
     return (
       <div className="text-xs text-muted-foreground">
-        Нет breakdown-данных. Этот прогон был до 2026-05-11 (тогда поле
-        products_per_site_category ещё не сохранялось). Новые runs будут иметь подробности.
+        Этот прогон не содержит per-category breakdown — он был выполнен до
+        включения детальной статистики. Свежие прогоны имеют полную разбивку.
       </div>
     );
   }

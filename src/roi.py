@@ -104,7 +104,7 @@ def compute_actions(
     *,
     raise_threshold_pct: float = 5.0,  # минимальная разница чтобы советовать поднять
     undercut_threshold_pct: float = 3.0,  # минимальная просадка чтобы алерт
-    max_spread_pct: float = 90.0,  # выше этого считаем bad-match и скрываем
+    max_spread_pct: float = 80.0,  # выше этого считаем bad-match и скрываем
     max_per_type: int = 10,
 ) -> list[ActionItem]:
     """Главная точка: собрать все действия, отсортировать по spread desc.
@@ -115,7 +115,7 @@ def compute_actions(
     """
     actions: list[ActionItem] = []
     actions += _price_raise_opportunities(
-        session, raise_threshold_pct, max_per_type
+        session, raise_threshold_pct, max_spread_pct, max_per_type
     )
     actions += _undercut_threats(
         session, undercut_threshold_pct, max_spread_pct, max_per_type
@@ -141,9 +141,14 @@ def _latest_run_id(session: Session) -> int | None:
 
 
 def _price_raise_opportunities(
-    session: Session, threshold_pct: float, max_n: int
+    session: Session, threshold_pct: float, max_spread_pct: float, max_n: int
 ) -> list[ActionItem]:
-    """Где клиент дешевле всех конкурентов более чем на threshold%."""
+    """Где клиент дешевле всех конкурентов более чем на threshold%.
+
+    Пропускаем gap >= `max_spread_pct` (80% по умолчанию) — почти наверняка
+    bad match (например, поштучный товар склеен с упаковкой 10 шт), советовать
+    «подними с 0.20 до 7.60 ₼ — будешь в 3800% дороже» бесполезно.
+    """
     run_id = _latest_run_id(session)
     if not run_id:
         return []
@@ -170,6 +175,8 @@ def _price_raise_opportunities(
         gap_pct = (median_comp - client_price) / client_price * 100
         if gap_pct < threshold_pct:
             continue  # разница слишком мелкая
+        if gap_pct >= max_spread_pct:
+            continue  # подозрительно — likely bad match (e.g. pack-size mismatch)
 
         # Целевая цена = медиана конкурентов − 2% буфер (чтоб остаться лучшим)
         target = round(median_comp * 0.98, 2)
