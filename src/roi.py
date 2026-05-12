@@ -1,7 +1,7 @@
 """ROI / Actionable insights — превращаем сырые данные в конкретные действия.
 
 Главная цель: вместо "вот метрики, разбирайся" дать клиенту:
-    "Опусти Aspirin Cardio на 0.50 ₼ → возможный профит +210 ₼/мес"
+    "Опусти Aspirin Cardio на 0.50 ₼ за единицу (−31% от текущей)"
 
 Поддерживаемые типы действий:
     1. PRICE_RAISE     — клиент дешевле всех конкурентов, можно поднять
@@ -9,8 +9,17 @@
     3. ASSORTMENT_GAP  — товар есть у конкурента, нет у клиента
     4. PROMO_RESPONSE  — конкурент запустил акцию (нужно реагировать)
 
-Все денежные оценки рассчитываются от **assumed_monthly_volume** —
-по умолчанию 30 ед./мес. Клиент может менять в UI.
+Что НЕ рассчитываем (и почему):
+    «AZN/месяц» убран 2026-05-13 — старый код умножал разницу цен на
+    захардкоженный объём `assumed_monthly_volume=30`. Это был placeholder
+    без основания: у одного товара 200 шт/мес, у другого 2 шт/мес. Получался
+    misleading вывод где приоритеты не отражали реальный профит.
+    Теперь возвращаем ТОЛЬКО проверяемые цифры: `unit_gap_azn` (разница на
+    единицу) и `spread_pct` (% спред). Клиент сам прикинет ×свой_объём.
+
+    Когда у клиента будет ERP-интеграция с реальной stock-историей, можно
+    будет deriv'ить `monthly_volume = (stock_start - stock_end + purchases)
+    / days × 30` per-product и вернуть честные ₼/мес.
 """
 
 from __future__ import annotations
@@ -55,7 +64,16 @@ class ActionItem:
     product_url: str | None = None
     current_value_azn: float | None = None
     target_value_azn: float | None = None
-    estimated_monthly_impact_azn: float = 0.0  # положительное = профит
+    # Разница цены за ЕДИНИЦУ товара (положительное = профит при подъёме,
+    # отрицательное = маржа которую теряем если опустим до конкурента).
+    unit_gap_azn: float | None = None
+    # % спред между ценами. Положительный для price_raise (мы дешевле),
+    # отрицательный для undercut (конкурент дешевле).
+    spread_pct: float | None = None
+    # DEPRECATED 2026-05-13: всегда 0.0. Раньше = unit_gap × assumed_volume=30,
+    # но volume был placeholder без основания. Поле остаётся для backward-compat
+    # с telegram_bot.py + старого dashboard.py. Не использовать в новом коде.
+    estimated_monthly_impact_azn: float = 0.0
     competitor_site: str | None = None
     competitor_url: str | None = None
     extra: dict = field(default_factory=dict)
@@ -84,28 +102,33 @@ def _preload_snapshots(session: Session, run_id: int) -> dict[int, "PriceSnapsho
 def compute_actions(
     session: Session,
     *,
-    assumed_monthly_volume: int = 30,
     raise_threshold_pct: float = 5.0,  # минимальная разница чтобы советовать поднять
     undercut_threshold_pct: float = 3.0,  # минимальная просадка чтобы алерт
+    max_spread_pct: float = 90.0,  # выше этого считаем bad-match и скрываем
     max_per_type: int = 10,
 ) -> list[ActionItem]:
-    """Главная точка: собрать все действия, отсортировать по impact desc."""
+    """Главная точка: собрать все действия, отсортировать по spread desc.
+
+    Сортируем по |spread_pct| desc — самые большие разрывы вверху. Не по
+    «месячному impact'у» потому что объёмы продаж нам неизвестны (см.
+    module docstring).
+    """
     actions: list[ActionItem] = []
     actions += _price_raise_opportunities(
-        session, assumed_monthly_volume, raise_threshold_pct, max_per_type
+        session, raise_threshold_pct, max_per_type
     )
     actions += _undercut_threats(
-        session, assumed_monthly_volume, undercut_threshold_pct, max_per_type
+        session, undercut_threshold_pct, max_spread_pct, max_per_type
     )
     actions += _assortment_gaps(session, max_per_type)
     actions += _promo_responses(session, max_per_type)
 
-    # Сортировка: critical → warning → opportunity → info; внутри — по impact desc
+    # Сортировка: critical → warning → opportunity → info; внутри — по |spread_pct| desc
     sev_order = {"critical": 0, "warning": 1, "opportunity": 2, "info": 3}
     actions.sort(
         key=lambda a: (
             sev_order.get(a.severity, 9),
-            -a.estimated_monthly_impact_azn,
+            -abs(a.spread_pct or 0),
         )
     )
     return actions
@@ -118,7 +141,7 @@ def _latest_run_id(session: Session) -> int | None:
 
 
 def _price_raise_opportunities(
-    session: Session, volume: int, threshold_pct: float, max_n: int
+    session: Session, threshold_pct: float, max_n: int
 ) -> list[ActionItem]:
     """Где клиент дешевле всех конкурентов более чем на threshold%."""
     run_id = _latest_run_id(session)
@@ -150,8 +173,7 @@ def _price_raise_opportunities(
 
         # Целевая цена = медиана конкурентов − 2% буфер (чтоб остаться лучшим)
         target = round(median_comp * 0.98, 2)
-        delta = target - client_price
-        impact = round(delta * volume, 2)
+        delta = round(target - client_price, 2)
 
         client_product = _client_product(m)
         # Если товара нет на складе — нет смысла советовать поднимать
@@ -171,11 +193,12 @@ def _price_raise_opportunities(
             product_url=client_product.url if client_product else None,
             current_value_azn=client_price,
             target_value_azn=target,
-            estimated_monthly_impact_azn=impact,
-            extra={"gap_pct": round(gap_pct, 1), "median_competitor": median_comp},
+            unit_gap_azn=delta,
+            spread_pct=round(gap_pct, 1),
+            extra={"median_competitor": median_comp},
         ))
 
-    out.sort(key=lambda a: -a.estimated_monthly_impact_azn)
+    out.sort(key=lambda a: -(a.spread_pct or 0))
     return out[:max_n]
 
 
@@ -187,9 +210,15 @@ def _is_in_stock(session: Session, product_id: int) -> bool:
 
 
 def _undercut_threats(
-    session: Session, volume: int, threshold_pct: float, max_n: int
+    session: Session, threshold_pct: float, max_spread_pct: float, max_n: int
 ) -> list[ActionItem]:
-    """Где конкурент опустил цену ниже клиента."""
+    """Где конкурент опустил цену ниже клиента.
+
+    Пропускаем спреды >= `max_spread_pct` (90% по умолчанию) — такое отклонение
+    обычно говорит не о настоящем undercut'е, а о бракованном matching'е
+    (например, поштучный товар слепился с упаковкой 10шт). Реальные ценовые
+    войны не дают 99% дисконт.
+    """
     run_id = _latest_run_id(session)
     if not run_id:
         return []
@@ -219,12 +248,15 @@ def _undercut_threats(
         diff_pct = (client_price - cheapest_comp_price) / client_price * 100
         if diff_pct < threshold_pct:
             continue
+        if diff_pct >= max_spread_pct:
+            # Подозрительный спред — почти наверняка bad match. Скрываем
+            # чтобы не вводить клиента в заблуждение «опусти до 0.25 ₼».
+            continue
 
         # Рекомендованная новая цена = match competitor − 0.01 (быть на копейку дешевле)
         target = round(cheapest_comp_price - 0.01, 2)
         # Lost margin per unit (assuming we have to match)
-        lost_per_unit = client_price - target
-        impact = round(-lost_per_unit * volume, 2)  # отрицательно — это убыток
+        lost_per_unit = round(client_price - target, 2)
 
         client_product = _client_product(m)
         comp_url = next(
@@ -269,13 +301,14 @@ def _undercut_threats(
             product_url=client_product.url if client_product else None,
             current_value_azn=client_price,
             target_value_azn=target,
-            estimated_monthly_impact_azn=impact,
+            unit_gap_azn=-lost_per_unit,  # отрицательное — потерянная маржа на единицу
+            spread_pct=-round(diff_pct, 1),  # отрицательный = конкурент дешевле
             competitor_site=cheapest_comp_site,
             competitor_url=comp_url,
-            extra={"diff_pct": round(diff_pct, 1)},
         ))
 
-    out.sort(key=lambda a: a.estimated_monthly_impact_azn)  # самые большие убытки сверху
+    # Сортируем по |spread_pct| desc — самые серьёзные разрывы сверху
+    out.sort(key=lambda a: -abs(a.spread_pct or 0))
     return out[:max_n]
 
 
@@ -391,13 +424,20 @@ def _client_product(match: Match) -> Product | None:
 
 
 def aggregate_impact(actions: list[ActionItem]) -> dict[str, float]:
-    """Сумма impact'ов по типам — для KPI-карточек на главной."""
+    """Свёртка по unit-gap'ам — для информативных карточек.
+
+    Возвращаем сумму unit_gap_azn по типам (положительное = возможный
+    профит на единицу, отрицательное = потерянная маржа на единицу).
+    Это per-unit агрегат, не «в месяц» — реальный месячный impact зависит
+    от объёма продаж которого у нас нет.
+    """
     out = {"opportunity": 0.0, "loss": 0.0, "total": 0.0, "count": 0}
     for a in actions:
         out["count"] += 1
-        if a.estimated_monthly_impact_azn > 0:
-            out["opportunity"] += a.estimated_monthly_impact_azn
-        else:
-            out["loss"] += a.estimated_monthly_impact_azn
-        out["total"] += a.estimated_monthly_impact_azn
+        gap = a.unit_gap_azn or 0.0
+        if gap > 0:
+            out["opportunity"] += gap
+        elif gap < 0:
+            out["loss"] += gap
+        out["total"] += gap
     return {k: round(v, 2) if isinstance(v, float) else v for k, v in out.items()}

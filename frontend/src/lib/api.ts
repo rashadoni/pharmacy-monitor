@@ -59,6 +59,11 @@ export interface RoiAction {
   product_url: string | null;
   current_value_azn: number | null;
   target_value_azn: number | null;
+  /** Разница цены за ЕДИНИЦУ товара. + = профит при подъёме, − = потерянная маржа при опускании. */
+  unit_gap_azn: number | null;
+  /** % спред. + = клиент дешевле, − = конкурент дешевле. */
+  spread_pct: number | null;
+  /** @deprecated 2026-05-13 — всегда 0. Раньше = unit_gap × placeholder volume 30. */
   estimated_monthly_impact_azn: number;
   competitor_site: string | null;
 }

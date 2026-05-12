@@ -979,6 +979,11 @@ def dash_roi_actions(
             "product_url": a.product_url,
             "current_value_azn": a.current_value_azn,
             "target_value_azn": a.target_value_azn,
+            # Реальные цифры (per-unit gap + % spread). См. roi.py module
+            # docstring — почему больше не возвращаем «AZN/мес».
+            "unit_gap_azn": a.unit_gap_azn,
+            "spread_pct": a.spread_pct,
+            # Deprecated — всегда 0. Сохранено для backward-compat (telegram bot).
             "estimated_monthly_impact_azn": a.estimated_monthly_impact_azn,
             "competitor_site": a.competitor_site,
         }

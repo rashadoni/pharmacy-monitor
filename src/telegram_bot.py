@@ -82,7 +82,7 @@ def cmd_help(session: Session, chat_id: str, args: str) -> str:
 def cmd_today(session: Session, chat_id: str, args: str) -> str:
     """Краткая сводка: топ-3 действия из ROI."""
     from src import roi
-    actions = roi.compute_actions(session, assumed_monthly_volume=30)
+    actions = roi.compute_actions(session)
     agg = roi.aggregate_impact(actions)
     if not actions:
         return "📊 *Сегодня:* данных пока нет — запусти прогон."
@@ -100,12 +100,15 @@ def cmd_today(session: Session, chat_id: str, args: str) -> str:
         sev = {"critical": "🔴", "warning": "⚠️", "opportunity": "💡", "info": "ℹ️"}.get(
             a.severity, "•"
         )
-        impact = (
-            f"+{a.estimated_monthly_impact_azn:.0f}"
-            if a.estimated_monthly_impact_azn > 0
-            else f"{a.estimated_monthly_impact_azn:.0f}"
+        # Показываем разницу на единицу + % спред — реально проверяемые цифры.
+        # «AZN/мес» убран 2026-05-13: множитель volume=30 был placeholder без
+        # основания, см. roi.py module docstring.
+        gap = a.unit_gap_azn or 0
+        spread = a.spread_pct or 0
+        gap_str = f"+{gap:.2f}" if gap > 0 else f"{gap:.2f}"
+        lines.append(
+            f"{i}. {sev} {a.title[:60]} (`{gap_str} ₼/ед`, спред {spread:.1f}%)"
         )
-        lines.append(f"{i}. {sev} {a.title[:60]} (`{impact} ₼/мес`)")
     return "\n".join(lines)
 
 

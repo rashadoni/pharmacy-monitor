@@ -285,9 +285,11 @@ function ActionRow({ action }: { action: RoiAction }) {
         : action.severity === "opportunity"
           ? "border-success/40 bg-success/5"
           : "border-border bg-card";
-  const showImpact =
-    action.estimated_monthly_impact_azn != null &&
-    Math.abs(action.estimated_monthly_impact_azn) < 100_000; // hide bug-prices
+  // Показываем РЕАЛЬНЫЕ цифры: разница на единицу + % спред.
+  // Раньше тут было «{impact}/мес», но impact = unit_gap × 30 (placeholder
+  // volume без основания) — вводило в заблуждение. Объёмов продаж у нас нет.
+  const hasGap = action.unit_gap_azn != null && action.spread_pct != null;
+  const gapPositive = (action.unit_gap_azn ?? 0) > 0;
   return (
     <div className={`rounded-lg border ${tone} p-3`}>
       <div className="flex items-start justify-between gap-2">
@@ -295,9 +297,20 @@ function ActionRow({ action }: { action: RoiAction }) {
           <div className="font-medium text-sm">{action.title}</div>
           <div className="text-xs text-muted-foreground mt-0.5">{action.detail}</div>
         </div>
-        {showImpact && (
-          <div className="text-sm font-semibold tabular-nums shrink-0">
-            {formatPrice(action.estimated_monthly_impact_azn)}/мес
+        {hasGap && (
+          <div className="shrink-0 text-right">
+            <div
+              className={`text-sm font-semibold tabular-nums ${
+                gapPositive ? "text-success" : "text-destructive"
+              }`}
+              title="Разница цены за единицу товара — реально проверяемая величина"
+            >
+              {gapPositive ? "+" : ""}
+              {formatPrice(action.unit_gap_azn ?? 0)} ₼/ед
+            </div>
+            <div className="text-[11px] text-muted-foreground tabular-nums">
+              {(action.spread_pct ?? 0).toFixed(1)}% спред
+            </div>
           </div>
         )}
       </div>

@@ -67,14 +67,17 @@ def test_price_raise_when_client_cheaper(db_session):
         db_session, "Aspirin",
         {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
     )
-    actions = roi.compute_actions(db_session, assumed_monthly_volume=30)
+    actions = roi.compute_actions(db_session)
     raise_actions = [a for a in actions if a.type == "price_raise"]
     assert len(raise_actions) == 1
     a = raise_actions[0]
     assert a.severity == "opportunity"
     assert a.current_value_azn == 5.00
     assert a.target_value_azn > 5.00
-    assert a.estimated_monthly_impact_azn > 0
+    assert a.unit_gap_azn is not None and a.unit_gap_azn > 0
+    assert a.spread_pct is not None and a.spread_pct > 0
+    # estimated_monthly_impact_azn deprecated — всегда 0
+    assert a.estimated_monthly_impact_azn == 0
 
 
 def test_undercut_when_competitor_cheaper(db_session):
@@ -82,15 +85,16 @@ def test_undercut_when_competitor_cheaper(db_session):
         db_session, "Paracetamol",
         {"pharmonline": 10.00, "aptekonline": 7.00, "aloe": 9.00},
     )
-    actions = roi.compute_actions(db_session, assumed_monthly_volume=30)
+    actions = roi.compute_actions(db_session)
     undercut_actions = [a for a in actions if a.type == "undercut"]
     assert len(undercut_actions) == 1
     a = undercut_actions[0]
     assert a.severity in ("warning", "critical")
     assert a.current_value_azn == 10.00
     assert a.target_value_azn < 10.00
-    # impact отрицательный (мы теряем margin)
-    assert a.estimated_monthly_impact_azn < 0
+    # unit_gap отрицательный (мы теряем margin per unit)
+    assert a.unit_gap_azn is not None and a.unit_gap_azn < 0
+    assert a.spread_pct is not None and a.spread_pct < 0  # отрицательный — конкурент дешевле
     assert a.competitor_site == "aptekonline"
 
 
@@ -157,7 +161,7 @@ def test_aggregate_impact_separates_opportunity_and_loss(db_session):
         {"pharmonline": 10.00, "aptekonline": 7.00, "aloe": 9.00},
         run=run,
     )
-    actions = roi.compute_actions(db_session, assumed_monthly_volume=30)
+    actions = roi.compute_actions(db_session)
     agg = roi.aggregate_impact(actions)
     assert agg["opportunity"] > 0
     assert agg["loss"] < 0
