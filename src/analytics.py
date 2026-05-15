@@ -30,6 +30,10 @@ COMPETITOR_SITES = ("aptekonline", "aloe")
 ALL_SITES = (CLIENT_SITE, *COMPETITOR_SITES)
 
 
+def _competitors_for(client_site: str) -> tuple[str, ...]:
+    return tuple(s for s in ALL_SITES if s != client_site)
+
+
 @dataclass
 class BrandRow:
     brand: str
@@ -40,12 +44,19 @@ class BrandRow:
 
 
 def brand_share(
-    session: Session, *, run_id: int | None = None, top_n: int = 30
+    session: Session,
+    *,
+    run_id: int | None = None,
+    top_n: int = 30,
+    site: str | None = None,
 ) -> list[BrandRow]:
     """Сводка: каких брендов сколько на каждом сайте.
 
     Возвращает список отсортированный по `total` desc, ограниченный top_n.
     Брэнды с пустым именем игнорируются.
+
+    Если передан `site` — возвращает только бренды, представленные на этом
+    сайте; counts остаются по всем сайтам (чтобы видеть exclusive-to флаг).
     """
     if run_id is None:
         run_id = session.scalar(
@@ -63,10 +74,10 @@ def brand_share(
 
     # Aggregate
     by_brand: dict[str, dict[str, int]] = defaultdict(lambda: {s: 0 for s in ALL_SITES})
-    for brand, site, n in rows:
+    for brand, site_name, n in rows:
         if not brand:
             continue
-        by_brand[brand][site] = n
+        by_brand[brand][site_name] = n
 
     out: list[BrandRow] = []
     for brand, counts in by_brand.items():
@@ -75,6 +86,8 @@ def brand_share(
         exclusive = None
         if sites_with == 1:
             exclusive = next(s for s, v in counts.items() if v > 0)
+        if site is not None and counts.get(site, 0) == 0:
+            continue
         out.append(BrandRow(
             brand=brand, counts=dict(counts), total=total,
             sites_with_brand=sites_with, exclusive_to=exclusive,
@@ -244,31 +257,35 @@ def match_quality(session: Session) -> MatchQuality:
     )
 
 
-def price_index_by_category(session: Session) -> list[PriceIndex]:
+def price_index_by_category(
+    session: Session,
+    *,
+    client_site: str = CLIENT_SITE,
+) -> list[PriceIndex]:
     """Для каждой категории — среднее по клиенту vs конкурентам.
 
-    N+1 fix: загружаем все snapshots run_id одним запросом, мапим product_id→snap.
+    Diff-only-aware: используем `latest_snapshots_per_product` вместо
+    snapshot'ов одного run_id. После 2026-05-09 snapshot пишется только
+    при изменении цены, поэтому фильтр `WHERE run_id == last_run` пропустил
+    бы продукты со стабильной ценой — и для бутиковых сайтов (aloe) это
+    давало пустой результат.
     """
-    run_id = session.scalar(
-        select(Run.id).where(Run.status == "ok").order_by(desc(Run.id)).limit(1)
-    )
-    if run_id is None:
+    from src.storage import latest_snapshots_per_product
+
+    competitor_sites = _competitors_for(client_site)
+    matches = session.scalars(select(Match)).all()
+    if not matches:
         return []
 
-    # Preload всех snapshots run'а одним SQL — устраняет N+1
-    snaps_by_pid = {
-        s.product_id: s for s in session.scalars(
-            select(PriceSnapshot).where(PriceSnapshot.run_id == run_id)
-        ).all()
-    }
+    all_pids = [p.id for m in matches for p in m.products]
+    snaps_by_pid = latest_snapshots_per_product(session, all_pids)
 
-    matches = session.scalars(select(Match)).all()
     by_cat: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: {"client": [], "competitor": []}
     )
 
     for m in matches:
-        client_p = next((p for p in m.products if p.site == CLIENT_SITE), None)
+        client_p = next((p for p in m.products if p.site == client_site), None)
         if not client_p:
             continue
         client_snap = snaps_by_pid.get(client_p.id)
@@ -280,7 +297,7 @@ def price_index_by_category(session: Session) -> list[PriceIndex]:
 
         comp_prices: list[float] = []
         for p in m.products:
-            if p.site == CLIENT_SITE:
+            if p.site == client_site or p.site not in competitor_sites:
                 continue
             snap = snaps_by_pid.get(p.id)
             if snap is None:

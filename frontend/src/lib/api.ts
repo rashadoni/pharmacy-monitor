@@ -97,6 +97,53 @@ export interface BrandShareRow {
   exclusive_to: string | null;
 }
 
+export interface PriceIndexRow {
+  category: string | null;
+  avg_client_price: number | null;
+  avg_competitor_price: number | null;
+  /** 100 = paritet, <100 клиент дешевле, >100 клиент дороже. */
+  index: number | null;
+  matched_skus: number | null;
+}
+
+export interface SiteProduct {
+  id: number;
+  external_id: string;
+  name: string;
+  brand: string | null;
+  category: string | null;
+  url: string;
+  image_url: string | null;
+  price: number | null;
+  discount_price: number | null;
+  /** discount_price ?? price */
+  effective_price: number | null;
+  is_on_sale: boolean;
+  last_seen_at: string | null;
+}
+
+export interface SiteProductsPage {
+  items: SiteProduct[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface SiteFacets {
+  categories: { name: string; count: number }[];
+  brands: { name: string; count: number }[];
+}
+
+export interface SiteSummary {
+  total_products: number;
+  total_brands: number;
+  exclusive_brands: number;
+  on_sale_count: number;
+  on_sale_pct: number;
+  last_run_at: string | null;
+  last_run_id: number | null;
+}
+
 export interface RunRow {
   id: number;
   started_at: string | null;
@@ -162,14 +209,52 @@ export const api = {
     if (params.limit) q.set("limit", String(params.limit));
     return request<ComparisonRow[]>(`/api/v1/dash/comparison?${q}`);
   },
-  roiActions: () => request<RoiAction[]>("/api/v1/dash/roi/actions"),
+  roiActions: (client_site?: string) => {
+    const q = new URLSearchParams();
+    if (client_site) q.set("client_site", client_site);
+    const qs = q.toString();
+    return request<RoiAction[]>(`/api/v1/dash/roi/actions${qs ? `?${qs}` : ""}`);
+  },
   alerts: (severity?: string, limit = 100) => {
     const q = new URLSearchParams({ limit: String(limit) });
     if (severity) q.set("severity", severity);
     return request<AlertEvent[]>(`/api/v1/dash/alerts?${q}`);
   },
   matchQuality: () => request<MatchQuality>("/api/v1/dash/match-quality"),
-  brandShare: (top_n = 30) => request<BrandShareRow[]>(`/api/v1/dash/brand-share?top_n=${top_n}`),
+  brandShare: (params: { top_n?: number; site?: string } = {}) => {
+    const q = new URLSearchParams();
+    q.set("top_n", String(params.top_n ?? 30));
+    if (params.site) q.set("site", params.site);
+    return request<BrandShareRow[]>(`/api/v1/dash/brand-share?${q}`);
+  },
+  priceIndex: (client_site?: string) => {
+    const q = new URLSearchParams();
+    if (client_site) q.set("client_site", client_site);
+    const qs = q.toString();
+    return request<PriceIndexRow[]>(`/api/v1/dash/price-index${qs ? `?${qs}` : ""}`);
+  },
+  siteProducts: (params: {
+    site: string;
+    category?: string;
+    brand?: string;
+    search?: string;
+    on_sale?: boolean;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const q = new URLSearchParams({ site: params.site });
+    if (params.category) q.set("category", params.category);
+    if (params.brand) q.set("brand", params.brand);
+    if (params.search) q.set("search", params.search);
+    if (params.on_sale != null) q.set("on_sale", String(params.on_sale));
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    return request<SiteProductsPage>(`/api/v1/dash/products?${q}`);
+  },
+  siteProductsFacets: (site: string) =>
+    request<SiteFacets>(`/api/v1/dash/products/facets?site=${encodeURIComponent(site)}`),
+  siteProductsSummary: (site: string) =>
+    request<SiteSummary>(`/api/v1/dash/products/summary?site=${encodeURIComponent(site)}`),
   runs: (limit = 30) => request<RunRow[]>(`/api/v1/dash/runs?limit=${limit}`),
   runBreakdown: (id: number) =>
     request<RunBreakdown>(`/api/v1/dash/runs/${id}/breakdown`),

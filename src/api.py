@@ -962,13 +962,27 @@ def dash_comparison(
     return out
 
 
+_VALID_SITES = ("pharmonline", "aptekonline", "aloe")
+
+
+def _require_site(value: str) -> str:
+    if value not in _VALID_SITES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown site '{value}'. Allowed: {', '.join(_VALID_SITES)}",
+        )
+    return value
+
+
 @app.get("/api/v1/dash/roi/actions")
 def dash_roi_actions(
+    client_site: str = "pharmonline",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
     from src import roi
-    actions = roi.compute_actions(db)
+    _require_site(client_site)
+    actions = roi.compute_actions(db, client_site=client_site)
     return [
         {
             "type": a.type,
@@ -1043,11 +1057,14 @@ def dash_match_quality(
 @app.get("/api/v1/dash/brand-share")
 def dash_brand_share(
     top_n: int = 30,
+    site: str | None = None,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
     from src import analytics
-    rows = analytics.brand_share(db, top_n=top_n)
+    if site is not None:
+        _require_site(site)
+    rows = analytics.brand_share(db, top_n=top_n, site=site)
     return [
         {
             "brand": r.brand,
@@ -1062,11 +1079,13 @@ def dash_brand_share(
 
 @app.get("/api/v1/dash/price-index")
 def dash_price_index(
+    client_site: str = "pharmonline",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
     from src import analytics
-    rows = analytics.price_index_by_category(db)
+    _require_site(client_site)
+    rows = analytics.price_index_by_category(db, client_site=client_site)
     return [
         {
             "category": getattr(r, "category", None),
@@ -1088,6 +1107,187 @@ def dash_forecast_movers(
     from src import forecast
     movers = forecast.top_movers(db, limit=limit)
     return movers
+
+
+@app.get("/api/v1/dash/products")
+def dash_products(
+    site: str,
+    category: str | None = None,
+    brand: str | None = None,
+    search: str | None = None,
+    on_sale: bool | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Список продуктов одного сайта с актуальной ценой.
+
+    Используется страницей /aloe (и потенциально /pharmonline, /aptekonline).
+    Возвращает latest snapshot per product (diff-only-aware).
+    """
+    _require_site(site)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    stmt = (
+        select(storage.Product)
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+        .order_by(desc(storage.Product.last_seen_at))
+    )
+    if category:
+        stmt = stmt.where(storage.Product.category == category)
+    if brand:
+        stmt = stmt.where(storage.Product.brand == brand)
+    if search:
+        like = f"%{search.lower()}%"
+        stmt = stmt.where(
+            storage.Product.name.ilike(like)
+            | storage.Product.brand.ilike(like)
+        )
+
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+
+    products = db.scalars(stmt.offset(offset).limit(limit)).all()
+    if not products:
+        return {"items": [], "total": total, "limit": limit, "offset": offset}
+
+    snaps_by_pid = storage.latest_snapshots_per_product(db, [p.id for p in products])
+
+    items = []
+    for p in products:
+        snap = snaps_by_pid.get(p.id)
+        eff_price = (snap.discount_price or snap.price) if snap else None
+        if on_sale is not None:
+            is_sale = bool(snap and snap.is_on_sale) if snap else False
+            if on_sale != is_sale:
+                continue
+        items.append({
+            "id": p.id,
+            "external_id": p.external_id,
+            "name": p.name,
+            "brand": p.brand,
+            "category": p.category,
+            "url": p.url,
+            "image_url": p.image_url,
+            "price": snap.price if snap else None,
+            "discount_price": snap.discount_price if snap else None,
+            "effective_price": eff_price,
+            "is_on_sale": bool(snap and snap.is_on_sale) if snap else False,
+            "last_seen_at": p.last_seen_at.isoformat() if p.last_seen_at else None,
+        })
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/v1/dash/products/facets")
+def dash_products_facets(
+    site: str,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Уникальные категории/бренды одного сайта — для UI-фильтров.
+
+    Возвращает счётчики per-category и per-brand, отсортированные desc.
+    Лёгкая операция: один GROUP BY на сайт.
+    """
+    _require_site(site)
+
+    cat_rows = db.execute(
+        select(storage.Product.category, func.count(storage.Product.id))
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.category.is_not(None),
+        )
+        .group_by(storage.Product.category)
+        .order_by(desc(func.count(storage.Product.id)))
+    ).all()
+
+    brand_rows = db.execute(
+        select(storage.Product.brand, func.count(storage.Product.id))
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.brand.is_not(None),
+        )
+        .group_by(storage.Product.brand)
+        .order_by(desc(func.count(storage.Product.id)))
+        .limit(100)
+    ).all()
+
+    return {
+        "categories": [{"name": c, "count": n} for c, n in cat_rows if c],
+        "brands": [{"name": b, "count": n} for b, n in brand_rows if b],
+    }
+
+
+@app.get("/api/v1/dash/products/summary")
+def dash_products_summary(
+    site: str,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """KPI-карточки страницы сайта: всего продуктов, брендов, exclusive, %sale.
+
+    Использует latest snapshot per product (diff-only-aware) для подсчёта
+    `% on_sale`. Exclusive_brands считается через brand_share с site=… —
+    переиспользует общую логику.
+    """
+    _require_site(site)
+    from src import analytics
+
+    total_products = db.scalar(
+        select(func.count(storage.Product.id))
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    ) or 0
+
+    total_brands = db.scalar(
+        select(func.count(func.distinct(storage.Product.brand)))
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.brand.is_not(None),
+        )
+    ) or 0
+
+    brand_rows = analytics.brand_share(db, top_n=10_000, site=site)
+    exclusive_brands = sum(1 for r in brand_rows if r.exclusive_to == site)
+
+    pids = db.scalars(
+        select(storage.Product.id).where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    ).all()
+    snaps_by_pid = storage.latest_snapshots_per_product(db, pids)
+    on_sale = sum(1 for s in snaps_by_pid.values() if s.is_on_sale)
+    on_sale_pct = round(on_sale / total_products * 100, 1) if total_products else 0.0
+
+    last_run = db.scalar(
+        select(storage.Run)
+        .where(
+            storage.Run.status == "ok",
+            storage.Run.tenant_id == user.tenant_id,
+        )
+        .order_by(desc(storage.Run.id))
+        .limit(1)
+    )
+
+    return {
+        "total_products": total_products,
+        "total_brands": total_brands,
+        "exclusive_brands": exclusive_brands,
+        "on_sale_count": on_sale,
+        "on_sale_pct": on_sale_pct,
+        "last_run_at": last_run.started_at.isoformat() if last_run and last_run.started_at else None,
+        "last_run_id": last_run.id if last_run else None,
+    }
 
 
 @app.get("/api/v1/dash/runs")

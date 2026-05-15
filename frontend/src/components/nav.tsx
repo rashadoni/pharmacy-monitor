@@ -6,6 +6,7 @@ import { useTranslations } from "next-intl";
 import {
   BarChart3,
   Bell,
+  Leaf,
   ListTree,
   LogOut,
   Search,
@@ -19,6 +20,7 @@ import { cn } from "@/lib/utils";
 const NAV_ITEMS = [
   { href: "/comparison", key: "comparison", icon: Search },
   { href: "/overview", key: "overview", icon: TrendingUp },
+  { href: "/aloe", key: "aloe", icon: Leaf },
   { href: "/analytics", key: "analytics", icon: BarChart3 },
   { href: "/alerts", key: "alerts", icon: Bell },
   { href: "/watchlist", key: "watchlist", icon: Star },

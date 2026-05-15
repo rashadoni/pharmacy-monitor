@@ -240,3 +240,203 @@ def test_jwt_decode_wrong_secret(monkeypatch):
     token = api_module._make_jwt(user_id=1, tenant_id=1, email="a@b.c")
     monkeypatch.setattr(api_module, "JWT_SECRET", "secret-b")
     assert api_module._decode_jwt(token) is None
+
+
+# ─── Per-site dashboard endpoints (для страницы /aloe) ───────────────────────
+
+def _seed_aloe_products(session, tenant_id: int = 1) -> dict[str, int]:
+    """Seed 3 aloe-продукта в разных категориях/брендах для тестов /dash/products*."""
+    run = storage.Run(started_at=utcnow(), status="ok", tenant_id=tenant_id)
+    session.add(run)
+    session.flush()
+
+    p1 = storage.Product(
+        tenant_id=tenant_id, site="aloe", external_id="al-1",
+        url="https://aloe.az/p/1", name="Aspirin Cardio", name_normalized="aspirin cardio",
+        brand="Bayer", category="dermanlar",
+    )
+    p2 = storage.Product(
+        tenant_id=tenant_id, site="aloe", external_id="al-2",
+        url="https://aloe.az/p/2", name="Solgar D3", name_normalized="solgar d3",
+        brand="Solgar", category="bad",
+    )
+    p3 = storage.Product(
+        tenant_id=tenant_id, site="aloe", external_id="al-3",
+        url="https://aloe.az/p/3", name="Vəfa Tea", name_normalized="vəfa tea",
+        brand="Vəfa", category="bad",
+    )
+    session.add_all([p1, p2, p3])
+    session.flush()
+    session.add_all([
+        storage.PriceSnapshot(run_id=run.id, product_id=p1.id, price=15.0, is_on_sale=False),
+        storage.PriceSnapshot(run_id=run.id, product_id=p2.id, price=42.0, discount_price=35.0, is_on_sale=True),
+        storage.PriceSnapshot(run_id=run.id, product_id=p3.id, price=8.5, is_on_sale=False),
+    ])
+    session.commit()
+    return {"p1": p1.id, "p2": p2.id, "p3": p3.id, "run": run.id}
+
+
+def test_dash_products_requires_auth(client):
+    r = client.get("/api/v1/dash/products?site=aloe")
+    assert r.status_code == 401
+
+
+def test_dash_products_rejects_unknown_site(client, auth_cookie):
+    r = client.get(
+        "/api/v1/dash/products?site=evilcorp",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 400
+    assert "Unknown site" in r.json()["detail"]
+
+
+def test_dash_products_returns_aloe_items(client, auth_cookie, tenant_user, setup_db):
+    _seed_aloe_products(setup_db, tenant_id=tenant_user.tenant_id)
+    r = client.get(
+        "/api/v1/dash/products?site=aloe",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 3
+    names = sorted(it["name"] for it in body["items"])
+    assert names == ["Aspirin Cardio", "Solgar D3", "Vəfa Tea"]
+    solgar = next(it for it in body["items"] if it["name"] == "Solgar D3")
+    assert solgar["discount_price"] == 35.0
+    assert solgar["is_on_sale"] is True
+    assert solgar["effective_price"] == 35.0
+
+
+def test_dash_products_filters_by_category_and_brand(
+    client, auth_cookie, tenant_user, setup_db
+):
+    _seed_aloe_products(setup_db, tenant_id=tenant_user.tenant_id)
+    r = client.get(
+        "/api/v1/dash/products?site=aloe&category=bad",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert {it["category"] for it in body["items"]} == {"bad"}
+    assert len(body["items"]) == 2
+
+    r2 = client.get(
+        "/api/v1/dash/products?site=aloe&brand=Bayer",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r2.status_code == 200
+    body2 = r2.json()
+    assert len(body2["items"]) == 1
+    assert body2["items"][0]["brand"] == "Bayer"
+
+
+def test_dash_products_search_matches_name_and_brand(
+    client, auth_cookie, tenant_user, setup_db
+):
+    _seed_aloe_products(setup_db, tenant_id=tenant_user.tenant_id)
+    r = client.get(
+        "/api/v1/dash/products?site=aloe&search=solgar",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    body = r.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["name"] == "Solgar D3"
+
+
+def test_dash_products_on_sale_filter(client, auth_cookie, tenant_user, setup_db):
+    _seed_aloe_products(setup_db, tenant_id=tenant_user.tenant_id)
+    r = client.get(
+        "/api/v1/dash/products?site=aloe&on_sale=true",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    body = r.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["is_on_sale"] is True
+
+
+def test_dash_products_pagination_offset_beyond_total(
+    client, auth_cookie, tenant_user, setup_db
+):
+    _seed_aloe_products(setup_db, tenant_id=tenant_user.tenant_id)
+    r = client.get(
+        "/api/v1/dash/products?site=aloe&offset=999&limit=10",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    body = r.json()
+    assert body["total"] == 3
+    assert body["items"] == []
+
+
+def test_dash_products_facets_returns_categories_and_brands(
+    client, auth_cookie, tenant_user, setup_db
+):
+    _seed_aloe_products(setup_db, tenant_id=tenant_user.tenant_id)
+    r = client.get(
+        "/api/v1/dash/products/facets?site=aloe",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    cats = {c["name"] for c in body["categories"]}
+    assert cats == {"dermanlar", "bad"}
+    bad_cat = next(c for c in body["categories"] if c["name"] == "bad")
+    assert bad_cat["count"] == 2
+    brands = {b["name"] for b in body["brands"]}
+    assert brands == {"Bayer", "Solgar", "Vəfa"}
+
+
+def test_dash_products_summary_returns_kpis(
+    client, auth_cookie, tenant_user, setup_db
+):
+    _seed_aloe_products(setup_db, tenant_id=tenant_user.tenant_id)
+    r = client.get(
+        "/api/v1/dash/products/summary?site=aloe",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_products"] == 3
+    assert body["total_brands"] == 3
+    assert body["on_sale_count"] == 1
+    assert body["on_sale_pct"] == round(1 / 3 * 100, 1)
+    # 3 brand_share rows, all exclusive_to=aloe (нет pharmonline/aptekonline в БД)
+    assert body["exclusive_brands"] == 3
+    assert body["last_run_id"] is not None
+
+
+def test_dash_brand_share_site_param(
+    client, auth_cookie, tenant_user, setup_db
+):
+    _seed_aloe_products(setup_db, tenant_id=tenant_user.tenant_id)
+    r = client.get(
+        "/api/v1/dash/brand-share?site=aloe",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    brands = {row["brand"] for row in body}
+    assert brands == {"Bayer", "Solgar", "Vəfa"}
+
+
+def test_dash_brand_share_rejects_unknown_site(client, auth_cookie):
+    r = client.get(
+        "/api/v1/dash/brand-share?site=hax",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 400
+
+
+def test_dash_price_index_rejects_unknown_client_site(client, auth_cookie):
+    r = client.get(
+        "/api/v1/dash/price-index?client_site=hax",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 400
+
+
+def test_dash_roi_actions_rejects_unknown_client_site(client, auth_cookie):
+    r = client.get(
+        "/api/v1/dash/roi/actions?client_site=hax",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 400

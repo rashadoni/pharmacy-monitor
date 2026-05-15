@@ -65,7 +65,7 @@ function MatchQualitySection() {
 function BrandShareSection() {
   const { data, isLoading } = useQuery({
     queryKey: ["brand-share"],
-    queryFn: () => api.brandShare(15),
+    queryFn: () => api.brandShare({ top_n: 15 }),
   });
 
   const chartData = data?.map((b) => ({

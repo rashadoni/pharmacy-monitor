@@ -43,6 +43,11 @@ log = structlog.get_logger()
 
 CLIENT_SITE = "pharmonline"
 COMPETITOR_SITES = ("aptekonline", "aloe")
+ALL_SITES = (CLIENT_SITE, *COMPETITOR_SITES)
+
+
+def _competitors_for(client_site: str) -> tuple[str, ...]:
+    return tuple(s for s in ALL_SITES if s != client_site)
 
 ActionType = Literal[
     "price_raise",
@@ -106,22 +111,30 @@ def compute_actions(
     undercut_threshold_pct: float = 3.0,  # минимальная просадка чтобы алерт
     max_spread_pct: float = 80.0,  # выше этого считаем bad-match и скрываем
     max_per_type: int = 10,
+    client_site: str = CLIENT_SITE,
 ) -> list[ActionItem]:
     """Главная точка: собрать все действия, отсортировать по spread desc.
 
     Сортируем по |spread_pct| desc — самые большие разрывы вверху. Не по
     «месячному impact'у» потому что объёмы продаж нам неизвестны (см.
     module docstring).
+
+    Параметр `client_site` определяет, чью точку зрения берём: pharmonline
+    (по умолчанию) или другой сайт (aloe, aptekonline). Конкуренты =
+    ALL_SITES − {client_site}.
     """
+    competitor_sites = _competitors_for(client_site)
     actions: list[ActionItem] = []
     actions += _price_raise_opportunities(
-        session, raise_threshold_pct, max_spread_pct, max_per_type
+        session, raise_threshold_pct, max_spread_pct, max_per_type,
+        client_site, competitor_sites,
     )
     actions += _undercut_threats(
-        session, undercut_threshold_pct, max_spread_pct, max_per_type
+        session, undercut_threshold_pct, max_spread_pct, max_per_type,
+        client_site, competitor_sites,
     )
-    actions += _assortment_gaps(session, max_per_type)
-    actions += _promo_responses(session, max_per_type)
+    actions += _assortment_gaps(session, max_per_type, competitor_sites)
+    actions += _promo_responses(session, max_per_type, competitor_sites)
 
     # Сортировка: critical → warning → opportunity → info; внутри — по |spread_pct| desc
     sev_order = {"critical": 0, "warning": 1, "opportunity": 2, "info": 3}
@@ -141,7 +154,9 @@ def _latest_run_id(session: Session) -> int | None:
 
 
 def _price_raise_opportunities(
-    session: Session, threshold_pct: float, max_spread_pct: float, max_n: int
+    session: Session, threshold_pct: float, max_spread_pct: float, max_n: int,
+    client_site: str = CLIENT_SITE,
+    competitor_sites: tuple[str, ...] = COMPETITOR_SITES,
 ) -> list[ActionItem]:
     """Где клиент дешевле всех конкурентов более чем на threshold%.
 
@@ -159,12 +174,12 @@ def _price_raise_opportunities(
 
     for m in matches:
         prices_by_site = _prices_for_match(session, m, run_id, snaps_cache)
-        client_price = prices_by_site.get(CLIENT_SITE)
+        client_price = prices_by_site.get(client_site)
         if client_price is None:
             continue
         comp_prices = [
             (s, p) for s, p in prices_by_site.items()
-            if s in COMPETITOR_SITES and p is not None
+            if s in competitor_sites and p is not None
         ]
         if not comp_prices:
             continue
@@ -182,7 +197,7 @@ def _price_raise_opportunities(
         target = round(median_comp * 0.98, 2)
         delta = round(target - client_price, 2)
 
-        client_product = _client_product(m)
+        client_product = _client_product(m, client_site)
         # Если товара нет на складе — нет смысла советовать поднимать
         if client_product and not _is_in_stock(session, client_product.id):
             continue
@@ -217,7 +232,9 @@ def _is_in_stock(session: Session, product_id: int) -> bool:
 
 
 def _undercut_threats(
-    session: Session, threshold_pct: float, max_spread_pct: float, max_n: int
+    session: Session, threshold_pct: float, max_spread_pct: float, max_n: int,
+    client_site: str = CLIENT_SITE,
+    competitor_sites: tuple[str, ...] = COMPETITOR_SITES,
 ) -> list[ActionItem]:
     """Где конкурент опустил цену ниже клиента.
 
@@ -236,13 +253,13 @@ def _undercut_threats(
 
     for m in matches:
         prices_by_site = _prices_for_match(session, m, run_id, snaps_cache)
-        client_price = prices_by_site.get(CLIENT_SITE)
+        client_price = prices_by_site.get(client_site)
         if client_price is None:
             continue
 
         cheapest_comp_site = None
         cheapest_comp_price = None
-        for site in COMPETITOR_SITES:
+        for site in competitor_sites:
             p = prices_by_site.get(site)
             if p is None:
                 continue
@@ -265,7 +282,7 @@ def _undercut_threats(
         # Lost margin per unit (assuming we have to match)
         lost_per_unit = round(client_price - target, 2)
 
-        client_product = _client_product(m)
+        client_product = _client_product(m, client_site)
         comp_url = next(
             (p.url for p in m.products if p.site == cheapest_comp_site), None
         )
@@ -319,7 +336,10 @@ def _undercut_threats(
     return out[:max_n]
 
 
-def _assortment_gaps(session: Session, max_n: int) -> list[ActionItem]:
+def _assortment_gaps(
+    session: Session, max_n: int,
+    competitor_sites: tuple[str, ...] = COMPETITOR_SITES,
+) -> list[ActionItem]:
     """Товары на конкурентах которых нет у клиента (canonical_id is None).
 
     Diff-only-aware (2026-05-09): берём competitor unmatched products + их
@@ -330,7 +350,7 @@ def _assortment_gaps(session: Session, max_n: int) -> list[ActionItem]:
 
     products = session.scalars(
         select(Product).where(
-            Product.site.in_(COMPETITOR_SITES),
+            Product.site.in_(competitor_sites),
             Product.canonical_id.is_(None),
         )
     ).all()
@@ -369,14 +389,17 @@ def _assortment_gaps(session: Session, max_n: int) -> list[ActionItem]:
     return out
 
 
-def _promo_responses(session: Session, max_n: int) -> list[ActionItem]:
+def _promo_responses(
+    session: Session, max_n: int,
+    competitor_sites: tuple[str, ...] = COMPETITOR_SITES,
+) -> list[ActionItem]:
     """Активные промо у конкурентов — могут потребовать ответа."""
     run_id = _latest_run_id(session)
     if not run_id:
         return []
     promos = session.scalars(
         select(Promo).where(
-            Promo.run_id == run_id, Promo.site.in_(COMPETITOR_SITES)
+            Promo.run_id == run_id, Promo.site.in_(competitor_sites)
         )
     ).all()
     out: list[ActionItem] = []
@@ -406,9 +429,7 @@ def _prices_for_match(
     Если передан `snapshots_cache` (preloaded {product_id: PriceSnapshot}) —
     используется он вместо отдельного SQL на каждый product. Это убирает N+1.
     """
-    out: dict[str, float | None] = {
-        CLIENT_SITE: None, "aptekonline": None, "aloe": None
-    }
+    out: dict[str, float | None] = {s: None for s in ALL_SITES}
     for p in match.products:
         if snapshots_cache is not None:
             snap = snapshots_cache.get(p.id)
@@ -426,8 +447,8 @@ def _prices_for_match(
     return out
 
 
-def _client_product(match: Match) -> Product | None:
-    return next((p for p in match.products if p.site == CLIENT_SITE), None)
+def _client_product(match: Match, client_site: str = CLIENT_SITE) -> Product | None:
+    return next((p for p in match.products if p.site == client_site), None)
 
 
 def aggregate_impact(actions: list[ActionItem]) -> dict[str, float]:

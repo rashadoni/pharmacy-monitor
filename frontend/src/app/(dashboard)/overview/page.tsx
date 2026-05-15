@@ -3,12 +3,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useState } from "react";
-import { api, type RoiAction, type RunRow } from "@/lib/api";
-import { formatPrice } from "@/lib/utils";
+import { api, type RunRow } from "@/lib/api";
+import { ActionRow } from "@/components/action-row";
+import { KpiCard } from "@/components/kpi-card";
 
 export default function OverviewPage() {
   const matchQ = useQuery({ queryKey: ["match-quality"], queryFn: api.matchQuality });
-  const actionsQ = useQuery({ queryKey: ["roi-actions"], queryFn: api.roiActions });
+  const actionsQ = useQuery({ queryKey: ["roi-actions"], queryFn: () => api.roiActions() });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
   const [expandedRun, setExpandedRun] = useState<number | null>(null);
 
@@ -252,67 +253,6 @@ function RunBreakdownPanel({
             </div>
           );
         })}
-      </div>
-    </div>
-  );
-}
-
-function KpiCard({
-  label,
-  value,
-  loading,
-}: {
-  label: string;
-  value: number | string;
-  loading: boolean;
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-card p-4">
-      <div className="text-xs text-muted-foreground uppercase tracking-wide">{label}</div>
-      <div className="text-2xl font-semibold mt-1 tabular-nums">
-        {loading ? "…" : value}
-      </div>
-    </div>
-  );
-}
-
-function ActionRow({ action }: { action: RoiAction }) {
-  const tone =
-    action.severity === "critical"
-      ? "border-destructive/40 bg-destructive/5"
-      : action.severity === "warning"
-        ? "border-warning/40 bg-warning/5"
-        : action.severity === "opportunity"
-          ? "border-success/40 bg-success/5"
-          : "border-border bg-card";
-  // Показываем РЕАЛЬНЫЕ цифры: разница на единицу + % спред.
-  // Раньше тут было «{impact}/мес», но impact = unit_gap × 30 (placeholder
-  // volume без основания) — вводило в заблуждение. Объёмов продаж у нас нет.
-  const hasGap = action.unit_gap_azn != null && action.spread_pct != null;
-  const gapPositive = (action.unit_gap_azn ?? 0) > 0;
-  return (
-    <div className={`rounded-lg border ${tone} p-3`}>
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex-1 min-w-0">
-          <div className="font-medium text-sm">{action.title}</div>
-          <div className="text-xs text-muted-foreground mt-0.5">{action.detail}</div>
-        </div>
-        {hasGap && (
-          <div className="shrink-0 text-right">
-            <div
-              className={`text-sm font-semibold tabular-nums ${
-                gapPositive ? "text-success" : "text-destructive"
-              }`}
-              title="Разница цены за единицу товара — реально проверяемая величина"
-            >
-              {gapPositive ? "+" : ""}
-              {formatPrice(action.unit_gap_azn ?? 0)} ₼/ед
-            </div>
-            <div className="text-[11px] text-muted-foreground tabular-nums">
-              {(action.spread_pct ?? 0).toFixed(1)}% спред
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );

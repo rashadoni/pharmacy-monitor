@@ -184,3 +184,111 @@ def test_empty_db_returns_empty(db_session):
     overlap = analytics.assortment_overlap(db_session)
     assert overlap.matched_count == 0
     assert overlap.coverage_pct == 0.0
+
+
+def test_brand_share_filtered_by_site_aloe(db_session):
+    """site=aloe → только бренды представленные на aloe; counts по всем сайтам."""
+    run = _add_run(db_session)
+    bayer_ph = _add_product(db_session, "pharmonline", "Aspirin", brand="Bayer", ext_id="1")
+    bayer_aloe = _add_product(db_session, "aloe", "Aspirin", brand="Bayer", ext_id="2")
+    solgar_ph = _add_product(db_session, "pharmonline", "Solgar D", brand="Solgar", ext_id="3")
+    grass_aloe = _add_product(db_session, "aloe", "Grass Tea", brand="Grassberg", ext_id="4")
+    for p in (bayer_ph, bayer_aloe, solgar_ph, grass_aloe):
+        _add_snap(db_session, run, p, 10.0)
+    db_session.commit()
+
+    rows = analytics.brand_share(db_session, site="aloe")
+    brands = {b.brand for b in rows}
+    assert brands == {"Bayer", "Grassberg"}, "Solgar отсутствует на aloe — не должно быть"
+    grass = next(b for b in rows if b.brand == "Grassberg")
+    assert grass.exclusive_to == "aloe"
+    bayer = next(b for b in rows if b.brand == "Bayer")
+    # counts остаются по всем сайтам — нужны фронту чтобы показать «exclusive» флаг
+    assert bayer.counts["pharmonline"] == 1
+    assert bayer.counts["aloe"] == 1
+    assert bayer.exclusive_to is None
+
+
+def test_brand_share_no_site_filter_unchanged(db_session):
+    """Без параметра site поведение прежнее (backwards-compat)."""
+    run = _add_run(db_session)
+    p = _add_product(db_session, "pharmonline", "X", brand="Bayer", ext_id="1")
+    _add_snap(db_session, run, p, 10.0)
+    db_session.commit()
+
+    rows = analytics.brand_share(db_session)
+    assert len(rows) == 1
+    assert rows[0].brand == "Bayer"
+
+
+def test_price_index_for_aloe_client(db_session):
+    """client_site='aloe' → возвращает индекс с точки зрения aloe."""
+    m = Match(canonical_name="Test", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    run = _add_run(db_session)
+    p_aloe = _add_product(
+        db_session, "aloe", "Test", canonical_id=m.id, category="vitamins", ext_id="al"
+    )
+    p_ph = _add_product(
+        db_session, "pharmonline", "Test", canonical_id=m.id, category="vitamins", ext_id="ph"
+    )
+    _add_snap(db_session, run, p_aloe, 12.0)
+    _add_snap(db_session, run, p_ph, 10.0)
+    db_session.commit()
+
+    # client=aloe → клиентская цена 12, конкурент (ph) 10 → index = 12/10*100 = 120
+    idx = analytics.price_index_by_category(db_session, client_site="aloe")
+    assert len(idx) == 1
+    assert idx[0].avg_client_price == 12.0
+    assert idx[0].avg_competitor_price == 10.0
+    assert idx[0].index == 120.0
+
+
+def test_price_index_default_pharmonline_unchanged(db_session):
+    """Без параметра client_site дефолт pharmonline — не ломаем существующие вызовы."""
+    m = Match(canonical_name="Test", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    run = _add_run(db_session)
+    p_ph = _add_product(
+        db_session, "pharmonline", "Test", canonical_id=m.id, category="vitamins", ext_id="ph"
+    )
+    p_aloe = _add_product(
+        db_session, "aloe", "Test", canonical_id=m.id, category="vitamins", ext_id="al"
+    )
+    _add_snap(db_session, run, p_ph, 10.0)
+    _add_snap(db_session, run, p_aloe, 8.0)
+    db_session.commit()
+
+    idx = analytics.price_index_by_category(db_session)  # дефолт client_site
+    assert len(idx) == 1
+    assert idx[0].avg_client_price == 10.0
+    assert idx[0].avg_competitor_price == 8.0
+    assert idx[0].index == 125.0  # клиент (ph) дороже
+
+
+def test_price_index_aloe_finds_aloe_aptekonline_matches(db_session):
+    """Регрессия: матч (aloe, aptekonline) без pharmonline теперь виден из aloe."""
+    m = Match(canonical_name="OnlyTwo", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    run = _add_run(db_session)
+    p_aloe = _add_product(
+        db_session, "aloe", "OnlyTwo", canonical_id=m.id, category="bad", ext_id="al"
+    )
+    p_apt = _add_product(
+        db_session, "aptekonline", "OnlyTwo", canonical_id=m.id, category="bad", ext_id="ap"
+    )
+    _add_snap(db_session, run, p_aloe, 15.0)
+    _add_snap(db_session, run, p_apt, 12.0)
+    db_session.commit()
+
+    # Из перспективы aloe (бутик) этот матч должен быть виден; pharmonline в кластере нет.
+    idx = analytics.price_index_by_category(db_session, client_site="aloe")
+    assert len(idx) == 1
+    assert idx[0].category == "bad"
+
+    # А по дефолтной перспективе (pharmonline) — этот матч пропускается (нет клиентской цены).
+    idx_default = analytics.price_index_by_category(db_session)
+    assert idx_default == []
