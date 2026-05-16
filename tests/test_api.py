@@ -440,3 +440,72 @@ def test_dash_roi_actions_rejects_unknown_client_site(client, auth_cookie):
         cookies={api_module.COOKIE_NAME: auth_cookie},
     )
     assert r.status_code == 400
+
+
+# ─── AI normalize stats endpoint ─────────────────────────────────────────────
+
+
+def test_dash_normalize_stats_empty_db(client, auth_cookie):
+    r = client.get(
+        "/api/v1/dash/normalize/stats",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["products_total"] == 0
+    assert body["products_normalized"] == 0
+    assert body["coverage_pct"] == 0.0
+    assert body["matches_by_strategy"] == {}
+
+
+def test_dash_normalize_stats_with_data(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """3 продукта, 2 с normalized_attrs (1 needs_review). 1 Match со strategy."""
+    s = setup_db
+    run = storage.Run(started_at=utcnow(), status="ok", tenant_id=tenant_user.tenant_id)
+    s.add(run)
+    s.flush()
+
+    p1 = storage.Product(
+        tenant_id=tenant_user.tenant_id, site="aloe", external_id="1",
+        url="x", name="A", name_normalized="a", brand="X",
+        normalized_attrs={"active_ingredient": "asa", "confidence": 0.9, "needs_review": False},
+        normalize_hash="h1",
+        normalized_at=utcnow(),
+    )
+    p2 = storage.Product(
+        tenant_id=tenant_user.tenant_id, site="aloe", external_id="2",
+        url="x", name="B", name_normalized="b", brand="X",
+        normalized_attrs={"active_ingredient": "asa", "confidence": 0.4, "needs_review": True},
+        normalize_hash="h2",
+        normalized_at=utcnow(),
+    )
+    p3 = storage.Product(
+        tenant_id=tenant_user.tenant_id, site="aloe", external_id="3",
+        url="x", name="C", name_normalized="c", brand="X",
+    )
+    m = storage.Match(
+        tenant_id=tenant_user.tenant_id, canonical_name="A",
+        confidence=0.95, is_manual=False, match_strategy="ai_attrs_strict",
+    )
+    s.add_all([p1, p2, p3, m])
+    s.commit()
+
+    r = client.get(
+        "/api/v1/dash/normalize/stats",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["products_total"] == 3
+    assert body["products_normalized"] == 2
+    assert body["needs_review"] == 1
+    assert body["coverage_pct"] == round(2 / 3 * 100, 1)
+    assert body["matches_by_strategy"] == {"ai_attrs_strict": 1}
+    assert body["last_normalized_at"] is not None
+
+
+def test_dash_normalize_stats_requires_auth(client):
+    r = client.get("/api/v1/dash/normalize/stats")
+    assert r.status_code == 401

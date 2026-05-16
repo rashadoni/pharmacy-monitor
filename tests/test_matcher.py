@@ -172,3 +172,175 @@ def test_manual_override_preserved(db_session):
     db_session.refresh(m)
     assert a.canonical_id == b.canonical_id == m.id
     assert m.is_manual is True
+
+
+# ─── AI-attrs matching pass ──────────────────────────────────────────────────
+
+
+def _ai(active_ingredient, dosage_mg, pack_count, brand_canonical, form="tablet", is_pharma=True, confidence=0.95):
+    return {
+        "active_ingredient": active_ingredient,
+        "dosage_mg": dosage_mg,
+        "pack_count": pack_count,
+        "form": form,
+        "brand_canonical": brand_canonical,
+        "is_pharma": is_pharma,
+        "confidence": confidence,
+        "needs_review": False,
+    }
+
+
+def test_match_by_normalized_attrs_strict(db_session):
+    """Два продукта с одинаковыми active_ingredient + dosage_mg + pack_count + brand — strict match."""
+    a = _make_product(
+        db_session, site="pharmonline", external_id="ph",
+        name="Aspirin Cardio 100 mg 30 əd",
+        name_normalized="aspirin cardio 100 mg 30 ed",
+        brand="Bayer",
+    )
+    a.normalized_attrs = _ai("acetylsalicylic acid", 100.0, 30, "Bayer")
+    b = _make_product(
+        db_session, site="aloe", external_id="al",
+        name="Aspirin-cardio 100mg N30",  # совершенно другое написание
+        name_normalized="aspirin cardio 100mg n30",
+        brand="Bayer",
+    )
+    b.normalized_attrs = _ai("acetylsalicylic acid", 100.0, 30, "Bayer")
+    db_session.commit()
+
+    n = matcher.match_products(db_session)
+    assert n >= 1
+    db_session.refresh(a)
+    db_session.refresh(b)
+    assert a.canonical_id == b.canonical_id
+    m = db_session.get(storage.Match, a.canonical_id)
+    assert m.match_strategy == "ai_attrs_strict"
+
+
+def test_match_blocks_different_active_ingredient(db_session):
+    """Bayer Aspirin (ASA) vs Bayer Bepanthen (dexpanthenol) — разные вещества → НЕ матч."""
+    a = _make_product(
+        db_session, site="pharmonline", external_id="ph-asp",
+        name="Aspirin Cardio", name_normalized="aspirin", brand="Bayer",
+    )
+    a.normalized_attrs = _ai("acetylsalicylic acid", 100.0, 30, "Bayer")
+    b = _make_product(
+        db_session, site="aloe", external_id="al-bep",
+        name="Bepanthen", name_normalized="bepanthen", brand="Bayer",
+    )
+    b.normalized_attrs = _ai("dexpanthenol", 50.0, 30, "Bayer", form="cream", is_pharma=False)
+    db_session.commit()
+
+    matcher.match_products(db_session)
+    db_session.refresh(a)
+    db_session.refresh(b)
+    assert a.canonical_id is None or b.canonical_id is None or a.canonical_id != b.canonical_id
+
+
+def test_match_tolerates_dosage_5pct(db_session):
+    """100 mg и 99 mg должны склеиться (±5% толерантность)."""
+    a = _make_product(
+        db_session, site="pharmonline", external_id="ph", name="Asp", name_normalized="asp", brand="X",
+    )
+    a.normalized_attrs = _ai("acetylsalicylic acid", 100.0, 30, "X")
+    b = _make_product(
+        db_session, site="aloe", external_id="al", name="Asp", name_normalized="asp", brand="X",
+    )
+    b.normalized_attrs = _ai("acetylsalicylic acid", 99.0, 30, "X")  # 1% разница
+    db_session.commit()
+
+    matcher.match_products(db_session)
+    db_session.refresh(a)
+    db_session.refresh(b)
+    assert a.canonical_id == b.canonical_id and a.canonical_id is not None
+
+
+def test_match_rejects_dosage_25pct(db_session):
+    """100 mg и 75 mg — разница 25%, далеко за толерантностью → НЕ матч."""
+    a = _make_product(
+        db_session, site="pharmonline", external_id="ph", name="Asp", name_normalized="asp", brand="X",
+    )
+    a.normalized_attrs = _ai("acetylsalicylic acid", 100.0, 30, "X")
+    b = _make_product(
+        db_session, site="aloe", external_id="al", name="Asp", name_normalized="asp", brand="X",
+    )
+    b.normalized_attrs = _ai("acetylsalicylic acid", 75.0, 30, "X")
+    db_session.commit()
+
+    matcher.match_products(db_session)
+    db_session.refresh(a)
+    db_session.refresh(b)
+    # Они в одном bucket'е (active_ingredient + form + is_pharma), но dosage_mismatch блокирует AI-pass
+    # → falls к legacy fuzzy на name_normalized="asp" == "asp" → ratio=100 — потенциально сматчит!
+    # Тест проверяет именно AI-pass: оба прошли через AI-pass без склейки (visited не содержит a/b);
+    # legacy pass возможно склеит через name. Так что строгий assert не подходит — проверяем что
+    # match не имеет strategy=ai_attrs_strict.
+    if a.canonical_id and a.canonical_id == b.canonical_id:
+        m = db_session.get(storage.Match, a.canonical_id)
+        assert m.match_strategy != "ai_attrs_strict"
+
+
+def test_match_fallback_to_fuzzy_when_attrs_null(db_session):
+    """Продукты без normalized_attrs — старый fuzzy путь срабатывает."""
+    a = _make_product(
+        db_session, site="pharmonline", external_id="ph",
+        name="Paracetamol 500mg N20", name_normalized="paracetamol",
+        brand="Bayer", dosage="500mg", pack_size="n20",
+    )
+    b = _make_product(
+        db_session, site="aloe", external_id="al",
+        name="Paracetamol 500mg", name_normalized="paracetamol",
+        brand="Bayer", dosage="500mg", pack_size="n20",
+    )
+    # normalized_attrs остаются null
+    db_session.commit()
+
+    matcher.match_products(db_session)
+    db_session.refresh(a)
+    db_session.refresh(b)
+    assert a.canonical_id == b.canonical_id and a.canonical_id is not None
+    m = db_session.get(storage.Match, a.canonical_id)
+    assert m.match_strategy == "legacy_fuzzy"
+
+
+def test_match_blocks_pharma_vs_supplement(db_session):
+    """Лекарство (is_pharma=True) не склеивается с БАДом (is_pharma=False)
+    даже при том же active_ingredient — bucket разный."""
+    a = _make_product(
+        db_session, site="pharmonline", external_id="ph",
+        name="Vitamin C 500mg tablet", name_normalized="vitamin c", brand="Bayer",
+    )
+    a.normalized_attrs = _ai("ascorbic acid", 500.0, 30, "Bayer", is_pharma=True)
+    b = _make_product(
+        db_session, site="aloe", external_id="al",
+        name="Vitamin C 500mg supplement", name_normalized="vitamin c", brand="Bayer",
+    )
+    b.normalized_attrs = _ai("ascorbic acid", 500.0, 30, "Bayer", is_pharma=False)
+    db_session.commit()
+
+    matcher.match_products(db_session)
+    db_session.refresh(a)
+    db_session.refresh(b)
+    # Разные bucket'ы из-за is_pharma → не пересекаются в AI-pass
+    if a.canonical_id and a.canonical_id == b.canonical_id:
+        m = db_session.get(storage.Match, a.canonical_id)
+        assert m.match_strategy != "ai_attrs_strict"
+
+
+def test_match_strategy_ai_strict_has_confidence_095(db_session):
+    """ai_attrs_strict матчи получают confidence=0.95."""
+    a = _make_product(
+        db_session, site="pharmonline", external_id="ph", name="Asp", name_normalized="asp", brand="X",
+    )
+    a.normalized_attrs = _ai("paracetamol", 500.0, 20, "X")
+    b = _make_product(
+        db_session, site="aloe", external_id="al", name="Asp", name_normalized="asp", brand="X",
+    )
+    b.normalized_attrs = _ai("paracetamol", 500.0, 20, "X")
+    db_session.commit()
+
+    matcher.match_products(db_session)
+    db_session.refresh(a)
+    m = db_session.get(storage.Match, a.canonical_id)
+    assert m.match_strategy == "ai_attrs_strict"
+    assert m.confidence == 0.95

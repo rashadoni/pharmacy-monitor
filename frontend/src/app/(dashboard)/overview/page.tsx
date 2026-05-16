@@ -10,6 +10,7 @@ import { KpiCard } from "@/components/kpi-card";
 export default function OverviewPage() {
   const matchQ = useQuery({ queryKey: ["match-quality"], queryFn: api.matchQuality });
   const actionsQ = useQuery({ queryKey: ["roi-actions"], queryFn: () => api.roiActions() });
+  const normalizeQ = useQuery({ queryKey: ["normalize-stats"], queryFn: api.normalizeStats });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
   const [expandedRun, setExpandedRun] = useState<number | null>(null);
 
@@ -42,11 +43,40 @@ export default function OverviewPage() {
           loading={matchQ.isLoading}
         />
         <KpiCard
-          label="Manual matches"
-          value={matchQ.data?.manual_matches ?? "—"}
-          loading={matchQ.isLoading}
+          label="AI-normalized"
+          value={
+            normalizeQ.data
+              ? `${normalizeQ.data.coverage_pct.toFixed(1)}%`
+              : "—"
+          }
+          loading={normalizeQ.isLoading}
+          hint={
+            normalizeQ.data?.needs_review
+              ? `${normalizeQ.data.needs_review} нужно проверить`
+              : undefined
+          }
         />
       </div>
+
+      {/* Match strategy distribution — компактная пилюля под KPI */}
+      {normalizeQ.data &&
+        Object.keys(normalizeQ.data.matches_by_strategy).length > 0 && (
+          <div className="flex flex-wrap gap-2 text-xs">
+            <span className="text-muted-foreground">Стратегии матчей:</span>
+            {Object.entries(normalizeQ.data.matches_by_strategy)
+              .sort(([, a], [, b]) => b - a)
+              .map(([strategy, count]) => (
+                <span
+                  key={strategy}
+                  className="inline-flex items-center gap-1 rounded bg-muted/50 px-2 py-0.5 font-mono"
+                  title={strategyLabel(strategy)}
+                >
+                  <span className="text-muted-foreground">{strategy}</span>
+                  <span className="font-semibold">{count}</span>
+                </span>
+              ))}
+          </div>
+        )}
 
       {/* Today's actions */}
       <div>
@@ -289,4 +319,19 @@ function StatusBadge({ status }: { status: string }) {
       {status}
     </span>
   );
+}
+
+function strategyLabel(s: string): string {
+  switch (s) {
+    case "ai_attrs_strict":
+      return "AI: совпали активное вещество, дозировка, упаковка и бренд";
+    case "ai_attrs_partial":
+      return "AI: активное вещество + 1-2 атрибута";
+    case "legacy_fuzzy":
+      return "Legacy: token_set_ratio по названию";
+    case "manual":
+      return "Подтверждено вручную";
+    default:
+      return s;
+  }
 }

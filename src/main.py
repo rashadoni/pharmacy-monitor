@@ -544,6 +544,86 @@ def init_db_cmd() -> None:
     click.echo("DB initialized.")
 
 
+@cli.command("ai-normalize")
+@click.option(
+    "--site",
+    default=None,
+    type=click.Choice(["pharmonline", "aptekonline", "aloe"]),
+    help="Ограничить одним сайтом",
+)
+@click.option(
+    "--limit",
+    default=None,
+    type=int,
+    help="Максимум продуктов в этом прогоне (smoke-test)",
+)
+@click.option(
+    "--batch-size",
+    default=None,
+    type=int,
+    help="Сколько продуктов отправлять одним LLM-вызовом (default 50)",
+)
+@click.option(
+    "--budget-usd",
+    default=None,
+    type=float,
+    help="Стоп если стоимость превысит N USD (default $10)",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Пересчитать даже cached продукты (после изменения prompt'а)",
+)
+def ai_normalize_cmd(
+    site: str | None,
+    limit: int | None,
+    batch_size: int | None,
+    budget_usd: float | None,
+    force: bool,
+) -> None:
+    """AI-нормализация фарма-атрибутов: active_ingredient, dosage_mg, pack_count.
+
+    Заполняет колонку `Product.normalized_attrs` через LLM (Anthropic Haiku
+    по умолчанию). Hash-кэш гарантирует, что неизменённые SKU не зовутся
+    повторно. Запускается автоматически в `run` перед matcher (можно отключить
+    PHARMACY_AI_NORMALIZE=0); standalone полезен для backfill и retry.
+
+    Примеры:
+        pharmacy-monitor ai-normalize                          # все продукты
+        pharmacy-monitor ai-normalize --site aloe              # только aloe
+        pharmacy-monitor ai-normalize --limit 100              # smoke-test
+        pharmacy-monitor ai-normalize --force                  # пересчёт всех
+    """
+    from src import ai_normalize
+
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as s:
+        stats = ai_normalize.normalize_run(
+            s,
+            site=site,
+            limit=limit,
+            batch_size=batch_size,
+            budget_usd=budget_usd,
+            force=force,
+        )
+
+    click.echo(
+        f"total={stats.products_total}  "
+        f"called={stats.products_called}  "
+        f"cached={stats.products_cached}  "
+        f"failed={stats.products_failed}  "
+        f"cost_usd={stats.cost_usd:.4f}"
+    )
+    if stats.budget_exceeded:
+        click.echo("⚠️  Бюджет исчерпан — следующий прогон продолжит pending продукты.")
+    if stats.failures:
+        click.echo(f"⚠️  {len(stats.failures)} failures (first 3):")
+        for f in stats.failures[:3]:
+            click.echo(f"   - {f}")
+
+
 @cli.command("db-check")
 @click.option("--fix", is_flag=True, help="Автоматически чинить orphans (удалять)")
 def db_check_cmd(fix: bool) -> None:
@@ -1422,6 +1502,27 @@ def run_cmd(
             if effective_mode == "watchlist":
                 linked = auto_match_watchlist(session)
                 log.info("watchlist_auto_matched", linked=linked)
+
+            # AI-нормализация фармацевтических атрибутов перед matcher.
+            # Feature flag: PHARMACY_AI_NORMALIZE=0 отключает (default on).
+            # При отсутствии ANTHROPIC_API_KEY модуль fail-soft — matcher
+            # переключается на legacy fuzzy path для unnormalized продуктов.
+            if os.getenv("PHARMACY_AI_NORMALIZE", "1") == "1" and not dry_run:
+                try:
+                    from src import ai_normalize
+                    stats = ai_normalize.normalize_run(session)
+                    log.info(
+                        "ai_normalize_done",
+                        total=stats.products_total,
+                        called=stats.products_called,
+                        cached=stats.products_cached,
+                        failed=stats.products_failed,
+                        cost_usd=round(stats.cost_usd, 4),
+                        budget_exceeded=stats.budget_exceeded,
+                    )
+                except Exception as e:
+                    log.warning("ai_normalize_skipped", error=str(e))
+
             matcher.match_products(session)
 
             # === Real-time alerts ===

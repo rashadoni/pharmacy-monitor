@@ -144,6 +144,15 @@ export interface SiteSummary {
   last_run_id: number | null;
 }
 
+export interface NormalizeStats {
+  products_total: number;
+  products_normalized: number;
+  needs_review: number;
+  coverage_pct: number;
+  last_normalized_at: string | null;
+  matches_by_strategy: Record<string, number>;
+}
+
 export interface RunRow {
   id: number;
   started_at: string | null;
@@ -221,6 +230,7 @@ export const api = {
     return request<AlertEvent[]>(`/api/v1/dash/alerts?${q}`);
   },
   matchQuality: () => request<MatchQuality>("/api/v1/dash/match-quality"),
+  normalizeStats: () => request<NormalizeStats>("/api/v1/dash/normalize/stats"),
   brandShare: (params: { top_n?: number; site?: string } = {}) => {
     const q = new URLSearchParams();
     q.set("top_n", String(params.top_n ?? 30));

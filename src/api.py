@@ -1054,6 +1054,75 @@ def dash_match_quality(
     }
 
 
+@app.get("/api/v1/dash/normalize/stats")
+def dash_normalize_stats(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Coverage AI-нормализатора и распределение match.strategy.
+
+    Используется на /overview как KPI здоровья. Когда coverage падает <80%,
+    это сигнал что промпт перестал работать на новых SKU или бюджет исчерпан.
+    """
+    products_total = db.scalar(
+        select(func.count(storage.Product.id))
+        .where(storage.Product.tenant_id == user.tenant_id)
+    ) or 0
+
+    products_normalized = db.scalar(
+        select(func.count(storage.Product.id))
+        .where(
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.normalized_attrs.is_not(None),
+        )
+    ) or 0
+
+    # needs_review требует читать JSON — делаем загрузку и фильтр в python,
+    # так как Postgres jsonb operators недоступны в SQLite (dev). На проде
+    # это ~2K rows max, безопасно.
+    needs_review_rows = db.scalars(
+        select(storage.Product.normalized_attrs)
+        .where(
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.normalized_attrs.is_not(None),
+        )
+    ).all()
+    needs_review = sum(
+        1 for attrs in needs_review_rows
+        if isinstance(attrs, dict) and attrs.get("needs_review")
+    )
+
+    last_normalized_at = db.scalar(
+        select(func.max(storage.Product.normalized_at))
+        .where(storage.Product.tenant_id == user.tenant_id)
+    )
+
+    # Распределение matches по стратегии
+    strategy_rows = db.execute(
+        select(storage.Match.match_strategy, func.count(storage.Match.id))
+        .where(storage.Match.tenant_id == user.tenant_id)
+        .group_by(storage.Match.match_strategy)
+    ).all()
+    matches_by_strategy = {
+        (row[0] or "unknown"): row[1] for row in strategy_rows
+    }
+
+    coverage_pct = (
+        round(products_normalized / products_total * 100, 1)
+        if products_total else 0.0
+    )
+    return {
+        "products_total": products_total,
+        "products_normalized": products_normalized,
+        "needs_review": needs_review,
+        "coverage_pct": coverage_pct,
+        "last_normalized_at": (
+            last_normalized_at.isoformat() if last_normalized_at else None
+        ),
+        "matches_by_strategy": matches_by_strategy,
+    }
+
+
 @app.get("/api/v1/dash/brand-share")
 def dash_brand_share(
     top_n: int = 30,

@@ -129,6 +129,21 @@ class Product(Base):
         ForeignKey("matches.id"), nullable=True, index=True
     )
 
+    # AI-normalized pharmaceutical attributes (active_ingredient, dosage_mg,
+    # pack_count, form, brand_canonical, confidence). Populated by ai_normalize
+    # module after persist. Matcher uses these for structured-attr matching
+    # instead of fuzzy name comparison. Null → matcher falls back to legacy
+    # fuzzy path.
+    normalized_attrs: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    normalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    # sha256 of (site, name, brand, dosage, pack_size) — cache key. If unchanged
+    # between runs, ai_normalize skips the LLM call entirely.
+    normalize_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+
     snapshots: Mapped[list[PriceSnapshot]] = relationship(back_populates="product")
     canonical: Mapped[Match | None] = relationship(back_populates="products")
 
@@ -165,6 +180,12 @@ class Match(Base):
     canonical_pack_size: Mapped[str | None] = mapped_column(String(100), nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)  # 0..1
     is_manual: Mapped[bool] = mapped_column(Boolean, default=False)  # подтверждено вручную
+    # Какая стратегия дала match — для аудита и подсчёта lift'а:
+    # 'ai_attrs_strict' (active_ingredient + dosage_mg + pack_count + brand)
+    # 'ai_attrs_partial' (active_ingredient + 1-2 поля)
+    # 'legacy_fuzzy' (старый rapidfuzz token_set_ratio)
+    # 'manual' (пользователь подтвердил через UI)
+    match_strategy: Mapped[str | None] = mapped_column(String(30), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     products: Mapped[list[Product]] = relationship(back_populates="canonical")
@@ -555,6 +576,12 @@ def _apply_lightweight_migrations(engine) -> None:
             ("runs", "products_per_site_category", "JSON"),
             # 2026-05-11 (ночь): password в DB (вместо global env-hash)
             ("tenant_users", "password_hash", "VARCHAR(200)"),
+            # 2026-05-16: AI-normalized pharmaceutical attributes
+            ("products", "normalized_attrs", "JSON"),
+            ("products", "normalized_at", "DATETIME"),
+            ("products", "normalize_hash", "VARCHAR(64)"),
+            # 2026-05-16: match strategy для аудита/lift метрик
+            ("matches", "match_strategy", "VARCHAR(30)"),
         ]
         for table, column, coltype in migrations:
             try:
