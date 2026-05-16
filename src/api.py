@@ -1526,6 +1526,232 @@ def dash_match_reject(
     return Response(status_code=204)
 
 
+# ─── Manual aloe-matcher endpoints ───────────────────────────────────────────
+# Дополняет AI-нормализатор: human-in-the-loop для needs_review хвоста и для
+# продуктов где AI не сработал. Поток: пользователь выбирает категорию, видит
+# pharmonline/aptekonline продукты без aloe в кластере → ищет aloe-аналог →
+# одним кликом привязывает к существующему Match.
+
+
+@app.get("/api/v1/dash/unmatched-pairs")
+def dash_unmatched_pairs(
+    site: str,
+    category: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Match-кластеры, в которых отсутствует продукт указанного `site`.
+
+    Используется UI /aloe-matcher: показать ph/apt продукты, которым ручник
+    может найти aloe-аналог. Фильтр `category` — по anchor-продукту в кластере.
+    """
+    _require_site(site)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    # Подзапрос: match_id'ы где УЖЕ есть продукт с этим site
+    has_site_subq = (
+        select(storage.Product.canonical_id)
+        .where(
+            storage.Product.site == site,
+            storage.Product.canonical_id.is_not(None),
+            storage.Product.tenant_id == user.tenant_id,
+        )
+        .distinct()
+        .subquery()
+    )
+
+    # Базовый набор matches: tenant + НЕТ в has_site_subq + есть хотя бы 1 product
+    stmt = (
+        select(storage.Match)
+        .where(
+            storage.Match.tenant_id == user.tenant_id,
+            storage.Match.id.not_in(select(has_site_subq.c.canonical_id)),
+        )
+        .order_by(storage.Match.id.desc())
+    )
+    matches = list(db.scalars(stmt).all())
+
+    if category:
+        matches = [
+            m for m in matches
+            if any((p.category or "") == category for p in m.products)
+        ]
+
+    matches = [m for m in matches if m.products]
+    total = len(matches)
+    page = matches[offset : offset + limit]
+
+    items = []
+    for m in page:
+        anchors = []
+        for p in m.products:
+            snap = None
+            if p.snapshots:
+                snap = max(p.snapshots, key=lambda s: s.captured_at)
+            price = (snap.discount_price or snap.price) if snap else None
+            anchors.append({
+                "product_id": p.id,
+                "site": p.site,
+                "name": p.name,
+                "brand": p.brand,
+                "category": p.category,
+                "url": p.url,
+                "price": price,
+            })
+        items.append({
+            "match_id": m.id,
+            "canonical_name": m.canonical_name,
+            "canonical_brand": m.canonical_brand,
+            "canonical_dosage": m.canonical_dosage,
+            "canonical_pack_size": m.canonical_pack_size,
+            "anchor_products": anchors,
+        })
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+class _AddProductPayload(BaseModel):
+    product_id: int = Field(gt=0)
+
+
+@app.post("/api/v1/dash/matches/{match_id}/add-product")
+def dash_match_add_product(
+    match_id: int,
+    payload: _AddProductPayload,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Привязать продукт к существующему Match.
+
+    Валидация:
+    - Match существует и принадлежит tenant'у
+    - Product существует, tenant'у, не в этом кластере уже
+    - В кластере ещё нет продукта с тем же site (one product per site per match)
+    - Если product был в другом match'е — переезжает (старый match теряет связь)
+    Метит Match.is_manual=True (ручной выбор → защищён от auto-перематчивания).
+    """
+    match = db.scalar(
+        select(storage.Match).where(
+            storage.Match.id == match_id,
+            storage.Match.tenant_id == user.tenant_id,
+        )
+    )
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    product = db.scalar(
+        select(storage.Product).where(
+            storage.Product.id == payload.product_id,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    )
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    if product.canonical_id == match.id:
+        raise HTTPException(400, "Product already in this match")
+
+    existing_sites = {p.site for p in match.products}
+    if product.site in existing_sites:
+        raise HTTPException(
+            409, f"Match already has a product from {product.site}"
+        )
+
+    product.canonical_id = match.id
+    match.is_manual = True
+    match.match_strategy = "manual"
+    if match.confidence is None or match.confidence < 1.0:
+        match.confidence = 1.0
+    db.commit()
+
+    log.info(
+        "match_product_added",
+        match_id=match.id,
+        product_id=product.id,
+        user_id=user.id,
+        site=product.site,
+    )
+
+    db.refresh(match)
+    return {
+        "match_id": match.id,
+        "canonical_name": match.canonical_name,
+        "is_manual": match.is_manual,
+        "match_strategy": match.match_strategy,
+        "products": [
+            {"product_id": p.id, "site": p.site, "name": p.name, "url": p.url}
+            for p in match.products
+        ],
+    }
+
+
+class _CreateMatchPayload(BaseModel):
+    product_ids: list[int] = Field(min_length=2, max_length=10)
+
+
+@app.post("/api/v1/dash/matches/create-with-products")
+def dash_match_create_with_products(
+    payload: _CreateMatchPayload,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Создать новый Match с заданными продуктами (manual cluster).
+
+    Полезно когда оба anchor-продукта были unmatched (нет существующего
+    кластера). Берёт canonical_name/brand/... из первого продукта. Метит
+    is_manual=True. Возвращает созданный Match.
+    """
+    products = list(db.scalars(
+        select(storage.Product).where(
+            storage.Product.id.in_(payload.product_ids),
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    ).all())
+    if len(products) != len(payload.product_ids):
+        raise HTTPException(404, "One or more products not found")
+
+    sites = [p.site for p in products]
+    if len(set(sites)) != len(sites):
+        raise HTTPException(409, "Products must come from distinct sites")
+
+    first = products[0]
+    match = storage.Match(
+        tenant_id=user.tenant_id,
+        canonical_name=first.name,
+        canonical_brand=first.brand,
+        canonical_dosage=first.dosage,
+        canonical_pack_size=first.pack_size,
+        confidence=1.0,
+        is_manual=True,
+        match_strategy="manual",
+    )
+    db.add(match)
+    db.flush()
+    for p in products:
+        p.canonical_id = match.id
+    db.commit()
+    db.refresh(match)
+
+    log.info(
+        "match_created_manual",
+        match_id=match.id,
+        product_ids=[p.id for p in products],
+        user_id=user.id,
+    )
+    return {
+        "match_id": match.id,
+        "canonical_name": match.canonical_name,
+        "is_manual": True,
+        "match_strategy": "manual",
+        "products": [
+            {"product_id": p.id, "site": p.site, "name": p.name, "url": p.url}
+            for p in match.products
+        ],
+    }
+
+
 @app.get("/api/v1/dash/watchlist")
 def dash_watchlist_list(
     user: storage.TenantUser = Depends(require_user),

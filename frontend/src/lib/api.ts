@@ -153,6 +153,40 @@ export interface NormalizeStats {
   matches_by_strategy: Record<string, number>;
 }
 
+export interface AnchorProduct {
+  product_id: number;
+  site: string;
+  name: string;
+  brand: string | null;
+  category: string | null;
+  url: string;
+  price: number | null;
+}
+
+export interface UnmatchedPair {
+  match_id: number;
+  canonical_name: string;
+  canonical_brand: string | null;
+  canonical_dosage: string | null;
+  canonical_pack_size: string | null;
+  anchor_products: AnchorProduct[];
+}
+
+export interface UnmatchedPairsPage {
+  items: UnmatchedPair[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface MatchUpdated {
+  match_id: number;
+  canonical_name: string;
+  is_manual: boolean;
+  match_strategy: string | null;
+  products: { product_id: number; site: string; name: string; url: string }[];
+}
+
 export interface RunRow {
   id: number;
   started_at: string | null;
@@ -231,6 +265,28 @@ export const api = {
   },
   matchQuality: () => request<MatchQuality>("/api/v1/dash/match-quality"),
   normalizeStats: () => request<NormalizeStats>("/api/v1/dash/normalize/stats"),
+  unmatchedPairs: (params: {
+    site: string;
+    category?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const q = new URLSearchParams({ site: params.site });
+    if (params.category) q.set("category", params.category);
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    return request<UnmatchedPairsPage>(`/api/v1/dash/unmatched-pairs?${q}`);
+  },
+  matchAddProduct: (match_id: number, product_id: number) =>
+    request<MatchUpdated>(`/api/v1/dash/matches/${match_id}/add-product`, {
+      method: "POST",
+      body: JSON.stringify({ product_id }),
+    }),
+  matchCreateWithProducts: (product_ids: number[]) =>
+    request<MatchUpdated>("/api/v1/dash/matches/create-with-products", {
+      method: "POST",
+      body: JSON.stringify({ product_ids }),
+    }),
   brandShare: (params: { top_n?: number; site?: string } = {}) => {
     const q = new URLSearchParams();
     q.set("top_n", String(params.top_n ?? 30));

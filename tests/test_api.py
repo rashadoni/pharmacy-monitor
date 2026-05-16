@@ -509,3 +509,235 @@ def test_dash_normalize_stats_with_data(
 def test_dash_normalize_stats_requires_auth(client):
     r = client.get("/api/v1/dash/normalize/stats")
     assert r.status_code == 401
+
+
+# ─── Manual aloe-matcher endpoints ───────────────────────────────────────────
+
+
+_cluster_seq = [0]
+
+
+def _seed_matched_cluster(session, *, tenant_id=1, sites=("pharmonline", "aptekonline"), category="dermanlar"):
+    """Создать Match + N продуктов (по умолчанию ph+apt), вернуть (match, products)."""
+    _cluster_seq[0] += 1
+    seq = _cluster_seq[0]
+    m = storage.Match(
+        tenant_id=tenant_id, canonical_name=f"Aspirin Cardio #{seq}",
+        canonical_brand="Bayer", confidence=1.0,
+    )
+    session.add(m)
+    session.flush()
+    products = []
+    for i, site in enumerate(sites):
+        p = storage.Product(
+            tenant_id=tenant_id, site=site, external_id=f"{site}-c{seq}-x{i}",
+            url=f"https://{site}.az/p/{seq}/{i}",
+            name=f"Aspirin Cardio 100mg 30 tab #{seq}",
+            name_normalized="aspirin cardio", brand="Bayer",
+            category=category, canonical_id=m.id,
+        )
+        session.add(p)
+        products.append(p)
+    session.flush()
+    return m, products
+
+
+def test_dash_unmatched_pairs_returns_clusters_missing_site(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Match с ph+apt но без aloe → попадает в unmatched-pairs?site=aloe."""
+    m, _ = _seed_matched_cluster(setup_db, tenant_id=tenant_user.tenant_id)
+    setup_db.commit()
+
+    r = client.get(
+        "/api/v1/dash/unmatched-pairs?site=aloe",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    item = body["items"][0]
+    assert item["match_id"] == m.id
+    sites_in_anchor = {a["site"] for a in item["anchor_products"]}
+    assert sites_in_anchor == {"pharmonline", "aptekonline"}
+    assert "aloe" not in sites_in_anchor
+
+
+def test_dash_unmatched_pairs_excludes_complete_clusters(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Match со всеми тремя сайтами не должен попадать в результат."""
+    _seed_matched_cluster(
+        setup_db,
+        tenant_id=tenant_user.tenant_id,
+        sites=("pharmonline", "aptekonline", "aloe"),
+    )
+    setup_db.commit()
+
+    r = client.get(
+        "/api/v1/dash/unmatched-pairs?site=aloe",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    assert r.json()["total"] == 0
+
+
+def test_dash_unmatched_pairs_filters_by_category(
+    client, auth_cookie, tenant_user, setup_db
+):
+    _seed_matched_cluster(setup_db, tenant_id=tenant_user.tenant_id, category="dermanlar")
+    _seed_matched_cluster(setup_db, tenant_id=tenant_user.tenant_id, category="bad")
+    setup_db.commit()
+
+    r = client.get(
+        "/api/v1/dash/unmatched-pairs?site=aloe&category=bad",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    cats = {a["category"] for a in body["items"][0]["anchor_products"]}
+    assert cats == {"bad"}
+
+
+def test_dash_unmatched_pairs_rejects_unknown_site(client, auth_cookie):
+    r = client.get(
+        "/api/v1/dash/unmatched-pairs?site=hax",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 400
+
+
+def test_dash_match_add_product_links_correctly(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Привязка aloe-продукта к существующему ph+apt кластеру."""
+    m, _ = _seed_matched_cluster(setup_db, tenant_id=tenant_user.tenant_id)
+    aloe_p = storage.Product(
+        tenant_id=tenant_user.tenant_id, site="aloe", external_id="al-x",
+        url="https://aloe.az/p/x", name="Aspirin Cardio",
+        name_normalized="aspirin cardio", brand="Bayer", category="dermanlar",
+    )
+    setup_db.add(aloe_p)
+    setup_db.commit()
+
+    r = client.post(
+        f"/api/v1/dash/matches/{m.id}/add-product",
+        json={"product_id": aloe_p.id},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["match_id"] == m.id
+    assert body["is_manual"] is True
+    assert body["match_strategy"] == "manual"
+    assert len(body["products"]) == 3
+    sites = {p["site"] for p in body["products"]}
+    assert sites == {"pharmonline", "aptekonline", "aloe"}
+
+    setup_db.refresh(aloe_p)
+    assert aloe_p.canonical_id == m.id
+
+
+def test_dash_match_add_product_blocks_site_collision(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Если в кластере уже есть продукт с тем же site — 409."""
+    m, _ = _seed_matched_cluster(setup_db, tenant_id=tenant_user.tenant_id)
+    extra_ph = storage.Product(
+        tenant_id=tenant_user.tenant_id, site="pharmonline", external_id="ph-extra",
+        url="x", name="Aspirin Other", name_normalized="aspirin", brand="Bayer",
+    )
+    setup_db.add(extra_ph)
+    setup_db.commit()
+
+    r = client.post(
+        f"/api/v1/dash/matches/{m.id}/add-product",
+        json={"product_id": extra_ph.id},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 409
+
+
+def test_dash_match_add_product_404_on_missing_match(client, auth_cookie):
+    r = client.post(
+        "/api/v1/dash/matches/9999/add-product",
+        json={"product_id": 1},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 404
+
+
+def test_dash_match_add_product_requires_auth(client):
+    r = client.post(
+        "/api/v1/dash/matches/1/add-product",
+        json={"product_id": 1},
+    )
+    assert r.status_code == 401
+
+
+def test_dash_match_create_with_products(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Создание нового manual Match'а из 2-3 несвязанных продуктов."""
+    s = setup_db
+    p_ph = storage.Product(
+        tenant_id=tenant_user.tenant_id, site="pharmonline", external_id="ph",
+        url="x", name="Aspirin", name_normalized="aspirin", brand="Bayer",
+    )
+    p_al = storage.Product(
+        tenant_id=tenant_user.tenant_id, site="aloe", external_id="al",
+        url="x", name="Aspirin", name_normalized="aspirin", brand="Bayer",
+    )
+    s.add_all([p_ph, p_al])
+    s.commit()
+
+    r = client.post(
+        "/api/v1/dash/matches/create-with-products",
+        json={"product_ids": [p_ph.id, p_al.id]},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_manual"] is True
+    assert body["match_strategy"] == "manual"
+    sites = {p["site"] for p in body["products"]}
+    assert sites == {"pharmonline", "aloe"}
+
+    s.refresh(p_ph)
+    s.refresh(p_al)
+    assert p_ph.canonical_id == p_al.canonical_id == body["match_id"]
+
+
+def test_dash_match_create_rejects_same_site_duplicates(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Два продукта с одного сайта в одном manual match'е — 409."""
+    s = setup_db
+    p1 = storage.Product(
+        tenant_id=tenant_user.tenant_id, site="aloe", external_id="al1",
+        url="x", name="A", name_normalized="a", brand="X",
+    )
+    p2 = storage.Product(
+        tenant_id=tenant_user.tenant_id, site="aloe", external_id="al2",
+        url="x", name="B", name_normalized="b", brand="X",
+    )
+    s.add_all([p1, p2])
+    s.commit()
+
+    r = client.post(
+        "/api/v1/dash/matches/create-with-products",
+        json={"product_ids": [p1.id, p2.id]},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 409
+
+
+def test_dash_match_create_validates_min_two_products(client, auth_cookie):
+    r = client.post(
+        "/api/v1/dash/matches/create-with-products",
+        json={"product_ids": [42]},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    # Pydantic validation fails → 422
+    assert r.status_code == 422
