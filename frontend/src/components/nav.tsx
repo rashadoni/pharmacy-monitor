@@ -6,10 +6,12 @@ import { useTranslations } from "next-intl";
 import {
   BarChart3,
   Bell,
+  Building2,
   Leaf,
   Link2,
   ListTree,
   LogOut,
+  Pill,
   Search,
   Settings,
   Star,
@@ -21,7 +23,9 @@ import { cn } from "@/lib/utils";
 const NAV_ITEMS = [
   { href: "/comparison", key: "comparison", icon: Search },
   { href: "/overview", key: "overview", icon: TrendingUp },
-  { href: "/aloe", key: "aloe", icon: Leaf },
+  { href: "/site/pharmonline", key: "sitePharmonline", icon: Building2 },
+  { href: "/site/aptekonline", key: "siteAptekonline", icon: Pill },
+  { href: "/site/aloe", key: "siteAloe", icon: Leaf },
   { href: "/aloe-matcher", key: "aloeMatcher", icon: Link2 },
   { href: "/analytics", key: "analytics", icon: BarChart3 },
   { href: "/alerts", key: "alerts", icon: Bell },
