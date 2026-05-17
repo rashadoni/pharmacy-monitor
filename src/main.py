@@ -1553,19 +1553,28 @@ def run_cmd(
             xlsx_path.write_bytes(xlsx)
             log.info("report_saved", html=str(html_path), xlsx=str(xlsx_path))
 
-            # В hourly режиме пропускаем большой email-отчёт (только alerts)
+            # В hourly режиме пропускаем большой email-отчёт (только alerts).
+            # Любая ошибка отправки (SMTP quota, бан, network) НЕ должна валить
+            # весь run — скрейп уже завершён, данные в БД. Просто пишем warning.
             if not dry_run and not hourly:
-                notifier.send_email(
-                    subject=subject,
-                    html_body=html,
-                    attachments=[
-                        (
-                            reporter.excel_filename(report),
-                            xlsx,
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
-                    ],
-                )
+                try:
+                    notifier.send_email(
+                        subject=subject,
+                        html_body=html,
+                        attachments=[
+                            (
+                                reporter.excel_filename(report),
+                                xlsx,
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            )
+                        ],
+                    )
+                except Exception as email_err:
+                    log.warning(
+                        "report_email_failed",
+                        run_id=run_id,
+                        error=str(email_err),
+                    )
 
             run.status = "ok"
             run.finished_at = utcnow()
