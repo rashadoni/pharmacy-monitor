@@ -13,8 +13,12 @@ name: Daily scrape (pharmonline + aptekonline)
 # proxy (Crawlbase / VPS в Баку).
 
 on:
-  schedule:
-    - cron: "0 14 * * *"  # 14:00 UTC daily = 18:00 Asia/Baku
+  # Cron отключён 2026-05-17 — Mac launchd с caffeinate + retry + watchdog
+  # держит расписание сам, а Crawlbase free tier тратится зря если оба идут.
+  # Re-enable если Mac снова просядет ниже 80% success / придёт несколько
+  # `site_silent` alert'ов из health-check.
+  # schedule:
+  #   - cron: "0 14 * * *"
   workflow_dispatch:
     inputs:
       sites:
