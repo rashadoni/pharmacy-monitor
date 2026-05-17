@@ -13,6 +13,41 @@ import { formatPrice, formatTime } from "@/lib/utils";
 
 const PAGE_LIMIT = 50;
 
+/**
+ * P1.5 (PO Audit 2026-05-17): human-readable category label.
+ *
+ * Backend возвращает {name: slug, label: label_ru || slug}. Проблемы аудита:
+ * - `label = "Daha çox"` (Azerbaijani "Show more") — UI-artefact из aloe-scrape
+ *   seed-данных, бесполезный для пользователя
+ * - `label = slug` (отсутствует label_ru) — slug нечитаемый: `ushaqlar-uchun-vasiteler`
+ *
+ * Эвристика:
+ * 1. Если label один из generic UI-маркеров — fallback на красивый slug
+ * 2. Иначе если label !== slug — показать label
+ * 3. Иначе beautify slug: dashes→spaces, capitalize first
+ */
+const _GENERIC_LABELS = new Set([
+  "daha çox", "daha cox", "show more", "view all", "все", "more",
+  "детское питание", // not generic per se но дубликат когда slug = "uşaq-qidası"
+]);
+
+function prettyCategoryLabel(c: { name: string; label?: string }): string {
+  const slug = c.name;
+  const label = c.label?.trim();
+
+  // Beautify slug as fallback
+  const beautify = (s: string) =>
+    s
+      .replace(/[-_]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/^./, (ch) => ch.toUpperCase());
+
+  if (!label || label === slug) return beautify(slug);
+  if (_GENERIC_LABELS.has(label.toLowerCase())) return beautify(slug);
+  return label;
+}
+
 const VALID_SITES = ["pharmonline", "aptekonline", "aloe"] as const;
 type SiteName = (typeof VALID_SITES)[number];
 
@@ -261,25 +296,15 @@ function CategoriesPanel({
       )}
       <ul className="divide-y divide-border max-h-96 overflow-y-auto">
         {categories.map((c) => {
-          const hasLabel = c.label && c.label !== c.name;
+          const display = prettyCategoryLabel(c);
           return (
             <li
               key={c.name}
               className="flex items-center justify-between px-4 py-2 text-sm gap-2"
+              title={c.name}
             >
-              <span className="min-w-0 flex-1 truncate">
-                {hasLabel ? (
-                  <>
-                    <span className="font-medium">{c.label}</span>
-                    <span className="ml-1.5 text-[10px] font-mono text-muted-foreground/60">
-                      {c.name}
-                    </span>
-                  </>
-                ) : (
-                  <span className="font-mono text-xs text-muted-foreground">
-                    {c.name}
-                  </span>
-                )}
+              <span className="min-w-0 flex-1 truncate font-medium">
+                {display}
               </span>
               <span className="font-mono tabular-nums shrink-0">{c.count}</span>
             </li>
@@ -360,8 +385,8 @@ function ProductsSection({
         >
           <option value="">Все категории</option>
           {facets?.categories.map((c) => (
-            <option key={c.name} value={c.name}>
-              {c.label && c.label !== c.name ? c.label : c.name} ({c.count})
+            <option key={c.name} value={c.name} title={c.name}>
+              {prettyCategoryLabel(c)} ({c.count})
             </option>
           ))}
         </select>
