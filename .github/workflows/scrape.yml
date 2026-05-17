@@ -1,0 +1,105 @@
+name: Daily scrape (pharmonline + aptekonline)
+
+# Запускается каждый день в 14:00 UTC (= 18:00 Asia/Baku).
+# Альтернатива Mac launchd: GitHub Actions runner с Azure US East 2 IP,
+# открывает SSH-туннель на prod Postgres, прогоняет scraper для двух сайтов.
+#
+# Зачем: Mac launchd показал 17% success rate за 12 дней (Mac sleep / outage).
+# GitHub Actions managed, бесплатно (под 2000 мин/мес лимита free-tier для
+# private repo).
+#
+# Если Cloudflare блокирует Azure IP — workflow упадёт на первом site, в
+# логах будет "block_page captured: cf challenge". Тогда переход на платный
+# proxy (Crawlbase / VPS в Баку).
+
+on:
+  schedule:
+    - cron: "0 14 * * *"  # 14:00 UTC daily = 18:00 Asia/Baku
+  workflow_dispatch:
+    inputs:
+      sites:
+        description: "Сайты через запятую (по умолчанию: pharmonline,aptekonline)"
+        required: false
+        default: "pharmonline,aptekonline"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Install Playwright Chromium
+        # Скачивает только Chromium (~120 MB) — pharmonline скрейпер использует его.
+        # Aptekonline на httpx, браузер не нужен, но для общности ставим.
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Setup SSH key for prod tunnel
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Open SSH tunnel to prod Postgres
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -N -L 5433:localhost:5432 \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 &
+          echo "TUNNEL_PID=$!" >> $GITHUB_ENV
+          # Подождать пока туннель встанет (до 15с)
+          for i in $(seq 1 30); do
+            if nc -z localhost 5433 2>/dev/null; then
+              echo "tunnel up after ${i} retries"
+              break
+            fi
+            sleep 0.5
+          done
+          if ! nc -z localhost 5433 2>/dev/null; then
+            echo "ERROR: SSH tunnel did not come up"
+            exit 1
+          fi
+
+      - name: Run scraper
+        env:
+          DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
+          SITES_INPUT: ${{ github.event.inputs.sites || 'pharmonline,aptekonline' }}
+        run: |
+          # Преобразуем "pharmonline,aptekonline" в "--site pharmonline --site aptekonline"
+          SITE_ARGS=""
+          IFS=',' read -ra SITES <<< "$SITES_INPUT"
+          for s in "${SITES[@]}"; do
+            SITE_ARGS+="--site $s "
+          done
+          echo "Running: pharmacy-monitor run $SITE_ARGS --mode category --no-alerts"
+          pharmacy-monitor run $SITE_ARGS --mode category --no-alerts
+
+      - name: Close SSH tunnel
+        if: always()
+        run: |
+          if [ -n "${TUNNEL_PID:-}" ]; then
+            kill $TUNNEL_PID 2>/dev/null || true
+          fi
+
+      - name: Report failure (if scrape failed)
+        if: failure()
+        run: |
+          echo "::error::Scrape failed. Check logs above. If Cloudflare blocked, switch to paid proxy (see CLAUDE.md)."
