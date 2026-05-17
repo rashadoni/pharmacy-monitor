@@ -1225,29 +1225,30 @@ def dash_roi_actions(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
+    """ROI actions для client_site.
+
+    P0.1 (PO Audit 2026-05-17): compute_actions для 3к матчей занимает 15-30с
+    и frontend timeout'ит на 15с (API 408 на 4 экранах). Сейчас читаем из
+    roi_actions_cache (pre-computed после каждого scrape success). Если кэш
+    отсутствует или старше 26ч — fallback inline compute (медленно, но даёт
+    данные новому tenant'у пока первый scrape не отработал).
+    """
     from src import roi
     _require_site(client_site)
+
+    cached = roi.get_cached_actions(db, client_site, tenant_id=user.tenant_id)
+    if cached is not None:
+        return cached
+
+    # Fallback: compute inline (медленно, но всегда даёт ответ)
     actions = roi.compute_actions(db, client_site=client_site)
-    return [
-        {
-            "type": a.type,
-            "severity": a.severity,
-            "title": a.title,
-            "detail": a.detail,
-            "product_name": a.product_name,
-            "product_url": a.product_url,
-            "current_value_azn": a.current_value_azn,
-            "target_value_azn": a.target_value_azn,
-            # Реальные цифры (per-unit gap + % spread). См. roi.py module
-            # docstring — почему больше не возвращаем «AZN/мес».
-            "unit_gap_azn": a.unit_gap_azn,
-            "spread_pct": a.spread_pct,
-            # Deprecated — всегда 0. Сохранено для backward-compat (telegram bot).
-            "estimated_monthly_impact_azn": a.estimated_monthly_impact_azn,
-            "competitor_site": a.competitor_site,
-        }
-        for a in actions
-    ]
+    payload = [roi._action_to_dict(a) for a in actions]
+    # Лениво кэшируем — следующие запросы пойдут из БД
+    try:
+        roi.cache_actions(db, client_site, actions, tenant_id=user.tenant_id)
+    except Exception:
+        pass  # cache write не должен валить запрос
+    return payload
 
 
 @app.get("/api/v1/dash/alerts")

@@ -246,3 +246,88 @@ def test_compute_actions_aloe_assortment_gap_excludes_aloe_products(db_session):
     assert len(gap_actions) == 1
     assert gap_actions[0].competitor_site == "pharmonline"
     assert "PhOnly" in gap_actions[0].title
+
+
+# ─── ROI actions cache (P0.1 PO Audit 2026-05-17) ────────────────────────────
+
+
+def test_cache_actions_round_trip(db_session):
+    """compute_actions → cache_actions → get_cached_actions возвращает payload."""
+    _make_cluster(
+        db_session, "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+    )
+    actions = roi.compute_actions(db_session, client_site="pharmonline")
+    assert len(actions) >= 1
+
+    roi.cache_actions(db_session, "pharmonline", actions, run_id=42)
+
+    cached = roi.get_cached_actions(db_session, "pharmonline")
+    assert cached is not None
+    assert len(cached) == len(actions)
+    # Структура совпадает с HTTP response — те же ключи
+    keys = set(cached[0].keys())
+    assert {"type", "severity", "title", "spread_pct", "unit_gap_azn"} <= keys
+
+
+def test_get_cached_actions_returns_none_when_empty(db_session):
+    """Если кэша нет — должен возвращать None, не raise."""
+    assert roi.get_cached_actions(db_session, "pharmonline") is None
+
+
+def test_get_cached_actions_returns_none_when_stale(db_session):
+    """Кэш старше max_age_hours → None (forces fallback на inline compute)."""
+    from datetime import timedelta
+    from src.storage import RoiActionsCache
+
+    db_session.add(
+        RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            payload=[{"type": "price_raise", "severity": "info", "title": "test"}],
+            computed_at=utcnow() - timedelta(hours=48),
+            run_id=1,
+        )
+    )
+    db_session.commit()
+
+    assert roi.get_cached_actions(db_session, "pharmonline") is None
+    # Но если повысить порог — возвращается
+    assert (
+        roi.get_cached_actions(db_session, "pharmonline", max_age_hours=72)
+        is not None
+    )
+
+
+def test_cache_actions_upserts_existing(db_session):
+    """Второй cache_actions для same (tenant, site) обновляет, не дублирует."""
+    from src.storage import RoiActionsCache
+
+    _make_cluster(
+        db_session, "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+    )
+    actions = roi.compute_actions(db_session, client_site="pharmonline")
+
+    roi.cache_actions(db_session, "pharmonline", actions, run_id=1)
+    roi.cache_actions(db_session, "pharmonline", actions, run_id=2)
+
+    rows = db_session.query(RoiActionsCache).filter_by(client_site="pharmonline").all()
+    assert len(rows) == 1
+    assert rows[0].run_id == 2  # обновился
+
+
+def test_refresh_all_cached_actions_covers_three_sites(db_session):
+    """refresh_all_cached_actions создаёт 3 row (по одному на сайт)."""
+    from src.storage import RoiActionsCache
+
+    _make_cluster(
+        db_session, "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+    )
+
+    summary = roi.refresh_all_cached_actions(db_session, run_id=99)
+    assert set(summary.keys()) == {"pharmonline", "aptekonline", "aloe"}
+    rows = db_session.query(RoiActionsCache).all()
+    assert {r.client_site for r in rows} == {"pharmonline", "aptekonline", "aloe"}
+    assert all(r.run_id == 99 for r in rows)
