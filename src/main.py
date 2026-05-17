@@ -244,14 +244,32 @@ def _smoke_test_per_site_coverage(
     day = 1-5K → ложные срабатывания site_drop. Текущая версия использует
     products_scraped, который стабилен между режимами.)
     """
-    from src.storage import AlertEvent, AlertRule, Run
-    from sqlalchemy import select, desc
+    from src.storage import AlertEvent, AlertRule, Product, Run
+    from sqlalchemy import func, select, desc
 
     for result in results:
         site = result.site
         current = len(result.products) if hasattr(result, "products") else 0
         if current == 0:
             continue
+
+        # P0.5 (PO Audit 2026-05-17): if current < 10% of known site catalog,
+        # this is almost certainly a partial/cancelled scrape (GH Actions
+        # timeout, user-cancelled workflow, network failure mid-run), NOT a
+        # genuine "site dropped 93% of products". Раньше cancelled GH runs
+        # давали 119/249 prods → smoke генерил false-positive «-93%» alerts
+        # которые шумели в /alerts и Sentry.
+        catalog_size = session.scalar(
+            select(func.count()).select_from(Product).where(Product.site == site)
+        ) or 0
+        if catalog_size > 0 and current < 0.10 * catalog_size:
+            log.info(
+                "smoke_test_skipped_partial_run",
+                site=site, current=current, catalog_size=catalog_size,
+                reason="current<10%_of_catalog — likely cancelled/partial scrape",
+            )
+            continue
+
         # Среднее за прошлые 5 ok-runs, где этот сайт участвовал. Берём
         # `products_per_site.get(site)` если есть (точная per-site метрика,
         # добавлена 2026-05-11), иначе fallback на `products_scraped`.
