@@ -1,9 +1,18 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { AlertTriangle, AlertCircle, Info } from "lucide-react";
-import { api, type AlertEvent } from "@/lib/api";
+import {
+  AlertCircle,
+  AlertTriangle,
+  CheckCheck,
+  Clock,
+  Info,
+  Inbox,
+  Mail,
+  MailOpen,
+} from "lucide-react";
+import { api, friendlyError, type AlertEvent } from "@/lib/api";
 import { formatRelative } from "@/lib/utils";
 import { CardListSkeleton } from "@/components/skeleton";
 
@@ -28,16 +37,38 @@ const SEVERITY_CONFIG = {
   },
 } as const;
 
+type TabView = "inbox" | "snoozed" | "read";
+
 export default function AlertsPage() {
+  const queryClient = useQueryClient();
+  const [view, setView] = useState<TabView>("inbox");
   const [severityFilter, setSeverityFilter] = useState<string>("");
-  const [hoursWindow, setHoursWindow] = useState<number>(24);
+  const [hoursWindow, setHoursWindow] = useState<number>(168); // 7 дней по умолчанию
   const [ruleTypeFilter, setRuleTypeFilter] = useState<string>("");
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+
+  // Backend фильтры по view
+  const includeRead = view === "read";
+  const includeSnoozed = view === "snoozed";
 
   const { data, isLoading } = useQuery({
-    queryKey: ["alerts", severityFilter],
-    queryFn: () => api.alerts(severityFilter || undefined, 500),
+    queryKey: ["alerts", severityFilter, includeRead, includeSnoozed],
+    queryFn: () =>
+      api.alerts({
+        severity: severityFilter || undefined,
+        limit: 500,
+        include_read: includeRead,
+        include_snoozed: includeSnoozed,
+      }),
   });
 
+  const countsQ = useQuery({
+    queryKey: ["alerts-counts"],
+    queryFn: () => api.alertsCounts(),
+    staleTime: 30_000,
+  });
+
+  // Дополнительные client-side фильтры
   const filtered = useMemo(() => {
     if (!data) return data;
     const cutoff = Date.now() - hoursWindow * 3_600_000;
@@ -45,31 +76,133 @@ export default function AlertsPage() {
       if (hoursWindow > 0 && new Date(e.created_at).getTime() < cutoff)
         return false;
       if (ruleTypeFilter && e.rule_type !== ruleTypeFilter) return false;
+      // В inbox view фильтруем по semantics:
+      // - inbox = !is_read && (!snoozed || snoozed_until <= now)
+      // - snoozed = !is_read && snoozed > now
+      // - read = is_read
+      if (view === "inbox") {
+        if (e.is_read) return false;
+        if (e.snoozed_until && new Date(e.snoozed_until).getTime() > Date.now())
+          return false;
+      } else if (view === "snoozed") {
+        if (e.is_read) return false;
+        if (
+          !e.snoozed_until ||
+          new Date(e.snoozed_until).getTime() <= Date.now()
+        )
+          return false;
+      } else if (view === "read") {
+        if (!e.is_read) return false;
+      }
       return true;
     });
-  }, [data, hoursWindow, ruleTypeFilter]);
+  }, [data, hoursWindow, ruleTypeFilter, view]);
 
-  const counts = {
-    critical: filtered?.filter((e) => e.severity === "critical").length ?? 0,
-    warning: filtered?.filter((e) => e.severity === "warning").length ?? 0,
-    info: filtered?.filter((e) => e.severity === "info").length ?? 0,
-  };
-
-  // Уникальные типы правил во всём наборе (не filtered, чтобы dropdown был стабильным)
   const ruleTypes = useMemo(() => {
     const types = new Set<string>();
     data?.forEach((e) => e.rule_type && types.add(e.rule_type));
     return Array.from(types).sort();
   }, [data]);
 
+  // Mutations
+  const bulkMutation = useMutation({
+    mutationFn: ({
+      ids,
+      action,
+    }: {
+      ids: number[];
+      action:
+        | "mark_read"
+        | "mark_unread"
+        | "snooze_24h"
+        | "snooze_7d"
+        | "snooze_clear";
+    }) => api.alertsBulk(ids, action),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
+      setSelected(new Set());
+    },
+    onError: (e) => alert(friendlyError(e)),
+  });
+  const patchMutation = useMutation({
+    mutationFn: ({
+      id,
+      payload,
+    }: {
+      id: number;
+      payload: { is_read?: boolean; snooze_hours?: number };
+    }) => api.alertPatch(id, payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
+    },
+    onError: (e) => alert(friendlyError(e)),
+  });
+
+  function toggleSel(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function toggleSelAll() {
+    if (!filtered) return;
+    if (selected.size === filtered.length) setSelected(new Set());
+    else setSelected(new Set(filtered.map((e) => e.id)));
+  }
+
+  const counts = countsQ.data;
+
   return (
     <div className="space-y-4">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Алерты</h1>
-        <p className="text-sm text-muted-foreground">События за последние прогоны</p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Алерты</h1>
+          <p className="text-sm text-muted-foreground">
+            События за последние прогоны. Inbox-стиль: прочитанные/отложенные —
+            в отдельных tab&apos;ах.
+          </p>
+        </div>
       </div>
 
-      {/* Filters: severity chips + date window + rule type */}
+      {/* Tabs */}
+      <div className="flex items-center gap-1 border-b border-border">
+        <TabBtn
+          active={view === "inbox"}
+          onClick={() => {
+            setView("inbox");
+            setSelected(new Set());
+          }}
+          icon={Inbox}
+          label="Inbox"
+          count={counts?.unread}
+        />
+        <TabBtn
+          active={view === "snoozed"}
+          onClick={() => {
+            setView("snoozed");
+            setSelected(new Set());
+          }}
+          icon={Clock}
+          label="Отложено"
+          count={counts?.snoozed}
+        />
+        <TabBtn
+          active={view === "read"}
+          onClick={() => {
+            setView("read");
+            setSelected(new Set());
+          }}
+          icon={MailOpen}
+          label="Прочитано"
+          count={counts?.read}
+        />
+      </div>
+
+      {/* Filters */}
       <div className="flex gap-2 flex-wrap items-center">
         <Chip
           active={severityFilter === ""}
@@ -79,23 +212,23 @@ export default function AlertsPage() {
         <Chip
           active={severityFilter === "critical"}
           onClick={() => setSeverityFilter("critical")}
-          label={`🔴 Critical (${counts.critical})`}
+          label="🔴 Critical"
         />
         <Chip
           active={severityFilter === "warning"}
           onClick={() => setSeverityFilter("warning")}
-          label={`🟡 Warning (${counts.warning})`}
+          label="🟡 Warning"
         />
         <Chip
           active={severityFilter === "info"}
           onClick={() => setSeverityFilter("info")}
-          label={`ℹ️ Info (${counts.info})`}
+          label="ℹ️ Info"
         />
         <div className="ml-auto flex gap-2">
           <select
             value={hoursWindow}
             onChange={(e) => setHoursWindow(Number(e.target.value))}
-            className="text-xs rounded-full px-3 py-1 border border-border bg-card"
+            className="text-xs rounded-full px-3 py-1 border border-border bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <option value={24}>24 часа</option>
             <option value={72}>3 дня</option>
@@ -106,7 +239,7 @@ export default function AlertsPage() {
           <select
             value={ruleTypeFilter}
             onChange={(e) => setRuleTypeFilter(e.target.value)}
-            className="text-xs rounded-full px-3 py-1 border border-border bg-card"
+            className="text-xs rounded-full px-3 py-1 border border-border bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <option value="">Все типы</option>
             {ruleTypes.map((rt) => (
@@ -118,37 +251,191 @@ export default function AlertsPage() {
         </div>
       </div>
 
+      {/* Bulk toolbar — виден когда есть selected */}
+      {selected.size > 0 && (
+        <div className="sticky top-0 z-10 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 flex items-center gap-2 text-sm">
+          <span className="font-medium">{selected.size} выбрано:</span>
+          {view !== "read" && (
+            <button
+              onClick={() =>
+                bulkMutation.mutate({
+                  ids: [...selected],
+                  action: "mark_read",
+                })
+              }
+              disabled={bulkMutation.isPending}
+              className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <CheckCheck className="h-3.5 w-3.5" /> Прочитано
+            </button>
+          )}
+          {view === "read" && (
+            <button
+              onClick={() =>
+                bulkMutation.mutate({
+                  ids: [...selected],
+                  action: "mark_unread",
+                })
+              }
+              disabled={bulkMutation.isPending}
+              className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Mail className="h-3.5 w-3.5" /> Непрочитано
+            </button>
+          )}
+          {view !== "snoozed" && (
+            <>
+              <button
+                onClick={() =>
+                  bulkMutation.mutate({
+                    ids: [...selected],
+                    action: "snooze_24h",
+                  })
+                }
+                disabled={bulkMutation.isPending}
+                className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <Clock className="h-3.5 w-3.5" /> Отложить 24ч
+              </button>
+              <button
+                onClick={() =>
+                  bulkMutation.mutate({
+                    ids: [...selected],
+                    action: "snooze_7d",
+                  })
+                }
+                disabled={bulkMutation.isPending}
+                className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <Clock className="h-3.5 w-3.5" /> 7 дней
+              </button>
+            </>
+          )}
+          {view === "snoozed" && (
+            <button
+              onClick={() =>
+                bulkMutation.mutate({
+                  ids: [...selected],
+                  action: "snooze_clear",
+                })
+              }
+              disabled={bulkMutation.isPending}
+              className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Вернуть в inbox
+            </button>
+          )}
+          <button
+            onClick={() => setSelected(new Set())}
+            className="ml-auto text-muted-foreground hover:text-foreground"
+          >
+            Снять выделение
+          </button>
+        </div>
+      )}
+
+      {/* Select-all checkbox */}
+      {filtered && filtered.length > 0 && (
+        <label className="inline-flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+          <input
+            type="checkbox"
+            checked={selected.size > 0 && selected.size === filtered.length}
+            onChange={toggleSelAll}
+            className="h-3.5 w-3.5"
+          />
+          Выбрать всё на экране ({filtered.length})
+        </label>
+      )}
+
       {isLoading && <CardListSkeleton count={6} />}
       {filtered && filtered.length === 0 && !isLoading && (
         <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center">
-          По фильтрам ничего нет. Расширьте окно времени или сбросьте severity.
+          {view === "inbox" && "🎉 Inbox пуст. Все алерты прочитаны или отложены."}
+          {view === "snoozed" && "Нет отложенных алертов в текущем окне."}
+          {view === "read" && "Нет прочитанных алертов в текущем окне."}
         </div>
       )}
 
       <div className="space-y-2">
         {filtered?.map((event) => (
-          <AlertCard key={event.id} event={event} />
+          <AlertCard
+            key={event.id}
+            event={event}
+            selected={selected.has(event.id)}
+            onToggleSel={() => toggleSel(event.id)}
+            onMarkRead={() =>
+              patchMutation.mutate({
+                id: event.id,
+                payload: { is_read: !event.is_read },
+              })
+            }
+            onSnooze7d={() =>
+              patchMutation.mutate({
+                id: event.id,
+                payload: { snooze_hours: 24 * 7 },
+              })
+            }
+            onSnoozeClear={() =>
+              patchMutation.mutate({
+                id: event.id,
+                payload: { snooze_hours: 0 },
+              })
+            }
+          />
         ))}
       </div>
     </div>
   );
 }
 
-function AlertCard({ event }: { event: AlertEvent }) {
+function AlertCard({
+  event,
+  selected,
+  onToggleSel,
+  onMarkRead,
+  onSnooze7d,
+  onSnoozeClear,
+}: {
+  event: AlertEvent;
+  selected: boolean;
+  onToggleSel: () => void;
+  onMarkRead: () => void;
+  onSnooze7d: () => void;
+  onSnoozeClear: () => void;
+}) {
   const cfg = SEVERITY_CONFIG[event.severity] ?? SEVERITY_CONFIG.info;
   const Icon = cfg.icon;
+  const dimmed = event.is_read;
   return (
-    <div className={`rounded-lg border ${cfg.bg} p-3`}>
+    <div
+      className={`rounded-lg border ${cfg.bg} p-3 ${dimmed ? "opacity-60" : ""}`}
+    >
       <div className="flex items-start gap-3">
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={onToggleSel}
+          className="h-4 w-4 mt-1 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label="Выбрать для bulk-действия"
+        />
         <Icon className={`h-5 w-5 shrink-0 ${cfg.color} mt-0.5`} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2 flex-wrap">
-            <div className="font-medium text-sm">{event.title}</div>
-            <div
-              className="text-xs text-muted-foreground tabular-nums"
-              title={event.created_at}
-            >
-              {formatRelative(event.created_at)}
+            <div className={`font-medium text-sm ${event.is_read ? "line-through" : ""}`}>
+              {event.title}
+            </div>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground tabular-nums">
+              {event.snoozed_until &&
+                new Date(event.snoozed_until).getTime() > Date.now() && (
+                  <span
+                    className="inline-flex items-center gap-1 rounded bg-muted/50 px-1.5 py-0.5"
+                    title={`Snoozed до ${new Date(event.snoozed_until).toLocaleString("ru-RU")}`}
+                  >
+                    <Clock className="h-3 w-3" />
+                    отложено
+                  </span>
+                )}
+              <span title={event.created_at}>{formatRelative(event.created_at)}</span>
             </div>
           </div>
           {event.detail && (
@@ -159,9 +446,80 @@ function AlertCard({ event }: { event: AlertEvent }) {
               {event.rule_type}
             </div>
           )}
+          <div className="flex items-center gap-2 mt-2 text-[11px]">
+            <button
+              onClick={onMarkRead}
+              className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              title={event.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"}
+            >
+              {event.is_read ? (
+                <>
+                  <Mail className="h-3 w-3" /> Непрочитано
+                </>
+              ) : (
+                <>
+                  <CheckCheck className="h-3 w-3" /> Прочитано
+                </>
+              )}
+            </button>
+            {event.snoozed_until &&
+            new Date(event.snoozed_until).getTime() > Date.now() ? (
+              <button
+                onClick={onSnoozeClear}
+                className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Вернуть в inbox
+              </button>
+            ) : (
+              <button
+                onClick={onSnooze7d}
+                className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                title="Скрыть на 7 дней"
+              >
+                <Clock className="h-3 w-3" /> Отложить 7д
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>
+  );
+}
+
+function TabBtn({
+  active,
+  onClick,
+  icon: Icon,
+  label,
+  count,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: typeof Inbox;
+  label: string;
+  count: number | undefined;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`inline-flex items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+        active
+          ? "border-primary text-foreground font-medium"
+          : "border-transparent text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      <Icon className="h-4 w-4" />
+      {label}
+      {count != null && (
+        <span
+          className={`text-[10px] tabular-nums font-mono ${
+            active ? "text-primary-foreground/80" : "text-muted-foreground"
+          }`}
+        >
+          ({count})
+        </span>
+      )}
+    </button>
   );
 }
 
@@ -177,7 +535,7 @@ function Chip({
   return (
     <button
       onClick={onClick}
-      className={`text-xs rounded-full px-3 py-1 border transition-colors ${
+      className={`text-xs rounded-full px-3 py-1 border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
         active
           ? "bg-primary text-primary-foreground border-primary"
           : "bg-card text-muted-foreground border-border hover:bg-secondary"

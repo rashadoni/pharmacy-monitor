@@ -365,6 +365,14 @@ class AlertEvent(Base):
     # совместимость для single-tenant pilot.
     tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
 
+    # P1.4 (PO Audit 2026-05-17): in-app inbox state. Global (не per-user) пока
+    # pilot — multi-user сценарий вынесем в alert_user_state позже.
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    snoozed_until: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+
 
 class RoiActionsCache(Base):
     """Pre-computed ROI actions per (tenant, client_site).

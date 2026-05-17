@@ -1255,9 +1255,19 @@ def dash_roi_actions(
 def dash_alerts(
     limit: int = 100,
     severity: str | None = None,
+    include_read: bool = False,
+    include_snoozed: bool = False,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
+    """In-app inbox (P1.4 PO Audit 2026-05-17).
+
+    Default фильтры — скрыть прочитанные + те, что отложены до будущего
+    времени (snoozed_until > NOW). Это даёт «inbox-style» feed: только то,
+    что требует внимания.
+    """
+    from src._time import utcnow as _now
+
     stmt = (
         select(storage.AlertEvent)
         .where(storage.AlertEvent.tenant_id == user.tenant_id)
@@ -1266,6 +1276,14 @@ def dash_alerts(
     )
     if severity:
         stmt = stmt.where(storage.AlertEvent.severity == severity)
+    if not include_read:
+        stmt = stmt.where(storage.AlertEvent.is_read.is_(False))
+    if not include_snoozed:
+        now = _now()
+        stmt = stmt.where(
+            (storage.AlertEvent.snoozed_until.is_(None))
+            | (storage.AlertEvent.snoozed_until <= now)
+        )
     events = db.scalars(stmt).all()
     return [
         {
@@ -1276,9 +1294,130 @@ def dash_alerts(
             "detail": e.detail,
             "payload": e.payload,
             "created_at": e.created_at.isoformat(),
+            "is_read": bool(getattr(e, "is_read", False)),
+            "read_at": e.read_at.isoformat() if getattr(e, "read_at", None) else None,
+            "snoozed_until": (
+                e.snoozed_until.isoformat()
+                if getattr(e, "snoozed_until", None)
+                else None
+            ),
         }
         for e in events
     ]
+
+
+@app.get("/api/v1/dash/alerts/counts")
+def dash_alerts_counts(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Counts: unread / snoozed / read — для nav-badge."""
+    from src._time import utcnow as _now
+
+    now = _now()
+    base = select(func.count()).select_from(storage.AlertEvent).where(
+        storage.AlertEvent.tenant_id == user.tenant_id
+    )
+    unread = db.scalar(
+        base.where(
+            storage.AlertEvent.is_read.is_(False),
+            (storage.AlertEvent.snoozed_until.is_(None))
+            | (storage.AlertEvent.snoozed_until <= now),
+        )
+    ) or 0
+    snoozed = db.scalar(
+        base.where(
+            storage.AlertEvent.is_read.is_(False),
+            storage.AlertEvent.snoozed_until.is_not(None),
+            storage.AlertEvent.snoozed_until > now,
+        )
+    ) or 0
+    read = db.scalar(base.where(storage.AlertEvent.is_read.is_(True))) or 0
+    total = db.scalar(base) or 0
+    return {
+        "unread": int(unread),
+        "snoozed": int(snoozed),
+        "read": int(read),
+        "total": int(total),
+    }
+
+
+class _AlertPatchPayload(BaseModel):
+    """PATCH single alert: пометить read или snooze до даты."""
+    is_read: bool | None = None
+    snooze_hours: int | None = None  # alias: snooze на N часов от now
+
+
+@app.patch("/api/v1/dash/alerts/{alert_id}")
+def dash_alert_patch(
+    alert_id: int,
+    payload: _AlertPatchPayload,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    from datetime import timedelta as _td
+    from src._time import utcnow as _now
+
+    alert = db.scalar(
+        select(storage.AlertEvent).where(
+            storage.AlertEvent.id == alert_id,
+            storage.AlertEvent.tenant_id == user.tenant_id,
+        )
+    )
+    if not alert:
+        raise HTTPException(404, "Alert not found")
+    if payload.is_read is not None:
+        alert.is_read = payload.is_read
+        alert.read_at = _now() if payload.is_read else None
+    if payload.snooze_hours is not None:
+        if payload.snooze_hours == 0:
+            alert.snoozed_until = None
+        else:
+            alert.snoozed_until = _now() + _td(hours=payload.snooze_hours)
+    db.commit()
+    return {"ok": True, "id": alert.id}
+
+
+class _AlertBulkPayload(BaseModel):
+    """Bulk action на список ID. action ∈ {mark_read, mark_unread, snooze_24h, snooze_7d, snooze_clear}."""
+    ids: list[int]
+    action: str
+
+
+@app.post("/api/v1/dash/alerts/bulk")
+def dash_alerts_bulk(
+    payload: _AlertBulkPayload,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    from datetime import timedelta as _td
+    from sqlalchemy import update as _update
+    from src._time import utcnow as _now
+
+    if not payload.ids:
+        return {"affected": 0}
+
+    base_filter = (
+        (storage.AlertEvent.id.in_(payload.ids))
+        & (storage.AlertEvent.tenant_id == user.tenant_id)
+    )
+    now = _now()
+    if payload.action == "mark_read":
+        values = {"is_read": True, "read_at": now}
+    elif payload.action == "mark_unread":
+        values = {"is_read": False, "read_at": None}
+    elif payload.action == "snooze_24h":
+        values = {"snoozed_until": now + _td(hours=24)}
+    elif payload.action == "snooze_7d":
+        values = {"snoozed_until": now + _td(days=7)}
+    elif payload.action == "snooze_clear":
+        values = {"snoozed_until": None}
+    else:
+        raise HTTPException(400, f"Unknown action: {payload.action}")
+
+    result = db.execute(_update(storage.AlertEvent).where(base_filter).values(**values))
+    db.commit()
+    return {"affected": result.rowcount, "action": payload.action}
 
 
 @app.get("/api/v1/dash/match-quality")
