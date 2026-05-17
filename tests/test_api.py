@@ -741,3 +741,177 @@ def test_dash_match_create_validates_min_two_products(client, auth_cookie):
     )
     # Pydantic validation fails → 422
     assert r.status_code == 422
+
+
+# ─── Recipients management (admin only) ──────────────────────────────────────
+
+
+def test_dash_recipients_list_requires_admin(
+    client, auth_cookie, tenant_user, setup_db
+):
+    r = client.get(
+        "/api/v1/dash/recipients",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # current user is admin and is in tenant_users
+    assert any(u["email"] == tenant_user.email for u in body)
+
+
+def test_dash_recipients_list_forbidden_for_viewer(
+    client, auth_cookie, tenant_user, setup_db
+):
+    # Demote current user
+    tenant_user.role = "viewer"
+    setup_db.commit()
+    r = client.get(
+        "/api/v1/dash/recipients",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 403
+
+
+def test_dash_recipients_create_new(client, auth_cookie, tenant_user, setup_db):
+    r = client.post(
+        "/api/v1/dash/recipients",
+        json={
+            "email": "client@example.com",
+            "name": "Client One",
+            "role": "viewer",
+            "daily_digest": True,
+            "weekly_digest": False,
+            "email_severity_min": "warning",
+        },
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["email"] == "client@example.com"
+    assert body["name"] == "Client One"
+    assert body["role"] == "viewer"
+    assert body["daily_digest"] is True
+    assert body["weekly_digest"] is False
+    assert body["is_active"] is True
+    assert body["id"] != tenant_user.id
+
+
+def test_dash_recipients_create_duplicate_email_409(
+    client, auth_cookie, tenant_user, setup_db
+):
+    r = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": tenant_user.email},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 409
+
+
+def test_dash_recipients_create_normalizes_email_lowercase(
+    client, auth_cookie, tenant_user, setup_db
+):
+    r = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "  Mixed@CASE.com  ", "daily_digest": True},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    assert r.json()["email"] == "mixed@case.com"
+
+
+def test_dash_recipients_create_rejects_invalid_email(
+    client, auth_cookie, tenant_user, setup_db
+):
+    r = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "not-an-email"},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 422
+
+
+def test_dash_recipients_create_rejects_bad_role(
+    client, auth_cookie, tenant_user, setup_db
+):
+    r = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "x@y.com", "role": "superuser"},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 422
+
+
+def test_dash_recipients_update(client, auth_cookie, tenant_user, setup_db):
+    # Create
+    cr = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "edit@test.com", "name": "Old"},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    rid = cr.json()["id"]
+
+    # Update name + toggle digest
+    ur = client.patch(
+        f"/api/v1/dash/recipients/{rid}",
+        json={"name": "New Name", "daily_digest": False, "weekly_digest": True},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert ur.status_code == 200, ur.text
+    body = ur.json()
+    assert body["name"] == "New Name"
+    assert body["daily_digest"] is False
+    assert body["weekly_digest"] is True
+    # Unchanged fields stay
+    assert body["email"] == "edit@test.com"
+
+
+def test_dash_recipients_update_404(client, auth_cookie, tenant_user, setup_db):
+    r = client.patch(
+        "/api/v1/dash/recipients/9999",
+        json={"name": "x"},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 404
+
+
+def test_dash_recipients_delete_soft(client, auth_cookie, tenant_user, setup_db):
+    cr = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "todelete@test.com", "daily_digest": True},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    rid = cr.json()["id"]
+
+    dr = client.delete(
+        f"/api/v1/dash/recipients/{rid}",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert dr.status_code == 204
+
+    # Soft delete: row still exists but is_active=false, digest flags off
+    from sqlalchemy import select as _select
+    setup_db.expire_all()
+    u = setup_db.scalar(
+        _select(storage.TenantUser).where(storage.TenantUser.id == rid)
+    )
+    assert u is not None
+    assert u.is_active is False
+    assert u.daily_digest is False
+    assert u.weekly_digest is False
+
+
+def test_dash_recipients_cannot_delete_self(
+    client, auth_cookie, tenant_user, setup_db
+):
+    r = client.delete(
+        f"/api/v1/dash/recipients/{tenant_user.id}",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 400
+
+
+def test_dash_recipients_requires_auth(client):
+    r = client.get("/api/v1/dash/recipients")
+    assert r.status_code == 401
+    r = client.post("/api/v1/dash/recipients", json={"email": "x@y.com"})
+    assert r.status_code == 401

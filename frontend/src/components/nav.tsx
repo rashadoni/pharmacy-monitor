@@ -11,6 +11,7 @@ import {
   Link2,
   ListTree,
   LogOut,
+  Mail,
   Pill,
   Search,
   Settings,
@@ -31,6 +32,7 @@ const NAV_ITEMS = [
   { href: "/alerts", key: "alerts", icon: Bell },
   { href: "/watchlist", key: "watchlist", icon: Star },
   { href: "/categories", key: "categories", icon: ListTree },
+  { href: "/recipients", key: "recipients", icon: Mail },
   { href: "/settings", key: "settings", icon: Settings },
 ] as const;
 

@@ -187,6 +187,38 @@ export interface MatchUpdated {
   products: { product_id: number; site: string; name: string; url: string }[];
 }
 
+export interface Recipient {
+  id: number;
+  email: string;
+  name: string | null;
+  role: "admin" | "viewer";
+  is_active: boolean;
+  daily_digest: boolean;
+  weekly_digest: boolean;
+  email_severity_min: "off" | "info" | "warning" | "critical" | null;
+  telegram_chat_id: string | null;
+  last_login_at: string | null;
+  created_at: string | null;
+}
+
+export interface RecipientCreate {
+  email: string;
+  name?: string | null;
+  role?: "admin" | "viewer";
+  daily_digest?: boolean;
+  weekly_digest?: boolean;
+  email_severity_min?: "off" | "info" | "warning" | "critical" | null;
+}
+
+export interface RecipientUpdate {
+  name?: string | null;
+  role?: "admin" | "viewer";
+  is_active?: boolean;
+  daily_digest?: boolean;
+  weekly_digest?: boolean;
+  email_severity_min?: "off" | "info" | "warning" | "critical" | null;
+}
+
 export interface RunRow {
   id: number;
   started_at: string | null;
@@ -287,6 +319,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ product_ids }),
     }),
+  recipients: () => request<Recipient[]>("/api/v1/dash/recipients"),
+  recipientCreate: (payload: RecipientCreate) =>
+    request<Recipient>("/api/v1/dash/recipients", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  recipientUpdate: (id: number, payload: RecipientUpdate) =>
+    request<Recipient>(`/api/v1/dash/recipients/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  recipientDelete: (id: number) =>
+    request<void>(`/api/v1/dash/recipients/${id}`, { method: "DELETE" }),
   brandShare: (params: { top_n?: number; site?: string } = {}) => {
     const q = new URLSearchParams();
     q.set("top_n", String(params.top_n ?? 30));
