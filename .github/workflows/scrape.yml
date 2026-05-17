@@ -82,6 +82,11 @@ jobs:
         env:
           DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
           SITES_INPUT: ${{ github.event.inputs.sites || 'pharmonline,aptekonline' }}
+          # ScraperAPI proxy — GitHub Actions IP заблокирован Cloudflare для pharm/aptek,
+          # роутимся через ScraperAPI residential pool (см. src/scrapers/base.py).
+          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
+          SCRAPER_API_SITES: pharmonline,aptekonline
+          SCRAPER_API_COUNTRY: az  # Baku exit nodes если доступны
         run: |
           # Преобразуем "pharmonline,aptekonline" в "--site pharmonline --site aptekonline"
           SITE_ARGS=""
