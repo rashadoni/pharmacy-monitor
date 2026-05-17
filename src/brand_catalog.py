@@ -207,6 +207,12 @@ _BLOCKLIST_ALLCAPS = {
     "OPT", "OPTI", "PLUS", "MAX", "MIN", "PREMIUM", "EXPERT", "COMFORT",
     "ULTRA", "CLASSIC", "ORIGINAL", "SUPER", "MEGA", "EXTRA", "TOTAL",
     "BL", "PEP", "VOM", "HD", "UV", "ML", "MG", "AZN", "USD",
+    # P0.2 (PO Audit 2026-05-17): SPF/SPF15/SPF30/SPF50/SPF50+ путались как
+    # бренды для солнцезащитной косметики. Дополнительно числовые комбинации
+    # типа N20, N30 (количество в упаковке) — это pack-size, не brand.
+    "SPF", "SPF15", "SPF30", "SPF50", "SPF50+", "SPF100",
+    "N5", "N10", "N20", "N30", "N50", "N60", "N100",
+    "OTC", "RX", "IU", "BV",
 }
 
 # First-word fallback (для pharma названий типа `Çetirizin №10`, `Fomaksi 30`)
@@ -233,6 +239,39 @@ _BLOCKLIST_FIRST_WORD = {
     "tibbi", "vasitə", "vasitesi", "vasiteler",
     # Bottle / packaging
     "bottle", "şüşe", "buterılka",
+    # ─── P0.2 (PO Audit 2026-05-17): generic слова попавшие как «бренды»
+    # на /analytics top-15 и /site/X top brands. Аудит показал что эти слова
+    # — типы товаров / категории, не названия производителей.
+    # Gigiyenik (Гигиенические средства), Optik (оптика), Diapers (англ.
+    # подгузники), Antiperspirant, Günəşdən («от солнца» — SPF crema),
+    # Linkas (вид сиропа), Daha («Daha çox» = Show more — UI artifact в данных),
+    # Cece (обрезок какого-то слова), Maddələr (вещества), Maddələrin (родит.).
+    "gigiyenik", "gigiyenika", "gigiyena",
+    "optik", "optika", "optiki",
+    "diapers", "diaper",
+    "antiperspirant", "antiperspiranti",
+    "günəşdən", "gunesden", "gunesdän", "günəs", "gunes",
+    "linkas",  # народное обозначение сиропа, не бренд (Himalaya — настоящий)
+    "daha", "çox", "cox",  # фрагменты «Daha çox» — UI «Show more»
+    "cece",
+    "maddələr", "maddələrin", "maddeler", "maddelerin",
+    # SPF cosmetics (title-cased в БД после extract_brand .title())
+    "spf", "spf15", "spf30", "spf50", "spf100", "spf50+",
+    "şampun", "şampunu", "şampunlar", "sampun",  # шампунь — не бренд
+    "balzam", "balzamı",
+    "duş", "dush",
+    "krem", "kremi", "kremə",
+    "yağ", "yağı", "yagi", "yag",
+    "salfet", "salfeti", "salfetlər",
+    # NB: "pampers" НЕ в blocklist — это валидный brand (Procter&Gamble),
+    # отлавливается через BRANDS catalog. Раньше ошибочно был здесь.
+    # Возрастные группы baby food (часто попадают в начало имени)
+    "yaşdan", "yashdan", "yaşadan",
+    "ayından", "ayindan", "aylığ", "ayligh",
+    # Описание лекарственных форм / форм выпуска
+    "məhlulu", "mehlulu", "məhlullar",
+    "tibbi-vasitə", "tibbi-vasitələr",
+    "tampon", "tamponi", "tamponlar",
 }
 
 
@@ -273,6 +312,20 @@ def _compiled_patterns() -> list[tuple[str, re.Pattern[str]]]:
         )
         patterns.append((canonical, pat))
     return patterns
+
+
+def is_brand_blacklisted(brand: str | None) -> bool:
+    """True если строка — generic слово которое не должно быть в `brand` поле.
+
+    Используется (а) внутри extract_brand fallback (через _BLOCKLIST_FIRST_WORD),
+    (б) для backfill чистки существующих записей в БД (см.
+    scripts/cleanup_bad_brands.py), (в) для пост-валидации скрейпер output.
+
+    Регистро-нечувствительная проверка против объединённого blocklist.
+    """
+    if not brand:
+        return False
+    return brand.strip().lower() in _BLOCKLIST_FIRST_WORD
 
 
 def extract_brand(name: str | None) -> str | None:

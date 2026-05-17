@@ -93,10 +93,16 @@ def brand_share(
                 .group_by(Product.brand, Product.site)
             ).all()
 
+    # P0.2 (PO Audit 2026-05-17): runtime фильтр generic-слов попавших в
+    # brand-поле. Backfill cleanup-скрипт чистит БД, но если новые скрейпы
+    # ещё не успели пройти через обновлённый extract_brand — пропустим
+    # blacklisted сюда. Двойная защита.
+    from src.brand_catalog import is_brand_blacklisted
+
     # Aggregate
     by_brand: dict[str, dict[str, int]] = defaultdict(lambda: {s: 0 for s in ALL_SITES})
     for brand, site_name, n in rows:
-        if not brand:
+        if not brand or is_brand_blacklisted(brand):
             continue
         by_brand[brand][site_name] = n
 
