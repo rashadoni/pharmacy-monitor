@@ -76,6 +76,9 @@ export interface AlertEvent {
   detail: string | null;
   payload: Record<string, unknown> | null;
   created_at: string;
+  is_read?: boolean;
+  read_at?: string | null;
+  snoozed_until?: string | null;
 }
 
 export interface MatchQuality {
@@ -172,12 +175,48 @@ export const api = {
     if (params.limit) q.set("limit", String(params.limit));
     return request<ComparisonRow[]>(`/api/v1/dash/comparison?${q}`);
   },
-  roiActions: () => request<RoiAction[]>("/api/v1/dash/roi/actions"),
-  alerts: (severity?: string, limit = 100) => {
-    const q = new URLSearchParams({ limit: String(limit) });
-    if (severity) q.set("severity", severity);
+  roiActions: (client_site?: string) => {
+    const q = new URLSearchParams();
+    if (client_site) q.set("client_site", client_site);
+    const qs = q.toString();
+    // ROI compute может быть тяжёлым (matcher join), ставим явно 15с timeout
+    return request<RoiAction[]>(
+      `/api/v1/dash/roi/actions${qs ? `?${qs}` : ""}`,
+      { timeoutMs: 15_000 },
+    );
+  },
+  alerts: (params: {
+    severity?: string;
+    limit?: number;
+    include_read?: boolean;
+    include_snoozed?: boolean;
+  } = {}) => {
+    const q = new URLSearchParams({ limit: String(params.limit ?? 100) });
+    if (params.severity) q.set("severity", params.severity);
+    if (params.include_read) q.set("include_read", "true");
+    if (params.include_snoozed) q.set("include_snoozed", "true");
     return request<AlertEvent[]>(`/api/v1/dash/alerts?${q}`);
   },
+  alertsCounts: () =>
+    request<{ unread: number; snoozed: number; read: number; total: number }>(
+      "/api/v1/dash/alerts/counts",
+    ),
+  alertPatch: (id: number, payload: { is_read?: boolean; snooze_hours?: number }) =>
+    request<{ ok: true; id: number }>(`/api/v1/dash/alerts/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  alertsBulk: (ids: number[], action:
+    | "mark_read"
+    | "mark_unread"
+    | "snooze_24h"
+    | "snooze_7d"
+    | "snooze_clear",
+  ) =>
+    request<{ affected: number; action: string }>("/api/v1/dash/alerts/bulk", {
+      method: "POST",
+      body: JSON.stringify({ ids, action }),
+    }),
   matchQuality: () => request<MatchQuality>("/api/v1/dash/match-quality"),
   brandShare: (top_n = 30) => request<BrandShareRow[]>(`/api/v1/dash/brand-share?top_n=${top_n}`),
   runs: (limit = 30) => request<RunRow[]>(`/api/v1/dash/runs?limit=${limit}`),
