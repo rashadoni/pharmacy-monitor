@@ -201,8 +201,17 @@ function BrandsPanel({
       {!loading && brands.length === 0 && (
         <div className="p-4 text-sm text-muted-foreground">Нет данных</div>
       )}
+      {/*
+        P0.4 (PO Audit 2026-05-17): backend brand_share сортирует по `total`
+        (сумма SKU по всем сайтам). Для site-страницы хотим видеть топ брендов
+        ЭТОГО сайта — сортируем по counts[site] desc.
+        Например на /site/aloe Solgar (74 aloe / 0 elsewhere) важнее чем
+        La Roche-Posay (1 aloe / много прочих).
+      */}
       <ul className="divide-y divide-border max-h-96 overflow-y-auto">
-        {brands.map((b) => (
+        {[...brands]
+          .sort((a, b) => (b.counts[site] ?? 0) - (a.counts[site] ?? 0))
+          .map((b) => (
           <li
             key={b.brand}
             className="flex items-center justify-between px-4 py-2 text-sm"
