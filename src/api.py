@@ -1420,6 +1420,89 @@ def dash_alerts_bulk(
     return {"affected": result.rowcount, "action": payload.action}
 
 
+@app.get("/api/v1/dash/data-quality")
+def dash_data_quality(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Метрики качества данных для /overview strip (PO Audit dev cont. 2026-05-18).
+
+    PO Audit упомянул несколько метрик которых не хватает на главной:
+    - Brand-extraction confidence (% продуктов с unambiguous brand)
+    - Categories mapped to all 3 sites (Cross-3 count) — корреляция с coverage
+    - Manual matches per week (use signal для /matcher)
+    - Time since last successful scrape per site (MTTR signal)
+
+    Один endpoint = одна data quality strip. Все 4 — лёгкие SQL.
+    """
+    from datetime import timedelta as _td
+    from src._time import utcnow as _now
+    from src.brand_catalog import is_brand_blacklisted
+
+    # 1. Brand extraction rate
+    total_products = db.scalar(
+        select(func.count()).select_from(storage.Product).where(
+            storage.Product.tenant_id == user.tenant_id
+        )
+    ) or 0
+    with_brand_rows = db.execute(
+        select(storage.Product.brand, func.count(storage.Product.id))
+        .where(
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.brand.is_not(None),
+        )
+        .group_by(storage.Product.brand)
+    ).all()
+    good_brand_count = sum(
+        n for brand, n in with_brand_rows if not is_brand_blacklisted(brand)
+    )
+    brand_rate = (good_brand_count / total_products * 100) if total_products else 0.0
+
+    # 2. Cross-2 / Cross-3 categories
+    cats = db.scalars(select(storage.Category)).all()
+    cross_3 = sum(
+        1 for c in cats if c.pharmonline_slug and c.aptekonline_slug and c.aloe_slug
+    )
+    cross_2 = sum(
+        1 for c in cats
+        if sum(1 for s in (c.pharmonline_slug, c.aptekonline_slug, c.aloe_slug) if s) >= 2
+    )
+
+    # 3. Manual matches last 7 days
+    cutoff_7d = _now() - _td(days=7)
+    manual_7d = db.scalar(
+        select(func.count())
+        .select_from(storage.Match)
+        .where(
+            storage.Match.tenant_id == user.tenant_id,
+            storage.Match.is_manual.is_(True),
+            storage.Match.created_at >= cutoff_7d,
+        )
+    ) or 0
+
+    # 4. Time since last successful scrape per site (MAX(Product.last_seen_at))
+    last_seen: dict[str, str | None] = {}
+    for site in _VALID_SITES:
+        ts = db.scalar(
+            select(func.max(storage.Product.last_seen_at)).where(
+                storage.Product.tenant_id == user.tenant_id,
+                storage.Product.site == site,
+            )
+        )
+        last_seen[site] = ts.isoformat() if ts else None
+
+    return {
+        "brand_extraction_rate_pct": round(brand_rate, 1),
+        "products_with_good_brand": good_brand_count,
+        "products_total": total_products,
+        "cross_3_count": cross_3,
+        "cross_2_count": cross_2,
+        "total_categories": len(cats),
+        "manual_matches_last_7d": int(manual_7d),
+        "last_scrape_per_site": last_seen,
+    }
+
+
 @app.get("/api/v1/dash/match-quality")
 def dash_match_quality(
     user: storage.TenantUser = Depends(require_user),

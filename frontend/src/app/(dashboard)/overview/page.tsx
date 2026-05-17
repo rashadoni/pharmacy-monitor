@@ -15,6 +15,7 @@ export default function OverviewPage() {
   const actionsQ = useQuery({ queryKey: ["roi-actions"], queryFn: () => api.roiActions() });
   const normalizeQ = useQuery({ queryKey: ["normalize-stats"], queryFn: api.normalizeStats });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
+  const dqQ = useQuery({ queryKey: ["data-quality"], queryFn: api.dataQuality });
   const [expandedRun, setExpandedRun] = useState<number | null>(null);
 
   return (
@@ -112,6 +113,38 @@ export default function OverviewPage() {
               ))}
           </div>
         )}
+
+      {/*
+        P2 (PO Audit 2026-05-17): «Метрики, которые хотелось бы видеть, но их
+        нет». Brand quality, Cross-3 категорий (где есть все 3 сайта), скорость
+        ручного матчинга (за последние 7 дней), и MTTR-индикатор «свежесть
+        scrape» — oldest из трёх сайтов. Не раздуваем главный KPI-grid, держим
+        отдельной более компактной полосой ниже стратегий.
+      */}
+      {dqQ.data && (
+        <div className="grid gap-2 grid-cols-2 md:grid-cols-4">
+          <StatTile
+            label="Brand quality"
+            value={`${dqQ.data.brand_extraction_rate_pct}%`}
+            hint={`${dqQ.data.products_with_good_brand.toLocaleString("ru-RU")} из ${dqQ.data.products_total.toLocaleString("ru-RU")} с осмысленным брендом`}
+          />
+          <StatTile
+            label="Cross-3 категорий"
+            value={`${dqQ.data.cross_3_count}/${dqQ.data.total_categories}`}
+            hint={`Категорий со всеми 3 сайтами (Cross-2: ${dqQ.data.cross_2_count})`}
+          />
+          <StatTile
+            label="Manual matches (7д)"
+            value={dqQ.data.manual_matches_last_7d}
+            hint="Сколько кластеров создано/привязано вручную за неделю"
+          />
+          <StatTile
+            label="Свежесть scrape"
+            value={formatScrapeFreshness(dqQ.data.last_scrape_per_site)}
+            hint={scrapeFreshnessHint(dqQ.data.last_scrape_per_site)}
+          />
+        </div>
+      )}
 
       {/* Today's actions */}
       <div>
@@ -397,4 +430,66 @@ function strategyLabel(s: string): string {
     default:
       return s;
   }
+}
+
+/**
+ * Маленькая стат-плитка, легче по визуальному весу чем KpiCard. Используется
+ * под основным KPI-grid'ом для дополнительных data-quality метрик чтобы не
+ * раздувать главную сетку с 4 до 8 карточек.
+ */
+function StatTile({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: string | number;
+  hint?: string;
+}) {
+  return (
+    <div
+      className="rounded-md border border-border bg-card px-3 py-2"
+      title={hint}
+    >
+      <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
+        {label}
+      </div>
+      <div className="text-lg font-semibold tabular-nums leading-tight mt-0.5">
+        {value}
+      </div>
+      {hint && (
+        <div className="text-[11px] text-muted-foreground/80 mt-0.5 line-clamp-1">
+          {hint}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Возвращает relative-форматированный «худший» (oldest) timestamp из
+ * last_scrape_per_site. Если есть None — это сайт без данных, считаем
+ * «застой» и возвращаем «нет данных».
+ */
+function formatScrapeFreshness(
+  perSite: Record<string, string | null>,
+): string {
+  const values = Object.values(perSite);
+  if (values.length === 0) return "—";
+  if (values.some((v) => v === null)) return "нет данных";
+  const oldestIso = values
+    .filter((v): v is string => Boolean(v))
+    .reduce((acc, iso) =>
+      new Date(iso).getTime() < new Date(acc).getTime() ? iso : acc,
+    );
+  return formatRelative(oldestIso);
+}
+
+function scrapeFreshnessHint(
+  perSite: Record<string, string | null>,
+): string {
+  const parts = Object.entries(perSite).map(([site, iso]) => {
+    return `${site}: ${iso ? formatRelative(iso) : "нет"}`;
+  });
+  return parts.join(" · ");
 }

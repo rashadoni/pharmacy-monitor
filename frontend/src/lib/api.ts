@@ -151,6 +151,17 @@ export interface AlertEvent {
   snoozed_until?: string | null;
 }
 
+export interface DataQuality {
+  brand_extraction_rate_pct: number;
+  products_with_good_brand: number;
+  products_total: number;
+  cross_3_count: number;
+  cross_2_count: number;
+  total_categories: number;
+  manual_matches_last_7d: number;
+  last_scrape_per_site: Record<string, string | null>;
+}
+
 export interface MatchQuality {
   total_matches: number;
   auto_matches: number;
@@ -426,6 +437,7 @@ export const api = {
       body: JSON.stringify({ ids, action }),
     }),
   matchQuality: () => request<MatchQuality>("/api/v1/dash/match-quality"),
+  dataQuality: () => request<DataQuality>("/api/v1/dash/data-quality"),
   normalizeStats: () => request<NormalizeStats>("/api/v1/dash/normalize/stats"),
   unmatchedPairs: (params: {
     site: string;

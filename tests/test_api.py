@@ -1071,3 +1071,105 @@ def test_dash_recipients_requires_auth(client):
     assert r.status_code == 401
     r = client.post("/api/v1/dash/recipients", json={"email": "x@y.com"})
     assert r.status_code == 401
+
+
+# ─── /dash/data-quality ──────────────────────────────────────────────────────
+
+
+def test_dash_data_quality_requires_auth(client):
+    r = client.get("/api/v1/dash/data-quality")
+    assert r.status_code == 401
+
+
+def test_dash_data_quality_returns_metrics(client, auth_cookie, tenant_user, setup_db):
+    """Seed:
+    - 3 продукта (2 с реальным брендом, 1 с blacklisted "Витамин")
+    - 2 категории: одна с тремя сайтами (cross-3), одна — только pharm+aloe (cross-2)
+    - 1 manual match за last_7d, 1 manual match старше cutoff
+    Проверяем shape ответа и cross-3/cross-2 счётчики.
+    """
+    s = setup_db
+    t = tenant_user.tenant_id
+
+    # Категории глобальные (нет tenant_id) — одна Cross-3, одна Cross-2.
+    c_full = storage.Category(
+        key="vitamins",
+        label_ru="Vitamins",
+        pharmonline_slug="vitaminler",
+        aptekonline_slug="vitamin",
+        aloe_slug="vitamin",
+    )
+    c_partial = storage.Category(
+        key="cosmetics",
+        label_ru="Cosmetics",
+        pharmonline_slug="kosmetika",
+        aptekonline_slug=None,
+        aloe_slug="kosmetika",
+    )
+    s.add_all([c_full, c_partial])
+
+    # Продукты с last_seen_at — для last_scrape_per_site
+    now = utcnow()
+    p1 = storage.Product(
+        tenant_id=t, site="aloe", external_id="al-x1", url="https://aloe.az/p/x1",
+        name="Bayer Aspirin", name_normalized="bayer aspirin",
+        brand="Bayer", category="dermanlar", last_seen_at=now,
+    )
+    p2 = storage.Product(
+        tenant_id=t, site="pharmonline", external_id="ph-x2", url="https://pharm/p/x2",
+        name="Solgar D3", name_normalized="solgar d3",
+        brand="Solgar", category="vitaminler", last_seen_at=now - timedelta(hours=2),
+    )
+    p3 = storage.Product(
+        tenant_id=t, site="aptekonline", external_id="ap-x3", url="https://aptek/p/x3",
+        name="Vitamin C 1000mg", name_normalized="vitamin c",
+        brand="Vitamin", category="vitamin", last_seen_at=now - timedelta(hours=12),
+    )
+    s.add_all([p1, p2, p3])
+    s.flush()
+
+    # Manual matches: один в окне last_7d, один — старше
+    m_recent = storage.Match(
+        tenant_id=t,
+        canonical_name="Bayer Aspirin",
+        match_strategy="manual",
+        confidence=1.0,
+        is_manual=True,
+        created_at=now - timedelta(days=2),
+    )
+    m_old = storage.Match(
+        tenant_id=t,
+        canonical_name="Solgar D3",
+        match_strategy="manual",
+        confidence=1.0,
+        is_manual=True,
+        created_at=now - timedelta(days=30),
+    )
+    s.add_all([m_recent, m_old])
+    s.commit()
+
+    r = client.get(
+        "/api/v1/dash/data-quality",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    # Cross-3/Cross-2: vitamins (3 сайта) + cosmetics (2 сайта) → cross_2=2, cross_3=1
+    assert body["cross_3_count"] == 1
+    assert body["cross_2_count"] == 2
+    assert body["total_categories"] == 2
+
+    # Brand quality: 2 «хороших» бренда (Bayer, Solgar) из 3 продуктов
+    assert body["products_total"] == 3
+    assert body["products_with_good_brand"] == 2
+    assert body["brand_extraction_rate_pct"] == pytest.approx(66.7, abs=0.1)
+
+    # Manual matches last_7d: только m_recent
+    assert body["manual_matches_last_7d"] == 1
+
+    # last_scrape_per_site: все три сайта присутствуют, ISO-формат
+    assert set(body["last_scrape_per_site"].keys()) >= {"aloe", "pharmonline", "aptekonline"}
+    assert body["last_scrape_per_site"]["aloe"] is not None
+    assert body["last_scrape_per_site"]["pharmonline"] is not None
+    assert body["last_scrape_per_site"]["aptekonline"] is not None
