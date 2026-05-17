@@ -15,6 +15,7 @@ import {
 import { api, friendlyError, type AlertEvent } from "@/lib/api";
 import { formatRelative } from "@/lib/utils";
 import { CardListSkeleton } from "@/components/skeleton";
+import { OnboardingTip } from "@/components/onboarding-tip";
 
 const SEVERITY_CONFIG = {
   critical: {
@@ -158,6 +159,18 @@ export default function AlertsPage() {
 
   return (
     <div className="space-y-4">
+      <OnboardingTip
+        id="alerts-inbox-v1"
+        title="Inbox-стиль: tab'ы и bulk-actions"
+        description={
+          <>
+            «Inbox» — то что требует внимания. «Прочитано» / «Отложено» —
+            в отдельных tab'ах. Чекбоксы рядом с каждым алертом → выбери
+            несколько и используй sticky toolbar сверху для bulk
+            mark-read / snooze. Per-row тоже есть «✓ Прочитано» / «🕐 7д».
+          </>
+        }
+      />
       <div className="flex items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Алерты</h1>
