@@ -338,6 +338,16 @@ export interface CategoryRow {
   is_active: boolean;
 }
 
+export interface CategorySuggestion {
+  site_a_slug: string;
+  site_b_slug: string;
+  shared_brands_count: number;
+  sample_brands: string[];
+  site_a_products: number;
+  site_b_products: number;
+  already_mapped: boolean;
+}
+
 export interface NotifPrefs {
   telegram_chat_id: string | null;
   email_severity_min: string | null;
@@ -474,6 +484,30 @@ export const api = {
     }),
   categoryDelete: (id: number) =>
     request<void>(`/api/v1/dash/categories/${id}`, { method: "DELETE" }),
+  categorySuggestions: (params: {
+    site_a: string;
+    site_b: string;
+    min_overlap?: number;
+    limit?: number;
+  }) => {
+    const q = new URLSearchParams({ site_a: params.site_a, site_b: params.site_b });
+    if (params.min_overlap != null) q.set("min_overlap", String(params.min_overlap));
+    if (params.limit != null) q.set("limit", String(params.limit));
+    return request<CategorySuggestion[]>(
+      `/api/v1/dash/categories/suggestions?${q}`,
+    );
+  },
+  categoryMappingCreate: (payload: {
+    site_a: string;
+    site_a_slug: string;
+    site_b: string;
+    site_b_slug: string;
+    label_ru?: string | null;
+  }) =>
+    request<{ id: number; action: "created" | "extended"; key: string }>(
+      "/api/v1/dash/categories/mapping",
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
   rejectMatch: (id: number) =>
     request<void>(`/api/v1/dash/matches/${id}/reject`, { method: "POST" }),
 
