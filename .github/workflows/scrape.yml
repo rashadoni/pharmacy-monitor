@@ -81,16 +81,14 @@ jobs:
       - name: Run scraper
         env:
           DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
-          SITES_INPUT: ${{ github.event.inputs.sites || 'pharmonline,aptekonline' }}
-          # Crawlbase Smart Proxy — приоритетный провайдер. Free tier 1000 req
-          # для пилота, потом $29/мес 250k req. JS Token для Playwright (pharm),
-          # Normal Token для httpx (aptek JSON API).
+          SITES_INPUT: ${{ github.event.inputs.sites || 'pharmonline' }}
+          # Crawlbase Crawling API — pre-fetch HTML с JS-рендером на их стороне
+          # вместо HTTP-proxy. Smart Proxy не пробил CF для pharmonline (run
+          # 25993261342: 0 products), Crawling API дал HTTP 200 + 2.9MB HTML
+          # (curl smoke 2026-05-17). Free tier 1000 req/мес → плана хватит
+          # на 2-3 тестовых прогона; $29/мес = 250k req.
           CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
-          CRAWLBASE_NORMAL_TOKEN: ${{ secrets.CRAWLBASE_NORMAL_TOKEN }}
-          CRAWLBASE_SITES: pharmonline,aptekonline
-          # ScraperAPI — фоллбэк если CRAWLBASE_*_TOKEN не задан.
-          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
-          SCRAPER_API_SITES: pharmonline,aptekonline
+          CRAWLBASE_API_SITES: pharmonline
         run: |
           # Преобразуем "pharmonline,aptekonline" в "--site pharmonline --site aptekonline"
           SITE_ARGS=""

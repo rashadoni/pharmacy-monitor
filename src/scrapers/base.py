@@ -267,37 +267,100 @@ class BaseScraper(ABC):
                 await asyncio.sleep(self.rate_limit_sec - since + jitter)
             self._last_request_at = asyncio.get_event_loop().time()
 
+    def _crawlbase_api_token_for_site(self) -> str | None:
+        """Если site в CRAWLBASE_SITES и CRAWLBASE_JS_TOKEN задан — вернуть токен.
+
+        Эта функция включает «pre-fetch HTML через Crawling API» режим: в goto()
+        вместо page.goto() мы тянем HTML через api.crawlbase.com и подаём его
+        через page.set_content. Используется когда:
+        - Direct connection не работает (CF блочит Hetzner/Azure IP)
+        - Smart Proxy mode не работает (CF блочит Crawlbase proxy IP)
+        - Crawling API имеет другую инфраструктуру и проходит CF
+        """
+        token = os.getenv("CRAWLBASE_JS_TOKEN")
+        if not token:
+            return None
+        sites_csv = os.getenv("CRAWLBASE_API_SITES") or os.getenv("CRAWLBASE_SITES", "")
+        sites = {s.strip() for s in sites_csv.split(",") if s.strip()}
+        return token if self.site_name in sites else None
+
     async def goto(self, page: Page, url: str, check_captcha: bool = True) -> None:
         """Navigate with rate-limit, exponential retry, and captcha detection.
+
+        Если активирован Crawlbase Crawling API mode (CRAWLBASE_JS_TOKEN +
+        CRAWLBASE_API_SITES contains self.site_name), вместо реального page.goto
+        мы тянем HTML через api.crawlbase.com (с JS-рендером на их стороне) и
+        подаём в page.set_content. Существующий код парсит DOM как обычно.
 
         Raises:
             CaptchaDetected: if a bot-wall is detected after navigation. Caller
                 may catch this to skip the page without killing the whole run.
         """
         await self._throttle()
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(self.max_retries),
-            wait=wait_exponential(multiplier=2, min=2, max=60),
-            retry=retry_if_exception_type((RuntimeError, TimeoutError)),
-            reraise=True,
-        ):
-            with attempt:
-                response = await page.goto(url, wait_until="domcontentloaded")
-                # Treat 429 as rate-limit signal — wait longer than exponential
-                if response and response.status == 429:
-                    log.warning("rate_limited", url=url, status=429)
-                    await asyncio.sleep(60 + random.uniform(0, 30))
-                    raise RuntimeError(f"HTTP 429 for {url}")
-                if response and response.status >= 500:
-                    raise RuntimeError(f"HTTP {response.status} for {url}")
-                if response and response.status == 403:
-                    log.warning("forbidden", url=url, status=403)
-                    raise RuntimeError(f"HTTP 403 for {url}")
+
+        cb_token = self._crawlbase_api_token_for_site()
+        if cb_token:
+            # Pre-fetch HTML through Crawling API
+            await self._goto_via_crawlbase_api(page, url, cb_token)
+        else:
+            # Native page.goto with retries
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(self.max_retries),
+                wait=wait_exponential(multiplier=2, min=2, max=60),
+                retry=retry_if_exception_type((RuntimeError, TimeoutError)),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await page.goto(url, wait_until="domcontentloaded")
+                    # Treat 429 as rate-limit signal — wait longer than exponential
+                    if response and response.status == 429:
+                        log.warning("rate_limited", url=url, status=429)
+                        await asyncio.sleep(60 + random.uniform(0, 30))
+                        raise RuntimeError(f"HTTP 429 for {url}")
+                    if response and response.status >= 500:
+                        raise RuntimeError(f"HTTP {response.status} for {url}")
+                    if response and response.status == 403:
+                        log.warning("forbidden", url=url, status=403)
+                        raise RuntimeError(f"HTTP 403 for {url}")
 
         if check_captcha:
             captcha = await detect_captcha(page)
             if captcha:
                 raise CaptchaDetected(f"{captcha} on {url}")
+
+    async def _goto_via_crawlbase_api(
+        self, page: Page, url: str, token: str
+    ) -> None:
+        """Fetch URL через api.crawlbase.com → подать HTML в page.set_content.
+
+        Crawlbase JS Token включает headless Chrome рендер у них на стороне,
+        отдаёт уже post-render HTML. Lazy-loaded cards гарантированно в DOM.
+        """
+        import httpx
+        from urllib.parse import quote
+
+        api_url = f"https://api.crawlbase.com/?token={token}&url={quote(url, safe='')}"
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(self.max_retries),
+            wait=wait_exponential(multiplier=2, min=2, max=60),
+            retry=retry_if_exception_type((RuntimeError, TimeoutError, httpx.HTTPError)),
+            reraise=True,
+        ):
+            with attempt:
+                # Crawlbase JS-rendering обычно занимает 3-10с на page
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.get(api_url)
+                if resp.status_code == 200:
+                    # Подаём HTML — Playwright парсит как обычно
+                    await page.set_content(resp.text, wait_until="domcontentloaded")
+                    return
+                if resp.status_code in (429, 503):
+                    raise RuntimeError(f"Crawlbase HTTP {resp.status_code} for {url}")
+                if resp.status_code == 520:
+                    # 520 — Crawlbase не смог обойти CF на target site
+                    log.warning("crawlbase_target_unreachable", url=url, status=520)
+                    raise RuntimeError(f"Crawlbase 520 (target CF challenge) for {url}")
+                raise RuntimeError(f"Crawlbase HTTP {resp.status_code} for {url}")
 
     async def new_page(self) -> Page:
         assert self._context is not None
