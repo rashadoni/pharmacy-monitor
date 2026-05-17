@@ -47,6 +47,19 @@ echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | run-scrape.sh start ====="
 
 cd "$PROJECT_DIR"
 
+# ── Keep Mac awake пока скрейп работает ────────────────────────────────────
+# launchd's StartCalendarInterval=18:00 не разбудит Mac если он в sleep, но
+# проблема большая в том, что Mac уходит в idle sleep ПОКА скрейп работает
+# (наш прогон 30-60 мин). caffeinate -imsu блокирует idle/disk/system sleep,
+# -w $$ привязывает к жизни этого процесса (auto-exit при завершении).
+if [[ -x /usr/bin/caffeinate ]]; then
+    /usr/bin/caffeinate -imsu -w $$ &
+    CAFFEINATE_PID=$!
+    echo "caffeinate pid=$CAFFEINATE_PID — Mac будет бодрствовать до конца скрейпа"
+else
+    echo "WARN: caffeinate not found, Mac может уйти в sleep"
+fi
+
 # ── Pull DB password — Keychain (secure) или env (для ad-hoc одиночного запуска) ─
 if [[ -n "${PG_PASS:-}" ]]; then
     echo "using PG_PASS from environment"
@@ -71,23 +84,55 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-ssh -i "$SSH_KEY" -N -L "$LOCAL_PG_PORT:localhost:5432" \
-    -o ExitOnForwardFailure=yes \
-    -o ServerAliveInterval=30 \
-    -o ConnectTimeout=15 \
-    "$PROD_USER@$PROD_HOST" &
-TUNNEL_PID=$!
-echo "tunnel pid=$TUNNEL_PID port=$LOCAL_PG_PORT"
+# Retry: до 3 попыток с экспоненциальной задержкой (network blip / интернет
+# поднимается медленнее launchd timer / SSH banner exchange timeout).
+TUNNEL_ATTEMPTS=3
+TUNNEL_OK=0
+for attempt in $(seq 1 $TUNNEL_ATTEMPTS); do
+    # Если предыдущая попытка оставила хвост — убить
+    if [[ -n "${TUNNEL_PID:-}" ]] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        kill "$TUNNEL_PID" 2>/dev/null || true
+        sleep 1
+    fi
 
-# Дожидаемся пока порт открылся (до 10 секунд)
-for i in {1..20}; do
-    if nc -z localhost "$LOCAL_PG_PORT" 2>/dev/null; then
+    echo "tunnel attempt $attempt/$TUNNEL_ATTEMPTS …"
+    ssh -i "$SSH_KEY" -N -L "$LOCAL_PG_PORT:localhost:5432" \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=30 \
+        -o ConnectTimeout=15 \
+        -o StrictHostKeyChecking=accept-new \
+        "$PROD_USER@$PROD_HOST" &
+    TUNNEL_PID=$!
+    echo "  tunnel pid=$TUNNEL_PID port=$LOCAL_PG_PORT"
+
+    # Ждём подъёма порта до 15с
+    for i in {1..30}; do
+        if nc -z localhost "$LOCAL_PG_PORT" 2>/dev/null; then
+            TUNNEL_OK=1
+            break
+        fi
+        # Если SSH-процесс упал — нет смысла ждать
+        if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            echo "  SSH process died early"
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [[ $TUNNEL_OK -eq 1 ]]; then
+        echo "  tunnel up on attempt $attempt"
         break
     fi
-    sleep 0.5
+
+    echo "  attempt $attempt failed; ssh exit pending"
+    if [[ $attempt -lt $TUNNEL_ATTEMPTS ]]; then
+        # exponential backoff: 5s → 15s → (no third)
+        sleep $((5 * attempt))
+    fi
 done
-if ! nc -z localhost "$LOCAL_PG_PORT" 2>/dev/null; then
-    echo "ERROR: tunnel did not come up after 10s"
+
+if [[ $TUNNEL_OK -ne 1 ]]; then
+    echo "ERROR: SSH tunnel не поднялся за $TUNNEL_ATTEMPTS попытки"
     exit 1
 fi
 

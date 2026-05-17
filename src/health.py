@@ -121,6 +121,13 @@ def check_health(
         # 6. Brand-coverage drop (если предыдущий имел brand'ы, а сейчас нет — алерт)
         report.issues.extend(_check_brand_coverage_drop(session, last_run.id))
 
+    # 7. Per-site silence — `stale_run` смотрит только на ПОСЛЕДНИЙ run в БД, но
+    # один сайт может молчать неделю пока другие отрабатывают. Например pharm/apt
+    # на Mac launchd, aloe на проде — если Mac уснул, aloe-run всё равно свежий,
+    # и stale_run check ничего не скажет о pharm/apt. Проверяем каждый сайт
+    # отдельно.
+    report.issues.extend(_check_site_silence(session, max_age_hours))
+
     # Совокупный статус
     if any(i.severity == "critical" for i in report.issues):
         report.status = "critical"
@@ -280,6 +287,53 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
             },
         )]
     return []
+
+
+def _check_site_silence(
+    session: Session, max_age_hours: int = 26
+) -> list[HealthIssue]:
+    """Per-site freshness: если у сайта нет свежих продуктов за max_age_hours → alert.
+
+    Метрика: `MAX(Product.last_seen_at)` per site. Если самое свежее обновление
+    у сайта старше max_age_hours, значит скрейп этого сайта молчит — Mac launchd
+    уснул, прокси упал, или CF забанил. `stale_run` смотрит на ПОСЛЕДНИЙ run в
+    принципе, но не per-site: если aloe скрейпится каждый день на проде, а
+    pharm/apt на Mac молчат — stale_run не сработает.
+
+    Сайты с 0 продуктов в каталоге игнорируются (новый/выключенный).
+    """
+    issues: list[HealthIssue] = []
+    cutoff = utcnow() - timedelta(hours=max_age_hours)
+
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        # Если сайт ещё ни разу не скрейпился — пропустить
+        total = session.scalar(
+            select(func.count())
+            .select_from(Product)
+            .where(Product.site == site)
+        ) or 0
+        if total == 0:
+            continue
+
+        last_seen = session.scalar(
+            select(func.max(Product.last_seen_at)).where(Product.site == site)
+        )
+
+        if last_seen is None or last_seen < cutoff:
+            age_h = (
+                (utcnow() - last_seen).total_seconds() / 3600
+                if last_seen
+                else 24 * 7
+            )
+            issues.append(
+                HealthIssue(
+                    "critical", "site_silent",
+                    f"Сайт {site}: последнее обновление {age_h:.1f}ч назад "
+                    f"(порог {max_age_hours}ч). Mac уснул / прокси упал?",
+                    context={"site": site, "hours_silent": round(age_h, 1)},
+                )
+            )
+    return issues
 
 
 def render_alert_html(report: HealthReport) -> str:

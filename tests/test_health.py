@@ -59,6 +59,32 @@ def test_recent_ok_run_returns_ok(db_session):
     assert rep.status == "ok"
 
 
+def test_site_silence_critical_when_one_site_stale(db_session):
+    """Per-site freshness: pharmonline молчит 3 дня, aloe скрейпился час назад.
+
+    `stale_run` смотрит на ПОСЛЕДНИЙ run и пропускает (aloe свежий), но per-site
+    silence check должен поймать pharmonline. Реальный сценарий: Mac launchd
+    уснул, aloe на проде продолжает скрейпиться.
+    """
+    # aloe свежий
+    aloe_run = _add_run(db_session, utcnow() - timedelta(hours=1))
+    _add_snap(db_session, aloe_run, "aloe", 50)
+    # pharmonline старый (3 дня назад)
+    old_pharm_run = _add_run(db_session, utcnow() - timedelta(days=3))
+    _add_snap(
+        db_session, old_pharm_run, "pharmonline", 50,
+        last_seen_at=utcnow() - timedelta(days=3),
+    )
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+    assert rep.status == "critical"
+    silent_issues = [i for i in rep.issues if i.code == "site_silent"]
+    silent_sites = {i.context.get("site") for i in silent_issues}
+    assert "pharmonline" in silent_sites
+    assert "aloe" not in silent_sites  # aloe свежий — не должен попасть
+
+
 def test_stale_run_critical(db_session):
     _add_run(db_session, utcnow() - timedelta(hours=48))
     db_session.commit()
