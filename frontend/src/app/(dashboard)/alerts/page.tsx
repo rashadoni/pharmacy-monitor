@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { AlertTriangle, AlertCircle, Info } from "lucide-react";
 import { api, type AlertEvent } from "@/lib/api";
 import { formatRelative } from "@/lib/utils";
+import { CardListSkeleton } from "@/components/skeleton";
 
 const SEVERITY_CONFIG = {
   critical: {
@@ -117,7 +118,7 @@ export default function AlertsPage() {
         </div>
       </div>
 
-      {isLoading && <div className="text-muted-foreground">Загрузка…</div>}
+      {isLoading && <CardListSkeleton count={6} />}
       {filtered && filtered.length === 0 && !isLoading && (
         <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center">
           По фильтрам ничего нет. Расширьте окно времени или сбросьте severity.

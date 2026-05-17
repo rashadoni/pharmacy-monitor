@@ -6,6 +6,7 @@ import { useState } from "react";
 import { api, type RunRow } from "@/lib/api";
 import { ActionRow } from "@/components/action-row";
 import { KpiCard } from "@/components/kpi-card";
+import { QuickActions } from "@/components/quick-actions";
 import { formatRelative } from "@/lib/utils";
 
 export default function OverviewPage() {
@@ -17,11 +18,14 @@ export default function OverviewPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Обзор</h1>
-        <p className="text-sm text-muted-foreground">
-          Сегодняшние действия и ключевые метрики
-        </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Обзор</h1>
+          <p className="text-sm text-muted-foreground">
+            Сегодняшние действия и ключевые метрики
+          </p>
+        </div>
+        <QuickActions />
       </div>
 
       {/* KPI cards */}
@@ -107,8 +111,14 @@ export default function OverviewPage() {
           </div>
         )}
         {actionsQ.data && actionsQ.data.length === 0 && (
-          <div className="text-muted-foreground text-sm">
-            Нет рекомендаций — pricing на уровне.
+          <div className="rounded-md border border-dashed border-border bg-card p-6 text-center text-sm text-muted-foreground">
+            <div className="text-base font-medium text-foreground mb-1">
+              Pricing на уровне 👌
+            </div>
+            <div>Никаких critical undercut'ов или missing-SKU не найдено.</div>
+            <div className="text-xs mt-2 text-muted-foreground/70">
+              Когда конкурент опустит цену &gt;3% — действие появится здесь.
+            </div>
           </div>
         )}
         <div className="space-y-2 mt-2">

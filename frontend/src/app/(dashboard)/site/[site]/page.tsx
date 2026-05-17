@@ -7,6 +7,7 @@ import { Building2, ExternalLink, Leaf, Pill, Search } from "lucide-react";
 import { api, type SiteProduct } from "@/lib/api";
 import { ActionRow } from "@/components/action-row";
 import { KpiCard } from "@/components/kpi-card";
+import { Sparkline } from "@/components/sparkline";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatTime } from "@/lib/utils";
 
@@ -400,6 +401,7 @@ function ProductsSection({
                   <th className="px-3 py-2 text-left">Категория</th>
                   <th className="px-3 py-2 text-right">Цена</th>
                   <th className="px-3 py-2 text-right">Скидка</th>
+                  <th className="px-3 py-2 text-right">Тренд 30д</th>
                   <th className="px-3 py-2 w-8"></th>
                 </tr>
               </thead>
@@ -409,7 +411,7 @@ function ProductsSection({
                 ))}
                 {items.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="px-3 py-6 text-center text-muted-foreground">
+                    <td colSpan={7} className="px-3 py-6 text-center text-muted-foreground">
                       Ничего не найдено
                     </td>
                   </tr>
@@ -442,6 +444,13 @@ function ProductsSection({
 }
 
 function ProductRow({ product, site }: { product: SiteProduct; site: SiteName }) {
+  // Lazy-load price history per row (React Query dedups + caches)
+  const historyQ = useQuery({
+    queryKey: ["product-price-history", product.id, 30],
+    queryFn: () => api.productPriceHistory(product.id, 30),
+    staleTime: 5 * 60_000, // 5 min — данные обновляются раз в день
+  });
+
   return (
     <tr className="border-t border-border hover:bg-muted/30">
       <td className="px-3 py-2">
@@ -474,6 +483,16 @@ function ProductRow({ product, site }: { product: SiteProduct; site: SiteName })
           </span>
         ) : (
           "—"
+        )}
+      </td>
+      <td className="px-3 py-2 text-right">
+        {historyQ.data ? (
+          <Sparkline
+            points={historyQ.data.points}
+            delta_pct={historyQ.data.delta_pct}
+          />
+        ) : (
+          <span className="text-xs text-muted-foreground/40">…</span>
         )}
       </td>
       <td className="px-3 py-2">

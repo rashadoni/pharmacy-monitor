@@ -45,6 +45,57 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Преобразовать ApiError / Error в человекочитаемое сообщение для UI.
+ * Анализирует Pydantic 422 (validation), 401/403/404/409 и timeout 408.
+ */
+export function friendlyError(err: unknown): string {
+  if (err instanceof ApiError) {
+    // Pydantic 422 detail обычно JSON: [{loc, msg, type}, ...]
+    if (err.status === 422 && err.detail.startsWith("{")) {
+      try {
+        const data = JSON.parse(err.detail);
+        if (Array.isArray(data?.detail)) {
+          const first = data.detail[0];
+          if (first?.msg) {
+            const field = first.loc?.slice(-1)?.[0] ?? "поле";
+            return `${field}: ${translatePydantic(first.msg)}`;
+          }
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+    if (err.status === 401) return "Нужно войти заново";
+    if (err.status === 403) return "Нет прав доступа (только админы)";
+    if (err.status === 404) return "Не найдено";
+    if (err.status === 408) return err.detail;
+    if (err.status === 409) {
+      // 409 detail обычно уже на русском от backend
+      try {
+        const d = JSON.parse(err.detail);
+        return d.detail ?? err.detail;
+      } catch {
+        return err.detail;
+      }
+    }
+    if (err.status >= 500) return "Сервер недоступен. Попробуйте через минуту.";
+    return err.detail || `Ошибка ${err.status}`;
+  }
+  if (err instanceof Error) return err.message;
+  return "Неизвестная ошибка";
+}
+
+function translatePydantic(msg: string): string {
+  const map: Record<string, string> = {
+    "Field required": "обязательное поле",
+    "Input should be a valid email address": "введите корректный email",
+    "String should have at least 3 characters": "минимум 3 символа",
+    "value is not a valid integer": "должно быть числом",
+  };
+  return map[msg] ?? msg;
+}
+
 // ─── Types matching FastAPI Pydantic schemas ───────────────────────────────
 
 export interface MeOut {
@@ -161,6 +212,22 @@ export interface SiteSummary {
   on_sale_pct: number;
   last_run_at: string | null;
   last_run_id: number | null;
+}
+
+export interface PriceHistoryPoint {
+  date: string;
+  price: number | null;
+  is_on_sale: boolean;
+}
+
+export interface PriceHistoryResponse {
+  product_id: number;
+  site: string;
+  name: string;
+  days: number;
+  points: PriceHistoryPoint[];
+  delta_pct: number | null;
+  current: number | null;
 }
 
 export interface NormalizeStats {
@@ -429,6 +496,15 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  digestSendTest: (kind: "daily" | "weekly" = "daily") =>
+    request<{ ok: boolean; recipients_sent: number }>(
+      `/api/v1/dash/digest/send-test?kind=${kind}`,
+      { method: "POST", timeoutMs: 30_000 },
+    ),
+  productPriceHistory: (product_id: number, days = 30) =>
+    request<PriceHistoryResponse>(
+      `/api/v1/dash/products/${product_id}/price-history?days=${days}`,
+    ),
   scrapeRequests: (limit = 10) =>
     request<ScrapeRequestRow[]>(`/api/v1/dash/scrape/requests?limit=${limit}`),
 };

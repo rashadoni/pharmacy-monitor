@@ -6,6 +6,7 @@ import { X } from "lucide-react";
 import { api, type ComparisonRow } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatPct } from "@/lib/utils";
+import { TableSkeleton } from "@/components/skeleton";
 
 const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
 
@@ -123,10 +124,15 @@ export default function ComparisonPage() {
         </label>
       </div>
 
-      {/* Status */}
-      {(isLoading || isFetching) && (
-        <div className="text-xs text-muted-foreground" data-testid="loading">
-          {isLoading ? "Загрузка…" : "Обновление…"}
+      {/* Status: skeleton при первой загрузке, тонкая полоска при refetch */}
+      {isLoading && !data && (
+        <div data-testid="loading">
+          <TableSkeleton rows={10} cols={6} />
+        </div>
+      )}
+      {isFetching && !isLoading && (
+        <div className="text-xs text-muted-foreground" data-testid="refetching">
+          Обновление…
         </div>
       )}
       {error && (

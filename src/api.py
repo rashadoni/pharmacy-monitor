@@ -866,6 +866,36 @@ def dash_notifications_unbind_telegram(
     return Response(status_code=204)
 
 
+@app.post("/api/v1/dash/digest/send-test")
+def dash_digest_send_test(
+    kind: str = "daily",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Отправить test digest всем получателям с `daily_digest=true`.
+
+    Используется из Quick Actions меню. Тот же код что и cron-таймер,
+    просто on-demand. Только admin.
+    """
+    if user.role != "admin":
+        raise HTTPException(403, "Admin role required")
+    if kind not in ("daily", "weekly"):
+        raise HTTPException(400, "kind must be 'daily' or 'weekly'")
+    from src import notifications
+
+    try:
+        count = (
+            notifications.send_daily_digest(db, tenant_id=user.tenant_id)
+            if kind == "daily"
+            else notifications.send_weekly_digest(db, tenant_id=user.tenant_id)
+        )
+        log.info("digest_sent_manual", kind=kind, count=count, by_user_id=user.id)
+        return {"ok": True, "recipients_sent": count}
+    except Exception as e:
+        log.error("digest_send_failed", error=str(e))
+        raise HTTPException(500, f"Не удалось отправить: {e}")
+
+
 # ─── Recipients management (admin only) ──────────────────────────────────────
 # Управление получателями email-digest. Admin может добавить любого получателя
 # (клиента, бухгалтера, партнёра) с настройкой severity_min и opt-in для
@@ -1380,6 +1410,86 @@ def dash_price_index(
         }
         for r in rows
     ]
+
+
+@app.get("/api/v1/dash/products/{product_id}/price-history")
+def dash_product_price_history(
+    product_id: int,
+    days: int = 30,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """История цен одного продукта за последние N дней (sparkline data).
+
+    Для каждого дня берётся latest snapshot этого продукта в данных сутках
+    (UTC). Возвращает массив `[{date, price, is_on_sale}]` отсортированный
+    по дате asc. Пустые дни пропускаются (без интерполяции — клиент рисует
+    sparkline как-есть).
+    """
+    days = max(1, min(days, 365))
+    cutoff = utcnow() - timedelta(days=days)
+
+    product = db.scalar(
+        select(storage.Product).where(
+            storage.Product.id == product_id,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    )
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    rows = db.execute(
+        select(
+            func.date(storage.PriceSnapshot.captured_at).label("d"),
+            func.max(storage.PriceSnapshot.captured_at).label("ts"),
+        )
+        .where(
+            storage.PriceSnapshot.product_id == product_id,
+            storage.PriceSnapshot.captured_at >= cutoff,
+        )
+        .group_by("d")
+        .order_by("d")
+    ).all()
+    timestamps = [r.ts for r in rows]
+    if not timestamps:
+        return {"product_id": product_id, "site": product.site, "points": []}
+
+    snaps = db.scalars(
+        select(storage.PriceSnapshot).where(
+            storage.PriceSnapshot.product_id == product_id,
+            storage.PriceSnapshot.captured_at.in_(timestamps),
+        )
+    ).all()
+    points = sorted(
+        [
+            {
+                "date": s.captured_at.date().isoformat(),
+                "price": s.discount_price or s.price,
+                "is_on_sale": bool(s.is_on_sale),
+            }
+            for s in snaps
+            if (s.discount_price or s.price) is not None
+        ],
+        key=lambda p: p["date"],
+    )
+
+    # delta % за период
+    delta_pct = None
+    if len(points) >= 2:
+        first = points[0]["price"]
+        last = points[-1]["price"]
+        if first:
+            delta_pct = round((last - first) / first * 100, 1)
+
+    return {
+        "product_id": product_id,
+        "site": product.site,
+        "name": product.name,
+        "days": days,
+        "points": points,
+        "delta_pct": delta_pct,
+        "current": points[-1]["price"] if points else None,
+    }
 
 
 @app.get("/api/v1/dash/forecast/movers")

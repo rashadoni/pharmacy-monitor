@@ -3,7 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Mail, Plus, Trash2, UserX } from "lucide-react";
-import { api, type Recipient, type RecipientCreate } from "@/lib/api";
+import { api, friendlyError, type Recipient, type RecipientCreate } from "@/lib/api";
 import { formatTime } from "@/lib/utils";
 
 type Severity = "off" | "info" | "warning" | "critical";
@@ -283,7 +283,7 @@ function CreateModal({ onClose }: { onClose: () => void }) {
       onClose();
     },
     onError: (err: unknown) => {
-      setError(err instanceof Error ? err.message : "Ошибка создания");
+      setError(friendlyError(err));
     },
   });
 
