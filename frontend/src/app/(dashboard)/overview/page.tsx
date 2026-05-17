@@ -225,9 +225,15 @@ export default function OverviewPage() {
 
       {/* Recent runs */}
       <div>
-        <h2 className="text-lg font-semibold mb-3">Последние прогоны</h2>
+        <div className="flex items-baseline justify-between mb-3">
+          <h2 className="text-lg font-semibold">Последние прогоны</h2>
+          {runsQ.data && runsQ.data.length > 0 && <RunsSummary runs={runsQ.data} />}
+        </div>
         <p className="text-xs text-muted-foreground mb-2">
-          Кликни на строку чтобы увидеть breakdown — сколько товаров на каждом сайте по каждой категории.
+          Кликни на строку чтобы увидеть breakdown — сколько товаров на каждом
+          сайте по каждой категории. <strong>cancelled</strong> ≠ failure: это
+          прогон, который завис и был прибит scheduled cleanup task'ом (обычно
+          ручной CLI-запуск который не довели до конца).
         </p>
         <div className="rounded-lg border border-border overflow-hidden">
           <table className="w-full text-sm">
@@ -297,7 +303,7 @@ function RunRowExpandable({
           {formatDuration(run.started_at, run.finished_at)}
         </td>
         <td className="px-3 py-2">
-          <StatusBadge status={run.status} />
+          <StatusBadge status={run.status} errorMessage={run.error_message} />
         </td>
         <td className="px-3 py-2 text-right tabular-nums">{run.products_scraped}</td>
         <td className="px-3 py-2 text-muted-foreground hidden md:table-cell">
@@ -438,15 +444,115 @@ function formatDuration(
   return `${hours}ч ${m}м`;
 }
 
-function StatusBadge({ status }: { status: string }) {
-  const cls =
-    status === "ok"
-      ? "bg-success/10 text-success"
-      : status === "failed"
-        ? "bg-destructive/10 text-destructive"
-        : "bg-muted text-muted-foreground";
+/**
+ * Сводка по последним N прогонам в виде маленьких chip'ов:
+ *   «3 ok · 1 cancelled · 0 failed»
+ *
+ * Без неё PO смотрел на 4/5 красных «failed» и видел production outage,
+ * хотя реально fail rate = 0% (все «failed» — это zombie cleanup'ы от
+ * manual CLI попыток которые не довели до конца).
+ */
+function RunsSummary({ runs }: { runs: RunRow[] }) {
+  const counts = runs.reduce(
+    (acc, r) => {
+      if (r.status === "ok") {
+        acc.ok += 1;
+      } else if (
+        r.error_message &&
+        /zombie cleanup|cancelled/i.test(r.error_message)
+      ) {
+        acc.cancelled += 1;
+      } else if (r.status === "failed") {
+        acc.failed += 1;
+      } else {
+        acc.other += 1;
+      }
+      return acc;
+    },
+    { ok: 0, cancelled: 0, failed: 0, other: 0 },
+  );
+
   return (
-    <span className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${cls}`}>
+    <div className="flex items-center gap-2 text-xs">
+      {counts.ok > 0 && (
+        <span className="inline-flex items-center gap-1 rounded-full bg-success/10 text-success px-2 py-0.5">
+          <span className="font-semibold">{counts.ok}</span> ok
+        </span>
+      )}
+      {counts.cancelled > 0 && (
+        <span
+          className="inline-flex items-center gap-1 rounded-full bg-muted text-muted-foreground px-2 py-0.5"
+          title="Zombie-cleanup'ы — не реальные production failures, а ручные запуски которые не финишировали"
+        >
+          <span className="font-semibold">{counts.cancelled}</span> cancelled
+        </span>
+      )}
+      {counts.failed > 0 && (
+        <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 text-destructive px-2 py-0.5">
+          <span className="font-semibold">{counts.failed}</span> failed
+        </span>
+      )}
+      {counts.other > 0 && (
+        <span className="inline-flex items-center gap-1 rounded-full bg-muted text-muted-foreground px-2 py-0.5">
+          <span className="font-semibold">{counts.other}</span> прочее
+        </span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Distinguish three states:
+ *   - ok                          → success green
+ *   - failed (real failure)       → destructive red
+ *   - cancelled / zombie-cleanup  → muted grey
+ *
+ * Раньше zombie cleanup'ы (вечно-running прогоны, прибитые scheduled task'ом)
+ * показывались как `failed` красным — выглядело как production outage хотя на
+ * самом деле это были diagnostic runs которые не довели до конца. Теперь они
+ * визуально отделены: серый «cancelled» badge + tooltip с пояснением.
+ */
+function StatusBadge({
+  status,
+  errorMessage,
+}: {
+  status: string;
+  errorMessage?: string | null;
+}) {
+  const isCancelled =
+    status !== "ok" &&
+    errorMessage &&
+    /zombie cleanup|cancelled/i.test(errorMessage);
+
+  if (status === "ok") {
+    return (
+      <span className="inline-flex rounded px-2 py-0.5 text-xs font-medium bg-success/10 text-success">
+        ok
+      </span>
+    );
+  }
+  if (isCancelled) {
+    return (
+      <span
+        className="inline-flex rounded px-2 py-0.5 text-xs font-medium bg-muted text-muted-foreground"
+        title={`Cancelled (zombie cleanup): ${errorMessage}. Это не реальный fail — прогон завис и был прибит scheduled task'ом.`}
+      >
+        cancelled
+      </span>
+    );
+  }
+  if (status === "failed") {
+    return (
+      <span
+        className="inline-flex rounded px-2 py-0.5 text-xs font-medium bg-destructive/10 text-destructive"
+        title={errorMessage ?? undefined}
+      >
+        failed
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex rounded px-2 py-0.5 text-xs font-medium bg-muted text-muted-foreground">
       {status}
     </span>
   );
