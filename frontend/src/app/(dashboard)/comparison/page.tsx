@@ -33,15 +33,72 @@ export default function ComparisonPage() {
     queryFn: () => api.comparison({ search: debouncedSearch, min_sites: minSites }),
   });
 
-  // Client-side filters поверх серверного результата
+  // Client-side filters + default sort (P1.2 PO Audit 2026-05-17)
+  // По умолчанию: сверху строки с наибольшим |spread_pct| — это самое полезное
+  // для PO (где конкурент бьёт по цене / где мы можем поднять).
   const filtered = useMemo(() => {
     if (!data) return data;
-    return data.filter((r) => {
+    const filtered = data.filter((r) => {
       if (diffOnly && (!r.spread_pct || r.spread_pct < 0.5)) return false;
       if (withAloe && !r.prices["aloe"]) return false;
       return true;
     });
+    return [...filtered].sort(
+      (a, b) => Math.abs(b.spread_pct ?? 0) - Math.abs(a.spread_pct ?? 0),
+    );
   }, [data, diffOnly, withAloe]);
+
+  // P1.2: auto-collapse колонок без данных в текущем срезе. Например когда
+  // включён фильтр «Только различия» — почти все строки могут не иметь aloe.
+  const visibleSites = useMemo(() => {
+    if (!filtered) return SITES;
+    return SITES.filter((s) => filtered.some((r) => r.prices[s] != null));
+  }, [filtered]);
+
+  // P1.2: Export CSV. Берёт уже-отфильтрованный + отсортированный набор.
+  function handleExportCsv() {
+    if (!filtered || filtered.length === 0) return;
+    const header = [
+      "id",
+      "name",
+      "brand",
+      ...SITES.flatMap((s) => [`${s}_price`, `${s}_url`]),
+      "spread_pct",
+      "cheapest_site",
+    ];
+    const escape = (v: unknown): string => {
+      if (v == null) return "";
+      const s = String(v);
+      // RFC 4180: escape если содержит ", , или newline
+      if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const lines = [header.join(",")];
+    for (const r of filtered) {
+      const row: string[] = [
+        String(r.canonical_id),
+        escape(r.name),
+        escape(r.brand ?? ""),
+      ];
+      for (const s of SITES) {
+        row.push(r.prices[s]?.price != null ? r.prices[s].price.toFixed(2) : "");
+        row.push(escape(r.prices[s]?.url ?? ""));
+      }
+      row.push(r.spread_pct != null ? r.spread_pct.toFixed(2) : "");
+      row.push(escape(r.cheapest_site ?? ""));
+      lines.push(row.join(","));
+    }
+    const blob = new Blob([lines.join("\n")], {
+      type: "text/csv;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const today = new Date().toISOString().slice(0, 10);
+    a.download = `comparison_${today}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
 
   const rejectMutation = useMutation({
     mutationFn: (id: number) => api.rejectMatch(id),
@@ -81,11 +138,22 @@ export default function ComparisonPage() {
 
   return (
     <div className="space-y-4">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Сравнение цен</h1>
-        <p className="text-sm text-muted-foreground">
-          Cross-site matched товары. Зелёным — самая низкая цена, красным — самая высокая.
-        </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Сравнение цен</h1>
+          <p className="text-sm text-muted-foreground">
+            Cross-site matched товары. Зелёным — самая низкая цена, красным — самая высокая.
+            Сортировка по |spread| desc.
+          </p>
+        </div>
+        <button
+          onClick={handleExportCsv}
+          disabled={!filtered || filtered.length === 0}
+          className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          title="Скачать CSV отфильтрованного списка"
+        >
+          ⬇ CSV
+        </button>
       </div>
 
       {/* Filters */}
@@ -181,7 +249,7 @@ export default function ComparisonPage() {
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
               <th className="px-3 py-2 text-left">Название</th>
-              {SITES.map((s) => (
+              {visibleSites.map((s) => (
                 <th key={s} className="px-3 py-2 text-right">
                   {s}
                 </th>
@@ -196,6 +264,7 @@ export default function ComparisonPage() {
               <ComparisonRowDesktop
                 key={row.canonical_id}
                 row={row}
+                sites={visibleSites}
                 expanded={expandedId === row.canonical_id}
                 onToggleExpand={() =>
                   setExpandedId((id) =>
@@ -218,6 +287,41 @@ export default function ComparisonPage() {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * P1.2 (PO Audit 2026-05-17): spread sign + arrow. PO ранее видел `+57.1%`
+ * и не понимал — клиент дешевле или дороже. Теперь:
+ *   ▲ красный  = у клиента (cheapest_site) самая высокая цена → конкурент дешевле
+ *   ▼ зелёный  = у клиента самая низкая → у нас лучший price
+ *   • muted    = нет cheapest_site (паритет / нет sites with price)
+ */
+function SpreadCell({ row }: { row: ComparisonRow }) {
+  if (row.spread_pct == null || row.cheapest_site == null) {
+    return <span className="text-muted-foreground/70">—</span>;
+  }
+  const abs = Math.abs(row.spread_pct);
+  // По умолчанию клиент = pharmonline (см. roi.CLIENT_SITE). Stable, простой
+  // эвристический сигнал направления цены: если pharmonline cheapest →
+  // зелёный ▼; если cheapest другой → красный ▲ (конкурент бьёт нас по цене).
+  const clientCheapest = row.cheapest_site === "pharmonline";
+  const Icon = clientCheapest
+    ? () => <span aria-hidden>▼</span>
+    : () => <span aria-hidden>▲</span>;
+  const color = clientCheapest ? "text-success" : "text-destructive";
+  return (
+    <span
+      className={`inline-flex items-center gap-0.5 tabular-nums ${color}`}
+      title={
+        clientCheapest
+          ? `pharmonline дешевле остальных на ${abs.toFixed(1)}%`
+          : `${row.cheapest_site} дешевле pharmonline на ${abs.toFixed(1)}%`
+      }
+    >
+      <Icon />
+      {abs.toFixed(1)}%
+    </span>
   );
 }
 
@@ -248,11 +352,13 @@ function priceCell(row: ComparisonRow, site: string) {
 
 function ComparisonRowDesktop({
   row,
+  sites,
   expanded,
   onToggleExpand,
   onReject,
 }: {
   row: ComparisonRow;
+  sites: readonly SiteName[];
   expanded: boolean;
   onToggleExpand: () => void;
   onReject: (r: ComparisonRow) => void;
@@ -268,13 +374,13 @@ function ComparisonRowDesktop({
             </div>
           )}
         </td>
-        {SITES.map((s) => (
+        {sites.map((s) => (
           <td key={s} className="px-3 py-2 text-right">
             {priceCell(row, s)}
           </td>
         ))}
         <td className="px-3 py-2 text-right tabular-nums">
-          {formatPct(row.spread_pct)}
+          <SpreadCell row={row} />
         </td>
         <td className="px-3 py-2">
           <button
@@ -306,7 +412,7 @@ function ComparisonRowDesktop({
       </tr>
       {expanded && (
         <tr className="bg-muted/20 border-t border-border">
-          <td colSpan={SITES.length + 3} className="px-3 py-3">
+          <td colSpan={sites.length + 3} className="px-3 py-3">
             <TrendPanel row={row} />
           </td>
         </tr>
@@ -338,9 +444,11 @@ function ComparisonCard({
         <X className="h-4 w-4" />
       </button>
       <div className="font-medium text-sm pr-8">{row.name}</div>
-      <div className="text-xs text-muted-foreground mt-0.5">
-        {row.brand ?? "—"} · {row.sites_with_price} сайтов · spread{" "}
-        {formatPct(row.spread_pct)}
+      <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5">
+        <span>
+          {row.brand ?? "—"} · {row.sites_with_price} сайтов · spread
+        </span>
+        <SpreadCell row={row} />
       </div>
       <div className="grid grid-cols-3 gap-2 mt-3">
         {SITES.map((s) => {
