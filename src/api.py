@@ -1458,7 +1458,12 @@ def dash_data_quality(
     )
     brand_rate = (good_brand_count / total_products * 100) if total_products else 0.0
 
-    # 2. Cross-2 / Cross-3 categories
+    # 2. Cross-2 / Cross-3 categories + ceilings + pending suggestions
+    # PO Audit recon (2026-05-18) показал: aloe.az имеет ВСЕГО 4 реальных
+    # категории (`dermanlar`, `usaq-dunyasi`, `bad`, `uşaq-qidası`), значит
+    # потолок Cross-3 физически = 4. Гнаться за «Cross-3 30+» нельзя.
+    # Реальный leverage — Cross-2 (pharm × apt): 52 vs 46 distinct категорий,
+    # потолок ~46. Сейчас Cross-2 = 20 → есть простор для роста.
     cats = db.scalars(select(storage.Category)).all()
     cross_3 = sum(
         1 for c in cats if c.pharmonline_slug and c.aptekonline_slug and c.aloe_slug
@@ -1466,6 +1471,59 @@ def dash_data_quality(
     cross_2 = sum(
         1 for c in cats
         if sum(1 for s in (c.pharmonline_slug, c.aptekonline_slug, c.aloe_slug) if s) >= 2
+    )
+    # Ceilings: min(distinct categories per site) для честного goal-setting.
+    # Junk фильтр: исключаем `product_field=*` (aloe scraper-artefact от
+    # promo-filters типа bestseller — не настоящая категория).
+    per_site_cats = db.execute(
+        select(storage.Product.site, func.count(func.distinct(storage.Product.category)))
+        .where(
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.category.is_not(None),
+            ~storage.Product.category.like("product_field=%"),
+        )
+        .group_by(storage.Product.site)
+    ).all()
+    cats_by_site = {site: int(n) for site, n in per_site_cats}
+    cross_3_ceiling = min(cats_by_site.values()) if cats_by_site else 0
+    pharm_apt_ceiling = min(
+        cats_by_site.get("pharmonline", 0), cats_by_site.get("aptekonline", 0)
+    )
+
+    # Cross-2 pending suggestions: пары (pharm-cat, apt-cat) с >= 5 shared
+    # brands, которых ещё нет в Categories table. Это «дешёвая еда»: каждая
+    # такая пара = категория готова к 1-click mapping в /categories?view=suggestions.
+    PA = storage.Product.__table__.alias("pa")
+    PB = storage.Product.__table__.alias("pb")
+    overlap_rows = db.execute(
+        select(
+            PA.c.category.label("a"),
+            PB.c.category.label("b"),
+            func.count(func.distinct(PA.c.brand)).label("brands"),
+        )
+        .where(
+            PA.c.site == "pharmonline",
+            PB.c.site == "aptekonline",
+            PA.c.brand.is_not(None),
+            PB.c.brand.is_not(None),
+            PA.c.brand == PB.c.brand,
+            PA.c.category.is_not(None),
+            PB.c.category.is_not(None),
+        )
+        .group_by(PA.c.category, PB.c.category)
+        .having(func.count(func.distinct(PA.c.brand)) >= 5)
+    ).all()
+    existing_pairs = set(
+        db.execute(
+            select(storage.Category.pharmonline_slug, storage.Category.aptekonline_slug)
+            .where(
+                storage.Category.pharmonline_slug.is_not(None),
+                storage.Category.aptekonline_slug.is_not(None),
+            )
+        ).all()
+    )
+    cross_2_pending = sum(
+        1 for a, b, _ in overlap_rows if (a, b) not in existing_pairs
     )
 
     # 3. Manual matches last 7 days
@@ -1496,7 +1554,10 @@ def dash_data_quality(
         "products_with_good_brand": good_brand_count,
         "products_total": total_products,
         "cross_3_count": cross_3,
+        "cross_3_ceiling": int(cross_3_ceiling),
         "cross_2_count": cross_2,
+        "cross_2_pharm_apt_ceiling": int(pharm_apt_ceiling),
+        "cross_2_pending_suggestions": int(cross_2_pending),
         "total_categories": len(cats),
         "manual_matches_last_7d": int(manual_7d),
         "last_scrape_per_site": last_seen,

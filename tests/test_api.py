@@ -1160,6 +1160,18 @@ def test_dash_data_quality_returns_metrics(client, auth_cookie, tenant_user, set
     assert body["cross_2_count"] == 2
     assert body["total_categories"] == 2
 
+    # Ceilings: distinct categories per site из products table
+    # P1+P2+P3 у нас по 1 продукту с уникальной категорией → ceiling = 1
+    assert "cross_3_ceiling" in body
+    assert "cross_2_pharm_apt_ceiling" in body
+    assert "cross_2_pending_suggestions" in body
+    # Все наши продукты в разных site/category → cross_3_ceiling = 1 (минимум)
+    assert body["cross_3_ceiling"] == 1
+    # pharm + apt продукты есть → ceiling >= 1
+    assert body["cross_2_pharm_apt_ceiling"] >= 1
+    # pending suggestions: 0 (brand'ы не пересекаются между категориями)
+    assert body["cross_2_pending_suggestions"] == 0
+
     # Brand quality: 2 «хороших» бренда (Bayer, Solgar) из 3 продуктов
     assert body["products_total"] == 3
     assert body["products_with_good_brand"] == 2

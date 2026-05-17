@@ -121,7 +121,11 @@ export default function CategoriesPage() {
     aloe: data?.filter((c) => c.aloe_slug).length ?? 0,
   };
 
-  const [view, setView] = useState<"list" | "suggestions">("list");
+  // P2 (PO Audit recon 2026-05-18): /overview?view=suggestions ведёт сюда
+  // напрямую в suggestions tab чтобы PO мог сразу делать 1-click mappings.
+  const initialView: "list" | "suggestions" =
+    searchParams.get("view") === "suggestions" ? "suggestions" : "list";
+  const [view, setView] = useState<"list" | "suggestions">(initialView);
 
   return (
     <div className="space-y-4">

@@ -156,7 +156,10 @@ export interface DataQuality {
   products_with_good_brand: number;
   products_total: number;
   cross_3_count: number;
+  cross_3_ceiling: number;
   cross_2_count: number;
+  cross_2_pharm_apt_ceiling: number;
+  cross_2_pending_suggestions: number;
   total_categories: number;
   manual_matches_last_7d: number;
   last_scrape_per_site: Record<string, string | null>;

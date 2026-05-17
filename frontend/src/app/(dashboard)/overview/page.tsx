@@ -129,11 +129,23 @@ export default function OverviewPage() {
             value={`${dqQ.data.brand_extraction_rate_pct}%`}
             hint={`${dqQ.data.products_with_good_brand.toLocaleString("ru-RU")} из ${dqQ.data.products_total.toLocaleString("ru-RU")} с осмысленным брендом`}
           />
+          {/*
+            P2 recon (2026-05-18): aloe.az имеет ВСЕГО 4 реальных категории,
+            значит потолок Cross-3 = 4. Гнаться за «Cross-3 30+» нельзя.
+            Реальный leverage — Cross-2 pharm × apt (потолок ~46).
+            Плитка показывает Cross-2 как primary, Cross-3 как hint, и
+            самое главное — `cross_2_pending_suggestions`: сколько пар
+            готовы к 1-click mapping в /categories?view=suggestions.
+          */}
           <StatTile
-            label="Cross-3 категорий"
-            value={`${dqQ.data.cross_3_count}/${dqQ.data.total_categories}`}
-            hint={`Cross-2: ${dqQ.data.cross_2_count} · Кликнуть → дочистить mapping`}
-            href="/categories?missing=3"
+            label="Category mappings"
+            value={`${dqQ.data.cross_2_count}/${dqQ.data.cross_2_pharm_apt_ceiling}`}
+            hint={
+              dqQ.data.cross_2_pending_suggestions > 0
+                ? `+${dqQ.data.cross_2_pending_suggestions} suggestions ready · Cross-3: ${dqQ.data.cross_3_count}/${dqQ.data.cross_3_ceiling}`
+                : `Cross-3: ${dqQ.data.cross_3_count}/${dqQ.data.cross_3_ceiling}`
+            }
+            href="/categories?view=suggestions"
           />
           <StatTile
             label="Manual matches (7д)"
