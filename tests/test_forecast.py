@@ -88,6 +88,36 @@ def test_compute_trend_stable_two_same_price_snapshots(db_session):
     assert t.n_points == 2
 
 
+def test_compute_trend_stable_when_last_snapshot_outside_window(db_session):
+    """Diff-only edge case: продукт виден сегодня, но последний snapshot 60 дней назад.
+
+    Сценарий: generic medicine со стабильной ценой 90+ дней. Под diff-only
+    snapshot пишется только при изменении, поэтому в окне 30 дней может быть
+    0 snapshots. Раньше compute_trend возвращал None для таких продуктов —
+    coverage тренд-графиков просела. Fix: fallback на latest_snapshots_per_product
+    когда `last_seen_at` свежий.
+    """
+    p = _add_product(db_session, "aloe", "VeryStable", "vs1")
+    # 1 snapshot, 60 дней назад
+    base = utcnow()
+    old_run = _add_run(db_session, base - timedelta(days=60))
+    db_session.add(PriceSnapshot(run_id=old_run.id, product_id=p.id, price=5.0))
+    # Продукт всё ещё виден сегодня
+    p.last_seen_at = utcnow() - timedelta(hours=2)
+    db_session.commit()
+
+    # Окно 30 дней — snapshot не попадает, но fallback на latest снаружи окна
+    t = forecast.compute_trend(db_session, p.id, days_window=30, min_points=3)
+    assert t is not None
+    assert t.direction == "stable"
+    assert t.last_price == 5.0
+    assert t.first_price == 5.0
+    assert t.forecast_7d_price == 5.0
+    assert t.change_pct == 0.0
+    assert t.confidence == "medium"
+    assert t.n_points == 1
+
+
 def test_compute_trend_returns_none_if_not_seen_recently(db_session):
     """Продукт исчез с сайта (last_seen_at давно) → None даже с 1 snapshot.
 

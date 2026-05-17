@@ -20,7 +20,13 @@ import structlog
 from sqlalchemy import asc, select
 from sqlalchemy.orm import Session
 
-from src.storage import Match, PriceSnapshot, Product, Run
+from src.storage import (
+    Match,
+    PriceSnapshot,
+    Product,
+    Run,
+    latest_snapshots_per_product,
+)
 
 log = structlog.get_logger()
 
@@ -138,11 +144,40 @@ def compute_trend(
     if len(prices) < min_points:
         # «Stable» возможен только если продукт действительно виден в окне
         # (last_seen_at в окне), иначе это просто dead SKU без свежих данных.
-        if (
-            product.last_seen_at >= cutoff
-            and prices
-            and len(set(round(p, 2) for p in prices)) == 1
-        ):
+        if product.last_seen_at is None or product.last_seen_at < cutoff:
+            return None
+
+        # Если в окне 0 snapshot'ов — fallback на latest snapshot вне окна.
+        # Под diff-only очень стабильный продукт (например generic medicine со
+        # стабильной ценой 90+ дней) имеет последний snapshot за пределами окна.
+        # `last_seen_at` подтверждает, что продукт по-прежнему виден на сайте,
+        # значит latest snapshot отражает актуальную цену.
+        if not prices:
+            latest = latest_snapshots_per_product(session, [product_id]).get(
+                product_id
+            )
+            if latest is None:
+                return None
+            p = latest.discount_price or latest.price
+            if p is None or p <= 0:
+                return None
+            return PriceTrend(
+                product_id=product_id,
+                site=product.site,
+                name=product.name,
+                n_points=1,
+                first_price=round(p, 2),
+                last_price=round(p, 2),
+                change_pct=0.0,
+                direction="stable",
+                forecast_7d_price=round(p, 2),
+                # Confidence=medium: цена стабильна (snapshot не пишется),
+                # но точка единственная и за пределами окна.
+                confidence="medium",
+            )
+
+        # 1-2 snapshot'а в окне со одинаковой ценой — также stable.
+        if len(set(round(p, 2) for p in prices)) == 1:
             p = prices[0]
             return PriceTrend(
                 product_id=product_id,
@@ -154,7 +189,6 @@ def compute_trend(
                 change_pct=0.0,
                 direction="stable",
                 forecast_7d_price=round(p, 2),
-                # Confidence=medium: цена стабильна, но мало точек подтверждения
                 confidence="medium",
             )
         return None
