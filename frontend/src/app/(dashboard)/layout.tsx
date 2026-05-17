@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { cookies } from "next/headers";
 import { SideNav, BottomNav } from "@/components/nav";
+import { NotificationsBanner } from "@/components/notifications-banner";
 
 /**
  * Protected layout: requires JWT cookie (`pm_session`). If absent → redirect to /login.
@@ -29,7 +30,10 @@ export default async function DashboardLayout({
       </a>
       <SideNav />
       <main id="main-content" className="flex-1 pb-16 md:pb-0" tabIndex={-1}>
-        <div className="container py-4 md:py-8">{children}</div>
+        <div className="container py-4 md:py-8">
+          <NotificationsBanner />
+          {children}
+        </div>
       </main>
       <BottomNav />
     </div>
