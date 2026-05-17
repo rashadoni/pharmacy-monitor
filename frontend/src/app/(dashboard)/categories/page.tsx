@@ -2,6 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Lightbulb, Pencil, Play, Plus, Trash2, X } from "lucide-react";
+import { useSearchParams } from "next/navigation";
 import { useState } from "react";
 import { api, friendlyError, type CategoryRow, type CategorySuggestion } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
@@ -65,11 +66,26 @@ function slugify(s: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
+type CrossFilter = "" | "cross2" | "cross3" | "missing3";
+
 export default function CategoriesPage() {
+  const searchParams = useSearchParams();
   const [search, setSearch] = useState("");
   const [siteFilter, setSiteFilter] = useState<"" | "pharmonline" | "aptekonline" | "aloe">("");
   const [activeOnly, setActiveOnly] = useState(false);
-  const [crossFilter, setCrossFilter] = useState<"" | "cross2" | "cross3">("");
+  // P2 (PO Audit 2026-05-17): data-quality strip на /overview ведёт сюда с
+  // ?missing=3 чтобы сразу показать категории без полного 3-сайтового маппинга.
+  // Это actionable view: PO видит «357 категорий без 3 сайтов» вместо «1 с»,
+  // и может за один заход дочистить mapping → Cross-3 от 1 → 30+.
+  const initialCross: CrossFilter = (() => {
+    const m = searchParams.get("missing");
+    if (m === "3") return "missing3";
+    const c = searchParams.get("cross");
+    if (c === "2") return "cross2";
+    if (c === "3") return "cross3";
+    return "";
+  })();
+  const [crossFilter, setCrossFilter] = useState<CrossFilter>(initialCross);
   const [showAdd, setShowAdd] = useState(false);
   const [editing, setEditing] = useState<CategoryRow | null>(null);
   const queryClient = useQueryClient();
@@ -89,6 +105,7 @@ export default function CategoriesPage() {
     if (activeOnly && !c.is_active) return false;
     if (crossFilter === "cross2" && !(c.pharmonline_slug && c.aptekonline_slug)) return false;
     if (crossFilter === "cross3" && !(c.pharmonline_slug && c.aptekonline_slug && c.aloe_slug)) return false;
+    if (crossFilter === "missing3" && c.pharmonline_slug && c.aptekonline_slug && c.aloe_slug) return false;
     return true;
   });
 
@@ -167,7 +184,13 @@ export default function CategoriesPage() {
         <Stat label="Всего" value={stats.total} />
         <Stat label="Active" value={stats.active} />
         <Stat label="Cross-2" value={stats.cross2} highlight />
-        <Stat label="Cross-3" value={stats.cross3} highlight />
+        <Stat
+          label="Cross-3"
+          value={stats.cross3}
+          highlight
+          onClick={() => setCrossFilter("missing3")}
+          subValue={`${stats.total - stats.cross3} без полного`}
+        />
         <Stat label="pharmonline" value={stats.pharmonline} />
         <Stat label="aptekonline" value={stats.aptekonline} />
         <Stat label="aloe" value={stats.aloe} />
@@ -194,12 +217,13 @@ export default function CategoriesPage() {
         </select>
         <select
           value={crossFilter}
-          onChange={(e) => setCrossFilter(e.target.value as any)}
+          onChange={(e) => setCrossFilter(e.target.value as CrossFilter)}
           className="rounded-md border border-input bg-background px-3 py-2 text-sm"
         >
           <option value="">Любой охват</option>
           <option value="cross2">Только Cross-2 (pharm+apt)</option>
           <option value="cross3">Только Cross-3 (все 3 сайта)</option>
+          <option value="missing3">Без полного 3-site маппинга</option>
         </select>
         <label className="inline-flex items-center gap-2 px-3 text-sm">
           <input
@@ -681,15 +705,50 @@ function CategoryRowDesktop({
   );
 }
 
-function Stat({ label, value, highlight }: { label: string; value: number; highlight?: boolean }) {
+function Stat({
+  label,
+  value,
+  highlight,
+  onClick,
+  subValue,
+}: {
+  label: string;
+  value: number;
+  highlight?: boolean;
+  onClick?: () => void;
+  subValue?: string;
+}) {
+  const baseClasses = `rounded-lg border bg-card px-3 py-2 ${
+    highlight ? "border-success/40 bg-success/5" : "border-border"
+  }`;
+  const interactive = onClick
+    ? "cursor-pointer transition-colors hover:bg-muted/40 hover:border-primary/40"
+    : "";
   return (
     <div
-      className={`rounded-lg border bg-card px-3 py-2 ${
-        highlight ? "border-success/40 bg-success/5" : "border-border"
-      }`}
+      className={`${baseClasses} ${interactive}`}
+      onClick={onClick}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onKeyDown={
+        onClick
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onClick();
+              }
+            }
+          : undefined
+      }
+      title={onClick ? "Кликнуть → фильтр «без полного 3-site маппинга»" : undefined}
     >
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="text-lg font-semibold">{value}</div>
+      {subValue && (
+        <div className="text-[11px] text-muted-foreground/80 mt-0.5">
+          {subValue}
+        </div>
+      )}
     </div>
   );
 }

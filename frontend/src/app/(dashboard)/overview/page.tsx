@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
+import Link from "next/link";
 import { useState } from "react";
 import { api, type RunRow } from "@/lib/api";
 import { ActionRow } from "@/components/action-row";
@@ -131,7 +132,8 @@ export default function OverviewPage() {
           <StatTile
             label="Cross-3 категорий"
             value={`${dqQ.data.cross_3_count}/${dqQ.data.total_categories}`}
-            hint={`Категорий со всеми 3 сайтами (Cross-2: ${dqQ.data.cross_2_count})`}
+            hint={`Cross-2: ${dqQ.data.cross_2_count} · Кликнуть → дочистить mapping`}
+            href="/categories?missing=3"
           />
           <StatTile
             label="Manual matches (7д)"
@@ -436,23 +438,37 @@ function strategyLabel(s: string): string {
  * Маленькая стат-плитка, легче по визуальному весу чем KpiCard. Используется
  * под основным KPI-grid'ом для дополнительных data-quality метрик чтобы не
  * раздувать главную сетку с 4 до 8 карточек.
+ *
+ * Если задан `href` — плитка кликабельная (Link) и подсвечивается на hover'е.
+ * Это превращает пассивную метрику в начало workflow. Например, Cross-3
+ * ведёт на /categories?missing=3 чтобы PO мог сразу пойти и дочистить
+ * mapping вместо «увидел число и забыл».
  */
 function StatTile({
   label,
   value,
   hint,
+  href,
 }: {
   label: string;
   value: string | number;
   hint?: string;
+  href?: string;
 }) {
-  return (
-    <div
-      className="rounded-md border border-border bg-card px-3 py-2"
-      title={hint}
-    >
+  const baseClasses =
+    "rounded-md border border-border bg-card px-3 py-2 block";
+  const interactive = href
+    ? "cursor-pointer transition-colors hover:bg-muted/40 hover:border-primary/40"
+    : "";
+  const content = (
+    <>
       <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
         {label}
+        {href && (
+          <span className="ml-1 text-muted-foreground/60" aria-hidden>
+            →
+          </span>
+        )}
       </div>
       <div className="text-lg font-semibold tabular-nums leading-tight mt-0.5">
         {value}
@@ -462,6 +478,18 @@ function StatTile({
           {hint}
         </div>
       )}
+    </>
+  );
+  if (href) {
+    return (
+      <Link href={href} className={`${baseClasses} ${interactive}`} title={hint}>
+        {content}
+      </Link>
+    );
+  }
+  return (
+    <div className={baseClasses} title={hint}>
+      {content}
     </div>
   );
 }
