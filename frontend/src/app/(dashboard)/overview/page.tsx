@@ -103,24 +103,19 @@ export default function OverviewPage() {
         />
       </div>
 
-      {/* Match strategy distribution — компактная пилюля под KPI */}
+      {/*
+        Match strategy distribution. Раньше показывалось raw tech-labels
+        (legacy_fuzzy 2577, ai_attrs_strict 493…). PO Audit отметил это как
+        cross-cutting issue («Технические артефакты везде»). Теперь:
+          • Russian читаемые лейблы
+          • Сортировка по качеству, не по count'у (good сверху)
+          • Color tier: high/medium/low quality
+          • Процент от общего количества рядом с count'ом
+          • Tech name (legacy_fuzzy) в tooltip для аудита
+      */}
       {normalizeQ.data &&
         Object.keys(normalizeQ.data.matches_by_strategy).length > 0 && (
-          <div className="flex flex-wrap gap-2 text-xs">
-            <span className="text-muted-foreground">Стратегии матчей:</span>
-            {Object.entries(normalizeQ.data.matches_by_strategy)
-              .sort(([, a], [, b]) => b - a)
-              .map(([strategy, count]) => (
-                <span
-                  key={strategy}
-                  className="inline-flex items-center gap-1 rounded bg-muted/50 px-2 py-0.5 font-mono"
-                  title={strategyLabel(strategy)}
-                >
-                  <span className="text-muted-foreground">{strategy}</span>
-                  <span className="font-semibold">{count}</span>
-                </span>
-              ))}
-          </div>
+          <MatchStrategyRow byStrategy={normalizeQ.data.matches_by_strategy} />
         )}
 
       {/*
@@ -457,19 +452,110 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-function strategyLabel(s: string): string {
-  switch (s) {
-    case "ai_attrs_strict":
-      return "AI: совпали активное вещество, дозировка, упаковка и бренд";
-    case "ai_attrs_partial":
-      return "AI: активное вещество + 1-2 атрибута";
-    case "legacy_fuzzy":
-      return "Legacy: token_set_ratio по названию";
-    case "manual":
-      return "Подтверждено вручную";
-    default:
-      return s;
-  }
+/**
+ * Метаинформация о стратегии матчинга для UI:
+ *  - `label` — человекочитаемый ярлык (Russian)
+ *  - `tier` — quality tier для color-кода
+ *  - `description` — длинное объяснение в tooltip + tech name для аудита
+ *  - `order` — приоритет сортировки (lower = first, лучшее качество вверху)
+ */
+type StrategyTier = "high" | "medium" | "low";
+type StrategyMeta = {
+  label: string;
+  tier: StrategyTier;
+  description: string;
+  order: number;
+};
+
+const STRATEGY_META: Record<string, StrategyMeta> = {
+  manual: {
+    label: "Вручную",
+    tier: "high",
+    description: "manual — подтверждено оператором через UI. Самое надёжное.",
+    order: 0,
+  },
+  ai_attrs_strict: {
+    label: "AI строгий",
+    tier: "high",
+    description:
+      "ai_attrs_strict — AI извлёк active_ingredient + dosage + pack + brand, все 4 совпали с другим сайтом. Высокая уверенность.",
+    order: 1,
+  },
+  ai_attrs_partial: {
+    label: "AI частичный",
+    tier: "medium",
+    description:
+      "ai_attrs_partial — AI извлёк active_ingredient + 1-2 атрибута. Средняя уверенность, бывают false-positives.",
+    order: 2,
+  },
+  legacy_fuzzy: {
+    label: "По названию",
+    tier: "low",
+    description:
+      "legacy_fuzzy — token_set_ratio по сырому названию. Worst quality: бьёт false-positives типа «Friso 3 Gold ↔ Friso Prematures».",
+    order: 3,
+  },
+  unknown: {
+    label: "Без метки",
+    tier: "low",
+    description:
+      "unknown — матчи pre-strategy-tracking (старая БД без поля match_strategy). Аудит-trail отсутствует.",
+    order: 4,
+  },
+};
+
+function strategyMeta(s: string): StrategyMeta {
+  return (
+    STRATEGY_META[s] ?? {
+      label: s,
+      tier: "low",
+      description: s,
+      order: 99,
+    }
+  );
+}
+
+function MatchStrategyRow({
+  byStrategy,
+}: {
+  byStrategy: Record<string, number>;
+}) {
+  const total = Object.values(byStrategy).reduce((sum, n) => sum + n, 0);
+  const entries = Object.entries(byStrategy)
+    .map(([key, count]) => ({ key, count, meta: strategyMeta(key) }))
+    .sort((a, b) => a.meta.order - b.meta.order);
+
+  const tierClass: Record<StrategyTier, string> = {
+    high: "bg-success/10 text-success border-success/30",
+    medium: "bg-warning/10 text-warning border-warning/30",
+    low: "bg-muted text-muted-foreground border-border",
+  };
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs">
+      <span className="text-muted-foreground">Качество матчей:</span>
+      {entries.map(({ key, count, meta }) => {
+        const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+        return (
+          <span
+            key={key}
+            className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 ${tierClass[meta.tier]}`}
+            title={`${meta.description} (${count.toLocaleString("ru-RU")} матчей)`}
+          >
+            <span>{meta.label}</span>
+            <span className="font-semibold tabular-nums">
+              {count.toLocaleString("ru-RU")}
+            </span>
+            {pct >= 1 && (
+              <span className="text-[10px] opacity-70 tabular-nums">
+                {pct}%
+              </span>
+            )}
+          </span>
+        );
+      })}
+    </div>
+  );
 }
 
 /**
