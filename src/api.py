@@ -1502,8 +1502,28 @@ def dash_products_facets(
         .limit(100)
     ).all()
 
+    # Lookup slug → label_ru: Category.{site}_slug → Category.label_ru
+    # Slug-format на каждом сайте свой, но Category-таблица их связывает.
+    slug_col = {
+        "pharmonline": storage.Category.pharmonline_slug,
+        "aptekonline": storage.Category.aptekonline_slug,
+        "aloe": storage.Category.aloe_slug,
+    }[site]
+    label_rows = db.execute(
+        select(slug_col, storage.Category.label_ru).where(slug_col.is_not(None))
+    ).all()
+    slug_to_label = {s: lbl for s, lbl in label_rows if s and lbl}
+
+    def _filter_internal(name: str) -> bool:
+        """Скрыть технические category-маркеры из UI (e.g. product_field=bestseller)."""
+        return not (name.startswith("product_field=") or name.startswith("__"))
+
     return {
-        "categories": [{"name": c, "count": n} for c, n in cat_rows if c],
+        "categories": [
+            {"name": c, "label": slug_to_label.get(c) or c, "count": n}
+            for c, n in cat_rows
+            if c and _filter_internal(c)
+        ],
         "brands": [{"name": b, "count": n} for b, n in brand_rows if b],
     }
 

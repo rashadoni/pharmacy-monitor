@@ -81,11 +81,33 @@ export default function OverviewPage() {
       {/* Today's actions */}
       <div>
         <h2 className="text-lg font-semibold mb-3">Сегодняшние действия</h2>
-        {actionsQ.isLoading && <div className="text-muted-foreground">Загрузка…</div>}
-        {actionsQ.data && actionsQ.data.length === 0 && (
-          <div className="text-muted-foreground">Нет рекомендаций — pricing на уровне.</div>
+        {actionsQ.isLoading && (
+          <div className="rounded-md border border-border bg-card p-3 text-sm text-muted-foreground flex items-center gap-2">
+            <span className="inline-block h-2 w-2 rounded-full bg-primary animate-pulse" />
+            Анализ pricing-recommendations… может занять до 15 сек на 3K матчей
+          </div>
         )}
-        <div className="space-y-2">
+        {actionsQ.error && (
+          <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive flex items-center justify-between gap-3">
+            <div>
+              {actionsQ.error instanceof Error
+                ? actionsQ.error.message
+                : "Не удалось загрузить рекомендации"}
+            </div>
+            <button
+              onClick={() => actionsQ.refetch()}
+              className="rounded border border-destructive/50 px-2 py-1 text-xs hover:bg-destructive/20"
+            >
+              Повторить
+            </button>
+          </div>
+        )}
+        {actionsQ.data && actionsQ.data.length === 0 && (
+          <div className="text-muted-foreground text-sm">
+            Нет рекомендаций — pricing на уровне.
+          </div>
+        )}
+        <div className="space-y-2 mt-2">
           {actionsQ.data?.slice(0, 10).map((a, i) => (
             <ActionRow key={i} action={a} />
           ))}

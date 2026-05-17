@@ -390,13 +390,24 @@ def dispatch_event(session: Session, event: AlertEvent) -> dict:
     """Отправить event по каналам которые настроены в его правиле.
 
     Возвращает {channel: status} где status = 'sent' / 'skipped' / 'error: msg'.
+
+    Real-time email rate-limit (2026-05-17 fix): email отправляется только
+    для severity=critical. warning/info складываются в `alert_events` и
+    приходят утром в daily digest (см. src/notifications.send_daily_digest).
+    Это защита от exhaust'а Resend daily-quota (100 emails/day на free tier
+    — раньше 687 alert'ов за прогон выжигали квоту за минуту).
     """
     rule = session.get(AlertRule, event.rule_id) if event.rule_id else None
-    channels = (rule.channels if rule else None) or ["email"]
+    # Default канала больше нет — нужна явная подписка в rule.channels.
+    # Это значит для большинства событий real-time email пропускается → digest.
+    channels = (rule.channels if rule else None) or []
     results: dict[str, Any] = {}
 
-    if "email" in channels:
+    # Email только для critical (защита от quota-exhaustion)
+    if "email" in channels and event.severity == "critical":
         results["email"] = _send_email_alert(event)
+    elif "email" in channels:
+        results["email"] = "deferred to digest"
 
     if "telegram" in channels:
         results["telegram"] = _send_telegram_alert(session, event)

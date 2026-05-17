@@ -127,7 +127,25 @@ export default function SitePage() {
           есть у {competitors.join("/")}, но нет у нас.
         </p>
         {roiQ.isLoading && (
-          <div className="text-sm text-muted-foreground">Загрузка…</div>
+          <div className="rounded-md border border-border bg-card p-3 text-sm text-muted-foreground flex items-center gap-2">
+            <span className="inline-block h-2 w-2 rounded-full bg-primary animate-pulse" />
+            Анализ pricing-recommendations… может занять до 15 сек
+          </div>
+        )}
+        {roiQ.error && (
+          <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive flex items-center justify-between gap-3">
+            <div>
+              {roiQ.error instanceof Error
+                ? roiQ.error.message
+                : "Не удалось загрузить рекомендации"}
+            </div>
+            <button
+              onClick={() => roiQ.refetch()}
+              className="rounded border border-destructive/50 px-2 py-1 text-xs hover:bg-destructive/20"
+            >
+              Повторить
+            </button>
+          </div>
         )}
         {roiQ.data && roiQ.data.length === 0 && (
           <div className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
@@ -213,7 +231,7 @@ function CategoriesPanel({
   loading,
   site,
 }: {
-  categories: { name: string; count: number }[];
+  categories: { name: string; label?: string; count: number }[];
   loading: boolean;
   site: SiteName;
 }) {
@@ -232,17 +250,31 @@ function CategoriesPanel({
         <div className="p-4 text-sm text-muted-foreground">Нет данных</div>
       )}
       <ul className="divide-y divide-border max-h-96 overflow-y-auto">
-        {categories.map((c) => (
-          <li
-            key={c.name}
-            className="flex items-center justify-between px-4 py-2 text-sm"
-          >
-            <span className="font-mono text-xs text-muted-foreground truncate">
-              {c.name}
-            </span>
-            <span className="font-mono tabular-nums">{c.count}</span>
-          </li>
-        ))}
+        {categories.map((c) => {
+          const hasLabel = c.label && c.label !== c.name;
+          return (
+            <li
+              key={c.name}
+              className="flex items-center justify-between px-4 py-2 text-sm gap-2"
+            >
+              <span className="min-w-0 flex-1 truncate">
+                {hasLabel ? (
+                  <>
+                    <span className="font-medium">{c.label}</span>
+                    <span className="ml-1.5 text-[10px] font-mono text-muted-foreground/60">
+                      {c.name}
+                    </span>
+                  </>
+                ) : (
+                  <span className="font-mono text-xs text-muted-foreground">
+                    {c.name}
+                  </span>
+                )}
+              </span>
+              <span className="font-mono tabular-nums shrink-0">{c.count}</span>
+            </li>
+          );
+        })}
       </ul>
     </div>
   );
@@ -255,7 +287,7 @@ function ProductsSection({
   site: SiteName;
   facets:
     | {
-        categories: { name: string; count: number }[];
+        categories: { name: string; label?: string; count: number }[];
         brands: { name: string; count: number }[];
       }
     | undefined;
@@ -319,7 +351,7 @@ function ProductsSection({
           <option value="">Все категории</option>
           {facets?.categories.map((c) => (
             <option key={c.name} value={c.name}>
-              {c.name} ({c.count})
+              {c.label && c.label !== c.name ? c.label : c.name} ({c.count})
             </option>
           ))}
         </select>

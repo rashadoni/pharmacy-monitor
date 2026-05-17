@@ -57,20 +57,41 @@ def brand_share(
 
     Если передан `site` — возвращает только бренды, представленные на этом
     сайте; counts остаются по всем сайтам (чтобы видеть exclusive-to флаг).
-    """
-    if run_id is None:
-        run_id = session.scalar(
-            select(Run.id).where(Run.status == "ok").order_by(desc(Run.id)).limit(1)
-        )
-        if run_id is None:
-            return []
 
-    rows = session.execute(
-        select(Product.brand, Product.site, func.count(Product.id))
-        .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
-        .where(PriceSnapshot.run_id == run_id, Product.brand.is_not(None))
-        .group_by(Product.brand, Product.site)
-    ).all()
+    Diff-only-aware (2026-05-17 fix): считаем по всем существующим продуктам
+    в БД (не привязка к `run_id`), потому что после diff-only persist + failed
+    aloe-scrape запрос `WHERE run_id == last_ok_run` возвращал 0 строк (когда
+    last_ok_run = run где этот сайт не участвовал). Параметр `run_id` оставлен
+    для backward-compat, но игнорируется когда `site` указан.
+    """
+    # Когда явно фильтруем по сайту — считаем по `Product` напрямую
+    # (избегаем зависимости от run_id который может быть свежий-но-пустой).
+    if site is not None:
+        rows = session.execute(
+            select(Product.brand, Product.site, func.count(Product.id))
+            .where(Product.brand.is_not(None))
+            .group_by(Product.brand, Product.site)
+        ).all()
+    else:
+        # Legacy path (без site фильтра) — оставлен совместимым с тестами:
+        # использует snapshot последнего ok-run если есть, иначе fallback на all products
+        if run_id is None:
+            run_id = session.scalar(
+                select(Run.id).where(Run.status == "ok").order_by(desc(Run.id)).limit(1)
+            )
+        if run_id is None:
+            rows = session.execute(
+                select(Product.brand, Product.site, func.count(Product.id))
+                .where(Product.brand.is_not(None))
+                .group_by(Product.brand, Product.site)
+            ).all()
+        else:
+            rows = session.execute(
+                select(Product.brand, Product.site, func.count(Product.id))
+                .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
+                .where(PriceSnapshot.run_id == run_id, Product.brand.is_not(None))
+                .group_by(Product.brand, Product.site)
+            ).all()
 
     # Aggregate
     by_brand: dict[str, dict[str, int]] = defaultdict(lambda: {s: 0 for s in ALL_SITES})

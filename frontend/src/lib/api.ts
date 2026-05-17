@@ -6,18 +6,37 @@
  */
 const BASE = ""; // same origin
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-    ...init,
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new ApiError(res.status, text || res.statusText);
+async function request<T>(
+  path: string,
+  init?: RequestInit & { timeoutMs?: number },
+): Promise<T> {
+  const timeoutMs = init?.timeoutMs ?? 30_000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      credentials: "include",
+      headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+      signal: controller.signal,
+      ...init,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new ApiError(res.status, text || res.statusText);
+    }
+    if (res.status === 204) return undefined as T;
+    return res.json();
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new ApiError(
+        408,
+        `Запрос дольше ${Math.round(timeoutMs / 1000)}с — сервер не ответил`,
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  if (res.status === 204) return undefined as T;
-  return res.json();
 }
 
 export class ApiError extends Error {
@@ -130,7 +149,7 @@ export interface SiteProductsPage {
 }
 
 export interface SiteFacets {
-  categories: { name: string; count: number }[];
+  categories: { name: string; label?: string; count: number }[];
   brands: { name: string; count: number }[];
 }
 
@@ -288,7 +307,11 @@ export const api = {
     const q = new URLSearchParams();
     if (client_site) q.set("client_site", client_site);
     const qs = q.toString();
-    return request<RoiAction[]>(`/api/v1/dash/roi/actions${qs ? `?${qs}` : ""}`);
+    // ROI compute может быть тяжёлым (matcher join), ставим явно 15с timeout
+    return request<RoiAction[]>(
+      `/api/v1/dash/roi/actions${qs ? `?${qs}` : ""}`,
+      { timeoutMs: 15_000 },
+    );
   },
   alerts: (severity?: string, limit = 100) => {
     const q = new URLSearchParams({ limit: String(limit) });
