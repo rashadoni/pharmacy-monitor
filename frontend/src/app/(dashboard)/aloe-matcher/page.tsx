@@ -43,6 +43,44 @@ export default function AloeMatcherPage() {
     setSkipped((s) => new Set(s).add(matchId));
   }
 
+  function handleSkipAllOnPage() {
+    if (!unmatchedQ.data) return;
+    const visibleIds = unmatchedQ.data.items
+      .filter((r) => !skipped.has(r.match_id))
+      .map((r) => r.match_id);
+    if (visibleIds.length === 0) return;
+    if (!confirm(`Пропустить все ${visibleIds.length} кластеров на этой странице?\n(можно потом сбросить кнопкой «Сброс»)`)) return;
+    setSkipped((s) => {
+      const next = new Set(s);
+      visibleIds.forEach((id) => next.add(id));
+      return next;
+    });
+  }
+
+  function handleSkipCheap(threshold: number) {
+    if (!unmatchedQ.data) return;
+    const cheapIds = unmatchedQ.data.items
+      .filter((r) => !skipped.has(r.match_id))
+      .filter((r) => {
+        const prices = r.anchor_products
+          .map((a) => a.price)
+          .filter((p): p is number => p != null);
+        if (prices.length === 0) return false;
+        return Math.max(...prices) < threshold;
+      })
+      .map((r) => r.match_id);
+    if (cheapIds.length === 0) {
+      alert(`Нет товаров дешевле ${threshold} AZN на этой странице`);
+      return;
+    }
+    if (!confirm(`Пропустить ${cheapIds.length} кластеров с ценой < ${threshold} AZN?`)) return;
+    setSkipped((s) => {
+      const next = new Set(s);
+      cheapIds.forEach((id) => next.add(id));
+      return next;
+    });
+  }
+
   return (
     <div className="space-y-6">
       <header className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
@@ -73,7 +111,7 @@ export default function AloeMatcherPage() {
         </div>
       </header>
 
-      <div className="flex flex-col md:flex-row gap-2">
+      <div className="flex flex-col md:flex-row md:flex-wrap gap-2">
         <select
           value={category}
           onChange={(e) => setCategory(e.target.value)}
@@ -82,10 +120,33 @@ export default function AloeMatcherPage() {
           <option value="">Все категории</option>
           {facetsQ.data?.categories.map((c) => (
             <option key={c.name} value={c.name}>
-              {c.name} ({c.count})
+              {c.label && c.label !== c.name ? c.label : c.name} ({c.count})
             </option>
           ))}
         </select>
+        <button
+          onClick={() => handleSkipCheap(5)}
+          className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50"
+          title="Скрыть кластеры с ценой < 5 AZN (мелочь — не приоритет)"
+        >
+          Пропустить дешёвые (&lt; 5 ₼)
+        </button>
+        <button
+          onClick={handleSkipAllOnPage}
+          className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50"
+          title="Скрыть всю текущую страницу"
+        >
+          Пропустить страницу
+        </button>
+        {skipped.size > 0 && (
+          <button
+            onClick={() => setSkipped(new Set())}
+            className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 text-muted-foreground"
+            title="Вернуть всех пропущенных в видимость"
+          >
+            Сброс ({skipped.size})
+          </button>
+        )}
       </div>
 
       {unmatchedQ.isLoading && (
@@ -126,9 +187,13 @@ function PairCard({
   onSkip: (matchId: number) => void;
 }) {
   const queryClient = useQueryClient();
-  const [search, setSearch] = useState(
-    pair.canonical_brand ? `${pair.canonical_brand} ${pair.canonical_name}` : pair.canonical_name,
-  );
+  // Авто-search: 2-3 первых слова имени (часто это бренд+название без дозировок).
+  // Раньше клеили `${brand} ${name}` что давало дубли ("Fluvir-Os Fluvir-OS suspenziya")
+  // и 0 результатов поиска. Короткий запрос даёт больше попаданий.
+  const [search, setSearch] = useState(() => {
+    const tokens = (pair.canonical_name || "").split(/\s+/).filter(Boolean);
+    return tokens.slice(0, 2).join(" ") || pair.canonical_brand || "";
+  });
   const debouncedSearch = useDebounce(search, 300);
   const [linkedProductId, setLinkedProductId] = useState<number | null>(null);
   const [linkError, setLinkError] = useState<string | null>(null);

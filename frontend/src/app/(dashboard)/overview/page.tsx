@@ -6,6 +6,7 @@ import { useState } from "react";
 import { api, type RunRow } from "@/lib/api";
 import { ActionRow } from "@/components/action-row";
 import { KpiCard } from "@/components/kpi-card";
+import { formatRelative } from "@/lib/utils";
 
 export default function OverviewPage() {
   const matchQ = useQuery({ queryKey: ["match-quality"], queryFn: api.matchQuality });
@@ -26,24 +27,27 @@ export default function OverviewPage() {
       {/* KPI cards */}
       <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
         <KpiCard
-          label="Cross-site matches"
+          label="Cross-site совпадений"
           value={matchQ.data?.total_matches ?? "—"}
           loading={matchQ.isLoading}
+          hint="Товары представленные на ≥ 2 сайтах"
         />
         <KpiCard
-          label="Coverage"
+          label="Покрытие"
           value={
             matchQ.data ? `${matchQ.data.coverage_pct.toFixed(1)}%` : "—"
           }
           loading={matchQ.isLoading}
+          hint="% продуктов с cross-site матчем"
         />
         <KpiCard
-          label="Products"
+          label="Всего продуктов"
           value={matchQ.data?.products_total ?? "—"}
           loading={matchQ.isLoading}
+          hint="Уникальных SKU во всех 3 сайтах"
         />
         <KpiCard
-          label="AI-normalized"
+          label="AI-нормализовано"
           value={
             normalizeQ.data
               ? `${normalizeQ.data.coverage_pct.toFixed(1)}%`
@@ -53,7 +57,7 @@ export default function OverviewPage() {
           hint={
             normalizeQ.data?.needs_review
               ? `${normalizeQ.data.needs_review} нужно проверить`
-              : undefined
+              : "Извлечены active_ingredient, dosage, pack"
           }
         />
       </div>
@@ -181,8 +185,8 @@ function RunRowExpandable({
           )}
         </td>
         <td className="px-3 py-2 font-mono text-xs">{run.id}</td>
-        <td className="px-3 py-2 text-muted-foreground">
-          {run.started_at?.slice(0, 16).replace("T", " ")}
+        <td className="px-3 py-2 text-muted-foreground" title={run.started_at ?? ""}>
+          {formatRelative(run.started_at)}
         </td>
         <td className="px-3 py-2 text-muted-foreground hidden sm:table-cell tabular-nums">
           {formatDuration(run.started_at, run.finished_at)}

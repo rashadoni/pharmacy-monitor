@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { X } from "lucide-react";
 import { api, type ComparisonRow } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
@@ -13,12 +13,24 @@ export default function ComparisonPage() {
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
   const [minSites, setMinSites] = useState(2);
+  const [diffOnly, setDiffOnly] = useState(true);
+  const [withAloe, setWithAloe] = useState(false);
   const queryClient = useQueryClient();
 
   const { data, isLoading, error, isFetching } = useQuery({
     queryKey: ["comparison", debouncedSearch, minSites],
     queryFn: () => api.comparison({ search: debouncedSearch, min_sites: minSites }),
   });
+
+  // Client-side filters поверх серверного результата
+  const filtered = useMemo(() => {
+    if (!data) return data;
+    return data.filter((r) => {
+      if (diffOnly && (!r.spread_pct || r.spread_pct < 0.5)) return false;
+      if (withAloe && !r.prices["aloe"]) return false;
+      return true;
+    });
+  }, [data, diffOnly, withAloe]);
 
   const rejectMutation = useMutation({
     mutationFn: (id: number) => api.rejectMatch(id),
@@ -66,13 +78,13 @@ export default function ComparisonPage() {
       </div>
 
       {/* Filters */}
-      <div className="flex flex-col md:flex-row gap-2">
+      <div className="flex flex-col md:flex-row md:flex-wrap gap-2">
         <input
           type="search"
           placeholder="🔎 Поиск (например: Friso, Nestle, Nutrilak)"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex-1 min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           data-testid="search-input"
         />
         <select
@@ -85,6 +97,30 @@ export default function ComparisonPage() {
           <option value={2}>≥ 2 сайтов (default)</option>
           <option value={1}>Все</option>
         </select>
+        <label
+          className="inline-flex items-center gap-2 text-sm px-3 py-2 rounded-md border border-input bg-background cursor-pointer select-none"
+          title="Только товары где spread > 0.5% (есть реальная разница между сайтами)"
+        >
+          <input
+            type="checkbox"
+            checked={diffOnly}
+            onChange={(e) => setDiffOnly(e.target.checked)}
+            className="h-4 w-4"
+          />
+          Только различия
+        </label>
+        <label
+          className="inline-flex items-center gap-2 text-sm px-3 py-2 rounded-md border border-input bg-background cursor-pointer select-none"
+          title="Только товары которые есть в каталоге aloe.az"
+        >
+          <input
+            type="checkbox"
+            checked={withAloe}
+            onChange={(e) => setWithAloe(e.target.checked)}
+            className="h-4 w-4"
+          />
+          Только с aloe
+        </label>
       </div>
 
       {/* Status */}
@@ -98,26 +134,27 @@ export default function ComparisonPage() {
           Ошибка загрузки данных
         </div>
       )}
-      {data && data.length === 0 && !isLoading && (
+      {filtered && filtered.length === 0 && !isLoading && (
         <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center" data-testid="empty">
-          По текущему фильтру ничего не найдено.
+          {data && data.length > 0
+            ? `По фильтрам ничего не найдено (всего матчей: ${data.length}). Снимите галочки выше.`
+            : "По текущему фильтру ничего не найдено."}
         </div>
       )}
 
       {/* Mobile: card list */}
       <div className="md:hidden space-y-2" data-testid="mobile-list">
-        {data?.map((row) => (
+        {filtered?.map((row) => (
           <ComparisonCard key={row.canonical_id} row={row} onReject={handleReject} />
         ))}
       </div>
 
-      {/* Desktop: table */}
+      {/* Desktop: table — Бренд column dropped (был дубликатом первого слова имени) */}
       <div className="hidden md:block rounded-lg border border-border overflow-hidden" data-testid="desktop-table">
         <table className="w-full text-sm">
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
               <th className="px-3 py-2 text-left">Название</th>
-              <th className="px-3 py-2 text-left">Бренд</th>
               {SITES.map((s) => (
                 <th key={s} className="px-3 py-2 text-right">
                   {s}
@@ -128,7 +165,7 @@ export default function ComparisonPage() {
             </tr>
           </thead>
           <tbody>
-            {data?.map((row) => (
+            {filtered?.map((row) => (
               <ComparisonRowDesktop
                 key={row.canonical_id}
                 row={row}
@@ -139,9 +176,12 @@ export default function ComparisonPage() {
         </table>
       </div>
 
-      {data && data.length > 0 && (
+      {filtered && filtered.length > 0 && (
         <div className="text-xs text-muted-foreground text-center" data-testid="result-count">
-          {data.length} матчей
+          {filtered.length} матчей
+          {data && filtered.length !== data.length && (
+            <span className="text-muted-foreground/60"> из {data.length}</span>
+          )}
         </div>
       )}
     </div>
@@ -158,11 +198,17 @@ function priceCell(row: ComparisonRow, site: string) {
       href={p.url}
       target="_blank"
       rel="noopener noreferrer"
-      className={`inline-block tabular-nums hover:underline ${
+      className={`inline-flex items-center gap-1 tabular-nums hover:underline ${
         isMin ? "text-success font-semibold" : isMax ? "text-destructive" : ""
       }`}
+      title={p.is_on_sale ? "Со скидкой" : undefined}
     >
       {formatPrice(p.price)}
+      {p.is_on_sale && (
+        <span className="text-[9px] rounded bg-warning/15 text-warning px-1 py-0.5 font-semibold uppercase">
+          sale
+        </span>
+      )}
     </a>
   );
 }
@@ -176,8 +222,14 @@ function ComparisonRowDesktop({
 }) {
   return (
     <tr className="border-t border-border hover:bg-muted/30 group">
-      <td className="px-3 py-2 max-w-md truncate">{row.name}</td>
-      <td className="px-3 py-2 text-muted-foreground">{row.brand ?? "—"}</td>
+      <td className="px-3 py-2 max-w-md truncate">
+        <div>{row.name}</div>
+        {row.brand && (
+          <div className="text-[11px] text-muted-foreground/70 truncate">
+            {row.brand}
+          </div>
+        )}
+      </td>
       {SITES.map((s) => (
         <td key={s} className="px-3 py-2 text-right">
           {priceCell(row, s)}
