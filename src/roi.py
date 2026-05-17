@@ -25,11 +25,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Literal
 
 import structlog
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
+
+from src._time import utcnow
 
 from src.storage import (
     Match,
@@ -97,6 +100,138 @@ def _preload_snapshots(session: Session, run_id: int) -> dict[int, "PriceSnapsho
     if not matched_pids:
         return {}
     return latest_snapshots_per_product(session, matched_pids)
+
+
+# ─── Persistent cache ────────────────────────────────────────────────────────
+# compute_actions для 3000+ матчей занимает 15-30с. HTTP-handler с таймаутом
+# 15с возвращал 408 на 4 экранах из 11 (P0.1 PO Audit). Решение:
+# pre-compute после scrape success → DB-cache → serve из кэша.
+
+# Cache freshness threshold. Старше — игнорируем, идём в inline compute как
+# fallback (с увеличенным backend-таймаутом).
+_CACHE_MAX_AGE_HOURS = 26
+
+
+def _action_to_dict(a: "ActionItem") -> dict:
+    """Сериализатор для кэша. Структура зеркалит HTTP response в api.py."""
+    return {
+        "type": a.type,
+        "severity": a.severity,
+        "title": a.title,
+        "detail": a.detail,
+        "product_name": a.product_name,
+        "product_url": a.product_url,
+        "current_value_azn": a.current_value_azn,
+        "target_value_azn": a.target_value_azn,
+        "unit_gap_azn": a.unit_gap_azn,
+        "spread_pct": a.spread_pct,
+        "estimated_monthly_impact_azn": a.estimated_monthly_impact_azn,
+        "competitor_site": a.competitor_site,
+        "competitor_url": a.competitor_url,
+        "extra": a.extra,
+    }
+
+
+def cache_actions(
+    session: Session,
+    client_site: str,
+    actions: list["ActionItem"],
+    *,
+    run_id: int | None = None,
+    tenant_id: int = 1,
+) -> None:
+    """Upsert pre-computed actions в `roi_actions_cache` для (tenant, client_site).
+
+    Безопасно вызывать многократно — UNIQUE(tenant_id, client_site) гарантирует
+    один row per срез. Никаких внешних зависимостей, sync операция.
+    """
+    from src.storage import RoiActionsCache
+
+    payload = [_action_to_dict(a) for a in actions]
+    existing = session.scalar(
+        select(RoiActionsCache).where(
+            RoiActionsCache.tenant_id == tenant_id,
+            RoiActionsCache.client_site == client_site,
+        )
+    )
+    if existing:
+        existing.payload = payload
+        existing.computed_at = utcnow()
+        existing.run_id = run_id
+    else:
+        session.add(
+            RoiActionsCache(
+                tenant_id=tenant_id,
+                client_site=client_site,
+                payload=payload,
+                computed_at=utcnow(),
+                run_id=run_id,
+            )
+        )
+    session.commit()
+    log.info(
+        "roi_actions_cached",
+        client_site=client_site,
+        count=len(payload),
+        run_id=run_id,
+    )
+
+
+def get_cached_actions(
+    session: Session,
+    client_site: str,
+    *,
+    tenant_id: int = 1,
+    max_age_hours: int = _CACHE_MAX_AGE_HOURS,
+) -> list[dict] | None:
+    """Прочитать кэш или вернуть None если stale/missing.
+
+    None означает caller должен fallback'нуться на inline compute_actions.
+    """
+    from src.storage import RoiActionsCache
+
+    row = session.scalar(
+        select(RoiActionsCache).where(
+            RoiActionsCache.tenant_id == tenant_id,
+            RoiActionsCache.client_site == client_site,
+        )
+    )
+    if row is None:
+        return None
+    age = utcnow() - row.computed_at
+    if age > timedelta(hours=max_age_hours):
+        log.info(
+            "roi_actions_cache_stale",
+            client_site=client_site,
+            age_hours=age.total_seconds() / 3600,
+        )
+        return None
+    return list(row.payload) if row.payload else []
+
+
+def refresh_all_cached_actions(
+    session: Session,
+    *,
+    run_id: int | None = None,
+    tenant_id: int = 1,
+) -> dict[str, int]:
+    """Пересчитать кэш для всех 3 сайтов. Вызывается из main.py после
+    persist_results (только если status=ok). Возвращает {site: count}.
+    """
+    out: dict[str, int] = {}
+    for site in ALL_SITES:
+        try:
+            actions = compute_actions(session, client_site=site)
+            cache_actions(session, site, actions, run_id=run_id, tenant_id=tenant_id)
+            out[site] = len(actions)
+        except Exception as e:
+            log.warning(
+                "roi_actions_cache_failed",
+                client_site=site,
+                error=str(e),
+            )
+            out[site] = -1
+    return out
 
 
 def compute_actions(

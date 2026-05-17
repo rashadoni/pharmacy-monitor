@@ -866,6 +866,251 @@ def dash_notifications_unbind_telegram(
     return Response(status_code=204)
 
 
+@app.post("/api/v1/dash/digest/send-test")
+def dash_digest_send_test(
+    kind: str = "daily",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Отправить test digest всем получателям с `daily_digest=true`.
+
+    Используется из Quick Actions меню. Тот же код что и cron-таймер,
+    просто on-demand. Только admin.
+    """
+    if user.role != "admin":
+        raise HTTPException(403, "Admin role required")
+    if kind not in ("daily", "weekly"):
+        raise HTTPException(400, "kind must be 'daily' or 'weekly'")
+    from src import notifications
+
+    try:
+        count = (
+            notifications.send_daily_digest(db, tenant_id=user.tenant_id)
+            if kind == "daily"
+            else notifications.send_weekly_digest(db, tenant_id=user.tenant_id)
+        )
+        log.info("digest_sent_manual", kind=kind, count=count, by_user_id=user.id)
+        return {"ok": True, "recipients_sent": count}
+    except Exception as e:
+        log.error("digest_send_failed", error=str(e))
+        raise HTTPException(500, f"Не удалось отправить: {e}")
+
+
+# ─── Recipients management (admin only) ──────────────────────────────────────
+# Управление получателями email-digest. Admin может добавить любого получателя
+# (клиента, бухгалтера, партнёра) с настройкой severity_min и opt-in для
+# daily/weekly. Каждый recipient это TenantUser с is_active=true. Digest-cron
+# собирает их через `daily_digest=true` и шлёт каждому отдельное письмо.
+
+
+class RecipientOut(BaseModel):
+    id: int
+    email: str
+    name: str | None
+    role: str
+    is_active: bool
+    daily_digest: bool
+    weekly_digest: bool
+    email_severity_min: str | None
+    telegram_chat_id: str | None
+    last_login_at: str | None
+    created_at: str | None
+
+
+class RecipientCreate(BaseModel):
+    email: str = Field(min_length=3, max_length=200)
+    name: str | None = None
+    role: str = "viewer"
+    daily_digest: bool = True
+    weekly_digest: bool = False
+    email_severity_min: str | None = "warning"
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: str) -> str:
+        v = v.strip().lower()
+        if "@" not in v or len(v) < 5:
+            raise ValueError("invalid email")
+        return v
+
+    @field_validator("role")
+    @classmethod
+    def _role(cls, v: str) -> str:
+        if v not in ("admin", "viewer"):
+            raise ValueError("role must be admin or viewer")
+        return v
+
+    @field_validator("email_severity_min")
+    @classmethod
+    def _sev(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if v not in ("off", "info", "warning", "critical"):
+            raise ValueError("severity must be off/info/warning/critical")
+        return v
+
+
+class RecipientUpdate(BaseModel):
+    name: str | None = None
+    role: str | None = None
+    is_active: bool | None = None
+    daily_digest: bool | None = None
+    weekly_digest: bool | None = None
+    email_severity_min: str | None = None
+
+    @field_validator("role")
+    @classmethod
+    def _role(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if v not in ("admin", "viewer"):
+            raise ValueError("role must be admin or viewer")
+        return v
+
+    @field_validator("email_severity_min")
+    @classmethod
+    def _sev(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if v not in ("off", "info", "warning", "critical"):
+            raise ValueError("severity must be off/info/warning/critical")
+        return v
+
+
+def _require_admin(user: storage.TenantUser) -> None:
+    if user.role != "admin":
+        raise HTTPException(403, "Admin role required")
+
+
+def _to_recipient_out(u: storage.TenantUser) -> RecipientOut:
+    return RecipientOut(
+        id=u.id,
+        email=u.email,
+        name=u.name,
+        role=u.role,
+        is_active=bool(u.is_active),
+        daily_digest=bool(u.daily_digest),
+        weekly_digest=bool(u.weekly_digest),
+        email_severity_min=u.email_severity_min,
+        telegram_chat_id=u.telegram_chat_id,
+        last_login_at=u.last_login_at.isoformat() if u.last_login_at else None,
+        created_at=u.created_at.isoformat() if u.created_at else None,
+    )
+
+
+@app.get("/api/v1/dash/recipients", response_model=list[RecipientOut])
+def dash_recipients_list(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user)
+    users = db.scalars(
+        select(storage.TenantUser)
+        .where(storage.TenantUser.tenant_id == user.tenant_id)
+        .order_by(desc(storage.TenantUser.created_at))
+    ).all()
+    return [_to_recipient_out(u) for u in users]
+
+
+@app.post("/api/v1/dash/recipients", response_model=RecipientOut)
+def dash_recipients_create(
+    payload: RecipientCreate,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user)
+    exists = db.scalar(
+        select(storage.TenantUser).where(
+            storage.TenantUser.tenant_id == user.tenant_id,
+            storage.TenantUser.email == payload.email,
+        )
+    )
+    if exists:
+        raise HTTPException(409, f"User with email {payload.email} already exists")
+
+    new_user = storage.TenantUser(
+        tenant_id=user.tenant_id,
+        email=payload.email,
+        name=payload.name,
+        role=payload.role,
+        is_active=True,
+        daily_digest=payload.daily_digest,
+        weekly_digest=payload.weekly_digest,
+        email_severity_min=payload.email_severity_min,
+        created_at=utcnow(),
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    log.info(
+        "recipient_created",
+        id=new_user.id, email=new_user.email, by_user_id=user.id,
+    )
+    return _to_recipient_out(new_user)
+
+
+@app.patch("/api/v1/dash/recipients/{recipient_id}", response_model=RecipientOut)
+def dash_recipients_update(
+    recipient_id: int,
+    payload: RecipientUpdate,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user)
+    r = db.scalar(
+        select(storage.TenantUser).where(
+            storage.TenantUser.id == recipient_id,
+            storage.TenantUser.tenant_id == user.tenant_id,
+        )
+    )
+    if not r:
+        raise HTTPException(404, "Recipient not found")
+    data = payload.model_dump(exclude_unset=True)
+    # Защита от self-lockout: нельзя демотнуть себя в viewer или деактивировать
+    if recipient_id == user.id:
+        if data.get("role") == "viewer":
+            raise HTTPException(
+                400, "Нельзя сменить себе роль на viewer — потеряете доступ к админке"
+            )
+        if data.get("is_active") is False:
+            raise HTTPException(400, "Нельзя деактивировать себя")
+    for k, v in data.items():
+        setattr(r, k, v)
+    db.commit()
+    db.refresh(r)
+    log.info(
+        "recipient_updated",
+        id=r.id, by_user_id=user.id, fields=list(data.keys()),
+    )
+    return _to_recipient_out(r)
+
+
+@app.delete("/api/v1/dash/recipients/{recipient_id}", status_code=204)
+def dash_recipients_delete(
+    recipient_id: int,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Soft delete — is_active=false + digest flags off. Лог сохраняется."""
+    _require_admin(user)
+    if recipient_id == user.id:
+        raise HTTPException(400, "Нельзя удалить себя")
+    r = db.scalar(
+        select(storage.TenantUser).where(
+            storage.TenantUser.id == recipient_id,
+            storage.TenantUser.tenant_id == user.tenant_id,
+        )
+    )
+    if not r:
+        raise HTTPException(404, "Recipient not found")
+    r.is_active = False
+    r.daily_digest = False
+    r.weekly_digest = False
+    db.commit()
+    log.info("recipient_deleted", id=r.id, by_user_id=user.id)
+    return Response(status_code=204)
+
+
 # ─── Frontend dashboard endpoints (JWT cookie) ───────────────────────────────
 
 
@@ -962,33 +1207,48 @@ def dash_comparison(
     return out
 
 
+_VALID_SITES = ("pharmonline", "aptekonline", "aloe")
+
+
+def _require_site(value: str) -> str:
+    if value not in _VALID_SITES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown site '{value}'. Allowed: {', '.join(_VALID_SITES)}",
+        )
+    return value
+
+
 @app.get("/api/v1/dash/roi/actions")
 def dash_roi_actions(
+    client_site: str = "pharmonline",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
+    """ROI actions для client_site.
+
+    P0.1 (PO Audit 2026-05-17): compute_actions для 3к матчей занимает 15-30с
+    и frontend timeout'ит на 15с (API 408 на 4 экранах). Сейчас читаем из
+    roi_actions_cache (pre-computed после каждого scrape success). Если кэш
+    отсутствует или старше 26ч — fallback inline compute (медленно, но даёт
+    данные новому tenant'у пока первый scrape не отработал).
+    """
     from src import roi
-    actions = roi.compute_actions(db)
-    return [
-        {
-            "type": a.type,
-            "severity": a.severity,
-            "title": a.title,
-            "detail": a.detail,
-            "product_name": a.product_name,
-            "product_url": a.product_url,
-            "current_value_azn": a.current_value_azn,
-            "target_value_azn": a.target_value_azn,
-            # Реальные цифры (per-unit gap + % spread). См. roi.py module
-            # docstring — почему больше не возвращаем «AZN/мес».
-            "unit_gap_azn": a.unit_gap_azn,
-            "spread_pct": a.spread_pct,
-            # Deprecated — всегда 0. Сохранено для backward-compat (telegram bot).
-            "estimated_monthly_impact_azn": a.estimated_monthly_impact_azn,
-            "competitor_site": a.competitor_site,
-        }
-        for a in actions
-    ]
+    _require_site(client_site)
+
+    cached = roi.get_cached_actions(db, client_site, tenant_id=user.tenant_id)
+    if cached is not None:
+        return cached
+
+    # Fallback: compute inline (медленно, но всегда даёт ответ)
+    actions = roi.compute_actions(db, client_site=client_site)
+    payload = [roi._action_to_dict(a) for a in actions]
+    # Лениво кэшируем — следующие запросы пойдут из БД
+    try:
+        roi.cache_actions(db, client_site, actions, tenant_id=user.tenant_id)
+    except Exception:
+        pass  # cache write не должен валить запрос
+    return payload
 
 
 @app.get("/api/v1/dash/alerts")
@@ -1040,14 +1300,86 @@ def dash_match_quality(
     }
 
 
+@app.get("/api/v1/dash/normalize/stats")
+def dash_normalize_stats(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Coverage AI-нормализатора и распределение match.strategy.
+
+    Используется на /overview как KPI здоровья. Когда coverage падает <80%,
+    это сигнал что промпт перестал работать на новых SKU или бюджет исчерпан.
+    """
+    products_total = db.scalar(
+        select(func.count(storage.Product.id))
+        .where(storage.Product.tenant_id == user.tenant_id)
+    ) or 0
+
+    products_normalized = db.scalar(
+        select(func.count(storage.Product.id))
+        .where(
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.normalized_attrs.is_not(None),
+        )
+    ) or 0
+
+    # needs_review требует читать JSON — делаем загрузку и фильтр в python,
+    # так как Postgres jsonb operators недоступны в SQLite (dev). На проде
+    # это ~2K rows max, безопасно.
+    needs_review_rows = db.scalars(
+        select(storage.Product.normalized_attrs)
+        .where(
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.normalized_attrs.is_not(None),
+        )
+    ).all()
+    needs_review = sum(
+        1 for attrs in needs_review_rows
+        if isinstance(attrs, dict) and attrs.get("needs_review")
+    )
+
+    last_normalized_at = db.scalar(
+        select(func.max(storage.Product.normalized_at))
+        .where(storage.Product.tenant_id == user.tenant_id)
+    )
+
+    # Распределение matches по стратегии
+    strategy_rows = db.execute(
+        select(storage.Match.match_strategy, func.count(storage.Match.id))
+        .where(storage.Match.tenant_id == user.tenant_id)
+        .group_by(storage.Match.match_strategy)
+    ).all()
+    matches_by_strategy = {
+        (row[0] or "unknown"): row[1] for row in strategy_rows
+    }
+
+    coverage_pct = (
+        round(products_normalized / products_total * 100, 1)
+        if products_total else 0.0
+    )
+    return {
+        "products_total": products_total,
+        "products_normalized": products_normalized,
+        "needs_review": needs_review,
+        "coverage_pct": coverage_pct,
+        "last_normalized_at": (
+            last_normalized_at.isoformat() if last_normalized_at else None
+        ),
+        "matches_by_strategy": matches_by_strategy,
+    }
+
+
 @app.get("/api/v1/dash/brand-share")
 def dash_brand_share(
     top_n: int = 30,
+    site: str | None = None,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
     from src import analytics
-    rows = analytics.brand_share(db, top_n=top_n)
+    if site is not None:
+        _require_site(site)
+    rows = analytics.brand_share(db, top_n=top_n, site=site)
     return [
         {
             "brand": r.brand,
@@ -1062,11 +1394,13 @@ def dash_brand_share(
 
 @app.get("/api/v1/dash/price-index")
 def dash_price_index(
+    client_site: str = "pharmonline",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
     from src import analytics
-    rows = analytics.price_index_by_category(db)
+    _require_site(client_site)
+    rows = analytics.price_index_by_category(db, client_site=client_site)
     return [
         {
             "category": getattr(r, "category", None),
@@ -1079,6 +1413,86 @@ def dash_price_index(
     ]
 
 
+@app.get("/api/v1/dash/products/{product_id}/price-history")
+def dash_product_price_history(
+    product_id: int,
+    days: int = 30,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """История цен одного продукта за последние N дней (sparkline data).
+
+    Для каждого дня берётся latest snapshot этого продукта в данных сутках
+    (UTC). Возвращает массив `[{date, price, is_on_sale}]` отсортированный
+    по дате asc. Пустые дни пропускаются (без интерполяции — клиент рисует
+    sparkline как-есть).
+    """
+    days = max(1, min(days, 365))
+    cutoff = utcnow() - timedelta(days=days)
+
+    product = db.scalar(
+        select(storage.Product).where(
+            storage.Product.id == product_id,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    )
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    rows = db.execute(
+        select(
+            func.date(storage.PriceSnapshot.captured_at).label("d"),
+            func.max(storage.PriceSnapshot.captured_at).label("ts"),
+        )
+        .where(
+            storage.PriceSnapshot.product_id == product_id,
+            storage.PriceSnapshot.captured_at >= cutoff,
+        )
+        .group_by("d")
+        .order_by("d")
+    ).all()
+    timestamps = [r.ts for r in rows]
+    if not timestamps:
+        return {"product_id": product_id, "site": product.site, "points": []}
+
+    snaps = db.scalars(
+        select(storage.PriceSnapshot).where(
+            storage.PriceSnapshot.product_id == product_id,
+            storage.PriceSnapshot.captured_at.in_(timestamps),
+        )
+    ).all()
+    points = sorted(
+        [
+            {
+                "date": s.captured_at.date().isoformat(),
+                "price": s.discount_price or s.price,
+                "is_on_sale": bool(s.is_on_sale),
+            }
+            for s in snaps
+            if (s.discount_price or s.price) is not None
+        ],
+        key=lambda p: p["date"],
+    )
+
+    # delta % за период
+    delta_pct = None
+    if len(points) >= 2:
+        first = points[0]["price"]
+        last = points[-1]["price"]
+        if first:
+            delta_pct = round((last - first) / first * 100, 1)
+
+    return {
+        "product_id": product_id,
+        "site": product.site,
+        "name": product.name,
+        "days": days,
+        "points": points,
+        "delta_pct": delta_pct,
+        "current": points[-1]["price"] if points else None,
+    }
+
+
 @app.get("/api/v1/dash/forecast/movers")
 def dash_forecast_movers(
     limit: int = 20,
@@ -1088,6 +1502,207 @@ def dash_forecast_movers(
     from src import forecast
     movers = forecast.top_movers(db, limit=limit)
     return movers
+
+
+@app.get("/api/v1/dash/products")
+def dash_products(
+    site: str,
+    category: str | None = None,
+    brand: str | None = None,
+    search: str | None = None,
+    on_sale: bool | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Список продуктов одного сайта с актуальной ценой.
+
+    Используется страницей /aloe (и потенциально /pharmonline, /aptekonline).
+    Возвращает latest snapshot per product (diff-only-aware).
+    """
+    _require_site(site)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    stmt = (
+        select(storage.Product)
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+        .order_by(desc(storage.Product.last_seen_at))
+    )
+    if category:
+        stmt = stmt.where(storage.Product.category == category)
+    if brand:
+        stmt = stmt.where(storage.Product.brand == brand)
+    if search:
+        like = f"%{search.lower()}%"
+        stmt = stmt.where(
+            storage.Product.name.ilike(like)
+            | storage.Product.brand.ilike(like)
+        )
+
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+
+    products = db.scalars(stmt.offset(offset).limit(limit)).all()
+    if not products:
+        return {"items": [], "total": total, "limit": limit, "offset": offset}
+
+    snaps_by_pid = storage.latest_snapshots_per_product(db, [p.id for p in products])
+
+    items = []
+    for p in products:
+        snap = snaps_by_pid.get(p.id)
+        eff_price = (snap.discount_price or snap.price) if snap else None
+        if on_sale is not None:
+            is_sale = bool(snap and snap.is_on_sale) if snap else False
+            if on_sale != is_sale:
+                continue
+        items.append({
+            "id": p.id,
+            "external_id": p.external_id,
+            "name": p.name,
+            "brand": p.brand,
+            "category": p.category,
+            "url": p.url,
+            "image_url": p.image_url,
+            "price": snap.price if snap else None,
+            "discount_price": snap.discount_price if snap else None,
+            "effective_price": eff_price,
+            "is_on_sale": bool(snap and snap.is_on_sale) if snap else False,
+            "last_seen_at": p.last_seen_at.isoformat() if p.last_seen_at else None,
+        })
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/v1/dash/products/facets")
+def dash_products_facets(
+    site: str,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Уникальные категории/бренды одного сайта — для UI-фильтров.
+
+    Возвращает счётчики per-category и per-brand, отсортированные desc.
+    Лёгкая операция: один GROUP BY на сайт.
+    """
+    _require_site(site)
+
+    cat_rows = db.execute(
+        select(storage.Product.category, func.count(storage.Product.id))
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.category.is_not(None),
+        )
+        .group_by(storage.Product.category)
+        .order_by(desc(func.count(storage.Product.id)))
+    ).all()
+
+    brand_rows = db.execute(
+        select(storage.Product.brand, func.count(storage.Product.id))
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.brand.is_not(None),
+        )
+        .group_by(storage.Product.brand)
+        .order_by(desc(func.count(storage.Product.id)))
+        .limit(100)
+    ).all()
+
+    # Lookup slug → label_ru: Category.{site}_slug → Category.label_ru
+    # Slug-format на каждом сайте свой, но Category-таблица их связывает.
+    slug_col = {
+        "pharmonline": storage.Category.pharmonline_slug,
+        "aptekonline": storage.Category.aptekonline_slug,
+        "aloe": storage.Category.aloe_slug,
+    }[site]
+    label_rows = db.execute(
+        select(slug_col, storage.Category.label_ru).where(slug_col.is_not(None))
+    ).all()
+    slug_to_label = {s: lbl for s, lbl in label_rows if s and lbl}
+
+    def _filter_internal(name: str) -> bool:
+        """Скрыть технические category-маркеры из UI (e.g. product_field=bestseller)."""
+        return not (name.startswith("product_field=") or name.startswith("__"))
+
+    return {
+        "categories": [
+            {"name": c, "label": slug_to_label.get(c) or c, "count": n}
+            for c, n in cat_rows
+            if c and _filter_internal(c)
+        ],
+        "brands": [{"name": b, "count": n} for b, n in brand_rows if b],
+    }
+
+
+@app.get("/api/v1/dash/products/summary")
+def dash_products_summary(
+    site: str,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """KPI-карточки страницы сайта: всего продуктов, брендов, exclusive, %sale.
+
+    Использует latest snapshot per product (diff-only-aware) для подсчёта
+    `% on_sale`. Exclusive_brands считается через brand_share с site=… —
+    переиспользует общую логику.
+    """
+    _require_site(site)
+    from src import analytics
+
+    total_products = db.scalar(
+        select(func.count(storage.Product.id))
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    ) or 0
+
+    total_brands = db.scalar(
+        select(func.count(func.distinct(storage.Product.brand)))
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.brand.is_not(None),
+        )
+    ) or 0
+
+    brand_rows = analytics.brand_share(db, top_n=10_000, site=site)
+    exclusive_brands = sum(1 for r in brand_rows if r.exclusive_to == site)
+
+    pids = db.scalars(
+        select(storage.Product.id).where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    ).all()
+    snaps_by_pid = storage.latest_snapshots_per_product(db, pids)
+    on_sale = sum(1 for s in snaps_by_pid.values() if s.is_on_sale)
+    on_sale_pct = round(on_sale / total_products * 100, 1) if total_products else 0.0
+
+    last_run = db.scalar(
+        select(storage.Run)
+        .where(
+            storage.Run.status == "ok",
+            storage.Run.tenant_id == user.tenant_id,
+        )
+        .order_by(desc(storage.Run.id))
+        .limit(1)
+    )
+
+    return {
+        "total_products": total_products,
+        "total_brands": total_brands,
+        "exclusive_brands": exclusive_brands,
+        "on_sale_count": on_sale,
+        "on_sale_pct": on_sale_pct,
+        "last_run_at": last_run.started_at.isoformat() if last_run and last_run.started_at else None,
+        "last_run_id": last_run.id if last_run else None,
+    }
 
 
 @app.get("/api/v1/dash/runs")
@@ -1255,6 +1870,279 @@ def dash_match_reject(
     db.delete(match)
     db.commit()
     return Response(status_code=204)
+
+
+# ─── Manual aloe-matcher endpoints ───────────────────────────────────────────
+# Дополняет AI-нормализатор: human-in-the-loop для needs_review хвоста и для
+# продуктов где AI не сработал. Поток: пользователь выбирает категорию, видит
+# pharmonline/aptekonline продукты без aloe в кластере → ищет aloe-аналог →
+# одним кликом привязывает к существующему Match.
+
+
+@app.get("/api/v1/dash/unmatched-pairs")
+def dash_unmatched_pairs(
+    site: str,
+    category: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Match-кластеры, в которых отсутствует продукт указанного `site`.
+
+    Используется UI /aloe-matcher: показать ph/apt продукты, которым ручник
+    может найти aloe-аналог. Фильтр `category` — по anchor-продукту в кластере.
+    """
+    _require_site(site)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    # Подзапрос: match_id'ы где УЖЕ есть продукт с этим site
+    has_site_subq = (
+        select(storage.Product.canonical_id)
+        .where(
+            storage.Product.site == site,
+            storage.Product.canonical_id.is_not(None),
+            storage.Product.tenant_id == user.tenant_id,
+        )
+        .distinct()
+        .subquery()
+    )
+
+    # Базовый набор matches: tenant + НЕТ в has_site_subq + есть хотя бы 1 product
+    stmt = (
+        select(storage.Match)
+        .where(
+            storage.Match.tenant_id == user.tenant_id,
+            storage.Match.id.not_in(select(has_site_subq.c.canonical_id)),
+        )
+        .order_by(storage.Match.id.desc())
+    )
+    matches = list(db.scalars(stmt).all())
+
+    if category:
+        matches = [
+            m for m in matches
+            if any((p.category or "") == category for p in m.products)
+        ]
+
+    matches = [m for m in matches if m.products]
+    total = len(matches)
+    page = matches[offset : offset + limit]
+
+    items = []
+    for m in page:
+        anchors = []
+        for p in m.products:
+            snap = None
+            if p.snapshots:
+                snap = max(p.snapshots, key=lambda s: s.captured_at)
+            price = (snap.discount_price or snap.price) if snap else None
+            anchors.append({
+                "product_id": p.id,
+                "site": p.site,
+                "name": p.name,
+                "brand": p.brand,
+                "category": p.category,
+                "url": p.url,
+                "price": price,
+            })
+        items.append({
+            "match_id": m.id,
+            "canonical_name": m.canonical_name,
+            "canonical_brand": m.canonical_brand,
+            "canonical_dosage": m.canonical_dosage,
+            "canonical_pack_size": m.canonical_pack_size,
+            "anchor_products": anchors,
+        })
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/v1/dash/matcher/counts")
+def dash_matcher_counts(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Кол-во unmatched кластеров для каждого из 3 сайтов.
+
+    Кластер считается «unmatched для сайта S», если в нём нет продукта с S.
+    Используется UI /matcher для бейджей-счётчиков в site selector — оператор
+    сразу видит, по какому сайту больше работы.
+
+    Возвращает: ``{"aloe": N, "pharmonline": M, "aptekonline": K}``.
+    """
+    out: dict[str, int] = {}
+    # Подмножество match_id'ов, у которых вообще есть хотя бы 1 продукт (защита
+    # от пустых orphaned Match'ей, которых не должно быть, но bы).
+    has_any_product_subq = (
+        select(storage.Product.canonical_id)
+        .where(
+            storage.Product.canonical_id.is_not(None),
+            storage.Product.tenant_id == user.tenant_id,
+        )
+        .distinct()
+        .subquery()
+    )
+    for site in _VALID_SITES:
+        has_site_subq = (
+            select(storage.Product.canonical_id)
+            .where(
+                storage.Product.site == site,
+                storage.Product.canonical_id.is_not(None),
+                storage.Product.tenant_id == user.tenant_id,
+            )
+            .distinct()
+            .subquery()
+        )
+        count = db.scalar(
+            select(func.count(storage.Match.id)).where(
+                storage.Match.tenant_id == user.tenant_id,
+                storage.Match.id.in_(select(has_any_product_subq.c.canonical_id)),
+                storage.Match.id.not_in(select(has_site_subq.c.canonical_id)),
+            )
+        )
+        out[site] = int(count or 0)
+    return out
+
+
+class _AddProductPayload(BaseModel):
+    product_id: int = Field(gt=0)
+
+
+@app.post("/api/v1/dash/matches/{match_id}/add-product")
+def dash_match_add_product(
+    match_id: int,
+    payload: _AddProductPayload,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Привязать продукт к существующему Match.
+
+    Валидация:
+    - Match существует и принадлежит tenant'у
+    - Product существует, tenant'у, не в этом кластере уже
+    - В кластере ещё нет продукта с тем же site (one product per site per match)
+    - Если product был в другом match'е — переезжает (старый match теряет связь)
+    Метит Match.is_manual=True (ручной выбор → защищён от auto-перематчивания).
+    """
+    match = db.scalar(
+        select(storage.Match).where(
+            storage.Match.id == match_id,
+            storage.Match.tenant_id == user.tenant_id,
+        )
+    )
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    product = db.scalar(
+        select(storage.Product).where(
+            storage.Product.id == payload.product_id,
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    )
+    if not product:
+        raise HTTPException(404, "Product not found")
+
+    if product.canonical_id == match.id:
+        raise HTTPException(400, "Product already in this match")
+
+    existing_sites = {p.site for p in match.products}
+    if product.site in existing_sites:
+        raise HTTPException(
+            409, f"Match already has a product from {product.site}"
+        )
+
+    product.canonical_id = match.id
+    match.is_manual = True
+    match.match_strategy = "manual"
+    if match.confidence is None or match.confidence < 1.0:
+        match.confidence = 1.0
+    db.commit()
+
+    log.info(
+        "match_product_added",
+        match_id=match.id,
+        product_id=product.id,
+        user_id=user.id,
+        site=product.site,
+    )
+
+    db.refresh(match)
+    return {
+        "match_id": match.id,
+        "canonical_name": match.canonical_name,
+        "is_manual": match.is_manual,
+        "match_strategy": match.match_strategy,
+        "products": [
+            {"product_id": p.id, "site": p.site, "name": p.name, "url": p.url}
+            for p in match.products
+        ],
+    }
+
+
+class _CreateMatchPayload(BaseModel):
+    product_ids: list[int] = Field(min_length=2, max_length=10)
+
+
+@app.post("/api/v1/dash/matches/create-with-products")
+def dash_match_create_with_products(
+    payload: _CreateMatchPayload,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Создать новый Match с заданными продуктами (manual cluster).
+
+    Полезно когда оба anchor-продукта были unmatched (нет существующего
+    кластера). Берёт canonical_name/brand/... из первого продукта. Метит
+    is_manual=True. Возвращает созданный Match.
+    """
+    products = list(db.scalars(
+        select(storage.Product).where(
+            storage.Product.id.in_(payload.product_ids),
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    ).all())
+    if len(products) != len(payload.product_ids):
+        raise HTTPException(404, "One or more products not found")
+
+    sites = [p.site for p in products]
+    if len(set(sites)) != len(sites):
+        raise HTTPException(409, "Products must come from distinct sites")
+
+    first = products[0]
+    match = storage.Match(
+        tenant_id=user.tenant_id,
+        canonical_name=first.name,
+        canonical_brand=first.brand,
+        canonical_dosage=first.dosage,
+        canonical_pack_size=first.pack_size,
+        confidence=1.0,
+        is_manual=True,
+        match_strategy="manual",
+    )
+    db.add(match)
+    db.flush()
+    for p in products:
+        p.canonical_id = match.id
+    db.commit()
+    db.refresh(match)
+
+    log.info(
+        "match_created_manual",
+        match_id=match.id,
+        product_ids=[p.id for p in products],
+        user_id=user.id,
+    )
+    return {
+        "match_id": match.id,
+        "canonical_name": match.canonical_name,
+        "is_manual": True,
+        "match_strategy": "manual",
+        "products": [
+            {"product_id": p.id, "site": p.site, "name": p.name, "url": p.url}
+            for p in match.products
+        ],
+    }
 
 
 @app.get("/api/v1/dash/watchlist")

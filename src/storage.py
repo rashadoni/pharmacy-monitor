@@ -345,6 +345,41 @@ class AlertEvent(Base):
     tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
 
 
+class RoiActionsCache(Base):
+    """Pre-computed ROI actions per (tenant, client_site).
+
+    `roi.compute_actions` делает N+1 SQL по матчам — 15-30с для 3к матчей.
+    Frontend timeout'ит на 15с (`/dash/roi/actions`), показывая 408 на 4
+    страницах из 11 (P0.1 в PO Audit 2026-05-17).
+
+    Решение: compute_actions запускается в фоне после успешного `persist_results`
+    (см. `src/main.py:_refresh_roi_cache`). HTTP-handler читает payload здесь —
+    JSON-сериализованный list[ActionItem]. Если cache отсутствует или
+    `computed_at` старше 26 часов (∼суточный cron + jitter) — fallback на
+    inline compute с увеличенным таймаутом.
+
+    Один row per (tenant_id, client_site). Upsert при каждом scrape success.
+    """
+
+    __tablename__ = "roi_actions_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    client_site: Mapped[str] = mapped_column(String(32))
+    # JSON-сериализованный list[dict] — те же поля что в HTTP-response API.
+    # Структура совпадает с ActionItem (см. src/roi.py).
+    payload: Mapped[list] = mapped_column(JSON)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, index=True
+    )
+    # Какой `Run.id` сгенерил кэш — для отладки «откуда устаревшие цифры»
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "client_site", name="uq_roi_cache_tenant_site"),
+    )
+
+
 class TrackedProduct(Base):
     """Конкретные SKU из watchlist клиента. Каждая запись — товар, который надо отслеживать.
 

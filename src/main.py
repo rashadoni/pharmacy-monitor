@@ -1470,6 +1470,22 @@ def run_cmd(
             run.finished_at = utcnow()
             session.commit()
             log.info("run_ok", run_id=run_id, products=count)
+
+            # P0.1 (PO Audit 2026-05-17): pre-compute ROI actions для всех 3
+            # сайтов и сохранить в roi_actions_cache. HTTP-handler
+            # /dash/roi/actions читает оттуда → <50мс latency вместо
+            # 15-30с inline compute (timeout'ило с 408 на 4 экранах).
+            # Fail-soft — ошибка не валит run, max 5-10с overhead на пересчёт.
+            try:
+                from src import roi as _roi
+                summary = _roi.refresh_all_cached_actions(session, run_id=run_id)
+                log.info("roi_cache_refreshed", run_id=run_id, **summary)
+            except Exception as cache_err:
+                log.warning(
+                    "roi_cache_refresh_failed",
+                    run_id=run_id,
+                    error=str(cache_err),
+                )
         except Exception as e:
             run.status = "failed"
             run.error_message = f"{type(e).__name__}: {e}"
