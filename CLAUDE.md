@@ -95,6 +95,31 @@ This protocol applies to tasks that change code. Trivial read-only operations (s
 
 Гибрид: **aloe** на проде (direct, 03:00 UTC), **pharmonline + aptekonline** с Mac launchd (14:00 UTC = 18:00 Asia/Baku). Прод-таймер pharmonline отключён 2026-05-11 (ScraperAPI default pool стабильно отдавал 0 продуктов — фантомные runs шумели в логах). Aptekonline-таймер на проде отключён 2026-05-08 (HTTP 403 от ScraperAPI default pool — нужен residential = Hobby $49/мес).
 
+> **🛠 PENDING CUTOVER: все 3 сайта на прод через ScraperAPI Hobby (2026-05-18)**
+>
+> Диагноз Mac launchd setup'а (выявлен 2026-05-18 разбором runs table):
+> - launchd job сам фaерится каждый день в 14:00 UTC — НЕ проблема расписания
+> - **4 из 7 последних запусков (11/13/14/16 мая) лажали** из-за SSH-tunnel:
+>   stale tunnel на :5433, server-closed-connection mid-run, network blips
+> - На дашборде это маскировалось как 4× «failed» (zombie cleanup'ы), хотя реально fail rate автоматики = 0% (только реальные prod runs учитываются)
+> - **Reality check**: `creditsLeft = 0` на ScraperAPI (5029/5000 free trial исчерпан 17 мая)
+>
+> Hard fix: upgrade ScraperAPI до Hobby ($49/мес, 100K credits, residential pool).
+> Cutover скрипт готов: [infra/scripts/cutover-to-prod-scrapers.sh](infra/scripts/cutover-to-prod-scrapers.sh).
+>
+> Step-by-step:
+> 1. PO upgrade'ит на https://dashboard.scraperapi.com/billing → Hobby plan
+> 2. `ssh root@46.225.149.52 'cd /opt/pharmacy-monitor && bash infra/scripts/cutover-to-prod-scrapers.sh'`
+> 3. Скрипт делает: verify credits → smoke pharmonline → enable timer → smoke aptekonline → enable timer
+> 4. На Mac: `launchctl unload ~/Library/LaunchAgents/com.pharmacy-monitor.scrape.plist`
+> 5. Через 24-30 часов проверить https://leaddrive.cloud/overview → «Свежесть scrape» зелёная везде
+>
+> Defensive fixes к `run-scrape.sh` УЖЕ применены (на случай возврата к Mac launchd):
+> - kill stale tunnel на :5433 перед новым bind (фикс кейса 11 мая)
+> - trap EXIT — всегда логировать end-маркер (раньше script тихо умирал)
+> - `psql -tAc 'SELECT 1'` вместо `nc -z` для tunnel health check (ловит PG handshake failures)
+> - `ServerAliveCountMax=3` — SSH сам умирает за 90с tunnel-silence вместо часовой агонии
+
 | Сайт | Где | Чем | Расписание |
 |---|---|---|---|
 | **aloe.az** | Hetzner prod | Playwright DOM (см. [src/scrapers/aloe.py](src/scrapers/aloe.py)) | systemd timer `pharmacy-monitor-scrape@aloe` 03:00 UTC, direct |

@@ -19,7 +19,9 @@
 #   security add-generic-password -a pm -s pharmacy-monitor-db -w '<pg_password>'
 #
 
-set -euo pipefail
+set -uo pipefail   # NB: `set -e` снят — нужно ловить exit code финального
+                   # scrape'а и логировать end-маркер. Errors всё равно
+                   # вылавливаются явно через `|| true` / `if`.
 
 # ── Config ──────────────────────────────────────────────────────────────────
 PROJECT_DIR="${PROJECT_DIR:-/Users/rashadrahimov/pharmacy-monitor}"
@@ -45,7 +47,34 @@ mkdir -p "$(dirname "$LOG_FILE")"
 exec >>"$LOG_FILE" 2>&1
 echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | run-scrape.sh start ====="
 
+# Trap EXIT — всегда логируем end-маркер с реальным exit-code.
+# Раньше при `set -e` script тихо умирал на крэше скрейпа, без end-лога.
+# Теперь даже на необработанной ошибке последняя строка лога будет:
+#    «===== ... | run-scrape.sh end (exit N) =====»
+SCRIPT_START_PID=$$
+on_exit() {
+    local code=$?
+    cleanup_tunnel || true
+    echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | run-scrape.sh end (exit $code) ====="
+    exit $code
+}
+trap on_exit EXIT INT TERM
+
 cd "$PROJECT_DIR"
+
+# ── Pre-flight: убить stale tunnel'ы на нашем порту ─────────────────────────
+# Кейс 11 мая: предыдущий run-scrape.sh упал, оставил SSH-туннель в фоне,
+# новый запуск получил `bind 127.0.0.1:5433: Address already in use` и
+# полностью провалился. Защита — kill всех процессов на нашем порту.
+if command -v lsof >/dev/null 2>&1; then
+    STALE_PIDS=$(lsof -ti :"$LOCAL_PG_PORT" 2>/dev/null || true)
+    if [[ -n "$STALE_PIDS" ]]; then
+        echo "WARN: port $LOCAL_PG_PORT занят PIDs: $STALE_PIDS — убиваю stale tunnel'ы"
+        # shellcheck disable=SC2086
+        kill -9 $STALE_PIDS 2>/dev/null || true
+        sleep 2
+    fi
+fi
 
 # ── Keep Mac awake пока скрейп работает ────────────────────────────────────
 # launchd's StartCalendarInterval=18:00 не разбудит Mac если он в sleep, но
@@ -76,13 +105,12 @@ fi
 
 # ── Open SSH tunnel ─────────────────────────────────────────────────────────
 TUNNEL_PID=""
-cleanup() {
+cleanup_tunnel() {
     if [[ -n "$TUNNEL_PID" ]] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
         kill "$TUNNEL_PID" 2>/dev/null || true
         echo "tunnel pid=$TUNNEL_PID closed"
     fi
 }
-trap cleanup EXIT INT TERM
 
 # Retry: до 3 попыток с экспоненциальной задержкой (network blip / интернет
 # поднимается медленнее launchd timer / SSH banner exchange timeout).
@@ -96,18 +124,26 @@ for attempt in $(seq 1 $TUNNEL_ATTEMPTS); do
     fi
 
     echo "tunnel attempt $attempt/$TUNNEL_ATTEMPTS …"
+    # ServerAliveCountMax=3 — после 3× 30с пингов без ответа (90с) SSH сам
+    # умирает; раньше тоннель мог часами числиться «живым» но реально DB
+    # writes уже отлетали с «server closed connection unexpectedly».
     ssh -i "$SSH_KEY" -N -L "$LOCAL_PG_PORT:localhost:5432" \
         -o ExitOnForwardFailure=yes \
         -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=3 \
         -o ConnectTimeout=15 \
         -o StrictHostKeyChecking=accept-new \
         "$PROD_USER@$PROD_HOST" &
     TUNNEL_PID=$!
     echo "  tunnel pid=$TUNNEL_PID port=$LOCAL_PG_PORT"
 
-    # Ждём подъёма порта до 15с
+    # Ждём подъёма порта + реальный PG-handshake. `nc -z` подтверждает
+    # только TCP listen — но если БД на проде не дала handshake (например
+    # ScraperAPI scrape залип так что Postgres под нагрузкой), мы поймаем
+    # это только при первой query через час. Лучше явный SELECT 1 здесь.
     for i in {1..30}; do
-        if nc -z localhost "$LOCAL_PG_PORT" 2>/dev/null; then
+        if PGPASSWORD="$PG_PASS" psql -h localhost -p "$LOCAL_PG_PORT" \
+                -U pm -d pharmacy_monitor -tAc 'SELECT 1' >/dev/null 2>&1; then
             TUNNEL_OK=1
             break
         fi
@@ -120,7 +156,7 @@ for attempt in $(seq 1 $TUNNEL_ATTEMPTS); do
     done
 
     if [[ $TUNNEL_OK -eq 1 ]]; then
-        echo "  tunnel up on attempt $attempt"
+        echo "  tunnel up on attempt $attempt (PG handshake confirmed)"
         break
     fi
 
@@ -146,8 +182,9 @@ if [[ ${#ARGS[@]} -eq 0 ]]; then
 fi
 
 echo "running: pharmacy-monitor run ${ARGS[*]}"
+# NB: end-marker логируется через trap on_exit, не здесь — даже при
+# unexpected exit (signal, OOM) лог получит «end (exit N)».
 .venv/bin/pharmacy-monitor run "${ARGS[@]}"
 EXIT_CODE=$?
 
-echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | run-scrape.sh end (exit $EXIT_CODE) ====="
 exit $EXIT_CODE
