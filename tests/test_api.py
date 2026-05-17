@@ -910,6 +910,53 @@ def test_dash_recipients_cannot_delete_self(
     assert r.status_code == 400
 
 
+def test_dash_recipients_cannot_self_demote_to_viewer(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Защита от lockout: admin не может сменить себе роль на viewer."""
+    r = client.patch(
+        f"/api/v1/dash/recipients/{tenant_user.id}",
+        json={"role": "viewer"},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 400
+    assert "viewer" in r.json()["detail"].lower() or "роль" in r.json()["detail"]
+
+
+def test_dash_recipients_cannot_self_deactivate(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Нельзя is_active=false для себя — потеряете доступ."""
+    r = client.patch(
+        f"/api/v1/dash/recipients/{tenant_user.id}",
+        json={"is_active": False},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 400
+
+
+def test_dash_recipients_can_change_other_admin_role(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Можно менять роль другого admin (вдвоём решат кто остаётся)."""
+    # Create another admin
+    cr = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "other@admin.com", "role": "admin"},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    other_id = cr.json()["id"]
+
+    # Can demote them to viewer
+    ur = client.patch(
+        f"/api/v1/dash/recipients/{other_id}",
+        json={"role": "viewer"},
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert ur.status_code == 200
+    assert ur.json()["role"] == "viewer"
+
+
 def test_dash_recipients_requires_auth(client):
     r = client.get("/api/v1/dash/recipients")
     assert r.status_code == 401

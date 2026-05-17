@@ -1036,6 +1036,14 @@ def dash_recipients_update(
     if not r:
         raise HTTPException(404, "Recipient not found")
     data = payload.model_dump(exclude_unset=True)
+    # Защита от self-lockout: нельзя демотнуть себя в viewer или деактивировать
+    if recipient_id == user.id:
+        if data.get("role") == "viewer":
+            raise HTTPException(
+                400, "Нельзя сменить себе роль на viewer — потеряете доступ к админке"
+            )
+        if data.get("is_active") is False:
+            raise HTTPException(400, "Нельзя деактивировать себя")
     for k, v in data.items():
         setattr(r, k, v)
     db.commit()

@@ -10,10 +10,12 @@ type Severity = "off" | "info" | "warning" | "critical";
 
 export default function RecipientsPage() {
   const [showCreate, setShowCreate] = useState(false);
+  const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
   const recipientsQ = useQuery({
     queryKey: ["recipients"],
     queryFn: api.recipients,
   });
+  const currentUserId = meQ.data?.id ?? -1;
 
   return (
     <div className="space-y-6">
@@ -68,7 +70,11 @@ export default function RecipientsPage() {
               </thead>
               <tbody>
                 {recipientsQ.data.map((r) => (
-                  <RecipientRow key={r.id} recipient={r} />
+                  <RecipientRow
+                    key={r.id}
+                    recipient={r}
+                    isSelf={r.id === currentUserId}
+                  />
                 ))}
                 {recipientsQ.data.length === 0 && (
                   <tr>
@@ -98,7 +104,13 @@ export default function RecipientsPage() {
   );
 }
 
-function RecipientRow({ recipient }: { recipient: Recipient }) {
+function RecipientRow({
+  recipient,
+  isSelf,
+}: {
+  recipient: Recipient;
+  isSelf: boolean;
+}) {
   const qc = useQueryClient();
   const update = useMutation({
     mutationFn: (patch: Partial<Recipient>) =>
@@ -124,7 +136,14 @@ function RecipientRow({ recipient }: { recipient: Recipient }) {
 
   return (
     <tr className={`border-t border-border hover:bg-muted/30 ${opacity}`}>
-      <td className="px-3 py-2 font-mono text-xs">{recipient.email}</td>
+      <td className="px-3 py-2 font-mono text-xs">
+        {recipient.email}
+        {isSelf && (
+          <span className="ml-2 text-[10px] rounded bg-primary/10 text-primary px-1.5 py-0.5 font-semibold uppercase">
+            вы
+          </span>
+        )}
+      </td>
       <td className="px-3 py-2 text-muted-foreground">{recipient.name ?? "—"}</td>
       <td className="px-3 py-2">
         <select
@@ -132,7 +151,9 @@ function RecipientRow({ recipient }: { recipient: Recipient }) {
           onChange={(e) =>
             update.mutate({ role: e.target.value as "admin" | "viewer" })
           }
-          className="rounded border border-input bg-background px-2 py-1 text-xs"
+          disabled={isSelf}
+          title={isSelf ? "Нельзя сменить себе роль" : "admin или viewer"}
+          className="rounded border border-input bg-background px-2 py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <option value="admin">admin</option>
           <option value="viewer">viewer</option>
@@ -174,10 +195,14 @@ function RecipientRow({ recipient }: { recipient: Recipient }) {
       <td className="px-3 py-2">
         <button
           onClick={handleDelete}
-          disabled={!recipient.is_active}
+          disabled={!recipient.is_active || isSelf}
           className="text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:cursor-not-allowed"
           title={
-            recipient.is_active ? "Удалить" : "Уже удалён (soft delete)"
+            isSelf
+              ? "Нельзя удалить себя"
+              : recipient.is_active
+                ? "Удалить"
+                : "Уже удалён (soft delete)"
           }
         >
           {recipient.is_active ? (
