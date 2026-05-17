@@ -743,6 +743,115 @@ def test_dash_match_create_validates_min_two_products(client, auth_cookie):
     assert r.status_code == 422
 
 
+# ─── Universal matcher (Этап 4-5: counts + pharm/aptek unmatched-pairs) ─────
+
+
+def test_dash_unmatched_pairs_for_pharmonline_returns_clusters_missing_pharmonline(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Зеркальный сценарий: кластер apt+aloe без pharmonline → site=pharmonline."""
+    m, _ = _seed_matched_cluster(
+        setup_db,
+        tenant_id=tenant_user.tenant_id,
+        sites=("aptekonline", "aloe"),
+    )
+    setup_db.commit()
+
+    r = client.get(
+        "/api/v1/dash/unmatched-pairs?site=pharmonline",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    sites_in_anchor = {a["site"] for a in body["items"][0]["anchor_products"]}
+    assert sites_in_anchor == {"aptekonline", "aloe"}
+    assert body["items"][0]["match_id"] == m.id
+
+
+def test_dash_unmatched_pairs_for_aptekonline_returns_clusters_missing_aptekonline(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Зеркальный сценарий: кластер ph+aloe без aptekonline → site=aptekonline."""
+    _seed_matched_cluster(
+        setup_db,
+        tenant_id=tenant_user.tenant_id,
+        sites=("pharmonline", "aloe"),
+    )
+    setup_db.commit()
+
+    r = client.get(
+        "/api/v1/dash/unmatched-pairs?site=aptekonline",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    sites_in_anchor = {a["site"] for a in body["items"][0]["anchor_products"]}
+    assert sites_in_anchor == {"pharmonline", "aloe"}
+
+
+def test_dash_matcher_counts_returns_all_three_sites(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """GET /dash/matcher/counts → {aloe: N, pharmonline: M, aptekonline: K}.
+
+    Сидим 3 кластера: один без aloe, один без pharmonline, один без aptekonline.
+    Каждый счётчик должен быть = 1.
+    """
+    _seed_matched_cluster(
+        setup_db,
+        tenant_id=tenant_user.tenant_id,
+        sites=("pharmonline", "aptekonline"),
+    )
+    _seed_matched_cluster(
+        setup_db,
+        tenant_id=tenant_user.tenant_id,
+        sites=("aptekonline", "aloe"),
+    )
+    _seed_matched_cluster(
+        setup_db,
+        tenant_id=tenant_user.tenant_id,
+        sites=("pharmonline", "aloe"),
+    )
+    setup_db.commit()
+
+    r = client.get(
+        "/api/v1/dash/matcher/counts",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body.keys()) == {"aloe", "pharmonline", "aptekonline"}
+    assert body["aloe"] == 1
+    assert body["pharmonline"] == 1
+    assert body["aptekonline"] == 1
+
+
+def test_dash_matcher_counts_excludes_complete_clusters(
+    client, auth_cookie, tenant_user, setup_db
+):
+    """Полный кластер (3 сайта) не должен попадать ни в один счётчик."""
+    _seed_matched_cluster(
+        setup_db,
+        tenant_id=tenant_user.tenant_id,
+        sites=("pharmonline", "aptekonline", "aloe"),
+    )
+    setup_db.commit()
+
+    r = client.get(
+        "/api/v1/dash/matcher/counts",
+        cookies={api_module.COOKIE_NAME: auth_cookie},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"aloe": 0, "pharmonline": 0, "aptekonline": 0}
+
+
+def test_dash_matcher_counts_requires_auth(client):
+    r = client.get("/api/v1/dash/matcher/counts")
+    assert r.status_code == 401
+
+
 # ─── Recipients management (admin only) ──────────────────────────────────────
 
 

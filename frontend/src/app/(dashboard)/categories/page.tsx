@@ -384,21 +384,21 @@ function CategoryRowDesktop({
         {cat.pharmonline_slug ? (
           <span className="font-mono text-muted-foreground">{cat.pharmonline_slug}</span>
         ) : (
-          <span className="text-muted-foreground/40">—</span>
+          <span className="text-muted-foreground/70">—</span>
         )}
       </td>
       <td className="px-3 py-2 text-xs">
         {cat.aptekonline_slug ? (
           <span className="font-mono text-muted-foreground">{cat.aptekonline_slug}</span>
         ) : (
-          <span className="text-muted-foreground/40">—</span>
+          <span className="text-muted-foreground/70">—</span>
         )}
       </td>
       <td className="px-3 py-2 text-xs">
         {cat.aloe_slug ? (
           <span className="font-mono text-muted-foreground">{cat.aloe_slug}</span>
         ) : (
-          <span className="text-muted-foreground/40">—</span>
+          <span className="text-muted-foreground/70">—</span>
         )}
       </td>
       <td className="px-3 py-2 text-center">

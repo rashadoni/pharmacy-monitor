@@ -22,8 +22,9 @@ export function Sparkline({
   if (vals.length < 2) {
     return (
       <div
-        className="inline-flex items-center text-[10px] text-muted-foreground/40"
+        className="inline-flex items-center text-[10px] text-muted-foreground/70"
         style={{ width }}
+        aria-label="недостаточно данных для тренда"
       >
         —
       </div>
@@ -45,7 +46,7 @@ export function Sparkline({
 
   const colorClass =
     delta_pct == null || Math.abs(delta_pct) < 0.5
-      ? "text-muted-foreground/60"
+      ? "text-muted-foreground"
       : delta_pct > 0
         ? "text-destructive"
         : "text-success";

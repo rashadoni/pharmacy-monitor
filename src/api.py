@@ -1957,6 +1957,53 @@ def dash_unmatched_pairs(
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
+@app.get("/api/v1/dash/matcher/counts")
+def dash_matcher_counts(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Кол-во unmatched кластеров для каждого из 3 сайтов.
+
+    Кластер считается «unmatched для сайта S», если в нём нет продукта с S.
+    Используется UI /matcher для бейджей-счётчиков в site selector — оператор
+    сразу видит, по какому сайту больше работы.
+
+    Возвращает: ``{"aloe": N, "pharmonline": M, "aptekonline": K}``.
+    """
+    out: dict[str, int] = {}
+    # Подмножество match_id'ов, у которых вообще есть хотя бы 1 продукт (защита
+    # от пустых orphaned Match'ей, которых не должно быть, но bы).
+    has_any_product_subq = (
+        select(storage.Product.canonical_id)
+        .where(
+            storage.Product.canonical_id.is_not(None),
+            storage.Product.tenant_id == user.tenant_id,
+        )
+        .distinct()
+        .subquery()
+    )
+    for site in _VALID_SITES:
+        has_site_subq = (
+            select(storage.Product.canonical_id)
+            .where(
+                storage.Product.site == site,
+                storage.Product.canonical_id.is_not(None),
+                storage.Product.tenant_id == user.tenant_id,
+            )
+            .distinct()
+            .subquery()
+        )
+        count = db.scalar(
+            select(func.count(storage.Match.id)).where(
+                storage.Match.tenant_id == user.tenant_id,
+                storage.Match.id.in_(select(has_any_product_subq.c.canonical_id)),
+                storage.Match.id.not_in(select(has_site_subq.c.canonical_id)),
+            )
+        )
+        out[site] = int(count or 0)
+    return out
+
+
 class _AddProductPayload(BaseModel):
     product_id: int = Field(gt=0)
 

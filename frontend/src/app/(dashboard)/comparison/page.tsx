@@ -1,14 +1,21 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { X } from "lucide-react";
+import { ChevronDown, ChevronUp, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api, type ComparisonRow } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatPct } from "@/lib/utils";
+import { Sparkline } from "@/components/sparkline";
 import { TableSkeleton } from "@/components/skeleton";
 
 const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
+type SiteName = (typeof SITES)[number];
 
 export default function ComparisonPage() {
   const [search, setSearch] = useState("");
@@ -16,6 +23,9 @@ export default function ComparisonPage() {
   const [minSites, setMinSites] = useState(2);
   const [diffOnly, setDiffOnly] = useState(true);
   const [withAloe, setWithAloe] = useState(false);
+  // Один row развёрнут за раз — иначе при 200+ строках можно случайно загрузить
+  // десятки запросов price-history. Click ещё раз — свернёт.
+  const [expandedId, setExpandedId] = useState<number | null>(null);
   const queryClient = useQueryClient();
 
   const { data, isLoading, error, isFetching } = useQuery({
@@ -151,7 +161,17 @@ export default function ComparisonPage() {
       {/* Mobile: card list */}
       <div className="md:hidden space-y-2" data-testid="mobile-list">
         {filtered?.map((row) => (
-          <ComparisonCard key={row.canonical_id} row={row} onReject={handleReject} />
+          <ComparisonCard
+            key={row.canonical_id}
+            row={row}
+            expanded={expandedId === row.canonical_id}
+            onToggleExpand={() =>
+              setExpandedId((id) =>
+                id === row.canonical_id ? null : row.canonical_id,
+              )
+            }
+            onReject={handleReject}
+          />
         ))}
       </div>
 
@@ -168,6 +188,7 @@ export default function ComparisonPage() {
               ))}
               <th className="px-3 py-2 text-right">Spread</th>
               <th className="px-3 py-2 w-10"></th>
+              <th className="px-3 py-2 w-10"></th>
             </tr>
           </thead>
           <tbody>
@@ -175,6 +196,12 @@ export default function ComparisonPage() {
               <ComparisonRowDesktop
                 key={row.canonical_id}
                 row={row}
+                expanded={expandedId === row.canonical_id}
+                onToggleExpand={() =>
+                  setExpandedId((id) =>
+                    id === row.canonical_id ? null : row.canonical_id,
+                  )
+                }
                 onReject={handleReject}
               />
             ))}
@@ -196,7 +223,7 @@ export default function ComparisonPage() {
 
 function priceCell(row: ComparisonRow, site: string) {
   const p = row.prices[site];
-  if (!p) return <span className="text-muted-foreground/50">—</span>;
+  if (!p) return <span className="text-muted-foreground/70">—</span>;
   const isMin = row.min_price === p.price;
   const isMax = row.max_price === p.price && row.min_price !== row.max_price;
   return (
@@ -221,70 +248,211 @@ function priceCell(row: ComparisonRow, site: string) {
 
 function ComparisonRowDesktop({
   row,
+  expanded,
+  onToggleExpand,
   onReject,
 }: {
   row: ComparisonRow;
+  expanded: boolean;
+  onToggleExpand: () => void;
   onReject: (r: ComparisonRow) => void;
 }) {
   return (
-    <tr className="border-t border-border hover:bg-muted/30 group">
-      <td className="px-3 py-2 max-w-md truncate">
-        <div>{row.name}</div>
-        {row.brand && (
-          <div className="text-[11px] text-muted-foreground/70 truncate">
-            {row.brand}
-          </div>
-        )}
-      </td>
-      {SITES.map((s) => (
-        <td key={s} className="px-3 py-2 text-right">
-          {priceCell(row, s)}
+    <>
+      <tr className="border-t border-border hover:bg-muted/30 group">
+        <td className="px-3 py-2 max-w-md truncate">
+          <div>{row.name}</div>
+          {row.brand && (
+            <div className="text-[11px] text-muted-foreground/70 truncate">
+              {row.brand}
+            </div>
+          )}
         </td>
-      ))}
-      <td className="px-3 py-2 text-right tabular-nums">{formatPct(row.spread_pct)}</td>
-      <td className="px-3 py-2">
-        <button
-          onClick={() => onReject(row)}
-          title="Отвергнуть как false match"
-          className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-destructive"
-          data-testid={`reject-${row.canonical_id}`}
-        >
-          <X className="h-4 w-4" />
-        </button>
-      </td>
-    </tr>
+        {SITES.map((s) => (
+          <td key={s} className="px-3 py-2 text-right">
+            {priceCell(row, s)}
+          </td>
+        ))}
+        <td className="px-3 py-2 text-right tabular-nums">
+          {formatPct(row.spread_pct)}
+        </td>
+        <td className="px-3 py-2">
+          <button
+            onClick={onToggleExpand}
+            title={expanded ? "Скрыть тренд" : "Показать тренд за 30 дней"}
+            aria-label={expanded ? "Скрыть тренд" : "Показать тренд за 30 дней"}
+            aria-expanded={expanded}
+            className="text-muted-foreground hover:text-foreground p-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            data-testid={`expand-${row.canonical_id}`}
+          >
+            {expanded ? (
+              <ChevronUp className="h-4 w-4" />
+            ) : (
+              <ChevronDown className="h-4 w-4" />
+            )}
+          </button>
+        </td>
+        <td className="px-3 py-2">
+          <button
+            onClick={() => onReject(row)}
+            title="Отвергнуть как false match"
+            aria-label="Отвергнуть как false match"
+            className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity text-muted-foreground hover:text-destructive rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            data-testid={`reject-${row.canonical_id}`}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </td>
+      </tr>
+      {expanded && (
+        <tr className="bg-muted/20 border-t border-border">
+          <td colSpan={SITES.length + 3} className="px-3 py-3">
+            <TrendPanel row={row} />
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 
 function ComparisonCard({
   row,
+  expanded,
+  onToggleExpand,
   onReject,
 }: {
   row: ComparisonRow;
+  expanded: boolean;
+  onToggleExpand: () => void;
   onReject: (r: ComparisonRow) => void;
 }) {
   return (
     <div className="rounded-lg border border-border bg-card p-3 relative">
       <button
         onClick={() => onReject(row)}
-        className="absolute top-2 right-2 text-muted-foreground hover:text-destructive p-1"
+        className="absolute top-2 right-2 text-muted-foreground hover:text-destructive p-1.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         title="Отвергнуть"
+        aria-label="Отвергнуть как false match"
         data-testid={`reject-mobile-${row.canonical_id}`}
       >
         <X className="h-4 w-4" />
       </button>
-      <div className="font-medium text-sm pr-6">{row.name}</div>
+      <div className="font-medium text-sm pr-8">{row.name}</div>
       <div className="text-xs text-muted-foreground mt-0.5">
-        {row.brand ?? "—"} · {row.sites_with_price} сайтов · spread {formatPct(row.spread_pct)}
+        {row.brand ?? "—"} · {row.sites_with_price} сайтов · spread{" "}
+        {formatPct(row.spread_pct)}
       </div>
       <div className="grid grid-cols-3 gap-2 mt-3">
-        {SITES.map((s) => (
-          <div key={s} className="text-center">
-            <div className="text-[10px] text-muted-foreground uppercase">{s}</div>
-            <div className="mt-0.5">{priceCell(row, s)}</div>
-          </div>
-        ))}
+        {SITES.map((s) => {
+          const p = row.prices[s];
+          const isCheapest = p && row.min_price === p.price;
+          return (
+            <div
+              key={s}
+              className={`text-center rounded-md py-2 px-1 border ${
+                isCheapest
+                  ? "border-success/40 bg-success/5"
+                  : "border-transparent"
+              }`}
+            >
+              <div className="text-[10px] text-muted-foreground uppercase">
+                {s}
+              </div>
+              <div className="mt-0.5">{priceCell(row, s)}</div>
+            </div>
+          );
+        })}
       </div>
+      <button
+        onClick={onToggleExpand}
+        aria-expanded={expanded}
+        className="mt-2 w-full text-xs text-muted-foreground hover:text-foreground inline-flex items-center justify-center gap-1 py-1.5 rounded-md hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        data-testid={`expand-mobile-${row.canonical_id}`}
+      >
+        {expanded ? (
+          <>
+            <ChevronUp className="h-3.5 w-3.5" /> Скрыть тренд
+          </>
+        ) : (
+          <>
+            <ChevronDown className="h-3.5 w-3.5" /> Тренд 30Д
+          </>
+        )}
+      </button>
+      {expanded && (
+        <div className="mt-2 pt-2 border-t border-border">
+          <TrendPanel row={row} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Внутренняя секция, показывающаяся при click на expand-row.
+ * Параллельно тянет историю цен 30D для каждого сайта в кластере (1-3 запроса),
+ * рендерит mini sparkline + delta % per site.
+ */
+function TrendPanel({ row }: { row: ComparisonRow }) {
+  const sitesWithPrice = SITES.filter((s) => row.prices[s]);
+  const queries = useQueries({
+    queries: sitesWithPrice.map((s) => ({
+      queryKey: ["price-history", row.prices[s].product_id, 30],
+      queryFn: () => api.productPriceHistory(row.prices[s].product_id, 30),
+      staleTime: 60_000,
+    })),
+  });
+
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      {sitesWithPrice.map((s, idx) => {
+        const q = queries[idx];
+        return (
+          <div key={s} className="flex items-center gap-2 text-xs">
+            <span className="text-[10px] uppercase tracking-wide text-muted-foreground w-20 shrink-0">
+              {s}
+            </span>
+            {q.isLoading ? (
+              <span className="text-muted-foreground">…</span>
+            ) : q.error || !q.data ? (
+              <span className="text-muted-foreground/70">нет данных</span>
+            ) : q.data.points.filter((p) => p.price != null).length < 2 ? (
+              <span className="text-muted-foreground/70 text-[11px]">
+                {q.data.current != null
+                  ? `стабильно ${formatPrice(q.data.current)}`
+                  : "—"}
+              </span>
+            ) : (
+              <div className="flex items-center gap-2 flex-1">
+                <Sparkline
+                  points={q.data.points}
+                  delta_pct={q.data.delta_pct}
+                  width={90}
+                  height={24}
+                />
+                {q.data.delta_pct != null &&
+                  Math.abs(q.data.delta_pct) >= 0.5 && (
+                    <span
+                      className={`inline-flex items-center gap-0.5 text-[11px] ${
+                        q.data.delta_pct > 0
+                          ? "text-destructive"
+                          : "text-success"
+                      }`}
+                    >
+                      {q.data.delta_pct > 0 ? (
+                        <TrendingUp className="h-3 w-3" />
+                      ) : (
+                        <TrendingDown className="h-3 w-3" />
+                      )}
+                      {q.data.delta_pct > 0 ? "+" : ""}
+                      {q.data.delta_pct.toFixed(1)}%
+                    </span>
+                  )}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

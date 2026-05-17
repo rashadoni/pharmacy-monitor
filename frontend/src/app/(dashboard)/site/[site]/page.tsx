@@ -492,7 +492,7 @@ function ProductRow({ product, site }: { product: SiteProduct; site: SiteName })
             delta_pct={historyQ.data.delta_pct}
           />
         ) : (
-          <span className="text-xs text-muted-foreground/40">…</span>
+          <span className="text-xs text-muted-foreground/70">…</span>
         )}
       </td>
       <td className="px-3 py-2">

@@ -49,7 +49,7 @@ const NAV_GROUPS: { label: string; items: readonly NavItem[] }[] = [
   {
     label: "Действия",
     items: [
-      { href: "/aloe-matcher", key: "aloeMatcher", icon: Link2 },
+      { href: "/matcher", key: "matcher", icon: Link2 },
       { href: "/alerts", key: "alerts", icon: Bell },
       { href: "/watchlist", key: "watchlist", icon: Star },
     ],

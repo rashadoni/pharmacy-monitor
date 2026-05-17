@@ -409,6 +409,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ product_ids }),
     }),
+  matcherCounts: () =>
+    request<Record<string, number>>("/api/v1/dash/matcher/counts"),
   recipients: () => request<Recipient[]>("/api/v1/dash/recipients"),
   recipientCreate: (payload: RecipientCreate) =>
     request<Recipient>("/api/v1/dash/recipients", {
