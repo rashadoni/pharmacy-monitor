@@ -1,7 +1,15 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  Layers,
+  Tag,
+  UserCheck,
+  type LucideIcon,
+} from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
 import { api, type RunRow } from "@/lib/api";
@@ -125,36 +133,54 @@ export default function OverviewPage() {
       {dqQ.data && (
         <div className="grid gap-2 grid-cols-2 md:grid-cols-4">
           <StatTile
+            icon={Tag}
             label="Brand quality"
             value={`${dqQ.data.brand_extraction_rate_pct}%`}
+            status={
+              dqQ.data.brand_extraction_rate_pct >= 80
+                ? "good"
+                : dqQ.data.brand_extraction_rate_pct >= 60
+                  ? "warn"
+                  : "bad"
+            }
             hint={`${dqQ.data.products_with_good_brand.toLocaleString("ru-RU")} из ${dqQ.data.products_total.toLocaleString("ru-RU")} с осмысленным брендом`}
           />
           {/*
             P2 recon (2026-05-18): aloe.az имеет ВСЕГО 4 реальных категории,
-            значит потолок Cross-3 = 4. Гнаться за «Cross-3 30+» нельзя.
-            Реальный leverage — Cross-2 pharm × apt (потолок ~46).
-            Плитка показывает Cross-2 как primary, Cross-3 как hint, и
-            самое главное — `cross_2_pending_suggestions`: сколько пар
-            готовы к 1-click mapping в /categories?view=suggestions.
+            значит потолок Cross-3 = 4. Реальный leverage — Cross-2 pharm × apt
+            (потолок ~46). Badge `+N ready` зелёной пилюлей — это main CTA
+            страницы: 120 suggestions ждут 1-click mapping.
           */}
           <StatTile
+            icon={Layers}
             label="Category mappings"
             value={`${dqQ.data.cross_2_count}/${dqQ.data.cross_2_pharm_apt_ceiling}`}
-            hint={
-              dqQ.data.cross_2_pending_suggestions > 0
-                ? `+${dqQ.data.cross_2_pending_suggestions} suggestions ready · Cross-3: ${dqQ.data.cross_3_count}/${dqQ.data.cross_3_ceiling}`
-                : `Cross-3: ${dqQ.data.cross_3_count}/${dqQ.data.cross_3_ceiling}`
+            status={
+              dqQ.data.cross_2_pharm_apt_ceiling > 0 &&
+              dqQ.data.cross_2_count / dqQ.data.cross_2_pharm_apt_ceiling >= 0.7
+                ? "good"
+                : "warn"
             }
+            badge={
+              dqQ.data.cross_2_pending_suggestions > 0
+                ? `+${dqQ.data.cross_2_pending_suggestions} ready`
+                : undefined
+            }
+            hint={`Cross-3: ${dqQ.data.cross_3_count}/${dqQ.data.cross_3_ceiling} · клик → suggestions`}
             href="/categories?view=suggestions"
           />
           <StatTile
+            icon={UserCheck}
             label="Manual matches (7д)"
             value={dqQ.data.manual_matches_last_7d}
+            status={dqQ.data.manual_matches_last_7d >= 3 ? "good" : "neutral"}
             hint="Сколько кластеров создано/привязано вручную за неделю"
           />
           <StatTile
+            icon={Clock}
             label="Свежесть scrape"
             value={formatScrapeFreshness(dqQ.data.last_scrape_per_site)}
+            status={scrapeFreshnessStatus(dqQ.data.last_scrape_per_site)}
             hint={scrapeFreshnessHint(dqQ.data.last_scrape_per_site)}
           />
         </div>
@@ -451,42 +477,78 @@ function strategyLabel(s: string): string {
  * под основным KPI-grid'ом для дополнительных data-quality метрик чтобы не
  * раздувать главную сетку с 4 до 8 карточек.
  *
- * Если задан `href` — плитка кликабельная (Link) и подсвечивается на hover'е.
- * Это превращает пассивную метрику в начало workflow. Например, Cross-3
- * ведёт на /categories?missing=3 чтобы PO мог сразу пойти и дочистить
- * mapping вместо «увидел число и забыл».
+ * Features:
+ * - `icon` — lucide-react иконка для визуальной distinction между тайлами
+ * - `status` — цвет числа (good=green, warn=yellow, bad=red, neutral)
+ * - `badge` — зелёная пилюля с actionable инсайтом (типа «+120 ready»)
+ * - `href` — Link с hover highlight; пассивная метрика → workflow start
  */
+type StatStatus = "good" | "warn" | "bad" | "neutral";
+
 function StatTile({
   label,
   value,
   hint,
   href,
+  icon: Icon,
+  status = "neutral",
+  badge,
 }: {
   label: string;
   value: string | number;
   hint?: string;
   href?: string;
+  icon?: LucideIcon;
+  status?: StatStatus;
+  badge?: string;
 }) {
   const baseClasses =
-    "rounded-md border border-border bg-card px-3 py-2 block";
+    "rounded-lg border bg-card px-3.5 py-3 block";
+  const borderClass = {
+    good: "border-success/30",
+    warn: "border-warning/40",
+    bad: "border-destructive/40",
+    neutral: "border-border",
+  }[status];
+  const valueColor = {
+    good: "text-success",
+    warn: "text-warning",
+    bad: "text-destructive",
+    neutral: "text-foreground",
+  }[status];
   const interactive = href
-    ? "cursor-pointer transition-colors hover:bg-muted/40 hover:border-primary/40"
+    ? "cursor-pointer transition-colors hover:bg-muted/40 hover:border-primary/50"
     : "";
   const content = (
     <>
-      <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
-        {label}
+      <div className="flex items-center gap-1.5">
+        {Icon && (
+          <Icon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+        )}
+        <div className="text-[11px] uppercase tracking-wide text-muted-foreground truncate">
+          {label}
+        </div>
         {href && (
-          <span className="ml-1 text-muted-foreground/60" aria-hidden>
+          <span
+            className="ml-auto text-muted-foreground/60 text-xs"
+            aria-hidden
+          >
             →
           </span>
         )}
       </div>
-      <div className="text-lg font-semibold tabular-nums leading-tight mt-0.5">
+      <div
+        className={`text-xl font-semibold tabular-nums leading-tight mt-1 ${valueColor}`}
+      >
         {value}
       </div>
+      {badge && (
+        <span className="inline-flex items-center rounded-full bg-success/10 text-success px-2 py-0.5 text-[10px] font-medium mt-1.5">
+          {badge}
+        </span>
+      )}
       {hint && (
-        <div className="text-[11px] text-muted-foreground/80 mt-0.5 line-clamp-1">
+        <div className="text-[11px] text-muted-foreground/80 mt-1 line-clamp-1">
           {hint}
         </div>
       )}
@@ -494,13 +556,17 @@ function StatTile({
   );
   if (href) {
     return (
-      <Link href={href} className={`${baseClasses} ${interactive}`} title={hint}>
+      <Link
+        href={href}
+        className={`${baseClasses} ${borderClass} ${interactive}`}
+        title={hint}
+      >
         {content}
       </Link>
     );
   }
   return (
-    <div className={baseClasses} title={hint}>
+    <div className={`${baseClasses} ${borderClass}`} title={hint}>
       {content}
     </div>
   );
@@ -532,4 +598,25 @@ function scrapeFreshnessHint(
     return `${site}: ${iso ? formatRelative(iso) : "нет"}`;
   });
   return parts.join(" · ");
+}
+
+/**
+ * Возвращает статус для color-coding плитки «Свежесть scrape».
+ * Базово: oldest scrape > 36h = bad, > 24h = warn, иначе good.
+ * (Daily timers: pharm+apt в 18:00 Baku, aloe в 03:00 UTC — после 24h задержки
+ * один из сайтов застрял или таймер упал.)
+ */
+function scrapeFreshnessStatus(
+  perSite: Record<string, string | null>,
+): StatStatus {
+  const isoValues = Object.values(perSite).filter(
+    (v): v is string => Boolean(v),
+  );
+  if (isoValues.length === 0) return "bad";
+  if (Object.values(perSite).some((v) => v === null)) return "warn";
+  const oldestMs = Math.min(...isoValues.map((iso) => new Date(iso).getTime()));
+  const hoursAgo = (Date.now() - oldestMs) / 3_600_000;
+  if (hoursAgo > 36) return "bad";
+  if (hoursAgo > 24) return "warn";
+  return "good";
 }
