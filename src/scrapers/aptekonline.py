@@ -72,6 +72,24 @@ def _scraperapi_httpx_proxy_for(site_name: str) -> str | None:
     return f"http://{user}:{key}@proxy-server.scraperapi.com:8001"
 
 
+def _crawlbase_httpx_proxy_for(site_name: str) -> str | None:
+    """Crawlbase Smart Proxy URL для httpx (если настроен).
+
+    Используем **Normal Token** (CRAWLBASE_NORMAL_TOKEN) — aptekonline backend
+    отдаёт чистый JSON без JS, дешевле чем JS-токен. Если есть только JS-токен
+    тоже сойдёт, но overkill для JSON-эндпоинта.
+    """
+    token = os.getenv("CRAWLBASE_NORMAL_TOKEN") or os.getenv("CRAWLBASE_JS_TOKEN")
+    if not token:
+        return None
+    sites_csv = os.getenv("CRAWLBASE_SITES") or os.getenv("SCRAPER_API_SITES", "")
+    sites = {s.strip() for s in sites_csv.split(",") if s.strip()}
+    if site_name not in sites:
+        return None
+    # USER_TOKEN — username, пароль пустой
+    return f"http://{token}:@smartproxy.crawlbase.com:8012"
+
+
 _API_PRODUCT_LIST = "https://www.aptekonline.az/shop/productList"
 
 # Заголовки скопированы 1-в-1 из main.js — иначе backend возвращает HTML-редирект
@@ -178,15 +196,25 @@ class AptekonlineScraper(BaseScraper):
         yielded = 0
         params_base = [("categoryId[]", category_id), ("lang", "az")]
 
-        proxy_url = _scraperapi_httpx_proxy_for("aptekonline")
+        # Proxy resolution: Crawlbase → ScraperAPI → direct.
+        # Provider-specific configs winning over generic env vars.
+        proxy_url = _crawlbase_httpx_proxy_for("aptekonline")
+        proxied_via = "crawlbase" if proxy_url else None
+        if proxy_url is None:
+            proxy_url = _scraperapi_httpx_proxy_for("aptekonline")
+            proxied_via = "scraperapi" if proxy_url else None
+
         client_kwargs: dict = {
             "headers": _API_HEADERS,
             "timeout": httpx.Timeout(90.0 if proxy_url else 30.0),
         }
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
-            client_kwargs["verify"] = False  # ScraperAPI MITMs HTTPS
-            log.info("aptekonline_using_scraperapi", country=os.getenv("SCRAPER_API_COUNTRY", "default"))
+            client_kwargs["verify"] = False  # MITM HTTPS на любом из этих прокси
+            log.info(
+                f"aptekonline_using_{proxied_via}",
+                country=os.getenv("SCRAPER_API_COUNTRY", "default"),
+            )
         async with httpx.AsyncClient(**client_kwargs) as client:
             for page_num in range(1, max_pages + 1):
                 if limit is not None and yielded >= limit:

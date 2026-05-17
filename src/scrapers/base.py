@@ -95,6 +95,35 @@ def _scraperapi_proxy_for(site_name: str) -> dict | None:
     }
 
 
+def _crawlbase_proxy_for(site_name: str) -> dict | None:
+    """Return Playwright proxy config for Crawlbase Smart Proxy.
+
+    Reads env vars:
+      CRAWLBASE_JS_TOKEN     Browser-Enabled API Token (для JS-rendering)
+      CRAWLBASE_SITES        CSV of site_names to route (default: same as
+                             SCRAPER_API_SITES для backwards compat)
+
+    Crawlbase smart proxy: USER_TOKEN — username, password пустой.
+    Endpoint: smartproxy.crawlbase.com:8012. С JS-токеном автоматически
+    рендерит JavaScript на их стороне (через Headless Chrome в их облаке).
+
+    Возвращает None если токен не задан или site не в CRAWLBASE_SITES — caller
+    провалится дальше по цепочке резолва (ScraperAPI / HTTP_PROXY / direct).
+    """
+    token = os.getenv("CRAWLBASE_JS_TOKEN")
+    if not token:
+        return None
+    sites_csv = os.getenv("CRAWLBASE_SITES") or os.getenv("SCRAPER_API_SITES", "")
+    sites = {s.strip() for s in sites_csv.split(",") if s.strip()}
+    if site_name not in sites:
+        return None
+    return {
+        "server": "http://smartproxy.crawlbase.com:8012",
+        "username": token,
+        "password": "",
+    }
+
+
 @dataclass
 class ScrapedProduct:
     """Единый формат товара, возвращаемый любым скрейпером."""
@@ -168,31 +197,41 @@ class BaseScraper(ABC):
         self._playwright = await async_playwright().start()
 
         # Proxy resolution order (first match wins):
-        #   1. ScraperAPI per-site config (SCRAPER_API_KEY + SCRAPER_API_SITES)
-        #   2. Generic HTTP_PROXY / SCRAPE_PROXY env (single proxy for everything)
-        # ScraperAPI takes precedence so aloe (which works direct from Hetzner)
-        # doesn't burn ScraperAPI credits unnecessarily.
+        #   1. Crawlbase Smart Proxy (CRAWLBASE_JS_TOKEN + CRAWLBASE_SITES)
+        #   2. ScraperAPI per-site config (SCRAPER_API_KEY + SCRAPER_API_SITES)
+        #   3. Generic HTTP_PROXY / SCRAPE_PROXY env (single proxy for everything)
+        # Provider-specific configs take precedence so aloe (works direct from
+        # Hetzner) не burn'ит платные credits.
         launch_args: dict = {"headless": self.headless}
-        scraperapi_cfg = _scraperapi_proxy_for(self.site_name)
-        if scraperapi_cfg:
-            launch_args["proxy"] = scraperapi_cfg
-            log.info(
-                "scrape_using_scraperapi",
-                site=self.site_name,
-                country=os.getenv("SCRAPER_API_COUNTRY", "default"),
-            )
+        crawlbase_cfg = _crawlbase_proxy_for(self.site_name)
+        scraperapi_cfg = None
+        proxied_via = None
+        if crawlbase_cfg:
+            launch_args["proxy"] = crawlbase_cfg
+            proxied_via = "crawlbase"
+            log.info("scrape_using_crawlbase", site=self.site_name)
         else:
-            proxy_url = os.getenv("HTTP_PROXY") or os.getenv("SCRAPE_PROXY")
-            if proxy_url:
-                launch_args["proxy"] = {"server": proxy_url}
-                log.info("scrape_using_proxy", proxy=_redact_proxy(proxy_url))
+            scraperapi_cfg = _scraperapi_proxy_for(self.site_name)
+            if scraperapi_cfg:
+                launch_args["proxy"] = scraperapi_cfg
+                proxied_via = "scraperapi"
+                log.info(
+                    "scrape_using_scraperapi",
+                    site=self.site_name,
+                    country=os.getenv("SCRAPER_API_COUNTRY", "default"),
+                )
+            else:
+                proxy_url = os.getenv("HTTP_PROXY") or os.getenv("SCRAPE_PROXY")
+                if proxy_url:
+                    launch_args["proxy"] = {"server": proxy_url}
+                    proxied_via = "generic"
+                    log.info("scrape_using_proxy", proxy=_redact_proxy(proxy_url))
 
         self._browser = await self._playwright.chromium.launch(**launch_args)
-        # ScraperAPI's proxy MITMs HTTPS with a self-signed cert — Chromium
-        # blocks with ERR_CERT_AUTHORITY_INVALID unless we explicitly accept it.
-        # Only relax the check when we actually went through ScraperAPI; direct
-        # / generic-proxy contexts keep strict TLS validation.
-        ignore_https_errors = scraperapi_cfg is not None
+        # Crawlbase + ScraperAPI прокси MITM'ят HTTPS self-signed серт →
+        # Chromium блокирует с ERR_CERT_AUTHORITY_INVALID без явного relaxation.
+        # Только если реально через proxy идёт — direct / generic-proxy keep strict.
+        ignore_https_errors = proxied_via in ("crawlbase", "scraperapi")
         self._context = await self._browser.new_context(
             user_agent=random_user_agent(),
             viewport=random_viewport(),
