@@ -1,9 +1,9 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Play, Plus, Trash2, X } from "lucide-react";
+import { CheckCircle2, Lightbulb, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
-import { api, type CategoryRow } from "@/lib/api";
+import { api, friendlyError, type CategoryRow, type CategorySuggestion } from "@/lib/api";
 
 /**
  * Извлечь slug категории из URL для каждого сайта.
@@ -103,6 +103,8 @@ export default function CategoriesPage() {
     aloe: data?.filter((c) => c.aloe_slug).length ?? 0,
   };
 
+  const [view, setView] = useState<"list" | "suggestions">("list");
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -124,6 +126,33 @@ export default function CategoriesPage() {
         </div>
       </div>
 
+      {/* P1.1 Tabs: Список / Suggested mappings */}
+      <div className="flex items-center gap-1 border-b border-border">
+        <button
+          onClick={() => setView("list")}
+          className={`inline-flex items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+            view === "list"
+              ? "border-primary text-foreground font-medium"
+              : "border-transparent text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Список ({stats.total})
+        </button>
+        <button
+          onClick={() => setView("suggestions")}
+          className={`inline-flex items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+            view === "suggestions"
+              ? "border-primary text-foreground font-medium"
+              : "border-transparent text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <Lightbulb className="h-3.5 w-3.5" />
+          Предложенные mapping&apos;и
+        </button>
+      </div>
+
+      {view === "suggestions" ? <SuggestionsPanel /> : (
+      <>
       {showAdd && <CategoryForm onClose={() => setShowAdd(false)} />}
       {editing && (
         <CategoryForm
@@ -217,7 +246,204 @@ export default function CategoriesPage() {
           По текущему фильтру ничего не найдено.
         </div>
       )}
+      </>
+      )}
     </div>
+  );
+}
+
+function SuggestionsPanel() {
+  const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
+  type Site = (typeof SITES)[number];
+  const [siteA, setSiteA] = useState<Site>("pharmonline");
+  const [siteB, setSiteB] = useState<Site>("aptekonline");
+  const [minOverlap, setMinOverlap] = useState(5);
+  const queryClient = useQueryClient();
+
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["category-suggestions", siteA, siteB, minOverlap],
+    queryFn: () => api.categorySuggestions({ site_a: siteA, site_b: siteB, min_overlap: minOverlap }),
+    enabled: siteA !== siteB,
+  });
+
+  const mapMutation = useMutation({
+    mutationFn: (payload: {
+      site_a: Site;
+      site_a_slug: string;
+      site_b: Site;
+      site_b_slug: string;
+    }) => api.categoryMappingCreate(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["category-suggestions"] });
+      queryClient.invalidateQueries({ queryKey: ["categories"] });
+    },
+    onError: (e) => alert(friendlyError(e)),
+  });
+
+  const notMapped = (data ?? []).filter((s) => !s.already_mapped);
+  const mapped = (data ?? []).filter((s) => s.already_mapped);
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-md bg-muted/30 border border-border p-3 text-xs text-muted-foreground">
+        <Lightbulb className="inline h-3.5 w-3.5 mr-1 -mt-0.5" />
+        Подсказки на основе <strong>shared brands</strong> между категориями двух сайтов.
+        Если у двух slug&apos;ов одни и те же 5+ брендов — это, скорее всего, одна категория.
+        Клик «Связать» создаёт Category row (или дополняет существующий, если slug одного из сайтов уже там).
+      </div>
+
+      <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+        <SiteSelector value={siteA} onChange={setSiteA} label="Сайт A" disabled={siteB} />
+        <span className="text-muted-foreground">↔</span>
+        <SiteSelector value={siteB} onChange={setSiteB} label="Сайт B" disabled={siteA} />
+        <label className="inline-flex items-center gap-2 text-sm ml-auto">
+          Мин. overlap:
+          <input
+            type="number"
+            value={minOverlap}
+            min={2}
+            max={50}
+            onChange={(e) => setMinOverlap(Number(e.target.value) || 3)}
+            className="w-16 rounded-md border border-input bg-background px-2 py-1 text-sm"
+          />
+        </label>
+      </div>
+
+      {isLoading && <div className="text-sm text-muted-foreground py-4">Ищу пересечения…</div>}
+      {error && (
+        <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive">
+          {friendlyError(error)}
+        </div>
+      )}
+      {!isLoading && data && notMapped.length === 0 && mapped.length === 0 && (
+        <div className="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+          Нет пересечений с overlap ≥ {minOverlap} брендов. Понизь порог или выбери другую пару сайтов.
+        </div>
+      )}
+
+      {notMapped.length > 0 && (
+        <div className="rounded-lg border border-border bg-card overflow-hidden">
+          <div className="px-4 py-3 border-b border-border">
+            <h2 className="text-sm font-semibold">
+              Новые предложения ({notMapped.length})
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Категории-кандидаты на mapping. Сортировка — по убыванию shared brands.
+            </p>
+          </div>
+          <table className="w-full text-sm">
+            <thead className="bg-muted/30 text-muted-foreground text-xs">
+              <tr>
+                <th className="px-4 py-2 text-left">{siteA}</th>
+                <th className="px-4 py-2 text-left">{siteB}</th>
+                <th className="px-4 py-2 text-right">Shared brands</th>
+                <th className="px-4 py-2 text-left">Примеры</th>
+                <th className="px-4 py-2 w-32"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {notMapped.map((s) => (
+                <tr
+                  key={`${s.site_a_slug}|${s.site_b_slug}`}
+                  className="border-t border-border"
+                >
+                  <td className="px-4 py-2 font-mono text-xs">
+                    {s.site_a_slug}
+                    <div className="text-[10px] text-muted-foreground/70">
+                      {s.site_a_products} prod
+                    </div>
+                  </td>
+                  <td className="px-4 py-2 font-mono text-xs">
+                    {s.site_b_slug}
+                    <div className="text-[10px] text-muted-foreground/70">
+                      {s.site_b_products} prod
+                    </div>
+                  </td>
+                  <td className="px-4 py-2 text-right tabular-nums font-semibold">
+                    {s.shared_brands_count}
+                  </td>
+                  <td className="px-4 py-2 text-xs text-muted-foreground">
+                    {s.sample_brands.slice(0, 4).join(", ")}
+                  </td>
+                  <td className="px-4 py-2">
+                    <button
+                      onClick={() =>
+                        mapMutation.mutate({
+                          site_a: siteA,
+                          site_a_slug: s.site_a_slug,
+                          site_b: siteB,
+                          site_b_slug: s.site_b_slug,
+                        })
+                      }
+                      disabled={mapMutation.isPending}
+                      className="inline-flex items-center gap-1 rounded bg-primary text-primary-foreground px-2 py-1 text-xs font-medium hover:bg-primary/90 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      Связать
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {mapped.length > 0 && (
+        <details className="rounded-lg border border-border bg-muted/20">
+          <summary className="px-4 py-2 cursor-pointer text-sm text-muted-foreground">
+            Уже связанные ({mapped.length})
+          </summary>
+          <table className="w-full text-xs">
+            <tbody>
+              {mapped.map((s) => (
+                <tr key={`m-${s.site_a_slug}|${s.site_b_slug}`} className="border-t border-border">
+                  <td className="px-4 py-2 font-mono text-muted-foreground">
+                    {s.site_a_slug}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-muted-foreground">
+                    {s.site_b_slug}
+                  </td>
+                  <td className="px-4 py-2 text-right tabular-nums">{s.shared_brands_count}</td>
+                  <td className="px-4 py-2 text-success">
+                    <CheckCircle2 className="inline h-3.5 w-3.5 mr-1" /> связано
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function SiteSelector({
+  value,
+  onChange,
+  label,
+  disabled,
+}: {
+  value: "pharmonline" | "aptekonline" | "aloe";
+  onChange: (v: "pharmonline" | "aptekonline" | "aloe") => void;
+  label: string;
+  disabled: string; // имя другого сайта, который нельзя выбрать (запрет site_a == site_b)
+}) {
+  const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
+  return (
+    <label className="inline-flex items-center gap-2 text-sm">
+      <span className="text-xs text-muted-foreground uppercase">{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value as typeof value)}
+        className="rounded-md border border-input bg-background px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        {SITES.map((s) => (
+          <option key={s} value={s} disabled={s === disabled}>
+            {s}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 

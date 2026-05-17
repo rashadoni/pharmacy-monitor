@@ -1845,6 +1845,206 @@ def dash_categories_delete(
     return Response(status_code=204)
 
 
+@app.get("/api/v1/dash/categories/suggestions")
+def dash_category_suggestions(
+    site_a: str,
+    site_b: str,
+    min_overlap: int = 3,
+    limit: int = 30,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """P1.1 (PO Audit 2026-05-17): Категория-мапер — подсказки.
+
+    Для каждой пары (slug_a на site_a, slug_b на site_b) считаем shared
+    brand count. Высокий overlap = реальные сабжовые категории на разных
+    сайтах. Skip pair'ы где обе slug уже в одной Category row (mapping есть).
+
+    Cross-3 categories = 1 (только uşaq-qidası). Через этот endpoint оператор
+    видит топ-30 кандидатов на mapping → одним кликом создаёт Category row.
+
+    Returns: [{
+        site_a_slug, site_b_slug, shared_brands_count,
+        sample_brands (top 5), a_products, b_products,
+        already_mapped (bool)
+    }]
+    """
+    _require_site(site_a)
+    _require_site(site_b)
+    if site_a == site_b:
+        raise HTTPException(400, "site_a и site_b должны различаться")
+
+    # Кол-во продуктов и shared brands per (slug_a, slug_b) пара
+    # Используем self-JOIN по brand. Один SQL, agg на стороне БД.
+    Product = storage.Product
+    PA = Product.__table__.alias("pa")
+    PB = Product.__table__.alias("pb")
+    rows = db.execute(
+        select(
+            PA.c.category.label("slug_a"),
+            PB.c.category.label("slug_b"),
+            func.count(func.distinct(PA.c.brand)).label("shared_brands"),
+        )
+        .where(
+            PA.c.site == site_a,
+            PB.c.site == site_b,
+            PA.c.brand.is_not(None),
+            PB.c.brand.is_not(None),
+            PA.c.brand == PB.c.brand,
+            PA.c.category.is_not(None),
+            PB.c.category.is_not(None),
+        )
+        .group_by(PA.c.category, PB.c.category)
+        .having(func.count(func.distinct(PA.c.brand)) >= min_overlap)
+        .order_by(func.count(func.distinct(PA.c.brand)).desc())
+        .limit(limit * 3)  # extra slots для filter'а already_mapped
+    ).all()
+
+    # Уже-mapped pairs из Category table
+    cat_slug_a = getattr(storage.Category, f"{site_a}_slug")
+    cat_slug_b = getattr(storage.Category, f"{site_b}_slug")
+    existing_mappings = set(
+        db.execute(
+            select(cat_slug_a, cat_slug_b).where(
+                cat_slug_a.is_not(None), cat_slug_b.is_not(None)
+            )
+        ).all()
+    )
+
+    out = []
+    for slug_a, slug_b, n_brands in rows:
+        already = (slug_a, slug_b) in existing_mappings
+        # Top-5 shared brands as sample
+        sample = db.scalars(
+            select(PA.c.brand)
+            .where(
+                PA.c.site == site_a,
+                PA.c.brand.is_not(None),
+                PA.c.category == slug_a,
+                PA.c.brand.in_(
+                    select(PB.c.brand).where(
+                        PB.c.site == site_b,
+                        PB.c.brand.is_not(None),
+                        PB.c.category == slug_b,
+                    )
+                ),
+            )
+            .distinct()
+            .limit(5)
+        ).all()
+        # Counts
+        a_count = db.scalar(
+            select(func.count())
+            .select_from(Product)
+            .where(Product.site == site_a, Product.category == slug_a)
+        ) or 0
+        b_count = db.scalar(
+            select(func.count())
+            .select_from(Product)
+            .where(Product.site == site_b, Product.category == slug_b)
+        ) or 0
+        out.append({
+            "site_a_slug": slug_a,
+            "site_b_slug": slug_b,
+            "shared_brands_count": int(n_brands),
+            "sample_brands": list(sample),
+            "site_a_products": int(a_count),
+            "site_b_products": int(b_count),
+            "already_mapped": already,
+        })
+        if len([o for o in out if not o["already_mapped"]]) >= limit:
+            break
+    return out
+
+
+class _MapCategoryPayload(BaseModel):
+    """Create или extend Category mapping одним кликом."""
+    site_a: str
+    site_a_slug: str
+    site_b: str
+    site_b_slug: str
+    label_ru: str | None = None
+
+
+@app.post("/api/v1/dash/categories/mapping", status_code=201)
+def dash_category_mapping_create(
+    payload: _MapCategoryPayload,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Создать новую Category row из suggested mapping.
+
+    Логика: если уже есть Category row где `{site_a}_slug == payload.site_a_slug` —
+    extend её (добавим site_b_slug). Иначе создать новую.
+    """
+    if user.role not in ("admin", "owner"):
+        raise HTTPException(403, "Admin role required")
+    _require_site(payload.site_a)
+    _require_site(payload.site_b)
+    if payload.site_a == payload.site_b:
+        raise HTTPException(400, "site_a и site_b должны различаться")
+
+    col_a = getattr(storage.Category, f"{payload.site_a}_slug")
+    col_b = getattr(storage.Category, f"{payload.site_b}_slug")
+
+    # Existing row для site_a slug?
+    existing = db.scalar(select(storage.Category).where(col_a == payload.site_a_slug))
+    if existing:
+        # Extend: добавим site_b slug если ещё нет
+        if getattr(existing, f"{payload.site_b}_slug") and getattr(
+            existing, f"{payload.site_b}_slug"
+        ) != payload.site_b_slug:
+            raise HTTPException(
+                409,
+                f"Категория уже маппирована на {payload.site_b}: "
+                f"{getattr(existing, f'{payload.site_b}_slug')}",
+            )
+        setattr(existing, f"{payload.site_b}_slug", payload.site_b_slug)
+        db.commit()
+        return {"id": existing.id, "action": "extended", "key": existing.key}
+
+    # Existing row для site_b slug? (symmetric)
+    existing_b = db.scalar(select(storage.Category).where(col_b == payload.site_b_slug))
+    if existing_b:
+        if getattr(existing_b, f"{payload.site_a}_slug") and getattr(
+            existing_b, f"{payload.site_a}_slug"
+        ) != payload.site_a_slug:
+            raise HTTPException(
+                409,
+                f"Категория уже маппирована на {payload.site_a}: "
+                f"{getattr(existing_b, f'{payload.site_a}_slug')}",
+            )
+        setattr(existing_b, f"{payload.site_a}_slug", payload.site_a_slug)
+        db.commit()
+        return {"id": existing_b.id, "action": "extended", "key": existing_b.key}
+
+    # New row — генерим уникальный key из slug'а
+    base_key = payload.site_a_slug.replace("/", "-").replace("=", "-")[:80]
+    key = base_key
+    seq = 2
+    while db.scalar(select(storage.Category).where(storage.Category.key == key)):
+        key = f"{base_key}_{seq}"
+        seq += 1
+
+    label = payload.label_ru or payload.site_a_slug.replace("-", " ").title()
+    cat = storage.Category(
+        key=key,
+        label_ru=label,
+        label_az=None,
+        pharmonline_slug=payload.site_a_slug if payload.site_a == "pharmonline" else
+            (payload.site_b_slug if payload.site_b == "pharmonline" else None),
+        aptekonline_slug=payload.site_a_slug if payload.site_a == "aptekonline" else
+            (payload.site_b_slug if payload.site_b == "aptekonline" else None),
+        aloe_slug=payload.site_a_slug if payload.site_a == "aloe" else
+            (payload.site_b_slug if payload.site_b == "aloe" else None),
+        is_active=True,
+    )
+    db.add(cat)
+    db.commit()
+    db.refresh(cat)
+    return {"id": cat.id, "action": "created", "key": cat.key}
+
+
 @app.post("/api/v1/dash/matches/{match_id}/reject", status_code=204)
 def dash_match_reject(
     match_id: int,
