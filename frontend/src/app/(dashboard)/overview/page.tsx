@@ -6,6 +6,7 @@ import { useState } from "react";
 import { api, type RunRow } from "@/lib/api";
 import { ActionRow } from "@/components/action-row";
 import { KpiCard } from "@/components/kpi-card";
+import { OnboardingTip } from "@/components/onboarding-tip";
 import { QuickActions } from "@/components/quick-actions";
 import { formatRelative } from "@/lib/utils";
 
@@ -18,6 +19,19 @@ export default function OverviewPage() {
 
   return (
     <div className="space-y-6">
+      <OnboardingTip
+        id="overview-welcome-v1"
+        title="Это — твой главный экран"
+        description={
+          <>
+            4 KPI карточки сверху: сколько cross-site совпадений, какое
+            покрытие и AI confidence. Ниже — «Сегодняшние действия» (где
+            конкурент бьёт по цене и где ты можешь поднять). Расписание
+            прогонов внизу — Mac launchd скрейпит pharm/aptek в 18:00 Baku,
+            aloe — direct с прода в 03:00 UTC.
+          </>
+        }
+      />
       <div className="flex items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Обзор</h1>

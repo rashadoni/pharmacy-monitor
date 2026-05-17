@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Lightbulb, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { api, friendlyError, type CategoryRow, type CategorySuggestion } from "@/lib/api";
+import { OnboardingTip } from "@/components/onboarding-tip";
 
 /**
  * Извлечь slug категории из URL для каждого сайта.
@@ -285,6 +286,18 @@ function SuggestionsPanel() {
 
   return (
     <div className="space-y-4">
+      <OnboardingTip
+        id="categories-suggestions-v1"
+        title="Категория-мапер по brand-overlap"
+        description={
+          <>
+            Cross-3 категорий = 1 — это узкое горлышко покрытия. Тут видны
+            пары категорий из 2 сайтов где много общих брендов — они скорее
+            всего одна категория. Связал → у матчера появляется shared
+            контекст → больше cross-site matches. Цель: довести Cross-3 до 30+.
+          </>
+        }
+      />
       <div className="rounded-md bg-muted/30 border border-border p-3 text-xs text-muted-foreground">
         <Lightbulb className="inline h-3.5 w-3.5 mr-1 -mt-0.5" />
         Подсказки на основе <strong>shared brands</strong> между категориями двух сайтов.

@@ -11,6 +11,7 @@ import { ChevronDown, ChevronUp, TrendingDown, TrendingUp, X } from "lucide-reac
 import { api, type ComparisonRow } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatPct } from "@/lib/utils";
+import { OnboardingTip } from "@/components/onboarding-tip";
 import { Sparkline } from "@/components/sparkline";
 import { TableSkeleton } from "@/components/skeleton";
 
@@ -138,6 +139,20 @@ export default function ComparisonPage() {
 
   return (
     <div className="space-y-4">
+      <OnboardingTip
+        id="comparison-arrows-v1"
+        title="Как читать таблицу"
+        description={
+          <>
+            Зелёный <span className="text-success">▼</span> = pharmonline
+            (client) дешевле всех. Красный <span className="text-destructive">▲</span>{" "}
+            = конкурент дешевле, надо реагировать. Клик на ▼/▲ кнопке справа от
+            spread — открывает тренд 30 дней. Кнопка «⬇ CSV» вверху —
+            экспорт отфильтрованного.
+          </>
+        }
+      />
+
       <div className="flex items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Сравнение цен</h1>

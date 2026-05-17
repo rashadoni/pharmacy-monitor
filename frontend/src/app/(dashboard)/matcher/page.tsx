@@ -22,6 +22,7 @@ import {
   type SiteProduct,
   type UnmatchedPair,
 } from "@/lib/api";
+import { OnboardingTip } from "@/components/onboarding-tip";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice } from "@/lib/utils";
 import { CreateFromScratch } from "./create-from-scratch";
@@ -72,6 +73,20 @@ export default function MatcherPage() {
 
   return (
     <div className="space-y-6">
+      <OnboardingTip
+        id="matcher-overview-v1"
+        title="Когда нужен ручной матчер"
+        description={
+          <>
+            Auto-matcher на name+brand similarity отрабатывает 99%
+            случаев. Сюда заходишь когда: товар точно есть на 2-3 сайтах,
+            но названия настолько разные что матчер не справился. Один
+            клик «Привязать» — создаётся manual Match (is_manual=True),
+            авто-матчер его больше не трогает.
+          </>
+        }
+      />
+
       <header className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
