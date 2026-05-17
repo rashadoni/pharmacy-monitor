@@ -82,11 +82,15 @@ jobs:
         env:
           DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
           SITES_INPUT: ${{ github.event.inputs.sites || 'pharmonline,aptekonline' }}
-          # ScraperAPI proxy — GitHub Actions IP заблокирован Cloudflare для pharm/aptek,
-          # роутимся через ScraperAPI residential pool (см. src/scrapers/base.py).
+          # Crawlbase Smart Proxy — приоритетный провайдер. Free tier 1000 req
+          # для пилота, потом $29/мес 250k req. JS Token для Playwright (pharm),
+          # Normal Token для httpx (aptek JSON API).
+          CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
+          CRAWLBASE_NORMAL_TOKEN: ${{ secrets.CRAWLBASE_NORMAL_TOKEN }}
+          CRAWLBASE_SITES: pharmonline,aptekonline
+          # ScraperAPI — фоллбэк если CRAWLBASE_*_TOKEN не задан.
           SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
           SCRAPER_API_SITES: pharmonline,aptekonline
-          SCRAPER_API_COUNTRY: az  # Baku exit nodes если доступны
         run: |
           # Преобразуем "pharmonline,aptekonline" в "--site pharmonline --site aptekonline"
           SITE_ARGS=""
