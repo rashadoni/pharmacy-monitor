@@ -289,14 +289,31 @@ def _decorate_attrs(raw: dict) -> dict:
 # ─── Main entry point ────────────────────────────────────────────────────────
 
 
+def _is_review_attrs(attrs: dict | None) -> bool:
+    """True если attrs помечены needs_review=True (low-confidence из прошлого прогона)."""
+    return isinstance(attrs, dict) and bool(attrs.get("needs_review"))
+
+
 def _pending_products(
     session: Session,
     *,
     site: str | None,
     limit: int | None,
     force: bool,
+    re_extract_review: bool = False,
 ) -> list[Product]:
-    """Продукты которым нужна нормализация (новые ИЛИ изменили hash ИЛИ force)."""
+    """Продукты которым нужна нормализация.
+
+    Включаются:
+    - Новые (`normalized_attrs IS NULL`)
+    - Изменили hash (`name/brand/dosage/pack_size` отличаются от прошлого прогона)
+    - Все, если `force=True`
+    - Помеченные `needs_review=True`, если `re_extract_review=True` (PO Audit
+      2026-05-17: 28K продуктов с low-confidence ждут повторной попытки).
+
+    Re-extract отличается от force тем, что не трогает high-confidence продукты —
+    дешевле в 1.6× и не тратит токены на уже хорошие записи.
+    """
     stmt = select(Product)
     if site is not None:
         stmt = stmt.where(Product.site == site)
@@ -305,7 +322,13 @@ def _pending_products(
     pending: list[Product] = []
     for p in products:
         new_hash = compute_normalize_hash(p.site, p.name, p.brand, p.dosage, p.pack_size)
-        if force or p.normalize_hash != new_hash or p.normalized_attrs is None:
+        include = (
+            force
+            or p.normalize_hash != new_hash
+            or p.normalized_attrs is None
+            or (re_extract_review and _is_review_attrs(p.normalized_attrs))
+        )
+        if include:
             pending.append(p)
         if limit is not None and len(pending) >= limit:
             break
@@ -322,12 +345,20 @@ def normalize_run(
     model: str | None = None,
     budget_usd: float | None = None,
     force: bool = False,
+    re_extract_review: bool = False,
+    dry_run: bool = False,
 ) -> NormalizeStats:
     """Основной API. Нормализует все pending продукты, возвращает статистику.
 
     - `site` — ограничить одним сайтом (pharmonline/aptekonline/aloe)
     - `limit` — максимум продуктов в этом прогоне (smoke-тесты)
-    - `force` — пересчитать даже cached (после изменения prompt'а)
+    - `force` — пересчитать даже cached (после изменения prompt'а). Дорого:
+      жмёт LLM на ВСЕ продукты.
+    - `re_extract_review` — повторно вызвать LLM на продуктах с `needs_review=True`.
+      Дешевле `force`: трогает только проблемное подмножество (~28K из 44K на
+      прод-данных). Cache bypass только для needs_review-кандидатов.
+    - `dry_run` — посчитать pending + оценить стоимость, не вызывая LLM.
+      Полезно перед большим backfill'ом чтобы убедиться в бюджете.
     """
     provider = provider or os.getenv("AI_NORMALIZE_PROVIDER", DEFAULT_PROVIDER)
     model = model or os.getenv("AI_NORMALIZE_MODEL", DEFAULT_MODEL)
@@ -341,7 +372,13 @@ def normalize_run(
     )
 
     stats = NormalizeStats()
-    pending = _pending_products(session, site=site, limit=limit, force=force)
+    pending = _pending_products(
+        session,
+        site=site,
+        limit=limit,
+        force=force,
+        re_extract_review=re_extract_review,
+    )
     stats.products_total = len(pending)
     if not pending:
         log.info("ai_normalize_nothing_to_do", site=site)
@@ -353,24 +390,61 @@ def normalize_run(
     for p in pending:
         h = compute_normalize_hash(p.site, p.name, p.brand, p.dosage, p.pack_size)
         new_hashes[p.id] = h
+    # Когда `re_extract_review=True`, для needs_review-продуктов кэш надо
+    # проигнорировать — иначе они получат те же low-confidence attrs из
+    # _load_cached_attrs_by_hash и LLM так и не вызовется. Tracking
+    # per-product set: каждый продукт с needs_review=True идёт мимо cache.
+    force_individual: set[int] = set()
+    if re_extract_review:
+        for p in pending:
+            if _is_review_attrs(p.normalized_attrs):
+                force_individual.add(p.id)
+
     if not force:
         cache_map = _load_cached_attrs_by_hash(
             session, list({h for h in new_hashes.values()})
         )
 
-    # Step 2: applying cached attrs (no LLM call)
+    # Step 2: applying cached attrs (no LLM call). force_individual продукты
+    # пропускаем чтобы они дошли до LLM-этапа.
     cached_ids: set[int] = set()
     for p in pending:
+        if p.id in force_individual:
+            continue
         h = new_hashes[p.id]
         if h in cache_map:
             _save_attrs(session, p.id, cache_map[h], h)
             cached_ids.add(p.id)
             stats.products_cached += 1
-    if cached_ids:
+    if cached_ids and not dry_run:
         session.commit()
 
     # Step 3: batch LLM call for the rest
     to_call = [p for p in pending if p.id not in cached_ids]
+
+    # Dry-run: оцениваем стоимость без LLM-вызовов.
+    # Эмпирика на claude-haiku-4-5 (см. CLAUDE.md прод-метрики ai_normalize):
+    # system prompt ~700 токенов амортизируется на batch_size=50 → ~14 in/product.
+    # Пользовательский payload: ~25 tokens per product input.
+    # JSON-ответ: ~50 output tokens per product.
+    if dry_run:
+        avg_in_per_product = 40
+        avg_out_per_product = 55
+        stats.tokens_in = len(to_call) * avg_in_per_product
+        stats.tokens_out = len(to_call) * avg_out_per_product
+        stats.cost_usd = estimate_cost_usd(
+            stats.tokens_in, stats.tokens_out, provider, model
+        )
+        log.info(
+            "ai_normalize_dry_run",
+            total=stats.products_total,
+            cached=stats.products_cached,
+            to_call=len(to_call),
+            estimated_cost_usd=round(stats.cost_usd, 4),
+            provider=provider,
+            model=model,
+        )
+        return stats
     log.info(
         "ai_normalize_batches_planned",
         total=stats.products_total,

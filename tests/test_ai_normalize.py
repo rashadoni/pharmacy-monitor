@@ -259,6 +259,99 @@ def test_normalize_site_filter(db_session):
     assert pending[0].site == "aloe"
 
 
+def test_pending_products_picks_needs_review_when_flag_set(db_session):
+    """`re_extract_review=True` подбирает продукт с needs_review=True, даже
+    если hash совпадает с кэшем (т.е. без этого флага он был бы skipped).
+    Backfill 28K низко-уверенных продуктов без --force.
+    """
+    p = _add_product(db_session)
+    h = ai_normalize.compute_normalize_hash(p.site, p.name, p.brand, p.dosage, p.pack_size)
+    p.normalize_hash = h
+    p.normalized_attrs = {
+        "active_ingredient": "vitamin c",
+        "confidence": 0.4,
+        "needs_review": True,
+    }
+    db_session.commit()
+
+    # Без флага — pending пуст (hash совпадает + есть attrs)
+    pending_no_flag = ai_normalize._pending_products(
+        db_session, site=None, limit=None, force=False, re_extract_review=False
+    )
+    assert p not in pending_no_flag
+
+    # С флагом — pending включает review-продукт
+    pending_with_flag = ai_normalize._pending_products(
+        db_session, site=None, limit=None, force=False, re_extract_review=True
+    )
+    assert p in pending_with_flag
+
+
+def test_re_extract_review_bypasses_cache_for_review_products(db_session):
+    """Когда re_extract_review=True, low-confidence продукты идут в LLM, а не
+    в кэш (иначе они получат те же low-conf attrs обратно).
+    """
+    p = _add_product(db_session, ext_id="rev1")
+    h = ai_normalize.compute_normalize_hash(p.site, p.name, p.brand, p.dosage, p.pack_size)
+    p.normalize_hash = h
+    p.normalized_attrs = {
+        "active_ingredient": "unclear",
+        "confidence": 0.3,
+        "needs_review": True,
+    }
+    db_session.commit()
+
+    # Stub LLM: возвращает high-confidence attrs
+    def fake_llm(payload, provider, model):
+        attrs = [
+            {
+                "idx": item["idx"],
+                "active_ingredient": "acetylsalicylic acid",
+                "dosage_mg": 100.0,
+                "pack_count": 30,
+                "form": "tablet",
+                "brand_canonical": "Bayer",
+                "is_pharma": True,
+                "confidence": 0.95,
+                "needs_review": False,
+            }
+            for item in payload
+        ]
+        return attrs, 100, 50
+
+    with patch.object(ai_normalize, "call_llm_batch", side_effect=fake_llm) as mock_llm:
+        stats = ai_normalize.normalize_run(db_session, re_extract_review=True)
+
+    mock_llm.assert_called_once()
+    assert stats.products_called == 1
+    assert stats.products_cached == 0
+    db_session.refresh(p)
+    assert p.normalized_attrs["active_ingredient"] == "acetylsalicylic acid"
+    assert p.normalized_attrs["confidence"] == 0.95
+    assert p.normalized_attrs["needs_review"] is False
+
+
+def test_normalize_dry_run_estimates_cost_without_llm(db_session):
+    """--dry-run считает pending + оценивает стоимость, не вызывая LLM."""
+    # 10 продуктов: новые, hash не выставлен → все pending
+    for i in range(10):
+        _add_product(db_session, ext_id=f"dr{i}")
+    db_session.commit()
+
+    with patch.object(ai_normalize, "call_llm_batch") as mock_llm:
+        stats = ai_normalize.normalize_run(db_session, dry_run=True)
+
+    # Главное: LLM не вызывался
+    mock_llm.assert_not_called()
+    # Pending всё ещё 10, никто не помечен called/cached в БД
+    assert stats.products_total == 10
+    assert stats.products_called == 0
+    # Cost > 0 (есть оценка) и токены подсчитаны
+    assert stats.cost_usd > 0
+    assert stats.tokens_in > 0
+    assert stats.tokens_out > 0
+
+
 def test_parse_llm_response_strips_markdown_fence():
     """LLM иногда оборачивает JSON в ```json fence — должен распарситься."""
     txt = '```json\n[{"idx": 0, "confidence": 0.9}]\n```'

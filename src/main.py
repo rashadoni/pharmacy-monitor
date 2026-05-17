@@ -593,12 +593,29 @@ def init_db_cmd() -> None:
     default=False,
     help="Пересчитать даже cached продукты (после изменения prompt'а)",
 )
+@click.option(
+    "--re-extract-review",
+    is_flag=True,
+    default=False,
+    help=(
+        "Перевызвать LLM на продуктах с needs_review=True. Дешевле --force: "
+        "трогает только low-confidence подмножество."
+    ),
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Посчитать pending + оценить стоимость без вызова LLM.",
+)
 def ai_normalize_cmd(
     site: str | None,
     limit: int | None,
     batch_size: int | None,
     budget_usd: float | None,
     force: bool,
+    re_extract_review: bool,
+    dry_run: bool,
 ) -> None:
     """AI-нормализация фарма-атрибутов: active_ingredient, dosage_mg, pack_count.
 
@@ -612,6 +629,11 @@ def ai_normalize_cmd(
         pharmacy-monitor ai-normalize --site aloe              # только aloe
         pharmacy-monitor ai-normalize --limit 100              # smoke-test
         pharmacy-monitor ai-normalize --force                  # пересчёт всех
+        pharmacy-monitor ai-normalize --re-extract-review --dry-run
+                                                               # оценить стоимость
+                                                               # backfill needs_review
+        pharmacy-monitor ai-normalize --re-extract-review --budget-usd 5
+                                                               # реально запустить
     """
     from src import ai_normalize
 
@@ -625,7 +647,27 @@ def ai_normalize_cmd(
             batch_size=batch_size,
             budget_usd=budget_usd,
             force=force,
+            re_extract_review=re_extract_review,
+            dry_run=dry_run,
         )
+
+    if dry_run:
+        click.echo("─" * 60)
+        click.echo("DRY-RUN — LLM не вызывался.")
+        click.echo(f"  Pending:          {stats.products_total}")
+        click.echo(f"  Cached (skip):    {stats.products_cached}")
+        click.echo(
+            f"  To call LLM:      {stats.products_total - stats.products_cached}"
+        )
+        click.echo(f"  Est tokens in:    {stats.tokens_in:,}")
+        click.echo(f"  Est tokens out:   {stats.tokens_out:,}")
+        click.echo(f"  Est cost USD:     ${stats.cost_usd:.4f}")
+        if budget_usd is not None and stats.cost_usd > budget_usd:
+            click.echo(
+                f"⚠️  Оценка превысит --budget-usd={budget_usd}. "
+                "Учти --limit или повышай budget перед реальным запуском."
+            )
+        return
 
     click.echo(
         f"total={stats.products_total}  "
