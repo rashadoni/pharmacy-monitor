@@ -40,10 +40,32 @@ export default function OverviewPage() {
           value={matchQ.data?.products_total ?? "—"}
           loading={matchQ.isLoading}
         />
+        {/*
+          P1.3 (PO Audit 2026-05-17): раньше карточка показывала coverage_pct
+          (99.1% «AI прошёл хоть как-то») и в hint'е писала «28457 нужно
+          проверить» — внутреннее противоречие. Теперь — high-confidence
+          процент: (normalized - needs_review) / total. Это даёт честное
+          представление качества AI extraction. Например 35.9% реально-уверенно
+          извлечённых атрибутов, остальные 64% — нужно review-нуть.
+        */}
         <KpiCard
-          label="Manual matches"
-          value={matchQ.data?.manual_matches ?? "—"}
-          loading={matchQ.isLoading}
+          label="AI confidence (high)"
+          value={
+            normalizeQ.data
+              ? `${(
+                  ((normalizeQ.data.products_normalized -
+                    normalizeQ.data.needs_review) /
+                    Math.max(1, normalizeQ.data.products_total)) *
+                  100
+                ).toFixed(1)}%`
+              : "—"
+          }
+          loading={normalizeQ.isLoading}
+          hint={
+            normalizeQ.data
+              ? `${normalizeQ.data.needs_review.toLocaleString("ru-RU")} из ${normalizeQ.data.products_total.toLocaleString("ru-RU")} с low-confidence`
+              : "Доля продуктов с надёжно извлечёнными active_ingredient/dosage/pack"
+          }
         />
       </div>
 
