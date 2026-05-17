@@ -25,9 +25,11 @@ export default function WatchlistPage() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">📋 Watchlist</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">⭐ Watchlist</h1>
           <p className="text-sm text-muted-foreground">
-            Priority SKU для гарантированного cross-site сравнения
+            Приоритетные товары для гарантированного cross-site трекинга. Используй
+            если auto-matcher не нашёл match по name similarity, а товар точно
+            одинаковый на всех 3 сайтах.
           </p>
         </div>
         <button
@@ -43,8 +45,30 @@ export default function WatchlistPage() {
 
       {isLoading && <div className="text-muted-foreground">Загрузка…</div>}
       {data && data.length === 0 && (
-        <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center">
-          Watchlist пуст. Нажми «Добавить» чтобы привязать товар к URL'ам на 3 сайтах.
+        // P1.7 (PO Audit 2026-05-17): был {text-only} placeholder с (пример)
+        // данными в БД — никто фичу не пользовал. Делаем empty state объясняющий
+        // когда watchlist реально нужен и приглашающий первое добавление.
+        <div className="rounded-lg border border-dashed border-border bg-card p-8 text-center space-y-3">
+          <div className="text-4xl">⭐</div>
+          <div className="text-base font-medium">Watchlist пуст</div>
+          <div className="text-sm text-muted-foreground max-w-md mx-auto leading-relaxed">
+            Если у тебя есть SKU который ты хочешь видеть на /comparison при любых
+            условиях — добавь его URL на pharmonline / aptekonline / aloe сюда. Это
+            обходит автоматический matcher и связывает товары жёстко.
+            <br />
+            <span className="text-muted-foreground/70 text-xs">
+              Для большинства товаров auto-matcher работает сам — watchlist
+              нужен только для редких случаев (плохо нормализованные имена,
+              специальные SKU).
+            </span>
+          </div>
+          <button
+            onClick={() => setShowAdd(true)}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 mt-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <Plus className="h-4 w-4" />
+            Добавить первый
+          </button>
         </div>
       )}
 
