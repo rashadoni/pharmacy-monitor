@@ -167,6 +167,16 @@ class PharmonlineScraper(BaseScraper):
         price_handle = await card.query_selector(".second_price, .main-price")
         price = parse_price(await price_handle.inner_text()) if price_handle else None
 
+        # Sale detection — два источника (P0.3 PO Audit 2026-05-17):
+        # (а) old_price > price — классический crossed-out селектор (раньше
+        #     был единственным, давал 0% для pharmonline т.к. они не рендерят
+        #     зачёркнутую цену на каталог-карточках)
+        # (б) presence `.product_sale` badge — pharmonline 2026 UI ставит этот
+        #     CSS-флаг на карточку, если товар "со скидкой". Без old_price,
+        #     поэтому discount_percent остаётся None.
+        # NB: pharmonline маркирует **большинство** карточек как .product_sale
+        # (always-on marketing). Это даёт ~100% sale для site/pharmonline KPI
+        # — точнее чем 0%, но интерпретируется как «у клиента always-on акция».
         old_price_handle = await card.query_selector(
             ".old-price, [class*='old-price'], s, del"
         )
@@ -174,9 +184,14 @@ class PharmonlineScraper(BaseScraper):
             parse_price(await old_price_handle.inner_text()) if old_price_handle else None
         )
 
-        is_on_sale = old_price is not None and price is not None and old_price > price
+        has_crossed_old = (
+            old_price is not None and price is not None and old_price > price
+        )
+        has_sale_badge = await card.query_selector(".product_sale") is not None
+        is_on_sale = has_crossed_old or has_sale_badge
+
         discount_percent = None
-        if is_on_sale and old_price:
+        if has_crossed_old and old_price:
             discount_percent = round((1 - price / old_price) * 100, 1)  # type: ignore[operator]
 
         img_handle = await card.query_selector("img")
@@ -224,7 +239,9 @@ class PharmonlineScraper(BaseScraper):
             # У pharmonline старая цена может быть рядом — пока не находим её отдельно.
             # Если найдётся в HTML — добавим селектор.
             old_price = None
-            is_on_sale = False
+            # P0.3: проверяем `.product_sale` badge (см. _parse_card)
+            sale_badge = await page.query_selector(".product_sale")
+            is_on_sale = sale_badge is not None
             discount_percent = None
 
             img_handle = await page.query_selector("main img, .product-image img, [class*='product'] img")
