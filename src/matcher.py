@@ -260,6 +260,22 @@ def _has_conflicting_variant_tokens(name_a: str, name_b: str) -> bool:
     return bool(unique_a) and bool(unique_b)
 
 
+def _norm_units(s: str) -> str:
+    """Нормализует единицы дозировки/объёма для bucket_key.
+
+    Унифицирует азербайджанские/русские аббревиатуры с международными:
+    - mq → mg  (милиграм по-азербайджански = milligram)
+    - mkg → mcg (микрограм)
+    - цифра+q (напр. «5q», «0.5q») → цифра+g (gram)
+
+    Без этого «rinafos 250mq/5ml» (aptekonline) и «rinafos 250mg/5ml» (pharmonline)
+    попадают в разные bucket'ы, несмотря на идентичный товар.
+    """
+    s = s.replace("mq", "mg").replace("mkg", "mcg")
+    s = re.sub(r"(\d)q\b", r"\1g", s)
+    return s
+
+
 def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> int:
     """Прогнать матчинг на всех товарах в БД.
 
@@ -290,8 +306,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     # слово name_normalized, которое обычно и есть торговое название.
     def bucket_key(p: Product) -> tuple:
         brand = (p.brand or "").lower().strip()
-        dosage = (p.dosage or "").lower().replace(" ", "")
-        pack = (p.pack_size or "").lower().replace(" ", "")
+        # _norm_units: mq→mg, mkg→mcg, (\d)q→\1g — унифицирует AZ/RU единицы
+        # с международными, чтобы «250mq» и «250mg» попадали в один bucket.
+        dosage = _norm_units((p.dosage or "").lower().replace(" ", ""))
+        pack = _norm_units((p.pack_size or "").lower().replace(" ", ""))
         name_norm = (p.name_normalized or "").lower()
         tokens = name_norm.split()
         if brand:
@@ -377,6 +395,89 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= fuzzy_threshold:
+                    cluster.append(q)
+
+            if len(cluster) >= 2:
+                created_or_updated += _persist_match(session, cluster)
+                visited.update(c.id for c in cluster)
+
+    # ── Secondary pass: (brand, pack) без досировки ─────────────────────────
+    # Охватывает пары, где один сайт спарсил dosage, другой — нет.
+    # Пример: aptekonline ('alvis', '', 'n40') ↔ pharmonline ('alvis', '60mg/300mg', 'n40').
+    # После первого прохода оба остаются unvisited (разные bucket_key).
+    # Используем порог 85 (строже базового 78), чтобы компенсировать
+    # ослабленное ограничение на dosage.
+    _SEC_THRESHOLD = 85
+    by_brand_pack: dict[tuple, list[Product]] = defaultdict(list)
+    for p in products:
+        if p.id in visited:
+            continue
+        bk = bucket_key(p)
+        bp_key = (bk[0], bk[2])  # (brand, pack)
+        if not bp_key[0] or not bp_key[1]:
+            continue  # без бренда или упаковки — слишком широкий bucket
+        by_brand_pack[bp_key].append(p)
+
+    log.info(
+        "matcher_secondary_pass",
+        brand_pack_buckets=len(by_brand_pack),
+        candidates=sum(len(g) for g in by_brand_pack.values()),
+    )
+
+    for _bp_key, group in by_brand_pack.items():
+        if len(group) < 2:
+            continue
+        for i, p in enumerate(group):
+            if p.id in visited:
+                continue
+            dosage_p = _norm_units((p.dosage or "").lower().replace(" ", ""))
+            cluster = [p]
+            for q in group[i + 1 :]:
+                if q.id in visited:
+                    continue
+                if q.site == p.site:
+                    continue
+                if any(c.site == q.site for c in cluster):
+                    continue
+                dosage_q = _norm_units((q.dosage or "").lower().replace(" ", ""))
+                # Вторичный проход: только если хотя бы у одного пустая дозировка.
+                # Пары с двумя непустыми разными дозировками — это явно разные
+                # препараты (даже если brand+pack совпадают), не матчим.
+                if dosage_p and dosage_q:
+                    continue
+                if any(is_rejected(session, c.id, q.id) for c in cluster):
+                    continue
+                if any(
+                    _has_conflicting_modifier(c.name_normalized or "", q.name_normalized or "")
+                    for c in cluster
+                ):
+                    continue
+                if any(
+                    _has_conflicting_series_number(c.name_normalized or "", q.name_normalized or "")
+                    for c in cluster
+                ):
+                    continue
+                if _has_conflicting_form(p.name or "", q.name or ""):
+                    continue
+                if _has_extreme_length_disparity(
+                    p.name_normalized or "", q.name_normalized or ""
+                ):
+                    continue
+                if _has_conflicting_orphan_number(
+                    p.name_normalized or "", q.name_normalized or ""
+                ):
+                    continue
+                if _has_conflicting_gender(
+                    p.name_normalized or "", q.name_normalized or ""
+                ):
+                    continue
+                if any(
+                    _has_conflicting_variant_tokens(c.name_normalized or "", q.name_normalized or "")
+                    for c in cluster
+                ):
+                    continue
+                score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
+                if score >= _SEC_THRESHOLD:
                     cluster.append(q)
 
             if len(cluster) >= 2:
