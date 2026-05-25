@@ -37,6 +37,8 @@ _FORMS = (
     "amp",
     "drops",
     "damci",
+    "damcı",      # dotless-i (U+0131)
+    "damcısı",    # dotless-i variant with suffix
     "kapli",
     "gel",
     "powder",
@@ -48,13 +50,81 @@ _FORMS = (
     "şam",
     "eye drops",
     "göz damcisi",
+    # Azerbaijani plural / inflected forms (pharmonline adds these in parens)
+    "tabletlər",   # plural of "tablet" in AZ
+    "tabletkalar",
+    "kapsullar",   # plural of "kapsul" in AZ
+    "kapsulalar",
+    "kapsulları",
+    "ampulalar",
+    "ampullar",
+    "ampulları",
+    "damlalar",
+    "damcılar",
+    "suppozitorlar",
+    "suppozitorları",
+    "şamlar",
+    "dragee",
+    "draje",
+    "ampoules",    # English plural (seen in aloe/pharmonline)
+    "tablets",
+    "capsules",
+    "sorma",       # Azerbaijani "dissolving" — not a form per se but pharmonline uses it
 )
 
 _FORMS_RE = re.compile(r"\b(" + "|".join(_FORMS) + r")\b", re.IGNORECASE)
 
+# Канонические группы форм выпуска: синонимы → одно имя.
+# Кремы ≠ мази ≠ капли ≠ спреи — это РАЗНЫЕ препараты, матчинг запрещён.
+_FORM_CANONICAL: dict[str, str] = {
+    "tablet": "tablet",   "tab": "tablet",       "tabletka": "tablet",
+    "kapsul": "capsule",  "capsule": "capsule",  "kaps": "capsule",
+    "krem": "cream",      "cream": "cream",
+    "məlhəm": "ointment", "ointment": "ointment", "maz": "ointment",
+    "spreyi": "spray",    "spray": "spray",       "sprey": "spray",
+    "drops": "drops",     "damci": "drops",       "kapli": "drops",
+    "damcı": "drops",     "damcısı": "drops",     # dotless-i (U+0131) варианты
+    "eye drops": "drops", "göz damcisi": "drops", "göz damcısı": "drops",
+    "məhlul": "solution", "solution": "solution", "raztvor": "solution",
+    "gel": "gel",
+    "powder": "powder",   "poroshok": "powder",   "toz": "powder",
+    "suppoziter": "suppository", "suppository": "suppository",
+    "svecha": "suppository",     "şam": "suppository",
+    "siropla": "syrup",   "syrup": "syrup",
+    "şərbət": "syrup",    "sirop": "syrup",
+    "ampul": "ampoule",   "ampoule": "ampoule",   "amp": "ampoule",
+}
+
+
+def extract_form(name: str) -> str | None:
+    """Извлечь нормализованную форму выпуска из имени товара.
+
+    Работает на исходном (ненормализованном) имени — форма убирается
+    в normalize_name(), поэтому нужно вызывать ДО нормализации.
+
+    Возвращает каноническую группу: 'tablet', 'capsule', 'cream',
+    'ointment', 'spray', 'drops', 'solution', 'gel', 'powder',
+    'suppository', 'syrup', 'ampoule'. None если форма не распознана.
+    """
+    if not name:
+        return None
+    m = _FORMS_RE.search(name)
+    if not m:
+        return None
+    token = m.group(1).lower()
+    return _FORM_CANONICAL.get(token, token)
+
 # Дозировка: 500 mg, 10 ml, 100 mcg, 1.5 g, 250mg/5ml, etc.
 _DOSAGE_RE = re.compile(
-    r"\b(\d+(?:[.,]\d+)?\s*(?:mg|mkg|mcg|µg|g|ml|mq|qr|qrm|q|iu|me|%)(?:\s*/\s*\d+(?:[.,]\d+)?\s*(?:mg|mkg|mcg|µg|g|ml|mq|qr|q|iu|me|%))?)\b",
+    # Единицы дозировки расширены:
+    #   ed   = Einheit (нем.) = IU — aptekonline URL-слаги (3500-ED)
+    #   ie   = Internationale Einheit (нем.) = IU
+    #   tv   = тысяч единиц (aptekonline: «10000 TV»)
+    #   bv   = биологических единиц (pharmonline: «10000 BV»)
+    #   u    = units (краткая форма: «3500 U»)
+    #   units = полная форма
+    #   tis  = тысяч единиц (рос.)
+    r"\b(\d+(?:[.,]\d+)?\s*(?:mg|mkg|mcg|µg|g|ml|mq|qr|qrm|q|iu|ie|ed|me|tv|bv|u|units|tis|%)(?:\s*/\s*\d+(?:[.,]\d+)?\s*(?:mg|mkg|mcg|µg|g|ml|mq|qr|q|iu|ie|ed|me|tv|bv|u|units|tis|%))?)\b",
     re.IGNORECASE,
 )
 
@@ -81,12 +151,57 @@ _PACK_VOLUME_RE = re.compile(
 # его для удаления pack-токенов из имени).
 _PACK_RE = re.compile(
     r"\b(\d+\s*(?:tab|tabletka|kapsul|capsules|kaps|şt|шт|adet|amp|pieces|əd|n\d+)"
-    r"|n\s*\d+|№\s*\d+|\d+\s*(?:ml|kg|kq|qr|qrm|q|g))\b",
+    r"|n\s*\d+|no\s*\d+|№\s*\d+|\d+\s*(?:ml|kg|kq|qr|qrm|q|g))\b",
+    # no\s*\d+ убирает «No 20» — стейл-артефакт от «№ 20» после strip_punct
     re.IGNORECASE,
 )
 
 _PUNCT_RE = re.compile(r"[^\w\s%/.\-]", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
+
+# Страны происхождения — pharmonline добавляет в конце имени: «(Türkiyə)».
+# После strip_accents + lower + PUNCT_RE они становятся отдельными токенами в
+# name_normalized («turkiyə», «rusiya» и т.п.) и мешают fuzzy-match.
+# Список покрывает все страны, встречающиеся в prod-данных.
+_COUNTRY_RE = re.compile(
+    r"\b(?:"
+    r"turkiyə|türkiyə|turkiye|turkey|"
+    r"rusiya|russia|"
+    r"almaniya|germany|"
+    r"italiya|italy|"
+    r"polsa|polşa|poland|"
+    r"ukrayna|ukraine|"
+    r"cin|çin|china|"
+    r"avstriya|austria|"
+    r"sloveniya|slovakia|slovakiya|slovakia|"
+    r"rumıniya|rumaniya|romania|"
+    r"ispaniya|spain|"
+    r"fransa|france|"
+    r"ingiltərə|england|uk|"
+    r"belcika|belgium|"
+    r"niderlandlar|netherlands|"
+    r"danimarka|denmark|"
+    r"isvec|sweden|"
+    r"norvec|norway|"
+    r"finlandiya|finland|"
+    r"isveçrə|switzerland|"
+    r"hindistan|india|"
+    r"yaponiya|japan|"
+    r"koreya|korea|"
+    r"bolqarıstan|bulgaria|"
+    r"cexiya|czech|"
+    r"yunanistan|greece|"
+    r"macaristan|hungary|"
+    r"azerbaycan|azərbaycan|"
+    r"belarus|belarusiya|"
+    r"qazaxstan|kazakhstan|"
+    r"oezbekistan|uzbekistan|"
+    r"iordaniya|jordan|"
+    r"misir|egypt|"
+    r"pakistan"
+    r")\b",
+    re.IGNORECASE,
+)
 
 # Категория-префиксы (тип товара, не имя продукта). Их нужно убрать
 # из name_normalized чтобы fuzzy match не считал «Südlü qarışıq» общим
@@ -177,11 +292,13 @@ def normalize_name(name: str) -> str:
     Pipeline:
     1. strip_accents (ə→e, ş→s)
     2. lower-case
-    3. убираем формы лекарств (tab, kapsul, …)
+    3. убираем формы лекарств (tab, kapsul, tabletlər, kapsulalar, …)
     4. убираем dosage и pack-size (числа+единицы) — они хранятся отдельно
-    5. убираем category-префиксы («Südlü qarışıq», «Uşaq qidası» — это тип, не имя)
-    6. унифицируем написание бренда (frisolak→frisolac etc.)
-    7. punctuation→space, collapse whitespace
+    5. убираем страны происхождения (Türkiyə, Rusiya, Germany, …)
+    6. убираем category-префиксы («Südlü qarışıq», «Uşaq qidası» — это тип, не имя)
+    7. унифицируем написание бренда (frisolak→frisolac etc.)
+    8. punctuation→space, collapse whitespace
+    9. убираем одиночные незначащие токены (напр. "." из "30 əd.")
     """
     if not name:
         return ""
@@ -191,10 +308,14 @@ def normalize_name(name: str) -> str:
     s = _FORMS_RE.sub(" ", s)
     s = _DOSAGE_RE.sub(" ", s)
     s = _PACK_RE.sub(" ", s)
+    s = _COUNTRY_RE.sub(" ", s)
     s = _PUNCT_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip()
     s = _strip_category_prefix(s)
     s = _unify_brand_spelling(s)
+    # Убираем одиночные незначащие токены: "." из "30 əd.", "-" и т.п.
+    # Возникают после stripping pack-суффиксов типа "20 əd." → "."
+    s = " ".join(t for t in s.split() if len(t) > 1 or t.isalnum())
     s = _WS_RE.sub(" ", s).strip()
     return s
 
