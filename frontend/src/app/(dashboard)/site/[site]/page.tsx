@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { notFound, useParams } from "next/navigation";
+import { useTranslations } from "next-intl";
 import { useState } from "react";
 import { Building2, ExternalLink, Leaf, Pill, Search } from "lucide-react";
 import { api, type SiteProduct } from "@/lib/api";
@@ -51,21 +52,21 @@ function prettyCategoryLabel(c: { name: string; label?: string }): string {
 const VALID_SITES = ["pharmonline", "aptekonline", "aloe"] as const;
 type SiteName = (typeof VALID_SITES)[number];
 
-const SITE_META: Record<SiteName, { icon: typeof Leaf; iconColor: string; tagline: string }> = {
+const SITE_META: Record<SiteName, { icon: typeof Leaf; iconColor: string; taglineKey: string }> = {
   pharmonline: {
     icon: Building2,
     iconColor: "text-primary",
-    tagline: "Основной клиентский сайт. Каталог, бренды и ROI с перспективы pharmonline.",
+    taglineKey: "tagline_pharmonline",
   },
   aptekonline: {
     icon: Pill,
     iconColor: "text-warning",
-    tagline: "Крупнейший конкурент по ассортименту. Срез с перспективы aptekonline.",
+    taglineKey: "tagline_aptekonline",
   },
   aloe: {
     icon: Leaf,
     iconColor: "text-success",
-    tagline: "Бутиковая аптека. Каталог, бренды и ROI с перспективы aloe.",
+    taglineKey: "tagline_aloe",
   },
 };
 
@@ -74,6 +75,8 @@ function competitorsOf(site: SiteName): SiteName[] {
 }
 
 export default function SitePage() {
+  const t = useTranslations("site");
+  const tCommon = useTranslations("common");
   const params = useParams();
   const siteParam = (params.site as string) ?? "";
 
@@ -109,12 +112,12 @@ export default function SitePage() {
           <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
             <Icon className={`h-6 w-6 ${meta.iconColor}`} /> {site}.az
           </h1>
-          <p className="text-sm text-muted-foreground">{meta.tagline}</p>
+          <p className="text-sm text-muted-foreground">{t(meta.taglineKey as any)}</p>
         </div>
         <div className="text-xs text-muted-foreground">
           {summaryQ.data?.last_run_at ? (
             <>
-              Последний прогон:{" "}
+              {t("last_run")}{" "}
               <span className="font-mono">
                 {formatTime(summaryQ.data.last_run_at)}
               </span>
@@ -123,30 +126,30 @@ export default function SitePage() {
               )}
             </>
           ) : (
-            "Нет данных о прогонах"
+            t("no_run_data")
           )}
         </div>
       </header>
 
       <section className="grid gap-4 grid-cols-2 md:grid-cols-4">
         <KpiCard
-          label="Всего продуктов"
+          label={t("kpi_total_products")}
           value={summaryQ.data?.total_products ?? "—"}
           loading={summaryQ.isLoading}
         />
         <KpiCard
-          label="Брендов"
+          label={t("kpi_brands")}
           value={summaryQ.data?.total_brands ?? "—"}
           loading={summaryQ.isLoading}
         />
         <KpiCard
-          label="Эксклюзивных брендов"
+          label={t("kpi_exclusive_brands")}
           value={summaryQ.data?.exclusive_brands ?? "—"}
           loading={summaryQ.isLoading}
-          hint={`Нет на ${competitors.join("/")}`}
+          hint={t("kpi_exclusive_hint", { competitors: competitors.join("/") })}
         />
         <KpiCard
-          label="Со скидкой"
+          label={t("kpi_on_sale")}
           value={
             summaryQ.data
               ? `${summaryQ.data.on_sale_count} (${summaryQ.data.on_sale_pct.toFixed(1)}%)`
@@ -157,15 +160,14 @@ export default function SitePage() {
       </section>
 
       <section>
-        <h2 className="text-lg font-semibold mb-3">ROI рекомендации</h2>
+        <h2 className="text-lg font-semibold mb-3">{t("roi_title")}</h2>
         <p className="text-xs text-muted-foreground mb-3">
-          С точки зрения {site} — где мы дешевле/дороже конкурентов и какие SKU
-          есть у {competitors.join("/")}, но нет у нас.
+          {t("roi_subtitle", { site, competitors: competitors.join("/") })}
         </p>
         {roiQ.isLoading && (
           <div className="rounded-md border border-border bg-card p-3 text-sm text-muted-foreground flex items-center gap-2">
             <span className="inline-block h-2 w-2 rounded-full bg-primary animate-pulse" />
-            Анализ pricing-recommendations… может занять до 15 сек
+            {t("roi_loading")}
           </div>
         )}
         {roiQ.error && (
@@ -173,19 +175,19 @@ export default function SitePage() {
             <div>
               {roiQ.error instanceof Error
                 ? roiQ.error.message
-                : "Не удалось загрузить рекомендации"}
+                : t("roi_error")}
             </div>
             <button
               onClick={() => roiQ.refetch()}
               className="rounded border border-destructive/50 px-2 py-1 text-xs hover:bg-destructive/20"
             >
-              Повторить
+              {t("roi_retry")}
             </button>
           </div>
         )}
         {roiQ.data && roiQ.data.length === 0 && (
           <div className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
-            Нет рекомендаций — pricing на уровне.
+            {t("roi_empty")}
           </div>
         )}
         <div className="space-y-2">
@@ -222,19 +224,22 @@ function BrandsPanel({
   loading: boolean;
   site: SiteName;
 }) {
+  const t = useTranslations("site");
+  const tCommon = useTranslations("common");
+  const tOverview = useTranslations("overview");
   return (
     <div className="rounded-lg border border-border bg-card overflow-hidden">
       <div className="px-4 py-3 border-b border-border">
-        <h2 className="text-sm font-semibold">Топ брендов на {site}</h2>
+        <h2 className="text-sm font-semibold">{t("brands_title", { site })}</h2>
         <p className="text-xs text-muted-foreground">
-          По количеству SKU. Зелёный значок — эксклюзив только у {site}.
+          {t("brands_subtitle", { site })}
         </p>
       </div>
       {loading && (
-        <div className="p-4 text-sm text-muted-foreground">Загрузка…</div>
+        <div className="p-4 text-sm text-muted-foreground">{tCommon("loading")}</div>
       )}
       {!loading && brands.length === 0 && (
-        <div className="p-4 text-sm text-muted-foreground">Нет данных</div>
+        <div className="p-4 text-sm text-muted-foreground">{tOverview("no_data")}</div>
       )}
       {/*
         P0.4 (PO Audit 2026-05-17): backend brand_share сортирует по `total`
@@ -280,19 +285,22 @@ function CategoriesPanel({
   loading: boolean;
   site: SiteName;
 }) {
+  const t = useTranslations("site");
+  const tCommon = useTranslations("common");
+  const tOverview = useTranslations("overview");
   return (
     <div className="rounded-lg border border-border bg-card overflow-hidden">
       <div className="px-4 py-3 border-b border-border">
-        <h2 className="text-sm font-semibold">Категории на {site}</h2>
+        <h2 className="text-sm font-semibold">{t("categories_title", { site })}</h2>
         <p className="text-xs text-muted-foreground">
-          Размер каталога по разделам.
+          {t("categories_subtitle")}
         </p>
       </div>
       {loading && (
-        <div className="p-4 text-sm text-muted-foreground">Загрузка…</div>
+        <div className="p-4 text-sm text-muted-foreground">{tCommon("loading")}</div>
       )}
       {!loading && categories.length === 0 && (
-        <div className="p-4 text-sm text-muted-foreground">Нет данных</div>
+        <div className="p-4 text-sm text-muted-foreground">{tOverview("no_data")}</div>
       )}
       <ul className="divide-y divide-border max-h-96 overflow-y-auto">
         {categories.map((c) => {
@@ -327,6 +335,8 @@ function ProductsSection({
       }
     | undefined;
 }) {
+  const t = useTranslations("site");
+  const tCommon = useTranslations("common");
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
   const [category, setCategory] = useState("");
@@ -365,14 +375,14 @@ function ProductsSection({
 
   return (
     <section>
-      <h2 className="text-lg font-semibold mb-3">Каталог {site}</h2>
+      <h2 className="text-lg font-semibold mb-3">{t("catalog_title", { site })}</h2>
 
       <div className="flex flex-col md:flex-row gap-2 mb-3">
         <div className="relative flex-1">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <input
             type="search"
-            placeholder="Поиск по названию или бренду"
+            placeholder={t("search_placeholder")}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -383,7 +393,7 @@ function ProductsSection({
           onChange={(e) => setCategory(e.target.value)}
           className="rounded-md border border-input bg-background px-3 py-2 text-sm"
         >
-          <option value="">Все категории</option>
+          <option value="">{t("filter_all_categories")}</option>
           {facets?.categories.map((c) => (
             <option key={c.name} value={c.name} title={c.name}>
               {prettyCategoryLabel(c)} ({c.count})
@@ -395,7 +405,7 @@ function ProductsSection({
           onChange={(e) => setBrand(e.target.value)}
           className="rounded-md border border-input bg-background px-3 py-2 text-sm"
         >
-          <option value="">Все бренды</option>
+          <option value="">{t("filter_all_brands")}</option>
           {facets?.brands.slice(0, 50).map((b) => (
             <option key={b.name} value={b.name}>
               {b.name} ({b.count})
@@ -409,13 +419,13 @@ function ProductsSection({
             onChange={(e) => setOnSaleOnly(e.target.checked)}
             className="h-4 w-4"
           />
-          Скидка
+          {t("discount_label")}
         </label>
       </div>
 
       {productsQ.isLoading && (
         <div className="text-sm text-muted-foreground py-6 text-center">
-          Загрузка…
+          {tCommon("loading")}
         </div>
       )}
       {productsQ.error && (

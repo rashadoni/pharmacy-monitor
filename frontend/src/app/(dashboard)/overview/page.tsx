@@ -2,17 +2,19 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { useState } from "react";
-import { api, type RunRow } from "@/lib/api";
-import { ActionRow } from "@/components/action-row";
-import { KpiCard } from "@/components/kpi-card";
+import { api, type RunRow, type RoiAction } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { QuickActions } from "@/components/quick-actions";
-import { formatRelative } from "@/lib/utils";
+import { formatRelative, formatPrice } from "@/lib/utils";
 
 export default function OverviewPage() {
+  const t = useTranslations("overview");
+  const tCommon = useTranslations("common");
   const matchQ = useQuery({ queryKey: ["match-quality"], queryFn: api.matchQuality });
-  const actionsQ = useQuery({ queryKey: ["roi-actions"], queryFn: api.roiActions });
+  const normalizeQ = useQuery({ queryKey: ["normalize-stats"], queryFn: api.normalizeStats });
+  const actionsQ = useQuery({ queryKey: ["roi-actions"], queryFn: () => api.roiActions() });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
   const [expandedRun, setExpandedRun] = useState<number | null>(null);
 
@@ -33,9 +35,9 @@ export default function OverviewPage() {
       />
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Обзор</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
           <p className="text-sm text-muted-foreground">
-            Сегодняшние действия и ключевые метрики
+            {t("subtitle")}
           </p>
         </div>
         <QuickActions />
@@ -44,19 +46,19 @@ export default function OverviewPage() {
       {/* KPI cards */}
       <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
         <KpiCard
-          label="Cross-site matches"
+          label={t("kpi_matches")}
           value={matchQ.data?.total_matches ?? "—"}
           loading={matchQ.isLoading}
         />
         <KpiCard
-          label="Coverage"
+          label={t("kpi_coverage")}
           value={
             matchQ.data ? `${matchQ.data.coverage_pct.toFixed(1)}%` : "—"
           }
           loading={matchQ.isLoading}
         />
         <KpiCard
-          label="Products"
+          label={t("kpi_products")}
           value={matchQ.data?.products_total ?? "—"}
           loading={matchQ.isLoading}
         />
@@ -69,7 +71,7 @@ export default function OverviewPage() {
           извлечённых атрибутов, остальные 64% — нужно review-нуть.
         */}
         <KpiCard
-          label="AI confidence (high)"
+          label={t("kpi_ai_confidence")}
           value={
             normalizeQ.data
               ? `${(
@@ -83,18 +85,21 @@ export default function OverviewPage() {
           loading={normalizeQ.isLoading}
           hint={
             normalizeQ.data
-              ? `${normalizeQ.data.needs_review.toLocaleString("ru-RU")} из ${normalizeQ.data.products_total.toLocaleString("ru-RU")} с low-confidence`
-              : "Доля продуктов с надёжно извлечёнными active_ingredient/dosage/pack"
+              ? t("kpi_ai_low_confidence", {
+                  count: normalizeQ.data.needs_review.toLocaleString("ru-RU"),
+                  total: normalizeQ.data.products_total.toLocaleString("ru-RU"),
+                })
+              : t("kpi_ai_hint")
           }
         />
       </div>
 
       {/* Today's actions */}
       <div>
-        <h2 className="text-lg font-semibold mb-3">Сегодняшние действия</h2>
-        {actionsQ.isLoading && <div className="text-muted-foreground">Загрузка…</div>}
+        <h2 className="text-lg font-semibold mb-3">{t("today_actions")}</h2>
+        {actionsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
         {actionsQ.data && actionsQ.data.length === 0 && (
-          <div className="text-muted-foreground">Нет рекомендаций — pricing на уровне.</div>
+          <div className="text-muted-foreground">{t("no_actions")}</div>
         )}
         <div className="space-y-2">
           {actionsQ.data?.slice(0, 10).map((a, i) => (
@@ -105,21 +110,21 @@ export default function OverviewPage() {
 
       {/* Recent runs */}
       <div>
-        <h2 className="text-lg font-semibold mb-3">Последние прогоны</h2>
+        <h2 className="text-lg font-semibold mb-3">{t("recent_runs")}</h2>
         <p className="text-xs text-muted-foreground mb-2">
-          Кликни на строку чтобы увидеть breakdown — сколько товаров на каждом сайте по каждой категории.
+          {t("runs_desc")}
         </p>
         <div className="rounded-lg border border-border overflow-hidden">
           <table className="w-full text-sm">
             <thead className="bg-muted/50 text-muted-foreground">
               <tr>
                 <th className="px-3 py-2 w-6"></th>
-                <th className="px-3 py-2 text-left">ID</th>
-                <th className="px-3 py-2 text-left">Started</th>
-                <th className="px-3 py-2 text-left hidden sm:table-cell">Длительность</th>
-                <th className="px-3 py-2 text-left">Status</th>
-                <th className="px-3 py-2 text-right">Products</th>
-                <th className="px-3 py-2 text-left hidden md:table-cell">Sites</th>
+                <th className="px-3 py-2 text-left">{t("th_id")}</th>
+                <th className="px-3 py-2 text-left">{t("th_started")}</th>
+                <th className="px-3 py-2 text-left hidden sm:table-cell">{t("th_duration")}</th>
+                <th className="px-3 py-2 text-left">{t("th_status")}</th>
+                <th className="px-3 py-2 text-right">{t("th_products")}</th>
+                <th className="px-3 py-2 text-left hidden md:table-cell">{t("th_sites")}</th>
               </tr>
             </thead>
             <tbody>
@@ -150,6 +155,7 @@ function RunRowExpandable({
   isExpanded: boolean;
   onToggle: () => void;
 }) {
+  const t = useTranslations("overview");
   const breakdownQ = useQuery({
     queryKey: ["run-breakdown", run.id],
     queryFn: () => api.runBreakdown(run.id),
@@ -188,7 +194,7 @@ function RunRowExpandable({
         <tr className="border-t border-border bg-muted/10">
           <td colSpan={6} className="px-3 py-3">
             {breakdownQ.isLoading && (
-              <div className="text-xs text-muted-foreground">Загружаю breakdown…</div>
+              <div className="text-xs text-muted-foreground">{t("loading_breakdown")}</div>
             )}
             {breakdownQ.data && (
               <RunBreakdownPanel data={breakdownQ.data} />
@@ -208,6 +214,7 @@ function RunBreakdownPanel({
     products_per_site_category: Record<string, Record<string, number>>;
   };
 }) {
+  const t = useTranslations("overview");
   // Load categories один раз — нужно для маппинга slug → label_ru.
   // Slug на каждом сайте свой (pharm: 'vitamin-ve-mineral-kompleks',
   // apt: '78', aloe: 'uşaq-qidası'), поэтому строим lookup-table per site.
@@ -227,8 +234,7 @@ function RunBreakdownPanel({
   if (sites.length === 0) {
     return (
       <div className="text-xs text-muted-foreground">
-        Этот прогон не содержит per-category breakdown — он был выполнен до
-        включения детальной статистики. Свежие прогоны имеют полную разбивку.
+        {t("breakdown_legacy")}
       </div>
     );
   }
@@ -245,7 +251,7 @@ function RunBreakdownPanel({
             <span className="tabular-nums font-semibold">
               {data.products_per_site[site] ?? 0}
             </span>{" "}
-            <span className="text-muted-foreground">всего</span>
+            <span className="text-muted-foreground">{t("total_label")}</span>
           </div>
         ))}
       </div>
@@ -287,7 +293,7 @@ function RunBreakdownPanel({
                 })}
                 {sorted.length === 0 && (
                   <div className="text-xs text-muted-foreground">
-                    Нет данных
+                    {t("no_data")}
                   </div>
                 )}
               </div>
@@ -303,10 +309,12 @@ function KpiCard({
   label,
   value,
   loading,
+  hint,
 }: {
   label: string;
   value: number | string;
   loading: boolean;
+  hint?: string;
 }) {
   return (
     <div className="rounded-lg border border-border bg-card p-4">
@@ -314,11 +322,15 @@ function KpiCard({
       <div className="text-2xl font-semibold mt-1 tabular-nums">
         {loading ? "…" : value}
       </div>
+      {hint && (
+        <div className="text-xs text-muted-foreground mt-1">{hint}</div>
+      )}
     </div>
   );
 }
 
 function ActionRow({ action }: { action: RoiAction }) {
+  const t = useTranslations("overview");
   const tone =
     action.severity === "critical"
       ? "border-destructive/40 bg-destructive/5"
@@ -348,10 +360,10 @@ function ActionRow({ action }: { action: RoiAction }) {
               title="Разница цены за единицу товара — реально проверяемая величина"
             >
               {gapPositive ? "+" : ""}
-              {formatPrice(action.unit_gap_azn ?? 0)} ₼/ед
+              {formatPrice(action.unit_gap_azn ?? 0)} {t("unit_gap_label")}
             </div>
             <div className="text-[11px] text-muted-foreground tabular-nums">
-              {(action.spread_pct ?? 0).toFixed(1)}% спред
+              {(action.spread_pct ?? 0).toFixed(1)} {t("spread_label")}
             </div>
           </div>
         )}

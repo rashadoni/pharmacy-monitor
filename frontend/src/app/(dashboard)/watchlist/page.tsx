@@ -2,10 +2,13 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Trash2, X } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { useState } from "react";
 import { api } from "@/lib/api";
 
 export default function WatchlistPage() {
+  const t = useTranslations("watchlist");
+  const tCommon = useTranslations("common");
   const queryClient = useQueryClient();
   const [showAdd, setShowAdd] = useState(false);
 
@@ -27,9 +30,7 @@ export default function WatchlistPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">⭐ Watchlist</h1>
           <p className="text-sm text-muted-foreground">
-            Приоритетные товары для гарантированного cross-site трекинга. Используй
-            если auto-matcher не нашёл match по name similarity, а товар точно
-            одинаковый на всех 3 сайтах.
+            {t("subtitle")}
           </p>
         </div>
         <button
@@ -37,29 +38,25 @@ export default function WatchlistPage() {
           className="inline-flex items-center gap-1.5 rounded-md bg-primary text-primary-foreground px-3 py-2 text-sm font-medium hover:bg-primary/90"
         >
           <Plus className="h-4 w-4" />
-          Добавить
+          {t("add_button")}
         </button>
       </div>
 
       {showAdd && <AddForm onClose={() => setShowAdd(false)} />}
 
-      {isLoading && <div className="text-muted-foreground">Загрузка…</div>}
+      {isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
       {data && data.length === 0 && (
         // P1.7 (PO Audit 2026-05-17): был {text-only} placeholder с (пример)
         // данными в БД — никто фичу не пользовал. Делаем empty state объясняющий
         // когда watchlist реально нужен и приглашающий первое добавление.
         <div className="rounded-lg border border-dashed border-border bg-card p-8 text-center space-y-3">
           <div className="text-4xl">⭐</div>
-          <div className="text-base font-medium">Watchlist пуст</div>
+          <div className="text-base font-medium">{t("empty_heading")}</div>
           <div className="text-sm text-muted-foreground max-w-md mx-auto leading-relaxed">
-            Если у тебя есть SKU который ты хочешь видеть на /comparison при любых
-            условиях — добавь его URL на pharmonline / aptekonline / aloe сюда. Это
-            обходит автоматический matcher и связывает товары жёстко.
+            {t("empty_desc")}
             <br />
             <span className="text-muted-foreground/70 text-xs">
-              Для большинства товаров auto-matcher работает сам — watchlist
-              нужен только для редких случаев (плохо нормализованные имена,
-              специальные SKU).
+              {t("empty_hint")}
             </span>
           </div>
           <button
@@ -67,7 +64,7 @@ export default function WatchlistPage() {
             className="inline-flex items-center gap-1.5 rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 mt-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <Plus className="h-4 w-4" />
-            Добавить первый
+            {t("add_first")}
           </button>
         </div>
       )}
@@ -105,12 +102,12 @@ export default function WatchlistPage() {
             </div>
             <button
               onClick={() => {
-                if (confirm(`Удалить «${item.canonical_name}»?`)) {
+                if (confirm(t("delete_confirm", { name: item.canonical_name }))) {
                   deleteMutation.mutate(item.id);
                 }
               }}
               className="text-muted-foreground hover:text-destructive p-1"
-              title="Удалить"
+              title={tCommon("delete")}
             >
               <Trash2 className="h-4 w-4" />
             </button>
@@ -122,6 +119,8 @@ export default function WatchlistPage() {
 }
 
 function AddForm({ onClose }: { onClose: () => void }) {
+  const t = useTranslations("watchlist");
+  const tCommon = useTranslations("common");
   const queryClient = useQueryClient();
   const [form, setForm] = useState({
     canonical_name: "",
@@ -154,40 +153,40 @@ function AddForm({ onClose }: { onClose: () => void }) {
   return (
     <div className="rounded-lg border border-border bg-card p-4 space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold">Новый watchlist item</h3>
+        <h3 className="font-semibold">{t("form_title")}</h3>
         <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
           <X className="h-4 w-4" />
         </button>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         <Field
-          label="Название (canonical)"
+          label={t("form_canonical")}
           required
           value={form.canonical_name}
           onChange={(v) => setForm({ ...form, canonical_name: v })}
           placeholder="Friso Gold 1 800g"
         />
         <Field
-          label="Бренд"
+          label={t("form_brand")}
           value={form.brand}
           onChange={(v) => setForm({ ...form, brand: v })}
           placeholder="Friso"
         />
         <Field
-          label="Pack size"
+          label={t("form_pack")}
           value={form.pack_size}
           onChange={(v) => setForm({ ...form, pack_size: v })}
           placeholder="800q"
         />
         <Field
-          label="Dosage"
+          label={t("form_dosage")}
           value={form.dosage}
           onChange={(v) => setForm({ ...form, dosage: v })}
-          placeholder="(если применимо)"
+          placeholder={t("dosage_placeholder")}
         />
       </div>
       <div className="space-y-2 pt-2 border-t border-border">
-        <div className="text-xs text-muted-foreground">URL на каждом сайте (опционально)</div>
+        <div className="text-xs text-muted-foreground">{t("form_urls_label")}</div>
         <Field
           label="pharmonline.az"
           value={form.pharmonline_url}
@@ -213,14 +212,14 @@ function AddForm({ onClose }: { onClose: () => void }) {
           disabled={!form.canonical_name || create.isPending}
           className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
         >
-          {create.isPending ? "Сохраняем…" : "Сохранить"}
+          {create.isPending ? tCommon("save_view") : tCommon("save")}
         </button>
         <button onClick={onClose} className="text-sm text-muted-foreground hover:text-foreground">
-          Отмена
+          {tCommon("cancel")}
         </button>
       </div>
       {create.isError && (
-        <div className="text-sm text-destructive">Не удалось сохранить</div>
+        <div className="text-sm text-destructive">{t("save_error")}</div>
       )}
     </div>
   );

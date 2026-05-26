@@ -14,6 +14,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { useTranslations } from "next-intl";
 import { api } from "@/lib/api";
 
 const SITE_COLORS: Record<string, string> = {
@@ -166,6 +167,7 @@ interface ForecastMover {
 }
 
 function ForecastSection() {
+  const t = useTranslations("analytics");
   const { data, isLoading } = useQuery<ForecastMover[]>({
     queryKey: ["forecast"],
     queryFn: () =>
@@ -187,7 +189,7 @@ function ForecastSection() {
   }
 
   return (
-    <Card title="Топ движений цены за 30 дней">
+    <Card title={t("forecast_section_title")}>
       <div className="text-xs text-muted-foreground mb-3">
         Товары с самыми большими движениями цены. Отфильтрованы артефакты
         парсинга (изменения вне ±50%).
