@@ -26,7 +26,7 @@ The Verification Plan must enumerate:
 
 This protocol applies to tasks that change code. Trivial read-only operations (status checks, file reads, exploration) don't need a Verification Plan. Trivial doc updates (typos, minor wording) don't need one either, but anything affecting prod systems or business logic does.
 
-## Current production state (last updated: 2026-05-11)
+## Current production state (last updated: 2026-05-26)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
 **Login**: `admin` / `pharmacy2026`
@@ -58,6 +58,24 @@ This protocol applies to tasks that change code. Trivial read-only operations (s
 `data/.prod-secrets-DO-NOT-COMMIT` — has PG_PASS, JWT_SECRET, API_KEY (mode 0600)
 
 ## Active work-in-progress
+
+**Just finished (2026-05-26)**: **Full i18n audit + ROI translation**.
+
+- **Locale switcher в сайдбаре**: `LocaleSwitcher` добавлен в `SideNav` ([frontend/src/components/nav.tsx](frontend/src/components/nav.tsx)) над кнопкой logout. Sidebar исправлен на `sticky top-0 h-screen self-start` + `min-h-0` на middle-секции — switcher теперь всегда видим при любой длине меню.
+- **AZ locale не переключался**: `POST /api/locale` уходил к FastAPI (Caddy роутит `/api/*` → :8080 → 404). Роут перенесён в `/locale` ([frontend/src/app/locale/route.ts](frontend/src/app/locale/route.ts)). LocaleSwitcher обновлён. Куки устанавливаются через `response.cookies.set()` (не `cookieStore.set()` — ненадёжен в route handlers Next.js 14).
+- **71 непереведённая строка** — полный аудит и фикс по всем страницам:
+  - `overview/page.tsx` — KPI labels, duration strings (`formatDuration` принимает `t`)
+  - `analytics/page.tsx` — все table headers, card titles, empty states, forecast description
+  - `site/[site]/page.tsx` — table headers, pagination (prev/next/range), error/empty states, open-link title
+  - `comparison/page.tsx` — th_name, th_spread, `{t("sites_spread", {n})}`
+  - `notifications-banner.tsx` — все 5 строк через `useTranslations("banner")`
+  - `alerts/page.tsx` — tooltip strings
+  - Новые ключи добавлены в [frontend/messages/ru.json](frontend/messages/ru.json), [az.json](frontend/messages/az.json), [en.json](frontend/messages/en.json): пространства `analytics`, `banner`, `site`, `overview` (duration), `comparison` (sites_spread), `alerts` (tooltips)
+- **ROI action recommendations переведены** (тексты шли из Python backend с hardcoded RU):
+  - `src/roi.py`: добавлен `ALL_SITES`, `_STRINGS` (шаблоны title+detail для 4 типов: undercut/price_raise/assortment_gap/promo_response на AZ+EN), функция `translate_action(action, locale)`
+  - `src/api.py`: `/api/v1/dash/roi/actions` принимает `?locale=ru|az|en`, применяет `translate_action` при отдаче, кеш `roi_actions_cache` не инвалидируется
+  - `frontend/src/lib/api.ts`: `roiActions(client_site?, locale?)` передаёт `?locale=`
+  - `overview/page.tsx` + `site/[site]/page.tsx`: `useLocale()` → locale в queryKey + queryFn
 
 **Just finished (2026-05-07)**: HTTPS migration. `leaddrive.cloud` (Namecheap) → 46.225.149.52, Caddy with Let's Encrypt cert. Cookie host-only (no Domain attr) — same-origin, CORS not needed.
 
@@ -184,6 +202,7 @@ SELECT COUNT(*) FROM products;
 [✓] Nightly     Hybrid runtime: aloe на проде (03:00 UTC), pharmonline+aptekonline с Mac launchd 18:00 Baku
 [✓] Diff-only   persist + analyzer + 5 consumers под новую семантику (2026-05-09 → 11). 51× экономия snapshots, 2× быстрее прогон.
 [✓] Git         project under VCS с 2026-05-11 (initial commit c7fde84). Remote: TODO
+[✓] i18n full   locale switcher в nav, AZ/EN fix (route /locale вместо /api/locale), 71 строка переведена, ROI actions переведены (2026-05-26)
 [ ] Next        Remote git origin, SMTP (Resend), Telegram bot token, Sentry DSN, forecast.py diff-only refactor (опционально), ScraperAPI Hobby ($49) для возврата aptekonline на прод (опционально)
 ```
 
