@@ -75,7 +75,8 @@
     "trend_show": "Show 30-day trend",
     "suspicious_spread": "Suspicious spread ≥50% — verify match",
     "needs_review_aria": "Needs review",
-    "reject_tooltip": "Reject as false match"
+    "reject_tooltip": "Reject as false match",
+    "sites_spread": "{n} sites · spread"
   },
   "overview": {
     "title": "Overview",
@@ -102,7 +103,11 @@
     "total_label": "total",
     "no_data": "No data",
     "unit_gap_label": "₼/unit",
-    "spread_label": "% spread"
+    "spread_label": "% spread",
+    "duration_sec": "{n}s",
+    "duration_min": "{n}m",
+    "duration_min_sec": "{n}m {s}s",
+    "duration_hour": "{h}h {m}m"
   },
   "analytics": {
     "title": "📈 Analytics",
@@ -119,7 +124,15 @@
     "no_brand_data": "No brand distribution data yet.",
     "no_categories": "No categories with computed index yet.",
     "no_forecast": "Forecast needs ≥3 daily runs. Will appear in a few days.",
-    "forecast_section_title": "Top price movers over 30 days"
+    "forecast_section_title": "Top price movers over 30 days",
+    "th_category": "Category",
+    "th_avg_client": "Avg client",
+    "th_avg_competitor": "Avg competitor",
+    "th_index": "Index",
+    "th_matched_sku": "Matched SKU",
+    "forecast_desc": "Products with the largest price movements. Filtered parsing artifacts (changes outside ±50%).",
+    "forecast_row_meta": "{site} · {n} measurements · confidence: {conf}",
+    "forecast_7d": "Forecast in 7d:"
   },
   "alerts": {
     "title": "🔔 Alerts",
@@ -156,7 +169,11 @@
     "action_mark_read_short": "Read",
     "action_mark_unread_short": "Unread",
     "snooze_7d_short": "Snooze 7d",
-    "aria_select_for_bulk": "Select for bulk action"
+    "aria_select_for_bulk": "Select for bulk action",
+    "tooltip_snoozed_until": "Snoozed until {date}",
+    "tooltip_mark_read": "Mark as read",
+    "tooltip_mark_unread": "Mark as unread",
+    "tooltip_snooze_7d": "Hide for 7 days"
   },
   "watchlist": {
     "title": "📋 Watchlist",
@@ -202,7 +219,20 @@
     "search_placeholder": "Search by name or brand",
     "filter_all_categories": "All categories",
     "filter_all_brands": "All brands",
-    "discount_label": "Discount"
+    "discount_label": "Discount",
+    "th_name": "Name",
+    "th_brand": "Brand",
+    "th_category": "Category",
+    "th_price": "Price",
+    "th_discount_col": "Discount",
+    "th_trend": "Trend 30d",
+    "empty_products": "Nothing found",
+    "error_loading": "Failed to load data",
+    "open_link": "Open on {site}.az",
+    "pagination_range": "{from}–{to} of {total}",
+    "pagination_prev": "← Back",
+    "pagination_next": "Next →",
+    "pagination_page": "p. {page}/{total}"
   },
   "categories": {
     "title": "🗂️ Categories",
@@ -323,5 +353,12 @@
     "warning": "Warning",
     "info": "Info",
     "opportunity": "Opportunity"
+  },
+  "banner": {
+    "title": "Alerts are piling up but not being delivered",
+    "body": "Enable email notifications or Telegram, otherwise you won't know when competitors drop prices or a site stops scraping.",
+    "configure": "Configure →",
+    "hide_aria": "Hide reminder",
+    "hide_title": "Hide"
   }
 }

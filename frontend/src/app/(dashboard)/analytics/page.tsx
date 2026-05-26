@@ -24,12 +24,13 @@ const SITE_COLORS: Record<string, string> = {
 };
 
 export default function AnalyticsPage() {
+  const t = useTranslations("analytics");
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Аналитика</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
         <p className="text-sm text-muted-foreground">
-          Match quality, brand share, price index, forecast
+          {t("subtitle")}
         </p>
       </div>
 
@@ -42,21 +43,22 @@ export default function AnalyticsPage() {
 }
 
 function MatchQualitySection() {
+  const t = useTranslations("analytics");
   const { data, isLoading } = useQuery({
     queryKey: ["match-quality"],
     queryFn: api.matchQuality,
   });
 
   return (
-    <Card title="Match Quality">
+    <Card title={t("match_quality")}>
       {isLoading && <Skeleton />}
       {data && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <Stat label="Total matches" value={data.total_matches} />
-          <Stat label="Auto" value={data.auto_matches} sub={`${data.manual_matches} manual`} />
-          <Stat label="Coverage" value={`${data.coverage_pct.toFixed(1)}%`}
+          <Stat label={t("stat_total")} value={data.total_matches} />
+          <Stat label={t("stat_auto")} value={data.auto_matches} sub={t("stat_manual", { n: data.manual_matches })} />
+          <Stat label={t("stat_coverage")} value={`${data.coverage_pct.toFixed(1)}%`}
             sub={`${data.products_matched} / ${data.products_total}`} />
-          <Stat label="Rejected pairs" value={data.rejected_pairs} />
+          <Stat label={t("stat_rejected")} value={data.rejected_pairs} />
         </div>
       )}
     </Card>
@@ -64,6 +66,7 @@ function MatchQualitySection() {
 }
 
 function BrandShareSection() {
+  const t = useTranslations("analytics");
   const { data, isLoading } = useQuery({
     queryKey: ["brand-share"],
     queryFn: () => api.brandShare({ top_n: 15 }),
@@ -77,7 +80,7 @@ function BrandShareSection() {
   }));
 
   return (
-    <Card title="Brand Share по сайтам (top 15)">
+    <Card title={t("brand_share")}>
       {isLoading && <Skeleton />}
       {chartData && chartData.length > 0 && (
         <ResponsiveContainer width="100%" height={Math.max(320, chartData.length * 28)}>
@@ -95,7 +98,7 @@ function BrandShareSection() {
       )}
       {chartData && chartData.length === 0 && (
         <div className="text-muted-foreground text-center py-8">
-          Брендов с известным распределением пока нет.
+          {t("no_brand_data")}
         </div>
       )}
     </Card>
@@ -103,6 +106,7 @@ function BrandShareSection() {
 }
 
 function PriceIndexSection() {
+  const t = useTranslations("analytics");
   const { data, isLoading } = useQuery({
     queryKey: ["price-index"],
     queryFn: () =>
@@ -110,22 +114,22 @@ function PriceIndexSection() {
   });
 
   return (
-    <Card title="Price Index по категориям">
+    <Card title={t("price_index")}>
       {isLoading && <Skeleton />}
       {data && data.length === 0 && (
         <div className="text-muted-foreground text-center py-8">
-          Категорий с подсчитанным индексом пока нет (нужны matched products в каждой).
+          {t("no_categories")}
         </div>
       )}
       {data && data.length > 0 && (
         <table className="w-full text-sm">
           <thead className="text-muted-foreground">
             <tr className="border-b border-border">
-              <th className="px-3 py-2 text-left">Категория</th>
-              <th className="px-3 py-2 text-right">Avg client</th>
-              <th className="px-3 py-2 text-right">Avg competitor</th>
-              <th className="px-3 py-2 text-right">Index</th>
-              <th className="px-3 py-2 text-right">Matched SKU</th>
+              <th className="px-3 py-2 text-left">{t("th_category")}</th>
+              <th className="px-3 py-2 text-right">{t("th_avg_client")}</th>
+              <th className="px-3 py-2 text-right">{t("th_avg_competitor")}</th>
+              <th className="px-3 py-2 text-right">{t("th_index")}</th>
+              <th className="px-3 py-2 text-right">{t("th_matched_sku")}</th>
             </tr>
           </thead>
           <tbody>
@@ -191,8 +195,7 @@ function ForecastSection() {
   return (
     <Card title={t("forecast_section_title")}>
       <div className="text-xs text-muted-foreground mb-3">
-        Товары с самыми большими движениями цены. Отфильтрованы артефакты
-        парсинга (изменения вне ±50%).
+        {t("forecast_desc")}
       </div>
       {isLoading && <Skeleton />}
       {clean.length > 0 && (
@@ -207,6 +210,7 @@ function ForecastSection() {
 }
 
 function ForecastRow({ mover }: { mover: ForecastMover }) {
+  const t = useTranslations("analytics");
   const dirColor =
     mover.direction === "falling"
       ? "text-destructive"
@@ -224,7 +228,7 @@ function ForecastRow({ mover }: { mover: ForecastMover }) {
             {mover.name}
           </div>
           <div className="text-xs text-muted-foreground mt-0.5">
-            {mover.site} · {mover.n_points} замеров за 30д · confidence: {mover.confidence}
+            {t("forecast_row_meta", { site: mover.site, n: mover.n_points, conf: mover.confidence })}
           </div>
         </div>
         <div className={`text-right shrink-0 ${dirColor}`}>
@@ -238,7 +242,7 @@ function ForecastRow({ mover }: { mover: ForecastMover }) {
       </div>
       {mover.forecast_7d_price > 0 && (
         <div className="text-xs text-muted-foreground mt-1.5 pt-1.5 border-t border-border/50">
-          Прогноз через 7д: <span className="font-mono">{mover.forecast_7d_price.toFixed(2)} ₼</span>
+          {t("forecast_7d")} <span className="font-mono">{mover.forecast_7d_price.toFixed(2)} ₼</span>
         </div>
       )}
     </div>

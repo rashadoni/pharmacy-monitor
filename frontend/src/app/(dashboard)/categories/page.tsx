@@ -221,12 +221,12 @@ export default function CategoriesPage() {
         <table className="w-full text-sm">
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
-              <th className="px-3 py-2 text-left">Key</th>
-              <th className="px-3 py-2 text-left">Label</th>
+              <th className="px-3 py-2 text-left">{t("th_key")}</th>
+              <th className="px-3 py-2 text-left">{t("th_label")}</th>
               <th className="px-3 py-2 text-left">pharmonline</th>
               <th className="px-3 py-2 text-left">aptekonline</th>
               <th className="px-3 py-2 text-left">aloe</th>
-              <th className="px-3 py-2 text-center">Active</th>
+              <th className="px-3 py-2 text-center">{t("th_active")}</th>
               <th className="px-3 py-2 text-center"></th>
             </tr>
           </thead>

@@ -430,7 +430,7 @@ function ProductsSection({
       )}
       {productsQ.error && (
         <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive">
-          Ошибка загрузки данных
+          {t("error_loading")}
         </div>
       )}
 
@@ -440,12 +440,12 @@ function ProductsSection({
             <table className="w-full text-sm">
               <thead className="bg-muted/50 text-muted-foreground text-xs uppercase tracking-wide">
                 <tr>
-                  <th className="px-3 py-2 text-left">Название</th>
-                  <th className="px-3 py-2 text-left">Бренд</th>
-                  <th className="px-3 py-2 text-left">Категория</th>
-                  <th className="px-3 py-2 text-right">Цена</th>
-                  <th className="px-3 py-2 text-right">Скидка</th>
-                  <th className="px-3 py-2 text-right">Тренд 30д</th>
+                  <th className="px-3 py-2 text-left">{t("th_name")}</th>
+                  <th className="px-3 py-2 text-left">{t("th_brand")}</th>
+                  <th className="px-3 py-2 text-left">{t("th_category")}</th>
+                  <th className="px-3 py-2 text-right">{t("th_price")}</th>
+                  <th className="px-3 py-2 text-right">{t("th_discount_col")}</th>
+                  <th className="px-3 py-2 text-right">{t("th_trend")}</th>
                   <th className="px-3 py-2 w-8"></th>
                 </tr>
               </thead>
@@ -456,7 +456,7 @@ function ProductsSection({
                 {items.length === 0 && (
                   <tr>
                     <td colSpan={7} className="px-3 py-6 text-center text-muted-foreground">
-                      Ничего не найдено
+                      {t("empty_products")}
                     </td>
                   </tr>
                 )}
@@ -470,7 +470,7 @@ function ProductsSection({
             ))}
             {items.length === 0 && (
               <div className="rounded-lg border border-border bg-card p-6 text-center text-sm text-muted-foreground">
-                Ничего не найдено
+                {t("empty_products")}
               </div>
             )}
           </div>
@@ -488,6 +488,7 @@ function ProductsSection({
 }
 
 function ProductRow({ product, site }: { product: SiteProduct; site: SiteName }) {
+  const t = useTranslations("site");
   // Lazy-load price history per row (React Query dedups + caches)
   const historyQ = useQuery({
     queryKey: ["product-price-history", product.id, 30],
@@ -545,7 +546,7 @@ function ProductRow({ product, site }: { product: SiteProduct; site: SiteName })
           target="_blank"
           rel="noopener noreferrer"
           className="text-muted-foreground hover:text-foreground"
-          title={`Открыть на ${site}.az`}
+          title={t("open_link", { site })}
         >
           <ExternalLink className="h-4 w-4" />
         </a>
@@ -602,6 +603,7 @@ function Pagination({
   total: number;
   onChange: (offset: number) => void;
 }) {
+  const t = useTranslations("site");
   const page = Math.floor(offset / limit) + 1;
   const totalPages = Math.max(1, Math.ceil(total / limit));
   const canPrev = offset > 0;
@@ -611,7 +613,7 @@ function Pagination({
   return (
     <div className="flex items-center justify-between gap-2 mt-3 text-sm">
       <div className="text-muted-foreground tabular-nums">
-        {offset + 1}–{Math.min(offset + limit, total)} из {total}
+        {t("pagination_range", { from: offset + 1, to: Math.min(offset + limit, total), total })}
       </div>
       <div className="flex gap-2">
         <button
@@ -619,17 +621,17 @@ function Pagination({
           onClick={() => onChange(Math.max(0, offset - limit))}
           className="rounded-md border border-input px-3 py-1.5 text-sm disabled:opacity-40 hover:bg-muted/50"
         >
-          ← Назад
+          {t("pagination_prev")}
         </button>
         <div className="px-3 py-1.5 text-sm tabular-nums text-muted-foreground">
-          стр. {page}/{totalPages}
+          {t("pagination_page", { page, total: totalPages })}
         </div>
         <button
           disabled={!canNext}
           onClick={() => onChange(offset + limit)}
           className="rounded-md border border-input px-3 py-1.5 text-sm disabled:opacity-40 hover:bg-muted/50"
         >
-          Вперёд →
+          {t("pagination_next")}
         </button>
       </div>
     </div>

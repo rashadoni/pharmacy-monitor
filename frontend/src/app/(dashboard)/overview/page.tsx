@@ -180,7 +180,7 @@ function RunRowExpandable({
           {run.started_at?.slice(0, 16).replace("T", " ")}
         </td>
         <td className="px-3 py-2 text-muted-foreground hidden sm:table-cell tabular-nums">
-          {formatDuration(run.started_at, run.finished_at)}
+          {formatDuration(run.started_at, run.finished_at, t)}
         </td>
         <td className="px-3 py-2">
           <StatusBadge status={run.status} />
@@ -375,20 +375,21 @@ function ActionRow({ action }: { action: RoiAction }) {
 function formatDuration(
   startedAt: string | null,
   finishedAt: string | null,
+  t: (key: string, values?: Record<string, string | number>) => string,
 ): string {
   if (!startedAt) return "—";
   const start = new Date(startedAt).getTime();
   const end = finishedAt ? new Date(finishedAt).getTime() : Date.now();
   const seconds = Math.max(0, Math.floor((end - start) / 1000));
-  if (seconds < 60) return `${seconds}с`;
+  if (seconds < 60) return t("duration_sec", { n: seconds });
   const mins = Math.floor(seconds / 60);
   if (mins < 60) {
     const s = seconds % 60;
-    return s > 0 ? `${mins}м ${s}с` : `${mins}м`;
+    return s > 0 ? t("duration_min_sec", { n: mins, s }) : t("duration_min", { n: mins });
   }
   const hours = Math.floor(mins / 60);
   const m = mins % 60;
-  return `${hours}ч ${m}м`;
+  return t("duration_hour", { h: hours, m });
 }
 
 function StatusBadge({ status }: { status: string }) {

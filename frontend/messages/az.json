@@ -75,7 +75,8 @@
     "trend_show": "30 günlük trendi göstər",
     "suspicious_spread": "Şübhəli spread ≥50% — uyğunluğu yoxlayın",
     "needs_review_aria": "Yoxlanma tələb edir",
-    "reject_tooltip": "Səhv uyğunluq kimi rədd et"
+    "reject_tooltip": "Səhv uyğunluq kimi rədd et",
+    "sites_spread": "{n} sayt · fərq"
   },
   "overview": {
     "title": "Ümumi baxış",
@@ -102,7 +103,11 @@
     "total_label": "cəmi",
     "no_data": "Məlumat yoxdur",
     "unit_gap_label": "₼/vahid",
-    "spread_label": "% fərq"
+    "spread_label": "% fərq",
+    "duration_sec": "{n}s",
+    "duration_min": "{n}dəq",
+    "duration_min_sec": "{n}dəq {s}s",
+    "duration_hour": "{h}s {m}dəq"
   },
   "analytics": {
     "title": "📈 Analitika",
@@ -119,7 +124,15 @@
     "no_brand_data": "Hələ paylanma məlumatı olan brend yoxdur.",
     "no_categories": "Hələ hesablanmış indeksli kateqoriya yoxdur.",
     "no_forecast": "Proqnoz ən azı 3 gündə icra tələb edir. Bir neçə gün sonra görünəcək.",
-    "forecast_section_title": "30 günlük ən böyük qiymət hərəkətləri"
+    "forecast_section_title": "30 günlük ən böyük qiymət hərəkətləri",
+    "th_category": "Kateqoriya",
+    "th_avg_client": "Ort. müştəri qiyməti",
+    "th_avg_competitor": "Ort. rəqib qiyməti",
+    "th_index": "İndeks",
+    "th_matched_sku": "Uyğun SKU",
+    "forecast_desc": "Ən böyük qiymət dəyişiklikləri olan məhsullar. Parsinq artefaktları filtrlənib (±50% xaricindəki dəyişikliklər).",
+    "forecast_row_meta": "{site} · {n} ölçüm · etibar: {conf}",
+    "forecast_7d": "7 günlük proqnoz:"
   },
   "alerts": {
     "title": "🔔 Bildirişlər",
@@ -156,7 +169,11 @@
     "action_mark_read_short": "Oxunmuş",
     "action_mark_unread_short": "Oxunmamış",
     "snooze_7d_short": "7 günə gecikdir",
-    "aria_select_for_bulk": "Toplu əməliyyat üçün seç"
+    "aria_select_for_bulk": "Toplu əməliyyat üçün seç",
+    "tooltip_snoozed_until": "{date} tarixinədək gizlədilib",
+    "tooltip_mark_read": "Oxunmuş kimi işarələ",
+    "tooltip_mark_unread": "Oxunmamış kimi işarələ",
+    "tooltip_snooze_7d": "7 gün gizlət"
   },
   "watchlist": {
     "title": "📋 İzləmə",
@@ -202,7 +219,20 @@
     "search_placeholder": "Ad və ya brendə görə axtarış",
     "filter_all_categories": "Bütün kateqoriyalar",
     "filter_all_brands": "Bütün brendlər",
-    "discount_label": "Endirim"
+    "discount_label": "Endirim",
+    "th_name": "Ad",
+    "th_brand": "Brend",
+    "th_category": "Kateqoriya",
+    "th_price": "Qiymət",
+    "th_discount_col": "Endirim",
+    "th_trend": "30 günlük trend",
+    "empty_products": "Heç nə tapılmadı",
+    "error_loading": "Məlumatlar yüklənmədi",
+    "open_link": "{site}.az-da aç",
+    "pagination_range": "{from}–{to} / {total}",
+    "pagination_prev": "← Əvvəlki",
+    "pagination_next": "Sonrakı →",
+    "pagination_page": "s. {page}/{total}"
   },
   "categories": {
     "title": "🗂️ Kateqoriyalar",
@@ -323,5 +353,12 @@
     "warning": "Xəbərdarlıq",
     "info": "Məlumat",
     "opportunity": "İmkan"
+  },
+  "banner": {
+    "title": "Xəbərdarlıqlar toplanır, amma heç yerə çatdırılmır",
+    "body": "E-poçt bildirişlərini və ya Telegram-ı aktivləşdirin, əks halda rəqiblər qiymətləri düşürdükdə və ya sayt skreypinqi dayandırdıqda xəbər tutmayacaqsınız.",
+    "configure": "Tənzimlə →",
+    "hide_aria": "Xatırlatmanı gizlət",
+    "hide_title": "Gizlət"
   }
 }

@@ -16,11 +16,13 @@ import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Bell, X } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { api } from "@/lib/api";
 
 const DISMISS_KEY = "notif-banner-dismissed-v1";
 
 export function NotificationsBanner() {
+  const t = useTranslations("banner");
   const [dismissed, setDismissed] = useState(true); // hide by default, set after hydration
   const { data } = useQuery({
     queryKey: ["notif-prefs-banner"],
@@ -53,24 +55,23 @@ export function NotificationsBanner() {
       <Bell className="h-5 w-5 text-warning shrink-0 mt-0.5" aria-hidden />
       <div className="flex-1 min-w-0">
         <div className="text-sm font-medium text-foreground">
-          Алерты копятся, но никуда не доставляются
+          {t("title")}
         </div>
         <div className="text-xs text-muted-foreground mt-0.5">
-          Включи email-уведомления или Telegram, иначе ты не узнаешь когда
-          конкуренты роняют цены или сайт перестал скрейпиться.{" "}
+          {t("body")}{" "}
           <Link
             href="/settings"
             className="underline font-medium text-foreground hover:text-warning"
           >
-            Настроить →
+            {t("configure")}
           </Link>
         </div>
       </div>
       <button
         onClick={handleDismiss}
         className="text-muted-foreground hover:text-foreground p-1 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        aria-label="Скрыть напоминание"
-        title="Скрыть"
+        aria-label={t("hide_aria")}
+        title={t("hide_title")}
       >
         <X className="h-4 w-4" />
       </button>

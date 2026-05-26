@@ -217,13 +217,13 @@ export default function ComparisonPage() {
         <table className="w-full text-sm">
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
-              <th className="px-3 py-2 text-left">Название</th>
+              <th className="px-3 py-2 text-left">{t("th_name")}</th>
               {visibleSites.map((s) => (
                 <th key={s} className="px-3 py-2 text-right">
                   {s}
                 </th>
               ))}
-              <th className="px-3 py-2 text-right">Spread</th>
+              <th className="px-3 py-2 text-right">{t("th_spread")}</th>
               <th className="px-3 py-2 w-10"></th>
             </tr>
           </thead>
@@ -404,6 +404,7 @@ function ComparisonCard({
   row: ComparisonRow;
   onReject: (r: ComparisonRow) => void;
 }) {
+  const t = useTranslations("comparison");
   return (
     <div className="rounded-lg border border-border bg-card p-3 relative">
       <button
@@ -436,7 +437,7 @@ function ComparisonCard({
       </div>
       <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5">
         <span>
-          {row.brand ?? "—"} · {row.sites_with_price} сайтов · spread
+          {row.brand ?? "—"} · {t("sites_spread", { n: row.sites_with_price })}
         </span>
         <SpreadCell row={row} />
       </div>

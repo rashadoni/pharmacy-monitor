@@ -75,7 +75,8 @@
     "trend_show": "Показать тренд за 30 дней",
     "suspicious_spread": "Подозрительный spread ≥50% — проверить матч",
     "needs_review_aria": "Требует проверки",
-    "reject_tooltip": "Отвергнуть как false match"
+    "reject_tooltip": "Отвергнуть как false match",
+    "sites_spread": "{n} сайтов · spread"
   },
   "overview": {
     "title": "Обзор",
@@ -102,7 +103,11 @@
     "total_label": "всего",
     "no_data": "Нет данных",
     "unit_gap_label": "₼/ед",
-    "spread_label": "% спред"
+    "spread_label": "% спред",
+    "duration_sec": "{n}с",
+    "duration_min": "{n}м",
+    "duration_min_sec": "{n}м {s}с",
+    "duration_hour": "{h}ч {m}м"
   },
   "analytics": {
     "title": "📈 Аналитика",
@@ -119,7 +124,15 @@
     "no_brand_data": "Брендов с известным распределением пока нет.",
     "no_categories": "Категорий с подсчитанным индексом пока нет (нужны matched products в каждой).",
     "no_forecast": "Forecast требует ≥3 daily run'ов. Через несколько дней появится.",
-    "forecast_section_title": "Топ движений цены за 30 дней"
+    "forecast_section_title": "Топ движений цены за 30 дней",
+    "th_category": "Категория",
+    "th_avg_client": "Avg клиент",
+    "th_avg_competitor": "Avg конкурент",
+    "th_index": "Индекс",
+    "th_matched_sku": "Совпадений SKU",
+    "forecast_desc": "Товары с самыми большими движениями цены. Отфильтрованы артефакты парсинга (изменения вне ±50%).",
+    "forecast_row_meta": "{site} · {n} замеров · уверенность: {conf}",
+    "forecast_7d": "Прогноз через 7д:"
   },
   "alerts": {
     "title": "🔔 Алерты",
@@ -156,7 +169,11 @@
     "action_mark_read_short": "Прочитано",
     "action_mark_unread_short": "Непрочитано",
     "snooze_7d_short": "Отложить 7д",
-    "aria_select_for_bulk": "Выбрать для bulk-действия"
+    "aria_select_for_bulk": "Выбрать для bulk-действия",
+    "tooltip_snoozed_until": "Snoozed до {date}",
+    "tooltip_mark_read": "Пометить прочитанным",
+    "tooltip_mark_unread": "Пометить непрочитанным",
+    "tooltip_snooze_7d": "Скрыть на 7 дней"
   },
   "watchlist": {
     "title": "📋 Watchlist",
@@ -202,7 +219,20 @@
     "search_placeholder": "Поиск по названию или бренду",
     "filter_all_categories": "Все категории",
     "filter_all_brands": "Все бренды",
-    "discount_label": "Скидка"
+    "discount_label": "Скидка",
+    "th_name": "Название",
+    "th_brand": "Бренд",
+    "th_category": "Категория",
+    "th_price": "Цена",
+    "th_discount_col": "Скидка",
+    "th_trend": "Тренд 30д",
+    "empty_products": "Ничего не найдено",
+    "error_loading": "Ошибка загрузки данных",
+    "open_link": "Открыть на {site}.az",
+    "pagination_range": "{from}–{to} из {total}",
+    "pagination_prev": "← Назад",
+    "pagination_next": "Вперёд →",
+    "pagination_page": "стр. {page}/{total}"
   },
   "categories": {
     "title": "🗂️ Категории",
@@ -323,5 +353,12 @@
     "warning": "Warning",
     "info": "Info",
     "opportunity": "Opportunity"
+  },
+  "banner": {
+    "title": "Алерты копятся, но никуда не доставляются",
+    "body": "Включи email-уведомления или Telegram, иначе ты не узнаешь когда конкуренты роняют цены или сайт перестал скрейпиться.",
+    "configure": "Настроить →",
+    "hide_aria": "Скрыть напоминание",
+    "hide_title": "Скрыть"
   }
 }

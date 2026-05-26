@@ -464,7 +464,7 @@ function AlertCard({
                 new Date(event.snoozed_until).getTime() > Date.now() && (
                   <span
                     className="inline-flex items-center gap-1 rounded bg-muted/50 px-1.5 py-0.5"
-                    title={`Snoozed до ${new Date(event.snoozed_until).toLocaleString("ru-RU")}`}
+                    title={t("tooltip_snoozed_until", { date: new Date(event.snoozed_until!).toLocaleString() })}
                   >
                     <Clock className="h-3 w-3" />
                     {t("snoozed_badge")}
@@ -485,7 +485,7 @@ function AlertCard({
             <button
               onClick={onMarkRead}
               className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              title={event.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"}
+              title={event.is_read ? t("tooltip_mark_unread") : t("tooltip_mark_read")}
             >
               {event.is_read ? (
                 <>
@@ -509,7 +509,7 @@ function AlertCard({
               <button
                 onClick={onSnooze7d}
                 className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                title="Скрыть на 7 дней"
+                title={t("tooltip_snooze_7d")}
               >
                 <Clock className="h-3 w-3" /> {t("snooze_7d_short")}
               </button>
