@@ -263,16 +263,24 @@ def _has_conflicting_variant_tokens(name_a: str, name_b: str) -> bool:
 def _norm_units(s: str) -> str:
     """Нормализует единицы дозировки/объёма для bucket_key.
 
-    Унифицирует азербайджанские/русские аббревиатуры с международными:
-    - mq → mg  (милиграм по-азербайджански = milligram)
+    Унифицирует азербайджанские/русские/немецкие аббревиатуры с международными:
+    - mq → mg   (милиграм по-азербайджански = milligram)
     - mkg → mcg (микрограм)
     - цифра+q (напр. «5q», «0.5q») → цифра+g (gram)
+    - цифра+bv → цифра+iu  (BV = Bioloji Vahid ≈ IU — Ukraferon/interferon, aptekonline)
+    - цифра+me → цифра+iu  (ME = Mezinárodní jednotka = IU — aptekonline URL-slugs)
+    - цифра+ie → цифра+iu  (IE = Internationale Einheit = IU — немецкий)
 
-    Без этого «rinafos 250mq/5ml» (aptekonline) и «rinafos 250mg/5ml» (pharmonline)
-    попадают в разные bucket'ы, несмотря на идентичный товар.
+    Паттерн (\\d)(bv|me|ie)\\b требует цифру перед единицей — исключает
+    случайное совпадение с брендами или словами (me в названии препарата).
+
+    Без этого «ukraferon 500000bv/n10» (aptekonline) и «ukraferon 500000iu/n10»
+    (pharmonline) попадают в разные bucket'ы, хотя это идентичный товар.
     """
     s = s.replace("mq", "mg").replace("mkg", "mcg")
     s = re.sub(r"(\d)q\b", r"\1g", s)
+    # Международные единицы: bv/me/ie → iu
+    s = re.sub(r"(\d)(bv|me|ie)\b", r"\1iu", s)
     return s
 
 

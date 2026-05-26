@@ -69,6 +69,7 @@ _FORMS = (
     "ampoules",    # English plural (seen in aloe/pharmonline)
     "tablets",
     "capsules",
+    "suppositories",  # English plural — pharmonline: «(Suppositories)»
     "sorma",       # Azerbaijani "dissolving" — not a form per se but pharmonline uses it
 )
 
@@ -88,8 +89,9 @@ _FORM_CANONICAL: dict[str, str] = {
     "məhlul": "solution", "solution": "solution", "raztvor": "solution",
     "gel": "gel",
     "powder": "powder",   "poroshok": "powder",   "toz": "powder",
-    "suppoziter": "suppository", "suppository": "suppository",
-    "svecha": "suppository",     "şam": "suppository",
+    "suppoziter": "suppository", "suppository": "suppository", "suppositories": "suppository",
+    "svecha": "suppository",     "şam": "suppository",        "şamlar": "suppository",
+    "suppozitorlar": "suppository", "suppozitorları": "suppository",
     "siropla": "syrup",   "syrup": "syrup",
     "şərbət": "syrup",    "sirop": "syrup",
     "ampul": "ampoule",   "ampoule": "ampoule",   "amp": "ampoule",
@@ -113,6 +115,21 @@ def extract_form(name: str) -> str | None:
         return None
     token = m.group(1).lower()
     return _FORM_CANONICAL.get(token, token)
+
+# Числа с пробелами-разделителями тысяч: «1 000 000 BV», «500 000 BV».
+# _DOSAGE_RE ожидает непрерывную цифровую строку, поэтому перед применением
+# нормализуем «1 000 000» → «1000000».
+# Правило: последовательность 1–3 цифры, затем одна или более групп " \d{3}" —
+# именно так выглядит тысячный разделитель (пробел + ровно три цифры).
+# Примеры: "1 000 000 BV" → "1000000 BV", "500 000 BV" → "500000 BV".
+# НЕ затрагивает "N 10" (там группа не 3-значная) или "30 tab" (не цифровая).
+_SPACED_THOUSANDS_RE = re.compile(r"\b(\d{1,3})(?:\s(\d{3}))+\b")
+
+
+def _collapse_spaced_thousands(s: str) -> str:
+    """«1 000 000» → «1000000», «500 000» → «500000»."""
+    return _SPACED_THOUSANDS_RE.sub(lambda m: m.group(0).replace(" ", ""), s)
+
 
 # Дозировка: 500 mg, 10 ml, 100 mcg, 1.5 g, 250mg/5ml, etc.
 _DOSAGE_RE = re.compile(
@@ -303,6 +320,9 @@ def normalize_name(name: str) -> str:
     if not name:
         return ""
     s = name.strip()
+    # Схлопываем пробелы-разделители тысяч: «1 000 000 BV» → «1000000 BV»
+    # ДО strip_accents/lower, чтобы _DOSAGE_RE корректно съел весь диапазон.
+    s = _collapse_spaced_thousands(s)
     s = strip_accents(s)
     s = s.lower()
     s = _FORMS_RE.sub(" ", s)
@@ -324,6 +344,7 @@ def extract_dosage(name: str) -> str | None:
     """Вытащить дозировку (500mg, 10ml, 250mg/5ml). qr→q нормализуется."""
     if not name:
         return None
+    name = _collapse_spaced_thousands(name)  # «1 000 000 BV» → «1000000 BV»
     m = _DOSAGE_RE.search(name)
     if not m:
         return None
