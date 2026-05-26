@@ -274,6 +274,40 @@ def _has_conflicting_variant_tokens(name_a: str, name_b: str) -> bool:
     return bool(alpha2_a) and bool(alpha2_b)
 
 
+def _build_word_freq(products: list) -> dict[str, int]:
+    """Частота слов по всем name_normalized.
+
+    Используется для авто-обнаружения категорийных слов без хардкода.
+    Высокочастотные слова (sac=волосы, dis=зубы, usaq=дети) = общекатегорийные.
+    Низкочастотные слова = специфичные торговые названия / бренды.
+    """
+    freq: dict[str, int] = defaultdict(int)
+    for p in products:
+        seen: set[str] = set()
+        for tok in (p.name_normalized or "").split():
+            if len(tok) >= 3 and tok not in seen:
+                freq[tok] += 1
+                seen.add(tok)
+    return dict(freq)
+
+
+def _first_brand_token(
+    name_norm: str,
+    freq: dict[str, int],
+    max_freq: int,
+) -> str | None:
+    """Первый токен name_norm с частотой ниже max_freq.
+
+    Токены с высокой частотой = категорийные (sac, dis, gigiyenik, usaq).
+    Первый редкий токен ≈ торговое название/бренд.
+    None — если все токены высокочастотные (неразличимый товар без бренда).
+    """
+    for tok in name_norm.split():
+        if len(tok) >= 3 and freq.get(tok, 0) < max_freq:
+            return tok
+    return None
+
+
 def _norm_units(s: str) -> str:
     """Нормализует единицы дозировки/объёма для bucket_key.
 
@@ -728,6 +762,107 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = min(_min_score_tert / 100.0, _TERT_CONF_CAP)
+                created_or_updated += _persist_match(session, cluster, confidence)
+                visited.update(c.id for c in cluster)
+
+    # ── Quaternary pass: авто-обнаружение бренда по частоте слов ──────────────
+    # Для no-brand продуктов определяет "бренд" из name_normalized автоматически:
+    # - строит карту частот слов по всему каталогу (один проход)
+    # - порог = 1% каталога (адаптируется при росте данных, без хардкода)
+    # - высокочастотные токены = категорийные слова (sac, dis, usaq, gigiyenik)
+    # - первый низкочастотный токен = специфичное торговое название / бренд
+    #
+    # Не требует ручного обслуживания: по мере роста каталога порог растёт,
+    # редкие бренды остаются различимыми.
+    #
+    # Порог fuzzy строже базового (88 vs 75): bucket шире (нет dosage/pack),
+    # поэтому нужна более высокая уверенность в имени.
+    _QUART_FREQ_MAX = max(50, len(products) // 100)  # 1% от каталога
+    _QUART_THRESHOLD = 88
+    _QUART_CONF_CAP = 0.68
+
+    word_freq = _build_word_freq(products)
+
+    by_auto_brand: dict[str, list[Product]] = defaultdict(list)
+    for p in products:
+        if p.id in visited:
+            continue
+        if p.brand:
+            continue  # только no-brand продукты
+        auto_brand = _first_brand_token(p.name_normalized or "", word_freq, _QUART_FREQ_MAX)
+        if not auto_brand:
+            continue
+        by_auto_brand[auto_brand].append(p)
+
+    log.info(
+        "matcher_quaternary_pass",
+        freq_threshold=_QUART_FREQ_MAX,
+        auto_brand_buckets=len(by_auto_brand),
+        candidates=sum(len(g) for g in by_auto_brand.values()),
+    )
+
+    for _ab_key, group in by_auto_brand.items():
+        if len(group) < 2:
+            continue
+        for i, p in enumerate(group):
+            if p.id in visited:
+                continue
+            cluster = [p]
+            _min_score_q = float(_QUART_THRESHOLD)
+            for q in group[i + 1 :]:
+                if q.id in visited:
+                    continue
+                if q.site == p.site:
+                    continue
+                if any(c.site == q.site for c in cluster):
+                    continue
+                if any(is_rejected(session, c.id, q.id) for c in cluster):
+                    continue
+                if any(
+                    _has_conflicting_modifier(c.name_normalized or "", q.name_normalized or "")
+                    for c in cluster
+                ):
+                    continue
+                if any(
+                    _has_conflicting_series_number(c.name_normalized or "", q.name_normalized or "")
+                    for c in cluster
+                ):
+                    continue
+                if _has_conflicting_form(p.name or "", q.name or ""):
+                    continue
+                _fp, _fq = _prod_form[p.id], _prod_form[q.id]
+                if _fp is not None and _fq is None:
+                    if _fp in site_bucket_forms.get((q.site, _prod_bk[q.id]), set()):
+                        continue
+                if _fq is not None and _fp is None:
+                    if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
+                        continue
+                if _has_extreme_length_disparity(
+                    p.name_normalized or "", q.name_normalized or ""
+                ):
+                    continue
+                if _has_conflicting_orphan_number(
+                    p.name_normalized or "", q.name_normalized or ""
+                ):
+                    continue
+                if _has_conflicting_gender(
+                    p.name_normalized or "", q.name_normalized or ""
+                ):
+                    continue
+                if any(
+                    _has_conflicting_variant_tokens(c.name_normalized or "", q.name_normalized or "")
+                    for c in cluster
+                ):
+                    continue
+                score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
+                if score >= _QUART_THRESHOLD:
+                    cluster.append(q)
+                    _min_score_q = min(_min_score_q, float(score))
+
+            if len(cluster) >= 2:
+                if _has_perunit_mismatch(cluster, latest_prices):
+                    continue
+                confidence = min(_min_score_q / 100.0, _QUART_CONF_CAP)
                 created_or_updated += _persist_match(session, cluster, confidence)
                 visited.update(c.id for c in cluster)
 
