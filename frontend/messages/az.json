@@ -1,14 +1,18 @@
 {
   "nav": {
     "appName": "Pharmacy Monitor",
-    "tagline": "Production",
+    "tagline": "Qiymət monitorinqi",
     "comparison": "Müqayisə",
     "overview": "Ümumi baxış",
     "analytics": "Analitika",
     "alerts": "Bildirişlər",
     "watchlist": "İzləmə",
     "categories": "Kateqoriyalar",
-    "settings": "Tənzimləmələr"
+    "settings": "Tənzimləmələr",
+    "section_overview": "İcmal",
+    "section_sites": "Saytlar",
+    "section_actions": "Əməliyyatlar",
+    "section_settings": "Parametrlər"
   },
   "common": {
     "loading": "Yüklənir…",

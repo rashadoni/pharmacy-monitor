@@ -1,14 +1,18 @@
 {
   "nav": {
     "appName": "Pharmacy Monitor",
-    "tagline": "Production",
+    "tagline": "Price Monitor",
     "comparison": "Comparison",
     "overview": "Overview",
     "analytics": "Analytics",
     "alerts": "Alerts",
     "watchlist": "Watchlist",
     "categories": "Categories",
-    "settings": "Settings"
+    "settings": "Settings",
+    "section_overview": "Overview",
+    "section_sites": "Sites",
+    "section_actions": "Actions",
+    "section_settings": "Settings"
   },
   "common": {
     "loading": "Loading…",

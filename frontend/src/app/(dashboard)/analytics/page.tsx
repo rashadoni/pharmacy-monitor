@@ -65,7 +65,7 @@ function MatchQualitySection() {
 function BrandShareSection() {
   const { data, isLoading } = useQuery({
     queryKey: ["brand-share"],
-    queryFn: () => api.brandShare(15),
+    queryFn: () => api.brandShare({ top_n: 15 }),
   });
 
   const chartData = data?.map((b) => ({
@@ -79,12 +79,12 @@ function BrandShareSection() {
     <Card title="Brand Share по сайтам (top 15)">
       {isLoading && <Skeleton />}
       {chartData && chartData.length > 0 && (
-        <ResponsiveContainer width="100%" height={400}>
-          <BarChart data={chartData} layout="vertical" margin={{ left: 80 }}>
-            <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
-            <XAxis type="number" />
-            <YAxis dataKey="brand" type="category" width={80} fontSize={11} />
-            <Tooltip />
+        <ResponsiveContainer width="100%" height={Math.max(320, chartData.length * 28)}>
+          <BarChart data={chartData} layout="vertical" margin={{ top: 4, right: 24, left: 8, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" opacity={0.3} horizontal={false} />
+            <XAxis type="number" fontSize={11} />
+            <YAxis dataKey="brand" type="category" width={140} fontSize={11} tick={{ fill: "var(--foreground)" }} />
+            <Tooltip formatter={(v: number, name: string) => [v, name]} />
             <Legend />
             <Bar dataKey="pharmonline" stackId="a" fill={SITE_COLORS.pharmonline} />
             <Bar dataKey="aptekonline" stackId="a" fill={SITE_COLORS.aptekonline} />

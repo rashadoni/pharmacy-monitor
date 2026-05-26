@@ -37,7 +37,6 @@ export default function SettingsPage() {
             <Field label={t("email")} value={meQ.data.email} />
             {meQ.data.name && <Field label={t("name")} value={meQ.data.name} />}
             <Field label={t("role")} value={meQ.data.role} />
-            <Field label={t("tenant_id")} value={String(meQ.data.tenant_id)} />
           </div>
         )}
       </Section>

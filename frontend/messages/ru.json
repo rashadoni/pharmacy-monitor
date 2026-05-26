@@ -1,14 +1,18 @@
 {
   "nav": {
     "appName": "Pharmacy Monitor",
-    "tagline": "Production",
+    "tagline": "Мониторинг цен",
     "comparison": "Сравнение",
     "overview": "Обзор",
     "analytics": "Аналитика",
     "alerts": "Алерты",
     "watchlist": "Watchlist",
     "categories": "Категории",
-    "settings": "Настройки"
+    "settings": "Настройки",
+    "section_overview": "Обзор",
+    "section_sites": "Сайты",
+    "section_actions": "Действия",
+    "section_settings": "Настройки"
   },
   "common": {
     "loading": "Загрузка…",
