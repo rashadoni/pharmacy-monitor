@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from src.match_actions import is_rejected
 from src.normalize import extract_form, normalize_name
-from src.storage import Match, Product
+from src.storage import Match, PriceSnapshot, Product, latest_snapshots_per_product
 
 log = structlog.get_logger()
 
@@ -276,6 +276,67 @@ def _norm_units(s: str) -> str:
     return s
 
 
+def _pack_count(pack_size: str) -> float:
+    """Извлекает число из pack_size: 'n10' → 10.0, 'n30' → 30.0, '' → 1.0."""
+    if not pack_size:
+        return 1.0
+    m = re.search(r"(\d+(?:\.\d+)?)", pack_size)
+    return float(m.group(1)) if m else 1.0
+
+
+# ── Мismatch «по штуке vs по упаковке» ──────────────────────────────────────
+# Aloe.az продаёт ряд товаров поштучно (1 флакон за 8.90 AZN), тогда как
+# pharmonline/aptekonline продают заводскую упаковку N10 за 89.00 AZN.
+# Нормализованная цена: price / pack_count.
+# Если у одного продукта норм-цена в ≥5 раз ниже другого — это единица vs упаковка.
+# Порог 5× (не 10×) чтобы поймать N30/N20 тоже (30/5=6×, 20/4=5×).
+_PERUNIT_PRICE_RATIO = 5.0
+
+
+def _has_perunit_mismatch(
+    cluster: list[Product],
+    prices: dict[int, PriceSnapshot],
+) -> bool:
+    """True если кластер смешивает цену-за-штуку с ценой-за-упаковку.
+
+    Вычисляет нормализованную цену = price / pack_count для каждого продукта
+    в кластере. Если max/min нормализованных цен ≥ _PERUNIT_PRICE_RATIO →
+    это ложный матч (разные единицы продажи).
+
+    Примеры блокировки:
+      aloe 8.90 / n10  → 0.89 AZN/ед
+      pharmonline 89.00 / n10 → 8.90 AZN/ед
+      ratio = 10.0 ≥ 5 → BLOCK
+
+    Примеры пропуска:
+      aloe 0.95 / n30 → 0.032 AZN/ед
+      pharmonline 2.29 / n30 → 0.076 AZN/ед
+      ratio = 2.4 < 5 → OK (реальная разница цен)
+
+    Если цена неизвестна хотя бы для одного продукта — пропускаем проверку
+    (не блокируем без данных).
+    """
+    norms: list[float] = []
+    for p in cluster:
+        snap = prices.get(p.id)
+        if snap is None or snap.price is None or snap.price <= 0:
+            return False  # нет данных — не блокируем
+        count = _pack_count(p.pack_size or "")
+        norms.append(snap.price / count)
+    if len(norms) < 2:
+        return False
+    ratio = max(norms) / min(norms)
+    if ratio >= _PERUNIT_PRICE_RATIO:
+        log.debug(
+            "matcher_perunit_mismatch",
+            products=[p.id for p in cluster],
+            norms=norms,
+            ratio=round(ratio, 1),
+        )
+        return True
+    return False
+
+
 def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> int:
     """Прогнать матчинг на всех товарах в БД.
 
@@ -292,6 +353,14 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
 
     sites = sorted(by_site.keys())
     log.info("matcher_start", total_products=len(products), sites=sites)
+
+    # Pre-fetch последние цены для всех продуктов — нужны для проверки
+    # per-unit vs per-pack (цена-за-штуку vs цена-за-упаковку).
+    # Один SELECT на все product_ids, не N+1.
+    all_ids = [p.id for p in products]
+    latest_prices: dict[int, PriceSnapshot] = latest_snapshots_per_product(
+        session, all_ids
+    )
 
     # Группируем по эвристическому ключу для O(N*K) вместо O(N^2).
     # Если brand пустой — fallback на первые 2 значащих слова из name_normalized
@@ -398,6 +467,9 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     cluster.append(q)
 
             if len(cluster) >= 2:
+                # Проверка: не смешиваем цену-за-штуку с ценой-за-упаковку
+                if _has_perunit_mismatch(cluster, latest_prices):
+                    continue
                 created_or_updated += _persist_match(session, cluster)
                 visited.update(c.id for c in cluster)
 
@@ -481,6 +553,8 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     cluster.append(q)
 
             if len(cluster) >= 2:
+                if _has_perunit_mismatch(cluster, latest_prices):
+                    continue
                 created_or_updated += _persist_match(session, cluster)
                 visited.update(c.id for c in cluster)
 
