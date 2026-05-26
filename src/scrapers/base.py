@@ -62,6 +62,49 @@ def _redact_proxy(url: str) -> str:
     return f"{scheme}://***@{host}" if scheme else f"***@{host}"
 
 
+def _brightdata_proxy_for(site_name: str) -> dict | None:
+    """Return Playwright proxy config for Bright Data Residential when site is enabled.
+
+    Phase 1.2 (2026-05-27). Bright Data is the primary residential proxy provider —
+    Hetzner IPs got banned by pharmonline + aptekonline since ~2026-04-29, and
+    ScraperAPI default pool stable returned 0 products. Residential rotating IPs
+    bypass both bans without per-request fingerprint juggling.
+
+    Env vars:
+      BRIGHTDATA_USERNAME       Full username from Access Parameters, e.g.
+                                `brd-customer-hl_XXXXXX-zone-pharmacy-monitor`
+      BRIGHTDATA_PASSWORD       Zone password
+      BRIGHTDATA_SITES          CSV of site_names that should route through it
+                                (e.g. "pharmonline,aptekonline" — leave aloe direct)
+      BRIGHTDATA_HOST           Override endpoint (default brd.superproxy.io:33335)
+      BRIGHTDATA_COUNTRY        Optional ISO-2 (e.g. "tr"). Bright Data supports
+                                appending `-country-XX` to the zone username for
+                                country-specific routing without per-request config.
+
+    Returns None when creds or site list missing — caller falls through to the
+    next provider in chain (Crawlbase → ScraperAPI → HTTP_PROXY → direct).
+    """
+    username = os.getenv("BRIGHTDATA_USERNAME")
+    password = os.getenv("BRIGHTDATA_PASSWORD")
+    if not username or not password:
+        return None
+    sites_csv = os.getenv("BRIGHTDATA_SITES", "")
+    sites = {s.strip() for s in sites_csv.split(",") if s.strip()}
+    if site_name not in sites:
+        return None
+    country = os.getenv("BRIGHTDATA_COUNTRY", "").strip().lower()
+    # If country provided AND username doesn't already encode one, append it.
+    # Bright Data username syntax: `brd-customer-X-zone-Y[-country-tr]`.
+    if country and "-country-" not in username:
+        username = f"{username}-country-{country}"
+    host = os.getenv("BRIGHTDATA_HOST", "brd.superproxy.io:33335").strip()
+    return {
+        "server": f"http://{host}",
+        "username": username,
+        "password": password,
+    }
+
+
 def _scraperapi_proxy_for(site_name: str) -> dict | None:
     """Return Playwright proxy config for ScraperAPI when this site is configured.
 
@@ -197,41 +240,52 @@ class BaseScraper(ABC):
         self._playwright = await async_playwright().start()
 
         # Proxy resolution order (first match wins):
-        #   1. Crawlbase Smart Proxy (CRAWLBASE_JS_TOKEN + CRAWLBASE_SITES)
-        #   2. ScraperAPI per-site config (SCRAPER_API_KEY + SCRAPER_API_SITES)
-        #   3. Generic HTTP_PROXY / SCRAPE_PROXY env (single proxy for everything)
+        #   1. Bright Data residential (BRIGHTDATA_USERNAME/PASSWORD + BRIGHTDATA_SITES)
+        #   2. Crawlbase Smart Proxy (CRAWLBASE_JS_TOKEN + CRAWLBASE_SITES)
+        #   3. ScraperAPI per-site config (SCRAPER_API_KEY + SCRAPER_API_SITES)
+        #   4. Generic HTTP_PROXY / SCRAPE_PROXY env (single proxy for everything)
         # Provider-specific configs take precedence so aloe (works direct from
         # Hetzner) не burn'ит платные credits.
         launch_args: dict = {"headless": self.headless}
-        crawlbase_cfg = _crawlbase_proxy_for(self.site_name)
-        scraperapi_cfg = None
         proxied_via = None
-        if crawlbase_cfg:
-            launch_args["proxy"] = crawlbase_cfg
-            proxied_via = "crawlbase"
-            log.info("scrape_using_crawlbase", site=self.site_name)
+        brightdata_cfg = _brightdata_proxy_for(self.site_name)
+        if brightdata_cfg:
+            launch_args["proxy"] = brightdata_cfg
+            proxied_via = "brightdata"
+            log.info(
+                "scrape_using_brightdata",
+                site=self.site_name,
+                country=os.getenv("BRIGHTDATA_COUNTRY", "default"),
+            )
         else:
-            scraperapi_cfg = _scraperapi_proxy_for(self.site_name)
-            if scraperapi_cfg:
-                launch_args["proxy"] = scraperapi_cfg
-                proxied_via = "scraperapi"
-                log.info(
-                    "scrape_using_scraperapi",
-                    site=self.site_name,
-                    country=os.getenv("SCRAPER_API_COUNTRY", "default"),
-                )
+            crawlbase_cfg = _crawlbase_proxy_for(self.site_name)
+            if crawlbase_cfg:
+                launch_args["proxy"] = crawlbase_cfg
+                proxied_via = "crawlbase"
+                log.info("scrape_using_crawlbase", site=self.site_name)
             else:
-                proxy_url = os.getenv("HTTP_PROXY") or os.getenv("SCRAPE_PROXY")
-                if proxy_url:
-                    launch_args["proxy"] = {"server": proxy_url}
-                    proxied_via = "generic"
-                    log.info("scrape_using_proxy", proxy=_redact_proxy(proxy_url))
+                scraperapi_cfg = _scraperapi_proxy_for(self.site_name)
+                if scraperapi_cfg:
+                    launch_args["proxy"] = scraperapi_cfg
+                    proxied_via = "scraperapi"
+                    log.info(
+                        "scrape_using_scraperapi",
+                        site=self.site_name,
+                        country=os.getenv("SCRAPER_API_COUNTRY", "default"),
+                    )
+                else:
+                    proxy_url = os.getenv("HTTP_PROXY") or os.getenv("SCRAPE_PROXY")
+                    if proxy_url:
+                        launch_args["proxy"] = {"server": proxy_url}
+                        proxied_via = "generic"
+                        log.info("scrape_using_proxy", proxy=_redact_proxy(proxy_url))
 
         self._browser = await self._playwright.chromium.launch(**launch_args)
-        # Crawlbase + ScraperAPI прокси MITM'ят HTTPS self-signed серт →
-        # Chromium блокирует с ERR_CERT_AUTHORITY_INVALID без явного relaxation.
-        # Только если реально через proxy идёт — direct / generic-proxy keep strict.
-        ignore_https_errors = proxied_via in ("crawlbase", "scraperapi")
+        # Bright Data + Crawlbase + ScraperAPI прокси MITM'ят HTTPS self-signed
+        # серт → Chromium блокирует с ERR_CERT_AUTHORITY_INVALID без явного
+        # relaxation. Только если реально через managed proxy идёт — direct и
+        # generic-proxy остаются strict (там не должно быть MITM).
+        ignore_https_errors = proxied_via in ("brightdata", "crawlbase", "scraperapi")
         self._context = await self._browser.new_context(
             user_agent=random_user_agent(),
             viewport=random_viewport(),

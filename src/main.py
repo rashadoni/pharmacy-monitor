@@ -21,12 +21,13 @@ import click
 import structlog
 import yaml
 from dotenv import load_dotenv
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 load_dotenv(override=True)
 
 from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
+from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
 from src.scrapers.aptekonline import AptekonlineScraper  # noqa: E402
 from src.scrapers.base import BaseScraper, ScrapeResult  # noqa: E402
@@ -39,6 +40,74 @@ SCRAPER_CLASSES: dict[str, type[BaseScraper]] = {
     "aptekonline": AptekonlineScraper,
     "aloe": AloeScraper,
 }
+
+# Phase 1.4 (2026-05-27) — AI crawler fallback orchestration.
+#
+# Primary scrapers (Playwright DOM / httpx JSON) могут отдать ~0 продуктов из-за
+# IP-бана, ротации anti-bot, captcha. В таком случае пробуем AICrawler через
+# sitemap-discovery + LLM extraction (платный, ~$5/site/run при cold sitemap).
+#
+# Триггер настраивается через env (умолчания агрессивно-консервативные):
+#   AI_FALLBACK_ENABLED=1        включает (default off, чтобы не жечь Claude API)
+#   AI_FALLBACK_RATIO=0.5        retry если primary yield < 50% от baseline
+#   AI_FALLBACK_MIN_BASELINE=100 baseline ниже — игнор (слишком ненадёжный сигнал)
+AI_FALLBACK_ENABLED_ENV = "AI_FALLBACK_ENABLED"
+AI_FALLBACK_RATIO_ENV = "AI_FALLBACK_RATIO"
+AI_FALLBACK_MIN_BASELINE_ENV = "AI_FALLBACK_MIN_BASELINE"
+AI_FALLBACK_MAX_URLS_ENV = "AI_FALLBACK_MAX_URLS"
+
+
+def _ai_fallback_enabled() -> bool:
+    return os.environ.get(AI_FALLBACK_ENABLED_ENV, "").lower() in ("1", "true", "yes")
+
+
+def _should_trigger_ai_fallback(
+    primary_yield: int, baseline: int | None
+) -> bool:
+    """Decide whether to invoke AI fallback after primary scraper returned.
+
+    - Disabled by env → never
+    - No baseline / baseline too small → don't trigger (signal unreliable)
+    - primary_yield >= ratio * baseline → primary was good enough
+    """
+    if not _ai_fallback_enabled():
+        return False
+    if baseline is None:
+        return False
+    try:
+        min_baseline = int(os.environ.get(AI_FALLBACK_MIN_BASELINE_ENV, "100"))
+    except ValueError:
+        min_baseline = 100
+    if baseline < min_baseline:
+        return False
+    try:
+        ratio = float(os.environ.get(AI_FALLBACK_RATIO_ENV, "0.5"))
+    except ValueError:
+        ratio = 0.5
+    threshold = int(baseline * ratio)
+    return primary_yield < threshold
+
+
+def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | None]:
+    """Pre-fetch products_per_site from latest ok run for each requested site.
+
+    Используется в run_cmd для опционального AI fallback'а. Возвращает {} если
+    раньше не было успешного прогона — fallback не активируется на первом запуске.
+    """
+    out: dict[str, int | None] = {site: None for site in sites}
+    last_ok = session.scalars(
+        select(storage.Run)
+        .where(storage.Run.status == "ok")
+        .order_by(desc(storage.Run.id))
+        .limit(1)
+    ).first()
+    if last_ok is None or not last_ok.products_per_site:
+        return out
+    for site in sites:
+        val = last_ok.products_per_site.get(site)
+        if isinstance(val, int) and val > 0:
+            out[site] = val
+    return out
 
 
 def _setup_logging(level: str = "INFO") -> None:
@@ -110,21 +179,82 @@ def maybe_seed_categories(session) -> None:
 
 
 async def scrape_site(
-    site: str, slugs: list[str], limit_per_category: int | None
+    site: str,
+    slugs: list[str],
+    limit_per_category: int | None,
+    *,
+    ai_fallback_baseline: int | None = None,
 ) -> ScrapeResult:
     cls = SCRAPER_CLASSES[site]
     if not slugs:
         log.warning("no_categories_configured", site=site)
         return ScrapeResult(site=site)
     async with cls() as s:
-        return await s.scrape(slugs, limit_per_category=limit_per_category)
+        result = await s.scrape(slugs, limit_per_category=limit_per_category)
+
+    # Phase 1.4 — optional AI crawler fallback when primary yield collapses.
+    # Only kicks in if AI_FALLBACK_ENABLED=1 in env (off by default — costs $).
+    if _should_trigger_ai_fallback(len(result.products), ai_fallback_baseline):
+        ai_cls = AI_CRAWLER_BY_SITE.get(site)
+        if ai_cls is None:
+            log.warning("ai_fallback_no_subclass", site=site)
+        else:
+            log.warning(
+                "ai_fallback_triggered",
+                site=site,
+                primary_yield=len(result.products),
+                baseline=ai_fallback_baseline,
+            )
+            try:
+                max_urls = int(os.environ.get(AI_FALLBACK_MAX_URLS_ENV, "500"))
+            except ValueError:
+                max_urls = 500
+            try:
+                async with ai_cls() as ai_s:
+                    ai_result = await ai_s.crawl(max_urls=max_urls)
+                # Merge: skip dups by external_id (primary wins).
+                seen_ext = {p.external_id for p in result.products}
+                added = 0
+                for p in ai_result.products:
+                    if p.external_id not in seen_ext:
+                        result.products.append(p)
+                        seen_ext.add(p.external_id)
+                        added += 1
+                log.info(
+                    "ai_fallback_merged",
+                    site=site,
+                    primary=len(result.products) - added,
+                    ai_added=added,
+                    ai_errors=len(ai_result.errors),
+                )
+                if ai_result.errors:
+                    result.errors.extend(
+                        f"ai_fallback: {e}" for e in ai_result.errors[:5]
+                    )
+            except Exception as e:
+                log.error(
+                    "ai_fallback_failed",
+                    site=site,
+                    error=f"{type(e).__name__}: {e}",
+                )
+                result.errors.append(f"ai_fallback: {type(e).__name__}: {e}")
+    return result
 
 
 async def scrape_all(
-    sites_with_slugs: dict[str, list[str]], limit_per_category: int | None
+    sites_with_slugs: dict[str, list[str]],
+    limit_per_category: int | None,
+    *,
+    ai_fallback_baselines: dict[str, int | None] | None = None,
 ) -> list[ScrapeResult]:
+    baselines = ai_fallback_baselines or {}
     tasks = [
-        scrape_site(site, slugs, limit_per_category)
+        scrape_site(
+            site,
+            slugs,
+            limit_per_category,
+            ai_fallback_baseline=baselines.get(site),
+        )
         for site, slugs in sites_with_slugs.items()
     ]
     return await asyncio.gather(*tasks)
@@ -1427,7 +1557,10 @@ def run_cmd(
                     s: watchlist.categories_for_site(session, s, only_category_id=category_id)
                     for s in sites
                 }
-                results = asyncio.run(scrape_all(slugs_by_site, limit))
+                baselines = baselines_for_sites(session, sites)
+                results = asyncio.run(
+                    scrape_all(slugs_by_site, limit, ai_fallback_baselines=baselines)
+                )
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
@@ -1563,7 +1696,10 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...]) -> None:
         session.commit()
         try:
             slugs_by_site = {s: watchlist.categories_for_site(session, s) for s in sites}
-            results = asyncio.run(scrape_all(slugs_by_site, limit))
+            baselines = baselines_for_sites(session, sites)
+            results = asyncio.run(
+                scrape_all(slugs_by_site, limit, ai_fallback_baselines=baselines)
+            )
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}

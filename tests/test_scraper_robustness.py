@@ -112,6 +112,92 @@ def test_scraperapi_proxy_handles_whitespace_in_csv(monkeypatch):
     assert base._scraperapi_proxy_for("aloe") is None
 
 
+# ─── Bright Data residential (Phase 1.2) ────────────────────────────────────
+
+
+def _clear_brightdata_env(monkeypatch):
+    for k in ("BRIGHTDATA_USERNAME", "BRIGHTDATA_PASSWORD", "BRIGHTDATA_SITES",
+              "BRIGHTDATA_HOST", "BRIGHTDATA_COUNTRY"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_brightdata_proxy_returns_none_without_username(monkeypatch):
+    _clear_brightdata_env(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "secret")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "pharmonline")
+    assert base._brightdata_proxy_for("pharmonline") is None
+
+
+def test_brightdata_proxy_returns_none_without_password(monkeypatch):
+    _clear_brightdata_env(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "brd-customer-hl_X-zone-Y")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "pharmonline")
+    assert base._brightdata_proxy_for("pharmonline") is None
+
+
+def test_brightdata_proxy_returns_none_when_site_not_listed(monkeypatch):
+    _clear_brightdata_env(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "brd-customer-hl_X-zone-Y")
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "secret")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "pharmonline,aptekonline")
+    # aloe is NOT in the site list → no proxy (works direct from Hetzner)
+    assert base._brightdata_proxy_for("aloe") is None
+
+
+def test_brightdata_proxy_default_endpoint(monkeypatch):
+    _clear_brightdata_env(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "brd-customer-hl_X-zone-Y")
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "secret")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "pharmonline")
+    cfg = base._brightdata_proxy_for("pharmonline")
+    assert cfg == {
+        "server": "http://brd.superproxy.io:33335",
+        "username": "brd-customer-hl_X-zone-Y",
+        "password": "secret",
+    }
+
+
+def test_brightdata_proxy_appends_country_when_not_in_username(monkeypatch):
+    _clear_brightdata_env(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "brd-customer-hl_X-zone-Y")
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "secret")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "pharmonline")
+    monkeypatch.setenv("BRIGHTDATA_COUNTRY", "tr")
+    cfg = base._brightdata_proxy_for("pharmonline")
+    assert cfg["username"] == "brd-customer-hl_X-zone-Y-country-tr"
+
+
+def test_brightdata_proxy_does_not_double_country(monkeypatch):
+    """User pre-encoded country in username → don't append again."""
+    _clear_brightdata_env(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "brd-customer-hl_X-zone-Y-country-az")
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "secret")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "pharmonline")
+    monkeypatch.setenv("BRIGHTDATA_COUNTRY", "tr")  # different, should NOT clobber
+    cfg = base._brightdata_proxy_for("pharmonline")
+    assert cfg["username"] == "brd-customer-hl_X-zone-Y-country-az"
+
+
+def test_brightdata_proxy_custom_host(monkeypatch):
+    _clear_brightdata_env(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "u")
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "p")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "pharmonline")
+    monkeypatch.setenv("BRIGHTDATA_HOST", "custom.proxy.example:9999")
+    cfg = base._brightdata_proxy_for("pharmonline")
+    assert cfg["server"] == "http://custom.proxy.example:9999"
+
+
+def test_brightdata_proxy_handles_whitespace_in_csv(monkeypatch):
+    _clear_brightdata_env(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "u")
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "p")
+    monkeypatch.setenv("BRIGHTDATA_SITES", " pharmonline ,  aptekonline ")
+    assert base._brightdata_proxy_for("pharmonline") is not None
+    assert base._brightdata_proxy_for("aptekonline") is not None
+    assert base._brightdata_proxy_for("aloe") is None
+
+
 # ─── Captcha indicator constants ────────────────────────────────────────────
 
 

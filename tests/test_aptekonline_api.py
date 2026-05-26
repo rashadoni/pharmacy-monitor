@@ -21,6 +21,7 @@ import pytest
 from src.scrapers.aptekonline import (
     AptekonlineScraper,
     _DEFAULT_CHECKUS,
+    _brightdata_httpx_proxy_for,
     _build_product_from_api,
     _resolve_checkus_token,
 )
@@ -259,3 +260,47 @@ def test_checkus_fails_fast_on_whitespace_only_env(monkeypatch):
     monkeypatch.setenv("APTEKONLINE_CHECKUS", "   \n\t  ")
     with pytest.raises(RuntimeError, match="set but empty"):
         _resolve_checkus_token()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Phase 1.2 — Bright Data httpx proxy resolution for aptekonline.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _clear_brightdata(mp):
+    for k in ("BRIGHTDATA_USERNAME", "BRIGHTDATA_PASSWORD", "BRIGHTDATA_SITES",
+              "BRIGHTDATA_HOST", "BRIGHTDATA_COUNTRY"):
+        mp.delenv(k, raising=False)
+
+
+def test_brightdata_httpx_proxy_none_without_creds(monkeypatch):
+    _clear_brightdata(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_SITES", "aptekonline")
+    assert _brightdata_httpx_proxy_for("aptekonline") is None
+
+
+def test_brightdata_httpx_proxy_none_when_site_excluded(monkeypatch):
+    _clear_brightdata(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "u")
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "p")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "pharmonline")
+    assert _brightdata_httpx_proxy_for("aptekonline") is None
+
+
+def test_brightdata_httpx_proxy_returns_url_with_default_host(monkeypatch):
+    _clear_brightdata(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "brd-customer-hl_X-zone-Y")
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "s3cr3t")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "aptekonline")
+    url = _brightdata_httpx_proxy_for("aptekonline")
+    assert url == "http://brd-customer-hl_X-zone-Y:s3cr3t@brd.superproxy.io:33335"
+
+
+def test_brightdata_httpx_proxy_appends_country(monkeypatch):
+    _clear_brightdata(monkeypatch)
+    monkeypatch.setenv("BRIGHTDATA_USERNAME", "brd-customer-hl_X-zone-Y")
+    monkeypatch.setenv("BRIGHTDATA_PASSWORD", "p")
+    monkeypatch.setenv("BRIGHTDATA_SITES", "aptekonline")
+    monkeypatch.setenv("BRIGHTDATA_COUNTRY", "tr")
+    url = _brightdata_httpx_proxy_for("aptekonline")
+    assert url == "http://brd-customer-hl_X-zone-Y-country-tr:p@brd.superproxy.io:33335"

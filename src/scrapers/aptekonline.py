@@ -52,6 +52,33 @@ from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapedPromo
 log = structlog.get_logger()
 
 
+def _brightdata_httpx_proxy_for(site_name: str) -> str | None:
+    """Bright Data Residential proxy URL для httpx-клиента.
+
+    Mirror логика из base._brightdata_proxy_for, но возвращает один URL —
+    httpx понимает строку проще чем Playwright-style dict. Bright Data
+    residential pool — единственный реалистичный путь для прода: Hetzner IP
+    забанен и в JSON API aptekonline (HTTP 403) тоже.
+
+    Returns None если creds или site list missing → caller провалится на
+    следующий провайдер в цепочке (Crawlbase → ScraperAPI → direct).
+    """
+    username = os.getenv("BRIGHTDATA_USERNAME")
+    password = os.getenv("BRIGHTDATA_PASSWORD")
+    if not username or not password:
+        return None
+    sites_csv = os.getenv("BRIGHTDATA_SITES", "")
+    sites = {s.strip() for s in sites_csv.split(",") if s.strip()}
+    if site_name not in sites:
+        return None
+    country = os.getenv("BRIGHTDATA_COUNTRY", "").strip().lower()
+    if country and "-country-" not in username:
+        username = f"{username}-country-{country}"
+    host = os.getenv("BRIGHTDATA_HOST", "brd.superproxy.io:33335").strip()
+    # Bright Data residential MITMs HTTPS — caller должен использовать verify=False.
+    return f"http://{username}:{password}@{host}"
+
+
 def _scraperapi_httpx_proxy_for(site_name: str) -> str | None:
     """ScraperAPI proxy URL для httpx-клиента (если настроен в env).
 
@@ -222,10 +249,14 @@ class AptekonlineScraper(BaseScraper):
         yielded = 0
         params_base = [("categoryId[]", category_id), ("lang", "az")]
 
-        # Proxy resolution: Crawlbase → ScraperAPI → direct.
-        # Provider-specific configs winning over generic env vars.
-        proxy_url = _crawlbase_httpx_proxy_for("aptekonline")
-        proxied_via = "crawlbase" if proxy_url else None
+        # Proxy resolution: Bright Data → Crawlbase → ScraperAPI → direct.
+        # Provider-specific configs winning over generic env vars; Bright Data
+        # priority #1 since Hetzner IP banned on aptekonline JSON API (HTTP 403).
+        proxy_url = _brightdata_httpx_proxy_for("aptekonline")
+        proxied_via = "brightdata" if proxy_url else None
+        if proxy_url is None:
+            proxy_url = _crawlbase_httpx_proxy_for("aptekonline")
+            proxied_via = "crawlbase" if proxy_url else None
         if proxy_url is None:
             proxy_url = _scraperapi_httpx_proxy_for("aptekonline")
             proxied_via = "scraperapi" if proxy_url else None
@@ -239,7 +270,11 @@ class AptekonlineScraper(BaseScraper):
             client_kwargs["verify"] = False  # MITM HTTPS на любом из этих прокси
             log.info(
                 f"aptekonline_using_{proxied_via}",
-                country=os.getenv("SCRAPER_API_COUNTRY", "default"),
+                country=(
+                    os.getenv("BRIGHTDATA_COUNTRY")
+                    if proxied_via == "brightdata"
+                    else os.getenv("SCRAPER_API_COUNTRY", "default")
+                ),
             )
         async with httpx.AsyncClient(**client_kwargs) as client:
             for page_num in range(1, max_pages + 1):
