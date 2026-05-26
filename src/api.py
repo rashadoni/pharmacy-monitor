@@ -85,6 +85,7 @@ except ImportError:
 from src.observability import (
     init_observability,
     install_metrics_endpoint,
+    sentry_set_request_id,
     sentry_set_tenant,
 )
 
@@ -114,6 +115,52 @@ app.add_middleware(
 
 # Prometheus /metrics endpoint
 install_metrics_endpoint(app)
+
+
+# ─── Request ID middleware (Phase 0.5, 2026-05-26) ───────────────────────────
+#
+# Каждый запрос получает UUID4 (или принимается клиентский `X-Request-ID`,
+# если присутствует и выглядит безопасно). ID:
+#   1. Биндится в structlog.contextvars → все log-строки в рамках запроса
+#      получают `request_id=<uuid>`.
+#   2. Кладётся как тэг в Sentry scope → ошибки в Sentry searchable по id.
+#   3. Возвращается в response header `X-Request-ID` → фронт может его
+#      показать в error boundary и положить в bug report.
+#
+# Размер UUID-токена ограничен 128 символами, не-ASCII / control-символы
+# заменяются на безопасный fallback — чтобы клиент не мог инжектнуть мусор
+# в наши логи через заголовок.
+
+import re
+import uuid as _uuid
+
+from structlog.contextvars import bind_contextvars, clear_contextvars
+
+_REQUEST_ID_HEADER = "X-Request-ID"
+_REQUEST_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9\-_.]{1,128}$")
+
+
+def _sanitize_request_id(raw: str | None) -> str:
+    """Validate incoming `X-Request-ID`; otherwise generate fresh UUID4."""
+    if raw and _REQUEST_ID_SAFE_RE.match(raw):
+        return raw
+    return _uuid.uuid4().hex
+
+
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    request_id = _sanitize_request_id(request.headers.get(_REQUEST_ID_HEADER))
+    request.state.request_id = request_id
+    bind_contextvars(request_id=request_id)
+    sentry_set_request_id(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        # Avoid leaking request-scoped context into the next request handled by
+        # the same uvicorn worker.
+        clear_contextvars()
+    response.headers[_REQUEST_ID_HEADER] = request_id
+    return response
 
 
 # ─── Rate limiting (in-memory sliding window — to be replaced with Redis) ────
@@ -254,10 +301,27 @@ def require_user(
 # ─── Schemas ─────────────────────────────────────────────────────────────────
 
 
+class SiteStaleness(BaseModel):
+    """Per-site freshness: when did we last successfully see a product on it?
+
+    `hours_since` aggregates the gap between now and the max `last_seen_at`
+    across all products tagged with `site`. >30h is suspicious — scrapes
+    run daily, so anything older means the scraper has missed at least one run.
+    """
+
+    site: str
+    last_seen_at: datetime | None
+    hours_since: float | None
+
+
 class HealthOut(BaseModel):
-    status: str
+    status: str  # "up" | "degraded" — degraded if a dependency or scraper is stale
     last_run_at: datetime | None
     last_run_status: str | None
+    db_ping_ms: float | None = None  # SELECT 1 round-trip
+    redis_ping_ms: float | None = None  # PING round-trip, null if Redis unreachable
+    sites: list[SiteStaleness] = Field(default_factory=list)
+    staleness_warning: bool = False  # true if any site >30h stale
 
 
 class AuthRequestIn(BaseModel):
@@ -364,15 +428,89 @@ class WatchlistItemIn(BaseModel):
 # ─── Public endpoints ────────────────────────────────────────────────────────
 
 
+# Per-site staleness threshold: scrapes run daily, so >30h means at least one
+# scheduled run was skipped. Surfaced in `/health.staleness_warning`.
+_HEALTH_STALENESS_HOURS = 30
+
+
+def _ping_db(db: Session) -> float | None:
+    """SELECT 1 round-trip, returns ms or None on failure."""
+    try:
+        from sqlalchemy import text
+
+        t0 = time.perf_counter()
+        db.execute(text("SELECT 1"))
+        return round((time.perf_counter() - t0) * 1000, 2)
+    except Exception:
+        return None
+
+
+def _ping_redis() -> float | None:
+    """Redis PING round-trip, returns ms or None if URL unset / unreachable."""
+    url = os.environ.get("REDIS_URL")
+    if not url:
+        return None
+    try:
+        import redis as _redis  # local import — keeps health endpoint cheap if dep missing
+
+        client = _redis.from_url(url, socket_connect_timeout=1, socket_timeout=1)
+        t0 = time.perf_counter()
+        client.ping()
+        return round((time.perf_counter() - t0) * 1000, 2)
+    except Exception:
+        return None
+
+
+def _staleness_per_site(db: Session) -> list[SiteStaleness]:
+    """Max(Product.last_seen_at) per site, with hours-since-now diff.
+
+    Diff-only persist (2026-05-09) updates `last_seen_at` on every run,
+    independent of whether a snapshot was actually written — so this is
+    the canonical "did we run today" signal per site.
+
+    Project convention (src/_time.py): all DateTime columns store NAIVE UTC.
+    We strip tzinfo from inputs to match.
+    """
+    rows = db.execute(
+        select(storage.Product.site, func.max(storage.Product.last_seen_at))
+        .group_by(storage.Product.site)
+    ).all()
+    now = utcnow()  # naive UTC by project convention
+    out: list[SiteStaleness] = []
+    for site, last_seen in rows:
+        hours: float | None = None
+        if last_seen is not None:
+            ls = last_seen.replace(tzinfo=None) if last_seen.tzinfo else last_seen
+            hours = round((now - ls).total_seconds() / 3600, 2)
+        out.append(SiteStaleness(site=site, last_seen_at=last_seen, hours_since=hours))
+    return out
+
+
 @app.get("/health", response_model=HealthOut)
 def health_endpoint(db: Session = Depends(get_db)):
+    """Deep health check (Phase 0.3, 2026-05-26).
+
+    Used by ops + Caddy upstream health probe. NEVER throws — degraded
+    dependencies report as `null` ping or `staleness_warning=true`, but the
+    endpoint itself stays 200 so we can distinguish "API up but DB slow"
+    from "API down entirely".
+    """
     last = db.scalars(
         select(storage.Run).order_by(desc(storage.Run.id)).limit(1)
     ).first()
+    db_ms = _ping_db(db)
+    redis_ms = _ping_redis()
+    sites = _staleness_per_site(db)
+    stale = any(s.hours_since is not None and s.hours_since > _HEALTH_STALENESS_HOURS for s in sites)
+    status_label = "degraded" if (stale or db_ms is None) else "up"
     return HealthOut(
-        status="up",
+        status=status_label,
         last_run_at=last.started_at if last else None,
         last_run_status=last.status if last else None,
+        db_ping_ms=db_ms,
+        redis_ping_ms=redis_ms,
+        sites=sites,
+        staleness_warning=stale,
     )
 
 

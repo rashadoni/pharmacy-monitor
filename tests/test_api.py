@@ -85,6 +85,97 @@ def test_health_endpoint(client):
     assert body["status"] == "up"
     assert "last_run_at" in body
     assert "last_run_status" in body
+    # Phase 0.3 — deep health fields
+    assert "db_ping_ms" in body
+    assert "redis_ping_ms" in body  # null if REDIS_URL unset in tests
+    assert body.get("sites") == []  # empty DB → no sites
+    assert body["staleness_warning"] is False
+    assert body["db_ping_ms"] is not None and body["db_ping_ms"] >= 0
+
+
+def test_health_endpoint_db_ping_responds_quickly(client):
+    """SQLite in-memory ping should always be < 100ms."""
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["db_ping_ms"] < 100
+
+
+def test_health_endpoint_redis_unset_returns_null(client, monkeypatch):
+    """No REDIS_URL → redis_ping_ms is null, but health still reports up."""
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["redis_ping_ms"] is None
+    assert body["status"] == "up"
+
+
+def test_health_endpoint_flags_staleness(client, setup_db):
+    """Product older than 30h → staleness_warning=true, status=degraded."""
+    from datetime import timedelta
+
+    db = setup_db
+    old = datetime.now(timezone.utc) - timedelta(hours=48)
+    db.add(
+        storage.Product(
+            tenant_id=1,
+            site="pharmonline",
+            external_id="stale-1",
+            url="https://example.com/x",
+            name="Stale",
+            name_normalized="stale",
+            last_seen_at=old,
+            first_seen_at=old,
+        )
+    )
+    db.commit()
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["staleness_warning"] is True
+    assert body["status"] == "degraded"
+    sites = {s["site"]: s for s in body["sites"]}
+    assert "pharmonline" in sites
+    assert sites["pharmonline"]["hours_since"] >= 48
+
+
+# ─── Request ID middleware (Phase 0.5) ───────────────────────────────────────
+
+
+def test_request_id_generated_when_absent(client):
+    """No incoming header → server generates a UUID4-hex (32 chars)."""
+    r = client.get("/health")
+    rid = r.headers.get("X-Request-ID")
+    assert rid is not None
+    # uuid4().hex is 32 lowercase hex chars
+    assert len(rid) == 32
+    assert all(c in "0123456789abcdef" for c in rid)
+
+
+def test_request_id_echoes_safe_client_value(client):
+    """Safe-looking client `X-Request-ID` is echoed back unchanged."""
+    rid_in = "client-trace-abc.123_xyz"
+    r = client.get("/health", headers={"X-Request-ID": rid_in})
+    assert r.headers.get("X-Request-ID") == rid_in
+
+
+def test_request_id_rejects_unsafe_client_value(client):
+    """Newlines / control chars / overlong values must be replaced, not logged."""
+    bad = "evil\r\nLog-Injection: pwned" + "A" * 200
+    r = client.get("/health", headers={"X-Request-ID": bad})
+    out = r.headers.get("X-Request-ID")
+    assert out is not None
+    assert out != bad
+    assert "\n" not in out and "\r" not in out
+    assert len(out) == 32  # falls back to fresh UUID
+
+
+def test_request_id_unique_per_request(client):
+    """Two consecutive requests get distinct IDs (no leak from contextvars)."""
+    r1 = client.get("/health")
+    r2 = client.get("/health")
+    assert r1.headers["X-Request-ID"] != r2.headers["X-Request-ID"]
 
 
 # ─── Auth endpoints ──────────────────────────────────────────────────────────

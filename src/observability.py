@@ -134,6 +134,22 @@ def sentry_set_tenant(tenant_id: int) -> None:
         pass
 
 
+def sentry_set_request_id(request_id: str) -> None:
+    """Set request_id as Sentry tag for the current request scope.
+
+    Lets us cross-reference Sentry events with backend structlog lines and the
+    `X-Request-ID` header surfaced to the frontend.
+    """
+    if not _SENTRY_INITIALIZED:
+        return
+    try:
+        import sentry_sdk
+
+        sentry_sdk.set_tag("request_id", request_id)
+    except ImportError:
+        pass
+
+
 # ─── Prometheus metrics ─────────────────────────────────────────────────────
 
 

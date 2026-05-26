@@ -20,7 +20,9 @@ import pytest
 
 from src.scrapers.aptekonline import (
     AptekonlineScraper,
+    _DEFAULT_CHECKUS,
     _build_product_from_api,
+    _resolve_checkus_token,
 )
 
 
@@ -223,3 +225,37 @@ async def test_scrape_category_stops_on_empty_data():
         scraper = AptekonlineScraper()
         products = [p async for p in scraper.scrape_category("114")]
     assert products == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Phase 0.1 — APTEKONLINE_CHECKUS env resolution (rotation path).
+# Default остаётся как fallback; задаваемая через env строка имеет приоритет;
+# empty string → fail-fast (защита от .env-опечатки).
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_checkus_default_when_env_unset(monkeypatch):
+    monkeypatch.delenv("APTEKONLINE_CHECKUS", raising=False)
+    assert _resolve_checkus_token() == _DEFAULT_CHECKUS
+
+
+def test_checkus_uses_env_override(monkeypatch):
+    monkeypatch.setenv("APTEKONLINE_CHECKUS", "$2y$10$ROTATED_TOKEN_FROM_ENV")
+    assert _resolve_checkus_token() == "$2y$10$ROTATED_TOKEN_FROM_ENV"
+
+
+def test_checkus_strips_whitespace_from_env(monkeypatch):
+    monkeypatch.setenv("APTEKONLINE_CHECKUS", "  $2y$10$WITH_WS  \n")
+    assert _resolve_checkus_token() == "$2y$10$WITH_WS"
+
+
+def test_checkus_fails_fast_on_empty_env(monkeypatch):
+    monkeypatch.setenv("APTEKONLINE_CHECKUS", "")
+    with pytest.raises(RuntimeError, match="set but empty"):
+        _resolve_checkus_token()
+
+
+def test_checkus_fails_fast_on_whitespace_only_env(monkeypatch):
+    monkeypatch.setenv("APTEKONLINE_CHECKUS", "   \n\t  ")
+    with pytest.raises(RuntimeError, match="set but empty"):
+        _resolve_checkus_token()

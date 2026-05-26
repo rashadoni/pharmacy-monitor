@@ -92,9 +92,35 @@ def _crawlbase_httpx_proxy_for(site_name: str) -> str | None:
 
 _API_PRODUCT_LIST = "https://www.aptekonline.az/shop/productList"
 
+# checkus — bcrypt-захэшированный API-ключ, статичный для всех клиентов
+# (не привязан к user_id). Скопирован из main.js?v=35 (зафиксирован 2026-05-07).
+# Если сайт его ротейтит — переопредели через env APTEKONLINE_CHECKUS без
+# редеплоя кода. Default остаётся как fallback для совместимости.
+_DEFAULT_CHECKUS = "$2y$10$heJNZP6TbdT.DmpZlHp87u1NY7RqdXXV5Ht/rBbvjSsEIqgi42/ku"
+
+
+def _resolve_checkus_token() -> str:
+    """Resolve aptekonline `checkus` API token.
+
+    - APTEKONLINE_CHECKUS unset → use _DEFAULT_CHECKUS (back-compat).
+    - APTEKONLINE_CHECKUS set & non-empty → use env value (rotation path).
+    - APTEKONLINE_CHECKUS set & empty → RuntimeError (fail-fast, no silent fallback).
+    """
+    env_val = os.getenv("APTEKONLINE_CHECKUS")
+    if env_val is None:
+        return _DEFAULT_CHECKUS
+    stripped = env_val.strip()
+    if not stripped:
+        raise RuntimeError(
+            "APTEKONLINE_CHECKUS is set but empty — refusing to start aptekonline "
+            "scraper. Either unset the env var to use the bundled default token, "
+            "or provide a valid bcrypt-style token from main.js."
+        )
+    return stripped
+
+
 # Заголовки скопированы 1-в-1 из main.js — иначе backend возвращает HTML-редирект
-# на страницу логина вместо JSON. checkus — bcrypt-захэшированный API-ключ,
-# одинаковый для всех клиентов (не привязан к user_id).
+# на страницу логина вместо JSON.
 _API_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -104,7 +130,7 @@ _API_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "az-AZ,az;q=0.9,ru-RU;q=0.8,ru;q=0.7,en-US;q=0.6,en;q=0.5",
-    "checkus": "$2y$10$heJNZP6TbdT.DmpZlHp87u1NY7RqdXXV5Ht/rBbvjSsEIqgi42/ku",
+    "checkus": _resolve_checkus_token(),
 }
 
 
