@@ -133,7 +133,7 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
 - ~~22317 AZN bug in aptekonline price parser~~ FIXED 2026-05-07. Root cause: aptekonline's Angular template `'<del>' + price + 'AZN </del>' + p.discount_price + ' AZN '` renders with no separator, so `inner_text` of `.new-price` returns e.g. `"22AZN 317 AZN"` for a discounted product. Old `parse_price` stripped non-digits → `"22317"`. Fix: extract only the FIRST digit-run-with-dots/commas via regex. Existing bad rows перезатираются следующим aptekonline-прогоном (Mac launchd 18:00 Asia/Baku ежедневно); для немедленной очистки: `DELETE FROM price_snapshots WHERE site='aptekonline' AND price > 5000;`
 - pharmonline.az has NO `/sitemap.xml` (returns SPA HTML); aptekonline returns empty `<urlset>` — both need BFS fallback (regular Playwright scrapers continue to work via category pages)
 - **Hetzner DE IP banned by pharmonline.az + aptekonline.az** (since ~2026-04-29). MITIGATED 2026-05-11: оба сайта переехали на Mac launchd 18:00 Asia/Baku (Baku-IP не банится). Прод-таймеры pharmonline/aptekonline disabled. Aloe остался на проде (direct работает). См. "Runtime layout" выше.
-- Project under git с 2026-05-11. Initial commit `c7fde84` зафиксировал diff-only state. Remote ещё не настроен (`git remote add origin …`).
+- Project under git с 2026-05-11. Initial commit `c7fde84` зафиксировал diff-only state. **Remote**: `origin` = `https://github.com/rashadrahimov/pharmacy-monitor.git`. Auth работает через cached creds (`git push origin main` без проблем).
 - forecast.py не рефакторен под diff-only — JOIN'ы по `Run.started_at` валидны, но coverage упадёт: продукты со стабильной ценой получат < min_points (3) → forecast вернёт None. Семантически корректно, но trend-графиков станет меньше. Доделать когда станет нужен trend для широкого среза.
 - 7 false matches in matcher (Friso 3 Gold ↔ Friso Prematures etc) — needs manual reject via UI on /comparison
 - `admin off` in `/etc/caddy/Caddyfile` — `systemctl reload caddy` fails, use `restart` instead
@@ -201,9 +201,9 @@ SELECT COUNT(*) FROM products;
 [✓] AI crawler  CLI shipped, sitemap works, aloe extraction working (RSC JSON-LD + Playwright JSON-LD), 25/50 products on dry-run smoke
 [✓] Nightly     Hybrid runtime: aloe на проде (03:00 UTC), pharmonline+aptekonline с Mac launchd 18:00 Baku
 [✓] Diff-only   persist + analyzer + 5 consumers под новую семантику (2026-05-09 → 11). 51× экономия snapshots, 2× быстрее прогон.
-[✓] Git         project under VCS с 2026-05-11 (initial commit c7fde84). Remote: TODO
+[✓] Git         project under VCS с 2026-05-11 (initial commit c7fde84) + remote github.com/rashadrahimov/pharmacy-monitor
 [✓] i18n full   locale switcher в nav, AZ/EN fix (route /locale вместо /api/locale), 71 строка переведена, ROI actions переведены (2026-05-26)
-[ ] Next        Remote git origin, SMTP (Resend), Telegram bot token, Sentry DSN, forecast.py diff-only refactor (опционально), ScraperAPI Hobby ($49) для возврата aptekonline на прод (опционально)
+[ ] Next        SMTP (Resend), Telegram bot token, Sentry DSN, forecast.py diff-only refactor (опционально), ScraperAPI Hobby ($49) для возврата aptekonline на прод (опционально)
 ```
 
 ### Out of scope (decided 2026-05-07 by client)
