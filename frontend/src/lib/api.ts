@@ -430,6 +430,8 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
+  alertsMarkAllRead: () =>
+    request<{ affected: number }>("/api/v1/dash/alerts/mark-all-read", { method: "POST" }),
   alertsBulk: (ids: number[], action:
     | "mark_read"
     | "mark_unread"

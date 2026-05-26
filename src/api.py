@@ -1424,6 +1424,28 @@ def dash_alerts_bulk(
     return {"affected": result.rowcount, "action": payload.action}
 
 
+@app.post("/api/v1/dash/alerts/mark-all-read")
+def dash_alerts_mark_all_read(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Пометить все непрочитанные алерты (inbox) как прочитанные одним запросом."""
+    from sqlalchemy import update as _update
+    from src._time import utcnow as _now
+
+    now = _now()
+    result = db.execute(
+        _update(storage.AlertEvent)
+        .where(
+            storage.AlertEvent.tenant_id == user.tenant_id,
+            storage.AlertEvent.is_read == False,  # noqa: E712
+        )
+        .values(is_read=True, read_at=now)
+    )
+    db.commit()
+    return {"affected": result.rowcount}
+
+
 @app.get("/api/v1/dash/match-quality")
 def dash_match_quality(
     user: storage.TenantUser = Depends(require_user),

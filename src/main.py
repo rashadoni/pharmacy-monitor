@@ -1155,6 +1155,33 @@ def telegram_run_bot(timeout: int) -> None:
     run_polling(poll_timeout=timeout)
 
 
+# ─── Standalone digest command ───────────────────────────────────────────────
+
+
+@cli.command("digest")
+@click.option("--top", "top_n", type=int, default=20, show_default=True,
+              help="Топ-N алертов в письме.")
+@click.option("--window", "window_hours", type=int, default=24, show_default=True,
+              help="Окно выборки, часов.")
+@click.option("--dry-run", is_flag=True, help="Вывести preview в stdout, не отправлять.")
+def digest_cmd(top_n: int, window_hours: int, dry_run: bool) -> None:
+    """Отправить daily digest (топ-N алертов за последние window_hours часов).
+
+    Запускается systemd timer pharmacy-monitor-digest@daily.timer в 05:00 UTC
+    (09:00 Baku). При 0 событий — письмо не отправляется.
+    """
+    from src.digest import send_daily_digest
+
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as s:
+        n = send_daily_digest(s, window_hours=window_hours, top_n=top_n, dry_run=dry_run)
+        if n:
+            click.echo(f"OK: digest sent, {n} events")
+        else:
+            click.echo("Skipped: no events in window" if not dry_run else f"[dry-run] {n} events")
+
+
 # ─── Notifications: digest commands (W9) ─────────────────────────────────────
 
 

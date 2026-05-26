@@ -123,8 +123,11 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
     results: dict[str, list[str]] = {"email": [], "telegram": []}
     sent_at = utcnow()
     for user in users:
-        # Email
-        if _severity_passes(user.email_severity_min, event.severity, DEFAULT_EMAIL_SEVERITY):
+        # Email — skip real-time if user opted into daily digest (digest will include it)
+        if (
+            not user.daily_digest
+            and _severity_passes(user.email_severity_min, event.severity, DEFAULT_EMAIL_SEVERITY)
+        ):
             try:
                 notifier.send_email(
                     subject=f"[{event.severity.upper()}] {event.title[:80]}",

@@ -1,8 +1,8 @@
 [Unit]
-Description=Daily digest at 08:00 local time
+Description=Daily digest at 05:00 UTC (09:00 Baku)
 
 [Timer]
-OnCalendar=*-*-* 08:00:00
+OnCalendar=*-*-* 05:00:00 UTC
 RandomizedDelaySec=60
 Persistent=true
 Unit=pharmacy-monitor-digest@daily.service

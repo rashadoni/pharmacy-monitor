@@ -8,7 +8,7 @@ User=pm
 Group=pm
 WorkingDirectory=/opt/pharmacy-monitor
 EnvironmentFile=/etc/pharmacy-monitor/env
-ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor notify digest %i
+ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor digest
 
 NoNewPrivileges=true
 PrivateTmp=true

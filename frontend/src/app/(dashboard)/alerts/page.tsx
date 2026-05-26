@@ -106,6 +106,16 @@ export default function AlertsPage() {
   }, [data]);
 
   // Mutations
+  const markAllReadMutation = useMutation({
+    mutationFn: () => api.alertsMarkAllRead(),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
+      setSelected(new Set());
+    },
+    onError: (e) => alert(friendlyError(e)),
+  });
+
   const bulkMutation = useMutation({
     mutationFn: ({
       ids,
@@ -179,6 +189,16 @@ export default function AlertsPage() {
             в отдельных tab&apos;ах.
           </p>
         </div>
+        {view === "inbox" && counts?.unread != null && counts.unread > 0 && (
+          <button
+            onClick={() => markAllReadMutation.mutate()}
+            disabled={markAllReadMutation.isPending}
+            className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+          >
+            <CheckCheck className="h-3.5 w-3.5" />
+            {markAllReadMutation.isPending ? "…" : `Прочитать всё (${counts.unread})`}
+          </button>
+        )}
       </div>
 
       {/* Tabs */}
