@@ -323,9 +323,14 @@ def normalize_name(name: str) -> str:
     # Схлопываем пробелы-разделители тысяч: «1 000 000 BV» → «1000000 BV»
     # ДО strip_accents/lower, чтобы _DOSAGE_RE корректно съел весь диапазон.
     s = _collapse_spaced_thousands(s)
+    # Формы выпуска убираем ДО strip_accents — паттерны в _FORMS содержат
+    # оригинальные ş/ə/ı (шамлар, дамджы…). После strip_accents ş→s, и тогда
+    # «şamlar» не совпадает с паттерном «şamlar» — форма остаётся в имени,
+    # снижая точность fuzzy-матча (было: «ukraferon suppositories» не матчилось
+    # с «ukraferon rektal samlar»). re.IGNORECASE покрывает регистр.
+    s = _FORMS_RE.sub(" ", s)
     s = strip_accents(s)
     s = s.lower()
-    s = _FORMS_RE.sub(" ", s)
     s = _DOSAGE_RE.sub(" ", s)
     s = _PACK_RE.sub(" ", s)
     s = _COUNTRY_RE.sub(" ", s)
@@ -341,7 +346,13 @@ def normalize_name(name: str) -> str:
 
 
 def extract_dosage(name: str) -> str | None:
-    """Вытащить дозировку (500mg, 10ml, 250mg/5ml). qr→q нормализуется."""
+    """Вытащить дозировку (500mg, 10ml, 250mg/5ml). qr→q нормализуется.
+
+    Применяет strip_accents к результату: «İU» (турецкий I с точкой, U+0130)
+    после .lower() даёт «i̇u» (с combining dot) вместо ASCII «iu».
+    strip_accents убирает combining chars → «iu». Без этого такие продукты
+    попадают в другой bucket_key и не матчатся с IU/BV/ME продуктами.
+    """
     if not name:
         return None
     name = _collapse_spaced_thousands(name)  # «1 000 000 BV» → «1000000 BV»
@@ -349,6 +360,7 @@ def extract_dosage(name: str) -> str | None:
     if not m:
         return None
     raw = re.sub(r"\s+", "", m.group(1).lower()).replace(",", ".")
+    raw = strip_accents(raw)  # İU → iu, Ü → u (убирает combining chars)
     return _normalize_units(raw)
 
 

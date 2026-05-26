@@ -643,3 +643,90 @@ class TestPerunitMismatch:
         db_session.refresh(a)
         db_session.refresh(b)
         assert a.canonical_id is None or a.canonical_id != b.canonical_id
+
+
+class TestSiblingFormCheck:
+    """Sibling-form check: если у p нет формы, но на его сайте в том же bucket'е
+    уже есть продукт с явной формой q → матч запрещён.
+
+    Реальный кейс: aptk 11201 «Ukraferon 1000000 BV N10» (форма неизвестна) vs
+    pharm 4119 «Ukraferon 1000000 IU N10 (Suppositories)» (suppository).
+    На aptekonline в том же bucket'е есть aptk 10761 «…(rektal şamlar)»
+    → aptk 11201 — не суппозиторий → матч с фарм-суппозиторием ЗАПРЕЩЁН.
+    """
+
+    def test_sibling_blocks_nasal_from_matching_suppository(self, db_session):
+        """aptk без формы + aptk-sibling suppository → не матчится с pharm suppository."""
+        import datetime
+        run = storage.Run(
+            tenant_id=1, started_at=datetime.datetime.utcnow(), status="ok"
+        )
+        db_session.add(run)
+        db_session.flush()
+
+        # aptekonline: один суппозиторий с явной формой, один без формы (=другая форма)
+        aptk_suppository = _make_product(
+            db_session, site="aptekonline", external_id="ukr-aptk-supp",
+            name="Ukraferon 1000000 BV N10 (rektal şamlar)",
+            name_normalized="ukraferon",
+            brand="ukraferon", dosage="1000000bv", pack_size="n10",
+        )
+        aptk_no_form = _make_product(
+            db_session, site="aptekonline", external_id="ukr-aptk-nasal",
+            name="Ukraferon 1000000 BV N10",
+            name_normalized="ukraferon",
+            brand="ukraferon", dosage="1000000bv", pack_size="n10",
+        )
+        # pharmonline: суппозиторий
+        pharm_suppository = _make_product(
+            db_session, site="pharmonline", external_id="ukr-pharm-supp",
+            name="Ukraferon 1000000 IU N10 (Suppositories)",
+            name_normalized="ukraferon",
+            brand="ukraferon", dosage="1000000iu", pack_size="n10",
+        )
+        db_session.commit()
+
+        matcher.match_products(db_session)
+        db_session.refresh(aptk_suppository)
+        db_session.refresh(aptk_no_form)
+        db_session.refresh(pharm_suppository)
+
+        # aptk_suppository должен матчиться с pharm_suppository (оба суппозитории)
+        assert aptk_suppository.canonical_id is not None
+        assert aptk_suppository.canonical_id == pharm_suppository.canonical_id
+
+        # aptk_no_form НЕ должен матчиться с pharm_suppository
+        assert aptk_no_form.canonical_id is None or (
+            aptk_no_form.canonical_id != pharm_suppository.canonical_id
+        )
+
+    def test_no_block_when_no_sibling(self, db_session):
+        """Если на сайте нет sibling с явной формой — матч разрешён (нет данных → не блокируем)."""
+        import datetime
+        run = storage.Run(
+            tenant_id=1, started_at=datetime.datetime.utcnow(), status="ok"
+        )
+        db_session.add(run)
+        db_session.flush()
+
+        aptk_no_form = _make_product(
+            db_session, site="aptekonline", external_id="dr-aptk-1",
+            name="Drotaverinum 40mg N20",
+            name_normalized="drotaverinum",
+            brand="drotaverinum", dosage="40mg", pack_size="n20",
+        )
+        pharm_tablet = _make_product(
+            db_session, site="pharmonline", external_id="dr-pharm-1",
+            name="Drotaverinum 40mg N20 (Tablets)",
+            name_normalized="drotaverinum",
+            brand="drotaverinum", dosage="40mg", pack_size="n20",
+        )
+        db_session.commit()
+
+        matcher.match_products(db_session)
+        db_session.refresh(aptk_no_form)
+        db_session.refresh(pharm_tablet)
+
+        # aptk не имеет sibling с формой tablet → матч РАЗРЕШЁН
+        assert aptk_no_form.canonical_id is not None
+        assert aptk_no_form.canonical_id == pharm_tablet.canonical_id

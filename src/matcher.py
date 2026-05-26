@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.match_actions import is_rejected
-from src.normalize import extract_form, normalize_name
+from src.normalize import extract_form, normalize_name, strip_accents
 from src.storage import Match, PriceSnapshot, Product, latest_snapshots_per_product
 
 log = structlog.get_logger()
@@ -276,7 +276,11 @@ def _norm_units(s: str) -> str:
 
     Без этого «ukraferon 500000bv/n10» (aptekonline) и «ukraferon 500000iu/n10»
     (pharmonline) попадают в разные bucket'ы, хотя это идентичный товар.
+
+    strip_accents в начале убирает combining chars из stale данных БД:
+    «500000i̇u» (İU после .lower() в старом extract_dosage) → «500000iu».
     """
+    s = strip_accents(s)  # İ → i (combining dot removed), Ü → u и т.п.
     s = s.replace("mq", "mg").replace("mkg", "mcg")
     s = re.sub(r"(\d)q\b", r"\1g", s)
     # Международные единицы: bv/me/ie → iu
@@ -403,6 +407,30 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     for p in products:
         buckets[bucket_key(p)].append(p)
 
+    # ── Sibling-form check ───────────────────────────────────────────────────
+    # Если продукт P не имеет формы выпуска, но на его сайте в том же bucket'е
+    # уже есть другой продукт с явной формой X → P НЕ является формой X (иначе
+    # зачем сайт листил бы оба?).  Используется ниже в обоих проходах.
+    #
+    # Пример: aptk 11201 «Ukraferon 1000000 BV N10» (форма = None, вероятно
+    # назальные капли) vs pharm 4119 «…(Suppositories)» (форма = suppository).
+    # На aptekonline в том же bucket'е есть aptk 10761 «…(rektal şamlar)»
+    # (форма = suppository) → aptk 11201 — не суппозиторий → матч запрещён.
+    #
+    # _prod_form  : product.id → extracted form (or None)
+    # _prod_bk    : product.id → bucket_key(product)
+    # site_bucket_forms : (site, bucket_key) → set of forms present on that site
+    _prod_form: dict[int, str | None] = {
+        p.id: extract_form(p.name or "") for p in products
+    }
+    _prod_bk: dict[int, tuple] = {p.id: bucket_key(p) for p in products}
+
+    site_bucket_forms: dict[tuple, set[str]] = defaultdict(set)
+    for p in products:
+        f = _prod_form[p.id]
+        if f is not None:
+            site_bucket_forms[(p.site, _prod_bk[p.id])].add(f)
+
     created_or_updated = 0
     visited: set[int] = set()
 
@@ -447,6 +475,16 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # (проверяем только против якоря — форма берётся из raw name)
                 if _has_conflicting_form(p.name or "", q.name or ""):
                     continue
+                # Sibling-form: у q нет формы, но на сайте q в этом bucket'е
+                # уже есть продукт с явной формой p → q НЕ является этой формой.
+                # И наоборот — у p нет формы, а на сайте p уже есть форма q.
+                _fp, _fq = _prod_form[p.id], _prod_form[q.id]
+                if _fp is not None and _fq is None:
+                    if _fp in site_bucket_forms.get((q.site, _prod_bk[q.id]), set()):
+                        continue
+                if _fq is not None and _fp is None:
+                    if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
+                        continue
                 # Stub vs полное имя: «venatura» vs «venatura vitamin a palmitate…»
                 # (проверяем только против якоря — длина якоря самая репрезентативная)
                 if _has_extreme_length_disparity(
@@ -539,6 +577,13 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     continue
                 if _has_conflicting_form(p.name or "", q.name or ""):
                     continue
+                _fp, _fq = _prod_form[p.id], _prod_form[q.id]
+                if _fp is not None and _fq is None:
+                    if _fp in site_bucket_forms.get((q.site, _prod_bk[q.id]), set()):
+                        continue
+                if _fq is not None and _fp is None:
+                    if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
+                        continue
                 if _has_extreme_length_disparity(
                     p.name_normalized or "", q.name_normalized or ""
                 ):
