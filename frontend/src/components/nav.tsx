@@ -87,7 +87,7 @@ export function SideNav() {
   }
 
   return (
-    <nav className="hidden md:flex flex-col w-56 shrink-0 border-r border-border bg-card p-4 gap-3">
+    <nav className="hidden md:flex flex-col w-56 shrink-0 border-r border-border bg-card p-4 gap-3 sticky top-0 h-screen overflow-y-auto">
       <div className="px-2 py-3 mb-1">
         <div className="text-lg font-semibold text-foreground">{t("appName")}</div>
         <div className="text-xs text-muted-foreground">{t("tagline")}</div>
