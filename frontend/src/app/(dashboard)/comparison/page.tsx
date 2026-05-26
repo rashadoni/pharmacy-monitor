@@ -263,6 +263,7 @@ export default function ComparisonPage() {
  *   • muted    = нет cheapest_site (паритет / нет sites with price)
  */
 function SpreadCell({ row }: { row: ComparisonRow }) {
+  const t = useTranslations("comparison");
   if (row.spread_pct == null || row.cheapest_site == null) {
     return <span className="text-muted-foreground/70">—</span>;
   }
@@ -280,8 +281,8 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
       className={`inline-flex items-center gap-0.5 tabular-nums ${color}`}
       title={
         clientCheapest
-          ? `pharmonline дешевле остальных на ${abs.toFixed(1)}%`
-          : `${row.cheapest_site} дешевле pharmonline на ${abs.toFixed(1)}%`
+          ? t("spread_we_cheaper", { pct: abs.toFixed(1) })
+          : t("spread_they_cheaper", { site: row.cheapest_site, pct: abs.toFixed(1) })
       }
     >
       <Icon />
@@ -322,6 +323,7 @@ function ComparisonRowDesktop({
   onToggleExpand: () => void;
   onReject: (r: ComparisonRow) => void;
 }) {
+  const t = useTranslations("comparison");
   return (
     <>
       <tr className="border-t border-border hover:bg-muted/30 group">
@@ -331,8 +333,8 @@ function ComparisonRowDesktop({
             {row.needs_review && (
               <span
                 className="text-amber-500 text-xs leading-none"
-                title="Подозрительный spread ≥50% — проверить матч"
-                aria-label="Требует проверки"
+                title={t("suspicious_spread")}
+                aria-label={t("needs_review_aria")}
               >
                 ⚠
               </span>
@@ -359,8 +361,8 @@ function ComparisonRowDesktop({
         <td className="px-3 py-2">
           <button
             onClick={onToggleExpand}
-            title={expanded ? "Скрыть тренд" : "Показать тренд за 30 дней"}
-            aria-label={expanded ? "Скрыть тренд" : "Показать тренд за 30 дней"}
+            title={expanded ? t("trend_hide") : t("trend_show")}
+            aria-label={expanded ? t("trend_hide") : t("trend_show")}
             aria-expanded={expanded}
             className="text-muted-foreground hover:text-foreground p-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             data-testid={`expand-${row.canonical_id}`}
@@ -375,8 +377,8 @@ function ComparisonRowDesktop({
         <td className="px-3 py-2">
           <button
             onClick={() => onReject(row)}
-            title="Отвергнуть как false match"
-            aria-label="Отвергнуть как false match"
+            title={t("reject_tooltip")}
+            aria-label={t("reject_tooltip")}
             className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity text-muted-foreground hover:text-destructive rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             data-testid={`reject-${row.canonical_id}`}
           >

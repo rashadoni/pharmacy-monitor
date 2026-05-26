@@ -68,7 +68,14 @@
     "no_data": "нет данных",
     "stable_price": "стабильно {price}",
     "diff_only_filter": "Только с различием",
-    "with_aloe_filter": "С aloe"
+    "with_aloe_filter": "С aloe",
+    "spread_we_cheaper": "pharmonline дешевле остальных на {pct}%",
+    "spread_they_cheaper": "{site} дешевле pharmonline на {pct}%",
+    "trend_hide": "Скрыть тренд",
+    "trend_show": "Показать тренд за 30 дней",
+    "suspicious_spread": "Подозрительный spread ≥50% — проверить матч",
+    "needs_review_aria": "Требует проверки",
+    "reject_tooltip": "Отвергнуть как false match"
   },
   "overview": {
     "title": "Обзор",
@@ -204,7 +211,9 @@
     "suggestions_shared_brands_th": "Shared brands",
     "suggestions_examples_th": "Примеры",
     "scan_done_msg": "✓ Готово #{id} — {total} товаров",
-    "scan_failed_msg": "✗ Сбой #{id}: {error}"
+    "scan_failed_msg": "✗ Сбой #{id}: {error}",
+    "site_a_label": "Сайт A",
+    "site_b_label": "Сайт B"
   },
   "settings": {
     "title": "⚙️ Настройки",

@@ -68,7 +68,14 @@
     "no_data": "no data",
     "stable_price": "stable {price}",
     "diff_only_filter": "With difference only",
-    "with_aloe_filter": "With aloe"
+    "with_aloe_filter": "With aloe",
+    "spread_we_cheaper": "pharmonline is {pct}% cheaper than others",
+    "spread_they_cheaper": "{site} is {pct}% cheaper than pharmonline",
+    "trend_hide": "Hide trend",
+    "trend_show": "Show 30-day trend",
+    "suspicious_spread": "Suspicious spread ≥50% — verify match",
+    "needs_review_aria": "Needs review",
+    "reject_tooltip": "Reject as false match"
   },
   "overview": {
     "title": "Overview",
@@ -204,7 +211,9 @@
     "suggestions_shared_brands_th": "Shared brands",
     "suggestions_examples_th": "Examples",
     "scan_done_msg": "✓ Done #{id} — {total} products",
-    "scan_failed_msg": "✗ Failed #{id}: {error}"
+    "scan_failed_msg": "✗ Failed #{id}: {error}",
+    "site_a_label": "Site A",
+    "site_b_label": "Site B"
   },
   "settings": {
     "title": "⚙️ Settings",

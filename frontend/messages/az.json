@@ -68,7 +68,14 @@
     "no_data": "məlumat yoxdur",
     "stable_price": "sabit {price}",
     "diff_only_filter": "Yalnız fərqlənənlər",
-    "with_aloe_filter": "Aloe ilə"
+    "with_aloe_filter": "Aloe ilə",
+    "spread_we_cheaper": "pharmonline digərlərindən {pct}% ucuzdur",
+    "spread_they_cheaper": "{site} pharmonline-dan {pct}% ucuzdur",
+    "trend_hide": "Trendi gizlət",
+    "trend_show": "30 günlük trendi göstər",
+    "suspicious_spread": "Şübhəli spread ≥50% — uyğunluğu yoxlayın",
+    "needs_review_aria": "Yoxlanma tələb edir",
+    "reject_tooltip": "Səhv uyğunluq kimi rədd et"
   },
   "overview": {
     "title": "Ümumi baxış",
@@ -204,7 +211,9 @@
     "suggestions_shared_brands_th": "Ortaq brendlər",
     "suggestions_examples_th": "Nümunələr",
     "scan_done_msg": "✓ Hazırdır #{id} — {total} məhsul",
-    "scan_failed_msg": "✗ Xəta #{id}: {error}"
+    "scan_failed_msg": "✗ Xəta #{id}: {error}",
+    "site_a_label": "Sayt A",
+    "site_b_label": "Sayt B"
   },
   "settings": {
     "title": "⚙️ Tənzimləmələr",

@@ -310,9 +310,9 @@ function SuggestionsPanel() {
       </div>
 
       <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-        <SiteSelector value={siteA} onChange={setSiteA} label="Сайт A" disabled={siteB} />
+        <SiteSelector value={siteA} onChange={setSiteA} label={t("site_a_label")} disabled={siteB} />
         <span className="text-muted-foreground">↔</span>
-        <SiteSelector value={siteB} onChange={setSiteB} label="Сайт B" disabled={siteA} />
+        <SiteSelector value={siteB} onChange={setSiteB} label={t("site_b_label")} disabled={siteA} />
         <label className="inline-flex items-center gap-2 text-sm ml-auto">
           {t("min_overlap_label")}
           <input
