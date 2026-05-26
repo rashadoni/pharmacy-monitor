@@ -30,11 +30,11 @@ from src.storage import Match, PriceSnapshot, Product, latest_snapshots_per_prod
 
 log = structlog.get_logger()
 
-FUZZY_THRESHOLD = 78  # 0..100, минимальный score для авто-матча.
-# Понижено с 90: после strip_prefix + brand-unify в normalize.py пары
-# одного бренда + pack_size в одном bucket дают ratio 78-87 для baby food.
-# Bucket уже строго фильтрует по (brand, dosage, pack_size) → false positives
-# редки и фильтруются через match_actions UI.
+FUZZY_THRESHOLD = 75  # 0..100, минимальный score для авто-матча.
+# Снижено с 78 → 75 (2026-05-26): bucket (brand, dosage, pack) уже строго
+# фильтрует — дополнительные 3 пункта дают ~2-4% recall на коротких именах
+# (5-6 токенов), где реальные матчи дают 75-77. False positives
+# фильтруются через match_actions UI.
 
 # Фармацевтические модификаторы — однобуквенные/короткие токены, означающие
 # ДРУГОЙ состав препарата. Если у одного товара есть такой токен, а у другого
@@ -629,6 +629,105 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = min(_min_score_sec / 100.0, _SEC_CONF_CAP)
+                created_or_updated += _persist_match(session, cluster, confidence)
+                visited.update(c.id for c in cluster)
+
+    # ── Tertiary pass: (brand, dosage) без pack ─────────────────────────────
+    # Охватывает пары, где один сайт не вытащил pack_size (или разный).
+    # Пример: pharmonline ('aspirin', '500mg', '') ↔ aptekonline ('aspirin', '500mg', 'n20')
+    #   → primary: разные bucket_key → не матчатся
+    #   → secondary: ('aspirin', 'n20') vs ('aspirin', '') → secondary пропускает (нет pack у одного)
+    #   → tertiary: (brand='aspirin', dosage='500mg') → совпадает → матчим
+    #
+    # Требует: brand != '' И dosage != '' (без них bucket слишком широкий).
+    # Порог строже базового (85 vs 75), confidence capped 0.72.
+    _TERT_THRESHOLD = 85
+    _TERT_CONF_CAP = 0.72
+    by_brand_dosage: dict[tuple, list[Product]] = defaultdict(list)
+    for p in products:
+        if p.id in visited:
+            continue
+        bk = bucket_key(p)
+        bd_key = (bk[0], bk[1])  # (brand, dosage)
+        if not bd_key[0] or not bd_key[1]:
+            continue  # без бренда или дозировки — слишком широкий bucket
+        by_brand_dosage[bd_key].append(p)
+
+    log.info(
+        "matcher_tertiary_pass",
+        brand_dosage_buckets=len(by_brand_dosage),
+        candidates=sum(len(g) for g in by_brand_dosage.values()),
+    )
+
+    for _bd_key, group in by_brand_dosage.items():
+        if len(group) < 2:
+            continue
+        for i, p in enumerate(group):
+            if p.id in visited:
+                continue
+            pack_p = _norm_units((p.pack_size or "").lower().replace(" ", ""))
+            cluster = [p]
+            _min_score_tert = float(_TERT_THRESHOLD)
+            for q in group[i + 1 :]:
+                if q.id in visited:
+                    continue
+                if q.site == p.site:
+                    continue
+                if any(c.site == q.site for c in cluster):
+                    continue
+                pack_q = _norm_units((q.pack_size or "").lower().replace(" ", ""))
+                # Tertiary: только если у кого-то из пары нет pack_size.
+                # Если оба с pack — они разошлись бы в primary (разный pack),
+                # что значит они осознанно разные SKU (N10 vs N20 etc.).
+                if pack_p and pack_q:
+                    continue
+                if any(is_rejected(session, c.id, q.id) for c in cluster):
+                    continue
+                if any(
+                    _has_conflicting_modifier(c.name_normalized or "", q.name_normalized or "")
+                    for c in cluster
+                ):
+                    continue
+                if any(
+                    _has_conflicting_series_number(c.name_normalized or "", q.name_normalized or "")
+                    for c in cluster
+                ):
+                    continue
+                if _has_conflicting_form(p.name or "", q.name or ""):
+                    continue
+                _fp, _fq = _prod_form[p.id], _prod_form[q.id]
+                if _fp is not None and _fq is None:
+                    if _fp in site_bucket_forms.get((q.site, _prod_bk[q.id]), set()):
+                        continue
+                if _fq is not None and _fp is None:
+                    if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
+                        continue
+                if _has_extreme_length_disparity(
+                    p.name_normalized or "", q.name_normalized or ""
+                ):
+                    continue
+                if _has_conflicting_orphan_number(
+                    p.name_normalized or "", q.name_normalized or ""
+                ):
+                    continue
+                if _has_conflicting_gender(
+                    p.name_normalized or "", q.name_normalized or ""
+                ):
+                    continue
+                if any(
+                    _has_conflicting_variant_tokens(c.name_normalized or "", q.name_normalized or "")
+                    for c in cluster
+                ):
+                    continue
+                score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
+                if score >= _TERT_THRESHOLD:
+                    cluster.append(q)
+                    _min_score_tert = min(_min_score_tert, float(score))
+
+            if len(cluster) >= 2:
+                if _has_perunit_mismatch(cluster, latest_prices):
+                    continue
+                confidence = min(_min_score_tert / 100.0, _TERT_CONF_CAP)
                 created_or_updated += _persist_match(session, cluster, confidence)
                 visited.update(c.id for c in cluster)
 
