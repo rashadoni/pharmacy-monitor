@@ -1226,23 +1226,29 @@ def _require_site(value: str) -> str:
 @app.get("/api/v1/dash/roi/actions")
 def dash_roi_actions(
     client_site: str = "pharmonline",
+    locale: str = "ru",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """ROI actions для client_site.
+    """ROI actions для client_site с локализацией.
 
     P0.1 (PO Audit 2026-05-17): compute_actions для 3к матчей занимает 15-30с
     и frontend timeout'ит на 15с (API 408 на 4 экранах). Сейчас читаем из
     roi_actions_cache (pre-computed после каждого scrape success). Если кэш
     отсутствует или старше 26ч — fallback inline compute (медленно, но даёт
     данные новому tenant'у пока первый scrape не отработал).
+
+    Параметр locale (ru/az/en) применяется поверх кэша — title/detail
+    реконструируются из структурных полей, кэш не инвалидируется.
     """
     from src import roi
     _require_site(client_site)
+    if locale not in ("ru", "az", "en"):
+        locale = "ru"
 
     cached = roi.get_cached_actions(db, client_site, tenant_id=user.tenant_id)
     if cached is not None:
-        return cached
+        return [roi.translate_action(a, locale) for a in cached]
 
     # Fallback: compute inline (медленно, но всегда даёт ответ)
     actions = roi.compute_actions(db, client_site=client_site)
@@ -1252,7 +1258,7 @@ def dash_roi_actions(
         roi.cache_actions(db, client_site, actions, tenant_id=user.tenant_id)
     except Exception:
         pass  # cache write не должен валить запрос
-    return payload
+    return [roi.translate_action(a, locale) for a in payload]
 
 
 @app.get("/api/v1/dash/alerts")

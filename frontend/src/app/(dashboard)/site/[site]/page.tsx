@@ -2,7 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { notFound, useParams } from "next/navigation";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
 import { Building2, ExternalLink, Leaf, Pill, Search } from "lucide-react";
 import { api, type SiteProduct } from "@/lib/api";
@@ -77,6 +77,7 @@ function competitorsOf(site: SiteName): SiteName[] {
 export default function SitePage() {
   const t = useTranslations("site");
   const tCommon = useTranslations("common");
+  const locale = useLocale();
   const params = useParams();
   const siteParam = (params.site as string) ?? "";
 
@@ -101,8 +102,8 @@ export default function SitePage() {
     queryFn: () => api.brandShare({ top_n: 50, site }),
   });
   const roiQ = useQuery({
-    queryKey: ["site", site, "roi"],
-    queryFn: () => api.roiActions(site),
+    queryKey: ["site", site, "roi", locale],
+    queryFn: () => api.roiActions(site, locale),
   });
 
   return (

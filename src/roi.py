@@ -46,6 +46,7 @@ log = structlog.get_logger()
 
 CLIENT_SITE = "pharmonline"
 COMPETITOR_SITES = ("aptekonline", "aloe")
+ALL_SITES = (CLIENT_SITE, *COMPETITOR_SITES)
 
 ActionType = Literal[
     "price_raise",
@@ -583,3 +584,117 @@ def aggregate_impact(actions: list[ActionItem]) -> dict[str, float]:
             out["loss"] += gap
         out["total"] += gap
     return {k: round(v, 2) if isinstance(v, float) else v for k, v in out.items()}
+
+
+# ─── Localisation ─────────────────────────────────────────────────────────────
+
+_STRINGS: dict[str, dict[str, dict[str, str]]] = {
+    "ru": {
+        "undercut": {
+            "title": "Конкурент дешевле: {name}",
+            "detail": "{site} продаёт за {comp:.2f} ₼, ты — за {client:.2f} ₼ (−{pct:.1f}%). Опусти до {target:.2f} чтобы остаться конкурентным.",
+        },
+        "price_raise": {
+            "title": "Подними цену: {name}",
+            "detail": "Ты дешевле конкурентов на {pct:.1f}%. Подними с {client:.2f} до {target:.2f} ₼ — останешься самым дешёвым, но получишь +{delta:.2f} ₼/ед.",
+        },
+        "assortment_gap": {
+            "title": "Расширь ассортимент: {name}",
+            "detail": "Этот товар есть у {site} ({price:.2f} ₼), но нет у тебя. Возможный новый SKU для каталога.",
+        },
+        "promo_response": {
+            "title": "Промо у {site}: {promo}",
+            "detail": "Конкурент {site} запустил акцию. Проверь, не задевает ли твои топ-категории.",
+        },
+    },
+    "az": {
+        "undercut": {
+            "title": "Rəqib daha ucuzdur: {name}",
+            "detail": "{site} {comp:.2f} ₼-ə satır, siz — {client:.2f} ₼-ə (−{pct:.1f}%). Rəqabətdə qalmaq üçün {target:.2f} ₼-ə endirin.",
+        },
+        "price_raise": {
+            "title": "Qiyməti qaldırın: {name}",
+            "detail": "Rəqiblərdən {pct:.1f}% ucuzsunuz. {client:.2f}-dən {target:.2f} ₼-ə qaldırın — ən ucuz qalacaqsınız, +{delta:.2f} ₼/vahid qazanacaqsınız.",
+        },
+        "assortment_gap": {
+            "title": "Çeşidi genişləndirin: {name}",
+            "detail": "Bu məhsul {site}-da ({price:.2f} ₼) mövcuddur, sizdə yoxdur. Kataloqunuza yeni SKU əlavə edilə bilər.",
+        },
+        "promo_response": {
+            "title": "{site}-da aksiya: {promo}",
+            "detail": "Rəqib {site} aksiya başlatdı. Əsas kateqoriyalarınıza təsir edib-etmədiyini yoxlayın.",
+        },
+    },
+    "en": {
+        "undercut": {
+            "title": "Competitor cheaper: {name}",
+            "detail": "{site} sells for {comp:.2f} ₼, you sell for {client:.2f} ₼ (−{pct:.1f}%). Drop to {target:.2f} ₼ to stay competitive.",
+        },
+        "price_raise": {
+            "title": "Raise price: {name}",
+            "detail": "You're {pct:.1f}% cheaper than competitors. Raise from {client:.2f} to {target:.2f} ₼ — stay cheapest and gain +{delta:.2f} ₼/unit.",
+        },
+        "assortment_gap": {
+            "title": "Expand assortment: {name}",
+            "detail": "This product is at {site} ({price:.2f} ₼) but not in your catalog. Possible new SKU.",
+        },
+        "promo_response": {
+            "title": "Promo at {site}: {promo}",
+            "detail": "Competitor {site} launched a promotion. Check if it affects your top categories.",
+        },
+    },
+}
+
+
+def translate_action(action: dict, locale: str) -> dict:
+    """Перевести title/detail в action-словаре на указанный locale.
+
+    Использует структурные поля (type, product_name, competitor_site и т.д.)
+    для реконструкции строк без перегенерации кэша.
+    Неизвестный locale → возвращает оригинал (ru fallback).
+    """
+    strings = _STRINGS.get(locale)
+    if strings is None or locale == "ru":
+        return action  # ru — оригинал, другие неизвестные — без изменений
+
+    action_type = action.get("type", "")
+    tmpl = strings.get(action_type)
+    if tmpl is None:
+        return action
+
+    name = action.get("product_name") or ""
+    site = action.get("competitor_site") or ""
+    current = float(action.get("current_value_azn") or 0)
+    target = float(action.get("target_value_azn") or 0)
+    pct = abs(float(action.get("spread_pct") or 0))
+    delta = float(action.get("unit_gap_azn") or 0)
+
+    try:
+        if action_type == "undercut":
+            comp = round(target + 0.01, 2)
+            title = tmpl["title"].format(name=name)
+            detail = tmpl["detail"].format(
+                site=site, comp=comp, client=current, pct=pct, target=target
+            )
+        elif action_type == "price_raise":
+            title = tmpl["title"].format(name=name)
+            detail = tmpl["detail"].format(
+                pct=pct, client=current, target=target, delta=abs(delta)
+            )
+        elif action_type == "assortment_gap":
+            title = tmpl["title"].format(name=name)
+            detail = tmpl["detail"].format(site=site, price=current)
+        elif action_type == "promo_response":
+            raw_title = action.get("title", "")
+            promo = raw_title.split(": ", 1)[1] if ": " in raw_title else raw_title
+            title = tmpl["title"].format(site=site, promo=promo)
+            detail = tmpl["detail"].format(site=site)
+        else:
+            return action
+    except (KeyError, ValueError):
+        return action  # fallback — не ломаем ответ
+
+    result = dict(action)
+    result["title"] = title
+    result["detail"] = detail
+    return result

@@ -2,7 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
 import { api, type RunRow, type RoiAction } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
@@ -12,9 +12,10 @@ import { formatRelative, formatPrice } from "@/lib/utils";
 export default function OverviewPage() {
   const t = useTranslations("overview");
   const tCommon = useTranslations("common");
+  const locale = useLocale();
   const matchQ = useQuery({ queryKey: ["match-quality"], queryFn: api.matchQuality });
   const normalizeQ = useQuery({ queryKey: ["normalize-stats"], queryFn: api.normalizeStats });
-  const actionsQ = useQuery({ queryKey: ["roi-actions"], queryFn: () => api.roiActions() });
+  const actionsQ = useQuery({ queryKey: ["roi-actions", locale], queryFn: () => api.roiActions(undefined, locale) });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
   const [expandedRun, setExpandedRun] = useState<number | null>(null);
 

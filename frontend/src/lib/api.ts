@@ -399,9 +399,10 @@ export const api = {
     if (params.limit) q.set("limit", String(params.limit));
     return request<ComparisonRow[]>(`/api/v1/dash/comparison?${q}`);
   },
-  roiActions: (client_site?: string) => {
+  roiActions: (client_site?: string, locale?: string) => {
     const q = new URLSearchParams();
     if (client_site) q.set("client_site", client_site);
+    if (locale) q.set("locale", locale);
     const qs = q.toString();
     // ROI compute может быть тяжёлым (matcher join), ставим явно 15с timeout
     return request<RoiAction[]>(
