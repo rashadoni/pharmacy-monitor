@@ -331,6 +331,8 @@ class ComparisonRowOut(BaseModel):
     spread_pct: float | None
     cheapest_site: str | None
     prices: dict[str, dict[str, Any]]
+    confidence: float
+    needs_review: bool
 
 
 class CategoryIn(BaseModel):
@@ -1203,6 +1205,8 @@ def dash_comparison(
             spread_pct=spread,
             cheapest_site=cheapest,
             prices=prices,
+            confidence=m.confidence if m.confidence is not None else 1.0,
+            needs_review=(spread is not None and spread >= 50.0),
         ))
     return out
 

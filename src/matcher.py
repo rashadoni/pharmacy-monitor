@@ -248,16 +248,30 @@ def _has_conflicting_variant_tokens(name_a: str, name_b: str) -> bool:
     - «venatura methylfolate» ↔ «venatura b12» (b12 = 3-символьный код)
     - «makson» ↔ «makson d3» (d3 = 2-символьный алфавитно-цифровой код)
     - «safeguard bal» ↔ «safeguard limon fresh» (bal = 3 символа)
+    - «akriderm sk» ↔ «akriderm qk» (sk/qk — 2-буквенные фармкоды, оба уникальны)
 
     Пропускает, если только у одного имени есть уникальный токен — это
     интерпретируется как неполное имя (напр. «amoxicillin» vs «amoxicillin trihydrate»),
     а не как разный вариант препарата.
+
+    Специальный кейс: 2-буквенные all-alpha токены (SK, QK, GK и т.п.) — фарм-суффиксы
+    вариантов препарата. Стандартный _is_significant_variant_token их не ловит (нет цифр),
+    но если у ОБОИХ имён есть разные 2-буквенные all-alpha уникальные токены — это явный
+    признак разных вариантов → блокируем.
     """
     tokens_a = frozenset(name_a.split())
     tokens_b = frozenset(name_b.split())
     unique_a = {t for t in tokens_a - tokens_b if _is_significant_variant_token(t)}
     unique_b = {t for t in tokens_b - tokens_a if _is_significant_variant_token(t)}
-    return bool(unique_a) and bool(unique_b)
+    if unique_a and unique_b:
+        return True
+    # 2-буквенные all-alpha фармкоды: SK/QK/GK/GC и подобные.
+    # Срабатывает только когда у ОБОИХ имён есть разный 2-буквенный суффикс —
+    # это чёткий сигнал разных формул. Одиночный 2-буквенный токен у одного
+    # из имён пропускаем (неполные данные).
+    alpha2_a = {t for t in tokens_a - tokens_b if len(t) == 2 and t.isalpha()}
+    alpha2_b = {t for t in tokens_b - tokens_a if len(t) == 2 and t.isalpha()}
+    return bool(alpha2_a) and bool(alpha2_b)
 
 
 def _norm_units(s: str) -> str:
@@ -443,6 +457,7 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
             if p.id in visited:
                 continue
             cluster = [p]
+            _min_score = 100.0  # минимальный fuzzy score в кластере → confidence
             for q in group[i + 1 :]:
                 if q.id in visited:
                     continue
@@ -511,12 +526,14 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= fuzzy_threshold:
                     cluster.append(q)
+                    _min_score = min(_min_score, float(score))
 
             if len(cluster) >= 2:
                 # Проверка: не смешиваем цену-за-штуку с ценой-за-упаковку
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
-                created_or_updated += _persist_match(session, cluster)
+                confidence = _min_score / 100.0
+                created_or_updated += _persist_match(session, cluster, confidence)
                 visited.update(c.id for c in cluster)
 
     # ── Secondary pass: (brand, pack) без досировки ─────────────────────────
@@ -526,6 +543,7 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     # Используем порог 85 (строже базового 78), чтобы компенсировать
     # ослабленное ограничение на dosage.
     _SEC_THRESHOLD = 85
+    _SEC_CONF_CAP = 0.80  # вторичный проход: dosage не совпал → ниже уверенность
     by_brand_pack: dict[tuple, list[Product]] = defaultdict(list)
     for p in products:
         if p.id in visited:
@@ -550,6 +568,7 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 continue
             dosage_p = _norm_units((p.dosage or "").lower().replace(" ", ""))
             cluster = [p]
+            _min_score_sec = float(_SEC_THRESHOLD)
             for q in group[i + 1 :]:
                 if q.id in visited:
                     continue
@@ -604,11 +623,13 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _SEC_THRESHOLD:
                     cluster.append(q)
+                    _min_score_sec = min(_min_score_sec, float(score))
 
             if len(cluster) >= 2:
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
-                created_or_updated += _persist_match(session, cluster)
+                confidence = min(_min_score_sec / 100.0, _SEC_CONF_CAP)
+                created_or_updated += _persist_match(session, cluster, confidence)
                 visited.update(c.id for c in cluster)
 
     session.commit()
@@ -622,7 +643,7 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     return created_or_updated
 
 
-def _persist_match(session: Session, cluster: Sequence[Product]) -> int:
+def _persist_match(session: Session, cluster: Sequence[Product], confidence: float = 1.0) -> int:
     """Создать или обновить Match для кластера товаров.
 
     Snowball-guard (фикс 2026-05-25):
@@ -665,11 +686,14 @@ def _persist_match(session: Session, cluster: Sequence[Product]) -> int:
             canonical_brand=first.brand,
             canonical_dosage=first.dosage,
             canonical_pack_size=first.pack_size,
-            confidence=1.0,
+            confidence=confidence,
             is_manual=False,
         )
         session.add(match)
         session.flush()
+    else:
+        # Обновляем confidence при каждом пересчёте
+        match.confidence = confidence
 
     for p in cluster:
         p.canonical_id = match.id
@@ -707,6 +731,56 @@ def find_unmatched(session: Session) -> dict[str, list[Product]]:
     for p in products:
         by_site[p.site].append(p)
     return dict(by_site)
+
+
+_PRICE_FLAG_RATIO = 1.50  # расхождение ≥50% → нужна ручная проверка
+
+
+def flag_suspected_mismatches(session: Session) -> int:
+    """Флагирует авто-матчи с подозрительным расхождением цен (needs_review=True).
+
+    Только информационный флаг для UI — ничего не удаляет и не блокирует.
+    Порог: max(цена) / min(цена) ≥ 1.50 (50% разница).
+    Флаг сбрасывается автоматически если цены выровнялись.
+
+    Возвращает количество изменённых флагов.
+    """
+    matches = session.scalars(
+        select(Match).where(Match.is_manual.is_(False))
+    ).all()
+
+    # Один pre-fetch для всех продуктов — не N+1
+    all_pids = [p.id for m in matches for p in m.products]
+    if not all_pids:
+        return 0
+    prices = latest_snapshots_per_product(session, all_pids)
+
+    changed = 0
+    for m in matches:
+        prods = m.products
+        if not prods or len(prods) < 2:
+            continue
+        vals = [
+            prices[p.id].price
+            for p in prods
+            if p.id in prices and prices[p.id] and prices[p.id].price and prices[p.id].price > 0
+        ]
+        if len(vals) < 2:
+            continue
+        ratio = max(vals) / min(vals)
+        should_flag = ratio >= _PRICE_FLAG_RATIO
+        if m.needs_review != should_flag:
+            m.needs_review = should_flag
+            changed += 1
+
+    if changed:
+        session.commit()
+        log.info(
+            "flag_mismatches_done",
+            changed=changed,
+            flagged=sum(1 for m in matches if m.needs_review),
+        )
+    return changed
 
 
 def normalize_for_matching(name: str) -> str:

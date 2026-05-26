@@ -1061,7 +1061,8 @@ def alert_evaluate(dispatch: bool, rule_id: tuple[int, ...]) -> None:
         for ev in fired:
             click.echo(f"  [{ev.severity}] {ev.rule_type}: {ev.title[:80]}")
             if dispatch:
-                results = alerts_mod.dispatch_event(s, ev)
+                from src import notifications as notif_mod
+                results = notif_mod.dispatch_event(s, ev)
                 click.echo(f"     → {results}")
 
 
@@ -1441,15 +1442,21 @@ def run_cmd(
                 linked = auto_match_watchlist(session)
                 log.info("watchlist_auto_matched", linked=linked)
             matcher.match_products(session)
+            try:
+                flagged = matcher.flag_suspected_mismatches(session)
+                if flagged:
+                    log.info("price_mismatch_flags_updated", changed=flagged)
+            except Exception as _fe:
+                log.warning("flag_mismatches_failed", error=str(_fe))
 
             # === Real-time alerts ===
             if not no_alerts:
-                from src import alerts as alerts_mod
+                from src import alerts as alerts_mod, notifications as notif_mod
                 fired = alerts_mod.evaluate_rules(session, run.id)
                 if fired and not dry_run:
                     for ev in fired:
                         try:
-                            alerts_mod.dispatch_event(session, ev)
+                            notif_mod.dispatch_event(session, ev)
                         except Exception as e:
                             log.warning("alert_dispatch_failed", error=str(e))
                     log.info("alerts_dispatched", count=len(fired))
@@ -1545,6 +1552,65 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...]) -> None:
             run.error_message = str(e)
             session.commit()
             raise click.ClickException(str(e))
+
+
+@cli.command("rematch")
+@click.option("--reset", is_flag=True, default=False,
+              help="Очистить все авто-матчи (canonical_id) перед пересчётом")
+@click.option("--threshold", type=int, default=None,
+              help=f"Порог fuzzy (по умолчанию {matcher.FUZZY_THRESHOLD})")
+def rematch_cmd(reset: bool, threshold: int | None) -> None:
+    """Перезапустить матчинг (без скрейпинга). Полезно после изменения нормализации.
+
+    С --reset: сбрасывает все автоматические canonical_id и пересчитывает заново.
+    Ручные матчи (is_manual=True) никогда не трогаются.
+    """
+    from sqlalchemy import update as sa_update
+
+    Session = storage.make_session()
+    with Session() as session:
+        if reset:
+            # Сброс canonical_id только у авто-матчей
+            auto_match_ids = session.scalars(
+                select(storage.Match.id).where(storage.Match.is_manual.is_(False))
+            ).all()
+            if auto_match_ids:
+                session.execute(
+                    sa_update(storage.Product)
+                    .where(storage.Product.canonical_id.in_(auto_match_ids))
+                    .values(canonical_id=None)
+                )
+                session.execute(
+                    sa_update(storage.Match)
+                    .where(storage.Match.is_manual.is_(False))
+                    .values(needs_review=False)
+                )
+                # Удаляем авто-матчи из matches таблицы
+                for mid in auto_match_ids:
+                    m = session.get(storage.Match, mid)
+                    if m and not m.is_manual:
+                        session.delete(m)
+                session.commit()
+                click.echo(f"Reset {len(auto_match_ids)} auto-matches.")
+
+        # Заново нормализуем name_normalized (с учётом последних изменений пайплайна)
+        click.echo("Re-normalizing name_normalized…")
+        from src.normalize import normalize_name
+        products = session.scalars(select(storage.Product)).all()
+        for p in products:
+            p.name_normalized = normalize_name(p.name or "")
+        session.commit()
+        click.echo(f"Re-normalized {len(products)} products.")
+
+        # Запуск матчинга
+        thr = threshold if threshold is not None else matcher.FUZZY_THRESHOLD
+        click.echo(f"Running matcher (threshold={thr})…")
+        clusters = matcher.match_products(session, fuzzy_threshold=thr)
+        click.echo(f"Matcher done: {clusters} clusters created/updated.")
+
+        # Флагирование подозрительных расхождений цен
+        flagged = matcher.flag_suspected_mismatches(session)
+        click.echo(f"Price-spread flags updated: {flagged} matches changed.")
 
 
 @cli.command("report")

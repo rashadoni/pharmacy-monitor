@@ -220,6 +220,15 @@ _COUNTRY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Маршруты введения — не форма выпуска, но остаются в name_normalized и мешают
+# fuzzy-матчингу. «rektal» — самый частый в AZ/RU фармацевтике (свечи-суппозитории).
+# НЕ включаем «oral», «nasal» — встречаются в брендах (Oral-B, Nasal Spray как
+# товарное название). Применяем ДО strip_accents: буквы ASCII, re.IGNORECASE хватит.
+_ROUTE_RE = re.compile(
+    r"\b(?:rektal|intranazal|intranazale|vaginal|sublingual)\b",
+    re.IGNORECASE,
+)
+
 # Категория-префиксы (тип товара, не имя продукта). Их нужно убрать
 # из name_normalized чтобы fuzzy match не считал «Südlü qarışıq» общим
 # токеном для разных продуктов.
@@ -329,6 +338,8 @@ def normalize_name(name: str) -> str:
     # снижая точность fuzzy-матча (было: «ukraferon suppositories» не матчилось
     # с «ukraferon rektal samlar»). re.IGNORECASE покрывает регистр.
     s = _FORMS_RE.sub(" ", s)
+    # Маршруты введения (rektal, intranazal…) — ASCII, убираем сразу после форм.
+    s = _ROUTE_RE.sub(" ", s)
     s = strip_accents(s)
     s = s.lower()
     s = _DOSAGE_RE.sub(" ", s)

@@ -576,6 +576,39 @@ class _FakeProduct:
         self.pack_size = pack_size
 
 
+class TestTwoCharAlphaVariantCodes:
+    """2-буквенные all-alpha фармкоды (SK/QK/GK) блокируют ложные матчи."""
+
+    def test_sk_vs_qk_blocked(self):
+        # Akriderm SK (məlhəm) ≠ Akriderm QK (krem) — разные формулы
+        assert _has_conflicting_variant_tokens("akriderm sk", "akriderm qk") is True
+
+    def test_sk_vs_gk_blocked(self):
+        assert _has_conflicting_variant_tokens("akriderm sk", "akriderm gk") is True
+
+    def test_qk_vs_gk_blocked(self):
+        assert _has_conflicting_variant_tokens("akriderm qk", "akriderm gk") is True
+
+    def test_same_code_allowed(self):
+        # Оба SK — один и тот же вариант → матч разрешён
+        assert _has_conflicting_variant_tokens("akriderm sk", "akriderm sk") is False
+
+    def test_only_one_side_has_code_allowed(self):
+        # Только у одного сайта есть суффикс — неполные данные, не блокируем
+        assert _has_conflicting_variant_tokens("akriderm sk", "akriderm") is False
+        assert _has_conflicting_variant_tokens("akriderm", "akriderm qk") is False
+
+    def test_symmetry(self):
+        assert (
+            _has_conflicting_variant_tokens("akriderm sk", "akriderm qk")
+            == _has_conflicting_variant_tokens("akriderm qk", "akriderm sk")
+        )
+
+    def test_short_alpha_single_char_not_affected(self):
+        # Одиночные буквы (b, c) не блокируют — слишком короткие
+        assert _has_conflicting_variant_tokens("vitamin b", "vitamin c") is False
+
+
 class TestPerunitMismatch:
     def _product(self, site: str, pack_size: str, pid: int) -> _FakeProduct:
         return _FakeProduct(pid, site, pack_size)

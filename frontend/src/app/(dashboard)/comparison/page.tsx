@@ -1,8 +1,8 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { X } from "lucide-react";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState, useMemo } from "react";
+import { X, ChevronUp, ChevronDown, TrendingUp, TrendingDown } from "lucide-react";
 import { api, type ComparisonRow } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatPct } from "@/lib/utils";
@@ -11,11 +11,15 @@ import { Sparkline } from "@/components/sparkline";
 import { TableSkeleton } from "@/components/skeleton";
 
 const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
+type SiteName = typeof SITES[number];
 
 export default function ComparisonPage() {
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
   const [minSites, setMinSites] = useState(2);
+  const [diffOnly, setDiffOnly] = useState(false);
+  const [withAloe, setWithAloe] = useState(false);
+  const [expandedId, setExpandedId] = useState<number | null>(null);
   const queryClient = useQueryClient();
 
   const { data, isLoading, error, isFetching } = useQuery({
@@ -317,13 +321,31 @@ function ComparisonRowDesktop({
   onReject: (r: ComparisonRow) => void;
 }) {
   return (
-    <tr className="border-t border-border hover:bg-muted/30 group">
-      <td className="px-3 py-2 max-w-md truncate">{row.name}</td>
-      <td className="px-3 py-2 text-muted-foreground">{row.brand ?? "—"}</td>
-      {SITES.map((s) => (
-        <td key={s} className="px-3 py-2 text-right">
-          {priceCell(row, s)}
+    <>
+      <tr className="border-t border-border hover:bg-muted/30 group">
+        <td className="px-3 py-2 max-w-md truncate">
+          <span className="inline-flex items-center gap-1">
+            {row.name}
+            {row.needs_review && (
+              <span
+                className="text-amber-500 text-xs leading-none"
+                title="Подозрительный spread ≥50% — проверить матч"
+                aria-label="Требует проверки"
+              >
+                ⚠
+              </span>
+            )}
+            {row.confidence < 0.95 && (
+              <span
+                className="text-muted-foreground/60 text-[10px] tabular-nums leading-none"
+                title={`Уверенность матча: ${Math.round(row.confidence * 100)}%`}
+              >
+                {Math.round(row.confidence * 100)}%
+              </span>
+            )}
+          </span>
         </td>
+        <td className="px-3 py-2 text-muted-foreground">{row.brand ?? "—"}</td>
         {sites.map((s) => (
           <td key={s} className="px-3 py-2 text-right">
             {priceCell(row, s)}
@@ -388,7 +410,26 @@ function ComparisonCard({
       >
         <X className="h-4 w-4" />
       </button>
-      <div className="font-medium text-sm pr-8">{row.name}</div>
+      <div className="font-medium text-sm pr-8 inline-flex items-center gap-1 flex-wrap">
+        {row.name}
+        {row.needs_review && (
+          <span
+            className="text-amber-500 text-xs leading-none"
+            title="Подозрительный spread ≥50% — проверить матч"
+            aria-label="Требует проверки"
+          >
+            ⚠
+          </span>
+        )}
+        {row.confidence < 0.95 && (
+          <span
+            className="text-muted-foreground/60 text-[10px] tabular-nums leading-none"
+            title={`Уверенность матча: ${Math.round(row.confidence * 100)}%`}
+          >
+            {Math.round(row.confidence * 100)}%
+          </span>
+        )}
+      </div>
       <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5">
         <span>
           {row.brand ?? "—"} · {row.sites_with_price} сайтов · spread
@@ -403,6 +444,67 @@ function ComparisonCard({
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function TrendPanel({ row }: { row: ComparisonRow }) {
+  const sitesWithPrice = SITES.filter((s) => row.prices[s]);
+  const queries = useQueries({
+    queries: sitesWithPrice.map((s) => ({
+      queryKey: ["price-history", row.prices[s].product_id, 30],
+      queryFn: () => api.productPriceHistory(row.prices[s].product_id, 30),
+      staleTime: 60_000,
+    })),
+  });
+
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      {sitesWithPrice.map((s, idx) => {
+        const q = queries[idx];
+        return (
+          <div key={s} className="flex items-center gap-2 text-xs">
+            <span className="text-[10px] uppercase tracking-wide text-muted-foreground w-20 shrink-0">
+              {s}
+            </span>
+            {q.isLoading ? (
+              <span className="text-muted-foreground">…</span>
+            ) : q.error || !q.data ? (
+              <span className="text-muted-foreground/70">нет данных</span>
+            ) : q.data.points.filter((p) => p.price != null).length < 2 ? (
+              <span className="text-muted-foreground/70 text-[11px]">
+                {q.data.current != null
+                  ? `стабильно ${formatPrice(q.data.current)}`
+                  : "—"}
+              </span>
+            ) : (
+              <div className="flex items-center gap-2 flex-1">
+                <Sparkline
+                  points={q.data.points}
+                  delta_pct={q.data.delta_pct}
+                  width={90}
+                  height={24}
+                />
+                {q.data.delta_pct != null && Math.abs(q.data.delta_pct) >= 0.5 && (
+                  <span
+                    className={`inline-flex items-center gap-0.5 text-[11px] ${
+                      q.data.delta_pct > 0 ? "text-destructive" : "text-success"
+                    }`}
+                  >
+                    {q.data.delta_pct > 0 ? (
+                      <TrendingUp className="h-3 w-3" />
+                    ) : (
+                      <TrendingDown className="h-3 w-3" />
+                    )}
+                    {q.data.delta_pct > 0 ? "+" : ""}
+                    {q.data.delta_pct.toFixed(1)}%
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
