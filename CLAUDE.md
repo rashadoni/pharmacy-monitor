@@ -26,7 +26,7 @@ The Verification Plan must enumerate:
 
 This protocol applies to tasks that change code. Trivial read-only operations (status checks, file reads, exploration) don't need a Verification Plan. Trivial doc updates (typos, minor wording) don't need one either, but anything affecting prod systems or business logic does.
 
-## Current production state (last updated: 2026-05-26)
+## Current production state (last updated: 2026-05-27)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
 **Login**: `admin` / `pharmacy2026`
@@ -58,6 +58,16 @@ This protocol applies to tasks that change code. Trivial read-only operations (s
 `data/.prod-secrets-DO-NOT-COMMIT` — has PG_PASS, JWT_SECRET, API_KEY (mode 0600)
 
 ## Active work-in-progress
+
+**Just finished (2026-05-27)**: **Phase 0 — defuse time bombs** (commit `af63932`, roadmap ~/.claude/plans/rosy-launching-lamport.md):
+
+- **`APTEKONLINE_CHECKUS` env-var** ([src/scrapers/aptekonline.py](src/scrapers/aptekonline.py)) — захардкоженный bcrypt-токен из `main.js` перенесён в env с back-compat default. Fail-fast только когда переменная *задана но пустая* (защита от .env-опечатки). Default — текущее зафиксированное значение (2026-05-07). На проде env ещё не задан → fallback на default, всё работает. 5 unit-тестов в [tests/test_aptekonline_api.py](tests/test_aptekonline_api.py).
+- **Request-ID middleware** ([src/api.py](src/api.py)) — UUID4 per-request, bind в `structlog.contextvars`, response header `X-Request-ID`, Sentry tag через новый `sentry_set_request_id()` в [src/observability.py](src/observability.py). Принимает клиентский `X-Request-ID` если он soft-sanitized (128 ASCII chars max), иначе генерит свежий. 4 unit-теста.
+- **Deep `/health` endpoint** ([src/api.py:HealthOut](src/api.py)) — добавлены `db_ping_ms` (`SELECT 1`), `redis_ping_ms` (`PING` если REDIS_URL задан), `sites[]` с `hours_since` per site через `max(Product.last_seen_at)`, `staleness_warning=true` если любой сайт > 30h. Status flips на `"degraded"` при DB unreachable / stale. Backward compat сохранён (старые поля на месте). 3 unit-теста + проверено на проде: aloe=16.6h, aptekonline=5.0h, pharmonline=5.15h.
+- **`scripts/cleanup_false_matches.py`** — bulk-rejection 7 known false matches из CSV (`match_id, detach_product_id, reason`). Idempotent через `match_actions.break_match`. 5 unit-тестов. Запускать: `DATABASE_URL=... python -m scripts.cleanup_false_matches data/false_matches.csv --apply` (CSV ещё не подготовлен, нужно идентифицировать 7 пар через UI или SQL).
+- **`infra/scripts/cleanup_caddy_backups.sh`** — portable bash (без GNU `find -printf` / `mapfile`), сортирует `.bak.*` по имени (filename = timestamp), удаляет старше N (default 3). Dry-run by default, `--apply` коммитит. Cron suggestion: `0 3 * * 0 ... --apply >> /var/log/caddy-cleanup.log`.
+
+48/48 новых тестов проходят. 9 pre-existing failures в `test_roi.py` (compute_actions signature drift), `test_analytics.py` (NameError), `test_scrapers_snapshot.py` (snapshot fixture out of date) — не от Phase 0, отметить как backlog.
 
 **Just finished (2026-05-26)**: **Full i18n audit + ROI translation**.
 
@@ -203,7 +213,9 @@ SELECT COUNT(*) FROM products;
 [✓] Diff-only   persist + analyzer + 5 consumers под новую семантику (2026-05-09 → 11). 51× экономия snapshots, 2× быстрее прогон.
 [✓] Git         project under VCS с 2026-05-11 (initial commit c7fde84) + remote github.com/rashadrahimov/pharmacy-monitor
 [✓] i18n full   locale switcher в nav, AZ/EN fix (route /locale вместо /api/locale), 71 строка переведена, ROI actions переведены (2026-05-26)
-[ ] Next        SMTP (Resend), Telegram bot token, Sentry DSN, forecast.py diff-only refactor (опционально), ScraperAPI Hobby ($49) для возврата aptekonline на прод (опционально)
+[✓] Phase 0     defuse time bombs: env-checkus, request_id, deep /health, cleanup tools (2026-05-27, commit af63932)
+[ ] Phase 1     scraper resilience: Bright Data residential proxies, AI crawler fallback, kill Mac launchd primary
+[ ] Next        Bright Data signup ($250/мес), Telegram bot (отложен), forecast.py diff-only refactor (опционально)
 ```
 
 ### Out of scope (decided 2026-05-07 by client)
