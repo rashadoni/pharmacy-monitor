@@ -87,13 +87,13 @@ export function SideNav() {
   }
 
   return (
-    <nav className="hidden md:flex flex-col w-56 shrink-0 border-r border-border bg-card p-4 gap-3 sticky top-0 h-screen overflow-y-auto">
+    <nav className="hidden md:flex flex-col w-56 shrink-0 border-r border-border bg-card p-4 gap-3 sticky top-0 h-screen self-start">
       <div className="px-2 py-3 mb-1">
         <div className="text-lg font-semibold text-foreground">{t("appName")}</div>
         <div className="text-xs text-muted-foreground">{t("tagline")}</div>
       </div>
 
-      <div className="flex-1 flex flex-col gap-3 overflow-y-auto">
+      <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto">
         <NavSection label={t("section_overview")}>
           {NAV_OVERVIEW.map((item) => (
             <NavLink key={item.href} href={item.href} icon={item.icon} label={t(item.key)} pathname={pathname} />

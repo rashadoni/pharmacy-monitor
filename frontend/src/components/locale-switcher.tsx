@@ -11,7 +11,7 @@ export function LocaleSwitcher() {
   function changeLocale(next: Locale) {
     if (next === current) return;
     startTransition(async () => {
-      const res = await fetch("/api/locale", {
+      const res = await fetch("/locale", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ locale: next }),
