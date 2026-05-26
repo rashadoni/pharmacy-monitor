@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { LocaleSwitcher } from "@/components/locale-switcher";
 
 const NAV_OVERVIEW = [
   { href: "/overview", key: "overview", icon: TrendingUp },
@@ -118,13 +119,16 @@ export function SideNav() {
         </NavSection>
       </div>
 
-      <button
-        onClick={handleLogout}
-        className="flex items-center gap-3 rounded-md px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors border-t border-border pt-3"
-      >
-        <LogOut className="h-4 w-4" />
-        {tAuth("logout")}
-      </button>
+      <div className="border-t border-border pt-3 flex flex-col gap-2">
+        <LocaleSwitcher />
+        <button
+          onClick={handleLogout}
+          className="flex items-center gap-3 rounded-md px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
+        >
+          <LogOut className="h-4 w-4" />
+          {tAuth("logout")}
+        </button>
+      </div>
     </nav>
   );
 }
