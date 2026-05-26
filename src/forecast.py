@@ -20,7 +20,7 @@ import structlog
 from sqlalchemy import asc, select
 from sqlalchemy.orm import Session
 
-from src.storage import Match, PriceSnapshot, Product, Run
+from src.storage import Match, PriceSnapshot, Product, Run, latest_snapshots_per_product
 
 log = structlog.get_logger()
 
@@ -136,13 +136,36 @@ def compute_trend(
 
     # === Diff-only fast-path: продукт скрейпился, но цена не менялась ===
     if len(prices) < min_points:
-        # «Stable» возможен только если продукт действительно виден в окне
-        # (last_seen_at в окне), иначе это просто dead SKU без свежих данных.
-        if (
-            product.last_seen_at >= cutoff
-            and prices
-            and len(set(round(p, 2) for p in prices)) == 1
-        ):
+        # Dead SKU: last_seen_at вне окна → не показываем trend вообще
+        if product.last_seen_at < cutoff:
+            return None
+
+        # --- Case A: 0 снапшотов в окне ---
+        # Продукт активен (last_seen_at свежий), но цена не менялась >days_window дней
+        # → diff-only не писал снапшоты. Берём последнюю известную цену глобально.
+        if not prices:
+            snap_map = latest_snapshots_per_product(session, [product_id])
+            latest_snap = snap_map.get(product_id)
+            if latest_snap is None:
+                return None
+            p = latest_snap.discount_price or latest_snap.price
+            if not p or p <= 0:
+                return None
+            return PriceTrend(
+                product_id=product_id,
+                site=product.site,
+                name=product.name,
+                n_points=0,
+                first_price=round(p, 2),
+                last_price=round(p, 2),
+                change_pct=0.0,
+                direction="stable",
+                forecast_7d_price=round(p, 2),
+                confidence="medium",
+            )
+
+        # --- Case B: 1-2 снапшота в окне, цена одинакова ---
+        if len(set(round(p, 2) for p in prices)) == 1:
             p = prices[0]
             return PriceTrend(
                 product_id=product_id,
@@ -154,10 +177,29 @@ def compute_trend(
                 change_pct=0.0,
                 direction="stable",
                 forecast_7d_price=round(p, 2),
-                # Confidence=medium: цена стабильна, но мало точек подтверждения
                 confidence="medium",
             )
-        return None
+
+        # --- Case C: 2 снапшота с разными ценами (реальный mover, мало точек) ---
+        # Возвращаем направление и change_pct, но без прогноза (недостаточно точек).
+        p1, p2 = prices[0], prices[-1]
+        change_pct = (p2 - p1) / p1 * 100 if p1 else 0.0
+        direction: TrendDirection = (
+            "stable" if abs(change_pct) < 1.0
+            else ("rising" if change_pct > 0 else "falling")
+        )
+        return PriceTrend(
+            product_id=product_id,
+            site=product.site,
+            name=product.name,
+            n_points=len(prices),
+            first_price=round(p1, 2),
+            last_price=round(p2, 2),
+            change_pct=round(change_pct, 2),
+            direction=direction,
+            forecast_7d_price=None,  # мало точек для надёжного прогноза
+            confidence="low",
+        )
 
     first_p = prices[0]
     last_p = prices[-1]
@@ -256,6 +298,39 @@ def top_movers(
 
     if not history:
         return []
+
+    # Diff-only gap: для продуктов с ровно 1 снапшотом в окне предыдущая цена
+    # могла быть написана до cutoff (изменение только что произошло после долгой
+    # стабильности). Подгружаем последний pre-cutoff снапшот → теперь видим
+    # change_pct относительно реальной "старой" цены.
+    single_snap_pids = [pid for pid, pts in history.items() if len(pts) == 1]
+    if single_snap_pids:
+        from sqlalchemy import func as _func
+        # Для каждого product_id берём самый свежий снапшот ДО cutoff
+        pre_rows = session.execute(
+            select(
+                PriceSnapshot.product_id,
+                PriceSnapshot.price,
+                PriceSnapshot.discount_price,
+                Run.started_at,
+            )
+            .join(Run, Run.id == PriceSnapshot.run_id)
+            .where(
+                PriceSnapshot.product_id.in_(single_snap_pids),
+                Run.status == "ok",
+                Run.started_at < cutoff,
+            )
+            .order_by(PriceSnapshot.product_id, Run.started_at.desc())
+        ).all()
+        seen: set[int] = set()
+        for row in pre_rows:
+            pid, price, disc, ts = row
+            if pid in seen:
+                continue  # уже взяли самый свежий pre-cutoff
+            seen.add(pid)
+            eff = disc if disc else price
+            if eff and eff > 0:
+                history[pid].insert(0, (eff, ts))  # prepend как "старая" точка
 
     products = {p.id: p for p in session.scalars(
         select(Product).where(Product.id.in_(history.keys()))

@@ -161,6 +161,74 @@ def test_top_movers_includes_2point_real_movers(db_session):
     assert m.direction == "falling"
 
 
+def test_compute_trend_stable_zero_snapshots_in_window(db_session):
+    """Diff-only: 0 снапшотов в окне, но продукт виден сегодня → stable trend.
+
+    Самый частый кейс: цена не менялась >30 дней → diff-only ничего не писал
+    в окне. До фикса compute_trend возвращал None → trend coverage ~0%.
+    """
+    p = _add_product(db_session, "aloe", "LongStable", "ls1")
+    # Снапшот 45 дней назад (за пределами 30-дневного окна)
+    old_run = Run(started_at=utcnow() - timedelta(days=45), status="ok")
+    db_session.add(old_run)
+    db_session.flush()
+    db_session.add(PriceSnapshot(run_id=old_run.id, product_id=p.id, price=15.0))
+    # Продукт виден вчера (last_seen_at свежий)
+    p.last_seen_at = utcnow() - timedelta(hours=12)
+    db_session.commit()
+
+    t = forecast.compute_trend(db_session, p.id, days_window=30, min_points=3)
+    assert t is not None, "stable product should return trend, not None"
+    assert t.direction == "stable"
+    assert t.last_price == 15.0
+    assert t.forecast_7d_price == 15.0
+    assert t.change_pct == 0.0
+    assert t.n_points == 0  # 0 снапшотов в окне — это норма
+
+
+def test_compute_trend_two_points_different_prices(db_session):
+    """Diff-only: 2 снапшота с разными ценами → direction без прогноза (confidence=low)."""
+    p = _add_product(db_session, "aloe", "TwoPointDiff", "tpd")
+    _add_history(db_session, p, [10.0, 8.0])  # 2 точки, -20%
+    p.last_seen_at = utcnow() - timedelta(hours=1)
+    db_session.commit()
+
+    t = forecast.compute_trend(db_session, p.id, min_points=3)
+    assert t is not None
+    assert t.direction == "falling"
+    assert t.change_pct == -20.0
+    assert t.forecast_7d_price is None  # мало точек
+    assert t.confidence == "low"
+
+
+def test_top_movers_detects_change_with_pre_cutoff_price(db_session):
+    """Diff-only: продукт с 1 снапшотом в окне + старый снапшот до cutoff.
+
+    До фикса: 1 снапшот в окне → len(points) < 2 → пропускался.
+    После фикса: подгружается pre-cutoff снапшот → change_pct считается корректно.
+    """
+    p = _add_product(db_session, "aloe", "LateMover", "lm1")
+    # Снапшот 40 дней назад (за пределами 30-дневного окна)
+    old_run = Run(started_at=utcnow() - timedelta(days=40), status="ok")
+    db_session.add(old_run)
+    db_session.flush()
+    db_session.add(PriceSnapshot(run_id=old_run.id, product_id=p.id, price=10.0))
+    # Новый снапшот 5 дней назад (внутри окна) — цена упала
+    new_run = Run(started_at=utcnow() - timedelta(days=5), status="ok")
+    db_session.add(new_run)
+    db_session.flush()
+    db_session.add(PriceSnapshot(run_id=new_run.id, product_id=p.id, price=7.0))
+    p.last_seen_at = utcnow() - timedelta(days=5)
+    db_session.commit()
+
+    movers = forecast.top_movers(db_session, days_window=30, min_change_pct=5.0)
+    names = [m.name for m in movers]
+    assert "LateMover" in names, f"LateMover not in movers: {names}"
+    m = next(m for m in movers if m.name == "LateMover")
+    assert m.change_pct == -30.0
+    assert m.direction == "falling"
+
+
 def test_predict_competitor_moves(db_session):
     """Конкурент с падающей ценой → high probability."""
     m = Match(canonical_name="Foo", confidence=1.0)
