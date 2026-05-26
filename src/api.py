@@ -1458,42 +1458,34 @@ def dash_normalize_stats(
         .where(storage.Product.tenant_id == user.tenant_id)
     ) or 0
 
+    # Нормализованным считается продукт у которого заполнен name_normalized
     products_normalized = db.scalar(
         select(func.count(storage.Product.id))
         .where(
             storage.Product.tenant_id == user.tenant_id,
-            storage.Product.normalized_attrs.is_not(None),
+            storage.Product.name_normalized != "",
         )
     ) or 0
 
-    # needs_review требует читать JSON — делаем загрузку и фильтр в python,
-    # так как Postgres jsonb operators недоступны в SQLite (dev). На проде
-    # это ~2K rows max, безопасно.
-    needs_review_rows = db.scalars(
-        select(storage.Product.normalized_attrs)
+    # needs_review — маркер на Match (spread ≥50% между сайтами)
+    needs_review = db.scalar(
+        select(func.count(storage.Match.id))
         .where(
-            storage.Product.tenant_id == user.tenant_id,
-            storage.Product.normalized_attrs.is_not(None),
+            storage.Match.tenant_id == user.tenant_id,
+            storage.Match.needs_review == True,  # noqa: E712
         )
-    ).all()
-    needs_review = sum(
-        1 for attrs in needs_review_rows
-        if isinstance(attrs, dict) and attrs.get("needs_review")
-    )
+    ) or 0
 
-    last_normalized_at = db.scalar(
-        select(func.max(storage.Product.normalized_at))
-        .where(storage.Product.tenant_id == user.tenant_id)
-    )
-
-    # Распределение matches по стратегии
-    strategy_rows = db.execute(
-        select(storage.Match.match_strategy, func.count(storage.Match.id))
-        .where(storage.Match.tenant_id == user.tenant_id)
-        .group_by(storage.Match.match_strategy)
-    ).all()
+    # Распределение matches по типу: ручной vs авто
     matches_by_strategy = {
-        (row[0] or "unknown"): row[1] for row in strategy_rows
+        "auto": db.scalar(
+            select(func.count(storage.Match.id))
+            .where(storage.Match.tenant_id == user.tenant_id, storage.Match.is_manual == False)  # noqa: E712
+        ) or 0,
+        "manual": db.scalar(
+            select(func.count(storage.Match.id))
+            .where(storage.Match.tenant_id == user.tenant_id, storage.Match.is_manual == True)  # noqa: E712
+        ) or 0,
     }
 
     coverage_pct = (
@@ -1505,9 +1497,7 @@ def dash_normalize_stats(
         "products_normalized": products_normalized,
         "needs_review": needs_review,
         "coverage_pct": coverage_pct,
-        "last_normalized_at": (
-            last_normalized_at.isoformat() if last_normalized_at else None
-        ),
+        "last_normalized_at": None,  # не отслеживается пока
         "matches_by_strategy": matches_by_strategy,
     }
 
