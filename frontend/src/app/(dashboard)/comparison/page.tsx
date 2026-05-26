@@ -3,6 +3,7 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, useMemo } from "react";
 import { X, ChevronUp, ChevronDown, TrendingUp, TrendingDown } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { api, type ComparisonRow } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatPct } from "@/lib/utils";
@@ -14,6 +15,8 @@ const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
 type SiteName = typeof SITES[number];
 
 export default function ComparisonPage() {
+  const t = useTranslations("comparison");
+  const tCommon = useTranslations("common");
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
   const [minSites, setMinSites] = useState(2);
@@ -124,7 +127,7 @@ export default function ComparisonPage() {
   });
 
   function handleReject(row: ComparisonRow) {
-    if (!confirm(`Отвергнуть как false match?\n\n${row.name}\n(brand: ${row.brand ?? "—"})\n\nПары будут добавлены в match_rejections, matcher не предложит их снова.`)) {
+    if (!confirm(t("reject_confirm", { name: row.name, brand: row.brand ?? "—" }))) {
       return;
     }
     rejectMutation.mutate(row.canonical_id);
@@ -148,17 +151,16 @@ export default function ComparisonPage() {
 
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Сравнение цен</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("page_title")}</h1>
           <p className="text-sm text-muted-foreground">
-            Cross-site matched товары. Зелёным — самая низкая цена, красным — самая высокая.
-            Сортировка по |spread| desc.
+            {t("page_subtitle")}
           </p>
         </div>
         <button
           onClick={handleExportCsv}
           disabled={!filtered || filtered.length === 0}
           className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          title="Скачать CSV отфильтрованного списка"
+          title={t("export_csv_title")}
         >
           ⬇ CSV
         </button>
@@ -168,7 +170,7 @@ export default function ComparisonPage() {
       <div className="flex flex-col md:flex-row gap-2">
         <input
           type="search"
-          placeholder="🔎 Поиск (например: Friso, Nestle, Nutrilak)"
+          placeholder={t("search_placeholder")}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -180,26 +182,26 @@ export default function ComparisonPage() {
           className="rounded-md border border-input bg-background px-3 py-2 text-sm"
           data-testid="min-sites-select"
         >
-          <option value={3}>3 сайта</option>
-          <option value={2}>≥ 2 сайтов (default)</option>
-          <option value={1}>Все</option>
+          <option value={3}>{t("min_sites_3")}</option>
+          <option value={2}>{t("min_sites_2")}</option>
+          <option value={1}>{t("min_sites_1")}</option>
         </select>
       </div>
 
       {/* Status */}
       {(isLoading || isFetching) && (
         <div className="text-xs text-muted-foreground" data-testid="loading">
-          {isLoading ? "Загрузка…" : "Обновление…"}
+          {isLoading ? tCommon("loading") : tCommon("updating")}
         </div>
       )}
       {error && (
         <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive" data-testid="error">
-          Ошибка загрузки данных
+          {tCommon("error")}
         </div>
       )}
       {data && data.length === 0 && !isLoading && (
         <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center" data-testid="empty">
-          По текущему фильтру ничего не найдено.
+          {t("empty")}
         </div>
       )}
 
@@ -246,7 +248,7 @@ export default function ComparisonPage() {
 
       {data && data.length > 0 && (
         <div className="text-xs text-muted-foreground text-center" data-testid="result-count">
-          {data.length} матчей
+          {t("result_count", { count: data.length })}
         </div>
       )}
     </div>
@@ -449,6 +451,7 @@ function ComparisonCard({
 }
 
 function TrendPanel({ row }: { row: ComparisonRow }) {
+  const t = useTranslations("comparison");
   const sitesWithPrice = SITES.filter((s) => row.prices[s]);
   const queries = useQueries({
     queries: sitesWithPrice.map((s) => ({
@@ -470,11 +473,11 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
             {q.isLoading ? (
               <span className="text-muted-foreground">…</span>
             ) : q.error || !q.data ? (
-              <span className="text-muted-foreground/70">нет данных</span>
+              <span className="text-muted-foreground/70">{t("no_data")}</span>
             ) : q.data.points.filter((p) => p.price != null).length < 2 ? (
               <span className="text-muted-foreground/70 text-[11px]">
                 {q.data.current != null
-                  ? `стабильно ${formatPrice(q.data.current)}`
+                  ? t("stable_price", { price: formatPrice(q.data.current) })
                   : "—"}
               </span>
             ) : (

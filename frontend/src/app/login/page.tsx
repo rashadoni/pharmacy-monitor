@@ -2,10 +2,12 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { useTranslations } from "next-intl";
 import { Lock, User } from "lucide-react";
 
 export default function LoginPage() {
   const router = useRouter();
+  const t = useTranslations("auth");
   const [login, setLogin] = useState("");
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState<"idle" | "loading" | "error">("idle");
@@ -24,14 +26,14 @@ export default function LoginPage() {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data?.detail || "Ошибка входа");
+        throw new Error(data?.detail || t("login_error"));
       }
       // Cookie set, redirect to overview
       router.push("/overview");
       router.refresh();
     } catch (err) {
       setStatus("error");
-      setErrorMsg(err instanceof Error ? err.message : "Ошибка");
+      setErrorMsg(err instanceof Error ? err.message : t("login_error"));
     }
   }
 
@@ -53,7 +55,7 @@ export default function LoginPage() {
             </div>
             <h1 className="text-2xl font-semibold tracking-tight">Pharmacy Monitor</h1>
             <p className="text-sm text-muted-foreground mt-1.5">
-              Введите логин и пароль для входа
+              {t("password_subtitle")}
             </p>
           </div>
 
@@ -61,7 +63,7 @@ export default function LoginPage() {
             {/* Login */}
             <div>
               <label htmlFor="login" className="text-sm font-medium block mb-1.5">
-                Логин
+                {t("login_label")}
               </label>
               <div className="relative">
                 <User className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
@@ -83,7 +85,7 @@ export default function LoginPage() {
             {/* Password */}
             <div>
               <label htmlFor="password" className="text-sm font-medium block mb-1.5">
-                Пароль
+                {t("password_label")}
               </label>
               <div className="relative">
                 <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
@@ -117,7 +119,7 @@ export default function LoginPage() {
               disabled={status === "loading" || !login || !password}
               className="w-full rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150 active:scale-[0.99] shadow-sm"
             >
-              {status === "loading" ? "Входим…" : "Войти"}
+              {status === "loading" ? t("login_loading") : t("login_submit")}
             </button>
           </form>
         </div>

@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Lightbulb, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { api, friendlyError, type CategoryRow, type CategorySuggestion } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 
@@ -66,6 +67,8 @@ function slugify(s: string): string {
 }
 
 export default function CategoriesPage() {
+  const t = useTranslations("categories");
+  const tCommon = useTranslations("common");
   const [search, setSearch] = useState("");
   const [siteFilter, setSiteFilter] = useState<"" | "pharmonline" | "aptekonline" | "aloe">("");
   const [activeOnly, setActiveOnly] = useState(false);
@@ -110,9 +113,9 @@ export default function CategoriesPage() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Категории</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
           <p className="text-sm text-muted-foreground">
-            Категории для скрейпинга. ON-категории идут в next-run; OFF — пропускаются.
+            {t("subtitle")}
           </p>
         </div>
         <div className="flex gap-2">
@@ -122,7 +125,7 @@ export default function CategoriesPage() {
             className="inline-flex items-center gap-1.5 rounded-md bg-primary text-primary-foreground px-3 py-2 text-sm font-medium hover:bg-primary/90"
           >
             <Plus className="h-4 w-4" />
-            Добавить
+            {t("add_button")}
           </button>
         </div>
       </div>
@@ -137,7 +140,7 @@ export default function CategoriesPage() {
               : "border-transparent text-muted-foreground hover:text-foreground"
           }`}
         >
-          Список ({stats.total})
+          {t("view_list_tab", { total: stats.total })}
         </button>
         <button
           onClick={() => setView("suggestions")}
@@ -148,7 +151,7 @@ export default function CategoriesPage() {
           }`}
         >
           <Lightbulb className="h-3.5 w-3.5" />
-          Предложенные mapping&apos;и
+          {t("view_suggestions_tab")}
         </button>
       </div>
 
@@ -164,10 +167,10 @@ export default function CategoriesPage() {
 
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-7 gap-3">
-        <Stat label="Всего" value={stats.total} />
-        <Stat label="Active" value={stats.active} />
-        <Stat label="Cross-2" value={stats.cross2} highlight />
-        <Stat label="Cross-3" value={stats.cross3} highlight />
+        <Stat label={t("stat_total")} value={stats.total} />
+        <Stat label={t("stat_active")} value={stats.active} />
+        <Stat label={t("stat_cross2")} value={stats.cross2} highlight />
+        <Stat label={t("stat_cross3")} value={stats.cross3} highlight />
         <Stat label="pharmonline" value={stats.pharmonline} />
         <Stat label="aptekonline" value={stats.aptekonline} />
         <Stat label="aloe" value={stats.aloe} />
@@ -177,7 +180,7 @@ export default function CategoriesPage() {
       <div className="flex flex-col md:flex-row gap-2">
         <input
           type="search"
-          placeholder="🔎 Поиск по названию / key"
+          placeholder={t("search_placeholder")}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm"
@@ -187,7 +190,7 @@ export default function CategoriesPage() {
           onChange={(e) => setSiteFilter(e.target.value as any)}
           className="rounded-md border border-input bg-background px-3 py-2 text-sm"
         >
-          <option value="">Все сайты</option>
+          <option value="">{t("filter_all")}</option>
           <option value="pharmonline">pharmonline</option>
           <option value="aptekonline">aptekonline</option>
           <option value="aloe">aloe</option>
@@ -197,9 +200,9 @@ export default function CategoriesPage() {
           onChange={(e) => setCrossFilter(e.target.value as any)}
           className="rounded-md border border-input bg-background px-3 py-2 text-sm"
         >
-          <option value="">Любой охват</option>
-          <option value="cross2">Только Cross-2 (pharm+apt)</option>
-          <option value="cross3">Только Cross-3 (все 3 сайта)</option>
+          <option value="">{t("filter_any_coverage")}</option>
+          <option value="cross2">{t("filter_cross2")}</option>
+          <option value="cross3">{t("filter_cross3")}</option>
         </select>
         <label className="inline-flex items-center gap-2 px-3 text-sm">
           <input
@@ -208,11 +211,11 @@ export default function CategoriesPage() {
             onChange={(e) => setActiveOnly(e.target.checked)}
             className="rounded"
           />
-          Только Active
+          {t("only_active")}
         </label>
       </div>
 
-      {isLoading && <div className="text-muted-foreground">Загрузка…</div>}
+      {isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
 
       <div className="rounded-lg border border-border overflow-hidden">
         <table className="w-full text-sm">
@@ -244,7 +247,7 @@ export default function CategoriesPage() {
 
       {filtered.length === 0 && !isLoading && (
         <div className="text-muted-foreground text-center py-4">
-          По текущему фильтру ничего не найдено.
+          {t("empty")}
         </div>
       )}
       </>
@@ -254,6 +257,7 @@ export default function CategoriesPage() {
 }
 
 function SuggestionsPanel() {
+  const t = useTranslations("categories");
   const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
   type Site = (typeof SITES)[number];
   const [siteA, setSiteA] = useState<Site>("pharmonline");
@@ -310,7 +314,7 @@ function SuggestionsPanel() {
         <span className="text-muted-foreground">↔</span>
         <SiteSelector value={siteB} onChange={setSiteB} label="Сайт B" disabled={siteA} />
         <label className="inline-flex items-center gap-2 text-sm ml-auto">
-          Мин. overlap:
+          {t("min_overlap_label")}
           <input
             type="number"
             value={minOverlap}
@@ -322,7 +326,7 @@ function SuggestionsPanel() {
         </label>
       </div>
 
-      {isLoading && <div className="text-sm text-muted-foreground py-4">Ищу пересечения…</div>}
+      {isLoading && <div className="text-sm text-muted-foreground py-4">{t("searching_overlaps")}</div>}
       {error && (
         <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive">
           {friendlyError(error)}
@@ -330,7 +334,7 @@ function SuggestionsPanel() {
       )}
       {!isLoading && data && notMapped.length === 0 && mapped.length === 0 && (
         <div className="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
-          Нет пересечений с overlap ≥ {minOverlap} брендов. Понизь порог или выбери другую пару сайтов.
+          {t("no_overlaps", { n: minOverlap })}
         </div>
       )}
 
@@ -338,10 +342,10 @@ function SuggestionsPanel() {
         <div className="rounded-lg border border-border bg-card overflow-hidden">
           <div className="px-4 py-3 border-b border-border">
             <h2 className="text-sm font-semibold">
-              Новые предложения ({notMapped.length})
+              {t("suggestions_new_title", { count: notMapped.length })}
             </h2>
             <p className="text-xs text-muted-foreground">
-              Категории-кандидаты на mapping. Сортировка — по убыванию shared brands.
+              {t("suggestions_new_desc")}
             </p>
           </div>
           <table className="w-full text-sm">
@@ -349,8 +353,8 @@ function SuggestionsPanel() {
               <tr>
                 <th className="px-4 py-2 text-left">{siteA}</th>
                 <th className="px-4 py-2 text-left">{siteB}</th>
-                <th className="px-4 py-2 text-right">Shared brands</th>
-                <th className="px-4 py-2 text-left">Примеры</th>
+                <th className="px-4 py-2 text-right">{t("suggestions_shared_brands_th")}</th>
+                <th className="px-4 py-2 text-left">{t("suggestions_examples_th")}</th>
                 <th className="px-4 py-2 w-32"></th>
               </tr>
             </thead>
@@ -391,7 +395,7 @@ function SuggestionsPanel() {
                       disabled={mapMutation.isPending}
                       className="inline-flex items-center gap-1 rounded bg-primary text-primary-foreground px-2 py-1 text-xs font-medium hover:bg-primary/90 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     >
-                      Связать
+                      {t("bind_btn")}
                     </button>
                   </td>
                 </tr>
@@ -404,7 +408,7 @@ function SuggestionsPanel() {
       {mapped.length > 0 && (
         <details className="rounded-lg border border-border bg-muted/20">
           <summary className="px-4 py-2 cursor-pointer text-sm text-muted-foreground">
-            Уже связанные ({mapped.length})
+            {t("suggestions_mapped_title", { count: mapped.length })}
           </summary>
           <table className="w-full text-xs">
             <tbody>
@@ -418,7 +422,7 @@ function SuggestionsPanel() {
                   </td>
                   <td className="px-4 py-2 text-right tabular-nums">{s.shared_brands_count}</td>
                   <td className="px-4 py-2 text-success">
-                    <CheckCircle2 className="inline h-3.5 w-3.5 mr-1" /> связано
+                    <CheckCircle2 className="inline h-3.5 w-3.5 mr-1" /> {t("already_mapped_badge")}
                   </td>
                 </tr>
               ))}
@@ -461,6 +465,7 @@ function SiteSelector({
 }
 
 function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
+  const t = useTranslations("categories");
   const queryClient = useQueryClient();
   const requestsQ = useQuery({
     queryKey: ["scrape-requests"],
@@ -509,7 +514,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
       return (
         <span className="inline-flex items-center gap-1 text-xs text-warning whitespace-nowrap">
           <Play className="h-3 w-3 animate-pulse" />
-          {activeThis.status === "pending" ? "в очереди" : "сканируем"} #{activeThis.id}
+          {activeThis.status === "pending" ? t("scan_in_queue") : t("scanning")} #{activeThis.id}
         </span>
       );
     }
@@ -526,7 +531,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
         }
       >
         <Play className="h-3 w-3" />
-        Сканировать
+        {t("scan_per_cat_btn")}
       </button>
     );
   }
@@ -537,7 +542,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
       <div className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm">
         <Play className="h-4 w-4 animate-pulse" />
         <span className="font-medium">
-          {activeAll.status === "pending" ? "В очереди…" : "Сканируем все…"}
+          {activeAll.status === "pending" ? t("scanning_queued") : t("scanning_all")}
         </span>
         <span className="text-xs text-muted-foreground">#{activeAll.id}</span>
       </div>
@@ -552,7 +557,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
         title="Запустить scan всех активных категорий"
       >
         <Play className="h-4 w-4" />
-        {triggerMut.isPending ? "Отправляем…" : "Сканировать все"}
+        {triggerMut.isPending ? t("sending") : t("scan_all_btn")}
       </button>
       {showCompleted && lastCompleted && (
         <ScrapeResultBadge req={lastCompleted} />
@@ -562,10 +567,11 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
 }
 
 function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow }) {
+  const t = useTranslations("categories");
   if (req.status === "failed") {
     return (
       <div className="text-xs text-destructive max-w-[280px] truncate" title={req.error_message ?? "Без сообщения об ошибке"}>
-        ✗ Сбой #{req.id}: {req.error_message ?? "—"}
+        {t("scan_failed_msg", { id: req.id, error: req.error_message ?? "—" })}
       </div>
     );
   }
@@ -578,7 +584,7 @@ function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow 
     .join(", ");
   return (
     <div className="text-xs text-success" title={`run_id=${req.run_id}, завершено ${req.completed_at}`}>
-      ✓ Готово #{req.id} — <span className="font-medium">{total.toLocaleString("ru-RU")}</span> товаров
+      {t("scan_done_msg", { id: req.id, total: total.toLocaleString("ru-RU") })}
       {siteParts && <span className="text-muted-foreground"> ({siteParts})</span>}
     </div>
   );
@@ -594,6 +600,7 @@ function CategoryRowDesktop({
   onEdit: () => void;
   onChanged: () => void;
 }) {
+  const t = useTranslations("categories");
   const queryClient = useQueryClient();
 
   const toggleActive = useMutation({
@@ -661,13 +668,13 @@ function CategoryRowDesktop({
           <button
             onClick={onEdit}
             className="text-muted-foreground hover:text-foreground"
-            title="Редактировать"
+            title={t("edit_tooltip")}
           >
             <Pencil className="h-4 w-4" />
           </button>
           <button
             onClick={() => {
-              if (confirm(`Удалить категорию «${cat.label_ru}»?`)) remove.mutate();
+              if (confirm(t("delete_confirm", { label: cat.label_ru }))) remove.mutate();
             }}
             disabled={remove.isPending}
             className="text-muted-foreground hover:text-destructive disabled:opacity-50"
@@ -701,6 +708,8 @@ function CategoryForm({
   onClose: () => void;
   editing?: CategoryRow;
 }) {
+  const t = useTranslations("categories");
+  const tCommon = useTranslations("common");
   const queryClient = useQueryClient();
   const isEdit = Boolean(editing);
   const [form, setForm] = useState({
@@ -740,7 +749,7 @@ function CategoryForm({
       queryClient.invalidateQueries({ queryKey: ["categories"] });
       onClose();
     },
-    onError: (e: any) => setError(e?.message || "Не удалось сохранить"),
+    onError: (e: any) => setError(e?.message || t("form_save_error")),
   });
 
   const canSubmit =
@@ -750,28 +759,26 @@ function CategoryForm({
     <div className="rounded-lg border border-border bg-card p-4 space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="font-semibold">
-          {isEdit ? `Редактировать категорию #${editing!.id}` : "Новая категория"}
+          {isEdit ? t("form_edit_title", { id: editing!.id }) : t("form_new_title")}
         </h3>
         <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
           <X className="h-4 w-4" />
         </button>
       </div>
       <p className="text-xs text-muted-foreground">
-        {isEdit
-          ? "Можно поправить название или slug на любом сайте. Изменение slug повлияет только на следующий scrape — существующие продукты не удалятся."
-          : "Вставь URL категории с каждого сайта — slug извлечётся автоматически. Можно ввести голый slug, если уже знаешь."}
+        {isEdit ? t("form_desc_edit") : t("form_desc_add")}
       </p>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         <Field
-          label="Название (RU)"
+          label={t("form_name_ru")}
           required
           value={form.label_ru}
           onChange={(v) => setForm({ ...form, label_ru: v })}
           placeholder="Витамины"
         />
         <Field
-          label="Название (AZ)"
+          label={t("form_name_az")}
           value={form.label_az}
           onChange={(v) => setForm({ ...form, label_az: v })}
           placeholder="Vitaminlər"
@@ -804,7 +811,7 @@ function CategoryForm({
 
       {key && (
         <div className="text-xs text-muted-foreground">
-          Key {isEdit ? "(read-only при редактировании)" : "(автоматически)"}:{" "}
+          Key {isEdit ? `(${t("form_key_readonly")})` : `(${t("form_key_auto")})`}:{" "}
           <span className="font-mono">{key}</span>
         </div>
       )}
@@ -815,10 +822,10 @@ function CategoryForm({
           disabled={!canSubmit || save.isPending}
           className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
         >
-          {save.isPending ? "Сохраняем…" : isEdit ? "Применить" : "Сохранить"}
+          {save.isPending ? t("form_save_pending") : isEdit ? t("form_apply") : t("form_save")}
         </button>
         <button onClick={onClose} className="text-sm text-muted-foreground hover:text-foreground">
-          Отмена
+          {tCommon("cancel")}
         </button>
       </div>
       {error && <div className="text-sm text-destructive">{error}</div>}

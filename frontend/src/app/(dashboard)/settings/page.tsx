@@ -65,6 +65,7 @@ export default function SettingsPage() {
 }
 
 function ChangePasswordSection() {
+  const t = useTranslations("settings");
   const [curr, setCurr] = useState("");
   const [next1, setNext1] = useState("");
   const [next2, setNext2] = useState("");
@@ -84,10 +85,10 @@ function ChangePasswordSection() {
   const canSubmit = curr && next1 && next2 && next1 === next2 && next1.length >= 6;
 
   return (
-    <Section title="Сменить пароль" icon={Key}>
+    <Section title={t("change_password")} icon={Key}>
       <div className="space-y-3 max-w-md">
         <label className="block">
-          <span className="text-xs font-medium block mb-1">Текущий пароль</span>
+          <span className="text-xs font-medium block mb-1">{t("current_password")}</span>
           <input
             type="password"
             value={curr}
@@ -97,7 +98,7 @@ function ChangePasswordSection() {
           />
         </label>
         <label className="block">
-          <span className="text-xs font-medium block mb-1">Новый пароль (мин. 6 символов)</span>
+          <span className="text-xs font-medium block mb-1">{t("new_password_hint")}</span>
           <input
             type="password"
             value={next1}
@@ -105,10 +106,10 @@ function ChangePasswordSection() {
             autoComplete="new-password"
             className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
           />
-          {tooShort && <span className="text-xs text-destructive">Минимум 6 символов</span>}
+          {tooShort && <span className="text-xs text-destructive">{t("password_too_short")}</span>}
         </label>
         <label className="block">
-          <span className="text-xs font-medium block mb-1">Повтори новый пароль</span>
+          <span className="text-xs font-medium block mb-1">{t("new_password_repeat")}</span>
           <input
             type="password"
             value={next2}
@@ -116,19 +117,19 @@ function ChangePasswordSection() {
             autoComplete="new-password"
             className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
           />
-          {mismatch && <span className="text-xs text-destructive">Пароли не совпадают</span>}
+          {mismatch && <span className="text-xs text-destructive">{t("password_mismatch")}</span>}
         </label>
         <button
           onClick={() => mut.mutate()}
           disabled={!canSubmit || mut.isPending}
           className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
         >
-          {mut.isPending ? "Сохраняем…" : "Сменить пароль"}
+          {mut.isPending ? t("saving") : t("change_password")}
         </button>
-        {done && <div className="text-sm text-success">✓ Пароль изменён. Следующий вход — с новым.</div>}
+        {done && <div className="text-sm text-success">{t("password_changed")}</div>}
         {mut.isError && (
           <div className="text-sm text-destructive">
-            {(mut.error as any)?.message || "Не удалось сохранить — проверь текущий пароль"}
+            {(mut.error as any)?.message || t("password_save_error")}
           </div>
         )}
       </div>
@@ -138,6 +139,7 @@ function ChangePasswordSection() {
 
 
 function IntegrationsStatusSection() {
+  const t = useTranslations("settings");
   const q = useQuery({ queryKey: ["integrations"], queryFn: api.integrations });
 
   if (q.isLoading || !q.data) {
@@ -147,46 +149,46 @@ function IntegrationsStatusSection() {
   const items: { key: string; label: string; ok: boolean; hint: string }[] = [
     {
       key: "smtp",
-      label: "Email-уведомления",
+      label: t("integration_smtp_label"),
       ok: q.data.smtp,
       hint: q.data.smtp
-        ? `Подключено (отправка с ${q.data.smtp_from ?? "—"})`
-        : "Не подключено · можно включить через 5 минут (Resend / SendGrid)",
+        ? t("integration_smtp_ok", { smtp_from: q.data.smtp_from ?? "—" })
+        : t("integration_smtp_not_ok"),
     },
     {
       key: "telegram",
-      label: "Telegram push-алерты",
+      label: t("integration_telegram_label"),
       ok: q.data.telegram,
       hint: q.data.telegram
-        ? `Подключено${q.data.telegram_bot_username ? ` (@${q.data.telegram_bot_username})` : ""}`
-        : "Не подключено · нужен бот-токен от @BotFather (бесплатно)",
+        ? `${t("integration_telegram_ok")}${q.data.telegram_bot_username ? ` (@${q.data.telegram_bot_username})` : ""}`
+        : t("integration_telegram_not_ok"),
     },
     {
       key: "sentry",
-      label: "Мониторинг ошибок (Sentry)",
+      label: t("integration_sentry_label"),
       ok: q.data.sentry,
       hint: q.data.sentry
-        ? "Подключено · ошибки и performance отслеживаются"
-        : "Не подключено · опционально, free-tier 5K событий/мес",
+        ? t("integration_sentry_ok")
+        : t("integration_sentry_not_ok"),
     },
     {
       key: "scraperapi",
-      label: "Резервный прокси (ScraperAPI)",
+      label: t("integration_scraperapi_label"),
       ok: q.data.scraperapi,
       hint: q.data.scraperapi
-        ? `Подключено для: ${q.data.scraperapi_sites.join(", ") || "—"}`
-        : "Не подключено · опционально для обхода IP-блокировок",
+        ? t("integration_scraperapi_ok", { sites: q.data.scraperapi_sites.join(", ") || "—" })
+        : t("integration_scraperapi_not_ok"),
     },
   ];
 
   const okCount = items.filter((i) => i.ok).length;
 
   return (
-    <Section title="Интеграции" icon={Zap}>
+    <Section title={t("integrations")} icon={Zap}>
       <div className="text-xs text-muted-foreground mb-3">
-        Внешние сервисы для уведомлений и мониторинга.
-        Подключено: <span className="font-semibold">{okCount} / {items.length}</span>.
-        Каждый из них опционален — ядро системы работает и без них.
+        {t("integrations_desc")}{" "}
+        {t("integrations_connected_count", { ok: okCount, total: items.length })}{" "}
+        {t("integrations_optional_hint")}
       </div>
       <div className="space-y-2">
         {items.map((it) => (
@@ -275,10 +277,11 @@ function NotificationsSection({ email }: { email?: string }) {
               </div>
             ) : !integrationsQ.data?.telegram ? (
               <div className="rounded-md bg-warning/10 border border-warning/40 p-3 text-sm">
-                <div className="font-medium text-warning mb-1">⚠️ Telegram-бот не настроен на сервере</div>
+                <div className="font-medium text-warning mb-1">{t("telegram_not_configured_title")}</div>
                 <div className="text-xs text-muted-foreground">
-                  Чтобы привязать Telegram нужно сначала добавить <code className="font-mono">TELEGRAM_BOT_TOKEN</code> в
-                  <code className="font-mono"> /etc/pharmacy-monitor/env</code>. Запусти:
+                  {t("telegram_not_configured_hint")}{" "}
+                  <code className="font-mono">TELEGRAM_BOT_TOKEN</code>{" "}
+                  <code className="font-mono">/etc/pharmacy-monitor/env</code>
                 </div>
                 <code className="block mt-2 font-mono text-xs bg-secondary/50 p-2 rounded">
                   bash scripts/configure-integrations.sh

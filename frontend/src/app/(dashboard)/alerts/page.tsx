@@ -12,6 +12,7 @@ import {
   Mail,
   MailOpen,
 } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { api, friendlyError, type AlertEvent } from "@/lib/api";
 import { formatRelative } from "@/lib/utils";
 import { CardListSkeleton } from "@/components/skeleton";
@@ -41,6 +42,7 @@ const SEVERITY_CONFIG = {
 type TabView = "inbox" | "snoozed" | "read";
 
 export default function AlertsPage() {
+  const t = useTranslations("alerts");
   const queryClient = useQueryClient();
   const [view, setView] = useState<TabView>("inbox");
   const [severityFilter, setSeverityFilter] = useState<string>("");
@@ -183,10 +185,9 @@ export default function AlertsPage() {
       />
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Алерты</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("page_title")}</h1>
           <p className="text-sm text-muted-foreground">
-            События за последние прогоны. Inbox-стиль: прочитанные/отложенные —
-            в отдельных tab&apos;ах.
+            {t("page_subtitle")}
           </p>
         </div>
         {view === "inbox" && counts?.unread != null && counts.unread > 0 && (
@@ -196,7 +197,7 @@ export default function AlertsPage() {
             className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
           >
             <CheckCheck className="h-3.5 w-3.5" />
-            {markAllReadMutation.isPending ? "…" : `Прочитать всё (${counts.unread})`}
+            {markAllReadMutation.isPending ? "…" : t("mark_all_read_btn", { count: counts.unread })}
           </button>
         )}
       </div>
@@ -210,7 +211,7 @@ export default function AlertsPage() {
             setSelected(new Set());
           }}
           icon={Inbox}
-          label="Inbox"
+          label={t("tab_inbox")}
           count={counts?.unread}
         />
         <TabBtn
@@ -220,7 +221,7 @@ export default function AlertsPage() {
             setSelected(new Set());
           }}
           icon={Clock}
-          label="Отложено"
+          label={t("tab_snoozed")}
           count={counts?.snoozed}
         />
         <TabBtn
@@ -230,7 +231,7 @@ export default function AlertsPage() {
             setSelected(new Set());
           }}
           icon={MailOpen}
-          label="Прочитано"
+          label={t("tab_read")}
           count={counts?.read}
         />
       </div>
@@ -240,22 +241,22 @@ export default function AlertsPage() {
         <Chip
           active={severityFilter === ""}
           onClick={() => setSeverityFilter("")}
-          label={`Все${data ? ` (${data.length})` : ""}`}
+          label={`${t("filter_all")}${data ? ` (${data.length})` : ""}`}
         />
         <Chip
           active={severityFilter === "critical"}
           onClick={() => setSeverityFilter("critical")}
-          label="🔴 Critical"
+          label={t("filter_critical")}
         />
         <Chip
           active={severityFilter === "warning"}
           onClick={() => setSeverityFilter("warning")}
-          label="🟡 Warning"
+          label={t("filter_warning")}
         />
         <Chip
           active={severityFilter === "info"}
           onClick={() => setSeverityFilter("info")}
-          label="ℹ️ Info"
+          label={t("filter_info")}
         />
         <div className="ml-auto flex gap-2">
           <select
@@ -263,18 +264,18 @@ export default function AlertsPage() {
             onChange={(e) => setHoursWindow(Number(e.target.value))}
             className="text-xs rounded-full px-3 py-1 border border-border bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            <option value={24}>24 часа</option>
-            <option value={72}>3 дня</option>
-            <option value={168}>7 дней</option>
-            <option value={720}>30 дней</option>
-            <option value={0}>Всё время</option>
+            <option value={24}>{t("window_24h")}</option>
+            <option value={72}>{t("window_3d")}</option>
+            <option value={168}>{t("window_7d")}</option>
+            <option value={720}>{t("window_30d")}</option>
+            <option value={0}>{t("window_all")}</option>
           </select>
           <select
             value={ruleTypeFilter}
             onChange={(e) => setRuleTypeFilter(e.target.value)}
             className="text-xs rounded-full px-3 py-1 border border-border bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            <option value="">Все типы</option>
+            <option value="">{t("filter_all_types")}</option>
             {ruleTypes.map((rt) => (
               <option key={rt} value={rt}>
                 {rt}
@@ -287,7 +288,7 @@ export default function AlertsPage() {
       {/* Bulk toolbar — виден когда есть selected */}
       {selected.size > 0 && (
         <div className="sticky top-0 z-10 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 flex items-center gap-2 text-sm">
-          <span className="font-medium">{selected.size} выбрано:</span>
+          <span className="font-medium">{t("selected_count", { count: selected.size })}</span>
           {view !== "read" && (
             <button
               onClick={() =>
@@ -299,7 +300,7 @@ export default function AlertsPage() {
               disabled={bulkMutation.isPending}
               className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <CheckCheck className="h-3.5 w-3.5" /> Прочитано
+              <CheckCheck className="h-3.5 w-3.5" /> {t("action_mark_read")}
             </button>
           )}
           {view === "read" && (
@@ -313,7 +314,7 @@ export default function AlertsPage() {
               disabled={bulkMutation.isPending}
               className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <Mail className="h-3.5 w-3.5" /> Непрочитано
+              <Mail className="h-3.5 w-3.5" /> {t("action_mark_unread")}
             </button>
           )}
           {view !== "snoozed" && (
@@ -328,7 +329,7 @@ export default function AlertsPage() {
                 disabled={bulkMutation.isPending}
                 className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
-                <Clock className="h-3.5 w-3.5" /> Отложить 24ч
+                <Clock className="h-3.5 w-3.5" /> {t("action_snooze_24h")}
               </button>
               <button
                 onClick={() =>
@@ -340,7 +341,7 @@ export default function AlertsPage() {
                 disabled={bulkMutation.isPending}
                 className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
-                <Clock className="h-3.5 w-3.5" /> 7 дней
+                <Clock className="h-3.5 w-3.5" /> {t("action_snooze_7d")}
               </button>
             </>
           )}
@@ -355,14 +356,14 @@ export default function AlertsPage() {
               disabled={bulkMutation.isPending}
               className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              Вернуть в inbox
+              {t("action_unsnooze")}
             </button>
           )}
           <button
             onClick={() => setSelected(new Set())}
             className="ml-auto text-muted-foreground hover:text-foreground"
           >
-            Снять выделение
+            {t("action_deselect")}
           </button>
         </div>
       )}
@@ -376,16 +377,16 @@ export default function AlertsPage() {
             onChange={toggleSelAll}
             className="h-3.5 w-3.5"
           />
-          Выбрать всё на экране ({filtered.length})
+          {t("select_all_on_screen", { count: filtered.length })}
         </label>
       )}
 
       {isLoading && <CardListSkeleton count={6} />}
       {filtered && filtered.length === 0 && !isLoading && (
         <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center">
-          {view === "inbox" && "🎉 Inbox пуст. Все алерты прочитаны или отложены."}
-          {view === "snoozed" && "Нет отложенных алертов в текущем окне."}
-          {view === "read" && "Нет прочитанных алертов в текущем окне."}
+          {view === "inbox" && t("empty_inbox")}
+          {view === "snoozed" && t("empty_snoozed")}
+          {view === "read" && t("empty_read")}
         </div>
       )}
 
@@ -436,6 +437,7 @@ function AlertCard({
   onSnooze7d: () => void;
   onSnoozeClear: () => void;
 }) {
+  const t = useTranslations("alerts");
   const cfg = SEVERITY_CONFIG[event.severity] ?? SEVERITY_CONFIG.info;
   const Icon = cfg.icon;
   const dimmed = event.is_read;
@@ -449,7 +451,7 @@ function AlertCard({
           checked={selected}
           onChange={onToggleSel}
           className="h-4 w-4 mt-1 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label="Выбрать для bulk-действия"
+          aria-label={t("aria_select_for_bulk")}
         />
         <Icon className={`h-5 w-5 shrink-0 ${cfg.color} mt-0.5`} />
         <div className="flex-1 min-w-0">
@@ -465,7 +467,7 @@ function AlertCard({
                     title={`Snoozed до ${new Date(event.snoozed_until).toLocaleString("ru-RU")}`}
                   >
                     <Clock className="h-3 w-3" />
-                    отложено
+                    {t("snoozed_badge")}
                   </span>
                 )}
               <span title={event.created_at}>{formatRelative(event.created_at)}</span>
@@ -487,11 +489,11 @@ function AlertCard({
             >
               {event.is_read ? (
                 <>
-                  <Mail className="h-3 w-3" /> Непрочитано
+                  <Mail className="h-3 w-3" /> {t("action_mark_unread_short")}
                 </>
               ) : (
                 <>
-                  <CheckCheck className="h-3 w-3" /> Прочитано
+                  <CheckCheck className="h-3 w-3" /> {t("action_mark_read_short")}
                 </>
               )}
             </button>
@@ -501,7 +503,7 @@ function AlertCard({
                 onClick={onSnoozeClear}
                 className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
-                Вернуть в inbox
+                {t("action_unsnooze")}
               </button>
             ) : (
               <button
@@ -509,7 +511,7 @@ function AlertCard({
                 className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 title="Скрыть на 7 дней"
               >
-                <Clock className="h-3 w-3" /> Отложить 7д
+                <Clock className="h-3 w-3" /> {t("snooze_7d_short")}
               </button>
             )}
           </div>
