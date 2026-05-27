@@ -70,7 +70,15 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 ## Active work-in-progress
 
-**Just finished (2026-05-27 evening)**: **URL fix + Phase 4.5 MAP + Phase 5.5 X-Request-ID** (commits `4765620`, `7e5a541`, `1090db5`):
+**Attempted (2026-05-27 night, ROLLED BACK)**: **Phase 6.1 URL-based i18n** — full migration to `app/[locale]/(dashboard)/...` structure, next-intl middleware с `localePrefix: 'as-needed'`, locale-aware Router + Link через `createNavigation`.
+
+- **Code passed local + prod build** (42 routes, middleware 39.2 KB)
+- **Production rendered HTTP 500**: middleware emits `x-middleware-rewrite: http://localhost:3000/<path>` header → Next.js standalone тратит этот URL как HTTP proxy fetch к самому себе → infinite recursion / ECONNRESET. Root cause: `output: 'standalone'` build обрабатывает middleware rewrite через actual HTTP request к localhost:3000 вместо internal dispatch.
+- **Attempted workarounds**: `alternateLinks: false` (не помог), `NODE_OPTIONS=--dns-result-order=ipv4first` (изменил ECONNREFUSED→ECONNRESET, recursion остался).
+- **Rolled back**: восстановлен tar backup `frontend-src-pre-i18n-20260527-195718.tgz`, cookie-based i18n работает. Локальные изменения в `git stash`: `Phase 6.1 i18n attempt — recursive proxy in standalone build`. Branch `wip/phase6.1-i18n-attempt` создан.
+- **Для retry**: попробовать (1) `localePrefix: 'always'` (не уверен поможет, та же middleware mechanic), (2) убрать `output: 'standalone'` и развернуть полный `.next/`, (3) подождать апстрим-фикса в Next.js / next-intl для standalone + middleware rewrite.
+
+**Just finished (2026-05-27 evening)**: **URL fix + Phase 4.5 MAP + Phase 5.5 X-Request-ID + Phase 5.1 intraday** (commits `4765620`, `7e5a541`, `1090db5`, `a95f1ca`):
 
 - **URL update bug в `persist_results` (commit `4765620`)**: `existing.url` НИКОГДА не обновлялся → 6238 pharmonline-продуктов застряли на `https://pharmonline.az/product/True` (артефакт старого `postQuery` бага в DDP). Plus: `ScrapedProduct` dataclass даже не имел поля `barcode` (task #12 был неполон). Фикс: `existing.url = sp.url or existing.url` + `existing.barcode` conditional fill + добавлен `barcode` в `ScrapedProduct`. **Verified on prod: 6238 → 2** (99.97% fix rate, оставшиеся 2 — orphan products not re-scraped). +4 регрессионных теста в [tests/test_persist_results.py](tests/test_persist_results.py). Run 108 показал: 272k products в 51 минуту, persist завершил все URL'ы корректно.
 - **Phase 4.5 — MAP violation detection (commit `7e5a541`)**: новый ROI action type `map_violation` — трекает min цены конкурентов per brand за 30д. Если клиент дешевле этого floor более чем на 5% — флагуем opportunity. Severity buckets: critical (≥20%), warning (≥10%), info (≥5%). Min 3 snapshot-семпла per бренд для валидного floor. Отличается от `_price_raise_opportunities` тем, что агрегат по БРЕНДУ (не один матч), 30-дневное окно (стабильнее). +5 регрессионных тестов в [tests/test_roi.py](tests/test_roi.py). Bonus: фикс pre-existing NameError в [src/analytics.py:75](src/analytics.py) (`by_brand[brand][site]` → `[site_name]`).
