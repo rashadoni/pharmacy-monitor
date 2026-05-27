@@ -59,6 +59,15 @@ This protocol applies to tasks that change code. Trivial read-only operations (s
 
 ## Active work-in-progress
 
+**Just finished (2026-05-27)**: **Phase 1 — scraper resilience**:
+
+- **Bright Data Web Unlocker** ($1.50/CPM) — zone `pharmacy_unlocker`, native proxy mode (`brd.superproxy.io:33335`). Allowed IP whitelist: 46.225.149.52 (prod). Phase 1.2 код в [src/scrapers/base.py](src/scrapers/base.py) (`_brightdata_proxy_for`) + [src/scrapers/aptekonline.py](src/scrapers/aptekonline.py) (`_brightdata_httpx_proxy_for`) подхватывает env `BRIGHTDATA_USERNAME/PASSWORD/SITES/HOST`.
+- **aptekonline переехал на прод**: live test — 2264+431+111 продуктов из 3 категорий, все HTTP 200, ~30 сек. Лог: `aptekonline_using_brightdata`. Таймер `pharmacy-monitor-scrape@aptekonline.timer` enabled+started.
+- **pharmonline остался на Mac**: Web Unlocker даёт HTTP 502 для pharmonline.az независимо от country (az/tr/ru tested). Прямой curl с Baku-IP даёт 200 → значит pharmonline блочит residential pool Bright Data. Open question: escalate в BD support или попробовать Smartproxy/Oxylabs. Pragmatic решение — Mac launchd для pharmonline остаётся.
+- **AI crawler fallback** ([src/main.py](src/main.py)) — wired как опт-ин через `AI_FALLBACK_ENABLED=1` env. Срабатывает когда primary scraper отдаёт < 50% от baseline. Disabled by default — burns Claude tokens.
+- **ScraperAPI default pool** (`SCRAPER_API_KEY` + `SCRAPER_API_SITES`) — устарел, остаётся как 3rd priority в chain.
+- **Старый ISP zone `pharmacy_monitor`** — оставлен active в Bright Data (фикс $2/мес). Не удалён на случай если понадобится для будущих экспериментов. **TODO**: удалить через UI если решим что Web Unlocker достаточно.
+
 **Just finished (2026-05-27)**: **Phase 0 — defuse time bombs** (commit `af63932`, roadmap ~/.claude/plans/rosy-launching-lamport.md):
 
 - **`APTEKONLINE_CHECKUS` env-var** ([src/scrapers/aptekonline.py](src/scrapers/aptekonline.py)) — захардкоженный bcrypt-токен из `main.js` перенесён в env с back-compat default. Fail-fast только когда переменная *задана но пустая* (защита от .env-опечатки). Default — текущее зафиксированное значение (2026-05-07). На проде env ещё не задан → fallback на default, всё работает. 5 unit-тестов в [tests/test_aptekonline_api.py](tests/test_aptekonline_api.py).
@@ -214,8 +223,9 @@ SELECT COUNT(*) FROM products;
 [✓] Git         project under VCS с 2026-05-11 (initial commit c7fde84) + remote github.com/rashadrahimov/pharmacy-monitor
 [✓] i18n full   locale switcher в nav, AZ/EN fix (route /locale вместо /api/locale), 71 строка переведена, ROI actions переведены (2026-05-26)
 [✓] Phase 0     defuse time bombs: env-checkus, request_id, deep /health, cleanup tools (2026-05-27, commit af63932)
-[ ] Phase 1     scraper resilience: Bright Data residential proxies, AI crawler fallback, kill Mac launchd primary
-[ ] Next        Bright Data signup ($250/мес), Telegram bot (отложен), forecast.py diff-only refactor (опционально)
+[~] Phase 1     scraper resilience: BD Web Unlocker для aptekonline ✓, pharmonline даёт 502 от BD → остался на Mac. AI fallback wired (opt-in)
+[ ] Phase 2     matcher v2 с barcode/EAN (нужно ~3-5 дней)
+[ ] Next        Mac launchd для pharmonline, либо BD support escalation для pharmonline (низкий приоритет), либо Smartproxy POC
 ```
 
 ### Out of scope (decided 2026-05-07 by client)
