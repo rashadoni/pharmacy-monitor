@@ -149,7 +149,7 @@ This protocol applies to tasks that change code. Trivial read-only operations (s
 | Сайт | Где | Чем | Расписание |
 |---|---|---|---|
 | **aloe.az** | Hetzner prod | Playwright DOM (см. [src/scrapers/aloe.py](src/scrapers/aloe.py)) | systemd timer `pharmacy-monitor-scrape@aloe` 03:00 UTC, direct |
-| **pharmonline.az** | **Mac launchd только** | Playwright DOM (см. [src/scrapers/pharmonline.py](src/scrapers/pharmonline.py)) | Mac launchd `com.pharmacy-monitor.scrape` 18:00 Asia/Baku. **Прод-таймер отключён 2026-05-11** — ScraperAPI default pool стабильно возвращал 0 продуктов (run_46, 50, 53 — все пустые), создавал шум в логах. С Mac (Baku-IP) скрейп стабильно даёт ~9-10K продуктов. |
+| **pharmonline.az** | **Прод (Hetzner) — DDP + IPRoyal** | Meteor DDP WebSocket (см. [src/scrapers/pharmonline_ddp.py](src/scrapers/pharmonline_ddp.py)) — pierces Cloudflare без браузера, через IPRoyal residential proxy ($1.75/GB). | systemd timer `pharmacy-monitor-scrape@pharmonline` 01:00 UTC. Активирован 2026-05-27 после run 104=ok с 266,718 products. Reconnect-on-close logic выживает persist phase. Mac launchd теперь DR-fallback только: `bash infra/local/run-scrape.sh --site pharmonline --site aptekonline`. |
 | **aptekonline.az** | **Mac launchd только** | httpx JSON API (см. [src/scrapers/aptekonline.py](src/scrapers/aptekonline.py)) | Mac launchd `com.pharmacy-monitor.scrape` 18:00 Asia/Baku. **Прод-таймер отключён 2026-05-08** (`systemctl disable --now pharmacy-monitor-scrape@aptekonline.timer`) — ScraperAPI default pool отдаёт HTTP 403, нужен residential (Hobby $49/мес). Endpoint: `GET /shop/productList?categoryId[]=N&lang=az&page=N` (Laravel paginator), header `checkus: $2y$10$...` из `main.js`. 12 тестов в [tests/test_aptekonline_api.py](tests/test_aptekonline_api.py). |
 
 Systemd unit на проде: `/etc/systemd/system/pharmacy-monitor-scrape@.service`, ExecStart=`pharmacy-monitor run --site %i --mode category`. Активны таймеры **pharmonline + aloe** (aptekonline отключён 2026-05-08).
@@ -238,7 +238,8 @@ SELECT COUNT(*) FROM products;
 [✓] i18n full   locale switcher в nav, AZ/EN fix (route /locale вместо /api/locale), 71 строка переведена, ROI actions переведены (2026-05-26)
 [✓] Phase 0     defuse time bombs: env-checkus, request_id, deep /health, cleanup tools (2026-05-27, commit af63932)
 [~] Phase 1     scraper resilience: BD Web Unlocker для aptekonline ✓, pharmonline даёт 502 от BD → остался на Mac. AI fallback wired (opt-in)
-[~] Phase 1c    DDP scraper для pharmonline reverse-engineered (commit 6969e96), pierces CF без браузера через IPRoyal. Run 103 status=ok, 599 unique products. Известный limit: DDP socket close при длительном persist phase (1011 keepalive). Need reconnect logic для cutover. Mac launchd остаётся primary.
+[✓] Phase 1c    DDP scraper для pharmonline (commit 6969e96+beac3ca). Reverse-engineered Meteor `products` method, pierces Cloudflare без браузера через IPRoyal residential. Reconnect-on-close logic — выживает persist phase pause. **Run 104: status=ok, 266,718 products** (vs 599 без reconnect = 445× прирост).
+[✓] Cutover     pharmonline переведён на прод-таймер (01:00 UTC = 05:00 Baku). Mac launchd теперь скрейпит только aptekonline. Mac DR-fallback для pharmonline остался (`bash run-scrape.sh --site pharmonline`).
 [✓] Phase 2     matcher v2 с barcode (2.1-2.4): migration 0007, extraction в aloe+pharmonline, priority-0 pass, rematch script. UI 2.5 deferred.
 [ ] Phase 3     HA & backups: Postgres replica + B2 offsite backup
 [ ] Next        Phase 2.5 (UI suggestion queue), Phase 3, либо real-data barcode coverage analysis после нескольких daily scrape
