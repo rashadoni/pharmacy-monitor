@@ -32,6 +32,7 @@ dependencies = [
     "bcrypt>=5.0",              # password login
     "openai>=1.50",             # AI crawler — default LLM provider
     "anthropic>=0.40",          # AI crawler — alternative provider
+    "websockets>=13.0",         # Meteor DDP scraper для pharmonline (Phase 1c)
 ]
 
 [dependency-groups]

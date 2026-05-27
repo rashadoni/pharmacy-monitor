@@ -35,8 +35,18 @@ from src.scrapers.pharmonline import PharmonlineScraper  # noqa: E402
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "categories.yaml"
 
+# Phase 1c (2026-05-27) — pharmonline DDP path uses reverse-engineered Meteor
+# protocol через WebSocket, обходит Cloudflare без Playwright. Opt-in via
+# PHARMONLINE_USE_DDP=1. Когда выключено — используется legacy Playwright путь.
+def _pharmonline_scraper_class() -> type[BaseScraper]:
+    if os.environ.get("PHARMONLINE_USE_DDP", "").lower() in ("1", "true", "yes"):
+        from src.scrapers.pharmonline_ddp import PharmonlineDDPScraper
+        return PharmonlineDDPScraper
+    return PharmonlineScraper
+
+
 SCRAPER_CLASSES: dict[str, type[BaseScraper]] = {
-    "pharmonline": PharmonlineScraper,
+    "pharmonline": _pharmonline_scraper_class(),
     "aptekonline": AptekonlineScraper,
     "aloe": AloeScraper,
 }
