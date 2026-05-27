@@ -238,6 +238,7 @@ SELECT COUNT(*) FROM products;
 [✓] i18n full   locale switcher в nav, AZ/EN fix (route /locale вместо /api/locale), 71 строка переведена, ROI actions переведены (2026-05-26)
 [✓] Phase 0     defuse time bombs: env-checkus, request_id, deep /health, cleanup tools (2026-05-27, commit af63932)
 [~] Phase 1     scraper resilience: BD Web Unlocker для aptekonline ✓, pharmonline даёт 502 от BD → остался на Mac. AI fallback wired (opt-in)
+[~] Phase 1c    DDP scraper для pharmonline reverse-engineered (commit 6969e96), pierces CF без браузера через IPRoyal. Run 103 status=ok, 599 unique products. Известный limit: DDP socket close при длительном persist phase (1011 keepalive). Need reconnect logic для cutover. Mac launchd остаётся primary.
 [✓] Phase 2     matcher v2 с barcode (2.1-2.4): migration 0007, extraction в aloe+pharmonline, priority-0 pass, rematch script. UI 2.5 deferred.
 [ ] Phase 3     HA & backups: Postgres replica + B2 offsite backup
 [ ] Next        Phase 2.5 (UI suggestion queue), Phase 3, либо real-data barcode coverage analysis после нескольких daily scrape
