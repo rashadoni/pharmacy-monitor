@@ -110,7 +110,15 @@ class _DDPClient:
         # For prod use case: when proxy is needed, fall back to httpx-ws or
         # explicit tunnel. For now, IPRoyal supports SOCKS5 too — we'll wire
         # that as needed. Direct connection works for testing from Baku-IP.
-        kwargs: dict = {"max_size": 50 * 1024 * 1024}  # 50MB messages
+        # Long-running scrapes (~20 min total): bump keepalive ping timeout to
+        # 60s (default 20s) — pharmonline server occasionally takes 30+s to
+        # respond on heavy categories, which triggered 1011 close in run 102.
+        kwargs: dict = {
+            "max_size": 50 * 1024 * 1024,  # 50MB messages
+            "ping_interval": 30,
+            "ping_timeout": 60,
+            "close_timeout": 10,
+        }
         if self.proxy_url:
             # websockets has experimental proxy support via `proxy` param in 13+.
             kwargs["proxy"] = self.proxy_url
@@ -228,13 +236,29 @@ def _build_product(raw: dict, locale: str) -> ScrapedProduct | None:
     elif barcode:
         barcode = str(barcode).strip()
 
+    # DDP returns `category` as a list (product can belong to multiple
+    # categories) and `manufacturer` similarly. Existing scrapers expect a
+    # single string — flatten to first/primary slug. Otherwise downstream
+    # `_per_category_breakdown` raises TypeError: unhashable type: 'list'.
+    category = raw.get("category")
+    if isinstance(category, list):
+        category = category[0] if category else None
+    if category is not None:
+        category = str(category)
+
+    manufacturer = raw.get("manufacturer")
+    if isinstance(manufacturer, list):
+        manufacturer = manufacturer[0] if manufacturer else None
+    if manufacturer is not None:
+        manufacturer = str(manufacturer)
+
     return ScrapedProduct(
         site="pharmonline",
         external_id=str(raw["_id"]),
         url=f"https://pharmonline.az/product/{slug}",
         name=str(name)[:500],
-        manufacturer=raw.get("manufacturer"),
-        category=raw.get("category"),
+        manufacturer=manufacturer,
+        category=category,
         image_url=image_url,
         description=(i18n.get(locale, {}) or {}).get("description") or None,
         price=max_price if is_on_sale else price,
