@@ -59,6 +59,15 @@ This protocol applies to tasks that change code. Trivial read-only operations (s
 
 ## Active work-in-progress
 
+**Just finished (2026-05-27 evening)**: **URL fix + Phase 4.5 MAP + Phase 5.5 X-Request-ID** (commits `4765620`, `7e5a541`, `1090db5`):
+
+- **URL update bug в `persist_results` (commit `4765620`)**: `existing.url` НИКОГДА не обновлялся → 6238 pharmonline-продуктов застряли на `https://pharmonline.az/product/True` (артефакт старого `postQuery` бага в DDP). Plus: `ScrapedProduct` dataclass даже не имел поля `barcode` (task #12 был неполон). Фикс: `existing.url = sp.url or existing.url` + `existing.barcode` conditional fill + добавлен `barcode` в `ScrapedProduct`. **Verified on prod: 6238 → 2** (99.97% fix rate, оставшиеся 2 — orphan products not re-scraped). +4 регрессионных теста в [tests/test_persist_results.py](tests/test_persist_results.py). Run 108 показал: 272k products в 51 минуту, persist завершил все URL'ы корректно.
+- **Phase 4.5 — MAP violation detection (commit `7e5a541`)**: новый ROI action type `map_violation` — трекает min цены конкурентов per brand за 30д. Если клиент дешевле этого floor более чем на 5% — флагуем opportunity. Severity buckets: critical (≥20%), warning (≥10%), info (≥5%). Min 3 snapshot-семпла per бренд для валидного floor. Отличается от `_price_raise_opportunities` тем, что агрегат по БРЕНДУ (не один матч), 30-дневное окно (стабильнее). +5 регрессионных тестов в [tests/test_roi.py](tests/test_roi.py). Bonus: фикс pre-existing NameError в [src/analytics.py:75](src/analytics.py) (`by_brand[brand][site]` → `[site_name]`).
+- **Phase 5.5 — Frontend X-Request-ID propagation (commit `1090db5`)**: каждый fetch генерит UUID v4 (crypto.randomUUID, Math.random fallback), отправляет как `X-Request-ID` header, backend echoes back, ApiError несёт `requestId` для support correlation. Новая helper `getRequestId(err)` для consumers. Round-trip verified: `curl -H "X-Request-ID: test" /health` возвращает тот же header.
+- **Orphan runs cleanup**: run 97 (вчера Mac, 102k products, orphan "running") → marked `ok`; run 99 (утренний empty test) → marked `failed`. Дашборд status'ы теперь чистые.
+
+Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~32MB). 25 726 pharmonline products с правильными URLs. /health: db_ping 0.62ms, redis_ping 2.62ms, all sites < 24h fresh.
+
 **Just finished (2026-05-27)**: **Phase 2 — matcher v2 with barcode** (commit `97b7526`):
 
 - **`products.barcode` column** (varchar(40), indexed) — Alembic migration `0007_product_barcode` применена на проде. Унифицирует EAN/GTIN/UPC в один canonical field. `ix_products_barcode` btree index для O(log n) lookup.
