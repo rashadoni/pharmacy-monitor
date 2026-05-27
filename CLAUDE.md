@@ -59,6 +59,20 @@ This protocol applies to tasks that change code. Trivial read-only operations (s
 
 ## Active work-in-progress
 
+**Just finished (2026-05-27)**: **Phase 2 — matcher v2 with barcode** (commit `97b7526`):
+
+- **`products.barcode` column** (varchar(40), indexed) — Alembic migration `0007_product_barcode` применена на проде. Унифицирует EAN/GTIN/UPC в один canonical field. `ix_products_barcode` btree index для O(log n) lookup.
+- **Barcode extraction** в 2 из 3 scraper'ов:
+  - **aloe.py** — JSON-LD `gtin13`/`gtin14`/`gtin12`/`gtin8`/`gtin` priority order через shared helper `_extract_barcode_from_jsonld` в [src/scrapers/ai_crawler.py](src/scrapers/ai_crawler.py)
+  - **pharmonline.py** — JSON-LD первым, HTML table regex fallback (`Ştrix kod`, `Штрих-код`, `Barcode`, `EAN`, `GTIN` patterns)
+  - **aptekonline.py** — **SKIPPED**: listing JSON не содержит barcode, detail page удвоит Bright Data расходы. Когда нужно — отдельная batch-harvest job.
+- **Matcher v2 priority-0 pass** ([src/matcher.py](src/matcher.py)): группирует продукты по barcode → cluster cross-site → confidence=1.0. Skip name heuristics (modifier conflicts, series numbers — barcode trumps name). Respect `MatchRejection` + per-unit price sanity. Logged: `matcher_barcode_pass unique_barcodes=N clusters_created=M`.
+- **`scripts/rematch_with_barcode.py`** — bulk-break low-confidence (< 0.85, not `is_manual`) clusters когда their members disagree on barcode. Idempotent, dry-run by default, `--apply` коммитит и re-runs matcher для подбора новых pairs.
+- **persist_results** ([src/main.py](src/main.py)) — копирует `sp.barcode` в `Product`, never overwrites existing non-null value (защита от scrape runs которые временно не имеют field'а).
+- **26 unit tests**: 11 для barcode extraction, 7 для matcher barcode pass, 8 для rematch decision logic. Full suite: **386 pass**, 9 pre-existing failures без изменений.
+
+**Что отложено**: Phase 2.5 (UI suggestion queue для unmatched borderline cases) — отдельная frontend сессия.
+
 **Just finished (2026-05-27)**: **Phase 1 — scraper resilience**:
 
 - **Bright Data Web Unlocker** ($1.50/CPM) — zone `pharmacy_unlocker`, native proxy mode (`brd.superproxy.io:33335`). Allowed IP whitelist: 46.225.149.52 (prod). Phase 1.2 код в [src/scrapers/base.py](src/scrapers/base.py) (`_brightdata_proxy_for`) + [src/scrapers/aptekonline.py](src/scrapers/aptekonline.py) (`_brightdata_httpx_proxy_for`) подхватывает env `BRIGHTDATA_USERNAME/PASSWORD/SITES/HOST`.
@@ -224,8 +238,9 @@ SELECT COUNT(*) FROM products;
 [✓] i18n full   locale switcher в nav, AZ/EN fix (route /locale вместо /api/locale), 71 строка переведена, ROI actions переведены (2026-05-26)
 [✓] Phase 0     defuse time bombs: env-checkus, request_id, deep /health, cleanup tools (2026-05-27, commit af63932)
 [~] Phase 1     scraper resilience: BD Web Unlocker для aptekonline ✓, pharmonline даёт 502 от BD → остался на Mac. AI fallback wired (opt-in)
-[ ] Phase 2     matcher v2 с barcode/EAN (нужно ~3-5 дней)
-[ ] Next        Mac launchd для pharmonline, либо BD support escalation для pharmonline (низкий приоритет), либо Smartproxy POC
+[✓] Phase 2     matcher v2 с barcode (2.1-2.4): migration 0007, extraction в aloe+pharmonline, priority-0 pass, rematch script. UI 2.5 deferred.
+[ ] Phase 3     HA & backups: Postgres replica + B2 offsite backup
+[ ] Next        Phase 2.5 (UI suggestion queue), Phase 3, либо real-data barcode coverage analysis после нескольких daily scrape
 ```
 
 ### Out of scope (decided 2026-05-07 by client)
