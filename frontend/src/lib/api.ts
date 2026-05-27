@@ -122,6 +122,22 @@ export interface ComparisonRow {
   needs_review: boolean;
 }
 
+export interface PricingConfig {
+  raise_threshold_pct: number;
+  undercut_threshold_pct: number;
+  max_spread_pct: number;
+  min_margin_pct: number;
+  max_per_type: number;
+  updated_at?: string | null;
+}
+
+export interface CostImportResult {
+  rows_processed: number;
+  rows_imported: number;
+  rows_skipped: number;
+  errors: string[];
+}
+
 export interface MatchSuggestionProduct {
   product_id: number;
   site: string;
@@ -440,6 +456,28 @@ export const api = {
     if (params.limit) q.set("limit", String(params.limit));
     return request<ComparisonRow[]>(`/api/v1/dash/comparison?${q}`);
   },
+  // Phase 4 — Pricing config + cost CSV upload
+  pricingGet: () => request<PricingConfig>("/api/v1/dash/settings/pricing"),
+  pricingUpdate: (cfg: PricingConfig) =>
+    request<PricingConfig>("/api/v1/dash/settings/pricing", {
+      method: "PUT",
+      body: JSON.stringify(cfg),
+    }),
+  costsCsvImport: async (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${BASE}/api/v1/dash/settings/costs/import`, {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new ApiError(res.status, text || res.statusText);
+    }
+    return res.json() as Promise<CostImportResult>;
+  },
+
   matchSuggestions: (params: {
     confidence_max?: number;
     only_needs_review?: boolean;

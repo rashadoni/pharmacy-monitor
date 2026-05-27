@@ -462,3 +462,116 @@ def test_match_confirm_requires_auth(client, setup_db):
 def test_match_suggestions_requires_auth(client, setup_db):
     r = client.get("/api/v1/dash/matches/suggestions")
     assert r.status_code == 401
+
+
+# ─── Phase 4.1+4.3+4.6 — Pricing settings + cost CSV import ──────────────────
+
+
+def test_pricing_get_returns_defaults(client, tenant_user, setup_db):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/settings/pricing")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["raise_threshold_pct"] == 5.0
+    assert body["undercut_threshold_pct"] == 3.0
+    assert body["max_spread_pct"] == 80.0
+    assert body["min_margin_pct"] == 10.0
+    assert body["max_per_type"] == 10
+
+
+def test_pricing_put_updates_values(client, tenant_user, setup_db):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.put(
+        "/api/v1/dash/settings/pricing",
+        json={
+            "raise_threshold_pct": 7.5,
+            "undercut_threshold_pct": 2.0,
+            "max_spread_pct": 70.0,
+            "min_margin_pct": 15.0,
+            "max_per_type": 20,
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["raise_threshold_pct"] == 7.5
+    # GET should reflect new values
+    g = client.get("/api/v1/dash/settings/pricing").json()
+    assert g["min_margin_pct"] == 15.0
+
+
+def test_pricing_put_rejects_out_of_range(client, tenant_user, setup_db):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.put(
+        "/api/v1/dash/settings/pricing",
+        json={
+            "raise_threshold_pct": 150.0,  # > 100
+            "undercut_threshold_pct": 3.0,
+            "max_spread_pct": 80.0,
+            "min_margin_pct": 10.0,
+            "max_per_type": 10,
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_pricing_requires_auth(client):
+    r = client.get("/api/v1/dash/settings/pricing")
+    assert r.status_code == 401
+    r2 = client.put("/api/v1/dash/settings/pricing", json={})
+    assert r2.status_code == 401
+
+
+def test_cost_csv_import_rejects_missing_columns(client, tenant_user, setup_db):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    bad_csv = b"sku,name\nABC123,Foo\n"
+    r = client.post(
+        "/api/v1/dash/settings/costs/import",
+        files={"file": ("bad.csv", bad_csv, "text/csv")},
+    )
+    assert r.status_code == 400
+    assert "purchase_price" in r.text or "supplier_name" in r.text
+
+
+def test_cost_csv_import_imports_valid_rows(client, tenant_user, setup_db):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    # Setup: insert one product so CSV row matches by sku
+    p = storage.Product(
+        tenant_id=1, site="pharmonline", external_id="SKU-001",
+        url="http://x", name="Test", name_normalized="test",
+    )
+    s.add(p)
+    s.commit()
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    csv_body = (
+        b"sku,supplier_name,purchase_price,currency\n"
+        b"SKU-001,Vendor1,3.50,AZN\n"
+        b"NOT-FOUND,Vendor1,5.0,AZN\n"
+        b"SKU-001,,not_a_number,AZN\n"
+    )
+    r = client.post(
+        "/api/v1/dash/settings/costs/import",
+        files={"file": ("costs.csv", csv_body, "text/csv")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["rows_processed"] == 3
+    assert body["rows_imported"] == 1
+    assert body["rows_skipped"] == 2

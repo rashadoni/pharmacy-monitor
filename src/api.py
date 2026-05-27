@@ -60,7 +60,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 import structlog
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Header, Request, Response, status
+from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Header, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, func, select
@@ -2495,6 +2495,200 @@ def dash_match_reject(
     db.delete(match)
     db.commit()
     return Response(status_code=204)
+
+
+# ── Phase 4.1+4.3+4.6 (2026-05-27) — Pricing settings + cost CSV import ─────
+
+
+class PricingConfigOut(BaseModel):
+    raise_threshold_pct: float
+    undercut_threshold_pct: float
+    max_spread_pct: float
+    min_margin_pct: float
+    max_per_type: int
+    updated_at: datetime | None = None
+
+
+class PricingConfigIn(BaseModel):
+    raise_threshold_pct: float = Field(ge=0.0, le=100.0)
+    undercut_threshold_pct: float = Field(ge=0.0, le=100.0)
+    max_spread_pct: float = Field(ge=0.0, le=100.0)
+    min_margin_pct: float = Field(ge=0.0, le=100.0)
+    max_per_type: int = Field(ge=1, le=200)
+
+
+@app.get("/api/v1/dash/settings/pricing", response_model=PricingConfigOut)
+def dash_pricing_get(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Return current pricing config row для tenant (or default if missing)."""
+    cfg = storage.load_pricing_config(db, tenant_id=user.tenant_id)
+    db.commit()  # in case default row was just created
+    return PricingConfigOut(
+        raise_threshold_pct=cfg.raise_threshold_pct,
+        undercut_threshold_pct=cfg.undercut_threshold_pct,
+        max_spread_pct=cfg.max_spread_pct,
+        min_margin_pct=cfg.min_margin_pct,
+        max_per_type=cfg.max_per_type,
+        updated_at=cfg.updated_at,
+    )
+
+
+@app.put("/api/v1/dash/settings/pricing", response_model=PricingConfigOut)
+def dash_pricing_update(
+    payload: PricingConfigIn,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Update pricing thresholds. Invalidates ROI cache so next request re-computes."""
+    cfg = storage.load_pricing_config(db, tenant_id=user.tenant_id)
+    cfg.raise_threshold_pct = payload.raise_threshold_pct
+    cfg.undercut_threshold_pct = payload.undercut_threshold_pct
+    cfg.max_spread_pct = payload.max_spread_pct
+    cfg.min_margin_pct = payload.min_margin_pct
+    cfg.max_per_type = payload.max_per_type
+    cfg.updated_at = utcnow()
+    # Invalidate ROI cache so next /roi/actions re-computes with new thresholds.
+    db.query(storage.RoiActionsCache).filter(
+        storage.RoiActionsCache.tenant_id == user.tenant_id
+    ).delete()
+    db.commit()
+    log.info("pricing_config_updated", tenant_id=user.tenant_id, user_id=user.id)
+    return PricingConfigOut(
+        raise_threshold_pct=cfg.raise_threshold_pct,
+        undercut_threshold_pct=cfg.undercut_threshold_pct,
+        max_spread_pct=cfg.max_spread_pct,
+        min_margin_pct=cfg.min_margin_pct,
+        max_per_type=cfg.max_per_type,
+        updated_at=cfg.updated_at,
+    )
+
+
+class CostImportResult(BaseModel):
+    rows_processed: int
+    rows_imported: int
+    rows_skipped: int
+    errors: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/v1/dash/settings/costs/import", response_model=CostImportResult)
+async def dash_cost_csv_import(
+    file: UploadFile = File(...),
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Import purchase prices from CSV.
+
+    Expected columns (header required):
+      sku, supplier_name, purchase_price, currency, name
+
+    `sku` matches Product.external_id. `supplier_name` is free-form (used as
+    SupplierPrice.supplier). `purchase_price` is float in AZN. `currency`
+    defaults to "AZN" if missing. `name` is optional (logged for human review).
+
+    Idempotent: existing (product_id, supplier) pair updated, others inserted.
+    """
+    import csv
+    import io
+
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")  # strip BOM
+    except UnicodeDecodeError:
+        raise HTTPException(400, "File is not UTF-8 encoded")
+    reader = csv.DictReader(io.StringIO(text))
+
+    required_cols = {"sku", "supplier_name", "purchase_price"}
+    actual_cols = set(reader.fieldnames or [])
+    missing = required_cols - actual_cols
+    if missing:
+        raise HTTPException(
+            400,
+            f"Missing required columns: {sorted(missing)}. "
+            f"Got: {sorted(actual_cols)}",
+        )
+
+    rows_processed = 0
+    rows_imported = 0
+    rows_skipped = 0
+    errors: list[str] = []
+
+    # Build sku → Product map for tenant (one query, not N+1).
+    products_by_sku: dict[str, storage.Product] = {
+        p.external_id: p for p in db.scalars(
+            select(storage.Product).where(storage.Product.tenant_id == user.tenant_id)
+        ).all()
+    }
+
+    for line_num, row in enumerate(reader, start=2):  # line 1 = header
+        rows_processed += 1
+        sku = (row.get("sku") or "").strip()
+        if not sku:
+            errors.append(f"line {line_num}: empty sku")
+            rows_skipped += 1
+            continue
+        product = products_by_sku.get(sku)
+        if product is None:
+            errors.append(f"line {line_num}: sku={sku!r} not found in products")
+            rows_skipped += 1
+            continue
+        try:
+            price = float((row.get("purchase_price") or "").strip())
+        except (ValueError, TypeError):
+            errors.append(f"line {line_num}: invalid purchase_price {row.get('purchase_price')!r}")
+            rows_skipped += 1
+            continue
+        if price <= 0:
+            errors.append(f"line {line_num}: purchase_price must be > 0")
+            rows_skipped += 1
+            continue
+        supplier = (row.get("supplier_name") or "default").strip() or "default"
+        currency = (row.get("currency") or "AZN").strip() or "AZN"
+        # Upsert (product_id, supplier_name) row.
+        existing = db.scalar(
+            select(storage.SupplierPrice).where(
+                storage.SupplierPrice.product_id == product.id,
+                storage.SupplierPrice.supplier_name == supplier,
+            )
+        )
+        if existing:
+            existing.purchase_price = price
+            existing.currency = currency
+            existing.source = "dashboard_csv"
+            existing.updated_at = utcnow()
+        else:
+            db.add(storage.SupplierPrice(
+                product_id=product.id,
+                sku=sku,
+                supplier_name=supplier,
+                purchase_price=price,
+                currency=currency,
+                source="dashboard_csv",
+                updated_at=utcnow(),
+            ))
+        rows_imported += 1
+
+    db.commit()
+    # Drop ROI cache so margin-aware logic picks up new costs immediately.
+    db.query(storage.RoiActionsCache).filter(
+        storage.RoiActionsCache.tenant_id == user.tenant_id
+    ).delete()
+    db.commit()
+    log.info(
+        "cost_csv_imported",
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        rows_imported=rows_imported,
+        rows_skipped=rows_skipped,
+    )
+    # Cap errors list to first 20 for response size sanity.
+    return CostImportResult(
+        rows_processed=rows_processed,
+        rows_imported=rows_imported,
+        rows_skipped=rows_skipped,
+        errors=errors[:20],
+    )
 
 
 # ─── Manual aloe-matcher endpoints ───────────────────────────────────────────

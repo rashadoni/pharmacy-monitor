@@ -3,7 +3,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
-import { Bell, CheckCircle2, Globe, Key, LogOut, MessageCircle, Send, User, XCircle, Zap } from "lucide-react";
+import Link from "next/link";
+import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, MessageCircle, Send, User, XCircle, Zap } from "lucide-react";
 import { useState } from "react";
 import { api, type NotifPrefs } from "@/lib/api";
 import { LocaleSwitcher } from "@/components/locale-switcher";
@@ -46,6 +47,20 @@ export default function SettingsPage() {
       <ChangePasswordSection />
 
       <IntegrationsStatusSection />
+
+      {/* Phase 4.6 — link to pricing settings sub-page */}
+      <Section title={t("pricing_section_title")} icon={DollarSign}>
+        <Link
+          href="/settings/pricing"
+          className="flex items-center justify-between rounded-md border border-border p-3 hover:bg-secondary/50 transition-colors group"
+        >
+          <div>
+            <div className="font-medium text-sm">{t("pricing_link_label")}</div>
+            <div className="text-xs text-muted-foreground mt-0.5">{t("pricing_link_hint")}</div>
+          </div>
+          <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground" />
+        </Link>
+      </Section>
 
       <Section title={t("language")} icon={Globe}>
         <LocaleSwitcher />

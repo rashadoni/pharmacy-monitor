@@ -33,6 +33,7 @@ dependencies = [
     "openai>=1.50",             # AI crawler — default LLM provider
     "anthropic>=0.40",          # AI crawler — alternative provider
     "websockets>=13.0",         # Meteor DDP scraper для pharmonline (Phase 1c)
+    "python-multipart>=0.0.20", # FastAPI File/UploadFile (Phase 4.3 CSV import)
 ]
 
 [dependency-groups]

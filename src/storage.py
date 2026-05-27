@@ -393,6 +393,54 @@ class RoiActionsCache(Base):
     )
 
 
+class PricingConfig(Base):
+    """Per-tenant configurable ROI thresholds (Phase 4.1, 2026-05-27).
+
+    Was: hardcoded `raise_threshold_pct=5.0`, `undercut_threshold_pct=3.0`,
+         `max_spread_pct=80.0` в compute_actions(). Меняешь — нужен deploy.
+    Now: загружается из DB через `load_pricing_config(session, tenant_id)`.
+         Defaults на створении row = старые hardcoded values (back-compat).
+
+    Поля:
+      - raise_threshold_pct (%): минимальная разница чтобы советовать поднять
+      - undercut_threshold_pct (%): минимальная просадка чтобы алерт «конкурент дешевле»
+      - max_spread_pct (%): скрываем матчи с большим спредом (вероятно bad match)
+      - min_margin_pct (%): не предлагать undercut если маржа после < этого
+      - max_per_type: top-N действий на тип
+
+    Один row per tenant. Создаётся при первом запросе с дефолтами.
+    """
+
+    __tablename__ = "pricing_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(
+        Integer, default=1, index=True, unique=True,
+    )
+    raise_threshold_pct: Mapped[float] = mapped_column(Float, default=5.0)
+    undercut_threshold_pct: Mapped[float] = mapped_column(Float, default=3.0)
+    max_spread_pct: Mapped[float] = mapped_column(Float, default=80.0)
+    min_margin_pct: Mapped[float] = mapped_column(Float, default=10.0)
+    max_per_type: Mapped[int] = mapped_column(Integer, default=10)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow,
+    )
+
+
+def load_pricing_config(session, tenant_id: int = 1) -> "PricingConfig":
+    """Get-or-create config row для tenant. Returns mutable ORM instance."""
+    from sqlalchemy import select as _select
+    cfg = session.scalar(
+        _select(PricingConfig).where(PricingConfig.tenant_id == tenant_id)
+    )
+    if cfg is None:
+        cfg = PricingConfig(tenant_id=tenant_id)
+        session.add(cfg)
+        session.flush()
+    return cfg
+
+
 class TrackedProduct(Base):
     """Конкретные SKU из watchlist клиента. Каждая запись — товар, который надо отслеживать.
 

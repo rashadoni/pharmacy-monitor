@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from src._time import utcnow
 
+from src import storage  # for load_pricing_config + RoiActionsCache
 from src.storage import (
     Match,
     PriceSnapshot,
@@ -47,6 +48,12 @@ log = structlog.get_logger()
 CLIENT_SITE = "pharmonline"
 COMPETITOR_SITES = ("aptekonline", "aloe")
 ALL_SITES = (CLIENT_SITE, *COMPETITOR_SITES)
+
+# Phase 4.1 (2026-05-27): set by compute_actions() from PricingConfig, read by
+# _undercut_threats. Module-level for the same reason CLIENT_SITE is module-level
+# (avoids threading through every sub-function signature). Thread-unsafe across
+# parallel compute_actions calls — but those are serial in our codebase.
+_CURRENT_MIN_MARGIN_PCT: float = 10.0
 
 ActionType = Literal[
     "price_raise",
@@ -239,10 +246,12 @@ def compute_actions(
     session: Session,
     *,
     client_site: str | None = None,
-    raise_threshold_pct: float = 5.0,  # минимальная разница чтобы советовать поднять
-    undercut_threshold_pct: float = 3.0,  # минимальная просадка чтобы алерт
-    max_spread_pct: float = 80.0,  # выше этого считаем bad-match и скрываем
-    max_per_type: int = 10,
+    tenant_id: int = 1,
+    raise_threshold_pct: float | None = None,
+    undercut_threshold_pct: float | None = None,
+    max_spread_pct: float | None = None,
+    max_per_type: int | None = None,
+    min_margin_pct: float | None = None,
 ) -> list[ActionItem]:
     """Главная точка: собрать все действия, отсортировать по spread desc.
 
@@ -252,10 +261,28 @@ def compute_actions(
     module-level constants (thread-unsafe — but compute_actions сейчас зовётся
     только серийно: либо из API request, либо из refresh_all_cached_actions цикла).
 
+    Phase 4.1 (2026-05-27): thresholds теперь грузятся из `pricing_config` table
+    через `storage.load_pricing_config(session, tenant_id)`. Explicit kwarg
+    overrides DB value. None → use DB. Используем кэш-row для соответствующего
+    tenant; первый запрос создаёт row с дефолтами (5/3/80/10/10).
+
     Сортируем по |spread_pct| desc — самые большие разрывы вверху. Не по
     «месячному impact'у» потому что объёмы продаж нам неизвестны (см.
     module docstring).
     """
+    # Load per-tenant config (creates default row if missing).
+    cfg = storage.load_pricing_config(session, tenant_id)
+    # Apply explicit overrides (kwargs win over DB).
+    raise_pct = raise_threshold_pct if raise_threshold_pct is not None else cfg.raise_threshold_pct
+    undercut_pct = undercut_threshold_pct if undercut_threshold_pct is not None else cfg.undercut_threshold_pct
+    max_spread = max_spread_pct if max_spread_pct is not None else cfg.max_spread_pct
+    per_type = max_per_type if max_per_type is not None else cfg.max_per_type
+    # Stash min_margin_pct on the module for _undercut_threats to pick up.
+    # (Avoids changing every sub-function signature.)
+    min_margin = min_margin_pct if min_margin_pct is not None else cfg.min_margin_pct
+    global _CURRENT_MIN_MARGIN_PCT
+    _CURRENT_MIN_MARGIN_PCT = min_margin
+
     global CLIENT_SITE, COMPETITOR_SITES
     orig_client = CLIENT_SITE
     orig_competitors = COMPETITOR_SITES
@@ -267,13 +294,13 @@ def compute_actions(
     try:
         actions: list[ActionItem] = []
         actions += _price_raise_opportunities(
-            session, raise_threshold_pct, max_spread_pct, max_per_type
+            session, raise_pct, max_spread, per_type
         )
         actions += _undercut_threats(
-            session, undercut_threshold_pct, max_spread_pct, max_per_type
+            session, undercut_pct, max_spread, per_type
         )
-        actions += _assortment_gaps(session, max_per_type)
-        actions += _promo_responses(session, max_per_type)
+        actions += _assortment_gaps(session, per_type)
+        actions += _promo_responses(session, per_type)
     finally:
         # Always restore — even on exception.
         CLIENT_SITE = orig_client
@@ -446,10 +473,14 @@ def _undercut_threats(
                         f" ⚠️ Целевая цена {target:.2f} ₼ ниже закупки {purchase:.2f} ₼ — "
                         f"продажа в убыток. Лучше держать текущую и принять потерю объёма."
                     )
-                elif (target - purchase) / target < 0.10:
-                    margin_warning = (
-                        f" ⚠️ Маржа после снижения < 10% (закупка {purchase:.2f} ₼)."
-                    )
+                else:
+                    # Phase 4.1: configurable min_margin_pct (was hardcoded 10%)
+                    margin_threshold = _CURRENT_MIN_MARGIN_PCT / 100.0
+                    if (target - purchase) / target < margin_threshold:
+                        margin_warning = (
+                            f" ⚠️ Маржа после снижения < {_CURRENT_MIN_MARGIN_PCT:.0f}% "
+                            f"(закупка {purchase:.2f} ₼)."
+                        )
 
         out.append(ActionItem(
             type="undercut",
