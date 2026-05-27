@@ -1,0 +1,28 @@
+[Unit]
+Description=Pharmacy Monitor — intraday category rotation (Phase 5.1 Вариант C)
+Documentation=https://github.com/rashadrahimov/pharmacy-monitor
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pm
+Group=pm
+WorkingDirectory=/opt/pharmacy-monitor
+EnvironmentFile=/etc/pharmacy-monitor/env
+ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor intraday-tick
+
+# Phase 5.1: Один tick = одна категория. Обычно < 5 минут. Macro-safety 20 мин.
+TimeoutStartSec=1200
+
+# Stdout/err → journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pharmacy-monitor-intraday
+
+# Resource hardening — intraday не должен сожрать всё CPU при обычном tick.
+CPUQuota=200%
+MemoryMax=1500M
+
+[Install]
+WantedBy=multi-user.target

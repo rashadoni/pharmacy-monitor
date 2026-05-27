@@ -1,0 +1,22 @@
+[Unit]
+Description=Hourly trigger for intraday category rotation (Phase 5.1 Вариант C)
+Documentation=https://github.com/rashadrahimov/pharmacy-monitor
+
+[Timer]
+# Business hours: 05:00-17:00 UTC = 09:00-21:00 Asia/Baku.
+# 13 ticks/day, по 1 категории на tick. Сайты круглят round-robin
+# (см. src/intraday.py — INTRADAY_SITES) с rate-limit 2ч/site.
+#
+# OnCalendar format: hh:mm:ss. Список конкретных часов даёт детерминированное
+# расписание; в сравнении с OnUnitActiveSec нет накопления skew'а.
+OnCalendar=*-*-* 05,06,07,08,09,10,11,12,13,14,15,16,17:00:00
+
+# Persistent=true → если timer пропустил tick (host down/reboot), запустит
+# при следующей возможности. Для intraday это OK — лучше отложенный tick чем
+# пропущенный.
+Persistent=true
+
+Unit=pharmacy-monitor-intraday.service
+
+[Install]
+WantedBy=timers.target

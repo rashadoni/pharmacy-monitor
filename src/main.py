@@ -1738,6 +1738,71 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...]) -> None:
             raise click.ClickException(str(e))
 
 
+@cli.command("intraday-tick")
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Только показать (site, category), которые бы взяли — без скрейпа.",
+)
+def intraday_tick_cmd(dry_run: bool) -> None:
+    """Phase 5.1 (Вариант C) — supplemental hourly scrape of ONE category on ONE site.
+
+    Каждый вызов:
+      1. Берёт top-30 volatile категорий (по count(price_snapshots) за 7 дней)
+      2. Через Redis-rotation index выбирает следующую категорию
+      3. Round-robin'ит сайт (pharmonline → aloe) с per-site rate-limit 2ч
+      4. Запускает `pharmacy-monitor run --site X --mode category --category-id N --no-alerts`
+
+    Запускается из systemd timer ежечасно во время business hours (05-17 UTC).
+    No-alerts чтобы не дублировать notifications с full nightly run.
+
+    Skip-conditions (silent no-op, exit 0):
+      - Redis недоступен → можем работать без rate-limit, продолжаем
+      - 0 volatile categories (новый деплой, мало данных) → skip
+      - Все sites locked (последний intraday на каждом < 2ч назад) → skip
+
+    Failures (exit 1):
+      - Сам scrape упал (network, proxy и т.п.) — поднимаем error чтобы systemd
+        пометил unit failed и алерт сработал.
+    """
+    from src import intraday
+
+    storage.init_db()
+    Session = storage.make_session()
+
+    with Session() as session:
+        # dry_run → preview mode (без INCR rotation idx и без SETNX lock'а).
+        target = intraday.pick_next_scrape_target(session, commit_state=not dry_run)
+        if target is None:
+            click.echo("intraday-tick: skipped (no volatile categories or all sites locked)")
+            return
+
+        site, cat = target
+        click.echo(
+            f"intraday-tick: site={site} category_id={cat.id} key={cat.key} "
+            f"label={cat.label_ru!r}"
+        )
+
+        if dry_run:
+            click.echo("--dry-run: skipping actual scrape (no state mutation)")
+            return
+
+    # Run в новой сессии — отдельная transaction, как делает обычный run_cmd.
+    # Вызываем тот же путь что и `pharmacy-monitor run`, но программно
+    # (не через subprocess — медленно, теряем context).
+    ctx = click.get_current_context()
+    ctx.invoke(
+        run_cmd,
+        dry_run=False,
+        limit=None,
+        site=(site,),
+        mode="category",
+        category_id=cat.id,
+        hourly=False,
+        no_alerts=True,  # Phase 5.1 — supplemental, без дубликат-alerts
+        request_id=None,
+    )
+
+
 @cli.command("rematch")
 @click.option("--reset", is_flag=True, default=False,
               help="Очистить все авто-матчи (canonical_id) перед пересчётом")
