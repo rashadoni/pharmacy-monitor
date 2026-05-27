@@ -331,3 +331,133 @@ def test_refresh_all_cached_actions_covers_three_sites(db_session):
     rows = db_session.query(RoiActionsCache).all()
     assert {r.client_site for r in rows} == {"pharmonline", "aptekonline", "aloe"}
     assert all(r.run_id == 99 for r in rows)
+
+
+# ─── Phase 4.5: MAP violations ────────────────────────────────────────────────
+
+
+def _add_product_with_brand(s, site, name, brand, ext_id, canonical_id=None):
+    p = Product(
+        site=site,
+        external_id=ext_id,
+        url=f"http://{site}.az/p/{ext_id}",
+        name=name,
+        name_normalized=name.lower(),
+        brand=brand,
+        canonical_id=canonical_id,
+    )
+    s.add(p)
+    s.flush()
+    return p
+
+
+def _add_brand_snapshots(s, run, products_with_prices):
+    """Adds N snapshots for product-price pairs."""
+    for product, price in products_with_prices:
+        s.add(PriceSnapshot(
+            run_id=run.id, product_id=product.id, price=price
+        ))
+    s.flush()
+
+
+def test_map_violation_detected_when_client_below_brand_floor(db_session):
+    """Client цена < brand floor у конкурентов → map_violation flagged."""
+    # Конкуренты держат бренд Bayer на уровне 10.00+ ₼ (3 snapshots для валидности)
+    apt = _add_product_with_brand(db_session, "aptekonline", "Aspirin Bayer 100", "Bayer", "apt-1")
+    aloe = _add_product_with_brand(db_session, "aloe", "Aspirin Bayer 100", "Bayer", "aloe-1")
+    r = _make_run(db_session, [(apt, 10.50), (aloe, 11.00)])
+    # Добавим ещё один snapshot для floor-min (3 семпла минимум)
+    db_session.add(PriceSnapshot(run_id=r.id, product_id=apt.id, price=10.00))
+    db_session.flush()
+
+    # Client (pharmonline) — 7.00 ₼ — это 30% ниже floor 10.00
+    client = _add_product_with_brand(db_session, "pharmonline", "Aspirin Bayer 100", "Bayer", "ph-1")
+    db_session.add(PriceSnapshot(run_id=r.id, product_id=client.id, price=7.00))
+    db_session.commit()
+
+    actions = roi.compute_actions(db_session)
+    map_actions = [a for a in actions if a.type == "map_violation"]
+    assert len(map_actions) == 1, f"ожидали 1 map_violation, получили: {[a.type for a in actions]}"
+    a = map_actions[0]
+    assert a.severity == "critical", f"gap 30% >= 20% → critical, got {a.severity}"
+    assert a.product_name == "Aspirin Bayer 100"
+    assert a.current_value_azn == 7.00
+    assert a.target_value_azn is not None and a.target_value_azn < 10.00
+
+
+def test_map_violation_severity_buckets(db_session):
+    """Three buckets: critical >= 20%, warning >= 10%, info >= 5%."""
+    r = _shared_run(db_session)
+    # Three brands with floor 10.00, three client products at different gaps
+    for i, (brand, client_price, expected_sev) in enumerate([
+        ("BrandA", 7.50,  "critical"),  # 25% below
+        ("BrandB", 8.80,  "warning"),   # 12% below
+        ("BrandC", 9.50,  "info"),      # 5% below
+    ]):
+        comp_a = _add_product_with_brand(db_session, "aptekonline", f"P{i}-{brand}", brand, f"a{i}")
+        comp_b = _add_product_with_brand(db_session, "aloe",        f"P{i}-{brand}", brand, f"b{i}")
+        client = _add_product_with_brand(db_session, "pharmonline", f"P{i}-{brand}", brand, f"c{i}")
+        # 3 snapshots — нужны для валидного floor (n >= 3 в _map_violations)
+        for p, price in [(comp_a, 10.00), (comp_b, 10.50), (comp_a, 11.00), (client, client_price)]:
+            db_session.add(PriceSnapshot(run_id=r.id, product_id=p.id, price=price))
+        db_session.flush()
+    db_session.commit()
+
+    actions = roi.compute_actions(db_session)
+    by_brand = {(a.extra or {}).get("brand"): a.severity for a in actions if a.type == "map_violation"}
+    assert by_brand.get("BrandA") == "critical", f"got: {by_brand}"
+    assert by_brand.get("BrandB") == "warning", f"got: {by_brand}"
+    assert by_brand.get("BrandC") == "info", f"got: {by_brand}"
+
+
+def test_map_violation_skipped_when_client_above_floor(db_session):
+    """Client >= floor → нет нарушения (это price_raise зона)."""
+    apt = _add_product_with_brand(db_session, "aptekonline", "X", "BrandX", "a1")
+    client = _add_product_with_brand(db_session, "pharmonline", "X", "BrandX", "c1")
+    r = _make_run(db_session, [
+        (apt, 5.00), (apt, 5.20), (apt, 5.50),  # floor = 5.00
+        (client, 6.00),  # выше floor — НЕ нарушение
+    ])
+    db_session.commit()
+
+    actions = roi.compute_actions(db_session)
+    assert not any(a.type == "map_violation" for a in actions)
+
+
+def test_map_violation_skipped_when_insufficient_samples(db_session):
+    """Меньше 3 snapshot-семплов для бренда — floor не статистически валиден."""
+    apt = _add_product_with_brand(db_session, "aptekonline", "X", "RareBrand", "a1")
+    client = _add_product_with_brand(db_session, "pharmonline", "X", "RareBrand", "c1")
+    r = _make_run(db_session, [
+        (apt, 10.00),  # только 1 семпл бренда у конкурентов
+        (client, 5.00),  # 50% gap, но floor невалидный
+    ])
+    db_session.commit()
+
+    actions = roi.compute_actions(db_session)
+    assert not any(a.type == "map_violation" for a in actions)
+
+
+def test_map_violation_translation_az_en(db_session):
+    """translate_action заменяет title/detail для az/en на map_violation."""
+    apt = _add_product_with_brand(db_session, "aptekonline", "Z", "TestBrand", "a1")
+    client = _add_product_with_brand(db_session, "pharmonline", "Z", "TestBrand", "c1")
+    r = _make_run(db_session, [
+        (apt, 10.00), (apt, 11.00), (apt, 10.50),  # 3 семпла, floor = 10
+        (client, 7.00),  # 30% gap → critical
+    ])
+    db_session.commit()
+
+    actions = roi.compute_actions(db_session)
+    map_actions = [a for a in actions if a.type == "map_violation"]
+    assert len(map_actions) == 1
+
+    # сериализуем как делает кэш
+    raw = roi._action_to_dict(map_actions[0])
+    az = roi.translate_action(raw, "az")
+    assert "TestBrand" in az["title"] and "qaldırın" in az["title"]
+    assert "rəqib floor" in az["detail"].lower() or "floor" in az["detail"].lower()
+
+    en = roi.translate_action(raw, "en")
+    assert "raise" in en["title"].lower() and "TestBrand" in en["title"]
+    assert "competitor floor" in en["detail"].lower()

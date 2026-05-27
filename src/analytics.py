@@ -72,7 +72,7 @@ def brand_share(
     for brand, site_name, n in rows:
         if not brand or is_brand_blacklisted(brand):
             continue
-        by_brand[brand][site] = n
+        by_brand[brand][site_name] = n
 
     out: list[BrandRow] = []
     for brand, counts in by_brand.items():

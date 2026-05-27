@@ -60,7 +60,16 @@ ActionType = Literal[
     "undercut",
     "assortment_gap",
     "promo_response",
+    "map_violation",
 ]
+
+# Phase 4.5 (2026-05-27): MAP-violation thresholds (% gap to brand-floor).
+# Brand-floor = min observed competitor price for that brand over last N days.
+# Если клиент дешевле floor больше чем на X% — флагуем (можно поднять цену).
+_MAP_FLOOR_WINDOW_DAYS = 30
+_MAP_MIN_GAP_PCT = 5.0       # ниже — не флагуем (внутри обычного шума)
+_MAP_WARNING_GAP_PCT = 10.0  # выше — severity = "warning"
+_MAP_CRITICAL_GAP_PCT = 20.0 # выше — severity = "critical"
 
 
 @dataclass
@@ -300,6 +309,7 @@ def compute_actions(
             session, undercut_pct, max_spread, per_type
         )
         actions += _assortment_gaps(session, per_type)
+        actions += _map_violations(session, per_type)
         actions += _promo_responses(session, per_type)
     finally:
         # Always restore — even on exception.
@@ -556,6 +566,127 @@ def _assortment_gaps(session: Session, max_n: int) -> list[ActionItem]:
     return out
 
 
+def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
+    """Phase 4.5: Detect client products priced below brand-floor.
+
+    Brand-floor = min observed competitor price for that brand over last
+    `_MAP_FLOOR_WINDOW_DAYS` days. If client's current price is below this
+    floor by more than `_MAP_MIN_GAP_PCT`, flag it.
+
+    This is an OPPORTUNITY to raise price: вся конкуренция держит флор выше,
+    значит клиент может поднять без потери конкурентоспособности и оставить
+    себе margin. Отличается от `_price_raise_opportunities` тем, что:
+      - smоtrит на BRAND-уровне через ВСЕ продукты бренда, не один матч
+      - использует 30-дневное окно, не текущий snapshot (стабильнее)
+      - не требует point-to-point matched pair (есть бренд → есть signal)
+
+    Severity buckets:
+      - critical: gap >= _MAP_CRITICAL_GAP_PCT (20%)
+      - warning:  gap >= _MAP_WARNING_GAP_PCT  (10%)
+      - info:     gap >= _MAP_MIN_GAP_PCT       (5%)
+    """
+    from sqlalchemy import func
+
+    from src.storage import latest_snapshots_per_product
+
+    floor_window_start = utcnow() - timedelta(days=_MAP_FLOOR_WINDOW_DAYS)
+
+    # Step 1: brand-floor per brand, computed across competitor snapshots over window.
+    # Используем discount_price если есть (как effective price), иначе price.
+    effective_price = func.coalesce(PriceSnapshot.discount_price, PriceSnapshot.price)
+    rows = session.execute(
+        select(
+            Product.brand,
+            func.min(effective_price).label("floor"),
+            func.count(PriceSnapshot.id).label("samples"),
+        )
+        .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
+        .where(
+            Product.site.in_(COMPETITOR_SITES),
+            Product.brand.is_not(None),
+            PriceSnapshot.captured_at >= floor_window_start,
+            effective_price.is_not(None),
+            effective_price > 0,
+        )
+        .group_by(Product.brand)
+    ).all()
+
+    # Минимум 3 snapshot-семпла per бренд чтобы floor был статистически валиден.
+    # Иначе одна цена-аномалия может дать ложный floor.
+    brand_floors: dict[str, float] = {
+        b: float(f) for b, f, n in rows if f is not None and n >= 3
+    }
+
+    if not brand_floors:
+        return []
+
+    # Step 2: client products в тех же брендах + их current effective price.
+    client_products = session.scalars(
+        select(Product).where(
+            Product.site == CLIENT_SITE,
+            Product.brand.in_(list(brand_floors.keys())),
+        )
+    ).all()
+    if not client_products:
+        return []
+
+    client_pids = [p.id for p in client_products]
+    snaps_by_pid = latest_snapshots_per_product(session, client_pids)
+
+    map_violations: list[ActionItem] = []
+    for p in client_products:
+        snap = snaps_by_pid.get(p.id)
+        if snap is None:
+            continue
+        client_price = snap.discount_price or snap.price
+        if client_price is None or client_price <= 0:
+            continue
+
+        floor = brand_floors.get(p.brand or "")
+        if floor is None or floor <= 0:
+            continue
+
+        # Только если клиент ДЕШЕВЛЕ floor (потенциал поднять).
+        if client_price >= floor:
+            continue
+
+        gap_pct = (floor - client_price) / floor * 100.0
+        if gap_pct < _MAP_MIN_GAP_PCT:
+            continue
+
+        if gap_pct >= _MAP_CRITICAL_GAP_PCT:
+            sev = "critical"
+        elif gap_pct >= _MAP_WARNING_GAP_PCT:
+            sev = "warning"
+        else:
+            sev = "info"
+
+        target = round(floor * 0.99, 2)  # чуть-чуть ниже floor → всё ещё cheapest
+        unit_gap = round(target - float(client_price), 2)
+
+        map_violations.append(ActionItem(
+            type="map_violation",
+            severity=sev,
+            title=f"MAP: {p.brand} — поднять {p.name}",
+            detail=(
+                f"Floor конкурентов по бренду {p.brand} за {_MAP_FLOOR_WINDOW_DAYS}д = "
+                f"{floor:.2f} ₼. Ты — {client_price:.2f} ₼ (−{gap_pct:.1f}%). "
+                f"Подними до {target:.2f} ₼ — останешься самым дешёвым, +{unit_gap:.2f} ₼/ед."
+            ),
+            product_name=p.name,
+            product_url=p.url,
+            current_value_azn=float(client_price),
+            target_value_azn=target,
+            unit_gap_azn=unit_gap,
+            spread_pct=gap_pct,
+            extra={"brand": p.brand, "floor_window_days": _MAP_FLOOR_WINDOW_DAYS},
+        ))
+
+    # Sort by gap_pct desc — самые большие violations вверху.
+    map_violations.sort(key=lambda a: -(a.spread_pct or 0))
+    return map_violations[:max_n]
+
+
 def _promo_responses(session: Session, max_n: int) -> list[ActionItem]:
     """Активные промо у конкурентов — могут потребовать ответа."""
     run_id = _latest_run_id(session)
@@ -657,6 +788,10 @@ _STRINGS: dict[str, dict[str, dict[str, str]]] = {
             "title": "Промо у {site}: {promo}",
             "detail": "Конкурент {site} запустил акцию. Проверь, не задевает ли твои топ-категории.",
         },
+        "map_violation": {
+            "title": "MAP: {brand} — поднять {name}",
+            "detail": "Floor конкурентов по бренду {brand} за {days}д = {target:.2f} ₼. Ты — {client:.2f} ₼ (−{pct:.1f}%). Подними до {target:.2f} ₼ — останешься самым дешёвым, +{delta:.2f} ₼/ед.",
+        },
     },
     "az": {
         "undercut": {
@@ -675,6 +810,10 @@ _STRINGS: dict[str, dict[str, dict[str, str]]] = {
             "title": "{site}-da aksiya: {promo}",
             "detail": "Rəqib {site} aksiya başlatdı. Əsas kateqoriyalarınıza təsir edib-etmədiyini yoxlayın.",
         },
+        "map_violation": {
+            "title": "MAP: {brand} — {name} qaldırın",
+            "detail": "{brand} brendi üçün rəqib floor-u ({days} gün) = {target:.2f} ₼. Siz — {client:.2f} ₼ (−{pct:.1f}%). {target:.2f} ₼-ə qaldırın — ən ucuz qalacaqsınız, +{delta:.2f} ₼/vahid.",
+        },
     },
     "en": {
         "undercut": {
@@ -692,6 +831,10 @@ _STRINGS: dict[str, dict[str, dict[str, str]]] = {
         "promo_response": {
             "title": "Promo at {site}: {promo}",
             "detail": "Competitor {site} launched a promotion. Check if it affects your top categories.",
+        },
+        "map_violation": {
+            "title": "MAP: {brand} — raise {name}",
+            "detail": "Competitor floor for brand {brand} over {days}d = {target:.2f} ₼. You — {client:.2f} ₼ (−{pct:.1f}%). Raise to {target:.2f} ₼ — stay cheapest and gain +{delta:.2f} ₼/unit.",
         },
     },
 }
@@ -740,6 +883,15 @@ def translate_action(action: dict, locale: str) -> dict:
             promo = raw_title.split(": ", 1)[1] if ": " in raw_title else raw_title
             title = tmpl["title"].format(site=site, promo=promo)
             detail = tmpl["detail"].format(site=site)
+        elif action_type == "map_violation":
+            extra = action.get("extra") or {}
+            brand = extra.get("brand") or ""
+            days = int(extra.get("floor_window_days") or _MAP_FLOOR_WINDOW_DAYS)
+            title = tmpl["title"].format(brand=brand, name=name)
+            detail = tmpl["detail"].format(
+                brand=brand, days=days, target=target, client=current,
+                pct=pct, delta=abs(delta),
+            )
         else:
             return action
     except (KeyError, ValueError):
