@@ -122,6 +122,28 @@ export interface ComparisonRow {
   needs_review: boolean;
 }
 
+export interface MatchSuggestionProduct {
+  product_id: number;
+  site: string;
+  name: string;
+  url: string;
+  price: number | null;
+  brand: string | null;
+  pack_size: string | null;
+  dosage: string | null;
+  image_url: string | null;
+  barcode: string | null;
+}
+
+export interface MatchSuggestion {
+  match_id: number;
+  canonical_name: string;
+  confidence: number;
+  needs_review: boolean;
+  spread_pct: number | null;
+  products: MatchSuggestionProduct[];
+}
+
 export interface RoiAction {
   type: string;
   severity: "info" | "opportunity" | "warning" | "critical";
@@ -399,6 +421,24 @@ export const api = {
     if (params.limit) q.set("limit", String(params.limit));
     return request<ComparisonRow[]>(`/api/v1/dash/comparison?${q}`);
   },
+  matchSuggestions: (params: {
+    confidence_max?: number;
+    only_needs_review?: boolean;
+    limit?: number;
+  } = {}) => {
+    const q = new URLSearchParams();
+    if (params.confidence_max != null) q.set("confidence_max", String(params.confidence_max));
+    if (params.only_needs_review) q.set("only_needs_review", "true");
+    if (params.limit != null) q.set("limit", String(params.limit));
+    const qs = q.toString();
+    return request<MatchSuggestion[]>(
+      `/api/v1/dash/matches/suggestions${qs ? `?${qs}` : ""}`,
+    );
+  },
+  matchConfirm: (matchId: number) =>
+    request<void>(`/api/v1/dash/matches/${matchId}/confirm`, { method: "POST" }),
+  matchReject: (matchId: number) =>
+    request<void>(`/api/v1/dash/matches/${matchId}/reject`, { method: "POST" }),
   roiActions: (client_site?: string, locale?: string) => {
     const q = new URLSearchParams();
     if (client_site) q.set("client_site", client_site);

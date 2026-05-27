@@ -7,6 +7,7 @@
     "analytics": "Analitika",
     "alerts": "Bildirişlər",
     "watchlist": "İzləmə",
+    "matches_review": "Uyğunlaşma yoxlaması",
     "categories": "Kateqoriyalar",
     "settings": "Tənzimləmələr",
     "section_overview": "İcmal",
@@ -360,5 +361,22 @@
     "configure": "Tənzimlə →",
     "hide_aria": "Xatırlatmanı gizlət",
     "hide_title": "Gizlət"
+  },
+  "matches_review": {
+    "title": "Şübhəli uyğunlaşmaların yoxlanışı",
+    "subtitle": "Matcher-in əmin olmadığı uyğunlaşmalar. Təsdiqlə və ya rədd et — bu gələcək proseslərin dəqiqliyini artıracaq.",
+    "filter_confidence": "Etibar ≤",
+    "filter_only_flagged": "Yalnız yoxlama üçün işarələnənlər",
+    "loading": "Yüklənir…",
+    "empty_title": "Təmizdir",
+    "empty_subtitle": "Diqqət tələb edən uyğunlaşma yoxdur.",
+    "confidence_label": "Etibar",
+    "flagged": "Yoxlama",
+    "spread": "Qiymət fərqi",
+    "btn_confirm": "Təsdiqlə",
+    "btn_reject": "Eyni məhsul deyil",
+    "confirm_hint": "Uyğunlaşmanı qeyd et — auto-matcher artıq dəyişməyəcək",
+    "reject_hint": "Klasteri böl — məhsullar fərqli kimi qeyd olunur",
+    "count": "Növbədə {n} uyğunlaşma"
   }
 }

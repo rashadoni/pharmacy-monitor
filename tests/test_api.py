@@ -331,3 +331,134 @@ def test_jwt_decode_wrong_secret(monkeypatch):
     token = api_module._make_jwt(user_id=1, tenant_id=1, email="a@b.c")
     monkeypatch.setattr(api_module, "JWT_SECRET", "secret-b")
     assert api_module._decode_jwt(token) is None
+
+
+# ─── Phase 2.5 — match suggestions endpoint ──────────────────────────────────
+
+
+def _make_match_with_products(
+    db, *, confidence: float, is_manual: bool = False, needs_review: bool = False,
+    canonical: str = "Test Product", tenant_id: int = 1, products_per_site: int = 2,
+) -> storage.Match:
+    """Helper: create a match + N products on different sites bound to it."""
+    m = storage.Match(
+        tenant_id=tenant_id,
+        canonical_name=canonical,
+        confidence=confidence,
+        is_manual=is_manual,
+        needs_review=needs_review,
+    )
+    db.add(m)
+    db.flush()
+    sites = ["pharmonline", "aptekonline", "aloe"][:products_per_site]
+    for i, site in enumerate(sites):
+        p = storage.Product(
+            tenant_id=tenant_id,
+            site=site,
+            external_id=f"{site}-{canonical.lower()}-{i}",
+            url=f"https://{site}.example/p/{canonical}",
+            name=f"{canonical} on {site}",
+            name_normalized=canonical.lower(),
+            canonical_id=m.id,
+        )
+        db.add(p)
+    db.commit()
+    return m
+
+
+def test_match_suggestions_returns_low_confidence(client, tenant_user, setup_db):
+    """Matches with confidence below threshold + not manual are returned."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    _make_match_with_products(s, confidence=0.70, canonical="LowConf")
+    _make_match_with_products(s, confidence=0.95, canonical="HighConf")  # excluded
+
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")  # set cookie
+    r = client.get("/api/v1/dash/matches/suggestions?confidence_max=0.85")
+    assert r.status_code == 200, r.text
+    names = [m["canonical_name"] for m in r.json()]
+    assert "LowConf" in names
+    assert "HighConf" not in names
+
+
+def test_match_suggestions_skips_manual(client, tenant_user, setup_db):
+    """is_manual=True matches are never in the queue (already confirmed)."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    _make_match_with_products(s, confidence=0.5, is_manual=True, canonical="Manual")
+    _make_match_with_products(s, confidence=0.5, is_manual=False, canonical="Auto")
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/matches/suggestions")
+    names = [m["canonical_name"] for m in r.json()]
+    assert "Auto" in names
+    assert "Manual" not in names
+
+
+def test_match_suggestions_only_needs_review_filter(client, tenant_user, setup_db):
+    """only_needs_review=true narrows the list."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    _make_match_with_products(s, confidence=0.5, needs_review=True, canonical="Flagged")
+    _make_match_with_products(s, confidence=0.5, needs_review=False, canonical="Unflagged")
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/matches/suggestions?only_needs_review=true")
+    names = [m["canonical_name"] for m in r.json()]
+    assert "Flagged" in names
+    assert "Unflagged" not in names
+
+
+def test_match_suggestions_sorted_ascending_confidence(client, tenant_user, setup_db):
+    """Lowest confidence first (most uncertain, highest review priority)."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    _make_match_with_products(s, confidence=0.80, canonical="Higher")
+    _make_match_with_products(s, confidence=0.50, canonical="Lower")
+    _make_match_with_products(s, confidence=0.65, canonical="Middle")
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/matches/suggestions")
+    names = [m["canonical_name"] for m in r.json()]
+    # Order: Lower (.50), Middle (.65), Higher (.80)
+    assert names.index("Lower") < names.index("Middle") < names.index("Higher")
+
+
+def test_match_confirm_sets_is_manual(client, tenant_user, setup_db):
+    """POST /confirm sets is_manual=true and clears needs_review."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.5, needs_review=True, canonical="Confirm me")
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.post(f"/api/v1/dash/matches/{m.id}/confirm")
+    assert r.status_code == 204
+    s.refresh(m)
+    assert m.is_manual is True
+    assert m.needs_review is False
+
+
+def test_match_confirm_404_on_unknown(client, tenant_user, setup_db):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.post("/api/v1/dash/matches/99999/confirm")
+    assert r.status_code == 404
+
+
+def test_match_confirm_requires_auth(client, setup_db):
+    r = client.post("/api/v1/dash/matches/1/confirm")
+    assert r.status_code == 401
+
+
+def test_match_suggestions_requires_auth(client, setup_db):
+    r = client.get("/api/v1/dash/matches/suggestions")
+    assert r.status_code == 401

@@ -2344,6 +2344,132 @@ def dash_category_mapping_create(
     return {"id": cat.id, "action": "created", "key": cat.key}
 
 
+# ── Phase 2.5 (2026-05-27) — borderline-match suggestion queue ─────────────
+# Listing matches that look uncertain (low confidence OR needs_review flag set)
+# so a human can quickly confirm / reject from the dashboard. Goal: drive
+# false-match rate from 8.4% toward <2% by cleaning the tail.
+
+
+class MatchSuggestionProduct(BaseModel):
+    """One product in a borderline match cluster."""
+
+    product_id: int
+    site: str
+    name: str
+    url: str
+    price: float | None
+    brand: str | None
+    pack_size: str | None
+    dosage: str | None
+    image_url: str | None
+    barcode: str | None
+
+
+class MatchSuggestionOut(BaseModel):
+    """One borderline match ready for human review."""
+
+    match_id: int
+    canonical_name: str
+    confidence: float
+    needs_review: bool
+    spread_pct: float | None  # price disagreement percentage (max-min)/max
+    products: list[MatchSuggestionProduct]
+
+
+@app.get("/api/v1/dash/matches/suggestions", response_model=list[MatchSuggestionOut])
+def dash_match_suggestions(
+    confidence_max: float = 0.85,
+    only_needs_review: bool = False,
+    limit: int = 100,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """List borderline matches awaiting human review.
+
+    Filter:
+      - is_manual=False (already-confirmed matches are skipped)
+      - confidence < confidence_max (default 0.85)
+      - optional needs_review=True restricts to flagged ones
+
+    Sorted by confidence ASC (most uncertain first → review priority).
+    Pre-fetches latest snapshots в одной SELECT (no N+1).
+    """
+    matches = db.scalars(
+        select(storage.Match)
+        .where(
+            storage.Match.tenant_id == user.tenant_id,
+            storage.Match.is_manual.is_(False),
+            storage.Match.confidence < confidence_max,
+            *( [storage.Match.needs_review.is_(True)] if only_needs_review else [] ),
+        )
+        .order_by(storage.Match.confidence.asc())
+        .limit(limit)
+    ).all()
+
+    all_pids = [p.id for m in matches for p in m.products]
+    snaps_by_pid = storage.latest_snapshots_per_product(db, all_pids)
+
+    out: list[MatchSuggestionOut] = []
+    for m in matches:
+        prods: list[MatchSuggestionProduct] = []
+        prices: list[float] = []
+        for p in m.products:
+            snap = snaps_by_pid.get(p.id)
+            price = (snap.discount_price or snap.price) if snap else None
+            if price is not None and price > 0:
+                prices.append(price)
+            prods.append(MatchSuggestionProduct(
+                product_id=p.id,
+                site=p.site,
+                name=p.name,
+                url=p.url,
+                price=price,
+                brand=p.brand,
+                pack_size=p.pack_size,
+                dosage=p.dosage,
+                image_url=p.image_url,
+                barcode=p.barcode,
+            ))
+        spread = None
+        if len(prices) >= 2:
+            spread = round((max(prices) - min(prices)) / max(prices) * 100, 1)
+        out.append(MatchSuggestionOut(
+            match_id=m.id,
+            canonical_name=m.canonical_name,
+            confidence=m.confidence,
+            needs_review=m.needs_review,
+            spread_pct=spread,
+            products=prods,
+        ))
+    return out
+
+
+@app.post("/api/v1/dash/matches/{match_id}/confirm", status_code=204)
+def dash_match_confirm(
+    match_id: int,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Confirm a borderline match — sets is_manual=true so auto-matcher won't
+    re-cluster on next nightly run. Inverse of /reject. Used by suggestion UI.
+    """
+    match = db.scalar(
+        select(storage.Match).where(
+            storage.Match.id == match_id,
+            storage.Match.tenant_id == user.tenant_id,
+        )
+    )
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if not match.is_manual:
+        match.is_manual = True
+        # Clear needs_review since user just resolved it.
+        match.needs_review = False
+        db.commit()
+        log.info("match_confirmed", match_id=match_id, user_id=user.id)
+    return Response(status_code=204)
+
+
 @app.post("/api/v1/dash/matches/{match_id}/reject", status_code=204)
 def dash_match_reject(
     match_id: int,

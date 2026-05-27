@@ -8,6 +8,7 @@ import {
   Bell,
   Building2,
   Leaf,
+  Link2,
   ListTree,
   LogOut,
   Pill,
@@ -35,6 +36,7 @@ const NAV_SITES = [
 const NAV_ACTIONS = [
   { href: "/alerts", key: "alerts", icon: Bell },
   { href: "/watchlist", key: "watchlist", icon: Star },
+  { href: "/matches/review", key: "matches_review", icon: Link2 },
 ] as const;
 
 const NAV_SETTINGS = [

@@ -7,6 +7,7 @@
     "analytics": "Аналитика",
     "alerts": "Алерты",
     "watchlist": "Watchlist",
+    "matches_review": "Ревью матчей",
     "categories": "Категории",
     "settings": "Настройки",
     "section_overview": "Обзор",
@@ -360,5 +361,22 @@
     "configure": "Настроить →",
     "hide_aria": "Скрыть напоминание",
     "hide_title": "Скрыть"
+  },
+  "matches_review": {
+    "title": "Ревью спорных матчей",
+    "subtitle": "Совпадения, где matcher не уверен. Подтверди или отклони — это улучшит точность будущих прогонов.",
+    "filter_confidence": "Confidence ≤",
+    "filter_only_flagged": "Только помеченные на ревью",
+    "loading": "Загрузка…",
+    "empty_title": "Чисто",
+    "empty_subtitle": "Нет матчей, требующих внимания.",
+    "confidence_label": "Уверенность",
+    "flagged": "На ревью",
+    "spread": "Разброс цен",
+    "btn_confirm": "Подтвердить",
+    "btn_reject": "Не один товар",
+    "confirm_hint": "Зафиксировать матч — auto-matcher не будет его пересчитывать",
+    "reject_hint": "Разбить кластер — продукты помечаются как разные товары",
+    "count": "{n} матчей в очереди"
   }
 }
