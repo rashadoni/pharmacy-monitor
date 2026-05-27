@@ -240,6 +240,8 @@ SELECT COUNT(*) FROM products;
 [~] Phase 1     scraper resilience: BD Web Unlocker для aptekonline ✓, pharmonline даёт 502 от BD → остался на Mac. AI fallback wired (opt-in)
 [✓] Phase 1c    DDP scraper для pharmonline (commit 6969e96+beac3ca). Reverse-engineered Meteor `products` method, pierces Cloudflare без браузера через IPRoyal residential. Reconnect-on-close logic — выживает persist phase pause. **Run 104: status=ok, 266,718 products** (vs 599 без reconnect = 445× прирост).
 [✓] Cutover     pharmonline переведён на прод-таймер (01:00 UTC = 05:00 Baku). Mac launchd теперь скрейпит только aptekonline. Mac DR-fallback для pharmonline остался (`bash run-scrape.sh --site pharmonline`).
+[✓] Phase 2.5   Match suggestion review UI (commit 82922ad). GET /api/v1/dash/matches/suggestions + POST /confirm. Page /matches/review с confidence slider + needs_review filter + confirm/reject buttons. 8 unit tests pass. i18n ru/az/en.
+[✓] Phase 3.3   Local backup восстановлен (commit 437dfc9 — фикс `$2: unbound variable` regression от 2026-05-23) + GPG encryption. Manual offsite через `infra/local/fetch-backup.sh` на Mac. B2 cloud отложен по решению клиента.
 [✓] Phase 2     matcher v2 с barcode (2.1-2.4): migration 0007, extraction в aloe+pharmonline, priority-0 pass, rematch script. UI 2.5 deferred.
 [ ] Phase 3     HA & backups: Postgres replica + B2 offsite backup
 [ ] Next        Phase 2.5 (UI suggestion queue), Phase 3, либо real-data barcode coverage analysis после нескольких daily scrape
