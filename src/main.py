@@ -568,6 +568,10 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                     existing.pack_size = pack or existing.pack_size
                     existing.image_url = sp.image_url or existing.image_url
                     existing.category = sp.category or existing.category
+                    # Phase 2.1 — barcode never overwrites existing non-null
+                    # (some scrape runs may temporarily lack the field).
+                    if sp.barcode and not existing.barcode:
+                        existing.barcode = sp.barcode
                     existing.last_seen_at = utcnow()
                 else:
                     product = storage.Product(
@@ -583,6 +587,7 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                         pack_size=pack,
                         image_url=sp.image_url,
                         description=sp.description,
+                        barcode=sp.barcode,
                     )
                     new_products.append(product)
                     existing_by_key[(sp.site, sp.external_id)] = product

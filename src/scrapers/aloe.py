@@ -255,6 +255,23 @@ class AloeScraper(BaseScraper):
 
             external_id = url.rstrip("/").split("/")[-1]
 
+            # Phase 2.2 — try to extract barcode from JSON-LD injected post-
+            # hydration. Next.js apps put <script type="application/ld+json">
+            # with schema.org Product (including gtin*) into the DOM.
+            barcode: str | None = None
+            try:
+                from src.scrapers.ai_crawler import (
+                    _extract_barcode_from_jsonld,
+                    parse_jsonld_product,
+                )
+
+                html = await page.content()
+                jsonld = parse_jsonld_product(html)
+                if jsonld:
+                    barcode = _extract_barcode_from_jsonld(jsonld)
+            except Exception as exc:
+                log.debug("aloe_barcode_extract_failed", url=url, error=str(exc))
+
             return ScrapedProduct(
                 site=self.site_name,
                 external_id=external_id,
@@ -268,6 +285,7 @@ class AloeScraper(BaseScraper):
                 discount_price=price if is_on_sale else None,
                 discount_percent=discount_percent,
                 is_on_sale=is_on_sale,
+                barcode=barcode,
             )
         finally:
             await page.close()

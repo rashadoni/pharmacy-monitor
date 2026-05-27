@@ -70,6 +70,22 @@ class PharmonlineScraper(BaseScraper):
                         log.warning("pharmonline_no_cards", category=category_slug)
                     break  # пустая страница — конец пагинации
 
+                # Ждём пока внутри хотя бы одной карточки появится реальная ссылка
+                # на товар — это признак полной гидрации DOM. Без этой проверки
+                # scraper видит оболочки .product_box_v2 до того как JS вставит
+                # href, и _parse_card возвращает None для всех карточек.
+                try:
+                    await page.wait_for_selector(
+                        '.product_box_v2 a[href*="/product/"]',
+                        timeout=8000,
+                        state="attached",
+                    )
+                except Exception:
+                    # Если ссылок нет после 8с — реально пустая страница
+                    if page_num == 1:
+                        log.warning("pharmonline_no_product_links", category=category_slug)
+                    break
+
                 # Lazy-load: scroll до стабилизации количества карточек
                 prev_count = -1
                 for _ in range(12):
@@ -252,6 +268,12 @@ class PharmonlineScraper(BaseScraper):
             if not name:
                 return None
 
+            # Phase 2.2 — extract barcode from JSON-LD (если есть) или из
+            # HTML-таблицы характеристик. Pharmonline rendering — Bootstrap +
+            # jQuery, иногда они кладут schema.org microdata, иногда таблицу
+            # типа "Штрих-код / Barcode: 8-14 digits".
+            barcode = await self._extract_barcode_from_page(page, url)
+
             return ScrapedProduct(
                 site=self.site_name,
                 external_id=external_id,
@@ -264,9 +286,52 @@ class PharmonlineScraper(BaseScraper):
                 discount_price=price if is_on_sale else None,
                 discount_percent=discount_percent,
                 is_on_sale=is_on_sale,
+                barcode=barcode,
             )
         finally:
             await page.close()
+
+    async def _extract_barcode_from_page(self, page, url: str) -> str | None:
+        """Try JSON-LD first (schema.org gtin*), fall back to HTML table row scan.
+
+        Returns digits-only barcode or None. Conservative — silent on any
+        parse error to avoid blowing up the whole scrape.
+        """
+        try:
+            from src.scrapers.ai_crawler import (
+                _extract_barcode_from_jsonld,
+                parse_jsonld_product,
+            )
+
+            html = await page.content()
+            jsonld = parse_jsonld_product(html)
+            if jsonld:
+                bc = _extract_barcode_from_jsonld(jsonld)
+                if bc:
+                    return bc
+            # Pharmonline product info table fallback — look for labelled rows.
+            # Patterns observed: "Ştrix kod", "Штрих-код", "Barcode" followed
+            # by 8-14 digit string in same cell or next sibling.
+            import re
+
+            label_patterns = (
+                r"[ŞşSs]trix[ -]?kod",
+                r"[Шш]трих[- ]?код",
+                r"[Bb]ar[Cc]ode",
+                r"EAN",
+                r"GTIN",
+            )
+            digit_re = re.compile(r"(\d{8,14})")
+            for label in label_patterns:
+                # Match "<label> ... <digits>" within ~80 chars (table cells).
+                pat = re.compile(label + r"[^<>0-9]{0,80}?(\d{8,14})")
+                match = pat.search(html)
+                if match:
+                    return match.group(1)
+            return None
+        except Exception as exc:
+            log.debug("pharmonline_barcode_extract_failed", url=url, error=str(exc))
+            return None
 
     async def scrape_promos(self) -> list[ScrapedPromo]:
         page = await self.new_page()

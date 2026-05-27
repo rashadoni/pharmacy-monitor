@@ -187,6 +187,8 @@ class ScrapedProduct:
     discount_percent: float | None = None
     is_on_sale: bool = False
     promo_label: str | None = None
+    # Phase 2.1 — canonical barcode (EAN/GTIN/UPC unified). Digits-only string.
+    barcode: str | None = None
 
 
 @dataclass

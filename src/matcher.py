@@ -482,6 +482,63 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     created_or_updated = 0
     visited: set[int] = set()
 
+    # ── Pass 0: barcode-based matching (Phase 2.3, 2026-05-27) ──────────────
+    # Если два продукта с РАЗНЫХ сайтов имеют одинаковый barcode (EAN/GTIN/UPC),
+    # это canonical signal — один и тот же товар. Confidence = 1.0, skip всех
+    # эвристик name/dosage/form (barcode trumps name).
+    #
+    # Эвристики ниже (modifier conflicts, series numbers и т.д.) могут давать
+    # false negative — два продукта с одинаковым barcode но слегка разными
+    # name'ами (опечатка, другая транслитерация) НЕ будут смэтчены через fuzzy.
+    # Barcode pass их спасает. Скорее всего barcode coverage ~50-70%, остальные
+    # уйдут в fuzzy ниже.
+    #
+    # Защита от мусора: если barcode пустой / "0" / "null" / < 8 digits —
+    # игнорируем (это noise от scrapers, не реальный barcode).
+    by_barcode: dict[str, list[Product]] = defaultdict(list)
+    for p in products:
+        bc = (p.barcode or "").strip()
+        if not bc or bc in ("0", "null", "none") or not bc.isdigit() or len(bc) < 8:
+            continue
+        by_barcode[bc].append(p)
+
+    barcode_matches_created = 0
+    for bc, group in by_barcode.items():
+        if len(group) < 2:
+            continue
+        # Берём по одному продукту с каждого уникального сайта (если на одном
+        # сайте несколько продуктов с тем же barcode — это нормально для variants
+        # одного товара, но мы матчим cross-site).
+        seen_sites: set[str] = set()
+        cluster: list[Product] = []
+        for p in sorted(group, key=lambda x: x.id):  # deterministic order
+            if p.site in seen_sites:
+                continue
+            if any(is_rejected(session, c.id, p.id) for c in cluster):
+                continue
+            cluster.append(p)
+            seen_sites.add(p.site)
+        if len(cluster) < 2:
+            continue
+        # Per-unit price sanity check ещё держим — даже одинаковый barcode на
+        # разных сайтах может быть продан per-pack vs per-piece.
+        if _has_perunit_mismatch(cluster, latest_prices):
+            log.warning(
+                "matcher_barcode_perunit_mismatch",
+                barcode=bc,
+                products=[p.id for p in cluster],
+            )
+            continue
+        created_or_updated += _persist_match(session, cluster, confidence=1.0)
+        visited.update(c.id for c in cluster)
+        barcode_matches_created += 1
+
+    log.info(
+        "matcher_barcode_pass",
+        unique_barcodes=len(by_barcode),
+        clusters_created=barcode_matches_created,
+    )
+
     for key, group in buckets.items():
         if len(group) < 2:
             continue

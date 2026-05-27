@@ -119,6 +119,10 @@ class Product(Base):
     pack_size: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 30 tab, 100ml...
     image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Phase 2.1 (2026-05-27) — canonical barcode/EAN/GTIN/UPC. All four labels
+    # represent the same identifier in pharma; we collapse into one column.
+    # Indexed for matcher v2 priority-0 lookup. Nullable until scraper fills.
+    barcode: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
 
     name_normalized: Mapped[str] = mapped_column(String(500), index=True)
 

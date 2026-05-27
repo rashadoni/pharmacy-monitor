@@ -273,6 +273,12 @@ def _build_product_from_jsonld(
         str(sku) if sku else hashlib.sha1(url.encode()).hexdigest()[:16]
     )
 
+    # Phase 2.2 — schema.org Product может содержать canonical barcode под
+    # одним из ключей: gtin13 (EAN-13), gtin (general), gtin8, gtin12 (UPC),
+    # gtin14, mpn (manufacturer part — НЕ barcode, но иногда сайты кладут туда).
+    # Берём первое непустое цифровое значение, нормализуем (digits only).
+    barcode = _extract_barcode_from_jsonld(jsonld)
+
     return ScrapedProduct(
         site=site_name,
         external_id=external_id,
@@ -285,7 +291,30 @@ def _build_product_from_jsonld(
         price=price,
         discount_price=None,
         is_on_sale=False,
+        barcode=barcode,
     )
+
+
+_BARCODE_KEYS = ("gtin13", "gtin14", "gtin12", "gtin8", "gtin")
+_BARCODE_DIGITS_RE = re.compile(r"^\d{8,14}$")
+
+
+def _extract_barcode_from_jsonld(jsonld: dict) -> str | None:
+    """Return canonical barcode from schema.org Product, or None.
+
+    schema.org defines multiple GTIN sub-types — try them in order of preference
+    (most specific first). Strip whitespace, validate length 8-14 digits.
+    `mpn` is intentionally skipped: in pharma it's manufacturer part-number,
+    not always a barcode, and mixing the two would degrade matcher precision.
+    """
+    for key in _BARCODE_KEYS:
+        val = jsonld.get(key)
+        if not val:
+            continue
+        s = str(val).strip().replace(" ", "").replace("-", "")
+        if _BARCODE_DIGITS_RE.match(s):
+            return s
+    return None
 
 
 # ─── Next.js RSC stream short-circuit ────────────────────────────────────────
