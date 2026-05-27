@@ -253,8 +253,15 @@ class _DDPClient:
                     return ddp.get("result", {})
 
 
-def _build_product(raw: dict, locale: str) -> ScrapedProduct | None:
-    """Map pharmonline DDP product → our ScrapedProduct."""
+def _build_product(
+    raw: dict, locale: str, category_id_to_slug: dict[str, str] | None = None,
+) -> ScrapedProduct | None:
+    """Map pharmonline DDP product → our ScrapedProduct.
+
+    `category_id_to_slug` (optional): map Meteor _id → human-readable slug for
+    category resolution. DDP returns category as list of Meteor _id's; we want
+    the URL-slug for frontend rendering. Pass via getFilterParam pre-fetch.
+    """
     name = raw.get("name") or ""
     i18n = raw.get("i18n") or {}
     # Prefer locale-specific name if available
@@ -263,7 +270,9 @@ def _build_product(raw: dict, locale: str) -> ScrapedProduct | None:
     if not name:
         return None
 
-    slug = raw.get("postQuery") or raw.get("_id")
+    # IMPORTANT: pharmonline uses `path` as URL slug (e.g. "dimedrol-005-q-10-tabletler-ukrayna"),
+    # NOT `postQuery` (which is boolean `true` indicating that path field exists).
+    slug = raw.get("path") or raw.get("_id")
     if not slug:
         return None
 
@@ -295,14 +304,23 @@ def _build_product(raw: dict, locale: str) -> ScrapedProduct | None:
     elif barcode:
         barcode = str(barcode).strip()
 
-    # DDP returns `category` as a list (product can belong to multiple
-    # categories) and `manufacturer` similarly. Existing scrapers expect a
-    # single string — flatten to first/primary slug. Otherwise downstream
-    # `_per_category_breakdown` raises TypeError: unhashable type: 'list'.
+    # DDP returns `category` as a list of Meteor _id's (product can belong
+    # to multiple categories). We resolve first _id → human-readable slug via
+    # the pre-fetched `category_id_to_slug` map (built from getFilterParam).
+    # Falls back to None if no map provided — downstream uses external_id for
+    # URL anyway, only frontend filtering needs category slug.
     category = raw.get("category")
-    if isinstance(category, list):
-        category = category[0] if category else None
-    if category is not None:
+    if isinstance(category, list) and category:
+        cat_id = str(category[0])
+        if category_id_to_slug and cat_id in category_id_to_slug:
+            category = category_id_to_slug[cat_id]
+        else:
+            # Unknown _id (perhaps newer than our map) — leave raw _id rather
+            # than None so we at least have something stable for grouping.
+            category = cat_id
+    elif isinstance(category, list):
+        category = None  # empty list
+    elif category is not None:
         category = str(category)
 
     manufacturer = raw.get("manufacturer")
@@ -342,6 +360,7 @@ class PharmonlineDDPScraper(BaseScraper):
     async def __aenter__(self) -> "PharmonlineDDPScraper":  # type: ignore[override]
         # Don't init Playwright — DDP doesn't need it. Light alternative entry.
         self._ddp: _DDPClient | None = None
+        self._cat_map: dict[str, str] = {}
         self._locale = os.getenv("PHARMONLINE_DDP_LOCALE", "az").lower()
         self._page_size = int(os.getenv("PHARMONLINE_DDP_PAGE_SIZE", "100"))
         proxy_url = _iproyal_httpx_proxy()
@@ -354,6 +373,29 @@ class PharmonlineDDPScraper(BaseScraper):
             proxy_url=proxy_url,
         )
         await self._ddp.__aenter__()
+        # Pre-fetch category _id → slug map. Without this, products have raw
+        # Mongo ObjectIds ("Fom7dQ8wnDWSgAeyn") as `category` field, breaking
+        # frontend "click category → browse" UX. getFilterParam returns a list
+        # of {id: _id, path: slug, name: human-readable} dicts.
+        try:
+            flt = await self._ddp.call(
+                "getFilterParam",
+                [{"query": {}, "sortBy": {"totalMinPrice": 1}, "productLimit": 24},
+                 self._locale],
+                timeout=30.0,
+            )
+            for c in flt.get("category", []) or []:
+                cid = c.get("id")
+                slug = c.get("path")
+                if cid and slug:
+                    self._cat_map[str(cid)] = str(slug)
+            log.info("pharmonline_ddp_cat_map_loaded", count=len(self._cat_map))
+        except Exception as exc:
+            log.warning(
+                "pharmonline_ddp_cat_map_failed",
+                error=f"{type(exc).__name__}: {exc}",
+                note="продукты получат raw Mongo _id в поле category",
+            )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
@@ -394,7 +436,7 @@ class PharmonlineDDPScraper(BaseScraper):
                 break
 
             for raw in products:
-                sp = _build_product(raw, self._locale)
+                sp = _build_product(raw, self._locale, self._cat_map)
                 if sp is None:
                     continue
                 yielded += 1
