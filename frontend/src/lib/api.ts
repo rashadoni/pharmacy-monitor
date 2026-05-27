@@ -3,8 +3,25 @@
  * In dev, Next.js rewrites /api/* to localhost:8080 (see next.config.mjs).
  *
  * Auth: JWT cookie (httpOnly, set by /auth/verify endpoint). No manual token handling.
+ *
+ * Phase 5.5 (2026-05-27): correlation via X-Request-ID. Каждый fetch генерит
+ * uuid'ом client-side; backend либо принимает наш, либо генерит свой; в обоих
+ * случаях возвращает в response header — мы пишем его в ApiError, чтобы
+ * support мог сопоставить с server-side логом / Sentry трейсом.
  */
 const BASE = ""; // same origin
+
+/** Generate RFC4122-ish v4 UUID — для трассировки запросов через стек. */
+function genRequestId(): string {
+  // Browser-native (Safari 15.4+, Chrome 92+, Firefox 95+).
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // Fallback (legacy IE, server-side build).
+  return "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".replace(/x/g, () =>
+    Math.floor(Math.random() * 16).toString(16),
+  );
+}
 
 async function request<T>(
   path: string,
@@ -13,16 +30,23 @@ async function request<T>(
   const timeoutMs = init?.timeoutMs ?? 30_000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const requestId = genRequestId();
   try {
     const res = await fetch(`${BASE}${path}`, {
       credentials: "include",
-      headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Request-ID": requestId,
+        ...(init?.headers || {}),
+      },
       signal: controller.signal,
       ...init,
     });
+    // Backend echoes our X-Request-ID (or substitutes its own).
+    const responseRequestId = res.headers.get("X-Request-ID") || requestId;
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new ApiError(res.status, text || res.statusText);
+      throw new ApiError(res.status, text || res.statusText, responseRequestId);
     }
     if (res.status === 204) return undefined as T;
     return res.json();
@@ -31,7 +55,13 @@ async function request<T>(
       throw new ApiError(
         408,
         `Запрос дольше ${Math.round(timeoutMs / 1000)}с — сервер не ответил`,
+        requestId,
       );
+    }
+    if (err instanceof ApiError) throw err;
+    // Network failure / DNS / refused — wrap with request_id для трассировки.
+    if (err instanceof TypeError) {
+      throw new ApiError(0, `Сеть недоступна: ${err.message}`, requestId);
     }
     throw err;
   } finally {
@@ -40,7 +70,11 @@ async function request<T>(
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, public detail: string) {
+  constructor(
+    public status: number,
+    public detail: string,
+    public requestId?: string,
+  ) {
     super(`API ${status}: ${detail}`);
   }
 }
@@ -84,6 +118,20 @@ export function friendlyError(err: unknown): string {
   }
   if (err instanceof Error) return err.message;
   return "Неизвестная ошибка";
+}
+
+/**
+ * Phase 5.5 (2026-05-27): retrieve X-Request-ID для отображения в UI или
+ * передачи в Sentry. `null` если ошибка не ApiError или request_id не пришёл.
+ *
+ * Usage:
+ *   const id = getRequestId(err);
+ *   if (id) Sentry.setTag("request_id", id);
+ *   showToast(`Ошибка ${friendlyError(err)} (id: ${id})`);
+ */
+export function getRequestId(err: unknown): string | null {
+  if (err instanceof ApiError && err.requestId) return err.requestId;
+  return null;
 }
 
 function translatePydantic(msg: string): string {
