@@ -26,6 +26,17 @@ The Verification Plan must enumerate:
 
 This protocol applies to tasks that change code. Trivial read-only operations (status checks, file reads, exploration) don't need a Verification Plan. Trivial doc updates (typos, minor wording) don't need one either, but anything affecting prod systems or business logic does.
 
+### Visual verification — no screenshot lies
+
+When confirming a UI change via screenshot (browser MCP, computer-use, screenshots, photos):
+
+- **NEVER** assert «вот, X виден» without identifiable evidence — name the exact pixel/glyph/coordinate and describe what makes it identifiable
+- If the element is <16px or visually ambiguous — **zoom tighter** before asserting
+- Cross-check via accessibility tree: `find` returns `title` / `aria-label` attributes that survive in the DOM even when the visual glyph is too small to read
+- If still unsure — say «не вижу — проверю иначе», NEVER produce a confident-but-wrong claim
+- If a marker reads ambiguously at small sizes — **fix the rendering** (filled dot + ring beats a 9px emoji), do not claim it's «already visible»
+- **Reason**: 2026-05-27 in another project Claude saw a 1-letter macro provenance marker and confidently called it the new ⏳ hourglass marker. User trusted the false positive until manually zooming and discovering nothing was there. False positives erode trust faster than missing features. A confident wrong answer is worse than «I can't clearly see X».
+
 ## Current production state (last updated: 2026-05-27)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
