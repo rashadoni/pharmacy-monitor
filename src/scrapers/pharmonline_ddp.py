@@ -96,53 +96,82 @@ def _iproyal_httpx_proxy() -> str | None:
 
 
 class _DDPClient:
-    """Minimal Meteor DDP client over WebSocket. One-call-at-a-time semantics."""
+    """Minimal Meteor DDP client over WebSocket. One-call-at-a-time semantics.
 
-    def __init__(self, ws_url: str, proxy_url: str | None = None):
-        self.ws_url = ws_url
+    Phase 1c.4 (2026-05-27): handles persistent-connection failures via
+    transparent reconnect-on-close in `call()`. Persist phase в pharmacy-monitor
+    блочит event loop на ~5 минут, и pharmonline сервер бросает 1011 close
+    (keepalive ping timeout). Reconnect восстанавливает session и retry'ит
+    call один раз. Call IDs reset на новой сессии — это OK, мы не subscriber'им
+    long-lived data.
+    """
+
+    # Connection params (constants for testability)
+    PING_INTERVAL = 30
+    PING_TIMEOUT = 60
+    CLOSE_TIMEOUT = 10
+    MAX_MSG_SIZE = 50 * 1024 * 1024
+
+    def __init__(self, ws_url_factory, proxy_url: str | None = None):
+        """ws_url_factory: callable returning fresh SockJS URL on each connect.
+
+        Each reconnect generates a new random session id (see _new_sockjs_path)
+        — Meteor server treats it as a new client and won't reject as duplicate.
+        """
+        self.ws_url_factory = ws_url_factory if callable(ws_url_factory) else (lambda: ws_url_factory)
         self.proxy_url = proxy_url
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._call_id = 0
         self._lock = asyncio.Lock()
 
-    async def __aenter__(self) -> "_DDPClient":
-        # websockets library doesn't natively support HTTP proxy CONNECT.
-        # For prod use case: when proxy is needed, fall back to httpx-ws or
-        # explicit tunnel. For now, IPRoyal supports SOCKS5 too — we'll wire
-        # that as needed. Direct connection works for testing from Baku-IP.
-        # Long-running scrapes (~20 min total): bump keepalive ping timeout to
-        # 60s (default 20s) — pharmonline server occasionally takes 30+s to
-        # respond on heavy categories, which triggered 1011 close in run 102.
+    async def _connect(self) -> None:
+        """Open websocket + DDP handshake. Sets self._ws on success."""
         kwargs: dict = {
-            "max_size": 50 * 1024 * 1024,  # 50MB messages
-            "ping_interval": 30,
-            "ping_timeout": 60,
-            "close_timeout": 10,
+            "max_size": self.MAX_MSG_SIZE,
+            "ping_interval": self.PING_INTERVAL,
+            "ping_timeout": self.PING_TIMEOUT,
+            "close_timeout": self.CLOSE_TIMEOUT,
         }
         if self.proxy_url:
-            # websockets has experimental proxy support via `proxy` param in 13+.
             kwargs["proxy"] = self.proxy_url
-        self._ws = await websockets.connect(self.ws_url, **kwargs)
-        # SockJS sends "o" opening frame, then we send connect message.
+        ws_url = self.ws_url_factory()
+        self._ws = await websockets.connect(ws_url, **kwargs)
         opening = await self._ws.recv()
         if opening != "o":
             raise RuntimeError(f"Expected SockJS open frame 'o', got {opening!r}")
-        # SockJS wraps DDP messages as arrays of JSON strings.
         connect_msg = {"msg": "connect", "version": DDP_PROTOCOL_VERSION, "support": DDP_SUPPORT}
         await self._ws.send(json.dumps([json.dumps(connect_msg)]))
-        # Wait for "connected" message.
         while True:
             frame = await self._ws.recv()
             for ddp in self._unwrap_sockjs(frame):
                 if ddp.get("msg") == "connected":
                     log.info("ddp_connected", session=ddp.get("session"))
-                    return self
+                    return
                 if ddp.get("msg") == "failed":
                     raise RuntimeError(f"DDP handshake failed: {ddp}")
 
+    async def __aenter__(self) -> "_DDPClient":
+        await self._connect()
+        return self
+
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._ws:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+
+    async def _reconnect(self) -> None:
+        """Close dead websocket and re-establish DDP session."""
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        self._ws = None
+        self._call_id = 0  # new server session = id counter restarts
+        log.info("ddp_reconnecting")
+        await self._connect()
 
     @staticmethod
     def _unwrap_sockjs(frame: str) -> list[dict]:
@@ -171,27 +200,57 @@ class _DDPClient:
         return msgs
 
     async def call(self, method: str, params: list, timeout: float = 30.0) -> dict:
-        """Synchronous-style Meteor method call. Returns result payload."""
+        """Synchronous-style Meteor method call с auto-reconnect.
+
+        Если socket закрылся (1011 ping timeout либо ConnectionClosed),
+        делаем один reconnect и retry'им call. Это критично для long-running
+        scrapes где persist phase блочит event loop на 5+ минут.
+        """
         async with self._lock:
-            self._call_id += 1
-            cid = str(self._call_id)
-            req = {"msg": "method", "id": cid, "method": method, "params": params}
-            assert self._ws is not None
-            await self._ws.send(json.dumps([json.dumps(req)]))
-            deadline = asyncio.get_event_loop().time() + timeout
-            while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    raise TimeoutError(f"DDP method {method!r} timeout after {timeout}s")
+            for attempt in range(2):
                 try:
-                    frame = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    raise TimeoutError(f"DDP method {method!r} timeout")
-                for ddp in self._unwrap_sockjs(frame):
-                    if ddp.get("msg") == "result" and ddp.get("id") == cid:
-                        if "error" in ddp:
-                            raise RuntimeError(f"DDP method {method!r} error: {ddp['error']}")
-                        return ddp.get("result", {})
+                    return await self._send_and_wait(method, params, timeout)
+                except (
+                    websockets.exceptions.ConnectionClosed,
+                    websockets.exceptions.WebSocketException,
+                    ConnectionError,
+                ) as exc:
+                    if attempt == 0:
+                        log.warning(
+                            "ddp_call_reconnecting",
+                            method=method,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                        await self._reconnect()
+                        continue
+                    raise
+            # Unreachable — loop either returns or raises.
+            raise RuntimeError("DDP call exhausted retries (logic bug)")
+
+    async def _send_and_wait(
+        self, method: str, params: list, timeout: float
+    ) -> dict:
+        """Single attempt: send call message, wait for matching result."""
+        if self._ws is None:
+            raise ConnectionError("DDP socket not open")
+        self._call_id += 1
+        cid = str(self._call_id)
+        req = {"msg": "method", "id": cid, "method": method, "params": params}
+        await self._ws.send(json.dumps([json.dumps(req)]))
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(f"DDP method {method!r} timeout after {timeout}s")
+            try:
+                frame = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise TimeoutError(f"DDP method {method!r} timeout")
+            for ddp in self._unwrap_sockjs(frame):
+                if ddp.get("msg") == "result" and ddp.get("id") == cid:
+                    if "error" in ddp:
+                        raise RuntimeError(f"DDP method {method!r} error: {ddp['error']}")
+                    return ddp.get("result", {})
 
 
 def _build_product(raw: dict, locale: str) -> ScrapedProduct | None:
@@ -288,8 +347,12 @@ class PharmonlineDDPScraper(BaseScraper):
         proxy_url = _iproyal_httpx_proxy()
         if not proxy_url:
             log.warning("pharmonline_ddp_no_proxy", note="will connect direct")
-        ws_url = SOCKJS_BASE + _new_sockjs_path()
-        self._ddp = _DDPClient(ws_url, proxy_url=proxy_url)
+        # Pass URL factory (not static URL) so reconnect gets a fresh SockJS
+        # session path each time — pharmonline server rejects stale session ids.
+        self._ddp = _DDPClient(
+            lambda: SOCKJS_BASE + _new_sockjs_path(),
+            proxy_url=proxy_url,
+        )
         await self._ddp.__aenter__()
         return self
 
