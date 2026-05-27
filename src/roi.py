@@ -238,6 +238,7 @@ def refresh_all_cached_actions(
 def compute_actions(
     session: Session,
     *,
+    client_site: str | None = None,
     raise_threshold_pct: float = 5.0,  # минимальная разница чтобы советовать поднять
     undercut_threshold_pct: float = 3.0,  # минимальная просадка чтобы алерт
     max_spread_pct: float = 80.0,  # выше этого считаем bad-match и скрываем
@@ -245,19 +246,38 @@ def compute_actions(
 ) -> list[ActionItem]:
     """Главная точка: собрать все действия, отсортировать по spread desc.
 
+    `client_site` (optional) — какой сайт рассматривать как «свой» (с perspective
+    которого считаем undercut/raise/assortment-gap). По умолчанию глобальная
+    константа CLIENT_SITE. Если передан другой site, временно подмениваем
+    module-level constants (thread-unsafe — but compute_actions сейчас зовётся
+    только серийно: либо из API request, либо из refresh_all_cached_actions цикла).
+
     Сортируем по |spread_pct| desc — самые большие разрывы вверху. Не по
     «месячному impact'у» потому что объёмы продаж нам неизвестны (см.
     module docstring).
     """
-    actions: list[ActionItem] = []
-    actions += _price_raise_opportunities(
-        session, raise_threshold_pct, max_spread_pct, max_per_type
-    )
-    actions += _undercut_threats(
-        session, undercut_threshold_pct, max_spread_pct, max_per_type
-    )
-    actions += _assortment_gaps(session, max_per_type)
-    actions += _promo_responses(session, max_per_type)
+    global CLIENT_SITE, COMPETITOR_SITES
+    orig_client = CLIENT_SITE
+    orig_competitors = COMPETITOR_SITES
+    if client_site and client_site != CLIENT_SITE:
+        if client_site not in ALL_SITES:
+            raise ValueError(f"unknown client_site: {client_site!r}")
+        CLIENT_SITE = client_site
+        COMPETITOR_SITES = tuple(s for s in ALL_SITES if s != client_site)
+    try:
+        actions: list[ActionItem] = []
+        actions += _price_raise_opportunities(
+            session, raise_threshold_pct, max_spread_pct, max_per_type
+        )
+        actions += _undercut_threats(
+            session, undercut_threshold_pct, max_spread_pct, max_per_type
+        )
+        actions += _assortment_gaps(session, max_per_type)
+        actions += _promo_responses(session, max_per_type)
+    finally:
+        # Always restore — even on exception.
+        CLIENT_SITE = orig_client
+        COMPETITOR_SITES = orig_competitors
 
     # Сортировка: critical → warning → opportunity → info; внутри — по |spread_pct| desc
     sev_order = {"critical": 0, "warning": 1, "opportunity": 2, "info": 3}
