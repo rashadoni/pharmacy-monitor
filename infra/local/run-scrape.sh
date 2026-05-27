@@ -31,10 +31,19 @@ KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-pharmacy-monitor-db}"
 KEYCHAIN_ACCOUNT="${KEYCHAIN_ACCOUNT:-pm}"
 LOG_FILE="${LOG_FILE:-$HOME/Library/Logs/pharmacy-monitor.log}"
 
-# По умолчанию скрейпим pharmonline (aloe и aptekonline крутятся на проде).
-# Можно переопределить аргументами из launchd, e.g. `--site pharmonline --site aptekonline`.
+# С 2026-05-27: pharmonline переехал на прод (DDP scraper через IPRoyal —
+# работает прямо с Hetzner IP, не требует Mac-IP). Mac launchd теперь скрейпит
+# только aptekonline (BD Web Unlocker сейчас даёт 403 на Hetzner для JSON API
+# когда rate-limit'ы тяжёлые — Mac residential gateway остаётся надёжней пока
+# мы не доделаем IPRoyal для aptekonline тоже).
+#
+# Aloe скрейпится прод-таймером (systemd) — direct.
+#
+# Mac launchd теперь:
+#   - aptekonline (через тоннель в прод-DB)
+#   - DR-fallback для pharmonline если прод DDP path упадёт (manual override:
+#     `bash run-scrape.sh --site pharmonline --site aptekonline`)
 DEFAULT_ARGS=(
-    "--site" "pharmonline"
     "--site" "aptekonline"
     "--mode" "category"
     "--no-alerts"
@@ -98,7 +107,9 @@ for attempt in $(seq 1 $TUNNEL_ATTEMPTS); do
     echo "tunnel attempt $attempt/$TUNNEL_ATTEMPTS …"
     ssh -i "$SSH_KEY" -N -L "$LOCAL_PG_PORT:localhost:5432" \
         -o ExitOnForwardFailure=yes \
-        -o ServerAliveInterval=30 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=20 \
+        -o TCPKeepAlive=yes \
         -o ConnectTimeout=15 \
         -o StrictHostKeyChecking=accept-new \
         "$PROD_USER@$PROD_HOST" &
