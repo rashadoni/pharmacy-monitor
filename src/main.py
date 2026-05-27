@@ -578,6 +578,12 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                     existing.pack_size = pack or existing.pack_size
                     existing.image_url = sp.image_url or existing.image_url
                     existing.category = sp.category or existing.category
+                    # Регрессия 2026-05-27: existing.url не обновлялся → 6238
+                    # pharmonline-продуктов застряли на '/True' после фикса
+                    # `path` vs `postQuery` в pharmonline_ddp. Свежие прогоны
+                    # с правильным slug должны перезаписать broken URL.
+                    # Пустой/None от скрейпера — keep existing (defensive).
+                    existing.url = sp.url or existing.url
                     # Phase 2.1 — barcode never overwrites existing non-null
                     # (some scrape runs may temporarily lack the field).
                     if sp.barcode and not existing.barcode:

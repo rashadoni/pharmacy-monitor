@@ -370,3 +370,79 @@ def test_persist_one_select_per_site_not_per_product(db_session):
     # 1 для existing pre-fetch, плюс возможные внутренние ORM SELECT'ы. До фикса
     # было бы ≥50 (по одному на каждый продукт).
     assert select_count < 10, f"ожидалось ≤10 SELECT'ов, получили {select_count} (N+1 не пофикшен?)"
+
+
+def test_persist_updates_url_on_existing_product(db_session):
+    """Регрессия 2026-05-27: existing.url не обновлялся → 6238 продуктов
+    застряли на '/True' после фикса pharmonline_ddp `path` vs `postQuery`.
+
+    Свежий run с правильным URL должен перезаписать broken slug.
+    """
+    run1 = storage.Run(status="running")
+    db_session.add(run1)
+    db_session.commit()
+
+    # Симулируем старый прогон: продукт с broken URL '/True'
+    broken = ScrapedProduct(
+        site="pharmonline",
+        external_id="EXT1",
+        url="/True",
+        name="Aspirin 100mg",
+        price=5.0,
+    )
+    persist_results(db_session, run1, [ScrapeResult(site="pharmonline", products=[broken])])
+
+    products = db_session.scalars(select(storage.Product)).all()
+    assert len(products) == 1
+    assert products[0].url == "/True"
+
+    # Свежий прогон с правильным slug
+    run2 = storage.Run(status="running")
+    db_session.add(run2)
+    db_session.commit()
+
+    fixed = ScrapedProduct(
+        site="pharmonline",
+        external_id="EXT1",
+        url="/product/aspirin-100mg-tab-30",
+        name="Aspirin 100mg",
+        price=5.0,
+    )
+    persist_results(db_session, run2, [ScrapeResult(site="pharmonline", products=[fixed])])
+
+    products = db_session.scalars(select(storage.Product)).all()
+    assert len(products) == 1, "тот же external_id → UPDATE, не INSERT"
+    assert products[0].url == "/product/aspirin-100mg-tab-30", "URL должен обновиться"
+
+
+def test_persist_keeps_existing_url_when_scraper_returns_empty(db_session):
+    """Defensive: если скрейпер вернёт пустой/None url, сохраняем старый."""
+    run1 = storage.Run(status="running")
+    db_session.add(run1)
+    db_session.commit()
+
+    good = ScrapedProduct(
+        site="aloe",
+        external_id="EXT2",
+        url="https://aloe.az/p/good-url",
+        name="Foo",
+        price=10.0,
+    )
+    persist_results(db_session, run1, [ScrapeResult(site="aloe", products=[good])])
+
+    run2 = storage.Run(status="running")
+    db_session.add(run2)
+    db_session.commit()
+
+    empty_url = ScrapedProduct(
+        site="aloe",
+        external_id="EXT2",
+        url="",  # эмулируем баг скрейпера
+        name="Foo",
+        price=10.0,
+    )
+    persist_results(db_session, run2, [ScrapeResult(site="aloe", products=[empty_url])])
+
+    products = db_session.scalars(select(storage.Product)).all()
+    assert len(products) == 1
+    assert products[0].url == "https://aloe.az/p/good-url", "пустой url не должен стирать good URL"
