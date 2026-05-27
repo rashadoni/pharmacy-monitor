@@ -23,6 +23,7 @@ from src.scrapers.aptekonline import (
     _DEFAULT_CHECKUS,
     _brightdata_httpx_proxy_for,
     _build_product_from_api,
+    _iproyal_httpx_proxy_for,
     _resolve_checkus_token,
 )
 
@@ -304,3 +305,45 @@ def test_brightdata_httpx_proxy_appends_country(monkeypatch):
     monkeypatch.setenv("BRIGHTDATA_COUNTRY", "tr")
     url = _brightdata_httpx_proxy_for("aptekonline")
     assert url == "http://brd-customer-hl_X-zone-Y-country-tr:p@brd.superproxy.io:33335"
+
+
+# ─── IPRoyal httpx (Phase 1.2b) ──────────────────────────────────────────────
+
+
+def _clear_iproyal(mp):
+    for k in ("IPROYAL_USERNAME", "IPROYAL_PASSWORD", "IPROYAL_SITES",
+              "IPROYAL_HOST", "IPROYAL_COUNTRY"):
+        mp.delenv(k, raising=False)
+
+
+def test_iproyal_httpx_proxy_none_without_creds(monkeypatch):
+    _clear_iproyal(monkeypatch)
+    monkeypatch.setenv("IPROYAL_SITES", "aptekonline")
+    assert _iproyal_httpx_proxy_for("aptekonline") is None
+
+
+def test_iproyal_httpx_proxy_none_when_site_excluded(monkeypatch):
+    _clear_iproyal(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "u")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "p")
+    monkeypatch.setenv("IPROYAL_SITES", "pharmonline")
+    assert _iproyal_httpx_proxy_for("aptekonline") is None
+
+
+def test_iproyal_httpx_proxy_returns_url(monkeypatch):
+    _clear_iproyal(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "myuser")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "s3cr3t")
+    monkeypatch.setenv("IPROYAL_SITES", "aptekonline")
+    url = _iproyal_httpx_proxy_for("aptekonline")
+    assert url == "http://myuser:s3cr3t@geo.iproyal.com:12321"
+
+
+def test_iproyal_httpx_proxy_with_country(monkeypatch):
+    _clear_iproyal(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "myuser")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "p")
+    monkeypatch.setenv("IPROYAL_SITES", "aptekonline")
+    monkeypatch.setenv("IPROYAL_COUNTRY", "az")
+    url = _iproyal_httpx_proxy_for("aptekonline")
+    assert url == "http://myuser_country-az:p@geo.iproyal.com:12321"

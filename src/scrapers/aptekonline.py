@@ -52,6 +52,28 @@ from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapedPromo
 log = structlog.get_logger()
 
 
+def _iproyal_httpx_proxy_for(site_name: str) -> str | None:
+    """IPRoyal Residential proxy URL для httpx-клиента.
+
+    Mirror логика из base._iproyal_proxy_for, возвращает один URL для httpx.
+    IPRoyal — приоритетный provider (дешевле BD, без KYC).
+    """
+    username = os.getenv("IPROYAL_USERNAME")
+    password = os.getenv("IPROYAL_PASSWORD")
+    if not username or not password:
+        return None
+    sites_csv = os.getenv("IPROYAL_SITES", "")
+    sites = {s.strip() for s in sites_csv.split(",") if s.strip()}
+    if site_name not in sites:
+        return None
+    country = os.getenv("IPROYAL_COUNTRY", "").strip().lower()
+    if country and "_country-" not in username:
+        username = f"{username}_country-{country}"
+    host = os.getenv("IPROYAL_HOST", "geo.iproyal.com:12321").strip()
+    # IPRoyal residential MITMs HTTPS → use verify=False on httpx.AsyncClient.
+    return f"http://{username}:{password}@{host}"
+
+
 def _brightdata_httpx_proxy_for(site_name: str) -> str | None:
     """Bright Data Residential proxy URL для httpx-клиента.
 
@@ -249,11 +271,13 @@ class AptekonlineScraper(BaseScraper):
         yielded = 0
         params_base = [("categoryId[]", category_id), ("lang", "az")]
 
-        # Proxy resolution: Bright Data → Crawlbase → ScraperAPI → direct.
-        # Provider-specific configs winning over generic env vars; Bright Data
-        # priority #1 since Hetzner IP banned on aptekonline JSON API (HTTP 403).
-        proxy_url = _brightdata_httpx_proxy_for("aptekonline")
-        proxied_via = "brightdata" if proxy_url else None
+        # Proxy resolution: IPRoyal → Bright Data → Crawlbase → ScraperAPI → direct.
+        # IPRoyal первым — дешевле ($1.75/GB vs BD $8/GB) и без KYC.
+        proxy_url = _iproyal_httpx_proxy_for("aptekonline")
+        proxied_via = "iproyal" if proxy_url else None
+        if proxy_url is None:
+            proxy_url = _brightdata_httpx_proxy_for("aptekonline")
+            proxied_via = "brightdata" if proxy_url else None
         if proxy_url is None:
             proxy_url = _crawlbase_httpx_proxy_for("aptekonline")
             proxied_via = "crawlbase" if proxy_url else None
@@ -268,12 +292,16 @@ class AptekonlineScraper(BaseScraper):
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
             client_kwargs["verify"] = False  # MITM HTTPS на любом из этих прокси
+            _country_env_by_provider = {
+                "iproyal": "IPROYAL_COUNTRY",
+                "brightdata": "BRIGHTDATA_COUNTRY",
+                "scraperapi": "SCRAPER_API_COUNTRY",
+            }
             log.info(
                 f"aptekonline_using_{proxied_via}",
-                country=(
-                    os.getenv("BRIGHTDATA_COUNTRY")
-                    if proxied_via == "brightdata"
-                    else os.getenv("SCRAPER_API_COUNTRY", "default")
+                country=os.getenv(
+                    _country_env_by_provider.get(proxied_via, "SCRAPER_API_COUNTRY"),
+                    "default",
                 ),
             )
         async with httpx.AsyncClient(**client_kwargs) as client:

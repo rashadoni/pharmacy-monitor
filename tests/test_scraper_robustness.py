@@ -112,6 +112,81 @@ def test_scraperapi_proxy_handles_whitespace_in_csv(monkeypatch):
     assert base._scraperapi_proxy_for("aloe") is None
 
 
+# ─── IPRoyal residential (Phase 1.2b) ───────────────────────────────────────
+
+
+def _clear_iproyal_env(monkeypatch):
+    for k in ("IPROYAL_USERNAME", "IPROYAL_PASSWORD", "IPROYAL_SITES",
+              "IPROYAL_HOST", "IPROYAL_COUNTRY"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_iproyal_proxy_returns_none_without_username(monkeypatch):
+    _clear_iproyal_env(monkeypatch)
+    monkeypatch.setenv("IPROYAL_PASSWORD", "secret")
+    monkeypatch.setenv("IPROYAL_SITES", "pharmonline")
+    assert base._iproyal_proxy_for("pharmonline") is None
+
+
+def test_iproyal_proxy_returns_none_without_password(monkeypatch):
+    _clear_iproyal_env(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "user1")
+    monkeypatch.setenv("IPROYAL_SITES", "pharmonline")
+    assert base._iproyal_proxy_for("pharmonline") is None
+
+
+def test_iproyal_proxy_skips_site_not_in_list(monkeypatch):
+    _clear_iproyal_env(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "user1")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "p")
+    monkeypatch.setenv("IPROYAL_SITES", "pharmonline")
+    assert base._iproyal_proxy_for("aloe") is None
+
+
+def test_iproyal_proxy_default_endpoint(monkeypatch):
+    _clear_iproyal_env(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "user1")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "p")
+    monkeypatch.setenv("IPROYAL_SITES", "pharmonline")
+    cfg = base._iproyal_proxy_for("pharmonline")
+    assert cfg == {
+        "server": "http://geo.iproyal.com:12321",
+        "username": "user1",
+        "password": "p",
+    }
+
+
+def test_iproyal_proxy_appends_country(monkeypatch):
+    _clear_iproyal_env(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "user1")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "p")
+    monkeypatch.setenv("IPROYAL_SITES", "pharmonline")
+    monkeypatch.setenv("IPROYAL_COUNTRY", "tr")
+    cfg = base._iproyal_proxy_for("pharmonline")
+    # IPRoyal uses underscore syntax, not dash
+    assert cfg["username"] == "user1_country-tr"
+
+
+def test_iproyal_proxy_does_not_double_country(monkeypatch):
+    _clear_iproyal_env(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "user1_country-az")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "p")
+    monkeypatch.setenv("IPROYAL_SITES", "pharmonline")
+    monkeypatch.setenv("IPROYAL_COUNTRY", "tr")
+    cfg = base._iproyal_proxy_for("pharmonline")
+    assert cfg["username"] == "user1_country-az"
+
+
+def test_iproyal_proxy_custom_host(monkeypatch):
+    _clear_iproyal_env(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "u")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "p")
+    monkeypatch.setenv("IPROYAL_SITES", "pharmonline")
+    monkeypatch.setenv("IPROYAL_HOST", "premium.iproyal.com:6000")
+    cfg = base._iproyal_proxy_for("pharmonline")
+    assert cfg["server"] == "http://premium.iproyal.com:6000"
+
+
 # ─── Bright Data residential (Phase 1.2) ────────────────────────────────────
 
 

@@ -62,6 +62,48 @@ def _redact_proxy(url: str) -> str:
     return f"{scheme}://***@{host}" if scheme else f"***@{host}"
 
 
+def _iproyal_proxy_for(site_name: str) -> dict | None:
+    """Return Playwright proxy config for IPRoyal Residential when site enabled.
+
+    Phase 1.2b (2026-05-27) — IPRoyal added as a cheaper alternative to Bright
+    Data: $1.75/GB vs $8/GB, no KYC. Used when BD compliance restrictions block
+    target (e.g. pharmonline.az where BD Web Unlocker returns 502).
+
+    Env vars:
+      IPROYAL_USERNAME    Dashboard username (just account name, not zone)
+      IPROYAL_PASSWORD    Account password
+      IPROYAL_SITES       CSV of site_names that should route through it
+                          (e.g. "pharmonline" — leave aptekonline on BD)
+      IPROYAL_HOST        Override endpoint (default geo.iproyal.com:12321)
+      IPROYAL_COUNTRY     Optional ISO-2 (e.g. "tr", "az"). IPRoyal supports
+                          `username_country-tr_session-...` suffix syntax;
+                          when set, appended as `_country-XX` to username.
+
+    Returns None when creds or site list missing → caller falls through to the
+    next provider in chain (Bright Data → Crawlbase → ScraperAPI → direct).
+    """
+    username = os.getenv("IPROYAL_USERNAME")
+    password = os.getenv("IPROYAL_PASSWORD")
+    if not username or not password:
+        return None
+    sites_csv = os.getenv("IPROYAL_SITES", "")
+    sites = {s.strip() for s in sites_csv.split(",") if s.strip()}
+    if site_name not in sites:
+        return None
+    country = os.getenv("IPROYAL_COUNTRY", "").strip().lower()
+    # IPRoyal username suffix syntax: `<user>_country-XX_session-<id>`.
+    # We add only country; sticky sessions are not needed for our diff-only
+    # daily scrape (rotation per request is fine).
+    if country and "_country-" not in username:
+        username = f"{username}_country-{country}"
+    host = os.getenv("IPROYAL_HOST", "geo.iproyal.com:12321").strip()
+    return {
+        "server": f"http://{host}",
+        "username": username,
+        "password": password,
+    }
+
+
 def _brightdata_proxy_for(site_name: str) -> dict | None:
     """Return Playwright proxy config for Bright Data Residential when site is enabled.
 
@@ -242,16 +284,27 @@ class BaseScraper(ABC):
         self._playwright = await async_playwright().start()
 
         # Proxy resolution order (first match wins):
-        #   1. Bright Data residential (BRIGHTDATA_USERNAME/PASSWORD + BRIGHTDATA_SITES)
-        #   2. Crawlbase Smart Proxy (CRAWLBASE_JS_TOKEN + CRAWLBASE_SITES)
-        #   3. ScraperAPI per-site config (SCRAPER_API_KEY + SCRAPER_API_SITES)
-        #   4. Generic HTTP_PROXY / SCRAPE_PROXY env (single proxy for everything)
+        #   1. IPRoyal residential (IPROYAL_USERNAME/PASSWORD + IPROYAL_SITES)
+        #      — cheapest ($1.75/GB), no KYC
+        #   2. Bright Data residential (BRIGHTDATA_USERNAME/PASSWORD + SITES)
+        #      — $8/GB ISP or Web Unlocker $1.50/CPM, KYC required for some targets
+        #   3. Crawlbase Smart Proxy (CRAWLBASE_JS_TOKEN + CRAWLBASE_SITES)
+        #   4. ScraperAPI per-site config (SCRAPER_API_KEY + SCRAPER_API_SITES)
+        #   5. Generic HTTP_PROXY / SCRAPE_PROXY env (single proxy for everything)
         # Provider-specific configs take precedence so aloe (works direct from
         # Hetzner) не burn'ит платные credits.
         launch_args: dict = {"headless": self.headless}
         proxied_via = None
-        brightdata_cfg = _brightdata_proxy_for(self.site_name)
-        if brightdata_cfg:
+        iproyal_cfg = _iproyal_proxy_for(self.site_name)
+        if iproyal_cfg:
+            launch_args["proxy"] = iproyal_cfg
+            proxied_via = "iproyal"
+            log.info(
+                "scrape_using_iproyal",
+                site=self.site_name,
+                country=os.getenv("IPROYAL_COUNTRY", "default"),
+            )
+        elif (brightdata_cfg := _brightdata_proxy_for(self.site_name)):
             launch_args["proxy"] = brightdata_cfg
             proxied_via = "brightdata"
             log.info(
@@ -283,11 +336,13 @@ class BaseScraper(ABC):
                         log.info("scrape_using_proxy", proxy=_redact_proxy(proxy_url))
 
         self._browser = await self._playwright.chromium.launch(**launch_args)
-        # Bright Data + Crawlbase + ScraperAPI прокси MITM'ят HTTPS self-signed
-        # серт → Chromium блокирует с ERR_CERT_AUTHORITY_INVALID без явного
-        # relaxation. Только если реально через managed proxy идёт — direct и
-        # generic-proxy остаются strict (там не должно быть MITM).
-        ignore_https_errors = proxied_via in ("brightdata", "crawlbase", "scraperapi")
+        # IPRoyal + Bright Data + Crawlbase + ScraperAPI прокси MITM'ят HTTPS
+        # self-signed серт → Chromium блокирует с ERR_CERT_AUTHORITY_INVALID
+        # без явного relaxation. Только если реально через managed proxy идёт
+        # — direct и generic-proxy остаются strict (там не должно быть MITM).
+        ignore_https_errors = proxied_via in (
+            "iproyal", "brightdata", "crawlbase", "scraperapi"
+        )
         self._context = await self._browser.new_context(
             user_agent=random_user_agent(),
             viewport=random_viewport(),
