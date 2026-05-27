@@ -362,6 +362,14 @@
     "hide_aria": "Xatırlatmanı gizlət",
     "hide_title": "Gizlət"
   },
+  "staleness": {
+    "title": "Saytlar üzrə məlumat təzəliyi",
+    "auto_refresh": "Hər dəqiqədə yenilənir",
+    "no_data": "Məlumat yoxdur",
+    "minutes_ago": "{n} dəq əvvəl",
+    "hours_ago": "{n} saat əvvəl",
+    "days_ago": "{n} gün əvvəl"
+  },
   "matches_review": {
     "title": "Şübhəli uyğunlaşmaların yoxlanışı",
     "subtitle": "Matcher-in əmin olmadığı uyğunlaşmalar. Təsdiqlə və ya rədd et — bu gələcək proseslərin dəqiqliyini artıracaq.",

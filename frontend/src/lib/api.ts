@@ -400,6 +400,22 @@ export interface NotifPrefs {
 
 // ─── API calls ─────────────────────────────────────────────────────────────
 
+export interface HealthSite {
+  site: string;
+  last_seen_at: string | null;
+  hours_since: number | null;
+}
+
+export interface Health {
+  status: "up" | "degraded";
+  last_run_at: string | null;
+  last_run_status: string | null;
+  db_ping_ms: number | null;
+  redis_ping_ms: number | null;
+  sites: HealthSite[];
+  staleness_warning: boolean;
+}
+
 export const api = {
   // Auth
   authRequest: (email: string) =>
@@ -408,6 +424,9 @@ export const api = {
       body: JSON.stringify({ email }),
     }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
+
+  // Health (public, no auth)
+  health: () => request<Health>("/health"),
 
   // User
   me: () => request<MeOut>("/api/v1/dash/me"),

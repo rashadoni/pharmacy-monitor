@@ -1,10 +1,10 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, CheckCircle2, AlertCircle, AlertTriangle } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
-import { api, type RunRow, type RoiAction } from "@/lib/api";
+import { api, type RunRow, type RoiAction, type HealthSite } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { QuickActions } from "@/components/quick-actions";
 import { formatRelative, formatPrice } from "@/lib/utils";
@@ -17,6 +17,13 @@ export default function OverviewPage() {
   const normalizeQ = useQuery({ queryKey: ["normalize-stats"], queryFn: api.normalizeStats });
   const actionsQ = useQuery({ queryKey: ["roi-actions", locale], queryFn: () => api.roiActions(undefined, locale) });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
+  // Phase 5.6: live staleness panel. Refresh every 60s automatically.
+  const healthQ = useQuery({
+    queryKey: ["health"],
+    queryFn: api.health,
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
   const [expandedRun, setExpandedRun] = useState<number | null>(null);
 
   return (
@@ -43,6 +50,9 @@ export default function OverviewPage() {
         </div>
         <QuickActions />
       </div>
+
+      {/* Phase 5.6 — Per-site staleness panel */}
+      {healthQ.data && <SiteStalenessPanel sites={healthQ.data.sites} />}
 
       {/* KPI cards */}
       <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
@@ -404,5 +414,72 @@ function StatusBadge({ status }: { status: string }) {
     <span className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${cls}`}>
       {status}
     </span>
+  );
+}
+
+/** Phase 5.6 — Per-site freshness panel using /health staleness data. */
+function SiteStalenessPanel({ sites }: { sites: HealthSite[] }) {
+  const t = useTranslations("staleness");
+  if (!sites.length) return null;
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+          {t("title")}
+        </h2>
+        <span className="text-xs text-muted-foreground">{t("auto_refresh")}</span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        {sites.map((s) => (
+          <SiteStalenessCell key={s.site} site={s} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SiteStalenessCell({ site }: { site: HealthSite }) {
+  const t = useTranslations("staleness");
+  const hours = site.hours_since;
+  // Threshold rules:
+  //   green:  <8h (scrape happened within last shift)
+  //   yellow: 8-30h (between two daily runs is OK; >30h is suspicious)
+  //   red:    >=30h or null (stale enough to flag)
+  let tone: "green" | "yellow" | "red" = "green";
+  let Icon = CheckCircle2;
+  if (hours === null) {
+    tone = "red";
+    Icon = AlertCircle;
+  } else if (hours >= 30) {
+    tone = "red";
+    Icon = AlertCircle;
+  } else if (hours >= 8) {
+    tone = "yellow";
+    Icon = AlertTriangle;
+  }
+  const toneClasses = {
+    green: "bg-green-500/10 text-green-700 dark:text-green-400 border-green-500/20",
+    yellow: "bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border-yellow-500/20",
+    red: "bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20",
+  };
+
+  const ageText =
+    hours === null
+      ? t("no_data")
+      : hours < 1
+      ? t("minutes_ago", { n: Math.round(hours * 60) })
+      : hours < 24
+      ? t("hours_ago", { n: Math.round(hours) })
+      : t("days_ago", { n: Math.round(hours / 24) });
+
+  return (
+    <div className={`flex items-center gap-3 rounded-md border p-3 ${toneClasses[tone]}`}>
+      <Icon className="h-5 w-5 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <div className="font-medium text-sm truncate">{site.site}.az</div>
+        <div className="text-xs opacity-80">{ageText}</div>
+      </div>
+    </div>
   );
 }

@@ -362,6 +362,14 @@
     "hide_aria": "Hide reminder",
     "hide_title": "Hide"
   },
+  "staleness": {
+    "title": "Per-site data freshness",
+    "auto_refresh": "Refreshes every minute",
+    "no_data": "No data",
+    "minutes_ago": "{n} min ago",
+    "hours_ago": "{n}h ago",
+    "days_ago": "{n}d ago"
+  },
   "matches_review": {
     "title": "Match Review Queue",
     "subtitle": "Matches the auto-matcher wasn't confident about. Confirm or reject to improve future accuracy.",
