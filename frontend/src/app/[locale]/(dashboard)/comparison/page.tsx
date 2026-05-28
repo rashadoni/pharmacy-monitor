@@ -218,12 +218,19 @@ export default function ComparisonPage() {
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
               <th className="px-3 py-2 text-left">{t("th_name")}</th>
+              {/* Bug fix 2026-05-28: TBODY row рендерил отдельную колонку
+                  с brand — но в THEAD её не было, и из-за этого визуальный
+                  alignment всех price-колонок съезжал на 1 (например
+                  pharmonline price оказывалась под "aptekonline" header).
+                  Добавляем явный th_brand. */}
+              <th className="px-3 py-2 text-left">{t("th_brand")}</th>
               {visibleSites.map((s) => (
                 <th key={s} className="px-3 py-2 text-right">
                   {s}
                 </th>
               ))}
               <th className="px-3 py-2 text-right">{t("th_spread")}</th>
+              <th className="px-3 py-2 w-10"></th>
               <th className="px-3 py-2 w-10"></th>
             </tr>
           </thead>
