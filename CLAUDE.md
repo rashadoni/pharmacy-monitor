@@ -70,7 +70,53 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 ## Active work-in-progress
 
-**Just installed (2026-05-28)**: **Perplexity MCP + Firecrawl MCP user-scope** для cross-check anti-hallucination и web scraping fallback.
+**Just finished (2026-05-28 morning)**: **9 MCPs всё user-scope + persistent Postgres tunnel + overnight pipeline green + 4 commits pushed**.
+
+### MCP stack (`~/.claude.json`, user-scope, во всех проектах):
+
+| MCP | Purpose | Cost | Tools | Notes |
+|---|---|---|---|---|
+| `openrouter-sonar` | Existing Sonar (4 tools) | OpenRouter credits exhausted — нужен top-up | 4 (sonar_ask/reason/research/search) | Backup для cross-check, сейчас 402 |
+| `perplexity-ask` | Anti-hallucination primary | $50 prepaid, ~$0.005-0.02/req | 1 (perplexity_ask) | Sonar Pro native API |
+| `firecrawl` | Web scraping + extraction | Free 1000/мес (988 left) | ~24 (scrape, crawl, map, search, extract, monitor, agent, interact, browser_*) | **Cloudflare bypass работает для pharmonline** ✓ |
+| `memory` | Persistent cross-session knowledge graph | Free local | 9 (create/search/delete entities, relations, observations) | JSON-граф local |
+| `postgres` | Direct DB queries без SSH | Free local | 19 (pg_execute_query/sql/mutation, pg_manage_*, pg_monitor) | Через persistent SSH tunnel `:5433` |
+| `github` | PRs/issues/code search natively | Free | ~40+ (create_pr, search_code, get_file_contents, push_files, list_*, manage reviews) | PAT, repo `rashadrahimov/pharmacy-monitor` |
+| `brave-search` | Independent search engine для cross-check | Free 2000/мес | 6 (web/news/image/video/local/llm_context_search) | Заменяет dead openrouter-sonar |
+| `playwright` | Cross-browser automation (E2E) | Free local (300MB Chromium) | 23 (browser_navigate/click/fill/snapshot/screenshot/evaluate, тaby/dialog/network) | Microsoft official |
+| `chrome-devtools` | Debug live Chrome (Network/Console/Perf) | Free local | 30+ (navigate, click, list_network_requests, performance_*, lighthouse, take_heapsnapshot) | Google Chrome team official |
+
+### Persistent SSH tunnel for Postgres MCP
+
+- launchd plist: `~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist`
+- Tracked в проекте: `infra/local/com.pharmacy-monitor.db-tunnel.plist`
+- Logs: `~/Library/Logs/pharmacy-monitor-db-tunnel.log`
+- Auto-start при логине, auto-restart если SSH упадёт, ThrottleInterval=30s
+- Management: `launchctl bootout|bootstrap gui/$UID/com.pharmacy-monitor.db-tunnel`
+
+### Overnight pipeline verified 2026-05-28 (все 5 runs green):
+
+| Run | UTC | Site | Dur | Products | Type |
+|---|---|---|---|---|---|
+| 110 | 01:02 | pharmonline | 28m | 261,519 | nightly timer |
+| 111 | 02:04 | aptekonline | 65m | 89,375 | Mac launchd |
+| 112 | 03:04 | aloe | 27m | 1,874 | nightly timer |
+| 113 | 05:00 | pharmonline | 7m | 10,000 | **Phase 5.1 intraday ✓** |
+| 114 | 06:00 | aloe | 5m | 64 | **Phase 5.1 intraday ✓** |
+
+Backup 04:02 UTC ✓ (GPG encrypted, 10MB). /health up, db 0.97ms, redis 3.03ms, all sites < 4h fresh.
+
+### Exposed API keys (rotate when convenient):
+- Perplexity: `pplx-9JgqRvCJ...` — perplexity.ai/settings/api → Regenerate
+- Firecrawl: `fc-d0f71c2c...` — firecrawl.dev/dashboard → API Keys → Regenerate
+- Brave: `BSAMo35R...` — api-dashboard.search.brave.com/app/keys → Revoke + new
+- GitHub PAT: `github_pat_11BZ7WQWY00X...` — github.com/settings/personal-access-tokens → revoke
+
+After rotation, re-register via `claude mcp remove <name> -s user && claude mcp add ...`.
+
+---
+
+**Just installed (2026-05-28 0:00)**: **Perplexity MCP + Firecrawl MCP user-scope** для cross-check anti-hallucination и web scraping fallback.
 
 **Perplexity MCP** (`perplexity-ask`):
 - Config: `/Users/rashadrahimov/.claude.json` → `npx -y server-perplexity-ask`

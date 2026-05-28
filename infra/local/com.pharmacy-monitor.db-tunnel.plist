@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pharmacy-monitor.db-tunnel</string>
+
+    <!-- SSH tunnel: Mac:5433 → prod 46.225.149.52:5432 for Postgres MCP -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/ssh</string>
+        <string>-i</string>
+        <string>/Users/rashadrahimov/.ssh/id_ed25519</string>
+        <string>-N</string>
+        <string>-T</string>
+        <string>-L</string>
+        <string>5433:localhost:5432</string>
+        <!-- keep-alive: ping every 30s, drop after 3 missed -->
+        <string>-o</string>
+        <string>ServerAliveInterval=30</string>
+        <string>-o</string>
+        <string>ServerAliveCountMax=3</string>
+        <!-- fail fast if port already used or auth fails -->
+        <string>-o</string>
+        <string>ExitOnForwardFailure=yes</string>
+        <!-- non-interactive (no password prompts) -->
+        <string>-o</string>
+        <string>BatchMode=yes</string>
+        <!-- accept new host keys automatically (we already trust this host) -->
+        <string>-o</string>
+        <string>StrictHostKeyChecking=accept-new</string>
+        <string>root@46.225.149.52</string>
+    </array>
+
+    <!-- Start when user logs in (or `launchctl load`) -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if process dies (network blip, server reboot, etc.) -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Wait 30s between restart attempts to avoid hammering -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Logs -->
+    <key>StandardOutPath</key>
+    <string>/Users/rashadrahimov/Library/Logs/pharmacy-monitor-db-tunnel.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/rashadrahimov/Library/Logs/pharmacy-monitor-db-tunnel.log</string>
+
+    <!-- Don't run if not logged in (avoids issues with screen-locked state) -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
