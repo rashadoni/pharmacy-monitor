@@ -39,11 +39,21 @@ class BrandRow:
     exclusive_to: str | None  # site если бренд только у одного, иначе None
 
 
-def brand_share(session: Session, *, run_id: int | None = None, top_n: int = 30) -> list[BrandRow]:
+def brand_share(
+    session: Session,
+    *,
+    run_id: int | None = None,
+    top_n: int = 30,
+    site: str | None = None,
+) -> list[BrandRow]:
     """Сводка: каких брендов сколько на каждом сайте.
 
     Возвращает список отсортированный по `total` desc, ограниченный top_n.
     Брэнды с пустым именем игнорируются.
+
+    Если `site` указан — оставляем только бренды представленные на этом сайте
+    (для site-specific dashboard view). Counts всё равно показывают разбивку
+    по всем сайтам — нужно для понимания exclusivity.
     """
     if run_id is None:
         run_id = session.scalar(
@@ -52,12 +62,13 @@ def brand_share(session: Session, *, run_id: int | None = None, top_n: int = 30)
         if run_id is None:
             return []
 
-    rows = session.execute(
+    stmt = (
         select(Product.brand, Product.site, func.count(Product.id))
         .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
         .where(PriceSnapshot.run_id == run_id, Product.brand.is_not(None))
         .group_by(Product.brand, Product.site)
-    ).all()
+    )
+    rows = session.execute(stmt).all()
 
     # P0.2 (PO Audit 2026-05-17): runtime фильтр generic-слов попавших в
     # brand-поле. Backfill cleanup-скрипт чистит БД, но если новые скрейпы
@@ -76,6 +87,11 @@ def brand_share(session: Session, *, run_id: int | None = None, top_n: int = 30)
     for brand, counts in by_brand.items():
         total = sum(counts.values())
         sites_with = sum(1 for v in counts.values() if v > 0)
+        # Site filter (Phase 6-fix 2026-05-28): если запросили конкретный сайт,
+        # оставляем только бренды представленные на этом сайте. Counts всё равно
+        # показывают полный per-site breakdown — для exclusivity analysis.
+        if site is not None and counts.get(site, 0) == 0:
+            continue
         exclusive = None
         if sites_with == 1:
             exclusive = next(s for s, v in counts.items() if v > 0)
