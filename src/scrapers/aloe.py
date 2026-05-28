@@ -1,6 +1,6 @@
 """Скрейпер для aloe.az — Next.js, динамический рендер.
 
-Структура (по результатам live-probe 2026-04-28):
+Структура (по результатам live-probe 2026-04-28, обновлено 2026-05-28):
 - Categories:    https://aloe.az/catalog/filters/?product_field=bestseller
                  https://aloe.az/catalog/filters/?category_slug={slug}
 - Product page:  https://aloe.az/{slug}/   ← БЕЗ /product/ префикса!
@@ -12,13 +12,21 @@
 - Detail title:  `h1[class*="style_title"]`
 - Detail price:  `[class*="priceWrapper"] [class*="style_price"]` → e.g. "4.03"
 
-Карточка не имеет href — для извлечения URL нужно либо клик-навигация,
-либо синтез slug из имени. Для category-режима пишем имя/цену из карточки
-без URL (url='listing-url' — placeholder). Для watchlist-режима юзер даёт URL.
+URL synth (Task #33 fix, 2026-05-28):
+Карточка не имеет href, но клик-навигация через Playwright MCP подтвердила
+паттерн: slug = lowercase + Azeri-to-ASCII + remove punctuation + space→dash.
+
+  'Vitamin B1 5% 1 ml 10 əd.'        → vitamin-b1-5-1-ml-10-ed
+  'Diampa-M 12,5 mq/1000 mq 28 əd'   → diampa-m-125-mq1000-mq-28-ed
+  'Şüşə və əmzik fırçası'             → suse-ve-emzik-fircasi
+
+Если product page по synth-slug не существует — будет 404, но это лучше чем
+гарантированно неправильный listing-URL (предыдущее поведение для всех 1809 aloe products).
 """
 
 from __future__ import annotations
 
+import re
 from typing import AsyncIterator
 
 import structlog
@@ -32,6 +40,44 @@ from src.normalize import (
 from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapedPromo
 
 log = structlog.get_logger()
+
+
+# ─── Azeri → ASCII transliteration (Task #33, 2026-05-28) ────────────────────
+# Aloe.az генерирует URL slug из product name по этим правилам.
+# Verified via Playwright MCP click-navigation на 3 products.
+_AZERI_TO_ASCII = str.maketrans({
+    "ə": "e", "Ə": "e",
+    "ı": "i", "İ": "i",  # dotless + dotted I
+    "ö": "o", "Ö": "o",
+    "ü": "u", "Ü": "u",
+    "ş": "s", "Ş": "s",
+    "ç": "c", "Ç": "c",
+    "ğ": "g", "Ğ": "g",
+})
+
+# Punctuation которая удаляется БЕЗ замены (12,5 → 125, не 12-5).
+_PUNCT_REMOVE_RE = re.compile(r"[,/.%()\[\]'\"!?:;«»“”]+")
+
+
+def aloe_slug(name: str) -> str:
+    """Convert product name → URL slug as aloe.az generates it.
+
+    Returns empty string for empty input (callers should fallback to listing URL).
+
+    Order matters: translate FIRST (handles `İ` → `i` before `.lower()` produces
+    combining-dot `i̇`), THEN lowercase, THEN strip punctuation.
+    """
+    if not name:
+        return ""
+    s = name.strip()
+    s = s.translate(_AZERI_TO_ASCII)  # İ→i, Ə→e BEFORE lower() screws up İ
+    s = s.lower()
+    s = _PUNCT_REMOVE_RE.sub("", s)
+    # Whitespace runs → single dash, then collapse multiple dashes
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"-+", "-", s)
+    s = s.strip("-")
+    return s
 
 
 class AloeScraper(BaseScraper):
@@ -180,13 +226,21 @@ class AloeScraper(BaseScraper):
         promo_text = (await promo_handle.inner_text()).strip() if promo_handle else None
         promo_label = promo_text if promo_text and len(promo_text) < 50 else None
 
-        # external_id: aloe не даёт стабильного id в карточке, генерируем из имени
-        external_id = name.lower().replace(" ", "-")[:100]
+        # external_id: aloe не даёт стабильного id в карточке, генерируем из имени.
+        # Task #33 (2026-05-28): используем aloe_slug, идентичен URL slug → стабильность
+        # внешнего id между runs + точное соответствие detail page URL.
+        slug = aloe_slug(name)
+        external_id = slug[:100] if slug else name.lower().replace(" ", "-")[:100]
+
+        # URL synthesis (Task #33 fix): aloe.az/{slug}/ — verified via Playwright MCP
+        # click-navigation. Fallback на listing_url если slugification failed
+        # (empty slug, edge case с не-Azeri/Latin/Cyrillic chars).
+        product_url = f"{self.base_url}/{slug}/" if slug else listing_url
 
         return ScrapedProduct(
             site=self.site_name,
             external_id=external_id,
-            url=listing_url,  # на карточке нет href — fallback
+            url=product_url,
             name=name,
             brand=brand,
             category=category,
