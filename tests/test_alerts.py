@@ -214,3 +214,221 @@ def test_only_specific_rule_when_rule_ids_filter(db_session):
 
     fired = alerts.evaluate_rules(db_session, run.id, rule_ids=[r1.id])
     assert all(f.rule_id == r1.id for f in fired)
+
+
+# === DETECTOR — price_raise_opportunity ===
+
+
+def test_price_raise_opportunity_fires_when_client_below_median(db_session):
+    """Клиент дешевле медианы конкурентов на >= min_pct → fires."""
+    m = _make_match(db_session, "Vitamins")
+    p_client = _add_product(db_session, "pharmonline", "V", "ph", canonical_id=m.id)
+    p_a = _add_product(db_session, "aptekonline", "V", "ap", canonical_id=m.id)
+    p_o = _add_product(db_session, "aloe", "V", "al", canonical_id=m.id)
+    run = _add_run(db_session)
+    _add_snap(db_session, run, p_client, 8.0)
+    _add_snap(db_session, run, p_a, 10.0)
+    _add_snap(db_session, run, p_o, 11.0)
+    db_session.commit()
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+    assert len(cands) == 1
+    assert cands[0].severity == "info"
+    assert "Vitamins" in cands[0].title
+    # gap_pct = (10 - 8) / 8 * 100 = 25% (median = 10)
+    assert cands[0].payload["gap_pct"] >= 24.0
+
+
+def test_price_raise_opportunity_no_fire_when_below_min_pct(db_session):
+    """Gap < min_pct → no fire."""
+    m = _make_match(db_session, "X")
+    p_client = _add_product(db_session, "pharmonline", "X", "ph", canonical_id=m.id)
+    p_a = _add_product(db_session, "aloe", "X", "al", canonical_id=m.id)
+    run = _add_run(db_session)
+    _add_snap(db_session, run, p_client, 9.5)
+    _add_snap(db_session, run, p_a, 10.0)  # 5.3% gap
+    db_session.commit()
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 10.0})
+    assert cands == []
+
+
+def test_price_raise_opportunity_no_fire_when_client_higher(db_session):
+    """Клиент дороже конкурентов → не предлагаем поднять (бессмысленно)."""
+    m = _make_match(db_session, "X")
+    p_client = _add_product(db_session, "pharmonline", "X", "ph", canonical_id=m.id)
+    p_a = _add_product(db_session, "aloe", "X", "al", canonical_id=m.id)
+    run = _add_run(db_session)
+    _add_snap(db_session, run, p_client, 12.0)
+    _add_snap(db_session, run, p_a, 10.0)
+    db_session.commit()
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+    assert cands == []
+
+
+def test_price_raise_opportunity_skips_match_without_competitor(db_session):
+    """Only-client match → не fire (нечего сравнивать)."""
+    m = _make_match(db_session, "X")
+    p_client = _add_product(db_session, "pharmonline", "X", "ph", canonical_id=m.id)
+    run = _add_run(db_session)
+    _add_snap(db_session, run, p_client, 10.0)
+    db_session.commit()
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+    assert cands == []
+
+
+# === DISPATCH ===
+
+
+def _stub_notifier(monkeypatch):
+    """Подменяем notifier.send_email и send_telegram_message."""
+    import src.notifier as real_notifier
+
+    calls = {"email": [], "telegram": []}
+
+    def fake_email(subject, html_body):
+        calls["email"].append({"subject": subject, "html_body": html_body})
+
+    def fake_telegram(chat_id, text, parse_mode="Markdown"):
+        calls["telegram"].append({"chat_id": chat_id, "text": text})
+        return True
+
+    monkeypatch.setattr(real_notifier, "send_email", fake_email)
+    monkeypatch.setattr(real_notifier, "send_telegram_message", fake_telegram)
+    return calls
+
+
+def test_dispatch_event_default_email_only(db_session, monkeypatch):
+    """Event без rule (rule_id=None) → default email channel."""
+    calls = _stub_notifier(monkeypatch)
+    e = AlertEvent(
+        severity="warning",
+        title="Test alert",
+        detail="Some detail",
+        rule_type="test",
+        dedup_key="test-1",
+    )
+    db_session.add(e)
+    db_session.commit()
+    result = alerts.dispatch_event(db_session, e)
+    assert result == {"email": "sent"}
+    assert len(calls["email"]) == 1
+    assert "Test alert" in calls["email"][0]["subject"]
+    assert e.channels_sent == ["email"]
+
+
+def test_dispatch_event_email_and_telegram(db_session, monkeypatch):
+    """rule.channels=['email','telegram'] + recipient с chat_id → отправка по обоим."""
+    calls = _stub_notifier(monkeypatch)
+    rule = _add_rule(db_session, "undercut_threshold", channels=["email", "telegram"])
+    # Recipient с привязанным chat_id
+    from src.storage import Recipient
+
+    db_session.add(Recipient(email="user@x", is_active=True, telegram_chat_id="555"))
+    e = AlertEvent(
+        severity="critical",
+        title="Big alert",
+        detail="D",
+        rule_type="undercut_threshold",
+        dedup_key="k1",
+        rule_id=rule.id,
+    )
+    db_session.add(e)
+    db_session.commit()
+    result = alerts.dispatch_event(db_session, e)
+    assert result["email"] == "sent"
+    assert "sent to 1/1" in result["telegram"]
+    assert len(calls["email"]) == 1
+    assert len(calls["telegram"]) == 1
+    assert calls["telegram"][0]["chat_id"] == "555"
+
+
+def test_dispatch_event_telegram_no_chat_ids_skipped(db_session, monkeypatch):
+    """Если нет recipient'ов с chat_id → 'skipped: no telegram chat_ids'."""
+    _stub_notifier(monkeypatch)
+    rule = _add_rule(db_session, "undercut_threshold", channels=["telegram"])
+    e = AlertEvent(
+        severity="warning",
+        title="T",
+        detail="d",
+        rule_type="undercut_threshold",
+        dedup_key="k2",
+        rule_id=rule.id,
+    )
+    db_session.add(e)
+    db_session.commit()
+    result = alerts.dispatch_event(db_session, e)
+    assert "skipped" in result["telegram"]
+
+
+def test_dispatch_event_email_smtp_failure_returns_error(db_session, monkeypatch):
+    """SMTP-exception → result['email'] starts with 'error:'."""
+    import src.notifier as real_notifier
+
+    def boom(*_a, **_kw):
+        raise ConnectionError("smtp down")
+
+    monkeypatch.setattr(real_notifier, "send_email", boom)
+
+    rule = _add_rule(db_session, "undercut_threshold", channels=["email"])
+    e = AlertEvent(
+        severity="warning",
+        title="Boom",
+        detail="d",
+        rule_type="undercut_threshold",
+        dedup_key="k3",
+        rule_id=rule.id,
+    )
+    db_session.add(e)
+    db_session.commit()
+    result = alerts.dispatch_event(db_session, e)
+    assert result["email"].startswith("error:")
+
+
+def test_dispatch_event_telegram_send_failure_returns_partial(db_session, monkeypatch):
+    """Если send_telegram_message возвращает False для какого-то chat_id —
+    counter sent < total."""
+    import src.notifier as real_notifier
+    from src.storage import Recipient
+
+    def fail_tg(chat_id, text, parse_mode="Markdown"):
+        return chat_id == "ok-chat"
+
+    monkeypatch.setattr(real_notifier, "send_telegram_message", fail_tg)
+    monkeypatch.setattr(real_notifier, "send_email", lambda *_a, **_kw: None)
+
+    rule = _add_rule(db_session, "undercut_threshold", channels=["telegram"])
+    db_session.add_all(
+        [
+            Recipient(email="a@x", is_active=True, telegram_chat_id="ok-chat"),
+            Recipient(email="b@x", is_active=True, telegram_chat_id="bad-chat"),
+        ]
+    )
+    e = AlertEvent(
+        severity="warning",
+        title="Multi",
+        detail="d",
+        rule_type="undercut_threshold",
+        dedup_key="k4",
+        rule_id=rule.id,
+    )
+    db_session.add(e)
+    db_session.commit()
+    result = alerts.dispatch_event(db_session, e)
+    # 1 из 2 успешно
+    assert "sent to 1/2" in result["telegram"]
+
+
+def test_send_email_alert_unknown_severity_uses_dot(db_session, monkeypatch):
+    """severity='??' → emoji '•' (fallback в _send_email_alert)."""
+    calls = _stub_notifier(monkeypatch)
+    e = AlertEvent(
+        severity="strange",
+        title="X",
+        detail="d",
+        rule_type="t",
+        dedup_key="k",
+    )
+    db_session.add(e)
+    db_session.commit()
+    alerts.dispatch_event(db_session, e)
+    assert "[STRANGE]" in calls["email"][0]["subject"]

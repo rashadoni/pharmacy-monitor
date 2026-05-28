@@ -173,6 +173,11 @@ class _Metrics:
         self.runs_total: any = _NoopMetric()
         self.db_query_seconds: any = _NoopMetric()
         self.app_info: any = _NoopMetric()
+        # Phase 5.4 (2026-05-28) — HTTP-level metrics for API alerting rules.
+        # Labels: status (2xx/3xx/4xx/5xx bucket — высокая cardinality для exact
+        # code'ов исключена), endpoint (path или route name).
+        self.api_requests_total: any = _NoopMetric()
+        self.api_request_duration_seconds: any = _NoopMetric()
 
     def init(self) -> None:
         if self._initialized:
@@ -226,6 +231,17 @@ class _Metrics:
                 "DB query duration",
                 ["query_type"],
                 buckets=(0.005, 0.01, 0.05, 0.1, 0.5, 1, 5),
+            )
+            self.api_requests_total = Counter(
+                "pharmacy_api_requests_total",
+                "HTTP requests handled by FastAPI",
+                ["status", "method"],
+            )
+            self.api_request_duration_seconds = Histogram(
+                "pharmacy_api_request_duration_seconds",
+                "FastAPI request duration",
+                ["status_bucket"],
+                buckets=(0.005, 0.01, 0.05, 0.1, 0.5, 1, 2, 5),
             )
             self.app_info = Info(
                 "pharmacy_app",

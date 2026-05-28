@@ -67,6 +67,7 @@
     "page_subtitle": "Cross-site matched товары. Зелёным — самая низкая цена, красным — самая высокая. Сортировка по |spread| desc.",
     "export_csv_title": "Скачать CSV отфильтрованного списка",
     "no_data": "нет данных",
+    "load_error": "ошибка загрузки",
     "stable_price": "стабильно {price}",
     "diff_only_filter": "Только с различием",
     "with_aloe_filter": "С aloe",
@@ -193,7 +194,11 @@
     "dosage_placeholder": "(если применимо)",
     "form_urls_label": "URL на каждом сайте (опционально)",
     "delete_confirm": "Удалить «{name}»?",
-    "save_error": "Не удалось сохранить"
+    "delete_arm": "Нажми ещё раз чтобы удалить",
+    "save_error": "Не удалось сохранить",
+    "search_placeholder": "Поиск по имени или бренду…",
+    "no_match": "Ничего не найдено",
+    "items_count": "{count, plural, one {# элемент} few {# элемента} many {# элементов} other {# элементов}}"
   },
   "site": {
     "tagline_pharmonline": "Основной клиентский сайт. Каталог, бренды и ROI с перспективы pharmonline.",

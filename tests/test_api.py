@@ -593,3 +593,201 @@ def test_cost_csv_import_imports_valid_rows(client, tenant_user, setup_db):
     assert body["rows_processed"] == 3
     assert body["rows_imported"] == 1
     assert body["rows_skipped"] == 2
+
+
+# ─── Phase 5.2 prep — batch price-history endpoint ───────────────────────────
+
+
+def _seed_history(
+    db,
+    *,
+    site: str,
+    external_id: str,
+    name: str,
+    daily_prices: list[float],
+    tenant_id: int = 1,
+) -> int:
+    """Создаёт продукт + snapshots по одному в день с captured_at=days_ago.
+
+    Возвращает product.id. Каждая цена в `daily_prices` идёт в один из
+    последних len(prices) дней (от старого к новому).
+    """
+    p = storage.Product(
+        tenant_id=tenant_id,
+        site=site,
+        external_id=external_id,
+        url=f"https://{site}.example/p/{external_id}",
+        name=name,
+        name_normalized=name.lower(),
+    )
+    db.add(p)
+    db.flush()
+    n = len(daily_prices)
+    for i, price in enumerate(daily_prices):
+        ts = utcnow() - timedelta(days=n - 1 - i)
+        run = storage.Run(started_at=ts, status="ok", finished_at=ts)
+        db.add(run)
+        db.flush()
+        snap = storage.PriceSnapshot(
+            run_id=run.id,
+            product_id=p.id,
+            price=price,
+            captured_at=ts,
+        )
+        db.add(snap)
+    db.commit()
+    return p.id
+
+
+def _login(client, tenant_user, db):
+    """Возвращает True если JWT доступен и сессия установлена."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    token = tenants.issue_magic_token(db, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+
+
+def test_price_history_batch_returns_dict_keyed_by_id(client, tenant_user, setup_db):
+    """Базовый случай: 2 продукта, оба возвращаются в dict с правильной payload-схемой."""
+    s = setup_db
+    pid1 = _seed_history(
+        s,
+        site="pharmonline",
+        external_id="b-1",
+        name="Drug A",
+        daily_prices=[10.0, 11.0, 12.0],
+    )
+    pid2 = _seed_history(
+        s,
+        site="aloe",
+        external_id="b-2",
+        name="Drug B",
+        daily_prices=[5.0, 5.0, 6.0],
+    )
+    _login(client, tenant_user, s)
+
+    r = client.get(f"/api/v1/dash/products/price-history?ids={pid1},{pid2}&days=30")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body.keys()) == {str(pid1), str(pid2)}
+    a = body[str(pid1)]
+    assert a["product_id"] == pid1
+    assert a["site"] == "pharmonline"
+    assert a["name"] == "Drug A"
+    assert len(a["points"]) == 3
+    assert a["current"] == 12.0
+    assert a["delta_pct"] == 20.0  # (12-10)/10 * 100
+
+
+def test_price_history_batch_skips_other_tenant(client, tenant_user, setup_db):
+    """Продукты другого tenant'а не должны попасть в ответ."""
+    s = setup_db
+    mine = _seed_history(
+        s,
+        site="pharmonline",
+        external_id="mine",
+        name="Mine",
+        daily_prices=[10.0, 11.0],
+    )
+    other = _seed_history(
+        s,
+        site="pharmonline",
+        external_id="other",
+        name="Other",
+        daily_prices=[20.0, 22.0],
+        tenant_id=999,
+    )
+    _login(client, tenant_user, s)
+
+    r = client.get(f"/api/v1/dash/products/price-history?ids={mine},{other}&days=30")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert str(mine) in body
+    assert str(other) not in body
+
+
+def test_price_history_batch_empty_ids_returns_empty(client, tenant_user, setup_db):
+    """ids='' → {} без 400."""
+    s = setup_db
+    _login(client, tenant_user, s)
+    r = client.get("/api/v1/dash/products/price-history?ids=&days=30")
+    assert r.status_code == 200
+    assert r.json() == {}
+
+
+def test_price_history_batch_invalid_ids_400(client, tenant_user, setup_db):
+    """Нечисловые ids → 400."""
+    s = setup_db
+    _login(client, tenant_user, s)
+    r = client.get("/api/v1/dash/products/price-history?ids=abc,def&days=30")
+    assert r.status_code == 400
+
+
+def test_price_history_batch_too_many_ids_400(client, tenant_user, setup_db):
+    """Больше 50 ids → 400 (anti-abuse)."""
+    s = setup_db
+    _login(client, tenant_user, s)
+    ids = ",".join(str(i) for i in range(1, 52))
+    r = client.get(f"/api/v1/dash/products/price-history?ids={ids}&days=30")
+    assert r.status_code == 400
+
+
+def test_price_history_batch_no_snapshots_returns_empty_points(client, tenant_user, setup_db):
+    """Продукт без snapshots → присутствует в ответе с points=[]."""
+    s = setup_db
+    p = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="no-snaps",
+        url="https://x",
+        name="NoSnaps",
+        name_normalized="nosnaps",
+    )
+    s.add(p)
+    s.commit()
+    s.refresh(p)
+    _login(client, tenant_user, s)
+
+    r = client.get(f"/api/v1/dash/products/price-history?ids={p.id}&days=30")
+    assert r.status_code == 200
+    body = r.json()
+    assert str(p.id) in body
+    assert body[str(p.id)]["points"] == []
+    assert body[str(p.id)]["current"] is None
+    assert body[str(p.id)]["delta_pct"] is None
+
+
+def test_price_history_batch_requires_auth(client, setup_db):
+    """Без cookie → 401."""
+    r = client.get("/api/v1/dash/products/price-history?ids=1&days=30")
+    assert r.status_code == 401
+
+
+def test_price_history_batch_rejects_huge_ids_string(client, tenant_user, setup_db):
+    """Codex review fix: `ids` string > 2048 chars → 400 (DoS guard)."""
+    s = setup_db
+    _login(client, tenant_user, s)
+    # 3000 chars of `1,1,1,...` — длиннее лимита но валидные ints
+    huge = ",".join(["1"] * 1500)  # ~3000 chars
+    r = client.get(f"/api/v1/dash/products/price-history?ids={huge}&days=30")
+    assert r.status_code == 400
+
+
+def test_price_history_batch_dedupes_ids(client, tenant_user, setup_db):
+    """Codex review fix: дубли в `ids` собираются в unique set."""
+    s = setup_db
+    pid = _seed_history(
+        s,
+        site="pharmonline",
+        external_id="dup-test",
+        name="Dup",
+        daily_prices=[10.0, 11.0],
+    )
+    _login(client, tenant_user, s)
+    # Шлём 5 раз тот же id — должно работать, не падать на "too many"
+    dup_ids = ",".join([str(pid)] * 5)
+    r = client.get(f"/api/v1/dash/products/price-history?ids={dup_ids}&days=30")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1  # дедуплицировано
+    assert str(pid) in body

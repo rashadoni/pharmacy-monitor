@@ -217,8 +217,11 @@ export default function CategoriesPage() {
 
       {isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
 
-      <div className="rounded-lg border border-border overflow-hidden">
-        <table className="w-full text-sm">
+      {/* Mobile-fix 2026-05-28: было overflow-hidden → 7-колонная таблица
+          обрезалась на 375px. overflow-x-auto + min-w на table — пользователь
+          горизонтально пролистывает на телефоне. */}
+      <div className="rounded-lg border border-border overflow-x-auto">
+        <table className="w-full min-w-[640px] text-sm">
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
               <th className="px-3 py-2 text-left">{t("th_key")}</th>
@@ -339,7 +342,7 @@ function SuggestionsPanel() {
       )}
 
       {notMapped.length > 0 && (
-        <div className="rounded-lg border border-border bg-card overflow-hidden">
+        <div className="rounded-lg border border-border bg-card">
           <div className="px-4 py-3 border-b border-border">
             <h2 className="text-sm font-semibold">
               {t("suggestions_new_title", { count: notMapped.length })}
@@ -348,9 +351,11 @@ function SuggestionsPanel() {
               {t("suggestions_new_desc")}
             </p>
           </div>
-          <table className="w-full text-sm">
-            <thead className="bg-muted/30 text-muted-foreground text-xs">
-              <tr>
+          {/* Mobile-fix 2026-05-28: 5-колонная таблица overflows на 375px */}
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[640px] text-sm">
+              <thead className="bg-muted/30 text-muted-foreground text-xs">
+                <tr>
                 <th className="px-4 py-2 text-left">{siteA}</th>
                 <th className="px-4 py-2 text-left">{siteB}</th>
                 <th className="px-4 py-2 text-right">{t("suggestions_shared_brands_th")}</th>
@@ -400,8 +405,9 @@ function SuggestionsPanel() {
                   </td>
                 </tr>
               ))}
-            </tbody>
-          </table>
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
@@ -410,7 +416,9 @@ function SuggestionsPanel() {
           <summary className="px-4 py-2 cursor-pointer text-sm text-muted-foreground">
             {t("suggestions_mapped_title", { count: mapped.length })}
           </summary>
-          <table className="w-full text-xs">
+          {/* Mobile-fix 2026-05-28: mapped table overflows */}
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[560px] text-xs">
             <tbody>
               {mapped.map((s) => (
                 <tr key={`m-${s.site_a_slug}|${s.site_b_slug}`} className="border-t border-border">
@@ -427,7 +435,8 @@ function SuggestionsPanel() {
                 </tr>
               ))}
             </tbody>
-          </table>
+            </table>
+          </div>
         </details>
       )}
     </div>

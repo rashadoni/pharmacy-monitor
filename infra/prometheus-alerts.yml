@@ -1,0 +1,139 @@
+# Phase 5.4 — Prometheus alerting rules для pharmacy-monitor.
+#
+# Install:
+#   cp infra/prometheus-alerts.yml /etc/prometheus/alerts.yml
+#   # В /etc/prometheus/prometheus.yml дописать:
+#   #   rule_files:
+#   #     - /etc/prometheus/alerts.yml
+#   systemctl restart prometheus
+#
+# Без Alertmanager rules не отсылают notifications — но Prometheus
+# `/alerts` endpoint показывает active firing rules, плюс они логируются.
+# Когда добавим Alertmanager (Phase 5.4+) — webhook → Telegram / SMTP.
+#
+# Метрики emitted из src/observability.py. См. там же список с labels.
+
+groups:
+  - name: pharmacy_scraper_health
+    interval: 1m
+    rules:
+      # Scrape failures spike — больше 5 failures/site за последний час
+      # в течение 10m подряд → почти наверняка sustained scraper outage.
+      - alert: ScraperFailuresHigh
+        expr: |
+          sum by (site) (
+            increase(pharmacy_scrape_failures_total[1h])
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          category: scraper
+        annotations:
+          summary: "Scraper failures spike on {{ $labels.site }}"
+          description: |
+            More than 5 scrape failures on {{ $labels.site }} in the last hour
+            (sustained 10m+). Check journalctl -u pharmacy-monitor-scrape@{{ $labels.site }}.
+
+      # Полное отсутствие successful scrape за 4 часа в рабочее время Баку
+      # (05-21 UTC ≈ 09-01 Asia/Baku). Aloe скрейпится в 03 UTC, pharm/aptek
+      # с Mac 14 UTC — окно покрывает оба.
+      #
+      # Fixed 2026-05-28 (Codex review): прежняя версия использовала `counter * 0`
+      # и неверный chained `hour() >= 5 < 21` — silently misfired. Теперь
+      # `increase(counter[4h]) == 0` корректно ловит "нет ни одного успешного
+      # прогона за последние 4 часа", + valid PromQL для business-hours filter.
+      - alert: ScraperStaleInBusinessHours
+        expr: |
+          sum by (site) (increase(pharmacy_runs_total{status="ok"}[4h])) == 0
+          and (hour() >= 5 and hour() < 21)
+        for: 5m
+        labels:
+          severity: warning
+          category: scraper
+        annotations:
+          summary: "No successful scrape on {{ $labels.site }} for 4h+"
+          description: |
+            Last successful run was >4 hours ago during business hours.
+            Check /health endpoint and systemd timers.
+
+      # Captcha-hit spike (proxy/IP burned) — >3 captchas в час
+      - alert: CaptchaHitsSpike
+        expr: sum by (site) (increase(pharmacy_captcha_hits_total[1h])) > 3
+        for: 5m
+        labels:
+          severity: warning
+          category: scraper
+        annotations:
+          summary: "Captcha challenges spike on {{ $labels.site }}"
+          description: |
+            > 3 captcha hits in last hour — proxy pool likely burned.
+            Rotate via /etc/pharmacy-monitor/env (BRIGHTDATA_ZONE or IPROYAL_USER).
+
+  - name: pharmacy_api_health
+    interval: 1m
+    rules:
+      # Rate-limit 429 burst — нормально иметь редкие, но > 50/min
+      # значит либо frontend bug, либо abusive client.
+      - alert: APIRateLimit429Burst
+        expr: |
+          sum(rate(pharmacy_api_requests_total{status="429"}[5m])) * 60 > 50
+        for: 5m
+        labels:
+          severity: warning
+          category: api
+        annotations:
+          summary: "API rate limit (429) burst"
+          description: |
+            > 50 429 responses/min for 5m+. Possible frontend N+1 pattern
+            or abuse. Check src/api.py call-sites; bump
+            PHARMACY_API_RATE_LIMIT_*_RPM if legit traffic outgrew tier.
+
+      # 5xx error rate — любые > 1/min sustained 5m
+      - alert: API5xxErrors
+        expr: sum(rate(pharmacy_api_requests_total{status=~"5.."}[5m])) * 60 > 1
+        for: 5m
+        labels:
+          severity: critical
+          category: api
+        annotations:
+          summary: "API 5xx error rate elevated"
+          description: |
+            > 1 5xx/min sustained. Check Sentry trace + journalctl -u
+            pharmacy-monitor-api. X-Request-ID in 5xx response correlates
+            to log lines.
+
+  - name: pharmacy_business_logic
+    interval: 1m
+    rules:
+      # Matcher clusters fell — possible mass rejection or DB issue
+      - alert: MatcherClustersDrop
+        expr: |
+          (
+            pharmacy_matcher_clusters_total
+            - pharmacy_matcher_clusters_total offset 24h
+          ) < -20
+        for: 1h
+        labels:
+          severity: warning
+          category: matcher
+        annotations:
+          summary: "Matcher cluster count dropped >20 in 24h"
+          description: |
+            Cross-site match count fell sharply. Either bulk MatchRejection
+            event (intentional) or matcher v2 regression (unintentional).
+            See /api/v1/dash/matches/suggestions for review queue.
+
+      # Alert dispatch backlog — too many AlertEvent rows pending notify
+      - alert: AlertDispatchBacklog
+        expr: sum by (severity) (increase(pharmacy_alert_events_total[15m])) > 10
+        for: 15m
+        labels:
+          severity: warning
+          category: alerts
+        annotations:
+          summary: "Alert dispatch backlog: {{ $labels.severity }} severity"
+          description: |
+            > 10 {{ $labels.severity }} alerts emitted in 15m. Either real
+            market event (price drops cascading) or scraper inserted bad
+            data triggering false-positive alerts (check zero_prices health
+            check).

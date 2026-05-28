@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
@@ -173,26 +173,62 @@ async def _request_id_middleware(request: Request, call_next):
     return response
 
 
-# ─── Rate limiting (in-memory sliding window — to be replaced with Redis) ────
+# ─── Phase 5.4 — HTTP request metrics ────────────────────────────────────────
+# Counter + histogram per response, label cardinality bounded:
+#   status: literal HTTP code как string ("200", "404", "500"…)
+#   method: GET/POST/etc.
+#   status_bucket для histogram'а: "2xx" / "4xx" / "5xx" (sniff'ить latency
+#       per family — успешные обычно быстрее чем 5xx с DB-таймаутом).
 
-_RATE_LIMIT_RPM = int(os.environ.get("PHARMACY_API_RATE_LIMIT_RPM", "100"))
-_RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 
+@app.middleware("http")
+async def _api_metrics_middleware(request: Request, call_next):
+    from src.observability import metrics
 
-def _check_rate_limit(client_key: str, limit: int = _RATE_LIMIT_RPM) -> None:
-    """Sliding window: не более `limit` запросов в минуту от одного клиента."""
-    now = time.time()
-    bucket = _RATE_BUCKETS[client_key]
-    while bucket and bucket[0] < now - 60:
-        bucket.popleft()
-    if len(bucket) >= limit:
-        retry_after = int(60 - (now - bucket[0]))
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded ({limit} req/min)",
-            headers={"Retry-After": str(max(1, retry_after))},
+    t0 = time.perf_counter()
+    try:
+        response = await call_next(request)
+        status = str(response.status_code)
+    except Exception:
+        # Прокидываем дальше — FastAPI отдаст 500, но мы успеем посчитать.
+        metrics.api_requests_total.labels(status="500", method=request.method).inc()
+        metrics.api_request_duration_seconds.labels(status_bucket="5xx").observe(
+            time.perf_counter() - t0
         )
-    bucket.append(now)
+        raise
+    metrics.api_requests_total.labels(status=status, method=request.method).inc()
+    metrics.api_request_duration_seconds.labels(status_bucket=f"{status[0]}xx").observe(
+        time.perf_counter() - t0
+    )
+    return response
+
+
+# ─── Rate limiting (Phase 5.2 — Redis-backed, per-user tiers) ───────────────
+# Реальная реализация в src.rate_limit. Эти обёртки сохраняют старый
+# `_check_rate_limit(key, limit=...)` API чтобы не трогать call-sites при
+# миграции. `_rate_limit_user(user)` — новый tier-aware path.
+
+from src.rate_limit import Tier as _Tier
+from src.rate_limit import check_rate_limit as _rate_check
+from src.rate_limit import tier_for_user as _tier_for_user
+
+
+def _check_rate_limit(client_key: str, limit: int | None = None) -> None:
+    """Backwards-compat обёртка.
+
+    Без `limit` → Tier.VIEWER из rate_limit.py.
+    С `limit` → explicit override (используется для auth endpoints).
+    """
+    if limit is None:
+        _rate_check(client_key, tier=_Tier.VIEWER)
+    else:
+        _rate_check(client_key, limit=limit, window_sec=60)
+
+
+def _rate_limit_user(user: storage.TenantUser) -> None:
+    """Per-user rate-limit с tier-detection по user.role."""
+    tier = _tier_for_user(user.role)
+    _rate_check(f"user:{user.id}", tier=tier)
 
 
 # ─── DB session dependency ───────────────────────────────────────────────────
@@ -301,8 +337,8 @@ def require_user(
     user = db.scalar(select(storage.TenantUser).where(storage.TenantUser.id == user_id))
     if not user or not user.is_active:
         raise HTTPException(401, "User not found or inactive")
-    # Rate limit per user
-    _check_rate_limit(f"user:{user_id}")
+    # Rate limit per user — tier зависит от user.role (admin > viewer)
+    _rate_limit_user(user)
     # Stash tenant_id on request for endpoint use
     request.state.tenant_id = user.tenant_id
     request.state.user_id = user.id
@@ -1844,6 +1880,154 @@ def dash_product_price_history(
         "delta_pct": delta_pct,
         "current": points[-1]["price"] if points else None,
     }
+
+
+# Batch версия price-history — устраняет N+1 на /comparison (TrendPanel
+# раньше делал по 3 fetch'а на каждую раскрытую строку). Принимает
+# ?ids=1,2,3&days=30, возвращает dict[product_id_str] → ту же payload-схему,
+# что и single-product endpoint. Лимит ids ≤ 50 чтобы не уехать в slow-query
+# при злоумышленном wildcard'е.
+_BATCH_PRICE_HISTORY_MAX_IDS = 50
+
+
+@app.get("/api/v1/dash/products/price-history")
+def dash_products_price_history_batch(
+    ids: str,
+    days: int = 30,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, dict[str, Any]]:
+    """Batch версия истории цен — за один запрос для нескольких продуктов.
+
+    Принимает `ids=1,2,3` (comma-separated, max 50). Возвращает dict
+    keyed by product_id (как строка — JSON ключи всегда строки):
+
+        {
+          "<product_id>": {
+            "product_id": int,
+            "site": str,
+            "name": str,
+            "days": int,
+            "points": [{"date", "price", "is_on_sale"}],
+            "delta_pct": float | None,
+            "current": float | None,
+          },
+          ...
+        }
+
+    Продукты не принадлежащие tenant'у или не найденные просто пропускаются
+    (нет в ответе). Frontend проверяет наличие ключа.
+    """
+    days = max(1, min(days, 365))
+    cutoff = utcnow() - timedelta(days=days)
+
+    # DoS guard #1 (Codex review 2026-05-28): raw `ids` string length cap.
+    # 50 IDs × 10 digits + commas ≈ 550 chars — берём с запасом 2K.
+    if len(ids) > 2048:
+        raise HTTPException(400, "ids parameter too long")
+
+    try:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(400, "ids must be comma-separated integers")
+    if not id_list:
+        return {}
+    # DoS guard #2: dedupe + cap. Дубли в `ids=1,1,1,1,...` раньше проходили
+    # как 50 уникальных слотов с одним product_id.
+    id_list = list(set(id_list))
+    if len(id_list) > _BATCH_PRICE_HISTORY_MAX_IDS:
+        raise HTTPException(
+            400,
+            f"too many ids (max {_BATCH_PRICE_HISTORY_MAX_IDS})",
+        )
+
+    # Tenant-safe lookup продуктов
+    products = db.scalars(
+        select(storage.Product).where(
+            storage.Product.id.in_(id_list),
+            storage.Product.tenant_id == user.tenant_id,
+        )
+    ).all()
+    if not products:
+        return {}
+    product_by_id = {p.id: p for p in products}
+    valid_ids = list(product_by_id.keys())
+
+    # Single SQL fetch: все snapshots в окне для valid_ids, затем reduce
+    # в Python к "latest per (product_id, date)". Это правильнее старого
+    # подхода (2 запроса с huge IN-list of timestamps — могло достигать
+    # 50*365=18250 элементов в WHERE clause при days=365).
+    # DoS guard #3 (Codex review): убираем потенциально гигантский `IN (...)`.
+    all_snaps = db.scalars(
+        select(storage.PriceSnapshot)
+        .where(
+            storage.PriceSnapshot.product_id.in_(valid_ids),
+            storage.PriceSnapshot.captured_at >= cutoff,
+        )
+        .order_by(
+            storage.PriceSnapshot.product_id,
+            storage.PriceSnapshot.captured_at,
+        )
+    ).all()
+
+    if not all_snaps:
+        return {
+            str(p.id): {
+                "product_id": p.id,
+                "site": p.site,
+                "name": p.name,
+                "days": days,
+                "points": [],
+                "delta_pct": None,
+                "current": None,
+            }
+            for p in products
+        }
+
+    # Reduce в Python: latest snapshot per (product_id, day).
+    # Группируем по (pid, date) и берём самый поздний captured_at.
+    by_pid_day: dict[tuple[int, str], storage.PriceSnapshot] = {}
+    for s in all_snaps:
+        key = (s.product_id, s.captured_at.date().isoformat())
+        prev = by_pid_day.get(key)
+        if prev is None or s.captured_at > prev.captured_at:
+            by_pid_day[key] = s
+
+    snaps_by_pid: dict[int, list[storage.PriceSnapshot]] = defaultdict(list)
+    for (pid, _date), s in by_pid_day.items():
+        snaps_by_pid[pid].append(s)
+
+    out: dict[str, dict[str, Any]] = {}
+    for p in products:
+        product_snaps = snaps_by_pid.get(p.id, [])
+        points = sorted(
+            [
+                {
+                    "date": s.captured_at.date().isoformat(),
+                    "price": s.discount_price or s.price,
+                    "is_on_sale": bool(s.is_on_sale),
+                }
+                for s in product_snaps
+                if (s.discount_price or s.price) is not None
+            ],
+            key=lambda x: x["date"],
+        )
+        delta_pct = None
+        if len(points) >= 2:
+            first = points[0]["price"]
+            last = points[-1]["price"]
+            if first:
+                delta_pct = round((last - first) / first * 100, 1)
+        out[str(p.id)] = {
+            "product_id": p.id,
+            "site": p.site,
+            "name": p.name,
+            "days": days,
+            "points": points,
+            "delta_pct": delta_pct,
+            "current": points[-1]["price"] if points else None,
+        }
+    return out
 
 
 @app.get("/api/v1/dash/forecast/movers")

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, useMemo } from "react";
 import { X, ChevronUp, ChevronDown, TrendingUp, TrendingDown } from "lucide-react";
 import { useTranslations } from "next-intl";
@@ -456,54 +456,66 @@ function ComparisonCard({
 function TrendPanel({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
   const sitesWithPrice = SITES.filter((s) => row.prices[s]);
-  const queries = useQueries({
-    queries: sitesWithPrice.map((s) => ({
-      queryKey: ["price-history", row.prices[s].product_id, 30],
-      queryFn: () => api.productPriceHistory(row.prices[s].product_id, 30),
-      staleTime: 60_000,
-    })),
+  // Batch fetch: 1 запрос вместо N×3. Сортируем ids для стабильного queryKey.
+  const productIds = useMemo(
+    () => sitesWithPrice.map((s) => row.prices[s].product_id).sort((a, b) => a - b),
+    [row, sitesWithPrice],
+  );
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["price-history-batch", productIds, 30],
+    queryFn: () => api.productPriceHistoryBatch(productIds, 30),
+    staleTime: 60_000,
+    enabled: productIds.length > 0,
   });
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-      {sitesWithPrice.map((s, idx) => {
-        const q = queries[idx];
+      {sitesWithPrice.map((s) => {
+        const pid = row.prices[s].product_id;
+        const ph = data?.[String(pid)];
+        // Codex review fix (2026-05-28): отличаем batch-level error от
+        // "продукт отсутствует в ответе" (missing pid). При batch-error все
+        // сайты показывали no_data, маскируя partial успешные данные.
         return (
           <div key={s} className="flex items-center gap-2 text-xs">
             <span className="text-[10px] uppercase tracking-wide text-muted-foreground w-20 shrink-0">
               {s}
             </span>
-            {q.isLoading ? (
+            {isLoading ? (
               <span className="text-muted-foreground">…</span>
-            ) : q.error || !q.data ? (
+            ) : error ? (
+              <span className="text-destructive/80 text-[11px]" title={String(error)}>
+                {t("load_error")}
+              </span>
+            ) : !ph ? (
               <span className="text-muted-foreground/70">{t("no_data")}</span>
-            ) : q.data.points.filter((p) => p.price != null).length < 2 ? (
+            ) : ph.points.filter((p) => p.price != null).length < 2 ? (
               <span className="text-muted-foreground/70 text-[11px]">
-                {q.data.current != null
-                  ? t("stable_price", { price: formatPrice(q.data.current) })
+                {ph.current != null
+                  ? t("stable_price", { price: formatPrice(ph.current) })
                   : "—"}
               </span>
             ) : (
               <div className="flex items-center gap-2 flex-1">
                 <Sparkline
-                  points={q.data.points}
-                  delta_pct={q.data.delta_pct}
+                  points={ph.points}
+                  delta_pct={ph.delta_pct}
                   width={90}
                   height={24}
                 />
-                {q.data.delta_pct != null && Math.abs(q.data.delta_pct) >= 0.5 && (
+                {ph.delta_pct != null && Math.abs(ph.delta_pct) >= 0.5 && (
                   <span
                     className={`inline-flex items-center gap-0.5 text-[11px] ${
-                      q.data.delta_pct > 0 ? "text-destructive" : "text-success"
+                      ph.delta_pct > 0 ? "text-destructive" : "text-success"
                     }`}
                   >
-                    {q.data.delta_pct > 0 ? (
+                    {ph.delta_pct > 0 ? (
                       <TrendingUp className="h-3 w-3" />
                     ) : (
                       <TrendingDown className="h-3 w-3" />
                     )}
-                    {q.data.delta_pct > 0 ? "+" : ""}
-                    {q.data.delta_pct.toFixed(1)}%
+                    {ph.delta_pct > 0 ? "+" : ""}
+                    {ph.delta_pct.toFixed(1)}%
                   </span>
                 )}
               </div>

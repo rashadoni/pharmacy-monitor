@@ -319,6 +319,38 @@ export interface SiteSummary {
   last_run_id: number | null;
 }
 
+export interface WatchlistLink {
+  site: "pharmonline" | "aptekonline" | "aloe" | string;
+  url: string;
+  external_id: string | null;
+  /** Backend statuses: pending, confirmed, missing */
+  status: string;
+}
+
+export interface WatchlistItem {
+  id: number;
+  canonical_name: string;
+  brand: string | null;
+  dosage: string | null;
+  pack_size: string | null;
+  search_query: string | null;
+  notes: string | null;
+  is_active: boolean;
+  links: WatchlistLink[];
+}
+
+export interface WatchlistCreatePayload {
+  canonical_name: string;
+  brand?: string;
+  dosage?: string;
+  pack_size?: string;
+  search_query?: string;
+  notes?: string;
+  pharmonline_url?: string;
+  aptekonline_url?: string;
+  aloe_url?: string;
+}
+
 export interface PriceHistoryPoint {
   date: string;
   price: number | null;
@@ -732,10 +764,34 @@ export const api = {
       `/api/v1/dash/digest/send-test?kind=${kind}`,
       { method: "POST", timeoutMs: 30_000 },
     ),
+  watchlistList: () =>
+    request<WatchlistItem[]>("/api/v1/dash/watchlist"),
+  watchlistCreate: (payload: WatchlistCreatePayload) =>
+    request<{ id: number }>("/api/v1/dash/watchlist", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  watchlistDelete: (id: number) =>
+    request<void>(`/api/v1/dash/watchlist/${id}`, { method: "DELETE" }),
   productPriceHistory: (product_id: number, days = 30) =>
     request<PriceHistoryResponse>(
       `/api/v1/dash/products/${product_id}/price-history?days=${days}`,
     ),
+  /**
+   * Batch версия — за один HTTP-запрос история цен для нескольких товаров.
+   * Используется на /comparison TrendPanel (раньше делал N×3 fetch).
+   * Backend лимит 50 ids/запрос. Возвращает dict keyed by stringified id;
+   * продукты без доступа или не найденные просто не появятся в ответе.
+   */
+  productPriceHistoryBatch: (product_ids: number[], days = 30) => {
+    if (product_ids.length === 0) {
+      return Promise.resolve<Record<string, PriceHistoryResponse>>({});
+    }
+    const ids = product_ids.join(",");
+    return request<Record<string, PriceHistoryResponse>>(
+      `/api/v1/dash/products/price-history?ids=${encodeURIComponent(ids)}&days=${days}`,
+    );
+  },
   scrapeRequests: (limit = 10) =>
     request<ScrapeRequestRow[]>(`/api/v1/dash/scrape/requests?limit=${limit}`),
 };

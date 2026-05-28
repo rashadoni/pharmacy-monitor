@@ -67,6 +67,7 @@
     "page_subtitle": "Cross-site matched products. Green — lowest price, red — highest. Sorted by |spread| desc.",
     "export_csv_title": "Download filtered list as CSV",
     "no_data": "no data",
+    "load_error": "load error",
     "stable_price": "stable {price}",
     "diff_only_filter": "With difference only",
     "with_aloe_filter": "With aloe",
@@ -193,7 +194,11 @@
     "dosage_placeholder": "(if applicable)",
     "form_urls_label": "URL on each site (optional)",
     "delete_confirm": "Delete \"{name}\"?",
-    "save_error": "Save failed"
+    "delete_arm": "Click again to delete",
+    "save_error": "Save failed",
+    "search_placeholder": "Search by name or brand…",
+    "no_match": "No items match this search",
+    "items_count": "{count, plural, one {# item} other {# items}}"
   },
   "site": {
     "tagline_pharmonline": "Main client site. Catalog, brands and ROI from pharmonline perspective.",

@@ -250,3 +250,79 @@ def test_predict_competitor_moves(db_session):
     assert m_pred.competitor_site == "aloe"
     assert m_pred.probability == "high"
     assert m_pred.trend_7d_change_pct < 0
+
+
+# ─── Phase 5.x diff-only regression coverage ─────────────────────────────────
+
+
+def test_compute_trend_diff_only_sparse_active_pricing(db_session):
+    """Diff-only-realistic: 1 снапшот написан 3 дня назад, цена «забетонирована».
+
+    Раньше len(prices) < min_points возвращал None. После refactor — должен
+    возвращать stable с last_seen_at-актуальной ценой.
+    """
+    p = _add_product(db_session, "aloe", "Stable", "stb")
+    # Один реальный snapshot 3 дня назад
+    run = Run(started_at=utcnow() - timedelta(days=3), status="ok")
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(PriceSnapshot(run_id=run.id, product_id=p.id, price=12.50))
+    p.last_seen_at = utcnow() - timedelta(hours=12)  # видели сегодня
+    db_session.commit()
+
+    t = forecast.compute_trend(db_session, p.id, days_window=30, min_points=3)
+    assert t is not None, "Diff-only sparse product should still get a trend"
+    assert t.direction == "stable"
+    assert t.last_price == 12.50
+    assert t.confidence in ("low", "medium")
+
+
+def test_predict_competitor_moves_diff_only_skips_truly_stable(db_session):
+    """Diff-only: конкурент имеет 1 снапшот за 7d → stable → не предсказываем move.
+
+    Логика: если за последнюю неделю не было изменений — мы НЕ хотим говорить
+    "вероятен move", это false positive. Корректное поведение — skip.
+    """
+    m = Match(canonical_name="Stable competitor", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    client = _add_product(db_session, "pharmonline", "SC", "ph2", canonical_id=m.id)
+    comp = _add_product(db_session, "aloe", "SC", "al2", canonical_id=m.id)
+    # Клиент стабилен
+    run = Run(started_at=utcnow() - timedelta(days=2), status="ok")
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(PriceSnapshot(run_id=run.id, product_id=client.id, price=10.0))
+    db_session.add(PriceSnapshot(run_id=run.id, product_id=comp.id, price=15.0))
+    client.last_seen_at = utcnow()
+    comp.last_seen_at = utcnow()
+    db_session.commit()
+
+    moves = forecast.predict_competitor_moves(db_session)
+    # Никаких predictions — оба «stable» в Case A
+    assert moves == []
+
+
+def test_top_movers_diff_only_sparse_change(db_session):
+    """Diff-only: ровно 2 snapshot'а с разными ценами в 30d окне → mover."""
+    p = _add_product(db_session, "aloe", "SparseMover", "sm1")
+    # День -20: 10.0
+    r1 = Run(started_at=utcnow() - timedelta(days=20), status="ok")
+    # День -3: 8.0 (−20%)
+    r2 = Run(started_at=utcnow() - timedelta(days=3), status="ok")
+    db_session.add_all([r1, r2])
+    db_session.flush()
+    db_session.add_all(
+        [
+            PriceSnapshot(run_id=r1.id, product_id=p.id, price=10.0),
+            PriceSnapshot(run_id=r2.id, product_id=p.id, price=8.0),
+        ]
+    )
+    p.last_seen_at = utcnow()
+    db_session.commit()
+
+    movers = forecast.top_movers(db_session, days_window=30, min_change_pct=5.0)
+    assert any(m.name == "SparseMover" for m in movers)
+    sm = next(m for m in movers if m.name == "SparseMover")
+    assert sm.change_pct == -20.0
+    assert sm.direction == "falling"

@@ -507,6 +507,96 @@ claude mcp add <name> -s user -e KEY=VAL -- <cmd>
 ps -ef | grep <server-name> | head -2
 ```
 
+### MCP playbook — install per-project vs user-global
+
+**user-scope** (`-s user`, по умолчанию у нас все 9 MCP): доступны в каждом
+проекте Claude, конфиг в `~/.claude.json`. Применяй для personal tooling
+(Perplexity, Brave, Firecrawl) и любых key-bearing сервисов которые не
+коммитятся в репо.
+
+**project-scope** (`-s project`): конфиг в `.claude/mcp.json` репозитория,
+коммитится. Применяй для team-shared MCPs (например внутренний linear MCP
+команды, custom company-specific tools).
+
+**local-scope** (`-s local`): только для текущего проекта, в `.claude/mcp.json`
+но НЕ под git (gitignored). Используй для experimental или sensitive-but-shared
+configs.
+
+```bash
+# Установить (3 scope варианта):
+claude mcp add <name> -s user    -e KEY=$VAL -- npx -y <package>
+claude mcp add <name> -s project -e KEY=$VAL -- npx -y <package>
+claude mcp add <name> -s local   -e KEY=$VAL -- npx -y <package>
+
+# Migrate user → project (для team-shared)
+claude mcp remove <name> -s user
+claude mcp add <name> -s project -e KEY=$VAL -- npx -y <package>
+```
+
+### MCP installation — verify connection
+
+После каждого `claude mcp add`:
+
+1. **Restart Claude Code** (`Cmd+Q` → re-open) — server spawns on session start, not hot-reload.
+2. `claude mcp list` — должен показывать ✓ или ⚠ next to server name.
+3. В новом session: попроси Claude использовать один tool из этого MCP — например для firecrawl: "use firecrawl to fetch https://example.com" → должен вернуть HTML без ошибки.
+4. Если ✗ или "Unauthorized": см. ниже **env var propagation**.
+
+### MCP env-var propagation troubleshooting
+
+**Симптом**: tool сразу возвращает `Unauthorized: API key is required` или `403 invalid token`, хотя key верный.
+
+**Корень**: Claude spawn'ит MCP server'а subprocess'ом и передаёт env через `-e` флаги. Если key содержит спец-символы (`$`, `!`, `:`, backslash) — shell может их интерпретировать ДО передачи в `claude mcp add`.
+
+**Диагностика**:
+
+```bash
+# 1. Проверь актуальный env у spawn'нутого процесса:
+ps -ef | grep <server-name>          # узнать PID
+ps eww <PID> | tr ' ' '\n' | grep KEY  # увидеть env vars процесса
+
+# 2. Сравни с тем что в ~/.claude.json:
+grep -A5 '"<server-name>"' ~/.claude.json
+```
+
+**Фикс**:
+
+```bash
+# Используй single-quotes для значения:
+claude mcp add foo -s user -e 'FOO_KEY=fc-abc!def$ghi' -- npx -y foo-mcp
+
+# Или экспортируй через temp env-file:
+echo 'FOO_KEY=fc-abc!def$ghi' > /tmp/foo.env
+claude mcp add foo -s user --env-file /tmp/foo.env -- npx -y foo-mcp
+rm /tmp/foo.env
+```
+
+### MCP — test from CLI without Claude
+
+Полезно проверить server stdio handshake до debug'а через Claude:
+
+```bash
+# Запусти MCP server в stdio mode (как сделал бы Claude):
+FOO_KEY=fc-... npx -y firecrawl-mcp <<EOF
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"manual","version":"1.0"}}}
+EOF
+# Ожидаем JSON response с `serverInfo`, `capabilities`.
+# Если ошибка про auth — env не дошёл; если ошибка про protocol —
+# server либо crashed либо не stdio-MCP compatible.
+```
+
+### Per-server gotchas (verified 2026-05-28)
+
+| Server | Gotcha | Workaround |
+|---|---|---|
+| firecrawl-mcp | v3.19.1: env var `FIRECRAWL_API_KEY` не propagates через npx через Claude spawn | Используй прямые `curl https://api.firecrawl.dev/v2/scrape -H "Authorization: Bearer $KEY"` через bash |
+| postgres-mcp | Ожидает `POSTGRES_CONNECTION_STRING`, не `DATABASE_URL` | Set explicit env: `-e POSTGRES_CONNECTION_STRING=postgresql://...` |
+| perplexity-ask | Rate limit ~60 rpm free tier | Backoff or upgrade Pro $20/mo |
+| brave-search | Free 2000 req/мес | Скромный использовать только для cross-check |
+| chrome-devtools | Требует Chrome --remote-debugging-port=9222 | Запусти Chrome: `/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-mcp` |
+| github-mcp | PAT с `repo` + `read:org` scope | Используй fine-grained PAT, expires 1 year |
+| memory-mcp | Knowledge graph persisted в `~/.claude/memory.jsonl` | Backup file перед major surgery |
+
 ---
 
 ## 🔑 API key rotation

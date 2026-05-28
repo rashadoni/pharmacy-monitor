@@ -67,6 +67,7 @@
     "page_subtitle": "Saytlar arası uyğunlaşdırılmış məhsullar. Yaşıl — ən aşağı, qırmızı — ən yüksək qiymət.",
     "export_csv_title": "Süzülmüş siyahını CSV kimi endirin",
     "no_data": "məlumat yoxdur",
+    "load_error": "yükləmə xətası",
     "stable_price": "sabit {price}",
     "diff_only_filter": "Yalnız fərqlənənlər",
     "with_aloe_filter": "Aloe ilə",
@@ -193,7 +194,11 @@
     "dosage_placeholder": "(tətbiq olunarsa)",
     "form_urls_label": "Hər saytdakı URL (istəyə bağlı)",
     "delete_confirm": "«{name}» silinsin?",
-    "save_error": "Saxlamaq alınmadı"
+    "delete_arm": "Silmək üçün bir də klikləyin",
+    "save_error": "Saxlamaq alınmadı",
+    "search_placeholder": "Ad və ya brend üzrə axtar…",
+    "no_match": "Heç bir nəticə tapılmadı",
+    "items_count": "{count, plural, one {# qeyd} other {# qeyd}}"
   },
   "site": {
     "tagline_pharmonline": "Əsas müştəri saytı. pharmonline perspektivindən katalog, brendlər və ROI.",

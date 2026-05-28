@@ -177,3 +177,48 @@ def test_init_observability_orchestrates_both():
     observability.init_observability(service="test")
     # Metrics is always initialized (no extra deps needed if prometheus_client installed)
     assert observability.metrics._initialized is True
+
+
+# ─── Phase 5.4 — API request metrics middleware ─────────────────────────────
+
+
+def test_api_metrics_middleware_records_404_request():
+    """Любой HTTP-запрос (даже 404) проходит через middleware и инкрементит counter.
+
+    Используем 404 path чтобы не зависеть от DB fixture'ов и tenant setup —
+    middleware фиксирует ВСЕ requests до route resolution.
+    """
+    from fastapi.testclient import TestClient
+
+    from src import api as api_module
+
+    observability.metrics.init()
+    client = TestClient(api_module.app)
+    r = client.get("/definitely-nonexistent-route-12345")
+    assert r.status_code == 404
+
+    # Pull /metrics and verify counter incremented для 404
+    metrics_r = client.get("/metrics")
+    if metrics_r.status_code == 404:
+        pytest.skip("prometheus_client not installed")
+    body = metrics_r.text
+    assert 'pharmacy_api_requests_total{method="GET",status="404"}' in body
+
+
+def test_api_metrics_middleware_buckets_status_in_histogram():
+    """api_request_duration_seconds histogram has status_bucket label set."""
+    from fastapi.testclient import TestClient
+
+    from src import api as api_module
+
+    observability.metrics.init()
+    client = TestClient(api_module.app)
+    client.get("/definitely-nonexistent-route-12346")
+    metrics_r = client.get("/metrics")
+    if metrics_r.status_code == 404:
+        pytest.skip("prometheus_client not installed")
+    body = metrics_r.text
+    # Histogram emits *_bucket lines — checking for label, не exact value
+    assert "pharmacy_api_request_duration_seconds_bucket" in body
+    # 4xx bucket — от наших 404-х
+    assert 'status_bucket="4xx"' in body

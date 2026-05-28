@@ -15,6 +15,13 @@ global:
     monitor: pharmacy-monitor
     env: production
 
+# Phase 5.4 — alerting rules (firing surface visible at /alerts на Prometheus).
+# Без Alertmanager notifications не уходят — но `/alerts` показывает firing
+# rules + они логируются. Когда нужны Telegram/SMTP — раскомментируй блок
+# alertmanagers и подними его (apt install prometheus-alertmanager).
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: pharmacy-monitor-api
     metrics_path: /metrics
@@ -27,7 +34,6 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:9090"]
 
-# (Optional) Alertmanager — out of scope for pilot, can be added later
 # alerting:
 #   alertmanagers:
 #     - static_configs:

@@ -122,7 +122,9 @@ function PriceIndexSection() {
         </div>
       )}
       {data && data.length > 0 && (
-        <table className="w-full text-sm">
+        /* Mobile-fix 2026-05-28: 5-колонная таблица overflows на 375px */
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[520px] text-sm">
           <thead className="text-muted-foreground">
             <tr className="border-b border-border">
               <th className="px-3 py-2 text-left">{t("th_category")}</th>
@@ -152,6 +154,7 @@ function PriceIndexSection() {
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </Card>
   );
