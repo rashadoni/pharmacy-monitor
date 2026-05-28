@@ -70,6 +70,13 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 ## Active work-in-progress
 
+**Just installed (2026-05-28)**: **Perplexity MCP server user-scope** для cross-check anti-hallucination.
+- Config: `/Users/rashadrahimov/.claude.json` → `perplexity-ask: npx -y server-perplexity-ask`
+- Доступен tool `mcp__perplexity-ask__perplexity_ask` (после рестарта Claude Code)
+- Дополняет существующий `mcp__openrouter-sonar__*` (4 tool'а через OpenRouter). Cross-check между двумя независимыми провайдерами Sonar моделей.
+- $50 кредитов на Perplexity API. Стоимость ~$0.005-0.02/запрос (Sonar Pro $3+$15/1M tokens).
+- **First win**: за 2 запроса ($0.04) распарсили root cause Phase 6.1 i18n блокера — это NEXT-INTL ISSUE #524 (standalone middleware recursive rewrite). См. task #31 для retry strategies.
+
 **Attempted (2026-05-27 night, ROLLED BACK)**: **Phase 6.1 URL-based i18n** — full migration to `app/[locale]/(dashboard)/...` structure, next-intl middleware с `localePrefix: 'as-needed'`, locale-aware Router + Link через `createNavigation`.
 
 - **Code passed local + prod build** (42 routes, middleware 39.2 KB)
