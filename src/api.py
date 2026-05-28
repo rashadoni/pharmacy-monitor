@@ -1690,17 +1690,21 @@ def dash_normalize_stats(
     )
 
     # Распределение matches по типу: ручной vs авто
+    # SQLAlchemy column comparisons require `==` operator (not Python truth),
+    # hence E712 noqa.
     matches_by_strategy = {
         "auto": db.scalar(
             select(func.count(storage.Match.id)).where(
-                storage.Match.tenant_id == user.tenant_id, storage.Match.is_manual == False
-            )  # noqa: E712
+                storage.Match.tenant_id == user.tenant_id,
+                storage.Match.is_manual == False,  # noqa: E712
+            )
         )
         or 0,
         "manual": db.scalar(
             select(func.count(storage.Match.id)).where(
-                storage.Match.tenant_id == user.tenant_id, storage.Match.is_manual == True
-            )  # noqa: E712
+                storage.Match.tenant_id == user.tenant_id,
+                storage.Match.is_manual == True,  # noqa: E712
+            )
         )
         or 0,
     }
