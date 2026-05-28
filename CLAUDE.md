@@ -70,12 +70,25 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 ## Active work-in-progress
 
-**Just installed (2026-05-28)**: **Perplexity MCP server user-scope** для cross-check anti-hallucination.
-- Config: `/Users/rashadrahimov/.claude.json` → `perplexity-ask: npx -y server-perplexity-ask`
-- Доступен tool `mcp__perplexity-ask__perplexity_ask` (после рестарта Claude Code)
-- Дополняет существующий `mcp__openrouter-sonar__*` (4 tool'а через OpenRouter). Cross-check между двумя независимыми провайдерами Sonar моделей.
-- $50 кредитов на Perplexity API. Стоимость ~$0.005-0.02/запрос (Sonar Pro $3+$15/1M tokens).
-- **First win**: за 2 запроса ($0.04) распарсили root cause Phase 6.1 i18n блокера — это NEXT-INTL ISSUE #524 (standalone middleware recursive rewrite). См. task #31 для retry strategies.
+**Just installed (2026-05-28)**: **Perplexity MCP + Firecrawl MCP user-scope** для cross-check anti-hallucination и web scraping fallback.
+
+**Perplexity MCP** (`perplexity-ask`):
+- Config: `/Users/rashadrahimov/.claude.json` → `npx -y server-perplexity-ask`
+- Tool `mcp__perplexity-ask__perplexity_ask` (после рестарта Claude Code)
+- Дополняет существующий `mcp__openrouter-sonar__*` (4 tool'а через OpenRouter, но **credits exhausted — top up если нужен dual cross-check**). 
+- $50 кредитов на Perplexity API. Стоимость ~$0.005-0.02/запрос.
+- **First win**: за 2 запроса ($0.04) распарсили root cause Phase 6.1 i18n блокера — это [next-intl issue #524](https://github.com/amannn/next-intl/issues/524). См. task #31.
+
+**Firecrawl MCP** (`firecrawl`):
+- Config: `/Users/rashadrahimov/.claude.json` → `npx -y firecrawl-mcp`
+- Free tier 1000 credits/мес (~1 credit per scrape, ~2 per extract). Billing 2026-05-28 → 2026-06-28.
+- Tools после рестарта: `mcp__firecrawl__firecrawl_scrape/batch_scrape/crawl/map/search/extract/agent/interact`.
+- **CRITICAL FINDING — Cloudflare bypass для pharmonline.az работает**. Real test: `korinfar-10-mg-100-heb-pliva-almaniya?lng=en` → status 200, full Markdown, LLM-prompt extracted `{name, priceAZN, manufacturer, barcode}` корректно. Это потенциальная альтернатива DDP/IPRoyal для конкретных use cases.
+- **Применимо у нас для**:
+  - AI crawler fallback (замена Anthropic API extraction — Firecrawl дешевле для этого)
+  - Barcode backfill (25k+ pharmonline products без barcode)
+  - Quality-control re-scrape подозрительных match'ей
+- **НЕ применимо**: full daily scrape (25k+9k+1.8k products × 30 days = 1M+ credits, не влезет даже в Growth план).
 
 **Attempted (2026-05-27 night, ROLLED BACK)**: **Phase 6.1 URL-based i18n** — full migration to `app/[locale]/(dashboard)/...` structure, next-intl middleware с `localePrefix: 'as-needed'`, locale-aware Router + Link через `createNavigation`.
 
