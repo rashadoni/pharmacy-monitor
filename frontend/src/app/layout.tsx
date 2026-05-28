@@ -1,8 +1,19 @@
+/**
+ * Phase 6.1 retry (2026-05-28) — root layout.
+ *
+ * Минимальный passthrough — все локалёзависимые вещи переехали в
+ * app/[locale]/layout.tsx. Root отвечает только за <html>/<body> и global CSS.
+ *
+ * `lang` ставится в defaultLocale (ru) для path'ов БЕЗ locale-префикса
+ * (которые next.config.mjs redirects пересылают на /ru/...). После redirect'а
+ * [locale]/layout.tsx не может перезаписать <html lang="">, поэтому
+ * accessibility tools на момент redirect'а видят lang=ru. После redirect
+ * локализованная страница рендерится с правильным контентом через
+ * NextIntlClientProvider, hreflang URL'ы корректны.
+ */
 import type { Metadata, Viewport } from "next";
-import { NextIntlClientProvider } from "next-intl";
-import { getLocale, getMessages } from "next-intl/server";
 import "./globals.css";
-import { Providers } from "@/components/providers";
+import { defaultLocale } from "@/i18n/config";
 
 export const metadata: Metadata = {
   title: "Pharmacy Monitor",
@@ -19,16 +30,10 @@ export const viewport: Viewport = {
   ],
 };
 
-export default async function RootLayout({ children }: { children: React.ReactNode }) {
-  const locale = await getLocale();
-  const messages = await getMessages();
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang={locale} suppressHydrationWarning>
-      <body className="min-h-screen antialiased">
-        <NextIntlClientProvider locale={locale} messages={messages}>
-          <Providers>{children}</Providers>
-        </NextIntlClientProvider>
-      </body>
+    <html lang={defaultLocale} suppressHydrationWarning>
+      <body className="min-h-screen antialiased">{children}</body>
     </html>
   );
 }

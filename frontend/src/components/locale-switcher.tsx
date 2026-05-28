@@ -1,24 +1,33 @@
 "use client";
 
-import { useLocale, useTranslations } from "next-intl";
+import { useLocale } from "next-intl";
 import { useTransition } from "react";
 import { localeFlags, localeNames, locales, type Locale } from "@/i18n/config";
+import { useRouter, usePathname } from "@/i18n/navigation";
 
+/**
+ * Phase 6.1 retry (2026-05-28) — URL-based locale switching без middleware.
+ *
+ * До этого: fetch /locale → cookie + window.location.reload(). Грязный
+ * full page reload, ломал scroll position, deep-link sharing не работал.
+ *
+ * После: next-intl createNavigation router.replace({ locale }) → push same
+ * pathname с новым locale-префиксом. Client-side навигация, no reload.
+ * Deep links `/az/comparison` работают через share.
+ */
 export function LocaleSwitcher() {
   const current = useLocale() as Locale;
+  const router = useRouter();
+  const pathname = usePathname();
   const [pending, startTransition] = useTransition();
 
   function changeLocale(next: Locale) {
     if (next === current) return;
-    startTransition(async () => {
-      const res = await fetch("/locale", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ locale: next }),
-      });
-      if (res.ok) {
-        window.location.reload();
-      }
+    startTransition(() => {
+      // router.replace принимает текущий pathname (без locale prefix —
+      // createNavigation абстрагирует) + новый locale. Sub-pathname сохраняется:
+      // если ты на /az/comparison → switch to en → /en/comparison.
+      router.replace(pathname, { locale: next });
     });
   }
 

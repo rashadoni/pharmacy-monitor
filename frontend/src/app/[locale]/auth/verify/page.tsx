@@ -1,14 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { useRouter } from "@/i18n/navigation";
 
 /**
- * /auth/verify?token=...
- * Calls the FastAPI endpoint which sets the JWT cookie, then redirects to /overview.
- * If token is invalid/expired → shows error.
+ * /[locale]/auth/verify?token=...
+ *
+ * Calls FastAPI endpoint, sets JWT cookie, redirects to /<locale>/overview.
+ *
+ * Phase 6.1 retry: Suspense boundary обязательна для useSearchParams при
+ * SSG из [locale]/ dynamic segment. Иначе prerender падает.
  */
-export default function VerifyPage() {
+function VerifyInner() {
   const router = useRouter();
   const params = useSearchParams();
   const [error, setError] = useState<string | null>(null);
@@ -24,6 +28,7 @@ export default function VerifyPage() {
     })
       .then((res) => {
         if (res.ok) {
+          // i18n/navigation router → автоматом подставит locale префикс
           router.replace("/overview");
         } else {
           setError("Invalid or expired token");
@@ -45,5 +50,19 @@ export default function VerifyPage() {
         <div className="text-muted-foreground text-sm">Verifying…</div>
       )}
     </div>
+  );
+}
+
+export default function VerifyPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen flex items-center justify-center">
+          <div className="text-muted-foreground text-sm">Verifying…</div>
+        </div>
+      }
+    >
+      <VerifyInner />
+    </Suspense>
   );
 }
