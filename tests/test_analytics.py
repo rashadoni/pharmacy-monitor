@@ -1,6 +1,6 @@
 """Тесты аналитического модуля: brand_share, promo_history, assortment_overlap, price_index."""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from src._time import utcnow
 
 from src import analytics

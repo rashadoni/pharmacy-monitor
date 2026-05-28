@@ -56,9 +56,7 @@ import os
 import random
 import string
 from typing import AsyncIterator
-from urllib.parse import urlparse
 
-import httpx
 import structlog
 import websockets
 

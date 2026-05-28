@@ -11,7 +11,6 @@ Coverage:
 """
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -113,7 +112,6 @@ def test_health_endpoint_redis_unset_returns_null(client, monkeypatch):
 
 def test_health_endpoint_flags_staleness(client, setup_db):
     """Product older than 30h → staleness_warning=true, status=degraded."""
-    from datetime import timedelta
 
     db = setup_db
     old = datetime.now(timezone.utc) - timedelta(hours=48)

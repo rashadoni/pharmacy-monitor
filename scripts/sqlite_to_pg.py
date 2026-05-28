@@ -176,7 +176,7 @@ def main() -> int:
                             text(f"SELECT COALESCE(MAX(id), 0) FROM {tbl_name}")
                         ).scalar()
                         conn.execute(
-                            text(f"SELECT setval(:s, :v)"),
+                            text("SELECT setval(:s, :v)"),
                             {"s": seq_name, "v": max_id + 1},
                         )
                         conn.commit()

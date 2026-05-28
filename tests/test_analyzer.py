@@ -1,6 +1,6 @@
 """Тесты diff-анализа: изменения цен, новые товары, undercuts."""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from src._time import utcnow
 
 from src import analyzer, storage

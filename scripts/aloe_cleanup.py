@@ -135,7 +135,7 @@ def main():
 
     if not apply:
         print()
-        print(f"=== DRY-RUN COMPLETE — no changes made. Re-run with --apply to commit. ===")
+        print("=== DRY-RUN COMPLETE — no changes made. Re-run with --apply to commit. ===")
 
 
 if __name__ == "__main__":

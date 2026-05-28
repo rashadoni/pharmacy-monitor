@@ -6,6 +6,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Claude Code agent worktrees (not source code)
+.claude/worktrees/
+
 # Virtual envs
 .venv/
 venv/

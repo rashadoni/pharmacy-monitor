@@ -1,7 +1,7 @@
 """Тесты helper-операций для ручной коррекции матчей."""
 
 from src import match_actions as ma
-from src.storage import Match, MatchRejection, Product
+from src.storage import Match, Product
 
 
 def _make_product(s, **kw) -> Product:

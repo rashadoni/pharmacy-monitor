@@ -1,12 +1,10 @@
 """Тесты fuzzy-матчинга товаров между сайтами."""
 
-import pytest
 
 from src import match_actions, matcher, storage
 from src.matcher import (
     _has_conflicting_form,
     _has_conflicting_gender,
-    _has_conflicting_modifier,
     _has_conflicting_series_number,
     _has_conflicting_variant_tokens,
     _has_extreme_length_disparity,

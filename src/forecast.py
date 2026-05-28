@@ -305,7 +305,6 @@ def top_movers(
     # change_pct относительно реальной "старой" цены.
     single_snap_pids = [pid for pid, pts in history.items() if len(pts) == 1]
     if single_snap_pids:
-        from sqlalchemy import func as _func
         # Для каждого product_id берём самый свежий снапшот ДО cutoff
         pre_rows = session.execute(
             select(

@@ -60,7 +60,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 import structlog
-from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Header, Request, Response, UploadFile, status
+from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Header, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, func, select

@@ -1,6 +1,6 @@
 """Тесты forecast: линейная регрессия + детекция тренда + вероятности."""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from src._time import utcnow
 
 from src import forecast

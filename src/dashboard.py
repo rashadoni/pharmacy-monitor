@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from datetime import datetime, timedelta
+from datetime import timedelta
 from src._time import utcnow
 from pathlib import Path
 

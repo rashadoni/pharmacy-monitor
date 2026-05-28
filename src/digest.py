@@ -20,7 +20,7 @@ import structlog
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from src.storage import AlertEvent, TenantUser
+from src.storage import AlertEvent
 
 log = structlog.get_logger()
 

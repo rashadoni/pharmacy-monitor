@@ -1,6 +1,5 @@
 """Тесты Telegram-бота: маршрутизация команд + рендер сводок."""
 
-from datetime import datetime
 from src._time import utcnow
 
 from src import telegram_bot

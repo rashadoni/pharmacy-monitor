@@ -1,6 +1,6 @@
 """Тесты health-check логики."""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from src._time import utcnow
 
 from src.health import check_health

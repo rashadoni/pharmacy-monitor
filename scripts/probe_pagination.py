@@ -95,7 +95,7 @@ async def probe(site: str, url: str):
             print(f"    {c['text']!r}")
 
         # Try scrolling — do new cards appear?
-        print(f"\n--- Scroll test ---")
+        print("\n--- Scroll test ---")
         prev = initial
         for i in range(10):
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")

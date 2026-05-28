@@ -1,9 +1,8 @@
 """Тесты движка алертов: detection, dedup, dispatch routing."""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from src._time import utcnow
 
-import pytest
 
 from src import alerts
 from src.storage import (

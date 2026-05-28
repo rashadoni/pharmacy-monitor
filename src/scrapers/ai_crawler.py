@@ -26,14 +26,13 @@ Provider abstraction:
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
 import re
 from dataclasses import dataclass, field
 from typing import AsyncIterator
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
 import structlog

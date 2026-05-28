@@ -30,7 +30,7 @@ from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noq
 from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
 from src.scrapers.aptekonline import AptekonlineScraper  # noqa: E402
-from src.scrapers.base import BaseScraper, ScrapeResult  # noqa: E402
+from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapeResult  # noqa: E402
 from src.scrapers.pharmonline import PharmonlineScraper  # noqa: E402
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "categories.yaml"
@@ -445,7 +445,7 @@ def _smoke_test_per_site_coverage(
             )
             if not rule:
                 rule = AlertRule(
-                    name=f"smoke_site_drop",
+                    name="smoke_site_drop",
                     rule_type="site_drop_smoke",
                     params={},
                     channels=[],
@@ -724,7 +724,7 @@ def db_check_cmd(fix: bool) -> None:
 
     Exit-code: 0 = OK, 1 = найдены проблемы (без --fix), 2 = ошибка SQL
     """
-    from sqlalchemy import select as _s, func as _f, delete as _del, text
+    from sqlalchemy import select as _s, func as _f, text
 
     storage.init_db()
     Session = storage.make_session()
@@ -1085,7 +1085,7 @@ def tenant_issue_token(email: str, ttl_min: int) -> None:
         token = t_mod.issue_magic_token(s, email, ttl_minutes=ttl_min)
         if token:
             click.echo(f"Token: {token}")
-            click.echo(f"(в продакшене — отправить ссылкой в email)")
+            click.echo("(в продакшене — отправить ссылкой в email)")
         else:
             click.echo(f"Юзер {email} не найден или неактивен")
 

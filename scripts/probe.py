@@ -62,7 +62,7 @@ async def probe_homepage(page, url: str) -> dict:
     if product_like:
         print(f"  sample product: {product_like[0]['href']}")
     if category_like:
-        print(f"  sample categories:")
+        print("  sample categories:")
         for l in category_like[:5]:
             print(f"    - {l['href']}  [{l['text'][:40]}]")
 
@@ -136,10 +136,10 @@ async def probe_url(page, url: str, label: str) -> dict:
     """)
 
     print(f"  status={status}  title={title!r}")
-    print(f"  Title-like elements:")
+    print("  Title-like elements:")
     for t in signals["titles"]:
         print(f"    {t['tag']:4s} class={t['cls'][:50]:50s} text={t['text']!r}")
-    print(f"  Price-like elements:")
+    print("  Price-like elements:")
     for p in signals["priceLike"]:
         print(f"    {p['tag']:4s} class={p['cls'][:50]:50s} text={p['text']!r}")
     print(f"  Card-like containers (img+price): {len(signals['cards'])}")

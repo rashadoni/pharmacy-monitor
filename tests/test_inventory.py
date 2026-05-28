@@ -1,8 +1,6 @@
 """Тесты inventory: импорт CSV + margin + stock-aware ROI."""
 
-from datetime import datetime
 from src._time import utcnow
-from pathlib import Path
 
 from src import inventory, roi
 from src.storage import (

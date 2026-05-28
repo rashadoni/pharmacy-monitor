@@ -21,7 +21,7 @@ import sys
 from sqlalchemy import func, update
 
 from src import storage
-from src.brand_catalog import _BLOCKLIST_FIRST_WORD, is_brand_blacklisted
+from src.brand_catalog import is_brand_blacklisted
 
 
 def main() -> int:

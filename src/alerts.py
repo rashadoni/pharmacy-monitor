@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from src._time import utcnow
 from typing import Any, Callable
 
@@ -30,8 +30,6 @@ from src.storage import (
     AlertEvent,
     AlertRule,
     Match,
-    PriceSnapshot,
-    Product,
     Promo,
     Run,
 )

@@ -1,6 +1,5 @@
 """Тесты ROI/actions модуля на синтетических данных."""
 
-from datetime import datetime
 from src._time import utcnow
 
 from src import roi

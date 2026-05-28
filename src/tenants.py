@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timedelta
+from datetime import timedelta
 from src._time import utcnow
 
 import structlog

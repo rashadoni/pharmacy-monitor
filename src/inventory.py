@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import datetime
 from src._time import utcnow
 from pathlib import Path
 
@@ -30,7 +29,6 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from src.storage import (
-    Match,
     PriceSnapshot,
     Product,
     Run,
