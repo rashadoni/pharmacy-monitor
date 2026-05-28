@@ -4,6 +4,7 @@ These don't actually launch a browser — they verify the helpers and the
 configuration plumbing that BaseScraper relies on (UA rotation, viewport,
 proxy URL redaction, captcha pattern matching).
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -46,7 +47,9 @@ def test_random_viewport_returns_realistic_size():
 
 def test_random_viewport_jitter_changes_value():
     """Multiple calls should produce different exact sizes (due to ±10 jitter)."""
-    sizes = {(vp := anti_detection.random_viewport()) and (vp["width"], vp["height"]) for _ in range(100)}
+    sizes = {
+        (vp := anti_detection.random_viewport()) and (vp["width"], vp["height"]) for _ in range(100)
+    }
     assert len(sizes) > 5
 
 
@@ -116,8 +119,13 @@ def test_scraperapi_proxy_handles_whitespace_in_csv(monkeypatch):
 
 
 def _clear_iproyal_env(monkeypatch):
-    for k in ("IPROYAL_USERNAME", "IPROYAL_PASSWORD", "IPROYAL_SITES",
-              "IPROYAL_HOST", "IPROYAL_COUNTRY"):
+    for k in (
+        "IPROYAL_USERNAME",
+        "IPROYAL_PASSWORD",
+        "IPROYAL_SITES",
+        "IPROYAL_HOST",
+        "IPROYAL_COUNTRY",
+    ):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -191,8 +199,13 @@ def test_iproyal_proxy_custom_host(monkeypatch):
 
 
 def _clear_brightdata_env(monkeypatch):
-    for k in ("BRIGHTDATA_USERNAME", "BRIGHTDATA_PASSWORD", "BRIGHTDATA_SITES",
-              "BRIGHTDATA_HOST", "BRIGHTDATA_COUNTRY"):
+    for k in (
+        "BRIGHTDATA_USERNAME",
+        "BRIGHTDATA_PASSWORD",
+        "BRIGHTDATA_SITES",
+        "BRIGHTDATA_HOST",
+        "BRIGHTDATA_COUNTRY",
+    ):
         monkeypatch.delenv(k, raising=False)
 
 

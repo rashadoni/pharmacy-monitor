@@ -16,8 +16,12 @@ def _add_run(s, started_at):
 
 def _add_product(s, site, name, ext_id, canonical_id=None):
     p = Product(
-        site=site, external_id=ext_id, url=f"http://x/{ext_id}",
-        name=name, name_normalized=name.lower(), canonical_id=canonical_id,
+        site=site,
+        external_id=ext_id,
+        url=f"http://x/{ext_id}",
+        name=name,
+        name_normalized=name.lower(),
+        canonical_id=canonical_id,
     )
     s.add(p)
     s.flush()

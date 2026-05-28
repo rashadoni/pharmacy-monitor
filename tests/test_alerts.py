@@ -25,8 +25,11 @@ def _add_run(s, started_at=None, status="ok") -> Run:
 
 def _add_product(s, site, name, ext_id, canonical_id=None) -> Product:
     p = Product(
-        site=site, external_id=ext_id, url=f"http://{site}.az/{ext_id}",
-        name=name, name_normalized=name.lower(),
+        site=site,
+        external_id=ext_id,
+        url=f"http://{site}.az/{ext_id}",
+        name=name,
+        name_normalized=name.lower(),
         canonical_id=canonical_id,
     )
     s.add(p)
@@ -35,10 +38,14 @@ def _add_product(s, site, name, ext_id, canonical_id=None) -> Product:
 
 
 def _add_snap(s, run, product, price, discount_price=None):
-    s.add(PriceSnapshot(
-        run_id=run.id, product_id=product.id,
-        price=price, discount_price=discount_price,
-    ))
+    s.add(
+        PriceSnapshot(
+            run_id=run.id,
+            product_id=product.id,
+            price=price,
+            discount_price=discount_price,
+        )
+    )
     s.flush()
 
 
@@ -123,12 +130,9 @@ def test_dedup_after_cooldown_fires_again(db_session):
 
     alerts.evaluate_rules(db_session, run.id)
     # "Сделать вид" что прошлый event был 2 часа назад
-    ev = db_session.scalars(
-        AlertEvent.__table__.select().limit(1)
-    ).first()
+    ev = db_session.scalars(AlertEvent.__table__.select().limit(1)).first()
     db_session.execute(
-        AlertEvent.__table__.update()
-        .values(created_at=utcnow() - timedelta(hours=2))
+        AlertEvent.__table__.update().values(created_at=utcnow() - timedelta(hours=2))
     )
     db_session.commit()
     second = alerts.evaluate_rules(db_session, run.id)

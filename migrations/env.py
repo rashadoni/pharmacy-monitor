@@ -1,4 +1,5 @@
 """Alembic env. Reads DATABASE_URL from environment, supports SQLite + Postgres."""
+
 from __future__ import annotations
 
 import os

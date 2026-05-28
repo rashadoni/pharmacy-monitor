@@ -24,6 +24,7 @@ Metrics (Prometheus naming convention):
   - pharmacy_db_query_seconds          Histogram  labels: query_type
   - pharmacy_app_info                  Info       version, env
 """
+
 from __future__ import annotations
 
 import os
@@ -230,11 +231,13 @@ class _Metrics:
                 "pharmacy_app",
                 "Application info: version, environment",
             )
-            self.app_info.info({
-                "version": os.environ.get("APP_VERSION", "0.1.0"),
-                "environment": os.environ.get("SENTRY_ENVIRONMENT", "production"),
-                "git_sha": _git_short_sha(),
-            })
+            self.app_info.info(
+                {
+                    "version": os.environ.get("APP_VERSION", "0.1.0"),
+                    "environment": os.environ.get("SENTRY_ENVIRONMENT", "production"),
+                    "git_sha": _git_short_sha(),
+                }
+            )
             self._initialized = True
             log.info("prometheus_metrics_initialized")
         except ImportError:
@@ -264,8 +267,8 @@ metrics = _Metrics()
 def time_observation(metric, **labels) -> Iterator[None]:
     """Context manager that observes elapsed seconds into a Histogram with labels.
 
-        with time_observation(metrics.scrape_duration_seconds, site="pharmonline"):
-            await scrape(...)
+    with time_observation(metrics.scrape_duration_seconds, site="pharmonline"):
+        await scrape(...)
     """
     start = time.perf_counter()
     try:

@@ -80,8 +80,10 @@ def test_baselines_for_sites_uses_latest_ok_run(db_session):
     """Pulls products_per_site from latest status=ok run."""
     # Старый failed run — игнорируется
     failed = storage.Run(
-        status="failed", products_per_site={"pharmonline": 9999},
-        started_at=utcnow(), finished_at=utcnow(),
+        status="failed",
+        products_per_site={"pharmonline": 9999},
+        started_at=utcnow(),
+        finished_at=utcnow(),
     )
     db_session.add(failed)
     db_session.flush()
@@ -89,7 +91,8 @@ def test_baselines_for_sites_uses_latest_ok_run(db_session):
     ok = storage.Run(
         status="ok",
         products_per_site={"pharmonline": 4500, "aptekonline": 2200, "aloe": 1100},
-        started_at=utcnow(), finished_at=utcnow(),
+        started_at=utcnow(),
+        finished_at=utcnow(),
     )
     db_session.add(ok)
     db_session.commit()
@@ -103,7 +106,8 @@ def test_baselines_ignores_zero_and_missing(db_session):
     ok = storage.Run(
         status="ok",
         products_per_site={"pharmonline": 0, "aptekonline": 1500},  # aloe missing
-        started_at=utcnow(), finished_at=utcnow(),
+        started_at=utcnow(),
+        finished_at=utcnow(),
     )
     db_session.add(ok)
     db_session.commit()

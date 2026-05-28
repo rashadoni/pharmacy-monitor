@@ -170,9 +170,7 @@ def _scraperapi_proxy_for(site_name: str) -> dict | None:
     # ScraperAPI accepts feature flags as suffixes on the username — e.g.
     # "scraperapi.country_code=tr". When no country is set, plain "scraperapi"
     # uses their default datacenter pool.
-    username = (
-        f"scraperapi.country_code={country}" if country else "scraperapi"
-    )
+    username = f"scraperapi.country_code={country}" if country else "scraperapi"
     return {
         "server": "http://proxy-server.scraperapi.com:8001",
         "username": username,
@@ -304,7 +302,7 @@ class BaseScraper(ABC):
                 site=self.site_name,
                 country=os.getenv("IPROYAL_COUNTRY", "default"),
             )
-        elif (brightdata_cfg := _brightdata_proxy_for(self.site_name)):
+        elif brightdata_cfg := _brightdata_proxy_for(self.site_name):
             launch_args["proxy"] = brightdata_cfg
             proxied_via = "brightdata"
             log.info(
@@ -340,9 +338,7 @@ class BaseScraper(ABC):
         # self-signed серт → Chromium блокирует с ERR_CERT_AUTHORITY_INVALID
         # без явного relaxation. Только если реально через managed proxy идёт
         # — direct и generic-proxy остаются strict (там не должно быть MITM).
-        ignore_https_errors = proxied_via in (
-            "iproyal", "brightdata", "crawlbase", "scraperapi"
-        )
+        ignore_https_errors = proxied_via in ("iproyal", "brightdata", "crawlbase", "scraperapi")
         self._context = await self._browser.new_context(
             user_agent=random_user_agent(),
             viewport=random_viewport(),
@@ -439,9 +435,7 @@ class BaseScraper(ABC):
             if captcha:
                 raise CaptchaDetected(f"{captcha} on {url}")
 
-    async def _goto_via_crawlbase_api(
-        self, page: Page, url: str, token: str
-    ) -> None:
+    async def _goto_via_crawlbase_api(self, page: Page, url: str, token: str) -> None:
         """Fetch URL через api.crawlbase.com → подать HTML в page.set_content.
 
         Crawlbase JS Token включает headless Chrome рендер у них на стороне,
@@ -547,7 +541,9 @@ class BaseScraper(ABC):
             except CaptchaDetected as e:
                 captcha_hits += 1
                 msg = f"category={slug}: captcha — {e}"
-                log.warning("category_captcha_blocked", site=self.site_name, slug=slug, error=str(e))
+                log.warning(
+                    "category_captcha_blocked", site=self.site_name, slug=slug, error=str(e)
+                )
                 result.errors.append(msg)
             except Exception as e:
                 category_failures += 1
@@ -578,9 +574,9 @@ class BaseScraper(ABC):
             if captcha_hits:
                 metrics.captcha_hits_total.labels(site=self.site_name).inc(captcha_hits)
             if category_failures:
-                metrics.scrape_failures_total.labels(
-                    site=self.site_name, reason="exception"
-                ).inc(category_failures)
+                metrics.scrape_failures_total.labels(site=self.site_name, reason="exception").inc(
+                    category_failures
+                )
         except Exception:
             pass
         return result

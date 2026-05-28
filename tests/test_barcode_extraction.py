@@ -56,7 +56,10 @@ def test_barcode_rejects_too_long():
 
 def test_barcode_skips_empty_values():
     """Empty string, None, falsy — try next key, finally None."""
-    assert _extract_barcode_from_jsonld({"gtin13": "", "gtin12": None, "gtin": "1234567890"}) == "1234567890"
+    assert (
+        _extract_barcode_from_jsonld({"gtin13": "", "gtin12": None, "gtin": "1234567890"})
+        == "1234567890"
+    )
 
 
 def test_barcode_returns_none_for_empty_jsonld():

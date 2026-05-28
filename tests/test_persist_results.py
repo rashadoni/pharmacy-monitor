@@ -138,7 +138,10 @@ def test_persist_handles_multiple_results(db_session):
         [
             ScrapeResult(
                 site="aloe",
-                products=[_make_product("aloe", "A1", "Aloe One"), _make_product("aloe", "A2", "Aloe Two")],
+                products=[
+                    _make_product("aloe", "A1", "Aloe One"),
+                    _make_product("aloe", "A2", "Aloe Two"),
+                ],
             ),
             ScrapeResult(
                 site="pharmonline",
@@ -314,7 +317,10 @@ def test_persist_chunks_large_results(db_session):
     from sqlalchemy import event
 
     def capture_inserts(conn, cursor, statement, parameters, context, executemany):
-        if statement.strip().upper().startswith("INSERT") and "price_snapshots" in statement.lower():
+        if (
+            statement.strip().upper().startswith("INSERT")
+            and "price_snapshots" in statement.lower()
+        ):
             # SQLAlchemy шлёт executemany как один statement с N параметрами
             if executemany and isinstance(parameters, (list, tuple)):
                 insert_sizes.append(len(parameters))
@@ -326,9 +332,7 @@ def test_persist_chunks_large_results(db_session):
     engine = db_session.get_bind()
     event.listen(engine, "before_cursor_execute", capture_inserts)
     try:
-        count = persist_results(
-            db_session, run, [ScrapeResult(site="aloe", products=products)]
-        )
+        count = persist_results(db_session, run, [ScrapeResult(site="aloe", products=products)])
     finally:
         event.remove(engine, "before_cursor_execute", capture_inserts)
 

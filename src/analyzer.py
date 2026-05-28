@@ -104,7 +104,10 @@ def analyze(session: Session, current_run_id: int) -> AnalysisReport:
 
     if prev_run is None:
         log.info("analyzer_first_run", run_id=current_run.id)
-        report.summary_counts = {**_count_first_run(session, current_run_id), "undercuts": len(report.undercuts)}
+        report.summary_counts = {
+            **_count_first_run(session, current_run_id),
+            "undercuts": len(report.undercuts),
+        }
         return report
 
     report.price_changes = _detect_price_changes(session, current_run)
@@ -122,9 +125,7 @@ def analyze(session: Session, current_run_id: int) -> AnalysisReport:
 # curr_and_prev_snapshots_for_run перенесён в storage.py — общий helper.
 
 
-def _detect_price_changes(
-    session: Session, current_run: Run
-) -> list[PriceChange]:
+def _detect_price_changes(session: Session, current_run: Run) -> list[PriceChange]:
     """Сравниваем curr-snap с последним snapshot'ом до current_run.started_at.
 
     После diff-only persist (2026-05-09) snapshots в curr_run — это уже
@@ -166,9 +167,7 @@ def _detect_price_changes(
     return changes
 
 
-def _detect_undercuts(
-    session: Session, threshold_pct: float = 0.0
-) -> list[CompetitorUndercut]:
+def _detect_undercuts(session: Session, threshold_pct: float = 0.0) -> list[CompetitorUndercut]:
     """Конкурент дешевле клиента на тот же canonical_match → undercut.
 
     Diff-only-aware (2026-05-09): «текущая цена» = latest snapshot per product
@@ -178,10 +177,7 @@ def _detect_undercuts(
     """
     from sqlalchemy import func
 
-    matches = session.scalars(
-        select(Match)
-        .where(Match.products.any())
-    ).all()
+    matches = session.scalars(select(Match).where(Match.products.any())).all()
 
     # Все product_ids из всех matches
     all_match_product_ids: set[int] = set()
@@ -262,9 +258,7 @@ def _detect_undercuts(
     return undercuts
 
 
-def _detect_new_products(
-    session: Session, current_run: Run
-) -> list[NewProduct]:
+def _detect_new_products(session: Session, current_run: Run) -> list[NewProduct]:
     """Товары, у которых до current_run.started_at не было ни одного snapshot'а.
 
     «Новый» = впервые видим. Если в `curr_and_prev_snapshots_for_run` для
@@ -324,12 +318,7 @@ def _count_first_run(session: Session, run_id: int) -> dict:
     )
     counts = {}
     for site in (CLIENT_SITE, *COMPETITOR_SITES):
-        c = sum(
-            1
-            for _ in session.scalars(
-                select(Product).where(Product.site == site)
-            )
-        )
+        c = sum(1 for _ in session.scalars(select(Product).where(Product.site == site)))
         counts[site] = c
     counts["total_products"] = sum(counts.values())
     return counts

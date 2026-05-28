@@ -51,7 +51,8 @@ async def probe_homepage(page, url: str) -> dict:
     """)
     product_like = [l for l in all_links if "/product/" in l["href"] or "/p/" in l["href"]]
     category_like = [
-        l for l in all_links
+        l
+        for l in all_links
         if any(k in l["href"] for k in ("/category", "/catalog", "/products?", "/products/", "/c/"))
     ]
 
@@ -163,7 +164,9 @@ async def main():
     results = {"sites": []}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=UA, viewport={"width": 1366, "height": 900}, locale="az-AZ")
+        context = await browser.new_context(
+            user_agent=UA, viewport={"width": 1366, "height": 900}, locale="az-AZ"
+        )
         page = await context.new_page()
 
         for site_url in SITES:

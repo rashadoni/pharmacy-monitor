@@ -60,6 +60,7 @@ async def _parse_cards(
 @pytest.mark.asyncio
 async def test_aloe_snapshot_yields_products():
     from src.scrapers.aloe import AloeScraper
+
     products, n_cards = await _parse_cards(
         "aloe_bestseller.html",
         AloeScraper,
@@ -73,6 +74,7 @@ async def test_aloe_snapshot_yields_products():
 @pytest.mark.asyncio
 async def test_aloe_snapshot_extracts_brand():
     from src.scrapers.aloe import AloeScraper
+
     products, _ = await _parse_cards(
         "aloe_bestseller.html",
         AloeScraper,
@@ -83,7 +85,7 @@ async def test_aloe_snapshot_extracts_brand():
         pytest.skip("snapshot пустой")
     with_brand = sum(1 for p in products if p.brand)
     coverage = with_brand / len(products)
-    assert coverage >= 0.5, f"Brand-coverage {coverage*100:.0f}% < 50% на aloe"
+    assert coverage >= 0.5, f"Brand-coverage {coverage * 100:.0f}% < 50% на aloe"
 
 
 # === PHARMONLINE ===
@@ -92,6 +94,7 @@ async def test_aloe_snapshot_extracts_brand():
 @pytest.mark.asyncio
 async def test_pharmonline_snapshot_yields_products():
     from src.scrapers.pharmonline import PharmonlineScraper
+
     products, n_cards = await _parse_cards(
         "pharmonline_category.html",
         PharmonlineScraper,
@@ -104,6 +107,7 @@ async def test_pharmonline_snapshot_yields_products():
 @pytest.mark.asyncio
 async def test_pharmonline_snapshot_prices_parseable():
     from src.scrapers.pharmonline import PharmonlineScraper
+
     products, _ = await _parse_cards(
         "pharmonline_category.html",
         PharmonlineScraper,

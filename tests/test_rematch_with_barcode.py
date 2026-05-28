@@ -21,8 +21,13 @@ from src import storage  # noqa: E402
 def _mk(site: str, barcode: str | None) -> storage.Product:
     """Light unattached Product for decision-logic tests."""
     return storage.Product(
-        tenant_id=1, site=site, external_id=f"{site}-x", url="http://x",
-        name="X", name_normalized="x", barcode=barcode,
+        tenant_id=1,
+        site=site,
+        external_id=f"{site}-x",
+        url="http://x",
+        name="X",
+        name_normalized="x",
+        barcode=barcode,
     )
 
 

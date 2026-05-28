@@ -81,6 +81,7 @@ def cmd_help(session: Session, chat_id: str, args: str) -> str:
 def cmd_today(session: Session, chat_id: str, args: str) -> str:
     """Краткая сводка: топ-3 действия из ROI."""
     from src import roi
+
     actions = roi.compute_actions(session)
     agg = roi.aggregate_impact(actions)
     if not actions:
@@ -105,18 +106,14 @@ def cmd_today(session: Session, chat_id: str, args: str) -> str:
         gap = a.unit_gap_azn or 0
         spread = a.spread_pct or 0
         gap_str = f"+{gap:.2f}" if gap > 0 else f"{gap:.2f}"
-        lines.append(
-            f"{i}. {sev} {a.title[:60]} (`{gap_str} ₼/ед`, спред {spread:.1f}%)"
-        )
+        lines.append(f"{i}. {sev} {a.title[:60]} (`{gap_str} ₼/ед`, спред {spread:.1f}%)")
     return "\n".join(lines)
 
 
 def cmd_alerts(session: Session, chat_id: str, args: str) -> str:
     """Последние 5 алертов."""
     events = session.scalars(
-        select(storage.AlertEvent)
-        .order_by(desc(storage.AlertEvent.created_at))
-        .limit(5)
+        select(storage.AlertEvent).order_by(desc(storage.AlertEvent.created_at)).limit(5)
     ).all()
     if not events:
         return "🔔 Алертов ещё не было."
@@ -131,6 +128,7 @@ def cmd_alerts(session: Session, chat_id: str, args: str) -> str:
 def cmd_status(session: Session, chat_id: str, args: str) -> str:
     """Health-check кратко."""
     from src import health
+
     rep = health.check_health(session)
     sev_emoji = {"ok": "✅", "warning": "⚠️", "critical": "🔴"}.get(rep.status, "•")
     out = [
@@ -167,9 +165,7 @@ def handle_update(session: Session, update: dict) -> None:
 
     handler = COMMANDS.get(cmd)
     if not handler:
-        notifier.send_telegram_message(
-            chat_id, f"Неизвестная команда: `{cmd}`. /help"
-        )
+        notifier.send_telegram_message(chat_id, f"Неизвестная команда: `{cmd}`. /help")
         return
     try:
         response = handler(session, chat_id, args)
@@ -195,9 +191,7 @@ def run_polling(poll_timeout: int = 30) -> None:
 
     while True:
         try:
-            updates = notifier.telegram_get_updates(
-                offset=last_update_id, timeout=poll_timeout
-            )
+            updates = notifier.telegram_get_updates(offset=last_update_id, timeout=poll_timeout)
         except Exception as e:
             log.warning("telegram_poll_error", error=str(e))
             time.sleep(5)

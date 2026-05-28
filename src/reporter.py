@@ -48,7 +48,15 @@ def render_excel(report: AnalysisReport) -> bytes:
     # Undercuts
     add_sheet(
         "Конкурент дешевле",
-        ["Товар", "Клиент ₼", "Клиент URL", "Конкурент сайт", "Конкурент ₼", "Конкурент URL", "Дельта %"],
+        [
+            "Товар",
+            "Клиент ₼",
+            "Клиент URL",
+            "Конкурент сайт",
+            "Конкурент ₼",
+            "Конкурент URL",
+            "Дельта %",
+        ],
         [
             [
                 u.canonical_name,
@@ -67,7 +75,15 @@ def render_excel(report: AnalysisReport) -> bytes:
         "Изменения цен",
         ["Сайт", "Товар", "URL", "Было ₼", "Стало ₼", "Дельта %", "Промо"],
         [
-            [c.site, c.product_name, c.url, c.prev_price, c.curr_price, c.delta_pct, c.promo_label or ""]
+            [
+                c.site,
+                c.product_name,
+                c.url,
+                c.prev_price,
+                c.curr_price,
+                c.delta_pct,
+                c.promo_label or "",
+            ]
             for c in report.price_changes
         ],
     )

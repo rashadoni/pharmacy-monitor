@@ -60,7 +60,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 import structlog
-from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Header, Request, Response, UploadFile
+from fastapi import (
+    Cookie,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Header,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, func, select
@@ -187,6 +197,7 @@ def _check_rate_limit(client_key: str, limit: int = _RATE_LIMIT_RPM) -> None:
 
 # ─── DB session dependency ───────────────────────────────────────────────────
 
+
 def get_db() -> Iterator[Session]:
     Session_ = storage.make_session()
     db = Session_()
@@ -197,6 +208,7 @@ def get_db() -> Iterator[Session]:
 
 
 # ─── Auth: API key (legacy ERP endpoints) ────────────────────────────────────
+
 
 def require_api_key(
     request: Request,
@@ -272,6 +284,7 @@ def require_user(
         if not user:
             # No user exists — auto-create one
             from src import tenants as _tenants
+
             t = _tenants.get_or_create_default(db)
             user = _tenants.add_user(db, t.id, "admin@local", name="Admin", role="admin")
             db.commit()
@@ -342,6 +355,7 @@ class PasswordLoginIn(BaseModel):
     Validates the password against `ADMIN_PASSWORD_HASH` env var (bcrypt).
     Issues a JWT cookie tied to the first active admin user in the DB.
     """
+
     login: str
     password: str
 
@@ -472,8 +486,9 @@ def _staleness_per_site(db: Session) -> list[SiteStaleness]:
     We strip tzinfo from inputs to match.
     """
     rows = db.execute(
-        select(storage.Product.site, func.max(storage.Product.last_seen_at))
-        .group_by(storage.Product.site)
+        select(storage.Product.site, func.max(storage.Product.last_seen_at)).group_by(
+            storage.Product.site
+        )
     ).all()
     now = utcnow()  # naive UTC by project convention
     out: list[SiteStaleness] = []
@@ -495,13 +510,13 @@ def health_endpoint(db: Session = Depends(get_db)):
     endpoint itself stays 200 so we can distinguish "API up but DB slow"
     from "API down entirely".
     """
-    last = db.scalars(
-        select(storage.Run).order_by(desc(storage.Run.id)).limit(1)
-    ).first()
+    last = db.scalars(select(storage.Run).order_by(desc(storage.Run.id)).limit(1)).first()
     db_ms = _ping_db(db)
     redis_ms = _ping_redis()
     sites = _staleness_per_site(db)
-    stale = any(s.hours_since is not None and s.hours_since > _HEALTH_STALENESS_HOURS for s in sites)
+    stale = any(
+        s.hours_since is not None and s.hours_since > _HEALTH_STALENESS_HOURS for s in sites
+    )
     status_label = "degraded" if (stale or db_ms is None) else "up"
     return HealthOut(
         status=status_label,
@@ -568,9 +583,11 @@ def _verify_bcrypt(password: str, hash_str: str) -> bool:
     """Verify bcrypt password. Used by auth.login и change-password."""
     try:
         import bcrypt
+
         return bcrypt.checkpw(password.encode(), hash_str.encode())
     except ImportError:
         from passlib.hash import bcrypt as bcrypt_pl
+
         return bcrypt_pl.verify(password, hash_str)
 
 
@@ -578,14 +595,18 @@ def _hash_bcrypt(password: str) -> str:
     """Generate bcrypt hash."""
     try:
         import bcrypt
+
         return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     except ImportError:
         from passlib.hash import bcrypt as bcrypt_pl
+
         return bcrypt_pl.hash(password)
 
 
 @app.post("/auth/login")
-def auth_login(payload: PasswordLoginIn, response: Response, request: Request, db: Session = Depends(get_db)):
+def auth_login(
+    payload: PasswordLoginIn, response: Response, request: Request, db: Session = Depends(get_db)
+):
     """Password login. DB-first (TenantUser.password_hash), env fallback.
 
     Раньше (до 2026-05-11) сравнивал только с ADMIN_LOGIN + ADMIN_PASSWORD_HASH
@@ -604,6 +625,7 @@ def auth_login(payload: PasswordLoginIn, response: Response, request: Request, d
     # Constant-time login compare против env (для backward-compat — login
     # фиксированный в env, в DB user identifier'ом служит email)
     import hmac
+
     if not hmac.compare_digest(payload.login.lower(), expected_login.lower()):
         _check_rate_limit(f"login_fail:{client_ip}", limit=5)
         raise HTTPException(401, "Неверный логин или пароль")
@@ -617,6 +639,7 @@ def auth_login(payload: PasswordLoginIn, response: Response, request: Request, d
     )
     if not user:
         from src import tenants as _tenants
+
         t = _tenants.get_or_create_default(db)
         user = _tenants.add_user(db, t.id, "admin@local", name="Admin", role="admin")
         db.commit()
@@ -651,8 +674,11 @@ def auth_logout(response: Response):
 @app.get("/api/v1/dash/me", response_model=MeOut)
 def dash_me(user: storage.TenantUser = Depends(require_user)):
     return MeOut(
-        id=user.id, email=user.email, name=user.name,
-        role=user.role, tenant_id=user.tenant_id,
+        id=user.id,
+        email=user.email,
+        name=user.name,
+        role=user.role,
+        tenant_id=user.tenant_id,
     )
 
 
@@ -713,13 +739,15 @@ def dash_scrape_trigger(
         raise HTTPException(400, "category_id required for mode='category'")
 
     # Анти-spam #1: не более 5 pending заявок одновременно (watcher разгребёт серийно).
-    pending_count = db.scalar(
-        select(func.count(storage.ScrapeRequest.id))
-        .where(
-            storage.ScrapeRequest.tenant_id == user.tenant_id,
-            storage.ScrapeRequest.status.in_(("pending", "running")),
+    pending_count = (
+        db.scalar(
+            select(func.count(storage.ScrapeRequest.id)).where(
+                storage.ScrapeRequest.tenant_id == user.tenant_id,
+                storage.ScrapeRequest.status.in_(("pending", "running")),
+            )
         )
-    ) or 0
+        or 0
+    )
     MAX_PENDING = 5
     if pending_count >= MAX_PENDING:
         raise HTTPException(
@@ -800,28 +828,28 @@ def dash_scrape_requests(
     run_ids = [r.run_id for r in reqs if r.run_id]
     runs_map: dict[int, storage.Run] = {}
     if run_ids:
-        rows = db.scalars(
-            select(storage.Run).where(storage.Run.id.in_(run_ids))
-        ).all()
+        rows = db.scalars(select(storage.Run).where(storage.Run.id.in_(run_ids))).all()
         runs_map = {run.id: run for run in rows}
 
     out = []
     for r in reqs:
         run = runs_map.get(r.run_id) if r.run_id else None
-        out.append({
-            "id": r.id,
-            "mode": r.mode,
-            "category_id": r.category_id,
-            "sites": r.sites,
-            "status": r.status,
-            "requested_at": r.requested_at.isoformat() if r.requested_at else None,
-            "started_at": r.started_at.isoformat() if r.started_at else None,
-            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-            "run_id": r.run_id,
-            "error_message": r.error_message,
-            "products_scraped": run.products_scraped if run else None,
-            "products_per_site": run.products_per_site if run else None,
-        })
+        out.append(
+            {
+                "id": r.id,
+                "mode": r.mode,
+                "category_id": r.category_id,
+                "sites": r.sites,
+                "status": r.status,
+                "requested_at": r.requested_at.isoformat() if r.requested_at else None,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "run_id": r.run_id,
+                "error_message": r.error_message,
+                "products_scraped": run.products_scraped if run else None,
+                "products_per_site": run.products_per_site if run else None,
+            }
+        )
     return out
 
 
@@ -861,8 +889,7 @@ class ScrapeCompleteIn(BaseModel):
     error_message: str | None = None
 
 
-@app.post("/api/v1/internal/scrape-complete/{request_id}",
-          dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/internal/scrape-complete/{request_id}", dependencies=[Depends(require_api_key)])
 def internal_scrape_complete(
     request_id: int,
     payload: ScrapeCompleteIn,
@@ -914,7 +941,8 @@ def dash_integrations(user: storage.TenantUser = Depends(require_user)):
         "sentry": bool(os.environ.get("SENTRY_DSN")),
         "scraperapi": bool(os.environ.get("SCRAPER_API_KEY")),
         "scraperapi_sites": (os.environ.get("SCRAPER_API_SITES") or "").split(",")
-            if os.environ.get("SCRAPER_API_SITES") else [],
+        if os.environ.get("SCRAPER_API_SITES")
+        else [],
     }
 
 
@@ -1184,7 +1212,9 @@ def dash_recipients_create(
     db.refresh(new_user)
     log.info(
         "recipient_created",
-        id=new_user.id, email=new_user.email, by_user_id=user.id,
+        id=new_user.id,
+        email=new_user.email,
+        by_user_id=user.id,
     )
     return _to_recipient_out(new_user)
 
@@ -1220,7 +1250,9 @@ def dash_recipients_update(
     db.refresh(r)
     log.info(
         "recipient_updated",
-        id=r.id, by_user_id=user.id, fields=list(data.keys()),
+        id=r.id,
+        by_user_id=user.id,
+        fields=list(data.keys()),
     )
     return _to_recipient_out(r)
 
@@ -1273,16 +1305,11 @@ def dash_comparison(
     if not last_run:
         return []
 
-    matches_q = (
-        select(storage.Match)
-        .where(storage.Match.tenant_id == user.tenant_id)
-        .limit(limit)
-    )
+    matches_q = select(storage.Match).where(storage.Match.tenant_id == user.tenant_id).limit(limit)
     if search:
         like = f"%{search.lower()}%"
         matches_q = matches_q.where(
-            storage.Match.canonical_name.ilike(like)
-            | storage.Match.canonical_brand.ilike(like)
+            storage.Match.canonical_name.ilike(like) | storage.Match.canonical_brand.ilike(like)
         )
     matches = db.scalars(matches_q).all()
 
@@ -1318,7 +1345,8 @@ def dash_comparison(
             median = vals[len(vals) // 2]
             outlier_threshold = median * 0.1  # 10× cheaper than median
             prices = {
-                site: data for site, data in raw_prices.items()
+                site: data
+                for site, data in raw_prices.items()
                 if data["price"] >= outlier_threshold
             }
 
@@ -1332,20 +1360,23 @@ def dash_comparison(
         max_p = max(price_vals) if price_vals else None
         cheapest = min(prices.items(), key=lambda x: x[1]["price"])[0] if prices else None
         spread = round((max_p - min_p) / max_p * 100, 1) if max_p else None
-        out.append(ComparisonRowOut(
-            canonical_id=m.id,
-            name=m.canonical_name,
-            brand=m.canonical_brand,
-            pack_size=m.canonical_pack_size,
-            is_manual=m.is_manual,
-            sites_with_price=sites_with_price,
-            min_price=min_p, max_price=max_p,
-            spread_pct=spread,
-            cheapest_site=cheapest,
-            prices=prices,
-            confidence=m.confidence if m.confidence is not None else 1.0,
-            needs_review=(spread is not None and spread >= 50.0),
-        ))
+        out.append(
+            ComparisonRowOut(
+                canonical_id=m.id,
+                name=m.canonical_name,
+                brand=m.canonical_brand,
+                pack_size=m.canonical_pack_size,
+                is_manual=m.is_manual,
+                sites_with_price=sites_with_price,
+                min_price=min_p,
+                max_price=max_p,
+                spread_pct=spread,
+                cheapest_site=cheapest,
+                prices=prices,
+                confidence=m.confidence if m.confidence is not None else 1.0,
+                needs_review=(spread is not None and spread >= 50.0),
+            )
+        )
     return out
 
 
@@ -1380,6 +1411,7 @@ def dash_roi_actions(
     реконструируются из структурных полей, кэш не инвалидируется.
     """
     from src import roi
+
     _require_site(client_site)
     if locale not in ("ru", "az", "en"):
         locale = "ru"
@@ -1429,8 +1461,7 @@ def dash_alerts(
     if not include_snoozed:
         now = _now()
         stmt = stmt.where(
-            (storage.AlertEvent.snoozed_until.is_(None))
-            | (storage.AlertEvent.snoozed_until <= now)
+            (storage.AlertEvent.snoozed_until.is_(None)) | (storage.AlertEvent.snoozed_until <= now)
         )
     events = db.scalars(stmt).all()
     return [
@@ -1445,9 +1476,7 @@ def dash_alerts(
             "is_read": bool(getattr(e, "is_read", False)),
             "read_at": e.read_at.isoformat() if getattr(e, "read_at", None) else None,
             "snoozed_until": (
-                e.snoozed_until.isoformat()
-                if getattr(e, "snoozed_until", None)
-                else None
+                e.snoozed_until.isoformat() if getattr(e, "snoozed_until", None) else None
             ),
         }
         for e in events
@@ -1463,23 +1492,31 @@ def dash_alerts_counts(
     from src._time import utcnow as _now
 
     now = _now()
-    base = select(func.count()).select_from(storage.AlertEvent).where(
-        storage.AlertEvent.tenant_id == user.tenant_id
+    base = (
+        select(func.count())
+        .select_from(storage.AlertEvent)
+        .where(storage.AlertEvent.tenant_id == user.tenant_id)
     )
-    unread = db.scalar(
-        base.where(
-            storage.AlertEvent.is_read.is_(False),
-            (storage.AlertEvent.snoozed_until.is_(None))
-            | (storage.AlertEvent.snoozed_until <= now),
+    unread = (
+        db.scalar(
+            base.where(
+                storage.AlertEvent.is_read.is_(False),
+                (storage.AlertEvent.snoozed_until.is_(None))
+                | (storage.AlertEvent.snoozed_until <= now),
+            )
         )
-    ) or 0
-    snoozed = db.scalar(
-        base.where(
-            storage.AlertEvent.is_read.is_(False),
-            storage.AlertEvent.snoozed_until.is_not(None),
-            storage.AlertEvent.snoozed_until > now,
+        or 0
+    )
+    snoozed = (
+        db.scalar(
+            base.where(
+                storage.AlertEvent.is_read.is_(False),
+                storage.AlertEvent.snoozed_until.is_not(None),
+                storage.AlertEvent.snoozed_until > now,
+            )
         )
-    ) or 0
+        or 0
+    )
     read = db.scalar(base.where(storage.AlertEvent.is_read.is_(True))) or 0
     total = db.scalar(base) or 0
     return {
@@ -1492,6 +1529,7 @@ def dash_alerts_counts(
 
 class _AlertPatchPayload(BaseModel):
     """PATCH single alert: пометить read или snooze до даты."""
+
     is_read: bool | None = None
     snooze_hours: int | None = None  # alias: snooze на N часов от now
 
@@ -1528,6 +1566,7 @@ def dash_alert_patch(
 
 class _AlertBulkPayload(BaseModel):
     """Bulk action на список ID. action ∈ {mark_read, mark_unread, snooze_24h, snooze_7d, snooze_clear}."""
+
     ids: list[int]
     action: str
 
@@ -1545,9 +1584,8 @@ def dash_alerts_bulk(
     if not payload.ids:
         return {"affected": 0}
 
-    base_filter = (
-        (storage.AlertEvent.id.in_(payload.ids))
-        & (storage.AlertEvent.tenant_id == user.tenant_id)
+    base_filter = (storage.AlertEvent.id.in_(payload.ids)) & (
+        storage.AlertEvent.tenant_id == user.tenant_id
     )
     now = _now()
     if payload.action == "mark_read":
@@ -1596,6 +1634,7 @@ def dash_match_quality(
     db: Session = Depends(get_db),
 ):
     from src import analytics
+
     mq = analytics.match_quality(db)
     return {
         "total_matches": mq.total_matches,
@@ -1619,45 +1658,54 @@ def dash_normalize_stats(
     Используется на /overview как KPI здоровья. Когда coverage падает <80%,
     это сигнал что промпт перестал работать на новых SKU или бюджет исчерпан.
     """
-    products_total = db.scalar(
-        select(func.count(storage.Product.id))
-        .where(storage.Product.tenant_id == user.tenant_id)
-    ) or 0
+    products_total = (
+        db.scalar(
+            select(func.count(storage.Product.id)).where(
+                storage.Product.tenant_id == user.tenant_id
+            )
+        )
+        or 0
+    )
 
     # Нормализованным считается продукт у которого заполнен name_normalized
-    products_normalized = db.scalar(
-        select(func.count(storage.Product.id))
-        .where(
-            storage.Product.tenant_id == user.tenant_id,
-            storage.Product.name_normalized != "",
+    products_normalized = (
+        db.scalar(
+            select(func.count(storage.Product.id)).where(
+                storage.Product.tenant_id == user.tenant_id,
+                storage.Product.name_normalized != "",
+            )
         )
-    ) or 0
+        or 0
+    )
 
     # needs_review — маркер на Match (spread ≥50% между сайтами)
-    needs_review = db.scalar(
-        select(func.count(storage.Match.id))
-        .where(
-            storage.Match.tenant_id == user.tenant_id,
-            storage.Match.needs_review == True,  # noqa: E712
+    needs_review = (
+        db.scalar(
+            select(func.count(storage.Match.id)).where(
+                storage.Match.tenant_id == user.tenant_id,
+                storage.Match.needs_review == True,  # noqa: E712
+            )
         )
-    ) or 0
+        or 0
+    )
 
     # Распределение matches по типу: ручной vs авто
     matches_by_strategy = {
         "auto": db.scalar(
-            select(func.count(storage.Match.id))
-            .where(storage.Match.tenant_id == user.tenant_id, storage.Match.is_manual == False)  # noqa: E712
-        ) or 0,
+            select(func.count(storage.Match.id)).where(
+                storage.Match.tenant_id == user.tenant_id, storage.Match.is_manual == False
+            )  # noqa: E712
+        )
+        or 0,
         "manual": db.scalar(
-            select(func.count(storage.Match.id))
-            .where(storage.Match.tenant_id == user.tenant_id, storage.Match.is_manual == True)  # noqa: E712
-        ) or 0,
+            select(func.count(storage.Match.id)).where(
+                storage.Match.tenant_id == user.tenant_id, storage.Match.is_manual == True
+            )  # noqa: E712
+        )
+        or 0,
     }
 
-    coverage_pct = (
-        round(products_normalized / products_total * 100, 1)
-        if products_total else 0.0
-    )
+    coverage_pct = round(products_normalized / products_total * 100, 1) if products_total else 0.0
     return {
         "products_total": products_total,
         "products_normalized": products_normalized,
@@ -1676,6 +1724,7 @@ def dash_brand_share(
     db: Session = Depends(get_db),
 ):
     from src import analytics
+
     if site is not None:
         _require_site(site)
     rows = analytics.brand_share(db, top_n=top_n, site=site)
@@ -1698,6 +1747,7 @@ def dash_price_index(
     db: Session = Depends(get_db),
 ):
     from src import analytics
+
     _require_site(client_site)
     rows = analytics.price_index_by_category(db, client_site=client_site)
     return [
@@ -1799,6 +1849,7 @@ def dash_forecast_movers(
     db: Session = Depends(get_db),
 ):
     from src import forecast
+
     movers = forecast.top_movers(db, limit=limit)
     return movers
 
@@ -1838,10 +1889,7 @@ def dash_products(
         stmt = stmt.where(storage.Product.brand == brand)
     if search:
         like = f"%{search.lower()}%"
-        stmt = stmt.where(
-            storage.Product.name.ilike(like)
-            | storage.Product.brand.ilike(like)
-        )
+        stmt = stmt.where(storage.Product.name.ilike(like) | storage.Product.brand.ilike(like))
 
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
 
@@ -1859,20 +1907,22 @@ def dash_products(
             is_sale = bool(snap and snap.is_on_sale) if snap else False
             if on_sale != is_sale:
                 continue
-        items.append({
-            "id": p.id,
-            "external_id": p.external_id,
-            "name": p.name,
-            "brand": p.brand,
-            "category": p.category,
-            "url": p.url,
-            "image_url": p.image_url,
-            "price": snap.price if snap else None,
-            "discount_price": snap.discount_price if snap else None,
-            "effective_price": eff_price,
-            "is_on_sale": bool(snap and snap.is_on_sale) if snap else False,
-            "last_seen_at": p.last_seen_at.isoformat() if p.last_seen_at else None,
-        })
+        items.append(
+            {
+                "id": p.id,
+                "external_id": p.external_id,
+                "name": p.name,
+                "brand": p.brand,
+                "category": p.category,
+                "url": p.url,
+                "image_url": p.image_url,
+                "price": snap.price if snap else None,
+                "discount_price": snap.discount_price if snap else None,
+                "effective_price": eff_price,
+                "is_on_sale": bool(snap and snap.is_on_sale) if snap else False,
+                "last_seen_at": p.last_seen_at.isoformat() if p.last_seen_at else None,
+            }
+        )
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
@@ -1953,22 +2003,26 @@ def dash_products_summary(
     _require_site(site)
     from src import analytics
 
-    total_products = db.scalar(
-        select(func.count(storage.Product.id))
-        .where(
-            storage.Product.site == site,
-            storage.Product.tenant_id == user.tenant_id,
+    total_products = (
+        db.scalar(
+            select(func.count(storage.Product.id)).where(
+                storage.Product.site == site,
+                storage.Product.tenant_id == user.tenant_id,
+            )
         )
-    ) or 0
+        or 0
+    )
 
-    total_brands = db.scalar(
-        select(func.count(func.distinct(storage.Product.brand)))
-        .where(
-            storage.Product.site == site,
-            storage.Product.tenant_id == user.tenant_id,
-            storage.Product.brand.is_not(None),
+    total_brands = (
+        db.scalar(
+            select(func.count(func.distinct(storage.Product.brand))).where(
+                storage.Product.site == site,
+                storage.Product.tenant_id == user.tenant_id,
+                storage.Product.brand.is_not(None),
+            )
         )
-    ) or 0
+        or 0
+    )
 
     brand_rows = analytics.brand_share(db, top_n=10_000, site=site)
     exclusive_brands = sum(1 for r in brand_rows if r.exclusive_to == site)
@@ -1999,7 +2053,9 @@ def dash_products_summary(
         "exclusive_brands": exclusive_brands,
         "on_sale_count": on_sale,
         "on_sale_pct": on_sale_pct,
-        "last_run_at": last_run.started_at.isoformat() if last_run and last_run.started_at else None,
+        "last_run_at": last_run.started_at.isoformat()
+        if last_run and last_run.started_at
+        else None,
         "last_run_id": last_run.id if last_run else None,
     }
 
@@ -2010,11 +2066,7 @@ def dash_runs(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    runs = db.scalars(
-        select(storage.Run)
-        .order_by(desc(storage.Run.id))
-        .limit(limit)
-    ).all()
+    runs = db.scalars(select(storage.Run).order_by(desc(storage.Run.id)).limit(limit)).all()
     return [
         {
             "id": r.id,
@@ -2066,13 +2118,13 @@ def dash_categories_list(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    cats = db.scalars(
-        select(storage.Category).order_by(storage.Category.id)
-    ).all()
+    cats = db.scalars(select(storage.Category).order_by(storage.Category.id)).all()
     return [
         {
-            "id": c.id, "key": c.key,
-            "label_ru": c.label_ru, "label_az": c.label_az,
+            "id": c.id,
+            "key": c.key,
+            "label_ru": c.label_ru,
+            "label_az": c.label_az,
             "pharmonline_slug": c.pharmonline_slug,
             "aptekonline_slug": c.aptekonline_slug,
             "aloe_slug": c.aloe_slug,
@@ -2204,9 +2256,7 @@ def dash_category_suggestions(
     cat_slug_b = getattr(storage.Category, f"{site_b}_slug")
     existing_mappings = set(
         db.execute(
-            select(cat_slug_a, cat_slug_b).where(
-                cat_slug_a.is_not(None), cat_slug_b.is_not(None)
-            )
+            select(cat_slug_a, cat_slug_b).where(cat_slug_a.is_not(None), cat_slug_b.is_not(None))
         ).all()
     )
 
@@ -2232,25 +2282,33 @@ def dash_category_suggestions(
             .limit(5)
         ).all()
         # Counts
-        a_count = db.scalar(
-            select(func.count())
-            .select_from(Product)
-            .where(Product.site == site_a, Product.category == slug_a)
-        ) or 0
-        b_count = db.scalar(
-            select(func.count())
-            .select_from(Product)
-            .where(Product.site == site_b, Product.category == slug_b)
-        ) or 0
-        out.append({
-            "site_a_slug": slug_a,
-            "site_b_slug": slug_b,
-            "shared_brands_count": int(n_brands),
-            "sample_brands": list(sample),
-            "site_a_products": int(a_count),
-            "site_b_products": int(b_count),
-            "already_mapped": already,
-        })
+        a_count = (
+            db.scalar(
+                select(func.count())
+                .select_from(Product)
+                .where(Product.site == site_a, Product.category == slug_a)
+            )
+            or 0
+        )
+        b_count = (
+            db.scalar(
+                select(func.count())
+                .select_from(Product)
+                .where(Product.site == site_b, Product.category == slug_b)
+            )
+            or 0
+        )
+        out.append(
+            {
+                "site_a_slug": slug_a,
+                "site_b_slug": slug_b,
+                "shared_brands_count": int(n_brands),
+                "sample_brands": list(sample),
+                "site_a_products": int(a_count),
+                "site_b_products": int(b_count),
+                "already_mapped": already,
+            }
+        )
         if len([o for o in out if not o["already_mapped"]]) >= limit:
             break
     return out
@@ -2258,6 +2316,7 @@ def dash_category_suggestions(
 
 class _MapCategoryPayload(BaseModel):
     """Create или extend Category mapping одним кликом."""
+
     site_a: str
     site_a_slug: str
     site_b: str
@@ -2290,9 +2349,10 @@ def dash_category_mapping_create(
     existing = db.scalar(select(storage.Category).where(col_a == payload.site_a_slug))
     if existing:
         # Extend: добавим site_b slug если ещё нет
-        if getattr(existing, f"{payload.site_b}_slug") and getattr(
-            existing, f"{payload.site_b}_slug"
-        ) != payload.site_b_slug:
+        if (
+            getattr(existing, f"{payload.site_b}_slug")
+            and getattr(existing, f"{payload.site_b}_slug") != payload.site_b_slug
+        ):
             raise HTTPException(
                 409,
                 f"Категория уже маппирована на {payload.site_b}: "
@@ -2305,9 +2365,10 @@ def dash_category_mapping_create(
     # Existing row для site_b slug? (symmetric)
     existing_b = db.scalar(select(storage.Category).where(col_b == payload.site_b_slug))
     if existing_b:
-        if getattr(existing_b, f"{payload.site_a}_slug") and getattr(
-            existing_b, f"{payload.site_a}_slug"
-        ) != payload.site_a_slug:
+        if (
+            getattr(existing_b, f"{payload.site_a}_slug")
+            and getattr(existing_b, f"{payload.site_a}_slug") != payload.site_a_slug
+        ):
             raise HTTPException(
                 409,
                 f"Категория уже маппирована на {payload.site_a}: "
@@ -2330,12 +2391,15 @@ def dash_category_mapping_create(
         key=key,
         label_ru=label,
         label_az=None,
-        pharmonline_slug=payload.site_a_slug if payload.site_a == "pharmonline" else
-            (payload.site_b_slug if payload.site_b == "pharmonline" else None),
-        aptekonline_slug=payload.site_a_slug if payload.site_a == "aptekonline" else
-            (payload.site_b_slug if payload.site_b == "aptekonline" else None),
-        aloe_slug=payload.site_a_slug if payload.site_a == "aloe" else
-            (payload.site_b_slug if payload.site_b == "aloe" else None),
+        pharmonline_slug=payload.site_a_slug
+        if payload.site_a == "pharmonline"
+        else (payload.site_b_slug if payload.site_b == "pharmonline" else None),
+        aptekonline_slug=payload.site_a_slug
+        if payload.site_a == "aptekonline"
+        else (payload.site_b_slug if payload.site_b == "aptekonline" else None),
+        aloe_slug=payload.site_a_slug
+        if payload.site_a == "aloe"
+        else (payload.site_b_slug if payload.site_b == "aloe" else None),
         is_active=True,
     )
     db.add(cat)
@@ -2400,7 +2464,7 @@ def dash_match_suggestions(
             storage.Match.tenant_id == user.tenant_id,
             storage.Match.is_manual.is_(False),
             storage.Match.confidence < confidence_max,
-            *( [storage.Match.needs_review.is_(True)] if only_needs_review else [] ),
+            *([storage.Match.needs_review.is_(True)] if only_needs_review else []),
         )
         .order_by(storage.Match.confidence.asc())
         .limit(limit)
@@ -2418,29 +2482,33 @@ def dash_match_suggestions(
             price = (snap.discount_price or snap.price) if snap else None
             if price is not None and price > 0:
                 prices.append(price)
-            prods.append(MatchSuggestionProduct(
-                product_id=p.id,
-                site=p.site,
-                name=p.name,
-                url=p.url,
-                price=price,
-                brand=p.brand,
-                pack_size=p.pack_size,
-                dosage=p.dosage,
-                image_url=p.image_url,
-                barcode=p.barcode,
-            ))
+            prods.append(
+                MatchSuggestionProduct(
+                    product_id=p.id,
+                    site=p.site,
+                    name=p.name,
+                    url=p.url,
+                    price=price,
+                    brand=p.brand,
+                    pack_size=p.pack_size,
+                    dosage=p.dosage,
+                    image_url=p.image_url,
+                    barcode=p.barcode,
+                )
+            )
         spread = None
         if len(prices) >= 2:
             spread = round((max(prices) - min(prices)) / max(prices) * 100, 1)
-        out.append(MatchSuggestionOut(
-            match_id=m.id,
-            canonical_name=m.canonical_name,
-            confidence=m.confidence,
-            needs_review=m.needs_review,
-            spread_pct=spread,
-            products=prods,
-        ))
+        out.append(
+            MatchSuggestionOut(
+                match_id=m.id,
+                canonical_name=m.canonical_name,
+                confidence=m.confidence,
+                needs_review=m.needs_review,
+                spread_pct=spread,
+                products=prods,
+            )
+        )
     return out
 
 
@@ -2486,7 +2554,7 @@ def dash_match_reject(
     if len(products) >= 2:
         # Record all pairs as rejected
         for i, a in enumerate(products):
-            for b in products[i + 1:]:
+            for b in products[i + 1 :]:
                 match_actions.add_rejection(db, a.id, b.id, reason=f"manual:user={user.id}")
     # Unlink products from this match
     for p in products:
@@ -2605,8 +2673,7 @@ async def dash_cost_csv_import(
     if missing:
         raise HTTPException(
             400,
-            f"Missing required columns: {sorted(missing)}. "
-            f"Got: {sorted(actual_cols)}",
+            f"Missing required columns: {sorted(missing)}. Got: {sorted(actual_cols)}",
         )
 
     rows_processed = 0
@@ -2616,7 +2683,8 @@ async def dash_cost_csv_import(
 
     # Build sku → Product map for tenant (one query, not N+1).
     products_by_sku: dict[str, storage.Product] = {
-        p.external_id: p for p in db.scalars(
+        p.external_id: p
+        for p in db.scalars(
             select(storage.Product).where(storage.Product.tenant_id == user.tenant_id)
         ).all()
     }
@@ -2658,15 +2726,17 @@ async def dash_cost_csv_import(
             existing.source = "dashboard_csv"
             existing.updated_at = utcnow()
         else:
-            db.add(storage.SupplierPrice(
-                product_id=product.id,
-                sku=sku,
-                supplier_name=supplier,
-                purchase_price=price,
-                currency=currency,
-                source="dashboard_csv",
-                updated_at=utcnow(),
-            ))
+            db.add(
+                storage.SupplierPrice(
+                    product_id=product.id,
+                    sku=sku,
+                    supplier_name=supplier,
+                    purchase_price=price,
+                    currency=currency,
+                    source="dashboard_csv",
+                    updated_at=utcnow(),
+                )
+            )
         rows_imported += 1
 
     db.commit()
@@ -2740,10 +2810,7 @@ def dash_unmatched_pairs(
     matches = list(db.scalars(stmt).all())
 
     if category:
-        matches = [
-            m for m in matches
-            if any((p.category or "") == category for p in m.products)
-        ]
+        matches = [m for m in matches if any((p.category or "") == category for p in m.products)]
 
     matches = [m for m in matches if m.products]
     total = len(matches)
@@ -2757,23 +2824,27 @@ def dash_unmatched_pairs(
             if p.snapshots:
                 snap = max(p.snapshots, key=lambda s: s.captured_at)
             price = (snap.discount_price or snap.price) if snap else None
-            anchors.append({
-                "product_id": p.id,
-                "site": p.site,
-                "name": p.name,
-                "brand": p.brand,
-                "category": p.category,
-                "url": p.url,
-                "price": price,
-            })
-        items.append({
-            "match_id": m.id,
-            "canonical_name": m.canonical_name,
-            "canonical_brand": m.canonical_brand,
-            "canonical_dosage": m.canonical_dosage,
-            "canonical_pack_size": m.canonical_pack_size,
-            "anchor_products": anchors,
-        })
+            anchors.append(
+                {
+                    "product_id": p.id,
+                    "site": p.site,
+                    "name": p.name,
+                    "brand": p.brand,
+                    "category": p.category,
+                    "url": p.url,
+                    "price": price,
+                }
+            )
+        items.append(
+            {
+                "match_id": m.id,
+                "canonical_name": m.canonical_name,
+                "canonical_brand": m.canonical_brand,
+                "canonical_dosage": m.canonical_dosage,
+                "canonical_pack_size": m.canonical_pack_size,
+                "anchor_products": anchors,
+            }
+        )
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
@@ -2867,9 +2938,7 @@ def dash_match_add_product(
 
     existing_sites = {p.site for p in match.products}
     if product.site in existing_sites:
-        raise HTTPException(
-            409, f"Match already has a product from {product.site}"
-        )
+        raise HTTPException(409, f"Match already has a product from {product.site}")
 
     product.canonical_id = match.id
     match.is_manual = True
@@ -2915,12 +2984,14 @@ def dash_match_create_with_products(
     кластера). Берёт canonical_name/brand/... из первого продукта. Метит
     is_manual=True. Возвращает созданный Match.
     """
-    products = list(db.scalars(
-        select(storage.Product).where(
-            storage.Product.id.in_(payload.product_ids),
-            storage.Product.tenant_id == user.tenant_id,
-        )
-    ).all())
+    products = list(
+        db.scalars(
+            select(storage.Product).where(
+                storage.Product.id.in_(payload.product_ids),
+                storage.Product.tenant_id == user.tenant_id,
+            )
+        ).all()
+    )
     if len(products) != len(payload.product_ids):
         raise HTTPException(404, "One or more products not found")
 
@@ -2985,9 +3056,16 @@ def dash_watchlist_list(
             "notes": t.notes,
             "is_active": t.is_active,
             "links": [
-                {"site": link.site, "url": link.url, "external_id": link.external_id, "status": link.status}
+                {
+                    "site": link.site,
+                    "url": link.url,
+                    "external_id": link.external_id,
+                    "status": link.status,
+                }
                 for link in t.links
-            ] if hasattr(t, "links") else [],
+            ]
+            if hasattr(t, "links")
+            else [],
         }
         for t in items
     ]
@@ -3017,12 +3095,14 @@ def dash_watchlist_create(
         ("aloe", payload.aloe_url),
     ]:
         if url:
-            db.add(storage.TrackedProductLink(
-                tracked_product_id=tp.id,
-                site=site,
-                url=url,
-                status="pending",
-            ))
+            db.add(
+                storage.TrackedProductLink(
+                    tracked_product_id=tp.id,
+                    site=site,
+                    url=url,
+                    status="pending",
+                )
+            )
     db.commit()
     return {"id": tp.id}
 
@@ -3052,9 +3132,7 @@ def dash_watchlist_delete(
 @app.get("/api/v1/alerts/recent", dependencies=[Depends(require_api_key)])
 def alerts_recent(limit: int = 50, db: Session = Depends(get_db)):
     events = db.scalars(
-        select(storage.AlertEvent)
-        .order_by(desc(storage.AlertEvent.created_at))
-        .limit(limit)
+        select(storage.AlertEvent).order_by(desc(storage.AlertEvent.created_at)).limit(limit)
     ).all()
     return [
         {
@@ -3081,9 +3159,14 @@ def products_list(
     products = db.scalars(stmt).all()
     return [
         {
-            "id": p.id, "site": p.site, "external_id": p.external_id,
-            "url": p.url, "name": p.name, "brand": p.brand,
-            "category": p.category, "canonical_id": p.canonical_id,
+            "id": p.id,
+            "site": p.site,
+            "external_id": p.external_id,
+            "url": p.url,
+            "name": p.name,
+            "brand": p.brand,
+            "category": p.category,
+            "canonical_id": p.canonical_id,
         }
         for p in products
     ]
@@ -3114,13 +3197,15 @@ def comparisons(db: Session = Depends(get_db)):
                     "is_on_sale": snap.is_on_sale,
                     "url": p.url,
                 }
-        out.append({
-            "canonical_id": m.id,
-            "name": m.canonical_name,
-            "brand": m.canonical_brand,
-            "is_manual": m.is_manual,
-            "prices": prices,
-        })
+        out.append(
+            {
+                "canonical_id": m.id,
+                "name": m.canonical_name,
+                "brand": m.canonical_brand,
+                "is_manual": m.is_manual,
+                "prices": prices,
+            }
+        )
     return out
 
 
@@ -3129,9 +3214,12 @@ def margin_endpoint(db: Session = Depends(get_db)):
     rows = inv_mod.margin_report(db)
     return [
         {
-            "product_id": r.product_id, "name": r.name,
-            "sale_price": r.sale_price, "purchase_price": r.purchase_price,
-            "margin_azn": r.margin_azn, "margin_pct": r.margin_pct,
+            "product_id": r.product_id,
+            "name": r.name,
+            "sale_price": r.sale_price,
+            "purchase_price": r.purchase_price,
+            "margin_azn": r.margin_azn,
+            "margin_pct": r.margin_pct,
             "in_stock": r.in_stock,
         }
         for r in rows
@@ -3145,19 +3233,25 @@ def push_stock(
     db: Session = Depends(get_db),
 ):
     from sqlalchemy import delete as _del
+
     db.execute(_del(storage.StockLevel).where(storage.StockLevel.source == source))
     matched = 0
     for item in items:
         product = inv_mod._find_product_by_sku_or_name(db, item.sku, item.name)
         if product:
             matched += 1
-        db.add(storage.StockLevel(
-            product_id=product.id if product else None,
-            canonical_id=product.canonical_id if product else None,
-            sku=item.sku, name=item.name or (product.name if product else None),
-            qty=item.qty, is_in_stock=item.qty > 0,
-            source=source, updated_at=utcnow(),
-        ))
+        db.add(
+            storage.StockLevel(
+                product_id=product.id if product else None,
+                canonical_id=product.canonical_id if product else None,
+                sku=item.sku,
+                name=item.name or (product.name if product else None),
+                qty=item.qty,
+                is_in_stock=item.qty > 0,
+                source=source,
+                updated_at=utcnow(),
+            )
+        )
     db.commit()
     return {"received": len(items), "matched_to_product": matched}
 
@@ -3169,6 +3263,7 @@ def push_prices(
     db: Session = Depends(get_db),
 ):
     from sqlalchemy import delete as _del
+
     db.execute(_del(storage.SupplierPrice).where(storage.SupplierPrice.source == source))
     matched = 0
     for item in items:
@@ -3177,13 +3272,18 @@ def push_prices(
         product = inv_mod._find_product_by_sku_or_name(db, item.sku, item.name)
         if product:
             matched += 1
-        db.add(storage.SupplierPrice(
-            product_id=product.id if product else None,
-            canonical_id=product.canonical_id if product else None,
-            sku=item.sku, name=item.name or (product.name if product else None),
-            supplier_name=item.supplier_name,
-            purchase_price=item.purchase_price, currency=item.currency,
-            source=source, updated_at=utcnow(),
-        ))
+        db.add(
+            storage.SupplierPrice(
+                product_id=product.id if product else None,
+                canonical_id=product.canonical_id if product else None,
+                sku=item.sku,
+                name=item.name or (product.name if product else None),
+                supplier_name=item.supplier_name,
+                purchase_price=item.purchase_price,
+                currency=item.currency,
+                source=source,
+                updated_at=utcnow(),
+            )
+        )
     db.commit()
     return {"received": len(items), "matched_to_product": matched}

@@ -72,7 +72,10 @@ def test_site_silence_critical_when_one_site_stale(db_session):
     # pharmonline старый (3 дня назад)
     old_pharm_run = _add_run(db_session, utcnow() - timedelta(days=3))
     _add_snap(
-        db_session, old_pharm_run, "pharmonline", 50,
+        db_session,
+        old_pharm_run,
+        "pharmonline",
+        50,
         last_seen_at=utcnow() - timedelta(days=3),
     )
     db_session.commit()
@@ -136,16 +139,22 @@ def test_zero_prices_critical(db_session):
     # 12 NULL/0 prices, 8 нормальных (60% zero)
     for i in range(12):
         p = Product(
-            site="aloe", external_id=f"z-{i}", url="x",
-            name=f"Z{i}", name_normalized=f"z{i}",
+            site="aloe",
+            external_id=f"z-{i}",
+            url="x",
+            name=f"Z{i}",
+            name_normalized=f"z{i}",
         )
         db_session.add(p)
         db_session.flush()
         db_session.add(PriceSnapshot(run_id=run.id, product_id=p.id, price=0))
     for i in range(8):
         p = Product(
-            site="aloe", external_id=f"ok-{i}", url="x",
-            name=f"OK{i}", name_normalized=f"ok{i}",
+            site="aloe",
+            external_id=f"ok-{i}",
+            url="x",
+            name=f"OK{i}",
+            name_normalized=f"ok{i}",
         )
         db_session.add(p)
         db_session.flush()
@@ -167,8 +176,12 @@ def test_brand_coverage_loss_critical(db_session):
     prev = _add_run(db_session, base - timedelta(days=1), products_scraped=20)
     for i in range(16):
         p = Product(
-            site="aloe", external_id=f"prev-b-{i}", url="x",
-            name=f"P{i}", name_normalized=f"p{i}", brand="Bayer",
+            site="aloe",
+            external_id=f"prev-b-{i}",
+            url="x",
+            name=f"P{i}",
+            name_normalized=f"p{i}",
+            brand="Bayer",
             last_seen_at=prev.started_at,
         )
         db_session.add(p)
@@ -176,8 +189,11 @@ def test_brand_coverage_loss_critical(db_session):
         db_session.add(PriceSnapshot(run_id=prev.id, product_id=p.id, price=10.0))
     for i in range(4):
         p = Product(
-            site="aloe", external_id=f"prev-nb-{i}", url="x",
-            name=f"P{i}", name_normalized=f"p{i}",
+            site="aloe",
+            external_id=f"prev-nb-{i}",
+            url="x",
+            name=f"P{i}",
+            name_normalized=f"p{i}",
             last_seen_at=prev.started_at,
         )
         db_session.add(p)
@@ -188,8 +204,11 @@ def test_brand_coverage_loss_critical(db_session):
     curr = _add_run(db_session, base - timedelta(hours=1), products_scraped=20)
     for i in range(20):
         p = Product(
-            site="aloe", external_id=f"curr-{i}", url="x",
-            name=f"C{i}", name_normalized=f"c{i}",
+            site="aloe",
+            external_id=f"curr-{i}",
+            url="x",
+            name=f"C{i}",
+            name_normalized=f"c{i}",
             last_seen_at=curr.started_at,
         )
         db_session.add(p)

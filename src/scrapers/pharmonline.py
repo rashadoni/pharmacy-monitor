@@ -60,7 +60,7 @@ class PharmonlineScraper(BaseScraper):
                 # подстраховка: ждать пока появится хотя бы 1 карточка
                 for _ in range(10):
                     count = await page.evaluate(
-                        'document.querySelectorAll(\'.product_box_v2\').length'
+                        "document.querySelectorAll('.product_box_v2').length"
                     )
                     if count >= 1:
                         break
@@ -92,9 +92,7 @@ class PharmonlineScraper(BaseScraper):
                     cards_now = await page.query_selector_all(".product_box_v2")
                     if len(cards_now) == prev_count:
                         break
-                    await page.evaluate(
-                        "window.scrollTo(0, document.body.scrollHeight)"
-                    )
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await page.wait_for_timeout(700)
                     prev_count = len(cards_now)
 
@@ -193,16 +191,10 @@ class PharmonlineScraper(BaseScraper):
         # NB: pharmonline маркирует **большинство** карточек как .product_sale
         # (always-on marketing). Это даёт ~100% sale для site/pharmonline KPI
         # — точнее чем 0%, но интерпретируется как «у клиента always-on акция».
-        old_price_handle = await card.query_selector(
-            ".old-price, [class*='old-price'], s, del"
-        )
-        old_price = (
-            parse_price(await old_price_handle.inner_text()) if old_price_handle else None
-        )
+        old_price_handle = await card.query_selector(".old-price, [class*='old-price'], s, del")
+        old_price = parse_price(await old_price_handle.inner_text()) if old_price_handle else None
 
-        has_crossed_old = (
-            old_price is not None and price is not None and old_price > price
-        )
+        has_crossed_old = old_price is not None and price is not None and old_price > price
         has_sale_badge = await card.query_selector(".product_sale") is not None
         is_on_sale = has_crossed_old or has_sale_badge
 
@@ -260,7 +252,9 @@ class PharmonlineScraper(BaseScraper):
             is_on_sale = sale_badge is not None
             discount_percent = None
 
-            img_handle = await page.query_selector("main img, .product-image img, [class*='product'] img")
+            img_handle = await page.query_selector(
+                "main img, .product-image img, [class*='product'] img"
+            )
             image_url = await img_handle.get_attribute("src") if img_handle else None
 
             external_id = url.rstrip("/").split("/")[-1]

@@ -25,7 +25,7 @@ TARGETS = [
 
 
 async def probe(site: str, url: str):
-    print(f"\n{'='*70}\n=== {site.upper()}: {url} ===\n{'='*70}")
+    print(f"\n{'=' * 70}\n=== {site.upper()}: {url} ===\n{'=' * 70}")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         ctx = await browser.new_context(
@@ -37,14 +37,10 @@ async def probe(site: str, url: str):
         await page.wait_for_timeout(4000)
 
         # Селектор карточек
-        cards_sel = (
-            ".product_box_v2" if site == "pharmonline" else "div.single-product-wrap"
-        )
+        cards_sel = ".product_box_v2" if site == "pharmonline" else "div.single-product-wrap"
 
         # Initial count
-        initial = await page.evaluate(
-            f'document.querySelectorAll("{cards_sel}").length'
-        )
+        initial = await page.evaluate(f'document.querySelectorAll("{cards_sel}").length')
         print(f"\n--- Initial cards: {initial} ---")
 
         # Probe pagination signals
@@ -100,9 +96,7 @@ async def probe(site: str, url: str):
         for i in range(10):
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1500)
-            count = await page.evaluate(
-                f'document.querySelectorAll("{cards_sel}").length'
-            )
+            count = await page.evaluate(f'document.querySelectorAll("{cards_sel}").length')
             if count == prev:
                 print(f"    iter {i}: stable at {count}")
                 break
@@ -117,9 +111,7 @@ async def probe(site: str, url: str):
                     url + "&page=2", wait_until="domcontentloaded", timeout=20000
                 )
                 await page.wait_for_timeout(3000)
-                p2_count = await page.evaluate(
-                    f'document.querySelectorAll("{cards_sel}").length'
-                )
+                p2_count = await page.evaluate(f'document.querySelectorAll("{cards_sel}").length')
                 print(f"    page=2: {p2_count} cards (status {resp.status if resp else '?'})")
                 # Are they DIFFERENT products?
                 first_url_p2 = await page.evaluate(

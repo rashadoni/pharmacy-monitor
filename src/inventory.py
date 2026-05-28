@@ -103,20 +103,25 @@ def import_stock_from_csv(
                 matched += 1
             else:
                 unmatched += 1
-            session.add(StockLevel(
-                product_id=product.id if product else None,
-                canonical_id=product.canonical_id if product else None,
-                sku=sku or None,
-                name=name or (product.name if product else None),
-                qty=qty,
-                is_in_stock=qty > 0,
-                source=source,
-                updated_at=utcnow(),
-            ))
+            session.add(
+                StockLevel(
+                    product_id=product.id if product else None,
+                    canonical_id=product.canonical_id if product else None,
+                    sku=sku or None,
+                    name=name or (product.name if product else None),
+                    qty=qty,
+                    is_in_stock=qty > 0,
+                    source=source,
+                    updated_at=utcnow(),
+                )
+            )
     session.commit()
     log.info(
         "stock_import_done",
-        source=source, total=total, matched=matched, unmatched=unmatched,
+        source=source,
+        total=total,
+        matched=matched,
+        unmatched=unmatched,
     )
     return ImportResult(total=total, matched_to_product=matched, unmatched=unmatched)
 
@@ -149,21 +154,26 @@ def import_supplier_prices_from_csv(
                 matched += 1
             else:
                 unmatched += 1
-            session.add(SupplierPrice(
-                product_id=product.id if product else None,
-                canonical_id=product.canonical_id if product else None,
-                sku=sku or None,
-                name=name or (product.name if product else None),
-                supplier_name=supplier,
-                purchase_price=price,
-                currency=currency,
-                source=source,
-                updated_at=utcnow(),
-            ))
+            session.add(
+                SupplierPrice(
+                    product_id=product.id if product else None,
+                    canonical_id=product.canonical_id if product else None,
+                    sku=sku or None,
+                    name=name or (product.name if product else None),
+                    supplier_name=supplier,
+                    purchase_price=price,
+                    currency=currency,
+                    source=source,
+                    updated_at=utcnow(),
+                )
+            )
     session.commit()
     log.info(
         "supplier_import_done",
-        source=source, total=total, matched=matched, unmatched=unmatched,
+        source=source,
+        total=total,
+        matched=matched,
+        unmatched=unmatched,
     )
     return ImportResult(total=total, matched_to_product=matched, unmatched=unmatched)
 
@@ -197,9 +207,7 @@ def margin_report(session: Session, *, run_id: int | None = None) -> list[Margin
 
     rows: list[MarginRow] = []
     # Берём все клиентские Products со снимком цены
-    products = session.scalars(
-        select(Product).where(Product.site == "pharmonline")
-    ).all()
+    products = session.scalars(select(Product).where(Product.site == "pharmonline")).all()
 
     for p in products:
         snap = session.scalar(
@@ -232,20 +240,24 @@ def margin_report(session: Session, *, run_id: int | None = None) -> list[Margin
         margin_azn = sale_price - purchase
         margin_pct = (margin_azn / sale_price * 100) if sale_price > 0 else 0.0
 
-        rows.append(MarginRow(
-            product_id=p.id, canonical_id=p.canonical_id,
-            name=p.name, sale_price=sale_price, purchase_price=purchase,
-            margin_azn=round(margin_azn, 2), margin_pct=round(margin_pct, 1),
-            in_stock=in_stock,
-        ))
+        rows.append(
+            MarginRow(
+                product_id=p.id,
+                canonical_id=p.canonical_id,
+                name=p.name,
+                sale_price=sale_price,
+                purchase_price=purchase,
+                margin_azn=round(margin_azn, 2),
+                margin_pct=round(margin_pct, 1),
+                in_stock=in_stock,
+            )
+        )
     rows.sort(key=lambda x: -x.margin_pct)
     return rows
 
 
 def get_stock_for_product(session: Session, product_id: int) -> StockLevel | None:
-    return session.scalar(
-        select(StockLevel).where(StockLevel.product_id == product_id).limit(1)
-    )
+    return session.scalar(select(StockLevel).where(StockLevel.product_id == product_id).limit(1))
 
 
 def get_min_purchase_price(session: Session, product_id: int) -> float | None:

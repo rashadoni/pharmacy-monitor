@@ -22,6 +22,7 @@ ROI actions endpoint (`compute_actions`) делает 4 функции с N+1 SQ
 - computed_at — для определения staleness, fallback recompute если > 26h
 - run_id — какой run сгенерил кэш (для отладки)
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence

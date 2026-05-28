@@ -35,12 +35,14 @@ from src.scrapers.pharmonline import PharmonlineScraper  # noqa: E402
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "categories.yaml"
 
+
 # Phase 1c (2026-05-27) — pharmonline DDP path uses reverse-engineered Meteor
 # protocol через WebSocket, обходит Cloudflare без Playwright. Opt-in via
 # PHARMONLINE_USE_DDP=1. Когда выключено — используется legacy Playwright путь.
 def _pharmonline_scraper_class() -> type[BaseScraper]:
     if os.environ.get("PHARMONLINE_USE_DDP", "").lower() in ("1", "true", "yes"):
         from src.scrapers.pharmonline_ddp import PharmonlineDDPScraper
+
         return PharmonlineDDPScraper
     return PharmonlineScraper
 
@@ -71,9 +73,7 @@ def _ai_fallback_enabled() -> bool:
     return os.environ.get(AI_FALLBACK_ENABLED_ENV, "").lower() in ("1", "true", "yes")
 
 
-def _should_trigger_ai_fallback(
-    primary_yield: int, baseline: int | None
-) -> bool:
+def _should_trigger_ai_fallback(primary_yield: int, baseline: int | None) -> bool:
     """Decide whether to invoke AI fallback after primary scraper returned.
 
     - Disabled by env → never
@@ -238,9 +238,7 @@ async def scrape_site(
                     ai_errors=len(ai_result.errors),
                 )
                 if ai_result.errors:
-                    result.errors.extend(
-                        f"ai_fallback: {e}" for e in ai_result.errors[:5]
-                    )
+                    result.errors.extend(f"ai_fallback: {e}" for e in ai_result.errors[:5])
             except Exception as e:
                 log.error(
                     "ai_fallback_failed",
@@ -270,9 +268,7 @@ async def scrape_all(
     return await asyncio.gather(*tasks)
 
 
-async def scrape_watchlist_for_site(
-    site: str, urls: list[str]
-) -> ScrapeResult:
+async def scrape_watchlist_for_site(site: str, urls: list[str]) -> ScrapeResult:
     """Watchlist-режим: ходим по конкретным URL'ам товаров на одном сайте."""
     cls = SCRAPER_CLASSES[site]
     if not urls:
@@ -287,9 +283,7 @@ async def scrape_watchlist_for_site(
         return ScrapeResult(site=site, products=products, promos=promos)
 
 
-async def scrape_watchlist_all(
-    urls_by_site: dict[str, list[str]]
-) -> list[ScrapeResult]:
+async def scrape_watchlist_all(urls_by_site: dict[str, list[str]]) -> list[ScrapeResult]:
     tasks = [scrape_watchlist_for_site(site, urls) for site, urls in urls_by_site.items()]
     return await asyncio.gather(*tasks)
 
@@ -314,6 +308,7 @@ def auto_match_watchlist(session) -> int:
     Возвращает кол-во привязанных Product'ов.
     """
     from sqlalchemy import select
+
     linked = 0
     for tp in watchlist.list_tracked(session, active_only=True):
         # Найти/создать Match для этого TrackedProduct
@@ -399,13 +394,16 @@ def _smoke_test_per_site_coverage(
         # genuine "site dropped 93% of products". Раньше cancelled GH runs
         # давали 119/249 prods → smoke генерил false-positive «-93%» alerts
         # которые шумели в /alerts и Sentry.
-        catalog_size = session.scalar(
-            select(func.count()).select_from(Product).where(Product.site == site)
-        ) or 0
+        catalog_size = (
+            session.scalar(select(func.count()).select_from(Product).where(Product.site == site))
+            or 0
+        )
         if catalog_size > 0 and current < 0.10 * catalog_size:
             log.info(
                 "smoke_test_skipped_partial_run",
-                site=site, current=current, catalog_size=catalog_size,
+                site=site,
+                current=current,
+                catalog_size=catalog_size,
                 reason="current<10%_of_catalog — likely cancelled/partial scrape",
             )
             continue
@@ -437,7 +435,10 @@ def _smoke_test_per_site_coverage(
         if ratio < drop_threshold:
             log.warning(
                 "smoke_test_site_drop",
-                site=site, current=current, avg=round(avg, 1), ratio=round(ratio, 2),
+                site=site,
+                current=current,
+                avg=round(avg, 1),
+                ratio=round(ratio, 2),
             )
             # Find or create site_drop rule
             rule = session.scalar(
@@ -457,19 +458,21 @@ def _smoke_test_per_site_coverage(
             # NOTE: AlertEvent НЕ имеет поля `run_id` — раньше тут падало
             # `'run_id' is an invalid keyword argument`. run_id зашит в
             # `dedup_key`, этого достаточно для трассируемости.
-            session.add(AlertEvent(
-                rule_id=rule.id,
-                rule_type="site_drop_smoke",
-                dedup_key=f"site_drop_smoke|run={run.id}|site={site}",
-                severity="warning",
-                title=f"Site {site} собрал на {round((1-ratio)*100)}% меньше обычного",
-                detail=(
-                    f"В этом прогоне site={site} собрал {current} товаров. "
-                    f"Среднее за прошлые {len(prev_counts)} ok-runs: {round(avg)}. "
-                    f"Возможно сменилась вёрстка или rate-limit."
-                ),
-                payload={"site": site, "current": current, "avg": round(avg, 1)},
-            ))
+            session.add(
+                AlertEvent(
+                    rule_id=rule.id,
+                    rule_type="site_drop_smoke",
+                    dedup_key=f"site_drop_smoke|run={run.id}|site={site}",
+                    severity="warning",
+                    title=f"Site {site} собрал на {round((1 - ratio) * 100)}% меньше обычного",
+                    detail=(
+                        f"В этом прогоне site={site} собрал {current} товаров. "
+                        f"Среднее за прошлые {len(prev_counts)} ok-runs: {round(avg)}. "
+                        f"Возможно сменилась вёрстка или rate-limit."
+                    ),
+                    payload={"site": site, "current": current, "avg": round(avg, 1)},
+                )
+            )
         else:
             log.info("smoke_test_ok", site=site, current=current, avg=round(avg, 1))
     session.commit()
@@ -614,9 +617,7 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                 session.flush()
 
             # === Pre-fetch latest snapshots — для diff-only решения ===
-            existing_product_ids = [
-                p.id for p in existing_by_key.values() if p.id is not None
-            ]
+            existing_product_ids = [p.id for p in existing_by_key.values() if p.id is not None]
             latest_snapshots: dict[int, dict] = {}
             if existing_product_ids:
                 # Subquery: latest captured_at per product_id (одна агрегатная
@@ -740,9 +741,7 @@ def db_check_cmd(fix: bool) -> None:
             click.echo("✓ SQLite integrity_check: ok")
 
         # 2. Orphan matches (без products)
-        orphan_matches = s.scalars(
-            _s(storage.Match).where(~storage.Match.products.any())
-        ).all()
+        orphan_matches = s.scalars(_s(storage.Match).where(~storage.Match.products.any())).all()
         if orphan_matches:
             issues_found += len(orphan_matches)
             click.echo(f"⚠️  Orphan matches (без products): {len(orphan_matches)}")
@@ -753,64 +752,72 @@ def db_check_cmd(fix: bool) -> None:
                 click.echo(f"   → Удалено {len(orphan_matches)}")
 
         # 3. Snapshots с product_id ссылающимися на удалённый Product
-        stale_snaps = s.scalar(text("""
+        stale_snaps = s.scalar(
+            text("""
             SELECT COUNT(*) FROM price_snapshots ps
             LEFT JOIN products p ON p.id = ps.product_id
             WHERE p.id IS NULL
-        """))
+        """)
+        )
         if stale_snaps:
             issues_found += stale_snaps
             click.echo(f"⚠️  Snapshots с битой product_id: {stale_snaps}")
             if fix:
-                s.execute(text("""
+                s.execute(
+                    text("""
                     DELETE FROM price_snapshots
                     WHERE product_id NOT IN (SELECT id FROM products)
-                """))
+                """)
+                )
                 s.commit()
                 click.echo(f"   → Удалено {stale_snaps}")
 
         # 4. Products с canonical_id указывающим на удалённый Match
-        stale_canon = s.scalar(text("""
+        stale_canon = s.scalar(
+            text("""
             SELECT COUNT(*) FROM products p
             LEFT JOIN matches m ON m.id = p.canonical_id
             WHERE p.canonical_id IS NOT NULL AND m.id IS NULL
-        """))
+        """)
+        )
         if stale_canon:
             issues_found += stale_canon
             click.echo(f"⚠️  Products с битой canonical_id: {stale_canon}")
             if fix:
-                s.execute(text("""
+                s.execute(
+                    text("""
                     UPDATE products SET canonical_id = NULL
                     WHERE canonical_id NOT IN (SELECT id FROM matches)
-                """))
+                """)
+                )
                 s.commit()
                 click.echo(f"   → Обнулено canonical_id в {stale_canon}")
 
         # 5. NULL prices (более 80% snapshots без price — подозрительно)
         total_snaps = s.scalar(_s(_f.count(storage.PriceSnapshot.id))) or 0
-        null_prices = s.scalar(
-            _s(_f.count(storage.PriceSnapshot.id))
-            .where(storage.PriceSnapshot.price.is_(None))
-        ) or 0
+        null_prices = (
+            s.scalar(
+                _s(_f.count(storage.PriceSnapshot.id)).where(storage.PriceSnapshot.price.is_(None))
+            )
+            or 0
+        )
         if total_snaps > 0:
             null_pct = null_prices / total_snaps * 100
             if null_pct > 80:
                 issues_found += null_prices
-                click.echo(
-                    f"⚠️  NULL prices: {null_prices}/{total_snaps} ({null_pct:.0f}%)"
-                )
+                click.echo(f"⚠️  NULL prices: {null_prices}/{total_snaps} ({null_pct:.0f}%)")
             else:
-                click.echo(
-                    f"✓ NULL prices в норме: {null_prices}/{total_snaps} ({null_pct:.1f}%)"
-                )
+                click.echo(f"✓ NULL prices в норме: {null_prices}/{total_snaps} ({null_pct:.1f}%)")
 
         # 6. Дубликаты Products (same site + same external_id) — должно быть 0 за счёт UniqueConstraint
-        dup_products = s.scalar(text("""
+        dup_products = s.scalar(
+            text("""
             SELECT COUNT(*) FROM (
                 SELECT site, external_id, COUNT(*) as cnt
                 FROM products GROUP BY site, external_id HAVING cnt > 1
             )
-        """))
+        """)
+        )
         if dup_products:
             click.echo(f"❌ Duplicate products (site, external_id): {dup_products}")
             issues_found += dup_products
@@ -833,19 +840,25 @@ def db_check_cmd(fix: bool) -> None:
 
 @cli.command("health-check")
 @click.option(
-    "--max-age-hours", type=int, default=26,
+    "--max-age-hours",
+    type=int,
+    default=26,
     help="Алерт если последний прогон старше N часов (по умолчанию 26 — суточный cron + jitter)",
 )
 @click.option(
-    "--min-products", type=int, default=1,
+    "--min-products",
+    type=int,
+    default=1,
     help="Алерт если последний прогон собрал меньше N товаров",
 )
 @click.option(
-    "--alert-email", is_flag=True,
+    "--alert-email",
+    is_flag=True,
     help="Отправить email-алерт получателям при warning/critical",
 )
 @click.option(
-    "--quiet-on-ok", is_flag=True,
+    "--quiet-on-ok",
+    is_flag=True,
     help="Без вывода если статус ok (для cron — пишет только при проблемах)",
 )
 def health_check_cmd(
@@ -857,9 +870,7 @@ def health_check_cmd(
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        report = check_health(
-            s, max_age_hours=max_age_hours, min_products=min_products
-        )
+        report = check_health(s, max_age_hours=max_age_hours, min_products=min_products)
 
     if report.status == "ok" and quiet_on_ok:
         return
@@ -947,8 +958,7 @@ def inv_import_stock(csv_path: str, source: str) -> None:
     with Session() as s:
         result = import_stock_from_csv(s, Path(csv_path), source=source)
     click.echo(
-        f"OK: total={result.total} matched={result.matched_to_product} "
-        f"unmatched={result.unmatched}"
+        f"OK: total={result.total} matched={result.matched_to_product} unmatched={result.unmatched}"
     )
 
 
@@ -966,8 +976,7 @@ def inv_import_prices(csv_path: str, source: str) -> None:
     with Session() as s:
         result = import_supplier_prices_from_csv(s, Path(csv_path), source=source)
     click.echo(
-        f"OK: total={result.total} matched={result.matched_to_product} "
-        f"unmatched={result.unmatched}"
+        f"OK: total={result.total} matched={result.matched_to_product} unmatched={result.unmatched}"
     )
 
 
@@ -1011,6 +1020,7 @@ def tenant_init_default() -> None:
     Запускается автоматически при `init-db`, но можно дёрнуть руками.
     """
     from src import tenants as t_mod
+
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
@@ -1026,6 +1036,7 @@ def tenant_init_default() -> None:
 def tenant_add(slug: str, name: str, client_site: str | None, plan: str) -> None:
     """Создать нового тенанта."""
     from src import tenants as t_mod
+
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
@@ -1040,6 +1051,7 @@ def tenant_add(slug: str, name: str, client_site: str | None, plan: str) -> None
 def tenant_list() -> None:
     """Список тенантов."""
     from src import tenants as t_mod
+
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
@@ -1063,6 +1075,7 @@ def tenant_list() -> None:
 def tenant_add_user(tenant_slug: str, email: str, name: str | None, role: str) -> None:
     """Добавить пользователя в тенант."""
     from src import tenants as t_mod
+
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
@@ -1079,6 +1092,7 @@ def tenant_add_user(tenant_slug: str, email: str, name: str | None, role: str) -
 def tenant_issue_token(email: str, ttl_min: int) -> None:
     """Выпустить magic-link токен (для тестов SaaS-auth)."""
     from src import tenants as t_mod
+
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
@@ -1114,16 +1128,24 @@ _RULE_TYPES = (
 @click.option("--name", default=None, help="Имя правила (по умолчанию = тип)")
 @click.option("--min-pct", type=float, default=None, help="Порог % для threshold-правил")
 @click.option(
-    "--site", type=click.Choice(["pharmonline", "aptekonline", "aloe"]),
-    default=None, help="Ограничить правило одним сайтом",
+    "--site",
+    type=click.Choice(["pharmonline", "aptekonline", "aloe"]),
+    default=None,
+    help="Ограничить правило одним сайтом",
 )
 @click.option(
-    "--channels", default="email", help="Список каналов через запятую: email,telegram",
+    "--channels",
+    default="email",
+    help="Список каналов через запятую: email,telegram",
 )
 @click.option("--cooldown-hours", type=int, default=12)
 def alert_add_rule(
-    rule_type: str, name: str | None, min_pct: float | None,
-    site: str | None, channels: str, cooldown_hours: int,
+    rule_type: str,
+    name: str | None,
+    min_pct: float | None,
+    site: str | None,
+    channels: str,
+    cooldown_hours: int,
 ) -> None:
     """Создать новое правило алерта."""
     storage.init_db()
@@ -1157,6 +1179,7 @@ def alert_list_rules(show_all: bool) -> None:
     storage.init_db()
     Session = storage.make_session()
     from sqlalchemy import select
+
     with Session() as s:
         stmt = select(storage.AlertRule).order_by(storage.AlertRule.id)
         if not show_all:
@@ -1191,11 +1214,14 @@ def alert_remove_rule(rule_id: int) -> None:
 
 @alert_group.command("evaluate")
 @click.option(
-    "--dispatch", is_flag=True,
+    "--dispatch",
+    is_flag=True,
     help="Не только посчитать, но и отправить по каналам (email/telegram)",
 )
 @click.option(
-    "--rule-id", type=int, multiple=True,
+    "--rule-id",
+    type=int,
+    multiple=True,
     help="Прогнать только указанные правила (можно несколько)",
 )
 def alert_evaluate(dispatch: bool, rule_id: tuple[int, ...]) -> None:
@@ -1205,14 +1231,13 @@ def alert_evaluate(dispatch: bool, rule_id: tuple[int, ...]) -> None:
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        fired = alerts_mod.evaluate_rules(
-            s, rule_ids=list(rule_id) if rule_id else None
-        )
+        fired = alerts_mod.evaluate_rules(s, rule_ids=list(rule_id) if rule_id else None)
         click.echo(f"Сработало: {len(fired)}")
         for ev in fired:
             click.echo(f"  [{ev.severity}] {ev.rule_type}: {ev.title[:80]}")
             if dispatch:
                 from src import notifications as notif_mod
+
                 results = notif_mod.dispatch_event(s, ev)
                 click.echo(f"     → {results}")
 
@@ -1227,9 +1252,7 @@ def alert_recent(limit: int) -> None:
     Session = storage.make_session()
     with Session() as s:
         events = s.scalars(
-            sa_select(storage.AlertEvent)
-            .order_by(desc(storage.AlertEvent.created_at))
-            .limit(limit)
+            sa_select(storage.AlertEvent).order_by(desc(storage.AlertEvent.created_at)).limit(limit)
         ).all()
         if not events:
             click.echo("(нет событий)")
@@ -1253,7 +1276,8 @@ def telegram_group() -> None:
 
 @telegram_group.command("poll")
 @click.option(
-    "--once", is_flag=True,
+    "--once",
+    is_flag=True,
     help="Один раз получить getUpdates и выйти (для register-flow)",
 )
 def telegram_poll(once: bool) -> None:
@@ -1263,6 +1287,7 @@ def telegram_poll(once: bool) -> None:
     эту команду чтобы увидеть его chat_id и привязать через `recipient update`.
     """
     from src import notifier
+
     updates = notifier.telegram_get_updates()
     if not updates:
         click.echo("Нет новых сообщений. Попроси клиента написать боту /start.")
@@ -1285,13 +1310,16 @@ def telegram_poll(once: bool) -> None:
 def telegram_send_test(chat_id: str, text: str) -> None:
     """Отправить тестовое сообщение по chat_id."""
     from src import notifier
+
     ok = notifier.send_telegram_message(chat_id, text)
     click.echo("OK" if ok else "FAIL — проверь TELEGRAM_BOT_TOKEN и chat_id")
 
 
 @telegram_group.command("run-bot")
 @click.option(
-    "--timeout", type=int, default=30,
+    "--timeout",
+    type=int,
+    default=30,
     help="Long-poll timeout (сек). На VPS ставь 30+",
 )
 def telegram_run_bot(timeout: int) -> None:
@@ -1301,6 +1329,7 @@ def telegram_run_bot(timeout: int) -> None:
     Завершить: Ctrl+C. На VPS поднимается через systemd как отдельный сервис.
     """
     from src.telegram_bot import run_polling
+
     storage.init_db()
     click.echo("🤖 Telegram bot запущен. Ctrl+C для выхода.")
     run_polling(poll_timeout=timeout)
@@ -1310,10 +1339,12 @@ def telegram_run_bot(timeout: int) -> None:
 
 
 @cli.command("digest")
-@click.option("--top", "top_n", type=int, default=20, show_default=True,
-              help="Топ-N алертов в письме.")
-@click.option("--window", "window_hours", type=int, default=24, show_default=True,
-              help="Окно выборки, часов.")
+@click.option(
+    "--top", "top_n", type=int, default=20, show_default=True, help="Топ-N алертов в письме."
+)
+@click.option(
+    "--window", "window_hours", type=int, default=24, show_default=True, help="Окно выборки, часов."
+)
 @click.option("--dry-run", is_flag=True, help="Вывести preview в stdout, не отправлять.")
 def digest_cmd(top_n: int, window_hours: int, dry_run: bool) -> None:
     """Отправить daily digest (топ-N алертов за последние window_hours часов).
@@ -1377,19 +1408,27 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool) -> None:
     help="Сайт для AI-обхода (sitemap + LLM extraction)",
 )
 @click.option(
-    "--max-urls", type=int, default=200,
+    "--max-urls",
+    type=int,
+    default=200,
     help="Макс. URL за сессию (default 200; на больших сайтах >1000 = ~$1-3)",
 )
 @click.option(
-    "--dry-run", is_flag=True,
+    "--dry-run",
+    is_flag=True,
     help="Только discover URLs + heuristic-классификация, без LLM-extract (бесплатно).",
 )
 @click.option(
-    "--budget-usd", type=float, default=None,
+    "--budget-usd",
+    type=float,
+    default=None,
     help="Override env AI_CRAWL_BUDGET_USD. Crawl аборт когда лимит превышен.",
 )
 def ai_crawl_cmd(
-    site: str, max_urls: int, dry_run: bool, budget_usd: float | None,
+    site: str,
+    max_urls: int,
+    dry_run: bool,
+    budget_usd: float | None,
 ) -> None:
     """AI-driven crawl (Level 3) с LLM extraction.
 
@@ -1442,9 +1481,7 @@ def ai_crawl_cmd(
             count = persist_results(session, run, [result])
             run.products_scraped = count
             run.products_per_site = {site: len(result.products)}
-            run.products_per_site_category = {
-                site: _per_category_breakdown([result])
-            }
+            run.products_per_site_category = {site: _per_category_breakdown([result])}
             run.sites_completed = site
             run.status = "ok"
             run.finished_at = utcnow()
@@ -1487,8 +1524,15 @@ def seed_demo_cmd(force: bool) -> None:
 
 
 @cli.command("run")
-@click.option("--dry-run", is_flag=True, help="Не отправлять email, только сгенерировать отчёт в reports/")
-@click.option("--limit", type=int, default=None, help="Ограничить N товаров на категорию (только в category-режиме)")
+@click.option(
+    "--dry-run", is_flag=True, help="Не отправлять email, только сгенерировать отчёт в reports/"
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=None,
+    help="Ограничить N товаров на категорию (только в category-режиме)",
+)
 @click.option(
     "--site",
     multiple=True,
@@ -1508,11 +1552,13 @@ def seed_demo_cmd(force: bool) -> None:
     help="Скрейпить ТОЛЬКО эту категорию (по id из таблицы categories). Только в category-режиме.",
 )
 @click.option(
-    "--hourly", is_flag=True,
+    "--hourly",
+    is_flag=True,
     help="Ежечасный микро-прогон: только watchlist + только pinned URL'ы. Быстрый.",
 )
 @click.option(
-    "--no-alerts", is_flag=True,
+    "--no-alerts",
+    is_flag=True,
     help="Пропустить evaluation алертов после прогона (по умолчанию запускается)",
 )
 @click.option(
@@ -1520,12 +1566,17 @@ def seed_demo_cmd(force: bool) -> None:
     type=int,
     default=None,
     help="ID строки в scrape_requests. Если задан — после persist (но ДО matcher) "
-         "немедленно проставляем status='ok' + run_id, чтобы UI показал «Готово — N "
-         "товаров» не дожидаясь медленных matcher/analyzer фаз.",
+    "немедленно проставляем status='ok' + run_id, чтобы UI показал «Готово — N "
+    "товаров» не дожидаясь медленных matcher/analyzer фаз.",
 )
 def run_cmd(
-    dry_run: bool, limit: int | None, site: tuple[str, ...], mode: str,
-    category_id: int | None, hourly: bool, no_alerts: bool,
+    dry_run: bool,
+    limit: int | None,
+    site: tuple[str, ...],
+    mode: str,
+    category_id: int | None,
+    hourly: bool,
+    no_alerts: bool,
     request_id: int | None,
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
@@ -1585,9 +1636,7 @@ def run_cmd(
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
-            run.products_per_site_category = {
-                r.site: _per_category_breakdown([r]) for r in results
-            }
+            run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
             run.sites_completed = ",".join(sites)
             session.commit()
 
@@ -1633,6 +1682,7 @@ def run_cmd(
             # === Real-time alerts ===
             if not no_alerts:
                 from src import alerts as alerts_mod, notifications as notif_mod
+
                 fired = alerts_mod.evaluate_rules(session, run.id)
                 if fired and not dry_run:
                     for ev in fired:
@@ -1684,6 +1734,7 @@ def run_cmd(
             # Fail-soft — ошибка не валит run, max 5-10с overhead на пересчёт.
             try:
                 from src import roi as _roi
+
                 summary = _roi.refresh_all_cached_actions(session, run_id=run_id)
                 log.info("roi_cache_refreshed", run_id=run_id, **summary)
             except Exception as cache_err:
@@ -1718,15 +1769,11 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...]) -> None:
         try:
             slugs_by_site = {s: watchlist.categories_for_site(session, s) for s in sites}
             baselines = baselines_for_sites(session, sites)
-            results = asyncio.run(
-                scrape_all(slugs_by_site, limit, ai_fallback_baselines=baselines)
-            )
+            results = asyncio.run(scrape_all(slugs_by_site, limit, ai_fallback_baselines=baselines))
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
-            run.products_per_site_category = {
-                r.site: _per_category_breakdown([r]) for r in results
-            }
+            run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
             run.status = "ok"
             run.finished_at = utcnow()
             session.commit()
@@ -1740,7 +1787,8 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...]) -> None:
 
 @cli.command("intraday-tick")
 @click.option(
-    "--dry-run", is_flag=True,
+    "--dry-run",
+    is_flag=True,
     help="Только показать (site, category), которые бы взяли — без скрейпа.",
 )
 def intraday_tick_cmd(dry_run: bool) -> None:
@@ -1778,8 +1826,7 @@ def intraday_tick_cmd(dry_run: bool) -> None:
 
         site, cat = target
         click.echo(
-            f"intraday-tick: site={site} category_id={cat.id} key={cat.key} "
-            f"label={cat.label_ru!r}"
+            f"intraday-tick: site={site} category_id={cat.id} key={cat.key} label={cat.label_ru!r}"
         )
 
         if dry_run:
@@ -1804,10 +1851,18 @@ def intraday_tick_cmd(dry_run: bool) -> None:
 
 
 @cli.command("rematch")
-@click.option("--reset", is_flag=True, default=False,
-              help="Очистить все авто-матчи (canonical_id) перед пересчётом")
-@click.option("--threshold", type=int, default=None,
-              help=f"Порог fuzzy (по умолчанию {matcher.FUZZY_THRESHOLD})")
+@click.option(
+    "--reset",
+    is_flag=True,
+    default=False,
+    help="Очистить все авто-матчи (canonical_id) перед пересчётом",
+)
+@click.option(
+    "--threshold",
+    type=int,
+    default=None,
+    help=f"Порог fuzzy (по умолчанию {matcher.FUZZY_THRESHOLD})",
+)
 def rematch_cmd(reset: bool, threshold: int | None) -> None:
     """Перезапустить матчинг (без скрейпинга). Полезно после изменения нормализации.
 
@@ -1845,6 +1900,7 @@ def rematch_cmd(reset: bool, threshold: int | None) -> None:
         # Заново нормализуем name_normalized (с учётом последних изменений пайплайна)
         click.echo("Re-normalizing name_normalized…")
         from src.normalize import normalize_name
+
         products = session.scalars(select(storage.Product)).all()
         for p in products:
             p.name_normalized = normalize_name(p.name or "")
@@ -2125,7 +2181,9 @@ def watchlist_list(show_all: bool) -> None:
     with Session() as s:
         rows = watchlist.list_tracked(s, active_only=not show_all)
         if not rows:
-            click.echo("(watchlist пуст — добавь товары через `watchlist add` или `watchlist import`)")
+            click.echo(
+                "(watchlist пуст — добавь товары через `watchlist add` или `watchlist import`)"
+            )
             return
         for tp in rows:
             mark = "✓" if tp.is_active else "✗"
@@ -2152,11 +2210,11 @@ def watchlist_remove(tracked_id: int) -> None:
 
 @watchlist_group.command("link")
 @click.argument("tracked_id", type=int)
-@click.option(
-    "--site", required=True, type=click.Choice(list(watchlist.SITES))
-)
+@click.option("--site", required=True, type=click.Choice(list(watchlist.SITES)))
 @click.option("--url", required=True)
-@click.option("--status", default="confirmed", type=click.Choice(["pending", "confirmed", "not_found"]))
+@click.option(
+    "--status", default="confirmed", type=click.Choice(["pending", "confirmed", "not_found"])
+)
 def watchlist_link(tracked_id: int, site: str, url: str, status: str) -> None:
     """Привязать конкретный URL к товару на конкретном сайте."""
     storage.init_db()

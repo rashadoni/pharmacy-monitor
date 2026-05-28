@@ -1,6 +1,5 @@
 """Тесты fuzzy-матчинга товаров между сайтами."""
 
-
 from src import match_actions, matcher, storage
 from src.matcher import (
     _has_conflicting_form,
@@ -99,9 +98,7 @@ def test_no_match_for_different_brands(db_session):
     matcher.match_products(db_session)
     db_session.refresh(a)
     db_session.refresh(b)
-    assert a.canonical_id != b.canonical_id or (
-        a.canonical_id is None and b.canonical_id is None
-    )
+    assert a.canonical_id != b.canonical_id or (a.canonical_id is None and b.canonical_id is None)
 
 
 def test_rejection_blocks_auto_match(db_session):
@@ -149,6 +146,7 @@ def test_rejection_blocks_auto_match(db_session):
 
 # ── Unit-тесты для guard-функций ─────────────────────────────────────────────
 
+
 class TestHasConflictingSeriesNumber:
     def test_blocks_different_stages(self):
         assert _has_conflicting_series_number("nutrilon 1", "nutrilon 4") is True
@@ -187,18 +185,27 @@ class TestHasConflictingSeriesNumber:
     def test_blocks_in_db_integration(self, db_session):
         """Nutrilon 1 и Nutrilon 4 в одном бакете — не должны матчиться."""
         a = _make_product(
-            db_session, site="pharmonline", external_id="nl-1",
-            name="Nutrilon 1 600g", name_normalized="nutrilon 1",
-            brand="nutrilon", pack_size="600g",
+            db_session,
+            site="pharmonline",
+            external_id="nl-1",
+            name="Nutrilon 1 600g",
+            name_normalized="nutrilon 1",
+            brand="nutrilon",
+            pack_size="600g",
         )
         b = _make_product(
-            db_session, site="aptekonline", external_id="nl-4",
-            name="Nutrilon 4 600g", name_normalized="nutrilon 4",
-            brand="nutrilon", pack_size="600g",
+            db_session,
+            site="aptekonline",
+            external_id="nl-4",
+            name="Nutrilon 4 600g",
+            name_normalized="nutrilon 4",
+            brand="nutrilon",
+            pack_size="600g",
         )
         db_session.commit()
         matcher.match_products(db_session)
-        db_session.refresh(a); db_session.refresh(b)
+        db_session.refresh(a)
+        db_session.refresh(b)
         assert a.canonical_id != b.canonical_id or (
             a.canonical_id is None and b.canonical_id is None
         )
@@ -212,7 +219,9 @@ class TestHasConflictingForm:
         assert _has_conflicting_form("Bepanten krem 30g", "Bepanten məlhəm 30g") is True
 
     def test_allows_same_form(self):
-        assert _has_conflicting_form("Paracetamol tablet 500mg", "Paracetamol tab 500mg N20") is False
+        assert (
+            _has_conflicting_form("Paracetamol tablet 500mg", "Paracetamol tab 500mg N20") is False
+        )
 
     def test_allows_if_form_unknown(self):
         # Форма не распознана → не блокируем
@@ -224,8 +233,14 @@ class TestHasConflictingForm:
 
 class TestHasExtremeLengthDisparity:
     def test_blocks_stub_vs_full(self):
-        assert _has_extreme_length_disparity("venatura", "venatura vitamin a palmitate retinol zinc") is True
-        assert _has_extreme_length_disparity("bioderma", "bioderma atoderm intensive baume 200ml") is True
+        assert (
+            _has_extreme_length_disparity("venatura", "venatura vitamin a palmitate retinol zinc")
+            is True
+        )
+        assert (
+            _has_extreme_length_disparity("bioderma", "bioderma atoderm intensive baume 200ml")
+            is True
+        )
 
     def test_allows_similar_length(self):
         assert _has_extreme_length_disparity("nutrilon 1", "nutrilon 1 comfort") is False
@@ -286,6 +301,7 @@ def test_manual_override_preserved(db_session):
 
 # ── Snowball / cluster-growth regression ─────────────────────────────────────
 
+
 def test_snowball_no_site_conflict_in_existing_cluster(db_session):
     """_persist_match не должен добавлять продукт если его сайт уже занят в матче.
 
@@ -296,14 +312,26 @@ def test_snowball_no_site_conflict_in_existing_cluster(db_session):
     """
     # Первый прогон: p1(aptk) + p3(pharm) матчатся → Match X
     # token_set_ratio("nivea deodorant", "nivea fresh deodorant") = 100 → матч
-    p1 = _make_product(db_session, site="aptekonline", external_id="a1",
-                       name="Nivea deodorant 150ml",
-                       name_normalized="nivea deodorant",
-                       brand="nivea", dosage="150ml", pack_size="150ml")
-    p3 = _make_product(db_session, site="pharmonline", external_id="p1",
-                       name="Nivea fresh deodorant 150ml",
-                       name_normalized="nivea fresh deodorant",
-                       brand="nivea", dosage="150ml", pack_size="150ml")
+    p1 = _make_product(
+        db_session,
+        site="aptekonline",
+        external_id="a1",
+        name="Nivea deodorant 150ml",
+        name_normalized="nivea deodorant",
+        brand="nivea",
+        dosage="150ml",
+        pack_size="150ml",
+    )
+    p3 = _make_product(
+        db_session,
+        site="pharmonline",
+        external_id="p1",
+        name="Nivea fresh deodorant 150ml",
+        name_normalized="nivea fresh deodorant",
+        brand="nivea",
+        dosage="150ml",
+        pack_size="150ml",
+    )
     matcher.match_products(db_session)
     db_session.refresh(p1)
     db_session.refresh(p3)
@@ -314,14 +342,26 @@ def test_snowball_no_site_conflict_in_existing_cluster(db_session):
     # Второй прогон: добавляем p2(aptk) — тот же сайт что p1, но другой вариант.
     # Используем одинаковые имена чтобы p2+p4 гарантированно матчились между собой
     # (тест проверяет snowball-guard, не variant-guard).
-    p2 = _make_product(db_session, site="aptekonline", external_id="a2",
-                       name="Nivea sport deodorant 150ml",
-                       name_normalized="nivea sport deodorant",
-                       brand="nivea", dosage="150ml", pack_size="150ml")
-    p4 = _make_product(db_session, site="pharmonline", external_id="p2",
-                       name="Nivea sport deodorant 150ml",
-                       name_normalized="nivea sport deodorant",
-                       brand="nivea", dosage="150ml", pack_size="150ml")
+    p2 = _make_product(
+        db_session,
+        site="aptekonline",
+        external_id="a2",
+        name="Nivea sport deodorant 150ml",
+        name_normalized="nivea sport deodorant",
+        brand="nivea",
+        dosage="150ml",
+        pack_size="150ml",
+    )
+    p4 = _make_product(
+        db_session,
+        site="pharmonline",
+        external_id="p2",
+        name="Nivea sport deodorant 150ml",
+        name_normalized="nivea sport deodorant",
+        brand="nivea",
+        dosage="150ml",
+        pack_size="150ml",
+    )
     db_session.commit()
 
     matcher.match_products(db_session)
@@ -331,10 +371,12 @@ def test_snowball_no_site_conflict_in_existing_cluster(db_session):
     db_session.refresh(p4)
 
     # Старый кластер не должен был вырасти до 4 продуктов
-    assert p2.canonical_id != first_cid, \
+    assert p2.canonical_id != first_cid, (
         "второй aptekonline-продукт НЕ должен попасть в кластер где aptekonline уже занят"
-    assert p4.canonical_id != first_cid, \
+    )
+    assert p4.canonical_id != first_cid, (
         "второй pharmonline-продукт НЕ должен попасть в кластер где pharmonline уже занят"
+    )
     # p2 и p4 могут образовать собственный кластер — это нормально
     assert p2.canonical_id == p4.canonical_id
 
@@ -352,13 +394,20 @@ def test_snowball_cluster_stays_max_one_per_site(db_session):
         ("pharmonline", "p1", "testbrand deodorant"),
         ("pharmonline", "p2", "testbrand deodorant"),
         ("pharmonline", "p3", "testbrand deodorant"),
-        ("aloe",        "l1", "testbrand deodorant"),
+        ("aloe", "l1", "testbrand deodorant"),
     ]
     products = []
     for site, ext_id, name in variants:
-        p = _make_product(db_session, site=site, external_id=ext_id,
-                          name=name, name_normalized=name,
-                          brand="testbrand", dosage="150ml", pack_size="150ml")
+        p = _make_product(
+            db_session,
+            site=site,
+            external_id=ext_id,
+            name=name,
+            name_normalized=name,
+            brand="testbrand",
+            dosage="150ml",
+            pack_size="150ml",
+        )
         products.append(p)
     db_session.commit()
 
@@ -371,32 +420,39 @@ def test_snowball_cluster_stays_max_one_per_site(db_session):
         db_session.refresh(p)
 
     from collections import defaultdict
+
     cid_to_sites: dict[int, list[str]] = defaultdict(list)
     for p in products:
         if p.canonical_id:
             cid_to_sites[p.canonical_id].append(p.site)
 
     for cid, sites in cid_to_sites.items():
-        assert len(sites) == len(set(sites)), \
-            f"Кластер {cid} содержит дубли сайтов: {sites}"
+        assert len(sites) == len(set(sites)), f"Кластер {cid} содержит дубли сайтов: {sites}"
 
 
 # ── TestHasConflictingGender ──────────────────────────────────────────────────
 
+
 class TestHasConflictingGender:
     def test_blocks_male_vs_female_az(self):
         # "oglanlar" (после strip breve: oğlanlar→oglanlar) vs "qız" (dotless-i)
-        assert _has_conflicting_gender(
-            "usaq bezi huggies 5 oglanlar ucun",
-            "huggies 5 ultra qız ucun",
-        ) is True
+        assert (
+            _has_conflicting_gender(
+                "usaq bezi huggies 5 oglanlar ucun",
+                "huggies 5 ultra qız ucun",
+            )
+            is True
+        )
 
     def test_blocks_female_vs_male_order(self):
         # Порядок аргументов не важен
-        assert _has_conflicting_gender(
-            "huggies qızlar n64",
-            "huggies oglanlar n64",
-        ) is True
+        assert (
+            _has_conflicting_gender(
+                "huggies qızlar n64",
+                "huggies oglanlar n64",
+            )
+            is True
+        )
 
     def test_allows_same_gender_male(self):
         assert _has_conflicting_gender("huggies oglanlar n64", "huggies oglanlar n40") is False
@@ -414,16 +470,22 @@ class TestHasConflictingGender:
     def test_blocks_in_db_integration(self, db_session):
         """Huggies для мальчиков и для девочек в одном бакете — не должны матчиться."""
         a = _make_product(
-            db_session, site="pharmonline", external_id="hg-m",
+            db_session,
+            site="pharmonline",
+            external_id="hg-m",
             name="Huggies oğlanlar N64",
             name_normalized="usaq bezi huggies 5 oglanlar ucun",
-            brand="huggies", pack_size="n64",
+            brand="huggies",
+            pack_size="n64",
         )
         b = _make_product(
-            db_session, site="aptekonline", external_id="hg-f",
+            db_session,
+            site="aptekonline",
+            external_id="hg-f",
             name="Huggies qızlar N64",
             name_normalized="huggies 5 qız ucun n64",
-            brand="huggies", pack_size="n64",
+            brand="huggies",
+            pack_size="n64",
         )
         db_session.commit()
         matcher.match_products(db_session)
@@ -436,13 +498,17 @@ class TestHasConflictingGender:
 
 # ── TestHasConflictingVariantTokens ──────────────────────────────────────────
 
+
 class TestHasConflictingVariantTokens:
     def test_blocks_different_cosmetic_variants(self):
         # splat aktiv vs splat lavandasept — оба имеют уникальный токен >= 4 символов
-        assert _has_conflicting_variant_tokens(
-            "dis məcunu splat aktiv",
-            "dis məcunu splat lavandasept",
-        ) is True
+        assert (
+            _has_conflicting_variant_tokens(
+                "dis məcunu splat aktiv",
+                "dis məcunu splat lavandasept",
+            )
+            is True
+        )
 
     def test_blocks_different_product_lines(self):
         assert _has_conflicting_variant_tokens("bioderma atoderm", "bioderma sensibio") is True
@@ -461,31 +527,42 @@ class TestHasConflictingVariantTokens:
     def test_allows_one_side_has_unique_other_does_not(self):
         # Только у одного имени есть уникальный токен — неполные данные, не блокируем
         # «nivea men deodorant» vs «nivea deodorant» — у B нет уникальных токенов
-        assert _has_conflicting_variant_tokens(
-            "nivea men deodorant",
-            "nivea deodorant",
-        ) is False
+        assert (
+            _has_conflicting_variant_tokens(
+                "nivea men deodorant",
+                "nivea deodorant",
+            )
+            is False
+        )
 
     def test_blocks_short_3char_variant_tokens(self):
         # «bal» (3 символа, мёд) vs «limon» — оба имеют уникальные токены → блокируем
         # Safeguard bal ≠ Safeguard Limon Fresh
-        assert _has_conflicting_variant_tokens(
-            "safeguard bal",
-            "safeguard limon fresh",
-        ) is True
+        assert (
+            _has_conflicting_variant_tokens(
+                "safeguard bal",
+                "safeguard limon fresh",
+            )
+            is True
+        )
 
     def test_blocks_short_alphanumeric_codes(self):
         # «b12» (3 символа, буква+цифра) — значащий код витамина → блокируем
         # Venatura Methylfolate ≠ Venatura B12
-        assert _has_conflicting_variant_tokens(
-            "venatura methylfolate odt",
-            "venatura b12",
-        ) is True
+        assert (
+            _has_conflicting_variant_tokens(
+                "venatura methylfolate odt",
+                "venatura b12",
+            )
+            is True
+        )
         # «d3» (2 символа, буква+цифра) — значащий код витамина → блокируем
         # Makson ≠ Makson D3
         assert _has_conflicting_variant_tokens("makson maxon", "makson d3") is True
         # «2x» (2 символа, буква+цифра) — значащий формульный код → блокируем
-        assert _has_conflicting_variant_tokens("amoksiklav 2x", "amoksiklav") is False  # only one side
+        assert (
+            _has_conflicting_variant_tokens("amoksiklav 2x", "amoksiklav") is False
+        )  # only one side
         assert _has_conflicting_variant_tokens("amoksiklav 2x", "amoksiklav forte") is True
 
     def test_symmetry(self):
@@ -498,37 +575,43 @@ class TestIsSignificantVariantToken:
     def test_long_tokens_significant(self):
         assert _is_significant_variant_token("aktiv") is True
         assert _is_significant_variant_token("methylfolate") is True
-        assert _is_significant_variant_token("bal") is True   # 3 chars
+        assert _is_significant_variant_token("bal") is True  # 3 chars
 
     def test_short_alpha_only_not_significant(self):
-        assert _is_significant_variant_token("b") is False    # 1 char
-        assert _is_significant_variant_token("ml") is False   # 2 chars, only alpha
-        assert _is_significant_variant_token("sr") is False   # 2 chars, only alpha
+        assert _is_significant_variant_token("b") is False  # 1 char
+        assert _is_significant_variant_token("ml") is False  # 2 chars, only alpha
+        assert _is_significant_variant_token("sr") is False  # 2 chars, only alpha
 
     def test_short_digit_only_not_significant(self):
-        assert _is_significant_variant_token("50") is False   # only digits
+        assert _is_significant_variant_token("50") is False  # only digits
         assert _is_significant_variant_token("10") is False
 
     def test_short_alphanumeric_significant(self):
         # Код витамина/формулы — буква + цифра
-        assert _is_significant_variant_token("b12") is True   # 3 chars, letter+digit
-        assert _is_significant_variant_token("d3") is True    # 2 chars, letter+digit
-        assert _is_significant_variant_token("2x") is True    # 2 chars, digit+letter
-        assert _is_significant_variant_token("c3") is True    # 2 chars
+        assert _is_significant_variant_token("b12") is True  # 3 chars, letter+digit
+        assert _is_significant_variant_token("d3") is True  # 2 chars, letter+digit
+        assert _is_significant_variant_token("2x") is True  # 2 chars, digit+letter
+        assert _is_significant_variant_token("c3") is True  # 2 chars
 
     def test_blocks_in_db_integration(self, db_session):
         """Splat Aktiv и Splat Lavandasept в одном бакете — не должны матчиться."""
         a = _make_product(
-            db_session, site="pharmonline", external_id="sp-1",
+            db_session,
+            site="pharmonline",
+            external_id="sp-1",
             name="Splat Aktiv 75ml",
             name_normalized="dis məcunu splat aktiv",
-            brand="splat", pack_size="75ml",
+            brand="splat",
+            pack_size="75ml",
         )
         b = _make_product(
-            db_session, site="aptekonline", external_id="sp-2",
+            db_session,
+            site="aptekonline",
+            external_id="sp-2",
             name="Splat Lavandasept 75ml",
             name_normalized="dis məcunu splat lavandasept",
-            brand="splat", pack_size="75ml",
+            brand="splat",
+            pack_size="75ml",
         )
         db_session.commit()
         matcher.match_products(db_session)
@@ -540,6 +623,7 @@ class TestIsSignificantVariantToken:
 
 
 # ── _pack_count ──────────────────────────────────────────────────────────────
+
 
 class TestPackCount:
     def test_n10(self):
@@ -560,14 +644,17 @@ class TestPackCount:
 
 # ── _has_perunit_mismatch ────────────────────────────────────────────────────
 
+
 class _FakeSnap:
     """Лёгкий мок PriceSnapshot — только поле price."""
+
     def __init__(self, price: float):
         self.price = price
 
 
 class _FakeProduct:
     """Лёгкий мок Product — только поля id, site, pack_size."""
+
     def __init__(self, pid: int, site: str, pack_size: str):
         self.id = pid
         self.site = site
@@ -597,10 +684,9 @@ class TestTwoCharAlphaVariantCodes:
         assert _has_conflicting_variant_tokens("akriderm", "akriderm qk") is False
 
     def test_symmetry(self):
-        assert (
-            _has_conflicting_variant_tokens("akriderm sk", "akriderm qk")
-            == _has_conflicting_variant_tokens("akriderm qk", "akriderm sk")
-        )
+        assert _has_conflicting_variant_tokens(
+            "akriderm sk", "akriderm qk"
+        ) == _has_conflicting_variant_tokens("akriderm qk", "akriderm sk")
 
     def test_short_alpha_single_char_not_affected(self):
         # Одиночные буквы (b, c) не блокируют — слишком короткие
@@ -640,34 +726,47 @@ class TestPerunitMismatch:
     def test_blocks_in_db_integration(self, db_session):
         """Интеграционный тест: aloe 8.90 vs pharmonline 89.00 не матчатся."""
         import datetime
-        run = storage.Run(
-            tenant_id=1, started_at=datetime.datetime.utcnow(), status="ok"
-        )
+
+        run = storage.Run(tenant_id=1, started_at=datetime.datetime.utcnow(), status="ok")
         db_session.add(run)
         db_session.flush()
 
         a = _make_product(
-            db_session, site="aloe", external_id="th-aloe",
+            db_session,
+            site="aloe",
+            external_id="th-aloe",
             name="Thiogamma Turbo 50 ml, 10 əd",
             name_normalized="thiogamma turbo",
-            brand="thiogamma", pack_size="n10",
+            brand="thiogamma",
+            pack_size="n10",
         )
         b = _make_product(
-            db_session, site="pharmonline", external_id="th-pharm",
+            db_session,
+            site="pharmonline",
+            external_id="th-pharm",
             name="Thiogamma turbo 50 ml N10 (Solution)",
             name_normalized="thiogamma turbo",
-            brand="thiogamma", pack_size="n10",
+            brand="thiogamma",
+            pack_size="n10",
         )
-        db_session.add(storage.PriceSnapshot(
-            run_id=run.id, product_id=a.id,
-            price=8.9, is_on_sale=False,
-            captured_at=datetime.datetime.utcnow(),
-        ))
-        db_session.add(storage.PriceSnapshot(
-            run_id=run.id, product_id=b.id,
-            price=89.0, is_on_sale=False,
-            captured_at=datetime.datetime.utcnow(),
-        ))
+        db_session.add(
+            storage.PriceSnapshot(
+                run_id=run.id,
+                product_id=a.id,
+                price=8.9,
+                is_on_sale=False,
+                captured_at=datetime.datetime.utcnow(),
+            )
+        )
+        db_session.add(
+            storage.PriceSnapshot(
+                run_id=run.id,
+                product_id=b.id,
+                price=89.0,
+                is_on_sale=False,
+                captured_at=datetime.datetime.utcnow(),
+            )
+        )
         db_session.commit()
 
         matcher.match_products(db_session)
@@ -689,31 +788,42 @@ class TestSiblingFormCheck:
     def test_sibling_blocks_nasal_from_matching_suppository(self, db_session):
         """aptk без формы + aptk-sibling suppository → не матчится с pharm suppository."""
         import datetime
-        run = storage.Run(
-            tenant_id=1, started_at=datetime.datetime.utcnow(), status="ok"
-        )
+
+        run = storage.Run(tenant_id=1, started_at=datetime.datetime.utcnow(), status="ok")
         db_session.add(run)
         db_session.flush()
 
         # aptekonline: один суппозиторий с явной формой, один без формы (=другая форма)
         aptk_suppository = _make_product(
-            db_session, site="aptekonline", external_id="ukr-aptk-supp",
+            db_session,
+            site="aptekonline",
+            external_id="ukr-aptk-supp",
             name="Ukraferon 1000000 BV N10 (rektal şamlar)",
             name_normalized="ukraferon",
-            brand="ukraferon", dosage="1000000bv", pack_size="n10",
+            brand="ukraferon",
+            dosage="1000000bv",
+            pack_size="n10",
         )
         aptk_no_form = _make_product(
-            db_session, site="aptekonline", external_id="ukr-aptk-nasal",
+            db_session,
+            site="aptekonline",
+            external_id="ukr-aptk-nasal",
             name="Ukraferon 1000000 BV N10",
             name_normalized="ukraferon",
-            brand="ukraferon", dosage="1000000bv", pack_size="n10",
+            brand="ukraferon",
+            dosage="1000000bv",
+            pack_size="n10",
         )
         # pharmonline: суппозиторий
         pharm_suppository = _make_product(
-            db_session, site="pharmonline", external_id="ukr-pharm-supp",
+            db_session,
+            site="pharmonline",
+            external_id="ukr-pharm-supp",
             name="Ukraferon 1000000 IU N10 (Suppositories)",
             name_normalized="ukraferon",
-            brand="ukraferon", dosage="1000000iu", pack_size="n10",
+            brand="ukraferon",
+            dosage="1000000iu",
+            pack_size="n10",
         )
         db_session.commit()
 
@@ -734,23 +844,30 @@ class TestSiblingFormCheck:
     def test_no_block_when_no_sibling(self, db_session):
         """Если на сайте нет sibling с явной формой — матч разрешён (нет данных → не блокируем)."""
         import datetime
-        run = storage.Run(
-            tenant_id=1, started_at=datetime.datetime.utcnow(), status="ok"
-        )
+
+        run = storage.Run(tenant_id=1, started_at=datetime.datetime.utcnow(), status="ok")
         db_session.add(run)
         db_session.flush()
 
         aptk_no_form = _make_product(
-            db_session, site="aptekonline", external_id="dr-aptk-1",
+            db_session,
+            site="aptekonline",
+            external_id="dr-aptk-1",
             name="Drotaverinum 40mg N20",
             name_normalized="drotaverinum",
-            brand="drotaverinum", dosage="40mg", pack_size="n20",
+            brand="drotaverinum",
+            dosage="40mg",
+            pack_size="n20",
         )
         pharm_tablet = _make_product(
-            db_session, site="pharmonline", external_id="dr-pharm-1",
+            db_session,
+            site="pharmonline",
+            external_id="dr-pharm-1",
             name="Drotaverinum 40mg N20 (Tablets)",
             name_normalized="drotaverinum",
-            brand="drotaverinum", dosage="40mg", pack_size="n20",
+            brand="drotaverinum",
+            dosage="40mg",
+            pack_size="n20",
         )
         db_session.commit()
 

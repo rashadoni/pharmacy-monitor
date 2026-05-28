@@ -56,8 +56,8 @@ def send_daily_digest(
     )[:top_n]
 
     n_critical = sum(1 for e in events_sorted if e.severity == "critical")
-    n_warning  = sum(1 for e in events_sorted if e.severity == "warning")
-    n_info     = sum(1 for e in events_sorted if e.severity == "info")
+    n_warning = sum(1 for e in events_sorted if e.severity == "warning")
+    n_info = sum(1 for e in events_sorted if e.severity == "info")
     total_in_window = len(events)
 
     subject = _make_subject(n_critical, n_warning, n_info, total_in_window, top_n)
@@ -73,6 +73,7 @@ def send_daily_digest(
 
     try:
         from src import notifier
+
         notifier.send_email(subject=subject, html_body=html)
         log.info("digest_sent", subject=subject, events=len(events_sorted), total=total_in_window)
     except Exception as exc:

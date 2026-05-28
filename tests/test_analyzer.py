@@ -216,7 +216,7 @@ def test_undercut_skips_obvious_data_error_prices(db_session):
     comp_good = _add_product(db_session, "aptekonline", "Foo", "apt-1", canonical_id=m.id)
     run = _add_run(db_session, utcnow())
     _add_snapshot(db_session, run, client, 28.0)
-    _add_snapshot(db_session, run, comp_bad, 0.20)   # data error — должен пропуститься
+    _add_snapshot(db_session, run, comp_bad, 0.20)  # data error — должен пропуститься
     _add_snapshot(db_session, run, comp_good, 25.0)  # legitimate undercut
     db_session.commit()
 

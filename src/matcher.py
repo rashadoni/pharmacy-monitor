@@ -41,19 +41,35 @@ FUZZY_THRESHOLD = 75  # 0..100, минимальный score для авто-м�
 # нет → разные лекарства, матчинг запрещён.
 # Примеры: Lopril vs Lopril H (H = гидрохлоротиазид), Eksforj vs Eksforj H,
 #           Valsakor H vs Valsakor HD.
-_PHARMA_MODIFIERS: frozenset[str] = frozenset({
-    "h", "n", "d", "hd", "nd",           # комбо-добавки (HCT, диуретик и т.д.)
-    "plus", "forte", "neo", "extra",       # усиленные/другие формулы
-    "sr", "mr", "xr", "xl", "cr",         # модифицированное высвобождение
-    "retard", "depot", "long", "mite",
-    "ar",                                  # Anti-Reflux (Nutrilon AR, Gaviscon AR)
-    "pre",                                 # Pre-формула (для недоношенных/новорождённых)
-                                           # Nutrilon Pre ≠ Nutrilon 1/2/3
-    "hipertonik",                          # гипертонический раствор ≠ изотонический
-                                           # Marimer 100ml ≠ Marimer hipertonik 100ml
-    "urso",                                # Fosfoqliv Urso (урсодезоксихолевая к-та)
-                                           # ≠ обычный Fosfoqliv (только фосфолипиды)
-})
+_PHARMA_MODIFIERS: frozenset[str] = frozenset(
+    {
+        "h",
+        "n",
+        "d",
+        "hd",
+        "nd",  # комбо-добавки (HCT, диуретик и т.д.)
+        "plus",
+        "forte",
+        "neo",
+        "extra",  # усиленные/другие формулы
+        "sr",
+        "mr",
+        "xr",
+        "xl",
+        "cr",  # модифицированное высвобождение
+        "retard",
+        "depot",
+        "long",
+        "mite",
+        "ar",  # Anti-Reflux (Nutrilon AR, Gaviscon AR)
+        "pre",  # Pre-формула (для недоношенных/новорождённых)
+        # Nutrilon Pre ≠ Nutrilon 1/2/3
+        "hipertonik",  # гипертонический раствор ≠ изотонический
+        # Marimer 100ml ≠ Marimer hipertonik 100ml
+        "urso",  # Fosfoqliv Urso (урсодезоксихолевая к-та)
+        # ≠ обычный Fosfoqliv (только фосфолипиды)
+    }
+)
 
 
 # ── Серийный номер (ступень формулы) ────────────────────────────────────────
@@ -86,10 +102,7 @@ def _has_conflicting_series_number(name_a: str, name_b: str) -> bool:
     # а не просто неполное имя (Nutrilon без цифры).
     tokens_no_series = frozenset(name_a.split()) if not nums_a else frozenset(name_b.split())
     tokens_with_series = frozenset(name_b.split()) if not nums_a else frozenset(name_a.split())
-    unique_meaningful = {
-        t for t in tokens_no_series - tokens_with_series
-        if len(t) >= 4
-    }
+    unique_meaningful = {t for t in tokens_no_series - tokens_with_series if len(t) >= 4}
     if unique_meaningful:
         return True  # именованный вариант vs нумерованная ступень → разные
     return False  # бренд-only без токенов vs номер — скорее неполные данные
@@ -188,14 +201,29 @@ def _has_conflicting_modifier(name_a: str, name_b: str) -> bool:
 # После normalize_name() ğ → g (breve strip) → "oglanlar".
 # Азербайджанское ı (U+0131, dotless i) в "qız" СОХРАНЯЕТСЯ нормализатором
 # (нет NFKD-декомпозиции) → нужны оба варианта "qız" и "qiz" для надёжности.
-_GENDER_MALE: frozenset[str] = frozenset({
-    "oğlan", "oglan", "oğlanlar", "oglanlar",
-    "boy", "boys", "erkek",
-})
-_GENDER_FEMALE: frozenset[str] = frozenset({
-    "qız", "qiz", "qızlar", "qizlar",   # qız / qızlar (dotless-i и ASCII)
-    "girl", "girls", "qadın", "qadin",        # qadın / qadin
-})
+_GENDER_MALE: frozenset[str] = frozenset(
+    {
+        "oğlan",
+        "oglan",
+        "oğlanlar",
+        "oglanlar",
+        "boy",
+        "boys",
+        "erkek",
+    }
+)
+_GENDER_FEMALE: frozenset[str] = frozenset(
+    {
+        "qız",
+        "qiz",
+        "qızlar",
+        "qizlar",  # qız / qızlar (dotless-i и ASCII)
+        "girl",
+        "girls",
+        "qadın",
+        "qadin",  # qadın / qadin
+    }
+)
 
 
 def _has_conflicting_gender(name_a: str, name_b: str) -> bool:
@@ -418,9 +446,7 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     # per-unit vs per-pack (цена-за-штуку vs цена-за-упаковку).
     # Один SELECT на все product_ids, не N+1.
     all_ids = [p.id for p in products]
-    latest_prices: dict[int, PriceSnapshot] = latest_snapshots_per_product(
-        session, all_ids
-    )
+    latest_prices: dict[int, PriceSnapshot] = latest_snapshots_per_product(session, all_ids)
 
     # Группируем по эвристическому ключу для O(N*K) вместо O(N^2).
     # Если brand пустой — fallback на первые 2 значащих слова из name_normalized
@@ -468,9 +494,7 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     # _prod_form  : product.id → extracted form (or None)
     # _prod_bk    : product.id → bucket_key(product)
     # site_bucket_forms : (site, bucket_key) → set of forms present on that site
-    _prod_form: dict[int, str | None] = {
-        p.id: extract_form(p.name or "") for p in products
-    }
+    _prod_form: dict[int, str | None] = {p.id: extract_form(p.name or "") for p in products}
     _prod_bk: dict[int, tuple] = {p.id: bucket_key(p) for p in products}
 
     site_bucket_forms: dict[tuple, set[str]] = defaultdict(set)
@@ -593,24 +617,20 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                         continue
                 # Stub vs полное имя: «venatura» vs «venatura vitamin a palmitate…»
                 # (проверяем только против якоря — длина якоря самая репрезентативная)
-                if _has_extreme_length_disparity(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_extreme_length_disparity(p.name_normalized or "", q.name_normalized or ""):
                     continue
                 # Осиротевшее число дозировки: «mezim forte» vs «mezim forte 3500 ed»
-                if _has_conflicting_orphan_number(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
                     continue
                 # Гендерный конфликт: мальчики vs девочки → разные продукты
-                if _has_conflicting_gender(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_conflicting_gender(p.name_normalized or "", q.name_normalized or ""):
                     continue
                 # Вариантный конфликт: splat aktiv vs splat lavandasept → разные варианты
                 # Проверяем против ВСЕХ членов кластера (транзитивная защита).
                 if any(
-                    _has_conflicting_variant_tokens(c.name_normalized or "", q.name_normalized or "")
+                    _has_conflicting_variant_tokens(
+                        c.name_normalized or "", q.name_normalized or ""
+                    )
                     for c in cluster
                 ):
                     continue
@@ -694,20 +714,16 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _fq is not None and _fp is None:
                     if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
                         continue
-                if _has_extreme_length_disparity(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_extreme_length_disparity(p.name_normalized or "", q.name_normalized or ""):
                     continue
-                if _has_conflicting_orphan_number(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
                     continue
-                if _has_conflicting_gender(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_conflicting_gender(p.name_normalized or "", q.name_normalized or ""):
                     continue
                 if any(
-                    _has_conflicting_variant_tokens(c.name_normalized or "", q.name_normalized or "")
+                    _has_conflicting_variant_tokens(
+                        c.name_normalized or "", q.name_normalized or ""
+                    )
                     for c in cluster
                 ):
                     continue
@@ -793,20 +809,16 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _fq is not None and _fp is None:
                     if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
                         continue
-                if _has_extreme_length_disparity(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_extreme_length_disparity(p.name_normalized or "", q.name_normalized or ""):
                     continue
-                if _has_conflicting_orphan_number(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
                     continue
-                if _has_conflicting_gender(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_conflicting_gender(p.name_normalized or "", q.name_normalized or ""):
                     continue
                 if any(
-                    _has_conflicting_variant_tokens(c.name_normalized or "", q.name_normalized or "")
+                    _has_conflicting_variant_tokens(
+                        c.name_normalized or "", q.name_normalized or ""
+                    )
                     for c in cluster
                 ):
                     continue
@@ -894,20 +906,16 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _fq is not None and _fp is None:
                     if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
                         continue
-                if _has_extreme_length_disparity(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_extreme_length_disparity(p.name_normalized or "", q.name_normalized or ""):
                     continue
-                if _has_conflicting_orphan_number(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
                     continue
-                if _has_conflicting_gender(
-                    p.name_normalized or "", q.name_normalized or ""
-                ):
+                if _has_conflicting_gender(p.name_normalized or "", q.name_normalized or ""):
                     continue
                 if any(
-                    _has_conflicting_variant_tokens(c.name_normalized or "", q.name_normalized or "")
+                    _has_conflicting_variant_tokens(
+                        c.name_normalized or "", q.name_normalized or ""
+                    )
                     for c in cluster
                 ):
                     continue
@@ -954,9 +962,7 @@ def _persist_match(session: Session, cluster: Sequence[Product], confidence: flo
             return 0  # ручной match — не трогаем
         # Snowball-guard: не добавляем продукт если его сайт уже есть в матче
         if match:
-            occupied_sites = {
-                p.site for p in match.products if p.canonical_id == match_id
-            }
+            occupied_sites = {p.site for p in match.products if p.canonical_id == match_id}
             new_products = [p for p in cluster if p.canonical_id != match_id]
             for np in new_products:
                 if np.site in occupied_sites:
@@ -1015,9 +1021,7 @@ def find_matched_groups(session: Session) -> list[dict]:
 
 def find_unmatched(session: Session) -> dict[str, list[Product]]:
     """Товары без canonical_id — кандидаты для gap-анализа."""
-    products = session.scalars(
-        select(Product).where(Product.canonical_id.is_(None))
-    ).all()
+    products = session.scalars(select(Product).where(Product.canonical_id.is_(None))).all()
     by_site: dict[str, list[Product]] = defaultdict(list)
     for p in products:
         by_site[p.site].append(p)
@@ -1036,9 +1040,7 @@ def flag_suspected_mismatches(session: Session) -> int:
 
     Возвращает количество изменённых флагов.
     """
-    matches = session.scalars(
-        select(Match).where(Match.is_manual.is_(False))
-    ).all()
+    matches = session.scalars(select(Match).where(Match.is_manual.is_(False))).all()
 
     # Один pre-fetch для всех продуктов — не N+1
     all_pids = [p.id for m in matches for p in m.products]

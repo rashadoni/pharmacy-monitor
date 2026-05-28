@@ -36,6 +36,7 @@ def current_tenant_id() -> int:
     3. Magic-link cookie (для multi-user dashboard)
     """
     import os
+
     val = os.environ.get("PHARMACY_CURRENT_TENANT_ID")
     if val:
         try:
@@ -45,6 +46,7 @@ def current_tenant_id() -> int:
     # Streamlit-aware (если работаем внутри дашборда):
     try:
         import streamlit as st
+
         return int(st.session_state.get("current_tenant_id", DEFAULT_TENANT_ID))
     except Exception:
         return DEFAULT_TENANT_ID
@@ -68,7 +70,10 @@ def get_or_create_default(session: Session) -> Tenant:
 
 
 def create_tenant(
-    session: Session, slug: str, name: str, client_site: str | None = None,
+    session: Session,
+    slug: str,
+    name: str,
+    client_site: str | None = None,
     plan: str = "trial",
 ) -> Tenant:
     slug = slug.strip().lower()
@@ -96,14 +101,16 @@ def get_tenant(session: Session, slug: str) -> Tenant | None:
 
 
 def add_user(
-    session: Session, tenant_id: int, email: str, *,
-    name: str | None = None, role: str = "admin",
+    session: Session,
+    tenant_id: int,
+    email: str,
+    *,
+    name: str | None = None,
+    role: str = "admin",
 ) -> TenantUser:
     email = email.strip().lower()
     existing = session.scalar(
-        select(TenantUser).where(
-            TenantUser.tenant_id == tenant_id, TenantUser.email == email
-        )
+        select(TenantUser).where(TenantUser.tenant_id == tenant_id, TenantUser.email == email)
     )
     if existing:
         if name:
@@ -124,9 +131,7 @@ def list_users(session: Session, tenant_id: int | None = None) -> list[TenantUse
     return list(session.scalars(stmt).all())
 
 
-def issue_magic_token(
-    session: Session, email: str, ttl_minutes: int = 30
-) -> str | None:
+def issue_magic_token(session: Session, email: str, ttl_minutes: int = 30) -> str | None:
     """Сгенерировать magic-token. Вернуть токен (для отправки в email).
 
     Если такого юзера нет — None. Не создаёт user'а автоматически (security).
@@ -149,9 +154,7 @@ def verify_magic_token(session: Session, token: str) -> TenantUser | None:
     """Проверить токен. Если валиден — отметить last_login_at, обнулить токен, вернуть user."""
     if not token:
         return None
-    u = session.scalar(
-        select(TenantUser).where(TenantUser.magic_token == token)
-    )
+    u = session.scalar(select(TenantUser).where(TenantUser.magic_token == token))
     if not u:
         return None
     if u.magic_token_expires_at and u.magic_token_expires_at < utcnow():

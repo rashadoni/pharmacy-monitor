@@ -45,11 +45,7 @@ def _valid_barcode(s: str | None) -> bool:
 
 def _cluster_barcode_unanimous(products: list[storage.Product]) -> str | None:
     """Return the shared barcode if ≥2 products agree, else None."""
-    barcodes = [
-        p.barcode.strip()
-        for p in products
-        if p.barcode and _valid_barcode(p.barcode)
-    ]
+    barcodes = [p.barcode.strip() for p in products if p.barcode and _valid_barcode(p.barcode)]
     if len(barcodes) < 2:
         return None
     distinct = set(barcodes)
@@ -78,9 +74,7 @@ def auto_confirm(apply: bool = False, max_count: int | None = None) -> dict:
         # Look at all auto matches (not yet manual). Don't filter by confidence —
         # even high-conf matches benefit from is_manual=True (locks them in
         # against future auto-matcher mutations).
-        matches = db.scalars(
-            select(storage.Match).where(storage.Match.is_manual.is_(False))
-        ).all()
+        matches = db.scalars(select(storage.Match).where(storage.Match.is_manual.is_(False))).all()
         stats["scanned"] = len(matches)
 
         for m in matches:

@@ -169,7 +169,9 @@ class Match(Base):
     canonical_pack_size: Mapped[str | None] = mapped_column(String(100), nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)  # 0..1
     is_manual: Mapped[bool] = mapped_column(Boolean, default=False)  # подтверждено вручную
-    needs_review: Mapped[bool] = mapped_column(Boolean, default=False)  # флаг UI: подозрительное расхождение цен
+    needs_review: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )  # флаг UI: подозрительное расхождение цен
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     products: Mapped[list[Product]] = relationship(back_populates="canonical")
@@ -205,9 +207,7 @@ class TenantUser(Base):
     __table_args__ = (UniqueConstraint("tenant_id", "email", name="uq_tenant_email"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tenant_id: Mapped[int] = mapped_column(
-        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
-    )
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
     email: Mapped[str] = mapped_column(String(200), index=True)
     name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     role: Mapped[str] = mapped_column(String(20), default="admin")  # admin/viewer
@@ -217,9 +217,7 @@ class TenantUser(Base):
     # сначала проверяет DB-hash, фолбэк на env только если DB-hash NULL.
     password_hash: Mapped[str | None] = mapped_column(String(200), nullable=True)
     magic_token: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    magic_token_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime, nullable=True
-    )
+    magic_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -247,9 +245,7 @@ class MatchRejection(Base):
     """
 
     __tablename__ = "match_rejections"
-    __table_args__ = (
-        UniqueConstraint("product_a_id", "product_b_id", name="uq_rejection_pair"),
-    )
+    __table_args__ = (UniqueConstraint("product_a_id", "product_b_id", name="uq_rejection_pair"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     product_a_id: Mapped[int] = mapped_column(
@@ -294,9 +290,7 @@ class Recipient(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email: Mapped[str] = mapped_column(String(200), unique=True, index=True)
     name: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    telegram_chat_id: Mapped[str | None] = mapped_column(
-        String(50), nullable=True, index=True
-    )
+    telegram_chat_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -317,9 +311,7 @@ class AlertRule(Base):
     #       price_raise_opportunity
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=dict)
     # channels — список: ["email", "telegram"]
-    channels: Mapped[list | None] = mapped_column(
-        JSON, nullable=True, default=lambda: ["email"]
-    )
+    channels: Mapped[list | None] = mapped_column(JSON, nullable=True, default=lambda: ["email"])
     cooldown_hours: Mapped[int] = mapped_column(Integer, default=12)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -353,9 +345,7 @@ class AlertEvent(Base):
     # pilot — multi-user сценарий вынесем в alert_user_state позже.
     is_read: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    snoozed_until: Mapped[datetime | None] = mapped_column(
-        DateTime, nullable=True, index=True
-    )
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
 
 class RoiActionsCache(Base):
@@ -382,9 +372,7 @@ class RoiActionsCache(Base):
     # JSON-сериализованный list[dict] — те же поля что в HTTP-response API.
     # Структура совпадает с ActionItem (см. src/roi.py).
     payload: Mapped[list] = mapped_column(JSON)
-    computed_at: Mapped[datetime] = mapped_column(
-        DateTime, default=utcnow, index=True
-    )
+    computed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     # Какой `Run.id` сгенерил кэш — для отладки «откуда устаревшие цифры»
     run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -415,7 +403,10 @@ class PricingConfig(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tenant_id: Mapped[int] = mapped_column(
-        Integer, default=1, index=True, unique=True,
+        Integer,
+        default=1,
+        index=True,
+        unique=True,
     )
     raise_threshold_pct: Mapped[float] = mapped_column(Float, default=5.0)
     undercut_threshold_pct: Mapped[float] = mapped_column(Float, default=3.0)
@@ -424,16 +415,17 @@ class PricingConfig(Base):
     max_per_type: Mapped[int] = mapped_column(Integer, default=10)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=utcnow, onupdate=utcnow,
+        DateTime,
+        default=utcnow,
+        onupdate=utcnow,
     )
 
 
 def load_pricing_config(session, tenant_id: int = 1) -> "PricingConfig":
     """Get-or-create config row для tenant. Returns mutable ORM instance."""
     from sqlalchemy import select as _select
-    cfg = session.scalar(
-        _select(PricingConfig).where(PricingConfig.tenant_id == tenant_id)
-    )
+
+    cfg = session.scalar(_select(PricingConfig).where(PricingConfig.tenant_id == tenant_id))
     if cfg is None:
         cfg = PricingConfig(tenant_id=tenant_id)
         session.add(cfg)
@@ -478,9 +470,7 @@ class TrackedProductLink(Base):
     """
 
     __tablename__ = "tracked_product_links"
-    __table_args__ = (
-        UniqueConstraint("tracked_product_id", "site", name="uq_tracked_site"),
-    )
+    __table_args__ = (UniqueConstraint("tracked_product_id", "site", name="uq_tracked_site"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tracked_product_id: Mapped[int] = mapped_column(
@@ -612,6 +602,7 @@ def _ensure_default_tenant(engine) -> None:
     with Session() as s:
         try:
             from src import tenants as _t
+
             _t.get_or_create_default(s)
         except Exception:
             # default-tenant не критичен, не валим init-db
@@ -654,16 +645,12 @@ def _apply_lightweight_migrations(engine) -> None:
         ]
         for table, column, coltype in migrations:
             try:
-                cols = conn.execute(
-                    text(f"PRAGMA table_info({table})")
-                ).all()
+                cols = conn.execute(text(f"PRAGMA table_info({table})")).all()
                 if not cols:
                     continue  # таблицы ещё нет (свежая БД — create_all создаст)
                 existing = {c[1] for c in cols}
                 if column not in existing:
-                    conn.execute(
-                        text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-                    )
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
             except Exception:
                 pass  # не валим init-db
 
@@ -738,9 +725,7 @@ def curr_and_prev_snapshots_for_run(
     return curr_snaps, prev_by_product
 
 
-def latest_snapshots_per_product(
-    session, product_ids
-) -> dict[int, PriceSnapshot]:
+def latest_snapshots_per_product(session, product_ids) -> dict[int, PriceSnapshot]:
     """Для каждого product_id из списка → его последний `PriceSnapshot`.
 
     Работает в обоих режимах persist'а:

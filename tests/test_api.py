@@ -9,6 +9,7 @@ Coverage:
   - /api/v1/dash/categories CRUD with role enforcement
   - /api/v1/products legacy ERP endpoint requires X-API-Key
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -76,6 +77,7 @@ def auth_cookie(client, tenant_user):
 
 
 # ─── Public endpoints ────────────────────────────────────────────────────────
+
 
 def test_health_endpoint(client):
     r = client.get("/health")
@@ -178,6 +180,7 @@ def test_request_id_unique_per_request(client):
 
 # ─── Auth endpoints ──────────────────────────────────────────────────────────
 
+
 def test_auth_request_unknown_email_returns_success(client):
     """Don't leak email existence — always 200."""
     r = client.post("/auth/request", json={"email": "nobody@example.com"})
@@ -207,6 +210,7 @@ def test_auth_verify_valid_token_sets_cookie(client, tenant_user, setup_db):
 
 # ─── Dashboard endpoints — require JWT ───────────────────────────────────────
 
+
 def test_dash_me_without_cookie_401(client):
     r = client.get("/api/v1/dash/me")
     assert r.status_code == 401
@@ -223,6 +227,7 @@ def test_dash_alerts_without_cookie_401(client):
 
 
 # ─── Legacy ERP endpoints — require X-API-Key ────────────────────────────────
+
 
 def test_legacy_products_without_key_401(client):
     r = client.get("/api/v1/products")
@@ -266,6 +271,7 @@ def test_legacy_invalid_key_401(client):
 
 # ─── Inventory push endpoints ────────────────────────────────────────────────
 
+
 def test_legacy_push_stock_with_key(client):
     r = client.post(
         "/api/v1/inventory/stock",
@@ -281,17 +287,20 @@ def test_legacy_push_prices_with_key(client):
     r = client.post(
         "/api/v1/inventory/prices",
         headers={"X-API-Key": "test-key-1234"},
-        json=[{
-            "sku": "TEST-001",
-            "supplier_name": "Supplier A",
-            "purchase_price": 12.5,
-            "currency": "AZN",
-        }],
+        json=[
+            {
+                "sku": "TEST-001",
+                "supplier_name": "Supplier A",
+                "purchase_price": 12.5,
+                "currency": "AZN",
+            }
+        ],
     )
     assert r.status_code == 200
 
 
 # ─── Categories CRUD (requires admin role) ───────────────────────────────────
+
 
 def test_dash_categories_create_requires_auth(client):
     r = client.post(
@@ -302,6 +311,7 @@ def test_dash_categories_create_requires_auth(client):
 
 
 # ─── JWT decode/encode (no DB needed) ────────────────────────────────────────
+
 
 def test_jwt_roundtrip(monkeypatch):
     if not api_module._JWT_AVAILABLE:
@@ -335,8 +345,14 @@ def test_jwt_decode_wrong_secret(monkeypatch):
 
 
 def _make_match_with_products(
-    db, *, confidence: float, is_manual: bool = False, needs_review: bool = False,
-    canonical: str = "Test Product", tenant_id: int = 1, products_per_site: int = 2,
+    db,
+    *,
+    confidence: float,
+    is_manual: bool = False,
+    needs_review: bool = False,
+    canonical: str = "Test Product",
+    tenant_id: int = 1,
+    products_per_site: int = 2,
 ) -> storage.Match:
     """Helper: create a match + N products on different sites bound to it."""
     m = storage.Match(
@@ -551,8 +567,12 @@ def test_cost_csv_import_imports_valid_rows(client, tenant_user, setup_db):
     s = setup_db
     # Setup: insert one product so CSV row matches by sku
     p = storage.Product(
-        tenant_id=1, site="pharmonline", external_id="SKU-001",
-        url="http://x", name="Test", name_normalized="test",
+        tenant_id=1,
+        site="pharmonline",
+        external_id="SKU-001",
+        url="http://x",
+        name="Test",
+        name_normalized="test",
     )
     s.add(p)
     s.commit()

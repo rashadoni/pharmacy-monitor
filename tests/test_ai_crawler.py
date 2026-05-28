@@ -40,9 +40,7 @@ def test_rsc_jsonld_to_scraped_product() -> None:
 
     jsonld = parse_next_rsc_jsonld(html)
     assert jsonld is not None
-    product = _build_product_from_jsonld(
-        "aloe.az", "https://aloe.az/nimesil-100-q-30-ed/", jsonld
-    )
+    product = _build_product_from_jsonld("aloe.az", "https://aloe.az/nimesil-100-q-30-ed/", jsonld)
 
     assert product is not None
     assert product.site == "aloe.az"
@@ -80,7 +78,7 @@ def test_rsc_jsonld_handles_malformed_chunks() -> None:
         '"truncated string with no closing quote'  # missing closing "
         "</script>"
         "<script>self.__next_f.push([1, []])</script>"  # not a string
-        "<script>self.__next_f.push([1, \"valid but unrelated\"])</script>"
+        '<script>self.__next_f.push([1, "valid but unrelated"])</script>'
     )
     # No Product schema in any chunk → None, but importantly: no exception.
     assert parse_next_rsc_jsonld(html) is None

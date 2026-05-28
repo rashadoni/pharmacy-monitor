@@ -14,6 +14,7 @@ Antiperspirant, Günəşdən, Daha, Linkas) показывались как «б
       set -a; . /etc/pharmacy-monitor/env; set +a; \\
       .venv/bin/python scripts/cleanup_bad_brands.py
 """
+
 from __future__ import annotations
 
 import sys
@@ -29,19 +30,21 @@ def main() -> int:
     Session = storage.make_session()
     with Session() as session:
         # Сначала статистика — сколько Product.brand попадают в blacklist
-        all_rows = session.execute(
-            "SELECT brand, COUNT(*) AS n "
-            "FROM products WHERE brand IS NOT NULL "
-            "GROUP BY brand ORDER BY n DESC"
-        ).fetchall() if False else []
+        all_rows = (
+            session.execute(
+                "SELECT brand, COUNT(*) AS n "
+                "FROM products WHERE brand IS NOT NULL "
+                "GROUP BY brand ORDER BY n DESC"
+            ).fetchall()
+            if False
+            else []
+        )
 
         # SQLAlchemy core путь — безопаснее без raw SQL
         bad_brands = set()
         rows = session.execute(
             storage.Product.__table__.select()
-            .with_only_columns(
-                storage.Product.brand, func.count(storage.Product.id).label("n")
-            )
+            .with_only_columns(storage.Product.brand, func.count(storage.Product.id).label("n"))
             .where(storage.Product.brand.is_not(None))
             .group_by(storage.Product.brand)
         ).all()
@@ -63,9 +66,7 @@ def main() -> int:
             print(f"  {b!r:<25}  {count} products")
 
         affected = session.execute(
-            update(storage.Product)
-            .where(storage.Product.brand.in_(bad_brands))
-            .values(brand=None)
+            update(storage.Product).where(storage.Product.brand.in_(bad_brands)).values(brand=None)
         ).rowcount
         session.commit()
         print(f"\nupdated {affected} rows (brand → NULL)")

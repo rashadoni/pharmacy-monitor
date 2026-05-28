@@ -55,9 +55,7 @@ class CandidateEvent:
 # === DETECTORS ===
 
 
-def _detect_undercut_threshold(
-    session: Session, run_id: int, params: dict
-) -> list[CandidateEvent]:
+def _detect_undercut_threshold(session: Session, run_id: int, params: dict) -> list[CandidateEvent]:
     """Конкурент дешевле клиента на ≥ min_pct."""
     min_pct = float(params.get("min_pct", 5.0))
     out: list[CandidateEvent] = []
@@ -75,27 +73,29 @@ def _detect_undercut_threshold(
             if diff_pct < min_pct:
                 continue
             sev = "critical" if diff_pct >= 10 else "warning"
-            out.append(CandidateEvent(
-                rule_type="undercut_threshold",
-                dedup_key=f"undercut|m={m.id}|site={site}",
-                severity=sev,
-                title=f"{site} дешевле на {diff_pct:.1f}%: {m.canonical_name}",
-                detail=(
-                    f"Клиент: {client_price:.2f} ₼, {site}: {comp_price:.2f} ₼ "
-                    f"(−{diff_pct:.1f}%)."
-                ),
-                payload={
-                    "match_id": m.id, "site": site,
-                    "client_price": client_price, "competitor_price": comp_price,
-                    "diff_pct": round(diff_pct, 2),
-                },
-            ))
+            out.append(
+                CandidateEvent(
+                    rule_type="undercut_threshold",
+                    dedup_key=f"undercut|m={m.id}|site={site}",
+                    severity=sev,
+                    title=f"{site} дешевле на {diff_pct:.1f}%: {m.canonical_name}",
+                    detail=(
+                        f"Клиент: {client_price:.2f} ₼, {site}: {comp_price:.2f} ₼ "
+                        f"(−{diff_pct:.1f}%)."
+                    ),
+                    payload={
+                        "match_id": m.id,
+                        "site": site,
+                        "client_price": client_price,
+                        "competitor_price": comp_price,
+                        "diff_pct": round(diff_pct, 2),
+                    },
+                )
+            )
     return out
 
 
-def _detect_price_drop(
-    session: Session, run_id: int, params: dict
-) -> list[CandidateEvent]:
+def _detect_price_drop(session: Session, run_id: int, params: dict) -> list[CandidateEvent]:
     """Любой сайт уронил цену на ≥ min_pct относительно предыдущего snapshot'а.
 
     Diff-only-aware (2026-05-09): «предыдущий» — последний snapshot из
@@ -129,27 +129,28 @@ def _detect_price_drop(
         if site_filter and product.site != site_filter:
             continue
         sev = "warning" if drop_pct < 20 else "critical"
-        out.append(CandidateEvent(
-            rule_type="price_drop_pct",
-            dedup_key=f"drop|p={product.id}",
-            severity=sev,
-            title=f"Цена упала на {drop_pct:.1f}%: {product.name[:60]}",
-            detail=(
-                f"{product.site}: {prev_price:.2f} → {curr_price:.2f} ₼ "
-                f"(−{drop_pct:.1f}%)."
-            ),
-            payload={
-                "product_id": product.id, "site": product.site,
-                "prev_price": prev_price, "curr_price": curr_price,
-                "drop_pct": round(drop_pct, 2),
-            },
-        ))
+        out.append(
+            CandidateEvent(
+                rule_type="price_drop_pct",
+                dedup_key=f"drop|p={product.id}",
+                severity=sev,
+                title=f"Цена упала на {drop_pct:.1f}%: {product.name[:60]}",
+                detail=(
+                    f"{product.site}: {prev_price:.2f} → {curr_price:.2f} ₼ (−{drop_pct:.1f}%)."
+                ),
+                payload={
+                    "product_id": product.id,
+                    "site": product.site,
+                    "prev_price": prev_price,
+                    "curr_price": curr_price,
+                    "drop_pct": round(drop_pct, 2),
+                },
+            )
+        )
     return out
 
 
-def _detect_new_product(
-    session: Session, run_id: int, params: dict
-) -> list[CandidateEvent]:
+def _detect_new_product(session: Session, run_id: int, params: dict) -> list[CandidateEvent]:
     """Появились товары впервые в БД (нет snapshot'ов до текущего прогона).
 
     Diff-only-aware (2026-05-09): «новый» = нет snapshot'ов до current_run.
@@ -170,52 +171,44 @@ def _detect_new_product(
         product = snap.product
         if site_filter and product.site != site_filter:
             continue
-        out.append(CandidateEvent(
-            rule_type="new_product",
-            dedup_key=f"new|p={product.id}",
-            severity="info",
-            title=f"Новый товар на {product.site}: {product.name[:60]}",
-            detail=(
-                f"Цена: {snap.price or '?'} ₼. "
-                f"Появился впервые на {product.site}."
-            ),
-            payload={"product_id": product.id, "site": product.site},
-        ))
+        out.append(
+            CandidateEvent(
+                rule_type="new_product",
+                dedup_key=f"new|p={product.id}",
+                severity="info",
+                title=f"Новый товар на {product.site}: {product.name[:60]}",
+                detail=(f"Цена: {snap.price or '?'} ₼. Появился впервые на {product.site}."),
+                payload={"product_id": product.id, "site": product.site},
+            )
+        )
     return out
 
 
-def _detect_promo_started(
-    session: Session, run_id: int, params: dict
-) -> list[CandidateEvent]:
+def _detect_promo_started(session: Session, run_id: int, params: dict) -> list[CandidateEvent]:
     """Новые промо-кампании на конкурентах."""
     out: list[CandidateEvent] = []
     prev_run_id = session.scalar(
-        select(Run.id)
-        .where(Run.id != run_id, Run.status == "ok")
-        .order_by(desc(Run.id))
-        .limit(1)
+        select(Run.id).where(Run.id != run_id, Run.status == "ok").order_by(desc(Run.id)).limit(1)
     )
     if not prev_run_id:
         return []
     prev_keys = {
-        (p.site, p.title) for p in session.scalars(
-            select(Promo).where(Promo.run_id == prev_run_id)
-        )
+        (p.site, p.title) for p in session.scalars(select(Promo).where(Promo.run_id == prev_run_id))
     }
-    curr_promos = session.scalars(
-        select(Promo).where(Promo.run_id == run_id)
-    ).all()
+    curr_promos = session.scalars(select(Promo).where(Promo.run_id == run_id)).all()
     for promo in curr_promos:
         if (promo.site, promo.title) in prev_keys:
             continue
-        out.append(CandidateEvent(
-            rule_type="promo_started",
-            dedup_key=f"promo|{promo.site}|{promo.title[:80]}",
-            severity="warning",
-            title=f"Новая промо у {promo.site}: {promo.title[:60]}",
-            detail=promo.title,
-            payload={"site": promo.site, "title": promo.title, "url": promo.landing_url},
-        ))
+        out.append(
+            CandidateEvent(
+                rule_type="promo_started",
+                dedup_key=f"promo|{promo.site}|{promo.title[:80]}",
+                severity="warning",
+                title=f"Новая промо у {promo.site}: {promo.title[:60]}",
+                detail=promo.title,
+                payload={"site": promo.site, "title": promo.title, "url": promo.landing_url},
+            )
+        )
     return out
 
 
@@ -240,19 +233,21 @@ def _detect_price_raise_opportunity(
         gap_pct = (median - client_price) / client_price * 100
         if gap_pct < min_pct:
             continue
-        out.append(CandidateEvent(
-            rule_type="price_raise_opportunity",
-            dedup_key=f"raise|m={m.id}",
-            severity="info",
-            title=f"Можно поднять: {m.canonical_name} (+{gap_pct:.1f}%)",
-            detail=(
-                f"Клиент: {client_price:.2f} ₼. Медиана конкурентов: {median:.2f} ₼."
-            ),
-            payload={
-                "match_id": m.id, "client_price": client_price,
-                "median_competitor": median, "gap_pct": round(gap_pct, 2),
-            },
-        ))
+        out.append(
+            CandidateEvent(
+                rule_type="price_raise_opportunity",
+                dedup_key=f"raise|m={m.id}",
+                severity="info",
+                title=f"Можно поднять: {m.canonical_name} (+{gap_pct:.1f}%)",
+                detail=(f"Клиент: {client_price:.2f} ₼. Медиана конкурентов: {median:.2f} ₼."),
+                payload={
+                    "match_id": m.id,
+                    "client_price": client_price,
+                    "median_competitor": median,
+                    "gap_pct": round(gap_pct, 2),
+                },
+            )
+        )
     return out
 
 
@@ -408,9 +403,8 @@ def _send_email_alert(event: AlertEvent) -> str:
     """Отправить email-алерт. Использует существующий notifier."""
     try:
         from src import notifier
-        sev_emoji = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️"}.get(
-            event.severity, "•"
-        )
+
+        sev_emoji = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️"}.get(event.severity, "•")
         html = f"""
         <div style="font-family:-apple-system,Segoe UI,sans-serif;max-width:560px;
                     margin:24px auto;padding:18px 24px;background:#fff;
@@ -423,7 +417,7 @@ def _send_email_alert(event: AlertEvent) -> str:
             {sev_emoji} {event.title}
           </div>
           <div style="font-size:14px;color:#3a3a3c;margin-top:10px;line-height:1.4;">
-            {event.detail or ''}
+            {event.detail or ""}
           </div>
         </div>
         """
@@ -441,13 +435,12 @@ def _send_telegram_alert(session: Session, event: AlertEvent) -> str:
     """Отправить Telegram-алерт всем активным получателям с привязанным chat_id."""
     try:
         from src import notifier, watchlist as wl
+
         recipients = wl.list_recipients(session, active_only=True)
         chat_ids = [r.telegram_chat_id for r in recipients if r.telegram_chat_id]
         if not chat_ids:
             return "skipped: no telegram chat_ids"
-        sev_emoji = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️"}.get(
-            event.severity, "•"
-        )
+        sev_emoji = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️"}.get(event.severity, "•")
         text = f"{sev_emoji} *{event.title}*\n\n{event.detail or ''}"
         sent = 0
         for chat_id in chat_ids:

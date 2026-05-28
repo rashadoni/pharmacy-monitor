@@ -24,6 +24,7 @@ Provider abstraction:
   - AI_CRAWL_MODEL=gpt-4o-mini | claude-haiku-4-5
   - OPENAI_API_KEY or ANTHROPIC_API_KEY required
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -50,10 +51,10 @@ log = structlog.get_logger()
 # ─── Cost model (per 1M tokens, USD) ────────────────────────────────────────
 # Update when model prices change. Source: provider pricing pages.
 PROVIDER_PRICING = {
-    "openai/gpt-4o-mini":  {"input": 0.15, "output": 0.60},
-    "openai/gpt-4o":       {"input": 2.50, "output": 10.00},
-    "anthropic/claude-haiku-4-5":   {"input": 0.25, "output": 1.25},
-    "anthropic/claude-sonnet-4-5":  {"input": 3.00, "output": 15.00},
+    "openai/gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "openai/gpt-4o": {"input": 2.50, "output": 10.00},
+    "anthropic/claude-haiku-4-5": {"input": 0.25, "output": 1.25},
+    "anthropic/claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
 }
 
 
@@ -63,6 +64,7 @@ class CrawlSession:
 
     Tracks: URLs visited, products yielded, total tokens spent (for budget guard).
     """
+
     site_name: str
     base_url: str
     visited: set[str] = field(default_factory=set)
@@ -179,7 +181,7 @@ async def fetch_sitemap_urls(base_url: str, page: Page) -> list[str]:
 
 _PRODUCT_HEURISTIC_MARKERS = [
     'itemtype="http://schema.org/Product"',
-    "itemtype=\"https://schema.org/Product\"",
+    'itemtype="https://schema.org/Product"',
     '"@type":"Product"',
     'property="og:type" content="product"',
     'property="product:price:amount"',
@@ -234,17 +236,14 @@ def parse_jsonld_product(html: str) -> dict | None:
                 products.append(item)
 
     with_avail = [
-        p for p in products
-        if isinstance(p.get("offers"), dict) and p["offers"].get("availability")
+        p for p in products if isinstance(p.get("offers"), dict) and p["offers"].get("availability")
     ]
     if len(with_avail) == 1:
         return with_avail[0]
     return None
 
 
-def _build_product_from_jsonld(
-    site_name: str, url: str, jsonld: dict
-) -> ScrapedProduct | None:
+def _build_product_from_jsonld(site_name: str, url: str, jsonld: dict) -> ScrapedProduct | None:
     """Map schema.org Product JSON-LD → our ScrapedProduct dataclass."""
     name = jsonld.get("name")
     offers = jsonld.get("offers")
@@ -268,9 +267,7 @@ def _build_product_from_jsonld(
         image_url = image_url.get("url")
 
     sku = jsonld.get("sku")
-    external_id = (
-        str(sku) if sku else hashlib.sha1(url.encode()).hexdigest()[:16]
-    )
+    external_id = str(sku) if sku else hashlib.sha1(url.encode()).hexdigest()[:16]
 
     # Phase 2.2 — schema.org Product может содержать canonical barcode под
     # одним из ключей: gtin13 (EAN-13), gtin (general), gtin8, gtin12 (UPC),
@@ -438,8 +435,7 @@ def parse_next_rsc_jsonld(html: str) -> dict | None:
         unique.append(p)
 
     with_avail = [
-        p for p in unique
-        if isinstance(p.get("offers"), dict) and p["offers"].get("availability")
+        p for p in unique if isinstance(p.get("offers"), dict) and p["offers"].get("availability")
     ]
     if len(with_avail) == 1:
         return with_avail[0]
@@ -585,7 +581,9 @@ class AICrawlerScraper(BaseScraper):
                 ...
     """
 
-    async def scrape_category(self, category_slug: str, limit: int | None = None) -> AsyncIterator[ScrapedProduct]:
+    async def scrape_category(
+        self, category_slug: str, limit: int | None = None
+    ) -> AsyncIterator[ScrapedProduct]:
         """AICrawler ignores category_slug — it discovers everything itself."""
         async for product in self._crawl_iter(max_urls=limit or 500):
             yield product
@@ -604,7 +602,9 @@ class AICrawlerScraper(BaseScraper):
         page = await self.new_page()
         try:
             # 1. Discover via sitemap
-            log.info("ai_crawl_start", site=self.site_name, max_urls=max_urls, budget_usd=budget_usd)
+            log.info(
+                "ai_crawl_start", site=self.site_name, max_urls=max_urls, budget_usd=budget_usd
+            )
             urls = await fetch_sitemap_urls(self.base_url, page)
 
             # Filter to same-domain only (avoid leaking to external domains)
@@ -613,7 +613,9 @@ class AICrawlerScraper(BaseScraper):
             urls = urls[:max_urls]
 
             if not urls:
-                log.warning("no_sitemap_urls", site=self.site_name, fallback="BFS not yet implemented")
+                log.warning(
+                    "no_sitemap_urls", site=self.site_name, fallback="BFS not yet implemented"
+                )
                 result.errors.append("no sitemap and BFS fallback not implemented")
                 return result
 
@@ -636,9 +638,7 @@ class AICrawlerScraper(BaseScraper):
                     # after hydration — wait for network to settle so we don't
                     # miss it. Don't fail if site is slow; just take what we have.
                     try:
-                        await page.wait_for_load_state(
-                            "networkidle", timeout=8000
-                        )
+                        await page.wait_for_load_state("networkidle", timeout=8000)
                     except Exception:
                         pass
                     html = await page.content()
@@ -663,9 +663,7 @@ class AICrawlerScraper(BaseScraper):
                         source = "rsc_jsonld"
                 if jsonld:
                     if not dry_run:
-                        product = _build_product_from_jsonld(
-                            self.site_name, url, jsonld
-                        )
+                        product = _build_product_from_jsonld(self.site_name, url, jsonld)
                         if product:
                             result.products.append(product)
                     session.products_yielded += 1

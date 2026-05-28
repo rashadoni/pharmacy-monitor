@@ -12,6 +12,7 @@ Revision ID: 0002_tenant_id
 Revises: 0001_initial
 Create Date: 2026-04-29
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -51,9 +52,7 @@ def upgrade() -> None:
             batch_op.add_column(
                 sa.Column("tenant_id", sa.Integer(), nullable=False, server_default="1")
             )
-            batch_op.create_index(
-                f"ix_{table}_tenant_id", ["tenant_id"], unique=False
-            )
+            batch_op.create_index(f"ix_{table}_tenant_id", ["tenant_id"], unique=False)
 
 
 def downgrade() -> None:

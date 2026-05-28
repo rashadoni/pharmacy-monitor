@@ -38,9 +38,9 @@ def _add_snap(s, run, product, price):
 def test_brand_share_counts_per_site(db_session):
     run = _add_run(db_session)
     p1 = _add_product(db_session, "pharmonline", "Aspirin", brand="Bayer", ext_id="1")
-    p2 = _add_product(db_session, "aloe",        "Aspirin", brand="Bayer", ext_id="2")
+    p2 = _add_product(db_session, "aloe", "Aspirin", brand="Bayer", ext_id="2")
     p3 = _add_product(db_session, "pharmonline", "Bepanthen", brand="Bayer", ext_id="3")
-    p4 = _add_product(db_session, "pharmonline", "Solgar D",  brand="Solgar", ext_id="4")
+    p4 = _add_product(db_session, "pharmonline", "Solgar D", brand="Solgar", ext_id="4")
     for p in (p1, p2, p3, p4):
         _add_snap(db_session, run, p, 10.0)
     db_session.commit()
@@ -69,8 +69,17 @@ def test_promo_history_groups_by_site_title(db_session):
     r1 = _add_run(db_session, base)
     r2 = _add_run(db_session, base + timedelta(days=2))
     db_session.add(Promo(run_id=r1.id, site="aloe", title="Sale 30%", captured_at=base))
-    db_session.add(Promo(run_id=r2.id, site="aloe", title="Sale 30%", captured_at=base + timedelta(days=2)))
-    db_session.add(Promo(run_id=r2.id, site="aptekonline", title="New launch", captured_at=base + timedelta(days=2)))
+    db_session.add(
+        Promo(run_id=r2.id, site="aloe", title="Sale 30%", captured_at=base + timedelta(days=2))
+    )
+    db_session.add(
+        Promo(
+            run_id=r2.id,
+            site="aptekonline",
+            title="New launch",
+            captured_at=base + timedelta(days=2),
+        )
+    )
     db_session.commit()
 
     history = analytics.promo_history(db_session, days=30)
@@ -88,15 +97,9 @@ def test_assortment_overlap_counts_unmatched(db_session):
     matched_client = _add_product(
         db_session, "pharmonline", "Foo", canonical_id=m.id, ext_id="ph-m1"
     )
-    matched_aloe = _add_product(
-        db_session, "aloe", "Foo", canonical_id=m.id, ext_id="al-m1"
-    )
-    unmatched_client = _add_product(
-        db_session, "pharmonline", "Excl Client", ext_id="ph-x"
-    )
-    unmatched_aloe = _add_product(
-        db_session, "aloe", "Excl Aloe", ext_id="al-x"
-    )
+    matched_aloe = _add_product(db_session, "aloe", "Foo", canonical_id=m.id, ext_id="al-m1")
+    unmatched_client = _add_product(db_session, "pharmonline", "Excl Client", ext_id="ph-x")
+    unmatched_aloe = _add_product(db_session, "aloe", "Excl Aloe", ext_id="al-x")
     for p in (matched_client, matched_aloe, unmatched_client, unmatched_aloe):
         _add_snap(db_session, run, p, 10.0)
     db_session.commit()
@@ -116,12 +119,20 @@ def test_price_index_by_category(db_session):
     run = _add_run(db_session)
 
     client = _add_product(
-        db_session, "pharmonline", "Test", canonical_id=m.id,
-        category="vitamins", ext_id="ph",
+        db_session,
+        "pharmonline",
+        "Test",
+        canonical_id=m.id,
+        category="vitamins",
+        ext_id="ph",
     )
     comp = _add_product(
-        db_session, "aloe", "Test", canonical_id=m.id,
-        category="vitamins", ext_id="al",
+        db_session,
+        "aloe",
+        "Test",
+        canonical_id=m.id,
+        category="vitamins",
+        ext_id="al",
     )
     _add_snap(db_session, run, client, 10.0)
     _add_snap(db_session, run, comp, 8.0)  # клиент дороже на 25%

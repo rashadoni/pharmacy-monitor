@@ -45,26 +45,20 @@ def test_aloe_category_slug_url_encoded():
 
 
 def test_aloe_category_slug_plain():
-    site, slug = parse_category_url(
-        "https://aloe.az/catalog/filters/?category_slug=dermanlar"
-    )
+    site, slug = parse_category_url("https://aloe.az/catalog/filters/?category_slug=dermanlar")
     assert site == "aloe"
     assert slug == "dermanlar"
 
 
 def test_aloe_product_field_bestseller():
-    site, slug = parse_category_url(
-        "https://aloe.az/catalog/filters/?product_field=bestseller"
-    )
+    site, slug = parse_category_url("https://aloe.az/catalog/filters/?product_field=bestseller")
     assert site == "aloe"
     # AloeScraper ожидает формат "product_field=VALUE" чтобы знать что это спец-срез
     assert slug == "product_field=bestseller"
 
 
 def test_aloe_product_field_promo():
-    site, slug = parse_category_url(
-        "https://aloe.az/catalog/filters/?product_field=promo"
-    )
+    site, slug = parse_category_url("https://aloe.az/catalog/filters/?product_field=promo")
     assert site == "aloe"
     assert slug == "product_field=promo"
 

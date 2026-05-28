@@ -21,6 +21,7 @@ Design:
 
 Если Redis unreachable — silent no-op (intraday не critical).
 """
+
 from __future__ import annotations
 
 import os

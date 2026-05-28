@@ -8,6 +8,7 @@
 
 Redis замокан unittest.mock.MagicMock для контролируемого поведения.
 """
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -36,9 +37,7 @@ def _add_category(
     return c
 
 
-def _add_product_with_category(
-    session, site, ext_id, name, category_slug
-) -> storage.Product:
+def _add_product_with_category(session, site, ext_id, name, category_slug) -> storage.Product:
     p = storage.Product(
         site=site,
         external_id=ext_id,
@@ -59,10 +58,14 @@ def _add_snaps(session, product, n_snaps, when=None):
     session.add(run)
     session.flush()
     for i in range(n_snaps):
-        session.add(storage.PriceSnapshot(
-            run_id=run.id, product_id=product.id, price=10.0 + i,
-            captured_at=when,
-        ))
+        session.add(
+            storage.PriceSnapshot(
+                run_id=run.id,
+                product_id=product.id,
+                price=10.0 + i,
+                captured_at=when,
+            )
+        )
     session.flush()
 
 
@@ -172,8 +175,10 @@ def test_acquire_site_lock_returns_true_when_setnx_succeeds():
     redis_mock.set.return_value = True
     assert intraday.acquire_site_lock(redis_mock, "pharmonline") is True
     redis_mock.set.assert_called_once_with(
-        "intraday:lock:site:pharmonline", "1",
-        nx=True, ex=intraday.INTRADAY_PER_SITE_MIN_GAP_SEC,
+        "intraday:lock:site:pharmonline",
+        "1",
+        nx=True,
+        ex=intraday.INTRADAY_PER_SITE_MIN_GAP_SEC,
     )
 
 

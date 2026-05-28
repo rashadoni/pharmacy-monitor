@@ -42,10 +42,7 @@ def get_status(session: Session) -> OnboardingStatus:
     has_runs = session.scalar(select(func.count(Run.id))) > 0
     has_categories = session.scalar(select(func.count(Category.id))) > 0
     has_recipients = (
-        session.scalar(
-            select(func.count(Recipient.id)).where(Recipient.is_active.is_(True))
-        )
-        > 0
+        session.scalar(select(func.count(Recipient.id)).where(Recipient.is_active.is_(True))) > 0
     )
     has_products = session.scalar(select(func.count(Product.id))) > 0
     has_tracked = session.scalar(select(func.count(TrackedProduct.id))) > 0

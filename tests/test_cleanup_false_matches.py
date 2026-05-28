@@ -31,9 +31,7 @@ def test_parse_csv_basic(tmp_path: Path):
 
 def test_parse_csv_strips_whitespace_from_reason(tmp_path: Path):
     p = tmp_path / "x.csv"
-    p.write_text(
-        "match_id,detach_product_id,reason\n1,2,  whitespace around  \n", encoding="utf-8"
-    )
+    p.write_text("match_id,detach_product_id,reason\n1,2,  whitespace around  \n", encoding="utf-8")
     rows = _parse_csv(p)
     assert rows[0].reason == "whitespace around"
 
@@ -57,11 +55,19 @@ def test_break_match_idempotent_via_add_rejection(db_session):
     s = db_session
     # Build a minimal cluster: 2 products → 1 Match.
     p_a = storage.Product(
-        tenant_id=1, site="pharmonline", external_id="a", url="http://a", name="A",
+        tenant_id=1,
+        site="pharmonline",
+        external_id="a",
+        url="http://a",
+        name="A",
         name_normalized="a",
     )
     p_b = storage.Product(
-        tenant_id=1, site="aptekonline", external_id="b", url="http://b", name="B",
+        tenant_id=1,
+        site="aptekonline",
+        external_id="b",
+        url="http://b",
+        name="B",
         name_normalized="b",
     )
     s.add_all([p_a, p_b])

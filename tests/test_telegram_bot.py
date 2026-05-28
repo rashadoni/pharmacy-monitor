@@ -40,20 +40,30 @@ def test_cmd_today_with_data(db_session):
     db_session.add(m)
     db_session.flush()
     p_client = Product(
-        site="pharmonline", external_id="ph", url="x", name="Foo",
-        name_normalized="foo", canonical_id=m.id,
+        site="pharmonline",
+        external_id="ph",
+        url="x",
+        name="Foo",
+        name_normalized="foo",
+        canonical_id=m.id,
     )
     p_comp = Product(
-        site="aloe", external_id="al", url="x", name="Foo",
-        name_normalized="foo", canonical_id=m.id,
+        site="aloe",
+        external_id="al",
+        url="x",
+        name="Foo",
+        name_normalized="foo",
+        canonical_id=m.id,
     )
     db_session.add_all([p_client, p_comp])
     db_session.flush()
     run = _add_run(db_session)
-    db_session.add_all([
-        PriceSnapshot(run_id=run.id, product_id=p_client.id, price=10.0),
-        PriceSnapshot(run_id=run.id, product_id=p_comp.id, price=7.0),
-    ])
+    db_session.add_all(
+        [
+            PriceSnapshot(run_id=run.id, product_id=p_client.id, price=10.0),
+            PriceSnapshot(run_id=run.id, product_id=p_comp.id, price=7.0),
+        ]
+    )
     db_session.commit()
 
     out = telegram_bot.cmd_today(db_session, "12345", "")
@@ -66,13 +76,15 @@ def test_cmd_alerts_empty(db_session):
 
 
 def test_cmd_alerts_with_events(db_session):
-    db_session.add(AlertEvent(
-        rule_type="undercut_threshold",
-        dedup_key="test",
-        severity="warning",
-        title="Test alert title",
-        detail="x",
-    ))
+    db_session.add(
+        AlertEvent(
+            rule_type="undercut_threshold",
+            dedup_key="test",
+            severity="warning",
+            title="Test alert title",
+            detail="x",
+        )
+    )
     db_session.commit()
     out = telegram_bot.cmd_alerts(db_session, "12345", "")
     assert "Test alert title" in out
@@ -90,10 +102,11 @@ def test_handle_update_routes_to_command(db_session):
 
     # Monkey-patch send_telegram_message
     from src import notifier
+
     original = notifier.send_telegram_message
-    notifier.send_telegram_message = lambda chat_id, text, **kw: sent_messages.append(
-        (chat_id, text)
-    ) or True
+    notifier.send_telegram_message = lambda chat_id, text, **kw: (
+        sent_messages.append((chat_id, text)) or True
+    )
 
     try:
         update = {
@@ -115,6 +128,7 @@ def test_handle_update_routes_to_command(db_session):
 def test_handle_update_unknown_command(db_session):
     sent: list = []
     from src import notifier
+
     original = notifier.send_telegram_message
     notifier.send_telegram_message = lambda c, t, **kw: sent.append((c, t)) or True
     try:
@@ -132,6 +146,7 @@ def test_handle_update_unknown_command(db_session):
 def test_handle_update_ignores_non_command(db_session):
     sent: list = []
     from src import notifier
+
     original = notifier.send_telegram_message
     notifier.send_telegram_message = lambda c, t, **kw: sent.append((c, t)) or True
     try:

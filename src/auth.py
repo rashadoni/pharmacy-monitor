@@ -122,6 +122,7 @@ def render_login_gate() -> bool:
                             # Прод: отправляем email через notifier
                             try:
                                 from src import notifier
+
                                 domain = os.environ.get(
                                     "PHARMACY_PUBLIC_URL", "http://localhost:8501"
                                 )
@@ -160,8 +161,8 @@ def render_user_badge() -> None:
         f"""
 <div style="padding:10px;background:#fafafa;border-radius:8px;font-size:12px;">
   <div style="color:#86868b;">Вы вошли как</div>
-  <div style="font-weight:600;color:#1d1d1f;">{user['name'] or user['email']}</div>
-  <div style="color:#86868b;font-size:11px;">{user['role']}</div>
+  <div style="font-weight:600;color:#1d1d1f;">{user["name"] or user["email"]}</div>
+  <div style="color:#86868b;font-size:11px;">{user["role"]}</div>
 </div>
 """,
         unsafe_allow_html=True,

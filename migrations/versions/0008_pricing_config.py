@@ -16,6 +16,7 @@ Default values (from previous compute_actions() signature):
   min_margin_pct = 10.0  (was inline in _undercut_threats; now configurable)
   max_per_type = 10
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -49,11 +50,15 @@ def upgrade() -> None:
         sa.Column("min_margin_pct", sa.Float, nullable=False, server_default="10.0"),
         sa.Column("max_per_type", sa.Integer, nullable=False, server_default="10"),
         sa.Column(
-            "created_at", sa.DateTime, nullable=False,
+            "created_at",
+            sa.DateTime,
+            nullable=False,
             server_default=sa.text("CURRENT_TIMESTAMP"),
         ),
         sa.Column(
-            "updated_at", sa.DateTime, nullable=False,
+            "updated_at",
+            sa.DateTime,
+            nullable=False,
             server_default=sa.text("CURRENT_TIMESTAMP"),
         ),
     )

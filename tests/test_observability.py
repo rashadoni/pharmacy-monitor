@@ -3,6 +3,7 @@
 These don't require a real Sentry / Prometheus server — verify the wiring
 and graceful degradation when SDKs aren't installed or DSN is missing.
 """
+
 from __future__ import annotations
 
 from unittest.mock import patch

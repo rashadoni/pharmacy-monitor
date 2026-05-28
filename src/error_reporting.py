@@ -69,9 +69,7 @@ def report_error(
         "type": type(exc).__name__,
         "message": str(exc),
         "context": context or {},
-        "traceback": "".join(
-            traceback.format_exception(type(exc), exc, exc.__traceback__)
-        )[:5000],
+        "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[:5000],
     }
 
     # 1. Файл-логи
@@ -94,6 +92,7 @@ def report_error(
     if should_notify:
         try:
             from src import notifier
+
             html = (
                 f"<div style='font-family:Menlo,monospace;font-size:12px;'>"
                 f"<h3 style='color:#ff3b30;'>🔴 Pharmacy Monitor — Error</h3>"
@@ -135,6 +134,7 @@ def install_global_handler() -> None:
 # Декоратор для оборачивания функций
 def report_on_error(component: str = "unknown", notify: bool = True):
     """@report_on_error('scraper.aloe') — автоматически ловит и репортит."""
+
     def deco(fn):
         def wrapper(*args, **kwargs):
             try:
@@ -142,5 +142,7 @@ def report_on_error(component: str = "unknown", notify: bool = True):
             except Exception as e:
                 report_error(e, component=component, notify=notify)
                 raise
+
         return wrapper
+
     return deco

@@ -67,9 +67,9 @@ ActionType = Literal[
 # Brand-floor = min observed competitor price for that brand over last N days.
 # Если клиент дешевле floor больше чем на X% — флагуем (можно поднять цену).
 _MAP_FLOOR_WINDOW_DAYS = 30
-_MAP_MIN_GAP_PCT = 5.0       # ниже — не флагуем (внутри обычного шума)
+_MAP_MIN_GAP_PCT = 5.0  # ниже — не флагуем (внутри обычного шума)
 _MAP_WARNING_GAP_PCT = 10.0  # выше — severity = "warning"
-_MAP_CRITICAL_GAP_PCT = 20.0 # выше — severity = "critical"
+_MAP_CRITICAL_GAP_PCT = 20.0  # выше — severity = "critical"
 
 
 @dataclass
@@ -283,7 +283,9 @@ def compute_actions(
     cfg = storage.load_pricing_config(session, tenant_id)
     # Apply explicit overrides (kwargs win over DB).
     raise_pct = raise_threshold_pct if raise_threshold_pct is not None else cfg.raise_threshold_pct
-    undercut_pct = undercut_threshold_pct if undercut_threshold_pct is not None else cfg.undercut_threshold_pct
+    undercut_pct = (
+        undercut_threshold_pct if undercut_threshold_pct is not None else cfg.undercut_threshold_pct
+    )
     max_spread = max_spread_pct if max_spread_pct is not None else cfg.max_spread_pct
     per_type = max_per_type if max_per_type is not None else cfg.max_per_type
     # Stash min_margin_pct on the module for _undercut_threats to pick up.
@@ -302,12 +304,8 @@ def compute_actions(
         COMPETITOR_SITES = tuple(s for s in ALL_SITES if s != client_site)
     try:
         actions: list[ActionItem] = []
-        actions += _price_raise_opportunities(
-            session, raise_pct, max_spread, per_type
-        )
-        actions += _undercut_threats(
-            session, undercut_pct, max_spread, per_type
-        )
+        actions += _price_raise_opportunities(session, raise_pct, max_spread, per_type)
+        actions += _undercut_threats(session, undercut_pct, max_spread, per_type)
         actions += _assortment_gaps(session, per_type)
         actions += _map_violations(session, per_type)
         actions += _promo_responses(session, per_type)
@@ -328,9 +326,7 @@ def compute_actions(
 
 
 def _latest_run_id(session: Session) -> int | None:
-    return session.scalar(
-        select(Run.id).where(Run.status == "ok").order_by(desc(Run.id)).limit(1)
-    )
+    return session.scalar(select(Run.id).where(Run.status == "ok").order_by(desc(Run.id)).limit(1))
 
 
 def _price_raise_opportunities(
@@ -356,8 +352,7 @@ def _price_raise_opportunities(
         if client_price is None:
             continue
         comp_prices = [
-            (s, p) for s, p in prices_by_site.items()
-            if s in COMPETITOR_SITES and p is not None
+            (s, p) for s, p in prices_by_site.items() if s in COMPETITOR_SITES and p is not None
         ]
         if not comp_prices:
             continue
@@ -380,23 +375,25 @@ def _price_raise_opportunities(
         if client_product and not _is_in_stock(session, client_product.id):
             continue
 
-        out.append(ActionItem(
-            type="price_raise",
-            severity="opportunity",
-            title=f"Подними цену: {m.canonical_name}",
-            detail=(
-                f"Ты дешевле конкурентов на {gap_pct:.1f}%. "
-                f"Подними с {client_price:.2f} до {target:.2f} ₼ — "
-                f"останешься самым дешёвым, но получишь +{delta:.2f} ₼/ед."
-            ),
-            product_name=m.canonical_name,
-            product_url=client_product.url if client_product else None,
-            current_value_azn=client_price,
-            target_value_azn=target,
-            unit_gap_azn=delta,
-            spread_pct=round(gap_pct, 1),
-            extra={"median_competitor": median_comp},
-        ))
+        out.append(
+            ActionItem(
+                type="price_raise",
+                severity="opportunity",
+                title=f"Подними цену: {m.canonical_name}",
+                detail=(
+                    f"Ты дешевле конкурентов на {gap_pct:.1f}%. "
+                    f"Подними с {client_price:.2f} до {target:.2f} ₼ — "
+                    f"останешься самым дешёвым, но получишь +{delta:.2f} ₼/ед."
+                ),
+                product_name=m.canonical_name,
+                product_url=client_product.url if client_product else None,
+                current_value_azn=client_price,
+                target_value_azn=target,
+                unit_gap_azn=delta,
+                spread_pct=round(gap_pct, 1),
+                extra={"median_competitor": median_comp},
+            )
+        )
 
     out.sort(key=lambda a: -(a.spread_pct or 0))
     return out[:max_n]
@@ -405,6 +402,7 @@ def _price_raise_opportunities(
 def _is_in_stock(session: Session, product_id: int) -> bool:
     """True если у клиента есть остаток на складе (или нет данных stock — считаем что есть)."""
     from src.inventory import get_stock_for_product
+
     stock = get_stock_for_product(session, product_id)
     return True if stock is None else bool(stock.is_in_stock)
 
@@ -459,22 +457,19 @@ def _undercut_threats(
         lost_per_unit = round(client_price - target, 2)
 
         client_product = _client_product(m)
-        comp_url = next(
-            (p.url for p in m.products if p.site == cheapest_comp_site), None
-        )
+        comp_url = next((p.url for p in m.products if p.site == cheapest_comp_site), None)
 
         # Stock-aware: если у нас нет товара на складе — undercut неактуален
         if client_product and not _is_in_stock(session, client_product.id):
             continue
 
-        severity: Literal["warning", "critical"] = (
-            "critical" if diff_pct >= 10 else "warning"
-        )
+        severity: Literal["warning", "critical"] = "critical" if diff_pct >= 10 else "warning"
 
         # Margin-aware: если опускаем ниже purchase price — критически
         margin_warning = ""
         if client_product:
             from src.inventory import get_min_purchase_price
+
             purchase = get_min_purchase_price(session, client_product.id)
             if purchase is not None:
                 if target <= purchase:
@@ -492,24 +487,26 @@ def _undercut_threats(
                             f"(закупка {purchase:.2f} ₼)."
                         )
 
-        out.append(ActionItem(
-            type="undercut",
-            severity=severity,
-            title=f"Конкурент дешевле: {m.canonical_name}",
-            detail=(
-                f"{cheapest_comp_site} продаёт за {cheapest_comp_price:.2f} ₼, "
-                f"ты — за {client_price:.2f} ₼ (−{diff_pct:.1f}%). "
-                f"Опусти до {target:.2f} чтобы остаться конкурентным." + margin_warning
-            ),
-            product_name=m.canonical_name,
-            product_url=client_product.url if client_product else None,
-            current_value_azn=client_price,
-            target_value_azn=target,
-            unit_gap_azn=-lost_per_unit,  # отрицательное — потерянная маржа на единицу
-            spread_pct=-round(diff_pct, 1),  # отрицательный = конкурент дешевле
-            competitor_site=cheapest_comp_site,
-            competitor_url=comp_url,
-        ))
+        out.append(
+            ActionItem(
+                type="undercut",
+                severity=severity,
+                title=f"Конкурент дешевле: {m.canonical_name}",
+                detail=(
+                    f"{cheapest_comp_site} продаёт за {cheapest_comp_price:.2f} ₼, "
+                    f"ты — за {client_price:.2f} ₼ (−{diff_pct:.1f}%). "
+                    f"Опусти до {target:.2f} чтобы остаться конкурентным." + margin_warning
+                ),
+                product_name=m.canonical_name,
+                product_url=client_product.url if client_product else None,
+                current_value_azn=client_price,
+                target_value_azn=target,
+                unit_gap_azn=-lost_per_unit,  # отрицательное — потерянная маржа на единицу
+                spread_pct=-round(diff_pct, 1),  # отрицательный = конкурент дешевле
+                competitor_site=cheapest_comp_site,
+                competitor_url=comp_url,
+            )
+        )
 
     # Сортируем по |spread_pct| desc — самые серьёзные разрывы сверху
     out.sort(key=lambda a: -abs(a.spread_pct or 0))
@@ -542,27 +539,29 @@ def _assortment_gaps(session: Session, max_n: int) -> list[ActionItem]:
             continue
         rows.append((p, snap))
     # Сортируем по цене desc — самые дорогие unmatched товары вверху
-    rows.sort(key=lambda r: (r[1].discount_price or r[1].price or 0), reverse=True)
+    rows.sort(key=lambda r: r[1].discount_price or r[1].price or 0, reverse=True)
 
     out: list[ActionItem] = []
     for product, snap in rows[:max_n]:
         price = snap.discount_price or snap.price
         if price is None or price < 1.0:
             continue
-        out.append(ActionItem(
-            type="assortment_gap",
-            severity="opportunity",
-            title=f"Расширь ассортимент: {product.name}",
-            detail=(
-                f"Этот товар есть у {product.site} ({price:.2f} ₼), но нет у тебя. "
-                f"Возможный новый SKU для каталога."
-            ),
-            product_name=product.name,
-            competitor_site=product.site,
-            competitor_url=product.url,
-            current_value_azn=price,
-            extra={"category": product.category},
-        ))
+        out.append(
+            ActionItem(
+                type="assortment_gap",
+                severity="opportunity",
+                title=f"Расширь ассортимент: {product.name}",
+                detail=(
+                    f"Этот товар есть у {product.site} ({price:.2f} ₼), но нет у тебя. "
+                    f"Возможный новый SKU для каталога."
+                ),
+                product_name=product.name,
+                competitor_site=product.site,
+                competitor_url=product.url,
+                current_value_azn=price,
+                extra={"category": product.category},
+            )
+        )
     return out
 
 
@@ -613,9 +612,7 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
 
     # Минимум 3 snapshot-семпла per бренд чтобы floor был статистически валиден.
     # Иначе одна цена-аномалия может дать ложный floor.
-    brand_floors: dict[str, float] = {
-        b: float(f) for b, f, n in rows if f is not None and n >= 3
-    }
+    brand_floors: dict[str, float] = {b: float(f) for b, f, n in rows if f is not None and n >= 3}
 
     if not brand_floors:
         return []
@@ -664,23 +661,25 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
         target = round(floor * 0.99, 2)  # чуть-чуть ниже floor → всё ещё cheapest
         unit_gap = round(target - float(client_price), 2)
 
-        map_violations.append(ActionItem(
-            type="map_violation",
-            severity=sev,
-            title=f"MAP: {p.brand} — поднять {p.name}",
-            detail=(
-                f"Floor конкурентов по бренду {p.brand} за {_MAP_FLOOR_WINDOW_DAYS}д = "
-                f"{floor:.2f} ₼. Ты — {client_price:.2f} ₼ (−{gap_pct:.1f}%). "
-                f"Подними до {target:.2f} ₼ — останешься самым дешёвым, +{unit_gap:.2f} ₼/ед."
-            ),
-            product_name=p.name,
-            product_url=p.url,
-            current_value_azn=float(client_price),
-            target_value_azn=target,
-            unit_gap_azn=unit_gap,
-            spread_pct=gap_pct,
-            extra={"brand": p.brand, "floor_window_days": _MAP_FLOOR_WINDOW_DAYS},
-        ))
+        map_violations.append(
+            ActionItem(
+                type="map_violation",
+                severity=sev,
+                title=f"MAP: {p.brand} — поднять {p.name}",
+                detail=(
+                    f"Floor конкурентов по бренду {p.brand} за {_MAP_FLOOR_WINDOW_DAYS}д = "
+                    f"{floor:.2f} ₼. Ты — {client_price:.2f} ₼ (−{gap_pct:.1f}%). "
+                    f"Подними до {target:.2f} ₼ — останешься самым дешёвым, +{unit_gap:.2f} ₼/ед."
+                ),
+                product_name=p.name,
+                product_url=p.url,
+                current_value_azn=float(client_price),
+                target_value_azn=target,
+                unit_gap_azn=unit_gap,
+                spread_pct=gap_pct,
+                extra={"brand": p.brand, "floor_window_days": _MAP_FLOOR_WINDOW_DAYS},
+            )
+        )
 
     # Sort by gap_pct desc — самые большие violations вверху.
     map_violations.sort(key=lambda a: -(a.spread_pct or 0))
@@ -693,23 +692,23 @@ def _promo_responses(session: Session, max_n: int) -> list[ActionItem]:
     if not run_id:
         return []
     promos = session.scalars(
-        select(Promo).where(
-            Promo.run_id == run_id, Promo.site.in_(COMPETITOR_SITES)
-        )
+        select(Promo).where(Promo.run_id == run_id, Promo.site.in_(COMPETITOR_SITES))
     ).all()
     out: list[ActionItem] = []
     for promo in promos[:max_n]:
-        out.append(ActionItem(
-            type="promo_response",
-            severity="warning",
-            title=f"Промо у {promo.site}: {promo.title[:60]}",
-            detail=(
-                f"Конкурент {promo.site} запустил акцию. "
-                "Проверь, не задевает ли твои топ-категории."
-            ),
-            competitor_site=promo.site,
-            competitor_url=promo.landing_url,
-        ))
+        out.append(
+            ActionItem(
+                type="promo_response",
+                severity="warning",
+                title=f"Промо у {promo.site}: {promo.title[:60]}",
+                detail=(
+                    f"Конкурент {promo.site} запустил акцию. "
+                    "Проверь, не задевает ли твои топ-категории."
+                ),
+                competitor_site=promo.site,
+                competitor_url=promo.landing_url,
+            )
+        )
     return out
 
 
@@ -724,9 +723,7 @@ def _prices_for_match(
     Если передан `snapshots_cache` (preloaded {product_id: PriceSnapshot}) —
     используется он вместо отдельного SQL на каждый product. Это убирает N+1.
     """
-    out: dict[str, float | None] = {
-        CLIENT_SITE: None, "aptekonline": None, "aloe": None
-    }
+    out: dict[str, float | None] = {CLIENT_SITE: None, "aptekonline": None, "aloe": None}
     for p in match.products:
         if snapshots_cache is not None:
             snap = snapshots_cache.get(p.id)
@@ -872,9 +869,7 @@ def translate_action(action: dict, locale: str) -> dict:
             )
         elif action_type == "price_raise":
             title = tmpl["title"].format(name=name)
-            detail = tmpl["detail"].format(
-                pct=pct, client=current, target=target, delta=abs(delta)
-            )
+            detail = tmpl["detail"].format(pct=pct, client=current, target=target, delta=abs(delta))
         elif action_type == "assortment_gap":
             title = tmpl["title"].format(name=name)
             detail = tmpl["detail"].format(site=site, price=current)
@@ -889,8 +884,12 @@ def translate_action(action: dict, locale: str) -> dict:
             days = int(extra.get("floor_window_days") or _MAP_FLOOR_WINDOW_DAYS)
             title = tmpl["title"].format(brand=brand, name=name)
             detail = tmpl["detail"].format(
-                brand=brand, days=days, target=target, client=current,
-                pct=pct, delta=abs(delta),
+                brand=brand,
+                days=days,
+                target=target,
+                client=current,
+                pct=pct,
+                delta=abs(delta),
             )
         else:
             return action

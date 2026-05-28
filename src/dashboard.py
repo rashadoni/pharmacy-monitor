@@ -427,9 +427,7 @@ def load_comparison() -> pd.DataFrame:
     price_cols = ["ph_price", "ap_price", "al_price"]
     df["min_price"] = df[price_cols].min(axis=1)
     df["max_price"] = df[price_cols].max(axis=1)
-    df["spread_pct"] = (
-        (df["max_price"] - df["min_price"]) / df["max_price"] * 100
-    ).round(1)
+    df["spread_pct"] = ((df["max_price"] - df["min_price"]) / df["max_price"] * 100).round(1)
     df["sites_with_price"] = df[price_cols].notna().sum(axis=1)
 
     def _cheapest(row):
@@ -504,13 +502,9 @@ def render_run_panel(*, key_prefix: str, default_dry_run: bool = True) -> None:
             key=f"{key_prefix}_btn",
         )
     if clicked:
-        with st.spinner(
-            "🔄 Запускаю scraping... обычно 30-90 сек, не закрывай вкладку"
-        ):
+        with st.spinner("🔄 Запускаю scraping... обычно 30-90 сек, не закрывай вкладку"):
             try:
-                rc, log = run_pharmacy_monitor(
-                    dry_run=dry, sites=sites_chosen or None, mode="auto"
-                )
+                rc, log = run_pharmacy_monitor(dry_run=dry, sites=sites_chosen or None, mode="auto")
             except subprocess.TimeoutExpired:
                 rc, log = -1, "⛔ Превышен timeout 15 мин — прогон убит."
         if rc == 0:
@@ -580,17 +574,17 @@ with st.sidebar:
     st.divider()
 
 _SEVERITY_STYLES = {
-    "critical":    {"bg": "#ffeded", "border": "#ff3b30", "icon": "🔴", "label": "Критично"},
-    "warning":     {"bg": "#fff5e6", "border": "#ff9500", "icon": "⚠️", "label": "Внимание"},
+    "critical": {"bg": "#ffeded", "border": "#ff3b30", "icon": "🔴", "label": "Критично"},
+    "warning": {"bg": "#fff5e6", "border": "#ff9500", "icon": "⚠️", "label": "Внимание"},
     "opportunity": {"bg": "#eaf6ec", "border": "#34c759", "icon": "💡", "label": "Возможность"},
-    "info":        {"bg": "#eef4fb", "border": "#0066cc", "icon": "ℹ️", "label": "Инфо"},
+    "info": {"bg": "#eef4fb", "border": "#0066cc", "icon": "ℹ️", "label": "Инфо"},
 }
 
 _TYPE_LABELS = {
-    "price_raise":     "💰 Подними цену",
-    "undercut":        "🔴 Конкурент дешевле",
-    "assortment_gap":  "🆕 Нет в ассортименте",
-    "promo_response":  "🎯 Промо конкурента",
+    "price_raise": "💰 Подними цену",
+    "undercut": "🔴 Конкурент дешевле",
+    "assortment_gap": "🆕 Нет в ассортименте",
+    "promo_response": "🎯 Промо конкурента",
 }
 
 
@@ -620,8 +614,7 @@ def _render_action_card(a):
         )
     elif a.current_value_azn is not None:
         prices_html = (
-            f"<span style='font-size:13px;color:#86868b;'>"
-            f"{a.current_value_azn:.2f} ₼</span>"
+            f"<span style='font-size:13px;color:#86868b;'>{a.current_value_azn:.2f} ₼</span>"
         )
     else:
         prices_html = ""
@@ -644,13 +637,13 @@ def _render_action_card(a):
 
     st.markdown(
         f"""
-<div style="background:{style['bg']};border-left:4px solid {style['border']};
+<div style="background:{style["bg"]};border-left:4px solid {style["border"]};
             border-radius:10px;padding:14px 18px;margin-bottom:10px;">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;">
     <div style="flex:1;">
       <div style="font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#86868b;
                   font-weight:500;margin-bottom:4px;">
-        {style['icon']} {style['label']}  ·  {type_label}
+        {style["icon"]} {style["label"]}  ·  {type_label}
       </div>
       <div style="font-size:15px;font-weight:600;color:#1d1d1f;line-height:1.3;">
         {a.title}
@@ -659,7 +652,7 @@ def _render_action_card(a):
         {a.detail}
       </div>
       <div style="margin-top:8px;">{prices_html}</div>
-      <div style="margin-top:8px;">{''.join(links_parts)}</div>
+      <div style="margin-top:8px;">{"".join(links_parts)}</div>
     </div>
     <div style="text-align:right;min-width:120px;">
       <div style="font-size:11px;color:#86868b;text-transform:uppercase;letter-spacing:.05em;">
@@ -696,15 +689,23 @@ def _format_price_cell(price, url, is_sale, is_cheapest, is_most_expensive):
         accent = "transparent"
         ring = "none"
     sale_badge = (
-        "<span style='background:rgba(255,149,0,0.14);color:#b85d00;font-size:10px;"
-        "padding:2px 6px;border-radius:4px;font-weight:600;letter-spacing:.04em;margin-left:6px;'>"
-        "🔥 SALE</span>"
-    ) if is_sale else ""
+        (
+            "<span style='background:rgba(255,149,0,0.14);color:#b85d00;font-size:10px;"
+            "padding:2px 6px;border-radius:4px;font-weight:600;letter-spacing:.04em;margin-left:6px;'>"
+            "🔥 SALE</span>"
+        )
+        if is_sale
+        else ""
+    )
     cheap_badge = (
-        "<span style='font-size:10px;background:rgba(255,255,255,.25);"
-        "padding:2px 6px;border-radius:4px;letter-spacing:.06em;margin-left:6px;font-weight:700;'>"
-        "🏆 ДЕШЕВЛЕ</span>"
-    ) if is_cheapest else ""
+        (
+            "<span style='font-size:10px;background:rgba(255,255,255,.25);"
+            "padding:2px 6px;border-radius:4px;letter-spacing:.06em;margin-left:6px;font-weight:700;'>"
+            "🏆 ДЕШЕВЛЕ</span>"
+        )
+        if is_cheapest
+        else ""
+    )
     pill = (
         f"<a href='{url}' target='_blank' style='text-decoration:none;'>"
         f"<div style='display:inline-flex;align-items:center;background:{bg};color:{color};"
@@ -784,11 +785,7 @@ def _render_comparison_card(row):
                             unsafe_allow_html=True,
                         )
                         ph_price = row.get("ph_price")
-                        if (
-                            site_key != "pharmonline"
-                            and pd.notna(ph_price)
-                            and pd.notna(price)
-                        ):
+                        if site_key != "pharmonline" and pd.notna(ph_price) and pd.notna(price):
                             diff = (price - ph_price) / ph_price * 100
                             sign = "▼" if diff < 0 else "▲"
                             color = "#34c759" if diff < 0 else "#ff3b30"
@@ -806,8 +803,8 @@ def _render_alert_event(ev):
     """Карточка одного alert event."""
     sev_styles = {
         "critical": ("#ffeded", "#ff3b30", "🔴"),
-        "warning":  ("#fff5e6", "#ff9500", "⚠️"),
-        "info":     ("#eef4fb", "#0066cc", "ℹ️"),
+        "warning": ("#fff5e6", "#ff9500", "⚠️"),
+        "info": ("#eef4fb", "#0066cc", "ℹ️"),
     }
     bg, border, icon = sev_styles.get(ev.severity, sev_styles["info"])
     when = ev.created_at.strftime("%d.%m %H:%M")
@@ -822,7 +819,7 @@ def _render_alert_event(ev):
     </div>
     <div style="font-size:11px;color:#86868b;">{when}</div>
   </div>
-  <div style="font-size:12px;color:#3a3a3c;margin-top:4px;">{ev.detail or ''}</div>
+  <div style="font-size:12px;color:#3a3a3c;margin-top:4px;">{ev.detail or ""}</div>
   <div style="font-size:10px;color:#86868b;margin-top:6px;text-transform:uppercase;
               letter-spacing:.04em;">
     {ev.rule_type}  ·  отправлено: {sent}
@@ -853,7 +850,8 @@ def _render_manual_actions(row):
             )
         else:
             if st.button(
-                "✓ Подтвердить", key=f"confirm_{cid}",
+                "✓ Подтвердить",
+                key=f"confirm_{cid}",
                 help="Зафиксировать матч — auto-matcher больше не тронет",
                 use_container_width=True,
             ):
@@ -864,7 +862,8 @@ def _render_manual_actions(row):
 
     with ac2:
         if st.button(
-            "✗ Не один товар", key=f"break_btn_{cid}",
+            "✗ Не один товар",
+            key=f"break_btn_{cid}",
             help="Развязать матч — указать какой Product отвязать",
             use_container_width=True,
         ):
@@ -874,7 +873,8 @@ def _render_manual_actions(row):
 
     with ac3:
         if st.button(
-            "🔍 Заменить...", key=f"swap_btn_{cid}",
+            "🔍 Заменить...",
+            key=f"swap_btn_{cid}",
             help="Заменить Product на другой кандидат с того же сайта",
             use_container_width=True,
         ):
@@ -912,9 +912,7 @@ def _render_manual_actions(row):
                         type="primary",
                         use_container_width=True,
                     ):
-                        detach_pid = next(
-                            pid for s, pid in sites_in_match if s == site_choice
-                        )
+                        detach_pid = next(pid for s, pid in sites_in_match if s == site_choice)
                         with get_session() as s:
                             ma.break_match(s, cid, detach_pid, reason="manual break")
                         st.session_state[f"break_open_{cid}"] = False
@@ -997,10 +995,10 @@ if _onb_status.state != "ready" and not st.session_state.get("onboarding_dismiss
     with st.container(border=True):
         # Прогресс-бар: 4 шага
         steps = [
-            ("📦 Данные",  _onb_status.has_runs or _onb_status.has_products),
-            ("🗂️ Категории",  _onb_status.has_categories or _onb_status.has_tracked),
-            ("📧 Получатели",  _onb_status.has_recipients),
-            ("✅ Готово",  False),
+            ("📦 Данные", _onb_status.has_runs or _onb_status.has_products),
+            ("🗂️ Категории", _onb_status.has_categories or _onb_status.has_tracked),
+            ("📧 Получатели", _onb_status.has_recipients),
+            ("✅ Готово", False),
         ]
         progress_html = ""
         for label, done in steps[:-1]:
@@ -1040,9 +1038,7 @@ if _onb_status.state != "ready" and not st.session_state.get("onboarding_dismiss
 
         if _onb_status.state == "empty_db":
             st.markdown("**Шаг 1 из 3: данные**")
-            st.markdown(
-                "У тебя пока нет данных в системе. Можно начать с одного из двух путей:"
-            )
+            st.markdown("У тебя пока нет данных в системе. Можно начать с одного из двух путей:")
             wc1, wc2 = st.columns(2)
             with wc1:
                 with st.container(border=True):
@@ -1052,10 +1048,13 @@ if _onb_status.state != "ready" and not st.session_state.get("onboarding_dismiss
                         "с историей цен — чтобы потрогать дашборд за 5 секунд."
                     )
                     if st.button(
-                        "Загрузить demo", type="primary", use_container_width=True,
+                        "Загрузить demo",
+                        type="primary",
+                        use_container_width=True,
                         key="onb_seed_demo",
                     ):
                         from src.demo import seed_demo
+
                         with get_session() as s_:
                             seed_demo(s_, force=True)
                         reset_caches()
@@ -1069,8 +1068,7 @@ if _onb_status.state != "ready" and not st.session_state.get("onboarding_dismiss
                         "или товар в watchlist (📋 Watchlist), потом запусти прогон."
                     )
                     st.markdown(
-                        "<a href='#categories' style='color:#0066cc;'>"
-                        "→ Перейти к Категориям</a>",
+                        "<a href='#categories' style='color:#0066cc;'>→ Перейти к Категориям</a>",
                         unsafe_allow_html=True,
                     )
 
@@ -1096,15 +1094,14 @@ if _onb_status.state != "ready" and not st.session_state.get("onboarding_dismiss
 
         elif _onb_status.state == "need_recipients":
             st.markdown("**Шаг 3 из 3: получатели**")
-            st.markdown(
-                "Чтобы получать ежедневный отчёт + алерты — добавь хотя бы один email."
-            )
+            st.markdown("Чтобы получать ежедневный отчёт + алерты — добавь хотя бы один email.")
             with st.form("onb_add_recipient"):
                 email = st.text_input("Email", placeholder="you@pharmonline.az")
                 name = st.text_input("Имя (опц.)", placeholder="Rashad")
                 if st.form_submit_button("Добавить", type="primary"):
                     if "@" in email:
                         from src import watchlist as wl_
+
                         with get_session() as s_:
                             wl_.add_recipient(s_, email, name=name or None)
                         reset_caches()
@@ -1209,8 +1206,10 @@ with tab_compare:
                                         scope = old.scope
                                         wl.delete_saved_view(_s_, old_name)
                                         wl.upsert_saved_view(
-                                            _s_, new_name.strip(),
-                                            params, scope=scope,
+                                            _s_,
+                                            new_name.strip(),
+                                            params,
+                                            scope=scope,
                                         )
                             st.session_state.pop("cmp_view_renaming", None)
                             st.rerun()
@@ -1279,9 +1278,7 @@ with tab_compare:
         # Жёсткий фильтр по числу сайтов (главный — по согласованию default=3)
         view = view[view["sites_with_price"] >= min_sites]
         if search:
-            view = view[
-                view["canonical_name"].str.contains(search, case=False, na=False)
-            ]
+            view = view[view["canonical_name"].str.contains(search, case=False, na=False)]
         if filter_mode == "Где конкурент дешевле клиента":
             mask = (view["ph_price"].notna()) & (
                 ((view["ap_price"].notna()) & (view["ap_price"] < view["ph_price"]))
@@ -1289,7 +1286,11 @@ with tab_compare:
             )
             view = view[mask]
         elif filter_mode == "На скидке":
-            mask = (view.get("ph_sale", False) > 0) | (view.get("ap_sale", False) > 0) | (view.get("al_sale", False) > 0)
+            mask = (
+                (view.get("ph_sale", False) > 0)
+                | (view.get("ap_sale", False) > 0)
+                | (view.get("al_sale", False) > 0)
+            )
             view = view[mask]
 
         if sort_mode == "По спреду (макс → мин)":
@@ -1311,9 +1312,7 @@ with tab_compare:
         else:
             col_c.metric("Макс. спред", "—")
         if not view.empty:
-            undercut_n = int(
-                (view["cheapest_site"].isin(["aptekonline", "aloe"])).sum()
-            )
+            undercut_n = int((view["cheapest_site"].isin(["aptekonline", "aloe"])).sum())
             col_d.metric("Конкурент дешевле", undercut_n)
 
         st.divider()
@@ -1323,7 +1322,8 @@ with tab_compare:
         else:
             # === Batch confirm: подтвердить все непомеченные матчи на странице ===
             unconfirmed_ids = [
-                int(r["canonical_id"]) for _, r in view.iterrows()
+                int(r["canonical_id"])
+                for _, r in view.iterrows()
                 if not bool(r.get("is_manual", False))
             ]
             if unconfirmed_ids:
@@ -1338,9 +1338,10 @@ with tab_compare:
                         type="primary",
                         use_container_width=True,
                         help="Помечает все видимые матчи как is_manual=True — auto-matcher "
-                             "не будет их трогать.",
+                        "не будет их трогать.",
                     ):
                         from src import match_actions as ma
+
                         with get_session() as s_:
                             for cid in unconfirmed_ids:
                                 ma.confirm_match(s_, cid)
@@ -1367,9 +1368,7 @@ with tab_overview:
     else:
         with st.sidebar:
             st.header("⚙️ Фильтры")
-            selected_sites = st.multiselect(
-                "Сайты", options=list(SITES), default=list(SITES)
-            )
+            selected_sites = st.multiselect("Сайты", options=list(SITES), default=list(SITES))
             monthly_volume = st.slider(
                 "Объём продаж/мес (для ROI)",
                 min_value=5,
@@ -1415,10 +1414,13 @@ with tab_overview:
             ):
                 from src import analyzer as analyzer_mod, pdf_export, reporter as reporter_mod
                 from sqlalchemy import desc as _d, select as _s
+
                 with get_session() as s_pdf:
                     last_run = s_pdf.scalars(
-                        _s(storage.Run).where(storage.Run.status == "ok")
-                        .order_by(_d(storage.Run.started_at)).limit(1)
+                        _s(storage.Run)
+                        .where(storage.Run.status == "ok")
+                        .order_by(_d(storage.Run.started_at))
+                        .limit(1)
                     ).first()
                     if not last_run:
                         st.warning("Нет успешных прогонов")
@@ -1431,9 +1433,7 @@ with tab_overview:
                                 st.download_button(
                                     "💾 Скачать PDF",
                                     data=pdf_bytes,
-                                    file_name=pdf_export.report_pdf_filename(
-                                        report.run_started_at
-                                    ),
+                                    file_name=pdf_export.report_pdf_filename(report.run_started_at),
                                     mime="application/pdf",
                                     use_container_width=True,
                                 )
@@ -1498,7 +1498,9 @@ with tab_overview:
         with col1:
             st.metric("Товаров (последний прогон)", len(snapshot))
         with col2:
-            on_sale = snapshot[snapshot["is_on_sale"] == 1] if not snapshot.empty else pd.DataFrame()
+            on_sale = (
+                snapshot[snapshot["is_on_sale"] == 1] if not snapshot.empty else pd.DataFrame()
+            )
             st.metric("На скидке", len(on_sale))
         with col3:
             matches_df = load_matches()
@@ -1536,28 +1538,38 @@ with tab_overview:
                 canon_name = client_rows["name"].iloc[0]
                 for _, comp in comp_rows.iterrows():
                     if comp["effective_price"] < client_price:
-                        diff_pct = round((client_price - comp["effective_price"]) / client_price * 100, 1)
-                        rows.append({
-                            "Товар": canon_name,
-                            "Клиент ₼": round(client_price, 2),
-                            "Конкурент": comp["site"],
-                            "Цена конкурента ₼": round(comp["effective_price"], 2),
-                            "Дельта %": -diff_pct,
-                            "Клиент URL": client_url,
-                            "Конкурент URL": comp["url"],
-                        })
+                        diff_pct = round(
+                            (client_price - comp["effective_price"]) / client_price * 100, 1
+                        )
+                        rows.append(
+                            {
+                                "Товар": canon_name,
+                                "Клиент ₼": round(client_price, 2),
+                                "Конкурент": comp["site"],
+                                "Цена конкурента ₼": round(comp["effective_price"], 2),
+                                "Дельта %": -diff_pct,
+                                "Клиент URL": client_url,
+                                "Конкурент URL": comp["url"],
+                            }
+                        )
             if rows:
                 undercut_df = pd.DataFrame(rows).sort_values("Дельта %")
                 st.dataframe(
-                    undercut_df, use_container_width=True, hide_index=True,
+                    undercut_df,
+                    use_container_width=True,
+                    hide_index=True,
                     column_config={
                         "Клиент URL": st.column_config.LinkColumn("Клиент", display_text="open"),
-                        "Конкурент URL": st.column_config.LinkColumn("Конкурент", display_text="open"),
+                        "Конкурент URL": st.column_config.LinkColumn(
+                            "Конкурент", display_text="open"
+                        ),
                         "Дельта %": st.column_config.NumberColumn(format="%.1f%%"),
                     },
                 )
             else:
-                st.success("✅ Конкуренты сейчас не дешевле клиента ни по одному сматченному товару.")
+                st.success(
+                    "✅ Конкуренты сейчас не дешевле клиента ни по одному сматченному товару."
+                )
 
         st.divider()
 
@@ -1575,9 +1587,16 @@ with tab_overview:
                 canon_history = history[history["canonical_id"] == canon_id]
                 if not canon_history.empty:
                     fig = px.line(
-                        canon_history, x="run_started_at", y="price", color="site",
+                        canon_history,
+                        x="run_started_at",
+                        y="price",
+                        color="site",
                         markers=True,
-                        labels={"run_started_at": "Дата прогона", "price": "Цена ₼", "site": "Сайт"},
+                        labels={
+                            "run_started_at": "Дата прогона",
+                            "price": "Цена ₼",
+                            "site": "Сайт",
+                        },
                         title=canon_options.get(canon_id, "Тренд"),
                     )
                     fig.update_layout(height=420)
@@ -1593,12 +1612,16 @@ with tab_overview:
                 (snapshot["site"].isin(COMPETITOR_SITES)) & (snapshot["canonical_id"].isna())
             ]
             if not competitor_only.empty:
-                gap_df = competitor_only[["site", "name", "category", "discount_price", "price", "url"]].copy()
+                gap_df = competitor_only[
+                    ["site", "name", "category", "discount_price", "price", "url"]
+                ].copy()
                 gap_df["effective_price"] = gap_df["discount_price"].fillna(gap_df["price"])
                 gap_df = gap_df.drop(columns=["discount_price", "price"])
                 gap_df.columns = ["Сайт", "Товар", "Категория", "URL", "Цена ₼"]
                 st.dataframe(
-                    gap_df.head(100), use_container_width=True, hide_index=True,
+                    gap_df.head(100),
+                    use_container_width=True,
+                    hide_index=True,
                     column_config={"URL": st.column_config.LinkColumn(display_text="open")},
                 )
                 st.caption(f"Показаны первые 100 из {len(gap_df)} несматченных товаров конкурентов")
@@ -1633,9 +1656,7 @@ with tab_analytics:
     if overlap.only_competitor_count:
         st.caption(
             "Эксклюзив конкурентов по сайтам: "
-            + " · ".join(
-                f"**{site}**: {n}" for site, n in overlap.only_competitor_count.items()
-            )
+            + " · ".join(f"**{site}**: {n}" for site, n in overlap.only_competitor_count.items())
         )
 
     # === Match quality ===
@@ -1651,7 +1672,8 @@ with tab_analytics:
         st.metric("Анти-матчей ✗", mq.rejected_pairs)
     with mq4:
         st.metric(
-            "Manual %", f"{mq.manual_pct:.0f}%",
+            "Manual %",
+            f"{mq.manual_pct:.0f}%",
             help="Доля матчей подтверждённых вручную. Растёт со временем.",
         )
 
@@ -1666,22 +1688,25 @@ with tab_analytics:
     with get_session() as s:
         idx_rows = analytics.price_index_by_category(s)
     if idx_rows:
-        idx_df = pd.DataFrame([
-            {
-                "Категория": x.category,
-                "Сматченных SKU": x.matched_skus,
-                "Клиент avg ₼": x.avg_client_price,
-                "Конкуренты avg ₼": x.avg_competitor_price,
-                "Index": x.index,
-            }
-            for x in idx_rows
-        ])
+        idx_df = pd.DataFrame(
+            [
+                {
+                    "Категория": x.category,
+                    "Сматченных SKU": x.matched_skus,
+                    "Клиент avg ₼": x.avg_client_price,
+                    "Конкуренты avg ₼": x.avg_competitor_price,
+                    "Index": x.index,
+                }
+                for x in idx_rows
+            ]
+        )
         st.dataframe(
-            idx_df, use_container_width=True, hide_index=True,
+            idx_df,
+            use_container_width=True,
+            hide_index=True,
             column_config={
                 "Index": st.column_config.NumberColumn(
-                    format="%.1f",
-                    help="<100 = клиент дешевле; >100 = клиент дороже"
+                    format="%.1f", help="<100 = клиент дешевле; >100 = клиент дороже"
                 ),
             },
         )
@@ -1695,17 +1720,19 @@ with tab_analytics:
     with get_session() as s:
         brands = analytics.brand_share(s, top_n=30)
     if brands:
-        brand_df = pd.DataFrame([
-            {
-                "Бренд": b.brand,
-                "pharmonline": b.counts.get("pharmonline", 0),
-                "aptekonline": b.counts.get("aptekonline", 0),
-                "aloe": b.counts.get("aloe", 0),
-                "Всего": b.total,
-                "Эксклюзив у": b.exclusive_to or "—",
-            }
-            for b in brands
-        ])
+        brand_df = pd.DataFrame(
+            [
+                {
+                    "Бренд": b.brand,
+                    "pharmonline": b.counts.get("pharmonline", 0),
+                    "aptekonline": b.counts.get("aptekonline", 0),
+                    "aloe": b.counts.get("aloe", 0),
+                    "Всего": b.total,
+                    "Эксклюзив у": b.exclusive_to or "—",
+                }
+                for b in brands
+            ]
+        )
         st.dataframe(brand_df, use_container_width=True, hide_index=True)
     else:
         st.info("Нет данных по брендам — проверь что скрейперы заполняют поле brand.")
@@ -1729,43 +1756,61 @@ with tab_analytics:
     with fc1:
         st.markdown("**Топ движений по цене (всем сайтам)**")
         if movers:
-            mv_df = pd.DataFrame([
-                {
-                    "Тренд": "📈" if t.direction == "rising"
-                            else "📉" if t.direction == "falling" else "➖",
-                    "Сайт": t.site,
-                    "Товар": t.name[:50],
-                    "Было ₼": t.first_price,
-                    "Сейчас ₼": t.last_price,
-                    "Δ %": t.change_pct,
-                    "Прогноз 7д ₼": t.forecast_7d_price,
-                    "Уверенность": t.confidence,
-                    "Точек": t.n_points,
-                }
-                for t in movers
-            ])
-            st.dataframe(mv_df, use_container_width=True, hide_index=True,
-                         column_config={"Δ %": st.column_config.NumberColumn(format="%+.1f")})
+            mv_df = pd.DataFrame(
+                [
+                    {
+                        "Тренд": "📈"
+                        if t.direction == "rising"
+                        else "📉"
+                        if t.direction == "falling"
+                        else "➖",
+                        "Сайт": t.site,
+                        "Товар": t.name[:50],
+                        "Было ₼": t.first_price,
+                        "Сейчас ₼": t.last_price,
+                        "Δ %": t.change_pct,
+                        "Прогноз 7д ₼": t.forecast_7d_price,
+                        "Уверенность": t.confidence,
+                        "Точек": t.n_points,
+                    }
+                    for t in movers
+                ]
+            )
+            st.dataframe(
+                mv_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={"Δ %": st.column_config.NumberColumn(format="%+.1f")},
+            )
         else:
             st.info("Нужно ≥3 прогона на товар для расчёта тренда.")
 
     with fc2:
         st.markdown("**Предсказания: конкуренты, которые могут опустить ещё**")
         if comp_moves:
-            cm_df = pd.DataFrame([
-                {
-                    "Вероятность": {"high": "🔴 Высокая", "medium": "⚠️ Средняя",
-                                    "low": "ℹ️ Низкая"}.get(c.probability, c.probability),
-                    "Сайт": c.competitor_site,
-                    "Товар": c.canonical_name[:40],
-                    "Сейчас ₼": c.current_price,
-                    "Тренд %": c.trend_7d_change_pct,
-                    "Прогноз 7д ₼": c.expected_next_price,
-                }
-                for c in comp_moves
-            ])
-            st.dataframe(cm_df, use_container_width=True, hide_index=True,
-                         column_config={"Тренд %": st.column_config.NumberColumn(format="%+.1f")})
+            cm_df = pd.DataFrame(
+                [
+                    {
+                        "Вероятность": {
+                            "high": "🔴 Высокая",
+                            "medium": "⚠️ Средняя",
+                            "low": "ℹ️ Низкая",
+                        }.get(c.probability, c.probability),
+                        "Сайт": c.competitor_site,
+                        "Товар": c.canonical_name[:40],
+                        "Сейчас ₼": c.current_price,
+                        "Тренд %": c.trend_7d_change_pct,
+                        "Прогноз 7д ₼": c.expected_next_price,
+                    }
+                    for c in comp_moves
+                ]
+            )
+            st.dataframe(
+                cm_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={"Тренд %": st.column_config.NumberColumn(format="%+.1f")},
+            )
             st.caption(
                 "Конкуренты с падающим трендом — будь готов реагировать "
                 "(можно настроить `price_drop_pct` алерт)."
@@ -1780,19 +1825,23 @@ with tab_analytics:
     with get_session() as s:
         promos = analytics.promo_history(s, days=30)
     if promos:
-        promo_df = pd.DataFrame([
-            {
-                "Сайт": p.site,
-                "Промо": p.title[:80],
-                "Первое появление": p.first_seen.strftime("%d.%m"),
-                "Последнее": p.last_seen.strftime("%d.%m"),
-                "Дней активна": p.days_active,
-                "URL": p.landing_url or "",
-            }
-            for p in promos
-        ])
+        promo_df = pd.DataFrame(
+            [
+                {
+                    "Сайт": p.site,
+                    "Промо": p.title[:80],
+                    "Первое появление": p.first_seen.strftime("%d.%m"),
+                    "Последнее": p.last_seen.strftime("%d.%m"),
+                    "Дней активна": p.days_active,
+                    "URL": p.landing_url or "",
+                }
+                for p in promos
+            ]
+        )
         st.dataframe(
-            promo_df, use_container_width=True, hide_index=True,
+            promo_df,
+            use_container_width=True,
+            hide_index=True,
             column_config={"URL": st.column_config.LinkColumn(display_text="open")},
         )
     else:
@@ -1816,9 +1865,7 @@ with tab_inventory:
         with st.container(border=True):
             st.markdown("**📥 Импорт остатков**")
             st.caption("CSV колонки: `sku, qty, name`")
-            stock_file = st.file_uploader(
-                "stock.csv", type=["csv"], key="stock_upload"
-            )
+            stock_file = st.file_uploader("stock.csv", type=["csv"], key="stock_upload")
             if stock_file:
                 tmp = Path("data") / "_uploaded_stock.csv"
                 tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -1834,12 +1881,8 @@ with tab_inventory:
     with inv_c2:
         with st.container(border=True):
             st.markdown("**💰 Импорт закупочных цен**")
-            st.caption(
-                "CSV колонки: `sku, supplier_name, purchase_price, currency, name`"
-            )
-            sup_file = st.file_uploader(
-                "purchase_prices.csv", type=["csv"], key="sup_upload"
-            )
+            st.caption("CSV колонки: `sku, supplier_name, purchase_price, currency, name`")
+            sup_file = st.file_uploader("purchase_prices.csv", type=["csv"], key="sup_upload")
             if sup_file:
                 tmp = Path("data") / "_uploaded_supplier.csv"
                 tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -1864,19 +1907,23 @@ with tab_inventory:
             "2. Импорт закупочных цен (форма выше)"
         )
     else:
-        margin_df = pd.DataFrame([
-            {
-                "Stock": "📦" if r.in_stock else "⏸️",
-                "Товар": r.name[:60],
-                "Sale ₼": r.sale_price,
-                "Buy ₼": r.purchase_price,
-                "Margin ₼": r.margin_azn,
-                "Margin %": r.margin_pct,
-            }
-            for r in margin_rows[:100]
-        ])
+        margin_df = pd.DataFrame(
+            [
+                {
+                    "Stock": "📦" if r.in_stock else "⏸️",
+                    "Товар": r.name[:60],
+                    "Sale ₼": r.sale_price,
+                    "Buy ₼": r.purchase_price,
+                    "Margin ₼": r.margin_azn,
+                    "Margin %": r.margin_pct,
+                }
+                for r in margin_rows[:100]
+            ]
+        )
         st.dataframe(
-            margin_df, use_container_width=True, hide_index=True,
+            margin_df,
+            use_container_width=True,
+            hide_index=True,
             column_config={
                 "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
                 "Margin ₼": st.column_config.NumberColumn(format="%+.2f"),
@@ -1904,25 +1951,26 @@ with tab_alerts:
         # === RULES ===
         st.markdown("**📐 Активные правила**")
 
-        rules = s.scalars(
-            _sa_select(storage.AlertRule).order_by(storage.AlertRule.id)
-        ).all()
+        rules = s.scalars(_sa_select(storage.AlertRule).order_by(storage.AlertRule.id)).all()
 
         if rules:
             rule_rows = []
             for r in rules:
-                rule_rows.append({
-                    "ID": r.id,
-                    "Активно": r.is_active,
-                    "Тип": r.rule_type,
-                    "Имя": r.name,
-                    "Параметры": str(r.params or {}),
-                    "Каналы": ", ".join(r.channels or []),
-                    "Cooldown (ч)": r.cooldown_hours,
-                })
+                rule_rows.append(
+                    {
+                        "ID": r.id,
+                        "Активно": r.is_active,
+                        "Тип": r.rule_type,
+                        "Имя": r.name,
+                        "Параметры": str(r.params or {}),
+                        "Каналы": ", ".join(r.channels or []),
+                        "Cooldown (ч)": r.cooldown_hours,
+                    }
+                )
             edited = st.data_editor(
                 pd.DataFrame(rule_rows),
-                use_container_width=True, hide_index=True,
+                use_container_width=True,
+                hide_index=True,
                 disabled=["ID", "Тип", "Параметры"],
                 column_config={"Активно": st.column_config.CheckboxColumn()},
                 key="alert_rules_editor",
@@ -1938,9 +1986,7 @@ with tab_alerts:
                     if rule:
                         rule.is_active = new["Активно"]
                         rule.name = new["Имя"]
-                        rule.channels = [
-                            c.strip() for c in new["Каналы"].split(",") if c.strip()
-                        ]
+                        rule.channels = [c.strip() for c in new["Каналы"].split(",") if c.strip()]
                         rule.cooldown_hours = int(new["Cooldown (ч)"])
                     s.commit()
                     reset_caches()
@@ -1970,16 +2016,20 @@ with tab_alerts:
                             "price_raise_opportunity": "💰 Возможность поднять цену",
                         }.get(t, t),
                     )
-                    new_name = st.text_input(
-                        "Имя (опц.)", placeholder="Undercut top-50 SKU"
-                    )
+                    new_name = st.text_input("Имя (опц.)", placeholder="Undercut top-50 SKU")
                 with c2:
                     new_min_pct = st.number_input(
                         "Порог % (для threshold-правил)",
-                        min_value=0.0, max_value=100.0, value=5.0, step=0.5,
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=5.0,
+                        step=0.5,
                     )
                     new_cooldown = st.number_input(
-                        "Cooldown (часов)", min_value=1, max_value=168, value=12,
+                        "Cooldown (часов)",
+                        min_value=1,
+                        max_value=168,
+                        value=12,
                     )
                 new_channels = st.multiselect(
                     "Каналы доставки",
@@ -1990,7 +2040,8 @@ with tab_alerts:
                 if st.form_submit_button("Создать правило", type="primary"):
                     params: dict = {}
                     if new_type in (
-                        "undercut_threshold", "price_drop_pct",
+                        "undercut_threshold",
+                        "price_drop_pct",
                         "price_raise_opportunity",
                     ):
                         params["min_pct"] = float(new_min_pct)
@@ -2020,6 +2071,7 @@ with tab_alerts:
                 help="Прогон evaluate_rules вручную — без скрейпинга, только перепроверка по последнему прогону",
             ):
                 from src import alerts as alerts_mod
+
                 with st.spinner("Прогон..."):
                     fired = alerts_mod.evaluate_rules(s)
                 reset_caches()
@@ -2046,9 +2098,7 @@ with tab_alerts:
         # === RECENT EVENTS FEED ===
         st.markdown("**📜 Последние 50 событий**")
         events = s.scalars(
-            _sa_select(storage.AlertEvent)
-            .order_by(_desc(storage.AlertEvent.created_at))
-            .limit(50)
+            _sa_select(storage.AlertEvent).order_by(_desc(storage.AlertEvent.created_at)).limit(50)
         ).all()
         if not events:
             st.caption("(пока нет событий — запусти прогон)")
@@ -2073,6 +2123,7 @@ with tab_categories:
         if not cats:
             with st.spinner("Импорт категорий из config/categories.yaml..."):
                 from pathlib import Path as _P
+
                 n = wl.seed_categories_from_yaml(s, _P("config/categories.yaml"))
                 if n > 0:
                     st.success(f"Импортировано {n} категорий из YAML")
@@ -2135,16 +2186,10 @@ with tab_categories:
                         placeholder="kids_food",
                     )
                 with fc2:
-                    new_label_ru = st.text_input(
-                        "Название (RU)*", placeholder="Детское питание"
-                    )
+                    new_label_ru = st.text_input("Название (RU)*", placeholder="Детское питание")
                 with fc3:
-                    new_label_az = st.text_input(
-                        "Название (AZ)", placeholder="Uşaq qidası"
-                    )
-                submitted = st.form_submit_button(
-                    "🔗 Распарсить и добавить", type="primary"
-                )
+                    new_label_az = st.text_input("Название (AZ)", placeholder="Uşaq qidası")
+                submitted = st.form_submit_button("🔗 Распарсить и добавить", type="primary")
 
                 if submitted:
                     if not urls_text.strip():
@@ -2152,15 +2197,10 @@ with tab_categories:
                     elif not new_label_ru.strip():
                         st.error("Название (RU) обязательно")
                     elif not preview_found:
-                        st.error(
-                            "Ни одного URL не распознано. Проверь формат ссылок."
-                        )
+                        st.error("Ни одного URL не распознано. Проверь формат ссылок.")
                     else:
                         # Авто-генерируем ключ если не задан (из label_ru транслитом)
-                        auto_key = (
-                            new_key.strip()
-                            or new_label_ru.lower().replace(" ", "_")[:40]
-                        )
+                        auto_key = new_key.strip() or new_label_ru.lower().replace(" ", "_")[:40]
                         cat = wl.add_category(
                             s,
                             key=auto_key,
@@ -2190,7 +2230,11 @@ with tab_categories:
                         active_emoji = "✅" if cat.is_active else "⏸️"
                         st.markdown(
                             f"{active_emoji} **#{cat.id} · {cat.label_ru}**"
-                            + (f"<br><span style='color:#86868b;font-size:12px;'>{cat.label_az}</span>" if cat.label_az else ""),
+                            + (
+                                f"<br><span style='color:#86868b;font-size:12px;'>{cat.label_az}</span>"
+                                if cat.label_az
+                                else ""
+                            ),
                             unsafe_allow_html=True,
                         )
                         st.caption(f"Ключ: `{cat.key}`")
@@ -2228,21 +2272,22 @@ with tab_categories:
                             type="primary",
                             help="Скрейпит только эту категорию по всем сайтам где есть slug",
                         ):
-                            with st.spinner(
-                                f"Скрейпим '{cat.label_ru}' (~30-90 сек)..."
-                            ):
+                            with st.spinner(f"Скрейпим '{cat.label_ru}' (~30-90 сек)..."):
                                 try:
-                                    rc, log = run_pharmacy_monitor(
-                                        dry_run=True, mode="category"
-                                    )
+                                    rc, log = run_pharmacy_monitor(dry_run=True, mode="category")
                                     # ↑ простой вариант: запускаем все категории.
                                     # Можно использовать --category-id если subprocess возьмёт его.
                                     # Для точечной точки — пробрасываем флаг через extra args:
                                     proc = subprocess.run(
                                         [
-                                            "uv", "run", "pharmacy-monitor",
-                                            "run", "--mode", "category",
-                                            "--category-id", str(cat.id),
+                                            "uv",
+                                            "run",
+                                            "pharmacy-monitor",
+                                            "run",
+                                            "--mode",
+                                            "category",
+                                            "--category-id",
+                                            str(cat.id),
                                             "--dry-run",
                                         ],
                                         cwd=PROJECT_ROOT,
@@ -2257,8 +2302,7 @@ with tab_categories:
                             if rc == 0:
                                 reset_caches()
                                 st.success(
-                                    f"✅ Прогон '{cat.label_ru}' готов. "
-                                    "Открой 🔍 Сравнение цен."
+                                    f"✅ Прогон '{cat.label_ru}' готов. Открой 🔍 Сравнение цен."
                                 )
                                 with st.expander("📜 Лог"):
                                     st.code(log[-3000:], language="bash")
@@ -2364,20 +2408,30 @@ with tab_watchlist:
             rows = []
             for tp in items:
                 urls = {link.site: link for link in tp.links}
-                rows.append({
-                    "ID": tp.id,
-                    "Активен": "✓" if tp.is_active else "✗",
-                    "Название": tp.canonical_name,
-                    "Бренд": tp.brand or "",
-                    "Дозировка": tp.dosage or "",
-                    "Упаковка": tp.pack_size or "",
-                    "pharmonline": urls.get("pharmonline").url if "pharmonline" in urls and urls["pharmonline"].url else "—",
-                    "aptekonline": urls.get("aptekonline").url if "aptekonline" in urls and urls["aptekonline"].url else "—",
-                    "aloe": urls.get("aloe").url if "aloe" in urls and urls["aloe"].url else "—",
-                })
+                rows.append(
+                    {
+                        "ID": tp.id,
+                        "Активен": "✓" if tp.is_active else "✗",
+                        "Название": tp.canonical_name,
+                        "Бренд": tp.brand or "",
+                        "Дозировка": tp.dosage or "",
+                        "Упаковка": tp.pack_size or "",
+                        "pharmonline": urls.get("pharmonline").url
+                        if "pharmonline" in urls and urls["pharmonline"].url
+                        else "—",
+                        "aptekonline": urls.get("aptekonline").url
+                        if "aptekonline" in urls and urls["aptekonline"].url
+                        else "—",
+                        "aloe": urls.get("aloe").url
+                        if "aloe" in urls and urls["aloe"].url
+                        else "—",
+                    }
+                )
             df = pd.DataFrame(rows)
             st.dataframe(
-                df, use_container_width=True, hide_index=True,
+                df,
+                use_container_width=True,
+                hide_index=True,
                 column_config={
                     "pharmonline": st.column_config.LinkColumn(display_text="pharmonline"),
                     "aptekonline": st.column_config.LinkColumn(display_text="aptekonline"),
@@ -2401,8 +2455,12 @@ with tab_watchlist:
                         dosage = st.text_input("Дозировка (500mg)")
                     with c3:
                         pack_size = st.text_input("Упаковка (N20)")
-                    ph_url = st.text_input("pharmonline URL", placeholder="https://www.pharmonline.az/...")
-                    ap_url = st.text_input("aptekonline URL", placeholder="https://www.aptekonline.az/...")
+                    ph_url = st.text_input(
+                        "pharmonline URL", placeholder="https://www.pharmonline.az/..."
+                    )
+                    ap_url = st.text_input(
+                        "aptekonline URL", placeholder="https://www.aptekonline.az/..."
+                    )
                     al_url = st.text_input("aloe URL", placeholder="https://aloe.az/...")
                     notes = st.text_area("Заметки")
                     submit = st.form_submit_button("Добавить", type="primary")
@@ -2411,7 +2469,8 @@ with tab_watchlist:
                             st.error("Название обязательно.")
                         else:
                             tp = wl.add_tracked_product(
-                                s, name,
+                                s,
+                                name,
                                 brand=brand or None,
                                 dosage=dosage or None,
                                 pack_size=pack_size or None,
@@ -2428,7 +2487,11 @@ with tab_watchlist:
             with st.expander("✏️ Изменить / удалить"):
                 if items:
                     tp_options = {tp.id: f"#{tp.id} {tp.canonical_name}" for tp in items}
-                    chosen = st.selectbox("Товар", options=list(tp_options.keys()), format_func=lambda x: tp_options[x])
+                    chosen = st.selectbox(
+                        "Товар",
+                        options=list(tp_options.keys()),
+                        format_func=lambda x: tp_options[x],
+                    )
                     chosen_tp = next((t for t in items if t.id == chosen), None)
                     if chosen_tp:
                         with st.form("edit_tracked"):
@@ -2437,12 +2500,20 @@ with tab_watchlist:
                             with c1:
                                 new_brand = st.text_input("Бренд", value=chosen_tp.brand or "")
                             with c2:
-                                new_dosage = st.text_input("Дозировка", value=chosen_tp.dosage or "")
+                                new_dosage = st.text_input(
+                                    "Дозировка", value=chosen_tp.dosage or ""
+                                )
                             with c3:
-                                new_pack = st.text_input("Упаковка", value=chosen_tp.pack_size or "")
+                                new_pack = st.text_input(
+                                    "Упаковка", value=chosen_tp.pack_size or ""
+                                )
                             current_urls = {link.site: link.url or "" for link in chosen_tp.links}
-                            new_ph = st.text_input("pharmonline URL", value=current_urls.get("pharmonline", ""))
-                            new_ap = st.text_input("aptekonline URL", value=current_urls.get("aptekonline", ""))
+                            new_ph = st.text_input(
+                                "pharmonline URL", value=current_urls.get("pharmonline", "")
+                            )
+                            new_ap = st.text_input(
+                                "aptekonline URL", value=current_urls.get("aptekonline", "")
+                            )
                             new_al = st.text_input("aloe URL", value=current_urls.get("aloe", ""))
                             is_active = st.checkbox("Активен", value=chosen_tp.is_active)
                             cs, cd = st.columns(2)
@@ -2452,19 +2523,35 @@ with tab_watchlist:
                                 delete = st.form_submit_button("🗑 Удалить", type="secondary")
                             if save:
                                 wl.update_tracked(
-                                    s, chosen_tp.id,
+                                    s,
+                                    chosen_tp.id,
                                     canonical_name=new_name,
                                     brand=new_brand or None,
                                     dosage=new_dosage or None,
                                     pack_size=new_pack or None,
                                     is_active=is_active,
                                 )
-                                wl.set_link_url(s, chosen_tp.id, "pharmonline", new_ph or None,
-                                                status="confirmed" if new_ph else "pending")
-                                wl.set_link_url(s, chosen_tp.id, "aptekonline", new_ap or None,
-                                                status="confirmed" if new_ap else "pending")
-                                wl.set_link_url(s, chosen_tp.id, "aloe", new_al or None,
-                                                status="confirmed" if new_al else "pending")
+                                wl.set_link_url(
+                                    s,
+                                    chosen_tp.id,
+                                    "pharmonline",
+                                    new_ph or None,
+                                    status="confirmed" if new_ph else "pending",
+                                )
+                                wl.set_link_url(
+                                    s,
+                                    chosen_tp.id,
+                                    "aptekonline",
+                                    new_ap or None,
+                                    status="confirmed" if new_ap else "pending",
+                                )
+                                wl.set_link_url(
+                                    s,
+                                    chosen_tp.id,
+                                    "aloe",
+                                    new_al or None,
+                                    status="confirmed" if new_al else "pending",
+                                )
                                 reset_caches()
                                 st.success("Сохранено")
                                 st.rerun()
@@ -2479,7 +2566,9 @@ with tab_watchlist:
         st.divider()
 
         with st.expander("📥 Импорт / экспорт CSV"):
-            st.markdown("**Колонки CSV:** `canonical_name, brand, dosage, pack_size, search_query, pharmonline_url, aptekonline_url, aloe_url, notes`")
+            st.markdown(
+                "**Колонки CSV:** `canonical_name, brand, dosage, pack_size, search_query, pharmonline_url, aptekonline_url, aloe_url, notes`"
+            )
             uploaded = st.file_uploader("Выбрать CSV для импорта", type=["csv"])
             if uploaded:
                 tmp_path = Path("data") / "_uploaded_watchlist.csv"
@@ -2496,7 +2585,9 @@ with tab_watchlist:
                     n = wl.export_to_csv(s, export_path)
                     st.success(f"Экспортировано {n} в {export_path}")
                     with open(export_path, "rb") as f:
-                        st.download_button("Скачать CSV", f, file_name="watchlist.csv", mime="text/csv")
+                        st.download_button(
+                            "Скачать CSV", f, file_name="watchlist.csv", mime="text/csv"
+                        )
 
 # ============================================================================
 # TAB 3: RECIPIENTS
@@ -2512,7 +2603,10 @@ with tab_recipients:
         recipients = wl.list_recipients(s, active_only=False)
 
         if recipients:
-            rows = [{"ID": r.id, "Email": r.email, "Имя": r.name or "", "Активен": r.is_active} for r in recipients]
+            rows = [
+                {"ID": r.id, "Email": r.email, "Имя": r.name or "", "Активен": r.is_active}
+                for r in recipients
+            ]
             edited = st.data_editor(
                 pd.DataFrame(rows),
                 use_container_width=True,
@@ -2557,9 +2651,7 @@ with tab_recipients:
             with st.form("remove_recipient", clear_on_submit=True):
                 st.write("**🗑 Удалить получателя**")
                 if recipients:
-                    email_to_remove = st.selectbox(
-                        "Email", options=[r.email for r in recipients]
-                    )
+                    email_to_remove = st.selectbox("Email", options=[r.email for r in recipients])
                     if st.form_submit_button("Удалить", type="secondary"):
                         ok = wl.remove_recipient(s, email_to_remove)
                         reset_caches()
@@ -2584,10 +2676,26 @@ with tab_settings:
         st.markdown("**🌐 Скрейпинг — переменные окружения**")
         env_table = pd.DataFrame(
             [
-                {"Параметр": "SCRAPE_RATE_LIMIT_SEC", "Значение": os.getenv("SCRAPE_RATE_LIMIT_SEC", "2"), "Описание": "Минимум сек между запросами"},
-                {"Параметр": "SCRAPE_TIMEOUT_SEC", "Значение": os.getenv("SCRAPE_TIMEOUT_SEC", "30"), "Описание": "Timeout одного запроса"},
-                {"Параметр": "SCRAPE_MAX_RETRIES", "Значение": os.getenv("SCRAPE_MAX_RETRIES", "3"), "Описание": "Кол-во попыток при ошибке"},
-                {"Параметр": "SCRAPE_HEADLESS", "Значение": os.getenv("SCRAPE_HEADLESS", "true"), "Описание": "Браузер без UI"},
+                {
+                    "Параметр": "SCRAPE_RATE_LIMIT_SEC",
+                    "Значение": os.getenv("SCRAPE_RATE_LIMIT_SEC", "2"),
+                    "Описание": "Минимум сек между запросами",
+                },
+                {
+                    "Параметр": "SCRAPE_TIMEOUT_SEC",
+                    "Значение": os.getenv("SCRAPE_TIMEOUT_SEC", "30"),
+                    "Описание": "Timeout одного запроса",
+                },
+                {
+                    "Параметр": "SCRAPE_MAX_RETRIES",
+                    "Значение": os.getenv("SCRAPE_MAX_RETRIES", "3"),
+                    "Описание": "Кол-во попыток при ошибке",
+                },
+                {
+                    "Параметр": "SCRAPE_HEADLESS",
+                    "Значение": os.getenv("SCRAPE_HEADLESS", "true"),
+                    "Описание": "Браузер без UI",
+                },
             ]
         )
         st.dataframe(env_table, use_container_width=True, hide_index=True)
@@ -2601,7 +2709,10 @@ with tab_settings:
                 {"Параметр": "SMTP_HOST", "Значение": os.getenv("SMTP_HOST", "smtp.gmail.com")},
                 {"Параметр": "SMTP_PORT", "Значение": os.getenv("SMTP_PORT", "587")},
                 {"Параметр": "SMTP_USER", "Значение": os.getenv("SMTP_USER") or "(не задан)"},
-                {"Параметр": "SMTP_PASSWORD", "Значение": "•••••••" if os.getenv("SMTP_PASSWORD") else "(не задан)"},
+                {
+                    "Параметр": "SMTP_PASSWORD",
+                    "Значение": "•••••••" if os.getenv("SMTP_PASSWORD") else "(не задан)",
+                },
                 {"Параметр": "SMTP_FROM", "Значение": os.getenv("SMTP_FROM") or "(не задан)"},
             ]
         )

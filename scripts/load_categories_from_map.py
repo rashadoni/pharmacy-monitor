@@ -9,6 +9,7 @@
   - is_active=True
   - name_az = name из discovery
 """
+
 from __future__ import annotations
 
 import json
@@ -42,23 +43,24 @@ def main() -> None:
 
     # Существующие slug'и в БД (чтобы не дублировать)
     existing_pharma = {
-        s for (s,) in session.execute(
+        s
+        for (s,) in session.execute(
             select(Category.pharmonline_slug).where(Category.pharmonline_slug.isnot(None))
         )
     }
     existing_aptek = {
-        s for (s,) in session.execute(
+        s
+        for (s,) in session.execute(
             select(Category.aptekonline_slug).where(Category.aptekonline_slug.isnot(None))
         )
     }
     existing_aloe = {
-        s for (s,) in session.execute(
+        s
+        for (s,) in session.execute(
             select(Category.aloe_slug).where(Category.aloe_slug.isnot(None))
         )
     }
-    existing_keys = {
-        s for (s,) in session.execute(select(Category.key))
-    }
+    existing_keys = {s for (s,) in session.execute(select(Category.key))}
 
     def make_unique_key(prefix, slug):
         base = f"{prefix}_{slug}"[:90]

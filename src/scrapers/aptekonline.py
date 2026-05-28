@@ -203,9 +203,7 @@ def _build_product_from_api(
     except (TypeError, ValueError):
         discount_price = None
 
-    is_on_sale = (
-        discount_price is not None and price is not None and 0 < discount_price < price
-    )
+    is_on_sale = discount_price is not None and price is not None and 0 < discount_price < price
     discount_percent = None
     if is_on_sale:
         discount_percent = round((1 - discount_price / price) * 100, 1)
@@ -221,9 +219,7 @@ def _build_product_from_api(
     except (TypeError, ValueError):
         cashback_pct_num = None
     promo_label = (
-        f"{cashback_pct_num:g}% kəşbək"
-        if cashback_pct_num and cashback_pct_num > 0
-        else None
+        f"{cashback_pct_num:g}% kəşbək" if cashback_pct_num and cashback_pct_num > 0 else None
     )
 
     # API не отдаёт brand отдельно. Для категории передаём тот же slug что был

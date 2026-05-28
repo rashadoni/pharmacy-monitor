@@ -7,6 +7,7 @@ Covers:
   - bind_telegram links chat_id by email
   - digest sends to opted-in users only
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -149,9 +150,10 @@ def test_dispatch_event_marks_channels_sent(setup, tenant_user):
     s.add(event)
     s.commit()
 
-    with patch("src.notifier.send_email") as mock_email, patch(
-        "src.notifier.send_telegram_message"
-    ) as mock_tg:
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
+    ):
         # No telegram_chat_id → only email attempted
         notifications.dispatch_event(s, event)
         assert mock_email.called
@@ -197,9 +199,10 @@ def test_dispatch_event_telegram_when_bound(setup, tenant_user):
     s.add(event)
     s.commit()
 
-    with patch("src.notifier.send_email") as mock_email, patch(
-        "src.notifier.send_telegram_message"
-    ) as mock_tg:
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
+    ):
         notifications.dispatch_event(s, event)
         assert mock_tg.called
         assert mock_tg.call_args[0][0] == "100"
@@ -222,9 +225,7 @@ def test_dispatch_event_respects_quiet_hours(setup, tenant_user, monkeypatch):
     s.add(event)
     s.commit()
 
-    with patch("src.notifier.send_email"), patch(
-        "src.notifier.send_telegram_message"
-    ) as mock_tg:
+    with patch("src.notifier.send_email"), patch("src.notifier.send_telegram_message") as mock_tg:
         notifications.dispatch_event(s, event)
         assert not mock_tg.called
 
@@ -265,14 +266,16 @@ def test_send_daily_digest_no_recipients(setup, tenant_user):
 def test_send_daily_digest_with_events(setup, tenant_user):
     s = setup
     tenant_user.daily_digest = True
-    s.add(storage.AlertEvent(
-        rule_type="undercut_threshold",
-        dedup_key="d-1",
-        severity="warning",
-        title="Today event",
-        tenant_id=tenant_user.tenant_id,
-        created_at=utcnow(),
-    ))
+    s.add(
+        storage.AlertEvent(
+            rule_type="undercut_threshold",
+            dedup_key="d-1",
+            severity="warning",
+            title="Today event",
+            tenant_id=tenant_user.tenant_id,
+            created_at=utcnow(),
+        )
+    )
     s.commit()
 
     with patch("src.notifier.send_email") as mock_email:
@@ -285,14 +288,16 @@ def test_send_daily_digest_skips_old_events(setup, tenant_user):
     """Events older than 24h not included — if all old, no email."""
     s = setup
     tenant_user.daily_digest = True
-    s.add(storage.AlertEvent(
-        rule_type="undercut_threshold",
-        dedup_key="d-old",
-        severity="warning",
-        title="Old event",
-        tenant_id=tenant_user.tenant_id,
-        created_at=utcnow() - timedelta(days=3),
-    ))
+    s.add(
+        storage.AlertEvent(
+            rule_type="undercut_threshold",
+            dedup_key="d-old",
+            severity="warning",
+            title="Old event",
+            tenant_id=tenant_user.tenant_id,
+            created_at=utcnow() - timedelta(days=3),
+        )
+    )
     s.commit()
 
     with patch("src.notifier.send_email") as mock_email:

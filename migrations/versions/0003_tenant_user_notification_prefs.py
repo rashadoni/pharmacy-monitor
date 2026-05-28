@@ -4,6 +4,7 @@ Revision ID: 0003_notif_prefs
 Revises: 0002_tenant_id
 Create Date: 2026-04-29
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence

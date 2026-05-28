@@ -11,6 +11,7 @@ Usage:
     # Or use scoped helper directly:
     products = scoped(session, Product).all()  # auto-filters by tenant_id
 """
+
 from __future__ import annotations
 
 import contextvars
@@ -84,6 +85,4 @@ def assert_same_tenant(*objects, tenant_id: int | None = None) -> None:
             continue
         actual = getattr(o, "tenant_id", None)
         if actual is not None and actual != expected:
-            raise ValueError(
-                f"Tenant mismatch: object tenant_id={actual} != expected {expected}"
-            )
+            raise ValueError(f"Tenant mismatch: object tenant_id={actual} != expected {expected}")

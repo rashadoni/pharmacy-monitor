@@ -100,21 +100,20 @@ def test_break_match_dissolves_cluster_if_only_one_left(db_session):
 
 
 def test_find_alternatives_ranks_by_similarity(db_session):
-    m, _ = _make_match_cluster(
-        db_session, "Paracetamol 500mg", ["pharmonline", "aloe"]
-    )
+    m, _ = _make_match_cluster(db_session, "Paracetamol 500mg", ["pharmonline", "aloe"])
     # Кандидаты на aptekonline (unmatched)
     closer = _make_product(
-        db_session, site="aptekonline", external_id="ap-close",
-        name="Paracetamol 500mg generic"
+        db_session, site="aptekonline", external_id="ap-close", name="Paracetamol 500mg generic"
     )
     further = _make_product(
-        db_session, site="aptekonline", external_id="ap-far",
-        name="Aspirin Cardio 100mg"
+        db_session, site="aptekonline", external_id="ap-far", name="Aspirin Cardio 100mg"
     )
     matched_already = _make_product(
-        db_session, site="aptekonline", external_id="ap-matched",
-        name="Paracetamol other", canonical_id=m.id  # уже сматченный — не должен попасть
+        db_session,
+        site="aptekonline",
+        external_id="ap-matched",
+        name="Paracetamol other",
+        canonical_id=m.id,  # уже сматченный — не должен попасть
     )
     db_session.commit()
 
@@ -130,9 +129,7 @@ def test_find_alternatives_ranks_by_similarity(db_session):
 
 
 def test_swap_alternative_replaces_product(db_session):
-    m, [p1, p2] = _make_match_cluster(
-        db_session, "Paracetamol", ["pharmonline", "aloe"]
-    )
+    m, [p1, p2] = _make_match_cluster(db_session, "Paracetamol", ["pharmonline", "aloe"])
     # Новый кандидат на aloe
     new_p = _make_product(
         db_session, site="aloe", external_id="aloe-new", name="Paracetamol Generic"

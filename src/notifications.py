@@ -13,6 +13,7 @@ Public API:
 
 Severity ordering (low → high):  info < warning < critical
 """
+
 from __future__ import annotations
 
 import os
@@ -93,7 +94,7 @@ def _format_event_html(event: storage.AlertEvent) -> str:
       {event.severity} · {when}
     </div>
     <div style="font-weight:600;margin-top:4px;color:#18181b;">{event.title}</div>
-    {f'<div style="font-size:13px;color:#52525b;margin-top:4px;">{event.detail}</div>' if event.detail else ''}
+    {f'<div style="font-size:13px;color:#52525b;margin-top:4px;">{event.detail}</div>' if event.detail else ""}
   </td>
 </tr>
 """.strip()
@@ -124,9 +125,8 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
     sent_at = utcnow()
     for user in users:
         # Email — skip real-time if user opted into daily digest (digest will include it)
-        if (
-            not user.daily_digest
-            and _severity_passes(user.email_severity_min, event.severity, DEFAULT_EMAIL_SEVERITY)
+        if not user.daily_digest and _severity_passes(
+            user.email_severity_min, event.severity, DEFAULT_EMAIL_SEVERITY
         ):
             try:
                 notifier.send_email(
@@ -141,7 +141,9 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
         # Telegram (respects quiet hours)
         if (
             user.telegram_chat_id
-            and _severity_passes(user.telegram_severity_min, event.severity, DEFAULT_TELEGRAM_SEVERITY)
+            and _severity_passes(
+                user.telegram_severity_min, event.severity, DEFAULT_TELEGRAM_SEVERITY
+            )
             and not _in_quiet_hours(user.quiet_hours)
         ):
             try:
@@ -204,8 +206,9 @@ def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -
         select(storage.TenantUser).where(
             storage.TenantUser.tenant_id == tenant_id,
             storage.TenantUser.is_active.is_(True),
-            storage.TenantUser.daily_digest.is_(True) if kind == "daily" else
-            storage.TenantUser.weekly_digest.is_(True),
+            storage.TenantUser.daily_digest.is_(True)
+            if kind == "daily"
+            else storage.TenantUser.weekly_digest.is_(True),
         )
     ).all()
     if not users:
@@ -254,7 +257,7 @@ def _render_single_event_email(event: storage.AlertEvent) -> str:
     </td></tr>
     {_format_event_html(event)}
     <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
-      Открой <a href="{os.environ.get('PHARMACY_PUBLIC_URL', '')}/alerts" style="color:#3b82f6;">дашборд</a>
+      Открой <a href="{os.environ.get("PHARMACY_PUBLIC_URL", "")}/alerts" style="color:#3b82f6;">дашборд</a>
       чтобы увидеть полный список и историю.
     </td></tr>
   </table>

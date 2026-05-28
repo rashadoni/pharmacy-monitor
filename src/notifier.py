@@ -30,9 +30,7 @@ log = structlog.get_logger()
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
-def send_telegram_message(
-    chat_id: str | int, text: str, parse_mode: str = "Markdown"
-) -> bool:
+def send_telegram_message(chat_id: str | int, text: str, parse_mode: str = "Markdown") -> bool:
     """Отправить Telegram-сообщение. Возвращает True если ok=true."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:

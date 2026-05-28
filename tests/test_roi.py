@@ -30,9 +30,7 @@ def _make_run(s, products_with_prices: list[tuple[Product, float]]) -> Run:
     return r
 
 
-def _make_cluster(
-    s, name: str, sites_prices: dict[str, float], run: Run | None = None
-) -> Match:
+def _make_cluster(s, name: str, sites_prices: dict[str, float], run: Run | None = None) -> Match:
     """Создать Match-кластер; если run передан — все snapshots привязываются к нему."""
     m = Match(canonical_name=name, confidence=1.0)
     s.add(m)
@@ -63,7 +61,8 @@ def _shared_run(s) -> Run:
 def test_price_raise_when_client_cheaper(db_session):
     """Клиент дешевле — должна быть price_raise opportunity."""
     _make_cluster(
-        db_session, "Aspirin",
+        db_session,
+        "Aspirin",
         {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
     )
     actions = roi.compute_actions(db_session)
@@ -81,7 +80,8 @@ def test_price_raise_when_client_cheaper(db_session):
 
 def test_undercut_when_competitor_cheaper(db_session):
     _make_cluster(
-        db_session, "Paracetamol",
+        db_session,
+        "Paracetamol",
         {"pharmonline": 10.00, "aptekonline": 7.00, "aloe": 9.00},
     )
     actions = roi.compute_actions(db_session)
@@ -99,7 +99,8 @@ def test_undercut_when_competitor_cheaper(db_session):
 
 def test_undercut_severity_critical_when_drop_over_10pct(db_session):
     _make_cluster(
-        db_session, "BigDrop",
+        db_session,
+        "BigDrop",
         {"pharmonline": 100.00, "aptekonline": 80.00, "aloe": 90.00},
     )
     actions = roi.compute_actions(db_session)
@@ -110,12 +111,11 @@ def test_undercut_severity_critical_when_drop_over_10pct(db_session):
 def test_no_actions_when_prices_close(db_session):
     """Если разница меньше threshold — никаких действий не предлагаем."""
     _make_cluster(
-        db_session, "Equal",
+        db_session,
+        "Equal",
         {"pharmonline": 10.00, "aptekonline": 10.10, "aloe": 9.95},
     )
-    actions = roi.compute_actions(
-        db_session, raise_threshold_pct=5.0, undercut_threshold_pct=3.0
-    )
+    actions = roi.compute_actions(db_session, raise_threshold_pct=5.0, undercut_threshold_pct=3.0)
     assert all(a.type not in ("price_raise", "undercut") for a in actions)
 
 
@@ -136,10 +136,14 @@ def test_promo_response_action(db_session):
     run = Run(started_at=utcnow(), status="ok")
     db_session.add(run)
     db_session.flush()
-    db_session.add(Promo(
-        run_id=run.id, site="aloe", title="Big Sale 30%",
-        landing_url="http://aloe.az/promo",
-    ))
+    db_session.add(
+        Promo(
+            run_id=run.id,
+            site="aloe",
+            title="Big Sale 30%",
+            landing_url="http://aloe.az/promo",
+        )
+    )
     db_session.commit()
 
     actions = roi.compute_actions(db_session)
@@ -151,12 +155,14 @@ def test_promo_response_action(db_session):
 def test_aggregate_impact_separates_opportunity_and_loss(db_session):
     run = _shared_run(db_session)
     _make_cluster(
-        db_session, "RaiseUp",
+        db_session,
+        "RaiseUp",
         {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
         run=run,
     )
     _make_cluster(
-        db_session, "DropDown",
+        db_session,
+        "DropDown",
         {"pharmonline": 10.00, "aptekonline": 7.00, "aloe": 9.00},
         run=run,
     )
@@ -169,12 +175,14 @@ def test_aggregate_impact_separates_opportunity_and_loss(db_session):
 def test_actions_sorted_by_severity_then_impact(db_session):
     run = _shared_run(db_session)
     _make_cluster(
-        db_session, "BigUndercut",
+        db_session,
+        "BigUndercut",
         {"pharmonline": 100.00, "aptekonline": 80.00, "aloe": 100.00},
         run=run,
     )
     _make_cluster(
-        db_session, "RaiseSmall",
+        db_session,
+        "RaiseSmall",
         {"pharmonline": 5.00, "aptekonline": 6.00, "aloe": 5.50},
         run=run,
     )
@@ -191,7 +199,8 @@ def test_compute_actions_for_aloe_client_inverts_perspective(db_session):
     Раньше (hardcoded pharmonline) для этого же сценария был бы undercut.
     """
     _make_cluster(
-        db_session, "ChepAloe",
+        db_session,
+        "ChepAloe",
         {"pharmonline": 12.00, "aptekonline": 11.00, "aloe": 8.00},
     )
     actions = roi.compute_actions(db_session, client_site="aloe")
@@ -205,7 +214,8 @@ def test_compute_actions_for_aloe_client_inverts_perspective(db_session):
 def test_compute_actions_aloe_undercut_when_competitor_cheaper(db_session):
     """С перспективы aloe: если pharmonline/apt дешевле — это undercut для aloe."""
     _make_cluster(
-        db_session, "DearAloe",
+        db_session,
+        "DearAloe",
         {"pharmonline": 5.00, "aptekonline": 6.00, "aloe": 10.00},
     )
     actions = roi.compute_actions(db_session, client_site="aloe")
@@ -219,17 +229,15 @@ def test_compute_actions_aloe_undercut_when_competitor_cheaper(db_session):
 def test_compute_actions_default_pharmonline_unchanged(db_session):
     """Без параметра client_site дефолт pharmonline — backwards-compat."""
     _make_cluster(
-        db_session, "Default",
+        db_session,
+        "Default",
         {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
     )
     actions_default = roi.compute_actions(db_session)
     actions_explicit = roi.compute_actions(db_session, client_site="pharmonline")
     assert len(actions_default) == len(actions_explicit)
     # Снимем поля которые могут отличаться по ссылке — типов одинаковое
-    assert (
-        sorted(a.type for a in actions_default)
-        == sorted(a.type for a in actions_explicit)
-    )
+    assert sorted(a.type for a in actions_default) == sorted(a.type for a in actions_explicit)
 
 
 def test_compute_actions_aloe_assortment_gap_excludes_aloe_products(db_session):
@@ -253,7 +261,8 @@ def test_compute_actions_aloe_assortment_gap_excludes_aloe_products(db_session):
 def test_cache_actions_round_trip(db_session):
     """compute_actions → cache_actions → get_cached_actions возвращает payload."""
     _make_cluster(
-        db_session, "Aspirin",
+        db_session,
+        "Aspirin",
         {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
     )
     actions = roi.compute_actions(db_session, client_site="pharmonline")
@@ -292,10 +301,7 @@ def test_get_cached_actions_returns_none_when_stale(db_session):
 
     assert roi.get_cached_actions(db_session, "pharmonline") is None
     # Но если повысить порог — возвращается
-    assert (
-        roi.get_cached_actions(db_session, "pharmonline", max_age_hours=72)
-        is not None
-    )
+    assert roi.get_cached_actions(db_session, "pharmonline", max_age_hours=72) is not None
 
 
 def test_cache_actions_upserts_existing(db_session):
@@ -303,7 +309,8 @@ def test_cache_actions_upserts_existing(db_session):
     from src.storage import RoiActionsCache
 
     _make_cluster(
-        db_session, "Aspirin",
+        db_session,
+        "Aspirin",
         {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
     )
     actions = roi.compute_actions(db_session, client_site="pharmonline")
@@ -321,7 +328,8 @@ def test_refresh_all_cached_actions_covers_three_sites(db_session):
     from src.storage import RoiActionsCache
 
     _make_cluster(
-        db_session, "Aspirin",
+        db_session,
+        "Aspirin",
         {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
     )
 
@@ -353,9 +361,7 @@ def _add_product_with_brand(s, site, name, brand, ext_id, canonical_id=None):
 def _add_brand_snapshots(s, run, products_with_prices):
     """Adds N snapshots for product-price pairs."""
     for product, price in products_with_prices:
-        s.add(PriceSnapshot(
-            run_id=run.id, product_id=product.id, price=price
-        ))
+        s.add(PriceSnapshot(run_id=run.id, product_id=product.id, price=price))
     s.flush()
 
 
@@ -370,7 +376,9 @@ def test_map_violation_detected_when_client_below_brand_floor(db_session):
     db_session.flush()
 
     # Client (pharmonline) — 7.00 ₼ — это 30% ниже floor 10.00
-    client = _add_product_with_brand(db_session, "pharmonline", "Aspirin Bayer 100", "Bayer", "ph-1")
+    client = _add_product_with_brand(
+        db_session, "pharmonline", "Aspirin Bayer 100", "Bayer", "ph-1"
+    )
     db_session.add(PriceSnapshot(run_id=r.id, product_id=client.id, price=7.00))
     db_session.commit()
 
@@ -388,13 +396,15 @@ def test_map_violation_severity_buckets(db_session):
     """Three buckets: critical >= 20%, warning >= 10%, info >= 5%."""
     r = _shared_run(db_session)
     # Three brands with floor 10.00, three client products at different gaps
-    for i, (brand, client_price, expected_sev) in enumerate([
-        ("BrandA", 7.50,  "critical"),  # 25% below
-        ("BrandB", 8.80,  "warning"),   # 12% below
-        ("BrandC", 9.50,  "info"),      # 5% below
-    ]):
+    for i, (brand, client_price, expected_sev) in enumerate(
+        [
+            ("BrandA", 7.50, "critical"),  # 25% below
+            ("BrandB", 8.80, "warning"),  # 12% below
+            ("BrandC", 9.50, "info"),  # 5% below
+        ]
+    ):
         comp_a = _add_product_with_brand(db_session, "aptekonline", f"P{i}-{brand}", brand, f"a{i}")
-        comp_b = _add_product_with_brand(db_session, "aloe",        f"P{i}-{brand}", brand, f"b{i}")
+        comp_b = _add_product_with_brand(db_session, "aloe", f"P{i}-{brand}", brand, f"b{i}")
         client = _add_product_with_brand(db_session, "pharmonline", f"P{i}-{brand}", brand, f"c{i}")
         # 3 snapshots — нужны для валидного floor (n >= 3 в _map_violations)
         for p, price in [(comp_a, 10.00), (comp_b, 10.50), (comp_a, 11.00), (client, client_price)]:
@@ -403,7 +413,9 @@ def test_map_violation_severity_buckets(db_session):
     db_session.commit()
 
     actions = roi.compute_actions(db_session)
-    by_brand = {(a.extra or {}).get("brand"): a.severity for a in actions if a.type == "map_violation"}
+    by_brand = {
+        (a.extra or {}).get("brand"): a.severity for a in actions if a.type == "map_violation"
+    }
     assert by_brand.get("BrandA") == "critical", f"got: {by_brand}"
     assert by_brand.get("BrandB") == "warning", f"got: {by_brand}"
     assert by_brand.get("BrandC") == "info", f"got: {by_brand}"
@@ -413,10 +425,15 @@ def test_map_violation_skipped_when_client_above_floor(db_session):
     """Client >= floor → нет нарушения (это price_raise зона)."""
     apt = _add_product_with_brand(db_session, "aptekonline", "X", "BrandX", "a1")
     client = _add_product_with_brand(db_session, "pharmonline", "X", "BrandX", "c1")
-    r = _make_run(db_session, [
-        (apt, 5.00), (apt, 5.20), (apt, 5.50),  # floor = 5.00
-        (client, 6.00),  # выше floor — НЕ нарушение
-    ])
+    r = _make_run(
+        db_session,
+        [
+            (apt, 5.00),
+            (apt, 5.20),
+            (apt, 5.50),  # floor = 5.00
+            (client, 6.00),  # выше floor — НЕ нарушение
+        ],
+    )
     db_session.commit()
 
     actions = roi.compute_actions(db_session)
@@ -427,10 +444,13 @@ def test_map_violation_skipped_when_insufficient_samples(db_session):
     """Меньше 3 snapshot-семплов для бренда — floor не статистически валиден."""
     apt = _add_product_with_brand(db_session, "aptekonline", "X", "RareBrand", "a1")
     client = _add_product_with_brand(db_session, "pharmonline", "X", "RareBrand", "c1")
-    r = _make_run(db_session, [
-        (apt, 10.00),  # только 1 семпл бренда у конкурентов
-        (client, 5.00),  # 50% gap, но floor невалидный
-    ])
+    r = _make_run(
+        db_session,
+        [
+            (apt, 10.00),  # только 1 семпл бренда у конкурентов
+            (client, 5.00),  # 50% gap, но floor невалидный
+        ],
+    )
     db_session.commit()
 
     actions = roi.compute_actions(db_session)
@@ -441,10 +461,15 @@ def test_map_violation_translation_az_en(db_session):
     """translate_action заменяет title/detail для az/en на map_violation."""
     apt = _add_product_with_brand(db_session, "aptekonline", "Z", "TestBrand", "a1")
     client = _add_product_with_brand(db_session, "pharmonline", "Z", "TestBrand", "c1")
-    r = _make_run(db_session, [
-        (apt, 10.00), (apt, 11.00), (apt, 10.50),  # 3 семпла, floor = 10
-        (client, 7.00),  # 30% gap → critical
-    ])
+    r = _make_run(
+        db_session,
+        [
+            (apt, 10.00),
+            (apt, 11.00),
+            (apt, 10.50),  # 3 семпла, floor = 10
+            (client, 7.00),  # 30% gap → critical
+        ],
+    )
     db_session.commit()
 
     actions = roi.compute_actions(db_session)

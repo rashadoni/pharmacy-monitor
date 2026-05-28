@@ -8,6 +8,7 @@
 
 Использование результата: см. scripts/load_categories_from_map.py
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -42,12 +43,14 @@ async def discover_pharmonline() -> list[dict]:
             if slug in seen or not slug:
                 continue
             seen.add(slug)
-            out.append({
-                "site": "pharmonline",
-                "slug": slug,
-                "name": text or slug,
-                "source_url": href,
-            })
+            out.append(
+                {
+                    "site": "pharmonline",
+                    "slug": slug,
+                    "name": text or slug,
+                    "source_url": href,
+                }
+            )
         await browser.close()
     return out
 
@@ -74,12 +77,14 @@ async def discover_aptekonline() -> list[dict]:
             if len(slug) > 60 or slug in seen:
                 continue
             seen.add(slug)
-            out.append({
-                "site": "aptekonline",
-                "slug": slug,
-                "name": text or slug,
-                "source_url": href,
-            })
+            out.append(
+                {
+                    "site": "aptekonline",
+                    "slug": slug,
+                    "name": text or slug,
+                    "source_url": href,
+                }
+            )
         await browser.close()
     return out
 
@@ -118,12 +123,14 @@ async def discover_aloe() -> list[dict]:
             if not slug or len(slug) > 80 or slug in seen:
                 continue
             seen.add(slug)
-            out.append({
-                "site": "aloe",
-                "slug": slug,
-                "name": text or slug,
-                "source_url": href,
-            })
+            out.append(
+                {
+                    "site": "aloe",
+                    "slug": slug,
+                    "name": text or slug,
+                    "source_url": href,
+                }
+            )
         await browser.close()
     return out
 

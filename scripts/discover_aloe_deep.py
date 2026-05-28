@@ -4,6 +4,7 @@
 Aloe.az имеет structure: /category/<slug> с side-bar навигацией.
 Внутри страницы категории есть фильтры/sub-categories (тоже /category/<slug>).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -53,13 +54,15 @@ async def discover_subcategories(top_slug: str, page) -> list[dict]:
             if not slug or len(slug) > 100 or slug in seen or slug in TOP_CATEGORIES:
                 continue
             seen.add(slug)
-            out.append({
-                "site": "aloe",
-                "slug": slug,
-                "name": text or slug,
-                "source_url": href,
-                "parent": top_slug,
-            })
+            out.append(
+                {
+                    "site": "aloe",
+                    "slug": slug,
+                    "name": text or slug,
+                    "source_url": href,
+                    "parent": top_slug,
+                }
+            )
     except Exception as e:
         print(f"    ERROR: {e}")
     return out

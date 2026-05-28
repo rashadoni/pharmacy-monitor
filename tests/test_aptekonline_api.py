@@ -56,13 +56,12 @@ def _mock_httpx_client(payload: dict | list[dict] | None = None, status: int = 2
 
     return patch.object(httpx.AsyncClient, "__init__", patched_init), call_count
 
+
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _load_fixture() -> dict:
-    return json.loads(
-        (FIXTURES / "aptekonline_api_response.json").read_text(encoding="utf-8")
-    )
+    return json.loads((FIXTURES / "aptekonline_api_response.json").read_text(encoding="utf-8"))
 
 
 # ─── _build_product_from_api ────────────────────────────────────────────────
@@ -73,9 +72,7 @@ def test_build_product_basic_fields():
     item = payload["data"][0]
     thumb = payload["thumb_folder"]
 
-    product = _build_product_from_api(
-        item, "114", thumb, "https://www.aptekonline.az"
-    )
+    product = _build_product_from_api(item, "114", thumb, "https://www.aptekonline.az")
 
     assert product is not None
     assert product.site == "aptekonline"
@@ -130,9 +127,14 @@ def test_build_product_handles_active_discount():
 def test_build_product_skips_invalid_discount_price_higher_than_price():
     """API иногда отдаёт discount_price >= price (мусор) — игнорируем."""
     item = {
-        "url_id": "X-3", "name": "X", "price": 5.0,
-        "discount_price": 10.0, "thumb1": None, "olke": None,
-        "terkib": None, "cashback_percent": None,
+        "url_id": "X-3",
+        "name": "X",
+        "price": 5.0,
+        "discount_price": 10.0,
+        "thumb1": None,
+        "olke": None,
+        "terkib": None,
+        "cashback_percent": None,
     }
     product = _build_product_from_api(item, "1", "", "https://x.az")
     assert product is not None
@@ -148,9 +150,14 @@ def test_build_product_returns_none_without_url_id_or_name():
 
 def test_build_product_promo_label_from_cashback_percent():
     item = {
-        "url_id": "X-4", "name": "X", "price": 10.0,
-        "discount_price": None, "thumb1": None, "olke": None,
-        "terkib": None, "cashback_percent": 5,
+        "url_id": "X-4",
+        "name": "X",
+        "price": 10.0,
+        "discount_price": None,
+        "thumb1": None,
+        "olke": None,
+        "terkib": None,
+        "cashback_percent": 5,
     }
     product = _build_product_from_api(item, "1", "", "https://x.az")
     assert product is not None
@@ -160,9 +167,14 @@ def test_build_product_promo_label_from_cashback_percent():
 def test_build_product_handles_string_prices():
     """Иногда API отдаёт цены как строки — должны парситься."""
     item = {
-        "url_id": "X-5", "name": "X", "price": "10.50",
-        "discount_price": "8.25", "thumb1": None, "olke": None,
-        "terkib": None, "cashback_percent": None,
+        "url_id": "X-5",
+        "name": "X",
+        "price": "10.50",
+        "discount_price": "8.25",
+        "thumb1": None,
+        "olke": None,
+        "terkib": None,
+        "cashback_percent": None,
     }
     product = _build_product_from_api(item, "1", "", "https://x.az")
     assert product is not None
@@ -269,8 +281,13 @@ def test_checkus_fails_fast_on_whitespace_only_env(monkeypatch):
 
 
 def _clear_brightdata(mp):
-    for k in ("BRIGHTDATA_USERNAME", "BRIGHTDATA_PASSWORD", "BRIGHTDATA_SITES",
-              "BRIGHTDATA_HOST", "BRIGHTDATA_COUNTRY"):
+    for k in (
+        "BRIGHTDATA_USERNAME",
+        "BRIGHTDATA_PASSWORD",
+        "BRIGHTDATA_SITES",
+        "BRIGHTDATA_HOST",
+        "BRIGHTDATA_COUNTRY",
+    ):
         mp.delenv(k, raising=False)
 
 
@@ -311,8 +328,13 @@ def test_brightdata_httpx_proxy_appends_country(monkeypatch):
 
 
 def _clear_iproyal(mp):
-    for k in ("IPROYAL_USERNAME", "IPROYAL_PASSWORD", "IPROYAL_SITES",
-              "IPROYAL_HOST", "IPROYAL_COUNTRY"):
+    for k in (
+        "IPROYAL_USERNAME",
+        "IPROYAL_PASSWORD",
+        "IPROYAL_SITES",
+        "IPROYAL_HOST",
+        "IPROYAL_COUNTRY",
+    ):
         mp.delenv(k, raising=False)
 
 

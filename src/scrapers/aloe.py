@@ -45,15 +45,24 @@ log = structlog.get_logger()
 # ─── Azeri → ASCII transliteration (Task #33, 2026-05-28) ────────────────────
 # Aloe.az генерирует URL slug из product name по этим правилам.
 # Verified via Playwright MCP click-navigation на 3 products.
-_AZERI_TO_ASCII = str.maketrans({
-    "ə": "e", "Ə": "e",
-    "ı": "i", "İ": "i",  # dotless + dotted I
-    "ö": "o", "Ö": "o",
-    "ü": "u", "Ü": "u",
-    "ş": "s", "Ş": "s",
-    "ç": "c", "Ç": "c",
-    "ğ": "g", "Ğ": "g",
-})
+_AZERI_TO_ASCII = str.maketrans(
+    {
+        "ə": "e",
+        "Ə": "e",
+        "ı": "i",
+        "İ": "i",  # dotless + dotted I
+        "ö": "o",
+        "Ö": "o",
+        "ü": "u",
+        "Ü": "u",
+        "ş": "s",
+        "Ş": "s",
+        "ç": "c",
+        "Ç": "c",
+        "ğ": "g",
+        "Ğ": "g",
+    }
+)
 
 # Punctuation которая удаляется БЕЗ замены (12,5 → 125, не 12-5).
 _PUNCT_REMOVE_RE = re.compile(r"[,/.%()\[\]'\"!?:;«»“”]+")
@@ -124,7 +133,9 @@ class AloeScraper(BaseScraper):
                 total_cards_found += len(cards)
                 log.info(
                     "aloe_cards_found",
-                    category=category_slug, page=page_num, count=len(cards),
+                    category=category_slug,
+                    page=page_num,
+                    count=len(cards),
                 )
 
                 for card in cards:
@@ -158,7 +169,8 @@ class AloeScraper(BaseScraper):
             if page_yielded == 0:
                 log.info(
                     "aloe_pagination_done",
-                    category=category_slug, pages=page_num,
+                    category=category_slug,
+                    pages=page_num,
                     total_cards_found=total_cards_found,
                     total_yielded=yielded,
                     total_card_failures=total_card_failures,
@@ -170,7 +182,7 @@ class AloeScraper(BaseScraper):
         same_streak = 0
         for _ in range(max_iterations):
             count = await page.evaluate(
-                'document.querySelectorAll(\'[class*="productCardWrapper"]\').length'
+                "document.querySelectorAll('[class*=\"productCardWrapper\"]').length"
             )
             if count == prev_count:
                 same_streak += 1
@@ -198,17 +210,13 @@ class AloeScraper(BaseScraper):
         brand = (await brand_handle.inner_text()).strip() if brand_handle else None
 
         # цена
-        price_handle = await card.query_selector(
-            '[class*="priceWrapper"] [class*="style_price"]'
-        )
+        price_handle = await card.query_selector('[class*="priceWrapper"] [class*="style_price"]')
         if not price_handle:
             price_handle = await card.query_selector('[class*="price"]:not([class*="old"])')
         price_text = await price_handle.inner_text() if price_handle else None
         price = parse_price(price_text)
 
-        old_price_handle = await card.query_selector(
-            '[class*="oldPriceText"], [class*="oldPrice"]'
-        )
+        old_price_handle = await card.query_selector('[class*="oldPriceText"], [class*="oldPrice"]')
         old_price_text = await old_price_handle.inner_text() if old_price_handle else None
         old_price = parse_price(old_price_text)
 
@@ -282,13 +290,9 @@ class AloeScraper(BaseScraper):
             )
             price = parse_price(await price_handle.inner_text()) if price_handle else None
 
-            old_price_handle = await page.query_selector(
-                '[class*="oldPrice"], [class*="OldPrice"]'
-            )
+            old_price_handle = await page.query_selector('[class*="oldPrice"], [class*="OldPrice"]')
             old_price = (
-                parse_price(await old_price_handle.inner_text())
-                if old_price_handle
-                else None
+                parse_price(await old_price_handle.inner_text()) if old_price_handle else None
             )
 
             is_on_sale = old_price is not None and price is not None and old_price > price

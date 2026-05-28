@@ -81,9 +81,7 @@ def rematch(apply: bool, confidence_cutoff: float) -> int:
             if not _cluster_barcodes_disagree(products):
                 continue
 
-            barcodes_pretty = sorted({
-                (p.site, p.barcode) for p in products if p.barcode
-            })
+            barcodes_pretty = sorted({(p.site, p.barcode) for p in products if p.barcode})
             print(
                 f"  match_id={m.id} conf={m.confidence:.2f} "
                 f"name={m.canonical_name!r} barcodes={barcodes_pretty}"
@@ -106,7 +104,9 @@ def rematch(apply: bool, confidence_cutoff: float) -> int:
                     if p.site == q.site:
                         continue
                     match_actions.add_rejection(
-                        db, p.id, q.id,
+                        db,
+                        p.id,
+                        q.id,
                         reason=f"rematch_v2: barcode disagree (pre={m.confidence:.2f})",
                     )
             db.delete(m)
@@ -129,7 +129,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--apply", action="store_true", help="Commit changes (default: dry-run)")
     p.add_argument(
-        "--confidence-cutoff", type=float, default=0.85,
+        "--confidence-cutoff",
+        type=float,
+        default=0.85,
         help="Only consider matches with confidence < this (default 0.85)",
     )
     args = p.parse_args()

@@ -18,6 +18,7 @@ Strategy:
 
 Order matters: parents before children (FKs).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,19 +34,19 @@ INSERT_ORDER = [
     "tenants",
     "tenant_users",
     "matches",
-    "products",            # FK matches
+    "products",  # FK matches
     "runs",
-    "price_snapshots",     # FK runs, products
+    "price_snapshots",  # FK runs, products
     "categories",
     "recipients",
     "promos",
     "alert_rules",
-    "alert_events",        # FK alert_rules
+    "alert_events",  # FK alert_rules
     "tracked_products",
     "tracked_product_links",  # FK tracked_products
-    "match_rejections",    # FK products
-    "stock_levels",        # FK products, matches
-    "supplier_prices",     # FK products, matches
+    "match_rejections",  # FK products
+    "stock_levels",  # FK products, matches
+    "supplier_prices",  # FK products, matches
     "saved_views",
 ]
 
@@ -146,9 +147,7 @@ def main() -> int:
                 stmt = stmt.on_conflict_do_nothing(index_elements=pk_cols)
                 dst_session.execute(stmt)
             dst_session.commit()
-            inserted = dst_session.execute(
-                select(func.count()).select_from(dst_tbl)
-            ).scalar()
+            inserted = dst_session.execute(select(func.count()).select_from(dst_tbl)).scalar()
             total_dst += inserted
             print(f"  [migrate] {tbl_name:25s} src={src_count:>6} → dst={inserted:>6}")
 
@@ -166,9 +165,7 @@ def main() -> int:
                 # Check if sequence exists (Postgres autoincrement uses sequences)
                 with dst_engine.connect() as conn:
                     res = conn.execute(
-                        text(
-                            "SELECT 1 FROM pg_class WHERE relkind='S' AND relname=:n"
-                        ),
+                        text("SELECT 1 FROM pg_class WHERE relkind='S' AND relname=:n"),
                         {"n": seq_name},
                     ).scalar()
                     if res:

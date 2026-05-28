@@ -64,8 +64,7 @@ def _parse_csv(path: Path) -> list[CleanupRow]:
         missing = required - set(reader.fieldnames or [])
         if missing:
             raise ValueError(
-                f"CSV missing required columns: {sorted(missing)}. "
-                f"Header was: {reader.fieldnames}"
+                f"CSV missing required columns: {sorted(missing)}. Header was: {reader.fieldnames}"
             )
         for i, raw in enumerate(reader, start=2):  # line 1 = header
             try:

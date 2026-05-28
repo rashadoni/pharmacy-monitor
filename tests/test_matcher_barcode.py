@@ -21,7 +21,12 @@ from src.match_actions import add_rejection  # noqa: E402
 
 
 def _make_product(
-    db, site: str, name: str, *, barcode: str | None = None, ext: str | None = None,
+    db,
+    site: str,
+    name: str,
+    *,
+    barcode: str | None = None,
+    ext: str | None = None,
     brand: str | None = None,
 ) -> storage.Product:
     p = storage.Product(
@@ -130,10 +135,12 @@ def test_barcode_match_bypasses_name_conflict(db_session):
     a pharma modifier. But if both ship with same barcode (manufacturer made
     same package, just labelled differently per market) → still match.
     """
-    a = _make_product(db_session, "pharmonline", "Lopril 10mg", barcode="5712345678901",
-                       brand="Lopril")
-    b = _make_product(db_session, "aptekonline", "Lopril H 10mg", barcode="5712345678901",
-                       brand="Lopril")
+    a = _make_product(
+        db_session, "pharmonline", "Lopril 10mg", barcode="5712345678901", brand="Lopril"
+    )
+    b = _make_product(
+        db_session, "aptekonline", "Lopril H 10mg", barcode="5712345678901", brand="Lopril"
+    )
     db_session.commit()
 
     matcher.match_products(db_session)

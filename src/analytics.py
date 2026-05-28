@@ -39,9 +39,7 @@ class BrandRow:
     exclusive_to: str | None  # site если бренд только у одного, иначе None
 
 
-def brand_share(
-    session: Session, *, run_id: int | None = None, top_n: int = 30
-) -> list[BrandRow]:
+def brand_share(session: Session, *, run_id: int | None = None, top_n: int = 30) -> list[BrandRow]:
     """Сводка: каких брендов сколько на каждом сайте.
 
     Возвращает список отсортированный по `total` desc, ограниченный top_n.
@@ -81,10 +79,15 @@ def brand_share(
         exclusive = None
         if sites_with == 1:
             exclusive = next(s for s, v in counts.items() if v > 0)
-        out.append(BrandRow(
-            brand=brand, counts=dict(counts), total=total,
-            sites_with_brand=sites_with, exclusive_to=exclusive,
-        ))
+        out.append(
+            BrandRow(
+                brand=brand,
+                counts=dict(counts),
+                total=total,
+                sites_with_brand=sites_with,
+                exclusive_to=exclusive,
+            )
+        )
     out.sort(key=lambda b: -b.total)
     return out[:top_n]
 
@@ -99,17 +102,13 @@ class PromoStats:
     days_active: int
 
 
-def promo_history(
-    session: Session, *, days: int = 30
-) -> list[PromoStats]:
+def promo_history(session: Session, *, days: int = 30) -> list[PromoStats]:
     """История промо-кампаний за последние N дней.
 
     Группирует по (site, title), вычисляет first/last seen и длительность.
     """
     cutoff = utcnow() - timedelta(days=days)
-    promos = session.scalars(
-        select(Promo).where(Promo.captured_at >= cutoff)
-    ).all()
+    promos = session.scalars(select(Promo).where(Promo.captured_at >= cutoff)).all()
 
     grouped: dict[tuple[str, str], list[Promo]] = defaultdict(list)
     for p in promos:
@@ -121,12 +120,16 @@ def promo_history(
         first = items[0].captured_at
         last = items[-1].captured_at
         days_active = max(1, (last - first).days + 1)
-        out.append(PromoStats(
-            site=site, title=title,
-            landing_url=items[0].landing_url,
-            first_seen=first, last_seen=last,
-            days_active=days_active,
-        ))
+        out.append(
+            PromoStats(
+                site=site,
+                title=title,
+                landing_url=items[0].landing_url,
+                first_seen=first,
+                last_seen=last,
+                days_active=days_active,
+            )
+        )
     out.sort(key=lambda p: -p.days_active)
     return out
 
@@ -146,7 +149,8 @@ def assortment_overlap(session: Session) -> AssortmentOverlap:
     )
     if run_id is None:
         return AssortmentOverlap(
-            matched_count=0, only_client=0,
+            matched_count=0,
+            only_client=0,
             only_competitor_count={s: 0 for s in COMPETITOR_SITES},
             coverage_pct=0.0,
         )
@@ -156,35 +160,44 @@ def assortment_overlap(session: Session) -> AssortmentOverlap:
     matched_count = len(matches)
 
     # Клиентские товары без canonical_id (эксклюзив клиента)
-    only_client = session.scalar(
-        select(func.count(Product.id))
-        .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
-        .where(
-            PriceSnapshot.run_id == run_id,
-            Product.site == CLIENT_SITE,
-            Product.canonical_id.is_(None),
-        )
-    ) or 0
-
-    # Эксклюзив каждого конкурента
-    only_comp: dict[str, int] = {}
-    for site in COMPETITOR_SITES:
-        only_comp[site] = session.scalar(
+    only_client = (
+        session.scalar(
             select(func.count(Product.id))
             .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
             .where(
                 PriceSnapshot.run_id == run_id,
-                Product.site == site,
+                Product.site == CLIENT_SITE,
                 Product.canonical_id.is_(None),
             )
-        ) or 0
+        )
+        or 0
+    )
+
+    # Эксклюзив каждого конкурента
+    only_comp: dict[str, int] = {}
+    for site in COMPETITOR_SITES:
+        only_comp[site] = (
+            session.scalar(
+                select(func.count(Product.id))
+                .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
+                .where(
+                    PriceSnapshot.run_id == run_id,
+                    Product.site == site,
+                    Product.canonical_id.is_(None),
+                )
+            )
+            or 0
+        )
 
     # Coverage: client matched / total client
-    total_client = session.scalar(
-        select(func.count(Product.id))
-        .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
-        .where(PriceSnapshot.run_id == run_id, Product.site == CLIENT_SITE)
-    ) or 0
+    total_client = (
+        session.scalar(
+            select(func.count(Product.id))
+            .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
+            .where(PriceSnapshot.run_id == run_id, Product.site == CLIENT_SITE)
+        )
+        or 0
+    )
     matched_client = total_client - only_client
     coverage_pct = (matched_client / total_client * 100) if total_client else 0.0
 
@@ -199,6 +212,7 @@ def assortment_overlap(session: Session) -> AssortmentOverlap:
 @dataclass
 class PriceIndex:
     """Ценовой индекс клиента vs конкурентов по категории."""
+
     category: str
     avg_client_price: float
     avg_competitor_price: float
@@ -225,16 +239,16 @@ def match_quality(session: Session) -> MatchQuality:
     from src.storage import Match, MatchRejection
 
     total_matches = session.scalar(select(func.count(Match.id))) or 0
-    manual_matches = session.scalar(
-        select(func.count(Match.id)).where(Match.is_manual.is_(True))
-    ) or 0
+    manual_matches = (
+        session.scalar(select(func.count(Match.id)).where(Match.is_manual.is_(True))) or 0
+    )
     auto_matches = total_matches - manual_matches
     rejected = session.scalar(select(func.count(MatchRejection.id))) or 0
 
     products_total = session.scalar(select(func.count(Product.id))) or 0
-    products_matched = session.scalar(
-        select(func.count(Product.id)).where(Product.canonical_id.is_not(None))
-    ) or 0
+    products_matched = (
+        session.scalar(select(func.count(Product.id)).where(Product.canonical_id.is_not(None))) or 0
+    )
     coverage = (products_matched / products_total * 100) if products_total else 0.0
     manual_pct = (manual_matches / total_matches * 100) if total_matches else 0.0
 
@@ -263,9 +277,8 @@ def price_index_by_category(session: Session) -> list[PriceIndex]:
 
     # Preload всех snapshots run'а одним SQL — устраняет N+1
     snaps_by_pid = {
-        s.product_id: s for s in session.scalars(
-            select(PriceSnapshot).where(PriceSnapshot.run_id == run_id)
-        ).all()
+        s.product_id: s
+        for s in session.scalars(select(PriceSnapshot).where(PriceSnapshot.run_id == run_id)).all()
     }
 
     matches = session.scalars(select(Match)).all()
@@ -308,12 +321,14 @@ def price_index_by_category(session: Session) -> list[PriceIndex]:
         avg_c = sum(prices["client"]) / len(prices["client"])
         avg_comp = sum(prices["competitor"]) / len(prices["competitor"])
         idx = (avg_c / avg_comp * 100) if avg_comp else 100.0
-        out.append(PriceIndex(
-            category=cat,
-            avg_client_price=round(avg_c, 2),
-            avg_competitor_price=round(avg_comp, 2),
-            index=round(idx, 1),
-            matched_skus=len(prices["client"]),
-        ))
+        out.append(
+            PriceIndex(
+                category=cat,
+                avg_client_price=round(avg_c, 2),
+                avg_competitor_price=round(avg_comp, 2),
+                index=round(idx, 1),
+                matched_skus=len(prices["client"]),
+            )
+        )
     out.sort(key=lambda x: -x.matched_skus)
     return out

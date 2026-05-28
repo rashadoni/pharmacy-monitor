@@ -37,8 +37,8 @@ _FORMS = (
     "amp",
     "drops",
     "damci",
-    "damcı",      # dotless-i (U+0131)
-    "damcısı",    # dotless-i variant with suffix
+    "damcı",  # dotless-i (U+0131)
+    "damcısı",  # dotless-i variant with suffix
     "kapli",
     "gel",
     "powder",
@@ -51,9 +51,9 @@ _FORMS = (
     "eye drops",
     "göz damcisi",
     # Azerbaijani plural / inflected forms (pharmonline adds these in parens)
-    "tabletlər",   # plural of "tablet" in AZ
+    "tabletlər",  # plural of "tablet" in AZ
     "tabletkalar",
-    "kapsullar",   # plural of "kapsul" in AZ
+    "kapsullar",  # plural of "kapsul" in AZ
     "kapsulalar",
     "kapsulları",
     "ampulalar",
@@ -66,11 +66,11 @@ _FORMS = (
     "şamlar",
     "dragee",
     "draje",
-    "ampoules",    # English plural (seen in aloe/pharmonline)
+    "ampoules",  # English plural (seen in aloe/pharmonline)
     "tablets",
     "capsules",
     "suppositories",  # English plural — pharmonline: «(Suppositories)»
-    "sorma",       # Azerbaijani "dissolving" — not a form per se but pharmonline uses it
+    "sorma",  # Azerbaijani "dissolving" — not a form per se but pharmonline uses it
 )
 
 _FORMS_RE = re.compile(r"\b(" + "|".join(_FORMS) + r")\b", re.IGNORECASE)
@@ -78,23 +78,50 @@ _FORMS_RE = re.compile(r"\b(" + "|".join(_FORMS) + r")\b", re.IGNORECASE)
 # Канонические группы форм выпуска: синонимы → одно имя.
 # Кремы ≠ мази ≠ капли ≠ спреи — это РАЗНЫЕ препараты, матчинг запрещён.
 _FORM_CANONICAL: dict[str, str] = {
-    "tablet": "tablet",   "tab": "tablet",       "tabletka": "tablet",
-    "kapsul": "capsule",  "capsule": "capsule",  "kaps": "capsule",
-    "krem": "cream",      "cream": "cream",
-    "məlhəm": "ointment", "ointment": "ointment", "maz": "ointment",
-    "spreyi": "spray",    "spray": "spray",       "sprey": "spray",
-    "drops": "drops",     "damci": "drops",       "kapli": "drops",
-    "damcı": "drops",     "damcısı": "drops",     # dotless-i (U+0131) варианты
-    "eye drops": "drops", "göz damcisi": "drops", "göz damcısı": "drops",
-    "məhlul": "solution", "solution": "solution", "raztvor": "solution",
+    "tablet": "tablet",
+    "tab": "tablet",
+    "tabletka": "tablet",
+    "kapsul": "capsule",
+    "capsule": "capsule",
+    "kaps": "capsule",
+    "krem": "cream",
+    "cream": "cream",
+    "məlhəm": "ointment",
+    "ointment": "ointment",
+    "maz": "ointment",
+    "spreyi": "spray",
+    "spray": "spray",
+    "sprey": "spray",
+    "drops": "drops",
+    "damci": "drops",
+    "kapli": "drops",
+    "damcı": "drops",
+    "damcısı": "drops",  # dotless-i (U+0131) варианты
+    "eye drops": "drops",
+    "göz damcisi": "drops",
+    "göz damcısı": "drops",
+    "məhlul": "solution",
+    "solution": "solution",
+    "raztvor": "solution",
     "gel": "gel",
-    "powder": "powder",   "poroshok": "powder",   "toz": "powder",
-    "suppoziter": "suppository", "suppository": "suppository", "suppositories": "suppository",
-    "svecha": "suppository",     "şam": "suppository",        "şamlar": "suppository",
-    "suppozitorlar": "suppository", "suppozitorları": "suppository",
-    "siropla": "syrup",   "syrup": "syrup",
-    "şərbət": "syrup",    "sirop": "syrup",
-    "ampul": "ampoule",   "ampoule": "ampoule",   "amp": "ampoule",
+    "powder": "powder",
+    "poroshok": "powder",
+    "toz": "powder",
+    "suppoziter": "suppository",
+    "suppository": "suppository",
+    "suppositories": "suppository",
+    "svecha": "suppository",
+    "şam": "suppository",
+    "şamlar": "suppository",
+    "suppozitorlar": "suppository",
+    "suppozitorları": "suppository",
+    "siropla": "syrup",
+    "syrup": "syrup",
+    "şərbət": "syrup",
+    "sirop": "syrup",
+    "ampul": "ampoule",
+    "ampoule": "ampoule",
+    "amp": "ampoule",
 }
 
 
@@ -115,6 +142,7 @@ def extract_form(name: str) -> str | None:
         return None
     token = m.group(1).lower()
     return _FORM_CANONICAL.get(token, token)
+
 
 # Числа с пробелами-разделителями тысяч: «1 000 000 BV», «500 000 BV».
 # _DOSAGE_RE ожидает непрерывную цифровую строку, поэтому перед применением
@@ -153,9 +181,9 @@ _DOSAGE_RE = re.compile(
 # возвращал «14kg» (вес РЕБЁНКА!), а N66 терялся → разные упаковки сливались
 # в один false match (match_id=447, 0.20 AZN ↔ 28.90 AZN).
 _PACK_COUNT_RE = re.compile(
-    r"\bN\s*(\d+)"                                                                   # N20, N 20 (ASCII N)
-    r"|№\s*(\d+)"                                                                    # №20 (Unicode № — \b не работает с non-word)
-    r"|(\d+)\s*(?:tab|tabletka|kapsul|capsules|kaps|şt|шт|adet|amp|pieces|əd)",      # 30 tab, 54 əd
+    r"\bN\s*(\d+)"  # N20, N 20 (ASCII N)
+    r"|№\s*(\d+)"  # №20 (Unicode № — \b не работает с non-word)
+    r"|(\d+)\s*(?:tab|tabletka|kapsul|capsules|kaps|şt|шт|adet|amp|pieces|əd)",  # 30 tab, 54 əd
     re.IGNORECASE,
 )
 # Vol unit list: ml, kg, kq, qr, qrm, q, gr, g. Используем lookahead вместо \b
@@ -232,39 +260,101 @@ _ROUTE_RE = re.compile(
 # Категория-префиксы (тип товара, не имя продукта). Их нужно убрать
 # из name_normalized чтобы fuzzy match не считал «Südlü qarışıq» общим
 # токеном для разных продуктов.
-_CATEGORY_PREFIXES = sorted([
-    # Baby food
-    "südlü qarışıq", "südlü qarisiq", "sudlu qarısıq", "sudlu qarisiq",
-    "südsüz sıyıq", "südsüz siyiq", "sudsuz sıyıq", "sudsuz siyiq",
-    "südlü sıyıq", "südlü siyiq", "sudlu sıyıq", "sudlu siyiq",
-    "uşaq qidası", "uşaq qidasi", "usaq qidası", "usaq qidasi",
-    "uşaq peçenyesi", "uşaq peçenye", "usaq pecenye",
-    "uşaq yeməyi", "usaq yeməyi",
-    "peçenye", "pecenye", "püre", "pure",
-    "su", "çay", "cay", "süd", "sud",
-    # Лек. формы как префикс — обычно «Tablet 'Brand' ...»
-    "tableti", "tabletkalar", "tabletka", "tablet",
-    "kapsulalar", "kapsulları", "kapsulalar",
-    "ampullar", "ampulalar", "ampulları", "ampul",
-    "şərbət", "şərbeti", "serbet", "şərbeti",
-    "məhlul", "mehlul", "mehlulu",
-    "krem", "kremi", "məlhəm", "məlhəmi", "melhem",
-    "gel", "geli",
-    "sirop", "sirup",
-    "suppozitorlar", "suppozitorları", "suppozitor",
-    "drops", "damla", "damlalar", "damcı", "damcısı",
-    # Косметика / гигиена
-    "şampun", "şampunu", "sampun",
-    "balzam", "balzamı",
-    "sabun", "sabunu",
-    "dezodorant", "dezodorantı",
-    "losyon", "losyonu",
-    "tonik", "tonikı",
-    "maska", "maskası",
-    # Универсальные
-    "dərman", "dərmani", "derman",
-    "vasitəsi", "vasitesi",
-], key=len, reverse=True)
+_CATEGORY_PREFIXES = sorted(
+    [
+        # Baby food
+        "südlü qarışıq",
+        "südlü qarisiq",
+        "sudlu qarısıq",
+        "sudlu qarisiq",
+        "südsüz sıyıq",
+        "südsüz siyiq",
+        "sudsuz sıyıq",
+        "sudsuz siyiq",
+        "südlü sıyıq",
+        "südlü siyiq",
+        "sudlu sıyıq",
+        "sudlu siyiq",
+        "uşaq qidası",
+        "uşaq qidasi",
+        "usaq qidası",
+        "usaq qidasi",
+        "uşaq peçenyesi",
+        "uşaq peçenye",
+        "usaq pecenye",
+        "uşaq yeməyi",
+        "usaq yeməyi",
+        "peçenye",
+        "pecenye",
+        "püre",
+        "pure",
+        "su",
+        "çay",
+        "cay",
+        "süd",
+        "sud",
+        # Лек. формы как префикс — обычно «Tablet 'Brand' ...»
+        "tableti",
+        "tabletkalar",
+        "tabletka",
+        "tablet",
+        "kapsulalar",
+        "kapsulları",
+        "kapsulalar",
+        "ampullar",
+        "ampulalar",
+        "ampulları",
+        "ampul",
+        "şərbət",
+        "şərbeti",
+        "serbet",
+        "şərbeti",
+        "məhlul",
+        "mehlul",
+        "mehlulu",
+        "krem",
+        "kremi",
+        "məlhəm",
+        "məlhəmi",
+        "melhem",
+        "gel",
+        "geli",
+        "sirop",
+        "sirup",
+        "suppozitorlar",
+        "suppozitorları",
+        "suppozitor",
+        "drops",
+        "damla",
+        "damlalar",
+        "damcı",
+        "damcısı",
+        # Косметика / гигиена
+        "şampun",
+        "şampunu",
+        "sampun",
+        "balzam",
+        "balzamı",
+        "sabun",
+        "sabunu",
+        "dezodorant",
+        "dezodorantı",
+        "losyon",
+        "losyonu",
+        "tonik",
+        "tonikı",
+        "maska",
+        "maskası",
+        # Универсальные
+        "dərman",
+        "dərmani",
+        "derman",
+        "vasitəsi",
+        "vasitesi",
+    ],
+    key=len,
+    reverse=True,
+)
 _PREFIX_RE = re.compile(
     r"^\s*(?:" + "|".join(re.escape(p) for p in _CATEGORY_PREFIXES) + r")\b\s*",
     re.IGNORECASE,

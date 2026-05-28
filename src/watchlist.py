@@ -236,8 +236,12 @@ def toggle_recipient(session: Session, email: str) -> Recipient | None:
 
 
 def update_recipient(
-    session: Session, email: str, *, new_email: str | None = None,
-    name: str | None = None, telegram_chat_id: str | None = None,
+    session: Session,
+    email: str,
+    *,
+    new_email: str | None = None,
+    name: str | None = None,
+    telegram_chat_id: str | None = None,
 ) -> Recipient | None:
     """Изменить имя, email или telegram_chat_id существующей записи."""
     r = session.scalar(select(Recipient).where(Recipient.email == email.strip().lower()))
@@ -301,9 +305,7 @@ def add_tracked_product(
                 )
             )
         else:
-            session.add(
-                TrackedProductLink(tracked_product_id=tp.id, site=site, status="pending")
-            )
+            session.add(TrackedProductLink(tracked_product_id=tp.id, site=site, status="pending"))
     session.commit()
     return tp
 

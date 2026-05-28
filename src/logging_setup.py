@@ -10,6 +10,7 @@ Usage (call once at process start):
     from src.logging_setup import configure_logging
     configure_logging(service="api")
 """
+
 from __future__ import annotations
 
 import logging
@@ -82,7 +83,9 @@ def configure_logging(service: str = "app") -> None:
 
 def _add_service_tag(service: str):
     """Processor that injects service=... into every log event."""
+
     def add(_, __, event_dict):
         event_dict.setdefault("service", service)
         return event_dict
+
     return add

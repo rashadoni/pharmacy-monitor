@@ -60,15 +60,14 @@ def check_health(
     """Запустить все проверки и вернуть совокупный отчёт."""
     report = HealthReport(status="ok")
 
-    last_run = session.scalars(
-        select(Run).order_by(desc(Run.started_at)).limit(1)
-    ).first()
+    last_run = session.scalars(select(Run).order_by(desc(Run.started_at)).limit(1)).first()
 
     if last_run is None:
         report.status = "warning"
         report.issues.append(
             HealthIssue(
-                "warning", "no_runs",
+                "warning",
+                "no_runs",
                 "В БД ни одного прогона. Запустите `pharmacy-monitor run`.",
             )
         )
@@ -83,7 +82,8 @@ def check_health(
     if age > timedelta(hours=max_age_hours):
         report.issues.append(
             HealthIssue(
-                "critical", "stale_run",
+                "critical",
+                "stale_run",
                 f"Последний прогон был {age.total_seconds() / 3600:.1f}ч назад "
                 f"(порог {max_age_hours}ч). Проверьте cron.",
                 context={"hours_ago": age.total_seconds() / 3600},
@@ -94,7 +94,8 @@ def check_health(
     if last_run.status == "failed":
         report.issues.append(
             HealthIssue(
-                "critical", "last_run_failed",
+                "critical",
+                "last_run_failed",
                 f"Последний прогон #{last_run.id} упал: {last_run.error_message or '?'}",
                 context={"run_id": last_run.id, "error": last_run.error_message},
             )
@@ -104,7 +105,8 @@ def check_health(
     if last_run.status == "ok" and (last_run.products_scraped or 0) < min_products:
         report.issues.append(
             HealthIssue(
-                "critical", "empty_run",
+                "critical",
+                "empty_run",
                 f"Прогон #{last_run.id} закончился ok, но спарсил {last_run.products_scraped} "
                 f"товаров (порог {min_products}). Возможно сайты сменили вёрстку.",
                 context={"run_id": last_run.id, "products": last_run.products_scraped},
@@ -163,25 +165,27 @@ def _check_site_drops(
         return []
 
     for site in sites:
-        total = session.scalar(
-            select(func.count())
-            .select_from(Product)
-            .where(Product.site == site)
-        ) or 0
+        total = (
+            session.scalar(select(func.count()).select_from(Product).where(Product.site == site))
+            or 0
+        )
         if total < 10:
             continue  # сайт ещё не наполнен — не на чем сравнивать
 
         # Видимы в этом прогоне: last_seen_at >= run.started_at. Verхняя
         # граница не ставится: check_health всегда вызывается для ПОСЛЕДНЕГО
         # run'а, более новых ещё нет, поэтому overestimate невозможен.
-        seen = session.scalar(
-            select(func.count())
-            .select_from(Product)
-            .where(
-                Product.site == site,
-                Product.last_seen_at >= last_run.started_at,
+        seen = (
+            session.scalar(
+                select(func.count())
+                .select_from(Product)
+                .where(
+                    Product.site == site,
+                    Product.last_seen_at >= last_run.started_at,
+                )
             )
-        ) or 0
+            or 0
+        )
 
         ratio = seen / total
         if ratio < threshold:
@@ -190,7 +194,7 @@ def _check_site_drops(
                     "warning" if ratio > 0.2 else "critical",
                     "site_drop",
                     f"Сайт {site}: увидели {seen}/{total} товаров каталога "
-                    f"({ratio*100:.0f}%). Порог: {threshold*100:.0f}%. "
+                    f"({ratio * 100:.0f}%). Порог: {threshold * 100:.0f}%. "
                     f"Возможно сменилась вёрстка или сайт лежал.",
                     context={
                         "site": site,
@@ -205,28 +209,37 @@ def _check_site_drops(
 
 def _check_zero_prices(session: Session, run_id: int) -> list[HealthIssue]:
     """Если >50% snapshots в прогоне имеют price=0/NULL — скрейпер сломан."""
-    total = session.scalar(
-        select(func.count()).select_from(PriceSnapshot)
-        .where(PriceSnapshot.run_id == run_id)
-    ) or 0
+    total = (
+        session.scalar(
+            select(func.count()).select_from(PriceSnapshot).where(PriceSnapshot.run_id == run_id)
+        )
+        or 0
+    )
     if total < 10:
         return []  # маленький прогон — недостаточно данных для проверки
-    zero_or_null = session.scalar(
-        select(func.count()).select_from(PriceSnapshot)
-        .where(
-            PriceSnapshot.run_id == run_id,
-            (PriceSnapshot.price.is_(None)) | (PriceSnapshot.price <= 0),
+    zero_or_null = (
+        session.scalar(
+            select(func.count())
+            .select_from(PriceSnapshot)
+            .where(
+                PriceSnapshot.run_id == run_id,
+                (PriceSnapshot.price.is_(None)) | (PriceSnapshot.price <= 0),
+            )
         )
-    ) or 0
+        or 0
+    )
     ratio = zero_or_null / total
     if ratio < 0.50:
         return []
-    return [HealthIssue(
-        "critical", "zero_prices",
-        f"{zero_or_null}/{total} snapshots с price=0 или NULL ({ratio*100:.0f}%). "
-        f"Скорее всего — сломан price-парсинг.",
-        context={"zero_count": zero_or_null, "total": total, "ratio": ratio},
-    )]
+    return [
+        HealthIssue(
+            "critical",
+            "zero_prices",
+            f"{zero_or_null}/{total} snapshots с price=0 или NULL ({ratio * 100:.0f}%). "
+            f"Скорее всего — сломан price-парсинг.",
+            context={"zero_count": zero_or_null, "total": total, "ratio": ratio},
+        )
+    ]
 
 
 def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssue]:
@@ -242,56 +255,73 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
         return []
 
     # Видимые в этом прогоне
-    curr_total = session.scalar(
-        select(func.count()).select_from(Product)
-        .where(Product.last_seen_at >= last_run.started_at)
-    ) or 0
+    curr_total = (
+        session.scalar(
+            select(func.count())
+            .select_from(Product)
+            .where(Product.last_seen_at >= last_run.started_at)
+        )
+        or 0
+    )
     if curr_total < 10:
         return []
-    curr_with_brand = session.scalar(
-        select(func.count()).select_from(Product)
-        .where(
-            Product.last_seen_at >= last_run.started_at,
-            Product.brand.is_not(None),
+    curr_with_brand = (
+        session.scalar(
+            select(func.count())
+            .select_from(Product)
+            .where(
+                Product.last_seen_at >= last_run.started_at,
+                Product.brand.is_not(None),
+            )
         )
-    ) or 0
+        or 0
+    )
     curr_coverage = curr_with_brand / curr_total
 
     # Остальной каталог (last_seen_at до run.started_at)
-    rest_total = session.scalar(
-        select(func.count()).select_from(Product)
-        .where(Product.last_seen_at < last_run.started_at)
-    ) or 0
+    rest_total = (
+        session.scalar(
+            select(func.count())
+            .select_from(Product)
+            .where(Product.last_seen_at < last_run.started_at)
+        )
+        or 0
+    )
     if rest_total < 10:
         return []
-    rest_with_brand = session.scalar(
-        select(func.count()).select_from(Product)
-        .where(
-            Product.last_seen_at < last_run.started_at,
-            Product.brand.is_not(None),
+    rest_with_brand = (
+        session.scalar(
+            select(func.count())
+            .select_from(Product)
+            .where(
+                Product.last_seen_at < last_run.started_at,
+                Product.brand.is_not(None),
+            )
         )
-    ) or 0
+        or 0
+    )
     rest_coverage = rest_with_brand / rest_total
 
     # Триггер: остальной каталог имеет brand'ы, но текущий прогон их не извлёк.
     if rest_coverage >= 0.50 and curr_coverage < 0.20:
-        return [HealthIssue(
-            "critical", "brand_coverage_loss",
-            f"Brand-coverage в этом прогоне: {curr_coverage*100:.0f}% "
-            f"({curr_with_brand}/{curr_total}). В остальном каталоге: "
-            f"{rest_coverage*100:.0f}%. Скрейпер перестал извлекать brand — "
-            f"возможно сменилась вёрстка.",
-            context={
-                "curr_coverage": round(curr_coverage, 3),
-                "rest_coverage": round(rest_coverage, 3),
-            },
-        )]
+        return [
+            HealthIssue(
+                "critical",
+                "brand_coverage_loss",
+                f"Brand-coverage в этом прогоне: {curr_coverage * 100:.0f}% "
+                f"({curr_with_brand}/{curr_total}). В остальном каталоге: "
+                f"{rest_coverage * 100:.0f}%. Скрейпер перестал извлекать brand — "
+                f"возможно сменилась вёрстка.",
+                context={
+                    "curr_coverage": round(curr_coverage, 3),
+                    "rest_coverage": round(rest_coverage, 3),
+                },
+            )
+        ]
     return []
 
 
-def _check_site_silence(
-    session: Session, max_age_hours: int = 26
-) -> list[HealthIssue]:
+def _check_site_silence(session: Session, max_age_hours: int = 26) -> list[HealthIssue]:
     """Per-site freshness: если у сайта нет свежих продуктов за max_age_hours → alert.
 
     Метрика: `MAX(Product.last_seen_at)` per site. Если самое свежее обновление
@@ -307,11 +337,10 @@ def _check_site_silence(
 
     for site in ("pharmonline", "aptekonline", "aloe"):
         # Если сайт ещё ни разу не скрейпился — пропустить
-        total = session.scalar(
-            select(func.count())
-            .select_from(Product)
-            .where(Product.site == site)
-        ) or 0
+        total = (
+            session.scalar(select(func.count()).select_from(Product).where(Product.site == site))
+            or 0
+        )
         if total == 0:
             continue
 
@@ -320,14 +349,11 @@ def _check_site_silence(
         )
 
         if last_seen is None or last_seen < cutoff:
-            age_h = (
-                (utcnow() - last_seen).total_seconds() / 3600
-                if last_seen
-                else 24 * 7
-            )
+            age_h = (utcnow() - last_seen).total_seconds() / 3600 if last_seen else 24 * 7
             issues.append(
                 HealthIssue(
-                    "critical", "site_silent",
+                    "critical",
+                    "site_silent",
                     f"Сайт {site}: последнее обновление {age_h:.1f}ч назад "
                     f"(порог {max_age_hours}ч). Mac уснул / прокси упал?",
                     context={"site": site, "hours_silent": round(age_h, 1)},
@@ -339,15 +365,11 @@ def _check_site_silence(
 def render_alert_html(report: HealthReport) -> str:
     """Простое HTML-письмо для алерта."""
     color = {"ok": "#34c759", "warning": "#ff9500", "critical": "#ff3b30"}[report.status]
-    title = {"ok": "✓ OK", "warning": "⚠️ Внимание", "critical": "🔴 Проблема"}[
-        report.status
-    ]
+    title = {"ok": "✓ OK", "warning": "⚠️ Внимание", "critical": "🔴 Проблема"}[report.status]
 
     rows = []
     for i in report.issues:
-        sev_color = {"warning": "#ff9500", "critical": "#ff3b30", "ok": "#34c759"}[
-            i.severity
-        ]
+        sev_color = {"warning": "#ff9500", "critical": "#ff3b30", "ok": "#34c759"}[i.severity]
         rows.append(
             f"<tr><td style='padding:8px;border-bottom:1px solid #eee;'>"
             f"<span style='color:{sev_color};font-weight:600;'>{i.severity.upper()}</span> "
@@ -366,15 +388,15 @@ def render_alert_html(report: HealthReport) -> str:
           {title}
         </div>
         <div style="font-size:13px;color:#6e6e73;margin-top:6px;">
-          Last run: #{report.last_run_id or '—'} ({report.last_run_status or '—'}) at
-          {report.last_run_at.strftime('%Y-%m-%d %H:%M UTC') if report.last_run_at else '—'}
+          Last run: #{report.last_run_id or "—"} ({report.last_run_status or "—"}) at
+          {report.last_run_at.strftime("%Y-%m-%d %H:%M UTC") if report.last_run_at else "—"}
         </div>
       </div>
       <table style="width:100%;border-collapse:collapse;font-size:13px;">
-        {''.join(rows) if rows else '<tr><td style="padding:16px;color:#34c759;">All checks pass.</td></tr>'}
+        {"".join(rows) if rows else '<tr><td style="padding:16px;color:#34c759;">All checks pass.</td></tr>'}
       </table>
       <div style="padding:12px 24px;background:#fafafa;font-size:11px;color:#86868b;">
-        Сгенерировано {utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+        Сгенерировано {utcnow().strftime("%Y-%m-%d %H:%M UTC")}
       </div>
     </div>
     """

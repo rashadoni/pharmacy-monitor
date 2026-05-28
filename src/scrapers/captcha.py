@@ -10,6 +10,7 @@ page. If a site introduces captcha for our scraper, that's a signal to:
 The goal: never silently skip pages thinking they're empty when actually a
 captcha is rendered.
 """
+
 from __future__ import annotations
 
 import structlog

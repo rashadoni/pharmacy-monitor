@@ -69,6 +69,7 @@ DDP_PROTOCOL_VERSION = "1"
 DDP_SUPPORT = [DDP_PROTOCOL_VERSION, "pre2", "pre1"]
 SOCKJS_BASE = "wss://pharmonline.az/sockjs"
 
+
 # SockJS spec: URL format /<server_id_3digits>/<session_8chars>/websocket
 def _new_sockjs_path() -> str:
     server = "".join(random.choices(string.digits, k=3))
@@ -116,7 +117,9 @@ class _DDPClient:
         Each reconnect generates a new random session id (see _new_sockjs_path)
         — Meteor server treats it as a new client and won't reject as duplicate.
         """
-        self.ws_url_factory = ws_url_factory if callable(ws_url_factory) else (lambda: ws_url_factory)
+        self.ws_url_factory = (
+            ws_url_factory if callable(ws_url_factory) else (lambda: ws_url_factory)
+        )
         self.proxy_url = proxy_url
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._call_id = 0
@@ -225,9 +228,7 @@ class _DDPClient:
             # Unreachable — loop either returns or raises.
             raise RuntimeError("DDP call exhausted retries (logic bug)")
 
-    async def _send_and_wait(
-        self, method: str, params: list, timeout: float
-    ) -> dict:
+    async def _send_and_wait(self, method: str, params: list, timeout: float) -> dict:
         """Single attempt: send call message, wait for matching result."""
         if self._ws is None:
             raise ConnectionError("DDP socket not open")
@@ -252,7 +253,9 @@ class _DDPClient:
 
 
 def _build_product(
-    raw: dict, locale: str, category_id_to_slug: dict[str, str] | None = None,
+    raw: dict,
+    locale: str,
+    category_id_to_slug: dict[str, str] | None = None,
 ) -> ScrapedProduct | None:
     """Map pharmonline DDP product → our ScrapedProduct.
 
@@ -285,9 +288,7 @@ def _build_product(
         max_price = float(max_price) if max_price is not None else None
     except (TypeError, ValueError):
         max_price = None
-    is_on_sale = (
-        max_price is not None and price is not None and max_price > price + 0.01
-    )
+    is_on_sale = max_price is not None and price is not None and max_price > price + 0.01
 
     images = raw.get("images") or []
     image_url = None
@@ -378,8 +379,7 @@ class PharmonlineDDPScraper(BaseScraper):
         try:
             flt = await self._ddp.call(
                 "getFilterParam",
-                [{"query": {}, "sortBy": {"totalMinPrice": 1}, "productLimit": 24},
-                 self._locale],
+                [{"query": {}, "sortBy": {"totalMinPrice": 1}, "productLimit": 24}, self._locale],
                 timeout=30.0,
             )
             for c in flt.get("category", []) or []:

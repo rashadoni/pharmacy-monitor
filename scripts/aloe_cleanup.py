@@ -17,6 +17,7 @@ Strategy per old row:
 
 Idempotent — running twice is safe (zombies count drops to 0 second run, no-op).
 """
+
 import argparse
 import sys
 
@@ -29,10 +30,15 @@ from sqlalchemy import select, text
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", default=True,
-                        help="Default mode — report only, no mutations")
-    parser.add_argument("--apply", action="store_true",
-                        help="Actually apply mutations (overrides --dry-run)")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=True,
+        help="Default mode — report only, no mutations",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="Actually apply mutations (overrides --dry-run)"
+    )
     args = parser.parse_args()
     apply = args.apply
     mode = "APPLY" if apply else "DRY-RUN"
@@ -40,7 +46,7 @@ def main():
     storage.init_db()
     Session = storage.make_session()
 
-    would_merge = 0   # has new row → delete old, migrate FKs
+    would_merge = 0  # has new row → delete old, migrate FKs
     would_update_inplace = 0  # no new row → keep old row, just fix url+external_id
     would_skip_failed_slug = 0
     snapshots_to_migrate = 0
@@ -50,15 +56,12 @@ def main():
     samples_inplace = []
 
     with Session() as s:
-        all_aloe = s.execute(
-            select(storage.Product).where(storage.Product.site == "aloe")
-        ).scalars().all()
+        all_aloe = (
+            s.execute(select(storage.Product).where(storage.Product.site == "aloe")).scalars().all()
+        )
 
         by_external_id = {p.external_id: p for p in all_aloe}
-        old_listing_rows = [
-            p for p in all_aloe
-            if p.url and "catalog/filters" in p.url
-        ]
+        old_listing_rows = [p for p in all_aloe if p.url and "catalog/filters" in p.url]
         print(f"[{mode}] Total aloe products: {len(all_aloe)}")
         print(f"[{mode}] Old listing-URL rows to process: {len(old_listing_rows)}")
         print()
@@ -73,9 +76,10 @@ def main():
             if new_row and new_row.id != old.id:
                 would_merge += 1
                 # Count snapshots that would be migrated
-                snap_count = s.scalar(text(
-                    "SELECT COUNT(*) FROM price_snapshots WHERE product_id=:pid"
-                ), {"pid": old.id})
+                snap_count = s.scalar(
+                    text("SELECT COUNT(*) FROM price_snapshots WHERE product_id=:pid"),
+                    {"pid": old.id},
+                )
                 snapshots_to_migrate += snap_count or 0
                 if old.canonical_id and not new_row.canonical_id:
                     matches_inherited += 1
@@ -88,7 +92,9 @@ def main():
 
                 if apply:
                     s.execute(
-                        text("UPDATE price_snapshots SET product_id=:new_id WHERE product_id=:old_id"),
+                        text(
+                            "UPDATE price_snapshots SET product_id=:new_id WHERE product_id=:old_id"
+                        ),
                         {"new_id": new_row.id, "old_id": old.id},
                     )
                     if old.canonical_id and not new_row.canonical_id:

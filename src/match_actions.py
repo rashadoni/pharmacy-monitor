@@ -88,9 +88,7 @@ def break_match(
         return 0
     detach = session.get(Product, detach_product_id)
     if not detach or detach.canonical_id != match_id:
-        log.warning(
-            "break_match_skip", reason="product_not_in_match", product=detach_product_id
-        )
+        log.warning("break_match_skip", reason="product_not_in_match", product=detach_product_id)
         return 0
 
     others = [p for p in m.products if p.id != detach_product_id]
@@ -149,9 +147,7 @@ def find_alternatives(
     return scored[:limit]
 
 
-def swap_alternative(
-    session: Session, match_id: int, site: str, new_product_id: int
-) -> bool:
+def swap_alternative(session: Session, match_id: int, site: str, new_product_id: int) -> bool:
     """Заменить Product этого site в Match на другой.
 
     - Существующий Product этого site → отвязывается + rejection с new_product

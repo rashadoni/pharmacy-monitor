@@ -15,8 +15,12 @@ from src.storage import (
 
 def _add_product(s, site, name, ext_id, canonical_id=None):
     p = Product(
-        site=site, external_id=ext_id, url=f"http://x/{ext_id}",
-        name=name, name_normalized=name.lower(), canonical_id=canonical_id,
+        site=site,
+        external_id=ext_id,
+        url=f"http://x/{ext_id}",
+        name=name,
+        name_normalized=name.lower(),
+        canonical_id=canonical_id,
     )
     s.add(p)
     s.flush()
@@ -41,10 +45,7 @@ def test_import_stock_matches_by_sku(db_session, tmp_path):
 
     csv_path = tmp_path / "stock.csv"
     csv_path.write_text(
-        "sku,qty,name\n"
-        "PHM-100,15,Foo 500mg\n"
-        "PHM-999,0,Out of stock\n"
-        "PHM-200,5,Unknown SKU\n",
+        "sku,qty,name\nPHM-100,15,Foo 500mg\nPHM-999,0,Out of stock\nPHM-200,5,Unknown SKU\n",
         encoding="utf-8",
     )
     result = inventory.import_stock_from_csv(db_session, csv_path)
@@ -102,13 +103,21 @@ def test_margin_report(db_session, tmp_path):
     run = _add_run(db_session)
     _add_snap(db_session, run, p, 10.00)
 
-    db_session.add(SupplierPrice(
-        product_id=p.id, supplier_name="WS",
-        purchase_price=6.50, name="Test 100mg",
-    ))
-    db_session.add(StockLevel(
-        product_id=p.id, qty=20, is_in_stock=True,
-    ))
+    db_session.add(
+        SupplierPrice(
+            product_id=p.id,
+            supplier_name="WS",
+            purchase_price=6.50,
+            name="Test 100mg",
+        )
+    )
+    db_session.add(
+        StockLevel(
+            product_id=p.id,
+            qty=20,
+            is_in_stock=True,
+        )
+    )
     db_session.commit()
 
     rows = inventory.margin_report(db_session)
@@ -126,12 +135,8 @@ def test_roi_undercut_skipped_when_out_of_stock(db_session):
     m = Match(canonical_name="Out", confidence=1.0)
     db_session.add(m)
     db_session.flush()
-    p_client = _add_product(
-        db_session, "pharmonline", "Out", "ph-out", canonical_id=m.id
-    )
-    p_comp = _add_product(
-        db_session, "aloe", "Out", "al-out", canonical_id=m.id
-    )
+    p_client = _add_product(db_session, "pharmonline", "Out", "ph-out", canonical_id=m.id)
+    p_comp = _add_product(db_session, "aloe", "Out", "al-out", canonical_id=m.id)
     run = _add_run(db_session)
     _add_snap(db_session, run, p_client, 10.0)
     _add_snap(db_session, run, p_comp, 7.0)
@@ -149,12 +154,8 @@ def test_roi_undercut_kept_when_in_stock(db_session):
     m = Match(canonical_name="In", confidence=1.0)
     db_session.add(m)
     db_session.flush()
-    p_client = _add_product(
-        db_session, "pharmonline", "In", "ph-in", canonical_id=m.id
-    )
-    p_comp = _add_product(
-        db_session, "aloe", "In", "al-in", canonical_id=m.id
-    )
+    p_client = _add_product(db_session, "pharmonline", "In", "ph-in", canonical_id=m.id)
+    p_comp = _add_product(db_session, "aloe", "In", "al-in", canonical_id=m.id)
     run = _add_run(db_session)
     _add_snap(db_session, run, p_client, 10.0)
     _add_snap(db_session, run, p_comp, 7.0)
@@ -171,19 +172,19 @@ def test_roi_undercut_critical_when_target_below_purchase(db_session):
     m = Match(canonical_name="LowMargin", confidence=1.0)
     db_session.add(m)
     db_session.flush()
-    p_client = _add_product(
-        db_session, "pharmonline", "LowMargin", "ph-lm", canonical_id=m.id
-    )
-    p_comp = _add_product(
-        db_session, "aloe", "LowMargin", "al-lm", canonical_id=m.id
-    )
+    p_client = _add_product(db_session, "pharmonline", "LowMargin", "ph-lm", canonical_id=m.id)
+    p_comp = _add_product(db_session, "aloe", "LowMargin", "al-lm", canonical_id=m.id)
     run = _add_run(db_session)
     _add_snap(db_session, run, p_client, 10.0)
     _add_snap(db_session, run, p_comp, 5.0)  # сильный undercut
     # Закупка 6 ₼ — рекомендуемая (4.99) ниже закупки!
-    db_session.add(SupplierPrice(
-        product_id=p_client.id, supplier_name="X", purchase_price=6.0,
-    ))
+    db_session.add(
+        SupplierPrice(
+            product_id=p_client.id,
+            supplier_name="X",
+            purchase_price=6.0,
+        )
+    )
     db_session.commit()
 
     actions = roi.compute_actions(db_session)

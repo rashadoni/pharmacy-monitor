@@ -18,6 +18,7 @@ normalises). Nullable — older rows scraped before Phase 2.2 have no value.
 scraper provided which value, we can add a separate column or audit via
 git blame on the scraper.
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -55,9 +56,7 @@ def upgrade() -> None:
         )
     # Use a NAMED index so downgrade can find it portably across SQLite/Postgres.
     if not _index_exists(bind, "products", "ix_products_barcode"):
-        op.create_index(
-            "ix_products_barcode", "products", ["barcode"], unique=False
-        )
+        op.create_index("ix_products_barcode", "products", ["barcode"], unique=False)
 
 
 def downgrade() -> None:

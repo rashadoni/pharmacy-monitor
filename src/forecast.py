@@ -92,7 +92,7 @@ def _detect_seasonality(prices: list[float], timestamps: list) -> bool:
     overall_mean = sum(means) / len(means)
     variance = sum((m - overall_mean) ** 2 for m in means) / len(means)
     # Если коэфф. вариации > 5% — считаем что есть сезонность
-    return overall_mean > 0 and (variance ** 0.5) / overall_mean > 0.05
+    return overall_mean > 0 and (variance**0.5) / overall_mean > 0.05
 
 
 def compute_trend(
@@ -185,8 +185,7 @@ def compute_trend(
         p1, p2 = prices[0], prices[-1]
         change_pct = (p2 - p1) / p1 * 100 if p1 else 0.0
         direction: TrendDirection = (
-            "stable" if abs(change_pct) < 1.0
-            else ("rising" if change_pct > 0 else "falling")
+            "stable" if abs(change_pct) < 1.0 else ("rising" if change_pct > 0 else "falling")
         )
         return PriceTrend(
             product_id=product_id,
@@ -221,10 +220,9 @@ def compute_trend(
     # Если есть weekly seasonality — корректируем forecast средним за тот же weekday
     if _detect_seasonality(prices, timestamps):
         from datetime import timedelta as _td
+
         target_dow = (timestamps[-1] + _td(days=7)).weekday()
-        same_dow_prices = [
-            p for p, t in zip(prices, timestamps) if t.weekday() == target_dow
-        ]
+        same_dow_prices = [p for p, t in zip(prices, timestamps) if t.weekday() == target_dow]
         if same_dow_prices:
             seasonal_avg = sum(same_dow_prices) / len(same_dow_prices)
             # Blend линейный прогноз и сезонное среднее 50/50
@@ -288,6 +286,7 @@ def top_movers(
 
     # Группировка: {product_id: [(price, ts), ...]}
     from collections import defaultdict
+
     history: dict[int, list[tuple[float, "datetime"]]] = defaultdict(list)
     for row in rows:
         pid, price, disc, ts = row
@@ -331,9 +330,10 @@ def top_movers(
             if eff and eff > 0:
                 history[pid].insert(0, (eff, ts))  # prepend как "старая" точка
 
-    products = {p.id: p for p in session.scalars(
-        select(Product).where(Product.id.in_(history.keys()))
-    ).all()}
+    products = {
+        p.id: p
+        for p in session.scalars(select(Product).where(Product.id.in_(history.keys()))).all()
+    }
 
     trends: list[PriceTrend] = []
     for pid, points in history.items():
@@ -383,15 +383,20 @@ def top_movers(
         else:
             direction = "falling"
 
-        trends.append(PriceTrend(
-            product_id=pid, site=product.site, name=product.name,
-            n_points=len(prices),
-            first_price=round(first_p, 2), last_price=round(last_p, 2),
-            change_pct=round(change_pct, 2),
-            direction=direction,
-            forecast_7d_price=round(forecast_price, 2),
-            confidence=confidence,
-        ))
+        trends.append(
+            PriceTrend(
+                product_id=pid,
+                site=product.site,
+                name=product.name,
+                n_points=len(prices),
+                first_price=round(first_p, 2),
+                last_price=round(last_p, 2),
+                change_pct=round(change_pct, 2),
+                direction=direction,
+                forecast_7d_price=round(forecast_price, 2),
+                confidence=confidence,
+            )
+        )
 
     trends.sort(key=lambda x: -abs(x.change_pct))
     return trends[:limit]
@@ -404,6 +409,7 @@ class CompetitorMoveProbability:
     Эвристика: если конкурент уже снизил >threshold% за последние N дней —
     высокая вероятность что снижение продолжится.
     """
+
     canonical_id: int
     canonical_name: str
     competitor_site: str
@@ -436,14 +442,16 @@ def predict_competitor_moves(
                 prob = "medium"
             else:
                 continue  # слишком мало
-            out.append(CompetitorMoveProbability(
-                canonical_id=m.id,
-                canonical_name=m.canonical_name,
-                competitor_site=product.site,
-                current_price=trend.last_price,
-                trend_7d_change_pct=trend.change_pct,
-                probability=prob,
-                expected_next_price=trend.forecast_7d_price,
-            ))
+            out.append(
+                CompetitorMoveProbability(
+                    canonical_id=m.id,
+                    canonical_name=m.canonical_name,
+                    competitor_site=product.site,
+                    current_price=trend.last_price,
+                    trend_7d_change_pct=trend.change_pct,
+                    probability=prob,
+                    expected_next_price=trend.forecast_7d_price,
+                )
+            )
     out.sort(key=lambda x: x.trend_7d_change_pct)  # сильнее падение → выше
     return out[:max_n]

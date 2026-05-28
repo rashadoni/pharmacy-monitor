@@ -20,8 +20,11 @@ from src.scrapers.base import ScrapedProduct, ScrapeResult
 
 def _make_product(site, ext_id, name="P", price=10.0):
     return ScrapedProduct(
-        site=site, external_id=ext_id,
-        url=f"http://{site}/{ext_id}", name=name, price=price,
+        site=site,
+        external_id=ext_id,
+        url=f"http://{site}/{ext_id}",
+        name=name,
+        price=price,
     )
 
 
@@ -91,17 +94,21 @@ def test_smoke_test_no_falsepositive_when_per_site_normal(db_session):
     base = utcnow()
     for d in [5, 3, 1]:
         _add_run_with_per_site(
-            db_session, base - timedelta(days=d),
-            {"aloe": 800}, "aloe",
+            db_session,
+            base - timedelta(days=d),
+            {"aloe": 800},
+            "aloe",
         )
     curr = storage.Run(started_at=base, status="running", sites_completed="aloe")
     db_session.add(curr)
     db_session.flush()
 
-    results = [ScrapeResult(
-        site="aloe",
-        products=[_make_product("aloe", str(i)) for i in range(820)],
-    )]
+    results = [
+        ScrapeResult(
+            site="aloe",
+            products=[_make_product("aloe", str(i)) for i in range(820)],
+        )
+    ]
     _smoke_test_per_site_coverage(db_session, results, curr)
 
     events = db_session.scalars(
@@ -143,10 +150,12 @@ def test_smoke_test_legacy_run_fallback_to_products_scraped(db_session):
     db_session.flush()
 
     # Текущий: 50 продуктов (drop с avg=810 до 50, ratio=0.06 << 0.5)
-    results = [ScrapeResult(
-        site="aloe",
-        products=[_make_product("aloe", str(i)) for i in range(50)],
-    )]
+    results = [
+        ScrapeResult(
+            site="aloe",
+            products=[_make_product("aloe", str(i)) for i in range(50)],
+        )
+    ]
     _smoke_test_per_site_coverage(db_session, results, curr)
 
     events = db_session.scalars(
@@ -163,18 +172,22 @@ def test_smoke_test_does_not_crash_on_alert_event_creation(db_session):
     base = utcnow()
     for d in [5, 3, 1]:
         _add_run_with_per_site(
-            db_session, base - timedelta(days=d),
-            {"aloe": 800}, "aloe",
+            db_session,
+            base - timedelta(days=d),
+            {"aloe": 800},
+            "aloe",
         )
     curr = storage.Run(started_at=base, status="running", sites_completed="aloe")
     db_session.add(curr)
     db_session.flush()
 
     # Drop до 24 (как run_47)
-    results = [ScrapeResult(
-        site="aloe",
-        products=[_make_product("aloe", str(i)) for i in range(24)],
-    )]
+    results = [
+        ScrapeResult(
+            site="aloe",
+            products=[_make_product("aloe", str(i)) for i in range(24)],
+        )
+    ]
     # Не должно выбрасывать ничего
     _smoke_test_per_site_coverage(db_session, results, curr)
 

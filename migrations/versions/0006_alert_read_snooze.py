@@ -16,6 +16,7 @@ in-app inbox с mark-read / snooze для управления потоком.
 Multi-user сценарий вынесем в отдельную таблицу alert_user_state когда
 будет нужно.
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -52,9 +53,7 @@ def upgrade() -> None:
     if not _column_exists(bind, "alert_events", "snoozed_until"):
         op.add_column(
             "alert_events",
-            sa.Column(
-                "snoozed_until", sa.DateTime(timezone=False), nullable=True, index=True
-            ),
+            sa.Column("snoozed_until", sa.DateTime(timezone=False), nullable=True, index=True),
         )
 
 

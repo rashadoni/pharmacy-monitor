@@ -16,6 +16,7 @@ Usage:
     context = await browser.new_context(...)
     await apply_stealth(context)
 """
+
 from __future__ import annotations
 
 import random
