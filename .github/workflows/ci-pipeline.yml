@@ -65,6 +65,8 @@ jobs:
         run: pip install uv
       - name: Sync deps (with dev)
         run: uv sync --frozen --all-groups
+      - name: Install Playwright Chromium (for test_scrapers_snapshot.py)
+        run: uv run playwright install chromium --with-deps
       - name: Run alembic migrations
         run: uv run alembic upgrade head
       - name: Pytest
