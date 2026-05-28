@@ -878,3 +878,227 @@ class TestSiblingFormCheck:
         # aptk не имеет sibling с формой tablet → матч РАЗРЕШЁН
         assert aptk_no_form.canonical_id is not None
         assert aptk_no_form.canonical_id == pharm_tablet.canonical_id
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Coverage gap closure (2026-05-28): _norm_units, finders, flag_suspected_mismatches
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_norm_units_mq_to_mg():
+    """mq (азербайджанский milliqram) → mg."""
+    assert matcher._norm_units("500mq") == "500mg"
+
+
+def test_norm_units_mkg_to_mcg():
+    """mkg → mcg."""
+    assert matcher._norm_units("100mkg") == "100mcg"
+
+
+def test_norm_units_q_to_g():
+    """цифра+q → цифра+g (gram)."""
+    assert matcher._norm_units("5q") == "5g"
+    assert matcher._norm_units("0.5q") == "0.5g"
+
+
+def test_norm_units_iu_aliases():
+    """bv/me/ie → iu (international units)."""
+    assert matcher._norm_units("500000bv") == "500000iu"
+    assert matcher._norm_units("100me") == "100iu"
+    assert matcher._norm_units("200ie") == "200iu"
+
+
+def test_norm_units_does_not_replace_non_unit_chars():
+    """`me` без digit-prefix не должен меняться (brand-name 'meridia')."""
+    out = matcher._norm_units("meridia")
+    assert "iu" not in out  # 'meridia' остаётся как было
+
+
+def test_pack_count_simple():
+    assert matcher._pack_count("n10") == 10.0
+    assert matcher._pack_count("n30") == 30.0
+    assert matcher._pack_count("") == 1.0
+    assert matcher._pack_count("nothing-numeric") == 1.0
+
+
+def test_pack_count_decimal():
+    """Decimal number support: '1.5' → 1.5."""
+    assert matcher._pack_count("1.5g") == 1.5
+
+
+def test_find_matched_groups_returns_only_with_products(db_session):
+    """Match без products в кластере не возвращается."""
+    m1 = storage.Match(canonical_name="Empty", confidence=1.0)
+    m2 = storage.Match(canonical_name="HasProducts", confidence=1.0)
+    db_session.add_all([m1, m2])
+    db_session.flush()
+    p = _make_product(db_session, site="pharmonline", external_id="hp1", name="Has")
+    p.canonical_id = m2.id  # _make_product не принимает canonical_id напрямую
+    db_session.commit()
+    out = matcher.find_matched_groups(db_session)
+    names = [g["name"] for g in out]
+    assert "HasProducts" in names
+    assert "Empty" not in names
+
+
+def test_find_matched_groups_payload_shape(db_session):
+    """Payload содержит canonical_id, name, brand, dosage, pack_size, products, is_manual."""
+    m = storage.Match(
+        canonical_name="X",
+        canonical_brand="X-brand",
+        canonical_dosage="500mg",
+        canonical_pack_size="n10",
+        confidence=1.0,
+        is_manual=True,
+    )
+    db_session.add(m)
+    db_session.flush()
+    p = _make_product(db_session, site="pharmonline", external_id="x1", name="X")
+    p.canonical_id = m.id
+    db_session.commit()
+    out = matcher.find_matched_groups(db_session)
+    g = out[0]
+    assert g["canonical_id"] == m.id
+    assert g["name"] == "X"
+    assert g["brand"] == "X-brand"
+    assert g["dosage"] == "500mg"
+    assert g["pack_size"] == "n10"
+    assert len(g["products"]) == 1
+    assert g["is_manual"] is True
+
+
+def test_find_unmatched_groups_by_site(db_session):
+    """Продукты без canonical_id группируются по сайту."""
+    _make_product(db_session, site="pharmonline", external_id="u1", name="A")
+    _make_product(db_session, site="pharmonline", external_id="u2", name="B")
+    _make_product(db_session, site="aloe", external_id="u3", name="C")
+    # Matched product — не возвращается
+    m = storage.Match(canonical_name="M", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    p = _make_product(db_session, site="aloe", external_id="u4", name="D")
+    p.canonical_id = m.id
+    db_session.commit()
+    by_site = matcher.find_unmatched(db_session)
+    assert len(by_site["pharmonline"]) == 2
+    assert len(by_site["aloe"]) == 1  # только C, D исключён (matched)
+
+
+def test_normalize_for_matching_returns_string():
+    """`normalize_for_matching` — backwards-compat helper."""
+    out = matcher.normalize_for_matching("Some Product 500mg N10")
+    assert isinstance(out, str)
+    assert len(out) > 0
+
+
+# === flag_suspected_mismatches ============================================
+
+
+def _add_match_with_prices(db_session, *, name, prices_by_site, is_manual=False):
+    """Хелпер: создаёт Match + Products + PriceSnapshots."""
+    import datetime
+
+    m = storage.Match(
+        canonical_name=name,
+        confidence=1.0,
+        is_manual=is_manual,
+    )
+    db_session.add(m)
+    db_session.flush()
+    run = storage.Run(started_at=datetime.datetime.utcnow(), status="ok")
+    db_session.add(run)
+    db_session.flush()
+    for site, price in prices_by_site.items():
+        p = _make_product(
+            db_session,
+            site=site,
+            external_id=f"{site}-{name}",
+            name=name,
+        )
+        p.canonical_id = m.id
+        db_session.add(storage.PriceSnapshot(run_id=run.id, product_id=p.id, price=price))
+    db_session.commit()
+    return m
+
+
+def test_flag_suspected_mismatches_flags_spread_above_50pct(db_session):
+    """Match с разлётом цен ≥50% → needs_review=True."""
+    m = _add_match_with_prices(
+        db_session,
+        name="Big spread",
+        prices_by_site={"pharmonline": 10.0, "aloe": 20.0},  # 2× spread
+    )
+    changed = matcher.flag_suspected_mismatches(db_session)
+    assert changed == 1
+    db_session.refresh(m)
+    assert m.needs_review is True
+
+
+def test_flag_suspected_mismatches_keeps_close_prices(db_session):
+    """Match с близкими ценами → needs_review=False."""
+    m = _add_match_with_prices(
+        db_session,
+        name="Close",
+        prices_by_site={"pharmonline": 10.0, "aloe": 11.0},  # 10% spread
+    )
+    matcher.flag_suspected_mismatches(db_session)
+    db_session.refresh(m)
+    assert m.needs_review is False
+
+
+def test_flag_suspected_mismatches_skips_manual(db_session):
+    """is_manual=True match'и не флагируются — даже с большим spread."""
+    m = _add_match_with_prices(
+        db_session,
+        name="Manual spread",
+        is_manual=True,
+        prices_by_site={"pharmonline": 10.0, "aloe": 100.0},  # 10× spread!
+    )
+    matcher.flag_suspected_mismatches(db_session)
+    db_session.refresh(m)
+    assert m.needs_review is False
+
+
+def test_flag_suspected_mismatches_unflags_when_prices_align(db_session):
+    """Existing needs_review=True flag сбрасывается если spread упал ниже порога."""
+    m = _add_match_with_prices(
+        db_session,
+        name="Was spread",
+        prices_by_site={"pharmonline": 10.0, "aloe": 11.0},  # уже close
+    )
+    m.needs_review = True  # был flagged, симулируем
+    db_session.commit()
+    changed = matcher.flag_suspected_mismatches(db_session)
+    assert changed == 1
+    db_session.refresh(m)
+    assert m.needs_review is False
+
+
+def test_flag_suspected_mismatches_zero_changes_returns_zero(db_session):
+    """Если ни один флаг не изменился → 0 (no commit overhead)."""
+    _add_match_with_prices(
+        db_session,
+        name="Already stable",
+        prices_by_site={"pharmonline": 10.0, "aloe": 10.5},  # close
+    )
+    # Первый вызов установит false (или уже false) — второй меняет 0
+    matcher.flag_suspected_mismatches(db_session)
+    second = matcher.flag_suspected_mismatches(db_session)
+    assert second == 0
+
+
+def test_flag_suspected_mismatches_skips_singleton_clusters(db_session):
+    """Match с одним продуктом (< 2) — пропускается."""
+    m = _add_match_with_prices(
+        db_session,
+        name="Solo",
+        prices_by_site={"pharmonline": 10.0},  # single site
+    )
+    matcher.flag_suspected_mismatches(db_session)
+    db_session.refresh(m)
+    assert m.needs_review is False
+
+
+def test_flag_suspected_mismatches_empty_db_returns_zero(db_session):
+    """Нет matches → 0, не падает."""
+    assert matcher.flag_suspected_mismatches(db_session) == 0
