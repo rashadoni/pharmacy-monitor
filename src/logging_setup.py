@@ -33,10 +33,12 @@ def configure_logging(service: str = "app") -> None:
     log_format = os.environ.get("LOG_FORMAT", "json").lower()
     log_file = os.environ.get("LOG_FILE")  # e.g. /var/log/pharmacy-monitor/app.jsonl
 
+    # Note (2026-05-28): убран `structlog.stdlib.add_logger_name` —
+    # он требует Logger.name attribute, а мы используем PrintLoggerFactory
+    # (не stdlib). Без этого fix первый же log emit падал с AttributeError.
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         # Always include service tag for filtering across CLI / API / scraper
         _add_service_tag(service),
