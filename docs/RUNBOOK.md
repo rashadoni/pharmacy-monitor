@@ -321,3 +321,245 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
 - VPS недоступен → хостинг (Hetzner/DigitalOcean)
 - Email не идёт → Gmail support / новый App Password
 - Telegram молчит → @BotFather
+
+---
+
+## 🌐 Scraper proxy chain + DDP recovery (2026-05-28)
+
+Текущий runtime:
+
+| Сайт | Где | Чем | Proxy |
+|---|---|---|---|
+| **pharmonline.az** | Hetzner prod | **Meteor DDP WebSocket** (`src/scrapers/pharmonline_ddp.py`) | IPRoyal residential `geo.iproyal.com:12321` |
+| **aloe.az** | Hetzner prod | Playwright DOM (`src/scrapers/aloe.py`) | Direct (no proxy needed) |
+| **aptekonline.az** | **Mac launchd only** | httpx JSON API (`src/scrapers/aptekonline.py`) | Direct from Baku-IP |
+
+### DDP recovery procedures
+
+**HTTP 403 на WebSocket handshake** (наблюдалось 2026-05-27):
+- Cloudflare/IPRoyal session ban после high-volume scrape
+- Wait 5-10 мин, retry — IPRoyal session rotation помогает
+- Если повторяется: `systemctl restart pharmacy-monitor-scrape@pharmonline`
+- Если упорно: переключиться на Mac launchd как fallback (см. `infra/local/run-scrape.sh`)
+
+**`ConnectionClosedError: no close frame received or sent`** во время persist phase:
+- Это нормально — DDP server тайм-аутит ping pong когда event loop долго блокирован
+- `_DDPClient` имеет reconnect-on-close (Phase 1c.4) — auto-recover, retry 1 раз с fresh session
+- Если retry тоже падает → check `journalctl -u pharmacy-monitor-scrape@pharmonline`
+
+**Меняем proxy провайдер**:
+```bash
+# Update /etc/pharmacy-monitor/env on prod (root only)
+# IPROYAL_USERNAME, IPROYAL_PASSWORD, IPROYAL_HOST=geo.iproyal.com:12321
+# BRIGHTDATA_USERNAME, BRIGHTDATA_PASSWORD, BRIGHTDATA_HOST
+# SCRAPER_API_KEY (fallback)
+# Restart scrape:
+systemctl restart pharmacy-monitor-scrape@pharmonline
+```
+
+Priority order in `src/scrapers/base.py`:
+1. IPRoyal residential (primary для pharmonline)
+2. Bright Data Web Unlocker (secondary, для aptekonline)
+3. ScraperAPI default pool (3rd-priority, free tier)
+4. Direct connection (fallback)
+
+### Firecrawl as scraper backup (Phase 6 — Firecrawl MCP)
+
+Бэкап путь когда нативные скрейперы падают:
+```python
+# Один продукт через Firecrawl API ($0.005 per scrape)
+curl -X POST 'https://api.firecrawl.dev/v2/scrape' \
+  -H "Authorization: Bearer $FIRECRAWL_API_KEY" \
+  -d '{"url":"...","formats":["markdown"]}'
+```
+
+**Cloudflare bypass работает** для pharmonline (verified 2026-05-28). Используем когда DDP блокирован.
+
+**НЕ для daily 25k+ scrape** — free tier 1000 credits/мес, не покрывает full coverage. Только для targeted use cases:
+- Quality-control re-scrape подозрительных matches
+- AI crawler fallback (см. `src/scrapers/ai_crawler.py`)
+- Backfill specific fields для existing products
+
+---
+
+## 🌍 i18n routing (Phase 6.1, 2026-05-28)
+
+URL pattern: `/<locale>/<route>` где locale ∈ {ru, az, en}.
+
+### Архитектура
+
+- **No middleware** — обходит next-intl issue #524 (standalone middleware rewrite recursion)
+- `app/[locale]/layout.tsx` — locale validation + setRequestLocale + NextIntlClientProvider
+- `app/page.tsx` — root redirect → `/ru`
+- `app/[locale]/page.tsx` — `/ru` → `/ru/overview`
+- `next.config.mjs` `redirects()` — backward compat для legacy unprefixed URLs (`/comparison` → `/ru/comparison`)
+
+### Debug recipes
+
+**Locale переключение не работает на конкретной странице**:
+```bash
+# Verify locale appears in URL
+curl -sSI https://leaddrive.cloud/az/comparison | grep -i location
+# Should return 307 → /login (auth gate) или 200 (page renders)
+```
+
+**Получаешь 500 на /[locale]/ страницах**:
+- Check journal: `journalctl -u pharmacy-monitor-frontend --since "5 min ago" | grep -i error`
+- "Failed to proxy localhost:3000" → middleware был не удалён, проверь `ls frontend/src/middleware.ts`
+- useSearchParams ошибка → нужен Suspense boundary в client component
+
+**Старые bookmarks `/comparison` не работают**:
+- Verify `next.config.mjs` имеет `redirects()` block
+- Test: `curl -sSI https://leaddrive.cloud/comparison` → 307 → /ru/comparison
+- Если 404 — `redirects()` не сработал или route не в `LEGACY_ROUTES` list
+
+### Add new locale-aware route
+
+1. `frontend/src/app/[locale]/<route>/page.tsx` (главная страница)
+2. Внутренние `<Link>` — используй `import {Link} from "@/i18n/navigation"`
+3. Для backward compat: добавь `<route>` в `LEGACY_ROUTES` массив в `next.config.mjs`
+
+---
+
+## 🕐 Intraday rotation (Phase 5.1c, 2026-05-28)
+
+Hourly during business hours (05-17 UTC), rotates через top-30 volatile категорий.
+
+### Manual trigger
+
+```bash
+# Dry-run (preview без mutation)
+ssh root@46.225.149.52 'cd /opt/pharmacy-monitor && \
+  sudo -u pm bash -c "set -a; source /etc/pharmacy-monitor/env; \
+  .venv/bin/pharmacy-monitor intraday-tick --dry-run"'
+
+# Real tick
+ssh root@46.225.149.52 'systemctl start pharmacy-monitor-intraday.service'
+```
+
+### Inspect rotation state (Redis)
+
+```bash
+ssh root@46.225.149.52 '
+  redis-cli get "intraday:rotation:idx"  # current index
+  redis-cli ttl "intraday:lock:site:pharmonline"  # TTL до next tick allowed
+  redis-cli ttl "intraday:lock:site:aloe"
+'
+```
+
+### Reset rotation (если зависло)
+
+```bash
+ssh root@46.225.149.52 '
+  redis-cli del "intraday:rotation:idx" "intraday:lock:site:pharmonline" "intraday:lock:site:aloe"
+'
+# Next tick перезапустится с idx=1
+```
+
+### Disable intraday (если жрёт proxy credits)
+
+```bash
+ssh root@46.225.149.52 'systemctl disable --now pharmacy-monitor-intraday.timer'
+```
+
+---
+
+## 🔌 MCP servers — 9 stack (2026-05-28)
+
+**Доступны во всех проектах через user-scope** (`~/.claude.json`). Когда использовать:
+
+| MCP | Best for |
+|---|---|
+| `mcp__perplexity-ask__*` | Anti-hallucination, fact-check, library docs |
+| `mcp__brave-search__*` | Independent search для cross-check (Perplexity backup) |
+| `mcp__firecrawl__*` | Web scraping, Cloudflare bypass, schema extract |
+| `mcp__postgres__*` | DB queries без SSH (через persistent tunnel :5433) |
+| `mcp__github__*` | Native PR/issues/code-search |
+| `mcp__memory__*` | Cross-session knowledge graph |
+| `mcp__playwright__*` | Cross-browser E2E automation, login flows |
+| `mcp__chrome-devtools__*` | Debug live Chrome — Network/Console/Performance |
+| `mcp__openrouter-sonar__*` | Sonar models (если OpenRouter credits ok) |
+
+### Postgres MCP — SSH tunnel auto-start
+
+`~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist` (auto-restart, persistent).
+
+Управление:
+```bash
+launchctl list | grep db-tunnel  # status
+launchctl bootout gui/$UID/com.pharmacy-monitor.db-tunnel  # stop
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist  # start
+tail -f ~/Library/Logs/pharmacy-monitor-db-tunnel.log  # tunnel logs
+```
+
+### MCP debug
+
+```bash
+# Список servers + connection status
+claude mcp list
+
+# Re-spawn конкретный server (после env update в config)
+claude mcp remove <name> -s user
+claude mcp add <name> -s user -e KEY=VAL -- <cmd>
+
+# Если tool возвращает "Unauthorized" — env not propagating
+# Check process args:
+ps -ef | grep <server-name> | head -2
+```
+
+---
+
+## 🔑 API key rotation
+
+Все ключи в `~/.claude.json` plain text. Ротация procedures:
+
+### Perplexity (`pplx-...`)
+1. https://www.perplexity.ai/settings/api → Regenerate
+2. Update config: `claude mcp remove perplexity-ask -s user && claude mcp add perplexity-ask -s user -e PERPLEXITY_API_KEY=NEW -- npx -y server-perplexity-ask`
+
+### Firecrawl (`fc-...`)
+1. https://www.firecrawl.dev/dashboard → API Keys → Regenerate
+2. Update config: `claude mcp remove firecrawl -s user && claude mcp add firecrawl -s user -e FIRECRAWL_API_KEY=NEW -- npx -y firecrawl-mcp`
+
+### Brave (`BSA...`)
+1. https://api-dashboard.search.brave.com/app/keys → Revoke + new
+2. Update config: `claude mcp remove brave-search -s user && claude mcp add brave-search -s user -e BRAVE_API_KEY=NEW -- npx -y brave-search-mcp`
+
+### GitHub PAT (`github_pat_...`)
+1. https://github.com/settings/personal-access-tokens → Revoke
+2. New token: see CLAUDE.md / Phase 6.1 setup
+3. Update config: `claude mcp remove github -s user && claude mcp add github -s user -e GITHUB_PERSONAL_ACCESS_TOKEN=NEW -- github-mcp-server stdio`
+
+После rotation — restart Claude Code чтобы MCP servers re-spawn с новыми env.
+
+---
+
+## 🧪 Restore drill — verified 2026-05-27
+
+**Recovery scenario**: восстановить frontend после failed deploy (i18n rollback experience).
+
+```bash
+# 1. Find latest pre-deploy backup
+LATEST=$(ssh root@46.225.149.52 'ls -t /var/backups/pharmacy-monitor/frontend-src-pre-*.tgz | head -1')
+echo "Will restore from: $LATEST"
+
+# 2. Restore
+ssh root@46.225.149.52 '
+  cd /opt/pharmacy-monitor
+  rm -rf frontend/src
+  tar xzf '"$LATEST"'
+  chown -R pm:pm frontend/src
+'
+
+# 3. Rebuild + restart
+ssh root@46.225.149.52 '
+  cd /opt/pharmacy-monitor/frontend
+  sudo -u pm bash -c "NODE_OPTIONS=--max-old-space-size=4096 pnpm build"
+  systemctl restart pharmacy-monitor-frontend
+'
+
+# 4. Verify
+curl -sSI https://leaddrive.cloud/login | head -2  # should be HTTP/2 200
+```
+
+**RTO measured**: ~3-5 минут. Backups создаются автоматически перед deploy через ExecStartPre hook + manual `tar czf` step в deploy скриптах.
