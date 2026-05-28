@@ -173,3 +173,113 @@ def test_email_failure_does_not_break_reporter(monkeypatch):
         error_reporting.report_error(e, component="x", notify=True)
     # JSONL запись всё равно появилась
     assert error_reporting.ERRORS_LOG.read_text().strip()
+
+
+def test_jsonl_write_failure_doesnt_break_reporter(monkeypatch):
+    """Если файловая запись падает (disk full / permission) — report_error
+    не должен падать. JSONL-write обёрнут в try/except для resilience."""
+    _stub_notifier(monkeypatch)
+
+    # Делаем ERRORS_LOG.parent.mkdir() падать
+    class FailPath:
+        @property
+        def parent(self):
+            return self
+
+        def mkdir(self, **_kw):
+            raise PermissionError("disk read-only")
+
+        def open(self, *a, **kw):
+            raise PermissionError("disk read-only")
+
+    monkeypatch.setattr(error_reporting, "ERRORS_LOG", FailPath())
+
+    try:
+        raise ValueError("test")
+    except ValueError as e:
+        # Не должно raise
+        error_reporting.report_error(e, component="x", notify=False)
+
+
+def test_dedup_cleanup_removes_very_old_fingerprints(monkeypatch):
+    """Старые entries (> 2× DEDUP_WINDOW) удаляются из _RECENT при очередном report."""
+    _stub_notifier(monkeypatch)
+    # Вручную добавим устаревший fingerprint
+    error_reporting._RECENT["very-old"] = time.time() - (error_reporting._DEDUP_WINDOW * 3)
+    try:
+        raise ValueError("cleanup-trigger")
+    except ValueError as e:
+        error_reporting.report_error(e, component="x", notify=False)
+    assert "very-old" not in error_reporting._RECENT
+
+
+def test_install_global_handler_sets_excepthook():
+    """install_global_handler() заменяет sys.excepthook."""
+    import sys
+
+    original = sys.excepthook
+    try:
+        error_reporting.install_global_handler()
+        assert sys.excepthook is not original
+        # Hook is callable
+        assert callable(sys.excepthook)
+    finally:
+        sys.excepthook = original
+
+
+def test_install_global_handler_passes_through_keyboard_interrupt(monkeypatch):
+    """KeyboardInterrupt должен идти в default excepthook (не репортиться)."""
+    import sys
+
+    original = sys.excepthook
+    try:
+        # Stub report_error чтобы заметить если вызывалось
+        report_called = []
+        monkeypatch.setattr(
+            error_reporting,
+            "report_error",
+            lambda *a, **kw: report_called.append(True),
+        )
+        # Stub __excepthook__ tracking
+        default_called = []
+        monkeypatch.setattr(sys, "__excepthook__", lambda *a: default_called.append(True))
+
+        error_reporting.install_global_handler()
+        # Simulate KeyboardInterrupt
+        try:
+            raise KeyboardInterrupt()
+        except KeyboardInterrupt as e:
+            sys.excepthook(type(e), e, e.__traceback__)
+
+        assert report_called == [], "report_error не должен вызываться для KeyboardInterrupt"
+        assert default_called == [True], "Default excepthook должен быть вызван"
+    finally:
+        sys.excepthook = original
+
+
+def test_install_global_handler_reports_real_exceptions(monkeypatch):
+    """Real exceptions — report_error вызывается + default hook тоже."""
+    import sys
+
+    original = sys.excepthook
+    try:
+        report_called = []
+        monkeypatch.setattr(
+            error_reporting,
+            "report_error",
+            lambda *a, **kw: report_called.append(a),
+        )
+        default_called = []
+        monkeypatch.setattr(sys, "__excepthook__", lambda *a: default_called.append(True))
+
+        error_reporting.install_global_handler()
+        try:
+            raise RuntimeError("oops")
+        except RuntimeError as e:
+            sys.excepthook(type(e), e, e.__traceback__)
+
+        assert len(report_called) == 1
+        assert isinstance(report_called[0][0], RuntimeError)
+        assert default_called == [True]
+    finally:
+        sys.excepthook = original
