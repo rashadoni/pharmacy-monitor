@@ -1,8 +1,15 @@
 """roi_actions_cache table
 
 Revision ID: 0005_roi_cache
-Revises: 0004_norm_attrs
+Revises: 0003_notif_prefs
 Create Date: 2026-05-17
+
+History note (2026-05-28): originally `Revises: 0004_norm_attrs` (AI normalizer
++ structured-attrs matcher migration, commit 33c8495). That migration was later
+reverted/deleted but down_revision не обновился — ломало fresh deploys (CI
+alembic upgrade head failed `KeyError: 0004_norm_attrs`). Прод-DB уже на 0008
+head, не impacted. Fixed: down_revision now points back to 0003 (skipping
+deleted 0004).
 
 ROI actions endpoint (`compute_actions`) делает 4 функции с N+1 SQL по 3388
 матчам — 15-30с. Frontend timeout'ит на 15с и показывает `API 408` на 4
@@ -23,7 +30,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0005_roi_cache"
-down_revision: str | None = "0004_norm_attrs"
+down_revision: str | None = "0003_notif_prefs"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
