@@ -403,10 +403,33 @@ class PharmonlineDDPScraper(BaseScraper):
     async def scrape_category(
         self, category_slug: str, limit: int | None = None
     ) -> AsyncIterator[ScrapedProduct]:
+        """Yield products from DDP pagination, deduped by external_id.
+
+        Bug fix 2026-05-28 (Codex/DB-audit): прежний код выдавал ровно 10K
+        для больших категорий — но в БД оказывалось ≤ 200 уникальных. Причина:
+        (а) НИКАКОГО dedup по external_id внутри одной категории.
+        (б) `offset += 1` неоднозначно: может быть page-index, а DDP API
+            возможно ожидает product-index. Pharmonline возвращал overlapping
+            страницы → counter рос, unique оставались десятки.
+
+        Fix:
+        - `seen_external_ids` set предотвращает duplicate yields.
+        - Если 3 страницы подряд дали 0 новых → end-of-stream (защита от
+          server возвращающего infinite-overlap).
+        - `max_yield` теперь env-configurable через
+          `PHARMONLINE_DDP_MAX_YIELD_PER_CATEGORY` (default 50_000 — pharmonline
+          катaлог 26K, всю категорию покрываем).
+        """
         assert self._ddp is not None
         offset = 0
         yielded = 0
-        max_yield = limit if limit is not None else 10_000
+        max_yield = (
+            limit
+            if limit is not None
+            else int(os.getenv("PHARMONLINE_DDP_MAX_YIELD_PER_CATEGORY", "50000"))
+        )
+        seen_external_ids: set[str] = set()
+        zero_new_streak = 0  # подряд страниц с 0 новыми → break
 
         while yielded < max_yield:
             params = [
@@ -433,19 +456,52 @@ class PharmonlineDDPScraper(BaseScraper):
             if not products:
                 break
 
+            page_new = 0
+            page_dup = 0
             for raw in products:
                 sp = _build_product(raw, self._locale, self._cat_map)
                 if sp is None:
                     continue
+                if sp.external_id in seen_external_ids:
+                    page_dup += 1
+                    continue
+                seen_external_ids.add(sp.external_id)
+                page_new += 1
                 yielded += 1
                 yield sp
                 if yielded >= max_yield:
                     return
 
+            # Если на странице 0 новых — копим streak
+            if page_new == 0:
+                zero_new_streak += 1
+                if zero_new_streak >= 3:
+                    log.info(
+                        "pharmonline_ddp_pagination_exhausted",
+                        category=category_slug,
+                        pages=offset + 1,
+                        yielded=yielded,
+                        reason="3 pages in a row with 0 new products",
+                    )
+                    break
+            else:
+                zero_new_streak = 0
+
+            if page_dup and page_new == 0:
+                # Лог если страница полностью overlapping — это сигнал что
+                # pharmonline DDP pagination возвращает одни и те же items
+                # на разных offset'ах
+                log.debug(
+                    "pharmonline_ddp_page_all_dup",
+                    category=category_slug,
+                    offset=offset,
+                    dup=page_dup,
+                )
+
             # If we got fewer than page_size, we've hit the end
             if len(products) < self._page_size:
                 break
-            offset += 1  # offset is page-index, NOT product-index
+            offset += 1  # offset is page-index in current DDP semantics
 
     async def scrape_promos(self) -> list[ScrapedPromo]:  # type: ignore[override]
         # Promo banners are SSR'd into homepage HTML — separate scraper task.
