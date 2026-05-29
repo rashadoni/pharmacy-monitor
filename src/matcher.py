@@ -482,6 +482,45 @@ def _has_conflicting_variant_atoms(name_raw_a: str, name_raw_b: str) -> bool:
     return bool(atoms_a - atoms_b) and bool(atoms_b - atoms_a)
 
 
+# ── Многозначная сила/доза (2026-05-29) ─────────────────────────────────────
+# variant-atoms берёт только 1-9 (серия/одиночная mg). Большие силы — enzyme/IU
+# единицы (Mikrazim 25000 ED ≠ 10000, Creon 25000 ≠ 10000, D3 50000 IU) — это
+# 4+-значные числа, которые normalize вырезает как dosage/число. Сравниваем их
+# из RAW: thousand-space «50 000»→«50000», убираем pack (N20/№20/20 əd), берём
+# standalone 4+-значные. Блок только если у ОБОИХ есть такое число и они разные
+# (50000 IU == 50 000 BV → не блок; 25000 ≠ 10000 → блок). Volume/доза <1000
+# (100ml, 500mg) не трогаем — это bucket/другие guard'ы.
+_STRENGTH_NUM_RE = re.compile(r"(?<![\d.])\d{4,}(?![\d.])")
+_THOUSAND_SPACE_RE = re.compile(r"(\d)\s+(\d{3})(?!\d)")
+
+
+def _strength_numbers(raw_name: str) -> frozenset[str]:
+    low = strip_accents(raw_name or "").lower()
+    low = _THOUSAND_SPACE_RE.sub(r"\1\2", low)  # «50 000» → «50000»
+    # NB: НЕ применяем _VA_AZ_PACK_UNIT_RE — её «ed» (ədəd=штук после strip_accents)
+    # коллизит с «ED» (enzyme units: Mikrazim 25000 ED) → съедал бы силу. Pack-
+    # счётчики <1000, на 4+-значную силу не влияют, так что убирать pack тут не нужно.
+    for rx in (_VA_NUM_HASH_RE, _VA_PACK_RE):
+        low = rx.sub(" ", low)
+    return frozenset(_STRENGTH_NUM_RE.findall(low))
+
+
+def _has_conflicting_strength_number(name_raw_a: str, name_raw_b: str) -> bool:
+    """True если у обоих имён есть 4+-значная сила и множества различаются."""
+    a = _strength_numbers(name_raw_a)
+    b = _strength_numbers(name_raw_b)
+    return bool(a) and bool(b) and a != b
+
+
+def _significant_name_tokens(name_norm: str | None) -> frozenset[str]:
+    """Значащие токены name_normalized: len≥4, не noise/modifier (для ambiguity)."""
+    return frozenset(
+        t
+        for t in (name_norm or "").split()
+        if len(t) >= 4 and t not in _MATCH_NOISE_TOKENS and t not in _PHARMA_MODIFIERS
+    )
+
+
 def _build_word_freq(products: list) -> dict[str, int]:
     """Частота слов по всем name_normalized.
 
@@ -667,6 +706,40 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     for p in products:
         buckets[bucket_key(p)].append(p)
 
+    # ── Ambiguity pre-pass (2026-05-29): неоднозначный генерик ──────────────────
+    # aptek листит коммодити генерически («Çaytikanı yağı 100ml»), pharm — с
+    # брендом (Altay/Mirrolla/Medoil/Seide). Генерик подходит под НЕСКОЛЬКО разных
+    # брендов → какой «тот же товар» неизвестно → матчер цеплял произвольно (ложный
+    # cross-brand spread). Правило: если товар fuzzy-матчится к ≥2 кросс-сайт
+    # кандидатам с РАЗНЫМИ значащими «лишними» токенами — он неоднозначен → не
+    # матчим (кладём в visited ниже). Легит verbose-vs-terse НЕ страдает: Nestogen-1
+    # матчится к ОДНОМУ Nestogen-1 (один кандидат, не ≥2 различных). Валидировано
+    # на прод-дампе (scripts/scan_brandstub.py).
+    ambiguous_ids: set[int] = set()
+    for _agrp in buckets.values():
+        if len(_agrp) < 3:
+            continue
+        _sig = {p.id: _significant_name_tokens(p.name_normalized) for p in _agrp}
+        for q in _agrp:
+            _extras: set[frozenset[str]] = set()
+            for p in _agrp:
+                if p.site == q.site or p.id == q.id:
+                    continue
+                if (
+                    fuzz.token_set_ratio(q.name_normalized or "", p.name_normalized or "")
+                    < fuzzy_threshold
+                ):
+                    continue
+                _extra = _sig[p.id] - _sig[q.id]
+                if _extra:
+                    _extras.add(_extra)
+                if len(_extras) >= 2:
+                    break
+            if len(_extras) >= 2:
+                ambiguous_ids.add(q.id)
+    if ambiguous_ids:
+        log.info("matcher_ambiguous_generics_suppressed", count=len(ambiguous_ids))
+
     # ── Sibling-form check ───────────────────────────────────────────────────
     # Если продукт P не имеет формы выпуска, но на его сайте в том же bucket'е
     # уже есть другой продукт с явной формой X → P НЕ является формой X (иначе
@@ -749,6 +822,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
         clusters_created=barcode_matches_created,
     )
 
+    # Неоднозначные генерики (ambiguity pre-pass выше) → в visited, чтобы все 4
+    # fuzzy-прохода их пропускали (не матчили ни анкером, ни кандидатом). Barcode-
+    # матч их не трогает — у генериков нет штрихкода.
+    visited |= ambiguous_ids
+
     for key, group in buckets.items():
         if len(group) < 2:
             continue
@@ -827,6 +905,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
                 # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
                 if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Многозначная сила: Mikrazim 25000 ED ≠ 10000 (enzyme/IU единицы).
+                if any(
+                    _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
+                ):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= fuzzy_threshold:
@@ -928,6 +1011,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
                 # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
                 if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Многозначная сила: Mikrazim 25000 ED ≠ 10000 (enzyme/IU единицы).
+                if any(
+                    _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
+                ):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _SEC_THRESHOLD:
@@ -1031,6 +1119,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
                 # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
                 if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Многозначная сила: Mikrazim 25000 ED ≠ 10000 (enzyme/IU единицы).
+                if any(
+                    _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
+                ):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _TERT_THRESHOLD:
@@ -1136,6 +1229,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
                 # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
                 if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Многозначная сила: Mikrazim 25000 ED ≠ 10000 (enzyme/IU единицы).
+                if any(
+                    _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
+                ):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _QUART_THRESHOLD:

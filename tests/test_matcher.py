@@ -5,12 +5,14 @@ from src.matcher import (
     _has_conflicting_form,
     _has_conflicting_gender,
     _has_conflicting_series_number,
+    _has_conflicting_strength_number,
     _has_conflicting_variant_atoms,
     _has_conflicting_variant_tokens,
     _has_extreme_length_disparity,
     _has_perunit_mismatch,
     _is_significant_variant_token,
     _pack_count,
+    _strength_numbers,
     _variant_atoms,
 )
 
@@ -1260,3 +1262,112 @@ class TestHasConflictingVariantAtoms:
             _has_conflicting_variant_atoms("Paracetamol 500 mg N20", "Paracetamol 500 mq N10")
             is False
         )
+
+
+# ── Strength-number conflict (Mikrazim 25000 ED ≠ 10000) ─────────────────────
+
+
+class TestStrengthNumber:
+    def test_blocks_different_enzyme_strength(self):
+        assert (
+            _has_conflicting_strength_number(
+                "Mikrazim 25000 ED № 20 (Kapsulalar)", "Mikrazim  10000  N20"
+            )
+            is True
+        )
+
+    def test_allows_same_strength_diff_notation(self):
+        # 50000 IU == 50 000 BV (thousand-space normalize; обе = единицы)
+        assert (
+            _has_conflicting_strength_number("D3 Ferol 50000 IU 15 ml", "D3 Ferol 50 000 BV 15 ml")
+            is False
+        )
+
+    def test_ed_enzyme_units_not_eaten_as_pack(self):
+        # «25000 ED» (enzyme) НЕ стрипается как «əd»=штук → сила извлекается
+        assert _strength_numbers("Mikrazim 25000 ED № 20") == frozenset({"25000"})
+
+    def test_ignores_sub_1000_volume_dose(self):
+        assert _strength_numbers("Çaytikanı yağı 100 ml") == frozenset()  # 100 < 1000
+        assert _strength_numbers("Aspirin 500 mg") == frozenset()  # 500 < 1000
+
+    def test_one_sided_strength_not_blocked(self):
+        # одна сторона со силой, другая без → неполные данные, не блокируем
+        assert _has_conflicting_strength_number("Mikrazim 25000 ED", "Mikrazim") is False
+
+
+# ── Ambiguity-suppression: генерик ↔ несколько брендов (2026-05-29) ───────────
+
+
+def test_ambiguous_generic_suppressed(db_session):
+    """Генерик («Çaytikanı yağı»), матчащийся к ≥2 РАЗНЫМ брендам (Altay,
+    Mirrolla) — неоднозначен → не матчим (какой «тот же товар» неизвестно)."""
+    s = db_session
+    g = _make_product(
+        s,
+        site="aptekonline",
+        external_id="cg",
+        name="Çaytikanı yağı 100 ml",
+        name_normalized="caytikani yagi",
+        brand="caytikani",
+        pack_size="100ml",
+    )
+    _make_product(
+        s,
+        site="pharmonline",
+        external_id="ca",
+        name="Çaytikanı yağı Altay 100 ml",
+        name_normalized="caytikani yagi altay",
+        brand="caytikani",
+        pack_size="100ml",
+    )
+    _make_product(
+        s,
+        site="pharmonline",
+        external_id="cm",
+        name="Çaytikanı yağı Mirrolla 100 ml",
+        name_normalized="caytikani yagi mirrolla",
+        brand="caytikani",
+        pack_size="100ml",
+    )
+    s.commit()
+    matcher.match_products(s)
+    s.refresh(g)
+    assert g.canonical_id is None  # неоднозначен → подавлен
+
+
+def test_single_brand_generic_still_matches(db_session):
+    """Генерик + ОДИН бренд (один уникальный токен у всех кандидатов) → НЕ
+    ambiguous → матчится (легит verbose-vs-terse сохранён)."""
+    s = db_session
+    g = _make_product(
+        s,
+        site="aptekonline",
+        external_id="bg",
+        name="Biyan 100 ml",
+        name_normalized="biyan",
+        brand="biyan",
+        pack_size="100ml",
+    )
+    _make_product(
+        s,
+        site="pharmonline",
+        external_id="ba",
+        name="Biyan Altay 100 ml",
+        name_normalized="biyan altay",
+        brand="biyan",
+        pack_size="100ml",
+    )
+    _make_product(
+        s,
+        site="aloe",
+        external_id="ba2",
+        name="Biyan Altay 100 ml",
+        name_normalized="biyan altay",
+        brand="biyan",
+        pack_size="100ml",
+    )
+    s.commit()
+    matcher.match_products(s)
+    s.refresh(g)
+    assert g.canonical_id is not None  # один бренд → не ambiguous → матч
