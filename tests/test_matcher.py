@@ -2,9 +2,13 @@
 
 from src import match_actions, matcher, storage
 from src.matcher import (
+    _concentrations,
     _country_from_url,
     _country_of,
+    _dimensions,
+    _has_conflicting_concentration,
     _has_conflicting_country,
+    _has_conflicting_dimensions,
     _has_conflicting_form,
     _has_conflicting_gender,
     _has_conflicting_series_number,
@@ -1503,6 +1507,100 @@ def test_country_blocks_cross_country_match(db_session):
         brand="qliserin",
         pack_size="50ml",
         url="https://pharmonline.az/product/qliserin-50-ml-mehlul-azerfarm-mmc-azerbaycan",
+    )
+    s.commit()
+    matcher.match_products(s)
+    s.refresh(a)
+    s.refresh(b)
+    assert a.canonical_id != b.canonical_id or (a.canonical_id is None and b.canonical_id is None)
+
+
+# ── Габариты AxB + концентрация % (2026-05-29) ────────────────────────────────
+
+
+class TestDimensionGuard:
+    def test_extract_basic(self):
+        assert _dimensions("Alban 10 sm x 10 sm N25") == frozenset({(100.0, 100.0)})
+        assert _dimensions("Alban 10 smx25 sm") == frozenset({(100.0, 250.0)})
+
+    def test_order_and_mixed_units(self):
+        # порядок не важен; смешанные единицы (m + sm) приводятся к мм
+        assert _dimensions("X 5 m x 2.5 sm") == _dimensions("X 2.5 sm x 5 m")
+
+    def test_no_false_dimension_from_volume(self):
+        assert _dimensions("Drug 10 x 5 ml") == frozenset()  # ml — не длина
+        assert _dimensions("Kleksan 40 mq/0.4 ml N2") == frozenset()
+
+    def test_conflict(self):
+        assert _has_conflicting_dimensions("Alban 10 sm x 10 sm", "Alban 10 smx25 sm") is True
+        assert _has_conflicting_dimensions("Alban 10 sm x 30 sm", "Alban 10smx30sm") is False
+        # одна сторона без размера → не блокируем
+        assert _has_conflicting_dimensions("Alban 10 sm x 10 sm", "Alban N25") is False
+
+
+class TestConcentrationGuard:
+    def test_extract(self):
+        assert _concentrations("Tetrasiklin 3% 15 q") == frozenset({3.0})
+        assert _concentrations("Novokain 0.5% 2 ml") == frozenset({0.5})
+
+    def test_conflict(self):
+        assert _has_conflicting_concentration("Tetrasiklin 3% 15q", "Tetrasiklin 1% 15q") is True
+        assert _has_conflicting_concentration("Novokain 2% 2ml", "Novokain 0,5% 2ml") is True
+        assert (
+            _has_conflicting_concentration("Tetrasiklin 3% 15q", "Tetrasiklin 3 % 15 qr") is False
+        )
+        # одна сторона без % → не блокируем
+        assert _has_conflicting_concentration("Diklofenak 1%", "Diklofenak gel") is False
+
+
+def test_dimension_blocks_different_size(db_session):
+    """Пластырь Alban 10×10 ≠ 10×25 — разный размер, не матчатся."""
+    s = db_session
+    a = _make_product(
+        s,
+        site="aptekonline",
+        external_id="lp-10",
+        name='Leykoplastr "Alban" 10 sm x 10 sm N25',
+        name_normalized="leykoplastr alban",
+        brand="leykoplastr",
+        pack_size="n25",
+    )
+    b = _make_product(
+        s,
+        site="pharmonline",
+        external_id="lp-25",
+        name="Leykoplastr Alban 10 smx25 sm N25",
+        name_normalized="leykoplastr alban",
+        brand="leykoplastr",
+        pack_size="n25",
+    )
+    s.commit()
+    matcher.match_products(s)
+    s.refresh(a)
+    s.refresh(b)
+    assert a.canonical_id != b.canonical_id or (a.canonical_id is None and b.canonical_id is None)
+
+
+def test_concentration_blocks_different_percent(db_session):
+    """Tetrasiklin 3% ≠ 1% — разная концентрация, не матчатся."""
+    s = db_session
+    a = _make_product(
+        s,
+        site="aptekonline",
+        external_id="tet-3",
+        name="Tetrasiklin 3% 15 q məlhəm",
+        name_normalized="tetrasiklin",
+        brand="tetrasiklin",
+        pack_size="15q",
+    )
+    b = _make_product(
+        s,
+        site="pharmonline",
+        external_id="tet-1",
+        name="Tetrasiklin 1% 15 qr (Məlhəm)",
+        name_normalized="tetrasiklin",
+        brand="tetrasiklin",
+        pack_size="15q",
     )
     s.commit()
     matcher.match_products(s)

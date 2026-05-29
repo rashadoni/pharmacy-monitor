@@ -660,6 +660,63 @@ def _has_conflicting_country(a, b) -> bool:
     return bool(ca) and bool(cb) and ca != cb
 
 
+# ── Габариты AxB (2026-05-29) ────────────────────────────────────────────────
+# Пластыри/повязки/марля различаются размером: «Leykoplastr Alban 10sm x 10sm»
+# ≠ «10sm x 25sm» (разная площадь → разная цена, не арбитраж). Размер остаётся в
+# name_normalized, но fuzzy игнорирует разницу чисел. Извлекаем «ЧИСЛО[ед] x
+# ЧИСЛО ед» (ед: mm/sm/cm/m, разделитель x/х/×/*, смешанные единицы, без ед у
+# первого), нормализуем в мм, сравниваем как неупорядоченную пару.
+_DIM_UNIT_MM = {"mm": 1.0, "sm": 10.0, "cm": 10.0, "m": 1000.0}
+_DIM_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(mm|sm|cm|m)?\s*[x×х*]\s*"
+    r"(\d+(?:[.,]\d+)?)\s*(mm|sm|cm|m)(?![a-z])",
+    re.IGNORECASE,
+)
+
+
+def _dimensions(raw_name: str) -> frozenset[tuple[float, float]]:
+    """Габариты товара в мм как множество неупорядоченных пар (10×30 == 30×10)."""
+    low = strip_accents(raw_name or "").lower()
+    dims: set[tuple[float, float]] = set()
+    for m in _DIM_RE.finditer(low):
+        n1, u1, n2, u2 = m.group(1), m.group(2), m.group(3), m.group(4)
+        u1 = u1 or u2  # нет единицы у первого числа → берём от второго
+        try:
+            mm1 = float(n1.replace(",", ".")) * _DIM_UNIT_MM[u1.lower()]
+            mm2 = float(n2.replace(",", ".")) * _DIM_UNIT_MM[u2.lower()]
+        except (KeyError, ValueError, AttributeError):
+            continue
+        a, b = sorted((round(mm1, 1), round(mm2, 1)))
+        dims.add((a, b))
+    return frozenset(dims)
+
+
+def _has_conflicting_dimensions(name_raw_a: str, name_raw_b: str) -> bool:
+    """True если у ОБОИХ товаров есть габариты и они различаются (10×10 ≠ 10×25)."""
+    a = _dimensions(name_raw_a)
+    b = _dimensions(name_raw_b)
+    return bool(a) and bool(b) and a != b
+
+
+# ── Концентрация % (2026-05-29) ──────────────────────────────────────────────
+# «Tetrasiklin 3% 15q» ≠ «Tetrasiklin 1% 15q», «Novokain 2%» ≠ «0.5%» — разная
+# концентрация = разный препарат. extract_dosage % НЕ ловит (берёт вес/объём).
+_PERCENT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
+
+
+def _concentrations(raw_name: str) -> frozenset[float]:
+    return frozenset(
+        round(float(m.group(1).replace(",", ".")), 3) for m in _PERCENT_RE.finditer(raw_name or "")
+    )
+
+
+def _has_conflicting_concentration(name_raw_a: str, name_raw_b: str) -> bool:
+    """True если у ОБОИХ есть процент-концентрация и множества различаются."""
+    a = _concentrations(name_raw_a)
+    b = _concentrations(name_raw_b)
+    return bool(a) and bool(b) and a != b
+
+
 def _significant_name_tokens(name_norm: str | None) -> frozenset[str]:
     """Значащие токены name_normalized для ambiguity: len≥4, БЕЗ цифр, не noise/modifier.
 
@@ -1106,6 +1163,12 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # обоих страна известна и различается (см. _has_conflicting_country).
                 if any(_has_conflicting_country(c, q) for c in cluster):
                     continue
+                # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
+                if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
+                if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= fuzzy_threshold:
                     cluster.append(q)
@@ -1216,6 +1279,12 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # глицерин — разный товар, ложный 85% spread. Блок только если у
                 # обоих страна известна и различается (см. _has_conflicting_country).
                 if any(_has_conflicting_country(c, q) for c in cluster):
+                    continue
+                # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
+                if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
+                if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _SEC_THRESHOLD:
@@ -1329,6 +1398,12 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # глицерин — разный товар, ложный 85% spread. Блок только если у
                 # обоих страна известна и различается (см. _has_conflicting_country).
                 if any(_has_conflicting_country(c, q) for c in cluster):
+                    continue
+                # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
+                if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
+                if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _TERT_THRESHOLD:
@@ -1444,6 +1519,12 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # глицерин — разный товар, ложный 85% spread. Блок только если у
                 # обоих страна известна и различается (см. _has_conflicting_country).
                 if any(_has_conflicting_country(c, q) for c in cluster):
+                    continue
+                # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
+                if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
+                if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _QUART_THRESHOLD:
