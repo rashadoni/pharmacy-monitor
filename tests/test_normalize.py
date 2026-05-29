@@ -4,6 +4,7 @@ import pytest
 
 from src.normalize import (
     extract_dosage,
+    extract_form,
     extract_pack_size,
     normalize_name,
     pack_unit_count,
@@ -162,3 +163,35 @@ def test_pack_unit_count(pack_size, name, expected):
 def test_pack_unit_count_pack_size_priority_over_name():
     """pack_size проверяется первым; если там count — его и берём."""
     assert pack_unit_count("n30", "Aspirin N10 (старое имя)") == (30, "high")
+
+
+# ── «X ağacı» = растение, не категория/форма (2026-05-29) ─────────────────────
+
+
+def test_tree_plant_bigram_not_stripped():
+    """«Çay ağacı» (чайное дерево) и «Şam ağacı» (сосна) НЕ схлопываются в
+    «agaci» — иначе ложный матч чайное-дерево ↔ сосна (разные растения)."""
+    cay = normalize_name("Çay ağacı yağı 20 ml")
+    sam = normalize_name("Şam ağacı yağı 20 ml")
+    assert "cayagaci" in cay
+    assert "samagaci" in sam
+    assert cay != sam  # различимы → не матчатся
+
+
+def test_tea_tree_distinct_from_herbal_tea_category():
+    # «Çay ağacı» (дерево) сохраняет çay; обычный «çay»-префикс (категория) — нет
+    assert "cayagaci" in normalize_name("Çay ağacı efir yağı 10 ml")
+
+
+# ── yağı (масло) = форма «oil», oil ≠ solution (2026-05-29) ───────────────────
+
+
+def test_oil_form_distinct_from_solution():
+    assert extract_form("Qliserin yağı 50 ml") == "oil"
+    assert extract_form("Qliserin 50 ml (Məhlul)") == "solution"
+
+
+def test_oil_oil_same_form():
+    # масло ↔ масло (Çaytikanı обоих сайтов) остаётся одной формой → матч сохраняется
+    assert extract_form("Çaytikanı yağı 100 ml") == "oil"
+    assert extract_form("Lavanda yağı 10 ml") == "oil"

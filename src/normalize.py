@@ -71,9 +71,17 @@ _FORMS = (
     "capsules",
     "suppositories",  # English plural — pharmonline: «(Suppositories)»
     "sorma",  # Azerbaijani "dissolving" — not a form per se but pharmonline uses it
+    "yağı",  # масло (oil) — тип препарата; oil ≠ solution/cream (см. _FORM_CANONICAL).
+    "yağ",  # «Qliserin yağı»(oil) ≠ «Qliserin məhlul»(solution) — раньше не различались.
 )
 
 _FORMS_RE = re.compile(r"\b(" + "|".join(_FORMS) + r")\b", re.IGNORECASE)
+
+# «çay ağacı» (чайное дерево, Melaleuca) и «şam ağacı» (сосна) — РАСТЕНИЯ, а не
+# категория-«чай» / форма-«суппозиторий». Склеиваем биграмму ДО стрипа форм и
+# category-префиксов, иначе «çay»/«şam» вырезаются → «çay ağacı yağı» и «şam ağacı
+# yağı» оба схлопываются в «agaci yagi» → ложный матч чайное-дерево ↔ сосна.
+_TREE_PLANT_RE = re.compile(r"\b(çay|şam)\s+(ağac)", re.IGNORECASE)
 
 # Канонические группы форм выпуска: синонимы → одно имя.
 # Кремы ≠ мази ≠ капли ≠ спреи — это РАЗНЫЕ препараты, матчинг запрещён.
@@ -122,6 +130,13 @@ _FORM_CANONICAL: dict[str, str] = {
     "ampul": "ampoule",
     "ampoule": "ampoule",
     "amp": "ampoule",
+    # Масло (oil) — отдельная группа форм: «Qliserin yağı»(oil) ≠ «Qliserin
+    # məhlul»(solution), «Çay ağacı yağı»(oil) ≠ свечи. Масло↔масло (Çaytikanı
+    # yağı обоих сайтов) остаётся одной формой → матч сохраняется.
+    "yağı": "oil",
+    "yağ": "oil",
+    "yag": "oil",
+    "oil": "oil",
     # AZ-плюралы / EN-плюралы / синонимы (2026-05-29): раньше отсутствовали в
     # каноне → extract_form возвращал сам токен → ложный form-конфликт против
     # канона (напр. aptek «sorma tabletlər»→"sorma" vs pharm «tabletlər»→"tabletlər"
@@ -476,6 +491,8 @@ def normalize_name(name: str) -> str:
     # Схлопываем пробелы-разделители тысяч: «1 000 000 BV» → «1000000 BV»
     # ДО strip_accents/lower, чтобы _DOSAGE_RE корректно съел весь диапазон.
     s = _collapse_spaced_thousands(s)
+    # Защита «çay/şam ağacı» (растения) ДО стрипа форм/префиксов — см. _TREE_PLANT_RE.
+    s = _TREE_PLANT_RE.sub(r"\1\2", s)  # «çay ağacı»→«çayağac…», «şam ağacı»→«şamağac…»
     # Формы выпуска убираем ДО strip_accents — паттерны в _FORMS содержат
     # оригинальные ş/ə/ı (шамлар, дамджы…). После strip_accents ş→s, и тогда
     # «şamlar» не совпадает с паттерном «şamlar» — форма остаётся в имени,
