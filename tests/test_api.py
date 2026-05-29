@@ -489,6 +489,195 @@ def test_comparison_sorted_by_spread_desc(client, tenant_user, setup_db):
     assert names.index("big") < names.index("small")
 
 
+# ─── Comparison freshness (stale-цены, 2026-05-29) ───────────────────────────
+
+
+def _make_match_with_freshness(db, run, *, canonical, prods, tenant_id=1):
+    """Match + products с заданными (site, price, last_seen_at, captured_at).
+
+    Фасовка одинаковая (n20) у всех → basis остаётся raw, изолируем freshness.
+    """
+    m = storage.Match(tenant_id=tenant_id, canonical_name=canonical, confidence=1.0)
+    db.add(m)
+    db.flush()
+    for site, price, last_seen, captured in prods:
+        p = storage.Product(
+            tenant_id=tenant_id,
+            site=site,
+            external_id=f"{site}-{canonical}",
+            url=f"https://{site}/{canonical}",
+            name=f"{canonical} N20",
+            name_normalized=canonical.lower(),
+            pack_size="n20",
+            canonical_id=m.id,
+            last_seen_at=last_seen,
+        )
+        db.add(p)
+        db.flush()
+        db.add(
+            storage.PriceSnapshot(run_id=run.id, product_id=p.id, price=price, captured_at=captured)
+        )
+    db.commit()
+    return m
+
+
+def test_price_age_days_tz_defensive():
+    """_price_age_days: naive/aware/None/future (Codex HIGH fix 2026-05-29).
+
+    tz-aware вход НЕ должен падать (naive-aware вычитание = TypeError); future
+    timestamp (clock skew Mac↔prod) клампится в 0, age не уходит в минус.
+    """
+    now = utcnow()  # naive
+    assert api_module._price_age_days(now, now - timedelta(days=5)) == 5
+    # aware вход нормализуется, не падает
+    aware = (now - timedelta(days=10)).replace(tzinfo=timezone.utc)
+    assert api_module._price_age_days(now, aware) == 10
+    # None → None (last_seen_at=NULL)
+    assert api_module._price_age_days(now, None) is None
+    # future → clamp 0 (не отрицательное)
+    assert api_module._price_age_days(now, now + timedelta(days=3)) == 0
+
+
+def test_comparison_stale_price_excluded_from_spread(client, tenant_user, setup_db):
+    """Stale-цена (last_seen > 14д) показывается с stale=True + age_days, но НЕ
+    участвует в spread. aptek свежий 10.0, pharm устаревший 100.0 (30д): без
+    freshness был бы ложный spread 90%; теперь 1 свежая цена → spread=None,
+    строка видна с обеими ценами (ничего не теряется)."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    fresh = utcnow()
+    old = utcnow() - timedelta(days=30)
+    _make_match_with_freshness(
+        s,
+        run,
+        canonical="Staletest",
+        prods=[
+            ("aptekonline", 10.0, fresh, fresh),
+            ("pharmonline", 100.0, old, old),
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    row = next(x for x in rows if x["name"] == "Staletest")
+    # обе цены показаны
+    assert set(row["prices"].keys()) == {"aptekonline", "pharmonline"}
+    assert row["sites_with_price"] == 2
+    # pharm помечен stale + возраст ~30д; aptek свежий
+    assert row["prices"]["pharmonline"]["stale"] is True
+    assert row["prices"]["pharmonline"]["age_days"] >= 28
+    assert row["prices"]["aptekonline"]["stale"] is False
+    # spread НЕ посчитан (1 свежая цена) — устаревшая 100.0 не раздувает spread
+    assert row["spread_pct"] is None
+    # <2 свежих → min/max/cheapest тоже None (единственную свежую не подсвечиваем
+    # как «дешёвую» — сравнивать не с чем). Codex MED fix 2026-05-29.
+    assert row["min_price"] is None
+    assert row["max_price"] is None
+    assert row["cheapest_site"] is None
+
+
+def test_comparison_stable_price_not_stale(client, tenant_user, setup_db):
+    """diff-only корректность: товар со СТАБИЛЬНОЙ ценой имеет старый
+    captured_at (снапшот пишется только при смене цены), но СВЕЖИЙ last_seen_at
+    (видели в каждом прогоне). Свежесть считается по last_seen_at → НЕ stale,
+    spread считается нормально. Если бы считали по captured_at — ложно скрыли
+    бы половину каталога."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    fresh = utcnow()
+    old_snapshot = utcnow() - timedelta(days=40)  # цена не менялась 40 дней
+    _make_match_with_freshness(
+        s,
+        run,
+        canonical="Stableprice",
+        prods=[
+            # last_seen свежий (видели сегодня), но captured_at старый
+            ("aptekonline", 10.0, fresh, old_snapshot),
+            ("pharmonline", 15.0, fresh, old_snapshot),
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    row = next(x for x in rows if x["name"] == "Stableprice")
+    assert row["prices"]["aptekonline"]["stale"] is False
+    assert row["prices"]["pharmonline"]["stale"] is False
+    # spread считается (обе свежие): (15-10)/15 = 33%
+    assert abs(row["spread_pct"] - 33.3) < 1.0
+
+
+def test_comparison_all_stale_still_shown_no_spread(client, tenant_user, setup_db):
+    """Обе цены stale → строка всё равно показывается (клиент видит обе старые
+    цены с бейджами), но spread=None — нет свежей базы для сравнения."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    old = utcnow() - timedelta(days=20)
+    _make_match_with_freshness(
+        s,
+        run,
+        canonical="Allstale",
+        prods=[
+            ("aptekonline", 10.0, old, old),
+            ("pharmonline", 30.0, old, old),
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    row = next(x for x in rows if x["name"] == "Allstale")
+    assert row["sites_with_price"] == 2
+    assert row["prices"]["aptekonline"]["stale"] is True
+    assert row["prices"]["pharmonline"]["stale"] is True
+    assert row["spread_pct"] is None
+
+
+def test_comparison_fresh_outlier_still_dropped_with_stale_present(client, tenant_user, setup_db):
+    """Регрессия: outlier-фильтр (parse-ошибка) работает по свежим даже когда в
+    кластере есть stale-цена. 3 сайта: 2 свежих (10 + битая 0.5), 1 stale.
+    Битая свежая 0.5 (<12% медианы) дропается; stale остаётся для показа."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    fresh = utcnow()
+    old = utcnow() - timedelta(days=25)
+    _make_match_with_freshness(
+        s,
+        run,
+        canonical="Outlierstale",
+        prods=[
+            ("aptekonline", 10.0, fresh, fresh),
+            ("pharmonline", 0.5, fresh, fresh),  # свежая parse-ошибка → дроп
+            ("aloe", 11.0, old, old),  # stale → показываем, но не в spread
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    row = next(x for x in rows if x["name"] == "Outlierstale")
+    # битая свежая 0.5 убрана из payload
+    assert "pharmonline" not in row["prices"]
+    # aptek (свежий) + aloe (stale) остаются
+    assert row["prices"]["aptekonline"]["stale"] is False
+    assert row["prices"]["aloe"]["stale"] is True
+    # spread None: после дропа осталась 1 свежая (aptek), aloe stale не в расчёте
+    assert row["spread_pct"] is None
+
+
 def test_dash_alerts_without_cookie_401(client):
     r = client.get("/api/v1/dash/alerts")
     assert r.status_code == 401

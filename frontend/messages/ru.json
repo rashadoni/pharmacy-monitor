@@ -69,6 +69,8 @@
     "no_data": "нет данных",
     "load_error": "ошибка загрузки",
     "per_unit_note": "сравнение нормализовано за штуку (разные фасовки)",
+    "stale_badge": "{days} дн. назад",
+    "stale_note": "Цена обновлялась {days} дн. назад — не учитывается в спреде",
     "stable_price": "стабильно {price}",
     "diff_only_filter": "Только с различием",
     "with_aloe_filter": "С aloe",

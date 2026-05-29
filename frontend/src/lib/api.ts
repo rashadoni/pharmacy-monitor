@@ -178,6 +178,11 @@ export interface ComparisonRow {
       pack_count?: number;
       unit_price?: number;
       pack_size?: string | null;
+      // Свежесть (2026-05-29). age_days = дней с last_seen_at; stale=true когда
+      // цена старше порога (14д) — показывается с бейджем «N дн. назад» и НЕ
+      // участвует в расчёте spread (устаревшая цена не даёт ложный undercut).
+      age_days?: number | null;
+      stale?: boolean;
     }
   >;
   confidence: number;

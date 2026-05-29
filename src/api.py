@@ -1328,17 +1328,48 @@ def dash_recipients_delete(
 # ─── Frontend dashboard endpoints (JWT cookie) ───────────────────────────────
 
 
+# Порог свежести цены для comparison (2026-05-29). Считается по
+# Product.last_seen_at (обновляется КАЖДЫЙ прогон под diff-only), НЕ по
+# snapshot.captured_at (пишется только при смене цены — у товара со стабильной
+# ценой captured_at старый, но товар живой). Цена старше порога: показывается
+# с бейджем «N дн. назад», но НЕ участвует в расчёте spread/min/max/cheapest,
+# чтобы устаревшая цена не давала ложный undercut/spread. Строка всё равно
+# отображается (ничего не теряется — клиент видит обе цены + контекст возраста).
+_COMPARISON_STALE_DAYS = 14
+
+
+def _price_age_days(now: datetime, last_seen: datetime | None) -> int | None:
+    """Возраст цены в днях по last_seen_at. None → None (last_seen_at=NULL).
+
+    tz-defensive: prod-колонка naive (Postgres timestamp without tz), но если
+    прилетит aware datetime — нормализуем (иначе naive-aware вычитание упало бы
+    TypeError'ом). Будущие timestamp'ы (clock skew между Mac-скрейпером и prod)
+    клампятся в 0, чтобы age не уходил в минус.
+    """
+    if last_seen is None:
+        return None
+    if last_seen.tzinfo is not None:
+        last_seen = last_seen.replace(tzinfo=None)
+    return max(0, (now - last_seen).days)
+
+
 def _comparison_spread(
     prices: dict[str, dict[str, Any]],
 ) -> tuple[str, float | None, float | None, str | None, float | None]:
-    """Per-unit-aware spread для comparison-строки.
+    """Per-unit-aware spread для comparison-строки (учёт свежести).
 
     Мутирует `prices`: (а) добавляет каждому сайту `pack_count` + `unit_price`,
-    (б) УДАЛЯЕТ сайты с явно-битой ценой (outlier < 10% медианы per-unit — это
+    (б) УДАЛЯЕТ сайты с явно-битой СВЕЖЕЙ ценой (outlier < 12% медианы — это
     parse-ошибка/не та единица, не реальный undercut). Возвращает
     (basis, min, max, cheapest_site, spread_pct) на выбранном basis.
 
-    Логика (2026-05-29, Perplexity+Codex consensus):
+    Свежесть (2026-05-29): записи с `stale=True` (last_seen_at старше
+    _COMPARISON_STALE_DAYS) ОСТАЮТСЯ в `prices` для отображения с бейджем, но в
+    расчёт basis/outlier/stats НЕ входят — устаревшая цена не должна двигать
+    spread/undercut. Если свежих цен < 2 → spread не считается (None), но строка
+    всё равно показывается со stale-ценами.
+
+    Логика per-unit (2026-05-29, Perplexity+Codex consensus):
     - Считаем count штук в упаковке + unit_price = price/count.
     - Outlier-фильтр работает на UNIT-цене (не raw): для маски поштучно 0.20
       vs пачки N50 за 10.00 unit price у обоих 0.20 → ни один не выбрасывается
@@ -1354,17 +1385,20 @@ def _comparison_spread(
         data["count_conf"] = conf
         data["unit_price"] = data["price"] / cnt if cnt > 0 else data["price"]
 
+    # Свежие = участвуют в расчёте. Stale остаются в `prices` для показа (бейдж).
+    fresh = {s: d for s, d in prices.items() if not d.get("stale")}
+
     def _spread_over(key: str) -> float:
-        vs = [d[key] for d in prices.values()]
+        vs = [d[key] for d in fresh.values()]
         return (max(vs) - min(vs)) / max(vs) * 100 if vs and max(vs) else 0.0
 
-    # ── Шаг 1: выбрать basis ДО outlier-фильтра ──
+    # ── Шаг 1: выбрать basis ДО outlier-фильтра (только по свежим) ──
     # (фильтровать надо по той цене, которой доверяем; иначе при недостоверных
     #  count'ах unit-цены ложные и дропнут легитимный сайт — risk #4.)
     basis = "raw"
-    if len(prices) >= 2:
-        counts = [d["pack_count"] for d in prices.values()]
-        has_high = any(d["count_conf"] == "high" for d in prices.values())
+    if len(fresh) >= 2:
+        counts = [d["pack_count"] for d in fresh.values()]
+        has_high = any(d["count_conf"] == "high" for d in fresh.values())
         counts_differ = max(counts) / min(counts) >= 2 if min(counts) > 0 else False
         # unit только если фасовки различаются И нормализация УМЕНЬШАЕТ spread.
         if has_high and counts_differ and _spread_over("unit_price") < _spread_over("price"):
@@ -1372,23 +1406,30 @@ def _comparison_spread(
 
     key = "unit_price" if basis == "unit" else "price"
 
-    # ── Шаг 2: outlier-фильтр на выбранном basis (parse-ошибки) ──
+    # ── Шаг 2: outlier-фильтр на выбранном basis по свежим (parse-ошибки) ──
     # Порог 12%: цена дешевле 12% медианы = >8.3× разрыв. Для идентичной
     # фасовки такой разрыв почти всегда parse-ошибка (Thiogamma aloe 8.90 vs
     # pharm 89.00 = ровно 10× — теперь ловится; раньше при 10% ровно на границе
-    # проскакивал). Реальный 2-5× undercut остаётся виден.
-    if len(prices) >= 2:
-        vals = sorted(d[key] for d in prices.values())
+    # проскакивал). Реальный 2-5× undercut остаётся виден. Битую ТЕКУЩУЮ цену
+    # дропаем и из `prices` (не показываем); stale-цены не трогаем.
+    if len(fresh) >= 2:
+        vals = sorted(d[key] for d in fresh.values())
         median = vals[len(vals) // 2]
         threshold = median * 0.12
-        for site in [s for s, d in prices.items() if d[key] < threshold]:
+        for site in [s for s, d in fresh.items() if d[key] < threshold]:
             del prices[site]
+            del fresh[site]
 
-    if not prices:
+    # <2 свежих цен (все stale или одна осталась после outlier-дропа) —
+    # сравнивать не с чем: возвращаем ВСЁ None. Иначе единственная свежая цена
+    # дала бы spread=None, но min/max/cheapest были бы выставлены, и frontend
+    # ложно подсветил бы её как «дешёвую» (Codex MED, 2026-05-29). Stale-записи
+    # остаются в `prices` для отображения с бейджем.
+    if len(fresh) < 2:
         return basis, None, None, None, None
 
-    # ── Шаг 3: stats на выбранном basis ──
-    items = [(s, d[key]) for s, d in prices.items()]
+    # ── Шаг 3: stats только по свежим ──
+    items = [(s, d[key]) for s, d in fresh.items()]
     mn = min(v for _, v in items)
     mx = max(v for _, v in items)
     cheap = min(items, key=lambda x: x[1])[0]
@@ -1449,6 +1490,7 @@ def dash_comparison(
     all_pids = [p.id for m in matches for p in m.products]
     snaps_by_pid = storage.latest_snapshots_per_product(db, all_pids)
 
+    now = utcnow()  # naive UTC; last_seen_at тоже naive (src/_time) — вычитание ок
     out: list[ComparisonRowOut] = []
     for m in matches:
         # Confidence floor: низко-достоверные fuzzy-матчи (Bio Kolik ↔ Bio sprey)
@@ -1461,6 +1503,10 @@ def dash_comparison(
             snap = snaps_by_pid.get(p.id)
             price = (snap.discount_price or snap.price) if snap else None
             if price is not None and price > 0:
+                # Свежесть по last_seen_at (видели в прогоне), НЕ по captured_at:
+                # под diff-only стабильная цена имеет старый captured_at, но свежий
+                # last_seen_at — товар активен. last_seen_at=NULL → не stale.
+                age_days = _price_age_days(now, p.last_seen_at)
                 raw_prices[p.site] = {
                     "price": price,
                     "is_on_sale": snap.is_on_sale if snap else False,
@@ -1469,6 +1515,8 @@ def dash_comparison(
                     # pack_size + name нужны для per-unit нормализации (ниже)
                     "pack_size": p.pack_size,
                     "name": p.name,
+                    "age_days": age_days,
+                    "stale": age_days is not None and age_days > _COMPARISON_STALE_DAYS,
                 }
 
         # Per-unit-aware spread + outlier-фильтр (2026-05-29). Заменяет прежний

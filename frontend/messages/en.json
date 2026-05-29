@@ -69,6 +69,8 @@
     "no_data": "no data",
     "load_error": "load error",
     "per_unit_note": "comparison normalized per unit (different pack sizes)",
+    "stale_badge": "{days}d ago",
+    "stale_note": "Price last seen {days} days ago — excluded from spread",
     "stable_price": "stable {price}",
     "diff_only_filter": "With difference only",
     "with_aloe_filter": "With aloe",

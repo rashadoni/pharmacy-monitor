@@ -308,26 +308,47 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
   );
 }
 
-function priceCell(row: ComparisonRow, site: string) {
+function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
+  const t = useTranslations("comparison");
   const p = row.prices[site];
   if (!p) return <span className="text-muted-foreground/50">—</span>;
   // Per-unit basis (2026-05-29): min/max/cheapest посчитаны на цене-за-штуку,
   // поэтому подсветку дешёвого/дорогого считаем по unit_price, а не pack price.
   const isUnit = row.spread_basis === "unit";
   const cmpVal = isUnit && p.unit_price != null ? p.unit_price : p.price;
-  const isMin = row.min_price === cmpVal;
-  const isMax = row.max_price === cmpVal && row.min_price !== row.max_price;
-  const showUnit = isUnit && p.pack_count != null && p.pack_count > 1 && p.unit_price != null;
+  // Stale-цена (2026-05-29) НЕ участвует в spread → не подсвечиваем как min/max,
+  // приглушаем и зачёркиваем, показываем бейдж «N дн. назад».
+  const stale = p.stale === true;
+  const isMin = !stale && row.min_price === cmpVal;
+  const isMax = !stale && row.max_price === cmpVal && row.min_price !== row.max_price;
+  const showUnit =
+    !stale && isUnit && p.pack_count != null && p.pack_count > 1 && p.unit_price != null;
   return (
     <a
       href={p.url}
       target="_blank"
       rel="noopener noreferrer"
+      title={
+        stale && p.age_days != null ? t("stale_note", { days: p.age_days }) : undefined
+      }
       className={`inline-flex flex-col items-end tabular-nums hover:underline leading-tight ${
-        isMin ? "text-success font-semibold" : isMax ? "text-destructive" : ""
+        stale
+          ? "text-muted-foreground/60"
+          : isMin
+            ? "text-success font-semibold"
+            : isMax
+              ? "text-destructive"
+              : ""
       }`}
     >
-      <span>{formatPrice(p.price)}</span>
+      <span className={stale ? "line-through decoration-muted-foreground/40" : ""}>
+        {formatPrice(p.price)}
+      </span>
+      {stale && p.age_days != null && (
+        <span className="text-[10px] font-normal text-amber-600 dark:text-amber-500">
+          {t("stale_badge", { days: p.age_days })}
+        </span>
+      )}
       {showUnit && (
         <span className="text-[10px] font-normal text-muted-foreground">
           {formatPrice(p.unit_price!)}/шт · {p.pack_count}шт
@@ -379,7 +400,7 @@ function ComparisonRowDesktop({
         <td className="px-3 py-2 text-muted-foreground">{row.brand ?? "—"}</td>
         {sites.map((s) => (
           <td key={s} className="px-3 py-2 text-right">
-            {priceCell(row, s)}
+            <PriceCell row={row} site={s} />
           </td>
         ))}
         <td className="px-3 py-2 text-right tabular-nums">
@@ -472,7 +493,7 @@ function ComparisonCard({
         {SITES.map((s) => (
           <div key={s} className="text-center">
             <div className="text-[10px] text-muted-foreground uppercase">{s}</div>
-            <div className="mt-0.5">{priceCell(row, s)}</div>
+            <div className="mt-0.5"><PriceCell row={row} site={s} /></div>
           </div>
         ))}
       </div>
