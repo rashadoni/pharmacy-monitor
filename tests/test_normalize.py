@@ -60,6 +60,21 @@ def test_extract_pack_size():
     assert extract_pack_size("Bottle 100ml") == "100ml"
 
 
+def test_extract_pack_size_english_no_variant():
+    """Регрессия (2026-05-29): английское «No. 28» (импортные бренды из
+    India/Turkey/Hungary на pharmonline) раньше давало pack_size=None →
+    матчер бакетил их с другими фасовками. Теперь ловится как n28.
+    """
+    assert extract_pack_size("Esom 40 mg No. 28 (Capsules) (Turkey)") == "n28"
+    assert extract_pack_size("Evinol 400 mg No.30 (Capsules)") == "n30"
+    assert extract_pack_size("Baralgin max 500 mg No 100 (Tablets)") == "n100"
+    # bare N и № по-прежнему работают
+    assert extract_pack_size("Aspirin N20") == "n20"
+    assert extract_pack_size("Drug № 28") == "n28"
+    # бренды с 'No' но без count-цифры → не ложный count (volume fallback / None)
+    assert extract_pack_size("No-Spa forte 40mg 50ml") == "50ml"
+
+
 def test_extract_pack_size_prefers_count_over_weight():
     """Регрессия false-match (2026-05-11): для diapers «Huggies-4 8-14kg N66»
     раньше возвращалось '14kg' (вес ребёнка), теперь должно вернуть n66

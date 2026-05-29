@@ -181,7 +181,7 @@ _DOSAGE_RE = re.compile(
 # возвращал «14kg» (вес РЕБЁНКА!), а N66 терялся → разные упаковки сливались
 # в один false match (match_id=447, 0.20 AZN ↔ 28.90 AZN).
 _PACK_COUNT_RE = re.compile(
-    r"\bN\s*(\d+)"  # N20, N 20 (ASCII N)
+    r"\bN(?:o\.?)?\s*(\d+)"  # N20, N 20, No 28, No. 28, No.28 (ASCII N / English «No.»)
     r"|№\s*(\d+)"  # №20 (Unicode № — \b не работает с non-word)
     r"|(\d+)\s*(?:tab|tabletka|kapsul|capsules|kaps|şt|шт|adet|amp|pieces|əd)",  # 30 tab, 54 əd
     re.IGNORECASE,
