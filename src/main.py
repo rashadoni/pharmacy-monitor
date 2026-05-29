@@ -2052,6 +2052,83 @@ def category_add(
         click.echo(f"OK: #{cat.id} {cat.key} ({cat.label_ru}) — {slugs}")
 
 
+def _sync_pharmonline_categories(session, discovered: list[tuple[str, str]]) -> tuple[int, int]:
+    """Upsert обнаруженных (slug, name) категорий pharmonline. Уже замапленные
+    (по pharmonline_slug) пропускаются. key = `pharma_{slug}` (конвенция проекта).
+    Возвращает (добавлено, пропущено). Чистая функция — тестируется без сети.
+    """
+    existing = {
+        c.pharmonline_slug
+        for c in session.scalars(
+            select(storage.Category).where(storage.Category.pharmonline_slug.is_not(None))
+        )
+    }
+    added = skipped = 0
+    for slug, name in discovered:
+        slug = (slug or "").strip()
+        if not slug or slug in existing:
+            skipped += 1
+            continue
+        watchlist.add_category(
+            session,
+            key=f"pharma_{slug}",
+            label_ru=(name or slug),
+            label_az=(name or slug),
+            pharmonline_slug=slug,
+        )
+        existing.add(slug)
+        added += 1
+    return added, skipped
+
+
+@category_group.command("sync-pharmonline")
+@click.option("--dry-run", is_flag=True, help="Только показать, сколько добавится")
+def category_sync_pharmonline(dry_run: bool) -> None:
+    """Авто-обнаружить ВСЕ категории pharmonline через DDP `getFilterParam` и
+    засеять недостающие в БД.
+
+    Чинит неполное покрытие: было заведено 53 категории из 205 на сайте → ночной
+    прогон видел ~половину каталога. После sync прогон покрывает весь pharmonline.
+    Требует IPROYAL_* + PHARMONLINE_USE_DDP в окружении (residential-прокси для DDP).
+    """
+    import asyncio
+
+    from src.scrapers.pharmonline_ddp import PharmonlineDDPScraper
+
+    storage.init_db()
+
+    async def _fetch() -> list[tuple[str, str]]:
+        async with PharmonlineDDPScraper() as sc:
+            flt = await sc._ddp.call(
+                "getFilterParam",
+                [{"query": {}, "sortBy": {"totalMinPrice": 1}, "productLimit": 24}, sc._locale],
+                timeout=30.0,
+            )
+            return [
+                (c.get("path"), c.get("name")) for c in (flt.get("category") or []) if c.get("path")
+            ]
+
+    discovered = asyncio.run(_fetch())
+    click.echo(f"DDP getFilterParam вернул {len(discovered)} категорий pharmonline")
+
+    Session = storage.make_session()
+    with Session() as s:
+        if dry_run:
+            existing = {
+                c.pharmonline_slug
+                for c in s.scalars(
+                    select(storage.Category).where(storage.Category.pharmonline_slug.is_not(None))
+                )
+            }
+            new = [sl for sl, _ in discovered if sl and sl not in existing]
+            click.echo(
+                f"[dry-run] добавилось бы новых: {len(new)} (уже есть: {len(discovered) - len(new)})"
+            )
+            return
+        added, skipped = _sync_pharmonline_categories(s, discovered)
+        click.echo(f"Добавлено новых категорий: {added}, пропущено (уже замаплены): {skipped}")
+
+
 @category_group.command("list")
 @click.option("--all", "show_all", is_flag=True, help="Включая деактивированные")
 def category_list(show_all: bool) -> None:

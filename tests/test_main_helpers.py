@@ -412,3 +412,35 @@ def test_snapshot_changed_when_sale_flag_flips():
         "promo_label": sp.promo_label,
     }
     assert main_mod._snapshot_payload_changed(last, sp) is True
+
+
+# ── _sync_pharmonline_categories (2026-05-29: фикс покрытия 53→205) ───────────
+
+
+def test_sync_pharmonline_categories_adds_missing(db_session):
+    s = db_session
+    watchlist.add_category(
+        s, key="pharma_existing", label_ru="Existing", pharmonline_slug="existing-slug"
+    )
+    discovered = [
+        ("existing-slug", "Existing"),  # уже замаплен → skip
+        ("new-cat-1", "Новая 1"),  # новый → add
+        ("new-cat-2", "Новая 2"),  # новый → add
+        ("", "пустой slug"),  # пустой → skip
+    ]
+    added, skipped = main_mod._sync_pharmonline_categories(s, discovered)
+    assert added == 2
+    assert skipped == 2
+    c = watchlist.get_category(s, "pharma_new-cat-1")
+    assert c is not None
+    assert c.pharmonline_slug == "new-cat-1"
+    assert c.label_ru == "Новая 1"
+
+
+def test_sync_pharmonline_categories_idempotent(db_session):
+    s = db_session
+    discovered = [("cat-x", "X")]
+    a1, _ = main_mod._sync_pharmonline_categories(s, discovered)
+    a2, sk2 = main_mod._sync_pharmonline_categories(s, discovered)
+    assert a1 == 1
+    assert a2 == 0 and sk2 == 1  # повторный запуск ничего не добавляет
