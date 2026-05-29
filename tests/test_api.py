@@ -221,6 +221,88 @@ def test_dash_comparison_without_cookie_401(client):
     assert r.status_code == 401
 
 
+def _make_match_with_prices(db, run, *, canonical, prices, tenant_id=1):
+    """Match + products на 2 сайтах + PriceSnapshot для каждого."""
+    m = storage.Match(tenant_id=tenant_id, canonical_name=canonical, confidence=1.0)
+    db.add(m)
+    db.flush()
+    for site, price in prices.items():
+        p = storage.Product(
+            tenant_id=tenant_id,
+            site=site,
+            external_id=f"{site}-{canonical}",
+            url=f"https://{site}.example/{canonical}",
+            name=f"{canonical} {site}",
+            name_normalized=canonical.lower(),
+            canonical_id=m.id,
+        )
+        db.add(p)
+        db.flush()
+        db.add(
+            storage.PriceSnapshot(run_id=run.id, product_id=p.id, price=price, captured_at=utcnow())
+        )
+    db.commit()
+    return m
+
+
+def test_comparison_limit_applies_after_filter(client, tenant_user, setup_db):
+    """Regression (2026-05-29): `limit` должен применяться к ОТФИЛЬТРОВАННОМУ
+    выходу, не к raw matches query.
+
+    Сценарий: создаём 3 невалидных match'а (только 1 сайт с ценой → отсеются)
+    с МАЛЕНЬКИМИ id, потом 2 валидных (2 сайта) с большими id. Со старым
+    кодом `.limit(2)` взял бы первые 2 невалидных → 0 в выходе. С фиксом —
+    fetch все, фильтр, и оба валидных видны.
+    """
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    # 3 невалидных (1 сайт) — низкие id
+    for i in range(3):
+        _make_match_with_prices(s, run, canonical=f"solo{i}", prices={"pharmonline": 10.0})
+    # 2 валидных (2 сайта) — высокие id
+    _make_match_with_prices(s, run, canonical="dual1", prices={"pharmonline": 10.0, "aloe": 12.0})
+    _make_match_with_prices(
+        s, run, canonical="dual2", prices={"pharmonline": 20.0, "aptekonline": 30.0}
+    )
+
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/comparison?min_sites=2")
+    assert r.status_code == 200, r.text
+    names = [row["name"] for row in r.json()]
+    # Оба валидных видны несмотря на то что они после невалидных по id
+    assert "dual1" in names
+    assert "dual2" in names
+    # Невалидные (1 сайт) отсеяны
+    assert not any(n.startswith("solo") for n in names)
+
+
+def test_comparison_sorted_by_spread_desc(client, tenant_user, setup_db):
+    """Rows отсортированы по spread_pct desc (самое полезное сверху)."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    # spread small: 10 vs 11 = ~9%
+    _make_match_with_prices(s, run, canonical="small", prices={"pharmonline": 10.0, "aloe": 11.0})
+    # spread big: 10 vs 30 = ~67%
+    _make_match_with_prices(s, run, canonical="big", prices={"pharmonline": 10.0, "aloe": 30.0})
+
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/comparison?min_sites=2")
+    rows = r.json()
+    names = [row["name"] for row in rows]
+    # big spread первым
+    assert names.index("big") < names.index("small")
+
+
 def test_dash_alerts_without_cookie_401(client):
     r = client.get("/api/v1/dash/alerts")
     assert r.status_code == 401

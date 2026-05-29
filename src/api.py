@@ -74,7 +74,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from src import inventory as inv_mod
 from src import storage, tenants
@@ -1327,7 +1327,7 @@ def dash_comparison(
     search: str | None = None,
     min_sites: int = 2,
     site_filter: str | None = None,
-    limit: int = 500,
+    limit: int = 5000,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -1341,7 +1341,18 @@ def dash_comparison(
     if not last_run:
         return []
 
-    matches_q = select(storage.Match).where(storage.Match.tenant_id == user.tenant_id).limit(limit)
+    # Bug fix 2026-05-29: раньше `.limit(limit)` стоял на raw matches query —
+    # бралось первые 500 matches по id, ПОТОМ фильтровалось по min_sites +
+    # свежести цен → итог всегда ~497 независимо от объёма скрейпа (при 4824
+    # matches видно только 10%). Теперь fetch ВСЕ matches, фильтруем, сортируем
+    # по spread desc, и limit применяем к ОТФИЛЬТРОВАННОМУ выходу.
+    # `selectinload(products)` грузит products одним доп. запросом — устраняет
+    # N+1 (4824 lazy-load'а превратились бы в 4824 SELECT'а).
+    matches_q = (
+        select(storage.Match)
+        .where(storage.Match.tenant_id == user.tenant_id)
+        .options(selectinload(storage.Match.products))
+    )
     if search:
         like = f"%{search.lower()}%"
         matches_q = matches_q.where(
@@ -1413,7 +1424,10 @@ def dash_comparison(
                 needs_review=(spread is not None and spread >= 50.0),
             )
         )
-    return out
+    # Сортируем по |spread| desc (самое полезное для PO — где конкурент бьёт
+    # по цене / где можно поднять) и применяем limit к отфильтрованному выходу.
+    out.sort(key=lambda r: r.spread_pct if r.spread_pct is not None else -1.0, reverse=True)
+    return out[:limit]
 
 
 _VALID_SITES = ("pharmonline", "aptekonline", "aloe")
