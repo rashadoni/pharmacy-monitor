@@ -342,6 +342,14 @@ def _has_conflicting_gender(name_a: str, name_b: str) -> bool:
 # Правило: если только У ОДНОГО есть уникальный токен — допускаем матч
 # (скорее всего неполные данные на одном из сайтов, а не другой вариант).
 _MIN_VARIANT_TOKEN_LEN = 3  # токены короче 3 символов игнорируем ("h", "sr", "b")
+
+# Hard-различители (2026-05-29): токены, которые меняют идентичность товара
+# ДАЖЕ если присутствуют только у одной стороны (в отличие от verbose-суффиксов
+# вроде «trihydrate»). «toxumu»/«toxum» = семена: «Bağayarpağı» (подорожник-лист)
+# ≠ «Bağayarpağı toxumu» (семена подорожника) — это разные товары. Держим
+# список МАКСИМАЛЬНО узким — только однозначные различители, чтобы не блокировать
+# легитимные verbose-vs-terse пары.
+_HARD_DISTINCT_TOKENS: frozenset[str] = frozenset({"toxumu", "toxum"})
 # Дополнительно: короткие (2 символа) алфавитно-цифровые токены (B12 → "b12",
 # D3 → "d3", 2X → "2x") — значащие идентификаторы продуктов, даже если короткие.
 
@@ -382,6 +390,10 @@ def _has_conflicting_variant_tokens(name_a: str, name_b: str) -> bool:
     """
     tokens_a = frozenset(name_a.split())
     tokens_b = frozenset(name_b.split())
+    # Hard-различитель (toxumu=семена) присутствует только у одной стороны →
+    # разные товары. Блокируем даже без встречного уникального токена.
+    if (tokens_a & _HARD_DISTINCT_TOKENS) != (tokens_b & _HARD_DISTINCT_TOKENS):
+        return True
     unique_a = {t for t in tokens_a - tokens_b if _is_significant_variant_token(t)}
     unique_b = {t for t in tokens_b - tokens_a if _is_significant_variant_token(t)}
     if unique_a and unique_b:

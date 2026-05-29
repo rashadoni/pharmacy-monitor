@@ -587,6 +587,17 @@ class TestHasConflictingVariantTokens:
             is False
         )
 
+    def test_hard_distinct_token_toxumu_blocks_one_sided(self):
+        """2026-05-29: «toxumu» (семена) — hard-различитель. «Bağayarpağı»
+        (подорожник-лист) ≠ «Bağayarpağı toxumu» (семена) — разные товары,
+        блокируем даже без встречного уникального токена (в отличие от
+        verbose-суффикса вроде «trihydrate»)."""
+        assert _has_conflicting_variant_tokens("bağayarpağı", "bağayarpağı toxumu") is True
+        # оба «toxumu» — не блокируем (одинаковый товар)
+        assert _has_conflicting_variant_tokens("bağayarpağı toxumu", "bağayarpağı toxumu") is False
+        # обычный verbose-суффикс (не hard) по-прежнему разрешён
+        assert _has_conflicting_variant_tokens("amoxicillin", "amoxicillin trihydrate") is False
+
     def test_blocks_short_3char_variant_tokens(self):
         # «bal» (3 символа, мёд) vs «limon» — оба имеют уникальные токены → блокируем
         # Safeguard bal ≠ Safeguard Limon Fresh
