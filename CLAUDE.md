@@ -247,9 +247,23 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 - [src/scrapers/aptekonline.py](src/scrapers/aptekonline.py) полностью переписан: Playwright → httpx (~250 строк). 0.23s/page вместо 30+s. 12 unit-тестов в [tests/test_aptekonline_api.py](tests/test_aptekonline_api.py).
 - Hetzner-IP **забанен и на JSON API** aptekonline тоже (HTTP 403 от прода). Поэтому **aptekonline тоже скрейпится с Mac**.
 
-### Runtime layout (split prod + Mac, обновлено 2026-05-11)
+### Runtime layout (обновлено 2026-05-29 — ВСЕ 3 сайта на проде)
 
-Гибрид: **aloe** на проде (direct, 03:00 UTC), **pharmonline + aptekonline** с Mac launchd (14:00 UTC = 18:00 Asia/Baku). Прод-таймер pharmonline отключён 2026-05-11 (ScraperAPI default pool стабильно отдавал 0 продуктов — фантомные runs шумели в логах). Aptekonline-таймер на проде отключён 2026-05-08 (HTTP 403 от ScraperAPI default pool — нужен residential = Hobby $49/мес).
+**⚠️ Поправка 2026-05-29 (проверено):** запись ниже про «Mac launchd только / прод-таймеры
+отключены» УСТАРЕЛА. Реальность: **все 3 сайта скрейпятся с прода**, таймеры enabled и
+успешно отрабатывают ежедневно (pharmonline ~01:00, aptekonline ~02:00, aloe ~03:00 UTC;
+verified: run_id 123/124, «Finished successfully»). Hetzner-IP бан обойдён residential-прокси:
+- **pharmonline** → IPRoyal, DDP WebSocket (`PHARMONLINE_USE_DDP=1`, без браузера). Проверено: `ddp_connected`, 205 категорий.
+- **aptekonline** → BrightData residential, httpx JSON. Проверено: `api_loaded total=3267` (403 обойдён).
+- **aloe** → direct (не банится).
+
+Mac launchd `com.pharmacy-monitor.scrape` (14:00 UTC) теперь **избыточный DR-fallback** — прод
+от ноутбука НЕ зависит (выключен ноут → прод всё равно скрейпит). Можно отключить Mac launchd
+(`launchctl unload ~/Library/LaunchAgents/com.pharmacy-monitor.scrape.plist`) чтобы убрать
+двойной скрейп, либо оставить как бесплатный (Baku-direct) запасной источник.
+
+---
+_Историческая запись (устарела, см. поправку выше):_ Гибрид: **aloe** на проде (direct, 03:00 UTC), **pharmonline + aptekonline** с Mac launchd (14:00 UTC = 18:00 Asia/Baku). Прод-таймер pharmonline отключён 2026-05-11. Aptekonline-таймер на проде отключён 2026-05-08.
 
 | Сайт | Где | Чем | Расписание |
 |---|---|---|---|
@@ -271,7 +285,7 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
 - NOTE: `pharmacy-monitor notify test` для smoke-теста доставки запускать с загруженным env (systemd EnvironmentFile НЕ грузится при ручном CLI): `set -a; source /etc/pharmacy-monitor/env; .venv/bin/pharmacy-monitor notify test`.
 - ~~22317 AZN bug in aptekonline price parser~~ FIXED 2026-05-07. Root cause: aptekonline's Angular template `'<del>' + price + 'AZN </del>' + p.discount_price + ' AZN '` renders with no separator, so `inner_text` of `.new-price` returns e.g. `"22AZN 317 AZN"` for a discounted product. Old `parse_price` stripped non-digits → `"22317"`. Fix: extract only the FIRST digit-run-with-dots/commas via regex. Existing bad rows перезатираются следующим aptekonline-прогоном (Mac launchd 18:00 Asia/Baku ежедневно); для немедленной очистки: `DELETE FROM price_snapshots WHERE site='aptekonline' AND price > 5000;`
 - pharmonline.az has NO `/sitemap.xml` (returns SPA HTML); aptekonline returns empty `<urlset>` — both need BFS fallback (regular Playwright scrapers continue to work via category pages)
-- **Hetzner DE IP banned by pharmonline.az + aptekonline.az** (since ~2026-04-29). MITIGATED 2026-05-11: оба сайта переехали на Mac launchd 18:00 Asia/Baku (Baku-IP не банится). Прод-таймеры pharmonline/aptekonline disabled. Aloe остался на проде (direct работает). См. "Runtime layout" выше.
+- ~~**Hetzner DE IP banned by pharmonline.az + aptekonline.az**~~ **RESOLVED via residential proxies (verified 2026-05-29)**: бан обойдён — pharmonline через IPRoyal (DDP), aptekonline через BrightData (httpx). Прод-таймеры pharmonline/aptekonline **enabled + успешно отрабатывают** ежедневно. Mac launchd теперь избыточный DR-fallback (прод не зависит от ноутбука). См. "Runtime layout" выше. (Прежняя запись «Mac launchd только / timers disabled» устарела.)
 - Project under git с 2026-05-11. Initial commit `c7fde84` зафиксировал diff-only state. **Remote**: `origin` = `https://github.com/rashadrahimov/pharmacy-monitor.git`. Auth работает через cached creds (`git push origin main` без проблем).
 - ~~forecast.py не рефакторен под diff-only~~ **DONE 2026-05-28**: `compute_trend` имеет Case A/B/C для sparse data (0 snaps в окне → latest globally; 1-2 snaps same price → stable). `top_movers` имеет pre-cutoff lookup для single-snapshot products. 3 diff-only regression теста в `tests/test_forecast.py` (`test_compute_trend_diff_only_sparse_active_pricing`, `test_predict_competitor_moves_diff_only_skips_truly_stable`, `test_top_movers_diff_only_sparse_change`). 18/18 forecast тестов проходят.
 - 7 false matches in matcher (Friso 3 Gold ↔ Friso Prematures etc) — needs manual reject via UI on /comparison
