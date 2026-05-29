@@ -257,6 +257,58 @@ class TestHasExtremeLengthDisparity:
         b = "venatura vitamin a palmitate retinol zinc"
         assert _has_extreme_length_disparity(a, b) == _has_extreme_length_disparity(b, a)
 
+    # ── Stub-aware redesign (2026-05-29, Perplexity+Codex consensus) ──────────
+
+    def test_allows_verbose_superset_with_brand_hint(self):
+        """Verbose-vs-terse ОДНОГО товара НЕ блокируется когда есть общий
+        значимый токен (cobanyastıgı=ромашка). Это главный fix — раньше
+        блокировалось как disparity 3/13."""
+        terse = "fitoton sampun cobanyastıgı"
+        verbose = (
+            "fitoton sampun cobanyastıgı ultra care d/norm sac ucun "
+            "kosmetika herba flora azerbaycan"
+        )
+        assert _has_extreme_length_disparity(terse, verbose, brand_hint="Fitoton") is False
+
+    def test_blocks_stub_even_with_brand_hint(self):
+        """venatura остаётся заблокированным даже с brand_hint — после удаления
+        бренда у короткого 0 значимых токенов → stub."""
+        assert (
+            _has_extreme_length_disparity(
+                "venatura",
+                "venatura vitamin a palmitate retinol zinc",
+                brand_hint="venatura",
+            )
+            is True
+        )
+
+    def test_blocks_different_variants_via_noise_filter(self):
+        """РАЗНЫЕ варианты (mineral vs chamomile) при verbose-длинном →
+        блокируется: 'sampun' это noise, дифференциаторы (mineral/cobanyastıgı)
+        НЕ пересекаются → нет общего значимого токена → stub-block.
+
+        Это precision: mineral-шампунь не должен склеиться с ромашковым."""
+        mineral = "fitoton sampun mineral"
+        chamomile_verbose = (
+            "fitoton sampun cobanyastıgı ultra care kosmetika herba flora azerbaycan"
+        )
+        assert (
+            _has_extreme_length_disparity(mineral, chamomile_verbose, brand_hint="Fitoton") is True
+        )
+
+    def test_no_brand_hint_requires_two_overlap(self):
+        """Без brand_hint требуется ≥2 общих значимых токена (защита от
+        случая где единственное совпадение — сам бренд)."""
+        # 1 общий значимый (kreatin) + бренд не указан → 1 < 2 → BLOCK
+        assert (
+            _has_extreme_length_disparity(
+                "solgar kreatin", "solgar kreatin monohydrate powder extra strength 300"
+            )
+            is False  # 2 общих: solgar + kreatin (бренд не исключён без hint) → allow
+        )
+        # чистый stub без hint
+        assert _has_extreme_length_disparity("solgar", "solgar omega 3 fish oil softgels") is True
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 

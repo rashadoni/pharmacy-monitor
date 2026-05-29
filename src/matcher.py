@@ -162,23 +162,115 @@ def _has_conflicting_orphan_number(name_a: str, name_b: str) -> bool:
 _DISPARITY_MAX_RATIO = 0.40
 _DISPARITY_MIN_LONGER = 3
 
+# Шумовые токены, которые НЕ являются дифференциатором товара. Используются
+# stub-aware disparity guard'ом (см. ниже): при сравнении «короткое vs длинное»
+# имя эти токены не считаются «значимым пересечением». Это позволяет отличить
+# brand-stub (venatura) от verbose-superset (тот же товар с маркетинг-хвостом).
+#
+# Источник (2026-05-29): pharmonline DDP-имена пихают в скобки категорию/бренд-
+# хаус/страну/маркетинг: «(Kosmetika) (Herba Flora) (Azərbaycan) Ultra Care
+# d/norm, saç üçün». normalize_name снимает скобки-пунктуацию, но СЛОВА остаются
+# и раздувают token-count → ложный disparity-block против лаконичного aptekonline.
+# Дизайн подтверждён Perplexity + Codex (independent review, оба сошлись на
+# «stub-aware overlap» вместо raw length ratio).
+_MATCH_NOISE_TOKENS: frozenset[str] = frozenset(
+    {
+        # категория/тип косметики (AZ) — не дифференциатор товара
+        "sampun",
+        "krem",
+        "gel",
+        "balzam",
+        "maska",
+        "losyon",
+        "kosmetika",
+        "kosmetik",
+        # маркетинг-линии / generic качества
+        "ultra",
+        "care",
+        "extra",
+        "premium",
+        "classic",
+        "professional",
+        # бренд-хаус слова, дублирующие brand-поле (pharmonline parens)
+        "herba",
+        "flora",
+        # generic дескрипторы волос/кожи (AZ)
+        "sac",
+        "ucun",
+        "norm",
+        "normal",
+        "quru",
+        "yagli",
+        "deri",
+        # остатки страны (если _COUNTRY_RE не добил)
+        "azerbaycan",
+        "azerbaijan",
+    }
+)
 
-def _has_extreme_length_disparity(name_a: str, name_b: str) -> bool:
-    """True если одно имя подозрительно короче другого.
 
-    Блокирует матч типа «venatura» (1 слово) ↔
-    «venatura vitamin a palmitate retinol» (5 слов), где
-    token_set_ratio=100 из-за subset-логики rapidfuzz.
+def _is_significant_for_disparity(
+    tok: str, brand_tokens: frozenset[str] | set[str], noise: frozenset[str]
+) -> bool:
+    """Токен «значимый» (дифференцирует товар) для stub-проверки.
+
+    Исключаем: brand-токены, noise-токены, фарма-модификаторы, короткие (<3).
     """
-    words_a = len(name_a.split())
-    words_b = len(name_b.split())
-    if words_a == 0 or words_b == 0:
+    if tok in brand_tokens:
         return False
-    longer = max(words_a, words_b)
-    if longer < _DISPARITY_MIN_LONGER:
-        return False  # оба имени короткие — нормально
-    shorter = min(words_a, words_b)
-    return shorter / longer < _DISPARITY_MAX_RATIO
+    if tok in noise:
+        return False
+    if tok in _PHARMA_MODIFIERS:
+        return False
+    if len(tok) < 3:
+        return False
+    return True
+
+
+def _has_extreme_length_disparity(name_a: str, name_b: str, brand_hint: str = "") -> bool:
+    """True если короткое имя — brand/generic STUB длинного (разные товары).
+
+    Stub-aware redesign (2026-05-29, Perplexity+Codex consensus): прежняя версия
+    блокировала ЛЮБУЮ пару с token-ratio < 0.40 — это давало массовый false-
+    negative для verbose-vs-terse легитимных пар (pharmonline раздувает имена
+    маркетинг-хвостом). Теперь:
+
+    - Если длины не диспропорциональны (ratio ≥ 0.40) → не блокируем.
+    - Если диспропорциональны → блокируем ТОЛЬКО когда у короткого имени НЕТ
+      значимого (non-brand, non-noise, len≥3) токена, общего с длинным.
+      * venatura (brand-stub) ↔ venatura vitamin a palmitate: после удаления
+        бренда у короткого 0 значимых токенов → BLOCK (precision сохранён).
+      * fitoton sampun cobanyastıgı ↔ …+ultra care kosmetika herba flora:
+        «cobanyastıgı» (ромашка) общий и значимый → verbose-superset → ALLOW.
+
+    `brand_hint` — бренд из bucket_key (или auto-brand). Если пуст — строже:
+    требуем ≥2 общих значимых токена (защита когда бренд не известен).
+    """
+    words_a = name_a.split()
+    words_b = name_b.split()
+    if not words_a or not words_b:
+        return False
+    longer = words_a if len(words_a) >= len(words_b) else words_b
+    shorter = words_b if longer is words_a else words_a
+    if len(longer) < _DISPARITY_MIN_LONGER:
+        return False  # оба короткие — нормально
+    if len(shorter) / len(longer) >= _DISPARITY_MAX_RATIO:
+        return False  # длины сопоставимы — не stub
+
+    brand_tokens = set(brand_hint.lower().split())
+    short_sig = {
+        t for t in shorter if _is_significant_for_disparity(t, brand_tokens, _MATCH_NOISE_TOKENS)
+    }
+    long_sig = {
+        t for t in longer if _is_significant_for_disparity(t, brand_tokens, _MATCH_NOISE_TOKENS)
+    }
+    overlap = short_sig & long_sig
+    # Без brand-hint строже: требуем 2+ общих значимых токена, иначе единственное
+    # совпадение могло быть самим брендом (venatura) → ложный allow.
+    min_overlap = 1 if brand_tokens else 2
+    if len(overlap) >= min_overlap:
+        return False  # общий дифференциатор → verbose superset → разрешаем
+    return True  # короткое — brand/generic stub → блокируем
 
 
 def _has_conflicting_modifier(name_a: str, name_b: str) -> bool:
@@ -617,7 +709,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                         continue
                 # Stub vs полное имя: «venatura» vs «venatura vitamin a palmitate…»
                 # (проверяем только против якоря — длина якоря самая репрезентативная)
-                if _has_extreme_length_disparity(p.name_normalized or "", q.name_normalized or ""):
+                if _has_extreme_length_disparity(
+                    p.name_normalized or "",
+                    q.name_normalized or "",
+                    brand_hint=(p.brand or q.brand or ""),
+                ):
                     continue
                 # Осиротевшее число дозировки: «mezim forte» vs «mezim forte 3500 ed»
                 if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
@@ -714,7 +810,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _fq is not None and _fp is None:
                     if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
                         continue
-                if _has_extreme_length_disparity(p.name_normalized or "", q.name_normalized or ""):
+                if _has_extreme_length_disparity(
+                    p.name_normalized or "",
+                    q.name_normalized or "",
+                    brand_hint=(p.brand or q.brand or ""),
+                ):
                     continue
                 if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
                     continue
@@ -809,7 +909,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _fq is not None and _fp is None:
                     if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
                         continue
-                if _has_extreme_length_disparity(p.name_normalized or "", q.name_normalized or ""):
+                if _has_extreme_length_disparity(
+                    p.name_normalized or "",
+                    q.name_normalized or "",
+                    brand_hint=(p.brand or q.brand or ""),
+                ):
                     continue
                 if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
                     continue
@@ -906,7 +1010,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _fq is not None and _fp is None:
                     if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
                         continue
-                if _has_extreme_length_disparity(p.name_normalized or "", q.name_normalized or ""):
+                if _has_extreme_length_disparity(
+                    p.name_normalized or "",
+                    q.name_normalized or "",
+                    brand_hint=(p.brand or q.brand or ""),
+                ):
                     continue
                 if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
                     continue
