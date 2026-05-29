@@ -28,9 +28,17 @@ leaddrive.cloud, www.leaddrive.cloud {
     }
 
     # API → FastAPI on 8080
-    @api path /api/* /docs /openapi.json /auth/*
+    @api path /api/* /docs /openapi.json /auth/* /health /metrics
     handle @api {
         reverse_proxy 127.0.0.1:8080
+    }
+
+    # Grafana (observability) → :3001. Grafana serves under /grafana subpath
+    # (GF_SERVER_SERVE_FROM_SUB_PATH=true, root_url=.../grafana/) + own login.
+    # Install: см. docs/RUNBOOK.md «Observability (Prometheus + Grafana)».
+    @grafana path /grafana /grafana/*
+    handle @grafana {
+        reverse_proxy 127.0.0.1:3001
     }
 
     # Everything else → Next.js on 3000

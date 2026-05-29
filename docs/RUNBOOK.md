@@ -238,6 +238,33 @@ sudo systemctl start pharmacy-monitor-backup.service
 
 ---
 
+## Observability (Prometheus + Grafana)
+
+Установлено 2026-05-29 (apt, не docker). Дашборд: **https://leaddrive.cloud/grafana**
+
+| Компонент | Порт | Что |
+|---|---|---|
+| Prometheus | 127.0.0.1:9090 | скрейпит `/metrics` приложения (15s) + self; alert-rules в `/etc/prometheus/alerts.yml` (7 правил) |
+| Grafana | 127.0.0.1:3001 | datasource Prometheus (default), дашборд «Pharmacy Monitor» (10 панелей); за Caddy `/grafana` |
+| node_exporter | — | НЕ установлен (дашборд по app-метрикам; host-метрики при желании: `apt install prometheus-node-exporter` + scrape job) |
+
+**Первый вход:** логин `admin` / пароль `admin` → Grafana **сразу заставит сменить пароль**. Смени немедленно.
+Сбросить admin-пароль: `sudo grafana-cli admin reset-admin-password <new>` (на проде).
+
+**Конфиги:** `/etc/prometheus/prometheus.yml` (из `infra/prometheus.yml`), `/etc/prometheus/alerts.yml` (из `infra/prometheus-alerts.yml`), Grafana provisioning в `/etc/grafana/provisioning/{datasources,dashboards}/`, дашборд `/var/lib/grafana/dashboards/pharmacy.json` (из `infra/grafana/dashboard.json`).
+
+```bash
+systemctl restart prometheus grafana-server     # рестарт
+curl -s http://127.0.0.1:9090/api/v1/targets     # проверить targets up
+journalctl -u grafana-server -n 50               # логи Grafana
+```
+
+**Caddy:** `/grafana` роут в `/etc/caddy/Caddyfile` (`@grafana` → :3001). Бэкап перед правкой: `Caddyfile.bak.*`. `systemctl restart caddy` (reload не работает — `admin off`).
+
+> Alertmanager НЕ поднят — alert-rules видны на Prometheus `/alerts`, но notifications не уходят (для пилота алерты идут через email-дайджест + Sentry). Поднять: `apt install prometheus-alertmanager` + раскомментировать блок в prometheus.yml.
+
+---
+
 ## 🚨 Аварийные сценарии
 
 ### Полная потеря VPS
