@@ -70,6 +70,17 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 ## Active work-in-progress
 
+**Just finished (2026-05-29)**: **Comparison-фича закалена end-to-end + matcher precision/recall + дедуп** (5 деплоев, всё на проде/в git):
+- **Freshness в `/comparison`** ([src/api.py](src/api.py) `_comparison_spread` + `_price_age_days`): цена считается свежей по `Product.last_seen_at` (НЕ `captured_at` — под diff-only у стабильной цены он старый). Stale (>14д) показывается с бейджем «N дн. назад», но НЕ участвует в spread/min/max/cheapest. Frontend: `PriceCell` приглушает + зачёркивает stale, i18n `stale_badge`/`stale_note` (ru/az/en).
+- **High-outlier guard** ([src/api.py](src/api.py)): симметрично low-outlier — при 3+ свежих сайтах дропает цену >8.3× медианы (wrong-match «Aspirin C» 8.02 при 0.30/0.30). + ручной reject 7 wrong-match (Mustela, Mikrazim-доза, Normoqlip-вариант…) + хирургический unlink Aspirin C из 3-товарного кластера.
+- **Matcher variant-atom guard** ([src/matcher.py](src/matcher.py) `_has_conflicting_variant_atoms`): сравнивает «вариант-атомы» из RAW-имени (серийная цифра 1-9 + буква-вариант кроме юнитов q/g/l + одиночная фарм-масса 1-9 mg) — ловит Normoqlip M≠2≠4mg, Lorinden C≠A, Vitamin A≠C, ASferon C≠S, Solgar C≠E, Güzgü M≠S. normalize вырезал эти различители рядом с pack → guard'ы их не видели. Валидировано на дампе 57142 (0 ложных).
+- **Form-synonym recall fix** ([src/normalize.py](src/normalize.py) `_FORM_CANONICAL`): канонизированы 16 AZ-плюралов/синонимов (tabletlər/sorma/kapsulalar/ampoules…) — раньше «sorma tabletlər» ≠ «tabletlər» ложно блокировало гомеопатию (Afalaza/Anaferon/Divaza). +15 матчей. Группы форм остаются раздельными (cream≠ointment).
+- **EN-locale дедуп** ([src/scrapers/pharmonline.py](src/scrapers/pharmonline.py) `_external_id_from_href`): Playwright-скрейпер клал `?lng=en` в external_id → ~9560 EN-дублей. Root-fix (обрезка query) + удалено 9560 дублей с прода (бэкап `pre-endup-dedup-*.sql.gz`).
+- **`notify test`** ([src/main.py](src/main.py)): smoke-тест доставки (email+telegram одной командой). + удалён мёртвый `scripts/backup.sh` (SQLite; прод на Postgres `infra/scripts/backup.sh`), provision/RUNBOOK/README реконсилированы.
+- **Состояние интеграций (verified 2026-05-29)**: Resend email ✓ работает (daily digest), Sentry ✓ работает, локальный Postgres-бэкап ✓ (GPG). Не настроено: Telegram (опц.), B2 offsite (отклонено клиентом), HA-резерв.
+- **Matcher у потолка**: recall 98.3% (2253/2293 кросс-сайт-идентичных групп сматчены), precision закалён. Дальше по матчеру/дедупу — убывающая отдача (нет barcode: pharmonline ~13%, aptek/aloe 0).
+- Коммиты: ce9ecf3→b97a3e1 (freshness+Codex), 1bd15db (high-outlier), 5307ce1→10aa115 (variant-atom), 82ddabf (EN-dedup), 0137b5d (form-fix), 6c3ced2 (notify test), 68832e5 (docs). 764 теста.
+
 **Just finished (2026-05-28 morning)**: **9 MCPs всё user-scope + persistent Postgres tunnel + overnight pipeline green + 4 commits pushed**.
 
 ### MCP stack (`~/.claude.json`, user-scope, во всех проектах):

@@ -162,9 +162,10 @@ docs/
 └── MATCHING-GUIDE.md    # Гайд для клиента: как корректировать матчи
 scripts/
 ├── provision_vps.sh     # One-shot Ubuntu deploy (nginx + systemd + Let's Encrypt)
-├── backup.sh            # Atomic SQLite backup + gzip + 90d retention
 ├── probe.py             # Live DOM inspection (для дебага скрейперов)
 └── probe_pagination.py  # Пагинация-разведка
+infra/scripts/
+└── backup.sh            # Daily Postgres pg_dump + gzip + GPG + optional B2 offsite
 tests/                   # 139 unit-тестов + 7 snapshot regression
 └── fixtures/            # Сохранённые HTML страницы 3 сайтов
 ```

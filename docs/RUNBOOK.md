@@ -230,7 +230,10 @@ sudo systemctl start pharmacy-monitor-run.timer
 ### Сделать бэкап вручную
 
 ```bash
-sudo -u pharmacy bash /opt/pharmacy-monitor/scripts/backup.sh
+# Postgres pg_dump → /var/backups/pharmacy-monitor/ (+ GPG если задан BACKUP_GPG_PASSPHRASE,
+# + B2 offsite если заданы B2_APPLICATION_KEY_ID/KEY):
+sudo systemctl start pharmacy-monitor-backup.service
+# или напрямую: sudo bash /opt/pharmacy-monitor/infra/scripts/backup.sh
 ```
 
 ---

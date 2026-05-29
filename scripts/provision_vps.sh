@@ -244,25 +244,27 @@ StandardError=append:$INSTALL_DIR/logs/telegram.log
 WantedBy=multi-user.target
 EOF
 
-# === SQLite backup — ежедневно в 02:00 UTC ===
+# === Postgres backup — ежедневно в 04:00 UTC ===
+# Use infra/scripts/backup.sh (pg_dump → gzip → optional GPG + B2 offsite).
+# NB: prod мигрировал SQLite → Postgres; старый scripts/backup.sh (SQLite) удалён.
 cat > /etc/systemd/system/pharmacy-monitor-backup.service <<EOF
 [Unit]
-Description=Pharmacy Monitor — daily SQLite backup
+Description=Pharmacy Monitor — daily Postgres backup
 
 [Service]
 Type=oneshot
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
 Environment="INSTALL_DIR=$INSTALL_DIR"
-ExecStart=/bin/bash $INSTALL_DIR/scripts/backup.sh
+ExecStart=/bin/bash $INSTALL_DIR/infra/scripts/backup.sh
 EOF
 
 cat > /etc/systemd/system/pharmacy-monitor-backup.timer <<EOF
 [Unit]
-Description=Pharmacy Monitor — daily backup at 02:00 UTC
+Description=Pharmacy Monitor — daily backup at 04:00 UTC
 
 [Timer]
-OnCalendar=*-*-* 02:00:00
+OnCalendar=*-*-* 04:00:00
 Persistent=true
 
 [Install]
