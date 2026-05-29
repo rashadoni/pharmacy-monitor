@@ -10,14 +10,18 @@ from src.normalize import (
 
 
 def test_strip_accents_decomposable_diacritics():
-    """strip_accents использует NFKD — работает только на пре-композированных символах.
+    """strip_accents: NFKD для декомпозируемых + явная AZ-карта для ə/ı.
 
-    `ç`, `ü`, `Ş` декомпозируются → диакритика убирается.
-    `ə` (U+0259, Latin schwa) — атомарный символ, НЕ декомпозируется. Это известно
-    и ожидаемо; для матчинга мы полагаемся на нормализацию name через token-set ratio.
+    Fix 2026-05-29: ранее `ə` (U+0259 schwa) и `ı` (U+0131 dotless i) НЕ
+    декомпозировались NFKD и оставались в выводе → «Şəkər»→«Səkər», ломая
+    cross-site матч между сайтом с «ə» и сайтом с «e». Теперь явная карта
+    переводит ə→e, ı→i (регистр сохраняется).
     """
     assert strip_accents("üçün") == "ucun"
-    assert strip_accents("Şəkər") == "Səkər"  # ş→S, ə остаётся, к не имеет диакритики
+    assert strip_accents("Şəkər") == "Seker"  # Ş→S, ə→e, к→k
+    assert strip_accents("şərbət") == "serbet"  # ə→e полностью
+    assert strip_accents("Günəş") == "Gunes"  # ü→u, ə→e, ş→s, регистр сохранён
+    assert strip_accents("Ağız") == "Agiz"  # ğ→g, ı→i
 
 
 def test_normalize_name_strips_dosage_and_pack():

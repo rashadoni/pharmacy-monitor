@@ -30,6 +30,17 @@ def main() -> None:
     with open(dump_path) as f:
         rows = json.load(f)
 
+    # --renormalize: пересчитать name_normalized из сырого name с ТЕКУЩИМ
+    # normalize_name (fixed strip_accents ə→e/ı→i). Симулирует прод-backfill,
+    # чтобы измерить эффект accent-fix на coverage до деплоя.
+    renorm = "--renormalize" in sys.argv
+    if renorm:
+        from src.normalize import normalize_name
+
+        for r in rows:
+            r["name_normalized"] = normalize_name(r["name"] or "")
+        print("[--renormalize] recomputed name_normalized from raw name")
+
     # Isolated in-memory SQLite
     engine = create_engine("sqlite://")
     storage.Base.metadata.create_all(engine)

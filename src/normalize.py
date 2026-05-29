@@ -396,8 +396,40 @@ def _normalize_units(unit_str: str | None) -> str | None:
     return s or None
 
 
+# Азербайджанские буквы, которые NFKD НЕ декомпозирует (это самостоятельные
+# буквы, а не accented-варианты). Без явной карты ə/ı оставались в
+# name_normalized → «şərbət»→«sərbət» (а не «serbet»), и cross-site матч между
+# сайтом с «ə» и сайтом с «e» проваливался. Bug fix 2026-05-29.
+# Регистр сохраняем (нижний→нижний, верхний→верхний): strip_accents не должен
+# менять case — это делает .lower() у вызывающего при необходимости.
+_AZ_CHAR_MAP = str.maketrans(
+    {
+        "ə": "e",
+        "Ə": "E",
+        "ı": "i",
+        "İ": "I",
+        "ş": "s",  # дублируем NFKD-покрытие для надёжности
+        "Ş": "S",
+        "ç": "c",
+        "Ç": "C",
+        "ğ": "g",
+        "Ğ": "G",
+        "ö": "o",
+        "Ö": "O",
+        "ü": "u",
+        "Ü": "U",
+    }
+)
+
+
 def strip_accents(text: str) -> str:
-    """ə→e, ü→u, ş→s и т.п. Helps cross-language matching (AZ ↔ RU translit)."""
+    """ə→e, ı→i, ü→u, ş→s и т.п. Helps cross-language matching (AZ ↔ RU translit).
+
+    Двухступенчато: (1) явная AZ-карта для букв, которые NFKD не разбирает
+    (ə, ı — самостоятельные буквы), (2) NFKD + удаление combining-марок для
+    остальных диакритик (é, ñ, …).
+    """
+    text = text.translate(_AZ_CHAR_MAP)
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 

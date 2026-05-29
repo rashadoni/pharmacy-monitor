@@ -24,6 +24,7 @@ from rapidfuzz import fuzz
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from src.brand_catalog import is_brand_blacklisted
 from src.match_actions import is_rejected
 from src.normalize import extract_form, normalize_name, strip_accents
 from src.storage import Match, PriceSnapshot, Product, latest_snapshots_per_product
@@ -553,6 +554,12 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     # слово name_normalized, которое обычно и есть торговое название.
     def bucket_key(p: Product) -> tuple:
         brand = (p.brand or "").lower().strip()
+        # Blacklist-фильтр (2026-05-29): generic AZ-слова (baby, sabun, günəş,
+        # qoruyucu…) массово извлекаются как «бренд» и раздувают/искажают
+        # bucket → пропущенные cross-site матчи. Если brand в блок-листе —
+        # трактуем как пустой, чтобы упасть на name-based fallback (ниже).
+        if brand and is_brand_blacklisted(brand):
+            brand = ""
         # _norm_units: mq→mg, mkg→mcg, (\d)q→\1g — унифицирует AZ/RU единицы
         # с международными, чтобы «250mq» и «250mg» попадали в один bucket.
         dosage = _norm_units((p.dosage or "").lower().replace(" ", ""))

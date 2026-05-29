@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 
+from src.normalize import strip_accents
+
 BRANDS: dict[str, list[str]] = {
     # Baby formula (молочные смеси)
     "Friso": ["friso", "friso pep", "friso gold"],
@@ -410,7 +412,44 @@ _BLOCKLIST_FIRST_WORD = {
     "tampon",
     "tamponi",
     "tamponlar",
+    # ─── 2026-05-29 (matcher coverage deep-dive): generic AZ слова, массово
+    # извлечённые как «бренды» (top-40 brand audit на проде). Это категории/
+    # дескрипторы, не производители. Раздувают bucket_key и маскируют реальный
+    # бренд → пропущенные cross-site матчи. Сравнение теперь accent-insensitive
+    # (через strip_accents), поэтому достаточно ASCII-форм.
+    "baby",
+    "body",
+    "sabun",  # мыло
+    "leykoplastr",  # пластырь
+    "boyukler",  # böyüklər = взрослые
+    "boyuklar",
+    "elastik",  # эластик(бинт)
+    "emzik",  # əmzik = соска
+    "qoruyucu",  # защитный
+    "kalqotka",  # колготки
+    "elcek",  # əlcək = перчатка
+    "prezervativ",  # презерватив
+    "beden",  # bədən = тело
+    "maye",  # жидкость
+    "varikoz",  # варикоз (категория)
+    "agiz",  # ağız = рот/полость рта
+    "toothpaste",
+    "salfetka",
+    "salfetkalar",
 }
+
+
+# Accent-insensitive вид блок-листа: strip_accents(ə→e, ş→s, ı→i…)+lower.
+# Без этого «Günəş».lower()=«günəş» не совпадал с «gunes» в списке. Строим
+# один раз на импорте.
+_BLOCKLIST_NORMALIZED: frozenset[str] = frozenset(
+    strip_accents(w).lower() for w in _BLOCKLIST_FIRST_WORD
+)
+
+
+def _is_blocklisted_word(word: str) -> bool:
+    """Accent-insensitive проверка слова против блок-листа."""
+    return strip_accents(word).lower() in _BLOCKLIST_NORMALIZED
 
 
 def _first_word_brand(name: str) -> str | None:
@@ -424,7 +463,7 @@ def _first_word_brand(name: str) -> str | None:
     if not m:
         return None
     word = m.group(1)
-    if word.lower() in _BLOCKLIST_FIRST_WORD:
+    if _is_blocklisted_word(word):
         return None
     # Не возвращать просто numeric/short
     if len(word) < 4:
@@ -459,11 +498,12 @@ def is_brand_blacklisted(brand: str | None) -> bool:
     (б) для backfill чистки существующих записей в БД (см.
     scripts/cleanup_bad_brands.py), (в) для пост-валидации скрейпер output.
 
-    Регистро-нечувствительная проверка против объединённого blocklist.
+    Регистро- И акцент-нечувствительная проверка против объединённого blocklist
+    (Günəş→gunes, Şampun→sampun ловятся несмотря на ş/ə-варианты).
     """
     if not brand:
         return False
-    return brand.strip().lower() in _BLOCKLIST_FIRST_WORD
+    return _is_blocklisted_word(brand.strip())
 
 
 def extract_brand(name: str | None) -> str | None:
