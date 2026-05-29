@@ -531,6 +531,28 @@ def _significant_name_tokens(name_norm: str | None) -> frozenset[str]:
     )
 
 
+def _hard_conflict(a, b) -> bool:
+    """Pairwise hard-guard'ы (как в проходах), отличающие РАЗНЫЕ товары.
+
+    Для ambiguity pre-pass: кандидата, которого настоящий проход всё равно бы
+    отверг (Nutrilon Premium 1 vs Comfort/Pepti → series-guard), НЕ считаем —
+    иначе генерик-якорь ложно «неоднозначен» и теряет легит-двойника.
+    НЕ включаем length-disparity: короткий генерик vs длинное брендовое имя —
+    это как раз brand-stub, который ДОЛЖЕН считаться неоднозначностью.
+    """
+    an, bn = a.name_normalized or "", b.name_normalized or ""
+    ar, br = a.name or "", b.name or ""
+    return (
+        _has_conflicting_form(ar, br)
+        or _has_conflicting_gender(an, bn)
+        or _has_conflicting_series_number(an, bn)
+        or _has_conflicting_orphan_number(an, bn)
+        or _has_conflicting_variant_tokens(an, bn)
+        or _has_conflicting_variant_atoms(ar, br)
+        or _has_conflicting_strength_number(ar, br)
+    )
+
+
 def _build_word_freq(products: list) -> dict[str, int]:
     """Частота слов по всем name_normalized.
 
@@ -733,7 +755,6 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
         for q in _agrp:
             _qsig = _sig[q.id]
             _extras: set[frozenset[str]] = set()
-            _has_equal_peer = False
             for p in _agrp:
                 if p.site == q.site or p.id == q.id:
                     continue
@@ -742,18 +763,23 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     < fuzzy_threshold
                 ):
                     continue
-                # Точный двойник (равный набор значащих токенов) на другом сайте →
-                # у q ЕСТЬ определённый матч → это не генерик-неоднозначность.
-                # Спасает мульти-вариантные линейки: «Nutrilon Premium 1» с твином
-                # «Nutrilon Premium 1» не подавляется из-за соседей Comfort/Pepti.
-                if _sig[p.id] == _qsig:
-                    _has_equal_peer = True
-                    break
-                _extra = _sig[p.id] - _qsig
-                if _extra:
-                    _extras.add(_extra)
-            # Подавляем только генерик БЕЗ точного двойника, матчащийся к ≥2 РАЗНЫМ.
-            if not _has_equal_peer and len(_extras) >= 2:
+                # Считаем кандидата, только если настоящий проход его НЕ отверг бы
+                # (иначе Nutrilon Premium 1 ложно неоднозначен из-за Comfort/Pepti).
+                if _hard_conflict(q, p):
+                    continue
+                # Считаем «лишнее» ТОЛЬКО когда q — генерик ОТНОСИТЕЛЬНО p (q ⊆ p):
+                # тогда p добавляет бренд/вариант, которого у q нет. Если бренды
+                # ВЗАИМНО различаются (Medoil vs Fitooil — ни один не подмножество),
+                # это просто разные товары, q не генерик → не считаем (иначе легит
+                # same-brand Medoil↔Medoil ложно подавляется соседом Fitooil).
+                _psig = _sig[p.id]
+                if _qsig <= _psig:
+                    _extra = _psig - _qsig
+                    if _extra:
+                        _extras.add(_extra)
+            # Неоднозначен, если q-генерик подходит к ≥2 кандидатам с РАЗНЫМИ
+            # добавочными токенами (разные бренды/варианты: Altay vs Mirrolla vs Seide).
+            if len(_extras) >= 2:
                 ambiguous_ids.add(q.id)
     if ambiguous_ids:
         log.info("matcher_ambiguous_generics_suppressed", count=len(ambiguous_ids))
