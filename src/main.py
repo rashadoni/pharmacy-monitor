@@ -1400,6 +1400,51 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool) -> None:
         click.echo(f"OK: {kind} digest sent to {sent} recipients")
 
 
+@notify_group.command("test")
+@click.option(
+    "--email", "email_to", default=None, help="Override-получатель (default: DB/EMAIL_TO)"
+)
+@click.option(
+    "--chat-id", "chat_id", default=None, help="Telegram chat_id (default: TELEGRAM_CHAT_ID)"
+)
+def notify_test(email_to: str | None, chat_id: str | None) -> None:
+    """Smoke-тест доставки алертов: шлёт тест-письмо + Telegram, репортит каждый канал.
+
+    Запускать ПОСЛЕ configure-integrations.sh для проверки ключей. Неконфигурированные
+    каналы помечаются 'skipped' (не ошибка). Пример (на проде):
+        pharmacy-monitor notify test
+    """
+    import os
+
+    from src import notifier
+
+    # ── Email ──
+    if os.environ.get("SMTP_HOST"):
+        try:
+            notifier.send_email(
+                subject="🧪 Pharmacy Monitor — тест доставки",
+                html_body="<p>Если вы это видите — SMTP настроен корректно.</p>",
+                to=[email_to] if email_to else None,
+            )
+            click.echo("email:    OK (отправлено)")
+        except Exception as e:
+            click.echo(f"email:    FAIL — {e}")
+    else:
+        click.echo("email:    skipped (SMTP_HOST не задан)")
+
+    # ── Telegram ──
+    cid = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
+    if not os.environ.get("TELEGRAM_BOT_TOKEN"):
+        click.echo("telegram: skipped (TELEGRAM_BOT_TOKEN не задан)")
+    elif not cid:
+        click.echo("telegram: skipped (нет chat_id — задай TELEGRAM_CHAT_ID или --chat-id)")
+    else:
+        ok = notifier.send_telegram_message(
+            cid, "🧪 Pharmacy Monitor — тест доставки. Если видите это — Telegram настроен."
+        )
+        click.echo("telegram: OK" if ok else "telegram: FAIL — проверь токен/chat_id")
+
+
 @cli.command("ai-crawl")
 @click.option(
     "--site",

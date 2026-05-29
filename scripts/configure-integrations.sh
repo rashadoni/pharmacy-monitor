@@ -101,7 +101,7 @@ configure_smtp() {
     [[ -n "$from_email" ]] && update_env "SMTP_FROM" "$from_email"
     [[ -n "$to_email" ]] && update_env "EMAIL_TO" "$to_email"
     restart_api
-    echo "  ✓ SMTP готов. Test: pharmacy-monitor notify-test (на проде)."
+    echo "  ✓ SMTP готов. Test: ssh root@prod 'cd /opt/pharmacy-monitor && .venv/bin/pharmacy-monitor notify test'"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -249,7 +249,8 @@ main() {
     echo
     echo "Что дальше:"
     echo "  • Открой https://leaddrive.cloud/settings — проверь что нотификации показывают ✓"
-    echo "  • Триггер тестового алерта (для Telegram): pharmacy-monitor alerts test (на проде)"
+    echo "  • Smoke-тест доставки (email+telegram одной командой):"
+    echo "      ssh root@$PROD_HOST 'cd /opt/pharmacy-monitor && .venv/bin/pharmacy-monitor notify test'"
     echo "  • Sentry начнёт ловить ошибки автоматически на любых API-call'ах"
 }
 
