@@ -389,6 +389,84 @@ def test_comparison_same_pack_stays_raw(client, tenant_user, setup_db):
     assert abs(row["spread_pct"] - 33.3) < 1.0  # (15-10)/15 = 33%
 
 
+def test_comparison_excludes_low_confidence_matches(client, tenant_user, setup_db):
+    """2026-05-29: низко-достоверные fuzzy-матчи (Bio Kolik капли ↔ Bio sprey,
+    confidence 0.68 — разные товары) исключаются дефолтным min_confidence=0.70,
+    чтобы не давать ложный spread в топе."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    # low-conf wrong match
+    bad = storage.Match(tenant_id=1, canonical_name="Bio thing", confidence=0.68)
+    s.add(bad)
+    s.flush()
+    for site, price, nm in [
+        ("aptekonline", 4.45, "Bio Kolik N20"),
+        ("pharmonline", 14.6, "Bio sprey 30ml"),
+    ]:
+        p = storage.Product(
+            tenant_id=1,
+            site=site,
+            external_id=f"{site}-bio",
+            url=f"http://{site}/bio",
+            name=nm,
+            name_normalized=nm.lower(),
+            canonical_id=bad.id,
+        )
+        s.add(p)
+        s.flush()
+        s.add(
+            storage.PriceSnapshot(run_id=run.id, product_id=p.id, price=price, captured_at=utcnow())
+        )
+    # high-conf good match (control)
+    _make_match_with_packs(
+        s,
+        run,
+        canonical="GoodDrug",
+        prods=[
+            ("aptekonline", 10.0, "n20", "GoodDrug N20"),
+            ("pharmonline", 11.0, "n20", "GoodDrug N20"),
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    names = [r["name"] for r in client.get("/api/v1/dash/comparison?min_sites=2").json()]
+    assert "Bio thing" not in names  # 0.68 < 0.70 floor → excluded
+    assert "GoodDrug" in names
+    # явный low floor показывает их обратно
+    resp = client.get("/api/v1/dash/comparison?min_sites=2&min_confidence=0")
+    assert "Bio thing" in [r["name"] for r in resp.json()]
+
+
+def test_comparison_drops_extreme_price_outlier(client, tenant_user, setup_db):
+    """Thiogamma-класс: одинаковая фасовка (обе N10), но одна цена 10× битая
+    (aloe 8.90 vs pharm 89.00 — per-unit scrape error). Битая цена дропается
+    (>8.3× от медианы), строка уходит из сравнения (остаётся 1 сайт)."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_packs(
+        s,
+        run,
+        canonical="Thiogamma turbo",
+        prods=[
+            ("aloe", 8.9, "n10", "Thiogamma Turbo 50 ml, 10 əd"),
+            ("pharmonline", 89.0, "n10", "Thiogamma turbo 50 ml № 10"),
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    # 8.90 = 10% of 89 → dropped (< 12% threshold) → only 1 site → row excluded
+    assert not any(r["name"] == "Thiogamma turbo" for r in rows)
+
+
 def test_comparison_sorted_by_spread_desc(client, tenant_user, setup_db):
     """Rows отсортированы по spread_pct desc (самое полезное сверху)."""
     if not api_module._JWT_AVAILABLE:

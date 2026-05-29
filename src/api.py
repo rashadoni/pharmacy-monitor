@@ -1372,11 +1372,15 @@ def _comparison_spread(
 
     key = "unit_price" if basis == "unit" else "price"
 
-    # ── Шаг 2: outlier-фильтр на выбранном basis (parse-ошибки <10% медианы) ──
+    # ── Шаг 2: outlier-фильтр на выбранном basis (parse-ошибки) ──
+    # Порог 12%: цена дешевле 12% медианы = >8.3× разрыв. Для идентичной
+    # фасовки такой разрыв почти всегда parse-ошибка (Thiogamma aloe 8.90 vs
+    # pharm 89.00 = ровно 10× — теперь ловится; раньше при 10% ровно на границе
+    # проскакивал). Реальный 2-5× undercut остаётся виден.
     if len(prices) >= 2:
         vals = sorted(d[key] for d in prices.values())
         median = vals[len(vals) // 2]
-        threshold = median * 0.1
+        threshold = median * 0.12
         for site in [s for s, d in prices.items() if d[key] < threshold]:
             del prices[site]
 
@@ -1398,10 +1402,18 @@ def dash_comparison(
     min_sites: int = 2,
     site_filter: str | None = None,
     limit: int = 5000,
+    min_confidence: float = 0.70,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """Cross-site comparison rows. Filtered by tenant_id automatically."""
+    """Cross-site comparison rows. Filtered by tenant_id automatically.
+
+    `min_confidence` (default 0.70): отсекаем низко-достоверные fuzzy-матчи —
+    они почти всегда РАЗНЫЕ товары (Bio Kolik капли ↔ Bio sprey, Vitamin C
+    таблетки ↔ Vitamin C ампула), сматченные по generic-токенам, и дают
+    ложный гигантский spread в топе. is_manual=True матчи (подтверждены
+    человеком) показываются всегда, независимо от confidence.
+    """
     last_run = db.scalar(
         select(storage.Run.id)
         .where(storage.Run.status == "ok", storage.Run.tenant_id == user.tenant_id)
@@ -1439,6 +1451,11 @@ def dash_comparison(
 
     out: list[ComparisonRowOut] = []
     for m in matches:
+        # Confidence floor: низко-достоверные fuzzy-матчи (Bio Kolik ↔ Bio sprey)
+        # дают ложный spread. Ручные (is_manual) показываем всегда.
+        conf = m.confidence if m.confidence is not None else 1.0
+        if not m.is_manual and conf < min_confidence:
+            continue
         raw_prices: dict[str, dict[str, Any]] = {}
         for p in m.products:
             snap = snaps_by_pid.get(p.id)
