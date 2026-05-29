@@ -1406,17 +1406,21 @@ def _comparison_spread(
 
     key = "unit_price" if basis == "unit" else "price"
 
-    # ── Шаг 2: outlier-фильтр на выбранном basis по свежим (parse-ошибки) ──
-    # Порог 12%: цена дешевле 12% медианы = >8.3× разрыв. Для идентичной
-    # фасовки такой разрыв почти всегда parse-ошибка (Thiogamma aloe 8.90 vs
-    # pharm 89.00 = ровно 10× — теперь ловится; раньше при 10% ровно на границе
-    # проскакивал). Реальный 2-5× undercut остаётся виден. Битую ТЕКУЩУЮ цену
-    # дропаем и из `prices` (не показываем); stale-цены не трогаем.
+    # ── Шаг 2: СИММЕТРИЧНЫЙ outlier-фильтр по свежим (parse-ошибки/wrong-match) ──
+    # Низкий выброс (<12% медианы = >8.3× дешевле): почти всегда parse-ошибка /
+    #   не та единица (Thiogamma aloe 8.90 vs pharm 89.00 = 10×).
+    # Высокий выброс (>8.3× медианы): ловится ТОЛЬКО при 3+ сайтах, где медиана —
+    #   реальный консенсус. Напр. wrong-match «Aspirin C» 8.02 при aptek/aloe
+    #   0.30/0.30 → дропаем 8.02, остаётся консенсус 0.30/0.30 (spread 0%).
+    #   При 2 сайтах median == max, высокий порог не срабатывает → поведение
+    #   2-сайтовых строк без изменений. Реальный 2-5× undercut остаётся виден.
+    # Битую ТЕКУЩУЮ цену дропаем из `prices` (не показываем); stale не трогаем.
     if len(fresh) >= 2:
         vals = sorted(d[key] for d in fresh.values())
         median = vals[len(vals) // 2]
-        threshold = median * 0.12
-        for site in [s for s, d in fresh.items() if d[key] < threshold]:
+        low_t = median * 0.12
+        high_t = median / 0.12 if median > 0 else float("inf")
+        for site in [s for s, d in fresh.items() if d[key] < low_t or d[key] > high_t]:
             del prices[site]
             del fresh[site]
 

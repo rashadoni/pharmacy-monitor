@@ -467,6 +467,65 @@ def test_comparison_drops_extreme_price_outlier(client, tenant_user, setup_db):
     assert not any(r["name"] == "Thiogamma turbo" for r in rows)
 
 
+def test_comparison_drops_high_outlier_3site_wrong_match(client, tenant_user, setup_db):
+    """3-сайтовый wrong-match: 2 сайта сходятся (0.30/0.30), 1 — высокий выброс
+    8.02 ('Aspirin C' ошибочно сматчен с 'Aspirin'). Высокая цена >8.3× медианы
+    дропается → строка показывает консенсус 0.30/0.30 без ложного 96% spread.
+    (Низкий-выброс фильтр такое не ловил — это симметричный high-outlier guard.)
+    """
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_packs(
+        s,
+        run,
+        canonical="Aspirin",
+        prods=[
+            ("aptekonline", 0.30, "n10", "Aspirin 500 mq N10"),
+            ("aloe", 0.30, "n10", "Aspirin 500 mq 10 əd"),
+            ("pharmonline", 8.02, "n10", "Aspirin C N10 (effervescent)"),
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    row = next(x for x in rows if x["name"] == "Aspirin")
+    # высокий выброс pharm 8.02 убран; остаётся консенсус aptek+aloe
+    assert "pharmonline" not in row["prices"]
+    assert set(row["prices"].keys()) == {"aptekonline", "aloe"}
+    assert row["spread_pct"] < 5.0  # 0.30 vs 0.30 → ~0, не ложные 96%
+
+
+def test_comparison_2site_high_ratio_not_dropped(client, tenant_user, setup_db):
+    """Регрессия симметричного фильтра: при 2 сайтах median==max, высокий порог
+    НЕ срабатывает. Реальный 4× undercut (4.40 vs 1.10, оба n10) остаётся виден,
+    обе цены сохраняются, spread ~75%."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_packs(
+        s,
+        run,
+        canonical="Doksisiklin",
+        prods=[
+            ("pharmonline", 4.40, "n10", "Doksisiklin 100 mq N10"),
+            ("aptekonline", 1.10, "n10", "Doksisiklin 100 mq N10"),
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    row = next(x for x in rows if x["name"] == "Doksisiklin")
+    assert set(row["prices"].keys()) == {"pharmonline", "aptekonline"}
+    assert abs(row["spread_pct"] - 75.0) < 1.0
+
+
 def test_comparison_sorted_by_spread_desc(client, tenant_user, setup_db):
     """Rows отсортированы по spread_pct desc (самое полезное сверху)."""
     if not api_module._JWT_AVAILABLE:
