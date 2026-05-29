@@ -5,11 +5,13 @@ from src.matcher import (
     _has_conflicting_form,
     _has_conflicting_gender,
     _has_conflicting_series_number,
+    _has_conflicting_variant_atoms,
     _has_conflicting_variant_tokens,
     _has_extreme_length_disparity,
     _has_perunit_mismatch,
     _is_significant_variant_token,
     _pack_count,
+    _variant_atoms,
 )
 
 
@@ -1165,3 +1167,79 @@ def test_flag_suspected_mismatches_skips_singleton_clusters(db_session):
 def test_flag_suspected_mismatches_empty_db_returns_zero(db_session):
     """Нет matches → 0, не падает."""
     assert matcher.flag_suspected_mismatches(db_session) == 0
+
+
+# ── Variant-atoms (2026-05-29): буква/серийная цифра из RAW ───────────────────
+# Валидировано на прод-дампе (57142 товара, scripts/scan_variant_conflicts.py):
+# ловит 7 настоящих wrong-match (Lorinden C/A, Vitamin A/C, ASferon C/S,
+# Solgar C/E, Normoqlip M/2, Güzgü M/S), 0 ложных. Сводит общий 2+ счёт 4876→4873.
+
+
+class TestVariantAtoms:
+    def test_extracts_single_variant_letter(self):
+        assert _variant_atoms("Lorinden C məlhəm 15 q") == frozenset({"c"})
+        assert _variant_atoms("Vitamin A № 10") == frozenset({"a"})
+        assert _variant_atoms("Normoqlip M № 30 (Tabletlər)") == frozenset({"m"})
+
+    def test_extracts_series_digit(self):
+        assert _variant_atoms("Normoqlip 2  N30") == frozenset({"2"})
+        assert _variant_atoms("Nutrilon 1") == frozenset({"1"})
+
+    def test_excludes_unit_letters_q_g_l(self):
+        # q=грамм(AZ), g=грамм, l=литр — единицы, НЕ варианты
+        assert _variant_atoms("Heparin 25 q") == frozenset()
+        assert _variant_atoms("Heparin 25 g") == frozenset()
+
+    def test_excludes_age_weight_volume_pack(self):
+        assert _variant_atoms("Gerber sıyıq 6 aylıq alma 180 q") == frozenset()
+        assert _variant_atoms("Mikrazim 10000 N20") == frozenset()  # 10000 = 2+-значное
+        # range «2-5» убран, pack «N94» убран, серийная «1» сохранена
+        assert _variant_atoms("Pampers 1 New Baby 2-5 kq N94") == frozenset({"1"})
+
+    def test_excludes_multidigit_strength(self):
+        # «25000 ED» → unit-strip; «50 000» split-число → 2+-значные не атомы
+        assert _variant_atoms("Mikrazim 25000 ED № 20") == frozenset()
+        # D-3 → буква d + серийная 3 (на ОБОИХ сайтах одинаково → не конфликт)
+        assert _variant_atoms("D-3 Ferol 50 000 BV 15 ml") == frozenset({"d", "3"})
+
+    def test_extracts_single_digit_pharma_mass(self):
+        # «2 mq» (Normoqlip 2mg глимепирид) → атом {2}; дробные/многозначные — нет
+        assert _variant_atoms("Normoqlip 2 mq № 30") == frozenset({"2"})
+        assert _variant_atoms("Concor 5 mg N30") == frozenset({"5"})
+        assert _variant_atoms("Amlodipin 2.5 mg N30") == frozenset()  # дробное → не атом
+        assert _variant_atoms("Paracetamol 500 mg N20") == frozenset()  # многозначное
+
+
+class TestHasConflictingVariantAtoms:
+    def test_blocks_letter_variants(self):
+        assert _has_conflicting_variant_atoms("Lorinden C məlhəm 15 q", "Lorinden A 15 qr") is True
+        assert _has_conflicting_variant_atoms("Vitamin A № 10", "Vitamin C 100 mq N10") is True
+        assert _has_conflicting_variant_atoms("ASferon C  N30", "Asferon S № 30") is True
+
+    def test_blocks_cross_type_letter_vs_digit(self):
+        # Normoqlip M (буква) ≠ Normoqlip 2 (цифра) — кросс-тип, главный кейс
+        assert _has_conflicting_variant_atoms("Normoqlip M № 30", "Normoqlip 2  N30") is True
+
+    def test_blocks_size_variant(self):
+        assert _has_conflicting_variant_atoms("güzgü spekulum ölçüsü M", "Güzgü (S)") is True
+
+    def test_blocks_single_digit_dosage_variant(self):
+        # Normoqlip 2 mq (2mg, юнит у pharm) ≠ Normoqlip 4 N30 (голая 4 у aptek):
+        # single-mass атом «2» против серийной «4» → кросс-форматный конфликт дозы.
+        assert _has_conflicting_variant_atoms("Normoqlip 2 mq № 30", "Normoqlip 4  N30") is True
+        # та же доза в разном формате → НЕ блок
+        assert _has_conflicting_variant_atoms("Normoqlip 2 mq № 30", "Normoqlip 2  N30") is False
+
+    def test_allows_same_atoms(self):
+        assert _has_conflicting_variant_atoms("Nutrilon 1", "Nutrilon 1") is False
+        assert _has_conflicting_variant_atoms("Heparin 25 g", "Heparin 25 q") is False
+
+    def test_allows_one_sided_atom_incomplete_data(self):
+        # «Vitamin C 1» vs «Vitamin C» — superset, неполные данные, НЕ блокируем
+        assert _has_conflicting_variant_atoms("Vitamin C 1", "Vitamin C") is False
+
+    def test_allows_no_atoms(self):
+        assert (
+            _has_conflicting_variant_atoms("Paracetamol 500 mg N20", "Paracetamol 500 mq N10")
+            is False
+        )

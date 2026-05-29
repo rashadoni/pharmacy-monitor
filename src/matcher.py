@@ -407,6 +407,81 @@ def _has_conflicting_variant_tokens(name_a: str, name_b: str) -> bool:
     return bool(alpha2_a) and bool(alpha2_b)
 
 
+# ── Вариант-атомы из RAW-имени (2026-05-29) ─────────────────────────────────
+# normalize_name вырезает одиночные различители: «Normoqlip 2  N30» → 'normoqlip'
+# (цифра пропадает рядом с pack), а «Normoqlip M» → 'normoqlip m'. Поэтому
+# series/variant-guard'ы (работают на name_normalized) НЕ видят вырезанный «2» →
+# Normoqlip M ↔ Normoqlip 2 ошибочно матчатся. Сравниваем атомы прямо из RAW:
+#   • одиночная серийная цифра 1-9  (Nutrilon 1, Normoqlip 2)
+#   • одиночная буква-вариант КРОМЕ юнитов q/g/l (Lorinden C/A, Vitamin A/C,
+#     ASferon C/S, Güzgü M/S, Normoqlip M)
+# Перед извлечением удаляем pack/№/возраст/диапазон/числа-с-юнитами/2+-значные
+# числа — иначе возраст («6 aylıq»), вес («25 q»), объём, split-числа («50 000»)
+# дают ложные атомы. Валидация на прод-дампе (57142 товара, scripts/
+# scan_variant_conflicts.py): 7 flagged кластеров, ВСЕ 7 — настоящие wrong-match,
+# 0 ложных.
+_VA_NUM_HASH_RE = re.compile(r"№\s*\d+")
+_VA_PACK_RE = re.compile(r"\b(?:n|no\.?)\s*\d+\b", re.I)
+_VA_AZ_PACK_UNIT_RE = re.compile(r"\b\d+\s*(?:eded|ed|dest|sase|sashe|st|saise)\b", re.I)
+_VA_RANGE_RE = re.compile(r"\d+\s*-\s*\d+")
+_VA_AGE_RE = re.compile(r"\b\d+\s*(?:ay(?:liq|indan|inda|dan)?|il|yas(?:inda)?)\b", re.I)
+_VA_NUM_UNIT_RE = re.compile(
+    r"\b\d+[.,]?\d*\s*(?:mg|ml|mq|mkg|mcg|kg|kq|qr|g|q|l|iu|tv|ed|bv|mln|million)\b",
+    re.I,
+)
+_VA_MULTIDIGIT_RE = re.compile(r"\b\d{2,}\b")
+_VA_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_VA_UNIT_LETTERS: frozenset[str] = frozenset({"q", "g", "l"})  # грамм(AZ)/грамм/литр
+# Одиночная фарм-масса 1-9 mg/mq/mcg как атом: Normoqlip 2 mq ≠ 4 mq (глимепирид
+# 2/3/4 mg). pharm пишет «2 mq» (доза, иначе ушла бы в _VA_NUM_UNIT), aptek «4 N30»
+# (голая цифра) → сводим в общий atom-space. Lookbehind (?<![.\d]) исключает
+# дробные/многозначные (2.5 mg → не «5», 500 mg → не «0»).
+_VA_SINGLE_MASS_RE = re.compile(r"(?<![.\d])([1-9])\s*(?:mg|mq|mcg|mkg)\b", re.I)
+
+
+def _variant_atoms(raw_name: str) -> frozenset[str]:
+    """Вариант-атомы из RAW-имени: серийные цифры 1-9 + одиночные буквы-варианты
+    + одиночная фарм-масса 1-9 mg (Normoqlip 2 mq).
+
+    Удаляет pack/№/возраст/диапазон/числа-с-юнитами/2+-значные числа перед
+    извлечением (чтобы не зацепить возраст/вес/объём/split-числа). Юнит-буквы
+    q/g/l исключены.
+    """
+    low = strip_accents(raw_name or "").lower()
+    atoms: set[str] = set()
+    # Одиночная фарм-масса — ДО strip (иначе «2 mq» съест _VA_NUM_UNIT_RE).
+    atoms.update(_VA_SINGLE_MASS_RE.findall(low))
+    for rx in (
+        _VA_NUM_HASH_RE,
+        _VA_PACK_RE,
+        _VA_AZ_PACK_UNIT_RE,
+        _VA_RANGE_RE,
+        _VA_AGE_RE,
+        _VA_NUM_UNIT_RE,
+    ):
+        low = rx.sub(" ", low)
+    low = _VA_MULTIDIGIT_RE.sub(" ", low)  # после unit-strip: 2+-значные остатки = шум
+    for t in _VA_TOKEN_RE.findall(low):
+        if len(t) != 1:
+            continue
+        if t in "123456789" or (t.isalpha() and t not in _VA_UNIT_LETTERS):
+            atoms.add(t)
+    return frozenset(atoms)
+
+
+def _has_conflicting_variant_atoms(name_raw_a: str, name_raw_b: str) -> bool:
+    """True если у КАЖДОЙ стороны есть свой уникальный вариант-атом.
+
+    Симметричное правило (как _has_conflicting_variant_tokens): блокируем только
+    при взаимно-уникальных атомах (Lorinden c|a, Normoqlip m|2, Vitamin a|c).
+    Односторонний/superset атом («brand c 1» vs «brand c») пропускаем — это
+    неполные данные, а не другой вариант.
+    """
+    atoms_a = _variant_atoms(name_raw_a)
+    atoms_b = _variant_atoms(name_raw_b)
+    return bool(atoms_a - atoms_b) and bool(atoms_b - atoms_a)
+
+
 def _build_word_freq(products: list) -> dict[str, int]:
     """Частота слов по всем name_normalized.
 
@@ -749,6 +824,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     for c in cluster
                 ):
                     continue
+                # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
+                # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
+                if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= fuzzy_threshold:
                     cluster.append(q)
@@ -845,6 +924,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     )
                     for c in cluster
                 ):
+                    continue
+                # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
+                # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
+                if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _SEC_THRESHOLD:
@@ -944,6 +1027,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     )
                     for c in cluster
                 ):
+                    continue
+                # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
+                # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
+                if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _TERT_THRESHOLD:
@@ -1045,6 +1132,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     )
                     for c in cluster
                 ):
+                    continue
+                # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
+                # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
+                if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _QUART_THRESHOLD:
