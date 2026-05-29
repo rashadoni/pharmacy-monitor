@@ -68,6 +68,7 @@
     "export_csv_title": "Скачать CSV отфильтрованного списка",
     "no_data": "нет данных",
     "load_error": "ошибка загрузки",
+    "per_unit_note": "сравнение нормализовано за штуку (разные фасовки)",
     "stable_price": "стабильно {price}",
     "diff_only_filter": "Только с различием",
     "with_aloe_filter": "С aloe",

@@ -281,6 +281,114 @@ def test_comparison_limit_applies_after_filter(client, tenant_user, setup_db):
     assert not any(n.startswith("solo") for n in names)
 
 
+def _make_match_with_packs(db, run, *, canonical, prods, tenant_id=1):
+    """Match + products с заданными (site, price, pack_size, name)."""
+    m = storage.Match(tenant_id=tenant_id, canonical_name=canonical, confidence=1.0)
+    db.add(m)
+    db.flush()
+    for site, price, pack, name in prods:
+        p = storage.Product(
+            tenant_id=tenant_id,
+            site=site,
+            external_id=f"{site}-{canonical}",
+            url=f"https://{site}/{canonical}",
+            name=name,
+            name_normalized=name.lower(),
+            pack_size=pack,
+            canonical_id=m.id,
+        )
+        db.add(p)
+        db.flush()
+        db.add(
+            storage.PriceSnapshot(run_id=run.id, product_id=p.id, price=price, captured_at=utcnow())
+        )
+    db.commit()
+    return m
+
+
+def test_comparison_per_unit_normalizes_pack_vs_single(client, tenant_user, setup_db):
+    """Per-unit fix: маска поштучно 0.20 vs пачка N50 за 10.00 → spread должен
+    схлопнуться (0.20/шт у обоих), basis='unit'."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_packs(
+        s,
+        run,
+        canonical="Tibbi maska",
+        prods=[
+            ("aptekonline", 10.0, "n50", "Tibbi maska N50"),
+            ("pharmonline", 0.20, None, "Tibbi maska"),
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/comparison?min_sites=2")
+    row = next(x for x in r.json() if x["name"] == "Tibbi maska")
+    assert row["spread_basis"] == "unit"
+    assert row["spread_pct"] < 5.0  # 0.20 vs 0.20 → ~0
+    # unit_price проставлен
+    assert abs(row["prices"]["aptekonline"]["unit_price"] - 0.20) < 0.01
+    assert row["prices"]["aptekonline"]["pack_count"] == 50
+
+
+def test_comparison_per_unit_avoids_false_spread(client, tenant_user, setup_db):
+    """Критический guard (#4): оба сайта — пачка 50, но у одного count не
+    распарсился (default 1). Нормализация РАЗДУЛА бы spread (10/50 vs 10/1) →
+    должны остаться на raw (spread ~0), basis='raw'."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_packs(
+        s,
+        run,
+        canonical="Bint",
+        prods=[
+            ("aptekonline", 10.0, "n50", "Bint elastik N50"),
+            ("pharmonline", 10.5, None, "Bint elastik"),  # тоже пачка, count не виден
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/comparison?min_sites=2")
+    row = next(x for x in r.json() if x["name"] == "Bint")
+    # raw spread (10 vs 10.5) ~5%; unit нормализация дала бы 0.2 vs 10.5 = 98% →
+    # отвергается, остаёмся на raw
+    assert row["spread_basis"] == "raw"
+    assert row["spread_pct"] < 10.0
+
+
+def test_comparison_same_pack_stays_raw(client, tenant_user, setup_db):
+    """Одинаковая фасовка → basis='raw', реальный spread сохраняется."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_packs(
+        s,
+        run,
+        canonical="Aspirin",
+        prods=[
+            ("aptekonline", 10.0, "n20", "Aspirin N20"),
+            ("pharmonline", 15.0, "n20", "Aspirin N20"),
+        ],
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/comparison?min_sites=2")
+    row = next(x for x in r.json() if x["name"] == "Aspirin")
+    assert row["spread_basis"] == "raw"
+    assert abs(row["spread_pct"] - 33.3) < 1.0  # (15-10)/15 = 33%
+
+
 def test_comparison_sorted_by_spread_desc(client, tenant_user, setup_db):
     """Rows отсортированы по spread_pct desc (самое полезное сверху)."""
     if not api_module._JWT_AVAILABLE:

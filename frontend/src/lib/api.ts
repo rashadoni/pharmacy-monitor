@@ -165,9 +165,25 @@ export interface ComparisonRow {
   max_price: number | null;
   spread_pct: number | null;
   cheapest_site: string | null;
-  prices: Record<string, { price: number; is_on_sale: boolean; url: string; product_id: number }>;
+  prices: Record<
+    string,
+    {
+      price: number;
+      is_on_sale: boolean;
+      url: string;
+      product_id: number;
+      // Per-unit normalization (2026-05-29). pack_count = штук в упаковке,
+      // unit_price = price/pack_count. Заполняются всегда; используются для
+      // отображения когда spread_basis === "unit".
+      pack_count?: number;
+      unit_price?: number;
+      pack_size?: string | null;
+    }
+  >;
   confidence: number;
   needs_review: boolean;
+  /** "unit" когда spread/cheapest посчитаны на цене-за-штуку (разные фасовки). */
+  spread_basis?: "raw" | "unit";
 }
 
 export interface PricingConfig {

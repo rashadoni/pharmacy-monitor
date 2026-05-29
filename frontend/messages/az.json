@@ -68,6 +68,7 @@
     "export_csv_title": "Süzülmüş siyahını CSV kimi endirin",
     "no_data": "məlumat yoxdur",
     "load_error": "yükləmə xətası",
+    "per_unit_note": "müqayisə ədəd başına normallaşdırılıb (fərqli qablaşdırma)",
     "stable_price": "sabit {price}",
     "diff_only_filter": "Yalnız fərqlənənlər",
     "with_aloe_filter": "Aloe ilə",

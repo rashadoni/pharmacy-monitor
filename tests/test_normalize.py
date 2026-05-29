@@ -1,9 +1,12 @@
 """Тесты нормализации имён, парсинга цены и извлечения дозировки/упаковки."""
 
+import pytest
+
 from src.normalize import (
     extract_dosage,
     extract_pack_size,
     normalize_name,
+    pack_unit_count,
     parse_price,
     strip_accents,
 )
@@ -108,3 +111,39 @@ def test_parse_price_multi_price_contamination():
     assert parse_price("22.31 AZN\n17 AZN") == 22.31
     # Common HTML inner_text shape: "<del>5.28 AZN</del> 4.62 AZN"
     assert parse_price("5.28 AZN 4.62 AZN") == 5.28
+
+
+# ── pack_unit_count (per-unit price comparison, 2026-05-29) ──────────────────
+
+
+@pytest.mark.parametrize(
+    "pack_size,name,expected",
+    [
+        ("n10", None, (10, "high")),
+        ("N50", None, (50, "high")),
+        (None, "Tibbi maska N50", (50, "high")),
+        (None, "Maska No 10", (10, "high")),
+        ("n10x2", None, (20, "high")),  # multiplier
+        ("10 ədəd", None, (10, "high")),
+        ("10 шт", None, (10, "high")),
+        # ── COUNT не путается с объёмом/весом/дозой ──
+        ("50ml", None, (1, "low")),
+        ("300q", None, (1, "low")),  # 300 грамм по-азербайджански
+        ("500mg", None, (1, "low")),
+        ("200 ml", None, (1, "low")),
+        (None, "Sirop 100 ml", (1, "low")),
+        # ── одиночный товар без маркера ──
+        (None, "Thiogamma turbo 50 ml", (1, "low")),
+        (None, None, (1, "low")),
+        ("", "", (1, "low")),
+        # ── N-count + объём в названии: count берётся, ml игнорируется ──
+        ("n20", "Drug 0.9% 200 ml", (20, "high")),
+    ],
+)
+def test_pack_unit_count(pack_size, name, expected):
+    assert pack_unit_count(pack_size, name) == expected
+
+
+def test_pack_unit_count_pack_size_priority_over_name():
+    """pack_size проверяется первым; если там count — его и берём."""
+    assert pack_unit_count("n30", "Aspirin N10 (старое имя)") == (30, "high")

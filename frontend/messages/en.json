@@ -68,6 +68,7 @@
     "export_csv_title": "Download filtered list as CSV",
     "no_data": "no data",
     "load_error": "load error",
+    "per_unit_note": "comparison normalized per unit (different pack sizes)",
     "stable_price": "stable {price}",
     "diff_only_filter": "With difference only",
     "with_aloe_filter": "With aloe",

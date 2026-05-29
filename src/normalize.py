@@ -552,3 +552,52 @@ def parse_price(text: str | None) -> float | None:
         return float(cleaned)
     except (ValueError, TypeError):
         return None
+
+
+# ── Pack-unit count для per-unit price comparison (2026-05-29) ───────────────
+# Извлекает КОЛИЧЕСТВО штук в упаковке (N10, №10, 10 ədəd, 10x2), НЕ объём/вес.
+# Используется comparison endpoint'ом для нормализации цены за штуку: один товар
+# в разной фасовке (маска поштучно 0.20 vs пачка 50 за 10.00) не должен давать
+# ложный 98% spread. Возвращает (count, confidence): confidence='high' если
+# найден явный count-маркер, 'low' если маркера нет (по умолчанию 1 штука).
+#
+# КРИТИЧНО: исключаем числа с единицами объёма/веса/дозы (ml/g/q/mg/iu…), иначе
+# «50 ml» распарсится как count=50. Дизайн подтверждён Perplexity + Codex.
+_UNIT_SUFFIX = r"(?:ml|m2|l|mg|mcg|mkg|µg|g|gr|q|qr|kg|kq|%|iu|bv|me|ie|мл|мг|г|кг)"
+_PACK_MULT_RE = re.compile(r"\b(?:n|no)?\s*(\d{1,4})\s*[x×]\s*(\d{1,4})\b", re.IGNORECASE)
+_PACK_N_RE = re.compile(r"\b(?:n|no)\s*(\d{1,4})\b", re.IGNORECASE)
+_PACK_WORD_RE = re.compile(
+    r"\b(\d{1,4})\s*(?:ədəd|eded|əd\b|şt|adet|pcs?|pieces?|штук|шт)\b",
+    re.IGNORECASE,
+)
+
+
+def _followed_by_unit(text: str, end: int) -> bool:
+    """True если сразу после позиции end идёт единица объёма/веса (→ это не count)."""
+    return re.match(r"\s*" + _UNIT_SUFFIX + r"\b", text[end : end + 8], re.IGNORECASE) is not None
+
+
+def pack_unit_count(pack_size: str | None, name: str | None = None) -> tuple[int, str]:
+    """Количество штук в упаковке + уверенность ('high'|'low').
+
+    Ищет count-маркеры (N10, №10, 10 ədəd, 10x2) в pack_size, затем в name.
+    Игнорирует объём/вес («50 ml» → не count). Без маркера → (1, 'low').
+    """
+    for src in (pack_size or "", name or ""):
+        if not src:
+            continue
+        s = src.lower().replace("№", "n").replace("nº", "n").replace("no.", "no")
+
+        m = _PACK_MULT_RE.search(s)
+        if m and not _followed_by_unit(s, m.end()):
+            return int(m.group(1)) * int(m.group(2)), "high"
+
+        m = _PACK_N_RE.search(s)
+        if m and not _followed_by_unit(s, m.end()):
+            return int(m.group(1)), "high"
+
+        m = _PACK_WORD_RE.search(s)
+        if m:
+            return int(m.group(1)), "high"
+
+    return 1, "low"

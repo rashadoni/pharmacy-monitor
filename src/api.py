@@ -79,6 +79,7 @@ from sqlalchemy.orm import Session, selectinload
 from src import inventory as inv_mod
 from src import storage, tenants
 from src._time import utcnow
+from src.normalize import pack_unit_count
 
 log = structlog.get_logger()
 
@@ -447,6 +448,11 @@ class ComparisonRowOut(BaseModel):
     prices: dict[str, dict[str, Any]]
     confidence: float
     needs_review: bool
+    # Per-unit normalization (2026-05-29). spread_basis="unit" когда товар в
+    # разной фасовке и нормализация цены-за-штуку уменьшает spread (честное
+    # сравнение); "raw" когда фасовки одинаковы или нормализация недостоверна.
+    # Каждая запись в `prices` тогда содержит unit_price + pack_count.
+    spread_basis: str = "raw"  # "raw" | "unit"
 
 
 class CategoryIn(BaseModel):
@@ -1322,6 +1328,70 @@ def dash_recipients_delete(
 # ─── Frontend dashboard endpoints (JWT cookie) ───────────────────────────────
 
 
+def _comparison_spread(
+    prices: dict[str, dict[str, Any]],
+) -> tuple[str, float | None, float | None, str | None, float | None]:
+    """Per-unit-aware spread для comparison-строки.
+
+    Мутирует `prices`: (а) добавляет каждому сайту `pack_count` + `unit_price`,
+    (б) УДАЛЯЕТ сайты с явно-битой ценой (outlier < 10% медианы per-unit — это
+    parse-ошибка/не та единица, не реальный undercut). Возвращает
+    (basis, min, max, cheapest_site, spread_pct) на выбранном basis.
+
+    Логика (2026-05-29, Perplexity+Codex consensus):
+    - Считаем count штук в упаковке + unit_price = price/count.
+    - Outlier-фильтр работает на UNIT-цене (не raw): для маски поштучно 0.20
+      vs пачки N50 за 10.00 unit price у обоих 0.20 → ни один не выбрасывается
+      (старый raw-фильтр ошибочно дропал 0.20 как «<10% от 10»).
+    - basis="unit" ТОЛЬКО если фасовки реально различаются (max/min count ≥ 2,
+      ≥1 high-confidence) И нормализация УМЕНЬШАЕТ spread. Это снимает риск
+      «один сайт N50, другой не распарсился → ложный 50×»: если нормализация
+      раздувает spread — это parse-артефакт, остаёмся на raw.
+    """
+    for data in prices.values():
+        cnt, conf = pack_unit_count(data.get("pack_size"), data.get("name"))
+        data["pack_count"] = cnt
+        data["count_conf"] = conf
+        data["unit_price"] = data["price"] / cnt if cnt > 0 else data["price"]
+
+    def _spread_over(key: str) -> float:
+        vs = [d[key] for d in prices.values()]
+        return (max(vs) - min(vs)) / max(vs) * 100 if vs and max(vs) else 0.0
+
+    # ── Шаг 1: выбрать basis ДО outlier-фильтра ──
+    # (фильтровать надо по той цене, которой доверяем; иначе при недостоверных
+    #  count'ах unit-цены ложные и дропнут легитимный сайт — risk #4.)
+    basis = "raw"
+    if len(prices) >= 2:
+        counts = [d["pack_count"] for d in prices.values()]
+        has_high = any(d["count_conf"] == "high" for d in prices.values())
+        counts_differ = max(counts) / min(counts) >= 2 if min(counts) > 0 else False
+        # unit только если фасовки различаются И нормализация УМЕНЬШАЕТ spread.
+        if has_high and counts_differ and _spread_over("unit_price") < _spread_over("price"):
+            basis = "unit"
+
+    key = "unit_price" if basis == "unit" else "price"
+
+    # ── Шаг 2: outlier-фильтр на выбранном basis (parse-ошибки <10% медианы) ──
+    if len(prices) >= 2:
+        vals = sorted(d[key] for d in prices.values())
+        median = vals[len(vals) // 2]
+        threshold = median * 0.1
+        for site in [s for s, d in prices.items() if d[key] < threshold]:
+            del prices[site]
+
+    if not prices:
+        return basis, None, None, None, None
+
+    # ── Шаг 3: stats на выбранном basis ──
+    items = [(s, d[key]) for s, d in prices.items()]
+    mn = min(v for _, v in items)
+    mx = max(v for _, v in items)
+    cheap = min(items, key=lambda x: x[1])[0]
+    spr = round((mx - mn) / mx * 100, 1) if mx else 0.0
+    return basis, mn, mx, cheap, spr
+
+
 @app.get("/api/v1/dash/comparison")
 def dash_comparison(
     search: str | None = None,
@@ -1379,34 +1449,28 @@ def dash_comparison(
                     "is_on_sale": snap.is_on_sale if snap else False,
                     "url": p.url,
                     "product_id": p.id,
+                    # pack_size + name нужны для per-unit нормализации (ниже)
+                    "pack_size": p.pack_size,
+                    "name": p.name,
                 }
 
-        # Price-sanity filter (2026-05-11): на aptekonline.az встречаются
-        # явные опечатки — товар стоит 0.20 ₼ против 28 ₼ на других сайтах
-        # (вероятно single-piece price вместо pack-price). Если в кластере
-        # есть цена < 10% медианы — это data error, не реальный undercut.
-        # Filterим такой outlier, чтобы клиент не видел false-undercut алерты.
-        prices = raw_prices
-        if len(raw_prices) >= 2:
-            vals = sorted(d["price"] for d in raw_prices.values())
-            median = vals[len(vals) // 2]
-            outlier_threshold = median * 0.1  # 10× cheaper than median
-            prices = {
-                site: data
-                for site, data in raw_prices.items()
-                if data["price"] >= outlier_threshold
-            }
+        # Per-unit-aware spread + outlier-фильтр (2026-05-29). Заменяет прежний
+        # raw-price 10%-median фильтр (он ошибочно дропал легитимную цену-за-
+        # штуку). `_comparison_spread` нормализует цену за штуку когда фасовки
+        # различаются и это уменьшает spread, и дропает parse-ошибки на unit-цене.
+        # Мутирует prices (annotate + drop).
+        prices = dict(raw_prices)
+        basis, min_p, max_p, cheapest, spread = _comparison_spread(prices)
 
         sites_with_price = len(prices)
         if sites_with_price < min_sites:
             continue
         if site_filter and site_filter not in prices:
             continue
-        price_vals = [d["price"] for d in prices.values()]
-        min_p = min(price_vals) if price_vals else None
-        max_p = max(price_vals) if price_vals else None
-        cheapest = min(prices.items(), key=lambda x: x[1]["price"])[0] if prices else None
-        spread = round((max_p - min_p) / max_p * 100, 1) if max_p else None
+        # Убираем служебные поля из payload (оставляем pack_size/count/unit_price).
+        for d in prices.values():
+            d.pop("name", None)
+            d.pop("count_conf", None)
         out.append(
             ComparisonRowOut(
                 canonical_id=m.id,
@@ -1422,6 +1486,7 @@ def dash_comparison(
                 prices=prices,
                 confidence=m.confidence if m.confidence is not None else 1.0,
                 needs_review=(spread is not None and spread >= 50.0),
+                spread_basis=basis,
             )
         )
     # Сортируем по |spread| desc (самое полезное для PO — где конкурент бьёт

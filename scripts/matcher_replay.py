@@ -94,7 +94,9 @@ def main() -> None:
     from collections import Counter, defaultdict
 
     cluster_sites: dict[int, set[str]] = defaultdict(set)
-    prods = s.scalars(select(storage.Product).where(storage.Product.canonical_id.is_not(None))).all()
+    prods = s.scalars(
+        select(storage.Product).where(storage.Product.canonical_id.is_not(None))
+    ).all()
     for p in prods:
         cluster_sites[p.canonical_id].add(p.site)
     dist = Counter(len(sites) for sites in cluster_sites.values())
@@ -104,7 +106,7 @@ def main() -> None:
         select(func.count(storage.Product.id)).where(storage.Product.canonical_id.is_not(None))
     )
 
-    print(f"\n=== RESULTS ===")
+    print("\n=== RESULTS ===")
     print(f"total matches:        {total_matches}")
     print(f"matched products:     {matched_products}")
     print(f"clusters by sites:    {dict(sorted(dist.items()))}")
@@ -116,7 +118,9 @@ def main() -> None:
 
     random.seed(42)
     sample = random.sample(multi, min(sample_n, len(multi)))
-    print(f"\n=== RANDOM SAMPLE of {len(sample)} multi-site clusters (audit for FALSE POSITIVES) ===")
+    print(
+        f"\n=== RANDOM SAMPLE of {len(sample)} multi-site clusters (audit for FALSE POSITIVES) ==="
+    )
     for cid in sample:
         members = s.scalars(
             select(storage.Product).where(storage.Product.canonical_id == cid)

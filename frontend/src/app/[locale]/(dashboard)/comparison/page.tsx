@@ -283,17 +283,27 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
     ? () => <span aria-hidden>▼</span>
     : () => <span aria-hidden>▲</span>;
   const color = clientCheapest ? "text-success" : "text-destructive";
+  const isUnit = row.spread_basis === "unit";
   return (
     <span
       className={`inline-flex items-center gap-0.5 tabular-nums ${color}`}
       title={
-        clientCheapest
+        (clientCheapest
           ? t("spread_we_cheaper", { pct: abs.toFixed(1) })
-          : t("spread_they_cheaper", { site: row.cheapest_site, pct: abs.toFixed(1) })
+          : t("spread_they_cheaper", { site: row.cheapest_site, pct: abs.toFixed(1) })) +
+        (isUnit ? ` · ${t("per_unit_note")}` : "")
       }
     >
       <Icon />
       {abs.toFixed(1)}%
+      {isUnit && (
+        <span
+          className="text-[9px] font-normal text-muted-foreground ml-0.5"
+          title={t("per_unit_note")}
+        >
+          /шт
+        </span>
+      )}
     </span>
   );
 }
@@ -301,18 +311,28 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
 function priceCell(row: ComparisonRow, site: string) {
   const p = row.prices[site];
   if (!p) return <span className="text-muted-foreground/50">—</span>;
-  const isMin = row.min_price === p.price;
-  const isMax = row.max_price === p.price && row.min_price !== row.max_price;
+  // Per-unit basis (2026-05-29): min/max/cheapest посчитаны на цене-за-штуку,
+  // поэтому подсветку дешёвого/дорогого считаем по unit_price, а не pack price.
+  const isUnit = row.spread_basis === "unit";
+  const cmpVal = isUnit && p.unit_price != null ? p.unit_price : p.price;
+  const isMin = row.min_price === cmpVal;
+  const isMax = row.max_price === cmpVal && row.min_price !== row.max_price;
+  const showUnit = isUnit && p.pack_count != null && p.pack_count > 1 && p.unit_price != null;
   return (
     <a
       href={p.url}
       target="_blank"
       rel="noopener noreferrer"
-      className={`inline-block tabular-nums hover:underline ${
+      className={`inline-flex flex-col items-end tabular-nums hover:underline leading-tight ${
         isMin ? "text-success font-semibold" : isMax ? "text-destructive" : ""
       }`}
     >
-      {formatPrice(p.price)}
+      <span>{formatPrice(p.price)}</span>
+      {showUnit && (
+        <span className="text-[10px] font-normal text-muted-foreground">
+          {formatPrice(p.unit_price!)}/шт · {p.pack_count}шт
+        </span>
+      )}
     </a>
   );
 }
