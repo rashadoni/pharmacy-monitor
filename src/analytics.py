@@ -13,14 +13,16 @@ from src._time import utcnow
 
 import structlog
 from sqlalchemy import desc, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from src.storage import (
+    Category,
     Match,
     PriceSnapshot,
     Product,
     Promo,
     Run,
+    latest_snapshots_per_product,
 )
 
 log = structlog.get_logger()
@@ -254,6 +256,34 @@ class PriceIndex:
 
 
 @dataclass
+class CategoryComparison:
+    """Расширенное сравнение цен клиента vs конкурентов в разрезе категории.
+
+    `index` 100 = паритет, <100 клиент дешевле (хорошо), >100 дороже.
+    `per_site_avg` — средняя цена КАЖДОГО конкурента отдельно (aptekonline/aloe),
+    чтобы видеть кто именно бьёт по цене. `avg_competitor_price` — комбинированная
+    (среднее по сайтам), на ней строится index.
+    win/lose считается per-SKU против СРЕДНЕГО конкурента (та же база, что index):
+    cheaper = клиент дешевле, pricier = дороже, parity = в пределах ±0.5%.
+    """
+
+    category: str  # slug (Product.category) — стабильный ключ группировки
+    label_ru: str | None  # из Category.label_ru, иначе None → фронт покажет slug
+    label_az: str | None
+    matched_skus: int
+    avg_client_price: float
+    per_site_avg: dict[str, float]  # {"aptekonline": .., "aloe": ..}
+    avg_competitor_price: float
+    index: float
+    cheaper_count: int
+    pricier_count: int
+    parity_count: int
+    cheaper_pct: float
+    pricier_pct: float
+    parity_pct: float
+
+
+@dataclass
 class MatchQuality:
     """Метрика качества автоматического матчинга."""
 
@@ -297,62 +327,107 @@ def match_quality(session: Session) -> MatchQuality:
     )
 
 
-def price_index_by_category(session: Session) -> list[PriceIndex]:
-    """Для каждой категории — среднее по клиенту vs конкурентам.
+# Допуск паритета для per-SKU win/lose: цены в пределах ±0.5% считаем равными.
+_PARITY_EPS = 0.005
 
-    N+1 fix: загружаем все snapshots run_id одним запросом, мапим product_id→snap.
+# Текущая цена товара: discount_price (если есть) иначе price, и только > 0.
+def _current_price(snap: PriceSnapshot | None) -> float | None:
+    if snap is None:
+        return None
+    price = snap.discount_price or snap.price
+    if price is None or price <= 0:
+        return None
+    return price
+
+
+def _iter_matched_prices(
+    session: Session,
+    *,
+    client_site: str,
+    tenant_id: int | None,
+    min_confidence: float,
+) -> list[tuple[str, float, dict[str, float]]]:
+    """Per-match записи `(category, client_price, comp_price_by_site)`.
+
+    Общий фундамент для `price_index_by_category` и `category_comparison`.
+
+    Фиксы относительно прежней логики:
+    - **diff-only:** `latest_snapshots_per_product` вместо snapshot'ов одного
+      run_id — берёт актуальную цену независимо от того, менялась ли она в
+      последнем прогоне (под diff-only стабильная цена пишется редко).
+    - **tenant:** опц. фильтр `Match.tenant_id` (None → без фильтра, для
+      не-HTTP вызовов вроде weekly email).
+    - **confidence floor:** дропаем `confidence < min_confidence` (кроме
+      `is_manual`) — как в `dash_comparison`, иначе мусорные fuzzy-матчи
+      искажают средние и числа расходятся с товарным сравнением.
+
+    Для каждого сайта-конкурента цена усредняется (если в матче >1 товар
+    с этого сайта). Возвращаются только матчи с ценой клиента + ≥1 конкурента.
     """
-    run_id = session.scalar(
-        select(Run.id).where(Run.status == "ok").order_by(desc(Run.id)).limit(1)
-    )
-    if run_id is None:
-        return []
+    q = select(Match).options(selectinload(Match.products))
+    if tenant_id is not None:
+        q = q.where(Match.tenant_id == tenant_id)
+    matches = session.scalars(q).all()
 
-    # Preload всех snapshots run'а одним SQL — устраняет N+1
-    snaps_by_pid = {
-        s.product_id: s
-        for s in session.scalars(select(PriceSnapshot).where(PriceSnapshot.run_id == run_id)).all()
-    }
+    all_pids = [p.id for m in matches for p in m.products]
+    snaps = latest_snapshots_per_product(session, all_pids)
 
-    matches = session.scalars(select(Match)).all()
-    by_cat: dict[str, dict[str, list[float]]] = defaultdict(
-        lambda: {"client": [], "competitor": []}
-    )
-
+    records: list[tuple[str, float, dict[str, float]]] = []
     for m in matches:
-        client_p = next((p for p in m.products if p.site == CLIENT_SITE), None)
-        if not client_p:
+        conf = m.confidence if m.confidence is not None else 1.0
+        if not m.is_manual and conf < min_confidence:
             continue
-        client_snap = snaps_by_pid.get(client_p.id)
-        if client_snap is None:
+        client_p = next((p for p in m.products if p.site == client_site), None)
+        if client_p is None:
             continue
-        client_price = client_snap.discount_price or client_snap.price
+        client_price = _current_price(snaps.get(client_p.id))
         if client_price is None:
             continue
 
-        comp_prices: list[float] = []
+        comp_by_site: dict[str, list[float]] = defaultdict(list)
         for p in m.products:
-            if p.site == CLIENT_SITE:
+            if p.site == client_site:
                 continue
-            snap = snaps_by_pid.get(p.id)
-            if snap is None:
-                continue
-            ep = snap.discount_price or snap.price
-            if ep is not None:
-                comp_prices.append(ep)
-        if not comp_prices:
+            price = _current_price(snaps.get(p.id))
+            if price is not None:
+                comp_by_site[p.site].append(price)
+        if not comp_by_site:
             continue
 
+        comp_price_by_site = {site: sum(v) / len(v) for site, v in comp_by_site.items()}
         cat = client_p.category or "(без категории)"
+        records.append((cat, client_price, comp_price_by_site))
+    return records
+
+
+def price_index_by_category(
+    session: Session,
+    *,
+    client_site: str = CLIENT_SITE,
+    tenant_id: int | None = None,
+    min_confidence: float = 0.70,
+) -> list[PriceIndex]:
+    """Для каждой категории — средняя цена клиента vs конкурентов (index).
+
+    diff-only-safe (latest_snapshots) + tenant/confidence-aware. См.
+    `_iter_matched_prices`. `category_comparison` — расширенная версия с
+    per-site разбивкой и win/lose.
+    """
+    records = _iter_matched_prices(
+        session, client_site=client_site, tenant_id=tenant_id, min_confidence=min_confidence
+    )
+    by_cat: dict[str, dict[str, list[float]]] = defaultdict(lambda: {"client": [], "comp": []})
+    for cat, client_price, comp_by_site in records:
+        comp_mean = sum(comp_by_site.values()) / len(comp_by_site)
         by_cat[cat]["client"].append(client_price)
-        by_cat[cat]["competitor"].append(sum(comp_prices) / len(comp_prices))
+        by_cat[cat]["comp"].append(comp_mean)
 
     out: list[PriceIndex] = []
     for cat, prices in by_cat.items():
         if not prices["client"]:
             continue
         avg_c = sum(prices["client"]) / len(prices["client"])
-        avg_comp = sum(prices["competitor"]) / len(prices["competitor"])
+        avg_comp = sum(prices["comp"]) / len(prices["comp"])
         idx = (avg_c / avg_comp * 100) if avg_comp else 100.0
         out.append(
             PriceIndex(
@@ -364,4 +439,94 @@ def price_index_by_category(session: Session) -> list[PriceIndex]:
             )
         )
     out.sort(key=lambda x: -x.matched_skus)
+    return out
+
+
+def category_comparison(
+    session: Session,
+    *,
+    client_site: str = CLIENT_SITE,
+    tenant_id: int | None = None,
+    min_confidence: float = 0.70,
+) -> list[CategoryComparison]:
+    """Сравнение цен по категориям: per-site средние + index + win/lose.
+
+    Категория = `Product.category` товара-клиента (slug сайта). Человекочитаемый
+    ярлык подтягивается из `Category.pharmonline_slug` одним запросом; если slug
+    не в таблице (напр. сырой Mongo `_id` при промахе DDP-карты) — label_ru/az
+    остаются None, фронт показывает сырой slug. Математика стабильна в любом случае.
+    """
+    records = _iter_matched_prices(
+        session, client_site=client_site, tenant_id=tenant_id, min_confidence=min_confidence
+    )
+    if not records:
+        return []
+
+    groups: dict[str, dict] = defaultdict(
+        lambda: {
+            "client": [],
+            "per_site": defaultdict(list),
+            "comp": [],
+            "cheaper": 0,
+            "pricier": 0,
+            "parity": 0,
+        }
+    )
+    for cat, client_price, comp_by_site in records:
+        g = groups[cat]
+        g["client"].append(client_price)
+        for site, price in comp_by_site.items():
+            g["per_site"][site].append(price)
+        comp_mean = sum(comp_by_site.values()) / len(comp_by_site)
+        g["comp"].append(comp_mean)
+        # win/lose против среднего конкурента (та же база, что index).
+        if client_price < comp_mean * (1 - _PARITY_EPS):
+            g["cheaper"] += 1
+        elif client_price > comp_mean * (1 + _PARITY_EPS):
+            g["pricier"] += 1
+        else:
+            g["parity"] += 1
+
+    # Ярлыки одним запросом: slug → (label_ru, label_az).
+    slugs = list(groups.keys())
+    labels: dict[str, tuple[str | None, str | None]] = {}
+    if slugs:
+        for c in session.scalars(
+            select(Category).where(Category.pharmonline_slug.in_(slugs))
+        ).all():
+            labels[c.pharmonline_slug] = (c.label_ru, c.label_az)
+
+    out: list[CategoryComparison] = []
+    for cat, g in groups.items():
+        n = len(g["client"])
+        if n == 0:
+            continue
+        avg_c = sum(g["client"]) / n
+        avg_comp = sum(g["comp"]) / len(g["comp"])
+        idx = (avg_c / avg_comp * 100) if avg_comp else 100.0
+        per_site_avg = {
+            site: round(sum(vals) / len(vals), 2) for site, vals in g["per_site"].items() if vals
+        }
+        label_ru, label_az = labels.get(cat, (None, None))
+        out.append(
+            CategoryComparison(
+                category=cat,
+                label_ru=label_ru,
+                label_az=label_az,
+                matched_skus=n,
+                avg_client_price=round(avg_c, 2),
+                per_site_avg=per_site_avg,
+                avg_competitor_price=round(avg_comp, 2),
+                index=round(idx, 1),
+                cheaper_count=g["cheaper"],
+                pricier_count=g["pricier"],
+                parity_count=g["parity"],
+                cheaper_pct=round(g["cheaper"] / n * 100, 1),
+                pricier_pct=round(g["pricier"] / n * 100, 1),
+                parity_pct=round(g["parity"] / n * 100, 1),
+            )
+        )
+    # Дефолт-сортировка: наибольший «мисприсинг» = |index-100| × matched_skus.
+    # Категории где клиент сильнее всего отклонён от рынка И с весом SKU — вверху.
+    out.sort(key=lambda x: -abs(x.index - 100.0) * x.matched_skus)
     return out

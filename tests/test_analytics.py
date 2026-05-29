@@ -35,6 +35,19 @@ def _add_snap(s, run, product, price):
     s.flush()
 
 
+def _add_snap_at(s, run, product, price, captured_at=None, discount_price=None):
+    s.add(
+        PriceSnapshot(
+            run_id=run.id,
+            product_id=product.id,
+            price=price,
+            discount_price=discount_price,
+            captured_at=captured_at or utcnow(),
+        )
+    )
+    s.flush()
+
+
 def test_brand_share_counts_per_site(db_session):
     run = _add_run(db_session)
     p1 = _add_product(db_session, "pharmonline", "Aspirin", brand="Bayer", ext_id="1")
@@ -223,3 +236,170 @@ def test_empty_db_returns_empty(db_session):
     overlap = analytics.assortment_overlap(db_session)
     assert overlap.matched_count == 0
     assert overlap.coverage_pct == 0.0
+
+
+# ── category_comparison ──────────────────────────────────────────────────────
+
+
+def test_category_comparison_multi_category_and_labels(db_session):
+    """2 категории, per-site средние, index, win/lose + ярлык из Category/fallback."""
+    from src.storage import Category
+
+    # Ярлык только для vitamins; pain — без записи Category (fallback на slug).
+    db_session.add(
+        Category(
+            key="vitamins",
+            label_ru="Витамины",
+            label_az="Vitaminlər",
+            pharmonline_slug="vitamins",
+        )
+    )
+    run = _add_run(db_session)
+
+    m1 = Match(canonical_name="V1", confidence=1.0)
+    m2 = Match(canonical_name="V2", confidence=1.0)
+    m3 = Match(canonical_name="P1", confidence=1.0)
+    db_session.add_all([m1, m2, m3])
+    db_session.flush()
+
+    # SKU1 (vitamins): client 10 vs aptekonline 8 → клиент дороже.
+    c1 = _add_product(db_session, "pharmonline", "V1", canonical_id=m1.id, category="vitamins", ext_id="c1")
+    a1 = _add_product(db_session, "aptekonline", "V1", canonical_id=m1.id, category="apt-v", ext_id="a1")
+    _add_snap_at(db_session, run, c1, 10.0)
+    _add_snap_at(db_session, run, a1, 8.0)
+
+    # SKU2 (vitamins): client 5 vs aptekonline 6 + aloe 10 → comp_mean 8 → дешевле.
+    c2 = _add_product(db_session, "pharmonline", "V2", canonical_id=m2.id, category="vitamins", ext_id="c2")
+    a2 = _add_product(db_session, "aptekonline", "V2", canonical_id=m2.id, category="apt-v", ext_id="a2")
+    l2 = _add_product(db_session, "aloe", "V2", canonical_id=m2.id, category="aloe-v", ext_id="l2")
+    _add_snap_at(db_session, run, c2, 5.0)
+    _add_snap_at(db_session, run, a2, 6.0)
+    _add_snap_at(db_session, run, l2, 10.0)
+
+    # SKU3 (pain): client 20 vs aloe 20 → паритет.
+    c3 = _add_product(db_session, "pharmonline", "P1", canonical_id=m3.id, category="pain", ext_id="c3")
+    l3 = _add_product(db_session, "aloe", "P1", canonical_id=m3.id, category="aloe-p", ext_id="l3")
+    _add_snap_at(db_session, run, c3, 20.0)
+    _add_snap_at(db_session, run, l3, 20.0)
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session)
+    by = {r.category: r for r in rows}
+    assert set(by) == {"vitamins", "pain"}
+
+    v = by["vitamins"]
+    assert v.matched_skus == 2
+    assert v.label_ru == "Витамины"
+    assert v.label_az == "Vitaminlər"
+    assert v.per_site_avg == {"aptekonline": 7.0, "aloe": 10.0}
+    assert v.avg_client_price == 7.5
+    assert v.avg_competitor_price == 8.0
+    assert v.index == 93.8  # 7.5/8*100
+    assert v.cheaper_count == 1  # SKU2
+    assert v.pricier_count == 1  # SKU1
+    assert v.parity_count == 0
+    assert v.cheaper_pct == 50.0
+
+    p = by["pain"]
+    assert p.matched_skus == 1
+    assert p.label_ru is None  # нет записи Category → fallback на slug на фронте
+    assert p.label_az is None
+    assert p.index == 100.0
+    assert p.parity_count == 1
+    assert p.per_site_avg == {"aloe": 20.0}
+
+    # Дефолт-сортировка: vitamins (|93.8-100|*2=12.4) выше pain (0).
+    assert rows[0].category == "vitamins"
+
+
+def test_category_comparison_diff_only_old_run(db_session):
+    """Регрессия diff-only: товар со snapshot'ом ТОЛЬКО в старом прогоне всё равно
+    учитывается. На прежней run_id-логике (snapshots последнего ok-run) он выпал бы:
+    новый ok-run без его snapshot (цена не менялась) → пустой результат."""
+    old = _add_run(db_session, started_at=utcnow() - timedelta(days=10))
+    _add_run(db_session, started_at=utcnow())  # новый ok-run БЕЗ snapshot'ов
+
+    m = Match(canonical_name="Stable", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    c = _add_product(db_session, "pharmonline", "Stable", canonical_id=m.id, category="herbs", ext_id="c")
+    a = _add_product(db_session, "aloe", "Stable", canonical_id=m.id, category="aloe-h", ext_id="a")
+    _add_snap_at(db_session, old, c, 12.0, captured_at=utcnow() - timedelta(days=10))
+    _add_snap_at(db_session, old, a, 10.0, captured_at=utcnow() - timedelta(days=10))
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session)
+    assert len(rows) == 1
+    assert rows[0].category == "herbs"
+    assert rows[0].matched_skus == 1
+    assert rows[0].avg_client_price == 12.0
+    assert rows[0].index == 120.0  # 12/10*100, клиент дороже
+
+
+def test_category_comparison_uses_discount_price(db_session):
+    """Текущая цена = discount_price (если есть), иначе price."""
+    run = _add_run(db_session)
+    m = Match(canonical_name="D", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    c = _add_product(db_session, "pharmonline", "D", canonical_id=m.id, category="d", ext_id="c")
+    a = _add_product(db_session, "aloe", "D", canonical_id=m.id, category="ad", ext_id="a")
+    _add_snap_at(db_session, run, c, 20.0, discount_price=10.0)  # клиент по скидке 10
+    _add_snap_at(db_session, run, a, 10.0)
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session)
+    assert rows[0].avg_client_price == 10.0  # discount_price, не 20
+    assert rows[0].index == 100.0
+
+
+def test_category_comparison_confidence_floor(db_session):
+    """Низко-достоверный авто-матч отсекается; ручной (is_manual) — всегда включён."""
+    run = _add_run(db_session)
+    m_low = Match(canonical_name="Low", confidence=0.5, is_manual=False)
+    m_manual = Match(canonical_name="Man", confidence=0.1, is_manual=True)
+    db_session.add_all([m_low, m_manual])
+    db_session.flush()
+    cl = _add_product(db_session, "pharmonline", "Low", canonical_id=m_low.id, category="low", ext_id="cl")
+    al = _add_product(db_session, "aloe", "Low", canonical_id=m_low.id, category="aloe-l", ext_id="al")
+    cm = _add_product(db_session, "pharmonline", "Man", canonical_id=m_manual.id, category="man", ext_id="cm")
+    am = _add_product(db_session, "aloe", "Man", canonical_id=m_manual.id, category="aloe-m", ext_id="am")
+    for p, pr in ((cl, 10.0), (al, 8.0), (cm, 10.0), (am, 8.0)):
+        _add_snap_at(db_session, run, p, pr)
+    db_session.commit()
+
+    cats = {r.category for r in analytics.category_comparison(db_session)}
+    assert cats == {"man"}  # low (0.5 авто) отсечён, manual (0.1 ручной) включён
+
+
+def test_category_comparison_tenant_isolation(db_session):
+    """tenant_id фильтрует матчи; None → все тенанты (для не-HTTP вызовов)."""
+    run = _add_run(db_session)
+    m1 = Match(canonical_name="T1", confidence=1.0, tenant_id=1)
+    m2 = Match(canonical_name="T2", confidence=1.0, tenant_id=2)
+    db_session.add_all([m1, m2])
+    db_session.flush()
+    c1 = _add_product(db_session, "pharmonline", "T1", canonical_id=m1.id, category="t1cat", ext_id="c1")
+    a1 = _add_product(db_session, "aloe", "T1", canonical_id=m1.id, category="aloe1", ext_id="a1")
+    c2 = _add_product(db_session, "pharmonline", "T2", canonical_id=m2.id, category="t2cat", ext_id="c2")
+    a2 = _add_product(db_session, "aloe", "T2", canonical_id=m2.id, category="aloe2", ext_id="a2")
+    for p, pr in ((c1, 10.0), (a1, 8.0), (c2, 10.0), (a2, 8.0)):
+        _add_snap_at(db_session, run, p, pr)
+    db_session.commit()
+
+    assert {r.category for r in analytics.category_comparison(db_session, tenant_id=1)} == {"t1cat"}
+    assert {r.category for r in analytics.category_comparison(db_session, tenant_id=2)} == {"t2cat"}
+    assert {r.category for r in analytics.category_comparison(db_session)} == {"t1cat", "t2cat"}
+
+
+def test_category_comparison_empty(db_session):
+    assert analytics.category_comparison(db_session) == []
+
+
+def test_price_index_and_category_comparison_kwargs_no_typeerror(db_session):
+    """Регрессия: API зовёт обе функции с client_site=/tenant_id= — не TypeError.
+
+    (Старая `price_index_by_category(session)` бросала TypeError на api.py:1940.)
+    """
+    assert analytics.price_index_by_category(db_session, client_site="pharmonline", tenant_id=1) == []
+    assert analytics.category_comparison(db_session, client_site="pharmonline", tenant_id=1) == []

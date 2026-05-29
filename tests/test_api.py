@@ -221,8 +221,12 @@ def test_dash_comparison_without_cookie_401(client):
     assert r.status_code == 401
 
 
-def _make_match_with_prices(db, run, *, canonical, prices, tenant_id=1):
-    """Match + products на 2 сайтах + PriceSnapshot для каждого."""
+def _make_match_with_prices(db, run, *, canonical, prices, tenant_id=1, category=None):
+    """Match + products на 2 сайтах + PriceSnapshot для каждого.
+
+    `category` (опц.) проставляется всем products — для тестов
+    /category-comparison и drill-down /comparison?category=.
+    """
     m = storage.Match(tenant_id=tenant_id, canonical_name=canonical, confidence=1.0)
     db.add(m)
     db.flush()
@@ -235,6 +239,7 @@ def _make_match_with_prices(db, run, *, canonical, prices, tenant_id=1):
             name=f"{canonical} {site}",
             name_normalized=canonical.lower(),
             canonical_id=m.id,
+            category=category,
         )
         db.add(p)
         db.flush()
@@ -1406,3 +1411,87 @@ def test_match_relink_requires_auth(client, setup_db):
         json={"site": "aptekonline", "url": "https://x/y"},
     )
     assert r.status_code == 401
+
+
+# ─── /dash/category-comparison + /comparison?category= ───────────────────────
+
+
+def test_category_comparison_without_cookie_401(client):
+    r = client.get("/api/v1/dash/category-comparison")
+    assert r.status_code == 401
+
+
+def test_category_comparison_groups_and_indexes(client, tenant_user, setup_db):
+    """Группировка по категории клиента: per-site средние + index + label-fallback."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_prices(
+        s, run, canonical="v1", prices={"pharmonline": 10.0, "aloe": 8.0}, category="vitamins"
+    )
+    _make_match_with_prices(
+        s, run, canonical="p1", prices={"pharmonline": 20.0, "aloe": 20.0}, category="pain"
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/category-comparison")
+    assert r.status_code == 200, r.text
+    rows = {row["category"]: row for row in r.json()}
+    assert set(rows) == {"vitamins", "pain"}
+    assert rows["vitamins"]["index"] == 125.0  # клиент 10 / конкурент 8
+    assert rows["vitamins"]["per_site_avg"] == {"aloe": 8.0}
+    assert rows["vitamins"]["pricier_count"] == 1
+    assert rows["pain"]["index"] == 100.0
+    # Нет записи Category → label graceful fallback на сырой slug.
+    assert rows["vitamins"]["label"] == "vitamins"
+
+
+def test_category_comparison_tenant_isolation(client, tenant_user, setup_db):
+    """Категории чужого тенанта не видны."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_prices(
+        s, run, canonical="v1", prices={"pharmonline": 10.0, "aloe": 8.0},
+        category="vitamins", tenant_id=1,
+    )
+    _make_match_with_prices(
+        s, run, canonical="x1", prices={"pharmonline": 10.0, "aloe": 8.0},
+        category="secret", tenant_id=2,
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/category-comparison")
+    assert r.status_code == 200, r.text
+    cats = {row["category"] for row in r.json()}
+    assert cats == {"vitamins"}  # тенант 2's "secret" исключён
+
+
+def test_comparison_category_filter(client, tenant_user, setup_db):
+    """drill-down: /comparison?category=X возвращает только матчи этой категории."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_prices(
+        s, run, canonical="v1", prices={"pharmonline": 10.0, "aloe": 8.0}, category="vitamins"
+    )
+    _make_match_with_prices(
+        s, run, canonical="p1", prices={"pharmonline": 20.0, "aloe": 25.0}, category="pain"
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/comparison?category=vitamins")
+    assert r.status_code == 200, r.text
+    assert [row["name"] for row in r.json()] == ["v1"]
+    # Без фильтра — обе категории.
+    r2 = client.get("/api/v1/dash/comparison")
+    assert {row["name"] for row in r2.json()} == {"v1", "p1"}

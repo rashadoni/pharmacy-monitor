@@ -15,7 +15,8 @@ import {
   YAxis,
 } from "recharts";
 import { useTranslations } from "next-intl";
-import { api } from "@/lib/api";
+import { useRouter } from "@/i18n/navigation";
+import { api, type PriceIndexRow } from "@/lib/api";
 
 const SITE_COLORS: Record<string, string> = {
   pharmonline: "#3b82f6",
@@ -107,10 +108,13 @@ function BrandShareSection() {
 
 function PriceIndexSection() {
   const t = useTranslations("analytics");
+  const router = useRouter();
+  // 2026-05-29: было raw fetch → 500 (бэкенд бросал TypeError, см. analytics.py).
+  // Теперь api.priceIndex() (typed, request() кидает на non-2xx) + строки
+  // кликабельны: drill в /comparison?category=. Полная версия — /category-comparison.
   const { data, isLoading } = useQuery({
     queryKey: ["price-index"],
-    queryFn: () =>
-      fetch("/api/v1/dash/price-index", { credentials: "include" }).then((r) => r.json()),
+    queryFn: () => api.priceIndex(),
   });
 
   return (
@@ -135,8 +139,16 @@ function PriceIndexSection() {
             </tr>
           </thead>
           <tbody>
-            {data.map((row: any, i: number) => (
-              <tr key={i} className="border-b border-border last:border-0">
+            {data.map((row: PriceIndexRow, i: number) => (
+              <tr
+                key={i}
+                onClick={() =>
+                  row.category &&
+                  router.push(`/comparison?category=${encodeURIComponent(row.category)}`)
+                }
+                className="border-b border-border last:border-0 cursor-pointer hover:bg-muted/30"
+                title={t("price_index_drill_hint")}
+              >
                 <td className="px-3 py-2">{row.category}</td>
                 <td className="px-3 py-2 text-right tabular-nums">
                   {row.avg_client_price?.toFixed(2)}

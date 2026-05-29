@@ -455,6 +455,22 @@ class ComparisonRowOut(BaseModel):
     spread_basis: str = "raw"  # "raw" | "unit"
 
 
+class CategoryComparisonOut(BaseModel):
+    category: str  # slug (Product.category) — ключ для drill-down в /comparison
+    label: str  # резолвится по locale (label_ru/az), fallback на slug
+    matched_skus: int
+    avg_client_price: float
+    per_site_avg: dict[str, float]  # {"aptekonline": .., "aloe": ..}
+    avg_competitor_price: float
+    index: float  # 100 = паритет, <100 клиент дешевле, >100 дороже
+    cheaper_count: int
+    pricier_count: int
+    parity_count: int
+    cheaper_pct: float
+    pricier_pct: float
+    parity_pct: float
+
+
 class CategoryIn(BaseModel):
     key: str
     label_ru: str
@@ -1448,6 +1464,7 @@ def dash_comparison(
     site_filter: str | None = None,
     limit: int = 5000,
     min_confidence: float = 0.70,
+    category: str | None = None,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -1497,6 +1514,12 @@ def dash_comparison(
     now = utcnow()  # naive UTC; last_seen_at тоже naive (src/_time) — вычитание ок
     out: list[ComparisonRowOut] = []
     for m in matches:
+        # Drill-down из /category-comparison: фильтр по категории товара-клиента
+        # (pharmonline). None → без фильтра (обычный режим страницы сравнения).
+        if category is not None:
+            client_p = next((p for p in m.products if p.site == "pharmonline"), None)
+            if client_p is None or client_p.category != category:
+                continue
         # Confidence floor: низко-достоверные fuzzy-матчи (Bio Kolik ↔ Bio sprey)
         # дают ложный spread. Ручные (is_manual) показываем всегда.
         conf = m.confidence if m.confidence is not None else 1.0
@@ -1937,7 +1960,9 @@ def dash_price_index(
     from src import analytics
 
     _require_site(client_site)
-    rows = analytics.price_index_by_category(db, client_site=client_site)
+    rows = analytics.price_index_by_category(
+        db, client_site=client_site, tenant_id=user.tenant_id
+    )
     return [
         {
             "category": getattr(r, "category", None),
@@ -1948,6 +1973,51 @@ def dash_price_index(
         }
         for r in rows
     ]
+
+
+@app.get("/api/v1/dash/category-comparison", response_model=list[CategoryComparisonOut])
+def dash_category_comparison(
+    client_site: str = "pharmonline",
+    locale: str = "ru",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Сравнение цен по категориям (client_site vs конкуренты), tenant-scoped.
+
+    Параллель товарному /comparison, но агрегировано по категории товара-клиента:
+    per-site средние (aptekonline/aloe раздельно), ценовой индекс, % SKU где
+    клиент дешевле/дороже/паритет. `label` резолвится по locale (label_ru/az)
+    с graceful fallback на сырой slug (если категории нет в таблице Category).
+    Дефолт-сортировка — наибольший мисприсинг (|index-100|×matched_skus).
+    """
+    from src import analytics
+
+    _require_site(client_site)
+    if locale not in ("ru", "az", "en"):
+        locale = "ru"
+
+    rows = analytics.category_comparison(db, client_site=client_site, tenant_id=user.tenant_id)
+    out: list[CategoryComparisonOut] = []
+    for r in rows:
+        label = (r.label_az if locale == "az" else r.label_ru) or r.label_ru or r.category
+        out.append(
+            CategoryComparisonOut(
+                category=r.category,
+                label=label,
+                matched_skus=r.matched_skus,
+                avg_client_price=r.avg_client_price,
+                per_site_avg=r.per_site_avg,
+                avg_competitor_price=r.avg_competitor_price,
+                index=r.index,
+                cheaper_count=r.cheaper_count,
+                pricier_count=r.pricier_count,
+                parity_count=r.parity_count,
+                cheaper_pct=r.cheaper_pct,
+                pricier_pct=r.pricier_pct,
+                parity_pct=r.parity_pct,
+            )
+        )
+    return out
 
 
 @app.get("/api/v1/dash/products/{product_id}/price-history")

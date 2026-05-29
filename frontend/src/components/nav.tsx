@@ -24,6 +24,7 @@ import { LocaleSwitcher } from "@/components/locale-switcher";
 const NAV_OVERVIEW = [
   { href: "/overview", key: "overview", icon: TrendingUp },
   { href: "/comparison", key: "comparison", icon: Search },
+  { href: "/category-comparison", key: "category_comparison", icon: ListTree },
   { href: "/analytics", key: "analytics", icon: BarChart3 },
 ] as const;
 

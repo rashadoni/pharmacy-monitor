@@ -302,6 +302,26 @@ export interface PriceIndexRow {
   matched_skus: number | null;
 }
 
+export interface CategoryComparisonRow {
+  /** slug (Product.category) — ключ drill-down в /comparison?category=. */
+  category: string;
+  /** человекочитаемый ярлык (резолвлен по locale) или сырой slug-fallback. */
+  label: string;
+  matched_skus: number;
+  avg_client_price: number;
+  /** средняя цена каждого конкурента отдельно: {aptekonline, aloe}. */
+  per_site_avg: Record<string, number>;
+  avg_competitor_price: number;
+  /** 100 = paritet, <100 клиент дешевле, >100 клиент дороже. */
+  index: number;
+  cheaper_count: number;
+  pricier_count: number;
+  parity_count: number;
+  cheaper_pct: number;
+  pricier_pct: number;
+  parity_pct: number;
+}
+
 export interface SiteProduct {
   id: number;
   external_id: string;
@@ -549,12 +569,13 @@ export const api = {
   me: () => request<MeOut>("/api/v1/dash/me"),
 
   // Data
-  comparison: (params: { search?: string; min_sites?: number; site_filter?: string; limit?: number } = {}) => {
+  comparison: (params: { search?: string; min_sites?: number; site_filter?: string; limit?: number; category?: string } = {}) => {
     const q = new URLSearchParams();
     if (params.search) q.set("search", params.search);
     if (params.min_sites != null) q.set("min_sites", String(params.min_sites));
     if (params.site_filter) q.set("site_filter", params.site_filter);
     if (params.limit) q.set("limit", String(params.limit));
+    if (params.category) q.set("category", params.category);
     return request<ComparisonRow[]>(`/api/v1/dash/comparison?${q}`);
   },
   // Phase 4 — Pricing config + cost CSV upload
@@ -698,6 +719,15 @@ export const api = {
     if (client_site) q.set("client_site", client_site);
     const qs = q.toString();
     return request<PriceIndexRow[]>(`/api/v1/dash/price-index${qs ? `?${qs}` : ""}`);
+  },
+  categoryComparison: (client_site?: string, locale?: string) => {
+    const q = new URLSearchParams();
+    if (client_site) q.set("client_site", client_site);
+    if (locale) q.set("locale", locale);
+    const qs = q.toString();
+    return request<CategoryComparisonRow[]>(
+      `/api/v1/dash/category-comparison${qs ? `?${qs}` : ""}`,
+    );
   },
   siteProducts: (params: {
     site: string;

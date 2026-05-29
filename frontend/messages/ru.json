@@ -13,7 +13,8 @@
     "section_overview": "Обзор",
     "section_sites": "Сайты",
     "section_actions": "Действия",
-    "section_settings": "Настройки"
+    "section_settings": "Настройки",
+    "category_comparison": "Сравнение категорий"
   },
   "common": {
     "loading": "Загрузка…",
@@ -87,7 +88,9 @@
     "relink_apply": "Применить",
     "relink_current": "сейчас",
     "relink_ok": "✓ Переназначено: {name}",
-    "relink_error": "Не удалось переназначить"
+    "relink_error": "Не удалось переназначить",
+    "category_filter": "Категория: {category}",
+    "category_filter_clear": "Сбросить фильтр"
   },
   "overview": {
     "title": "Обзор",
@@ -143,7 +146,8 @@
     "th_matched_sku": "Совпадений SKU",
     "forecast_desc": "Товары с самыми большими движениями цены. Отфильтрованы артефакты парсинга (изменения вне ±50%).",
     "forecast_row_meta": "{site} · {n} замеров · уверенность: {conf}",
-    "forecast_7d": "Прогноз через 7д:"
+    "forecast_7d": "Прогноз через 7д:",
+    "price_index_drill_hint": "Открыть товары этой категории"
   },
   "alerts": {
     "title": "🔔 Алерты",
@@ -428,5 +432,28 @@
     "confirm_hint": "Зафиксировать матч — auto-matcher не будет его пересчитывать",
     "reject_hint": "Разбить кластер — продукты помечаются как разные товары",
     "count": "{n} матчей в очереди"
+  },
+  "category_comparison": {
+    "title": "📊 Сравнение по категориям",
+    "subtitle": "Насколько pharmonline дороже или дешевле конкурентов в каждой категории. Клик по строке — товары категории.",
+    "export_csv_title": "Экспортировать в CSV",
+    "th_category": "Категория",
+    "th_skus": "SKU",
+    "th_client": "pharmonline (вы)",
+    "th_index": "Индекс",
+    "th_cheaper": "% дешевле",
+    "kpi_cheaper_cats": "Категорий где вы дешевле",
+    "kpi_cheaper_cats_hint": "индекс < 100",
+    "kpi_avg_index": "Средний индекс",
+    "kpi_avg_index_hint": "взвешен по числу SKU; <100 — вы дешевле рынка",
+    "kpi_total_skus": "Всего SKU",
+    "empty": "Нет сопоставленных товаров. Запустите скрейп и матчинг.",
+    "result_count": "{count} категорий",
+    "drill_hint": "Открыть товары этой категории",
+    "index_cheaper": "Вы дешевле рынка",
+    "index_pricier": "Вы дороже рынка",
+    "index_parity": "Паритет с рынком",
+    "card_skus": "{count} SKU",
+    "card_cheaper": "{pct}% дешевле"
   }
 }

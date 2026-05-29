@@ -13,7 +13,8 @@
     "section_overview": "Overview",
     "section_sites": "Sites",
     "section_actions": "Actions",
-    "section_settings": "Settings"
+    "section_settings": "Settings",
+    "category_comparison": "Category comparison"
   },
   "common": {
     "loading": "Loading…",
@@ -87,7 +88,9 @@
     "relink_apply": "Apply",
     "relink_current": "now",
     "relink_ok": "✓ Relinked: {name}",
-    "relink_error": "Relink failed"
+    "relink_error": "Relink failed",
+    "category_filter": "Category: {category}",
+    "category_filter_clear": "Clear filter"
   },
   "overview": {
     "title": "Overview",
@@ -143,7 +146,8 @@
     "th_matched_sku": "Matched SKU",
     "forecast_desc": "Products with the largest price movements. Filtered parsing artifacts (changes outside ±50%).",
     "forecast_row_meta": "{site} · {n} measurements · confidence: {conf}",
-    "forecast_7d": "Forecast in 7d:"
+    "forecast_7d": "Forecast in 7d:",
+    "price_index_drill_hint": "Open this category's products"
   },
   "alerts": {
     "title": "🔔 Alerts",
@@ -428,5 +432,28 @@
     "confirm_hint": "Lock this match — auto-matcher won't change it",
     "reject_hint": "Break the cluster — products marked as different",
     "count": "{n} matches in queue"
+  },
+  "category_comparison": {
+    "title": "📊 Category comparison",
+    "subtitle": "How much pharmonline is above or below competitors in each category. Click a row for that category's products.",
+    "export_csv_title": "Export to CSV",
+    "th_category": "Category",
+    "th_skus": "SKU",
+    "th_client": "pharmonline (you)",
+    "th_index": "Index",
+    "th_cheaper": "% cheaper",
+    "kpi_cheaper_cats": "Categories where you're cheaper",
+    "kpi_cheaper_cats_hint": "index < 100",
+    "kpi_avg_index": "Average index",
+    "kpi_avg_index_hint": "weighted by SKU count; <100 = you're below market",
+    "kpi_total_skus": "Total SKU",
+    "empty": "No matched products. Run a scrape and matching.",
+    "result_count": "{count} categories",
+    "drill_hint": "Open this category's products",
+    "index_cheaper": "You're below market",
+    "index_pricier": "You're above market",
+    "index_parity": "At market parity",
+    "card_skus": "{count} SKU",
+    "card_cheaper": "{pct}% cheaper"
   }
 }

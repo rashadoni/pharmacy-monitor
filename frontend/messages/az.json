@@ -13,7 +13,8 @@
     "section_overview": "İcmal",
     "section_sites": "Saytlar",
     "section_actions": "Əməliyyatlar",
-    "section_settings": "Parametrlər"
+    "section_settings": "Parametrlər",
+    "category_comparison": "Kateqoriya müqayisəsi"
   },
   "common": {
     "loading": "Yüklənir…",
@@ -87,7 +88,9 @@
     "relink_apply": "Tətbiq et",
     "relink_current": "indi",
     "relink_ok": "✓ Dəyişdirildi: {name}",
-    "relink_error": "Dəyişdirmək alınmadı"
+    "relink_error": "Dəyişdirmək alınmadı",
+    "category_filter": "Kateqoriya: {category}",
+    "category_filter_clear": "Filtri sıfırla"
   },
   "overview": {
     "title": "Ümumi baxış",
@@ -143,7 +146,8 @@
     "th_matched_sku": "Uyğun SKU",
     "forecast_desc": "Ən böyük qiymət dəyişiklikləri olan məhsullar. Parsinq artefaktları filtrlənib (±50% xaricindəki dəyişikliklər).",
     "forecast_row_meta": "{site} · {n} ölçüm · etibar: {conf}",
-    "forecast_7d": "7 günlük proqnoz:"
+    "forecast_7d": "7 günlük proqnoz:",
+    "price_index_drill_hint": "Bu kateqoriyanın məhsullarını aç"
   },
   "alerts": {
     "title": "🔔 Bildirişlər",
@@ -428,5 +432,28 @@
     "confirm_hint": "Uyğunlaşmanı qeyd et — auto-matcher artıq dəyişməyəcək",
     "reject_hint": "Klasteri böl — məhsullar fərqli kimi qeyd olunur",
     "count": "Növbədə {n} uyğunlaşma"
+  },
+  "category_comparison": {
+    "title": "📊 Kateqoriyalar üzrə müqayisə",
+    "subtitle": "Hər kateqoriyada pharmonline rəqiblərdən nə qədər baha və ya ucuzdur. Sətirə klikləyin — kateqoriya məhsulları.",
+    "export_csv_title": "CSV-yə ixrac et",
+    "th_category": "Kateqoriya",
+    "th_skus": "SKU",
+    "th_client": "pharmonline (siz)",
+    "th_index": "İndeks",
+    "th_cheaper": "% ucuz",
+    "kpi_cheaper_cats": "Ucuz olduğunuz kateqoriyalar",
+    "kpi_cheaper_cats_hint": "indeks < 100",
+    "kpi_avg_index": "Orta indeks",
+    "kpi_avg_index_hint": "SKU sayına görə çəkilənmiş; <100 — bazardan ucuzsunuz",
+    "kpi_total_skus": "Ümumi SKU",
+    "empty": "Uyğunlaşdırılmış məhsul yoxdur. Skreyp və uyğunlaşdırmanı işə salın.",
+    "result_count": "{count} kateqoriya",
+    "drill_hint": "Bu kateqoriyanın məhsullarını aç",
+    "index_cheaper": "Bazardan ucuzsunuz",
+    "index_pricier": "Bazardan bahasınız",
+    "index_parity": "Bazarla paritet",
+    "card_skus": "{count} SKU",
+    "card_cheaper": "{pct}% ucuz"
   }
 }

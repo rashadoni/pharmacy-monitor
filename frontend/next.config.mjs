@@ -34,6 +34,7 @@ const nextConfig = {
       "alerts",
       "analytics",
       "categories",
+      "category-comparison",
       "comparison",
       "login",
       "matcher",

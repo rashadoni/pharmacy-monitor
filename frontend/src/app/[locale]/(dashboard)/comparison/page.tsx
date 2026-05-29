@@ -2,8 +2,10 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, useMemo } from "react";
+import { useSearchParams } from "next/navigation";
 import { X, ChevronUp, ChevronDown, TrendingUp, TrendingDown } from "lucide-react";
 import { useTranslations } from "next-intl";
+import { useRouter } from "@/i18n/navigation";
 import { api, ApiError, type ComparisonRow } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatPct } from "@/lib/utils";
@@ -17,6 +19,10 @@ type SiteName = typeof SITES[number];
 export default function ComparisonPage() {
   const t = useTranslations("comparison");
   const tCommon = useTranslations("common");
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  // Drill-down из /category-comparison: фильтр по категории товара-клиента.
+  const category = searchParams.get("category");
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
   const [minSites, setMinSites] = useState(2);
@@ -26,8 +32,13 @@ export default function ComparisonPage() {
   const queryClient = useQueryClient();
 
   const { data, isLoading, error, isFetching } = useQuery({
-    queryKey: ["comparison", debouncedSearch, minSites],
-    queryFn: () => api.comparison({ search: debouncedSearch, min_sites: minSites }),
+    queryKey: ["comparison", debouncedSearch, minSites, category],
+    queryFn: () =>
+      api.comparison({
+        search: debouncedSearch,
+        min_sites: minSites,
+        category: category ?? undefined,
+      }),
   });
 
   // Client-side filters + default sort (P1.2 PO Audit 2026-05-17)
@@ -103,10 +114,10 @@ export default function ComparisonPage() {
       // Optimistic: filter the row out immediately
       await queryClient.cancelQueries({ queryKey: ["comparison"] });
       const prev = queryClient.getQueryData<ComparisonRow[]>([
-        "comparison", debouncedSearch, minSites,
+        "comparison", debouncedSearch, minSites, category,
       ]);
       queryClient.setQueryData<ComparisonRow[]>(
-        ["comparison", debouncedSearch, minSites],
+        ["comparison", debouncedSearch, minSites, category],
         (old) => old?.filter((r) => r.canonical_id !== id),
       );
       return { prev };
@@ -115,7 +126,7 @@ export default function ComparisonPage() {
       // Rollback
       if (ctx?.prev) {
         queryClient.setQueryData(
-          ["comparison", debouncedSearch, minSites],
+          ["comparison", debouncedSearch, minSites, category],
           ctx.prev,
         );
       }
@@ -187,6 +198,23 @@ export default function ComparisonPage() {
           <option value={1}>{t("min_sites_1")}</option>
         </select>
       </div>
+
+      {/* Drill-down filter chip (из /category-comparison) */}
+      {category && (
+        <div className="flex items-center gap-2 text-sm" data-testid="category-filter-chip">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 text-primary px-3 py-1">
+            {t("category_filter", { category })}
+            <button
+              onClick={() => router.replace("/comparison")}
+              aria-label={t("category_filter_clear")}
+              title={t("category_filter_clear")}
+              className="hover:text-primary/70"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </span>
+        </div>
+      )}
 
       {/* Status */}
       {(isLoading || isFetching) && (
