@@ -28,6 +28,19 @@ from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapedPromo
 log = structlog.get_logger()
 
 
+def _external_id_from_href(href: str) -> str:
+    """Стабильный external_id из product-href: последний path-сегмент БЕЗ query.
+
+    Bug-fix (2026-05-29): раньше брали `href.split('/')[-1]` вместе с query-строкой,
+    поэтому `/product/ringer-400-ml?lng=en` давал external_id `ringer-400-ml?lng=en`
+    ≠ `ringer-400-ml` (AZ-локаль) → один товар дублировался по локалям (на проде
+    ~9.5K EN-дублей pharmonline). Обрезаем `?...` и `#...` → external_id
+    locale-агностичен, EN/AZ/RU мапятся на один товар.
+    """
+    seg = href.rstrip("/").split("/")[-1]
+    return seg.split("?")[0].split("#")[0]
+
+
 class PharmonlineScraper(BaseScraper):
     site_name = "pharmonline"
     base_url = "https://pharmonline.az"  # без www
@@ -165,7 +178,7 @@ class PharmonlineScraper(BaseScraper):
         if not href:
             return None
         full_url = href if href.startswith("http") else f"{self.base_url}{href}"
-        external_id = href.rstrip("/").split("/")[-1]
+        external_id = _external_id_from_href(href)
 
         # Имя — в aria-label у ссылки, либо в alt у изображения
         name = await link.get_attribute("aria-label") or ""
