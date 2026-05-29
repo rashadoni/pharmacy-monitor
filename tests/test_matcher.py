@@ -232,6 +232,23 @@ class TestHasConflictingForm:
     def test_allows_if_one_form_unknown(self):
         assert _has_conflicting_form("Vitamin C", "Vitamin C tablet 500mg") is False
 
+    def test_az_plural_and_sorma_canonicalize_to_group(self):
+        """2026-05-29: AZ-плюралы и «sorma» канонизируются в свою группу, не
+        дают ложный form-конфликт против канона. Гомеопатия «sorma tabletlər»
+        (сублингвальные таблетки) ≡ «tabletlər» ≡ tablet → один товар."""
+        # sorma tabletlər ≡ tabletlər (recall-edge: Afalaza/Anaferon/Divaza)
+        assert (
+            _has_conflicting_form(
+                "Afalaza 6 mq N100 (sorma tabletlər)", "Afalaza 6 mq № 100 (tabletlər)"
+            )
+            is False
+        )
+        # AZ-плюрал капсул/ампул ≡ канон
+        assert _has_conflicting_form("Drug N20 (kapsulalar)", "Drug № 20 (Kapsul)") is False
+        assert _has_conflicting_form("Drug 2ml (ampulalar)", "Drug 2 ml (Ampoules)") is False
+        # но РАЗНЫЕ группы по-прежнему конфликтуют
+        assert _has_conflicting_form("Drug tabletlər", "Drug şərbət") is True  # tablet≠syrup
+
 
 class TestHasExtremeLengthDisparity:
     def test_blocks_stub_vs_full(self):

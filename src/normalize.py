@@ -122,6 +122,28 @@ _FORM_CANONICAL: dict[str, str] = {
     "ampul": "ampoule",
     "ampoule": "ampoule",
     "amp": "ampoule",
+    # AZ-плюралы / EN-плюралы / синонимы (2026-05-29): раньше отсутствовали в
+    # каноне → extract_form возвращал сам токен → ложный form-конфликт против
+    # канона (напр. aptek «sorma tabletlər»→"sorma" vs pharm «tabletlər»→"tabletlər"
+    # → блок, хотя это ОДИН товар — сублингвальные таблетки = таблетки). Группы
+    # форм остаются раздельными (cream≠ointment, drops≠spray) — мёржим лишь
+    # синонимы внутри одной группы.
+    "tabletlər": "tablet",
+    "tabletkalar": "tablet",
+    "tablets": "tablet",
+    "dragee": "tablet",  # драже = таблетка в оболочке
+    "draje": "tablet",
+    "sorma": "tablet",  # «sorma tabletlər» = сублингвальные/рассасывающие таблетки
+    "kapsullar": "capsule",
+    "kapsulalar": "capsule",
+    "kapsulları": "capsule",
+    "capsules": "capsule",
+    "ampulalar": "ampoule",
+    "ampullar": "ampoule",
+    "ampulları": "ampoule",
+    "ampoules": "ampoule",
+    "damlalar": "drops",
+    "damcılar": "drops",
 }
 
 
