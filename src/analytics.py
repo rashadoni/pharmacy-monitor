@@ -29,6 +29,11 @@ CLIENT_SITE = "pharmonline"
 COMPETITOR_SITES = ("aptekonline", "aloe")
 ALL_SITES = (CLIENT_SITE, *COMPETITOR_SITES)
 
+# Окно «активного» товара для brand_share под diff-only persist. 14 дней —
+# щедро покрывает суточный цикл скрейпа + переживает пропущенный прогон, но
+# исключает давно-снятые SKU.
+_BRAND_SHARE_ACTIVE_DAYS = 14
+
 
 @dataclass
 class BrandRow:
@@ -54,20 +59,32 @@ def brand_share(
     Если `site` указан — оставляем только бренды представленные на этом сайте
     (для site-specific dashboard view). Counts всё равно показывают разбивку
     по всем сайтам — нужно для понимания exclusivity.
-    """
-    if run_id is None:
-        run_id = session.scalar(
-            select(Run.id).where(Run.status == "ok").order_by(desc(Run.id)).limit(1)
-        )
-        if run_id is None:
-            return []
 
-    stmt = (
-        select(Product.brand, Product.site, func.count(Product.id))
-        .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
-        .where(PriceSnapshot.run_id == run_id, Product.brand.is_not(None))
-        .group_by(Product.brand, Product.site)
-    )
+    Diff-only fix (2026-05-29): раньше JOIN'илось на `PriceSnapshot.run_id ==
+    last_run`. После diff-only persist последний run (особенно intraday-tick на
+    1 категорию) пишет snapshot'ы только для товаров с изменившейся ценой →
+    join отдавал почти пусто → страница /analytics брендов была пустой. Теперь
+    считаем АКТИВНЫЕ товары по `Product.last_seen_at` (обновляется каждый прогон
+    независимо от записи snapshot'а — это и есть «видели недавно»), как и
+    остальные diff-only-aware консьюмеры. `run_id` оставлен для обратной
+    совместимости: если явно передан — используем старый snapshot-join.
+    """
+    if run_id is not None:
+        # Explicit run_id (legacy/тесты) — точечный snapshot-join по этому прогону.
+        stmt = (
+            select(Product.brand, Product.site, func.count(Product.id))
+            .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
+            .where(PriceSnapshot.run_id == run_id, Product.brand.is_not(None))
+            .group_by(Product.brand, Product.site)
+        )
+    else:
+        # Diff-only-correct: активные товары по last_seen_at в окне.
+        cutoff = utcnow() - timedelta(days=_BRAND_SHARE_ACTIVE_DAYS)
+        stmt = (
+            select(Product.brand, Product.site, func.count(Product.id))
+            .where(Product.last_seen_at >= cutoff, Product.brand.is_not(None))
+            .group_by(Product.brand, Product.site)
+        )
     rows = session.execute(stmt).all()
 
     # P0.2 (PO Audit 2026-05-17): runtime фильтр generic-слов попавших в

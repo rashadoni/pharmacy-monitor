@@ -64,6 +64,34 @@ def test_brand_share_ignores_null_brand(db_session):
     assert analytics.brand_share(db_session) == []
 
 
+def test_brand_share_diff_only_no_snapshot_in_latest_run(db_session):
+    """Diff-only regression (2026-05-29): товар активен (last_seen_at свежий),
+    но БЕЗ snapshot'а в последнем прогоне (цена не менялась). Раньше brand_share
+    через PriceSnapshot.run_id join его пропускал → пустая страница. Теперь
+    считается по last_seen_at."""
+    # Старый run со снапшотом (имитирует первый прогон где цена записана)
+    old_run = _add_run(db_session, started_at=utcnow() - timedelta(days=3))
+    p = _add_product(db_session, "pharmonline", "Aspirin", brand="Bayer", ext_id="a1")
+    _add_snap(db_session, old_run, p, 10.0)
+    # Свежий прогон БЕЗ снапшота для p (diff-only: цена не менялась)
+    _add_run(db_session, started_at=utcnow())
+    # last_seen_at свежий (default=utcnow при создании продукта)
+    db_session.commit()
+
+    brands = analytics.brand_share(db_session)
+    assert len(brands) == 1
+    assert brands[0].brand == "Bayer"
+    assert brands[0].counts["pharmonline"] == 1
+
+
+def test_brand_share_excludes_stale_products(db_session):
+    """Товар не виденный > 14 дней → исключается (давно снят с продажи)."""
+    p = _add_product(db_session, "aloe", "DeadSKU", brand="GhostBrand", ext_id="d1")
+    p.last_seen_at = utcnow() - timedelta(days=30)
+    db_session.commit()
+    assert analytics.brand_share(db_session) == []
+
+
 def test_promo_history_groups_by_site_title(db_session):
     base = utcnow() - timedelta(days=5)
     r1 = _add_run(db_session, base)
