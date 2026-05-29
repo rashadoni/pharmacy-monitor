@@ -94,6 +94,30 @@ def _iproyal_httpx_proxy() -> str | None:
     return f"http://{username}:{password}@{host}"
 
 
+# ── DDP reliability tuning (2026-05-29) ──────────────────────────────────────
+# Читаются из env ПРИ ВЫЗОВЕ (не module-level) → прод-override без редеплоя +
+# тесты через monkeypatch.setenv. Дефолты: connect 4 попытки с backoff 2/4/8/16с,
+# каждая ограничена open_timeout; call 3 попытки с reconnect.
+def _ddp_open_timeout() -> float:
+    return float(os.getenv("PHARMONLINE_DDP_OPEN_TIMEOUT", "20"))
+
+
+def _ddp_connect_attempts() -> int:
+    return max(1, int(os.getenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", "4")))
+
+
+def _ddp_connect_backoff() -> float:
+    return float(os.getenv("PHARMONLINE_DDP_CONNECT_BACKOFF", "2"))
+
+
+def _ddp_call_attempts() -> int:
+    return max(1, int(os.getenv("PHARMONLINE_DDP_CALL_ATTEMPTS", "3")))
+
+
+def _ddp_call_retry_backoff() -> float:
+    return float(os.getenv("PHARMONLINE_DDP_CALL_RETRY_BACKOFF", "1.0"))
+
+
 class _DDPClient:
     """Minimal Meteor DDP client over WebSocket. One-call-at-a-time semantics.
 
@@ -126,17 +150,74 @@ class _DDPClient:
         self._lock = asyncio.Lock()
 
     async def _connect(self) -> None:
-        """Open websocket + DDP handshake. Sets self._ws on success."""
+        """Connect with retry + exp-backoff. Used by __aenter__ AND _reconnect.
+
+        Fix 2026-05-29: раньше один naked `await websockets.connect()` без таймаута
+        и ретрая → transient handshake-timeout валил весь прогон (exit 1). Теперь
+        каждая попытка ограничена open_timeout, между попытками exp-backoff.
+        """
+        attempts = _ddp_connect_attempts()
+        backoff_base = _ddp_connect_backoff()
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                await self._connect_once()
+                if attempt > 0:
+                    log.info("ddp_connect_recovered", attempt=attempt + 1)
+                return
+            except (
+                asyncio.TimeoutError,
+                TimeoutError,
+                OSError,
+                websockets.exceptions.WebSocketException,
+                ConnectionError,
+            ) as exc:
+                last_exc = exc
+                if self._ws is not None:  # закрыть half-open сокет перед ретраем
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                    self._ws = None
+                if attempt < attempts - 1:
+                    backoff = backoff_base ** (attempt + 1)  # 2,4,8,16
+                    log.warning(
+                        "ddp_connect_retry",
+                        attempt=attempt + 1,
+                        max_attempts=attempts,
+                        backoff_s=backoff,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    await asyncio.sleep(backoff)
+        log.error(
+            "ddp_connect_exhausted",
+            attempts=attempts,
+            error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown",
+        )
+        raise last_exc if last_exc else RuntimeError("DDP connect failed")
+
+    async def _connect_once(self) -> None:
+        """Single connect attempt: open websocket + SockJS open + DDP handshake.
+
+        websockets-native `open_timeout` бьёт только WS-handshake; SockJS 'o' frame
+        и DDP connect→connected идут ПОСЛЕ connect() → оборачиваем их в wait_for.
+        """
+        open_timeout = _ddp_open_timeout()
         kwargs: dict = {
             "max_size": self.MAX_MSG_SIZE,
             "ping_interval": self.PING_INTERVAL,
             "ping_timeout": self.PING_TIMEOUT,
             "close_timeout": self.CLOSE_TIMEOUT,
+            "open_timeout": open_timeout,
         }
         if self.proxy_url:
             kwargs["proxy"] = self.proxy_url
         ws_url = self.ws_url_factory()
         self._ws = await websockets.connect(ws_url, **kwargs)
+        await asyncio.wait_for(self._ddp_handshake(), timeout=open_timeout)
+
+    async def _ddp_handshake(self) -> None:
+        """SockJS open frame + DDP connect/connected. Assumes self._ws is open."""
         opening = await self._ws.recv()
         if opening != "o":
             raise RuntimeError(f"Expected SockJS open frame 'o', got {opening!r}")
@@ -207,44 +288,69 @@ class _DDPClient:
         делаем один reconnect и retry'им call. Это критично для long-running
         scrapes где persist phase блочит event loop на 5+ минут.
         """
+        attempts = _ddp_call_attempts()
+        retry_backoff = _ddp_call_retry_backoff()
         async with self._lock:
-            for attempt in range(2):
+            last_exc: Exception | None = None
+            for attempt in range(attempts):
                 try:
                     return await self._send_and_wait(method, params, timeout)
                 except (
+                    asyncio.TimeoutError,  # half-open сокет: send/recv завис дольше timeout
+                    TimeoutError,
                     websockets.exceptions.ConnectionClosed,
                     websockets.exceptions.WebSocketException,
                     ConnectionError,
                 ) as exc:
-                    if attempt == 0:
+                    last_exc = exc
+                    if attempt < attempts - 1:
                         log.warning(
                             "ddp_call_reconnecting",
                             method=method,
+                            attempt=attempt + 1,
+                            max_attempts=attempts,
                             error=f"{type(exc).__name__}: {exc}",
                         )
-                        await self._reconnect()
+                        try:
+                            await self._reconnect()
+                        except Exception as rexc:  # reconnect исчерпал ретраи — фиксируем
+                            last_exc = rexc
+                            log.warning(
+                                "ddp_call_reconnect_failed",
+                                method=method,
+                                error=f"{type(rexc).__name__}: {rexc}",
+                            )
+                        if retry_backoff > 0:
+                            await asyncio.sleep(retry_backoff)
                         continue
-                    raise
-            # Unreachable — loop either returns or raises.
-            raise RuntimeError("DDP call exhausted retries (logic bug)")
+            log.error(
+                "ddp_call_exhausted",
+                method=method,
+                attempts=attempts,
+                error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown",
+            )
+            raise last_exc if last_exc else RuntimeError("DDP call exhausted retries")
 
     async def _send_and_wait(self, method: str, params: list, timeout: float) -> dict:
-        """Single attempt: send call message, wait for matching result."""
+        """Single attempt, hard-bounded by `timeout`.
+
+        Fix 2026-05-29: оборачиваем ВЕСЬ метод (вкл. `ws.send`) в asyncio.wait_for.
+        Раньше дедлайн покрывал только recv-loop, а `ws.send` перед ним — нет → на
+        half-open сокете send() висел 5+ мин (TCP). Теперь wait_for отменяет всю
+        операцию (send+recv) по timeout и бросает asyncio.TimeoutError → call()
+        делает reconnect+retry.
+        """
         if self._ws is None:
             raise ConnectionError("DDP socket not open")
+        return await asyncio.wait_for(self._send_and_wait_inner(method, params), timeout=timeout)
+
+    async def _send_and_wait_inner(self, method: str, params: list) -> dict:
         self._call_id += 1
         cid = str(self._call_id)
         req = {"msg": "method", "id": cid, "method": method, "params": params}
         await self._ws.send(json.dumps([json.dumps(req)]))
-        deadline = asyncio.get_event_loop().time() + timeout
         while True:
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                raise TimeoutError(f"DDP method {method!r} timeout after {timeout}s")
-            try:
-                frame = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
-            except asyncio.TimeoutError:
-                raise TimeoutError(f"DDP method {method!r} timeout")
+            frame = await self._ws.recv()
             for ddp in self._unwrap_sockjs(frame):
                 if ddp.get("msg") == "result" and ddp.get("id") == cid:
                     if "error" in ddp:
