@@ -81,7 +81,13 @@
     "suspicious_spread": "Şübhəli spread ≥50% — uyğunluğu yoxlayın",
     "needs_review_aria": "Yoxlanma tələb edir",
     "reject_tooltip": "Səhv uyğunluq kimi rədd et",
-    "sites_spread": "{n} sayt · fərq"
+    "sites_spread": "{n} sayt · fərq",
+    "relink_hint": "Uyğunluq səhvdir? Düzgün məhsulun keçidini yapışdırın:",
+    "relink_placeholder": "https://… məhsul keçidi",
+    "relink_apply": "Tətbiq et",
+    "relink_current": "indi",
+    "relink_ok": "✓ Dəyişdirildi: {name}",
+    "relink_error": "Dəyişdirmək alınmadı"
   },
   "overview": {
     "title": "Ümumi baxış",

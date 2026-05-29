@@ -2901,6 +2901,87 @@ def dash_match_reject(
     return Response(status_code=204)
 
 
+class MatchRelinkIn(BaseModel):
+    site: str
+    url: str
+
+
+def _external_id_from_url(url: str) -> str:
+    """Последний сегмент пути URL (без query/fragment) = external_id товара.
+
+    Совпадает с тем, как скрейперы формируют external_id (pharmonline:
+    `_external_id_from_href`; aptekonline/aloe: url_id = слаг после /product/).
+    """
+    path = (url or "").split("?")[0].split("#")[0].rstrip("/")
+    return path.split("/")[-1].strip()
+
+
+@app.post("/api/v1/dash/matches/{match_id}/relink")
+def dash_match_relink(
+    match_id: int,
+    body: MatchRelinkIn,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Вручную переназначить товар сайта в кластере по URL.
+
+    Матчер ошибся → пользователь вставляет ссылку на ПРАВИЛЬНЫЙ товар. Старый
+    товар этого сайта отвязывается (+ rejection, чтобы auto-matcher не вернул),
+    новый привязывается, match помечается `is_manual` (rematch его не тронет).
+    Если сайта в кластере ещё не было — товар просто добавляется.
+    Товар должен быть в нашем каталоге (иначе нет данных о цене).
+    """
+    from src import match_actions
+
+    match = db.scalar(
+        select(storage.Match).where(
+            storage.Match.id == match_id, storage.Match.tenant_id == user.tenant_id
+        )
+    )
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    site = (body.site or "").strip().lower()
+    if site not in ("pharmonline", "aptekonline", "aloe"):
+        raise HTTPException(400, f"Неизвестный сайт: {site!r}")
+
+    ext = _external_id_from_url(body.url)
+    if not ext:
+        raise HTTPException(400, "Не удалось разобрать ссылку")
+
+    prod = db.scalar(
+        select(storage.Product).where(
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.site == site,
+            storage.Product.external_id == ext,
+        )
+    )
+    if prod is None:  # fallback: по подстроке URL (на случай иной формы external_id)
+        prod = db.scalar(
+            select(storage.Product).where(
+                storage.Product.tenant_id == user.tenant_id,
+                storage.Product.site == site,
+                storage.Product.url.ilike(f"%{ext}%"),
+            )
+        )
+    if prod is None:
+        raise HTTPException(
+            404, f"Товар по этой ссылке не найден в каталоге {site} (возможно, не заскрейплен)"
+        )
+    if prod.canonical_id is not None and prod.canonical_id != match_id:
+        raise HTTPException(
+            409,
+            f"Этот товар уже в другом сравнении (#{prod.canonical_id}) — сначала отклоните его там",
+        )
+
+    ok = match_actions.swap_alternative(db, match_id, site, prod.id)
+    if not ok:
+        raise HTTPException(400, "Не удалось переназначить (возможно, это уже текущий товар сайта)")
+
+    log.info("match_relinked", match_id=match_id, site=site, product_id=prod.id, user_id=user.id)
+    return {"ok": True, "product_id": prod.id, "name": prod.name, "site": site}
+
+
 # ── Phase 4.1+4.3+4.6 (2026-05-27) — Pricing settings + cost CSV import ─────
 
 

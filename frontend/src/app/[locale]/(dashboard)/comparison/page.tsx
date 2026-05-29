@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, useMemo } from "react";
 import { X, ChevronUp, ChevronDown, TrendingUp, TrendingDown } from "lucide-react";
 import { useTranslations } from "next-intl";
-import { api, type ComparisonRow } from "@/lib/api";
+import { api, ApiError, type ComparisonRow } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatPct } from "@/lib/utils";
 import { OnboardingTip } from "@/components/onboarding-tip";
@@ -438,6 +438,7 @@ function ComparisonRowDesktop({
         <tr className="bg-muted/20 border-t border-border">
           <td colSpan={sites.length + 3} className="px-3 py-3">
             <TrendPanel row={row} />
+            <RelinkPanel row={row} />
           </td>
         </tr>
       )}
@@ -571,6 +572,85 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// Ручной override матча по URL (2026-05-29): матчер ошибся → пользователь
+// вставляет ссылку на правильный товар сайта. swap_alternative на бэкенде:
+// старый товар сайта отвязывается (+rejection), новый привязывается, is_manual.
+function RelinkPanel({ row }: { row: ComparisonRow }) {
+  const t = useTranslations("comparison");
+  const queryClient = useQueryClient();
+  const [urls, setUrls] = useState<Record<string, string>>({});
+  const [msg, setMsg] = useState<{ site: string; ok: boolean; text: string } | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: ({ site, url }: { site: string; url: string }) =>
+      api.matchRelink(row.canonical_id, site, url),
+    onSuccess: (res, vars) => {
+      setMsg({ site: vars.site, ok: true, text: t("relink_ok", { name: res.name }) });
+      setUrls((u) => ({ ...u, [vars.site]: "" }));
+      queryClient.invalidateQueries({ queryKey: ["comparison"] });
+      queryClient.invalidateQueries({ queryKey: ["match-quality"] });
+    },
+    onError: (err: unknown, vars) => {
+      const text = err instanceof ApiError && err.message ? err.message : t("relink_error");
+      setMsg({ site: vars.site, ok: false, text });
+    },
+  });
+
+  return (
+    <div className="mt-3 pt-3 border-t border-border/50">
+      <p className="text-[11px] text-muted-foreground mb-2">{t("relink_hint")}</p>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        {SITES.map((s) => {
+          const cur = row.prices[s];
+          const busy = mutation.isPending && mutation.variables?.site === s;
+          const val = urls[s] ?? "";
+          return (
+            <div key={s} className="flex flex-col gap-1">
+              <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                {s}
+              </span>
+              <div className="flex gap-1">
+                <input
+                  type="url"
+                  value={val}
+                  onChange={(e) => setUrls((u) => ({ ...u, [s]: e.target.value }))}
+                  placeholder={t("relink_placeholder")}
+                  className="flex-1 min-w-0 px-2 py-1 text-xs border border-border rounded bg-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  data-testid={`relink-input-${s}-${row.canonical_id}`}
+                />
+                <button
+                  onClick={() => val.trim() && mutation.mutate({ site: s, url: val.trim() })}
+                  disabled={busy || !val.trim()}
+                  className="px-2 py-1 text-xs rounded bg-primary text-primary-foreground disabled:opacity-40 whitespace-nowrap"
+                  data-testid={`relink-apply-${s}-${row.canonical_id}`}
+                >
+                  {busy ? "…" : t("relink_apply")}
+                </button>
+              </div>
+              {cur && (
+                <a
+                  href={cur.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[10px] text-muted-foreground/70 truncate hover:underline"
+                  title={cur.url}
+                >
+                  {t("relink_current")}: {cur.url.split("/").filter(Boolean).pop()}
+                </a>
+              )}
+              {msg?.site === s && (
+                <span className={`text-[10px] ${msg.ok ? "text-success" : "text-destructive"}`}>
+                  {msg.text}
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

@@ -81,7 +81,13 @@
     "suspicious_spread": "Подозрительный spread ≥50% — проверить матч",
     "needs_review_aria": "Требует проверки",
     "reject_tooltip": "Отвергнуть как false match",
-    "sites_spread": "{n} сайтов · spread"
+    "sites_spread": "{n} сайтов · spread",
+    "relink_hint": "Матч неверный? Вставьте ссылку на правильный товар нужного сайта:",
+    "relink_placeholder": "https://… ссылка на товар",
+    "relink_apply": "Применить",
+    "relink_current": "сейчас",
+    "relink_ok": "✓ Переназначено: {name}",
+    "relink_error": "Не удалось переназначить"
   },
   "overview": {
     "title": "Обзор",

@@ -1307,3 +1307,102 @@ def test_price_history_batch_dedupes_ids(client, tenant_user, setup_db):
     body = r.json()
     assert len(body) == 1  # дедуплицировано
     assert str(pid) in body
+
+
+# ── Manual relink by URL (2026-05-29) ────────────────────────────────────────
+
+
+def test_match_relink_swaps_by_url(client, tenant_user, setup_db):
+    """POST /relink: вставить URL правильного товара → swap товара сайта."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="Relinkable", products_per_site=2)
+    old = next(p for p in m.products if p.site == "aptekonline")
+    new = storage.Product(
+        tenant_id=1, site="aptekonline", external_id="correct-999",
+        url="https://www.aptekonline.az/product/correct-999", name="Correct Item",
+        name_normalized="correct item",
+    )
+    s.add(new)
+    s.commit()
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    # URL с query (?lng=en) — должен резолвиться по external_id из последнего сегмента
+    r = client.post(
+        f"/api/v1/dash/matches/{m.id}/relink",
+        json={"site": "aptekonline", "url": "https://www.aptekonline.az/product/correct-999?lng=en"},
+    )
+    assert r.status_code == 200, r.text
+    s.refresh(new)
+    s.refresh(old)
+    s.refresh(m)
+    assert new.canonical_id == m.id  # новый привязан
+    assert old.canonical_id is None  # старый отвязан
+    assert m.is_manual is True  # rematch не тронет
+
+
+def test_match_relink_adds_missing_site(client, tenant_user, setup_db):
+    """Если сайта в кластере не было — товар просто добавляется."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="TwoSite", products_per_site=2)
+    # кластер pharmonline+aptekonline; добавим aloe
+    new = storage.Product(
+        tenant_id=1, site="aloe", external_id="aloe-add-1",
+        url="https://aloe.az/aloe-add-1/", name="Aloe Add", name_normalized="aloe add",
+    )
+    s.add(new)
+    s.commit()
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.post(
+        f"/api/v1/dash/matches/{m.id}/relink",
+        json={"site": "aloe", "url": "https://aloe.az/aloe-add-1/"},
+    )
+    assert r.status_code == 200, r.text
+    s.refresh(new)
+    assert new.canonical_id == m.id
+
+
+def test_match_relink_404_unknown_url(client, tenant_user, setup_db):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="NoTarget", products_per_site=2)
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.post(
+        f"/api/v1/dash/matches/{m.id}/relink",
+        json={"site": "aptekonline", "url": "https://www.aptekonline.az/product/does-not-exist-xyz"},
+    )
+    assert r.status_code == 404
+
+
+def test_match_relink_409_already_matched(client, tenant_user, setup_db):
+    """Товар уже в другом кластере → 409 (сначала отклони там)."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    m1 = _make_match_with_products(s, confidence=0.8, canonical="ClusterA", products_per_site=2)
+    m2 = _make_match_with_products(s, confidence=0.8, canonical="ClusterB", products_per_site=2)
+    other = next(p for p in m2.products if p.site == "aptekonline")
+    other.external_id = "busy-777"
+    other.url = "https://www.aptekonline.az/product/busy-777"
+    s.commit()
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.post(
+        f"/api/v1/dash/matches/{m1.id}/relink",
+        json={"site": "aptekonline", "url": "https://www.aptekonline.az/product/busy-777"},
+    )
+    assert r.status_code == 409
+
+
+def test_match_relink_requires_auth(client, setup_db):
+    r = client.post(
+        "/api/v1/dash/matches/1/relink",
+        json={"site": "aptekonline", "url": "https://x/y"},
+    )
+    assert r.status_code == 401

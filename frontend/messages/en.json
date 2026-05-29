@@ -81,7 +81,13 @@
     "suspicious_spread": "Suspicious spread ≥50% — verify match",
     "needs_review_aria": "Needs review",
     "reject_tooltip": "Reject as false match",
-    "sites_spread": "{n} sites · spread"
+    "sites_spread": "{n} sites · spread",
+    "relink_hint": "Wrong match? Paste the URL of the correct product for that site:",
+    "relink_placeholder": "https://… product link",
+    "relink_apply": "Apply",
+    "relink_current": "now",
+    "relink_ok": "✓ Relinked: {name}",
+    "relink_error": "Relink failed"
   },
   "overview": {
     "title": "Overview",

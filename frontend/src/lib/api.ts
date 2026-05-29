@@ -597,6 +597,11 @@ export const api = {
     request<void>(`/api/v1/dash/matches/${matchId}/confirm`, { method: "POST" }),
   matchReject: (matchId: number) =>
     request<void>(`/api/v1/dash/matches/${matchId}/reject`, { method: "POST" }),
+  matchRelink: (matchId: number, site: string, url: string) =>
+    request<{ ok: boolean; product_id: number; name: string; site: string }>(
+      `/api/v1/dash/matches/${matchId}/relink`,
+      { method: "POST", body: JSON.stringify({ site, url }) },
+    ),
   roiActions: (client_site?: string, locale?: string) => {
     const q = new URLSearchParams();
     if (client_site) q.set("client_site", client_site);
