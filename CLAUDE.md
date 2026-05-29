@@ -254,9 +254,10 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
 
 ## Known issues / NOT done
 
-- Resend SMTP not configured (email magic-link silently no-ops, password login works)
-- Telegram bot token not configured (alerts only in DB)
-- Sentry DSN not configured (errors only in journald)
+- ~~Resend SMTP not configured~~ **CONFIGURED & WORKING** (2026-05-29 verified): `SMTP_HOST=smtp.resend.com`, verified domain `digest@leaddrive.cloud`. Daily digest email delivered to `EMAIL_TO` (rashadrahimov@gmail.com) — see journald `smtp_sent_ok` / `digest_sent` (digest@daily.timer 05:00 UTC).
+- Telegram bot token NOT configured (`TELEGRAM_BOT_TOKEN` empty) — push-alerts off; email digest covers delivery. Activate via `configure-integrations.sh` → @BotFather token + chat_id.
+- ~~Sentry DSN not configured~~ **CONFIGURED & WORKING** (2026-05-29 verified): `SENTRY_DSN` set, `init_sentry()` runs on startup (journald `sentry_initialized env=production`). FastAPI+SQLAlchemy integrations.
+- NOTE: `pharmacy-monitor notify test` для smoke-теста доставки запускать с загруженным env (systemd EnvironmentFile НЕ грузится при ручном CLI): `set -a; source /etc/pharmacy-monitor/env; .venv/bin/pharmacy-monitor notify test`.
 - ~~22317 AZN bug in aptekonline price parser~~ FIXED 2026-05-07. Root cause: aptekonline's Angular template `'<del>' + price + 'AZN </del>' + p.discount_price + ' AZN '` renders with no separator, so `inner_text` of `.new-price` returns e.g. `"22AZN 317 AZN"` for a discounted product. Old `parse_price` stripped non-digits → `"22317"`. Fix: extract only the FIRST digit-run-with-dots/commas via regex. Existing bad rows перезатираются следующим aptekonline-прогоном (Mac launchd 18:00 Asia/Baku ежедневно); для немедленной очистки: `DELETE FROM price_snapshots WHERE site='aptekonline' AND price > 5000;`
 - pharmonline.az has NO `/sitemap.xml` (returns SPA HTML); aptekonline returns empty `<urlset>` — both need BFS fallback (regular Playwright scrapers continue to work via category pages)
 - **Hetzner DE IP banned by pharmonline.az + aptekonline.az** (since ~2026-04-29). MITIGATED 2026-05-11: оба сайта переехали на Mac launchd 18:00 Asia/Baku (Baku-IP не банится). Прод-таймеры pharmonline/aptekonline disabled. Aloe остался на проде (direct работает). См. "Runtime layout" выше.
