@@ -490,7 +490,9 @@ def _has_conflicting_variant_atoms(name_raw_a: str, name_raw_b: str) -> bool:
 # standalone 4+-значные. Блок только если у ОБОИХ есть такое число и они разные
 # (50000 IU == 50 000 BV → не блок; 25000 ≠ 10000 → блок). Volume/доза <1000
 # (100ml, 500mg) не трогаем — это bucket/другие guard'ы.
-_STRENGTH_NUM_RE = re.compile(r"(?<![\d.])\d{4,}(?![\d.])")
+# \d{4,7}: 1000–9 999 999 покрывает enzyme/IU/BV силы (Mikrazim 25000, D3 50000,
+# Ukraferon 1000000 BV); 8+ знаков = EAN-8/EAN-13/рег-коды в имени → НЕ сила.
+_STRENGTH_NUM_RE = re.compile(r"(?<![\d.])\d{4,7}(?![\d.])")
 _THOUSAND_SPACE_RE = re.compile(r"(\d)\s+(\d{3})(?!\d)")
 
 
@@ -513,11 +515,19 @@ def _has_conflicting_strength_number(name_raw_a: str, name_raw_b: str) -> bool:
 
 
 def _significant_name_tokens(name_norm: str | None) -> frozenset[str]:
-    """Значащие токены name_normalized: len≥4, не noise/modifier (для ambiguity)."""
+    """Значащие токены name_normalized для ambiguity: len≥4, БЕЗ цифр, не noise/modifier.
+
+    Цифро-содержащие токены («100ml», «60ml», «250mq») исключены: объём/доза уже
+    в bucket_key, ambiguity должна драйвиться брендом/вариантом СЛОВАМИ (altay,
+    mirrolla, medoil), а не объёмными артефактами.
+    """
     return frozenset(
         t
         for t in (name_norm or "").split()
-        if len(t) >= 4 and t not in _MATCH_NOISE_TOKENS and t not in _PHARMA_MODIFIERS
+        if len(t) >= 4
+        and not any(ch.isdigit() for ch in t)
+        and t not in _MATCH_NOISE_TOKENS
+        and t not in _PHARMA_MODIFIERS
     )
 
 
@@ -721,7 +731,9 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
             continue
         _sig = {p.id: _significant_name_tokens(p.name_normalized) for p in _agrp}
         for q in _agrp:
+            _qsig = _sig[q.id]
             _extras: set[frozenset[str]] = set()
+            _has_equal_peer = False
             for p in _agrp:
                 if p.site == q.site or p.id == q.id:
                     continue
@@ -730,12 +742,18 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     < fuzzy_threshold
                 ):
                     continue
-                _extra = _sig[p.id] - _sig[q.id]
+                # Точный двойник (равный набор значащих токенов) на другом сайте →
+                # у q ЕСТЬ определённый матч → это не генерик-неоднозначность.
+                # Спасает мульти-вариантные линейки: «Nutrilon Premium 1» с твином
+                # «Nutrilon Premium 1» не подавляется из-за соседей Comfort/Pepti.
+                if _sig[p.id] == _qsig:
+                    _has_equal_peer = True
+                    break
+                _extra = _sig[p.id] - _qsig
                 if _extra:
                     _extras.add(_extra)
-                if len(_extras) >= 2:
-                    break
-            if len(_extras) >= 2:
+            # Подавляем только генерик БЕЗ точного двойника, матчащийся к ≥2 РАЗНЫМ.
+            if not _has_equal_peer and len(_extras) >= 2:
                 ambiguous_ids.add(q.id)
     if ambiguous_ids:
         log.info("matcher_ambiguous_generics_suppressed", count=len(ambiguous_ids))

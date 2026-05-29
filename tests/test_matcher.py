@@ -1371,3 +1371,43 @@ def test_single_brand_generic_still_matches(db_session):
     matcher.match_products(s)
     s.refresh(g)
     assert g.canonical_id is not None  # один бренд → не ambiguous → матч
+
+
+def test_generic_with_exact_twin_not_suppressed(db_session):
+    """Генерик с ТОЧНЫМ двойником (равный набор значащих токенов) на другом сайте
+    НЕ подавляется, даже если рядом brand-сиблинги (Codex HIGH fix): у него есть
+    определённый матч → cross-brand-неоднозначность к нему не относится."""
+    s = db_session
+    g1 = _make_product(
+        s,
+        site="aptekonline",
+        external_id="cg1",
+        name="Çaytikanı yağı 100 ml",
+        name_normalized="caytikani yagi",
+        brand="caytikani",
+        pack_size="100ml",
+    )
+    g2 = _make_product(
+        s,
+        site="pharmonline",
+        external_id="cg2",
+        name="Çaytikanı yağı 100 ml",
+        name_normalized="caytikani yagi",
+        brand="caytikani",
+        pack_size="100ml",
+    )
+    _make_product(
+        s,
+        site="aloe",
+        external_id="cma",
+        name="Çaytikanı yağı Mirrolla 100 ml",
+        name_normalized="caytikani yagi mirrolla",
+        brand="caytikani",
+        pack_size="100ml",
+    )
+    s.commit()
+    matcher.match_products(s)
+    s.refresh(g1)
+    s.refresh(g2)
+    assert g1.canonical_id is not None
+    assert g1.canonical_id == g2.canonical_id  # два генерика склеились, не подавлены
