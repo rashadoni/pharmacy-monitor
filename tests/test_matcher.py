@@ -2,6 +2,9 @@
 
 from src import match_actions, matcher, storage
 from src.matcher import (
+    _country_from_url,
+    _country_of,
+    _has_conflicting_country,
     _has_conflicting_form,
     _has_conflicting_gender,
     _has_conflicting_series_number,
@@ -1411,3 +1414,98 @@ def test_generic_with_exact_twin_not_suppressed(db_session):
     s.refresh(g2)
     assert g1.canonical_id is not None
     assert g1.canonical_id == g2.canonical_id  # два генерика склеились, не подавлены
+
+
+# ── Страна производителя: разная страна → разный товар (2026-05-29) ───────────
+
+
+class TestCountryGuard:
+    def test_country_from_apte_manufacturer_field(self):
+        class P:
+            manufacturer = "TÜRKİYƏ"
+            url = "https://www.aptekonline.az/product/18470"
+
+        assert _country_of(P()) == "tr"
+
+    def test_country_from_phar_url_tail(self):
+        assert (
+            _country_from_url(
+                "https://pharmonline.az/product/qliserin-50-ml-azerfarm-mmc-azerbaycan"
+            )
+            == "az"
+        )
+        assert (
+            _country_from_url("https://pharmonline.az/product/mokast-10-mq-nobel-ilac-turkiye")
+            == "tr"
+        )
+        assert _country_from_url("https://pharmonline.az/product/maska-qara-1-chin") == "cn"
+
+    def test_country_url_ignores_non_country_tail(self):
+        # «ml»/«tabletler»/бренд в хвосте слага — не страна
+        assert (
+            _country_from_url("https://pharmonline.az/product/aspirin-500-mg-20-tabletler") is None
+        )
+        assert _country_from_url("https://pharmonline.az/product/syrup-100-ml") is None
+
+    def test_conflict_different_country(self):
+        class A:
+            manufacturer = "TÜRKİYƏ"
+            url = None
+
+        class B:
+            manufacturer = None
+            url = "https://pharmonline.az/product/qliserin-50-ml-azerfarm-mmc-azerbaycan"
+
+        assert _has_conflicting_country(A(), B()) is True  # tr ≠ az
+
+    def test_no_conflict_same_country(self):
+        class A:
+            manufacturer = "Rusiya"
+            url = None
+
+        class B:
+            manufacturer = None
+            url = "https://pharmonline.az/product/drug-rusiya"
+
+        assert _has_conflicting_country(A(), B()) is False  # ru == ru
+
+    def test_no_conflict_when_one_unknown(self):
+        class A:
+            manufacturer = "TÜRKİYƏ"
+            url = None
+
+        class B:
+            manufacturer = None
+            url = "https://pharmonline.az/product/drug-no-country-tail"
+
+        assert _has_conflicting_country(A(), B()) is False  # одна страна неизвестна → не блок
+
+
+def test_country_blocks_cross_country_match(db_session):
+    """Глицерин Türkiyə (Talya) ≠ глицерин Azərbaycan (Azerfarm) — не матчатся."""
+    s = db_session
+    a = _make_product(
+        s,
+        site="aptekonline",
+        external_id="gl-tr",
+        name="Qliserin 50 ml",
+        name_normalized="qliserin",
+        brand="qliserin",
+        pack_size="50ml",
+    )
+    a.manufacturer = "TÜRKİYƏ"
+    b = _make_product(
+        s,
+        site="pharmonline",
+        external_id="gl-az",
+        name="Qliserin 50 ml (Məhlul)",
+        name_normalized="qliserin",
+        brand="qliserin",
+        pack_size="50ml",
+        url="https://pharmonline.az/product/qliserin-50-ml-mehlul-azerfarm-mmc-azerbaycan",
+    )
+    s.commit()
+    matcher.match_products(s)
+    s.refresh(a)
+    s.refresh(b)
+    assert a.canonical_id != b.canonical_id or (a.canonical_id is None and b.canonical_id is None)

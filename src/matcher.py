@@ -514,6 +514,152 @@ def _has_conflicting_strength_number(name_raw_a: str, name_raw_b: str) -> bool:
     return bool(a) and bool(b) and a != b
 
 
+# ── Страна производителя (2026-05-29) ────────────────────────────────────────
+# Генерик-коммодити (глицерин, новокаин, шприцы) каждый сайт берёт у СВОЕГО
+# производителя → ложный «85% дешевле» между Talya(Türkiyə) и Azerfarm(Azərbaycan).
+# Сигнал страны ЕСТЬ: aptekonline хранит её в Product.manufacturer (поле «olke»);
+# pharmonline — в хвосте URL-слага («…azerfarm-mmc-azerbaycan», «…nobel-ilac-turkiye»).
+# Канон-словарь унифицирует AZ/EN-написания (после strip_accents) в ISO-код.
+_COUNTRY_CANON: dict[str, str] = {
+    "turkiye": "tr",
+    "turkiya": "tr",
+    "turkey": "tr",
+    "rusiya": "ru",
+    "russia": "ru",
+    "rossiya": "ru",
+    "azerbaycan": "az",
+    "azerbaijan": "az",
+    "fransa": "fr",
+    "france": "fr",
+    "almaniya": "de",
+    "germany": "de",
+    "ger": "de",
+    "germaniya": "de",
+    "ukrayna": "ua",
+    "ukraine": "ua",
+    "polsa": "pl",
+    "polsha": "pl",
+    "poland": "pl",
+    "polonya": "pl",
+    "italiya": "it",
+    "italy": "it",
+    "cin": "cn",
+    "chin": "cn",
+    "china": "cn",
+    "hindistan": "in",
+    "india": "in",
+    "belarus": "by",
+    "macaristan": "hu",
+    "hungary": "hu",
+    "ispaniya": "es",
+    "spain": "es",
+    "bolqaristan": "bg",
+    "bulgaria": "bg",
+    "latviya": "lv",
+    "latvia": "lv",
+    "sloveniya": "si",
+    "slovenia": "si",
+    "abs": "us",
+    "usa": "us",
+    "amerika": "us",
+    "yaponiya": "jp",
+    "japan": "jp",
+    "cexiya": "cz",
+    "chexiya": "cz",
+    "czech": "cz",
+    "niderland": "nl",
+    "hollandiya": "nl",
+    "isvecre": "ch",
+    "isveckre": "ch",
+    "switzerland": "ch",
+    "isvec": "se",
+    "sweden": "se",
+    "avstriya": "at",
+    "austria": "at",
+    "koreya": "kr",
+    "korea": "kr",
+    "ingiltere": "gb",
+    "uk": "gb",
+    "britaniya": "gb",
+    "misir": "eg",
+    "egypt": "eg",
+    "iran": "ir",
+    "pakistan": "pk",
+    "vyetnam": "vn",
+    "vietnam": "vn",
+    "yunanistan": "gr",
+    "greece": "gr",
+    "rumıniya": "ro",
+    "rumeniya": "ro",
+    "romania": "ro",
+    "portuqaliya": "pt",
+    "portugal": "pt",
+    "belcika": "be",
+    "belgium": "be",
+    "danimarka": "dk",
+    "denmark": "dk",
+    "finlandiya": "fi",
+    "finland": "fi",
+    "norvec": "no",
+    "norway": "no",
+    "litva": "lt",
+    "estoniya": "ee",
+    "xorvatiya": "hr",
+    "serbiya": "rs",
+    "sloveniya2": "si",
+    "gurcustan": "ge",
+    "georgia": "ge",
+    "qazaxistan": "kz",
+    "kazakhstan": "kz",
+    "ozbekistan": "uz",
+    "uzbekistan": "uz",
+}
+
+
+def _country_token(raw: str | None) -> str | None:
+    """Канон ISO-код страны из строки (apte manufacturer-поле = «olke»)."""
+    if not raw:
+        return None
+    tok = strip_accents(raw).lower().strip()
+    if tok in ("none", "null", ""):
+        return None
+    return _COUNTRY_CANON.get(tok)
+
+
+def _country_from_url(url: str | None) -> str | None:
+    """Страна из хвоста URL-слага (pharmonline: «…-azerfarm-mmc-azerbaycan»).
+
+    Берём последние до 3 токенов слага и проверяем по словарю стран (чтобы не
+    принять «ml»/«tabletler»/бренд за страну).
+    """
+    if not url:
+        return None
+    slug = strip_accents(url).rstrip("/").split("/")[-1].split("?")[0].lower()
+    parts = slug.split("-")
+    for tok in reversed(parts[-3:]):
+        c = _COUNTRY_CANON.get(tok)
+        if c:
+            return c
+    return None
+
+
+def _country_of(p) -> str | None:
+    """Страна производителя товара: поле manufacturer (apte) или хвост URL (phar)."""
+    return _country_token(getattr(p, "manufacturer", None)) or _country_from_url(
+        getattr(p, "url", None)
+    )
+
+
+def _has_conflicting_country(a, b) -> bool:
+    """True если у ОБОИХ товаров определена страна и они РАЗНЫЕ.
+
+    Разная страна происхождения = разный производитель/импорт = разный товар
+    (Talya Türkiyə глицерин ≠ Azerfarm Azərbaycan глицерин). Если у одного страна
+    неизвестна — не блокируем (консервативно, неполные данные)."""
+    ca, cb = _country_of(a), _country_of(b)
+    return bool(ca) and bool(cb) and ca != cb
+
+
 def _significant_name_tokens(name_norm: str | None) -> frozenset[str]:
     """Значащие токены name_normalized для ambiguity: len≥4, БЕЗ цифр, не noise/modifier.
 
@@ -955,6 +1101,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
+                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
+                # глицерин — разный товар, ложный 85% spread. Блок только если у
+                # обоих страна известна и различается (см. _has_conflicting_country).
+                if any(_has_conflicting_country(c, q) for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= fuzzy_threshold:
                     cluster.append(q)
@@ -1060,6 +1211,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if any(
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
+                    continue
+                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
+                # глицерин — разный товар, ложный 85% spread. Блок только если у
+                # обоих страна известна и различается (см. _has_conflicting_country).
+                if any(_has_conflicting_country(c, q) for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _SEC_THRESHOLD:
@@ -1168,6 +1324,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if any(
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
+                    continue
+                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
+                # глицерин — разный товар, ложный 85% spread. Блок только если у
+                # обоих страна известна и различается (см. _has_conflicting_country).
+                if any(_has_conflicting_country(c, q) for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _TERT_THRESHOLD:
@@ -1278,6 +1439,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if any(
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
+                    continue
+                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
+                # глицерин — разный товар, ложный 85% spread. Блок только если у
+                # обоих страна известна и различается (см. _has_conflicting_country).
+                if any(_has_conflicting_country(c, q) for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _QUART_THRESHOLD:
