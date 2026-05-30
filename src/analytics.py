@@ -327,8 +327,12 @@ def match_quality(session: Session) -> MatchQuality:
     )
 
 
-# Допуск паритета для per-SKU win/lose: цены в пределах ±0.5% считаем равными.
+# Допуск паритета для per-SKU win/lose: max(0.5% относительно, 1 qəpik абсолютно).
+# Абсолютный пол (аудит H4): 0.5% от дешёвого товара (1-2 AZN) < 1 qəpik —
+# гранулярности цены, и бакет «паритет» почти не срабатывал бы. 1 qəpik = «та же цена».
 _PARITY_EPS = 0.005
+_PARITY_ABS = 0.01  # AZN
+
 
 # Текущая цена товара: discount_price (если есть) иначе price, и только > 0.
 def _current_price(snap: PriceSnapshot | None) -> float | None:
@@ -480,10 +484,14 @@ def category_comparison(
             g["per_site"][site].append(price)
         comp_mean = sum(comp_by_site.values()) / len(comp_by_site)
         g["comp"].append(comp_mean)
-        # win/lose против среднего конкурента (та же база, что index).
-        if client_price < comp_mean * (1 - _PARITY_EPS):
+        # win/lose против среднего конкурента ЭТОГО матча (та же база, что index).
+        # NB: индекс категории — mean(comp_mean по МАТЧАМ) → взвешен по числу matched
+        # SKU (каждый матч равен), НЕ mean(per_site_avg) — одиночный SKU сайта не
+        # перекашивает индекс. per_site_avg — только для отображения колонок.
+        band = max(comp_mean * _PARITY_EPS, _PARITY_ABS)
+        if client_price < comp_mean - band:
             g["cheaper"] += 1
-        elif client_price > comp_mean * (1 + _PARITY_EPS):
+        elif client_price > comp_mean + band:
             g["pricier"] += 1
         else:
             g["parity"] += 1

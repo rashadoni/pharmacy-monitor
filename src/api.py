@@ -1525,6 +1525,11 @@ def dash_comparison(
         conf = m.confidence if m.confidence is not None else 1.0
         if not m.is_manual and conf < min_confidence:
             continue
+        # Если товар-КЛИЕНТ (pharmonline) мёртв (404) — матч бесполезен (нечего
+        # сравнивать с ценой клиента), дропаем целиком, а не показываем competitor-only
+        # строку (аудит M1; зеркалит analytics._iter_matched_prices).
+        if any(p.site == "pharmonline" and p.url_dead_at is not None for p in m.products):
+            continue
         raw_prices: dict[str, dict[str, Any]] = {}
         for p in m.products:
             # «Фантомные» товары (страница 404, помечены validate-links) — скрываем,
@@ -1964,9 +1969,7 @@ def dash_price_index(
     from src import analytics
 
     _require_site(client_site)
-    rows = analytics.price_index_by_category(
-        db, client_site=client_site, tenant_id=user.tenant_id
-    )
+    rows = analytics.price_index_by_category(db, client_site=client_site, tenant_id=user.tenant_id)
     return [
         {
             "category": getattr(r, "category", None),

@@ -1325,8 +1325,11 @@ def test_match_relink_swaps_by_url(client, tenant_user, setup_db):
     m = _make_match_with_products(s, confidence=0.8, canonical="Relinkable", products_per_site=2)
     old = next(p for p in m.products if p.site == "aptekonline")
     new = storage.Product(
-        tenant_id=1, site="aptekonline", external_id="correct-999",
-        url="https://www.aptekonline.az/product/correct-999", name="Correct Item",
+        tenant_id=1,
+        site="aptekonline",
+        external_id="correct-999",
+        url="https://www.aptekonline.az/product/correct-999",
+        name="Correct Item",
         name_normalized="correct item",
     )
     s.add(new)
@@ -1336,7 +1339,10 @@ def test_match_relink_swaps_by_url(client, tenant_user, setup_db):
     # URL с query (?lng=en) — должен резолвиться по external_id из последнего сегмента
     r = client.post(
         f"/api/v1/dash/matches/{m.id}/relink",
-        json={"site": "aptekonline", "url": "https://www.aptekonline.az/product/correct-999?lng=en"},
+        json={
+            "site": "aptekonline",
+            "url": "https://www.aptekonline.az/product/correct-999?lng=en",
+        },
     )
     assert r.status_code == 200, r.text
     s.refresh(new)
@@ -1355,8 +1361,12 @@ def test_match_relink_adds_missing_site(client, tenant_user, setup_db):
     m = _make_match_with_products(s, confidence=0.8, canonical="TwoSite", products_per_site=2)
     # кластер pharmonline+aptekonline; добавим aloe
     new = storage.Product(
-        tenant_id=1, site="aloe", external_id="aloe-add-1",
-        url="https://aloe.az/aloe-add-1/", name="Aloe Add", name_normalized="aloe add",
+        tenant_id=1,
+        site="aloe",
+        external_id="aloe-add-1",
+        url="https://aloe.az/aloe-add-1/",
+        name="Aloe Add",
+        name_normalized="aloe add",
     )
     s.add(new)
     s.commit()
@@ -1380,7 +1390,10 @@ def test_match_relink_404_unknown_url(client, tenant_user, setup_db):
     client.get(f"/auth/verify?token={token}")
     r = client.post(
         f"/api/v1/dash/matches/{m.id}/relink",
-        json={"site": "aptekonline", "url": "https://www.aptekonline.az/product/does-not-exist-xyz"},
+        json={
+            "site": "aptekonline",
+            "url": "https://www.aptekonline.az/product/does-not-exist-xyz",
+        },
     )
     assert r.status_code == 404
 
@@ -1458,12 +1471,20 @@ def test_category_comparison_tenant_isolation(client, tenant_user, setup_db):
     s.add(run)
     s.flush()
     _make_match_with_prices(
-        s, run, canonical="v1", prices={"pharmonline": 10.0, "aloe": 8.0},
-        category="vitamins", tenant_id=1,
+        s,
+        run,
+        canonical="v1",
+        prices={"pharmonline": 10.0, "aloe": 8.0},
+        category="vitamins",
+        tenant_id=1,
     )
     _make_match_with_prices(
-        s, run, canonical="x1", prices={"pharmonline": 10.0, "aloe": 8.0},
-        category="secret", tenant_id=2,
+        s,
+        run,
+        canonical="x1",
+        prices={"pharmonline": 10.0, "aloe": 8.0},
+        category="secret",
+        tenant_id=2,
     )
     token = tenants.issue_magic_token(s, tenant_user.email)
     client.get(f"/auth/verify?token={token}")
@@ -1506,7 +1527,9 @@ def test_comparison_excludes_dead_aptekonline(client, tenant_user, setup_db):
     s.add(run)
     s.flush()
     m = _make_match_with_prices(
-        s, run, canonical="phantom",
+        s,
+        run,
+        canonical="phantom",
         prices={"pharmonline": 10.0, "aptekonline": 8.0, "aloe": 9.0},
     )
     next(p for p in m.products if p.site == "aptekonline").url_dead_at = utcnow()
@@ -1538,3 +1561,46 @@ def test_comparison_hides_match_when_only_dead_competitor(client, tenant_user, s
     r = client.get("/api/v1/dash/comparison?min_sites=2")
     assert r.status_code == 200, r.text
     assert "solodead" not in [row["name"] for row in r.json()]
+
+
+def test_price_index_endpoint_200(client, tenant_user, setup_db):
+    """Регресс (аудит): /price-index 500'ил TypeError'ом (client_site= в сломанной
+    сигнатуре), а юнит-тест звал функцию напрямую → suite был зелёный. Endpoint-smoke
+    ловит весь wire-контракт: assert не-500."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    _make_match_with_prices(
+        s, run, canonical="v1", prices={"pharmonline": 10.0, "aloe": 8.0}, category="vitamins"
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/price-index")
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json(), list)
+
+
+def test_comparison_drops_match_when_client_dead(client, tenant_user, setup_db):
+    """Мёртв сам клиент (pharmonline 404) → матч дропается целиком, а не competitor-only."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    m = _make_match_with_prices(
+        s,
+        run,
+        canonical="clientdead",
+        prices={"pharmonline": 10.0, "aloe": 8.0, "aptekonline": 9.0},
+    )
+    next(p for p in m.products if p.site == "pharmonline").url_dead_at = utcnow()
+    s.commit()
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/comparison?min_sites=2")
+    assert r.status_code == 200, r.text
+    assert "clientdead" not in [row["name"] for row in r.json()]
