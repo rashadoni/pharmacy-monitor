@@ -172,15 +172,16 @@ export default function ComparisonPage() {
   return (
     <div className="space-y-4">
       <OnboardingTip
-        id="comparison-arrows-v1"
+        id="comparison-sort-v2"
         title="Как читать таблицу"
         description={
           <>
             Зелёный <span className="text-success">▼</span> = pharmonline
             (client) дешевле всех. Красный <span className="text-destructive">▲</span>{" "}
-            = конкурент дешевле, надо реагировать. Клик на ▼/▲ кнопке справа от
-            spread — открывает тренд 30 дней. Кнопка «⬇ CSV» вверху —
-            экспорт отфильтрованного.
+            = конкурент дешевле, надо реагировать.{" "}
+            <b>Клик по заголовку колонки (⇅) — сортировка</b> (повторный клик
+            меняет ▲/▼). Клик на ▼/▲ кнопке справа от spread — открывает тренд
+            30 дней. Кнопка «⬇ CSV» вверху — экспорт отфильтрованного.
           </>
         }
       />
@@ -720,9 +721,9 @@ function SortableTh({
     <th className={`px-3 py-2 font-medium ${align === "right" ? "text-right" : "text-left"}`}>
       <button
         onClick={onClick}
-        className={`inline-flex items-center gap-0.5 hover:text-foreground ${
+        className={`inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-1 hover:bg-muted hover:text-foreground ${
           align === "right" ? "flex-row-reverse" : ""
-        } ${isActive ? "text-foreground" : ""}`}
+        } ${isActive ? "text-foreground" : "text-muted-foreground"}`}
       >
         {label}
         {isActive ? (
@@ -732,7 +733,7 @@ function SortableTh({
             <ChevronDown className="h-3 w-3" />
           )
         ) : (
-          <ChevronsUpDown className="h-3 w-3 opacity-30" />
+          <ChevronsUpDown className="h-3.5 w-3.5 opacity-60" />
         )}
       </button>
     </th>
