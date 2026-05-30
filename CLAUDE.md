@@ -70,6 +70,15 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 ## Active work-in-progress
 
+**Just finished (2026-05-30, ещё позже)**: **Validation-job для «фантомных» aptekonline-товаров (страница 404)** (`src/link_validator.py`, на проде; коммит TODO):
+- Пользователь нашёл матчи где ссылка на aptekonline ведёт на 404. **Диагностика**: aptekonline JSON API (`productList`) листит товары, которых нет как страниц — они скрейпятся (**age=0!**), matched, но `/product/{url_id}` отдаёт 404. ~3-5% сматченных. Исключено: делистинг/staleness (мёртвые age=0 — фильтр по `last_seen` не поможет), баг URL (98% живые), формат `url_id` (мёртвые размазаны ~4% по форматам, чистого разделителя нет). **Единственный сигнал — реальный HTTP-чек.**
+- **`Product.url_dead_at`** (timestamp, nullable). Прод: рабочего alembic НЕТ (`alembic.ini` есть, `alembic/` нет) → колонка вручную `ALTER TABLE products ADD COLUMN IF NOT EXISTS url_dead_at TIMESTAMP`. Lightweight-миграция SQLite-only (для тестов).
+- **`src/link_validator.py`**: `classify` (404/410/451→dead; 2xx/3xx→alive; 403/429/5xx/сеть→**error НЕ трогаем** — транзиент не должен скрыть живой/воскресить мёртвый), async `check_urls` (httpx, browser UA, `trust_env=False`=direct, GET для надёжного hard-404), `apply_results`. 6 тестов (httpx MockTransport).
+- **CLI `validate-links --site aptekonline [--limit --concurrency --matched-only]`** ([src/main.py](src/main.py)).
+- **Фильтр**: `dash_comparison` ([src/api.py](src/api.py)) + `category_comparison`/`_iter_matched_prices` ([src/analytics.py](src/analytics.py)) исключают `url_dead_at` товары (мёртвый клиент → матч выпадает; мёртвый конкурент → скрыт). 4 теста.
+- **Расписание**: в Mac launchd [run-scrape.sh](infra/local/run-scrape.sh) после aptekonline-скрейпа (**Baku-IP direct, без прокси** — Hetzner забанен; residential-прокси на 3894 product-страницы сжёг бы трафик). Non-fatal.
+- Деплой: ALTER + rsync кода + API restart (verified: CLI registered, category_comparison=170). **Первый validate-links оставлен ночному Mac launchd** (по выбору юзера). 828 тестов, e2e vs реальный aptekonline ✓ ({dead, alive, alive}).
+
 **Just finished (2026-05-30, позже)**: **Matcher вариант-guard (серебро Ag + номер модели type/tip/тип N) — хирургия вместо rematch** (`src/matcher.py`, на проде; коммит TODO):
 - Пользователь нашёл ложный матч `Spiral Yunona Bio-T Ag` (серебро) ↔ `Bio-T Tip 1` (тип) — целый класс в линейках с модификациями (Юнона Био-Т: Ag/Cu380/type1/2/Super). Корень: «Ag» (2 буквы) < `_MIN_VARIANT_TOKEN_LEN=3` → игнорился; type/tip N не сверялся.
 - **`_has_conflicting_variant_marker`** ([src/matcher.py](src/matcher.py)): серебро→маркер `ag`, type/tip/тип N→`t<N>`; СИММЕТРИЧНОЕ правило (как variant_tokens/atoms) — блок при взаимно-уникальных маркерах. **Ловушка** az `ağ`=белый / `AG`=антиген обойдена: detection БЕЗ strip_accents (ğ≠g) + симметрия (односторонний `{ag}` vs `{}` НЕ блокирует, т.е. «Maska (ag)» vs «Maska» ок). type-номер 1-2 цифры+`\b` → «Cu380 type1»→{t1} (380 не зацепляется). Встроен в `_hard_conflict` + 4 прохода. 8 unit-тестов, 130 matcher-тестов.
