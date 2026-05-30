@@ -170,9 +170,22 @@ EXIT_CODE=$?
 # Non-fatal: проблема валидации не валит скрейп. (TODO: вынести в отдельный
 # launchd-таймер в другое время, чтобы бан от валидации не отравлял скрейп.)
 if [[ "${ARGS[*]}" == *aptekonline* ]]; then
-    echo "validating aptekonline links…"
-    .venv/bin/pharmacy-monitor validate-links --site aptekonline \
-        || echo "WARN: validate-links failed/aborted (non-fatal)"
+    echo "validating aptekonline links (matched-only)…"
+    # После длинного скрейпа коннект/туннель мог отвалиться — проверяем явно,
+    # иначе validate-links молча падает на DB-коннекте и метит 0 (как было до 2026-05-30).
+    if ! nc -z localhost "$LOCAL_PG_PORT" 2>/dev/null; then
+        echo "WARN: PG tunnel (:$LOCAL_PG_PORT) down before validate-links — пропуск (0 marked)"
+    else
+        # --matched-only: только товары в сравнениях (~3.9k), не все 26k (иначе не успеет).
+        .venv/bin/pharmacy-monitor validate-links --site aptekonline --matched-only
+        VL_EXIT=$?
+        case "$VL_EXIT" in
+            0) echo "validate-links OK" ;;
+            2) echo "WARN: validate-links MASS-DEAD cap (>15%) — НЕ применено, разобраться вручную" ;;
+            3) echo "WARN: validate-links circuit-breaker abort (серия 403/429 — возможен бан Baku-IP)" ;;
+            *) echo "WARN: validate-links exit=$VL_EXIT — связь/туннель/код? (0 marked, разобраться)" ;;
+        esac
+    fi
 fi
 
 echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | run-scrape.sh end (exit $EXIT_CODE) ====="
