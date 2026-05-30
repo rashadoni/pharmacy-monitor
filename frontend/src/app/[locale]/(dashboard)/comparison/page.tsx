@@ -180,7 +180,7 @@ export default function ComparisonPage() {
             (client) дешевле всех. Красный <span className="text-destructive">▲</span>{" "}
             = конкурент дешевле, надо реагировать.{" "}
             <b>Клик по заголовку колонки (⇅) — сортировка</b> (повторный клик
-            меняет ▲/▼). Клик на ▼/▲ кнопке справа от spread — открывает тренд
+            меняет ▲/▼). Клик на ▼/▲ кнопке справа от «Разницы» — открывает тренд
             30 дней. Кнопка «⬇ CSV» вверху — экспорт отфильтрованного.
           </>
         }
@@ -234,19 +234,19 @@ export default function ComparisonPage() {
           title="Сортировка"
           aria-label="Сортировка"
         >
-          <optgroup label="Сортировка">
-            <option value="spread:desc">↕ Spread ↓</option>
-            <option value="spread:asc">↕ Spread ↑</option>
-            <option value="name:asc">↕ Название А–Я</option>
-            <option value="name:desc">↕ Название Я–А</option>
-            <option value="brand:asc">↕ Бренд А–Я</option>
-            <option value="brand:desc">↕ Бренд Я–А</option>
-            <option value="pharmonline:asc">↕ pharmonline ↑ (дешёвые)</option>
-            <option value="pharmonline:desc">↕ pharmonline ↓</option>
-            <option value="aptekonline:asc">↕ aptekonline ↑ (дешёвые)</option>
-            <option value="aptekonline:desc">↕ aptekonline ↓</option>
-            <option value="aloe:asc">↕ aloe ↑ (дешёвые)</option>
-            <option value="aloe:desc">↕ aloe ↓</option>
+          <optgroup label={t("sort_label")}>
+            <option value="spread:desc">{t("th_spread")} ↓</option>
+            <option value="spread:asc">{t("th_spread")} ↑</option>
+            <option value="name:asc">{t("th_name")} ↑</option>
+            <option value="name:desc">{t("th_name")} ↓</option>
+            <option value="brand:asc">{t("th_brand")} ↑</option>
+            <option value="brand:desc">{t("th_brand")} ↓</option>
+            <option value="pharmonline:asc">pharmonline ↑</option>
+            <option value="pharmonline:desc">pharmonline ↓</option>
+            <option value="aptekonline:asc">aptekonline ↑</option>
+            <option value="aptekonline:desc">aptekonline ↓</option>
+            <option value="aloe:asc">aloe ↑</option>
+            <option value="aloe:desc">aloe ↓</option>
           </optgroup>
         </select>
       </div>
@@ -542,7 +542,7 @@ function ComparisonCard({
         {row.needs_review && (
           <span
             className="text-amber-500 text-xs leading-none"
-            title="Подозрительный spread ≥50% — проверить матч"
+            title={t("suspicious_spread")}
             aria-label="Требует проверки"
           >
             ⚠

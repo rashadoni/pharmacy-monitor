@@ -67,6 +67,7 @@
     "card_meta": "{brand} · {sites} sites · spread {spread}",
     "page_title": "Price comparison",
     "page_subtitle": "Cross-site matched products. Green — lowest price, red — highest. Sorted by |spread| desc.",
+    "sort_label": "Sort",
     "export_csv_title": "Download filtered list as CSV",
     "no_data": "no data",
     "load_error": "load error",
