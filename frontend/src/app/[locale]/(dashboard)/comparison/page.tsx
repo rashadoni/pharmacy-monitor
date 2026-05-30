@@ -223,6 +223,32 @@ export default function ComparisonPage() {
           <option value={2}>{t("min_sites_2")}</option>
           <option value={1}>{t("min_sites_1")}</option>
         </select>
+        <select
+          value={`${sort.key}:${sort.dir}`}
+          onChange={(e) => {
+            const [k, d] = e.target.value.split(":");
+            setSort({ key: k as SortKey, dir: d as "asc" | "desc" });
+          }}
+          className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+          data-testid="sort-select"
+          title="Сортировка"
+          aria-label="Сортировка"
+        >
+          <optgroup label="Сортировка">
+            <option value="spread:desc">↕ Spread ↓</option>
+            <option value="spread:asc">↕ Spread ↑</option>
+            <option value="name:asc">↕ Название А–Я</option>
+            <option value="name:desc">↕ Название Я–А</option>
+            <option value="brand:asc">↕ Бренд А–Я</option>
+            <option value="brand:desc">↕ Бренд Я–А</option>
+            <option value="pharmonline:asc">↕ pharmonline ↑ (дешёвые)</option>
+            <option value="pharmonline:desc">↕ pharmonline ↓</option>
+            <option value="aptekonline:asc">↕ aptekonline ↑ (дешёвые)</option>
+            <option value="aptekonline:desc">↕ aptekonline ↓</option>
+            <option value="aloe:asc">↕ aloe ↑ (дешёвые)</option>
+            <option value="aloe:desc">↕ aloe ↓</option>
+          </optgroup>
+        </select>
       </div>
 
       {/* Drill-down filter chip (из /category-comparison) */}
