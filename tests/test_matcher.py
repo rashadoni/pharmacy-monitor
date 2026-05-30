@@ -1560,20 +1560,22 @@ class TestVariantMarkerGuard:
 
     def test_extract_silver_and_type(self):
         assert _variant_markers("Spiral Yunona Bio-T Ag") == frozenset({"ag"})
-        assert _variant_markers("Spiral Yunona Bio-T Cu380 type1") == frozenset({"t1"})
-        assert _variant_markers("Spiral Yunona Bio T Cu 380+Ag 2 tip") == frozenset({"ag", "t2"})
+        assert _variant_markers("Spiral Yunona Bio-T Cu380 type1") == frozenset({"t1", "cu380"})
+        assert _variant_markers("Spiral Yunona Bio T Cu 380+Ag 2 tip") == frozenset(
+            {"ag", "t2", "cu380"}
+        )
         assert _variant_markers('Spiral "Yunona" Bio-T Tip 1') == frozenset({"t1"})
 
-    def test_no_type_pollution_from_copper(self):
-        # «Cu380 type1» → только t1; «380» (медь) НЕ становится t380.
-        assert _variant_markers("Bio-T Cu380 type1") == frozenset({"t1"})
+    def test_copper_not_type_pollution(self):
+        # «Cu380 type1» → t1 + cu380 (медь — свой маркер), а НЕ ложный t380.
+        m = _variant_markers("Bio-T Cu380 type1")
+        assert m == frozenset({"t1", "cu380"})
+        assert "t380" not in m
 
     def test_silver_vs_type_blocks(self):
         # Реальный кейс: Bio-T Ag (серебро) ≠ Bio-T Tip 1 (тип) → блок.
         assert (
-            _has_conflicting_variant_marker(
-                "Spiral Yunona Bio-T Ag", 'Spiral "Yunona" Bio-T Tip 1'
-            )
+            _has_conflicting_variant_marker("Spiral Yunona Bio-T Ag", 'Spiral "Yunona" Bio-T Tip 1')
             is True
         )
 
@@ -1588,15 +1590,37 @@ class TestVariantMarkerGuard:
     def test_az_white_antigen_no_false_block(self):
         # ЛОВУШКА: «ağ»(белый)/«AG»(антиген) не дают ложный блок — symmetric спасает.
         assert (
-            _has_conflicting_variant_marker(
-                "Fitoton ağ gil (ag gil) 150 qr", "Fitoton gil 150 qr"
-            )
+            _has_conflicting_variant_marker("Fitoton ağ gil (ag gil) 150 qr", "Fitoton gil 150 qr")
             is False
         )
         assert _has_conflicting_variant_marker("Maska (ag) №1", "Maska tibbi №1") is False
 
     def test_no_markers_no_block(self):
         assert _has_conflicting_variant_marker("Aspirin 500 N20", "Aspirin 500 N10") is False
+
+    def test_no_overblock_type_inside_word(self):
+        # Левая \b: proTYPE/genoTYPE/seroTYPE — НЕ номер модели (аудит-баг).
+        assert _variant_markers("Prototype 5 serum") == frozenset()
+        assert _variant_markers("Hepatit genotype 1") == frozenset()
+        assert _has_conflicting_variant_marker("Prototype 5 serum", "Prototype 3 serum") is False
+
+    def test_no_overblock_antigen(self):
+        # «AG» в антиген-тесте ≠ серебро (аудит-баг).
+        assert _variant_markers("COVID-19 AG Test") == frozenset()
+        assert _has_conflicting_variant_marker("COVID-19 AG Test", "COVID-19 Test Tip 2") is False
+
+    def test_silver_word_still_marks(self):
+        # Явное слово «gümüş» — всегда серебро (даже без голого «ag»).
+        assert _variant_markers("gümüş krem") == frozenset({"ag"})
+
+    def test_hyphen_type_blocks(self):
+        # «Tip-1» (дефис) теперь ловится (был under-block).
+        assert _has_conflicting_variant_marker("Bio Tip-1", "Bio Tip-2") is True
+
+    def test_copper_marker(self):
+        assert _variant_markers("Bio-T Cu380") == frozenset({"cu380"})
+        assert _has_conflicting_variant_marker("Bio-T Cu375", "Bio-T Cu380") is True
+        assert _has_conflicting_variant_marker("Bio-T Ag", "Bio-T Cu380") is True
 
 
 def test_variant_marker_blocks_silver_vs_type(db_session):
@@ -1623,6 +1647,41 @@ def test_variant_marker_blocks_silver_vs_type(db_session):
     s.refresh(a)
     s.refresh(b)
     assert not (a.canonical_id and b.canonical_id and a.canonical_id == b.canonical_id)
+
+
+def test_find_conflicting_clusters(db_session):
+    """revalidate: находит существующие авто-кластеры с конфликтной cross-site парой,
+    не трогает чистые и ручные (is_manual)."""
+    s = db_session
+
+    def _clustered(match, site, ext, name, nn):
+        p = _make_product(s, site=site, external_id=ext, name=name, name_normalized=nn)
+        p.canonical_id = match.id
+        return p
+
+    m_bad = storage.Match(canonical_name="bad", confidence=0.9, is_manual=False)
+    m_ok = storage.Match(canonical_name="ok", confidence=1.0, is_manual=False)
+    m_manual = storage.Match(canonical_name="man", confidence=0.9, is_manual=True)
+    s.add_all([m_bad, m_ok, m_manual])
+    s.flush()
+    # bad: Bio-T Ag (серебро) ↔ Bio-T Tip 1 (тип) — конфликт variant_marker
+    _clustered(m_bad, "pharmonline", "ag", "Spiral Yunona Bio-T Ag", "spiral yunona bio t ag")
+    _clustered(
+        m_bad, "aptekonline", "t1", 'Spiral "Yunona" Bio-T Tip 1', "spiral yunona bio t tip 1"
+    )
+    # ok: одинаковый товар — без конфликта
+    _clustered(m_ok, "pharmonline", "ok1", "Aspirin 500 N20", "aspirin 500")
+    _clustered(m_ok, "aloe", "ok2", "Aspirin 500 N20", "aspirin 500")
+    # manual: тоже конфликт, но is_manual → НЕ трогаем
+    _clustered(m_manual, "pharmonline", "mn1", "Bio-T Ag", "bio t ag")
+    _clustered(m_manual, "aptekonline", "mn2", "Bio-T Tip 2", "bio t tip 2")
+    s.commit()
+
+    flagged = matcher.find_conflicting_clusters(s)
+    ids = {m.id for m, _, _ in flagged}
+    assert m_bad.id in ids
+    assert m_ok.id not in ids
+    assert m_manual.id not in ids  # ручной матч не перепроверяется
 
 
 def test_dimension_blocks_different_size(db_session):

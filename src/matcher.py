@@ -53,8 +53,6 @@ _PHARMA_MODIFIERS: frozenset[str] = frozenset(
         "forte",
         "neo",
         "extra",  # усиленные/другие формулы
-        "super",
-        "multi",  # Yunona Bio-T Super/Multi ≠ базовый; multivitamin Multi ≠ single
         "sr",
         "mr",
         "xr",
@@ -494,18 +492,32 @@ def _has_conflicting_variant_atoms(name_raw_a: str, name_raw_b: str) -> bool:
 # — блок только при взаимно-уникальных маркерах. «Maska (ag)»{ag} vs «Maska»{} →
 # НЕ блок (односторонний = неполные данные). type-номер 1-2 цифры + \b: «Cu380
 # type1»→{t1} (380 не зацепляется), «2 tip»/«type1»/«Tip 2» — все ловятся.
-_SILVER_RE = re.compile(r"\bag\b|g[üu]m[üu][sş]|silver|серебро", re.IGNORECASE)
-_TYPE_FWD_RE = re.compile(r"(?:tip|type|тип)\s*(\d{1,2})\b", re.IGNORECASE)
-_TYPE_REV_RE = re.compile(r"\b(\d{1,2})\s*(?:tip|type|тип)\b", re.IGNORECASE)
+# Серебро: явные слова (gümüş/silver/серебро) — всегда; голый «ag» — только ВНЕ
+# антиген-контекста (аудит: «COVID-19 AG Test» = антиген-тест, не серебро).
+_SILVER_EXPLICIT_RE = re.compile(r"g[üu]m[üu][sş]|silver|серебро", re.IGNORECASE)
+_SILVER_AG_RE = re.compile(r"\bag\b", re.IGNORECASE)
+_ANTIGEN_RE = re.compile(r"\b(?:antigen|test|rapid)\b", re.IGNORECASE)
+# Номер модели type/tip/тип N: ЛЕВАЯ \b (иначе proTYPE/genoTYPE/seroTYPE → ложный
+# маркер), [\s-]* (ловим «Tip-1»), 1-2 цифры (380 = медь Cu, не номер типа).
+_TYPE_FWD_RE = re.compile(r"\b(?:tip|type|тип)[\s-]*(\d{1,2})\b", re.IGNORECASE)
+_TYPE_REV_RE = re.compile(r"\b(\d{1,2})[\s-]*(?:tip|type|тип)\b", re.IGNORECASE)
+# Медь Cu<N> — симметричный маркер (Bio-T Cu380 ≠ Cu375 ≠ Ag).
+_COPPER_RE = re.compile(r"\bcu\s*(\d{2,4})\b", re.IGNORECASE)
 
 
 def _variant_markers(raw_name: str) -> frozenset[str]:
-    """Маркеры модификации из RAW-имени (БЕЗ strip_accents): серебро → 'ag',
-    номер модели type/tip/тип N → 't<N>'. Ловушка ağ/AG — см. блок-коммент выше."""
+    """Маркеры модификации из RAW (БЕЗ strip_accents): серебро→'ag', медь→'cuNNN',
+    номер модели type/tip/тип N→'t<N>'. Симметричное правило в
+    `_has_conflicting_variant_marker`. Антиген-контекст (test/rapid/antigen) гасит
+    голый «ag» (COVID AG Test = антиген, не серебро); proTYPE — левая \\b в regex."""
     low = (raw_name or "").lower()
     markers: set[str] = set()
-    if _SILVER_RE.search(low):
+    if _SILVER_EXPLICIT_RE.search(low) or (
+        _SILVER_AG_RE.search(low) and not _ANTIGEN_RE.search(low)
+    ):
         markers.add("ag")
+    for m in _COPPER_RE.finditer(low):
+        markers.add("cu" + m.group(1))
     for rx in (_TYPE_FWD_RE, _TYPE_REV_RE):
         for m in rx.finditer(low):
             markers.add("t" + m.group(1))
@@ -794,6 +806,54 @@ def _hard_conflict(a, b) -> bool:
         or _has_conflicting_strength_number(ar, br)
         or _has_conflicting_variant_marker(ar, br)
     )
+
+
+def _pairwise_spec_conflict(a, b) -> bool:
+    """Высокоточные СИММЕТРИЧНЫЕ guard'ы для РЕТРО-перепроверки (revalidate): серебро/
+    тип/медь, одиночный вариант-атом, многозначная сила, габариты, %. Все требуют
+    конфликтующего сигнала с ОБЕИХ сторон → near-zero false-positive на одном товаре.
+
+    НАМЕРЕННО уже, чем проходы: НЕ включаем country/form/modifier/vtokens/series —
+    они имеют false-positive на verbose-vs-terse / параллельный-импорт паре ОДНОГО
+    товара (Novalans с/без «(Kapsulalar)», бренд с разной страной, məhlul/şərbət),
+    и авто-dissolve таких кластеров СЛОМАЛ БЫ верные матчи (проверено на прод-дампе:
+    5×country + 1×form — все ложные; только 2×vmarker реальные). Для НОВОЙ
+    кластеризации полный набор ок (greedy + др. сигналы компенсируют), но для
+    необратимого ретро-разрыва берём только надёжные дискриминаторы."""
+    ar, br = a.name or "", b.name or ""
+    return (
+        _has_conflicting_variant_marker(ar, br)
+        or _has_conflicting_variant_atoms(ar, br)
+        or _has_conflicting_strength_number(ar, br)
+        or _has_conflicting_dimensions(ar, br)
+        or _has_conflicting_concentration(ar, br)
+    )
+
+
+def find_conflicting_clusters(session: Session) -> list:
+    """Авто-Match'и, где хоть одна cross-site пара членов конфликтует по ТЕКУЩИМ
+    guard'ам. Возвращает [(match, product_a, product_b)] — первая конфликтная пара
+    на кластер. Корень «whack-a-mole»: инкрементальный матчинг переиспользует
+    canonical_id и НЕ перепроверяет старые кластеры; этот хелпер питает точечный
+    `rematch --revalidate` (split-only, без 78% churn полного --reset).
+
+    `_pairwise_spec_conflict` использует только RAW-имя (серебро/тип/медь/сила/
+    габариты/%), поэтому не зависит от (возможно устаревшей) stored name_normalized."""
+    import itertools
+
+    from sqlalchemy.orm import selectinload
+
+    matches = session.scalars(
+        select(Match).where(Match.is_manual.is_(False)).options(selectinload(Match.products))
+    ).all()
+    flagged = []
+    for m in matches:
+        prods = list(m.products)
+        for a, b in itertools.combinations(prods, 2):
+            if a.site != b.site and _pairwise_spec_conflict(a, b):
+                flagged.append((m, a, b))
+                break
+    return flagged
 
 
 def _build_word_freq(products: list) -> dict[str, int]:
@@ -1209,8 +1269,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
                 if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
                     continue
-                # Вариант-маркеры: Ag(серебро) ≠ без серебра, type1 ≠ type2, Tip1 ≠ Tip2.
-                if any(_has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster):
+                # Вариант-маркеры (СИММЕТРИЧНО, взаимно-уникальные): Ag↔Tip1, type1↔type2,
+                # Ag↔Cu380. Односторонний (Ag vs без маркера) НЕ блокирует.
+                if any(
+                    _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
+                ):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= fuzzy_threshold:
@@ -1329,8 +1392,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
                 if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
                     continue
-                # Вариант-маркеры: Ag(серебро) ≠ без серебра, type1 ≠ type2, Tip1 ≠ Tip2.
-                if any(_has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster):
+                # Вариант-маркеры (СИММЕТРИЧНО, взаимно-уникальные): Ag↔Tip1, type1↔type2,
+                # Ag↔Cu380. Односторонний (Ag vs без маркера) НЕ блокирует.
+                if any(
+                    _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
+                ):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _SEC_THRESHOLD:
@@ -1451,8 +1517,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
                 if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
                     continue
-                # Вариант-маркеры: Ag(серебро) ≠ без серебра, type1 ≠ type2, Tip1 ≠ Tip2.
-                if any(_has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster):
+                # Вариант-маркеры (СИММЕТРИЧНО, взаимно-уникальные): Ag↔Tip1, type1↔type2,
+                # Ag↔Cu380. Односторонний (Ag vs без маркера) НЕ блокирует.
+                if any(
+                    _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
+                ):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _TERT_THRESHOLD:
@@ -1575,8 +1644,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
                 if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
                     continue
-                # Вариант-маркеры: Ag(серебро) ≠ без серебра, type1 ≠ type2, Tip1 ≠ Tip2.
-                if any(_has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster):
+                # Вариант-маркеры (СИММЕТРИЧНО, взаимно-уникальные): Ag↔Tip1, type1↔type2,
+                # Ag↔Cu380. Односторонний (Ag vs без маркера) НЕ блокирует.
+                if any(
+                    _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
+                ):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _QUART_THRESHOLD:
