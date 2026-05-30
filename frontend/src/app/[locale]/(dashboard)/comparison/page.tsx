@@ -15,6 +15,7 @@ import { TableSkeleton } from "@/components/skeleton";
 
 const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
 type SiteName = typeof SITES[number];
+type SortKey = "name" | "brand" | "spread" | SiteName;
 
 export default function ComparisonPage() {
   const t = useTranslations("comparison");
@@ -29,6 +30,10 @@ export default function ComparisonPage() {
   const [diffOnly, setDiffOnly] = useState(false);
   const [withAloe, setWithAloe] = useState(false);
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({
+    key: "spread",
+    dir: "desc",
+  });
   const queryClient = useQueryClient();
 
   const { data, isLoading, error, isFetching } = useQuery({
@@ -41,20 +46,40 @@ export default function ComparisonPage() {
       }),
   });
 
-  // Client-side filters + default sort (P1.2 PO Audit 2026-05-17)
-  // По умолчанию: сверху строки с наибольшим |spread_pct| — это самое полезное
-  // для PO (где конкурент бьёт по цене / где мы можем поднять).
+  // Client-side filters + user sort. Дефолт: |spread_pct| desc — самое полезное
+  // для PO (где конкурент бьёт по цене / где можем поднять). Клик по заголовку
+  // колонки меняет ключ/направление сортировки.
   const filtered = useMemo(() => {
     if (!data) return data;
-    const filtered = data.filter((r) => {
+    const rows = data.filter((r) => {
       if (diffOnly && (!r.spread_pct || r.spread_pct < 0.5)) return false;
       if (withAloe && !r.prices["aloe"]) return false;
       return true;
     });
-    return [...filtered].sort(
-      (a, b) => Math.abs(b.spread_pct ?? 0) - Math.abs(a.spread_pct ?? 0),
+    const dir = sort.dir === "asc" ? 1 : -1;
+    return [...rows].sort((a, b) => {
+      if (sort.key === "name") return (a.name ?? "").localeCompare(b.name ?? "") * dir;
+      if (sort.key === "brand")
+        return (a.brand ?? "").localeCompare(b.brand ?? "") * dir;
+      if (sort.key === "spread")
+        return (Math.abs(a.spread_pct ?? 0) - Math.abs(b.spread_pct ?? 0)) * dir;
+      // per-site price: отсутствующая цена всегда внизу, независимо от dir
+      const av = a.prices[sort.key]?.price;
+      const bv = b.prices[sort.key]?.price;
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      return (av - bv) * dir;
+    });
+  }, [data, diffOnly, withAloe, sort]);
+
+  function toggleSort(key: SortKey) {
+    setSort((cur) =>
+      cur.key === key
+        ? { key, dir: cur.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "name" || key === "brand" ? "asc" : "desc" },
     );
-  }, [data, diffOnly, withAloe]);
+  }
 
   // P1.2: auto-collapse колонок без данных в текущем срезе. Например когда
   // включён фильтр «Только различия» — почти все строки могут не иметь aloe.
@@ -235,7 +260,7 @@ export default function ComparisonPage() {
 
       {/* Mobile: card list */}
       <div className="md:hidden space-y-2" data-testid="mobile-list">
-        {data?.map((row) => (
+        {filtered?.map((row) => (
           <ComparisonCard key={row.canonical_id} row={row} onReject={handleReject} />
         ))}
       </div>
@@ -245,25 +270,18 @@ export default function ComparisonPage() {
         <table className="w-full text-sm">
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
-              <th className="px-3 py-2 text-left">{t("th_name")}</th>
-              {/* Bug fix 2026-05-28: TBODY row рендерил отдельную колонку
-                  с brand — но в THEAD её не было, и из-за этого визуальный
-                  alignment всех price-колонок съезжал на 1 (например
-                  pharmonline price оказывалась под "aptekonline" header).
-                  Добавляем явный th_brand. */}
-              <th className="px-3 py-2 text-left">{t("th_brand")}</th>
+              <SortableTh label={t("th_name")} col="name" active={sort} onClick={() => toggleSort("name")} align="left" />
+              <SortableTh label={t("th_brand")} col="brand" active={sort} onClick={() => toggleSort("brand")} align="left" />
               {visibleSites.map((s) => (
-                <th key={s} className="px-3 py-2 text-right">
-                  {s}
-                </th>
+                <SortableTh key={s} label={s} col={s} active={sort} onClick={() => toggleSort(s)} align="right" />
               ))}
-              <th className="px-3 py-2 text-right">{t("th_spread")}</th>
+              <SortableTh label={t("th_spread")} col="spread" active={sort} onClick={() => toggleSort("spread")} align="right" />
               <th className="px-3 py-2 w-10"></th>
               <th className="px-3 py-2 w-10"></th>
             </tr>
           </thead>
           <tbody>
-            {data?.map((row) => (
+            {filtered?.map((row) => (
               <ComparisonRowDesktop
                 key={row.canonical_id}
                 row={row}
@@ -281,9 +299,9 @@ export default function ComparisonPage() {
         </table>
       </div>
 
-      {data && data.length > 0 && (
+      {filtered && filtered.length > 0 && (
         <div className="text-xs text-muted-foreground text-center" data-testid="result-count">
-          {t("result_count", { count: data.length })}
+          {t("result_count", { count: filtered.length })}
         </div>
       )}
     </div>
@@ -680,5 +698,40 @@ function RelinkPanel({ row }: { row: ComparisonRow }) {
         })}
       </div>
     </div>
+  );
+}
+
+/** Кликабельный заголовок-сортировщик для таблицы сравнения (как в category-comparison). */
+function SortableTh({
+  label,
+  col,
+  active,
+  onClick,
+  align,
+}: {
+  label: string;
+  col: SortKey;
+  active: { key: SortKey; dir: "asc" | "desc" };
+  onClick: () => void;
+  align: "left" | "right";
+}) {
+  const isActive = active.key === col;
+  return (
+    <th className={`px-3 py-2 font-medium ${align === "right" ? "text-right" : "text-left"}`}>
+      <button
+        onClick={onClick}
+        className={`inline-flex items-center gap-0.5 hover:text-foreground ${
+          align === "right" ? "flex-row-reverse" : ""
+        } ${isActive ? "text-foreground" : ""}`}
+      >
+        {label}
+        {isActive &&
+          (active.dir === "asc" ? (
+            <ChevronUp className="h-3 w-3" />
+          ) : (
+            <ChevronDown className="h-3 w-3" />
+          ))}
+      </button>
+    </th>
   );
 }
