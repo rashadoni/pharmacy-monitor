@@ -84,6 +84,7 @@
     "suspicious_spread": "Şübhəli fərq ≥50% — uyğunluğu yoxlayın",
     "needs_review_aria": "Yoxlanma tələb edir",
     "reject_tooltip": "Səhv uyğunluq kimi rədd et",
+    "needs_review_tooltip": "Yoxlama tələb edir",
     "sites_spread": "{n} sayt · fərq",
     "relink_hint": "Uyğunluq səhvdir? Düzgün məhsulun keçidini yapışdırın:",
     "relink_placeholder": "https://… məhsul keçidi",

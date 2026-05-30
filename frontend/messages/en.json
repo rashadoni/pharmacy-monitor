@@ -84,6 +84,7 @@
     "suspicious_spread": "Suspicious spread ≥50% — verify match",
     "needs_review_aria": "Needs review",
     "reject_tooltip": "Reject as false match",
+    "needs_review_tooltip": "Needs review",
     "sites_spread": "{n} sites · spread",
     "relink_hint": "Wrong match? Paste the URL of the correct product for that site:",
     "relink_placeholder": "https://… product link",

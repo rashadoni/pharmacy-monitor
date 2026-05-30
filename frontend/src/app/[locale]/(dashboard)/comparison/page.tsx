@@ -231,8 +231,8 @@ export default function ComparisonPage() {
           }}
           className="rounded-md border border-input bg-background px-3 py-2 text-sm"
           data-testid="sort-select"
-          title="Сортировка"
-          aria-label="Сортировка"
+          title={t("sort_label")}
+          aria-label={t("sort_label")}
         >
           <optgroup label={t("sort_label")}>
             <option value="spread:desc">{t("th_spread")} ↓</option>
@@ -532,7 +532,7 @@ function ComparisonCard({
       <button
         onClick={() => onReject(row)}
         className="absolute top-2 right-2 text-muted-foreground hover:text-destructive p-1"
-        title="Отвергнуть"
+        title={t("reject_tooltip")}
         data-testid={`reject-mobile-${row.canonical_id}`}
       >
         <X className="h-4 w-4" />
@@ -543,7 +543,7 @@ function ComparisonCard({
           <span
             className="text-amber-500 text-xs leading-none"
             title={t("suspicious_spread")}
-            aria-label="Требует проверки"
+            aria-label={t("needs_review_tooltip")}
           >
             ⚠
           </span>
