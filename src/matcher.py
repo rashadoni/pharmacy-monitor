@@ -53,6 +53,8 @@ _PHARMA_MODIFIERS: frozenset[str] = frozenset(
         "forte",
         "neo",
         "extra",  # усиленные/другие формулы
+        "super",
+        "multi",  # Yunona Bio-T Super/Multi ≠ базовый; multivitamin Multi ≠ single
         "sr",
         "mr",
         "xr",
