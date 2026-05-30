@@ -68,6 +68,8 @@
     "page_title": "Qiymət müqayisəsi",
     "page_subtitle": "Saytlar arası uyğunlaşdırılmış məhsullar. Yaşıl — ən aşağı, qırmızı — ən yüksək qiymət.",
     "sort_label": "Sıralama",
+    "how_to_read_title": "Cədvəli necə oxumaq",
+    "how_to_read": "Yaşıl <green>▼</green> = pharmonline (müştəri) ən ucuz. Qırmızı <red>▲</red> = rəqib daha ucuz, reaksiya lazımdır. <b>Sütun başlığına klik — sıralama</b> (təkrar klik ▲/▼ dəyişir). «Fərq»in sağındakı ▼/▲ düyməsi — 30 günlük trend açır. Yuxarıdakı «⬇ CSV» düyməsi — filtrlənmiş siyahını ixrac edir.",
     "export_csv_title": "Süzülmüş siyahını CSV kimi endirin",
     "no_data": "məlumat yoxdur",
     "load_error": "yükləmə xətası",

@@ -68,6 +68,8 @@
     "page_title": "Price comparison",
     "page_subtitle": "Cross-site matched products. Green — lowest price, red — highest. Sorted by |spread| desc.",
     "sort_label": "Sort",
+    "how_to_read_title": "How to read the table",
+    "how_to_read": "Green <green>▼</green> = pharmonline (client) is cheapest. Red <red>▲</red> = a competitor is cheaper — act. <b>Click a column header — sort</b> (click again toggles ▲/▼). The ▼/▲ button right of «Spread» opens a 30-day trend. The «⬇ CSV» button up top exports the filtered list.",
     "export_csv_title": "Download filtered list as CSV",
     "no_data": "no data",
     "load_error": "load error",

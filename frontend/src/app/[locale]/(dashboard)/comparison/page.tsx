@@ -173,17 +173,12 @@ export default function ComparisonPage() {
     <div className="space-y-4">
       <OnboardingTip
         id="comparison-sort-v2"
-        title="Как читать таблицу"
-        description={
-          <>
-            Зелёный <span className="text-success">▼</span> = pharmonline
-            (client) дешевле всех. Красный <span className="text-destructive">▲</span>{" "}
-            = конкурент дешевле, надо реагировать.{" "}
-            <b>Клик по заголовку колонки (⇅) — сортировка</b> (повторный клик
-            меняет ▲/▼). Клик на ▼/▲ кнопке справа от «Разницы» — открывает тренд
-            30 дней. Кнопка «⬇ CSV» вверху — экспорт отфильтрованного.
-          </>
-        }
+        title={t("how_to_read_title")}
+        description={t.rich("how_to_read", {
+          green: (chunks) => <span className="text-success">{chunks}</span>,
+          red: (chunks) => <span className="text-destructive">{chunks}</span>,
+          b: (chunks) => <b>{chunks}</b>,
+        })}
       />
 
       <div className="flex items-start justify-between gap-3">
