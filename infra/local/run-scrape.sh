@@ -162,13 +162,17 @@ EXIT_CODE=$?
 
 # ── Validate aptekonline links (фантомные товары: страница 404) ──────────────
 # aptekonline JSON API листит товары без живой страницы (в каталоге, но 404).
-# Они скрейпятся/matched (age=0), но ссылка мёртвая. HTTP-чек URL с Baku-IP
-# (прямой, без прокси — Hetzner-IP забанен) помечает 404 (Product.url_dead_at);
-# comparison их скрывает. Non-fatal: проблема валидации не валит скрейп.
+# Они скрейпятся/matched (age=0), но ссылка мёртвая → HEAD-чек URL с Baku-IP
+# помечает 404 (Product.url_dead_at), comparison их скрывает.
+# АНТИ-БАН (аудит): команда сама rate-limited (~2 req/s + джиттер, HEAD не GET),
+# с circuit-breaker (серия 403/429 → abort, не углубляем бан) и mass-dead cap
+# (смена URL-схемы не обнулит comparison). ~30 мин на ~3894 URL — ок для 3×/нед.
+# Non-fatal: проблема валидации не валит скрейп. (TODO: вынести в отдельный
+# launchd-таймер в другое время, чтобы бан от валидации не отравлял скрейп.)
 if [[ "${ARGS[*]}" == *aptekonline* ]]; then
     echo "validating aptekonline links…"
     .venv/bin/pharmacy-monitor validate-links --site aptekonline \
-        || echo "WARN: validate-links failed (non-fatal)"
+        || echo "WARN: validate-links failed/aborted (non-fatal)"
 fi
 
 echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | run-scrape.sh end (exit $EXIT_CODE) ====="

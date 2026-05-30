@@ -31,9 +31,10 @@ def _client(routes):
 def test_check_urls_mixed():
     client = _client({"/a": 200, "/b": 404, "/c": 500})
     items = [(1, "http://x/a"), (2, "http://x/b"), (3, "http://x/c")]
-    results = asyncio.run(link_validator.check_urls(items, client=client))
+    results, meta = asyncio.run(link_validator.check_urls(items, client=client, rate_per_sec=0))
     asyncio.run(client.aclose())
     assert results == {1: "alive", 2: "dead", 3: "error"}
+    assert meta == {"checked": 3, "aborted": False}
 
 
 def test_check_urls_network_error():
@@ -41,19 +42,81 @@ def test_check_urls_network_error():
         raise httpx.ConnectError("boom")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    results = asyncio.run(link_validator.check_urls([(1, "http://x/a")], client=client))
+    results, _ = asyncio.run(
+        link_validator.check_urls([(1, "http://x/a")], client=client, rate_per_sec=0)
+    )
     asyncio.run(client.aclose())
     assert results == {1: "error"}
 
 
 def test_check_urls_empty():
-    assert asyncio.run(link_validator.check_urls([])) == {}
+    results, meta = asyncio.run(link_validator.check_urls([]))
+    assert results == {} and meta["checked"] == 0
+
+
+def test_check_urls_circuit_breaker_aborts():
+    """Серия 'error' (403=бан-сигнал) → circuit-breaker прерывает прогон."""
+
+    def handler(request):
+        return httpx.Response(403)  # все error
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    items = [(i, f"http://x/{i}") for i in range(30)]
+    results, meta = asyncio.run(
+        link_validator.check_urls(
+            items, client=client, concurrency=1, rate_per_sec=0, circuit_breaker=5
+        )
+    )
+    asyncio.run(client.aclose())
+    assert meta["aborted"] is True
+    assert len(results) < 30  # оставшиеся НЕ дёрнуты (не углубляем бан)
+
+
+def test_check_urls_head_fallback_to_get():
+    """HEAD 405 (не поддержан) → fallback GET → честный статус."""
+
+    def handler(request):
+        return httpx.Response(405 if request.method == "HEAD" else 404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    results, _ = asyncio.run(
+        link_validator.check_urls([(1, "http://x/a")], client=client, rate_per_sec=0)
+    )
+    asyncio.run(client.aclose())
+    assert results == {1: "dead"}  # HEAD 405 → GET 404 → dead
+
+
+def test_check_urls_no_get_on_ban_code():
+    """HEAD 403 (бан) НЕ добивается GET'ом — только error."""
+    seen = {"methods": []}
+
+    def handler(request):
+        seen["methods"].append(request.method)
+        return httpx.Response(403)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    results, _ = asyncio.run(
+        link_validator.check_urls([(1, "http://x/a")], client=client, rate_per_sec=0)
+    )
+    asyncio.run(client.aclose())
+    assert results == {1: "error"}
+    assert seen["methods"] == ["HEAD"]  # GET НЕ делался
+
+
+def test_dead_fraction():
+    assert link_validator.dead_fraction({}) == 0.0
+    assert link_validator.dead_fraction({1: "dead", 2: "alive", 3: "alive", 4: "dead"}) == 0.5
+    assert link_validator.dead_fraction({1: "alive"}) == 0.0
 
 
 def _mk(s, ext, url_dead_at=None):
     p = storage.Product(
-        site="aptekonline", external_id=ext, url=f"http://x/{ext}",
-        name=ext, name_normalized=ext.lower(), url_dead_at=url_dead_at,
+        site="aptekonline",
+        external_id=ext,
+        url=f"http://x/{ext}",
+        name=ext,
+        name_normalized=ext.lower(),
+        url_dead_at=url_dead_at,
     )
     s.add(p)
     s.flush()

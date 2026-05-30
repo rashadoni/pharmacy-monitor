@@ -1908,16 +1908,49 @@ def intraday_tick_cmd(dry_run: bool) -> None:
     default=None,
     help=f"Порог fuzzy (по умолчанию {matcher.FUZZY_THRESHOLD})",
 )
-def rematch_cmd(reset: bool, threshold: int | None) -> None:
+@click.option(
+    "--revalidate",
+    is_flag=True,
+    default=False,
+    help="Точечно разбить существующие кластеры с конфликтом по текущим guard'ам",
+)
+@click.option("--dry-run", is_flag=True, default=False, help="С --revalidate: только показать")
+def rematch_cmd(reset: bool, threshold: int | None, revalidate: bool, dry_run: bool) -> None:
     """Перезапустить матчинг (без скрейпинга). Полезно после изменения нормализации.
 
-    С --reset: сбрасывает все автоматические canonical_id и пересчитывает заново.
-    Ручные матчи (is_manual=True) никогда не трогаются.
+    С --reset: сбрасывает все авто-canonical_id и пересчитывает заново (78% churn!).
+    С --revalidate: ТОЧЕЧНО разбивает только те существующие кластеры, где cross-site
+    пара конфликтует по текущим guard'ам (закрывает «whack-a-mole» старых матчей без
+    churn полного --reset). Ручные матчи (is_manual=True) никогда не трогаются.
     """
     from sqlalchemy import update as sa_update
 
     Session = storage.make_session()
     with Session() as session:
+        if revalidate:
+            from src import match_actions
+
+            flagged = matcher.find_conflicting_clusters(session)
+            click.echo(f"revalidate: {len(flagged)} конфликтных кластеров (текущие guard'ы)")
+            for m, a, b in flagged:
+                click.echo(f"  cl{m.id}: [{a.site}] {a.name}  ✗  [{b.site}] {b.name}")
+            if dry_run:
+                click.echo("(dry-run — ничего не изменено)")
+                return
+            for m, a, b in flagged:
+                prods = list(m.products)
+                for i, x in enumerate(prods):
+                    for y in prods[i + 1 :]:
+                        match_actions.add_rejection(session, x.id, y.id, reason="revalidate-guard")
+                for p in prods:
+                    p.canonical_id = None
+                session.delete(m)
+            session.commit()
+            click.echo(
+                f"dissolved {len(flagged)} кластеров (+rejections); re-match на след. скрейпе"
+            )
+            return
+
         if reset:
             # Сброс canonical_id только у авто-матчей
             auto_match_ids = session.scalars(
@@ -1963,17 +1996,32 @@ def rematch_cmd(reset: bool, threshold: int | None) -> None:
         click.echo(f"Price-spread flags updated: {flagged} matches changed.")
 
 
+_VALIDATE_CLIENT_SITE = "pharmonline"  # сайт-клиент — валидировать только с --force
+
+
 @cli.command("validate-links")
-@click.option("--site", default="aptekonline", help="Сайт для проверки (default aptekonline)")
+@click.option(
+    "--site", default="aptekonline", help="Сайт (default aptekonline); client только с --force"
+)
 @click.option("--limit", type=int, default=None, help="Макс. товаров (для smoke-теста)")
-@click.option("--concurrency", default=10, help="Параллельных HTTP-запросов")
+@click.option("--concurrency", default=5, help="Параллельных HTTP-запросов")
+@click.option("--rate-per-sec", default=2.0, help="Лимит запросов/сек (анти-бан)")
 @click.option("--matched-only/--all", default=True, help="Только matched товары (default)")
-def validate_links_cmd(site: str, limit: int | None, concurrency: int, matched_only: bool) -> None:
+@click.option("--force", is_flag=True, help="Разрешить валидацию сайта-клиента")
+def validate_links_cmd(
+    site: str,
+    limit: int | None,
+    concurrency: int,
+    rate_per_sec: float,
+    matched_only: bool,
+    force: bool,
+) -> None:
     """HTTP-проверка URL товаров → помечает 404-страницы (Product.url_dead_at).
 
     aptekonline JSON API листит «фантомные» товары (в каталоге, но страница 404).
     Comparison скрывает помеченные. Запускать с НЕ-забаненного IP (Mac/Baku — для
-    aptekonline Hetzner-IP забанен; прокси для product-страниц тратил бы трафик).
+    aptekonline Hetzner-IP забанен). Rate-limit + circuit-breaker + mass-dead cap
+    защищают единственный рабочий IP от бана и comparison от обнуления (аудит).
     """
     import asyncio
 
@@ -1982,20 +2030,47 @@ def validate_links_cmd(site: str, limit: int | None, concurrency: int, matched_o
     from src import link_validator
     from src._time import utcnow
 
+    # Allow-list: валидация сайта-КЛИЕНТА скрыла бы его товары из comparison (фильтр
+    # в dash_comparison роняет матч без клиента). Требуем явный --force.
+    if site == _VALIDATE_CLIENT_SITE and not force:
+        raise click.ClickException(
+            f"validate-links на сайте-клиенте ({site}) скрыл бы товары клиента из "
+            "comparison. Добавь --force если точно нужно."
+        )
+
     Session = storage.make_session()
     with Session() as session:
         q = select(storage.Product).where(storage.Product.site == site)
         if matched_only:
-            q = q.where(storage.Product.canonical_id.is_not(None))
+            # matched ИЛИ ранее-помеченные мёртвыми — последним даём шанс на revival
+            # (страница вернулась), даже если потеряли матч. Иначе url_dead_at завис
+            # бы навсегда (аудит H2/TTL): revival только если товар ещё в check-set.
+            q = q.where(
+                storage.Product.canonical_id.is_not(None) | storage.Product.url_dead_at.is_not(None)
+            )
         q = q.order_by(storage.Product.id)
         if limit:
             q = q.limit(limit)
         products = session.scalars(q).all()
         click.echo(
-            f"validate-links: проверяю {len(products)} URL ({site}, matched_only={matched_only})…"
+            f"validate-links: проверяю {len(products)} URL ({site}, "
+            f"matched_only={matched_only}, rate={rate_per_sec}/s)…"
         )
         items = [(p.id, p.url) for p in products]
-        results = asyncio.run(link_validator.check_urls(items, concurrency=concurrency))
+        results, meta = asyncio.run(
+            link_validator.check_urls(items, concurrency=concurrency, rate_per_sec=rate_per_sec)
+        )
+        frac = link_validator.dead_fraction(results)
+        # mass-dead guard: на реальном прогоне (≥100 URL) аномальная доля мёртвых =
+        # смена URL-схемы / maintenance aptekonline → НЕ применяем (иначе обнулим
+        # comparison целиком). На малых smoke-прогонах не срабатывает.
+        if meta["checked"] >= 100 and frac > link_validator.MAX_DEAD_FRACTION:
+            click.echo(
+                f"ABORT: dead_fraction={frac:.0%} > {link_validator.MAX_DEAD_FRACTION:.0%} "
+                f"на {meta['checked']} URL — аномалия (смена URL-схемы?). НЕ применяю.",
+                err=True,
+            )
+            raise SystemExit(2)
         counts = link_validator.apply_results(session, results, utcnow())
         session.commit()
         total_dead = session.scalar(
@@ -2004,10 +2079,17 @@ def validate_links_cmd(site: str, limit: int | None, concurrency: int, matched_o
             )
         )
         click.echo(
+            f"checked={meta['checked']}/{len(items)} aborted={meta['aborted']} "
             f"newly_dead={counts['newly_dead']} revived={counts['revived']} "
-            f"still_dead={counts['still_dead']} errors_skipped={counts['error']} | "
-            f"total_dead_now({site})={total_dead}"
+            f"still_dead={counts['still_dead']} errors={counts['error']} "
+            f"dead_frac={frac:.1%} | total_dead({site})={total_dead}"
         )
+        if meta["aborted"]:
+            click.echo(
+                "WARN: circuit-breaker — серия ошибок (возможен бан/throttle), прогон неполный.",
+                err=True,
+            )
+            raise SystemExit(3)
 
 
 @cli.command("report")
