@@ -649,8 +649,8 @@ def _apply_lightweight_migrations(engine) -> None:
             ("runs", "products_per_site_category", "JSON"),
             # 2026-05-11 (ночь): password в DB (вместо global env-hash)
             ("tenant_users", "password_hash", "VARCHAR(200)"),
-            # 2026-05-30: «фантомные» товары (страница 404) — ставится validate-links
-            ("products", "url_dead_at", "TIMESTAMP"),
+            # NB: новые колонки — через alembic (migrations/versions/), НЕ сюда.
+            # Этот SQLite-only путь — легаси до alembic; см. 0009_product_url_dead_at.
         ]
         for table, column, coltype in migrations:
             try:
