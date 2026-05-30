@@ -13,8 +13,9 @@ name: Deploy to Hetzner
 #     дать pm узкий sudo на два restart'а, иначе шаг restart упадёт:
 #       echo 'pm ALL=(root) NOPASSWD: /usr/bin/systemctl restart pharmacy-monitor-api.service, /usr/bin/systemctl restart pharmacy-monitor-frontend.service' \
 #         | sudo tee /etc/sudoers.d/pm-deploy && sudo chmod 440 /etc/sudoers.d/pm-deploy
-#   * АЛЕМБИК НЕ ЗАПУСКАЕТСЯ автоматически — прод alembic_version рассинхронен (0005
-#     при ручных ALTER'ах). Миграции катать вручную после ревью (см. CLAUDE.md).
+#   * АЛЕМБИК НЕ ЗАПУСКАЕТСЯ автоматически (осознанно): миграции — отдельное решение,
+#     не на каждый деплой. Прод-схема консистентна (PG alembic_version=0008, схема
+#     через 0009; upgrade head безопасен — 0009 идемпотентна). См. CLAUDE.md.
 
 on:
   workflow_dispatch:
