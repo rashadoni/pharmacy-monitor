@@ -856,6 +856,97 @@ def find_conflicting_clusters(session: Session) -> list:
     return flagged
 
 
+def relink_dead_members(
+    session: Session, *, dry_run: bool = False, min_score: int = 80
+) -> list[dict]:
+    """Авто-кластеры с мёртвым (url_dead_at) членом → подменить его живой
+    альтернативой того же сайта/спеки (через match_actions.swap_alternative).
+
+    Зачем: validate-links метит фантомные URL мёртвыми, comparison их прячет, и
+    строка теряет конкурента — хотя живая альтернатива того же товара существует
+    unmatched (напр. Asiklovir: aptek Terapia сдохла, живой дженерик не подвязан).
+
+    Безопасность кандидата: (1) живой + unmatched (find_alternatives отдаёт только
+    canonical_id IS NULL), (2) тот же pack_count и strength, что у мёртвого (один
+    сайт → единый формат), (3) НЕ конфликтует с живым cross-site anchor'ом по
+    _hard_conflict/_pairwise_spec_conflict, (4) fuzzy score >= min_score. Ручные
+    (is_manual) кластеры не трогаем. Возвращает план [{match_id,site,old,new,score,
+    action}]; при dry_run БД не меняется (swap_alternative не вызывается)."""
+    from src import match_actions
+
+    results: list[dict] = []
+    dead_members = session.scalars(
+        select(Product).where(
+            Product.url_dead_at.is_not(None),
+            Product.canonical_id.is_not(None),
+        )
+    ).all()
+    seen: set[tuple[int, str]] = set()
+    for d in dead_members:
+        key = (d.canonical_id, d.site)
+        if key in seen:
+            continue
+        seen.add(key)
+        m = session.get(Match, d.canonical_id)
+        if m is None or m.is_manual:
+            continue
+        anchor = next((p for p in m.products if p.url_dead_at is None and p.site != d.site), None)
+        if anchor is None:
+            results.append(
+                {
+                    "match_id": d.canonical_id,
+                    "site": d.site,
+                    "old": d.id,
+                    "new": None,
+                    "score": None,
+                    "action": "skip-no-anchor",
+                }
+            )
+            continue
+        d_pack = _pack_count(d.pack_size or "")
+        d_str = _strength_numbers(d.name or "")
+        chosen = None
+        for cand, score in match_actions.find_alternatives(session, m.id, d.site, limit=25):
+            if score < min_score:
+                break  # отсортировано по убыванию
+            if cand.url_dead_at is not None:
+                continue
+            if _pack_count(cand.pack_size or "") != d_pack:
+                continue
+            if _strength_numbers(cand.name or "") != d_str:
+                continue
+            if _hard_conflict(anchor, cand) or _pairwise_spec_conflict(anchor, cand):
+                continue
+            chosen = (cand, score)
+            break
+        if chosen is None:
+            results.append(
+                {
+                    "match_id": m.id,
+                    "site": d.site,
+                    "old": d.id,
+                    "new": None,
+                    "score": None,
+                    "action": "skip-no-live-alt",
+                }
+            )
+            continue
+        cand, score = chosen
+        results.append(
+            {
+                "match_id": m.id,
+                "site": d.site,
+                "old": d.id,
+                "new": cand.id,
+                "score": score,
+                "action": "swap",
+            }
+        )
+        if not dry_run:
+            match_actions.swap_alternative(session, m.id, d.site, cand.id)
+    return results
+
+
 def _build_word_freq(products: list) -> dict[str, int]:
     """Частота слов по всем name_normalized.
 

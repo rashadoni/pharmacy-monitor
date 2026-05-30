@@ -1914,8 +1914,18 @@ def intraday_tick_cmd(dry_run: bool) -> None:
     default=False,
     help="Точечно разбить существующие кластеры с конфликтом по текущим guard'ам",
 )
-@click.option("--dry-run", is_flag=True, default=False, help="С --revalidate: только показать")
-def rematch_cmd(reset: bool, threshold: int | None, revalidate: bool, dry_run: bool) -> None:
+@click.option(
+    "--relink-dead",
+    is_flag=True,
+    default=False,
+    help="Подменить мёртвые (url_dead_at) члены кластеров живой альтернативой того же спека",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False, help="С --revalidate/--relink-dead: только показать"
+)
+def rematch_cmd(
+    reset: bool, threshold: int | None, revalidate: bool, relink_dead: bool, dry_run: bool
+) -> None:
     """Перезапустить матчинг (без скрейпинга). Полезно после изменения нормализации.
 
     С --reset: сбрасывает все авто-canonical_id и пересчитывает заново (78% churn!).
@@ -1927,6 +1937,23 @@ def rematch_cmd(reset: bool, threshold: int | None, revalidate: bool, dry_run: b
 
     Session = storage.make_session()
     with Session() as session:
+        if relink_dead:
+            plan = matcher.relink_dead_members(session, dry_run=dry_run)
+            swaps = [r for r in plan if r["action"] == "swap"]
+            skips = [r for r in plan if r["action"] != "swap"]
+            click.echo(f"relink-dead: {len(swaps)} swap, {len(skips)} skip")
+            for r in swaps:
+                click.echo(
+                    f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} → live#{r['new']} (score {r['score']})"
+                )
+            for r in skips[:20]:
+                click.echo(f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} — {r['action']}")
+            if dry_run:
+                click.echo("(dry-run — ничего не изменено)")
+            else:
+                click.echo(f"applied {len(swaps)} swap'ов (swap_alternative → кластер is_manual)")
+            return
+
         if revalidate:
             from src import match_actions
 

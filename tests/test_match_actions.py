@@ -1,6 +1,9 @@
 """Тесты helper-операций для ручной коррекции матчей."""
 
+import datetime
+
 from src import match_actions as ma
+from src import matcher
 from src.storage import Match, Product
 
 
@@ -164,3 +167,113 @@ def test_list_rejections_for_product(db_session):
     assert sorted(rej_for_p1) == sorted([p2.id, p3.id])
     rej_for_p2 = ma.list_rejections_for_product(db_session, p2.id)
     assert rej_for_p2 == [p1.id]
+
+
+# ── relink_dead_members (swap мёртвого члена кластера на живую альтернативу) ──
+_DEAD = datetime.datetime(2026, 5, 30, 17, 0, 0)
+
+
+def _mk(s, **kw) -> Product:
+    p = Product(
+        site=kw["site"],
+        external_id=kw["external_id"],
+        url=kw.get("url", "http://x/" + kw["external_id"]),
+        name=kw["name"],
+        name_normalized=kw.get("name_normalized", kw["name"].lower()),
+        canonical_id=kw.get("canonical_id"),
+        pack_size=kw.get("pack_size"),
+        url_dead_at=kw.get("url_dead_at"),
+        manufacturer=kw.get("manufacturer"),
+    )
+    s.add(p)
+    s.flush()
+    return p
+
+
+def _cluster_with_dead(s, *, manual=False):
+    m = Match(canonical_name="Asiklovir 200 mq N20", confidence=1.0, is_manual=manual)
+    s.add(m)
+    s.flush()
+    anchor = _mk(
+        s,
+        site="pharmonline",
+        external_id="ph1",
+        name="Asiklovir 200 mq N20",
+        canonical_id=m.id,
+        pack_size="N20",
+    )
+    dead = _mk(
+        s,
+        site="aptekonline",
+        external_id="ap-dead",
+        name="Asiklovir Terapiya 200 mq N20",
+        canonical_id=m.id,
+        pack_size="N20",
+        url_dead_at=_DEAD,
+    )
+    return m, anchor, dead
+
+
+def test_relink_dead_swaps_live_alternative(db_session):
+    m, _anchor, dead = _cluster_with_dead(db_session)
+    live = _mk(
+        db_session,
+        site="aptekonline",
+        external_id="ap-live",
+        name="Asiklovir 200 mq N20",
+        pack_size="N20",
+    )  # живой, unmatched
+    db_session.commit()
+    res = matcher.relink_dead_members(db_session)
+    assert any(r["action"] == "swap" and r["new"] == live.id and r["old"] == dead.id for r in res)
+    db_session.refresh(live)
+    db_session.refresh(dead)
+    assert live.canonical_id == m.id  # живой подвязан
+    assert dead.canonical_id is None  # мёртвый отвязан
+
+
+def test_relink_dead_skips_wrong_pack(db_session):
+    _cluster_with_dead(db_session)
+    # единственный живой кандидат — другая упаковка (N25) → НЕ подменять
+    _mk(
+        db_session,
+        site="aptekonline",
+        external_id="ap-n25",
+        name="Asiklovir 200 mq N25",
+        pack_size="N25",
+    )
+    db_session.commit()
+    res = matcher.relink_dead_members(db_session)
+    assert all(r["action"] != "swap" for r in res)
+
+
+def test_relink_dead_dry_run_no_change(db_session):
+    _cluster_with_dead(db_session)
+    live = _mk(
+        db_session,
+        site="aptekonline",
+        external_id="ap-live",
+        name="Asiklovir 200 mq N20",
+        pack_size="N20",
+    )
+    db_session.commit()
+    res = matcher.relink_dead_members(db_session, dry_run=True)
+    assert any(r["action"] == "swap" for r in res)  # план показывает swap
+    db_session.refresh(live)
+    assert live.canonical_id is None  # но БД не тронута
+
+
+def test_relink_dead_skips_manual_cluster(db_session):
+    _cluster_with_dead(db_session, manual=True)
+    live = _mk(
+        db_session,
+        site="aptekonline",
+        external_id="ap-live",
+        name="Asiklovir 200 mq N20",
+        pack_size="N20",
+    )
+    db_session.commit()
+    res = matcher.relink_dead_members(db_session)
+    assert res == []  # ручной кластер не трогаем
+    db_session.refresh(live)
+    assert live.canonical_id is None
