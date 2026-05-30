@@ -26,7 +26,19 @@ data/*.sqlite
 data/*.sqlite-journal
 data/snapshots/
 logs/*.log
+logs/*.jsonl
+data/category_labels_ru_backup_*.json
 reports/
+
+# Business/pitch artifacts in repo root — NOT source. Keep contracts/proposals
+# out of git history (одна git add -A от утечки конфиденциалки). Root-anchored.
+/*.docx
+/*.pptx
+/*.pdf
+/*.jpg
+/*_teklif.js
+/*_pitch*.js
+/pitch_*.js
 
 # Playwright
 playwright-report/

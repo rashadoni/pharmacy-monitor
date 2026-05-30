@@ -89,5 +89,7 @@ jobs:
           cache: "pnpm"
           cache-dependency-path: frontend/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - name: Typecheck (tsc --noEmit)
+        run: pnpm typecheck
       - name: Build
         run: NODE_OPTIONS=--max-old-space-size=4096 pnpm build

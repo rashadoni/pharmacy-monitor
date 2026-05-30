@@ -25,11 +25,40 @@ from src.matcher import _MATCH_NOISE_TOKENS, _PHARMA_MODIFIERS
 # Химические/фарм-дескрипторы — НЕ бренд, тот же товар (терсе ↔ verbose ОК).
 _DESCRIPTORS = frozenset(
     {
-        "trihydrate", "monohydrate", "anhydrous", "micronized", "hcl", "sodium",
-        "potassium", "hydrochloride", "sulfate", "sulphate", "maleate", "besylate",
-        "tablet", "tablets", "tabletler", "kapsul", "kapsulalar", "capsule", "capsules",
-        "mehlul", "solution", "syrup", "serbet", "krem", "cream", "gel", "ointment",
-        "melhem", "drops", "damci", "sprey", "spray", "ampul", "ampoule",
+        "trihydrate",
+        "monohydrate",
+        "anhydrous",
+        "micronized",
+        "hcl",
+        "sodium",
+        "potassium",
+        "hydrochloride",
+        "sulfate",
+        "sulphate",
+        "maleate",
+        "besylate",
+        "tablet",
+        "tablets",
+        "tabletler",
+        "kapsul",
+        "kapsulalar",
+        "capsule",
+        "capsules",
+        "mehlul",
+        "solution",
+        "syrup",
+        "serbet",
+        "krem",
+        "cream",
+        "gel",
+        "ointment",
+        "melhem",
+        "drops",
+        "damci",
+        "sprey",
+        "spray",
+        "ampul",
+        "ampoule",
     }
 )
 
@@ -59,10 +88,17 @@ def main() -> None:
     for r in rows:
         s.add(
             storage.Product(
-                id=r["id"], tenant_id=1, site=r["site"], external_id=r["external_id"],
-                url=f"http://x/{r['external_id']}", name=r["name"] or "",
-                name_normalized=r["name_normalized"] or "", brand=r["brand"],
-                dosage=r["dosage"], pack_size=r["pack_size"], barcode=r.get("barcode"),
+                id=r["id"],
+                tenant_id=1,
+                site=r["site"],
+                external_id=r["external_id"],
+                url=f"http://x/{r['external_id']}",
+                name=r["name"] or "",
+                name_normalized=r["name_normalized"] or "",
+                brand=r["brand"],
+                dosage=r["dosage"],
+                pack_size=r["pack_size"],
+                barcode=r.get("barcode"),
             )
         )
     s.commit()
@@ -96,9 +132,13 @@ def main() -> None:
 
     two_plus = sum(1 for mem in members.values() if len({m.site for m in mem}) >= 2)
     print(f"2+ site clusters: {two_plus}")
-    print(f"clusters с односторонним sig-токеном (brand-stub риск): {len(flagged)} "
-          f"({100 * len(flagged) / two_plus:.1f}%)")
-    print(f"\n=== SAMPLE {min(show, len(flagged))} (eyeball: bad brand-mismatch или legit terse?) ===")
+    print(
+        f"clusters с односторонним sig-токеном (brand-stub риск): {len(flagged)} "
+        f"({100 * len(flagged) / two_plus:.1f}%)"
+    )
+    print(
+        f"\n=== SAMPLE {min(show, len(flagged))} (eyeball: bad brand-mismatch или legit terse?) ==="
+    )
     for cid, mem in flagged[:show]:
         print(f"\ncluster {cid}:")
         for m in mem:

@@ -263,21 +263,31 @@ def test_category_comparison_multi_category_and_labels(db_session):
     db_session.flush()
 
     # SKU1 (vitamins): client 10 vs aptekonline 8 → клиент дороже.
-    c1 = _add_product(db_session, "pharmonline", "V1", canonical_id=m1.id, category="vitamins", ext_id="c1")
-    a1 = _add_product(db_session, "aptekonline", "V1", canonical_id=m1.id, category="apt-v", ext_id="a1")
+    c1 = _add_product(
+        db_session, "pharmonline", "V1", canonical_id=m1.id, category="vitamins", ext_id="c1"
+    )
+    a1 = _add_product(
+        db_session, "aptekonline", "V1", canonical_id=m1.id, category="apt-v", ext_id="a1"
+    )
     _add_snap_at(db_session, run, c1, 10.0)
     _add_snap_at(db_session, run, a1, 8.0)
 
     # SKU2 (vitamins): client 5 vs aptekonline 6 + aloe 10 → comp_mean 8 → дешевле.
-    c2 = _add_product(db_session, "pharmonline", "V2", canonical_id=m2.id, category="vitamins", ext_id="c2")
-    a2 = _add_product(db_session, "aptekonline", "V2", canonical_id=m2.id, category="apt-v", ext_id="a2")
+    c2 = _add_product(
+        db_session, "pharmonline", "V2", canonical_id=m2.id, category="vitamins", ext_id="c2"
+    )
+    a2 = _add_product(
+        db_session, "aptekonline", "V2", canonical_id=m2.id, category="apt-v", ext_id="a2"
+    )
     l2 = _add_product(db_session, "aloe", "V2", canonical_id=m2.id, category="aloe-v", ext_id="l2")
     _add_snap_at(db_session, run, c2, 5.0)
     _add_snap_at(db_session, run, a2, 6.0)
     _add_snap_at(db_session, run, l2, 10.0)
 
     # SKU3 (pain): client 20 vs aloe 20 → паритет.
-    c3 = _add_product(db_session, "pharmonline", "P1", canonical_id=m3.id, category="pain", ext_id="c3")
+    c3 = _add_product(
+        db_session, "pharmonline", "P1", canonical_id=m3.id, category="pain", ext_id="c3"
+    )
     l3 = _add_product(db_session, "aloe", "P1", canonical_id=m3.id, category="aloe-p", ext_id="l3")
     _add_snap_at(db_session, run, c3, 20.0)
     _add_snap_at(db_session, run, l3, 20.0)
@@ -322,7 +332,9 @@ def test_category_comparison_diff_only_old_run(db_session):
     m = Match(canonical_name="Stable", confidence=1.0)
     db_session.add(m)
     db_session.flush()
-    c = _add_product(db_session, "pharmonline", "Stable", canonical_id=m.id, category="herbs", ext_id="c")
+    c = _add_product(
+        db_session, "pharmonline", "Stable", canonical_id=m.id, category="herbs", ext_id="c"
+    )
     a = _add_product(db_session, "aloe", "Stable", canonical_id=m.id, category="aloe-h", ext_id="a")
     _add_snap_at(db_session, old, c, 12.0, captured_at=utcnow() - timedelta(days=10))
     _add_snap_at(db_session, old, a, 10.0, captured_at=utcnow() - timedelta(days=10))
@@ -360,10 +372,18 @@ def test_category_comparison_confidence_floor(db_session):
     m_manual = Match(canonical_name="Man", confidence=0.1, is_manual=True)
     db_session.add_all([m_low, m_manual])
     db_session.flush()
-    cl = _add_product(db_session, "pharmonline", "Low", canonical_id=m_low.id, category="low", ext_id="cl")
-    al = _add_product(db_session, "aloe", "Low", canonical_id=m_low.id, category="aloe-l", ext_id="al")
-    cm = _add_product(db_session, "pharmonline", "Man", canonical_id=m_manual.id, category="man", ext_id="cm")
-    am = _add_product(db_session, "aloe", "Man", canonical_id=m_manual.id, category="aloe-m", ext_id="am")
+    cl = _add_product(
+        db_session, "pharmonline", "Low", canonical_id=m_low.id, category="low", ext_id="cl"
+    )
+    al = _add_product(
+        db_session, "aloe", "Low", canonical_id=m_low.id, category="aloe-l", ext_id="al"
+    )
+    cm = _add_product(
+        db_session, "pharmonline", "Man", canonical_id=m_manual.id, category="man", ext_id="cm"
+    )
+    am = _add_product(
+        db_session, "aloe", "Man", canonical_id=m_manual.id, category="aloe-m", ext_id="am"
+    )
     for p, pr in ((cl, 10.0), (al, 8.0), (cm, 10.0), (am, 8.0)):
         _add_snap_at(db_session, run, p, pr)
     db_session.commit()
@@ -379,9 +399,13 @@ def test_category_comparison_tenant_isolation(db_session):
     m2 = Match(canonical_name="T2", confidence=1.0, tenant_id=2)
     db_session.add_all([m1, m2])
     db_session.flush()
-    c1 = _add_product(db_session, "pharmonline", "T1", canonical_id=m1.id, category="t1cat", ext_id="c1")
+    c1 = _add_product(
+        db_session, "pharmonline", "T1", canonical_id=m1.id, category="t1cat", ext_id="c1"
+    )
     a1 = _add_product(db_session, "aloe", "T1", canonical_id=m1.id, category="aloe1", ext_id="a1")
-    c2 = _add_product(db_session, "pharmonline", "T2", canonical_id=m2.id, category="t2cat", ext_id="c2")
+    c2 = _add_product(
+        db_session, "pharmonline", "T2", canonical_id=m2.id, category="t2cat", ext_id="c2"
+    )
     a2 = _add_product(db_session, "aloe", "T2", canonical_id=m2.id, category="aloe2", ext_id="a2")
     for p, pr in ((c1, 10.0), (a1, 8.0), (c2, 10.0), (a2, 8.0)):
         _add_snap_at(db_session, run, p, pr)
@@ -401,7 +425,9 @@ def test_price_index_and_category_comparison_kwargs_no_typeerror(db_session):
 
     (Старая `price_index_by_category(session)` бросала TypeError на api.py:1940.)
     """
-    assert analytics.price_index_by_category(db_session, client_site="pharmonline", tenant_id=1) == []
+    assert (
+        analytics.price_index_by_category(db_session, client_site="pharmonline", tenant_id=1) == []
+    )
     assert analytics.category_comparison(db_session, client_site="pharmonline", tenant_id=1) == []
 
 
@@ -412,7 +438,9 @@ def test_category_comparison_excludes_dead_url(db_session):
     db_session.add(m)
     db_session.flush()
     c = _add_product(db_session, "pharmonline", "D", canonical_id=m.id, category="cat", ext_id="c")
-    a_dead = _add_product(db_session, "aptekonline", "D", canonical_id=m.id, category="ac", ext_id="a")
+    a_dead = _add_product(
+        db_session, "aptekonline", "D", canonical_id=m.id, category="ac", ext_id="a"
+    )
     al = _add_product(db_session, "aloe", "D", canonical_id=m.id, category="lc", ext_id="l")
     a_dead.url_dead_at = utcnow()  # фантомный конкурент
     db_session.flush()

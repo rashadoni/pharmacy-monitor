@@ -31,10 +31,17 @@ def main() -> None:
     for r in rows:
         s.add(
             storage.Product(
-                id=r["id"], tenant_id=1, site=r["site"], external_id=r["external_id"],
-                url=f"http://x/{r['external_id']}", name=r["name"] or "",
-                name_normalized=r["name_normalized"] or "", brand=r["brand"],
-                dosage=r["dosage"], pack_size=r["pack_size"], barcode=r.get("barcode"),
+                id=r["id"],
+                tenant_id=1,
+                site=r["site"],
+                external_id=r["external_id"],
+                url=f"http://x/{r['external_id']}",
+                name=r["name"] or "",
+                name_normalized=r["name_normalized"] or "",
+                brand=r["brand"],
+                dosage=r["dosage"],
+                pack_size=r["pack_size"],
+                barcode=r.get("barcode"),
             )
         )
     s.commit()
@@ -56,7 +63,9 @@ def main() -> None:
             else:
                 unmatched += 1
         multi = {c: m for c, m in clusters.items() if len({x.site for x in m}) >= 2}
-        print(f"\n=== '{kw}': {len(prods)} продуктов, {len(multi)} cross-site кластеров, {unmatched} unmatched ===")
+        print(
+            f"\n=== '{kw}': {len(prods)} продуктов, {len(multi)} cross-site кластеров, {unmatched} unmatched ==="
+        )
         for c, mem in list(multi.items())[:6]:
             sites = " | ".join(f"{m.site[:4]}:{m.name[:30]}" for m in mem)
             print(f"  c{c}: {sites}")
