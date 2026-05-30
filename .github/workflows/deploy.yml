@@ -1,36 +1,35 @@
 name: Deploy to Hetzner
 
-# Деплой на прод — ТОЛЬКО ручной триггер (workflow_dispatch), как scrape.yml.
-# Прод-деплой требует явного per-deploy решения (см. CLAUDE.md / security),
-# поэтому НЕ on:push. Запускать из вкладки Actions → "Run workflow" ПОСЛЕ того,
-# как нужный коммит в origin/main и CI на нём зелёный (infra/deploy.sh на сервере
-# делает `git reset --hard origin/main`, т.е. катит именно то, что в origin/main).
+# Manual deploy (workflow_dispatch). Запускать из Actions → "Run workflow" ПОСЛЕ
+# зелёного CI на нужном коммите. Прод-деплой = явное per-deploy решение (security).
 #
-# Чтобы включить АВТО-деплой после зелёного CI — заменить триггер на:
-#   on:
-#     workflow_run:
-#       workflows: ["Pharmacy Monitor CI"]
-#       types: [completed]
-#       branches: [main]
-#   jobs: { deploy: { if: ${{ github.event.workflow_run.conclusion == 'success' }}, ... } }
-#
-# Использует существующий секрет SSH_PRIVATE_KEY (тот же ключ, что scrape.yml).
-# Заходит как root: infra/deploy.sh делает `sudo systemctl restart/reload`,
-# а у pm нет passwordless sudo.
+# РЕАЛЬНОСТЬ ПРОДА (2026-05-30):
+#   * /opt/pharmacy-monitor — это RSYNC-деплой, НЕ git-чекаут. Поэтому здесь rsync,
+#     а НЕ `git reset --hard` (старый infra/deploy.sh так не работает — на проде нет
+#     рабочего .git). Катит то, что в checkout этого workflow (= коммит, который
+#     выбран для прогона).
+#   * Используем существующий секрет SSH_PRIVATE_KEY (pm-scoped, тот же что scrape.yml).
+#   * pm НЕ имеет passwordless sudo по умолчанию. ОДНОРАЗОВЫЙ ПРЕРЕКВИЗИТ на сервере —
+#     дать pm узкий sudo на два restart'а, иначе шаг restart упадёт:
+#       echo 'pm ALL=(root) NOPASSWD: /usr/bin/systemctl restart pharmacy-monitor-api.service, /usr/bin/systemctl restart pharmacy-monitor-frontend.service' \
+#         | sudo tee /etc/sudoers.d/pm-deploy && sudo chmod 440 /etc/sudoers.d/pm-deploy
+#   * АЛЕМБИК НЕ ЗАПУСКАЕТСЯ автоматически — прод alembic_version рассинхронен (0005
+#     при ручных ALTER'ах). Миграции катать вручную после ревью (см. CLAUDE.md).
 
 on:
   workflow_dispatch:
 
 jobs:
   deploy:
-    name: SSH deploy
+    name: rsync deploy
     runs-on: ubuntu-latest
     concurrency:
       group: deploy-prod
       cancel-in-progress: false
-
     steps:
-      - name: Setup SSH key
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH key (pm)
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
@@ -43,9 +42,27 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Deploy (server pulls origin/main → migrate → restart → health-check)
+      - name: Rsync code -> prod (src + frontend source)
         run: |
-          ssh -i ~/.ssh/id_ed25519 \
-              -o ConnectTimeout=15 -o ServerAliveInterval=30 \
-              root@46.225.149.52 \
-              'cd /opt/pharmacy-monitor && bash infra/deploy.sh'
+          rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
+            --exclude='__pycache__/' --exclude='*.pyc' \
+            src/ pm@46.225.149.52:/opt/pharmacy-monitor/src/
+          rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
+            --exclude='node_modules/' --exclude='.next/' --exclude='*.tsbuildinfo' --exclude='test-results/' \
+            frontend/ pm@46.225.149.52:/opt/pharmacy-monitor/frontend/
+
+      - name: Build frontend + restart services
+        run: |
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -e
+            cd /opt/pharmacy-monitor/frontend
+            NODE_OPTIONS=--max-old-space-size=4096 pnpm install --frozen-lockfile
+            NODE_OPTIONS=--max-old-space-size=4096 pnpm build
+            sudo systemctl restart pharmacy-monitor-api.service
+            sudo systemctl restart pharmacy-monitor-frontend.service'
+
+      - name: Health check
+        run: |
+          sleep 5
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 '
+            curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"
+            curl -s -o /dev/null -w "frontend HTTP %{http_code}\n" http://127.0.0.1:3000/'
