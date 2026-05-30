@@ -1,0 +1,1517 @@
+[
+  {
+    "id": 55,
+    "az": "Cinsi yolla keçən infeksiyaların müalicə və profilaktikası üçün vasitələr",
+    "ru": "Средства для лечения и профилактики инфекций, передающихся половым путём"
+  },
+  {
+    "id": 56,
+    "az": "Protozoy infeksiyası əleyhinə vasitələr",
+    "ru": "Противопротозойные средства"
+  },
+  {
+    "id": 57,
+    "az": "Qoturluq və pedikulyoz zamanı istifadə olunan vasitələr",
+    "ru": "Средства при чесотке и педикулёзе"
+  },
+  {
+    "id": 58,
+    "az": "Qurd xəstəliklərində istifadə olunan (antihelmint) vasitələr",
+    "ru": "Противоглистные (антигельминтные) средства"
+  },
+  {
+    "id": 59,
+    "az": "Göbələk əleyhinə vasitələr",
+    "ru": "Противогрибковые средства"
+  },
+  {
+    "id": 60,
+    "az": "Virus infeksiyası əleyhinə vasitələr",
+    "ru": "Противовирусные средства"
+  },
+  {
+    "id": 61,
+    "az": "Şiş xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при опухолевых заболеваниях"
+  },
+  {
+    "id": 62,
+    "az": "Sinir oyanıqlığında istifadə olunan vasitələr",
+    "ru": "Средства при нервной возбудимости"
+  },
+  {
+    "id": 63,
+    "az": "Nikotin asılılığı zamanı istifadə olunan vasitələr",
+    "ru": "Средства при никотиновой зависимости"
+  },
+  {
+    "id": 64,
+    "az": "Xroniki yorğunluq sindromu və asteniya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при синдроме хронической усталости и астении"
+  },
+  {
+    "id": 65,
+    "az": "Nevralgiyalarda istifadə olunan vasitələr",
+    "ru": "Средства при невралгиях"
+  },
+  {
+    "id": 66,
+    "az": "Yuxu pozğunluğu zamanı istifadə olunan vasitələr",
+    "ru": "Средства при нарушениях сна"
+  },
+  {
+    "id": 67,
+    "az": "Depressiya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при депрессии"
+  },
+  {
+    "id": 68,
+    "az": "Neyrosirkulyator distoniya  (NSD)",
+    "ru": "Нейроциркуляторная дистония (НЦД)"
+  },
+  {
+    "id": 69,
+    "az": "Epilepsiyada istifadə olunan vasitələr",
+    "ru": "Средства при эпилепсии"
+  },
+  {
+    "id": 70,
+    "az": "Şizofreniya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при шизофрении"
+  },
+  {
+    "id": 71,
+    "az": "Parkinson xəstəliyində istifadə olunan vasitələr",
+    "ru": "Средства при болезни Паркинсона"
+  },
+  {
+    "id": 72,
+    "az": "Alkohol asılılığı zamanı istifadə olunan vasitələr",
+    "ru": "Средства при алкогольной зависимости"
+  },
+  {
+    "id": 73,
+    "az": "Miqren",
+    "ru": "Мигрень"
+  },
+  {
+    "id": 74,
+    "az": "Neyropatiya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при нейропатии"
+  },
+  {
+    "id": 75,
+    "az": "Beyin fəaliyyətini və yaddaşı möhkəmləndirən vasitələr",
+    "ru": "Средства для улучшения работы мозга и памяти"
+  },
+  {
+    "id": 76,
+    "az": "Aktiv fiziki və zehni inkişaf zamanı istifadə olunan vasitələr",
+    "ru": "Средства при активном физическом и умственном развитии"
+  },
+  {
+    "id": 77,
+    "az": "Ezofagit zamanı istifadə olunan vasitələr",
+    "ru": "Средства при эзофагите"
+  },
+  {
+    "id": 78,
+    "az": "Mədə və 12 barmaq bağırsaq xorasında istifadə olunan vasitələr",
+    "ru": "Средства при язве желудка и двенадцатиперстной кишки"
+  },
+  {
+    "id": 79,
+    "az": "Qastrit zamanı istifadə olunan vasitələr",
+    "ru": "Средства при гастрите"
+  },
+  {
+    "id": 80,
+    "az": "Köp əleyhinə vasitələr",
+    "ru": "Средства против вздутия (метеоризма)"
+  },
+  {
+    "id": 81,
+    "az": "Disbakterioz zamanı istifadə olunan vasitələr",
+    "ru": "Средства при дисбактериозе"
+  },
+  {
+    "id": 82,
+    "az": "Digər həzm pozğunluqları zamanı istifadə olunan vasitələr",
+    "ru": "Средства при других нарушениях пищеварения"
+  },
+  {
+    "id": 83,
+    "az": "Qaraciyər xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "ru": "Средства для лечения и профилактики заболеваний печени"
+  },
+  {
+    "id": 84,
+    "az": "Öd xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "ru": "Средства для лечения и профилактики заболеваний жёлчных путей"
+  },
+  {
+    "id": 85,
+    "az": "Ferment çatışmamazlığı zamanı istifadə olunan vasitələr",
+    "ru": "Средства при ферментной недостаточности"
+  },
+  {
+    "id": 86,
+    "az": "İshalda istifadə olunan vasitələr",
+    "ru": "Средства при диарее"
+  },
+  {
+    "id": 87,
+    "az": "Qəbizlik zamanı istifadə olunan vasitələr",
+    "ru": "Средства при запоре"
+  },
+  {
+    "id": 88,
+    "az": "Babasil (hemorroy) zamanı istifadə olunan vasitələr",
+    "ru": "Средства при геморрое"
+  },
+  {
+    "id": 89,
+    "az": "Mədəaltı vəzin xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "ru": "Средства для лечения и профилактики заболеваний поджелудочной железы"
+  },
+  {
+    "id": 90,
+    "az": "Antibiotiklə birgə istifadə olunan vasitələr",
+    "ru": "Средства, применяемые совместно с антибиотиками"
+  },
+  {
+    "id": 91,
+    "az": "Kolit zamanı istifadə olunan vasitələr",
+    "ru": "Средства при колите"
+  },
+  {
+    "id": 92,
+    "az": "Ürəkbulanma və qusma zamanı istifadə olunan vasitələr",
+    "ru": "Средства при тошноте и рвоте"
+  },
+  {
+    "id": 93,
+    "az": "Ağız boşluğu xəstəlikləri zamanı istifadə olunan vasitələr",
+    "ru": "Средства при заболеваниях полости рта"
+  },
+  {
+    "id": 94,
+    "az": "Qıcıqlanmış bağırsaq sindromu zamanı istifadə olunan vasitələr",
+    "ru": "Средства при синдроме раздражённого кишечника"
+  },
+  {
+    "id": 95,
+    "az": "Bağırsağın hazırlanması üçün vasitələr",
+    "ru": "Средства для подготовки кишечника"
+  },
+  {
+    "id": 96,
+    "az": "Sidik-cinsiyyət sistemi xəstəliklərinin profilaktikası zamanı istifadə olunan vasitələr",
+    "ru": "Средства для профилактики заболеваний мочеполовой системы"
+  },
+  {
+    "id": 97,
+    "az": "Böyrək və sidik  yollarının  iltihabında istifadə olunan vasitələr",
+    "ru": "Средства при воспалении почек и мочевыводящих путей"
+  },
+  {
+    "id": 98,
+    "az": "Böyrək daşı xəstəliyində istifadə olunan vasitələr",
+    "ru": "Средства при мочекаменной болезни"
+  },
+  {
+    "id": 99,
+    "az": "Sidik ifrazatı xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при заболеваниях мочевыделения"
+  },
+  {
+    "id": 100,
+    "az": "Prostat vəzin adenomasında istifadə olunan vasitələr",
+    "ru": "Средства при аденоме предстательной железы"
+  },
+  {
+    "id": 101,
+    "az": "Prostatit zamanı istifadə olunan vasitələr",
+    "ru": "Средства при простатите"
+  },
+  {
+    "id": 102,
+    "az": "Kişi sonsuzluğunda istifadə olunan vasitələr",
+    "ru": "Средства при мужском бесплодии"
+  },
+  {
+    "id": 103,
+    "az": "Mastopatiya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при мастопатии"
+  },
+  {
+    "id": 104,
+    "az": "Potensiya zəifliyi zamanı istifadə olunan vasitələr",
+    "ru": "Средства при ослаблении потенции"
+  },
+  {
+    "id": 105,
+    "az": "Klimaks və menopauzada istifadə olunan vasitələr",
+    "ru": "Средства при климаксе и менопаузе"
+  },
+  {
+    "id": 106,
+    "az": "Menstruasiya pozğunluqları zamanı istifadə olunan vasitələr",
+    "ru": "Средства при нарушениях менструального цикла"
+  },
+  {
+    "id": 107,
+    "az": "Böyrək çatmamazlığı zamanı istifadə olunan vasitələr",
+    "ru": "Средства при почечной недостаточности"
+  },
+  {
+    "id": 108,
+    "az": "Qadın çanaq orqanlarının iltihabı xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при воспалительных заболеваниях органов малого таза у женщин"
+  },
+  {
+    "id": 109,
+    "az": "Qadın sonsuzluğunda istifadə olunan vasitələr",
+    "ru": "Средства при женском бесплодии"
+  },
+  {
+    "id": 110,
+    "az": "Doğuş fəaliyyətinin pozğunluğu",
+    "ru": "Нарушение родовой деятельности"
+  },
+  {
+    "id": 111,
+    "az": "Dölün hipoksiyası zamanı istifadə olunan vasitələr",
+    "ru": "Средства при гипоксии плода"
+  },
+  {
+    "id": 112,
+    "az": "Hamiləlikdən qorunma vasitələri (kontraseptivlər)",
+    "ru": "Средства контрацепции (контрацептивы)"
+  },
+  {
+    "id": 113,
+    "az": "Uşaqlığın hipertonusu zamanı istifadə olunan vasitələr",
+    "ru": "Средства при гипертонусе матки"
+  },
+  {
+    "id": 114,
+    "az": "Hamiləliyi və ovulyasiya vaxtini təyin etmək üçün testlər",
+    "ru": "Тесты для определения беременности и овуляции"
+  },
+  {
+    "id": 115,
+    "az": "Hamiləlik toksikozu zamanı istifadə olunan vasitələr",
+    "ru": "Средства при токсикозе беременных"
+  },
+  {
+    "id": 116,
+    "az": "Həlledicilər",
+    "ru": "Растворители"
+  },
+  {
+    "id": 117,
+    "az": "Köməkçi maddələr",
+    "ru": "Вспомогательные вещества"
+  },
+  {
+    "id": 118,
+    "az": "Anestetiklər",
+    "ru": "Анестетики"
+  },
+  {
+    "id": 119,
+    "az": "Narkoz üçün vasitələr",
+    "ru": "Средства для наркоза"
+  },
+  {
+    "id": 120,
+    "az": "Cərrahi vasitələr",
+    "ru": "Хирургические средства"
+  },
+  {
+    "id": 121,
+    "az": "Mövsümi virus infeksiyalarına qarşı mübarizə",
+    "ru": "Борьба с сезонными вирусными инфекциями"
+  },
+  {
+    "id": 122,
+    "az": "Öskürək əleyhinə vasitələr",
+    "ru": "Противокашлевые средства"
+  },
+  {
+    "id": 123,
+    "az": "Allergik boğulmalar və bronxial astmada istifadə olunan vasitələr",
+    "ru": "Средства при аллергическом удушье и бронхиальной астме"
+  },
+  {
+    "id": 124,
+    "az": "Qrip zamanı istifadə olunan vasitələr",
+    "ru": "Средства при гриппе"
+  },
+  {
+    "id": 125,
+    "az": "Rinit, sinusit zamanı istifadə olunan vasitələr",
+    "ru": "Средства при рините, синусите"
+  },
+  {
+    "id": 126,
+    "az": "Bronxit, pnevmoniya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при бронхите, пневмонии"
+  },
+  {
+    "id": 127,
+    "az": "Angina, faringit, laringit zamanı istifadə olunan vasitələr",
+    "ru": "Средства при ангине, фарингите, ларингите"
+  },
+  {
+    "id": 128,
+    "az": "Yuxarı tənəffüs yollarının digər xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при других заболеваниях верхних дыхательных путей"
+  },
+  {
+    "id": 129,
+    "az": "Aşağı tənəffüs yollarının digər xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при других заболеваниях нижних дыхательных путей"
+  },
+  {
+    "id": 130,
+    "az": "Travmatik ağrılarda istifadə olunan vasitələr",
+    "ru": "Средства при травматических болях"
+  },
+  {
+    "id": 131,
+    "az": "Oynaq və əzələ ağrılarında istifadə olunan vasitələr",
+    "ru": "Средства при болях в суставах и мышцах"
+  },
+  {
+    "id": 132,
+    "az": "Spazmolitiklər",
+    "ru": "Спазмолитики"
+  },
+  {
+    "id": 133,
+    "az": "Menstrual ağrılar zamanı istifadə olunan vasitələr",
+    "ru": "Средства при менструальных болях"
+  },
+  {
+    "id": 134,
+    "az": "Baş, diş və qulaq ağrılarında istifadə olunan vasitələr",
+    "ru": "Средства при головной, зубной и ушной боли"
+  },
+  {
+    "id": 135,
+    "az": "Daxili orqanlarda ağrılar zamanı istifadə olunan vasitələr",
+    "ru": "Средства при болях во внутренних органах"
+  },
+  {
+    "id": 136,
+    "az": "Qadınlar üçün bezlər",
+    "ru": "Прокладки для женщин"
+  },
+  {
+    "id": 137,
+    "az": "Böyüklər üçün bezlər",
+    "ru": "Подгузники для взрослых"
+  },
+  {
+    "id": 138,
+    "az": "Yataq xəstələrinə istifadə olunan vasitələr",
+    "ru": "Средства для лежачих больных"
+  },
+  {
+    "id": 139,
+    "az": "Digər gigiyenik vasitələr",
+    "ru": "Прочие гигиенические средства"
+  },
+  {
+    "id": 140,
+    "az": "Osteoporoz zamanı istifadə olunan vasitələr",
+    "ru": "Средства при остеопорозе"
+  },
+  {
+    "id": 141,
+    "az": "Raxit zamanı istifadə olunan vasitələr",
+    "ru": "Средства при рахите"
+  },
+  {
+    "id": 142,
+    "az": "Artrit zamanı istifadə olunan vasitələr",
+    "ru": "Средства при артрите"
+  },
+  {
+    "id": 143,
+    "az": "Artroz zamanı istifadə olunan vasitələr",
+    "ru": "Средства при артрозе"
+  },
+  {
+    "id": 144,
+    "az": "Podaqra əleyhinə vasitələr",
+    "ru": "Средства против подагры"
+  },
+  {
+    "id": 145,
+    "az": "Yumşaq toxumaların zədələnmələri",
+    "ru": "Повреждения мягких тканей"
+  },
+  {
+    "id": 146,
+    "az": "Dayaq-hərəkət sisteminin fəaliyyətini yaxşılaşdırıcı vasitələr",
+    "ru": "Средства для улучшения работы опорно-двигательной системы"
+  },
+  {
+    "id": 147,
+    "az": "Kalsium defisitli xəstəliklər",
+    "ru": "Заболевания с дефицитом кальция"
+  },
+  {
+    "id": 148,
+    "az": "Sınıqlar",
+    "ru": "Переломы"
+  },
+  {
+    "id": 149,
+    "az": "Qulaq xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "ru": "Средства для лечения и профилактики заболеваний уха"
+  },
+  {
+    "id": 150,
+    "az": "Vestibulyar funksiyanın pozğunluğu",
+    "ru": "Нарушение вестибулярной функции"
+  },
+  {
+    "id": 151,
+    "az": "Kəllə-beyin və digər travmalar",
+    "ru": "Черепно-мозговые и другие травмы"
+  },
+  {
+    "id": 152,
+    "az": "Allergik reaksiya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при аллергических реакциях"
+  },
+  {
+    "id": 153,
+    "az": "Zəhərlənmələr zamanı istifadə olunan vasitələr",
+    "ru": "Средства при отравлениях"
+  },
+  {
+    "id": 154,
+    "az": "Köçürülmüş orqan və toxumaların rədd edilməsi",
+    "ru": "Отторжение пересаженных органов и тканей"
+  },
+  {
+    "id": 155,
+    "az": "Anafilaktik şok zamanı istifadə olunan vasitələr",
+    "ru": "Средства при анафилактическом шоке"
+  },
+  {
+    "id": 156,
+    "az": "Ana və uşaq vasitələri",
+    "ru": "Средства для матери и ребёнка"
+  },
+  {
+    "id": 157,
+    "az": "Uşaqlar üçün ağız boşluğuna qulluq",
+    "ru": "Уход за полостью рта для детей"
+  },
+  {
+    "id": 158,
+    "az": "Uşaq bezləri",
+    "ru": "Детские подгузники"
+  },
+  {
+    "id": 159,
+    "az": "Uşaq dərisinə qulluq vasitələri",
+    "ru": "Средства по уходу за детской кожей"
+  },
+  {
+    "id": 160,
+    "az": "Uşaq oyuncaqları",
+    "ru": "Детские игрушки"
+  },
+  {
+    "id": 161,
+    "az": "Aşağı ətraflar üçün ortopedik vasitələr",
+    "ru": "Ортопедические средства для нижних конечностей"
+  },
+  {
+    "id": 162,
+    "az": "Hamilələr üçün ortopedik vasitələr",
+    "ru": "Ортопедические средства для беременных"
+  },
+  {
+    "id": 163,
+    "az": "Yuxarı ətraflar üçün ortopedik vasitələr",
+    "ru": "Ортопедические средства для верхних конечностей"
+  },
+  {
+    "id": 164,
+    "az": "Çanaq nahiyəsi üçün ortopedik vasitələr",
+    "ru": "Ортопедические средства для области таза"
+  },
+  {
+    "id": 165,
+    "az": "Qadınlar üçün ortopedik vasitələr",
+    "ru": "Ортопедические средства для женщин"
+  },
+  {
+    "id": 166,
+    "az": "Döş qəfəsi nahiyəsi üçün ortopedik vasitələr",
+    "ru": "Ортопедические средства для области грудной клетки"
+  },
+  {
+    "id": 167,
+    "az": "Boyun nahiyəsi üçün ortopedik vasitələr",
+    "ru": "Ортопедические средства для области шеи"
+  },
+  {
+    "id": 168,
+    "az": "Bel-qarın nahiyəsi üçün ortopedik vasitələr",
+    "ru": "Ортопедические средства для пояснично-брюшной области"
+  },
+  {
+    "id": 169,
+    "az": "Qaməti korreksiyaedici bandajlar",
+    "ru": "Бандажи для коррекции осанки"
+  },
+  {
+    "id": 170,
+    "az": "Digər ortopedik vasitələr",
+    "ru": "Прочие ортопедические средства"
+  },
+  {
+    "id": 171,
+    "az": "Optik çərçivələr",
+    "ru": "Оптические оправы"
+  },
+  {
+    "id": 172,
+    "az": "Uşaqlar üçün optik çərçivələr",
+    "ru": "Оптические оправы для детей"
+  },
+  {
+    "id": 173,
+    "az": "Qadınlar üçün günəş eynəkləri",
+    "ru": "Солнцезащитные очки для женщин"
+  },
+  {
+    "id": 174,
+    "az": "Kişilər üçün günəş eynəkləri",
+    "ru": "Солнцезащитные очки для мужчин"
+  },
+  {
+    "id": 175,
+    "az": "Uşaqlar üçün günəş eynəkləri",
+    "ru": "Солнцезащитные очки для детей"
+  },
+  {
+    "id": 176,
+    "az": "Qarışıq günəş eynəkləri",
+    "ru": "Солнцезащитные очки (смешанные)"
+  },
+  {
+    "id": 177,
+    "az": "Optik kontakt linzalar",
+    "ru": "Оптические контактные линзы"
+  },
+  {
+    "id": 178,
+    "az": "Kosmetik kontakt linzalar",
+    "ru": "Косметические контактные линзы"
+  },
+  {
+    "id": 179,
+    "az": "Xizək eynəkləri",
+    "ru": "Лыжные очки"
+  },
+  {
+    "id": 180,
+    "az": "Linza məhlulu",
+    "ru": "Раствор для линз"
+  },
+  {
+    "id": 181,
+    "az": "Digər optiki vasitələr",
+    "ru": "Прочие оптические средства"
+  },
+  {
+    "id": 182,
+    "az": "Optik şüşə",
+    "ru": "Оптическое стекло"
+  },
+  {
+    "id": 183,
+    "az": "Dırnaq xəstləlikləri zamanı istifadə olunan vasitələr",
+    "ru": "Средства при заболеваниях ногтей"
+  },
+  {
+    "id": 184,
+    "az": "Göbələk mənşəli səpkilərdə istifadə olunan vasitələr",
+    "ru": "Средства при высыпаниях грибкового происхождения"
+  },
+  {
+    "id": 185,
+    "az": "Psoriaz zamanı istifadə olunan vasitələr",
+    "ru": "Средства при псориазе"
+  },
+  {
+    "id": 186,
+    "az": "Saç xəstəlikləri zamanı istifadə olunan vasitələr",
+    "ru": "Средства при заболеваниях волос"
+  },
+  {
+    "id": 187,
+    "az": "Yanıq zamanı istifadə olunan vasitələr",
+    "ru": "Средства при ожогах"
+  },
+  {
+    "id": 188,
+    "az": "Dermatit və ekzema zamanı istifadə olunan vasitələr",
+    "ru": "Средства при дерматите и экземе"
+  },
+  {
+    "id": 189,
+    "az": "Dəri infeksiyaları zamanı istifadə olunan vasitələr",
+    "ru": "Средства при кожных инфекциях"
+  },
+  {
+    "id": 190,
+    "az": "Dəmrov zamanı istifadə olunan vasitələr",
+    "ru": "Средства при лишае"
+  },
+  {
+    "id": 191,
+    "az": "Sızanaqlar əleyhinə vasitələr",
+    "ru": "Средства против угрей (акне)"
+  },
+  {
+    "id": 192,
+    "az": "Döyənək əleyhinə vasitələr",
+    "ru": "Средства против мозолей"
+  },
+  {
+    "id": 193,
+    "az": "Tonometrlər, stetoskoplar",
+    "ru": "Тонометры, стетоскопы"
+  },
+  {
+    "id": 194,
+    "az": "Termometrlər",
+    "ru": "Термометры"
+  },
+  {
+    "id": 195,
+    "az": "Masaj aparatları",
+    "ru": "Массажёры"
+  },
+  {
+    "id": 196,
+    "az": "Qlükometrlər",
+    "ru": "Глюкометры"
+  },
+  {
+    "id": 197,
+    "az": "İnhalyatorlar",
+    "ru": "Ингаляторы"
+  },
+  {
+    "id": 198,
+    "az": "Tərəzilər",
+    "ru": "Весы"
+  },
+  {
+    "id": 199,
+    "az": "Pulsoksimetrlər",
+    "ru": "Пульсоксиметры"
+  },
+  {
+    "id": 200,
+    "az": "Eşitmə cihazları",
+    "ru": "Слуховые аппараты"
+  },
+  {
+    "id": 201,
+    "az": "Hava təmizləyici cihazlar",
+    "ru": "Очистители воздуха"
+  },
+  {
+    "id": 202,
+    "az": "Digər cihazlar",
+    "ru": "Прочие приборы"
+  },
+  {
+    "id": 203,
+    "az": "İsidici vasitələr",
+    "ru": "Согревающие средства"
+  },
+  {
+    "id": 204,
+    "az": "Tibbi maskalar və respiratorlar",
+    "ru": "Медицинские маски и респираторы"
+  },
+  {
+    "id": 205,
+    "az": "Tibbi kişi xalatları",
+    "ru": "Медицинские мужские халаты"
+  },
+  {
+    "id": 206,
+    "az": "Tibbi qadın xalatları",
+    "ru": "Медицинские женские халаты"
+  },
+  {
+    "id": 207,
+    "az": "Tibbi kostyumlar",
+    "ru": "Медицинские костюмы"
+  },
+  {
+    "id": 208,
+    "az": "Tibbi ayaqqabılar, baxillər",
+    "ru": "Медицинская обувь, бахилы"
+  },
+  {
+    "id": 209,
+    "az": "Tibbi papaqlar",
+    "ru": "Медицинские шапочки"
+  },
+  {
+    "id": 210,
+    "az": "Tibbi əlcəklər",
+    "ru": "Медицинские перчатки"
+  },
+  {
+    "id": 211,
+    "az": "Yumurtalıqların polikistozu sindromunda istifadə olunan vasitələr",
+    "ru": "Средства при синдроме поликистоза яичников"
+  },
+  {
+    "id": 212,
+    "az": "Qalxanabənzər vəzi (zob) xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "ru": "Средства для лечения и профилактики заболеваний щитовидной железы (зоба)"
+  },
+  {
+    "id": 213,
+    "az": "Diabet xəstəliklərinin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "ru": "Средства для лечения и профилактики диабета"
+  },
+  {
+    "id": 214,
+    "az": "Digər hormonal xəstəliklərin müalicə və profilaktikasında istifadə olunan vasitələr",
+    "ru": "Средства для лечения и профилактики других гормональных заболеваний"
+  },
+  {
+    "id": 215,
+    "az": "Stenokardiya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при стенокардии"
+  },
+  {
+    "id": 216,
+    "az": "Ürəyin digər xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при других заболеваниях сердца"
+  },
+  {
+    "id": 217,
+    "az": "Beyin qan dövranı pozğunluğunda istifadə olunan vasitələr",
+    "ru": "Средства при нарушении мозгового кровообращения"
+  },
+  {
+    "id": 218,
+    "az": "Venaların varikoz genişlənməsi zamanı istifadə olunan vasitələr",
+    "ru": "Средства при варикозном расширении вен"
+  },
+  {
+    "id": 219,
+    "az": "Tromboflebit zamanı istifadə olunan vasitələr",
+    "ru": "Средства при тромбофлебите"
+  },
+  {
+    "id": 220,
+    "az": "Aritmiya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при аритмии"
+  },
+  {
+    "id": 221,
+    "az": "Ürək revmatizmi zamanı istifadə olunan vasitələr",
+    "ru": "Средства при ревматизме сердца"
+  },
+  {
+    "id": 222,
+    "az": "Qan dövranının digər xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при других заболеваниях кровообращения"
+  },
+  {
+    "id": 223,
+    "az": "Hipertoniya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при гипертонии"
+  },
+  {
+    "id": 224,
+    "az": "Qanaxmalarda istifadə olunan vasitələr",
+    "ru": "Средства при кровотечениях"
+  },
+  {
+    "id": 225,
+    "az": "Miokard infarktı zamanı istifadə olunan vasitələr",
+    "ru": "Средства при инфаркте миокарда"
+  },
+  {
+    "id": 226,
+    "az": "Hipotoniya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при гипотонии"
+  },
+  {
+    "id": 227,
+    "az": "Ürək çatmamazlığı zamanı istifadə olunan vasitələr",
+    "ru": "Средства при сердечной недостаточности"
+  },
+  {
+    "id": 228,
+    "az": "Ateroskleroz zamanı istifadə olunan vasitələr",
+    "ru": "Средства при атеросклерозе"
+  },
+  {
+    "id": 229,
+    "az": "İnsult zamanı istifadə olunan vasitələr",
+    "ru": "Средства при инсульте"
+  },
+  {
+    "id": 230,
+    "az": "Əl, dəri və selikli qişalar üçün antiseptik vasitələr",
+    "ru": "Антисептические средства для рук, кожи и слизистых оболочек"
+  },
+  {
+    "id": 231,
+    "az": "Tibbi avadanlıqlar üçün",
+    "ru": "Для медицинского оборудования"
+  },
+  {
+    "id": 232,
+    "az": "Dezinfeksiyaedici vasitələr",
+    "ru": "Дезинфицирующие средства"
+  },
+  {
+    "id": 233,
+    "az": "Quru göz sindromu zamanı istifadə olunan vasitələr",
+    "ru": "Средства при синдроме сухого глаза"
+  },
+  {
+    "id": 234,
+    "az": "Görmə zəifliyi zamanı istifadə olunan vasitələr",
+    "ru": "Средства при ослаблении зрения"
+  },
+  {
+    "id": 235,
+    "az": "Kataraktada istifadə olunan vasitələr",
+    "ru": "Средства при катаракте"
+  },
+  {
+    "id": 236,
+    "az": "Gözün virus mənşəli xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при вирусных заболеваниях глаз"
+  },
+  {
+    "id": 237,
+    "az": "Gözün diaqnostikası zamanı istifadə olunan vasitələr",
+    "ru": "Средства для диагностики глаз"
+  },
+  {
+    "id": 238,
+    "az": "Gözün allergik xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при аллергических заболеваниях глаз"
+  },
+  {
+    "id": 239,
+    "az": "Gözün iltihabi xəstəliklərində istifadə olunan vasitələr",
+    "ru": "Средства при воспалительных заболеваниях глаз"
+  },
+  {
+    "id": 240,
+    "az": "Qlaukomada istifadə olunan vasitələr",
+    "ru": "Средства при глаукоме"
+  },
+  {
+    "id": 241,
+    "az": "Qidalanma pozğunluğu zamanı istifadə olunan vasitələr",
+    "ru": "Средства при нарушении питания"
+  },
+  {
+    "id": 242,
+    "az": "Vitamin və mineral çatmamazlığı",
+    "ru": "Дефицит витаминов и минералов"
+  },
+  {
+    "id": 243,
+    "az": "Piylənmədə istifadə olunan vasitələr",
+    "ru": "Средства при ожирении"
+  },
+  {
+    "id": 244,
+    "az": "Metabolik pozulmalar zamanı istifadə olunan vasitələr",
+    "ru": "Средства при нарушениях обмена веществ"
+  },
+  {
+    "id": 245,
+    "az": "Saç üçün maskalar, yağlar, kremlər",
+    "ru": "Маски, масла, кремы для волос"
+  },
+  {
+    "id": 246,
+    "az": "Saç üçün laklar, musslar",
+    "ru": "Лаки, муссы для волос"
+  },
+  {
+    "id": 247,
+    "az": "Şampunlar",
+    "ru": "Шампуни"
+  },
+  {
+    "id": 248,
+    "az": "Balzamlar",
+    "ru": "Бальзамы"
+  },
+  {
+    "id": 249,
+    "az": "Saç boyaları",
+    "ru": "Краски для волос"
+  },
+  {
+    "id": 250,
+    "az": "Saç üçün digər vasitələr",
+    "ru": "Прочие средства для волос"
+  },
+  {
+    "id": 251,
+    "az": "Homeopatik vasitələr",
+    "ru": "Гомеопатические средства"
+  },
+  {
+    "id": 252,
+    "az": "Uşaqlıq yoluna daraldıcı təsir göstərən vasitələr",
+    "ru": "Средства, оказывающие сужающее действие на влагалище"
+  },
+  {
+    "id": 253,
+    "az": "Ginekoloji vasitələr",
+    "ru": "Гинекологические средства"
+  },
+  {
+    "id": 254,
+    "az": "Qoruyucu məmulatlar",
+    "ru": "Презервативы"
+  },
+  {
+    "id": 255,
+    "az": "İntim gellər",
+    "ru": "Интимные гели"
+  },
+  {
+    "id": 256,
+    "az": "Anemiya zamanı istifadə olunan vasitələr",
+    "ru": "Средства при анемии"
+  },
+  {
+    "id": 257,
+    "az": "İmmunçatışmazlığı zamanı istifadə olunan vasitələr",
+    "ru": "Средства при иммунодефиците"
+  },
+  {
+    "id": 258,
+    "az": "Əllərə qulluq vasitələri",
+    "ru": "Средства по уходу за руками"
+  },
+  {
+    "id": 259,
+    "az": "Ayaqlara qulluq vasitələri",
+    "ru": "Средства по уходу за ногами"
+  },
+  {
+    "id": 260,
+    "az": "Bədənə qulluq vasitələri",
+    "ru": "Средства по уходу за телом"
+  },
+  {
+    "id": 261,
+    "az": "Tər əleyhinə vasitələr",
+    "ru": "Средства против пота (антиперспиранты)"
+  },
+  {
+    "id": 262,
+    "az": "Epilyasiya və depilyasiya",
+    "ru": "Эпиляция и депиляция"
+  },
+  {
+    "id": 263,
+    "az": "Zərdablar",
+    "ru": "Сыворотки"
+  },
+  {
+    "id": 264,
+    "az": "Üzə qulluq vasitələri",
+    "ru": "Средства по уходу за лицом"
+  },
+  {
+    "id": 265,
+    "az": "Yaşlanma əleyhinə qulluq vasitələri",
+    "ru": "Антивозрастные средства по уходу"
+  },
+  {
+    "id": 266,
+    "az": "Duş gelləri",
+    "ru": "Гели для душа"
+  },
+  {
+    "id": 267,
+    "az": "Sabunlar",
+    "ru": "Мыло"
+  },
+  {
+    "id": 268,
+    "az": "Təmizləyici vasitələr",
+    "ru": "Очищающие средства"
+  },
+  {
+    "id": 269,
+    "az": "Nəmləndirici vasitələr",
+    "ru": "Увлажняющие средства"
+  },
+  {
+    "id": 270,
+    "az": "Günəş vannası üçün kremlər",
+    "ru": "Кремы для загара"
+  },
+  {
+    "id": 271,
+    "az": "Kişilər üçün təraş vasitələri",
+    "ru": "Средства для бритья для мужчин"
+  },
+  {
+    "id": 272,
+    "az": "Gözətrafı dəriyə qulluq vasitələri",
+    "ru": "Средства по уходу за кожей вокруг глаз"
+  },
+  {
+    "id": 273,
+    "az": "Tonal vasitələr",
+    "ru": "Тональные средства"
+  },
+  {
+    "id": 274,
+    "az": "Dodaqlara qulluq vasitələri",
+    "ru": "Средства по уходу за губами"
+  },
+  {
+    "id": 275,
+    "az": "Çapıqlar üçün vasitələr",
+    "ru": "Средства от рубцов"
+  },
+  {
+    "id": 276,
+    "az": "Saqqızlar",
+    "ru": "Жевательные резинки"
+  },
+  {
+    "id": 277,
+    "az": "Diş sapları",
+    "ru": "Зубные нити"
+  },
+  {
+    "id": 278,
+    "az": "Diş protezləri üçün vasitələr",
+    "ru": "Средства для зубных протезов"
+  },
+  {
+    "id": 279,
+    "az": "Diş fırçaları",
+    "ru": "Зубные щётки"
+  },
+  {
+    "id": 280,
+    "az": "Diş məcunları",
+    "ru": "Зубные пасты"
+  },
+  {
+    "id": 281,
+    "az": "Diş tozları",
+    "ru": "Зубные порошки"
+  },
+  {
+    "id": 282,
+    "az": "Ağız boşluğu üçün məhlullar",
+    "ru": "Растворы для полости рта"
+  },
+  {
+    "id": 283,
+    "az": "Ağız boşluğu üçün gellər",
+    "ru": "Гели для полости рта"
+  },
+  {
+    "id": 284,
+    "az": "Ağız boşluğu üçün digər vasitələr",
+    "ru": "Прочие средства для полости рта"
+  },
+  {
+    "id": 285,
+    "az": "La Roche-Posay",
+    "ru": "La Roche-Posay"
+  },
+  {
+    "id": 286,
+    "az": "Vichy",
+    "ru": "Vichy"
+  },
+  {
+    "id": 287,
+    "az": "Biolane",
+    "ru": "Biolane"
+  },
+  {
+    "id": 288,
+    "az": "Artıq bədən çəkisi zamanı istifadə olunan vasitələr",
+    "ru": "Средства при избыточной массе тела"
+  },
+  {
+    "id": 289,
+    "az": "Zondlar, kateterlər",
+    "ru": "Зонды, катетеры"
+  },
+  {
+    "id": 290,
+    "az": "Yuyucu vasitələr",
+    "ru": "Моющие средства"
+  },
+  {
+    "id": 291,
+    "az": "Sarğı materialları",
+    "ru": "Перевязочные материалы"
+  },
+  {
+    "id": 292,
+    "az": "İnfuziya sistemləri, şprislər, iynələr",
+    "ru": "Инфузионные системы, шприцы, иглы"
+  },
+  {
+    "id": 293,
+    "az": "Test üçün vasitələr",
+    "ru": "Средства для тестов"
+  },
+  {
+    "id": 294,
+    "az": "Digər vasitələr",
+    "ru": "Прочие средства"
+  },
+  {
+    "id": 295,
+    "az": "Kosmetoloji alətlər",
+    "ru": "Косметологические инструменты"
+  },
+  {
+    "id": 296,
+    "az": "Qidalandırıcı kremlər",
+    "ru": "Питательные кремы"
+  },
+  {
+    "id": 297,
+    "az": "Yumşaldıcı vasitələr",
+    "ru": "Смягчающие средства"
+  },
+  {
+    "id": 298,
+    "az": "Digər kosmetik vasitələr",
+    "ru": "Прочие косметические средства"
+  },
+  {
+    "id": 299,
+    "az": "Günəşdən qoruyucu vasitələr",
+    "ru": "Солнцезащитные средства"
+  },
+  {
+    "id": 300,
+    "az": "İdmançılar üçün digər vasitələr",
+    "ru": "Прочие средства для спортсменов"
+  },
+  {
+    "id": 301,
+    "az": "İdmançılar üçün qidalar",
+    "ru": "Питание для спортсменов"
+  },
+  {
+    "id": 302,
+    "az": "İdman zədələnmələrində istifadə olunan vasitələr",
+    "ru": "Средства при спортивных травмах"
+  },
+  {
+    "id": 303,
+    "az": "Mineral sular, meyvə şirələri",
+    "ru": "Минеральные воды, фруктовые соки"
+  },
+  {
+    "id": 304,
+    "az": "Bitki yağları",
+    "ru": "Растительные масла"
+  },
+  {
+    "id": 305,
+    "az": "Qəhvələr",
+    "ru": "Кофе"
+  },
+  {
+    "id": 306,
+    "az": "Bitki çayları",
+    "ru": "Травяные чаи"
+  },
+  {
+    "id": 307,
+    "az": "Dərman bitkiləri",
+    "ru": "Лекарственные растения"
+  },
+  {
+    "id": 308,
+    "az": "Berdoues",
+    "ru": "Berdoues"
+  },
+  {
+    "id": 309,
+    "az": "Uşaq ətirləri",
+    "ru": "Детская парфюмерия"
+  },
+  {
+    "id": 310,
+    "az": "Ətirli sular",
+    "ru": "Душистые воды"
+  },
+  {
+    "id": 311,
+    "az": "Eau De Toilette",
+    "ru": "Туалетная вода"
+  },
+  {
+    "id": 312,
+    "az": "Neylon corablar",
+    "ru": "Нейлоновые носки"
+  },
+  {
+    "id": 313,
+    "az": "Kalqotkalar",
+    "ru": "Колготки"
+  },
+  {
+    "id": 314,
+    "az": "Pastalar",
+    "ru": "Пасты"
+  },
+  {
+    "id": 315,
+    "az": "Şirniyyat",
+    "ru": "Сладости"
+  },
+  {
+    "id": 316,
+    "az": "İnfeksion və parazitar xəstəliklər",
+    "ru": "Инфекционные и паразитарные заболевания"
+  },
+  {
+    "id": 317,
+    "az": "Onkoloji xəstəliklər",
+    "ru": "Онкологические заболевания"
+  },
+  {
+    "id": 318,
+    "az": "Sinir sistemi xəstəlikləri",
+    "ru": "Заболевания нервной системы"
+  },
+  {
+    "id": 319,
+    "az": "Həzm sistemi  xəstəlikləri",
+    "ru": "Заболевания пищеварительной системы"
+  },
+  {
+    "id": 320,
+    "az": "Sidik-cinsiyyət sistemi xəstəlikləri",
+    "ru": "Заболевания мочеполовой системы"
+  },
+  {
+    "id": 321,
+    "az": "Hamiləlik",
+    "ru": "Беременность"
+  },
+  {
+    "id": 322,
+    "az": "Cərrahiyə",
+    "ru": "Хирургия"
+  },
+  {
+    "id": 323,
+    "az": "Tənəffüs sistemi xəstəlikləri",
+    "ru": "Заболевания дыхательной системы"
+  },
+  {
+    "id": 324,
+    "az": "Ağrıkəsicilər",
+    "ru": "Обезболивающие"
+  },
+  {
+    "id": 325,
+    "az": "Gigiyenik  bezlər",
+    "ru": "Гигиенические прокладки"
+  },
+  {
+    "id": 326,
+    "az": "Sümük-əzələ sisteminin xəstəlikləri",
+    "ru": "Заболевания костно-мышечной системы"
+  },
+  {
+    "id": 327,
+    "az": "Qulaq xəstəlikləri",
+    "ru": "Заболевания уха"
+  },
+  {
+    "id": 328,
+    "az": "Travmalar, zəhərlənmələr və digər xarici təsirlər",
+    "ru": "Травмы, отравления и другие внешние воздействия"
+  },
+  {
+    "id": 329,
+    "az": "Ana və uşaq",
+    "ru": "Мать и ребёнок"
+  },
+  {
+    "id": 330,
+    "az": "Ortopediya vasitələri",
+    "ru": "Ортопедические средства"
+  },
+  {
+    "id": 331,
+    "az": "Optika məhsulları",
+    "ru": "Оптические товары"
+  },
+  {
+    "id": 332,
+    "az": "Dəri xəstəlikləri",
+    "ru": "Кожные заболевания"
+  },
+  {
+    "id": 333,
+    "az": "Tibbi avadanlıqlar",
+    "ru": "Медицинское оборудование"
+  },
+  {
+    "id": 334,
+    "az": "Tibbi geyimlər",
+    "ru": "Медицинская одежда"
+  },
+  {
+    "id": 335,
+    "az": "Endokrinoloji xəstəliklər",
+    "ru": "Эндокринологические заболевания"
+  },
+  {
+    "id": 336,
+    "az": "Qan dövranı sisteminin xəstəlikləri",
+    "ru": "Заболевания системы кровообращения"
+  },
+  {
+    "id": 337,
+    "az": "Antiseptiklər və dezinfeksiyaedicilər",
+    "ru": "Антисептики и дезинфицирующие средства"
+  },
+  {
+    "id": 338,
+    "az": "Göz xəstəlikləri",
+    "ru": "Заболевания глаз"
+  },
+  {
+    "id": 339,
+    "az": "Maddələr mübadiləsinin pozğunluğu",
+    "ru": "Нарушение обмена веществ"
+  },
+  {
+    "id": 340,
+    "az": "Saça qulluq vasitələri",
+    "ru": "Средства по уходу за волосами"
+  },
+  {
+    "id": 341,
+    "az": "Homeopatiya",
+    "ru": "Гомеопатия"
+  },
+  {
+    "id": 342,
+    "az": "İntim vasitələr",
+    "ru": "Интимные средства"
+  },
+  {
+    "id": 343,
+    "az": "Qan xəstəlikləri və immun sistemin çatışmazlıqları",
+    "ru": "Заболевания крови и иммунодефициты"
+  },
+  {
+    "id": 344,
+    "az": "Dəriyə qulluq vasitələri",
+    "ru": "Средства по уходу за кожей"
+  },
+  {
+    "id": 345,
+    "az": "Ağız boşluğunun qulluğu",
+    "ru": "Уход за полостью рта"
+  },
+  {
+    "id": 346,
+    "az": "Kosmetik vasitələr",
+    "ru": "Косметические средства"
+  },
+  {
+    "id": 347,
+    "az": "Dieta",
+    "ru": "Диета"
+  },
+  {
+    "id": 348,
+    "az": "Tibbi vasitələr",
+    "ru": "Медицинские средства"
+  },
+  {
+    "id": 349,
+    "az": "Kosmetoloji və dəriyə qulluq vasitələri",
+    "ru": "Косметологические средства и средства по уходу за кожей"
+  },
+  {
+    "id": 350,
+    "az": "İdman",
+    "ru": "Спорт"
+  },
+  {
+    "id": 351,
+    "az": "Təbii vasitələr",
+    "ru": "Натуральные средства"
+  },
+  {
+    "id": 352,
+    "az": "Ətirlər",
+    "ru": "Парфюмерия"
+  },
+  {
+    "id": 353,
+    "az": "Qadın guşəsi",
+    "ru": "Женский уголок"
+  },
+  {
+    "id": 354,
+    "az": "Qida",
+    "ru": "Питание"
+  },
+  {
+    "id": 355,
+    "az": "Daha çox",
+    "ru": "Ещё"
+  },
+  {
+    "id": 356,
+    "az": "Daha çox",
+    "ru": "Ещё"
+  },
+  {
+    "id": 357,
+    "az": "Daha çox",
+    "ru": "Ещё"
+  }
+]
