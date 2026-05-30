@@ -1527,6 +1527,10 @@ def dash_comparison(
             continue
         raw_prices: dict[str, dict[str, Any]] = {}
         for p in m.products:
+            # «Фантомные» товары (страница 404, помечены validate-links) — скрываем,
+            # чтобы не показывать матч с мёртвой ссылкой на конкурента.
+            if p.url_dead_at is not None:
+                continue
             snap = snaps_by_pid.get(p.id)
             price = (snap.discount_price or snap.price) if snap else None
             if price is not None and price > 0:

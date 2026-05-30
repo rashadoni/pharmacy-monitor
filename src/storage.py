@@ -133,6 +133,13 @@ class Product(Base):
         ForeignKey("matches.id"), nullable=True, index=True
     )
 
+    # 2026-05-30: страница товара отдаёт 404. aptekonline JSON API листит
+    # «фантомные» товары (в каталоге, но без живой страницы) → они скрейпятся,
+    # matched, last_seen свежий, но ссылка ведёт на 404. Ставится `validate-links`
+    # CLI (HTTP-проверка); comparison исключает такие товары. NULL = жива/не
+    # проверялась. Единственный надёжный сигнал — реальный HTTP-чек URL.
+    url_dead_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     snapshots: Mapped[list[PriceSnapshot]] = relationship(back_populates="product")
     canonical: Mapped[Match | None] = relationship(back_populates="products")
 
@@ -642,6 +649,8 @@ def _apply_lightweight_migrations(engine) -> None:
             ("runs", "products_per_site_category", "JSON"),
             # 2026-05-11 (ночь): password в DB (вместо global env-hash)
             ("tenant_users", "password_hash", "VARCHAR(200)"),
+            # 2026-05-30: «фантомные» товары (страница 404) — ставится validate-links
+            ("products", "url_dead_at", "TIMESTAMP"),
         ]
         for table, column, coltype in migrations:
             try:

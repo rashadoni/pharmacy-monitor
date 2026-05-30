@@ -403,3 +403,43 @@ def test_price_index_and_category_comparison_kwargs_no_typeerror(db_session):
     """
     assert analytics.price_index_by_category(db_session, client_site="pharmonline", tenant_id=1) == []
     assert analytics.category_comparison(db_session, client_site="pharmonline", tenant_id=1) == []
+
+
+def test_category_comparison_excludes_dead_url(db_session):
+    """Товар с url_dead_at (страница 404) исключается из сравнения."""
+    run = _add_run(db_session)
+    m = Match(canonical_name="D", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    c = _add_product(db_session, "pharmonline", "D", canonical_id=m.id, category="cat", ext_id="c")
+    a_dead = _add_product(db_session, "aptekonline", "D", canonical_id=m.id, category="ac", ext_id="a")
+    al = _add_product(db_session, "aloe", "D", canonical_id=m.id, category="lc", ext_id="l")
+    a_dead.url_dead_at = utcnow()  # фантомный конкурент
+    db_session.flush()
+    _add_snap_at(db_session, run, c, 10.0)
+    _add_snap_at(db_session, run, a_dead, 8.0)
+    _add_snap_at(db_session, run, al, 9.0)
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session)
+    assert len(rows) == 1
+    # aptekonline (dead) исключён, остаётся только aloe
+    assert "aptekonline" not in rows[0].per_site_avg
+    assert rows[0].per_site_avg == {"aloe": 9.0}
+
+
+def test_category_comparison_skips_match_with_dead_client(db_session):
+    """Если фантомен сам клиент (pharmonline 404) — матч выпадает целиком."""
+    run = _add_run(db_session)
+    m = Match(canonical_name="DC", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    c = _add_product(db_session, "pharmonline", "DC", canonical_id=m.id, category="cat", ext_id="c")
+    a = _add_product(db_session, "aloe", "DC", canonical_id=m.id, category="lc", ext_id="a")
+    c.url_dead_at = utcnow()
+    db_session.flush()
+    _add_snap_at(db_session, run, c, 10.0)
+    _add_snap_at(db_session, run, a, 8.0)
+    db_session.commit()
+
+    assert analytics.category_comparison(db_session) == []

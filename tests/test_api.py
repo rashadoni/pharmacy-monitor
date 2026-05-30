@@ -1495,3 +1495,46 @@ def test_comparison_category_filter(client, tenant_user, setup_db):
     # Без фильтра — обе категории.
     r2 = client.get("/api/v1/dash/comparison")
     assert {row["name"] for row in r2.json()} == {"v1", "p1"}
+
+
+def test_comparison_excludes_dead_aptekonline(client, tenant_user, setup_db):
+    """Товар с url_dead_at (404) скрыт; матч остаётся через pharmonline+aloe."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    m = _make_match_with_prices(
+        s, run, canonical="phantom",
+        prices={"pharmonline": 10.0, "aptekonline": 8.0, "aloe": 9.0},
+    )
+    next(p for p in m.products if p.site == "aptekonline").url_dead_at = utcnow()
+    s.commit()
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/comparison?min_sites=2")
+    assert r.status_code == 200, r.text
+    rows = {row["name"]: row for row in r.json()}
+    assert "phantom" in rows  # ещё виден (pharmonline + aloe)
+    assert set(rows["phantom"]["prices"]) == {"pharmonline", "aloe"}  # мёртвый aptekonline скрыт
+
+
+def test_comparison_hides_match_when_only_dead_competitor(client, tenant_user, setup_db):
+    """Единственный конкурент мёртв → матч падает ниже min_sites и не виден."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    m = _make_match_with_prices(
+        s, run, canonical="solodead", prices={"pharmonline": 10.0, "aptekonline": 8.0}
+    )
+    next(p for p in m.products if p.site == "aptekonline").url_dead_at = utcnow()
+    s.commit()
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get("/api/v1/dash/comparison?min_sites=2")
+    assert r.status_code == 200, r.text
+    assert "solodead" not in [row["name"] for row in r.json()]

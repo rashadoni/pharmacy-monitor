@@ -160,5 +160,16 @@ echo "running: pharmacy-monitor run ${ARGS[*]}"
 .venv/bin/pharmacy-monitor run "${ARGS[@]}"
 EXIT_CODE=$?
 
+# ── Validate aptekonline links (фантомные товары: страница 404) ──────────────
+# aptekonline JSON API листит товары без живой страницы (в каталоге, но 404).
+# Они скрейпятся/matched (age=0), но ссылка мёртвая. HTTP-чек URL с Baku-IP
+# (прямой, без прокси — Hetzner-IP забанен) помечает 404 (Product.url_dead_at);
+# comparison их скрывает. Non-fatal: проблема валидации не валит скрейп.
+if [[ "${ARGS[*]}" == *aptekonline* ]]; then
+    echo "validating aptekonline links…"
+    .venv/bin/pharmacy-monitor validate-links --site aptekonline \
+        || echo "WARN: validate-links failed (non-fatal)"
+fi
+
 echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | run-scrape.sh end (exit $EXIT_CODE) ====="
 exit $EXIT_CODE

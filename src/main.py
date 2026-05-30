@@ -1963,6 +1963,53 @@ def rematch_cmd(reset: bool, threshold: int | None) -> None:
         click.echo(f"Price-spread flags updated: {flagged} matches changed.")
 
 
+@cli.command("validate-links")
+@click.option("--site", default="aptekonline", help="Сайт для проверки (default aptekonline)")
+@click.option("--limit", type=int, default=None, help="Макс. товаров (для smoke-теста)")
+@click.option("--concurrency", default=10, help="Параллельных HTTP-запросов")
+@click.option("--matched-only/--all", default=True, help="Только matched товары (default)")
+def validate_links_cmd(site: str, limit: int | None, concurrency: int, matched_only: bool) -> None:
+    """HTTP-проверка URL товаров → помечает 404-страницы (Product.url_dead_at).
+
+    aptekonline JSON API листит «фантомные» товары (в каталоге, но страница 404).
+    Comparison скрывает помеченные. Запускать с НЕ-забаненного IP (Mac/Baku — для
+    aptekonline Hetzner-IP забанен; прокси для product-страниц тратил бы трафик).
+    """
+    import asyncio
+
+    from sqlalchemy import func
+
+    from src import link_validator
+    from src._time import utcnow
+
+    Session = storage.make_session()
+    with Session() as session:
+        q = select(storage.Product).where(storage.Product.site == site)
+        if matched_only:
+            q = q.where(storage.Product.canonical_id.is_not(None))
+        q = q.order_by(storage.Product.id)
+        if limit:
+            q = q.limit(limit)
+        products = session.scalars(q).all()
+        click.echo(
+            f"validate-links: проверяю {len(products)} URL ({site}, matched_only={matched_only})…"
+        )
+        items = [(p.id, p.url) for p in products]
+        results = asyncio.run(link_validator.check_urls(items, concurrency=concurrency))
+        counts = link_validator.apply_results(session, results, utcnow())
+        session.commit()
+        total_dead = session.scalar(
+            select(func.count(storage.Product.id)).where(
+                storage.Product.site == site, storage.Product.url_dead_at.is_not(None)
+            )
+        )
+        click.echo(
+            f"newly_dead={counts['newly_dead']} revived={counts['revived']} "
+            f"still_dead={counts['still_dead']} errors_skipped={counts['error']} | "
+            f"total_dead_now({site})={total_dead}"
+        )
+
+
 @cli.command("report")
 @click.option("--run-id", type=int, default=None, help="ID прогона (по умолчанию — последний ok)")
 @click.option("--send", is_flag=True, help="Отправить по email")

@@ -378,7 +378,8 @@ def _iter_matched_prices(
         if not m.is_manual and conf < min_confidence:
             continue
         client_p = next((p for p in m.products if p.site == client_site), None)
-        if client_p is None:
+        # «Фантомный» клиент (страница 404, помечен validate-links) → матч бесполезен.
+        if client_p is None or client_p.url_dead_at is not None:
             continue
         client_price = _current_price(snaps.get(client_p.id))
         if client_price is None:
@@ -386,7 +387,7 @@ def _iter_matched_prices(
 
         comp_by_site: dict[str, list[float]] = defaultdict(list)
         for p in m.products:
-            if p.site == client_site:
+            if p.site == client_site or p.url_dead_at is not None:
                 continue
             price = _current_price(snaps.get(p.id))
             if price is not None:
