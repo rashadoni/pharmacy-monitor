@@ -14,6 +14,7 @@ from src.matcher import (
     _has_conflicting_series_number,
     _has_conflicting_strength_number,
     _has_conflicting_variant_atoms,
+    _has_conflicting_variant_marker,
     _has_conflicting_variant_tokens,
     _has_extreme_length_disparity,
     _has_perunit_mismatch,
@@ -21,6 +22,7 @@ from src.matcher import (
     _pack_count,
     _strength_numbers,
     _variant_atoms,
+    _variant_markers,
 )
 
 
@@ -1551,6 +1553,76 @@ class TestConcentrationGuard:
         )
         # одна сторона без % → не блокируем
         assert _has_conflicting_concentration("Diklofenak 1%", "Diklofenak gel") is False
+
+
+class TestVariantMarkerGuard:
+    """Серебро (Ag) + номер модели (type/tip/тип N) как взаимно-уникальные маркеры."""
+
+    def test_extract_silver_and_type(self):
+        assert _variant_markers("Spiral Yunona Bio-T Ag") == frozenset({"ag"})
+        assert _variant_markers("Spiral Yunona Bio-T Cu380 type1") == frozenset({"t1"})
+        assert _variant_markers("Spiral Yunona Bio T Cu 380+Ag 2 tip") == frozenset({"ag", "t2"})
+        assert _variant_markers('Spiral "Yunona" Bio-T Tip 1') == frozenset({"t1"})
+
+    def test_no_type_pollution_from_copper(self):
+        # «Cu380 type1» → только t1; «380» (медь) НЕ становится t380.
+        assert _variant_markers("Bio-T Cu380 type1") == frozenset({"t1"})
+
+    def test_silver_vs_type_blocks(self):
+        # Реальный кейс: Bio-T Ag (серебро) ≠ Bio-T Tip 1 (тип) → блок.
+        assert (
+            _has_conflicting_variant_marker(
+                "Spiral Yunona Bio-T Ag", 'Spiral "Yunona" Bio-T Tip 1'
+            )
+            is True
+        )
+
+    def test_different_type_numbers_block(self):
+        assert _has_conflicting_variant_marker("Bio-T Cu380 type1", "Bio-T Cu380 type2") is True
+
+    def test_same_or_superset_no_block(self):
+        assert _has_conflicting_variant_marker("Bio-T Ag", "Bio-T  Ag") is False
+        # «Ag» vs «Ag Tip 2» — односторонний (неполные данные) → не блок.
+        assert _has_conflicting_variant_marker("Bio-T Ag", "Bio-T Ag Tip 2") is False
+
+    def test_az_white_antigen_no_false_block(self):
+        # ЛОВУШКА: «ağ»(белый)/«AG»(антиген) не дают ложный блок — symmetric спасает.
+        assert (
+            _has_conflicting_variant_marker(
+                "Fitoton ağ gil (ag gil) 150 qr", "Fitoton gil 150 qr"
+            )
+            is False
+        )
+        assert _has_conflicting_variant_marker("Maska (ag) №1", "Maska tibbi №1") is False
+
+    def test_no_markers_no_block(self):
+        assert _has_conflicting_variant_marker("Aspirin 500 N20", "Aspirin 500 N10") is False
+
+
+def test_variant_marker_blocks_silver_vs_type(db_session):
+    """Юнона Био-Т Ag (серебро) ≠ Био-Т Тип 1 — разные модификации, не матчатся."""
+    s = db_session
+    a = _make_product(
+        s,
+        site="pharmonline",
+        external_id="spiral-ag",
+        name="Spiral Yunona Bio-T Ag",
+        name_normalized="spiral yunona bio t ag",
+        brand="yunona",
+    )
+    b = _make_product(
+        s,
+        site="aptekonline",
+        external_id="spiral-tip1",
+        name='Spiral "Yunona" Bio-T Tip 1',
+        name_normalized="spiral yunona bio t tip 1",
+        brand="yunona",
+    )
+    s.commit()
+    matcher.match_products(s)
+    s.refresh(a)
+    s.refresh(b)
+    assert not (a.canonical_id and b.canonical_id and a.canonical_id == b.canonical_id)
 
 
 def test_dimension_blocks_different_size(db_session):

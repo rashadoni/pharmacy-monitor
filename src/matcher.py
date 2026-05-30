@@ -482,6 +482,43 @@ def _has_conflicting_variant_atoms(name_raw_a: str, name_raw_b: str) -> bool:
     return bool(atoms_a - atoms_b) and bool(atoms_b - atoms_a)
 
 
+# ── Вариант-маркеры: серебро (Ag) + номер модели (type/tip/тип N) (2026-05-30) ──
+# Класс ложных матчей в линейках с модификациями (Юнона Био-Т: Ag/Cu380/type1/2):
+# матчер сцеплял «Bio-T Ag» ↔ «Bio-T Tip 1» по общим токенам. «Ag» (2 буквы) <
+# _MIN_VARIANT_TOKEN_LEN=3 → игнорился; type/tip N не сверялся как номер модели.
+# ЛОВУШКА: az «ağ»=белый → после strip_accents «ag» коллизит с серебром Ag, плюс
+# «AG»=антиген (COVID-19 AG тест). Поэтому: (1) detection БЕЗ strip_accents (ğ≠g,
+# так «ağ gil» не даёт маркер); (2) СИММЕТРИЧНОЕ правило (как variant_tokens/atoms)
+# — блок только при взаимно-уникальных маркерах. «Maska (ag)»{ag} vs «Maska»{} →
+# НЕ блок (односторонний = неполные данные). type-номер 1-2 цифры + \b: «Cu380
+# type1»→{t1} (380 не зацепляется), «2 tip»/«type1»/«Tip 2» — все ловятся.
+_SILVER_RE = re.compile(r"\bag\b|g[üu]m[üu][sş]|silver|серебро", re.IGNORECASE)
+_TYPE_FWD_RE = re.compile(r"(?:tip|type|тип)\s*(\d{1,2})\b", re.IGNORECASE)
+_TYPE_REV_RE = re.compile(r"\b(\d{1,2})\s*(?:tip|type|тип)\b", re.IGNORECASE)
+
+
+def _variant_markers(raw_name: str) -> frozenset[str]:
+    """Маркеры модификации из RAW-имени (БЕЗ strip_accents): серебро → 'ag',
+    номер модели type/tip/тип N → 't<N>'. Ловушка ağ/AG — см. блок-коммент выше."""
+    low = (raw_name or "").lower()
+    markers: set[str] = set()
+    if _SILVER_RE.search(low):
+        markers.add("ag")
+    for rx in (_TYPE_FWD_RE, _TYPE_REV_RE):
+        for m in rx.finditer(low):
+            markers.add("t" + m.group(1))
+    return frozenset(markers)
+
+
+def _has_conflicting_variant_marker(name_raw_a: str, name_raw_b: str) -> bool:
+    """True если у КАЖДОЙ стороны свой уникальный вариант-маркер (серебро / номер
+    модели). Симметрично: «Bio-T Ag»{ag} vs «Bio-T Tip 1»{t1} → блок; type1 vs
+    type2 → блок; «Ag» vs «Ag» / «Ag» vs «Ag Tip 2» (superset) → НЕ блок."""
+    ma = _variant_markers(name_raw_a)
+    mb = _variant_markers(name_raw_b)
+    return bool(ma - mb) and bool(mb - ma)
+
+
 # ── Многозначная сила/доза (2026-05-29) ─────────────────────────────────────
 # variant-atoms берёт только 1-9 (серия/одиночная mg). Большие силы — enzyme/IU
 # единицы (Mikrazim 25000 ED ≠ 10000, Creon 25000 ≠ 10000, D3 50000 IU) — это
@@ -753,6 +790,7 @@ def _hard_conflict(a, b) -> bool:
         or _has_conflicting_variant_tokens(an, bn)
         or _has_conflicting_variant_atoms(ar, br)
         or _has_conflicting_strength_number(ar, br)
+        or _has_conflicting_variant_marker(ar, br)
     )
 
 
@@ -1169,6 +1207,9 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
                 if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
                     continue
+                # Вариант-маркеры: Ag(серебро) ≠ без серебра, type1 ≠ type2, Tip1 ≠ Tip2.
+                if any(_has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= fuzzy_threshold:
                     cluster.append(q)
@@ -1285,6 +1326,9 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     continue
                 # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
                 if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Вариант-маркеры: Ag(серебро) ≠ без серебра, type1 ≠ type2, Tip1 ≠ Tip2.
+                if any(_has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _SEC_THRESHOLD:
@@ -1404,6 +1448,9 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     continue
                 # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
                 if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Вариант-маркеры: Ag(серебро) ≠ без серебра, type1 ≠ type2, Tip1 ≠ Tip2.
+                if any(_has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _TERT_THRESHOLD:
@@ -1525,6 +1572,9 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     continue
                 # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
                 if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
+                    continue
+                # Вариант-маркеры: Ag(серебро) ≠ без серебра, type1 ≠ type2, Tip1 ≠ Tip2.
+                if any(_has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster):
                     continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _QUART_THRESHOLD:
