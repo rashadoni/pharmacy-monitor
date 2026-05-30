@@ -3,7 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, useMemo } from "react";
 import { useSearchParams } from "next/navigation";
-import { X, ChevronUp, ChevronDown, TrendingUp, TrendingDown } from "lucide-react";
+import { X, ChevronUp, ChevronDown, ChevronsUpDown, TrendingUp, TrendingDown } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
 import { api, ApiError, type ComparisonRow } from "@/lib/api";
@@ -725,12 +725,15 @@ function SortableTh({
         } ${isActive ? "text-foreground" : ""}`}
       >
         {label}
-        {isActive &&
-          (active.dir === "asc" ? (
+        {isActive ? (
+          active.dir === "asc" ? (
             <ChevronUp className="h-3 w-3" />
           ) : (
             <ChevronDown className="h-3 w-3" />
-          ))}
+          )
+        ) : (
+          <ChevronsUpDown className="h-3 w-3 opacity-30" />
+        )}
       </button>
     </th>
   );
