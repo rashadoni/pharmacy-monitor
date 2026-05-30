@@ -14,7 +14,8 @@
     "section_sites": "Saytlar",
     "section_actions": "Əməliyyatlar",
     "section_settings": "Parametrlər",
-    "category_comparison": "Kateqoriya müqayisəsi"
+    "category_comparison": "Kateqoriya müqayisəsi",
+    "category_comparison_short": "Kateqoriya"
   },
   "common": {
     "loading": "Yüklənir…",

@@ -14,7 +14,8 @@
     "section_sites": "Сайты",
     "section_actions": "Действия",
     "section_settings": "Настройки",
-    "category_comparison": "Сравнение категорий"
+    "category_comparison": "Сравнение категорий",
+    "category_comparison_short": "Категории"
   },
   "common": {
     "loading": "Загрузка…",

@@ -143,13 +143,14 @@ export function BottomNav() {
   const visible = [
     { href: "/overview", key: "overview", icon: TrendingUp },
     { href: "/comparison", key: "comparison", icon: Search },
+    { href: "/category-comparison", key: "category_comparison_short", icon: ListTree },
     { href: "/analytics", key: "analytics", icon: BarChart3 },
     { href: "/alerts", key: "alerts", icon: Bell },
     { href: "/settings", key: "settings", icon: Settings },
   ] as const;
 
   return (
-    <nav className="md:hidden fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 grid grid-cols-5">
+    <nav className="md:hidden fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 grid grid-cols-6">
       {visible.map((item) => {
         const active = pathname?.startsWith(item.href);
         const Icon = item.icon;
@@ -158,12 +159,12 @@ export function BottomNav() {
             key={item.href}
             href={item.href}
             className={cn(
-              "flex flex-col items-center justify-center gap-0.5 py-2.5 text-[10px] transition-colors",
+              "flex min-w-0 flex-col items-center justify-center gap-0.5 px-0.5 py-2.5 text-[10px] transition-colors",
               active ? "text-primary font-semibold" : "text-muted-foreground",
             )}
           >
-            <Icon className="h-5 w-5" />
-            {t(item.key)}
+            <Icon className="h-5 w-5 shrink-0" />
+            <span className="max-w-full text-center leading-tight break-words">{t(item.key)}</span>
           </Link>
         );
       })}

@@ -14,7 +14,8 @@
     "section_sites": "Sites",
     "section_actions": "Actions",
     "section_settings": "Settings",
-    "category_comparison": "Category comparison"
+    "category_comparison": "Category comparison",
+    "category_comparison_short": "Categories"
   },
   "common": {
     "loading": "Loading…",
