@@ -363,6 +363,16 @@ function AttachMode({
         </div>
       </div>
 
+      <div className="rounded-md border border-border bg-muted/40 p-3 text-xs text-muted-foreground leading-relaxed">
+        <span className="font-medium text-foreground">Как это работает: </span>
+        каждая карточка — товар, найденный на других сайтах, но
+        отсутствующий на <span className="font-medium">{SITE_LABEL[site]}</span>.
+        Слева — товар в кластере, справа — кандидаты с {SITE_LABEL[site]}.
+        Нажмите <span className="font-medium">«Привязать»</span> у подходящего —
+        и цена с {SITE_LABEL[site]} добавится в сравнение. Зелёная отметка
+        «точное совпадение» = можно привязывать без раздумий.
+      </div>
+
       {unmatchedQ.isLoading && (
         <div className="text-sm text-muted-foreground py-6 text-center">
           Загрузка…
@@ -484,6 +494,22 @@ function PairCard({
             )}
             {pair.canonical_pack_size && <span>{pair.canonical_pack_size}</span>}
           </div>
+          <div className="text-xs mt-1.5 flex flex-wrap items-center gap-x-1.5 gap-y-1">
+            <span className="text-muted-foreground">есть на:</span>
+            {pair.anchor_products.map((a) => (
+              <span
+                key={a.product_id}
+                className="font-mono text-[10px] uppercase rounded bg-muted px-1.5 py-0.5"
+              >
+                {a.site}
+              </span>
+            ))}
+            <span className="text-muted-foreground ml-1">нет на:</span>
+            <span className="font-mono text-[10px] uppercase rounded bg-primary/10 text-primary px-1.5 py-0.5">
+              {site}
+            </span>
+            <span className="text-primary">→ добавьте справа</span>
+          </div>
         </div>
         <button
           onClick={() => onSkip(pair.match_id)}
@@ -498,7 +524,7 @@ function PairCard({
       <div className="grid md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-border">
         <div className="p-4 space-y-2">
           <div className="text-xs uppercase tracking-wide text-muted-foreground mb-2">
-            Anchor продукты
+            Тот же товар на других сайтах
           </div>
           {pair.anchor_products.map((a) => (
             <AnchorRow key={a.product_id} anchor={a} />
@@ -506,10 +532,15 @@ function PairCard({
         </div>
 
         <div className="p-4 space-y-2">
+          <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">
+            Какой товар с {SITE_LABEL[site]} сюда подходит?
+          </div>
           {suggestionsQ.data && suggestionsQ.data.items.length > 0 && (
             <div className="mb-3">
-              <div className="text-xs uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-1">
-                <Sparkles className="h-3.5 w-3.5" /> Предложенные аналоги
+              <div className="text-xs mb-2 flex items-center gap-1 text-foreground">
+                <Sparkles className="h-3.5 w-3.5 text-primary" />
+                <span className="font-medium">Лучшие совпадения</span>
+                <span className="text-muted-foreground">— нажмите «Привязать»</span>
               </div>
               <ul className="space-y-1.5">
                 {suggestionsQ.data.items.map((p) => (
@@ -529,9 +560,16 @@ function PairCard({
               </ul>
             </div>
           )}
+          {suggestionsQ.data && suggestionsQ.data.items.length === 0 && (
+            <div className="text-xs text-muted-foreground mb-1">
+              Авто-подсказок нет — найдите товар вручную ниже.
+            </div>
+          )}
 
-          <div className="text-xs uppercase tracking-wide text-muted-foreground mb-2">
-            Поиск по {SITE_LABEL[site]}
+          <div className="text-xs text-muted-foreground mb-1 pt-1">
+            {suggestionsQ.data && suggestionsQ.data.items.length > 0
+              ? "Не то? Искать вручную:"
+              : "Поиск вручную:"}
           </div>
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
@@ -711,12 +749,16 @@ function SuggestionRow({
             <ExternalLink className="h-3 w-3 text-muted-foreground shrink-0" />
           </div>
           <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5">
-            {cand.auto_safe && (
+            {cand.auto_safe ? (
               <span className="inline-flex items-center gap-0.5 text-success font-medium">
                 <CheckCircle2 className="h-3 w-3" /> точное совпадение
               </span>
+            ) : (
+              <span className="text-amber-600 dark:text-amber-500">похоже — проверьте</span>
             )}
-            <span className="tabular-nums">{cand.score}%</span>
+            <span className="tabular-nums" title="сходство названий">
+              {cand.score}%
+            </span>
             {cand.brand && <span className="truncate">{cand.brand}</span>}
           </div>
         </div>
