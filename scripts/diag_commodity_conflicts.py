@@ -51,15 +51,39 @@ def _cosmetic_origin_false(m) -> bool:
     )
 
 
+def _strict_not_identical(m) -> bool:
+    """STRICT (client: «только идентичные товары и ТОЛЬКО»): a COMMODITY cluster is
+    NOT identical if some cross-site pair differs in COUNTRY of origin OR in GRADE
+    (cosmetic/kosmetik), UNLESS a pair confirms the SAME consumer brand. Same-brand
+    (Medoil tr↔az) and no-distinguishing-difference (same country+grade, e.g.
+    Gənəgərçək az↔az) are kept as identical; everything else → split to /matcher."""
+    ms = list(m.products)
+    if len({p.site for p in ms}) < 2 or not all(is_commodity_name(p.name) for p in ms):
+        return False
+    pairs = [(a, b) for i, a in enumerate(ms) for b in ms[i + 1 :] if a.site != b.site]
+    if _same_recoverable_brand(pairs):
+        return False
+    return any(
+        matcher._has_conflicting_country(a, b) or _grade_tokens(a.name) != _grade_tokens(b.name)
+        for a, b in pairs
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample", type=int, default=15)
     ap.add_argument(
         "--apply",
         action="store_true",
-        help="dissolve the cosmetic-vs-food cross-origin clusters (+ rejection)",
+        help="dissolve the targeted clusters (+ rejection)",
+    )
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help="STRICT: split ALL non-identical commodity (diff country OR grade, no shared brand)",
     )
     args = ap.parse_args()
+    target_fn = _strict_not_identical if args.strict else _cosmetic_origin_false
     Session = storage.make_session(os.environ["DATABASE_URL"])
     with Session() as s:
         matches = s.scalars(select(storage.Match).where(storage.Match.is_manual.is_(False))).all()
@@ -74,7 +98,7 @@ def main() -> int:
                 continue
             comm += 1
             pairs = [(a, b) for i, a in enumerate(ms) for b in ms[i + 1 :] if a.site != b.site]
-            if _cosmetic_origin_false(m):
+            if target_fn(m):
                 targets.append(m)
             if any(matcher._has_conflicting_brand(a, b) for a, b in pairs):
                 brand_conf += 1
