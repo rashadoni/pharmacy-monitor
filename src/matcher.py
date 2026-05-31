@@ -801,9 +801,37 @@ def _has_conflicting_brand(a, b) -> bool:
     Поэтому guard срабатывает лишь когда ОБА имени — ботанический коммодити И
     у обоих уверенный различающийся потребительский бренд. Заводы-компании
     (Merck KGaA, Egis İlaç) неразличающи; NULL/unknown → не срабатывает."""
-    if not (is_commodity_name(getattr(a, "name", None)) and is_commodity_name(getattr(b, "name", None))):
+    if not (
+        is_commodity_name(getattr(a, "name", None)) and is_commodity_name(getattr(b, "name", None))
+    ):
         return False
     return brands_conflict(getattr(a, "brand_verified", None), getattr(b, "brand_verified", None))
+
+
+# Витаминно-минеральные коды-маркеры состава: буква D/K/B + 1-2 цифры
+# (d3, d2, k1, k2, b1…b12). Однозначны (в отличие от одиночных C/E/A). Разный
+# НАБОР кодов = разный состав (D3 ≠ D3+K2 — комбо-препарат, не моно).
+_INGREDIENT_CODE_RE = re.compile(r"\b([dkb]\d{1,2})\b")
+
+
+def _ingredient_codes(name: str) -> frozenset[str]:
+    return frozenset(m.group(1) for m in _INGREDIENT_CODE_RE.finditer((name or "").lower()))
+
+
+def _has_conflicting_ingredient_codes(a, b) -> bool:
+    """Разный состав по витаминным кодам → разные товары.
+
+    Корень бага клиента: «Venatura Vitamin D3» (моно, 13.20) ошибочно склеен с
+    «Venatura Vitamin D3, K2» (комбо D3+K2, 25.60) — тот же бренд, объём, префикс
+    имени, но РАЗНЫЙ состав (K2 — добавленный ингредиент). Сравниваем НАБОР
+    кодов d/k/b+цифра в именах.
+
+    Срабатывает ТОЛЬКО когда у ОБОИХ есть код И наборы различаются (D3 vs D3+K2,
+    B6 vs B12). Если у одной стороны кодов НЕТ — это опущение в названии
+    (DetriBus = DetriBus D3), НЕ конфликт → recall сохраняется."""
+    ca = _ingredient_codes(a.name_normalized or a.name or "")
+    cb = _ingredient_codes(b.name_normalized or b.name or "")
+    return bool(ca) and bool(cb) and ca != cb
 
 
 def _hard_conflict(a, b) -> bool:
@@ -819,6 +847,7 @@ def _hard_conflict(a, b) -> bool:
     ar, br = a.name or "", b.name or ""
     return (
         _has_conflicting_brand(a, b)
+        or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_form(ar, br)
         or _has_conflicting_gender(an, bn)
         or _has_conflicting_series_number(an, bn)
@@ -849,6 +878,7 @@ def _pairwise_spec_conflict(a, b) -> bool:
     ar, br = a.name or "", b.name or ""
     return (
         _has_conflicting_brand(a, b)
+        or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_marker(ar, br)
         or _has_conflicting_variant_atoms(ar, br)
         or _has_conflicting_strength_number(ar, br)

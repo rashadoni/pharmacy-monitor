@@ -24,17 +24,20 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src import brand_resolver, match_actions, matcher, storage  # noqa: E402
+from src import match_actions, matcher, storage  # noqa: E402
 
 
 def _brand_groups(members: list) -> list[list]:
-    """Connected components where an edge = two members that do NOT brand-conflict.
-    Members with no consumer brand attach to the first compatible group."""
+    """Connected components where an edge = two members that do NOT spec-conflict.
+    Uses the full _pairwise_spec_conflict (brand + ingredient-code + variant/strength
+    /dimension/concentration), so it coherently splits ANY conflicting cluster — e.g.
+    keeps a same-brand Herba Flora pair while ejecting a Xerbes outlier, and separates
+    D3 from D3+K2. Members with no conflicting signal attach to the first group."""
     groups: list[list] = []
     for p in members:
         placed = False
         for g in groups:
-            if all(not brand_resolver.brands_conflict(p.brand_verified, q.brand_verified) for q in g):
+            if all(not matcher._pairwise_spec_conflict(p, q) for q in g):
                 g.append(p)
                 placed = True
                 break
@@ -68,11 +71,13 @@ def main() -> int:
             eject = [p for p in members if keep is None or p not in keep]
             label = (m.canonical_name or "")[:34]
             if keep is None:
-                print(f"cl{m.id} «{label}»: DISSOLVE ({len(members)} members, no same-brand cross-site group)")
+                print(
+                    f"cl{m.id} «{label}»: DISSOLVE ({len(members)} members, no coherent cross-site group)"
+                )
                 for i, x in enumerate(members):
                     for y in members[i + 1 :]:
                         if args.commit:
-                            match_actions.add_rejection(s, x.id, y.id, reason="brand-guard")
+                            match_actions.add_rejection(s, x.id, y.id, reason="spec-conflict")
                 for p in members:
                     if args.commit:
                         p.canonical_id = None
@@ -80,15 +85,14 @@ def main() -> int:
                     s.delete(m)
                 actions += 1
             else:
-                kb = brand_resolver.consumer_brand(next((p.brand_verified for p in keep), None))
                 print(
-                    f"cl{m.id} «{label}»: KEEP {[p.id for p in keep]} (brand≈{kb}), "
+                    f"cl{m.id} «{label}»: KEEP {[p.id for p in keep]}, "
                     f"EJECT {[(p.id, p.brand_verified) for p in eject]}"
                 )
                 for p in eject:
                     for q in keep:
                         if args.commit:
-                            match_actions.add_rejection(s, p.id, q.id, reason="brand-guard")
+                            match_actions.add_rejection(s, p.id, q.id, reason="spec-conflict")
                     if args.commit:
                         p.canonical_id = None
                 actions += 1

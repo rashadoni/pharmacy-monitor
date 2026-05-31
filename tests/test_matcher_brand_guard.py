@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from src.matcher import _has_conflicting_brand, _hard_conflict, _pairwise_spec_conflict
+from src.matcher import (
+    _has_conflicting_brand,
+    _has_conflicting_ingredient_codes,
+    _hard_conflict,
+    _pairwise_spec_conflict,
+)
 
 
 def _p(name, brand_verified):
@@ -53,6 +58,32 @@ class TestBrandGuard:
         b = _p("Alaqanqal yağı 100 ml", "Biola")
         assert _has_conflicting_brand(a, b) is False
         assert _hard_conflict(a, b) is False
+
+    def test_ingredient_code_combo_conflicts(self):
+        # client's case: D3 mono vs D3+K2 combo — same brand/volume, different composition
+        d3 = _p("Venatura Vitamin D3 20 ml", None)
+        d3k2 = _p("Venatura Vitamin D3 K2 20 ml", None)
+        assert _has_conflicting_ingredient_codes(d3, d3k2) is True
+        assert _hard_conflict(d3, d3k2) is True
+        assert _pairwise_spec_conflict(d3, d3k2) is True
+
+    def test_ingredient_code_same_no_conflict(self):
+        a = _p("Venatura Vitamin D3 20 ml", None)
+        b = _p("Venatura Vitamin D3 damci 20 ml", None)
+        assert _has_conflicting_ingredient_codes(a, b) is False
+
+    def test_ingredient_code_omission_no_conflict(self):
+        # one side omits the code (DetriBus == DetriBus D3, P-Devit B6-spacing) → NOT a conflict
+        assert (
+            _has_conflicting_ingredient_codes(
+                _p("DetriBus 15 ml", None), _p("DetriBus D3 15 ml", None)
+            )
+            is False
+        )
+        assert (
+            _has_conflicting_ingredient_codes(_p("Proqram B 6", None), _p("Proqram B6 N20", None))
+            is False
+        )
 
     def test_non_commodity_different_brands_no_conflict(self):
         # commodity gate: a trade-name drug with different brand strings must NOT
