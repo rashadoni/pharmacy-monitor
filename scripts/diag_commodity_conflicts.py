@@ -61,8 +61,8 @@ def _strict_not_identical(m) -> bool:
     if len({p.site for p in ms}) < 2 or not all(is_commodity_name(p.name) for p in ms):
         return False
     pairs = [(a, b) for i, a in enumerate(ms) for b in ms[i + 1 :] if a.site != b.site]
-    if _same_recoverable_brand(pairs):
-        return False
+    # client policy 2026-05-31: country must match too — NO same-brand exception
+    # (Medoil Türkiyə ≠ Medoil Azərbaycan).
     return any(
         matcher._has_conflicting_country(a, b) or _grade_tokens(a.name) != _grade_tokens(b.name)
         for a, b in pairs

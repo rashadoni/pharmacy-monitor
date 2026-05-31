@@ -273,12 +273,13 @@ class TestStrictCommodityOrigin:
         assert _hard_conflict(a, b) is True
         assert _pairwise_spec_conflict(a, b) is True
 
-    def test_same_brand_diff_country_no_conflict(self):
-        # Medoil tr↔az — same brand, country tag is metadata noise → keep (identical)
+    def test_same_brand_diff_country_conflicts(self):
+        # client policy 2026-05-31: country must match too — Medoil Türkiyə ≠ Medoil
+        # Azərbaycan even though brand matches (client explicitly required this).
         a = self._pc("Naftalan yağı 60 ml", "Medoil", manufacturer="TÜRKİYƏ")
         b = self._pc("Naftalan yağı 60 ml", "Medoil", manufacturer="AZERBAYCAN")
-        assert _has_conflicting_origin_or_grade(a, b) is False
-        assert _pairwise_spec_conflict(a, b) is False
+        assert _has_conflicting_origin_or_grade(a, b) is True
+        assert _pairwise_spec_conflict(a, b) is True
 
     def test_grade_asymmetry_conflicts(self):
         # cosmetic-grade ≠ regular (the client's Çaytikanı kosmetik case)
