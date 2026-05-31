@@ -1734,6 +1734,16 @@ def run_cmd(
                 linked = auto_match_watchlist(session)
                 log.info("watchlist_auto_matched", linked=linked)
             matcher.match_products(session)
+            # Auto-revalidate: match_products линкует широко (bucket+fuzzy) и НЕ
+            # блокирует guard-конфликты в primary-проходе → бренд/состав/вариант/сила
+            # несоответствия пересоздаются каждый прогон. Чистим их сразу когерентным
+            # split'ом (корень «whack-a-mole» — раньше требовался ручной rematch).
+            try:
+                split_actions = matcher.revalidate_split(session)
+                if split_actions:
+                    log.info("revalidate_split", clusters=len(split_actions))
+            except Exception as _re:
+                log.warning("revalidate_split_failed", error=str(_re))
             try:
                 flagged = matcher.flag_suspected_mismatches(session)
                 if flagged:
@@ -1972,27 +1982,19 @@ def rematch_cmd(
             return
 
         if revalidate:
-            from src import match_actions
-
-            flagged = matcher.find_conflicting_clusters(session)
-            click.echo(f"revalidate: {len(flagged)} конфликтных кластеров (текущие guard'ы)")
-            for m, a, b in flagged:
-                click.echo(f"  cl{m.id}: [{a.site}] {a.name}  ✗  [{b.site}] {b.name}")
+            # Coherent split (keep largest spec-coherent cross-site group, eject
+            # outliers; dissolve only if none). Same logic now auto-runs after
+            # match_products in the scrape pipeline.
+            actions = matcher.revalidate_split(session, dry_run=dry_run)
+            for a in actions:
+                if a["action"] == "dissolve":
+                    click.echo(f"  cl{a['match_id']}: DISSOLVE {a['members']}")
+                else:
+                    click.echo(f"  cl{a['match_id']}: KEEP {a['keep']}, EJECT {a['eject']}")
             if dry_run:
-                click.echo("(dry-run — ничего не изменено)")
-                return
-            for m, a, b in flagged:
-                prods = list(m.products)
-                for i, x in enumerate(prods):
-                    for y in prods[i + 1 :]:
-                        match_actions.add_rejection(session, x.id, y.id, reason="revalidate-guard")
-                for p in prods:
-                    p.canonical_id = None
-                session.delete(m)
-            session.commit()
-            click.echo(
-                f"dissolved {len(flagged)} кластеров (+rejections); re-match на след. скрейпе"
-            )
+                click.echo(f"(dry-run — {len(actions)} кластеров, ничего не изменено)")
+            else:
+                click.echo(f"revalidate: re-split {len(actions)} кластеров (+rejections)")
             return
 
         if reset:

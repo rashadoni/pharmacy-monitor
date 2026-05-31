@@ -1684,6 +1684,55 @@ def test_find_conflicting_clusters(db_session):
     assert m_manual.id not in ids  # ручной матч не перепроверяется
 
 
+def test_revalidate_split(db_session):
+    """revalidate_split: dissolves a 2-member conflict, ejects ONLY the outlier from a
+    3-member cluster (keeps the coherent cross-site pair), leaves clean clusters intact."""
+    s = db_session
+
+    def _clustered(match, site, ext, name, nn):
+        p = _make_product(s, site=site, external_id=ext, name=name, name_normalized=nn)
+        p.canonical_id = match.id
+        return p
+
+    m_combo = storage.Match(canonical_name="combo", confidence=0.9, is_manual=False)
+    m_trio = storage.Match(canonical_name="trio", confidence=0.9, is_manual=False)
+    m_ok = storage.Match(canonical_name="ok", confidence=1.0, is_manual=False)
+    s.add_all([m_combo, m_trio, m_ok])
+    s.flush()
+    # combo: D3 vs D3+K2 → ingredient conflict, 2 members → DISSOLVE
+    d3 = _clustered(
+        m_combo, "pharmonline", "c1", "Venatura Vitamin D3 20 ml", "venatura vitamin d3"
+    )
+    d3k2 = _clustered(
+        m_combo, "aptekonline", "c2", "Venatura Vitamin D3 K2 20 ml", "venatura vitamin d3 k2"
+    )
+    # trio: two D3 (ph+aloe, coherent cross-site) + one D3+K2 outlier → KEEP pair, EJECT outlier
+    t_ph = _clustered(m_trio, "pharmonline", "t1", "Foo D3 10 ml", "foo d3")
+    _clustered(m_trio, "aloe", "t2", "Foo D3 10 ml", "foo d3")
+    t_out = _clustered(m_trio, "aptekonline", "t3", "Foo D3 K2 10 ml", "foo d3 k2")
+    # ok: identical, no conflict → untouched
+    _clustered(m_ok, "pharmonline", "o1", "Aspirin 500 N20", "aspirin 500")
+    _clustered(m_ok, "aloe", "o2", "Aspirin 500 N20", "aspirin 500")
+    s.commit()
+
+    plan = {a["match_id"]: a for a in matcher.revalidate_split(s, dry_run=True)}
+    assert plan[m_combo.id]["action"] == "dissolve"
+    assert plan[m_trio.id]["action"] == "split"
+    assert set(plan[m_trio.id]["eject"]) == {t_out.id}
+    assert m_ok.id not in plan
+    s.refresh(d3)
+    assert d3.canonical_id == m_combo.id  # dry-run changed nothing
+
+    matcher.revalidate_split(s, dry_run=False)
+    for p in (d3, d3k2, t_out):
+        s.refresh(p)
+        assert p.canonical_id is None
+    s.refresh(t_ph)
+    assert t_ph.canonical_id == m_trio.id  # coherent pair kept
+    s.expire_all()  # drop cached Match.products (session is expire_on_commit=False)
+    assert matcher.find_conflicting_clusters(s) == []  # nothing left flagged
+
+
 def test_dimension_blocks_different_size(db_session):
     """Пластырь Alban 10×10 ≠ 10×25 — разный размер, не матчатся."""
     s = db_session

@@ -913,6 +913,80 @@ def find_conflicting_clusters(session: Session) -> list:
     return flagged
 
 
+def _spec_coherent_groups(members: list) -> list[list]:
+    """Группы членов, попарно НЕ конфликтующих по _pairwise_spec_conflict.
+    Greedy connected-components: член идёт в первую группу, где не конфликтует ни с кем."""
+    groups: list[list] = []
+    for p in members:
+        for g in groups:
+            if all(not _pairwise_spec_conflict(p, q) for q in g):
+                g.append(p)
+                break
+        else:
+            groups.append([p])
+    return groups
+
+
+def revalidate_split(session: Session, *, dry_run: bool = False) -> list[dict]:
+    """Разбить кластеры с cross-site spec-конфликтом на spec-когерентные группы.
+
+    Для каждого флагнутого кластера: бьём членов на группы, где никто не конфликтует
+    (_pairwise_spec_conflict). Оставляем БОЛЬШУЮ группу с cross-site парой как Match,
+    «выкидышей» отвязываем (canonical_id=None) + reject против оставшихся, чтобы пара
+    не сматчилась снова. Если когерентной cross-site группы нет — кластер распускаем.
+    Это лучше тупого dissolve-all в CLI: верную same-brand пару в 3-членном кластере
+    (Herba Flora+Herba Flora vs Xerbes) сохраняем, выкидываем только Xerbes.
+
+    Запускается ПОСЛЕ match_products в пайплайне скрейпа (main.py) — иначе пойманные
+    guard'ом несоответствия (бренд/состав/вариант/сила) пересоздаются каждый прогон и
+    висят до ручного `rematch --revalidate` (корень «whack-a-mole»). Возвращает список
+    действий [{match_id, action, ...}]. При dry_run БД не меняется."""
+    import itertools
+
+    from src import match_actions
+
+    actions: list[dict] = []
+    seen: set[int] = set()
+    for m, _a, _b in find_conflicting_clusters(session):
+        if m.id in seen:
+            continue
+        seen.add(m.id)
+        members = list(m.products)
+        groups = sorted(_spec_coherent_groups(members), key=len, reverse=True)
+        keep = next((g for g in groups if len({p.site for p in g}) >= 2), None)
+        if keep is None:
+            for x, y in itertools.combinations(members, 2):
+                if not dry_run:
+                    match_actions.add_rejection(session, x.id, y.id, reason="revalidate-split")
+            for p in members:
+                if not dry_run:
+                    p.canonical_id = None
+            if not dry_run:
+                session.delete(m)
+            actions.append(
+                {"match_id": m.id, "action": "dissolve", "members": [p.id for p in members]}
+            )
+        else:
+            eject = [p for p in members if p not in keep]
+            for p in eject:
+                for q in keep:
+                    if not dry_run:
+                        match_actions.add_rejection(session, p.id, q.id, reason="revalidate-split")
+                if not dry_run:
+                    p.canonical_id = None
+            actions.append(
+                {
+                    "match_id": m.id,
+                    "action": "split",
+                    "keep": [p.id for p in keep],
+                    "eject": [p.id for p in eject],
+                }
+            )
+    if actions and not dry_run:
+        session.commit()
+    return actions
+
+
 def relink_dead_members(
     session: Session, *, dry_run: bool = False, min_score: int = 80
 ) -> list[dict]:
