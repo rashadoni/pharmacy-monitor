@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.brand_catalog import is_brand_blacklisted
-from src.brand_resolver import brands_conflict, is_commodity_name
+from src.brand_resolver import brands_conflict, consumer_brand, is_commodity_name
 from src.match_actions import is_rejected
 from src.normalize import (
     extract_form,
@@ -718,6 +718,32 @@ def _has_conflicting_country(a, b) -> bool:
     return bool(ca) and bool(cb) and ca != cb
 
 
+# Grade-слова: косметическое масло ≠ пищевое/обычное (разный товар, разная цена).
+_GRADE_WORDS = {"kosmetik", "kosmetika", "kosmeticeskoe", "naruzhnoe", "cosmetic"}
+
+
+def _grade_tokens(name: str | None) -> frozenset[str]:
+    t = strip_accents((name or "").lower())
+    return frozenset(g for g in _GRADE_WORDS if g in t)
+
+
+def _has_conflicting_origin_or_grade(a, b) -> bool:
+    """Строгая идентичность КОММОДИТИ (политика клиента 2026-05-31: «только
+    идентичные товары и ТОЛЬКО»): два commodity-товара с РАЗНОЙ страной происхождения
+    ИЛИ разным grade (косметическое vs обычное) — НЕ один товар. Исключение: если
+    пара подтверждает ОДИН потребительский бренд (Medoil tr↔az — расхождение страны
+    это метаданные одного бренда) → не конфликт. Commodity-gated → trade-name
+    препараты (один и тот же выпускается в разных странах) НЕ затрагиваются."""
+    an, bn = getattr(a, "name", None), getattr(b, "name", None)
+    if not (is_commodity_name(an) and is_commodity_name(bn)):
+        return False
+    ca = consumer_brand(getattr(a, "brand_verified", None))
+    cb = consumer_brand(getattr(b, "brand_verified", None))
+    if ca and cb and ca == cb:
+        return False  # подтверждённо один бренд → идентичны
+    return _has_conflicting_country(a, b) or _grade_tokens(an) != _grade_tokens(bn)
+
+
 # ── Габариты AxB (2026-05-29) ────────────────────────────────────────────────
 # Пластыри/повязки/марля различаются размером: «Leykoplastr Alban 10sm x 10sm»
 # ≠ «10sm x 25sm» (разная площадь → разная цена, не арбитраж). Размер остаётся в
@@ -1012,6 +1038,7 @@ def _hard_conflict(a, b) -> bool:
     ar, br = a.name or "", b.name or ""
     return (
         _has_conflicting_brand(a, b)
+        or _has_conflicting_origin_or_grade(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
         or _has_conflicting_pack_volume(a, b)
@@ -1046,6 +1073,7 @@ def _pairwise_spec_conflict(a, b) -> bool:
     ar, br = a.name or "", b.name or ""
     return (
         _has_conflicting_brand(a, b)
+        or _has_conflicting_origin_or_grade(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
         or _has_conflicting_pack_volume(a, b)

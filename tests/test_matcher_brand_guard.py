@@ -14,6 +14,7 @@ from src.matcher import (
     _has_conflicting_brand,
     _has_conflicting_dose,
     _has_conflicting_ingredient_codes,
+    _has_conflicting_origin_or_grade,
     _has_conflicting_pack_volume,
     _has_conflicting_variant_words,
     _hard_conflict,
@@ -248,6 +249,54 @@ class TestBrandGuard:
         assert _has_conflicting_brand(a, b) is False
         assert _hard_conflict(a, b) is False
         assert _pairwise_spec_conflict(a, b) is False
+
+
+class TestStrictCommodityOrigin:
+    """Client policy 2026-05-31 «только идентичные товары»: COMMODITY differing in
+    country-of-origin OR grade (cosmetic) is NOT the same product — unless a shared
+    consumer brand confirms identity. Drugs (non-commodity) are unaffected."""
+
+    @staticmethod
+    def _pc(name, brand_verified=None, manufacturer=None, url=""):
+        return SimpleNamespace(
+            name=name,
+            name_normalized=name.lower(),
+            brand_verified=brand_verified,
+            manufacturer=manufacturer,
+            url=url,
+        )
+
+    def test_diff_country_no_brand_conflicts(self):
+        a = self._pc("Qara zirə yağı 100 ml", manufacturer="AZERBAYCAN")
+        b = self._pc("Qara zirə yağı 100 ml", manufacturer="RUSİYA")
+        assert _has_conflicting_origin_or_grade(a, b) is True
+        assert _hard_conflict(a, b) is True
+        assert _pairwise_spec_conflict(a, b) is True
+
+    def test_same_brand_diff_country_no_conflict(self):
+        # Medoil tr↔az — same brand, country tag is metadata noise → keep (identical)
+        a = self._pc("Naftalan yağı 60 ml", "Medoil", manufacturer="TÜRKİYƏ")
+        b = self._pc("Naftalan yağı 60 ml", "Medoil", manufacturer="AZERBAYCAN")
+        assert _has_conflicting_origin_or_grade(a, b) is False
+        assert _pairwise_spec_conflict(a, b) is False
+
+    def test_grade_asymmetry_conflicts(self):
+        # cosmetic-grade ≠ regular (the client's Çaytikanı kosmetik case)
+        a = self._pc("Çaytikanı yağı 100 ml (kosmetik)", manufacturer="RUSİYA")
+        b = self._pc("Çaytikanı yağı 100 ml", manufacturer="AZERBAYCAN")
+        assert _has_conflicting_origin_or_grade(a, b) is True
+
+    def test_same_country_same_grade_no_conflict(self):
+        a = self._pc("Gənəgərçək yağı 30 ml", manufacturer="AZERBAYCAN")
+        b = self._pc("Gənəgərçək yağı 30 ml", manufacturer="AZERBAYCAN")
+        assert _has_conflicting_origin_or_grade(a, b) is False
+
+    def test_non_commodity_drug_diff_country_no_conflict(self):
+        # trade-name drug made in different plants is the SAME drug → commodity gate off
+        a = self._pc("Konkor 5 mg N30", "Merck", manufacturer="ALMANİYA")
+        b = self._pc("Konkor 5 mg N30", "Merck", manufacturer="FRANSA")
+        assert _has_conflicting_origin_or_grade(a, b) is False
+        assert _hard_conflict(a, b) is False
 
 
 class TestUltraEqual:
