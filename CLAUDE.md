@@ -70,6 +70,12 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 ## Active work-in-progress
 
+**Just finished (2026-05-31, позже)**: **Composition-variant guard — D3 vs D3+K2** (коммит `814cd03`, на проде/в git). Клиент нашёл: «Venatura Vitamin D3» (моно, 13.20) ошибочно склеен с «Venatura Vitamin D3, K2» (комбо D3+K2, 25.60) — тот же бренд (Venatura/Vefa İlaç), объём 20ml, префикс имени, но РАЗНЫЙ состав.
+- Корень: matcher bucket'ит по (brand,dosage,pack) + fuzzy имени; «venatura vitamin d3» — почти-префикс «...d3 k2» → высокий fuzzy → матч. Отличающий «K2» (добавленный витамин) не учитывался.
+- Фикс: `matcher._has_conflicting_ingredient_codes(a,b)` — извлекает витаминные коды `[dkb]\d{1,2}` (d3,k2,b6,b12…) из имён; конфликт ТОЛЬКО когда у ОБОИХ есть код И наборы различаются (D3 vs D3+K2). Если у одной стороны кода НЕТ — это опущение в названии (DetriBus = DetriBus D3), НЕ конфликт. Wired в `_hard_conflict` + `_pairwise_spec_conflict`.
+- Масштаб на проде: ровно **2 кластера** этого класса (Venatura, Kombivit) — оба разнесены; vs ~13 omission/spacing/translit случаев которые правило корректно НЕ трогает.
+- `scripts/apply_brand_split.py` обобщён: группирует по полному `_pairwise_spec_conflict` (бренд + ingredient + variant/strength/…), а не только бренд → когерентно разносит ЛЮБОЙ конфликтный кластер. Применено: cl99399 + cl99951 dissolved, 0 flagged. Прод-matcher с guard'ом.
+
 **Just finished (2026-05-31)**: **Brand-aware matcher guard — кросс-брендовые матчи коммодити** (коммиты `efcabec`+`200da10`, на проде/в git). Клиент нашёл: «Alaqanqal yağı 100 ml» Biola (pharmonline 14.00) ошибочно сматчен с Herba Flora (aptek 6.70) — разные фирмы.
 - **Корень**: поле `products.brand` — мусор. `brand_catalog.extract_brand()` при промахе каталога фолбэчит на ПЕРВОЕ СЛОВО названия → у 92% pharmonline / 81% aptek `brand` = generic-имя («Alaqanqal»), а не фирма. Matcher не мог различить Biola от Herba Flora.
 - **Новая колонка `products.brand_verified`** (migration `0010`, прод на ней + застампан 0009): настоящий бренд из АВТОРИТЕТНОГО источника — pharmonline из URL-slug, aptek из `"brand":{}` JSON на странице товара (category-API бренд НЕ отдаёт; `olke`=страна, `terkib`=состав), aloe из готового поля `brand`.
