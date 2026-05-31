@@ -14,6 +14,7 @@ import {
   Pill,
   Search,
   Settings,
+  Sparkles,
   Star,
   TrendingUp,
 } from "lucide-react";
@@ -37,6 +38,7 @@ const NAV_SITES = [
 const NAV_ACTIONS = [
   { href: "/alerts", key: "alerts", icon: Bell },
   { href: "/watchlist", key: "watchlist", icon: Star },
+  { href: "/matcher", key: "matcher", icon: Sparkles },
   { href: "/matches/review", key: "matches_review", icon: Link2 },
 ] as const;
 
