@@ -10,7 +10,31 @@ from src.brand_resolver import (
     consumer_brand,
     is_commodity_name,
     is_manufacturer_company,
+    match_brand_in_text,
 )
+
+
+class TestMatchBrandInText:
+    VOCAB = {"herba flora", "medoil", "biola", "fitooil", "mirrolla"}
+
+    def test_matches_known_brand_in_aptek_slug(self):
+        assert (
+            match_brand_in_text("FEMINIKA--CAY--N25-Herba-Flora-AZE", self.VOCAB) == "herba flora"
+        )
+        assert match_brand_in_text("maslo-medoil-ozon-50ml", self.VOCAB) == "medoil"
+        assert match_brand_in_text("EVKALIPT--MASLO--10ml-Mirrolla-RUS", self.VOCAB) == "mirrolla"
+
+    def test_longest_match_wins(self):
+        assert match_brand_in_text("x-herba-flora-y", {"herba", "herba flora"}) == "herba flora"
+
+    def test_unknown_or_noise_returns_none(self):
+        # the slug junk that a naive parser produced — must NOT yield a false brand
+        assert match_brand_in_text("maslo-tikvennoe-balqabaq-yagi-100m", self.VOCAB) is None
+        assert match_brand_in_text("KA--s-norkovim-jirom-10gr-kosmeticeskoye", self.VOCAB) is None
+
+    def test_empty(self):
+        assert match_brand_in_text(None, self.VOCAB) is None
+        assert match_brand_in_text("", self.VOCAB) is None
 
 
 class TestCommodityName:
@@ -69,9 +93,11 @@ class TestManufacturerDetection:
 
     @pytest.mark.parametrize(
         "name",
-        ["Biola", "Herba Flora", "Medoil", "Fitooil", "Althea", "Botalife", "Nivea"],
+        ["Biola", "Herba Flora", "Medoil", "Althea", "Botalife", "Nivea"],
     )
     def test_consumer_brands_are_not_manufacturers(self, name):
+        # (Fitooil is a consumer brand too, but aliases to Herba Flora — see
+        # test_fitooil_is_herba_flora_alias)
         assert is_manufacturer_company(name) is False
         assert consumer_brand(name) == name.lower()
 
@@ -92,6 +118,13 @@ class TestBrandsConflict:
         assert brands_conflict("Merck KGaA", "Nycomed") is False
         assert brands_conflict("Egis Pharmaceuticals", "Egis") is False
         assert brands_conflict("Pharmex Rom Industry SRL", "Pharmex") is False
+
+    def test_fitooil_is_herba_flora_alias(self):
+        # Fitooil is Herba Flora's oil line — same firm, must NOT conflict
+        assert consumer_brand("Fitooil") == "herba flora"
+        assert brands_conflict("Fitooil", "Herba Flora") is False
+        # …but still conflicts with a genuinely different firm
+        assert brands_conflict("Fitooil", "Biola") is True
 
     def test_spelling_variants_of_same_firm_no_conflict(self):
         # transliteration / suffix variants of the SAME firm are fuzzy-similar →
@@ -144,6 +177,20 @@ class TestPharmonlineSlugBrand:
         # whatever it returns must not be a generic/noise consumer brand that
         # would cause a false block — i.e. it resolves to no consumer brand
         assert consumer_brand(out) in (None, "nioli", "pachuli") or out is None
+
+    def test_strips_query_string_and_truncated_country(self):
+        # `?lng=en` previously leaked "Turkiye?Lng=En"; "azerbayca" (truncated) was
+        # not stripped → "Flora Azerbayca". Both fixed.
+        assert (
+            brand_from_pharmonline_slug("https://pharmonline.az/product/x-medoil-turkiye?lng=en")
+            == "Medoil"
+        )
+        assert (
+            brand_from_pharmonline_slug(
+                "https://pharmonline.az/product/lavanda-yaghi-fitooil-30-ml-herba-flora-azerbayca"
+            )
+            == "Herba Flora"
+        )
 
     def test_empty(self):
         assert brand_from_pharmonline_slug(None) is None

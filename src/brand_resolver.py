@@ -179,17 +179,28 @@ def is_manufacturer_company(brand: str | None) -> bool:
     return False
 
 
+# Consumer-brand equivalences (normalized → canonical). Different labels for the
+# SAME firm/line that fuzzy-matching can't bridge. "Fitooil" is Herba Flora's oil
+# brand — aptek labels it "Fitooil", pharmonline "Herba Flora"; their slugs carry
+# BOTH tokens (…-fitooil-…-herba-flora-…). Without this they'd falsely split.
+_BRAND_ALIASES = {
+    "fitooil": "herba flora",
+}
+
+
 def consumer_brand(brand_verified: str | None) -> str | None:
     """Normalized CONSUMER brand for the conflict guard.
 
     Returns None if the brand is unknown OR a manufacturer company (both treated
     as non-discriminating → the guard will not fire and recall is preserved).
+    Applies brand-equivalence aliases (Fitooil → Herba Flora).
     """
     if not brand_verified:
         return None
     if is_manufacturer_company(brand_verified):
         return None
     n = _norm(brand_verified)
+    n = _BRAND_ALIASES.get(n, n)
     return n or None
 
 
@@ -220,17 +231,24 @@ def brands_conflict(a_verified: str | None, b_verified: str | None) -> bool:
 # presence of a botanical form-word in the name. Markers are accent-normalized
 # (ə→e, ş→s, ı→i, ç→c, ğ→g, ö→o, ü→u — see _norm).
 _COMMODITY_MARKERS = {
-    "yagi", "yag",  # oil  (yağı/yağ)
-    "toxumu", "toxum",  # seed
-    "cayi", "cay",  # tea  (çayı/çay)
+    "yagi",
+    "yag",  # oil  (yağı/yağ)
+    "toxumu",
+    "toxum",  # seed
+    "cayi",
+    "cay",  # tea  (çayı/çay)
     "otu",  # herb  (otu) — bare "ot" excluded (too common/short)
-    "qabigi", "qabig",  # bark  (qabığı)
-    "ekstrakti", "ekstrakt",  # extract
+    "qabigi",
+    "qabig",  # bark  (qabığı)
+    "ekstrakti",
+    "ekstrakt",  # extract
     "siresi",  # juice/sap  (şirəsi)
-    "meyveleri", "meyve",  # fruit/berries  (meyvələri)
+    "meyveleri",
+    "meyve",  # fruit/berries  (meyvələri)
     "koku",  # root  (kökü)
     "yarpagi",  # leaf  (yarpağı)
-    "covheri", "covher",  # tincture  (cövhəri)
+    "covheri",
+    "covher",  # tincture  (cövhəri)
     "gulu",  # flower  (gülü)
 }
 
@@ -244,6 +262,31 @@ def is_commodity_name(name: str | None) -> bool:
     return any(tok in _COMMODITY_MARKERS for tok in _norm(name).split())
 
 
+def match_brand_in_text(text: str | None, vocab) -> str | None:
+    """Longest known consumer-brand phrase from `vocab` that appears as a whole
+    word in `text` (a product name or URL slug), else None.
+
+    `vocab` is an iterable of normalized consumer-brand strings (see `_norm`).
+    Precise by construction: only brands already known elsewhere can match, so the
+    noisy descriptors / form-words / corporate fragments in aptekonline slugs
+    (kosmeticeskoye, naturalnie, flak …) cannot produce a false brand. Recovers
+    brand for aptek slug-form products whose pages lack the `"brand":{}` JSON, e.g.
+    `.../FEMINIKA--CAY--N25-Herba-Flora-AZE` → "herba flora". The result still
+    passes through the commodity gate + fuzzy filter at match time."""
+    if not text:
+        return None
+    t = _norm(text.replace("-", " ").replace("_", " "))
+    best: str | None = None
+    for v in vocab:
+        if (
+            v
+            and re.search(r"\b" + re.escape(v) + r"\b", t)
+            and (best is None or len(v) > len(best))
+        ):
+            best = v
+    return best
+
+
 # ── pharmonline slug → brand ────────────────────────────────────────────────
 # pharmonline slugs look like `<name…>-<dosage>-<pack>-<brand…>-<country>`, e.g.
 # `alaqanqal-yaghi-100-ml-biola-azerbaycan` → brand "biola". The brand is the
@@ -253,6 +296,9 @@ def is_commodity_name(name: str | None) -> bool:
 _COUNTRIES = {
     "azerbaycan",
     "azerbaycani",
+    "azerbayca",  # truncated slug form seen in real data (…-herba-flora-azerbayca)
+    "belarusiya",
+    "belarus",
     "turkiye",
     "rusiya",
     "almaniya",
@@ -419,7 +465,8 @@ def brand_from_pharmonline_slug(url: str | None) -> str | None:
     """
     if not url:
         return None
-    slug = url.rstrip("/").split("/")[-1].lower()
+    # strip query string (…-turkiye?lng=en leaked "Turkiye?Lng=En" as a brand) + fragment
+    slug = url.split("?")[0].split("#")[0].rstrip("/").split("/")[-1].lower()
     toks = slug.split("-")
     if len(toks) < 2:
         return None
