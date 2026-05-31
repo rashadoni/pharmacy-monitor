@@ -127,9 +127,24 @@ def main() -> int:
         for sc, a, b in cands[:: step][: args.sample]:
             print(f"  {sc:.0f}  [{a.site[:3]}] {(a.name or '').strip()[:32]}  ✗  [{b.site[:3]}] {(b.name or '').strip()[:32]}")
         if args.commit:
-            new_clusters = attached = 0
+            from src.brand_resolver import consumer_brand, is_commodity_name
+
+            def _commodity_unbranded(a, b) -> bool:
+                # commodity name on both + consumer brand unknown on either side → do
+                # NOT auto-link (leave for the human /matcher queue). ultra_equal can't
+                # see brand when brand_verified is NULL, so cross-brand commodity oils
+                # (Çaytikanı Mirrolla vs Herba Flora) would otherwise auto-link. Safe:
+                # candidates still appear for review, just not auto-committed. (wmol35wiv)
+                if not (is_commodity_name(a.name) and is_commodity_name(b.name)):
+                    return False
+                return not (consumer_brand(a.brand_verified) and consumer_brand(b.brand_verified))
+
+            new_clusters = attached = skipped_commodity = 0
             used: set[int] = set()  # a product joins at most one cluster per run
             for _sc, a, b in cands:
+                if _commodity_unbranded(a, b):
+                    skipped_commodity += 1
+                    continue
                 am = a.canonical_id is not None
                 bm = b.canonical_id is not None
                 if am and bm:
@@ -165,7 +180,8 @@ def main() -> int:
             s.commit()
             print(
                 f"\nCOMMITTED: {new_clusters} new clusters + {attached} attached to existing "
-                "(is_manual=False)"
+                f"(is_manual=False); skipped {skipped_commodity} unbranded-commodity pairs "
+                "(→ human /matcher queue)"
             )
     return 0
 
