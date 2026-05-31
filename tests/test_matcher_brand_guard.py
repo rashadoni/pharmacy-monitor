@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from src.matcher import (
     _has_conflicting_brand,
+    _has_conflicting_dose,
     _has_conflicting_ingredient_codes,
     _has_conflicting_pack_volume,
     _has_conflicting_variant_words,
@@ -20,11 +21,12 @@ from src.matcher import (
 )
 
 
-def _p(name, brand_verified):
+def _p(name, brand_verified, url=""):
     return SimpleNamespace(
         name=name,
         name_normalized=name.lower(),
         brand_verified=brand_verified,
+        url=url,
     )
 
 
@@ -167,6 +169,40 @@ class TestBrandGuard:
             _has_conflicting_pack_volume(_p("X 200mq/5ml", None), _p("X 200mq/5ml 30ml", None))
             is False
         )
+
+    def test_pack_volume_unit_mismatch_and_kg_do_not_fire(self):
+        # different unit family (toothpaste 100ml vs 100g = same product) → no conflict
+        assert (
+            _has_conflicting_pack_volume(_p("Splat 100 ml", None), _p("Splat 100 qr", None))
+            is False
+        )
+        # kg is a diaper BABY-weight range, not package volume → never fires
+        assert (
+            _has_conflicting_pack_volume(
+                _p("Paddlers 11-25kg N52", None), _p("Paddlers 11-18kg N52", None)
+            )
+            is False
+        )
+
+    def test_dose_conflict_reads_name_and_url(self):
+        # client's Risek case: ph name has "40 mq", aptek name has NO mg but URL slug does
+        a = _p(
+            "Risek Insta (nanə) 40 mq № 10",
+            None,
+            url="https://pharmonline.az/product/risek-insta-40",
+        )
+        b = _p("Risek İnsta N10 (toz)", None, url="https://aptekonline.az/product/risek-20mg-n10")
+        assert _has_conflicting_dose(a, b) is True
+        assert _hard_conflict(a, b) is True
+        assert _pairwise_spec_conflict(a, b) is True
+
+    def test_dose_same_or_missing_no_conflict(self):
+        # same dose (mq == mg) → no conflict
+        assert _has_conflicting_dose(_p("X 40 mq", None), _p("X 40 mg N10", None)) is False
+        # one side has no dose unit (bare pack number) → not a conflict
+        assert _has_conflicting_dose(_p("X 500 mg", None), _p("X № 20", None)) is False
+        # mcg vs mg equivalence (1000 mcg == 1 mg) → no conflict
+        assert _has_conflicting_dose(_p("X 1000 mcg", None), _p("X 1 mg", None)) is False
 
     def test_non_commodity_different_brands_no_conflict(self):
         # commodity gate: a trade-name drug with different brand strings must NOT

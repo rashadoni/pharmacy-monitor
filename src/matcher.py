@@ -870,17 +870,65 @@ def _has_conflicting_variant_words(a, b) -> bool:
     return _variant_words(a.name or "") != _variant_words(b.name or "")
 
 
+_VOL_RE = re.compile(r"^(\d+(?:[.,]\d+)?)(ml|q|g|gr|qr)$")
+_VOL_FAMILY = {"ml": "ml", "q": "g", "g": "g", "gr": "g", "qr": "g"}
+
+
+def _parse_volume(s: str | None) -> tuple[float, str] | None:
+    """«15ml»→(15.0,"ml"), «90q»→(90.0,"g"). None для kg/kq (это вес РЕБЁНКА у
+    подгузников «11-25kg», а не объём упаковки) и для непарсимого."""
+    if not s:
+        return None
+    m = _VOL_RE.match(s)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", ".")), _VOL_FAMILY[m.group(2)]
+
+
 def _has_conflicting_pack_volume(a, b) -> bool:
     """Разный ОБЪЁМ упаковки (флакон/туба) → разные товары.
 
     Корень (workflow-аудит 2026-05-31): «Azoksin 200mq/5ml 15ml» vs «…30ml» —
     extract_pack_size брал «5ml» (знаменатель концентрации) у обоих → одинаковый
-    bucket → склейка 15ml-флакона с 30ml. Сравниваем НАСТОЯЩИЙ объём упаковки
-    (extract_total_volume снимает «X/Yml»): блок если у ОБОИХ есть объём и он
-    различается. Одна сторона без объёма → не блок (recall сохраняется)."""
-    va = extract_total_volume(a.name or "")
-    vb = extract_total_volume(b.name or "")
-    return bool(va) and bool(vb) and va != vb
+    bucket → склейка 15ml-флакона с 30ml. Сравниваем НАСТОЯЩИЙ объём
+    (extract_total_volume снимает «X/Yml»).
+
+    Блок ТОЛЬКО когда у обоих есть объём в ОДНОЙ единице измерения и он различается.
+    Разные единицы (100ml vs 100q — паста в мл/г = тот же товар) и kg-веса
+    подгузников НЕ блокируем (false-positive'ы из dry-run); одна сторона без объёма
+    → не блок (recall цел)."""
+    pa = _parse_volume(extract_total_volume(a.name or ""))
+    pb = _parse_volume(extract_total_volume(b.name or ""))
+    if not pa or not pb or pa[1] != pb[1]:
+        return False
+    return pa[0] != pb[0]
+
+
+# Сила дозы препарата: число + mg/mq/mkg/mcg (НЕ ml/g — то объём/вес упаковки).
+_DOSE_MG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(mg|mq|mkg|mcg|µg)(?![a-z])", re.IGNORECASE)
+
+
+def _doses_mg(text: str) -> frozenset[float]:
+    out = set()
+    for m in _DOSE_MG_RE.finditer(strip_accents(text or "").lower()):
+        v = float(m.group(1).replace(",", "."))
+        if m.group(2) in ("mkg", "mcg", "µg"):
+            v /= 1000.0
+        out.add(round(v, 4))
+    return frozenset(out)
+
+
+def _has_conflicting_dose(a, b) -> bool:
+    """Разная сила дозы (mg) → разные товары — читаем имя И URL-slug.
+
+    Корень (клиент): «Risek Insta 40 mq» (pharmonline) склеен с aptek «Risek İnsta
+    N10 (toz)» — в aptek-ИМЕНИ mg нет, но в URL-slug есть (risek-20mg-n10). Имя+slug
+    дают 40 vs 20 → блок. Требуется единица mg/mq/mkg/mcg (не голое число и не
+    объём ml/g) → нет ложных срабатываний на pack-count. Одна сторона без дозы →
+    не блок (recall цел)."""
+    da = _doses_mg(f"{getattr(a, 'name', '') or ''} {getattr(a, 'url', '') or ''}")
+    db = _doses_mg(f"{getattr(b, 'name', '') or ''} {getattr(b, 'url', '') or ''}")
+    return bool(da) and bool(db) and da != db
 
 
 def _hard_conflict(a, b) -> bool:
@@ -899,6 +947,7 @@ def _hard_conflict(a, b) -> bool:
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
         or _has_conflicting_pack_volume(a, b)
+        or _has_conflicting_dose(a, b)
         or _has_conflicting_form(ar, br)
         or _has_conflicting_gender(an, bn)
         or _has_conflicting_series_number(an, bn)
@@ -932,6 +981,7 @@ def _pairwise_spec_conflict(a, b) -> bool:
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
         or _has_conflicting_pack_volume(a, b)
+        or _has_conflicting_dose(a, b)
         or _has_conflicting_variant_marker(ar, br)
         or _has_conflicting_variant_atoms(ar, br)
         or _has_conflicting_strength_number(ar, br)
