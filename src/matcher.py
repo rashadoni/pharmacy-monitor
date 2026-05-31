@@ -854,6 +854,17 @@ _VARIANT_WORDS = {
     "bronxo",
     "bronho",
     "pain",
+    # тоничность солевых спреев — однозначная линейка без size/translation-двойника:
+    # Marimer/Aqua Maris izotonik ≠ hipertonik (разная концентрация соли, разный товар).
+    # Verified 2026-05-31 recall dry-run: «Marimer 100ml» ✗ «Marimer hipertonik 100ml».
+    "izotonik",
+    "izotonic",
+    "isotonik",
+    "isotonic",
+    "hipertonik",
+    "hipertonic",
+    "hypertonik",
+    "hypertonic",
 }
 
 

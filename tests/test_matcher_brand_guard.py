@@ -115,6 +115,23 @@ class TestBrandGuard:
             is False
         )
 
+    def test_saline_tonicity_variant_conflicts(self):
+        # Marimer/Aqua Maris izotonik ≠ hipertonik — different salt concentration,
+        # different product. Recall dry-run 2026-05-31 surfaced "Marimer 100ml" ✗
+        # "Marimer hipertonik 100ml" as a near-twin that must NOT auto-link.
+        a = _p("Marimer 100 ml burun spreyi", None)
+        b = _p("Marimer hipertonik 100 ml burun spreyi", None)
+        assert _has_conflicting_variant_words(a, b) is True
+        assert _hard_conflict(a, b) is True
+        assert _pairwise_spec_conflict(a, b) is True
+        # same tonicity on both sides → still a match
+        assert (
+            _has_conflicting_variant_words(
+                _p("Aqua Maris izotonik 30 ml", None), _p("Aqua Maris izotonik № 1 30 ml", None)
+            )
+            is False
+        )
+
     def test_size_and_translation_words_do_not_fire(self):
         # diaper size-name == size-number (same product) and men==kişilər (translation)
         # are deliberately NOT in the whitelist → must NOT split (dry-run showed ~15 such)
