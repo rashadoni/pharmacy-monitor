@@ -345,6 +345,7 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
 ## Known issues / NOT done
 
 - ~~Resend SMTP not configured~~ **CONFIGURED & WORKING** (2026-05-29 verified): `SMTP_HOST=smtp.resend.com`, verified domain `digest@leaddrive.cloud`. Daily digest email delivered to `EMAIL_TO` (rashadrahimov@gmail.com) — see journald `smtp_sent_ok` / `digest_sent` (digest@daily.timer 05:00 UTC).
+- **Weekly digest (added 2026-05-31)**: `pharmacy-monitor-digest-weekly.timer` → **Mondays 06:00 UTC (10:00 Baku)**, runs `notify digest weekly` (7-day window → `tenant_users` with `weekly_digest=True`; admin id=1 opted in). Delivers via the same SMTP. Distinct from the daily `EMAIL_TO` digest (left untouched). Units: `infra/systemd/pharmacy-monitor-digest-weekly.{service,timer}`. NB: empty-week → no email (digest skips when 0 events in window).
 - Telegram bot token NOT configured (`TELEGRAM_BOT_TOKEN` empty) — push-alerts off; email digest covers delivery. Activate via `configure-integrations.sh` → @BotFather token + chat_id.
 - ~~Sentry DSN not configured~~ **CONFIGURED & WORKING** (2026-05-29 verified): `SENTRY_DSN` set, `init_sentry()` runs on startup (journald `sentry_initialized env=production`). FastAPI+SQLAlchemy integrations.
 - NOTE: `pharmacy-monitor notify test` для smoke-теста доставки запускать с загруженным env (systemd EnvironmentFile НЕ грузится при ручном CLI): `set -a; source /etc/pharmacy-monitor/env; .venv/bin/pharmacy-monitor notify test`.
