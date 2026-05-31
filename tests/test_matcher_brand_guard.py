@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from src.matcher import (
     _has_conflicting_brand,
     _has_conflicting_ingredient_codes,
+    _has_conflicting_pack_volume,
     _has_conflicting_variant_words,
     _hard_conflict,
     _pairwise_spec_conflict,
@@ -144,6 +145,26 @@ class TestBrandGuard:
             _has_conflicting_variant_words(
                 _p("Kəpənək N21", None), _p("Kəpənək venoz kateter N21", None)
             )
+            is False
+        )
+
+    def test_pack_volume_conflict(self):
+        # workflow audit: Azoksin 200mq/5ml 15ml vs 30ml — the "5ml" concentration
+        # base shadowed the bottle volume → 15ml flacon merged with 30ml
+        a = _p("Azoksin 200mq/5ml 15ml", None)
+        b = _p("Azoksin 200mq/5ml 30ml", None)
+        assert _has_conflicting_pack_volume(a, b) is True
+        assert _hard_conflict(a, b) is True
+        assert _pairwise_spec_conflict(a, b) is True
+
+    def test_pack_volume_same_or_missing_no_conflict(self):
+        # same total volume despite concentration token → no conflict
+        assert (
+            _has_conflicting_pack_volume(_p("X 200mq/5ml 15ml", None), _p("X 15 ml", None)) is False
+        )
+        # one side has no total volume (concentration only) → omission, not a conflict
+        assert (
+            _has_conflicting_pack_volume(_p("X 200mq/5ml", None), _p("X 200mq/5ml 30ml", None))
             is False
         )
 

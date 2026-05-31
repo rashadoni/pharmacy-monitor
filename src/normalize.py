@@ -229,6 +229,15 @@ _PACK_VOLUME_RE = re.compile(
     r"\b(\d+\s*(?:ml|kg|kq|qrm|qr|gr|q|g))(?=\b|[^a-zA-Z])",
     re.IGNORECASE,
 )
+# Концентрация вида «200mq/5ml», «0.5mg/ml», «10%/5ml» — знаменатель «Yml» НЕ
+# объём упаковки. Снимаем его ПЕРЕД _PACK_VOLUME_RE, иначе «Azoksin 200mq/5ml
+# 15ml» даёт pack=«5ml» (концентрация) вместо 15ml (флакон) → разные по объёму
+# флаконы (15ml vs 30ml) сливаются в один bucket. (workflow audit 2026-05-31.)
+_CONCENTRATION_RE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:mg|mkg|mcg|µg|g|mq|qr|q|iu|ie|ed|me|tv|bv|u|%)"
+    r"\s*/\s*\d*(?:[.,]\d+)?\s*(?:ml|mg|g|q|qr)",
+    re.IGNORECASE,
+)
 # Backward-compat: оставляем _PACK_RE для других мест (normalize_name использует
 # его для удаления pack-токенов из имени).
 _PACK_RE = re.compile(
@@ -557,12 +566,29 @@ def extract_pack_size(name: str) -> str | None:
         count = next((g for g in m.groups() if g), None)
         if count:
             return f"n{count}"
-    # Этап 2: фолбэк на vol/weight
-    m = _PACK_VOLUME_RE.search(name)
+    # Этап 2: фолбэк на vol/weight — но СНАЧАЛА снимаем концентрацию «X/Yml»,
+    # чтобы знаменатель не приняли за объём упаковки (Azoksin 200mq/5ml 15ml → 15ml).
+    stripped = _CONCENTRATION_RE.sub(" ", name)
+    m = _PACK_VOLUME_RE.search(stripped)
     if m:
         raw = re.sub(r"\s+", "", m.group(1).lower())
         return _normalize_units(raw)
     return None
+
+
+def extract_total_volume(name: str | None) -> str | None:
+    """Объём/вес УПАКОВКИ (ml/g/kg…), с снятым знаменателем концентрации «X/Yml».
+
+    Отличается от extract_pack_size: всегда про объём (не count), для matcher-guard'а
+    _has_conflicting_pack_volume — чтобы 15ml-флакон не слился с 30ml даже когда у
+    обоих одинаковый count (N1) и concentration-base (5ml). None если объёма нет."""
+    if not name:
+        return None
+    stripped = _CONCENTRATION_RE.sub(" ", _collapse_spaced_thousands(name))
+    m = _PACK_VOLUME_RE.search(stripped)
+    if not m:
+        return None
+    return _normalize_units(re.sub(r"\s+", "", m.group(1).lower()))
 
 
 _PRICE_TOKEN_RE = re.compile(r"\d[\d,.]*")

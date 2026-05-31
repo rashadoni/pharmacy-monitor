@@ -195,3 +195,15 @@ def test_oil_oil_same_form():
     # масло ↔ масло (Çaytikanı обоих сайтов) остаётся одной формой → матч сохраняется
     assert extract_form("Çaytikanı yağı 100 ml") == "oil"
     assert extract_form("Lavanda yağı 10 ml") == "oil"
+
+
+def test_extract_pack_size_concentration_shadow():
+    """workflow audit 2026-05-31: the '5ml' in '200mq/5ml' is concentration, not the
+    bottle volume — must not shadow the trailing total volume (15ml/30ml)."""
+    from src.normalize import extract_pack_size, extract_total_volume
+
+    assert extract_pack_size("Azoksin 200mq/5ml 15ml") == "15ml"
+    assert extract_total_volume("Azoksin 200mq/5ml 15ml") == "15ml"
+    assert extract_total_volume("Azoksin 200mq/5ml 30ml") == "30ml"
+    assert extract_total_volume("Azoksin 200mq/5ml") is None
+    assert extract_total_volume("Lavanda yağı 100 ml") == "100ml"

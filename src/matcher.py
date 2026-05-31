@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from src.brand_catalog import is_brand_blacklisted
 from src.brand_resolver import brands_conflict, is_commodity_name
 from src.match_actions import is_rejected
-from src.normalize import extract_form, normalize_name, strip_accents
+from src.normalize import extract_form, extract_total_volume, normalize_name, strip_accents
 from src.storage import Match, PriceSnapshot, Product, latest_snapshots_per_product
 
 log = structlog.get_logger()
@@ -870,6 +870,19 @@ def _has_conflicting_variant_words(a, b) -> bool:
     return _variant_words(a.name or "") != _variant_words(b.name or "")
 
 
+def _has_conflicting_pack_volume(a, b) -> bool:
+    """Разный ОБЪЁМ упаковки (флакон/туба) → разные товары.
+
+    Корень (workflow-аудит 2026-05-31): «Azoksin 200mq/5ml 15ml» vs «…30ml» —
+    extract_pack_size брал «5ml» (знаменатель концентрации) у обоих → одинаковый
+    bucket → склейка 15ml-флакона с 30ml. Сравниваем НАСТОЯЩИЙ объём упаковки
+    (extract_total_volume снимает «X/Yml»): блок если у ОБОИХ есть объём и он
+    различается. Одна сторона без объёма → не блок (recall сохраняется)."""
+    va = extract_total_volume(a.name or "")
+    vb = extract_total_volume(b.name or "")
+    return bool(va) and bool(vb) and va != vb
+
+
 def _hard_conflict(a, b) -> bool:
     """Pairwise hard-guard'ы (как в проходах), отличающие РАЗНЫЕ товары.
 
@@ -885,6 +898,7 @@ def _hard_conflict(a, b) -> bool:
         _has_conflicting_brand(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
+        or _has_conflicting_pack_volume(a, b)
         or _has_conflicting_form(ar, br)
         or _has_conflicting_gender(an, bn)
         or _has_conflicting_series_number(an, bn)
@@ -917,6 +931,7 @@ def _pairwise_spec_conflict(a, b) -> bool:
         _has_conflicting_brand(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
+        or _has_conflicting_pack_volume(a, b)
         or _has_conflicting_variant_marker(ar, br)
         or _has_conflicting_variant_atoms(ar, br)
         or _has_conflicting_strength_number(ar, br)
