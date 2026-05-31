@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from src.matcher import (
     _has_conflicting_brand,
     _has_conflicting_ingredient_codes,
+    _has_conflicting_variant_words,
     _hard_conflict,
     _pairwise_spec_conflict,
 )
@@ -82,6 +83,67 @@ class TestBrandGuard:
         )
         assert (
             _has_conflicting_ingredient_codes(_p("Proqram B 6", None), _p("Proqram B6 N20", None))
+            is False
+        )
+
+    def test_variant_word_conflicts(self):
+        # unambiguous product-line modifiers → different product
+        assert (
+            _has_conflicting_variant_words(_p("Linkas № 16", None), _p("Linkas Plyus 120 ml", None))
+            is True
+        )
+        assert (
+            _has_conflicting_variant_words(_p("Kodelak N10", None), _p("Kodelak Bronxo N10", None))
+            is True
+        )
+        assert (
+            _has_conflicting_variant_words(_p("Snip № 20", None), _p("Snip pain N20", None)) is True
+        )
+        assert _hard_conflict(_p("Linkas № 16", None), _p("Linkas Plyus 120 ml", None)) is True
+        assert (
+            _pairwise_spec_conflict(_p("Kodelak N10", None), _p("Kodelak Bronxo N10", None)) is True
+        )
+
+    def test_variant_word_same_no_conflict(self):
+        assert (
+            _has_conflicting_variant_words(
+                _p("Linkas Plyus 120", None), _p("Linkas Plyus № 16", None)
+            )
+            is False
+        )
+
+    def test_size_and_translation_words_do_not_fire(self):
+        # diaper size-name == size-number (same product) and men==kişilər (translation)
+        # are deliberately NOT in the whitelist → must NOT split (dry-run showed ~15 such)
+        assert (
+            _has_conflicting_variant_words(
+                _p("Sleepy Natural-3 4-9kq", None), _p("Sleepy Natural Midi 4-9kq", None)
+            )
+            is False
+        )
+        assert (
+            _has_conflicting_variant_words(
+                _p("Nivea Men duş geli", None), _p("Nivea kişilər duş geli", None)
+            )
+            is False
+        )
+
+    def test_form_word_omission_no_conflict(self):
+        # form/descriptor words are NOT in the whitelist → omission stays a match
+        assert (
+            _has_conflicting_variant_words(_p("Yarpız 40 q", None), _p("Yarpız otu 40 qr", None))
+            is False
+        )
+        assert (
+            _has_conflicting_variant_words(
+                _p("Levomekol 40 q", None), _p("Levomekol məlhəm 40 q", None)
+            )
+            is False
+        )
+        assert (
+            _has_conflicting_variant_words(
+                _p("Kəpənək N21", None), _p("Kəpənək venoz kateter N21", None)
+            )
             is False
         )
 

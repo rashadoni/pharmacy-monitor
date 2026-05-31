@@ -834,6 +834,42 @@ def _has_conflicting_ingredient_codes(a, b) -> bool:
     return bool(ca) and bool(cb) and ca != cb
 
 
+# Вариант/линейка-модификаторы: WHITELIST слов, наличие которых у ОДНОЙ стороны и
+# отсутствие у другой = разный товар (Linkas vs Linkas Plyus, Kodelak vs Kodelak
+# Bronxo, подгузник Newborn vs Mini, Molped Daily vs Soft). НЕ форм-слова
+# (otu/məlhəm/şam — это опущение, тот же товар) и НЕ страны — поэтому именно
+# whitelist, а не «любое лишнее слово»: ложный split тут авто-повторялся бы каждый
+# скрейп (revalidate_split в пайплайне). Accent-normalized (strip_accents).
+# ВНИМАНИЕ: только ОДНОЗНАЧНЫЕ модификаторы линейки/формулы, у которых нет
+# size/translation-двойника. НЕ включать (проверено dry-run'ом 2026-05-31 — давали
+# ~15 ложных split'ов): размеры подгузников (newborn/mini/midi/maxi/junior — = номер
+# размера, тот же товар: «Sleepy Natural 3» = «Sleepy Natural Midi»), линейки
+# (ultra/comfort/active/baby — не различают), men/women (= kişilər/qadın, перевод),
+# super/maks/intensiv (маркетинг-хвост). Эти классы НЕ авто-гардятся — только UI-флаг.
+_VARIANT_WORDS = {
+    "plyus",
+    "plus",
+    "forte",
+    "fort",
+    "bronxo",
+    "bronho",
+    "pain",
+}
+
+
+def _variant_words(name: str) -> frozenset[str]:
+    return frozenset(strip_accents((name or "").lower()).split()) & _VARIANT_WORDS
+
+
+def _has_conflicting_variant_words(a, b) -> bool:
+    """Разный набор вариант/линейка-слов из whitelist → разные товары.
+
+    Срабатывает, когда у одной стороны есть вариант-слово (Plyus/Bronxo/Newborn/
+    Daily/…), которого нет у другой (или наборы различаются). Whitelist держит это
+    точным: форм-слова (otu/məlhəm/şam) и страны НЕ в нём → опущения не ломаются."""
+    return _variant_words(a.name or "") != _variant_words(b.name or "")
+
+
 def _hard_conflict(a, b) -> bool:
     """Pairwise hard-guard'ы (как в проходах), отличающие РАЗНЫЕ товары.
 
@@ -848,6 +884,7 @@ def _hard_conflict(a, b) -> bool:
     return (
         _has_conflicting_brand(a, b)
         or _has_conflicting_ingredient_codes(a, b)
+        or _has_conflicting_variant_words(a, b)
         or _has_conflicting_form(ar, br)
         or _has_conflicting_gender(an, bn)
         or _has_conflicting_series_number(an, bn)
@@ -879,6 +916,7 @@ def _pairwise_spec_conflict(a, b) -> bool:
     return (
         _has_conflicting_brand(a, b)
         or _has_conflicting_ingredient_codes(a, b)
+        or _has_conflicting_variant_words(a, b)
         or _has_conflicting_variant_marker(ar, br)
         or _has_conflicting_variant_atoms(ar, br)
         or _has_conflicting_strength_number(ar, br)
