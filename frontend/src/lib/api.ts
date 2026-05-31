@@ -451,6 +451,14 @@ export interface MatchUpdated {
   products: { product_id: number; site: string; name: string; url: string }[];
 }
 
+export interface MatchAlternative {
+  product_id: number;
+  name: string;
+  url: string | null;
+  price: number | null;
+  score: number;
+}
+
 export interface CandidateAnalog {
   product_id: number;
   site: string;
@@ -634,6 +642,10 @@ export const api = {
     request<{ ok: boolean; product_id: number; name: string; site: string }>(
       `/api/v1/dash/matches/${matchId}/relink`,
       { method: "POST", body: JSON.stringify({ site, url }) },
+    ),
+  matchAlternatives: (matchId: number, site: string, limit = 6) =>
+    request<{ items: MatchAlternative[] }>(
+      `/api/v1/dash/matches/${matchId}/alternatives?site=${encodeURIComponent(site)}&limit=${limit}`,
     ),
   roiActions: (client_site?: string, locale?: string) => {
     const q = new URLSearchParams();

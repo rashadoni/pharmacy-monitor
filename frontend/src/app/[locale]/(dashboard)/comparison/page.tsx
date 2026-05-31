@@ -447,13 +447,16 @@ function ComparisonRowDesktop({
           <span className="inline-flex items-center gap-1">
             {row.name}
             {row.needs_review && (
-              <span
-                className="text-amber-500 text-xs leading-none"
-                title={t("suspicious_spread")}
-                aria-label={t("needs_review_aria")}
+              <button
+                onClick={onToggleExpand}
+                className="text-amber-500 text-xs leading-none inline-flex items-center gap-0.5 rounded hover:text-amber-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                title={t("relink_title")}
+                aria-label={t("relink_title")}
+                aria-expanded={expanded}
+                data-testid={`fix-${row.canonical_id}`}
               >
-                ⚠
-              </span>
+                ⚠ <span className="underline decoration-dotted">{t("relink_title")}</span>
+              </button>
             )}
             {row.confidence < 0.95 && (
               <span
@@ -650,7 +653,6 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
 function RelinkPanel({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
   const queryClient = useQueryClient();
-  const [urls, setUrls] = useState<Record<string, string>>({});
   const [msg, setMsg] = useState<{ site: string; ok: boolean; text: string } | null>(null);
 
   const mutation = useMutation({
@@ -658,7 +660,6 @@ function RelinkPanel({ row }: { row: ComparisonRow }) {
       api.matchRelink(row.canonical_id, site, url),
     onSuccess: (res, vars) => {
       setMsg({ site: vars.site, ok: true, text: t("relink_ok", { name: res.name }) });
-      setUrls((u) => ({ ...u, [vars.site]: "" }));
       queryClient.invalidateQueries({ queryKey: ["comparison"] });
       queryClient.invalidateQueries({ queryKey: ["match-quality"] });
     },
@@ -668,57 +669,147 @@ function RelinkPanel({ row }: { row: ComparisonRow }) {
     },
   });
 
+  const relink = (site: string, url: string) => {
+    if (url.trim()) mutation.mutate({ site, url: url.trim() });
+  };
+
   return (
     <div className="mt-3 pt-3 border-t border-border/50">
+      <p className="text-xs font-medium text-foreground mb-0.5">{t("relink_title")}</p>
       <p className="text-[11px] text-muted-foreground mb-2">{t("relink_hint")}</p>
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-        {SITES.map((s) => {
-          const cur = row.prices[s];
-          const busy = mutation.isPending && mutation.variables?.site === s;
-          const val = urls[s] ?? "";
-          return (
-            <div key={s} className="flex flex-col gap-1">
-              <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                {s}
-              </span>
-              <div className="flex gap-1">
-                <input
-                  type="url"
-                  value={val}
-                  onChange={(e) => setUrls((u) => ({ ...u, [s]: e.target.value }))}
-                  placeholder={t("relink_placeholder")}
-                  className="flex-1 min-w-0 px-2 py-1 text-xs border border-border rounded bg-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  data-testid={`relink-input-${s}-${row.canonical_id}`}
-                />
-                <button
-                  onClick={() => val.trim() && mutation.mutate({ site: s, url: val.trim() })}
-                  disabled={busy || !val.trim()}
-                  className="px-2 py-1 text-xs rounded bg-primary text-primary-foreground disabled:opacity-40 whitespace-nowrap"
-                  data-testid={`relink-apply-${s}-${row.canonical_id}`}
-                >
-                  {busy ? "…" : t("relink_apply")}
-                </button>
-              </div>
-              {cur && (
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {SITES.map((s) => (
+          <RelinkSite
+            key={s}
+            row={row}
+            site={s}
+            onRelink={relink}
+            busy={mutation.isPending && mutation.variables?.site === s}
+            msg={msg?.site === s ? msg : null}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RelinkSite({
+  row,
+  site,
+  onRelink,
+  busy,
+  msg,
+}: {
+  row: ComparisonRow;
+  site: string;
+  onRelink: (site: string, url: string) => void;
+  busy: boolean;
+  msg: { ok: boolean; text: string } | null;
+}) {
+  const t = useTranslations("comparison");
+  const [val, setVal] = useState("");
+  const [showAlts, setShowAlts] = useState(false);
+  const cur = row.prices[site];
+  const altsQ = useQuery({
+    queryKey: ["alternatives", row.canonical_id, site],
+    queryFn: () => api.matchAlternatives(row.canonical_id, site),
+    enabled: showAlts,
+    staleTime: 60_000,
+  });
+
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-border/60 p-2">
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
+        {site}
+      </span>
+      {cur ? (
+        <a
+          href={cur.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-[10px] text-muted-foreground/70 truncate hover:underline"
+          title={cur.url}
+        >
+          {t("relink_current")}: {cur.url.split("/").filter(Boolean).pop()}
+        </a>
+      ) : (
+        <span className="text-[10px] text-muted-foreground/60">{t("relink_no_product")}</span>
+      )}
+
+      {/* «сначала — другие варианты» */}
+      <button
+        onClick={() => setShowAlts((v) => !v)}
+        className="text-[11px] text-primary hover:underline self-start"
+        data-testid={`alts-toggle-${site}-${row.canonical_id}`}
+      >
+        {showAlts ? t("alts_hide") : t("alts_show")}
+      </button>
+      {showAlts && (
+        <div className="flex flex-col gap-1">
+          {altsQ.isLoading && <span className="text-[10px] text-muted-foreground">…</span>}
+          {altsQ.data && altsQ.data.items.length === 0 && (
+            <span className="text-[10px] text-muted-foreground">{t("alts_none")}</span>
+          )}
+          {altsQ.data?.items.map((a) => (
+            <div
+              key={a.product_id}
+              className="flex items-center justify-between gap-1 rounded bg-background/60 px-1.5 py-1"
+            >
+              <div className="min-w-0 flex-1">
                 <a
-                  href={cur.url}
+                  href={a.url ?? "#"}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-[10px] text-muted-foreground/70 truncate hover:underline"
-                  title={cur.url}
+                  className="text-[11px] hover:underline truncate block"
+                  title={a.name}
                 >
-                  {t("relink_current")}: {cur.url.split("/").filter(Boolean).pop()}
+                  {a.name}
                 </a>
-              )}
-              {msg?.site === s && (
-                <span className={`text-[10px] ${msg.ok ? "text-success" : "text-destructive"}`}>
-                  {msg.text}
+                <span className="text-[9px] text-muted-foreground tabular-nums">
+                  {a.price != null ? `${a.price.toFixed(2)} ₼ · ` : ""}
+                  {a.score}%
                 </span>
-              )}
+              </div>
+              <button
+                onClick={() => a.url && onRelink(site, a.url)}
+                disabled={busy || !a.url}
+                className="px-1.5 py-0.5 text-[10px] rounded bg-primary text-primary-foreground disabled:opacity-40 whitespace-nowrap"
+                data-testid={`alts-pick-${a.product_id}`}
+              >
+                {t("alts_pick")}
+              </button>
             </div>
-          );
-        })}
+          ))}
+        </div>
+      )}
+
+      {/* «или свой — ссылка» */}
+      <div className="flex gap-1 mt-0.5">
+        <input
+          type="url"
+          value={val}
+          onChange={(e) => setVal(e.target.value)}
+          placeholder={t("relink_placeholder")}
+          className="flex-1 min-w-0 px-2 py-1 text-xs border border-border rounded bg-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          data-testid={`relink-input-${site}-${row.canonical_id}`}
+        />
+        <button
+          onClick={() => {
+            onRelink(site, val);
+            setVal("");
+          }}
+          disabled={busy || !val.trim()}
+          className="px-2 py-1 text-xs rounded bg-secondary text-secondary-foreground disabled:opacity-40 whitespace-nowrap"
+          data-testid={`relink-apply-${site}-${row.canonical_id}`}
+        >
+          {busy ? "…" : t("relink_apply")}
+        </button>
       </div>
+      {msg && (
+        <span className={`text-[10px] ${msg.ok ? "text-success" : "text-destructive"}`}>
+          {msg.text}
+        </span>
+      )}
     </div>
   );
 }

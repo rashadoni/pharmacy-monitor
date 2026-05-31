@@ -3059,6 +3059,52 @@ def dash_match_relink(
     return {"ok": True, "product_id": prod.id, "name": prod.name, "site": site}
 
 
+@app.get("/api/v1/dash/matches/{match_id}/alternatives")
+def dash_match_alternatives(
+    match_id: int,
+    site: str,
+    limit: int = 6,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Похожие unmatched-товары сайта `site` — кандидаты на ЗАМЕНУ ошибочного
+    члена кластера. Для кнопки «Неправильное сравнение?» в /comparison: оператор
+    видит «другие варианты» и выбирает верный (или вставляет свою ссылку →
+    relink). Обёртка над match_actions.find_alternatives + актуальная цена.
+    """
+    _require_site(site)
+    limit = max(1, min(limit, 20))
+    from src import match_actions
+
+    match = db.scalar(
+        select(storage.Match).where(
+            storage.Match.id == match_id, storage.Match.tenant_id == user.tenant_id
+        )
+    )
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    alts = [
+        (p, sc)
+        for (p, sc) in match_actions.find_alternatives(db, match_id, site, limit=limit * 3)
+        if p.tenant_id == user.tenant_id
+    ][:limit]
+    snaps = storage.latest_snapshots_per_product(db, [p.id for p, _ in alts])
+    items = []
+    for p, sc in alts:
+        snap = snaps.get(p.id)
+        items.append(
+            {
+                "product_id": p.id,
+                "name": p.name,
+                "url": p.url,
+                "price": (snap.discount_price or snap.price) if snap else None,
+                "score": int(sc),
+            }
+        )
+    return {"items": items}
+
+
 # ── Phase 4.1+4.3+4.6 (2026-05-27) — Pricing settings + cost CSV import ─────
 
 

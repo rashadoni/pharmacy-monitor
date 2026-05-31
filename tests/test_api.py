@@ -1696,3 +1696,30 @@ def test_candidate_analogs_empty_when_site_already_present(client, tenant_user, 
     r = client.get(f"/api/v1/dash/matches/{m.id}/candidate-analogs?site=aloe")
     assert r.status_code == 200, r.text
     assert r.json()["items"] == []
+
+
+def test_match_alternatives_ranks_similar_unmatched(client, tenant_user, setup_db):
+    """alternatives endpoint (the «Неправильное сравнение?» panel) returns
+    similar unmatched products on the requested site, ranked by similarity."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    m = _make_match_with_prices(
+        s, run, canonical="Çaytikanı yağı", prices={"pharmonline": 10.6, "aptekonline": 6.7}
+    )
+    # unmatched aptekonline candidates the operator could swap in
+    good = _add_unmatched(s, site="aptekonline", name="Çaytikanı yağı 100 ml", run=run, price=7.0)
+    _add_unmatched(s, site="aptekonline", name="Paracetamol 500 mq N20", run=run)  # dissimilar
+
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get(f"/api/v1/dash/matches/{m.id}/alternatives?site=aptekonline")
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert items, "expected at least one alternative"
+    # the similar oil ranks first; dissimilar paracetamol is far down or absent
+    assert items[0]["product_id"] == good.id
+    assert items[0]["score"] >= items[-1]["score"]
