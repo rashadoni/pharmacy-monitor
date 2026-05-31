@@ -25,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.brand_catalog import is_brand_blacklisted
+from src.brand_resolver import brands_conflict
 from src.match_actions import is_rejected
 from src.normalize import extract_form, normalize_name, strip_accents
 from src.storage import Match, PriceSnapshot, Product, latest_snapshots_per_product
@@ -785,6 +786,19 @@ def _significant_name_tokens(name_norm: str | None) -> frozenset[str]:
     )
 
 
+def _has_conflicting_brand(a, b) -> bool:
+    """Разные ПОТРЕБИТЕЛЬСКИЕ бренды (brand_verified) → разные товары.
+
+    Корень бага клиента: коммодити с дженерик-именем («Alaqanqal yağı 100 ml»)
+    продаётся разными фирмами (Biola vs Herba Flora), но `brand`-поле хранит
+    generic-имя, и matcher их склеивает. Сравниваем ВОССТАНОВЛЕННЫЙ бренд
+    (brand_verified) через brand_resolver: блок только если у ОБОИХ — уверенный
+    ПОТРЕБИТЕЛЬСКИЙ бренд и они различаются. Компании-заводы (Merck KGaA, Egis
+    İlaç, Nycomed) считаются неразличающими → trade-name препараты (Konkor под
+    разным заводом) НЕ ломаются. NULL/unknown → не срабатывает (recall цел)."""
+    return brands_conflict(getattr(a, "brand_verified", None), getattr(b, "brand_verified", None))
+
+
 def _hard_conflict(a, b) -> bool:
     """Pairwise hard-guard'ы (как в проходах), отличающие РАЗНЫЕ товары.
 
@@ -797,7 +811,8 @@ def _hard_conflict(a, b) -> bool:
     an, bn = a.name_normalized or "", b.name_normalized or ""
     ar, br = a.name or "", b.name or ""
     return (
-        _has_conflicting_form(ar, br)
+        _has_conflicting_brand(a, b)
+        or _has_conflicting_form(ar, br)
         or _has_conflicting_gender(an, bn)
         or _has_conflicting_series_number(an, bn)
         or _has_conflicting_orphan_number(an, bn)
@@ -819,10 +834,15 @@ def _pairwise_spec_conflict(a, b) -> bool:
     и авто-dissolve таких кластеров СЛОМАЛ БЫ верные матчи (проверено на прод-дампе:
     5×country + 1×form — все ложные; только 2×vmarker реальные). Для НОВОЙ
     кластеризации полный набор ок (greedy + др. сигналы компенсируют), но для
-    необратимого ретро-разрыва берём только надёжные дискриминаторы."""
+    необратимого ретро-разрыва берём только надёжные дискриминаторы.
+
+    + brand-conflict (2026-05-31): brand_verified из АВТОРИТЕТНОГО источника
+    (slug/page-JSON/aloe), оба потребительские и различаются — надёжный сигнал
+    разных товаров (Biola≠Herba Flora), компании-заводы не считаются."""
     ar, br = a.name or "", b.name or ""
     return (
-        _has_conflicting_variant_marker(ar, br)
+        _has_conflicting_brand(a, b)
+        or _has_conflicting_variant_marker(ar, br)
         or _has_conflicting_variant_atoms(ar, br)
         or _has_conflicting_strength_number(ar, br)
         or _has_conflicting_dimensions(ar, br)

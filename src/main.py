@@ -526,8 +526,20 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
     from sqlalchemy import func
     from sqlalchemy import insert as sa_insert
 
+    from src import brand_resolver
     from src.brand_catalog import extract_brand
     from src.normalize import extract_dosage, extract_pack_size, normalize_name
+
+    def _compute_brand_verified(sp) -> str | None:
+        """Настоящий бренд из АВТОРИТЕТНОГО источника (см. brand_resolver):
+        aloe — уже чистое поле brand; pharmonline — токен бренда из slug;
+        aptekonline — None здесь (заполняется отдельным backfill через page-JSON,
+        т.к. category-API бренд не отдаёт)."""
+        if sp.site == "aloe":
+            return sp.brand
+        if sp.site == "pharmonline":
+            return brand_resolver.brand_from_pharmonline_slug(sp.url)
+        return None
 
     total = 0
     for result in results:
@@ -566,6 +578,7 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                 # Скрейпер pharmonline/aptekonline почти не достаёт brand из
                 # вёрстки → фолбэк на извлечение из названия по каталогу.
                 brand = sp.brand or extract_brand(sp.name)
+                bverified = _compute_brand_verified(sp)
                 # Дозировка/пакет: если скрейпер не вернул, извлечём из имени.
                 dosage = sp.dosage or extract_dosage(sp.name)
                 pack = sp.pack_size or extract_pack_size(sp.name)
@@ -576,6 +589,9 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                     existing.name = sp.name
                     existing.name_normalized = normalized
                     existing.brand = brand or existing.brand
+                    # brand_verified: pharmonline/aloe обновляем; aptek (None
+                    # здесь) НЕ затираем backfill-значение через `or existing`.
+                    existing.brand_verified = bverified or existing.brand_verified
                     existing.manufacturer = sp.manufacturer or existing.manufacturer
                     existing.dosage = dosage or existing.dosage
                     existing.pack_size = pack or existing.pack_size
@@ -600,6 +616,7 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                         name=sp.name,
                         name_normalized=normalized,
                         brand=brand,
+                        brand_verified=bverified,
                         manufacturer=sp.manufacturer,
                         category=sp.category,
                         dosage=dosage,

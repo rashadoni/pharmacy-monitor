@@ -140,6 +140,16 @@ class Product(Base):
     # проверялась. Единственный надёжный сигнал — реальный HTTP-чек URL.
     url_dead_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # 2026-05-31: настоящий бренд, восстановленный из АВТОРИТЕТНОГО источника
+    # (pharmonline — токен бренда в slug; aptekonline — JSON `"brand":{}` на
+    # странице товара; aloe — уже чистое поле brand). В отличие от `brand`,
+    # который из-за first-word fallback в extract_brand() у 92% pharmonline хранит
+    # generic-имя («Alaqanqal»), а не фирму. Используется brand-conflict guard'ом
+    # матчера: разные ПОТРЕБИТЕЛЬСКИЕ бренды (Biola≠Herba Flora) → разные товары;
+    # компании-заводы (Merck KGaA, Egis İlaç) считаются неразличающими. NULL =
+    # не восстановлен (guard не срабатывает, recall сохраняется).
+    brand_verified: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
     snapshots: Mapped[list[PriceSnapshot]] = relationship(back_populates="product")
     canonical: Mapped[Match | None] = relationship(back_populates="products")
 
