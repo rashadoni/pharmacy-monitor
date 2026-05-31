@@ -184,17 +184,33 @@ class TestBrandGuard:
             is False
         )
 
-    def test_dose_conflict_reads_name_and_url(self):
-        # client's Risek case: ph name has "40 mq", aptek name has NO mg but URL slug does
-        a = _p(
-            "Risek Insta (nanə) 40 mq № 10",
-            None,
-            url="https://pharmonline.az/product/risek-insta-40",
+    def test_dose_conflict_from_names(self):
+        # different single dose, and different multi-component combos (Tripliksam 10mg vs 5mg)
+        assert (
+            _has_conflicting_dose(
+                _p("Risek Insta 40 mq № 10", None), _p("Risek Insta 20 mq № 10", None)
+            )
+            is True
         )
-        b = _p("Risek İnsta N10 (toz)", None, url="https://aptekonline.az/product/risek-20mg-n10")
+        a = _p("Tripliksam 5 mq/1.25 mq/10 mq N30", None)
+        b = _p("Tripliksam 5 mq/1.25 mq/5 mq N30", None)
         assert _has_conflicting_dose(a, b) is True
-        assert _hard_conflict(a, b) is True
         assert _pairwise_spec_conflict(a, b) is True
+
+    def test_dose_multicomponent_same_no_conflict(self):
+        # decimal comma/dot + spaced thousands must NOT create spurious doses
+        assert (
+            _has_conflicting_dose(
+                _p("Tripliksam 5 mq/1.25 mq/10 mq", None), _p("Tripliksam 5mq/1,25mq/10mq", None)
+            )
+            is False
+        )
+        assert (
+            _has_conflicting_dose(
+                _p("Terapin Bid 1 000 mq № 14", None), _p("Terapin Bid 1000 mq N14", None)
+            )
+            is False
+        )
 
     def test_dose_same_or_missing_no_conflict(self):
         # same dose (mq == mg) → no conflict

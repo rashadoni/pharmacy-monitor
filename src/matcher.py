@@ -908,9 +908,15 @@ def _has_conflicting_pack_volume(a, b) -> bool:
 _DOSE_MG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(mg|mq|mkg|mcg|µg)(?![a-z])", re.IGNORECASE)
 
 
+_SPACED_THOUSANDS_RE = re.compile(r"\b(\d{1,3})(?:\s(\d{3}))+\b")
+
+
 def _doses_mg(text: str) -> frozenset[float]:
+    # «1 000 mq» → «1000 mq» (иначе regex берёт «000 mq» = 0)
+    t = strip_accents(text or "").lower()
+    t = _SPACED_THOUSANDS_RE.sub(lambda m: m.group(0).replace(" ", ""), t)
     out = set()
-    for m in _DOSE_MG_RE.finditer(strip_accents(text or "").lower()):
+    for m in _DOSE_MG_RE.finditer(t):
         v = float(m.group(1).replace(",", "."))
         if m.group(2) in ("mkg", "mcg", "µg"):
             v /= 1000.0
@@ -919,15 +925,18 @@ def _doses_mg(text: str) -> frozenset[float]:
 
 
 def _has_conflicting_dose(a, b) -> bool:
-    """Разная сила дозы (mg) → разные товары — читаем имя И URL-slug.
+    """Разная сила дозы (mg) в ИМЕНАХ → разные товары.
 
-    Корень (клиент): «Risek Insta 40 mq» (pharmonline) склеен с aptek «Risek İnsta
-    N10 (toz)» — в aptek-ИМЕНИ mg нет, но в URL-slug есть (risek-20mg-n10). Имя+slug
-    дают 40 vs 20 → блок. Требуется единица mg/mq/mkg/mcg (не голое число и не
-    объём ml/g) → нет ложных срабатываний на pack-count. Одна сторона без дозы →
-    не блок (recall цел)."""
-    da = _doses_mg(f"{getattr(a, 'name', '') or ''} {getattr(a, 'url', '') or ''}")
-    db = _doses_mg(f"{getattr(b, 'name', '') or ''} {getattr(b, 'url', '') or ''}")
+    Сравниваем НАБОР доз (mg/mq/mkg/mcg) из имён — корректно для много-
+    компонентных (5/1.25/10 vs 5/1.25/5). Требуется единица (не голое число, не
+    объём ml/g) → нет ложных на pack-count. Одна сторона без дозы → не блок.
+
+    NB: читаем ТОЛЬКО имена, НЕ url: в slug десятичные/диапазоны ломаются дефисом
+    («7.5mg»→«7-5mg»→ложн.«5mg»; «5mg125mg10mg»→125 вместо 1.25) → массовые ложные
+    разрывы (dry-run 2026-05-31). Кейс aptek-без-mg-в-имени (Risek «N10 (toz)») —
+    редкий, чинится точечно, не этим guard'ом."""
+    da = _doses_mg(getattr(a, "name", "") or "")
+    db = _doses_mg(getattr(b, "name", "") or "")
     return bool(da) and bool(db) and da != db
 
 
