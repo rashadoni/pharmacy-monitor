@@ -8,8 +8,40 @@ from src.brand_resolver import (
     brand_from_pharmonline_slug,
     brands_conflict,
     consumer_brand,
+    is_commodity_name,
     is_manufacturer_company,
 )
+
+
+class TestCommodityName:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Alaqanqal yağı 100 ml",
+            "Palıd qabığı 50 qr",
+            "Şüyüd çayı № 30",
+            "Balqabaq toxumu 50 q",
+            "Çaytikanı yağı altay 100 ml",
+            "Boymadərən otu 40 qr",
+            "Adaçayı ekstraktı",
+        ],
+    )
+    def test_botanical_commodities(self, name):
+        assert is_commodity_name(name) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Konkor 5 mg N30",
+            "Densip 30 əd.",
+            "Movalis 15 mq № 20",
+            "Glukofaj 500 mg N60",
+            "Asmartin 125 ml (Sirop)",
+            "Depantol N10",
+        ],
+    )
+    def test_trade_name_drugs_are_not_commodity(self, name):
+        assert is_commodity_name(name) is False
 
 
 class TestManufacturerDetection:
@@ -60,6 +92,14 @@ class TestBrandsConflict:
         assert brands_conflict("Merck KGaA", "Nycomed") is False
         assert brands_conflict("Egis Pharmaceuticals", "Egis") is False
         assert brands_conflict("Pharmex Rom Industry SRL", "Pharmex") is False
+
+    def test_spelling_variants_of_same_firm_no_conflict(self):
+        # transliteration / suffix variants of the SAME firm are fuzzy-similar →
+        # not a conflict (the manufacturer-transliteration confound that made a
+        # blanket guard split ~115 correct matches)
+        assert brands_conflict("Borisov", "Borisovsky Zmp") is False
+        assert brands_conflict("Medizin", "Medizen") is False
+        assert brands_conflict("Nijfarm", "Nizhfarm") is False
 
     def test_missing_brand_no_conflict(self):
         # unknown brand → recall preserved (guard does not fire)

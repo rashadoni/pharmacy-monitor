@@ -25,7 +25,15 @@ from __future__ import annotations
 
 import re
 
+from rapidfuzz import fuzz
+
 from src.normalize import strip_accents
+
+# Above this fuzzy similarity, two differing brand strings are treated as the
+# SAME brand spelled differently (transliteration / suffix), NOT a conflict:
+# Borisov↔Borisovsky Zmp=100, Medizin↔Medizen=86, Nijfarm↔Nizhfarm=80 vs genuine
+# Biola↔Herba Flora=50, Xerbes↔Herba Flora=60 (measured on prod, 2026-05-31).
+_BRAND_SAME_FUZZ = 72
 
 # ── manufacturer-company detection ──────────────────────────────────────────
 # A brand reads as a manufacturer COMPANY (non-discriminating) if it carries a
@@ -186,12 +194,54 @@ def consumer_brand(brand_verified: str | None) -> str | None:
 
 
 def brands_conflict(a_verified: str | None, b_verified: str | None) -> bool:
-    """True iff BOTH products have a confident consumer brand and they differ."""
+    """True iff both products have a confident consumer brand that genuinely differs.
+
+    Two differing strings that are fuzzy-similar (≥ _BRAND_SAME_FUZZ) are treated
+    as the SAME brand spelled differently (Borisov / Borisovsky Zmp, Medizin /
+    Medizen) — not a conflict. This catches the manufacturer-transliteration
+    confound generically, without per-firm lists."""
     ca = consumer_brand(a_verified)
     cb = consumer_brand(b_verified)
     if not ca or not cb:
         return False
-    return ca != cb
+    if ca == cb:
+        return False
+    sim = max(fuzz.ratio(ca, cb), fuzz.partial_ratio(ca, cb), fuzz.token_set_ratio(ca, cb))
+    return sim < _BRAND_SAME_FUZZ
+
+
+# ── commodity gate ──────────────────────────────────────────────────────────
+# The brand-conflict guard is ONLY safe for COMMODITY products — herbal/natural
+# goods with a generic descriptive name (<plant> <form>) where the brand IS the
+# product identity (Biola vs Herba Flora milk-thistle oil). For trade-name DRUGS
+# the brand_verified field is the MANUFACTURER, which aloe and pharmonline spell
+# differently (Nijfarm/Nizhfarm, Merk/Merck Sante, Berinqer/Boehringer) — guarding
+# those would split ~115 correct matches (measured on prod). So we gate on the
+# presence of a botanical form-word in the name. Markers are accent-normalized
+# (ə→e, ş→s, ı→i, ç→c, ğ→g, ö→o, ü→u — see _norm).
+_COMMODITY_MARKERS = {
+    "yagi", "yag",  # oil  (yağı/yağ)
+    "toxumu", "toxum",  # seed
+    "cayi", "cay",  # tea  (çayı/çay)
+    "otu",  # herb  (otu) — bare "ot" excluded (too common/short)
+    "qabigi", "qabig",  # bark  (qabığı)
+    "ekstrakti", "ekstrakt",  # extract
+    "siresi",  # juice/sap  (şirəsi)
+    "meyveleri", "meyve",  # fruit/berries  (meyvələri)
+    "koku",  # root  (kökü)
+    "yarpagi",  # leaf  (yarpağı)
+    "covheri", "covher",  # tincture  (cövhəri)
+    "gulu",  # flower  (gülü)
+}
+
+
+def is_commodity_name(name: str | None) -> bool:
+    """True if the name carries a botanical/commodity form-word (oil/seed/tea/
+    bark/extract/…) → a generic-named good where brand = identity. Used to gate
+    the brand-conflict guard so it never fires on trade-name drugs."""
+    if not name:
+        return False
+    return any(tok in _COMMODITY_MARKERS for tok in _norm(name).split())
 
 
 # ── pharmonline slug → brand ────────────────────────────────────────────────

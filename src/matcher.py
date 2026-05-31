@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.brand_catalog import is_brand_blacklisted
-from src.brand_resolver import brands_conflict
+from src.brand_resolver import brands_conflict, is_commodity_name
 from src.match_actions import is_rejected
 from src.normalize import extract_form, normalize_name, strip_accents
 from src.storage import Match, PriceSnapshot, Product, latest_snapshots_per_product
@@ -787,15 +787,22 @@ def _significant_name_tokens(name_norm: str | None) -> frozenset[str]:
 
 
 def _has_conflicting_brand(a, b) -> bool:
-    """Разные ПОТРЕБИТЕЛЬСКИЕ бренды (brand_verified) → разные товары.
+    """Разные ПОТРЕБИТЕЛЬСКИЕ бренды (brand_verified) → разные товары — но ТОЛЬКО
+    для товаров-коммодити (масла/семена/чаи/экстракты с дженерик-именем).
 
-    Корень бага клиента: коммодити с дженерик-именем («Alaqanqal yağı 100 ml»)
-    продаётся разными фирмами (Biola vs Herba Flora), но `brand`-поле хранит
-    generic-имя, и matcher их склеивает. Сравниваем ВОССТАНОВЛЕННЫЙ бренд
-    (brand_verified) через brand_resolver: блок только если у ОБОИХ — уверенный
-    ПОТРЕБИТЕЛЬСКИЙ бренд и они различаются. Компании-заводы (Merck KGaA, Egis
-    İlaç, Nycomed) считаются неразличающими → trade-name препараты (Konkor под
-    разным заводом) НЕ ломаются. NULL/unknown → не срабатывает (recall цел)."""
+    Корень бага клиента: коммодити «Alaqanqal yağı 100 ml» продаётся разными
+    фирмами (Biola vs Herba Flora), но `brand`-поле хранит generic-имя, и matcher
+    их склеивает. Сравниваем ВОССТАНОВЛЕННЫЙ бренд (brand_verified).
+
+    Почему ТОЛЬКО коммодити (gate is_commodity_name): для trade-name препаратов
+    brand_verified = ЗАВОД, а aloe и pharmonline пишут его по-разному
+    (Nijfarm/Nizhfarm, Merk/Merck Sante, Berinqer/Boehringer) → блокировка
+    разорвала бы ~115 ВЕРНЫХ матчей (замерено на проде, dry-run 2026-05-31).
+    Поэтому guard срабатывает лишь когда ОБА имени — ботанический коммодити И
+    у обоих уверенный различающийся потребительский бренд. Заводы-компании
+    (Merck KGaA, Egis İlaç) неразличающи; NULL/unknown → не срабатывает."""
+    if not (is_commodity_name(getattr(a, "name", None)) and is_commodity_name(getattr(b, "name", None))):
+        return False
     return brands_conflict(getattr(a, "brand_verified", None), getattr(b, "brand_verified", None))
 
 

@@ -53,3 +53,14 @@ class TestBrandGuard:
         b = _p("Alaqanqal yağı 100 ml", "Biola")
         assert _has_conflicting_brand(a, b) is False
         assert _hard_conflict(a, b) is False
+
+    def test_non_commodity_different_brands_no_conflict(self):
+        # commodity gate: a trade-name drug with different brand strings must NOT
+        # fire — aloe/pharmonline spell the same manufacturer differently
+        # (Biofarm vs Biofarm Spzoo, Merk vs Merck Sante) and blanket-blocking
+        # split ~115 correct matches. Identical name isolates the brand gate.
+        a = _p("Densip 30", "Biofarm")
+        b = _p("Densip 30", "Pharmaco")
+        assert _has_conflicting_brand(a, b) is False
+        assert _hard_conflict(a, b) is False
+        assert _pairwise_spec_conflict(a, b) is False
