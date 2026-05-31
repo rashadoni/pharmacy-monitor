@@ -19,6 +19,7 @@ import {
   api,
   friendlyError,
   type AnchorProduct,
+  type CandidateAnalog,
   type SiteProduct,
   type UnmatchedPair,
 } from "@/lib/api";
@@ -436,6 +437,12 @@ function PairCard({
     enabled: Boolean(debouncedSearch),
   });
 
+  // Авто-подсказки: guard-passing аналоги, ранжированные матчером (auto_safe = ultra-равны)
+  const suggestionsQ = useQuery({
+    queryKey: ["matcher", "analogs", site, pair.match_id],
+    queryFn: () => api.matchCandidateAnalogs(pair.match_id, site),
+  });
+
   const linkMutation = useMutation({
     mutationFn: ({
       matchId,
@@ -454,6 +461,7 @@ function PairCard({
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["matcher", "unmatched"] });
+      queryClient.invalidateQueries({ queryKey: ["matcher", "analogs"] });
       queryClient.invalidateQueries({ queryKey: ["match-quality"] });
       queryClient.invalidateQueries({ queryKey: ["normalize-stats"] });
       queryClient.invalidateQueries({ queryKey: ["comparison"] });
@@ -498,6 +506,30 @@ function PairCard({
         </div>
 
         <div className="p-4 space-y-2">
+          {suggestionsQ.data && suggestionsQ.data.items.length > 0 && (
+            <div className="mb-3">
+              <div className="text-xs uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-1">
+                <Sparkles className="h-3.5 w-3.5" /> Предложенные аналоги
+              </div>
+              <ul className="space-y-1.5">
+                {suggestionsQ.data.items.map((p) => (
+                  <SuggestionRow
+                    key={p.product_id}
+                    cand={p}
+                    disabled={isLinked || linkMutation.isPending}
+                    isLinkedHere={linkedProductId === p.product_id}
+                    onLink={() =>
+                      linkMutation.mutate({
+                        matchId: pair.match_id,
+                        productId: p.product_id,
+                      })
+                    }
+                  />
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div className="text-xs uppercase tracking-wide text-muted-foreground mb-2">
             Поиск по {SITE_LABEL[site]}
           </div>
@@ -628,6 +660,69 @@ function CandidateRow({
         <div className="text-right shrink-0 flex flex-col items-end gap-1">
           <div className="text-sm font-medium tabular-nums">
             {formatPrice(product.effective_price)}
+          </div>
+          <button
+            onClick={onLink}
+            disabled={disabled}
+            className={`text-xs rounded px-2 py-1 font-medium transition-colors ${
+              isLinkedHere
+                ? "bg-success text-success-foreground"
+                : "bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed"
+            }`}
+          >
+            {isLinkedHere ? "✓ Привязано" : "Привязать"}
+          </button>
+        </div>
+      </div>
+    </li>
+  );
+}
+
+function SuggestionRow({
+  cand,
+  disabled,
+  isLinkedHere,
+  onLink,
+}: {
+  cand: CandidateAnalog;
+  disabled: boolean;
+  isLinkedHere: boolean;
+  onLink: () => void;
+}) {
+  return (
+    <li
+      className={`rounded-md border p-2 ${
+        cand.auto_safe
+          ? "border-success/40 bg-success/5"
+          : "border-border bg-background/50"
+      }`}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm flex items-center gap-1">
+            <a
+              href={cand.url ?? "#"}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:underline truncate"
+            >
+              {cand.name}
+            </a>
+            <ExternalLink className="h-3 w-3 text-muted-foreground shrink-0" />
+          </div>
+          <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5">
+            {cand.auto_safe && (
+              <span className="inline-flex items-center gap-0.5 text-success font-medium">
+                <CheckCircle2 className="h-3 w-3" /> точное совпадение
+              </span>
+            )}
+            <span className="tabular-nums">{cand.score}%</span>
+            {cand.brand && <span className="truncate">{cand.brand}</span>}
+          </div>
+        </div>
+        <div className="text-right shrink-0 flex flex-col items-end gap-1">
+          <div className="text-sm font-medium tabular-nums">
+            {formatPrice(cand.price)}
           </div>
           <button
             onClick={onLink}

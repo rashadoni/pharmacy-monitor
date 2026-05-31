@@ -73,7 +73,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from src import inventory as inv_mod
@@ -3340,6 +3340,107 @@ def dash_unmatched_pairs(
             }
         )
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/v1/dash/matches/{match_id}/candidate-analogs")
+def dash_match_candidate_analogs(
+    match_id: int,
+    site: str,
+    limit: int = 6,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Ранжированные guard-passing аналоги для кластера на недостающем `site`.
+
+    Заменяет ручной текст-поиск в /matcher: берём имена членов кластера, блокируем
+    по первому значимому токену, ищем unmatched-продукты `site` с тем же токеном,
+    ранжируем по token_set_ratio и ОТФИЛЬТРОВЫВАЕМ всё, что конфликтует с любым
+    членом (_hard_conflict + _pairwise_spec_conflict) или уже отклонено
+    (match_rejections). Флаг ``auto_safe`` — кандидат ultra-эквивалентен якорю
+    (равные токены/доза/объём/форма/коды) → one-click без раздумий. Accept на
+    фронте зовёт add-product (is_manual=True). Дешёво: один токен-блок, не скан.
+    """
+    _require_site(site)
+    limit = max(1, min(limit, 20))
+    from rapidfuzz import fuzz
+
+    from src import match_actions, matcher
+
+    match = db.scalar(
+        select(storage.Match).where(
+            storage.Match.id == match_id,
+            storage.Match.tenant_id == user.tenant_id,
+        )
+    )
+    if not match:
+        raise HTTPException(404, "Match not found")
+    members = list(match.products)
+    if not members or any(p.site == site for p in members):
+        return {"items": []}  # nothing to add (empty cluster or site already present)
+
+    # first significant token of each member → coarse block
+    block_tokens: set[str] = set()
+    for m in members:
+        nn = m.name_normalized or ""
+        toks = matcher._significant_name_tokens(nn)
+        first = next((t for t in nn.split() if t in toks), None)
+        if first:
+            block_tokens.add(first)
+    if not block_tokens:
+        return {"items": []}
+
+    conds = [storage.Product.name_normalized.ilike(f"%{t}%") for t in block_tokens]
+    cand_rows = db.scalars(
+        select(storage.Product)
+        .where(
+            storage.Product.site == site,
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.canonical_id.is_(None),
+            storage.Product.url_dead_at.is_(None),
+            or_(*conds),
+        )
+        .limit(500)
+    ).all()
+
+    scored: list[tuple[float, bool, storage.Product]] = []
+    for c in cand_rows:
+        if not c.name_normalized:
+            continue
+        if any(
+            matcher._hard_conflict(c, m)
+            or matcher._pairwise_spec_conflict(c, m)
+            or match_actions.is_rejected(db, c.id, m.id)
+            for m in members
+        ):
+            continue
+        score = max(
+            fuzz.token_set_ratio(c.name_normalized, m.name_normalized or "") for m in members
+        )
+        if score < 80:
+            continue
+        auto_safe = any(matcher.ultra_equal(c, m) for m in members)
+        scored.append((score, auto_safe, c))
+
+    scored.sort(key=lambda r: (r[1], r[0]), reverse=True)
+    top = scored[:limit]
+    snaps = storage.latest_snapshots_per_product(db, [c.id for _s, _a, c in top])
+    items = []
+    for score, auto_safe, c in top:
+        snap = snaps.get(c.id)
+        items.append(
+            {
+                "product_id": c.id,
+                "site": c.site,
+                "name": c.name,
+                "brand": c.brand,
+                "url": c.url,
+                "image_url": c.image_url,
+                "price": (snap.discount_price or snap.price) if snap else None,
+                "score": round(float(score), 1),
+                "auto_safe": auto_safe,
+            }
+        )
+    return {"items": items}
 
 
 @app.get("/api/v1/dash/matcher/counts")

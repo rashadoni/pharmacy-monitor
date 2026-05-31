@@ -1604,3 +1604,95 @@ def test_comparison_drops_match_when_client_dead(client, tenant_user, setup_db):
     r = client.get("/api/v1/dash/comparison?min_sites=2")
     assert r.status_code == 200, r.text
     assert "clientdead" not in [row["name"] for row in r.json()]
+
+
+# ─── /matches/{id}/candidate-analogs — guard-ranked recall suggestions ────────
+
+
+def _add_unmatched(db, *, site, name, run, price=None):
+    from src.normalize import normalize_name
+
+    p = storage.Product(
+        tenant_id=1,
+        site=site,
+        external_id=f"{site}-{name}",
+        url=f"https://{site}.example/{name}",
+        name=name,
+        name_normalized=normalize_name(name),
+    )
+    db.add(p)
+    db.flush()
+    if price is not None:
+        db.add(
+            storage.PriceSnapshot(run_id=run.id, product_id=p.id, price=price, captured_at=utcnow())
+        )
+    db.commit()
+    return p
+
+
+def test_candidate_analogs_ranks_guard_passing_and_flags_auto_safe(client, tenant_user, setup_db):
+    """Endpoint suggests the missing-site twin, flags ultra-equal as auto_safe,
+    and filters out spec-conflicting (different pack) + dissimilar candidates."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    from src.normalize import normalize_name
+
+    m = storage.Match(tenant_id=1, canonical_name="Tussor 100 ml", confidence=1.0)
+    s.add(m)
+    s.flush()
+    for site, nm in [
+        ("pharmonline", "Tussor 100 ml (Sirop)"),
+        ("aptekonline", "Tussor şərbət 100 ml"),
+    ]:
+        s.add(
+            storage.Product(
+                tenant_id=1,
+                site=site,
+                external_id=f"{site}-tussor",
+                url=f"https://{site}.example/tussor",
+                name=nm,
+                name_normalized=normalize_name(nm),
+                canonical_id=m.id,
+            )
+        )
+    s.flush()
+    # ultra-equal twin: same tokens/pack AND form (şərbət≡sirop → syrup)
+    twin = _add_unmatched(s, site="aloe", name="Tussor şərbət 100 ml", run=run, price=7.5)
+    _add_unmatched(s, site="aloe", name="Tussor 200 ml", run=run)  # different pack → conflict
+    _add_unmatched(s, site="aloe", name="Aspirin 500 mq N20", run=run)  # unrelated → low fuzz
+
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get(f"/api/v1/dash/matches/{m.id}/candidate-analogs?site=aloe")
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    ids = {it["product_id"] for it in items}
+    assert twin.id in ids
+    twin_row = next(it for it in items if it["product_id"] == twin.id)
+    assert twin_row["auto_safe"] is True
+    assert twin_row["price"] == 7.5
+    names = {it["name"] for it in items}
+    assert "Tussor 200 ml" not in names
+    assert "Aspirin 500 mq N20" not in names
+
+
+def test_candidate_analogs_empty_when_site_already_present(client, tenant_user, setup_db):
+    """If the cluster already has the requested site, nothing to suggest."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    m = _make_match_with_prices(
+        s, run, canonical="Tussor", prices={"pharmonline": 10.0, "aloe": 8.0}
+    )
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.get(f"/api/v1/dash/matches/{m.id}/candidate-analogs?site=aloe")
+    assert r.status_code == 200, r.text
+    assert r.json()["items"] == []

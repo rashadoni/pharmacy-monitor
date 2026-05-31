@@ -27,7 +27,13 @@ from sqlalchemy.orm import Session
 from src.brand_catalog import is_brand_blacklisted
 from src.brand_resolver import brands_conflict, is_commodity_name
 from src.match_actions import is_rejected
-from src.normalize import extract_form, extract_total_volume, normalize_name, strip_accents
+from src.normalize import (
+    extract_form,
+    extract_pack_size,
+    extract_total_volume,
+    normalize_name,
+    strip_accents,
+)
 from src.storage import Match, PriceSnapshot, Product, latest_snapshots_per_product
 
 log = structlog.get_logger()
@@ -949,6 +955,42 @@ def _has_conflicting_dose(a, b) -> bool:
     da = _doses_mg(getattr(a, "name", "") or "")
     db = _doses_mg(getattr(b, "name", "") or "")
     return bool(da) and bool(db) and da != db
+
+
+# Буквенные размеры (подгузники/одежда/бельё): M ≠ L — разный товар. Отдельно от
+# числовых, т.к. в имени стоят как голые токены.
+_SIZE_LETTERS = {"xs", "s", "m", "l", "xl", "xxl", "xxxl"}
+_SIZE_SPLIT_RE = re.compile(r"[^a-zəçşğöüı]+")
+
+
+def _size_letters(name: str | None) -> frozenset[str]:
+    return frozenset(
+        t for t in _SIZE_SPLIT_RE.split((name or "").lower()) if t in _SIZE_LETTERS
+    )
+
+
+def ultra_equal(a, b) -> bool:
+    """Высокоуверенная эквивалентность двух продуктов — one-click безопасно.
+
+    РАВЕНСТВО (не подмножество) по всем спец-осям: значимые токены имени +
+    буквенный размер (M≠L) + ingredient-коды (D3≠D3K2) + pack-size + набор доз +
+    форма + вариант-слова. Под этими равенствами отношения транзитивны, поэтому
+    кандидат, ultra-равный одному члену кластера, согласован со всем кластером.
+
+    Источник истины для recall_candidates.py --ultra И для UI suggest-analog
+    (бейдж auto_safe). НЕ заменяет _hard_conflict/_pairwise_spec_conflict —
+    это ДОПОЛНИТЕЛЬНЫЙ, более строгий фильтр поверх них."""
+    na, nb = a.name_normalized or a.name or "", b.name_normalized or b.name or ""
+    ra, rb = a.name or "", b.name or ""
+    return (
+        _significant_name_tokens(na) == _significant_name_tokens(nb)
+        and _size_letters(ra) == _size_letters(rb)
+        and _ingredient_codes(ra) == _ingredient_codes(rb)
+        and extract_pack_size(ra) == extract_pack_size(rb)
+        and _doses_mg(ra) == _doses_mg(rb)
+        and extract_form(ra) == extract_form(rb)
+        and _variant_words(ra) == _variant_words(rb)
+    )
 
 
 def _hard_conflict(a, b) -> bool:

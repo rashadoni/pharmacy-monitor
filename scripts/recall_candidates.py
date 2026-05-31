@@ -51,12 +51,6 @@ def main() -> int:
     args = ap.parse_args()
     if args.ultra:
         args.strict = True
-    SIZES = {"xs", "s", "m", "l", "xl", "xxl", "xxxl"}
-
-    import re as _re
-
-    def _size_tokens(name: str) -> frozenset[str]:
-        return frozenset(t for t in _re.split(r"[^a-zəçşğöüı]+", (name or "").lower()) if t in SIZES)
     db = os.environ.get("DATABASE_URL")
     if not db:
         print("ERROR: set DATABASE_URL", file=sys.stderr)
@@ -103,7 +97,11 @@ def main() -> int:
                         continue
                     if matcher._hard_conflict(a, b) or matcher._pairwise_spec_conflict(a, b):
                         continue
-                    if args.strict:
+                    if args.ultra:
+                        # single source of truth — same predicate as the UI auto_safe badge
+                        if not matcher.ultra_equal(a, b):
+                            continue
+                    elif args.strict:
                         from src.normalize import extract_pack_size
 
                         if extract_pack_size(a.name) != extract_pack_size(b.name):
@@ -113,18 +111,6 @@ def main() -> int:
                         if matcher._variant_words(a.name) != matcher._variant_words(b.name):
                             continue
                         if matcher.extract_form(a.name) != matcher.extract_form(b.name):
-                            continue
-                    if args.ultra:
-                        if matcher._significant_name_tokens(
-                            a.name_normalized
-                        ) != matcher._significant_name_tokens(b.name_normalized):
-                            continue
-                        if _size_tokens(a.name) != _size_tokens(b.name):
-                            continue
-                        # EQUAL ingredient codes (not omission-tolerant): excludes
-                        # "Dekol" vs "Dekol+K2", "Venatura" vs "Venatura K2" — the
-                        # D3-vs-D3+K2 composition class the client flagged.
-                        if matcher._ingredient_codes(a.name) != matcher._ingredient_codes(b.name):
                             continue
                     cands.append((sc, a, b))
         cands.sort(key=lambda r: r[0], reverse=True)

@@ -451,6 +451,18 @@ export interface MatchUpdated {
   products: { product_id: number; site: string; name: string; url: string }[];
 }
 
+export interface CandidateAnalog {
+  product_id: number;
+  site: string;
+  name: string;
+  brand: string | null;
+  url: string | null;
+  image_url: string | null;
+  price: number | null;
+  score: number;
+  auto_safe: boolean;
+}
+
 export interface Recipient {
   id: number;
   email: string;
@@ -695,6 +707,12 @@ export const api = {
     }),
   matcherCounts: () =>
     request<Record<string, number>>("/api/v1/dash/matcher/counts"),
+  matchCandidateAnalogs: (match_id: number, site: string, limit = 6) => {
+    const q = new URLSearchParams({ site, limit: String(limit) });
+    return request<{ items: CandidateAnalog[] }>(
+      `/api/v1/dash/matches/${match_id}/candidate-analogs?${q}`,
+    );
+  },
   recipients: () => request<Recipient[]>("/api/v1/dash/recipients"),
   recipientCreate: (payload: RecipientCreate) =>
     request<Recipient>("/api/v1/dash/recipients", {

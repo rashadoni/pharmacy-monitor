@@ -18,6 +18,7 @@ from src.matcher import (
     _has_conflicting_variant_words,
     _hard_conflict,
     _pairwise_spec_conflict,
+    ultra_equal,
 )
 
 
@@ -247,3 +248,50 @@ class TestBrandGuard:
         assert _has_conflicting_brand(a, b) is False
         assert _hard_conflict(a, b) is False
         assert _pairwise_spec_conflict(a, b) is False
+
+
+class TestUltraEqual:
+    """ultra_equal — high-confidence equality powering recall_candidates --ultra
+    AND the UI auto_safe badge. EQUAL (not subset) on every spec axis."""
+
+    def test_formatting_only_difference_is_equal(self):
+        # punctuation/spacing/case only → same product (these are in the applied set)
+        assert ultra_equal(_p("Tioktas N30", None), _p("TioktAs № 30", None)) is True
+        assert ultra_equal(_p("Estova 2 mq N28", None), _p("Estova 2 mq № 28", None)) is True
+        assert (
+            ultra_equal(
+                _p("Qara zirə yağı 100 ml", None), _p("Qara zirə yağı  100 ml", None)
+            )
+            is True
+        )
+
+    def test_noise_form_words_collapse_equal(self):
+        # form words (şərbət/sirop) drop out under real normalize_name → both reduce
+        # to the product token. Uses normalize_name (not the naive _p lowercase) since
+        # this asserts the prod normalize+ultra_equal interaction.
+        from src.normalize import normalize_name
+
+        def _np(name):
+            return SimpleNamespace(name=name, name_normalized=normalize_name(name), brand_verified=None, url="")
+
+        assert ultra_equal(_np("Litosit şərbət 100 ml"), _np("Litosit 100 ml (Sirop)")) is True
+
+    def test_size_letter_difference_not_equal(self):
+        assert ultra_equal(_p("Pufies M 30", None), _p("Pufies L 30", None)) is False
+
+    def test_ingredient_code_difference_not_equal(self):
+        # the D3 vs D3+K2 class the client flagged — must NOT be auto_safe
+        assert ultra_equal(_p("Venatura D3 20 ml", None), _p("Venatura D3 K2 20 ml", None)) is False
+
+    def test_dose_difference_not_equal(self):
+        assert ultra_equal(_p("Risek 40 mq N10", None), _p("Risek 20 mq N10", None)) is False
+
+    def test_extra_significant_token_not_equal(self):
+        # aloe-vera vs aloe: "vera" is a significant token on one side only
+        assert ultra_equal(_p("Aloe vera gel 100 ml", None), _p("Aloe gel 100 ml", None)) is False
+
+    def test_pack_size_difference_not_equal(self):
+        assert (
+            ultra_equal(_p("Qara zirə yağı 100 ml", None), _p("Qara zirə yağı 250 ml", None))
+            is False
+        )
