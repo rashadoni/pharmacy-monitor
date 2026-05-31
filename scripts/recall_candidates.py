@@ -42,6 +42,12 @@ def main() -> int:
         help="strict + equal significant-token SET (not subset) + equal size-letter",
     )
     ap.add_argument("--commit", action="store_true", help="link the candidates (is_manual=False)")
+    ap.add_argument(
+        "--attach",
+        action="store_true",
+        help="also attach unmatched products to EXISTING clusters (recovers 3-way twins "
+        "greedy 2-way missed); joiner must clear every cluster member's guards + free site",
+    )
     args = ap.parse_args()
     if args.ultra:
         args.strict = True
@@ -62,10 +68,17 @@ def main() -> int:
         for a, b in s.execute(select(MatchRejection.product_a_id, MatchRejection.product_b_id)):
             rej.add((a, b))
             rej.add((b, a))
-        prods = s.scalars(select(Product).where(Product.url_dead_at.is_(None))).all()
-        unmatched = [p for p in prods if p.canonical_id is None and p.name_normalized]
+        prods = [p for p in s.scalars(select(Product).where(Product.url_dead_at.is_(None))).all() if p.name_normalized]
+        unmatched = [p for p in prods if p.canonical_id is None]
+        # members of every existing cluster — used by --attach to grow safely
+        cluster_members: dict[int, list[Product]] = defaultdict(list)
+        for p in prods:
+            if p.canonical_id is not None:
+                cluster_members[p.canonical_id].append(p)
+        # block pool: unmatched only, OR all products when attaching to existing clusters
+        pool = prods if args.attach else unmatched
         blocks = defaultdict(list)
-        for p in unmatched:
+        for p in pool:
             toks = matcher._significant_name_tokens(p.name_normalized)
             first = next((t for t in p.name_normalized.split() if t in toks), None)
             if first:
@@ -79,6 +92,9 @@ def main() -> int:
             for i, a in enumerate(group):
                 for b in group[i + 1 :]:
                     if a.site == b.site:
+                        continue
+                    # at least one side must be unmatched (no point re-pairing two clusters)
+                    if a.canonical_id is not None and b.canonical_id is not None:
                         continue
                     sc = fuzz.token_set_ratio(a.name_normalized, b.name_normalized)
                     if sc < args.fuzz:
@@ -112,28 +128,59 @@ def main() -> int:
                             continue
                     cands.append((sc, a, b))
         cands.sort(key=lambda r: r[0], reverse=True)
+        n_new = sum(1 for _s, a, b in cands if a.canonical_id is None and b.canonical_id is None)
+        n_att = len(cands) - n_new
         print(f"unmatched products: {len(unmatched)} | blocks: {len(blocks)} (skipped {skipped_blocks} > {args.max_block})")
-        print(f"RECALL CANDIDATES (fuzz>={args.fuzz}, guards pass, not rejected): {len(cands)}")
+        print(
+            f"RECALL CANDIDATES (fuzz>={args.fuzz}, guards pass, not rejected): {len(cands)}"
+            + (f"  [new-cluster: {n_new}, attach-to-existing: {n_att}]" if args.attach else "")
+        )
         print("--- sample (score | site:name ✗ site:name) — EYEBALL for false matches ---")
         # sample across the score range
         step = max(1, len(cands) // args.sample)
         for sc, a, b in cands[:: step][: args.sample]:
             print(f"  {sc:.0f}  [{a.site[:3]}] {(a.name or '').strip()[:32]}  ✗  [{b.site[:3]}] {(b.name or '').strip()[:32]}")
         if args.commit:
-            linked = 0
-            used: set[int] = set()
+            new_clusters = attached = 0
+            used: set[int] = set()  # a product joins at most one cluster per run
             for _sc, a, b in cands:
-                # greedy: skip if either product already linked this run or now has a cluster
-                if a.id in used or b.id in used:
-                    continue
-                if a.canonical_id is not None or b.canonical_id is not None:
-                    continue
-                matcher._persist_match(s, [a, b], confidence=0.9)
-                used.add(a.id)
-                used.add(b.id)
-                linked += 1
+                am = a.canonical_id is not None
+                bm = b.canonical_id is not None
+                if am and bm:
+                    continue  # both already clustered — skip cluster-merge (riskier)
+                if not am and not bm:
+                    # both free → new 2-product cluster (greedy: one membership per run)
+                    if a.id in used or b.id in used:
+                        continue
+                    matcher._persist_match(s, [a, b], confidence=0.9)
+                    cid = a.canonical_id
+                    if cid is not None:
+                        cluster_members[cid] = [a, b]  # so later joins see in-run cluster
+                    used.add(a.id)
+                    used.add(b.id)
+                    new_clusters += 1
+                else:
+                    # one clustered (anchor), one free (joiner) → grow if safe
+                    anchor, joiner = (a, b) if am else (b, a)
+                    if joiner.id in used:
+                        continue
+                    members = cluster_members.get(anchor.canonical_id, [])
+                    if joiner.site in {m.site for m in members}:
+                        continue  # site already in cluster (snowball-guard)
+                    if any(
+                        matcher._hard_conflict(joiner, m) or matcher._pairwise_spec_conflict(joiner, m)
+                        for m in members
+                    ):
+                        continue  # joiner conflicts with a cluster member
+                    matcher._persist_match(s, [anchor, joiner], confidence=0.9)
+                    members.append(joiner)  # keep map current for chained joins
+                    used.add(joiner.id)
+                    attached += 1
             s.commit()
-            print(f"\nCOMMITTED: linked {linked} new cross-site pairs (is_manual=False)")
+            print(
+                f"\nCOMMITTED: {new_clusters} new clusters + {attached} attached to existing "
+                "(is_manual=False)"
+            )
     return 0
 
 
