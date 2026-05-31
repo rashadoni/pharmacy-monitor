@@ -990,6 +990,12 @@ def ultra_equal(a, b) -> bool:
         and _doses_mg(ra) == _doses_mg(rb)
         and extract_form(ra) == extract_form(rb)
         and _variant_words(ra) == _variant_words(rb)
+        # Не помечаем cross-brand коммодити «точным совпадением»: для масел/чаёв/
+        # экстрактов бренд — главный различитель (Herba Flora ≠ Mirrolla). Commodity-
+        # gated + fuzzy/NULL/manufacturer-safe внутри _has_conflicting_brand, поэтому
+        # same-firm транслитерации и NULL-brand твины остаются auto_safe. (workflow
+        # wmol35wiv, 2026-05-31: единственный одобренный после adversarial-проверки фикс.)
+        and not _has_conflicting_brand(a, b)
     )
 
 

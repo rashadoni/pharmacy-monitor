@@ -295,3 +295,57 @@ class TestUltraEqual:
             ultra_equal(_p("Qara zirə yağı 100 ml", None), _p("Qara zirə yağı 250 ml", None))
             is False
         )
+
+    # ── brand-aware ultra_equal (workflow wmol35wiv 2026-05-31) ──────────────
+    def test_ultra_equal_demotes_cross_brand_commodity(self):
+        # commodity oil, different CONSUMER brands → not a safe exact match
+        # (recall-apply gate + UI auto_safe badge both go through ultra_equal)
+        assert (
+            ultra_equal(
+                _p("Alaqanqal yağı 100 ml", "Herba Flora"),
+                _p("Alaqanqal yağı 100 ml", "Biola"),
+            )
+            is False
+        )
+
+    def test_ultra_equal_keeps_same_firm_translit_commodity(self):
+        # same firm spelled differently → fuzzy bridge keeps it auto_safe
+        assert (
+            ultra_equal(
+                _p("Valerian yağı 50 ml", "Borisov"),
+                _p("Valerian yağı 50 ml", "Borisovsky Zmp"),
+            )
+            is True
+        )
+
+    def test_ultra_equal_keeps_null_brand_commodity_twin(self):
+        # NULL brand = missing metadata, correct twin → stays auto_safe (recall)
+        assert (
+            ultra_equal(
+                _p("Exinasea ekstraktı 50 ml", None),
+                _p("Exinasea ekstraktı 50 ml", None),
+            )
+            is True
+        )
+
+    def test_ultra_equal_inert_for_trade_name_drug(self):
+        # non-commodity name → brand gate cannot fire even w/ different makers
+        assert (
+            ultra_equal(_p("Konkor 5 mg N30", "Merck KGaA"), _p("Konkor 5 mg N30", "Nycomed"))
+            is True
+        )
+
+    def test_ultra_equal_kosmetika_pad_word_still_collapses(self):
+        # regression lock: pharmonline category pad "(Kosmetika)" must NOT split a
+        # NULL-brand twin (grade-word guard was REJECTED — pads aren't grades).
+        from src.normalize import normalize_name
+
+        def _np(name):
+            return SimpleNamespace(
+                name=name, name_normalized=normalize_name(name), brand_verified=None, url=""
+            )
+
+        assert (
+            ultra_equal(_np("Çaytıkanı yağı 100 ml"), _np("Çaytıkanı yağı 100 ml (Kosmetika)"))
+            is True
+        )
