@@ -421,16 +421,17 @@ function PairCard({
   onSkip: (matchId: number) => void;
 }) {
   const queryClient = useQueryClient();
-  // Авто-search: 2-3 первых слова имени (часто это бренд+название без дозировок).
-  const [search, setSearch] = useState(() => {
+  // Поиск стартует ПУСТЫМ: по умолчанию показываем авто-подсказки, поиск их
+  // ЗАМЕНЯЕТ (а не дублирует). 2-3 первых слова имени — fallback-термин.
+  const autoTerm = useMemo(() => {
     const tokens = (pair.canonical_name || "").split(/\s+/).filter(Boolean);
     return tokens.slice(0, 2).join(" ") || pair.canonical_brand || "";
-  });
+  }, [pair.canonical_name, pair.canonical_brand]);
+  const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
   const [linkedProductId, setLinkedProductId] = useState<number | null>(null);
   const [linkError, setLinkError] = useState<string | null>(null);
 
-  // При смене site сбрасываем поиск (новая первая 2 слова с того же anchor)
   useEffect(() => {
     setLinkedProductId(null);
     setLinkError(null);
@@ -452,6 +453,15 @@ function PairCard({
     queryKey: ["matcher", "analogs", site, pair.match_id],
     queryFn: () => api.matchCandidateAnalogs(pair.match_id, site),
   });
+
+  // Если подсказок НЕТ — авто-подставляем поисковый термин (запасной путь),
+  // чтобы оператор сразу увидел кандидатов из текст-поиска, а не пустоту.
+  const noSuggestions =
+    suggestionsQ.data != null && suggestionsQ.data.items.length === 0;
+  useEffect(() => {
+    if (noSuggestions && !search) setSearch(autoTerm);
+  }, [noSuggestions, autoTerm, search]);
+  const searching = debouncedSearch.trim().length > 0;
 
   const linkMutation = useMutation({
     mutationFn: ({
@@ -522,9 +532,12 @@ function PairCard({
       </div>
 
       <div className="grid md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-border">
-        <div className="p-4 space-y-2">
-          <div className="text-xs uppercase tracking-wide text-muted-foreground mb-2">
-            Тот же товар на других сайтах
+        <div className="p-4 space-y-2 bg-muted/20">
+          <div className="text-xs uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-1">
+            <CheckCircle2 className="h-3.5 w-3.5 text-success" /> Уже в кластере
+            <span className="normal-case tracking-normal text-muted-foreground/70">
+              (справочно — менять не нужно)
+            </span>
           </div>
           {pair.anchor_products.map((a) => (
             <AnchorRow key={a.product_id} anchor={a} />
@@ -535,78 +548,84 @@ function PairCard({
           <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">
             Какой товар с {SITE_LABEL[site]} сюда подходит?
           </div>
-          {suggestionsQ.data && suggestionsQ.data.items.length > 0 && (
-            <div className="mb-3">
-              <div className="text-xs mb-2 flex items-center gap-1 text-foreground">
-                <Sparkles className="h-3.5 w-3.5 text-primary" />
-                <span className="font-medium">Лучшие совпадения</span>
-                <span className="text-muted-foreground">— нажмите «Привязать»</span>
-              </div>
-              <ul className="space-y-1.5">
-                {suggestionsQ.data.items.map((p) => (
-                  <SuggestionRow
-                    key={p.product_id}
-                    cand={p}
-                    disabled={isLinked || linkMutation.isPending}
-                    isLinkedHere={linkedProductId === p.product_id}
-                    onLink={() =>
-                      linkMutation.mutate({
-                        matchId: pair.match_id,
-                        productId: p.product_id,
-                      })
-                    }
-                  />
-                ))}
-              </ul>
-            </div>
-          )}
-          {suggestionsQ.data && suggestionsQ.data.items.length === 0 && (
-            <div className="text-xs text-muted-foreground mb-1">
-              Авто-подсказок нет — найдите товар вручную ниже.
-            </div>
-          )}
 
-          <div className="text-xs text-muted-foreground mb-1 pt-1">
-            {suggestionsQ.data && suggestionsQ.data.items.length > 0
-              ? "Не то? Искать вручную:"
-              : "Поиск вручную:"}
-          </div>
+          {/* search box — REFINES the list below, never shows a 2nd duplicate list */}
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
             <input
               type="search"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Имя или бренд"
+              placeholder={`Поиск по ${SITE_LABEL[site]}…`}
               className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             />
           </div>
 
-          {candidatesQ.isLoading && (
-            <div className="text-xs text-muted-foreground">Ищу…</div>
+          {!searching ? (
+            <>
+              {suggestionsQ.isLoading && (
+                <div className="text-xs text-muted-foreground pt-1">Подбираю…</div>
+              )}
+              {suggestionsQ.data && suggestionsQ.data.items.length > 0 && (
+                <>
+                  <div className="text-xs flex items-center gap-1 text-foreground pt-1">
+                    <Sparkles className="h-3.5 w-3.5 text-primary" />
+                    <span className="font-medium">Лучшие совпадения</span>
+                    <span className="text-muted-foreground">— нажмите «Привязать»</span>
+                  </div>
+                  <ul className="space-y-1.5">
+                    {suggestionsQ.data.items.map((p) => (
+                      <SuggestionRow
+                        key={p.product_id}
+                        cand={p}
+                        disabled={isLinked || linkMutation.isPending}
+                        isLinkedHere={linkedProductId === p.product_id}
+                        onLink={() =>
+                          linkMutation.mutate({
+                            matchId: pair.match_id,
+                            productId: p.product_id,
+                          })
+                        }
+                      />
+                    ))}
+                  </ul>
+                </>
+              )}
+              {noSuggestions && (
+                <div className="text-xs text-muted-foreground pt-1">
+                  Авто-подсказок нет — введите название в поиск выше.
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="text-xs text-muted-foreground pt-1">Результаты поиска:</div>
+              {candidatesQ.isLoading && (
+                <div className="text-xs text-muted-foreground">Ищу…</div>
+              )}
+              {candidatesQ.data && candidatesQ.data.items.length === 0 && (
+                <div className="text-xs text-muted-foreground">
+                  Ничего не найдено. Попробуйте другие слова.
+                </div>
+              )}
+              <ul className="space-y-1.5 max-h-80 overflow-y-auto">
+                {candidatesQ.data?.items.map((p) => (
+                  <CandidateRow
+                    key={p.id}
+                    product={p}
+                    disabled={isLinked || linkMutation.isPending}
+                    isLinkedHere={linkedProductId === p.id}
+                    onLink={() =>
+                      linkMutation.mutate({
+                        matchId: pair.match_id,
+                        productId: p.id,
+                      })
+                    }
+                  />
+                ))}
+              </ul>
+            </>
           )}
-          {candidatesQ.data && candidatesQ.data.items.length === 0 && (
-            <div className="text-xs text-muted-foreground">
-              Ничего не найдено. Попробуйте другие слова или пропустите.
-            </div>
-          )}
-
-          <ul className="space-y-1.5 max-h-80 overflow-y-auto">
-            {candidatesQ.data?.items.map((p) => (
-              <CandidateRow
-                key={p.id}
-                product={p}
-                disabled={isLinked || linkMutation.isPending}
-                isLinkedHere={linkedProductId === p.id}
-                onLink={() =>
-                  linkMutation.mutate({
-                    matchId: pair.match_id,
-                    productId: p.id,
-                  })
-                }
-              />
-            ))}
-          </ul>
 
           {linkError && (
             <div className="text-xs text-destructive flex items-center gap-1">
