@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly digest — Mondays 06:00 UTC (10:00 Asia/Baku)
+
+[Timer]
+OnCalendar=Mon *-*-* 06:00:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+Unit=pharmacy-monitor-digest-weekly.service
+
+[Install]
+WantedBy=timers.target

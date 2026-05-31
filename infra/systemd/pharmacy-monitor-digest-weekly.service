@@ -1,0 +1,24 @@
+[Unit]
+Description=Pharmacy Monitor — weekly digest (Mondays)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=pm
+Group=pm
+WorkingDirectory=/opt/pharmacy-monitor
+EnvironmentFile=/etc/pharmacy-monitor/env
+# Weekly digest = 7-day window, sent to tenant_users with weekly_digest=True
+# (distinct from the daily `digest` command, which is a 24h top-N alert email).
+ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor notify digest weekly
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/pharmacy-monitor/data /opt/pharmacy-monitor/logs
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
