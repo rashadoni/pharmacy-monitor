@@ -357,7 +357,19 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
 - NOTE: `pharmacy-monitor notify test` для smoke-теста доставки запускать с загруженным env (systemd EnvironmentFile НЕ грузится при ручном CLI): `set -a; source /etc/pharmacy-monitor/env; .venv/bin/pharmacy-monitor notify test`.
 - ~~22317 AZN bug in aptekonline price parser~~ FIXED 2026-05-07. Root cause: aptekonline's Angular template `'<del>' + price + 'AZN </del>' + p.discount_price + ' AZN '` renders with no separator, so `inner_text` of `.new-price` returns e.g. `"22AZN 317 AZN"` for a discounted product. Old `parse_price` stripped non-digits → `"22317"`. Fix: extract only the FIRST digit-run-with-dots/commas via regex. Existing bad rows перезатираются следующим aptekonline-прогоном (Mac launchd 18:00 Asia/Baku ежедневно); для немедленной очистки: `DELETE FROM price_snapshots WHERE site='aptekonline' AND price > 5000;`
 - pharmonline.az has NO `/sitemap.xml` (returns SPA HTML); aptekonline returns empty `<urlset>` — both need BFS fallback (regular Playwright scrapers continue to work via category pages)
-- ~~**Hetzner DE IP banned by pharmonline.az + aptekonline.az**~~ **RESOLVED via residential proxies (verified 2026-05-29)**: бан обойдён — pharmonline через IPRoyal (DDP), aptekonline через BrightData (httpx). Прод-таймеры pharmonline/aptekonline **enabled + успешно отрабатывают** ежедневно. Mac launchd теперь избыточный DR-fallback (прод не зависит от ноутбука). См. "Runtime layout" выше. (Прежняя запись «Mac launchd только / timers disabled» устарела.)
+- **Hetzner DE IP banned by pharmonline.az + aptekonline.az** — частично обойдено:
+  - **pharmonline → IPRoyal (DDP)** на проде — ✅ работает, daily.
+  - **aloe → direct** на проде — ✅ работает.
+  - **aptekonline → ТОЛЬКО Mac (Baku-IP)** — ⚠️ **прод-прокси НЕ работают (проверено 2026-06-02, перепробованы ВСЕ 3)**:
+    - **IPRoyal**: без гео aptek→`403` (нужен AZ-IP); с `country=az`→IPRoyal сам `407` (**нет AZ-residential пула**).
+    - **BrightData**: `407 Account is suspended` (аккаунт приостановлен, биллинг).
+    - **ScraperAPI**: с `country=az` aptek→`403` (az-гео не даёт рабочий AZ-IP).
+    - **Корень:** aptek требует НАСТОЯЩИЙ азербайджанский residential IP; ни один провайдер не выдаёт. Единственный рабочий — реальный **Baku-IP с Mac**.
+    - **Прод-таймер aptek ОТКЛЮЧЁН** (`systemctl disable pharmacy-monitor-scrape@aptekonline.timer`) — иначе 0 товаров + 325 critical-алертов/прогон.
+    - **Рабочий путь:** Mac launchd `com.pharmacy-monitor.scrape` 18:00 Baku, через SSH-туннель Mac:5433→prod:5432. Туннель `com.pharmacy-monitor.db-tunnel` ДОЛЖЕН быть жив (падал → aptek простаивал 6 дней 2026-05-26→06-01, чинится перезапуском). Mac должен быть включён.
+    - **NB:** матчинг-фаза Mac-скрейпа ~3-4ч (каждый DB-query через туннель = latency; на сервере 2 мин). Отрабатывает за ночь — ок.
+    - **Чтобы снять зависимость от Mac:** нужен прокси с **AZ-residential** пулом (IPRoyal/ScraperAPI/BrightData его НЕ имеют для aptek) ИЛИ разблокировать BrightData-биллинг (но AZ-пул у них не гарантирован). До тех пор — aptek = Mac.
+  - (Прежние записи «RESOLVED via BrightData / Mac-зависимость снята» — УСТАРЕЛИ, см. строки ~151/328/342.)
 - Project under git с 2026-05-11. Initial commit `c7fde84` зафиксировал diff-only state. **Remote**: `origin` = `https://github.com/rashadrahimov/pharmacy-monitor.git`. Auth работает через cached creds (`git push origin main` без проблем).
 - ~~forecast.py не рефакторен под diff-only~~ **DONE 2026-05-28**: `compute_trend` имеет Case A/B/C для sparse data (0 snaps в окне → latest globally; 1-2 snaps same price → stable). `top_movers` имеет pre-cutoff lookup для single-snapshot products. 3 diff-only regression теста в `tests/test_forecast.py` (`test_compute_trend_diff_only_sparse_active_pricing`, `test_predict_competitor_moves_diff_only_skips_truly_stable`, `test_top_movers_diff_only_sparse_change`). 18/18 forecast тестов проходят.
 - 7 false matches in matcher (Friso 3 Gold ↔ Friso Prematures etc) — needs manual reject via UI on /comparison
