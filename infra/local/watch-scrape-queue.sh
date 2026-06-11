@@ -32,6 +32,24 @@ KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-pharmacy-monitor-db}"
 KEYCHAIN_ACCOUNT="${KEYCHAIN_ACCOUNT:-pm}"
 API_KEY="${API_KEY:-}"  # X-API-Key
 LOG_FILE="${LOG_FILE:-$HOME/Library/Logs/pharmacy-monitor-watch.log}"
+SCRAPE_MAX_HOURS="${SCRAPE_MAX_HOURS:-6}"  # дольше = прогон считаем зависшим (self-heal)
+
+# Достаёт X-API-Key из env или Keychain. Нужен и guard'у (self-heal), и основному потоку.
+_get_api_key() {
+    if [[ -n "$API_KEY" ]]; then printf '%s' "$API_KEY"; return; fi
+    security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s pharmacy-monitor-api-key -w 2>/dev/null || true
+}
+
+# Зависший ли прогон по его etime (macOS `ps -o etime`: [[DD-]HH:]MM:SS).
+# Формат с днями ('-') ИЛИ HH:MM:SS где HH >= порога → stale. MM:SS → свежий.
+_etime_is_stale() {
+    local e="$1"
+    [[ "$e" == *-* ]] && return 0
+    if [[ "$e" =~ ^([0-9]+):[0-9][0-9]:[0-9][0-9]$ ]]; then
+        (( 10#${BASH_REMATCH[1]} >= SCRAPE_MAX_HOURS )) && return 0
+    fi
+    return 1
+}
 
 mkdir -p "$(dirname "$LOG_FILE")"
 exec >>"$LOG_FILE" 2>&1
@@ -45,15 +63,34 @@ cd "$PROJECT_DIR"
 # конкурентные UPSERT'ы в `products`/`price_snapshots` пораждают конфликты
 # на уникальном (site, external_id), а matcher одновременно с persist
 # создаёт дубликаты Match'ей. Launchd попробует ещё раз через 60 секунд.
-if pgrep -f "pharmacy-monitor run" >/dev/null 2>&1; then
-    echo "  pharmacy-monitor run already in progress, deferring tick"
-    exit 0
+running_pid="$(pgrep -f "pharmacy-monitor run" | head -1 || true)"
+if [[ -n "$running_pid" ]]; then
+    etime="$(ps -o etime= -p "$running_pid" 2>/dev/null | tr -d ' ' || true)"
+    if [[ -n "$etime" ]] && _etime_is_stale "$etime"; then
+        # Зависший прогон (> SCRAPE_MAX_HOURS) заклинивает очередь навсегда
+        # (каждый tick вечно defer'ится). Убиваем + помечаем его request
+        # failed (серверного reaper'а нет → иначе orphan блокирует новые клики
+        # анти-спамом 409), затем падаем дальше и берём следующий pending.
+        stale_req="$(ps -o command= -p "$running_pid" 2>/dev/null | sed -nE 's/.*--request-id[ =]+([0-9]+).*/\1/p' | head -1)"
+        echo "  STALE pharmacy-monitor run pid=$running_pid etime=$etime (> ${SCRAPE_MAX_HOURS}h) — killing (req=${stale_req:-?})"
+        kill -TERM "$running_pid" 2>/dev/null || true
+        sleep 5
+        kill -KILL "$running_pid" 2>/dev/null || true
+        if [[ -n "$stale_req" ]]; then
+            _ak="$(_get_api_key)"
+            [[ -n "$_ak" ]] && curl -s -m 10 -X POST \
+                -H "X-API-Key: $_ak" -H "Content-Type: application/json" \
+                -d "{\"error_message\":\"watcher killed stale run (etime=$etime > ${SCRAPE_MAX_HOURS}h)\"}" \
+                "$API_BASE/api/v1/internal/scrape-complete/$stale_req" >/dev/null 2>&1 || true
+        fi
+    else
+        echo "  pharmacy-monitor run already in progress (etime=${etime:-?}), deferring tick"
+        exit 0
+    fi
 fi
 
-# Pull API_KEY from Keychain if not set in env
-if [[ -z "$API_KEY" ]]; then
-    API_KEY="$(security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s pharmacy-monitor-api-key -w 2>/dev/null || true)"
-fi
+# Pull API_KEY (env или Keychain) для основного потока.
+API_KEY="$(_get_api_key)"
 if [[ -z "$API_KEY" ]]; then
     echo "ERROR: API_KEY not set (env or Keychain 'pharmacy-monitor-api-key')"
     exit 1
@@ -135,24 +172,49 @@ echo "  spawning detached: pharmacy-monitor ${ARGS[*]}"
 
 # === Detached subshell ======================================================
 # Subshell:
-#   - открывает SSH-tunnel (со своим trap-cleanup)
+#   - переиспользует персистентный db-tunnel (:5433) или поднимает свой
 #   - запускает pharmacy-monitor синхронно
 #   - на не-zero exit вызывает /scrape-complete с error_message
 #     (на success ничего не нужно — pharmacy-monitor сам пометит ok через
 #     --request-id сразу после persist)
-#   - убивает tunnel
 #
-# Snake `setsid` нет на macOS, используем nohup-стиль через `&` + `disown`
-# + редирект stdin/out/err. После `disown` watcher теряет связь с subshell,
-# subshell живёт независимо до своего собственного выхода.
+# ВЫЖИВАНИЕ субшелла обеспечивает `AbandonProcessGroup=true` в plist'е, НЕ
+# `disown`: disown снимает только bash'евый SIGHUP-on-exit, а launchd при
+# выходе watcher-скрипта убивал всю process-group задачи (без ключа субшелл
+# умирал за <1с, не начав скрейп — баг чинился 2026-06-11). `& + disown`
+# оставлены чтобы watcher-тик не блокировался на часы работы скрейпа.
 (
     cd "$PROJECT_DIR"
-    ssh -i "$SSH_KEY" -N -L "$LOCAL_PG_PORT:localhost:5432" \
-        -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ConnectTimeout=15 \
-        "root@$PROD_HOST" &
-    TUNNEL_PID=$!
-    trap 'kill $TUNNEL_PID 2>/dev/null || true' EXIT
-    sleep 3
+    # DB-туннель: предпочитаем уже поднятый персистентный db-tunnel (launchd
+    # KeepAlive держит :5433). Свой ssh поднимаем ТОЛЬКО если порт свободен —
+    # иначе ExitOnForwardFailure всё равно убил бы наш ssh, а trap целил бы в
+    # мёртвый PID (старый баг: «мёртвый-при-старте» туннель). Нет ни того ни
+    # другого → fail'им request, не скрейпим вслепую.
+    TUNNEL_PID=""
+    if nc -z localhost "$LOCAL_PG_PORT" 2>/dev/null; then
+        echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | reusing existing tunnel on :$LOCAL_PG_PORT"
+    else
+        echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | :$LOCAL_PG_PORT free — bringing up own ssh tunnel"
+        ssh -i "$SSH_KEY" -N -L "$LOCAL_PG_PORT:localhost:5432" \
+            -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ConnectTimeout=15 \
+            "root@$PROD_HOST" &
+        TUNNEL_PID=$!
+        for _i in $(seq 1 20); do
+            if nc -z localhost "$LOCAL_PG_PORT" 2>/dev/null; then break; fi
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then break; fi
+            sleep 0.5
+        done
+    fi
+    # Чистим ТОЛЬКО свой туннель (персистентный db-tunnel не трогаем).
+    trap '[ -n "$TUNNEL_PID" ] && kill "$TUNNEL_PID" 2>/dev/null || true' EXIT
+
+    if ! nc -z localhost "$LOCAL_PG_PORT" 2>/dev/null; then
+        echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | ERROR: no DB tunnel on :$LOCAL_PG_PORT — failing request #$req_id"
+        curl -s -m 10 -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+            -d '{"error_message":"Mac watcher: DB tunnel (:5433) unavailable"}' \
+            "$API_BASE/api/v1/internal/scrape-complete/$req_id" >/dev/null 2>&1 || true
+        exit 1
+    fi
 
     export DATABASE_URL="postgresql+psycopg://pm:${PG_PASS}@localhost:${LOCAL_PG_PORT}/pharmacy_monitor"
 
