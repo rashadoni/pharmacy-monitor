@@ -34,6 +34,14 @@
     <key>RunAtLoad</key>
     <false/>
 
+    <!-- КРИТИЧНО: watcher спавнит detached-субшелл со скрейпом и сразу выходит.
+         Без этого ключа launchd при выходе watcher-скрипта убивает всю
+         process-group задачи — включая этот субшелл (& + disown НЕ спасает,
+         см. man launchd.plist). Результат: скрейп никогда не стартует, запрос
+         висит в 'running'. true = launchd НЕ трогает осиротевшие процессы. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
     <key>WorkingDirectory</key>
     <string>/Users/rashadrahimov/pharmacy-monitor</string>
 
