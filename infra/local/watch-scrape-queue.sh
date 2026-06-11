@@ -152,7 +152,7 @@ if [[ -z "$PG_PASS" ]]; then
     echo "  ERROR: PG_PASS not in Keychain"
     curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
         -d '{"error_message":"Mac watcher: PG_PASS not found in Keychain"}' \
-        "$API_BASE/api/v1/internal/scrape-complete/$req_id"
+        "$API_BASE/api/v1/internal/scrape-complete/$req_id" || true
     exit 1
 fi
 
@@ -227,7 +227,7 @@ echo "  spawning detached: pharmacy-monitor ${ARGS[*]}"
         # иначе пометит 'failed'.
         curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
             -d '{"error_message":"pharmacy-monitor run exit non-zero"}' \
-            "$API_BASE/api/v1/internal/scrape-complete/$req_id"
+            "$API_BASE/api/v1/internal/scrape-complete/$req_id" || true
     fi
 ) </dev/null >>"$LOG_FILE" 2>&1 &
 BG_PID=$!
