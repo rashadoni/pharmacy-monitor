@@ -562,11 +562,20 @@ class BaseScraper(ABC):
         return out
 
     async def scrape(
-        self, category_slugs: list[str], limit_per_category: int | None = None
+        self,
+        category_slugs: list[str],
+        limit_per_category: int | None = None,
+        on_category=None,
     ) -> ScrapeResult:
         """Точка входа: парсит все запрошенные категории + промо.
 
         Tracking metrics added (W10): captcha hits, retry counts, blocked categories.
+
+        on_category(site, slug, products): опциональный callback, вызываемый ПОСЛЕ
+        каждой успешной категории — для ИНКРЕМЕНТАЛЬНОГО persist'а. Без него persist
+        идёт только в конце прогона (`run_cmd`), и медленный/оборванный/зависший
+        прогон (pharmonline DDP ~7ч) теряет ВСЁ собранное. Callback сохраняет каждую
+        категорию сразу. Ошибка callback'а НЕ валит скрейп (логируется и идём дальше).
         """
         result = ScrapeResult(site=self.site_name)
         captcha_hits = 0
@@ -577,8 +586,10 @@ class BaseScraper(ABC):
                 continue
             try:
                 count = 0
+                cat_products = []
                 async for product in self.scrape_category(slug, limit=limit_per_category):
                     result.products.append(product)
+                    cat_products.append(product)
                     count += 1
                 log.info(
                     "category_scraped",
@@ -586,6 +597,16 @@ class BaseScraper(ABC):
                     category=slug,
                     products=count,
                 )
+                if on_category is not None and cat_products:
+                    try:
+                        on_category(self.site_name, slug, cat_products)
+                    except Exception as e:
+                        log.error(
+                            "incremental_persist_failed",
+                            site=self.site_name,
+                            category=slug,
+                            error=f"{type(e).__name__}: {e}",
+                        )
             except CaptchaDetected as e:
                 captcha_hits += 1
                 msg = f"category={slug}: captcha — {e}"

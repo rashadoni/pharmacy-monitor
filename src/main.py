@@ -194,13 +194,16 @@ async def scrape_site(
     limit_per_category: int | None,
     *,
     ai_fallback_baseline: int | None = None,
+    on_category=None,
 ) -> ScrapeResult:
     cls = SCRAPER_CLASSES[site]
     if not slugs:
         log.warning("no_categories_configured", site=site)
         return ScrapeResult(site=site)
     async with cls() as s:
-        result = await s.scrape(slugs, limit_per_category=limit_per_category)
+        result = await s.scrape(
+            slugs, limit_per_category=limit_per_category, on_category=on_category
+        )
 
     # Phase 1.4 — optional AI crawler fallback when primary yield collapses.
     # Only kicks in if AI_FALLBACK_ENABLED=1 in env (off by default — costs $).
@@ -254,6 +257,7 @@ async def scrape_all(
     limit_per_category: int | None,
     *,
     ai_fallback_baselines: dict[str, int | None] | None = None,
+    on_category=None,
 ) -> list[ScrapeResult]:
     baselines = ai_fallback_baselines or {}
     tasks = [
@@ -262,6 +266,7 @@ async def scrape_all(
             slugs,
             limit_per_category,
             ai_fallback_baseline=baselines.get(site),
+            on_category=on_category,
         )
         for site, slugs in sites_with_slugs.items()
     ]
@@ -1692,8 +1697,28 @@ def run_cmd(
                     for s in sites
                 }
                 baselines = baselines_for_sites(session, sites)
+
+                # Инкрементальный persist: сохраняем каждую категорию СРАЗУ (callback
+                # → persist_results коммитит per-result), чтобы медленный/оборванный/
+                # зависший прогон (pharmonline DDP ~7ч) не терял уже собранное — без
+                # него persist шёл только в конце = всё-или-ничего. Callback синхронный
+                # → сериализуется на однопоточном event loop, общая session безопасна.
+                # Финальный persist ниже остаётся (промо + count); повтор товаров
+                # безвреден (diff-only: те же товары → 0 новых snapshot).
+                def _persist_category(site_name, slug, cat_products):
+                    persist_results(
+                        session,
+                        run,
+                        [ScrapeResult(site=site_name, products=list(cat_products))],
+                    )
+
                 results = asyncio.run(
-                    scrape_all(slugs_by_site, limit, ai_fallback_baselines=baselines)
+                    scrape_all(
+                        slugs_by_site,
+                        limit,
+                        ai_fallback_baselines=baselines,
+                        on_category=_persist_category,
+                    )
                 )
             count = persist_results(session, run, results)
             run.products_scraped = count

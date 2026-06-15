@@ -242,6 +242,59 @@ def test_decodo_proxy_custom_host_and_port_range(monkeypatch):
     assert cfg["server"] == "http://gate.decodo.com:30005"  # первый из диапазона
 
 
+# ── Инкрементальный persist: on_category callback в BaseScraper.scrape() ───────
+
+
+class _StubScraper(base.BaseScraper):
+    """Минимальный скрейпер для теста scrape(): scrape_category отдаёт N товаров
+    на категорию ('a'→2, 'b'→1), promos пусто. Без браузера/сети."""
+
+    site_name = "teststub"
+    base_url = "http://x"
+
+    async def scrape_category(self, slug, limit=None):
+        for i in range({"a": 2, "b": 1}.get(slug, 0)):
+            yield object()  # callback не инспектирует поля — достаточно объекта
+
+    async def scrape_promos(self):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_scrape_calls_on_category_per_category():
+    """on_category вызывается ПОСЛЕ каждой успешной категории с её товарами
+    (инкрементальный persist). result.products всё ещё держит всё для финала."""
+    calls = []
+    s = _StubScraper()
+    result = await s.scrape(
+        ["a", "b"],
+        on_category=lambda site, slug, prods: calls.append((site, slug, len(prods))),
+    )
+    assert calls == [("teststub", "a", 2), ("teststub", "b", 1)]
+    assert len(result.products) == 3
+
+
+@pytest.mark.asyncio
+async def test_scrape_on_category_error_does_not_break_scrape():
+    """Падение on_category (persist умер) НЕ валит скрейп — логируется, остальные
+    категории собираются (резильентность важнее одной неудачной записи)."""
+
+    def boom(site, slug, prods):
+        raise RuntimeError("persist died")
+
+    s = _StubScraper()
+    result = await s.scrape(["a", "b"], on_category=boom)
+    assert len(result.products) == 3  # обе категории собрались несмотря на падение
+
+
+@pytest.mark.asyncio
+async def test_scrape_without_on_category_is_unchanged():
+    """Без callback (on_category=None) — поведение прежнее (at-end persist в run_cmd)."""
+    s = _StubScraper()
+    result = await s.scrape(["a", "b"])
+    assert len(result.products) == 3
+
+
 # ─── Bright Data residential (Phase 1.2) ────────────────────────────────────
 
 
