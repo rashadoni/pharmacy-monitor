@@ -195,6 +195,53 @@ def test_iproyal_proxy_custom_host(monkeypatch):
     assert cfg["server"] == "http://premium.iproyal.com:6000"
 
 
+# ── Decodo residential Playwright proxy (aloe / любой Playwright-сайт) ─────────
+
+
+def _clear_decodo_env(monkeypatch):
+    for k in ("DECODO_USERNAME", "DECODO_PASSWORD", "DECODO_SITES", "DECODO_HOST", "DECODO_PORTS"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_decodo_proxy_returns_none_without_creds(monkeypatch):
+    _clear_decodo_env(monkeypatch)
+    monkeypatch.setenv("DECODO_SITES", "aloe")
+    assert base._decodo_proxy_for("aloe") is None
+
+
+def test_decodo_proxy_skips_site_not_in_list(monkeypatch):
+    _clear_decodo_env(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "u")
+    monkeypatch.setenv("DECODO_PASSWORD", "p")
+    monkeypatch.setenv("DECODO_SITES", "aptekonline")
+    assert base._decodo_proxy_for("aloe") is None
+
+
+def test_decodo_proxy_default_endpoint_first_port(monkeypatch):
+    _clear_decodo_env(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "spw25z9lwn")
+    monkeypatch.setenv("DECODO_PASSWORD", "85Yo=yePfQ")
+    monkeypatch.setenv("DECODO_SITES", "aloe,pharmonline,aptekonline")
+    cfg = base._decodo_proxy_for("aloe")
+    # Playwright-dict: пароль НЕ кодируется (Playwright сам), первый sticky-порт
+    assert cfg == {
+        "server": "http://az.decodo.com:30001",
+        "username": "spw25z9lwn",
+        "password": "85Yo=yePfQ",
+    }
+
+
+def test_decodo_proxy_custom_host_and_port_range(monkeypatch):
+    _clear_decodo_env(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "u")
+    monkeypatch.setenv("DECODO_PASSWORD", "p")
+    monkeypatch.setenv("DECODO_SITES", "aloe")
+    monkeypatch.setenv("DECODO_HOST", "gate.decodo.com")
+    monkeypatch.setenv("DECODO_PORTS", "30005-30010")
+    cfg = base._decodo_proxy_for("aloe")
+    assert cfg["server"] == "http://gate.decodo.com:30005"  # первый из диапазона
+
+
 # ─── Bright Data residential (Phase 1.2) ────────────────────────────────────
 
 

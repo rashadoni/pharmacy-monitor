@@ -104,6 +104,33 @@ def _iproyal_proxy_for(site_name: str) -> dict | None:
     }
 
 
+def _decodo_proxy_for(site_name: str) -> dict | None:
+    """Playwright proxy config for Decodo residential (AZ pool) when site enabled.
+
+    Для Playwright-сайтов (aloe). Гео (Азербайджан) закодировано в host
+    (az.decodo.com), ОДИН sticky-порт (первый из DECODO_PORTS) на сессию браузера.
+    Playwright сам кодирует username/password в Proxy-Authorization — URL-encoding
+    здесь НЕ нужен (в отличие от httpx-пути, где пароль с '=' квотится вручную).
+    None если creds/сайт не настроены → следующий провайдер в цепочке.
+    """
+    username = os.getenv("DECODO_USERNAME")
+    password = os.getenv("DECODO_PASSWORD")
+    if not username or not password:
+        return None
+    sites = {s.strip() for s in os.getenv("DECODO_SITES", "").split(",") if s.strip()}
+    if site_name not in sites:
+        return None
+    host = os.getenv("DECODO_HOST", "az.decodo.com").strip()
+    ports = os.getenv("DECODO_PORTS", "30001-30010").strip()
+    first = ports.split(",")[0].split("-")[0].strip()
+    port = first if first.isdigit() else "30001"
+    return {
+        "server": f"http://{host}:{port}",
+        "username": username,
+        "password": password,
+    }
+
+
 def _brightdata_proxy_for(site_name: str) -> dict | None:
     """Return Playwright proxy config for Bright Data Residential when site is enabled.
 
@@ -299,8 +326,17 @@ class BaseScraper(ABC):
         # Hetzner) не burn'ит платные credits.
         launch_args: dict = {"headless": self.headless}
         proxied_via = None
+        decodo_cfg = _decodo_proxy_for(self.site_name)
         iproyal_cfg = _iproyal_proxy_for(self.site_name)
-        if iproyal_cfg:
+        if decodo_cfg:
+            launch_args["proxy"] = decodo_cfg
+            proxied_via = "decodo"
+            log.info(
+                "scrape_using_decodo",
+                site=self.site_name,
+                host=os.getenv("DECODO_HOST", "az.decodo.com"),
+            )
+        elif iproyal_cfg:
             launch_args["proxy"] = iproyal_cfg
             proxied_via = "iproyal"
             log.info(
@@ -344,7 +380,13 @@ class BaseScraper(ABC):
         # self-signed серт → Chromium блокирует с ERR_CERT_AUTHORITY_INVALID
         # без явного relaxation. Только если реально через managed proxy идёт
         # — direct и generic-proxy остаются strict (там не должно быть MITM).
-        ignore_https_errors = proxied_via in ("iproyal", "brightdata", "crawlbase", "scraperapi")
+        ignore_https_errors = proxied_via in (
+            "iproyal",
+            "brightdata",
+            "crawlbase",
+            "scraperapi",
+            "decodo",
+        )
         self._context = await self._browser.new_context(
             user_agent=random_user_agent(),
             viewport=random_viewport(),

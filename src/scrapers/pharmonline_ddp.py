@@ -94,6 +94,61 @@ def _iproyal_httpx_proxy() -> str | None:
     return f"http://{username}:{password}@{host}"
 
 
+def _decodo_ports_list() -> list[int]:
+    """Порты Decodo (DECODO_PORTS: диапазон '30001-30010' или CSV). Деф. 30001-30010.
+
+    Каждый порт = отдельная sticky AZ-сессия (свой exit-IP). Гарантирует непустой
+    список (fallback [30001]).
+    """
+    raw = os.getenv("DECODO_PORTS", "30001-30010").strip()
+    ports: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, _, hi = part.partition("-")
+            if lo.strip().isdigit() and hi.strip().isdigit():
+                ports.extend(range(int(lo), int(hi) + 1))
+        elif part.isdigit():
+            ports.append(int(part))
+    return ports or [30001]
+
+
+def _decodo_proxy_factory():
+    """Фабрика Decodo-прокси для DDP: callable, отдающий URL с РОТАЦИЕЙ порта на
+    каждый вызов (= другой sticky AZ-IP на каждый (re)connect).
+
+    Лечит ~38% флайки residential-IP: reconnect берёт свежий IP, а не лупится в
+    мёртвый (особенно важно — IPRoyal-fallback мёртв на 402, подстраховки нет).
+    Зеркало per-request port-cycling из aptekonline, адаптированное под одну
+    долгоживущую DDP-сессию (ротация на reconnect, а не на запрос). None если
+    Decodo не настроен для pharmonline → caller fallback'ит на статичный IPRoyal.
+
+    ВАЖНО — пароль RAW, НЕ URL-encoded. Библиотека `websockets` НЕ percent-декодирует
+    userinfo из proxy-URL (в отличие от httpx у aptek): encoded '85Yo%3D...' → она
+    шлёт его буквально → HTTP 407. Подтверждено эмпирически (raw connect ok / encoded
+    407). Пароли Decodo base64-подобные (alnum + '='); '=' валиден в userinfo. Если
+    пароль когда-нибудь будет содержать '@'/':' — это сломает парсинг URL (но Decodo
+    такие не выдаёт; тогда понадобится отдельная схема).
+    """
+    user = os.getenv("DECODO_USERNAME")
+    pwd = os.getenv("DECODO_PASSWORD")
+    if not user or not pwd:
+        return None
+    sites = {s.strip() for s in os.getenv("DECODO_SITES", "").split(",") if s.strip()}
+    if "pharmonline" not in sites:
+        return None
+    host = os.getenv("DECODO_HOST", "az.decodo.com").strip()
+    ports = _decodo_ports_list()
+    state = {"i": 0}
+
+    def _next_proxy() -> str:
+        port = ports[state["i"] % len(ports)]
+        state["i"] += 1
+        return f"http://{user}:{pwd}@{host}:{port}"
+
+    return _next_proxy
+
+
 # ── DDP reliability tuning (2026-05-29) ──────────────────────────────────────
 # Читаются из env ПРИ ВЫЗОВЕ (не module-level) → прод-override без редеплоя +
 # тесты через monkeypatch.setenv. Дефолты: connect 4 попытки с backoff 2/4/8/16с,
@@ -144,7 +199,13 @@ class _DDPClient:
         self.ws_url_factory = (
             ws_url_factory if callable(ws_url_factory) else (lambda: ws_url_factory)
         )
-        self.proxy_url = proxy_url
+        # proxy_url: строка ИЛИ callable-фабрика (как ws_url_factory выше). Decodo
+        # передаёт фабрику, циклящую sticky-порты → каждый (re)connect берёт ДРУГОЙ
+        # AZ-IP. Без этого reconnect лупился бы в тот же (возможно мёртвый при ~38%
+        # 522) IP до исчерпания попыток, убивая всю DDP-сессию (IPRoyal-fallback=402).
+        self.proxy_url_factory = (
+            proxy_url if callable(proxy_url) else (lambda: proxy_url)
+        )
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._call_id = 0
         self._lock = asyncio.Lock()
@@ -210,8 +271,9 @@ class _DDPClient:
             "close_timeout": self.CLOSE_TIMEOUT,
             "open_timeout": open_timeout,
         }
-        if self.proxy_url:
-            kwargs["proxy"] = self.proxy_url
+        proxy = self.proxy_url_factory()
+        if proxy:
+            kwargs["proxy"] = proxy
         ws_url = self.ws_url_factory()
         self._ws = await websockets.connect(ws_url, **kwargs)
         await asyncio.wait_for(self._ddp_handshake(), timeout=open_timeout)
@@ -468,8 +530,17 @@ class PharmonlineDDPScraper(BaseScraper):
         self._cat_map: dict[str, str] = {}
         self._locale = os.getenv("PHARMONLINE_DDP_LOCALE", "az").lower()
         self._page_size = int(os.getenv("PHARMONLINE_DDP_PAGE_SIZE", "100"))
-        proxy_url = _iproyal_httpx_proxy()
-        if not proxy_url:
+        # Decodo (AZ residential, ротация порта на reconnect) первым; IPRoyal —
+        # fallback (его баланс кончился 2026-06-12 → HTTP 402). decodo_factory это
+        # callable (циклит порты); IPRoyal — статичный URL. _DDPClient принимает оба.
+        decodo_factory = _decodo_proxy_factory()
+        proxy_url = decodo_factory or _iproyal_httpx_proxy()
+        if proxy_url:
+            log.info(
+                "pharmonline_ddp_proxy",
+                provider="decodo" if decodo_factory else "iproyal",
+            )
+        else:
             log.warning("pharmonline_ddp_no_proxy", note="will connect direct")
         # Pass URL factory (not static URL) so reconnect gets a fresh SockJS
         # session path each time — pharmonline server rejects stale session ids.

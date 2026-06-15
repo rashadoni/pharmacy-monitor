@@ -178,3 +178,85 @@ async def test_call_default_timeout_returns_result(monkeypatch):
     client._ws = FakeWS([_result("1", {"category": [{"id": "1", "path": "c1"}]})])
     res = await client.call("getFilterParam", [{"query": {}}])
     assert res == {"category": [{"id": "1", "path": "c1"}]}
+
+
+# ── Decodo proxy for the DDP WebSocket (pharmonline off IPRoyal) ──────────────
+
+
+def _clear_decodo_env(monkeypatch):
+    for k in ("DECODO_USERNAME", "DECODO_PASSWORD", "DECODO_SITES", "DECODO_HOST", "DECODO_PORTS"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_decodo_factory_none_without_creds(monkeypatch):
+    _clear_decodo_env(monkeypatch)
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+    assert pharmonline_ddp._decodo_proxy_factory() is None
+
+
+def test_decodo_factory_none_when_pharmonline_excluded(monkeypatch):
+    _clear_decodo_env(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "u")
+    monkeypatch.setenv("DECODO_PASSWORD", "p")
+    monkeypatch.setenv("DECODO_SITES", "aptekonline,aloe")
+    assert pharmonline_ddp._decodo_proxy_factory() is None
+
+
+def test_decodo_factory_rotates_ports_raw_password(monkeypatch):
+    """M1: каждый вызов фабрики (= reconnect) отдаёт СЛЕДУЮЩИЙ порт (другой AZ-IP),
+    зацикливаясь. Пароль RAW (НЕ URL-encoded): websockets-lib не декодирует userinfo
+    → encoded '%3D' ломает с HTTP 407, raw '=' проходит (подтверждено на проде)."""
+    _clear_decodo_env(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "spw25z9lwn")
+    monkeypatch.setenv("DECODO_PASSWORD", "85Yo=yePfQ")  # '=' остаётся сырым
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+    monkeypatch.setenv("DECODO_PORTS", "30001-30003")
+    factory = pharmonline_ddp._decodo_proxy_factory()
+    assert factory is not None
+    urls = [factory() for _ in range(4)]
+    assert urls == [
+        "http://spw25z9lwn:85Yo=yePfQ@az.decodo.com:30001",
+        "http://spw25z9lwn:85Yo=yePfQ@az.decodo.com:30002",
+        "http://spw25z9lwn:85Yo=yePfQ@az.decodo.com:30003",
+        "http://spw25z9lwn:85Yo=yePfQ@az.decodo.com:30001",  # цикл
+    ]
+
+
+def test_decodo_factory_preferred_over_iproyal(monkeypatch):
+    """Оба настроены → pharmonline берёт Decodo-фабрику (IPRoyal остаётся fallback)."""
+    _clear_decodo_env(monkeypatch)
+    for k in ("IPROYAL_USERNAME", "IPROYAL_PASSWORD", "IPROYAL_SITES", "IPROYAL_HOST", "IPROYAL_COUNTRY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("DECODO_USERNAME", "duser")
+    monkeypatch.setenv("DECODO_PASSWORD", "dpass")
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+    monkeypatch.setenv("IPROYAL_USERNAME", "iuser")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "ipass")
+    monkeypatch.setenv("IPROYAL_SITES", "pharmonline")
+    factory = pharmonline_ddp._decodo_proxy_factory()
+    iproyal = pharmonline_ddp._iproyal_httpx_proxy()
+    assert callable(factory) and iproyal is not None
+    # резолюция в коде: `decodo_factory or iproyal` → берётся фабрика Decodo
+    chosen = factory or iproyal
+    assert callable(chosen) and chosen().startswith("http://duser:")
+
+
+def test_ddpclient_wraps_proxy_factory_and_string(monkeypatch):
+    """_DDPClient принимает proxy как callable-фабрику (ротация) ИЛИ строку
+    (статика, backward-compat) ИЛИ None — все три через self.proxy_url_factory."""
+    calls = {"n": 0}
+
+    def fac():
+        calls["n"] += 1
+        return f"http://x:y@h:{3000 + calls['n']}"
+
+    c = pharmonline_ddp._DDPClient(lambda: "wss://x", proxy_url=fac)
+    assert c.proxy_url_factory() == "http://x:y@h:3001"
+    assert c.proxy_url_factory() == "http://x:y@h:3002"  # ротация на каждый connect
+
+    c2 = pharmonline_ddp._DDPClient(lambda: "wss://x", proxy_url="http://static:1")
+    assert c2.proxy_url_factory() == "http://static:1"
+    assert c2.proxy_url_factory() == "http://static:1"  # строка → статичная фабрика
+
+    c3 = pharmonline_ddp._DDPClient(lambda: "wss://x")
+    assert c3.proxy_url_factory() is None  # нет прокси → None
