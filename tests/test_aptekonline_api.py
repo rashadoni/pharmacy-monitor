@@ -23,6 +23,10 @@ from src.scrapers.aptekonline import (
     _DEFAULT_CHECKUS,
     _brightdata_httpx_proxy_for,
     _build_product_from_api,
+    _decodo_enabled,
+    _decodo_httpx_proxy_for,
+    _decodo_page_attempts,
+    _decodo_ports,
     _iproyal_httpx_proxy_for,
     _resolve_checkus_token,
     _scraperapi_httpx_proxy_for,
@@ -56,6 +60,35 @@ def _mock_httpx_client(payload: dict | list[dict] | None = None, status: int = 2
         return real_init(self, *args, **kwargs)
 
     return patch.object(httpx.AsyncClient, "__init__", patched_init), call_count
+
+
+def _mock_httpx_status_seq(statuses: list[int], payload: dict | None):
+    """Mock-транспорт с последовательностью статусов: i-й запрос → statuses[i]
+    (последний повторяется), json=payload только для 200.
+
+    Для Decodo-ретрая каждый attempt создаёт НОВЫЙ клиент с proxy=, поэтому
+    proxy/mounts вычищаем — они конфликтуют с подменным transport.
+    """
+    idx = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        i = idx["n"]
+        idx["n"] += 1
+        st = statuses[min(i, len(statuses) - 1)]
+        if st == 200:
+            return httpx.Response(200, json=payload)
+        return httpx.Response(st)
+
+    transport = httpx.MockTransport(handler)
+    real_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs.pop("proxy", None)
+        kwargs.pop("mounts", None)
+        kwargs["transport"] = transport
+        return real_init(self, *args, **kwargs)
+
+    return patch.object(httpx.AsyncClient, "__init__", patched_init), idx
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -467,3 +500,137 @@ def test_scraperapi_httpx_proxy_none_without_key_even_with_premium(monkeypatch):
     monkeypatch.setenv("SCRAPER_API_COUNTRY", "az")
     monkeypatch.setenv("SCRAPER_API_PREMIUM_SITES", "aptekonline")
     assert _scraperapi_httpx_proxy_for("aptekonline") is None
+
+
+# Decodo residential AZ proxy: per-port retry pool for aptekonline.
+
+
+def _clear_decodo(mp):
+    for k in (
+        "DECODO_USERNAME",
+        "DECODO_PASSWORD",
+        "DECODO_SITES",
+        "DECODO_HOST",
+        "DECODO_PORTS",
+        "DECODO_PAGE_ATTEMPTS",
+    ):
+        mp.delenv(k, raising=False)
+
+
+def test_decodo_disabled_without_creds(monkeypatch):
+    _clear_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_SITES", "aptekonline")
+    assert _decodo_enabled("aptekonline") is False
+    assert _decodo_ports("aptekonline") == []
+
+
+def test_decodo_disabled_when_site_excluded(monkeypatch):
+    _clear_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "u")
+    monkeypatch.setenv("DECODO_PASSWORD", "p")
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+    assert _decodo_enabled("aptekonline") is False
+    assert _decodo_ports("aptekonline") == []
+    assert _decodo_httpx_proxy_for("aptekonline", 30001) is None
+
+
+def test_decodo_ports_default_range(monkeypatch):
+    _clear_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "u")
+    monkeypatch.setenv("DECODO_PASSWORD", "p")
+    monkeypatch.setenv("DECODO_SITES", "aptekonline")
+    # default DECODO_PORTS = "30001-30010"
+    assert _decodo_ports("aptekonline") == list(range(30001, 30011))
+
+
+def test_decodo_ports_explicit_range_and_csv(monkeypatch):
+    _clear_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "u")
+    monkeypatch.setenv("DECODO_PASSWORD", "p")
+    monkeypatch.setenv("DECODO_SITES", "aptekonline")
+    monkeypatch.setenv("DECODO_PORTS", "30001-30003")
+    assert _decodo_ports("aptekonline") == [30001, 30002, 30003]
+    monkeypatch.setenv("DECODO_PORTS", "30001, 30005, 30009")
+    assert _decodo_ports("aptekonline") == [30001, 30005, 30009]
+
+
+def test_decodo_proxy_url_encodes_password(monkeypatch):
+    # Пароль с '=' должен быть URL-кодирован (%3D), иначе ломает userinfo.
+    _clear_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "spw25z9lwn")
+    monkeypatch.setenv("DECODO_PASSWORD", "85Yo=yePfQ")
+    monkeypatch.setenv("DECODO_SITES", "aptekonline")
+    url = _decodo_httpx_proxy_for("aptekonline", 30001)
+    assert url == "http://spw25z9lwn:85Yo%3DyePfQ@az.decodo.com:30001"
+
+
+def test_decodo_proxy_custom_host_and_port(monkeypatch):
+    _clear_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "u")
+    monkeypatch.setenv("DECODO_PASSWORD", "p")
+    monkeypatch.setenv("DECODO_SITES", "aptekonline")
+    monkeypatch.setenv("DECODO_HOST", "tr.decodo.com")
+    assert _decodo_httpx_proxy_for("aptekonline", 7000) == "http://u:p@tr.decodo.com:7000"
+
+
+def test_decodo_page_attempts_default_and_override(monkeypatch):
+    _clear_decodo(monkeypatch)
+    assert _decodo_page_attempts() == 5
+    monkeypatch.setenv("DECODO_PAGE_ATTEMPTS", "3")
+    assert _decodo_page_attempts() == 3
+    # invalid / zero → safe default
+    monkeypatch.setenv("DECODO_PAGE_ATTEMPTS", "0")
+    assert _decodo_page_attempts() == 5
+    monkeypatch.setenv("DECODO_PAGE_ATTEMPTS", "abc")
+    assert _decodo_page_attempts() == 5
+
+
+def _enable_decodo(monkeypatch):
+    _clear_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_USERNAME", "u")
+    monkeypatch.setenv("DECODO_PASSWORD", "p")
+    monkeypatch.setenv("DECODO_SITES", "aptekonline")
+    monkeypatch.setenv("DECODO_PAGE_ATTEMPTS", "5")
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_decodo_retries_past_transient_522(monkeypatch):
+    """Decodo: 2 первых IP дают 522, 3-й — 200. Ретрай по портам должен пробить."""
+    _enable_decodo(monkeypatch)
+    payload = _load_fixture()
+    payload["last_page"] = 1
+    payload["next_page_url"] = None
+    patcher, idx = _mock_httpx_status_seq([522, 522, 200], payload)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+    assert len(products) == len(payload["data"])  # пробились на 3-м порту
+    assert idx["n"] == 3  # два 522 отретраены, затем 200
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_decodo_skips_then_aborts_on_persistent_522(monkeypatch):
+    """Постоянный 522: страница пропускается (skip), после 3 подряд — обрыв
+    категории (не бесконечный перебор всех max_pages)."""
+    _enable_decodo(monkeypatch)
+    patcher, idx = _mock_httpx_status_seq([522], None)  # всегда 522
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+    assert products == []
+    # 3 пропущенных страницы × 5 attempts = 15 запросов, затем обрыв
+    assert idx["n"] == 15
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_decodo_aborts_on_403_hard_block(monkeypatch):
+    """403 — жёсткий блок: ретрай по портам исчерпывается, категория обрывается
+    сразу (НЕ skip-continue, в отличие от транзиентного 522)."""
+    _enable_decodo(monkeypatch)
+    patcher, idx = _mock_httpx_status_seq([403], None)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+    assert products == []
+    # _fetch_page ретраит 403 по 5 портам, вернёт 403 → hard-block → обрыв
+    assert idx["n"] == 5

@@ -36,8 +36,10 @@ scrape_promos() остаётся на Playwright — главная страни
 
 from __future__ import annotations
 
+import itertools
 import os
 from typing import AsyncIterator
+from urllib.parse import quote
 
 import httpx
 import structlog
@@ -147,6 +149,71 @@ def _scraperapi_httpx_proxy_for(site_name: str) -> str | None:
     # как пароль прокси — НЕ логировать его verbatim (call-site логирует только
     # provider+country, не URL).
     return f"http://{user}:{key}@proxy-server.scraperapi.com:8001"
+
+
+_DECODO_HOST_DEFAULT = "az.decodo.com"
+
+# Транзиентно провалившуюся страницу (сеть/5xx/522 после ретраев) ПРОПУСКАЕМ и
+# идём дальше — не обрываем всю категорию (Decodo residential даёт ~38% флайки на
+# отдельный IP; одна сбойная страница не повод терять остальные). Жёсткий блок
+# (403/401/451) → ретрай бесполезен, обрыв. N провалов подряд → реальная
+# проблема (провайдер лёг / систематический блок), тоже обрыв.
+_HARD_BLOCK_STATUSES = {401, 403, 451}
+_MAX_CONSECUTIVE_PAGE_FAILURES = 3
+
+
+def _decodo_enabled(site_name: str) -> bool:
+    """Decodo настроен для сайта (creds заданы И сайт в DECODO_SITES)."""
+    if not (os.getenv("DECODO_USERNAME") and os.getenv("DECODO_PASSWORD")):
+        return False
+    sites = {s.strip() for s in os.getenv("DECODO_SITES", "").split(",") if s.strip()}
+    return site_name in sites
+
+
+def _decodo_ports(site_name: str) -> list[int]:
+    """Порты Decodo для site — каждый порт = отдельная sticky AZ-сессия (свой IP).
+
+    Цикл по портам = ретрай на разных IP: residential-пул Decodo даёт ~38%
+    транзиентных 522 на отдельный IP, повтор на другом порту это лечит.
+    DECODO_PORTS: диапазон "30001-30010" или CSV. Пусто если Decodo не настроен.
+    """
+    if not _decodo_enabled(site_name):
+        return []
+    raw = os.getenv("DECODO_PORTS", "30001-30010").strip()
+    ports: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, _, hi = part.partition("-")
+            if lo.strip().isdigit() and hi.strip().isdigit():
+                ports.extend(range(int(lo), int(hi) + 1))
+        elif part.isdigit():
+            ports.append(int(part))
+    return ports
+
+
+def _decodo_page_attempts() -> int:
+    """Сколько IP перебрать на одну страницу до отказа (деф. 5)."""
+    raw = os.getenv("DECODO_PAGE_ATTEMPTS", "5").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else 5
+
+
+def _decodo_httpx_proxy_for(site_name: str, port: int) -> str | None:
+    """Decodo residential proxy URL для одного порта (sticky AZ-сессия).
+
+    Гео (Азербайджан) закодировано в host (az.decodo.com), НЕ в username —
+    country-флаг не нужен. Пароль URL-кодируется (может содержать '='/спецсимволы).
+    ВНИМАНИЕ: URL несёт DECODO_PASSWORD — не логировать verbatim.
+    """
+    user = os.getenv("DECODO_USERNAME")
+    pwd = os.getenv("DECODO_PASSWORD")
+    if not user or not pwd:
+        return None
+    sites = {s.strip() for s in os.getenv("DECODO_SITES", "").split(",") if s.strip()}
+    if site_name not in sites:
+        return None
+    host = os.getenv("DECODO_HOST", _DECODO_HOST_DEFAULT).strip()
+    return f"http://{user}:{quote(pwd, safe='')}@{host}:{port}"
 
 
 def _crawlbase_httpx_proxy_for(site_name: str) -> str | None:
@@ -295,72 +362,140 @@ class AptekonlineScraper(BaseScraper):
         yielded = 0
         params_base = [("categoryId[]", category_id), ("lang", "az")]
 
-        # Proxy resolution: IPRoyal → Bright Data → Crawlbase → ScraperAPI → direct.
-        # IPRoyal первым — дешевле ($1.75/GB vs BD $8/GB) и без KYC.
-        proxy_url = _iproyal_httpx_proxy_for("aptekonline")
-        proxied_via = "iproyal" if proxy_url else None
-        if proxy_url is None:
-            proxy_url = _brightdata_httpx_proxy_for("aptekonline")
-            proxied_via = "brightdata" if proxy_url else None
-        if proxy_url is None:
-            proxy_url = _crawlbase_httpx_proxy_for("aptekonline")
-            proxied_via = "crawlbase" if proxy_url else None
-        if proxy_url is None:
-            proxy_url = _scraperapi_httpx_proxy_for("aptekonline")
-            proxied_via = "scraperapi" if proxy_url else None
+        # Proxy resolution: Decodo (AZ residential) → IPRoyal → Bright Data →
+        # Crawlbase → ScraperAPI → direct. Decodo первым: единственный рабочий
+        # азербайджанский residential-пул (aptek принимает только AZ-IP).
+        decodo_ports = _decodo_ports("aptekonline")
+        port_cycle = itertools.cycle(decodo_ports) if decodo_ports else None
+        persistent_client: httpx.AsyncClient | None = None
 
-        client_kwargs: dict = {
-            "headers": _API_HEADERS,
-            "timeout": httpx.Timeout(90.0 if proxy_url else 30.0),
-        }
-        if proxy_url:
-            client_kwargs["proxy"] = proxy_url
-            client_kwargs["verify"] = False  # MITM HTTPS на любом из этих прокси
-            _country_env_by_provider = {
-                "iproyal": "IPROYAL_COUNTRY",
-                "brightdata": "BRIGHTDATA_COUNTRY",
-                "scraperapi": "SCRAPER_API_COUNTRY",
-            }
+        if port_cycle is not None:
+            proxied_via = "decodo"
             log.info(
-                f"aptekonline_using_{proxied_via}",
-                country=os.getenv(
-                    _country_env_by_provider.get(proxied_via, "SCRAPER_API_COUNTRY"),
-                    "default",
-                ),
+                "aptekonline_using_decodo",
+                host=os.getenv("DECODO_HOST", _DECODO_HOST_DEFAULT),
+                ports=len(decodo_ports),
+                attempts_per_page=_decodo_page_attempts(),
             )
-        async with httpx.AsyncClient(**client_kwargs) as client:
+        else:
+            proxy_url = _iproyal_httpx_proxy_for("aptekonline")
+            proxied_via = "iproyal" if proxy_url else None
+            if proxy_url is None:
+                proxy_url = _brightdata_httpx_proxy_for("aptekonline")
+                proxied_via = "brightdata" if proxy_url else None
+            if proxy_url is None:
+                proxy_url = _crawlbase_httpx_proxy_for("aptekonline")
+                proxied_via = "crawlbase" if proxy_url else None
+            if proxy_url is None:
+                proxy_url = _scraperapi_httpx_proxy_for("aptekonline")
+                proxied_via = "scraperapi" if proxy_url else None
+            client_kwargs: dict = {
+                "headers": _API_HEADERS,
+                "timeout": httpx.Timeout(90.0 if proxy_url else 30.0),
+            }
+            if proxy_url:
+                client_kwargs["proxy"] = proxy_url
+                client_kwargs["verify"] = False  # MITM HTTPS на этих прокси
+                _country_env_by_provider = {
+                    "iproyal": "IPROYAL_COUNTRY",
+                    "brightdata": "BRIGHTDATA_COUNTRY",
+                    "scraperapi": "SCRAPER_API_COUNTRY",
+                }
+                log.info(
+                    f"aptekonline_using_{proxied_via}",
+                    country=os.getenv(
+                        _country_env_by_provider.get(
+                            proxied_via, "SCRAPER_API_COUNTRY"
+                        ),
+                        "default",
+                    ),
+                )
+            persistent_client = httpx.AsyncClient(**client_kwargs)
+
+        async def _fetch_page(req_params: list) -> httpx.Response | None:
+            """GET страницы. Decodo — ретрай по портам (порт = другой AZ-IP;
+            ~38% IP дают транзиентный 522). Прочие — один persistent client."""
+            if port_cycle is not None:
+                last_resp: httpx.Response | None = None
+                for _ in range(_decodo_page_attempts()):
+                    purl = _decodo_httpx_proxy_for("aptekonline", next(port_cycle))
+                    try:
+                        async with httpx.AsyncClient(
+                            headers=_API_HEADERS,
+                            timeout=httpx.Timeout(60.0),
+                            proxy=purl,
+                            verify=False,
+                        ) as c:
+                            r = await c.get(_API_PRODUCT_LIST, params=req_params)
+                        if r.status_code == 200:
+                            return r
+                        last_resp = r
+                    except httpx.RequestError:
+                        continue
+                return last_resp
+            try:
+                return await persistent_client.get(
+                    _API_PRODUCT_LIST, params=req_params
+                )
+            except httpx.RequestError:
+                return None
+
+        pages_skipped = 0
+        consecutive_failures = 0
+        try:
             for page_num in range(1, max_pages + 1):
                 if limit is not None and yielded >= limit:
                     return
                 params = list(params_base) + [("page", str(page_num))]
-                try:
-                    resp = await client.get(_API_PRODUCT_LIST, params=params)
-                except (httpx.RequestError, httpx.TimeoutException) as e:
+                resp = await _fetch_page(params)
+                status = None if resp is None else resp.status_code
+                if status != 200:
+                    if status in _HARD_BLOCK_STATUSES:
+                        log.warning(
+                            "aptekonline_api_blocked",
+                            category=category_slug,
+                            page=page_num,
+                            status=status,
+                            provider=proxied_via,
+                        )
+                        return
+                    # Транзиент (сеть/5xx/522): пропускаем страницу, идём дальше.
+                    pages_skipped += 1
+                    consecutive_failures += 1
                     log.warning(
-                        "aptekonline_api_request_failed",
+                        "aptekonline_page_skipped",
                         category=category_slug,
                         page=page_num,
-                        error=str(e),
+                        status=status,
+                        provider=proxied_via,
+                        consecutive=consecutive_failures,
                     )
-                    return
-                if resp.status_code != 200:
-                    log.warning(
-                        "aptekonline_api_status",
-                        category=category_slug,
-                        page=page_num,
-                        status=resp.status_code,
-                    )
-                    return
+                    if consecutive_failures >= _MAX_CONSECUTIVE_PAGE_FAILURES:
+                        log.warning(
+                            "aptekonline_category_aborted",
+                            category=category_slug,
+                            page=page_num,
+                            consecutive=consecutive_failures,
+                            provider=proxied_via,
+                        )
+                        return
+                    continue
                 try:
                     payload = resp.json()
                 except ValueError as e:
+                    pages_skipped += 1
+                    consecutive_failures += 1
                     log.warning(
                         "aptekonline_api_invalid_json",
                         category=category_slug,
                         page=page_num,
                         error=str(e),
+                        consecutive=consecutive_failures,
                     )
-                    return
+                    if consecutive_failures >= _MAX_CONSECUTIVE_PAGE_FAILURES:
+                        return
+                    continue
+                consecutive_failures = 0
 
                 items = payload.get("data") or []
                 thumb_folder = payload.get("thumb_folder") or ""
@@ -397,6 +532,16 @@ class AptekonlineScraper(BaseScraper):
                     break
                 if not payload.get("next_page_url"):
                     break
+            if pages_skipped:
+                log.warning(
+                    "aptekonline_category_incomplete",
+                    category=category_slug,
+                    pages_skipped=pages_skipped,
+                    provider=proxied_via,
+                )
+        finally:
+            if persistent_client is not None:
+                await persistent_client.aclose()
 
     async def scrape_product_page(self, url: str) -> ScrapedProduct | None:
         """Watchlist-режим: один товар.
