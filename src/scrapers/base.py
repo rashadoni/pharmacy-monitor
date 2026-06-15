@@ -170,6 +170,12 @@ def _scraperapi_proxy_for(site_name: str) -> dict | None:
     # ScraperAPI accepts feature flags as suffixes on the username — e.g.
     # "scraperapi.country_code=tr". When no country is set, plain "scraperapi"
     # uses their default datacenter pool.
+    #
+    # NB: premium=true (residential) support intentionally lives ONLY in the
+    # httpx sibling _scraperapi_httpx_proxy_for in aptekonline.py — aptekonline
+    # is the only site needing AZ residential and it scrapes via httpx, never
+    # Playwright. The omission here is deliberate, not an oversight; add it if a
+    # Playwright-routed site ever needs a residential pool.
     username = f"scraperapi.country_code={country}" if country else "scraperapi"
     return {
         "server": "http://proxy-server.scraperapi.com:8001",

@@ -25,6 +25,7 @@ from src.scrapers.aptekonline import (
     _build_product_from_api,
     _iproyal_httpx_proxy_for,
     _resolve_checkus_token,
+    _scraperapi_httpx_proxy_for,
 )
 
 
@@ -369,3 +370,100 @@ def test_iproyal_httpx_proxy_with_country(monkeypatch):
     monkeypatch.setenv("IPROYAL_COUNTRY", "az")
     url = _iproyal_httpx_proxy_for("aptekonline")
     assert url == "http://myuser_country-az:p@geo.iproyal.com:12321"
+
+
+# ScraperAPI httpx proxy resolution + premium flag (Azerbaijan residential).
+
+
+def _clear_scraperapi(mp):
+    for k in (
+        "SCRAPER_API_KEY",
+        "SCRAPER_API_SITES",
+        "SCRAPER_API_COUNTRY",
+        "SCRAPER_API_PREMIUM_SITES",
+    ):
+        mp.delenv(k, raising=False)
+
+
+def test_scraperapi_httpx_proxy_none_without_key(monkeypatch):
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.setenv("SCRAPER_API_SITES", "aptekonline")
+    assert _scraperapi_httpx_proxy_for("aptekonline") is None
+
+
+def test_scraperapi_httpx_proxy_none_when_site_excluded(monkeypatch):
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.setenv("SCRAPER_API_KEY", "k3y")
+    monkeypatch.setenv("SCRAPER_API_SITES", "pharmonline")
+    assert _scraperapi_httpx_proxy_for("aptekonline") is None
+
+
+def test_scraperapi_httpx_proxy_plain_without_country_or_premium(monkeypatch):
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.setenv("SCRAPER_API_KEY", "k3y")
+    monkeypatch.setenv("SCRAPER_API_SITES", "aptekonline")
+    url = _scraperapi_httpx_proxy_for("aptekonline")
+    assert url == "http://scraperapi:k3y@proxy-server.scraperapi.com:8001"
+
+
+def test_scraperapi_httpx_proxy_country_only(monkeypatch):
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.setenv("SCRAPER_API_KEY", "k3y")
+    monkeypatch.setenv("SCRAPER_API_SITES", "aptekonline")
+    monkeypatch.setenv("SCRAPER_API_COUNTRY", "az")
+    url = _scraperapi_httpx_proxy_for("aptekonline")
+    assert url == "http://scraperapi.country_code=az:k3y@proxy-server.scraperapi.com:8001"
+
+
+def test_scraperapi_httpx_proxy_premium_only(monkeypatch):
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.setenv("SCRAPER_API_KEY", "k3y")
+    monkeypatch.setenv("SCRAPER_API_SITES", "aptekonline")
+    monkeypatch.setenv("SCRAPER_API_PREMIUM_SITES", "aptekonline")
+    url = _scraperapi_httpx_proxy_for("aptekonline")
+    assert url == "http://scraperapi.premium=true:k3y@proxy-server.scraperapi.com:8001"
+
+
+def test_scraperapi_httpx_proxy_country_and_premium_for_aptek(monkeypatch):
+    # Боевая конфигурация aptekonline: AZ residential через premium-тариф.
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.setenv("SCRAPER_API_KEY", "k3y")
+    monkeypatch.setenv("SCRAPER_API_SITES", "pharmonline,aptekonline")
+    monkeypatch.setenv("SCRAPER_API_COUNTRY", "az")
+    monkeypatch.setenv("SCRAPER_API_PREMIUM_SITES", "aptekonline")
+    url = _scraperapi_httpx_proxy_for("aptekonline")
+    assert url == (
+        "http://scraperapi.country_code=az.premium=true:k3y"
+        "@proxy-server.scraperapi.com:8001"
+    )
+
+
+def test_scraperapi_httpx_proxy_premium_not_applied_to_other_site(monkeypatch):
+    # premium точечный: pharmonline-фоллбэк не должен получить платный premium.
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.setenv("SCRAPER_API_KEY", "k3y")
+    monkeypatch.setenv("SCRAPER_API_SITES", "pharmonline,aptekonline")
+    monkeypatch.setenv("SCRAPER_API_COUNTRY", "az")
+    monkeypatch.setenv("SCRAPER_API_PREMIUM_SITES", "aptekonline")
+    url = _scraperapi_httpx_proxy_for("pharmonline")
+    assert url == "http://scraperapi.country_code=az:k3y@proxy-server.scraperapi.com:8001"
+
+
+def test_scraperapi_httpx_proxy_premium_list_present_but_bare_result(monkeypatch):
+    # premium задан для aptek, но запрашиваем другой сайт без country →
+    # должен получиться голый "scraperapi" (premium-список не протёк).
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.setenv("SCRAPER_API_KEY", "k3y")
+    monkeypatch.setenv("SCRAPER_API_SITES", "pharmonline,aptekonline")
+    monkeypatch.setenv("SCRAPER_API_PREMIUM_SITES", "aptekonline")
+    url = _scraperapi_httpx_proxy_for("pharmonline")
+    assert url == "http://scraperapi:k3y@proxy-server.scraperapi.com:8001"
+
+
+def test_scraperapi_httpx_proxy_none_without_key_even_with_premium(monkeypatch):
+    # Нет ключа → None ДО любой flag-логики, даже если premium настроен.
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.setenv("SCRAPER_API_SITES", "aptekonline")
+    monkeypatch.setenv("SCRAPER_API_COUNTRY", "az")
+    monkeypatch.setenv("SCRAPER_API_PREMIUM_SITES", "aptekonline")
+    assert _scraperapi_httpx_proxy_for("aptekonline") is None

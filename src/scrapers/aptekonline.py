@@ -106,6 +106,16 @@ def _scraperapi_httpx_proxy_for(site_name: str) -> str | None:
 
     Mirror логика из base._scraperapi_proxy_for, но возвращает один URL —
     httpx понимает строку проще чем Playwright-style dict.
+
+    Дополнительный env:
+      SCRAPER_API_PREMIUM_SITES  CSV сайтов, которым нужен premium=true
+                                 (residential-пул, +10 кредитов/запрос).
+                                 Требуется для гео-стран, доступных ТОЛЬКО
+                                 через residential-тариф — напр. Azerbaijan
+                                 для aptekonline (без premium ScraperAPI
+                                 отдаёт 403 "country requires premium tier").
+                                 Флаг точечный, чтобы не навешивать платный
+                                 premium на дешёвые datacenter-фоллбэки.
     """
     key = os.getenv("SCRAPER_API_KEY")
     if not key:
@@ -114,10 +124,28 @@ def _scraperapi_httpx_proxy_for(site_name: str) -> str | None:
     sites = {s.strip() for s in sites_csv.split(",") if s.strip()}
     if site_name not in sites:
         return None
+    # ScraperAPI proxy-mode: флаги в username через точку, напр.
+    # "scraperapi.country_code=az.premium=true". country_code бесплатен,
+    # premium=true стоит +10 кредитов (residential).
+    flags: list[str] = []
+    # NB: SCRAPER_API_COUNTRY — ГЛОБАЛЬНЫЙ (не per-site, в отличие от premium
+    # ниже). Он применится КО ВСЕМ сайтам в SCRAPER_API_SITES. Сейчас это
+    # безвредно (только aptekonline реально ходит через ScraperAPI; pharmonline
+    # там лишь deep-fallback за IPRoyal DDP), но если задашь country под один
+    # сайт — он молча затронет и второй. Захочешь scope per-site — заведи
+    # SCRAPER_API_COUNTRY_SITES по образцу premium ниже.
     country = os.getenv("SCRAPER_API_COUNTRY", "").strip()
-    user = f"scraperapi.country_code={country}" if country else "scraperapi"
+    if country:
+        flags.append(f"country_code={country}")
+    premium_csv = os.getenv("SCRAPER_API_PREMIUM_SITES", "")
+    premium_sites = {s.strip() for s in premium_csv.split(",") if s.strip()}
+    if site_name in premium_sites:
+        flags.append("premium=true")
+    user = ".".join(["scraperapi", *flags])
     # ScraperAPI proxy MITMs HTTPS — caller должен использовать verify=False
-    # на httpx.AsyncClient.
+    # на httpx.AsyncClient. ВНИМАНИЕ: возвращаемый URL содержит SCRAPER_API_KEY
+    # как пароль прокси — НЕ логировать его verbatim (call-site логирует только
+    # provider+country, не URL).
     return f"http://{user}:{key}@proxy-server.scraperapi.com:8001"
 
 
