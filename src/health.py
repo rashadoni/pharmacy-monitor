@@ -321,19 +321,32 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
     return []
 
 
+# Per-site пороги «молчания» (часы). Дефолт = суточная частота (26ч = 24ч + jitter).
+# Сайты с НЕ-суточным расписанием переопределяются: aptekonline скрейпится РАЗ В
+# НЕДЕЛЮ (Decodo, Пн 02:00 UTC) — «молчит» только если нет обновлений >8 дней,
+# иначе hourly health-check спамил бы critical 6 из 7 дней (alert fatigue, маскирует
+# реальные сбои Decodo/баланса).
+# TODO (при отключении Mac launchd): pharmonline идёт Пн/Ср/Пт, зазор Пт→Пн ~72ч →
+# поднять его порог до ~80ч. Сейчас НЕ переопределяем: Mac ежедневно обновляет
+# pharmonline last_seen (DR-фоллбэк ещё включён), поэтому суточные 26ч корректны.
+_SITE_MAX_AGE_HOURS: dict[str, int] = {
+    "aptekonline": 8 * 24 + 6,  # 198ч = 8 суток + 6ч jitter (недельный таймер)
+}
+
+
 def _check_site_silence(session: Session, max_age_hours: int = 26) -> list[HealthIssue]:
-    """Per-site freshness: если у сайта нет свежих продуктов за max_age_hours → alert.
+    """Per-site freshness: если у сайта нет свежих продуктов за порог → alert.
 
     Метрика: `MAX(Product.last_seen_at)` per site. Если самое свежее обновление
-    у сайта старше max_age_hours, значит скрейп этого сайта молчит — Mac launchd
-    уснул, прокси упал, или CF забанил. `stale_run` смотрит на ПОСЛЕДНИЙ run в
-    принципе, но не per-site: если aloe скрейпится каждый день на проде, а
-    pharm/apt на Mac молчат — stale_run не сработает.
+    у сайта старше порога, значит скрейп этого сайта молчит — прокси упал, баланс
+    кончился, или CF забанил. Порог per-site (`_SITE_MAX_AGE_HOURS`, fallback на
+    `max_age_hours`) — у сайтов разное расписание (см. константу выше). `stale_run`
+    смотрит на ПОСЛЕДНИЙ run в принципе, но не per-site.
 
     Сайты с 0 продуктов в каталоге игнорируются (новый/выключенный).
     """
     issues: list[HealthIssue] = []
-    cutoff = utcnow() - timedelta(hours=max_age_hours)
+    now = utcnow()
 
     for site in ("pharmonline", "aptekonline", "aloe"):
         # Если сайт ещё ни разу не скрейпился — пропустить
@@ -348,15 +361,21 @@ def _check_site_silence(session: Session, max_age_hours: int = 26) -> list[Healt
             select(func.max(Product.last_seen_at)).where(Product.site == site)
         )
 
+        site_max = _SITE_MAX_AGE_HOURS.get(site, max_age_hours)
+        cutoff = now - timedelta(hours=site_max)
         if last_seen is None or last_seen < cutoff:
-            age_h = (utcnow() - last_seen).total_seconds() / 3600 if last_seen else 24 * 7
+            age_h = (now - last_seen).total_seconds() / 3600 if last_seen else 24 * 7
             issues.append(
                 HealthIssue(
                     "critical",
                     "site_silent",
                     f"Сайт {site}: последнее обновление {age_h:.1f}ч назад "
-                    f"(порог {max_age_hours}ч). Mac уснул / прокси упал?",
-                    context={"site": site, "hours_silent": round(age_h, 1)},
+                    f"(порог {site_max}ч). Прокси упал / баланс кончился?",
+                    context={
+                        "site": site,
+                        "hours_silent": round(age_h, 1),
+                        "threshold_hours": site_max,
+                    },
                 )
             )
     return issues

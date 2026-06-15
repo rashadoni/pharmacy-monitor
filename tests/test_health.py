@@ -88,6 +88,38 @@ def test_site_silence_critical_when_one_site_stale(db_session):
     assert "aloe" not in silent_sites  # aloe свежий — не должен попасть
 
 
+def test_site_silence_respects_weekly_aptekonline_threshold(db_session):
+    """aptekonline скрейпится РАЗ В НЕДЕЛЮ (Decodo) → порог 198ч, не суточные 26ч.
+
+    100ч давности для aptek — норма (НЕ alert), иначе hourly health-check спамил
+    бы critical 6 из 7 дней. Для aloe (суточный) те же 100ч — реальный alert.
+    """
+    now = utcnow()
+    apt_run = _add_run(db_session, now - timedelta(hours=100))
+    _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=100))
+    aloe_run = _add_run(db_session, now - timedelta(hours=100))
+    _add_snap(db_session, aloe_run, "aloe", 30, last_seen_at=now - timedelta(hours=100))
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+    silent_sites = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
+    assert "aptekonline" not in silent_sites  # 100ч < 198ч недельного порога
+    assert "aloe" in silent_sites  # 100ч > 26ч суточного порога
+
+
+def test_site_silence_flags_aptekonline_past_weekly_threshold(db_session):
+    """aptekonline молчит >8 дней (порог 198ч) → alert: реальный сбой Decodo/баланса
+    больше не маскируется недельной частотой."""
+    now = utcnow()
+    apt_run = _add_run(db_session, now - timedelta(hours=210))
+    _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=210))
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+    silent_sites = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
+    assert "aptekonline" in silent_sites  # 210ч > 198ч → действительно молчит
+
+
 def test_stale_run_critical(db_session):
     _add_run(db_session, utcnow() - timedelta(hours=48))
     db_session.commit()

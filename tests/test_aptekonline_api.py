@@ -632,5 +632,21 @@ async def test_scrape_category_decodo_aborts_on_403_hard_block(monkeypatch):
         scraper = AptekonlineScraper()
         products = [p async for p in scraper.scrape_category("114")]
     assert products == []
-    # _fetch_page ретраит 403 по 5 портам, вернёт 403 → hard-block → обрыв
-    assert idx["n"] == 5
+    # _fetch_page short-circuit'ит на hard-block (НЕ перебирает порты) → 1 запрос,
+    # затем обрыв категории
+    assert idx["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_decodo_aborts_on_407_balance_exhausted(monkeypatch):
+    """407 (proxy-auth / у Decodo кончился PAYG-баланс) — жёсткий блок: обрыв
+    категории, НЕ skip-continue. Иначе 5 ретраев×порты на каждой странице жгли бы
+    остаток баланса вслепую, а run вернул бы run_ok с заниженным products."""
+    _enable_decodo(monkeypatch)
+    patcher, idx = _mock_httpx_status_seq([407], None)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+    assert products == []
+    # short-circuit на hard-block → 1 запрос (не жжём баланс перебором портов)
+    assert idx["n"] == 1

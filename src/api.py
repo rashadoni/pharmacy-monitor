@@ -500,8 +500,10 @@ class WatchlistItemIn(BaseModel):
 # ─── Public endpoints ────────────────────────────────────────────────────────
 
 
-# Per-site staleness threshold: scrapes run daily, so >30h means at least one
-# scheduled run was skipped. Surfaced in `/health.staleness_warning`.
+# Default per-site staleness threshold (hours) for daily-cadence sites (>30h = at
+# least one scheduled run skipped). Non-daily sites override via
+# health._SITE_MAX_AGE_HOURS (aptekonline weekly → 198h), единый источник порогов.
+# Surfaced in `/health.staleness_warning`.
 _HEALTH_STALENESS_HOURS = 30
 
 
@@ -572,8 +574,14 @@ def health_endpoint(db: Session = Depends(get_db)):
     db_ms = _ping_db(db)
     redis_ms = _ping_redis()
     sites = _staleness_per_site(db)
+    # Per-site порог (единый источник health._SITE_MAX_AGE_HOURS; fallback на
+    # суточный дефолт). aptekonline недельный — иначе /health = degraded 6 из 7 дней.
+    from src.health import _SITE_MAX_AGE_HOURS
+
     stale = any(
-        s.hours_since is not None and s.hours_since > _HEALTH_STALENESS_HOURS for s in sites
+        s.hours_since is not None
+        and s.hours_since > _SITE_MAX_AGE_HOURS.get(s.site, _HEALTH_STALENESS_HOURS)
+        for s in sites
     )
     status_label = "degraded" if (stale or db_ms is None) else "up"
     return HealthOut(
