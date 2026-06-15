@@ -163,6 +163,10 @@ def _check_site_drops(
     last_run = session.get(Run, last_run_id)
     if last_run is None:
         return []
+    # Прогон ещё идёт (finished_at пуст) → частичное покрытие это НЕ «падение»
+    # (health-check мог сработать в середине скрейпа). Дождёмся завершения.
+    if last_run.finished_at is None:
+        return []
 
     for site in sites:
         total = (
@@ -186,6 +190,14 @@ def _check_site_drops(
             )
             or 0
         )
+
+        if seen == 0:
+            # Сайт НЕ входил в этот прогон. Прогоны у нас по-сайтно (aptek/aloe/
+            # pharmonline — ОТДЕЛЬНЫЕ runs), поэтому сайты не из last_run всегда
+            # дают seen=0 → раньше site_drop ложно срабатывал для 2 из 3 сайтов
+            # КАЖДЫЙ прогон. «Не скрейпился» это staleness → ловит site_silent
+            # (per-site порог), а не этот чек (он про «скрейпился, но недобрал»).
+            continue
 
         ratio = seen / total
         if ratio < threshold:

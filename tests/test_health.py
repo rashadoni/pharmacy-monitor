@@ -266,3 +266,28 @@ def test_site_drop_below_20_percent_critical(db_session):
     rep = check_health(db_session, history_days=14, site_drop_threshold=0.5)
     drop_issues = [i for i in rep.issues if i.code == "site_drop"]
     assert any(i.severity == "critical" for i in drop_issues)
+
+
+def test_site_drop_skips_sites_not_in_latest_run(db_session):
+    """Прогоны по-сайтно: последний run скрейпил ТОЛЬКО pharmonline. aptek/aloe с
+    last_seen из своих ПРЕЖНИХ прогонов (seen=0 относительно pharmonline-run) НЕ
+    должны ложно флагаться site_drop — это «не в этом прогоне» (staleness ловит
+    site_silent), а не «упал». Регрессия: при per-site runs site_drop ложно бил
+    2 из 3 сайтов на каждом прогоне.
+    """
+    base = utcnow()
+    # aptek и aloe скрейпились РАНЬШЕ (свои отдельные прогоны), каталог полный
+    apt_run = _add_run(db_session, base - timedelta(hours=5))
+    _add_snap(db_session, apt_run, "aptekonline", 50, last_seen_at=base - timedelta(hours=5))
+    aloe_run = _add_run(db_session, base - timedelta(hours=4))
+    _add_snap(db_session, aloe_run, "aloe", 50, last_seen_at=base - timedelta(hours=4))
+    # Последний прогон — ТОЛЬКО pharmonline, собрал свой каталог полностью
+    ph_run = _add_run(db_session, base - timedelta(hours=1))
+    _add_snap(db_session, ph_run, "pharmonline", 50, last_seen_at=base - timedelta(hours=1))
+    db_session.commit()
+
+    rep = check_health(db_session, site_drop_threshold=0.5)
+    drop_sites = {i.context.get("site") for i in rep.issues if i.code == "site_drop"}
+    assert "aptekonline" not in drop_sites  # не в последнем прогоне → не «упал»
+    assert "aloe" not in drop_sites
+    assert "pharmonline" not in drop_sites  # собрал 50/50 → тоже не падение
