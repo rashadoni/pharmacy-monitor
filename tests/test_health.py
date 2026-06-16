@@ -489,3 +489,45 @@ def test_site_zero_scrape_ignores_in_flight_run(db_session):
 
     rep = check_health(db_session, max_age_hours=999)
     assert not [i for i in rep.issues if i.code == "site_zero_scrape"]
+
+
+def test_alert_signature_stable_and_sorted():
+    """Подпись = отсортированный набор code:site по warning/critical; ok отброшен,
+    порядок issues не влияет."""
+    from src.health import HealthIssue, HealthReport, alert_signature
+
+    r = HealthReport(
+        status="critical",
+        issues=[
+            HealthIssue("critical", "site_zero_scrape", "x", {"site": "aloe"}),
+            HealthIssue("warning", "site_drop", "y", {"site": "pharmonline"}),
+            HealthIssue("ok", "noise", "z", {}),
+        ],
+    )
+    sig = alert_signature(r)
+    assert sig == "site_drop:pharmonline|site_zero_scrape:aloe"
+    r2 = HealthReport(status="critical", issues=list(reversed(r.issues)))
+    assert alert_signature(r2) == sig  # порядок не влияет
+
+
+def test_alert_due_cooldown_logic():
+    """alert_due: новая/изменённая подпись → слать; та же в пределах cooldown → нет;
+    та же после cooldown → слать; нет/битое состояние → слать (fail-safe)."""
+    from src.health import alert_due
+
+    now = utcnow()
+    sig = "site_zero_scrape:aloe"
+    assert alert_due(sig, None, now=now, cooldown_hours=6) is True  # нет состояния
+    assert (
+        alert_due(
+            sig, {"signature": "other", "sent_at": now.isoformat()}, now=now, cooldown_hours=6
+        )
+        is True
+    )  # другая подпись
+    recent = {"signature": sig, "sent_at": (now - timedelta(hours=1)).isoformat()}
+    assert alert_due(sig, recent, now=now, cooldown_hours=6) is False  # в пределах cooldown
+    old = {"signature": sig, "sent_at": (now - timedelta(hours=7)).isoformat()}
+    assert alert_due(sig, old, now=now, cooldown_hours=6) is True  # cooldown прошёл
+    assert (
+        alert_due(sig, {"signature": sig, "sent_at": "garbage"}, now=now, cooldown_hours=6) is True
+    )  # битый timestamp → fail-safe

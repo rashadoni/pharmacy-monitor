@@ -143,6 +143,45 @@ def check_health(
     return report
 
 
+def alert_signature(report: HealthReport) -> str:
+    """Стабильная подпись набора АКТИВНЫХ проблем (code+site) — для дедупа алертов.
+
+    Одинаковый набор проблем → одинаковая подпись. Изменился набор (появилась/ушла
+    проблема) → подпись другая → алерт уходит сразу (новую проблему не глушим).
+    """
+    parts = sorted(
+        f"{i.code}:{i.context.get('site', '')}"
+        for i in report.issues
+        if i.severity in ("warning", "critical")
+    )
+    return "|".join(parts)
+
+
+def alert_due(
+    signature: str,
+    last_state: dict | None,
+    *,
+    now: datetime,
+    cooldown_hours: float,
+) -> bool:
+    """Слать ли email-алерт сейчас (анти-спам для hourly health-check).
+
+    - набор проблем ИЗМЕНИЛСЯ (подпись другая) → слать (новую проблему не глушим);
+    - тот же набор, прошёл `cooldown_hours` с прошлой отправки → слать (напоминание);
+    - тот же набор, в пределах cooldown → НЕ слать (раньше слали каждый час = спам).
+    """
+    if not last_state or last_state.get("signature") != signature:
+        return True
+    sent_at = last_state.get("sent_at")
+    if not sent_at:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(sent_at)
+    except (TypeError, ValueError):
+        return True
+    return (now - last_dt) >= timedelta(hours=cooldown_hours)
+
+
 _SITE_FRESHNESS_DAYS: dict[str, int] = {
     "pharmonline": 21,  # недельный таймер → ~3 цикла
     "aptekonline": 21,  # недельный таймер

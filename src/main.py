@@ -860,6 +860,33 @@ def db_check_cmd(fix: bool) -> None:
         click.echo("\n✓ DB целостность: OK")
 
 
+def _read_health_alert_state(path: str) -> dict | None:
+    """Прочитать состояние последнего отправленного health-алерта (для дедупа)."""
+    import json
+    from pathlib import Path
+
+    try:
+        return json.loads(Path(path).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def _write_health_alert_state(path: str, signature: str) -> None:
+    """Записать подпись + время последнего отправленного алерта. Сбой записи не
+    фатален — деградируем до «слать всегда» (безопасно)."""
+    import json
+    from pathlib import Path
+
+    from src._time import utcnow
+
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"signature": signature, "sent_at": utcnow().isoformat()}))
+    except OSError as e:
+        log.warning("health_alert_state_write_failed", path=path, error=str(e))
+
+
 @cli.command("health-check")
 @click.option(
     "--max-age-hours",
@@ -883,8 +910,25 @@ def db_check_cmd(fix: bool) -> None:
     is_flag=True,
     help="Без вывода если статус ok (для cron — пишет только при проблемах)",
 )
+@click.option(
+    "--alert-cooldown-hours",
+    type=float,
+    default=6.0,
+    help="Анти-спам: не слать ТОТ ЖЕ набор проблем чаще раза в N часов (деф. 6)",
+)
+@click.option(
+    "--alert-state-file",
+    envvar="HEALTH_ALERT_STATE_FILE",
+    default="data/health_alert_state.json",
+    help="Файл состояния для дедупа алертов (env HEALTH_ALERT_STATE_FILE)",
+)
 def health_check_cmd(
-    max_age_hours: int, min_products: int, alert_email: bool, quiet_on_ok: bool
+    max_age_hours: int,
+    min_products: int,
+    alert_email: bool,
+    quiet_on_ok: bool,
+    alert_cooldown_hours: float,
+    alert_state_file: str,
 ) -> None:
     """Проверить здоровье системы: stale/failed/empty/site-drop. Exit-code 0=ok, 1=warning, 2=critical."""
     from src.health import check_health, render_alert_html
@@ -907,15 +951,27 @@ def health_check_cmd(
         click.echo(f"  [{i.severity}] {i.code}: {i.message}")
 
     if alert_email and report.status != "ok":
-        try:
-            html = render_alert_html(report)
-            notifier.send_email(
-                subject=f"Pharmacy Monitor — {report.status.upper()}",
-                html_body=html,
+        from src._time import utcnow
+        from src.health import alert_due, alert_signature
+
+        sig = alert_signature(report)
+        state = _read_health_alert_state(alert_state_file)
+        if alert_due(sig, state, now=utcnow(), cooldown_hours=alert_cooldown_hours):
+            try:
+                html = render_alert_html(report)
+                notifier.send_email(
+                    subject=f"Pharmacy Monitor — {report.status.upper()}",
+                    html_body=html,
+                )
+                _write_health_alert_state(alert_state_file, sig)
+                click.echo("→ Email-алерт отправлен")
+            except Exception as e:
+                click.echo(f"⚠️ Не удалось отправить email-алерт: {e}", err=True)
+        else:
+            click.echo(
+                f"→ Email подавлен (cooldown {alert_cooldown_hours}ч — "
+                f"те же проблемы уже отправлены)"
             )
-            click.echo("→ Email-алерт отправлен")
-        except Exception as e:
-            click.echo(f"⚠️ Не удалось отправить email-алерт: {e}", err=True)
 
     # Exit code для cron-логики
     sys.exit({"ok": 0, "warning": 1, "critical": 2}[report.status])
