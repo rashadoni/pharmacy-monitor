@@ -457,6 +457,66 @@ def test_map_violation_skipped_when_insufficient_samples(db_session):
     assert not any(a.type == "map_violation" for a in actions)
 
 
+def test_map_violation_skipped_when_client_price_is_placeholder(db_session):
+    """Fix 2026-06-03: client цена ~0.01 (placeholder «нет цены») НЕ даёт map_violation.
+
+    Раньше gap (10−0.01)/10 = 99.9% всплывал наверху как «подними с 0.01 до 9.90
+    (+99.9%)» — мусор, ломающий доверие в демо. Теперь client_price < 0.20 → пропуск.
+    """
+    apt = _add_product_with_brand(db_session, "aptekonline", "P Bayer", "Bayer", "a1")
+    aloe = _add_product_with_brand(db_session, "aloe", "P Bayer", "Bayer", "b1")
+    client = _add_product_with_brand(db_session, "pharmonline", "P Bayer", "Bayer", "c1")
+    r = _make_run(db_session, [(apt, 10.00), (aloe, 10.50)])
+    db_session.add(PriceSnapshot(run_id=r.id, product_id=apt.id, price=11.00))  # floor=10, n=3
+    db_session.add(PriceSnapshot(run_id=r.id, product_id=client.id, price=0.01))  # placeholder
+    db_session.commit()
+
+    actions = roi.compute_actions(db_session)
+    assert not any(a.type == "map_violation" for a in actions), (
+        "placeholder 0.01 не должен давать MAP-рекомендацию"
+    )
+
+
+def test_map_violation_skipped_when_gap_implausibly_large(db_session):
+    """Fix 2026-06-03: client дешевле floor больше чем на _MAP_MAX_GAP_PCT (80%) → пропуск.
+
+    Кейс «Vena кateter»: client 0.50 ₼ (правдоподобная цена, > 0.20), но floor 44.40 →
+    gap 98.9%. Это bad-match / data-artifact, не реальная возможность поднять. Floor-guard
+    не ловит (0.50 > 0.20), ловит gap-cap.
+    """
+    apt = _add_product_with_brand(db_session, "aptekonline", "Kateter Vena", "Vena", "a1")
+    aloe = _add_product_with_brand(db_session, "aloe", "Kateter Vena", "Vena", "b1")
+    client = _add_product_with_brand(db_session, "pharmonline", "Kateter Vena", "Vena", "c1")
+    r = _make_run(db_session, [(apt, 44.40), (aloe, 45.00)])
+    db_session.add(PriceSnapshot(run_id=r.id, product_id=apt.id, price=46.00))  # floor=44.40, n=3
+    db_session.add(PriceSnapshot(run_id=r.id, product_id=client.id, price=0.50))  # gap 98.9%
+    db_session.commit()
+
+    actions = roi.compute_actions(db_session)
+    assert not any(a.type == "map_violation" for a in actions), (
+        "gap 98.9% (>80%) — почти наверняка mismatch, не должен флагаться"
+    )
+
+
+def test_map_violation_still_flagged_below_gap_cap(db_session):
+    """Boundary: правдоподобная цена + gap 70% (< 80% cap) + валидный floor → флагуется.
+
+    Гарантирует, что новый cap не «съедает» реальные агрессивные, но валидные возможности.
+    """
+    apt = _add_product_with_brand(db_session, "aptekonline", "P Roche", "Roche", "a1")
+    aloe = _add_product_with_brand(db_session, "aloe", "P Roche", "Roche", "b1")
+    client = _add_product_with_brand(db_session, "pharmonline", "P Roche", "Roche", "c1")
+    r = _make_run(db_session, [(apt, 10.00), (aloe, 10.50)])
+    db_session.add(PriceSnapshot(run_id=r.id, product_id=apt.id, price=11.00))  # floor=10, n=3
+    db_session.add(PriceSnapshot(run_id=r.id, product_id=client.id, price=3.00))  # gap 70%
+    db_session.commit()
+
+    actions = roi.compute_actions(db_session)
+    map_actions = [a for a in actions if a.type == "map_violation"]
+    assert len(map_actions) == 1, f"gap 70% (< 80%) должен флагаться, got: {[a.type for a in actions]}"
+    assert map_actions[0].current_value_azn == 3.00
+
+
 def test_map_violation_translation_az_en(db_session):
     """translate_action заменяет title/detail для az/en на map_violation."""
     apt = _add_product_with_brand(db_session, "aptekonline", "Z", "TestBrand", "a1")

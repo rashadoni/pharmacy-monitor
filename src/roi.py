@@ -70,6 +70,14 @@ _MAP_FLOOR_WINDOW_DAYS = 30
 _MAP_MIN_GAP_PCT = 5.0  # ниже — не флагуем (внутри обычного шума)
 _MAP_WARNING_GAP_PCT = 10.0  # выше — severity = "warning"
 _MAP_CRITICAL_GAP_PCT = 20.0  # выше — severity = "critical"
+# Fix 2026-06-03: защита от битых/placeholder цен. MAP-gap floor-relative (0–100%),
+# верхней границы не было → товар клиента с ценой ~0.01 (нет реальной цены на сайте,
+# сохранён как placeholder) давал gap ~99.9% и всплывал наверх как «подними с 0.01 до
+# 11.14 (+99.9%)» — мусор, который убивает доверие в демо. Зеркалит max_spread guard
+# из _price_raise_opportunities. Клиент дальше чем на _MAP_MAX_GAP_PCT ниже floor —
+# почти наверняка data-artifact или mismatch (другой размер/grade), не opportunity.
+_MAP_MAX_GAP_PCT = 80.0  # gap >= этого — не флагуем (битая цена / bad match)
+_MIN_PLAUSIBLE_PRICE = 0.20  # цена ниже — считаем «нет реальной цены» (placeholder)
 
 
 @dataclass
@@ -605,7 +613,7 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
             Product.brand.is_not(None),
             PriceSnapshot.captured_at >= floor_window_start,
             effective_price.is_not(None),
-            effective_price > 0,
+            effective_price >= _MIN_PLAUSIBLE_PRICE,
         )
         .group_by(Product.brand)
     ).all()
@@ -636,8 +644,8 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
         if snap is None:
             continue
         client_price = snap.discount_price or snap.price
-        if client_price is None or client_price <= 0:
-            continue
+        if client_price is None or client_price < _MIN_PLAUSIBLE_PRICE:
+            continue  # нет цены / placeholder (~0.01) — не реальная цена, не флагуем
 
         floor = brand_floors.get(p.brand or "")
         if floor is None or floor <= 0:
@@ -650,6 +658,8 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
         gap_pct = (floor - client_price) / floor * 100.0
         if gap_pct < _MAP_MIN_GAP_PCT:
             continue
+        if gap_pct >= _MAP_MAX_GAP_PCT:
+            continue  # клиент в разы ниже floor → data-artifact / mismatch, не opportunity
 
         if gap_pct >= _MAP_CRITICAL_GAP_PCT:
             sev = "critical"
