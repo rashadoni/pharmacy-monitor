@@ -127,6 +127,13 @@ def check_health(
     # отдельно.
     report.issues.extend(_check_site_silence(session, max_age_hours))
 
+    # 8. Полный отказ сайта: последний прогон, включавший сайт, собрал РОВНО 0
+    # товаров → critical сразу (в течение часа), не дожидаясь суточного порога
+    # site_silent. Раньше это терялось: smoke-test пропускал `current == 0`, а
+    # `empty_run` смотрит только на последний прогон в принципе (его маскировал
+    # intraday-прогон другого сайта).
+    report.issues.extend(_check_site_zero_scrape(session))
+
     # Совокупный статус
     if any(i.severity == "critical" for i in report.issues):
         report.status = "critical"
@@ -421,6 +428,47 @@ def _check_site_silence(session: Session, max_age_hours: int = 26) -> list[Healt
                     },
                 )
             )
+    return issues
+
+
+def _check_site_zero_scrape(session: Session) -> list[HealthIssue]:
+    """Per-site: последний прогон, ВКЛЮЧАВШИЙ сайт, собрал РОВНО 0 товаров → critical.
+
+    Ловит полный отказ сайта (лёг / прокси умер / сменилась вёрстка) в течение
+    часа (hourly health-check + --alert-email), не дожидаясь порога site_silent
+    (~сутки). Реальный кейс (2026-06-11): aloe.az отдал HTTP 502 → прогон собрал
+    0 товаров, но не алертнул — `_smoke_test_per_site_coverage` пропускал
+    `current == 0` (самый худший случай!), а `empty_run` маскировался intraday.
+
+    Порог именно ==0: intraday-блипы (частичные ~100-250 шт) НЕ триггерят. Берём
+    последний прогон С ЭТИМ сайтом в `products_per_site`, поэтому intraday-прогон
+    другого сайта (pharmonline featured) не маскирует 0 у aloe/aptek.
+    """
+    sites = {"pharmonline", "aptekonline", "aloe"}
+    issues: list[HealthIssue] = []
+    seen: set[str] = set()
+    # limit с запасом: intraday-прогоны (hourly, pharmonline) плодят ~24 Run/день,
+    # 500 покрывает >2 недель → достаёт даже недельный прогон aptekonline.
+    recent = session.scalars(
+        select(Run).where(Run.finished_at.isnot(None)).order_by(desc(Run.started_at)).limit(500)
+    ).all()
+    for run in recent:
+        pps = run.products_per_site or {}
+        for site in sites - seen:
+            if site in pps:
+                seen.add(site)
+                if (pps.get(site) or 0) == 0:
+                    issues.append(
+                        HealthIssue(
+                            "critical",
+                            "site_zero_scrape",
+                            f"Сайт {site}: последний прогон #{run.id} собрал 0 товаров "
+                            f"(сайт лёг / прокси упал / сменилась вёрстка?).",
+                            context={"site": site, "run_id": run.id},
+                        )
+                    )
+        if seen == sites:
+            break
     return issues
 
 

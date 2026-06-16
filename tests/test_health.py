@@ -361,3 +361,131 @@ def test_site_drop_skips_sites_not_in_latest_run(db_session):
     assert "aptekonline" not in drop_sites  # не в последнем прогоне → не «упал»
     assert "aloe" not in drop_sites
     assert "pharmonline" not in drop_sites  # собрал 50/50 → тоже не падение
+
+
+def test_site_zero_scrape_alerts_on_full_zero_run(db_session):
+    """Сайт собрал РОВНО 0 в последнем прогоне → critical site_zero_scrape.
+
+    Регрессия 06-11: aloe.az отдал 502, прогон собрал 0, но алерта не было.
+    """
+    base = utcnow()
+    db_session.add(
+        Run(
+            started_at=base - timedelta(hours=1),
+            finished_at=base - timedelta(minutes=58),
+            status="ok",
+            products_scraped=0,
+            products_per_site={"aloe": 0},
+        )
+    )
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=999)  # не отвлекаться на staleness
+    zero = [i for i in rep.issues if i.code == "site_zero_scrape"]
+    assert zero, "Нулевой прогон сайта должен дать site_zero_scrape"
+    assert zero[0].context["site"] == "aloe"
+    assert zero[0].severity == "critical"
+
+
+def test_site_zero_scrape_silent_when_site_has_products(db_session):
+    """Последний прогон сайта собрал товары → нет site_zero_scrape."""
+    base = utcnow()
+    db_session.add(
+        Run(
+            started_at=base - timedelta(hours=1),
+            finished_at=base - timedelta(minutes=58),
+            status="ok",
+            products_scraped=1866,
+            products_per_site={"aloe": 1866},
+        )
+    )
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=999)
+    assert not [i for i in rep.issues if i.code == "site_zero_scrape"]
+
+
+def test_site_zero_scrape_ignores_intraday_partial_of_other_site(db_session):
+    """Intraday-прогон (pharmonline:127) НЕ маскирует и не триггерит zero для aloe:
+    aloe берётся из СВОЕГО последнего прогона (1866), а 127≠0 → нет zero-alerts."""
+    base = utcnow()
+    db_session.add_all(
+        [
+            Run(
+                started_at=base - timedelta(hours=3),
+                finished_at=base - timedelta(hours=2, minutes=58),
+                status="ok",
+                products_scraped=1866,
+                products_per_site={"aloe": 1866},
+            ),
+            Run(
+                started_at=base - timedelta(minutes=10),
+                finished_at=base - timedelta(minutes=8),
+                status="ok",
+                products_scraped=127,
+                products_per_site={"pharmonline": 127},
+            ),
+        ]
+    )
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=999)
+    assert not [i for i in rep.issues if i.code == "site_zero_scrape"]
+
+
+def test_site_zero_scrape_fires_for_zero_under_newer_intraday(db_session):
+    """Точная регрессия 06-11: aloe собрал 0, СВЕРХУ прошёл intraday-прогон
+    другого сайта (pharmonline:127) → zero для aloe ВСЁ РАВНО ловится (intraday
+    не маскирует более старый 0)."""
+    base = utcnow()
+    db_session.add_all(
+        [
+            Run(
+                started_at=base - timedelta(hours=2),
+                finished_at=base - timedelta(hours=1, minutes=58),
+                status="ok",
+                products_scraped=0,
+                products_per_site={"aloe": 0},
+            ),
+            Run(
+                started_at=base - timedelta(minutes=10),
+                finished_at=base - timedelta(minutes=8),
+                status="ok",
+                products_scraped=127,
+                products_per_site={"pharmonline": 127},
+            ),
+        ]
+    )
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=999)
+    zero = [i for i in rep.issues if i.code == "site_zero_scrape" and i.context["site"] == "aloe"]
+    assert zero, "aloe:0 под более новым intraday-прогоном должен всё равно алертить"
+
+
+def test_site_zero_scrape_ignores_in_flight_run(db_session):
+    """Бегущий прогон (finished_at=NULL) с 0 НЕ алертит — берём предыдущий
+    ЗАВЕРШЁННЫЙ прогон (1866)."""
+    base = utcnow()
+    db_session.add_all(
+        [
+            Run(
+                started_at=base - timedelta(minutes=5),
+                finished_at=None,
+                status="running",
+                products_scraped=0,
+                products_per_site={"aloe": 0},
+            ),
+            Run(
+                started_at=base - timedelta(hours=2),
+                finished_at=base - timedelta(hours=1, minutes=58),
+                status="ok",
+                products_scraped=1866,
+                products_per_site={"aloe": 1866},
+            ),
+        ]
+    )
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=999)
+    assert not [i for i in rep.issues if i.code == "site_zero_scrape"]
