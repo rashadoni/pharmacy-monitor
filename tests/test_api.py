@@ -1723,3 +1723,90 @@ def test_match_alternatives_ranks_similar_unmatched(client, tenant_user, setup_d
     # the similar oil ranks first; dissimilar paracetamol is far down or absent
     assert items[0]["product_id"] == good.id
     assert items[0]["score"] >= items[-1]["score"]
+
+
+# ─── Recipients / user management (admin) ────────────────────────────────────
+
+
+def _verify_login(client, session, email):
+    """Magic-link login as `email`; returns the verify response."""
+    token = tenants.issue_magic_token(session, email)
+    return client.get(f"/auth/verify?token={token}")
+
+
+def test_is_last_active_admin_helper(setup_db):
+    """Helper: последний активный админ → True; есть второй активный → False."""
+    s = setup_db
+    t = tenants.get_or_create_default(s)
+    a1 = storage.TenantUser(
+        tenant_id=t.id, email="a1@x.az", role="admin", is_active=True, created_at=utcnow()
+    )
+    s.add(a1)
+    s.commit()
+    s.refresh(a1)
+    assert api_module._is_last_active_admin(s, t.id, exclude_id=a1.id) is True
+    a2 = storage.TenantUser(
+        tenant_id=t.id, email="a2@x.az", role="admin", is_active=True, created_at=utcnow()
+    )
+    s.add(a2)
+    s.commit()
+    assert api_module._is_last_active_admin(s, t.id, exclude_id=a1.id) is False
+    a2.is_active = False
+    s.commit()
+    assert api_module._is_last_active_admin(s, t.id, exclude_id=a1.id) is True
+
+
+def test_recipients_list_requires_admin(client, setup_db):
+    """viewer не может смотреть список получателей (403)."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    s = setup_db
+    t = tenants.get_or_create_default(s)
+    s.add(
+        storage.TenantUser(
+            tenant_id=t.id, email="v@x.az", role="viewer", is_active=True, created_at=utcnow()
+        )
+    )
+    s.commit()
+    assert _verify_login(client, s, "v@x.az").status_code == 200
+    assert client.get("/api/v1/dash/recipients").status_code == 403
+
+
+def test_recipient_create_and_list(client, auth_cookie, setup_db):
+    """admin добавляет получателя — появляется в списке с нужной ролью."""
+    r = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "New@X.az", "name": "New", "role": "viewer", "daily_digest": True},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == "new@x.az"  # нормализован в lowercase
+    assert r.json()["role"] == "viewer"
+    lst = client.get("/api/v1/dash/recipients").json()
+    assert any(u["email"] == "new@x.az" for u in lst)
+
+
+def test_cannot_delete_self(client, auth_cookie, tenant_user):
+    """admin не может удалить себя (self-lockout)."""
+    assert client.delete(f"/api/v1/dash/recipients/{tenant_user.id}").status_code == 400
+
+
+def test_cannot_demote_self_to_viewer(client, auth_cookie, tenant_user):
+    """admin не может понизить себя до viewer."""
+    r = client.patch(f"/api/v1/dash/recipients/{tenant_user.id}", json={"role": "viewer"})
+    assert r.status_code == 400, r.text
+
+
+def test_can_demote_other_admin_when_multiple(client, auth_cookie, tenant_user, setup_db):
+    """С 2+ активными админами понижение ДРУГОГО админа разрешено — last-admin гард
+    НЕ переблокирует легитимное понижение (защита от регрессии over-block)."""
+    s = setup_db
+    t = tenants.get_or_create_default(s)
+    other = storage.TenantUser(
+        tenant_id=t.id, email="admin2@x.az", role="admin", is_active=True, created_at=utcnow()
+    )
+    s.add(other)
+    s.commit()
+    s.refresh(other)
+    r = client.patch(f"/api/v1/dash/recipients/{other.id}", json={"role": "viewer"})
+    assert r.status_code == 200, r.text
+    assert r.json()["role"] == "viewer"

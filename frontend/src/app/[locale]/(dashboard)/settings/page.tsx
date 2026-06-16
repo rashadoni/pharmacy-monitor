@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import Link from "next/link";
-import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, MessageCircle, Send, User, XCircle, Zap } from "lucide-react";
+import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, MessageCircle, Send, User, Users, XCircle, Zap } from "lucide-react";
 import { useState } from "react";
 import { api, type NotifPrefs } from "@/lib/api";
 import { LocaleSwitcher } from "@/components/locale-switcher";
@@ -61,6 +61,21 @@ export default function SettingsPage() {
           <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground" />
         </Link>
       </Section>
+
+      {meQ.data?.role === "admin" && (
+        <Section title={t("users_section_title")} icon={Users}>
+          <Link
+            href="/settings/users"
+            className="flex items-center justify-between rounded-md border border-border p-3 hover:bg-secondary/50 transition-colors group"
+          >
+            <div>
+              <div className="font-medium text-sm">{t("users_link_label")}</div>
+              <div className="text-xs text-muted-foreground mt-0.5">{t("users_link_hint")}</div>
+            </div>
+            <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground" />
+          </Link>
+        </Section>
+      )}
 
       <Section title={t("language")} icon={Globe}>
         <LocaleSwitcher />

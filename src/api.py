@@ -1216,6 +1216,26 @@ def _require_admin(user: storage.TenantUser) -> None:
         raise HTTPException(403, "Admin role required")
 
 
+def _is_last_active_admin(db: Session, tenant_id: int, exclude_id: int) -> bool:
+    """True если в тенанте НЕТ других активных админов кроме exclude_id.
+
+    Защищает от состояния «0 админов» при demote/deactivate/delete чужого
+    admin-аккаунта (self-lockout гарды покрывают только себя).
+    """
+    others = (
+        db.scalar(
+            select(func.count(storage.TenantUser.id)).where(
+                storage.TenantUser.tenant_id == tenant_id,
+                storage.TenantUser.role == "admin",
+                storage.TenantUser.is_active.is_(True),
+                storage.TenantUser.id != exclude_id,
+            )
+        )
+        or 0
+    )
+    return others == 0
+
+
 def _to_recipient_out(u: storage.TenantUser) -> RecipientOut:
     return RecipientOut(
         id=u.id,
@@ -1310,6 +1330,14 @@ def dash_recipients_update(
             )
         if data.get("is_active") is False:
             raise HTTPException(400, "Нельзя деактивировать себя")
+    # Нельзя оставить тенант без активного администратора (demote/deactivate чужого)
+    if (
+        r.role == "admin"
+        and r.is_active
+        and (data.get("role") == "viewer" or data.get("is_active") is False)
+        and _is_last_active_admin(db, user.tenant_id, r.id)
+    ):
+        raise HTTPException(400, "Нельзя убрать последнего активного администратора")
     for k, v in data.items():
         setattr(r, k, v)
     db.commit()
@@ -1341,6 +1369,8 @@ def dash_recipients_delete(
     )
     if not r:
         raise HTTPException(404, "Recipient not found")
+    if r.role == "admin" and r.is_active and _is_last_active_admin(db, user.tenant_id, r.id):
+        raise HTTPException(400, "Нельзя удалить последнего активного администратора")
     r.is_active = False
     r.daily_digest = False
     r.weekly_digest = False

@@ -42,6 +42,7 @@ const nextConfig = {
       "overview",
       "settings",
       "settings/pricing",
+      "settings/users",
       "watchlist",
     ];
     return [
