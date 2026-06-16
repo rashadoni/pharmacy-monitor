@@ -60,23 +60,24 @@ def test_recent_ok_run_returns_ok(db_session):
 
 
 def test_site_silence_critical_when_one_site_stale(db_session):
-    """Per-site freshness: pharmonline молчит 3 дня, aloe скрейпился час назад.
+    """Per-site freshness: pharmonline молчит 9 дней (>198ч), aloe скрейпился час назад.
 
     `stale_run` смотрит на ПОСЛЕДНИЙ run и пропускает (aloe свежий), но per-site
     silence check должен поймать pharmonline. Реальный сценарий: Mac launchd
-    уснул, aloe на проде продолжает скрейпиться.
+    уснул, aloe на проде продолжает скрейпиться. (pharmonline недельный → порог
+    198ч, поэтому «молчит» = >8 суток, а не 3 дня.)
     """
     # aloe свежий
     aloe_run = _add_run(db_session, utcnow() - timedelta(hours=1))
     _add_snap(db_session, aloe_run, "aloe", 50)
-    # pharmonline старый (3 дня назад)
-    old_pharm_run = _add_run(db_session, utcnow() - timedelta(days=3))
+    # pharmonline молчит 9 дней (> 198ч недельного порога)
+    old_pharm_run = _add_run(db_session, utcnow() - timedelta(days=9))
     _add_snap(
         db_session,
         old_pharm_run,
         "pharmonline",
         50,
-        last_seen_at=utcnow() - timedelta(days=3),
+        last_seen_at=utcnow() - timedelta(days=9),
     )
     db_session.commit()
 
@@ -146,22 +147,90 @@ def test_empty_ok_run_critical(db_session):
 
 
 def test_site_drop_warning(db_session):
-    """Если current site count <50% от медианы — warning."""
+    """Если за окно покрытия видели <50% живого каталога — alert."""
     base = utcnow()
-    # 3 исторических прогона по 100 товаров pharmonline
-    for d in [10, 5, 3]:
-        old = _add_run(db_session, base - timedelta(days=d), products_scraped=100)
-        _add_snap(db_session, old, "pharmonline", 100)
-    # Текущий прогон — только 30 товаров на pharmonline (drop до 30%)
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=30)
-    _add_snap(db_session, cur, "pharmonline", 30)
+    # Живой каталог: 100 товаров, виденных 18 дней назад (в окне свежести 21д,
+    # но ВНЕ окна покрытия 14д) — недавние скрейпы их НЕ переснимали.
+    old = _add_run(db_session, base - timedelta(days=18), products_scraped=100)
+    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=18))
+    # Недавнее покрытие: только 30 товаров за окно покрытия.
+    _add_snap(db_session, cur, "pharmonline", 30, last_seen_at=base - timedelta(hours=1))
     db_session.commit()
 
-    rep = check_health(db_session, history_days=14, site_drop_threshold=0.5)
+    rep = check_health(db_session, site_drop_threshold=0.5)
     drop_issues = [i for i in rep.issues if i.code == "site_drop"]
     assert drop_issues, "Должен быть site_drop issue"
     assert drop_issues[0].context["site"] == "pharmonline"
-    assert drop_issues[0].context["ratio"] < 0.5
+    assert drop_issues[0].context["ratio"] < 0.5  # 30/130 = 23%
+
+
+def test_site_drop_robust_to_partial_intraday_run(db_session):
+    """Частичный intraday-прогон (latest) НЕ роняет метрику.
+
+    Кейс 2026-06-16: pharmonline run_277 = 127 товаров (featured-выборка) был
+    ПОСЛЕДНИМ прогоном; привязка seen к нему дала ложный 127/10333=1% critical.
+    Окно покрытия включает прежний ПОЛНЫЙ прогон → seen считается от него.
+    """
+    base = utcnow()
+    # Полный прогон 2 дня назад: 200 товаров (в окне покрытия 9д).
+    full = _add_run(db_session, base - timedelta(days=2), products_scraped=200)
+    _add_snap(db_session, full, "pharmonline", 200, last_seen_at=base - timedelta(days=2))
+    # Частичный intraday-прогон СЕЙЧАС: всего 5 товаров (latest run).
+    partial = _add_run(db_session, base - timedelta(minutes=10), products_scraped=5)
+    _add_snap(db_session, partial, "pharmonline", 5, last_seen_at=base - timedelta(minutes=10))
+    db_session.commit()
+
+    rep = check_health(db_session, site_drop_threshold=0.5)
+    drop = [i for i in rep.issues if i.code == "site_drop"]
+    # seen(14д)=205 (200 полного + 5 частичного), total(21д)=205 → 100%, без ложного drop
+    assert not drop, "Частичный intraday-прогон не должен давать ложный site_drop"
+
+
+def test_site_drop_tolerates_slightly_late_weekly_run(db_session):
+    """Слегка опоздавший недельный прогон (в пределах окна покрытия 14д) — не drop.
+
+    Закрепляет выбор окна покрытия (14д > 7д каденции + запас): полный прогон
+    10 дней назад ещё в окне → seen считается от него, даже если поверх идёт
+    мелкий intraday-прогон. Реальный дроп (полный прогон СТАРШЕ 14д) ловит
+    test_site_drop_warning; полный отказ скрейпа ловит site_silent.
+    """
+    base = utcnow()
+    # Полный недельный прогон 10 дней назад (опоздал, но в окне покрытия 14д).
+    full = _add_run(db_session, base - timedelta(days=10), products_scraped=200)
+    _add_snap(db_session, full, "pharmonline", 200, last_seen_at=base - timedelta(days=10))
+    # Мелкий intraday сейчас.
+    cur = _add_run(db_session, base - timedelta(minutes=5), products_scraped=3)
+    _add_snap(db_session, cur, "pharmonline", 3, last_seen_at=base - timedelta(minutes=5))
+    db_session.commit()
+
+    rep = check_health(db_session, site_drop_threshold=0.5)
+    drop = [i for i in rep.issues if i.code == "site_drop"]
+    # seen(14д)=203, total(21д)=203 → 100%
+    assert not drop, "Опоздавший недельный прогон в пределах окна не должен давать drop"
+
+
+def test_site_drop_excludes_stale_orphans_from_denominator(db_session):
+    """Осиротевшие ряды (last_seen за окном свежести) НЕ входят в знаменатель.
+
+    Регрессия 2026-06-16: pharmonline показывал 49% (9840/19811 — все ряды),
+    т.к. в total попадали ~9.8K Playwright-дублей при живом каталоге ~9951.
+    Freshness-окно (21д для pharmonline) исключает ряды старше окна → ratio
+    считается от живого каталога, и ложного site_drop нет.
+    """
+    base = utcnow()
+    # Текущий прогон видит 100 «живых» товаров
+    cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=100)
+    _add_snap(db_session, cur, "pharmonline", 100, last_seen_at=base - timedelta(hours=1))
+    # Старый прогон оставил 200 осиротевших рядов, не виденных 40 дней (> окна 21д)
+    old = _add_run(db_session, base - timedelta(days=40), products_scraped=200)
+    _add_snap(db_session, old, "pharmonline", 200, last_seen_at=base - timedelta(days=40))
+    db_session.commit()
+
+    rep = check_health(db_session, site_drop_threshold=0.5)
+    drop = [i for i in rep.issues if i.code == "site_drop"]
+    # Без фикса было бы 100/300=33% → critical; с freshness-окном 100/100=100%
+    assert not drop, "Старые орфаны не должны раздувать знаменатель → нет site_drop"
 
 
 def test_zero_prices_critical(db_session):
@@ -256,24 +325,25 @@ def test_brand_coverage_loss_critical(db_session):
 
 def test_site_drop_below_20_percent_critical(db_session):
     base = utcnow()
-    for d in [10, 5, 3]:
-        old = _add_run(db_session, base - timedelta(days=d), products_scraped=100)
-        _add_snap(db_session, old, "pharmonline", 100)
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=10)
-    _add_snap(db_session, cur, "pharmonline", 10)  # 10% от медианы
+    # Каталог 100 виден 18 дней назад (вне окна покрытия), недавно — лишь 10.
+    old = _add_run(db_session, base - timedelta(days=18), products_scraped=100)
+    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=18))
+    _add_snap(db_session, cur, "pharmonline", 10, last_seen_at=base - timedelta(hours=1))
     db_session.commit()
 
-    rep = check_health(db_session, history_days=14, site_drop_threshold=0.5)
+    rep = check_health(db_session, site_drop_threshold=0.5)
     drop_issues = [i for i in rep.issues if i.code == "site_drop"]
+    # seen(9д)=10, total(21д)=110 → 9% → critical
     assert any(i.severity == "critical" for i in drop_issues)
 
 
 def test_site_drop_skips_sites_not_in_latest_run(db_session):
-    """Прогоны по-сайтно: последний run скрейпил ТОЛЬКО pharmonline. aptek/aloe с
-    last_seen из своих ПРЕЖНИХ прогонов (seen=0 относительно pharmonline-run) НЕ
-    должны ложно флагаться site_drop — это «не в этом прогоне» (staleness ловит
-    site_silent), а не «упал». Регрессия: при per-site runs site_drop ложно бил
-    2 из 3 сайтов на каждом прогоне.
+    """Прогоны по-сайтно: последний run скрейпил ТОЛЬКО pharmonline. aptek/aloe
+    с last_seen из своих ПРЕЖНИХ прогонов (но в пределах своих окон покрытия) НЕ
+    должны ложно флагаться site_drop — каждый сайт меряется по СВОЕМУ окну, а не
+    по тому, был ли он в последнем прогоне. Регрессия: при per-site runs site_drop
+    ложно бил 2 из 3 сайтов на каждом прогоне.
     """
     base = utcnow()
     # aptek и aloe скрейпились РАНЬШЕ (свои отдельные прогоны), каталог полный

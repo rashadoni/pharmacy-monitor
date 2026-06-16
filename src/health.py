@@ -7,7 +7,7 @@
 1. **Stale**: последний успешный run был >max_age_hours назад
 2. **Failed**: последний run завершился со status='failed'
 3. **Empty**: последний run ok но < min_products (полностью пустой)
-4. **Site-drop**: какой-то сайт спарсил <50% от baseline (медианы за 7 дней)
+4. **Site-drop**: сайт покрыл <50% живого каталога за окно покрытия
 """
 
 from __future__ import annotations
@@ -54,8 +54,7 @@ def check_health(
     *,
     max_age_hours: int = 26,  # с запасом за суточный cron + jitter
     min_products: int = 1,
-    site_drop_threshold: float = 0.5,  # 50% от медианы
-    history_days: int = 7,
+    site_drop_threshold: float = 0.5,  # порог: доля живого каталога за окно покрытия
 ) -> HealthReport:
     """Запустить все проверки и вернуть совокупный отчёт."""
     report = HealthReport(status="ok")
@@ -113,11 +112,9 @@ def check_health(
             )
         )
 
-    # 4. Site-drop check (сравниваем с медианой за history_days)
+    # 4. Site-drop check — доля живого каталога, покрытая за окно (см. _check_site_drops)
     if last_run.status == "ok":
-        report.issues.extend(
-            _check_site_drops(session, last_run.id, site_drop_threshold, history_days)
-        )
+        report.issues.extend(_check_site_drops(session, last_run.id, site_drop_threshold))
         # 5. Sanity: цены не должны быть все нулевыми / NaN
         report.issues.extend(_check_zero_prices(session, last_run.id))
         # 6. Brand-coverage drop (если предыдущий имел brand'ы, а сейчас нет — алерт)
@@ -139,23 +136,48 @@ def check_health(
     return report
 
 
+_SITE_FRESHNESS_DAYS: dict[str, int] = {
+    "pharmonline": 21,  # недельный таймер → ~3 цикла
+    "aptekonline": 21,  # недельный таймер
+    "aloe": 10,  # ежедневный → запас на простой
+}
+_DEFAULT_FRESHNESS_DAYS = 21
+
+# Окно ПОКРЫТИЯ для числителя site_drop: сколько РАЗНЫХ товаров сайта видели за
+# последние N дней (≥ один полный цикл скрейпа + запас). Берём окно, а НЕ
+# буквальный последний прогон — последним бывает ЧАСТИЧНЫЙ intraday-прогон
+# (pharmonline run_277 = 127 товаров featured-выборки), тогда seen=127/каталог
+# дал бы ложный site_drop. Окно включает последний ПОЛНЫЙ прогон → одиночный
+# частичный прогон метрику не роняет. Должно быть < _SITE_FRESHNESS_DAYS.
+_SITE_COVERAGE_DAYS: dict[str, int] = {
+    "pharmonline": 14,  # недельный цикл (7д) + запас на слип/пропуск одного прогона
+    "aptekonline": 14,  # недельный цикл + запас
+    "aloe": 4,  # дневной цикл + запас
+}
+_DEFAULT_COVERAGE_DAYS = 14
+
+
 def _check_site_drops(
     session: Session,
     last_run_id: int,
     threshold: float,
-    history_days: int,
 ) -> list[HealthIssue]:
-    """Для каждого сайта — сколько ИЗ КАТАЛОГА увидели в этом прогоне.
+    """Per-site: какую долю ЖИВОГО каталога покрыли НЕДАВНИЕ скрейпы.
 
-    Diff-only-aware (2026-05-09): после оптимизации persist'а snapshot
-    пишется только при изменении цены. Раньше считали `COUNT(snapshots)`
-    per (run, site), что после diff-only стало = «продукты с изменением
-    цены на этом сайте сегодня», не «увиденные на этом сайте сегодня»
-    (последнее обычно ~1000, первое ~30).
+    ЧИСЛИТЕЛЬ `seen` = distinct товаров сайта, виденных за окно ПОКРЫТИЯ
+    (`_SITE_COVERAGE_DAYS`, ≥ один цикл скрейпа) — а НЕ за буквальный последний
+    прогон: последним бывает ЧАСТИЧНЫЙ intraday-прогон (pharmonline run_277 =
+    127 товаров featured-выборки), и `seen=127` дал бы ложный site_drop. Окно
+    покрытия включает последний ПОЛНЫЙ прогон → одиночный частичный прогон
+    метрику не роняет.
 
-    Корректная метрика: `Product.last_seen_at >= run.started_at` per site.
-    Сравниваем с total products per site (известный каталог). Если видимо
-    < threshold доли каталога — alert.
+    ЗНАМЕНАТЕЛЬ `total` = ЖИВОЙ каталог (виден за `_SITE_FRESHNESS_DAYS`), а НЕ
+    весь накопленный total: «мёртвые» ряды (делистинг, ротация, осиротевшие дубли
+    другого скрейпера с иным external_id) иначе занижают ratio.
+
+    Реальные кейсы (2026-06-16): (1) pharmonline 9840/19811=49% из-за ~9.8K
+    Playwright-дублей при живом каталоге ~9951; (2) после их чистки — 127/10333=1%
+    из-за частичного run_277. Окно покрытия (14д) + свежести (21д) → ~99%.
     """
     sites = ["pharmonline", "aptekonline", "aloe"]
     issues: list[HealthIssue] = []
@@ -168,35 +190,40 @@ def _check_site_drops(
     if last_run.finished_at is None:
         return []
 
+    now = utcnow()
     for site in sites:
+        # Знаменатель = живой каталог за окно свежести (см. docstring).
+        fresh_cutoff = now - timedelta(days=_SITE_FRESHNESS_DAYS.get(site, _DEFAULT_FRESHNESS_DAYS))
         total = (
-            session.scalar(select(func.count()).select_from(Product).where(Product.site == site))
+            session.scalar(
+                select(func.count())
+                .select_from(Product)
+                .where(Product.site == site, Product.last_seen_at >= fresh_cutoff)
+            )
             or 0
         )
         if total < 10:
-            continue  # сайт ещё не наполнен — не на чем сравнивать
+            continue  # сайт ещё не наполнен / давно молчит — не на чем сравнивать
 
-        # Видимы в этом прогоне: last_seen_at >= run.started_at. Verхняя
-        # граница не ставится: check_health всегда вызывается для ПОСЛЕДНЕГО
-        # run'а, более новых ещё нет, поэтому overestimate невозможен.
+        # Числитель = distinct товаров, виденных за окно ПОКРЫТИЯ (не за один
+        # последний прогон — он бывает частичным intraday, см. docstring).
+        cover_cutoff = now - timedelta(days=_SITE_COVERAGE_DAYS.get(site, _DEFAULT_COVERAGE_DAYS))
         seen = (
             session.scalar(
                 select(func.count())
                 .select_from(Product)
                 .where(
                     Product.site == site,
-                    Product.last_seen_at >= last_run.started_at,
+                    Product.last_seen_at >= cover_cutoff,
                 )
             )
             or 0
         )
 
         if seen == 0:
-            # Сайт НЕ входил в этот прогон. Прогоны у нас по-сайтно (aptek/aloe/
-            # pharmonline — ОТДЕЛЬНЫЕ runs), поэтому сайты не из last_run всегда
-            # дают seen=0 → раньше site_drop ложно срабатывал для 2 из 3 сайтов
-            # КАЖДЫЙ прогон. «Не скрейпился» это staleness → ловит site_silent
-            # (per-site порог), а не этот чек (он про «скрейпился, но недобрал»).
+            # Сайт не скрейпился ни разу за окно покрытия → это staleness, ловит
+            # site_silent (per-site порог), а не этот чек (он про «скрейпился,
+            # но недобрал каталог»).
             continue
 
         ratio = seen / total
@@ -205,8 +232,8 @@ def _check_site_drops(
                 HealthIssue(
                     "warning" if ratio > 0.2 else "critical",
                     "site_drop",
-                    f"Сайт {site}: увидели {seen}/{total} товаров каталога "
-                    f"({ratio * 100:.0f}%). Порог: {threshold * 100:.0f}%. "
+                    f"Сайт {site}: за окно покрытия видели {seen}/{total} живого "
+                    f"каталога ({ratio * 100:.0f}%). Порог: {threshold * 100:.0f}%. "
                     f"Возможно сменилась вёрстка или сайт лежал.",
                     context={
                         "site": site,
@@ -343,6 +370,10 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
 # pharmonline last_seen (DR-фоллбэк ещё включён), поэтому суточные 26ч корректны.
 _SITE_MAX_AGE_HOURS: dict[str, int] = {
     "aptekonline": 8 * 24 + 6,  # 198ч = 8 суток + 6ч jitter (недельный таймер)
+    # pharmonline тоже недельный таймер (Mon 01:00). Без этого override default
+    # 26ч давал бы ложный site_silent 6 из 7 дней, как только Mac-DR-фолбэк
+    # (ежедневно освежающий pharmonline) будет отключён. Инертен пока Mac жив.
+    "pharmonline": 8 * 24 + 6,
 }
 
 
