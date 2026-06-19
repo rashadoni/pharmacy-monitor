@@ -1,9 +1,8 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
-import Link from "next/link";
+import { Link, useRouter } from "@/i18n/navigation";
 import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, MessageCircle, Send, User, Users, XCircle, Zap } from "lucide-react";
 import { useState } from "react";
 import { api, type NotifPrefs } from "@/lib/api";

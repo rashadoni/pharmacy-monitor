@@ -12,7 +12,7 @@
  * - CTA: Перейти в Настройки → /settings
  */
 
-import Link from "next/link";
+import { Link } from "@/i18n/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Bell, X } from "lucide-react";

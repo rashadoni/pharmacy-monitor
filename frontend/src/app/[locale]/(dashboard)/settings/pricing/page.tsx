@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslations } from "next-intl";
-import Link from "next/link";
+import { Link } from "@/i18n/navigation";
 import { useState, useEffect, useRef } from "react";
 import { Save, Upload, CheckCircle2, AlertCircle, ArrowLeft } from "lucide-react";
 
