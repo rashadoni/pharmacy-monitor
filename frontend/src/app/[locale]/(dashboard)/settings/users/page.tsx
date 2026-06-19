@@ -2,9 +2,9 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslations } from "next-intl";
-import Link from "next/link";
+import { Link } from "@/i18n/navigation";
 import { useState } from "react";
-import { ArrowLeft, Clock, Trash2, UserPlus } from "lucide-react";
+import { ArrowLeft, Clock, Send, Trash2, UserPlus } from "lucide-react";
 import { api, type Recipient, type RecipientCreate, type RecipientUpdate } from "@/lib/api";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
@@ -219,6 +219,9 @@ function UserCard({
   onDelete: () => void;
 }) {
   const t = useTranslations("users");
+  const sendLinkMut = useMutation({
+    mutationFn: () => api.recipientSendLoginLink(u.id),
+  });
   return (
     <div
       className={`rounded-lg border p-4 ${
@@ -293,6 +296,23 @@ function UserCard({
           disabled={isSelf}
           onChange={(is_active) => onUpdate({ is_active })}
         />
+        <div className="ml-auto flex items-center gap-2">
+          {sendLinkMut.isSuccess && (
+            <span className="text-[11px] text-success">{t("login_link_sent")}</span>
+          )}
+          {sendLinkMut.isError && (
+            <span className="text-[11px] text-destructive">{t("login_link_error")}</span>
+          )}
+          <button
+            onClick={() => sendLinkMut.mutate()}
+            disabled={!u.is_active || sendLinkMut.isPending}
+            title={u.is_active ? t("send_login_link_hint") : t("send_login_link_inactive")}
+            className="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Send className="h-3.5 w-3.5" />
+            {sendLinkMut.isPending ? t("login_link_sending") : t("send_login_link")}
+          </button>
+        </div>
       </div>
     </div>
   );

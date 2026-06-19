@@ -738,6 +738,11 @@ export const api = {
     }),
   recipientDelete: (id: number) =>
     request<void>(`/api/v1/dash/recipients/${id}`, { method: "DELETE" }),
+  recipientSendLoginLink: (id: number) =>
+    request<{ ok: boolean; email: string }>(
+      `/api/v1/dash/recipients/${id}/send-login-link`,
+      { method: "POST" },
+    ),
   brandShare: (params: { top_n?: number; site?: string } = {}) => {
     const q = new URLSearchParams();
     q.set("top_n", String(params.top_n ?? 30));

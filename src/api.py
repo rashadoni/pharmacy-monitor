@@ -598,30 +598,59 @@ def health_endpoint(db: Session = Depends(get_db)):
 # ─── Auth endpoints (frontend) ───────────────────────────────────────────────
 
 
+def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
+    """Выпустить magic-token для email и отправить ссылку на вход. Best-effort.
+
+    Возвращает True, если активный пользователь с таким email найден (токен
+    выпущен, попытка отправки сделана), False — если такого активного юзера нет
+    (issue_magic_token вернул None). Сбой SMTP логируется, но НЕ пробрасывается:
+    создание/инвайт пользователя не должно падать из-за временной проблемы с
+    почтой (fail-open). `invite=True` — приветственная формулировка письма.
+    """
+    token = tenants.issue_magic_token(db, email)
+    if not token:
+        return False
+    public_url = os.environ.get("PHARMACY_PUBLIC_URL", "http://localhost:3000")
+    link = f"{public_url}/auth/verify?token={token}"
+    if invite:
+        subject = "Pharmacy Monitor — giriş üçün dəvət / приглашение"
+        intro = (
+            "<p>Sizə Pharmacy Monitor monitorinq paneli üçün giriş açıldı. "
+            "Daxil olmaq üçün aşağıdakı keçidə klikləyin (30 dəqiqə qüvvədədir):</p>"
+            "<p>Вам открыт доступ к панели Pharmacy Monitor. Нажмите ссылку ниже, "
+            "чтобы войти (действует 30 минут):</p>"
+        )
+    else:
+        subject = "Pharmacy Monitor — giriş keçidi / ссылка для входа"
+        intro = (
+            "<p>Daxil olmaq üçün keçid (30 dəqiqə qüvvədədir):</p>"
+            "<p>Ссылка для входа (действует 30 минут):</p>"
+        )
+    try:
+        from src import notifier
+
+        notifier.send_email(
+            subject=subject,
+            html_body=(
+                f"{intro}"
+                f"<p><a href='{link}'>{link}</a></p>"
+                f"<p>Əgər bunu siz tələb etməmisinizsə, məktubu nəzərə almayın. "
+                f"Если вы этого не запрашивали — просто проигнорируйте письмо.</p>"
+            ),
+            to=[email],
+        )
+    except Exception as e:
+        log.warning("login_link_email_failed", error=str(e), email=email)
+    return True
+
+
 @app.post("/auth/request", response_model=AuthRequestOut)
 def auth_request(payload: AuthRequestIn, request: Request, db: Session = Depends(get_db)):
     """Request a magic-link by email. Always returns success to avoid email enumeration."""
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(f"auth_req:{client_ip}", limit=5)
 
-    token = tenants.issue_magic_token(db, str(payload.email))
-    if token:
-        public_url = os.environ.get("PHARMACY_PUBLIC_URL", "http://localhost:3000")
-        link = f"{public_url}/auth/verify?token={token}"
-        try:
-            from src import notifier
-
-            notifier.send_email(
-                subject="Pharmacy Monitor — magic link",
-                html_body=(
-                    f"<p>Click the link below to sign in (expires in 30 minutes):</p>"
-                    f"<p><a href='{link}'>{link}</a></p>"
-                    f"<p>If you didn't request this, ignore this email.</p>"
-                ),
-                to=[str(payload.email)],
-            )
-        except Exception as e:
-            log.warning("magic_link_email_failed", error=str(e))
+    _send_login_link(db, str(payload.email).strip().lower())
     # Always return success (don't leak whether email exists)
     return AuthRequestOut(sent=True, detail="If the email is registered, a magic-link was sent.")
 
@@ -1296,11 +1325,16 @@ def dash_recipients_create(
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
+    # Авто-инвайт: новый юзер получает magic-link на вход сразу (без него у
+    # него нет способа залогиниться — общий пароль логинит как админа, а формы
+    # запроса ссылки в UI нет). Best-effort: сбой почты не валит создание.
+    invite_sent = _send_login_link(db, new_user.email, invite=True)
     log.info(
         "recipient_created",
         id=new_user.id,
         email=new_user.email,
         by_user_id=user.id,
+        invite_sent=invite_sent,
     )
     return _to_recipient_out(new_user)
 
@@ -1377,6 +1411,34 @@ def dash_recipients_delete(
     db.commit()
     log.info("recipient_deleted", id=r.id, by_user_id=user.id)
     return Response(status_code=204)
+
+
+@app.post("/api/v1/dash/recipients/{recipient_id}/send-login-link")
+def dash_recipients_send_login_link(
+    recipient_id: int,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Повторно отправить пользователю magic-link на вход (admin-only).
+
+    В отличие от публичного /auth/request (анти-enumeration → всегда 200), этот
+    эндпоинт admin-only, поэтому может честно вернуть 404/400 — утечки наличия
+    email тут нет.
+    """
+    _require_admin(user)
+    r = db.scalar(
+        select(storage.TenantUser).where(
+            storage.TenantUser.id == recipient_id,
+            storage.TenantUser.tenant_id == user.tenant_id,
+        )
+    )
+    if not r:
+        raise HTTPException(404, "Recipient not found")
+    if not r.is_active:
+        raise HTTPException(400, "Пользователь деактивирован — сначала активируйте его")
+    _send_login_link(db, r.email, invite=False)
+    log.info("recipient_login_link_sent", id=r.id, by_user_id=user.id)
+    return {"ok": True, "email": r.email}
 
 
 # ─── Frontend dashboard endpoints (JWT cookie) ───────────────────────────────

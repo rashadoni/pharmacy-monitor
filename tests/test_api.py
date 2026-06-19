@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from src import api as api_module
@@ -1810,3 +1811,69 @@ def test_can_demote_other_admin_when_multiple(client, auth_cookie, tenant_user, 
     r = client.patch(f"/api/v1/dash/recipients/{other.id}", json={"role": "viewer"})
     assert r.status_code == 200, r.text
     assert r.json()["role"] == "viewer"
+
+
+def test_recipient_create_issues_login_token(client, auth_cookie, setup_db):
+    """Создание юзера авто-выпускает magic-token (инвайт-письмо). Без SMTP в
+    тест-окружении письмо — no-op, но токен должен быть выпущен в БД."""
+    r = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "invite@x.az", "name": "Inv", "role": "viewer"},
+    )
+    assert r.status_code == 200, r.text
+    u = setup_db.scalar(select(storage.TenantUser).where(storage.TenantUser.email == "invite@x.az"))
+    assert u is not None
+    assert u.magic_token is not None  # инвайт выпустил токен на вход
+    assert u.magic_token_expires_at is not None
+
+
+def test_send_login_link_requires_admin(client, setup_db):
+    """viewer не может слать login-link (403)."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    s = setup_db
+    t = tenants.get_or_create_default(s)
+    s.add(
+        storage.TenantUser(
+            tenant_id=t.id, email="vv@x.az", role="viewer", is_active=True, created_at=utcnow()
+        )
+    )
+    s.commit()
+    assert _verify_login(client, s, "vv@x.az").status_code == 200
+    target = s.scalar(select(storage.TenantUser).where(storage.TenantUser.email == "vv@x.az"))
+    assert client.post(f"/api/v1/dash/recipients/{target.id}/send-login-link").status_code == 403
+
+
+def test_send_login_link_ok(client, auth_cookie, setup_db):
+    """admin шлёт login-link активному юзеру → 200 + выпущен свежий токен."""
+    s = setup_db
+    t = tenants.get_or_create_default(s)
+    u = storage.TenantUser(
+        tenant_id=t.id, email="reuse@x.az", role="viewer", is_active=True, created_at=utcnow()
+    )
+    s.add(u)
+    s.commit()
+    s.refresh(u)
+    r = client.post(f"/api/v1/dash/recipients/{u.id}/send-login-link")
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == "reuse@x.az"
+    s.refresh(u)
+    assert u.magic_token is not None
+
+
+def test_send_login_link_404(client, auth_cookie):
+    """Несуществующий получатель → 404."""
+    assert client.post("/api/v1/dash/recipients/999999/send-login-link").status_code == 404
+
+
+def test_send_login_link_inactive_400(client, auth_cookie, setup_db):
+    """Деактивированному юзеру ссылку не шлём (400)."""
+    s = setup_db
+    t = tenants.get_or_create_default(s)
+    u = storage.TenantUser(
+        tenant_id=t.id, email="off@x.az", role="viewer", is_active=False, created_at=utcnow()
+    )
+    s.add(u)
+    s.commit()
+    s.refresh(u)
+    assert client.post(f"/api/v1/dash/recipients/{u.id}/send-login-link").status_code == 400
