@@ -154,7 +154,9 @@ def verify_magic_token(session: Session, token: str) -> TenantUser | None:
     """Проверить токен. Если валиден — отметить last_login_at, обнулить токен, вернуть user."""
     if not token:
         return None
-    u = session.scalar(select(TenantUser).where(TenantUser.magic_token == token))
+    u = session.scalar(
+        select(TenantUser).where(TenantUser.magic_token == token, TenantUser.is_active.is_(True))
+    )
     if not u:
         return None
     if u.magic_token_expires_at and u.magic_token_expires_at < utcnow():

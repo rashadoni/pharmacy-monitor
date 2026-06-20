@@ -51,6 +51,20 @@
     "login_submit": "Daxil ol",
     "login_error": "Giriş xətası"
   },
+  "set_password": {
+    "title": "Parol yaradın",
+    "subtitle": "Pharmacy Monitor-a giriş üçün parol seçin",
+    "password_label": "Yeni parol",
+    "confirm_label": "Parolu təkrarlayın",
+    "submit": "Yadda saxla və daxil ol",
+    "loading": "Saxlanılır…",
+    "error_mismatch": "Parollar uyğun gəlmir",
+    "error_short": "Ən azı 6 simvol",
+    "error_invalid": "Link yararsız və ya müddəti bitib",
+    "error_generic": "Parolu saxlamaq alınmadı",
+    "token_missing": "Linkdə token yoxdur",
+    "request_new": "Yeni link tələb edin"
+  },
   "comparison": {
     "title": "🔍 Qiymət müqayisəsi",
     "subtitle": "3 saytda eyni məhsul. Yaşıl — ən aşağı qiymət, qırmızı — ən yüksək.",

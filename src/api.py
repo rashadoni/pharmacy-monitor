@@ -72,6 +72,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session, selectinload
@@ -387,10 +388,11 @@ class AuthRequestIn(BaseModel):
 
 
 class PasswordLoginIn(BaseModel):
-    """Simple password-based login (single shared admin password).
+    """Password-based login.
 
-    Validates the password against `ADMIN_PASSWORD_HASH` env var (bcrypt).
-    Issues a JWT cookie tied to the first active admin user in the DB.
+    `login` — либо env ADMIN_LOGIN ("admin", bootstrap-админ), либо email
+    конкретного пользователя. Пароль проверяется против user.password_hash
+    (для админа — fallback на env ADMIN_PASSWORD_HASH). См. auth_login.
     """
 
     login: str
@@ -598,29 +600,60 @@ def health_endpoint(db: Session = Depends(get_db)):
 # ─── Auth endpoints (frontend) ───────────────────────────────────────────────
 
 
+def _wants_html(request: Request) -> bool:
+    """True, если запрос — навигация браузера (Accept содержит text/html).
+
+    Используется для content-negotiation: браузер по клику из письма должен
+    получить redirect на дашборд, а программные/XHR-вызовы (Accept */*) —
+    привычный JSON-контракт.
+    """
+    return "text/html" in request.headers.get("accept", "").lower()
+
+
 def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     """Выпустить magic-token для email и отправить ссылку на вход. Best-effort.
 
     Возвращает True, если активный пользователь с таким email найден (токен
-    выпущен, попытка отправки сделана), False — если такого активного юзера нет
-    (issue_magic_token вернул None). Сбой SMTP логируется, но НЕ пробрасывается:
-    создание/инвайт пользователя не должно падать из-за временной проблемы с
-    почтой (fail-open). `invite=True` — приветственная формулировка письма.
+    выпущен, попытка отправки сделана), False — если такого активного юзера нет.
+    Сбой SMTP логируется, но НЕ пробрасывается: создание/инвайт пользователя не
+    должно падать из-за временной проблемы с почтой (fail-open).
+
+    Цель ссылки выбирается по тому, есть ли у пользователя свой пароль:
+    - нет пароля (`password_hash` пуст) → `/set-password` — юзер задаёт пароль и
+      сразу входит. Дальше логинится по email+паролю в любой момент.
+    - есть пароль → `/auth/verify` — magic-link просто логинит (passwordless вход).
+    `invite=True` — приветственная формулировка письма (новый пользователь).
     """
+    email = email.strip().lower()
+    user = db.scalar(
+        select(storage.TenantUser).where(
+            storage.TenantUser.email == email,
+            storage.TenantUser.is_active.is_(True),
+        )
+    )
+    if not user:
+        return False
     token = tenants.issue_magic_token(db, email)
     if not token:
         return False
+    needs_password = not user.password_hash
     public_url = os.environ.get("PHARMACY_PUBLIC_URL", "http://localhost:3000")
-    link = f"{public_url}/auth/verify?token={token}"
-    if invite:
-        subject = "Pharmacy Monitor — giriş üçün dəvət / приглашение"
+    if needs_password:
+        link = f"{public_url}/set-password?token={token}"
+        welcome = (
+            "<p>Sizə Pharmacy Monitor monitorinq paneli üçün giriş açıldı.</p>"
+            "<p>Вам открыт доступ к панели Pharmacy Monitor.</p>"
+            if invite
+            else ""
+        )
+        subject = "Pharmacy Monitor — parol yaradın / создайте пароль"
         intro = (
-            "<p>Sizə Pharmacy Monitor monitorinq paneli üçün giriş açıldı. "
-            "Daxil olmaq üçün aşağıdakı keçidə klikləyin (30 dəqiqə qüvvədədir):</p>"
-            "<p>Вам открыт доступ к панели Pharmacy Monitor. Нажмите ссылку ниже, "
-            "чтобы войти (действует 30 минут):</p>"
+            f"{welcome}"
+            "<p>Daxil olmaq üçün parol təyin edin (keçid 30 dəqiqə qüvvədədir):</p>"
+            "<p>Задайте пароль для входа (ссылка действует 30 минут):</p>"
         )
     else:
+        link = f"{public_url}/auth/verify?token={token}"
         subject = "Pharmacy Monitor — giriş keçidi / ссылка для входа"
         intro = (
             "<p>Daxil olmaq üçün keçid (30 dəqiqə qüvvədədir):</p>"
@@ -656,13 +689,33 @@ def auth_request(payload: AuthRequestIn, request: Request, db: Session = Depends
 
 
 @app.get("/auth/verify")
-def auth_verify(token: str, response: Response, db: Session = Depends(get_db)):
-    """Verify magic token, set JWT cookie."""
+def auth_verify(token: str, request: Request, response: Response, db: Session = Depends(get_db)):
+    """Verify magic token, set JWT cookie.
+
+    Этот эндпоинт кликают прямо из письма, поэтому для браузера (Accept:
+    text/html) после установки cookie делаем 303-redirect на дашборд — иначе
+    пользователь видел бы сырой JSON. Программные/XHR-вызовы (Accept */*)
+    получают прежний JSON-контракт.
+    """
+    wants_html = _wants_html(request)
     user = tenants.verify_magic_token(db, token)
     if not user:
+        if wants_html:
+            return RedirectResponse(url="/login?error=link", status_code=303)
         raise HTTPException(401, "Invalid or expired token")
     jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
     secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")
+    if wants_html:
+        redirect = RedirectResponse(url="/overview", status_code=303)
+        redirect.set_cookie(
+            key=COOKIE_NAME,
+            value=jwt_token,
+            max_age=JWT_EXPIRY_DAYS * 24 * 3600,
+            httponly=True,
+            secure=secure,
+            samesite="lax",
+        )
+        return redirect
     response.set_cookie(
         key=COOKIE_NAME,
         value=jwt_token,
@@ -698,54 +751,137 @@ def _hash_bcrypt(password: str) -> str:
         return bcrypt_pl.hash(password)
 
 
+# Dummy-хеш для постоянного времени в auth_login (см. там) — bcrypt запускается
+# даже когда у логина нет пароля, чтобы не было timing-оракула энумерации.
+_DUMMY_BCRYPT_HASH = _hash_bcrypt("not-a-real-password-timing-equalizer")
+
+
 @app.post("/auth/login")
 def auth_login(
     payload: PasswordLoginIn, response: Response, request: Request, db: Session = Depends(get_db)
 ):
-    """Password login. DB-first (TenantUser.password_hash), env fallback.
+    """Password login. Вход по email+паролю (любой юзер) или admin-bootstrap.
 
-    Раньше (до 2026-05-11) сравнивал только с ADMIN_LOGIN + ADMIN_PASSWORD_HASH
-    в env. Теперь:
-    1. Находим пользователя по login (= local-part email или env ADMIN_LOGIN).
-    2. Если у user.password_hash есть значение — verify против DB.
-    3. Иначе fallback на env ADMIN_PASSWORD_HASH (bootstrap mode пока клиент
-       не сменил пароль через UI).
+    Два пути резолва пользователя:
+    1. `login` == env ADMIN_LOGIN ("admin") — bootstrap: первый активный админ.
+       Для него разрешён fallback на env ADMIN_PASSWORD_HASH, пока клиент не задал
+       свой пароль через UI.
+    2. иначе `login` трактуется как email — конкретный активный пользователь.
+       Для именованного юзера env-хеш НЕ применяется: войти можно только своим
+       `password_hash` (его задают по ссылке-приглашению /set-password). Это
+       не даёт постороннему войти под чужим email общим админ-паролем.
     """
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(f"login:{client_ip}", limit=10)
 
-    expected_login = os.environ.get("ADMIN_LOGIN", "admin")
-    env_pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
-
-    # Constant-time login compare против env (для backward-compat — login
-    # фиксированный в env, в DB user identifier'ом служит email)
     import hmac
 
-    if not hmac.compare_digest(payload.login.lower(), expected_login.lower()):
+    expected_login = os.environ.get("ADMIN_LOGIN", "admin")
+    env_pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
+    login_raw = payload.login.strip()
+
+    if hmac.compare_digest(login_raw.lower(), expected_login.lower()):
+        # Bootstrap-админ: первый активный АДМИН + допускается env-хеш
+        user = db.scalar(
+            select(storage.TenantUser)
+            .where(
+                storage.TenantUser.is_active.is_(True),
+                storage.TenantUser.role == "admin",
+            )
+            .order_by(storage.TenantUser.id)
+            .limit(1)
+        )
+        if not user:
+            from src import tenants as _tenants
+
+            t = _tenants.get_or_create_default(db)
+            user = _tenants.add_user(db, t.id, "admin@local", name="Admin", role="admin")
+            db.commit()
+        pw_to_check = user.password_hash or env_pw_hash
+    else:
+        # Email-based login для конкретного пользователя — без env-fallback
+        user = db.scalar(
+            select(storage.TenantUser)
+            .where(
+                storage.TenantUser.email == login_raw.lower(),
+                storage.TenantUser.is_active.is_(True),
+            )
+            .order_by(storage.TenantUser.id)
+            .limit(1)
+        )
+        pw_to_check = user.password_hash if user else ""
+
+    # Единообразный 401 (не раскрываем, существует ли логин и задан ли пароль).
+    # bcrypt выполняется ВСЕГДА (против dummy-хеша, если пароля нет) — иначе
+    # разница во времени ответа выдала бы, у какого email задан пароль.
+    pw_ok = _verify_bcrypt(payload.password, pw_to_check or _DUMMY_BCRYPT_HASH)
+    if not user or not pw_to_check or not pw_ok:
         _check_rate_limit(f"login_fail:{client_ip}", limit=5)
         raise HTTPException(401, "Неверный логин или пароль")
 
-    # Find first active admin
-    user = db.scalar(
-        select(storage.TenantUser)
-        .where(storage.TenantUser.is_active.is_(True))
-        .order_by(storage.TenantUser.id)
-        .limit(1)
+    jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
+    secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=jwt_token,
+        max_age=JWT_EXPIRY_DAYS * 24 * 3600,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
     )
+    return {"ok": True, "user_id": user.id, "email": user.email}
+
+
+class SetPasswordIn(BaseModel):
+    """Задать пароль по magic-token из письма-приглашения."""
+
+    token: str
+    new_password: str
+
+    @field_validator("token")
+    @classmethod
+    def _strip_token(cls, v: str) -> str:
+        v = v.strip()
+        if not v or len(v) > 512:
+            raise ValueError("invalid token")
+        return v
+
+    @field_validator("new_password")
+    @classmethod
+    def _check_password(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("Пароль должен быть минимум 6 символов")
+        if len(v) > 200:
+            raise ValueError("too long")
+        return v
+
+
+@app.post("/auth/set-password")
+def auth_set_password(
+    payload: SetPasswordIn, response: Response, request: Request, db: Session = Depends(get_db)
+):
+    """Задать свой пароль по одноразовому magic-token (ссылка-приглашение).
+
+    Проверяет token (одноразовый, TTL 30 мин), сохраняет bcrypt(new_password) в
+    user.password_hash и сразу логинит (ставит JWT cookie). Дальше пользователь
+    входит по email+паролю через /auth/login. Невалидный/просроченный token → 401.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(f"setpw:{client_ip}", limit=10)
+
+    user = tenants.verify_magic_token(db, payload.token)
     if not user:
-        from src import tenants as _tenants
+        _check_rate_limit(f"setpw_fail:{client_ip}", limit=5)
+        raise HTTPException(401, "Ссылка недействительна или истекла")
 
-        t = _tenants.get_or_create_default(db)
-        user = _tenants.add_user(db, t.id, "admin@local", name="Admin", role="admin")
-        db.commit()
+    # Защита от перехвата (Codex MED): set-password только для ПЕРВИЧНОЙ установки.
+    # У юзера с паролем magic-link ведёт на /auth/verify (вход), а не сюда; иначе
+    # перезапись пароля по перехваченной login-ссылке = persistent takeover.
+    if user.password_hash:
+        raise HTTPException(400, "Пароль уже задан — войдите по email и паролю")
 
-    # Verify password: DB-first if set, fallback to env
-    pw_to_check = user.password_hash or env_pw_hash
-    if not pw_to_check:
-        raise HTTPException(503, "Login not configured (no DB hash and no ADMIN_PASSWORD_HASH env)")
-    if not _verify_bcrypt(payload.password, pw_to_check):
-        _check_rate_limit(f"login_fail:{client_ip}", limit=5)
-        raise HTTPException(401, "Неверный логин или пароль")
+    user.password_hash = _hash_bcrypt(payload.new_password)
+    db.commit()
 
     jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
     secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")

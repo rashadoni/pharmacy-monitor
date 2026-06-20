@@ -1877,3 +1877,223 @@ def test_send_login_link_inactive_400(client, auth_cookie, setup_db):
     s.commit()
     s.refresh(u)
     assert client.post(f"/api/v1/dash/recipients/{u.id}/send-login-link").status_code == 400
+
+
+# ─── Set-password flow (invite link → юзер задаёт свой пароль) ───────────────
+
+
+def _make_user(session, email, *, role="viewer", password=None, active=True):
+    t = tenants.get_or_create_default(session)
+    u = storage.TenantUser(
+        tenant_id=t.id, email=email, role=role, is_active=active, created_at=utcnow()
+    )
+    if password:
+        u.password_hash = api_module._hash_bcrypt(password)
+    session.add(u)
+    session.commit()
+    session.refresh(u)
+    return u
+
+
+def test_set_password_valid_token_sets_hash_and_cookie(client, setup_db):
+    """Валидный magic-token → password_hash сохранён, JWT cookie выставлен."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    s = setup_db
+    u = _make_user(s, "newbie@x.az")
+    token = tenants.issue_magic_token(s, "newbie@x.az")
+    r = client.post("/auth/set-password", json={"token": token, "new_password": "mypass123"})
+    assert r.status_code == 200, r.text
+    assert api_module.COOKIE_NAME in r.cookies
+    s.refresh(u)
+    assert u.password_hash
+    assert api_module._verify_bcrypt("mypass123", u.password_hash)
+    assert u.magic_token is None  # одноразовый — погашен
+
+
+def test_set_password_invalid_token_401(client, setup_db):
+    r = client.post(
+        "/auth/set-password", json={"token": "bogus-token", "new_password": "mypass123"}
+    )
+    assert r.status_code == 401
+
+
+def test_set_password_short_password_422(client, setup_db):
+    """Короткий пароль отсекается валидатором модели (422)."""
+    s = setup_db
+    _make_user(s, "shorty@x.az")
+    token = tenants.issue_magic_token(s, "shorty@x.az")
+    r = client.post("/auth/set-password", json={"token": token, "new_password": "ab"})
+    assert r.status_code == 422
+
+
+def test_set_password_token_single_use(client, setup_db):
+    """Повторное использование того же токена → 401 (token погашен)."""
+    s = setup_db
+    _make_user(s, "once@x.az")
+    token = tenants.issue_magic_token(s, "once@x.az")
+    assert (
+        client.post(
+            "/auth/set-password", json={"token": token, "new_password": "mypass123"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/auth/set-password", json={"token": token, "new_password": "other1234"}
+        ).status_code
+        == 401
+    )
+
+
+def test_login_by_email_success(client, setup_db):
+    """Юзер со своим password_hash логинится по email+паролю → JWT того же юзера."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    s = setup_db
+    u = _make_user(s, "emailuser@x.az", password="secret123")
+    r = client.post("/auth/login", json={"login": "emailuser@x.az", "password": "secret123"})
+    assert r.status_code == 200, r.text
+    assert r.json()["user_id"] == u.id
+    assert api_module.COOKIE_NAME in r.cookies
+
+
+def test_login_by_email_wrong_password_401(client, setup_db):
+    s = setup_db
+    _make_user(s, "emailuser2@x.az", password="secret123")
+    r = client.post("/auth/login", json={"login": "emailuser2@x.az", "password": "WRONG"})
+    assert r.status_code == 401
+
+
+def test_login_by_email_no_password_does_not_use_env_hash(client, setup_db, monkeypatch):
+    """SECURITY: именованный юзер БЕЗ своего пароля НЕ логинится общим админ-хешем
+    из env (иначе — эскалация: любой вошёл бы под чужим email)."""
+    s = setup_db
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", api_module._hash_bcrypt("sharedadmin"))
+    _make_user(s, "viewer-nopw@x.az", role="viewer")  # password_hash отсутствует
+    r = client.post("/auth/login", json={"login": "viewer-nopw@x.az", "password": "sharedadmin"})
+    assert r.status_code == 401
+
+
+def test_login_admin_bootstrap_env_hash(client, tenant_user, monkeypatch):
+    """admin-literal + env ADMIN_PASSWORD_HASH (bootstrap) → 200, логинит первого
+    активного админа."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    monkeypatch.setenv("ADMIN_LOGIN", "admin")
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", api_module._hash_bcrypt("adminpw"))
+    r = client.post("/auth/login", json={"login": "admin", "password": "adminpw"})
+    assert r.status_code == 200, r.text
+    assert r.json()["user_id"] == tenant_user.id
+
+
+def test_send_login_link_targets_set_password_for_new_user(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    """Юзер без пароля → письмо ведёт на /set-password (создание пароля)."""
+    captured = {}
+
+    def fake_send_email(*, subject, html_body, to):
+        captured["html"] = html_body
+
+    from src import notifier
+
+    monkeypatch.setattr(notifier, "send_email", fake_send_email)
+    s = setup_db
+    u = _make_user(s, "freshlink@x.az")  # без пароля
+    r = client.post(f"/api/v1/dash/recipients/{u.id}/send-login-link")
+    assert r.status_code == 200, r.text
+    assert "/set-password?token=" in captured["html"]
+    assert "/auth/verify?token=" not in captured["html"]
+
+
+def test_send_login_link_targets_auto_login_for_existing_password(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    """Юзер со своим паролем → письмо — обычный login-link (/auth/verify)."""
+    captured = {}
+
+    def fake_send_email(*, subject, html_body, to):
+        captured["html"] = html_body
+
+    from src import notifier
+
+    monkeypatch.setattr(notifier, "send_email", fake_send_email)
+    s = setup_db
+    u = _make_user(s, "haspw@x.az", password="secret123")
+    r = client.post(f"/api/v1/dash/recipients/{u.id}/send-login-link")
+    assert r.status_code == 200, r.text
+    assert "/auth/verify?token=" in captured["html"]
+    assert "/set-password?token=" not in captured["html"]
+
+
+def test_auth_verify_browser_accept_redirects(client, setup_db):
+    """Браузерная навигация (Accept: text/html) → 303 redirect + cookie, не JSON."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    s = setup_db
+    _make_user(s, "browser@x.az")
+    token = tenants.issue_magic_token(s, "browser@x.az")
+    r = client.get(
+        f"/auth/verify?token={token}",
+        headers={"Accept": "text/html"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert r.headers["location"] == "/overview"
+    assert api_module.COOKIE_NAME in r.cookies
+
+
+def test_auth_verify_browser_invalid_token_redirects_to_login(client, setup_db):
+    """Браузер + битый токен → redirect на /login (не 401-страница)."""
+    r = client.get(
+        "/auth/verify?token=bogus",
+        headers={"Accept": "text/html"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/login")
+
+
+# ─── Codex-review hardening (takeover guard, inactive token, bootstrap role) ──
+
+
+def test_set_password_rejected_when_already_set(client, setup_db):
+    """SECURITY (Codex MED): set-password нельзя использовать для ПЕРЕЗАПИСИ
+    существующего пароля (иначе перехваченная login-ссылка = takeover)."""
+    s = setup_db
+    _make_user(s, "haspw2@x.az", password="orig12345")
+    token = tenants.issue_magic_token(s, "haspw2@x.az")
+    r = client.post("/auth/set-password", json={"token": token, "new_password": "new12345"})
+    assert r.status_code == 400
+    # пароль не изменён
+    u = s.scalar(select(storage.TenantUser).where(storage.TenantUser.email == "haspw2@x.az"))
+    assert api_module._verify_bcrypt("orig12345", u.password_hash)
+
+
+def test_verify_magic_token_rejects_inactive_user(setup_db):
+    """SECURITY (Codex LOW): токен, выпущенный до деактивации, не валиден после."""
+    s = setup_db
+    _make_user(s, "willdisable@x.az")
+    token = tenants.issue_magic_token(s, "willdisable@x.az")
+    assert token is not None
+    u = s.scalar(select(storage.TenantUser).where(storage.TenantUser.email == "willdisable@x.az"))
+    u.is_active = False
+    s.commit()
+    assert tenants.verify_magic_token(s, token) is None
+
+
+def test_login_admin_bootstrap_picks_admin_not_lower_id_viewer(client, setup_db, monkeypatch):
+    """Codex LOW: admin-bootstrap резолвит первого активного АДМИНА, даже если
+    у viewer'а меньший id."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    s = setup_db
+    viewer = _make_user(s, "lowid-viewer@x.az", role="viewer")  # меньший id
+    admin = _make_user(s, "the-admin@x.az", role="admin")  # больший id
+    assert viewer.id < admin.id
+    monkeypatch.setenv("ADMIN_LOGIN", "admin")
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", api_module._hash_bcrypt("adminpw"))
+    r = client.post("/auth/login", json={"login": "admin", "password": "adminpw"})
+    assert r.status_code == 200, r.text
+    assert r.json()["user_id"] == admin.id

@@ -51,6 +51,20 @@
     "login_submit": "Sign in",
     "login_error": "Login error"
   },
+  "set_password": {
+    "title": "Create your password",
+    "subtitle": "Choose a password to sign in to Pharmacy Monitor",
+    "password_label": "New password",
+    "confirm_label": "Confirm password",
+    "submit": "Save and sign in",
+    "loading": "Saving…",
+    "error_mismatch": "Passwords don't match",
+    "error_short": "At least 6 characters",
+    "error_invalid": "Link is invalid or expired",
+    "error_generic": "Couldn't save password",
+    "token_missing": "Token missing in link",
+    "request_new": "Request a new link"
+  },
   "comparison": {
     "title": "🔍 Price comparison",
     "subtitle": "Cross-site matched products. Green — lowest price, red — highest.",

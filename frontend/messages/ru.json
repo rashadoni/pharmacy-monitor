@@ -51,6 +51,20 @@
     "login_submit": "Войти",
     "login_error": "Ошибка входа"
   },
+  "set_password": {
+    "title": "Создание пароля",
+    "subtitle": "Придумайте пароль для входа в Pharmacy Monitor",
+    "password_label": "Новый пароль",
+    "confirm_label": "Повторите пароль",
+    "submit": "Сохранить и войти",
+    "loading": "Сохраняем…",
+    "error_mismatch": "Пароли не совпадают",
+    "error_short": "Минимум 6 символов",
+    "error_invalid": "Ссылка недействительна или истекла",
+    "error_generic": "Не удалось сохранить пароль",
+    "token_missing": "В ссылке нет токена",
+    "request_new": "Запросить новую ссылку"
+  },
   "comparison": {
     "title": "🔍 Сравнение цен",
     "subtitle": "Cross-site matched товары. Зелёным — самая низкая цена, красным — самая высокая.",
