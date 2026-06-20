@@ -1524,10 +1524,21 @@ def dash_recipients_update(
 @app.delete("/api/v1/dash/recipients/{recipient_id}", status_code=204)
 def dash_recipients_delete(
     recipient_id: int,
+    hard: bool = False,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """Soft delete — is_active=false + digest flags off. Лог сохраняется."""
+    """Удаление получателя.
+
+    По умолчанию (`hard=false`) — soft delete: is_active=false + дайджесты off,
+    строка остаётся (история/аудит цел, обратимо галочкой Aktiv).
+
+    `hard=true` — физическое удаление строки. Используется для уже
+    деактивированных юзеров, когда нужно реально освободить email (UI показывает
+    кнопку только у деактивированных). Единственный FK на tenant_users —
+    `scrape_requests.requested_by_user_id` — обнуляется явно ПЕРЕД DELETE, чтобы
+    не упереться в FK независимо от ondelete-настройки на проде.
+    """
     _require_admin(user)
     if recipient_id == user.id:
         raise HTTPException(400, "Нельзя удалить себя")
@@ -1541,6 +1552,20 @@ def dash_recipients_delete(
         raise HTTPException(404, "Recipient not found")
     if r.role == "admin" and r.is_active and _is_last_active_admin(db, user.tenant_id, r.id):
         raise HTTPException(400, "Нельзя удалить последнего активного администратора")
+
+    if hard:
+        from sqlalchemy import update as _update
+
+        db.execute(
+            _update(storage.ScrapeRequest)
+            .where(storage.ScrapeRequest.requested_by_user_id == r.id)
+            .values(requested_by_user_id=None)
+        )
+        db.delete(r)
+        db.commit()
+        log.info("recipient_hard_deleted", id=recipient_id, by_user_id=user.id)
+        return Response(status_code=204)
+
     r.is_active = False
     r.daily_digest = False
     r.weekly_digest = False

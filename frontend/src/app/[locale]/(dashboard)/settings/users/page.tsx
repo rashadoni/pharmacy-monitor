@@ -31,7 +31,7 @@ export default function UsersPage() {
     },
   });
   const deleteMut = useMutation({
-    mutationFn: (id: number) => api.recipientDelete(id),
+    mutationFn: ({ id, hard }: { id: number; hard: boolean }) => api.recipientDelete(id, hard),
     onSuccess: invalidate,
   });
 
@@ -88,7 +88,12 @@ export default function UsersPage() {
                 isSelf={u.id === meQ.data?.id}
                 onUpdate={(patch) => updateMut.mutate({ id: u.id, patch })}
                 onDelete={() => {
-                  if (confirm(t("delete_confirm", { email: u.email }))) deleteMut.mutate(u.id);
+                  if (confirm(t("delete_confirm", { email: u.email })))
+                    deleteMut.mutate({ id: u.id, hard: false });
+                }}
+                onHardDelete={() => {
+                  if (confirm(t("delete_permanently_confirm", { email: u.email })))
+                    deleteMut.mutate({ id: u.id, hard: true });
                 }}
               />
             ))}
@@ -212,11 +217,13 @@ function UserCard({
   isSelf,
   onUpdate,
   onDelete,
+  onHardDelete,
 }: {
   u: Recipient;
   isSelf: boolean;
   onUpdate: (patch: RecipientUpdate) => void;
   onDelete: () => void;
+  onHardDelete: () => void;
 }) {
   const t = useTranslations("users");
   const sendLinkMut = useMutation({
@@ -296,6 +303,16 @@ function UserCard({
           disabled={isSelf}
           onChange={(is_active) => onUpdate({ is_active })}
         />
+        {!u.is_active && !isSelf && (
+          <button
+            onClick={onHardDelete}
+            title={t("delete_permanently_hint")}
+            className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 text-destructive px-2.5 py-1.5 text-xs font-medium hover:bg-destructive/10"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            {t("delete_permanently")}
+          </button>
+        )}
         <div className="ml-auto flex items-center gap-2">
           {sendLinkMut.isSuccess && (
             <span className="text-[11px] text-success">{t("login_link_sent")}</span>

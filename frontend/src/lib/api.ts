@@ -736,8 +736,11 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
-  recipientDelete: (id: number) =>
-    request<void>(`/api/v1/dash/recipients/${id}`, { method: "DELETE" }),
+  recipientDelete: (id: number, hard = false) =>
+    request<void>(
+      `/api/v1/dash/recipients/${id}${hard ? "?hard=true" : ""}`,
+      { method: "DELETE" },
+    ),
   recipientSendLoginLink: (id: number) =>
     request<{ ok: boolean; email: string }>(
       `/api/v1/dash/recipients/${id}/send-login-link`,

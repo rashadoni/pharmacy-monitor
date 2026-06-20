@@ -2097,3 +2097,86 @@ def test_login_admin_bootstrap_picks_admin_not_lower_id_viewer(client, setup_db,
     r = client.post("/auth/login", json={"login": "admin", "password": "adminpw"})
     assert r.status_code == 200, r.text
     assert r.json()["user_id"] == admin.id
+
+
+# ─── Recipient hard-delete (permanent) ───────────────────────────────────────
+
+
+def test_recipient_soft_delete_is_default(client, auth_cookie, setup_db):
+    """DELETE без ?hard — soft: строка остаётся, is_active=false."""
+    s = setup_db
+    u = _make_user(s, "softdel@x.az")
+    assert client.delete(f"/api/v1/dash/recipients/{u.id}").status_code == 204
+    s.expire_all()
+    row = s.scalar(select(storage.TenantUser).where(storage.TenantUser.id == u.id))
+    assert row is not None  # строка цела
+    assert row.is_active is False
+
+
+def test_recipient_hard_delete_removes_row(client, auth_cookie, setup_db):
+    """DELETE ?hard=true — физически удаляет строку."""
+    s = setup_db
+    uid = _make_user(s, "harddel@x.az").id  # plain int — объект будет удалён
+    assert client.delete(f"/api/v1/dash/recipients/{uid}?hard=true").status_code == 204
+    s.expire_all()
+    assert s.scalar(select(storage.TenantUser).where(storage.TenantUser.id == uid)) is None
+
+
+def test_recipient_hard_delete_nulls_scrape_request_fk(client, auth_cookie, setup_db):
+    """Перед DELETE обнуляется единственный FK (scrape_requests.requested_by_user_id)."""
+    s = setup_db
+    uid = _make_user(s, "fkuser@x.az").id
+    sr = storage.ScrapeRequest(
+        tenant_id=1, requested_by_user_id=uid, mode="all", status="ok", requested_at=utcnow()
+    )
+    s.add(sr)
+    s.commit()
+    srid = sr.id
+    assert client.delete(f"/api/v1/dash/recipients/{uid}?hard=true").status_code == 204
+    s.expire_all()
+    assert s.scalar(select(storage.TenantUser).where(storage.TenantUser.id == uid)) is None
+    sr2 = s.scalar(select(storage.ScrapeRequest).where(storage.ScrapeRequest.id == srid))
+    assert sr2 is not None  # сам запрос цел
+    assert sr2.requested_by_user_id is None  # указатель обнулён
+
+
+def test_recipient_hard_delete_self_400(client, auth_cookie, tenant_user):
+    """admin не может удалить себя даже hard."""
+    assert client.delete(f"/api/v1/dash/recipients/{tenant_user.id}?hard=true").status_code == 400
+
+
+def test_recipient_hard_delete_requires_admin(client, setup_db):
+    """viewer не может hard-delete (403) — admin-гард до ветки hard."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    s = setup_db
+    target_id = _make_user(s, "vtarget@x.az", role="viewer").id
+    _make_user(s, "vactor@x.az", role="viewer")
+    assert _verify_login(client, s, "vactor@x.az").status_code == 200
+    assert client.delete(f"/api/v1/dash/recipients/{target_id}?hard=true").status_code == 403
+
+
+def test_recreate_email_after_hard_delete(client, auth_cookie, setup_db):
+    """После hard-delete email освобождается → создать заново с тем же email можно."""
+    s = setup_db
+    u = _make_user(s, "recreate@x.az")
+    assert client.delete(f"/api/v1/dash/recipients/{u.id}?hard=true").status_code == 204
+    r = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "recreate@x.az", "name": "Again", "role": "viewer"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == "recreate@x.az"
+
+
+def test_recreate_email_after_soft_delete_still_409(client, auth_cookie, setup_db):
+    """После soft-delete строка остаётся → создать тот же email = 409 (поведение
+    не изменилось; для пересоздания нужен hard-delete или реактивация)."""
+    s = setup_db
+    u = _make_user(s, "stillthere@x.az")
+    assert client.delete(f"/api/v1/dash/recipients/{u.id}").status_code == 204
+    r = client.post(
+        "/api/v1/dash/recipients",
+        json={"email": "stillthere@x.az", "name": "X", "role": "viewer"},
+    )
+    assert r.status_code == 409

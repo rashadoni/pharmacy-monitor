@@ -373,7 +373,10 @@
     "role_admin": "Admin — tam giriş",
     "role_viewer": "Viewer — yalnız baxış",
     "active": "Aktiv",
-    "delete_confirm": "{email} istifadəçisini silmək? (deaktivasiya, log qalır)"
+    "delete_confirm": "{email} istifadəçisini silmək? (deaktivasiya, log qalır)",
+    "delete_permanently": "Həmişəlik sil",
+    "delete_permanently_hint": "İstifadəçini fiziki olaraq sil (geri qaytarılmır)",
+    "delete_permanently_confirm": "{email} HƏMİŞƏLİK silinsin? Bu geri qaytarılmır — istifadəçinin qeydi və tarixçəsi silinəcək."
   },
   "settings": {
     "title": "⚙️ Tənzimləmələr",

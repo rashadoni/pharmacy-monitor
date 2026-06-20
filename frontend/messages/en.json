@@ -373,7 +373,10 @@
     "role_admin": "Admin — full access",
     "role_viewer": "Viewer — read-only",
     "active": "Active",
-    "delete_confirm": "Delete user {email}? (deactivation, log kept)"
+    "delete_confirm": "Delete user {email}? (deactivation, log kept)",
+    "delete_permanently": "Delete permanently",
+    "delete_permanently_hint": "Physically remove the user (irreversible)",
+    "delete_permanently_confirm": "Delete {email} PERMANENTLY? This is irreversible — the user row and history will be erased."
   },
   "settings": {
     "title": "⚙️ Settings",
