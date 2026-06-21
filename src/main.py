@@ -98,6 +98,34 @@ def _should_trigger_ai_fallback(primary_yield: int, baseline: int | None) -> boo
     return primary_yield < threshold
 
 
+# ── Полный email-отчёт скрейпа (reporter.py) — opt-out ────────────────────────
+#
+# HTML-отчёт + Excel-вложение (тема «Pharmacy Monitor DD.MM.YYYY — N undercuts»)
+# шлётся в конце каждого НЕ-hourly прогона на EMAIL_TO/recipients. Это отдельный
+# канал от мгновенных undercut-алертов (evaluate_rules → dispatch_event) и от
+# daily/weekly дайджестов — управляется собственным флагом:
+#   SCRAPE_REPORT_EMAIL=0   отключает письмо (default ON — обратная совместимость)
+#
+# NB полярность: это opt-OUT (default ON, гасим явным falsy) — в отличие от
+# соседнего _ai_fallback_enabled, который opt-IN (default OFF, включаем явным
+# truthy). Разные дефолты намеренны: отчёт исторически слался всегда (не ломаем
+# существующее поведение), а AI-fallback жжёт деньги → по умолчанию выключен.
+SCRAPE_REPORT_EMAIL_ENV = "SCRAPE_REPORT_EMAIL"
+
+
+def _report_email_enabled() -> bool:
+    """Слать ли полный email-отчёт скрейпа. Opt-out через SCRAPE_REPORT_EMAIL=0.
+
+    Мгновенные undercut-алерты идут отдельным путём и этим флагом НЕ управляются.
+    """
+    return os.environ.get(SCRAPE_REPORT_EMAIL_ENV, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | None]:
     """Pre-fetch products_per_site from latest ok run for each requested site.
 
@@ -1861,8 +1889,9 @@ def run_cmd(
             xlsx_path.write_bytes(xlsx)
             log.info("report_saved", html=str(html_path), xlsx=str(xlsx_path))
 
-            # В hourly режиме пропускаем большой email-отчёт (только alerts)
-            if not dry_run and not hourly:
+            # В hourly режиме пропускаем большой email-отчёт (только alerts).
+            # SCRAPE_REPORT_EMAIL=0 отключает его глобально (см. _report_email_enabled).
+            if not dry_run and not hourly and _report_email_enabled():
                 notifier.send_email(
                     subject=subject,
                     html_body=html,

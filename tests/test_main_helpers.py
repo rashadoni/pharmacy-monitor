@@ -92,6 +92,29 @@ def test_ai_fallback_invalid_min_baseline_falls_back_to_default(monkeypatch):
     assert main_mod._should_trigger_ai_fallback(10, baseline=150) is True
 
 
+# === scrape report email toggle ===
+
+
+def test_report_email_enabled_by_default(monkeypatch):
+    """Env не задан → письмо шлётся (обратная совместимость)."""
+    monkeypatch.delenv(main_mod.SCRAPE_REPORT_EMAIL_ENV, raising=False)
+    assert main_mod._report_email_enabled() is True
+
+
+def test_report_email_disabled_via_env(monkeypatch):
+    """Явно falsy значение → отключено (вкл. регистр/пробелы)."""
+    for val in ("0", "false", "no", "off", "FALSE", "Off", " 0 "):
+        monkeypatch.setenv(main_mod.SCRAPE_REPORT_EMAIL_ENV, val)
+        assert main_mod._report_email_enabled() is False, val
+
+
+def test_report_email_enabled_for_non_falsy(monkeypatch):
+    """Любое не-falsy значение → письмо шлётся (только явный opt-out отключает)."""
+    for val in ("1", "true", "yes", "on", "anything"):
+        monkeypatch.setenv(main_mod.SCRAPE_REPORT_EMAIL_ENV, val)
+        assert main_mod._report_email_enabled() is True, val
+
+
 # === baselines_for_sites ===
 
 

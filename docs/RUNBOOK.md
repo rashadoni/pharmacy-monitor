@@ -154,6 +154,37 @@ sudo -u pharmacy uv run --directory /opt/pharmacy-monitor pharmacy-monitor recip
 # 3. Gmail App Password rotated? Создать новый: https://myaccount.google.com/apppasswords
 ```
 
+### Email — слишком много писем (volume controls)
+
+**Симптом:** клиент жалуется, что писем приходит больше, чем ожидает (напр.
+«поставил дайджест раз в неделю, а капает по несколько раз в день»).
+
+**Контекст:** на `EMAIL_TO`/recipients идут НЕСКОЛЬКО независимых потоков, и
+per-user тумблеры daily/weekly (`tenant_users`, страница «Пользователи»)
+управляют ТОЛЬКО per-user дайджестом. Остальные — отдельные механизмы:
+
+| Поток | Источник | Как выключить | Как включить обратно |
+|---|---|---|---|
+| Мгновенные undercut-алерты (`[CRITICAL] … дешевле на %`) | `run` → `evaluate_rules` → `dispatch_event` (в конце каждого прогона) | `--no-alerts` в override сервиса скрейпа (гасит ВСЕ алерты сайта) | убрать `--no-alerts` |
+| Полный отчёт скрейпа (HTML+Excel, тема «Pharmacy Monitor DD.MM.YYYY — N undercuts») | `run_cmd` в конце КАЖДОГО не-hourly прогона — nightly **и intraday-tick** (`hourly=False`, до ~13/день 05–17 UTC) | `SCRAPE_REPORT_EMAIL=0` в `/etc/pharmacy-monitor/env` (next scrape) | `SCRAPE_REPORT_EMAIL=1` или убрать строку |
+| Daily-дайджест (тема «Дайджест за сегодня», топ-N за 24ч) | `digest@daily.timer` → `pharmacy-monitor digest` → `src/digest.py` | `systemctl disable --now pharmacy-monitor-digest@daily.timer` | `systemctl enable --now …` |
+| Недельный per-user дайджест | `digest-weekly.timer` Пн 06:00 UTC → `notify digest weekly` → `src/notifications.py` (`tenant_users.weekly_digest`) | per-user тумблер в UI / `systemctl disable …` | UI / `systemctl enable …` |
+
+**Важно — два разных тумблера, два разных отката:** отчёт-письмо гасится
+**env-флагом**, daily-дайджест — **состоянием systemd-юнита**. При откате нужно
+вернуть ОБА (легко забыть один).
+
+```bash
+# Текущее состояние всех email-потоков
+ssh root@46.225.149.52 '
+  grep "^SCRAPE_REPORT_EMAIL=" /etc/pharmacy-monitor/env || echo "(report email: ON — флаг не задан)"
+  systemctl is-enabled pharmacy-monitor-digest@daily.timer pharmacy-monitor-digest-weekly.timer
+  systemctl list-timers --all | grep -i digest
+'
+# NB: есть templated-юнит pharmacy-monitor-digest@weekly.timer (слал бы 24ч-дайджест
+# на EMAIL_TO еженедельно) — он должен быть DISABLED, иначе лишний недельный блок.
+```
+
 ### Дашборд не открывается
 
 **Симптом:** `https://monitor.pharmonline.az` → timeout / 502 / 503.
