@@ -323,6 +323,53 @@ def test_brand_coverage_loss_critical(db_session):
     assert bc[0].severity == "critical"
 
 
+def test_brand_coverage_partial_intraday_tick_skipped(db_session):
+    """Регресс (run #307, 2026-06-21): частичный intraday-тик НЕ должен алертить.
+
+    Featured-тик pharmonline (~116 косметик-товаров без brand) из ~10k каталога
+    давал ложный brand_coverage_loss, хотя полный каталог на 89%. Guard по доле
+    каталога доминирующего сайта должен пропустить такой тик. Без guard'а этот же
+    сценарий сработал бы (rest=100% ≥50%, curr=0% <20%) — что и тестим обратным.
+    """
+    base = utcnow()
+    # Каталог pharmonline: 100 товаров С brand, видны «вчера» (rest-of-catalog).
+    prev = _add_run(db_session, base - timedelta(days=1), products_scraped=100)
+    for i in range(100):
+        p = Product(
+            site="pharmonline",
+            external_id=f"cat-{i}",
+            url="x",
+            name=f"P{i}",
+            name_normalized=f"p{i}",
+            brand="Bayer",
+            last_seen_at=prev.started_at,
+        )
+        db_session.add(p)
+        db_session.flush()
+        db_session.add(PriceSnapshot(run_id=prev.id, product_id=p.id, price=10.0))
+
+    # Интрадей-тик: 12 товаров БЕЗ brand (≥10 → проходит min-sample guard), но
+    # 12 < 0.25*112 = 28 → доминирующий сайт pharmonline, тонкий срез → скип.
+    curr = _add_run(db_session, base - timedelta(hours=1), products_scraped=12)
+    for i in range(12):
+        p = Product(
+            site="pharmonline",
+            external_id=f"tick-{i}",
+            url="x",
+            name=f"T{i}",
+            name_normalized=f"t{i}",
+            last_seen_at=curr.started_at,
+        )
+        db_session.add(p)
+        db_session.flush()
+        db_session.add(PriceSnapshot(run_id=curr.id, product_id=p.id, price=10.0))
+    db_session.commit()
+
+    rep = check_health(db_session)
+    bc = [i for i in rep.issues if i.code == "brand_coverage_loss"]
+    assert bc == [], "частичный intraday-тик не должен давать brand_coverage_loss"
+
+
 def test_site_drop_below_20_percent_critical(db_session):
     base = utcnow()
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=10)

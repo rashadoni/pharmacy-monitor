@@ -327,6 +327,18 @@ def _check_zero_prices(session: Session, run_id: int) -> list[HealthIssue]:
     ]
 
 
+# Минимальная доля каталога доминирующего сайта, при которой прогон считается
+# РЕПРЕЗЕНТАТИВНЫМ для оценки brand-coverage. Частичные intraday-тики (pharmonline
+# featured ~100-250 шт из ~10k каталога) НЕ репрезентативны: их срез смещён в
+# косметику/коммодити без brand (категория dish-mecunlar и т.п.) → давали ложный
+# critical. Реальный кейс (2026-06-21, run #307): 116 товаров featured-тика, 20%
+# brand (23/116) vs 89% по полному каталогу pharmonline → ложная «сменилась вёрстка».
+# Тот же класс false-positive, что уже закрыт в _check_site_drops/_check_site_zero_scrape
+# («intraday-блипы частичные НЕ триггерят»). 0.25 отделяет featured-тик (~1% каталога)
+# от полного прогона (aloe ~100%, pharmonline ~97%, aptek >100%).
+_BRAND_COVERAGE_MIN_RUN_FRACTION = 0.25
+
+
 def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssue]:
     """Регрессия brand-coverage: rest-of-catalog ≥50%, visible-now <20% → alert.
 
@@ -334,6 +346,11 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
     (`last_seen_at >= run.started_at`) с **остальным каталогом**
     (продукты, которых не видели сегодня). Это устраняет смещение
     от продуктов текущего прогона в общей оценке ковеража.
+
+    Intraday-guard (2026-06-21): пропускаем оценку, если прогон — частичный
+    intraday-тик (когорта покрывает < `_BRAND_COVERAGE_MIN_RUN_FRACTION` каталога
+    доминирующего сайта). Featured-тик pharmonline (~116 косметик-товаров без brand)
+    давал ложный critical, хотя полный каталог на 89%.
     """
     last_run = session.get(Run, run_id)
     if last_run is None:
@@ -350,6 +367,26 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
     )
     if curr_total < 10:
         return []
+
+    # Репрезентативность: частичный intraday-тик судить по brand-coverage нельзя.
+    # Доминирующий сайт когорты + его каталог; если когорта — тонкий срез, скип.
+    dominant = session.execute(
+        select(Product.site, func.count())
+        .where(Product.last_seen_at >= last_run.started_at)
+        .group_by(Product.site)
+        .order_by(func.count().desc(), Product.site)  # site = детерминированный tie-break
+        .limit(1)
+    ).first()
+    if dominant is not None:
+        dom_site, _dom_count = dominant
+        site_catalog = (
+            session.scalar(
+                select(func.count()).select_from(Product).where(Product.site == dom_site)
+            )
+            or 0
+        )
+        if site_catalog > 0 and curr_total < _BRAND_COVERAGE_MIN_RUN_FRACTION * site_catalog:
+            return []
     curr_with_brand = (
         session.scalar(
             select(func.count())
