@@ -227,6 +227,45 @@ def test_undercut_skips_obvious_data_error_prices(db_session):
     )
 
 
+def test_undercut_zero_client_price_no_zerodiv(db_session):
+    """Регресс #311 (2026-06-22): клиент с ценой 0.0 (нет в наличии) ронял ВЕСЬ
+    прогон через ZeroDivisionError в _detect_undercuts (client_price в знаменателе
+    diff_pct). Теперь 0-цена клиента пропускается — без краха, без undercut.
+    """
+    m = storage.Match(canonical_name="ZeroFoo", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    client = _add_product(db_session, "pharmonline", "ZeroFoo", "ph-z", canonical_id=m.id)
+    comp = _add_product(db_session, "aloe", "ZeroFoo", "al-z", canonical_id=m.id)
+    run = _add_run(db_session, utcnow())
+    _add_snapshot(db_session, run, client, 0.0)  # клиент: цена 0 = нет в наличии
+    _add_snapshot(db_session, run, comp, 80.0)
+    db_session.commit()
+
+    # До фикса: ZeroDivisionError здесь ронял весь run_cmd.
+    report = analyzer.analyze(db_session, run.id)
+    assert report.undercuts == []  # 0-цена клиента не сравнивается
+
+
+def test_price_change_zero_prev_price_no_zerodiv(db_session):
+    """Регресс того же класса: prev_price=0 (restock из нуля) ронял
+    _detect_price_changes (prev_price в знаменателе delta_pct). Теперь — пропуск.
+    """
+    day1 = utcnow() - timedelta(days=1)
+    day2 = utcnow()
+    run1 = _add_run(db_session, day1)
+    run2 = _add_run(db_session, day2)
+    p = _add_product(db_session, "aloe", "RestockFoo", "rf-1")
+    s1 = _add_snapshot(db_session, run1, p, 0.0)  # был 0 (нет в наличии)
+    s1.captured_at = day1
+    s2 = _add_snapshot(db_session, run2, p, 5.0)  # появилась цена
+    s2.captured_at = day2
+    db_session.commit()
+
+    report = analyzer.analyze(db_session, run2.id)  # НЕ должно бросать
+    assert report.price_changes == []  # restock из нуля — не % изменение
+
+
 def test_no_undercut_when_competitor_more_expensive(db_session):
     m = storage.Match(canonical_name="Foo", confidence=1.0)
     db_session.add(m)

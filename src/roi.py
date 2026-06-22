@@ -357,8 +357,8 @@ def _price_raise_opportunities(
     for m in matches:
         prices_by_site = _prices_for_match(session, m, run_id, snaps_cache)
         client_price = prices_by_site.get(CLIENT_SITE)
-        if client_price is None:
-            continue
+        if client_price is None or client_price <= 0:
+            continue  # цена 0 → иначе деление на 0 в gap_pct (fail-soft, но всё равно гардим)
         comp_prices = [
             (s, p) for s, p in prices_by_site.items() if s in COMPETITOR_SITES and p is not None
         ]

@@ -145,8 +145,8 @@ def _detect_price_changes(session: Session, current_run: Run) -> list[PriceChang
 
         prev_price = prev.discount_price or prev.price
         curr_price = curr.discount_price or curr.price
-        if prev_price is None or curr_price is None:
-            continue
+        if prev_price is None or curr_price is None or prev_price <= 0:
+            continue  # prev=0 (restock из нуля) → иначе деление на 0 в delta_pct
         if abs(curr_price - prev_price) < 0.01:
             continue
         delta_pct = round((curr_price - prev_price) / prev_price * 100, 2)
@@ -224,8 +224,8 @@ def _detect_undercuts(session: Session, threshold_pct: float = 0.0) -> list[Comp
         if not client_snap:
             continue
         client_price = client_snap.discount_price or client_snap.price
-        if client_price is None:
-            continue
+        if client_price is None or client_price <= 0:
+            continue  # цена 0 = нет в наличии → иначе деление на 0 в diff_pct (run #311)
 
         for cp in competitor_products:
             comp_snap = snaps_by_product.get(cp.id)

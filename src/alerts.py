@@ -222,8 +222,8 @@ def _detect_price_raise_opportunity(
     for m in matches:
         prices = _prices_for_match(session, m, run_id)
         client_price = prices.get(CLIENT_SITE)
-        if client_price is None:
-            continue
+        if client_price is None or client_price <= 0:
+            continue  # цена 0 → иначе деление на 0 в gap_pct
         comp_prices = [p for s, p in prices.items() if s in COMPETITOR_SITES and p is not None]
         if not comp_prices:
             continue
