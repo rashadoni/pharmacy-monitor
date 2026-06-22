@@ -1341,11 +1341,11 @@ def alert_evaluate(dispatch: bool, rule_id: tuple[int, ...]) -> None:
         click.echo(f"Сработало: {len(fired)}")
         for ev in fired:
             click.echo(f"  [{ev.severity}] {ev.rule_type}: {ev.title[:80]}")
-            if dispatch:
-                from src import notifications as notif_mod
+        if dispatch and fired:
+            from src import notifications as notif_mod
 
-                results = notif_mod.dispatch_event(s, ev)
-                click.echo(f"     → {results}")
+            results = notif_mod.dispatch_events_batch(s, fired)
+            click.echo(f"  → отправлено одним письмом: {results}")
 
 
 @alert_group.command("recent")
@@ -1866,11 +1866,12 @@ def run_cmd(
 
                 fired = alerts_mod.evaluate_rules(session, run.id)
                 if fired and not dry_run:
-                    for ev in fired:
-                        try:
-                            notif_mod.dispatch_event(session, ev)
-                        except Exception as e:
-                            log.warning("alert_dispatch_failed", error=str(e))
+                    # Одно письмо-сводка на прогон (вместо письма на событие) —
+                    # переоценка целой линейки больше не топит инбокс.
+                    try:
+                        notif_mod.dispatch_events_batch(session, fired)
+                    except Exception as e:
+                        log.warning("alert_dispatch_failed", error=str(e))
                     log.info("alerts_dispatched", count=len(fired))
                 elif fired:
                     log.info("alerts_dispatch_skipped_dry_run", count=len(fired))

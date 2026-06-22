@@ -166,6 +166,108 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
     return {c: f"sent_{len(r)}" for c, r in results.items()}
 
 
+def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) -> dict[str, int]:
+    """Слить ВСЕ события одного прогона в ОДНО письмо-сводку на получателя.
+
+    Замена циклу `for ev: dispatch_event(ev)` (одно письмо на событие → поток:
+    переоценка линейки из 15 товаров = 15 писем). Теперь одно письмо со списком
+    всех алертов прогона, шлётся сразу после прогона — немедленность сохранена,
+    поток убран. Уважает те же per-user правила, что и `dispatch_event`:
+    `daily_digest`-opt-out (real-time пропускается, событие попадёт в дайджест),
+    email/telegram `severity_min`, quiet hours. Telegram — одним сообщением.
+
+    `channels_sent` проставляется per-event (точная dedup-метка: канал отмечается
+    только у событий, реально вошедших в отправленную сводку) и коммитится
+    per-получатель — чтобы сбой commit не дал повторную рассылку всей пачки.
+
+    Возвращает {'email': писем, 'telegram': сообщений}.
+    """
+    # Dedup: не трогаем уже отправленные (retry-safe, как dispatch_event).
+    pending = [e for e in events if not (e.channels_sent and len(e.channels_sent) > 0)]
+    if not pending:
+        return {"email": 0, "telegram": 0}
+
+    # Группировка по tenant_id — forward-looking. СЕЙЧАС no-op: evaluate_rules
+    # создаёт AlertEvent без tenant_id → все события дефолтятся в tenant 1 (как и
+    # dispatch_event, читающий event.tenant_id). Реальную мульти-тенант изоляцию
+    # даст только стамп tenant_id из правила в evaluate_rules (отдельная задача).
+    by_tenant: dict[int, list[storage.AlertEvent]] = {}
+    for e in pending:
+        by_tenant.setdefault(getattr(e, "tenant_id", 1) or 1, []).append(e)
+
+    emails_sent = 0
+    tg_sent = 0
+
+    for tenant_id, tevents in by_tenant.items():
+        users = session.scalars(
+            select(storage.TenantUser).where(
+                storage.TenantUser.tenant_id == tenant_id,
+                storage.TenantUser.is_active.is_(True),
+            )
+        ).all()
+        by_obj = {id(e): e for e in tevents}
+        for user in users:
+            sent_now: dict[int, set[str]] = {}
+
+            # Email — пропускаем real-time если юзер на daily_digest (попадёт в дайджест)
+            if not user.daily_digest:
+                ev_email = [
+                    e
+                    for e in tevents
+                    if _severity_passes(user.email_severity_min, e.severity, DEFAULT_EMAIL_SEVERITY)
+                ]
+                if ev_email:
+                    try:
+                        notifier.send_email(
+                            subject=_batch_subject(ev_email),
+                            html_body=_render_batch_email(ev_email),
+                            to=[user.email],
+                        )
+                        emails_sent += 1
+                        for e in ev_email:
+                            sent_now.setdefault(id(e), set()).add("email")
+                    except Exception as exc:
+                        log.warning("email_batch_failed", user=user.email, error=str(exc))
+
+            # Telegram — одним сообщением, уважает quiet hours
+            if user.telegram_chat_id and not _in_quiet_hours(user.quiet_hours):
+                ev_tg = [
+                    e
+                    for e in tevents
+                    if _severity_passes(
+                        user.telegram_severity_min, e.severity, DEFAULT_TELEGRAM_SEVERITY
+                    )
+                ]
+                if ev_tg:
+                    try:
+                        notifier.send_telegram_message(
+                            user.telegram_chat_id, _format_batch_text(ev_tg)
+                        )
+                        tg_sent += 1
+                        for e in ev_tg:
+                            sent_now.setdefault(id(e), set()).add("telegram")
+                    except Exception as exc:
+                        log.warning("telegram_batch_failed", user=user.email, error=str(exc))
+
+            # Коммитим прогресс СРАЗУ после каждого получателя: успешно отправленное
+            # помечаем channels_sent и фиксируем. Если commit упадёт (tunnel-EOF на
+            # Mac-DR-пути), повторная рассылка ограничится ОДНИМ получателем, а не
+            # всей пачкой (единый end-of-batch commit мог бы продублировать всем).
+            if sent_now:
+                for eid, chans in sent_now.items():
+                    ev = by_obj[eid]
+                    ev.channels_sent = sorted(set(ev.channels_sent or []) | chans)
+                session.commit()
+
+    log.info(
+        "alerts_dispatched_batch",
+        events=len(pending),
+        emails=emails_sent,
+        telegram=tg_sent,
+    )
+    return {"email": emails_sent, "telegram": tg_sent}
+
+
 # ─── Telegram /start binding ─────────────────────────────────────────────────
 
 
@@ -292,3 +394,61 @@ def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since:
 </body>
 </html>
 """.strip()
+
+
+# ─── Per-run batch (consolidated single email) ───────────────────────────────
+
+
+def _batch_subject(events: list[storage.AlertEvent]) -> str:
+    """Тема batch-письма. 1 событие → старый single-style (без регресса для
+    одиночных алертов); >1 → сводка с худшей severity и количеством."""
+    if len(events) == 1:
+        e = events[0]
+        return f"[{e.severity.upper()}] {(e.title or '')[:80]}"
+    worst = max(events, key=lambda e: SEVERITY_ORDER.get(e.severity, 0)).severity
+    return f"[{worst.upper()}] Pharmacy Monitor — {len(events)} алертов"
+
+
+def _render_batch_email(events: list[storage.AlertEvent]) -> str:
+    """ОДНО письмо со списком всех событий прогона (critical → warning → info)."""
+    ordered = sorted(events, key=lambda e: -SEVERITY_ORDER.get(e.severity, 0))
+    rows = "\n".join(_format_event_html(e) for e in ordered)
+    public = os.environ.get("PHARMACY_PUBLIC_URL", "")
+    sev_counts: dict[str, int] = {}
+    for e in events:
+        sev_counts[e.severity] = sev_counts.get(e.severity, 0) + 1
+    summary = " · ".join(
+        f"{v} {k}"
+        for k, v in sorted(sev_counts.items(), key=lambda kv: -SEVERITY_ORDER.get(kv[0], 0))
+    )
+    return f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>{len(events)} alerts</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
+  <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
+    <tr><td style="padding:24px;border-bottom:1px solid #e4e4e7;">
+      <div style="font-size:14px;color:#71717a;margin-bottom:4px;">Pharmacy Monitor</div>
+      <div style="font-size:22px;font-weight:600;color:#18181b;">{len(events)} алертов за прогон</div>
+      <div style="font-size:13px;color:#71717a;margin-top:4px;">{summary}</div>
+    </td></tr>
+    {rows}
+    <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
+      <a href="{public}/alerts" style="color:#3b82f6;">Открыть в дашборде →</a>
+    </td></tr>
+  </table>
+</body>
+</html>
+""".strip()
+
+
+def _format_batch_text(events: list[storage.AlertEvent]) -> str:
+    """Telegram: одно сообщение со списком (cap 30 строк)."""
+    ordered = sorted(events, key=lambda e: -SEVERITY_ORDER.get(e.severity, 0))
+    emoji = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️", "opportunity": "💡"}
+    lines = [f"*Pharmacy Monitor — {len(events)} алертов*"]
+    for e in ordered[:30]:
+        lines.append(f"{emoji.get(e.severity, '•')} {(e.title or '')[:120]}")
+    if len(ordered) > 30:
+        lines.append(f"…и ещё {len(ordered) - 30}")
+    return "\n".join(lines)
