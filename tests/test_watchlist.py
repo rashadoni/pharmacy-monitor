@@ -238,6 +238,25 @@ def test_categories_for_site_returns_only_active_with_slug(db_session):
     assert sorted(wl.categories_for_site(db_session, "aloe")) == ["alA", "alC"]
 
 
+def test_add_tracked_category_idempotent(db_session):
+    cat = wl.add_category(db_session, key="vit", label_ru="Витамины", pharmonline_slug="vit")
+    first = wl.add_tracked_category(db_session, cat.id, tenant_id=1, notes="top")
+    second = wl.add_tracked_category(db_session, cat.id, tenant_id=1, notes="updated")
+    assert first.id == second.id
+    assert second.notes == "updated"
+    rows = wl.list_tracked_categories(db_session, tenant_id=1)
+    assert len(rows) == 1
+    assert rows[0].category.key == "vit"
+
+
+def test_remove_tracked_category_scoped_by_tenant(db_session):
+    cat = wl.add_category(db_session, key="baby", label_ru="Детский мир")
+    tracked = wl.add_tracked_category(db_session, cat.id, tenant_id=2)
+    assert wl.remove_tracked_category(db_session, tracked.id, tenant_id=1) is False
+    assert wl.remove_tracked_category(db_session, tracked.id, tenant_id=2) is True
+    assert wl.list_tracked_categories(db_session, tenant_id=2, active_only=False) == []
+
+
 def test_categories_for_site_filters_by_category_id(db_session):
     a = wl.add_category(db_session, key="a", label_ru="A", pharmonline_slug="phA")
     wl.add_category(db_session, key="b", label_ru="B", pharmonline_slug="phB")

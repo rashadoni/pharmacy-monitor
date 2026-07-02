@@ -26,9 +26,13 @@ URL synth (Task #33 fix, 2026-05-28):
 
 from __future__ import annotations
 
+import html
+import json
+import os
 import re
 from typing import AsyncIterator
 
+import httpx
 import structlog
 
 from src.normalize import (
@@ -66,6 +70,19 @@ _AZERI_TO_ASCII = str.maketrans(
 
 # Punctuation которая удаляется БЕЗ замены (12,5 → 125, не 12-5).
 _PUNCT_REMOVE_RE = re.compile(r"[,/.%()\[\]'\"!?:;«»“”]+")
+_NEXT_FLIGHT_CHUNK_RE = re.compile(
+    r"self\.__next_f\.push\(\[1,\"((?:\\.|[^\"\\])*)\"\]\)</script>",
+    re.DOTALL,
+)
+_ALOE_DATA_MARKER_RE = re.compile(r'"data":\{')
+_ALOE_HTTP_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "az-AZ,az;q=0.9,ru-RU;q=0.8,ru;q=0.7,en-US;q=0.6,en;q=0.5",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+}
 
 
 def aloe_slug(name: str) -> str:
@@ -89,11 +106,220 @@ def aloe_slug(name: str) -> str:
     return s
 
 
+def _decode_next_flight(html_text: str) -> str:
+    """Return decoded Next.js flight payload chunks embedded in Aloe listing HTML."""
+    chunks: list[str] = []
+    for match in _NEXT_FLIGHT_CHUNK_RE.finditer(html_text):
+        raw = match.group(1)
+        try:
+            chunks.append(json.loads(f'"{raw}"'))
+        except json.JSONDecodeError:
+            log.debug("aloe_next_chunk_decode_failed")
+    return "\n".join(chunks)
+
+
+def aloe_listing_page_info(html_text: str) -> tuple[int | None, int | None]:
+    """Extract (currentPage, lastPage) from Aloe listing HTML."""
+    text = _decode_next_flight(html_text) or html.unescape(html_text)
+    current_matches = re.findall(r'"currentPage"\s*:\s*(\d+)', text)
+    last_matches = re.findall(r'"lastPage"\s*:\s*(\d+)', text)
+    current = int(current_matches[-1]) if current_matches else None
+    last = int(last_matches[-1]) if last_matches else None
+    return current, last
+
+
+def _media_url(path: str | None) -> str | None:
+    if not path:
+        return None
+    if path.startswith(("http://", "https://")):
+        return path
+    return f"https://ecom.aloe.az/{path.lstrip('/')}"
+
+
+def _strip_html_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r"<[^>]+>", " ", value)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
+def _is_aloe_product_payload(obj: object) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    return all(k in obj for k in ("id", "code", "name", "slug", "price")) and isinstance(
+        obj.get("name"), str
+    )
+
+
+def _aloe_product_from_payload(
+    obj: dict, *, category_slug: str, base_url: str
+) -> ScrapedProduct | None:
+    name = str(obj.get("name") or "").strip()
+    slug = str(obj.get("slug") or "").strip()
+    if not name or not slug:
+        return None
+
+    price = parse_price(str(obj.get("price"))) if obj.get("price") is not None else None
+    old_price = (
+        parse_price(str(obj.get("old_price"))) if obj.get("old_price") is not None else None
+    )
+    is_on_sale = old_price is not None and price is not None and old_price > price
+    discount_percent = None
+    if is_on_sale and old_price:
+        discount_percent = round((1 - price / old_price) * 100, 1)
+
+    brand_payload = obj.get("brand") if isinstance(obj.get("brand"), dict) else {}
+    brand = (brand_payload.get("name") or "").strip() or None
+
+    image_url = None
+    images = obj.get("images")
+    if isinstance(images, list):
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            media = image.get("media_manager")
+            if isinstance(media, dict):
+                image_url = _media_url(media.get("media_file") or media.get("thumbnail_path"))
+            if image_url:
+                break
+
+    promo_label = None
+    if obj.get("promo"):
+        promo_label = "promo"
+
+    return ScrapedProduct(
+        site="aloe",
+        external_id=slug[:100],
+        url=f"{base_url}/{slug}/",
+        name=name,
+        brand=brand,
+        manufacturer=str(obj.get("ats_classification") or "").strip() or None,
+        category=category_slug,
+        dosage=extract_dosage(name),
+        pack_size=extract_pack_size(name),
+        image_url=image_url,
+        description=_strip_html_text(obj.get("short_description")),
+        price=old_price if is_on_sale else price,
+        discount_price=price if is_on_sale else None,
+        discount_percent=discount_percent,
+        is_on_sale=is_on_sale,
+        promo_label=promo_label,
+    )
+
+
+def aloe_products_from_listing_html(
+    html_text: str, *, category_slug: str, base_url: str = "https://aloe.az"
+) -> list[ScrapedProduct]:
+    """Parse product payloads embedded in Aloe Next.js listing HTML.
+
+    Aloe listing pages expose the authoritative product objects in the Next
+    flight stream. Parsing that stream avoids the old Playwright DOM limit that
+    stopped at 100 pages while Aloe currently reports much larger `lastPage`
+    values for broad categories.
+    """
+    text = _decode_next_flight(html_text) or html.unescape(html_text)
+    decoder = json.JSONDecoder()
+    products: list[ScrapedProduct] = []
+    seen: set[str] = set()
+
+    for match in _ALOE_DATA_MARKER_RE.finditer(text):
+        start = match.end() - 1
+        try:
+            obj, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if not _is_aloe_product_payload(obj):
+            continue
+        product = _aloe_product_from_payload(obj, category_slug=category_slug, base_url=base_url)
+        if product is None or product.external_id in seen:
+            continue
+        seen.add(product.external_id)
+        products.append(product)
+
+    return products
+
+
 class AloeScraper(BaseScraper):
     site_name = "aloe"
     base_url = "https://aloe.az"
 
     async def scrape_category(
+        self, category_slug: str, limit: int | None = None, max_pages: int = 100
+    ) -> AsyncIterator[ScrapedProduct]:
+        mode = os.getenv("ALOE_SCRAPER_MODE", "rsc").strip().lower()
+        if mode not in ("playwright", "browser"):
+            async for product in self._scrape_category_rsc(category_slug, limit=limit):
+                yield product
+            return
+
+        async for product in self._scrape_category_playwright(
+            category_slug, limit=limit, max_pages=max_pages
+        ):
+            yield product
+
+    async def _scrape_category_rsc(
+        self, category_slug: str, limit: int | None = None
+    ) -> AsyncIterator[ScrapedProduct]:
+        if not category_slug:
+            return
+        if "=" in category_slug:
+            base_url = f"{self.base_url}/catalog/filters/?{category_slug}"
+        elif category_slug in ("bestseller", "new", "promo", "seasonal_product_now_is_the_time"):
+            base_url = f"{self.base_url}/catalog/filters/?product_field={category_slug}"
+        else:
+            base_url = f"{self.base_url}/catalog/filters/?category_slug={category_slug}"
+
+        first_html = await self._fetch_listing_html(base_url)
+        current_page, last_page = aloe_listing_page_info(first_html)
+        if not last_page:
+            last_page = 1
+        max_pages = int(os.getenv("ALOE_RSC_MAX_PAGES", "1000"))
+        last_page = min(last_page, max_pages)
+
+        yielded = 0
+        seen_external_ids: set[str] = set()
+        for page_num in range(1, last_page + 1):
+            html_text = first_html if page_num == 1 else await self._fetch_listing_html(
+                f"{base_url}&page={page_num}"
+            )
+            products = aloe_products_from_listing_html(
+                html_text, category_slug=category_slug, base_url=self.base_url
+            )
+            log.info(
+                "aloe_rsc_page_parsed",
+                category=category_slug,
+                page=page_num,
+                current_page=current_page if page_num == 1 else page_num,
+                last_page=last_page,
+                products=len(products),
+            )
+            if page_num > 1 and not products:
+                log.info("aloe_rsc_pagination_done", category=category_slug, page=page_num)
+                break
+            for product in products:
+                if product.external_id in seen_external_ids:
+                    continue
+                seen_external_ids.add(product.external_id)
+                yielded += 1
+                yield product
+                if limit and yielded >= limit:
+                    return
+
+    async def _fetch_listing_html(self, url: str) -> str:
+        await self._throttle()
+        timeout = float(os.getenv("ALOE_HTTP_TIMEOUT_SEC", str(self.timeout_sec)))
+        async with httpx.AsyncClient(
+            headers=_ALOE_HTTP_HEADERS,
+            timeout=timeout,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.text
+
+    async def _scrape_category_playwright(
         self, category_slug: str, limit: int | None = None, max_pages: int = 100
     ) -> AsyncIterator[ScrapedProduct]:
         """Aloe пагинация через ?page=N (12 товаров на страницу).

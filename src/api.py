@@ -499,6 +499,11 @@ class WatchlistItemIn(BaseModel):
     aloe_url: str | None = None
 
 
+class WatchlistCategoryIn(BaseModel):
+    category_id: int
+    notes: str | None = None
+
+
 # ─── Public endpoints ────────────────────────────────────────────────────────
 
 
@@ -4007,6 +4012,89 @@ def dash_watchlist_create(
             )
     db.commit()
     return {"id": tp.id}
+
+
+def _watchlist_category_payload(tc: storage.TrackedCategory) -> dict[str, Any]:
+    c = tc.category
+    return {
+        "id": tc.id,
+        "category_id": c.id,
+        "key": c.key,
+        "label_ru": c.label_ru,
+        "label_az": c.label_az,
+        "pharmonline_slug": c.pharmonline_slug,
+        "aptekonline_slug": c.aptekonline_slug,
+        "aloe_slug": c.aloe_slug,
+        "notes": tc.notes,
+        "is_active": tc.is_active,
+    }
+
+
+@app.get("/api/v1/dash/watchlist/categories")
+def dash_watchlist_categories_list(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    items = db.scalars(
+        select(storage.TrackedCategory)
+        .options(selectinload(storage.TrackedCategory.category))
+        .join(storage.TrackedCategory.category)
+        .where(storage.TrackedCategory.tenant_id == user.tenant_id)
+        .order_by(storage.Category.label_ru)
+    ).all()
+    return [_watchlist_category_payload(item) for item in items]
+
+
+@app.post("/api/v1/dash/watchlist/categories", status_code=201)
+def dash_watchlist_categories_create(
+    payload: WatchlistCategoryIn,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    category = db.scalar(select(storage.Category).where(storage.Category.id == payload.category_id))
+    if not category:
+        raise HTTPException(404, "Category not found")
+    existing = db.scalar(
+        select(storage.TrackedCategory).where(
+            storage.TrackedCategory.tenant_id == user.tenant_id,
+            storage.TrackedCategory.category_id == payload.category_id,
+        )
+    )
+    if existing:
+        existing.notes = payload.notes if payload.notes is not None else existing.notes
+        existing.is_active = True
+        db.commit()
+        db.refresh(existing)
+        return {"id": existing.id}
+    item = storage.TrackedCategory(
+        tenant_id=user.tenant_id,
+        category_id=payload.category_id,
+        notes=payload.notes.strip() if payload.notes else None,
+        is_active=True,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"id": item.id}
+
+
+@app.delete("/api/v1/dash/watchlist/categories/{tracked_category_id}", status_code=204)
+def dash_watchlist_categories_delete(
+    tracked_category_id: int,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    item = db.scalar(
+        select(storage.TrackedCategory).where(
+            storage.TrackedCategory.id == tracked_category_id,
+            storage.TrackedCategory.tenant_id == user.tenant_id,
+        )
+    )
+    if not item:
+        raise HTTPException(404, "Watchlist category not found")
+    db.delete(item)
+    db.commit()
+    return Response(status_code=204)
 
 
 @app.delete("/api/v1/dash/watchlist/{tp_id}", status_code=204)

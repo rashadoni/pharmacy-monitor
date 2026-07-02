@@ -392,6 +392,19 @@ export interface WatchlistCreatePayload {
   aloe_url?: string;
 }
 
+export interface WatchlistCategoryItem {
+  id: number;
+  category_id: number;
+  key: string;
+  label_ru: string;
+  label_az: string | null;
+  pharmonline_slug: string | null;
+  aptekonline_slug: string | null;
+  aloe_slug: string | null;
+  notes: string | null;
+  is_active: boolean;
+}
+
 export interface PriceHistoryPoint {
   date: string;
   price: number | null;
@@ -867,6 +880,15 @@ export const api = {
     }),
   watchlistDelete: (id: number) =>
     request<void>(`/api/v1/dash/watchlist/${id}`, { method: "DELETE" }),
+  watchlistCategoriesList: () =>
+    request<WatchlistCategoryItem[]>("/api/v1/dash/watchlist/categories"),
+  watchlistCategoryCreate: (payload: { category_id: number; notes?: string }) =>
+    request<{ id: number }>("/api/v1/dash/watchlist/categories", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  watchlistCategoryDelete: (id: number) =>
+    request<void>(`/api/v1/dash/watchlist/categories/${id}`, { method: "DELETE" }),
   productPriceHistory: (product_id: number, days = 30) =>
     request<PriceHistoryResponse>(
       `/api/v1/dash/products/${product_id}/price-history?days=${days}`,

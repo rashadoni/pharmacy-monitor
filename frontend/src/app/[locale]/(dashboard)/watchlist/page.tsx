@@ -1,12 +1,15 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Search, Trash2, X } from "lucide-react";
+import { BarChart3, ListTree, Plus, Search, Trash2, X } from "lucide-react";
 import { useTranslations } from "next-intl";
+import { useLocale } from "next-intl";
 import { useMemo, useState } from "react";
 import {
   api,
+  type CategoryRow,
   type WatchlistCreatePayload,
+  type WatchlistCategoryItem,
   type WatchlistItem,
   type WatchlistLink,
 } from "@/lib/api";
@@ -32,10 +35,19 @@ export default function WatchlistPage() {
     queryKey: ["watchlist"],
     queryFn: api.watchlistList,
   });
+  const { data: trackedCategories, isLoading: categoriesLoading } = useQuery({
+    queryKey: ["watchlist-categories"],
+    queryFn: api.watchlistCategoriesList,
+  });
 
   const deleteMutation = useMutation({
     mutationFn: api.watchlistDelete,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["watchlist"] }),
+  });
+  const deleteCategoryMutation = useMutation({
+    mutationFn: api.watchlistCategoryDelete,
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ["watchlist-categories"] }),
   });
 
   const filtered = useMemo(() => {
@@ -126,6 +138,37 @@ export default function WatchlistPage() {
           />
         ))}
       </div>
+
+      <section className="space-y-3 pt-4 border-t border-border">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight">{t("categories_title")}</h2>
+            <p className="text-sm text-muted-foreground">{t("categories_subtitle")}</p>
+          </div>
+          <AddCategoryForm />
+        </div>
+        {categoriesLoading && (
+          <div className="text-sm text-muted-foreground">{tCommon("loading")}</div>
+        )}
+        {trackedCategories && trackedCategories.length === 0 && (
+          <div className="rounded-lg border border-dashed border-border p-5 text-sm text-muted-foreground">
+            {t("categories_empty")}
+          </div>
+        )}
+        <div className="space-y-2">
+          {trackedCategories?.map((item) => (
+            <CategoryRow
+              key={item.id}
+              item={item}
+              onDelete={() => deleteCategoryMutation.mutate(item.id)}
+              deletePending={
+                deleteCategoryMutation.isPending &&
+                deleteCategoryMutation.variables === item.id
+              }
+            />
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
@@ -201,6 +244,123 @@ function WatchlistRow({
           <Trash2 className="h-4 w-4" />
         </button>
       )}
+    </div>
+  );
+}
+
+function CategoryRow({
+  item,
+  onDelete,
+  deletePending,
+}: {
+  item: WatchlistCategoryItem;
+  onDelete: () => void;
+  deletePending: boolean;
+}) {
+  const t = useTranslations("watchlist");
+  const tCommon = useTranslations("common");
+  const locale = useLocale();
+  const [armed, setArmed] = useState(false);
+  const label = locale === "az" && item.label_az ? item.label_az : item.label_ru;
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-3 flex items-start gap-3">
+      <div className="flex-1 min-w-0">
+        <div className="font-medium text-sm">{label}</div>
+        <div className="text-xs text-muted-foreground mt-0.5 flex flex-wrap gap-x-3">
+          {item.pharmonline_slug && <span>pharmonline: {item.pharmonline_slug}</span>}
+          {item.aptekonline_slug && <span>aptekonline: {item.aptekonline_slug}</span>}
+          {item.aloe_slug && <span>aloe: {item.aloe_slug}</span>}
+        </div>
+        <div className="flex flex-wrap gap-2 mt-2">
+          <a
+            href="/category-comparison"
+            className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
+          >
+            <BarChart3 className="h-3 w-3" />
+            {t("category_comparison")}
+          </a>
+          {item.pharmonline_slug && (
+            <a
+              href={`/comparison?category=${encodeURIComponent(item.pharmonline_slug)}`}
+              className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
+            >
+              <ListTree className="h-3 w-3" />
+              {t("category_products")}
+            </a>
+          )}
+        </div>
+      </div>
+      {armed ? (
+        <button
+          onClick={onDelete}
+          disabled={deletePending}
+          onBlur={() => setArmed(false)}
+          className="rounded border border-destructive bg-destructive/10 text-destructive px-2 py-1 text-xs font-medium hover:bg-destructive/20 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive"
+          autoFocus
+        >
+          {t("delete_arm")}
+        </button>
+      ) : (
+        <button
+          onClick={() => setArmed(true)}
+          className="text-muted-foreground hover:text-destructive p-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
+          title={tCommon("delete")}
+          aria-label={t("delete_category_confirm", { name: label })}
+        >
+          <Trash2 className="h-4 w-4" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function AddCategoryForm() {
+  const t = useTranslations("watchlist");
+  const queryClient = useQueryClient();
+  const locale = useLocale();
+  const [categoryId, setCategoryId] = useState("");
+  const { data: categories } = useQuery({
+    queryKey: ["categories"],
+    queryFn: api.categories,
+  });
+
+  const create = useMutation({
+    mutationFn: (payload: { category_id: number }) => api.watchlistCategoryCreate(payload),
+    onSuccess: () => {
+      setCategoryId("");
+      queryClient.invalidateQueries({ queryKey: ["watchlist-categories"] });
+    },
+  });
+
+  const activeCategories = useMemo(
+    () => (categories ?? []).filter((cat: CategoryRow) => cat.is_active),
+    [categories],
+  );
+
+  return (
+    <div className="flex items-center gap-2">
+      <select
+        value={categoryId}
+        onChange={(e) => setCategoryId(e.target.value)}
+        className="w-56 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        aria-label={t("category_select")}
+      >
+        <option value="">{t("category_select")}</option>
+        {activeCategories.map((cat) => (
+          <option key={cat.id} value={cat.id}>
+            {locale === "az" && cat.label_az ? cat.label_az : cat.label_ru}
+          </option>
+        ))}
+      </select>
+      <button
+        onClick={() => create.mutate({ category_id: Number(categoryId) })}
+        disabled={!categoryId || create.isPending}
+        className="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-2 text-sm font-medium hover:bg-secondary disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Plus className="h-4 w-4" />
+        {t("category_add")}
+      </button>
     </div>
   );
 }

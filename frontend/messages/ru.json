@@ -237,6 +237,14 @@
     "save_error": "Не удалось сохранить",
     "search_placeholder": "Поиск по имени или бренду…",
     "no_match": "Ничего не найдено",
+    "categories_title": "Категории",
+    "categories_subtitle": "Быстрый доступ к сравнению выбранных категорий",
+    "categories_empty": "Категории пока не добавлены.",
+    "category_select": "Выбрать категорию",
+    "category_add": "Добавить",
+    "category_comparison": "Сравнение категорий",
+    "category_products": "Товары категории",
+    "delete_category_confirm": "Удалить категорию «{name}»?",
     "items_count": "{count, plural, one {# элемент} few {# элемента} many {# элементов} other {# элементов}}"
   },
   "site": {

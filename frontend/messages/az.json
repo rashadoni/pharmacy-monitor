@@ -237,6 +237,14 @@
     "save_error": "Saxlamaq alınmadı",
     "search_placeholder": "Ad və ya brend üzrə axtar…",
     "no_match": "Heç bir nəticə tapılmadı",
+    "categories_title": "Kateqoriyalar",
+    "categories_subtitle": "Seçilmiş kateqoriyaların müqayisəsinə sürətli keçid",
+    "categories_empty": "Hələ kateqoriya əlavə olunmayıb.",
+    "category_select": "Kateqoriya seç",
+    "category_add": "Əlavə et",
+    "category_comparison": "Kateqoriya müqayisəsi",
+    "category_products": "Kateqoriya məhsulları",
+    "delete_category_confirm": "«{name}» kateqoriyası silinsin?",
     "items_count": "{count, plural, one {# qeyd} other {# qeyd}}"
   },
   "site": {

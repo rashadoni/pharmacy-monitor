@@ -237,6 +237,14 @@
     "save_error": "Save failed",
     "search_placeholder": "Search by name or brand…",
     "no_match": "No items match this search",
+    "categories_title": "Categories",
+    "categories_subtitle": "Quick access to comparison for selected categories",
+    "categories_empty": "No categories added yet.",
+    "category_select": "Select category",
+    "category_add": "Add",
+    "category_comparison": "Category comparison",
+    "category_products": "Category products",
+    "delete_category_confirm": "Delete category \"{name}\"?",
     "items_count": "{count, plural, one {# item} other {# items}}"
   },
   "site": {

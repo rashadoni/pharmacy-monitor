@@ -832,6 +832,57 @@ def test_dash_categories_create_requires_auth(client):
     assert r.status_code == 401
 
 
+def test_dash_watchlist_categories_crud(client, auth_cookie, setup_db):
+    cat = storage.Category(
+        key="vit",
+        label_ru="Витамины",
+        label_az="Vitaminlər",
+        pharmonline_slug="vitamins",
+        aloe_slug="dermanlar",
+        is_active=True,
+    )
+    setup_db.add(cat)
+    setup_db.commit()
+    setup_db.refresh(cat)
+
+    created = client.post(
+        "/api/v1/dash/watchlist/categories",
+        json={"category_id": cat.id, "notes": "priority"},
+    )
+    assert created.status_code == 201, created.text
+    tracked_id = created.json()["id"]
+
+    listed = client.get("/api/v1/dash/watchlist/categories")
+    assert listed.status_code == 200, listed.text
+    body = listed.json()
+    assert body == [
+        {
+            "id": tracked_id,
+            "category_id": cat.id,
+            "key": "vit",
+            "label_ru": "Витамины",
+            "label_az": "Vitaminlər",
+            "pharmonline_slug": "vitamins",
+            "aptekonline_slug": None,
+            "aloe_slug": "dermanlar",
+            "notes": "priority",
+            "is_active": True,
+        }
+    ]
+
+    deleted = client.delete(f"/api/v1/dash/watchlist/categories/{tracked_id}")
+    assert deleted.status_code == 204
+    assert client.get("/api/v1/dash/watchlist/categories").json() == []
+
+
+def test_dash_watchlist_categories_requires_auth(client, setup_db):
+    cat = storage.Category(key="x", label_ru="X", is_active=True)
+    setup_db.add(cat)
+    setup_db.commit()
+    r = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})
+    assert r.status_code == 401
+
+
 # ─── JWT decode/encode (no DB needed) ────────────────────────────────────────
 
 

@@ -11,7 +11,14 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src.storage import Category, Recipient, SavedView, TrackedProduct, TrackedProductLink
+from src.storage import (
+    Category,
+    Recipient,
+    SavedView,
+    TrackedCategory,
+    TrackedProduct,
+    TrackedProductLink,
+)
 
 SITES = ("pharmonline", "aptekonline", "aloe")
 
@@ -355,6 +362,69 @@ def set_link_url(
     link.status = status
     session.commit()
     return link
+
+
+# === TRACKED CATEGORIES (WATCHLIST) ===
+
+
+def add_tracked_category(
+    session: Session,
+    category_id: int,
+    *,
+    tenant_id: int = 1,
+    notes: str | None = None,
+) -> TrackedCategory:
+    category = session.get(Category, category_id)
+    if not category:
+        raise ValueError(f"Category not found: {category_id}")
+    existing = session.scalar(
+        select(TrackedCategory).where(
+            TrackedCategory.tenant_id == tenant_id,
+            TrackedCategory.category_id == category_id,
+        )
+    )
+    if existing:
+        existing.notes = notes if notes is not None else existing.notes
+        existing.is_active = True
+        session.commit()
+        return existing
+    tc = TrackedCategory(
+        tenant_id=tenant_id,
+        category_id=category_id,
+        notes=notes.strip() if notes else None,
+        is_active=True,
+    )
+    session.add(tc)
+    session.commit()
+    return tc
+
+
+def list_tracked_categories(
+    session: Session, *, tenant_id: int = 1, active_only: bool = True
+) -> list[TrackedCategory]:
+    stmt = (
+        select(TrackedCategory)
+        .join(TrackedCategory.category)
+        .where(TrackedCategory.tenant_id == tenant_id)
+        .order_by(Category.label_ru)
+    )
+    if active_only:
+        stmt = stmt.where(TrackedCategory.is_active.is_(True))
+    return list(session.scalars(stmt).all())
+
+
+def remove_tracked_category(session: Session, tracked_category_id: int, *, tenant_id: int = 1) -> bool:
+    tc = session.scalar(
+        select(TrackedCategory).where(
+            TrackedCategory.id == tracked_category_id,
+            TrackedCategory.tenant_id == tenant_id,
+        )
+    )
+    if not tc:
+        return False
+    session.delete(tc)
+    session.commit()
+    return True
 
 
 def import_from_csv(session: Session, csv_path: Path) -> int:

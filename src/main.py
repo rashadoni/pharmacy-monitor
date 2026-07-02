@@ -21,7 +21,7 @@ import click
 import structlog
 import yaml
 from dotenv import load_dotenv
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, text
 from sqlalchemy.orm import Session
 
 load_dotenv(override=True)
@@ -124,6 +124,42 @@ def _report_email_enabled() -> bool:
         "no",
         "off",
     )
+
+
+_MATCHER_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
+
+
+def _is_postgres_session(session: Session) -> bool:
+    return str(session.get_bind().url).startswith("postgresql")
+
+
+def _acquire_matcher_lock(session: Session, *, wait: bool) -> bool:
+    """Serialize matcher/rematch writes to products.canonical_id on Postgres."""
+    if not _is_postgres_session(session):
+        return True
+    if wait:
+        session.scalar(
+            text("SELECT pg_advisory_lock(hashtext(:key))"),
+            {"key": _MATCHER_ADVISORY_LOCK_KEY},
+        )
+        return True
+    acquired = session.scalar(
+        text("SELECT pg_try_advisory_lock(hashtext(:key))"),
+        {"key": _MATCHER_ADVISORY_LOCK_KEY},
+    )
+    return bool(acquired)
+
+
+def _release_matcher_lock(session: Session) -> None:
+    if not _is_postgres_session(session):
+        return
+    try:
+        session.scalar(
+            text("SELECT pg_advisory_unlock(hashtext(:key))"),
+            {"key": _MATCHER_ADVISORY_LOCK_KEY},
+        )
+    except Exception as exc:
+        log.warning("matcher_lock_release_failed", error=str(exc))
 
 
 def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | None]:
@@ -1839,26 +1875,34 @@ def run_cmd(
             except Exception as e:
                 log.warning("smoke_test_failed", error=str(e))
 
-            if effective_mode == "watchlist":
-                linked = auto_match_watchlist(session)
-                log.info("watchlist_auto_matched", linked=linked)
-            matcher.match_products(session)
-            # Auto-revalidate: match_products линкует широко (bucket+fuzzy) и НЕ
-            # блокирует guard-конфликты в primary-проходе → бренд/состав/вариант/сила
-            # несоответствия пересоздаются каждый прогон. Чистим их сразу когерентным
-            # split'ом (корень «whack-a-mole» — раньше требовался ручной rematch).
+            lock_taken = False
             try:
-                split_actions = matcher.revalidate_split(session)
-                if split_actions:
-                    log.info("revalidate_split", clusters=len(split_actions))
-            except Exception as _re:
-                log.warning("revalidate_split_failed", error=str(_re))
-            try:
-                flagged = matcher.flag_suspected_mismatches(session)
-                if flagged:
-                    log.info("price_mismatch_flags_updated", changed=flagged)
-            except Exception as _fe:
-                log.warning("flag_mismatches_failed", error=str(_fe))
+                log.info("matcher_lock_wait", run_id=run.id)
+                _acquire_matcher_lock(session, wait=True)
+                lock_taken = True
+                if effective_mode == "watchlist":
+                    linked = auto_match_watchlist(session)
+                    log.info("watchlist_auto_matched", linked=linked)
+                matcher.match_products(session)
+                # Auto-revalidate: match_products линкует широко (bucket+fuzzy) и НЕ
+                # блокирует guard-конфликты в primary-проходе → бренд/состав/вариант/сила
+                # несоответствия пересоздаются каждый прогон. Чистим их сразу когерентным
+                # split'ом (корень «whack-a-mole» — раньше требовался ручной rematch).
+                try:
+                    split_actions = matcher.revalidate_split(session)
+                    if split_actions:
+                        log.info("revalidate_split", clusters=len(split_actions))
+                except Exception as _re:
+                    log.warning("revalidate_split_failed", error=str(_re))
+                try:
+                    flagged = matcher.flag_suspected_mismatches(session)
+                    if flagged:
+                        log.info("price_mismatch_flags_updated", changed=flagged)
+                except Exception as _fe:
+                    log.warning("flag_mismatches_failed", error=str(_fe))
+            finally:
+                if lock_taken:
+                    _release_matcher_lock(session)
 
             # === Real-time alerts ===
             if not no_alerts:
@@ -1938,7 +1982,13 @@ def run_cmd(
 @cli.command("scrape")
 @click.option("--limit", type=int, default=None)
 @click.option("--site", multiple=True, type=click.Choice(list(SCRAPER_CLASSES.keys())))
-def scrape_cmd(limit: int | None, site: tuple[str, ...]) -> None:
+@click.option(
+    "--category-id",
+    type=int,
+    default=None,
+    help="Скрейпить ТОЛЬКО эту категорию (по id из таблицы categories).",
+)
+def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None) -> None:
     """Только скрейпинг — без анализа и отправки."""
     storage.init_db()
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
@@ -1950,13 +2000,17 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...]) -> None:
         session.add(run)
         session.commit()
         try:
-            slugs_by_site = {s: watchlist.categories_for_site(session, s) for s in sites}
+            slugs_by_site = {
+                s: watchlist.categories_for_site(session, s, only_category_id=category_id)
+                for s in sites
+            }
             baselines = baselines_for_sites(session, sites)
             results = asyncio.run(scrape_all(slugs_by_site, limit, ai_fallback_baselines=baselines))
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
             run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
+            run.sites_completed = ",".join(sites)
             run.status = "ok"
             run.finished_at = utcnow()
             session.commit()
@@ -1981,7 +2035,7 @@ def intraday_tick_cmd(dry_run: bool) -> None:
       1. Берёт top-30 volatile категорий (по count(price_snapshots) за 7 дней)
       2. Через Redis-rotation index выбирает следующую категорию
       3. Round-robin'ит сайт (pharmonline → aloe) с per-site rate-limit 2ч
-      4. Запускает `pharmacy-monitor run --site X --mode category --category-id N --no-alerts`
+      4. Запускает scrape-only persist для этой категории.
 
     Запускается из systemd timer ежечасно во время business hours (05-17 UTC).
     No-alerts чтобы не дублировать notifications с full nightly run.
@@ -2016,20 +2070,16 @@ def intraday_tick_cmd(dry_run: bool) -> None:
             click.echo("--dry-run: skipping actual scrape (no state mutation)")
             return
 
-    # Run в новой сессии — отдельная transaction, как делает обычный run_cmd.
-    # Вызываем тот же путь что и `pharmacy-monitor run`, но программно
-    # (не через subprocess — медленно, теряем context).
+    # Run в новой сессии — отдельная transaction. Intraday должен только
+    # обновить цены/наличие выбранной категории; полный matcher/analyzer/report
+    # остаётся за nightly/manual full run, иначе 20-минутный systemd timeout
+    # убивает тик посреди matcher и оставляет Run в status='running'.
     ctx = click.get_current_context()
     ctx.invoke(
-        run_cmd,
-        dry_run=False,
+        scrape_cmd,
         limit=None,
         site=(site,),
-        mode="category",
         category_id=cat.id,
-        hourly=False,
-        no_alerts=True,  # Phase 5.1 — supplemental, без дубликат-alerts
-        request_id=None,
     )
 
 
@@ -2075,6 +2125,10 @@ def rematch_cmd(
 
     Session = storage.make_session()
     with Session() as session:
+        lock_taken = _acquire_matcher_lock(session, wait=False)
+        if not lock_taken:
+            click.echo("Another matcher/rematch is already running; skipped.")
+            return
         if relink_dead:
             plan = matcher.relink_dead_members(session, dry_run=dry_run)
             swaps = [r for r in plan if r["action"] == "swap"]
@@ -2090,6 +2144,7 @@ def rematch_cmd(
                 click.echo("(dry-run — ничего не изменено)")
             else:
                 click.echo(f"applied {len(swaps)} swap'ов (swap_alternative → кластер is_manual)")
+            _release_matcher_lock(session)
             return
 
         if revalidate:
@@ -2106,6 +2161,7 @@ def rematch_cmd(
                 click.echo(f"(dry-run — {len(actions)} кластеров, ничего не изменено)")
             else:
                 click.echo(f"revalidate: re-split {len(actions)} кластеров (+rejections)")
+            _release_matcher_lock(session)
             return
 
         if reset:
@@ -2151,6 +2207,7 @@ def rematch_cmd(
         # Флагирование подозрительных расхождений цен
         flagged = matcher.flag_suspected_mismatches(session)
         click.echo(f"Price-spread flags updated: {flagged} matches changed.")
+        _release_matcher_lock(session)
 
 
 _VALIDATE_CLIENT_SITE = "pharmonline"  # сайт-клиент — валидировать только с --force

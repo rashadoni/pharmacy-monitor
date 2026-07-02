@@ -477,6 +477,30 @@ class TrackedProduct(Base):
     )
 
 
+class TrackedCategory(Base):
+    """Категория, которую клиент хочет держать под рукой в watchlist.
+
+    Сравнение берётся из уже существующих category-comparison/comparison экранов;
+    эта таблица только хранит приоритетные категории на tenant.
+    """
+
+    __tablename__ = "tracked_categories"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "category_id", name="uq_tracked_category_tenant_category"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    category_id: Mapped[int] = mapped_column(
+        ForeignKey("categories.id", ondelete="CASCADE"), index=True
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    category: Mapped[Category] = relationship()
+
+
 class TrackedProductLink(Base):
     """Привязка watchlist-записи к конкретной странице на конкретном сайте.
 
