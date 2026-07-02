@@ -1625,7 +1625,7 @@ def _price_age_days(now: datetime, last_seen: datetime | None) -> int | None:
 
     tz-defensive: prod-колонка naive (Postgres timestamp without tz), но если
     прилетит aware datetime — нормализуем (иначе naive-aware вычитание упало бы
-    TypeError'ом). Будущие timestamp'ы (clock skew между Mac-скрейпером и prod)
+    TypeError'ом). Будущие timestamp'ы (clock skew между scraper runtime и API)
     клампятся в 0, чтобы age не уходил в минус.
     """
     if last_seen is None:

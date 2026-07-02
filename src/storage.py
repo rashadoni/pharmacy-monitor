@@ -678,7 +678,7 @@ def _apply_lightweight_migrations(engine) -> None:
             ("tracked_products", "tenant_id", "INTEGER DEFAULT 1"),
             ("stock_levels", "tenant_id", "INTEGER DEFAULT 1"),
             ("supplier_prices", "tenant_id", "INTEGER DEFAULT 1"),
-            # 2026-05-11: per-site breakdown для smoke_test (multi-site Mac runs)
+            # 2026-05-11: per-site breakdown для smoke_test (multi-site runs)
             ("runs", "products_per_site", "JSON"),
             # 2026-05-11 (вечер): per-(site,category) breakdown для UI coverage panel
             ("runs", "products_per_site_category", "JSON"),

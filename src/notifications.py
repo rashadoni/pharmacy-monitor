@@ -250,8 +250,9 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                         log.warning("telegram_batch_failed", user=user.email, error=str(exc))
 
             # Коммитим прогресс СРАЗУ после каждого получателя: успешно отправленное
-            # помечаем channels_sent и фиксируем. Если commit упадёт (tunnel-EOF на
-            # Mac-DR-пути), повторная рассылка ограничится ОДНИМ получателем, а не
+            # помечаем channels_sent и фиксируем. Если commit упадёт (например,
+            # transient DB/network fault), повторная рассылка ограничится ОДНИМ
+            # получателем, а не
             # всей пачкой (единый end-of-batch commit мог бы продублировать всем).
             if sent_now:
                 for eid, chans in sent_now.items():

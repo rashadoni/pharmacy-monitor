@@ -2233,9 +2233,9 @@ def validate_links_cmd(
     """HTTP-проверка URL товаров → помечает 404-страницы (Product.url_dead_at).
 
     aptekonline JSON API листит «фантомные» товары (в каталоге, но страница 404).
-    Comparison скрывает помеченные. Запускать с НЕ-забаненного IP (Mac/Baku — для
-    aptekonline Hetzner-IP забанен). Rate-limit + circuit-breaker + mass-dead cap
-    защищают единственный рабочий IP от бана и comparison от обнуления (аудит).
+    Comparison скрывает помеченные. Запускать только через route, который имеет
+    рабочий доступ к сайту (server/proxy path). Rate-limit + circuit-breaker +
+    mass-dead cap защищают рабочий route от бана и comparison от обнуления.
     """
     import asyncio
 
