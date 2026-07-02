@@ -395,8 +395,13 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
 | Сайт | Где | Чем | Proxy |
 |---|---|---|---|
 | **pharmonline.az** | Hetzner prod | **Meteor DDP WebSocket** (`src/scrapers/pharmonline_ddp.py`) | IPRoyal residential `geo.iproyal.com:12321` |
-| **aloe.az** | Hetzner prod | Playwright DOM (`src/scrapers/aloe.py`) | Direct (no proxy needed) |
-| **aptekonline.az** | **Mac launchd only** | httpx JSON API (`src/scrapers/aptekonline.py`) | Direct from Baku-IP |
+| **aloe.az** | Hetzner prod | RSC/HTTP parser (`src/scrapers/aloe.py`) | Direct (no proxy needed) |
+| **aptekonline.az** | Hetzner prod | httpx JSON API (`src/scrapers/aptekonline.py`) | Decodo AZ residential |
+
+Mac scraping is retired. `com.pharmacy-monitor.scrape` and
+`com.pharmacy-monitor.watch` should remain unloaded/disabled; the scripts under
+`infra/local/` are fail-closed unless `PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1` is
+set for an explicit disaster-recovery run.
 
 ### DDP recovery procedures
 
@@ -404,7 +409,8 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
 - Cloudflare/IPRoyal session ban после high-volume scrape
 - Wait 5-10 мин, retry — IPRoyal session rotation помогает
 - Если повторяется: `systemctl restart pharmacy-monitor-scrape@pharmonline`
-- Если упорно: переключиться на Mac launchd как fallback (см. `infra/local/run-scrape.sh`)
+- Если упорно: проверить баланс/доступ paid proxy и DDP reconnect logs; Mac
+  launchd не является штатным fallback.
 
 **`ConnectionClosedError: no close frame received or sent`** во время persist phase:
 - Это нормально — DDP server тайм-аутит ping pong когда event loop долго блокирован

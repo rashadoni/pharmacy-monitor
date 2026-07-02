@@ -1,8 +1,13 @@
 #!/bin/bash
 #
-# Local Mac wrapper для nightly pharmacy-monitor scrape.
+# DEPRECATED: Local Mac wrapper for emergency-only pharmacy-monitor scrape.
 #
-# Запускается из launchd (см. com.pharmacy-monitor.scrape.plist) или вручную:
+# Production scraping no longer depends on this Mac. All scraping is server-side:
+# pharmonline via paid proxy/DDP, aptekonline via paid AZ residential proxy, aloe
+# direct/RSC. The script is fail-closed unless explicitly enabled for a one-off
+# disaster-recovery run with PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1.
+#
+# Historical launchd/manual usage:
 #   bash infra/local/run-scrape.sh                    # все три сайта
 #   bash infra/local/run-scrape.sh --site pharmonline # только pharmonline
 #
@@ -53,6 +58,12 @@ DEFAULT_ARGS=(
 mkdir -p "$(dirname "$LOG_FILE")"
 exec >>"$LOG_FILE" 2>&1
 echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | run-scrape.sh start ====="
+
+if [[ "${PHARMACY_MONITOR_ENABLE_MAC_SCRAPE:-0}" != "1" ]]; then
+    echo "DISABLED: Mac scraping is retired. Server-side paid services own all scrapes."
+    echo "Set PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 only for an explicit DR run."
+    exit 0
+fi
 
 cd "$PROJECT_DIR"
 

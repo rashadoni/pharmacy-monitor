@@ -18,19 +18,19 @@ Comprehensive overview за после Phase 6.1 (URL-based i18n) и устан�
                   ┌─────────────────────────────┼─────────────────────────────┐
                   │                             │                             │
                   ▼                             ▼                             ▼
-       Hetzner cx33 prod (DE)        Mac launchd (Baku)             User browsers
+       Hetzner cx33 prod (DE)        Mac dev/diagnostics            User browsers
        ┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
        │  pharmonline DDP     │      │  aptekonline httpx   │      │  Chrome / Safari     │
-       │  (Meteor WebSocket)  │      │  (JSON API direct)   │      │  (RU / AZ / EN)      │
-       │  via IPRoyal proxy   │      │  Baku-IP, no proxy   │      └──────────┬───────────┘
-       │  → 01:00 + intraday  │      │  → 18:00 Asia/Baku   │                 │ HTTPS
+       │  (Meteor WebSocket)  │      │  (no scrape runtime) │      │  (RU / AZ / EN)      │
+       │  via IPRoyal proxy   │      │                      │      └──────────┬───────────┘
+       │  → 01:00 + intraday  │      │  DB tunnel only      │                 │ HTTPS
        │                      │      │                      │                 │
-       │  aloe Playwright DOM │      │  (also pharmonline   │                 │
-       │  direct connection   │      │   as DR fallback)    │                 ▼
+       │  aloe RSC/HTTP       │      │  scrape launchd      │                 │
+       │  direct connection   │      │  retired/disabled    │                 ▼
        │  → 03:00 + intraday  │      │                      │      ┌──────────────────────┐
        │                      │      └──────────┬───────────┘      │  Namecheap DNS       │
        │  AI crawler          │                 │ SSH tunnel        │  leaddrive.cloud → A │
-       │  (Claude API fallback)│                │ Mac:5433→prod:5432│                      │
+       │  (Claude API fallback)│                │ for diagnostics   │                      │
        └──────────┬───────────┘                 │                   └──────────┬───────────┘
                   │                             ▼                              │
                   │                  ┌──────────────────────┐                  ▼
@@ -245,11 +245,11 @@ State management: React Query (TanStack). Cache invalidation после mutation
   ├── report (HTML + XLSX в reports/)
   └── SMTP send (Resend) — silent no-op если не configured
 
-02:00 UTC ─ pharmacy-monitor-scrape@aptekonline.timer (DISABLED on prod)
-  └── (выполняется Mac launchd 14:00 UTC через SSH tunnel в prod DB)
+02:00 UTC ─ pharmacy-monitor-scrape@aptekonline.timer fires
+  └── server-side httpx JSON scrape via Decodo AZ residential proxy
 
 03:00 UTC ─ pharmacy-monitor-scrape@aloe.timer fires
-  └── (same pipeline, direct connection, 1-2k products)
+  └── server-side RSC/HTTP scrape, direct connection
 
 04:00 UTC ─ pharmacy-monitor-backup.timer fires
   └── pg_dump → /var/backups/pharmacy-monitor/*.sql.gz.gpg (GPG encrypted)
@@ -331,7 +331,9 @@ Persistent state:
 ```
 - pharmacy-monitor git clone (development)
 - Persistent SSH tunnel Mac:5433 → prod:5432 (launchd, see infra/local/com.pharmacy-monitor.db-tunnel.plist)
-- Mac launchd job для daily Mac-side scrapes (pharmonline+aptekonline когда нужны Baku-IP)
+- Mac scrape launchd jobs are retired and should stay unloaded/disabled. Local
+  scrape scripts are fail-closed unless `PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1`
+  is set for explicit DR.
 - ~/.claude.json — 9 MCP servers user-scope
 - Local Postgres optional (for dev DB)
 ```
@@ -359,13 +361,17 @@ Persistent state:
 - **`Product.barcode` ≠ EAN-13 для pharmonline** — это 9-digit internal article number (pharmacy SKU). Cross-site matching через barcode не работает для AZ pharmacies в принципе. Matcher v2 priority-0 эффективен только когда несколько сайтов отдают тот же barcode (rare).
 - **Diff-only persist** — snapshot создаётся только при price change. `Product.last_seen_at` обновляется КАЖДЫЙ run (canonical "видели сегодня").
 - **`Run.products_scraped`** = page hits, не unique products. Уникальных по `external_id` будет меньше.
-- **Mac launchd run и prod systemd timer пишут в одну prod БД** через SSH tunnel. Не запускать одновременно — конфликт на `(site, external_id)`.
+- **Scrape concurrency** — server watcher skips when any `pharmacy-monitor run`,
+  `scrape`, `intraday-tick`, or `rematch` is active; matcher/rematch uses a
+  Postgres advisory lock for `canonical_id` writes.
 
 ### Scraping
 
 - **Pharmonline DDP**: WebSocket keep-alive фейлится во время persist phase (event loop blocked). Reconnect-on-close (Phase 1c.4) восстанавливает session.
-- **Aloe `Product.url`** — **БАГ** (Task #33): scraper пишет URL listing page, не product detail. User не может перейти на конкретный товар из дашборда. Чинить.
-- **Aptekonline prod-IP banned**, поэтому Mac launchd only. Mac launchd проксирует через SSH tunnel в prod БД.
+- **Aloe scraper** — server-side RSC/HTTP parser reads Next flight data and uses
+  product detail slugs; production run #382 verified `dermanlar` 480/480 pages.
+- **Aptekonline** — server-side through Decodo AZ residential proxy; Mac launchd
+  is no longer a runtime dependency.
 
 ### Frontend
 

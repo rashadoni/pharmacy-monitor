@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd config для polling scrape-requests из UI.
+  DEPRECATED 2026-07-03.
+  UI scrape queue polling now runs on the server via
+  pharmacy-monitor-scrape-watcher.timer. This plist should stay unloaded/disabled.
+  The target script is fail-closed unless PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 is
+  explicitly set.
+
+  Historical launchd config for polling scrape-requests from UI.
   Тикает раз в 60 секунд, опрашивает прод API, исполняет если есть pending.
 
   Установка:

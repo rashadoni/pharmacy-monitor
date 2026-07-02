@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd config для ежедневного pharmonline-скрейпа с ноута (Baku-IP).
+  DEPRECATED 2026-07-03.
+  Mac scraping is retired; all sites scrape from the server through paid
+  services/proxies. This plist should stay unloaded/disabled. The target script
+  is fail-closed unless PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 is explicitly set.
+
+  Historical launchd config for daily pharmonline/aptek scrape from Mac (Baku-IP).
   Aloe и aptekonline крутятся на проде, см. CLAUDE.md → "Runtime layout".
 
   Установка (один раз):

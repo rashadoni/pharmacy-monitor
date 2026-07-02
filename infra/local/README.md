@@ -1,4 +1,25 @@
-# Local Mac runtime для pharmonline scrape
+# DEPRECATED: Local Mac scrape runtime
+
+Production scraping is fully server-side as of 2026-07-03. The paid services now
+own the scrape path:
+
+| Site | Runtime |
+|---|---|
+| pharmonline.az | Hetzner prod, DDP through paid proxy |
+| aptekonline.az | Hetzner prod, Decodo AZ residential proxy |
+| aloe.az | Hetzner prod, direct RSC/HTTP parser |
+
+`com.pharmacy-monitor.scrape` and `com.pharmacy-monitor.watch` must stay
+unloaded/disabled. The local scrape scripts are fail-closed and exit without
+scraping unless `PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1` is set for an explicit
+one-off disaster-recovery run.
+
+The DB tunnel and backup helpers in this folder are not scraper jobs and can
+remain available for diagnostics/backup workflows.
+
+---
+
+# Historical Mac runtime notes
 
 Pharmonline.az **И** aptekonline.az оба забанили Hetzner DE IP в конце апреля
 2026 (HTTP 403 даже на JSON API). Только **aloe** продолжает крутиться на проде

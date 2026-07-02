@@ -1,6 +1,11 @@
 #!/bin/bash
 #
-# Pharmacy Monitor — Mac launchd watcher для UI-triggered scrape requests.
+# DEPRECATED: Mac launchd watcher for UI-triggered scrape requests.
+#
+# Production queue polling now runs on the server via
+# infra/server/watch-scrape-queue.sh and paid proxy services. This Mac watcher is
+# fail-closed unless explicitly enabled for a one-off DR run with
+# PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1.
 #
 # Каждые 60 секунд (тикает launchd) опрашивает прод API:
 #   GET /api/v1/internal/pending-scrape
@@ -54,6 +59,12 @@ _etime_is_stale() {
 mkdir -p "$(dirname "$LOG_FILE")"
 exec >>"$LOG_FILE" 2>&1
 echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') | watch-scrape-queue tick ====="
+
+if [[ "${PHARMACY_MONITOR_ENABLE_MAC_SCRAPE:-0}" != "1" ]]; then
+    echo "DISABLED: Mac scrape watcher is retired. Server-side watcher owns the queue."
+    echo "Set PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 only for an explicit DR run."
+    exit 0
+fi
 
 cd "$PROJECT_DIR"
 
