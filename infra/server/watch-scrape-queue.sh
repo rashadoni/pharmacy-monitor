@@ -31,6 +31,9 @@ VENV_BIN="${VENV_BIN:-$PROJECT_DIR/.venv/bin}"
 SCRAPE_MAX_HOURS="${SCRAPE_MAX_HOURS:-6}"  # дольше = прогон/запрос считаем зависшим
 
 log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | $*"; }
+active_pharmacy_monitor_job() {
+    pgrep -f "pharmacy-monitor (run|scrape|intraday-tick|rematch)( |$)" >/dev/null 2>&1
+}
 
 log "watch-scrape-queue tick (server)"
 
@@ -42,10 +45,10 @@ cd "$PROJECT_DIR" || { log "ERROR: cannot cd $PROJECT_DIR"; exit 1; }
 
 # === Reap зависших 'running' запросов =======================================
 # При синхронной модели запрос остаётся 'running' только если вотчер убили
-# в середине скрейпа (reboot / TimeoutStartSec). Если активного
-# `pharmacy-monitor run` нет, а запрос висит 'running' > SCRAPE_MAX_HOURS —
+# в середине скрейпа (reboot / TimeoutStartSec). Если активного scrape/rematch
+# процесса нет, а запрос висит 'running' > SCRAPE_MAX_HOURS —
 # метим failed, чтобы UI-антиспам (409) разблокировался. Best-effort, не фатально.
-if ! pgrep -f "pharmacy-monitor run" >/dev/null 2>&1; then
+if ! active_pharmacy_monitor_job; then
     "$VENV_BIN/python" - "$SCRAPE_MAX_HOURS" <<'PY' 2>/dev/null || true
 import sys, datetime
 from sqlalchemy import select
@@ -74,13 +77,13 @@ PY
 fi
 
 # === Pgrep guard ============================================================
-# Не опрашиваем очередь, пока активен ЛЮБОЙ `pharmacy-monitor run` (плановый
-# таймер, intraday-тик или предыдущий button-прогон): параллельный persist даёт
-# конфликты по unique (site, external_id) + дубли Match'ей. Guard ПЕРЕД опросом,
-# иначе pending-scrape пометит запрос 'running' на GET, а мы его не запустим.
+# Не опрашиваем очередь, пока активен ЛЮБОЙ scrape/matcher CLI-процесс:
+# плановый run, scrape-only intraday, ручной scrape или rematch. Параллельный
+# persist/match даёт конфликты по unique (site, external_id) + дубли Match'ей.
+# Guard ПЕРЕД опросом, иначе pending-scrape пометит запрос 'running', а мы его
 # Следующий тик (через ~60с) повторит.
-if pgrep -f "pharmacy-monitor run" >/dev/null 2>&1; then
-    log "skip: a pharmacy-monitor run is already active"
+if active_pharmacy_monitor_job; then
+    log "skip: a pharmacy-monitor scrape/matcher job is already active"
     exit 0
 fi
 

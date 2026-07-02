@@ -114,14 +114,14 @@ def test_health_endpoint_redis_unset_returns_null(client, monkeypatch):
 
 
 def test_health_endpoint_flags_staleness(client, setup_db):
-    """Product older than 30h → staleness_warning=true, status=degraded."""
+    """Daily-cadence site older than 30h → staleness_warning=true, status=degraded."""
 
     db = setup_db
     old = datetime.now(timezone.utc) - timedelta(hours=48)
     db.add(
         storage.Product(
             tenant_id=1,
-            site="pharmonline",
+                site="aloe",
             external_id="stale-1",
             url="https://example.com/x",
             name="Stale",
@@ -137,8 +137,8 @@ def test_health_endpoint_flags_staleness(client, setup_db):
     assert body["staleness_warning"] is True
     assert body["status"] == "degraded"
     sites = {s["site"]: s for s in body["sites"]}
-    assert "pharmonline" in sites
-    assert sites["pharmonline"]["hours_since"] >= 48
+    assert "aloe" in sites
+    assert sites["aloe"]["hours_since"] >= 48
 
 
 # ─── Request ID middleware (Phase 0.5) ───────────────────────────────────────

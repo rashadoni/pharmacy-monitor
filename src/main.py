@@ -2129,85 +2129,85 @@ def rematch_cmd(
         if not lock_taken:
             click.echo("Another matcher/rematch is already running; skipped.")
             return
-        if relink_dead:
-            plan = matcher.relink_dead_members(session, dry_run=dry_run)
-            swaps = [r for r in plan if r["action"] == "swap"]
-            skips = [r for r in plan if r["action"] != "swap"]
-            click.echo(f"relink-dead: {len(swaps)} swap, {len(skips)} skip")
-            for r in swaps:
-                click.echo(
-                    f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} → live#{r['new']} (score {r['score']})"
-                )
-            for r in skips[:20]:
-                click.echo(f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} — {r['action']}")
-            if dry_run:
-                click.echo("(dry-run — ничего не изменено)")
-            else:
-                click.echo(f"applied {len(swaps)} swap'ов (swap_alternative → кластер is_manual)")
-            _release_matcher_lock(session)
-            return
-
-        if revalidate:
-            # Coherent split (keep largest spec-coherent cross-site group, eject
-            # outliers; dissolve only if none). Same logic now auto-runs after
-            # match_products in the scrape pipeline.
-            actions = matcher.revalidate_split(session, dry_run=dry_run)
-            for a in actions:
-                if a["action"] == "dissolve":
-                    click.echo(f"  cl{a['match_id']}: DISSOLVE {a['members']}")
+        try:
+            if relink_dead:
+                plan = matcher.relink_dead_members(session, dry_run=dry_run)
+                swaps = [r for r in plan if r["action"] == "swap"]
+                skips = [r for r in plan if r["action"] != "swap"]
+                click.echo(f"relink-dead: {len(swaps)} swap, {len(skips)} skip")
+                for r in swaps:
+                    click.echo(
+                        f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} → live#{r['new']} (score {r['score']})"
+                    )
+                for r in skips[:20]:
+                    click.echo(f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} — {r['action']}")
+                if dry_run:
+                    click.echo("(dry-run — ничего не изменено)")
                 else:
-                    click.echo(f"  cl{a['match_id']}: KEEP {a['keep']}, EJECT {a['eject']}")
-            if dry_run:
-                click.echo(f"(dry-run — {len(actions)} кластеров, ничего не изменено)")
-            else:
-                click.echo(f"revalidate: re-split {len(actions)} кластеров (+rejections)")
+                    click.echo(f"applied {len(swaps)} swap'ов (swap_alternative → кластер is_manual)")
+                return
+
+            if revalidate:
+                # Coherent split (keep largest spec-coherent cross-site group, eject
+                # outliers; dissolve only if none). Same logic now auto-runs after
+                # match_products in the scrape pipeline.
+                actions = matcher.revalidate_split(session, dry_run=dry_run)
+                for a in actions:
+                    if a["action"] == "dissolve":
+                        click.echo(f"  cl{a['match_id']}: DISSOLVE {a['members']}")
+                    else:
+                        click.echo(f"  cl{a['match_id']}: KEEP {a['keep']}, EJECT {a['eject']}")
+                if dry_run:
+                    click.echo(f"(dry-run — {len(actions)} кластеров, ничего не изменено)")
+                else:
+                    click.echo(f"revalidate: re-split {len(actions)} кластеров (+rejections)")
+                return
+
+            if reset:
+                # Сброс canonical_id только у авто-матчей
+                auto_match_ids = session.scalars(
+                    select(storage.Match.id).where(storage.Match.is_manual.is_(False))
+                ).all()
+                if auto_match_ids:
+                    session.execute(
+                        sa_update(storage.Product)
+                        .where(storage.Product.canonical_id.in_(auto_match_ids))
+                        .values(canonical_id=None)
+                    )
+                    session.execute(
+                        sa_update(storage.Match)
+                        .where(storage.Match.is_manual.is_(False))
+                        .values(needs_review=False)
+                    )
+                    # Удаляем авто-матчи из matches таблицы
+                    for mid in auto_match_ids:
+                        m = session.get(storage.Match, mid)
+                        if m and not m.is_manual:
+                            session.delete(m)
+                    session.commit()
+                    click.echo(f"Reset {len(auto_match_ids)} auto-matches.")
+
+            # Заново нормализуем name_normalized (с учётом последних изменений пайплайна)
+            click.echo("Re-normalizing name_normalized…")
+            from src.normalize import normalize_name
+
+            products = session.scalars(select(storage.Product)).all()
+            for p in products:
+                p.name_normalized = normalize_name(p.name or "")
+            session.commit()
+            click.echo(f"Re-normalized {len(products)} products.")
+
+            # Запуск матчинга
+            thr = threshold if threshold is not None else matcher.FUZZY_THRESHOLD
+            click.echo(f"Running matcher (threshold={thr})…")
+            clusters = matcher.match_products(session, fuzzy_threshold=thr)
+            click.echo(f"Matcher done: {clusters} clusters created/updated.")
+
+            # Флагирование подозрительных расхождений цен
+            flagged = matcher.flag_suspected_mismatches(session)
+            click.echo(f"Price-spread flags updated: {flagged} matches changed.")
+        finally:
             _release_matcher_lock(session)
-            return
-
-        if reset:
-            # Сброс canonical_id только у авто-матчей
-            auto_match_ids = session.scalars(
-                select(storage.Match.id).where(storage.Match.is_manual.is_(False))
-            ).all()
-            if auto_match_ids:
-                session.execute(
-                    sa_update(storage.Product)
-                    .where(storage.Product.canonical_id.in_(auto_match_ids))
-                    .values(canonical_id=None)
-                )
-                session.execute(
-                    sa_update(storage.Match)
-                    .where(storage.Match.is_manual.is_(False))
-                    .values(needs_review=False)
-                )
-                # Удаляем авто-матчи из matches таблицы
-                for mid in auto_match_ids:
-                    m = session.get(storage.Match, mid)
-                    if m and not m.is_manual:
-                        session.delete(m)
-                session.commit()
-                click.echo(f"Reset {len(auto_match_ids)} auto-matches.")
-
-        # Заново нормализуем name_normalized (с учётом последних изменений пайплайна)
-        click.echo("Re-normalizing name_normalized…")
-        from src.normalize import normalize_name
-
-        products = session.scalars(select(storage.Product)).all()
-        for p in products:
-            p.name_normalized = normalize_name(p.name or "")
-        session.commit()
-        click.echo(f"Re-normalized {len(products)} products.")
-
-        # Запуск матчинга
-        thr = threshold if threshold is not None else matcher.FUZZY_THRESHOLD
-        click.echo(f"Running matcher (threshold={thr})…")
-        clusters = matcher.match_products(session, fuzzy_threshold=thr)
-        click.echo(f"Matcher done: {clusters} clusters created/updated.")
-
-        # Флагирование подозрительных расхождений цен
-        flagged = matcher.flag_suspected_mismatches(session)
-        click.echo(f"Price-spread flags updated: {flagged} matches changed.")
-        _release_matcher_lock(session)
 
 
 _VALIDATE_CLIENT_SITE = "pharmonline"  # сайт-клиент — валидировать только с --force
