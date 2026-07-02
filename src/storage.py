@@ -53,7 +53,7 @@ class Run(Base):
     sites_completed: Mapped[str | None] = mapped_column(String(200), nullable=True)
     # Per-site breakdown {site: count}. Nullable для backward-compat со старыми
     # runs (до 2026-05-11). Используется smoke_test'ом для точной per-site
-    # baseline в multi-site прогонах (Mac launchd pharmonline+aptekonline).
+    # baseline в multi-site/server-side прогонах.
     products_per_site: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Per-(site,category) breakdown {site: {category_label: count}}. Заполняется
     # после persist'а: показывает сколько товаров скрейпер увидел по каждому
@@ -68,12 +68,13 @@ class ScrapeRequest(Base):
     """Очередь scrape-запросов, запущенных пользователем через UI.
 
     Клиент жмёт «▶️ Запустить scan сейчас» → backend создаёт row здесь со
-    status='pending'. Mac launchd-watcher (плистом com.pharmacy-monitor.watch,
-    тикает каждые 60 секунд) polls API на pending → если есть, исполняет
-    `pharmacy-monitor run ...` через SSH-tunnel → PATCH запись status='ok'+run_id.
+    status='pending'. Server-side watcher (`pharmacy-monitor-scrape-watcher.timer`)
+    polls API на pending → если есть, исполняет `pharmacy-monitor run ...` на
+    прод-сервере через оплаченные proxy/direct scrape-пути → PATCH запись
+    status='ok'+run_id.
 
-    Зачем не выполнять сразу на проде: pharmonline+aptekonline бенят Hetzner-IP,
-    реально scrape идёт только с Mac (Baku-IP). Поэтому очередь.
+    Очередь нужна, чтобы UI не держал HTTP request во время долгого scrape и
+    чтобы watcher сериализовал тяжёлые run/scrape/rematch задачи.
     """
 
     __tablename__ = "scrape_requests"

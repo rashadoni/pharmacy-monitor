@@ -92,7 +92,8 @@ async def check_urls(
     gate = asyncio.Lock()
     own = client is None
     if own:
-        # trust_env=False: всегда прямое соединение (Baku-IP), игнорируя env-прокси.
+        # trust_env=False: всегда прямое соединение с текущего runtime-хоста,
+        # игнорируя env-прокси.
         client = httpx.AsyncClient(
             follow_redirects=True, timeout=15.0, headers={"User-Agent": _UA}, trust_env=False
         )

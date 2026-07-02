@@ -121,10 +121,9 @@ def check_health(
         report.issues.extend(_check_brand_coverage_drop(session, last_run.id))
 
     # 7. Per-site silence — `stale_run` смотрит только на ПОСЛЕДНИЙ run в БД, но
-    # один сайт может молчать неделю пока другие отрабатывают. Например pharm/apt
-    # на Mac launchd, aloe на проде — если Mac уснул, aloe-run всё равно свежий,
-    # и stale_run check ничего не скажет о pharm/apt. Проверяем каждый сайт
-    # отдельно.
+    # один сайт может молчать неделю пока другие отрабатывают. Например aloe-run
+    # может быть свежим, а недельный pharmonline/aptekonline timer не обновлялся.
+    # Проверяем каждый сайт отдельно.
     report.issues.extend(_check_site_silence(session, max_age_hours))
 
     # 8. Полный отказ сайта: последний прогон, включавший сайт, собрал РОВНО 0
@@ -448,14 +447,10 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
 # НЕДЕЛЮ (Decodo, Пн 02:00 UTC) — «молчит» только если нет обновлений >8 дней,
 # иначе hourly health-check спамил бы critical 6 из 7 дней (alert fatigue, маскирует
 # реальные сбои Decodo/баланса).
-# TODO (при отключении Mac launchd): pharmonline идёт Пн/Ср/Пт, зазор Пт→Пн ~72ч →
-# поднять его порог до ~80ч. Сейчас НЕ переопределяем: Mac ежедневно обновляет
-# pharmonline last_seen (DR-фоллбэк ещё включён), поэтому суточные 26ч корректны.
 _SITE_MAX_AGE_HOURS: dict[str, int] = {
     "aptekonline": 8 * 24 + 6,  # 198ч = 8 суток + 6ч jitter (недельный таймер)
     # pharmonline тоже недельный таймер (Mon 01:00). Без этого override default
-    # 26ч давал бы ложный site_silent 6 из 7 дней, как только Mac-DR-фолбэк
-    # (ежедневно освежающий pharmonline) будет отключён. Инертен пока Mac жив.
+    # 26ч давал бы ложный site_silent 6 из 7 дней.
     "pharmonline": 8 * 24 + 6,
 }
 

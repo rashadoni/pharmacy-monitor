@@ -953,7 +953,7 @@ def dash_change_password(
 class ScrapeTriggerIn(BaseModel):
     mode: str = "all"  # 'all' | 'category'
     category_id: int | None = None
-    sites: list[str] | None = None  # ["pharmonline", "aptekonline"] etc
+    sites: list[str] | None = None  # ["pharmonline", "aptekonline", "aloe"] etc
 
 
 @app.post("/api/v1/dash/scrape/trigger", status_code=202)
@@ -962,7 +962,7 @@ def dash_scrape_trigger(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """Поставить scrape-запрос в очередь. Mac launchd-watcher подберёт в течение ~60 секунд.
+    """Поставить scrape-запрос в очередь. Server watcher подберёт в течение ~60 секунд.
 
     Использует таблицу `scrape_requests`. Возвращает 202 + id запроса —
     UI polls статус до status='ok'/'failed'.
@@ -1089,12 +1089,12 @@ def dash_scrape_requests(
     return out
 
 
-# ─── Internal endpoints для Mac launchd-watcher ─────────────────────────────
+# ─── Internal endpoints для server-side scrape watcher ──────────────────────
 
 
 @app.get("/api/v1/internal/pending-scrape", dependencies=[Depends(require_api_key)])
 def internal_pending_scrape(db: Session = Depends(get_db)):
-    """Возвращает старейший pending запрос (для Mac watcher'а).
+    """Возвращает старейший pending запрос (для server watcher'а).
 
     Auth via X-API-Key header (require_api_key, same as legacy ERP endpoints).
     """
@@ -1131,7 +1131,7 @@ def internal_scrape_complete(
     payload: ScrapeCompleteIn,
     db: Session = Depends(get_db),
 ):
-    """Mac watcher вызывает после завершения. status → 'ok' или 'failed'.
+    """Server watcher вызывает после завершения. status → 'ok' или 'failed'.
 
     Идемпотентность: если запрос уже помечен 'ok' (через `pharmacy-monitor run
     --request-id` сразу после persist phase) — НЕ откатываем обратно в 'failed',

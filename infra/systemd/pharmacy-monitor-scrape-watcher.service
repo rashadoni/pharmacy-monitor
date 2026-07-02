@@ -11,10 +11,10 @@ Group=pm
 WorkingDirectory=/opt/pharmacy-monitor
 EnvironmentFile=/etc/pharmacy-monitor/env
 ExecStart=/bin/bash /opt/pharmacy-monitor/infra/server/watch-scrape-queue.sh
-# Синхронный прогон может быть долгим (all-sites ≈ pharmonline ~2-3ч). По
+# Синхронный прогон может быть долгим (all-sites включает pharmonline ~7ч). По
 # таймауту systemd убьёт весь cgroup (вкл. дочерний scrape) → запрос потом
 # подберёт reap. Держим запас под полный прогон.
-TimeoutStartSec=14400
+TimeoutStartSec=36000
 
 # Security (зеркало pharmacy-monitor-scrape@.service)
 NoNewPrivileges=true

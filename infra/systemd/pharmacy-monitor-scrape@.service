@@ -10,7 +10,8 @@ Group=pm
 WorkingDirectory=/opt/pharmacy-monitor
 EnvironmentFile=/etc/pharmacy-monitor/env
 ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor run --site %i
-TimeoutStartSec=14400  ; 4h max for full mega-scrape
+# 10h max for full mega-scrape (pharmonline DDP can run ~7h)
+TimeoutStartSec=36000
 
 # Security
 NoNewPrivileges=true

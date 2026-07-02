@@ -44,8 +44,9 @@ INTRADAY_TOP_N_CATEGORIES = 30
 # Мин промежуток между intraday-прогонами на ОДНОМ сайте (Redis TTL).
 INTRADAY_PER_SITE_MIN_GAP_SEC = 2 * 3600  # 2 часа
 
-# Какие сайты допустимы в intraday rotation. aptekonline-on-prod забанен,
-# Mac launchd только раз/день — поэтому исключён. aloe и pharmonline — OK.
+# Какие сайты допустимы в intraday rotation. aptekonline исключён: его
+# server-side путь тяжёлый и недельный через AZ residential proxy, без лёгкого
+# внутридневного категорийного refresh.
 INTRADAY_SITES = ("pharmonline", "aloe")
 
 # Окно для подсчёта volatility (count price changes per category per N days).
@@ -256,7 +257,9 @@ def pick_next_scrape_target(
     site_to_slug = {
         "pharmonline": cat.pharmonline_slug,
         "aloe": cat.aloe_slug,
-        # aptekonline исключён — не intraday-able с прода (Mac launchd only).
+        # aptekonline исключён из intraday: прод-скрейп server-side, но тяжёлый
+        # weekly-путь через AZ residential proxy пока не используется для
+        # лёгких внутридневных категорийных тиков.
     }
 
     for site in INTRADAY_SITES:
