@@ -8,6 +8,12 @@ __pycache__/
 
 # Claude Code agent worktrees (not source code)
 .claude/worktrees/
+.claude/hooks/
+.claude/settings.json
+.codex/
+.playwright-mcp/
+.pnpm-store/
+AGENTS.md
 
 # Virtual envs
 .venv/
@@ -29,6 +35,7 @@ logs/*.log
 logs/*.jsonl
 data/category_labels_ru_backup_*.json
 reports/
+deck/
 
 # Business/pitch artifacts in repo root — NOT source. Keep contracts/proposals
 # out of git history (одна git add -A от утечки конфиденциалки). Root-anchored.

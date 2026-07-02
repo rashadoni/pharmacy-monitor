@@ -1,0 +1,17 @@
+[Unit]
+Description=Poll UI scrape queue every ~60s (server-side watcher)
+Documentation=https://github.com/rashadrahimov/pharmacy-monitor
+
+[Timer]
+# OnUnitInactiveSec=60s → тик через 60с ПОСЛЕ того как сервис в прошлый раз
+# деактивировался. Пока идёт скрейп (сервис active), таймер НЕ фаerr'ит →
+# гарантия отсутствия параллельных прогонов. Первый запуск — через 2 мин после
+# загрузки. Если скрейп зависнет, TimeoutStartSec в .service деактивирует сервис
+# (failed) → таймер возобновит опрос.
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
