@@ -259,6 +259,7 @@
     "total_products": "Total products",
     "page_limit": "Per-site limit",
     "no_sites": "This category has no site-slug mapping.",
+    "missing_sites": "Not connected for this category: {sites}. These sites do not have a safe category mapping, so their products are not shown.",
     "site_slug": "Category: {slug}",
     "site_count": "{count} products",
     "shown_count": "Showing {shown} of {total}",

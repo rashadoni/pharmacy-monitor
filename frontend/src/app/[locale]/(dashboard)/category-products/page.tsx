@@ -29,6 +29,10 @@ export default function CategoryProductsPage() {
     { site: "aptekonline" as const, slug: aptekonline, query: aptekonlineQ },
     { site: "aloe" as const, slug: aloe, query: aloeQ },
   ].filter((section) => section.slug);
+  const missingSites = SITES.filter(
+    (site) =>
+      !sections.some((section) => section.site === site),
+  ).map((site) => `${site}.az`);
 
   const configuredSites = sections.length;
   const totalProducts = sections.reduce(
@@ -54,6 +58,15 @@ export default function CategoryProductsPage() {
       {sections.length === 0 && (
         <div className="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
           {t("no_sites")}
+        </div>
+      )}
+
+      {sections.length > 0 && missingSites.length > 0 && (
+        <div
+          className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200"
+          data-testid="category-products-missing-sites"
+        >
+          {t("missing_sites", { sites: missingSites.join(", ") })}
         </div>
       )}
 

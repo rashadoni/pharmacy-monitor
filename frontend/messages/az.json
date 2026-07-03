@@ -259,6 +259,7 @@
     "total_products": "Cəmi məhsul",
     "page_limit": "Sayt üzrə limit",
     "no_sites": "Bu kateqoriya üçün site-slug mapping yoxdur.",
+    "missing_sites": "Bu kateqoriya üçün qoşulmayıb: {sites}. Bu saytlar üçün təhlükəsiz category mapping yoxdur, ona görə məhsulları göstərilmir.",
     "site_slug": "Kateqoriya: {slug}",
     "site_count": "{count} məhsul",
     "shown_count": "{shown} / {total} göstərilir",

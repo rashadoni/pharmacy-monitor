@@ -259,6 +259,7 @@
     "total_products": "Всего товаров",
     "page_limit": "Лимит на сайт",
     "no_sites": "У этой категории нет site-slug mapping.",
+    "missing_sites": "Не подключены для этой категории: {sites}. Для этих сайтов нет безопасного category mapping, поэтому их товары не показаны.",
     "site_slug": "Категория: {slug}",
     "site_count": "{count} товаров",
     "shown_count": "Показано {shown} из {total}",

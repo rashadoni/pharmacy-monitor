@@ -86,7 +86,6 @@ test.describe("Watchlist page (authenticated)", () => {
 
   test("category products link preserves locale and does not open comparison", async ({ page }) => {
     await page.goto("/az/watchlist");
-    await page.waitForLoadState("networkidle");
     const link = page.locator('[data-testid^="watchlist-category-products-"]').first();
     await expect(link).toBeVisible({ timeout: 10_000 });
 
@@ -97,5 +96,8 @@ test.describe("Watchlist page (authenticated)", () => {
     await link.click();
     await expect(page).toHaveURL(/\/az\/category-products\?/);
     await expect(page.locator("h1")).toContainText("Kateqoriya məhsulları");
+    await expect(page.locator('[data-testid="category-products-missing-sites"]')).toContainText(
+      "aloe.az",
+    );
   });
 });
