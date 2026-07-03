@@ -560,6 +560,7 @@
     "skip_page": "Səhifəni ötür",
     "reset_skipped_title": "Ötürülənləri yenidən göstər",
     "reset_skipped": "Sıfırla ({count})",
+    "create_category_scope": "Kateqoriya filtri: {category} ({slug})",
     "clusters_without_site": "{site} olmayan klaster",
     "how_it_works": "<b>Necə işləyir:</b> hər kart digər saytlarda tapılan, amma <site></site> saytında olmayan məhsuldur. Solda klasterdəki məhsul, sağda bu saytdan namizədlər göstərilir. Uyğun məhsulda “Bağla” düyməsini basın — qiymət müqayisəyə əlavə olunacaq. Yaşıl “dəqiq uyğunluq” işarəsi varsa, rahat bağlamaq olar.",
     "loading": "Yüklənir…",

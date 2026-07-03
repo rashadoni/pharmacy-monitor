@@ -560,6 +560,7 @@
     "skip_page": "Skip page",
     "reset_skipped_title": "Show skipped clusters again",
     "reset_skipped": "Reset ({count})",
+    "create_category_scope": "Category filter: {category} ({slug})",
     "clusters_without_site": "clusters without {site}",
     "how_it_works": "<b>How it works:</b> each card is a product found on other sites but missing on <site></site>. Left side shows products already in the cluster, right side shows candidates from this site. Click “Link” on the right match and its price will be added to comparison. A green “exact match” mark means it is safe to link.",
     "loading": "Loading…",

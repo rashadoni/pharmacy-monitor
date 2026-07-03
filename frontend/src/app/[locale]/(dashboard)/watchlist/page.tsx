@@ -263,6 +263,7 @@ function CategoryRow({
   const [armed, setArmed] = useState(false);
   const label = locale === "az" && item.label_az ? item.label_az : item.label_ru;
   const hasComparisonRows = item.comparison_count > 0;
+  const matcherHref = buildCategoryMatcherHref(item, label);
 
   return (
     <div className="rounded-lg border border-border bg-card p-3 flex items-start gap-3">
@@ -319,7 +320,7 @@ function CategoryRow({
           ) : null}
           {!hasComparisonRows && (
             <a
-              href="/matcher?mode=create"
+              href={matcherHref}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-primary/30 text-primary hover:bg-primary/10"
             >
               <Sparkles className="h-3 w-3" />
@@ -350,6 +351,14 @@ function CategoryRow({
       )}
     </div>
   );
+}
+
+function buildCategoryMatcherHref(item: WatchlistCategoryItem, label: string) {
+  const q = new URLSearchParams({ mode: "create", category_label: label });
+  if (item.pharmonline_slug) q.set("pharmonline_category", item.pharmonline_slug);
+  if (item.aptekonline_slug) q.set("aptekonline_category", item.aptekonline_slug);
+  if (item.aloe_slug) q.set("aloe_category", item.aloe_slug);
+  return `/matcher?${q.toString()}`;
 }
 
 function AddCategoryForm() {

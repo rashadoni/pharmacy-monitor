@@ -54,9 +54,21 @@ export default function MatcherPage() {
 
   const siteParam = sp.get("site");
   const modeParam = sp.get("mode");
+  const aloeCategory = sp.get("aloe_category") ?? "";
+  const pharmonlineCategory = sp.get("pharmonline_category") ?? "";
+  const aptekonlineCategory = sp.get("aptekonline_category") ?? "";
   const site: Site = isSite(siteParam) ? siteParam : "aloe";
   const mode: "attach" | "create" = isMode(modeParam) ? modeParam : "attach";
   const category = sp.get("category") ?? "";
+  const createCategories = useMemo(
+    () => ({
+      aloe: aloeCategory,
+      pharmonline: pharmonlineCategory,
+      aptekonline: aptekonlineCategory,
+    }),
+    [aloeCategory, pharmonlineCategory, aptekonlineCategory],
+  );
+  const categoryLabel = sp.get("category_label") ?? "";
 
   // Счётчики unmatched-кластеров per-site — для бейджей в site selector
   const countsQ = useQuery({
@@ -165,7 +177,10 @@ export default function MatcherPage() {
           setCategory={(c) => updateParams({ category: c || null })}
         />
       ) : (
-        <CreateFromScratch />
+        <CreateFromScratch
+          categoryBySite={createCategories}
+          categoryLabel={categoryLabel}
+        />
       )}
     </div>
   );

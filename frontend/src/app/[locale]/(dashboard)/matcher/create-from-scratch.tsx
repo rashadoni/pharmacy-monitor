@@ -41,8 +41,15 @@ const SITE_ICON: Record<Site, typeof Search> = {
 };
 
 type Selected = Partial<Record<Site, SiteProduct>>;
+type CategoryBySite = Partial<Record<Site, string>>;
 
-export function CreateFromScratch() {
+export function CreateFromScratch({
+  categoryBySite = {},
+  categoryLabel = "",
+}: {
+  categoryBySite?: CategoryBySite;
+  categoryLabel?: string;
+}) {
   const t = useTranslations("matcher");
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<Selected>({});
@@ -121,6 +128,8 @@ export function CreateFromScratch() {
           <SiteSearchPanel
             key={s}
             site={s}
+            category={categoryBySite[s] ?? ""}
+            categoryLabel={categoryLabel}
             selectedProduct={selected[s] ?? null}
             onAdd={(p) => handleAdd(s, p)}
           />
@@ -200,10 +209,14 @@ export function CreateFromScratch() {
 
 function SiteSearchPanel({
   site,
+  category,
+  categoryLabel,
   selectedProduct,
   onAdd,
 }: {
   site: Site;
+  category: string;
+  categoryLabel: string;
   selectedProduct: SiteProduct | null;
   onAdd: (product: SiteProduct) => void;
 }) {
@@ -213,14 +226,15 @@ function SiteSearchPanel({
   const debounced = useDebounce(search, 300);
 
   const productsQ = useQuery({
-    queryKey: ["matcher", "create-search", site, debounced],
+    queryKey: ["matcher", "create-search", site, category, debounced],
     queryFn: () =>
       api.siteProducts({
         site,
+        category: category || undefined,
         search: debounced || undefined,
         limit: 15,
       }),
-    enabled: debounced.length >= 2,
+    enabled: Boolean(category) || debounced.length >= 2,
   });
 
   return (
@@ -245,8 +259,16 @@ function SiteSearchPanel({
             className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           />
         </div>
+        {category && (
+          <div className="text-[11px] text-primary bg-primary/10 rounded px-2 py-1">
+            {t("create_category_scope", {
+              category: categoryLabel || category,
+              slug: category,
+            })}
+          </div>
+        )}
 
-        {debounced.length < 2 && (
+        {!category && debounced.length < 2 && (
           <div className="text-xs text-muted-foreground py-2">
             {t("enter_name_or_brand")}
           </div>
