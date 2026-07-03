@@ -284,7 +284,7 @@ function CategoryRow({
           </div>
         )}
         <div className="flex flex-wrap gap-2 mt-2">
-          {item.pharmonline_slug && hasComparisonRows ? (
+          {item.pharmonline_slug ? (
             <a
               href={`/category-comparison?category=${encodeURIComponent(item.pharmonline_slug)}`}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
