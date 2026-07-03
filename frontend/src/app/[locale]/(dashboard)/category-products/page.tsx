@@ -19,6 +19,9 @@ export default function CategoryProductsPage() {
   const pharmonline = searchParams.get("pharmonline") || "";
   const aptekonline = searchParams.get("aptekonline") || "";
   const aloe = searchParams.get("aloe") || "";
+  const expectedSites = (searchParams.get("expected_sites") || "")
+    .split(",")
+    .filter((site): site is SiteName => SITES.includes(site as SiteName));
 
   const pharmonlineQ = useCategoryProducts("pharmonline", pharmonline);
   const aptekonlineQ = useCategoryProducts("aptekonline", aptekonline);
@@ -29,7 +32,7 @@ export default function CategoryProductsPage() {
     { site: "aptekonline" as const, slug: aptekonline, query: aptekonlineQ },
     { site: "aloe" as const, slug: aloe, query: aloeQ },
   ].filter((section) => section.slug);
-  const missingSites = SITES.filter(
+  const missingSites = expectedSites.filter(
     (site) =>
       !sections.some((section) => section.site === site),
   ).map((site) => `${site}.az`);

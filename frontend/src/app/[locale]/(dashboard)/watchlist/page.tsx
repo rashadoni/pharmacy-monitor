@@ -364,6 +364,7 @@ function buildCategoryProductsHref(
   locale: string,
 ) {
   const q = new URLSearchParams({ label });
+  q.set("expected_sites", "pharmonline,aptekonline,aloe");
   if (item.pharmonline_slug) q.set("pharmonline", item.pharmonline_slug);
   if (item.aptekonline_slug) q.set("aptekonline", item.aptekonline_slug);
   if (item.aloe_slug) q.set("aloe", item.aloe_slug);
