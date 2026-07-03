@@ -261,6 +261,8 @@
     "no_sites": "Bu kateqoriya üçün site-slug mapping yoxdur.",
     "site_slug": "Kateqoriya: {slug}",
     "site_count": "{count} məhsul",
+    "shown_count": "{shown} / {total} göstərilir",
+    "load_more": "Daha çox yüklə",
     "load_error": "Məhsulları yükləmək alınmadı",
     "empty": "Bu site-kateqoriyada məhsul yoxdur.",
     "th_name": "Ad",

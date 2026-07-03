@@ -83,4 +83,19 @@ test.describe("Watchlist page (authenticated)", () => {
     // "No match" empty-state appears
     await expect(page.getByText(/Ничего не найдено|no match/i)).toBeVisible();
   });
+
+  test("category products link preserves locale and does not open comparison", async ({ page }) => {
+    await page.goto("/az/watchlist");
+    const link = page.locator('[data-testid^="watchlist-category-products-"]').first();
+    const visible = await link.isVisible().catch(() => false);
+    test.skip(!visible, "No watchlist category with product slug is seeded");
+
+    const href = await link.getAttribute("href");
+    expect(href).toContain("/az/category-products?");
+    expect(href).not.toContain("/comparison");
+
+    await link.click();
+    await expect(page).toHaveURL(/\/az\/category-products\?/);
+    await expect(page.locator("h1")).toContainText("Kateqoriya məhsulları");
+  });
 });

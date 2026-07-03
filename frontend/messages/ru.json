@@ -261,6 +261,8 @@
     "no_sites": "У этой категории нет site-slug mapping.",
     "site_slug": "Категория: {slug}",
     "site_count": "{count} товаров",
+    "shown_count": "Показано {shown} из {total}",
+    "load_more": "Загрузить ещё",
     "load_error": "Не удалось загрузить товары",
     "empty": "В этой site-категории товаров нет.",
     "th_name": "Название",

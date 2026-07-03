@@ -289,6 +289,7 @@ function CategoryRow({
           {item.pharmonline_slug ? (
             <a
               href={categoryComparisonHref}
+              data-testid={`watchlist-category-comparison-${item.id}`}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
             >
               <BarChart3 className="h-3 w-3" />
@@ -306,6 +307,7 @@ function CategoryRow({
           {item.pharmonline_slug || item.aptekonline_slug || item.aloe_slug ? (
             <a
               href={categoryProductsHref}
+              data-testid={`watchlist-category-products-${item.id}`}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
             >
               <ListTree className="h-3 w-3" />
@@ -323,6 +325,7 @@ function CategoryRow({
           {!hasComparisonRows && (
             <a
               href={matcherHref}
+              data-testid={`watchlist-category-matcher-${item.id}`}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-primary/30 text-primary hover:bg-primary/10"
             >
               <Sparkles className="h-3 w-3" />

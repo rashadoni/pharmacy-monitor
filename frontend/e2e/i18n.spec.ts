@@ -47,6 +47,7 @@ test.describe("Legacy URL redirects (Phase 6.1 backward compat)", () => {
     "analytics",
     "categories",
     "matcher",
+    "category-products",
     "settings",
     "watchlist",
     "login",

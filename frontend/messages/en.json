@@ -261,6 +261,8 @@
     "no_sites": "This category has no site-slug mapping.",
     "site_slug": "Category: {slug}",
     "site_count": "{count} products",
+    "shown_count": "Showing {shown} of {total}",
+    "load_more": "Load more",
     "load_error": "Failed to load products",
     "empty": "No products in this site category.",
     "th_name": "Name",

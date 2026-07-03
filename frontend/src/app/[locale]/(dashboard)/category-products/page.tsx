@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { ExternalLink } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
@@ -32,7 +32,7 @@ export default function CategoryProductsPage() {
 
   const configuredSites = sections.length;
   const totalProducts = sections.reduce(
-    (sum, section) => sum + (section.query.data?.total ?? 0),
+    (sum, section) => sum + (section.query.data?.pages[0]?.total ?? 0),
     0,
   );
 
@@ -63,10 +63,13 @@ export default function CategoryProductsPage() {
             key={site}
             site={site}
             slug={slug}
-            products={query.data?.items ?? []}
-            total={query.data?.total ?? 0}
+            products={query.data?.pages.flatMap((page) => page.items) ?? []}
+            total={query.data?.pages[0]?.total ?? 0}
             isLoading={query.isLoading}
             isError={query.isError}
+            hasNextPage={query.hasNextPage}
+            isFetchingNextPage={query.isFetchingNextPage}
+            onLoadMore={() => query.fetchNextPage()}
             loadingText={tCommon("loading")}
           />
         ))}
@@ -76,9 +79,15 @@ export default function CategoryProductsPage() {
 }
 
 function useCategoryProducts(site: SiteName, category: string) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: ["category-products", site, category],
-    queryFn: () => api.siteProducts({ site, category, limit: PAGE_LIMIT }),
+    queryFn: ({ pageParam = 0 }) =>
+      api.siteProducts({ site, category, limit: PAGE_LIMIT, offset: pageParam }),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage) => {
+      const nextOffset = lastPage.offset + lastPage.items.length;
+      return nextOffset < lastPage.total ? nextOffset : undefined;
+    },
     enabled: Boolean(category),
   });
 }
@@ -101,6 +110,9 @@ function SiteSection({
   total,
   isLoading,
   isError,
+  hasNextPage,
+  isFetchingNextPage,
+  onLoadMore,
   loadingText,
 }: {
   site: SiteName;
@@ -109,9 +121,13 @@ function SiteSection({
   total: number;
   isLoading: boolean;
   isError: boolean;
+  hasNextPage: boolean;
+  isFetchingNextPage: boolean;
+  onLoadMore: () => void;
   loadingText: string;
 }) {
   const t = useTranslations("category_products");
+  const shown = products.length;
 
   return (
     <section className="rounded-lg border border-border bg-card overflow-hidden">
@@ -123,7 +139,7 @@ function SiteSection({
           </p>
         </div>
         <div className="text-xs text-muted-foreground tabular-nums">
-          {t("site_count", { count: total })}
+          {t("shown_count", { shown, total })}
         </div>
       </div>
 
@@ -182,6 +198,21 @@ function SiteSection({
               ))}
             </tbody>
           </table>
+          <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-3 text-xs text-muted-foreground">
+            <span className="tabular-nums">
+              {t("shown_count", { shown, total })}
+            </span>
+            {hasNextPage && (
+              <button
+                type="button"
+                onClick={onLoadMore}
+                disabled={isFetchingNextPage}
+                className="rounded-md border border-input bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-secondary disabled:opacity-50"
+              >
+                {isFetchingNextPage ? loadingText : t("load_more")}
+              </button>
+            )}
+          </div>
         </div>
       )}
     </section>
