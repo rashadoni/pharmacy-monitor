@@ -263,7 +263,9 @@ function CategoryRow({
   const [armed, setArmed] = useState(false);
   const label = locale === "az" && item.label_az ? item.label_az : item.label_ru;
   const hasComparisonRows = item.comparison_count > 0;
-  const matcherHref = buildCategoryMatcherHref(item, label);
+  const categoryComparisonHref = `/${locale}/category-comparison?category=${encodeURIComponent(item.pharmonline_slug ?? "")}`;
+  const categoryProductsHref = buildCategoryProductsHref(item, label, locale);
+  const matcherHref = buildCategoryMatcherHref(item, label, locale);
 
   return (
     <div className="rounded-lg border border-border bg-card p-3 flex items-start gap-3">
@@ -286,7 +288,7 @@ function CategoryRow({
         <div className="flex flex-wrap gap-2 mt-2">
           {item.pharmonline_slug ? (
             <a
-              href={`/category-comparison?category=${encodeURIComponent(item.pharmonline_slug)}`}
+              href={categoryComparisonHref}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
             >
               <BarChart3 className="h-3 w-3" />
@@ -301,15 +303,15 @@ function CategoryRow({
               {t("category_comparison")}
             </span>
           )}
-          {item.pharmonline_slug && hasComparisonRows ? (
+          {item.pharmonline_slug || item.aptekonline_slug || item.aloe_slug ? (
             <a
-              href={`/comparison?category=${encodeURIComponent(item.pharmonline_slug)}`}
+              href={categoryProductsHref}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
             >
               <ListTree className="h-3 w-3" />
               {t("category_products")}
             </a>
-          ) : item.pharmonline_slug ? (
+          ) : (
             <span
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground/60 bg-muted/30"
               title={t("category_no_comparison")}
@@ -317,7 +319,7 @@ function CategoryRow({
               <ListTree className="h-3 w-3" />
               {t("category_products")}
             </span>
-          ) : null}
+          )}
           {!hasComparisonRows && (
             <a
               href={matcherHref}
@@ -353,12 +355,28 @@ function CategoryRow({
   );
 }
 
-function buildCategoryMatcherHref(item: WatchlistCategoryItem, label: string) {
+function buildCategoryProductsHref(
+  item: WatchlistCategoryItem,
+  label: string,
+  locale: string,
+) {
+  const q = new URLSearchParams({ label });
+  if (item.pharmonline_slug) q.set("pharmonline", item.pharmonline_slug);
+  if (item.aptekonline_slug) q.set("aptekonline", item.aptekonline_slug);
+  if (item.aloe_slug) q.set("aloe", item.aloe_slug);
+  return `/${locale}/category-products?${q.toString()}`;
+}
+
+function buildCategoryMatcherHref(
+  item: WatchlistCategoryItem,
+  label: string,
+  locale: string,
+) {
   const q = new URLSearchParams({ mode: "create", category_label: label });
   if (item.pharmonline_slug) q.set("pharmonline_category", item.pharmonline_slug);
   if (item.aptekonline_slug) q.set("aptekonline_category", item.aptekonline_slug);
   if (item.aloe_slug) q.set("aloe_category", item.aloe_slug);
-  return `/matcher?${q.toString()}`;
+  return `/${locale}/matcher?${q.toString()}`;
 }
 
 function AddCategoryForm() {

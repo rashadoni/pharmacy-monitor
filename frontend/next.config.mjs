@@ -35,6 +35,7 @@ const nextConfig = {
       "analytics",
       "categories",
       "category-comparison",
+      "category-products",
       "comparison",
       "login",
       "matcher",

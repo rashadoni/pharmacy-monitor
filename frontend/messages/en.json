@@ -251,6 +251,23 @@
     "category_no_comparison": "No cross-site matched products yet: run matching or link products manually.",
     "category_make_matches": "Create matches"
   },
+  "category_products": {
+    "title": "Category products",
+    "fallback_label": "Category",
+    "subtitle": "All products in the selected Watchlist category: {label}",
+    "configured_sites": "Configured sites",
+    "total_products": "Total products",
+    "page_limit": "Per-site limit",
+    "no_sites": "This category has no site-slug mapping.",
+    "site_slug": "Category: {slug}",
+    "site_count": "{count} products",
+    "load_error": "Failed to load products",
+    "empty": "No products in this site category.",
+    "th_name": "Name",
+    "th_brand": "Brand",
+    "th_price": "Price",
+    "open_product": "Open product"
+  },
   "site": {
     "tagline_pharmonline": "Main client site. Catalog, brands and ROI from pharmonline perspective.",
     "tagline_aptekonline": "Largest competitor by assortment. View from aptekonline perspective.",

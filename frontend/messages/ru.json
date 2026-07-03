@@ -251,6 +251,23 @@
     "category_no_comparison": "Пока нет cross-site matched товаров: запустите матчинг или привяжите товары вручную.",
     "category_make_matches": "Подобрать матчи"
   },
+  "category_products": {
+    "title": "Товары категории",
+    "fallback_label": "Категория",
+    "subtitle": "Все товары из выбранной Watchlist-категории: {label}",
+    "configured_sites": "Сайтов подключено",
+    "total_products": "Всего товаров",
+    "page_limit": "Лимит на сайт",
+    "no_sites": "У этой категории нет site-slug mapping.",
+    "site_slug": "Категория: {slug}",
+    "site_count": "{count} товаров",
+    "load_error": "Не удалось загрузить товары",
+    "empty": "В этой site-категории товаров нет.",
+    "th_name": "Название",
+    "th_brand": "Бренд",
+    "th_price": "Цена",
+    "open_product": "Открыть товар"
+  },
   "site": {
     "tagline_pharmonline": "Основной клиентский сайт. Каталог, бренды и ROI с перспективы pharmonline.",
     "tagline_aptekonline": "Крупнейший конкурент по ассортименту. Срез с перспективы aptekonline.",

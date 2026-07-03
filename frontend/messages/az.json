@@ -251,6 +251,23 @@
     "category_no_comparison": "Hələ cross-site uyğun məhsul yoxdur: matching-i işə salın və ya məhsulları əl ilə bağlayın.",
     "category_make_matches": "Uyğunluq seç"
   },
+  "category_products": {
+    "title": "Kateqoriya məhsulları",
+    "fallback_label": "Kateqoriya",
+    "subtitle": "Seçilmiş Watchlist kateqoriyasındakı bütün məhsullar: {label}",
+    "configured_sites": "Qoşulan saytlar",
+    "total_products": "Cəmi məhsul",
+    "page_limit": "Sayt üzrə limit",
+    "no_sites": "Bu kateqoriya üçün site-slug mapping yoxdur.",
+    "site_slug": "Kateqoriya: {slug}",
+    "site_count": "{count} məhsul",
+    "load_error": "Məhsulları yükləmək alınmadı",
+    "empty": "Bu site-kateqoriyada məhsul yoxdur.",
+    "th_name": "Ad",
+    "th_brand": "Brend",
+    "th_price": "Qiymət",
+    "open_product": "Məhsulu aç"
+  },
   "site": {
     "tagline_pharmonline": "Əsas müştəri saytı. pharmonline perspektivindən katalog, brendlər və ROI.",
     "tagline_aptekonline": "Çeşidə görə ən böyük rəqib. aptekonline perspektivindən baxış.",
