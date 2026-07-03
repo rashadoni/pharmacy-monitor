@@ -187,6 +187,7 @@ class Match(Base):
     canonical_pack_size: Mapped[str | None] = mapped_column(String(100), nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)  # 0..1
     is_manual: Mapped[bool] = mapped_column(Boolean, default=False)  # подтверждено вручную
+    match_strategy: Mapped[str | None] = mapped_column(String(30), nullable=True)
     needs_review: Mapped[bool] = mapped_column(
         Boolean, default=False
     )  # флаг UI: подозрительное расхождение цен

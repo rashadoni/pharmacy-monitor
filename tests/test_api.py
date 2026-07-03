@@ -1718,6 +1718,51 @@ def _add_unmatched(db, *, site, name, run, price=None):
     return p
 
 
+def test_match_create_with_products_sets_manual_strategy(client, tenant_user, setup_db):
+    """Regression: create-with-products must not 500 when setting match_strategy."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    from src.normalize import normalize_name
+
+    s = setup_db
+    p1 = storage.Product(
+        tenant_id=1,
+        site="aptekonline",
+        external_id="aptek-zanzarella",
+        url="https://aptek.example/zanzarella",
+        name="Zanzarella Ambiente 170 q",
+        name_normalized=normalize_name("Zanzarella Ambiente 170 q"),
+        brand="Zanzarella",
+    )
+    p2 = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="pharm-zanzarella",
+        url="https://pharm.example/zanzarella",
+        name="Zanzarella teravetlendirici 170 q",
+        name_normalized=normalize_name("Zanzarella teravetlendirici 170 q"),
+        brand="Zanzarella",
+    )
+    s.add_all([p1, p2])
+    s.commit()
+
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    r = client.post(
+        "/api/v1/dash/matches/create-with-products",
+        json={"product_ids": [p1.id, p2.id]},
+    )
+
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert payload["match_strategy"] == "manual"
+    assert payload["is_manual"] is True
+    s.refresh(p1)
+    s.refresh(p2)
+    assert p1.canonical_id == payload["match_id"]
+    assert p2.canonical_id == payload["match_id"]
+
+
 def test_candidate_analogs_ranks_guard_passing_and_flags_auto_safe(client, tenant_user, setup_db):
     """Endpoint suggests the missing-site twin, flags ultra-equal as auto_safe,
     and filters out spec-conflicting (different pack) + dissimilar candidates."""
