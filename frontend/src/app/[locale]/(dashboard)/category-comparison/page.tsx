@@ -284,12 +284,12 @@ export default function CategoryComparisonPage() {
         </div>
       )}
 
-      {data && data.length > 0 && (
+      {visibleRows && visibleRows.length > 0 && (
         <div
           className="text-xs text-muted-foreground text-center"
           data-testid="result-count"
         >
-          {t("result_count", { count: data.length })}
+          {t("result_count", { count: visibleRows.length })}
         </div>
       )}
     </div>
