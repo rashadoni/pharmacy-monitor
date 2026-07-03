@@ -248,7 +248,8 @@
     "items_count": "{count, plural, one {# элемент} few {# элемента} many {# элементов} other {# элементов}}",
     "category_products_count": "{count} товаров в категории",
     "category_matched_count": "{count} matched для сравнения",
-    "category_no_comparison": "Пока нет cross-site matched товаров: запустите матчинг или привяжите товары вручную."
+    "category_no_comparison": "Пока нет cross-site matched товаров: запустите матчинг или привяжите товары вручную.",
+    "category_make_matches": "Подобрать матчи"
   },
   "site": {
     "tagline_pharmonline": "Основной клиентский сайт. Каталог, бренды и ROI с перспективы pharmonline.",
@@ -537,7 +538,9 @@
     "index_pricier": "Вы дороже рынка",
     "index_parity": "Паритет с рынком",
     "card_skus": "{count} SKU",
-    "card_cheaper": "{pct}% дешевле"
+    "card_cheaper": "{pct}% дешевле",
+    "filter_category": "Категория: {category}",
+    "filter_clear": "Сбросить фильтр"
   },
   "matcher": {
     "tip_title": "Когда нужен ручной матчер",

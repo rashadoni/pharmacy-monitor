@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { BarChart3, ListTree, Plus, Search, Trash2, X } from "lucide-react";
+import { BarChart3, ListTree, Plus, Search, Sparkles, Trash2, X } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { useLocale } from "next-intl";
 import { useMemo, useState } from "react";
@@ -283,13 +283,23 @@ function CategoryRow({
           </div>
         )}
         <div className="flex flex-wrap gap-2 mt-2">
-          <a
-            href="/category-comparison"
-            className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
-          >
-            <BarChart3 className="h-3 w-3" />
-            {t("category_comparison")}
-          </a>
+          {item.pharmonline_slug && hasComparisonRows ? (
+            <a
+              href={`/category-comparison?category=${encodeURIComponent(item.pharmonline_slug)}`}
+              className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
+            >
+              <BarChart3 className="h-3 w-3" />
+              {t("category_comparison")}
+            </a>
+          ) : (
+            <span
+              className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground/60 bg-muted/30"
+              title={t("category_no_comparison")}
+            >
+              <BarChart3 className="h-3 w-3" />
+              {t("category_comparison")}
+            </span>
+          )}
           {item.pharmonline_slug && hasComparisonRows ? (
             <a
               href={`/comparison?category=${encodeURIComponent(item.pharmonline_slug)}`}
@@ -307,6 +317,15 @@ function CategoryRow({
               {t("category_products")}
             </span>
           ) : null}
+          {!hasComparisonRows && (
+            <a
+              href="/matcher?mode=create"
+              className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-primary/30 text-primary hover:bg-primary/10"
+            >
+              <Sparkles className="h-3 w-3" />
+              {t("category_make_matches")}
+            </a>
+          )}
         </div>
       </div>
       {armed ? (

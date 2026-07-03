@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
@@ -20,6 +21,8 @@ export default function CategoryComparisonPage() {
   const tCommon = useTranslations("common");
   const locale = useLocale();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const selectedCategory = searchParams.get("category");
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({
     key: "misprice",
     dir: "desc",
@@ -32,8 +35,14 @@ export default function CategoryComparisonPage() {
 
   // Дефолт-сортировка — наибольший «мисприсинг» |index-100|×matched_skus:
   // вверху категории где клиент сильнее всего отклонён от рынка и с весом SKU.
-  const sorted = useMemo(() => {
+  const visibleRows = useMemo(() => {
     if (!data) return data;
+    if (!selectedCategory) return data;
+    return data.filter((row) => row.category === selectedCategory);
+  }, [data, selectedCategory]);
+
+  const sorted = useMemo(() => {
+    if (!visibleRows) return visibleRows;
     const val = (r: CategoryComparisonRow): number | string => {
       switch (sort.key) {
         case "label":
@@ -51,7 +60,7 @@ export default function CategoryComparisonPage() {
       }
     };
     const dir = sort.dir === "asc" ? 1 : -1;
-    return [...data].sort((a, b) => {
+    return [...visibleRows].sort((a, b) => {
       const va = val(a);
       const vb = val(b);
       if (typeof va === "string" && typeof vb === "string") {
@@ -59,20 +68,20 @@ export default function CategoryComparisonPage() {
       }
       return ((va as number) - (vb as number)) * dir;
     });
-  }, [data, sort]);
+  }, [visibleRows, sort]);
 
   // KPI: категорий где клиент дешевле рынка (index<100), SKU-взвешенный средний
   // индекс, всего matched SKU.
   const kpi = useMemo(() => {
-    if (!data || data.length === 0) {
+    if (!visibleRows || visibleRows.length === 0) {
       return { cheaperCats: 0, avgIndex: null as number | null, totalSkus: 0 };
     }
-    const cheaperCats = data.filter((r) => r.index < 100).length;
-    const totalSkus = data.reduce((s, r) => s + r.matched_skus, 0);
-    const weighted = data.reduce((s, r) => s + r.index * r.matched_skus, 0);
+    const cheaperCats = visibleRows.filter((r) => r.index < 100).length;
+    const totalSkus = visibleRows.reduce((s, r) => s + r.matched_skus, 0);
+    const weighted = visibleRows.reduce((s, r) => s + r.index * r.matched_skus, 0);
     const avgIndex = totalSkus > 0 ? weighted / totalSkus : null;
     return { cheaperCats, avgIndex, totalSkus };
-  }, [data]);
+  }, [visibleRows]);
 
   function toggleSort(key: SortKey) {
     setSort((cur) =>
@@ -140,6 +149,19 @@ export default function CategoryComparisonPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
           <p className="text-sm text-muted-foreground">{t("subtitle")}</p>
+          {selectedCategory && (
+            <div className="mt-2 inline-flex items-center gap-2 rounded-full bg-primary/10 px-3 py-1 text-xs text-primary">
+              {t("filter_category", { category: selectedCategory })}
+              <button
+                onClick={() => router.replace("/category-comparison")}
+                className="hover:text-primary/70"
+                aria-label={t("filter_clear")}
+                title={t("filter_clear")}
+              >
+                ×
+              </button>
+            </div>
+          )}
         </div>
         <button
           onClick={handleExportCsv}
@@ -155,7 +177,7 @@ export default function CategoryComparisonPage() {
       <section className="grid gap-3 grid-cols-1 sm:grid-cols-3">
         <KpiCard
           label={t("kpi_cheaper_cats")}
-          value={data ? `${kpi.cheaperCats} / ${data.length}` : "—"}
+          value={visibleRows ? `${kpi.cheaperCats} / ${visibleRows.length}` : "—"}
           loading={isLoading}
           hint={t("kpi_cheaper_cats_hint")}
         />
@@ -187,7 +209,7 @@ export default function CategoryComparisonPage() {
         </div>
       )}
       {isLoading && <TableSkeleton rows={8} cols={7} />}
-      {data && data.length === 0 && !isLoading && (
+      {visibleRows && visibleRows.length === 0 && !isLoading && (
         <div
           className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center"
           data-testid="empty"
@@ -204,7 +226,7 @@ export default function CategoryComparisonPage() {
       </div>
 
       {/* Desktop table */}
-      {data && data.length > 0 && (
+      {visibleRows && visibleRows.length > 0 && (
         <div
           className="hidden md:block rounded-lg border border-border overflow-hidden"
           data-testid="desktop-table"

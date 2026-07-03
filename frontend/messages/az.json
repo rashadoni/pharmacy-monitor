@@ -248,7 +248,8 @@
     "items_count": "{count, plural, one {# qeyd} other {# qeyd}}",
     "category_products_count": "Kateqoriyada {count} məhsul",
     "category_matched_count": "Müqayisə üçün {count} uyğunluq",
-    "category_no_comparison": "Hələ cross-site uyğun məhsul yoxdur: matching-i işə salın və ya məhsulları əl ilə bağlayın."
+    "category_no_comparison": "Hələ cross-site uyğun məhsul yoxdur: matching-i işə salın və ya məhsulları əl ilə bağlayın.",
+    "category_make_matches": "Uyğunluq seç"
   },
   "site": {
     "tagline_pharmonline": "Əsas müştəri saytı. pharmonline perspektivindən katalog, brendlər və ROI.",
@@ -537,7 +538,9 @@
     "index_pricier": "Bazardan bahasınız",
     "index_parity": "Bazarla paritet",
     "card_skus": "{count} SKU",
-    "card_cheaper": "{pct}% ucuz"
+    "card_cheaper": "{pct}% ucuz",
+    "filter_category": "Kateqoriya: {category}",
+    "filter_clear": "Filtri sıfırla"
   },
   "matcher": {
     "tip_title": "Manual matcher nə vaxt lazımdır",
