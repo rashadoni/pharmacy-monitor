@@ -2,6 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
+import { useTranslations } from "next-intl";
 import { useMemo, useState, useEffect } from "react";
 import {
   Building2,
@@ -46,6 +47,7 @@ function isMode(v: string | null): v is "attach" | "create" {
 }
 
 export default function MatcherPage() {
+  const t = useTranslations("matcher");
   const sp = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
@@ -76,32 +78,23 @@ export default function MatcherPage() {
     <div className="space-y-6">
       <OnboardingTip
         id="matcher-overview-v1"
-        title="Когда нужен ручной матчер"
-        description={
-          <>
-            Auto-matcher на name+brand similarity отрабатывает 99%
-            случаев. Сюда заходишь когда: товар точно есть на 2-3 сайтах,
-            но названия настолько разные что матчер не справился. Один
-            клик «Привязать» — создаётся manual Match (is_manual=True),
-            авто-матчер его больше не трогает.
-          </>
-        }
+        title={t("tip_title")}
+        description={t("tip_desc")}
       />
 
       <header className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
             <Link2 className="h-6 w-6 text-primary" />
-            Ручной матчер
+            {t("title")}
           </h1>
           <p className="text-sm text-muted-foreground max-w-2xl">
-            Привяжите продукт сайта <strong>{SITE_LABEL[site]}</strong> к
-            существующему cross-site кластеру, или создайте новый кластер
-            «с нуля» из 2–3 продуктов разных сайтов. Ручные связки помечаются{" "}
+            {t("subtitle_prefix")} <strong>{SITE_LABEL[site]}</strong>{" "}
+            {t("subtitle_middle")}{" "}
             <code className="text-xs rounded bg-muted/50 px-1 py-0.5">
               is_manual
             </code>{" "}
-            и не пересчитываются авто-матчером.
+            {t("subtitle_suffix")}
           </p>
         </div>
       </header>
@@ -113,14 +106,14 @@ export default function MatcherPage() {
           onClick={() => updateParams({ mode: "attach" })}
           icon={Link2}
         >
-          Привязать к существующему
+          {t("tab_attach")}
         </ModeTab>
         <ModeTab
           active={mode === "create"}
           onClick={() => updateParams({ mode: "create" })}
           icon={Sparkles}
         >
-          Создать кластер с нуля
+          {t("tab_create")}
         </ModeTab>
       </div>
 
@@ -128,7 +121,7 @@ export default function MatcherPage() {
       {mode === "attach" && (
         <div className="flex flex-col sm:flex-row sm:items-center gap-3">
           <span className="text-xs uppercase tracking-wide text-muted-foreground font-semibold">
-            Сайт
+            {t("site_label")}
           </span>
           <div className="inline-flex rounded-md border border-input bg-background p-0.5 gap-0.5">
             {SITES.map((s) => {
@@ -215,6 +208,7 @@ function AttachMode({
   category: string;
   setCategory: (c: string) => void;
 }) {
+  const t = useTranslations("matcher");
   const [offset, setOffset] = useState(0);
   // Skipped per-site чтобы переключение сайта не показывало чужие пропущенные
   const [skippedBySite, setSkippedBySite] = useState<Record<Site, Set<number>>>(
@@ -265,7 +259,7 @@ function AttachMode({
     if (visibleIds.length === 0) return;
     if (
       !confirm(
-        `Пропустить все ${visibleIds.length} кластеров на этой странице?\n(можно потом сбросить кнопкой «Сброс»)`,
+        t("confirm_skip_page", { count: visibleIds.length }),
       )
     )
       return;
@@ -291,10 +285,10 @@ function AttachMode({
       })
       .map((r) => r.match_id);
     if (cheapIds.length === 0) {
-      alert(`Нет товаров дешевле ${threshold} AZN на этой странице`);
+      alert(t("alert_no_cheap", { threshold }));
       return;
     }
-    if (!confirm(`Пропустить ${cheapIds.length} кластеров с ценой < ${threshold} AZN?`))
+    if (!confirm(t("confirm_skip_cheap", { count: cheapIds.length, threshold })))
       return;
     setSkippedBySite((prev) => {
       const next = { ...prev };
@@ -318,7 +312,7 @@ function AttachMode({
             onChange={(e) => setCategory(e.target.value)}
             className="rounded-md border border-input bg-background px-3 py-2 text-sm md:w-72"
           >
-            <option value="">Все категории</option>
+            <option value="">{t("all_categories")}</option>
             {facetsQ.data?.categories.map((c) => (
               <option key={c.name} value={c.name}>
                 {c.label && c.label !== c.name ? c.label : c.name} ({c.count})
@@ -328,24 +322,24 @@ function AttachMode({
           <button
             onClick={() => handleSkipCheap(5)}
             className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            title="Скрыть кластеры с ценой < 5 AZN (мелочь — не приоритет)"
+            title={t("skip_cheap_title")}
           >
-            Пропустить дешёвые (&lt; 5 ₼)
+            {t("skip_cheap")}
           </button>
           <button
             onClick={handleSkipAllOnPage}
             className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            title="Скрыть всю текущую страницу"
+            title={t("skip_page_title")}
           >
-            Пропустить страницу
+            {t("skip_page")}
           </button>
           {skipped.size > 0 && (
             <button
               onClick={handleResetSkipped}
               className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              title="Вернуть всех пропущенных в видимость"
+              title={t("reset_skipped_title")}
             >
-              Сброс ({skipped.size})
+              {t("reset_skipped", { count: skipped.size })}
             </button>
           )}
         </div>
@@ -355,7 +349,7 @@ function AttachMode({
               <span className="font-mono tabular-nums">
                 {Math.max(0, unmatchedQ.data.total - skipped.size)}
               </span>{" "}
-              кластеров без {site}
+              {t("clusters_without_site", { site })}
             </>
           ) : (
             "—"
@@ -364,23 +358,20 @@ function AttachMode({
       </div>
 
       <div className="rounded-md border border-border bg-muted/40 p-3 text-xs text-muted-foreground leading-relaxed">
-        <span className="font-medium text-foreground">Как это работает: </span>
-        каждая карточка — товар, найденный на других сайтах, но
-        отсутствующий на <span className="font-medium">{SITE_LABEL[site]}</span>.
-        Слева — товар в кластере, справа — кандидаты с {SITE_LABEL[site]}.
-        Нажмите <span className="font-medium">«Привязать»</span> у подходящего —
-        и цена с {SITE_LABEL[site]} добавится в сравнение. Зелёная отметка
-        «точное совпадение» = можно привязывать без раздумий.
+        {t.rich("how_it_works", {
+          b: (chunks) => <span className="font-medium text-foreground">{chunks}</span>,
+          site: () => <span className="font-medium">{SITE_LABEL[site]}</span>,
+        })}
       </div>
 
       {unmatchedQ.isLoading && (
         <div className="text-sm text-muted-foreground py-6 text-center">
-          Загрузка…
+          {t("loading")}
         </div>
       )}
       {unmatchedQ.error && (
         <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive">
-          Ошибка загрузки
+          {t("load_error")}
         </div>
       )}
 
@@ -395,8 +386,7 @@ function AttachMode({
         ))}
         {!unmatchedQ.isLoading && items.length === 0 && (
           <div className="rounded-lg border border-border bg-card p-6 text-center text-sm text-muted-foreground">
-            Нет кластеров без {site} в этом срезе. Попробуйте другую категорию
-            или сайт.
+            {t("empty_clusters", { site })}
           </div>
         )}
       </div>
@@ -420,6 +410,7 @@ function PairCard({
   site: Site;
   onSkip: (matchId: number) => void;
 }) {
+  const t = useTranslations("matcher");
   const queryClient = useQueryClient();
   // Поиск стартует ПУСТЫМ: по умолчанию показываем авто-подсказки, поиск их
   // ЗАМЕНЯЕТ (а не дублирует). 2-3 первых слова имени — fallback-термин.
@@ -497,7 +488,7 @@ function PairCard({
           <div className="font-medium text-sm">{pair.canonical_name}</div>
           <div className="text-xs text-muted-foreground mt-0.5">
             {pair.canonical_brand && (
-              <span className="mr-2">бренд: {pair.canonical_brand}</span>
+              <span className="mr-2">{t("brand_label")}: {pair.canonical_brand}</span>
             )}
             {pair.canonical_dosage && (
               <span className="mr-2">{pair.canonical_dosage}</span>
@@ -505,7 +496,7 @@ function PairCard({
             {pair.canonical_pack_size && <span>{pair.canonical_pack_size}</span>}
           </div>
           <div className="text-xs mt-1.5 flex flex-wrap items-center gap-x-1.5 gap-y-1">
-            <span className="text-muted-foreground">есть на:</span>
+            <span className="text-muted-foreground">{t("has_on")}</span>
             {pair.anchor_products.map((a) => (
               <span
                 key={a.product_id}
@@ -514,29 +505,29 @@ function PairCard({
                 {a.site}
               </span>
             ))}
-            <span className="text-muted-foreground ml-1">нет на:</span>
+            <span className="text-muted-foreground ml-1">{t("missing_on")}</span>
             <span className="font-mono text-[10px] uppercase rounded bg-primary/10 text-primary px-1.5 py-0.5">
               {site}
             </span>
-            <span className="text-primary">→ добавьте справа</span>
+            <span className="text-primary">{t("add_on_right")}</span>
           </div>
         </div>
         <button
           onClick={() => onSkip(pair.match_id)}
           className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 shrink-0 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          title="Скрыть этот кластер в текущей сессии (не запоминается между загрузками)"
+          title={t("skip_one_title")}
         >
           <SkipForward className="h-3.5 w-3.5" />
-          Пропустить
+          {t("skip_one")}
         </button>
       </div>
 
       <div className="grid md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-border">
         <div className="p-4 space-y-2 bg-muted/20">
           <div className="text-xs uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-1">
-            <CheckCircle2 className="h-3.5 w-3.5 text-success" /> Уже в кластере
+            <CheckCircle2 className="h-3.5 w-3.5 text-success" /> {t("already_in_cluster")}
             <span className="normal-case tracking-normal text-muted-foreground/70">
-              (справочно — менять не нужно)
+              {t("reference_only")}
             </span>
           </div>
           {pair.anchor_products.map((a) => (
@@ -546,7 +537,7 @@ function PairCard({
 
         <div className="p-4 space-y-2">
           <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">
-            Какой товар с {SITE_LABEL[site]} сюда подходит?
+            {t("which_product", { site: SITE_LABEL[site] })}
           </div>
 
           {/* search box — REFINES the list below, never shows a 2nd duplicate list */}
@@ -556,7 +547,7 @@ function PairCard({
               type="search"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder={`Поиск по ${SITE_LABEL[site]}…`}
+              placeholder={t("search_site_placeholder", { site: SITE_LABEL[site] })}
               className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             />
           </div>
@@ -564,14 +555,14 @@ function PairCard({
           {!searching ? (
             <>
               {suggestionsQ.isLoading && (
-                <div className="text-xs text-muted-foreground pt-1">Подбираю…</div>
+                <div className="text-xs text-muted-foreground pt-1">{t("suggesting")}</div>
               )}
               {suggestionsQ.data && suggestionsQ.data.items.length > 0 && (
                 <>
                   <div className="text-xs flex items-center gap-1 text-foreground pt-1">
                     <Sparkles className="h-3.5 w-3.5 text-primary" />
-                    <span className="font-medium">Лучшие совпадения</span>
-                    <span className="text-muted-foreground">— нажмите «Привязать»</span>
+                    <span className="font-medium">{t("best_matches")}</span>
+                    <span className="text-muted-foreground">{t("click_link_hint")}</span>
                   </div>
                   <ul className="space-y-1.5">
                     {suggestionsQ.data.items.map((p) => (
@@ -593,19 +584,19 @@ function PairCard({
               )}
               {noSuggestions && (
                 <div className="text-xs text-muted-foreground pt-1">
-                  Авто-подсказок нет — введите название в поиск выше.
+                  {t("no_suggestions")}
                 </div>
               )}
             </>
           ) : (
             <>
-              <div className="text-xs text-muted-foreground pt-1">Результаты поиска:</div>
+              <div className="text-xs text-muted-foreground pt-1">{t("search_results")}</div>
               {candidatesQ.isLoading && (
-                <div className="text-xs text-muted-foreground">Ищу…</div>
+                <div className="text-xs text-muted-foreground">{t("searching")}</div>
               )}
               {candidatesQ.data && candidatesQ.data.items.length === 0 && (
                 <div className="text-xs text-muted-foreground">
-                  Ничего не найдено. Попробуйте другие слова.
+                  {t("nothing_found")}
                 </div>
               )}
               <ul className="space-y-1.5 max-h-80 overflow-y-auto">
@@ -634,8 +625,7 @@ function PairCard({
           )}
           {isLinked && !linkError && (
             <div className="text-xs text-success flex items-center gap-1">
-              <CheckCircle2 className="h-3.5 w-3.5" /> Привязано — кластер
-              обновится при следующей загрузке.
+              <CheckCircle2 className="h-3.5 w-3.5" /> {t("linked_success")}
             </div>
           )}
         </div>
@@ -690,6 +680,7 @@ function CandidateRow({
   isLinkedHere: boolean;
   onLink: () => void;
 }) {
+  const t = useTranslations("matcher");
   return (
     <li className="rounded-md border border-border bg-background/50 p-2">
       <div className="flex items-start justify-between gap-2">
@@ -727,7 +718,7 @@ function CandidateRow({
                 : "bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed"
             }`}
           >
-            {isLinkedHere ? "✓ Привязано" : "Привязать"}
+            {isLinkedHere ? t("linked_button") : t("link_button")}
           </button>
         </div>
       </div>
@@ -746,6 +737,7 @@ function SuggestionRow({
   isLinkedHere: boolean;
   onLink: () => void;
 }) {
+  const t = useTranslations("matcher");
   return (
     <li
       className={`rounded-md border p-2 ${
@@ -770,12 +762,12 @@ function SuggestionRow({
           <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5">
             {cand.auto_safe ? (
               <span className="inline-flex items-center gap-0.5 text-success font-medium">
-                <CheckCircle2 className="h-3 w-3" /> точное совпадение
+                <CheckCircle2 className="h-3 w-3" /> {t("exact_match")}
               </span>
             ) : (
-              <span className="text-amber-600 dark:text-amber-500">похоже — проверьте</span>
+              <span className="text-amber-600 dark:text-amber-500">{t("check_match")}</span>
             )}
-            <span className="tabular-nums" title="сходство названий">
+            <span className="tabular-nums" title={t("name_similarity")}>
               {cand.score}%
             </span>
             {cand.brand && <span className="truncate">{cand.brand}</span>}
@@ -794,7 +786,7 @@ function SuggestionRow({
                 : "bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed"
             }`}
           >
-            {isLinkedHere ? "✓ Привязано" : "Привязать"}
+            {isLinkedHere ? t("linked_button") : t("link_button")}
           </button>
         </div>
       </div>
@@ -813,6 +805,7 @@ function Pagination({
   total: number;
   onChange: (offset: number) => void;
 }) {
+  const t = useTranslations("matcher");
   const page = Math.floor(offset / limit) + 1;
   const totalPages = Math.max(1, Math.ceil(total / limit));
   const canPrev = offset > 0;
@@ -821,7 +814,7 @@ function Pagination({
   return (
     <div className="flex items-center justify-between gap-2 text-sm">
       <div className="text-muted-foreground tabular-nums">
-        {offset + 1}–{Math.min(offset + limit, total)} из {total}
+        {t("pagination_range", { from: offset + 1, to: Math.min(offset + limit, total), total })}
       </div>
       <div className="flex gap-2">
         <button
@@ -829,17 +822,17 @@ function Pagination({
           onClick={() => onChange(Math.max(0, offset - limit))}
           className="rounded-md border border-input px-3 py-1.5 disabled:opacity-40 hover:bg-muted/50"
         >
-          ← Назад
+          {t("prev")}
         </button>
         <div className="px-3 py-1.5 tabular-nums text-muted-foreground">
-          стр. {page}/{totalPages}
+          {t("page_of", { page, total: totalPages })}
         </div>
         <button
           disabled={!canNext}
           onClick={() => onChange(offset + limit)}
           className="rounded-md border border-input px-3 py-1.5 disabled:opacity-40 hover:bg-muted/50"
         >
-          Вперёд →
+          {t("next")}
         </button>
       </div>
     </div>

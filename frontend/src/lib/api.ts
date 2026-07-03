@@ -403,6 +403,9 @@ export interface WatchlistCategoryItem {
   aloe_slug: string | null;
   notes: string | null;
   is_active: boolean;
+  product_count: number;
+  matched_product_count: number;
+  comparison_count: number;
 }
 
 export interface PriceHistoryPoint {

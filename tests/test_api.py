@@ -867,12 +867,48 @@ def test_dash_watchlist_categories_crud(client, auth_cookie, setup_db):
             "aloe_slug": "dermanlar",
             "notes": "priority",
             "is_active": True,
+            "product_count": 0,
+            "matched_product_count": 0,
+            "comparison_count": 0,
         }
     ]
 
     deleted = client.delete(f"/api/v1/dash/watchlist/categories/{tracked_id}")
     assert deleted.status_code == 204
     assert client.get("/api/v1/dash/watchlist/categories").json() == []
+
+
+def test_dash_watchlist_categories_include_comparison_counts(client, auth_cookie, setup_db):
+    run = storage.Run(status="ok", tenant_id=1)
+    setup_db.add(run)
+    setup_db.commit()
+    setup_db.refresh(run)
+    cat = storage.Category(
+        key="vit",
+        label_ru="Витамины",
+        label_az="Vitaminlər",
+        pharmonline_slug="vitamins",
+        aloe_slug="aloe-vitamins",
+        is_active=True,
+    )
+    setup_db.add(cat)
+    setup_db.commit()
+    setup_db.refresh(cat)
+    _make_match_with_prices(
+        setup_db,
+        run,
+        canonical="v1",
+        prices={"pharmonline": 10.0, "aloe": 8.0},
+        category="vitamins",
+    )
+
+    created = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})
+    assert created.status_code == 201, created.text
+
+    item = client.get("/api/v1/dash/watchlist/categories").json()[0]
+    assert item["product_count"] == 2
+    assert item["matched_product_count"] == 2
+    assert item["comparison_count"] == 1
 
 
 def test_dash_watchlist_categories_requires_auth(client, setup_db):

@@ -75,7 +75,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, func, or_, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, aliased, selectinload
 
 from src import inventory as inv_mod
 from src import storage, tenants
@@ -4014,8 +4014,45 @@ def dash_watchlist_create(
     return {"id": tp.id}
 
 
-def _watchlist_category_payload(tc: storage.TrackedCategory) -> dict[str, Any]:
+def _watchlist_category_payload(tc: storage.TrackedCategory, db: Session) -> dict[str, Any]:
     c = tc.category
+    slugs = [s for s in (c.pharmonline_slug, c.aptekonline_slug, c.aloe_slug) if s]
+    product_count = 0
+    matched_product_count = 0
+    comparison_count = 0
+    if slugs:
+        product_count = db.scalar(
+            select(func.count(storage.Product.id)).where(
+                storage.Product.tenant_id == tc.tenant_id,
+                storage.Product.category.in_(slugs),
+            )
+        ) or 0
+        matched_product_count = db.scalar(
+            select(func.count(storage.Product.id)).where(
+                storage.Product.tenant_id == tc.tenant_id,
+                storage.Product.category.in_(slugs),
+                storage.Product.canonical_id.is_not(None),
+            )
+        ) or 0
+    if c.pharmonline_slug:
+        other = aliased(storage.Product)
+        comparison_count = db.scalar(
+            select(func.count(func.distinct(storage.Product.canonical_id))).where(
+                storage.Product.tenant_id == tc.tenant_id,
+                storage.Product.site == "pharmonline",
+                storage.Product.category == c.pharmonline_slug,
+                storage.Product.canonical_id.is_not(None),
+                storage.Product.url_dead_at.is_(None),
+                select(other.id)
+                .where(
+                    other.tenant_id == tc.tenant_id,
+                    other.canonical_id == storage.Product.canonical_id,
+                    other.site != "pharmonline",
+                    other.url_dead_at.is_(None),
+                )
+                .exists(),
+            )
+        ) or 0
     return {
         "id": tc.id,
         "category_id": c.id,
@@ -4027,6 +4064,9 @@ def _watchlist_category_payload(tc: storage.TrackedCategory) -> dict[str, Any]:
         "aloe_slug": c.aloe_slug,
         "notes": tc.notes,
         "is_active": tc.is_active,
+        "product_count": product_count,
+        "matched_product_count": matched_product_count,
+        "comparison_count": comparison_count,
     }
 
 
@@ -4042,7 +4082,7 @@ def dash_watchlist_categories_list(
         .where(storage.TrackedCategory.tenant_id == user.tenant_id)
         .order_by(storage.Category.label_ru)
     ).all()
-    return [_watchlist_category_payload(item) for item in items]
+    return [_watchlist_category_payload(item, db) for item in items]
 
 
 @app.post("/api/v1/dash/watchlist/categories", status_code=201)

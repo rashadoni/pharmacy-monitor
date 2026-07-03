@@ -15,6 +15,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslations } from "next-intl";
 import { useState } from "react";
 import {
   Building2,
@@ -42,6 +43,7 @@ const SITE_ICON: Record<Site, typeof Search> = {
 type Selected = Partial<Record<Site, SiteProduct>>;
 
 export function CreateFromScratch() {
+  const t = useTranslations("matcher");
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<Selected>({});
   const [success, setSuccess] = useState<number | null>(null);
@@ -98,11 +100,7 @@ export function CreateFromScratch() {
       const list = products
         .map((p) => `${p.brand ?? "—"}: ${p.name}`)
         .join("\n");
-      if (
-        !confirm(
-          `Бренды выбранных продуктов различаются:\n\n${list}\n\nТочно один и тот же товар?`,
-        )
-      )
+      if (!confirm(t("confirm_different_brands", { list })))
         return;
     }
 
@@ -113,9 +111,9 @@ export function CreateFromScratch() {
     <div className="space-y-4">
       <div className="rounded-md bg-muted/30 border border-border p-3 text-xs text-muted-foreground">
         <Sparkles className="inline h-3.5 w-3.5 mr-1 -mt-0.5" />
-        Создаёт новый cross-site Match из выбранных продуктов. Минимум 2
-        продукта с <strong>разных</strong> сайтов. После создания авто-матчер не
-        будет пересчитывать этот кластер.
+        {t.rich("create_help", {
+          strong: (chunks) => <strong>{chunks}</strong>,
+        })}
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -134,11 +132,11 @@ export function CreateFromScratch() {
         <div className="flex flex-col sm:flex-row sm:items-center gap-3">
           <div className="flex-1 space-y-1.5">
             <div className="text-xs uppercase tracking-wide text-muted-foreground font-semibold">
-              Корзина ({selectedCount}/3)
+              {t("basket", { count: selectedCount })}
             </div>
             {selectedCount === 0 && (
               <div className="text-sm text-muted-foreground">
-                Выберите продукты минимум с 2 разных сайтов…
+                {t("basket_empty")}
               </div>
             )}
             <div className="flex flex-wrap gap-1.5">
@@ -159,7 +157,7 @@ export function CreateFromScratch() {
                     <button
                       onClick={() => handleRemove(s)}
                       className="text-muted-foreground hover:text-destructive ml-1"
-                      title="Убрать из корзины"
+                      title={t("remove_from_basket")}
                     >
                       <X className="h-3 w-3" />
                     </button>
@@ -174,10 +172,10 @@ export function CreateFromScratch() {
             className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
           >
             {createMutation.isPending
-              ? "Создаём…"
+              ? t("creating")
               : canCreate
-                ? `Создать кластер (${selectedCount})`
-                : "Нужны разные сайты (≥ 2)"}
+                ? t("create_cluster_count", { count: selectedCount })
+                : t("need_different_sites")}
           </button>
         </div>
 
@@ -188,8 +186,11 @@ export function CreateFromScratch() {
         )}
         {success != null && (
           <div className="mt-2 text-xs text-success flex items-center gap-1">
-            <CheckCircle2 className="h-3.5 w-3.5" /> Кластер #{success} создан.
-            Виден на <a href="/comparison" className="underline">/comparison</a>.
+            <CheckCircle2 className="h-3.5 w-3.5" />{" "}
+            {t.rich("cluster_created", {
+              id: success,
+              link: (chunks) => <a href="/comparison" className="underline">{chunks}</a>,
+            })}
           </div>
         )}
       </div>
@@ -206,6 +207,7 @@ function SiteSearchPanel({
   selectedProduct: SiteProduct | null;
   onAdd: (product: SiteProduct) => void;
 }) {
+  const t = useTranslations("matcher");
   const Icon = SITE_ICON[site];
   const [search, setSearch] = useState("");
   const debounced = useDebounce(search, 300);
@@ -228,7 +230,7 @@ function SiteSearchPanel({
         <span className="text-sm font-medium">{site}.az</span>
         {selectedProduct && (
           <span className="ml-auto text-[10px] text-success font-medium uppercase tracking-wide">
-            ✓ выбран
+            {t("selected")}
           </span>
         )}
       </div>
@@ -239,22 +241,22 @@ function SiteSearchPanel({
             type="search"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Поиск — минимум 2 символа"
+            placeholder={t("create_search_placeholder")}
             className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           />
         </div>
 
         {debounced.length < 2 && (
           <div className="text-xs text-muted-foreground py-2">
-            Введите название или бренд…
+            {t("enter_name_or_brand")}
           </div>
         )}
         {productsQ.isLoading && (
-          <div className="text-xs text-muted-foreground py-2">Ищу…</div>
+          <div className="text-xs text-muted-foreground py-2">{t("searching")}</div>
         )}
         {productsQ.data && productsQ.data.items.length === 0 && (
           <div className="text-xs text-muted-foreground py-2">
-            Ничего не найдено
+            {t("nothing_found_short")}
           </div>
         )}
 
@@ -300,11 +302,11 @@ function SiteSearchPanel({
                       }`}
                     >
                       {isAlreadySelected ? (
-                        "Выбрано"
+                        t("selected_plain")
                       ) : (
                         <>
                           <Plus className="inline h-2.5 w-2.5 -mt-0.5" />{" "}
-                          Добавить
+                          {t("add")}
                         </>
                       )}
                     </button>

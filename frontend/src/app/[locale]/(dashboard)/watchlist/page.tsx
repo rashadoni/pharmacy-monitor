@@ -262,6 +262,7 @@ function CategoryRow({
   const locale = useLocale();
   const [armed, setArmed] = useState(false);
   const label = locale === "az" && item.label_az ? item.label_az : item.label_ru;
+  const hasComparisonRows = item.comparison_count > 0;
 
   return (
     <div className="rounded-lg border border-border bg-card p-3 flex items-start gap-3">
@@ -272,6 +273,15 @@ function CategoryRow({
           {item.aptekonline_slug && <span>aptekonline: {item.aptekonline_slug}</span>}
           {item.aloe_slug && <span>aloe: {item.aloe_slug}</span>}
         </div>
+        <div className="text-xs text-muted-foreground mt-1 flex flex-wrap gap-x-3">
+          <span>{t("category_products_count", { count: item.product_count })}</span>
+          <span>{t("category_matched_count", { count: item.comparison_count })}</span>
+        </div>
+        {!hasComparisonRows && (
+          <div className="text-xs text-amber-600 dark:text-amber-500 mt-1">
+            {t("category_no_comparison")}
+          </div>
+        )}
         <div className="flex flex-wrap gap-2 mt-2">
           <a
             href="/category-comparison"
@@ -280,7 +290,7 @@ function CategoryRow({
             <BarChart3 className="h-3 w-3" />
             {t("category_comparison")}
           </a>
-          {item.pharmonline_slug && (
+          {item.pharmonline_slug && hasComparisonRows ? (
             <a
               href={`/comparison?category=${encodeURIComponent(item.pharmonline_slug)}`}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-secondary"
@@ -288,7 +298,15 @@ function CategoryRow({
               <ListTree className="h-3 w-3" />
               {t("category_products")}
             </a>
-          )}
+          ) : item.pharmonline_slug ? (
+            <span
+              className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-border text-muted-foreground/60 bg-muted/30"
+              title={t("category_no_comparison")}
+            >
+              <ListTree className="h-3 w-3" />
+              {t("category_products")}
+            </span>
+          ) : null}
         </div>
       </div>
       {armed ? (
