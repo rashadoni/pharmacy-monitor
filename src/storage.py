@@ -11,6 +11,7 @@ Schema overview:
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime
 from src._time import utcnow
 from pathlib import Path
@@ -38,6 +39,21 @@ from sqlalchemy.orm import (
 
 class Base(DeclarativeBase):
     pass
+
+
+_SESSION_CACHE_LOCK = threading.Lock()
+_SESSION_FACTORY_CACHE: dict[str, sessionmaker] = {}
+
+
+def _env_int(name: str, default: int, *, min_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(min_value, value)
 
 
 class Run(Base):
@@ -629,7 +645,21 @@ def make_engine(database_url: str | None = None):
     if url.startswith("sqlite:///") and not url.startswith("sqlite:////"):
         rel = url.replace("sqlite:///", "", 1)
         Path(rel).parent.mkdir(parents=True, exist_ok=True)
-    return create_engine(url, echo=False, future=True)
+        return create_engine(url, echo=False, future=True)
+    if url.startswith("sqlite"):
+        return create_engine(url, echo=False, future=True)
+
+    return create_engine(
+        url,
+        echo=False,
+        future=True,
+        pool_size=_env_int("DB_POOL_SIZE", 5, min_value=1),
+        max_overflow=_env_int("DB_MAX_OVERFLOW", 5, min_value=0),
+        pool_timeout=_env_int("DB_POOL_TIMEOUT", 10, min_value=1),
+        pool_recycle=_env_int("DB_POOL_RECYCLE", 1800, min_value=30),
+        pool_pre_ping=True,
+        pool_use_lifo=True,
+    )
 
 
 def init_db(database_url: str | None = None) -> None:
@@ -701,8 +731,19 @@ def _apply_lightweight_migrations(engine) -> None:
 
 
 def make_session(database_url: str | None = None):
-    engine = make_engine(database_url)
-    return sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    url = database_url or os.getenv("DATABASE_URL", "sqlite:///data/db.sqlite")
+    if url.startswith("sqlite"):
+        engine = make_engine(url)
+        return sessionmaker(engine, expire_on_commit=False, autoflush=False)
+
+    with _SESSION_CACHE_LOCK:
+        cached = _SESSION_FACTORY_CACHE.get(url)
+        if cached is not None:
+            return cached
+        engine = make_engine(url)
+        factory = sessionmaker(engine, expire_on_commit=False, autoflush=False)
+        _SESSION_FACTORY_CACHE[url] = factory
+        return factory
 
 
 # ============================================================================
