@@ -53,6 +53,7 @@ function NavLink({ href, icon: Icon, label, pathname }: {
   return (
     <Link
       href={href}
+      prefetch={false}
       className={cn(
         "flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
         active
@@ -159,6 +160,7 @@ export function BottomNav() {
           <Link
             key={item.href}
             href={item.href}
+            prefetch={false}
             className={cn(
               "flex min-w-0 flex-col items-center justify-center gap-0.5 px-0.5 py-2.5 text-[10px] transition-colors",
               active ? "text-primary font-semibold" : "text-muted-foreground",

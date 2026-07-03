@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { authenticate, hasE2EAuth } from "./helpers/auth";
 
 /**
  * Phase 6.3 (audit 2026-05-28) — Watchlist UX E2E.
@@ -11,7 +12,7 @@ import { test, expect } from "@playwright/test";
  *   - delete-armed pattern: первый клик меняет иконку → второй удаляет
  *   - add form открывается/закрывается
  *
- * Auth-gated: пропускаем full set если нет PLAYWRIGHT_AUTH_TOKEN.
+ * Auth-gated: use PLAYWRIGHT_AUTH_TOKEN or PLAYWRIGHT_AUTH_LOGIN/PASSWORD.
  */
 
 test.describe("Watchlist page (unauthenticated)", () => {
@@ -31,13 +32,12 @@ test.describe("Watchlist page (unauthenticated)", () => {
 
 test.describe("Watchlist page (authenticated)", () => {
   test.skip(
-    !process.env.PLAYWRIGHT_AUTH_TOKEN,
-    "Set PLAYWRIGHT_AUTH_TOKEN to run authenticated tests",
+    !hasE2EAuth(),
+    "Set PLAYWRIGHT_AUTH_TOKEN or PLAYWRIGHT_AUTH_LOGIN/PASSWORD to run authenticated tests",
   );
 
   test.beforeEach(async ({ page }) => {
-    await page.goto(`/auth/verify?token=${process.env.PLAYWRIGHT_AUTH_TOKEN}`);
-    await page.waitForURL(/\/overview/, { timeout: 10_000 });
+    await authenticate(page);
   });
 
   test("watchlist page renders", async ({ page }) => {
@@ -86,9 +86,9 @@ test.describe("Watchlist page (authenticated)", () => {
 
   test("category products link preserves locale and does not open comparison", async ({ page }) => {
     await page.goto("/az/watchlist");
+    await page.waitForLoadState("networkidle");
     const link = page.locator('[data-testid^="watchlist-category-products-"]').first();
-    const visible = await link.isVisible().catch(() => false);
-    test.skip(!visible, "No watchlist category with product slug is seeded");
+    await expect(link).toBeVisible({ timeout: 10_000 });
 
     const href = await link.getAttribute("href");
     expect(href).toContain("/az/category-products?");
