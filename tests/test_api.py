@@ -917,6 +917,49 @@ def test_dash_watchlist_categories_skip_comparison_without_pharmonline_slug(
     assert item["comparison_count"] == 0
 
 
+def test_dash_watchlist_categories_mixed_slugs_only_enrich_pharmonline_categories(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    pharm_cat = storage.Category(
+        key="vit",
+        label_ru="Витамины",
+        pharmonline_slug="vitamins",
+        aloe_slug="aloe-vitamins",
+        is_active=True,
+    )
+    aloe_cat = storage.Category(
+        key="aloe-only",
+        label_ru="Aloe only",
+        aloe_slug="aloe-only",
+        is_active=True,
+    )
+    setup_db.add_all([pharm_cat, aloe_cat])
+    setup_db.commit()
+    setup_db.refresh(pharm_cat)
+    setup_db.refresh(aloe_cat)
+
+    calls = []
+
+    class Row:
+        category = "vitamins"
+        matched_skus = 7
+
+    def fake_category_comparison(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [Row()]
+
+    monkeypatch.setattr(api_module.analytics, "category_comparison", fake_category_comparison)
+
+    for cat in [pharm_cat, aloe_cat]:
+        created = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})
+        assert created.status_code == 201, created.text
+
+    items = {item["key"]: item for item in client.get("/api/v1/dash/watchlist/categories").json()}
+    assert calls
+    assert items["vit"]["comparison_count"] == 7
+    assert items["aloe-only"]["comparison_count"] == 0
+
+
 def test_dash_watchlist_categories_include_comparison_counts(client, auth_cookie, setup_db):
     run = storage.Run(status="ok", tenant_id=1)
     setup_db.add(run)
