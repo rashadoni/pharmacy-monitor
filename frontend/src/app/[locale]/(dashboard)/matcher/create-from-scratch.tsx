@@ -34,6 +34,9 @@ import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice } from "@/lib/utils";
 import { SITES, type Site } from "./sites";
 
+const DEFAULT_SEARCH_LIMIT = 15;
+const CATEGORY_SCOPED_LIMIT = 100;
+
 const SITE_ICON: Record<Site, typeof Search> = {
   aloe: Leaf,
   pharmonline: Building2,
@@ -224,15 +227,16 @@ function SiteSearchPanel({
   const Icon = SITE_ICON[site];
   const [search, setSearch] = useState("");
   const debounced = useDebounce(search, 300);
+  const limit = category ? CATEGORY_SCOPED_LIMIT : DEFAULT_SEARCH_LIMIT;
 
   const productsQ = useQuery({
-    queryKey: ["matcher", "create-search", site, category, debounced],
+    queryKey: ["matcher", "create-search", site, category, debounced, limit],
     queryFn: () =>
       api.siteProducts({
         site,
         category: category || undefined,
         search: debounced || undefined,
-        limit: 15,
+        limit,
       }),
     enabled: Boolean(category) || debounced.length >= 2,
   });
@@ -279,6 +283,14 @@ function SiteSearchPanel({
         {productsQ.data && productsQ.data.items.length === 0 && (
           <div className="text-xs text-muted-foreground py-2">
             {t("nothing_found_short")}
+          </div>
+        )}
+        {category && productsQ.data && productsQ.data.items.length > 0 && (
+          <div className="text-[11px] text-muted-foreground">
+            {t("create_category_results", {
+              shown: productsQ.data.items.length,
+              total: productsQ.data.total,
+            })}
           </div>
         )}
 

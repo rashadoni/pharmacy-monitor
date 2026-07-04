@@ -628,6 +628,7 @@
     "selected_plain": "Выбрано",
     "create_search_placeholder": "Поиск — минимум 2 символа",
     "enter_name_or_brand": "Введите название или бренд…",
+    "create_category_results": "Показано {shown} из {total} товаров категории",
     "add": "Добавить",
     "subtitle_prefix": "Привяжите продукт сайта",
     "subtitle_middle": "к существующему cross-site кластеру или создайте новый кластер с нуля из 2-3 продуктов разных сайтов. Ручные связки помечаются",

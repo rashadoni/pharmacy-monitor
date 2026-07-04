@@ -628,6 +628,7 @@
     "selected_plain": "Selected",
     "create_search_placeholder": "Search — minimum 2 characters",
     "enter_name_or_brand": "Enter name or brand…",
+    "create_category_results": "Showing {shown} of {total} category products",
     "add": "Add",
     "subtitle_prefix": "Link a product from",
     "subtitle_middle": "to an existing cross-site cluster, or create a new cluster from scratch using 2-3 products from different sites. Manual links are marked",

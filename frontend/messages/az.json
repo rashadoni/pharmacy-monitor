@@ -628,6 +628,7 @@
     "selected_plain": "Seçildi",
     "create_search_placeholder": "Axtarış — minimum 2 simvol",
     "enter_name_or_brand": "Ad və ya brend daxil edin…",
+    "create_category_results": "Kateqoriyadan {shown} / {total} məhsul göstərilir",
     "add": "Əlavə et",
     "subtitle_prefix": "Bu saytın məhsulunu bağlayın:",
     "subtitle_middle": "mövcud cross-site klasterə və ya müxtəlif saytlardan 2-3 məhsulla sıfırdan yeni klaster yaradın. Manual bağlar",
