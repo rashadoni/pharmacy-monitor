@@ -130,6 +130,8 @@
     "kpi_ai_low_confidence": "{count} / {total} aşağı etibarlılıqla",
     "today_actions": "Bugünkü tövsiyələr",
     "no_actions": "Tövsiyə yoxdur — qiymətləriniz uyğundur.",
+    "latest_by_site": "Hər sayt üzrə son icra",
+    "latest_by_site_desc": "Həftəlik saytlar son 5 ümumi icraya düşməsə də burada həmişə görünür.",
     "recent_runs": "Son icra olunanlar",
     "runs_desc": "Sətirə klik edin — hər saytda hər kateqoriya üzrə məhsul sayını görmək üçün.",
     "th_id": "ID",

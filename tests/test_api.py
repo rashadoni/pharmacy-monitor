@@ -252,6 +252,65 @@ def test_dash_comparison_without_cookie_401(client):
     assert r.status_code == 401
 
 
+def test_dash_runs_latest_by_site_includes_weekly_site(client, auth_cookie, setup_db):
+    """Latest-by-site keeps aptekonline visible even when global recent runs are newer."""
+
+    db = setup_db
+    base = utcnow()
+    aptek = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(days=4),
+        finished_at=base - timedelta(days=4) + timedelta(minutes=25),
+        status="ok",
+        products_scraped=93932,
+        products_per_site={"aptekonline": 93932},
+        sites_completed="aptekonline",
+    )
+    aloe = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=2),
+        finished_at=base - timedelta(hours=2) + timedelta(minutes=1),
+        status="ok",
+        products_scraped=6237,
+        products_per_site={"aloe": 6237},
+        sites_completed="aloe",
+    )
+    pharm = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=1),
+        finished_at=base - timedelta(hours=1) + timedelta(minutes=1),
+        status="ok",
+        products_scraped=166,
+        products_per_site={"pharmonline": 166},
+        sites_completed="pharmonline",
+    )
+    other_tenant_newer = storage.Run(
+        tenant_id=2,
+        started_at=base,
+        finished_at=base,
+        status="ok",
+        products_scraped=999,
+        products_per_site={"aptekonline": 999},
+        sites_completed="aptekonline",
+    )
+    db.add_all([aptek, aloe, pharm, other_tenant_newer])
+    db.commit()
+
+    r = client.get("/api/v1/dash/runs/latest-by-site")
+    assert r.status_code == 200, r.text
+    rows = {row["site"]: row["run"] for row in r.json()}
+    assert rows["pharmonline"]["id"] == pharm.id
+    assert rows["aloe"]["id"] == aloe.id
+    assert rows["aptekonline"]["id"] == aptek.id
+    assert rows["aptekonline"]["products_per_site"] == {"aptekonline": 93932}
+
+    recent = client.get("/api/v1/dash/runs?limit=5")
+    assert recent.status_code == 200, recent.text
+    recent_ids = {row["id"] for row in recent.json()}
+    assert other_tenant_newer.id not in recent_ids
+    assert pharm.id in recent_ids
+
+
 def _make_match_with_prices(db, run, *, canonical, prices, tenant_id=1, category=None):
     """Match + products на 2 сайтах + PriceSnapshot для каждого.
 

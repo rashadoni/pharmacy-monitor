@@ -2761,19 +2761,59 @@ def dash_runs(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    runs = db.scalars(select(storage.Run).order_by(desc(storage.Run.id)).limit(limit)).all()
+    runs = db.scalars(
+        select(storage.Run)
+        .where(storage.Run.tenant_id == user.tenant_id)
+        .order_by(desc(storage.Run.id))
+        .limit(limit)
+    ).all()
+    return [_run_row_out(r) for r in runs]
+
+
+def _run_row_out(r: storage.Run) -> dict:
+    return {
+        "id": r.id,
+        "started_at": r.started_at.isoformat() if r.started_at else None,
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        "status": r.status,
+        "products_scraped": r.products_scraped,
+        "products_per_site": r.products_per_site,
+        "sites_completed": r.sites_completed,
+        "error_message": r.error_message,
+    }
+
+
+@app.get("/api/v1/dash/runs/latest-by-site")
+def dash_runs_latest_by_site(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Latest run that touched each monitored site.
+
+    `/overview` also shows the last N runs globally. Weekly sites such as
+    aptekonline can be pushed out of that short list by intraday pharmonline
+    and aloe runs, so this endpoint returns one row per site.
+    """
+    runs = db.scalars(
+        select(storage.Run)
+        .where(storage.Run.tenant_id == user.tenant_id)
+        .order_by(desc(storage.Run.id))
+        .limit(500)
+    ).all()
+    latest: dict[str, storage.Run] = {}
+    for run in runs:
+        per_site = run.products_per_site or {}
+        for site in _VALID_SITES:
+            if site in latest:
+                continue
+            if site in per_site:
+                latest[site] = run
+        if len(latest) == len(_VALID_SITES):
+            break
+
     return [
-        {
-            "id": r.id,
-            "started_at": r.started_at.isoformat() if r.started_at else None,
-            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
-            "status": r.status,
-            "products_scraped": r.products_scraped,
-            "products_per_site": r.products_per_site,
-            "sites_completed": r.sites_completed,
-            "error_message": r.error_message,
-        }
-        for r in runs
+        {"site": site, "run": _run_row_out(latest[site]) if site in latest else None}
+        for site in _VALID_SITES
     ]
 
 

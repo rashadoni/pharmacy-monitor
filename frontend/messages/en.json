@@ -130,6 +130,8 @@
     "kpi_ai_low_confidence": "{count} of {total} with low confidence",
     "today_actions": "Today's actions",
     "no_actions": "No recommendations — pricing is on track.",
+    "latest_by_site": "Latest run by site",
+    "latest_by_site_desc": "Weekly sites stay visible here even when they are pushed out of the last 5 global runs.",
     "recent_runs": "Recent runs",
     "runs_desc": "Click a row to see breakdown — products per site per category.",
     "th_id": "ID",

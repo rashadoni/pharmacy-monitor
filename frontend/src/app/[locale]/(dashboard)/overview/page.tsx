@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, CheckCircle2, AlertCircle, AlertTriangle } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
-import { api, type RunRow, type RoiAction, type HealthSite } from "@/lib/api";
+import { api, type RunRow, type RoiAction, type HealthSite, type LatestRunBySite } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { QuickActions } from "@/components/quick-actions";
 import { formatRelative, formatPrice } from "@/lib/utils";
@@ -17,6 +17,10 @@ export default function OverviewPage() {
   const normalizeQ = useQuery({ queryKey: ["normalize-stats"], queryFn: api.normalizeStats });
   const actionsQ = useQuery({ queryKey: ["roi-actions", locale], queryFn: () => api.roiActions(undefined, locale) });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
+  const latestBySiteQ = useQuery({
+    queryKey: ["runs-latest-by-site"],
+    queryFn: api.runsLatestBySite,
+  });
   // Phase 5.6: live staleness panel. Refresh every 60s automatically.
   const healthQ = useQuery({
     queryKey: ["health"],
@@ -119,6 +123,8 @@ export default function OverviewPage() {
         </div>
       </div>
 
+      <LatestRunsBySitePanel items={latestBySiteQ.data ?? []} loading={latestBySiteQ.isLoading} />
+
       {/* Recent runs */}
       <div>
         <h2 className="text-lg font-semibold mb-3">{t("recent_runs")}</h2>
@@ -153,6 +159,73 @@ export default function OverviewPage() {
           </table>
         </div>
       </div>
+    </div>
+  );
+}
+
+function LatestRunsBySitePanel({
+  items,
+  loading,
+}: {
+  items: LatestRunBySite[];
+  loading: boolean;
+}) {
+  const t = useTranslations("overview");
+  const tCommon = useTranslations("common");
+
+  return (
+    <div>
+      <h2 className="text-lg font-semibold mb-1">{t("latest_by_site")}</h2>
+      <p className="text-xs text-muted-foreground mb-2">{t("latest_by_site_desc")}</p>
+      {loading ? (
+        <div className="text-sm text-muted-foreground">{tCommon("loading")}</div>
+      ) : (
+        <div className="rounded-lg border border-border overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/50 text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2 text-left">{t("th_sites")}</th>
+                <th className="px-3 py-2 text-left">{t("th_id")}</th>
+                <th className="px-3 py-2 text-left">{t("th_started")}</th>
+                <th className="px-3 py-2 text-left hidden sm:table-cell">{t("th_duration")}</th>
+                <th className="px-3 py-2 text-left">{t("th_status")}</th>
+                <th className="px-3 py-2 text-right">{t("th_products")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => {
+                const run = item.run;
+                const siteProducts = run?.products_per_site?.[item.site] ?? run?.products_scraped ?? null;
+                return (
+                  <tr key={item.site} className="border-t border-border">
+                    <td className="px-3 py-2 font-medium">{item.site}</td>
+                    <td className="px-3 py-2 font-mono text-xs">{run?.id ?? "—"}</td>
+                    <td className="px-3 py-2 text-muted-foreground">
+                      {run?.started_at ? run.started_at.slice(0, 16).replace("T", " ") : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-muted-foreground hidden sm:table-cell tabular-nums">
+                      {run ? formatDuration(run.started_at, run.finished_at, t) : "—"}
+                    </td>
+                    <td className="px-3 py-2">
+                      {run ? <StatusBadge status={run.status} /> : <span className="text-muted-foreground">—</span>}
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums">
+                      {siteProducts == null ? "—" : siteProducts}
+                    </td>
+                  </tr>
+                );
+              })}
+              {items.length === 0 && (
+                <tr className="border-t border-border">
+                  <td colSpan={6} className="px-3 py-4 text-center text-muted-foreground">
+                    {t("no_data")}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

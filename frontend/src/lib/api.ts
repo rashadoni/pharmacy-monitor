@@ -542,6 +542,11 @@ export interface RunBreakdown {
   sites_completed: string | null;
 }
 
+export interface LatestRunBySite {
+  site: string;
+  run: RunRow | null;
+}
+
 export interface CategoryRow {
   id: number;
   key: string;
@@ -808,6 +813,7 @@ export const api = {
   siteProductsSummary: (site: string) =>
     request<SiteSummary>(`/api/v1/dash/products/summary?site=${encodeURIComponent(site)}`),
   runs: (limit = 30) => request<RunRow[]>(`/api/v1/dash/runs?limit=${limit}`),
+  runsLatestBySite: () => request<LatestRunBySite[]>("/api/v1/dash/runs/latest-by-site"),
   runBreakdown: (id: number) =>
     request<RunBreakdown>(`/api/v1/dash/runs/${id}/breakdown`),
   categories: () => request<CategoryRow[]>("/api/v1/dash/categories"),
