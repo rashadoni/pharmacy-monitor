@@ -439,6 +439,38 @@ def test_category_comparison_can_filter_categories(db_session):
     assert analytics.category_comparison(db_session, categories=set()) == []
 
 
+def test_category_comparison_filter_selects_matching_client_category(db_session):
+    run = _add_run(db_session)
+    m = Match(canonical_name="Dirty multi client", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    keep = _add_product(
+        db_session,
+        "pharmonline",
+        "Keep",
+        canonical_id=m.id,
+        category="keep-cat",
+        ext_id="keep",
+    )
+    skip = _add_product(
+        db_session,
+        "pharmonline",
+        "Skip",
+        canonical_id=m.id,
+        category="skip-cat",
+        ext_id="skip",
+    )
+    aloe = _add_product(db_session, "aloe", "Keep", canonical_id=m.id, category="aloe", ext_id="a")
+    _add_snap_at(db_session, run, keep, 10.0)
+    _add_snap_at(db_session, run, skip, 30.0)
+    _add_snap_at(db_session, run, aloe, 8.0)
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session, categories={"keep-cat"})
+    assert [r.category for r in rows] == ["keep-cat"]
+    assert rows[0].avg_client_price == 10.0
+
+
 def test_category_comparison_empty(db_session):
     assert analytics.category_comparison(db_session) == []
 
