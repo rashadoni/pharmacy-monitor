@@ -36,8 +36,8 @@ export default function OverviewPage() {
             4 KPI карточки сверху: сколько cross-site совпадений, какое
             покрытие и AI confidence. Ниже — «Сегодняшние действия» (где
             конкурент бьёт по цене и где ты можешь поднять). Расписание
-            прогонов внизу — Mac launchd скрейпит pharm/aptek в 18:00 Baku,
-            aloe — direct с прода в 03:00 UTC.
+            прогонов внизу — все скрейпы идут на сервере через оплаченные
+            сервисы/proxy, без зависимости от Mac.
           </>
         }
       />
@@ -442,19 +442,21 @@ function SiteStalenessPanel({ sites }: { sites: HealthSite[] }) {
 function SiteStalenessCell({ site }: { site: HealthSite }) {
   const t = useTranslations("staleness");
   const hours = site.hours_since;
+  const maxAgeHours = site.max_age_hours;
+  const warningAfterHours = maxAgeHours <= 30 ? 8 : maxAgeHours * 0.75;
   // Threshold rules:
-  //   green:  <8h (scrape happened within last shift)
-  //   yellow: 8-30h (between two daily runs is OK; >30h is suspicious)
-  //   red:    >=30h or null (stale enough to flag)
+  //   green:  comfortably inside the site's scrape cadence
+  //   yellow: near the backend staleness threshold
+  //   red:    beyond the backend staleness threshold, or no data
   let tone: "green" | "yellow" | "red" = "green";
   let Icon = CheckCircle2;
   if (hours === null) {
     tone = "red";
     Icon = AlertCircle;
-  } else if (hours >= 30) {
+  } else if (hours > maxAgeHours) {
     tone = "red";
     Icon = AlertCircle;
-  } else if (hours >= 8) {
+  } else if (hours >= warningAfterHours) {
     tone = "yellow";
     Icon = AlertTriangle;
   }

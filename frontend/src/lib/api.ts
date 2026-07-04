@@ -578,6 +578,7 @@ export interface HealthSite {
   site: string;
   last_seen_at: string | null;
   hours_since: number | null;
+  max_age_hours: number;
 }
 
 export interface Health {

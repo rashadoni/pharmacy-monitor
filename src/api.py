@@ -357,13 +357,15 @@ class SiteStaleness(BaseModel):
     """Per-site freshness: when did we last successfully see a product on it?
 
     `hours_since` aggregates the gap between now and the max `last_seen_at`
-    across all products tagged with `site`. >30h is suspicious — scrapes
-    run daily, so anything older means the scraper has missed at least one run.
+    across all products tagged with `site`. `max_age_hours` is the site-specific
+    threshold used by backend health checks; daily sites use the default, while
+    weekly scrapes such as aptekonline/pharmonline have a larger threshold.
     """
 
     site: str
     last_seen_at: datetime | None
     hours_since: float | None
+    max_age_hours: int
 
 
 class HealthOut(BaseModel):
@@ -373,7 +375,7 @@ class HealthOut(BaseModel):
     db_ping_ms: float | None = None  # SELECT 1 round-trip
     redis_ping_ms: float | None = None  # PING round-trip, null if Redis unreachable
     sites: list[SiteStaleness] = Field(default_factory=list)
-    staleness_warning: bool = False  # true if any site >30h stale
+    staleness_warning: bool = False  # true if any site exceeds its freshness threshold
 
 
 class AuthRequestIn(BaseModel):
@@ -515,6 +517,13 @@ class WatchlistCategoryIn(BaseModel):
 _HEALTH_STALENESS_HOURS = 30
 
 
+def _site_staleness_threshold(site: str) -> int:
+    """Return the backend health threshold for a site's freshness card."""
+    from src.health import _SITE_MAX_AGE_HOURS
+
+    return _SITE_MAX_AGE_HOURS.get(site, _HEALTH_STALENESS_HOURS)
+
+
 def _ping_db(db: Session) -> float | None:
     """SELECT 1 round-trip, returns ms or None on failure."""
     try:
@@ -565,7 +574,14 @@ def _staleness_per_site(db: Session) -> list[SiteStaleness]:
         if last_seen is not None:
             ls = last_seen.replace(tzinfo=None) if last_seen.tzinfo else last_seen
             hours = round((now - ls).total_seconds() / 3600, 2)
-        out.append(SiteStaleness(site=site, last_seen_at=last_seen, hours_since=hours))
+        out.append(
+            SiteStaleness(
+                site=site,
+                last_seen_at=last_seen,
+                hours_since=hours,
+                max_age_hours=_site_staleness_threshold(site),
+            )
+        )
     return out
 
 
@@ -582,13 +598,9 @@ def health_endpoint(db: Session = Depends(get_db)):
     db_ms = _ping_db(db)
     redis_ms = _ping_redis()
     sites = _staleness_per_site(db)
-    # Per-site порог (единый источник health._SITE_MAX_AGE_HOURS; fallback на
-    # суточный дефолт). aptekonline недельный — иначе /health = degraded 6 из 7 дней.
-    from src.health import _SITE_MAX_AGE_HOURS
-
     stale = any(
         s.hours_since is not None
-        and s.hours_since > _SITE_MAX_AGE_HOURS.get(s.site, _HEALTH_STALENESS_HOURS)
+        and s.hours_since > s.max_age_hours
         for s in sites
     )
     status_label = "degraded" if (stale or db_ms is None) else "up"
