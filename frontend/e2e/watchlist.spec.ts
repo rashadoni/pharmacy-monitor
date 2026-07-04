@@ -86,16 +86,18 @@ test.describe("Watchlist page (authenticated)", () => {
   });
 
   test("delete uses 2-click armed pattern (no window.confirm)", async ({ page }) => {
-    const itemId = await createWatchlistItem(page, `E2E Delete ${Date.now()}`);
+    const itemName = `E2E Delete ${Date.now()}`;
+    const itemId = await createWatchlistItem(page, itemName);
     try {
       await page.goto("/ru/watchlist");
+      await expect(page.getByText(itemName)).toBeVisible();
 
       await page.locator(`[data-testid="watchlist-delete-${itemId}"]`).click();
       await expect(
         page.locator(`[data-testid="watchlist-delete-confirm-${itemId}"]`),
       ).toHaveCount(1);
       await page.locator(`[data-testid="watchlist-delete-confirm-${itemId}"]`).click();
-      await expect(page.locator(`[data-testid="watchlist-delete-${itemId}"]`)).toHaveCount(0);
+      await expect(page.getByText(itemName)).toHaveCount(0);
     } finally {
       await deleteWatchlistItem(page, itemId, { allowMissing: true });
     }
