@@ -1167,6 +1167,33 @@ def test_watchlist_dead_target_member_stays_attachable(client, auth_cookie, setu
     assert live_aloe.canonical_id == match.id
 
 
+def test_matcher_ignores_fully_dead_clusters(client, auth_cookie, setup_db):
+    match = storage.Match(tenant_id=1, canonical_name="Dead cluster", confidence=1.0)
+    setup_db.add(match)
+    setup_db.flush()
+    setup_db.add(
+        storage.Product(
+            tenant_id=1,
+            site="pharmonline",
+            external_id="dead-ph",
+            url="https://pharmonline.example/dead",
+            name="Dead pharmonline",
+            name_normalized="dead pharmonline",
+            category="supplies",
+            canonical_id=match.id,
+            url_dead_at=utcnow(),
+        )
+    )
+    setup_db.commit()
+
+    counts = client.get("/api/v1/dash/matcher/counts")
+    assert counts.status_code == 200, counts.text
+    assert counts.json() == {"pharmonline": 0, "aptekonline": 0, "aloe": 0}
+    pairs = client.get("/api/v1/dash/unmatched-pairs?site=aloe&category=supplies")
+    assert pairs.status_code == 200, pairs.text
+    assert pairs.json()["items"] == []
+
+
 def test_dash_watchlist_categories_counts_are_site_scoped(client, auth_cookie, setup_db):
     run = storage.Run(status="ok", tenant_id=1)
     setup_db.add(run)

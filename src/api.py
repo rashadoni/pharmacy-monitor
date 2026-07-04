@@ -3619,9 +3619,16 @@ def dash_unmatched_pairs(
     matches = list(db.scalars(stmt).all())
 
     if category:
-        matches = [m for m in matches if any((p.category or "") == category for p in m.products)]
+        matches = [
+            m
+            for m in matches
+            if any(
+                p.url_dead_at is None and (p.category or "") == category
+                for p in m.products
+            )
+        ]
 
-    matches = [m for m in matches if m.products]
+    matches = [m for m in matches if any(p.url_dead_at is None for p in m.products)]
     total = len(matches)
     page = matches[offset : offset + limit]
 
@@ -3780,6 +3787,7 @@ def dash_matcher_counts(
         .where(
             storage.Product.canonical_id.is_not(None),
             storage.Product.tenant_id == user.tenant_id,
+            storage.Product.url_dead_at.is_(None),
         )
         .distinct()
         .subquery()
