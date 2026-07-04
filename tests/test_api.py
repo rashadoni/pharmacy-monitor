@@ -1127,8 +1127,8 @@ def test_watchlist_dead_target_member_stays_attachable(client, auth_cookie, setu
         site="aloe",
         external_id="aloe-live-replacement",
         url="https://aloe.example/live-replacement",
-        name="Live replacement",
-        name_normalized="live replacement",
+        name="replace-dead aloe live",
+        name_normalized="replace-dead aloe live",
         category="aloe-supplies",
     )
     setup_db.add(live_aloe)
@@ -1146,6 +1146,17 @@ def test_watchlist_dead_target_member_stays_attachable(client, auth_cookie, setu
     pairs = client.get("/api/v1/dash/unmatched-pairs?site=aloe&category=supplies")
     assert pairs.status_code == 200, pairs.text
     assert [row["match_id"] for row in pairs.json()["items"]] == [match.id]
+    suggestions = client.get(f"/api/v1/dash/matches/{match.id}/candidate-analogs?site=aloe")
+    assert suggestions.status_code == 200, suggestions.text
+    assert [row["product_id"] for row in suggestions.json()["items"]] == [live_aloe.id]
+    products = client.get("/api/v1/dash/products?site=aloe&search=replace-dead")
+    assert products.status_code == 200, products.text
+    assert [row["id"] for row in products.json()["items"]] == [live_aloe.id]
+    dead_add = client.post(
+        f"/api/v1/dash/matches/{match.id}/add-product",
+        json={"product_id": dead_aloe.id},
+    )
+    assert dead_add.status_code == 400, dead_add.text
 
     added = client.post(
         f"/api/v1/dash/matches/{match.id}/add-product",

@@ -2560,6 +2560,7 @@ def dash_products(
         .where(
             storage.Product.site == site,
             storage.Product.tenant_id == user.tenant_id,
+            storage.Product.url_dead_at.is_(None),
         )
         .order_by(desc(storage.Product.last_seen_at))
     )
@@ -3689,12 +3690,13 @@ def dash_match_candidate_analogs(
     if not match:
         raise HTTPException(404, "Match not found")
     members = list(match.products)
-    if not members or any(p.site == site for p in members):
+    live_members = [p for p in members if p.url_dead_at is None]
+    if not live_members or any(p.site == site for p in live_members):
         return {"items": []}  # nothing to add (empty cluster or site already present)
 
     # first significant token of each member → coarse block
     block_tokens: set[str] = set()
-    for m in members:
+    for m in live_members:
         nn = m.name_normalized or ""
         toks = matcher._significant_name_tokens(nn)
         first = next((t for t in nn.split() if t in toks), None)
@@ -3724,15 +3726,15 @@ def dash_match_candidate_analogs(
             matcher._hard_conflict(c, m)
             or matcher._pairwise_spec_conflict(c, m)
             or match_actions.is_rejected(db, c.id, m.id)
-            for m in members
+            for m in live_members
         ):
             continue
         score = max(
-            fuzz.token_set_ratio(c.name_normalized, m.name_normalized or "") for m in members
+            fuzz.token_set_ratio(c.name_normalized, m.name_normalized or "") for m in live_members
         )
         if score < 80:
             continue
-        auto_safe = any(matcher.ultra_equal(c, m) for m in members)
+        auto_safe = any(matcher.ultra_equal(c, m) for m in live_members)
         scored.append((score, auto_safe, c))
 
     scored.sort(key=lambda r: (r[1], r[0]), reverse=True)
@@ -3842,6 +3844,8 @@ def dash_match_add_product(
     )
     if not product:
         raise HTTPException(404, "Product not found")
+    if product.url_dead_at is not None:
+        raise HTTPException(400, "Product is marked dead")
 
     if product.canonical_id == match.id:
         raise HTTPException(400, "Product already in this match")
