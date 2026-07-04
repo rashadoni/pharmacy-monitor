@@ -910,13 +910,41 @@ def test_dash_watchlist_categories_include_comparison_counts(client, auth_cookie
     assert aloe_product is not None
     aloe_product.category = "aloe-vitamins"
     setup_db.commit()
+    low_conf = storage.Match(tenant_id=1, canonical_name="low", confidence=0.2)
+    setup_db.add(low_conf)
+    setup_db.flush()
+    setup_db.add_all(
+        [
+            storage.Product(
+                tenant_id=1,
+                site="pharmonline",
+                external_id="ph-low",
+                url="https://pharmonline.example/low",
+                name="Low",
+                name_normalized="low",
+                canonical_id=low_conf.id,
+                category="vitamins",
+            ),
+            storage.Product(
+                tenant_id=1,
+                site="aloe",
+                external_id="al-low",
+                url="https://aloe.example/low",
+                name="Low",
+                name_normalized="low",
+                canonical_id=low_conf.id,
+                category="aloe-vitamins",
+            ),
+        ]
+    )
+    setup_db.commit()
 
     created = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})
     assert created.status_code == 201, created.text
 
     item = client.get("/api/v1/dash/watchlist/categories").json()[0]
-    assert item["product_count"] == 2
-    assert item["matched_product_count"] == 2
+    assert item["product_count"] == 4
+    assert item["matched_product_count"] == 4
     assert item["comparison_count"] == 1
 
 

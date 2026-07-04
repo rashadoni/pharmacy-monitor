@@ -77,6 +77,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session, aliased, selectinload
 
+from src import analytics
 from src import inventory as inv_mod
 from src import storage, tenants
 from src._time import utcnow
@@ -4014,7 +4015,12 @@ def dash_watchlist_create(
     return {"id": tp.id}
 
 
-def _watchlist_category_payload(tc: storage.TrackedCategory, db: Session) -> dict[str, Any]:
+def _watchlist_category_payload(
+    tc: storage.TrackedCategory,
+    db: Session,
+    *,
+    category_comparison_counts: dict[str, int] | None = None,
+) -> dict[str, Any]:
     c = tc.category
     site_category_filters = [
         (storage.Product.site == site) & (storage.Product.category == slug)
@@ -4042,7 +4048,9 @@ def _watchlist_category_payload(tc: storage.TrackedCategory, db: Session) -> dic
                 storage.Product.canonical_id.is_not(None),
             )
         ) or 0
-    if c.pharmonline_slug:
+    if c.pharmonline_slug and category_comparison_counts is not None:
+        comparison_count = category_comparison_counts.get(c.pharmonline_slug, 0)
+    elif c.pharmonline_slug:
         other = aliased(storage.Product)
         comparison_count = db.scalar(
             select(func.count(func.distinct(storage.Product.canonical_id))).where(
@@ -4090,7 +4098,20 @@ def dash_watchlist_categories_list(
         .where(storage.TrackedCategory.tenant_id == user.tenant_id)
         .order_by(storage.Category.label_ru)
     ).all()
-    return [_watchlist_category_payload(item, db) for item in items]
+    comparison_counts = {
+        row.category: row.matched_skus
+        for row in analytics.category_comparison(
+            db, client_site="pharmonline", tenant_id=user.tenant_id
+        )
+    }
+    return [
+        _watchlist_category_payload(
+            item,
+            db,
+            category_comparison_counts=comparison_counts,
+        )
+        for item in items
+    ]
 
 
 @app.post("/api/v1/dash/watchlist/categories", status_code=201)
