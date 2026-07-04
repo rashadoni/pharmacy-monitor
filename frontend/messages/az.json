@@ -247,7 +247,8 @@
     "delete_category_confirm": "«{name}» kateqoriyası silinsin?",
     "items_count": "{count, plural, one {# qeyd} other {# qeyd}}",
     "category_products_count": "Kateqoriyada {count} məhsul",
-    "category_matched_count": "Müqayisə üçün {count} uyğunluq",
+    "category_matched_count": "{count} bağlanıb",
+    "category_comparison_count": "{count} müqayisəyə hazırdır",
     "category_no_comparison": "Hələ cross-site uyğun məhsul yoxdur: matching-i işə salın və ya məhsulları əl ilə bağlayın.",
     "category_make_matches": "Uyğunluq seç"
   },

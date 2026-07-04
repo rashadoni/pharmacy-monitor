@@ -278,7 +278,8 @@ function CategoryRow({
         </div>
         <div className="text-xs text-muted-foreground mt-1 flex flex-wrap gap-x-3">
           <span>{t("category_products_count", { count: item.product_count })}</span>
-          <span>{t("category_matched_count", { count: item.comparison_count })}</span>
+          <span>{t("category_matched_count", { count: item.matched_product_count })}</span>
+          <span>{t("category_comparison_count", { count: item.comparison_count })}</span>
         </div>
         {!hasComparisonRows && (
           <div className="text-xs text-amber-600 dark:text-amber-500 mt-1">

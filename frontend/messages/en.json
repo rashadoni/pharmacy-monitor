@@ -247,7 +247,8 @@
     "delete_category_confirm": "Delete category \"{name}\"?",
     "items_count": "{count, plural, one {# item} other {# items}}",
     "category_products_count": "{count} products in category",
-    "category_matched_count": "{count} matched for comparison",
+    "category_matched_count": "{count} linked",
+    "category_comparison_count": "{count} ready for comparison",
     "category_no_comparison": "No cross-site matched products yet: run matching or link products manually.",
     "category_make_matches": "Create matches"
   },

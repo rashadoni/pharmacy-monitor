@@ -4016,21 +4016,29 @@ def dash_watchlist_create(
 
 def _watchlist_category_payload(tc: storage.TrackedCategory, db: Session) -> dict[str, Any]:
     c = tc.category
-    slugs = [s for s in (c.pharmonline_slug, c.aptekonline_slug, c.aloe_slug) if s]
+    site_category_filters = [
+        (storage.Product.site == site) & (storage.Product.category == slug)
+        for site, slug in (
+            ("pharmonline", c.pharmonline_slug),
+            ("aptekonline", c.aptekonline_slug),
+            ("aloe", c.aloe_slug),
+        )
+        if slug
+    ]
     product_count = 0
     matched_product_count = 0
     comparison_count = 0
-    if slugs:
+    if site_category_filters:
         product_count = db.scalar(
             select(func.count(storage.Product.id)).where(
                 storage.Product.tenant_id == tc.tenant_id,
-                storage.Product.category.in_(slugs),
+                or_(*site_category_filters),
             )
         ) or 0
         matched_product_count = db.scalar(
             select(func.count(storage.Product.id)).where(
                 storage.Product.tenant_id == tc.tenant_id,
-                storage.Product.category.in_(slugs),
+                or_(*site_category_filters),
                 storage.Product.canonical_id.is_not(None),
             )
         ) or 0

@@ -901,6 +901,15 @@ def test_dash_watchlist_categories_include_comparison_counts(client, auth_cookie
         prices={"pharmonline": 10.0, "aloe": 8.0},
         category="vitamins",
     )
+    aloe_product = setup_db.scalar(
+        select(storage.Product).where(
+            storage.Product.site == "aloe",
+            storage.Product.external_id == "aloe-v1",
+        )
+    )
+    assert aloe_product is not None
+    aloe_product.category = "aloe-vitamins"
+    setup_db.commit()
 
     created = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})
     assert created.status_code == 201, created.text
@@ -909,6 +918,58 @@ def test_dash_watchlist_categories_include_comparison_counts(client, auth_cookie
     assert item["product_count"] == 2
     assert item["matched_product_count"] == 2
     assert item["comparison_count"] == 1
+
+
+def test_dash_watchlist_categories_counts_are_site_scoped(client, auth_cookie, setup_db):
+    run = storage.Run(status="ok", tenant_id=1)
+    setup_db.add(run)
+    setup_db.commit()
+    setup_db.refresh(run)
+    cat = storage.Category(
+        key="supplies",
+        label_ru="Медицинские средства",
+        pharmonline_slug="shared-slug",
+        aloe_slug="aloe-supplies",
+        is_active=True,
+    )
+    setup_db.add(cat)
+    setup_db.commit()
+    setup_db.refresh(cat)
+
+    # This pharmonline product is in the tracked category.
+    setup_db.add(
+        storage.Product(
+            tenant_id=1,
+            site="pharmonline",
+            external_id="ph-1",
+            url="https://pharmonline.example/ph-1",
+            name="Tracked",
+            name_normalized="tracked",
+            category="shared-slug",
+        )
+    )
+    # Same raw category string on a different site must not be counted unless
+    # that site is mapped to the same slug.
+    setup_db.add(
+        storage.Product(
+            tenant_id=1,
+            site="aloe",
+            external_id="al-1",
+            url="https://aloe.example/al-1",
+            name="Unmapped",
+            name_normalized="unmapped",
+            category="shared-slug",
+        )
+    )
+    setup_db.commit()
+
+    created = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})
+    assert created.status_code == 201, created.text
+
+    item = client.get("/api/v1/dash/watchlist/categories").json()[0]
+    assert item["product_count"] == 1
+    assert item["matched_product_count"] == 0
+    assert item["comparison_count"] == 0
 
 
 def test_dash_watchlist_categories_requires_auth(client, setup_db):

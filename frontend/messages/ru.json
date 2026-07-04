@@ -247,7 +247,8 @@
     "delete_category_confirm": "Удалить категорию «{name}»?",
     "items_count": "{count, plural, one {# элемент} few {# элемента} many {# элементов} other {# элементов}}",
     "category_products_count": "{count} товаров в категории",
-    "category_matched_count": "{count} matched для сравнения",
+    "category_matched_count": "{count} привязано",
+    "category_comparison_count": "{count} готово к сравнению",
     "category_no_comparison": "Пока нет cross-site matched товаров: запустите матчинг или привяжите товары вручную.",
     "category_make_matches": "Подобрать матчи"
   },
