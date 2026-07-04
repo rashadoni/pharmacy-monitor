@@ -3609,28 +3609,42 @@ def dash_unmatched_pairs(
         .subquery()
     )
 
-    # Базовый набор matches: tenant + НЕТ в has_site_subq + есть хотя бы 1 product
+    live_anchor_exists = (
+        select(storage.Product.id)
+        .where(
+            storage.Product.canonical_id == storage.Match.id,
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.url_dead_at.is_(None),
+        )
+        .exists()
+    )
+
+    # Базовый набор matches: tenant + НЕТ live target-site product + есть live anchor.
     stmt = (
         select(storage.Match)
+        .options(selectinload(storage.Match.products).selectinload(storage.Product.snapshots))
         .where(
             storage.Match.tenant_id == user.tenant_id,
             storage.Match.id.not_in(select(has_site_subq.c.canonical_id)),
+            live_anchor_exists,
         )
         .order_by(storage.Match.id.desc())
     )
-    matches = list(db.scalars(stmt).all())
 
     if category:
-        matches = [
-            m
-            for m in matches
-            if any(
-                p.url_dead_at is None and (p.category or "") == category
-                for p in m.products
+        category_anchor_exists = (
+            select(storage.Product.id)
+            .where(
+                storage.Product.canonical_id == storage.Match.id,
+                storage.Product.tenant_id == user.tenant_id,
+                storage.Product.url_dead_at.is_(None),
+                storage.Product.category == category,
             )
-        ]
+            .exists()
+        )
+        stmt = stmt.where(category_anchor_exists)
 
-    matches = [m for m in matches if any(p.url_dead_at is None for p in m.products)]
+    matches = list(db.scalars(stmt).all())
     total = len(matches)
     page = matches[offset : offset + limit]
 
