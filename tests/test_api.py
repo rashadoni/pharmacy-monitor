@@ -1091,6 +1091,71 @@ def test_dash_watchlist_categories_include_missing_site_counts(client, auth_cook
     assert item["missing_site_counts"] == {"aloe": 1, "aptekonline": 2}
 
 
+def test_watchlist_dead_target_member_stays_attachable(client, auth_cookie, setup_db):
+    run = storage.Run(status="ok", tenant_id=1)
+    setup_db.add(run)
+    setup_db.commit()
+    setup_db.refresh(run)
+    cat = storage.Category(
+        key="dead-target",
+        label_ru="Dead target",
+        pharmonline_slug="supplies",
+        aloe_slug="aloe-supplies",
+        is_active=True,
+    )
+    setup_db.add(cat)
+    setup_db.commit()
+    setup_db.refresh(cat)
+    match = _make_match_with_prices(
+        setup_db,
+        run,
+        canonical="replace-dead",
+        prices={"pharmonline": 10.0, "aloe": 8.0},
+        category="supplies",
+    )
+    dead_aloe = setup_db.scalar(
+        select(storage.Product).where(
+            storage.Product.site == "aloe",
+            storage.Product.external_id == "aloe-replace-dead",
+        )
+    )
+    assert dead_aloe is not None
+    dead_aloe.category = "aloe-supplies"
+    dead_aloe.url_dead_at = utcnow()
+    live_aloe = storage.Product(
+        tenant_id=1,
+        site="aloe",
+        external_id="aloe-live-replacement",
+        url="https://aloe.example/live-replacement",
+        name="Live replacement",
+        name_normalized="live replacement",
+        category="aloe-supplies",
+    )
+    setup_db.add(live_aloe)
+    setup_db.commit()
+    setup_db.refresh(live_aloe)
+
+    created = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})
+    assert created.status_code == 201, created.text
+
+    item = client.get("/api/v1/dash/watchlist/categories").json()[0]
+    assert item["missing_site_counts"] == {"aloe": 1}
+    counts = client.get("/api/v1/dash/matcher/counts")
+    assert counts.status_code == 200, counts.text
+    assert counts.json()["aloe"] == 1
+    pairs = client.get("/api/v1/dash/unmatched-pairs?site=aloe&category=supplies")
+    assert pairs.status_code == 200, pairs.text
+    assert [row["match_id"] for row in pairs.json()["items"]] == [match.id]
+
+    added = client.post(
+        f"/api/v1/dash/matches/{match.id}/add-product",
+        json={"product_id": live_aloe.id},
+    )
+    assert added.status_code == 200, added.text
+    setup_db.refresh(live_aloe)
+    assert live_aloe.canonical_id == match.id
+
+
 def test_dash_watchlist_categories_counts_are_site_scoped(client, auth_cookie, setup_db):
     run = storage.Run(status="ok", tenant_id=1)
     setup_db.add(run)

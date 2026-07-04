@@ -3600,6 +3600,7 @@ def dash_unmatched_pairs(
             storage.Product.site == site,
             storage.Product.canonical_id.is_not(None),
             storage.Product.tenant_id == user.tenant_id,
+            storage.Product.url_dead_at.is_(None),
         )
         .distinct()
         .subquery()
@@ -3788,6 +3789,7 @@ def dash_matcher_counts(
                 storage.Product.site == site,
                 storage.Product.canonical_id.is_not(None),
                 storage.Product.tenant_id == user.tenant_id,
+                storage.Product.url_dead_at.is_(None),
             )
             .distinct()
             .subquery()
@@ -3844,7 +3846,7 @@ def dash_match_add_product(
     if product.canonical_id == match.id:
         raise HTTPException(400, "Product already in this match")
 
-    existing_sites = {p.site for p in match.products}
+    existing_sites = {p.site for p in match.products if p.url_dead_at is None}
     if product.site in existing_sites:
         raise HTTPException(409, f"Match already has a product from {product.site}")
 
