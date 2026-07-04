@@ -4100,12 +4100,14 @@ def dash_watchlist_categories_list(
     ).all()
     if not items:
         return []
-    comparison_counts = {
-        row.category: row.matched_skus
-        for row in analytics.category_comparison(
-            db, client_site="pharmonline", tenant_id=user.tenant_id
-        )
-    }
+    comparison_counts = {}
+    if any(item.category.pharmonline_slug for item in items):
+        comparison_counts = {
+            row.category: row.matched_skus
+            for row in analytics.category_comparison(
+                db, client_site="pharmonline", tenant_id=user.tenant_id
+            )
+        }
     return [
         _watchlist_category_payload(
             item,

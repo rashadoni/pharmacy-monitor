@@ -878,6 +878,45 @@ def test_dash_watchlist_categories_crud(client, auth_cookie, setup_db):
     assert client.get("/api/v1/dash/watchlist/categories").json() == []
 
 
+def test_dash_watchlist_categories_skip_comparison_without_pharmonline_slug(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    cat = storage.Category(
+        key="aloe-only",
+        label_ru="Aloe only",
+        aloe_slug="aloe-only",
+        is_active=True,
+    )
+    setup_db.add(cat)
+    setup_db.add(
+        storage.Product(
+            tenant_id=1,
+            site="aloe",
+            external_id="aloe-only-1",
+            url="https://aloe.example/only-1",
+            name="Aloe only product",
+            name_normalized="aloe only product",
+            category="aloe-only",
+        )
+    )
+    setup_db.commit()
+    setup_db.refresh(cat)
+
+    def fail_category_comparison(*args, **kwargs):
+        raise AssertionError("category_comparison should not run without pharmonline slugs")
+
+    monkeypatch.setattr(api_module.analytics, "category_comparison", fail_category_comparison)
+
+    created = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})
+    assert created.status_code == 201, created.text
+
+    item = client.get("/api/v1/dash/watchlist/categories").json()[0]
+    assert item["pharmonline_slug"] is None
+    assert item["product_count"] == 1
+    assert item["matched_product_count"] == 0
+    assert item["comparison_count"] == 0
+
+
 def test_dash_watchlist_categories_include_comparison_counts(client, auth_cookie, setup_db):
     run = storage.Run(status="ok", tenant_id=1)
     setup_db.add(run)
