@@ -192,8 +192,8 @@ def test_categories_for_site_orders_aloe_broad_before_precise(db_session):
 
     assert wl.categories_for_site(db_session, "aloe") == [
         "dermanlar",
-        "tibbi-vasitələr",
         "product_field=bestseller",
+        "tibbi-vasitələr",
     ]
     assert wl.categories_for_site(db_session, "aloe", only_category_id=precise.id) == [
         "tibbi-vasitələr"

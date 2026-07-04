@@ -24,6 +24,15 @@ SITES = ("pharmonline", "aptekonline", "aloe")
 ALOE_BROAD_CATEGORY_SLUGS = {"dermanlar", "bad", "usaq-dunyasi", "uşaq-qidası"}
 
 
+def _aloe_category_sort_rank(slug_field) -> object:
+    """Sort broad/non-category Aloe filters before precise category slugs."""
+    return case(
+        (slug_field.in_(ALOE_BROAD_CATEGORY_SLUGS), 0),
+        (slug_field.like("%=%"), 0),
+        else_=1,
+    )
+
+
 # === SAVED VIEWS ===
 
 
@@ -165,10 +174,10 @@ def categories_for_site(
         stmt = stmt.where(Category.id == only_category_id)
     if site == "aloe":
         # Aloe has broad buckets (for example `dermanlar`) plus more precise
-        # category_slug filters. Scrape broad buckets first so precise category
-        # runs can persist their product.category last.
+        # category_slug filters. Scrape broad/non-category filters first so
+        # precise category runs can persist their product.category last.
         stmt = stmt.order_by(
-            case((field.in_(ALOE_BROAD_CATEGORY_SLUGS), 0), else_=1),
+            _aloe_category_sort_rank(field),
             Category.id,
         )
     else:
