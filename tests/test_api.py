@@ -958,6 +958,7 @@ def test_dash_watchlist_categories_mixed_slugs_only_enrich_pharmonline_categorie
     assert len(calls) == 1
     assert calls[0][1]["client_site"] == "pharmonline"
     assert calls[0][1]["tenant_id"] == 1
+    assert calls[0][1]["categories"] == {"vitamins"}
     assert items["vit"]["comparison_count"] == 7
     assert items["aloe-only"]["comparison_count"] == 0
 

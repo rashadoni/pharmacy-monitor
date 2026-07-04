@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from src._time import utcnow
@@ -350,6 +351,7 @@ def _iter_matched_prices(
     client_site: str,
     tenant_id: int | None,
     min_confidence: float,
+    categories: Collection[str] | None = None,
 ) -> list[tuple[str, float, dict[str, float]]]:
     """Per-match записи `(category, client_price, comp_price_by_site)`.
 
@@ -371,7 +373,22 @@ def _iter_matched_prices(
     q = select(Match).options(selectinload(Match.products))
     if tenant_id is not None:
         q = q.where(Match.tenant_id == tenant_id)
+    category_filter = set(categories) if categories is not None else None
+    if category_filter is not None and not category_filter:
+        return []
+
     matches = session.scalars(q).all()
+    if category_filter is not None:
+        matches = [
+            m
+            for m in matches
+            if any(
+                p.site == client_site
+                and p.url_dead_at is None
+                and (p.category or "(без категории)") in category_filter
+                for p in m.products
+            )
+        ]
 
     all_pids = [p.id for m in matches for p in m.products]
     snaps = latest_snapshots_per_product(session, all_pids)
@@ -453,6 +470,7 @@ def category_comparison(
     client_site: str = CLIENT_SITE,
     tenant_id: int | None = None,
     min_confidence: float = 0.70,
+    categories: Collection[str] | None = None,
 ) -> list[CategoryComparison]:
     """Сравнение цен по категориям: per-site средние + index + win/lose.
 
@@ -462,7 +480,11 @@ def category_comparison(
     остаются None, фронт показывает сырой slug. Математика стабильна в любом случае.
     """
     records = _iter_matched_prices(
-        session, client_site=client_site, tenant_id=tenant_id, min_confidence=min_confidence
+        session,
+        client_site=client_site,
+        tenant_id=tenant_id,
+        min_confidence=min_confidence,
+        categories=categories,
     )
     if not records:
         return []

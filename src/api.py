@@ -4101,11 +4101,17 @@ def dash_watchlist_categories_list(
     if not items:
         return []
     comparison_counts = {}
-    if any(item.category.pharmonline_slug for item in items):
+    pharmonline_slugs = {
+        item.category.pharmonline_slug for item in items if item.category.pharmonline_slug
+    }
+    if pharmonline_slugs:
         comparison_counts = {
             row.category: row.matched_skus
             for row in analytics.category_comparison(
-                db, client_site="pharmonline", tenant_id=user.tenant_id
+                db,
+                client_site="pharmonline",
+                tenant_id=user.tenant_id,
+                categories=pharmonline_slugs,
             )
         }
     return [

@@ -416,6 +416,29 @@ def test_category_comparison_tenant_isolation(db_session):
     assert {r.category for r in analytics.category_comparison(db_session)} == {"t1cat", "t2cat"}
 
 
+def test_category_comparison_can_filter_categories(db_session):
+    run = _add_run(db_session)
+    m1 = Match(canonical_name="Keep", confidence=1.0)
+    m2 = Match(canonical_name="Skip", confidence=1.0)
+    db_session.add_all([m1, m2])
+    db_session.flush()
+    c1 = _add_product(
+        db_session, "pharmonline", "Keep", canonical_id=m1.id, category="keep-cat", ext_id="c1"
+    )
+    a1 = _add_product(db_session, "aloe", "Keep", canonical_id=m1.id, category="aloe1", ext_id="a1")
+    c2 = _add_product(
+        db_session, "pharmonline", "Skip", canonical_id=m2.id, category="skip-cat", ext_id="c2"
+    )
+    a2 = _add_product(db_session, "aloe", "Skip", canonical_id=m2.id, category="aloe2", ext_id="a2")
+    for p, pr in ((c1, 10.0), (a1, 8.0), (c2, 10.0), (a2, 8.0)):
+        _add_snap_at(db_session, run, p, pr)
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session, categories={"keep-cat"})
+    assert [r.category for r in rows] == ["keep-cat"]
+    assert analytics.category_comparison(db_session, categories=set()) == []
+
+
 def test_category_comparison_empty(db_session):
     assert analytics.category_comparison(db_session) == []
 
