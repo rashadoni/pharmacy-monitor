@@ -1,5 +1,22 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { authenticate, hasE2EAuth } from "./helpers/auth";
+
+async function createWatchlistItem(page: Page, canonicalName: string) {
+  const response = await page.context().request.post("/api/v1/dash/watchlist", {
+    data: {
+      canonical_name: canonicalName,
+      brand: "E2E",
+      notes: "created by Playwright e2e",
+    },
+  });
+  expect(response.ok(), await response.text()).toBe(true);
+  const body = await response.json();
+  return body.id as number;
+}
+
+async function deleteWatchlistItem(page: Page, id: number) {
+  await page.context().request.delete(`/api/v1/dash/watchlist/${id}`);
+}
 
 /**
  * Phase 6.3 (audit 2026-05-28) — Watchlist UX E2E.
@@ -31,6 +48,8 @@ test.describe("Watchlist page (unauthenticated)", () => {
 });
 
 test.describe("Watchlist page (authenticated)", () => {
+  test.describe.configure({ mode: "serial" });
+
   test.skip(
     !hasE2EAuth(),
     "Set PLAYWRIGHT_AUTH_TOKEN or PLAYWRIGHT_AUTH_LOGIN/PASSWORD to run authenticated tests",
@@ -61,27 +80,30 @@ test.describe("Watchlist page (authenticated)", () => {
   });
 
   test("delete uses 2-click armed pattern (no window.confirm)", async ({ page }) => {
-    await page.goto("/ru/watchlist");
-    // Tries to find any existing item via testid prefix; skip if none seeded
-    const deleteButtons = page.locator('[data-testid^="watchlist-delete-"]:not([data-testid*="confirm"])');
-    const count = await deleteButtons.count();
-    test.skip(count === 0, "No watchlist items seeded — skipping armed-delete check");
+    const itemId = await createWatchlistItem(page, `E2E Delete ${Date.now()}`);
+    try {
+      await page.goto("/ru/watchlist");
 
-    await deleteButtons.first().click();
-    // After first click the same row now has the confirm button visible
-    await expect(
-      page.locator('[data-testid^="watchlist-delete-confirm-"]'),
-    ).toHaveCount(1);
+      await page.locator(`[data-testid="watchlist-delete-${itemId}"]`).click();
+      await expect(
+        page.locator(`[data-testid="watchlist-delete-confirm-${itemId}"]`),
+      ).toHaveCount(1);
+    } finally {
+      await deleteWatchlistItem(page, itemId);
+    }
   });
 
   test("search input filters visible items", async ({ page }) => {
-    await page.goto("/ru/watchlist");
-    const search = page.locator('[data-testid="watchlist-search"]');
-    const visible = await search.isVisible().catch(() => false);
-    test.skip(!visible, "No items rendered → search not shown");
-    await search.fill("definitely-not-in-list-zzzz");
-    // "No match" empty-state appears
-    await expect(page.getByText(/Ничего не найдено|no match/i)).toBeVisible();
+    const itemId = await createWatchlistItem(page, `E2E Search ${Date.now()}`);
+    try {
+      await page.goto("/ru/watchlist");
+      const search = page.locator('[data-testid="watchlist-search"]');
+      await expect(search).toBeVisible();
+      await search.fill("definitely-not-in-list-zzzz");
+      await expect(page.getByText(/Ничего не найдено|no match/i)).toBeVisible();
+    } finally {
+      await deleteWatchlistItem(page, itemId);
+    }
   });
 
   test("category products link preserves locale and does not open comparison", async ({ page }) => {
