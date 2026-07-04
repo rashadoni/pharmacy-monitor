@@ -92,6 +92,77 @@ def test_ai_fallback_invalid_min_baseline_falls_back_to_default(monkeypatch):
     assert main_mod._should_trigger_ai_fallback(10, baseline=150) is True
 
 
+def test_reap_stale_running_runs_marks_old_orphans_failed(db_session):
+    old = storage.Run(
+        started_at=main_mod.utcnow() - timedelta(hours=8),
+        status="running",
+        products_scraped=0,
+    )
+    fresh = storage.Run(
+        started_at=main_mod.utcnow() - timedelta(minutes=30),
+        status="running",
+        products_scraped=0,
+    )
+    ok = storage.Run(
+        started_at=main_mod.utcnow() - timedelta(hours=9),
+        finished_at=main_mod.utcnow() - timedelta(hours=8),
+        status="ok",
+        products_scraped=10,
+    )
+    db_session.add_all([old, fresh, ok])
+    db_session.commit()
+
+    count = main_mod.reap_stale_running_runs(db_session, max_age_hours=6)
+
+    assert count == 1
+    db_session.refresh(old)
+    db_session.refresh(fresh)
+    db_session.refresh(ok)
+    assert old.status == "failed"
+    assert old.finished_at is not None
+    assert "reaped stale running run" in (old.error_message or "")
+    assert fresh.status == "running"
+    assert fresh.finished_at is None
+    assert ok.status == "ok"
+
+
+def test_reap_stale_running_runs_noops_when_none_stale(db_session):
+    db_session.add(
+        storage.Run(
+            started_at=main_mod.utcnow() - timedelta(minutes=10),
+            status="running",
+            products_scraped=0,
+        )
+    )
+    db_session.commit()
+
+    assert main_mod.reap_stale_running_runs(db_session, max_age_hours=6) == 0
+
+
+def test_count_duplicate_products_executes_on_product_table(db_session):
+    db_session.add_all(
+        [
+            storage.Product(
+                site="pharmonline",
+                external_id="ph-1",
+                url="https://example.test/ph-1",
+                name="A",
+                name_normalized="a",
+            ),
+            storage.Product(
+                site="aloe",
+                external_id="al-1",
+                url="https://example.test/al-1",
+                name="A",
+                name_normalized="a",
+            ),
+        ]
+    )
+    db_session.commit()
+
+    assert main_mod.count_duplicate_products(db_session) == 0
+
+
 # === scrape report email toggle ===
 
 

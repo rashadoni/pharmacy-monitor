@@ -74,6 +74,9 @@ with Session() as s:
         s.commit()
         print(f"reaped {len(stale)} stale running request(s)")
 PY
+    "$VENV_BIN/pharmacy-monitor" reap-stale-runs \
+        --max-age-hours "$SCRAPE_MAX_HOURS" \
+        --reason "reaped stale running run after interrupted/timeout process" || true
 fi
 
 # === Pgrep guard ============================================================

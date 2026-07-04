@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from src._time import utcnow
 from pathlib import Path
 
@@ -21,7 +21,7 @@ import click
 import structlog
 import yaml
 from dotenv import load_dotenv
-from sqlalchemy import desc, select, text
+from sqlalchemy import desc, func, select, text
 from sqlalchemy.orm import Session
 
 load_dotenv(override=True)
@@ -250,6 +250,49 @@ def maybe_seed_categories(session) -> None:
         n = watchlist.seed_categories_from_yaml(session, CONFIG_PATH)
         if n > 0:
             log.info("categories_seeded_from_yaml", count=n, path=str(CONFIG_PATH))
+
+
+def reap_stale_running_runs(
+    session: Session,
+    *,
+    max_age_hours: float = 6.0,
+    reason: str = "reaped stale running run after interrupted/timeout process",
+) -> int:
+    """Mark orphaned `runs.status=running` rows as failed.
+
+    Callers must guard that no pharmacy-monitor scrape/rematch process is active.
+    This is for DB rows left behind after a killed process, reboot, or timeout.
+    """
+    cutoff = utcnow() - timedelta(hours=max_age_hours)
+    stale = session.scalars(
+        select(storage.Run)
+        .where(
+            storage.Run.status == "running",
+            storage.Run.started_at < cutoff,
+            storage.Run.finished_at.is_(None),
+        )
+        .order_by(storage.Run.started_at)
+    ).all()
+    if not stale:
+        return 0
+    finished_at = utcnow()
+    for run in stale:
+        run.status = "failed"
+        run.finished_at = finished_at
+        run.error_message = ((run.error_message or "") + f" | {reason}").strip(" |")
+    session.commit()
+    return len(stale)
+
+
+def count_duplicate_products(session: Session) -> int:
+    """Count duplicate `(site, external_id)` product groups."""
+    duplicate_groups = (
+        select(storage.Product.site, storage.Product.external_id)
+        .group_by(storage.Product.site, storage.Product.external_id)
+        .having(func.count(storage.Product.id) > 1)
+        .subquery()
+    )
+    return session.scalar(select(func.count()).select_from(duplicate_groups)) or 0
 
 
 async def scrape_site(
@@ -896,14 +939,7 @@ def db_check_cmd(fix: bool) -> None:
                 click.echo(f"✓ NULL prices в норме: {null_prices}/{total_snaps} ({null_pct:.1f}%)")
 
         # 6. Дубликаты Products (same site + same external_id) — должно быть 0 за счёт UniqueConstraint
-        dup_products = s.scalar(
-            text("""
-            SELECT COUNT(*) FROM (
-                SELECT site, external_id, COUNT(*) as cnt
-                FROM products GROUP BY site, external_id HAVING cnt > 1
-            )
-        """)
-        )
+        dup_products = count_duplicate_products(s)
         if dup_products:
             click.echo(f"❌ Duplicate products (site, external_id): {dup_products}")
             issues_found += dup_products
@@ -922,6 +958,31 @@ def db_check_cmd(fix: bool) -> None:
         click.echo(f"\n✓ Исправлено {issues_found} проблем.")
     else:
         click.echo("\n✓ DB целостность: OK")
+
+
+@cli.command("reap-stale-runs")
+@click.option(
+    "--max-age-hours",
+    type=float,
+    default=6.0,
+    help="Mark running runs older than N hours as failed.",
+)
+@click.option(
+    "--reason",
+    default="reaped stale running run after interrupted/timeout process",
+    help="Reason appended to run.error_message.",
+)
+def reap_stale_runs_cmd(max_age_hours: float, reason: str) -> None:
+    """Mark orphaned `runs.status=running` rows as failed.
+
+    Intended for server watcher use after it confirms no scrape/rematch process
+    is active. Does not kill processes.
+    """
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as s:
+        count = reap_stale_running_runs(s, max_age_hours=max_age_hours, reason=reason)
+    click.echo(f"reaped {count} stale running run(s)")
 
 
 def _read_health_alert_state(path: str) -> dict | None:
