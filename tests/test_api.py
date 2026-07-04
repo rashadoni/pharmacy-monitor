@@ -1202,23 +1202,24 @@ def test_unmatched_pairs_category_paginates_and_filters_tenant_anchors(
     client, auth_cookie, setup_db
 ):
     matches = []
+    products = []
     for idx in range(3):
         match = storage.Match(tenant_id=1, canonical_name=f"Anchor {idx}", confidence=1.0)
         setup_db.add(match)
         setup_db.flush()
-        setup_db.add(
-            storage.Product(
-                tenant_id=1,
-                site="pharmonline",
-                external_id=f"ph-{idx}",
-                url=f"https://pharmonline.example/{idx}",
-                name=f"Anchor {idx}",
-                name_normalized=f"anchor {idx}",
-                category="supplies",
-                canonical_id=match.id,
-            )
+        product = storage.Product(
+            tenant_id=1,
+            site="pharmonline",
+            external_id=f"ph-{idx}",
+            url=f"https://pharmonline.example/{idx}",
+            name=f"Anchor {idx}",
+            name_normalized=f"anchor {idx}",
+            category="supplies",
+            canonical_id=match.id,
         )
+        setup_db.add(product)
         matches.append(match)
+        products.append(product)
     setup_db.add(
         storage.Product(
             tenant_id=2,
@@ -1228,7 +1229,7 @@ def test_unmatched_pairs_category_paginates_and_filters_tenant_anchors(
             name="Foreign anchor",
             name_normalized="foreign anchor",
             category="supplies",
-            canonical_id=matches[-1].id,
+            canonical_id=matches[1].id,
         )
     )
     setup_db.commit()
@@ -1240,6 +1241,17 @@ def test_unmatched_pairs_category_paginates_and_filters_tenant_anchors(
     assert body["limit"] == 2
     assert body["offset"] == 1
     assert [row["match_id"] for row in body["items"]] == [matches[1].id, matches[0].id]
+    assert body["items"][0]["anchor_products"] == [
+        {
+            "product_id": products[1].id,
+            "site": "pharmonline",
+            "name": "Anchor 1",
+            "brand": None,
+            "category": "supplies",
+            "url": "https://pharmonline.example/1",
+            "price": None,
+        }
+    ]
     assert all(
         anchor["site"] == "pharmonline"
         for row in body["items"]
