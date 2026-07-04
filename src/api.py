@@ -3654,7 +3654,7 @@ def dash_unmatched_pairs(
         p.id
         for m in page
         for p in m.products
-        if p.url_dead_at is None
+        if p.tenant_id == user.tenant_id and p.url_dead_at is None
     ]
     snaps_by_pid = storage.latest_snapshots_per_product(db, page_product_ids)
 
@@ -3662,7 +3662,7 @@ def dash_unmatched_pairs(
     for m in page:
         anchors = []
         for p in m.products:
-            if p.url_dead_at is not None:
+            if p.tenant_id != user.tenant_id or p.url_dead_at is not None:
                 continue
             snap = snaps_by_pid.get(p.id)
             price = (snap.discount_price or snap.price) if snap else None

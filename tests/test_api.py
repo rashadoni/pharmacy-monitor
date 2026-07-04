@@ -1198,6 +1198,55 @@ def test_matcher_ignores_fully_dead_clusters(client, auth_cookie, setup_db):
     assert "supplies" not in {row["name"] for row in facets.json()["categories"]}
 
 
+def test_unmatched_pairs_category_paginates_and_filters_tenant_anchors(
+    client, auth_cookie, setup_db
+):
+    matches = []
+    for idx in range(3):
+        match = storage.Match(tenant_id=1, canonical_name=f"Anchor {idx}", confidence=1.0)
+        setup_db.add(match)
+        setup_db.flush()
+        setup_db.add(
+            storage.Product(
+                tenant_id=1,
+                site="pharmonline",
+                external_id=f"ph-{idx}",
+                url=f"https://pharmonline.example/{idx}",
+                name=f"Anchor {idx}",
+                name_normalized=f"anchor {idx}",
+                category="supplies",
+                canonical_id=match.id,
+            )
+        )
+        matches.append(match)
+    setup_db.add(
+        storage.Product(
+            tenant_id=2,
+            site="aptekonline",
+            external_id="foreign-anchor",
+            url="https://aptekonline.example/foreign",
+            name="Foreign anchor",
+            name_normalized="foreign anchor",
+            category="supplies",
+            canonical_id=matches[-1].id,
+        )
+    )
+    setup_db.commit()
+
+    r = client.get("/api/v1/dash/unmatched-pairs?site=aloe&category=supplies&limit=2&offset=1")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 3
+    assert body["limit"] == 2
+    assert body["offset"] == 1
+    assert [row["match_id"] for row in body["items"]] == [matches[1].id, matches[0].id]
+    assert all(
+        anchor["site"] == "pharmonline"
+        for row in body["items"]
+        for anchor in row["anchor_products"]
+    )
+
+
 def test_dash_watchlist_categories_counts_are_site_scoped(client, auth_cookie, setup_db):
     run = storage.Run(status="ok", tenant_id=1)
     setup_db.add(run)
