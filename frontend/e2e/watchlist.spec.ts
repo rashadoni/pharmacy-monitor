@@ -131,4 +131,20 @@ test.describe("Watchlist page (authenticated)", () => {
     await expect(page.locator("h1")).toContainText("Kateqoriya məhsulları");
     await expect(page.locator('[data-testid="category-products-missing-sites"]')).toHaveCount(0);
   });
+
+  test("category attach link opens matcher in current locale", async ({ page }) => {
+    await page.goto("/ru/watchlist");
+    const link = page.locator('[data-testid^="watchlist-category-attach-aloe-"]').first();
+    await expect(link).toBeVisible({ timeout: 10_000 });
+
+    const href = await link.getAttribute("href");
+    expect(href).toContain("/ru/matcher?");
+    expect(href).toContain("mode=attach");
+    expect(href).toContain("site=aloe");
+    expect(href).toContain("category=");
+
+    await link.click();
+    await expect(page).toHaveURL(/\/ru\/matcher\?.*mode=attach/);
+    await expect(page).toHaveURL(/site=aloe/);
+  });
 });

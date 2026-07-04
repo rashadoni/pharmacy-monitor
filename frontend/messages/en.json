@@ -250,7 +250,9 @@
     "category_matched_count": "{count} linked",
     "category_comparison_count": "{count} ready for comparison",
     "category_no_comparison": "No cross-site matched products yet: run matching or link products manually.",
-    "category_make_matches": "Create matches"
+    "category_make_matches": "Create matches",
+    "category_add_site_matches": "Add {site}",
+    "category_create_matches": "Create new match"
   },
   "category_products": {
     "title": "Category products",

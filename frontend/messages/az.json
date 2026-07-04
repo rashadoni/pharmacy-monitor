@@ -250,7 +250,9 @@
     "category_matched_count": "{count} bağlanıb",
     "category_comparison_count": "{count} müqayisəyə hazırdır",
     "category_no_comparison": "Hələ cross-site uyğun məhsul yoxdur: matching-i işə salın və ya məhsulları əl ilə bağlayın.",
-    "category_make_matches": "Uyğunluq seç"
+    "category_make_matches": "Uyğunluq seç",
+    "category_add_site_matches": "{site} əlavə et",
+    "category_create_matches": "Yeni uyğunluq yarat"
   },
   "category_products": {
     "title": "Kateqoriya məhsulları",
