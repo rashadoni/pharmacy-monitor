@@ -14,8 +14,14 @@ async function createWatchlistItem(page: Page, canonicalName: string) {
   return body.id as number;
 }
 
-async function deleteWatchlistItem(page: Page, id: number) {
-  await page.context().request.delete(`/api/v1/dash/watchlist/${id}`);
+async function deleteWatchlistItem(
+  page: Page,
+  id: number,
+  { allowMissing = false }: { allowMissing?: boolean } = {},
+) {
+  const response = await page.context().request.delete(`/api/v1/dash/watchlist/${id}`);
+  if (allowMissing && response.status() === 404) return;
+  expect(response.ok(), await response.text()).toBe(true);
 }
 
 /**
@@ -88,8 +94,10 @@ test.describe("Watchlist page (authenticated)", () => {
       await expect(
         page.locator(`[data-testid="watchlist-delete-confirm-${itemId}"]`),
       ).toHaveCount(1);
+      await page.locator(`[data-testid="watchlist-delete-confirm-${itemId}"]`).click();
+      await expect(page.locator(`[data-testid="watchlist-delete-${itemId}"]`)).toHaveCount(0);
     } finally {
-      await deleteWatchlistItem(page, itemId);
+      await deleteWatchlistItem(page, itemId, { allowMissing: true });
     }
   });
 
