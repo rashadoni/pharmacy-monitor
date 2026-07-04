@@ -3620,16 +3620,11 @@ def dash_unmatched_pairs(
     )
 
     # Базовый набор matches: tenant + НЕТ live target-site product + есть live anchor.
-    stmt = (
-        select(storage.Match)
-        .options(selectinload(storage.Match.products).selectinload(storage.Product.snapshots))
-        .where(
-            storage.Match.tenant_id == user.tenant_id,
-            storage.Match.id.not_in(select(has_site_subq.c.canonical_id)),
-            live_anchor_exists,
-        )
-        .order_by(storage.Match.id.desc())
-    )
+    conditions = [
+        storage.Match.tenant_id == user.tenant_id,
+        storage.Match.id.not_in(select(has_site_subq.c.canonical_id)),
+        live_anchor_exists,
+    ]
 
     if category:
         category_anchor_exists = (
@@ -3642,11 +3637,26 @@ def dash_unmatched_pairs(
             )
             .exists()
         )
-        stmt = stmt.where(category_anchor_exists)
+        conditions.append(category_anchor_exists)
 
-    matches = list(db.scalars(stmt).all())
-    total = len(matches)
-    page = matches[offset : offset + limit]
+    total = db.scalar(select(func.count(storage.Match.id)).where(*conditions)) or 0
+    page = list(
+        db.scalars(
+            select(storage.Match)
+            .options(selectinload(storage.Match.products))
+            .where(*conditions)
+            .order_by(storage.Match.id.desc())
+            .offset(offset)
+            .limit(limit)
+        ).all()
+    )
+    page_product_ids = [
+        p.id
+        for m in page
+        for p in m.products
+        if p.url_dead_at is None
+    ]
+    snaps_by_pid = storage.latest_snapshots_per_product(db, page_product_ids)
 
     items = []
     for m in page:
@@ -3654,9 +3664,7 @@ def dash_unmatched_pairs(
         for p in m.products:
             if p.url_dead_at is not None:
                 continue
-            snap = None
-            if p.snapshots:
-                snap = max(p.snapshots, key=lambda s: s.captured_at)
+            snap = snaps_by_pid.get(p.id)
             price = (snap.discount_price or snap.price) if snap else None
             anchors.append(
                 {
