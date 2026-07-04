@@ -9,6 +9,9 @@ import { defineConfig, devices } from "@playwright/test";
  *   2. Next.js dev server running on :3000:
  *        pnpm dev
  *   3. Test user with magic-link enabled (or PHARMACY_AUTH_DEV_SHOW_TOKEN=1)
+ *
+ * Chromium-only smoke, useful on machines without Playwright WebKit installed:
+ *        pnpm test:e2e:chromium e2e/watchlist.spec.ts
  */
 export default defineConfig({
   testDir: "./e2e",
