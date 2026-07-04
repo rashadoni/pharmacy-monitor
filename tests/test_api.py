@@ -1146,6 +1146,7 @@ def test_watchlist_dead_target_member_stays_attachable(client, auth_cookie, setu
     pairs = client.get("/api/v1/dash/unmatched-pairs?site=aloe&category=supplies")
     assert pairs.status_code == 200, pairs.text
     assert [row["match_id"] for row in pairs.json()["items"]] == [match.id]
+    assert [p["site"] for p in pairs.json()["items"][0]["anchor_products"]] == ["pharmonline"]
     suggestions = client.get(f"/api/v1/dash/matches/{match.id}/candidate-analogs?site=aloe")
     assert suggestions.status_code == 200, suggestions.text
     assert [row["product_id"] for row in suggestions.json()["items"]] == [live_aloe.id]
@@ -1192,6 +1193,9 @@ def test_matcher_ignores_fully_dead_clusters(client, auth_cookie, setup_db):
     pairs = client.get("/api/v1/dash/unmatched-pairs?site=aloe&category=supplies")
     assert pairs.status_code == 200, pairs.text
     assert pairs.json()["items"] == []
+    facets = client.get("/api/v1/dash/products/facets?site=pharmonline")
+    assert facets.status_code == 200, facets.text
+    assert "supplies" not in {row["name"] for row in facets.json()["categories"]}
 
 
 def test_dash_watchlist_categories_counts_are_site_scoped(client, auth_cookie, setup_db):

@@ -2626,6 +2626,7 @@ def dash_products_facets(
             storage.Product.site == site,
             storage.Product.tenant_id == user.tenant_id,
             storage.Product.category.is_not(None),
+            storage.Product.url_dead_at.is_(None),
         )
         .group_by(storage.Product.category)
         .order_by(desc(func.count(storage.Product.id)))
@@ -2637,6 +2638,7 @@ def dash_products_facets(
             storage.Product.site == site,
             storage.Product.tenant_id == user.tenant_id,
             storage.Product.brand.is_not(None),
+            storage.Product.url_dead_at.is_(None),
         )
         .group_by(storage.Product.brand)
         .order_by(desc(func.count(storage.Product.id)))
@@ -3636,6 +3638,8 @@ def dash_unmatched_pairs(
     for m in page:
         anchors = []
         for p in m.products:
+            if p.url_dead_at is not None:
+                continue
             snap = None
             if p.snapshots:
                 snap = max(p.snapshots, key=lambda s: s.captured_at)
@@ -4054,6 +4058,7 @@ def _watchlist_category_payload(
             select(func.count(storage.Product.id)).where(
                 storage.Product.tenant_id == tc.tenant_id,
                 or_(*site_category_filters),
+                storage.Product.url_dead_at.is_(None),
             )
         ) or 0
         matched_product_count = db.scalar(
@@ -4061,6 +4066,7 @@ def _watchlist_category_payload(
                 storage.Product.tenant_id == tc.tenant_id,
                 or_(*site_category_filters),
                 storage.Product.canonical_id.is_not(None),
+                storage.Product.url_dead_at.is_(None),
             )
         ) or 0
     if c.pharmonline_slug and category_comparison_counts is not None:
