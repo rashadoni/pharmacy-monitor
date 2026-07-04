@@ -170,6 +170,39 @@ def test_get_category_returns_none_for_missing(db_session):
     assert wl.get_category(db_session, "nope") is None
 
 
+def test_categories_for_site_orders_aloe_broad_before_precise(db_session):
+    broad = wl.add_category(
+        db_session,
+        key="aloe-broad",
+        label_ru="Aloe broad",
+        aloe_slug="dermanlar",
+    )
+    precise = wl.add_category(
+        db_session,
+        key="aloe-precise",
+        label_ru="Aloe precise",
+        aloe_slug="tibbi-vasitələr",
+    )
+    wl.add_category(
+        db_session,
+        key="aloe-bestseller",
+        label_ru="Aloe bestseller",
+        aloe_slug="product_field=bestseller",
+    )
+
+    assert wl.categories_for_site(db_session, "aloe") == [
+        "dermanlar",
+        "tibbi-vasitələr",
+        "product_field=bestseller",
+    ]
+    assert wl.categories_for_site(db_session, "aloe", only_category_id=precise.id) == [
+        "tibbi-vasitələr"
+    ]
+    assert wl.categories_for_site(db_session, "aloe", only_category_id=broad.id) == [
+        "dermanlar"
+    ]
+
+
 def test_update_category_modifies_fields(db_session):
     c = wl.add_category(db_session, key="x", label_ru="X")
     updated = wl.update_category(db_session, c.id, label_ru="X-NEW", pharmonline_slug="ph-x")

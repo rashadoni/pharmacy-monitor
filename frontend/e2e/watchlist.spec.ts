@@ -91,13 +91,12 @@ test.describe("Watchlist page (authenticated)", () => {
 
     const href = await link.getAttribute("href");
     expect(href).toContain("/az/category-products?");
+    expect(href).toContain("aloe=tibbi-vasit");
     expect(href).not.toContain("/comparison");
 
     await link.click();
     await expect(page).toHaveURL(/\/az\/category-products\?/);
     await expect(page.locator("h1")).toContainText("Kateqoriya məhsulları");
-    await expect(page.locator('[data-testid="category-products-missing-sites"]')).toContainText(
-      "aloe.az",
-    );
+    await expect(page.locator('[data-testid="category-products-missing-sites"]')).toHaveCount(0);
   });
 });

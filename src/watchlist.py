@@ -8,7 +8,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
 from src.storage import (
@@ -21,6 +21,7 @@ from src.storage import (
 )
 
 SITES = ("pharmonline", "aptekonline", "aloe")
+ALOE_BROAD_CATEGORY_SLUGS = {"dermanlar", "bad", "usaq-dunyasi", "uşaq-qidası"}
 
 
 # === SAVED VIEWS ===
@@ -162,6 +163,16 @@ def categories_for_site(
     stmt = select(field).where(Category.is_active.is_(True), field.is_not(None))
     if only_category_id is not None:
         stmt = stmt.where(Category.id == only_category_id)
+    if site == "aloe":
+        # Aloe has broad buckets (for example `dermanlar`) plus more precise
+        # category_slug filters. Scrape broad buckets first so precise category
+        # runs can persist their product.category last.
+        stmt = stmt.order_by(
+            case((field.in_(ALOE_BROAD_CATEGORY_SLUGS), 0), else_=1),
+            Category.id,
+        )
+    else:
+        stmt = stmt.order_by(Category.id)
     rows = session.scalars(stmt).all()
     return [r for r in rows if r]
 
