@@ -910,33 +910,22 @@ def test_dash_watchlist_categories_include_comparison_counts(client, auth_cookie
     assert aloe_product is not None
     aloe_product.category = "aloe-vitamins"
     setup_db.commit()
-    low_conf = storage.Match(tenant_id=1, canonical_name="low", confidence=0.2)
-    setup_db.add(low_conf)
-    setup_db.flush()
-    setup_db.add_all(
-        [
-            storage.Product(
-                tenant_id=1,
-                site="pharmonline",
-                external_id="ph-low",
-                url="https://pharmonline.example/low",
-                name="Low",
-                name_normalized="low",
-                canonical_id=low_conf.id,
-                category="vitamins",
-            ),
-            storage.Product(
-                tenant_id=1,
-                site="aloe",
-                external_id="al-low",
-                url="https://aloe.example/low",
-                name="Low",
-                name_normalized="low",
-                canonical_id=low_conf.id,
-                category="aloe-vitamins",
-            ),
-        ]
+    low_conf = _make_match_with_prices(
+        setup_db,
+        run,
+        canonical="low",
+        prices={"pharmonline": 12.0, "aloe": 11.0},
+        category="vitamins",
     )
+    low_conf.confidence = 0.2
+    low_aloe_product = setup_db.scalar(
+        select(storage.Product).where(
+            storage.Product.site == "aloe",
+            storage.Product.external_id == "aloe-low",
+        )
+    )
+    assert low_aloe_product is not None
+    low_aloe_product.category = "aloe-vitamins"
     setup_db.commit()
 
     created = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})

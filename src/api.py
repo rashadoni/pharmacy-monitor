@@ -4098,6 +4098,8 @@ def dash_watchlist_categories_list(
         .where(storage.TrackedCategory.tenant_id == user.tenant_id)
         .order_by(storage.Category.label_ru)
     ).all()
+    if not items:
+        return []
     comparison_counts = {
         row.category: row.matched_skus
         for row in analytics.category_comparison(
