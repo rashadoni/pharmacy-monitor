@@ -234,8 +234,10 @@ function AttachMode({
   // Reset pagination when filter/site changes
   useFilterReset(`${site}|${category}`, () => setOffset(0));
 
-  // Берём фасеты с одного из 2 «не-целевых» сайтов — категории у pharmonline/aptekonline богаче
-  const facetsSite = site === "aloe" ? "pharmonline" : "aloe";
+  // Категорийный фильтр в attach-mode относится к anchor-кластерам.
+  // Для добавления конкурентов к клиентской категории используем pharmonline facets,
+  // чтобы ссылки из Watchlist с pharmonline_slug отображались в select.
+  const facetsSite = site === "pharmonline" ? "aloe" : "pharmonline";
 
   const facetsQ = useQuery({
     queryKey: ["matcher", "categories", facetsSite],

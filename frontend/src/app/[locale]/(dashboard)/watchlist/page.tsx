@@ -263,13 +263,11 @@ function CategoryRow({
   const [armed, setArmed] = useState(false);
   const label = locale === "az" && item.label_az ? item.label_az : item.label_ru;
   const hasComparisonRows = item.comparison_count > 0;
-  const needsMoreComparisonRows = Boolean(
-    item.pharmonline_slug && item.comparison_count < item.matched_product_count,
-  );
   const categoryComparisonHref = `/${locale}/category-comparison?category=${encodeURIComponent(item.pharmonline_slug ?? "")}`;
   const categoryProductsHref = buildCategoryProductsHref(item, label, locale);
   const matcherHref = buildCategoryMatcherHref(item, label, locale);
   const attachMatcherHrefs = buildCategoryAttachMatcherHrefs(item, locale);
+  const hasAttachWork = attachMatcherHrefs.length > 0;
 
   return (
     <div className="rounded-lg border border-border bg-card p-3 flex items-start gap-3">
@@ -327,19 +325,18 @@ function CategoryRow({
               {t("category_products")}
             </span>
           )}
-          {needsMoreComparisonRows &&
-            attachMatcherHrefs.map(({ site, href }) => (
-              <a
-                key={site}
-                href={href}
-                data-testid={`watchlist-category-attach-${site}-${item.id}`}
-                className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-primary/30 text-primary hover:bg-primary/10"
-              >
-                <Sparkles className="h-3 w-3" />
-                {t("category_add_site_matches", { site })}
-              </a>
-            ))}
-          {(needsMoreComparisonRows || !hasComparisonRows) && (
+          {attachMatcherHrefs.map(({ site, href, count }) => (
+            <a
+              key={site}
+              href={href}
+              data-testid={`watchlist-category-attach-${site}-${item.id}`}
+              className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-primary/30 text-primary hover:bg-primary/10"
+            >
+              <Sparkles className="h-3 w-3" />
+              {t("category_add_site_matches", { site, count })}
+            </a>
+          ))}
+          {(hasAttachWork || !hasComparisonRows) && (
             <a
               href={matcherHref}
               data-testid={`watchlist-category-matcher-${item.id}`}
@@ -405,16 +402,19 @@ function buildCategoryAttachMatcherHrefs(
   locale: string,
 ) {
   if (!item.pharmonline_slug) return [];
-  const out: Array<{ site: "aloe" | "aptekonline"; href: string }> = [];
+  const missingCounts = item.missing_site_counts ?? {};
+  const out: Array<{ site: "aloe" | "aptekonline"; href: string; count: number }> = [];
   for (const site of ["aloe", "aptekonline"] as const) {
     const hasCategory = site === "aloe" ? item.aloe_slug : item.aptekonline_slug;
+    const count = missingCounts[site] ?? 0;
     if (!hasCategory) continue;
+    if (count <= 0) continue;
     const q = new URLSearchParams({
       mode: "attach",
       site,
       category: item.pharmonline_slug,
     });
-    out.push({ site, href: `/${locale}/matcher?${q.toString()}` });
+    out.push({ site, href: `/${locale}/matcher?${q.toString()}`, count });
   }
   return out;
 }

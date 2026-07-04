@@ -4034,6 +4034,7 @@ def _watchlist_category_payload(
     product_count = 0
     matched_product_count = 0
     comparison_count = 0
+    missing_site_counts: dict[str, int] = {}
     if site_category_filters:
         product_count = db.scalar(
             select(func.count(storage.Product.id)).where(
@@ -4069,6 +4070,28 @@ def _watchlist_category_payload(
                 .exists(),
             )
         ) or 0
+    if c.pharmonline_slug:
+        for site, slug in (("aloe", c.aloe_slug), ("aptekonline", c.aptekonline_slug)):
+            if not slug:
+                continue
+            target = aliased(storage.Product)
+            missing_site_counts[site] = db.scalar(
+                select(func.count(func.distinct(storage.Product.canonical_id))).where(
+                    storage.Product.tenant_id == tc.tenant_id,
+                    storage.Product.site == "pharmonline",
+                    storage.Product.category == c.pharmonline_slug,
+                    storage.Product.canonical_id.is_not(None),
+                    storage.Product.url_dead_at.is_(None),
+                    ~select(target.id)
+                    .where(
+                        target.tenant_id == tc.tenant_id,
+                        target.canonical_id == storage.Product.canonical_id,
+                        target.site == site,
+                        target.url_dead_at.is_(None),
+                    )
+                    .exists(),
+                )
+            ) or 0
     return {
         "id": tc.id,
         "category_id": c.id,
@@ -4083,6 +4106,7 @@ def _watchlist_category_payload(
         "product_count": product_count,
         "matched_product_count": matched_product_count,
         "comparison_count": comparison_count,
+        "missing_site_counts": missing_site_counts,
     }
 
 

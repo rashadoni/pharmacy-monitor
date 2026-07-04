@@ -251,7 +251,7 @@
     "category_comparison_count": "{count} готово к сравнению",
     "category_no_comparison": "Пока нет cross-site matched товаров: запустите матчинг или привяжите товары вручную.",
     "category_make_matches": "Подобрать матчи",
-    "category_add_site_matches": "Добавить {site}",
+    "category_add_site_matches": "Добавить {site} ({count})",
     "category_create_matches": "Создать новый матч"
   },
   "category_products": {

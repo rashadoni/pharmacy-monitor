@@ -406,6 +406,7 @@ export interface WatchlistCategoryItem {
   product_count: number;
   matched_product_count: number;
   comparison_count: number;
+  missing_site_counts?: Record<string, number>;
 }
 
 export interface PriceHistoryPoint {

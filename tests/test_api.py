@@ -870,6 +870,7 @@ def test_dash_watchlist_categories_crud(client, auth_cookie, setup_db):
             "product_count": 0,
             "matched_product_count": 0,
             "comparison_count": 0,
+            "missing_site_counts": {"aloe": 0},
         }
     ]
 
@@ -1020,6 +1021,74 @@ def test_dash_watchlist_categories_include_comparison_counts(client, auth_cookie
     assert item["product_count"] == 4
     assert item["matched_product_count"] == 4
     assert item["comparison_count"] == 1
+    assert item["missing_site_counts"] == {"aloe": 0}
+
+
+def test_dash_watchlist_categories_include_missing_site_counts(client, auth_cookie, setup_db):
+    run = storage.Run(status="ok", tenant_id=1)
+    setup_db.add(run)
+    setup_db.commit()
+    setup_db.refresh(run)
+    cat = storage.Category(
+        key="supplies",
+        label_ru="Медицинские средства",
+        pharmonline_slug="supplies",
+        aloe_slug="aloe-supplies",
+        aptekonline_slug="aptek-supplies",
+        is_active=True,
+    )
+    setup_db.add(cat)
+    setup_db.commit()
+    setup_db.refresh(cat)
+
+    full = _make_match_with_prices(
+        setup_db,
+        run,
+        canonical="full",
+        prices={"pharmonline": 10.0, "aloe": 8.0, "aptekonline": 9.0},
+        category="supplies",
+    )
+    missing_aptek = _make_match_with_prices(
+        setup_db,
+        run,
+        canonical="missing_aptek",
+        prices={"pharmonline": 11.0, "aloe": 8.5},
+        category="supplies",
+    )
+    missing_both = _make_match_with_prices(
+        setup_db,
+        run,
+        canonical="missing_both",
+        prices={"pharmonline": 12.0},
+        category="supplies",
+    )
+    for canonical in ("full", "missing_aptek"):
+        aloe_product = setup_db.scalar(
+            select(storage.Product).where(
+                storage.Product.site == "aloe",
+                storage.Product.external_id == f"aloe-{canonical}",
+            )
+        )
+        assert aloe_product is not None
+        aloe_product.category = "aloe-supplies"
+    aptek_product = setup_db.scalar(
+        select(storage.Product).where(
+            storage.Product.site == "aptekonline",
+            storage.Product.external_id == "aptekonline-full",
+        )
+    )
+    assert aptek_product is not None
+    aptek_product.category = "aptek-supplies"
+    setup_db.commit()
+    assert full.id
+    assert missing_aptek.id
+    assert missing_both.id
+
+    created = client.post("/api/v1/dash/watchlist/categories", json={"category_id": cat.id})
+    assert created.status_code == 201, created.text
+
+    item = client.get("/api/v1/dash/watchlist/categories").json()[0]
+    assert item["missing_site_counts"] == {"aloe": 1, "aptekonline": 2}
 
 
 def test_dash_watchlist_categories_counts_are_site_scoped(client, auth_cookie, setup_db):
