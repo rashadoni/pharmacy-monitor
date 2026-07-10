@@ -66,6 +66,21 @@ jobs:
             exit 1
           fi
 
+      - name: Preflight deployment paths are writable
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+            for path in \
+              /opt/pharmacy-monitor/src \
+              /opt/pharmacy-monitor/frontend \
+              /opt/pharmacy-monitor/migrations/versions
+            do
+              if [ ! -w "$path" ]; then
+                printf "deployment path is not writable by pm: %s\n" "$path" >&2
+                exit 1
+              fi
+            done'
+
       - name: Rsync code -> prod (src + frontend + canonical migrations)
         run: |
           set -euo pipefail
