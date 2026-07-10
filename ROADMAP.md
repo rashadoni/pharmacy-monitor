@@ -143,8 +143,9 @@ Pharmacy Monitor должен стать не «дашбордом с ценам
     единиц, подсказок, auth verify и `html lang`; добавить RU/AZ/EN parity-тесты.
   - [x] Сделать выбор подписи для повторяющихся site-slug маппингов
     детерминированным без удаления допустимых many-to-one связей.
-  - [ ] Задеплоить и визуально подтвердить AZ category/matcher/watchlist на
-    production (локальные API/unit/typecheck/build проверки завершены).
+  - [x] Задеплоить и визуально подтвердить AZ category/matcher/watchlist на
+    production (2026-07-10: DB `0012`, `missing_az=0`, `cyrillic_az=0`,
+    авторизованный Chrome smoke для watchlist → Aloe attach → matcher).
   - [ ] Перевести backend-generated alert/health content с готовых русских
     `title/detail` на `message_code + params`, чтобы web/email/Telegram могли
     рендерить язык каждого получателя.

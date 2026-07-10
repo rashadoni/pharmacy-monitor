@@ -70,15 +70,48 @@ jobs:
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            for path in \
+            source_bad=$(find \
               /opt/pharmacy-monitor/src \
-              /opt/pharmacy-monitor/frontend \
-              /opt/pharmacy-monitor/migrations/versions
+              /opt/pharmacy-monitor/migrations/versions \
+              -xdev \
+              \( -name __pycache__ -o -name "*.pyc" \) -prune -o \
+              ! -writable -print -quit)
+            if [ -n "$source_bad" ]; then
+              printf "deployment path is not writable by pm: %s\n" "$source_bad" >&2
+              exit 1
+            fi
+
+            frontend_bad=$(find /opt/pharmacy-monitor/frontend -xdev \
+              \( -name node_modules -o -name .next -o -name test-results \
+                 -o -name "*.tsbuildinfo" \) -prune -o \
+              ! -writable -print -quit)
+            if [ -n "$frontend_bad" ]; then
+              printf "deployment path is not writable by pm: %s\n" "$frontend_bad" >&2
+              exit 1
+            fi'
+
+      - name: Preflight least-privilege service restart
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+            for service in \
+              pharmacy-monitor-api.service \
+              pharmacy-monitor-frontend.service
             do
-              if [ ! -w "$path" ]; then
-                printf "deployment path is not writable by pm: %s\n" "$path" >&2
-                exit 1
-              fi
+              test "$(systemctl show --property User --value "$service")" = pm
+
+              fragment=$(systemctl show --property FragmentPath --value "$service")
+              test -n "$fragment"
+              test "$(stat -c %U "$fragment")" = root
+              test ! -w "$fragment"
+
+              for dropin in $(systemctl show --property DropInPaths --value "$service")
+              do
+                test "$(stat -c %U "$dropin")" = root
+                test ! -w "$dropin"
+              done
+
+              sudo -n -l /usr/bin/systemctl restart "$service" >/dev/null
             done'
 
       - name: Rsync code -> prod (src + frontend + canonical migrations)
@@ -131,8 +164,8 @@ jobs:
             cd /opt/pharmacy-monitor/frontend
             NODE_OPTIONS=--max-old-space-size=4096 pnpm install --frozen-lockfile
             NODE_OPTIONS=--max-old-space-size=4096 pnpm build
-            sudo systemctl restart pharmacy-monitor-api.service
-            sudo systemctl restart pharmacy-monitor-frontend.service'
+            sudo -n /usr/bin/systemctl restart pharmacy-monitor-api.service
+            sudo -n /usr/bin/systemctl restart pharmacy-monitor-frontend.service'
 
       - name: Health check
         run: |
