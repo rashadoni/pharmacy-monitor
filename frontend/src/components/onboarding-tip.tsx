@@ -17,6 +17,7 @@
 
 import { useEffect, useState } from "react";
 import { Lightbulb, X } from "lucide-react";
+import { useTranslations } from "next-intl";
 
 interface Props {
   id: string;
@@ -26,6 +27,7 @@ interface Props {
 }
 
 export function OnboardingTip({ id, title, description }: Props) {
+  const t = useTranslations("common");
   const storageKey = `tip-${id}-dismissed`;
   const [dismissed, setDismissed] = useState(true); // SSR-safe: hide пока не hydrate
 
@@ -52,8 +54,8 @@ export function OnboardingTip({ id, title, description }: Props) {
       <button
         onClick={handleDismiss}
         className="text-muted-foreground hover:text-foreground p-1 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        aria-label="Скрыть подсказку"
-        title="Скрыть навсегда"
+        aria-label={t("hide_tip")}
+        title={t("hide_tip_forever")}
       >
         <X className="h-4 w-4" />
       </button>

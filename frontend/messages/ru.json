@@ -29,18 +29,42 @@
     "save_view": "Сохраняем…",
     "savings_failed": "Не удалось сохранить",
     "yes": "Да",
-    "no": "Нет"
+    "no": "Нет",
+    "hide_tip": "Скрыть подсказку",
+    "hide_tip_forever": "Скрыть навсегда",
+    "theme_light": "Светлая тема",
+    "theme_dark": "Тёмная тема",
+    "insufficient_trend_data": "Недостаточно данных для тренда"
+  },
+  "quick_actions": {
+    "button_title": "Быстрые действия",
+    "button_short": "Быстро",
+    "scrape_confirm": "Запустить серверный скан всех трёх сайтов сейчас?",
+    "scrape_title": "Запустить скан",
+    "all_sites": "Все 3 сайта",
+    "starting": "Запускаем…",
+    "now": "Сейчас",
+    "scrape_queued": "Запрос скана #{id} поставлен в очередь (status={status})",
+    "digest_confirm": "Отправить тестовый digest всем пользователям с включённым daily digest?",
+    "digest_title": "Отправить тестовый digest",
+    "all_subscribers": "Всем подписанным",
+    "sending": "Отправляем…",
+    "digest_sent": "Digest отправлен {count} получателям",
+    "error": "Ошибка: {message}",
+    "dismiss_feedback": "Нажмите, чтобы скрыть"
   },
   "auth": {
-    "title": "Sign in",
+    "title": "Вход",
     "subtitle": "Введите email — пришлём magic-link",
     "email_label": "Email",
     "request": "📧 Запросить ссылку",
     "submitting": "Отправляем…",
     "sent_title": "Письмо отправлено",
     "sent_body": "Если такой email зарегистрирован, кликните по ссылке в письме (живёт 30 минут).",
-    "verify_loading": "Verifying…",
-    "verify_invalid": "Invalid or expired token",
+    "verify_loading": "Проверяем ссылку…",
+    "verify_invalid": "Ссылка недействительна или устарела",
+    "verify_missing": "В адресе отсутствует токен",
+    "verify_network": "Не удалось проверить ссылку: сеть недоступна",
     "verify_request_new": "Запросить новую ссылку",
     "logout_confirm": "Выйти из системы?",
     "logout": "Выйти",
@@ -89,6 +113,7 @@
     "no_data": "нет данных",
     "load_error": "ошибка загрузки",
     "per_unit_note": "сравнение нормализовано за штуку (разные фасовки)",
+    "unit_short": "шт.",
     "stale_badge": "{days} дн. назад",
     "stale_note": "Цена обновлялась {days} дн. назад — не учитывается в спреде",
     "stable_price": "стабильно {price}",
@@ -102,6 +127,7 @@
     "needs_review_aria": "Требует проверки",
     "reject_tooltip": "Отвергнуть как ложный матч",
     "needs_review_tooltip": "Требует проверки",
+    "match_confidence": "Уверенность сопоставления: {pct}%",
     "sites_spread": "{n} сайтов · разница",
     "relink_title": "Неправильное сравнение?",
     "relink_hint": "Замените товар на нужном сайте: выберите из вариантов или вставьте свою ссылку.",
@@ -149,7 +175,10 @@
     "duration_sec": "{n}с",
     "duration_min": "{n}м",
     "duration_min_sec": "{n}м {s}с",
-    "duration_hour": "{h}ч {m}м"
+    "duration_hour": "{h}ч {m}м",
+    "onboarding_title": "Ваш главный экран",
+    "onboarding_desc": "KPI сверху показывают совпадения, покрытие и качество данных. Сегодняшние рекомендации выделяют ценовые ситуации, требующие решения; ниже виден статус всех серверных сканов.",
+    "unit_gap_hint": "Разница цены за единицу товара — напрямую проверяемая величина"
   },
   "analytics": {
     "title": "📈 Аналитика",
@@ -216,7 +245,9 @@
     "tooltip_snoozed_until": "Snoozed до {date}",
     "tooltip_mark_read": "Пометить прочитанным",
     "tooltip_mark_unread": "Пометить непрочитанным",
-    "tooltip_snooze_7d": "Скрыть на 7 дней"
+    "tooltip_snooze_7d": "Скрыть на 7 дней",
+    "onboarding_title": "Работа с уведомлениями",
+    "onboarding_desc": "Во входящих остаются уведомления, требующие внимания. Выберите несколько строк, чтобы массово отметить их прочитанными или отложить; прочитанные и отложенные события находятся в отдельных вкладках."
   },
   "watchlist": {
     "title": "📋 Watchlist",
@@ -253,7 +284,8 @@
     "category_comparison_count": "{count} готово к сравнению",
     "category_no_comparison": "Пока нет cross-site matched товаров: запустите матчинг или привяжите товары вручную.",
     "category_make_matches": "Подобрать матчи",
-    "category_add_site_matches": "Добавить {site} ({count})",
+    "category_add_site_matches": "Добавить сопоставления из {site} ({count})",
+    "category_add_site_matches_hint": "Открывает подбор соответствий, чтобы привязать {count} товаров с сайта {site} к существующим сопоставлениям.",
     "category_create_matches": "Создать новый матч"
   },
   "category_products": {
@@ -370,7 +402,16 @@
     "scan_done_msg": "✓ Готово #{id} — {total} товаров",
     "scan_failed_msg": "✗ Сбой #{id}: {error}",
     "site_a_label": "Сайт A",
-    "site_b_label": "Сайт B"
+    "site_b_label": "Сайт B",
+    "suggestions_tip_title": "Связи категорий по общим брендам",
+    "suggestions_tip_desc": "Категории двух сайтов с большим количеством общих брендов часто обозначают один раздел. После связывания система сопоставления получает более безопасный общий контекст.",
+    "suggestions_explainer": "Рекомендации основаны на общих брендах в категориях двух сайтов. Пять и более одинаковых брендов обычно указывают на одну категорию.",
+    "scan_category_title": "Сканировать только эту категорию",
+    "scan_category_blocked_title": "Полный скан #{id} уже включает эту категорию",
+    "scan_all_title": "Сканировать все активные категории",
+    "error_without_message": "Сообщение об ошибке отсутствует",
+    "completed_title": "run_id={id}, завершено {date}",
+    "delete_tooltip": "Удалить"
   },
   "users": {
     "back": "← Настройки",
@@ -540,7 +581,8 @@
     "btn_reject": "Не один товар",
     "confirm_hint": "Зафиксировать матч — auto-matcher не будет его пересчитывать",
     "reject_hint": "Разбить кластер — продукты помечаются как разные товары",
-    "count": "{n} матчей в очереди"
+    "count": "{n} матчей в очереди",
+    "barcode_title": "Штрихкод"
   },
   "category_comparison": {
     "title": "📊 Сравнение по категориям",

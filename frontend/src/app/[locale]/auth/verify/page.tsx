@@ -2,7 +2,8 @@
 
 import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { useRouter } from "@/i18n/navigation";
+import { useTranslations } from "next-intl";
+import { Link, useRouter } from "@/i18n/navigation";
 
 /**
  * /[locale]/auth/verify?token=...
@@ -13,6 +14,7 @@ import { useRouter } from "@/i18n/navigation";
  * SSG из [locale]/ dynamic segment. Иначе prerender падает.
  */
 function VerifyInner() {
+  const t = useTranslations("auth");
   const router = useRouter();
   const params = useSearchParams();
   const [error, setError] = useState<string | null>(null);
@@ -20,7 +22,7 @@ function VerifyInner() {
   useEffect(() => {
     const token = params.get("token");
     if (!token) {
-      setError("Token missing in URL");
+      setError(t("verify_missing"));
       return;
     }
     fetch(`/auth/verify?token=${encodeURIComponent(token)}`, {
@@ -31,34 +33,35 @@ function VerifyInner() {
           // i18n/navigation router → автоматом подставит locale префикс
           router.replace("/overview");
         } else {
-          setError("Invalid or expired token");
+          setError(t("verify_invalid"));
         }
       })
-      .catch(() => setError("Network error"));
-  }, [params, router]);
+      .catch(() => setError(t("verify_network")));
+  }, [params, router, t]);
 
   return (
     <div className="min-h-screen flex items-center justify-center">
       {error ? (
-        <div className="text-center">
+        <div className="text-center" role="alert" aria-live="polite">
           <div className="text-destructive font-medium mb-2">{error}</div>
-          <a href="/login" className="text-sm underline text-primary">
-            Запросить новую ссылку
-          </a>
+          <Link href="/login" className="text-sm underline text-primary">
+            {t("verify_request_new")}
+          </Link>
         </div>
       ) : (
-        <div className="text-muted-foreground text-sm">Verifying…</div>
+        <div className="text-muted-foreground text-sm">{t("verify_loading")}</div>
       )}
     </div>
   );
 }
 
 export default function VerifyPage() {
+  const t = useTranslations("auth");
   return (
     <Suspense
       fallback={
         <div className="min-h-screen flex items-center justify-center">
-          <div className="text-muted-foreground text-sm">Verifying…</div>
+          <div className="text-muted-foreground text-sm">{t("verify_loading")}</div>
         </div>
       }
     >

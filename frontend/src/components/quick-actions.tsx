@@ -3,6 +3,7 @@
 import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
 import { Mail, Play, Zap } from "lucide-react";
+import { useLocale, useTranslations } from "next-intl";
 import { api, friendlyError } from "@/lib/api";
 
 /**
@@ -12,25 +13,27 @@ import { api, friendlyError } from "@/lib/api";
  *   - Отправить test digest всем получателям с daily_digest=true
  */
 export function QuickActions() {
+  const t = useTranslations("quick_actions");
+  const locale = useLocale();
   const [open, setOpen] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
 
   const scrapeMut = useMutation({
     mutationFn: () => api.scrapeTrigger({ mode: "all" }),
     onSuccess: (r) => {
-      setFeedback(`Scan-request #${r.id} поставлен в очередь (status=${r.status})`);
+      setFeedback(t("scrape_queued", { id: r.id, status: r.status }));
       setOpen(false);
     },
-    onError: (err) => setFeedback(`Ошибка: ${friendlyError(err)}`),
+    onError: (err) => setFeedback(t("error", { message: friendlyError(err, locale) })),
   });
 
   const digestMut = useMutation({
     mutationFn: () => api.digestSendTest("daily"),
     onSuccess: (r) => {
-      setFeedback(`Digest отправлен на ${r.recipients_sent} получателей`);
+      setFeedback(t("digest_sent", { count: r.recipients_sent }));
       setOpen(false);
     },
-    onError: (err) => setFeedback(`Ошибка: ${friendlyError(err)}`),
+    onError: (err) => setFeedback(t("error", { message: friendlyError(err, locale) })),
   });
 
   function handleAction(fn: () => void, confirmText: string) {
@@ -43,10 +46,10 @@ export function QuickActions() {
       <button
         onClick={() => setOpen(!open)}
         className="inline-flex items-center gap-1.5 rounded-md border border-input bg-card px-3 py-1.5 text-sm hover:bg-muted/50"
-        title="Quick Actions"
+        title={t("button_title")}
       >
         <Zap className="h-4 w-4 text-warning" />
-        Quick
+        {t("button_short")}
       </button>
 
       {open && (
@@ -57,7 +60,7 @@ export function QuickActions() {
               onClick={() =>
                 handleAction(
                   () => scrapeMut.mutate(),
-                  "Запустить scrape всех 3 сайтов сейчас?\n\nMac watcher подберёт через ~60 сек.",
+                  t("scrape_confirm"),
                 )
               }
               disabled={scrapeMut.isPending}
@@ -65,9 +68,9 @@ export function QuickActions() {
             >
               <Play className="h-4 w-4 text-primary" />
               <div className="flex-1 min-w-0">
-                <div className="text-sm font-medium">Запустить scrape</div>
+                <div className="text-sm font-medium">{t("scrape_title")}</div>
                 <div className="text-xs text-muted-foreground">
-                  Все 3 сайта · {scrapeMut.isPending ? "Запускаю…" : "Сейчас"}
+                  {t("all_sites")} · {scrapeMut.isPending ? t("starting") : t("now")}
                 </div>
               </div>
             </button>
@@ -76,7 +79,7 @@ export function QuickActions() {
               onClick={() =>
                 handleAction(
                   () => digestMut.mutate(),
-                  "Отправить test digest всем получателям с daily_digest=true сейчас?",
+                  t("digest_confirm"),
                 )
               }
               disabled={digestMut.isPending}
@@ -84,9 +87,9 @@ export function QuickActions() {
             >
               <Mail className="h-4 w-4 text-success" />
               <div className="flex-1 min-w-0">
-                <div className="text-sm font-medium">Отправить test digest</div>
+                <div className="text-sm font-medium">{t("digest_title")}</div>
                 <div className="text-xs text-muted-foreground">
-                  Всем подписанным · {digestMut.isPending ? "Отправляю…" : "Сейчас"}
+                  {t("all_subscribers")} · {digestMut.isPending ? t("sending") : t("now")}
                 </div>
               </div>
             </button>
@@ -101,7 +104,9 @@ export function QuickActions() {
           role="status"
         >
           {feedback}
-          <div className="text-[10px] text-muted-foreground mt-1">Кликни чтобы скрыть</div>
+          <div className="text-[10px] text-muted-foreground mt-1">
+            {t("dismiss_feedback")}
+          </div>
         </div>
       )}
     </div>

@@ -7,7 +7,8 @@ import { useState } from "react";
 import { api, type RunRow, type RoiAction, type HealthSite, type LatestRunBySite } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { QuickActions } from "@/components/quick-actions";
-import { formatRelative, formatPrice } from "@/lib/utils";
+import { formatNumber, formatRelative, formatPrice } from "@/lib/utils";
+import { categoryDisplayLabel } from "@/lib/category-label";
 
 export default function OverviewPage() {
   const t = useTranslations("overview");
@@ -34,16 +35,8 @@ export default function OverviewPage() {
     <div className="space-y-6">
       <OnboardingTip
         id="overview-welcome-v1"
-        title="Это — твой главный экран"
-        description={
-          <>
-            4 KPI карточки сверху: сколько cross-site совпадений, какое
-            покрытие и AI confidence. Ниже — «Сегодняшние действия» (где
-            конкурент бьёт по цене и где ты можешь поднять). Расписание
-            прогонов внизу — все скрейпы идут на сервере через оплаченные
-            сервисы/proxy, без зависимости от Mac.
-          </>
-        }
+        title={t("onboarding_title")}
+        description={t("onboarding_desc")}
       />
       <div className="flex items-start justify-between gap-3">
         <div>
@@ -101,8 +94,8 @@ export default function OverviewPage() {
           hint={
             normalizeQ.data
               ? t("kpi_ai_low_confidence", {
-                  count: normalizeQ.data.needs_review.toLocaleString("ru-RU"),
-                  total: normalizeQ.data.products_total.toLocaleString("ru-RU"),
+                  count: formatNumber(normalizeQ.data.needs_review, locale),
+                  total: formatNumber(normalizeQ.data.products_total, locale),
                 })
               : t("kpi_ai_hint")
           }
@@ -299,7 +292,8 @@ function RunBreakdownPanel({
   };
 }) {
   const t = useTranslations("overview");
-  // Load categories один раз — нужно для маппинга slug → label_ru.
+  const locale = useLocale();
+  // Load categories один раз — нужно для локализованного маппинга slug → label.
   // Slug на каждом сайте свой (pharm: 'vitamin-ve-mineral-kompleks',
   // apt: '78', aloe: 'uşaq-qidası'), поэтому строим lookup-table per site.
   const catsQ = useQuery({ queryKey: ["categories"], queryFn: api.categories });
@@ -311,7 +305,7 @@ function RunBreakdownPanel({
       if (site === "aloe") return c.aloe_slug === slugOrId;
       return false;
     });
-    return match?.label_ru ?? null;
+    return match ? categoryDisplayLabel(match, locale, slugOrId) : null;
   };
 
   const sites = Object.keys(data.products_per_site_category).sort();
@@ -415,6 +409,7 @@ function KpiCard({
 
 function ActionRow({ action }: { action: RoiAction }) {
   const t = useTranslations("overview");
+  const locale = useLocale();
   const tone =
     action.severity === "critical"
       ? "border-destructive/40 bg-destructive/5"
@@ -441,10 +436,10 @@ function ActionRow({ action }: { action: RoiAction }) {
               className={`text-sm font-semibold tabular-nums ${
                 gapPositive ? "text-success" : "text-destructive"
               }`}
-              title="Разница цены за единицу товара — реально проверяемая величина"
+              title={t("unit_gap_hint")}
             >
               {gapPositive ? "+" : ""}
-              {formatPrice(action.unit_gap_azn ?? 0)} {t("unit_gap_label")}
+              {formatPrice(action.unit_gap_azn ?? 0, locale)} {t("unit_gap_label")}
             </div>
             <div className="text-[11px] text-muted-foreground tabular-nums">
               {(action.spread_pct ?? 0).toFixed(1)} {t("spread_label")}

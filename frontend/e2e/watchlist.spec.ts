@@ -133,18 +133,23 @@ test.describe("Watchlist page (authenticated)", () => {
   });
 
   test("category attach link opens matcher in current locale", async ({ page }) => {
-    await page.goto("/ru/watchlist");
+    await page.goto("/az/watchlist");
     const link = page.locator('[data-testid^="watchlist-category-attach-aloe-"]').first();
     await expect(link).toBeVisible({ timeout: 10_000 });
+    await expect(link).toContainText("uyğunluq əlavə et");
+    await expect(link).toHaveAttribute("title", /uyğunlaşdırma seçimini/i);
 
     const href = await link.getAttribute("href");
-    expect(href).toContain("/ru/matcher?");
+    expect(href).toContain("/az/matcher?");
     expect(href).toContain("mode=attach");
     expect(href).toContain("site=aloe");
     expect(href).toContain("category=");
 
     await link.click();
-    await expect(page).toHaveURL(/\/ru\/matcher\?.*mode=attach/);
+    await expect(page).toHaveURL(/\/az\/matcher\?.*mode=attach/);
     await expect(page).toHaveURL(/site=aloe/);
+    const selectedCategory = page.locator('[data-testid="matcher-category-filter"] option:checked');
+    await expect(selectedCategory).toContainText("Digər tibbi vasitələr");
+    await expect(selectedCategory).not.toContainText(/[А-Яа-яЁё]/);
   });
 });

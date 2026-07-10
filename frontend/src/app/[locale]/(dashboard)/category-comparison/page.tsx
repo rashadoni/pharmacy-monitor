@@ -260,12 +260,12 @@ export default function CategoryComparisonPage() {
                     {row.matched_skus}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">
-                    {formatPrice(row.avg_client_price)}
+                    {formatPrice(row.avg_client_price, locale)}
                   </td>
                   {COMPETITORS.map((s) => (
                     <td key={s} className="px-3 py-2 text-right tabular-nums">
                       {row.per_site_avg[s] != null ? (
-                        formatPrice(row.per_site_avg[s])
+                        formatPrice(row.per_site_avg[s], locale)
                       ) : (
                         <span className="text-muted-foreground/50">—</span>
                       )}
@@ -353,6 +353,7 @@ function IndexBadge({ index, t }: { index: number; t: ReturnType<typeof useTrans
 
 function CategoryCard({ row, onClick }: { row: CategoryComparisonRow; onClick: () => void }) {
   const t = useTranslations("category_comparison");
+  const locale = useLocale();
   return (
     <button
       onClick={onClick}
@@ -369,13 +370,13 @@ function CategoryCard({ row, onClick }: { row: CategoryComparisonRow; onClick: (
       <div className="grid grid-cols-3 gap-2 mt-2 text-center">
         <div>
           <div className="text-[10px] text-muted-foreground uppercase">pharmonline</div>
-          <div className="tabular-nums text-sm">{formatPrice(row.avg_client_price)}</div>
+          <div className="tabular-nums text-sm">{formatPrice(row.avg_client_price, locale)}</div>
         </div>
         {COMPETITORS.map((s) => (
           <div key={s}>
             <div className="text-[10px] text-muted-foreground uppercase">{s}</div>
             <div className="tabular-nums text-sm">
-              {row.per_site_avg[s] != null ? formatPrice(row.per_site_avg[s]) : "—"}
+              {row.per_site_avg[s] != null ? formatPrice(row.per_site_avg[s], locale) : "—"}
             </div>
           </div>
         ))}

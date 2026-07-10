@@ -13,12 +13,18 @@ name: Deploy to Hetzner
 #     дать pm узкий sudo на два restart'а, иначе шаг restart упадёт:
 #       echo 'pm ALL=(root) NOPASSWD: /usr/bin/systemctl restart pharmacy-monitor-api.service, /usr/bin/systemctl restart pharmacy-monitor-frontend.service' \
 #         | sudo tee /etc/sudoers.d/pm-deploy && sudo chmod 440 /etc/sudoers.d/pm-deploy
-#   * АЛЕМБИК НЕ ЗАПУСКАЕТСЯ автоматически (осознанно): миграции — отдельное решение,
-#     не на каждый деплой. Прод-схема консистентна (PG alembic_version=0008, схема
-#     через 0009; upgrade head безопасен — 0009 идемпотентна). См. CLAUDE.md.
+#   * АЛЕМБИК ПО УМОЛЧАНИЮ НЕ ЗАПУСКАЕТСЯ: миграции включаются явным флагом
+#     apply_migrations и только после проверенного backup. Канонический каталог
+#     versions синхронизируется с --delete; несколько heads останавливают deploy.
 
 on:
   workflow_dispatch:
+    inputs:
+      apply_migrations:
+        description: "After a verified backup, upgrade the production DB to the single Alembic head"
+        type: boolean
+        required: true
+        default: false
 
 jobs:
   deploy:
@@ -43,18 +49,70 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Rsync code -> prod (src + frontend source)
+      - name: Preflight production DB revision against checkout
         run: |
+          set -euo pipefail
+          current_output=$(ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+            cd /opt/pharmacy-monitor
+            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
+            test -n "$db_url"
+            DATABASE_URL="$db_url" .venv/bin/alembic current')
+          printf '%s\n' "$current_output"
+          current_count=$(printf '%s\n' "$current_output" | sed '/^[[:space:]]*$/d' | wc -l)
+          test "$current_count" -eq 1
+          current_revision=$(printf '%s\n' "$current_output" | awk 'NF {print $1}')
+          if ! grep -Rqs --include='*.py' "revision: str = \"$current_revision\"" migrations/versions; then
+            echo "::error::production DB revision $current_revision is absent from checkout; refusing rsync --delete"
+            exit 1
+          fi
+
+      - name: Rsync code -> prod (src + frontend + canonical migrations)
+        run: |
+          set -euo pipefail
           rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
             src/ pm@46.225.149.52:/opt/pharmacy-monitor/src/
           rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='node_modules/' --exclude='.next/' --exclude='*.tsbuildinfo' --exclude='test-results/' \
             frontend/ pm@46.225.149.52:/opt/pharmacy-monitor/frontend/
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            --exclude='__pycache__/' --exclude='*.pyc' \
+            frontend/src/ pm@46.225.149.52:/opt/pharmacy-monitor/frontend/src/
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            --exclude='__pycache__/' --exclude='*.pyc' \
+            migrations/versions/ pm@46.225.149.52:/opt/pharmacy-monitor/migrations/versions/
+
+      - name: Verify migration graph has one head
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+            cd /opt/pharmacy-monitor
+            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
+            test -n "$db_url"
+            heads=$(.venv/bin/alembic heads)
+            printf "%s\n" "$heads"
+            test "$(printf "%s\n" "$heads" | sed "/^[[:space:]]*$/d" | wc -l)" -eq 1
+            DATABASE_URL="$db_url" .venv/bin/alembic current'
+
+      - name: Verified backup + apply migrations
+        if: ${{ inputs.apply_migrations }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+            cd /opt/pharmacy-monitor
+            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
+            test -n "$db_url"
+            bash infra/scripts/backup.sh
+            DATABASE_URL="$db_url" .venv/bin/alembic upgrade head
+            current=$(DATABASE_URL="$db_url" .venv/bin/alembic current | awk "NF {print \$1}")
+            head=$(.venv/bin/alembic heads | awk "NF {print \$1}")
+            test "$current" = "$head"
+            printf "migration current=head=%s\n" "$current"'
 
       - name: Build frontend + restart services
         run: |
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -e
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
             cd /opt/pharmacy-monitor/frontend
             NODE_OPTIONS=--max-old-space-size=4096 pnpm install --frozen-lockfile
             NODE_OPTIONS=--max-old-space-size=4096 pnpm build
@@ -63,7 +121,9 @@ jobs:
 
       - name: Health check
         run: |
+          set -euo pipefail
           sleep 5
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 '
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
             curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"
-            curl -s -o /dev/null -w "frontend HTTP %{http_code}\n" http://127.0.0.1:3000/'
+            curl -fsSL -o /dev/null -w "frontend HTTP %{http_code}\n" http://127.0.0.1:3000/ru/login
+            curl -fsSL http://127.0.0.1:3000/ru/login | grep -q "<html lang=\"ru\""'

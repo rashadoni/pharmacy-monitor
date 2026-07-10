@@ -1,3 +1,7 @@
+"use client";
+
+import { useTranslations } from "next-intl";
+
 /**
  * Маленький SVG sparkline без зависимостей. Показывает динамику цены за N дней
  * + ниже — числовая delta_pct ("+5.2%" / "-3.1%").
@@ -18,13 +22,14 @@ export function Sparkline({
   width?: number;
   height?: number;
 }) {
+  const t = useTranslations("common");
   const vals = points.map((p) => p.price).filter((v): v is number => v != null);
   if (vals.length < 2) {
     return (
       <div
         className="inline-flex items-center text-[10px] text-muted-foreground/70"
         style={{ width }}
-        aria-label="недостаточно данных для тренда"
+        aria-label={t("insufficient_trend_data")}
       >
         —
       </div>

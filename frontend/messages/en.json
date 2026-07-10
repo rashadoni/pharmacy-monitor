@@ -29,7 +29,29 @@
     "save_view": "Saving…",
     "savings_failed": "Save failed",
     "yes": "Yes",
-    "no": "No"
+    "no": "No",
+    "hide_tip": "Hide tip",
+    "hide_tip_forever": "Hide permanently",
+    "theme_light": "Light theme",
+    "theme_dark": "Dark theme",
+    "insufficient_trend_data": "Not enough data for a trend"
+  },
+  "quick_actions": {
+    "button_title": "Quick actions",
+    "button_short": "Quick",
+    "scrape_confirm": "Start a server-side scan of all three sites now?",
+    "scrape_title": "Start scan",
+    "all_sites": "All 3 sites",
+    "starting": "Starting…",
+    "now": "Now",
+    "scrape_queued": "Scan request #{id} was queued (status={status})",
+    "digest_confirm": "Send a test digest to every user with daily digest enabled?",
+    "digest_title": "Send test digest",
+    "all_subscribers": "All subscribers",
+    "sending": "Sending…",
+    "digest_sent": "Digest sent to {count} recipients",
+    "error": "Error: {message}",
+    "dismiss_feedback": "Click to dismiss"
   },
   "auth": {
     "title": "Sign in",
@@ -41,6 +63,8 @@
     "sent_body": "If this email is registered, click the link in the message (expires in 30 min).",
     "verify_loading": "Verifying…",
     "verify_invalid": "Invalid or expired token",
+    "verify_missing": "The URL does not contain a token",
+    "verify_network": "The link could not be verified: network unavailable",
     "verify_request_new": "Request a new link",
     "logout_confirm": "Sign out?",
     "logout": "Sign out",
@@ -89,6 +113,7 @@
     "no_data": "no data",
     "load_error": "load error",
     "per_unit_note": "comparison normalized per unit (different pack sizes)",
+    "unit_short": "unit",
     "stale_badge": "{days}d ago",
     "stale_note": "Price last seen {days} days ago — excluded from spread",
     "stable_price": "stable {price}",
@@ -102,6 +127,7 @@
     "needs_review_aria": "Needs review",
     "reject_tooltip": "Reject as false match",
     "needs_review_tooltip": "Needs review",
+    "match_confidence": "Match confidence: {pct}%",
     "sites_spread": "{n} sites · spread",
     "relink_title": "Wrong comparison?",
     "relink_hint": "Replace the product for a site: pick from suggestions or paste your own link.",
@@ -149,7 +175,10 @@
     "duration_sec": "{n}s",
     "duration_min": "{n}m",
     "duration_min_sec": "{n}m {s}s",
-    "duration_hour": "{h}h {m}m"
+    "duration_hour": "{h}h {m}m",
+    "onboarding_title": "Your main workspace",
+    "onboarding_desc": "The KPI row shows matching, coverage, and data quality. Today's recommendations highlight pricing situations that need a decision; the run list below shows the state of every server-side scan.",
+    "unit_gap_hint": "Price difference per product unit — a directly verifiable measure"
   },
   "analytics": {
     "title": "📈 Analytics",
@@ -216,7 +245,9 @@
     "tooltip_snoozed_until": "Snoozed until {date}",
     "tooltip_mark_read": "Mark as read",
     "tooltip_mark_unread": "Mark as unread",
-    "tooltip_snooze_7d": "Hide for 7 days"
+    "tooltip_snooze_7d": "Hide for 7 days",
+    "onboarding_title": "Working with notifications",
+    "onboarding_desc": "The inbox keeps notifications that need attention. Select multiple rows to mark them read or snooze them in bulk; read and snoozed events live in separate tabs."
   },
   "watchlist": {
     "title": "📋 Watchlist",
@@ -253,7 +284,8 @@
     "category_comparison_count": "{count} ready for comparison",
     "category_no_comparison": "No cross-site matched products yet: run matching or link products manually.",
     "category_make_matches": "Create matches",
-    "category_add_site_matches": "Add {site} ({count})",
+    "category_add_site_matches": "Add matches from {site} ({count})",
+    "category_add_site_matches_hint": "Opens match selection to attach {count} products from {site} to existing matches.",
     "category_create_matches": "Create new match"
   },
   "category_products": {
@@ -370,7 +402,16 @@
     "scan_done_msg": "✓ Done #{id} — {total} products",
     "scan_failed_msg": "✗ Failed #{id}: {error}",
     "site_a_label": "Site A",
-    "site_b_label": "Site B"
+    "site_b_label": "Site B",
+    "suggestions_tip_title": "Category links based on shared brands",
+    "suggestions_tip_desc": "Categories on two sites that share many brands often represent the same section. Linking them gives the matching system safer shared context.",
+    "suggestions_explainer": "Suggestions are based on brands shared by categories on two sites. Five or more matching brands usually indicate the same category.",
+    "scan_category_title": "Scan only this category",
+    "scan_category_blocked_title": "Full scan #{id} already includes this category",
+    "scan_all_title": "Scan all active categories",
+    "error_without_message": "No error message",
+    "completed_title": "run_id={id}, completed {date}",
+    "delete_tooltip": "Delete"
   },
   "users": {
     "back": "← Settings",
@@ -540,7 +581,8 @@
     "btn_reject": "Not the same product",
     "confirm_hint": "Lock this match — auto-matcher won't change it",
     "reject_hint": "Break the cluster — products marked as different",
-    "count": "{n} matches in queue"
+    "count": "{n} matches in queue",
+    "barcode_title": "Barcode"
   },
   "category_comparison": {
     "title": "📊 Category comparison",

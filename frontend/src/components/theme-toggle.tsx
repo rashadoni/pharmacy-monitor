@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Moon, Sun } from "lucide-react";
+import { useTranslations } from "next-intl";
 
 type Theme = "light" | "dark";
 
@@ -11,6 +12,7 @@ type Theme = "light" | "dark";
  * первом запуске если в localStorage нет значения.
  */
 export function ThemeToggle() {
+  const t = useTranslations("common");
   const [theme, setTheme] = useState<Theme>("light");
   const [mounted, setMounted] = useState(false);
 
@@ -41,9 +43,9 @@ export function ThemeToggle() {
   return (
     <button
       onClick={toggle}
-      className="text-muted-foreground hover:text-foreground transition-colors"
-      title={theme === "dark" ? "Светлая тема" : "Тёмная тема"}
-      aria-label="Toggle theme"
+      className="rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      title={theme === "dark" ? t("theme_light") : t("theme_dark")}
+      aria-label={theme === "dark" ? t("theme_light") : t("theme_dark")}
     >
       <Icon className="h-4 w-4" />
     </button>

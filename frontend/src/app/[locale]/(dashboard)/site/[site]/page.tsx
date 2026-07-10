@@ -5,7 +5,7 @@ import { notFound, useParams } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
 import { Building2, ExternalLink, Leaf, Pill, Search } from "lucide-react";
-import { api, type SiteProduct } from "@/lib/api";
+import { api, friendlyError, type SiteProduct } from "@/lib/api";
 import { ActionRow } from "@/components/action-row";
 import { KpiCard } from "@/components/kpi-card";
 import { Sparkline } from "@/components/sparkline";
@@ -17,7 +17,7 @@ const PAGE_LIMIT = 50;
 /**
  * P1.5 (PO Audit 2026-05-17): human-readable category label.
  *
- * Backend возвращает {name: slug, label: label_ru || slug}. Проблемы аудита:
+ * Backend возвращает {name: slug, label: localized label || slug}.
  * - `label = "Daha çox"` (Azerbaijani "Show more") — UI-artefact из aloe-scrape
  *   seed-данных, бесполезный для пользователя
  * - `label = slug` (отсутствует label_ru) — slug нечитаемый: `ushaqlar-uchun-vasiteler`
@@ -29,7 +29,6 @@ const PAGE_LIMIT = 50;
  */
 const _GENERIC_LABELS = new Set([
   "daha çox", "daha cox", "show more", "view all", "все", "more",
-  "детское питание", // not generic per se но дубликат когда slug = "uşaq-qidası"
 ]);
 
 function prettyCategoryLabel(c: { name: string; label?: string }): string {
@@ -94,8 +93,8 @@ export default function SitePage() {
     queryFn: () => api.siteProductsSummary(site),
   });
   const facetsQ = useQuery({
-    queryKey: ["site", site, "facets"],
-    queryFn: () => api.siteProductsFacets(site),
+    queryKey: ["site", site, "facets", locale],
+    queryFn: () => api.siteProductsFacets(site, locale),
   });
   const brandsQ = useQuery({
     queryKey: ["site", site, "brands"],
@@ -120,7 +119,7 @@ export default function SitePage() {
             <>
               {t("last_run")}{" "}
               <span className="font-mono">
-                {formatTime(summaryQ.data.last_run_at)}
+                {formatTime(summaryQ.data.last_run_at, locale)}
               </span>
               {summaryQ.data.last_run_id != null && (
                 <> — run #{summaryQ.data.last_run_id}</>
@@ -174,9 +173,7 @@ export default function SitePage() {
         {roiQ.error && (
           <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive flex items-center justify-between gap-3">
             <div>
-              {roiQ.error instanceof Error
-                ? roiQ.error.message
-                : t("roi_error")}
+              {friendlyError(roiQ.error, locale)}
             </div>
             <button
               onClick={() => roiQ.refetch()}
@@ -490,6 +487,7 @@ function ProductsSection({
 
 function ProductRow({ product, site }: { product: SiteProduct; site: SiteName }) {
   const t = useTranslations("site");
+  const locale = useLocale();
   // Lazy-load price history per row (React Query dedups + caches)
   const historyQ = useQuery({
     queryKey: ["product-price-history", product.id, 30],
@@ -516,16 +514,16 @@ function ProductRow({ product, site }: { product: SiteProduct; site: SiteName })
       <td className="px-3 py-2 text-right tabular-nums">
         {product.is_on_sale && product.price != null ? (
           <span className="line-through text-muted-foreground/70">
-            {formatPrice(product.price)}
+            {formatPrice(product.price, locale)}
           </span>
         ) : (
-          formatPrice(product.price)
+          formatPrice(product.price, locale)
         )}
       </td>
       <td className="px-3 py-2 text-right tabular-nums">
         {product.is_on_sale && product.discount_price != null ? (
           <span className="text-success font-medium">
-            {formatPrice(product.discount_price)}
+            {formatPrice(product.discount_price, locale)}
           </span>
         ) : (
           "—"
@@ -557,6 +555,7 @@ function ProductRow({ product, site }: { product: SiteProduct; site: SiteName })
 }
 
 function ProductCard({ product }: { product: SiteProduct }) {
+  const locale = useLocale();
   return (
     <a
       href={product.url}
@@ -578,14 +577,14 @@ function ProductCard({ product }: { product: SiteProduct }) {
           {product.is_on_sale && product.discount_price != null ? (
             <>
               <div className="text-success font-semibold text-sm">
-                {formatPrice(product.discount_price)}
+                {formatPrice(product.discount_price, locale)}
               </div>
               <div className="text-xs text-muted-foreground line-through">
-                {formatPrice(product.price)}
+                {formatPrice(product.price, locale)}
               </div>
             </>
           ) : (
-            <div className="text-sm font-semibold">{formatPrice(product.price)}</div>
+            <div className="text-sm font-semibold">{formatPrice(product.price, locale)}</div>
           )}
         </div>
       </div>

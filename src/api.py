@@ -479,11 +479,19 @@ class CategoryComparisonOut(BaseModel):
 class CategoryIn(BaseModel):
     key: str
     label_ru: str
-    label_az: str | None = None
+    label_az: str = Field(min_length=1)
     pharmonline_slug: str | None = None
     aptekonline_slug: str | None = None
     aloe_slug: str | None = None
     is_active: bool = True
+
+    @field_validator("key", "label_ru", "label_az")
+    @classmethod
+    def strip_required_category_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
 
 
 class CategoryOut(CategoryIn):
@@ -1876,6 +1884,7 @@ def dash_comparison(
 
 
 _VALID_SITES = ("pharmonline", "aptekonline", "aloe")
+_VALID_LOCALES = ("ru", "az", "en")
 
 
 def _require_site(value: str) -> str:
@@ -1885,6 +1894,59 @@ def _require_site(value: str) -> str:
             detail=f"Unknown site '{value}'. Allowed: {', '.join(_VALID_SITES)}",
         )
     return value
+
+
+def _normalize_locale(value: str) -> str:
+    return value if value in _VALID_LOCALES else "ru"
+
+
+def _humanize_category_slug(value: str) -> str:
+    return value.replace("_", " ").replace("-", " ").strip().capitalize() or value
+
+
+def _localized_category_label(
+    *,
+    label_ru: str | None,
+    label_az: str | None,
+    locale: str,
+    fallback: str,
+) -> str:
+    """Resolve a category label without leaking another language into AZ UI.
+
+    English currently has no dedicated DB column, so it intentionally follows
+    the existing Russian fallback.  Azerbaijani falls back to a readable slug,
+    never to Russian; missing translations therefore stay visible to operators
+    without silently presenting mixed-language UI.
+    """
+    normalized = _normalize_locale(locale)
+    if normalized == "az":
+        return (label_az or "").strip() or _humanize_category_slug(fallback)
+    preferred = label_ru
+    return preferred or label_ru or label_az or fallback
+
+
+def _category_label_priority(
+    *,
+    site: str,
+    slug: str,
+    key: str,
+    is_active: bool,
+    category_id: int,
+) -> tuple[bool, bool, int]:
+    """Rank duplicate site-slug mappings deterministically.
+
+    A site-native category (``pharma_<slug>``, ``aptek_<slug>`` or
+    ``aloe_<slug>``) describes that site's own facet more precisely than a
+    cross-site mapping which happens to reuse the same slug.  The production
+    catalogue contains legitimate many-to-one mappings, so deleting duplicate
+    rows or adding a uniqueness constraint would break category comparison.
+    """
+    prefix = {
+        "pharmonline": "pharma",
+        "aptekonline": "aptek",
+        "aloe": "aloe",
+    }[site]
+    return (key == f"{prefix}_{slug}", bool(is_active), category_id)
 
 
 @app.get("/api/v1/dash/roi/actions")
@@ -1908,8 +1970,7 @@ def dash_roi_actions(
     from src import roi
 
     _require_site(client_site)
-    if locale not in ("ru", "az", "en"):
-        locale = "ru"
+    locale = _normalize_locale(locale)
 
     cached = roi.get_cached_actions(db, client_site, tenant_id=user.tenant_id)
     if cached is not None:
@@ -2285,7 +2346,12 @@ def dash_category_comparison(
     rows = analytics.category_comparison(db, client_site=client_site, tenant_id=user.tenant_id)
     out: list[CategoryComparisonOut] = []
     for r in rows:
-        label = (r.label_az if locale == "az" else r.label_ru) or r.label_ru or r.category
+        label = _localized_category_label(
+            label_ru=r.label_ru,
+            label_az=r.label_az,
+            locale=locale,
+            fallback=r.category,
+        )
         out.append(
             CategoryComparisonOut(
                 category=r.category,
@@ -2622,6 +2688,7 @@ def dash_products(
 @app.get("/api/v1/dash/products/facets")
 def dash_products_facets(
     site: str,
+    locale: str = "ru",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -2657,17 +2724,46 @@ def dash_products_facets(
         .limit(100)
     ).all()
 
-    # Lookup slug → label_ru: Category.{site}_slug → Category.label_ru
-    # Slug-format на каждом сайте свой, но Category-таблица их связывает.
+    locale = _normalize_locale(locale)
+
+    # Lookup slug → localized label. Slug-format на каждом сайте свой, но
+    # Category-таблица связывает их и хранит RU/AZ display labels.
     slug_col = {
         "pharmonline": storage.Category.pharmonline_slug,
         "aptekonline": storage.Category.aptekonline_slug,
         "aloe": storage.Category.aloe_slug,
     }[site]
     label_rows = db.execute(
-        select(slug_col, storage.Category.label_ru).where(slug_col.is_not(None))
+        select(
+            slug_col,
+            storage.Category.id,
+            storage.Category.key,
+            storage.Category.label_ru,
+            storage.Category.label_az,
+            storage.Category.is_active,
+        ).where(slug_col.is_not(None))
     ).all()
-    slug_to_label = {s: lbl for s, lbl in label_rows if s and lbl}
+    preferred_labels: dict[str, tuple[tuple[bool, bool, int], str]] = {}
+    for slug, category_id, key, label_ru, label_az, is_active in label_rows:
+        if not slug:
+            continue
+        priority = _category_label_priority(
+            site=site,
+            slug=slug,
+            key=key,
+            is_active=is_active,
+            category_id=category_id,
+        )
+        label = _localized_category_label(
+            label_ru=label_ru,
+            label_az=label_az,
+            locale=locale,
+            fallback=slug,
+        )
+        current = preferred_labels.get(slug)
+        if current is None or priority > current[0]:
+            preferred_labels[slug] = (priority, label)
+    slug_to_label = {slug: value[1] for slug, value in preferred_labels.items()}
 
     def _filter_internal(name: str) -> bool:
         """Скрыть технические category-маркеры из UI (e.g. product_field=bestseller)."""
@@ -3057,6 +3153,13 @@ class _MapCategoryPayload(BaseModel):
     site_b: str
     site_b_slug: str
     label_ru: str | None = None
+    label_az: str | None = None
+
+    @field_validator("label_ru", "label_az")
+    @classmethod
+    def strip_optional_category_label(cls, value: str | None) -> str | None:
+        value = value.strip() if value else ""
+        return value or None
 
 
 @app.post("/api/v1/dash/categories/mapping", status_code=201)
@@ -3094,6 +3197,12 @@ def dash_category_mapping_create(
                 f"{getattr(existing, f'{payload.site_b}_slug')}",
             )
         setattr(existing, f"{payload.site_b}_slug", payload.site_b_slug)
+        if not (existing.label_az or "").strip():
+            existing.label_az = payload.label_az or _humanize_category_slug(
+                payload.site_a_slug
+                if not payload.site_a_slug.isdigit()
+                else payload.site_b_slug
+            )
         db.commit()
         return {"id": existing.id, "action": "extended", "key": existing.key}
 
@@ -3110,6 +3219,12 @@ def dash_category_mapping_create(
                 f"{getattr(existing_b, f'{payload.site_a}_slug')}",
             )
         setattr(existing_b, f"{payload.site_a}_slug", payload.site_a_slug)
+        if not (existing_b.label_az or "").strip():
+            existing_b.label_az = payload.label_az or _humanize_category_slug(
+                payload.site_b_slug
+                if not payload.site_b_slug.isdigit()
+                else payload.site_a_slug
+            )
         db.commit()
         return {"id": existing_b.id, "action": "extended", "key": existing_b.key}
 
@@ -3121,11 +3236,14 @@ def dash_category_mapping_create(
         key = f"{base_key}_{seq}"
         seq += 1
 
-    label = payload.label_ru or payload.site_a_slug.replace("-", " ").title()
+    label = payload.label_ru or _humanize_category_slug(payload.site_a_slug)
+    label_az = payload.label_az or _humanize_category_slug(
+        payload.site_a_slug if not payload.site_a_slug.isdigit() else payload.site_b_slug
+    )
     cat = storage.Category(
         key=key,
         label_ru=label,
-        label_az=None,
+        label_az=label_az,
         pharmonline_slug=payload.site_a_slug
         if payload.site_a == "pharmonline"
         else (payload.site_b_slug if payload.site_b == "pharmonline" else None),

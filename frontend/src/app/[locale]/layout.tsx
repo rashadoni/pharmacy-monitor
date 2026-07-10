@@ -14,8 +14,25 @@
 import { NextIntlClientProvider } from "next-intl";
 import { getMessages, setRequestLocale } from "next-intl/server";
 import { notFound } from "next/navigation";
+import type { Metadata, Viewport } from "next";
 import { Providers } from "@/components/providers";
 import { locales, type Locale } from "@/i18n/config";
+import "../globals.css";
+
+export const metadata: Metadata = {
+  title: "Pharmacy Monitor",
+  description: "Daily competitive monitoring for AZ pharmacies",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 5,
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
+  ],
+};
 
 export function generateStaticParams() {
   return locales.map((locale) => ({ locale }));
@@ -47,8 +64,12 @@ export default async function LocaleLayout({
   const messages = await getMessages();
 
   return (
-    <NextIntlClientProvider locale={locale} messages={messages}>
-      <Providers>{children}</Providers>
-    </NextIntlClientProvider>
+    <html lang={locale} suppressHydrationWarning>
+      <body className="min-h-screen antialiased">
+        <NextIntlClientProvider locale={locale} messages={messages}>
+          <Providers>{children}</Providers>
+        </NextIntlClientProvider>
+      </body>
+    </html>
   );
 }

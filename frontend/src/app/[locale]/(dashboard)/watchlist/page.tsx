@@ -2,8 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BarChart3, ListTree, Plus, Search, Sparkles, Trash2, X } from "lucide-react";
-import { useTranslations } from "next-intl";
-import { useLocale } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useMemo, useState } from "react";
 import {
   api,
@@ -14,6 +13,7 @@ import {
   type WatchlistLink,
 } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
+import { categoryDisplayLabel } from "@/lib/category-label";
 
 // Phase 5.2/UX audit (2026-05-28):
 //  - Заменён raw fetch() → api.watchlist* (корректный X-Request-ID для Sentry).
@@ -261,7 +261,7 @@ function CategoryRow({
   const tCommon = useTranslations("common");
   const locale = useLocale();
   const [armed, setArmed] = useState(false);
-  const label = locale === "az" && item.label_az ? item.label_az : item.label_ru;
+  const label = categoryDisplayLabel(item, locale, item.key);
   const hasComparisonRows = item.comparison_count > 0;
   const categoryComparisonHref = `/${locale}/category-comparison?category=${encodeURIComponent(item.pharmonline_slug ?? "")}`;
   const categoryProductsHref = buildCategoryProductsHref(item, label, locale);
@@ -330,6 +330,7 @@ function CategoryRow({
               key={site}
               href={href}
               data-testid={`watchlist-category-attach-${site}-${item.id}`}
+              title={t("category_add_site_matches_hint", { site, count })}
               className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border border-primary/30 text-primary hover:bg-primary/10"
             >
               <Sparkles className="h-3 w-3" />
@@ -453,7 +454,7 @@ function AddCategoryForm() {
         <option value="">{t("category_select")}</option>
         {activeCategories.map((cat) => (
           <option key={cat.id} value={cat.id}>
-            {locale === "az" && cat.label_az ? cat.label_az : cat.label_ru}
+            {categoryDisplayLabel(cat, locale, cat.key)}
           </option>
         ))}
       </select>

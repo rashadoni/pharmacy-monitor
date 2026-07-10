@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
 import { CheckCircle2, ExternalLink, XCircle, AlertTriangle } from "lucide-react";
 
@@ -21,6 +21,7 @@ import { formatPrice } from "@/lib/utils";
  */
 export default function MatchesReviewPage() {
   const t = useTranslations("matches_review");
+  const locale = useLocale();
   const qc = useQueryClient();
   const [confidenceMax, setConfidenceMax] = useState(0.85);
   const [onlyNeedsReview, setOnlyNeedsReview] = useState(false);
@@ -88,7 +89,7 @@ export default function MatchesReviewPage() {
         <p className="text-sm text-muted-foreground">{t("loading")}</p>
       )}
       {q.error && (
-        <p className="text-sm text-destructive">{friendlyError(q.error)}</p>
+        <p className="text-sm text-destructive">{friendlyError(q.error, locale)}</p>
       )}
       {q.data && q.data.length === 0 && !q.isLoading && (
         <div className="rounded-lg border border-border bg-card p-8 text-center">
@@ -132,6 +133,7 @@ function MatchCard({
   disabled: boolean;
 }) {
   const t = useTranslations("matches_review");
+  const locale = useLocale();
   const confPct = Math.round(match.confidence * 100);
   // Confidence color: red < 60, yellow 60-79, green ≥ 80
   const confClass =
@@ -213,10 +215,13 @@ function MatchCard({
             </p>
             <div className="flex items-center justify-between mt-2">
               <span className="font-mono font-semibold text-base">
-                {p.price != null ? formatPrice(p.price) : "—"}
+                {p.price != null ? formatPrice(p.price, locale) : "—"}
               </span>
               {p.barcode && (
-                <span className="font-mono text-[10px] text-muted-foreground" title="Barcode">
+                <span
+                  className="font-mono text-[10px] text-muted-foreground"
+                  title={t("barcode_title")}
+                >
                   {p.barcode}
                 </span>
               )}

@@ -3,9 +3,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Lightbulb, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { api, friendlyError, type CategoryRow, type CategorySuggestion } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
+import { formatNumber, formatTime } from "@/lib/utils";
 
 /**
  * Извлечь slug категории из URL для каждого сайта.
@@ -261,6 +262,7 @@ export default function CategoriesPage() {
 
 function SuggestionsPanel() {
   const t = useTranslations("categories");
+  const locale = useLocale();
   const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
   type Site = (typeof SITES)[number];
   const [siteA, setSiteA] = useState<Site>("pharmonline");
@@ -285,7 +287,7 @@ function SuggestionsPanel() {
       queryClient.invalidateQueries({ queryKey: ["category-suggestions"] });
       queryClient.invalidateQueries({ queryKey: ["categories"] });
     },
-    onError: (e) => alert(friendlyError(e)),
+    onError: (e) => alert(friendlyError(e, locale)),
   });
 
   const notMapped = (data ?? []).filter((s) => !s.already_mapped);
@@ -295,21 +297,12 @@ function SuggestionsPanel() {
     <div className="space-y-4">
       <OnboardingTip
         id="categories-suggestions-v1"
-        title="Категория-мапер по brand-overlap"
-        description={
-          <>
-            Cross-3 категорий = 1 — это узкое горлышко покрытия. Тут видны
-            пары категорий из 2 сайтов где много общих брендов — они скорее
-            всего одна категория. Связал → у матчера появляется shared
-            контекст → больше cross-site matches. Цель: довести Cross-3 до 30+.
-          </>
-        }
+        title={t("suggestions_tip_title")}
+        description={t("suggestions_tip_desc")}
       />
       <div className="rounded-md bg-muted/30 border border-border p-3 text-xs text-muted-foreground">
         <Lightbulb className="inline h-3.5 w-3.5 mr-1 -mt-0.5" />
-        Подсказки на основе <strong>shared brands</strong> между категориями двух сайтов.
-        Если у двух slug&apos;ов одни и те же 5+ брендов — это, скорее всего, одна категория.
-        Клик «Связать» создаёт Category row (или дополняет существующий, если slug одного из сайтов уже там).
+        {t("suggestions_explainer")}
       </div>
 
       <div className="flex flex-col sm:flex-row sm:items-center gap-3">
@@ -332,7 +325,7 @@ function SuggestionsPanel() {
       {isLoading && <div className="text-sm text-muted-foreground py-4">{t("searching_overlaps")}</div>}
       {error && (
         <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive">
-          {friendlyError(error)}
+          {friendlyError(error, locale)}
         </div>
       )}
       {!isLoading && data && notMapped.length === 0 && mapped.length === 0 && (
@@ -475,6 +468,7 @@ function SiteSelector({
 
 function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
   const t = useTranslations("categories");
+  const locale = useLocale();
   const queryClient = useQueryClient();
   const requestsQ = useQuery({
     queryKey: ["scrape-requests"],
@@ -493,7 +487,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
           : { mode: "all" }
       ),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["scrape-requests"] }),
-    onError: (e: Error) => alert(e.message),
+    onError: (e: Error) => alert(friendlyError(e, locale)),
   });
 
   // Активный = running ИЛИ pending. Может быть несколько (до 5 в очереди).
@@ -535,8 +529,8 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
         className="inline-flex items-center gap-1 rounded border border-border bg-background px-2 py-1 text-xs font-medium hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
         title={
           blockedByAll
-            ? `Идёт полное сканирование #${activeAll.id} — оно уже включает эту категорию`
-            : "Запустить сканирование только этой категории"
+            ? t("scan_category_blocked_title", { id: activeAll.id })
+            : t("scan_category_title")
         }
       >
         <Play className="h-3 w-3" />
@@ -563,7 +557,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
         onClick={() => triggerMut.mutate()}
         disabled={triggerMut.isPending}
         className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium hover:bg-secondary disabled:opacity-50"
-        title="Запустить scan всех активных категорий"
+        title={t("scan_all_title")}
       >
         <Play className="h-4 w-4" />
         {triggerMut.isPending ? t("sending") : t("scan_all_btn")}
@@ -577,9 +571,13 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
 
 function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow }) {
   const t = useTranslations("categories");
+  const locale = useLocale();
   if (req.status === "failed") {
     return (
-      <div className="text-xs text-destructive max-w-[280px] truncate" title={req.error_message ?? "Без сообщения об ошибке"}>
+      <div
+        className="text-xs text-destructive max-w-[280px] truncate"
+        title={req.error_message ?? t("error_without_message")}
+      >
         {t("scan_failed_msg", { id: req.id, error: req.error_message ?? "—" })}
       </div>
     );
@@ -589,11 +587,17 @@ function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow 
   const perSite = req.products_per_site ?? {};
   const siteParts = Object.entries(perSite)
     .filter(([, n]) => n > 0)
-    .map(([site, n]) => `${site}: ${n}`)
+    .map(([site, n]) => `${site}: ${formatNumber(n, locale)}`)
     .join(", ");
   return (
-    <div className="text-xs text-success" title={`run_id=${req.run_id}, завершено ${req.completed_at}`}>
-      {t("scan_done_msg", { id: req.id, total: total.toLocaleString("ru-RU") })}
+    <div
+      className="text-xs text-success"
+      title={t("completed_title", {
+        id: req.run_id ?? "—",
+        date: formatTime(req.completed_at, locale),
+      })}
+    >
+      {t("scan_done_msg", { id: req.id, total: formatNumber(total, locale) })}
       {siteParts && <span className="text-muted-foreground"> ({siteParts})</span>}
     </div>
   );
@@ -687,7 +691,7 @@ function CategoryRowDesktop({
             }}
             disabled={remove.isPending}
             className="text-muted-foreground hover:text-destructive disabled:opacity-50"
-            title="Удалить"
+            title={t("delete_tooltip")}
           >
             <Trash2 className="h-4 w-4" />
           </button>
@@ -719,6 +723,7 @@ function CategoryForm({
 }) {
   const t = useTranslations("categories");
   const tCommon = useTranslations("common");
+  const locale = useLocale();
   const queryClient = useQueryClient();
   const isEdit = Boolean(editing);
   const [form, setForm] = useState({
@@ -744,7 +749,7 @@ function CategoryForm({
       const payload = {
         key,
         label_ru: form.label_ru,
-        label_az: form.label_az || null,
+        label_az: form.label_az.trim(),
         pharmonline_slug: phmSlug || null,
         aptekonline_slug: aptSlug || null,
         aloe_slug: aloeSlug || null,
@@ -752,17 +757,19 @@ function CategoryForm({
       };
       return isEdit
         ? api.categoryUpdate(editing!.id, payload).then(() => payload)
-        : api.categoryCreate(payload);
+        : api.categoryCreate(payload).then(() => payload);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["categories"] });
       onClose();
     },
-    onError: (e: any) => setError(e?.message || t("form_save_error")),
+    onError: (e: unknown) => setError(friendlyError(e, locale) || t("form_save_error")),
   });
 
   const canSubmit =
-    form.label_ru.trim().length > 0 && (phmSlug || aptSlug || aloeSlug);
+    form.label_ru.trim().length > 0 &&
+    form.label_az.trim().length > 0 &&
+    (phmSlug || aptSlug || aloeSlug);
 
   return (
     <div className="rounded-lg border border-border bg-card p-4 space-y-3">
@@ -770,7 +777,11 @@ function CategoryForm({
         <h3 className="font-semibold">
           {isEdit ? t("form_edit_title", { id: editing!.id }) : t("form_new_title")}
         </h3>
-        <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
+        <button
+          onClick={onClose}
+          className="rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label={tCommon("close")}
+        >
           <X className="h-4 w-4" />
         </button>
       </div>
@@ -788,6 +799,7 @@ function CategoryForm({
         />
         <Field
           label={t("form_name_az")}
+          required
           value={form.label_az}
           onChange={(v) => setForm({ ...form, label_az: v })}
           placeholder="Vitaminlər"

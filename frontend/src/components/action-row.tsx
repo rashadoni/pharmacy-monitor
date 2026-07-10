@@ -1,7 +1,12 @@
+"use client";
+
+import { useLocale, useTranslations } from "next-intl";
 import type { RoiAction } from "@/lib/api";
 import { formatPrice } from "@/lib/utils";
 
 export function ActionRow({ action }: { action: RoiAction }) {
+  const t = useTranslations("overview");
+  const locale = useLocale();
   const tone =
     action.severity === "critical"
       ? "border-destructive/40 bg-destructive/5"
@@ -25,13 +30,13 @@ export function ActionRow({ action }: { action: RoiAction }) {
               className={`text-sm font-semibold tabular-nums ${
                 gapPositive ? "text-success" : "text-destructive"
               }`}
-              title="Разница цены за единицу товара — реально проверяемая величина"
+              title={t("unit_gap_hint")}
             >
               {gapPositive ? "+" : ""}
-              {formatPrice(action.unit_gap_azn ?? 0)} ₼/ед
+              {formatPrice(action.unit_gap_azn ?? 0, locale)} {t("unit_gap_label")}
             </div>
             <div className="text-[11px] text-muted-foreground tabular-nums">
-              {(action.spread_pct ?? 0).toFixed(1)}% спред
+              {(action.spread_pct ?? 0).toFixed(1)}{t("spread_label")}
             </div>
           </div>
         )}

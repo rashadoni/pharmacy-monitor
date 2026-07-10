@@ -15,7 +15,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
 import {
   Building2,
@@ -54,6 +54,7 @@ export function CreateFromScratch({
   categoryLabel?: string;
 }) {
   const t = useTranslations("matcher");
+  const locale = useLocale();
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<Selected>({});
   const [success, setSuccess] = useState<number | null>(null);
@@ -70,7 +71,7 @@ export function CreateFromScratch({
       setSuccess(null);
     },
     onError: (err: unknown) => {
-      setError(friendlyError(err));
+      setError(friendlyError(err, locale));
     },
     onSuccess: (data) => {
       setSuccess(data.match_id);
@@ -164,7 +165,7 @@ export function CreateFromScratch({
                     <Icon className="h-3 w-3 text-muted-foreground shrink-0" />
                     <span className="truncate max-w-[200px]">{p.name}</span>
                     <span className="text-muted-foreground tabular-nums">
-                      {formatPrice(p.effective_price)}
+                      {formatPrice(p.effective_price, locale)}
                     </span>
                     <button
                       onClick={() => handleRemove(s)}
@@ -224,6 +225,7 @@ function SiteSearchPanel({
   onAdd: (product: SiteProduct) => void;
 }) {
   const t = useTranslations("matcher");
+  const locale = useLocale();
   const Icon = SITE_ICON[site];
   const [search, setSearch] = useState("");
   const debounced = useDebounce(search, 300);
@@ -325,7 +327,7 @@ function SiteSearchPanel({
                   </div>
                   <div className="text-right shrink-0 flex flex-col items-end gap-1">
                     <div className="text-xs font-medium tabular-nums">
-                      {formatPrice(p.effective_price)}
+                      {formatPrice(p.effective_price, locale)}
                     </div>
                     <button
                       onClick={() => onAdd(p)}

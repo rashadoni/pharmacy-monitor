@@ -83,7 +83,68 @@ export class ApiError extends Error {
  * Преобразовать ApiError / Error в человекочитаемое сообщение для UI.
  * Анализирует Pydantic 422 (validation), 401/403/404/409 и timeout 408.
  */
-export function friendlyError(err: unknown): string {
+type UiLocale = "ru" | "az" | "en";
+
+const ERROR_COPY: Record<
+  UiLocale,
+  {
+    field: string;
+    login: string;
+    forbidden: string;
+    notFound: string;
+    timeout: string;
+    network: string;
+    server: string;
+    conflict: string;
+    error: string;
+    unknown: string;
+  }
+> = {
+  ru: {
+    field: "поле",
+    login: "Нужно войти заново",
+    forbidden: "Нет прав доступа (только администраторы)",
+    notFound: "Не найдено",
+    timeout: "Сервер не ответил вовремя. Попробуйте ещё раз.",
+    network: "Сеть недоступна. Проверьте подключение.",
+    server: "Сервер недоступен. Попробуйте через минуту.",
+    conflict: "Конфликт данных. Обновите страницу и проверьте изменения.",
+    error: "Ошибка",
+    unknown: "Неизвестная ошибка",
+  },
+  az: {
+    field: "sahə",
+    login: "Yenidən daxil olun",
+    forbidden: "Giriş icazəsi yoxdur (yalnız administratorlar)",
+    notFound: "Tapılmadı",
+    timeout: "Server vaxtında cavab vermədi. Yenidən cəhd edin.",
+    network: "Şəbəkə əlçatan deyil. Bağlantını yoxlayın.",
+    server: "Server əlçatan deyil. Bir dəqiqə sonra cəhd edin.",
+    conflict: "Məlumat ziddiyyəti var. Səhifəni yeniləyib dəyişiklikləri yoxlayın.",
+    error: "Xəta",
+    unknown: "Naməlum xəta",
+  },
+  en: {
+    field: "field",
+    login: "Please sign in again",
+    forbidden: "Access denied (administrators only)",
+    notFound: "Not found",
+    timeout: "The server did not respond in time. Try again.",
+    network: "The network is unavailable. Check your connection.",
+    server: "The server is unavailable. Try again in a minute.",
+    conflict: "Data conflict. Refresh the page and review your changes.",
+    error: "Error",
+    unknown: "Unknown error",
+  },
+};
+
+function normalizeUiLocale(locale: string): UiLocale {
+  return locale === "az" || locale === "en" ? locale : "ru";
+}
+
+export function friendlyError(err: unknown, locale = "ru"): string {
+  const normalizedLocale = normalizeUiLocale(locale);
+  const copy = ERROR_COPY[normalizedLocale];
   if (err instanceof ApiError) {
     // Pydantic 422 detail обычно JSON: [{loc, msg, type}, ...]
     if (err.status === 422 && err.detail.startsWith("{")) {
@@ -92,19 +153,21 @@ export function friendlyError(err: unknown): string {
         if (Array.isArray(data?.detail)) {
           const first = data.detail[0];
           if (first?.msg) {
-            const field = first.loc?.slice(-1)?.[0] ?? "поле";
-            return `${field}: ${translatePydantic(first.msg)}`;
+            const field = first.loc?.slice(-1)?.[0] ?? copy.field;
+            return `${field}: ${translatePydantic(first.msg, normalizedLocale)}`;
           }
         }
       } catch {
         /* fall through */
       }
     }
-    if (err.status === 401) return "Нужно войти заново";
-    if (err.status === 403) return "Нет прав доступа (только админы)";
-    if (err.status === 404) return "Не найдено";
-    if (err.status === 408) return err.detail;
+    if (err.status === 0) return copy.network;
+    if (err.status === 401) return copy.login;
+    if (err.status === 403) return copy.forbidden;
+    if (err.status === 404) return copy.notFound;
+    if (err.status === 408) return copy.timeout;
     if (err.status === 409) {
+      if (normalizedLocale !== "ru") return copy.conflict;
       // 409 detail обычно уже на русском от backend
       try {
         const d = JSON.parse(err.detail);
@@ -113,11 +176,14 @@ export function friendlyError(err: unknown): string {
         return err.detail;
       }
     }
-    if (err.status >= 500) return "Сервер недоступен. Попробуйте через минуту.";
-    return err.detail || `Ошибка ${err.status}`;
+    if (err.status >= 500) return copy.server;
+    if (err.status >= 400 && normalizedLocale !== "ru") {
+      return `${copy.error} ${err.status}`;
+    }
+    return err.detail || `${copy.error} ${err.status}`;
   }
   if (err instanceof Error) return err.message;
-  return "Неизвестная ошибка";
+  return copy.unknown;
 }
 
 /**
@@ -134,14 +200,28 @@ export function getRequestId(err: unknown): string | null {
   return null;
 }
 
-function translatePydantic(msg: string): string {
-  const map: Record<string, string> = {
-    "Field required": "обязательное поле",
-    "Input should be a valid email address": "введите корректный email",
-    "String should have at least 3 characters": "минимум 3 символа",
-    "value is not a valid integer": "должно быть числом",
+function translatePydantic(msg: string, locale: UiLocale): string {
+  const map: Record<UiLocale, Record<string, string>> = {
+    ru: {
+      "Field required": "обязательное поле",
+      "Input should be a valid email address": "введите корректный email",
+      "String should have at least 3 characters": "минимум 3 символа",
+      "value is not a valid integer": "должно быть числом",
+    },
+    az: {
+      "Field required": "məcburi sahə",
+      "Input should be a valid email address": "düzgün e-poçt ünvanı daxil edin",
+      "String should have at least 3 characters": "ən azı 3 simvol olmalıdır",
+      "value is not a valid integer": "tam ədəd olmalıdır",
+    },
+    en: {
+      "Field required": "required field",
+      "Input should be a valid email address": "enter a valid email address",
+      "String should have at least 3 characters": "must contain at least 3 characters",
+      "value is not a valid integer": "must be an integer",
+    },
   };
-  return map[msg] ?? msg;
+  return map[locale][msg] ?? msg;
 }
 
 // ─── Types matching FastAPI Pydantic schemas ───────────────────────────────
@@ -808,8 +888,10 @@ export const api = {
     if (params.offset != null) q.set("offset", String(params.offset));
     return request<SiteProductsPage>(`/api/v1/dash/products?${q}`);
   },
-  siteProductsFacets: (site: string) =>
-    request<SiteFacets>(`/api/v1/dash/products/facets?site=${encodeURIComponent(site)}`),
+  siteProductsFacets: (site: string, locale = "ru") => {
+    const q = new URLSearchParams({ site, locale });
+    return request<SiteFacets>(`/api/v1/dash/products/facets?${q}`);
+  },
   siteProductsSummary: (site: string) =>
     request<SiteSummary>(`/api/v1/dash/products/summary?site=${encodeURIComponent(site)}`),
   runs: (limit = 30) => request<RunRow[]>(`/api/v1/dash/runs?limit=${limit}`),
@@ -848,6 +930,7 @@ export const api = {
     site_b: string;
     site_b_slug: string;
     label_ru?: string | null;
+    label_az?: string | null;
   }) =>
     request<{ id: number; action: "created" | "extended"; key: string }>(
       "/api/v1/dash/categories/mapping",

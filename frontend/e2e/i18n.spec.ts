@@ -22,6 +22,8 @@ test.describe("Locale prefix routing", () => {
       // Body should contain auth-related content
       const body = await response.text();
       expect(body.length).toBeGreaterThan(500);  // not an empty error page
+      await page.goto(`/${locale}/login`);
+      await expect(page.locator("html")).toHaveAttribute("lang", locale);
     });
 
     test(`/${locale}/comparison hits auth gate (307 to login)`, async ({ request }) => {

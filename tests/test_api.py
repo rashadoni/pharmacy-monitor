@@ -916,9 +916,17 @@ def test_legacy_push_prices_with_key(client):
 def test_dash_categories_create_requires_auth(client):
     r = client.post(
         "/api/v1/dash/categories",
-        json={"key": "test", "label_ru": "Test"},
+        json={"key": "test", "label_ru": "Test", "label_az": "Test AZ"},
     )
     assert r.status_code == 401
+
+
+def test_dash_categories_require_nonblank_az_label(client, auth_cookie):
+    r = client.post(
+        "/api/v1/dash/categories",
+        json={"key": "blank-az", "label_ru": "Русское имя", "label_az": "   "},
+    )
+    assert r.status_code == 422
 
 
 def test_dash_watchlist_categories_crud(client, auth_cookie, setup_db):
@@ -1285,6 +1293,95 @@ def test_matcher_ignores_fully_dead_clusters(client, auth_cookie, setup_db):
     facets = client.get("/api/v1/dash/products/facets?site=pharmonline")
     assert facets.status_code == 200, facets.text
     assert "supplies" not in {row["name"] for row in facets.json()["categories"]}
+
+
+def test_product_facets_localize_category_labels_and_fallback(
+    client,
+    auth_cookie,
+    setup_db,
+):
+    setup_db.add_all(
+        [
+            storage.Category(
+                key="localized-vit",
+                label_ru="Витамины",
+                label_az="Vitaminlər",
+                pharmonline_slug="localized-vit",
+                is_active=True,
+            ),
+            storage.Category(
+                key="localized-fallback",
+                label_ru="Без перевода",
+                label_az=None,
+                pharmonline_slug="localized-fallback",
+                is_active=True,
+            ),
+            storage.Category(
+                key="cross-site-duplicate",
+                label_ru="Широкая категория",
+                label_az="Geniş kateqoriya",
+                pharmonline_slug="localized-duplicate",
+                aptekonline_slug="shared-duplicate",
+                is_active=True,
+            ),
+            storage.Category(
+                key="pharma_localized-duplicate",
+                label_ru="Точная категория",
+                label_az="Dəqiq kateqoriya",
+                pharmonline_slug="localized-duplicate",
+                is_active=True,
+            ),
+            storage.Product(
+                tenant_id=1,
+                site="pharmonline",
+                external_id="localized-vit-1",
+                url="https://pharmonline.example/localized-vit-1",
+                name="Localized vitamin",
+                name_normalized="localized vitamin",
+                category="localized-vit",
+            ),
+            storage.Product(
+                tenant_id=1,
+                site="pharmonline",
+                external_id="localized-fallback-1",
+                url="https://pharmonline.example/localized-fallback-1",
+                name="Localized fallback",
+                name_normalized="localized fallback",
+                category="localized-fallback",
+            ),
+            storage.Product(
+                tenant_id=1,
+                site="pharmonline",
+                external_id="localized-duplicate-1",
+                url="https://pharmonline.example/localized-duplicate-1",
+                name="Localized duplicate",
+                name_normalized="localized duplicate",
+                category="localized-duplicate",
+            ),
+        ]
+    )
+    setup_db.commit()
+
+    az_response = client.get("/api/v1/dash/products/facets?site=pharmonline&locale=az")
+    assert az_response.status_code == 200, az_response.text
+    az_labels = {row["name"]: row["label"] for row in az_response.json()["categories"]}
+    assert az_labels["localized-vit"] == "Vitaminlər"
+    assert az_labels["localized-fallback"] == "Localized fallback"
+    assert az_labels["localized-duplicate"] == "Dəqiq kateqoriya"
+
+    ru_response = client.get("/api/v1/dash/products/facets?site=pharmonline&locale=ru")
+    assert ru_response.status_code == 200, ru_response.text
+    ru_labels = {row["name"]: row["label"] for row in ru_response.json()["categories"]}
+    assert ru_labels["localized-vit"] == "Витамины"
+
+    invalid_response = client.get(
+        "/api/v1/dash/products/facets?site=pharmonline&locale=unexpected"
+    )
+    assert invalid_response.status_code == 200, invalid_response.text
+    invalid_labels = {
+        row["name"]: row["label"] for row in invalid_response.json()["categories"]
+    }
+    assert invalid_labels["localized-vit"] == "Витамины"
 
 
 def test_unmatched_pairs_category_paginates_and_filters_tenant_anchors(
@@ -2009,6 +2106,45 @@ def test_match_relink_requires_auth(client, setup_db):
 def test_category_comparison_without_cookie_401(client):
     r = client.get("/api/v1/dash/category-comparison")
     assert r.status_code == 401
+
+
+def test_mapping_create_keeps_az_category_views_free_of_russian(
+    client,
+    auth_cookie,
+    setup_db,
+):
+    created = client.post(
+        "/api/v1/dash/categories/mapping",
+        json={
+            "site_a": "pharmonline",
+            "site_a_slug": "vitamin-kompleksi",
+            "site_b": "aloe",
+            "site_b_slug": "vitaminler",
+            "label_ru": "Витаминный комплекс",
+        },
+    )
+    assert created.status_code == 201, created.text
+    cat = setup_db.get(storage.Category, created.json()["id"])
+    assert cat is not None
+    assert cat.label_az == "Vitamin kompleksi"
+
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    setup_db.add(run)
+    setup_db.flush()
+    _make_match_with_prices(
+        setup_db,
+        run,
+        canonical="vitamin-mapped",
+        prices={"pharmonline": 10.0, "aloe": 9.0},
+        category="vitamin-kompleksi",
+    )
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/category-comparison?locale=az")
+    assert response.status_code == 200, response.text
+    rows = {row["category"]: row for row in response.json()}
+    assert rows["vitamin-kompleksi"]["label"] == "Vitamin kompleksi"
+    assert "Витаминный" not in rows["vitamin-kompleksi"]["label"]
 
 
 def test_category_comparison_groups_and_indexes(client, tenant_user, setup_db):

@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useMemo, useState, useEffect } from "react";
 import {
   Building2,
@@ -224,6 +224,7 @@ function AttachMode({
   setCategory: (c: string) => void;
 }) {
   const t = useTranslations("matcher");
+  const locale = useLocale();
   const [offset, setOffset] = useState(0);
   // Skipped per-site чтобы переключение сайта не показывало чужие пропущенные
   const [skippedBySite, setSkippedBySite] = useState<Record<Site, Set<number>>>(
@@ -240,8 +241,8 @@ function AttachMode({
   const facetsSite = site === "pharmonline" ? "aloe" : "pharmonline";
 
   const facetsQ = useQuery({
-    queryKey: ["matcher", "categories", facetsSite],
-    queryFn: () => api.siteProductsFacets(facetsSite),
+    queryKey: ["matcher", "categories", facetsSite, locale],
+    queryFn: () => api.siteProductsFacets(facetsSite, locale),
   });
 
   const unmatchedQ = useQuery({
@@ -325,6 +326,7 @@ function AttachMode({
       <div className="flex items-end justify-between gap-3 flex-wrap">
         <div className="flex flex-col sm:flex-row sm:flex-wrap gap-2 flex-1">
           <select
+            data-testid="matcher-category-filter"
             value={category}
             onChange={(e) => setCategory(e.target.value)}
             className="rounded-md border border-input bg-background px-3 py-2 text-sm md:w-72"
@@ -428,6 +430,7 @@ function PairCard({
   onSkip: (matchId: number) => void;
 }) {
   const t = useTranslations("matcher");
+  const locale = useLocale();
   const queryClient = useQueryClient();
   // Поиск стартует ПУСТЫМ: по умолчанию показываем авто-подсказки, поиск их
   // ЗАМЕНЯЕТ (а не дублирует). 2-3 первых слова имени — fallback-термин.
@@ -485,7 +488,7 @@ function PairCard({
     },
     onError: (err: unknown) => {
       setLinkedProductId(null);
-      setLinkError(friendlyError(err));
+      setLinkError(friendlyError(err, locale));
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["matcher", "unmatched"] });
@@ -652,6 +655,7 @@ function PairCard({
 }
 
 function AnchorRow({ anchor }: { anchor: AnchorProduct }) {
+  const locale = useLocale();
   return (
     <div className="rounded-md border border-border bg-background/50 p-2">
       <div className="flex items-start justify-between gap-2">
@@ -679,7 +683,7 @@ function AnchorRow({ anchor }: { anchor: AnchorProduct }) {
           </div>
         </div>
         <div className="text-right shrink-0 text-sm font-medium tabular-nums">
-          {formatPrice(anchor.price)}
+          {formatPrice(anchor.price, locale)}
         </div>
       </div>
     </div>
@@ -698,6 +702,7 @@ function CandidateRow({
   onLink: () => void;
 }) {
   const t = useTranslations("matcher");
+  const locale = useLocale();
   return (
     <li className="rounded-md border border-border bg-background/50 p-2">
       <div className="flex items-start justify-between gap-2">
@@ -724,7 +729,7 @@ function CandidateRow({
         </div>
         <div className="text-right shrink-0 flex flex-col items-end gap-1">
           <div className="text-sm font-medium tabular-nums">
-            {formatPrice(product.effective_price)}
+            {formatPrice(product.effective_price, locale)}
           </div>
           <button
             onClick={onLink}
@@ -755,6 +760,7 @@ function SuggestionRow({
   onLink: () => void;
 }) {
   const t = useTranslations("matcher");
+  const locale = useLocale();
   return (
     <li
       className={`rounded-md border p-2 ${
@@ -792,7 +798,7 @@ function SuggestionRow({
         </div>
         <div className="text-right shrink-0 flex flex-col items-end gap-1">
           <div className="text-sm font-medium tabular-nums">
-            {formatPrice(cand.price)}
+            {formatPrice(cand.price, locale)}
           </div>
           <button
             onClick={onLink}

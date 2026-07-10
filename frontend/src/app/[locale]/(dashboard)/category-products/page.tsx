@@ -3,7 +3,7 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { ExternalLink } from "lucide-react";
 import { useSearchParams } from "next/navigation";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { api, type SiteProduct } from "@/lib/api";
 import { formatPrice } from "@/lib/utils";
 
@@ -143,6 +143,7 @@ function SiteSection({
   loadingText: string;
 }) {
   const t = useTranslations("category_products");
+  const locale = useLocale();
   const shown = products.length;
 
   return (
@@ -197,7 +198,7 @@ function SiteSection({
                     {product.brand ?? "—"}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">
-                    {formatPrice(product.effective_price ?? product.price)}
+                    {formatPrice(product.effective_price ?? product.price, locale)}
                   </td>
                   <td className="px-3 py-2">
                     <a

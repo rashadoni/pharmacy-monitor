@@ -1,12 +1,13 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
 import { useState, useEffect, useRef } from "react";
 import { Save, Upload, CheckCircle2, AlertCircle, ArrowLeft } from "lucide-react";
 
 import { api, friendlyError, type PricingConfig, type CostImportResult } from "@/lib/api";
+import { formatClock } from "@/lib/utils";
 
 /**
  * Phase 4.1 + 4.3 + 4.6 — Pricing intelligence settings.
@@ -22,6 +23,7 @@ import { api, friendlyError, type PricingConfig, type CostImportResult } from "@
 export default function PricingSettingsPage() {
   const t = useTranslations("pricing");
   const tCommon = useTranslations("common");
+  const locale = useLocale();
   const qc = useQueryClient();
 
   const cfgQ = useQuery({ queryKey: ["pricing-config"], queryFn: api.pricingGet });
@@ -72,7 +74,9 @@ export default function PricingSettingsPage() {
       </header>
 
       {cfgQ.isLoading && <p className="text-sm text-muted-foreground">{tCommon("loading")}</p>}
-      {cfgQ.error && <p className="text-sm text-destructive">{friendlyError(cfgQ.error)}</p>}
+      {cfgQ.error && (
+        <p className="text-sm text-destructive">{friendlyError(cfgQ.error, locale)}</p>
+      )}
 
       {/* === Thresholds form === */}
       {form && (
@@ -132,11 +136,14 @@ export default function PricingSettingsPage() {
             </button>
             {updateM.isSuccess && (
               <span className="inline-flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
-                <CheckCircle2 className="h-3 w-3" /> {t("saved_at", { time: new Date().toLocaleTimeString() })}
+                <CheckCircle2 className="h-3 w-3" />{" "}
+                {t("saved_at", { time: formatClock(new Date(), locale) })}
               </span>
             )}
             {updateM.error && (
-              <span className="text-xs text-destructive">{friendlyError(updateM.error)}</span>
+              <span className="text-xs text-destructive">
+                {friendlyError(updateM.error, locale)}
+              </span>
             )}
           </div>
         </section>
@@ -171,7 +178,7 @@ PRODUCT-003,Vendor B,3.10,AZN,Diazolin 100mg N10`}
         {importM.error && (
           <p className="text-sm text-destructive flex items-start gap-2">
             <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
-            {friendlyError(importM.error)}
+            {friendlyError(importM.error, locale)}
           </p>
         )}
 

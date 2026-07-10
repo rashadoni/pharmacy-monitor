@@ -12,9 +12,9 @@ import {
   Mail,
   MailOpen,
 } from "lucide-react";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { api, friendlyError, type AlertEvent } from "@/lib/api";
-import { formatRelative } from "@/lib/utils";
+import { formatRelative, formatTime } from "@/lib/utils";
 import { CardListSkeleton } from "@/components/skeleton";
 import { OnboardingTip } from "@/components/onboarding-tip";
 
@@ -43,6 +43,7 @@ type TabView = "inbox" | "snoozed" | "read";
 
 export default function AlertsPage() {
   const t = useTranslations("alerts");
+  const locale = useLocale();
   const queryClient = useQueryClient();
   const [view, setView] = useState<TabView>("inbox");
   const [severityFilter, setSeverityFilter] = useState<string>("");
@@ -115,7 +116,7 @@ export default function AlertsPage() {
       queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
       setSelected(new Set());
     },
-    onError: (e) => alert(friendlyError(e)),
+    onError: (e) => alert(friendlyError(e, locale)),
   });
 
   const bulkMutation = useMutation({
@@ -136,7 +137,7 @@ export default function AlertsPage() {
       queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
       setSelected(new Set());
     },
-    onError: (e) => alert(friendlyError(e)),
+    onError: (e) => alert(friendlyError(e, locale)),
   });
   const patchMutation = useMutation({
     mutationFn: ({
@@ -150,7 +151,7 @@ export default function AlertsPage() {
       queryClient.invalidateQueries({ queryKey: ["alerts"] });
       queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
     },
-    onError: (e) => alert(friendlyError(e)),
+    onError: (e) => alert(friendlyError(e, locale)),
   });
 
   function toggleSel(id: number) {
@@ -173,15 +174,8 @@ export default function AlertsPage() {
     <div className="space-y-4">
       <OnboardingTip
         id="alerts-inbox-v1"
-        title="Inbox-стиль: tab'ы и bulk-actions"
-        description={
-          <>
-            «Inbox» — то что требует внимания. «Прочитано» / «Отложено» —
-            в отдельных tab'ах. Чекбоксы рядом с каждым алертом → выбери
-            несколько и используй sticky toolbar сверху для bulk
-            mark-read / snooze. Per-row тоже есть «✓ Прочитано» / «🕐 7д».
-          </>
-        }
+        title={t("onboarding_title")}
+        description={t("onboarding_desc")}
       />
       <div className="flex items-start justify-between gap-3">
         <div>
@@ -438,6 +432,7 @@ function AlertCard({
   onSnoozeClear: () => void;
 }) {
   const t = useTranslations("alerts");
+  const locale = useLocale();
   const cfg = SEVERITY_CONFIG[event.severity] ?? SEVERITY_CONFIG.info;
   const Icon = cfg.icon;
   const dimmed = event.is_read;
@@ -464,13 +459,15 @@ function AlertCard({
                 new Date(event.snoozed_until).getTime() > Date.now() && (
                   <span
                     className="inline-flex items-center gap-1 rounded bg-muted/50 px-1.5 py-0.5"
-                    title={t("tooltip_snoozed_until", { date: new Date(event.snoozed_until!).toLocaleString() })}
+                    title={t("tooltip_snoozed_until", {
+                      date: formatTime(event.snoozed_until, locale),
+                    })}
                   >
                     <Clock className="h-3 w-3" />
                     {t("snoozed_badge")}
                   </span>
                 )}
-              <span title={event.created_at}>{formatRelative(event.created_at)}</span>
+              <span title={event.created_at}>{formatRelative(event.created_at, locale)}</span>
             </div>
           </div>
           {event.detail && (

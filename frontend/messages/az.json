@@ -29,7 +29,29 @@
     "save_view": "Saxlanılır…",
     "savings_failed": "Saxlamaq alınmadı",
     "yes": "Bəli",
-    "no": "Xeyr"
+    "no": "Xeyr",
+    "hide_tip": "İpucunu gizlət",
+    "hide_tip_forever": "Həmişəlik gizlət",
+    "theme_light": "İşıqlı mövzu",
+    "theme_dark": "Qaranlıq mövzu",
+    "insufficient_trend_data": "Trend üçün məlumat kifayət deyil"
+  },
+  "quick_actions": {
+    "button_title": "Sürətli əməliyyatlar",
+    "button_short": "Sürətli",
+    "scrape_confirm": "İndi hər üç saytın server skanını başladın?",
+    "scrape_title": "Skan başladın",
+    "all_sites": "Hər 3 sayt",
+    "starting": "Başladılır…",
+    "now": "İndi",
+    "scrape_queued": "Skan sorğusu #{id} növbəyə əlavə edildi (status={status})",
+    "digest_confirm": "Gündəlik digest aktiv olan bütün istifadəçilərə test digest göndərilsin?",
+    "digest_title": "Test digest göndər",
+    "all_subscribers": "Bütün abunəçilər",
+    "sending": "Göndərilir…",
+    "digest_sent": "Digest {count} alıcıya göndərildi",
+    "error": "Xəta: {message}",
+    "dismiss_feedback": "Gizlətmək üçün klikləyin"
   },
   "auth": {
     "title": "Daxil ol",
@@ -41,6 +63,8 @@
     "sent_body": "Əgər bu e-poçt qeydiyyatdadırsa, məktubdakı linkə klikləyin (30 dəqiqə yaşayır).",
     "verify_loading": "Yoxlanılır…",
     "verify_invalid": "Yararsız və ya müddəti bitmiş token",
+    "verify_missing": "Ünvanda token yoxdur",
+    "verify_network": "Link yoxlanılmadı: şəbəkə əlçatan deyil",
     "verify_request_new": "Yeni link tələb edin",
     "logout_confirm": "Sistemdən çıxmaq istəyirsiniz?",
     "logout": "Çıxış",
@@ -89,6 +113,7 @@
     "no_data": "məlumat yoxdur",
     "load_error": "yükləmə xətası",
     "per_unit_note": "müqayisə ədəd başına normallaşdırılıb (fərqli qablaşdırma)",
+    "unit_short": "əd.",
     "stale_badge": "{days} gün əvvəl",
     "stale_note": "Qiymət {days} gün əvvəl yenilənib — spredə daxil edilmir",
     "stable_price": "sabit {price}",
@@ -102,6 +127,7 @@
     "needs_review_aria": "Yoxlanma tələb edir",
     "reject_tooltip": "Səhv uyğunluq kimi rədd et",
     "needs_review_tooltip": "Yoxlama tələb edir",
+    "match_confidence": "Uyğunluq etibarı: {pct}%",
     "sites_spread": "{n} sayt · fərq",
     "relink_title": "Səhv müqayisə?",
     "relink_hint": "Lazımi saytda məhsulu dəyişin: variantlardan seçin və ya öz keçidinizi yapışdırın.",
@@ -149,7 +175,10 @@
     "duration_sec": "{n}s",
     "duration_min": "{n}dəq",
     "duration_min_sec": "{n}dəq {s}s",
-    "duration_hour": "{h}s {m}dəq"
+    "duration_hour": "{h}s {m}dəq",
+    "onboarding_title": "Əsas ekranınız",
+    "onboarding_desc": "Yuxarıdakı KPI-lər uyğunluqları, əhatəni və məlumat keyfiyyətini göstərir. Bugünkü tövsiyələr qərar tələb edən qiymət fərqlərini göstərir; aşağıda isə bütün server skanlarının vəziyyəti görünür.",
+    "unit_gap_hint": "Məhsul vahidi üzrə qiymət fərqi — birbaşa yoxlanılan göstərici"
   },
   "analytics": {
     "title": "📈 Analitika",
@@ -216,7 +245,9 @@
     "tooltip_snoozed_until": "{date} tarixinədək gizlədilib",
     "tooltip_mark_read": "Oxunmuş kimi işarələ",
     "tooltip_mark_unread": "Oxunmamış kimi işarələ",
-    "tooltip_snooze_7d": "7 gün gizlət"
+    "tooltip_snooze_7d": "7 gün gizlət",
+    "onboarding_title": "Bildirişlərlə iş",
+    "onboarding_desc": "Giriş qutusunda diqqət tələb edən bildirişlər qalır. Bir neçə sətri seçərək onları toplu şəkildə oxunmuş saya və ya gecikdirə bilərsiniz; oxunmuş və gecikdirilmiş bildirişlər ayrıca nişanlardadır."
   },
   "watchlist": {
     "title": "📋 İzləmə",
@@ -253,7 +284,8 @@
     "category_comparison_count": "{count} müqayisəyə hazırdır",
     "category_no_comparison": "Hələ cross-site uyğun məhsul yoxdur: matching-i işə salın və ya məhsulları əl ilə bağlayın.",
     "category_make_matches": "Uyğunluq seç",
-    "category_add_site_matches": "{site} əlavə et ({count})",
+    "category_add_site_matches": "{site}-dan uyğunluq əlavə et ({count})",
+    "category_add_site_matches_hint": "{site} saytındakı {count} məhsulu mövcud uyğunluqlara bağlamaq üçün uyğunlaşdırma seçimini açır.",
     "category_create_matches": "Yeni uyğunluq yarat"
   },
   "category_products": {
@@ -370,7 +402,16 @@
     "scan_done_msg": "✓ Hazırdır #{id} — {total} məhsul",
     "scan_failed_msg": "✗ Xəta #{id}: {error}",
     "site_a_label": "Sayt A",
-    "site_b_label": "Sayt B"
+    "site_b_label": "Sayt B",
+    "suggestions_tip_title": "Brend oxşarlığına görə kateqoriya əlaqələri",
+    "suggestions_tip_desc": "İki saytda çoxlu ortaq brendi olan kateqoriyalar çox vaxt eyni bölməni ifadə edir. Əlaqələndirdikdən sonra uyğunlaşdırma sistemi daha təhlükəsiz ümumi kontekst əldə edir.",
+    "suggestions_explainer": "Tövsiyələr iki saytın kateqoriyalarındakı ortaq brendlərə əsaslanır. Beş və daha çox eyni brend adətən eyni kateqoriyaya işarə edir.",
+    "scan_category_title": "Yalnız bu kateqoriyanı skan et",
+    "scan_category_blocked_title": "Tam skan #{id} artıq bu kateqoriyanı əhatə edir",
+    "scan_all_title": "Bütün aktiv kateqoriyaları skan et",
+    "error_without_message": "Xəta mesajı yoxdur",
+    "completed_title": "run_id={id}, {date} tarixində tamamlandı",
+    "delete_tooltip": "Sil"
   },
   "users": {
     "back": "← Tənzimləmələr",
@@ -540,7 +581,8 @@
     "btn_reject": "Eyni məhsul deyil",
     "confirm_hint": "Uyğunlaşmanı qeyd et — auto-matcher artıq dəyişməyəcək",
     "reject_hint": "Klasteri böl — məhsullar fərqli kimi qeyd olunur",
-    "count": "Növbədə {n} uyğunlaşma"
+    "count": "Növbədə {n} uyğunlaşma",
+    "barcode_title": "Ştrixkod"
   },
   "category_comparison": {
     "title": "📊 Kateqoriyalar üzrə müqayisə",

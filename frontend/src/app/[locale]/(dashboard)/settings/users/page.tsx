@@ -1,11 +1,12 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
 import { useState } from "react";
 import { ArrowLeft, Clock, Send, Trash2, UserPlus } from "lucide-react";
 import { api, type Recipient, type RecipientCreate, type RecipientUpdate } from "@/lib/api";
+import { formatTime } from "@/lib/utils";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
 type Sev = (typeof SEVERITIES)[number];
@@ -226,6 +227,7 @@ function UserCard({
   onHardDelete: () => void;
 }) {
   const t = useTranslations("users");
+  const locale = useLocale();
   const sendLinkMut = useMutation({
     mutationFn: () => api.recipientSendLoginLink(u.id),
   });
@@ -253,7 +255,7 @@ function UserCard({
           {u.name && <div className="text-xs text-muted-foreground">{u.name}</div>}
           {u.last_login_at && (
             <div className="text-[11px] text-muted-foreground mt-0.5">
-              {t("last_login")}: {new Date(u.last_login_at).toLocaleString()}
+              {t("last_login")}: {formatTime(u.last_login_at, locale)}
             </div>
           )}
         </div>

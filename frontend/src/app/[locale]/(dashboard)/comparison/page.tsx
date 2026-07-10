@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, useMemo } from "react";
 import { useSearchParams } from "next/navigation";
 import { X, ChevronUp, ChevronDown, ChevronsUpDown, TrendingUp, TrendingDown } from "lucide-react";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
 import { api, ApiError, type ComparisonRow } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
@@ -369,7 +369,7 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
           className="text-[9px] font-normal text-muted-foreground ml-0.5"
           title={t("per_unit_note")}
         >
-          /шт
+          /{t("unit_short")}
         </span>
       )}
     </span>
@@ -378,6 +378,7 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
 
 function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
   const t = useTranslations("comparison");
+  const locale = useLocale();
   const p = row.prices[site];
   if (!p) return <span className="text-muted-foreground/50">—</span>;
   // Per-unit basis (2026-05-29): min/max/cheapest посчитаны на цене-за-штуку,
@@ -410,7 +411,7 @@ function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
       }`}
     >
       <span className={stale ? "line-through decoration-muted-foreground/40" : ""}>
-        {formatPrice(p.price)}
+        {formatPrice(p.price, locale)}
       </span>
       {stale && p.age_days != null && (
         <span className="text-[10px] font-normal text-amber-600 dark:text-amber-500">
@@ -419,7 +420,8 @@ function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
       )}
       {showUnit && (
         <span className="text-[10px] font-normal text-muted-foreground">
-          {formatPrice(p.unit_price!)}/шт · {p.pack_count}шт
+          {formatPrice(p.unit_price!, locale)}/{t("unit_short")} · {p.pack_count}{" "}
+          {t("unit_short")}
         </span>
       )}
     </a>
@@ -461,7 +463,7 @@ function ComparisonRowDesktop({
             {row.confidence < 0.95 && (
               <span
                 className="text-muted-foreground/60 text-[10px] tabular-nums leading-none"
-                title={`Уверенность матча: ${Math.round(row.confidence * 100)}%`}
+                title={t("match_confidence", { pct: Math.round(row.confidence * 100) })}
               >
                 {Math.round(row.confidence * 100)}%
               </span>
@@ -549,7 +551,7 @@ function ComparisonCard({
         {row.confidence < 0.95 && (
           <span
             className="text-muted-foreground/60 text-[10px] tabular-nums leading-none"
-            title={`Уверенность матча: ${Math.round(row.confidence * 100)}%`}
+            title={t("match_confidence", { pct: Math.round(row.confidence * 100) })}
           >
             {Math.round(row.confidence * 100)}%
           </span>
@@ -575,6 +577,7 @@ function ComparisonCard({
 
 function TrendPanel({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
+  const locale = useLocale();
   const sitesWithPrice = SITES.filter((s) => row.prices[s]);
   // Batch fetch: 1 запрос вместо N×3. Сортируем ids для стабильного queryKey.
   const productIds = useMemo(
@@ -612,7 +615,7 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
             ) : ph.points.filter((p) => p.price != null).length < 2 ? (
               <span className="text-muted-foreground/70 text-[11px]">
                 {ph.current != null
-                  ? t("stable_price", { price: formatPrice(ph.current) })
+                  ? t("stable_price", { price: formatPrice(ph.current, locale) })
                   : "—"}
               </span>
             ) : (
