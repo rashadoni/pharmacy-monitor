@@ -1406,14 +1406,24 @@ with tab_overview:
                 from sqlalchemy import desc as _d, select as _s
 
                 with get_session() as s_pdf:
-                    last_run = s_pdf.scalars(
-                        _s(storage.Run)
-                        .where(storage.Run.status == "ok")
-                        .order_by(_d(storage.Run.started_at))
-                        .limit(1)
-                    ).first()
+                    eligible_ids = storage.financially_eligible_run_ids(s_pdf, tenant_id=1)
+                    last_run = None
+                    if (
+                        eligible_ids
+                        and not storage.has_unfinished_run(s_pdf, tenant_id=1)
+                        and roi.financial_inputs_are_fresh(s_pdf, tenant_id=1)
+                    ):
+                        last_run = s_pdf.scalars(
+                            _s(storage.Run)
+                            .where(
+                                storage.Run.id.in_(eligible_ids),
+                                storage.Run.finished_at.is_not(None),
+                            )
+                            .order_by(_d(storage.Run.finished_at), _d(storage.Run.id))
+                            .limit(1)
+                        ).first()
                     if not last_run:
-                        st.warning("Нет успешных прогонов")
+                        st.warning("Нет завершённого подтверждённого полного прогона")
                     else:
                         with st.spinner("Генерирую PDF (~2 сек)..."):
                             report = analyzer_mod.analyze(s_pdf, last_run.id)

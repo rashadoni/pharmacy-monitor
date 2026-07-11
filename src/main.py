@@ -376,18 +376,20 @@ def reap_stale_running_runs(
     session: Session,
     *,
     max_age_hours: float = 6.0,
-    reason: str = "reaped stale running run after interrupted/timeout process",
+    reason: str = "reaped stale unfinished run after interrupted/timeout process",
 ) -> int:
-    """Mark orphaned `runs.status=running` rows as failed.
+    """Fail and finish every stale run left without ``finished_at``.
 
     Callers must guard that no pharmacy-monitor scrape/rematch process is active.
-    This is for DB rows left behind after a killed process, reboot, or timeout.
+    This is for DB rows left behind after a killed process, reboot, timeout, or
+    a legacy error path that set ``status=failed`` without a completion stamp.
+    A classified ``ok``/``degraded`` orphan is deliberately stripped of money
+    trust: post-processing may have stopped after mutating Product/Match rows.
     """
     cutoff = utcnow() - timedelta(hours=max_age_hours)
     stale = session.scalars(
         select(storage.Run)
         .where(
-            storage.Run.status == "running",
             storage.Run.started_at < cutoff,
             storage.Run.finished_at.is_(None),
         )
@@ -395,11 +397,29 @@ def reap_stale_running_runs(
     ).all()
     if not stale:
         return 0
-    finished_at = utcnow()
+    recovered_at = utcnow()
     for run in stale:
+        previous_status = run.status
         run.status = "failed"
-        run.finished_at = finished_at
-        run.error_message = ((run.error_message or "") + f" | {reason}").strip(" |")
+        # Preserve historical ordering. Recovery today must not make a May
+        # orphan newer than a healthy July run merely because its legacy row
+        # lacked a completion stamp.
+        run.finished_at = run.started_at
+        if run.run_quality:
+            quality = dict(run.run_quality)
+            quality["full_catalog_verified"] = False
+            quality["financially_eligible"] = False
+            quality["recovery"] = {
+                "reason": reason,
+                "previous_status": previous_status,
+                "recovered_at": recovered_at.isoformat(),
+            }
+            run.run_quality = quality
+        recovery_note = (
+            f"{reason} (previous_status={previous_status}, "
+            f"recovered_at={recovered_at.isoformat()})"
+        )
+        run.error_message = ((run.error_message or "") + f" | {recovery_note}").strip(" |")
     session.commit()
     return len(stale)
 
@@ -1373,15 +1393,15 @@ def db_check_cmd(fix: bool) -> None:
     "--max-age-hours",
     type=float,
     default=6.0,
-    help="Mark running runs older than N hours as failed.",
+    help="Mark unfinished runs older than N hours as failed.",
 )
 @click.option(
     "--reason",
-    default="reaped stale running run after interrupted/timeout process",
+    default="reaped stale unfinished run after interrupted/timeout process",
     help="Reason appended to run.error_message.",
 )
 def reap_stale_runs_cmd(max_age_hours: float, reason: str) -> None:
-    """Mark orphaned `runs.status=running` rows as failed.
+    """Mark orphaned runs without ``finished_at`` as failed.
 
     Intended for server watcher use after it confirms no scrape/rematch process
     is active. Does not kill processes.

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import click
 
 from src import main as main_mod
-from src import storage, watchlist
+from src import roi, storage, watchlist
 from src.scrapers.base import ScrapedProduct, ScrapeResult
 
 
@@ -200,21 +200,145 @@ def test_reap_stale_running_runs_marks_old_orphans_failed(db_session):
         status="ok",
         products_scraped=10,
     )
-    db_session.add_all([old, fresh, ok])
+    classified_orphan = storage.Run(
+        started_at=main_mod.utcnow() - timedelta(hours=7),
+        status="ok",
+        products_scraped=10,
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+        },
+    )
+    legacy_failed = storage.Run(
+        started_at=main_mod.utcnow() - timedelta(days=2),
+        status="failed",
+        products_scraped=0,
+    )
+    db_session.add_all([old, fresh, ok, classified_orphan, legacy_failed])
     db_session.commit()
 
     count = main_mod.reap_stale_running_runs(db_session, max_age_hours=6)
 
-    assert count == 1
+    assert count == 3
     db_session.refresh(old)
     db_session.refresh(fresh)
     db_session.refresh(ok)
+    db_session.refresh(classified_orphan)
+    db_session.refresh(legacy_failed)
     assert old.status == "failed"
     assert old.finished_at is not None
-    assert "reaped stale running run" in (old.error_message or "")
+    assert "reaped stale unfinished run" in (old.error_message or "")
     assert fresh.status == "running"
     assert fresh.finished_at is None
     assert ok.status == "ok"
+    assert ok.finished_at is not None
+    assert classified_orphan.status == "failed"
+    assert classified_orphan.finished_at is not None
+    assert classified_orphan.run_quality["full_catalog_verified"] is False
+    assert classified_orphan.run_quality["financially_eligible"] is False
+    assert classified_orphan.run_quality["recovery"]["previous_status"] == "ok"
+    assert classified_orphan.run_quality["recovery"]["recovered_at"]
+    assert legacy_failed.status == "failed"
+    assert legacy_failed.finished_at is not None
+    assert legacy_failed.finished_at == legacy_failed.started_at
+    assert "previous_status=failed" in (legacy_failed.error_message or "")
+    assert "recovered_at=" in (legacy_failed.error_message or "")
+    # The newer classified orphan honestly supersedes `ok`; the much older
+    # legacy failed row must not jump to the front merely because it was reaped.
+    assert storage.latest_terminal_run(db_session).id == classified_orphan.id
+    assert storage.latest_terminal_run(db_session).id != legacy_failed.id
+
+
+def _full_quality(*, eligible: bool = True) -> dict:
+    status = "ok" if eligible else "failed"
+    return {
+        "baseline_enforced": True,
+        "full_catalog_verified": eligible,
+        "financially_eligible": eligible,
+        "sites": {
+            site: {"status": status}
+            for site in storage.FULL_CATALOG_SITES
+        },
+    }
+
+
+def test_reap_old_classified_orphan_preserves_newer_healthy_lineage_and_cache(db_session):
+    now = main_mod.utcnow()
+    orphan = storage.Run(
+        started_at=now - timedelta(days=2),
+        status="ok",
+        run_quality=_full_quality(),
+    )
+    healthy = storage.Run(
+        started_at=now - timedelta(hours=20),
+        finished_at=now - timedelta(hours=19),
+        status="ok",
+        run_quality=_full_quality(),
+    )
+    db_session.add_all([orphan, healthy])
+    db_session.flush()
+    db_session.add(
+        storage.RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            payload=[{"title": "trusted"}],
+            computed_at=now,
+            run_id=healthy.id,
+        )
+    )
+    db_session.commit()
+
+    assert main_mod.reap_stale_running_runs(db_session, max_age_hours=6) == 1
+
+    attempts = storage.latest_full_catalog_attempts_by_site(
+        db_session,
+        storage.FULL_CATALOG_SITES,
+    )
+    assert storage.latest_terminal_run(db_session).id == healthy.id
+    assert {site: run.id for site, run in attempts.items()} == {
+        site: healthy.id for site in storage.FULL_CATALOG_SITES
+    }
+    assert roi.get_cached_actions(db_session, "pharmonline") == [{"title": "trusted"}]
+
+
+def test_reap_newer_classified_orphan_supersedes_older_healthy_lineage(db_session):
+    now = main_mod.utcnow()
+    healthy = storage.Run(
+        started_at=now - timedelta(hours=20),
+        finished_at=now - timedelta(hours=19),
+        status="ok",
+        run_quality=_full_quality(),
+    )
+    orphan = storage.Run(
+        started_at=now - timedelta(hours=7),
+        status="ok",
+        run_quality=_full_quality(),
+    )
+    db_session.add_all([healthy, orphan])
+    db_session.flush()
+    db_session.add(
+        storage.RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            payload=[{"title": "superseded"}],
+            computed_at=now,
+            run_id=healthy.id,
+        )
+    )
+    db_session.commit()
+
+    assert main_mod.reap_stale_running_runs(db_session, max_age_hours=6) == 1
+
+    attempts = storage.latest_full_catalog_attempts_by_site(
+        db_session,
+        storage.FULL_CATALOG_SITES,
+    )
+    assert storage.latest_terminal_run(db_session).id == orphan.id
+    assert {site: run.id for site, run in attempts.items()} == {
+        site: orphan.id for site in storage.FULL_CATALOG_SITES
+    }
+    assert roi.get_cached_actions(db_session, "pharmonline") is None
 
 
 def test_reap_stale_running_runs_noops_when_none_stale(db_session):
