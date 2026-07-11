@@ -139,6 +139,18 @@ export function SideNav() {
   );
 }
 
+/** Mobile top bar keeps the active language visible and switchable. */
+export function MobileHeader() {
+  const t = useTranslations("nav");
+
+  return (
+    <header className="fixed inset-x-0 top-0 z-40 flex min-h-14 items-center justify-between border-b border-border bg-background/95 px-3 backdrop-blur supports-[backdrop-filter]:bg-background/80 md:hidden">
+      <span className="truncate pr-2 text-sm font-semibold text-foreground">{t("appName")}</span>
+      <LocaleSwitcher compact />
+    </header>
+  );
+}
+
 /** Mobile bottom-tab nav (< md). */
 export function BottomNav() {
   const pathname = usePathname();

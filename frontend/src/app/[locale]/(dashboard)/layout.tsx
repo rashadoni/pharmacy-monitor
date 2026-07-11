@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { cookies } from "next/headers";
-import { SideNav, BottomNav } from "@/components/nav";
+import { SideNav, BottomNav, MobileHeader } from "@/components/nav";
 import { NotificationsBanner } from "@/components/notifications-banner";
 import { getTranslations } from "next-intl/server";
 
@@ -30,7 +30,8 @@ export default async function DashboardLayout({
         {t("skip_to_content")}
       </a>
       <SideNav />
-      <main id="main-content" className="min-w-0 flex-1 pb-16 md:pb-0" tabIndex={-1}>
+      <MobileHeader />
+      <main id="main-content" className="min-w-0 flex-1 pb-16 pt-14 md:pb-0 md:pt-0" tabIndex={-1}>
         <div className="container py-4 md:py-8">
           <NotificationsBanner />
           {children}

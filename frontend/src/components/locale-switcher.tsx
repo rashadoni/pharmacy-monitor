@@ -1,6 +1,6 @@
 "use client";
 
-import { useLocale } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useTransition } from "react";
 import { useSearchParams } from "next/navigation";
 import { localeFlags, localeNames, locales, type Locale } from "@/i18n/config";
@@ -17,8 +17,9 @@ import { pathWithSearch } from "@/lib/locale-path";
  * pathname с новым locale-префиксом. Client-side навигация, no reload.
  * Deep links `/az/comparison` работают через share.
  */
-export function LocaleSwitcher() {
+export function LocaleSwitcher({ compact = false }: { compact?: boolean }) {
   const current = useLocale() as Locale;
+  const t = useTranslations("settings");
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -35,7 +36,11 @@ export function LocaleSwitcher() {
   }
 
   return (
-    <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
+    <div
+      className="inline-flex overflow-hidden rounded-md border border-border text-xs"
+      role="group"
+      aria-label={t("language")}
+    >
       {locales.map((loc) => (
         <button
           key={loc}
@@ -45,14 +50,15 @@ export function LocaleSwitcher() {
           aria-pressed={loc === current}
           aria-label={localeNames[loc]}
           className={
-            "flex min-h-11 items-center gap-1 px-3 py-1.5 transition-colors md:min-h-8 " +
+            "flex min-h-11 items-center justify-center gap-1 py-1.5 transition-colors md:min-h-8 " +
+            (compact ? "min-w-11 px-2 " : "px-3 ") +
             (loc === current
               ? "bg-primary text-primary-foreground font-semibold"
               : "bg-card text-muted-foreground hover:bg-secondary")
           }
         >
           <span>{localeFlags[loc]}</span>
-          <span>{localeNames[loc]}</span>
+          <span className={compact ? "sr-only" : undefined}>{localeNames[loc]}</span>
         </button>
       ))}
     </div>
