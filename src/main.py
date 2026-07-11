@@ -30,7 +30,15 @@ from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noq
 from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
 from src.scrapers.aptekonline import AptekonlineScraper  # noqa: E402
-from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapeResult  # noqa: E402
+from src.scrapers.base import (  # noqa: E402
+    BaseScraper,
+    ScrapedProduct,
+    ScrapeResult,
+    SiteScrapeFatalError,
+    fatal_proxy_reason,
+    site_fatal_error_message,
+    site_fatal_result,
+)
 from src.scrapers.pharmonline import PharmonlineScraper  # noqa: E402
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "categories.yaml"
@@ -365,14 +373,25 @@ async def scrape_site(
             site=site,
             errors=["no_categories_configured"],
         )
-    async with cls() as s:
-        result = await s.scrape(
-            slugs, limit_per_category=limit_per_category, on_category=on_category
+    try:
+        async with cls() as s:
+            result = await s.scrape(
+                slugs, limit_per_category=limit_per_category, on_category=on_category
+            )
+    except SiteScrapeFatalError as exc:
+        log.error(
+            "site_scrape_start_aborted",
+            site=site,
+            categories=len(slugs),
+            error=site_fatal_error_message(exc),
         )
+        return site_fatal_result(site, slugs, exc)
 
     # Phase 1.4 — optional AI crawler fallback when primary yield collapses.
     # Only kicks in if AI_FALLBACK_ENABLED=1 in env (off by default — costs $).
-    if _should_trigger_ai_fallback(len(result.products), ai_fallback_baseline):
+    if not result.site_fatal and _should_trigger_ai_fallback(
+        len(result.products), ai_fallback_baseline
+    ):
         ai_cls = AI_CRAWLER_BY_SITE.get(site)
         if ai_cls is None:
             log.warning("ai_fallback_no_subclass", site=site)
@@ -407,13 +426,24 @@ async def scrape_site(
                 )
                 if ai_result.errors:
                     result.errors.extend(f"ai_fallback: {e}" for e in ai_result.errors[:5])
+            except SiteScrapeFatalError as e:
+                message = site_fatal_error_message(e)
+                result.site_fatal = True
+                result.errors.append(f"site_fatal: ai_fallback: {message}")
+                log.error("ai_fallback_aborted", site=site, error=message)
             except Exception as e:
-                log.error(
-                    "ai_fallback_failed",
-                    site=site,
-                    error=f"{type(e).__name__}: {e}",
-                )
-                result.errors.append(f"ai_fallback: {type(e).__name__}: {e}")
+                reason = fatal_proxy_reason(e)
+                if reason is not None:
+                    result.site_fatal = True
+                    result.errors.append(f"site_fatal: ai_fallback: {reason}")
+                    log.error("ai_fallback_aborted", site=site, error=reason)
+                else:
+                    log.error(
+                        "ai_fallback_failed",
+                        site=site,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    result.errors.append(f"ai_fallback: {type(e).__name__}: {e}")
     return result
 
 
@@ -443,30 +473,78 @@ async def scrape_watchlist_for_site(site: str, urls: list[str]) -> ScrapeResult:
     cls = SCRAPER_CLASSES[site]
     if not urls:
         return ScrapeResult(site=site, errors=["no_watchlist_urls"])
-    async with cls() as s:
-        result = ScrapeResult(site=site, items_expected=len(urls))
+    result = ScrapeResult(site=site, items_expected=len(urls))
+    try:
+        async with cls() as s:
 
-        def _record_url(url, product, error):
-            if product is not None:
-                result.items_completed += 1
-                result.item_results[url] = {"status": "ok", "products": 1}
-                return
-            result.items_failed += 1
-            result.item_results[url] = {
-                "status": "failed",
-                "products": 0,
-                "error": str(error or "product_not_found")[:500],
-                "error_kind": "not_found" if error == "product_not_found" else "exception",
-            }
-            result.errors.append(f"url={url}: {error or 'product_not_found'}")
+            def _record_url(url, product, error):
+                if product is not None:
+                    result.products.append(product)
+                    result.items_completed += 1
+                    result.item_results[url] = {"status": "ok", "products": 1}
+                    return
+                result.items_failed += 1
+                result.item_results[url] = {
+                    "status": "failed",
+                    "products": 0,
+                    "error": str(error or "product_not_found")[:500],
+                    "error_kind": (
+                        "not_found" if error == "product_not_found" else "exception"
+                    ),
+                }
+                result.errors.append(f"url={url}: {error or 'product_not_found'}")
 
-        result.products = await s.scrape_urls(urls, on_result=_record_url)
-        try:
-            result.promos = await s.scrape_promos()
-        except Exception as e:
-            log.warning("promos_failed", site=site, error=str(e))
-            result.errors.append(f"promos: {type(e).__name__}: {e}")
-        return result
+            def _record_abort(current_url, remaining_urls, error):
+                message = site_fatal_error_message(error)
+                result.site_fatal = True
+                result.items_failed += 1 + len(remaining_urls)
+                result.item_results[current_url] = {
+                    "status": "failed",
+                    "products": 0,
+                    "error": message,
+                    "error_kind": "site_fatal",
+                }
+                for remaining_url in remaining_urls:
+                    result.item_results[remaining_url] = {
+                        "status": "skipped",
+                        "products": 0,
+                        "error": message,
+                        "error_kind": "site_fatal",
+                    }
+                result.errors.append(f"site_fatal: {message}")
+
+            try:
+                await s.scrape_urls(
+                    urls, on_result=_record_url, on_abort=_record_abort
+                )
+            except SiteScrapeFatalError:
+                return result
+            try:
+                result.promos = await s.scrape_promos()
+            except SiteScrapeFatalError as e:
+                message = site_fatal_error_message(e)
+                result.site_fatal = True
+                result.errors.append(f"site_fatal: promos: {message}")
+                log.error("watchlist_promos_aborted", site=site, error=message)
+            except Exception as e:
+                reason = fatal_proxy_reason(e)
+                if reason is not None:
+                    message = reason
+                    result.site_fatal = True
+                    result.errors.append(f"site_fatal: promos: {message}")
+                    log.error("watchlist_promos_aborted", site=site, error=message)
+                else:
+                    log.warning("promos_failed", site=site, error=str(e))
+                    result.errors.append(f"promos: {type(e).__name__}: {e}")
+            return result
+    except SiteScrapeFatalError as exc:
+        log.error(
+            "watchlist_site_start_aborted",
+            site=site,
+            urls=len(urls),
+            error=site_fatal_error_message(exc),
+        )
+        return site_fatal_result(site, urls, exc)
 
 
 async def scrape_watchlist_all(urls_by_site: dict[str, list[str]]) -> list[ScrapeResult]:
@@ -627,7 +705,10 @@ def classify_run_quality(
                 ),
             }
 
-        if expected == 0:
+        if result.site_fatal:
+            status = "failed"
+            reasons.append("site_fatal")
+        elif expected == 0:
             status = "failed"
             reasons.append("no_items_requested")
         elif products == 0:
@@ -656,6 +737,7 @@ def classify_run_quality(
             "items_expected": expected,
             "items_completed": completed,
             "items_failed": failed,
+            "site_fatal": bool(result.site_fatal),
             "baseline_products": baseline if isinstance(baseline, int) and baseline > 0 else None,
             "baseline_fraction": (
                 round(products / baseline, 4)
@@ -1980,9 +2062,11 @@ def ai_crawl_cmd(
         async with cls() as scraper:
             return await scraper.crawl(max_urls=max_urls, dry_run=dry_run)
 
-    result = asyncio.run(_run())
-
     if dry_run:
+        try:
+            result = asyncio.run(_run())
+        except SiteScrapeFatalError as exc:
+            raise click.ClickException(site_fatal_error_message(exc))
         click.echo(
             f"[dry-run] AI-crawl {site}: errors={len(result.errors)}. "
             "См. structlog 'ai_crawl_summary' (logs/app.jsonl) для visited/captcha/cost."
@@ -1995,22 +2079,27 @@ def ai_crawl_cmd(
         session.add(run)
         session.commit()
         try:
-            result.items_expected = 1
-            result.items_completed = 1 if result.products else 0
-            result.items_failed = 1 if result.errors or not result.products else 0
-            result.item_results = {
-                "ai_crawl": {
-                    "status": (
-                        "failed"
-                        if not result.products
-                        else "degraded"
-                        if result.errors
-                        else "ok"
-                    ),
-                    "products": len(result.products),
-                    "error": "; ".join(result.errors[:5])[:500] or None,
+            try:
+                result = asyncio.run(_run())
+            except SiteScrapeFatalError as exc:
+                result = site_fatal_result(site, ["ai_crawl"], exc)
+            if result.items_expected == 0:
+                result.items_expected = 1
+                result.items_completed = 1 if result.products else 0
+                result.items_failed = 1 if result.errors or not result.products else 0
+                result.item_results = {
+                    "ai_crawl": {
+                        "status": (
+                            "failed"
+                            if not result.products
+                            else "degraded"
+                            if result.errors
+                            else "ok"
+                        ),
+                        "products": len(result.products),
+                        "error": "; ".join(result.errors[:5])[:500] or None,
+                    }
                 }
-            }
             count = persist_results(session, run, [result])
             run.products_scraped = count
             run.products_per_site = {site: len(result.products)}

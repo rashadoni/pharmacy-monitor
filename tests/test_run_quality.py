@@ -16,7 +16,13 @@ from src.main import (
     run_quality_baselines_for_sites,
     run_tenant_id_for_request,
 )
-from src.scrapers.base import BaseScraper, CaptchaDetected, ScrapedProduct, ScrapeResult
+from src.scrapers.base import (
+    BaseScraper,
+    CaptchaDetected,
+    ScrapedProduct,
+    ScrapeResult,
+    SiteScrapeFatalError,
+)
 
 
 def _product(site: str, external_id: str, category: str = "cat") -> ScrapedProduct:
@@ -169,6 +175,235 @@ class _DummyScraper(BaseScraper):
 
 
 @pytest.mark.asyncio
+async def test_scrape_site_initial_proxy_failure_returns_bounded_fatal_result(
+    monkeypatch,
+):
+    class _FatalStartScraper(_DummyScraper):
+        site_name = "fatal"
+
+        def __init__(self):
+            super().__init__({})
+
+        async def __aenter__(self):
+            raise SiteScrapeFatalError("Decodo proxy access rejected: HTTP 407")
+
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "fatal", _FatalStartScraper)
+
+    result = await main_mod.scrape_site("fatal", ["one", "two"], None)
+    status, quality = classify_run_quality(
+        [result], ["fatal"], mode="category", enforce_baseline=True
+    )
+
+    assert result.items_expected == 2
+    assert result.items_failed == 2
+    assert status == "failed"
+    assert quality["financially_eligible"] is False
+    assert quality["sites"]["fatal"]["reasons"] == ["site_fatal"]
+
+
+@pytest.mark.asyncio
+async def test_watchlist_partial_fatal_is_bounded_and_skips_remaining(monkeypatch):
+    class _WatchFatalScraper(_DummyScraper):
+        site_name = "watchfatal"
+
+        def __init__(self):
+            super().__init__({})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def scrape_product_page(self, url):
+            if url.endswith("/fatal"):
+                raise SiteScrapeFatalError("proxy access rejected: HTTP 407")
+            return _product(self.site_name, url.rsplit("/", 1)[-1])
+
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "watchfatal", _WatchFatalScraper)
+    urls = ["https://x/ok", "https://x/fatal", "https://x/skipped"]
+
+    result = await main_mod.scrape_watchlist_for_site("watchfatal", urls)
+    status, quality = classify_run_quality(
+        [result], ["watchfatal"], mode="watchlist", enforce_baseline=False
+    )
+
+    assert len(result.products) == 1
+    assert result.site_fatal is True
+    assert result.items_completed == 1
+    assert result.items_failed == 2
+    assert result.item_results[urls[1]]["status"] == "failed"
+    assert result.item_results[urls[2]]["status"] == "skipped"
+    assert status == "failed"
+    assert quality["financially_eligible"] is False
+
+
+@pytest.mark.asyncio
+async def test_watchlist_initial_fatal_returns_bounded_result(monkeypatch):
+    class _WatchFatalStartScraper(_DummyScraper):
+        site_name = "watchstartfatal"
+
+        def __init__(self):
+            super().__init__({})
+
+        async def __aenter__(self):
+            raise SiteScrapeFatalError("proxy access rejected: HTTP 407")
+
+    monkeypatch.setitem(
+        main_mod.SCRAPER_CLASSES, "watchstartfatal", _WatchFatalStartScraper
+    )
+    urls = ["https://x/one", "https://x/two"]
+
+    result = await main_mod.scrape_watchlist_for_site("watchstartfatal", urls)
+
+    assert result.site_fatal is True
+    assert result.items_expected == 2
+    assert result.items_failed == 2
+    assert set(result.item_results) == set(urls)
+
+
+@pytest.mark.asyncio
+async def test_watchlist_promo_proxy_fatal_marks_site_failed_and_redacts(monkeypatch):
+    class _WatchPromoFatalScraper(_DummyScraper):
+        site_name = "watchpromofatal"
+
+        def __init__(self):
+            super().__init__({})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def scrape_product_page(self, url):
+            return _product(self.site_name, "ok")
+
+        async def scrape_promos(self):
+            raise RuntimeError(
+                "proxy http://user:top-secret@az.decodo.com:30001 rejected "
+                "net::ERR_PROXY_AUTH_REQUESTED"
+            )
+
+    monkeypatch.setitem(
+        main_mod.SCRAPER_CLASSES, "watchpromofatal", _WatchPromoFatalScraper
+    )
+
+    result = await main_mod.scrape_watchlist_for_site(
+        "watchpromofatal", ["https://x/ok"]
+    )
+    status, quality = classify_run_quality(
+        [result], ["watchpromofatal"], mode="watchlist", enforce_baseline=False
+    )
+
+    payload = repr((result.errors, quality))
+    assert result.site_fatal is True
+    assert status == "failed"
+    assert quality["financially_eligible"] is False
+    assert "top-secret" not in payload
+    assert "az.decodo.com" not in payload
+
+
+@pytest.mark.asyncio
+async def test_site_fatal_never_triggers_ai_fallback(monkeypatch):
+    class _FatalPrimary:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def scrape(self, *args, **kwargs):
+            return ScrapeResult(
+                site="fatalprimary",
+                products=[_product("fatalprimary", "partial")],
+                errors=["site_fatal: proxy access rejected: HTTP 407"],
+                site_fatal=True,
+                items_expected=2,
+                items_completed=1,
+                items_failed=1,
+            )
+
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "fatalprimary", _FatalPrimary)
+
+    def unexpected_fallback(*args, **kwargs):
+        pytest.fail("AI fallback decision must be skipped after site_fatal")
+
+    monkeypatch.setattr(main_mod, "_should_trigger_ai_fallback", unexpected_fallback)
+
+    result = await main_mod.scrape_site(
+        "fatalprimary", ["one", "two"], None, ai_fallback_baseline=1000
+    )
+
+    assert result.site_fatal is True
+
+
+@pytest.mark.asyncio
+async def test_ai_fallback_proxy_fatal_marks_partial_primary_site_failed(monkeypatch):
+    class _PartialPrimary:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def scrape(self, *args, **kwargs):
+            return _result("fallbackfatal", 1, expected=2, completed=1, failed=1)
+
+    class _FatalFallback:
+        async def __aenter__(self):
+            raise SiteScrapeFatalError(
+                "proxy http://user:top-secret@az.decodo.com:30001 rejected HTTP 407"
+            )
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "fallbackfatal", _PartialPrimary)
+    monkeypatch.setitem(main_mod.AI_CRAWLER_BY_SITE, "fallbackfatal", _FatalFallback)
+    monkeypatch.setattr(
+        main_mod, "_should_trigger_ai_fallback", lambda *args, **kwargs: True
+    )
+
+    result = await main_mod.scrape_site(
+        "fallbackfatal", ["one", "two"], None, ai_fallback_baseline=1000
+    )
+    status, quality = classify_run_quality(
+        [result], ["fallbackfatal"], mode="category", enforce_baseline=True
+    )
+
+    payload = repr((result.errors, quality))
+    assert result.site_fatal is True
+    assert status == "failed"
+    assert quality["financially_eligible"] is False
+    assert "top-secret" not in payload
+    assert "az.decodo.com" not in payload
+
+
+def test_partial_single_site_fatal_is_failed_but_mixed_run_is_degraded():
+    fatal = _result("aloe", 1, expected=3, completed=1, failed=2)
+    fatal.site_fatal = True
+    fatal.errors = ["site_fatal: proxy access rejected: HTTP 407"]
+
+    single_status, single_quality = classify_run_quality(
+        [fatal], ["aloe"], mode="category", enforce_baseline=True
+    )
+    mixed_status, mixed_quality = classify_run_quality(
+        [fatal, _result("aptekonline", 20)],
+        ["aloe", "aptekonline"],
+        mode="category",
+        enforce_baseline=True,
+    )
+
+    assert single_status == "failed"
+    assert single_quality["sites"]["aloe"]["status"] == "failed"
+    assert single_quality["financially_eligible"] is False
+    assert mixed_status == "degraded"
+    assert mixed_quality["sites"]["aloe"]["status"] == "failed"
+    assert mixed_quality["financially_eligible"] is False
+
+
+@pytest.mark.asyncio
 async def test_base_scraper_tracks_zero_error_and_captcha_categories():
     scraper = _DummyScraper({"ok": "ok", "empty": "empty", "error": "error", "captcha": "captcha"})
     result = await scraper.scrape(["ok", "empty", "error", "captcha"])
@@ -314,3 +549,42 @@ def test_report_send_rejects_missing_all_site_freshness(db_session, monkeypatch)
     assert result.exit_code != 0
     assert "Fresh verified full-catalog inputs are missing" in result.output
     assert sent == []
+
+
+def test_ai_crawl_fatal_creates_failed_run_with_sanitized_quality(
+    db_session, monkeypatch
+):
+    from src.scrapers import ai_crawler
+
+    class _FatalAICrawler:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def crawl(self, *args, **kwargs):
+            raise SiteScrapeFatalError(
+                "proxy http://user:top-secret@az.decodo.com:30001 rejected HTTP 407"
+            )
+
+    Session = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(storage, "init_db", lambda *args, **kwargs: None)
+    monkeypatch.setattr(storage, "make_session", lambda *args, **kwargs: Session)
+    monkeypatch.setitem(ai_crawler.AI_CRAWLER_BY_SITE, "aloe", _FatalAICrawler)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    result = CliRunner().invoke(
+        main_mod.cli,
+        ["ai-crawl", "--site", "aloe", "--max-urls", "3"],
+    )
+
+    run = db_session.query(storage.Run).one()
+    payload = repr((run.run_quality, run.error_message))
+    assert result.exit_code != 0
+    assert run.status == "failed"
+    assert run.finished_at is not None
+    assert run.run_quality["financially_eligible"] is False
+    assert run.run_quality["sites"]["aloe"]["site_fatal"] is True
+    assert "top-secret" not in payload
+    assert "az.decodo.com" not in payload

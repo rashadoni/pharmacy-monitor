@@ -275,6 +275,189 @@ async def test_scrape_calls_on_category_per_category():
 
 
 @pytest.mark.asyncio
+async def test_site_fatal_aborts_remaining_categories_with_fail_closed_telemetry():
+    """Account-level proxy failure stops the site once and marks all remaining work."""
+
+    called = []
+    promos_called = []
+
+    class FatalScraper(_StubScraper):
+        async def scrape_category(self, slug, limit=None):
+            called.append(slug)
+            if slug == "b":
+                raise base.SiteScrapeFatalError(
+                    "Decodo proxy access rejected: HTTP 407"
+                )
+            yield object()
+
+        async def scrape_promos(self):
+            promos_called.append(True)
+            return []
+
+    result = await FatalScraper().scrape(["a", "b", "c"])
+
+    assert called == ["a", "b"]
+    assert promos_called == []
+    assert result.items_expected == 3
+    assert result.site_fatal is True
+    assert result.items_completed == 1
+    assert result.items_failed == 2
+    assert result.item_results["a"]["status"] == "ok"
+    assert result.item_results["b"]["status"] == "failed"
+    assert result.item_results["c"]["status"] == "skipped"
+    assert result.item_results["c"]["error_kind"] == "site_fatal"
+    assert any("HTTP 407" in error for error in result.errors)
+
+
+@pytest.mark.asyncio
+async def test_playwright_proxy_auth_failure_aborts_remaining_categories():
+    called = []
+
+    class PlaywrightProxyFailScraper(_StubScraper):
+        async def scrape_category(self, slug, limit=None):
+            called.append(slug)
+            raise RuntimeError("Page.goto: net::ERR_PROXY_AUTH_REQUESTED")
+            yield  # pragma: no cover - keeps this an async generator
+
+    result = await PlaywrightProxyFailScraper().scrape(["a", "b", "c"])
+
+    assert called == ["a"]
+    assert result.items_failed == 3
+    assert result.item_results["a"]["status"] == "failed"
+    assert result.item_results["b"]["status"] == "skipped"
+    assert result.item_results["c"]["error_kind"] == "site_fatal"
+
+
+@pytest.mark.asyncio
+async def test_category_promo_proxy_fatal_marks_site_failed_and_redacts_secret():
+    class PromoFatalScraper(_StubScraper):
+        async def scrape_promos(self):
+            raise RuntimeError(
+                "proxy http://user:top-secret@az.decodo.com:30001 rejected HTTP 407"
+            )
+
+    result = await PromoFatalScraper().scrape(["a"])
+
+    payload = repr((result.errors, result.item_results))
+    assert result.site_fatal is True
+    assert result.items_completed == 1
+    assert "HTTP 407" in payload
+    assert "top-secret" not in payload
+    assert "az.decodo.com" not in payload
+
+
+@pytest.mark.asyncio
+async def test_watchlist_site_fatal_aborts_remaining_urls_and_redacts_proxy_secret():
+    called = []
+    aborted = []
+
+    class FatalURLScraper(_StubScraper):
+        async def scrape_product_page(self, url):
+            called.append(url)
+            if url.endswith("/fatal"):
+                raise ConnectionError(
+                    "proxy http://user:top-secret@az.decodo.com:30001 rejected HTTP 407"
+                )
+            return object()
+
+    def on_abort(current, remaining, error):
+        aborted.append((current, remaining, str(error)))
+
+    with pytest.raises(base.SiteScrapeFatalError) as exc_info:
+        await FatalURLScraper().scrape_urls(
+            ["https://site/ok", "https://site/fatal", "https://site/skipped"],
+            on_abort=on_abort,
+        )
+
+    assert called == ["https://site/ok", "https://site/fatal"]
+    assert aborted == [
+        (
+            "https://site/fatal",
+            ["https://site/skipped"],
+            "proxy access rejected: HTTP 407",
+        )
+    ]
+    assert "top-secret" not in str(exc_info.value)
+    assert "az.decodo.com" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_base_enter_converts_proxy_auth_and_closes_partial_resources(monkeypatch):
+    scraper = _StubScraper()
+    closed = []
+
+    async def fail_open():
+        raise RuntimeError("Browser launch net::ERR_INVALID_AUTH_CREDENTIALS")
+
+    async def close_resources():
+        closed.append(True)
+
+    monkeypatch.setattr(scraper, "_open_browser", fail_open)
+    monkeypatch.setattr(scraper, "_close_resources", close_resources)
+
+    with pytest.raises(base.SiteScrapeFatalError, match="HTTP 407"):
+        await scraper.__aenter__()
+    assert closed == [True]
+
+
+def test_site_fatal_result_marks_every_unstarted_item():
+    result = base.site_fatal_result(
+        "pharmonline",
+        ["one", "two"],
+        base.SiteScrapeFatalError("Decodo proxy access rejected: HTTP 407"),
+    )
+
+    assert result.items_expected == 2
+    assert result.items_completed == 0
+    assert result.items_failed == 2
+    assert result.site_fatal is True
+    assert set(result.item_results) == {"one", "two"}
+    assert {item["status"] for item in result.item_results.values()} == {"skipped"}
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("proxy rejected connection: HTTP 407", 407),
+        ("407 Proxy Authentication Required", 407),
+        ("Page.goto: net::ERR_PROXY_AUTH_REQUESTED", 407),
+        ("net::ERR_INVALID_AUTH_CREDENTIALS", 407),
+        ("status_code=402", 402),
+        ("connection timed out", None),
+        ("target returned HTTP 403", None),
+    ],
+)
+def test_fatal_proxy_status_only_matches_account_level_failures(message, expected):
+    assert base.fatal_proxy_status(RuntimeError(message)) == expected
+
+
+def test_site_fatal_result_never_persists_proxy_url_or_credentials():
+    result = base.site_fatal_result(
+        "aloe",
+        ["cat"],
+        ConnectionError(
+            "proxy http://user:top-secret@az.decodo.com:30001 rejected HTTP 407"
+        ),
+    )
+    payload = repr((result.errors, result.item_results))
+    assert "top-secret" not in payload
+    assert "az.decodo.com" not in payload
+    assert "HTTP 407" in payload
+
+
+def test_invalid_proxy_type_is_fatal_even_when_message_omits_class_name():
+    class InvalidProxy(Exception):
+        def __str__(self):
+            return "http://user:top-secret@proxy.invalid:9000 isn't a valid proxy"
+
+    error = InvalidProxy()
+
+    assert base.fatal_proxy_status(error) is None
+    assert base.fatal_proxy_reason(error) == "proxy configuration rejected"
+    assert base.site_fatal_error_message(error) == "proxy configuration rejected"
+
+
+@pytest.mark.asyncio
 async def test_scrape_on_category_error_does_not_break_scrape():
     """Падение on_category (persist умер) НЕ валит скрейп — логируется, остальные
     категории собираются (резильентность важнее одной неудачной записи)."""

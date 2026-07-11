@@ -49,7 +49,13 @@ from src.normalize import (
     extract_pack_size,
     normalize_name,
 )
-from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapedPromo
+from src.scrapers.base import (
+    BaseScraper,
+    ScrapedProduct,
+    ScrapedPromo,
+    SiteScrapeFatalError,
+    fatal_proxy_reason,
+)
 
 log = structlog.get_logger()
 
@@ -433,18 +439,38 @@ class AptekonlineScraper(BaseScraper):
                         if r.status_code == 200:
                             return r
                         last_resp = r
+                        if r.status_code in {402, 407}:
+                            raise SiteScrapeFatalError(
+                                f"Decodo proxy access rejected: HTTP {r.status_code}"
+                            )
                         # Жёсткий блок (403/401/451 или баланс 402/407): ретрай по
                         # ДРУГИМ портам бесполезен (это не флайки IP) — возвращаем
                         # сразу, не жжём оставшиеся попытки/баланс прокси.
                         if r.status_code in _HARD_BLOCK_STATUSES:
                             return r
+                    except httpx.ProxyError as exc:
+                        reason = fatal_proxy_reason(exc)
+                        if reason is not None:
+                            raise SiteScrapeFatalError(reason) from exc
+                        continue
                     except httpx.RequestError:
                         continue
                 return last_resp
             try:
-                return await persistent_client.get(
+                response = await persistent_client.get(
                     _API_PRODUCT_LIST, params=req_params
                 )
+                if proxied_via and response.status_code in {402, 407}:
+                    raise SiteScrapeFatalError(
+                        f"{proxied_via} proxy access rejected: "
+                        f"HTTP {response.status_code}"
+                    )
+                return response
+            except httpx.ProxyError as exc:
+                reason = fatal_proxy_reason(exc)
+                if reason is not None:
+                    raise SiteScrapeFatalError(reason) from exc
+                return None
             except httpx.RequestError:
                 return None
 
@@ -598,13 +624,23 @@ class AptekonlineScraper(BaseScraper):
         """
         try:
             page = await self.new_page()
+        except SiteScrapeFatalError:
+            raise
         except Exception as e:
+            reason = fatal_proxy_reason(e)
+            if reason is not None:
+                raise SiteScrapeFatalError(reason) from e
             log.warning("aptekonline_promos_browser_failed", error=str(e))
             return []
         try:
             try:
                 await self.goto(page, self.base_url)
+            except SiteScrapeFatalError:
+                raise
             except Exception as e:
+                reason = fatal_proxy_reason(e)
+                if reason is not None:
+                    raise SiteScrapeFatalError(reason) from e
                 log.warning("aptekonline_promos_goto_failed", error=str(e))
                 return []
             promos: list[ScrapedPromo] = []

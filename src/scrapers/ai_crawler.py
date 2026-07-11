@@ -44,6 +44,8 @@ from src.scrapers.base import (
     CaptchaDetected,
     ScrapedProduct,
     ScrapeResult,
+    SiteScrapeFatalError,
+    fatal_proxy_reason,
 )
 
 log = structlog.get_logger()
@@ -110,8 +112,12 @@ async def fetch_sitemap_urls(base_url: str, page: Page) -> list[str]:
             text = await robots_resp.text()
             for line in re.findall(r"(?im)^Sitemap:\s*(\S+)", text):
                 candidates.insert(0, line.strip())
-    except Exception:
-        pass
+    except SiteScrapeFatalError:
+        raise
+    except Exception as exc:
+        reason = fatal_proxy_reason(exc)
+        if reason is not None:
+            raise SiteScrapeFatalError(reason) from exc
 
     # Try every candidate; sites often split products/blog/categories into
     # separate sitemaps, so merge URLs from all that respond.
@@ -162,7 +168,12 @@ async def fetch_sitemap_urls(base_url: str, page: Page) -> list[str]:
             added = len(out) - before
             if added:
                 log.info("sitemap_loaded", url=sm_url, urls_added=added)
+        except SiteScrapeFatalError:
+            raise
         except Exception as e:
+            reason = fatal_proxy_reason(e)
+            if reason is not None:
+                raise SiteScrapeFatalError(reason) from e
             log.debug("sitemap_fetch_failed", url=sm_url, error=str(e))
             continue
 
@@ -599,7 +610,15 @@ class AICrawlerScraper(BaseScraper):
         session = CrawlSession(site_name=self.site_name, base_url=self.base_url)
         budget_usd = float(os.getenv("AI_CRAWL_BUDGET_USD", "5.0"))
 
-        page = await self.new_page()
+        try:
+            page = await self.new_page()
+        except SiteScrapeFatalError:
+            raise
+        except Exception as exc:
+            reason = fatal_proxy_reason(exc)
+            if reason is not None:
+                raise SiteScrapeFatalError(reason) from exc
+            raise
         try:
             # 1. Discover via sitemap
             log.info(
@@ -639,13 +658,22 @@ class AICrawlerScraper(BaseScraper):
                     # miss it. Don't fail if site is slow; just take what we have.
                     try:
                         await page.wait_for_load_state("networkidle", timeout=8000)
-                    except Exception:
-                        pass
+                    except SiteScrapeFatalError:
+                        raise
+                    except Exception as exc:
+                        reason = fatal_proxy_reason(exc)
+                        if reason is not None:
+                            raise SiteScrapeFatalError(reason) from exc
                     html = await page.content()
                 except CaptchaDetected:
                     session.captcha_urls.append(url)
                     continue
+                except SiteScrapeFatalError:
+                    raise
                 except Exception as e:
+                    reason = fatal_proxy_reason(e)
+                    if reason is not None:
+                        raise SiteScrapeFatalError(reason) from e
                     session.failed_urls.append(url)
                     log.debug("ai_crawl_url_failed", url=url, error=str(e))
                     continue
@@ -723,7 +751,10 @@ class AICrawlerScraper(BaseScraper):
                         cost_usd=round(session.estimated_cost_usd, 4),
                     )
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
 
         log.info(
             "ai_crawl_summary",
