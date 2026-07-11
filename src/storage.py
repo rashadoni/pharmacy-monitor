@@ -840,20 +840,31 @@ def curr_and_prev_snapshots_for_run(
     return curr_snaps, prev_by_product
 
 
-def financially_eligible_run_ids(session, *, tenant_id: int = 1) -> list[int]:
-    """Return run ids whose persisted quality envelope permits money outputs.
+def financially_eligible_run_ids(
+    session,
+    *,
+    tenant_id: int = 1,
+    include_run_id: int | None = None,
+) -> list[int]:
+    """Return completed run ids whose quality envelope permits money outputs.
 
     Keep the JSON interpretation in Python so the trust gate behaves the same
     on PostgreSQL and SQLite (tests/dev). Legacy rows without the envelope are
-    deliberately excluded.
+    deliberately excluded. ``include_run_id`` is the one explicit in-pipeline
+    exception for a classified current run whose post-processing is not done.
     """
-    from sqlalchemy import select
+    from sqlalchemy import or_, select
+
+    completion_filter = Run.finished_at.is_not(None)
+    if include_run_id is not None:
+        completion_filter = or_(completion_filter, Run.id == include_run_id)
 
     rows = session.execute(
         select(Run.id, Run.status, Run.run_quality).where(
             Run.tenant_id == tenant_id,
             Run.status == "ok",
             Run.run_quality.is_not(None),
+            completion_filter,
         )
     ).all()
     return [
@@ -863,12 +874,34 @@ def financially_eligible_run_ids(session, *, tenant_id: int = 1) -> list[int]:
     ]
 
 
+def has_unfinished_run(session, *, tenant_id: int = 1) -> bool:
+    """Whether scrape or post-processing can still mutate live product state.
+
+    Products and their match membership are intentionally mutable rather than
+    versioned by run.  External live financial calculations therefore cannot
+    combine a completed snapshot lineage with that state while any run is
+    unfinished.  Stale orphan runs also remain fail-closed until recovery.
+    """
+    from sqlalchemy import exists, select
+
+    return bool(
+        session.scalar(
+            select(
+                exists().where(
+                    Run.tenant_id == tenant_id,
+                    Run.finished_at.is_(None),
+                )
+            )
+        )
+    )
+
+
 def _terminal_run_ordering():
-    """Cross-database ordering by actual completion, with legacy fallback."""
-    from sqlalchemy import desc, func
+    """Cross-database ordering for runs whose post-processing has finished."""
+    from sqlalchemy import desc
 
     return (
-        desc(func.coalesce(Run.finished_at, Run.started_at)),
+        desc(Run.finished_at),
         desc(Run.id),
     )
 
@@ -885,7 +918,10 @@ def latest_terminal_run(session, *, tenant_id: int | None = 1) -> Run | None:
     """
     from sqlalchemy import select
 
-    stmt = select(Run).where(Run.status != "running")
+    stmt = select(Run).where(
+        Run.status != "running",
+        Run.finished_at.is_not(None),
+    )
     if tenant_id is not None:
         stmt = stmt.where(Run.tenant_id == tenant_id)
     return session.scalars(stmt.order_by(*_terminal_run_ordering()).limit(1)).first()
@@ -914,6 +950,7 @@ def latest_full_catalog_attempts_by_site(
         .where(
             Run.tenant_id == tenant_id,
             Run.status != "running",
+            Run.finished_at.is_not(None),
             Run.run_quality.is_not(None),
             Run.run_quality["baseline_enforced"].as_boolean().is_(True),
         )
@@ -948,7 +985,10 @@ def latest_financial_run_ids_by_site(
         return {}
     runs = session.scalars(
         select(Run)
-        .where(Run.id.in_(eligible_ids))
+        .where(
+            Run.id.in_(eligible_ids),
+            Run.finished_at.is_not(None),
+        )
         .order_by(*_terminal_run_ordering())
     ).all()
     out: dict[str, int] = {}
@@ -967,6 +1007,7 @@ def latest_snapshots_per_product(
     *,
     financially_eligible_only: bool = False,
     tenant_id: int = 1,
+    include_run_id: int | None = None,
 ) -> dict[int, PriceSnapshot]:
     """Для каждого product_id из списка → его последний `PriceSnapshot`.
 
@@ -992,7 +1033,11 @@ def latest_snapshots_per_product(
 
     eligible_run_ids: list[int] | None = None
     if financially_eligible_only:
-        eligible_run_ids = financially_eligible_run_ids(session, tenant_id=tenant_id)
+        eligible_run_ids = financially_eligible_run_ids(
+            session,
+            tenant_id=tenant_id,
+            include_run_id=include_run_id,
+        )
         if not eligible_run_ids:
             return {}
 

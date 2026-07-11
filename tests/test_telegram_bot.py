@@ -1,17 +1,30 @@
 """Тесты Telegram-бота: маршрутизация команд + рендер сводок."""
 
+from datetime import timedelta
+
 from src._time import utcnow
 
-from src import telegram_bot
+from src import roi, telegram_bot
 from src.storage import AlertEvent, Match, PriceSnapshot, Product, Run
 
 
 def _add_run(s, started_at=None, products_scraped=10):
+    started_at = started_at or utcnow()
     r = Run(
-        started_at=started_at or utcnow(),
+        started_at=started_at,
+        finished_at=started_at,
         status="ok",
         products_scraped=products_scraped,
-        run_quality={"full_catalog_verified": True, "financially_eligible": True},
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
     )
     s.add(r)
     s.flush()
@@ -32,7 +45,7 @@ def test_cmd_help_lists_commands(db_session):
 
 def test_cmd_today_no_data(db_session):
     out = telegram_bot.cmd_today(db_session, "12345", "")
-    assert "данных пока нет" in out.lower() or "запусти" in out.lower()
+    assert "временно недоступны" in out.lower()
 
 
 def test_cmd_today_with_data(db_session):
@@ -66,9 +79,54 @@ def test_cmd_today_with_data(db_session):
         ]
     )
     db_session.commit()
+    actions = roi.compute_actions(db_session, client_site="pharmonline")
+    roi.cache_actions(
+        db_session,
+        "pharmonline",
+        actions,
+        run_id=run.id,
+    )
 
     out = telegram_bot.cmd_today(db_session, "12345", "")
     assert "Foo" in out
+
+
+def test_cmd_today_does_not_compute_from_unfinished_run(db_session):
+    run = _add_run(db_session)
+    run.finished_at = None
+    db_session.commit()
+
+    out = telegram_bot.cmd_today(db_session, "12345", "")
+
+    assert "временно недоступны" in out.lower()
+
+
+def test_cmd_today_hides_old_cache_after_degraded_full_attempt(db_session):
+    run = _add_run(db_session, started_at=utcnow() - timedelta(hours=1))
+    roi.cache_actions(db_session, "pharmonline", [], run_id=run.id)
+    degraded_at = utcnow()
+    db_session.add(
+        Run(
+            started_at=degraded_at,
+            finished_at=degraded_at,
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {
+                    "pharmonline": {"status": "degraded"},
+                    "aptekonline": {"status": "ok"},
+                    "aloe": {"status": "ok"},
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    out = telegram_bot.cmd_today(db_session, "12345", "")
+
+    assert "временно недоступны" in out.lower()
 
 
 def test_cmd_alerts_empty(db_session):

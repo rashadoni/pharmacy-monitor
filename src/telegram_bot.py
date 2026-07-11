@@ -82,7 +82,12 @@ def cmd_today(session: Session, chat_id: str, args: str) -> str:
     """Краткая сводка: топ-3 действия из ROI."""
     from src import roi
 
-    actions = roi.compute_actions(session)
+    actions = roi.get_cached_action_items(session, roi.CLIENT_SITE, tenant_id=1)
+    if actions is None:
+        return (
+            "📊 *Сегодня:* рекомендации временно недоступны — "
+            "нужен завершённый подтверждённый полный прогон."
+        )
     agg = roi.aggregate_impact(actions)
     if not actions:
         return "📊 *Сегодня:* данных пока нет — запусти прогон."

@@ -33,6 +33,7 @@ from src.storage import (
     PriceSnapshot,
     Promo,
     Run,
+    has_unfinished_run,
     latest_financial_run_ids_by_site,
     run_is_financially_eligible,
 )
@@ -72,6 +73,7 @@ def _detect_undercut_threshold(session: Session, run_id: int, params: dict) -> l
         session,
         matches,
         tenant_id=current_run.tenant_id,
+        include_run_id=run_id,
     )
     for m in matches:
         prices = _prices_for_match(session, m, run_id, snapshots_cache=snapshots)
@@ -268,6 +270,7 @@ def _detect_price_raise_opportunity(
         session,
         matches,
         tenant_id=current_run.tenant_id,
+        include_run_id=run_id,
     )
     for m in matches:
         prices = _prices_for_match(session, m, run_id, snapshots_cache=snapshots)
@@ -334,15 +337,36 @@ def evaluate_rules(
 ) -> list[AlertEvent]:
     """Прогнать все активные правила, создать AlertEvent для не-дубликатов.
 
-    `rule_ids` — если задан, прогоняются только указанные правила
-    (для UI "запустить вручную одно правило").
+    `run_id=None` — внешний auto-select: только completed и не superseded
+    full-catalog lineage. Явный `run_id` — внутренний in-pipeline путь,
+    который может вычислять алерты до установки `finished_at`.
+
+    `rule_ids` — если задан, прогоняются только указанные правила.
     """
     run: Run | None = None
     if run_id is None:
+        from src import roi as roi_mod
+
+        if has_unfinished_run(session, tenant_id=tenant_id):
+            log.warning(
+                "alerts_auto_select_run_in_progress",
+                tenant_id=tenant_id,
+            )
+            return []
+        if not roi_mod.financial_inputs_are_fresh(session, tenant_id=tenant_id):
+            log.warning(
+                "alerts_auto_select_inputs_unverified",
+                tenant_id=tenant_id,
+            )
+            return []
         recent = session.scalars(
             select(Run)
-            .where(Run.status == "ok", Run.tenant_id == tenant_id)
-            .order_by(desc(Run.id))
+            .where(
+                Run.status == "ok",
+                Run.finished_at.is_not(None),
+                Run.tenant_id == tenant_id,
+            )
+            .order_by(desc(Run.finished_at), desc(Run.id))
             .limit(100)
         ).all()
         run = next((item for item in recent if run_is_financially_eligible(item)), None)
@@ -442,6 +466,7 @@ def _financial_snapshots_for_matches(
     matches: list[Match],
     *,
     tenant_id: int,
+    include_run_id: int | None = None,
 ) -> dict[int, "PriceSnapshot"]:
     from src.storage import latest_snapshots_per_product
 
@@ -451,6 +476,7 @@ def _financial_snapshots_for_matches(
         product_ids,
         financially_eligible_only=True,
         tenant_id=tenant_id,
+        include_run_id=include_run_id,
     )
 
 
@@ -473,6 +499,7 @@ def _prices_for_match(
             session,
             [match],
             tenant_id=match.tenant_id,
+            include_run_id=run_id,
         )
     else:
         snaps = snapshots_cache

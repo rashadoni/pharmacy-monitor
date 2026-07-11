@@ -325,6 +325,33 @@ def get_cached_actions(
     return list(row.payload) if row.payload else []
 
 
+def get_cached_action_items(
+    session: Session,
+    client_site: str,
+    *,
+    tenant_id: int = 1,
+    max_age_hours: int = _CACHE_MAX_AGE_HOURS,
+) -> list[ActionItem] | None:
+    """Validated ActionItem view for non-HTTP consumers such as Telegram."""
+    payload = get_cached_actions(
+        session,
+        client_site,
+        tenant_id=tenant_id,
+        max_age_hours=max_age_hours,
+    )
+    if payload is None:
+        return None
+    try:
+        return [ActionItem(**row) for row in payload]
+    except (TypeError, ValueError) as exc:
+        log.warning(
+            "roi_actions_cache_invalid_payload",
+            client_site=client_site,
+            error=str(exc),
+        )
+        return None
+
+
 def refresh_all_cached_actions(
     session: Session,
     *,
@@ -383,6 +410,8 @@ def compute_actions(
     «месячному impact'у» потому что объёмы продаж нам неизвестны (см.
     module docstring).
     """
+    global CLIENT_SITE, COMPETITOR_SITES
+
     # Load per-tenant config (creates default row if missing).
     cfg = storage.load_pricing_config(session, tenant_id)
     # Apply explicit overrides (kwargs win over DB).
@@ -398,7 +427,22 @@ def compute_actions(
     global _CURRENT_MIN_MARGIN_PCT
     _CURRENT_MIN_MARGIN_PCT = min_margin
 
-    global CLIENT_SITE, COMPETITOR_SITES
+    if storage.has_unfinished_run(session, tenant_id=tenant_id):
+        log.warning(
+            "roi_compute_run_in_progress",
+            client_site=client_site or CLIENT_SITE,
+            tenant_id=tenant_id,
+        )
+        return []
+
+    if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
+        log.warning(
+            "roi_compute_inputs_unverified",
+            client_site=client_site or CLIENT_SITE,
+            tenant_id=tenant_id,
+        )
+        return []
+
     orig_client = CLIENT_SITE
     orig_competitors = COMPETITOR_SITES
     if client_site and client_site != CLIENT_SITE:

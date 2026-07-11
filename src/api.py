@@ -633,12 +633,15 @@ def health_endpoint(db: Session = Depends(get_db)):
             for site, attempt in full_attempts.items()
         )
     )
-    full_unhealthy = bool(full_attempts) and not full_verified
+    # A healthy DB/Redis and a recent partial tick are not sufficient for
+    # financially trusted output. A fresh installation (or lost history) must
+    # remain fail-closed until every required site's full catalog is verified.
+    full_unhealthy = not full_verified
     full_completed_at = max(
         (attempt.finished_at or attempt.started_at for attempt in full_attempts.values()),
         default=None,
     )
-    full_status = None
+    full_status = "missing"
     if full_attempts:
         full_status = "ok" if full_verified else "degraded"
         if any(attempt.status == "failed" for attempt in full_attempts.values()):

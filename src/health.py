@@ -136,8 +136,13 @@ def check_health(
         storage.FULL_CATALOG_SITES,
         tenant_id=1,
     )
-    if full_attempts:
-        unverified_sites: dict[str, dict] = {}
+    unverified_sites: dict[str, dict] = {}
+    if not full_attempts:
+        unverified_sites = {
+            site: {"run_id": None, "status": "missing"}
+            for site in storage.FULL_CATALOG_SITES
+        }
+    else:
         for site in storage.FULL_CATALOG_SITES:
             attempt = full_attempts.get(site)
             if attempt is None:
@@ -157,27 +162,27 @@ def check_health(
                     "status": attempt.status,
                     "site_status": site_status,
                 }
-        if unverified_sites:
-            severity: Severity = (
-                "critical"
-                if any(
-                    row.get("status") == "failed" or row.get("site_status") == "failed"
-                    for row in unverified_sites.values()
-                )
-                else "warning"
+    if unverified_sites:
+        severity: Severity = (
+            "critical"
+            if any(
+                row.get("status") == "failed" or row.get("site_status") == "failed"
+                for row in unverified_sites.values()
             )
-            summary = ", ".join(
-                f"{site}=#{row.get('run_id') or '—'}:{row.get('site_status') or row['status']}"
-                for site, row in unverified_sites.items()
+            else "warning"
+        )
+        summary = ", ".join(
+            f"{site}=#{row.get('run_id') or '—'}:{row.get('site_status') or row['status']}"
+            for site, row in unverified_sites.items()
+        )
+        report.issues.append(
+            HealthIssue(
+                severity,
+                "full_catalog_unverified",
+                f"Полный каталог не подтверждён: {summary}.",
+                context={"sites": unverified_sites},
             )
-            report.issues.append(
-                HealthIssue(
-                    severity,
-                    "full_catalog_unverified",
-                    f"Полный каталог не подтверждён: {summary}.",
-                    context={"sites": unverified_sites},
-                )
-            )
+        )
 
     # 3. Empty check (только если статус ok)
     if last_run.status == "ok" and (last_run.products_scraped or 0) < min_products:

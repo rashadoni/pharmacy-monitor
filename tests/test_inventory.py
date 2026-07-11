@@ -28,10 +28,21 @@ def _add_product(s, site, name, ext_id, canonical_id=None):
 
 
 def _add_run(s):
+    now = utcnow()
     r = Run(
-        started_at=utcnow(),
+        started_at=now,
+        finished_at=now,
         status="ok",
-        run_quality={"full_catalog_verified": True, "financially_eligible": True},
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
     )
     s.add(r)
     s.flush()

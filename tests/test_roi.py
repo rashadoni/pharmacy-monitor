@@ -37,7 +37,13 @@ def _eligible_quality() -> dict:
 
 
 def _make_run(s, products_with_prices: list[tuple[Product, float]]) -> Run:
-    r = Run(started_at=utcnow(), status="ok", run_quality=_eligible_quality())
+    now = utcnow()
+    r = Run(
+        started_at=now,
+        finished_at=now,
+        status="ok",
+        run_quality=_eligible_quality(),
+    )
     s.add(r)
     s.flush()
     for product, price in products_with_prices:
@@ -68,7 +74,13 @@ def _make_cluster(s, name: str, sites_prices: dict[str, float], run: Run | None 
 
 def _shared_run(s) -> Run:
     """Создать пустой Run для совместного использования в тестах с несколькими кластерами."""
-    r = Run(started_at=utcnow(), status="ok", run_quality=_eligible_quality())
+    now = utcnow()
+    r = Run(
+        started_at=now,
+        finished_at=now,
+        status="ok",
+        run_quality=_eligible_quality(),
+    )
     s.add(r)
     s.flush()
     return r
@@ -149,7 +161,13 @@ def test_assortment_gap_detected(db_session):
 
 def test_promo_response_action(db_session):
     """Промо на сайте конкурента → promo_response action."""
-    run = Run(started_at=utcnow(), status="ok", run_quality=_eligible_quality())
+    now = utcnow()
+    run = Run(
+        started_at=now,
+        finished_at=now,
+        status="ok",
+        run_quality=_eligible_quality(),
+    )
     db_session.add(run)
     db_session.flush()
     db_session.add(
@@ -169,23 +187,41 @@ def test_promo_response_action(db_session):
 
 
 def test_promo_responses_use_latest_verified_run_per_competitor_site(db_session):
+    now = utcnow()
     apt_run = Run(
-        started_at=utcnow(),
+        started_at=now,
+        finished_at=now,
         status="ok",
         run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
             "financially_eligible": True,
             "sites": {"aptekonline": {"status": "ok"}},
         },
     )
     aloe_run = Run(
-        started_at=utcnow(),
+        started_at=now,
+        finished_at=now,
         status="ok",
         run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
             "financially_eligible": True,
             "sites": {"aloe": {"status": "ok"}},
         },
     )
-    db_session.add_all([apt_run, aloe_run])
+    pharm_run = Run(
+        started_at=now,
+        finished_at=now,
+        status="ok",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {"pharmonline": {"status": "ok"}},
+        },
+    )
+    db_session.add_all([apt_run, aloe_run, pharm_run])
     db_session.flush()
     db_session.add_all(
         [
@@ -481,6 +517,155 @@ def test_roi_cache_tie_breaks_equal_completion_by_run_id(db_session):
     db_session.commit()
 
     assert roi.get_cached_actions(db_session, "pharmonline") is None
+
+
+def test_roi_cache_ignores_new_full_attempt_until_post_processing_finishes(db_session):
+    from src.storage import RoiActionsCache
+
+    completed_at = utcnow() - timedelta(hours=1)
+    cached_run = _shared_run(db_session)
+    cached_run.started_at = completed_at - timedelta(minutes=30)
+    cached_run.finished_at = completed_at
+    db_session.add(
+        RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            payload=[{"type": "price_raise", "title": "trusted"}],
+            computed_at=utcnow(),
+            run_id=cached_run.id,
+        )
+    )
+    post_processing = Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=None,
+        status="ok",
+        run_quality=_eligible_quality(),
+    )
+    db_session.add(post_processing)
+    db_session.commit()
+
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is True
+    assert roi.get_cached_actions(db_session, "pharmonline") is not None
+
+    post_processing.finished_at = utcnow()
+    db_session.commit()
+
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is True
+    assert roi.get_cached_actions(db_session, "pharmonline") is None
+
+
+def test_direct_compute_fails_closed_after_degraded_full_attempt(db_session):
+    trusted = _shared_run(db_session)
+    _make_cluster(
+        db_session,
+        "Fail closed",
+        {"pharmonline": 10.0, "aloe": 8.0},
+        run=trusted,
+    )
+    degraded_at = utcnow()
+    db_session.add(
+        Run(
+            tenant_id=1,
+            started_at=degraded_at,
+            finished_at=degraded_at,
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {
+                    "pharmonline": {"status": "degraded"},
+                    "aptekonline": {"status": "ok"},
+                    "aloe": {"status": "ok"},
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    assert roi.compute_actions(db_session, client_site="pharmonline") == []
+
+
+def test_direct_compute_ignores_unfinished_eligible_snapshots(db_session):
+    match = Match(canonical_name="Snapshot boundary", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Snapshot boundary",
+        "boundary-ph",
+        canonical_id=match.id,
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Snapshot boundary",
+        "boundary-al",
+        canonical_id=match.id,
+    )
+    completed = _shared_run(db_session)
+    completed.started_at = utcnow() - timedelta(hours=1)
+    completed.finished_at = completed.started_at
+    db_session.add_all(
+        [
+            PriceSnapshot(run_id=completed.id, product_id=client.id, price=10.0),
+            PriceSnapshot(run_id=completed.id, product_id=competitor.id, price=12.0),
+        ]
+    )
+    unfinished = Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=None,
+        status="ok",
+        run_quality=_eligible_quality(),
+    )
+    db_session.add(unfinished)
+    db_session.flush()
+    db_session.add_all(
+        [
+            PriceSnapshot(run_id=unfinished.id, product_id=client.id, price=10.0),
+            PriceSnapshot(run_id=unfinished.id, product_id=competitor.id, price=5.0),
+        ]
+    )
+    db_session.commit()
+
+    actions = roi.compute_actions(db_session, client_site="pharmonline")
+
+    assert not [item for item in actions if item.type == "undercut"]
+
+
+def test_direct_compute_blocks_during_run_but_completed_cache_remains_available(db_session):
+    completed = _shared_run(db_session)
+    _make_cluster(
+        db_session,
+        "Mutable graph boundary",
+        {"pharmonline": 10.0, "aptekonline": 7.0, "aloe": 9.0},
+        run=completed,
+    )
+    actions = roi.compute_actions(db_session, client_site="pharmonline")
+    assert actions
+    roi.cache_actions(
+        db_session,
+        "pharmonline",
+        actions,
+        run_id=completed.id,
+    )
+
+    unfinished = Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=None,
+        status="running",
+    )
+    db_session.add(unfinished)
+    db_session.commit()
+
+    assert roi.compute_actions(db_session, client_site="pharmonline") == []
+    cached = roi.get_cached_actions(db_session, "pharmonline")
+    assert cached is not None
+    assert len(cached) == len(actions)
 
 
 def test_cache_actions_upserts_existing(db_session):

@@ -17,11 +17,15 @@ from src.storage import (
 
 
 def _add_run(s, started_at=None, status="ok") -> Run:
+    started_at = started_at or utcnow()
     r = Run(
-        started_at=started_at or utcnow(),
+        started_at=started_at,
+        finished_at=started_at + timedelta(minutes=1),
         status=status,
         run_quality=(
             {
+                "baseline_enforced": True,
+                "full_catalog_verified": True,
                 "financially_eligible": True,
                 "sites": {
                     "pharmonline": {"status": "ok"},
@@ -101,6 +105,9 @@ def test_undercut_threshold_fires(db_session):
     p_client = _add_product(db_session, "pharmonline", "Foo", "ph", canonical_id=m.id)
     p_comp = _add_product(db_session, "aloe", "Foo", "al", canonical_id=m.id)
     run = _add_run(db_session)
+    # Explicit run_id is the trusted in-pipeline path and intentionally works
+    # before run.finished_at is stamped after post-processing.
+    run.finished_at = None
     _add_snap(db_session, run, p_client, 10.0)
     _add_snap(db_session, run, p_comp, 8.0)  # 20% дешевле
     _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
@@ -110,6 +117,131 @@ def test_undercut_threshold_fires(db_session):
     assert len(fired) == 1
     assert fired[0].rule_type == "undercut_threshold"
     assert fired[0].severity == "critical"
+
+
+def test_auto_evaluate_selects_latest_completed_fresh_run(db_session):
+    match = _make_match(db_session, "Auto trusted")
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Auto trusted",
+        "auto-ph",
+        canonical_id=match.id,
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Auto trusted",
+        "auto-al",
+        canonical_id=match.id,
+    )
+    run = _add_run(db_session)
+    _add_snap(db_session, run, client, 10.0)
+    _add_snap(db_session, run, competitor, 8.0)
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session)
+
+    assert len(fired) == 1
+    assert fired[0].rule_type == "undercut_threshold"
+
+
+def test_auto_evaluate_ignores_unfinished_eligible_run(db_session):
+    match = _make_match(db_session, "Auto blocked during run")
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Auto blocked during run",
+        "blocked-ph",
+        canonical_id=match.id,
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Auto blocked during run",
+        "blocked-al",
+        canonical_id=match.id,
+    )
+    completed = _add_run(db_session, utcnow() - timedelta(hours=1))
+    _add_snap(db_session, completed, client, 10.0)
+    _add_snap(db_session, completed, competitor, 8.0)
+    unfinished = _add_run(db_session)
+    unfinished.finished_at = None
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    # Run A would produce a valid event, but external auto-evaluation must not
+    # read mutable Product/Match state while Run B is still changing it.
+    assert alerts.evaluate_rules(db_session) == []
+
+    unfinished.finished_at = utcnow()
+    unfinished.status = "failed"
+    unfinished.run_quality = None
+    db_session.commit()
+    fired = alerts.evaluate_rules(db_session)
+    assert len(fired) == 1
+    assert fired[0].payload["source_run_id"] == completed.id
+
+
+def test_auto_evaluate_does_not_mix_completed_run_with_unfinished_snapshots(db_session):
+    match = _make_match(db_session, "Snapshot boundary")
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Snapshot boundary",
+        "boundary-ph",
+        canonical_id=match.id,
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Snapshot boundary",
+        "boundary-al",
+        canonical_id=match.id,
+    )
+    completed = _add_run(db_session, utcnow() - timedelta(hours=1))
+    _add_snap(db_session, completed, client, 10.0)
+    _add_snap(db_session, completed, competitor, 12.0)
+    unfinished = _add_run(db_session, utcnow())
+    unfinished.finished_at = None
+    _add_snap(db_session, unfinished, client, 10.0)
+    _add_snap(db_session, unfinished, competitor, 5.0)
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session) == []
+
+    explicit = alerts.evaluate_rules(db_session, unfinished.id)
+    assert len(explicit) == 1
+    assert explicit[0].payload["competitor_price"] == 5.0
+
+
+def test_auto_evaluate_rejects_superseded_eligible_run(db_session):
+    trusted = _add_run(db_session, utcnow() - timedelta(hours=1))
+    _add_rule(db_session, "new_product")
+    degraded_at = utcnow()
+    db_session.add(
+        Run(
+            started_at=degraded_at,
+            finished_at=degraded_at,
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {
+                    "pharmonline": {"status": "degraded"},
+                    "aptekonline": {"status": "ok"},
+                    "aloe": {"status": "ok"},
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    assert storage.run_is_financially_eligible(trusted)
+    assert alerts.evaluate_rules(db_session) == []
 
 
 def test_undercut_prefetches_verified_snapshots_once(db_session, monkeypatch):

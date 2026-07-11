@@ -3,6 +3,7 @@
 from datetime import timedelta
 from src._time import utcnow
 
+from src import storage
 from src.health import alert_signature, check_health
 from src.storage import PriceSnapshot, Product, Run
 
@@ -53,6 +54,16 @@ def test_no_runs_returns_warning(db_session):
 def test_recent_ok_run_returns_ok(db_session):
     run = _add_run(db_session, utcnow() - timedelta(hours=1))
     _add_snap(db_session, run, "pharmonline", 10)
+    run.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {
+            "pharmonline": {"status": "ok"},
+            "aptekonline": {"status": "ok"},
+            "aloe": {"status": "ok"},
+        },
+    }
     db_session.commit()
     rep = check_health(db_session)
     assert rep.is_healthy
@@ -86,6 +97,57 @@ def test_running_run_does_not_hide_last_degraded_health(db_session):
     assert report.last_run_id == degraded.id
     assert report.status == "warning"
     assert any(issue.code == "last_run_degraded" for issue in report.issues)
+
+
+def test_post_processing_run_is_not_terminal_until_finished_at(db_session):
+    finished = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    finished.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {"pharmonline": {"status": "degraded"}},
+    }
+    post_processing = Run(
+        started_at=utcnow(),
+        finished_at=None,
+        status="ok",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
+    db_session.add(post_processing)
+    db_session.commit()
+
+    report = check_health(db_session)
+
+    assert report.last_run_id == finished.id
+    issue = next(i for i in report.issues if i.code == "full_catalog_unverified")
+    assert issue.context["sites"]["pharmonline"]["run_id"] == finished.id
+
+
+def test_partial_history_without_full_catalog_is_warning(db_session):
+    partial = _add_run(db_session, utcnow() - timedelta(hours=1), status="ok")
+    partial.run_quality = {
+        "baseline_enforced": False,
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {"pharmonline": {"status": "ok"}},
+    }
+    db_session.commit()
+
+    report = check_health(db_session)
+
+    assert report.status == "warning"
+    issue = next(i for i in report.issues if i.code == "full_catalog_unverified")
+    assert set(issue.context["sites"]) == set(storage.FULL_CATALOG_SITES)
+    assert all(row["status"] == "missing" for row in issue.context["sites"].values())
 
 
 def test_health_orders_terminal_runs_by_actual_completion(db_session):

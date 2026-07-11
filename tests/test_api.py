@@ -84,7 +84,9 @@ def test_health_endpoint(client):
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "up"
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "missing"
+    assert body["full_catalog_verified"] is False
     assert "last_run_at" in body
     assert "last_run_status" in body
     # Phase 0.3 — deep health fields
@@ -104,13 +106,14 @@ def test_health_endpoint_db_ping_responds_quickly(client):
 
 
 def test_health_endpoint_redis_unset_returns_null(client, monkeypatch):
-    """No REDIS_URL → redis_ping_ms is null, but health still reports up."""
+    """No REDIS_URL is non-fatal; missing full-catalog history remains degraded."""
     monkeypatch.delenv("REDIS_URL", raising=False)
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
     assert body["redis_ping_ms"] is None
-    assert body["status"] == "up"
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "missing"
 
 
 def test_health_endpoint_degraded_when_latest_run_degraded(client, setup_db):
@@ -133,6 +136,7 @@ def test_health_endpoint_does_not_hide_degraded_behind_running_run(client, setup
             storage.Run(
                 tenant_id=1,
                 started_at=utcnow() - timedelta(hours=1),
+                finished_at=utcnow() - timedelta(minutes=30),
                 status="degraded",
                 run_quality={"sites": {"aloe": {"status": "degraded"}}},
             ),
@@ -145,6 +149,74 @@ def test_health_endpoint_does_not_hide_degraded_behind_running_run(client, setup
     assert response.status_code == 200
     assert response.json()["status"] == "degraded"
     assert response.json()["last_run_status"] == "degraded"
+
+
+def test_health_endpoint_ignores_post_processing_run(client, setup_db):
+    now = utcnow()
+    setup_db.add_all(
+        [
+            storage.Run(
+                tenant_id=1,
+                started_at=now - timedelta(hours=1),
+                finished_at=now - timedelta(minutes=30),
+                status="degraded",
+                run_quality={
+                    "baseline_enforced": True,
+                    "full_catalog_verified": False,
+                    "financially_eligible": False,
+                    "sites": {"pharmonline": {"status": "degraded"}},
+                },
+            ),
+            storage.Run(
+                tenant_id=1,
+                started_at=now,
+                finished_at=None,
+                status="ok",
+                run_quality={
+                    "baseline_enforced": True,
+                    "full_catalog_verified": True,
+                    "financially_eligible": True,
+                    "sites": {
+                        "pharmonline": {"status": "ok"},
+                        "aptekonline": {"status": "ok"},
+                        "aloe": {"status": "ok"},
+                    },
+                },
+            ),
+        ]
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["last_run_status"] == "degraded"
+    assert body["full_catalog_status"] == "degraded"
+    assert body["full_catalog_verified"] is False
+
+
+def test_health_endpoint_without_full_catalog_history_is_fail_closed(client, setup_db):
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=utcnow() - timedelta(hours=1),
+            finished_at=utcnow(),
+            status="ok",
+            run_quality={
+                "baseline_enforced": False,
+                "financially_eligible": False,
+                "sites": {"pharmonline": {"status": "ok"}},
+            },
+        )
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "missing"
+    assert body["full_catalog_run_at"] is None
+    assert body["full_catalog_verified"] is False
 
 
 def test_health_endpoint_orders_terminal_runs_by_completion(client, setup_db):
@@ -312,7 +384,9 @@ def test_health_endpoint_uses_weekly_aptekonline_threshold(client, setup_db):
     assert r.status_code == 200
     body = r.json()
     assert body["staleness_warning"] is False
-    assert body["status"] == "up"
+    # Staleness is healthy, but no verified full-catalog lineage exists.
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "missing"
     sites = {s["site"]: s for s in body["sites"]}
     assert sites["aptekonline"]["hours_since"] >= 100
     assert sites["aptekonline"]["max_age_hours"] == 198

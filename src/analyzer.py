@@ -114,6 +114,7 @@ def analyze(session: Session, current_run_id: int) -> AnalysisReport:
         session,
         verified_only=verified_only,
         tenant_id=current_run.tenant_id,
+        include_run_id=current_run.id,
     )
 
     if prev_run is None:
@@ -210,6 +211,7 @@ def _detect_undercuts(
     *,
     verified_only: bool = False,
     tenant_id: int = 1,
+    include_run_id: int | None = None,
 ) -> list[CompetitorUndercut]:
     """Конкурент дешевле клиента на тот же canonical_match → undercut.
 
@@ -235,6 +237,7 @@ def _detect_undercuts(
         all_match_product_ids,
         financially_eligible_only=verified_only,
         tenant_id=tenant_id,
+        include_run_id=include_run_id,
     )
 
     undercuts: list[CompetitorUndercut] = []
