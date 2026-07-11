@@ -5,6 +5,9 @@
 @layer base {
   :root {
     color-scheme: light;
+    /* Tailwind's font-sans uses var(--font-sans). Without a defined value the
+       entire font-family declaration is invalid and browsers fall back to Times. */
+    --font-sans: ui-sans-serif;
     --background: 0 0% 100%;
     --foreground: 240 10% 3.9%;
     --card: 0 0% 100%;
