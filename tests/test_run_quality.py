@@ -45,8 +45,7 @@ def _result(
         items_completed=completed,
         items_failed=failed,
         item_results={
-            f"cat-{index}": {"status": "ok", "products": 1}
-            for index in range(completed)
+            f"cat-{index}": {"status": "ok", "products": 1} for index in range(completed)
         },
     )
 
@@ -76,9 +75,7 @@ def test_classify_run_quality_matrix(
         enforce_baseline=enforce_baseline,
     )
     assert status == expected_status
-    assert quality["financially_eligible"] is (
-        expected_status == "ok" and enforce_baseline
-    )
+    assert quality["financially_eligible"] is (expected_status == "ok" and enforce_baseline)
 
 
 def test_intentional_partial_run_is_ok_but_not_financially_eligible():
@@ -173,9 +170,7 @@ class _DummyScraper(BaseScraper):
 
 @pytest.mark.asyncio
 async def test_base_scraper_tracks_zero_error_and_captcha_categories():
-    scraper = _DummyScraper(
-        {"ok": "ok", "empty": "empty", "error": "error", "captcha": "captcha"}
-    )
+    scraper = _DummyScraper({"ok": "ok", "empty": "empty", "error": "error", "captcha": "captcha"})
     result = await scraper.scrape(["ok", "empty", "error", "captcha"])
     assert result.items_expected == 4
     assert result.items_completed == 1
@@ -226,9 +221,7 @@ def test_quality_baseline_uses_tenant_scoped_verified_median(db_session):
     )
     db_session.commit()
 
-    assert run_quality_baselines_for_sites(db_session, ["aloe"], tenant_id=1) == {
-        "aloe": 110
-    }
+    assert run_quality_baselines_for_sites(db_session, ["aloe"], tenant_id=1) == {"aloe": 110}
 
 
 def test_degraded_run_is_copied_to_scrape_request_queue(db_session):

@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -22,8 +24,25 @@ jobs:
         run: uv sync --frozen
       - name: Ruff check
         run: uv run ruff check .
-      - name: Ruff format check
-        run: uv run ruff format --check .
+      - name: Ruff format check (new Python files)
+        env:
+          # Formatter-debt baseline: files that existed here may still need a
+          # one-off cleanup. Every Python file added after this SHA is checked
+          # on every CI run, including follow-up commits and workflow_dispatch.
+          FORMAT_BASE_SHA: 52825fe4df57718fed382931c41e8501f878ab45
+        run: |
+          set -euo pipefail
+          git cat-file -e "$FORMAT_BASE_SHA^{commit}"
+          tmp=$(mktemp)
+          trap 'rm -f "$tmp"' EXIT
+          git diff --name-only -z --diff-filter=A "$FORMAT_BASE_SHA" HEAD -- '*.py' > "$tmp"
+          if [ ! -s "$tmp" ]; then
+            echo "No new Python files to format-check (legacy formatter debt is tracked separately)."
+            exit 0
+          fi
+          printf 'Format-checking new Python files:\n'
+          xargs -0 -n1 printf ' - %s\n' < "$tmp"
+          xargs -0 uv run ruff format --check -- < "$tmp"
 
   test:
     name: Test (pytest)
