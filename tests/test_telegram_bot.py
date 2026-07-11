@@ -11,6 +11,7 @@ def _add_run(s, started_at=None, products_scraped=10):
         started_at=started_at or utcnow(),
         status="ok",
         products_scraped=products_scraped,
+        run_quality={"full_catalog_verified": True, "financially_eligible": True},
     )
     s.add(r)
     s.flush()

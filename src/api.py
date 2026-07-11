@@ -602,7 +602,12 @@ def health_endpoint(db: Session = Depends(get_db)):
     endpoint itself stays 200 so we can distinguish "API up but DB slow"
     from "API down entirely".
     """
-    last = db.scalars(select(storage.Run).order_by(desc(storage.Run.id)).limit(1)).first()
+    last = db.scalars(
+        select(storage.Run)
+        .where(storage.Run.status != "running")
+        .order_by(desc(storage.Run.id))
+        .limit(1)
+    ).first()
     db_ms = _ping_db(db)
     redis_ms = _ping_redis()
     sites = _staleness_per_site(db)
@@ -611,7 +616,8 @@ def health_endpoint(db: Session = Depends(get_db)):
         and s.hours_since > s.max_age_hours
         for s in sites
     )
-    status_label = "degraded" if (stale or db_ms is None) else "up"
+    run_unhealthy = last is not None and last.status in {"degraded", "failed"}
+    status_label = "degraded" if (stale or db_ms is None or run_unhealthy) else "up"
     return HealthOut(
         status=status_label,
         last_run_at=last.started_at if last else None,
@@ -986,10 +992,15 @@ def dash_scrape_trigger(
     """Поставить scrape-запрос в очередь. Server watcher подберёт в течение ~60 секунд.
 
     Использует таблицу `scrape_requests`. Возвращает 202 + id запроса —
-    UI polls статус до status='ok'/'failed'.
+    UI polls статус до status='ok'/'degraded'/'failed'.
     """
     if user.role not in ("admin", "owner"):
         raise HTTPException(403, "Admin role required")
+    if user.tenant_id != 1:
+        raise HTTPException(
+            409,
+            "Server-side scraping is not enabled for this tenant yet",
+        )
     if payload.mode not in ("all", "category"):
         raise HTTPException(400, "mode must be 'all' or 'category'")
     if payload.mode == "category" and not payload.category_id:
@@ -1070,9 +1081,9 @@ def dash_scrape_requests(
 ):
     """Последние scrape-запросы tenant'а. UI polls этот endpoint для статуса.
 
-    Для request'ов со status='ok' (то есть scrape завершился успешно и есть run_id)
-    подмешиваем агрегаты из Run: products_scraped (total) + products_per_site
-    ({site: count}). UI показывает «Готово ✓ — N товаров (pharm: X, apt: Y)».
+    Для terminal request'ов с run_id подмешиваем агрегаты из Run:
+    products_scraped (total) + products_per_site ({site: count}). UI отличает
+    подтверждённый ok от частичного degraded и failed.
     """
     reqs = db.scalars(
         select(storage.ScrapeRequest)
@@ -1085,7 +1096,12 @@ def dash_scrape_requests(
     run_ids = [r.run_id for r in reqs if r.run_id]
     runs_map: dict[int, storage.Run] = {}
     if run_ids:
-        rows = db.scalars(select(storage.Run).where(storage.Run.id.in_(run_ids))).all()
+        rows = db.scalars(
+            select(storage.Run).where(
+                storage.Run.id.in_(run_ids),
+                storage.Run.tenant_id == user.tenant_id,
+            )
+        ).all()
         runs_map = {run.id: run for run in rows}
 
     out = []
@@ -1121,7 +1137,10 @@ def internal_pending_scrape(db: Session = Depends(get_db)):
     """
     req = db.scalar(
         select(storage.ScrapeRequest)
-        .where(storage.ScrapeRequest.status == "pending")
+        .where(
+            storage.ScrapeRequest.status == "pending",
+            storage.ScrapeRequest.tenant_id == 1,
+        )
         .order_by(storage.ScrapeRequest.id)
         .limit(1)
     )
@@ -1129,7 +1148,7 @@ def internal_pending_scrape(db: Session = Depends(get_db)):
         return {"pending": None}
     # Mark as running immediately, чтобы не подобрать дважды
     req.status = "running"
-    req.started_at = datetime.utcnow()
+    req.started_at = utcnow()
     db.commit()
     return {
         "pending": {
@@ -1152,27 +1171,37 @@ def internal_scrape_complete(
     payload: ScrapeCompleteIn,
     db: Session = Depends(get_db),
 ):
-    """Server watcher вызывает после завершения. status → 'ok' или 'failed'.
+    """Server watcher callback after command exit.
 
-    Идемпотентность: если запрос уже помечен 'ok' (через `pharmacy-monitor run
-    --request-id` сразу после persist phase) — НЕ откатываем обратно в 'failed',
-    даже если pharmacy-monitor позже упал в matcher/analyzer. UI уже показал
-    клиенту «Готово — N товаров», менять статус задним числом некорректно.
+    `run --request-id` writes the authoritative scrape-phase terminal state
+    (ok/degraded/failed) before matcher/analyzer. The watcher must never replace
+    degraded with ok merely because the process later exited zero.
     """
     req = db.scalar(select(storage.ScrapeRequest).where(storage.ScrapeRequest.id == request_id))
     if not req:
         raise HTTPException(404, "Request not found")
-    if req.status == "ok" and payload.error_message:
-        # Уже завершено успешно (early-complete от pharmacy-monitor); ошибка в
-        # post-persist фазе (matcher/analyzer) логируется в error_message но не
-        # меняет статус.
-        req.error_message = (
-            f"{req.error_message or ''} | post-persist: {payload.error_message}"
-        ).strip(" |")
+    payload_run = None
+    if payload.run_id is not None:
+        payload_run = db.scalar(
+            select(storage.Run).where(
+                storage.Run.id == payload.run_id,
+                storage.Run.tenant_id == req.tenant_id,
+            )
+        )
+        if payload_run is None:
+            raise HTTPException(400, "Run does not belong to scrape request tenant")
+    if req.status in {"ok", "degraded", "failed"}:
+        if payload.error_message:
+            req.error_message = (
+                f"{req.error_message or ''} | post-persist: {payload.error_message}"
+            ).strip(" |")
+        if payload.run_id is not None:
+            req.run_id = payload.run_id
+        req.completed_at = req.completed_at or utcnow()
         db.commit()
-        return {"ok": True, "noop": "already ok"}
+        return {"ok": True, "noop": f"already {req.status}"}
     req.status = "failed" if payload.error_message else "ok"
-    req.completed_at = datetime.utcnow()
+    req.completed_at = utcnow()
     if payload.run_id is not None:
         req.run_id = payload.run_id
     req.error_message = payload.error_message
@@ -1960,9 +1989,10 @@ def dash_roi_actions(
 
     P0.1 (PO Audit 2026-05-17): compute_actions для 3к матчей занимает 15-30с
     и frontend timeout'ит на 15с (API 408 на 4 экранах). Сейчас читаем из
-    roi_actions_cache (pre-computed после каждого scrape success). Если кэш
-    отсутствует или старше 26ч — fallback inline compute (медленно, но даёт
-    данные новому tenant'у пока первый scrape не отработал).
+    roi_actions_cache (pre-computed только после verified full-catalog run).
+    Если кэш отсутствует, stale или относится к partial/degraded run — 503.
+    Inline fallback запрещён: он читал globally-latest snapshots и мог тихо
+    смешать подтверждённые данные с частичным прогоном.
 
     Параметр locale (ru/az/en) применяется поверх кэша — title/detail
     реконструируются из структурных полей, кэш не инвалидируется.
@@ -1976,15 +2006,10 @@ def dash_roi_actions(
     if cached is not None:
         return [roi.translate_action(a, locale) for a in cached]
 
-    # Fallback: compute inline (медленно, но всегда даёт ответ)
-    actions = roi.compute_actions(db, client_site=client_site)
-    payload = [roi._action_to_dict(a) for a in actions]
-    # Лениво кэшируем — следующие запросы пойдут из БД
-    try:
-        roi.cache_actions(db, client_site, actions, tenant_id=user.tenant_id)
-    except Exception:
-        pass  # cache write не должен валить запрос
-    return [roi.translate_action(a, locale) for a in payload]
+    raise HTTPException(
+        503,
+        "Verified full-catalog recommendations are not available yet",
+    )
 
 
 @app.get("/api/v1/dash/alerts")
@@ -2874,6 +2899,7 @@ def _run_row_out(r: storage.Run) -> dict:
         "status": r.status,
         "products_scraped": r.products_scraped,
         "products_per_site": r.products_per_site,
+        "run_quality": r.run_quality,
         "sites_completed": r.sites_completed,
         "error_message": r.error_message,
     }
@@ -2926,10 +2952,16 @@ def dash_run_breakdown(
       "run_id": int, "started_at": iso, "finished_at": iso, "status": str,
       "products_scraped": int,
       "products_per_site": {site: total_count},
-      "products_per_site_category": {site: {category: count}}
+      "products_per_site_category": {site: {category: count}},
+      "run_quality": {version, mode, financially_eligible, sites}
     }
     """
-    run = db.scalar(select(storage.Run).where(storage.Run.id == run_id))
+    run = db.scalar(
+        select(storage.Run).where(
+            storage.Run.id == run_id,
+            storage.Run.tenant_id == user.tenant_id,
+        )
+    )
     if not run:
         raise HTTPException(404, "Run not found")
     return {
@@ -2940,6 +2972,7 @@ def dash_run_breakdown(
         "products_scraped": run.products_scraped or 0,
         "products_per_site": run.products_per_site or {},
         "products_per_site_category": run.products_per_site_category or {},
+        "run_quality": run.run_quality,
         "sites_completed": run.sites_completed,
     }
 

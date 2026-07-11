@@ -63,7 +63,9 @@ class Run(Base):
     tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default="running")  # running/ok/failed
+    status: Mapped[str] = mapped_column(
+        String(20), default="running"
+    )  # running/ok/degraded/failed
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     products_scraped: Mapped[int] = mapped_column(Integer, default=0)
     sites_completed: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -76,8 +78,21 @@ class Run(Base):
     # category-маршруту на каждом сайте. Используется в UI «Coverage» панели и
     # для debug — клиент видит «pharm scraped 100 vitamins, apt scraped 320».
     products_per_site_category: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Versioned quality envelope populated after the scrape phase. Contains
+    # per-site and per-category/URL expected/completed/failed counters, reasons
+    # and bounded errors. Financial alerts may only use status='ok' runs.
+    run_quality: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     snapshots: Mapped[list["PriceSnapshot"]] = relationship(back_populates="run")
+
+
+def run_is_financially_eligible(run: Run | None) -> bool:
+    """Only a verified full-catalog run may drive money recommendations."""
+    return bool(
+        run is not None
+        and run.status == "ok"
+        and (run.run_quality or {}).get("financially_eligible") is True
+    )
 
 
 class ScrapeRequest(Base):
@@ -87,7 +102,7 @@ class ScrapeRequest(Base):
     status='pending'. Server-side watcher (`pharmacy-monitor-scrape-watcher.timer`)
     polls API на pending → если есть, исполняет `pharmacy-monitor run ...` на
     прод-сервере через оплаченные proxy/direct scrape-пути → PATCH запись
-    status='ok'+run_id.
+    terminal status (ok/degraded/failed) + run_id.
 
     Очередь нужна, чтобы UI не держал HTTP request во время долгого scrape и
     чтобы watcher сериализовал тяжёлые run/scrape/rematch задачи.
@@ -107,7 +122,7 @@ class ScrapeRequest(Base):
     )
     sites: Mapped[str | None] = mapped_column(String(200), nullable=True)  # CSV
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
-    # pending → running → ok/failed
+    # pending → running → ok/degraded/failed
     requested_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -752,7 +767,10 @@ def make_session(database_url: str | None = None):
 
 
 def curr_and_prev_snapshots_for_run(
-    session, current_run: "Run"
+    session,
+    current_run: "Run",
+    *,
+    financially_eligible_only: bool = False,
 ) -> tuple[list[PriceSnapshot], dict[int, PriceSnapshot]]:
     """Snapshots в current_run + последний snapshot из предыдущих прогонов.
 
@@ -785,25 +803,36 @@ def curr_and_prev_snapshots_for_run(
         return curr_snaps, {}
 
     product_ids = list({s.product_id for s in curr_snaps})
+    previous_filters = [
+        PriceSnapshot.product_id.in_(product_ids),
+        Run.started_at < current_run.started_at,
+    ]
+    eligible_ids: list[int] | None = None
+    if financially_eligible_only:
+        eligible_ids = financially_eligible_run_ids(
+            session,
+            tenant_id=current_run.tenant_id,
+        )
+        previous_filters.append(PriceSnapshot.run_id.in_(eligible_ids))
     prev_max_subq = (
         select(
             PriceSnapshot.product_id,
             func.max(PriceSnapshot.captured_at).label("max_at"),
         )
         .join(Run, Run.id == PriceSnapshot.run_id)
-        .where(
-            PriceSnapshot.product_id.in_(product_ids),
-            Run.started_at < current_run.started_at,
-        )
+        .where(*previous_filters)
         .group_by(PriceSnapshot.product_id)
         .subquery()
     )
-    prev_snaps = session.scalars(
-        select(PriceSnapshot).join(
+    prev_stmt = select(PriceSnapshot).join(
             prev_max_subq,
             (PriceSnapshot.product_id == prev_max_subq.c.product_id)
             & (PriceSnapshot.captured_at == prev_max_subq.c.max_at),
         )
+    if eligible_ids is not None:
+        prev_stmt = prev_stmt.where(PriceSnapshot.run_id.in_(eligible_ids))
+    prev_snaps = session.scalars(
+        prev_stmt.order_by(PriceSnapshot.product_id, PriceSnapshot.id.desc())
     ).all()
     prev_by_product: dict[int, PriceSnapshot] = {}
     for s in prev_snaps:
@@ -811,7 +840,67 @@ def curr_and_prev_snapshots_for_run(
     return curr_snaps, prev_by_product
 
 
-def latest_snapshots_per_product(session, product_ids) -> dict[int, PriceSnapshot]:
+def financially_eligible_run_ids(session, *, tenant_id: int = 1) -> list[int]:
+    """Return run ids whose persisted quality envelope permits money outputs.
+
+    Keep the JSON interpretation in Python so the trust gate behaves the same
+    on PostgreSQL and SQLite (tests/dev). Legacy rows without the envelope are
+    deliberately excluded.
+    """
+    from sqlalchemy import select
+
+    rows = session.execute(
+        select(Run.id, Run.status, Run.run_quality).where(
+            Run.tenant_id == tenant_id,
+            Run.status == "ok",
+            Run.run_quality.is_not(None),
+        )
+    ).all()
+    return [
+        int(run_id)
+        for run_id, status, quality in rows
+        if status == "ok" and (quality or {}).get("financially_eligible") is True
+    ]
+
+
+def latest_financial_run_ids_by_site(
+    session,
+    sites,
+    *,
+    tenant_id: int = 1,
+    before_run_id: int | None = None,
+) -> dict[str, int]:
+    """Latest verified full-catalog run lineage for each requested site."""
+    from sqlalchemy import desc, select
+
+    wanted = set(sites)
+    if not wanted:
+        return {}
+    eligible_ids = financially_eligible_run_ids(session, tenant_id=tenant_id)
+    if before_run_id is not None:
+        eligible_ids = [run_id for run_id in eligible_ids if run_id < before_run_id]
+    if not eligible_ids:
+        return {}
+    runs = session.scalars(
+        select(Run).where(Run.id.in_(eligible_ids)).order_by(desc(Run.id))
+    ).all()
+    out: dict[str, int] = {}
+    for run in runs:
+        for site, details in ((run.run_quality or {}).get("sites") or {}).items():
+            if site in wanted and site not in out and details.get("status") == "ok":
+                out[site] = run.id
+        if wanted.issubset(out):
+            break
+    return out
+
+
+def latest_snapshots_per_product(
+    session,
+    product_ids,
+    *,
+    financially_eligible_only: bool = False,
+    tenant_id: int = 1,
+) -> dict[int, PriceSnapshot]:
     """Для каждого product_id из списка → его последний `PriceSnapshot`.
 
     Работает в обоих режимах persist'а:
@@ -834,21 +923,34 @@ def latest_snapshots_per_product(session, product_ids) -> dict[int, PriceSnapsho
     if not product_ids:
         return {}
 
+    eligible_run_ids: list[int] | None = None
+    if financially_eligible_only:
+        eligible_run_ids = financially_eligible_run_ids(session, tenant_id=tenant_id)
+        if not eligible_run_ids:
+            return {}
+
+    filters = [PriceSnapshot.product_id.in_(product_ids)]
+    if eligible_run_ids is not None:
+        filters.append(PriceSnapshot.run_id.in_(eligible_run_ids))
+
     latest_at_subq = (
         select(
             PriceSnapshot.product_id,
             func.max(PriceSnapshot.captured_at).label("max_at"),
         )
-        .where(PriceSnapshot.product_id.in_(product_ids))
+        .where(*filters)
         .group_by(PriceSnapshot.product_id)
         .subquery()
     )
-    snaps = session.scalars(
-        select(PriceSnapshot).join(
+    latest_stmt = select(PriceSnapshot).join(
             latest_at_subq,
             (PriceSnapshot.product_id == latest_at_subq.c.product_id)
             & (PriceSnapshot.captured_at == latest_at_subq.c.max_at),
         )
+    if eligible_run_ids is not None:
+        latest_stmt = latest_stmt.where(PriceSnapshot.run_id.in_(eligible_run_ids))
+    snaps = session.scalars(
+        latest_stmt.order_by(PriceSnapshot.product_id, PriceSnapshot.id.desc())
     ).all()
     out: dict[int, PriceSnapshot] = {}
     for s in snaps:

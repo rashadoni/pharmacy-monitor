@@ -4,7 +4,7 @@ from datetime import timedelta
 from src._time import utcnow
 
 
-from src import alerts
+from src import alerts, storage
 from src.storage import (
     AlertEvent,
     AlertRule,
@@ -17,10 +17,36 @@ from src.storage import (
 
 
 def _add_run(s, started_at=None, status="ok") -> Run:
-    r = Run(started_at=started_at or utcnow(), status=status)
+    r = Run(
+        started_at=started_at or utcnow(),
+        status=status,
+        run_quality=(
+            {
+                "financially_eligible": True,
+                "sites": {
+                    "pharmonline": {"status": "ok"},
+                    "aptekonline": {"status": "ok"},
+                    "aloe": {"status": "ok"},
+                },
+            }
+            if status == "ok"
+            else None
+        ),
+    )
     s.add(r)
     s.flush()
     return r
+
+
+def test_evaluate_rules_skips_degraded_and_intentional_partial_runs(db_session):
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    degraded = _add_run(db_session, status="degraded")
+    partial = _add_run(db_session, status="ok")
+    partial.run_quality = {"financially_eligible": False}
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session, degraded.id) == []
+    assert alerts.evaluate_rules(db_session, partial.id) == []
 
 
 def _add_product(s, site, name, ext_id, canonical_id=None) -> Product:
@@ -84,6 +110,63 @@ def test_undercut_threshold_fires(db_session):
     assert len(fired) == 1
     assert fired[0].rule_type == "undercut_threshold"
     assert fired[0].severity == "critical"
+
+
+def test_undercut_prefetches_verified_snapshots_once(db_session, monkeypatch):
+    run = _add_run(db_session)
+    for index in range(2):
+        match = _make_match(db_session, f"Product {index}")
+        client = _add_product(
+            db_session,
+            "pharmonline",
+            f"Product {index}",
+            f"ph-{index}",
+            canonical_id=match.id,
+        )
+        competitor = _add_product(
+            db_session,
+            "aloe",
+            f"Product {index}",
+            f"al-{index}",
+            canonical_id=match.id,
+        )
+        _add_snap(db_session, run, client, 10.0)
+        _add_snap(db_session, run, competitor, 8.0)
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    original = storage.latest_snapshots_per_product
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "latest_snapshots_per_product", counted)
+    assert len(alerts.evaluate_rules(db_session, run.id)) == 2
+    assert calls == 1
+
+
+def test_undercut_detector_does_not_leak_foreign_tenant_match(db_session):
+    run = _add_run(db_session)
+    foreign_match = Match(tenant_id=2, canonical_name="Foreign", confidence=1.0)
+    db_session.add(foreign_match)
+    db_session.flush()
+    client = _add_product(
+        db_session, "pharmonline", "Foreign", "foreign-ph", canonical_id=foreign_match.id
+    )
+    competitor = _add_product(
+        db_session, "aloe", "Foreign", "foreign-al", canonical_id=foreign_match.id
+    )
+    client.tenant_id = 2
+    competitor.tenant_id = 2
+    _add_snap(db_session, run, client, 10.0)
+    _add_snap(db_session, run, competitor, 1.0)
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session, run.id) == []
 
 
 def test_undercut_below_threshold_no_fire(db_session):
@@ -154,6 +237,23 @@ def test_price_drop_detects_yesterday_to_today(db_session):
     assert fired[0].payload["drop_pct"] == 30.0
 
 
+def test_price_drop_ignores_newer_partial_snapshot_as_baseline(db_session):
+    product = _add_product(db_session, "aloe", "Trusted", "trusted")
+    trusted = _add_run(db_session, utcnow() - timedelta(days=2))
+    partial = _add_run(db_session, utcnow() - timedelta(days=1))
+    partial.run_quality = {"financially_eligible": False}
+    current = _add_run(db_session, utcnow())
+    _add_snap(db_session, trusted, product, 100.0)
+    _add_snap(db_session, partial, product, 200.0)
+    _add_snap(db_session, current, product, 90.0)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 20.0})
+    db_session.commit()
+
+    # Verified 100 → 90 is only 10%. The newer partial value 200 must not
+    # manufacture a false 55% money alert.
+    assert alerts.evaluate_rules(db_session, current.id) == []
+
+
 def test_new_product_detected(db_session):
     yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
     today = _add_run(db_session, utcnow())
@@ -184,6 +284,37 @@ def test_promo_started_detected(db_session):
     new_promos = [f for f in fired if f.rule_type == "promo_started"]
     assert len(new_promos) == 1
     assert "Brand New Sale" in new_promos[0].title
+
+
+def test_promo_started_compares_previous_verified_run_of_same_site(db_session):
+    aloe_previous = _add_run(db_session, utcnow() - timedelta(days=2))
+    interleaved_aptek = _add_run(db_session, utcnow() - timedelta(days=1))
+    current = _add_run(db_session, utcnow())
+    aloe_previous.run_quality = {
+        "financially_eligible": True,
+        "sites": {"aloe": {"status": "ok"}},
+    }
+    interleaved_aptek.run_quality = {
+        "financially_eligible": True,
+        "sites": {"aptekonline": {"status": "ok"}},
+    }
+    current.run_quality = {
+        "financially_eligible": True,
+        "sites": {"aloe": {"status": "ok"}},
+    }
+    db_session.add_all(
+        [
+            Promo(run_id=aloe_previous.id, site="aloe", title="Existing"),
+            Promo(run_id=interleaved_aptek.id, site="aptekonline", title="Other Site"),
+            Promo(run_id=current.id, site="aloe", title="Existing"),
+            Promo(run_id=current.id, site="aloe", title="New Aloe Promo"),
+        ]
+    )
+    _add_rule(db_session, "promo_started")
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, current.id)
+    assert [event.payload["title"] for event in fired] == ["New Aloe Promo"]
 
 
 def test_inactive_rule_not_evaluated(db_session):

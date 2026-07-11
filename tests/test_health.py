@@ -3,7 +3,7 @@
 from datetime import timedelta
 from src._time import utcnow
 
-from src.health import check_health
+from src.health import alert_signature, check_health
 from src.storage import PriceSnapshot, Product, Run
 
 
@@ -57,6 +57,50 @@ def test_recent_ok_run_returns_ok(db_session):
     rep = check_health(db_session)
     assert rep.is_healthy
     assert rep.status == "ok"
+
+
+def test_degraded_run_is_warning_and_changes_alert_signature(db_session):
+    run = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    run.error_message = "aloe=degraded(incomplete_items)"
+    run.run_quality = {
+        "sites": {
+            "aloe": {"status": "degraded", "reasons": ["incomplete_items"]}
+        }
+    }
+    db_session.commit()
+    report = check_health(db_session)
+    assert report.status == "warning"
+    assert any(issue.code == "last_run_degraded" for issue in report.issues)
+    assert "last_run_degraded:" in alert_signature(report)
+
+
+def test_running_run_does_not_hide_last_degraded_health(db_session):
+    degraded = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    degraded.run_quality = {
+        "sites": {"aloe": {"status": "degraded", "reasons": ["incomplete_items"]}}
+    }
+    db_session.add(Run(started_at=utcnow(), status="running"))
+    db_session.commit()
+
+    report = check_health(db_session)
+    assert report.last_run_id == degraded.id
+    assert report.status == "warning"
+    assert any(issue.code == "last_run_degraded" for issue in report.issues)
+
+
+def test_degraded_run_with_failed_site_is_critical(db_session):
+    run = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    run.run_quality = {
+        "sites": {
+            "aloe": {"status": "ok", "reasons": []},
+            "aptekonline": {"status": "failed", "reasons": ["zero_products"]},
+        }
+    }
+    db_session.commit()
+    report = check_health(db_session)
+    assert report.status == "critical"
+    issue = next(item for item in report.issues if item.code == "degraded_site_failed")
+    assert issue.context["site"] == "aptekonline"
 
 
 def test_site_silence_critical_when_one_site_stale(db_session):

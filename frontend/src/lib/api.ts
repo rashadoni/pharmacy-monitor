@@ -607,6 +607,7 @@ export interface RunRow {
   status: string;
   products_scraped: number;
   products_per_site: Record<string, number> | null;
+  run_quality: RunQuality | null;
   sites_completed: string | null;
   error_message: string | null;
 }
@@ -619,7 +620,31 @@ export interface RunBreakdown {
   products_scraped: number;
   products_per_site: Record<string, number>;
   products_per_site_category: Record<string, Record<string, number>>;
+  run_quality: RunQuality | null;
   sites_completed: string | null;
+}
+
+export interface RunQualitySite {
+  status: "ok" | "degraded" | "failed";
+  products: number;
+  items_expected: number;
+  items_completed: number;
+  items_failed: number;
+  baseline_products: number | null;
+  baseline_fraction: number | null;
+  reasons: string[];
+  errors: string[];
+  errors_truncated: number;
+  items_truncated: number;
+}
+
+export interface RunQuality {
+  version: number;
+  mode: string;
+  baseline_enforced: boolean;
+  full_catalog_verified: boolean;
+  financially_eligible: boolean;
+  sites: Record<string, RunQualitySite>;
 }
 
 export interface LatestRunBySite {
@@ -1011,15 +1036,15 @@ export interface ScrapeRequestRow {
   mode: string;
   category_id: number | null;
   sites: string | null;
-  status: "pending" | "running" | "ok" | "failed";
+  status: "pending" | "running" | "ok" | "degraded" | "failed";
   requested_at: string | null;
   started_at: string | null;
   completed_at: string | null;
   run_id: number | null;
   error_message: string | null;
-  /** Total products across all sites in the run (filled when status=ok). */
+  /** Total products across all sites in the terminal run. */
   products_scraped: number | null;
-  /** Per-site breakdown {site: count} from runs.products_per_site (filled when status=ok). */
+  /** Per-site breakdown {site: count} from a terminal run. */
   products_per_site: Record<string, number> | null;
 }
 

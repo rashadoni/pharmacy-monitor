@@ -281,6 +281,14 @@ class ScrapeResult:
     products: list[ScrapedProduct] = field(default_factory=list)
     promos: list[ScrapedPromo] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Quality telemetry for the unit of work requested from this site. In
+    # category mode the unit is a category slug; in watchlist mode it is a URL.
+    # `item_results` is persisted on Run.run_quality so a degraded run can name
+    # the exact category/URL that failed instead of looking generically "ok".
+    items_expected: int = 0
+    items_completed: int = 0
+    items_failed: int = 0
+    item_results: dict[str, dict] = field(default_factory=dict)
 
 
 class BaseScraper(ABC):
@@ -549,7 +557,7 @@ class BaseScraper(ABC):
         """Опционально — собрать промо/баннеры с главной. По умолчанию — ничего."""
         return []
 
-    async def scrape_urls(self, urls: list[str]) -> list[ScrapedProduct]:
+    async def scrape_urls(self, urls: list[str], on_result=None) -> list[ScrapedProduct]:
         """Watchlist-режим: посетить список URL и собрать продукты."""
         out: list[ScrapedProduct] = []
         for url in urls:
@@ -557,8 +565,14 @@ class BaseScraper(ABC):
                 product = await self.scrape_product_page(url)
                 if product:
                     out.append(product)
+                    if on_result is not None:
+                        on_result(url, product, None)
+                elif on_result is not None:
+                    on_result(url, None, "product_not_found")
             except Exception as e:
                 log.warning("scrape_url_failed", url=url, error=str(e))
+                if on_result is not None:
+                    on_result(url, None, f"{type(e).__name__}: {e}")
         return out
 
     async def scrape(
@@ -577,7 +591,8 @@ class BaseScraper(ABC):
         прогон (pharmonline DDP ~7ч) теряет ВСЁ собранное. Callback сохраняет каждую
         категорию сразу. Ошибка callback'а НЕ валит скрейп (логируется и идём дальше).
         """
-        result = ScrapeResult(site=self.site_name)
+        requested_slugs = [slug for slug in category_slugs if slug is not None]
+        result = ScrapeResult(site=self.site_name, items_expected=len(requested_slugs))
         captcha_hits = 0
         category_failures = 0
 
@@ -597,6 +612,22 @@ class BaseScraper(ABC):
                     category=slug,
                     products=count,
                 )
+                if count == 0:
+                    msg = f"category={slug}: empty result"
+                    result.errors.append(msg)
+                    result.items_failed += 1
+                    result.item_results[str(slug)] = {
+                        "status": "empty",
+                        "products": 0,
+                        "error": "category returned zero products",
+                        "error_kind": "empty",
+                    }
+                else:
+                    result.items_completed += 1
+                    result.item_results[str(slug)] = {
+                        "status": "ok",
+                        "products": count,
+                    }
                 if on_category is not None and cat_products:
                     try:
                         on_category(self.site_name, slug, cat_products)
@@ -614,11 +645,25 @@ class BaseScraper(ABC):
                     "category_captcha_blocked", site=self.site_name, slug=slug, error=str(e)
                 )
                 result.errors.append(msg)
+                result.items_failed += 1
+                result.item_results[str(slug)] = {
+                    "status": "failed",
+                    "products": 0,
+                    "error": str(e)[:500],
+                    "error_kind": "captcha",
+                }
             except Exception as e:
                 category_failures += 1
                 msg = f"category={slug}: {type(e).__name__}: {e}"
                 log.error("category_failed", site=self.site_name, error=msg)
                 result.errors.append(msg)
+                result.items_failed += 1
+                result.item_results[str(slug)] = {
+                    "status": "failed",
+                    "products": 0,
+                    "error": f"{type(e).__name__}: {e}"[:500],
+                    "error_kind": "exception",
+                }
 
         try:
             result.promos = await self.scrape_promos()

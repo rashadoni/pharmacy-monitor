@@ -244,12 +244,21 @@ def seed_demo(session: Session, force: bool = False) -> dict:
 
     # --- Runs ---
     n_seed_products = 3 * len(SEED_MATCHED) + sum(len(v) for v in SEED_UNMATCHED.values())
+    demo_quality = {
+        "version": 1,
+        "mode": "demo",
+        "baseline_enforced": False,
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {},
+    }
     run_yesterday = Run(
         started_at=yesterday,
         finished_at=yesterday + timedelta(minutes=2),
         status="ok",
         sites_completed="pharmonline,aptekonline,aloe",
         products_scraped=n_seed_products,
+        run_quality=dict(demo_quality),
     )
     run_today = Run(
         started_at=today,
@@ -257,6 +266,7 @@ def seed_demo(session: Session, force: bool = False) -> dict:
         status="ok",
         sites_completed="pharmonline,aptekonline,aloe",
         products_scraped=n_seed_products,
+        run_quality=dict(demo_quality),
     )
     session.add_all([run_yesterday, run_today])
     session.flush()

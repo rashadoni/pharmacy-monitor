@@ -113,6 +113,40 @@ def test_health_endpoint_redis_unset_returns_null(client, monkeypatch):
     assert body["status"] == "up"
 
 
+def test_health_endpoint_degraded_when_latest_run_degraded(client, setup_db):
+    setup_db.add(
+        storage.Run(
+            status="degraded",
+            finished_at=utcnow(),
+            run_quality={"sites": {"aloe": {"status": "degraded"}}},
+        )
+    )
+    setup_db.commit()
+    body = client.get("/health").json()
+    assert body["status"] == "degraded"
+    assert body["last_run_status"] == "degraded"
+
+
+def test_health_endpoint_does_not_hide_degraded_behind_running_run(client, setup_db):
+    setup_db.add_all(
+        [
+            storage.Run(
+                tenant_id=1,
+                started_at=utcnow() - timedelta(hours=1),
+                status="degraded",
+                run_quality={"sites": {"aloe": {"status": "degraded"}}},
+            ),
+            storage.Run(tenant_id=1, started_at=utcnow(), status="running"),
+        ]
+    )
+    setup_db.commit()
+
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert response.json()["last_run_status"] == "degraded"
+
+
 def test_health_endpoint_flags_staleness(client, setup_db):
     """Daily-cadence site older than 30h → staleness_warning=true, status=degraded."""
 
@@ -2937,3 +2971,141 @@ def test_recreate_email_after_soft_delete_still_409(client, auth_cookie, setup_d
         json={"email": "stillthere@x.az", "name": "X", "role": "viewer"},
     )
     assert r.status_code == 409
+
+
+def test_scrape_complete_preserves_degraded_terminal_status(client, setup_db):
+    run = storage.Run(tenant_id=1, status="degraded", finished_at=utcnow())
+    setup_db.add(run)
+    setup_db.flush()
+    request_row = storage.ScrapeRequest(
+        tenant_id=1,
+        mode="all",
+        status="degraded",
+        run_id=run.id,
+        completed_at=utcnow(),
+        error_message="aloe=degraded(incomplete_items)",
+    )
+    setup_db.add(request_row)
+    setup_db.commit()
+
+    response = client.post(
+        f"/api/v1/internal/scrape-complete/{request_row.id}",
+        headers={"X-API-Key": "test-key-1234"},
+        json={"run_id": run.id},
+    )
+    assert response.status_code == 200
+    assert response.json()["noop"] == "already degraded"
+    setup_db.refresh(request_row)
+    assert request_row.status == "degraded"
+    assert request_row.error_message == "aloe=degraded(incomplete_items)"
+
+
+def test_run_endpoints_serialize_quality(client, auth_cookie, setup_db):
+    run = storage.Run(
+        tenant_id=1,
+        status="degraded",
+        finished_at=utcnow(),
+        products_scraped=5,
+        products_per_site={"aloe": 5},
+        products_per_site_category={"aloe": {"cat": 5}},
+        run_quality={
+            "version": 1,
+            "mode": "category",
+            "financially_eligible": False,
+            "sites": {"aloe": {"status": "degraded"}},
+        },
+    )
+    setup_db.add(run)
+    setup_db.commit()
+
+    rows = client.get("/api/v1/dash/runs?limit=1").json()
+    assert rows[0]["run_quality"]["sites"]["aloe"]["status"] == "degraded"
+    detail = client.get(f"/api/v1/dash/runs/{run.id}/breakdown").json()
+    assert detail["run_quality"]["financially_eligible"] is False
+
+
+def test_run_breakdown_is_tenant_scoped(client, auth_cookie, setup_db):
+    foreign_run = storage.Run(
+        tenant_id=2,
+        status="degraded",
+        run_quality={"sites": {"aloe": {"items": {"secret-url": {}}}}},
+    )
+    setup_db.add(foreign_run)
+    setup_db.commit()
+
+    response = client.get(f"/api/v1/dash/runs/{foreign_run.id}/breakdown")
+    assert response.status_code == 404
+
+
+def test_scrape_complete_rejects_cross_tenant_run(client, setup_db):
+    request_row = storage.ScrapeRequest(tenant_id=2, mode="all", status="running")
+    foreign_run = storage.Run(tenant_id=1, status="ok")
+    setup_db.add_all([request_row, foreign_run])
+    setup_db.commit()
+
+    response = client.post(
+        f"/api/v1/internal/scrape-complete/{request_row.id}",
+        headers={"X-API-Key": "test-key-1234"},
+        json={"run_id": foreign_run.id},
+    )
+    assert response.status_code == 400
+    setup_db.refresh(request_row)
+    assert request_row.status == "running"
+    assert request_row.run_id is None
+
+
+def test_pending_scrape_worker_ignores_non_pilot_tenant(client, setup_db):
+    foreign_request = storage.ScrapeRequest(tenant_id=2, mode="all", status="pending")
+    pilot_request = storage.ScrapeRequest(tenant_id=1, mode="all", status="pending")
+    setup_db.add_all([foreign_request, pilot_request])
+    setup_db.commit()
+
+    response = client.get(
+        "/api/v1/internal/pending-scrape",
+        headers={"X-API-Key": "test-key-1234"},
+    )
+    assert response.status_code == 200
+    assert response.json()["pending"]["id"] == pilot_request.id
+    setup_db.refresh(foreign_request)
+    assert foreign_request.status == "pending"
+
+
+def test_roi_actions_refuses_inline_compute_without_verified_cache(
+    client, auth_cookie
+):
+    response = client.get("/api/v1/dash/roi/actions")
+    assert response.status_code == 503
+    assert "Verified full-catalog" in response.json()["detail"]
+
+
+def test_roi_actions_serves_cache_from_financially_eligible_run(
+    client, auth_cookie, setup_db
+):
+    run = storage.Run(
+        tenant_id=1,
+        status="ok",
+        finished_at=utcnow(),
+        run_quality={
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
+    setup_db.add(run)
+    setup_db.flush()
+    setup_db.add(
+        storage.RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            run_id=run.id,
+            computed_at=utcnow(),
+            payload=[],
+        )
+    )
+    setup_db.commit()
+    response = client.get("/api/v1/dash/roi/actions")
+    assert response.status_code == 200
+    assert response.json() == []

@@ -15,6 +15,7 @@ import structlog
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from src import storage
 from src.storage import Match, PriceSnapshot, Product, Promo, Run
 
 log = structlog.get_logger()
@@ -84,12 +85,21 @@ def analyze(session: Session, current_run_id: int) -> AnalysisReport:
     if not current_run:
         raise ValueError(f"Run {current_run_id} not found")
 
+    verified_only = storage.run_is_financially_eligible(current_run)
+
+    prev_stmt = select(Run).where(
+        Run.id != current_run_id,
+        Run.status == "ok",
+        Run.tenant_id == current_run.tenant_id,
+    )
+    if verified_only:
+        eligible_ids = storage.financially_eligible_run_ids(
+            session,
+            tenant_id=current_run.tenant_id,
+        )
+        prev_stmt = prev_stmt.where(Run.id.in_(eligible_ids))
     prev_run = session.scalars(
-        select(Run)
-        .where(Run.id != current_run_id)
-        .where(Run.status == "ok")
-        .order_by(desc(Run.started_at))
-        .limit(1)
+        prev_stmt.order_by(desc(Run.started_at)).limit(1)
     ).first()
 
     report = AnalysisReport(
@@ -100,7 +110,11 @@ def analyze(session: Session, current_run_id: int) -> AnalysisReport:
     )
 
     # Undercut — это состояние "здесь и сейчас", считаем всегда (даже на первом прогоне)
-    report.undercuts = _detect_undercuts(session)
+    report.undercuts = _detect_undercuts(
+        session,
+        verified_only=verified_only,
+        tenant_id=current_run.tenant_id,
+    )
 
     if prev_run is None:
         log.info("analyzer_first_run", run_id=current_run.id)
@@ -110,9 +124,23 @@ def analyze(session: Session, current_run_id: int) -> AnalysisReport:
         }
         return report
 
-    report.price_changes = _detect_price_changes(session, current_run)
-    report.new_products = _detect_new_products(session, current_run)
-    report.promo_changes = _detect_promo_changes(session, prev_run.id, current_run.id)
+    report.price_changes = _detect_price_changes(
+        session,
+        current_run,
+        verified_only=verified_only,
+    )
+    report.new_products = _detect_new_products(
+        session,
+        current_run,
+        verified_only=verified_only,
+    )
+    report.promo_changes = _detect_promo_changes(
+        session,
+        prev_run.id,
+        current_run.id,
+        verified_only=verified_only,
+        tenant_id=current_run.tenant_id,
+    )
     report.summary_counts = {
         "price_changes": len(report.price_changes),
         "undercuts": len(report.undercuts),
@@ -125,7 +153,12 @@ def analyze(session: Session, current_run_id: int) -> AnalysisReport:
 # curr_and_prev_snapshots_for_run перенесён в storage.py — общий helper.
 
 
-def _detect_price_changes(session: Session, current_run: Run) -> list[PriceChange]:
+def _detect_price_changes(
+    session: Session,
+    current_run: Run,
+    *,
+    verified_only: bool = False,
+) -> list[PriceChange]:
     """Сравниваем curr-snap с последним snapshot'ом до current_run.started_at.
 
     После diff-only persist (2026-05-09) snapshots в curr_run — это уже
@@ -135,7 +168,11 @@ def _detect_price_changes(session: Session, current_run: Run) -> list[PriceChang
     """
     from src.storage import curr_and_prev_snapshots_for_run
 
-    curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(session, current_run)
+    curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(
+        session,
+        current_run,
+        financially_eligible_only=verified_only,
+    )
 
     changes: list[PriceChange] = []
     for curr in curr_snaps:
@@ -167,7 +204,13 @@ def _detect_price_changes(session: Session, current_run: Run) -> list[PriceChang
     return changes
 
 
-def _detect_undercuts(session: Session, threshold_pct: float = 0.0) -> list[CompetitorUndercut]:
+def _detect_undercuts(
+    session: Session,
+    threshold_pct: float = 0.0,
+    *,
+    verified_only: bool = False,
+    tenant_id: int = 1,
+) -> list[CompetitorUndercut]:
     """Конкурент дешевле клиента на тот же canonical_match → undercut.
 
     Diff-only-aware (2026-05-09): «текущая цена» = latest snapshot per product
@@ -175,9 +218,9 @@ def _detect_undercuts(session: Session, threshold_pct: float = 0.0) -> list[Comp
     иметь snapshot'а в каждом run'е, если цена не менялась). Используем
     aggregate `MAX(captured_at) GROUP BY product_id` + JOIN.
     """
-    from sqlalchemy import func
-
-    matches = session.scalars(select(Match).where(Match.products.any())).all()
+    matches = session.scalars(
+        select(Match).where(Match.products.any(), Match.tenant_id == tenant_id)
+    ).all()
 
     # Все product_ids из всех matches
     all_match_product_ids: set[int] = set()
@@ -187,26 +230,12 @@ def _detect_undercuts(session: Session, threshold_pct: float = 0.0) -> list[Comp
     if not all_match_product_ids:
         return []
 
-    # Latest snapshot per product (одна агрегатная SELECT)
-    latest_at_subq = (
-        select(
-            PriceSnapshot.product_id,
-            func.max(PriceSnapshot.captured_at).label("max_at"),
-        )
-        .where(PriceSnapshot.product_id.in_(all_match_product_ids))
-        .group_by(PriceSnapshot.product_id)
-        .subquery()
+    snaps_by_product = storage.latest_snapshots_per_product(
+        session,
+        all_match_product_ids,
+        financially_eligible_only=verified_only,
+        tenant_id=tenant_id,
     )
-    snaps_by_product: dict[int, PriceSnapshot] = {}
-    for snap in session.scalars(
-        select(PriceSnapshot).join(
-            latest_at_subq,
-            (PriceSnapshot.product_id == latest_at_subq.c.product_id)
-            & (PriceSnapshot.captured_at == latest_at_subq.c.max_at),
-        )
-    ).all():
-        # Дубли по captured_at маловероятны — оставим первый.
-        snaps_by_product.setdefault(snap.product_id, snap)
 
     undercuts: list[CompetitorUndercut] = []
     for m in matches:
@@ -258,7 +287,12 @@ def _detect_undercuts(session: Session, threshold_pct: float = 0.0) -> list[Comp
     return undercuts
 
 
-def _detect_new_products(session: Session, current_run: Run) -> list[NewProduct]:
+def _detect_new_products(
+    session: Session,
+    current_run: Run,
+    *,
+    verified_only: bool = False,
+) -> list[NewProduct]:
     """Товары, у которых до current_run.started_at не было ни одного snapshot'а.
 
     «Новый» = впервые видим. Если в `curr_and_prev_snapshots_for_run` для
@@ -266,7 +300,11 @@ def _detect_new_products(session: Session, current_run: Run) -> list[NewProduct]
     """
     from src.storage import curr_and_prev_snapshots_for_run
 
-    curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(session, current_run)
+    curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(
+        session,
+        current_run,
+        financially_eligible_only=verified_only,
+    )
 
     new_products: list[NewProduct] = []
     for snap in curr_snaps:
@@ -287,10 +325,38 @@ def _detect_new_products(session: Session, current_run: Run) -> list[NewProduct]
 
 
 def _detect_promo_changes(
-    session: Session, prev_run_id: int, curr_run_id: int
+    session: Session,
+    prev_run_id: int,
+    curr_run_id: int,
+    *,
+    verified_only: bool = False,
+    tenant_id: int = 1,
 ) -> list[PromoChange]:
-    prev = session.scalars(select(Promo).where(Promo.run_id == prev_run_id)).all()
     curr = session.scalars(select(Promo).where(Promo.run_id == curr_run_id)).all()
+    if verified_only:
+        from sqlalchemy import and_, or_
+
+        previous_by_site = storage.latest_financial_run_ids_by_site(
+            session,
+            {promo.site for promo in curr},
+            tenant_id=tenant_id,
+            before_run_id=curr_run_id,
+        )
+        if previous_by_site:
+            prev = session.scalars(
+                select(Promo).where(
+                    or_(
+                        *(
+                            and_(Promo.site == site, Promo.run_id == run_id)
+                            for site, run_id in previous_by_site.items()
+                        )
+                    )
+                )
+            ).all()
+        else:
+            prev = []
+    else:
+        prev = session.scalars(select(Promo).where(Promo.run_id == prev_run_id)).all()
 
     prev_keys: set[tuple[str, str]] = {(p.site, p.title) for p in prev}
     curr_keys: set[tuple[str, str]] = {(p.site, p.title) for p in curr}

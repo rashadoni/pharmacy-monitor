@@ -7,6 +7,7 @@ import { useLocale, useTranslations } from "next-intl";
 import { api, friendlyError, type CategoryRow, type CategorySuggestion } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { formatNumber, formatTime } from "@/lib/utils";
+import { isTerminalRunStatus, scrapeResultTextClass } from "@/lib/run-quality";
 
 /**
  * Извлечь slug категории из URL для каждого сайта.
@@ -503,7 +504,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
       )
     : undefined;
   const lastCompleted = !categoryId
-    ? requestsQ.data?.find((r) => r.status === "ok" || r.status === "failed")
+    ? requestsQ.data?.find((r) => isTerminalRunStatus(r.status))
     : undefined;
   const completedFreshlyMs = lastCompleted?.completed_at
     ? Date.now() - new Date(lastCompleted.completed_at).getTime()
@@ -582,7 +583,7 @@ function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow 
       </div>
     );
   }
-  // status === 'ok'
+  const degraded = req.status === "degraded";
   const total = req.products_scraped ?? 0;
   const perSite = req.products_per_site ?? {};
   const siteParts = Object.entries(perSite)
@@ -591,13 +592,22 @@ function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow 
     .join(", ");
   return (
     <div
-      className="text-xs text-success"
-      title={t("completed_title", {
-        id: req.run_id ?? "—",
-        date: formatTime(req.completed_at, locale),
-      })}
+      className={`text-xs ${scrapeResultTextClass(req.status)}`}
+      title={
+        degraded
+          ? t("degraded_title", {
+              id: req.run_id ?? "—",
+              error: req.error_message ?? "—",
+            })
+          : t("completed_title", {
+              id: req.run_id ?? "—",
+              date: formatTime(req.completed_at, locale),
+            })
+      }
     >
-      {t("scan_done_msg", { id: req.id, total: formatNumber(total, locale) })}
+      {degraded
+        ? t("scan_degraded_msg", { id: req.id, total: formatNumber(total, locale) })
+        : t("scan_done_msg", { id: req.id, total: formatNumber(total, locale) })}
       {siteParts && <span className="text-muted-foreground"> ({siteParts})</span>}
     </div>
   );

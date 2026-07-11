@@ -59,7 +59,12 @@ def check_health(
     """Запустить все проверки и вернуть совокупный отчёт."""
     report = HealthReport(status="ok")
 
-    last_run = session.scalars(select(Run).order_by(desc(Run.started_at)).limit(1)).first()
+    last_run = session.scalars(
+        select(Run)
+        .where(Run.status != "running")
+        .order_by(desc(Run.started_at))
+        .limit(1)
+    ).first()
 
     if last_run is None:
         report.status = "warning"
@@ -99,6 +104,33 @@ def check_health(
                 context={"run_id": last_run.id, "error": last_run.error_message},
             )
         )
+
+    if last_run.status == "degraded":
+        quality = last_run.run_quality or {}
+        report.issues.append(
+            HealthIssue(
+                "warning",
+                "last_run_degraded",
+                f"Прогон #{last_run.id} завершён частично: "
+                f"{last_run.error_message or 'см. run_quality'}",
+                context={"run_id": last_run.id, "run_quality": quality},
+            )
+        )
+        for site, details in (quality.get("sites") or {}).items():
+            if details.get("status") != "failed":
+                continue
+            report.issues.append(
+                HealthIssue(
+                    "critical",
+                    "degraded_site_failed",
+                    f"Сайт {site} не дал пригодного результата в прогоне #{last_run.id}.",
+                    context={
+                        "site": site,
+                        "run_id": last_run.id,
+                        "reasons": details.get("reasons") or [],
+                    },
+                )
+            )
 
     # 3. Empty check (только если статус ok)
     if last_run.status == "ok" and (last_run.products_scraped or 0) < min_products:

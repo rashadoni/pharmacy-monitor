@@ -27,6 +27,13 @@ def _add_run(s, started_at, status="ok") -> storage.Run:
     return r
 
 
+def _mark_financially_eligible(run, *sites):
+    run.run_quality = {
+        "financially_eligible": True,
+        "sites": {site: {"status": "ok"} for site in sites},
+    }
+
+
 def _add_snapshot(s, run, product, price, discount_price=None, is_on_sale=False):
     snap = storage.PriceSnapshot(
         run_id=run.id,
@@ -68,6 +75,49 @@ def test_price_change_detected(db_session):
     assert change.prev_price == 10.0
     assert change.curr_price == 8.0
     assert change.delta_pct == -20.0
+
+
+def test_verified_analysis_ignores_newer_partial_previous_snapshot(db_session):
+    trusted = _add_run(db_session, utcnow() - timedelta(days=2))
+    partial = _add_run(db_session, utcnow() - timedelta(days=1))
+    current = _add_run(db_session, utcnow())
+    _mark_financially_eligible(trusted, "aloe")
+    partial.run_quality = {"financially_eligible": False, "sites": {}}
+    _mark_financially_eligible(current, "aloe")
+    product = _add_product(db_session, "aloe", "Trusted price", "trusted-price")
+    _add_snapshot(db_session, trusted, product, 100.0)
+    _add_snapshot(db_session, partial, product, 200.0)
+    _add_snapshot(db_session, current, product, 90.0)
+    db_session.commit()
+
+    report = analyzer.analyze(db_session, current.id)
+    assert report.prev_run_id == trusted.id
+    assert len(report.price_changes) == 1
+    assert report.price_changes[0].prev_price == 100.0
+    assert report.price_changes[0].delta_pct == -10.0
+
+
+def test_verified_analysis_compares_promos_to_same_site_lineage(db_session):
+    aloe_previous = _add_run(db_session, utcnow() - timedelta(days=2))
+    interleaved_aptek = _add_run(db_session, utcnow() - timedelta(days=1))
+    current = _add_run(db_session, utcnow())
+    _mark_financially_eligible(aloe_previous, "aloe")
+    _mark_financially_eligible(interleaved_aptek, "aptekonline")
+    _mark_financially_eligible(current, "aloe")
+    db_session.add_all(
+        [
+            storage.Promo(run_id=aloe_previous.id, site="aloe", title="Existing"),
+            storage.Promo(run_id=interleaved_aptek.id, site="aptekonline", title="Other"),
+            storage.Promo(run_id=current.id, site="aloe", title="Existing"),
+            storage.Promo(run_id=current.id, site="aloe", title="New Aloe"),
+        ]
+    )
+    db_session.commit()
+
+    report = analyzer.analyze(db_session, current.id)
+    assert [(item.site, item.title, item.is_new) for item in report.promo_changes] == [
+        ("aloe", "New Aloe", True)
+    ]
 
 
 def test_new_product_detected(db_session):

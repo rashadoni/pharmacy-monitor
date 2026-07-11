@@ -4,11 +4,21 @@ import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, CheckCircle2, AlertCircle, AlertTriangle } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
-import { api, type RunRow, type RoiAction, type HealthSite, type LatestRunBySite } from "@/lib/api";
+import {
+  api,
+  ApiError,
+  friendlyError,
+  type RunBreakdown,
+  type RunRow,
+  type RoiAction,
+  type HealthSite,
+  type LatestRunBySite,
+} from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { QuickActions } from "@/components/quick-actions";
 import { formatNumber, formatRelative, formatPrice } from "@/lib/utils";
 import { categoryDisplayLabel } from "@/lib/category-label";
+import { runStatusToneClass } from "@/lib/run-quality";
 
 export default function OverviewPage() {
   const t = useTranslations("overview");
@@ -106,6 +116,13 @@ export default function OverviewPage() {
       <div>
         <h2 className="text-lg font-semibold mb-3">{t("today_actions")}</h2>
         {actionsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
+        {actionsQ.isError && (
+          <div className="rounded-md border border-warning/40 bg-warning/5 p-3 text-sm text-warning">
+            {actionsQ.error instanceof ApiError && actionsQ.error.status === 503
+              ? t("recommendations_waiting_verified")
+              : friendlyError(actionsQ.error, locale)}
+          </div>
+        )}
         {actionsQ.data && actionsQ.data.length === 0 && (
           <div className="text-muted-foreground">{t("no_actions")}</div>
         )}
@@ -269,7 +286,7 @@ function RunRowExpandable({
       </tr>
       {isExpanded && (
         <tr className="border-t border-border bg-muted/10">
-          <td colSpan={6} className="px-3 py-3">
+          <td colSpan={7} className="px-3 py-3">
             {breakdownQ.isLoading && (
               <div className="text-xs text-muted-foreground">{t("loading_breakdown")}</div>
             )}
@@ -285,12 +302,7 @@ function RunRowExpandable({
 
 function RunBreakdownPanel({
   data,
-}: {
-  data: {
-    products_per_site: Record<string, number>;
-    products_per_site_category: Record<string, Record<string, number>>;
-  };
-}) {
+}: { data: RunBreakdown }) {
   const t = useTranslations("overview");
   const locale = useLocale();
   // Load categories один раз — нужно для локализованного маппинга slug → label.
@@ -319,6 +331,39 @@ function RunBreakdownPanel({
 
   return (
     <div className="space-y-3">
+      {data.run_quality && (
+        <div className="rounded-md border border-warning/40 bg-warning/5 p-3 text-xs">
+          <div className="font-medium text-sm">{t("quality_title")}</div>
+          <div className="mt-1 text-muted-foreground">
+            {t("quality_mode", { mode: data.run_quality.mode })} ·{" "}
+            {data.run_quality.financially_eligible
+              ? t("quality_financial_yes")
+              : t("quality_financial_no")}
+          </div>
+          <div className="mt-2 grid gap-2 md:grid-cols-2 lg:grid-cols-3">
+            {Object.entries(data.run_quality.sites).map(([site, quality]) => (
+              <div key={site} className="rounded border border-border bg-card px-2.5 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium">{site}</span>
+                  <StatusBadge status={quality.status} />
+                </div>
+                <div className="mt-1 text-muted-foreground">
+                  {t("quality_items", {
+                    completed: quality.items_completed,
+                    expected: quality.items_expected,
+                    failed: quality.items_failed,
+                  })}
+                </div>
+                {quality.reasons.length > 0 && (
+                  <div className="mt-1 font-mono text-[10px] text-warning">
+                    {quality.reasons.join(", ")}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="flex flex-wrap gap-2">
         {sites.map((site) => (
           <div
@@ -472,14 +517,10 @@ function formatDuration(
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const cls =
-    status === "ok"
-      ? "bg-success/10 text-success"
-      : status === "failed"
-        ? "bg-destructive/10 text-destructive"
-        : "bg-muted text-muted-foreground";
   return (
-    <span className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${cls}`}>
+    <span
+      className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${runStatusToneClass(status)}`}
+    >
       {status}
     </span>
   );

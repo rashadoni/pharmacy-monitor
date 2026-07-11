@@ -28,7 +28,11 @@ def _add_product(s, site, name, ext_id, canonical_id=None):
 
 
 def _add_run(s):
-    r = Run(started_at=utcnow(), status="ok")
+    r = Run(
+        started_at=utcnow(),
+        status="ok",
+        run_quality={"full_catalog_verified": True, "financially_eligible": True},
+    )
     s.add(r)
     s.flush()
     return r

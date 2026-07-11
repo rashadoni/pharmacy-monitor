@@ -30,8 +30,11 @@ from src.storage import (
     AlertEvent,
     AlertRule,
     Match,
+    PriceSnapshot,
     Promo,
     Run,
+    latest_financial_run_ids_by_site,
+    run_is_financially_eligible,
 )
 
 log = structlog.get_logger()
@@ -59,9 +62,19 @@ def _detect_undercut_threshold(session: Session, run_id: int, params: dict) -> l
     """Конкурент дешевле клиента на ≥ min_pct."""
     min_pct = float(params.get("min_pct", 5.0))
     out: list[CandidateEvent] = []
-    matches = session.scalars(select(Match)).all()
+    current_run = session.get(Run, run_id)
+    if current_run is None:
+        return []
+    matches = session.scalars(
+        select(Match).where(Match.tenant_id == current_run.tenant_id)
+    ).all()
+    snapshots = _financial_snapshots_for_matches(
+        session,
+        matches,
+        tenant_id=current_run.tenant_id,
+    )
     for m in matches:
-        prices = _prices_for_match(session, m, run_id)
+        prices = _prices_for_match(session, m, run_id, snapshots_cache=snapshots)
         client_price = prices.get(CLIENT_SITE)
         if client_price is None:
             continue
@@ -112,7 +125,11 @@ def _detect_price_drop(session: Session, run_id: int, params: dict) -> list[Cand
     if current_run is None:
         return []
 
-    curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(session, current_run)
+    curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(
+        session,
+        current_run,
+        financially_eligible_only=True,
+    )
 
     for snap in curr_snaps:
         prev = prev_by_product.get(snap.product_id)
@@ -164,7 +181,11 @@ def _detect_new_product(session: Session, run_id: int, params: dict) -> list[Can
     if current_run is None:
         return []
 
-    curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(session, current_run)
+    curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(
+        session,
+        current_run,
+        financially_eligible_only=True,
+    )
     for snap in curr_snaps:
         if snap.product_id in prev_by_product:
             continue
@@ -186,16 +207,35 @@ def _detect_new_product(session: Session, run_id: int, params: dict) -> list[Can
 
 def _detect_promo_started(session: Session, run_id: int, params: dict) -> list[CandidateEvent]:
     """Новые промо-кампании на конкурентах."""
+    from sqlalchemy import and_, or_
+
     out: list[CandidateEvent] = []
-    prev_run_id = session.scalar(
-        select(Run.id).where(Run.id != run_id, Run.status == "ok").order_by(desc(Run.id)).limit(1)
-    )
-    if not prev_run_id:
+    current_run = session.get(Run, run_id)
+    if current_run is None:
         return []
-    prev_keys = {
-        (p.site, p.title) for p in session.scalars(select(Promo).where(Promo.run_id == prev_run_id))
-    }
     curr_promos = session.scalars(select(Promo).where(Promo.run_id == run_id)).all()
+    current_sites = {promo.site for promo in curr_promos}
+    previous_by_site = latest_financial_run_ids_by_site(
+        session,
+        current_sites,
+        tenant_id=current_run.tenant_id,
+        before_run_id=run_id,
+    )
+    if not previous_by_site:
+        return []
+    previous_promos = session.scalars(
+        select(Promo).where(
+            or_(
+                *(
+                    and_(Promo.site == site, Promo.run_id == previous_run_id)
+                    for site, previous_run_id in previous_by_site.items()
+                )
+            )
+        )
+    ).all()
+    prev_keys = {
+        (promo.site, promo.title) for promo in previous_promos
+    }
     for promo in curr_promos:
         if (promo.site, promo.title) in prev_keys:
             continue
@@ -218,9 +258,19 @@ def _detect_price_raise_opportunity(
     """Клиент дешевле всех конкурентов на ≥ min_pct."""
     min_pct = float(params.get("min_pct", 7.0))
     out: list[CandidateEvent] = []
-    matches = session.scalars(select(Match)).all()
+    current_run = session.get(Run, run_id)
+    if current_run is None:
+        return []
+    matches = session.scalars(
+        select(Match).where(Match.tenant_id == current_run.tenant_id)
+    ).all()
+    snapshots = _financial_snapshots_for_matches(
+        session,
+        matches,
+        tenant_id=current_run.tenant_id,
+    )
     for m in matches:
-        prices = _prices_for_match(session, m, run_id)
+        prices = _prices_for_match(session, m, run_id, snapshots_cache=snapshots)
         client_price = prices.get(CLIENT_SITE)
         if client_price is None or client_price <= 0:
             continue  # цена 0 → иначе деление на 0 в gap_pct
@@ -279,19 +329,37 @@ def evaluate_rules(
     session: Session,
     run_id: int | None = None,
     rule_ids: list[int] | None = None,
+    *,
+    tenant_id: int = 1,
 ) -> list[AlertEvent]:
     """Прогнать все активные правила, создать AlertEvent для не-дубликатов.
 
     `rule_ids` — если задан, прогоняются только указанные правила
     (для UI "запустить вручную одно правило").
     """
+    run: Run | None = None
     if run_id is None:
-        run_id = session.scalar(
-            select(Run.id).where(Run.status == "ok").order_by(desc(Run.id)).limit(1)
+        recent = session.scalars(
+            select(Run)
+            .where(Run.status == "ok", Run.tenant_id == tenant_id)
+            .order_by(desc(Run.id))
+            .limit(100)
+        ).all()
+        run = next((item for item in recent if run_is_financially_eligible(item)), None)
+        if run is not None:
+            run_id = run.id
+    else:
+        run = session.get(Run, run_id)
+        if run is not None:
+            tenant_id = run.tenant_id
+
+    if not run_is_financially_eligible(run):
+        log.warning(
+            "alerts_run_not_financially_eligible",
+            run_id=run_id,
+            status=run.status if run else None,
         )
-        if run_id is None:
-            log.warning("alerts_no_run", reason="no successful runs in DB")
-            return []
+        return []
 
     stmt = select(AlertRule).where(AlertRule.is_active.is_(True))
     if rule_ids:
@@ -311,7 +379,12 @@ def evaluate_rules(
             continue
 
         for cand in candidates:
-            if _is_duplicate(session, cand.dedup_key, rule.cooldown_hours):
+            if _is_duplicate(
+                session,
+                cand.dedup_key,
+                rule.cooldown_hours,
+                tenant_id=tenant_id,
+            ):
                 continue
             event = AlertEvent(
                 rule_id=rule.id,
@@ -320,7 +393,8 @@ def evaluate_rules(
                 severity=cand.severity,
                 title=cand.title,
                 detail=cand.detail,
-                payload=cand.payload,
+                payload={**(cand.payload or {}), "source_run_id": run_id},
+                tenant_id=tenant_id,
             )
             session.add(event)
             session.flush()
@@ -342,18 +416,50 @@ def evaluate_rules(
     return fired
 
 
-def _is_duplicate(session: Session, dedup_key: str, cooldown_hours: int) -> bool:
+def _is_duplicate(
+    session: Session,
+    dedup_key: str,
+    cooldown_hours: int,
+    *,
+    tenant_id: int = 1,
+) -> bool:
     """Был ли event с таким dedup_key за последние cooldown_hours."""
     cutoff = utcnow() - timedelta(hours=cooldown_hours)
     existing = session.scalar(
         select(AlertEvent.id)
-        .where(AlertEvent.dedup_key == dedup_key, AlertEvent.created_at >= cutoff)
+        .where(
+            AlertEvent.dedup_key == dedup_key,
+            AlertEvent.created_at >= cutoff,
+            AlertEvent.tenant_id == tenant_id,
+        )
         .limit(1)
     )
     return existing is not None
 
 
-def _prices_for_match(session: Session, match: Match, run_id: int) -> dict[str, float | None]:
+def _financial_snapshots_for_matches(
+    session: Session,
+    matches: list[Match],
+    *,
+    tenant_id: int,
+) -> dict[int, "PriceSnapshot"]:
+    from src.storage import latest_snapshots_per_product
+
+    product_ids = [product.id for match in matches for product in match.products]
+    return latest_snapshots_per_product(
+        session,
+        product_ids,
+        financially_eligible_only=True,
+        tenant_id=tenant_id,
+    )
+
+
+def _prices_for_match(
+    session: Session,
+    match: Match,
+    run_id: int,
+    snapshots_cache: dict[int, "PriceSnapshot"] | None = None,
+) -> dict[str, float | None]:
     """Цены на сайтах для конкретного match'а — берём latest snapshot per product.
 
     Diff-only-aware (2026-05-09): после оптимизации persist'а snapshot не
@@ -361,11 +467,15 @@ def _prices_for_match(session: Session, match: Match, run_id: int) -> dict[str, 
     совместимости с сигнатурой, но семантика теперь — «текущая (latest)
     цена», что и нужно для realtime undercut alerts.
     """
-    from src.storage import latest_snapshots_per_product
-
     out: dict[str, float | None] = {CLIENT_SITE: None, "aptekonline": None, "aloe": None}
-    pids = [p.id for p in match.products]
-    snaps = latest_snapshots_per_product(session, pids)
+    if snapshots_cache is None:
+        snaps = _financial_snapshots_for_matches(
+            session,
+            [match],
+            tenant_id=match.tenant_id,
+        )
+    else:
+        snaps = snapshots_cache
     for p in match.products:
         snap = snaps.get(p.id)
         if snap is None:
