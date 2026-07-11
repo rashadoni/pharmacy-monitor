@@ -249,9 +249,7 @@ async def test_watchlist_initial_fatal_returns_bounded_result(monkeypatch):
         async def __aenter__(self):
             raise SiteScrapeFatalError("proxy access rejected: HTTP 407")
 
-    monkeypatch.setitem(
-        main_mod.SCRAPER_CLASSES, "watchstartfatal", _WatchFatalStartScraper
-    )
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "watchstartfatal", _WatchFatalStartScraper)
     urls = ["https://x/one", "https://x/two"]
 
     result = await main_mod.scrape_watchlist_for_site("watchstartfatal", urls)
@@ -285,13 +283,9 @@ async def test_watchlist_promo_proxy_fatal_marks_site_failed_and_redacts(monkeyp
                 "net::ERR_PROXY_AUTH_REQUESTED"
             )
 
-    monkeypatch.setitem(
-        main_mod.SCRAPER_CLASSES, "watchpromofatal", _WatchPromoFatalScraper
-    )
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "watchpromofatal", _WatchPromoFatalScraper)
 
-    result = await main_mod.scrape_watchlist_for_site(
-        "watchpromofatal", ["https://x/ok"]
-    )
+    result = await main_mod.scrape_watchlist_for_site("watchpromofatal", ["https://x/ok"])
     status, quality = classify_run_quality(
         [result], ["watchpromofatal"], mode="watchlist", enforce_baseline=False
     )
@@ -361,9 +355,7 @@ async def test_ai_fallback_proxy_fatal_marks_partial_primary_site_failed(monkeyp
 
     monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "fallbackfatal", _PartialPrimary)
     monkeypatch.setitem(main_mod.AI_CRAWLER_BY_SITE, "fallbackfatal", _FatalFallback)
-    monkeypatch.setattr(
-        main_mod, "_should_trigger_ai_fallback", lambda *args, **kwargs: True
-    )
+    monkeypatch.setattr(main_mod, "_should_trigger_ai_fallback", lambda *args, **kwargs: True)
 
     result = await main_mod.scrape_site(
         "fallbackfatal", ["one", "two"], None, ai_fallback_baseline=1000
@@ -551,9 +543,7 @@ def test_report_send_rejects_missing_all_site_freshness(db_session, monkeypatch)
     assert sent == []
 
 
-def test_ai_crawl_fatal_creates_failed_run_with_sanitized_quality(
-    db_session, monkeypatch
-):
+def test_ai_crawl_fatal_creates_failed_run_with_sanitized_quality(db_session, monkeypatch):
     from src.scrapers import ai_crawler
 
     class _FatalAICrawler:
