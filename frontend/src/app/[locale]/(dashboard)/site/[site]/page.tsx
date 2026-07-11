@@ -5,7 +5,12 @@ import { notFound, useParams } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
 import { Building2, ExternalLink, Leaf, Pill, Search } from "lucide-react";
-import { api, friendlyError, type SiteProduct } from "@/lib/api";
+import {
+  api,
+  friendlyError,
+  isVerifiedScanPendingError,
+  type SiteProduct,
+} from "@/lib/api";
 import { ActionRow } from "@/components/action-row";
 import { KpiCard } from "@/components/kpi-card";
 import { Sparkline } from "@/components/sparkline";
@@ -104,6 +109,7 @@ export default function SitePage() {
     queryKey: ["site", site, "roi", locale],
     queryFn: () => api.roiActions(site, locale),
   });
+  const roiWaitingForVerifiedScan = isVerifiedScanPendingError(roiQ.error);
 
   return (
     <div className="space-y-6">
@@ -171,16 +177,26 @@ export default function SitePage() {
           </div>
         )}
         {roiQ.error && (
-          <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive flex items-center justify-between gap-3">
+          <div
+            className={`rounded-md border p-3 text-sm flex items-center justify-between gap-3 ${
+              roiWaitingForVerifiedScan
+                ? "border-warning/40 bg-warning/5 text-warning"
+                : "border-destructive/30 bg-destructive/10 text-destructive"
+            }`}
+          >
             <div>
-              {friendlyError(roiQ.error, locale)}
+              {roiWaitingForVerifiedScan
+                ? t("roi_waiting_verified")
+                : friendlyError(roiQ.error, locale)}
             </div>
-            <button
-              onClick={() => roiQ.refetch()}
-              className="rounded border border-destructive/50 px-2 py-1 text-xs hover:bg-destructive/20"
-            >
-              {t("roi_retry")}
-            </button>
+            {!roiWaitingForVerifiedScan && (
+              <button
+                onClick={() => roiQ.refetch()}
+                className="rounded border border-destructive/50 px-2 py-1 text-xs hover:bg-destructive/20"
+              >
+                {t("roi_retry")}
+              </button>
+            )}
           </div>
         )}
         {roiQ.data && roiQ.data.length === 0 && (

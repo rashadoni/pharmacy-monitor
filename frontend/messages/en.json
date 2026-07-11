@@ -328,6 +328,7 @@
     "roi_title": "ROI recommendations",
     "roi_subtitle": "From {site}'s perspective — where we're cheaper/pricier vs competitors and which SKUs {competitors} has that we don't.",
     "roi_loading": "Analyzing pricing recommendations… may take up to 15 sec",
+    "roi_waiting_verified": "Recommendations are temporarily hidden until the next verified full scan.",
     "roi_error": "Failed to load recommendations",
     "roi_retry": "Retry",
     "roi_empty": "No recommendations — pricing is on track.",

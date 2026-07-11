@@ -6,8 +6,8 @@ import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
 import {
   api,
-  ApiError,
   friendlyError,
+  isVerifiedScanPendingError,
   type RunBreakdown,
   type RunRow,
   type RoiAction,
@@ -118,7 +118,7 @@ export default function OverviewPage() {
         {actionsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
         {actionsQ.isError && (
           <div className="rounded-md border border-warning/40 bg-warning/5 p-3 text-sm text-warning">
-            {actionsQ.error instanceof ApiError && actionsQ.error.status === 503
+            {isVerifiedScanPendingError(actionsQ.error)
               ? t("recommendations_waiting_verified")
               : friendlyError(actionsQ.error, locale)}
           </div>

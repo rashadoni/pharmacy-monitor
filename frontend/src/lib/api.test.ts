@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ApiError, friendlyError } from "./api";
+import { ApiError, friendlyError, isVerifiedScanPendingError } from "./api";
 
 describe("friendlyError locale handling", () => {
   it("localizes common HTTP errors", () => {
@@ -32,5 +32,23 @@ describe("friendlyError locale handling", () => {
     expect(friendlyError(new ApiError(409, detail), "en")).toBe(
       "Data conflict. Refresh the page and review your changes.",
     );
+  });
+});
+
+describe("isVerifiedScanPendingError", () => {
+  it("distinguishes the expected ROI trust-gate response from real server errors", () => {
+    expect(
+      isVerifiedScanPendingError(
+        new ApiError(
+          503,
+          JSON.stringify({
+            detail: "Verified full-catalog recommendations are not available yet",
+          }),
+        ),
+      ),
+    ).toBe(true);
+    expect(isVerifiedScanPendingError(new ApiError(503, "service unavailable"))).toBe(false);
+    expect(isVerifiedScanPendingError(new ApiError(500, "database unavailable"))).toBe(false);
+    expect(isVerifiedScanPendingError(new Error("network failure"))).toBe(false);
   });
 });

@@ -328,6 +328,7 @@
     "roi_title": "ROI tövsiyələri",
     "roi_subtitle": "{site} perspektivindən — rəqiblərdən ucuz/baha olduğumuz yerlər və {competitors}-da olan, bizdə olmayan SKU-lar.",
     "roi_loading": "Qiymət tövsiyələri analiz edilir… 15 saniyəyə qədər çəkə bilər",
+    "roi_waiting_verified": "Tövsiyələr növbəti təsdiqlənmiş tam skana qədər müvəqqəti gizlədilib.",
     "roi_error": "Tövsiyələri yükləmək alınmadı",
     "roi_retry": "Yenidən cəhd et",
     "roi_empty": "Tövsiyə yoxdur — qiymətlər uyğundur.",

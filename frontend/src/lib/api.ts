@@ -79,6 +79,22 @@ export class ApiError extends Error {
   }
 }
 
+const VERIFIED_SCAN_PENDING_DETAIL =
+  "Verified full-catalog recommendations are not available yet";
+
+/** Expected fail-closed state while financial lineage awaits a verified full scan. */
+export function isVerifiedScanPendingError(err: unknown): err is ApiError {
+  if (!(err instanceof ApiError) || err.status !== 503) return false;
+
+  if (err.detail === VERIFIED_SCAN_PENDING_DETAIL) return true;
+  try {
+    const payload = JSON.parse(err.detail);
+    return payload?.detail === VERIFIED_SCAN_PENDING_DETAIL;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Преобразовать ApiError / Error в человекочитаемое сообщение для UI.
  * Анализирует Pydantic 422 (validation), 401/403/404/409 и timeout 408.
