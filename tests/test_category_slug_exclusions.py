@@ -41,6 +41,4 @@ def test_regenerated_map_cannot_reintroduce_tombstoned_slugs():
     )
 
     assert excluded_count == 2
-    assert [(row["site"], row["slug"]) for row in filtered] == [
-        ("aptekonline", "341")
-    ]
+    assert [(row["site"], row["slug"]) for row in filtered] == [("aptekonline", "341")]
