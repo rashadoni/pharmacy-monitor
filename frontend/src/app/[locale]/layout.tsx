@@ -61,7 +61,10 @@ export default async function LocaleLayout({
   // Enable static rendering for this locale segment (next-intl 3.22+ pattern).
   setRequestLocale(locale);
 
-  const messages = await getMessages();
+  // Pass the URL locale explicitly. Without it, a legacy `pm_locale` cookie can
+  // win during standalone/RSC rendering and produce Russian messages under an
+  // `/az/...` URL even though `<html lang>` is already `az`.
+  const messages = await getMessages({ locale });
 
   return (
     <html lang={locale} suppressHydrationWarning>

@@ -11,10 +11,13 @@ import { getTranslations } from "next-intl/server";
  */
 export default async function DashboardLayout({
   children,
+  params,
 }: {
   children: React.ReactNode;
+  params: Promise<{ locale: string }>;
 }) {
-  const t = await getTranslations("common");
+  const { locale } = await params;
+  const t = await getTranslations({ locale, namespace: "common" });
   const cookieStore = await cookies();
   const session = cookieStore.get("pm_session");
   if (!session) {
