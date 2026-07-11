@@ -126,9 +126,26 @@ Remaining non-blocking P2/P3 work is explicit:
   fits 390px and now has a 64px touch target.
 - Some code identifiers and domain terms (`SKU`, `URL`, `is_manual`, site names) intentionally
   remain untranslated; they identify persisted concepts rather than interface prose.
-- Production visual regression, keyboard traversal and failure-state smoke are deployment
-  gates, not yet evidence at this pre-review stage.
+- Alerts, category administration and site-catalog failure states still need a dedicated
+  destructive/fault-injection pass; the deployed read-only and retry states were verified.
 
-Pre-deploy re-score: accessibility 4/4, performance 4/4, responsive design 3/4,
-theming 4/4, anti-patterns 3/4 — **18/20**. This score remains provisional until the
-production browser smoke confirms the deployed artifact.
+Production verification completed on 2026-07-12:
+
+- CI passed backend pytest, Ruff, frontend typecheck and production build for the final
+  code revision; the fail-closed Hetzner deploy passed DB-revision, writable-path,
+  least-privilege restart, migration-head, build/restart and health gates.
+- Public smoke passed 9/9 checks. API and frontend services are active; `/health` reports
+  all three sites fresh and `full_catalog_verified=true`.
+- At 1280px the overview has no main horizontal overflow, uses the resolved
+  `ui-sans-serif, system-ui, sans-serif` stack, identifies recommendations as sourced from
+  verified full run #443, and separately shows partial run #444 in run history.
+- At 390×844 the comparison page has no horizontal overflow; switching RU→AZ preserves
+  search, minimum-site, diff, aloe and sort query parameters. The URL, `<html lang>`,
+  visible copy and accessible labels all switch to Azerbaijani.
+- At 390×844 the AZ matcher has `body.scrollWidth === viewport width === 390`, Azerbaijani
+  category labels, a localized site-selector group with `aria-pressed` state, and 44–56px
+  control targets.
+
+Post-deploy re-score: accessibility 4/4, performance 4/4, responsive design 3/4,
+theming 4/4, anti-patterns 3/4 — **18/20 confirmed**. The remaining two points are the
+explicit P2/P3 items above, not hidden deployment uncertainty.
