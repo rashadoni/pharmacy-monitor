@@ -135,7 +135,11 @@ export default function MatcherPage() {
           <span className="text-xs uppercase tracking-wide text-muted-foreground font-semibold">
             {t("site_label")}
           </span>
-          <div className="inline-flex rounded-md border border-input bg-background p-0.5 gap-0.5">
+          <div
+            className="grid w-full grid-cols-3 gap-0.5 rounded-md border border-input bg-background p-0.5 sm:inline-flex sm:w-auto"
+            role="group"
+            aria-label={t("site_label")}
+          >
             {SITES.map((s) => {
               const Icon = SITE_ICON[s];
               const active = site === s;
@@ -144,7 +148,8 @@ export default function MatcherPage() {
                 <button
                   key={s}
                   onClick={() => updateParams({ site: s })}
-                  className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-sm transition-colors ${
+                  aria-pressed={active}
+                  className={`flex min-h-11 min-w-0 flex-col items-center justify-center gap-0 rounded px-1 py-1 text-[11px] transition-colors sm:min-h-9 sm:flex-row sm:gap-1.5 sm:px-3 sm:py-1.5 sm:text-sm ${
                     active
                       ? "bg-primary text-primary-foreground font-medium"
                       : "text-foreground hover:bg-muted/50"
