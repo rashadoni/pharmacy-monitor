@@ -323,14 +323,14 @@ function AttachMode({
 
   return (
     <div className="space-y-4">
-      <div className="flex items-end justify-between gap-3 flex-wrap">
-        <div className="flex flex-col sm:flex-row sm:flex-wrap gap-2 flex-1">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:flex-wrap">
           <select
             data-testid="matcher-category-filter"
             value={category}
             onChange={(e) => setCategory(e.target.value)}
             aria-label={t("category_filter_label")}
-            className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9 md:w-72"
+            className="min-h-11 w-full min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm sm:w-auto md:min-h-9 md:w-72"
           >
             <option value="">{t("all_categories")}</option>
             {facetsQ.data?.categories.map((c) => (
@@ -341,14 +341,14 @@ function AttachMode({
           </select>
           <button
             onClick={() => handleSkipCheap(5)}
-            className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto md:min-h-9"
             title={t("skip_cheap_title")}
           >
             {t("skip_cheap")}
           </button>
           <button
             onClick={handleSkipAllOnPage}
-            className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto md:min-h-9"
             title={t("skip_page_title")}
           >
             {t("skip_page")}
@@ -356,7 +356,7 @@ function AttachMode({
           {skipped.size > 0 && (
             <button
               onClick={handleResetSkipped}
-              className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-muted-foreground hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto md:min-h-9"
               title={t("reset_skipped_title")}
             >
               {t("reset_skipped", { count: skipped.size })}
