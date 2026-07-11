@@ -381,6 +381,23 @@ class HealthOut(BaseModel):
     full_catalog_verified: bool = False
 
 
+class RoiStatusOut(BaseModel):
+    """Provenance for the recommendations currently safe to display."""
+
+    available: bool
+    client_site: str
+    run_id: int | None = None
+    computed_at: datetime | None = None
+    run_started_at: datetime | None = None
+    run_finished_at: datetime | None = None
+    item_count: int = 0
+
+
+class RoiRecommendationsOut(BaseModel):
+    items: list[dict[str, Any]]
+    provenance: RoiStatusOut
+
+
 class AuthRequestIn(BaseModel):
     email: str
 
@@ -2046,6 +2063,76 @@ def dash_roi_actions(
     )
 
 
+@app.get("/api/v1/dash/roi/recommendations", response_model=RoiRecommendationsOut)
+def dash_roi_recommendations(
+    client_site: str = "pharmonline",
+    locale: str = "ru",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Atomically return verified recommendations and their exact provenance."""
+    from src import roi
+
+    _require_site(client_site)
+    locale = _normalize_locale(locale)
+    snapshot = roi.get_cached_actions_snapshot(
+        db,
+        client_site,
+        tenant_id=user.tenant_id,
+    )
+    if snapshot is None:
+        raise HTTPException(
+            503,
+            "Verified full-catalog recommendations are not available yet",
+        )
+
+    payload, cache_row, run = snapshot
+    items = [roi.translate_action(item, locale) for item in payload]
+    return RoiRecommendationsOut(
+        items=items,
+        provenance=RoiStatusOut(
+            available=True,
+            client_site=client_site,
+            run_id=run.id,
+            computed_at=cache_row.computed_at,
+            run_started_at=run.started_at,
+            run_finished_at=run.finished_at,
+            item_count=len(items),
+        ),
+    )
+
+
+@app.get("/api/v1/dash/roi/status", response_model=RoiStatusOut)
+def dash_roi_status(
+    client_site: str = "pharmonline",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Return exact verified-run provenance for the visible ROI cache.
+
+    Availability uses the same fail-closed validation as ``/roi/actions``;
+    stale or superseded caches never receive a trustworthy-looking run label.
+    """
+    from src import roi
+
+    _require_site(client_site)
+    snapshot = roi.get_cached_actions_snapshot(db, client_site, tenant_id=user.tenant_id)
+    if snapshot is None:
+        return RoiStatusOut(available=False, client_site=client_site)
+
+    cached, cache_row, run = snapshot
+
+    return RoiStatusOut(
+        available=True,
+        client_site=client_site,
+        run_id=run.id,
+        computed_at=cache_row.computed_at,
+        run_started_at=run.started_at,
+        run_finished_at=run.finished_at,
+        item_count=len(cached),
+    )
+
+
 @app.get("/api/v1/dash/alerts")
 def dash_alerts(
     limit: int = 100,
@@ -2250,7 +2337,7 @@ def dash_match_quality(
 ):
     from src import analytics
 
-    mq = analytics.match_quality(db)
+    mq = analytics.match_quality(db, tenant_id=user.tenant_id)
     return {
         "total_matches": mq.total_matches,
         "auto_matches": mq.auto_matches,
@@ -2293,10 +2380,27 @@ def dash_normalize_stats(
         or 0
     )
 
-    # needs_review — маркер на Match (spread ≥50% между сайтами)
-    needs_review = (
+    # Keep product and match units separate.  The overview trust KPI uses
+    # products, so subtracting a Match count from Product count would be
+    # dimensionally invalid and could materially overstate confidence.
+    matches_needing_review = (
         db.scalar(
             select(func.count(storage.Match.id)).where(
+                storage.Match.tenant_id == user.tenant_id,
+                storage.Match.needs_review == True,  # noqa: E712
+            )
+        )
+        or 0
+    )
+    products_needing_review = (
+        db.scalar(
+            select(func.count(storage.Product.id))
+            .join(
+                storage.Match,
+                storage.Product.canonical_id == storage.Match.id,
+            )
+            .where(
+                storage.Product.tenant_id == user.tenant_id,
                 storage.Match.tenant_id == user.tenant_id,
                 storage.Match.needs_review == True,  # noqa: E712
             )
@@ -2328,7 +2432,11 @@ def dash_normalize_stats(
     return {
         "products_total": products_total,
         "products_normalized": products_normalized,
-        "needs_review": needs_review,
+        # Legacy field keeps its historical Match-row unit. New clients must
+        # use the explicit product/match fields below.
+        "needs_review": matches_needing_review,
+        "products_needing_review": products_needing_review,
+        "matches_needing_review": matches_needing_review,
         "coverage_pct": coverage_pct,
         "last_normalized_at": None,  # не отслеживается пока
         "matches_by_strategy": matches_by_strategy,

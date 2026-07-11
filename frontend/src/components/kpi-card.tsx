@@ -11,7 +11,7 @@ export function KpiCard({
 }) {
   return (
     <div className="rounded-lg border border-border bg-card p-4">
-      <div className="text-xs text-muted-foreground uppercase tracking-wide">{label}</div>
+      <div className="text-sm font-medium text-muted-foreground">{label}</div>
       <div className="text-2xl font-semibold mt-1 tabular-nums">
         {loading ? "…" : value}
       </div>

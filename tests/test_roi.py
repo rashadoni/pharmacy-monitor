@@ -1,5 +1,7 @@
 """Тесты ROI/actions модуля на синтетических данных."""
 
+from contextlib import contextmanager
+
 from datetime import timedelta
 
 from src._time import utcnow
@@ -365,6 +367,13 @@ def test_cache_actions_round_trip(db_session):
     keys = set(cached[0].keys())
     assert {"type", "severity", "title", "spread_pct", "unit_gap_azn"} <= keys
 
+    snapshot = roi.get_cached_actions_snapshot(db_session, "pharmonline")
+    assert snapshot is not None
+    payload, cache_row, source_run = snapshot
+    assert payload == cached
+    assert cache_row.run_id == eligible_run.id
+    assert source_run.id == eligible_run.id
+
 
 def test_get_cached_actions_returns_none_when_empty(db_session):
     """Если кэша нет — должен возвращать None, не raise."""
@@ -666,6 +675,16 @@ def test_direct_compute_blocks_during_run_but_completed_cache_remains_available(
     cached = roi.get_cached_actions(db_session, "pharmonline")
     assert cached is not None
     assert len(cached) == len(actions)
+
+
+def test_direct_compute_skips_when_scrape_lock_is_busy(db_session, monkeypatch):
+    @contextmanager
+    def busy_lock(_session):
+        yield False
+
+    monkeypatch.setattr(roi, "try_shared_scrape_read_lock", busy_lock)
+
+    assert roi.compute_actions(db_session, client_site="pharmonline") == []
 
 
 def test_cache_actions_upserts_existing(db_session):

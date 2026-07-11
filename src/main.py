@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 load_dotenv(override=True)
 
 from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
+from src.run_lock import SCRAPE_ADVISORY_LOCK_KEY  # noqa: E402
 from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
 from src.scrapers.aptekonline import AptekonlineScraper  # noqa: E402
@@ -135,7 +136,7 @@ def _report_email_enabled() -> bool:
 
 
 _MATCHER_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
-_SCRAPE_ADVISORY_LOCK_KEY = "pharmacy_monitor_scrape"
+_SCRAPE_ADVISORY_LOCK_KEY = SCRAPE_ADVISORY_LOCK_KEY
 
 
 def _is_postgres_session(session: Session) -> bool:
@@ -1408,6 +1409,10 @@ def reap_stale_runs_cmd(max_age_hours: float, reason: str) -> None:
     """
     storage.init_db()
     Session = storage.make_session()
+    if not _hold_scrape_lock_until_command_exit(Session, wait=False):
+        raise click.ClickException(
+            "recovery refused: an active scrape/rematch producer holds the run lock"
+        )
     with Session() as s:
         count = reap_stale_running_runs(s, max_age_hours=max_age_hours, reason=reason)
     click.echo(f"reaped {count} stale running run(s)")

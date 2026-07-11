@@ -26,7 +26,10 @@ export default function OverviewPage() {
   const locale = useLocale();
   const matchQ = useQuery({ queryKey: ["match-quality"], queryFn: api.matchQuality });
   const normalizeQ = useQuery({ queryKey: ["normalize-stats"], queryFn: api.normalizeStats });
-  const actionsQ = useQuery({ queryKey: ["roi-actions", locale], queryFn: () => api.roiActions(undefined, locale) });
+  const recommendationsQ = useQuery({
+    queryKey: ["roi-recommendations", "pharmonline", locale],
+    queryFn: () => api.roiRecommendations(undefined, locale),
+  });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
   const latestBySiteQ = useQuery({
     queryKey: ["runs-latest-by-site"],
@@ -80,21 +83,12 @@ export default function OverviewPage() {
           value={matchQ.data?.products_total ?? "—"}
           loading={matchQ.isLoading}
         />
-        {/*
-          P1.3 (PO Audit 2026-05-17): раньше карточка показывала coverage_pct
-          (99.1% «AI прошёл хоть как-то») и в hint'е писала «28457 нужно
-          проверить» — внутреннее противоречие. Теперь — high-confidence
-          процент: (normalized - needs_review) / total. Это даёт честное
-          представление качества AI extraction. Например 35.9% реально-уверенно
-          извлечённых атрибутов, остальные 64% — нужно review-нуть.
-        */}
         <KpiCard
-          label={t("kpi_ai_confidence")}
+          label={t("kpi_price_review")}
           value={
             normalizeQ.data
               ? `${(
-                  ((normalizeQ.data.products_normalized -
-                    normalizeQ.data.needs_review) /
+                  (normalizeQ.data.products_needing_review /
                     Math.max(1, normalizeQ.data.products_total)) *
                   100
                 ).toFixed(1)}%`
@@ -103,11 +97,11 @@ export default function OverviewPage() {
           loading={normalizeQ.isLoading}
           hint={
             normalizeQ.data
-              ? t("kpi_ai_low_confidence", {
-                  count: formatNumber(normalizeQ.data.needs_review, locale),
+              ? t("kpi_price_review_hint", {
+                  count: formatNumber(normalizeQ.data.products_needing_review, locale),
                   total: formatNumber(normalizeQ.data.products_total, locale),
                 })
-              : t("kpi_ai_hint")
+              : t("kpi_price_review_empty")
           }
         />
       </div>
@@ -115,19 +109,27 @@ export default function OverviewPage() {
       {/* Today's actions */}
       <div>
         <h2 className="text-lg font-semibold mb-3">{t("today_actions")}</h2>
-        {actionsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
-        {actionsQ.isError && (
+        {recommendationsQ.data?.provenance.run_id != null && (
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("recommendations_provenance", {
+              run: recommendationsQ.data.provenance.run_id,
+              completed: formatRelative(recommendationsQ.data.provenance.run_finished_at, locale),
+            })}
+          </p>
+        )}
+        {recommendationsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
+        {recommendationsQ.isError && (
           <div className="rounded-md border border-warning/40 bg-warning/5 p-3 text-sm text-warning">
-            {isVerifiedScanPendingError(actionsQ.error)
+            {isVerifiedScanPendingError(recommendationsQ.error)
               ? t("recommendations_waiting_verified")
-              : friendlyError(actionsQ.error, locale)}
+              : friendlyError(recommendationsQ.error, locale)}
           </div>
         )}
-        {actionsQ.data && actionsQ.data.length === 0 && (
+        {recommendationsQ.data && recommendationsQ.data.items.length === 0 && (
           <div className="text-muted-foreground">{t("no_actions")}</div>
         )}
         <div className="space-y-2">
-          {actionsQ.data?.slice(0, 10).map((a, i) => (
+          {recommendationsQ.data?.items.slice(0, 10).map((a, i) => (
             <ActionRow key={i} action={a} />
           ))}
         </div>
@@ -441,7 +443,7 @@ function KpiCard({
 }) {
   return (
     <div className="rounded-lg border border-border bg-card p-4">
-      <div className="text-xs text-muted-foreground uppercase tracking-wide">{label}</div>
+      <div className="text-sm font-medium text-muted-foreground">{label}</div>
       <div className="text-2xl font-semibold mt-1 tabular-nums">
         {loading ? "…" : value}
       </div>
@@ -517,11 +519,15 @@ function formatDuration(
 }
 
 function StatusBadge({ status }: { status: string }) {
+  const t = useTranslations("overview");
+  const translated = ["ok", "running", "degraded", "failed"].includes(status)
+    ? t(`status_${status}` as "status_ok")
+    : status;
   return (
     <span
       className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${runStatusToneClass(status)}`}
     >
-      {status}
+      {translated}
     </span>
   );
 }
@@ -534,7 +540,7 @@ function SiteStalenessPanel({ sites }: { sites: HealthSite[] }) {
   return (
     <div className="rounded-lg border border-border bg-card p-4">
       <div className="flex items-center justify-between mb-3">
-        <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+        <h2 className="text-sm font-semibold text-muted-foreground">
           {t("title")}
         </h2>
         <span className="text-xs text-muted-foreground">{t("auto_refresh")}</span>

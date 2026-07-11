@@ -256,7 +256,8 @@ export default function AlertsPage() {
           <select
             value={hoursWindow}
             onChange={(e) => setHoursWindow(Number(e.target.value))}
-            className="text-xs rounded-full px-3 py-1 border border-border bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={t("window_label")}
+            className="min-h-11 rounded-full border border-border bg-card px-3 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
           >
             <option value={24}>{t("window_24h")}</option>
             <option value={72}>{t("window_3d")}</option>
@@ -267,7 +268,8 @@ export default function AlertsPage() {
           <select
             value={ruleTypeFilter}
             onChange={(e) => setRuleTypeFilter(e.target.value)}
-            className="text-xs rounded-full px-3 py-1 border border-border bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={t("rule_type_label")}
+            className="min-h-11 rounded-full border border-border bg-card px-3 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
           >
             <option value="">{t("filter_all_types")}</option>
             {ruleTypes.map((rt) => (

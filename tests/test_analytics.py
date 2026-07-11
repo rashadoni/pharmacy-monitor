@@ -229,6 +229,36 @@ def test_match_quality_empty(db_session):
     assert q.coverage_pct == 0.0
 
 
+def test_match_quality_is_tenant_scoped(db_session):
+    from src.storage import Match, MatchRejection
+
+    own_match = Match(tenant_id=1, canonical_name="Own", confidence=1.0)
+    foreign_match = Match(tenant_id=2, canonical_name="Foreign", confidence=1.0)
+    db_session.add_all([own_match, foreign_match])
+    db_session.flush()
+    own_product = _add_product(
+        db_session, "pharmonline", "Own", canonical_id=own_match.id, ext_id="tenant-own"
+    )
+    foreign_product = _add_product(
+        db_session, "aloe", "Foreign", canonical_id=foreign_match.id, ext_id="tenant-foreign"
+    )
+    foreign_product.tenant_id = 2
+    db_session.add(
+        MatchRejection(
+            tenant_id=2,
+            product_a_id=own_product.id,
+            product_b_id=foreign_product.id,
+        )
+    )
+    db_session.commit()
+
+    own = analytics.match_quality(db_session, tenant_id=1)
+    foreign = analytics.match_quality(db_session, tenant_id=2)
+
+    assert (own.total_matches, own.products_total, own.rejected_pairs) == (1, 1, 0)
+    assert (foreign.total_matches, foreign.products_total, foreign.rejected_pairs) == (1, 1, 1)
+
+
 def test_empty_db_returns_empty(db_session):
     assert analytics.brand_share(db_session) == []
     assert analytics.promo_history(db_session) == []

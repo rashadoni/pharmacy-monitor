@@ -15,7 +15,7 @@ import { ActionRow } from "@/components/action-row";
 import { KpiCard } from "@/components/kpi-card";
 import { Sparkline } from "@/components/sparkline";
 import { useDebounce } from "@/lib/use-debounce";
-import { formatPrice, formatTime } from "@/lib/utils";
+import { formatPrice, formatRelative, formatTime } from "@/lib/utils";
 
 const PAGE_LIMIT = 50;
 
@@ -105,11 +105,11 @@ export default function SitePage() {
     queryKey: ["site", site, "brands"],
     queryFn: () => api.brandShare({ top_n: 50, site }),
   });
-  const roiQ = useQuery({
-    queryKey: ["site", site, "roi", locale],
-    queryFn: () => api.roiActions(site, locale),
+  const recommendationsQ = useQuery({
+    queryKey: ["site", site, "roi-recommendations", locale],
+    queryFn: () => api.roiRecommendations(site, locale),
   });
-  const roiWaitingForVerifiedScan = isVerifiedScanPendingError(roiQ.error);
+  const roiWaitingForVerifiedScan = isVerifiedScanPendingError(recommendationsQ.error);
 
   return (
     <div className="space-y-6">
@@ -170,13 +170,21 @@ export default function SitePage() {
         <p className="text-xs text-muted-foreground mb-3">
           {t("roi_subtitle", { site, competitors: competitors.join("/") })}
         </p>
-        {roiQ.isLoading && (
+        {recommendationsQ.data?.provenance.run_id != null && (
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("roi_provenance", {
+              run: recommendationsQ.data.provenance.run_id,
+              completed: formatRelative(recommendationsQ.data.provenance.run_finished_at, locale),
+            })}
+          </p>
+        )}
+        {recommendationsQ.isLoading && (
           <div className="rounded-md border border-border bg-card p-3 text-sm text-muted-foreground flex items-center gap-2">
             <span className="inline-block h-2 w-2 rounded-full bg-primary animate-pulse" />
             {t("roi_loading")}
           </div>
         )}
-        {roiQ.error && (
+        {recommendationsQ.error && (
           <div
             className={`rounded-md border p-3 text-sm flex items-center justify-between gap-3 ${
               roiWaitingForVerifiedScan
@@ -187,25 +195,26 @@ export default function SitePage() {
             <div>
               {roiWaitingForVerifiedScan
                 ? t("roi_waiting_verified")
-                : friendlyError(roiQ.error, locale)}
+                : friendlyError(recommendationsQ.error, locale)}
             </div>
             {!roiWaitingForVerifiedScan && (
               <button
-                onClick={() => roiQ.refetch()}
-                className="rounded border border-destructive/50 px-2 py-1 text-xs hover:bg-destructive/20"
+                type="button"
+                onClick={() => recommendationsQ.refetch()}
+                className="min-h-11 rounded border border-destructive/50 px-3 py-1 text-xs hover:bg-destructive/20 md:min-h-9"
               >
                 {t("roi_retry")}
               </button>
             )}
           </div>
         )}
-        {roiQ.data && roiQ.data.length === 0 && (
+        {recommendationsQ.data && recommendationsQ.data.items.length === 0 && (
           <div className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
             {t("roi_empty")}
           </div>
         )}
         <div className="space-y-2">
-          {roiQ.data?.slice(0, 10).map((a, i) => (
+          {recommendationsQ.data?.items.slice(0, 10).map((a, i) => (
             <ActionRow key={i} action={a} />
           ))}
         </div>

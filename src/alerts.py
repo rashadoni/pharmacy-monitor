@@ -37,6 +37,7 @@ from src.storage import (
     latest_financial_run_ids_by_site,
     run_is_financially_eligible,
 )
+from src.run_lock import try_shared_scrape_read_lock
 
 log = structlog.get_logger()
 
@@ -334,6 +335,7 @@ def evaluate_rules(
     rule_ids: list[int] | None = None,
     *,
     tenant_id: int = 1,
+    _shared_lock_held: bool = False,
 ) -> list[AlertEvent]:
     """Прогнать все активные правила, создать AlertEvent для не-дубликатов.
 
@@ -343,6 +345,19 @@ def evaluate_rules(
 
     `rule_ids` — если задан, прогоняются только указанные правила.
     """
+    if run_id is None and not _shared_lock_held:
+        with try_shared_scrape_read_lock(session) as acquired:
+            if not acquired:
+                log.warning("alerts_auto_select_scrape_in_progress", tenant_id=tenant_id)
+                return []
+            return evaluate_rules(
+                session,
+                run_id=None,
+                rule_ids=rule_ids,
+                tenant_id=tenant_id,
+                _shared_lock_held=True,
+            )
+
     run: Run | None = None
     if run_id is None:
         from src import roi as roi_mod

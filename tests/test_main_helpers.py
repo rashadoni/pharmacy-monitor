@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import click
+from click.testing import CliRunner
 
 from src import main as main_mod
 from src import roi, storage, watchlist
@@ -352,6 +353,22 @@ def test_reap_stale_running_runs_noops_when_none_stale(db_session):
     db_session.commit()
 
     assert main_mod.reap_stale_running_runs(db_session, max_age_hours=6) == 0
+
+
+def test_reap_stale_runs_cli_refuses_when_scrape_lock_is_busy(monkeypatch):
+    sentinel_factory = object()
+    monkeypatch.setattr(main_mod.storage, "init_db", lambda: None)
+    monkeypatch.setattr(main_mod.storage, "make_session", lambda: sentinel_factory)
+    monkeypatch.setattr(
+        main_mod,
+        "_hold_scrape_lock_until_command_exit",
+        lambda factory, *, wait: factory is not sentinel_factory,
+    )
+
+    result = CliRunner().invoke(main_mod.cli, ["reap-stale-runs"])
+
+    assert result.exit_code != 0
+    assert "active scrape/rematch producer" in result.output
 
 
 def test_count_duplicate_products_executes_on_product_table(db_session):

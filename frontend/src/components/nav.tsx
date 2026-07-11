@@ -55,13 +55,13 @@ function NavLink({ href, icon: Icon, label, pathname }: {
       href={href}
       prefetch={false}
       className={cn(
-        "flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
+        "flex min-h-11 items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
         active
           ? "bg-primary text-primary-foreground font-medium"
           : "text-foreground hover:bg-secondary",
       )}
     >
-      <Icon className="h-4 w-4" />
+      <Icon className="h-4 w-4" aria-hidden="true" />
       {label}
     </Link>
   );
@@ -127,10 +127,11 @@ export function SideNav() {
       <div className="border-t border-border pt-3 flex flex-col gap-2">
         <LocaleSwitcher />
         <button
+          type="button"
           onClick={handleLogout}
-          className="flex items-center gap-3 rounded-md px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
+          className="flex min-h-11 items-center gap-3 rounded-md px-3 py-2 text-sm text-destructive transition-colors hover:bg-destructive/10"
         >
-          <LogOut className="h-4 w-4" />
+          <LogOut className="h-4 w-4" aria-hidden="true" />
           {tAuth("logout")}
         </button>
       </div>
@@ -162,11 +163,11 @@ export function BottomNav() {
             href={item.href}
             prefetch={false}
             className={cn(
-              "flex min-w-0 flex-col items-center justify-center gap-0.5 px-0.5 py-2.5 text-[10px] transition-colors",
+              "flex min-h-16 min-w-0 flex-col items-center justify-center gap-0.5 px-0.5 py-2.5 text-[10px] transition-colors",
               active ? "text-primary font-semibold" : "text-muted-foreground",
             )}
           >
-            <Icon className="h-5 w-5 shrink-0" />
+            <Icon className="h-5 w-5 shrink-0" aria-hidden="true" />
             <span className="max-w-full text-center leading-tight break-words">{t(item.key)}</span>
           </Link>
         );

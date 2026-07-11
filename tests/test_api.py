@@ -3265,6 +3265,24 @@ def test_roi_actions_refuses_inline_compute_without_verified_cache(
     assert "Verified full-catalog" in response.json()["detail"]
 
 
+def test_roi_status_is_unavailable_without_verified_cache(client, auth_cookie):
+    response = client.get("/api/v1/dash/roi/status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "available": False,
+        "client_site": "pharmonline",
+        "run_id": None,
+        "computed_at": None,
+        "run_started_at": None,
+        "run_finished_at": None,
+        "item_count": 0,
+    }
+    recommendations = client.get("/api/v1/dash/roi/recommendations")
+    assert recommendations.status_code == 503
+    assert "Verified full-catalog" in recommendations.json()["detail"]
+
+
 def test_roi_actions_serves_cache_from_financially_eligible_run(
     client, auth_cookie, setup_db
 ):
@@ -3298,6 +3316,18 @@ def test_roi_actions_serves_cache_from_financially_eligible_run(
     response = client.get("/api/v1/dash/roi/actions")
     assert response.status_code == 200
     assert response.json() == []
+
+    status = client.get("/api/v1/dash/roi/status").json()
+    assert status["available"] is True
+    assert status["run_id"] == run.id
+    assert status["item_count"] == 0
+    assert status["computed_at"] is not None
+    assert status["run_finished_at"] is not None
+
+    recommendations = client.get("/api/v1/dash/roi/recommendations").json()
+    assert recommendations["items"] == []
+    assert recommendations["provenance"]["run_id"] == run.id
+    assert recommendations["provenance"]["item_count"] == 0
 
 
 def test_roi_actions_rejects_cache_after_newer_degraded_full_run(
@@ -3364,3 +3394,65 @@ def test_roi_actions_rejects_cache_after_newer_degraded_full_run(
 
     assert response.status_code == 503
     assert "Verified full-catalog" in response.json()["detail"]
+    assert client.get("/api/v1/dash/roi/status").json()["available"] is False
+    assert client.get("/api/v1/dash/roi/recommendations").status_code == 503
+
+
+def test_normalize_stats_uses_product_units_and_tenant_scope(
+    client, auth_cookie, setup_db
+):
+    own_match = storage.Match(
+        tenant_id=1,
+        canonical_name="Review own",
+        confidence=0.5,
+        needs_review=True,
+    )
+    foreign_match = storage.Match(
+        tenant_id=2,
+        canonical_name="Review foreign",
+        confidence=0.5,
+        needs_review=True,
+    )
+    setup_db.add_all([own_match, foreign_match])
+    setup_db.flush()
+    setup_db.add_all(
+        [
+            storage.Product(
+                tenant_id=1,
+                site="pharmonline",
+                external_id="trust-own-1",
+                url="https://example.test/own-1",
+                name="Own one",
+                name_normalized="own one",
+                canonical_id=own_match.id,
+            ),
+            storage.Product(
+                tenant_id=1,
+                site="aloe",
+                external_id="trust-own-2",
+                url="https://example.test/own-2",
+                name="Own two",
+                name_normalized="own two",
+                canonical_id=own_match.id,
+            ),
+            storage.Product(
+                tenant_id=2,
+                site="aptekonline",
+                external_id="trust-foreign",
+                url="https://example.test/foreign",
+                name="Foreign",
+                name_normalized="foreign",
+                canonical_id=foreign_match.id,
+            ),
+        ]
+    )
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/normalize/stats")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["products_total"] == 2
+    assert body["matches_needing_review"] == 1
+    assert body["products_needing_review"] == 2
+    assert body["needs_review"] == 1

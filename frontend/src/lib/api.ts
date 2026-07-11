@@ -524,10 +524,41 @@ export interface PriceHistoryResponse {
 export interface NormalizeStats {
   products_total: number;
   products_normalized: number;
+  products_needing_review: number;
+  matches_needing_review: number;
+  /** Legacy Match-row count; prefer the explicit fields above. */
   needs_review: number;
   coverage_pct: number;
   last_normalized_at: string | null;
   matches_by_strategy: Record<string, number>;
+}
+
+export interface RoiStatus {
+  available: boolean;
+  client_site: string;
+  run_id: number | null;
+  computed_at: string | null;
+  run_started_at: string | null;
+  run_finished_at: string | null;
+  item_count: number;
+}
+
+export interface RoiRecommendations {
+  items: RoiAction[];
+  provenance: RoiStatus;
+}
+
+export interface ForecastMover {
+  product_id: number;
+  site: string;
+  name: string;
+  n_points: number;
+  first_price: number;
+  last_price: number;
+  change_pct: number;
+  direction: "rising" | "falling" | "stable";
+  forecast_7d_price: number;
+  confidence: "low" | "medium" | "high";
 }
 
 export interface AnchorProduct {
@@ -715,6 +746,9 @@ export interface Health {
   redis_ping_ms: number | null;
   sites: HealthSite[];
   staleness_warning: boolean;
+  full_catalog_run_at: string | null;
+  full_catalog_status: string | null;
+  full_catalog_verified: boolean;
 }
 
 export const api = {
@@ -799,6 +833,22 @@ export const api = {
     // ROI compute может быть тяжёлым (matcher join), ставим явно 15с timeout
     return request<RoiAction[]>(
       `/api/v1/dash/roi/actions${qs ? `?${qs}` : ""}`,
+      { timeoutMs: 15_000 },
+    );
+  },
+  roiStatus: (client_site?: string) => {
+    const q = new URLSearchParams();
+    if (client_site) q.set("client_site", client_site);
+    const qs = q.toString();
+    return request<RoiStatus>(`/api/v1/dash/roi/status${qs ? `?${qs}` : ""}`);
+  },
+  roiRecommendations: (client_site?: string, locale?: string) => {
+    const q = new URLSearchParams();
+    if (client_site) q.set("client_site", client_site);
+    if (locale) q.set("locale", locale);
+    const qs = q.toString();
+    return request<RoiRecommendations>(
+      `/api/v1/dash/roi/recommendations${qs ? `?${qs}` : ""}`,
       { timeoutMs: 15_000 },
     );
   },
@@ -911,6 +961,7 @@ export const api = {
       `/api/v1/dash/category-comparison${qs ? `?${qs}` : ""}`,
     );
   },
+  forecastMovers: () => request<ForecastMover[]>("/api/v1/dash/forecast/movers"),
   siteProducts: (params: {
     site: string;
     category?: string;

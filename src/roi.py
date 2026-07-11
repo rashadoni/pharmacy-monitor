@@ -42,6 +42,7 @@ from src.storage import (
     Promo,
     Run,
 )
+from src.run_lock import try_shared_scrape_read_lock
 
 log = structlog.get_logger()
 
@@ -269,12 +270,33 @@ def get_cached_actions(
 
     None означает, что caller должен fail closed и скрыть рекомендации.
     """
-    from src.storage import RoiActionsCache
+    snapshot = get_cached_actions_snapshot(
+        session,
+        client_site,
+        tenant_id=tenant_id,
+        max_age_hours=max_age_hours,
+    )
+    return snapshot[0] if snapshot is not None else None
 
+
+def get_cached_actions_snapshot(
+    session: Session,
+    client_site: str,
+    *,
+    tenant_id: int = 1,
+    max_age_hours: int = _CACHE_MAX_AGE_HOURS,
+) -> tuple[list[dict], storage.RoiActionsCache, Run] | None:
+    """Return payload and provenance from the same validated cache row.
+
+    Keeping the selected row object with its payload prevents an HTTP caller
+    from labelling recommendations from run A with metadata from a concurrently
+    refreshed run B.  Newer full-catalog attempts still fail the snapshot
+    closed through the lineage checks below.
+    """
     row = session.scalar(
-        select(RoiActionsCache).where(
-            RoiActionsCache.tenant_id == tenant_id,
-            RoiActionsCache.client_site == client_site,
+        select(storage.RoiActionsCache).where(
+            storage.RoiActionsCache.tenant_id == tenant_id,
+            storage.RoiActionsCache.client_site == client_site,
         )
     )
     if row is None:
@@ -322,7 +344,8 @@ def get_cached_actions(
             age_hours=age.total_seconds() / 3600,
         )
         return None
-    return list(row.payload) if row.payload else []
+    payload = list(row.payload) if row.payload else []
+    return payload, row, run
 
 
 def get_cached_action_items(
@@ -369,7 +392,7 @@ def refresh_all_cached_actions(
     out: dict[str, int] = {}
     for site in ALL_SITES:
         try:
-            actions = compute_actions(session, client_site=site, tenant_id=tenant_id)
+            actions = _compute_actions_locked(session, client_site=site, tenant_id=tenant_id)
             cache_actions(session, site, actions, run_id=run_id, tenant_id=tenant_id)
             out[site] = len(actions)
         except Exception as e:
@@ -383,6 +406,38 @@ def refresh_all_cached_actions(
 
 
 def compute_actions(
+    session: Session,
+    *,
+    client_site: str | None = None,
+    tenant_id: int = 1,
+    raise_threshold_pct: float | None = None,
+    undercut_threshold_pct: float | None = None,
+    max_spread_pct: float | None = None,
+    max_per_type: int | None = None,
+    min_margin_pct: float | None = None,
+) -> list[ActionItem]:
+    """External live computation guarded against concurrent scrape writes."""
+    with try_shared_scrape_read_lock(session) as acquired:
+        if not acquired:
+            log.warning(
+                "roi_compute_scrape_in_progress",
+                client_site=client_site or CLIENT_SITE,
+                tenant_id=tenant_id,
+            )
+            return []
+        return _compute_actions_locked(
+            session,
+            client_site=client_site,
+            tenant_id=tenant_id,
+            raise_threshold_pct=raise_threshold_pct,
+            undercut_threshold_pct=undercut_threshold_pct,
+            max_spread_pct=max_spread_pct,
+            max_per_type=max_per_type,
+            min_margin_pct=min_margin_pct,
+        )
+
+
+def _compute_actions_locked(
     session: Session,
     *,
     client_site: str | None = None,

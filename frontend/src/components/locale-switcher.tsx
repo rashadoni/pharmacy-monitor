@@ -2,8 +2,10 @@
 
 import { useLocale } from "next-intl";
 import { useTransition } from "react";
+import { useSearchParams } from "next/navigation";
 import { localeFlags, localeNames, locales, type Locale } from "@/i18n/config";
 import { useRouter, usePathname } from "@/i18n/navigation";
+import { pathWithSearch } from "@/lib/locale-path";
 
 /**
  * Phase 6.1 retry (2026-05-28) — URL-based locale switching без middleware.
@@ -19,6 +21,7 @@ export function LocaleSwitcher() {
   const current = useLocale() as Locale;
   const router = useRouter();
   const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [pending, startTransition] = useTransition();
 
   function changeLocale(next: Locale) {
@@ -27,20 +30,22 @@ export function LocaleSwitcher() {
       // router.replace принимает текущий pathname (без locale prefix —
       // createNavigation абстрагирует) + новый locale. Sub-pathname сохраняется:
       // если ты на /az/comparison → switch to en → /en/comparison.
-      router.replace(pathname, { locale: next });
+      router.replace(pathWithSearch(pathname, searchParams.toString()), { locale: next });
     });
   }
 
   return (
-    <div className="inline-flex rounded-md border border-border overflow-hidden text-xs">
+    <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
       {locales.map((loc) => (
         <button
           key={loc}
           type="button"
           onClick={() => changeLocale(loc)}
           disabled={pending}
+          aria-pressed={loc === current}
+          aria-label={localeNames[loc]}
           className={
-            "px-3 py-1.5 transition-colors flex items-center gap-1 " +
+            "flex min-h-11 items-center gap-1 px-3 py-1.5 transition-colors md:min-h-8 " +
             (loc === current
               ? "bg-primary text-primary-foreground font-semibold"
               : "bg-card text-muted-foreground hover:bg-secondary")

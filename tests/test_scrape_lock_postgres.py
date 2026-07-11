@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from src import main as main_mod
 from src import storage
+from src.run_lock import try_shared_scrape_read_lock
 
 
 def _postgres_session_factory():
@@ -78,3 +79,25 @@ def test_scrape_lock_serializes_real_postgres_connections_without_open_transacti
         )
 
     assert _scrape_lock_rows(engine) == []
+
+
+def test_shared_reader_and_exclusive_scrape_lock_are_mutually_exclusive():
+    session_factory = _postgres_session_factory()
+
+    with click.Context(click.Command("writer")):
+        assert main_mod._hold_scrape_lock_until_command_exit(session_factory, wait=False)
+        with session_factory() as reader_session:
+            with try_shared_scrape_read_lock(reader_session) as acquired:
+                assert acquired is False
+
+    with session_factory() as reader_session:
+        with try_shared_scrape_read_lock(reader_session) as acquired:
+            assert acquired is True
+            with click.Context(click.Command("blocked-writer")):
+                assert not main_mod._hold_scrape_lock_until_command_exit(
+                    session_factory,
+                    wait=False,
+                )
+
+    with click.Context(click.Command("writer-after-reader")):
+        assert main_mod._hold_scrape_lock_until_command_exit(session_factory, wait=False)

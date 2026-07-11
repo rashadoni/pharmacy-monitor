@@ -329,7 +329,8 @@ function AttachMode({
             data-testid="matcher-category-filter"
             value={category}
             onChange={(e) => setCategory(e.target.value)}
-            className="rounded-md border border-input bg-background px-3 py-2 text-sm md:w-72"
+            aria-label={t("category_filter_label")}
+            className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9 md:w-72"
           >
             <option value="">{t("all_categories")}</option>
             {facetsQ.data?.categories.map((c) => (
@@ -568,7 +569,8 @@ function PairCard({
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder={t("search_site_placeholder", { site: SITE_LABEL[site] })}
-              className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label={t("search_site_label", { site: SITE_LABEL[site] })}
+              className="min-h-11 w-full rounded-md border border-input bg-background py-2 pl-8 pr-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
             />
           </div>
 

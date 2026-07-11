@@ -1,5 +1,7 @@
 """Тесты движка алертов: detection, dedup, dispatch routing."""
 
+from contextlib import contextmanager
+
 from datetime import timedelta
 from src._time import utcnow
 
@@ -182,6 +184,16 @@ def test_auto_evaluate_ignores_unfinished_eligible_run(db_session):
     fired = alerts.evaluate_rules(db_session)
     assert len(fired) == 1
     assert fired[0].payload["source_run_id"] == completed.id
+
+
+def test_auto_evaluate_skips_when_scrape_lock_is_busy(db_session, monkeypatch):
+    @contextmanager
+    def busy_lock(_session):
+        yield False
+
+    monkeypatch.setattr(alerts, "try_shared_scrape_read_lock", busy_lock)
+
+    assert alerts.evaluate_rules(db_session) == []
 
 
 def test_auto_evaluate_does_not_mix_completed_run_with_unfinished_snapshots(db_session):
