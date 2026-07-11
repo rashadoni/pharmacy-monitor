@@ -376,6 +376,9 @@ class HealthOut(BaseModel):
     redis_ping_ms: float | None = None  # PING round-trip, null if Redis unreachable
     sites: list[SiteStaleness] = Field(default_factory=list)
     staleness_warning: bool = False  # true if any site exceeds its freshness threshold
+    full_catalog_run_at: datetime | None = None
+    full_catalog_status: str | None = None
+    full_catalog_verified: bool = False
 
 
 class AuthRequestIn(BaseModel):
@@ -602,12 +605,12 @@ def health_endpoint(db: Session = Depends(get_db)):
     endpoint itself stays 200 so we can distinguish "API up but DB slow"
     from "API down entirely".
     """
-    last = db.scalars(
-        select(storage.Run)
-        .where(storage.Run.status != "running")
-        .order_by(desc(storage.Run.id))
-        .limit(1)
-    ).first()
+    last = storage.latest_terminal_run(db, tenant_id=1)
+    full_attempts = storage.latest_full_catalog_attempts_by_site(
+        db,
+        storage.FULL_CATALOG_SITES,
+        tenant_id=1,
+    )
     db_ms = _ping_db(db)
     redis_ms = _ping_redis()
     sites = _staleness_per_site(db)
@@ -617,7 +620,32 @@ def health_endpoint(db: Session = Depends(get_db)):
         for s in sites
     )
     run_unhealthy = last is not None and last.status in {"degraded", "failed"}
-    status_label = "degraded" if (stale or db_ms is None or run_unhealthy) else "up"
+    full_verified = bool(
+        set(full_attempts) == set(storage.FULL_CATALOG_SITES)
+        and all(
+            attempt.status == "ok"
+            and (attempt.run_quality or {}).get("full_catalog_verified") is True
+            and (attempt.run_quality or {}).get("financially_eligible") is True
+            and (
+                ((attempt.run_quality or {}).get("sites") or {}).get(site) or {}
+            ).get("status")
+            == "ok"
+            for site, attempt in full_attempts.items()
+        )
+    )
+    full_unhealthy = bool(full_attempts) and not full_verified
+    full_completed_at = max(
+        (attempt.finished_at or attempt.started_at for attempt in full_attempts.values()),
+        default=None,
+    )
+    full_status = None
+    if full_attempts:
+        full_status = "ok" if full_verified else "degraded"
+        if any(attempt.status == "failed" for attempt in full_attempts.values()):
+            full_status = "failed"
+    status_label = (
+        "degraded" if (stale or db_ms is None or run_unhealthy or full_unhealthy) else "up"
+    )
     return HealthOut(
         status=status_label,
         last_run_at=last.started_at if last else None,
@@ -626,6 +654,9 @@ def health_endpoint(db: Session = Depends(get_db)):
         redis_ping_ms=redis_ms,
         sites=sites,
         staleness_warning=stale,
+        full_catalog_run_at=full_completed_at,
+        full_catalog_status=full_status,
+        full_catalog_verified=full_verified,
     )
 
 

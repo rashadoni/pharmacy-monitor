@@ -703,12 +703,6 @@
   },
   {
     "site": "aptekonline",
-    "slug": "308",
-    "name": "Narkoz üçün vasitələr",
-    "source_url": "https://www.aptekonline.az/products/308"
-  },
-  {
-    "site": "aptekonline",
     "slug": "341",
     "name": "Cərrahi vasitələr",
     "source_url": "https://www.aptekonline.az/products/341"
@@ -1087,12 +1081,6 @@
   },
   {
     "site": "aptekonline",
-    "slug": "419",
-    "name": "Optik şüşə",
-    "source_url": "https://www.aptekonline.az/products/419"
-  },
-  {
-    "site": "aptekonline",
     "slug": "422",
     "name": "Dırnaq xəstləlikləri zamanı istifadə olunan vasitələr",
     "source_url": "https://www.aptekonline.az/products/422"
@@ -1228,12 +1216,6 @@
     "slug": "373",
     "name": "Tibbi kişi xalatları",
     "source_url": "https://www.aptekonline.az/products/373"
-  },
-  {
-    "site": "aptekonline",
-    "slug": "374",
-    "name": "Tibbi qadın xalatları",
-    "source_url": "https://www.aptekonline.az/products/374"
   },
   {
     "site": "aptekonline",
@@ -1882,12 +1864,6 @@
     "slug": "409",
     "name": "Pastalar",
     "source_url": "https://www.aptekonline.az/products/409"
-  },
-  {
-    "site": "aptekonline",
-    "slug": "425",
-    "name": "Şirniyyat",
-    "source_url": "https://www.aptekonline.az/products/425"
   },
   {
     "site": "aptekonline",

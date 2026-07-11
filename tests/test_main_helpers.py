@@ -14,9 +14,100 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import click
+
 from src import main as main_mod
 from src import storage, watchlist
 from src.scrapers.base import ScrapedProduct, ScrapeResult
+
+
+class _FakeLockConnection:
+    def __init__(self, acquired=True, fail_acquire=False):
+        self.acquired = acquired
+        self.fail_acquire = fail_acquire
+        self.calls = []
+        self.closed = False
+        self.commits = 0
+        self.rollbacks = 0
+
+    def scalar(self, statement, params):
+        sql = str(statement)
+        self.calls.append((sql, params))
+        if self.fail_acquire and "advisory_lock" in sql:
+            raise RuntimeError("lock connection failed")
+        if "pg_try_advisory_lock" in sql:
+            return self.acquired
+        return True
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeLockEngine:
+    url = "postgresql://test"
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def connect(self):
+        return self.connection
+
+
+class _FakeLockFactory:
+    def __init__(self, connection):
+        self.kw = {"bind": _FakeLockEngine(connection)}
+
+
+def test_scrape_lock_busy_closes_dedicated_connection():
+    connection = _FakeLockConnection(acquired=False)
+
+    with click.Context(click.Command("test")):
+        acquired = main_mod._hold_scrape_lock_until_command_exit(
+            _FakeLockFactory(connection), wait=False
+        )
+
+    assert acquired is False
+    assert connection.commits == 1
+    assert connection.closed is True
+    assert any("pg_try_advisory_lock" in sql for sql, _ in connection.calls)
+
+
+def test_scrape_lock_released_when_click_context_closes():
+    connection = _FakeLockConnection(acquired=True)
+    context = click.Context(click.Command("test"))
+
+    with context:
+        acquired = main_mod._hold_scrape_lock_until_command_exit(
+            _FakeLockFactory(connection), wait=False
+        )
+        assert acquired is True
+        assert connection.commits == 1
+        assert connection.closed is False
+
+    assert connection.commits == 2
+    assert connection.closed is True
+    assert any("pg_advisory_unlock" in sql for sql, _ in connection.calls)
+
+
+def test_scrape_lock_acquire_exception_rolls_back_and_closes():
+    import pytest
+
+    connection = _FakeLockConnection(fail_acquire=True)
+    with click.Context(click.Command("test")), pytest.raises(
+        RuntimeError, match="lock connection failed"
+    ):
+        main_mod._hold_scrape_lock_until_command_exit(
+            _FakeLockFactory(connection), wait=False
+        )
+
+    assert connection.rollbacks == 1
+    assert connection.closed is True
 
 
 # === AI fallback toggles ===

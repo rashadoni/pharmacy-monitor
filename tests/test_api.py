@@ -147,6 +147,119 @@ def test_health_endpoint_does_not_hide_degraded_behind_running_run(client, setup
     assert response.json()["last_run_status"] == "degraded"
 
 
+def test_health_endpoint_orders_terminal_runs_by_completion(client, setup_db):
+    now = utcnow()
+    setup_db.add_all(
+        [
+            storage.Run(
+                tenant_id=1,
+                started_at=now - timedelta(hours=2),
+                finished_at=now,
+                status="degraded",
+                run_quality={"sites": {"pharmonline": {"status": "degraded"}}},
+            ),
+            storage.Run(
+                tenant_id=1,
+                started_at=now - timedelta(hours=1),
+                finished_at=now - timedelta(minutes=30),
+                status="ok",
+                run_quality={"financially_eligible": False},
+            ),
+        ]
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["last_run_status"] == "degraded"
+
+
+def test_health_endpoint_partial_ok_preserves_full_catalog_failure(client, setup_db):
+    now = utcnow()
+    full = storage.Run(
+        tenant_id=1,
+        started_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=1),
+        status="degraded",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"pharmonline": {"status": "degraded"}},
+        },
+    )
+    setup_db.add(full)
+    setup_db.flush()
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=now - timedelta(minutes=30),
+            finished_at=now,
+            status="ok",
+            run_quality={
+                "baseline_enforced": False,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {"pharmonline": {"status": "ok"}},
+            },
+        )
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["last_run_status"] == "ok"
+    assert body["full_catalog_status"] == "degraded"
+    assert body["full_catalog_verified"] is False
+    assert body["full_catalog_run_at"] is not None
+
+
+def test_health_endpoint_aloe_full_does_not_mask_other_degraded_sites(client, setup_db):
+    now = utcnow()
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=now - timedelta(hours=2),
+            finished_at=now - timedelta(hours=1),
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {
+                    "pharmonline": {"status": "degraded"},
+                    "aptekonline": {"status": "degraded"},
+                    "aloe": {"status": "ok"},
+                },
+            },
+        )
+    )
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=now - timedelta(minutes=30),
+            finished_at=now,
+            status="ok",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": True,
+                "financially_eligible": True,
+                "sites": {"aloe": {"status": "ok"}},
+            },
+        )
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["last_run_status"] == "ok"
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "degraded"
+    assert body["full_catalog_verified"] is False
+
+
 def test_health_endpoint_flags_staleness(client, setup_db):
     """Daily-cadence site older than 30h → staleness_warning=true, status=degraded."""
 
@@ -3086,6 +3199,8 @@ def test_roi_actions_serves_cache_from_financially_eligible_run(
         status="ok",
         finished_at=utcnow(),
         run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
             "financially_eligible": True,
             "sites": {
                 "pharmonline": {"status": "ok"},
@@ -3109,3 +3224,69 @@ def test_roi_actions_serves_cache_from_financially_eligible_run(
     response = client.get("/api/v1/dash/roi/actions")
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_roi_actions_rejects_cache_after_newer_degraded_full_run(
+    client, auth_cookie, setup_db
+):
+    cached_run = storage.Run(
+        tenant_id=1,
+        started_at=utcnow() - timedelta(hours=2),
+        finished_at=utcnow() - timedelta(hours=1),
+        status="ok",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
+    setup_db.add(cached_run)
+    setup_db.flush()
+    setup_db.add(
+        storage.RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            run_id=cached_run.id,
+            computed_at=utcnow(),
+            payload=[],
+        )
+    )
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=utcnow() - timedelta(minutes=30),
+            finished_at=utcnow(),
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {"pharmonline": {"status": "degraded"}},
+            },
+        )
+    )
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=utcnow() - timedelta(minutes=10),
+            finished_at=utcnow() + timedelta(seconds=1),
+            status="ok",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": True,
+                "financially_eligible": True,
+                "sites": {"aloe": {"status": "ok"}},
+            },
+        )
+    )
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/roi/actions")
+
+    assert response.status_code == 503
+    assert "Verified full-catalog" in response.json()["detail"]

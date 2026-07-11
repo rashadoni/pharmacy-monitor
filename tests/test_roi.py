@@ -25,6 +25,7 @@ def _add_product(s, site, name, ext_id, canonical_id=None):
 def _eligible_quality() -> dict:
     return {
         "version": 1,
+        "baseline_enforced": True,
         "full_catalog_verified": True,
         "financially_eligible": True,
         "sites": {
@@ -354,6 +355,132 @@ def test_get_cached_actions_returns_none_when_stale(db_session):
     assert roi.get_cached_actions(db_session, "pharmonline") is None
     # Но если повысить порог — возвращается
     assert roi.get_cached_actions(db_session, "pharmonline", max_age_hours=72) is not None
+
+
+def test_roi_cache_rejected_after_newer_degraded_full_attempt(db_session):
+    from src.storage import RoiActionsCache
+
+    cached_run = _shared_run(db_session)
+    cached_run.started_at = utcnow() - timedelta(hours=2)
+    cached_run.finished_at = utcnow() - timedelta(hours=1)
+    db_session.add(
+        RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            payload=[{"type": "price_raise", "severity": "info", "title": "trusted"}],
+            computed_at=utcnow(),
+            run_id=cached_run.id,
+        )
+    )
+    db_session.commit()
+    assert roi.get_cached_actions(db_session, "pharmonline") is not None
+
+    db_session.add(
+        Run(
+            tenant_id=1,
+            started_at=utcnow() - timedelta(minutes=30),
+            finished_at=utcnow(),
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {"pharmonline": {"status": "degraded"}},
+            },
+        )
+    )
+    db_session.commit()
+
+    assert roi.get_cached_actions(db_session, "pharmonline") is None
+
+
+def test_per_site_attempt_chain_stays_closed_until_failed_site_recovers(db_session):
+    cached_run = _shared_run(db_session)
+    cached_run.started_at = utcnow() - timedelta(hours=3)
+    cached_run.finished_at = utcnow() - timedelta(hours=3)
+    db_session.commit()
+
+    aptek_degraded = Run(
+        tenant_id=1,
+        started_at=utcnow() - timedelta(hours=2),
+        finished_at=utcnow() - timedelta(hours=2),
+        status="degraded",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"aptekonline": {"status": "degraded"}},
+        },
+    )
+    aloe_ok = Run(
+        tenant_id=1,
+        started_at=utcnow() - timedelta(hours=1),
+        finished_at=utcnow() - timedelta(hours=1),
+        status="ok",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {"aloe": {"status": "ok"}},
+        },
+    )
+    db_session.add_all([aptek_degraded, aloe_ok])
+    db_session.commit()
+
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is False
+
+    aptek_ok = Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="ok",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {"aptekonline": {"status": "ok"}},
+        },
+    )
+    db_session.add(aptek_ok)
+    db_session.commit()
+
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is True
+
+
+def test_roi_cache_tie_breaks_equal_completion_by_run_id(db_session):
+    from src.storage import RoiActionsCache
+
+    completed_at = utcnow()
+    cached_run = _shared_run(db_session)
+    cached_run.started_at = completed_at - timedelta(hours=1)
+    cached_run.finished_at = completed_at
+    db_session.add(
+        RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            payload=[],
+            computed_at=completed_at,
+            run_id=cached_run.id,
+        )
+    )
+    db_session.flush()
+    db_session.add(
+        Run(
+            tenant_id=1,
+            started_at=completed_at - timedelta(minutes=30),
+            finished_at=completed_at,
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {"aptekonline": {"status": "degraded"}},
+            },
+        )
+    )
+    db_session.commit()
+
+    assert roi.get_cached_actions(db_session, "pharmonline") is None
 
 
 def test_cache_actions_upserts_existing(db_session):

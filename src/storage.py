@@ -863,6 +863,71 @@ def financially_eligible_run_ids(session, *, tenant_id: int = 1) -> list[int]:
     ]
 
 
+def _terminal_run_ordering():
+    """Cross-database ordering by actual completion, with legacy fallback."""
+    from sqlalchemy import desc, func
+
+    return (
+        desc(func.coalesce(Run.finished_at, Run.started_at)),
+        desc(Run.id),
+    )
+
+
+FULL_CATALOG_SITES = ("pharmonline", "aptekonline", "aloe")
+
+
+def latest_terminal_run(session, *, tenant_id: int | None = 1) -> Run | None:
+    """Return the terminal run that most recently finished.
+
+    Full scans can overlap short partial ticks. ``started_at`` and id ordering
+    can therefore let an earlier-finishing partial run hide a full run that
+    completed later with degraded quality.
+    """
+    from sqlalchemy import select
+
+    stmt = select(Run).where(Run.status != "running")
+    if tenant_id is not None:
+        stmt = stmt.where(Run.tenant_id == tenant_id)
+    return session.scalars(stmt.order_by(*_terminal_run_ordering()).limit(1)).first()
+
+
+def latest_full_catalog_attempts_by_site(
+    session,
+    sites,
+    *,
+    tenant_id: int = 1,
+) -> dict[str, Run]:
+    """Return each site's newest terminal full-catalog attempt.
+
+    A successful single-site run must not hide a newer degraded attempt for a
+    different site. Runs are streamed newest-completion-first and each site is
+    filled exactly once.
+    """
+    from sqlalchemy import select
+
+    wanted = set(sites)
+    if not wanted:
+        return {}
+    out: dict[str, Run] = {}
+    rows = session.scalars(
+        select(Run)
+        .where(
+            Run.tenant_id == tenant_id,
+            Run.status != "running",
+            Run.run_quality.is_not(None),
+            Run.run_quality["baseline_enforced"].as_boolean().is_(True),
+        )
+        .order_by(*_terminal_run_ordering())
+    ).yield_per(100)
+    for run in rows:
+        run_sites = set(((run.run_quality or {}).get("sites") or {}).keys())
+        for site in (wanted - out.keys()) & run_sites:
+            out[site] = run
+        if wanted.issubset(out):
+            break
+    return out
+
+
 def latest_financial_run_ids_by_site(
     session,
     sites,
@@ -871,7 +936,7 @@ def latest_financial_run_ids_by_site(
     before_run_id: int | None = None,
 ) -> dict[str, int]:
     """Latest verified full-catalog run lineage for each requested site."""
-    from sqlalchemy import desc, select
+    from sqlalchemy import select
 
     wanted = set(sites)
     if not wanted:
@@ -882,7 +947,9 @@ def latest_financial_run_ids_by_site(
     if not eligible_ids:
         return {}
     runs = session.scalars(
-        select(Run).where(Run.id.in_(eligible_ids)).order_by(desc(Run.id))
+        select(Run)
+        .where(Run.id.in_(eligible_ids))
+        .order_by(*_terminal_run_ordering())
     ).all()
     out: dict[str, int] = {}
     for run in runs:

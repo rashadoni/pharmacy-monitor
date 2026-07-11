@@ -161,6 +161,15 @@ def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
     )
     if set(run_ids) != set(ALL_SITES):
         return False
+    attempts = storage.latest_full_catalog_attempts_by_site(
+        session,
+        ALL_SITES,
+        tenant_id=tenant_id,
+    )
+    if set(attempts) != set(ALL_SITES):
+        return False
+    if any(attempts[site].id != run_ids[site] for site in ALL_SITES):
+        return False
     runs = {
         run.id: run
         for run in session.scalars(
@@ -278,6 +287,26 @@ def get_cached_actions(
             run_id=row.run_id,
         )
         return None
+    latest_attempts = storage.latest_full_catalog_attempts_by_site(
+        session,
+        ALL_SITES,
+        tenant_id=tenant_id,
+    )
+    cache_completed_at = run.finished_at or run.started_at
+    for site, latest_attempt in latest_attempts.items():
+        if latest_attempt.id == run.id:
+            continue
+        attempt_completed_at = latest_attempt.finished_at or latest_attempt.started_at
+        if (attempt_completed_at, latest_attempt.id) > (cache_completed_at, run.id):
+            log.warning(
+                "roi_actions_cache_superseded",
+                client_site=client_site,
+                cache_run_id=run.id,
+                superseding_site=site,
+                latest_full_attempt_id=latest_attempt.id,
+                latest_full_attempt_status=latest_attempt.status,
+            )
+            return None
     if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
         log.warning(
             "roi_actions_cache_inputs_unverified",

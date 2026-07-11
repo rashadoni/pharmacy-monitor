@@ -135,6 +135,7 @@ def _report_email_enabled() -> bool:
 
 
 _MATCHER_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
+_SCRAPE_ADVISORY_LOCK_KEY = "pharmacy_monitor_scrape"
 
 
 def _is_postgres_session(session: Session) -> bool:
@@ -168,6 +169,62 @@ def _release_matcher_lock(session: Session) -> None:
         )
     except Exception as exc:
         log.warning("matcher_lock_release_failed", error=str(exc))
+
+
+def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
+    """Hold one checked-out connection's session lock without an idle transaction."""
+    bind = SessionFactory.kw.get("bind")
+    if bind is None:
+        raise RuntimeError("scrape lock requires a bound session factory")
+    if not str(bind.url).startswith("postgresql"):
+        return True
+
+    connection = bind.connect()
+    try:
+        function = "pg_advisory_lock" if wait else "pg_try_advisory_lock"
+        acquired = connection.scalar(
+            text(f"SELECT {function}(hashtext(:key))"),
+            {"key": _SCRAPE_ADVISORY_LOCK_KEY},
+        )
+        # Session-level advisory locks survive COMMIT. End the implicit
+        # transaction immediately so a multi-hour scrape is never
+        # idle-in-transaction, while this exact connection stays checked out.
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        connection.close()
+        raise
+    if not wait and not acquired:
+        connection.close()
+        return False
+
+    context = click.get_current_context(silent=True)
+    if context is None:
+        try:
+            connection.scalar(
+                text("SELECT pg_advisory_unlock(hashtext(:key))"),
+                {"key": _SCRAPE_ADVISORY_LOCK_KEY},
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        raise RuntimeError("scrape lock requires an active Click command context")
+
+    def release() -> None:
+        try:
+            connection.scalar(
+                text("SELECT pg_advisory_unlock(hashtext(:key))"),
+                {"key": _SCRAPE_ADVISORY_LOCK_KEY},
+            )
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            log.warning("scrape_lock_release_failed", error=str(exc))
+        finally:
+            connection.close()
+
+    context.call_on_close(release)
+    return True
 
 
 def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | None]:
@@ -2074,6 +2131,8 @@ def ai_crawl_cmd(
         return
 
     Session = storage.make_session()
+    if not _hold_scrape_lock_until_command_exit(Session, wait=False):
+        raise click.ClickException("AI crawl blocked because another scrape run is active")
     with Session() as session:
         run = storage.Run(status="running")
         session.add(run)
@@ -2217,6 +2276,9 @@ def run_cmd(
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
 
     Session = storage.make_session()
+    # Full/manual runs wait for a short partial producer to finish. Conversely,
+    # scrape-only/intraday producers below fail-fast while this lock is held.
+    _hold_scrape_lock_until_command_exit(Session, wait=True)
     with Session() as session:
         maybe_seed_categories(session)
 
@@ -2519,6 +2581,9 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
 
     Session = storage.make_session()
+    if not _hold_scrape_lock_until_command_exit(Session, wait=False):
+        click.echo("scrape: skipped because another scrape run is active")
+        return
     with Session() as session:
         maybe_seed_categories(session)
         run = storage.Run(status="running")
