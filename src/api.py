@@ -3432,7 +3432,33 @@ def dash_audit_log(
     }
 
 
-def _run_row_out(r: storage.Run) -> dict:
+def _compact_run_quality(run_quality: dict | None) -> dict | None:
+    """Return list-safe run quality without per-category item payloads."""
+    if not isinstance(run_quality, dict):
+        return run_quality
+
+    compact = {
+        key: value
+        for key, value in run_quality.items()
+        if key != "sites"
+    }
+    sites = run_quality.get("sites")
+    if isinstance(sites, dict):
+        compact_sites: dict[str, dict] = {}
+        for site, site_quality in sites.items():
+            if isinstance(site_quality, dict):
+                compact_sites[site] = {
+                    key: value
+                    for key, value in site_quality.items()
+                    if key != "items"
+                }
+            else:
+                compact_sites[site] = {"status": site_quality}
+        compact["sites"] = compact_sites
+    return compact
+
+
+def _run_row_out(r: storage.Run, *, compact_quality: bool = True) -> dict:
     return {
         "id": r.id,
         "started_at": r.started_at.isoformat() if r.started_at else None,
@@ -3440,7 +3466,7 @@ def _run_row_out(r: storage.Run) -> dict:
         "status": r.status,
         "products_scraped": r.products_scraped,
         "products_per_site": r.products_per_site,
-        "run_quality": r.run_quality,
+        "run_quality": _compact_run_quality(r.run_quality) if compact_quality else r.run_quality,
         "sites_completed": r.sites_completed,
         "error_message": r.error_message,
     }

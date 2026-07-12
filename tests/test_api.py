@@ -3995,7 +3995,13 @@ def test_run_endpoints_serialize_quality(client, auth_cookie, setup_db):
             "version": 1,
             "mode": "category",
             "financially_eligible": False,
-            "sites": {"aloe": {"status": "degraded"}},
+            "sites": {
+                "aloe": {
+                    "status": "degraded",
+                    "items_expected": 1,
+                    "items": {"dermanlar": {"status": "ok", "products": 5}},
+                }
+            },
         },
     )
     setup_db.add(run)
@@ -4003,8 +4009,11 @@ def test_run_endpoints_serialize_quality(client, auth_cookie, setup_db):
 
     rows = client.get("/api/v1/dash/runs?limit=1").json()
     assert rows[0]["run_quality"]["sites"]["aloe"]["status"] == "degraded"
+    assert rows[0]["run_quality"]["sites"]["aloe"]["items_expected"] == 1
+    assert "items" not in rows[0]["run_quality"]["sites"]["aloe"]
     detail = client.get(f"/api/v1/dash/runs/{run.id}/breakdown").json()
     assert detail["run_quality"]["financially_eligible"] is False
+    assert detail["run_quality"]["sites"]["aloe"]["items"]["dermanlar"]["products"] == 5
 
 
 def test_run_breakdown_is_tenant_scoped(client, auth_cookie, setup_db):

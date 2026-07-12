@@ -2681,7 +2681,7 @@ def _intraday_product_limit() -> int:
         configured = int(os.environ.get("INTRADAY_PRODUCT_LIMIT", "600"))
     except ValueError:
         configured = 600
-    return max(1, min(configured, 5_000))
+    return max(1, min(configured, 600))
 
 
 @cli.command("intraday-tick")

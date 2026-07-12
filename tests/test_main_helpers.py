@@ -780,6 +780,6 @@ def test_intraday_product_limit_is_bounded(monkeypatch):
     monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "0")
     assert main_mod._intraday_product_limit() == 1
     monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "999999")
-    assert main_mod._intraday_product_limit() == 5_000
+    assert main_mod._intraday_product_limit() == 600
     monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "invalid")
     assert main_mod._intraday_product_limit() == 600
