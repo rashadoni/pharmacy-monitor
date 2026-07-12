@@ -540,7 +540,9 @@ def test_scrape_command_scopes_single_category_to_configured_sites(db_session, m
     Session = sessionmaker(db_session.get_bind(), expire_on_commit=False)
     monkeypatch.setattr(storage, "init_db", lambda *args, **kwargs: None)
     monkeypatch.setattr(storage, "make_session", lambda *args, **kwargs: Session)
-    monkeypatch.setattr(main_mod, "_hold_scrape_lock_until_command_exit", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        main_mod, "_hold_scrape_lock_until_command_exit", lambda *args, **kwargs: True
+    )
     monkeypatch.setattr(main_mod, "maybe_seed_categories", lambda *args, **kwargs: None)
     monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *args, **kwargs: {})
     monkeypatch.setattr(main_mod, "run_quality_baselines_for_sites", lambda *args, **kwargs: {})

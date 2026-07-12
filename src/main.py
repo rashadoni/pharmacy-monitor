@@ -417,8 +417,7 @@ def reap_stale_running_runs(
             }
             run.run_quality = quality
         recovery_note = (
-            f"{reason} (previous_status={previous_status}, "
-            f"recovered_at={recovered_at.isoformat()})"
+            f"{reason} (previous_status={previous_status}, recovered_at={recovered_at.isoformat()})"
         )
         run.error_message = ((run.error_message or "") + f" | {recovery_note}").strip(" |")
     session.commit()
@@ -566,9 +565,7 @@ async def scrape_watchlist_for_site(site: str, urls: list[str]) -> ScrapeResult:
                     "status": "failed",
                     "products": 0,
                     "error": str(error or "product_not_found")[:500],
-                    "error_kind": (
-                        "not_found" if error == "product_not_found" else "exception"
-                    ),
+                    "error_kind": ("not_found" if error == "product_not_found" else "exception"),
                 }
                 result.errors.append(f"url={url}: {error or 'product_not_found'}")
 
@@ -592,9 +589,7 @@ async def scrape_watchlist_for_site(site: str, urls: list[str]) -> ScrapeResult:
                 result.errors.append(f"site_fatal: {message}")
 
             try:
-                await s.scrape_urls(
-                    urls, on_result=_record_url, on_abort=_record_abort
-                )
+                await s.scrape_urls(urls, on_result=_record_url, on_abort=_record_abort)
             except SiteScrapeFatalError:
                 return result
             try:
@@ -760,9 +755,7 @@ def classify_run_quality(
         ordered_items = list(result.item_results.items())
         ordered_items.sort(key=lambda item: item[1].get("status") == "ok")
         persisted_items: dict[str, dict] = {}
-        for index, (raw_key, raw_value) in enumerate(
-            ordered_items[:_RUN_QUALITY_MAX_ITEMS]
-        ):
+        for index, (raw_key, raw_value) in enumerate(ordered_items[:_RUN_QUALITY_MAX_ITEMS]):
             key = str(raw_key)[:300]
             if key in persisted_items:
                 suffix = f"~{index}"
@@ -771,11 +764,7 @@ def classify_run_quality(
             persisted_items[key] = {
                 "status": str(value.get("status") or "unknown")[:30],
                 "products": max(0, int(value.get("products") or 0)),
-                **(
-                    {"error": str(value.get("error"))[:500]}
-                    if value.get("error")
-                    else {}
-                ),
+                **({"error": str(value.get("error"))[:500]} if value.get("error") else {}),
                 **(
                     {"error_kind": str(value.get("error_kind"))[:50]}
                     if value.get("error_kind")
@@ -837,9 +826,7 @@ def classify_run_quality(
     else:
         overall = "ok"
 
-    full_catalog_verified = (
-        overall == "ok" and mode == "category" and enforce_baseline
-    )
+    full_catalog_verified = overall == "ok" and mode == "category" and enforce_baseline
     return overall, {
         "version": 1,
         "mode": mode,
@@ -870,9 +857,7 @@ def scope_category_run_sites(
         return list(requested_sites), slugs_by_site
 
     configured = {
-        site: slugs_by_site.get(site, [])
-        for site in requested_sites
-        if slugs_by_site.get(site)
+        site: slugs_by_site.get(site, []) for site in requested_sites if slugs_by_site.get(site)
     }
     if not configured:
         return list(requested_sites), slugs_by_site
@@ -922,9 +907,7 @@ def run_tenant_id_for_request(session: Session, request_id: int | None) -> int:
     if request is None:
         raise click.ClickException(f"scrape request #{request_id} not found")
     if request.status not in {"pending", "running"}:
-        raise click.ClickException(
-            f"scrape request #{request_id} is already {request.status}"
-        )
+        raise click.ClickException(f"scrape request #{request_id} is already {request.status}")
     if request.tenant_id != 1:
         raise click.ClickException(
             "Server-side scraping is not enabled for non-pilot tenants; request blocked."
@@ -2373,9 +2356,7 @@ def run_cmd(
             quality_baselines: dict[str, int | None] = {}
             enforce_quality_baseline = False
             if effective_mode == "watchlist":
-                filtered = {
-                    s: urls for s, urls in watchlist_urls.items() if s in sites and urls
-                }
+                filtered = {s: urls for s, urls in watchlist_urls.items() if s in sites and urls}
                 quality_sites = list(filtered)
                 results = asyncio.run(scrape_watchlist_all(filtered))
             else:
@@ -2816,7 +2797,9 @@ def rematch_cmd(
                 if dry_run:
                     click.echo("(dry-run — ничего не изменено)")
                 else:
-                    click.echo(f"applied {len(swaps)} swap'ов (swap_alternative → кластер is_manual)")
+                    click.echo(
+                        f"applied {len(swaps)} swap'ов (swap_alternative → кластер is_manual)"
+                    )
                 return
 
             if revalidate:
@@ -2999,11 +2982,7 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
             ).all()
             run = (
                 next(
-                    (
-                        item
-                        for item in recent
-                        if storage.run_is_financially_eligible(item)
-                    ),
+                    (item for item in recent if storage.run_is_financially_eligible(item)),
                     None,
                 )
                 if send
@@ -3022,9 +3001,7 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
             if run is None:
                 raise click.ClickException(f"Run #{run_id} not found.")
             if run.tenant_id != tenant_id:
-                raise click.ClickException(
-                    f"Run #{run_id} does not belong to tenant #{tenant_id}."
-                )
+                raise click.ClickException(f"Run #{run_id} does not belong to tenant #{tenant_id}.")
 
         if send:
             from src import roi as roi_mod
