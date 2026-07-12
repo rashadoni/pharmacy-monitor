@@ -14,7 +14,7 @@ import {
   MailOpen,
 } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
-import { api, friendlyError, type AlertEvent } from "@/lib/api";
+import { api, friendlyError, type AlertEvent, type AlertSort } from "@/lib/api";
 import { formatRelative, formatTime } from "@/lib/utils";
 import { CardListSkeleton } from "@/components/skeleton";
 import { OnboardingTip } from "@/components/onboarding-tip";
@@ -74,9 +74,21 @@ export default function AlertsPage() {
     allowed: [0, 24, 72, 168, 720],
   });
   const ruleTypeFilter = searchParams.get("type") ?? "";
+  const siteFilter = choiceParam(
+    parsedParams,
+    "site",
+    ["", "pharmonline", "aptekonline", "aloe", "general"] as const,
+    "",
+  );
+  const sortOrder = choiceParam(
+    parsedParams,
+    "sort",
+    ["newest", "oldest", "site"] as const,
+    "newest",
+  ) as AlertSort;
   const offset = integerParam(parsedParams, "offset", 0);
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const filterSignature = `${view}|${severityFilter}|${hoursWindow}|${ruleTypeFilter}`;
+  const filterSignature = `${view}|${severityFilter}|${hoursWindow}|${ruleTypeFilter}|${siteFilter}|${sortOrder}`;
   const previousFilterSignature = useRef(filterSignature);
   useEffect(() => {
     if (previousFilterSignature.current !== filterSignature) {
@@ -98,12 +110,23 @@ export default function AlertsPage() {
   }
 
   const pageQ = useQuery({
-    queryKey: ["alerts-page", view, severityFilter, hoursWindow, ruleTypeFilter, offset],
+    queryKey: [
+      "alerts-page",
+      view,
+      severityFilter,
+      hoursWindow,
+      ruleTypeFilter,
+      siteFilter,
+      sortOrder,
+      offset,
+    ],
     queryFn: () =>
       api.alertsPage({
         view,
         severity: severityFilter || undefined,
         rule_type: ruleTypeFilter || undefined,
+        site: siteFilter || undefined,
+        sort: sortOrder,
         hours: hoursWindow,
         limit: PAGE_SIZE,
         offset,
@@ -149,6 +172,9 @@ export default function AlertsPage() {
   }, [data, hoursWindow, ruleTypeFilter, view]);
 
   const ruleTypes = pageQ.data?.rule_types ?? [];
+  const hasActiveFilters = Boolean(
+    severityFilter || ruleTypeFilter || siteFilter || hoursWindow !== 168,
+  );
 
   // Mutations
   const markAllReadMutation = useMutation({
@@ -224,21 +250,26 @@ export default function AlertsPage() {
       />
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{t("page_title")}</h1>
-          <p className="text-sm text-muted-foreground">
-            {t("page_subtitle")}
-          </p>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {t("page_title")}
+          </h1>
+          <p className="text-sm text-muted-foreground">{t("page_subtitle")}</p>
         </div>
-        {view === "inbox" && counts?.unread != null && counts.unread > 0 && (
-          <button
-            onClick={() => markAllReadMutation.mutate()}
-            disabled={markAllReadMutation.isPending}
-            className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:min-h-9"
-          >
-            <CheckCheck className="h-3.5 w-3.5" />
-            {markAllReadMutation.isPending ? "…" : t("mark_all_read_btn", { count: counts.unread })}
-          </button>
-        )}
+        {view === "inbox" &&
+          !hasActiveFilters &&
+          counts?.unread != null &&
+          counts.unread > 0 && (
+            <button
+              onClick={() => markAllReadMutation.mutate()}
+              disabled={markAllReadMutation.isPending}
+              className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:min-h-9"
+            >
+              <CheckCheck className="h-3.5 w-3.5" />
+              {markAllReadMutation.isPending
+                ? "…"
+                : t("mark_all_read_btn", { count: counts.unread })}
+            </button>
+          )}
       </div>
 
       {/* Tabs */}
@@ -277,7 +308,7 @@ export default function AlertsPage() {
         <Chip
           active={severityFilter === ""}
           onClick={() => updateFilters({ severity: null })}
-          label={`${t("filter_all")}${pageQ.data ? ` (${pageQ.data.total})` : ""}`}
+          label={t("filter_all")}
         />
         <Chip
           active={severityFilter === "critical"}
@@ -294,39 +325,100 @@ export default function AlertsPage() {
           onClick={() => updateFilters({ severity: "info" })}
           label={t("filter_info")}
         />
-        <div className="flex w-full gap-2 sm:ml-auto sm:w-auto">
-          <select
-            value={hoursWindow}
-            onChange={(e) =>
-              updateFilters({
-                hours: Number(e.target.value) === 168 ? null : Number(e.target.value),
-              })
-            }
-            aria-label={t("window_label")}
-            className="min-h-11 min-w-0 flex-1 rounded-full border border-border bg-card px-3 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:flex-none md:min-h-9"
-          >
-            <option value={24}>{t("window_24h")}</option>
-            <option value={72}>{t("window_3d")}</option>
-            <option value={168}>{t("window_7d")}</option>
-            <option value={720}>{t("window_30d")}</option>
-            <option value={0}>{t("window_all")}</option>
-          </select>
-          <select
-            value={ruleTypeFilter}
-            onChange={(e) => updateFilters({ type: e.target.value || null })}
-            aria-label={t("rule_type_label")}
-            className="min-h-11 min-w-0 flex-1 rounded-full border border-border bg-card px-3 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:flex-none md:min-h-9"
-          >
-            <option value="">{t("filter_all_types")}</option>
-            {ruleTypeFilter && !ruleTypes.includes(ruleTypeFilter) && (
-              <option value={ruleTypeFilter}>{ruleTypeFilter}</option>
-            )}
-            {ruleTypes.map((rt) => (
-              <option key={rt} value={rt}>
-                {rt}
-              </option>
-            ))}
-          </select>
+        <div className="grid w-full grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-1">
+            <label
+              htmlFor="alerts-site-filter"
+              className="text-[11px] font-medium text-muted-foreground"
+            >
+              {t("site_filter_label")}
+            </label>
+            <select
+              id="alerts-site-filter"
+              value={siteFilter}
+              onChange={(e) => updateFilters({ site: e.target.value || null })}
+              className="min-h-11 min-w-0 rounded-md border border-border bg-card px-3 py-1 text-xs font-normal text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              <option value="">{t("filter_all_sites")}</option>
+              <option value="pharmonline">{t("site_pharmonline")}</option>
+              <option value="aptekonline">{t("site_aptekonline")}</option>
+              <option value="aloe">{t("site_aloe")}</option>
+              <option value="general">{t("site_general")}</option>
+            </select>
+          </div>
+          <div className="grid gap-1">
+            <label
+              htmlFor="alerts-rule-type-filter"
+              className="text-[11px] font-medium text-muted-foreground"
+            >
+              {t("rule_type_label")}
+            </label>
+            <select
+              id="alerts-rule-type-filter"
+              value={ruleTypeFilter}
+              onChange={(e) => updateFilters({ type: e.target.value || null })}
+              className="min-h-11 min-w-0 rounded-md border border-border bg-card px-3 py-1 text-xs font-normal text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              <option value="">{t("filter_all_types")}</option>
+              {ruleTypeFilter && !ruleTypes.includes(ruleTypeFilter) && (
+                <option value={ruleTypeFilter}>{ruleTypeFilter}</option>
+              )}
+              {ruleTypes.map((rt) => (
+                <option key={rt} value={rt}>
+                  {rt}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="grid gap-1">
+            <label
+              htmlFor="alerts-window-filter"
+              className="text-[11px] font-medium text-muted-foreground"
+            >
+              {t("window_label")}
+            </label>
+            <select
+              id="alerts-window-filter"
+              value={hoursWindow}
+              onChange={(e) =>
+                updateFilters({
+                  hours:
+                    Number(e.target.value) === 168
+                      ? null
+                      : Number(e.target.value),
+                })
+              }
+              className="min-h-11 min-w-0 rounded-md border border-border bg-card px-3 py-1 text-xs font-normal text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              <option value={24}>{t("window_24h")}</option>
+              <option value={72}>{t("window_3d")}</option>
+              <option value={168}>{t("window_7d")}</option>
+              <option value={720}>{t("window_30d")}</option>
+              <option value={0}>{t("window_all")}</option>
+            </select>
+          </div>
+          <div className="grid gap-1">
+            <label
+              htmlFor="alerts-sort"
+              className="text-[11px] font-medium text-muted-foreground"
+            >
+              {t("sort_label")}
+            </label>
+            <select
+              id="alerts-sort"
+              value={sortOrder}
+              onChange={(e) =>
+                updateFilters({
+                  sort: e.target.value === "newest" ? null : e.target.value,
+                })
+              }
+              className="min-h-11 min-w-0 rounded-md border border-border bg-card px-3 py-1 text-xs font-normal text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              <option value="newest">{t("sort_newest")}</option>
+              <option value="oldest">{t("sort_oldest")}</option>
+              <option value="site">{t("sort_site")}</option>
+            </select>
+          </div>
         </div>
       </div>
 
@@ -341,7 +433,9 @@ export default function AlertsPage() {
       {/* Bulk toolbar — виден когда есть selected */}
       {selected.size > 0 && (
         <div className="sticky top-14 z-10 flex flex-wrap items-center gap-2 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 text-sm md:top-0">
-          <span className="font-medium">{t("selected_count", { count: selected.size })}</span>
+          <span className="font-medium">
+            {t("selected_count", { count: selected.size })}
+          </span>
           {view !== "read" && (
             <button
               onClick={() =>
@@ -437,9 +531,28 @@ export default function AlertsPage() {
       {isLoading && <CardListSkeleton count={6} />}
       {filtered && filtered.length === 0 && !isLoading && !isError && (
         <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center">
-          {view === "inbox" && t("empty_inbox")}
-          {view === "snoozed" && t("empty_snoozed")}
-          {view === "read" && t("empty_read")}
+          <p>
+            {hasActiveFilters && t("empty_filtered")}
+            {!hasActiveFilters && view === "inbox" && t("empty_inbox")}
+            {!hasActiveFilters && view === "snoozed" && t("empty_snoozed")}
+            {!hasActiveFilters && view === "read" && t("empty_read")}
+          </p>
+          {hasActiveFilters && (
+            <button
+              type="button"
+              onClick={() =>
+                updateFilters({
+                  severity: null,
+                  site: null,
+                  type: null,
+                  hours: null,
+                })
+              }
+              className="mt-3 min-h-11 rounded-md border border-border bg-card px-3 text-xs font-medium text-foreground hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              {t("reset_filters")}
+            </button>
+          )}
         </div>
       )}
 
@@ -481,8 +594,26 @@ export default function AlertsPage() {
             })}
           </span>
           <div className="flex gap-2">
-            <button type="button" disabled={offset === 0} onClick={() => updateFilters({ offset: Math.max(0, offset - PAGE_SIZE) || null })} className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9">{t("page_previous")}</button>
-            <button type="button" disabled={offset + PAGE_SIZE >= pageQ.data.total} onClick={() => updateFilters({ offset: offset + PAGE_SIZE })} className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9">{t("page_next")}</button>
+            <button
+              type="button"
+              disabled={offset === 0}
+              onClick={() =>
+                updateFilters({
+                  offset: Math.max(0, offset - PAGE_SIZE) || null,
+                })
+              }
+              className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9"
+            >
+              {t("page_previous")}
+            </button>
+            <button
+              type="button"
+              disabled={offset + PAGE_SIZE >= pageQ.data.total}
+              onClick={() => updateFilters({ offset: offset + PAGE_SIZE })}
+              className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9"
+            >
+              {t("page_next")}
+            </button>
           </div>
         </div>
       )}
@@ -510,6 +641,20 @@ function AlertCard({
   const cfg = SEVERITY_CONFIG[event.severity] ?? SEVERITY_CONFIG.info;
   const Icon = cfg.icon;
   const dimmed = event.is_read;
+  const siteLabel =
+    event.site === "pharmonline"
+      ? t("site_pharmonline")
+      : event.site === "aptekonline"
+        ? t("site_aptekonline")
+        : event.site === "aloe"
+          ? t("site_aloe")
+          : t("site_general_short");
+  const severityLabel =
+    event.severity === "critical"
+      ? t("severity_critical")
+      : event.severity === "warning"
+        ? t("severity_warning")
+        : t("severity_info");
   return (
     <div
       className={`rounded-lg border ${cfg.bg} p-3 ${dimmed ? "opacity-60" : ""}`}
@@ -524,10 +669,15 @@ function AlertCard({
             aria-label={t("aria_select_for_bulk")}
           />
         </label>
-        <Icon className={`h-5 w-5 shrink-0 ${cfg.color} mt-0.5`} />
+        <span className="mt-0.5 shrink-0">
+          <Icon aria-hidden="true" className={`h-5 w-5 ${cfg.color}`} />
+          <span className="sr-only">{severityLabel}</span>
+        </span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2 flex-wrap">
-            <div className={`font-medium text-sm ${event.is_read ? "line-through" : ""}`}>
+            <div
+              className={`font-medium text-sm ${event.is_read ? "line-through" : ""}`}
+            >
               {event.title}
             </div>
             <div className="flex items-center gap-2 text-xs text-muted-foreground tabular-nums">
@@ -543,11 +693,21 @@ function AlertCard({
                     {t("snoozed_badge")}
                   </span>
                 )}
-              <span title={event.created_at}>{formatRelative(event.created_at, locale)}</span>
+              <span
+                data-testid="alert-source"
+                className="inline-flex items-center rounded-md border border-border bg-background/80 px-1.5 py-0.5 font-medium text-foreground/80"
+              >
+                {siteLabel}
+              </span>
+              <span title={event.created_at}>
+                {formatRelative(event.created_at, locale)}
+              </span>
             </div>
           </div>
           {event.detail && (
-            <div className="text-xs text-muted-foreground mt-1">{event.detail}</div>
+            <div className="text-xs text-muted-foreground mt-1">
+              {event.detail}
+            </div>
           )}
           {event.rule_type && (
             <div className="text-[10px] text-muted-foreground/70 mt-1 uppercase tracking-wide">
@@ -558,7 +718,11 @@ function AlertCard({
             <button
               onClick={onMarkRead}
               className="inline-flex min-h-11 items-center gap-1 rounded px-2 py-1 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
-              title={event.is_read ? t("tooltip_mark_unread") : t("tooltip_mark_read")}
+              title={
+                event.is_read
+                  ? t("tooltip_mark_unread")
+                  : t("tooltip_mark_read")
+              }
             >
               {event.is_read ? (
                 <>
@@ -566,7 +730,8 @@ function AlertCard({
                 </>
               ) : (
                 <>
-                  <CheckCheck className="h-3 w-3" /> {t("action_mark_read_short")}
+                  <CheckCheck className="h-3 w-3" />{" "}
+                  {t("action_mark_read_short")}
                 </>
               )}
             </button>

@@ -74,7 +74,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.orm import Session, aliased, selectinload
 
 from src import analytics
@@ -2368,7 +2368,7 @@ def dash_alerts(
     stmt = (
         select(storage.AlertEvent)
         .where(storage.AlertEvent.tenant_id == user.tenant_id)
-        .order_by(desc(storage.AlertEvent.created_at))
+        .order_by(desc(storage.AlertEvent.created_at), desc(storage.AlertEvent.id))
         .limit(limit)
     )
     if severity:
@@ -2381,23 +2381,35 @@ def dash_alerts(
             (storage.AlertEvent.snoozed_until.is_(None)) | (storage.AlertEvent.snoozed_until <= now)
         )
     events = db.scalars(stmt).all()
-    return [
-        {
-            "id": e.id,
-            "rule_type": getattr(e, "rule_type", None),
-            "severity": e.severity,
-            "title": e.title,
-            "detail": e.detail,
-            "payload": e.payload,
-            "created_at": e.created_at.isoformat(),
-            "is_read": bool(getattr(e, "is_read", False)),
-            "read_at": e.read_at.isoformat() if getattr(e, "read_at", None) else None,
-            "snoozed_until": (
-                e.snoozed_until.isoformat() if getattr(e, "snoozed_until", None) else None
-            ),
-        }
-        for e in events
-    ]
+    return [_alert_event_out(event) for event in events]
+
+
+_ALERT_GENERAL_SITE = "general"
+_ALERT_SORTS = {"newest", "oldest", "site"}
+
+
+def _alert_site_from_payload(payload: dict | None) -> str | None:
+    """Return a trusted site value from old and new alert payloads."""
+    if not isinstance(payload, dict):
+        return None
+    site = payload.get("site")
+    return site if site in _VALID_SITES else None
+
+
+def _alert_event_out(event: storage.AlertEvent) -> dict:
+    return {
+        "id": event.id,
+        "rule_type": event.rule_type,
+        "severity": event.severity,
+        "title": event.title,
+        "detail": event.detail,
+        "payload": event.payload,
+        "site": _alert_site_from_payload(event.payload),
+        "created_at": event.created_at.isoformat(),
+        "is_read": bool(event.is_read),
+        "read_at": event.read_at.isoformat() if event.read_at else None,
+        "snoozed_until": event.snoozed_until.isoformat() if event.snoozed_until else None,
+    }
 
 
 @app.get("/api/v1/dash/alerts/page")
@@ -2407,6 +2419,8 @@ def dash_alerts_page(
     view: str = "inbox",
     severity: str | None = None,
     rule_type: str | None = None,
+    site: str | None = None,
+    sort: str = "newest",
     hours: int = 168,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
@@ -2418,6 +2432,10 @@ def dash_alerts_page(
         raise HTTPException(422, "Unknown alert view")
     if severity and severity not in {"info", "warning", "critical"}:
         raise HTTPException(422, "Unknown severity")
+    if site and site not in {*_VALID_SITES, _ALERT_GENERAL_SITE}:
+        raise HTTPException(422, "Unknown alert site")
+    if sort not in _ALERT_SORTS:
+        raise HTTPException(422, "Unknown alert sort")
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
     hours = max(0, min(hours, 24 * 365 * 5))
@@ -2445,6 +2463,16 @@ def dash_alerts_page(
         filters.append(storage.AlertEvent.severity == severity)
     if rule_type:
         filters.append(storage.AlertEvent.rule_type == rule_type)
+    site_expr = storage.AlertEvent.payload["site"].as_string()
+    if site == _ALERT_GENERAL_SITE:
+        filters.append(
+            or_(
+                site_expr.is_(None),
+                ~site_expr.in_(_VALID_SITES),
+            )
+        )
+    elif site:
+        filters.append(site_expr == site)
     if hours > 0:
         filters.append(storage.AlertEvent.created_at >= now - timedelta(hours=hours))
 
@@ -2456,10 +2484,29 @@ def dash_alerts_page(
         )
         or 0
     )
+    if sort == "oldest":
+        order_by = (storage.AlertEvent.created_at, storage.AlertEvent.id)
+    elif sort == "site":
+        site_order = case(
+            (site_expr == "aloe", 0),
+            (site_expr == "aptekonline", 1),
+            (site_expr == "pharmonline", 2),
+            else_=3,
+        )
+        order_by = (
+            site_order,
+            desc(storage.AlertEvent.created_at),
+            desc(storage.AlertEvent.id),
+        )
+    else:
+        order_by = (
+            desc(storage.AlertEvent.created_at),
+            desc(storage.AlertEvent.id),
+        )
     events = db.scalars(
         select(storage.AlertEvent)
         .where(*filters)
-        .order_by(desc(storage.AlertEvent.created_at), desc(storage.AlertEvent.id))
+        .order_by(*order_by)
         .offset(offset)
         .limit(limit)
     ).all()
@@ -2473,24 +2520,8 @@ def dash_alerts_page(
         .order_by(storage.AlertEvent.rule_type)
     ).all()
 
-    def event_out(event: storage.AlertEvent) -> dict:
-        return {
-            "id": event.id,
-            "rule_type": event.rule_type,
-            "severity": event.severity,
-            "title": event.title,
-            "detail": event.detail,
-            "payload": event.payload,
-            "created_at": event.created_at.isoformat(),
-            "is_read": bool(event.is_read),
-            "read_at": event.read_at.isoformat() if event.read_at else None,
-            "snoozed_until": (
-                event.snoozed_until.isoformat() if event.snoozed_until else None
-            ),
-        }
-
     return {
-        "items": [event_out(event) for event in events],
+        "items": [_alert_event_out(event) for event in events],
         "total": int(total),
         "limit": limit,
         "offset": offset,

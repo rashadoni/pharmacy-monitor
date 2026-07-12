@@ -1380,28 +1380,52 @@ def test_alert_page_filters_and_paginates_on_server(
     client, auth_cookie, setup_db
 ):
     now = utcnow()
+    sites = ["pharmonline", "aloe", "aptekonline", "pharmonline"]
     events = [
         storage.AlertEvent(
             tenant_id=1,
             rule_type="price_drop_pct",
             dedup_key=f"drop-{i}",
             severity="warning",
-            title=f"Drop {i}",
-            created_at=now - timedelta(minutes=i),
+            title="pharmonline in title" if sites[i] == "aloe" else f"Drop {i}",
+            payload={"site": sites[i]},
+            created_at=now if i < 2 else now - timedelta(minutes=i),
             is_read=False,
         )
         for i in range(4)
     ]
-    read = storage.AlertEvent(
+    read_without_site = storage.AlertEvent(
         tenant_id=1,
         rule_type="new_product",
         dedup_key="read-one",
         severity="info",
-        title="Read",
+        title="Read without site",
         created_at=now,
         is_read=True,
     )
-    setup_db.add_all([*events, read])
+    read_with_unknown_site = storage.AlertEvent(
+        tenant_id=1,
+        rule_type="new_product",
+        dedup_key="read-unknown-site",
+        severity="info",
+        title="Read with unknown site",
+        payload={"site": "unknown"},
+        created_at=now - timedelta(seconds=1),
+        is_read=True,
+    )
+    other_tenant = storage.AlertEvent(
+        tenant_id=2,
+        rule_type="price_drop_pct",
+        dedup_key="tenant-two",
+        severity="warning",
+        title="Tenant two aloe",
+        payload={"site": "aloe"},
+        created_at=now,
+        is_read=False,
+    )
+    setup_db.add_all(
+        [*events, read_without_site, read_with_unknown_site, other_tenant]
+    )
     setup_db.commit()
 
     first = client.get(
@@ -1412,6 +1436,8 @@ def test_alert_page_filters_and_paginates_on_server(
     assert body["total"] == 4
     assert len(body["items"]) == 2
     assert body["rule_types"] == ["new_product", "price_drop_pct"]
+    assert [item["id"] for item in body["items"]] == [events[1].id, events[0].id]
+    assert [item["site"] for item in body["items"]] == ["aloe", "pharmonline"]
 
     second = client.get(
         "/api/v1/dash/alerts/page?view=inbox&severity=warning&limit=2&offset=2"
@@ -1421,9 +1447,87 @@ def test_alert_page_filters_and_paginates_on_server(
         {item["id"] for item in second["items"]}
     )
 
-    read_page = client.get("/api/v1/dash/alerts/page?view=read").json()
-    assert read_page["total"] == 1
-    assert read_page["items"][0]["id"] == read.id
+    aloe_page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&site=aloe&severity=warning"
+    ).json()
+    assert aloe_page["total"] == 1
+    assert aloe_page["items"][0]["id"] == events[1].id
+    assert aloe_page["items"][0]["title"] == "pharmonline in title"
+
+    pharm_page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&site=pharmonline&severity=warning&limit=1"
+    ).json()
+    assert pharm_page["total"] == 2
+    assert len(pharm_page["items"]) == 1
+
+    general_page = client.get(
+        "/api/v1/dash/alerts/page?view=read&site=general&hours=0"
+    ).json()
+    assert general_page["total"] == 2
+    assert {item["id"] for item in general_page["items"]} == {
+        read_without_site.id,
+        read_with_unknown_site.id,
+    }
+    assert all(item["site"] is None for item in general_page["items"])
+
+    oldest_page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&severity=warning&sort=oldest&hours=0"
+    ).json()
+    assert [item["id"] for item in oldest_page["items"]] == [
+        events[3].id,
+        events[2].id,
+        events[0].id,
+        events[1].id,
+    ]
+
+    site_page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&severity=warning&sort=site&hours=0"
+    ).json()
+    assert [item["site"] for item in site_page["items"]] == [
+        "aloe",
+        "aptekonline",
+        "pharmonline",
+        "pharmonline",
+    ]
+    assert [item["id"] for item in site_page["items"][-2:]] == [
+        events[0].id,
+        events[3].id,
+    ]
+
+
+@pytest.mark.parametrize("query", ["site=unknown", "sort=random"])
+def test_alert_page_rejects_unknown_site_or_sort(client, auth_cookie, query):
+    response = client.get(f"/api/v1/dash/alerts/page?{query}")
+    assert response.status_code == 422
+
+
+def test_alert_page_site_sort_places_general_last(client, auth_cookie, setup_db):
+    now = utcnow()
+    rows = [
+        storage.AlertEvent(
+            tenant_id=1,
+            rule_type="new_product",
+            dedup_key=f"site-sort-{site or 'general'}",
+            severity="info",
+            title=site or "General",
+            payload={"site": site} if site else None,
+            created_at=now,
+            is_read=False,
+        )
+        for site in ("pharmonline", None, "aloe", "aptekonline")
+    ]
+    setup_db.add_all(rows)
+    setup_db.commit()
+
+    page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&sort=site&hours=0"
+    ).json()
+    assert [item["site"] for item in page["items"]] == [
+        "aloe",
+        "aptekonline",
+        "pharmonline",
+        None,
+    ]
 
 
 # ─── Legacy ERP endpoints — require X-API-Key ────────────────────────────────
