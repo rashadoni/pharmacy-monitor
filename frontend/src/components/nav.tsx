@@ -2,6 +2,7 @@
 
 import { Link, usePathname, useRouter } from "@/i18n/navigation";
 import { useTranslations } from "next-intl";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   BarChart3,
   Bell,
@@ -10,6 +11,7 @@ import {
   Link2,
   ListTree,
   LogOut,
+  MoreHorizontal,
   Pill,
   Search,
   Settings,
@@ -158,14 +160,40 @@ export function BottomNav() {
   const visible = [
     { href: "/overview", key: "overview", icon: TrendingUp },
     { href: "/comparison", key: "comparison", icon: Search },
-    { href: "/category-comparison", key: "category_comparison_short", icon: ListTree },
-    { href: "/analytics", key: "analytics", icon: BarChart3 },
+    { href: "/matcher", key: "matcher_short", icon: Sparkles },
     { href: "/alerts", key: "alerts", icon: Bell },
-    { href: "/settings", key: "settings", icon: Settings },
   ] as const;
+  const moreActive = !visible.some((item) => pathname?.startsWith(item.href));
+  const moreGroups = [
+    {
+      label: t("section_overview"),
+      items: [
+        { href: "/category-comparison", label: t("category_comparison"), icon: ListTree },
+        { href: "/analytics", label: t("analytics"), icon: BarChart3 },
+      ],
+    },
+    {
+      label: t("section_sites"),
+      items: NAV_SITES.map((item) => ({ href: item.href, label: item.label, icon: item.icon })),
+    },
+    {
+      label: t("section_actions"),
+      items: [
+        { href: "/watchlist", label: t("watchlist"), icon: Star },
+        { href: "/matches/review", label: t("matches_review"), icon: Link2 },
+      ],
+    },
+    {
+      label: t("section_settings"),
+      items: [
+        { href: "/categories", label: t("categories"), icon: ListTree },
+        { href: "/settings", label: t("settings"), icon: Settings },
+      ],
+    },
+  ];
 
   return (
-    <nav className="md:hidden fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 grid grid-cols-6">
+    <nav className="fixed bottom-0 left-0 right-0 z-50 grid grid-cols-5 border-t border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 md:hidden">
       {visible.map((item) => {
         const active = pathname?.startsWith(item.href);
         const Icon = item.icon;
@@ -178,12 +206,67 @@ export function BottomNav() {
               "flex min-h-16 min-w-0 flex-col items-center justify-center gap-0.5 px-0.5 py-2.5 text-[10px] transition-colors",
               active ? "text-primary font-semibold" : "text-muted-foreground",
             )}
+            aria-current={active ? "page" : undefined}
           >
             <Icon className="h-5 w-5 shrink-0" aria-hidden="true" />
             <span className="max-w-full text-center leading-tight break-words">{t(item.key)}</span>
           </Link>
         );
       })}
+
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger asChild>
+          <button
+            type="button"
+            className={cn(
+              "flex min-h-16 min-w-0 flex-col items-center justify-center gap-0.5 px-1 py-2.5 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+              moreActive ? "font-semibold text-primary" : "text-muted-foreground",
+            )}
+            aria-label={t("more")}
+          >
+            <MoreHorizontal className="h-5 w-5 shrink-0" aria-hidden="true" />
+            <span className="leading-tight">{t("more")}</span>
+          </button>
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            side="top"
+            align="end"
+            sideOffset={8}
+            collisionPadding={8}
+            className="z-50 max-h-[70vh] w-64 overflow-y-auto rounded-lg border border-border bg-card p-1 shadow-lg"
+          >
+            {moreGroups.map((group, groupIndex) => (
+              <div key={group.label}>
+                {groupIndex > 0 && <DropdownMenu.Separator className="my-1 h-px bg-border" />}
+                <DropdownMenu.Label className="px-2 py-1 text-xs font-medium text-muted-foreground">
+                  {group.label}
+                </DropdownMenu.Label>
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  const active = pathname?.startsWith(item.href);
+                  return (
+                    <DropdownMenu.Item key={item.href} asChild>
+                      <Link
+                        href={item.href}
+                        prefetch={false}
+                        className={cn(
+                          "flex min-h-11 cursor-pointer items-center gap-3 rounded-md px-2 py-2 text-sm outline-none hover:bg-muted/50 focus-visible:bg-muted/50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                          active ? "font-medium text-primary" : "text-foreground",
+                        )}
+                        aria-current={active ? "page" : undefined}
+                      >
+                        <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+                        <span>{item.label}</span>
+                      </Link>
+                    </DropdownMenu.Item>
+                  );
+                })}
+              </div>
+            ))}
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
     </nav>
   );
 }

@@ -1,7 +1,8 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import {
   AlertCircle,
   AlertTriangle,
@@ -17,6 +18,9 @@ import { api, friendlyError, type AlertEvent } from "@/lib/api";
 import { formatRelative, formatTime } from "@/lib/utils";
 import { CardListSkeleton } from "@/components/skeleton";
 import { OnboardingTip } from "@/components/onboarding-tip";
+import { QueryErrorState } from "@/components/query-error-state";
+import { useRouter } from "@/i18n/navigation";
+import { choiceParam, integerParam, queryWithPatch } from "@/lib/filter-query";
 
 const SEVERITY_CONFIG = {
   critical: {
@@ -43,19 +47,54 @@ type TabView = "inbox" | "snoozed" | "read";
 
 export default function AlertsPage() {
   const t = useTranslations("alerts");
+  const tCommon = useTranslations("common");
   const locale = useLocale();
   const queryClient = useQueryClient();
-  const [view, setView] = useState<TabView>("inbox");
-  const [severityFilter, setSeverityFilter] = useState<string>("");
-  const [hoursWindow, setHoursWindow] = useState<number>(168); // 7 дней по умолчанию
-  const [ruleTypeFilter, setRuleTypeFilter] = useState<string>("");
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const queryRef = useRef(searchParams.toString());
+  useEffect(() => {
+    queryRef.current = searchParams.toString();
+  }, [searchParams]);
+  const parsedParams = new URLSearchParams(searchParams.toString());
+  const view = choiceParam(
+    parsedParams,
+    "view",
+    ["inbox", "snoozed", "read"] as const,
+    "inbox",
+  ) as TabView;
+  const severityFilter = choiceParam(
+    parsedParams,
+    "severity",
+    ["", "critical", "warning", "info"] as const,
+    "",
+  );
+  const hoursWindow = integerParam(parsedParams, "hours", 168, {
+    allowed: [0, 24, 72, 168, 720],
+  });
+  const ruleTypeFilter = searchParams.get("type") ?? "";
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const filterSignature = `${view}|${severityFilter}|${hoursWindow}|${ruleTypeFilter}`;
+  const previousFilterSignature = useRef(filterSignature);
+  useEffect(() => {
+    if (previousFilterSignature.current !== filterSignature) {
+      previousFilterSignature.current = filterSignature;
+      setSelected(new Set());
+    }
+  }, [filterSignature]);
+
+  function updateFilters(patch: Record<string, string | number | null>) {
+    const query = queryWithPatch(queryRef.current, patch);
+    queryRef.current = query;
+    setSelected(new Set());
+    router.push(query ? `/alerts?${query}` : "/alerts", { scroll: false });
+  }
 
   // Backend фильтры по view
   const includeRead = view === "read";
   const includeSnoozed = view === "snoozed";
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["alerts", severityFilter, includeRead, includeSnoozed],
     queryFn: () =>
       api.alerts({
@@ -188,7 +227,7 @@ export default function AlertsPage() {
           <button
             onClick={() => markAllReadMutation.mutate()}
             disabled={markAllReadMutation.isPending}
-            className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+            className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:min-h-9"
           >
             <CheckCheck className="h-3.5 w-3.5" />
             {markAllReadMutation.isPending ? "…" : t("mark_all_read_btn", { count: counts.unread })}
@@ -197,12 +236,11 @@ export default function AlertsPage() {
       </div>
 
       {/* Tabs */}
-      <div className="flex items-center gap-1 border-b border-border">
+      <div className="grid grid-cols-3 border-b border-border sm:flex sm:items-center sm:gap-1">
         <TabBtn
           active={view === "inbox"}
           onClick={() => {
-            setView("inbox");
-            setSelected(new Set());
+            updateFilters({ view: null });
           }}
           icon={Inbox}
           label={t("tab_inbox")}
@@ -211,8 +249,7 @@ export default function AlertsPage() {
         <TabBtn
           active={view === "snoozed"}
           onClick={() => {
-            setView("snoozed");
-            setSelected(new Set());
+            updateFilters({ view: "snoozed" });
           }}
           icon={Clock}
           label={t("tab_snoozed")}
@@ -221,8 +258,7 @@ export default function AlertsPage() {
         <TabBtn
           active={view === "read"}
           onClick={() => {
-            setView("read");
-            setSelected(new Set());
+            updateFilters({ view: "read" });
           }}
           icon={MailOpen}
           label={t("tab_read")}
@@ -234,30 +270,34 @@ export default function AlertsPage() {
       <div className="flex gap-2 flex-wrap items-center">
         <Chip
           active={severityFilter === ""}
-          onClick={() => setSeverityFilter("")}
+          onClick={() => updateFilters({ severity: null })}
           label={`${t("filter_all")}${data ? ` (${data.length})` : ""}`}
         />
         <Chip
           active={severityFilter === "critical"}
-          onClick={() => setSeverityFilter("critical")}
+          onClick={() => updateFilters({ severity: "critical" })}
           label={t("filter_critical")}
         />
         <Chip
           active={severityFilter === "warning"}
-          onClick={() => setSeverityFilter("warning")}
+          onClick={() => updateFilters({ severity: "warning" })}
           label={t("filter_warning")}
         />
         <Chip
           active={severityFilter === "info"}
-          onClick={() => setSeverityFilter("info")}
+          onClick={() => updateFilters({ severity: "info" })}
           label={t("filter_info")}
         />
-        <div className="ml-auto flex gap-2">
+        <div className="flex w-full gap-2 sm:ml-auto sm:w-auto">
           <select
             value={hoursWindow}
-            onChange={(e) => setHoursWindow(Number(e.target.value))}
+            onChange={(e) =>
+              updateFilters({
+                hours: Number(e.target.value) === 168 ? null : Number(e.target.value),
+              })
+            }
             aria-label={t("window_label")}
-            className="min-h-11 rounded-full border border-border bg-card px-3 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            className="min-h-11 min-w-0 flex-1 rounded-full border border-border bg-card px-3 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:flex-none md:min-h-9"
           >
             <option value={24}>{t("window_24h")}</option>
             <option value={72}>{t("window_3d")}</option>
@@ -267,11 +307,14 @@ export default function AlertsPage() {
           </select>
           <select
             value={ruleTypeFilter}
-            onChange={(e) => setRuleTypeFilter(e.target.value)}
+            onChange={(e) => updateFilters({ type: e.target.value || null })}
             aria-label={t("rule_type_label")}
-            className="min-h-11 rounded-full border border-border bg-card px-3 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            className="min-h-11 min-w-0 flex-1 rounded-full border border-border bg-card px-3 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:flex-none md:min-h-9"
           >
             <option value="">{t("filter_all_types")}</option>
+            {ruleTypeFilter && !ruleTypes.includes(ruleTypeFilter) && (
+              <option value={ruleTypeFilter}>{ruleTypeFilter}</option>
+            )}
             {ruleTypes.map((rt) => (
               <option key={rt} value={rt}>
                 {rt}
@@ -281,9 +324,17 @@ export default function AlertsPage() {
         </div>
       </div>
 
+      {isError && (
+        <QueryErrorState
+          message={friendlyError(error, locale)}
+          retryLabel={tCommon("retry")}
+          onRetry={() => refetch()}
+        />
+      )}
+
       {/* Bulk toolbar — виден когда есть selected */}
       {selected.size > 0 && (
-        <div className="sticky top-0 z-10 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 flex items-center gap-2 text-sm">
+        <div className="sticky top-14 z-10 flex flex-wrap items-center gap-2 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 text-sm md:top-0">
           <span className="font-medium">{t("selected_count", { count: selected.size })}</span>
           {view !== "read" && (
             <button
@@ -294,7 +345,7 @@ export default function AlertsPage() {
                 })
               }
               disabled={bulkMutation.isPending}
-              className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
             >
               <CheckCheck className="h-3.5 w-3.5" /> {t("action_mark_read")}
             </button>
@@ -308,7 +359,7 @@ export default function AlertsPage() {
                 })
               }
               disabled={bulkMutation.isPending}
-              className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
             >
               <Mail className="h-3.5 w-3.5" /> {t("action_mark_unread")}
             </button>
@@ -323,7 +374,7 @@ export default function AlertsPage() {
                   })
                 }
                 disabled={bulkMutation.isPending}
-                className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
               >
                 <Clock className="h-3.5 w-3.5" /> {t("action_snooze_24h")}
               </button>
@@ -335,7 +386,7 @@ export default function AlertsPage() {
                   })
                 }
                 disabled={bulkMutation.isPending}
-                className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
               >
                 <Clock className="h-3.5 w-3.5" /> {t("action_snooze_7d")}
               </button>
@@ -350,14 +401,14 @@ export default function AlertsPage() {
                 })
               }
               disabled={bulkMutation.isPending}
-              className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
             >
               {t("action_unsnooze")}
             </button>
           )}
           <button
             onClick={() => setSelected(new Set())}
-            className="ml-auto text-muted-foreground hover:text-foreground"
+            className="ml-auto min-h-11 rounded-md px-2 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
           >
             {t("action_deselect")}
           </button>
@@ -366,7 +417,7 @@ export default function AlertsPage() {
 
       {/* Select-all checkbox */}
       {filtered && filtered.length > 0 && (
-        <label className="inline-flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+        <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 text-xs text-muted-foreground md:min-h-9">
           <input
             type="checkbox"
             checked={selected.size > 0 && selected.size === filtered.length}
@@ -378,7 +429,7 @@ export default function AlertsPage() {
       )}
 
       {isLoading && <CardListSkeleton count={6} />}
-      {filtered && filtered.length === 0 && !isLoading && (
+      {filtered && filtered.length === 0 && !isLoading && !isError && (
         <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center">
           {view === "inbox" && t("empty_inbox")}
           {view === "snoozed" && t("empty_snoozed")}
@@ -443,13 +494,15 @@ function AlertCard({
       className={`rounded-lg border ${cfg.bg} p-3 ${dimmed ? "opacity-60" : ""}`}
     >
       <div className="flex items-start gap-3">
-        <input
-          type="checkbox"
-          checked={selected}
-          onChange={onToggleSel}
-          className="h-4 w-4 mt-1 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label={t("aria_select_for_bulk")}
-        />
+        <label className="-m-3 inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center md:-m-2 md:h-9 md:w-9">
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggleSel}
+            className="h-4 w-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={t("aria_select_for_bulk")}
+          />
+        </label>
         <Icon className={`h-5 w-5 shrink-0 ${cfg.color} mt-0.5`} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -480,10 +533,10 @@ function AlertCard({
               {event.rule_type}
             </div>
           )}
-          <div className="flex items-center gap-2 mt-2 text-[11px]">
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
             <button
               onClick={onMarkRead}
-              className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="inline-flex min-h-11 items-center gap-1 rounded px-2 py-1 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
               title={event.is_read ? t("tooltip_mark_unread") : t("tooltip_mark_read")}
             >
               {event.is_read ? (
@@ -500,14 +553,14 @@ function AlertCard({
             new Date(event.snoozed_until).getTime() > Date.now() ? (
               <button
                 onClick={onSnoozeClear}
-                className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="inline-flex min-h-11 items-center gap-1 rounded px-2 py-1 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
               >
                 {t("action_unsnooze")}
               </button>
             ) : (
               <button
                 onClick={onSnooze7d}
-                className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="inline-flex min-h-11 items-center gap-1 rounded px-2 py-1 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
                 title={t("tooltip_snooze_7d")}
               >
                 <Clock className="h-3 w-3" /> {t("snooze_7d_short")}
@@ -536,18 +589,19 @@ function TabBtn({
   return (
     <button
       onClick={onClick}
-      className={`inline-flex items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+      aria-pressed={active}
+      className={`-mb-px inline-flex min-h-11 min-w-0 items-center justify-center gap-1 border-b-2 px-1.5 py-2 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:gap-2 sm:px-4 sm:text-sm ${
         active
           ? "border-primary text-foreground font-medium"
           : "border-transparent text-muted-foreground hover:text-foreground"
       }`}
     >
-      <Icon className="h-4 w-4" />
-      {label}
+      <Icon className="hidden h-4 w-4 sm:block" />
+      <span className="min-w-0 truncate">{label}</span>
       {count != null && (
         <span
           className={`text-[10px] tabular-nums font-mono ${
-            active ? "text-primary-foreground/80" : "text-muted-foreground"
+            active ? "text-primary" : "text-muted-foreground"
           }`}
         >
           ({count})
@@ -569,7 +623,8 @@ function Chip({
   return (
     <button
       onClick={onClick}
-      className={`text-xs rounded-full px-3 py-1 border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+      aria-pressed={active}
+      className={`min-h-11 rounded-full border px-3 py-1 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9 ${
         active
           ? "bg-primary text-primary-foreground border-primary"
           : "bg-card text-muted-foreground border-border hover:bg-secondary"

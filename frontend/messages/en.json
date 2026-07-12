@@ -8,6 +8,7 @@
     "alerts": "Alerts",
     "watchlist": "Watchlist",
     "matcher": "Find Matches",
+    "matcher_short": "Match",
     "matches_review": "Match Review",
     "categories": "Categories",
     "settings": "Settings",
@@ -16,7 +17,8 @@
     "section_actions": "Actions",
     "section_settings": "Settings",
     "category_comparison": "Category comparison",
-    "category_comparison_short": "Categories"
+    "category_comparison_short": "Categories",
+    "more": "More"
   },
   "common": {
     "loading": "Loading…",
@@ -353,6 +355,9 @@
     "categories_subtitle": "Catalog size by sections.",
     "catalog_title": "{site} catalog",
     "search_placeholder": "Search by name or brand",
+    "search_label": "Search catalog",
+    "category_filter_label": "Catalog category",
+    "brand_filter_label": "Catalog brand",
     "filter_all_categories": "All categories",
     "filter_all_brands": "All brands",
     "discount_label": "Discount",
@@ -376,6 +381,9 @@
     "stat_total": "Total",
     "stat_active": "Active",
     "search_placeholder": "🔎 Search by name / key",
+    "search_label": "Search categories",
+    "site_filter_label": "Category site",
+    "coverage_filter_label": "Category coverage",
     "filter_all": "All sites",
     "th_key": "Key",
     "th_label": "Label",

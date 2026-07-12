@@ -19,6 +19,7 @@ import { QuickActions } from "@/components/quick-actions";
 import { formatNumber, formatRelative, formatPrice } from "@/lib/utils";
 import { categoryDisplayLabel } from "@/lib/category-label";
 import { runStatusToneClass } from "@/lib/run-quality";
+import { MetricStrip } from "@/components/metric-strip";
 
 export default function OverviewPage() {
   const t = useTranslations("overview");
@@ -64,47 +65,44 @@ export default function OverviewPage() {
       {/* Phase 5.6 — Per-site staleness panel */}
       {healthQ.data && <SiteStalenessPanel sites={healthQ.data.sites} />}
 
-      {/* KPI cards */}
-      <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
-        <KpiCard
-          label={t("kpi_matches")}
-          value={matchQ.data?.total_matches ?? "—"}
-          loading={matchQ.isLoading}
+      <section aria-label={t("subtitle")}>
+        <MetricStrip
+          items={[
+            {
+              label: t("kpi_matches"),
+              value: matchQ.data?.total_matches ?? "—",
+              loading: matchQ.isLoading,
+            },
+            {
+              label: t("kpi_coverage"),
+              value: matchQ.data ? `${matchQ.data.coverage_pct.toFixed(1)}%` : "—",
+              loading: matchQ.isLoading,
+            },
+            {
+              label: t("kpi_products"),
+              value: matchQ.data?.products_total ?? "—",
+              loading: matchQ.isLoading,
+            },
+            {
+              label: t("kpi_price_review"),
+              value: normalizeQ.data
+                ? `${(
+                    (normalizeQ.data.products_needing_review /
+                      Math.max(1, normalizeQ.data.products_total)) *
+                    100
+                  ).toFixed(1)}%`
+                : "—",
+              loading: normalizeQ.isLoading,
+              hint: normalizeQ.data
+                ? t("kpi_price_review_hint", {
+                    count: formatNumber(normalizeQ.data.products_needing_review, locale),
+                    total: formatNumber(normalizeQ.data.products_total, locale),
+                  })
+                : t("kpi_price_review_empty"),
+            },
+          ]}
         />
-        <KpiCard
-          label={t("kpi_coverage")}
-          value={
-            matchQ.data ? `${matchQ.data.coverage_pct.toFixed(1)}%` : "—"
-          }
-          loading={matchQ.isLoading}
-        />
-        <KpiCard
-          label={t("kpi_products")}
-          value={matchQ.data?.products_total ?? "—"}
-          loading={matchQ.isLoading}
-        />
-        <KpiCard
-          label={t("kpi_price_review")}
-          value={
-            normalizeQ.data
-              ? `${(
-                  (normalizeQ.data.products_needing_review /
-                    Math.max(1, normalizeQ.data.products_total)) *
-                  100
-                ).toFixed(1)}%`
-              : "—"
-          }
-          loading={normalizeQ.isLoading}
-          hint={
-            normalizeQ.data
-              ? t("kpi_price_review_hint", {
-                  count: formatNumber(normalizeQ.data.products_needing_review, locale),
-                  total: formatNumber(normalizeQ.data.products_total, locale),
-                })
-              : t("kpi_price_review_empty")
-          }
-        />
-      </div>
+      </section>
 
       {/* Today's actions */}
       <div>
@@ -426,30 +424,6 @@ function RunBreakdownPanel({
           );
         })}
       </div>
-    </div>
-  );
-}
-
-function KpiCard({
-  label,
-  value,
-  loading,
-  hint,
-}: {
-  label: string;
-  value: number | string;
-  loading: boolean;
-  hint?: string;
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-card p-4">
-      <div className="text-sm font-medium text-muted-foreground">{label}</div>
-      <div className="text-2xl font-semibold mt-1 tabular-nums">
-        {loading ? "…" : value}
-      </div>
-      {hint && (
-        <div className="text-xs text-muted-foreground mt-1">{hint}</div>
-      )}
     </div>
   );
 }

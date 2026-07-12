@@ -1,5 +1,9 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const playwrightPort = process.env.PLAYWRIGHT_PORT || "3000";
+const playwrightBaseUrl =
+  process.env.PLAYWRIGHT_BASE_URL || `http://localhost:${playwrightPort}`;
+
 /**
  * Playwright e2e config.
  *
@@ -22,7 +26,7 @@ export default defineConfig({
   reporter: [["html", { open: "never" }], ["list"]],
 
   use: {
-    baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000",
+    baseURL: playwrightBaseUrl,
     trace: "on-first-retry",
     screenshot: "only-on-failure",
     video: "retain-on-failure",
@@ -42,8 +46,8 @@ export default defineConfig({
   webServer: process.env.CI
     ? [
         {
-          command: "pnpm dev",
-          url: "http://localhost:3000",
+          command: `pnpm exec next dev -p ${playwrightPort}`,
+          url: playwrightBaseUrl,
           reuseExistingServer: !process.env.CI,
           timeout: 60_000,
         },

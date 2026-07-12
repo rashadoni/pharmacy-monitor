@@ -8,7 +8,7 @@ import { useLocale, useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
 import { api, type CategoryComparisonRow } from "@/lib/api";
 import { formatPrice } from "@/lib/utils";
-import { KpiCard } from "@/components/kpi-card";
+import { MetricStrip } from "@/components/metric-strip";
 import { TableSkeleton } from "@/components/skeleton";
 
 // Конкуренты показываем отдельными колонками (клиент = pharmonline).
@@ -174,23 +174,27 @@ export default function CategoryComparisonPage() {
       </div>
 
       {/* KPI */}
-      <section className="grid gap-3 grid-cols-1 sm:grid-cols-3">
-        <KpiCard
-          label={t("kpi_cheaper_cats")}
-          value={visibleRows ? `${kpi.cheaperCats} / ${visibleRows.length}` : "—"}
-          loading={isLoading}
-          hint={t("kpi_cheaper_cats_hint")}
-        />
-        <KpiCard
-          label={t("kpi_avg_index")}
-          value={kpi.avgIndex != null ? kpi.avgIndex.toFixed(1) : "—"}
-          loading={isLoading}
-          hint={t("kpi_avg_index_hint")}
-        />
-        <KpiCard
-          label={t("kpi_total_skus")}
-          value={kpi.totalSkus || "—"}
-          loading={isLoading}
+      <section aria-label={t("title")}>
+        <MetricStrip
+          items={[
+            {
+              label: t("kpi_cheaper_cats"),
+              value: visibleRows ? `${kpi.cheaperCats} / ${visibleRows.length}` : "—",
+              loading: isLoading,
+              hint: t("kpi_cheaper_cats_hint"),
+            },
+            {
+              label: t("kpi_avg_index"),
+              value: kpi.avgIndex != null ? kpi.avgIndex.toFixed(1) : "—",
+              loading: isLoading,
+              hint: t("kpi_avg_index_hint"),
+            },
+            {
+              label: t("kpi_total_skus"),
+              value: kpi.totalSkus || "—",
+              loading: isLoading,
+            },
+          ]}
         />
       </section>
 
