@@ -2675,6 +2675,15 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
             raise click.ClickException(str(e))
 
 
+def _intraday_product_limit() -> int:
+    """Bound an hourly point scan; full-catalog producers remain unlimited."""
+    try:
+        configured = int(os.environ.get("INTRADAY_PRODUCT_LIMIT", "600"))
+    except ValueError:
+        configured = 600
+    return max(1, min(configured, 5_000))
+
+
 @cli.command("intraday-tick")
 @click.option(
     "--dry-run",
@@ -2715,8 +2724,10 @@ def intraday_tick_cmd(dry_run: bool) -> None:
             return
 
         site, cat = target
+        product_limit = _intraday_product_limit()
         click.echo(
-            f"intraday-tick: site={site} category_id={cat.id} key={cat.key} label={cat.label_ru!r}"
+            f"intraday-tick: site={site} category_id={cat.id} key={cat.key} "
+            f"label={cat.label_ru!r} limit={product_limit}"
         )
 
         if dry_run:
@@ -2730,7 +2741,7 @@ def intraday_tick_cmd(dry_run: bool) -> None:
     ctx = click.get_current_context()
     ctx.invoke(
         scrape_cmd,
-        limit=None,
+        limit=product_limit,
         site=(site,),
         category_id=cat.id,
     )

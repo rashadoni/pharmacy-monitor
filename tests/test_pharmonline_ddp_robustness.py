@@ -335,6 +335,29 @@ async def test_ddp_connect_407_does_not_retry_or_expose_proxy_secret(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_ddp_transient_proxy_status_retries(monkeypatch):
+    from websockets.datastructures import Headers
+    from websockets.exceptions import InvalidProxyStatus
+    from websockets.http11 import Response
+
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", "2")
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_BACKOFF", "0")
+    client = pharmonline_ddp._DDPClient(lambda: "wss://example.invalid")
+    calls = []
+
+    async def flaky_connect():
+        calls.append(True)
+        if len(calls) == 1:
+            raise InvalidProxyStatus(Response(502, "Bad Gateway", Headers()))
+
+    monkeypatch.setattr(client, "_connect_once", flaky_connect)
+
+    await client._connect()
+
+    assert calls == [True, True]
+
+
+@pytest.mark.asyncio
 async def test_ddp_invalid_proxy_is_fatal_before_raw_logging(monkeypatch):
     monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", "1")
     client = pharmonline_ddp._DDPClient(lambda: "wss://example.invalid")

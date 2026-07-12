@@ -457,6 +457,25 @@ def test_invalid_proxy_type_is_fatal_even_when_message_omits_class_name():
     assert base.site_fatal_error_message(error) == "proxy configuration rejected"
 
 
+def test_transient_websockets_proxy_status_is_not_misclassified_as_config():
+    class InvalidProxyStatus(Exception):
+        pass
+
+    error = InvalidProxyStatus("proxy rejected connection: HTTP 502")
+
+    assert base.fatal_proxy_status(error) is None
+    assert base.fatal_proxy_reason(error) is None
+
+
+def test_websockets_proxy_407_remains_account_fatal():
+    class InvalidProxyStatus(Exception):
+        pass
+
+    error = InvalidProxyStatus("proxy rejected connection: HTTP 407")
+
+    assert base.fatal_proxy_reason(error) == "proxy access rejected: HTTP 407"
+
+
 @pytest.mark.asyncio
 async def test_scrape_on_category_error_does_not_break_scrape():
     """Падение on_category (persist умер) НЕ валит скрейп — логируется, остальные

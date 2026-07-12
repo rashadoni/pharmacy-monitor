@@ -164,6 +164,19 @@ def test_system_status_exposes_queue_proxy_and_real_digest_schedule(
     assert "configured-secret" not in serialized
 
 
+def test_system_status_reports_effective_default_decodo_port_range(
+    client, auth_cookie, monkeypatch
+):
+    monkeypatch.setenv("DECODO_USERNAME", "configured-user")
+    monkeypatch.setenv("DECODO_PASSWORD", "configured-secret")
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+    monkeypatch.delenv("DECODO_PORTS", raising=False)
+
+    body = client.get("/api/v1/dash/system-status").json()
+
+    assert body["proxy"]["pool_size"] == 10
+
+
 def test_health_endpoint_degraded_when_latest_run_degraded(client, setup_db):
     setup_db.add(
         storage.Run(

@@ -726,6 +726,23 @@ def _env_enabled(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _decodo_port_pool() -> list[int]:
+    """Parse the effective sticky-port pool without exposing proxy secrets."""
+    raw = os.environ.get("DECODO_PORTS", "30001-30010").strip()
+    ports: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, _, end = part.partition("-")
+            if start.strip().isdigit() and end.strip().isdigit():
+                low, high = int(start), int(end)
+                if 0 < low <= high <= 65535:
+                    ports.update(range(low, high + 1))
+        elif part.isdigit() and 0 < int(part) <= 65535:
+            ports.add(int(part))
+    return sorted(ports)
+
+
 @app.get("/api/v1/dash/system-status")
 def dash_system_status(
     user: storage.TenantUser = Depends(require_user),
@@ -769,11 +786,7 @@ def dash_system_status(
         for site in (os.environ.get("DECODO_SITES") or "").split(",")
         if site.strip()
     )
-    decodo_ports = [
-        port.strip()
-        for port in (os.environ.get("DECODO_PORTS") or "").split(",")
-        if port.strip()
-    ]
+    decodo_ports = _decodo_port_pool()
     return {
         **snapshot.model_dump(mode="json"),
         "queue": {
@@ -1464,11 +1477,7 @@ def dash_integrations(user: storage.TenantUser = Depends(require_user)):
         for site in (os.environ.get("DECODO_SITES") or "").split(",")
         if site.strip()
     )
-    decodo_ports = [
-        port.strip()
-        for port in (os.environ.get("DECODO_PORTS") or "").split(",")
-        if port.strip()
-    ]
+    decodo_ports = _decodo_port_pool()
     return {
         "smtp": bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_PASSWORD")),
         "smtp_from": os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER") or None,

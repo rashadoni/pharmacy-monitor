@@ -770,3 +770,16 @@ def test_sync_pharmonline_categories_idempotent(db_session):
     a2, sk2 = main_mod._sync_pharmonline_categories(s, discovered)
     assert a1 == 1
     assert a2 == 0 and sk2 == 1  # повторный запуск ничего не добавляет
+
+
+def test_intraday_product_limit_is_bounded(monkeypatch):
+    monkeypatch.delenv("INTRADAY_PRODUCT_LIMIT", raising=False)
+    assert main_mod._intraday_product_limit() == 600
+    monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "80")
+    assert main_mod._intraday_product_limit() == 80
+    monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "0")
+    assert main_mod._intraday_product_limit() == 1
+    monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "999999")
+    assert main_mod._intraday_product_limit() == 5_000
+    monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "invalid")
+    assert main_mod._intraday_product_limit() == 600

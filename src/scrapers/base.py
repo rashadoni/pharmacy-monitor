@@ -85,9 +85,17 @@ def fatal_proxy_reason(error: BaseException) -> str | None:
     status = fatal_proxy_status(error)
     if status is not None:
         return f"proxy access rejected: HTTP {status}"
-    if re.search(
-        r"InvalidProxy|UnsupportedProxy|ERR_NO_SUPPORTED_PROXIES",
-        f"{type(error).__name__}: {error}",
+    error_type = type(error).__name__
+    # websockets.InvalidProxyStatus / InvalidProxyMessage describe a proxy
+    # response, not a malformed local configuration. Residential exits can
+    # transiently return 5xx; these must reach the retry loop. Account-level
+    # 402/407 was already caught above and remains fail-closed.
+    if error_type in {"InvalidProxyStatus", "InvalidProxyMessage"}:
+        return None
+    diagnostic = f"{error_type}: {error}"
+    if error_type in {"InvalidProxy", "UnsupportedProxy"} or re.search(
+        r"\b(?:InvalidProxy|UnsupportedProxy)\b|ERR_NO_SUPPORTED_PROXIES",
+        diagnostic,
         re.I,
     ):
         return "proxy configuration rejected"
