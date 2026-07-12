@@ -428,6 +428,7 @@
     "no_overlaps": "No overlaps with ≥ {n} shared brands. Lower the threshold or choose different sites.",
     "min_overlap_label": "Min. overlap:",
     "suggestions_shared_brands_th": "Shared brands",
+    "suggestions_products_count": "{count} products",
     "suggestions_examples_th": "Examples",
     "scan_done_msg": "✓ Done #{id} — {total} products",
     "scan_degraded_msg": "⚠ Partial #{id} — received {total} products",

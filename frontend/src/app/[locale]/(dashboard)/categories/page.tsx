@@ -456,13 +456,13 @@ function SuggestionsPanel({
                   <td className="px-4 py-2 font-mono text-xs">
                     {s.site_a_slug}
                     <div className="text-[10px] text-muted-foreground/70">
-                      {s.site_a_products} prod
+                      {t("suggestions_products_count", { count: s.site_a_products })}
                     </div>
                   </td>
                   <td className="px-4 py-2 font-mono text-xs">
                     {s.site_b_slug}
                     <div className="text-[10px] text-muted-foreground/70">
-                      {s.site_b_products} prod
+                      {t("suggestions_products_count", { count: s.site_b_products })}
                     </div>
                   </td>
                   <td className="px-4 py-2 text-right tabular-nums font-semibold">

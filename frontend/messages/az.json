@@ -428,6 +428,7 @@
     "no_overlaps": "{n} və ya daha çox ortaq brendi olan kəsişmə yoxdur. Həddi azaldın və ya başqa sayt cütü seçin.",
     "min_overlap_label": "Min. ortaq brend:",
     "suggestions_shared_brands_th": "Ortaq brendlər",
+    "suggestions_products_count": "{count} məhsul",
     "suggestions_examples_th": "Nümunələr",
     "scan_done_msg": "✓ Hazırdır #{id} — {total} məhsul",
     "scan_degraded_msg": "⚠ Qismən #{id} — {total} məhsul alındı",

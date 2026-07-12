@@ -428,6 +428,7 @@
     "no_overlaps": "Нет пересечений с {n} или более общими брендами. Уменьшите порог или выберите другую пару сайтов.",
     "min_overlap_label": "Мин. общих брендов:",
     "suggestions_shared_brands_th": "Общие бренды",
+    "suggestions_products_count": "{count} товаров",
     "suggestions_examples_th": "Примеры",
     "scan_done_msg": "✓ Готово #{id} — {total} товаров",
     "scan_degraded_msg": "⚠ Частично #{id} — получено {total} товаров",
