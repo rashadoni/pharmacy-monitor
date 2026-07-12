@@ -16,6 +16,7 @@ import {
 import { useLocale, useTranslations } from "next-intl";
 import { api, friendlyError, type AlertEvent, type AlertSort } from "@/lib/api";
 import { formatRelative, formatTime } from "@/lib/utils";
+import { localizedAlertCopy } from "@/lib/alert-copy";
 import { CardListSkeleton } from "@/components/skeleton";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { QueryErrorState } from "@/components/query-error-state";
@@ -655,6 +656,7 @@ function AlertCard({
       : event.severity === "warning"
         ? t("severity_warning")
         : t("severity_info");
+  const copy = localizedAlertCopy(event, t);
   return (
     <div
       className={`rounded-lg border ${cfg.bg} p-3 ${dimmed ? "opacity-60" : ""}`}
@@ -678,7 +680,7 @@ function AlertCard({
             <div
               className={`font-medium text-sm ${event.is_read ? "line-through" : ""}`}
             >
-              {event.title}
+              {copy.title}
             </div>
             <div className="flex items-center gap-2 text-xs text-muted-foreground tabular-nums">
               {event.snoozed_until &&
@@ -704,9 +706,9 @@ function AlertCard({
               </span>
             </div>
           </div>
-          {event.detail && (
+          {copy.detail && (
             <div className="text-xs text-muted-foreground mt-1">
-              {event.detail}
+              {copy.detail}
             </div>
           )}
           {event.rule_type && (

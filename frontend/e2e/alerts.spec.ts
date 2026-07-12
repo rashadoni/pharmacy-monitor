@@ -194,4 +194,61 @@ test.describe("Alerts inbox (authenticated)", () => {
       page.getByRole("combobox", { name: "Сортировка", exact: true }),
     ).toHaveValue("site");
   });
+
+  test("azerbaijani alerts render localized event copy from payload", async ({
+    page,
+  }) => {
+    await page.route("**/api/v1/dash/alerts/page?**", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [
+            {
+              id: 903,
+              rule_type: "price_drop_pct",
+              severity: "critical",
+              title:
+                "Цена упала на 30.0%: Biobalance dəri çatlarına qarşı (Krem) 60 ml",
+              detail: "pharmonline: 22.00 → 15.40 ₼ (−30.0%).",
+              payload: {
+                site: "pharmonline",
+                prev_price: 22,
+                curr_price: 15.4,
+                drop_pct: 30,
+              },
+              site: "pharmonline",
+              created_at: new Date().toISOString(),
+              is_read: false,
+              read_at: null,
+              snoozed_until: null,
+            },
+          ],
+          total: 1,
+          limit: 50,
+          offset: 0,
+          rule_types: ["price_drop_pct"],
+        }),
+      });
+    });
+    await page.route("**/api/v1/dash/alerts/counts", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ unread: 1, snoozed: 0, read: 0, total: 1 }),
+      });
+    });
+
+    await page.goto("/az/alerts");
+
+    await expect(
+      page.getByText(
+        "Qiymət 30.0% düşüb: Biobalance dəri çatlarına qarşı (Krem) 60 ml",
+      ),
+    ).toBeVisible();
+    await expect(page.getByText("Цена упала")).toHaveCount(0);
+    await expect(
+      page.getByText("pharmonline: 22.00 → 15.40 ₼ (-30.0%)."),
+    ).toBeVisible();
+  });
 });
