@@ -17,6 +17,9 @@ export default function UsersPage() {
   const qc = useQueryClient();
   const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
   const listQ = useQuery({ queryKey: ["recipients"], queryFn: api.recipients });
+  const statusQ = useQuery({ queryKey: ["system-status"], queryFn: api.systemStatus });
+  const dailyEnabled = statusQ.data?.digests.daily.enabled ?? false;
+  const weeklyEnabled = statusQ.data?.digests.weekly.enabled ?? true;
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["recipients"] });
   const createMut = useMutation({
@@ -65,8 +68,10 @@ export default function UsersPage() {
 
       {isAdmin && (
         <>
-          <DigestScheduleNote />
+          <DigestScheduleNote status={statusQ.data?.digests} />
           <AddUserForm
+            dailyEnabled={dailyEnabled}
+            weeklyEnabled={weeklyEnabled}
             onAdd={(p) => createMut.mutate(p)}
             pending={createMut.isPending}
             error={
@@ -87,6 +92,8 @@ export default function UsersPage() {
                 key={u.id}
                 u={u}
                 isSelf={u.id === meQ.data?.id}
+                dailyEnabled={dailyEnabled}
+                weeklyEnabled={weeklyEnabled}
                 onUpdate={(patch) => updateMut.mutate({ id: u.id, patch })}
                 onDelete={() => {
                   if (confirm(t("delete_confirm", { email: u.email })))
@@ -110,7 +117,7 @@ export default function UsersPage() {
   );
 }
 
-function DigestScheduleNote() {
+function DigestScheduleNote({ status }: { status?: import("@/lib/api").SystemStatus["digests"] }) {
   const t = useTranslations("users");
   return (
     <div className="rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground flex items-start gap-2">
@@ -118,8 +125,8 @@ function DigestScheduleNote() {
       <div>
         {t("digest_schedule_note")}
         <ul className="mt-1 list-disc pl-4 space-y-0.5">
-          <li>{t("digest_schedule_daily")}</li>
-          <li>{t("digest_schedule_weekly")}</li>
+          <li>{t("digest_schedule_daily_state", { state: status?.daily.enabled ? t("digest_schedule_enabled", { schedule: status.daily.schedule_baku }) : t("digest_schedule_disabled") })}</li>
+          <li>{t("digest_schedule_weekly_state", { state: status?.weekly.enabled === false ? t("digest_schedule_disabled") : t("digest_schedule_enabled", { schedule: status?.weekly.schedule_baku ?? "Monday 10:00" }) })}</li>
         </ul>
       </div>
     </div>
@@ -127,11 +134,15 @@ function DigestScheduleNote() {
 }
 
 function AddUserForm({
+  dailyEnabled,
+  weeklyEnabled,
   onAdd,
   pending,
   error,
   doneEmail,
 }: {
+  dailyEnabled: boolean;
+  weeklyEnabled: boolean;
   onAdd: (p: RecipientCreate) => void;
   pending: boolean;
   error: string | null;
@@ -141,7 +152,7 @@ function AddUserForm({
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [role, setRole] = useState<"admin" | "viewer">("viewer");
-  const [daily, setDaily] = useState(true);
+  const [daily, setDaily] = useState(false);
   const [weekly, setWeekly] = useState(false);
 
   const validEmail = /.+@.+\..+/.test(email.trim());
@@ -158,7 +169,7 @@ function AddUserForm({
     setEmail("");
     setName("");
     setRole("viewer");
-    setDaily(true);
+    setDaily(false);
     setWeekly(false);
   }
 
@@ -193,8 +204,8 @@ function AddUserForm({
           <RoleSelect value={role} onChange={setRole} />
         </label>
         <div className="flex items-end gap-4 pb-1">
-          <Toggle label={t("daily_digest")} checked={daily} onChange={setDaily} />
-          <Toggle label={t("weekly_digest")} checked={weekly} onChange={setWeekly} />
+          <Toggle label={t("daily_digest")} checked={daily} disabled={!dailyEnabled} onChange={setDaily} />
+          <Toggle label={t("weekly_digest")} checked={weekly} disabled={!weeklyEnabled} onChange={setWeekly} />
         </div>
       </div>
       <div className="mt-3 flex items-center gap-3">
@@ -216,12 +227,16 @@ function AddUserForm({
 function UserCard({
   u,
   isSelf,
+  dailyEnabled,
+  weeklyEnabled,
   onUpdate,
   onDelete,
   onHardDelete,
 }: {
   u: Recipient;
   isSelf: boolean;
+  dailyEnabled: boolean;
+  weeklyEnabled: boolean;
   onUpdate: (patch: RecipientUpdate) => void;
   onDelete: () => void;
   onHardDelete: () => void;
@@ -292,11 +307,13 @@ function UserCard({
         <Toggle
           label={t("daily_digest")}
           checked={u.daily_digest}
+          disabled={!dailyEnabled}
           onChange={(daily_digest) => onUpdate({ daily_digest })}
         />
         <Toggle
           label={t("weekly_digest")}
           checked={u.weekly_digest}
+          disabled={!weeklyEnabled}
           onChange={(weekly_digest) => onUpdate({ weekly_digest })}
         />
         <Toggle

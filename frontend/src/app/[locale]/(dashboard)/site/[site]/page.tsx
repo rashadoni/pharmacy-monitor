@@ -111,6 +111,7 @@ export default function SitePage() {
   const recommendationsQ = useQuery({
     queryKey: ["site", site, "roi-recommendations", locale],
     queryFn: () => api.roiRecommendations(site, locale),
+    enabled: site === "pharmonline",
   });
   const roiWaitingForVerifiedScan = isVerifiedScanPendingError(recommendationsQ.error);
   const pageDataError = summaryQ.error ?? facetsQ.error ?? brandsQ.error;
@@ -183,7 +184,7 @@ export default function SitePage() {
         />
       </section>
 
-      <section>
+      {site === "pharmonline" ? <section>
         <h2 className="text-lg font-semibold mb-3">{t("roi_title")}</h2>
         <p className="text-xs text-muted-foreground mb-3">
           {t("roi_subtitle", { site, competitors: competitors.join("/") })}
@@ -236,7 +237,14 @@ export default function SitePage() {
             <ActionRow key={i} action={a} />
           ))}
         </div>
-      </section>
+      </section> : (
+        <section className="rounded-lg border border-border bg-card p-4">
+          <h2 className="text-lg font-semibold">{t("benchmark_title")}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {t("benchmark_desc", { site })}
+          </p>
+        </section>
+      )}
 
       <section className="grid gap-6 lg:grid-cols-2">
         <BrandsPanel

@@ -13,6 +13,7 @@ import {
   type RoiAction,
   type HealthSite,
   type LatestRunBySite,
+  type SystemStatus,
 } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { QuickActions } from "@/components/quick-actions";
@@ -38,8 +39,8 @@ export default function OverviewPage() {
   });
   // Phase 5.6: live staleness panel. Refresh every 60s automatically.
   const healthQ = useQuery({
-    queryKey: ["health"],
-    queryFn: api.health,
+    queryKey: ["system-status"],
+    queryFn: api.systemStatus,
     refetchInterval: 60_000,
     staleTime: 30_000,
   });
@@ -63,6 +64,7 @@ export default function OverviewPage() {
       </div>
 
       {/* Phase 5.6 — Per-site staleness panel */}
+      {healthQ.data && <SystemTruthPanel status={healthQ.data} />}
       {healthQ.data && <SiteStalenessPanel sites={healthQ.data.sites} />}
 
       <section aria-label={t("subtitle")}>
@@ -205,6 +207,12 @@ function LatestRunsBySitePanel({
             <tbody>
               {items.map((item) => {
                 const run = item.run;
+                const attempt = item.latest_attempt;
+                const newerProblem = Boolean(
+                  attempt &&
+                  attempt.id !== run?.id &&
+                  (attempt.status === "degraded" || attempt.status === "failed"),
+                );
                 const siteProducts = run?.products_per_site?.[item.site] ?? run?.products_scraped ?? null;
                 return (
                   <tr key={item.site} className="border-t border-border">
@@ -217,7 +225,14 @@ function LatestRunsBySitePanel({
                       {run ? formatDuration(run.started_at, run.finished_at, t) : "—"}
                     </td>
                     <td className="px-3 py-2">
-                      {run ? <StatusBadge status={run.status} /> : <span className="text-muted-foreground">—</span>}
+                      <div className="flex flex-col items-start gap-1">
+                        {run ? <StatusBadge status={run.status} /> : <span className="text-muted-foreground">—</span>}
+                        {newerProblem && attempt && (
+                          <span className="text-xs text-warning">
+                            {t("newer_attempt_warning", { id: attempt.id })}
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums">
                       {siteProducts == null ? "—" : siteProducts}
@@ -237,6 +252,63 @@ function LatestRunsBySitePanel({
         </div>
       )}
     </div>
+  );
+}
+
+function SystemTruthPanel({ status }: { status: SystemStatus }) {
+  const t = useTranslations("overview");
+  const degraded = status.status !== "up";
+  const queueSize = status.queue.pending + status.queue.running;
+  const cells = [
+    {
+      label: t("system_api"),
+      value: degraded ? t("system_degraded") : t("system_up"),
+      ok: !degraded,
+    },
+    {
+      label: t("system_storage"),
+      value:
+        status.db_ping_ms == null || status.redis_ping_ms == null
+          ? t("system_unavailable")
+          : t("system_latency", {
+              db: status.db_ping_ms.toFixed(1),
+              redis: status.redis_ping_ms.toFixed(1),
+            }),
+      ok: status.db_ping_ms != null && status.redis_ping_ms != null,
+    },
+    {
+      label: t("system_catalog"),
+      value: status.full_catalog_verified
+        ? t("system_catalog_verified")
+        : t("system_catalog_unverified"),
+      ok: status.full_catalog_verified,
+    },
+    {
+      label: t("system_queue"),
+      value: queueSize === 0 ? t("system_queue_empty") : t("system_queue_count", { count: queueSize }),
+      ok: status.queue.running <= 1,
+    },
+  ];
+  return (
+    <section className="rounded-lg border border-border bg-card p-4" aria-label={t("system_status_title")}>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold">{t("system_status_title")}</h2>
+          <p className="text-xs text-muted-foreground">{t("system_status_desc")}</p>
+        </div>
+        <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${degraded ? "bg-warning/10 text-warning" : "bg-success/10 text-success"}`}>
+          {degraded ? t("system_degraded") : t("system_up")}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {cells.map((cell) => (
+          <div key={cell.label} className="rounded-md border border-border bg-background p-3">
+            <div className="text-xs text-muted-foreground">{cell.label}</div>
+            <div className={`mt-1 text-sm font-medium ${cell.ok ? "text-foreground" : "text-warning"}`}>{cell.value}</div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

@@ -116,6 +116,54 @@ def test_health_endpoint_redis_unset_returns_null(client, monkeypatch):
     assert body["full_catalog_status"] == "missing"
 
 
+def test_system_status_exposes_queue_proxy_and_real_digest_schedule(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    monkeypatch.setenv("DECODO_USERNAME", "configured-user")
+    monkeypatch.setenv("DECODO_PASSWORD", "configured-secret")
+    monkeypatch.setenv("DECODO_SITES", "aloe,pharmonline")
+    monkeypatch.setenv("DECODO_PORTS", "30001,30002")
+    monkeypatch.setenv("DAILY_DIGEST_ENABLED", "0")
+    monkeypatch.setenv("WEEKLY_DIGEST_ENABLED", "1")
+    monkeypatch.setenv("WEEKLY_DIGEST_SCHEDULE_BAKU", "Monday 10:00")
+    older = storage.ScrapeRequest(
+        tenant_id=1,
+        status="pending",
+        mode="all",
+        requested_at=utcnow() - timedelta(minutes=5),
+    )
+    running = storage.ScrapeRequest(
+        tenant_id=1,
+        status="running",
+        mode="category",
+    )
+    foreign = storage.ScrapeRequest(tenant_id=2, status="pending", mode="all")
+    setup_db.add_all([older, running, foreign])
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/system-status")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["queue"]["pending"] == 1
+    assert body["queue"]["running"] == 1
+    assert body["queue"]["oldest_pending_at"] is not None
+    assert body["proxy"] == {
+        "provider": "decodo",
+        "configured": True,
+        "sites": ["aloe", "pharmonline"],
+        "pool_size": 2,
+    }
+    assert body["digests"]["daily"]["enabled"] is False
+    assert body["digests"]["weekly"] == {
+        "enabled": True,
+        "schedule_baku": "Monday 10:00",
+    }
+    serialized = response.text
+    assert "configured-user" not in serialized
+    assert "configured-secret" not in serialized
+
+
 def test_health_endpoint_degraded_when_latest_run_degraded(client, setup_db):
     setup_db.add(
         storage.Run(
@@ -530,6 +578,263 @@ def test_dash_runs_latest_by_site_includes_weekly_site(client, auth_cookie, setu
     recent_ids = {row["id"] for row in recent.json()}
     assert other_tenant_newer.id not in recent_ids
     assert pharm.id in recent_ids
+
+
+def test_site_history_ignores_legacy_zero_placeholder_and_keeps_real_failure_visible(
+    client, auth_cookie, setup_db
+):
+    db = setup_db
+    base = utcnow()
+    successful = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(days=1),
+        finished_at=base - timedelta(days=1) + timedelta(minutes=10),
+        status="ok",
+        products_scraped=6300,
+        products_per_site={"aloe": 6300},
+        sites_completed="aloe",
+    )
+    # Historical producer wrote all sites with zero even though only
+    # pharmonline was in scope. It must not become aloe's latest attempt.
+    placeholder = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=2),
+        finished_at=base - timedelta(hours=2) + timedelta(minutes=1),
+        status="degraded",
+        products_scraped=200,
+        products_per_site={"pharmonline": 200, "aptekonline": 0, "aloe": 0},
+        sites_completed="pharmonline",
+    )
+    run_446_shape = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=3),
+        finished_at=base - timedelta(hours=3) + timedelta(minutes=6),
+        status="degraded",
+        products_scraped=606,
+        products_per_site={"pharmonline": 606, "aptekonline": 0, "aloe": 0},
+        sites_completed="pharmonline,aptekonline,aloe",
+        run_quality={
+            "sites": {
+                "pharmonline": {"status": "ok", "items_expected": 1, "products": 606},
+                "aptekonline": {"status": "failed", "items_expected": 0, "products": 0, "reasons": ["no_items_requested"]},
+                "aloe": {"status": "failed", "items_expected": 0, "products": 0, "reasons": ["no_items_requested"]},
+            }
+        },
+    )
+    # A real failed aloe attempt has expected work and remains visible as the
+    # latest attempt, while the trusted positive run remains the display run.
+    real_failure = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=1),
+        finished_at=base - timedelta(minutes=50),
+        status="degraded",
+        products_scraped=0,
+        products_per_site={"aloe": 0},
+        run_quality={
+            "sites": {
+                "aloe": {
+                    "status": "degraded",
+                    "items_expected": 6,
+                    "items_completed": 0,
+                    "items_failed": 6,
+                    "products": 0,
+                }
+            }
+        },
+    )
+    db.add_all([successful, run_446_shape, placeholder, real_failure])
+    db.commit()
+
+    rows = {
+        row["site"]: row
+        for row in client.get("/api/v1/dash/runs/latest-by-site").json()
+    }
+    assert rows["aloe"]["run"]["id"] == successful.id
+    assert rows["aloe"]["latest_attempt"]["id"] == real_failure.id
+    assert rows["aptekonline"]["run"] is None
+    assert rows["aptekonline"]["latest_attempt"] is None
+
+    summary = client.get("/api/v1/dash/products/summary?site=aloe").json()
+    assert summary["last_run_id"] == successful.id
+
+
+def test_site_summary_does_not_reuse_another_sites_latest_run(
+    client, auth_cookie, setup_db
+):
+    db = setup_db
+    aloe = storage.Run(
+        tenant_id=1,
+        status="ok",
+        started_at=utcnow() - timedelta(hours=2),
+        products_scraped=5,
+        products_per_site={"aloe": 5},
+        sites_completed="aloe",
+    )
+    pharm = storage.Run(
+        tenant_id=1,
+        status="ok",
+        started_at=utcnow() - timedelta(hours=1),
+        products_scraped=7,
+        products_per_site={"pharmonline": 7},
+        sites_completed="pharmonline",
+    )
+    db.add_all([aloe, pharm])
+    db.commit()
+
+    summary = client.get("/api/v1/dash/products/summary?site=aloe").json()
+    assert summary["last_run_id"] == aloe.id
+
+
+def test_run_history_filters_by_real_site_scope_and_paginates(
+    client, auth_cookie, setup_db
+):
+    rows = [
+        storage.Run(
+            tenant_id=1,
+            status="ok",
+            products_scraped=10 + i,
+            products_per_site={"aloe": 10 + i},
+            sites_completed="aloe",
+        )
+        for i in range(3)
+    ]
+    placeholder = storage.Run(
+        tenant_id=1,
+        status="degraded",
+        products_per_site={"aloe": 0, "pharmonline": 5},
+        sites_completed="pharmonline",
+    )
+    setup_db.add_all([*rows, placeholder])
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/runs/history?site=aloe&limit=2&offset=1")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 3
+    assert len(body["items"]) == 2
+    assert placeholder.id not in {item["id"] for item in body["items"]}
+
+
+def test_scrape_request_history_is_tenant_scoped_and_paginated(
+    client, auth_cookie, setup_db
+):
+    own = [
+        storage.ScrapeRequest(tenant_id=1, status="failed", mode="all")
+        for _ in range(3)
+    ]
+    setup_db.add_all(
+        [*own, storage.ScrapeRequest(tenant_id=2, status="failed", mode="all")]
+    )
+    setup_db.commit()
+
+    response = client.get(
+        "/api/v1/dash/scrape/requests/history?status=failed&limit=2"
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 3
+    assert len(body["items"]) == 2
+
+
+def test_successful_dashboard_mutation_is_audited_without_request_body(
+    client, auth_cookie, tenant_user, setup_db
+):
+    secret_marker = "22-08"
+    response = client.patch(
+        "/api/v1/dash/me/notifications",
+        json={"quiet_hours": secret_marker},
+    )
+    assert response.status_code == 200, response.text
+
+    audit = client.get("/api/v1/dash/audit-log")
+
+    assert audit.status_code == 200, audit.text
+    body = audit.json()
+    assert body["total"] >= 1
+    row = body["items"][0]
+    assert row["actor_user_id"] == tenant_user.id
+    assert row["actor_email"] == tenant_user.email
+    assert row["action"] == "PATCH"
+    assert row["resource"] == "/api/v1/dash/me/notifications"
+    assert row["response_status"] == 200
+    assert row["request_id"]
+    assert secret_marker not in audit.text
+
+
+def test_failed_dashboard_mutation_is_not_audited(client, auth_cookie):
+    response = client.patch(
+        "/api/v1/dash/me/notifications",
+        json={"email_severity_min": "not-a-level"},
+    )
+    assert response.status_code == 422
+
+    audit = client.get("/api/v1/dash/audit-log").json()
+    assert audit["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_middleware_uses_isolated_session(monkeypatch):
+    from fastapi import Request, Response
+
+    class FakeAuditSession:
+        def __init__(self):
+            self.added = []
+            self.commits = 0
+            self.rollbacks = 0
+            self.closed = 0
+
+        def add(self, row):
+            self.added.append(row)
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+        def close(self):
+            self.closed += 1
+
+    class BusinessSession:
+        commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    audit_session = FakeAuditSession()
+    business_session = BusinessSession()
+    monkeypatch.setattr(
+        storage, "make_session", lambda: (lambda: audit_session)
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "path": "/api/v1/dash/categories/1",
+            "query_string": b"",
+            "headers": [],
+            "server": ("test", 80),
+            "client": ("test", 123),
+            "scheme": "http",
+        }
+    )
+    request.state.request_id = "audit-test"
+
+    async def call_next(req):
+        req.state.tenant_id = 1
+        req.state.user_id = 7
+        req.state.db = business_session
+        return Response(status_code=200)
+
+    response = await api_module._dashboard_audit_middleware(request, call_next)
+
+    assert response.status_code == 200
+    assert business_session.commits == 0
+    assert audit_session.commits == 1
+    assert audit_session.closed == 1
+    assert len(audit_session.added) == 1
 
 
 def _make_match_with_prices(db, run, *, canonical, prices, tenant_id=1, category=None):
@@ -1058,6 +1363,56 @@ def test_dash_alerts_without_cookie_401(client):
     assert r.status_code == 401
 
 
+def test_alert_page_filters_and_paginates_on_server(
+    client, auth_cookie, setup_db
+):
+    now = utcnow()
+    events = [
+        storage.AlertEvent(
+            tenant_id=1,
+            rule_type="price_drop_pct",
+            dedup_key=f"drop-{i}",
+            severity="warning",
+            title=f"Drop {i}",
+            created_at=now - timedelta(minutes=i),
+            is_read=False,
+        )
+        for i in range(4)
+    ]
+    read = storage.AlertEvent(
+        tenant_id=1,
+        rule_type="new_product",
+        dedup_key="read-one",
+        severity="info",
+        title="Read",
+        created_at=now,
+        is_read=True,
+    )
+    setup_db.add_all([*events, read])
+    setup_db.commit()
+
+    first = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&severity=warning&limit=2"
+    )
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["total"] == 4
+    assert len(body["items"]) == 2
+    assert body["rule_types"] == ["new_product", "price_drop_pct"]
+
+    second = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&severity=warning&limit=2&offset=2"
+    ).json()
+    assert len(second["items"]) == 2
+    assert {item["id"] for item in body["items"]}.isdisjoint(
+        {item["id"] for item in second["items"]}
+    )
+
+    read_page = client.get("/api/v1/dash/alerts/page?view=read").json()
+    assert read_page["total"] == 1
+    assert read_page["items"][0]["id"] == read.id
+
+
 # ─── Legacy ERP endpoints — require X-API-Key ────────────────────────────────
 
 
@@ -1140,6 +1495,44 @@ def test_dash_categories_create_requires_auth(client):
         json={"key": "test", "label_ru": "Test", "label_az": "Test AZ"},
     )
     assert r.status_code == 401
+
+
+def test_categories_page_filters_paginates_and_returns_global_stats(
+    client, auth_cookie, setup_db
+):
+    setup_db.add_all(
+        [
+            storage.Category(
+                key=f"cat-{i}",
+                label_ru=f"Категория {i}",
+                label_az=f"Kateqoriya {i}",
+                pharmonline_slug=f"p-{i}",
+                aptekonline_slug=f"a-{i}" if i % 2 == 0 else None,
+                aloe_slug=f"l-{i}" if i == 0 else None,
+                is_active=i != 3,
+            )
+            for i in range(5)
+        ]
+    )
+    setup_db.commit()
+
+    response = client.get(
+        "/api/v1/dash/categories/page?coverage=cross2&limit=1&offset=1"
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 3
+    assert len(body["items"]) == 1
+    assert body["stats"] == {
+        "total": 5,
+        "active": 4,
+        "cross2": 3,
+        "cross3": 1,
+        "pharmonline": 5,
+        "aptekonline": 3,
+        "aloe": 1,
+    }
 
 
 def test_dash_categories_require_nonblank_az_label(client, auth_cookie):
@@ -2009,6 +2402,396 @@ def test_cost_csv_import_imports_valid_rows(client, tenant_user, setup_db):
     assert body["rows_processed"] == 3
     assert body["rows_imported"] == 1
     assert body["rows_skipped"] == 2
+    assert body["batch_id"] is not None
+
+
+def test_cost_csv_preview_is_read_only_then_import_can_be_rolled_back(
+    client, auth_cookie, setup_db
+):
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="ROLL-001",
+        url="http://x/roll",
+        name="Rollback product",
+        name_normalized="rollback product",
+    )
+    setup_db.add(product)
+    setup_db.flush()
+    original = storage.SupplierPrice(
+        product_id=product.id,
+        sku="ROLL-001",
+        supplier_name="Vendor",
+        purchase_price=3.0,
+        currency="AZN",
+        source="erp",
+    )
+    setup_db.add(original)
+    setup_db.commit()
+    csv_body = (
+        b"sku,supplier_name,purchase_price,currency\n"
+        b"ROLL-001,Vendor,4.50,AZN\n"
+    )
+
+    preview = client.post(
+        "/api/v1/dash/settings/costs/preview",
+        files={"file": ("costs.csv", csv_body, "text/csv")},
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["changes"][0]["before"]["purchase_price"] == 3.0
+    setup_db.refresh(original)
+    assert original.purchase_price == 3.0
+
+    imported = client.post(
+        "/api/v1/dash/settings/costs/import",
+        files={"file": ("costs.csv", csv_body, "text/csv")},
+    ).json()
+    setup_db.refresh(original)
+    assert original.purchase_price == 4.5
+    history = client.get("/api/v1/dash/settings/costs/imports").json()
+    assert history[0]["id"] == imported["batch_id"]
+    assert history[0]["can_rollback"] is True
+
+    rollback = client.post(
+        f"/api/v1/dash/settings/costs/imports/{imported['batch_id']}/rollback"
+    )
+    assert rollback.status_code == 200, rollback.text
+    setup_db.refresh(original)
+    assert original.purchase_price == 3.0
+    assert original.source == "erp"
+
+
+def test_cost_endpoints_reject_viewer(client, setup_db):
+    viewer = _make_user(setup_db, "cost-viewer@x.az", role="viewer")
+    token = tenants.issue_magic_token(setup_db, viewer.email)
+    client.get(f"/auth/verify?token={token}")
+    body = b"sku,supplier_name,purchase_price\nX,V,1\n"
+
+    assert client.put(
+        "/api/v1/dash/settings/pricing",
+        json={
+            "raise_threshold_pct": 1,
+            "undercut_threshold_pct": 1,
+            "max_spread_pct": 50,
+            "min_margin_pct": 5,
+            "max_per_type": 5,
+        },
+    ).status_code == 403
+    for endpoint in ("preview", "import"):
+        response = client.post(
+            f"/api/v1/dash/settings/costs/{endpoint}",
+            files={"file": ("costs.csv", body, "text/csv")},
+        )
+        assert response.status_code == 403
+    assert client.get("/api/v1/dash/settings/costs/imports").status_code == 403
+    assert (
+        client.post("/api/v1/dash/settings/costs/imports/1/rollback").status_code
+        == 403
+    )
+
+
+def test_cost_preview_uses_only_client_site_for_duplicate_external_id(
+    client, auth_cookie, setup_db
+):
+    pharm = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="SHARED-SKU",
+        url="https://pharmonline.az/shared",
+        name="Client product",
+        name_normalized="client product",
+    )
+    competitor = storage.Product(
+        tenant_id=1,
+        site="aloe",
+        external_id="SHARED-SKU",
+        url="https://aloe.az/shared",
+        name="Competitor product",
+        name_normalized="competitor product",
+    )
+    setup_db.add_all([pharm, competitor])
+    setup_db.commit()
+    body = b"sku,supplier_name,purchase_price\nSHARED-SKU,V,2.5\n"
+
+    preview = client.post(
+        "/api/v1/dash/settings/costs/preview",
+        files={"file": ("costs.csv", body, "text/csv")},
+    ).json()
+
+    assert preview["changes"][0]["product_id"] == pharm.id
+    assert preview["changes"][0]["product_name"] == "Client product"
+
+
+def test_dashboard_cost_then_erp_push_upserts_same_product_supplier(
+    client, auth_cookie, setup_db
+):
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="DASH-ERP-1",
+        url="https://pharmonline.az/dash-erp",
+        name="Dashboard ERP product",
+        name_normalized="dashboard erp product",
+    )
+    setup_db.add(product)
+    setup_db.commit()
+    dashboard_csv = b"sku,supplier_name,purchase_price\nDASH-ERP-1,Vendor,2.5\n"
+    imported = client.post(
+        "/api/v1/dash/settings/costs/import",
+        files={"file": ("costs.csv", dashboard_csv, "text/csv")},
+    )
+    assert imported.status_code == 200, imported.text
+
+    pushed = client.post(
+        "/api/v1/inventory/prices",
+        headers={"X-API-Key": "test-key-1234"},
+        json=[
+            {
+                "sku": "DASH-ERP-1",
+                "supplier_name": "Vendor",
+                "purchase_price": 4.25,
+                "currency": "AZN",
+            }
+        ],
+    )
+
+    assert pushed.status_code == 200, pushed.text
+    setup_db.expire_all()
+    rows = setup_db.scalars(
+        select(storage.SupplierPrice).where(
+            storage.SupplierPrice.product_id == product.id,
+            storage.SupplierPrice.supplier_name == "Vendor",
+        )
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].purchase_price == 4.25
+    assert rows[0].source == "api_erp"
+
+
+def test_cost_import_rolls_back_everything_when_cache_invalidation_fails(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    from sqlalchemy.orm import Query
+
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="ATOMIC-SKU",
+        url="https://pharmonline.az/atomic",
+        name="Atomic product",
+        name_normalized="atomic product",
+    )
+    setup_db.add(product)
+    setup_db.commit()
+    original_delete = Query.delete
+
+    def fail_roi_delete(query, *args, **kwargs):
+        entity = query.column_descriptions[0].get("entity")
+        if entity is storage.RoiActionsCache:
+            raise RuntimeError("cache delete failed")
+        return original_delete(query, *args, **kwargs)
+
+    monkeypatch.setattr(Query, "delete", fail_roi_delete)
+    body = b"sku,supplier_name,purchase_price\nATOMIC-SKU,V,2.5\n"
+    with pytest.raises(RuntimeError, match="cache delete failed"):
+        client.post(
+            "/api/v1/dash/settings/costs/import",
+            files={"file": ("costs.csv", body, "text/csv")},
+        )
+    setup_db.rollback()
+    assert setup_db.scalar(
+        select(storage.SupplierPrice).where(
+            storage.SupplierPrice.product_id == product.id
+        )
+    ) is None
+    assert setup_db.scalar(
+        select(storage.CostImportBatch).where(
+            storage.CostImportBatch.tenant_id == 1
+        )
+    ) is None
+
+
+def test_supplier_price_unique_product_supplier_invariant(setup_db):
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="UNIQUE-SKU",
+        url="https://pharmonline.az/unique",
+        name="Unique product",
+        name_normalized="unique product",
+    )
+    setup_db.add(product)
+    setup_db.flush()
+    setup_db.add_all(
+        [
+            storage.SupplierPrice(
+                product_id=product.id,
+                supplier_name="V",
+                purchase_price=1,
+            ),
+            storage.SupplierPrice(
+                product_id=product.id,
+                supplier_name="V",
+                purchase_price=2,
+            ),
+        ]
+    )
+    with pytest.raises(Exception):
+        setup_db.commit()
+    setup_db.rollback()
+
+
+def test_cost_import_lock_serializes_same_tenant(setup_db):
+    import threading
+    import time
+
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    entered_second = threading.Event()
+
+    def first():
+        with api_module.inv_mod.supplier_price_write_lock(setup_db, 1):
+            entered_first.set()
+            release_first.wait(timeout=2)
+
+    def second():
+        entered_first.wait(timeout=2)
+        with api_module.inv_mod.supplier_price_write_lock(setup_db, 1):
+            entered_second.set()
+
+    one = threading.Thread(target=first)
+    two = threading.Thread(target=second)
+    one.start()
+    two.start()
+    assert entered_first.wait(timeout=1)
+    time.sleep(0.05)
+    assert not entered_second.is_set()
+    release_first.set()
+    one.join(timeout=2)
+    two.join(timeout=2)
+    assert entered_second.is_set()
+
+
+def test_concurrent_erp_write_is_serialized_against_dashboard_rollback(
+    setup_db, tenant_user, monkeypatch
+):
+    import threading
+    import time
+
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="ERP-RB-1",
+        url="https://pharmonline.az/erp-rb",
+        name="ERP rollback product",
+        name_normalized="erp rollback product",
+    )
+    setup_db.add(product)
+    setup_db.flush()
+    setup_db.add(
+        storage.SupplierPrice(
+            product_id=product.id,
+            sku="ERP-RB-1",
+            supplier_name="Vendor",
+            purchase_price=2.5,
+            currency="AZN",
+            source="dashboard_csv",
+        )
+    )
+    batch = storage.CostImportBatch(
+        tenant_id=1,
+        actor_user_id=tenant_user.id,
+        rows_processed=1,
+        rows_imported=1,
+        rows_skipped=0,
+        changes=[
+            {
+                "product_id": product.id,
+                "supplier_name": "Vendor",
+                "before": None,
+                "after": {
+                    "purchase_price": 2.5,
+                    "currency": "AZN",
+                    "source": "dashboard_csv",
+                    "sku": "ERP-RB-1",
+                },
+            }
+        ],
+    )
+    setup_db.add(batch)
+    setup_db.commit()
+
+    SessionLocal = sessionmaker(setup_db.get_bind(), expire_on_commit=False)
+    erp_db = SessionLocal()
+    rollback_db = SessionLocal()
+    erp_entered = threading.Event()
+    release_erp = threading.Event()
+    rollback_done = threading.Event()
+    failures: list[BaseException] = []
+    original_find = api_module.inv_mod._find_product_by_sku_or_name
+
+    def blocking_find(*args, **kwargs):
+        erp_entered.set()
+        release_erp.wait(timeout=2)
+        return original_find(*args, **kwargs)
+
+    monkeypatch.setattr(
+        api_module.inv_mod, "_find_product_by_sku_or_name", blocking_find
+    )
+
+    def erp_write():
+        try:
+            api_module.push_prices(
+                [
+                    api_module.PurchasePriceIn(
+                        sku="ERP-RB-1",
+                        supplier_name="Vendor",
+                        purchase_price=4.0,
+                        currency="AZN",
+                    )
+                ],
+                source="api_erp",
+                db=erp_db,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    def rollback():
+        try:
+            api_module.dash_cost_import_rollback(
+                batch.id, user=tenant_user, db=rollback_db
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            rollback_done.set()
+
+    erp_thread = threading.Thread(target=erp_write)
+    rollback_thread = threading.Thread(target=rollback)
+    erp_thread.start()
+    assert erp_entered.wait(timeout=1)
+    rollback_thread.start()
+    time.sleep(0.05)
+    assert not rollback_done.is_set()
+    release_erp.set()
+    erp_thread.join(timeout=2)
+    rollback_thread.join(timeout=2)
+    erp_db.close()
+    rollback_db.close()
+
+    assert rollback_done.is_set()
+    assert len(failures) == 1
+    assert getattr(failures[0], "status_code", None) == 409
+    setup_db.expire_all()
+    current = setup_db.scalar(
+        select(storage.SupplierPrice).where(
+            storage.SupplierPrice.product_id == product.id,
+            storage.SupplierPrice.supplier_name == "Vendor",
+        )
+    )
+    assert current is not None
+    assert current.purchase_price == 4.0
+    assert current.source == "api_erp"
 
 
 # ─── Phase 5.2 prep — batch price-history endpoint ───────────────────────────

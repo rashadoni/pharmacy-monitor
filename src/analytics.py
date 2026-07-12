@@ -53,6 +53,7 @@ def brand_share(
     run_id: int | None = None,
     top_n: int = 30,
     site: str | None = None,
+    tenant_id: int = 1,
 ) -> list[BrandRow]:
     """Сводка: каких брендов сколько на каждом сайте.
 
@@ -77,7 +78,11 @@ def brand_share(
         stmt = (
             select(Product.brand, Product.site, func.count(Product.id))
             .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
-            .where(PriceSnapshot.run_id == run_id, Product.brand.is_not(None))
+            .where(
+                PriceSnapshot.run_id == run_id,
+                Product.brand.is_not(None),
+                Product.tenant_id == tenant_id,
+            )
             .group_by(Product.brand, Product.site)
         )
     else:
@@ -85,7 +90,11 @@ def brand_share(
         cutoff = utcnow() - timedelta(days=_BRAND_SHARE_ACTIVE_DAYS)
         stmt = (
             select(Product.brand, Product.site, func.count(Product.id))
-            .where(Product.last_seen_at >= cutoff, Product.brand.is_not(None))
+            .where(
+                Product.last_seen_at >= cutoff,
+                Product.brand.is_not(None),
+                Product.tenant_id == tenant_id,
+            )
             .group_by(Product.brand, Product.site)
         )
     rows = session.execute(stmt).all()

@@ -16,6 +16,7 @@ import {
 } from "recharts";
 import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
+import { useState } from "react";
 import { api, type CategoryComparisonRow, type ForecastMover } from "@/lib/api";
 
 const SITE_COLORS: Record<string, string> = {
@@ -111,6 +112,8 @@ function BrandShareSection() {
 function PriceIndexSection() {
   const t = useTranslations("analytics");
   const locale = useLocale();
+  const [page, setPage] = useState(0);
+  const pageSize = 25;
   // 2026-05-29: было raw fetch → 500 (бэкенд бросал TypeError, см. analytics.py).
   // Теперь api.priceIndex() (typed, request() кидает на non-2xx) + строки
   // кликабельны: drill в /comparison?category=. Полная версия — /category-comparison.
@@ -142,7 +145,7 @@ function PriceIndexSection() {
             </tr>
           </thead>
           <tbody>
-            {data.map((row: CategoryComparisonRow) => (
+            {data.slice(page * pageSize, (page + 1) * pageSize).map((row: CategoryComparisonRow) => (
               <tr key={row.category} className="border-b border-border last:border-0">
                 <td className="px-3 py-2">
                   <Link
@@ -169,6 +172,12 @@ function PriceIndexSection() {
             ))}
           </tbody>
         </table>
+        {data.length > pageSize && (
+          <div className="flex items-center justify-between border-t border-border px-3 py-2 text-xs">
+            <span className="text-muted-foreground">{t("page_range", { from: page * pageSize + 1, to: Math.min(data.length, (page + 1) * pageSize), total: data.length })}</span>
+            <div className="flex gap-2"><button type="button" disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))} className="min-h-11 rounded border border-border px-3 disabled:opacity-40 md:min-h-8">{t("page_previous")}</button><button type="button" disabled={(page + 1) * pageSize >= data.length} onClick={() => setPage((value) => value + 1)} className="min-h-11 rounded border border-border px-3 disabled:opacity-40 md:min-h-8">{t("page_next")}</button></div>
+          </div>
+        )}
         </div>
       )}
     </Card>
@@ -233,7 +242,11 @@ function ForecastRow({ mover }: { mover: ForecastMover }) {
             {mover.name}
           </div>
           <div className="text-xs text-muted-foreground mt-0.5">
-            {t("forecast_row_meta", { site: mover.site, n: mover.n_points, conf: mover.confidence })}
+            {t("forecast_row_meta", {
+              site: mover.site,
+              n: mover.n_points,
+              conf: t(`confidence_${mover.confidence}`),
+            })}
           </div>
         </div>
         <div className={`text-right shrink-0 ${dirColor}`}>
@@ -245,7 +258,7 @@ function ForecastRow({ mover }: { mover: ForecastMover }) {
           </div>
         </div>
       </div>
-      {mover.forecast_7d_price > 0 && (
+      {mover.forecast_7d_price != null && mover.forecast_7d_price > 0 && (
         <div className="text-xs text-muted-foreground mt-1.5 pt-1.5 border-t border-border/50">
           {t("forecast_7d")} <span className="font-mono">{mover.forecast_7d_price.toFixed(2)} ₼</span>
         </div>

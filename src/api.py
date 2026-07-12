@@ -176,6 +176,43 @@ async def _request_id_middleware(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def _dashboard_audit_middleware(request: Request, call_next):
+    """Record successful authenticated dashboard mutations, body-free.
+
+    The write is best-effort and isolated from the business transaction: an
+    audit storage outage must be observable in logs but must not turn a
+    successful user operation into a misleading HTTP failure.
+    """
+    response = await call_next(request)
+    if (
+        request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and request.url.path.startswith("/api/v1/dash/")
+        and 200 <= response.status_code < 400
+        and getattr(request.state, "user_id", None) is not None
+    ):
+        Session_ = storage.make_session()
+        audit_db = Session_()
+        try:
+            audit_db.add(
+                storage.AuditLog(
+                    tenant_id=int(request.state.tenant_id),
+                    actor_user_id=int(request.state.user_id),
+                    action=request.method,
+                    resource=request.url.path,
+                    response_status=response.status_code,
+                    request_id=getattr(request.state, "request_id", None),
+                )
+            )
+            audit_db.commit()
+        except Exception as exc:
+            audit_db.rollback()
+            log.warning("audit_log_write_failed", error=str(exc), path=request.url.path)
+        finally:
+            audit_db.close()
+    return response
+
+
 # ─── Phase 5.4 — HTTP request metrics ────────────────────────────────────────
 # Counter + histogram per response, label cardinality bounded:
 #   status: literal HTTP code как string ("200", "404", "500"…)
@@ -613,15 +650,7 @@ def _staleness_per_site(db: Session) -> list[SiteStaleness]:
     return out
 
 
-@app.get("/health", response_model=HealthOut)
-def health_endpoint(db: Session = Depends(get_db)):
-    """Deep health check (Phase 0.3, 2026-05-26).
-
-    Used by ops + Caddy upstream health probe. NEVER throws — degraded
-    dependencies report as `null` ping or `staleness_warning=true`, but the
-    endpoint itself stays 200 so we can distinguish "API up but DB slow"
-    from "API down entirely".
-    """
+def _health_snapshot(db: Session) -> HealthOut:
     last = storage.latest_terminal_run(db, tenant_id=1)
     full_attempts = storage.latest_full_catalog_attempts_by_site(
         db,
@@ -678,6 +707,109 @@ def health_endpoint(db: Session = Depends(get_db)):
         full_catalog_status=full_status,
         full_catalog_verified=full_verified,
     )
+
+
+@app.get("/health", response_model=HealthOut)
+def health_endpoint(db: Session = Depends(get_db)):
+    """Deep health check used by ops and the public upstream probe.
+
+    NEVER throws for optional dependencies: degraded components are reported
+    in the payload while the endpoint remains reachable for diagnosis.
+    """
+    return _health_snapshot(db)
+
+
+def _env_enabled(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@app.get("/api/v1/dash/system-status")
+def dash_system_status(
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Authenticated operational truth for the product UI.
+
+    Unlike public ``/health`` this includes tenant queue state and safe
+    configuration metadata. Secrets are never returned.
+    """
+    snapshot = _health_snapshot(db)
+    pending = (
+        db.scalar(
+            select(func.count(storage.ScrapeRequest.id)).where(
+                storage.ScrapeRequest.tenant_id == user.tenant_id,
+                storage.ScrapeRequest.status == "pending",
+            )
+        )
+        or 0
+    )
+    running = (
+        db.scalar(
+            select(func.count(storage.ScrapeRequest.id)).where(
+                storage.ScrapeRequest.tenant_id == user.tenant_id,
+                storage.ScrapeRequest.status == "running",
+            )
+        )
+        or 0
+    )
+    oldest_pending = db.scalar(
+        select(storage.ScrapeRequest)
+        .where(
+            storage.ScrapeRequest.tenant_id == user.tenant_id,
+            storage.ScrapeRequest.status == "pending",
+        )
+        .order_by(storage.ScrapeRequest.requested_at, storage.ScrapeRequest.id)
+        .limit(1)
+    )
+    decodo_sites = sorted(
+        site.strip()
+        for site in (os.environ.get("DECODO_SITES") or "").split(",")
+        if site.strip()
+    )
+    decodo_ports = [
+        port.strip()
+        for port in (os.environ.get("DECODO_PORTS") or "").split(",")
+        if port.strip()
+    ]
+    return {
+        **snapshot.model_dump(mode="json"),
+        "queue": {
+            "pending": pending,
+            "running": running,
+            "oldest_pending_at": (
+                oldest_pending.requested_at.isoformat() if oldest_pending else None
+            ),
+        },
+        "proxy": {
+            "provider": "decodo",
+            "configured": bool(
+                os.environ.get("DECODO_USERNAME")
+                and os.environ.get("DECODO_PASSWORD")
+                and decodo_sites
+            ),
+            "sites": decodo_sites,
+            "pool_size": len(decodo_ports),
+        },
+        "digests": {
+            # Systemd timer truth is mirrored through explicit deployment env,
+            # avoiding privileged `systemctl` calls from the web process.
+            "daily": {
+                "enabled": _env_enabled("DAILY_DIGEST_ENABLED", False),
+                "schedule_baku": os.environ.get(
+                    "DAILY_DIGEST_SCHEDULE_BAKU", "09:00"
+                ),
+            },
+            "weekly": {
+                "enabled": _env_enabled("WEEKLY_DIGEST_ENABLED", True),
+                "schedule_baku": os.environ.get(
+                    "WEEKLY_DIGEST_SCHEDULE_BAKU", "Monday 10:00"
+                ),
+            },
+        },
+    }
 
 
 # ─── Auth endpoints (frontend) ───────────────────────────────────────────────
@@ -1177,6 +1309,63 @@ def dash_scrape_requests(
     return out
 
 
+@app.get("/api/v1/dash/scrape/requests/history")
+def dash_scrape_requests_history(
+    limit: int = 25,
+    offset: int = 0,
+    status: str | None = None,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Paginated manual scan request history without the dashboard's short cap."""
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    valid_statuses = {"pending", "running", "ok", "degraded", "failed"}
+    if status and status not in valid_statuses:
+        raise HTTPException(422, "Unknown request status")
+    stmt = select(storage.ScrapeRequest).where(
+        storage.ScrapeRequest.tenant_id == user.tenant_id
+    )
+    if status:
+        stmt = stmt.where(storage.ScrapeRequest.status == status)
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    reqs = db.scalars(
+        stmt.order_by(desc(storage.ScrapeRequest.id)).offset(offset).limit(limit)
+    ).all()
+    run_ids = [row.run_id for row in reqs if row.run_id]
+    runs = (
+        db.scalars(
+            select(storage.Run).where(
+                storage.Run.tenant_id == user.tenant_id,
+                storage.Run.id.in_(run_ids),
+            )
+        ).all()
+        if run_ids
+        else []
+    )
+    runs_map = {run.id: run for run in runs}
+    items = []
+    for row in reqs:
+        run = runs_map.get(row.run_id) if row.run_id else None
+        items.append(
+            {
+                "id": row.id,
+                "mode": row.mode,
+                "category_id": row.category_id,
+                "sites": row.sites,
+                "status": row.status,
+                "requested_at": row.requested_at.isoformat() if row.requested_at else None,
+                "started_at": row.started_at.isoformat() if row.started_at else None,
+                "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+                "run_id": row.run_id,
+                "error_message": row.error_message,
+                "products_scraped": run.products_scraped if run else None,
+                "products_per_site": run.products_per_site if run else None,
+            }
+        )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
 # ─── Internal endpoints для server-side scrape watcher ──────────────────────
 
 
@@ -1270,6 +1459,16 @@ def dash_integrations(user: storage.TenantUser = Depends(require_user)):
     """
     import os
 
+    decodo_sites = sorted(
+        site.strip()
+        for site in (os.environ.get("DECODO_SITES") or "").split(",")
+        if site.strip()
+    )
+    decodo_ports = [
+        port.strip()
+        for port in (os.environ.get("DECODO_PORTS") or "").split(",")
+        if port.strip()
+    ]
     return {
         "smtp": bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_PASSWORD")),
         "smtp_from": os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER") or None,
@@ -1280,6 +1479,13 @@ def dash_integrations(user: storage.TenantUser = Depends(require_user)):
         "scraperapi_sites": (os.environ.get("SCRAPER_API_SITES") or "").split(",")
         if os.environ.get("SCRAPER_API_SITES")
         else [],
+        "decodo": bool(
+            os.environ.get("DECODO_USERNAME")
+            and os.environ.get("DECODO_PASSWORD")
+            and decodo_sites
+        ),
+        "decodo_sites": decodo_sites,
+        "decodo_pool_size": len(decodo_ports),
     }
 
 
@@ -2185,6 +2391,104 @@ def dash_alerts(
     ]
 
 
+@app.get("/api/v1/dash/alerts/page")
+def dash_alerts_page(
+    limit: int = 50,
+    offset: int = 0,
+    view: str = "inbox",
+    severity: str | None = None,
+    rule_type: str | None = None,
+    hours: int = 168,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Server-filtered alert page; never materializes the full inbox in UI."""
+    from src._time import utcnow as _now
+
+    if view not in {"inbox", "snoozed", "read"}:
+        raise HTTPException(422, "Unknown alert view")
+    if severity and severity not in {"info", "warning", "critical"}:
+        raise HTTPException(422, "Unknown severity")
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    hours = max(0, min(hours, 24 * 365 * 5))
+    now = _now()
+    filters = [storage.AlertEvent.tenant_id == user.tenant_id]
+    if view == "inbox":
+        filters.extend(
+            [
+                storage.AlertEvent.is_read.is_(False),
+                (storage.AlertEvent.snoozed_until.is_(None))
+                | (storage.AlertEvent.snoozed_until <= now),
+            ]
+        )
+    elif view == "snoozed":
+        filters.extend(
+            [
+                storage.AlertEvent.is_read.is_(False),
+                storage.AlertEvent.snoozed_until.is_not(None),
+                storage.AlertEvent.snoozed_until > now,
+            ]
+        )
+    else:
+        filters.append(storage.AlertEvent.is_read.is_(True))
+    if severity:
+        filters.append(storage.AlertEvent.severity == severity)
+    if rule_type:
+        filters.append(storage.AlertEvent.rule_type == rule_type)
+    if hours > 0:
+        filters.append(storage.AlertEvent.created_at >= now - timedelta(hours=hours))
+
+    total = (
+        db.scalar(
+            select(func.count())
+            .select_from(storage.AlertEvent)
+            .where(*filters)
+        )
+        or 0
+    )
+    events = db.scalars(
+        select(storage.AlertEvent)
+        .where(*filters)
+        .order_by(desc(storage.AlertEvent.created_at), desc(storage.AlertEvent.id))
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    rule_types = db.scalars(
+        select(storage.AlertEvent.rule_type)
+        .where(
+            storage.AlertEvent.tenant_id == user.tenant_id,
+            storage.AlertEvent.rule_type.is_not(None),
+        )
+        .distinct()
+        .order_by(storage.AlertEvent.rule_type)
+    ).all()
+
+    def event_out(event: storage.AlertEvent) -> dict:
+        return {
+            "id": event.id,
+            "rule_type": event.rule_type,
+            "severity": event.severity,
+            "title": event.title,
+            "detail": event.detail,
+            "payload": event.payload,
+            "created_at": event.created_at.isoformat(),
+            "is_read": bool(event.is_read),
+            "read_at": event.read_at.isoformat() if event.read_at else None,
+            "snoozed_until": (
+                event.snoozed_until.isoformat() if event.snoozed_until else None
+            ),
+        }
+
+    return {
+        "items": [event_out(event) for event in events],
+        "total": int(total),
+        "limit": limit,
+        "offset": offset,
+        "rule_types": list(rule_types),
+    }
+
+
 @app.get("/api/v1/dash/alerts/counts")
 def dash_alerts_counts(
     user: storage.TenantUser = Depends(require_user),
@@ -2454,7 +2758,9 @@ def dash_brand_share(
 
     if site is not None:
         _require_site(site)
-    rows = analytics.brand_share(db, top_n=top_n, site=site)
+    rows = analytics.brand_share(
+        db, top_n=top_n, site=site, tenant_id=user.tenant_id
+    )
     return [
         {
             "brand": r.brand,
@@ -2511,13 +2817,27 @@ def dash_category_comparison(
         locale = "ru"
 
     rows = analytics.category_comparison(db, client_site=client_site, tenant_id=user.tenant_id)
-    out: list[CategoryComparisonOut] = []
-    for r in rows:
-        label = _localized_category_label(
+    resolved_labels = [
+        _localized_category_label(
             label_ru=r.label_ru,
             label_az=r.label_az,
             locale=locale,
             fallback=r.category,
+        )
+        for r in rows
+    ]
+    label_counts: dict[str, int] = defaultdict(int)
+    for label in resolved_labels:
+        label_counts[label.casefold()] += 1
+    out: list[CategoryComparisonOut] = []
+    for r, resolved_label in zip(rows, resolved_labels):
+        # Repeated human labels (e.g. multiple independent "Растворы") are
+        # distinct source categories. Surface the stable slug only when needed
+        # so operators never act on an ambiguous row.
+        label = (
+            f"{resolved_label} · {r.category}"
+            if label_counts[resolved_label.casefold()] > 1
+            else resolved_label
         )
         out.append(
             CategoryComparisonOut(
@@ -2971,18 +3291,10 @@ def dash_products_summary(
         or 0
     )
 
-    total_brands = (
-        db.scalar(
-            select(func.count(func.distinct(storage.Product.brand))).where(
-                storage.Product.site == site,
-                storage.Product.tenant_id == user.tenant_id,
-                storage.Product.brand.is_not(None),
-            )
-        )
-        or 0
+    brand_rows = analytics.brand_share(
+        db, top_n=10_000, site=site, tenant_id=user.tenant_id
     )
-
-    brand_rows = analytics.brand_share(db, top_n=10_000, site=site)
+    total_brands = len(brand_rows)
     exclusive_brands = sum(1 for r in brand_rows if r.exclusive_to == site)
 
     pids = db.scalars(
@@ -2995,15 +3307,11 @@ def dash_products_summary(
     on_sale = sum(1 for s in snaps_by_pid.values() if s.is_on_sale)
     on_sale_pct = round(on_sale / total_products * 100, 1) if total_products else 0.0
 
-    last_run = db.scalar(
-        select(storage.Run)
-        .where(
-            storage.Run.status == "ok",
-            storage.Run.tenant_id == user.tenant_id,
-        )
-        .order_by(desc(storage.Run.id))
-        .limit(1)
-    )
+    # A global latest run is not evidence that this particular site was
+    # scanned.  Older multi-site producers also wrote zero placeholders for
+    # sites outside their real scope, so require a positive per-site result for
+    # the catalog timestamp shown on a site page.
+    last_run = _latest_successful_site_run(db, user.tenant_id, site)
 
     return {
         "total_products": total_products,
@@ -3033,6 +3341,88 @@ def dash_runs(
     return [_run_row_out(r) for r in runs]
 
 
+@app.get("/api/v1/dash/runs/history")
+def dash_runs_history(
+    limit: int = 25,
+    offset: int = 0,
+    status: str | None = None,
+    site: str | None = None,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Searchable, paginated Run history for the operations center."""
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    if status and status not in {"running", "ok", "degraded", "failed"}:
+        raise HTTPException(422, "Unknown run status")
+    if site:
+        _require_site(site)
+    stmt = select(storage.Run).where(storage.Run.tenant_id == user.tenant_id)
+    if status:
+        stmt = stmt.where(storage.Run.status == status)
+    rows = db.scalars(stmt.order_by(desc(storage.Run.id))).all()
+    if site:
+        rows = [run for run in rows if _run_site_was_requested(run, site)]
+    total = len(rows)
+    page = rows[offset : offset + limit]
+    return {
+        "items": [_run_row_out(run) for run in page],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/v1/dash/audit-log")
+def dash_audit_log(
+    limit: int = 50,
+    offset: int = 0,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    if user.role not in {"admin", "owner"}:
+        raise HTTPException(403, "Admin role required")
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    base = select(storage.AuditLog).where(
+        storage.AuditLog.tenant_id == user.tenant_id
+    )
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+    rows = db.scalars(
+        base.order_by(desc(storage.AuditLog.id)).offset(offset).limit(limit)
+    ).all()
+    actor_ids = {row.actor_user_id for row in rows if row.actor_user_id is not None}
+    actors = (
+        db.scalars(
+            select(storage.TenantUser).where(
+                storage.TenantUser.tenant_id == user.tenant_id,
+                storage.TenantUser.id.in_(actor_ids),
+            )
+        ).all()
+        if actor_ids
+        else []
+    )
+    actor_emails = {actor.id: actor.email for actor in actors}
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "actor_user_id": row.actor_user_id,
+                "actor_email": actor_emails.get(row.actor_user_id),
+                "action": row.action,
+                "resource": row.resource,
+                "response_status": row.response_status,
+                "request_id": row.request_id,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in rows
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 def _run_row_out(r: storage.Run) -> dict:
     return {
         "id": r.id,
@@ -3047,6 +3437,82 @@ def _run_row_out(r: storage.Run) -> dict:
     }
 
 
+def _csv_sites(value: str | None) -> set[str]:
+    return {part.strip() for part in (value or "").split(",") if part.strip()}
+
+
+def _run_site_was_requested(run: storage.Run, site: str) -> bool:
+    """Whether a Run contains credible evidence that ``site`` was in scope.
+
+    A mere ``products_per_site={site: 0}`` is deliberately insufficient:
+    legacy producers populated zero placeholders for sites they never ran.
+    Modern quality envelopes carry expected/completed/failed work counters,
+    while successful legacy producers have a positive count or
+    ``sites_completed`` marker.
+    """
+    count = (run.products_per_site or {}).get(site)
+    if isinstance(count, (int, float)) and count > 0:
+        return True
+    quality_site = (((run.run_quality or {}).get("sites") or {}).get(site) or {})
+    if quality_site:
+        # A quality envelope is the authoritative scope contract. In run #446
+        # legacy orchestration wrote all three names to `sites_completed`, but
+        # aptekonline/aloe explicitly had items_expected=0 and
+        # no_items_requested: they were never scanned.
+        return any(
+            (quality_site.get(key) or 0) > 0
+            for key in ("items_expected", "items_completed", "items_failed", "products")
+        )
+    # Very old runs had no quality envelope. Preserve their explicit completion
+    # marker only when no contradictory zero placeholder was recorded.
+    return site in _csv_sites(run.sites_completed) and site not in (
+        run.products_per_site or {}
+    )
+
+
+def _run_site_succeeded(run: storage.Run, site: str) -> bool:
+    count = (run.products_per_site or {}).get(site)
+    quality_site = (((run.run_quality or {}).get("sites") or {}).get(site) or {})
+    return bool(
+        run.status == "ok"
+        and isinstance(count, (int, float))
+        and count > 0
+        and quality_site.get("status", "ok") == "ok"
+    )
+
+
+def _site_run_history(
+    db: Session,
+    tenant_id: int,
+    site: str,
+    *,
+    limit: int = 1000,
+) -> tuple[storage.Run | None, storage.Run | None]:
+    """Return ``(latest_attempt, latest_success)`` for one site."""
+    rows = db.scalars(
+        select(storage.Run)
+        .where(storage.Run.tenant_id == tenant_id)
+        .order_by(desc(storage.Run.id))
+        .limit(limit)
+    ).all()
+    latest_attempt: storage.Run | None = None
+    latest_success: storage.Run | None = None
+    for run in rows:
+        if not _run_site_was_requested(run, site):
+            continue
+        latest_attempt = latest_attempt or run
+        if _run_site_succeeded(run, site):
+            latest_success = run
+            break
+    return latest_attempt, latest_success
+
+
+def _latest_successful_site_run(
+    db: Session, tenant_id: int, site: str
+) -> storage.Run | None:
+    return _site_run_history(db, tenant_id, site)[1]
+
+
 @app.get("/api/v1/dash/runs/latest-by-site")
 def dash_runs_latest_by_site(
     user: storage.TenantUser = Depends(require_user),
@@ -3058,27 +3524,23 @@ def dash_runs_latest_by_site(
     aptekonline can be pushed out of that short list by intraday pharmonline
     and aloe runs, so this endpoint returns one row per site.
     """
-    runs = db.scalars(
-        select(storage.Run)
-        .where(storage.Run.tenant_id == user.tenant_id)
-        .order_by(desc(storage.Run.id))
-        .limit(500)
-    ).all()
-    latest: dict[str, storage.Run] = {}
-    for run in runs:
-        per_site = run.products_per_site or {}
-        for site in _VALID_SITES:
-            if site in latest:
-                continue
-            if site in per_site:
-                latest[site] = run
-        if len(latest) == len(_VALID_SITES):
-            break
-
-    return [
-        {"site": site, "run": _run_row_out(latest[site]) if site in latest else None}
-        for site in _VALID_SITES
-    ]
+    out = []
+    for site in _VALID_SITES:
+        latest_attempt, latest_success = _site_run_history(db, user.tenant_id, site)
+        out.append(
+            {
+                "site": site,
+                # Backward-compatible `run` is now the latest trustworthy
+                # positive result used for site freshness/count presentation.
+                "run": _run_row_out(latest_success) if latest_success else None,
+                # Failures are not hidden: the UI can show a separate warning
+                # when a newer credible attempt failed or degraded.
+                "latest_attempt": (
+                    _run_row_out(latest_attempt) if latest_attempt else None
+                ),
+            }
+        )
+    return out
 
 
 @app.get("/api/v1/dash/runs/{run_id}/breakdown")
@@ -3138,6 +3600,102 @@ def dash_categories_list(
         }
         for c in cats
     ]
+
+
+@app.get("/api/v1/dash/categories/page")
+def dash_categories_page(
+    limit: int = 50,
+    offset: int = 0,
+    search: str | None = None,
+    site: str | None = None,
+    active_only: bool = False,
+    coverage: str | None = None,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Server-side category page plus unfiltered coverage summary."""
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    if site:
+        _require_site(site)
+    if coverage and coverage not in {"cross2", "cross3"}:
+        raise HTTPException(422, "Unknown coverage filter")
+    filters = []
+    if search:
+        token = f"%{search.strip()}%"
+        filters.append(
+            or_(
+                storage.Category.key.ilike(token),
+                storage.Category.label_ru.ilike(token),
+                storage.Category.label_az.ilike(token),
+            )
+        )
+    slug_cols = {
+        "pharmonline": storage.Category.pharmonline_slug,
+        "aptekonline": storage.Category.aptekonline_slug,
+        "aloe": storage.Category.aloe_slug,
+    }
+    if site:
+        filters.append(slug_cols[site].is_not(None))
+    if active_only:
+        filters.append(storage.Category.is_active.is_(True))
+    if coverage == "cross2":
+        filters.extend(
+            [
+                storage.Category.pharmonline_slug.is_not(None),
+                storage.Category.aptekonline_slug.is_not(None),
+            ]
+        )
+    elif coverage == "cross3":
+        filters.extend(column.is_not(None) for column in slug_cols.values())
+
+    total = (
+        db.scalar(select(func.count(storage.Category.id)).where(*filters)) or 0
+    )
+    rows = db.scalars(
+        select(storage.Category)
+        .where(*filters)
+        .order_by(storage.Category.id)
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    all_rows = db.scalars(select(storage.Category)).all()
+
+    def row_out(category: storage.Category) -> dict:
+        return {
+            "id": category.id,
+            "key": category.key,
+            "label_ru": category.label_ru,
+            "label_az": category.label_az,
+            "pharmonline_slug": category.pharmonline_slug,
+            "aptekonline_slug": category.aptekonline_slug,
+            "aloe_slug": category.aloe_slug,
+            "is_active": category.is_active,
+        }
+
+    return {
+        "items": [row_out(row) for row in rows],
+        "total": int(total),
+        "limit": limit,
+        "offset": offset,
+        "stats": {
+            "total": len(all_rows),
+            "active": sum(bool(row.is_active) for row in all_rows),
+            "cross2": sum(
+                bool(row.pharmonline_slug and row.aptekonline_slug) for row in all_rows
+            ),
+            "cross3": sum(
+                bool(
+                    row.pharmonline_slug and row.aptekonline_slug and row.aloe_slug
+                )
+                for row in all_rows
+            ),
+            **{
+                name: sum(bool(getattr(row, f"{name}_slug")) for row in all_rows)
+                for name in _VALID_SITES
+            },
+        },
+    }
 
 
 @app.post("/api/v1/dash/categories", response_model=CategoryOut, status_code=201)
@@ -3494,8 +4052,8 @@ def dash_match_suggestions(
             storage.Match.confidence < confidence_max,
             *([storage.Match.needs_review.is_(True)] if only_needs_review else []),
         )
-        .order_by(storage.Match.confidence.asc())
-        .limit(limit)
+        .order_by(storage.Match.needs_review.desc(), storage.Match.confidence.asc())
+        .limit(max(500, min(limit * 5, 2000)))
     ).all()
 
     all_pids = [p.id for m in matches for p in m.products]
@@ -3537,7 +4095,17 @@ def dash_match_suggestions(
                 products=prods,
             )
         )
-    return out
+    # Human effort goes first to explicitly flagged and financially risky
+    # clusters. Confidence remains the deterministic tie-breaker.
+    out.sort(
+        key=lambda item: (
+            not item.needs_review,
+            -(item.spread_pct or 0.0),
+            item.confidence,
+            item.match_id,
+        )
+    )
+    return out[: max(1, min(limit, 200))]
 
 
 @app.post("/api/v1/dash/matches/{match_id}/confirm", status_code=204)
@@ -3722,7 +4290,6 @@ def dash_match_alternatives(
 
 # ── Phase 4.1+4.3+4.6 (2026-05-27) — Pricing settings + cost CSV import ─────
 
-
 class PricingConfigOut(BaseModel):
     raise_threshold_pct: float
     undercut_threshold_pct: float
@@ -3765,6 +4332,7 @@ def dash_pricing_update(
     db: Session = Depends(get_db),
 ):
     """Update pricing thresholds. Invalidates ROI cache so next request re-computes."""
+    _require_admin(user)
     cfg = storage.load_pricing_config(db, tenant_id=user.tenant_id)
     cfg.raise_threshold_pct = payload.raise_threshold_pct
     cfg.undercut_threshold_pct = payload.undercut_threshold_pct
@@ -3789,10 +4357,153 @@ def dash_pricing_update(
 
 
 class CostImportResult(BaseModel):
+    batch_id: int | None = None
     rows_processed: int
     rows_imported: int
     rows_skipped: int
     errors: list[str] = Field(default_factory=list)
+
+
+class CostImportPreviewResult(CostImportResult):
+    changes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+def _build_cost_import_plan(
+    raw: bytes,
+    *,
+    tenant_id: int,
+    db: Session,
+) -> dict[str, Any]:
+    """Parse and validate a cost CSV without mutating storage."""
+    import csv
+    import io
+
+    try:
+        csv_text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "File is not UTF-8 encoded")
+    reader = csv.DictReader(io.StringIO(csv_text))
+    required_cols = {"sku", "supplier_name", "purchase_price"}
+    actual_cols = set(reader.fieldnames or [])
+    missing = required_cols - actual_cols
+    if missing:
+        raise HTTPException(
+            400,
+            f"Missing required columns: {sorted(missing)}. Got: {sorted(actual_cols)}",
+        )
+    products_by_sku = {
+        product.external_id: product
+        for product in db.scalars(
+            select(storage.Product).where(
+                storage.Product.tenant_id == tenant_id,
+                storage.Product.site == "pharmonline",
+            )
+        ).all()
+    }
+    existing_prices = db.scalars(
+        select(storage.SupplierPrice).where(
+            storage.SupplierPrice.product_id.in_(
+                [product.id for product in products_by_sku.values()]
+            )
+        )
+    ).all()
+    existing_by_key = {
+        (row.product_id, row.supplier_name): row for row in existing_prices
+    }
+    processed = skipped = 0
+    errors: list[str] = []
+    changes: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for line_num, row in enumerate(reader, start=2):
+        processed += 1
+        sku = (row.get("sku") or "").strip()
+        if not sku:
+            errors.append(f"line {line_num}: empty sku")
+            skipped += 1
+            continue
+        product = products_by_sku.get(sku)
+        if product is None:
+            errors.append(f"line {line_num}: sku={sku!r} not found in products")
+            skipped += 1
+            continue
+        try:
+            price = float((row.get("purchase_price") or "").strip())
+        except (ValueError, TypeError):
+            errors.append(
+                f"line {line_num}: invalid purchase_price {row.get('purchase_price')!r}"
+            )
+            skipped += 1
+            continue
+        if price <= 0:
+            errors.append(f"line {line_num}: purchase_price must be > 0")
+            skipped += 1
+            continue
+        supplier = (row.get("supplier_name") or "default").strip() or "default"
+        currency = (row.get("currency") or "AZN").strip().upper() or "AZN"
+        key = (product.id, supplier)
+        if key in seen:
+            errors.append(
+                f"line {line_num}: duplicate sku={sku!r}, supplier={supplier!r}"
+            )
+            skipped += 1
+            continue
+        seen.add(key)
+        existing = existing_by_key.get(key)
+        before = (
+            {
+                "purchase_price": existing.purchase_price,
+                "currency": existing.currency,
+                "source": existing.source,
+                "sku": existing.sku,
+            }
+            if existing
+            else None
+        )
+        changes.append(
+            {
+                "line": line_num,
+                "product_id": product.id,
+                "product_name": product.name,
+                "sku": sku,
+                "supplier_name": supplier,
+                "before": before,
+                "after": {
+                    "purchase_price": price,
+                    "currency": currency,
+                    "source": "dashboard_csv",
+                    "sku": sku,
+                },
+            }
+        )
+    return {
+        "rows_processed": processed,
+        "rows_imported": len(changes),
+        "rows_skipped": skipped,
+        "errors": errors,
+        "changes": changes,
+    }
+
+
+@app.post(
+    "/api/v1/dash/settings/costs/preview",
+    response_model=CostImportPreviewResult,
+)
+async def dash_cost_csv_preview(
+    file: UploadFile = File(...),
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user)
+    raw = await file.read()
+    plan = _build_cost_import_plan(raw, tenant_id=user.tenant_id, db=db)
+    return CostImportPreviewResult(
+        batch_id=None,
+        rows_processed=plan["rows_processed"],
+        rows_imported=plan["rows_imported"],
+        rows_skipped=plan["rows_skipped"],
+        errors=plan["errors"][:20],
+        changes=plan["changes"][:20],
+    )
 
 
 @app.post("/api/v1/dash/settings/costs/import", response_model=CostImportResult)
@@ -3812,108 +4523,179 @@ async def dash_cost_csv_import(
 
     Idempotent: existing (product_id, supplier) pair updated, others inserted.
     """
-    import csv
-    import io
-
+    _require_admin(user)
     raw = await file.read()
     try:
-        text = raw.decode("utf-8-sig")  # strip BOM
-    except UnicodeDecodeError:
-        raise HTTPException(400, "File is not UTF-8 encoded")
-    reader = csv.DictReader(io.StringIO(text))
-
-    required_cols = {"sku", "supplier_name", "purchase_price"}
-    actual_cols = set(reader.fieldnames or [])
-    missing = required_cols - actual_cols
-    if missing:
-        raise HTTPException(
-            400,
-            f"Missing required columns: {sorted(missing)}. Got: {sorted(actual_cols)}",
-        )
-
-    rows_processed = 0
-    rows_imported = 0
-    rows_skipped = 0
-    errors: list[str] = []
-
-    # Build sku → Product map for tenant (one query, not N+1).
-    products_by_sku: dict[str, storage.Product] = {
-        p.external_id: p
-        for p in db.scalars(
-            select(storage.Product).where(storage.Product.tenant_id == user.tenant_id)
-        ).all()
-    }
-
-    for line_num, row in enumerate(reader, start=2):  # line 1 = header
-        rows_processed += 1
-        sku = (row.get("sku") or "").strip()
-        if not sku:
-            errors.append(f"line {line_num}: empty sku")
-            rows_skipped += 1
-            continue
-        product = products_by_sku.get(sku)
-        if product is None:
-            errors.append(f"line {line_num}: sku={sku!r} not found in products")
-            rows_skipped += 1
-            continue
-        try:
-            price = float((row.get("purchase_price") or "").strip())
-        except (ValueError, TypeError):
-            errors.append(f"line {line_num}: invalid purchase_price {row.get('purchase_price')!r}")
-            rows_skipped += 1
-            continue
-        if price <= 0:
-            errors.append(f"line {line_num}: purchase_price must be > 0")
-            rows_skipped += 1
-            continue
-        supplier = (row.get("supplier_name") or "default").strip() or "default"
-        currency = (row.get("currency") or "AZN").strip() or "AZN"
-        # Upsert (product_id, supplier_name) row.
-        existing = db.scalar(
-            select(storage.SupplierPrice).where(
-                storage.SupplierPrice.product_id == product.id,
-                storage.SupplierPrice.supplier_name == supplier,
-            )
-        )
-        if existing:
-            existing.purchase_price = price
-            existing.currency = currency
-            existing.source = "dashboard_csv"
-            existing.updated_at = utcnow()
-        else:
-            db.add(
-                storage.SupplierPrice(
-                    product_id=product.id,
-                    sku=sku,
-                    supplier_name=supplier,
-                    purchase_price=price,
-                    currency=currency,
-                    source="dashboard_csv",
-                    updated_at=utcnow(),
+        with inv_mod.supplier_price_write_lock(db, user.tenant_id):
+            plan = _build_cost_import_plan(raw, tenant_id=user.tenant_id, db=db)
+            for change in plan["changes"]:
+                product = db.get(storage.Product, change["product_id"])
+                if product is None or product.tenant_id != user.tenant_id:
+                    raise HTTPException(409, "Product changed during import")
+                after = change["after"]
+                inv_mod.upsert_supplier_price(
+                    db,
+                    product=product,
+                    sku=after["sku"],
+                    name=product.name,
+                    supplier_name=change["supplier_name"],
+                    purchase_price=after["purchase_price"],
+                    currency=after["currency"],
+                    source=after["source"],
                 )
+            batch = storage.CostImportBatch(
+                tenant_id=user.tenant_id,
+                actor_user_id=user.id,
+                filename=(file.filename or "")[:255] or None,
+                rows_processed=plan["rows_processed"],
+                rows_imported=plan["rows_imported"],
+                rows_skipped=plan["rows_skipped"],
+                changes=plan["changes"],
             )
-        rows_imported += 1
-
-    db.commit()
-    # Drop ROI cache so margin-aware logic picks up new costs immediately.
-    db.query(storage.RoiActionsCache).filter(
-        storage.RoiActionsCache.tenant_id == user.tenant_id
-    ).delete()
-    db.commit()
+            db.add(batch)
+            db.flush()
+            # Costs, batch provenance and cache invalidation are one atomic
+            # transaction. Any failure rolls the entire import back.
+            db.query(storage.RoiActionsCache).filter(
+                storage.RoiActionsCache.tenant_id == user.tenant_id
+            ).delete()
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
     log.info(
         "cost_csv_imported",
         tenant_id=user.tenant_id,
         user_id=user.id,
-        rows_imported=rows_imported,
-        rows_skipped=rows_skipped,
+        rows_imported=plan["rows_imported"],
+        rows_skipped=plan["rows_skipped"],
     )
     # Cap errors list to first 20 for response size sanity.
     return CostImportResult(
-        rows_processed=rows_processed,
-        rows_imported=rows_imported,
-        rows_skipped=rows_skipped,
-        errors=errors[:20],
+        batch_id=batch.id,
+        rows_processed=plan["rows_processed"],
+        rows_imported=plan["rows_imported"],
+        rows_skipped=plan["rows_skipped"],
+        errors=plan["errors"][:20],
     )
+
+
+@app.get("/api/v1/dash/settings/costs/imports")
+def dash_cost_import_history(
+    limit: int = 20,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user)
+    limit = max(1, min(limit, 100))
+    rows = db.scalars(
+        select(storage.CostImportBatch)
+        .where(storage.CostImportBatch.tenant_id == user.tenant_id)
+        .order_by(desc(storage.CostImportBatch.id))
+        .limit(limit)
+    ).all()
+    latest_active_id = next(
+        (row.id for row in rows if row.rolled_back_at is None), None
+    )
+    return [
+        {
+            "id": row.id,
+            "filename": row.filename,
+            "rows_processed": row.rows_processed,
+            "rows_imported": row.rows_imported,
+            "rows_skipped": row.rows_skipped,
+            "created_at": row.created_at.isoformat(),
+            "rolled_back_at": (
+                row.rolled_back_at.isoformat() if row.rolled_back_at else None
+            ),
+            "can_rollback": row.id == latest_active_id,
+        }
+        for row in rows
+    ]
+
+
+@app.post("/api/v1/dash/settings/costs/imports/{batch_id}/rollback")
+def dash_cost_import_rollback(
+    batch_id: int,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user)
+    try:
+        with inv_mod.supplier_price_write_lock(db, user.tenant_id):
+            batch = db.scalar(
+                select(storage.CostImportBatch)
+                .where(
+                    storage.CostImportBatch.id == batch_id,
+                    storage.CostImportBatch.tenant_id == user.tenant_id,
+                )
+                .with_for_update()
+            )
+            if not batch:
+                raise HTTPException(404, "Import batch not found")
+            if batch.rolled_back_at is not None:
+                raise HTTPException(409, "Import batch already rolled back")
+            newer = db.scalar(
+                select(storage.CostImportBatch.id)
+                .where(
+                    storage.CostImportBatch.tenant_id == user.tenant_id,
+                    storage.CostImportBatch.id > batch.id,
+                    storage.CostImportBatch.rolled_back_at.is_(None),
+                )
+                .limit(1)
+            )
+            if newer is not None:
+                raise HTTPException(409, "Rollback newer imports first")
+            changes = batch.changes or []
+            current_rows: dict[tuple[int, str], storage.SupplierPrice] = {}
+            for change in changes:
+                key = (int(change["product_id"]), str(change["supplier_name"]))
+                current = db.scalar(
+                    select(storage.SupplierPrice)
+                    .where(
+                        storage.SupplierPrice.product_id == key[0],
+                        storage.SupplierPrice.supplier_name == key[1],
+                    )
+                    .with_for_update()
+                )
+                after = change["after"]
+                if (
+                    current is None
+                    or abs(current.purchase_price - float(after["purchase_price"])) > 0.000001
+                    or current.currency != after["currency"]
+                    or current.source != after["source"]
+                    or current.sku != after["sku"]
+                ):
+                    raise HTTPException(
+                        409,
+                        f"Cost changed after import for product={key[0]} supplier={key[1]!r}",
+                    )
+                current_rows[key] = current
+            for change in changes:
+                key = (int(change["product_id"]), str(change["supplier_name"]))
+                current = current_rows[key]
+                before = change.get("before")
+                if before is None:
+                    db.delete(current)
+                    continue
+                current.purchase_price = before["purchase_price"]
+                current.currency = before["currency"]
+                current.source = before["source"]
+                current.sku = before.get("sku")
+                current.updated_at = utcnow()
+            batch.rolled_back_at = utcnow()
+            batch.rolled_back_by_user_id = user.id
+            db.query(storage.RoiActionsCache).filter(
+                storage.RoiActionsCache.tenant_id == user.tenant_id
+            ).delete()
+            db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    return {"ok": True, "batch_id": batch.id, "rows_rolled_back": len(changes)}
 
 
 # ─── Manual aloe-matcher endpoints ───────────────────────────────────────────
@@ -4743,27 +5525,40 @@ def push_prices(
     db: Session = Depends(get_db),
 ):
     from sqlalchemy import delete as _del
-
-    db.execute(_del(storage.SupplierPrice).where(storage.SupplierPrice.source == source))
+    tenant_id = 1  # Legacy shared API key belongs to the default tenant.
     matched = 0
-    for item in items:
-        if item.purchase_price <= 0:
-            continue
-        product = inv_mod._find_product_by_sku_or_name(db, item.sku, item.name)
-        if product:
-            matched += 1
-        db.add(
-            storage.SupplierPrice(
-                product_id=product.id if product else None,
-                canonical_id=product.canonical_id if product else None,
-                sku=item.sku,
-                name=item.name or (product.name if product else None),
-                supplier_name=item.supplier_name,
-                purchase_price=item.purchase_price,
-                currency=item.currency,
-                source=source,
-                updated_at=utcnow(),
+    try:
+        with inv_mod.supplier_price_write_lock(db, tenant_id):
+            owned_product_ids = select(storage.Product.id).where(
+                storage.Product.tenant_id == tenant_id
             )
-        )
-    db.commit()
+            db.execute(
+                _del(storage.SupplierPrice).where(
+                    storage.SupplierPrice.source == source,
+                    (storage.SupplierPrice.product_id.is_(None))
+                    | (storage.SupplierPrice.product_id.in_(owned_product_ids)),
+                )
+            )
+            for item in items:
+                if item.purchase_price <= 0:
+                    continue
+                product = inv_mod._find_product_by_sku_or_name(
+                    db, item.sku, item.name, tenant_id=tenant_id
+                )
+                if product:
+                    matched += 1
+                inv_mod.upsert_supplier_price(
+                    db,
+                    product=product,
+                    sku=item.sku,
+                    name=item.name,
+                    supplier_name=item.supplier_name,
+                    purchase_price=item.purchase_price,
+                    currency=item.currency,
+                    source=source,
+                )
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {"received": len(items), "matched_to_product": matched}

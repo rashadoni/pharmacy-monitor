@@ -14,6 +14,7 @@ import { useRouter } from "@/i18n/navigation";
 import { choiceParam, integerParam, queryWithPatch } from "@/lib/filter-query";
 
 const CATEGORY_SITES = ["pharmonline", "aptekonline", "aloe"] as const;
+const CATEGORY_PAGE_SIZE = 50;
 type CategorySite = (typeof CATEGORY_SITES)[number];
 
 /**
@@ -114,6 +115,7 @@ export default function CategoriesPage() {
     ? CATEGORY_SITES.find((candidate) => candidate !== siteA) ?? "aptekonline"
     : requestedSiteB;
   const minOverlap = integerParam(parsedParams, "overlap", 5, { min: 2, max: 50 });
+  const offset = integerParam(parsedParams, "offset", 0);
   const [showAdd, setShowAdd] = useState(false);
   const [editing, setEditing] = useState<CategoryRow | null>(null);
   const queryClient = useQueryClient();
@@ -122,40 +124,34 @@ export default function CategoriesPage() {
     patch: Record<string, string | number | boolean | null>,
     history: "push" | "replace" = "push",
   ) {
-    const query = queryWithPatch(queryRef.current, patch);
+    const normalizedPatch = Object.prototype.hasOwnProperty.call(patch, "offset")
+      ? patch
+      : { ...patch, offset: null };
+    const query = queryWithPatch(queryRef.current, normalizedPatch);
     queryRef.current = query;
     const href = query ? `/categories?${query}` : "/categories";
     router[history](href, { scroll: false });
   }
 
   const { data, isLoading, isError, error, refetch } = useQuery({
-    queryKey: ["categories"],
-    queryFn: api.categories,
+    queryKey: ["categories", search, siteFilter, activeOnly, crossFilter, offset],
+    queryFn: () => api.categoriesPage({
+      search: search || undefined,
+      site: siteFilter || undefined,
+      active_only: activeOnly,
+      coverage: crossFilter || undefined,
+      offset,
+      limit: CATEGORY_PAGE_SIZE,
+    }),
   });
 
-  const filtered = (data ?? []).filter((c) => {
-    if (search && !`${c.label_ru} ${c.label_az ?? ""} ${c.key}`.toLowerCase().includes(search.toLowerCase())) {
-      return false;
-    }
-    if (siteFilter === "pharmonline" && !c.pharmonline_slug) return false;
-    if (siteFilter === "aptekonline" && !c.aptekonline_slug) return false;
-    if (siteFilter === "aloe" && !c.aloe_slug) return false;
-    if (activeOnly && !c.is_active) return false;
-    if (crossFilter === "cross2" && !(c.pharmonline_slug && c.aptekonline_slug)) return false;
-    if (crossFilter === "cross3" && !(c.pharmonline_slug && c.aptekonline_slug && c.aloe_slug)) return false;
-    return true;
-  });
+  const filtered = data?.items ?? [];
 
   // Категория «cross-2» — у неё есть pharm+apt-slug'и (двусторонний кейс).
   // «cross-3» — pharm+apt+aloe (полный треугольник, редко).
-  const stats = {
-    total: data?.length ?? 0,
-    active: data?.filter((c) => c.is_active).length ?? 0,
-    cross2: data?.filter((c) => c.pharmonline_slug && c.aptekonline_slug).length ?? 0,
-    cross3: data?.filter((c) => c.pharmonline_slug && c.aptekonline_slug && c.aloe_slug).length ?? 0,
-    pharmonline: data?.filter((c) => c.pharmonline_slug).length ?? 0,
-    aptekonline: data?.filter((c) => c.aptekonline_slug).length ?? 0,
-    aloe: data?.filter((c) => c.aloe_slug).length ?? 0,
+  const stats = data?.stats ?? {
+    total: 0, active: 0, cross2: 0, cross3: 0,
+    pharmonline: 0, aptekonline: 0, aloe: 0,
   };
 
   return (
@@ -318,6 +314,18 @@ export default function CategoriesPage() {
           </tbody>
         </table>
       </div>
+
+      {data && data.total > CATEGORY_PAGE_SIZE && (
+        <div className="flex items-center justify-between gap-3 text-sm">
+          <span className="text-muted-foreground">
+            {t("page_range", { from: offset + 1, to: Math.min(data.total, offset + CATEGORY_PAGE_SIZE), total: data.total })}
+          </span>
+          <div className="flex gap-2">
+            <button type="button" disabled={offset === 0} onClick={() => updateFilters({ offset: Math.max(0, offset - CATEGORY_PAGE_SIZE) || null })} className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9">{t("page_previous")}</button>
+            <button type="button" disabled={offset + CATEGORY_PAGE_SIZE >= data.total} onClick={() => updateFilters({ offset: offset + CATEGORY_PAGE_SIZE })} className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9">{t("page_next")}</button>
+          </div>
+        </div>
+      )}
 
       {filtered.length === 0 && !isLoading && !isError && (
         <div className="text-muted-foreground text-center py-4">

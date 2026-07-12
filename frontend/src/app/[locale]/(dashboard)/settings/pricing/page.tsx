@@ -4,9 +4,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
 import { useState, useEffect, useRef } from "react";
-import { Save, Upload, CheckCircle2, AlertCircle, ArrowLeft } from "lucide-react";
+import { Save, CheckCircle2, AlertCircle, ArrowLeft, RotateCcw } from "lucide-react";
 
-import { api, friendlyError, type PricingConfig, type CostImportResult } from "@/lib/api";
+import { api, friendlyError, type PricingConfig, type CostImportResult, type CostImportPreview } from "@/lib/api";
 import { formatClock } from "@/lib/utils";
 
 /**
@@ -49,12 +49,36 @@ export default function PricingSettingsPage() {
 
   // CSV upload state
   const fileRef = useRef<HTMLInputElement>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [previewResult, setPreviewResult] = useState<CostImportPreview | null>(null);
   const [importResult, setImportResult] = useState<CostImportResult | null>(null);
+  const historyQ = useQuery({ queryKey: ["cost-import-history"], queryFn: api.costImportHistory });
+  const previewM = useMutation({
+    mutationFn: (file: File) => api.costsCsvPreview(file),
+    onSuccess: (data) => {
+      setPreviewResult(data);
+      setImportResult(null);
+    },
+  });
   const importM = useMutation({
-    mutationFn: (file: File) => api.costsCsvImport(file),
+    mutationFn: () => {
+      if (!selectedFile) throw new Error("No file selected");
+      return api.costsCsvImport(selectedFile);
+    },
     onSuccess: (data) => {
       setImportResult(data);
+      setPreviewResult(null);
+      setSelectedFile(null);
+      if (fileRef.current) fileRef.current.value = "";
       qc.invalidateQueries({ queryKey: ["roi-actions"] });
+      qc.invalidateQueries({ queryKey: ["cost-import-history"] });
+    },
+  });
+  const rollbackM = useMutation({
+    mutationFn: (batchId: number) => api.costImportRollback(batchId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["roi-actions"] });
+      qc.invalidateQueries({ queryKey: ["cost-import-history"] });
     },
   });
 
@@ -168,19 +192,42 @@ PRODUCT-003,Vendor B,3.10,AZN,Diazolin 100mg N10`}
             ref={fileRef}
             onChange={(e) => {
               const f = e.target.files?.[0];
-              if (f) importM.mutate(f);
+              if (f) {
+                setSelectedFile(f);
+                previewM.mutate(f);
+              }
             }}
             className="min-h-11 max-w-full text-sm file:mr-3 file:min-h-11 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-primary file:text-primary-foreground hover:file:bg-primary/90 file:cursor-pointer md:min-h-9 md:file:min-h-9"
-            disabled={importM.isPending}
+            disabled={previewM.isPending || importM.isPending}
           />
+          {previewM.isPending && <span className="text-xs text-muted-foreground">{t("previewing")}</span>}
           {importM.isPending && <span className="text-xs text-muted-foreground">{t("uploading")}</span>}
         </div>
 
-        {importM.error && (
+        {(previewM.error || importM.error) && (
           <p className="text-sm text-destructive flex items-start gap-2">
             <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
-            {friendlyError(importM.error, locale)}
+            {friendlyError(previewM.error ?? importM.error, locale)}
           </p>
+        )}
+
+        {previewResult && (
+          <div className="space-y-3 rounded-md border border-warning/40 bg-warning/5 p-3">
+            <div>
+              <div className="text-sm font-medium">{t("preview_title")}</div>
+              <div className="text-xs text-muted-foreground">{t("preview_summary", { imported: previewResult.rows_imported, processed: previewResult.rows_processed, skipped: previewResult.rows_skipped })}</div>
+            </div>
+            <div className="max-h-64 overflow-auto rounded border border-border bg-background">
+              <table className="w-full min-w-[560px] text-xs">
+                <thead className="sticky top-0 bg-muted"><tr><th className="px-2 py-1.5 text-left">SKU</th><th className="px-2 py-1.5 text-left">{t("supplier")}</th><th className="px-2 py-1.5 text-right">{t("before")}</th><th className="px-2 py-1.5 text-right">{t("after")}</th></tr></thead>
+                <tbody>{previewResult.changes.map((change) => <tr key={`${change.product_id}-${change.supplier_name}`} className="border-t border-border"><td className="px-2 py-1.5 font-mono">{change.sku}</td><td className="px-2 py-1.5">{change.supplier_name}</td><td className="px-2 py-1.5 text-right tabular-nums">{change.before ? `${change.before.purchase_price.toFixed(2)} ${change.before.currency}` : t("new_row")}</td><td className="px-2 py-1.5 text-right font-medium tabular-nums">{change.after.purchase_price.toFixed(2)} {change.after.currency}</td></tr>)}</tbody>
+              </table>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" disabled={!selectedFile || importM.isPending || previewResult.rows_imported === 0} onClick={() => importM.mutate()} className="min-h-11 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40 md:min-h-9">{t("confirm_import")}</button>
+              <button type="button" onClick={() => { setPreviewResult(null); setSelectedFile(null); if (fileRef.current) fileRef.current.value = ""; }} className="min-h-11 rounded-md border border-border px-4 text-sm md:min-h-9">{tCommon("cancel")}</button>
+            </div>
+          </div>
         )}
 
         {importResult && (
@@ -209,6 +256,18 @@ PRODUCT-003,Vendor B,3.10,AZN,Diazolin 100mg N10`}
                 </ul>
               </details>
             )}
+          </div>
+        )}
+
+        {historyQ.data && historyQ.data.length > 0 && (
+          <div className="space-y-2 border-t border-border pt-4">
+            <h3 className="text-sm font-semibold">{t("history_title")}</h3>
+            {historyQ.data.map((batch) => (
+              <div key={batch.id} className="flex flex-col gap-2 rounded-md border border-border p-3 text-xs sm:flex-row sm:items-center sm:justify-between">
+                <div><div className="font-medium">#{batch.id} · {batch.filename ?? "CSV"}</div><div className="text-muted-foreground">{t("history_row", { imported: batch.rows_imported, skipped: batch.rows_skipped, time: new Date(batch.created_at).toLocaleString(locale) })}</div>{batch.rolled_back_at && <div className="text-warning">{t("rolled_back")}</div>}</div>
+                {batch.can_rollback && <button type="button" disabled={rollbackM.isPending} onClick={() => { if (confirm(t("rollback_confirm"))) rollbackM.mutate(batch.id); }} className="inline-flex min-h-11 items-center justify-center gap-1 rounded-md border border-destructive/40 px-3 text-destructive md:min-h-9"><RotateCcw className="h-3.5 w-3.5" />{t("rollback")}</button>}
+              </div>
+            ))}
           </div>
         )}
       </section>

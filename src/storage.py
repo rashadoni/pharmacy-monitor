@@ -132,6 +132,29 @@ class ScrapeRequest(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class AuditLog(Base):
+    """Immutable trail of successful dashboard mutations.
+
+    Payload bodies are intentionally not stored: pricing uploads, passwords and
+    integration secrets must never leak into an audit row.  The request path,
+    actor, method, response status and request id are enough to establish who
+    changed which resource and correlate with server logs.
+    """
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tenant_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(String(20))
+    resource: Mapped[str] = mapped_column(String(500), index=True)
+    response_status: Mapped[int] = mapped_column(Integer)
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
 class Product(Base):
     """Товар как он представлен на конкретном сайте."""
 
@@ -600,6 +623,11 @@ class SupplierPrice(Base):
     """
 
     __tablename__ = "supplier_prices"
+    __table_args__ = (
+        UniqueConstraint(
+            "product_id", "supplier_name", name="uq_supplier_price_product_supplier"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     product_id: Mapped[int | None] = mapped_column(
@@ -615,6 +643,28 @@ class SupplierPrice(Base):
     currency: Mapped[str] = mapped_column(String(10), default="AZN")
     source: Mapped[str] = mapped_column(String(50), default="manual_csv")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class CostImportBatch(Base):
+    """Reversible dashboard CSV import metadata and before/after values."""
+
+    __tablename__ = "cost_import_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tenant_users.id", ondelete="SET NULL"), nullable=True
+    )
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    rows_processed: Mapped[int] = mapped_column(Integer, default=0)
+    rows_imported: Mapped[int] = mapped_column(Integer, default=0)
+    rows_skipped: Mapped[int] = mapped_column(Integer, default=0)
+    changes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rolled_back_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tenant_users.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class SavedView(Base):

@@ -4,6 +4,7 @@ from datetime import timedelta
 from src._time import utcnow
 
 from src import analytics
+from src.brand_catalog import is_brand_blacklisted
 from src.storage import Match, PriceSnapshot, Product, Promo, Run
 
 
@@ -556,3 +557,7 @@ def test_category_comparison_skips_match_with_dead_client(db_session):
     db_session.commit()
 
     assert analytics.category_comparison(db_session) == []
+def test_brand_quality_rejects_pack_tokens_and_product_descriptors():
+    for value in ("0", "N120", "№20", "Şpris", "Qlükoza", "Elektron"):
+        assert is_brand_blacklisted(value), value
+    assert not is_brand_blacklisted("3M")

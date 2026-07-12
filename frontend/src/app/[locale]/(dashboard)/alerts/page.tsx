@@ -42,6 +42,7 @@ const SEVERITY_CONFIG = {
     label: "Info",
   },
 } as const;
+const PAGE_SIZE = 50;
 
 type TabView = "inbox" | "snoozed" | "read";
 
@@ -73,6 +74,7 @@ export default function AlertsPage() {
     allowed: [0, 24, 72, 168, 720],
   });
   const ruleTypeFilter = searchParams.get("type") ?? "";
+  const offset = integerParam(parsedParams, "offset", 0);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const filterSignature = `${view}|${severityFilter}|${hoursWindow}|${ruleTypeFilter}`;
   const previousFilterSignature = useRef(filterSignature);
@@ -84,26 +86,31 @@ export default function AlertsPage() {
   }, [filterSignature]);
 
   function updateFilters(patch: Record<string, string | number | null>) {
-    const query = queryWithPatch(queryRef.current, patch);
+    const query = queryWithPatch(
+      queryRef.current,
+      Object.prototype.hasOwnProperty.call(patch, "offset")
+        ? patch
+        : { ...patch, offset: null },
+    );
     queryRef.current = query;
     setSelected(new Set());
     router.push(query ? `/alerts?${query}` : "/alerts", { scroll: false });
   }
 
-  // Backend фильтры по view
-  const includeRead = view === "read";
-  const includeSnoozed = view === "snoozed";
-
-  const { data, isLoading, isError, error, refetch } = useQuery({
-    queryKey: ["alerts", severityFilter, includeRead, includeSnoozed],
+  const pageQ = useQuery({
+    queryKey: ["alerts-page", view, severityFilter, hoursWindow, ruleTypeFilter, offset],
     queryFn: () =>
-      api.alerts({
+      api.alertsPage({
+        view,
         severity: severityFilter || undefined,
-        limit: 500,
-        include_read: includeRead,
-        include_snoozed: includeSnoozed,
+        rule_type: ruleTypeFilter || undefined,
+        hours: hoursWindow,
+        limit: PAGE_SIZE,
+        offset,
       }),
   });
+  const data = pageQ.data?.items;
+  const { isLoading, isError, error, refetch } = pageQ;
 
   const countsQ = useQuery({
     queryKey: ["alerts-counts"],
@@ -141,17 +148,14 @@ export default function AlertsPage() {
     });
   }, [data, hoursWindow, ruleTypeFilter, view]);
 
-  const ruleTypes = useMemo(() => {
-    const types = new Set<string>();
-    data?.forEach((e) => e.rule_type && types.add(e.rule_type));
-    return Array.from(types).sort();
-  }, [data]);
+  const ruleTypes = pageQ.data?.rule_types ?? [];
 
   // Mutations
   const markAllReadMutation = useMutation({
     mutationFn: () => api.alertsMarkAllRead(),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts-page"] });
       queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
       setSelected(new Set());
     },
@@ -173,6 +177,7 @@ export default function AlertsPage() {
     }) => api.alertsBulk(ids, action),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts-page"] });
       queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
       setSelected(new Set());
     },
@@ -188,6 +193,7 @@ export default function AlertsPage() {
     }) => api.alertPatch(id, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts-page"] });
       queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
     },
     onError: (e) => alert(friendlyError(e, locale)),
@@ -271,7 +277,7 @@ export default function AlertsPage() {
         <Chip
           active={severityFilter === ""}
           onClick={() => updateFilters({ severity: null })}
-          label={`${t("filter_all")}${data ? ` (${data.length})` : ""}`}
+          label={`${t("filter_all")}${pageQ.data ? ` (${pageQ.data.total})` : ""}`}
         />
         <Chip
           active={severityFilter === "critical"}
@@ -465,6 +471,21 @@ export default function AlertsPage() {
           />
         ))}
       </div>
+      {pageQ.data && pageQ.data.total > PAGE_SIZE && (
+        <div className="flex items-center justify-between gap-3 border-t border-border pt-3 text-sm">
+          <span className="text-muted-foreground">
+            {t("page_range", {
+              from: offset + 1,
+              to: Math.min(pageQ.data.total, offset + PAGE_SIZE),
+              total: pageQ.data.total,
+            })}
+          </span>
+          <div className="flex gap-2">
+            <button type="button" disabled={offset === 0} onClick={() => updateFilters({ offset: Math.max(0, offset - PAGE_SIZE) || null })} className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9">{t("page_previous")}</button>
+            <button type="button" disabled={offset + PAGE_SIZE >= pageQ.data.total} onClick={() => updateFilters({ offset: offset + PAGE_SIZE })} className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9">{t("page_next")}</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

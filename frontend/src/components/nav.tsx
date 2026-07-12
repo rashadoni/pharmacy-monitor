@@ -5,6 +5,7 @@ import { useTranslations } from "next-intl";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   BarChart3,
+  Activity,
   Bell,
   Building2,
   Leaf,
@@ -25,6 +26,7 @@ import { LocaleSwitcher } from "@/components/locale-switcher";
 
 const NAV_OVERVIEW = [
   { href: "/overview", key: "overview", icon: TrendingUp },
+  { href: "/runs", key: "runs", icon: Activity },
   { href: "/comparison", key: "comparison", icon: Search },
   { href: "/category-comparison", key: "category_comparison", icon: ListTree },
   { href: "/analytics", key: "analytics", icon: BarChart3 },
@@ -168,6 +170,7 @@ export function BottomNav() {
     {
       label: t("section_overview"),
       items: [
+        { href: "/runs", label: t("runs"), icon: Activity },
         { href: "/category-comparison", label: t("category_comparison"), icon: ListTree },
         { href: "/analytics", label: t("analytics"), icon: BarChart3 },
       ],

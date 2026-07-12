@@ -19,13 +19,16 @@ CSV-форматы:
 from __future__ import annotations
 
 import csv
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from src._time import utcnow
 from pathlib import Path
 
 import structlog
 from rapidfuzz import fuzz, process
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
 from src.storage import (
@@ -38,6 +41,76 @@ from src.storage import (
 
 log = structlog.get_logger()
 
+_SUPPLIER_PRICE_LOCKS_GUARD = threading.Lock()
+_SUPPLIER_PRICE_LOCKS: dict[int, threading.Lock] = {}
+
+
+@contextmanager
+def supplier_price_write_lock(session: Session, tenant_id: int) -> Iterator[None]:
+    """Serialize every SupplierPrice writer for one tenant.
+
+    The process lock covers SQLite/tests and workers inside one process.  The
+    transaction-scoped PostgreSQL advisory lock covers API, dashboard and CLI
+    writers running in different server processes.
+    """
+    with _SUPPLIER_PRICE_LOCKS_GUARD:
+        local_lock = _SUPPLIER_PRICE_LOCKS.setdefault(tenant_id, threading.Lock())
+    local_lock.acquire()
+    try:
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": 7_120_260_000 + tenant_id},
+            )
+        yield
+    finally:
+        local_lock.release()
+
+
+def upsert_supplier_price(
+    session: Session,
+    *,
+    product: Product | None,
+    sku: str | None,
+    name: str | None,
+    supplier_name: str,
+    purchase_price: float,
+    currency: str,
+    source: str,
+) -> SupplierPrice:
+    """Upsert the global `(product, supplier)` row under write lock.
+
+    Callers must hold :func:`supplier_price_write_lock` and own the surrounding
+    transaction.  Updating `source` makes the most recent authoritative writer
+    explicit; a dashboard rollback then refuses to overwrite a later ERP/CLI
+    update because its recorded after-state no longer matches.
+    """
+    existing = None
+    if product is not None:
+        existing = session.scalar(
+            select(SupplierPrice)
+            .where(
+                SupplierPrice.product_id == product.id,
+                SupplierPrice.supplier_name == supplier_name,
+            )
+            .with_for_update()
+        )
+    if existing is None:
+        existing = SupplierPrice(
+            product_id=product.id if product else None,
+            canonical_id=product.canonical_id if product else None,
+            supplier_name=supplier_name,
+        )
+        session.add(existing)
+    existing.canonical_id = product.canonical_id if product else None
+    existing.sku = sku or None
+    existing.name = name or (product.name if product else None)
+    existing.purchase_price = purchase_price
+    existing.currency = currency
+    existing.source = source
+    existing.updated_at = utcnow()
+    return existing
+
 
 @dataclass
 class ImportResult:
@@ -47,19 +120,32 @@ class ImportResult:
 
 
 def _find_product_by_sku_or_name(
-    session: Session, sku: str | None, name: str | None
+    session: Session,
+    sku: str | None,
+    name: str | None,
+    *,
+    tenant_id: int = 1,
 ) -> Product | None:
     """Привязка CSV-строки к Product:
     1) external_id == sku (точно)
     2) fuzzy-match по name среди клиентских (pharmonline) товаров
     """
     if sku:
-        p = session.scalar(select(Product).where(Product.external_id == sku.strip()))
+        p = session.scalar(
+            select(Product).where(
+                Product.tenant_id == tenant_id,
+                Product.site == "pharmonline",
+                Product.external_id == sku.strip(),
+            )
+        )
         if p:
             return p
     if name:
         client_products = session.scalars(
-            select(Product).where(Product.site == "pharmonline")
+            select(Product).where(
+                Product.tenant_id == tenant_id,
+                Product.site == "pharmonline",
+            )
         ).all()
         if not client_products:
             return None
@@ -127,47 +213,61 @@ def import_stock_from_csv(
 
 
 def import_supplier_prices_from_csv(
-    session: Session, csv_path: Path | str, *, source: str = "manual_csv"
+    session: Session,
+    csv_path: Path | str,
+    *,
+    source: str = "manual_csv",
+    tenant_id: int = 1,
 ) -> ImportResult:
     """Импорт закупочных цен."""
     csv_path = Path(csv_path)
-    session.execute(delete(SupplierPrice).where(SupplierPrice.source == source))
-
     total = matched = unmatched = 0
-    with csv_path.open(encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            sku = (row.get("sku") or "").strip()
-            name = (row.get("name") or "").strip()
-            supplier = (row.get("supplier_name") or "Unknown").strip()
-            currency = (row.get("currency") or "AZN").strip()
-            price_raw = (row.get("purchase_price") or "0").strip().replace(",", ".")
-            try:
-                price = float(price_raw)
-            except ValueError:
-                continue
-            if price <= 0 or (not sku and not name):
-                continue
-            total += 1
-            product = _find_product_by_sku_or_name(session, sku, name)
-            if product:
-                matched += 1
-            else:
-                unmatched += 1
-            session.add(
-                SupplierPrice(
-                    product_id=product.id if product else None,
-                    canonical_id=product.canonical_id if product else None,
-                    sku=sku or None,
-                    name=name or (product.name if product else None),
-                    supplier_name=supplier,
-                    purchase_price=price,
-                    currency=currency,
-                    source=source,
-                    updated_at=utcnow(),
+    try:
+        with supplier_price_write_lock(session, tenant_id):
+            owned_product_ids = select(Product.id).where(Product.tenant_id == tenant_id)
+            session.execute(
+                delete(SupplierPrice).where(
+                    SupplierPrice.source == source,
+                    (SupplierPrice.product_id.is_(None))
+                    | (SupplierPrice.product_id.in_(owned_product_ids)),
                 )
             )
-    session.commit()
+            with csv_path.open(encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    sku = (row.get("sku") or "").strip()
+                    name = (row.get("name") or "").strip()
+                    supplier = (row.get("supplier_name") or "Unknown").strip()
+                    currency = (row.get("currency") or "AZN").strip()
+                    price_raw = (row.get("purchase_price") or "0").strip().replace(",", ".")
+                    try:
+                        price = float(price_raw)
+                    except ValueError:
+                        continue
+                    if price <= 0 or (not sku and not name):
+                        continue
+                    total += 1
+                    product = _find_product_by_sku_or_name(
+                        session, sku, name, tenant_id=tenant_id
+                    )
+                    if product:
+                        matched += 1
+                    else:
+                        unmatched += 1
+                    upsert_supplier_price(
+                        session,
+                        product=product,
+                        sku=sku,
+                        name=name,
+                        supplier_name=supplier,
+                        purchase_price=price,
+                        currency=currency,
+                        source=source,
+                    )
+            session.commit()
+    except Exception:
+        session.rollback()
+        raise
     log.info(
         "supplier_import_done",
         source=source,

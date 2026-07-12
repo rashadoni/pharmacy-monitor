@@ -208,6 +208,17 @@ function IntegrationsStatusSection() {
         ? t("integration_scraperapi_ok", { sites: q.data.scraperapi_sites.join(", ") || "—" })
         : t("integration_scraperapi_not_ok"),
     },
+    {
+      key: "decodo",
+      label: t("integration_decodo_label"),
+      ok: q.data.decodo,
+      hint: q.data.decodo
+        ? t("integration_decodo_ok", {
+            sites: q.data.decodo_sites.join(", ") || "—",
+            pool: q.data.decodo_pool_size,
+          })
+        : t("integration_decodo_not_ok"),
+    },
   ];
 
   const okCount = items.filter((i) => i.ok).length;
@@ -250,6 +261,7 @@ function NotificationsSection({ email }: { email?: string }) {
   const tCommon = useTranslations("common");
   const prefsQ = useQuery({ queryKey: ["notif-prefs"], queryFn: api.notifPrefs });
   const integrationsQ = useQuery({ queryKey: ["integrations"], queryFn: api.integrations });
+  const statusQ = useQuery({ queryKey: ["system-status"], queryFn: api.systemStatus });
   const bindEmail = email ?? "your-email@example.com";
   const updateMutation = useMutation({
     mutationFn: (patch: Partial<NotifPrefs>) => api.notifPrefsUpdate(patch),
@@ -358,14 +370,23 @@ function NotificationsSection({ email }: { email?: string }) {
           <div className="pt-3 border-t border-border space-y-2">
             <div className="text-sm font-medium mb-1.5">{t("digest")}</div>
             <Toggle
-              label={t("daily_digest")}
+              label={t("daily_digest_schedule", {
+                time: statusQ.data?.digests.daily.schedule_baku ?? "09:00",
+              })}
               checked={prefs.daily_digest}
               onChange={(v) => updateMutation.mutate({ daily_digest: v })}
+              disabled={statusQ.data?.digests.daily.enabled === false}
             />
+            {statusQ.data?.digests.daily.enabled === false && (
+              <p className="text-xs text-warning">{t("daily_digest_disabled")}</p>
+            )}
             <Toggle
-              label={t("weekly_digest")}
+              label={t("weekly_digest_schedule", {
+                schedule: statusQ.data?.digests.weekly.schedule_baku ?? "Monday 10:00",
+              })}
               checked={prefs.weekly_digest}
               onChange={(v) => updateMutation.mutate({ weekly_digest: v })}
+              disabled={statusQ.data?.digests.weekly.enabled === false}
             />
           </div>
 
@@ -414,16 +435,19 @@ function Toggle({
   label,
   checked,
   onChange,
+  disabled = false,
 }: {
   label: string;
   checked: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
-    <label className="flex min-h-11 items-center gap-2 cursor-pointer text-sm md:min-h-9">
+    <label className={`flex min-h-11 items-center gap-2 text-sm md:min-h-9 ${disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"}`}>
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
         className="h-4 w-4"
       />

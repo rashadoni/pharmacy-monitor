@@ -41,6 +41,7 @@ const nextConfig = {
       "matcher",
       "matches/review",
       "overview",
+      "runs",
       "set-password",
       "settings",
       "settings/pricing",

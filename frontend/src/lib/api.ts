@@ -297,10 +297,34 @@ export interface PricingConfig {
 }
 
 export interface CostImportResult {
+  batch_id: number | null;
   rows_processed: number;
   rows_imported: number;
   rows_skipped: number;
   errors: string[];
+}
+
+export interface CostImportPreview extends CostImportResult {
+  changes: {
+    line: number;
+    product_id: number;
+    product_name: string;
+    sku: string;
+    supplier_name: string;
+    before: { purchase_price: number; currency: string } | null;
+    after: { purchase_price: number; currency: string };
+  }[];
+}
+
+export interface CostImportBatch {
+  id: number;
+  filename: string | null;
+  rows_processed: number;
+  rows_imported: number;
+  rows_skipped: number;
+  created_at: string;
+  rolled_back_at: string | null;
+  can_rollback: boolean;
 }
 
 export interface MatchSuggestionProduct {
@@ -354,6 +378,14 @@ export interface AlertEvent {
   is_read?: boolean;
   read_at?: string | null;
   snoozed_until?: string | null;
+}
+
+export interface AlertPage {
+  items: AlertEvent[];
+  total: number;
+  limit: number;
+  offset: number;
+  rule_types: string[];
 }
 
 export interface DataQuality {
@@ -557,7 +589,7 @@ export interface ForecastMover {
   last_price: number;
   change_pct: number;
   direction: "rising" | "falling" | "stable";
-  forecast_7d_price: number;
+  forecast_7d_price: number | null;
   confidence: "low" | "medium" | "high";
 }
 
@@ -671,6 +703,31 @@ export interface RunBreakdown {
   sites_completed: string | null;
 }
 
+export interface RunHistoryPage {
+  items: RunRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface AuditLogRow {
+  id: number;
+  actor_user_id: number | null;
+  actor_email: string | null;
+  action: string;
+  resource: string;
+  response_status: number;
+  request_id: string | null;
+  created_at: string;
+}
+
+export interface AuditLogPage {
+  items: AuditLogRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface RunQualitySite {
   status: "ok" | "degraded" | "failed";
   products: number;
@@ -697,6 +754,7 @@ export interface RunQuality {
 export interface LatestRunBySite {
   site: string;
   run: RunRow | null;
+  latest_attempt: RunRow | null;
 }
 
 export interface CategoryRow {
@@ -708,6 +766,22 @@ export interface CategoryRow {
   aptekonline_slug: string | null;
   aloe_slug: string | null;
   is_active: boolean;
+}
+
+export interface CategoriesPage {
+  items: CategoryRow[];
+  total: number;
+  limit: number;
+  offset: number;
+  stats: {
+    total: number;
+    active: number;
+    cross2: number;
+    cross3: number;
+    pharmonline: number;
+    aptekonline: number;
+    aloe: number;
+  };
 }
 
 export interface CategorySuggestion {
@@ -751,6 +825,24 @@ export interface Health {
   full_catalog_verified: boolean;
 }
 
+export interface SystemStatus extends Health {
+  queue: {
+    pending: number;
+    running: number;
+    oldest_pending_at: string | null;
+  };
+  proxy: {
+    provider: "decodo";
+    configured: boolean;
+    sites: string[];
+    pool_size: number;
+  };
+  digests: {
+    daily: { enabled: boolean; schedule_baku: string };
+    weekly: { enabled: boolean; schedule_baku: string };
+  };
+}
+
 export const api = {
   // Auth
   authRequest: (email: string) =>
@@ -762,6 +854,7 @@ export const api = {
 
   // Health (public, no auth)
   health: () => request<Health>("/health"),
+  systemStatus: () => request<SystemStatus>("/api/v1/dash/system-status"),
 
   // User
   me: () => request<MeOut>("/api/v1/dash/me"),
@@ -797,6 +890,27 @@ export const api = {
     }
     return res.json() as Promise<CostImportResult>;
   },
+  costsCsvPreview: async (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${BASE}/api/v1/dash/settings/costs/preview`, {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new ApiError(res.status, text || res.statusText);
+    }
+    return res.json() as Promise<CostImportPreview>;
+  },
+  costImportHistory: () =>
+    request<CostImportBatch[]>("/api/v1/dash/settings/costs/imports"),
+  costImportRollback: (batchId: number) =>
+    request<{ ok: true; batch_id: number; rows_rolled_back: number }>(
+      `/api/v1/dash/settings/costs/imports/${batchId}/rollback`,
+      { method: "POST" },
+    ),
 
   matchSuggestions: (params: {
     confidence_max?: number;
@@ -863,6 +977,24 @@ export const api = {
     if (params.include_read) q.set("include_read", "true");
     if (params.include_snoozed) q.set("include_snoozed", "true");
     return request<AlertEvent[]>(`/api/v1/dash/alerts?${q}`);
+  },
+  alertsPage: (params: {
+    view?: "inbox" | "snoozed" | "read";
+    severity?: string;
+    rule_type?: string;
+    hours?: number;
+    limit?: number;
+    offset?: number;
+  } = {}) => {
+    const q = new URLSearchParams({
+      view: params.view ?? "inbox",
+      limit: String(params.limit ?? 50),
+      offset: String(params.offset ?? 0),
+      hours: String(params.hours ?? 168),
+    });
+    if (params.severity) q.set("severity", params.severity);
+    if (params.rule_type) q.set("rule_type", params.rule_type);
+    return request<AlertPage>(`/api/v1/dash/alerts/page?${q}`);
   },
   alertsCounts: () =>
     request<{ unread: number; snoozed: number; read: number; total: number }>(
@@ -987,10 +1119,34 @@ export const api = {
   siteProductsSummary: (site: string) =>
     request<SiteSummary>(`/api/v1/dash/products/summary?site=${encodeURIComponent(site)}`),
   runs: (limit = 30) => request<RunRow[]>(`/api/v1/dash/runs?limit=${limit}`),
+  runsHistory: (params: { limit?: number; offset?: number; status?: string; site?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    if (params.status) q.set("status", params.status);
+    if (params.site) q.set("site", params.site);
+    return request<RunHistoryPage>(`/api/v1/dash/runs/history?${q}`);
+  },
+  auditLog: (params: { limit?: number; offset?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    return request<AuditLogPage>(`/api/v1/dash/audit-log?${q}`);
+  },
   runsLatestBySite: () => request<LatestRunBySite[]>("/api/v1/dash/runs/latest-by-site"),
   runBreakdown: (id: number) =>
     request<RunBreakdown>(`/api/v1/dash/runs/${id}/breakdown`),
   categories: () => request<CategoryRow[]>("/api/v1/dash/categories"),
+  categoriesPage: (params: { limit?: number; offset?: number; search?: string; site?: string; active_only?: boolean; coverage?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    if (params.search) q.set("search", params.search);
+    if (params.site) q.set("site", params.site);
+    if (params.active_only) q.set("active_only", "true");
+    if (params.coverage) q.set("coverage", params.coverage);
+    return request<CategoriesPage>(`/api/v1/dash/categories/page?${q}`);
+  },
   categoryCreate: (payload: Omit<CategoryRow, "id">) =>
     request<CategoryRow>("/api/v1/dash/categories", {
       method: "POST",
@@ -1096,6 +1252,13 @@ export const api = {
   },
   scrapeRequests: (limit = 10) =>
     request<ScrapeRequestRow[]>(`/api/v1/dash/scrape/requests?limit=${limit}`),
+  scrapeRequestsHistory: (params: { limit?: number; offset?: number; status?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    if (params.status) q.set("status", params.status);
+    return request<ScrapeRequestHistoryPage>(`/api/v1/dash/scrape/requests/history?${q}`);
+  },
 };
 
 export interface ScrapeRequestRow {
@@ -1115,6 +1278,13 @@ export interface ScrapeRequestRow {
   products_per_site: Record<string, number> | null;
 }
 
+export interface ScrapeRequestHistoryPage {
+  items: ScrapeRequestRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface IntegrationsStatus {
   smtp: boolean;
   smtp_from: string | null;
@@ -1123,4 +1293,7 @@ export interface IntegrationsStatus {
   sentry: boolean;
   scraperapi: boolean;
   scraperapi_sites: string[];
+  decodo: boolean;
+  decodo_sites: string[];
+  decodo_pool_size: number;
 }
