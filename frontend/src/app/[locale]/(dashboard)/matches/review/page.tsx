@@ -59,7 +59,7 @@ export default function MatchesReviewPage() {
 
       {/* Filters */}
       <div className="flex flex-wrap items-center gap-4 rounded-lg border border-border bg-card p-4">
-        <label className="flex items-center gap-2 text-sm">
+        <label className="flex min-h-11 flex-wrap items-center gap-2 text-sm">
           <span>{t("filter_confidence")}</span>
           <input
             type="range"
@@ -74,7 +74,7 @@ export default function MatchesReviewPage() {
             {confidenceMax.toFixed(2)}
           </span>
         </label>
-        <label className="flex items-center gap-2 text-sm">
+        <label className="flex min-h-11 items-center gap-2 text-sm">
           <input
             type="checkbox"
             checked={onlyNeedsReview}
@@ -146,7 +146,7 @@ function MatchCard({
   return (
     <div className="rounded-lg border border-border bg-card overflow-hidden">
       {/* Header */}
-      <div className="flex items-start justify-between gap-4 p-4 border-b border-border">
+      <div className="flex flex-col items-start justify-between gap-4 p-4 border-b border-border sm:flex-row">
         <div className="min-w-0">
           <h3 className="font-semibold text-base truncate" title={match.canonical_name}>
             {match.canonical_name}
@@ -172,11 +172,11 @@ function MatchCard({
         </div>
 
         {/* Action buttons */}
-        <div className="flex gap-2 shrink-0">
+        <div className="flex w-full gap-2 shrink-0 sm:w-auto">
           <button
             onClick={onConfirm}
             disabled={disabled}
-            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md bg-green-600 text-white text-sm font-medium hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="inline-flex min-h-11 flex-1 items-center justify-center gap-1 px-3 py-1.5 rounded-md bg-green-600 text-white text-sm font-medium hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors sm:flex-none md:min-h-9"
             title={t("confirm_hint")}
           >
             <CheckCircle2 className="h-4 w-4" />
@@ -185,7 +185,7 @@ function MatchCard({
           <button
             onClick={onReject}
             disabled={disabled}
-            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md bg-red-600 text-white text-sm font-medium hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="inline-flex min-h-11 flex-1 items-center justify-center gap-1 px-3 py-1.5 rounded-md bg-red-600 text-white text-sm font-medium hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors sm:flex-none md:min-h-9"
             title={t("reject_hint")}
           >
             <XCircle className="h-4 w-4" />

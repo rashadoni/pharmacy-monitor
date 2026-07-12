@@ -176,7 +176,7 @@ function AddUserForm({
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             placeholder="name@company.az"
-            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           />
         </label>
         <label className="block">
@@ -185,7 +185,7 @@ function AddUserForm({
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           />
         </label>
         <label className="block">
@@ -201,7 +201,7 @@ function AddUserForm({
         <button
           onClick={submit}
           disabled={!validEmail || pending}
-          className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
+          className="min-h-11 rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50 md:min-h-9"
         >
           {pending ? t("adding") : t("add_btn")}
         </button>
@@ -263,7 +263,7 @@ function UserCard({
           onClick={onDelete}
           disabled={isSelf}
           title={isSelf ? t("cant_delete_self") : t("delete")}
-          className="text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:hover:text-muted-foreground shrink-0"
+          className="text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:hover:text-muted-foreground shrink-0 inline-flex min-h-11 min-w-11 items-center justify-center md:min-h-9 md:min-w-9"
         >
           <Trash2 className="h-4 w-4" />
         </button>
@@ -309,7 +309,7 @@ function UserCard({
           <button
             onClick={onHardDelete}
             title={t("delete_permanently_hint")}
-            className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 text-destructive px-2.5 py-1.5 text-xs font-medium hover:bg-destructive/10"
+            className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-destructive/40 text-destructive px-2.5 py-1.5 text-xs font-medium hover:bg-destructive/10 md:min-h-9"
           >
             <Trash2 className="h-3.5 w-3.5" />
             {t("delete_permanently")}
@@ -326,7 +326,7 @@ function UserCard({
             onClick={() => sendLinkMut.mutate()}
             disabled={!u.is_active || sendLinkMut.isPending}
             title={u.is_active ? t("send_login_link_hint") : t("send_login_link_inactive")}
-            className="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed md:min-h-9"
           >
             <Send className="h-3.5 w-3.5" />
             {sendLinkMut.isPending ? t("login_link_sending") : t("send_login_link")}
@@ -351,7 +351,7 @@ function RoleSelect({
     <select
       value={value}
       onChange={(e) => onChange(e.target.value as "admin" | "viewer")}
-      className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+      className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
     >
       <option value="admin">{t("role_admin")}</option>
       <option value="viewer" disabled={disabledViewer}>
@@ -373,7 +373,7 @@ function SeveritySelect({ value, onChange }: { value: Sev; onChange: (v: Sev) =>
     <select
       value={value}
       onChange={(e) => onChange(e.target.value as Sev)}
-      className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+      className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
     >
       {SEVERITIES.map((s) => (
         <option key={s} value={s}>
@@ -397,7 +397,7 @@ function Toggle({
 }) {
   return (
     <label
-      className={`flex items-center gap-2 text-sm ${disabled ? "opacity-40" : "cursor-pointer"}`}
+      className={`flex min-h-11 items-center gap-2 text-sm md:min-h-9 ${disabled ? "opacity-40" : "cursor-pointer"}`}
     >
       <input
         type="checkbox"

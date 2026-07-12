@@ -83,7 +83,7 @@ export default function SettingsPage() {
       <Section title={t("actions")}>
         <button
           onClick={handleLogout}
-          className="inline-flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 text-destructive px-4 py-2 text-sm font-medium hover:bg-destructive/10"
+          className="inline-flex min-h-11 items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 text-destructive px-4 py-2 text-sm font-medium hover:bg-destructive/10 md:min-h-9"
         >
           <LogOut className="h-4 w-4" />
           {t("logout")}
@@ -123,7 +123,7 @@ function ChangePasswordSection() {
             value={curr}
             onChange={(e) => setCurr(e.target.value)}
             autoComplete="current-password"
-            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           />
         </label>
         <label className="block">
@@ -133,7 +133,7 @@ function ChangePasswordSection() {
             value={next1}
             onChange={(e) => setNext1(e.target.value)}
             autoComplete="new-password"
-            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           />
           {tooShort && <span className="text-xs text-destructive">{t("password_too_short")}</span>}
         </label>
@@ -144,14 +144,14 @@ function ChangePasswordSection() {
             value={next2}
             onChange={(e) => setNext2(e.target.value)}
             autoComplete="new-password"
-            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           />
           {mismatch && <span className="text-xs text-destructive">{t("password_mismatch")}</span>}
         </label>
         <button
           onClick={() => mut.mutate()}
           disabled={!canSubmit || mut.isPending}
-          className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
+          className="min-h-11 rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50 md:min-h-9"
         >
           {mut.isPending ? t("saving") : t("change_password")}
         </button>
@@ -298,7 +298,7 @@ function NotificationsSection({ email }: { email?: string }) {
                     onClick={() => {
                       if (confirm(t("telegram_unbind_confirm"))) unbindMutation.mutate();
                     }}
-                    className="text-xs text-destructive hover:underline"
+                    className="inline-flex min-h-11 items-center text-xs text-destructive hover:underline md:min-h-9"
                   >
                     {t("telegram_unbind")}
                   </button>
@@ -351,7 +351,7 @@ function NotificationsSection({ email }: { email?: string }) {
                   updateMutation.mutate({ quiet_hours: v || null });
                 }
               }}
-              className="rounded-md border border-input bg-background px-3 py-1.5 text-sm w-32 font-mono"
+              className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm w-32 font-mono md:min-h-9"
             />
           </div>
 
@@ -399,7 +399,7 @@ function SeveritySelect({
     <select
       value={value}
       onChange={(e) => onChange(e.target.value)}
-      className="rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+      className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
     >
       {SEVERITIES.map((s) => (
         <option key={s} value={s}>
@@ -420,7 +420,7 @@ function Toggle({
   onChange: (v: boolean) => void;
 }) {
   return (
-    <label className="flex items-center gap-2 cursor-pointer text-sm">
+    <label className="flex min-h-11 items-center gap-2 cursor-pointer text-sm md:min-h-9">
       <input
         type="checkbox"
         checked={checked}

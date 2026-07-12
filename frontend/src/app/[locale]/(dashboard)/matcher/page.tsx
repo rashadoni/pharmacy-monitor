@@ -205,7 +205,7 @@ function ModeTab({
   return (
     <button
       onClick={onClick}
-      className={`inline-flex items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors ${
+      className={`inline-flex min-h-11 items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors md:min-h-9 ${
         active
           ? "border-primary text-foreground font-medium"
           : "border-transparent text-muted-foreground hover:text-foreground"
@@ -540,7 +540,7 @@ function PairCard({
         </div>
         <button
           onClick={() => onSkip(pair.match_id)}
-          className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 shrink-0 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="text-xs text-muted-foreground hover:text-foreground flex min-h-11 items-center gap-1 shrink-0 rounded px-2 py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
           title={t("skip_one_title")}
         >
           <SkipForward className="h-3.5 w-3.5" />

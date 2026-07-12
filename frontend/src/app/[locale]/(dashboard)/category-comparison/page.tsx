@@ -166,7 +166,7 @@ export default function CategoryComparisonPage() {
         <button
           onClick={handleExportCsv}
           disabled={!sorted || sorted.length === 0}
-          className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="shrink-0 inline-flex min-h-11 items-center gap-1.5 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
           title={t("export_csv_title")}
         >
           ⬇ CSV

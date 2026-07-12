@@ -851,6 +851,34 @@ def classify_run_quality(
     }
 
 
+def scope_category_run_sites(
+    slugs_by_site: dict[str, list[str]],
+    requested_sites: list[str],
+    *,
+    category_id: int | None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Limit a single-category run to sites where that category has a route.
+
+    A category can intentionally exist on only one or two sites. Treating the
+    other requested sites as ``no_items_requested`` makes a successful partial
+    category scan look degraded. Full-catalog runs stay fail-closed: an empty
+    site configuration is preserved so the quality classifier can reject it.
+    If a single-category row has no route anywhere, preserve the original scope
+    as well so the run fails instead of becoming a vacuous success.
+    """
+    if category_id is None:
+        return list(requested_sites), slugs_by_site
+
+    configured = {
+        site: slugs_by_site.get(site, [])
+        for site in requested_sites
+        if slugs_by_site.get(site)
+    }
+    if not configured:
+        return list(requested_sites), slugs_by_site
+    return list(configured), configured
+
+
 def is_run_financially_eligible(run: storage.Run | None) -> bool:
     return storage.run_is_financially_eligible(run)
 
@@ -2356,6 +2384,11 @@ def run_cmd(
                     s: watchlist.categories_for_site(session, s, only_category_id=category_id)
                     for s in sites
                 }
+                quality_sites, slugs_by_site = scope_category_run_sites(
+                    slugs_by_site,
+                    sites,
+                    category_id=category_id,
+                )
                 baselines = baselines_for_sites(session, sites)
                 quality_baselines = run_quality_baselines_for_sites(
                     session,
@@ -2619,6 +2652,11 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
                 s: watchlist.categories_for_site(session, s, only_category_id=category_id)
                 for s in sites
             }
+            quality_sites, slugs_by_site = scope_category_run_sites(
+                slugs_by_site,
+                sites,
+                category_id=category_id,
+            )
             baselines = baselines_for_sites(session, sites)
             quality_baselines = run_quality_baselines_for_sites(
                 session,
@@ -2633,7 +2671,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
             run.sites_completed = ",".join(r.site for r in results)
             quality_status, quality = classify_run_quality(
                 results,
-                sites,
+                quality_sites,
                 mode="category",
                 baselines=quality_baselines,
                 enforce_baseline=limit is None and category_id is None,

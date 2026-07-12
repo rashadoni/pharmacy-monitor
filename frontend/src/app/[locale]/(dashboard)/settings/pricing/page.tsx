@@ -129,7 +129,7 @@ export default function PricingSettingsPage() {
             <button
               onClick={() => form && updateM.mutate(form)}
               disabled={updateM.isPending}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+              className="inline-flex min-h-11 items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors md:min-h-9"
             >
               <Save className="h-4 w-4" />
               {updateM.isPending ? tCommon("save_view") : t("save_btn")}
@@ -163,13 +163,14 @@ PRODUCT-003,Vendor B,3.10,AZN,Diazolin 100mg N10`}
         <div className="flex items-center gap-3">
           <input
             type="file"
+            aria-label={t("costs_title")}
             accept=".csv,text/csv"
             ref={fileRef}
             onChange={(e) => {
               const f = e.target.files?.[0];
               if (f) importM.mutate(f);
             }}
-            className="text-sm file:mr-3 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-primary file:text-primary-foreground hover:file:bg-primary/90 file:cursor-pointer"
+            className="min-h-11 max-w-full text-sm file:mr-3 file:min-h-11 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-primary file:text-primary-foreground hover:file:bg-primary/90 file:cursor-pointer md:min-h-9 md:file:min-h-9"
             disabled={importM.isPending}
           />
           {importM.isPending && <span className="text-xs text-muted-foreground">{t("uploading")}</span>}
@@ -233,6 +234,7 @@ function ThresholdRow({
       </div>
       <input
         type="range"
+        aria-label={label}
         min={min}
         max={max}
         step={step}

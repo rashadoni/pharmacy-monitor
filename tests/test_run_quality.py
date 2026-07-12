@@ -15,6 +15,7 @@ from src.main import (
     mark_scrape_request_terminal,
     run_quality_baselines_for_sites,
     run_tenant_id_for_request,
+    scope_category_run_sites,
 )
 from src.scrapers.base import (
     BaseScraper,
@@ -94,6 +95,45 @@ def test_intentional_partial_run_is_ok_but_not_financially_eligible():
     assert status == "ok"
     assert quality["full_catalog_verified"] is False
     assert quality["financially_eligible"] is False
+
+
+def test_single_category_run_only_requests_sites_with_configured_route():
+    quality_sites, scrape_scope = scope_category_run_sites(
+        {
+            "pharmonline": ["sinir-sistemi-xestelikeri"],
+            "aptekonline": [],
+            "aloe": [],
+        },
+        ["pharmonline", "aptekonline", "aloe"],
+        category_id=9,
+    )
+
+    assert quality_sites == ["pharmonline"]
+    assert scrape_scope == {"pharmonline": ["sinir-sistemi-xestelikeri"]}
+
+
+def test_full_catalog_run_preserves_empty_sites_for_fail_closed_quality():
+    original = {"pharmonline": ["one"], "aptekonline": [], "aloe": ["two"]}
+    quality_sites, scrape_scope = scope_category_run_sites(
+        original,
+        ["pharmonline", "aptekonline", "aloe"],
+        category_id=None,
+    )
+
+    assert quality_sites == ["pharmonline", "aptekonline", "aloe"]
+    assert scrape_scope is original
+
+
+def test_single_category_without_any_route_still_fails_closed():
+    original = {"pharmonline": [], "aptekonline": [], "aloe": []}
+    quality_sites, scrape_scope = scope_category_run_sites(
+        original,
+        ["pharmonline", "aptekonline", "aloe"],
+        category_id=9,
+    )
+
+    assert quality_sites == ["pharmonline", "aptekonline", "aloe"]
+    assert scrape_scope is original
 
 
 def test_scraper_error_degrades_even_when_all_items_completed():
@@ -494,6 +534,44 @@ def test_run_blocks_non_pilot_tenant_scrape_request(db_session):
 
     with pytest.raises(ClickException, match="not enabled for non-pilot tenants"):
         run_tenant_id_for_request(db_session, request.id)
+
+
+def test_scrape_command_scopes_single_category_to_configured_sites(db_session, monkeypatch):
+    Session = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(storage, "init_db", lambda *args, **kwargs: None)
+    monkeypatch.setattr(storage, "make_session", lambda *args, **kwargs: Session)
+    monkeypatch.setattr(main_mod, "_hold_scrape_lock_until_command_exit", lambda *args, **kwargs: True)
+    monkeypatch.setattr(main_mod, "maybe_seed_categories", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *args, **kwargs: {})
+    monkeypatch.setattr(main_mod, "run_quality_baselines_for_sites", lambda *args, **kwargs: {})
+
+    slugs = {
+        "pharmonline": ["sinir-sistemi-xestelikeri"],
+        "aptekonline": [],
+        "aloe": [],
+    }
+    monkeypatch.setattr(
+        main_mod.watchlist,
+        "categories_for_site",
+        lambda _session, site, only_category_id=None: slugs[site],
+    )
+    captured = {}
+
+    async def fake_scrape_all(slugs_by_site, limit, **kwargs):
+        captured["scope"] = slugs_by_site
+        return [_result("pharmonline", 1, expected=1, completed=1)]
+
+    monkeypatch.setattr(main_mod, "scrape_all", fake_scrape_all)
+    monkeypatch.setattr(main_mod, "persist_results", lambda *args, **kwargs: 1)
+
+    result = CliRunner().invoke(main_mod.cli, ["scrape", "--category-id", "9"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["scope"] == {"pharmonline": ["sinir-sistemi-xestelikeri"]}
+    run = db_session.query(storage.Run).one()
+    assert run.status == "ok"
+    assert set(run.run_quality["sites"]) == {"pharmonline"}
+    assert run.run_quality["financially_eligible"] is False
 
 
 def test_report_send_rejects_intentional_partial_run(db_session, monkeypatch):

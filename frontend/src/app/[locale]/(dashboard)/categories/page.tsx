@@ -482,7 +482,7 @@ function SuggestionsPanel({
                         })
                       }
                       disabled={mapMutation.isPending}
-                      className="inline-flex items-center gap-1 rounded bg-primary text-primary-foreground px-2 py-1 text-xs font-medium hover:bg-primary/90 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      className="inline-flex min-h-11 items-center gap-1 rounded bg-primary text-primary-foreground px-3 py-1 text-xs font-medium hover:bg-primary/90 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-8"
                     >
                       {t("bind_btn")}
                     </button>
@@ -616,7 +616,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
       <button
         onClick={() => triggerMut.mutate()}
         disabled={triggerMut.isPending || blockedByAll}
-        className="inline-flex items-center gap-1 rounded border border-border bg-background px-2 py-1 text-xs font-medium hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
+        className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-3 py-1 text-xs font-medium hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap md:min-h-8"
         title={
           blockedByAll
             ? t("scan_category_blocked_title", { id: activeAll.id })
@@ -646,7 +646,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
       <button
         onClick={() => triggerMut.mutate()}
         disabled={triggerMut.isPending}
-        className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium hover:bg-secondary disabled:opacity-50"
+        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium hover:bg-secondary disabled:opacity-50 md:min-h-9"
         title={t("scan_all_title")}
       >
         <Play className="h-4 w-4" />
@@ -763,7 +763,7 @@ function CategoryRowDesktop({
         <button
           onClick={() => toggleActive.mutate()}
           disabled={toggleActive.isPending}
-          className={`inline-flex rounded px-2 py-0.5 text-xs font-medium transition-opacity ${
+          className={`inline-flex min-h-11 items-center rounded px-3 py-0.5 text-xs font-medium transition-opacity md:min-h-8 ${
             cat.is_active
               ? "bg-success/10 text-success hover:bg-success/20"
               : "bg-muted text-muted-foreground hover:bg-muted/80"
@@ -779,7 +779,7 @@ function CategoryRowDesktop({
           )}
           <button
             onClick={onEdit}
-            className="text-muted-foreground hover:text-foreground"
+            className="inline-flex min-h-11 min-w-11 items-center justify-center text-muted-foreground hover:text-foreground md:min-h-8 md:min-w-8"
             title={t("edit_tooltip")}
           >
             <Pencil className="h-4 w-4" />
@@ -789,7 +789,7 @@ function CategoryRowDesktop({
               if (confirm(t("delete_confirm", { label: cat.label_ru }))) remove.mutate();
             }}
             disabled={remove.isPending}
-            className="text-muted-foreground hover:text-destructive disabled:opacity-50"
+            className="inline-flex min-h-11 min-w-11 items-center justify-center text-muted-foreground hover:text-destructive disabled:opacity-50 md:min-h-8 md:min-w-8"
             title={t("delete_tooltip")}
           >
             <Trash2 className="h-4 w-4" />
@@ -878,7 +878,7 @@ function CategoryForm({
         </h3>
         <button
           onClick={onClose}
-          className="rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="inline-flex min-h-11 min-w-11 items-center justify-center rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9 md:min-w-9"
           aria-label={tCommon("close")}
         >
           <X className="h-4 w-4" />
@@ -940,11 +940,11 @@ function CategoryForm({
         <button
           onClick={() => save.mutate()}
           disabled={!canSubmit || save.isPending}
-          className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
+          className="min-h-11 rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50 md:min-h-9"
         >
           {save.isPending ? t("form_save_pending") : isEdit ? t("form_apply") : t("form_save")}
         </button>
-        <button onClick={onClose} className="text-sm text-muted-foreground hover:text-foreground">
+        <button onClick={onClose} className="min-h-11 px-2 text-sm text-muted-foreground hover:text-foreground md:min-h-9">
           {tCommon("cancel")}
         </button>
       </div>
@@ -978,7 +978,7 @@ function Field({
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         required={required}
-        className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
       />
     </label>
   );
@@ -1010,7 +1010,7 @@ function UrlField({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring font-mono"
+        className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring font-mono md:min-h-9"
       />
     </label>
   );
