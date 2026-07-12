@@ -119,15 +119,26 @@ All nine P1 findings are addressed in the isolated implementation:
 - Comparison search, minimum-site filter, sort, price-difference filter, aloe filter and
   category drill-down are URL-backed and survive locale switch, reload and sharing.
 
-Remaining non-blocking P2/P3 work is explicit:
+## P2/P3 closure — 2026-07-12
 
-- Alerts, category administration and site-catalog filters still use local component state.
-- The six-item mobile bottom navigation remains dense at narrow widths, although every item
-  fits 390px and now has a 64px touch target.
-- Some code identifiers and domain terms (`SKU`, `URL`, `is_manual`, site names) intentionally
-  remain untranslated; they identify persisted concepts rather than interface prose.
-- Alerts, category administration and site-catalog failure states still need a dedicated
-  destructive/fault-injection pass; the deployed read-only and retry states were verified.
+The remaining scoped audit findings are closed in `8f9b79d8` and the production visual-QA
+follow-up `81c969a8`:
+
+- Alerts, category administration and site-catalog filters are URL-backed. Search uses
+  history replacement; tabs, selects, checkboxes and pagination create Back/Forward history.
+  Invalid enum/integer inputs fail closed, stale select values remain visible instead of
+  silently presenting “All”, and out-of-range catalog pages canonicalize to the actual range.
+- Alert bulk selection is cleared when URL filter history changes, preventing actions against
+  IDs that are no longer visible.
+- Mobile navigation is now five 64px targets. Secondary routes are in an accessible “More”
+  menu with localized grouping and current-page state.
+- Generic repeated KPI cards were replaced by a compact semantic metric strip on overview,
+  site and category-comparison pages.
+- Alerts, categories and site catalog use an announced error state with an explicit retry.
+  Route-level fault injection verifies that Retry makes a new request on all three pages.
+- RU/AZ interface prose in the audited surfaces is localized. Production visual QA caught and
+  removed the last hardcoded `prod`; persisted identifiers (`SKU`, `URL`, rule/category keys,
+  site names) intentionally remain unchanged.
 
 Production verification completed on 2026-07-12:
 
@@ -146,6 +157,24 @@ Production verification completed on 2026-07-12:
   category labels, a localized site-selector group with `aria-pressed` state, and 44–56px
   control targets.
 
-Post-deploy re-score: accessibility 4/4, performance 4/4, responsive design 3/4,
-theming 4/4, anti-patterns 3/4 — **18/20 confirmed**. The remaining two points are the
-explicit P2/P3 items above, not hidden deployment uncertainty.
+Final verification for `81c969a8`:
+
+- Local: Vitest 20/20, Chromium P2/P3 E2E 4/4 at 390×844, TypeScript and Next production
+  build. E2E covers RU/AZ, reload, Back/Forward, stale URL values, out-of-range pagination,
+  Retry request counters, five ≥44px navigation targets and horizontal-overflow metrics.
+- CI: frontend, Ruff and full pytest jobs passed. Two fail-closed deploys passed preflight,
+  single migration-head, build/restart and health gates with migrations explicitly disabled.
+- Public smoke passed 9/9 after the final deploy.
+- Production mobile DOM: `clientWidth === scrollWidth === 390`; bottom navigation is five
+  64px targets; RU alert filter values match the URL; AZ category filters survive navigation;
+  the suggestions row renders `169 məhsul`; stale catalog category/brand remain visible and
+  `page=10000` is removed after canonicalization.
+- Production desktop DOM: 1280px without overflow, the system sans stack is active, and the
+  overview metric strip is a semantic `dl` containing the four audited metrics.
+
+Scoped post-deploy re-score: accessibility 4/4, performance 4/4, responsive design 4/4,
+theming 4/4, anti-patterns 4/4 — **20/20 confirmed for this audit scope**.
+
+Operational caveat outside the UI score: `/health` currently reports `degraded` because the
+latest Run is degraded. All three sites are within freshness SLA and
+`full_catalog_verified=true`; the UI deployment did not create this run-quality state.
