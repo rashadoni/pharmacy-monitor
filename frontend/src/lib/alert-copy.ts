@@ -30,6 +30,12 @@ function titleSubject(event: AlertEvent): string {
   return title;
 }
 
+function titleSubjectWithoutTrailingPercent(event: AlertEvent): string {
+  return titleSubject(event)
+    .replace(/\s+\(\+\d+(?:[.,]\d+)?%\)$/u, "")
+    .trim();
+}
+
 function formatAlertAmount(value: number | null): string {
   return value === null ? "?" : value.toFixed(2);
 }
@@ -93,7 +99,7 @@ export function localizedAlertCopy(
         site,
         product: subject,
       }),
-      detail: event.detail,
+      detail: t("event_new_product_detail", { site }),
     };
   }
 
@@ -114,7 +120,7 @@ export function localizedAlertCopy(
     const median = numberPayload(payload, "median_competitor");
     return {
       title: t("event_price_raise_title", {
-        product: subject,
+        product: titleSubjectWithoutTrailingPercent(event),
         pct: gapPct === null ? "?" : gapPct.toFixed(1),
       }),
       detail: t("event_price_raise_detail", {

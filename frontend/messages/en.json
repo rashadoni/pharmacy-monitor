@@ -351,6 +351,7 @@
     "event_undercut_title": "{site} is {pct}% cheaper: {product}",
     "event_undercut_detail": "Client: {client} ₼, {site}: {competitor} ₼ (-{pct}%).",
     "event_new_product_title": "New product on {site}: {product}",
+    "event_new_product_detail": "This product appeared on {site} for the first time.",
     "event_promo_started_title": "New promo on {site}: {promo}",
     "event_price_raise_title": "Can raise price: {product} (+{pct}%)",
     "event_price_raise_detail": "Client: {client} ₼. Competitor median: {median} ₼.",

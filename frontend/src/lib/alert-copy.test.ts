@@ -70,4 +70,41 @@ describe("localizedAlertCopy", () => {
 
     expect(copy).toEqual({ title: "Custom title", detail: "Custom detail" });
   });
+
+  it("does not leak stored Russian detail for new-product alerts", () => {
+    const copy = localizedAlertCopy(
+      event({
+        rule_type: "new_product",
+        title: "Новый товар на aloe: Test product",
+        detail: "Цена: 12 ₼. Появился впервые на aloe.",
+        payload: { site: "aloe" },
+        site: "aloe",
+      }),
+      tFromMessages(),
+    );
+
+    expect(copy.title).toBe("aloe saytında yeni məhsul: Test product");
+    expect(copy.detail).toBe("Bu məhsul ilk dəfə aloe saytında göründü.");
+    expect(copy.detail).not.toContain("Появился");
+  });
+
+  it("does not duplicate the stored percent for price-raise alerts", () => {
+    const copy = localizedAlertCopy(
+      event({
+        rule_type: "price_raise_opportunity",
+        title: "Можно поднять: Test product (+12.3%)",
+        detail: "Клиент: 10.00 ₼. Медиана конкурентов: 11.23 ₼.",
+        payload: {
+          client_price: 10,
+          median_competitor: 11.23,
+          gap_pct: 12.3,
+        },
+      }),
+      tFromMessages(),
+    );
+
+    expect(copy.title).toBe("Qiyməti qaldırmaq olar: Test product (+12.3%)");
+    expect(copy.title).not.toContain("(+12.3%) (+12.3%)");
+    expect(copy.detail).toBe("Müştəri: 10.00 ₼. Rəqiblərin medianı: 11.23 ₼.");
+  });
 });
