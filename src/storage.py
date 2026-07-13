@@ -82,17 +82,33 @@ class Run(Base):
     # per-site and per-category/URL expected/completed/failed counters, reasons
     # and bounded errors. Financial alerts may only use status='ok' runs.
     run_quality: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Trust gate for financial consumers. Only an unbounded category run with
+    # healthy per-site coverage may be marked as a verified full catalog.
+    catalog_scope: Mapped[str] = mapped_column(String(20), default="unknown", index=True)
+    full_catalog_sites: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    catalog_verified: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    catalog_verification_reason: Mapped[str | None] = mapped_column(
+        String(300), nullable=True
+    )
 
     snapshots: Mapped[list["PriceSnapshot"]] = relationship(back_populates="run")
 
 
 def run_is_financially_eligible(run: Run | None) -> bool:
     """Only a verified full-catalog run may drive money recommendations."""
-    return bool(
-        run is not None
-        and run.status == "ok"
-        and (run.run_quality or {}).get("financially_eligible") is True
-    )
+    if run is None:
+        return False
+    if run.catalog_scope != "full" or not bool(run.catalog_verified):
+        return False
+    if (run.run_quality or {}).get("financially_eligible") is not True:
+        return False
+    if run.status == "ok":
+        return True
+    if run.status == "running":
+        from src.product_policy import is_finalizing_trusted_run
+
+        return is_finalizing_trusted_run(run.id)
+    return False
 
 
 class ScrapeRequest(Base):
@@ -169,6 +185,38 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String(500), index=True)
     brand: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
     manufacturer: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Authoritative manufacturing country for this concrete SKU.  Kept separate
+    # from manufacturer company/brand so identity policy does not conflate them.
+    manufacturer_country_code: Mapped[str | None] = mapped_column(
+        String(2), nullable=True, index=True
+    )
+    manufacturer_country_raw: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    country_resolution_status: Mapped[str] = mapped_column(
+        String(20), default="unknown", index=True
+    )
+    country_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    country_observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # A conflicting one-off observation is quarantined rather than immediately
+    # changing identity and repartitioning a cluster.
+    country_candidate_code: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    country_candidate_seen_count: Mapped[int] = mapped_column(Integer, default=0)
+    country_candidate_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    country_candidate_run_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    # Current website offer state.  This is independent from StockLevel, which
+    # represents the client's ERP stock.
+    offer_availability_status: Mapped[str] = mapped_column(
+        String(20), default="unknown", index=True
+    )
+    offer_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    availability_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    availability_observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    availability_run_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
     category: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     dosage: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 500mg, 10ml...
     pack_size: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 30 tab, 100ml...
@@ -328,8 +376,69 @@ class MatchRejection(Base):
         ForeignKey("products.id", ondelete="CASCADE"), index=True
     )
     reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reason_type: Mapped[str] = mapped_column(String(40), default="manual", index=True)
+    metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+
+
+class OfferObservation(Base):
+    """Trusted per-run observation of country and website availability."""
+
+    __tablename__ = "offer_observations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), index=True
+    )
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), index=True
+    )
+    country_code: Mapped[str | None] = mapped_column(String(2), nullable=True, index=True)
+    country_raw: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    country_resolution_status: Mapped[str] = mapped_column(String(20), default="unknown")
+    country_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    availability_status: Mapped[str] = mapped_column(String(20), default="unknown", index=True)
+    quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    availability_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class MatchPolicyAudit(Base):
+    """Rollback record for machine-driven match partitioning."""
+
+    __tablename__ = "match_policy_audits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    match_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(40), index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AloeCountryMapping(Base):
+    """Versioned, detail-page-verified Aloe manufacturer-country dictionary."""
+
+    __tablename__ = "aloe_country_mappings"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "country_id", name="uq_aloe_country_mapping"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    country_id: Mapped[str] = mapped_column(String(40), index=True)
+    country_code: Mapped[str] = mapped_column(String(2), index=True)
+    country_raw: Mapped[str] = mapped_column(String(160))
+    source_url: Mapped[str] = mapped_column(Text)
+    sample_count: Mapped[int] = mapped_column(Integer, default=1)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    verified_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Category(Base):
@@ -448,6 +557,17 @@ class RoiActionsCache(Base):
     computed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     # Какой `Run.id` сгенерил кэш — для отладки «откуда устаревшие цифры»
     run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Financial output differs between shadow/enforce.  Old cache rows are
+    # invalidated automatically when either product-policy mode changes.
+    policy_fingerprint: Mapped[str] = mapped_column(
+        String(80), default="legacy", nullable=False
+    )
+    # Exact verified full-catalog Run IDs used to calculate this payload.
+    # Age alone is insufficient: a newer full scan can change country/stock
+    # immediately while an otherwise "fresh" cache is still present.
+    trust_epoch: Mapped[str] = mapped_column(
+        String(240), default="legacy", nullable=False
+    )
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "client_site", name="uq_roi_cache_tenant_site"),
@@ -903,25 +1023,31 @@ def financially_eligible_run_ids(
     deliberately excluded. ``include_run_id`` is the one explicit in-pipeline
     exception for a classified current run whose post-processing is not done.
     """
-    from sqlalchemy import or_, select
+    from sqlalchemy import and_, desc, or_, select
+    from src.product_policy import is_finalizing_trusted_run
 
     completion_filter = Run.finished_at.is_not(None)
+    finalizing_run_ids = [
+        int(run_id)
+        for run_id in session.scalars(
+            select(Run.id).where(Run.tenant_id == tenant_id, Run.status == "running")
+        )
+        if is_finalizing_trusted_run(int(run_id))
+    ]
+    if finalizing_run_ids:
+        completion_filter = or_(completion_filter, Run.id.in_(finalizing_run_ids))
     if include_run_id is not None:
         completion_filter = or_(completion_filter, Run.id == include_run_id)
 
-    rows = session.execute(
-        select(Run.id, Run.status, Run.run_quality).where(
+    runs = session.scalars(
+        select(Run).where(
             Run.tenant_id == tenant_id,
-            Run.status == "ok",
+            Run.status.in_(["ok", "running"]),
             Run.run_quality.is_not(None),
             completion_filter,
         )
     ).all()
-    return [
-        int(run_id)
-        for run_id, status, quality in rows
-        if status == "ok" and (quality or {}).get("financially_eligible") is True
-    ]
+    return [int(run.id) for run in runs if run_is_financially_eligible(run)]
 
 
 def has_unfinished_run(session, *, tenant_id: int = 1) -> bool:
@@ -932,18 +1058,16 @@ def has_unfinished_run(session, *, tenant_id: int = 1) -> bool:
     combine a completed snapshot lineage with that state while any run is
     unfinished.  Stale orphan runs also remain fail-closed until recovery.
     """
-    from sqlalchemy import exists, select
+    from sqlalchemy import desc, select
+    from src.product_policy import is_finalizing_trusted_run
 
-    return bool(
-        session.scalar(
-            select(
-                exists().where(
-                    Run.tenant_id == tenant_id,
-                    Run.finished_at.is_(None),
-                )
-            )
+    unfinished_ids = session.scalars(
+        select(Run.id).where(
+            Run.tenant_id == tenant_id,
+            Run.finished_at.is_(None),
         )
-    )
+    ).all()
+    return any(not is_finalizing_trusted_run(int(run_id)) for run_id in unfinished_ids)
 
 
 def _terminal_run_ordering():
@@ -966,7 +1090,7 @@ def latest_terminal_run(session, *, tenant_id: int | None = 1) -> Run | None:
     can therefore let an earlier-finishing partial run hide a full run that
     completed later with degraded quality.
     """
-    from sqlalchemy import select
+    from sqlalchemy import desc, select
 
     stmt = select(Run).where(
         Run.status != "running",
@@ -989,25 +1113,47 @@ def latest_full_catalog_attempts_by_site(
     different site. Runs are streamed newest-completion-first and each site is
     filled exactly once.
     """
-    from sqlalchemy import select
+    from sqlalchemy import and_, desc, or_, select
+    from src.product_policy import is_finalizing_trusted_run
 
     wanted = set(sites)
     if not wanted:
         return {}
     out: dict[str, Run] = {}
+    finalizing_run_id = None
+    for candidate in session.scalars(
+        select(Run.id).where(Run.tenant_id == tenant_id, Run.status == "running")
+    ):
+        if is_finalizing_trusted_run(int(candidate)):
+            finalizing_run_id = int(candidate)
+            break
+    terminal_condition = and_(Run.status != "running", Run.finished_at.is_not(None))
+    terminal_or_finalizing = (
+        or_(terminal_condition, Run.id == finalizing_run_id)
+        if finalizing_run_id is not None
+        else terminal_condition
+    )
+    ordering = (desc(Run.id),) if finalizing_run_id is not None else _terminal_run_ordering()
     rows = session.scalars(
         select(Run)
         .where(
             Run.tenant_id == tenant_id,
-            Run.status != "running",
-            Run.finished_at.is_not(None),
+            terminal_or_finalizing,
+            Run.catalog_scope == "full",
+            Run.full_catalog_sites.is_not(None),
             Run.run_quality.is_not(None),
             Run.run_quality["baseline_enforced"].as_boolean().is_(True),
         )
-        .order_by(*_terminal_run_ordering())
+        .order_by(*ordering)
     ).yield_per(100)
     for run in rows:
-        run_sites = set(((run.run_quality or {}).get("sites") or {}).keys())
+        declared_sites = {
+            site.strip()
+            for site in (run.full_catalog_sites or "").split(",")
+            if site.strip()
+        }
+        quality_sites = set(((run.run_quality or {}).get("sites") or {}).keys())
+        run_sites = declared_sites & quality_sites
         for site in (wanted - out.keys()) & run_sites:
             out[site] = run
         if wanted.issubset(out):
@@ -1023,7 +1169,7 @@ def latest_financial_run_ids_by_site(
     before_run_id: int | None = None,
 ) -> dict[str, int]:
     """Latest verified full-catalog run lineage for each requested site."""
-    from sqlalchemy import select
+    from sqlalchemy import desc, select
 
     wanted = set(sites)
     if not wanted:
@@ -1037,9 +1183,8 @@ def latest_financial_run_ids_by_site(
         select(Run)
         .where(
             Run.id.in_(eligible_ids),
-            Run.finished_at.is_not(None),
         )
-        .order_by(*_terminal_run_ordering())
+        .order_by(desc(Run.id))
     ).all()
     out: dict[str, int] = {}
     for run in runs:

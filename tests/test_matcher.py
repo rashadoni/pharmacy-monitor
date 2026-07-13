@@ -1,5 +1,7 @@
 """Тесты fuzzy-матчинга товаров между сайтами."""
 
+from sqlalchemy import func, select
+
 from src import match_actions, matcher, storage
 from src.matcher import (
     _concentrations,
@@ -28,6 +30,7 @@ from src.matcher import (
 
 def _make_product(s, **kw) -> storage.Product:
     p = storage.Product(
+        tenant_id=kw.get("tenant_id", 1),
         site=kw.get("site", "pharmonline"),
         external_id=kw.get("external_id", "id-1"),
         url=kw.get("url", "http://example.com/p"),
@@ -40,6 +43,72 @@ def _make_product(s, **kw) -> storage.Product:
     s.add(p)
     s.flush()
     return p
+
+
+def test_match_products_isolates_second_tenant(db_session):
+    tenant_one = _make_product(
+        db_session,
+        tenant_id=1,
+        site="pharmonline",
+        external_id="tenant-one",
+        name="Tenant product 500 mg N20",
+        name_normalized="tenant product",
+        brand="Brand",
+        dosage="500mg",
+        pack_size="n20",
+    )
+    tenant_two_a = _make_product(
+        db_session,
+        tenant_id=2,
+        site="pharmonline",
+        external_id="tenant-two-a",
+        name="Tenant product 500 mg N20",
+        name_normalized="tenant product",
+        brand="Brand",
+        dosage="500mg",
+        pack_size="n20",
+    )
+    tenant_two_b = _make_product(
+        db_session,
+        tenant_id=2,
+        site="aloe",
+        external_id="tenant-two-b",
+        name="Tenant product 500 mg N20",
+        name_normalized="tenant product",
+        brand="Brand",
+        dosage="500mg",
+        pack_size="n20",
+    )
+    db_session.commit()
+
+    matcher.match_products(db_session, tenant_id=2)
+
+    assert tenant_one.canonical_id is None
+    assert tenant_two_a.canonical_id == tenant_two_b.canonical_id
+    match = db_session.get(storage.Match, tenant_two_a.canonical_id)
+    assert match is not None
+    assert match.tenant_id == 2
+
+
+def test_persist_match_rejects_mixed_tenant_cluster(db_session):
+    left = _make_product(
+        db_session,
+        tenant_id=1,
+        site="pharmonline",
+        external_id="mixed-left",
+        name="Mixed tenant",
+    )
+    right = _make_product(
+        db_session,
+        tenant_id=2,
+        site="aloe",
+        external_id="mixed-right",
+        name="Mixed tenant",
+    )
+
+    assert matcher._persist_match(db_session, [left, right]) == 0
+    assert left.canonical_id is None
+    assert right.canonical_id is None
 
 
 def test_exact_match_across_sites(db_session):
@@ -1457,10 +1526,14 @@ class TestCountryGuard:
         class A:
             manufacturer = "TÜRKİYƏ"
             url = None
+            manufacturer_country_code = "tr"
+            country_resolution_status = "resolved"
 
         class B:
             manufacturer = None
             url = "https://pharmonline.az/product/qliserin-50-ml-azerfarm-mmc-azerbaycan"
+            manufacturer_country_code = "az"
+            country_resolution_status = "resolved"
 
         assert _has_conflicting_country(A(), B()) is True  # tr ≠ az
 
@@ -1468,10 +1541,14 @@ class TestCountryGuard:
         class A:
             manufacturer = "Rusiya"
             url = None
+            manufacturer_country_code = "ru"
+            country_resolution_status = "resolved"
 
         class B:
             manufacturer = None
             url = "https://pharmonline.az/product/drug-rusiya"
+            manufacturer_country_code = "ru"
+            country_resolution_status = "resolved"
 
         assert _has_conflicting_country(A(), B()) is False  # ru == ru
 
@@ -1479,10 +1556,14 @@ class TestCountryGuard:
         class A:
             manufacturer = "TÜRKİYƏ"
             url = None
+            manufacturer_country_code = "tr"
+            country_resolution_status = "resolved"
 
         class B:
             manufacturer = None
             url = "https://pharmonline.az/product/drug-no-country-tail"
+            manufacturer_country_code = None
+            country_resolution_status = "unknown"
 
         assert _has_conflicting_country(A(), B()) is False  # одна страна неизвестна → не блок
 
@@ -1500,6 +1581,8 @@ def test_country_blocks_cross_country_match(db_session):
         pack_size="50ml",
     )
     a.manufacturer = "TÜRKİYƏ"
+    a.manufacturer_country_code = "tr"
+    a.country_resolution_status = "resolved"
     b = _make_product(
         s,
         site="pharmonline",
@@ -1510,6 +1593,8 @@ def test_country_blocks_cross_country_match(db_session):
         pack_size="50ml",
         url="https://pharmonline.az/product/qliserin-50-ml-mehlul-azerfarm-mmc-azerbaycan",
     )
+    b.manufacturer_country_code = "az"
+    b.country_resolution_status = "resolved"
     s.commit()
     matcher.match_products(s)
     s.refresh(a)
@@ -1731,6 +1816,94 @@ def test_revalidate_split(db_session):
     assert t_ph.canonical_id == m_trio.id  # coherent pair kept
     s.expire_all()  # drop cached Match.products (session is expire_on_commit=False)
     assert matcher.find_conflicting_clusters(s) == []  # nothing left flagged
+
+
+def test_revalidate_country_repartitions_into_all_viable_groups(db_session):
+    """A legacy snowball cluster can contain two valid country-specific pairs."""
+    s = db_session
+    match = storage.Match(canonical_name="Ornafer", confidence=1.0, is_manual=True)
+    s.add(match)
+    s.flush()
+
+    members = []
+    for site, ext, country in (
+        ("pharmonline", "ua-ph", "ua"),
+        ("aloe", "ua-aloe", "ua"),
+        ("pharmonline", "rs-ph", "rs"),
+        ("aptekonline", "rs-aptek", "rs"),
+    ):
+        product = _make_product(
+            s,
+            site=site,
+            external_id=ext,
+            name="Ornafer N30",
+            name_normalized="ornafer n30",
+        )
+        product.manufacturer_country_code = country
+        product.country_resolution_status = "resolved"
+        product.canonical_id = match.id
+        members.append(product)
+    s.commit()
+
+    actions = matcher.revalidate_split(s)
+
+    assert actions[0]["action"] == "split"
+    assert len(actions[0]["groups"]) == 2
+    s.expire_all()
+    clusters = {
+        p.manufacturer_country_code: p.canonical_id
+        for p in s.scalars(
+            select(storage.Product).where(storage.Product.id.in_([p.id for p in members]))
+        )
+    }
+    assert clusters["ua"] is not None
+    assert clusters["rs"] is not None
+    assert clusters["ua"] != clusters["rs"]
+    assert s.scalar(select(func.count(storage.MatchPolicyAudit.id))) == 1
+
+
+def test_revalidate_detaches_oos_without_permanent_rejection(db_session):
+    """An explicit OOS offer is not an active match and may rematch after restock."""
+    s = db_session
+    match = storage.Match(canonical_name="Ornafer", confidence=1.0, is_manual=True)
+    s.add(match)
+    s.flush()
+
+    members = []
+    for site, ext, availability in (
+        ("pharmonline", "ornafer-ph", "in_stock"),
+        ("aloe", "ornafer-aloe", "in_stock"),
+        ("aptekonline", "ornafer-aptek", "out_of_stock"),
+    ):
+        product = _make_product(
+            s,
+            site=site,
+            external_id=ext,
+            name="Ornafer N30",
+            name_normalized="ornafer n30",
+        )
+        product.manufacturer_country_code = "gb"
+        product.country_resolution_status = "resolved"
+        product.offer_availability_status = availability
+        product.canonical_id = match.id
+        members.append(product)
+    s.commit()
+
+    actions = matcher.revalidate_split(s)
+
+    assert len(actions) == 1
+    assert actions[0]["match_id"] == match.id
+    assert actions[0]["action"] == "split"
+    assert {frozenset(group) for group in actions[0]["groups"]} == {
+        frozenset((members[0].id, members[1].id))
+    }
+    assert set(actions[0]["unmatched"]) == {members[2].id}
+    s.refresh(members[2])
+    assert members[2].canonical_id is None
+    assert members[0].canonical_id == members[1].canonical_id == match.id
+    assert s.scalar(select(func.count(storage.MatchRejection.id))) == 0
+    audit = s.scalar(select(storage.MatchPolicyAudit))
+    assert audit.action == "offer_repartition"
 
 
 def test_dimension_blocks_different_size(db_session):

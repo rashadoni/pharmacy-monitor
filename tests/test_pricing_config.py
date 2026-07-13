@@ -67,14 +67,24 @@ def test_compute_actions_explicit_kwarg_overrides_db(db_session):
     assert isinstance(actions, list)
 
 
-def test_compute_actions_sets_module_min_margin(db_session):
-    """Module-level _CURRENT_MIN_MARGIN_PCT should reflect either DB or kwarg."""
+def test_compute_actions_passes_min_margin_without_module_state(
+    db_session, monkeypatch
+):
+    """DB/kwarg margin is passed explicitly; concurrent calls share no state."""
     cfg = storage.load_pricing_config(db_session, tenant_id=1)
     cfg.min_margin_pct = 15.0
     db_session.commit()
+    seen = []
+
+    def capture(*args, **kwargs):
+        seen.append(kwargs["min_margin_pct"])
+        return []
+
+    monkeypatch.setattr(roi, "_undercut_threats", capture)
+    monkeypatch.setattr(roi, "financial_inputs_are_fresh", lambda *args, **kwargs: True)
 
     roi.compute_actions(db_session)
-    assert roi._CURRENT_MIN_MARGIN_PCT == 15.0
-
     roi.compute_actions(db_session, min_margin_pct=20.0)
-    assert roi._CURRENT_MIN_MARGIN_PCT == 20.0
+
+    assert seen == [15.0, 20.0]
+    assert not hasattr(roi, "_CURRENT_MIN_MARGIN_PCT")

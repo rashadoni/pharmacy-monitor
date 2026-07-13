@@ -153,6 +153,49 @@ def test_swap_alternative_replaces_product(db_session):
     assert ma.is_rejected(db_session, p2.id, new_p.id) is True
 
 
+def test_swap_alternative_enforce_rejects_unknown_country(db_session, monkeypatch):
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "enforce")
+    match, products = _make_match_cluster(
+        db_session, "Paracetamol", ["pharmonline", "aloe"]
+    )
+    for product in products:
+        product.manufacturer_country_code = "rs"
+        product.country_resolution_status = "resolved"
+    candidate = _make_product(
+        db_session,
+        site="aloe",
+        external_id="aloe-country-unknown",
+        name="Paracetamol",
+    )
+    db_session.commit()
+
+    assert ma.swap_alternative(db_session, match.id, "aloe", candidate.id) is False
+    assert candidate.canonical_id is None
+
+
+def test_swap_alternative_enforce_rejects_stale_offer(db_session, monkeypatch):
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "enforce")
+    match, products = _make_match_cluster(
+        db_session, "Paracetamol", ["pharmonline", "aloe"]
+    )
+    now = datetime.datetime.utcnow()
+    for product in products:
+        product.offer_availability_status = "in_stock"
+        product.availability_observed_at = now
+    candidate = _make_product(
+        db_session,
+        site="aloe",
+        external_id="aloe-stale",
+        name="Paracetamol",
+    )
+    candidate.offer_availability_status = "in_stock"
+    candidate.availability_observed_at = now - datetime.timedelta(days=10)
+    db_session.commit()
+
+    assert ma.swap_alternative(db_session, match.id, "aloe", candidate.id) is False
+    assert candidate.canonical_id is None
+
+
 def test_list_rejections_for_product(db_session):
     p1 = _make_product(db_session, name="A", external_id="1")
     p2 = _make_product(db_session, name="B", external_id="2")

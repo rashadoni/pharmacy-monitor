@@ -25,6 +25,8 @@
     "loading": "Loading…",
     "updating": "Updating…",
     "error": "Failed to load",
+    "financial_data_paused": "Financial comparisons are temporarily hidden while the system waits for a fresh, verified full catalog from all three sites with confirmed manufacturing country and availability.",
+    "system_degraded": "The latest run failed. Data and recommendations may be incomplete; check the run status.",
     "save": "Save",
     "cancel": "Cancel",
     "delete": "Delete",
@@ -149,7 +151,10 @@
     "alts_none": "No similar products found — paste your own link.",
     "alts_pick": "Pick",
     "category_filter": "Category: {category}",
-    "category_filter_clear": "Clear filter"
+    "category_filter_clear": "Clear filter",
+    "country_verified": "Manufacturing country verified: {code}",
+    "country_unverified": "Manufacturing country is not verified yet",
+    "country_unknown_short": "country ?"
   },
   "overview": {
     "title": "Overview",

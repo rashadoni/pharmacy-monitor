@@ -13,8 +13,10 @@ Coverage:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
@@ -103,6 +105,39 @@ def test_health_endpoint_db_ping_responds_quickly(client):
     assert r.status_code == 200
     body = r.json()
     assert body["db_ping_ms"] < 100
+
+
+def test_roi_cold_cache_fails_closed_without_inline_compute(setup_db, monkeypatch):
+    from src import roi
+
+    calls: dict[str, int] = {}
+    monkeypatch.setattr(
+        api_module, "_require_financial_policy_ready", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(roi, "get_cached_actions", lambda *args, **kwargs: None)
+
+    def fake_compute(session, client_site="pharmonline", *, tenant_id=1):
+        calls["compute_tenant"] = tenant_id
+        return []
+
+    def fake_cache(session, client_site, actions, *, tenant_id=1, **kwargs):
+        calls["cache_tenant"] = tenant_id
+
+    monkeypatch.setattr(roi, "compute_actions", fake_compute)
+    monkeypatch.setattr(roi, "cache_actions", fake_cache)
+
+    import pytest
+
+    with pytest.raises(HTTPException) as exc:
+        api_module.dash_roi_actions(
+            client_site="pharmonline",
+            locale="ru",
+            user=SimpleNamespace(tenant_id=2),
+            db=setup_db,
+        )
+
+    assert exc.value.status_code == 503
+    assert calls == {}
 
 
 def test_health_endpoint_redis_unset_returns_null(client, monkeypatch):
@@ -221,6 +256,9 @@ def test_health_endpoint_ignores_post_processing_run(client, setup_db):
                 started_at=now - timedelta(hours=1),
                 finished_at=now - timedelta(minutes=30),
                 status="degraded",
+                catalog_scope="full",
+                full_catalog_sites="pharmonline,aptekonline,aloe",
+                catalog_verified=False,
                 run_quality={
                     "baseline_enforced": True,
                     "full_catalog_verified": False,
@@ -232,7 +270,10 @@ def test_health_endpoint_ignores_post_processing_run(client, setup_db):
                 tenant_id=1,
                 started_at=now,
                 finished_at=None,
-                status="ok",
+                status="running",
+                catalog_scope="full",
+                full_catalog_sites="pharmonline,aptekonline,aloe",
+                catalog_verified=True,
                 run_quality={
                     "baseline_enforced": True,
                     "full_catalog_verified": True,
@@ -315,6 +356,9 @@ def test_health_endpoint_partial_ok_preserves_full_catalog_failure(client, setup
         started_at=now - timedelta(hours=2),
         finished_at=now - timedelta(hours=1),
         status="degraded",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=False,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": False,
@@ -330,6 +374,9 @@ def test_health_endpoint_partial_ok_preserves_full_catalog_failure(client, setup
             started_at=now - timedelta(minutes=30),
             finished_at=now,
             status="ok",
+            catalog_scope="partial",
+            full_catalog_sites=None,
+            catalog_verified=False,
             run_quality={
                 "baseline_enforced": False,
                 "full_catalog_verified": False,
@@ -357,6 +404,9 @@ def test_health_endpoint_aloe_full_does_not_mask_other_degraded_sites(client, se
             started_at=now - timedelta(hours=2),
             finished_at=now - timedelta(hours=1),
             status="degraded",
+            catalog_scope="full",
+            full_catalog_sites="pharmonline,aptekonline,aloe",
+            catalog_verified=False,
             run_quality={
                 "baseline_enforced": True,
                 "full_catalog_verified": False,
@@ -375,6 +425,9 @@ def test_health_endpoint_aloe_full_does_not_mask_other_degraded_sites(client, se
             started_at=now - timedelta(minutes=30),
             finished_at=now,
             status="ok",
+            catalog_scope="full",
+            full_catalog_sites="aloe",
+            catalog_verified=True,
             run_quality={
                 "baseline_enforced": True,
                 "full_catalog_verified": True,
@@ -451,6 +504,213 @@ def test_health_endpoint_uses_weekly_aptekonline_threshold(client, setup_db):
     sites = {s["site"]: s for s in body["sites"]}
     assert sites["aptekonline"]["hours_since"] >= 100
     assert sites["aptekonline"]["max_age_hours"] == 198
+
+
+def test_health_endpoint_degrades_on_latest_failed_run(client, setup_db):
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            status="failed",
+            started_at=utcnow(),
+            finished_at=utcnow(),
+            error_message="identity revalidation failed",
+        )
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["last_run_status"] == "failed"
+
+
+def _add_policy_ready_catalog(db, *, verified: bool = True) -> None:
+    now = utcnow()
+    run = storage.Run(
+        tenant_id=1,
+        status="ok",
+        started_at=now,
+        finished_at=now,
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=verified,
+        catalog_verification_reason=("complete_nonzero_coverage_ok" if verified else "failed"),
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": verified,
+            "financially_eligible": verified,
+            "sites": {
+                "pharmonline": {"status": "ok" if verified else "failed"},
+                "aptekonline": {"status": "ok" if verified else "failed"},
+                "aloe": {"status": "ok" if verified else "failed"},
+            },
+        },
+    )
+    db.add(run)
+    db.flush()
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        product = storage.Product(
+            tenant_id=1,
+            site=site,
+            external_id=f"policy-{site}",
+            url=f"https://example.com/{site}",
+            name=f"Policy {site}",
+            name_normalized=f"policy {site}",
+            first_seen_at=now,
+            last_seen_at=now,
+            manufacturer_country_code="rs",
+            country_resolution_status="resolved",
+            offer_availability_status="in_stock",
+            availability_observed_at=now,
+        )
+        db.add(product)
+        db.flush()
+        db.add(
+            storage.OfferObservation(
+                tenant_id=1,
+                run_id=run.id,
+                product_id=product.id,
+                country_code="rs",
+                country_raw="Serbia",
+                country_resolution_status="resolved",
+                country_source="test",
+                availability_status="in_stock",
+                availability_source="test",
+                observed_at=now,
+            )
+        )
+    db.commit()
+    return run
+
+
+def _mark_trusted_full_run(
+    db,
+    run: storage.Run,
+    *,
+    tenant_id: int = 1,
+    sites: tuple[str, ...] = ("pharmonline", "aptekonline", "aloe"),
+) -> storage.Run:
+    """Make a test run eligible for money-facing endpoints.
+
+    Production now fails closed unless snapshots come from a verified
+    full-catalog run. Most legacy API tests only cared about comparison logic,
+    so their bare `Run(status="ok")` fixtures need this explicit trust envelope.
+    """
+    now = utcnow()
+    run.tenant_id = tenant_id
+    run.status = "ok"
+    run.started_at = run.started_at or now
+    run.finished_at = run.finished_at or run.started_at
+    run.catalog_scope = "full"
+    run.full_catalog_sites = ",".join(sites)
+    run.catalog_verified = True
+    run.catalog_verification_reason = "test_verified_full_catalog"
+    run.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {site: {"status": "ok"} for site in sites},
+    }
+    db.add(run)
+    db.flush()
+    return run
+
+
+def test_health_policy_gate_requires_verified_full_catalog(
+    client, setup_db, monkeypatch
+):
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "enforce")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "enforce")
+    _add_policy_ready_catalog(setup_db, verified=False)
+
+    body = client.get("/health").json()
+    assert body["status"] == "degraded"
+    assert body["product_policy"]["policy_ready"] is False
+    assert body["product_policy"]["full_catalog_trust_ready"] is False
+    assert all(
+        row["full_catalog_run_id"] is None
+        for row in body["product_policy"]["sites"]
+    )
+
+
+def test_health_policy_gate_opens_only_with_fresh_coverage(
+    client, setup_db, monkeypatch
+):
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "enforce")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "enforce")
+    _add_policy_ready_catalog(setup_db)
+
+    body = client.get("/health").json()
+    assert body["status"] == "up"
+    assert body["product_policy"]["policy_ready"] is True
+    assert body["product_policy"]["full_catalog_trust_ready"] is True
+    assert all(row["ready"] for row in body["product_policy"]["sites"])
+
+
+def test_newer_unverified_full_attempt_closes_previous_trust(
+    client, setup_db, monkeypatch
+):
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "enforce")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "enforce")
+    _add_policy_ready_catalog(setup_db, verified=True)
+    now = utcnow()
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            status="ok",
+            started_at=now,
+            finished_at=now,
+            catalog_scope="full",
+            full_catalog_sites="pharmonline,aptekonline,aloe",
+            catalog_verified=False,
+            catalog_verification_reason="aloe:pages_skipped=1",
+        )
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["product_policy"]["policy_ready"] is False
+    assert all(
+        row["latest_full_attempt_verified"] is False
+        and row["full_catalog_run_id"] is None
+        for row in body["product_policy"]["sites"]
+    )
+
+
+def test_partial_product_refresh_cannot_rewrite_full_run_trust(
+    client, setup_db, monkeypatch
+):
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "enforce")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "enforce")
+    _add_policy_ready_catalog(setup_db)
+    aloe = setup_db.scalar(
+        select(storage.Product).where(storage.Product.site == "aloe")
+    )
+    observation = setup_db.scalar(
+        select(storage.OfferObservation).where(
+            storage.OfferObservation.product_id == aloe.id
+        )
+    )
+    observation.country_code = None
+    observation.country_resolution_status = "ambiguous"
+    observation.availability_status = "unknown"
+    # Mutable current state resembles a later successful partial observation.
+    aloe.manufacturer_country_code = "rs"
+    aloe.country_resolution_status = "resolved"
+    aloe.offer_availability_status = "in_stock"
+    aloe.availability_observed_at = utcnow()
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    aloe_policy = next(
+        row for row in body["product_policy"]["sites"] if row["site"] == "aloe"
+    )
+    assert aloe_policy["country_coverage_pct"] == 0
+    assert aloe_policy["availability_coverage_pct"] == 0
 
 
 # ─── Request ID middleware (Phase 0.5) ───────────────────────────────────────
@@ -532,6 +792,82 @@ def test_dash_me_without_cookie_401(client):
 def test_dash_comparison_without_cookie_401(client):
     r = client.get("/api/v1/dash/comparison")
     assert r.status_code == 401
+
+
+def test_dash_comparison_ignores_newer_untrusted_snapshot(
+    client, auth_cookie, setup_db
+):
+    trusted = _add_policy_ready_catalog(setup_db)
+    partial = storage.Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="degraded",
+        catalog_scope="partial",
+        catalog_verified=False,
+        run_quality={
+            "baseline_enforced": False,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"pharmonline": {"status": "degraded"}},
+        },
+    )
+    setup_db.add(partial)
+    setup_db.flush()
+    match = storage.Match(tenant_id=1, canonical_name="Trusted comparison", confidence=1.0)
+    setup_db.add(match)
+    setup_db.flush()
+    products = {}
+    for site in ("pharmonline", "aloe"):
+        product = storage.Product(
+            tenant_id=1,
+            site=site,
+            external_id=f"cmp-{site}",
+            url=f"https://example.com/{site}/cmp",
+            name="Trusted comparison",
+            name_normalized="trusted comparison",
+            canonical_id=match.id,
+            manufacturer_country_code="rs",
+            country_resolution_status="resolved",
+            offer_availability_status="in_stock",
+            availability_observed_at=utcnow(),
+        )
+        setup_db.add(product)
+        setup_db.flush()
+        products[site] = product
+    setup_db.add_all(
+        [
+            storage.PriceSnapshot(
+                run_id=trusted.id,
+                product_id=products["pharmonline"].id,
+                price=10.0,
+            ),
+            storage.PriceSnapshot(
+                run_id=trusted.id,
+                product_id=products["aloe"].id,
+                price=8.0,
+            ),
+            storage.PriceSnapshot(
+                run_id=partial.id,
+                product_id=products["pharmonline"].id,
+                price=99.0,
+            ),
+            storage.PriceSnapshot(
+                run_id=partial.id,
+                product_id=products["aloe"].id,
+                price=1.0,
+            ),
+        ]
+    )
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/comparison?search=Trusted%20comparison")
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert len(rows) == 1
+    assert rows[0]["prices"]["pharmonline"]["price"] == 10.0
+    assert rows[0]["prices"]["aloe"]["price"] == 8.0
 
 
 def test_dash_runs_latest_by_site_includes_weekly_site(client, auth_cookie, setup_db):
@@ -856,6 +1192,7 @@ def _make_match_with_prices(db, run, *, canonical, prices, tenant_id=1, category
     `category` (опц.) проставляется всем products — для тестов
     /category-comparison и drill-down /comparison?category=.
     """
+    _mark_trusted_full_run(db, run, tenant_id=tenant_id)
     m = storage.Match(tenant_id=tenant_id, canonical_name=canonical, confidence=1.0)
     db.add(m)
     db.flush()
@@ -915,8 +1252,141 @@ def test_comparison_limit_applies_after_filter(client, tenant_user, setup_db):
     assert not any(n.startswith("solo") for n in names)
 
 
+def test_comparison_fails_closed_when_enforce_lacks_full_catalog(
+    client, tenant_user, setup_db, monkeypatch
+):
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "enforce")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "enforce")
+    token = tenants.issue_magic_token(setup_db, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+
+    response = client.get("/api/v1/dash/comparison")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "full_catalog_trust_not_ready"
+
+
+def test_forecast_fails_closed_when_enforce_lacks_full_catalog(
+    client, tenant_user, setup_db, monkeypatch
+):
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "enforce")
+    token = tenants.issue_magic_token(setup_db, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+
+    response = client.get("/api/v1/dash/forecast/movers")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "full_catalog_trust_not_ready"
+
+
+def test_forecast_movers_ignores_newer_untrusted_snapshot(
+    client, auth_cookie, setup_db
+):
+    product = storage.Product(
+        tenant_id=1,
+        site="aloe",
+        external_id="forecast-trusted",
+        url="https://aloe.example/forecast-trusted",
+        name="Forecast trusted",
+        name_normalized="forecast trusted",
+        last_seen_at=utcnow(),
+    )
+    setup_db.add(product)
+    setup_db.flush()
+    old_run = _mark_trusted_full_run(
+        setup_db,
+        storage.Run(tenant_id=1, started_at=utcnow() - timedelta(days=10), status="ok"),
+    )
+    new_run = _mark_trusted_full_run(
+        setup_db,
+        storage.Run(tenant_id=1, started_at=utcnow() - timedelta(days=1), status="ok"),
+    )
+    partial_run = storage.Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="ok",
+        catalog_scope="partial",
+        catalog_verified=False,
+        run_quality={
+            "baseline_enforced": False,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"aloe": {"status": "ok"}},
+        },
+    )
+    setup_db.add(partial_run)
+    setup_db.flush()
+    setup_db.add_all(
+        [
+            storage.PriceSnapshot(run_id=old_run.id, product_id=product.id, price=10.0),
+            storage.PriceSnapshot(run_id=new_run.id, product_id=product.id, price=8.0),
+            storage.PriceSnapshot(run_id=partial_run.id, product_id=product.id, price=1.0),
+        ]
+    )
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/forecast/movers?limit=10")
+
+    assert response.status_code == 200, response.text
+    row = next(item for item in response.json() if item["name"] == "Forecast trusted")
+    assert row["first_price"] == 10.0
+    assert row["last_price"] == 8.0
+    assert row["change_pct"] == -20.0
+
+
+def test_comparison_excludes_known_cross_country_cluster_even_in_shadow(
+    client, tenant_user, setup_db
+):
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    match = _make_match_with_prices(
+        s,
+        run,
+        canonical="Ornafer cross-country",
+        prices={"pharmonline": 26.2, "aloe": 25.4},
+    )
+    products = list(match.products)
+    products[0].manufacturer_country_code = "lv"
+    products[1].manufacturer_country_code = "gb"
+    for product in products:
+        product.country_resolution_status = "resolved"
+    s.commit()
+
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    assert not any(row["name"] == "Ornafer cross-country" for row in rows)
+
+
+def test_comparison_excludes_only_explicit_oos_offer(client, tenant_user, setup_db):
+    s = setup_db
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    s.add(run)
+    s.flush()
+    match = _make_match_with_prices(
+        s,
+        run,
+        canonical="Three offers",
+        prices={"pharmonline": 10.0, "aptekonline": 9.0, "aloe": 8.0},
+    )
+    aloe = next(product for product in match.products if product.site == "aloe")
+    aloe.offer_availability_status = "out_of_stock"
+    aloe.availability_observed_at = utcnow()
+    s.commit()
+
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    row = next(item for item in rows if item["name"] == "Three offers")
+    assert set(row["prices"]) == {"pharmonline", "aptekonline"}
+
+
 def _make_match_with_packs(db, run, *, canonical, prods, tenant_id=1):
     """Match + products с заданными (site, price, pack_size, name)."""
+    _mark_trusted_full_run(db, run, tenant_id=tenant_id)
     m = storage.Match(tenant_id=tenant_id, canonical_name=canonical, confidence=1.0)
     db.add(m)
     db.flush()
@@ -1190,6 +1660,7 @@ def _make_match_with_freshness(db, run, *, canonical, prods, tenant_id=1):
 
     Фасовка одинаковая (n20) у всех → basis остаётся raw, изолируем freshness.
     """
+    _mark_trusted_full_run(db, run, tenant_id=tenant_id)
     m = storage.Match(tenant_id=tenant_id, canonical_name=canonical, confidence=1.0)
     db.add(m)
     db.flush()
@@ -1563,6 +2034,53 @@ def test_legacy_comparisons_with_key_empty(client):
     )
     assert r.status_code == 200
     assert r.json() == []  # empty DB
+
+
+def test_legacy_comparisons_ignore_newer_untrusted_snapshot(client, setup_db):
+    run = storage.Run(tenant_id=1, started_at=utcnow() - timedelta(hours=2), status="ok")
+    setup_db.add(run)
+    setup_db.flush()
+    match = _make_match_with_prices(
+        setup_db,
+        run,
+        canonical="Legacy trusted",
+        prices={"pharmonline": 10.0, "aloe": 8.0},
+    )
+    aloe = next(product for product in match.products if product.site == "aloe")
+    partial_run = storage.Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="ok",
+        catalog_scope="partial",
+        catalog_verified=False,
+        run_quality={
+            "baseline_enforced": False,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"aloe": {"status": "ok"}},
+        },
+    )
+    setup_db.add(partial_run)
+    setup_db.flush()
+    setup_db.add(
+        storage.PriceSnapshot(
+            run_id=partial_run.id,
+            product_id=aloe.id,
+            price=1.0,
+            captured_at=utcnow() + timedelta(seconds=1),
+        )
+    )
+    setup_db.commit()
+
+    response = client.get(
+        "/api/v1/comparisons",
+        headers={"X-API-Key": "test-key-1234"},
+    )
+
+    assert response.status_code == 200, response.text
+    row = next(item for item in response.json() if item["name"] == "Legacy trusted")
+    assert row["prices"]["aloe"]["price"] == 8.0
 
 
 def test_legacy_invalid_key_401(client):
@@ -2382,6 +2900,30 @@ def test_match_confirm_sets_is_manual(client, tenant_user, setup_db):
     s.refresh(m)
     assert m.is_manual is True
     assert m.needs_review is False
+
+
+def test_match_confirm_rejects_known_country_conflict(
+    client, tenant_user, setup_db
+):
+    s = setup_db
+    match = _make_match_with_products(
+        s, confidence=0.5, needs_review=True, canonical="Country conflict"
+    )
+    products = list(match.products)
+    products[0].manufacturer_country_code = "ua"
+    products[1].manufacturer_country_code = "rs"
+    for product in products:
+        product.country_resolution_status = "resolved"
+    s.commit()
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+
+    response = client.post(f"/api/v1/dash/matches/{match.id}/confirm")
+
+    assert response.status_code == 409
+    assert "different manufacturing countries" in response.text
+    s.refresh(match)
+    assert match.is_manual is False
 
 
 def test_match_confirm_404_on_unknown(client, tenant_user, setup_db):
@@ -3302,7 +3844,8 @@ def test_category_comparison_tenant_isolation(client, tenant_user, setup_db):
         pytest.skip("python-jose not installed")
     s = setup_db
     run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
-    s.add(run)
+    run2 = storage.Run(tenant_id=2, started_at=utcnow(), status="ok")
+    s.add_all([run, run2])
     s.flush()
     _make_match_with_prices(
         s,
@@ -3314,7 +3857,7 @@ def test_category_comparison_tenant_isolation(client, tenant_user, setup_db):
     )
     _make_match_with_prices(
         s,
-        run,
+        run2,
         canonical="x1",
         prices={"pharmonline": 10.0, "aloe": 8.0},
         category="secret",
@@ -3507,6 +4050,47 @@ def test_match_create_with_products_sets_manual_strategy(client, tenant_user, se
     s.refresh(p2)
     assert p1.canonical_id == payload["match_id"]
     assert p2.canonical_id == payload["match_id"]
+
+
+def test_match_create_with_products_rejects_explicit_oos(
+    client, tenant_user, setup_db
+):
+    s = setup_db
+    now = utcnow()
+    available = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="manual-active",
+        url="https://pharm.example/manual-active",
+        name="Manual active",
+        name_normalized="manual active",
+        offer_availability_status="in_stock",
+        availability_observed_at=now,
+    )
+    unavailable = storage.Product(
+        tenant_id=1,
+        site="aptekonline",
+        external_id="manual-oos",
+        url="https://aptek.example/manual-oos",
+        name="Manual unavailable",
+        name_normalized="manual unavailable",
+        offer_availability_status="out_of_stock",
+        availability_observed_at=now,
+    )
+    s.add_all([available, unavailable])
+    s.commit()
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+
+    response = client.post(
+        "/api/v1/dash/matches/create-with-products",
+        json={"product_ids": [available.id, unavailable.id]},
+    )
+
+    assert response.status_code == 409
+    assert "out of stock" in response.text
+    assert available.canonical_id is None
+    assert unavailable.canonical_id is None
 
 
 def test_candidate_analogs_ranks_guard_passing_and_flags_auto_safe(client, tenant_user, setup_db):
@@ -4195,23 +4779,11 @@ def test_roi_status_is_unavailable_without_verified_cache(client, auth_cookie):
 def test_roi_actions_serves_cache_from_financially_eligible_run(
     client, auth_cookie, setup_db
 ):
-    run = storage.Run(
-        tenant_id=1,
-        status="ok",
-        finished_at=utcnow(),
-        run_quality={
-            "baseline_enforced": True,
-            "full_catalog_verified": True,
-            "financially_eligible": True,
-            "sites": {
-                "pharmonline": {"status": "ok"},
-                "aptekonline": {"status": "ok"},
-                "aloe": {"status": "ok"},
-            },
-        },
-    )
-    setup_db.add(run)
-    setup_db.flush()
+    from src.product_policy import policy_fingerprint, trusted_catalog_epoch
+
+    run = _add_policy_ready_catalog(setup_db)
+    epoch = trusted_catalog_epoch(setup_db)
+    assert epoch is not None
     setup_db.add(
         storage.RoiActionsCache(
             tenant_id=1,
@@ -4219,6 +4791,8 @@ def test_roi_actions_serves_cache_from_financially_eligible_run(
             run_id=run.id,
             computed_at=utcnow(),
             payload=[],
+            policy_fingerprint=policy_fingerprint(),
+            trust_epoch=epoch,
         )
     )
     setup_db.commit()
@@ -4242,11 +4816,16 @@ def test_roi_actions_serves_cache_from_financially_eligible_run(
 def test_roi_actions_rejects_cache_after_newer_degraded_full_run(
     client, auth_cookie, setup_db
 ):
+    from src.product_policy import policy_fingerprint, trusted_catalog_epoch
+
     cached_run = storage.Run(
         tenant_id=1,
         started_at=utcnow() - timedelta(hours=2),
         finished_at=utcnow() - timedelta(hours=1),
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": True,
@@ -4260,6 +4839,8 @@ def test_roi_actions_rejects_cache_after_newer_degraded_full_run(
     )
     setup_db.add(cached_run)
     setup_db.flush()
+    epoch = trusted_catalog_epoch(setup_db)
+    assert epoch is not None
     setup_db.add(
         storage.RoiActionsCache(
             tenant_id=1,
@@ -4267,6 +4848,8 @@ def test_roi_actions_rejects_cache_after_newer_degraded_full_run(
             run_id=cached_run.id,
             computed_at=utcnow(),
             payload=[],
+            policy_fingerprint=policy_fingerprint(),
+            trust_epoch=epoch,
         )
     )
     setup_db.add(
@@ -4275,6 +4858,9 @@ def test_roi_actions_rejects_cache_after_newer_degraded_full_run(
             started_at=utcnow() - timedelta(minutes=30),
             finished_at=utcnow(),
             status="degraded",
+            catalog_scope="full",
+            full_catalog_sites="pharmonline,aptekonline,aloe",
+            catalog_verified=False,
             run_quality={
                 "baseline_enforced": True,
                 "full_catalog_verified": False,
@@ -4289,6 +4875,9 @@ def test_roi_actions_rejects_cache_after_newer_degraded_full_run(
             started_at=utcnow() - timedelta(minutes=10),
             finished_at=utcnow() + timedelta(seconds=1),
             status="ok",
+            catalog_scope="full",
+            full_catalog_sites="aloe",
+            catalog_verified=True,
             run_quality={
                 "baseline_enforced": True,
                 "full_catalog_verified": True,

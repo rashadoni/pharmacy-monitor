@@ -98,6 +98,15 @@ export function isVerifiedScanPendingError(err: unknown): err is ApiError {
   }
 }
 
+/** True when financial views are intentionally paused by the fail-closed gate. */
+export function isFullCatalogTrustError(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 503 &&
+    error.detail.includes("full_catalog_trust_not_ready")
+  );
+}
+
 /**
  * Преобразовать ApiError / Error в человекочитаемое сообщение для UI.
  * Анализирует Pydantic 422 (validation), 401/403/404/409 и timeout 408.
@@ -274,6 +283,14 @@ export interface ComparisonRow {
       is_on_sale: boolean;
       url: string;
       product_id: number;
+      country_code?: string | null;
+      country_resolution_status?:
+        | "resolved"
+        | "unknown"
+        | "ambiguous"
+        | "invalid";
+      availability_status?: "in_stock" | "out_of_stock" | "unknown";
+      availability_observed_at?: string | null;
       // Per-unit normalization (2026-05-29). pack_count = штук в упаковке,
       // unit_price = price/pack_count. Заполняются всегда; используются для
       // отображения когда spread_basis === "unit".
@@ -440,6 +457,19 @@ export interface PriceIndexRow {
   matched_skus: number | null;
 }
 
+export interface ForecastMover {
+  product_id: number;
+  site: string;
+  name: string;
+  n_points: number;
+  first_price: number;
+  last_price: number;
+  change_pct: number;
+  direction: "rising" | "falling" | "stable";
+  forecast_7d_price: number | null;
+  confidence: "low" | "medium" | "high";
+}
+
 export interface CategoryComparisonRow {
   /** slug (Product.category) — ключ drill-down в /comparison?category=. */
   category: string;
@@ -588,19 +618,6 @@ export interface RoiStatus {
 export interface RoiRecommendations {
   items: RoiAction[];
   provenance: RoiStatus;
-}
-
-export interface ForecastMover {
-  product_id: number;
-  site: string;
-  name: string;
-  n_points: number;
-  first_price: number;
-  last_price: number;
-  change_pct: number;
-  direction: "rising" | "falling" | "stable";
-  forecast_7d_price: number | null;
-  confidence: "low" | "medium" | "high";
 }
 
 export interface AnchorProduct {
@@ -833,6 +850,15 @@ export interface Health {
   full_catalog_run_at: string | null;
   full_catalog_status: string | null;
   full_catalog_verified: boolean;
+  product_policy: {
+    country_mode?: string;
+    availability_mode?: string;
+    full_catalog_trust_ready?: boolean;
+    country_trust_ready?: boolean;
+    availability_trust_ready?: boolean;
+    policy_ready?: boolean;
+    sites?: Array<Record<string, unknown>>;
+  };
 }
 
 export interface SystemStatus extends Health {
@@ -1123,6 +1149,8 @@ export const api = {
       `/api/v1/dash/price-index${qs ? `?${qs}` : ""}`,
     );
   },
+  forecastMovers: () =>
+    request<ForecastMover[]>("/api/v1/dash/forecast/movers"),
   categoryComparison: (client_site?: string, locale?: string) => {
     const q = new URLSearchParams();
     if (client_site) q.set("client_site", client_site);
@@ -1132,8 +1160,6 @@ export const api = {
       `/api/v1/dash/category-comparison${qs ? `?${qs}` : ""}`,
     );
   },
-  forecastMovers: () =>
-    request<ForecastMover[]>("/api/v1/dash/forecast/movers"),
   siteProducts: (params: {
     site: string;
     category?: string;

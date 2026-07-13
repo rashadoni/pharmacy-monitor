@@ -8,7 +8,24 @@ from src.storage import Match, PriceSnapshot, Product, Run
 
 
 def _add_run(s, started_at):
-    r = Run(started_at=started_at, status="ok")
+    r = Run(
+        started_at=started_at,
+        finished_at=started_at,
+        status="ok",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
     s.add(r)
     s.flush()
     return r
@@ -147,6 +164,16 @@ def test_top_movers_filters_by_min_change(db_session):
     assert movers[0].name == "Big"
 
 
+def test_top_movers_excludes_explicit_out_of_stock(db_session):
+    product = _add_product(db_session, "aptekonline", "Unavailable mover", "oos-mover")
+    _add_history(db_session, product, [10.0, 7.0])
+    product.offer_availability_status = "out_of_stock"
+    product.availability_observed_at = utcnow()
+    db_session.commit()
+
+    assert forecast.top_movers(db_session, min_change_pct=5.0) == []
+
+
 def test_top_movers_includes_2point_real_movers(db_session):
     """Diff-only: продукт с одним big-change (2 snapshot'а) — попадает в movers.
 
@@ -174,9 +201,7 @@ def test_compute_trend_stable_zero_snapshots_in_window(db_session):
     """
     p = _add_product(db_session, "aloe", "LongStable", "ls1")
     # Снапшот 45 дней назад (за пределами 30-дневного окна)
-    old_run = Run(started_at=utcnow() - timedelta(days=45), status="ok")
-    db_session.add(old_run)
-    db_session.flush()
+    old_run = _add_run(db_session, utcnow() - timedelta(days=45))
     db_session.add(PriceSnapshot(run_id=old_run.id, product_id=p.id, price=15.0))
     # Продукт виден вчера (last_seen_at свежий)
     p.last_seen_at = utcnow() - timedelta(hours=12)
@@ -214,14 +239,10 @@ def test_top_movers_detects_change_with_pre_cutoff_price(db_session):
     """
     p = _add_product(db_session, "aloe", "LateMover", "lm1")
     # Снапшот 40 дней назад (за пределами 30-дневного окна)
-    old_run = Run(started_at=utcnow() - timedelta(days=40), status="ok")
-    db_session.add(old_run)
-    db_session.flush()
+    old_run = _add_run(db_session, utcnow() - timedelta(days=40))
     db_session.add(PriceSnapshot(run_id=old_run.id, product_id=p.id, price=10.0))
     # Новый снапшот 5 дней назад (внутри окна) — цена упала
-    new_run = Run(started_at=utcnow() - timedelta(days=5), status="ok")
-    db_session.add(new_run)
-    db_session.flush()
+    new_run = _add_run(db_session, utcnow() - timedelta(days=5))
     db_session.add(PriceSnapshot(run_id=new_run.id, product_id=p.id, price=7.0))
     p.last_seen_at = utcnow() - timedelta(days=5)
     db_session.commit()
@@ -253,6 +274,27 @@ def test_predict_competitor_moves(db_session):
     assert m_pred.trend_7d_change_pct < 0
 
 
+def test_predict_competitor_moves_excludes_country_conflict(db_session):
+    match = Match(canonical_name="Different origin", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    client = _add_product(
+        db_session, "pharmonline", "Ornafer", "ph-country", canonical_id=match.id
+    )
+    competitor = _add_product(
+        db_session, "aloe", "Ornafer", "al-country", canonical_id=match.id
+    )
+    client.manufacturer_country_code = "lv"
+    competitor.manufacturer_country_code = "gb"
+    client.country_resolution_status = "resolved"
+    competitor.country_resolution_status = "resolved"
+    _add_history(db_session, client, [10.0] * 5)
+    _add_history(db_session, competitor, [12.0, 11.0, 10.0, 9.0, 8.0])
+    db_session.commit()
+
+    assert forecast.predict_competitor_moves(db_session) == []
+
+
 # ─── Phase 5.x diff-only regression coverage ─────────────────────────────────
 
 
@@ -264,9 +306,7 @@ def test_compute_trend_diff_only_sparse_active_pricing(db_session):
     """
     p = _add_product(db_session, "aloe", "Stable", "stb")
     # Один реальный snapshot 3 дня назад
-    run = Run(started_at=utcnow() - timedelta(days=3), status="ok")
-    db_session.add(run)
-    db_session.flush()
+    run = _add_run(db_session, utcnow() - timedelta(days=3))
     db_session.add(PriceSnapshot(run_id=run.id, product_id=p.id, price=12.50))
     p.last_seen_at = utcnow() - timedelta(hours=12)  # видели сегодня
     db_session.commit()
@@ -290,9 +330,7 @@ def test_predict_competitor_moves_diff_only_skips_truly_stable(db_session):
     client = _add_product(db_session, "pharmonline", "SC", "ph2", canonical_id=m.id)
     comp = _add_product(db_session, "aloe", "SC", "al2", canonical_id=m.id)
     # Клиент стабилен
-    run = Run(started_at=utcnow() - timedelta(days=2), status="ok")
-    db_session.add(run)
-    db_session.flush()
+    run = _add_run(db_session, utcnow() - timedelta(days=2))
     db_session.add(PriceSnapshot(run_id=run.id, product_id=client.id, price=10.0))
     db_session.add(PriceSnapshot(run_id=run.id, product_id=comp.id, price=15.0))
     client.last_seen_at = utcnow()
@@ -308,11 +346,9 @@ def test_top_movers_diff_only_sparse_change(db_session):
     """Diff-only: ровно 2 snapshot'а с разными ценами в 30d окне → mover."""
     p = _add_product(db_session, "aloe", "SparseMover", "sm1")
     # День -20: 10.0
-    r1 = Run(started_at=utcnow() - timedelta(days=20), status="ok")
+    r1 = _add_run(db_session, utcnow() - timedelta(days=20))
     # День -3: 8.0 (−20%)
-    r2 = Run(started_at=utcnow() - timedelta(days=3), status="ok")
-    db_session.add_all([r1, r2])
-    db_session.flush()
+    r2 = _add_run(db_session, utcnow() - timedelta(days=3))
     db_session.add_all(
         [
             PriceSnapshot(run_id=r1.id, product_id=p.id, price=10.0),

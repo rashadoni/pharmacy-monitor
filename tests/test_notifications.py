@@ -423,7 +423,21 @@ def test_send_daily_digest_with_events(setup, tenant_user):
     run = storage.Run(
         tenant_id=tenant_user.tenant_id,
         status="ok",
-        run_quality={"financially_eligible": True},
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
     )
     s.add(run)
     s.flush()

@@ -35,6 +35,35 @@ def _fake_raw_product(idx: int) -> dict:
     }
 
 
+def test_ddp_product_maps_manufacturer_country_and_stock() -> None:
+    raw = _fake_raw_product(1)
+    raw.update({"manufacturerCountry": "latvia-id", "totalCount": 7})
+
+    product = pharmonline_ddp._build_product(
+        raw, "az", {}, {"latvia-id": "lv"}
+    )
+
+    assert product is not None
+    assert product.manufacturer is None
+    assert product.manufacturer_country_raw == "lv"
+    assert product.country_source == "pharmonline_ddp_all_country"
+    assert product.offer_availability_status == "in_stock"
+    assert product.offer_quantity == 7
+
+
+def test_ddp_product_maps_explicit_zero_stock() -> None:
+    raw = _fake_raw_product(2)
+    raw.update({"manufacturerCountry": "england-id", "totalCount": 0})
+
+    product = pharmonline_ddp._build_product(
+        raw, "az", {}, {"england-id": "gb"}
+    )
+
+    assert product is not None
+    assert product.manufacturer_country_raw == "gb"
+    assert product.offer_availability_status == "out_of_stock"
+
+
 @pytest.mark.asyncio
 async def test_ddp_scrape_dedups_overlapping_pages(monkeypatch):
     """DDP server возвращает одни и те же 50 products на 5 страницах подряд.
@@ -68,6 +97,9 @@ async def test_ddp_scrape_dedups_overlapping_pages(monkeypatch):
     assert len({sp.external_id for sp in yielded}) == 50
     # DDP call'ы прервались early — не 10 раз, не больше 4 (1 initial + 3 zero-new streak)
     assert call_count["n"] <= 4
+    status = scraper._route_statuses["test-cat"]
+    assert status.complete is False
+    assert status.abort_reason == "duplicate_loop_without_terminal"
 
 
 @pytest.mark.asyncio
@@ -96,6 +128,38 @@ async def test_ddp_scrape_breaks_on_short_page(monkeypatch):
         yielded.append(sp)
 
     assert len(yielded) == 70  # 50 + 20
+    status = scraper._route_statuses["test-cat"]
+    assert status.complete is True
+    assert status.raw_items == 70
+    assert status.parsed_items == 70
+
+
+@pytest.mark.asyncio
+async def test_ddp_malformed_item_closes_short_page_route() -> None:
+    page = [_fake_raw_product(1), {"_id": "broken", "path": "broken"}]
+
+    async def fake_ddp_call(method, params, timeout=30.0):
+        return {"products": page}
+
+    scraper = pharmonline_ddp.PharmonlineDDPScraper.__new__(
+        pharmonline_ddp.PharmonlineDDPScraper
+    )
+    scraper._ddp = MagicMock()
+    scraper._ddp.call = AsyncMock(side_effect=fake_ddp_call)
+    scraper._locale = "az"
+    scraper._cat_map = {}
+    scraper._country_map = {}
+    scraper._page_size = 50
+
+    yielded = [
+        product async for product in scraper.scrape_category("test-cat")
+    ]
+
+    assert len(yielded) == 1
+    status = scraper._route_statuses["test-cat"]
+    assert status.complete is False
+    assert status.abort_reason == "item_count_mismatch"
+    assert status.item_failures == 1
 
 
 @pytest.mark.asyncio

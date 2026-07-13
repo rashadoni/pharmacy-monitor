@@ -14,6 +14,9 @@ def _add_run(s, started_at, status="ok", products_scraped=10):
         finished_at=started_at + timedelta(minutes=1),
         status=status,
         products_scraped=products_scraped,
+        catalog_scope="full" if status == "ok" else "unknown",
+        full_catalog_sites="pharmonline,aptekonline,aloe" if status == "ok" else None,
+        catalog_verified=status == "ok",
     )
     s.add(r)
     s.flush()
@@ -101,6 +104,9 @@ def test_running_run_does_not_hide_last_degraded_health(db_session):
 
 def test_post_processing_run_is_not_terminal_until_finished_at(db_session):
     finished = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    finished.catalog_scope = "full"
+    finished.full_catalog_sites = "pharmonline,aptekonline,aloe"
+    finished.catalog_verified = False
     finished.run_quality = {
         "baseline_enforced": True,
         "full_catalog_verified": False,
@@ -110,7 +116,10 @@ def test_post_processing_run_is_not_terminal_until_finished_at(db_session):
     post_processing = Run(
         started_at=utcnow(),
         finished_at=None,
-        status="ok",
+        status="running",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": True,
@@ -169,6 +178,9 @@ def test_later_partial_ok_does_not_clear_unverified_full_catalog(db_session):
     now = utcnow()
     full = _add_run(db_session, now - timedelta(hours=2), status="degraded")
     full.finished_at = now - timedelta(hours=1)
+    full.catalog_scope = "full"
+    full.full_catalog_sites = "pharmonline,aptekonline,aloe"
+    full.catalog_verified = False
     full.run_quality = {
         "baseline_enforced": True,
         "full_catalog_verified": False,
@@ -176,6 +188,9 @@ def test_later_partial_ok_does_not_clear_unverified_full_catalog(db_session):
         "sites": {"pharmonline": {"status": "degraded"}},
     }
     partial = _add_run(db_session, now - timedelta(minutes=30), status="ok")
+    partial.catalog_scope = "partial"
+    partial.full_catalog_sites = None
+    partial.catalog_verified = False
     partial.run_quality = {
         "baseline_enforced": False,
         "full_catalog_verified": False,
@@ -197,6 +212,9 @@ def test_single_site_success_does_not_mask_other_degraded_full_sites(db_session)
     now = utcnow()
     degraded = _add_run(db_session, now - timedelta(hours=2), status="degraded")
     degraded.finished_at = now - timedelta(hours=1)
+    degraded.catalog_scope = "full"
+    degraded.full_catalog_sites = "pharmonline,aptekonline,aloe"
+    degraded.catalog_verified = False
     degraded.run_quality = {
         "baseline_enforced": True,
         "full_catalog_verified": False,
@@ -208,6 +226,9 @@ def test_single_site_success_does_not_mask_other_degraded_full_sites(db_session)
         },
     }
     aloe_ok = _add_run(db_session, now - timedelta(minutes=30), status="ok")
+    aloe_ok.catalog_scope = "full"
+    aloe_ok.full_catalog_sites = "aloe"
+    aloe_ok.catalog_verified = True
     aloe_ok.run_quality = {
         "baseline_enforced": True,
         "full_catalog_verified": True,
@@ -317,6 +338,21 @@ def test_failed_run_critical(db_session):
     rep = check_health(db_session)
     assert rep.status == "critical"
     assert any(i.code == "last_run_failed" for i in rep.issues)
+
+
+def test_degraded_full_run_critical(db_session):
+    run = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    run.catalog_scope = "full"
+    run.catalog_verified = False
+    run.catalog_verification_reason = "aloe:item_parse_failures=1"
+    run.error_message = "FullCatalogVerificationError: item_parse_failures"
+    db_session.commit()
+
+    rep = check_health(db_session)
+
+    assert rep.status == "critical"
+    assert rep.last_run_status == "degraded"
+    assert any(i.code == "last_run_degraded" for i in rep.issues)
 
 
 def test_empty_ok_run_critical(db_session):

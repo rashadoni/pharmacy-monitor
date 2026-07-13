@@ -400,8 +400,18 @@ def _iter_matched_prices(
     Для каждого сайта-конкурента цена усредняется (если в матче >1 товар
     с этого сайта). Возвращаются только матчи с ценой клиента + ≥1 конкурента.
     """
+    from src.product_policy import policy_rollout_eligibility
+
     q = select(Match).options(selectinload(Match.products))
     if tenant_id is not None:
+        rollout = policy_rollout_eligibility(session, tenant_id=tenant_id)
+        if not rollout.eligible:
+            log.warning(
+                "analytics_policy_gate_closed",
+                tenant_id=tenant_id,
+                reason=rollout.reason,
+            )
+            return []
         q = q.where(Match.tenant_id == tenant_id)
     category_filter = set(categories) if categories is not None else None
     if category_filter is not None and not category_filter:
@@ -421,10 +431,43 @@ def _iter_matched_prices(
         ]
 
     all_pids = [p.id for m in matches for p in m.products]
-    snaps = latest_snapshots_per_product(session, all_pids)
+    if tenant_id is None:
+        pids_by_tenant: dict[int, list[int]] = defaultdict(list)
+        for m in matches:
+            for p in m.products:
+                pids_by_tenant[int(p.tenant_id or 1)].append(p.id)
+        snaps = {}
+        for current_tenant_id, tenant_pids in pids_by_tenant.items():
+            rollout = policy_rollout_eligibility(session, tenant_id=current_tenant_id)
+            if not rollout.eligible:
+                log.warning(
+                    "analytics_policy_gate_closed",
+                    tenant_id=current_tenant_id,
+                    reason=rollout.reason,
+                )
+                continue
+            snaps.update(
+                latest_snapshots_per_product(
+                    session,
+                    tenant_pids,
+                    financially_eligible_only=True,
+                    tenant_id=current_tenant_id,
+                )
+            )
+    else:
+        snaps = latest_snapshots_per_product(
+            session,
+            all_pids,
+            financially_eligible_only=True,
+            tenant_id=tenant_id,
+        )
 
     records: list[tuple[str, float, dict[str, float]]] = []
     for m in matches:
+        from src.product_policy import policy_identity_eligibility, policy_offer_eligibility
+
+        if not policy_identity_eligibility(list(m.products)).eligible:
+            continue
         conf = m.confidence if m.confidence is not None else 1.0
         if not m.is_manual and conf < min_confidence:
             continue
@@ -433,6 +476,7 @@ def _iter_matched_prices(
             for p in m.products
             if p.site == client_site
             and p.url_dead_at is None
+            and policy_offer_eligibility(p).eligible
             and (category_filter is None or (p.category or "(без категории)") in category_filter)
         ]
         if category_filter is None:
@@ -443,7 +487,11 @@ def _iter_matched_prices(
 
         comp_by_site: dict[str, list[float]] = defaultdict(list)
         for p in m.products:
-            if p.site == client_site or p.url_dead_at is not None:
+            if (
+                p.site == client_site
+                or p.url_dead_at is not None
+                or not policy_offer_eligibility(p).eligible
+            ):
                 continue
             price = _current_price(snaps.get(p.id))
             if price is not None:

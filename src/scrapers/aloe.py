@@ -145,6 +145,43 @@ def _strip_html_text(value: object) -> str | None:
     return text or None
 
 
+def aloe_product_detail_signals(html_text: str) -> tuple[str | None, str]:
+    """Extract explicit manufacturing country and stock from an Aloe detail page.
+
+    Aloe embeds the same data twice (rendered HTML and escaped Next flight
+    payload).  The patterns are intentionally anchored to the country label and
+    boolean ``inStock`` value so translation dictionaries do not become data.
+    """
+    from src.product_policy import OFFER_IN_STOCK, OFFER_OUT_OF_STOCK, OFFER_UNKNOWN
+
+    country: str | None = None
+    html_match = re.search(
+        r"(?:Ölkə|Страна|Country)(?:<!--.*?-->)?\s*:\s*</span>\s*"
+        r"<span[^>]*>([^<]+)</span>",
+        html_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if html_match:
+        country = html.unescape(html_match.group(1)).strip() or None
+    if country is None:
+        decoded = re.sub(r'\\+"', '"', html_text)
+        flight_match = re.search(
+            r'children"\s*:\s*(?:\[)?"(?:Ölkə|Страна|Country)".{0,300}?'
+            r'children"\s*:\s*"([^"\\]+)',
+            decoded,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if flight_match:
+            country = html.unescape(flight_match.group(1)).strip() or None
+
+    decoded = re.sub(r'\\+"', '"', html_text)
+    stock_match = re.search(r'"inStock"\s*:\s*(true|false)', decoded)
+    status = OFFER_UNKNOWN
+    if stock_match:
+        status = OFFER_IN_STOCK if stock_match.group(1) == "true" else OFFER_OUT_OF_STOCK
+    return country, status
+
+
 def _is_aloe_product_payload(obj: object) -> bool:
     if not isinstance(obj, dict):
         return False
@@ -189,13 +226,27 @@ def _aloe_product_from_payload(
     if obj.get("promo"):
         promo_label = "promo"
 
+    from src.product_policy import offer_from_quantity
+
+    country_raw = (
+        str(obj.get("manufacturer_country")).strip()
+        if obj.get("manufacturer_country") not in (None, "")
+        else None
+    )
+    availability_status, offer_quantity = offer_from_quantity(obj.get("quantity"))
+
     return ScrapedProduct(
         site="aloe",
         external_id=slug[:100],
         url=f"{base_url}/{slug}/",
         name=name,
         brand=brand,
-        manufacturer=str(obj.get("ats_classification") or "").strip() or None,
+        manufacturer=None,
+        manufacturer_country_raw=country_raw,
+        country_source="aloe_api_country_id" if country_raw else None,
+        offer_availability_status=availability_status,
+        offer_quantity=offer_quantity,
+        availability_source="aloe_api_quantity",
         category=category_slug,
         dosage=extract_dosage(name),
         pack_size=extract_pack_size(name),
@@ -219,31 +270,129 @@ def aloe_products_from_listing_html(
     stopped at 100 pages while Aloe currently reports much larger `lastPage`
     values for broad categories.
     """
+    products, _raw_items, _parsed_items, _item_failures = (
+        _aloe_products_from_listing_html_with_stats(
+            html_text, category_slug=category_slug, base_url=base_url
+        )
+    )
+    return products
+
+
+def _aloe_products_from_listing_html_with_stats(
+    html_text: str,
+    *,
+    category_slug: str,
+    base_url: str = "https://aloe.az",
+) -> tuple[list[ScrapedProduct], int, int, int]:
+    """Parse listing payloads and expose item-level completeness evidence."""
     text = _decode_next_flight(html_text) or html.unescape(html_text)
     decoder = json.JSONDecoder()
     products: list[ScrapedProduct] = []
     seen: set[str] = set()
+    raw_items = 0
+    parsed_items = 0
+    item_failures = 0
 
     for match in _ALOE_DATA_MARKER_RE.finditer(text):
+        raw_items += 1
         start = match.end() - 1
         try:
             obj, _ = decoder.raw_decode(text[start:])
         except json.JSONDecodeError:
+            item_failures += 1
             continue
         if not _is_aloe_product_payload(obj):
+            item_failures += 1
             continue
         product = _aloe_product_from_payload(obj, category_slug=category_slug, base_url=base_url)
-        if product is None or product.external_id in seen:
+        if product is None:
+            item_failures += 1
+            continue
+        parsed_items += 1
+        if product.external_id in seen:
             continue
         seen.add(product.external_id)
         products.append(product)
 
-    return products
+    return products, raw_items, parsed_items, item_failures
 
 
 class AloeScraper(BaseScraper):
     site_name = "aloe"
     base_url = "https://aloe.az"
+
+    def __init__(
+        self,
+        *args,
+        country_id_map: dict[str, dict[str, object]] | None = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.country_id_map = country_id_map or {}
+        self.verified_country_mappings: dict[str, dict[str, object]] = {}
+
+    async def _enrich_listing_country_ids(
+        self, products: list[ScrapedProduct]
+    ) -> None:
+        """Resolve Aloe numeric country IDs from durable map or detail pages."""
+        from src.product_policy import COUNTRY_RESOLVED, country_resolution
+
+        groups: dict[str, list[ScrapedProduct]] = {}
+        for product in products:
+            raw = product.manufacturer_country_raw
+            if raw is not None and str(raw).isdigit():
+                groups.setdefault(str(raw), []).append(product)
+
+        for country_id, group in groups.items():
+            mapping = self.country_id_map.get(country_id)
+            if mapping is None:
+                samples: list[tuple[str, str, str]] = []
+                for product in group[:2]:
+                    try:
+                        html_text = await self._fetch_listing_html(product.url)
+                        raw, _availability = aloe_product_detail_signals(html_text)
+                    except (httpx.HTTPError, ValueError) as exc:
+                        log.warning(
+                            "aloe_country_detail_failed",
+                            country_id=country_id,
+                            url=product.url,
+                            error=str(exc),
+                        )
+                        continue
+                    code, status = country_resolution(raw)
+                    if code is not None and status == COUNTRY_RESOLVED and raw:
+                        samples.append((code, raw, product.url))
+                codes = {code for code, _raw, _url in samples}
+                required_samples = min(2, len(group))
+                if len(samples) < required_samples or len(codes) != 1:
+                    self._set_route_status(
+                        group[0].category or "unknown",
+                        complete=False,
+                        abort_reason=f"country_id_{country_id}_unresolved",
+                    )
+                    continue
+                code, country_raw, source_url = samples[0]
+                mapping = {
+                    "country_code": code,
+                    "country_raw": country_raw,
+                    "source_url": source_url,
+                    "sample_count": len(samples),
+                }
+                self.country_id_map[country_id] = mapping
+                self.verified_country_mappings[country_id] = mapping
+
+            country_raw = str(mapping.get("country_raw") or "").strip()
+            code, status = country_resolution(country_raw)
+            if not country_raw or code is None or status != COUNTRY_RESOLVED:
+                self._set_route_status(
+                    group[0].category or "unknown",
+                    complete=False,
+                    abort_reason=f"country_id_{country_id}_invalid_mapping",
+                )
+                continue
+            for product in group:
+                product.manufacturer_country_raw = country_raw
+                product.country_source = "aloe_country_id_verified_detail"
 
     async def scrape_category(
         self, category_slug: str, limit: int | None = None, max_pages: int = 100
@@ -280,13 +429,24 @@ class AloeScraper(BaseScraper):
 
         yielded = 0
         seen_external_ids: set[str] = set()
+        visited_pages = 0
+        raw_items = 0
+        parsed_items = 0
+        item_failures = 0
         for page_num in range(1, last_page + 1):
             html_text = first_html if page_num == 1 else await self._fetch_listing_html(
                 f"{base_url}&page={page_num}"
             )
-            products = aloe_products_from_listing_html(
+            products, page_raw, page_parsed, page_failures = (
+                _aloe_products_from_listing_html_with_stats(
                 html_text, category_slug=category_slug, base_url=self.base_url
+                )
             )
+            raw_items += page_raw
+            parsed_items += page_parsed
+            item_failures += page_failures
+            await self._enrich_listing_country_ids(products)
+            visited_pages += 1
             log.info(
                 "aloe_rsc_page_parsed",
                 category=category_slug,
@@ -297,6 +457,16 @@ class AloeScraper(BaseScraper):
             )
             if page_num > 1 and not products:
                 log.info("aloe_rsc_pagination_done", category=category_slug, page=page_num)
+                self._set_route_status(
+                    category_slug,
+                    complete=False,
+                    abort_reason="empty_page_before_last",
+                    expected_pages=last_page,
+                    visited_pages=visited_pages,
+                    raw_items=raw_items,
+                    parsed_items=parsed_items,
+                    item_failures=item_failures,
+                )
                 break
             for product in products:
                 if product.external_id in seen_external_ids:
@@ -305,7 +475,32 @@ class AloeScraper(BaseScraper):
                 yielded += 1
                 yield product
                 if limit and yielded >= limit:
+                    self._set_route_status(
+                        category_slug,
+                        complete=False,
+                        abort_reason="requested_limit_reached",
+                        expected_pages=last_page,
+                        visited_pages=visited_pages,
+                        raw_items=raw_items,
+                        parsed_items=parsed_items,
+                        item_failures=item_failures,
+                    )
                     return
+        if str(category_slug) not in self._route_statuses:
+            self._set_route_status(
+                category_slug,
+                complete=visited_pages == last_page and item_failures == 0,
+                abort_reason=(
+                    "item_parse_failures"
+                    if item_failures
+                    else None if visited_pages == last_page else "pagination_incomplete"
+                ),
+                expected_pages=last_page,
+                visited_pages=visited_pages,
+                raw_items=raw_items,
+                parsed_items=parsed_items,
+                item_failures=item_failures,
+            )
 
     async def _fetch_listing_html(self, url: str) -> str:
         await self._throttle()
@@ -340,6 +535,7 @@ class AloeScraper(BaseScraper):
         yielded = 0
         total_cards_found = 0
         total_card_failures = 0
+        total_cards_parsed = 0
 
         for page_num in range(1, max_pages + 1):
             url = base_url if page_num == 1 else f"{base_url}&page={page_num}"
@@ -366,12 +562,23 @@ class AloeScraper(BaseScraper):
 
                 for card in cards:
                     if limit and yielded >= limit:
+                        self._set_route_status(
+                            category_slug,
+                            complete=False,
+                            abort_reason="requested_limit_reached",
+                            visited_pages=page_num,
+                            raw_items=total_cards_found,
+                            parsed_items=total_cards_parsed,
+                            item_failures=total_card_failures,
+                        )
                         return
                     try:
                         product = await self._parse_card(card, category_slug, url)
                         if not product:
                             page_dropped_empty += 1
+                            total_card_failures += 1
                             continue
+                        total_cards_parsed += 1
                         if product.external_id in seen_external_ids:
                             page_dropped_dup += 1
                             continue
@@ -401,7 +608,36 @@ class AloeScraper(BaseScraper):
                     total_yielded=yielded,
                     total_card_failures=total_card_failures,
                 )
+                self._set_route_status(
+                    category_slug,
+                    complete=(
+                        total_card_failures == 0 and page_dropped_dup == 0
+                    ),
+                    pages_skipped=total_card_failures,
+                    abort_reason=(
+                        "duplicate_only_page"
+                        if page_dropped_dup
+                        else None
+                        if total_card_failures == 0
+                        else "card_parse_failures"
+                    ),
+                    visited_pages=page_num,
+                    raw_items=total_cards_found,
+                    parsed_items=total_cards_parsed,
+                    item_failures=total_card_failures,
+                )
                 break
+        if str(category_slug) not in self._route_statuses:
+            self._set_route_status(
+                category_slug,
+                complete=False,
+                abort_reason="max_pages_reached",
+                expected_pages=max_pages,
+                visited_pages=max_pages,
+                raw_items=total_cards_found,
+                parsed_items=total_cards_parsed,
+                item_failures=total_card_failures,
+            )
 
     async def _scroll_until_stable(self, page, max_iterations: int = 20) -> None:
         prev_count = -1
@@ -556,12 +792,18 @@ class AloeScraper(BaseScraper):
             except Exception as exc:
                 log.debug("aloe_barcode_extract_failed", url=url, error=str(exc))
 
+            country_raw, availability_status = aloe_product_detail_signals(html)
+
             return ScrapedProduct(
                 site=self.site_name,
                 external_id=external_id,
                 url=url,
                 name=name,
                 brand=brand,
+                manufacturer_country_raw=country_raw,
+                country_source="aloe_detail_country_label" if country_raw else None,
+                offer_availability_status=availability_status,
+                availability_source="aloe_detail_in_stock",
                 dosage=extract_dosage(name),
                 pack_size=extract_pack_size(name),
                 image_url=image_url,

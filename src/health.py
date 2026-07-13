@@ -91,22 +91,32 @@ def check_health(
             )
         )
 
-    # 2. Failed check
+    # 2. Failed/degraded check.  ``degraded`` means the process returned but a
+    # nominal full catalog could not prove item-level completeness; treating it
+    # as healthy would reopen financial output on partial source data. It is a
+    # warning unless the site-level details below prove a full site failure.
     if last_run.status == "failed":
+        issue_code = "last_run_failed"
         report.issues.append(
             HealthIssue(
                 "critical",
-                "last_run_failed",
-                f"Последний прогон #{last_run.id} упал: {last_run.error_message or '?'}",
+                issue_code,
+                f"Последний прогон #{last_run.id} завершился со статусом "
+                f"{last_run.status}: {last_run.error_message or '?'}",
                 context={"run_id": last_run.id, "error": last_run.error_message},
             )
         )
 
     if last_run.status == "degraded":
         quality = last_run.run_quality or {}
+        degraded_severity: Severity = (
+            "critical"
+            if last_run.catalog_scope == "full" and not last_run.catalog_verified
+            else "warning"
+        )
         report.issues.append(
             HealthIssue(
-                "warning",
+                degraded_severity,
                 "last_run_degraded",
                 f"Прогон #{last_run.id} завершён частично: "
                 f"{last_run.error_message or 'см. run_quality'}",

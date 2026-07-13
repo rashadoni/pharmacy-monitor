@@ -252,18 +252,18 @@ class TestBrandGuard:
 
 
 class TestStrictCommodityOrigin:
-    """Client policy 2026-05-31 «только идентичные товары»: COMMODITY differing in
-    country-of-origin OR grade (cosmetic) is NOT the same product — unless a shared
-    consumer brand confirms identity. Drugs (non-commodity) are unaffected."""
+    """Country is strict for every SKU; grade remains commodity-specific."""
 
     @staticmethod
-    def _pc(name, brand_verified=None, manufacturer=None, url=""):
+    def _pc(name, brand_verified=None, manufacturer=None, url="", country_code=None):
         return SimpleNamespace(
             name=name,
             name_normalized=name.lower(),
             brand_verified=brand_verified,
             manufacturer=manufacturer,
             url=url,
+            manufacturer_country_code=country_code,
+            country_resolution_status="resolved" if country_code else "unknown",
         )
 
     def test_diff_country_no_brand_conflicts(self):
@@ -292,12 +292,17 @@ class TestStrictCommodityOrigin:
         b = self._pc("Gənəgərçək yağı 30 ml", manufacturer="AZERBAYCAN")
         assert _has_conflicting_origin_or_grade(a, b) is False
 
-    def test_non_commodity_drug_diff_country_no_conflict(self):
-        # trade-name drug made in different plants is the SAME drug → commodity gate off
-        a = self._pc("Konkor 5 mg N30", "Merck", manufacturer="ALMANİYA")
-        b = self._pc("Konkor 5 mg N30", "Merck", manufacturer="FRANSA")
+    def test_non_commodity_drug_diff_country_conflicts_under_new_policy(self):
+        # Client policy 2026-07-13 supersedes the old trade-name exception.
+        a = self._pc(
+            "Konkor 5 mg N30", "Merck", manufacturer="ALMANİYA", country_code="de"
+        )
+        b = self._pc(
+            "Konkor 5 mg N30", "Merck", manufacturer="FRANSA", country_code="fr"
+        )
         assert _has_conflicting_origin_or_grade(a, b) is False
-        assert _hard_conflict(a, b) is False
+        assert _hard_conflict(a, b) is True
+        assert _pairwise_spec_conflict(a, b) is True
 
 
 class TestUltraEqual:

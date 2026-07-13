@@ -1,0 +1,135 @@
+from datetime import timedelta
+
+from src._time import utcnow
+from src.product_observations import apply_product_observation
+from src.product_policy import (
+    COUNTRY_AMBIGUOUS,
+    COUNTRY_RESOLVED,
+    OFFER_IN_STOCK,
+    OFFER_OUT_OF_STOCK,
+    country_resolution,
+    financially_eligible,
+    normalize_country_code,
+    offer_from_quantity,
+)
+from src.scrapers.base import ScrapedProduct
+from src.storage import Product
+
+
+def _product(site: str = "aloe") -> Product:
+    return Product(
+        id=1,
+        tenant_id=1,
+        site=site,
+        external_id="x",
+        url="https://example/x",
+        name="X",
+        name_normalized="x",
+    )
+
+
+def _scraped(**kwargs) -> ScrapedProduct:
+    return ScrapedProduct(
+        site="aloe",
+        external_id="x",
+        url="https://example/x",
+        name="X",
+        **kwargs,
+    )
+
+
+def test_country_normalization_handles_client_examples() -> None:
+    assert normalize_country_code("Украина") == "ua"
+    assert normalize_country_code("Сербия") == "rs"
+    assert normalize_country_code("Англия") == "gb"
+    assert normalize_country_code("Latviya") == "lv"
+    assert country_resolution("14") == (None, COUNTRY_AMBIGUOUS)
+    assert normalize_country_code("TUR") == "tr"
+    assert normalize_country_code("GBR") == "gb"
+    assert normalize_country_code("Birləşmiş Krallıq") == "gb"
+    assert normalize_country_code("BƏƏ") == "ae"
+
+
+def test_country_normalization_rejects_non_iso_two_letter_noise() -> None:
+    assert normalize_country_code("RS") == "rs"
+    assert normalize_country_code(" ua ") == "ua"
+    assert normalize_country_code("XX") is None
+    assert normalize_country_code("AB") is None
+    assert country_resolution("zz") == (None, "invalid")
+
+
+def test_quantity_is_tri_state_not_missing_equals_zero() -> None:
+    assert offer_from_quantity(None) == ("unknown", None)
+    assert offer_from_quantity(0) == (OFFER_OUT_OF_STOCK, 0.0)
+    assert offer_from_quantity("2") == (OFFER_IN_STOCK, 2.0)
+
+
+def test_country_change_requires_two_distinct_runs() -> None:
+    now = utcnow()
+    product = _product()
+    first = _scraped(
+        manufacturer_country_raw="Украина",
+        country_source="detail",
+    )
+    apply_product_observation(product, first, run_id=10, observed_at=now)
+    assert product.manufacturer_country_code == "ua"
+    assert product.country_resolution_status == COUNTRY_RESOLVED
+
+    changed = _scraped(
+        manufacturer_country_raw="Сербия",
+        country_source="detail",
+    )
+    apply_product_observation(product, changed, run_id=11, observed_at=now)
+    assert product.manufacturer_country_code == "ua"
+    assert product.country_candidate_code == "rs"
+    assert product.country_resolution_status == COUNTRY_AMBIGUOUS
+
+    # Duplicate observation in the same run cannot promote identity.
+    apply_product_observation(product, changed, run_id=11, observed_at=now)
+    assert product.manufacturer_country_code == "ua"
+    assert product.country_candidate_seen_count == 1
+
+    apply_product_observation(product, changed, run_id=12, observed_at=now)
+    assert product.manufacturer_country_code == "rs"
+    assert product.country_resolution_status == COUNTRY_RESOLVED
+    assert product.country_candidate_code is None
+
+
+def test_unknown_signal_never_erases_resolved_country_or_offer() -> None:
+    now = utcnow()
+    product = _product()
+    known = _scraped(
+        manufacturer_country_raw="Italy",
+        country_source="detail",
+        offer_availability_status=OFFER_IN_STOCK,
+        offer_quantity=3,
+        availability_source="quantity",
+    )
+    apply_product_observation(product, known, run_id=1, observed_at=now)
+    unknown = _scraped(
+        manufacturer_country_raw="14",
+        country_source="listing_id",
+    )
+    apply_product_observation(product, unknown, run_id=2, observed_at=now)
+
+    assert product.manufacturer_country_code == "it"
+    assert product.country_resolution_status == COUNTRY_RESOLVED
+    assert product.offer_availability_status == OFFER_IN_STOCK
+    assert product.offer_quantity == 3
+
+
+def test_financial_eligibility_requires_same_country_and_fresh_stock() -> None:
+    now = utcnow()
+    a, b = _product("aloe"), _product("pharmonline")
+    for product in (a, b):
+        product.manufacturer_country_code = "rs"
+        product.country_resolution_status = COUNTRY_RESOLVED
+        product.offer_availability_status = OFFER_IN_STOCK
+        product.availability_observed_at = now
+    assert financially_eligible([a, b], now=now).eligible is True
+
+    b.manufacturer_country_code = "ua"
+    assert financially_eligible([a, b], now=now).reason == "country_conflict"
+    b.manufacturer_country_code = "rs"
+    b.availability_observed_at = now - timedelta(days=20)
+    assert financially_eligible([a, b], now=now).reason == "availability_stale"

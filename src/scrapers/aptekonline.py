@@ -326,6 +326,11 @@ def _build_product_from_api(
         f"{cashback_pct_num:g}% kəşbək" if cashback_pct_num and cashback_pct_num > 0 else None
     )
 
+    from src.product_policy import offer_from_quantity
+
+    country_raw = str(item.get("olke") or "").strip() or None
+    availability_status, offer_quantity = offer_from_quantity(item.get("qaliq"))
+
     # API не отдаёт brand отдельно. Для категории передаём тот же slug что был
     # передан скраперу — это совместимо со старыми данными в БД.
     return ScrapedProduct(
@@ -334,7 +339,12 @@ def _build_product_from_api(
         url=f"{base_url}/product/{url_id}",
         name=name,
         brand=None,
-        manufacturer=(item.get("olke") or None),
+        manufacturer=None,
+        manufacturer_country_raw=country_raw,
+        country_source="aptek_api_olke",
+        offer_availability_status=availability_status,
+        offer_quantity=offer_quantity,
+        availability_source="aptek_api_qaliq",
         category=str(category_slug),
         dosage=extract_dosage(name),
         pack_size=extract_pack_size(name),
@@ -365,6 +375,9 @@ class AptekonlineScraper(BaseScraper):
         category_id = str(category_slug).strip()
         if not category_id.isdigit():
             log.warning("aptekonline_skip_non_numeric_category", category=category_slug)
+            self._set_route_status(
+                category_slug, complete=False, abort_reason="invalid_category"
+            )
             return
 
         seen: set[str] = set()
@@ -476,9 +489,17 @@ class AptekonlineScraper(BaseScraper):
 
         pages_skipped = 0
         consecutive_failures = 0
+        visited_pages = 0
+        expected_pages: int | None = None
+        expected_items: int | None = None
+        raw_items = 0
+        parsed_items = 0
+        item_failures = 0
+        abort_reason: str | None = None
         try:
             for page_num in range(1, max_pages + 1):
                 if limit is not None and yielded >= limit:
+                    abort_reason = "requested_limit_reached"
                     return
                 params = list(params_base) + [("page", str(page_num))]
                 resp = await _fetch_page(params)
@@ -492,6 +513,7 @@ class AptekonlineScraper(BaseScraper):
                             status=status,
                             provider=proxied_via,
                         )
+                        abort_reason = f"hard_block_{status}"
                         return
                     # Транзиент (сеть/5xx/522): пропускаем страницу, идём дальше.
                     pages_skipped += 1
@@ -512,6 +534,7 @@ class AptekonlineScraper(BaseScraper):
                             consecutive=consecutive_failures,
                             provider=proxied_via,
                         )
+                        abort_reason = "consecutive_page_failures"
                         return
                     continue
                 try:
@@ -527,12 +550,34 @@ class AptekonlineScraper(BaseScraper):
                         consecutive=consecutive_failures,
                     )
                     if consecutive_failures >= _MAX_CONSECUTIVE_PAGE_FAILURES:
+                        abort_reason = "consecutive_invalid_json"
                         return
                     continue
                 consecutive_failures = 0
+                visited_pages += 1
 
                 items = payload.get("data") or []
+                raw_items += len(items)
                 thumb_folder = payload.get("thumb_folder") or ""
+                raw_last_page = payload.get("last_page")
+                if raw_last_page not in (None, ""):
+                    try:
+                        expected_pages = int(raw_last_page)
+                    except (TypeError, ValueError):
+                        abort_reason = "invalid_last_page"
+                        return
+                raw_total = payload.get("total")
+                if raw_total not in (None, ""):
+                    try:
+                        page_expected_items = int(raw_total)
+                    except (TypeError, ValueError):
+                        abort_reason = "invalid_total"
+                        return
+                    if expected_items is None:
+                        expected_items = page_expected_items
+                    elif expected_items != page_expected_items:
+                        abort_reason = "total_changed_during_pagination"
+                        return
 
                 if page_num == 1:
                     log.info(
@@ -544,16 +589,21 @@ class AptekonlineScraper(BaseScraper):
                     )
 
                 if not items:
+                    if expected_pages is not None and page_num < expected_pages:
+                        abort_reason = "empty_page_before_last"
                     break
 
                 for item in items:
                     if limit is not None and yielded >= limit:
+                        abort_reason = "requested_limit_reached"
                         return
                     product = _build_product_from_api(
                         item, category_slug, thumb_folder, self.base_url
                     )
                     if not product:
+                        item_failures += 1
                         continue
+                    parsed_items += 1
                     if product.external_id in seen:
                         continue
                     seen.add(product.external_id)
@@ -574,6 +624,28 @@ class AptekonlineScraper(BaseScraper):
                     provider=proxied_via,
                 )
         finally:
+            complete = (
+                abort_reason is None
+                and pages_skipped == 0
+                and item_failures == 0
+                and (expected_pages is None or visited_pages >= expected_pages)
+                and (
+                    expected_items is None
+                    or (raw_items == expected_items and parsed_items == expected_items)
+                )
+            )
+            self._set_route_status(
+                category_slug,
+                complete=complete,
+                pages_skipped=pages_skipped,
+                abort_reason=abort_reason,
+                expected_pages=expected_pages,
+                visited_pages=visited_pages,
+                raw_items=raw_items,
+                parsed_items=parsed_items,
+                item_failures=item_failures,
+                expected_items=expected_items,
+            )
             if persistent_client is not None:
                 await persistent_client.aclose()
 

@@ -40,6 +40,8 @@ def _blocks(a_name, b_name, a_mfr=None, b_mfr=None, a_url="", b_url=""):
         site="aptekonline",
         manufacturer=a_mfr,
         url=a_url,
+        manufacturer_country_code=("tr" if a_mfr else None),
+        country_resolution_status=("resolved" if a_mfr else "unknown"),
     )
     b = SimpleNamespace(
         name=b_name,
@@ -47,6 +49,8 @@ def _blocks(a_name, b_name, a_mfr=None, b_mfr=None, a_url="", b_url=""):
         site="pharmonline",
         manufacturer=b_mfr,
         url=b_url,
+        manufacturer_country_code=("az" if b_mfr else None),
+        country_resolution_status=("resolved" if b_mfr else "unknown"),
     )
     an, bn, ar, br = a.name_normalized, b.name_normalized, a.name, b.name
     return (

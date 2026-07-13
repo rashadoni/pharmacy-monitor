@@ -25,6 +25,8 @@
     "loading": "Yüklənir…",
     "updating": "Yenilənir…",
     "error": "Yükləmə xətası",
+    "financial_data_paused": "Maliyyə müqayisələri müvəqqəti gizlədilib: sistem istehsal ölkəsi və mövcudluğu yoxlanmış hər üç saytın təzə, təsdiqlənmiş tam kataloqunu gözləyir.",
+    "system_degraded": "Son icra xəta ilə başa çatdı. Məlumatlar və tövsiyələr natamam ola bilər — icraların vəziyyətini yoxlayın.",
     "save": "Saxla",
     "cancel": "Ləğv et",
     "delete": "Sil",
@@ -149,7 +151,10 @@
     "alts_none": "Oxşar məhsul tapılmadı — öz keçidinizi yapışdırın.",
     "alts_pick": "Seç",
     "category_filter": "Kateqoriya: {category}",
-    "category_filter_clear": "Filtri sıfırla"
+    "category_filter_clear": "Filtri sıfırla",
+    "country_verified": "İstehsal ölkəsi təsdiqlənib: {code}",
+    "country_unverified": "İstehsal ölkəsi hələ təsdiqlənməyib",
+    "country_unknown_short": "ölkə ?"
   },
   "overview": {
     "title": "Ümumi baxış",

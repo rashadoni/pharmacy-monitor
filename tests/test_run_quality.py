@@ -599,10 +599,19 @@ def test_report_send_rejects_intentional_partial_run(db_session, monkeypatch):
 
 
 def test_report_send_rejects_missing_all_site_freshness(db_session, monkeypatch):
+    now = utcnow()
     run = storage.Run(
         tenant_id=1,
         status="ok",
+        started_at=now,
+        finished_at=now,
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=True,
+        catalog_verification_reason="test_single_site_full_catalog",
         run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
             "financially_eligible": True,
             "sites": {"aloe": {"status": "ok"}},
         },

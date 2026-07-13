@@ -3,20 +3,49 @@
 from datetime import timedelta
 from src._time import utcnow
 
-from src import analytics
+from src import analytics, storage
 from src.brand_catalog import is_brand_blacklisted
 from src.storage import Match, PriceSnapshot, Product, Promo, Run
 
 
-def _add_run(s, started_at=None):
-    r = Run(started_at=started_at or utcnow(), status="ok")
+def _add_run(s, started_at=None, *, tenant_id=1):
+    started = started_at or utcnow()
+    r = Run(
+        tenant_id=tenant_id,
+        started_at=started,
+        finished_at=started,
+        status="ok",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
     s.add(r)
     s.flush()
     return r
 
 
-def _add_product(s, site, name, brand=None, ext_id=None, canonical_id=None, category=None):
+def _add_product(
+    s,
+    site,
+    name,
+    brand=None,
+    ext_id=None,
+    canonical_id=None,
+    category=None,
+    tenant_id=1,
+):
     p = Product(
+        tenant_id=tenant_id,
         site=site,
         external_id=ext_id or f"{site}-{name}",
         url=f"http://{site}.az/p",
@@ -379,6 +408,95 @@ def test_category_comparison_diff_only_old_run(db_session):
     assert rows[0].index == 120.0  # 12/10*100, клиент дороже
 
 
+def test_category_comparison_ignores_newer_untrusted_snapshot(db_session):
+    trusted = _add_run(db_session, started_at=utcnow() - timedelta(hours=2))
+    partial = Run(
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="degraded",
+        catalog_scope="partial",
+        catalog_verified=False,
+        run_quality={
+            "baseline_enforced": False,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"pharmonline": {"status": "degraded"}},
+        },
+    )
+    db_session.add(partial)
+    db_session.flush()
+
+    m = Match(canonical_name="Trusted price", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Trusted price",
+        canonical_id=m.id,
+        category="trusted-cat",
+        ext_id="trusted-client",
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Trusted price",
+        canonical_id=m.id,
+        category="trusted-cat",
+        ext_id="trusted-aloe",
+    )
+    aptek_policy_product = _add_product(
+        db_session,
+        "aptekonline",
+        "Policy witness",
+        canonical_id=None,
+        category="trusted-cat",
+        ext_id="trusted-aptek-policy",
+    )
+    _add_snap_at(db_session, trusted, client, 10.0)
+    _add_snap_at(db_session, trusted, competitor, 8.0)
+    _add_snap_at(db_session, partial, client, 99.0)
+    _add_snap_at(db_session, partial, competitor, 1.0)
+    for product in (client, competitor, aptek_policy_product):
+        product.manufacturer_country_code = "rs"
+        product.country_resolution_status = "resolved"
+        product.offer_availability_status = "in_stock"
+        product.availability_observed_at = utcnow()
+        db_session.add(
+            storage.OfferObservation(
+                tenant_id=product.tenant_id,
+                run_id=trusted.id,
+                product_id=product.id,
+                country_code="rs",
+                country_raw="Serbia",
+                country_resolution_status="resolved",
+                availability_status="in_stock",
+                observed_at=utcnow(),
+            )
+        )
+    db_session.commit()
+    from src import roi
+
+    assert storage.run_is_financially_eligible(trusted) is True
+    assert storage.financially_eligible_run_ids(db_session) == [trusted.id]
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is True
+    trusted_snaps = storage.latest_snapshots_per_product(
+        db_session,
+        [client.id, competitor.id],
+        financially_eligible_only=True,
+        tenant_id=1,
+    )
+    assert trusted_snaps[client.id].price == 10.0
+    assert trusted_snaps[competitor.id].price == 8.0
+
+    rows = analytics.category_comparison(db_session, categories={"trusted-cat"})
+
+    assert len(rows) == 1
+    assert rows[0].avg_client_price == 10.0
+    assert rows[0].avg_competitor_price == 8.0
+    assert rows[0].index == 125.0
+
+
 def test_category_comparison_uses_discount_price(db_session):
     """Текущая цена = discount_price (если есть), иначе price."""
     run = _add_run(db_session)
@@ -425,7 +543,8 @@ def test_category_comparison_confidence_floor(db_session):
 
 def test_category_comparison_tenant_isolation(db_session):
     """tenant_id фильтрует матчи; None → все тенанты (для не-HTTP вызовов)."""
-    run = _add_run(db_session)
+    run = _add_run(db_session, tenant_id=1)
+    run2 = _add_run(db_session, tenant_id=2)
     m1 = Match(canonical_name="T1", confidence=1.0, tenant_id=1)
     m2 = Match(canonical_name="T2", confidence=1.0, tenant_id=2)
     db_session.add_all([m1, m2])
@@ -435,11 +554,27 @@ def test_category_comparison_tenant_isolation(db_session):
     )
     a1 = _add_product(db_session, "aloe", "T1", canonical_id=m1.id, category="aloe1", ext_id="a1")
     c2 = _add_product(
-        db_session, "pharmonline", "T2", canonical_id=m2.id, category="t2cat", ext_id="c2"
+        db_session,
+        "pharmonline",
+        "T2",
+        canonical_id=m2.id,
+        category="t2cat",
+        ext_id="c2",
+        tenant_id=2,
     )
-    a2 = _add_product(db_session, "aloe", "T2", canonical_id=m2.id, category="aloe2", ext_id="a2")
-    for p, pr in ((c1, 10.0), (a1, 8.0), (c2, 10.0), (a2, 8.0)):
+    a2 = _add_product(
+        db_session,
+        "aloe",
+        "T2",
+        canonical_id=m2.id,
+        category="aloe2",
+        ext_id="a2",
+        tenant_id=2,
+    )
+    for p, pr in ((c1, 10.0), (a1, 8.0)):
         _add_snap_at(db_session, run, p, pr)
+    for p, pr in ((c2, 10.0), (a2, 8.0)):
+        _add_snap_at(db_session, run2, p, pr)
     db_session.commit()
 
     assert {r.category for r in analytics.category_comparison(db_session, tenant_id=1)} == {"t1cat"}
@@ -557,7 +692,82 @@ def test_category_comparison_skips_match_with_dead_client(db_session):
     db_session.commit()
 
     assert analytics.category_comparison(db_session) == []
+
+
 def test_brand_quality_rejects_pack_tokens_and_product_descriptors():
     for value in ("0", "N120", "№20", "Şpris", "Qlükoza", "Elektron"):
         assert is_brand_blacklisted(value), value
     assert not is_brand_blacklisted("3M")
+
+
+def test_category_comparison_excludes_oos_offer_but_keeps_active_competitor(
+    db_session,
+):
+    run = _add_run(db_session)
+    match = Match(canonical_name="Stock policy", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Stock policy",
+        canonical_id=match.id,
+        category="cat",
+        ext_id="stock-client",
+    )
+    oos = _add_product(
+        db_session,
+        "aptekonline",
+        "Stock policy",
+        canonical_id=match.id,
+        ext_id="stock-oos",
+    )
+    active = _add_product(
+        db_session,
+        "aloe",
+        "Stock policy",
+        canonical_id=match.id,
+        ext_id="stock-active",
+    )
+    oos.offer_availability_status = "out_of_stock"
+    oos.availability_observed_at = utcnow()
+    _add_snap_at(db_session, run, client, 10.0)
+    _add_snap_at(db_session, run, oos, 5.0)
+    _add_snap_at(db_session, run, active, 9.0)
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session)
+
+    assert len(rows) == 1
+    assert rows[0].per_site_avg == {"aloe": 9.0}
+
+
+def test_category_comparison_excludes_country_conflict(db_session):
+    run = _add_run(db_session)
+    match = Match(canonical_name="Country policy", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Country policy",
+        canonical_id=match.id,
+        category="cat",
+        ext_id="country-client",
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Country policy",
+        canonical_id=match.id,
+        ext_id="country-competitor",
+    )
+    client.manufacturer_country_code = "ua"
+    competitor.manufacturer_country_code = "rs"
+    client.country_resolution_status = "resolved"
+    competitor.country_resolution_status = "resolved"
+    _add_snap_at(db_session, run, client, 10.0)
+    _add_snap_at(db_session, run, competitor, 5.0)
+    db_session.commit()
+
+    assert analytics.category_comparison(db_session) == []

@@ -1,7 +1,13 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight, CheckCircle2, AlertCircle, AlertTriangle } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  CheckCircle2,
+  AlertCircle,
+  AlertTriangle,
+} from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
 import {
@@ -55,10 +61,10 @@ export default function OverviewPage() {
       />
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
-          <p className="text-sm text-muted-foreground">
-            {t("subtitle")}
-          </p>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {t("title")}
+          </h1>
+          <p className="text-sm text-muted-foreground">{t("subtitle")}</p>
         </div>
         <QuickActions />
       </div>
@@ -66,6 +72,17 @@ export default function OverviewPage() {
       {/* Phase 5.6 — Per-site staleness panel */}
       {healthQ.data && <SystemTruthPanel status={healthQ.data} />}
       {healthQ.data && <SiteStalenessPanel sites={healthQ.data.sites} />}
+      {healthQ.data?.product_policy?.policy_ready === false && (
+        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-300">
+          {tCommon("financial_data_paused")}
+        </div>
+      )}
+      {healthQ.data?.status === "degraded" &&
+        healthQ.data?.product_policy?.policy_ready !== false && (
+          <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+            {tCommon("system_degraded")}
+          </div>
+        )}
 
       <section aria-label={t("subtitle")}>
         <MetricStrip
@@ -135,14 +152,15 @@ export default function OverviewPage() {
         </div>
       </div>
 
-      <LatestRunsBySitePanel items={latestBySiteQ.data ?? []} loading={latestBySiteQ.isLoading} />
+      <LatestRunsBySitePanel
+        items={latestBySiteQ.data ?? []}
+        loading={latestBySiteQ.isLoading}
+      />
 
       {/* Recent runs */}
       <div>
         <h2 className="text-lg font-semibold mb-3">{t("recent_runs")}</h2>
-        <p className="text-xs text-muted-foreground mb-2">
-          {t("runs_desc")}
-        </p>
+        <p className="text-xs text-muted-foreground mb-2">{t("runs_desc")}</p>
         <div className="rounded-lg border border-border overflow-hidden">
           <table className="w-full text-sm">
             <thead className="bg-muted/50 text-muted-foreground">
@@ -150,10 +168,14 @@ export default function OverviewPage() {
                 <th className="px-3 py-2 w-6"></th>
                 <th className="px-3 py-2 text-left">{t("th_id")}</th>
                 <th className="px-3 py-2 text-left">{t("th_started")}</th>
-                <th className="px-3 py-2 text-left hidden sm:table-cell">{t("th_duration")}</th>
+                <th className="px-3 py-2 text-left hidden sm:table-cell">
+                  {t("th_duration")}
+                </th>
                 <th className="px-3 py-2 text-left">{t("th_status")}</th>
                 <th className="px-3 py-2 text-right">{t("th_products")}</th>
-                <th className="px-3 py-2 text-left hidden md:table-cell">{t("th_sites")}</th>
+                <th className="px-3 py-2 text-left hidden md:table-cell">
+                  {t("th_sites")}
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -188,9 +210,13 @@ function LatestRunsBySitePanel({
   return (
     <div>
       <h2 className="text-lg font-semibold mb-1">{t("latest_by_site")}</h2>
-      <p className="text-xs text-muted-foreground mb-2">{t("latest_by_site_desc")}</p>
+      <p className="text-xs text-muted-foreground mb-2">
+        {t("latest_by_site_desc")}
+      </p>
       {loading ? (
-        <div className="text-sm text-muted-foreground">{tCommon("loading")}</div>
+        <div className="text-sm text-muted-foreground">
+          {tCommon("loading")}
+        </div>
       ) : (
         <div className="rounded-lg border border-border overflow-hidden">
           <table className="w-full text-sm">
@@ -199,7 +225,9 @@ function LatestRunsBySitePanel({
                 <th className="px-3 py-2 text-left">{t("th_sites")}</th>
                 <th className="px-3 py-2 text-left">{t("th_id")}</th>
                 <th className="px-3 py-2 text-left">{t("th_started")}</th>
-                <th className="px-3 py-2 text-left hidden sm:table-cell">{t("th_duration")}</th>
+                <th className="px-3 py-2 text-left hidden sm:table-cell">
+                  {t("th_duration")}
+                </th>
                 <th className="px-3 py-2 text-left">{t("th_status")}</th>
                 <th className="px-3 py-2 text-right">{t("th_products")}</th>
               </tr>
@@ -217,12 +245,18 @@ function LatestRunsBySitePanel({
                 return (
                   <tr key={item.site} className="border-t border-border">
                     <td className="px-3 py-2 font-medium">{item.site}</td>
-                    <td className="px-3 py-2 font-mono text-xs">{run?.id ?? "—"}</td>
+                    <td className="px-3 py-2 font-mono text-xs">
+                      {run?.id ?? "—"}
+                    </td>
                     <td className="px-3 py-2 text-muted-foreground">
-                      {run?.started_at ? run.started_at.slice(0, 16).replace("T", " ") : "—"}
+                      {run?.started_at
+                        ? run.started_at.slice(0, 16).replace("T", " ")
+                        : "—"}
                     </td>
                     <td className="px-3 py-2 text-muted-foreground hidden sm:table-cell tabular-nums">
-                      {run ? formatDuration(run.started_at, run.finished_at, t) : "—"}
+                      {run
+                        ? formatDuration(run.started_at, run.finished_at, t)
+                        : "—"}
                     </td>
                     <td className="px-3 py-2">
                       <div className="flex flex-col items-start gap-1">
@@ -242,7 +276,10 @@ function LatestRunsBySitePanel({
               })}
               {items.length === 0 && (
                 <tr className="border-t border-border">
-                  <td colSpan={6} className="px-3 py-4 text-center text-muted-foreground">
+                  <td
+                    colSpan={6}
+                    className="px-3 py-4 text-center text-muted-foreground"
+                  >
                     {t("no_data")}
                   </td>
                 </tr>
@@ -351,7 +388,9 @@ function RunRowExpandable({
         <td className="px-3 py-2">
           <StatusBadge status={run.status} />
         </td>
-        <td className="px-3 py-2 text-right tabular-nums">{run.products_scraped}</td>
+        <td className="px-3 py-2 text-right tabular-nums">
+          {run.products_scraped}
+        </td>
         <td className="px-3 py-2 text-muted-foreground hidden md:table-cell">
           {run.sites_completed}
         </td>
@@ -360,11 +399,11 @@ function RunRowExpandable({
         <tr className="border-t border-border bg-muted/10">
           <td colSpan={7} className="px-3 py-3">
             {breakdownQ.isLoading && (
-              <div className="text-xs text-muted-foreground">{t("loading_breakdown")}</div>
+              <div className="text-xs text-muted-foreground">
+                {t("loading_breakdown")}
+              </div>
             )}
-            {breakdownQ.data && (
-              <RunBreakdownPanel data={breakdownQ.data} />
-            )}
+            {breakdownQ.data && <RunBreakdownPanel data={breakdownQ.data} />}
           </td>
         </tr>
       )}
@@ -456,7 +495,10 @@ function RunBreakdownPanel({
           const cats = data.products_per_site_category[site] || {};
           const sorted = Object.entries(cats).sort(([, a], [, b]) => b - a);
           return (
-            <div key={site} className="rounded-md border border-border bg-card p-3">
+            <div
+              key={site}
+              className="rounded-md border border-border bg-card p-3"
+            >
               <div className="font-medium text-sm mb-2">{site}</div>
               <div className="space-y-1.5">
                 {sorted.map(([cat, count]) => {
@@ -477,12 +519,17 @@ function RunBreakdownPanel({
                             </div>
                           </>
                         ) : (
-                          <div className="truncate text-muted-foreground" title={cat}>
+                          <div
+                            className="truncate text-muted-foreground"
+                            title={cat}
+                          >
                             {cat}
                           </div>
                         )}
                       </div>
-                      <span className="font-mono tabular-nums shrink-0">{count}</span>
+                      <span className="font-mono tabular-nums shrink-0">
+                        {count}
+                      </span>
                     </div>
                   );
                 })}
@@ -521,7 +568,9 @@ function ActionRow({ action }: { action: RoiAction }) {
       <div className="flex items-start justify-between gap-2">
         <div className="flex-1 min-w-0">
           <div className="font-medium text-sm">{action.title}</div>
-          <div className="text-xs text-muted-foreground mt-0.5">{action.detail}</div>
+          <div className="text-xs text-muted-foreground mt-0.5">
+            {action.detail}
+          </div>
         </div>
         {hasGap && (
           <div className="shrink-0 text-right">
@@ -532,7 +581,8 @@ function ActionRow({ action }: { action: RoiAction }) {
               title={t("unit_gap_hint")}
             >
               {gapPositive ? "+" : ""}
-              {formatPrice(action.unit_gap_azn ?? 0, locale)} {t("unit_gap_label")}
+              {formatPrice(action.unit_gap_azn ?? 0, locale)}{" "}
+              {t("unit_gap_label")}
             </div>
             <div className="text-[11px] text-muted-foreground tabular-nums">
               {(action.spread_pct ?? 0).toFixed(1)} {t("spread_label")}
@@ -557,7 +607,9 @@ function formatDuration(
   const mins = Math.floor(seconds / 60);
   if (mins < 60) {
     const s = seconds % 60;
-    return s > 0 ? t("duration_min_sec", { n: mins, s }) : t("duration_min", { n: mins });
+    return s > 0
+      ? t("duration_min_sec", { n: mins, s })
+      : t("duration_min", { n: mins });
   }
   const hours = Math.floor(mins / 60);
   const m = mins % 60;
@@ -589,7 +641,9 @@ function SiteStalenessPanel({ sites }: { sites: HealthSite[] }) {
         <h2 className="text-sm font-semibold text-muted-foreground">
           {t("title")}
         </h2>
-        <span className="text-xs text-muted-foreground">{t("auto_refresh")}</span>
+        <span className="text-xs text-muted-foreground">
+          {t("auto_refresh")}
+        </span>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
         {sites.map((s) => (
@@ -622,8 +676,10 @@ function SiteStalenessCell({ site }: { site: HealthSite }) {
     Icon = AlertTriangle;
   }
   const toneClasses = {
-    green: "bg-green-500/10 text-green-700 dark:text-green-400 border-green-500/20",
-    yellow: "bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border-yellow-500/20",
+    green:
+      "bg-green-500/10 text-green-700 dark:text-green-400 border-green-500/20",
+    yellow:
+      "bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border-yellow-500/20",
     red: "bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20",
   };
 
@@ -631,13 +687,15 @@ function SiteStalenessCell({ site }: { site: HealthSite }) {
     hours === null
       ? t("no_data")
       : hours < 1
-      ? t("minutes_ago", { n: Math.round(hours * 60) })
-      : hours < 24
-      ? t("hours_ago", { n: Math.round(hours) })
-      : t("days_ago", { n: Math.round(hours / 24) });
+        ? t("minutes_ago", { n: Math.round(hours * 60) })
+        : hours < 24
+          ? t("hours_ago", { n: Math.round(hours) })
+          : t("days_ago", { n: Math.round(hours / 24) });
 
   return (
-    <div className={`flex items-center gap-3 rounded-md border p-3 ${toneClasses[tone]}`}>
+    <div
+      className={`flex items-center gap-3 rounded-md border p-3 ${toneClasses[tone]}`}
+    >
       <Icon className="h-5 w-5 shrink-0" />
       <div className="min-w-0 flex-1">
         <div className="font-medium text-sm truncate">{site.site}.az</div>

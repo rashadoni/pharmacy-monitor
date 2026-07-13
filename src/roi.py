@@ -50,12 +50,6 @@ CLIENT_SITE = "pharmonline"
 COMPETITOR_SITES = ("aptekonline", "aloe")
 ALL_SITES = (CLIENT_SITE, *COMPETITOR_SITES)
 
-# Phase 4.1 (2026-05-27): set by compute_actions() from PricingConfig, read by
-# _undercut_threats. Module-level for the same reason CLIENT_SITE is module-level
-# (avoids threading through every sub-function signature). Thread-unsafe across
-# parallel compute_actions calls — but those are serial in our codebase.
-_CURRENT_MIN_MARGIN_PCT: float = 10.0
-
 ActionType = Literal[
     "price_raise",
     "undercut",
@@ -161,6 +155,12 @@ def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
         tenant_id=tenant_id,
     )
     if set(run_ids) != set(ALL_SITES):
+        log.warning(
+            "roi_financial_inputs_missing_lineage",
+            expected=list(ALL_SITES),
+            found=run_ids,
+            tenant_id=tenant_id,
+        )
         return False
     attempts = storage.latest_full_catalog_attempts_by_site(
         session,
@@ -168,8 +168,20 @@ def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
         tenant_id=tenant_id,
     )
     if set(attempts) != set(ALL_SITES):
+        log.warning(
+            "roi_financial_inputs_missing_attempts",
+            expected=list(ALL_SITES),
+            found=sorted(attempts.keys()),
+            tenant_id=tenant_id,
+        )
         return False
     if any(attempts[site].id != run_ids[site] for site in ALL_SITES):
+        log.warning(
+            "roi_financial_inputs_attempt_mismatch",
+            attempts={site: attempts[site].id for site in attempts},
+            run_ids=run_ids,
+            tenant_id=tenant_id,
+        )
         return False
     runs = {
         run.id: run
@@ -228,8 +240,13 @@ def cache_actions(
         raise ValueError("ROI cache requires a financially eligible full-catalog run")
     if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
         raise ValueError("ROI cache requires fresh verified full-catalog inputs for every site")
+    from src.product_policy import policy_fingerprint, trusted_catalog_epoch
 
     payload = [_action_to_dict(a) for a in actions]
+    fingerprint = policy_fingerprint()
+    epoch = trusted_catalog_epoch(session, tenant_id=tenant_id)
+    if epoch is None:
+        raise RuntimeError("trusted full-catalog epoch is unavailable")
     existing = session.scalar(
         select(RoiActionsCache).where(
             RoiActionsCache.tenant_id == tenant_id,
@@ -240,6 +257,8 @@ def cache_actions(
         existing.payload = payload
         existing.computed_at = utcnow()
         existing.run_id = run_id
+        existing.policy_fingerprint = fingerprint
+        existing.trust_epoch = epoch
     else:
         session.add(
             RoiActionsCache(
@@ -248,6 +267,8 @@ def cache_actions(
                 payload=payload,
                 computed_at=utcnow(),
                 run_id=run_id,
+                policy_fingerprint=fingerprint,
+                trust_epoch=epoch,
             )
         )
     session.commit()
@@ -293,6 +314,8 @@ def get_cached_actions_snapshot(
     refreshed run B.  Newer full-catalog attempts still fail the snapshot
     closed through the lineage checks below.
     """
+    from src.product_policy import policy_fingerprint, trusted_catalog_epoch
+
     row = session.scalar(
         select(storage.RoiActionsCache).where(
             storage.RoiActionsCache.tenant_id == tenant_id,
@@ -334,6 +357,24 @@ def get_cached_actions_snapshot(
             "roi_actions_cache_inputs_unverified",
             client_site=client_site,
             run_id=row.run_id,
+        )
+        return None
+    current_epoch = trusted_catalog_epoch(session, tenant_id=tenant_id)
+    if current_epoch is None or row.trust_epoch != current_epoch:
+        log.info(
+            "roi_actions_cache_epoch_mismatch",
+            client_site=client_site,
+            cached=row.trust_epoch,
+            current=current_epoch,
+        )
+        return None
+    current_fingerprint = policy_fingerprint()
+    if row.policy_fingerprint != current_fingerprint:
+        log.info(
+            "roi_actions_cache_policy_mismatch",
+            client_site=client_site,
+            cached=row.policy_fingerprint,
+            current=current_fingerprint,
         )
         return None
     age = utcnow() - row.computed_at
@@ -402,6 +443,12 @@ def refresh_all_cached_actions(
                 error=str(e),
             )
             out[site] = -1
+            # Never retain a financially stale payload after a failed refresh.
+            session.query(storage.RoiActionsCache).filter(
+                storage.RoiActionsCache.tenant_id == tenant_id,
+                storage.RoiActionsCache.client_site == site,
+            ).delete(synchronize_session=False)
+            session.commit()
     return out
 
 
@@ -451,10 +498,9 @@ def _compute_actions_locked(
     """Главная точка: собрать все действия, отсортировать по spread desc.
 
     `client_site` (optional) — какой сайт рассматривать как «свой» (с perspective
-    которого считаем undercut/raise/assortment-gap). По умолчанию глобальная
-    константа CLIENT_SITE. Если передан другой site, временно подмениваем
-    module-level constants (thread-unsafe — but compute_actions сейчас зовётся
-    только серийно: либо из API request, либо из refresh_all_cached_actions цикла).
+    которого считаем undercut/raise/assortment-gap). По умолчанию используется
+    CLIENT_SITE; выбранная перспектива передаётся во все расчёты явно и не
+    мутирует module-level state, поэтому параллельные tenant-запросы изолированы.
 
     Phase 4.1 (2026-05-27): thresholds теперь грузятся из `pricing_config` table
     через `storage.load_pricing_config(session, tenant_id)`. Explicit kwarg
@@ -465,7 +511,12 @@ def _compute_actions_locked(
     «месячному impact'у» потому что объёмы продаж нам неизвестны (см.
     module docstring).
     """
-    global CLIENT_SITE, COMPETITOR_SITES
+    from src.product_policy import policy_rollout_eligibility
+
+    rollout = policy_rollout_eligibility(session, tenant_id=tenant_id)
+    if not rollout.eligible:
+        log.warning("roi_policy_gate_closed", reason=rollout.reason, tenant_id=tenant_id)
+        return []
 
     # Load per-tenant config (creates default row if missing).
     cfg = storage.load_pricing_config(session, tenant_id)
@@ -476,11 +527,7 @@ def _compute_actions_locked(
     )
     max_spread = max_spread_pct if max_spread_pct is not None else cfg.max_spread_pct
     per_type = max_per_type if max_per_type is not None else cfg.max_per_type
-    # Stash min_margin_pct on the module for _undercut_threats to pick up.
-    # (Avoids changing every sub-function signature.)
     min_margin = min_margin_pct if min_margin_pct is not None else cfg.min_margin_pct
-    global _CURRENT_MIN_MARGIN_PCT
-    _CURRENT_MIN_MARGIN_PCT = min_margin
 
     if storage.has_unfinished_run(session, tenant_id=tenant_id):
         log.warning(
@@ -498,28 +545,49 @@ def _compute_actions_locked(
         )
         return []
 
-    orig_client = CLIENT_SITE
-    orig_competitors = COMPETITOR_SITES
-    if client_site and client_site != CLIENT_SITE:
-        if client_site not in ALL_SITES:
-            raise ValueError(f"unknown client_site: {client_site!r}")
-        CLIENT_SITE = client_site
-        COMPETITOR_SITES = tuple(s for s in ALL_SITES if s != client_site)
-    try:
-        actions: list[ActionItem] = []
-        actions += _price_raise_opportunities(
-            session, raise_pct, max_spread, per_type, tenant_id=tenant_id
-        )
-        actions += _undercut_threats(
-            session, undercut_pct, max_spread, per_type, tenant_id=tenant_id
-        )
-        actions += _assortment_gaps(session, per_type, tenant_id=tenant_id)
-        actions += _map_violations(session, per_type, tenant_id=tenant_id)
-        actions += _promo_responses(session, per_type, tenant_id=tenant_id)
-    finally:
-        # Always restore — even on exception.
-        CLIENT_SITE = orig_client
-        COMPETITOR_SITES = orig_competitors
+    effective_client = client_site or CLIENT_SITE
+    if effective_client not in ALL_SITES:
+        raise ValueError(f"unknown client_site: {effective_client!r}")
+    competitors = tuple(site for site in ALL_SITES if site != effective_client)
+    actions: list[ActionItem] = []
+    actions += _price_raise_opportunities(
+        session,
+        raise_pct,
+        max_spread,
+        per_type,
+        tenant_id=tenant_id,
+        client_site=effective_client,
+        competitor_sites=competitors,
+    )
+    actions += _undercut_threats(
+        session,
+        undercut_pct,
+        max_spread,
+        per_type,
+        min_margin_pct=min_margin,
+        tenant_id=tenant_id,
+        client_site=effective_client,
+        competitor_sites=competitors,
+    )
+    actions += _assortment_gaps(
+        session,
+        per_type,
+        tenant_id=tenant_id,
+        competitor_sites=competitors,
+    )
+    actions += _map_violations(
+        session,
+        per_type,
+        tenant_id=tenant_id,
+        client_site=effective_client,
+        competitor_sites=competitors,
+    )
+    actions += _promo_responses(
+        session,
+        per_type,
+        tenant_id=tenant_id,
+        competitor_sites=competitors,
+    )
 
     # Сортировка: critical → warning → opportunity → info; внутри — по |spread_pct| desc
     sev_order = {"critical": 0, "warning": 1, "opportunity": 2, "info": 3}
@@ -547,7 +615,9 @@ def _price_raise_opportunities(
     max_spread_pct: float,
     max_n: int,
     *,
-    tenant_id: int = 1,
+    tenant_id: int,
+    client_site: str,
+    competitor_sites: tuple[str, ...],
 ) -> list[ActionItem]:
     """Где клиент дешевле всех конкурентов более чем на threshold%.
 
@@ -559,17 +629,23 @@ def _price_raise_opportunities(
     if not run_id:
         return []
 
-    matches = session.scalars(select(Match).where(Match.tenant_id == tenant_id)).all()
+    matches = session.scalars(
+        select(Match).where(Match.tenant_id == tenant_id)
+    ).all()
     snaps_cache = _preload_snapshots(session, run_id, tenant_id=tenant_id)
     out: list[ActionItem] = []
 
     for m in matches:
-        prices_by_site = _prices_for_match(session, m, run_id, snaps_cache)
-        client_price = prices_by_site.get(CLIENT_SITE)
+        prices_by_site = _prices_for_match(
+            session, m, run_id, snaps_cache, client_site=client_site
+        )
+        client_price = prices_by_site.get(client_site)
         if client_price is None or client_price <= 0:
             continue  # цена 0 → иначе деление на 0 в gap_pct (fail-soft, но всё равно гардим)
         comp_prices = [
-            (s, p) for s, p in prices_by_site.items() if s in COMPETITOR_SITES and p is not None
+            (s, p)
+            for s, p in prices_by_site.items()
+            if s in competitor_sites and p is not None
         ]
         if not comp_prices:
             continue
@@ -587,7 +663,7 @@ def _price_raise_opportunities(
         target = round(median_comp * 0.98, 2)
         delta = round(target - client_price, 2)
 
-        client_product = _client_product(m)
+        client_product = _client_product(m, client_site)
         # Если товара нет на складе — нет смысла советовать поднимать
         if client_product and not _is_in_stock(session, client_product.id):
             continue
@@ -630,7 +706,10 @@ def _undercut_threats(
     max_spread_pct: float,
     max_n: int,
     *,
-    tenant_id: int = 1,
+    min_margin_pct: float,
+    tenant_id: int,
+    client_site: str,
+    competitor_sites: tuple[str, ...],
 ) -> list[ActionItem]:
     """Где конкурент опустил цену ниже клиента.
 
@@ -643,19 +722,23 @@ def _undercut_threats(
     if not run_id:
         return []
 
-    matches = session.scalars(select(Match).where(Match.tenant_id == tenant_id)).all()
+    matches = session.scalars(
+        select(Match).where(Match.tenant_id == tenant_id)
+    ).all()
     snaps_cache = _preload_snapshots(session, run_id, tenant_id=tenant_id)
     out: list[ActionItem] = []
 
     for m in matches:
-        prices_by_site = _prices_for_match(session, m, run_id, snaps_cache)
-        client_price = prices_by_site.get(CLIENT_SITE)
+        prices_by_site = _prices_for_match(
+            session, m, run_id, snaps_cache, client_site=client_site
+        )
+        client_price = prices_by_site.get(client_site)
         if client_price is None:
             continue
 
         cheapest_comp_site = None
         cheapest_comp_price = None
-        for site in COMPETITOR_SITES:
+        for site in competitor_sites:
             p = prices_by_site.get(site)
             if p is None:
                 continue
@@ -678,7 +761,7 @@ def _undercut_threats(
         # Lost margin per unit (assuming we have to match)
         lost_per_unit = round(client_price - target, 2)
 
-        client_product = _client_product(m)
+        client_product = _client_product(m, client_site)
         comp_url = next((p.url for p in m.products if p.site == cheapest_comp_site), None)
 
         # Stock-aware: если у нас нет товара на складе — undercut неактуален
@@ -702,10 +785,10 @@ def _undercut_threats(
                     )
                 else:
                     # Phase 4.1: configurable min_margin_pct (was hardcoded 10%)
-                    margin_threshold = _CURRENT_MIN_MARGIN_PCT / 100.0
+                    margin_threshold = min_margin_pct / 100.0
                     if (target - purchase) / target < margin_threshold:
                         margin_warning = (
-                            f" ⚠️ Маржа после снижения < {_CURRENT_MIN_MARGIN_PCT:.0f}% "
+                            f" ⚠️ Маржа после снижения < {min_margin_pct:.0f}% "
                             f"(закупка {purchase:.2f} ₼)."
                         )
 
@@ -739,7 +822,8 @@ def _assortment_gaps(
     session: Session,
     max_n: int,
     *,
-    tenant_id: int = 1,
+    tenant_id: int,
+    competitor_sites: tuple[str, ...],
 ) -> list[ActionItem]:
     """Товары на конкурентах которых нет у клиента (canonical_id is None).
 
@@ -747,15 +831,18 @@ def _assortment_gaps(
     latest snapshot (а не «snapshot последнего прогона», который после
     diff-only пропускает продукты без price-changes).
     """
+    from src.product_policy import policy_offer_eligibility
     from src.storage import latest_snapshots_per_product
 
     products = session.scalars(
         select(Product).where(
-            Product.site.in_(COMPETITOR_SITES),
+            Product.tenant_id == tenant_id,
+            Product.site.in_(competitor_sites),
             Product.canonical_id.is_(None),
             Product.tenant_id == tenant_id,
         )
     ).all()
+    products = [p for p in products if policy_offer_eligibility(p).eligible]
     if not products:
         return []
 
@@ -802,7 +889,9 @@ def _map_violations(
     session: Session,
     max_n: int,
     *,
-    tenant_id: int = 1,
+    tenant_id: int,
+    client_site: str,
+    competitor_sites: tuple[str, ...],
 ) -> list[ActionItem]:
     """Phase 4.5: Detect client products priced below brand-floor.
 
@@ -824,6 +913,12 @@ def _map_violations(
     """
     from sqlalchemy import func
 
+    from src.product_policy import (
+        OFFER_OUT_OF_STOCK,
+        availability_policy_enforced,
+        current_offer_sql,
+        policy_offer_eligibility,
+    )
     from src.storage import latest_snapshots_per_product
 
     floor_window_start = utcnow() - timedelta(days=_MAP_FLOOR_WINDOW_DAYS)
@@ -834,6 +929,11 @@ def _map_violations(
     eligible_run_ids = storage.financially_eligible_run_ids(session, tenant_id=tenant_id)
     if not eligible_run_ids:
         return []
+    offer_predicate = (
+        current_offer_sql(Product)
+        if availability_policy_enforced()
+        else Product.offer_availability_status != OFFER_OUT_OF_STOCK
+    )
     rows = session.execute(
         select(
             Product.brand,
@@ -842,9 +942,10 @@ def _map_violations(
         )
         .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
         .where(
-            Product.site.in_(COMPETITOR_SITES),
             Product.tenant_id == tenant_id,
+            Product.site.in_(competitor_sites),
             Product.brand.is_not(None),
+            offer_predicate,
             PriceSnapshot.captured_at >= floor_window_start,
             PriceSnapshot.run_id.in_(eligible_run_ids),
             effective_price.is_not(None),
@@ -863,11 +964,16 @@ def _map_violations(
     # Step 2: client products в тех же брендах + их current effective price.
     client_products = session.scalars(
         select(Product).where(
-            Product.site == CLIENT_SITE,
             Product.tenant_id == tenant_id,
+            Product.site == client_site,
             Product.brand.in_(list(brand_floors.keys())),
         )
     ).all()
+    client_products = [
+        product
+        for product in client_products
+        if policy_offer_eligibility(product).eligible
+    ]
     if not client_products:
         return []
 
@@ -941,14 +1047,15 @@ def _promo_responses(
     session: Session,
     max_n: int,
     *,
-    tenant_id: int = 1,
+    tenant_id: int,
+    competitor_sites: tuple[str, ...],
 ) -> list[ActionItem]:
     """Активные промо у конкурентов — могут потребовать ответа."""
     from sqlalchemy import and_, or_
 
     run_ids = storage.latest_financial_run_ids_by_site(
         session,
-        COMPETITOR_SITES,
+        competitor_sites,
         tenant_id=tenant_id,
     )
     if not run_ids:
@@ -987,14 +1094,25 @@ def _prices_for_match(
     match: Match,
     run_id: int,
     snapshots_cache: dict[int, "PriceSnapshot"] | None = None,
+    *,
+    client_site: str = CLIENT_SITE,
 ) -> dict[str, float | None]:
     """Эффективная цена для каждого сайта в Match.
 
     Если передан `snapshots_cache` (preloaded {product_id: PriceSnapshot}) —
     используется он вместо отдельного SQL на каждый product. Это убирает N+1.
     """
-    out: dict[str, float | None] = {CLIENT_SITE: None, "aptekonline": None, "aloe": None}
+    out: dict[str, float | None] = {
+        client_site: None,
+        **{site: None for site in ALL_SITES if site != client_site},
+    }
+    from src.product_policy import policy_identity_eligibility, policy_offer_eligibility
+
+    if not policy_identity_eligibility(list(match.products)).eligible:
+        return out
     for p in match.products:
+        if not policy_offer_eligibility(p).eligible:
+            continue
         if snapshots_cache is not None:
             snap = snapshots_cache.get(p.id)
         else:
@@ -1011,8 +1129,8 @@ def _prices_for_match(
     return out
 
 
-def _client_product(match: Match) -> Product | None:
-    return next((p for p in match.products if p.site == CLIENT_SITE), None)
+def _client_product(match: Match, client_site: str = CLIENT_SITE) -> Product | None:
+    return next((p for p in match.products if p.site == client_site), None)
 
 
 def aggregate_impact(actions: list[ActionItem]) -> dict[str, float]:
