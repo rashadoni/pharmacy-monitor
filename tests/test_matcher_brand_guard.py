@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from src.matcher import (
     _has_conflicting_brand,
     _has_conflicting_dose,
+    _has_conflicting_identity_country,
     _has_conflicting_ingredient_codes,
     _has_conflicting_origin_or_grade,
     _has_conflicting_pack_volume,
@@ -296,6 +297,7 @@ class TestStrictCommodityOrigin:
         # trade-name drug made in different plants is the SAME drug → commodity gate off
         a = self._pc("Konkor 5 mg N30", "Merck", manufacturer="ALMANİYA")
         b = self._pc("Konkor 5 mg N30", "Merck", manufacturer="FRANSA")
+        assert _has_conflicting_identity_country(a, b) is False
         assert _has_conflicting_origin_or_grade(a, b) is False
         assert _hard_conflict(a, b) is False
 

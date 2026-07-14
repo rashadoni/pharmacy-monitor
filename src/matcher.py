@@ -718,6 +718,76 @@ def _has_conflicting_country(a, b) -> bool:
     return bool(ca) and bool(cb) and ca != cb
 
 
+_COUNTRY_IDENTITY_NAME_TOKENS: frozenset[str] = frozenset(
+    {
+        # generic pharmaceutical commodities
+        "qliserin",
+        "gliserin",
+        "glycerin",
+        "qlukoza",
+        "glukoza",
+        "natrium",
+        "xlorid",
+        "sodium",
+        "chloride",
+        "ringer",
+        "ammonyak",
+        "ammiak",
+        "inyeksiya",
+        "injection",
+        # medical supplies / consumer goods where manufacturing origin is identity
+        "maska",
+        "mask",
+        "spris",
+        "syringe",
+        "spiral",
+        "kepenek",
+        "kateter",
+        "catheter",
+        "bez",
+        "pampers",
+        "huggies",
+        "salfet",
+        "bandi",
+        "bandaj",
+        "plastir",
+        "leukoplast",
+    }
+)
+
+
+def _is_country_identity_name(name: str | None) -> bool:
+    """Products where origin country is part of commercial identity.
+
+    This intentionally remains narrower than "all products": botanicals/oils/tea
+    use the existing commodity gate, and generic pharma commodities or medical
+    supplies use the marker list above. Trade-name medicines like X-Brain or
+    Konkor stay outside this gate.
+    """
+    if is_commodity_name(name):
+        return True
+    if not name:
+        return False
+    tokens = set(strip_accents(name).lower().replace("-", " ").split())
+    return bool(tokens & _COUNTRY_IDENTITY_NAME_TOKENS)
+
+
+def _has_conflicting_identity_country(a, b) -> bool:
+    """Country is a hard identity signal only for country-sensitive products.
+
+    Client rule (2026-05-31): commodity identity includes country. Do not apply
+    this globally to trade-name medicines: the same drug can be sold from
+    different manufacturing plants/import origins, and those cases belong to
+    diagnostics/manual review unless another hard guard fires.
+    """
+    if not (
+        _is_country_identity_name(getattr(a, "name", None))
+        and _is_country_identity_name(getattr(b, "name", None))
+    ):
+        return False
+    return _has_conflicting_country(a, b)
+
+
 # Grade-слова: косметическое масло ≠ пищевое/обычное (разный товар, разная цена).
 _GRADE_WORDS = {"kosmetik", "kosmetika", "kosmeticeskoe", "naruzhnoe", "cosmetic"}
 
@@ -737,7 +807,7 @@ def _has_conflicting_origin_or_grade(a, b) -> bool:
     an, bn = getattr(a, "name", None), getattr(b, "name", None)
     if not (is_commodity_name(an) and is_commodity_name(bn)):
         return False
-    return _has_conflicting_country(a, b) or _grade_tokens(an) != _grade_tokens(bn)
+    return _has_conflicting_identity_country(a, b) or _grade_tokens(an) != _grade_tokens(bn)
 
 
 # ── Габариты AxB (2026-05-29) ────────────────────────────────────────────────
@@ -1034,6 +1104,7 @@ def _hard_conflict(a, b) -> bool:
     ar, br = a.name or "", b.name or ""
     return (
         _has_conflicting_brand(a, b)
+        or _has_conflicting_identity_country(a, b)
         or _has_conflicting_origin_or_grade(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
@@ -1055,13 +1126,12 @@ def _pairwise_spec_conflict(a, b) -> bool:
     тип/медь, одиночный вариант-атом, многозначная сила, габариты, %. Все требуют
     конфликтующего сигнала с ОБЕИХ сторон → near-zero false-positive на одном товаре.
 
-    НАМЕРЕННО уже, чем проходы: НЕ включаем country/form/modifier/vtokens/series —
-    они имеют false-positive на verbose-vs-terse / параллельный-импорт паре ОДНОГО
-    товара (Novalans с/без «(Kapsulalar)», бренд с разной страной, məhlul/şərbət),
-    и авто-dissolve таких кластеров СЛОМАЛ БЫ верные матчи (проверено на прод-дампе:
-    5×country + 1×form — все ложные; только 2×vmarker реальные). Для НОВОЙ
-    кластеризации полный набор ок (greedy + др. сигналы компенсируют), но для
-    необратимого ретро-разрыва берём только надёжные дискриминаторы.
+    НАМЕРЕННО уже, чем проходы: НЕ включаем global country/form/modifier/vtokens/
+    series — они имеют false-positive на verbose-vs-terse / параллельный-импорт
+    паре ОДНОГО trade-name товара (Novalans с/без «(Kapsulalar)», бренд с разной
+    страной, məhlul/şərbət), и авто-dissolve таких кластеров СЛОМАЛ БЫ верные
+    матчи. Country включается только через _has_conflicting_identity_country:
+    botanicals/generic commodities/medical supplies, где страна — часть identity.
 
     + brand-conflict (2026-05-31): brand_verified из АВТОРИТЕТНОГО источника
     (slug/page-JSON/aloe), оба потребительские и различаются — надёжный сигнал
@@ -1069,6 +1139,7 @@ def _pairwise_spec_conflict(a, b) -> bool:
     ar, br = a.name or "", b.name or ""
     return (
         _has_conflicting_brand(a, b)
+        or _has_conflicting_identity_country(a, b)
         or _has_conflicting_origin_or_grade(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
@@ -1675,10 +1746,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
-                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
-                # глицерин — разный товар, ложный 85% spread. Блок только если у
-                # обоих страна известна и различается (см. _has_conflicting_country).
-                if any(_has_conflicting_country(c, q) for c in cluster):
+                # Country is hard identity only for country-sensitive products:
+                # Talya(Türkiyə) glycerin ≠ Azerfarm(Azərbaycan) glycerin.
+                # Trade-name medicines with different origins go to diagnostics/review,
+                # not an automatic block.
+                if any(_has_conflicting_identity_country(c, q) for c in cluster):
                     continue
                 # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
                 if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
@@ -1798,10 +1870,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
-                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
-                # глицерин — разный товар, ложный 85% spread. Блок только если у
-                # обоих страна известна и различается (см. _has_conflicting_country).
-                if any(_has_conflicting_country(c, q) for c in cluster):
+                # Country is hard identity only for country-sensitive products:
+                # Talya(Türkiyə) glycerin ≠ Azerfarm(Azərbaycan) glycerin.
+                # Trade-name medicines with different origins go to diagnostics/review,
+                # not an automatic block.
+                if any(_has_conflicting_identity_country(c, q) for c in cluster):
                     continue
                 # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
                 if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
@@ -1923,10 +1996,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
-                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
-                # глицерин — разный товар, ложный 85% spread. Блок только если у
-                # обоих страна известна и различается (см. _has_conflicting_country).
-                if any(_has_conflicting_country(c, q) for c in cluster):
+                # Country is hard identity only for country-sensitive products:
+                # Talya(Türkiyə) glycerin ≠ Azerfarm(Azərbaycan) glycerin.
+                # Trade-name medicines with different origins go to diagnostics/review,
+                # not an automatic block.
+                if any(_has_conflicting_identity_country(c, q) for c in cluster):
                     continue
                 # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
                 if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
@@ -2050,10 +2124,11 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
-                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
-                # глицерин — разный товар, ложный 85% spread. Блок только если у
-                # обоих страна известна и различается (см. _has_conflicting_country).
-                if any(_has_conflicting_country(c, q) for c in cluster):
+                # Country is hard identity only for country-sensitive products:
+                # Talya(Türkiyə) glycerin ≠ Azerfarm(Azərbaycan) glycerin.
+                # Trade-name medicines with different origins go to diagnostics/review,
+                # not an automatic block.
+                if any(_has_conflicting_identity_country(c, q) for c in cluster):
                     continue
                 # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
                 if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
