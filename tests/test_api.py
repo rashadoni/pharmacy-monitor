@@ -870,6 +870,62 @@ def test_dash_comparison_ignores_newer_untrusted_snapshot(
     assert rows[0]["prices"]["aloe"]["price"] == 8.0
 
 
+def test_dash_comparison_shadow_bootstraps_without_trusted_lineage(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    """Shadow rollout must not return an empty catalog before its first trusted full run."""
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "shadow")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "shadow")
+    run = storage.Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="ok",
+        catalog_scope="partial",
+        catalog_verified=False,
+        run_quality={
+            "baseline_enforced": False,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {},
+        },
+    )
+    setup_db.add(run)
+    setup_db.flush()
+    match = storage.Match(tenant_id=1, canonical_name="Shadow comparison", confidence=1.0)
+    setup_db.add(match)
+    setup_db.flush()
+    products = []
+    for site, price in (("pharmonline", 10.0), ("aloe", 8.0)):
+        product = storage.Product(
+            tenant_id=1,
+            site=site,
+            external_id=f"shadow-{site}",
+            url=f"https://example.com/{site}/shadow",
+            name="Shadow comparison",
+            name_normalized="shadow comparison",
+            canonical_id=match.id,
+            manufacturer_country_code="rs",
+            country_resolution_status="resolved",
+            offer_availability_status="in_stock",
+            availability_observed_at=utcnow(),
+            last_seen_at=utcnow(),
+        )
+        setup_db.add(product)
+        setup_db.flush()
+        products.append(product)
+        setup_db.add(storage.PriceSnapshot(run_id=run.id, product_id=product.id, price=price))
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/comparison?search=Shadow%20comparison")
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert len(rows) == 1
+    assert rows[0]["prices"]["pharmonline"]["price"] == 10.0
+    assert rows[0]["prices"]["aloe"]["price"] == 8.0
+
+
 def test_dash_runs_latest_by_site_includes_weekly_site(client, auth_cookie, setup_db):
     """Latest-by-site keeps aptekonline visible even when global recent runs are newer."""
 

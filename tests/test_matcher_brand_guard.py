@@ -11,6 +11,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from src.matcher import (
+    _doses_mg_from_url,
     _has_conflicting_brand,
     _has_conflicting_dose,
     _has_conflicting_ingredient_codes,
@@ -238,6 +239,20 @@ class TestBrandGuard:
         assert _has_conflicting_dose(_p("X 500 mg", None), _p("X № 20", None)) is False
         # mcg vs mg equivalence (1000 mcg == 1 mg) → no conflict
         assert _has_conflicting_dose(_p("X 1000 mcg", None), _p("X 1 mg", None)) is False
+
+    def test_dose_uses_safe_url_fallback_when_title_omits_strength(self):
+        title_poor = _p(
+            "Risek İnsta N10 (toz)",
+            None,
+            "https://www.aptekonline.az/product/risek-40mg-n10",
+        )
+        assert _doses_mg_from_url(title_poor.url) == frozenset({40.0})
+        assert _has_conflicting_dose(title_poor, _p("Risek Insta 20 mq № 10", None)) is True
+        assert _has_conflicting_dose(title_poor, _p("Risek Insta 40 mq № 10", None)) is False
+
+    def test_url_dose_fallback_rejects_ambiguous_slug_encodings(self):
+        assert _doses_mg_from_url("https://example.test/product/foo-7-5mg-n10") == frozenset()
+        assert _doses_mg_from_url("https://example.test/product/foo-5mg125mg10mg") == frozenset()
 
     def test_non_commodity_different_brands_no_conflict(self):
         # commodity gate: a trade-name drug with different brand strings must NOT

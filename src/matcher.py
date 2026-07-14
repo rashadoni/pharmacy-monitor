@@ -999,6 +999,16 @@ def _has_conflicting_pack_volume(a, b) -> bool:
 # Сила дозы препарата: число + mg/mq/mkg/mcg (НЕ ml/g — то объём/вес упаковки).
 _DOSE_MG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(mg|mq|mkg|mcg|µg)(?![a-z])", re.IGNORECASE)
 
+# Some sites omit the dose from the visible title but retain it in a clean URL
+# slug (for example aptekonline ``/product/risek-40mg-n10``).  This parser is
+# deliberately stricter than the title parser: a dose must occupy a complete
+# path/slug segment, and a digit-hyphen prefix is rejected so decimal slugs such
+# as ``7-5mg`` are not misread as 5 mg.
+_URL_DOSE_MG_RE = re.compile(
+    r"(?<!\d)(?:^|[-_/])(\d+(?:[.,]\d+)?)(mg|mq|mkg|mcg|µg)(?=$|[-_/])",
+    re.IGNORECASE,
+)
+
 
 _SPACED_THOUSANDS_RE = re.compile(r"\b(\d{1,3})(?:\s(\d{3}))+\b")
 
@@ -1016,6 +1026,25 @@ def _doses_mg(text: str) -> frozenset[float]:
     return frozenset(out)
 
 
+def _doses_mg_from_url(url: str | None) -> frozenset[float]:
+    text = strip_accents(url or "").lower()
+    out = set()
+    for match in _URL_DOSE_MG_RE.finditer(text):
+        value = float(match.group(1).replace(",", "."))
+        if match.group(2) in ("mkg", "mcg", "µg"):
+            value /= 1000.0
+        out.add(round(value, 4))
+    return frozenset(out)
+
+
+def _doses_mg_for_product(product) -> frozenset[float]:
+    """Return title dose, falling back to a conservative URL slug parser."""
+    from_name = _doses_mg(getattr(product, "name", "") or "")
+    if from_name:
+        return from_name
+    return _doses_mg_from_url(getattr(product, "url", None))
+
+
 def _has_conflicting_dose(a, b) -> bool:
     """Разная сила дозы (mg) в ИМЕНАХ → разные товары.
 
@@ -1023,12 +1052,11 @@ def _has_conflicting_dose(a, b) -> bool:
     компонентных (5/1.25/10 vs 5/1.25/5). Требуется единица (не голое число, не
     объём ml/g) → нет ложных на pack-count. Одна сторона без дозы → не блок.
 
-    NB: читаем ТОЛЬКО имена, НЕ url: в slug десятичные/диапазоны ломаются дефисом
-    («7.5mg»→«7-5mg»→ложн.«5mg»; «5mg125mg10mg»→125 вместо 1.25) → массовые ложные
-    разрывы (dry-run 2026-05-31). Кейс aptek-без-mg-в-имени (Risek «N10 (toz)») —
-    редкий, чинится точечно, не этим guard'ом."""
-    da = _doses_mg(getattr(a, "name", "") or "")
-    db = _doses_mg(getattr(b, "name", "") or "")
+    URL читаем только fallback-ом и только по безопасным slug-сегментам: это
+    закрывает aptekonline title-poor кейсы вроде Risek «N10 (toz)» при URL
+    `risek-40mg-n10`, не возвращая старые false-positive на `7-5mg`."""
+    da = _doses_mg_for_product(a)
+    db = _doses_mg_for_product(b)
     return bool(da) and bool(db) and da != db
 
 
@@ -1062,7 +1090,7 @@ def ultra_equal(a, b) -> bool:
         and _size_letters(ra) == _size_letters(rb)
         and _ingredient_codes(ra) == _ingredient_codes(rb)
         and extract_pack_size(ra) == extract_pack_size(rb)
-        and _doses_mg(ra) == _doses_mg(rb)
+        and _doses_mg_for_product(a) == _doses_mg_for_product(b)
         and extract_form(ra) == extract_form(rb)
         and _variant_words(ra) == _variant_words(rb)
         # Не помечаем cross-brand коммодити «точным совпадением»: для масел/чаёв/

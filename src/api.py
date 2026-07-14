@@ -2114,10 +2114,21 @@ def dash_comparison(
     # после diff-only persist'а (2026-05-09) прошлая логика `WHERE run_id ==
     # last_run` пропускала продукты без price-changes в last_run.
     all_pids = [p.id for m in matches for p in m.products]
+    # Rollout starts in shadow mode.  Until the first financially-eligible full
+    # catalog exists there is no trusted snapshot lineage to select, and an
+    # unconditional lineage filter would turn a healthy comparison catalog into
+    # an empty 200 response.  In that bootstrap state only, shadow mode serves
+    # the latest snapshots while the hard product gates below still exclude
+    # known country conflicts, dead URLs and explicit out-of-stock offers.
+    # Enforce mode cannot reach this point without a trusted catalog because
+    # `_require_financial_policy_ready` fails closed with 503.
+    trusted_lineage_available = bool(
+        storage.financially_eligible_run_ids(db, tenant_id=user.tenant_id)
+    )
     snaps_by_pid = storage.latest_snapshots_per_product(
         db,
         all_pids,
-        financially_eligible_only=True,
+        financially_eligible_only=trusted_lineage_available,
         tenant_id=user.tenant_id,
     )
 
