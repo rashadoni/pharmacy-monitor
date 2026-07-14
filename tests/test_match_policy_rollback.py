@@ -20,7 +20,7 @@ def _product(session, site: str, external_id: str, country: str) -> storage.Prod
 
 
 def test_country_repartition_can_restore_exact_topology(db_session) -> None:
-    match = storage.Match(canonical_name="Ornafer", confidence=0.95, is_manual=True)
+    match = storage.Match(canonical_name="Ornafer", confidence=0.95, is_manual=False)
     db_session.add(match)
     db_session.flush()
     original_id = match.id
@@ -49,7 +49,7 @@ def test_country_repartition_can_restore_exact_topology(db_session) -> None:
         select(storage.Product).where(storage.Product.id.in_(product_ids))
     ).all()
     assert {product.canonical_id for product in restored} == {original_id}
-    assert db_session.get(storage.Match, original_id).is_manual is True
+    assert db_session.get(storage.Match, original_id).is_manual is False
     assert audit.rolled_back_at is not None
     for match_id in audit.payload["after"]["match_ids"]:
         if match_id != original_id:
@@ -57,7 +57,7 @@ def test_country_repartition_can_restore_exact_topology(db_session) -> None:
 
 
 def test_rollback_stops_if_product_was_manually_rematched(db_session) -> None:
-    match = storage.Match(canonical_name="Ornafer", confidence=0.95, is_manual=True)
+    match = storage.Match(canonical_name="Ornafer", confidence=0.95, is_manual=False)
     db_session.add(match)
     db_session.flush()
     left = _product(db_session, "pharmonline", "ua", "ua")
@@ -84,7 +84,7 @@ def test_rollback_stops_if_product_was_manually_rematched(db_session) -> None:
 
 
 def test_v2_rollback_restores_only_exact_rejection_state(db_session) -> None:
-    match = storage.Match(canonical_name="Ornafer", confidence=0.95, is_manual=True)
+    match = storage.Match(canonical_name="Ornafer", confidence=0.95, is_manual=False)
     db_session.add(match)
     db_session.flush()
     left = _product(db_session, "pharmonline", "ua", "ua")

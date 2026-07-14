@@ -445,6 +445,33 @@ class _DDPClient:
                     return ddp.get("result", {})
 
 
+_MANUFACTURER_COUNTRY_CUSTOM_FIELD_ID = "arPsvL8wgPiZhJ4jm3"
+
+
+def _manufacturer_country_custom_field(raw: dict, locale: str) -> str | None:
+    """Return PharmOnline's legacy manufacturer-country text, when present.
+
+    Newer products use ``manufacturerCountry`` (an ``allCountry`` dictionary
+    id). A sizeable older cohort stores the same value only in this stable
+    custom-field id. The dictionary value remains authoritative; this helper
+    is strictly a fallback for ``none``/missing/unmapped dictionary values.
+    """
+    custom_fields = raw.get("customFields") or {}
+    inputs = custom_fields.get("input") if isinstance(custom_fields, dict) else None
+    for field in inputs if isinstance(inputs, list) else []:
+        if not isinstance(field, dict):
+            continue
+        if str(field.get("_id") or "") != _MANUFACTURER_COUNTRY_CUSTOM_FIELD_ID:
+            continue
+        localized = (field.get("i18n") or {}).get(locale) or {}
+        value = localized.get("value") or field.get("value")
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+    return None
+
+
 def _build_product(
     raw: dict,
     locale: str,
@@ -517,6 +544,7 @@ def _build_product(
         category = str(category)
 
     country_id = raw.get("manufacturerCountry")
+    country_source = None
     if isinstance(country_id, list):
         country_id = country_id[0] if country_id else None
     country_raw = None
@@ -527,6 +555,12 @@ def _build_product(
             if country_id_to_code is not None
             else country_key
         )
+        if country_raw is not None:
+            country_source = "pharmonline_ddp_all_country"
+    if country_raw is None:
+        country_raw = _manufacturer_country_custom_field(raw, locale)
+        if country_raw is not None:
+            country_source = "pharmonline_ddp_custom_field"
 
     from src.product_policy import offer_from_quantity
 
@@ -539,9 +573,7 @@ def _build_product(
         name=str(name)[:500],
         manufacturer=None,
         manufacturer_country_raw=country_raw,
-        country_source=(
-            "pharmonline_ddp_all_country" if country_raw is not None else None
-        ),
+        country_source=country_source,
         offer_availability_status=availability_status,
         offer_quantity=offer_quantity,
         availability_source="pharmonline_ddp_total_count",

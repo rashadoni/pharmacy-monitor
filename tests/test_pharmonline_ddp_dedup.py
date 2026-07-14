@@ -51,8 +51,61 @@ def test_ddp_product_maps_manufacturer_country_and_stock() -> None:
     assert product.offer_quantity == 7
 
 
-def test_ddp_product_maps_explicit_zero_stock() -> None:
+def test_ddp_product_prefers_country_dictionary_over_legacy_custom_field() -> None:
     raw = _fake_raw_product(2)
+    raw.update(
+        {
+            "manufacturerCountry": "germany-id",
+            "customFields": {
+                "input": [
+                    {
+                        "_id": "arPsvL8wgPiZhJ4jm3",
+                        "value": "Ukrayna",
+                        "i18n": {"az": {"value": "Ukrayna"}},
+                    }
+                ]
+            },
+        }
+    )
+
+    product = pharmonline_ddp._build_product(
+        raw, "az", {}, {"germany-id": "de"}
+    )
+
+    assert product is not None
+    assert product.manufacturer_country_raw == "de"
+    assert product.country_source == "pharmonline_ddp_all_country"
+
+
+def test_ddp_product_falls_back_to_legacy_country_custom_field() -> None:
+    raw = _fake_raw_product(3)
+    raw.update(
+        {
+            "manufacturerCountry": "none",
+            "customFields": {
+                "input": [
+                    {
+                        "_id": "arPsvL8wgPiZhJ4jm3",
+                        "value": "Latviya",
+                        "i18n": {
+                            "az": {"value": "Latviya"},
+                            "en": {"value": "Latvia"},
+                        },
+                    }
+                ]
+            },
+        }
+    )
+
+    product = pharmonline_ddp._build_product(raw, "en", {}, {})
+
+    assert product is not None
+    assert product.manufacturer_country_raw == "Latvia"
+    assert product.country_source == "pharmonline_ddp_custom_field"
+
+
+def test_ddp_product_maps_explicit_zero_stock() -> None:
+    raw = _fake_raw_product(4)
     raw.update({"manufacturerCountry": "england-id", "totalCount": 0})
 
     product = pharmonline_ddp._build_product(

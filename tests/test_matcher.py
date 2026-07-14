@@ -2107,7 +2107,7 @@ def test_revalidate_split(db_session):
 def test_revalidate_country_repartitions_into_all_viable_groups(db_session):
     """A legacy snowball cluster can contain two valid country-specific pairs."""
     s = db_session
-    match = storage.Match(canonical_name="Ornafer", confidence=1.0, is_manual=True)
+    match = storage.Match(canonical_name="Ornafer", confidence=1.0, is_manual=False)
     s.add(match)
     s.flush()
 
@@ -2151,7 +2151,7 @@ def test_revalidate_country_repartitions_into_all_viable_groups(db_session):
 def test_revalidate_detaches_oos_without_permanent_rejection(db_session):
     """An explicit OOS offer is not an active match and may rematch after restock."""
     s = db_session
-    match = storage.Match(canonical_name="Ornafer", confidence=1.0, is_manual=True)
+    match = storage.Match(canonical_name="Ornafer", confidence=1.0, is_manual=False)
     s.add(match)
     s.flush()
 
@@ -2190,6 +2190,43 @@ def test_revalidate_detaches_oos_without_permanent_rejection(db_session):
     assert s.scalar(select(func.count(storage.MatchRejection.id))) == 0
     audit = s.scalar(select(storage.MatchPolicyAudit))
     assert audit.action == "offer_repartition"
+
+
+def test_revalidate_never_mutates_manual_country_or_oos_cluster(db_session):
+    """Automatic revalidation must preserve an explicit operator decision."""
+    s = db_session
+    match = storage.Match(canonical_name="Manual Ornafer", confidence=1.0, is_manual=True)
+    s.add(match)
+    s.flush()
+
+    members = []
+    for site, ext, country, availability in (
+        ("pharmonline", "manual-de", "de", "in_stock"),
+        ("aloe", "manual-ua", "ua", "in_stock"),
+        ("aptekonline", "manual-oos", "de", "out_of_stock"),
+    ):
+        product = _make_product(
+            s,
+            site=site,
+            external_id=ext,
+            name="Manual Ornafer N30",
+            name_normalized="manual ornafer n30",
+        )
+        product.manufacturer_country_code = country
+        product.country_resolution_status = "resolved"
+        product.offer_availability_status = availability
+        product.canonical_id = match.id
+        members.append(product)
+    s.commit()
+
+    assert matcher.revalidate_split(s, match_ids={match.id}, dry_run=True) == []
+    assert matcher.revalidate_split(s, match_ids={match.id}) == []
+
+    s.expire_all()
+    assert s.get(storage.Match, match.id).is_manual is True
+    assert {s.get(storage.Product, p.id).canonical_id for p in members} == {match.id}
+    assert s.scalar(select(func.count(storage.MatchRejection.id))) == 0
+    assert s.scalar(select(func.count(storage.MatchPolicyAudit.id))) == 0
 
 
 def test_dimension_blocks_different_size(db_session):

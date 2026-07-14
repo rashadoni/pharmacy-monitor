@@ -1283,6 +1283,11 @@ def revalidate_split(
     ):
         if m.id in seen:
             continue
+        # Manual clusters encode an explicit user decision and are immutable
+        # under automatic revalidation. This also matches the CLI contract:
+        # `rematch --revalidate` must never dissolve or repartition them.
+        if m.is_manual:
+            continue
         seen.add(m.id)
         members = list(m.products)
         oos_members = [
