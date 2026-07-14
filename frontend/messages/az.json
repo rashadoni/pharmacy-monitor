@@ -351,6 +351,8 @@
     "tooltip_mark_read": "Oxunmuş kimi işarələ",
     "tooltip_mark_unread": "Oxunmamış kimi işarələ",
     "tooltip_snooze_7d": "7 gün gizlət",
+    "open_product": "Məhsulu aç",
+    "opens_new_tab": "yeni tabda açılacaq",
     "event_price_drop_title": "Qiymət {pct}% düşüb: {product}",
     "event_price_drop_detail": "{site}: {previous} → {current} ₼ (-{pct}%).",
     "event_undercut_title": "{site} {pct}% daha ucuzdur: {product}",

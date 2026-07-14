@@ -351,6 +351,8 @@
     "tooltip_mark_read": "Пометить прочитанным",
     "tooltip_mark_unread": "Пометить непрочитанным",
     "tooltip_snooze_7d": "Скрыть на 7 дней",
+    "open_product": "Открыть товар",
+    "opens_new_tab": "откроется в новой вкладке",
     "event_price_drop_title": "Цена упала на {pct}%: {product}",
     "event_price_drop_detail": "{site}: {previous} → {current} ₼ (-{pct}%).",
     "event_undercut_title": "{site} дешевле на {pct}%: {product}",

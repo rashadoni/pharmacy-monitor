@@ -2057,6 +2057,153 @@ def test_alert_page_site_sort_places_general_last(client, auth_cookie, setup_db)
     ]
 
 
+def test_alert_page_resolves_product_destination_tenant_safe(
+    client, auth_cookie, setup_db
+):
+    product = storage.Product(
+        tenant_id=1,
+        site="aloe",
+        external_id="pedikar-50-ml",
+        url="https://aloe.az/pedikar-50-ml/",
+        name="Pedikar 50 ml",
+        name_normalized="pedikar 50 ml",
+    )
+    foreign_product = storage.Product(
+        tenant_id=2,
+        site="aloe",
+        external_id="foreign-product",
+        url="https://example.com/private-tenant-product",
+        name="Private product",
+        name_normalized="private product",
+    )
+    setup_db.add_all([product, foreign_product])
+    setup_db.flush()
+    linked = storage.AlertEvent(
+        tenant_id=1,
+        rule_type="new_product",
+        dedup_key="pedikar-link",
+        severity="info",
+        title="New aloe product: Pedikar 50 ml",
+        payload={"site": "aloe", "product_id": product.id},
+        created_at=utcnow(),
+        is_read=False,
+    )
+    cross_tenant = storage.AlertEvent(
+        tenant_id=1,
+        rule_type="new_product",
+        dedup_key="cross-tenant-product-link",
+        severity="info",
+        title="Must not expose another tenant URL",
+        payload={"site": "aloe", "product_id": foreign_product.id},
+        created_at=utcnow() - timedelta(seconds=1),
+        is_read=False,
+    )
+    setup_db.add_all([linked, cross_tenant])
+    setup_db.commit()
+
+    items = client.get("/api/v1/dash/alerts/page?hours=0").json()["items"]
+    by_id = {item["id"]: item for item in items}
+
+    assert by_id[linked.id]["destination_url"] == "https://aloe.az/pedikar-50-ml/"
+    assert by_id[cross_tenant.id]["destination_url"] is None
+
+
+def test_safe_alert_destination_rejects_non_http_schemes():
+    assert api_module._safe_alert_destination("javascript:alert(1)") is None
+    assert api_module._safe_alert_destination("/relative/path") is None
+    assert api_module._safe_alert_destination("https://user:secret@aloe.az/p/") is None
+    assert api_module._safe_alert_destination("http://[") is None
+    assert api_module._safe_alert_destination("https://[::1") is None
+    assert (
+        api_module._safe_alert_destination("https://aloe.az/pedikar-50-ml/")
+        == "https://aloe.az/pedikar-50-ml/"
+    )
+
+
+def test_alert_page_resolves_match_destination_by_requested_site(
+    client, auth_cookie, setup_db
+):
+    match = storage.Match(
+        tenant_id=1, canonical_name="Matched product", confidence=1.0
+    )
+    foreign_match = storage.Match(
+        tenant_id=2, canonical_name="Foreign match", confidence=1.0
+    )
+    setup_db.add_all([match, foreign_match])
+    setup_db.flush()
+    products = [
+        storage.Product(
+            tenant_id=1,
+            site="pharmonline",
+            external_id="matched-pharmonline",
+            url="https://pharmonline.az/product/matched",
+            name="Matched product",
+            name_normalized="matched product",
+            canonical_id=match.id,
+        ),
+        storage.Product(
+            tenant_id=1,
+            site="aloe",
+            external_id="matched-aloe-dead",
+            url="https://aloe.az/dead-product/",
+            name="Matched product old",
+            name_normalized="matched product old",
+            canonical_id=match.id,
+            url_dead_at=utcnow(),
+        ),
+        storage.Product(
+            tenant_id=1,
+            site="aloe",
+            external_id="matched-aloe-live",
+            url="https://aloe.az/live-product/",
+            name="Matched product",
+            name_normalized="matched product",
+            canonical_id=match.id,
+        ),
+        storage.Product(
+            tenant_id=2,
+            site="aloe",
+            external_id="foreign-match-aloe",
+            url="https://example.com/foreign-tenant-match",
+            name="Foreign match",
+            name_normalized="foreign match",
+            canonical_id=foreign_match.id,
+        ),
+    ]
+    setup_db.add_all(products)
+    setup_db.flush()
+    requested_site = storage.AlertEvent(
+        tenant_id=1,
+        rule_type="undercut_threshold",
+        dedup_key="match-link-requested-site",
+        severity="warning",
+        title="Aloe undercut",
+        payload={"site": "aloe", "match_id": match.id},
+        created_at=utcnow(),
+        is_read=False,
+    )
+    cross_tenant = storage.AlertEvent(
+        tenant_id=1,
+        rule_type="undercut_threshold",
+        dedup_key="match-link-cross-tenant",
+        severity="warning",
+        title="Must not expose foreign match",
+        payload={"site": "aloe", "match_id": foreign_match.id},
+        created_at=utcnow() - timedelta(seconds=1),
+        is_read=False,
+    )
+    setup_db.add_all([requested_site, cross_tenant])
+    setup_db.commit()
+
+    items = client.get("/api/v1/dash/alerts/page?hours=0").json()["items"]
+    by_id = {item["id"]: item for item in items}
+
+    assert by_id[requested_site.id]["destination_url"] == (
+        "https://aloe.az/live-product/"
+    )
+    assert by_id[cross_tenant.id]["destination_url"] is None
+
+
 # ─── Legacy ERP endpoints — require X-API-Key ────────────────────────────────
 
 

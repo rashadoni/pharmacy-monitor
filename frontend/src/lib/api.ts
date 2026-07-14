@@ -400,6 +400,7 @@ export interface AlertEvent {
   title: string;
   detail: string | null;
   payload: Record<string, unknown> | null;
+  destination_url: string | null;
   site: AlertSite | null;
   created_at: string;
   is_read?: boolean;

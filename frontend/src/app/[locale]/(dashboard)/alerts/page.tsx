@@ -8,6 +8,7 @@ import {
   AlertTriangle,
   CheckCheck,
   Clock,
+  ExternalLink,
   Info,
   Inbox,
   Mail,
@@ -17,6 +18,7 @@ import { useLocale, useTranslations } from "next-intl";
 import { api, friendlyError, type AlertEvent, type AlertSort } from "@/lib/api";
 import { formatRelative, formatTime } from "@/lib/utils";
 import { localizedAlertCopy } from "@/lib/alert-copy";
+import { safeAlertDestination } from "@/lib/alert-link";
 import { CardListSkeleton } from "@/components/skeleton";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { QueryErrorState } from "@/components/query-error-state";
@@ -657,6 +659,7 @@ function AlertCard({
         ? t("severity_warning")
         : t("severity_info");
   const copy = localizedAlertCopy(event, t);
+  const destinationUrl = safeAlertDestination(event.destination_url);
   return (
     <div
       className={`rounded-lg border ${cfg.bg} p-3 ${dimmed ? "opacity-60" : ""}`}
@@ -677,11 +680,23 @@ function AlertCard({
         </span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2 flex-wrap">
-            <div
-              className={`font-medium text-sm ${event.is_read ? "line-through" : ""}`}
-            >
-              {copy.title}
-            </div>
+            {destinationUrl ? (
+              <a
+                href={destinationUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={`rounded-sm text-sm font-medium text-foreground underline decoration-border underline-offset-4 transition-colors hover:text-primary hover:decoration-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${event.is_read ? "line-through" : ""}`}
+              >
+                {copy.title}
+                <span className="sr-only"> ({t("opens_new_tab")})</span>
+              </a>
+            ) : (
+              <div
+                className={`text-sm font-medium ${event.is_read ? "line-through" : ""}`}
+              >
+                {copy.title}
+              </div>
+            )}
             <div className="flex items-center gap-2 text-xs text-muted-foreground tabular-nums">
               {event.snoozed_until &&
                 new Date(event.snoozed_until).getTime() > Date.now() && (
@@ -717,6 +732,18 @@ function AlertCard({
             </div>
           )}
           <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+            {destinationUrl && (
+              <a
+                href={destinationUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex min-h-11 items-center gap-1 rounded px-2 py-1 font-medium text-primary hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+              >
+                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                {t("open_product")}
+                <span className="sr-only"> ({t("opens_new_tab")})</span>
+              </a>
+            )}
             <button
               onClick={onMarkRead}
               className="inline-flex min-h-11 items-center gap-1 rounded px-2 py-1 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"

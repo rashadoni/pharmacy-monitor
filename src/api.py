@@ -58,6 +58,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
+from urllib.parse import urlsplit
 
 import structlog
 from fastapi import (
@@ -2433,7 +2434,7 @@ def dash_alerts(
             (storage.AlertEvent.snoozed_until.is_(None)) | (storage.AlertEvent.snoozed_until <= now)
         )
     events = db.scalars(stmt).all()
-    return [_alert_event_out(event) for event in events]
+    return _alert_events_out(events, db)
 
 
 _ALERT_GENERAL_SITE = "general"
@@ -2448,7 +2449,90 @@ def _alert_site_from_payload(payload: dict | None) -> str | None:
     return site if site in _VALID_SITES else None
 
 
-def _alert_event_out(event: storage.AlertEvent) -> dict:
+def _safe_alert_destination(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    try:
+        parsed = urlsplit(candidate)
+    except (ValueError, UnicodeError):
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return candidate
+
+
+def _alert_events_out(events: list[storage.AlertEvent], db: Session) -> list[dict]:
+    """Serialize alerts with one batched, tenant-safe external destination lookup."""
+    product_ids: set[int] = set()
+    match_ids: set[int] = set()
+    tenant_ids = {event.tenant_id for event in events}
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if isinstance(payload.get("product_id"), int):
+            product_ids.add(payload["product_id"])
+        if isinstance(payload.get("match_id"), int):
+            match_ids.add(payload["match_id"])
+
+    direct: dict[tuple[int, int], str] = {}
+    if product_ids:
+        products = db.scalars(
+            select(storage.Product)
+            .where(
+                storage.Product.id.in_(product_ids),
+                storage.Product.tenant_id.in_(tenant_ids),
+                storage.Product.url_dead_at.is_(None),
+            )
+            .order_by(storage.Product.id)
+        ).all()
+        for product in products:
+            url = _safe_alert_destination(product.url)
+            if url:
+                direct[(product.tenant_id, product.id)] = url
+
+    by_match_site: dict[tuple[int, int, str], str] = {}
+    if match_ids:
+        products = db.scalars(
+            select(storage.Product)
+            .where(
+                storage.Product.canonical_id.in_(match_ids),
+                storage.Product.tenant_id.in_(tenant_ids),
+                storage.Product.url_dead_at.is_(None),
+            )
+            .order_by(storage.Product.id)
+        ).all()
+        for product in products:
+            url = _safe_alert_destination(product.url)
+            if url and product.canonical_id is not None:
+                by_match_site.setdefault(
+                    (product.tenant_id, product.canonical_id, product.site), url
+                )
+
+    rows = []
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        destination = _safe_alert_destination(payload.get("url"))
+        product_id = payload.get("product_id")
+        match_id = payload.get("match_id")
+        if destination is None and isinstance(product_id, int):
+            destination = direct.get((event.tenant_id, product_id))
+        if destination is None and isinstance(match_id, int):
+            site = payload.get("site")
+            if site not in _VALID_SITES:
+                site = "pharmonline"
+            destination = by_match_site.get((event.tenant_id, match_id, site))
+        rows.append(_alert_event_out(event, destination_url=destination))
+    return rows
+
+
+def _alert_event_out(
+    event: storage.AlertEvent, *, destination_url: str | None = None
+) -> dict:
     return {
         "id": event.id,
         "rule_type": event.rule_type,
@@ -2456,6 +2540,7 @@ def _alert_event_out(event: storage.AlertEvent) -> dict:
         "title": event.title,
         "detail": event.detail,
         "payload": event.payload,
+        "destination_url": destination_url,
         "site": _alert_site_from_payload(event.payload),
         "created_at": event.created_at.isoformat(),
         "is_read": bool(event.is_read),
@@ -2573,7 +2658,7 @@ def dash_alerts_page(
     ).all()
 
     return {
-        "items": [_alert_event_out(event) for event in events],
+        "items": _alert_events_out(events, db),
         "total": int(total),
         "limit": limit,
         "offset": offset,

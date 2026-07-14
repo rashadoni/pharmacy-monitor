@@ -351,6 +351,8 @@
     "tooltip_mark_read": "Mark as read",
     "tooltip_mark_unread": "Mark as unread",
     "tooltip_snooze_7d": "Hide for 7 days",
+    "open_product": "Open product",
+    "opens_new_tab": "opens in a new tab",
     "event_price_drop_title": "Price fell by {pct}%: {product}",
     "event_price_drop_detail": "{site}: {previous} → {current} ₼ (-{pct}%).",
     "event_undercut_title": "{site} is {pct}% cheaper: {product}",
