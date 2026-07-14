@@ -13,6 +13,7 @@ from src.matcher import (
     _has_conflicting_dimensions,
     _has_conflicting_form,
     _has_conflicting_gender,
+    _has_conflicting_pack_count,
     _has_conflicting_series_number,
     _has_conflicting_strength_number,
     _has_conflicting_variant_atoms,
@@ -802,6 +803,187 @@ class TestPackCount:
 
     def test_ml_volume(self):
         assert _pack_count("50ml") == 50.0
+
+
+class TestExplicitPackCountConflict:
+    @staticmethod
+    def _product(pack_size, name=""):
+        return type("ProductStub", (), {"pack_size": pack_size, "name": name})()
+
+    def test_blocks_client_reported_pack_mismatches(self):
+        pairs = (
+            ("n12", "n60"),  # Paddlers Protection size 2
+            ("n10", "n36"),  # Always Ultra Light
+            ("n5", "n12"),  # Predo Hypoallergenic size 2
+            ("n28", "n16"),  # Molped Daily Care
+        )
+        for left, right in pairs:
+            assert _has_conflicting_pack_count(
+                self._product(left), self._product(right)
+            )
+
+    def test_allows_same_or_unknown_count(self):
+        assert not _has_conflicting_pack_count(
+            self._product("n60"), self._product("n60")
+        )
+        assert not _has_conflicting_pack_count(
+            self._product(None), self._product("n60")
+        )
+
+    def test_does_not_confuse_volume_with_unit_count(self):
+        assert not _has_conflicting_pack_count(
+            self._product("200ml"), self._product("300ml")
+        )
+
+    def test_falls_back_to_explicit_count_in_name(self):
+        assert _has_conflicting_pack_count(
+            self._product(None, 'Uşaq bezi "Paddlers - 2" 3-6kg № 12'),
+            self._product(None, 'Paddlers Protection 3-6 kq N60 (2)'),
+        )
+
+
+def test_persist_match_enforces_pack_count_for_every_producer(db_session):
+    """The central persistence boundary blocks barcode/tertiary/quaternary bypasses."""
+    s = db_session
+    n12 = _make_product(
+        s,
+        site="pharmonline",
+        external_id="central-n12",
+        name='Uşaq bezi "Paddlers - 2" 3-6kg № 12',
+        name_normalized="usaq bezi paddlers 2",
+        brand="paddlers",
+        pack_size=None,
+    )
+    n60 = _make_product(
+        s,
+        site="aptekonline",
+        external_id="central-n60",
+        name='Uşaq bezi "Paddlers" Protection 3-6 kq N60 (2)',
+        name_normalized="usaq bezi paddlers protection 2",
+        brand="paddlers",
+        pack_size=None,
+    )
+    s.flush()
+
+    assert matcher._persist_match(s, [n12, n60], confidence=1.0) == 0
+    assert n12.canonical_id is None
+    assert n60.canonical_id is None
+
+
+def test_persist_match_allows_same_explicit_pack_count(db_session):
+    """A valid N80/N80 pair remains matchable after the central invariant."""
+    s = db_session
+    left = _make_product(
+        s,
+        site="pharmonline",
+        external_id="central-n80-left",
+        name="Paddlers size 4 N80",
+        name_normalized="paddlers size 4",
+        brand="paddlers",
+        pack_size="n80",
+    )
+    right = _make_product(
+        s,
+        site="aptekonline",
+        external_id="central-n80-right",
+        name="Paddlers ölçü 4 №80",
+        name_normalized="paddlers olcu 4",
+        brand="paddlers",
+        pack_size="n80",
+    )
+    s.flush()
+
+    assert matcher._persist_match(s, [left, right], confidence=1.0) == 1
+    assert left.canonical_id is not None
+    assert left.canonical_id == right.canonical_id
+
+
+def test_barcode_pass_keeps_valid_pack_pair_when_conflict_has_lower_id(db_session):
+    """A reused barcode N60 must not poison the later N12/N12 pair."""
+    s = db_session
+    bad_first = _make_product(
+        s,
+        site="aptekonline",
+        external_id="barcode-n60-first",
+        name="Paddlers size 2 N60",
+        name_normalized="paddlers size 2",
+        brand="paddlers",
+        pack_size="n60",
+    )
+    bad_first.barcode = "1234567890123"
+    good_left = _make_product(
+        s,
+        site="pharmonline",
+        external_id="barcode-n12-left",
+        name="Paddlers size 2 N12",
+        name_normalized="paddlers size 2",
+        brand="paddlers",
+        pack_size="n12",
+    )
+    good_left.barcode = "1234567890123"
+    good_right = _make_product(
+        s,
+        site="aloe",
+        external_id="barcode-n12-right",
+        name="Paddlers ölçü 2 №12",
+        name_normalized="paddlers size 2",
+        brand="paddlers",
+        pack_size="n12",
+    )
+    good_right.barcode = "1234567890123"
+    s.commit()
+
+    matcher.match_products(s)
+    for product in (bad_first, good_left, good_right):
+        s.refresh(product)
+
+    assert bad_first.canonical_id is None
+    assert good_left.canonical_id is not None
+    assert good_left.canonical_id == good_right.canonical_id
+
+
+def test_tertiary_pass_keeps_valid_pair_when_conflict_has_lower_id(db_session):
+    """Wide fuzzy buckets skip only N60 and still persist the N12/N12 pair."""
+    s = db_session
+    bad_first = _make_product(
+        s,
+        site="aptekonline",
+        external_id="tertiary-n60-first",
+        name="Paddlers Baby 3-6 kq N60",
+        name_normalized="paddlers baby",
+        brand="paddlers",
+        dosage="3-6kg",
+        pack_size="n60",
+    )
+    good_left = _make_product(
+        s,
+        site="pharmonline",
+        external_id="tertiary-n12-left",
+        name="Paddlers Baby 3-6 kq N12",
+        name_normalized="paddlers baby",
+        brand="paddlers",
+        dosage="3-6kg",
+        pack_size=None,
+    )
+    good_right = _make_product(
+        s,
+        site="aloe",
+        external_id="tertiary-n12-right",
+        name="Paddlers Baby 3-6 kq №12",
+        name_normalized="paddlers baby",
+        brand="paddlers",
+        dosage="3-6kg",
+        pack_size="n12",
+    )
+    s.commit()
+
+    matcher.match_products(s)
+    for product in (bad_first, good_left, good_right):
+        s.refresh(product)
+
+    assert bad_first.canonical_id is None
+    assert good_left.canonical_id is not None
+    assert good_left.canonical_id == good_right.canonical_id
 
 
 # ── _has_perunit_mismatch ────────────────────────────────────────────────────
@@ -1767,6 +1949,110 @@ def test_find_conflicting_clusters(db_session):
     assert m_bad.id in ids
     assert m_ok.id not in ids
     assert m_manual.id not in ids  # ручной матч не перепроверяется
+
+
+def test_revalidate_dissolves_different_explicit_pack_counts(db_session):
+    """Same diaper size but N12/N60 are different physical packs."""
+    s = db_session
+    match = storage.Match(
+        canonical_name='Uşaq bezi "Paddlers" Protection 3-6 kq N60 (2)',
+        confidence=0.68,
+        is_manual=False,
+    )
+    s.add(match)
+    s.flush()
+    left = _make_product(
+        s,
+        site="pharmonline",
+        external_id="paddlers-n12",
+        name='Uşaq bezi "Paddlers - 2" 3-6kg № 12',
+        name_normalized="usaq bezi paddlers 2",
+        brand="paddlers",
+        pack_size="n12",
+    )
+    right = _make_product(
+        s,
+        site="aptekonline",
+        external_id="paddlers-n60",
+        name='Uşaq bezi "Paddlers" Protection 3-6 kq N60 (2)',
+        name_normalized="usaq bezi paddlers protection 2",
+        brand="paddlers",
+        pack_size="n60",
+    )
+    left.canonical_id = match.id
+    right.canonical_id = match.id
+    s.commit()
+
+    plan = matcher.revalidate_split(s, dry_run=True)
+
+    assert plan == [
+        {
+            "match_id": match.id,
+            "action": "dissolve",
+            "groups": [],
+            "unmatched": [left.id, right.id],
+            "keep": [],
+            "eject": [left.id, right.id],
+        }
+    ]
+
+    matcher.revalidate_split(s, match_ids={match.id})
+    audit = s.scalar(
+        select(storage.MatchPolicyAudit).where(
+            storage.MatchPolicyAudit.match_id == match.id
+        )
+    )
+    assert audit.action == "spec_dissolve"
+    assert audit.payload["conflict_kind"] == "spec"
+
+
+def test_revalidate_can_target_only_confirmed_match_ids(db_session):
+    """A production cleanup can dissolve an audited subset without touching others."""
+    s = db_session
+
+    def _bad_cluster(ext_prefix: str):
+        match = storage.Match(
+            canonical_name=f"Paddlers {ext_prefix}", confidence=0.68, is_manual=False
+        )
+        s.add(match)
+        s.flush()
+        left = _make_product(
+            s,
+            site="pharmonline",
+            external_id=f"{ext_prefix}-n12",
+            name='Uşaq bezi "Paddlers - 2" 3-6kg № 12',
+            name_normalized="usaq bezi paddlers 2",
+            brand="paddlers",
+            pack_size="n12",
+        )
+        right = _make_product(
+            s,
+            site="aptekonline",
+            external_id=f"{ext_prefix}-n60",
+            name='Uşaq bezi "Paddlers" Protection 3-6 kq N60 (2)',
+            name_normalized="usaq bezi paddlers protection 2",
+            brand="paddlers",
+            pack_size="n60",
+        )
+        left.canonical_id = right.canonical_id = match.id
+        return match, left, right
+
+    selected, selected_left, selected_right = _bad_cluster("selected")
+    untouched, untouched_left, untouched_right = _bad_cluster("untouched")
+    s.commit()
+
+    actions = matcher.revalidate_split(s, match_ids={selected.id})
+
+    assert [action["match_id"] for action in actions] == [selected.id]
+    s.refresh(selected_left)
+    s.refresh(selected_right)
+    s.refresh(untouched_left)
+    s.refresh(untouched_right)
+    assert selected_left.canonical_id is None
+    assert selected_right.canonical_id is None
+    assert untouched_left.canonical_id == untouched.id
+    assert untouched_right.canonical_id == untouched.id
+    assert matcher.find_conflicting_clusters(s, match_ids=set()) == []
 
 
 def test_revalidate_split(db_session):

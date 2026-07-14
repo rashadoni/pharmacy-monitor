@@ -32,6 +32,7 @@ from src.normalize import (
     extract_pack_size,
     extract_total_volume,
     normalize_name,
+    pack_unit_count,
     strip_accents,
 )
 from src.storage import (
@@ -996,6 +997,26 @@ def _has_conflicting_pack_volume(a, b) -> bool:
     return pa[0] != pb[0]
 
 
+def _has_conflicting_pack_count(a, b) -> bool:
+    """Different explicit unit counts are different physical packs.
+
+    Both sides must carry a high-confidence count marker (N/№/ədəd/etc.).
+    Unknown counts stay recall-friendly, while volume and dose numbers are
+    excluded by ``pack_unit_count``.
+    """
+    count_a, confidence_a = pack_unit_count(
+        getattr(a, "pack_size", None), getattr(a, "name", None)
+    )
+    count_b, confidence_b = pack_unit_count(
+        getattr(b, "pack_size", None), getattr(b, "name", None)
+    )
+    return (
+        confidence_a == "high"
+        and confidence_b == "high"
+        and count_a != count_b
+    )
+
+
 # Сила дозы препарата: число + mg/mq/mkg/mcg (НЕ ml/g — то объём/вес упаковки).
 _DOSE_MG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(mg|mq|mkg|mcg|µg)(?![a-z])", re.IGNORECASE)
 
@@ -1119,6 +1140,7 @@ def _hard_conflict(a, b) -> bool:
         or _has_conflicting_origin_or_grade(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
+        or _has_conflicting_pack_count(a, b)
         or _has_conflicting_pack_volume(a, b)
         or _has_conflicting_dose(a, b)
         or _has_conflicting_form(ar, br)
@@ -1151,6 +1173,7 @@ def _pairwise_spec_conflict(a, b) -> bool:
         or _has_conflicting_origin_or_grade(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
+        or _has_conflicting_pack_count(a, b)
         or _has_conflicting_pack_volume(a, b)
         or _has_conflicting_dose(a, b)
         or _has_conflicting_variant_marker(ar, br)
@@ -1162,7 +1185,10 @@ def _pairwise_spec_conflict(a, b) -> bool:
 
 
 def find_conflicting_clusters(
-    session: Session, *, tenant_id: int = 1
+    session: Session,
+    *,
+    tenant_id: int = 1,
+    match_ids: set[int] | None = None,
 ) -> list:
     """Авто-Match'и, где хоть одна cross-site пара членов конфликтует по ТЕКУЩИМ
     guard'ам. Возвращает [(match, product_a, product_b)] — первая конфликтная пара
@@ -1176,10 +1202,13 @@ def find_conflicting_clusters(
 
     from sqlalchemy.orm import selectinload
 
+    if match_ids is not None and not match_ids:
+        return []
+    statement = select(Match).where(Match.tenant_id == tenant_id)
+    if match_ids is not None:
+        statement = statement.where(Match.id.in_(match_ids))
     matches = session.scalars(
-        select(Match)
-        .where(Match.tenant_id == tenant_id)
-        .options(selectinload(Match.products))
+        statement.options(selectinload(Match.products))
     ).all()
     flagged = []
     for m in matches:
@@ -1222,7 +1251,11 @@ def _spec_coherent_groups(members: list, conflict_fn=None) -> list[list]:
 
 
 def revalidate_split(
-    session: Session, *, dry_run: bool = False, tenant_id: int = 1
+    session: Session,
+    *,
+    dry_run: bool = False,
+    tenant_id: int = 1,
+    match_ids: set[int] | None = None,
 ) -> list[dict]:
     """Разбить кластеры с cross-site spec-конфликтом на spec-когерентные группы.
 
@@ -1245,7 +1278,9 @@ def revalidate_split(
 
     actions: list[dict] = []
     seen: set[int] = set()
-    for m, _a, _b in find_conflicting_clusters(session, tenant_id=tenant_id):
+    for m, _a, _b in find_conflicting_clusters(
+        session, tenant_id=tenant_id, match_ids=match_ids
+    ):
         if m.id in seen:
             continue
         seen.add(m.id)
@@ -1256,6 +1291,17 @@ def revalidate_split(
             if getattr(product, "offer_availability_status", None) == "out_of_stock"
         ]
         active_members = [product for product in members if product not in oos_members]
+        has_country_conflict = any(
+            left.site != right.site and _has_conflicting_country(left, right)
+            for left, right in itertools.combinations(active_members, 2)
+        )
+        repartition_strategy = (
+            "offer_repartition"
+            if oos_members
+            else "country_repartition"
+            if has_country_conflict
+            else "spec_repartition"
+        )
         conflict_fn = _has_conflicting_country if m.is_manual else _pairwise_spec_conflict
         groups = sorted(
             _spec_coherent_groups(active_members, conflict_fn), key=len, reverse=True
@@ -1350,7 +1396,7 @@ def revalidate_split(
                         canonical_pack_size=group[0].pack_size,
                         confidence=m.confidence,
                         is_manual=m.is_manual,
-                        match_strategy="country_repartition",
+                        match_strategy=repartition_strategy,
                         needs_review=False,
                     )
                     session.add(target)
@@ -1360,7 +1406,7 @@ def revalidate_split(
                     target.canonical_brand = group[0].brand
                     target.canonical_dosage = group[0].dosage
                     target.canonical_pack_size = group[0].pack_size
-                    target.match_strategy = "country_repartition"
+                    target.match_strategy = repartition_strategy
                 created_match_ids.append(target.id)
                 for product in group:
                     product.canonical_id = target.id
@@ -1401,11 +1447,22 @@ def revalidate_split(
                     else "offer_dissolve"
                     if oos_members
                     else "country_repartition"
-                    if viable
+                    if viable and has_country_conflict
                     else "country_dissolve"
+                    if has_country_conflict
+                    else "spec_repartition"
+                    if viable
+                    else "spec_dissolve"
                 ),
                 payload={
                     "policy_version": 2,
+                    "conflict_kind": (
+                        "offer"
+                        if oos_members
+                        else "country"
+                        if has_country_conflict
+                        else "spec"
+                    ),
                     "before": before,
                     "after": {
                         "groups": action["groups"],
@@ -1805,32 +1862,42 @@ def match_products(
     for bc, group in by_barcode.items():
         if len(group) < 2:
             continue
-        # Берём по одному продукту с каждого уникального сайта (если на одном
-        # сайте несколько продуктов с тем же barcode — это нормально для variants
-        # одного товара, но мы матчим cross-site).
-        seen_sites: set[str] = set()
-        cluster: list[Product] = []
-        for p in sorted(group, key=lambda x: x.id):  # deterministic order
-            if p.site in seen_sites:
+        # A dirty/reused barcode must not let one conflicting pack poison a
+        # correct pair. Build deterministic pack-compatible cohorts first;
+        # this also makes the result independent from product-id order.
+        pack_groups = _spec_coherent_groups(
+            sorted(group, key=lambda product: product.id),
+            conflict_fn=_has_conflicting_pack_count,
+        )
+        for pack_group in pack_groups:
+            # Берём по одному продукту с каждого уникального сайта (если на одном
+            # сайте несколько продуктов с тем же barcode — это нормально для variants
+            # одного товара, но мы матчим cross-site).
+            seen_sites: set[str] = set()
+            cluster: list[Product] = []
+            for p in pack_group:
+                if p.site in seen_sites:
+                    continue
+                if any(is_rejected(session, c.id, p.id) for c in cluster):
+                    continue
+                cluster.append(p)
+                seen_sites.add(p.site)
+            if len(cluster) < 2:
                 continue
-            if any(is_rejected(session, c.id, p.id) for c in cluster):
+            # Per-unit price sanity check ещё держим — даже одинаковый barcode на
+            # разных сайтах может быть продан per-pack vs per-piece.
+            if _has_perunit_mismatch(cluster, latest_prices):
+                log.warning(
+                    "matcher_barcode_perunit_mismatch",
+                    barcode=bc,
+                    products=[p.id for p in cluster],
+                )
                 continue
-            cluster.append(p)
-            seen_sites.add(p.site)
-        if len(cluster) < 2:
-            continue
-        # Per-unit price sanity check ещё держим — даже одинаковый barcode на
-        # разных сайтах может быть продан per-pack vs per-piece.
-        if _has_perunit_mismatch(cluster, latest_prices):
-            log.warning(
-                "matcher_barcode_perunit_mismatch",
-                barcode=bc,
-                products=[p.id for p in cluster],
-            )
-            continue
-        created_or_updated += _persist_match(session, cluster, confidence=1.0)
-        visited.update(c.id for c in cluster)
-        barcode_matches_created += 1
+            persisted = _persist_match(session, cluster, confidence=1.0)
+            if persisted:
+                created_or_updated += persisted
+                visited.update(c.id for c in cluster)
+                barcode_matches_created += persisted
 
     log.info(
         "matcher_barcode_pass",
@@ -1884,6 +1951,8 @@ def match_products(
                 # Форма выпуска: drops vs spray, cream vs ointment → разные
                 # (проверяем только против якоря — форма берётся из raw name)
                 if _has_conflicting_form(p.name or "", q.name or ""):
+                    continue
+                if any(_has_conflicting_pack_count(c, q) for c in cluster):
                     continue
                 # Sibling-form: у q нет формы, но на сайте q в этом bucket'е
                 # уже есть продукт с явной формой p → q НЕ является этой формой.
@@ -1954,8 +2023,10 @@ def match_products(
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = _min_score / 100.0
-                created_or_updated += _persist_match(session, cluster, confidence)
-                visited.update(c.id for c in cluster)
+                persisted = _persist_match(session, cluster, confidence)
+                if persisted:
+                    created_or_updated += persisted
+                    visited.update(c.id for c in cluster)
 
     # ── Secondary pass: (brand, pack) без досировки ─────────────────────────
     # Охватывает пары, где один сайт спарсил dosage, другой — нет.
@@ -2067,6 +2138,8 @@ def match_products(
                     _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
+                if any(_has_conflicting_pack_count(c, q) for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _SEC_THRESHOLD:
                     cluster.append(q)
@@ -2076,8 +2149,10 @@ def match_products(
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = min(_min_score_sec / 100.0, _SEC_CONF_CAP)
-                created_or_updated += _persist_match(session, cluster, confidence)
-                visited.update(c.id for c in cluster)
+                persisted = _persist_match(session, cluster, confidence)
+                if persisted:
+                    created_or_updated += persisted
+                    visited.update(c.id for c in cluster)
 
     # ── Tertiary pass: (brand, dosage) без pack ─────────────────────────────
     # Охватывает пары, где один сайт не вытащил pack_size (или разный).
@@ -2192,6 +2267,8 @@ def match_products(
                     _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
+                if any(_has_conflicting_pack_count(c, q) for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _TERT_THRESHOLD:
                     cluster.append(q)
@@ -2201,8 +2278,10 @@ def match_products(
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = min(_min_score_tert / 100.0, _TERT_CONF_CAP)
-                created_or_updated += _persist_match(session, cluster, confidence)
-                visited.update(c.id for c in cluster)
+                persisted = _persist_match(session, cluster, confidence)
+                if persisted:
+                    created_or_updated += persisted
+                    visited.update(c.id for c in cluster)
 
     # ── Quaternary pass: авто-обнаружение бренда по частоте слов ──────────────
     # Для no-brand продуктов определяет "бренд" из name_normalized автоматически:
@@ -2319,6 +2398,8 @@ def match_products(
                     _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
+                if any(_has_conflicting_pack_count(c, q) for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _QUART_THRESHOLD:
                     cluster.append(q)
@@ -2328,8 +2409,10 @@ def match_products(
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = min(_min_score_q / 100.0, _QUART_CONF_CAP)
-                created_or_updated += _persist_match(session, cluster, confidence)
-                visited.update(c.id for c in cluster)
+                persisted = _persist_match(session, cluster, confidence)
+                if persisted:
+                    created_or_updated += persisted
+                    visited.update(c.id for c in cluster)
 
     session.commit()
     log.info("matcher_done", clusters=created_or_updated)
@@ -2399,6 +2482,15 @@ def _persist_match(session: Session, cluster: Sequence[Product], confidence: flo
         if country_policy_enforced() and country_code_of(left) is None:
             return 0
         for right in cohort[idx + 1 :]:
+            if left.site != right.site and _has_conflicting_pack_count(left, right):
+                log.info(
+                    "persist_match_pack_count_conflict",
+                    left_id=left.id,
+                    right_id=right.id,
+                    left_pack_size=left.pack_size,
+                    right_pack_size=right.pack_size,
+                )
+                return 0
             if left.site != right.site and _has_conflicting_country(left, right):
                 log.info(
                     "persist_match_country_conflict",
