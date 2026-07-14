@@ -5587,6 +5587,13 @@ def products_list(
 @app.get("/api/v1/comparisons", dependencies=[Depends(require_api_key)])
 def comparisons(db: Session = Depends(get_db)):
     _require_financial_policy_ready(db)
+    # Keep the API-key endpoint aligned with the dashboard during a shadow
+    # rollout: before the first trusted full-catalog Run exists, serve the
+    # latest snapshots while identity/availability guards still filter unsafe
+    # offers. Enforce mode remains fail-closed above.
+    trusted_lineage_available = bool(
+        storage.financially_eligible_run_ids(db, tenant_id=1)
+    )
     last_run = db.scalar(
         select(storage.Run.id)
         .where(storage.Run.status == "ok")
@@ -5601,7 +5608,7 @@ def comparisons(db: Session = Depends(get_db)):
     snaps_by_pid = storage.latest_snapshots_per_product(
         db,
         all_pids,
-        financially_eligible_only=True,
+        financially_eligible_only=trusted_lineage_available,
         tenant_id=1,
     )
     out = []

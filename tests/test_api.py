@@ -2092,6 +2092,78 @@ def test_legacy_comparisons_with_key_empty(client):
     assert r.json() == []  # empty DB
 
 
+def test_legacy_comparisons_shadow_bootstraps_without_trusted_lineage(
+    client, setup_db, monkeypatch
+):
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "shadow")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "shadow")
+    run = storage.Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="ok",
+        catalog_scope="partial",
+        catalog_verified=False,
+        run_quality={
+            "baseline_enforced": False,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {},
+        },
+    )
+    setup_db.add(run)
+    setup_db.flush()
+    match = storage.Match(tenant_id=1, canonical_name="Legacy shadow", confidence=1.0)
+    setup_db.add(match)
+    setup_db.flush()
+    for site, price in (("pharmonline", 10.0), ("aloe", 8.0)):
+        product = storage.Product(
+            tenant_id=1,
+            site=site,
+            external_id=f"legacy-shadow-{site}",
+            url=f"https://example.com/{site}/legacy-shadow",
+            name="Legacy shadow",
+            name_normalized="legacy shadow",
+            canonical_id=match.id,
+            manufacturer_country_code="rs",
+            country_resolution_status="resolved",
+            offer_availability_status="in_stock",
+            availability_observed_at=utcnow(),
+            last_seen_at=utcnow(),
+        )
+        setup_db.add(product)
+        setup_db.flush()
+        setup_db.add(
+            storage.PriceSnapshot(run_id=run.id, product_id=product.id, price=price)
+        )
+    setup_db.commit()
+
+    response = client.get(
+        "/api/v1/comparisons",
+        headers={"X-API-Key": "test-key-1234"},
+    )
+
+    assert response.status_code == 200, response.text
+    row = next(item for item in response.json() if item["name"] == "Legacy shadow")
+    assert row["prices"]["pharmonline"]["price"] == 10.0
+    assert row["prices"]["aloe"]["price"] == 8.0
+
+
+def test_legacy_comparisons_enforce_without_trusted_lineage_503(
+    client, monkeypatch
+):
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "enforce")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "enforce")
+
+    response = client.get(
+        "/api/v1/comparisons",
+        headers={"X-API-Key": "test-key-1234"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "full_catalog_trust_not_ready"
+
+
 def test_legacy_comparisons_ignore_newer_untrusted_snapshot(client, setup_db):
     run = storage.Run(tenant_id=1, started_at=utcnow() - timedelta(hours=2), status="ok")
     setup_db.add(run)
