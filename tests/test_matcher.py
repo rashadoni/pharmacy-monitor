@@ -5,9 +5,11 @@ from src.matcher import (
     _concentrations,
     _country_from_url,
     _country_of,
+    _country_token,
     _dimensions,
     _has_conflicting_concentration,
     _has_conflicting_country,
+    _has_conflicting_identity_country,
     _has_conflicting_dimensions,
     _has_conflicting_form,
     _has_conflicting_gender,
@@ -18,6 +20,7 @@ from src.matcher import (
     _has_conflicting_variant_tokens,
     _has_extreme_length_disparity,
     _has_perunit_mismatch,
+    _is_country_identity_name,
     _is_significant_variant_token,
     _pack_count,
     _strength_numbers,
@@ -1453,6 +1456,13 @@ class TestCountryGuard:
         )
         assert _country_from_url("https://pharmonline.az/product/syrup-100-ml") is None
 
+    def test_country_token_ignores_scraper_noise(self):
+        # aloe may store "0"/None/ATC in manufacturer; these are not origin countries.
+        assert _country_token("0") is None
+        assert _country_token("None") is None
+        assert _country_token("B05BA03") is None
+        assert _country_token("W06FA01") is None
+
     def test_conflict_different_country(self):
         class A:
             manufacturer = "TÜRKİYƏ"
@@ -1515,6 +1525,48 @@ def test_country_blocks_cross_country_match(db_session):
     s.refresh(a)
     s.refresh(b)
     assert a.canonical_id != b.canonical_id or (a.canonical_id is None and b.canonical_id is None)
+
+
+def test_country_identity_name_covers_generic_medical_commodities():
+    assert _is_country_identity_name("Qliserin 50 ml") is True
+    assert _is_country_identity_name("Natrium xlorid 0.9% 400 ml") is True
+    assert _is_country_identity_name("Uşaq bezi Huggies №44") is True
+    assert _is_country_identity_name("X-Brain 150 ml") is False
+
+
+def test_trade_name_country_does_not_block_match(db_session):
+    """Trade-name medicine can be parallel/import-origin-different; country alone is diagnostic."""
+    s = db_session
+    a = _make_product(
+        s,
+        site="aloe",
+        external_id="xbrain-tr",
+        name="X-Brain 150 ml",
+        name_normalized="x brain",
+        brand="X-Brain",
+        pack_size="150ml",
+    )
+    a.manufacturer = "TÜRKİYƏ"
+    b = _make_product(
+        s,
+        site="aptekonline",
+        external_id="xbrain-az",
+        name="X-Brain 150 ml",
+        name_normalized="x brain",
+        brand="X-Brain",
+        pack_size="150ml",
+    )
+    b.manufacturer = "Azərbaycan"
+
+    assert _has_conflicting_country(a, b) is True
+    assert _has_conflicting_identity_country(a, b) is False
+
+    s.commit()
+    matcher.match_products(s)
+    s.refresh(a)
+    s.refresh(b)
+    assert a.canonical_id is not None
+    assert a.canonical_id == b.canonical_id
 
 
 # ── Габариты AxB + концентрация % (2026-05-29) ────────────────────────────────
