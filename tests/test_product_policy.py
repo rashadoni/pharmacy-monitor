@@ -9,6 +9,7 @@ from src.product_policy import (
     OFFER_OUT_OF_STOCK,
     country_resolution,
     financially_eligible,
+    identity_eligibility,
     normalize_country_code,
     offer_from_quantity,
 )
@@ -133,3 +134,15 @@ def test_financial_eligibility_requires_same_country_and_fresh_stock() -> None:
     b.manufacturer_country_code = "rs"
     b.availability_observed_at = now - timedelta(days=20)
     assert financially_eligible([a, b], now=now).reason == "availability_stale"
+
+
+def test_unknown_country_does_not_mask_two_resolved_country_conflicts() -> None:
+    ua = _product("aloe")
+    rs = _product("aptekonline")
+    unknown = _product("pharmonline")
+    ua.manufacturer_country_code = "ua"
+    ua.country_resolution_status = COUNTRY_RESOLVED
+    rs.manufacturer_country_code = "rs"
+    rs.country_resolution_status = COUNTRY_RESOLVED
+
+    assert identity_eligibility([ua, rs, unknown]).reason == "country_conflict"

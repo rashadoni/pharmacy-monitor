@@ -618,10 +618,14 @@ def current_offer_eligibility(product: Any, *, now: datetime | None = None) -> E
 
 def identity_eligibility(products: list[Any]) -> Eligibility:
     codes = {country_code_of(p) for p in products}
+    # A third unknown offer must never mask a proven conflict between two
+    # resolved countries.  Check the known identity set first, then report
+    # incomplete coverage only when the resolved values do not conflict.
+    known_codes = codes - {None}
+    if len(known_codes) > 1:
+        return Eligibility(False, "country_conflict")
     if None in codes:
         return Eligibility(False, "country_unknown")
-    if len(codes) > 1:
-        return Eligibility(False, "country_conflict")
     return Eligibility(True)
 
 
