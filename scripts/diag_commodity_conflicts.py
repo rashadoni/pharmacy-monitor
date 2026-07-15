@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
-"""READ-ONLY: classify cross-site AUTO commodity clusters by available conflict
-signal (brand / country / asymmetric-grade) — to decide what can be auto-cleaned
-safely vs needs human/LLM review. Prints counts + samples. No mutation."""
+"""Classify cross-site AUTO commodity clusters by available conflict signal
+(brand / country / asymmetric-grade) — to decide what can be auto-cleaned safely
+vs needs human/LLM review. Prints counts + samples.
+
+Read-only BY DEFAULT. `--apply` MUTATES: it writes MatchRejection rows, nulls
+`canonical_id` and DELETES the Match.
+
+⚠️ `--apply` IS NOT REVERSIBLE BY TOOLING. `rollback_match_policy.py` finds work
+only through `MatchPolicyAudit` rows, which are emitted solely by
+`matcher.revalidate_split` (src/matcher.py:1446) — this script emits none, and
+`--apply` destroys the before-image (the Match row) that a rollback would need.
+`reason_type` alone does not make a rejection revertible. Take a DB snapshot
+first, or prefer `revalidate_split`, which does the same job with a coherent
+split instead of dissolve-all, and is audited and rollback-able.
+(The old docstring claimed "READ-ONLY … No mutation" while `--apply` deleted
+clusters; it was wrong from the commit that added `--apply`.)"""
 
 from __future__ import annotations
 
@@ -15,12 +28,17 @@ from sqlalchemy import select  # noqa: E402
 
 from src import matcher, storage  # noqa: E402
 from src.brand_resolver import consumer_brand, is_commodity_name  # noqa: E402
+from src.normalize import strip_accents  # noqa: E402
 
 _GRADE = {"kosmetik", "kosmetika", "kosmeticeskoe", "naruzhnoe", "cosmetic"}
 
 
 def _grade_tokens(name: str) -> frozenset[str]:
-    t = (name or "").lower()
+    # strip_accents to stay identical to matcher._grade_tokens. Without it the
+    # Azerbaijani dotted `İ` lowercases to `i` + combining dot, so `KOSMETİK YAĞ`
+    # reads as no-grade here while the matcher sees a grade — this audit would
+    # under-report against the very guard it audits.
+    t = strip_accents((name or "").lower())
     return frozenset(g for g in _GRADE if g in t)
 
 
@@ -107,7 +125,12 @@ def main() -> int:
                 continue
             comm += 1
             pairs = [(a, b) for i, a in enumerate(ms) for b in ms[i + 1 :] if a.site != b.site]
-            if target_fn(m):
+            # The samples below are labelled "NOT targeted", so a cluster that IS a
+            # target must never appear in them. Under --strict every country-conflict
+            # cluster is a target, and the sample printed all 46 of them under a
+            # "NOT targeted" heading while --apply dissolved them.
+            is_target = target_fn(m)
+            if is_target:
                 targets.append(m)
             if any(matcher._has_conflicting_brand(a, b) for a, b in pairs):
                 brand_conf += 1
@@ -119,16 +142,16 @@ def main() -> int:
             # readout would contradict the destructive action it precedes.
             if any(matcher._has_conflicting_legacy_country(a, b) for a, b in pairs):
                 country_conf += 1
-                if len(s_country) < args.sample:
+                if not is_target and len(s_country) < args.sample:
                     s_country.append(m)
                 continue
             if any(_grade_tokens(a.name) != _grade_tokens(b.name) for a, b in pairs):
                 grade_asym += 1
-                if len(s_grade) < args.sample:
+                if not is_target and len(s_grade) < args.sample:
                     s_grade.append(m)
                 continue
             neither += 1
-            if len(s_neither) < args.sample:
+            if not is_target and len(s_neither) < args.sample:
                 s_neither.append(m)
 
         def show(title, lst):
@@ -161,16 +184,21 @@ def main() -> int:
                 for i, a in enumerate(ms):
                     for b in ms[i + 1 :]:
                         if a.site != b.site:
-                            # reason_type must NOT default to "manual": that stamps a
-                            # machine decision as a human one and puts it outside
-                            # rollback_match_policy.py, which only reverts
-                            # system_country/system_spec.
+                            # Label by the evidence that actually fired, mirroring
+                            # matcher.revalidate_split. `_strict_not_identical` also
+                            # targets grade-only clusters, so hardcoding "country"
+                            # would stamp a grade split as a country one.
+                            country_conflict = matcher._has_conflicting_legacy_country(a, b)
                             add_rejection(
                                 s,
                                 a.id,
                                 b.id,
-                                reason="cosmetic vs food cross-origin",
-                                reason_type="system_country",
+                                reason=(
+                                    "cross-origin" if country_conflict else "grade mismatch"
+                                ),
+                                reason_type=(
+                                    "system_country" if country_conflict else "system_spec"
+                                ),
                             )
                 for p in ms:
                     p.canonical_id = None
