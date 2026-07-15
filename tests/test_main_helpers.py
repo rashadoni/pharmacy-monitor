@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import pytest
+
 from src import main as main_mod
 from src import storage, watchlist
 from src.scrapers.base import ScrapedProduct, ScrapeResult
@@ -90,6 +92,110 @@ def test_ai_fallback_invalid_min_baseline_falls_back_to_default(monkeypatch):
     assert main_mod._should_trigger_ai_fallback(0, baseline=50) is False
     # baseline=150 >= 100 + yield=10 < 75 → trigger
     assert main_mod._should_trigger_ai_fallback(10, baseline=150) is True
+
+
+def test_empty_scrape_with_errors_is_fatal():
+    result = ScrapeResult(
+        site="aloe",
+        products=[],
+        errors=[
+            "category=dermanlar: HTTPStatusError: 502 Bad Gateway",
+            "promos: RuntimeError: HTTP 500",
+        ],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"aloe scrape produced 0 products after 2 error\(s\)",
+    ):
+        main_mod._raise_for_empty_scrape_result(result)
+
+
+def test_partial_scrape_with_errors_remains_usable():
+    result = ScrapeResult(
+        site="aloe",
+        products=[object()],
+        errors=["category=bad: HTTPStatusError: 502 Bad Gateway"],
+    )
+
+    main_mod._raise_for_empty_scrape_result(result)
+
+
+def test_empty_scrape_without_errors_is_fatal():
+    with pytest.raises(
+        RuntimeError,
+        match="aloe scrape produced 0 products without explicit errors",
+    ):
+        main_mod._raise_for_empty_scrape_result(ScrapeResult(site="aloe"))
+
+
+@pytest.mark.asyncio
+async def test_scrape_site_applies_empty_error_guard(monkeypatch):
+    class FailedScraper:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def scrape(self, slugs, limit_per_category=None, on_category=None):
+            return ScrapeResult(
+                site="aloe",
+                errors=["category=dermanlar: HTTPStatusError: 502 Bad Gateway"],
+            )
+
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "aloe", FailedScraper)
+    monkeypatch.delenv(main_mod.AI_FALLBACK_ENABLED_ENV, raising=False)
+
+    with pytest.raises(RuntimeError, match="aloe scrape produced 0 products"):
+        await main_mod.scrape_site("aloe", ["dermanlar"], None)
+
+
+@pytest.mark.asyncio
+async def test_scrape_site_ai_fallback_can_rescue_empty_primary(monkeypatch):
+    primary_error = "category=dermanlar: RuntimeError: empty RSC payload"
+    fallback_product = ScrapedProduct(
+        site="aloe",
+        external_id="fallback-1",
+        url="https://aloe.az/fallback-1/",
+        name="Fallback product",
+    )
+
+    class EmptyPrimaryScraper:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def scrape(self, slugs, limit_per_category=None, on_category=None):
+            return ScrapeResult(site="aloe", errors=[primary_error])
+
+    class SuccessfulFallbackScraper:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def crawl(self, max_urls=500):
+            return ScrapeResult(site="aloe", products=[fallback_product])
+
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "aloe", EmptyPrimaryScraper)
+    monkeypatch.setitem(main_mod.AI_CRAWLER_BY_SITE, "aloe", SuccessfulFallbackScraper)
+    monkeypatch.setenv(main_mod.AI_FALLBACK_ENABLED_ENV, "1")
+    monkeypatch.setenv(main_mod.AI_FALLBACK_MIN_BASELINE_ENV, "100")
+    monkeypatch.setenv(main_mod.AI_FALLBACK_RATIO_ENV, "0.5")
+
+    result = await main_mod.scrape_site(
+        "aloe",
+        ["dermanlar"],
+        None,
+        ai_fallback_baseline=1000,
+    )
+
+    assert result.products == [fallback_product]
+    assert result.errors == [primary_error]
 
 
 def test_reap_stale_running_runs_marks_old_orphans_failed(db_session):

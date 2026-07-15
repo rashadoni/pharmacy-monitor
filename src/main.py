@@ -356,7 +356,33 @@ async def scrape_site(
                     error=f"{type(e).__name__}: {e}",
                 )
                 result.errors.append(f"ai_fallback: {type(e).__name__}: {e}")
+    _raise_for_empty_scrape_result(result)
     return result
+
+
+def _raise_for_empty_scrape_result(result: ScrapeResult) -> None:
+    """Fail a category-mode site run that produced no usable product data.
+
+    Individual category failures remain fail-soft when at least one product was
+    collected, and a successful AI fallback can rescue an empty primary result.
+    Zero products are always fatal after fallback resolution: Aloe run #427 had
+    explicit 5xx errors, while run #432 exposed a second failure mode where the
+    site returned HTTP 200 with an empty RSC error shell and no explicit scraper
+    errors. Neither case may publish a misleading ``ok`` run.
+    """
+    errors = [error for error in result.errors if error]
+    if result.products:
+        return
+
+    if errors:
+        preview = "; ".join(error[:240] for error in errors[:3])
+        if len(errors) > 3:
+            preview += f"; ... (+{len(errors) - 3} more)"
+        raise RuntimeError(
+            f"{result.site} scrape produced 0 products after {len(errors)} error(s): {preview}"
+        )
+
+    raise RuntimeError(f"{result.site} scrape produced 0 products without explicit errors")
 
 
 async def scrape_all(

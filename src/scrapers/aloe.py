@@ -273,6 +273,13 @@ class AloeScraper(BaseScraper):
 
         first_html = await self._fetch_listing_html(base_url)
         current_page, last_page = aloe_listing_page_info(first_html)
+        first_page_products = aloe_products_from_listing_html(
+            first_html, category_slug=category_slug, base_url=self.base_url
+        )
+        if current_page is None and last_page is None and not first_page_products:
+            raise RuntimeError(
+                "Aloe RSC listing payload contains neither pagination nor products"
+            )
         if not last_page:
             last_page = 1
         max_pages = int(os.getenv("ALOE_RSC_MAX_PAGES", "1000"))
@@ -281,12 +288,13 @@ class AloeScraper(BaseScraper):
         yielded = 0
         seen_external_ids: set[str] = set()
         for page_num in range(1, last_page + 1):
-            html_text = first_html if page_num == 1 else await self._fetch_listing_html(
-                f"{base_url}&page={page_num}"
-            )
-            products = aloe_products_from_listing_html(
-                html_text, category_slug=category_slug, base_url=self.base_url
-            )
+            if page_num == 1:
+                products = first_page_products
+            else:
+                html_text = await self._fetch_listing_html(f"{base_url}&page={page_num}")
+                products = aloe_products_from_listing_html(
+                    html_text, category_slug=category_slug, base_url=self.base_url
+                )
             log.info(
                 "aloe_rsc_page_parsed",
                 category=category_slug,

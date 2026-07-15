@@ -516,9 +516,10 @@ class PharmonlineDDPScraper(BaseScraper):
     """Pharmonline scraper via Meteor DDP protocol (no browser needed).
 
     Bypasses Cloudflare anti-bot because DDP WebSocket has different fingerprint
-    surface than Playwright Chromium. Works through IPRoyal residential proxy.
-
-    Falls back to Playwright PharmonlineScraper if `IPROYAL_*` env not set.
+    surface than Playwright Chromium. Uses Decodo AZ residential with sticky-port
+    rotation; legacy IPRoyal is considered only when Decodo is not configured.
+    Without either proxy it attempts a direct DDP connection (no Playwright
+    fallback exists in this class).
     """
 
     site_name = "pharmonline"
@@ -531,8 +532,9 @@ class PharmonlineDDPScraper(BaseScraper):
         self._locale = os.getenv("PHARMONLINE_DDP_LOCALE", "az").lower()
         self._page_size = int(os.getenv("PHARMONLINE_DDP_PAGE_SIZE", "100"))
         # Decodo (AZ residential, ротация порта на reconnect) первым; IPRoyal —
-        # fallback (его баланс кончился 2026-06-12 → HTTP 402). decodo_factory это
-        # callable (циклит порты); IPRoyal — статичный URL. _DDPClient принимает оба.
+        # legacy fallback, отключённый на prod после повторных HTTP 402 2026-07-06..10.
+        # decodo_factory — callable (циклит порты); IPRoyal — статичный URL.
+        # _DDPClient принимает оба варианта.
         decodo_factory = _decodo_proxy_factory()
         proxy_url = decodo_factory or _iproyal_httpx_proxy()
         if proxy_url:

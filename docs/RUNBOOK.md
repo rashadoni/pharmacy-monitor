@@ -2,7 +2,42 @@
 
 Operational manual для VPS-инсталляции. Используется когда что-то ломается.
 
-## 🚀 Начальная настройка
+> **CURRENT OVERRIDE (2026-07-10):** активный runtime — PostgreSQL + FastAPI +
+> Next.js на `46.225.149.52`, пользователь `pm`, URL `https://leaddrive.cloud`.
+> Раздел legacy ниже сохранён только как история и **не является инструкцией к
+> выполнению**. Актуальные процедуры начинаются с «Active runtime» и «Бэкапы».
+
+## Active runtime
+
+```bash
+ssh -i ~/.ssh/id_ed25519 root@46.225.149.52
+
+# Основные сервисы и расписание
+systemctl status caddy pharmacy-monitor-api pharmacy-monitor-frontend \
+  postgresql redis-server --no-pager
+systemctl list-timers --all 'pharmacy-monitor-*'
+
+# API и health
+curl -fsS http://127.0.0.1:8080/health
+journalctl -u pharmacy-monitor-api -n 100 --no-pager
+journalctl -u 'pharmacy-monitor-scrape@*' -n 100 --no-pager
+
+# Запустить сайт вручную только через systemd под pm
+systemctl start pharmacy-monitor-scrape@aloe.service
+systemctl status pharmacy-monitor-scrape@aloe.service --no-pager -l
+```
+
+Production не является git checkout. Не использовать на сервере `git pull`,
+`git reset` или legacy `pharmacy-monitor-dashboard/run/telegram` units. Код
+разворачивается контролируемым rsync/release-процессом; DB-схема — Alembic.
+
+## 🗄️ Архив legacy SQLite/Streamlit runtime — НЕ ВЫПОЛНЯТЬ
+
+Секция до следующего заголовка `## 💾 Бэкапы` описывает старую инсталляцию с
+пользователем `pharmacy`, SQLite, Streamlit/nginx и удалёнными systemd units.
+Она оставлена только для разбора истории проекта.
+
+### 🚀 Начальная настройка (архив)
 
 ### Запуск с нуля на чистой Ubuntu 22.04+
 
@@ -53,7 +88,7 @@ DATABASE_URL=sqlite:///data/db.sqlite
 
 ---
 
-## 🔍 Диагностика
+### 🔍 Диагностика (архив)
 
 ### Проверить состояние всех сервисов
 
@@ -93,7 +128,7 @@ ls -lah /opt/pharmacy-monitor/logs/
 
 ---
 
-## 🔧 Типовые проблемы и решения
+### 🔧 Типовые проблемы и решения (архив)
 
 ### `health-check` показывает `stale_run`
 
@@ -228,44 +263,84 @@ sudo -u pharmacy uv run --directory /opt/pharmacy-monitor pharmacy-monitor \
 
 ### Текущая стратегия
 
-- **Когда:** ежедневно в 02:00 UTC (`pharmacy-monitor-backup.timer`)
-- **Где:** `/opt/pharmacy-monitor/data/backups/db-YYYY-MM-DD.sqlite.gz`
-- **Срок хранения:** 90 дней
-- **Размер:** ~200KB на ~1MB БД (gzip −80%)
+- **Источник:** production PostgreSQL `pharmacy_monitor`.
+- **Когда:** ежедневно в 04:00 UTC (`pharmacy-monitor-backup.timer`).
+- **Где:** `/var/backups/pharmacy-monitor/pharmacy-monitor-*.sql.gz.gpg`.
+- **Срок хранения на VPS:** 14 дней.
+- **Шифрование:** AES-256, если задан `BACKUP_GPG_PASSPHRASE`.
+- **Offsite:** B2 при наличии `B2_APPLICATION_KEY_ID/KEY`; ручная независимая
+  копия на Mac — `bash infra/local/fetch-backup.sh`.
 
-### Восстановление из бэкапа
+`infra/scripts/backup.sh` пишет дамп во временный файл и публикует финальное имя
+только после проверки размера, `gzip -t` и GPG decrypt round-trip. При сбое
+`pg_dump`/gzip/GPG временные файлы удаляются. Наличие файла с финальным именем
+означает, что локальная проверка архива прошла.
 
-```bash
-# 1. Остановить процессы которые пишут в БД
-sudo systemctl stop pharmacy-monitor-dashboard
-sudo systemctl stop pharmacy-monitor-telegram
-sudo systemctl stop pharmacy-monitor-run.timer
+Если B2 credentials заданы, а CLI/auth/upload не работает, job завершается с
+ошибкой. Если credentials отсутствуют, backup остаётся только на VPS — это надо
+считать незакрытым offsite-риском.
 
-# 2. Сделать копию текущей БД (на всякий случай)
-sudo -u pharmacy cp /opt/pharmacy-monitor/data/db.sqlite \
-  /opt/pharmacy-monitor/data/db.sqlite.before-restore
-
-# 3. Распаковать выбранный бэкап
-sudo -u pharmacy gunzip -c /opt/pharmacy-monitor/data/backups/db-2026-04-29.sqlite.gz \
-  > /opt/pharmacy-monitor/data/db.sqlite
-
-# 4. Проверить integrity
-sudo -u pharmacy sqlite3 /opt/pharmacy-monitor/data/db.sqlite "PRAGMA integrity_check;"
-
-# 5. Запустить процессы обратно
-sudo systemctl start pharmacy-monitor-dashboard
-sudo systemctl start pharmacy-monitor-telegram
-sudo systemctl start pharmacy-monitor-run.timer
-```
-
-### Сделать бэкап вручную
+### Сделать и проверить backup вручную
 
 ```bash
-# Postgres pg_dump → /var/backups/pharmacy-monitor/ (+ GPG если задан BACKUP_GPG_PASSPHRASE,
-# + B2 offsite если заданы B2_APPLICATION_KEY_ID/KEY):
 sudo systemctl start pharmacy-monitor-backup.service
-# или напрямую: sudo bash /opt/pharmacy-monitor/infra/scripts/backup.sh
+systemctl status pharmacy-monitor-backup.service --no-pager -l
+journalctl -u pharmacy-monitor-backup.service -n 30 --no-pager
+ls -lat /var/backups/pharmacy-monitor | head
 ```
+
+Ожидается `status=0/SUCCESS`, `Dump verified`, `Encryption round-trip verified`
+и файл порядка мегабайт, а не 20-байтный gzip header.
+
+### Ежемесячный restore drill без изменения рабочей БД
+
+```bash
+# Выполнять под root на production. Рабочая БД не останавливается и не меняется.
+set -euo pipefail
+restore_db=''
+gpg_home=''
+cleanup_restore_drill() {
+  [[ -z "$restore_db" ]] || sudo -u postgres dropdb --if-exists "$restore_db" >/dev/null || true
+  [[ -z "$gpg_home" ]] || rm -rf -- "$gpg_home" || true
+}
+trap cleanup_restore_drill EXIT
+
+latest=$(find /var/backups/pharmacy-monitor -maxdepth 1 -type f \
+  -name 'pharmacy-monitor-*.sql.gz.gpg' -printf '%T@ %p\n' \
+  | sort -nr | head -1 | cut -d' ' -f2-)
+passphrase=$(grep -E '^BACKUP_GPG_PASSPHRASE=' /etc/pharmacy-monitor/env \
+  | head -1 | cut -d= -f2-)
+[[ -n "$latest" ]] || { echo 'Encrypted backup not found' >&2; exit 1; }
+[[ -n "$passphrase" ]] || { echo 'BACKUP_GPG_PASSPHRASE is empty' >&2; exit 1; }
+restore_db="pharmacy_monitor_restore_verify_$(date -u +%Y%m%d%H%M%S)"
+gpg_home=$(mktemp -d /tmp/pharmacy-restore-gpg.XXXXXX)
+
+sudo -u postgres createdb "$restore_db"
+export GNUPGHOME="$gpg_home"
+chmod 700 "$GNUPGHOME"
+printf '%s' "$passphrase" \
+  | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+      --decrypt "$latest" \
+  | gunzip \
+  | sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d "$restore_db"
+
+for table in products price_snapshots matches runs tenant_users; do
+  source_count=$(sudo -u postgres psql -d pharmacy_monitor -X -Atc "SELECT count(*) FROM $table")
+  restored_count=$(sudo -u postgres psql -d "$restore_db" -X -Atc "SELECT count(*) FROM $table")
+  printf '%s source=%s restored=%s\n' "$table" "$source_count" "$restored_count"
+  [[ "$source_count" == "$restored_count" ]]
+done
+
+echo 'Restore drill completed; temporary database will be removed by the trap.'
+```
+
+Trap удаляет только созданную для drill БД и временный `gpg_home`, в том числе
+при ошибке decrypt/restore. Production restore выполняется отдельной процедурой:
+сначала остановить все writers, сделать свежий аварийный dump текущего состояния
+и только затем восстанавливать выбранную проверенную копию.
+
+Production encryption обязательна; этот drill намеренно принимает только
+`.sql.gz.gpg`. Незашифрованный архив не считается готовой production-копией.
 
 ---
 
@@ -303,30 +378,41 @@ journalctl -u grafana-server -n 50               # логи Grafana
 
 ### Полная потеря VPS
 
-1. Поднять новый VPS
-2. Запустить `provision_vps.sh` (см. Начальная настройка)
-3. Если есть бэкап с предыдущего сервера (S3 / отдельный диск):
-   - Загрузить .sqlite.gz в `/opt/pharmacy-monitor/data/backups/`
-   - Восстановить (см. выше)
+1. Не считать копию на потерянном VPS доступной; взять проверенный
+   `pharmacy-monitor-*.sql.gz.gpg` из B2 или с Mac.
+2. Поднять Ubuntu VPS, установить PostgreSQL 16, Redis, Caddy, Python и Node/pnpm.
+3. Развернуть тот же release приложения и Alembic migrations.
+4. Создать пустую БД `pharmacy_monitor` и роль приложения `pm`.
+5. Расшифровать проверенный archive и восстановить через `psql -v ON_ERROR_STOP=1`.
+6. Сверить counts ключевых таблиц и Alembic head до запуска writers.
+7. Запустить API/frontend, выполнить smoke tests, затем включить scrape timers.
 
-**Recommendation:** настроить off-site бэкап (S3, Backblaze B2, dropbox).
+До автоматизации полного bare-metal restore это ручная операция. Секреты брать
+из отдельного защищённого хранилища, не из репозитория.
 
 ### БД повреждена
 
 ```bash
-sudo -u pharmacy sqlite3 /opt/pharmacy-monitor/data/db.sqlite "PRAGMA integrity_check;"
-# Если "ok" — БД целая. Иначе → восстановить из бэкапа.
+sudo -u postgres psql -d pharmacy_monitor -X -c 'SELECT 1;'
+sudo -u postgres psql -d pharmacy_monitor -X -c \
+  "SELECT datname, pg_database_size(datname) FROM pg_database WHERE datname='pharmacy_monitor';"
+sudo -u postgres pg_dump --schema-only --no-owner pharmacy_monitor >/dev/null
 ```
+
+Не восстанавливать поверх рабочей БД вслепую. Сначала остановить все writers,
+создать аварийный dump текущего состояния и доказать выбранный backup через
+restore drill во временную БД.
 
 ### Скрейперы внезапно перестали работать
 
 Это случается когда сайты меняют HTML. Сценарий:
 
 1. `pharmacy-monitor-health.timer` отправит email-алерт (`site_drop` или `brand_coverage_loss`)
-2. Войти на VPS → `git pull` → проверить если кто-то уже коммитнул фикс
+2. Проверить journal конкретного `pharmacy-monitor-scrape@<site>.service`
 3. Если нет — открыть страницу сайта в браузере с DevTools, найти новые селекторы
 4. Локально запустить `scripts/probe.py` для дебага
-5. Обновить `src/scrapers/<site>.py`, `git push`, на VPS `git pull` + `systemctl restart`
+5. Обновить `src/scrapers/<site>.py`, прогнать тесты и развернуть path-scoped fix
+6. Повторить только нужный сайт через systemd; Mac scraper не включать
 
 ### Disk full
 
@@ -339,28 +425,30 @@ sudo du -sh /opt/pharmacy-monitor/{logs,data,reports}/*
 sudo find /opt/pharmacy-monitor/reports/ -mtime +30 -delete
 
 # Чистка старых бэкапов
-sudo find /opt/pharmacy-monitor/data/backups/ -mtime +90 -delete
+sudo find /var/backups/pharmacy-monitor/ -name 'pharmacy-monitor-*.sql.gz*' \
+  -mtime +14 -type f -delete
 ```
 
 ---
 
 ## 🔄 Обновления / деплой нового кода
 
+Production `/opt/pharmacy-monitor` не является git checkout. Не выполнять там
+`git pull/reset`. Перед DB migration/deploy обязательны успешный backup и restore
+proof. Пока единый atomic release pipeline не реализован, деплой выполняется
+только path-scoped rsync с сохранением предыдущих файлов и явным smoke-test:
+
 ```bash
-# На VPS
-cd /opt/pharmacy-monitor
-sudo -u pharmacy git pull origin main
-sudo -u pharmacy /home/pharmacy/.local/bin/uv sync --no-dev
-# Применить миграции (lightweight, ALTER TABLE)
-sudo -u pharmacy /home/pharmacy/.local/bin/uv run pharmacy-monitor init-db
-
-# Перезапустить сервисы
-sudo systemctl restart pharmacy-monitor-dashboard
-sudo systemctl restart pharmacy-monitor-telegram
-
-# Проверка
-sudo journalctl -u pharmacy-monitor-dashboard -n 20
+systemctl status pharmacy-monitor-backup.service --no-pager -l
+curl -fsS http://127.0.0.1:8080/health
+curl -fsSI http://127.0.0.1:3000/login
+journalctl -u pharmacy-monitor-api -n 50 --no-pager
+journalctl -u pharmacy-monitor-frontend -n 50 --no-pager
 ```
+
+Миграции не запускать, пока `alembic current` и `alembic heads` не показывают
+одну согласованную ветку. Следующая задача roadmap — versioned release directory,
+полная доставка migrations/units/manifests, smoke tests и atomic symlink switch.
 
 ---
 
@@ -369,12 +457,14 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
 Раз в неделю:
 - [ ] `health-check` без issues
 - [ ] Email-отчёты приходят клиенту
-- [ ] Backups появляются в `/data/backups/`
+- [ ] Последний проверенный backup младше 26 часов и больше 1 MB
+- [ ] Offsite-копия существует вне production VPS
 - [ ] Логи в `/logs/` ротируются
 
 Раз в месяц:
 - [ ] Disk usage не растёт неконтролируемо
-- [ ] Streamlit & Telegram bot uptime ≥99%
+- [ ] Restore drill в отдельную PostgreSQL DB проходит со сверкой counts
+- [ ] FastAPI/Next.js uptime и per-site freshness соответствуют SLO
 - [ ] Случайный sample отчёта — данные осмысленные
 
 ---
@@ -388,13 +478,13 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
 
 ---
 
-## 🌐 Scraper proxy chain + DDP recovery (2026-05-28)
+## 🌐 Scraper proxy chain + DDP recovery (updated 2026-07-10)
 
 Текущий runtime:
 
 | Сайт | Где | Чем | Proxy |
 |---|---|---|---|
-| **pharmonline.az** | Hetzner prod | **Meteor DDP WebSocket** (`src/scrapers/pharmonline_ddp.py`) | IPRoyal residential `geo.iproyal.com:12321` |
+| **pharmonline.az** | Hetzner prod | **Meteor DDP WebSocket** (`src/scrapers/pharmonline_ddp.py`) | Decodo AZ residential `az.decodo.com:30001-30010` |
 | **aloe.az** | Hetzner prod | RSC/HTTP parser (`src/scrapers/aloe.py`) | Direct (no proxy needed) |
 | **aptekonline.az** | Hetzner prod | httpx JSON API (`src/scrapers/aptekonline.py`) | Decodo AZ residential |
 
@@ -405,12 +495,16 @@ set for an explicit disaster-recovery run.
 
 ### DDP recovery procedures
 
-**HTTP 403 на WebSocket handshake** (наблюдалось 2026-05-27):
-- Cloudflare/IPRoyal session ban после high-volume scrape
-- Wait 5-10 мин, retry — IPRoyal session rotation помогает
-- Если повторяется: `systemctl restart pharmacy-monitor-scrape@pharmonline`
-- Если упорно: проверить баланс/доступ paid proxy и DDP reconnect logs; Mac
-  launchd не является штатным fallback.
+**HTTP 402 на WebSocket proxy CONNECT** (наблюдалось 2026-07-06..10):
+- Это billing rejection от старого IPRoyal; prod больше не должен выбирать его.
+- Проверить: `DECODO_SITES` содержит `pharmonline`, а `IPROYAL_SITES` пуст.
+- В логе ожидается `pharmonline_ddp_proxy provider=decodo`.
+
+**HTTP 522 на Decodo proxy CONNECT**:
+- Отдельные sticky AZ-порты могут быть временно недоступны.
+- `_decodo_proxy_factory` циклически меняет `30001-30010` на каждый DDP reconnect.
+- Если все порты повторно падают: проверить баланс Decodo и состояние AZ-пула;
+  Mac launchd не является штатным fallback.
 
 **`ConnectionClosedError: no close frame received or sent`** во время persist phase:
 - Это нормально — DDP server тайм-аутит ping pong когда event loop долго блокирован
@@ -420,7 +514,10 @@ set for an explicit disaster-recovery run.
 **Меняем proxy провайдер**:
 ```bash
 # Update /etc/pharmacy-monitor/env on prod (root only)
-# IPROYAL_USERNAME, IPROYAL_PASSWORD, IPROYAL_HOST=geo.iproyal.com:12321
+# DECODO_USERNAME, DECODO_PASSWORD, DECODO_HOST=az.decodo.com
+# DECODO_PORTS=30001-30010
+# DECODO_SITES=aptekonline,pharmonline
+# IPROYAL_SITES=  (disabled; rollback only)
 # BRIGHTDATA_USERNAME, BRIGHTDATA_PASSWORD, BRIGHTDATA_HOST
 # SCRAPER_API_KEY (fallback)
 # Restart scrape:
@@ -428,10 +525,15 @@ systemctl restart pharmacy-monitor-scrape@pharmonline
 ```
 
 Priority order in `src/scrapers/base.py`:
-1. IPRoyal residential (primary для pharmonline)
-2. Bright Data Web Unlocker (secondary, для aptekonline)
-3. ScraperAPI default pool (3rd-priority, free tier)
-4. Direct connection (fallback)
+1. Decodo residential
+2. IPRoyal residential (legacy; disabled on prod)
+3. Bright Data
+4. Crawlbase
+5. ScraperAPI
+6. Generic proxy / direct connection
+
+For Pharmonline DDP specifically, `src/scrapers/pharmonline_ddp.py` selects
+Decodo first and rotates ports on reconnect; IPRoyal is only a legacy fallback.
 
 ### Firecrawl as scraper backup (Phase 6 — Firecrawl MCP)
 
@@ -694,7 +796,7 @@ EOF
 
 ---
 
-## 🧪 Restore drill — verified 2026-05-27
+## 🧪 Frontend source rollback — verified 2026-05-27
 
 **Recovery scenario**: восстановить frontend после failed deploy (i18n rollback experience).
 

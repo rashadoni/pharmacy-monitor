@@ -120,3 +120,18 @@ async def test_aloe_rsc_scrape_category_uses_last_page(monkeypatch) -> None:
     assert requested[0] == "https://aloe.az/catalog/filters/?category_slug=dermanlar"
     assert requested[1].endswith("&page=2")
     assert requested[2].endswith("&page=3")
+
+
+@pytest.mark.asyncio
+async def test_aloe_rsc_rejects_http_200_error_shell(monkeypatch) -> None:
+    async def fake_fetch(self, url: str) -> str:
+        return _flight_html('e:E{"digest":"1038857154"}')
+
+    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fake_fetch)
+    scraper = AloeScraper(rate_limit_sec=0)
+
+    with pytest.raises(
+        RuntimeError,
+        match="contains neither pagination nor products",
+    ):
+        _ = [p async for p in scraper.scrape_category("dermanlar")]

@@ -315,13 +315,15 @@ class BaseScraper(ABC):
         self._playwright = await async_playwright().start()
 
         # Proxy resolution order (first match wins):
-        #   1. IPRoyal residential (IPROYAL_USERNAME/PASSWORD + IPROYAL_SITES)
-        #      — cheapest ($1.75/GB), no KYC
-        #   2. Bright Data residential (BRIGHTDATA_USERNAME/PASSWORD + SITES)
+        #   1. Decodo residential (DECODO_USERNAME/PASSWORD + DECODO_SITES)
+        #      — current AZ provider for aptekonline/pharmonline
+        #   2. IPRoyal residential (IPROYAL_USERNAME/PASSWORD + IPROYAL_SITES)
+        #      — disabled on prod after repeated HTTP 402 billing rejections
+        #   3. Bright Data residential (BRIGHTDATA_USERNAME/PASSWORD + SITES)
         #      — $8/GB ISP or Web Unlocker $1.50/CPM, KYC required for some targets
-        #   3. Crawlbase Smart Proxy (CRAWLBASE_JS_TOKEN + CRAWLBASE_SITES)
-        #   4. ScraperAPI per-site config (SCRAPER_API_KEY + SCRAPER_API_SITES)
-        #   5. Generic HTTP_PROXY / SCRAPE_PROXY env (single proxy for everything)
+        #   4. Crawlbase Smart Proxy (CRAWLBASE_JS_TOKEN + CRAWLBASE_SITES)
+        #   5. ScraperAPI per-site config (SCRAPER_API_KEY + SCRAPER_API_SITES)
+        #   6. Generic HTTP_PROXY / SCRAPE_PROXY env (single proxy for everything)
         # Provider-specific configs take precedence so aloe (works direct from
         # Hetzner) не burn'ит платные credits.
         launch_args: dict = {"headless": self.headless}

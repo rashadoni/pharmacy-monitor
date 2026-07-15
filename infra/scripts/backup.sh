@@ -16,6 +16,8 @@
 #   B2_APPLICATION_KEY_ID     (optional, enables offsite upload)
 #   B2_APPLICATION_KEY        (optional)
 #   B2_BUCKET                 (optional, default "pharmacy-monitor-backups")
+# Runtime/test overrides:
+#   BACKUP_DIR, RETENTION_DAYS, ENV_FILE, BACKUP_MIN_BYTES, BACKUP_TIMESTAMP
 #
 # History: пре-2026-05-27 версия делала `source /etc/pharmacy-monitor/env`
 # под `set -u` и падала из-за `$2: unbound variable` (один из значений
@@ -23,10 +25,45 @@
 
 set -eo pipefail
 # NOTE: deliberately NOT using `set -u` — env file values are not safe.
+umask 077
 
-BACKUP_DIR="/var/backups/pharmacy-monitor"
-RETENTION_DAYS=14
-ENV_FILE="/etc/pharmacy-monitor/env"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/pharmacy-monitor}"
+RETENTION_DAYS="${RETENTION_DAYS:-14}"
+ENV_FILE="${ENV_FILE:-/etc/pharmacy-monitor/env}"
+BACKUP_MIN_BYTES="${BACKUP_MIN_BYTES:-1024}"
+
+tmp_base=""
+tmp_enc=""
+gpg_home_created=""
+
+cleanup() {
+    [[ -z "$tmp_base" ]] || rm -f -- "$tmp_base"
+    [[ -z "$tmp_enc" ]] || rm -f -- "$tmp_enc"
+
+    # Only remove the private temp homedir created by this process.
+    if [[ -n "$gpg_home_created" && "$gpg_home_created" == "${TMPDIR:-/tmp}"/pharm-gpg-* ]]; then
+        rm -rf -- "$gpg_home_created"
+    fi
+}
+trap cleanup EXIT
+
+verify_gzip_archive() {
+    local archive="$1"
+    local bytes
+
+    if [[ ! -s "$archive" ]]; then
+        echo "ERROR: backup archive is empty: $archive" >&2
+        return 1
+    fi
+
+    bytes=$(wc -c < "$archive" | tr -d ' ')
+    if (( bytes < BACKUP_MIN_BYTES )); then
+        echo "ERROR: backup archive is suspiciously small: ${bytes}B < ${BACKUP_MIN_BYTES}B" >&2
+        return 1
+    fi
+
+    gzip -t -- "$archive"
+}
 
 # Extract single env value safely (no shell-exec of env file).
 read_env() {
@@ -45,45 +82,76 @@ B2_KEY=$(read_env B2_APPLICATION_KEY)
 B2_BUCKET=$(read_env B2_BUCKET)
 B2_BUCKET="${B2_BUCKET:-pharmacy-monitor-backups}"
 
+# A half-configured offsite target is a configuration error, not "disabled".
+if [[ -n "$B2_KEY_ID" && -z "$B2_KEY" ]]; then
+    echo "ERROR: B2_APPLICATION_KEY_ID is set but B2_APPLICATION_KEY is missing" >&2
+    exit 1
+fi
+if [[ -z "$B2_KEY_ID" && -n "$B2_KEY" ]]; then
+    echo "ERROR: B2_APPLICATION_KEY is set but B2_APPLICATION_KEY_ID is missing" >&2
+    exit 1
+fi
+
 mkdir -p "$BACKUP_DIR"
-ts=$(date -u +%FT%H%M%SZ)
+ts="${BACKUP_TIMESTAMP:-$(date -u +%FT%H%M%SZ)}"
 base="$BACKUP_DIR/pharmacy-monitor-${ts}.sql.gz"
+tmp_base="$BACKUP_DIR/.pharmacy-monitor-${ts}.sql.gz.tmp"
+tmp_enc="$BACKUP_DIR/.pharmacy-monitor-${ts}.sql.gz.gpg.tmp"
 
 # 1) pg_dump → local gzipped file ─────────────────────────────────────
 # SQLAlchemy URL → pg_dump-compatible (strip +psycopg dialect tag).
-clean_url=$(echo "$DATABASE_URL" | sed 's/postgresql+psycopg/postgresql/')
+clean_url="${DATABASE_URL/postgresql+psycopg/postgresql}"
 
 echo "==> [1/3] pg_dump → $base"
-pg_dump --no-owner --clean --if-exists "$clean_url" | gzip -9 > "$base"
-size=$(du -h "$base" | cut -f1)
-echo "    OK ($size)"
+pg_dump --no-owner --clean --if-exists "$clean_url" | gzip -9 > "$tmp_base"
+verify_gzip_archive "$tmp_base"
+echo "    Dump verified"
 
 # 2) GPG encrypt if passphrase set ────────────────────────────────────
-final="$base"
+final=""
 if [[ -n "$GPG_PASSPHRASE" ]]; then
     enc="${base}.gpg"
     echo "==> [2/3] GPG encrypt → $enc"
     # systemd unit ProtectHome=true → $HOME inaccessible → GPG can't create
     # default ~/.gnupg. Force tmp homedir (writable, ephemeral).
     export GNUPGHOME="${TMPDIR:-/tmp}/pharm-gpg-$$"
+    gpg_home_created="$GNUPGHOME"
     mkdir -p "$GNUPGHOME"
     chmod 700 "$GNUPGHOME"
-    trap 'rm -rf "$GNUPGHOME"' EXIT
     printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
-        --symmetric --cipher-algo AES256 --output "$enc" "$base"
-    rm -f "$base"  # only keep encrypted local copy
+        --symmetric --cipher-algo AES256 --output "$tmp_enc" "$tmp_base"
+
+    if [[ ! -s "$tmp_enc" ]]; then
+        echo "ERROR: encrypted backup is empty" >&2
+        exit 1
+    fi
+
+    # Prove that the passphrase decrypts to a valid gzip stream before publish.
+    printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+        --decrypt "$tmp_enc" | gzip -t
+
+    mv -f -- "$tmp_enc" "$enc"
+    rm -f -- "$tmp_base"  # only keep encrypted local copy
+    tmp_enc=""
+    tmp_base=""
     final="$enc"
-    size=$(du -h "$final" | cut -f1)
-    echo "    OK ($size)"
+    echo "    Encryption round-trip verified"
 else
     echo "==> [2/3] GPG skipped (BACKUP_GPG_PASSPHRASE not set)"
+    mv -f -- "$tmp_base" "$base"
+    tmp_base=""
+    final="$base"
 fi
+
+size=$(du -h "$final" | cut -f1)
+echo "    Published atomically ($size)"
 
 # 3) B2 offsite upload if creds set ───────────────────────────────────
 if [[ -n "$B2_KEY_ID" && -n "$B2_KEY" ]]; then
     echo "==> [3/3] B2 upload → b2://$B2_BUCKET/$(basename "$final")"
     if ! command -v b2 &>/dev/null; then
-        echo "    WARN: b2 CLI not installed. Run: pip install b2 (or apt install b2)"
+        echo "    ERROR: B2 credentials are configured but b2 CLI is not installed" >&2
+        exit 1
     else
         # Auth is cached, but cheap to re-auth each run for idempotency.
         b2 account authorize "$B2_KEY_ID" "$B2_KEY" >/dev/null 2>&1 || {
