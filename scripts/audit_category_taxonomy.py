@@ -129,6 +129,12 @@ def build_category_taxonomy_audit(session, *, tenant_id: int = 1) -> dict:
     reasons: Counter[str] = Counter()
     ambiguous_rows: list[dict] = []
     segment_policy_rows: list[dict] = []
+    # `ambiguous`/`segment_policy` only surface TIES. A confidently-wrong
+    # single-signal `matched` lands in no queue at all — that is exactly how
+    # `usaq` (child) matching `uşaqlıq` (uterus) survived a full prod audit.
+    # Grouping mapped categories by the rule that carried them makes a
+    # low-specificity signal quietly owning many categories visible.
+    by_rule: dict[str, list[dict]] = defaultdict(list)
     for site, category, product_count in inventory_rows:
         result = classify(site, category)
         reasons[result.reason] += 1
@@ -144,6 +150,11 @@ def build_category_taxonomy_audit(session, *, tenant_id: int = 1) -> dict:
             "candidates": list(result.candidates),
             "rule_ids": list(result.rule_ids),
         }
+        if result.category is not None:
+            for rule_id in result.rule_ids:
+                by_rule[rule_id].append(
+                    {"site": site, "category": category, "products": int(product_count)}
+                )
         if result.reason == "ambiguous":
             ambiguous_rows.append(row)
         elif result.reason == "segment_policy":
@@ -179,6 +190,17 @@ def build_category_taxonomy_audit(session, *, tenant_id: int = 1) -> dict:
             for site, counts in sorted(coverage.items())
         },
         "classification_reasons": dict(sorted(reasons.items())),
+        # Review surface for confidently-wrong mappings (see `by_rule` above):
+        # a broad signal owning an unexpected pile of categories is the smell.
+        "mapped_categories_by_rule": [
+            {
+                "rule_id": rule_id,
+                "categories": len(rows),
+                "products": sum(r["products"] for r in rows),
+                "sample": sorted(rows, key=lambda r: -r["products"])[:5],
+            }
+            for rule_id, rows in sorted(by_rule.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        ],
         # Обе категории сработали, ничего не разрешило ничью → остаётся
         # несопоставленной. Это и есть очередь на ручной разбор.
         "ambiguous_source_categories": sorted(ambiguous_rows, key=lambda r: -r["products"]),

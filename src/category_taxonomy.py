@@ -292,6 +292,17 @@ _RULES: tuple[Rule, ...] = (
     Rule("uro.kontrasept", "urogenital_reproductive", "kontrasept"),
     Rule("uro.cinsi", "urogenital_reproductive", "cinsi yolla"),
     Rule("uro.mastopatiya", "urogenital_reproductive", "mastopatiya"),
+    # `uşaqlıq` = UTERUS, and folds to `usaqliq` — which starts with `usaq`
+    # (child). Without this the kids signal fires on uterine-hypertonus and
+    # vaginal-constrictor buckets by pure linguistic accident and, being a
+    # segment_override, wins. Same shape as `respirator distress` vs `respirator`.
+    # `usaqli` is deliberately not a prefix of `usaqlar`/`usaq qidasi`.
+    Rule(
+        "uro.usaqliq",
+        "urogenital_reproductive",
+        "usaqli",
+        supersedes=frozenset({"mb.usaq"}),
+    ),
     # ─── cardiovascular & blood ───
     Rule("cv.urek_damar", "cardiovascular_blood", "urek damar"),
     Rule("cv.qan_dovrani", "cardiovascular_blood", "qan dovrani"),

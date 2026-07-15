@@ -2142,7 +2142,7 @@ def dash_comparison(
     # классификатор прогоняет ВСЕ ~200 правил (в этом и смысл), поэтому вызов
     # на каждый матч — это ~200 правил × ~5k матчей регэкспов на запрос вместо
     # ~200 × ~178 категорий. Тот же приём, что в analytics.category_comparison.
-    _canonical_cache: dict[str, object] = {}
+    _canonical_cache: dict[str, str | None] = {}
 
     def _canonical_key_for(raw_category: str | None) -> str | None:
         cache_key = raw_category or ""

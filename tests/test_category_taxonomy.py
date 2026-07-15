@@ -165,9 +165,41 @@ def test_pregnancy_bucket_still_maps_when_nothing_collides() -> None:
 def test_segment_override_is_carried_by_signals_not_by_the_group() -> None:
     overriding = {r.id for r in taxonomy._RULES if r.segment_override}
     assert overriding == {"mb.ana_usaq", "mb.usaq", "mb.korpe", "mb.baby", "mb.pediatr"}
-    assert all(
-        taxonomy._BY_KEY[r.key].key == "mother_baby" for r in taxonomy._RULES if r.segment_override
+
+
+def test_obstetric_signals_fail_closed_on_collision() -> None:
+    """`dogus`/`laktasiya` are obstetric, not segment markers — pin them too."""
+    lactation = classify_source_category_detailed(
+        "aptekonline", "x", label_az="Laktasiya zamanı istifadə olunan vitaminlər"
     )
+    assert lactation.category is None
+    assert lactation.reason == "ambiguous"
+    assert set(lactation.candidates) == {"mother_baby", "vitamins_supplements"}
+
+
+def test_uterus_is_urogenital_not_a_kids_bucket() -> None:
+    """`uşaqlıq` (uterus) folds to `usaqliq`, which starts with `usaq` (child).
+
+    Without an explicit supersede the kids signal wins by linguistic accident
+    — and, being a segment_override, wins loudly. Live on production: 2
+    products under "Средства при гипертонусе матки".
+    """
+    assert (
+        _key("aptekonline", "63", "Uşaqlığın hipertonusu zamanı istifadə olunan vasitələr")
+        == "urogenital_reproductive"
+    )
+    assert (
+        _key("aptekonline", "227", "Uşaqlıq yoluna daraldıcı təsir göstərən vasitələr")
+        == "urogenital_reproductive"
+    )
+
+
+def test_uterus_guard_does_not_touch_any_kids_bucket() -> None:
+    """`usaqli` must not be a prefix of `usaqlar`/`usaq qidasi`."""
+    assert _key("aptekonline", "252", "Uşaq qidaları") == "mother_baby"
+    assert _key("aptekonline", "395", "Uşaqlar üçün optik çərçivələr") == "mother_baby"
+    assert _key("aptekonline", "80", "Uşaq dərisinə qulluq vasitələri") == "mother_baby"
+    assert _key("pharmonline", "ushaq-bezleri") == "mother_baby"
 
 
 def test_validation_rejects_segment_override_outside_the_segment_group() -> None:

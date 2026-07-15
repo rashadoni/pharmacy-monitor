@@ -66,13 +66,14 @@ def test_source_inventory_is_scoped_to_the_requested_tenant(db_session) -> None:
     db_session.commit()
 
     report = build_category_taxonomy_audit(db_session, tenant_id=1)
+    # Tenant 2's category must not appear in any inventory surface...
     inventoried = {
         (row["site"], row["category"])
-        for bucket in ("ambiguous_source_categories", "segment_policy_source_categories")
-        for row in report[bucket]
+        for entry in report["mapped_categories_by_rule"]
+        for row in entry["sample"]
     }
     assert ("pharmonline", "quru-goz-sindromu") not in inventoried
-    # Tenant 2's category must not inflate tenant 1's coverage.
+    # ...nor inflate tenant 1's coverage.
     assert report["source_coverage"]["pharmonline"]["categories"] == 1
     assert report["source_coverage"]["pharmonline"]["products"] == 1
 
@@ -97,15 +98,43 @@ def test_source_inventory_excludes_dead_urls(db_session) -> None:
     assert report["source_coverage"]["pharmonline"]["products"] == 1
 
 
-def test_audit_surfaces_ambiguity_and_segment_policy_for_review(db_session) -> None:
+def test_audit_surfaces_segment_policy_and_ambiguity_queues(db_session) -> None:
     match = Match(tenant_id=1, canonical_name="Kids", confidence=1.0)
     db_session.add(match)
     db_session.flush()
     # Kids + oral care → resolved by the documented segment policy.
     _product(db_session, match, "pharmonline", "ushaq-uchun-aghiz-boshlughuna-qulluq", "kid")
+    # Pregnancy + vitamins → no signal dominates → fails closed into the queue.
+    _product(db_session, match, "pharmonline", "hamileler-uchun-vitamin-mineral-kompleks", "preg")
     db_session.commit()
 
     report = build_category_taxonomy_audit(db_session, tenant_id=1)
     policy = {row["category"] for row in report["segment_policy_source_categories"]}
     assert "ushaq-uchun-aghiz-boshlughuna-qulluq" in policy
     assert report["classification_reasons"]["segment_policy"] == 1
+
+    ambiguous = {row["category"] for row in report["ambiguous_source_categories"]}
+    assert "hamileler-uchun-vitamin-mineral-kompleks" in ambiguous
+    assert report["classification_reasons"]["ambiguous"] == 1
+
+
+def test_audit_groups_mapped_categories_by_rule_for_review(db_session) -> None:
+    """A broad signal quietly owning many categories must be visible.
+
+    `usaq` (child) matching `uşaqlıq` (uterus) survived a full production audit
+    precisely because a confidently-wrong `matched` row landed in no queue.
+    """
+    match = Match(tenant_id=1, canonical_name="Kids", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    _product(db_session, match, "pharmonline", "ushaq-bezleri", "a")
+    _product(db_session, match, "pharmonline", "ushaq-qidasi", "b")
+    db_session.commit()
+
+    report = build_category_taxonomy_audit(db_session, tenant_id=1)
+    by_rule = {e["rule_id"]: e for e in report["mapped_categories_by_rule"]}
+    assert by_rule["mb.usaq"]["categories"] == 2
+    assert {r["category"] for r in by_rule["mb.usaq"]["sample"]} == {
+        "ushaq-bezleri",
+        "ushaq-qidasi",
+    }
