@@ -4081,8 +4081,8 @@ def test_mapping_create_keeps_az_category_views_free_of_russian(
     response = client.get("/api/v1/dash/category-comparison?locale=az")
     assert response.status_code == 200, response.text
     rows = {row["category"]: row for row in response.json()}
-    assert rows["vitamin-kompleksi"]["label"] == "Vitamin kompleksi"
-    assert "Витаминный" not in rows["vitamin-kompleksi"]["label"]
+    assert rows["vitamins_supplements"]["label"] == "Vitaminlər, BFƏ və təbii vasitələr"
+    assert "Витаминный" not in rows["vitamins_supplements"]["label"]
 
 
 def test_category_comparison_groups_and_indexes(client, tenant_user, setup_db):
@@ -4104,13 +4104,12 @@ def test_category_comparison_groups_and_indexes(client, tenant_user, setup_db):
     r = client.get("/api/v1/dash/category-comparison")
     assert r.status_code == 200, r.text
     rows = {row["category"]: row for row in r.json()}
-    assert set(rows) == {"vitamins", "pain"}
-    assert rows["vitamins"]["index"] == 125.0  # клиент 10 / конкурент 8
-    assert rows["vitamins"]["per_site_avg"] == {"aloe": 8.0}
-    assert rows["vitamins"]["pricier_count"] == 1
-    assert rows["pain"]["index"] == 100.0
-    # Нет записи Category → label graceful fallback на сырой slug.
-    assert rows["vitamins"]["label"] == "vitamins"
+    assert set(rows) == {"vitamins_supplements", "pain_musculoskeletal"}
+    assert rows["vitamins_supplements"]["index"] == 125.0  # клиент 10 / конкурент 8
+    assert rows["vitamins_supplements"]["per_site_avg"] == {"aloe": 8.0}
+    assert rows["vitamins_supplements"]["pricier_count"] == 1
+    assert rows["pain_musculoskeletal"]["index"] == 100.0
+    assert rows["vitamins_supplements"]["label"] == "Витамины, БАД и натуральные средства"
 
 
 def test_category_comparison_tenant_isolation(client, tenant_user, setup_db):
@@ -4143,7 +4142,7 @@ def test_category_comparison_tenant_isolation(client, tenant_user, setup_db):
     r = client.get("/api/v1/dash/category-comparison")
     assert r.status_code == 200, r.text
     cats = {row["category"] for row in r.json()}
-    assert cats == {"vitamins"}  # тенант 2's "secret" исключён
+    assert cats == {"vitamins_supplements"}  # тенант 2's "secret" исключён
 
 
 def test_comparison_category_filter(client, tenant_user, setup_db):

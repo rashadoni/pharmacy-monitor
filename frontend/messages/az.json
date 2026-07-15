@@ -743,7 +743,7 @@
   },
   "category_comparison": {
     "title": "📊 Kateqoriyalar üzrə müqayisə",
-    "subtitle": "Hər kateqoriyada pharmonline rəqiblərdən nə qədər baha və ya ucuzdur. Sətirə klikləyin — kateqoriya məhsulları.",
+    "subtitle": "Saytların xırda kateqoriyaları vahid bölmələrdə birləşdirilib. Hər bölmədə pharmonline-un rəqiblərdən nə qədər baha və ya ucuz olduğunu görün.",
     "export_csv_title": "CSV-yə ixrac et",
     "th_category": "Kateqoriya",
     "th_skus": "SKU",

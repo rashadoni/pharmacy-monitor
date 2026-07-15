@@ -2144,7 +2144,16 @@ def dash_comparison(
         # (pharmonline). None → без фильтра (обычный режим страницы сравнения).
         if category is not None:
             client_p = next((p for p in m.products if p.site == "pharmonline"), None)
-            if client_p is None or client_p.category != category:
+            if client_p is None:
+                continue
+            from src.category_taxonomy import classify_source_category
+
+            canonical_category = classify_source_category(
+                "pharmonline", client_p.category
+            )
+            if client_p.category != category and (
+                canonical_category is None or canonical_category.key != category
+            ):
                 continue
         # Confidence floor: низко-достоверные fuzzy-матчи (Bio Kolik ↔ Bio sprey)
         # дают ложный spread. Ручные (is_manual) показываем всегда.
@@ -2994,7 +3003,12 @@ def dash_category_comparison(
     if locale not in ("ru", "az", "en"):
         locale = "ru"
 
-    rows = analytics.category_comparison(db, client_site=client_site, tenant_id=user.tenant_id)
+    rows = analytics.category_comparison(
+        db,
+        client_site=client_site,
+        tenant_id=user.tenant_id,
+        canonical=True,
+    )
     resolved_labels = [
         _localized_category_label(
             label_ru=r.label_ru,

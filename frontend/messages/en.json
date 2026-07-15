@@ -743,7 +743,7 @@
   },
   "category_comparison": {
     "title": "📊 Category comparison",
-    "subtitle": "How much pharmonline is above or below competitors in each category. Click a row for that category's products.",
+    "subtitle": "Fine-grained source categories are combined into shared sections. Each section shows how pharmonline compares with competitors.",
     "export_csv_title": "Export to CSV",
     "th_category": "Category",
     "th_skus": "SKU",

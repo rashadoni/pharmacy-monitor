@@ -641,6 +641,129 @@ def test_category_comparison_empty(db_session):
     assert analytics.category_comparison(db_session) == []
 
 
+def test_category_comparison_canonical_collapses_source_categories(db_session):
+    run = _add_run(db_session)
+    first = Match(canonical_name="Heart 1", confidence=1.0)
+    second = Match(canonical_name="Heart 2", confidence=1.0)
+    db_session.add_all([first, second])
+    db_session.flush()
+
+    products = [
+        _add_product(
+            db_session,
+            "pharmonline",
+            "Heart 1",
+            canonical_id=first.id,
+            category="antihipertenziv-dermanlar",
+            ext_id="heart-client-1",
+        ),
+        _add_product(
+            db_session,
+            "aloe",
+            "Heart 1",
+            canonical_id=first.id,
+            category="dermanlar",
+            ext_id="heart-aloe-1",
+        ),
+        _add_product(
+            db_session,
+            "pharmonline",
+            "Heart 2",
+            canonical_id=second.id,
+            category="aritmiya-ve-stenokardiya-zamani",
+            ext_id="heart-client-2",
+        ),
+        _add_product(
+            db_session,
+            "aptekonline",
+            "Heart 2",
+            canonical_id=second.id,
+            category="260",
+            ext_id="heart-aptek-2",
+        ),
+    ]
+    for product, price in zip(products, (10.0, 9.0, 20.0, 18.0)):
+        _add_snap_at(db_session, run, product, price)
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session, canonical=True)
+
+    assert len(rows) == 1
+    assert rows[0].category == "cardiovascular_blood"
+    assert rows[0].label_ru == "Сердце, сосуды и кровь"
+    assert rows[0].label_az == "Ürək, damarlar və qan"
+    assert rows[0].matched_skus == 2
+
+
+def test_category_comparison_canonical_skips_format_only_categories(db_session):
+    run = _add_run(db_session)
+    match = Match(canonical_name="Suppository", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Suppository",
+        canonical_id=match.id,
+        category="shamlar-3",
+        ext_id="format-client",
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Suppository",
+        canonical_id=match.id,
+        category="dermanlar",
+        ext_id="format-aloe",
+    )
+    _add_snap_at(db_session, run, client, 10.0)
+    _add_snap_at(db_session, run, competitor, 9.0)
+    db_session.commit()
+
+    assert analytics.category_comparison(db_session, canonical=True) == []
+
+
+def test_category_comparison_shadow_bootstrap_uses_latest_prices(db_session):
+    partial = Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="degraded",
+        catalog_scope="partial",
+        catalog_verified=False,
+        run_quality={"financially_eligible": False, "sites": {}},
+    )
+    db_session.add(partial)
+    db_session.flush()
+    match = Match(canonical_name="Bootstrap", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Bootstrap",
+        canonical_id=match.id,
+        category="goz-xestelikleri-uchun-vasiteler",
+        ext_id="bootstrap-client",
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Bootstrap",
+        canonical_id=match.id,
+        category="dermanlar",
+        ext_id="bootstrap-aloe",
+    )
+    _add_snap_at(db_session, partial, client, 10.0)
+    _add_snap_at(db_session, partial, competitor, 8.0)
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session, canonical=True)
+
+    assert [row.category for row in rows] == ["eye_health"]
+    assert rows[0].matched_skus == 1
+
+
 def test_price_index_and_category_comparison_kwargs_no_typeerror(db_session):
     """Регрессия: API зовёт обе функции с client_site=/tenant_id= — не TypeError.
 

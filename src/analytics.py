@@ -23,6 +23,7 @@ from src.storage import (
     Product,
     Promo,
     Run,
+    financially_eligible_run_ids,
     latest_snapshots_per_product,
 )
 
@@ -446,19 +447,29 @@ def _iter_matched_prices(
                     reason=rollout.reason,
                 )
                 continue
+            trusted_lineage_available = bool(
+                financially_eligible_run_ids(session, tenant_id=current_tenant_id)
+            )
             snaps.update(
                 latest_snapshots_per_product(
                     session,
                     tenant_pids,
-                    financially_eligible_only=True,
+                    financially_eligible_only=trusted_lineage_available,
                     tenant_id=current_tenant_id,
                 )
             )
     else:
+        # Mirror /comparison's safe bootstrap contract. In shadow policy mode
+        # there may be no newly verified full-catalog lineage yet; returning an
+        # empty 200 hides a healthy matched catalogue. Product identity/offer
+        # gates below still reject country conflicts, dead URLs and explicit OOS.
+        trusted_lineage_available = bool(
+            financially_eligible_run_ids(session, tenant_id=tenant_id)
+        )
         snaps = latest_snapshots_per_product(
             session,
             all_pids,
-            financially_eligible_only=True,
+            financially_eligible_only=trusted_lineage_available,
             tenant_id=tenant_id,
         )
 
@@ -558,6 +569,7 @@ def category_comparison(
     tenant_id: int | None = None,
     min_confidence: float = 0.70,
     categories: Collection[str] | None = None,
+    canonical: bool = False,
 ) -> list[CategoryComparison]:
     """Сравнение цен по категориям: per-site средние + index + win/lose.
 
@@ -575,6 +587,34 @@ def category_comparison(
     )
     if not records:
         return []
+
+    canonical_labels = {}
+    if canonical:
+        from src.category_taxonomy import (
+            canonical_category,
+            classify_source_category,
+            source_category_labels,
+        )
+
+        source_labels = source_category_labels(session)
+        canonical_records: list[tuple[str, float, dict[str, float]]] = []
+        for raw_category, client_price, comp_by_site in records:
+            label_ru, label_az = source_labels.get(
+                (client_site, raw_category), (None, None)
+            )
+            mapped = classify_source_category(
+                client_site,
+                raw_category,
+                label_ru=label_ru,
+                label_az=label_az,
+            )
+            if mapped is None:
+                continue
+            canonical_records.append((mapped.key, client_price, comp_by_site))
+            canonical_labels[mapped.key] = canonical_category(mapped.key)
+        records = canonical_records
+        if not records:
+            return []
 
     groups: dict[str, dict] = defaultdict(
         lambda: {
@@ -605,10 +645,17 @@ def category_comparison(
         else:
             g["parity"] += 1
 
-    # Ярлыки одним запросом: slug → (label_ru, label_az).
+    # Ярлыки одним запросом: slug → (label_ru, label_az). Canonical mode uses
+    # compact source-independent labels instead.
     slugs = list(groups.keys())
     labels: dict[str, tuple[str | None, str | None]] = {}
-    if slugs:
+    if canonical:
+        labels = {
+            key: (category.label_ru, category.label_az)
+            for key, category in canonical_labels.items()
+            if category is not None
+        }
+    elif slugs:
         for c in session.scalars(
             select(Category).where(Category.pharmonline_slug.in_(slugs))
         ).all():
