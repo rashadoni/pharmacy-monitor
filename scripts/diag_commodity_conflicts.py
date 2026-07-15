@@ -112,7 +112,12 @@ def main() -> int:
             if any(matcher._has_conflicting_brand(a, b) for a, b in pairs):
                 brand_conf += 1
                 continue
-            if any(matcher._has_conflicting_country(a, b) for a, b in pairs):
+            # Same predicate as the target rules above. If this stays on the
+            # verified-only `_has_conflicting_country`, a cluster with a
+            # legacy-only country conflict is printed as "no signal (NOT
+            # targeted)" while `--apply` dissolves it in the same run — the
+            # readout would contradict the destructive action it precedes.
+            if any(matcher._has_conflicting_legacy_country(a, b) for a, b in pairs):
                 country_conf += 1
                 if len(s_country) < args.sample:
                     s_country.append(m)
@@ -156,7 +161,17 @@ def main() -> int:
                 for i, a in enumerate(ms):
                     for b in ms[i + 1 :]:
                         if a.site != b.site:
-                            add_rejection(s, a.id, b.id, reason="cosmetic vs food cross-origin")
+                            # reason_type must NOT default to "manual": that stamps a
+                            # machine decision as a human one and puts it outside
+                            # rollback_match_policy.py, which only reverts
+                            # system_country/system_spec.
+                            add_rejection(
+                                s,
+                                a.id,
+                                b.id,
+                                reason="cosmetic vs food cross-origin",
+                                reason_type="system_country",
+                            )
                 for p in ms:
                     p.canonical_id = None
                 s.delete(m)
