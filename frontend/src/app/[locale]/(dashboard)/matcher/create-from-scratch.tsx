@@ -169,7 +169,7 @@ export function CreateFromScratch({
                     </span>
                     <button
                       onClick={() => handleRemove(s)}
-                      className="text-muted-foreground hover:text-destructive ml-1"
+                      className="text-muted-foreground hover:text-destructive ml-1 inline-flex min-h-11 min-w-11 items-center justify-center md:min-h-9 md:min-w-9"
                       title={t("remove_from_basket")}
                     >
                       <X className="h-3 w-3" />
@@ -331,7 +331,7 @@ function SiteSearchPanel({
                     </div>
                     <button
                       onClick={() => onAdd(p)}
-                      className={`text-[10px] rounded px-1.5 py-0.5 font-medium transition-colors ${
+                      className={`min-h-11 text-xs rounded px-3 py-1 font-medium transition-colors md:min-h-8 ${
                         isAlreadySelected
                           ? "bg-success/20 text-success cursor-default"
                           : "bg-primary text-primary-foreground hover:bg-primary/90"

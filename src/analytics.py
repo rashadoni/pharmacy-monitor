@@ -53,6 +53,7 @@ def brand_share(
     run_id: int | None = None,
     top_n: int = 30,
     site: str | None = None,
+    tenant_id: int = 1,
 ) -> list[BrandRow]:
     """Сводка: каких брендов сколько на каждом сайте.
 
@@ -77,7 +78,11 @@ def brand_share(
         stmt = (
             select(Product.brand, Product.site, func.count(Product.id))
             .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
-            .where(PriceSnapshot.run_id == run_id, Product.brand.is_not(None))
+            .where(
+                PriceSnapshot.run_id == run_id,
+                Product.brand.is_not(None),
+                Product.tenant_id == tenant_id,
+            )
             .group_by(Product.brand, Product.site)
         )
     else:
@@ -85,7 +90,11 @@ def brand_share(
         cutoff = utcnow() - timedelta(days=_BRAND_SHARE_ACTIVE_DAYS)
         stmt = (
             select(Product.brand, Product.site, func.count(Product.id))
-            .where(Product.last_seen_at >= cutoff, Product.brand.is_not(None))
+            .where(
+                Product.last_seen_at >= cutoff,
+                Product.brand.is_not(None),
+                Product.tenant_id == tenant_id,
+            )
             .group_by(Product.brand, Product.site)
         )
     rows = session.execute(stmt).all()
@@ -298,20 +307,41 @@ class MatchQuality:
     manual_pct: float
 
 
-def match_quality(session: Session) -> MatchQuality:
+def match_quality(session: Session, *, tenant_id: int = 1) -> MatchQuality:
     """Сводка качества матчинга — для отображения в дашборде."""
     from src.storage import Match, MatchRejection
 
-    total_matches = session.scalar(select(func.count(Match.id))) or 0
+    total_matches = (
+        session.scalar(select(func.count(Match.id)).where(Match.tenant_id == tenant_id)) or 0
+    )
     manual_matches = (
-        session.scalar(select(func.count(Match.id)).where(Match.is_manual.is_(True))) or 0
+        session.scalar(
+            select(func.count(Match.id)).where(
+                Match.tenant_id == tenant_id,
+                Match.is_manual.is_(True),
+            )
+        )
+        or 0
     )
     auto_matches = total_matches - manual_matches
-    rejected = session.scalar(select(func.count(MatchRejection.id))) or 0
+    rejected = (
+        session.scalar(
+            select(func.count(MatchRejection.id)).where(MatchRejection.tenant_id == tenant_id)
+        )
+        or 0
+    )
 
-    products_total = session.scalar(select(func.count(Product.id))) or 0
+    products_total = (
+        session.scalar(select(func.count(Product.id)).where(Product.tenant_id == tenant_id)) or 0
+    )
     products_matched = (
-        session.scalar(select(func.count(Product.id)).where(Product.canonical_id.is_not(None))) or 0
+        session.scalar(
+            select(func.count(Product.id)).where(
+                Product.tenant_id == tenant_id,
+                Product.canonical_id.is_not(None),
+            )
+        )
+        or 0
     )
     coverage = (products_matched / products_total * 100) if products_total else 0.0
     manual_pct = (manual_matches / total_matches * 100) if total_matches else 0.0

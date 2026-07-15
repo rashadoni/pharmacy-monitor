@@ -14,7 +14,10 @@ const BASE = ""; // same origin
 /** Generate RFC4122-ish v4 UUID — для трассировки запросов через стек. */
 function genRequestId(): string {
   // Browser-native (Safari 15.4+, Chrome 92+, Firefox 95+).
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
     return crypto.randomUUID();
   }
   // Fallback (legacy IE, server-side build).
@@ -79,6 +82,22 @@ export class ApiError extends Error {
   }
 }
 
+const VERIFIED_SCAN_PENDING_DETAIL =
+  "Verified full-catalog recommendations are not available yet";
+
+/** Expected fail-closed state while financial lineage awaits a verified full scan. */
+export function isVerifiedScanPendingError(err: unknown): err is ApiError {
+  if (!(err instanceof ApiError) || err.status !== 503) return false;
+
+  if (err.detail === VERIFIED_SCAN_PENDING_DETAIL) return true;
+  try {
+    const payload = JSON.parse(err.detail);
+    return payload?.detail === VERIFIED_SCAN_PENDING_DETAIL;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Преобразовать ApiError / Error в человекочитаемое сообщение для UI.
  * Анализирует Pydantic 422 (validation), 401/403/404/409 и timeout 408.
@@ -120,7 +139,8 @@ const ERROR_COPY: Record<
     timeout: "Server vaxtında cavab vermədi. Yenidən cəhd edin.",
     network: "Şəbəkə əlçatan deyil. Bağlantını yoxlayın.",
     server: "Server əlçatan deyil. Bir dəqiqə sonra cəhd edin.",
-    conflict: "Məlumat ziddiyyəti var. Səhifəni yeniləyib dəyişiklikləri yoxlayın.",
+    conflict:
+      "Məlumat ziddiyyəti var. Səhifəni yeniləyib dəyişiklikləri yoxlayın.",
     error: "Xəta",
     unknown: "Naməlum xəta",
   },
@@ -210,14 +230,16 @@ function translatePydantic(msg: string, locale: UiLocale): string {
     },
     az: {
       "Field required": "məcburi sahə",
-      "Input should be a valid email address": "düzgün e-poçt ünvanı daxil edin",
+      "Input should be a valid email address":
+        "düzgün e-poçt ünvanı daxil edin",
       "String should have at least 3 characters": "ən azı 3 simvol olmalıdır",
       "value is not a valid integer": "tam ədəd olmalıdır",
     },
     en: {
       "Field required": "required field",
       "Input should be a valid email address": "enter a valid email address",
-      "String should have at least 3 characters": "must contain at least 3 characters",
+      "String should have at least 3 characters":
+        "must contain at least 3 characters",
       "value is not a valid integer": "must be an integer",
     },
   };
@@ -281,10 +303,34 @@ export interface PricingConfig {
 }
 
 export interface CostImportResult {
+  batch_id: number | null;
   rows_processed: number;
   rows_imported: number;
   rows_skipped: number;
   errors: string[];
+}
+
+export interface CostImportPreview extends CostImportResult {
+  changes: {
+    line: number;
+    product_id: number;
+    product_name: string;
+    sku: string;
+    supplier_name: string;
+    before: { purchase_price: number; currency: string } | null;
+    after: { purchase_price: number; currency: string };
+  }[];
+}
+
+export interface CostImportBatch {
+  id: number;
+  filename: string | null;
+  rows_processed: number;
+  rows_imported: number;
+  rows_skipped: number;
+  created_at: string;
+  rolled_back_at: string | null;
+  can_rollback: boolean;
 }
 
 export interface MatchSuggestionProduct {
@@ -327,6 +373,9 @@ export interface RoiAction {
   competitor_site: string | null;
 }
 
+export type AlertSite = "pharmonline" | "aptekonline" | "aloe";
+export type AlertSort = "newest" | "oldest" | "site";
+
 export interface AlertEvent {
   id: number;
   rule_type: string | null;
@@ -334,10 +383,19 @@ export interface AlertEvent {
   title: string;
   detail: string | null;
   payload: Record<string, unknown> | null;
+  site: AlertSite | null;
   created_at: string;
   is_read?: boolean;
   read_at?: string | null;
   snoozed_until?: string | null;
+}
+
+export interface AlertPage {
+  items: AlertEvent[];
+  total: number;
+  limit: number;
+  offset: number;
+  rule_types: string[];
 }
 
 export interface DataQuality {
@@ -508,10 +566,41 @@ export interface PriceHistoryResponse {
 export interface NormalizeStats {
   products_total: number;
   products_normalized: number;
+  products_needing_review: number;
+  matches_needing_review: number;
+  /** Legacy Match-row count; prefer the explicit fields above. */
   needs_review: number;
   coverage_pct: number;
   last_normalized_at: string | null;
   matches_by_strategy: Record<string, number>;
+}
+
+export interface RoiStatus {
+  available: boolean;
+  client_site: string;
+  run_id: number | null;
+  computed_at: string | null;
+  run_started_at: string | null;
+  run_finished_at: string | null;
+  item_count: number;
+}
+
+export interface RoiRecommendations {
+  items: RoiAction[];
+  provenance: RoiStatus;
+}
+
+export interface ForecastMover {
+  product_id: number;
+  site: string;
+  name: string;
+  n_points: number;
+  first_price: number;
+  last_price: number;
+  change_pct: number;
+  direction: "rising" | "falling" | "stable";
+  forecast_7d_price: number | null;
+  confidence: "low" | "medium" | "high";
 }
 
 export interface AnchorProduct {
@@ -607,6 +696,7 @@ export interface RunRow {
   status: string;
   products_scraped: number;
   products_per_site: Record<string, number> | null;
+  run_quality: RunQuality | null;
   sites_completed: string | null;
   error_message: string | null;
 }
@@ -619,12 +709,62 @@ export interface RunBreakdown {
   products_scraped: number;
   products_per_site: Record<string, number>;
   products_per_site_category: Record<string, Record<string, number>>;
+  run_quality: RunQuality | null;
   sites_completed: string | null;
+}
+
+export interface RunHistoryPage {
+  items: RunRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface AuditLogRow {
+  id: number;
+  actor_user_id: number | null;
+  actor_email: string | null;
+  action: string;
+  resource: string;
+  response_status: number;
+  request_id: string | null;
+  created_at: string;
+}
+
+export interface AuditLogPage {
+  items: AuditLogRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface RunQualitySite {
+  status: "ok" | "degraded" | "failed";
+  products: number;
+  items_expected: number;
+  items_completed: number;
+  items_failed: number;
+  baseline_products: number | null;
+  baseline_fraction: number | null;
+  reasons: string[];
+  errors: string[];
+  errors_truncated: number;
+  items_truncated: number;
+}
+
+export interface RunQuality {
+  version: number;
+  mode: string;
+  baseline_enforced: boolean;
+  full_catalog_verified: boolean;
+  financially_eligible: boolean;
+  sites: Record<string, RunQualitySite>;
 }
 
 export interface LatestRunBySite {
   site: string;
   run: RunRow | null;
+  latest_attempt: RunRow | null;
 }
 
 export interface CategoryRow {
@@ -636,6 +776,22 @@ export interface CategoryRow {
   aptekonline_slug: string | null;
   aloe_slug: string | null;
   is_active: boolean;
+}
+
+export interface CategoriesPage {
+  items: CategoryRow[];
+  total: number;
+  limit: number;
+  offset: number;
+  stats: {
+    total: number;
+    active: number;
+    cross2: number;
+    cross3: number;
+    pharmonline: number;
+    aptekonline: number;
+    aloe: number;
+  };
 }
 
 export interface CategorySuggestion {
@@ -674,6 +830,27 @@ export interface Health {
   redis_ping_ms: number | null;
   sites: HealthSite[];
   staleness_warning: boolean;
+  full_catalog_run_at: string | null;
+  full_catalog_status: string | null;
+  full_catalog_verified: boolean;
+}
+
+export interface SystemStatus extends Health {
+  queue: {
+    pending: number;
+    running: number;
+    oldest_pending_at: string | null;
+  };
+  proxy: {
+    provider: "decodo";
+    configured: boolean;
+    sites: string[];
+    pool_size: number;
+  };
+  digests: {
+    daily: { enabled: boolean; schedule_baku: string };
+    weekly: { enabled: boolean; schedule_baku: string };
+  };
 }
 
 export const api = {
@@ -687,12 +864,21 @@ export const api = {
 
   // Health (public, no auth)
   health: () => request<Health>("/health"),
+  systemStatus: () => request<SystemStatus>("/api/v1/dash/system-status"),
 
   // User
   me: () => request<MeOut>("/api/v1/dash/me"),
 
   // Data
-  comparison: (params: { search?: string; min_sites?: number; site_filter?: string; limit?: number; category?: string } = {}) => {
+  comparison: (
+    params: {
+      search?: string;
+      min_sites?: number;
+      site_filter?: string;
+      limit?: number;
+      category?: string;
+    } = {},
+  ) => {
     const q = new URLSearchParams();
     if (params.search) q.set("search", params.search);
     if (params.min_sites != null) q.set("min_sites", String(params.min_sites));
@@ -722,14 +908,38 @@ export const api = {
     }
     return res.json() as Promise<CostImportResult>;
   },
+  costsCsvPreview: async (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${BASE}/api/v1/dash/settings/costs/preview`, {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new ApiError(res.status, text || res.statusText);
+    }
+    return res.json() as Promise<CostImportPreview>;
+  },
+  costImportHistory: () =>
+    request<CostImportBatch[]>("/api/v1/dash/settings/costs/imports"),
+  costImportRollback: (batchId: number) =>
+    request<{ ok: true; batch_id: number; rows_rolled_back: number }>(
+      `/api/v1/dash/settings/costs/imports/${batchId}/rollback`,
+      { method: "POST" },
+    ),
 
-  matchSuggestions: (params: {
-    confidence_max?: number;
-    only_needs_review?: boolean;
-    limit?: number;
-  } = {}) => {
+  matchSuggestions: (
+    params: {
+      confidence_max?: number;
+      only_needs_review?: boolean;
+      limit?: number;
+    } = {},
+  ) => {
     const q = new URLSearchParams();
-    if (params.confidence_max != null) q.set("confidence_max", String(params.confidence_max));
+    if (params.confidence_max != null)
+      q.set("confidence_max", String(params.confidence_max));
     if (params.only_needs_review) q.set("only_needs_review", "true");
     if (params.limit != null) q.set("limit", String(params.limit));
     const qs = q.toString();
@@ -738,7 +948,9 @@ export const api = {
     );
   },
   matchConfirm: (matchId: number) =>
-    request<void>(`/api/v1/dash/matches/${matchId}/confirm`, { method: "POST" }),
+    request<void>(`/api/v1/dash/matches/${matchId}/confirm`, {
+      method: "POST",
+    }),
   matchReject: (matchId: number) =>
     request<void>(`/api/v1/dash/matches/${matchId}/reject`, { method: "POST" }),
   matchRelink: (matchId: number, site: string, url: string) =>
@@ -761,35 +973,84 @@ export const api = {
       { timeoutMs: 15_000 },
     );
   },
-  alerts: (params: {
-    severity?: string;
-    limit?: number;
-    include_read?: boolean;
-    include_snoozed?: boolean;
-  } = {}) => {
+  roiStatus: (client_site?: string) => {
+    const q = new URLSearchParams();
+    if (client_site) q.set("client_site", client_site);
+    const qs = q.toString();
+    return request<RoiStatus>(`/api/v1/dash/roi/status${qs ? `?${qs}` : ""}`);
+  },
+  roiRecommendations: (client_site?: string, locale?: string) => {
+    const q = new URLSearchParams();
+    if (client_site) q.set("client_site", client_site);
+    if (locale) q.set("locale", locale);
+    const qs = q.toString();
+    return request<RoiRecommendations>(
+      `/api/v1/dash/roi/recommendations${qs ? `?${qs}` : ""}`,
+      { timeoutMs: 15_000 },
+    );
+  },
+  alerts: (
+    params: {
+      severity?: string;
+      limit?: number;
+      include_read?: boolean;
+      include_snoozed?: boolean;
+    } = {},
+  ) => {
     const q = new URLSearchParams({ limit: String(params.limit ?? 100) });
     if (params.severity) q.set("severity", params.severity);
     if (params.include_read) q.set("include_read", "true");
     if (params.include_snoozed) q.set("include_snoozed", "true");
     return request<AlertEvent[]>(`/api/v1/dash/alerts?${q}`);
   },
+  alertsPage: (
+    params: {
+      view?: "inbox" | "snoozed" | "read";
+      severity?: string;
+      rule_type?: string;
+      site?: AlertSite | "general";
+      sort?: AlertSort;
+      hours?: number;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) => {
+    const q = new URLSearchParams({
+      view: params.view ?? "inbox",
+      limit: String(params.limit ?? 50),
+      offset: String(params.offset ?? 0),
+      hours: String(params.hours ?? 168),
+    });
+    if (params.severity) q.set("severity", params.severity);
+    if (params.rule_type) q.set("rule_type", params.rule_type);
+    if (params.site) q.set("site", params.site);
+    if (params.sort && params.sort !== "newest") q.set("sort", params.sort);
+    return request<AlertPage>(`/api/v1/dash/alerts/page?${q}`);
+  },
   alertsCounts: () =>
     request<{ unread: number; snoozed: number; read: number; total: number }>(
       "/api/v1/dash/alerts/counts",
     ),
-  alertPatch: (id: number, payload: { is_read?: boolean; snooze_hours?: number }) =>
+  alertPatch: (
+    id: number,
+    payload: { is_read?: boolean; snooze_hours?: number },
+  ) =>
     request<{ ok: true; id: number }>(`/api/v1/dash/alerts/${id}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
   alertsMarkAllRead: () =>
-    request<{ affected: number }>("/api/v1/dash/alerts/mark-all-read", { method: "POST" }),
-  alertsBulk: (ids: number[], action:
-    | "mark_read"
-    | "mark_unread"
-    | "snooze_24h"
-    | "snooze_7d"
-    | "snooze_clear",
+    request<{ affected: number }>("/api/v1/dash/alerts/mark-all-read", {
+      method: "POST",
+    }),
+  alertsBulk: (
+    ids: number[],
+    action:
+      | "mark_read"
+      | "mark_unread"
+      | "snooze_24h"
+      | "snooze_7d"
+      | "snooze_clear",
   ) =>
     request<{ affected: number; action: string }>("/api/v1/dash/alerts/bulk", {
       method: "POST",
@@ -840,10 +1101,9 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   recipientDelete: (id: number, hard = false) =>
-    request<void>(
-      `/api/v1/dash/recipients/${id}${hard ? "?hard=true" : ""}`,
-      { method: "DELETE" },
-    ),
+    request<void>(`/api/v1/dash/recipients/${id}${hard ? "?hard=true" : ""}`, {
+      method: "DELETE",
+    }),
   recipientSendLoginLink: (id: number) =>
     request<{ ok: boolean; email: string }>(
       `/api/v1/dash/recipients/${id}/send-login-link`,
@@ -859,7 +1119,9 @@ export const api = {
     const q = new URLSearchParams();
     if (client_site) q.set("client_site", client_site);
     const qs = q.toString();
-    return request<PriceIndexRow[]>(`/api/v1/dash/price-index${qs ? `?${qs}` : ""}`);
+    return request<PriceIndexRow[]>(
+      `/api/v1/dash/price-index${qs ? `?${qs}` : ""}`,
+    );
   },
   categoryComparison: (client_site?: string, locale?: string) => {
     const q = new URLSearchParams();
@@ -870,6 +1132,8 @@ export const api = {
       `/api/v1/dash/category-comparison${qs ? `?${qs}` : ""}`,
     );
   },
+  forecastMovers: () =>
+    request<ForecastMover[]>("/api/v1/dash/forecast/movers"),
   siteProducts: (params: {
     site: string;
     category?: string;
@@ -893,12 +1157,55 @@ export const api = {
     return request<SiteFacets>(`/api/v1/dash/products/facets?${q}`);
   },
   siteProductsSummary: (site: string) =>
-    request<SiteSummary>(`/api/v1/dash/products/summary?site=${encodeURIComponent(site)}`),
+    request<SiteSummary>(
+      `/api/v1/dash/products/summary?site=${encodeURIComponent(site)}`,
+    ),
   runs: (limit = 30) => request<RunRow[]>(`/api/v1/dash/runs?limit=${limit}`),
-  runsLatestBySite: () => request<LatestRunBySite[]>("/api/v1/dash/runs/latest-by-site"),
+  runsHistory: (
+    params: {
+      limit?: number;
+      offset?: number;
+      status?: string;
+      site?: string;
+    } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    if (params.status) q.set("status", params.status);
+    if (params.site) q.set("site", params.site);
+    return request<RunHistoryPage>(`/api/v1/dash/runs/history?${q}`);
+  },
+  auditLog: (params: { limit?: number; offset?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    return request<AuditLogPage>(`/api/v1/dash/audit-log?${q}`);
+  },
+  runsLatestBySite: () =>
+    request<LatestRunBySite[]>("/api/v1/dash/runs/latest-by-site"),
   runBreakdown: (id: number) =>
     request<RunBreakdown>(`/api/v1/dash/runs/${id}/breakdown`),
   categories: () => request<CategoryRow[]>("/api/v1/dash/categories"),
+  categoriesPage: (
+    params: {
+      limit?: number;
+      offset?: number;
+      search?: string;
+      site?: string;
+      active_only?: boolean;
+      coverage?: string;
+    } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    if (params.search) q.set("search", params.search);
+    if (params.site) q.set("site", params.site);
+    if (params.active_only) q.set("active_only", "true");
+    if (params.coverage) q.set("coverage", params.coverage);
+    return request<CategoriesPage>(`/api/v1/dash/categories/page?${q}`);
+  },
   categoryCreate: (payload: Omit<CategoryRow, "id">) =>
     request<CategoryRow>("/api/v1/dash/categories", {
       method: "POST",
@@ -917,8 +1224,12 @@ export const api = {
     min_overlap?: number;
     limit?: number;
   }) => {
-    const q = new URLSearchParams({ site_a: params.site_a, site_b: params.site_b });
-    if (params.min_overlap != null) q.set("min_overlap", String(params.min_overlap));
+    const q = new URLSearchParams({
+      site_a: params.site_a,
+      site_b: params.site_b,
+    });
+    if (params.min_overlap != null)
+      q.set("min_overlap", String(params.min_overlap));
     if (params.limit != null) q.set("limit", String(params.limit));
     return request<CategorySuggestion[]>(
       `/api/v1/dash/categories/suggestions?${q}`,
@@ -947,15 +1258,19 @@ export const api = {
       body: JSON.stringify(patch),
     }),
   notifUnbindTelegram: () =>
-    request<void>("/api/v1/dash/me/notifications/telegram", { method: "DELETE" }),
-  integrations: () =>
-    request<IntegrationsStatus>("/api/v1/dash/integrations"),
+    request<void>("/api/v1/dash/me/notifications/telegram", {
+      method: "DELETE",
+    }),
+  integrations: () => request<IntegrationsStatus>("/api/v1/dash/integrations"),
   changePassword: (current_password: string, new_password: string) =>
     request<{ ok: true }>("/api/v1/dash/me/password", {
       method: "POST",
       body: JSON.stringify({ current_password, new_password }),
     }),
-  scrapeTrigger: (payload: { mode: "all" | "category"; category_id?: number }) =>
+  scrapeTrigger: (payload: {
+    mode: "all" | "category";
+    category_id?: number;
+  }) =>
     request<{ id: number; status: string }>("/api/v1/dash/scrape/trigger", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -965,8 +1280,7 @@ export const api = {
       `/api/v1/dash/digest/send-test?kind=${kind}`,
       { method: "POST", timeoutMs: 30_000 },
     ),
-  watchlistList: () =>
-    request<WatchlistItem[]>("/api/v1/dash/watchlist"),
+  watchlistList: () => request<WatchlistItem[]>("/api/v1/dash/watchlist"),
   watchlistCreate: (payload: WatchlistCreatePayload) =>
     request<{ id: number }>("/api/v1/dash/watchlist", {
       method: "POST",
@@ -982,7 +1296,9 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   watchlistCategoryDelete: (id: number) =>
-    request<void>(`/api/v1/dash/watchlist/categories/${id}`, { method: "DELETE" }),
+    request<void>(`/api/v1/dash/watchlist/categories/${id}`, {
+      method: "DELETE",
+    }),
   productPriceHistory: (product_id: number, days = 30) =>
     request<PriceHistoryResponse>(
       `/api/v1/dash/products/${product_id}/price-history?days=${days}`,
@@ -1004,6 +1320,17 @@ export const api = {
   },
   scrapeRequests: (limit = 10) =>
     request<ScrapeRequestRow[]>(`/api/v1/dash/scrape/requests?limit=${limit}`),
+  scrapeRequestsHistory: (
+    params: { limit?: number; offset?: number; status?: string } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (params.limit != null) q.set("limit", String(params.limit));
+    if (params.offset != null) q.set("offset", String(params.offset));
+    if (params.status) q.set("status", params.status);
+    return request<ScrapeRequestHistoryPage>(
+      `/api/v1/dash/scrape/requests/history?${q}`,
+    );
+  },
 };
 
 export interface ScrapeRequestRow {
@@ -1011,16 +1338,23 @@ export interface ScrapeRequestRow {
   mode: string;
   category_id: number | null;
   sites: string | null;
-  status: "pending" | "running" | "ok" | "failed";
+  status: "pending" | "running" | "ok" | "degraded" | "failed";
   requested_at: string | null;
   started_at: string | null;
   completed_at: string | null;
   run_id: number | null;
   error_message: string | null;
-  /** Total products across all sites in the run (filled when status=ok). */
+  /** Total products across all sites in the terminal run. */
   products_scraped: number | null;
-  /** Per-site breakdown {site: count} from runs.products_per_site (filled when status=ok). */
+  /** Per-site breakdown {site: count} from a terminal run. */
   products_per_site: Record<string, number> | null;
+}
+
+export interface ScrapeRequestHistoryPage {
+  items: ScrapeRequestRow[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface IntegrationsStatus {
@@ -1031,4 +1365,7 @@ export interface IntegrationsStatus {
   sentry: boolean;
   scraperapi: boolean;
   scraperapi_sites: string[];
+  decodo: boolean;
+  decodo_sites: string[];
+  decodo_pool_size: number;
 }

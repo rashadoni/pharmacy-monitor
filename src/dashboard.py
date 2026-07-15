@@ -1369,17 +1369,7 @@ with tab_overview:
         with st.sidebar:
             st.header("⚙️ Фильтры")
             selected_sites = st.multiselect("Сайты", options=list(SITES), default=list(SITES))
-            monthly_volume = st.slider(
-                "Объём продаж/мес (для ROI)",
-                min_value=5,
-                max_value=200,
-                value=30,
-                step=5,
-                help=(
-                    "Условный объём в единицах для расчёта возможного "
-                    "месячного профита/убытка по каждому действию."
-                ),
-            )
+            st.caption("ROI показывает только проверяемую разницу цен на единицу.")
             st.divider()
             st.subheader("Прогоны")
             st.dataframe(
@@ -1394,17 +1384,17 @@ with tab_overview:
         from src import roi
 
         with get_session() as s:
-            actions = roi.compute_actions(s, assumed_monthly_volume=monthly_volume)
+            cached_actions = roi.get_cached_action_items(s, roi.CLIENT_SITE, tenant_id=1)
+            roi_unavailable = cached_actions is None
+            actions = cached_actions or []
             agg = roi.aggregate_impact(actions)
 
         col_h1, col_h2 = st.columns([4, 1])
         with col_h1:
             st.subheader("🎯 Сегодняшние действия")
-            st.caption(
-                "Конкретные шаги на основе свежих цен и матчей. "
-                "Прогноз эффекта — при условии что продаётся ~"
-                f"{monthly_volume} ед./мес (меняется в сайдбаре)."
-            )
+            st.caption("Конкретные шаги только из проверенного ROI-кэша полного прогона.")
+            if roi_unavailable:
+                st.warning("Рекомендации скрыты до завершённого подтверждённого full-catalog run.")
         with col_h2:
             # PDF-экспорт последнего отчёта
             if st.button(
@@ -1416,14 +1406,24 @@ with tab_overview:
                 from sqlalchemy import desc as _d, select as _s
 
                 with get_session() as s_pdf:
-                    last_run = s_pdf.scalars(
-                        _s(storage.Run)
-                        .where(storage.Run.status == "ok")
-                        .order_by(_d(storage.Run.started_at))
-                        .limit(1)
-                    ).first()
+                    eligible_ids = storage.financially_eligible_run_ids(s_pdf, tenant_id=1)
+                    last_run = None
+                    if (
+                        eligible_ids
+                        and not storage.has_unfinished_run(s_pdf, tenant_id=1)
+                        and roi.financial_inputs_are_fresh(s_pdf, tenant_id=1)
+                    ):
+                        last_run = s_pdf.scalars(
+                            _s(storage.Run)
+                            .where(
+                                storage.Run.id.in_(eligible_ids),
+                                storage.Run.finished_at.is_not(None),
+                            )
+                            .order_by(_d(storage.Run.finished_at), _d(storage.Run.id))
+                            .limit(1)
+                        ).first()
                     if not last_run:
-                        st.warning("Нет успешных прогонов")
+                        st.warning("Нет завершённого подтверждённого полного прогона")
                     else:
                         with st.spinner("Генерирую PDF (~2 сек)..."):
                             report = analyzer_mod.analyze(s_pdf, last_run.id)

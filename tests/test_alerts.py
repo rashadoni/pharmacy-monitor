@@ -1,10 +1,12 @@
 """Тесты движка алертов: detection, dedup, dispatch routing."""
 
+from contextlib import contextmanager
+
 from datetime import timedelta
 from src._time import utcnow
 
 
-from src import alerts
+from src import alerts, storage
 from src.storage import (
     AlertEvent,
     AlertRule,
@@ -17,10 +19,40 @@ from src.storage import (
 
 
 def _add_run(s, started_at=None, status="ok") -> Run:
-    r = Run(started_at=started_at or utcnow(), status=status)
+    started_at = started_at or utcnow()
+    r = Run(
+        started_at=started_at,
+        finished_at=started_at + timedelta(minutes=1),
+        status=status,
+        run_quality=(
+            {
+                "baseline_enforced": True,
+                "full_catalog_verified": True,
+                "financially_eligible": True,
+                "sites": {
+                    "pharmonline": {"status": "ok"},
+                    "aptekonline": {"status": "ok"},
+                    "aloe": {"status": "ok"},
+                },
+            }
+            if status == "ok"
+            else None
+        ),
+    )
     s.add(r)
     s.flush()
     return r
+
+
+def test_evaluate_rules_skips_degraded_and_intentional_partial_runs(db_session):
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    degraded = _add_run(db_session, status="degraded")
+    partial = _add_run(db_session, status="ok")
+    partial.run_quality = {"financially_eligible": False}
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session, degraded.id) == []
+    assert alerts.evaluate_rules(db_session, partial.id) == []
 
 
 def _add_product(s, site, name, ext_id, canonical_id=None) -> Product:
@@ -75,6 +107,9 @@ def test_undercut_threshold_fires(db_session):
     p_client = _add_product(db_session, "pharmonline", "Foo", "ph", canonical_id=m.id)
     p_comp = _add_product(db_session, "aloe", "Foo", "al", canonical_id=m.id)
     run = _add_run(db_session)
+    # Explicit run_id is the trusted in-pipeline path and intentionally works
+    # before run.finished_at is stamped after post-processing.
+    run.finished_at = None
     _add_snap(db_session, run, p_client, 10.0)
     _add_snap(db_session, run, p_comp, 8.0)  # 20% дешевле
     _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
@@ -84,6 +119,198 @@ def test_undercut_threshold_fires(db_session):
     assert len(fired) == 1
     assert fired[0].rule_type == "undercut_threshold"
     assert fired[0].severity == "critical"
+
+
+def test_auto_evaluate_selects_latest_completed_fresh_run(db_session):
+    match = _make_match(db_session, "Auto trusted")
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Auto trusted",
+        "auto-ph",
+        canonical_id=match.id,
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Auto trusted",
+        "auto-al",
+        canonical_id=match.id,
+    )
+    run = _add_run(db_session)
+    _add_snap(db_session, run, client, 10.0)
+    _add_snap(db_session, run, competitor, 8.0)
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session)
+
+    assert len(fired) == 1
+    assert fired[0].rule_type == "undercut_threshold"
+
+
+def test_auto_evaluate_ignores_unfinished_eligible_run(db_session):
+    match = _make_match(db_session, "Auto blocked during run")
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Auto blocked during run",
+        "blocked-ph",
+        canonical_id=match.id,
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Auto blocked during run",
+        "blocked-al",
+        canonical_id=match.id,
+    )
+    completed = _add_run(db_session, utcnow() - timedelta(hours=1))
+    _add_snap(db_session, completed, client, 10.0)
+    _add_snap(db_session, completed, competitor, 8.0)
+    unfinished = _add_run(db_session)
+    unfinished.finished_at = None
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    # Run A would produce a valid event, but external auto-evaluation must not
+    # read mutable Product/Match state while Run B is still changing it.
+    assert alerts.evaluate_rules(db_session) == []
+
+    unfinished.finished_at = utcnow()
+    unfinished.status = "failed"
+    unfinished.run_quality = None
+    db_session.commit()
+    fired = alerts.evaluate_rules(db_session)
+    assert len(fired) == 1
+    assert fired[0].payload["source_run_id"] == completed.id
+
+
+def test_auto_evaluate_skips_when_scrape_lock_is_busy(db_session, monkeypatch):
+    @contextmanager
+    def busy_lock(_session):
+        yield False
+
+    monkeypatch.setattr(alerts, "try_shared_scrape_read_lock", busy_lock)
+
+    assert alerts.evaluate_rules(db_session) == []
+
+
+def test_auto_evaluate_does_not_mix_completed_run_with_unfinished_snapshots(db_session):
+    match = _make_match(db_session, "Snapshot boundary")
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Snapshot boundary",
+        "boundary-ph",
+        canonical_id=match.id,
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Snapshot boundary",
+        "boundary-al",
+        canonical_id=match.id,
+    )
+    completed = _add_run(db_session, utcnow() - timedelta(hours=1))
+    _add_snap(db_session, completed, client, 10.0)
+    _add_snap(db_session, completed, competitor, 12.0)
+    unfinished = _add_run(db_session, utcnow())
+    unfinished.finished_at = None
+    _add_snap(db_session, unfinished, client, 10.0)
+    _add_snap(db_session, unfinished, competitor, 5.0)
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session) == []
+
+    explicit = alerts.evaluate_rules(db_session, unfinished.id)
+    assert len(explicit) == 1
+    assert explicit[0].payload["competitor_price"] == 5.0
+
+
+def test_auto_evaluate_rejects_superseded_eligible_run(db_session):
+    trusted = _add_run(db_session, utcnow() - timedelta(hours=1))
+    _add_rule(db_session, "new_product")
+    degraded_at = utcnow()
+    db_session.add(
+        Run(
+            started_at=degraded_at,
+            finished_at=degraded_at,
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {
+                    "pharmonline": {"status": "degraded"},
+                    "aptekonline": {"status": "ok"},
+                    "aloe": {"status": "ok"},
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    assert storage.run_is_financially_eligible(trusted)
+    assert alerts.evaluate_rules(db_session) == []
+
+
+def test_undercut_prefetches_verified_snapshots_once(db_session, monkeypatch):
+    run = _add_run(db_session)
+    for index in range(2):
+        match = _make_match(db_session, f"Product {index}")
+        client = _add_product(
+            db_session,
+            "pharmonline",
+            f"Product {index}",
+            f"ph-{index}",
+            canonical_id=match.id,
+        )
+        competitor = _add_product(
+            db_session,
+            "aloe",
+            f"Product {index}",
+            f"al-{index}",
+            canonical_id=match.id,
+        )
+        _add_snap(db_session, run, client, 10.0)
+        _add_snap(db_session, run, competitor, 8.0)
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    original = storage.latest_snapshots_per_product
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "latest_snapshots_per_product", counted)
+    assert len(alerts.evaluate_rules(db_session, run.id)) == 2
+    assert calls == 1
+
+
+def test_undercut_detector_does_not_leak_foreign_tenant_match(db_session):
+    run = _add_run(db_session)
+    foreign_match = Match(tenant_id=2, canonical_name="Foreign", confidence=1.0)
+    db_session.add(foreign_match)
+    db_session.flush()
+    client = _add_product(
+        db_session, "pharmonline", "Foreign", "foreign-ph", canonical_id=foreign_match.id
+    )
+    competitor = _add_product(
+        db_session, "aloe", "Foreign", "foreign-al", canonical_id=foreign_match.id
+    )
+    client.tenant_id = 2
+    competitor.tenant_id = 2
+    _add_snap(db_session, run, client, 10.0)
+    _add_snap(db_session, run, competitor, 1.0)
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session, run.id) == []
 
 
 def test_undercut_below_threshold_no_fire(db_session):
@@ -154,6 +381,23 @@ def test_price_drop_detects_yesterday_to_today(db_session):
     assert fired[0].payload["drop_pct"] == 30.0
 
 
+def test_price_drop_ignores_newer_partial_snapshot_as_baseline(db_session):
+    product = _add_product(db_session, "aloe", "Trusted", "trusted")
+    trusted = _add_run(db_session, utcnow() - timedelta(days=2))
+    partial = _add_run(db_session, utcnow() - timedelta(days=1))
+    partial.run_quality = {"financially_eligible": False}
+    current = _add_run(db_session, utcnow())
+    _add_snap(db_session, trusted, product, 100.0)
+    _add_snap(db_session, partial, product, 200.0)
+    _add_snap(db_session, current, product, 90.0)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 20.0})
+    db_session.commit()
+
+    # Verified 100 → 90 is only 10%. The newer partial value 200 must not
+    # manufacture a false 55% money alert.
+    assert alerts.evaluate_rules(db_session, current.id) == []
+
+
 def test_new_product_detected(db_session):
     yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
     today = _add_run(db_session, utcnow())
@@ -184,6 +428,37 @@ def test_promo_started_detected(db_session):
     new_promos = [f for f in fired if f.rule_type == "promo_started"]
     assert len(new_promos) == 1
     assert "Brand New Sale" in new_promos[0].title
+
+
+def test_promo_started_compares_previous_verified_run_of_same_site(db_session):
+    aloe_previous = _add_run(db_session, utcnow() - timedelta(days=2))
+    interleaved_aptek = _add_run(db_session, utcnow() - timedelta(days=1))
+    current = _add_run(db_session, utcnow())
+    aloe_previous.run_quality = {
+        "financially_eligible": True,
+        "sites": {"aloe": {"status": "ok"}},
+    }
+    interleaved_aptek.run_quality = {
+        "financially_eligible": True,
+        "sites": {"aptekonline": {"status": "ok"}},
+    }
+    current.run_quality = {
+        "financially_eligible": True,
+        "sites": {"aloe": {"status": "ok"}},
+    }
+    db_session.add_all(
+        [
+            Promo(run_id=aloe_previous.id, site="aloe", title="Existing"),
+            Promo(run_id=interleaved_aptek.id, site="aptekonline", title="Other Site"),
+            Promo(run_id=current.id, site="aloe", title="Existing"),
+            Promo(run_id=current.id, site="aloe", title="New Aloe Promo"),
+        ]
+    )
+    _add_rule(db_session, "promo_started")
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, current.id)
+    assert [event.payload["title"] for event in fired] == ["New Aloe Promo"]
 
 
 def test_inactive_rule_not_evaluated(db_session):

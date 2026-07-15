@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState, useMemo } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { useSearchParams } from "next/navigation";
 import { X, ChevronUp, ChevronDown, ChevronsUpDown, TrendingUp, TrendingDown } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
@@ -17,6 +17,21 @@ const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
 type SiteName = typeof SITES[number];
 type SortKey = "name" | "brand" | "spread" | SiteName;
 
+function initialMinSites(value: string | null): number {
+  const parsed = Number(value);
+  return [1, 2, 3].includes(parsed) ? parsed : 2;
+}
+
+function initialSort(value: string | null): { key: SortKey; dir: "asc" | "desc" } {
+  const [key, dir] = (value ?? "spread:desc").split(":");
+  return {
+    key: (["name", "brand", "spread", ...SITES] as string[]).includes(key)
+      ? (key as SortKey)
+      : "spread",
+    dir: dir === "asc" ? "asc" : "desc",
+  };
+}
+
 export default function ComparisonPage() {
   const t = useTranslations("comparison");
   const tCommon = useTranslations("common");
@@ -24,17 +39,23 @@ export default function ComparisonPage() {
   const router = useRouter();
   // Drill-down из /category-comparison: фильтр по категории товара-клиента.
   const category = searchParams.get("category");
-  const [search, setSearch] = useState("");
+  const urlSearch = searchParams.get("search") ?? "";
+  const [search, setSearch] = useState(urlSearch);
+  useEffect(() => setSearch(urlSearch), [urlSearch]);
   const debouncedSearch = useDebounce(search, 300);
-  const [minSites, setMinSites] = useState(2);
-  const [diffOnly, setDiffOnly] = useState(false);
-  const [withAloe, setWithAloe] = useState(false);
+  const minSites = initialMinSites(searchParams.get("min_sites"));
+  const diffOnly = searchParams.get("diff") === "1";
+  const withAloe = searchParams.get("aloe") === "1";
   const [expandedId, setExpandedId] = useState<number | null>(null);
-  const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({
-    key: "spread",
-    dir: "desc",
-  });
+  const sort = initialSort(searchParams.get("sort"));
   const queryClient = useQueryClient();
+
+  function updateQuery(key: string, value: string | null) {
+    const next = new URLSearchParams(searchParams.toString());
+    value ? next.set(key, value) : next.delete(key);
+    const target = next.toString();
+    router.replace(target ? `/comparison?${target}` : "/comparison", { scroll: false });
+  }
 
   const { data, isLoading, error, isFetching } = useQuery({
     queryKey: ["comparison", debouncedSearch, minSites, category],
@@ -74,11 +95,10 @@ export default function ComparisonPage() {
   }, [data, diffOnly, withAloe, sort]);
 
   function toggleSort(key: SortKey) {
-    setSort((cur) =>
-      cur.key === key
-        ? { key, dir: cur.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: key === "name" || key === "brand" ? "asc" : "desc" },
-    );
+    const next = sort.key === key
+      ? { key, dir: sort.dir === "asc" ? "desc" : "asc" }
+      : { key, dir: key === "name" || key === "brand" ? "asc" : "desc" };
+    updateQuery("sort", next.key === "spread" && next.dir === "desc" ? null : `${next.key}:${next.dir}`);
   }
 
   // P1.2: auto-collapse колонок без данных в текущем срезе. Например когда
@@ -191,7 +211,7 @@ export default function ComparisonPage() {
         <button
           onClick={handleExportCsv}
           disabled={!filtered || filtered.length === 0}
-          className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="shrink-0 inline-flex min-h-11 items-center gap-1.5 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
           title={t("export_csv_title")}
         >
           ⬇ CSV
@@ -199,19 +219,24 @@ export default function ComparisonPage() {
       </div>
 
       {/* Filters */}
-      <div className="flex flex-col md:flex-row gap-2">
+      <div className="flex flex-col gap-2 md:flex-row md:flex-wrap">
         <input
           type="search"
           placeholder={t("search_placeholder")}
+          aria-label={t("search_label")}
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          onChange={(e) => {
+            setSearch(e.target.value);
+            updateQuery("search", e.target.value || null);
+          }}
+          className="min-h-11 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9 md:min-w-64"
           data-testid="search-input"
         />
         <select
           value={minSites}
-          onChange={(e) => setMinSites(Number(e.target.value))}
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+          onChange={(e) => updateQuery("min_sites", e.target.value === "2" ? null : e.target.value)}
+          aria-label={t("min_sites_label")}
+          className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           data-testid="min-sites-select"
         >
           <option value={3}>{t("min_sites_3")}</option>
@@ -222,9 +247,9 @@ export default function ComparisonPage() {
           value={`${sort.key}:${sort.dir}`}
           onChange={(e) => {
             const [k, d] = e.target.value.split(":");
-            setSort({ key: k as SortKey, dir: d as "asc" | "desc" });
+            updateQuery("sort", k === "spread" && d === "desc" ? null : `${k}:${d}`);
           }}
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+          className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           data-testid="sort-select"
           title={t("sort_label")}
           aria-label={t("sort_label")}
@@ -244,6 +269,22 @@ export default function ComparisonPage() {
             <option value="aloe:desc">aloe ↓</option>
           </optgroup>
         </select>
+        <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9">
+          <input
+            type="checkbox"
+            checked={diffOnly}
+            onChange={(e) => updateQuery("diff", e.target.checked ? "1" : null)}
+          />
+          <span>{t("diff_only_filter")}</span>
+        </label>
+        <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9">
+          <input
+            type="checkbox"
+            checked={withAloe}
+            onChange={(e) => updateQuery("aloe", e.target.checked ? "1" : null)}
+          />
+          <span>{t("with_aloe_filter")}</span>
+        </label>
       </div>
 
       {/* Drill-down filter chip (из /category-comparison) */}
@@ -252,7 +293,12 @@ export default function ComparisonPage() {
           <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 text-primary px-3 py-1">
             {t("category_filter", { category })}
             <button
-              onClick={() => router.replace("/comparison")}
+              onClick={() => {
+                const next = new URLSearchParams(searchParams.toString());
+                next.delete("category");
+                const target = next.toString();
+                router.replace(target ? `/comparison?${target}` : "/comparison");
+              }}
               aria-label={t("category_filter_clear")}
               title={t("category_filter_clear")}
               className="hover:text-primary/70"

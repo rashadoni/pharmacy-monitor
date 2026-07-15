@@ -1,0 +1,180 @@
+# Pharmacy Monitor — Product & UI audit
+
+Baseline: `58bd278f` · production and source review · RU/AZ · desktop/mobile.
+
+## Audit health score
+
+| Dimension | Score | Key finding |
+|---|---:|---|
+| Accessibility | 1/4 | Unlabelled filters/searches, non-semantic clickable table row, missing skip link, sub-44px targets |
+| Performance | 3/4 | Pagination limits the matcher; analytics error handling and chart payloads need hardening |
+| Responsive design | 2/4 | Layout generally fits 390px, but dense controls and touch targets are undersized |
+| Theming | 3/4 | Tokens and dark palette exist; body font and native color-scheme are incomplete |
+| Anti-patterns | 2/4 | Browser-serif product UI, hero metric cards and mixed-language operational copy reduce trust |
+| **Total** | **11/20** | **Acceptable — significant trust and accessibility work required** |
+
+Anti-pattern verdict: the information architecture is familiar and restrained, but the
+unintentional serif rendering and English/Russian/Azerbaijani mixing make the product
+look unfinished rather than intentionally designed.
+
+## Executive summary
+
+- P0: 0
+- P1: 9
+- P2: 7
+- P3: 2
+- Positive baseline: stable sidebar/bottom navigation, useful empty states, locale-aware
+  number/date helpers, fail-closed ROI cache, responsive tables, deterministic RU/AZ
+  category labels, and paginated matcher results.
+
+## P1 findings
+
+1. **AI confidence mixes products and matches.**
+   - Location: `src/api.py` normalize stats; `frontend/src/app/[locale]/(dashboard)/overview/page.tsx`.
+   - Impact: the displayed 99.8% subtracts a count of suspect Match rows from a count of
+     Product rows. The percentage is dimensionally invalid and can overstate extraction quality.
+   - Fix: expose products-in-review and matches-in-review separately; compute the KPI only
+     from product counts.
+
+2. **Financial recommendation provenance is not visible.**
+   - Location: overview and site ROI sections.
+   - Impact: the UI shows latest partial Run #444 next to recommendations materialized from
+     verified full Run #443 without identifying the recommendation source.
+   - Fix: expose and display the verified full-catalog run id/time.
+
+3. **Primary RU/AZ copy mixes languages.**
+   - Location: `frontend/messages/ru.json`, `frontend/messages/az.json`.
+   - Examples: `Cross-site matches`, `Coverage`, `Products`, `AI confidence`, `Started`,
+     `Status`, `Manual matcher`, `name+brand similarity`.
+   - Impact: violates the product's explicit first-class RU/AZ contract and obscures meaning.
+
+4. **Product UI renders in the browser's serif default.**
+   - Location: `frontend/src/app/globals.css`.
+   - Evidence: production desktop/mobile screenshots render headings, labels and data in serif;
+     `font-sans` is configured but never applied to `body`.
+   - Impact: inconsistent density, weaker scanability and visibly unfinished product UI.
+
+5. **Locale switching loses query context.**
+   - Location: `frontend/src/components/locale-switcher.tsx`.
+   - Impact: switching RU/AZ on filtered comparison/matcher routes drops category, site, mode,
+     and other query state, contradicting the design principle “preserve working context”.
+
+6. **Analytics navigation is mouse-only.**
+   - Location: `frontend/src/app/[locale]/(dashboard)/analytics/page.tsx` price-index rows.
+   - Impact: `<tr onClick>` is not a link, cannot be opened with keyboard/Cmd-click, and has no
+     semantic destination.
+
+7. **Important form controls lack accessible names.**
+   - Location: comparison filters, matcher category/search controls, alerts filters.
+   - Production audit found the matcher category select and repeated search inputs without
+     labels; comparison search and min-sites select are also unlabelled.
+
+8. **Quick Actions is not an accessible menu.**
+   - Location: `frontend/src/components/quick-actions.tsx`.
+   - Impact: no `aria-expanded`/`aria-controls`, no Escape/focus management; click-away uses a
+     clickable `<div>`; feedback is clickable rather than providing a named dismiss action.
+
+9. **Analytics forecast hides transport/API failures.**
+   - Location: `frontend/src/app/[locale]/(dashboard)/analytics/page.tsx`.
+   - Impact: raw `fetch(...).then(r.json())` accepts non-2xx responses and the section has no
+     actionable error state.
+
+## P2 findings
+
+- Comparison, alerts, categories and site catalog keep important filters in component state
+  instead of the URL; reload/share/back loses working context.
+- Desktop nav links are 36px high; locale buttons are 28px; matcher actions are often 20–38px.
+  Mobile touch targets should be at least 44px.
+- Dashboard layout has `main#main-content` but no visible-on-focus skip link.
+- Bottom navigation has 6 dense items at 10px; all fit 390px but scanability is weak.
+- KPI labels use tiny uppercase tracked text and generic hero-metric cards.
+- `<html>` does not set `color-scheme` for dark mode native controls.
+- Status/severity values such as `ok`, `degraded`, `Critical`, `Warning` are not consistently localized.
+
+## Fix order
+
+1. Trust metrics and recommendation provenance.
+2. RU/AZ operational copy and locale query preservation.
+3. Semantic navigation, labels, menu/focus behavior and skip link.
+4. Analytics error handling.
+5. URL-backed filter state and touch-target polish.
+
+Re-run this audit after the P1 pass and record unresolved P2/P3 explicitly rather than
+claiming full visual parity.
+
+## Remediation pass — 2026-07-12
+
+All nine P1 findings are addressed in the isolated implementation:
+
+- The overview no longer calls price-spread review an AI extraction-confidence metric.
+  It reports the dimensionally valid share of Product rows belonging to suspicious-price
+  Match clusters; Product and Match review counts remain separate in the API.
+- Recommendations and their verified full-catalog run provenance now come from one
+  validated cache snapshot and one HTTP response, so labels cannot drift across runs.
+- RU/AZ operational copy, the default sans font, locale query preservation, semantic
+  analytics links, accessible form names, the Quick Actions menu, and analytics error/retry
+  states are fixed.
+- The dashboard now has a keyboard skip link, light/dark native `color-scheme`, a global
+  reduced-motion fallback, and 44px mobile targets for the audited controls.
+- Comparison search, minimum-site filter, sort, price-difference filter, aloe filter and
+  category drill-down are URL-backed and survive locale switch, reload and sharing.
+
+## P2/P3 closure — 2026-07-12
+
+The remaining scoped audit findings are closed in `8f9b79d8` and the production visual-QA
+follow-up `81c969a8`:
+
+- Alerts, category administration and site-catalog filters are URL-backed. Search uses
+  history replacement; tabs, selects, checkboxes and pagination create Back/Forward history.
+  Invalid enum/integer inputs fail closed, stale select values remain visible instead of
+  silently presenting “All”, and out-of-range catalog pages canonicalize to the actual range.
+- Alert bulk selection is cleared when URL filter history changes, preventing actions against
+  IDs that are no longer visible.
+- Mobile navigation is now five 64px targets. Secondary routes are in an accessible “More”
+  menu with localized grouping and current-page state.
+- Generic repeated KPI cards were replaced by a compact semantic metric strip on overview,
+  site and category-comparison pages.
+- Alerts, categories and site catalog use an announced error state with an explicit retry.
+  Route-level fault injection verifies that Retry makes a new request on all three pages.
+- RU/AZ interface prose in the audited surfaces is localized. Production visual QA caught and
+  removed the last hardcoded `prod`; persisted identifiers (`SKU`, `URL`, rule/category keys,
+  site names) intentionally remain unchanged.
+
+Production verification completed on 2026-07-12:
+
+- CI passed backend pytest, Ruff, frontend typecheck and production build for the final
+  code revision; the fail-closed Hetzner deploy passed DB-revision, writable-path,
+  least-privilege restart, migration-head, build/restart and health gates.
+- Public smoke passed 9/9 checks. API and frontend services are active; `/health` reports
+  all three sites fresh and `full_catalog_verified=true`.
+- At 1280px the overview has no main horizontal overflow, uses the resolved
+  `ui-sans-serif, system-ui, sans-serif` stack, identifies recommendations as sourced from
+  verified full run #443, and separately shows partial run #444 in run history.
+- At 390×844 the comparison page has no horizontal overflow; switching RU→AZ preserves
+  search, minimum-site, diff, aloe and sort query parameters. The URL, `<html lang>`,
+  visible copy and accessible labels all switch to Azerbaijani.
+- At 390×844 the AZ matcher has `body.scrollWidth === viewport width === 390`, Azerbaijani
+  category labels, a localized site-selector group with `aria-pressed` state, and 44–56px
+  control targets.
+
+Final verification for `81c969a8`:
+
+- Local: Vitest 20/20, Chromium P2/P3 E2E 4/4 at 390×844, TypeScript and Next production
+  build. E2E covers RU/AZ, reload, Back/Forward, stale URL values, out-of-range pagination,
+  Retry request counters, five ≥44px navigation targets and horizontal-overflow metrics.
+- CI: frontend, Ruff and full pytest jobs passed. Two fail-closed deploys passed preflight,
+  single migration-head, build/restart and health gates with migrations explicitly disabled.
+- Public smoke passed 9/9 after the final deploy.
+- Production mobile DOM: `clientWidth === scrollWidth === 390`; bottom navigation is five
+  64px targets; RU alert filter values match the URL; AZ category filters survive navigation;
+  the suggestions row renders `169 məhsul`; stale catalog category/brand remain visible and
+  `page=10000` is removed after canonicalization.
+- Production desktop DOM: 1280px without overflow, the system sans stack is active, and the
+  overview metric strip is a semantic `dl` containing the four audited metrics.
+
+Scoped post-deploy re-score: accessibility 4/4, performance 4/4, responsive design 4/4,
+theming 4/4, anti-patterns 4/4 — **20/20 confirmed for this audit scope**.
+
+Operational caveat outside the UI score: `/health` currently reports `degraded` because the
+latest Run is degraded. All three sites are within freshness SLA and
+`full_catalog_verified=true`; the UI deployment did not create this run-quality state.

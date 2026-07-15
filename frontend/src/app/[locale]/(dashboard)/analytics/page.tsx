@@ -14,9 +14,10 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { useTranslations } from "next-intl";
-import { useRouter } from "@/i18n/navigation";
-import { api, type PriceIndexRow } from "@/lib/api";
+import { useLocale, useTranslations } from "next-intl";
+import { Link } from "@/i18n/navigation";
+import { useState } from "react";
+import { api, type CategoryComparisonRow, type ForecastMover } from "@/lib/api";
 
 const SITE_COLORS: Record<string, string> = {
   pharmonline: "#3b82f6",
@@ -45,7 +46,7 @@ export default function AnalyticsPage() {
 
 function MatchQualitySection() {
   const t = useTranslations("analytics");
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["match-quality"],
     queryFn: api.matchQuality,
   });
@@ -53,6 +54,7 @@ function MatchQualitySection() {
   return (
     <Card title={t("match_quality")}>
       {isLoading && <Skeleton />}
+      {isError && <QueryError onRetry={() => refetch()} />}
       {data && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <Stat label={t("stat_total")} value={data.total_matches} />
@@ -68,7 +70,7 @@ function MatchQualitySection() {
 
 function BrandShareSection() {
   const t = useTranslations("analytics");
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["brand-share"],
     queryFn: () => api.brandShare({ top_n: 15 }),
   });
@@ -83,6 +85,7 @@ function BrandShareSection() {
   return (
     <Card title={t("brand_share")}>
       {isLoading && <Skeleton />}
+      {isError && <QueryError onRetry={() => refetch()} />}
       {chartData && chartData.length > 0 && (
         <ResponsiveContainer width="100%" height={Math.max(320, chartData.length * 28)}>
           <BarChart data={chartData} layout="vertical" margin={{ top: 4, right: 24, left: 8, bottom: 4 }}>
@@ -108,18 +111,21 @@ function BrandShareSection() {
 
 function PriceIndexSection() {
   const t = useTranslations("analytics");
-  const router = useRouter();
+  const locale = useLocale();
+  const [page, setPage] = useState(0);
+  const pageSize = 25;
   // 2026-05-29: было raw fetch → 500 (бэкенд бросал TypeError, см. analytics.py).
   // Теперь api.priceIndex() (typed, request() кидает на non-2xx) + строки
   // кликабельны: drill в /comparison?category=. Полная версия — /category-comparison.
-  const { data, isLoading } = useQuery({
-    queryKey: ["price-index"],
-    queryFn: () => api.priceIndex(),
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ["category-comparison", locale],
+    queryFn: () => api.categoryComparison(undefined, locale),
   });
 
   return (
     <Card title={t("price_index")}>
       {isLoading && <Skeleton />}
+      {isError && <QueryError onRetry={() => refetch()} />}
       {data && data.length === 0 && (
         <div className="text-muted-foreground text-center py-8">
           {t("no_categories")}
@@ -139,17 +145,17 @@ function PriceIndexSection() {
             </tr>
           </thead>
           <tbody>
-            {data.map((row: PriceIndexRow, i: number) => (
-              <tr
-                key={i}
-                onClick={() =>
-                  row.category &&
-                  router.push(`/comparison?category=${encodeURIComponent(row.category)}`)
-                }
-                className="border-b border-border last:border-0 cursor-pointer hover:bg-muted/30"
-                title={t("price_index_drill_hint")}
-              >
-                <td className="px-3 py-2">{row.category}</td>
+            {data.slice(page * pageSize, (page + 1) * pageSize).map((row: CategoryComparisonRow) => (
+              <tr key={row.category} className="border-b border-border last:border-0">
+                <td className="px-3 py-2">
+                  <Link
+                    href={`/comparison?category=${encodeURIComponent(row.category)}`}
+                    className="rounded-sm font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    title={t("price_index_drill_hint")}
+                  >
+                    {row.label}
+                  </Link>
+                </td>
                 <td className="px-3 py-2 text-right tabular-nums">
                   {row.avg_client_price?.toFixed(2)}
                 </td>
@@ -166,31 +172,23 @@ function PriceIndexSection() {
             ))}
           </tbody>
         </table>
+        {data.length > pageSize && (
+          <div className="flex items-center justify-between border-t border-border px-3 py-2 text-xs">
+            <span className="text-muted-foreground">{t("page_range", { from: page * pageSize + 1, to: Math.min(data.length, (page + 1) * pageSize), total: data.length })}</span>
+            <div className="flex gap-2"><button type="button" disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))} className="min-h-11 rounded border border-border px-3 disabled:opacity-40 md:min-h-8">{t("page_previous")}</button><button type="button" disabled={(page + 1) * pageSize >= data.length} onClick={() => setPage((value) => value + 1)} className="min-h-11 rounded border border-border px-3 disabled:opacity-40 md:min-h-8">{t("page_next")}</button></div>
+          </div>
+        )}
         </div>
       )}
     </Card>
   );
 }
 
-interface ForecastMover {
-  product_id: number;
-  site: string;
-  name: string;
-  n_points: number;
-  first_price: number;
-  last_price: number;
-  change_pct: number;
-  direction: "rising" | "falling" | "stable";
-  forecast_7d_price: number;
-  confidence: "low" | "medium" | "high";
-}
-
 function ForecastSection() {
   const t = useTranslations("analytics");
-  const { data, isLoading } = useQuery<ForecastMover[]>({
+  const { data, isLoading, isError, refetch } = useQuery<ForecastMover[]>({
     queryKey: ["forecast"],
-    queryFn: () =>
-      fetch("/api/v1/dash/forecast/movers", { credentials: "include" }).then((r) => r.json()),
+    queryFn: api.forecastMovers,
   });
 
   // Фильтр аномальных движений: ±50% за 30 дней — крайний предел разумного для
@@ -203,7 +201,7 @@ function ForecastSection() {
 
   // Если данных вовсе нет — не рендерим раздел, чтобы не было placeholder'а
   // «появится через N дней». Forecast вернётся когда наберётся ≥3 прогона.
-  if (!isLoading && clean.length === 0) {
+  if (!isLoading && !isError && clean.length === 0) {
     return null;
   }
 
@@ -213,6 +211,7 @@ function ForecastSection() {
         {t("forecast_desc")}
       </div>
       {isLoading && <Skeleton />}
+      {isError && <QueryError onRetry={() => refetch()} />}
       {clean.length > 0 && (
         <div className="space-y-2">
           {clean.slice(0, 10).map((m) => (
@@ -243,7 +242,11 @@ function ForecastRow({ mover }: { mover: ForecastMover }) {
             {mover.name}
           </div>
           <div className="text-xs text-muted-foreground mt-0.5">
-            {t("forecast_row_meta", { site: mover.site, n: mover.n_points, conf: mover.confidence })}
+            {t("forecast_row_meta", {
+              site: mover.site,
+              n: mover.n_points,
+              conf: t(`confidence_${mover.confidence}`),
+            })}
           </div>
         </div>
         <div className={`text-right shrink-0 ${dirColor}`}>
@@ -255,7 +258,7 @@ function ForecastRow({ mover }: { mover: ForecastMover }) {
           </div>
         </div>
       </div>
-      {mover.forecast_7d_price > 0 && (
+      {mover.forecast_7d_price != null && mover.forecast_7d_price > 0 && (
         <div className="text-xs text-muted-foreground mt-1.5 pt-1.5 border-t border-border/50">
           {t("forecast_7d")} <span className="font-mono">{mover.forecast_7d_price.toFixed(2)} ₼</span>
         </div>
@@ -286,7 +289,7 @@ function Stat({
 }) {
   return (
     <div>
-      <div className="text-xs text-muted-foreground uppercase tracking-wide">{label}</div>
+      <div className="text-sm font-medium text-muted-foreground">{label}</div>
       <div className="text-2xl font-semibold mt-1 tabular-nums">{value}</div>
       {sub && <div className="text-xs text-muted-foreground mt-0.5">{sub}</div>}
     </div>
@@ -298,6 +301,22 @@ function Skeleton() {
     <div className="animate-pulse space-y-2">
       <div className="h-4 bg-muted rounded w-full"></div>
       <div className="h-4 bg-muted rounded w-3/4"></div>
+    </div>
+  );
+}
+
+function QueryError({ onRetry }: { onRetry: () => void }) {
+  const t = useTranslations("common");
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+      <span>{t("error")}</span>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="min-h-11 rounded-md border border-destructive/40 px-3 py-1.5 hover:bg-destructive/10 md:min-h-9"
+      >
+        {t("retry")}
+      </button>
     </div>
   );
 }

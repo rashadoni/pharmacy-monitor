@@ -2,11 +2,20 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Lightbulb, Pencil, Play, Plus, Trash2, X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
 import { api, friendlyError, type CategoryRow, type CategorySuggestion } from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { formatNumber, formatTime } from "@/lib/utils";
+import { isTerminalRunStatus, scrapeResultTextClass } from "@/lib/run-quality";
+import { QueryErrorState } from "@/components/query-error-state";
+import { useRouter } from "@/i18n/navigation";
+import { choiceParam, integerParam, queryWithPatch } from "@/lib/filter-query";
+
+const CATEGORY_SITES = ["pharmonline", "aptekonline", "aloe"] as const;
+const CATEGORY_PAGE_SIZE = 50;
+type CategorySite = (typeof CATEGORY_SITES)[number];
 
 /**
  * Извлечь slug категории из URL для каждого сайта.
@@ -70,49 +79,84 @@ function slugify(s: string): string {
 export default function CategoriesPage() {
   const t = useTranslations("categories");
   const tCommon = useTranslations("common");
-  const [search, setSearch] = useState("");
-  const [siteFilter, setSiteFilter] = useState<"" | "pharmonline" | "aptekonline" | "aloe">("");
-  const [activeOnly, setActiveOnly] = useState(false);
-  const [crossFilter, setCrossFilter] = useState<"" | "cross2" | "cross3">("");
+  const locale = useLocale();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const queryRef = useRef(searchParams.toString());
+  useEffect(() => {
+    queryRef.current = searchParams.toString();
+  }, [searchParams]);
+  const parsedParams = new URLSearchParams(searchParams.toString());
+  const urlSearch = searchParams.get("q") ?? "";
+  const [search, setSearch] = useState(urlSearch);
+  useEffect(() => setSearch(urlSearch), [urlSearch]);
+  const siteFilter = choiceParam(
+    parsedParams,
+    "site",
+    ["", ...CATEGORY_SITES] as const,
+    "",
+  );
+  const activeOnly = searchParams.get("active") === "1";
+  const crossFilter = choiceParam(
+    parsedParams,
+    "coverage",
+    ["", "cross2", "cross3"] as const,
+    "",
+  );
+  const view = choiceParam(
+    parsedParams,
+    "view",
+    ["list", "suggestions"] as const,
+    "list",
+  );
+  const siteA = choiceParam(parsedParams, "site_a", CATEGORY_SITES, "pharmonline");
+  const requestedSiteB = choiceParam(parsedParams, "site_b", CATEGORY_SITES, "aptekonline");
+  const siteB = requestedSiteB === siteA
+    ? CATEGORY_SITES.find((candidate) => candidate !== siteA) ?? "aptekonline"
+    : requestedSiteB;
+  const minOverlap = integerParam(parsedParams, "overlap", 5, { min: 2, max: 50 });
+  const offset = integerParam(parsedParams, "offset", 0);
   const [showAdd, setShowAdd] = useState(false);
   const [editing, setEditing] = useState<CategoryRow | null>(null);
   const queryClient = useQueryClient();
 
-  const { data, isLoading } = useQuery({
-    queryKey: ["categories"],
-    queryFn: api.categories,
+  function updateFilters(
+    patch: Record<string, string | number | boolean | null>,
+    history: "push" | "replace" = "push",
+  ) {
+    const normalizedPatch = Object.prototype.hasOwnProperty.call(patch, "offset")
+      ? patch
+      : { ...patch, offset: null };
+    const query = queryWithPatch(queryRef.current, normalizedPatch);
+    queryRef.current = query;
+    const href = query ? `/categories?${query}` : "/categories";
+    router[history](href, { scroll: false });
+  }
+
+  const { data, isLoading, isError, error, refetch } = useQuery({
+    queryKey: ["categories", search, siteFilter, activeOnly, crossFilter, offset],
+    queryFn: () => api.categoriesPage({
+      search: search || undefined,
+      site: siteFilter || undefined,
+      active_only: activeOnly,
+      coverage: crossFilter || undefined,
+      offset,
+      limit: CATEGORY_PAGE_SIZE,
+    }),
   });
 
-  const filtered = (data ?? []).filter((c) => {
-    if (search && !`${c.label_ru} ${c.label_az ?? ""} ${c.key}`.toLowerCase().includes(search.toLowerCase())) {
-      return false;
-    }
-    if (siteFilter === "pharmonline" && !c.pharmonline_slug) return false;
-    if (siteFilter === "aptekonline" && !c.aptekonline_slug) return false;
-    if (siteFilter === "aloe" && !c.aloe_slug) return false;
-    if (activeOnly && !c.is_active) return false;
-    if (crossFilter === "cross2" && !(c.pharmonline_slug && c.aptekonline_slug)) return false;
-    if (crossFilter === "cross3" && !(c.pharmonline_slug && c.aptekonline_slug && c.aloe_slug)) return false;
-    return true;
-  });
+  const filtered = data?.items ?? [];
 
   // Категория «cross-2» — у неё есть pharm+apt-slug'и (двусторонний кейс).
   // «cross-3» — pharm+apt+aloe (полный треугольник, редко).
-  const stats = {
-    total: data?.length ?? 0,
-    active: data?.filter((c) => c.is_active).length ?? 0,
-    cross2: data?.filter((c) => c.pharmonline_slug && c.aptekonline_slug).length ?? 0,
-    cross3: data?.filter((c) => c.pharmonline_slug && c.aptekonline_slug && c.aloe_slug).length ?? 0,
-    pharmonline: data?.filter((c) => c.pharmonline_slug).length ?? 0,
-    aptekonline: data?.filter((c) => c.aptekonline_slug).length ?? 0,
-    aloe: data?.filter((c) => c.aloe_slug).length ?? 0,
+  const stats = data?.stats ?? {
+    total: 0, active: 0, cross2: 0, cross3: 0,
+    pharmonline: 0, aptekonline: 0, aloe: 0,
   };
-
-  const [view, setView] = useState<"list" | "suggestions">("list");
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
           <p className="text-sm text-muted-foreground">
@@ -123,7 +167,7 @@ export default function CategoriesPage() {
           <TriggerScrapeButton />
           <button
             onClick={() => setShowAdd(true)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary text-primary-foreground px-3 py-2 text-sm font-medium hover:bg-primary/90"
+            className="inline-flex min-h-11 items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 md:min-h-9"
           >
             <Plus className="h-4 w-4" />
             {t("add_button")}
@@ -134,8 +178,9 @@ export default function CategoriesPage() {
       {/* P1.1 Tabs: Список / Suggested mappings */}
       <div className="flex items-center gap-1 border-b border-border">
         <button
-          onClick={() => setView("list")}
-          className={`inline-flex items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+          onClick={() => updateFilters({ view: null })}
+          aria-pressed={view === "list"}
+          className={`-mb-px inline-flex min-h-11 items-center gap-2 border-b-2 px-4 py-2 text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
             view === "list"
               ? "border-primary text-foreground font-medium"
               : "border-transparent text-muted-foreground hover:text-foreground"
@@ -144,8 +189,9 @@ export default function CategoriesPage() {
           {t("view_list_tab", { total: stats.total })}
         </button>
         <button
-          onClick={() => setView("suggestions")}
-          className={`inline-flex items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+          onClick={() => updateFilters({ view: "suggestions" })}
+          aria-pressed={view === "suggestions"}
+          className={`-mb-px inline-flex min-h-11 items-center gap-2 border-b-2 px-4 py-2 text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
             view === "suggestions"
               ? "border-primary text-foreground font-medium"
               : "border-transparent text-muted-foreground hover:text-foreground"
@@ -156,7 +202,14 @@ export default function CategoriesPage() {
         </button>
       </div>
 
-      {view === "suggestions" ? <SuggestionsPanel /> : (
+      {view === "suggestions" ? (
+        <SuggestionsPanel
+          siteA={siteA}
+          siteB={siteB}
+          minOverlap={minOverlap}
+          onUpdate={updateFilters}
+        />
+      ) : (
       <>
       {showAdd && <CategoryForm onClose={() => setShowAdd(false)} />}
       {editing && (
@@ -182,14 +235,19 @@ export default function CategoriesPage() {
         <input
           type="search"
           placeholder={t("search_placeholder")}
+          aria-label={t("search_label")}
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm"
+          onChange={(e) => {
+            setSearch(e.target.value);
+            updateFilters({ q: e.target.value || null }, "replace");
+          }}
+          className="min-h-11 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
         />
         <select
           value={siteFilter}
-          onChange={(e) => setSiteFilter(e.target.value as any)}
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+          onChange={(e) => updateFilters({ site: e.target.value || null })}
+          aria-label={t("site_filter_label")}
+          className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
         >
           <option value="">{t("filter_all")}</option>
           <option value="pharmonline">pharmonline</option>
@@ -198,18 +256,19 @@ export default function CategoriesPage() {
         </select>
         <select
           value={crossFilter}
-          onChange={(e) => setCrossFilter(e.target.value as any)}
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+          onChange={(e) => updateFilters({ coverage: e.target.value || null })}
+          aria-label={t("coverage_filter_label")}
+          className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
         >
           <option value="">{t("filter_any_coverage")}</option>
           <option value="cross2">{t("filter_cross2")}</option>
           <option value="cross3">{t("filter_cross3")}</option>
         </select>
-        <label className="inline-flex items-center gap-2 px-3 text-sm">
+        <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md px-3 text-sm hover:bg-muted/50 md:min-h-9">
           <input
             type="checkbox"
             checked={activeOnly}
-            onChange={(e) => setActiveOnly(e.target.checked)}
+            onChange={(e) => updateFilters({ active: e.target.checked })}
             className="rounded"
           />
           {t("only_active")}
@@ -217,6 +276,13 @@ export default function CategoriesPage() {
       </div>
 
       {isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
+      {isError && (
+        <QueryErrorState
+          message={friendlyError(error, locale)}
+          retryLabel={tCommon("retry")}
+          onRetry={() => refetch()}
+        />
+      )}
 
       {/* Mobile-fix 2026-05-28: было overflow-hidden → 7-колонная таблица
           обрезалась на 375px. overflow-x-auto + min-w на table — пользователь
@@ -249,7 +315,19 @@ export default function CategoriesPage() {
         </table>
       </div>
 
-      {filtered.length === 0 && !isLoading && (
+      {data && data.total > CATEGORY_PAGE_SIZE && (
+        <div className="flex items-center justify-between gap-3 text-sm">
+          <span className="text-muted-foreground">
+            {t("page_range", { from: offset + 1, to: Math.min(data.total, offset + CATEGORY_PAGE_SIZE), total: data.total })}
+          </span>
+          <div className="flex gap-2">
+            <button type="button" disabled={offset === 0} onClick={() => updateFilters({ offset: Math.max(0, offset - CATEGORY_PAGE_SIZE) || null })} className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9">{t("page_previous")}</button>
+            <button type="button" disabled={offset + CATEGORY_PAGE_SIZE >= data.total} onClick={() => updateFilters({ offset: offset + CATEGORY_PAGE_SIZE })} className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9">{t("page_next")}</button>
+          </div>
+        </div>
+      )}
+
+      {filtered.length === 0 && !isLoading && !isError && (
         <div className="text-muted-foreground text-center py-4">
           {t("empty")}
         </div>
@@ -260,17 +338,23 @@ export default function CategoriesPage() {
   );
 }
 
-function SuggestionsPanel() {
+function SuggestionsPanel({
+  siteA,
+  siteB,
+  minOverlap,
+  onUpdate,
+}: {
+  siteA: CategorySite;
+  siteB: CategorySite;
+  minOverlap: number;
+  onUpdate: (patch: Record<string, string | number | boolean | null>) => void;
+}) {
   const t = useTranslations("categories");
+  const tCommon = useTranslations("common");
   const locale = useLocale();
-  const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
-  type Site = (typeof SITES)[number];
-  const [siteA, setSiteA] = useState<Site>("pharmonline");
-  const [siteB, setSiteB] = useState<Site>("aptekonline");
-  const [minOverlap, setMinOverlap] = useState(5);
   const queryClient = useQueryClient();
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["category-suggestions", siteA, siteB, minOverlap],
     queryFn: () => api.categorySuggestions({ site_a: siteA, site_b: siteB, min_overlap: minOverlap }),
     enabled: siteA !== siteB,
@@ -278,9 +362,9 @@ function SuggestionsPanel() {
 
   const mapMutation = useMutation({
     mutationFn: (payload: {
-      site_a: Site;
+      site_a: CategorySite;
       site_a_slug: string;
-      site_b: Site;
+      site_b: CategorySite;
       site_b_slug: string;
     }) => api.categoryMappingCreate(payload),
     onSuccess: () => {
@@ -305,28 +389,43 @@ function SuggestionsPanel() {
         {t("suggestions_explainer")}
       </div>
 
-      <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-        <SiteSelector value={siteA} onChange={setSiteA} label={t("site_a_label")} disabled={siteB} />
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+        <SiteSelector
+          value={siteA}
+          onChange={(value) => onUpdate({ site_a: value === "pharmonline" ? null : value })}
+          label={t("site_a_label")}
+          disabled={siteB}
+        />
         <span className="text-muted-foreground">↔</span>
-        <SiteSelector value={siteB} onChange={setSiteB} label={t("site_b_label")} disabled={siteA} />
-        <label className="inline-flex items-center gap-2 text-sm ml-auto">
+        <SiteSelector
+          value={siteB}
+          onChange={(value) => onUpdate({ site_b: value === "aptekonline" ? null : value })}
+          label={t("site_b_label")}
+          disabled={siteA}
+        />
+        <label className="ml-auto inline-flex min-h-11 items-center gap-2 text-sm">
           {t("min_overlap_label")}
           <input
             type="number"
             value={minOverlap}
             min={2}
             max={50}
-            onChange={(e) => setMinOverlap(Number(e.target.value) || 3)}
-            className="w-16 rounded-md border border-input bg-background px-2 py-1 text-sm"
+            onChange={(e) => {
+              const value = Math.min(50, Math.max(2, Number(e.target.value) || 5));
+              onUpdate({ overlap: value === 5 ? null : value });
+            }}
+            className="min-h-11 w-20 rounded-md border border-input bg-background px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           />
         </label>
       </div>
 
       {isLoading && <div className="text-sm text-muted-foreground py-4">{t("searching_overlaps")}</div>}
       {error && (
-        <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive">
-          {friendlyError(error, locale)}
-        </div>
+        <QueryErrorState
+          message={friendlyError(error, locale)}
+          retryLabel={tCommon("retry")}
+          onRetry={() => refetch()}
+        />
       )}
       {!isLoading && data && notMapped.length === 0 && mapped.length === 0 && (
         <div className="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
@@ -365,13 +464,13 @@ function SuggestionsPanel() {
                   <td className="px-4 py-2 font-mono text-xs">
                     {s.site_a_slug}
                     <div className="text-[10px] text-muted-foreground/70">
-                      {s.site_a_products} prod
+                      {t("suggestions_products_count", { count: s.site_a_products })}
                     </div>
                   </td>
                   <td className="px-4 py-2 font-mono text-xs">
                     {s.site_b_slug}
                     <div className="text-[10px] text-muted-foreground/70">
-                      {s.site_b_products} prod
+                      {t("suggestions_products_count", { count: s.site_b_products })}
                     </div>
                   </td>
                   <td className="px-4 py-2 text-right tabular-nums font-semibold">
@@ -391,7 +490,7 @@ function SuggestionsPanel() {
                         })
                       }
                       disabled={mapMutation.isPending}
-                      className="inline-flex items-center gap-1 rounded bg-primary text-primary-foreground px-2 py-1 text-xs font-medium hover:bg-primary/90 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      className="inline-flex min-h-11 items-center gap-1 rounded bg-primary text-primary-foreground px-3 py-1 text-xs font-medium hover:bg-primary/90 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-8"
                     >
                       {t("bind_btn")}
                     </button>
@@ -442,21 +541,20 @@ function SiteSelector({
   label,
   disabled,
 }: {
-  value: "pharmonline" | "aptekonline" | "aloe";
-  onChange: (v: "pharmonline" | "aptekonline" | "aloe") => void;
+  value: CategorySite;
+  onChange: (v: CategorySite) => void;
   label: string;
   disabled: string; // имя другого сайта, который нельзя выбрать (запрет site_a == site_b)
 }) {
-  const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
   return (
-    <label className="inline-flex items-center gap-2 text-sm">
+    <label className="inline-flex min-h-11 items-center gap-2 text-sm">
       <span className="text-xs text-muted-foreground uppercase">{label}</span>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value as typeof value)}
-        className="rounded-md border border-input bg-background px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="min-h-11 rounded-md border border-input bg-background px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
-        {SITES.map((s) => (
+        {CATEGORY_SITES.map((s) => (
           <option key={s} value={s} disabled={s === disabled}>
             {s}
           </option>
@@ -503,7 +601,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
       )
     : undefined;
   const lastCompleted = !categoryId
-    ? requestsQ.data?.find((r) => r.status === "ok" || r.status === "failed")
+    ? requestsQ.data?.find((r) => isTerminalRunStatus(r.status))
     : undefined;
   const completedFreshlyMs = lastCompleted?.completed_at
     ? Date.now() - new Date(lastCompleted.completed_at).getTime()
@@ -526,7 +624,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
       <button
         onClick={() => triggerMut.mutate()}
         disabled={triggerMut.isPending || blockedByAll}
-        className="inline-flex items-center gap-1 rounded border border-border bg-background px-2 py-1 text-xs font-medium hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
+        className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-3 py-1 text-xs font-medium hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap md:min-h-8"
         title={
           blockedByAll
             ? t("scan_category_blocked_title", { id: activeAll.id })
@@ -556,7 +654,7 @@ function TriggerScrapeButton({ categoryId }: { categoryId?: number } = {}) {
       <button
         onClick={() => triggerMut.mutate()}
         disabled={triggerMut.isPending}
-        className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium hover:bg-secondary disabled:opacity-50"
+        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium hover:bg-secondary disabled:opacity-50 md:min-h-9"
         title={t("scan_all_title")}
       >
         <Play className="h-4 w-4" />
@@ -582,7 +680,7 @@ function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow 
       </div>
     );
   }
-  // status === 'ok'
+  const degraded = req.status === "degraded";
   const total = req.products_scraped ?? 0;
   const perSite = req.products_per_site ?? {};
   const siteParts = Object.entries(perSite)
@@ -591,13 +689,22 @@ function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow 
     .join(", ");
   return (
     <div
-      className="text-xs text-success"
-      title={t("completed_title", {
-        id: req.run_id ?? "—",
-        date: formatTime(req.completed_at, locale),
-      })}
+      className={`text-xs ${scrapeResultTextClass(req.status)}`}
+      title={
+        degraded
+          ? t("degraded_title", {
+              id: req.run_id ?? "—",
+              error: req.error_message ?? "—",
+            })
+          : t("completed_title", {
+              id: req.run_id ?? "—",
+              date: formatTime(req.completed_at, locale),
+            })
+      }
     >
-      {t("scan_done_msg", { id: req.id, total: formatNumber(total, locale) })}
+      {degraded
+        ? t("scan_degraded_msg", { id: req.id, total: formatNumber(total, locale) })
+        : t("scan_done_msg", { id: req.id, total: formatNumber(total, locale) })}
       {siteParts && <span className="text-muted-foreground"> ({siteParts})</span>}
     </div>
   );
@@ -664,7 +771,7 @@ function CategoryRowDesktop({
         <button
           onClick={() => toggleActive.mutate()}
           disabled={toggleActive.isPending}
-          className={`inline-flex rounded px-2 py-0.5 text-xs font-medium transition-opacity ${
+          className={`inline-flex min-h-11 items-center rounded px-3 py-0.5 text-xs font-medium transition-opacity md:min-h-8 ${
             cat.is_active
               ? "bg-success/10 text-success hover:bg-success/20"
               : "bg-muted text-muted-foreground hover:bg-muted/80"
@@ -680,7 +787,7 @@ function CategoryRowDesktop({
           )}
           <button
             onClick={onEdit}
-            className="text-muted-foreground hover:text-foreground"
+            className="inline-flex min-h-11 min-w-11 items-center justify-center text-muted-foreground hover:text-foreground md:min-h-8 md:min-w-8"
             title={t("edit_tooltip")}
           >
             <Pencil className="h-4 w-4" />
@@ -690,7 +797,7 @@ function CategoryRowDesktop({
               if (confirm(t("delete_confirm", { label: cat.label_ru }))) remove.mutate();
             }}
             disabled={remove.isPending}
-            className="text-muted-foreground hover:text-destructive disabled:opacity-50"
+            className="inline-flex min-h-11 min-w-11 items-center justify-center text-muted-foreground hover:text-destructive disabled:opacity-50 md:min-h-8 md:min-w-8"
             title={t("delete_tooltip")}
           >
             <Trash2 className="h-4 w-4" />
@@ -779,7 +886,7 @@ function CategoryForm({
         </h3>
         <button
           onClick={onClose}
-          className="rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="inline-flex min-h-11 min-w-11 items-center justify-center rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9 md:min-w-9"
           aria-label={tCommon("close")}
         >
           <X className="h-4 w-4" />
@@ -841,11 +948,11 @@ function CategoryForm({
         <button
           onClick={() => save.mutate()}
           disabled={!canSubmit || save.isPending}
-          className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
+          className="min-h-11 rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50 md:min-h-9"
         >
           {save.isPending ? t("form_save_pending") : isEdit ? t("form_apply") : t("form_save")}
         </button>
-        <button onClick={onClose} className="text-sm text-muted-foreground hover:text-foreground">
+        <button onClick={onClose} className="min-h-11 px-2 text-sm text-muted-foreground hover:text-foreground md:min-h-9">
           {tCommon("cancel")}
         </button>
       </div>
@@ -879,7 +986,7 @@ function Field({
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         required={required}
-        className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
       />
     </label>
   );
@@ -911,7 +1018,7 @@ function UrlField({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring font-mono"
+        className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring font-mono md:min-h-9"
       />
     </label>
   );

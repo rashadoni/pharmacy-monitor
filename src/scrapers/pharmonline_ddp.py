@@ -60,7 +60,14 @@ from typing import AsyncIterator
 import structlog
 import websockets
 
-from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapedPromo
+from src.scrapers.base import (
+    BaseScraper,
+    ScrapedProduct,
+    ScrapedPromo,
+    SiteScrapeFatalError,
+    fatal_proxy_reason,
+    site_fatal_error_message,
+)
 
 log = structlog.get_logger()
 
@@ -233,6 +240,15 @@ class _DDPClient:
                 websockets.exceptions.WebSocketException,
                 ConnectionError,
             ) as exc:
+                reason = fatal_proxy_reason(exc)
+                if reason is not None:
+                    if self._ws is not None:
+                        try:
+                            await self._ws.close()
+                        except Exception:
+                            pass
+                        self._ws = None
+                    raise SiteScrapeFatalError(reason) from exc
                 last_exc = exc
                 if self._ws is not None:  # закрыть half-open сокет перед ретраем
                     try:
@@ -247,13 +263,13 @@ class _DDPClient:
                         attempt=attempt + 1,
                         max_attempts=attempts,
                         backoff_s=backoff,
-                        error=f"{type(exc).__name__}: {exc}",
+                        error=site_fatal_error_message(exc),
                     )
                     await asyncio.sleep(backoff)
         log.error(
             "ddp_connect_exhausted",
             attempts=attempts,
-            error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown",
+            error=site_fatal_error_message(last_exc) if last_exc else "unknown",
         )
         raise last_exc if last_exc else RuntimeError("DDP connect failed")
 
@@ -364,6 +380,9 @@ class _DDPClient:
                     websockets.exceptions.WebSocketException,
                     ConnectionError,
                 ) as exc:
+                    reason = fatal_proxy_reason(exc)
+                    if reason is not None:
+                        raise SiteScrapeFatalError(reason) from exc
                     last_exc = exc
                     if attempt < attempts - 1:
                         log.warning(
@@ -371,16 +390,21 @@ class _DDPClient:
                             method=method,
                             attempt=attempt + 1,
                             max_attempts=attempts,
-                            error=f"{type(exc).__name__}: {exc}",
+                            error=site_fatal_error_message(exc),
                         )
                         try:
                             await self._reconnect()
+                        except SiteScrapeFatalError:
+                            raise
                         except Exception as rexc:  # reconnect исчерпал ретраи — фиксируем
+                            reason = fatal_proxy_reason(rexc)
+                            if reason is not None:
+                                raise SiteScrapeFatalError(reason) from rexc
                             last_exc = rexc
                             log.warning(
                                 "ddp_call_reconnect_failed",
                                 method=method,
-                                error=f"{type(rexc).__name__}: {rexc}",
+                                error=site_fatal_error_message(rexc),
                             )
                         if retry_backoff > 0:
                             await asyncio.sleep(retry_backoff)
@@ -389,7 +413,7 @@ class _DDPClient:
                 "ddp_call_exhausted",
                 method=method,
                 attempts=attempts,
-                error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown",
+                error=site_fatal_error_message(last_exc) if last_exc else "unknown",
             )
             raise last_exc if last_exc else RuntimeError("DDP call exhausted retries")
 
@@ -548,7 +572,17 @@ class PharmonlineDDPScraper(BaseScraper):
             lambda: SOCKJS_BASE + _new_sockjs_path(),
             proxy_url=proxy_url,
         )
-        await self._ddp.__aenter__()
+        try:
+            await self._ddp.__aenter__()
+        except SiteScrapeFatalError:
+            await self._ddp.__aexit__(None, None, None)
+            raise
+        except Exception as exc:
+            await self._ddp.__aexit__(None, None, None)
+            reason = fatal_proxy_reason(exc)
+            if reason is not None:
+                raise SiteScrapeFatalError(reason) from exc
+            raise
         # Pre-fetch category _id → slug map. Without this, products have raw
         # Mongo ObjectIds ("Fom7dQ8wnDWSgAeyn") as `category` field, breaking
         # frontend "click category → browse" UX. getFilterParam returns a list
@@ -565,10 +599,17 @@ class PharmonlineDDPScraper(BaseScraper):
                 if cid and slug:
                     self._cat_map[str(cid)] = str(slug)
             log.info("pharmonline_ddp_cat_map_loaded", count=len(self._cat_map))
+        except SiteScrapeFatalError:
+            await self._ddp.__aexit__(None, None, None)
+            raise
         except Exception as exc:
+            reason = fatal_proxy_reason(exc)
+            if reason is not None:
+                await self._ddp.__aexit__(None, None, None)
+                raise SiteScrapeFatalError(reason) from exc
             log.warning(
                 "pharmonline_ddp_cat_map_failed",
-                error=f"{type(exc).__name__}: {exc}",
+                error=site_fatal_error_message(exc),
                 note="продукты получат raw Mongo _id в поле category",
             )
         return self
@@ -621,11 +662,14 @@ class PharmonlineDDPScraper(BaseScraper):
             try:
                 result = await self._ddp.call("products", params, timeout=30.0)
             except Exception as e:
+                reason = fatal_proxy_reason(e)
+                if reason is not None:
+                    raise SiteScrapeFatalError(reason) from e
                 log.warning(
                     "pharmonline_ddp_call_failed",
                     category=category_slug,
                     offset=offset,
-                    error=str(e),
+                    error=site_fatal_error_message(e),
                 )
                 break
 

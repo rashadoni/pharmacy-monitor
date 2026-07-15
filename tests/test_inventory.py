@@ -28,7 +28,22 @@ def _add_product(s, site, name, ext_id, canonical_id=None):
 
 
 def _add_run(s):
-    r = Run(started_at=utcnow(), status="ok")
+    now = utcnow()
+    r = Run(
+        started_at=now,
+        finished_at=now,
+        status="ok",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
     s.add(r)
     s.flush()
     return r
@@ -95,6 +110,37 @@ def test_import_supplier_prices(db_session, tmp_path):
     # Минимальная закупка
     min_price = inventory.get_min_purchase_price(db_session, p.id)
     assert min_price == 5.20
+
+
+def test_cli_supplier_import_upserts_row_owned_by_another_source(db_session, tmp_path):
+    product = _add_product(db_session, "pharmonline", "Shared", ext_id="SHARED-1")
+    db_session.add(
+        SupplierPrice(
+            product_id=product.id,
+            sku="SHARED-1",
+            supplier_name="Vendor",
+            purchase_price=2.0,
+            currency="AZN",
+            source="dashboard_csv",
+        )
+    )
+    db_session.commit()
+    csv_path = tmp_path / "shared.csv"
+    csv_path.write_text(
+        "sku,supplier_name,purchase_price,currency,name\n"
+        "SHARED-1,Vendor,3.25,AZN,Shared\n",
+        encoding="utf-8",
+    )
+
+    result = inventory.import_supplier_prices_from_csv(
+        db_session, csv_path, source="manual_csv"
+    )
+
+    assert result.matched_to_product == 1
+    rows = db_session.query(SupplierPrice).filter_by(product_id=product.id).all()
+    assert len(rows) == 1
+    assert rows[0].purchase_price == 3.25
+    assert rows[0].source == "manual_csv"
 
 
 def test_margin_report(db_session, tmp_path):

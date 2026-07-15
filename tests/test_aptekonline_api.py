@@ -18,6 +18,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from src.scrapers.base import SiteScrapeFatalError
 from src.scrapers.aptekonline import (
     AptekonlineScraper,
     _DEFAULT_CHECKUS,
@@ -639,14 +640,67 @@ async def test_scrape_category_decodo_aborts_on_403_hard_block(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_scrape_category_decodo_aborts_on_407_balance_exhausted(monkeypatch):
-    """407 (proxy-auth / у Decodo кончился PAYG-баланс) — жёсткий блок: обрыв
-    категории, НЕ skip-continue. Иначе 5 ретраев×порты на каждой странице жгли бы
-    остаток баланса вслепую, а run вернул бы run_ok с заниженным products."""
+    """407 is site-fatal: the caller must stop all remaining categories."""
     _enable_decodo(monkeypatch)
     patcher, idx = _mock_httpx_status_seq([407], None)
     with patcher:
         scraper = AptekonlineScraper()
-        products = [p async for p in scraper.scrape_category("114")]
-    assert products == []
+        with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+            _ = [p async for p in scraper.scrape_category("114")]
     # short-circuit на hard-block → 1 запрос (не жжём баланс перебором портов)
     assert idx["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_decodo_proxyerror_407_is_site_fatal(monkeypatch):
+    """httpx surfaces proxy CONNECT 407 as ProxyError rather than Response."""
+    _enable_decodo(monkeypatch)
+
+    class ProxyFailClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, *args, **kwargs):
+            raise httpx.ProxyError("407 Proxy Authentication Required")
+
+    with patch("src.scrapers.aptekonline.httpx.AsyncClient", ProxyFailClient):
+        scraper = AptekonlineScraper()
+        with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+            _ = [p async for p in scraper.scrape_category("114")]
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_persistent_proxy_407_is_site_fatal(monkeypatch):
+    """Non-Decodo persistent proxy accounts must fail-fast on 402/407 too."""
+    _clear_decodo(monkeypatch)
+    _clear_iproyal(monkeypatch)
+    monkeypatch.setenv("IPROYAL_USERNAME", "u")
+    monkeypatch.setenv("IPROYAL_PASSWORD", "p")
+    monkeypatch.setenv("IPROYAL_SITES", "aptekonline")
+    patcher, idx = _mock_httpx_status_seq([407], None)
+
+    with patcher:
+        scraper = AptekonlineScraper()
+        with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+            _ = [p async for p in scraper.scrape_category("114")]
+
+    assert idx["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scrape_promos_proxy_auth_is_not_swallowed(monkeypatch):
+    scraper = AptekonlineScraper()
+
+    async def fail_new_page():
+        raise RuntimeError("net::ERR_PROXY_AUTH_REQUESTED")
+
+    monkeypatch.setattr(scraper, "new_page", fail_new_page)
+
+    with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+        await scraper.scrape_promos()

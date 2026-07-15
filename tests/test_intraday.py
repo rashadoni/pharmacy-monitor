@@ -14,7 +14,12 @@ from __future__ import annotations
 from datetime import timedelta
 from unittest.mock import MagicMock
 
+import click
+from click.testing import CliRunner
+from sqlalchemy.orm import sessionmaker
+
 from src import intraday, storage
+from src import main as main_mod
 from src._time import utcnow
 
 
@@ -332,3 +337,32 @@ def test_pick_next_scrape_target_commit_false_detects_existing_lock(db_session):
     site, _ = result
     assert site == "aloe"
     redis_mock.set.assert_not_called()
+
+
+def test_intraday_tick_invokes_bounded_point_scrape(db_session, monkeypatch):
+    category = _add_category(
+        db_session, "bounded", "Bounded", ph_slug="bounded-ph", aloe_slug="bounded-aloe"
+    )
+    db_session.commit()
+    SessionLocal = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main_mod.storage, "init_db", lambda: None)
+    monkeypatch.setattr(main_mod.storage, "make_session", lambda: SessionLocal)
+    monkeypatch.setattr(
+        intraday,
+        "pick_next_scrape_target",
+        lambda session, commit_state: ("aloe", category),
+    )
+    monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "321")
+    invoked = {}
+
+    @click.command()
+    def fake_scrape(limit, site, category_id):
+        invoked.update(limit=limit, site=site, category_id=category_id)
+
+    monkeypatch.setattr(main_mod, "scrape_cmd", fake_scrape)
+
+    result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert invoked == {"limit": 321, "site": ("aloe",), "category_id": category.id}
+    assert "limit=321" in result.output

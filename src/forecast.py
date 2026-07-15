@@ -367,7 +367,15 @@ def top_movers(
         base_t = timestamps[0]
         xs = [(t - base_t).total_seconds() / 3600 for t in timestamps]
         slope, intercept = _linear_regression(xs, prices)
-        forecast_price = max(0.0, slope * (xs[-1] + 7 * 24) + intercept)
+        # A direction/change can be useful with two diff-only snapshots, but a
+        # numeric seven-day projection is not trustworthy until at least seven
+        # independent observations exist. Keep the mover, fail closed on the
+        # forecast value.
+        forecast_price = (
+            max(0.0, slope * (xs[-1] + 7 * 24) + intercept)
+            if len(prices) >= 7
+            else None
+        )
 
         if len(prices) >= 14:
             confidence: Literal["low", "medium", "high"] = "high"
@@ -393,7 +401,9 @@ def top_movers(
                 last_price=round(last_p, 2),
                 change_pct=round(change_pct, 2),
                 direction=direction,
-                forecast_7d_price=round(forecast_price, 2),
+                forecast_7d_price=(
+                    round(forecast_price, 2) if forecast_price is not None else None
+                ),
                 confidence=confidence,
             )
         )

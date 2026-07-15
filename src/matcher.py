@@ -21,7 +21,7 @@ from typing import Sequence
 
 import structlog
 from rapidfuzz import fuzz
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from src.brand_catalog import is_brand_blacklisted
@@ -43,6 +43,36 @@ FUZZY_THRESHOLD = 75  # 0..100, минимальный score для авто-м�
 # фильтрует — дополнительные 3 пункта дают ~2-4% recall на коротких именах
 # (5-6 токенов), где реальные матчи дают 75-77. False positives
 # фильтруются через match_actions UI.
+
+_MATCH_MUTATION_LOCK_KEY = "pharmacy-monitor:match-mutation"
+
+
+def acquire_match_mutation_lock(session: Session, *, wait: bool) -> bool:
+    """Serialize matcher/rematch writes to products.canonical_id on Postgres.
+
+    SQLite/local tests do not need this lock. On Postgres this is a session-level
+    advisory lock because match_products/revalidate_split may commit internally;
+    callers release it in a finally block.
+    """
+    bind = session.get_bind()
+    if not str(bind.url).startswith("postgresql"):
+        return True
+    fn = "pg_advisory_lock" if wait else "pg_try_advisory_lock"
+    acquired = session.scalar(
+        text(f"SELECT {fn}(hashtext(:key))"),
+        {"key": _MATCH_MUTATION_LOCK_KEY},
+    )
+    return True if wait else bool(acquired)
+
+
+def release_match_mutation_lock(session: Session) -> None:
+    bind = session.get_bind()
+    if not str(bind.url).startswith("postgresql"):
+        return
+    session.execute(
+        text("SELECT pg_advisory_unlock(hashtext(:key))"),
+        {"key": _MATCH_MUTATION_LOCK_KEY},
+    )
 
 # Фармацевтические модификаторы — однобуквенные/короткие токены, означающие
 # ДРУГОЙ состав препарата. Если у одного товара есть такой токен, а у другого

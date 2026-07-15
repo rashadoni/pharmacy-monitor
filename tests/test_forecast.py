@@ -163,6 +163,7 @@ def test_top_movers_includes_2point_real_movers(db_session):
     m = next(m for m in movers if m.name == "TwoPointMover")
     assert m.change_pct == -50.0
     assert m.direction == "falling"
+    assert m.forecast_7d_price is None
 
 
 def test_compute_trend_stable_zero_snapshots_in_window(db_session):
@@ -326,3 +327,4 @@ def test_top_movers_diff_only_sparse_change(db_session):
     sm = next(m for m in movers if m.name == "SparseMover")
     assert sm.change_pct == -20.0
     assert sm.direction == "falling"
+    assert sm.forecast_7d_price is None

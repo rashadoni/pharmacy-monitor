@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -51,6 +52,85 @@ class CaptchaDetected(Exception):
     Caught at the scrape_category level — the page is skipped and logged,
     but doesn't kill the overall run.
     """
+
+
+class SiteScrapeFatalError(RuntimeError):
+    """Account/provider failure that makes every remaining site item impossible.
+
+    Unlike a transient page failure, retrying the next category cannot recover
+    from an exhausted proxy balance or rejected proxy credentials.
+    """
+
+
+def fatal_proxy_status(exc: BaseException) -> int | None:
+    """Extract only account-level proxy statuses without leaking proxy URLs."""
+    message = str(exc)
+    match = re.search(
+        r"(?:HTTP\s+|status(?:_code)?[=: ]+|^)(402|407)\b", message, re.I
+    )
+    if match:
+        return int(match.group(1))
+    if re.search(
+        r"ERR_(?:PROXY_AUTH_REQUESTED|INVALID_AUTH_CREDENTIALS)|"
+        r"Proxy Authentication Required",
+        message,
+        re.I,
+    ):
+        return 407
+    return None
+
+
+def fatal_proxy_reason(error: BaseException) -> str | None:
+    """Return a sanitized site-fatal reason for account/config proxy failures."""
+    status = fatal_proxy_status(error)
+    if status is not None:
+        return f"proxy access rejected: HTTP {status}"
+    error_type = type(error).__name__
+    # websockets.InvalidProxyStatus / InvalidProxyMessage describe a proxy
+    # response, not a malformed local configuration. Residential exits can
+    # transiently return 5xx; these must reach the retry loop. Account-level
+    # 402/407 was already caught above and remains fail-closed.
+    if error_type in {"InvalidProxyStatus", "InvalidProxyMessage"}:
+        return None
+    diagnostic = f"{error_type}: {error}"
+    if error_type in {"InvalidProxy", "UnsupportedProxy"} or re.search(
+        r"\b(?:InvalidProxy|UnsupportedProxy)\b|ERR_NO_SUPPORTED_PROXIES",
+        diagnostic,
+        re.I,
+    ):
+        return "proxy configuration rejected"
+    return None
+
+
+def site_fatal_error_message(error: BaseException) -> str:
+    """Return bounded diagnostics without proxy endpoints or credentials."""
+    reason = fatal_proxy_reason(error)
+    if reason is not None:
+        return reason
+    message = f"{type(error).__name__}: {error}"
+    message = re.sub(r"https?://\S+", "[redacted-proxy-url]", message, flags=re.I)
+    return message[:500]
+
+
+def site_fatal_result(site: str, item_keys: list[str], error: BaseException) -> ScrapeResult:
+    """Build bounded fail-closed telemetry when a site cannot start at all."""
+    message = site_fatal_error_message(error)
+    return ScrapeResult(
+        site=site,
+        errors=[f"site_fatal: {message}"],
+        site_fatal=True,
+        items_expected=len(item_keys),
+        items_failed=len(item_keys),
+        item_results={
+            str(key): {
+                "status": "skipped",
+                "products": 0,
+                "error": message,
+                "error_kind": "site_fatal",
+            }
+            for key in item_keys
+        },
+    )
 
 
 def _redact_proxy(url: str) -> str:
@@ -281,6 +361,17 @@ class ScrapeResult:
     products: list[ScrapedProduct] = field(default_factory=list)
     promos: list[ScrapedPromo] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Account/provider failure means this site's result is untrustworthy even
+    # when earlier categories/URLs produced partial data.
+    site_fatal: bool = False
+    # Quality telemetry for the unit of work requested from this site. In
+    # category mode the unit is a category slug; in watchlist mode it is a URL.
+    # `item_results` is persisted on Run.run_quality so a degraded run can name
+    # the exact category/URL that failed instead of looking generically "ok".
+    items_expected: int = 0
+    items_completed: int = 0
+    items_failed: int = 0
+    item_results: dict[str, dict] = field(default_factory=dict)
 
 
 class BaseScraper(ABC):
@@ -312,6 +403,16 @@ class BaseScraper(ABC):
         self._context: BrowserContext | None = None
 
     async def __aenter__(self) -> BaseScraper:
+        try:
+            return await self._open_browser()
+        except Exception as exc:
+            await self._close_resources()
+            reason = fatal_proxy_reason(exc)
+            if reason is not None:
+                raise SiteScrapeFatalError(reason) from exc
+            raise
+
+    async def _open_browser(self) -> BaseScraper:
         self._playwright = await async_playwright().start()
 
         # Proxy resolution order (first match wins):
@@ -405,12 +506,27 @@ class BaseScraper(ABC):
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self._close_resources()
+
+    async def _close_resources(self) -> None:
         if self._context:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
         if self._browser:
-            await self._browser.close()
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
 
     async def _throttle(self) -> None:
         """Не более 1 запроса в `rate_limit_sec`. Безопасно для concurrent-доступа."""
@@ -549,16 +665,35 @@ class BaseScraper(ABC):
         """Опционально — собрать промо/баннеры с главной. По умолчанию — ничего."""
         return []
 
-    async def scrape_urls(self, urls: list[str]) -> list[ScrapedProduct]:
+    async def scrape_urls(
+        self, urls: list[str], on_result=None, on_abort=None
+    ) -> list[ScrapedProduct]:
         """Watchlist-режим: посетить список URL и собрать продукты."""
         out: list[ScrapedProduct] = []
-        for url in urls:
+        for item_index, url in enumerate(urls):
             try:
                 product = await self.scrape_product_page(url)
                 if product:
                     out.append(product)
+                    if on_result is not None:
+                        on_result(url, product, None)
+                elif on_result is not None:
+                    on_result(url, None, "product_not_found")
+            except SiteScrapeFatalError as exc:
+                fatal = SiteScrapeFatalError(site_fatal_error_message(exc))
+                if on_abort is not None:
+                    on_abort(url, urls[item_index + 1 :], fatal)
+                raise fatal from exc
             except Exception as e:
+                reason = fatal_proxy_reason(e)
+                if reason is not None:
+                    fatal = SiteScrapeFatalError(reason)
+                    if on_abort is not None:
+                        on_abort(url, urls[item_index + 1 :], fatal)
+                    raise fatal from e
                 log.warning("scrape_url_failed", url=url, error=str(e))
+                if on_result is not None:
+                    on_result(url, None, f"{type(e).__name__}: {e}")
         return out
 
     async def scrape(
@@ -577,13 +712,38 @@ class BaseScraper(ABC):
         прогон (pharmonline DDP ~7ч) теряет ВСЁ собранное. Callback сохраняет каждую
         категорию сразу. Ошибка callback'а НЕ валит скрейп (логируется и идём дальше).
         """
-        result = ScrapeResult(site=self.site_name)
+        requested_slugs = [slug for slug in category_slugs if slug is not None]
+        result = ScrapeResult(site=self.site_name, items_expected=len(requested_slugs))
         captcha_hits = 0
         category_failures = 0
+        site_aborted = False
 
-        for slug in category_slugs:
-            if slug is None:
-                continue
+        def abort_site(
+            error: BaseException, item_index: int, current_products: int
+        ) -> None:
+            nonlocal site_aborted
+            site_aborted = True
+            message = site_fatal_error_message(error)
+            remaining = requested_slugs[item_index:]
+            result.site_fatal = True
+            result.errors.append(f"site_fatal: {message}")
+            result.items_failed += len(remaining)
+            for remaining_index, remaining_slug in enumerate(remaining):
+                result.item_results[str(remaining_slug)] = {
+                    "status": "failed" if remaining_index == 0 else "skipped",
+                    "products": current_products if remaining_index == 0 else 0,
+                    "error": message,
+                    "error_kind": "site_fatal",
+                }
+            log.error(
+                "site_scrape_aborted",
+                site=self.site_name,
+                category=requested_slugs[item_index],
+                remaining=len(remaining),
+                error=message,
+            )
+
+        for item_index, slug in enumerate(requested_slugs):
             try:
                 count = 0
                 cat_products = []
@@ -597,6 +757,22 @@ class BaseScraper(ABC):
                     category=slug,
                     products=count,
                 )
+                if count == 0:
+                    msg = f"category={slug}: empty result"
+                    result.errors.append(msg)
+                    result.items_failed += 1
+                    result.item_results[str(slug)] = {
+                        "status": "empty",
+                        "products": 0,
+                        "error": "category returned zero products",
+                        "error_kind": "empty",
+                    }
+                else:
+                    result.items_completed += 1
+                    result.item_results[str(slug)] = {
+                        "status": "ok",
+                        "products": count,
+                    }
                 if on_category is not None and cat_products:
                     try:
                         on_category(self.site_name, slug, cat_products)
@@ -607,6 +783,9 @@ class BaseScraper(ABC):
                             category=slug,
                             error=f"{type(e).__name__}: {e}",
                         )
+            except SiteScrapeFatalError as e:
+                abort_site(e, item_index, count)
+                break
             except CaptchaDetected as e:
                 captcha_hits += 1
                 msg = f"category={slug}: captcha — {e}"
@@ -614,18 +793,61 @@ class BaseScraper(ABC):
                     "category_captcha_blocked", site=self.site_name, slug=slug, error=str(e)
                 )
                 result.errors.append(msg)
+                result.items_failed += 1
+                result.item_results[str(slug)] = {
+                    "status": "failed",
+                    "products": 0,
+                    "error": str(e)[:500],
+                    "error_kind": "captcha",
+                }
             except Exception as e:
+                fatal_reason = fatal_proxy_reason(e)
+                if fatal_reason is not None:
+                    abort_site(
+                        SiteScrapeFatalError(fatal_reason),
+                        item_index,
+                        count,
+                    )
+                    break
                 category_failures += 1
                 msg = f"category={slug}: {type(e).__name__}: {e}"
                 log.error("category_failed", site=self.site_name, error=msg)
                 result.errors.append(msg)
+                result.items_failed += 1
+                result.item_results[str(slug)] = {
+                    "status": "failed",
+                    "products": 0,
+                    "error": f"{type(e).__name__}: {e}"[:500],
+                    "error_kind": "exception",
+                }
 
-        try:
-            result.promos = await self.scrape_promos()
-        except Exception as e:
-            msg = f"promos: {type(e).__name__}: {e}"
-            log.error("promos_failed", site=self.site_name, error=msg)
-            result.errors.append(msg)
+        if not site_aborted:
+            try:
+                result.promos = await self.scrape_promos()
+            except SiteScrapeFatalError as e:
+                message = site_fatal_error_message(e)
+                result.site_fatal = True
+                result.errors.append(f"site_fatal: promos: {message}")
+                log.error(
+                    "site_scrape_promos_aborted",
+                    site=self.site_name,
+                    error=message,
+                )
+            except Exception as e:
+                reason = fatal_proxy_reason(e)
+                if reason is not None:
+                    message = reason
+                    result.site_fatal = True
+                    result.errors.append(f"site_fatal: promos: {message}")
+                    log.error(
+                        "site_scrape_promos_aborted",
+                        site=self.site_name,
+                        error=message,
+                    )
+                else:
+                    msg = f"promos: {type(e).__name__}: {e}"
+                    log.error("promos_failed", site=self.site_name, error=msg)
+                    result.errors.append(msg)
 
         log.info(
             "site_scrape_summary",

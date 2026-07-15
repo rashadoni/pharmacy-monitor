@@ -420,6 +420,13 @@ def test_send_daily_digest_no_recipients(setup, tenant_user):
 def test_send_daily_digest_with_events(setup, tenant_user):
     s = setup
     tenant_user.daily_digest = True
+    run = storage.Run(
+        tenant_id=tenant_user.tenant_id,
+        status="ok",
+        run_quality={"financially_eligible": True},
+    )
+    s.add(run)
+    s.flush()
     s.add(
         storage.AlertEvent(
             rule_type="undercut_threshold",
@@ -428,6 +435,7 @@ def test_send_daily_digest_with_events(setup, tenant_user):
             title="Today event",
             tenant_id=tenant_user.tenant_id,
             created_at=utcnow(),
+            payload={"source_run_id": run.id},
         )
     )
     s.commit()
@@ -436,6 +444,26 @@ def test_send_daily_digest_with_events(setup, tenant_user):
         sent = notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
         assert sent == 1
         assert mock_email.called
+
+
+def test_send_digest_skips_legacy_financial_event_without_verified_run(setup, tenant_user):
+    s = setup
+    tenant_user.daily_digest = True
+    s.add(
+        storage.AlertEvent(
+            rule_type="undercut_threshold",
+            dedup_key="legacy-unverified",
+            severity="critical",
+            title="Legacy event",
+            tenant_id=tenant_user.tenant_id,
+            created_at=utcnow(),
+        )
+    )
+    s.commit()
+
+    with patch("src.notifier.send_email") as mock_email:
+        assert notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id) == 0
+        assert not mock_email.called
 
 
 def test_send_daily_digest_skips_old_events(setup, tenant_user):

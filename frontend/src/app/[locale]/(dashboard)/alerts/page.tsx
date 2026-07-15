@@ -1,7 +1,8 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import {
   AlertCircle,
   AlertTriangle,
@@ -13,10 +14,14 @@ import {
   MailOpen,
 } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
-import { api, friendlyError, type AlertEvent } from "@/lib/api";
+import { api, friendlyError, type AlertEvent, type AlertSort } from "@/lib/api";
 import { formatRelative, formatTime } from "@/lib/utils";
+import { localizedAlertCopy } from "@/lib/alert-copy";
 import { CardListSkeleton } from "@/components/skeleton";
 import { OnboardingTip } from "@/components/onboarding-tip";
+import { QueryErrorState } from "@/components/query-error-state";
+import { useRouter } from "@/i18n/navigation";
+import { choiceParam, integerParam, queryWithPatch } from "@/lib/filter-query";
 
 const SEVERITY_CONFIG = {
   critical: {
@@ -38,33 +43,98 @@ const SEVERITY_CONFIG = {
     label: "Info",
   },
 } as const;
+const PAGE_SIZE = 50;
 
 type TabView = "inbox" | "snoozed" | "read";
 
 export default function AlertsPage() {
   const t = useTranslations("alerts");
+  const tCommon = useTranslations("common");
   const locale = useLocale();
   const queryClient = useQueryClient();
-  const [view, setView] = useState<TabView>("inbox");
-  const [severityFilter, setSeverityFilter] = useState<string>("");
-  const [hoursWindow, setHoursWindow] = useState<number>(168); // 7 дней по умолчанию
-  const [ruleTypeFilter, setRuleTypeFilter] = useState<string>("");
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const queryRef = useRef(searchParams.toString());
+  useEffect(() => {
+    queryRef.current = searchParams.toString();
+  }, [searchParams]);
+  const parsedParams = new URLSearchParams(searchParams.toString());
+  const view = choiceParam(
+    parsedParams,
+    "view",
+    ["inbox", "snoozed", "read"] as const,
+    "inbox",
+  ) as TabView;
+  const severityFilter = choiceParam(
+    parsedParams,
+    "severity",
+    ["", "critical", "warning", "info"] as const,
+    "",
+  );
+  const hoursWindow = integerParam(parsedParams, "hours", 168, {
+    allowed: [0, 24, 72, 168, 720],
+  });
+  const ruleTypeFilter = searchParams.get("type") ?? "";
+  const siteFilter = choiceParam(
+    parsedParams,
+    "site",
+    ["", "pharmonline", "aptekonline", "aloe", "general"] as const,
+    "",
+  );
+  const sortOrder = choiceParam(
+    parsedParams,
+    "sort",
+    ["newest", "oldest", "site"] as const,
+    "newest",
+  ) as AlertSort;
+  const offset = integerParam(parsedParams, "offset", 0);
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const filterSignature = `${view}|${severityFilter}|${hoursWindow}|${ruleTypeFilter}|${siteFilter}|${sortOrder}`;
+  const previousFilterSignature = useRef(filterSignature);
+  useEffect(() => {
+    if (previousFilterSignature.current !== filterSignature) {
+      previousFilterSignature.current = filterSignature;
+      setSelected(new Set());
+    }
+  }, [filterSignature]);
 
-  // Backend фильтры по view
-  const includeRead = view === "read";
-  const includeSnoozed = view === "snoozed";
+  function updateFilters(patch: Record<string, string | number | null>) {
+    const query = queryWithPatch(
+      queryRef.current,
+      Object.prototype.hasOwnProperty.call(patch, "offset")
+        ? patch
+        : { ...patch, offset: null },
+    );
+    queryRef.current = query;
+    setSelected(new Set());
+    router.push(query ? `/alerts?${query}` : "/alerts", { scroll: false });
+  }
 
-  const { data, isLoading } = useQuery({
-    queryKey: ["alerts", severityFilter, includeRead, includeSnoozed],
+  const pageQ = useQuery({
+    queryKey: [
+      "alerts-page",
+      view,
+      severityFilter,
+      hoursWindow,
+      ruleTypeFilter,
+      siteFilter,
+      sortOrder,
+      offset,
+    ],
     queryFn: () =>
-      api.alerts({
+      api.alertsPage({
+        view,
         severity: severityFilter || undefined,
-        limit: 500,
-        include_read: includeRead,
-        include_snoozed: includeSnoozed,
+        rule_type: ruleTypeFilter || undefined,
+        site: siteFilter || undefined,
+        sort: sortOrder,
+        hours: hoursWindow,
+        limit: PAGE_SIZE,
+        offset,
       }),
   });
+  const data = pageQ.data?.items;
+  const { isLoading, isError, error, refetch } = pageQ;
 
   const countsQ = useQuery({
     queryKey: ["alerts-counts"],
@@ -102,17 +172,17 @@ export default function AlertsPage() {
     });
   }, [data, hoursWindow, ruleTypeFilter, view]);
 
-  const ruleTypes = useMemo(() => {
-    const types = new Set<string>();
-    data?.forEach((e) => e.rule_type && types.add(e.rule_type));
-    return Array.from(types).sort();
-  }, [data]);
+  const ruleTypes = pageQ.data?.rule_types ?? [];
+  const hasActiveFilters = Boolean(
+    severityFilter || ruleTypeFilter || siteFilter || hoursWindow !== 168,
+  );
 
   // Mutations
   const markAllReadMutation = useMutation({
     mutationFn: () => api.alertsMarkAllRead(),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts-page"] });
       queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
       setSelected(new Set());
     },
@@ -134,6 +204,7 @@ export default function AlertsPage() {
     }) => api.alertsBulk(ids, action),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts-page"] });
       queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
       setSelected(new Set());
     },
@@ -149,6 +220,7 @@ export default function AlertsPage() {
     }) => api.alertPatch(id, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts-page"] });
       queryClient.invalidateQueries({ queryKey: ["alerts-counts"] });
     },
     onError: (e) => alert(friendlyError(e, locale)),
@@ -179,30 +251,34 @@ export default function AlertsPage() {
       />
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{t("page_title")}</h1>
-          <p className="text-sm text-muted-foreground">
-            {t("page_subtitle")}
-          </p>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {t("page_title")}
+          </h1>
+          <p className="text-sm text-muted-foreground">{t("page_subtitle")}</p>
         </div>
-        {view === "inbox" && counts?.unread != null && counts.unread > 0 && (
-          <button
-            onClick={() => markAllReadMutation.mutate()}
-            disabled={markAllReadMutation.isPending}
-            className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-          >
-            <CheckCheck className="h-3.5 w-3.5" />
-            {markAllReadMutation.isPending ? "…" : t("mark_all_read_btn", { count: counts.unread })}
-          </button>
-        )}
+        {view === "inbox" &&
+          !hasActiveFilters &&
+          counts?.unread != null &&
+          counts.unread > 0 && (
+            <button
+              onClick={() => markAllReadMutation.mutate()}
+              disabled={markAllReadMutation.isPending}
+              className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:min-h-9"
+            >
+              <CheckCheck className="h-3.5 w-3.5" />
+              {markAllReadMutation.isPending
+                ? "…"
+                : t("mark_all_read_btn", { count: counts.unread })}
+            </button>
+          )}
       </div>
 
       {/* Tabs */}
-      <div className="flex items-center gap-1 border-b border-border">
+      <div className="grid grid-cols-3 border-b border-border sm:flex sm:items-center sm:gap-1">
         <TabBtn
           active={view === "inbox"}
           onClick={() => {
-            setView("inbox");
-            setSelected(new Set());
+            updateFilters({ view: null });
           }}
           icon={Inbox}
           label={t("tab_inbox")}
@@ -211,8 +287,7 @@ export default function AlertsPage() {
         <TabBtn
           active={view === "snoozed"}
           onClick={() => {
-            setView("snoozed");
-            setSelected(new Set());
+            updateFilters({ view: "snoozed" });
           }}
           icon={Clock}
           label={t("tab_snoozed")}
@@ -221,8 +296,7 @@ export default function AlertsPage() {
         <TabBtn
           active={view === "read"}
           onClick={() => {
-            setView("read");
-            setSelected(new Set());
+            updateFilters({ view: "read" });
           }}
           icon={MailOpen}
           label={t("tab_read")}
@@ -234,55 +308,135 @@ export default function AlertsPage() {
       <div className="flex gap-2 flex-wrap items-center">
         <Chip
           active={severityFilter === ""}
-          onClick={() => setSeverityFilter("")}
-          label={`${t("filter_all")}${data ? ` (${data.length})` : ""}`}
+          onClick={() => updateFilters({ severity: null })}
+          label={t("filter_all")}
         />
         <Chip
           active={severityFilter === "critical"}
-          onClick={() => setSeverityFilter("critical")}
+          onClick={() => updateFilters({ severity: "critical" })}
           label={t("filter_critical")}
         />
         <Chip
           active={severityFilter === "warning"}
-          onClick={() => setSeverityFilter("warning")}
+          onClick={() => updateFilters({ severity: "warning" })}
           label={t("filter_warning")}
         />
         <Chip
           active={severityFilter === "info"}
-          onClick={() => setSeverityFilter("info")}
+          onClick={() => updateFilters({ severity: "info" })}
           label={t("filter_info")}
         />
-        <div className="ml-auto flex gap-2">
-          <select
-            value={hoursWindow}
-            onChange={(e) => setHoursWindow(Number(e.target.value))}
-            className="text-xs rounded-full px-3 py-1 border border-border bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <option value={24}>{t("window_24h")}</option>
-            <option value={72}>{t("window_3d")}</option>
-            <option value={168}>{t("window_7d")}</option>
-            <option value={720}>{t("window_30d")}</option>
-            <option value={0}>{t("window_all")}</option>
-          </select>
-          <select
-            value={ruleTypeFilter}
-            onChange={(e) => setRuleTypeFilter(e.target.value)}
-            className="text-xs rounded-full px-3 py-1 border border-border bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <option value="">{t("filter_all_types")}</option>
-            {ruleTypes.map((rt) => (
-              <option key={rt} value={rt}>
-                {rt}
-              </option>
-            ))}
-          </select>
+        <div className="grid w-full grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-1">
+            <label
+              htmlFor="alerts-site-filter"
+              className="text-[11px] font-medium text-muted-foreground"
+            >
+              {t("site_filter_label")}
+            </label>
+            <select
+              id="alerts-site-filter"
+              value={siteFilter}
+              onChange={(e) => updateFilters({ site: e.target.value || null })}
+              className="min-h-11 min-w-0 rounded-md border border-border bg-card px-3 py-1 text-xs font-normal text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              <option value="">{t("filter_all_sites")}</option>
+              <option value="pharmonline">{t("site_pharmonline")}</option>
+              <option value="aptekonline">{t("site_aptekonline")}</option>
+              <option value="aloe">{t("site_aloe")}</option>
+              <option value="general">{t("site_general")}</option>
+            </select>
+          </div>
+          <div className="grid gap-1">
+            <label
+              htmlFor="alerts-rule-type-filter"
+              className="text-[11px] font-medium text-muted-foreground"
+            >
+              {t("rule_type_label")}
+            </label>
+            <select
+              id="alerts-rule-type-filter"
+              value={ruleTypeFilter}
+              onChange={(e) => updateFilters({ type: e.target.value || null })}
+              className="min-h-11 min-w-0 rounded-md border border-border bg-card px-3 py-1 text-xs font-normal text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              <option value="">{t("filter_all_types")}</option>
+              {ruleTypeFilter && !ruleTypes.includes(ruleTypeFilter) && (
+                <option value={ruleTypeFilter}>{ruleTypeFilter}</option>
+              )}
+              {ruleTypes.map((rt) => (
+                <option key={rt} value={rt}>
+                  {rt}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="grid gap-1">
+            <label
+              htmlFor="alerts-window-filter"
+              className="text-[11px] font-medium text-muted-foreground"
+            >
+              {t("window_label")}
+            </label>
+            <select
+              id="alerts-window-filter"
+              value={hoursWindow}
+              onChange={(e) =>
+                updateFilters({
+                  hours:
+                    Number(e.target.value) === 168
+                      ? null
+                      : Number(e.target.value),
+                })
+              }
+              className="min-h-11 min-w-0 rounded-md border border-border bg-card px-3 py-1 text-xs font-normal text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              <option value={24}>{t("window_24h")}</option>
+              <option value={72}>{t("window_3d")}</option>
+              <option value={168}>{t("window_7d")}</option>
+              <option value={720}>{t("window_30d")}</option>
+              <option value={0}>{t("window_all")}</option>
+            </select>
+          </div>
+          <div className="grid gap-1">
+            <label
+              htmlFor="alerts-sort"
+              className="text-[11px] font-medium text-muted-foreground"
+            >
+              {t("sort_label")}
+            </label>
+            <select
+              id="alerts-sort"
+              value={sortOrder}
+              onChange={(e) =>
+                updateFilters({
+                  sort: e.target.value === "newest" ? null : e.target.value,
+                })
+              }
+              className="min-h-11 min-w-0 rounded-md border border-border bg-card px-3 py-1 text-xs font-normal text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              <option value="newest">{t("sort_newest")}</option>
+              <option value="oldest">{t("sort_oldest")}</option>
+              <option value="site">{t("sort_site")}</option>
+            </select>
+          </div>
         </div>
       </div>
 
+      {isError && (
+        <QueryErrorState
+          message={friendlyError(error, locale)}
+          retryLabel={tCommon("retry")}
+          onRetry={() => refetch()}
+        />
+      )}
+
       {/* Bulk toolbar — виден когда есть selected */}
       {selected.size > 0 && (
-        <div className="sticky top-0 z-10 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 flex items-center gap-2 text-sm">
-          <span className="font-medium">{t("selected_count", { count: selected.size })}</span>
+        <div className="sticky top-14 z-10 flex flex-wrap items-center gap-2 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 text-sm md:top-0">
+          <span className="font-medium">
+            {t("selected_count", { count: selected.size })}
+          </span>
           {view !== "read" && (
             <button
               onClick={() =>
@@ -292,7 +446,7 @@ export default function AlertsPage() {
                 })
               }
               disabled={bulkMutation.isPending}
-              className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
             >
               <CheckCheck className="h-3.5 w-3.5" /> {t("action_mark_read")}
             </button>
@@ -306,7 +460,7 @@ export default function AlertsPage() {
                 })
               }
               disabled={bulkMutation.isPending}
-              className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
             >
               <Mail className="h-3.5 w-3.5" /> {t("action_mark_unread")}
             </button>
@@ -321,7 +475,7 @@ export default function AlertsPage() {
                   })
                 }
                 disabled={bulkMutation.isPending}
-                className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
               >
                 <Clock className="h-3.5 w-3.5" /> {t("action_snooze_24h")}
               </button>
@@ -333,7 +487,7 @@ export default function AlertsPage() {
                   })
                 }
                 disabled={bulkMutation.isPending}
-                className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
               >
                 <Clock className="h-3.5 w-3.5" /> {t("action_snooze_7d")}
               </button>
@@ -348,14 +502,14 @@ export default function AlertsPage() {
                 })
               }
               disabled={bulkMutation.isPending}
-              className="inline-flex items-center gap-1 rounded bg-background border border-border px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="inline-flex min-h-11 items-center gap-1 rounded border border-border bg-background px-2 py-1 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
             >
               {t("action_unsnooze")}
             </button>
           )}
           <button
             onClick={() => setSelected(new Set())}
-            className="ml-auto text-muted-foreground hover:text-foreground"
+            className="ml-auto min-h-11 rounded-md px-2 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
           >
             {t("action_deselect")}
           </button>
@@ -364,7 +518,7 @@ export default function AlertsPage() {
 
       {/* Select-all checkbox */}
       {filtered && filtered.length > 0 && (
-        <label className="inline-flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+        <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 text-xs text-muted-foreground md:min-h-9">
           <input
             type="checkbox"
             checked={selected.size > 0 && selected.size === filtered.length}
@@ -376,11 +530,30 @@ export default function AlertsPage() {
       )}
 
       {isLoading && <CardListSkeleton count={6} />}
-      {filtered && filtered.length === 0 && !isLoading && (
+      {filtered && filtered.length === 0 && !isLoading && !isError && (
         <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center">
-          {view === "inbox" && t("empty_inbox")}
-          {view === "snoozed" && t("empty_snoozed")}
-          {view === "read" && t("empty_read")}
+          <p>
+            {hasActiveFilters && t("empty_filtered")}
+            {!hasActiveFilters && view === "inbox" && t("empty_inbox")}
+            {!hasActiveFilters && view === "snoozed" && t("empty_snoozed")}
+            {!hasActiveFilters && view === "read" && t("empty_read")}
+          </p>
+          {hasActiveFilters && (
+            <button
+              type="button"
+              onClick={() =>
+                updateFilters({
+                  severity: null,
+                  site: null,
+                  type: null,
+                  hours: null,
+                })
+              }
+              className="mt-3 min-h-11 rounded-md border border-border bg-card px-3 text-xs font-medium text-foreground hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+            >
+              {t("reset_filters")}
+            </button>
+          )}
         </div>
       )}
 
@@ -412,6 +585,39 @@ export default function AlertsPage() {
           />
         ))}
       </div>
+      {pageQ.data && pageQ.data.total > PAGE_SIZE && (
+        <div className="flex items-center justify-between gap-3 border-t border-border pt-3 text-sm">
+          <span className="text-muted-foreground">
+            {t("page_range", {
+              from: offset + 1,
+              to: Math.min(pageQ.data.total, offset + PAGE_SIZE),
+              total: pageQ.data.total,
+            })}
+          </span>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              disabled={offset === 0}
+              onClick={() =>
+                updateFilters({
+                  offset: Math.max(0, offset - PAGE_SIZE) || null,
+                })
+              }
+              className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9"
+            >
+              {t("page_previous")}
+            </button>
+            <button
+              type="button"
+              disabled={offset + PAGE_SIZE >= pageQ.data.total}
+              onClick={() => updateFilters({ offset: offset + PAGE_SIZE })}
+              className="min-h-11 rounded-md border border-border px-3 disabled:opacity-40 md:min-h-9"
+            >
+              {t("page_next")}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -436,23 +642,45 @@ function AlertCard({
   const cfg = SEVERITY_CONFIG[event.severity] ?? SEVERITY_CONFIG.info;
   const Icon = cfg.icon;
   const dimmed = event.is_read;
+  const siteLabel =
+    event.site === "pharmonline"
+      ? t("site_pharmonline")
+      : event.site === "aptekonline"
+        ? t("site_aptekonline")
+        : event.site === "aloe"
+          ? t("site_aloe")
+          : t("site_general_short");
+  const severityLabel =
+    event.severity === "critical"
+      ? t("severity_critical")
+      : event.severity === "warning"
+        ? t("severity_warning")
+        : t("severity_info");
+  const copy = localizedAlertCopy(event, t);
   return (
     <div
       className={`rounded-lg border ${cfg.bg} p-3 ${dimmed ? "opacity-60" : ""}`}
     >
       <div className="flex items-start gap-3">
-        <input
-          type="checkbox"
-          checked={selected}
-          onChange={onToggleSel}
-          className="h-4 w-4 mt-1 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label={t("aria_select_for_bulk")}
-        />
-        <Icon className={`h-5 w-5 shrink-0 ${cfg.color} mt-0.5`} />
+        <label className="-m-3 inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center md:-m-2 md:h-9 md:w-9">
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggleSel}
+            className="h-4 w-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={t("aria_select_for_bulk")}
+          />
+        </label>
+        <span className="mt-0.5 shrink-0">
+          <Icon aria-hidden="true" className={`h-5 w-5 ${cfg.color}`} />
+          <span className="sr-only">{severityLabel}</span>
+        </span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2 flex-wrap">
-            <div className={`font-medium text-sm ${event.is_read ? "line-through" : ""}`}>
-              {event.title}
+            <div
+              className={`font-medium text-sm ${event.is_read ? "line-through" : ""}`}
+            >
+              {copy.title}
             </div>
             <div className="flex items-center gap-2 text-xs text-muted-foreground tabular-nums">
               {event.snoozed_until &&
@@ -467,22 +695,36 @@ function AlertCard({
                     {t("snoozed_badge")}
                   </span>
                 )}
-              <span title={event.created_at}>{formatRelative(event.created_at, locale)}</span>
+              <span
+                data-testid="alert-source"
+                className="inline-flex items-center rounded-md border border-border bg-background/80 px-1.5 py-0.5 font-medium text-foreground/80"
+              >
+                {siteLabel}
+              </span>
+              <span title={event.created_at}>
+                {formatRelative(event.created_at, locale)}
+              </span>
             </div>
           </div>
-          {event.detail && (
-            <div className="text-xs text-muted-foreground mt-1">{event.detail}</div>
+          {copy.detail && (
+            <div className="text-xs text-muted-foreground mt-1">
+              {copy.detail}
+            </div>
           )}
           {event.rule_type && (
             <div className="text-[10px] text-muted-foreground/70 mt-1 uppercase tracking-wide">
               {event.rule_type}
             </div>
           )}
-          <div className="flex items-center gap-2 mt-2 text-[11px]">
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
             <button
               onClick={onMarkRead}
-              className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              title={event.is_read ? t("tooltip_mark_unread") : t("tooltip_mark_read")}
+              className="inline-flex min-h-11 items-center gap-1 rounded px-2 py-1 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+              title={
+                event.is_read
+                  ? t("tooltip_mark_unread")
+                  : t("tooltip_mark_read")
+              }
             >
               {event.is_read ? (
                 <>
@@ -490,7 +732,8 @@ function AlertCard({
                 </>
               ) : (
                 <>
-                  <CheckCheck className="h-3 w-3" /> {t("action_mark_read_short")}
+                  <CheckCheck className="h-3 w-3" />{" "}
+                  {t("action_mark_read_short")}
                 </>
               )}
             </button>
@@ -498,14 +741,14 @@ function AlertCard({
             new Date(event.snoozed_until).getTime() > Date.now() ? (
               <button
                 onClick={onSnoozeClear}
-                className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="inline-flex min-h-11 items-center gap-1 rounded px-2 py-1 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
               >
                 {t("action_unsnooze")}
               </button>
             ) : (
               <button
                 onClick={onSnooze7d}
-                className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="inline-flex min-h-11 items-center gap-1 rounded px-2 py-1 text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
                 title={t("tooltip_snooze_7d")}
               >
                 <Clock className="h-3 w-3" /> {t("snooze_7d_short")}
@@ -534,18 +777,19 @@ function TabBtn({
   return (
     <button
       onClick={onClick}
-      className={`inline-flex items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+      aria-pressed={active}
+      className={`-mb-px inline-flex min-h-11 min-w-0 items-center justify-center gap-1 border-b-2 px-1.5 py-2 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:gap-2 sm:px-4 sm:text-sm ${
         active
           ? "border-primary text-foreground font-medium"
           : "border-transparent text-muted-foreground hover:text-foreground"
       }`}
     >
-      <Icon className="h-4 w-4" />
-      {label}
+      <Icon className="hidden h-4 w-4 sm:block" />
+      <span className="min-w-0 truncate">{label}</span>
       {count != null && (
         <span
           className={`text-[10px] tabular-nums font-mono ${
-            active ? "text-primary-foreground/80" : "text-muted-foreground"
+            active ? "text-primary" : "text-muted-foreground"
           }`}
         >
           ({count})
@@ -567,7 +811,8 @@ function Chip({
   return (
     <button
       onClick={onClick}
-      className={`text-xs rounded-full px-3 py-1 border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+      aria-pressed={active}
+      className={`min-h-11 rounded-full border px-3 py-1 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9 ${
         active
           ? "bg-primary text-primary-foreground border-primary"
           : "bg-card text-muted-foreground border-border hover:bg-secondary"

@@ -83,7 +83,7 @@ export default function SettingsPage() {
       <Section title={t("actions")}>
         <button
           onClick={handleLogout}
-          className="inline-flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 text-destructive px-4 py-2 text-sm font-medium hover:bg-destructive/10"
+          className="inline-flex min-h-11 items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 text-destructive px-4 py-2 text-sm font-medium hover:bg-destructive/10 md:min-h-9"
         >
           <LogOut className="h-4 w-4" />
           {t("logout")}
@@ -123,7 +123,7 @@ function ChangePasswordSection() {
             value={curr}
             onChange={(e) => setCurr(e.target.value)}
             autoComplete="current-password"
-            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           />
         </label>
         <label className="block">
@@ -133,7 +133,7 @@ function ChangePasswordSection() {
             value={next1}
             onChange={(e) => setNext1(e.target.value)}
             autoComplete="new-password"
-            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           />
           {tooShort && <span className="text-xs text-destructive">{t("password_too_short")}</span>}
         </label>
@@ -144,14 +144,14 @@ function ChangePasswordSection() {
             value={next2}
             onChange={(e) => setNext2(e.target.value)}
             autoComplete="new-password"
-            className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           />
           {mismatch && <span className="text-xs text-destructive">{t("password_mismatch")}</span>}
         </label>
         <button
           onClick={() => mut.mutate()}
           disabled={!canSubmit || mut.isPending}
-          className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
+          className="min-h-11 rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50 md:min-h-9"
         >
           {mut.isPending ? t("saving") : t("change_password")}
         </button>
@@ -208,6 +208,17 @@ function IntegrationsStatusSection() {
         ? t("integration_scraperapi_ok", { sites: q.data.scraperapi_sites.join(", ") || "—" })
         : t("integration_scraperapi_not_ok"),
     },
+    {
+      key: "decodo",
+      label: t("integration_decodo_label"),
+      ok: q.data.decodo,
+      hint: q.data.decodo
+        ? t("integration_decodo_ok", {
+            sites: q.data.decodo_sites.join(", ") || "—",
+            pool: q.data.decodo_pool_size,
+          })
+        : t("integration_decodo_not_ok"),
+    },
   ];
 
   const okCount = items.filter((i) => i.ok).length;
@@ -250,6 +261,7 @@ function NotificationsSection({ email }: { email?: string }) {
   const tCommon = useTranslations("common");
   const prefsQ = useQuery({ queryKey: ["notif-prefs"], queryFn: api.notifPrefs });
   const integrationsQ = useQuery({ queryKey: ["integrations"], queryFn: api.integrations });
+  const statusQ = useQuery({ queryKey: ["system-status"], queryFn: api.systemStatus });
   const bindEmail = email ?? "your-email@example.com";
   const updateMutation = useMutation({
     mutationFn: (patch: Partial<NotifPrefs>) => api.notifPrefsUpdate(patch),
@@ -298,7 +310,7 @@ function NotificationsSection({ email }: { email?: string }) {
                     onClick={() => {
                       if (confirm(t("telegram_unbind_confirm"))) unbindMutation.mutate();
                     }}
-                    className="text-xs text-destructive hover:underline"
+                    className="inline-flex min-h-11 items-center text-xs text-destructive hover:underline md:min-h-9"
                   >
                     {t("telegram_unbind")}
                   </button>
@@ -351,21 +363,30 @@ function NotificationsSection({ email }: { email?: string }) {
                   updateMutation.mutate({ quiet_hours: v || null });
                 }
               }}
-              className="rounded-md border border-input bg-background px-3 py-1.5 text-sm w-32 font-mono"
+              className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm w-32 font-mono md:min-h-9"
             />
           </div>
 
           <div className="pt-3 border-t border-border space-y-2">
             <div className="text-sm font-medium mb-1.5">{t("digest")}</div>
             <Toggle
-              label={t("daily_digest")}
+              label={t("daily_digest_schedule", {
+                time: statusQ.data?.digests.daily.schedule_baku ?? "09:00",
+              })}
               checked={prefs.daily_digest}
               onChange={(v) => updateMutation.mutate({ daily_digest: v })}
+              disabled={statusQ.data?.digests.daily.enabled === false}
             />
+            {statusQ.data?.digests.daily.enabled === false && (
+              <p className="text-xs text-warning">{t("daily_digest_disabled")}</p>
+            )}
             <Toggle
-              label={t("weekly_digest")}
+              label={t("weekly_digest_schedule", {
+                schedule: statusQ.data?.digests.weekly.schedule_baku ?? "Monday 10:00",
+              })}
               checked={prefs.weekly_digest}
               onChange={(v) => updateMutation.mutate({ weekly_digest: v })}
+              disabled={statusQ.data?.digests.weekly.enabled === false}
             />
           </div>
 
@@ -399,7 +420,7 @@ function SeveritySelect({
     <select
       value={value}
       onChange={(e) => onChange(e.target.value)}
-      className="rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+      className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
     >
       {SEVERITIES.map((s) => (
         <option key={s} value={s}>
@@ -414,16 +435,19 @@ function Toggle({
   label,
   checked,
   onChange,
+  disabled = false,
 }: {
   label: string;
   checked: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
-    <label className="flex items-center gap-2 cursor-pointer text-sm">
+    <label className={`flex min-h-11 items-center gap-2 text-sm md:min-h-9 ${disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"}`}>
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
         className="h-4 w-4"
       />

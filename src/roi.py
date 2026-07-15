@@ -42,6 +42,7 @@ from src.storage import (
     Promo,
     Run,
 )
+from src.run_lock import try_shared_scrape_read_lock
 
 log = structlog.get_logger()
 
@@ -107,7 +108,12 @@ class ActionItem:
     extra: dict = field(default_factory=dict)
 
 
-def _preload_snapshots(session: Session, run_id: int) -> dict[int, "PriceSnapshot"]:
+def _preload_snapshots(
+    session: Session,
+    run_id: int,
+    *,
+    tenant_id: int = 1,
+) -> dict[int, "PriceSnapshot"]:
     """Загрузить latest snapshot per product, для всех matched товаров.
 
     Diff-only-aware (2026-05-09): после оптимизации persist'а snapshot
@@ -120,11 +126,19 @@ def _preload_snapshots(session: Session, run_id: int) -> dict[int, "PriceSnapsho
     from src.storage import latest_snapshots_per_product
 
     matched_pids = session.scalars(
-        select(Product.id).where(Product.canonical_id.is_not(None))
+        select(Product.id).where(
+            Product.canonical_id.is_not(None),
+            Product.tenant_id == tenant_id,
+        )
     ).all()
     if not matched_pids:
         return {}
-    return latest_snapshots_per_product(session, matched_pids)
+    return latest_snapshots_per_product(
+        session,
+        matched_pids,
+        financially_eligible_only=True,
+        tenant_id=tenant_id,
+    )
 
 
 # ─── Persistent cache ────────────────────────────────────────────────────────
@@ -132,9 +146,46 @@ def _preload_snapshots(session: Session, run_id: int) -> dict[int, "PriceSnapsho
 # 15с возвращал 408 на 4 экранах из 11 (P0.1 PO Audit). Решение:
 # pre-compute после scrape success → DB-cache → serve из кэша.
 
-# Cache freshness threshold. Старше — игнорируем, идём в inline compute как
-# fallback (с увеличенным backend-таймаутом).
+# Cache freshness threshold. Старше — игнорируем и показываем unavailable;
+# inline fallback запрещён, потому что он может прочитать непроверенные данные.
 _CACHE_MAX_AGE_HOURS = 26
+
+
+def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
+    """Every site must have verified lineage within its real scrape cadence."""
+    from src.health import _SITE_MAX_AGE_HOURS
+
+    run_ids = storage.latest_financial_run_ids_by_site(
+        session,
+        ALL_SITES,
+        tenant_id=tenant_id,
+    )
+    if set(run_ids) != set(ALL_SITES):
+        return False
+    attempts = storage.latest_full_catalog_attempts_by_site(
+        session,
+        ALL_SITES,
+        tenant_id=tenant_id,
+    )
+    if set(attempts) != set(ALL_SITES):
+        return False
+    if any(attempts[site].id != run_ids[site] for site in ALL_SITES):
+        return False
+    runs = {
+        run.id: run
+        for run in session.scalars(
+            select(Run).where(Run.id.in_(set(run_ids.values())))
+        ).all()
+    }
+    now = utcnow()
+    for site, run_id in run_ids.items():
+        run = runs.get(run_id)
+        if run is None:
+            return False
+        max_age_hours = _SITE_MAX_AGE_HOURS.get(site, _CACHE_MAX_AGE_HOURS)
+        if now - run.started_at > timedelta(hours=max_age_hours):
+            return False
+    return True
 
 
 def _action_to_dict(a: "ActionItem") -> dict:
@@ -171,6 +222,12 @@ def cache_actions(
     один row per срез. Никаких внешних зависимостей, sync операция.
     """
     from src.storage import RoiActionsCache
+
+    run = session.get(Run, run_id) if run_id is not None else None
+    if run is None or run.tenant_id != tenant_id or not storage.run_is_financially_eligible(run):
+        raise ValueError("ROI cache requires a financially eligible full-catalog run")
+    if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
+        raise ValueError("ROI cache requires fresh verified full-catalog inputs for every site")
 
     payload = [_action_to_dict(a) for a in actions]
     existing = session.scalar(
@@ -211,17 +268,73 @@ def get_cached_actions(
 ) -> list[dict] | None:
     """Прочитать кэш или вернуть None если stale/missing.
 
-    None означает caller должен fallback'нуться на inline compute_actions.
+    None означает, что caller должен fail closed и скрыть рекомендации.
     """
-    from src.storage import RoiActionsCache
+    snapshot = get_cached_actions_snapshot(
+        session,
+        client_site,
+        tenant_id=tenant_id,
+        max_age_hours=max_age_hours,
+    )
+    return snapshot[0] if snapshot is not None else None
 
+
+def get_cached_actions_snapshot(
+    session: Session,
+    client_site: str,
+    *,
+    tenant_id: int = 1,
+    max_age_hours: int = _CACHE_MAX_AGE_HOURS,
+) -> tuple[list[dict], storage.RoiActionsCache, Run] | None:
+    """Return payload and provenance from the same validated cache row.
+
+    Keeping the selected row object with its payload prevents an HTTP caller
+    from labelling recommendations from run A with metadata from a concurrently
+    refreshed run B.  Newer full-catalog attempts still fail the snapshot
+    closed through the lineage checks below.
+    """
     row = session.scalar(
-        select(RoiActionsCache).where(
-            RoiActionsCache.tenant_id == tenant_id,
-            RoiActionsCache.client_site == client_site,
+        select(storage.RoiActionsCache).where(
+            storage.RoiActionsCache.tenant_id == tenant_id,
+            storage.RoiActionsCache.client_site == client_site,
         )
     )
     if row is None:
+        return None
+    run = session.get(Run, row.run_id) if row.run_id is not None else None
+    if run is None or run.tenant_id != tenant_id or not storage.run_is_financially_eligible(run):
+        log.warning(
+            "roi_actions_cache_unverified",
+            client_site=client_site,
+            run_id=row.run_id,
+        )
+        return None
+    latest_attempts = storage.latest_full_catalog_attempts_by_site(
+        session,
+        ALL_SITES,
+        tenant_id=tenant_id,
+    )
+    cache_completed_at = run.finished_at or run.started_at
+    for site, latest_attempt in latest_attempts.items():
+        if latest_attempt.id == run.id:
+            continue
+        attempt_completed_at = latest_attempt.finished_at or latest_attempt.started_at
+        if (attempt_completed_at, latest_attempt.id) > (cache_completed_at, run.id):
+            log.warning(
+                "roi_actions_cache_superseded",
+                client_site=client_site,
+                cache_run_id=run.id,
+                superseding_site=site,
+                latest_full_attempt_id=latest_attempt.id,
+                latest_full_attempt_status=latest_attempt.status,
+            )
+            return None
+    if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
+        log.warning(
+            "roi_actions_cache_inputs_unverified",
+            client_site=client_site,
+            run_id=row.run_id,
+        )
         return None
     age = utcnow() - row.computed_at
     if age > timedelta(hours=max_age_hours):
@@ -231,7 +344,35 @@ def get_cached_actions(
             age_hours=age.total_seconds() / 3600,
         )
         return None
-    return list(row.payload) if row.payload else []
+    payload = list(row.payload) if row.payload else []
+    return payload, row, run
+
+
+def get_cached_action_items(
+    session: Session,
+    client_site: str,
+    *,
+    tenant_id: int = 1,
+    max_age_hours: int = _CACHE_MAX_AGE_HOURS,
+) -> list[ActionItem] | None:
+    """Validated ActionItem view for non-HTTP consumers such as Telegram."""
+    payload = get_cached_actions(
+        session,
+        client_site,
+        tenant_id=tenant_id,
+        max_age_hours=max_age_hours,
+    )
+    if payload is None:
+        return None
+    try:
+        return [ActionItem(**row) for row in payload]
+    except (TypeError, ValueError) as exc:
+        log.warning(
+            "roi_actions_cache_invalid_payload",
+            client_site=client_site,
+            error=str(exc),
+        )
+        return None
 
 
 def refresh_all_cached_actions(
@@ -241,12 +382,17 @@ def refresh_all_cached_actions(
     tenant_id: int = 1,
 ) -> dict[str, int]:
     """Пересчитать кэш для всех 3 сайтов. Вызывается из main.py после
-    persist_results (только если status=ok). Возвращает {site: count}.
+    подтверждённого full-catalog run. Возвращает {site: count}.
     """
+    run = session.get(Run, run_id) if run_id is not None else None
+    if run is None or run.tenant_id != tenant_id or not storage.run_is_financially_eligible(run):
+        raise ValueError("ROI refresh requires a financially eligible full-catalog run")
+    if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
+        raise ValueError("ROI refresh requires fresh verified full-catalog inputs for every site")
     out: dict[str, int] = {}
     for site in ALL_SITES:
         try:
-            actions = compute_actions(session, client_site=site)
+            actions = _compute_actions_locked(session, client_site=site, tenant_id=tenant_id)
             cache_actions(session, site, actions, run_id=run_id, tenant_id=tenant_id)
             out[site] = len(actions)
         except Exception as e:
@@ -260,6 +406,38 @@ def refresh_all_cached_actions(
 
 
 def compute_actions(
+    session: Session,
+    *,
+    client_site: str | None = None,
+    tenant_id: int = 1,
+    raise_threshold_pct: float | None = None,
+    undercut_threshold_pct: float | None = None,
+    max_spread_pct: float | None = None,
+    max_per_type: int | None = None,
+    min_margin_pct: float | None = None,
+) -> list[ActionItem]:
+    """External live computation guarded against concurrent scrape writes."""
+    with try_shared_scrape_read_lock(session) as acquired:
+        if not acquired:
+            log.warning(
+                "roi_compute_scrape_in_progress",
+                client_site=client_site or CLIENT_SITE,
+                tenant_id=tenant_id,
+            )
+            return []
+        return _compute_actions_locked(
+            session,
+            client_site=client_site,
+            tenant_id=tenant_id,
+            raise_threshold_pct=raise_threshold_pct,
+            undercut_threshold_pct=undercut_threshold_pct,
+            max_spread_pct=max_spread_pct,
+            max_per_type=max_per_type,
+            min_margin_pct=min_margin_pct,
+        )
+
+
+def _compute_actions_locked(
     session: Session,
     *,
     client_site: str | None = None,
@@ -287,6 +465,8 @@ def compute_actions(
     «месячному impact'у» потому что объёмы продаж нам неизвестны (см.
     module docstring).
     """
+    global CLIENT_SITE, COMPETITOR_SITES
+
     # Load per-tenant config (creates default row if missing).
     cfg = storage.load_pricing_config(session, tenant_id)
     # Apply explicit overrides (kwargs win over DB).
@@ -302,7 +482,22 @@ def compute_actions(
     global _CURRENT_MIN_MARGIN_PCT
     _CURRENT_MIN_MARGIN_PCT = min_margin
 
-    global CLIENT_SITE, COMPETITOR_SITES
+    if storage.has_unfinished_run(session, tenant_id=tenant_id):
+        log.warning(
+            "roi_compute_run_in_progress",
+            client_site=client_site or CLIENT_SITE,
+            tenant_id=tenant_id,
+        )
+        return []
+
+    if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
+        log.warning(
+            "roi_compute_inputs_unverified",
+            client_site=client_site or CLIENT_SITE,
+            tenant_id=tenant_id,
+        )
+        return []
+
     orig_client = CLIENT_SITE
     orig_competitors = COMPETITOR_SITES
     if client_site and client_site != CLIENT_SITE:
@@ -312,11 +507,15 @@ def compute_actions(
         COMPETITOR_SITES = tuple(s for s in ALL_SITES if s != client_site)
     try:
         actions: list[ActionItem] = []
-        actions += _price_raise_opportunities(session, raise_pct, max_spread, per_type)
-        actions += _undercut_threats(session, undercut_pct, max_spread, per_type)
-        actions += _assortment_gaps(session, per_type)
-        actions += _map_violations(session, per_type)
-        actions += _promo_responses(session, per_type)
+        actions += _price_raise_opportunities(
+            session, raise_pct, max_spread, per_type, tenant_id=tenant_id
+        )
+        actions += _undercut_threats(
+            session, undercut_pct, max_spread, per_type, tenant_id=tenant_id
+        )
+        actions += _assortment_gaps(session, per_type, tenant_id=tenant_id)
+        actions += _map_violations(session, per_type, tenant_id=tenant_id)
+        actions += _promo_responses(session, per_type, tenant_id=tenant_id)
     finally:
         # Always restore — even on exception.
         CLIENT_SITE = orig_client
@@ -333,12 +532,22 @@ def compute_actions(
     return actions
 
 
-def _latest_run_id(session: Session) -> int | None:
-    return session.scalar(select(Run.id).where(Run.status == "ok").order_by(desc(Run.id)).limit(1))
+def _latest_run_id(session: Session, *, tenant_id: int = 1) -> int | None:
+    eligible_ids = storage.financially_eligible_run_ids(session, tenant_id=tenant_id)
+    if not eligible_ids:
+        return None
+    return session.scalar(
+        select(Run.id).where(Run.id.in_(eligible_ids)).order_by(desc(Run.id)).limit(1)
+    )
 
 
 def _price_raise_opportunities(
-    session: Session, threshold_pct: float, max_spread_pct: float, max_n: int
+    session: Session,
+    threshold_pct: float,
+    max_spread_pct: float,
+    max_n: int,
+    *,
+    tenant_id: int = 1,
 ) -> list[ActionItem]:
     """Где клиент дешевле всех конкурентов более чем на threshold%.
 
@@ -346,12 +555,12 @@ def _price_raise_opportunities(
     bad match (например, поштучный товар склеен с упаковкой 10 шт), советовать
     «подними с 0.20 до 7.60 ₼ — будешь в 3800% дороже» бесполезно.
     """
-    run_id = _latest_run_id(session)
+    run_id = _latest_run_id(session, tenant_id=tenant_id)
     if not run_id:
         return []
 
-    matches = session.scalars(select(Match)).all()
-    snaps_cache = _preload_snapshots(session, run_id)
+    matches = session.scalars(select(Match).where(Match.tenant_id == tenant_id)).all()
+    snaps_cache = _preload_snapshots(session, run_id, tenant_id=tenant_id)
     out: list[ActionItem] = []
 
     for m in matches:
@@ -416,7 +625,12 @@ def _is_in_stock(session: Session, product_id: int) -> bool:
 
 
 def _undercut_threats(
-    session: Session, threshold_pct: float, max_spread_pct: float, max_n: int
+    session: Session,
+    threshold_pct: float,
+    max_spread_pct: float,
+    max_n: int,
+    *,
+    tenant_id: int = 1,
 ) -> list[ActionItem]:
     """Где конкурент опустил цену ниже клиента.
 
@@ -425,12 +639,12 @@ def _undercut_threats(
     (например, поштучный товар слепился с упаковкой 10шт). Реальные ценовые
     войны не дают 99% дисконт.
     """
-    run_id = _latest_run_id(session)
+    run_id = _latest_run_id(session, tenant_id=tenant_id)
     if not run_id:
         return []
 
-    matches = session.scalars(select(Match)).all()
-    snaps_cache = _preload_snapshots(session, run_id)
+    matches = session.scalars(select(Match).where(Match.tenant_id == tenant_id)).all()
+    snaps_cache = _preload_snapshots(session, run_id, tenant_id=tenant_id)
     out: list[ActionItem] = []
 
     for m in matches:
@@ -521,7 +735,12 @@ def _undercut_threats(
     return out[:max_n]
 
 
-def _assortment_gaps(session: Session, max_n: int) -> list[ActionItem]:
+def _assortment_gaps(
+    session: Session,
+    max_n: int,
+    *,
+    tenant_id: int = 1,
+) -> list[ActionItem]:
     """Товары на конкурентах которых нет у клиента (canonical_id is None).
 
     Diff-only-aware (2026-05-09): берём competitor unmatched products + их
@@ -534,12 +753,18 @@ def _assortment_gaps(session: Session, max_n: int) -> list[ActionItem]:
         select(Product).where(
             Product.site.in_(COMPETITOR_SITES),
             Product.canonical_id.is_(None),
+            Product.tenant_id == tenant_id,
         )
     ).all()
     if not products:
         return []
 
-    snaps_by_pid = latest_snapshots_per_product(session, [p.id for p in products])
+    snaps_by_pid = latest_snapshots_per_product(
+        session,
+        [p.id for p in products],
+        financially_eligible_only=True,
+        tenant_id=tenant_id,
+    )
     rows: list[tuple[Product, "PriceSnapshot"]] = []
     for p in products:
         snap = snaps_by_pid.get(p.id)
@@ -573,7 +798,12 @@ def _assortment_gaps(session: Session, max_n: int) -> list[ActionItem]:
     return out
 
 
-def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
+def _map_violations(
+    session: Session,
+    max_n: int,
+    *,
+    tenant_id: int = 1,
+) -> list[ActionItem]:
     """Phase 4.5: Detect client products priced below brand-floor.
 
     Brand-floor = min observed competitor price for that brand over last
@@ -601,6 +831,9 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
     # Step 1: brand-floor per brand, computed across competitor snapshots over window.
     # Используем discount_price если есть (как effective price), иначе price.
     effective_price = func.coalesce(PriceSnapshot.discount_price, PriceSnapshot.price)
+    eligible_run_ids = storage.financially_eligible_run_ids(session, tenant_id=tenant_id)
+    if not eligible_run_ids:
+        return []
     rows = session.execute(
         select(
             Product.brand,
@@ -610,8 +843,10 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
         .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
         .where(
             Product.site.in_(COMPETITOR_SITES),
+            Product.tenant_id == tenant_id,
             Product.brand.is_not(None),
             PriceSnapshot.captured_at >= floor_window_start,
+            PriceSnapshot.run_id.in_(eligible_run_ids),
             effective_price.is_not(None),
             effective_price >= _MIN_PLAUSIBLE_PRICE,
         )
@@ -629,6 +864,7 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
     client_products = session.scalars(
         select(Product).where(
             Product.site == CLIENT_SITE,
+            Product.tenant_id == tenant_id,
             Product.brand.in_(list(brand_floors.keys())),
         )
     ).all()
@@ -636,7 +872,12 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
         return []
 
     client_pids = [p.id for p in client_products]
-    snaps_by_pid = latest_snapshots_per_product(session, client_pids)
+    snaps_by_pid = latest_snapshots_per_product(
+        session,
+        client_pids,
+        financially_eligible_only=True,
+        tenant_id=tenant_id,
+    )
 
     map_violations: list[ActionItem] = []
     for p in client_products:
@@ -696,13 +937,32 @@ def _map_violations(session: Session, max_n: int) -> list[ActionItem]:
     return map_violations[:max_n]
 
 
-def _promo_responses(session: Session, max_n: int) -> list[ActionItem]:
+def _promo_responses(
+    session: Session,
+    max_n: int,
+    *,
+    tenant_id: int = 1,
+) -> list[ActionItem]:
     """Активные промо у конкурентов — могут потребовать ответа."""
-    run_id = _latest_run_id(session)
-    if not run_id:
+    from sqlalchemy import and_, or_
+
+    run_ids = storage.latest_financial_run_ids_by_site(
+        session,
+        COMPETITOR_SITES,
+        tenant_id=tenant_id,
+    )
+    if not run_ids:
         return []
     promos = session.scalars(
-        select(Promo).where(Promo.run_id == run_id, Promo.site.in_(COMPETITOR_SITES))
+        select(Promo).where(
+            Promo.tenant_id == tenant_id,
+            or_(
+                *(
+                    and_(Promo.site == site, Promo.run_id == run_id)
+                    for site, run_id in run_ids.items()
+                )
+            ),
+        )
     ).all()
     out: list[ActionItem] = []
     for promo in promos[:max_n]:

@@ -18,6 +18,42 @@ from src.storage import init_db, make_session, Category
 from sqlalchemy import select
 
 MAP_FILE = Path("data/category_map.json")
+EXCLUSIONS_FILE = Path("data/category_slug_exclusions.json")
+
+
+def load_excluded_slugs(path: Path = EXCLUSIONS_FILE) -> set[tuple[str, str]]:
+    """Load the durable denylist; malformed/missing data fails closed."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("version") != 1 or not isinstance(payload.get("excluded"), list):
+        raise ValueError(f"invalid category exclusion file: {path}")
+    out: set[tuple[str, str]] = set()
+    for row in payload["excluded"]:
+        if not isinstance(row, dict) or not row.get("site") or not row.get("slug"):
+            raise ValueError(f"invalid category exclusion row: {row!r}")
+        out.add((str(row["site"]), str(row["slug"])))
+    return out
+
+
+def filter_discovered_categories(
+    categories: list[dict],
+    excluded_slugs: set[tuple[str, str]],
+) -> tuple[list[dict], int]:
+    """Filter raw discovery output before any DB/key decisions are made."""
+    filtered: list[dict] = []
+    excluded_count = 0
+    for original in categories:
+        category = dict(original)
+        site = str(category["site"])
+        slug = str(category["slug"])
+        if (site, slug) in excluded_slugs:
+            excluded_count += 1
+            continue
+        if site == "aptekonline" and not slug.isdigit():
+            continue
+        if site == "aloe":
+            category["slug"] = slug.rstrip("/")
+        filtered.append(category)
+    return filtered, excluded_count
 
 
 def main() -> None:
@@ -26,20 +62,14 @@ def main() -> None:
     session = S()
 
     cats = json.loads(MAP_FILE.read_text())
+    excluded_slugs = load_excluded_slugs()
     print(f"Loaded {len(cats)} categories from map\n")
 
-    # Filter aptekonline: только числовые ID (это category ID)
-    filtered = []
-    for c in cats:
-        if c["site"] == "aptekonline":
-            if not c["slug"].isdigit():
-                continue
-        if c["site"] == "aloe":
-            # Удалить trailing slash
-            c["slug"] = c["slug"].rstrip("/")
-        filtered.append(c)
+    # Filter denylisted source-empty slugs before existing-key checks, so a
+    # regenerated discovery map can never create `aptek_308_2` tombstone bypasses.
+    filtered, excluded_count = filter_discovered_categories(cats, excluded_slugs)
 
-    print(f"After filter: {len(filtered)}\n")
+    print(f"After filter: {len(filtered)} ({excluded_count} denylisted)\n")
 
     # Существующие slug'и в БД (чтобы не дублировать)
     existing_pharma = {

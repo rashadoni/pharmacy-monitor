@@ -3,7 +3,8 @@
 from datetime import timedelta
 from src._time import utcnow
 
-from src.health import check_health
+from src import storage
+from src.health import alert_signature, check_health
 from src.storage import PriceSnapshot, Product, Run
 
 
@@ -53,10 +54,191 @@ def test_no_runs_returns_warning(db_session):
 def test_recent_ok_run_returns_ok(db_session):
     run = _add_run(db_session, utcnow() - timedelta(hours=1))
     _add_snap(db_session, run, "pharmonline", 10)
+    run.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {
+            "pharmonline": {"status": "ok"},
+            "aptekonline": {"status": "ok"},
+            "aloe": {"status": "ok"},
+        },
+    }
     db_session.commit()
     rep = check_health(db_session)
     assert rep.is_healthy
     assert rep.status == "ok"
+
+
+def test_degraded_run_is_warning_and_changes_alert_signature(db_session):
+    run = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    run.error_message = "aloe=degraded(incomplete_items)"
+    run.run_quality = {
+        "sites": {
+            "aloe": {"status": "degraded", "reasons": ["incomplete_items"]}
+        }
+    }
+    db_session.commit()
+    report = check_health(db_session)
+    assert report.status == "warning"
+    assert any(issue.code == "last_run_degraded" for issue in report.issues)
+    assert "last_run_degraded:" in alert_signature(report)
+
+
+def test_running_run_does_not_hide_last_degraded_health(db_session):
+    degraded = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    degraded.run_quality = {
+        "sites": {"aloe": {"status": "degraded", "reasons": ["incomplete_items"]}}
+    }
+    db_session.add(Run(started_at=utcnow(), status="running"))
+    db_session.commit()
+
+    report = check_health(db_session)
+    assert report.last_run_id == degraded.id
+    assert report.status == "warning"
+    assert any(issue.code == "last_run_degraded" for issue in report.issues)
+
+
+def test_post_processing_run_is_not_terminal_until_finished_at(db_session):
+    finished = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    finished.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {"pharmonline": {"status": "degraded"}},
+    }
+    post_processing = Run(
+        started_at=utcnow(),
+        finished_at=None,
+        status="ok",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
+    db_session.add(post_processing)
+    db_session.commit()
+
+    report = check_health(db_session)
+
+    assert report.last_run_id == finished.id
+    issue = next(i for i in report.issues if i.code == "full_catalog_unverified")
+    assert issue.context["sites"]["pharmonline"]["run_id"] == finished.id
+
+
+def test_partial_history_without_full_catalog_is_warning(db_session):
+    partial = _add_run(db_session, utcnow() - timedelta(hours=1), status="ok")
+    partial.run_quality = {
+        "baseline_enforced": False,
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {"pharmonline": {"status": "ok"}},
+    }
+    db_session.commit()
+
+    report = check_health(db_session)
+
+    assert report.status == "warning"
+    issue = next(i for i in report.issues if i.code == "full_catalog_unverified")
+    assert set(issue.context["sites"]) == set(storage.FULL_CATALOG_SITES)
+    assert all(row["status"] == "missing" for row in issue.context["sites"].values())
+
+
+def test_health_orders_terminal_runs_by_actual_completion(db_session):
+    now = utcnow()
+    degraded = _add_run(db_session, now - timedelta(hours=2), status="degraded")
+    degraded.finished_at = now
+    partial = _add_run(db_session, now - timedelta(hours=1), status="ok")
+    partial.finished_at = now - timedelta(minutes=30)
+    db_session.commit()
+
+    report = check_health(db_session)
+
+    assert report.last_run_id == degraded.id
+    assert report.status == "warning"
+    assert any(issue.code == "last_run_degraded" for issue in report.issues)
+
+
+def test_later_partial_ok_does_not_clear_unverified_full_catalog(db_session):
+    now = utcnow()
+    full = _add_run(db_session, now - timedelta(hours=2), status="degraded")
+    full.finished_at = now - timedelta(hours=1)
+    full.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {"pharmonline": {"status": "degraded"}},
+    }
+    partial = _add_run(db_session, now - timedelta(minutes=30), status="ok")
+    partial.run_quality = {
+        "baseline_enforced": False,
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {"pharmonline": {"status": "ok"}},
+    }
+    db_session.commit()
+
+    report = check_health(db_session)
+
+    assert report.last_run_id == partial.id
+    assert report.last_run_status == "ok"
+    assert report.status == "warning"
+    issue = next(i for i in report.issues if i.code == "full_catalog_unverified")
+    assert issue.context["sites"]["pharmonline"]["run_id"] == full.id
+
+
+def test_single_site_success_does_not_mask_other_degraded_full_sites(db_session):
+    now = utcnow()
+    degraded = _add_run(db_session, now - timedelta(hours=2), status="degraded")
+    degraded.finished_at = now - timedelta(hours=1)
+    degraded.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {
+            "pharmonline": {"status": "degraded"},
+            "aptekonline": {"status": "degraded"},
+            "aloe": {"status": "ok"},
+        },
+    }
+    aloe_ok = _add_run(db_session, now - timedelta(minutes=30), status="ok")
+    aloe_ok.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {"aloe": {"status": "ok"}},
+    }
+    db_session.commit()
+
+    report = check_health(db_session)
+
+    assert report.last_run_id == aloe_ok.id
+    assert report.status == "warning"
+    issue = next(i for i in report.issues if i.code == "full_catalog_unverified")
+    assert issue.context["sites"]["pharmonline"]["run_id"] == degraded.id
+    assert issue.context["sites"]["aptekonline"]["run_id"] == degraded.id
+    assert "aloe" not in issue.context["sites"]
+
+
+def test_degraded_run_with_failed_site_is_critical(db_session):
+    run = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
+    run.run_quality = {
+        "sites": {
+            "aloe": {"status": "ok", "reasons": []},
+            "aptekonline": {"status": "failed", "reasons": ["zero_products"]},
+        }
+    }
+    db_session.commit()
+    report = check_health(db_session)
+    assert report.status == "critical"
+    issue = next(item for item in report.issues if item.code == "degraded_site_failed")
+    assert issue.context["site"] == "aptekonline"
 
 
 def test_site_silence_critical_when_one_site_stale(db_session):

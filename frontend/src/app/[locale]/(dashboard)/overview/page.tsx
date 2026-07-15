@@ -4,11 +4,23 @@ import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, CheckCircle2, AlertCircle, AlertTriangle } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
-import { api, type RunRow, type RoiAction, type HealthSite, type LatestRunBySite } from "@/lib/api";
+import {
+  api,
+  friendlyError,
+  isVerifiedScanPendingError,
+  type RunBreakdown,
+  type RunRow,
+  type RoiAction,
+  type HealthSite,
+  type LatestRunBySite,
+  type SystemStatus,
+} from "@/lib/api";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { QuickActions } from "@/components/quick-actions";
 import { formatNumber, formatRelative, formatPrice } from "@/lib/utils";
 import { categoryDisplayLabel } from "@/lib/category-label";
+import { runStatusToneClass } from "@/lib/run-quality";
+import { MetricStrip } from "@/components/metric-strip";
 
 export default function OverviewPage() {
   const t = useTranslations("overview");
@@ -16,7 +28,10 @@ export default function OverviewPage() {
   const locale = useLocale();
   const matchQ = useQuery({ queryKey: ["match-quality"], queryFn: api.matchQuality });
   const normalizeQ = useQuery({ queryKey: ["normalize-stats"], queryFn: api.normalizeStats });
-  const actionsQ = useQuery({ queryKey: ["roi-actions", locale], queryFn: () => api.roiActions(undefined, locale) });
+  const recommendationsQ = useQuery({
+    queryKey: ["roi-recommendations", "pharmonline", locale],
+    queryFn: () => api.roiRecommendations(undefined, locale),
+  });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
   const latestBySiteQ = useQuery({
     queryKey: ["runs-latest-by-site"],
@@ -24,8 +39,8 @@ export default function OverviewPage() {
   });
   // Phase 5.6: live staleness panel. Refresh every 60s automatically.
   const healthQ = useQuery({
-    queryKey: ["health"],
-    queryFn: api.health,
+    queryKey: ["system-status"],
+    queryFn: api.systemStatus,
     refetchInterval: 60_000,
     staleTime: 30_000,
   });
@@ -49,68 +64,72 @@ export default function OverviewPage() {
       </div>
 
       {/* Phase 5.6 — Per-site staleness panel */}
+      {healthQ.data && <SystemTruthPanel status={healthQ.data} />}
       {healthQ.data && <SiteStalenessPanel sites={healthQ.data.sites} />}
 
-      {/* KPI cards */}
-      <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
-        <KpiCard
-          label={t("kpi_matches")}
-          value={matchQ.data?.total_matches ?? "—"}
-          loading={matchQ.isLoading}
+      <section aria-label={t("subtitle")}>
+        <MetricStrip
+          items={[
+            {
+              label: t("kpi_matches"),
+              value: matchQ.data?.total_matches ?? "—",
+              loading: matchQ.isLoading,
+            },
+            {
+              label: t("kpi_coverage"),
+              value: matchQ.data ? `${matchQ.data.coverage_pct.toFixed(1)}%` : "—",
+              loading: matchQ.isLoading,
+            },
+            {
+              label: t("kpi_products"),
+              value: matchQ.data?.products_total ?? "—",
+              loading: matchQ.isLoading,
+            },
+            {
+              label: t("kpi_price_review"),
+              value: normalizeQ.data
+                ? `${(
+                    (normalizeQ.data.products_needing_review /
+                      Math.max(1, normalizeQ.data.products_total)) *
+                    100
+                  ).toFixed(1)}%`
+                : "—",
+              loading: normalizeQ.isLoading,
+              hint: normalizeQ.data
+                ? t("kpi_price_review_hint", {
+                    count: formatNumber(normalizeQ.data.products_needing_review, locale),
+                    total: formatNumber(normalizeQ.data.products_total, locale),
+                  })
+                : t("kpi_price_review_empty"),
+            },
+          ]}
         />
-        <KpiCard
-          label={t("kpi_coverage")}
-          value={
-            matchQ.data ? `${matchQ.data.coverage_pct.toFixed(1)}%` : "—"
-          }
-          loading={matchQ.isLoading}
-        />
-        <KpiCard
-          label={t("kpi_products")}
-          value={matchQ.data?.products_total ?? "—"}
-          loading={matchQ.isLoading}
-        />
-        {/*
-          P1.3 (PO Audit 2026-05-17): раньше карточка показывала coverage_pct
-          (99.1% «AI прошёл хоть как-то») и в hint'е писала «28457 нужно
-          проверить» — внутреннее противоречие. Теперь — high-confidence
-          процент: (normalized - needs_review) / total. Это даёт честное
-          представление качества AI extraction. Например 35.9% реально-уверенно
-          извлечённых атрибутов, остальные 64% — нужно review-нуть.
-        */}
-        <KpiCard
-          label={t("kpi_ai_confidence")}
-          value={
-            normalizeQ.data
-              ? `${(
-                  ((normalizeQ.data.products_normalized -
-                    normalizeQ.data.needs_review) /
-                    Math.max(1, normalizeQ.data.products_total)) *
-                  100
-                ).toFixed(1)}%`
-              : "—"
-          }
-          loading={normalizeQ.isLoading}
-          hint={
-            normalizeQ.data
-              ? t("kpi_ai_low_confidence", {
-                  count: formatNumber(normalizeQ.data.needs_review, locale),
-                  total: formatNumber(normalizeQ.data.products_total, locale),
-                })
-              : t("kpi_ai_hint")
-          }
-        />
-      </div>
+      </section>
 
       {/* Today's actions */}
       <div>
         <h2 className="text-lg font-semibold mb-3">{t("today_actions")}</h2>
-        {actionsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
-        {actionsQ.data && actionsQ.data.length === 0 && (
+        {recommendationsQ.data?.provenance.run_id != null && (
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("recommendations_provenance", {
+              run: recommendationsQ.data.provenance.run_id,
+              completed: formatRelative(recommendationsQ.data.provenance.run_finished_at, locale),
+            })}
+          </p>
+        )}
+        {recommendationsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
+        {recommendationsQ.isError && (
+          <div className="rounded-md border border-warning/40 bg-warning/5 p-3 text-sm text-warning">
+            {isVerifiedScanPendingError(recommendationsQ.error)
+              ? t("recommendations_waiting_verified")
+              : friendlyError(recommendationsQ.error, locale)}
+          </div>
+        )}
+        {recommendationsQ.data && recommendationsQ.data.items.length === 0 && (
           <div className="text-muted-foreground">{t("no_actions")}</div>
         )}
         <div className="space-y-2">
-          {actionsQ.data?.slice(0, 10).map((a, i) => (
+          {recommendationsQ.data?.items.slice(0, 10).map((a, i) => (
             <ActionRow key={i} action={a} />
           ))}
         </div>
@@ -188,6 +207,12 @@ function LatestRunsBySitePanel({
             <tbody>
               {items.map((item) => {
                 const run = item.run;
+                const attempt = item.latest_attempt;
+                const newerProblem = Boolean(
+                  attempt &&
+                  attempt.id !== run?.id &&
+                  (attempt.status === "degraded" || attempt.status === "failed"),
+                );
                 const siteProducts = run?.products_per_site?.[item.site] ?? run?.products_scraped ?? null;
                 return (
                   <tr key={item.site} className="border-t border-border">
@@ -200,7 +225,14 @@ function LatestRunsBySitePanel({
                       {run ? formatDuration(run.started_at, run.finished_at, t) : "—"}
                     </td>
                     <td className="px-3 py-2">
-                      {run ? <StatusBadge status={run.status} /> : <span className="text-muted-foreground">—</span>}
+                      <div className="flex flex-col items-start gap-1">
+                        {run ? <StatusBadge status={run.status} /> : <span className="text-muted-foreground">—</span>}
+                        {newerProblem && attempt && (
+                          <span className="text-xs text-warning">
+                            {t("newer_attempt_warning", { id: attempt.id })}
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums">
                       {siteProducts == null ? "—" : siteProducts}
@@ -220,6 +252,63 @@ function LatestRunsBySitePanel({
         </div>
       )}
     </div>
+  );
+}
+
+function SystemTruthPanel({ status }: { status: SystemStatus }) {
+  const t = useTranslations("overview");
+  const degraded = status.status !== "up";
+  const queueSize = status.queue.pending + status.queue.running;
+  const cells = [
+    {
+      label: t("system_api"),
+      value: degraded ? t("system_degraded") : t("system_up"),
+      ok: !degraded,
+    },
+    {
+      label: t("system_storage"),
+      value:
+        status.db_ping_ms == null || status.redis_ping_ms == null
+          ? t("system_unavailable")
+          : t("system_latency", {
+              db: status.db_ping_ms.toFixed(1),
+              redis: status.redis_ping_ms.toFixed(1),
+            }),
+      ok: status.db_ping_ms != null && status.redis_ping_ms != null,
+    },
+    {
+      label: t("system_catalog"),
+      value: status.full_catalog_verified
+        ? t("system_catalog_verified")
+        : t("system_catalog_unverified"),
+      ok: status.full_catalog_verified,
+    },
+    {
+      label: t("system_queue"),
+      value: queueSize === 0 ? t("system_queue_empty") : t("system_queue_count", { count: queueSize }),
+      ok: status.queue.running <= 1,
+    },
+  ];
+  return (
+    <section className="rounded-lg border border-border bg-card p-4" aria-label={t("system_status_title")}>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold">{t("system_status_title")}</h2>
+          <p className="text-xs text-muted-foreground">{t("system_status_desc")}</p>
+        </div>
+        <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${degraded ? "bg-warning/10 text-warning" : "bg-success/10 text-success"}`}>
+          {degraded ? t("system_degraded") : t("system_up")}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {cells.map((cell) => (
+          <div key={cell.label} className="rounded-md border border-border bg-background p-3">
+            <div className="text-xs text-muted-foreground">{cell.label}</div>
+            <div className={`mt-1 text-sm font-medium ${cell.ok ? "text-foreground" : "text-warning"}`}>{cell.value}</div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -269,7 +358,7 @@ function RunRowExpandable({
       </tr>
       {isExpanded && (
         <tr className="border-t border-border bg-muted/10">
-          <td colSpan={6} className="px-3 py-3">
+          <td colSpan={7} className="px-3 py-3">
             {breakdownQ.isLoading && (
               <div className="text-xs text-muted-foreground">{t("loading_breakdown")}</div>
             )}
@@ -285,12 +374,7 @@ function RunRowExpandable({
 
 function RunBreakdownPanel({
   data,
-}: {
-  data: {
-    products_per_site: Record<string, number>;
-    products_per_site_category: Record<string, Record<string, number>>;
-  };
-}) {
+}: { data: RunBreakdown }) {
   const t = useTranslations("overview");
   const locale = useLocale();
   // Load categories один раз — нужно для локализованного маппинга slug → label.
@@ -319,6 +403,39 @@ function RunBreakdownPanel({
 
   return (
     <div className="space-y-3">
+      {data.run_quality && (
+        <div className="rounded-md border border-warning/40 bg-warning/5 p-3 text-xs">
+          <div className="font-medium text-sm">{t("quality_title")}</div>
+          <div className="mt-1 text-muted-foreground">
+            {t("quality_mode", { mode: data.run_quality.mode })} ·{" "}
+            {data.run_quality.financially_eligible
+              ? t("quality_financial_yes")
+              : t("quality_financial_no")}
+          </div>
+          <div className="mt-2 grid gap-2 md:grid-cols-2 lg:grid-cols-3">
+            {Object.entries(data.run_quality.sites).map(([site, quality]) => (
+              <div key={site} className="rounded border border-border bg-card px-2.5 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium">{site}</span>
+                  <StatusBadge status={quality.status} />
+                </div>
+                <div className="mt-1 text-muted-foreground">
+                  {t("quality_items", {
+                    completed: quality.items_completed,
+                    expected: quality.items_expected,
+                    failed: quality.items_failed,
+                  })}
+                </div>
+                {quality.reasons.length > 0 && (
+                  <div className="mt-1 font-mono text-[10px] text-warning">
+                    {quality.reasons.join(", ")}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="flex flex-wrap gap-2">
         {sites.map((site) => (
           <div
@@ -379,30 +496,6 @@ function RunBreakdownPanel({
           );
         })}
       </div>
-    </div>
-  );
-}
-
-function KpiCard({
-  label,
-  value,
-  loading,
-  hint,
-}: {
-  label: string;
-  value: number | string;
-  loading: boolean;
-  hint?: string;
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-card p-4">
-      <div className="text-xs text-muted-foreground uppercase tracking-wide">{label}</div>
-      <div className="text-2xl font-semibold mt-1 tabular-nums">
-        {loading ? "…" : value}
-      </div>
-      {hint && (
-        <div className="text-xs text-muted-foreground mt-1">{hint}</div>
-      )}
     </div>
   );
 }
@@ -472,15 +565,15 @@ function formatDuration(
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const cls =
-    status === "ok"
-      ? "bg-success/10 text-success"
-      : status === "failed"
-        ? "bg-destructive/10 text-destructive"
-        : "bg-muted text-muted-foreground";
+  const t = useTranslations("overview");
+  const translated = ["ok", "running", "degraded", "failed"].includes(status)
+    ? t(`status_${status}` as "status_ok")
+    : status;
   return (
-    <span className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${cls}`}>
-      {status}
+    <span
+      className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${runStatusToneClass(status)}`}
+    >
+      {translated}
     </span>
   );
 }
@@ -493,7 +586,7 @@ function SiteStalenessPanel({ sites }: { sites: HealthSite[] }) {
   return (
     <div className="rounded-lg border border-border bg-card p-4">
       <div className="flex items-center justify-between mb-3">
-        <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+        <h2 className="text-sm font-semibold text-muted-foreground">
           {t("title")}
         </h2>
         <span className="text-xs text-muted-foreground">{t("auto_refresh")}</span>

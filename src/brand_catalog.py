@@ -436,6 +436,9 @@ _BLOCKLIST_FIRST_WORD = {
     "toothpaste",
     "salfetka",
     "salfetkalar",
+    "spris",  # şpris = syringe
+    "qlukoza",  # glucose product descriptor
+    "elektron",  # product/device descriptor, not a manufacturer
 }
 
 
@@ -503,7 +506,15 @@ def is_brand_blacklisted(brand: str | None) -> bool:
     """
     if not brand:
         return False
-    return _is_blocklisted_word(brand.strip())
+    value = brand.strip()
+    if not value:
+        return False
+    # Scrapers occasionally promote pack markers ("0", "N120", "№20") to
+    # brands. These are structurally impossible brand identities and must not
+    # power exclusivity or matcher analytics.
+    if re.fullmatch(r"(?:n|№)?\d{1,6}", value, flags=re.IGNORECASE):
+        return True
+    return _is_blocklisted_word(value)
 
 
 def extract_brand(name: str | None) -> str | None:

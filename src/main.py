@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 from src._time import utcnow
 from pathlib import Path
 
@@ -27,10 +27,19 @@ from sqlalchemy.orm import Session
 load_dotenv(override=True)
 
 from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
+from src.run_lock import SCRAPE_ADVISORY_LOCK_KEY  # noqa: E402
 from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
 from src.scrapers.aptekonline import AptekonlineScraper  # noqa: E402
-from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapeResult  # noqa: E402
+from src.scrapers.base import (  # noqa: E402
+    BaseScraper,
+    ScrapedProduct,
+    ScrapeResult,
+    SiteScrapeFatalError,
+    fatal_proxy_reason,
+    site_fatal_error_message,
+    site_fatal_result,
+)
 from src.scrapers.pharmonline import PharmonlineScraper  # noqa: E402
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "categories.yaml"
@@ -127,6 +136,7 @@ def _report_email_enabled() -> bool:
 
 
 _MATCHER_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
+_SCRAPE_ADVISORY_LOCK_KEY = SCRAPE_ADVISORY_LOCK_KEY
 
 
 def _is_postgres_session(session: Session) -> bool:
@@ -162,6 +172,62 @@ def _release_matcher_lock(session: Session) -> None:
         log.warning("matcher_lock_release_failed", error=str(exc))
 
 
+def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
+    """Hold one checked-out connection's session lock without an idle transaction."""
+    bind = SessionFactory.kw.get("bind")
+    if bind is None:
+        raise RuntimeError("scrape lock requires a bound session factory")
+    if not str(bind.url).startswith("postgresql"):
+        return True
+
+    connection = bind.connect()
+    try:
+        function = "pg_advisory_lock" if wait else "pg_try_advisory_lock"
+        acquired = connection.scalar(
+            text(f"SELECT {function}(hashtext(:key))"),
+            {"key": _SCRAPE_ADVISORY_LOCK_KEY},
+        )
+        # Session-level advisory locks survive COMMIT. End the implicit
+        # transaction immediately so a multi-hour scrape is never
+        # idle-in-transaction, while this exact connection stays checked out.
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        connection.close()
+        raise
+    if not wait and not acquired:
+        connection.close()
+        return False
+
+    context = click.get_current_context(silent=True)
+    if context is None:
+        try:
+            connection.scalar(
+                text("SELECT pg_advisory_unlock(hashtext(:key))"),
+                {"key": _SCRAPE_ADVISORY_LOCK_KEY},
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        raise RuntimeError("scrape lock requires an active Click command context")
+
+    def release() -> None:
+        try:
+            connection.scalar(
+                text("SELECT pg_advisory_unlock(hashtext(:key))"),
+                {"key": _SCRAPE_ADVISORY_LOCK_KEY},
+            )
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            log.warning("scrape_lock_release_failed", error=str(exc))
+        finally:
+            connection.close()
+
+    context.call_on_close(release)
+    return True
+
+
 def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | None]:
     """Pre-fetch products_per_site from latest ok run for each requested site.
 
@@ -181,6 +247,61 @@ def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | N
         val = last_ok.products_per_site.get(site)
         if isinstance(val, int) and val > 0:
             out[site] = val
+    return out
+
+
+def run_quality_baselines_for_sites(
+    session: Session,
+    sites: list[str],
+    *,
+    tenant_id: int = 1,
+    history_limit: int = 100,
+) -> dict[str, int | None]:
+    """Return the median of recent confirmed full-run counts per site.
+
+    New rows explicitly carry ``financially_eligible``. Legacy rows are only
+    accepted when they contain a multi-category breakdown; this rejects hourly
+    ticks/watchlists without letting an old inflated maximum poison the
+    baseline forever.
+    """
+    candidates: dict[str, list[int]] = {site: [] for site in sites}
+    recent = session.scalars(
+        select(storage.Run)
+        .where(
+            storage.Run.status == "ok",
+            storage.Run.tenant_id == tenant_id,
+        )
+        .order_by(desc(storage.Run.id))
+        .limit(history_limit)
+    ).all()
+    for run in recent:
+        quality = run.run_quality or {}
+        per_site = run.products_per_site or {}
+        for site in sites:
+            if quality:
+                if not quality.get("financially_eligible"):
+                    continue
+            else:
+                legacy_categories = (run.products_per_site_category or {}).get(site) or {}
+                if len(legacy_categories) < 2:
+                    continue
+            value = per_site.get(site)
+            if isinstance(value, int) and value > 0:
+                candidates[site].append(value)
+        if all(len(values) >= 5 for values in candidates.values()):
+            break
+
+    out: dict[str, int | None] = {}
+    for site, values in candidates.items():
+        if not values:
+            out[site] = None
+            continue
+        sample = sorted(values[:5])
+        midpoint = len(sample) // 2
+        if len(sample) % 2:
+            out[site] = sample[midpoint]
+        else:
+            out[site] = round((sample[midpoint - 1] + sample[midpoint]) / 2)
     return out
 
 
@@ -256,18 +377,20 @@ def reap_stale_running_runs(
     session: Session,
     *,
     max_age_hours: float = 6.0,
-    reason: str = "reaped stale running run after interrupted/timeout process",
+    reason: str = "reaped stale unfinished run after interrupted/timeout process",
 ) -> int:
-    """Mark orphaned `runs.status=running` rows as failed.
+    """Fail and finish every stale run left without ``finished_at``.
 
     Callers must guard that no pharmacy-monitor scrape/rematch process is active.
-    This is for DB rows left behind after a killed process, reboot, or timeout.
+    This is for DB rows left behind after a killed process, reboot, timeout, or
+    a legacy error path that set ``status=failed`` without a completion stamp.
+    A classified ``ok``/``degraded`` orphan is deliberately stripped of money
+    trust: post-processing may have stopped after mutating Product/Match rows.
     """
     cutoff = utcnow() - timedelta(hours=max_age_hours)
     stale = session.scalars(
         select(storage.Run)
         .where(
-            storage.Run.status == "running",
             storage.Run.started_at < cutoff,
             storage.Run.finished_at.is_(None),
         )
@@ -275,11 +398,28 @@ def reap_stale_running_runs(
     ).all()
     if not stale:
         return 0
-    finished_at = utcnow()
+    recovered_at = utcnow()
     for run in stale:
+        previous_status = run.status
         run.status = "failed"
-        run.finished_at = finished_at
-        run.error_message = ((run.error_message or "") + f" | {reason}").strip(" |")
+        # Preserve historical ordering. Recovery today must not make a May
+        # orphan newer than a healthy July run merely because its legacy row
+        # lacked a completion stamp.
+        run.finished_at = run.started_at
+        if run.run_quality:
+            quality = dict(run.run_quality)
+            quality["full_catalog_verified"] = False
+            quality["financially_eligible"] = False
+            quality["recovery"] = {
+                "reason": reason,
+                "previous_status": previous_status,
+                "recovered_at": recovered_at.isoformat(),
+            }
+            run.run_quality = quality
+        recovery_note = (
+            f"{reason} (previous_status={previous_status}, recovered_at={recovered_at.isoformat()})"
+        )
+        run.error_message = ((run.error_message or "") + f" | {recovery_note}").strip(" |")
     session.commit()
     return len(stale)
 
@@ -306,15 +446,29 @@ async def scrape_site(
     cls = SCRAPER_CLASSES[site]
     if not slugs:
         log.warning("no_categories_configured", site=site)
-        return ScrapeResult(site=site)
-    async with cls() as s:
-        result = await s.scrape(
-            slugs, limit_per_category=limit_per_category, on_category=on_category
+        return ScrapeResult(
+            site=site,
+            errors=["no_categories_configured"],
         )
+    try:
+        async with cls() as s:
+            result = await s.scrape(
+                slugs, limit_per_category=limit_per_category, on_category=on_category
+            )
+    except SiteScrapeFatalError as exc:
+        log.error(
+            "site_scrape_start_aborted",
+            site=site,
+            categories=len(slugs),
+            error=site_fatal_error_message(exc),
+        )
+        return site_fatal_result(site, slugs, exc)
 
     # Phase 1.4 — optional AI crawler fallback when primary yield collapses.
     # Only kicks in if AI_FALLBACK_ENABLED=1 in env (off by default — costs $).
-    if _should_trigger_ai_fallback(len(result.products), ai_fallback_baseline):
+    if not result.site_fatal and _should_trigger_ai_fallback(
+        len(result.products), ai_fallback_baseline
+    ):
         ai_cls = AI_CRAWLER_BY_SITE.get(site)
         if ai_cls is None:
             log.warning("ai_fallback_no_subclass", site=site)
@@ -349,13 +503,24 @@ async def scrape_site(
                 )
                 if ai_result.errors:
                     result.errors.extend(f"ai_fallback: {e}" for e in ai_result.errors[:5])
+            except SiteScrapeFatalError as e:
+                message = site_fatal_error_message(e)
+                result.site_fatal = True
+                result.errors.append(f"site_fatal: ai_fallback: {message}")
+                log.error("ai_fallback_aborted", site=site, error=message)
             except Exception as e:
-                log.error(
-                    "ai_fallback_failed",
-                    site=site,
-                    error=f"{type(e).__name__}: {e}",
-                )
-                result.errors.append(f"ai_fallback: {type(e).__name__}: {e}")
+                reason = fatal_proxy_reason(e)
+                if reason is not None:
+                    result.site_fatal = True
+                    result.errors.append(f"site_fatal: ai_fallback: {reason}")
+                    log.error("ai_fallback_aborted", site=site, error=reason)
+                else:
+                    log.error(
+                        "ai_fallback_failed",
+                        site=site,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    result.errors.append(f"ai_fallback: {type(e).__name__}: {e}")
     return result
 
 
@@ -384,15 +549,75 @@ async def scrape_watchlist_for_site(site: str, urls: list[str]) -> ScrapeResult:
     """Watchlist-режим: ходим по конкретным URL'ам товаров на одном сайте."""
     cls = SCRAPER_CLASSES[site]
     if not urls:
-        return ScrapeResult(site=site)
-    async with cls() as s:
-        products = await s.scrape_urls(urls)
-        try:
-            promos = await s.scrape_promos()
-        except Exception as e:
-            log.warning("promos_failed", site=site, error=str(e))
-            promos = []
-        return ScrapeResult(site=site, products=products, promos=promos)
+        return ScrapeResult(site=site, errors=["no_watchlist_urls"])
+    result = ScrapeResult(site=site, items_expected=len(urls))
+    try:
+        async with cls() as s:
+
+            def _record_url(url, product, error):
+                if product is not None:
+                    result.products.append(product)
+                    result.items_completed += 1
+                    result.item_results[url] = {"status": "ok", "products": 1}
+                    return
+                result.items_failed += 1
+                result.item_results[url] = {
+                    "status": "failed",
+                    "products": 0,
+                    "error": str(error or "product_not_found")[:500],
+                    "error_kind": ("not_found" if error == "product_not_found" else "exception"),
+                }
+                result.errors.append(f"url={url}: {error or 'product_not_found'}")
+
+            def _record_abort(current_url, remaining_urls, error):
+                message = site_fatal_error_message(error)
+                result.site_fatal = True
+                result.items_failed += 1 + len(remaining_urls)
+                result.item_results[current_url] = {
+                    "status": "failed",
+                    "products": 0,
+                    "error": message,
+                    "error_kind": "site_fatal",
+                }
+                for remaining_url in remaining_urls:
+                    result.item_results[remaining_url] = {
+                        "status": "skipped",
+                        "products": 0,
+                        "error": message,
+                        "error_kind": "site_fatal",
+                    }
+                result.errors.append(f"site_fatal: {message}")
+
+            try:
+                await s.scrape_urls(urls, on_result=_record_url, on_abort=_record_abort)
+            except SiteScrapeFatalError:
+                return result
+            try:
+                result.promos = await s.scrape_promos()
+            except SiteScrapeFatalError as e:
+                message = site_fatal_error_message(e)
+                result.site_fatal = True
+                result.errors.append(f"site_fatal: promos: {message}")
+                log.error("watchlist_promos_aborted", site=site, error=message)
+            except Exception as e:
+                reason = fatal_proxy_reason(e)
+                if reason is not None:
+                    message = reason
+                    result.site_fatal = True
+                    result.errors.append(f"site_fatal: promos: {message}")
+                    log.error("watchlist_promos_aborted", site=site, error=message)
+                else:
+                    log.warning("promos_failed", site=site, error=str(e))
+                    result.errors.append(f"promos: {type(e).__name__}: {e}")
+            return result
+    except SiteScrapeFatalError as exc:
+        log.error(
+            "watchlist_site_start_aborted",
+            site=site,
+            urls=len(urls),
+            error=site_fatal_error_message(exc),
+        )
+        return site_fatal_result(site, urls, exc)
 
 
 async def scrape_watchlist_all(urls_by_site: dict[str, list[str]]) -> list[ScrapeResult]:
@@ -473,6 +698,221 @@ def _per_category_breakdown(results: list) -> dict[str, int]:
         for sp in result.products:
             breakdown[sp.category or "(uncategorized)"] += 1
     return dict(breakdown)
+
+
+_RUN_BASELINE_MIN_FRACTION = 0.50
+_RUN_QUALITY_MAX_ITEMS = 500
+
+
+class RunQualityFailure(RuntimeError):
+    """Scrape phase produced no trustworthy site result."""
+
+
+def classify_run_quality(
+    results: list[ScrapeResult],
+    requested_sites: list[str],
+    *,
+    mode: str,
+    baselines: dict[str, int | None] | None = None,
+    enforce_baseline: bool = False,
+) -> tuple[str, dict]:
+    """Classify a completed scrape phase as ok/degraded/failed.
+
+    The classifier is deliberately conservative only for full category runs.
+    A category-id, limit, watchlist or intraday run is intentionally partial and
+    therefore is not compared with a full-catalog baseline. Unit-level failures
+    (category or URL) are still visible and degrade the run in every mode.
+    """
+    baselines = baselines or {}
+    by_site = {result.site: result for result in results}
+    site_details: dict[str, dict] = {}
+
+    for site in requested_sites:
+        result = by_site.get(site)
+        if result is None:
+            site_details[site] = {
+                "status": "failed",
+                "products": 0,
+                "items_expected": 0,
+                "items_completed": 0,
+                "items_failed": 0,
+                "baseline_products": None,
+                "baseline_fraction": None,
+                "reasons": ["missing_site_result"],
+                "errors": ["scraper returned no result for requested site"],
+                "errors_truncated": 0,
+                "items": {},
+                "items_truncated": 0,
+            }
+            continue
+
+        expected = max(0, int(result.items_expected or 0))
+        completed = max(0, int(result.items_completed or 0))
+        failed = max(0, int(result.items_failed or 0))
+        products = len(result.products)
+        baseline = baselines.get(site)
+        reasons: list[str] = []
+        ordered_items = list(result.item_results.items())
+        ordered_items.sort(key=lambda item: item[1].get("status") == "ok")
+        persisted_items: dict[str, dict] = {}
+        for index, (raw_key, raw_value) in enumerate(ordered_items[:_RUN_QUALITY_MAX_ITEMS]):
+            key = str(raw_key)[:300]
+            if key in persisted_items:
+                suffix = f"~{index}"
+                key = f"{key[: 300 - len(suffix)]}{suffix}"
+            value = raw_value if isinstance(raw_value, dict) else {}
+            persisted_items[key] = {
+                "status": str(value.get("status") or "unknown")[:30],
+                "products": max(0, int(value.get("products") or 0)),
+                **({"error": str(value.get("error"))[:500]} if value.get("error") else {}),
+                **(
+                    {"error_kind": str(value.get("error_kind"))[:50]}
+                    if value.get("error_kind")
+                    else {}
+                ),
+            }
+
+        if result.site_fatal:
+            status = "failed"
+            reasons.append("site_fatal")
+        elif expected == 0:
+            status = "failed"
+            reasons.append("no_items_requested")
+        elif products == 0:
+            status = "failed"
+            reasons.append("zero_products")
+        else:
+            status = "ok"
+            if failed > 0 or completed < expected:
+                status = "degraded"
+                reasons.append("incomplete_items")
+            if result.errors:
+                status = "degraded"
+                reasons.append("scraper_errors")
+            if (
+                enforce_baseline
+                and isinstance(baseline, int)
+                and baseline > 0
+                and products < baseline * _RUN_BASELINE_MIN_FRACTION
+            ):
+                status = "degraded"
+                reasons.append("below_baseline")
+
+        site_details[site] = {
+            "status": status,
+            "products": products,
+            "items_expected": expected,
+            "items_completed": completed,
+            "items_failed": failed,
+            "site_fatal": bool(result.site_fatal),
+            "baseline_products": baseline if isinstance(baseline, int) and baseline > 0 else None,
+            "baseline_fraction": (
+                round(products / baseline, 4)
+                if isinstance(baseline, int) and baseline > 0
+                else None
+            ),
+            "reasons": reasons,
+            "errors": [str(error)[:500] for error in result.errors[:20]],
+            "errors_truncated": max(0, len(result.errors) - 20),
+            "items": persisted_items,
+            "items_truncated": max(0, len(ordered_items) - len(persisted_items)),
+        }
+
+    statuses = [row["status"] for row in site_details.values()]
+    if not statuses or all(status == "failed" for status in statuses):
+        overall = "failed"
+    elif any(status != "ok" for status in statuses):
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    full_catalog_verified = overall == "ok" and mode == "category" and enforce_baseline
+    return overall, {
+        "version": 1,
+        "mode": mode,
+        "baseline_enforced": enforce_baseline,
+        "baseline_min_fraction": _RUN_BASELINE_MIN_FRACTION if enforce_baseline else None,
+        "full_catalog_verified": full_catalog_verified,
+        "financially_eligible": full_catalog_verified,
+        "sites": site_details,
+    }
+
+
+def scope_category_run_sites(
+    slugs_by_site: dict[str, list[str]],
+    requested_sites: list[str],
+    *,
+    category_id: int | None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Limit a single-category run to sites where that category has a route.
+
+    A category can intentionally exist on only one or two sites. Treating the
+    other requested sites as ``no_items_requested`` makes a successful partial
+    category scan look degraded. Full-catalog runs stay fail-closed: an empty
+    site configuration is preserved so the quality classifier can reject it.
+    If a single-category row has no route anywhere, preserve the original scope
+    as well so the run fails instead of becoming a vacuous success.
+    """
+    if category_id is None:
+        return list(requested_sites), slugs_by_site
+
+    configured = {
+        site: slugs_by_site.get(site, []) for site in requested_sites if slugs_by_site.get(site)
+    }
+    if not configured:
+        return list(requested_sites), slugs_by_site
+    return list(configured), configured
+
+
+def is_run_financially_eligible(run: storage.Run | None) -> bool:
+    return storage.run_is_financially_eligible(run)
+
+
+def run_quality_message(status: str, quality: dict) -> str | None:
+    if status == "ok":
+        return None
+    fragments: list[str] = []
+    for site, details in (quality.get("sites") or {}).items():
+        if details.get("status") == "ok":
+            continue
+        reasons = ",".join(details.get("reasons") or ["unknown"])
+        fragments.append(f"{site}={details.get('status')}({reasons})")
+    if not fragments:
+        fragments.append("no requested scrape work produced a valid result")
+    return f"run quality {status}: " + "; ".join(fragments)
+
+
+def mark_scrape_request_terminal(
+    session: Session,
+    request_id: int,
+    run: storage.Run,
+) -> storage.ScrapeRequest | None:
+    """Copy the authoritative scrape-phase terminal state to the UI queue."""
+    request = session.get(storage.ScrapeRequest, request_id)
+    if request is None or request.tenant_id != run.tenant_id:
+        return None
+    request.run_id = run.id
+    request.status = run.status
+    request.completed_at = utcnow()
+    request.error_message = run.error_message
+    session.commit()
+    return request
+
+
+def run_tenant_id_for_request(session: Session, request_id: int | None) -> int:
+    """Resolve CLI run ownership from an active queue request."""
+    if request_id is None:
+        return 1
+    request = session.get(storage.ScrapeRequest, request_id)
+    if request is None:
+        raise click.ClickException(f"scrape request #{request_id} not found")
+    if request.status not in {"pending", "running"}:
+        raise click.ClickException(f"scrape request #{request_id} is already {request.status}")
+    if request.tenant_id != 1:
+        raise click.ClickException(
+            "Server-side scraping is not enabled for non-pilot tenants; request blocked."
+        )
+    return request.tenant_id
 
 
 def _smoke_test_per_site_coverage(
@@ -965,21 +1405,25 @@ def db_check_cmd(fix: bool) -> None:
     "--max-age-hours",
     type=float,
     default=6.0,
-    help="Mark running runs older than N hours as failed.",
+    help="Mark unfinished runs older than N hours as failed.",
 )
 @click.option(
     "--reason",
-    default="reaped stale running run after interrupted/timeout process",
+    default="reaped stale unfinished run after interrupted/timeout process",
     help="Reason appended to run.error_message.",
 )
 def reap_stale_runs_cmd(max_age_hours: float, reason: str) -> None:
-    """Mark orphaned `runs.status=running` rows as failed.
+    """Mark orphaned runs without ``finished_at`` as failed.
 
     Intended for server watcher use after it confirms no scrape/rematch process
     is active. Does not kill processes.
     """
     storage.init_db()
     Session = storage.make_session()
+    if not _hold_scrape_lock_until_command_exit(Session, wait=False):
+        raise click.ClickException(
+            "recovery refused: an active scrape/rematch producer holds the run lock"
+        )
     with Session() as s:
         count = reap_stale_running_runs(s, max_age_hours=max_age_hours, reason=reason)
     click.echo(f"reaped {count} stale running run(s)")
@@ -1711,9 +2155,11 @@ def ai_crawl_cmd(
         async with cls() as scraper:
             return await scraper.crawl(max_urls=max_urls, dry_run=dry_run)
 
-    result = asyncio.run(_run())
-
     if dry_run:
+        try:
+            result = asyncio.run(_run())
+        except SiteScrapeFatalError as exc:
+            raise click.ClickException(site_fatal_error_message(exc))
         click.echo(
             f"[dry-run] AI-crawl {site}: errors={len(result.errors)}. "
             "См. structlog 'ai_crawl_summary' (logs/app.jsonl) для visited/captcha/cost."
@@ -1721,24 +2167,58 @@ def ai_crawl_cmd(
         return
 
     Session = storage.make_session()
+    if not _hold_scrape_lock_until_command_exit(Session, wait=False):
+        raise click.ClickException("AI crawl blocked because another scrape run is active")
     with Session() as session:
         run = storage.Run(status="running")
         session.add(run)
         session.commit()
         try:
+            try:
+                result = asyncio.run(_run())
+            except SiteScrapeFatalError as exc:
+                result = site_fatal_result(site, ["ai_crawl"], exc)
+            if result.items_expected == 0:
+                result.items_expected = 1
+                result.items_completed = 1 if result.products else 0
+                result.items_failed = 1 if result.errors or not result.products else 0
+                result.item_results = {
+                    "ai_crawl": {
+                        "status": (
+                            "failed"
+                            if not result.products
+                            else "degraded"
+                            if result.errors
+                            else "ok"
+                        ),
+                        "products": len(result.products),
+                        "error": "; ".join(result.errors[:5])[:500] or None,
+                    }
+                }
             count = persist_results(session, run, [result])
             run.products_scraped = count
             run.products_per_site = {site: len(result.products)}
             run.products_per_site_category = {site: _per_category_breakdown([result])}
             run.sites_completed = site
-            run.status = "ok"
+            quality_status, quality = classify_run_quality(
+                [result],
+                [site],
+                mode="ai_crawl",
+            )
+            run.status = quality_status
+            run.run_quality = quality
+            run.error_message = run_quality_message(quality_status, quality)
             run.finished_at = utcnow()
             session.commit()
+            if quality_status == "failed":
+                raise RunQualityFailure(run.error_message or "run quality failed")
             click.echo(
-                f"OK: AI-crawl {site} → run #{run.id}, "
+                f"{quality_status}: AI-crawl {site} → run #{run.id}, "
                 f"persisted {count} (из {len(result.products)} extracted), "
                 f"errors={len(result.errors)}"
             )
+        except RunQualityFailure as e:
+            raise click.ClickException(str(e))
         except Exception as e:
             run.status = "failed"
             run.error_message = f"{type(e).__name__}: {e}"
@@ -1814,8 +2294,8 @@ def seed_demo_cmd(force: bool) -> None:
     type=int,
     default=None,
     help="ID строки в scrape_requests. Если задан — после persist (но ДО matcher) "
-    "немедленно проставляем status='ok' + run_id, чтобы UI показал «Готово — N "
-    "товаров» не дожидаясь медленных matcher/analyzer фаз.",
+    "немедленно проставляем честный status ok/degraded/failed + run_id, чтобы UI "
+    "не ждал медленных matcher/analyzer фаз.",
 )
 def run_cmd(
     dry_run: bool,
@@ -1832,10 +2312,14 @@ def run_cmd(
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
 
     Session = storage.make_session()
+    # Full/manual runs wait for a short partial producer to finish. Conversely,
+    # scrape-only/intraday producers below fail-fast while this lock is held.
+    _hold_scrape_lock_until_command_exit(Session, wait=True)
     with Session() as session:
         maybe_seed_categories(session)
 
-        run = storage.Run(status="running")
+        run_tenant_id = run_tenant_id_for_request(session, request_id)
+        run = storage.Run(status="running", tenant_id=run_tenant_id)
         session.add(run)
         session.commit()
         run_id = run.id
@@ -1868,8 +2352,12 @@ def run_cmd(
         )
 
         try:
+            quality_sites: list[str] = list(sites)
+            quality_baselines: dict[str, int | None] = {}
+            enforce_quality_baseline = False
             if effective_mode == "watchlist":
-                filtered = {s: urls for s, urls in watchlist_urls.items() if s in sites}
+                filtered = {s: urls for s, urls in watchlist_urls.items() if s in sites and urls}
+                quality_sites = list(filtered)
                 results = asyncio.run(scrape_watchlist_all(filtered))
             else:
                 # Категории из БД, опционально фильтр по одной category_id
@@ -1877,7 +2365,18 @@ def run_cmd(
                     s: watchlist.categories_for_site(session, s, only_category_id=category_id)
                     for s in sites
                 }
+                quality_sites, slugs_by_site = scope_category_run_sites(
+                    slugs_by_site,
+                    sites,
+                    category_id=category_id,
+                )
                 baselines = baselines_for_sites(session, sites)
+                quality_baselines = run_quality_baselines_for_sites(
+                    session,
+                    sites,
+                    tenant_id=run.tenant_id,
+                )
+                enforce_quality_baseline = limit is None and category_id is None
 
                 # Инкрементальный persist: сохраняем каждую категорию СРАЗУ (callback
                 # → persist_results коммитит per-result), чтобы медленный/оборванный/
@@ -1905,28 +2404,51 @@ def run_cmd(
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
             run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
-            run.sites_completed = ",".join(sites)
+            run.sites_completed = ",".join(r.site for r in results)
+            quality_status, quality = classify_run_quality(
+                results,
+                quality_sites,
+                mode=effective_mode,
+                baselines=quality_baselines,
+                enforce_baseline=enforce_quality_baseline,
+            )
+            run.status = quality_status
+            run.run_quality = quality
+            run.error_message = run_quality_message(quality_status, quality)
             session.commit()
 
             # === Early-complete для UI-triggered scrape (job queue) ===
             # Если запущены через `pharmacy-monitor run --request-id N`, помечаем
-            # ScrapeRequest как 'ok' СРАЗУ после persist. Это даёт UI feedback
-            # «Готово — N товаров» в течение секунды после scrape phase, не
-            # заставляя клиента ждать 10-30 мин на matcher через SSH tunnel.
-            # Matcher/analyzer запустятся дальше, но клиент уже видит результат.
+            # ScrapeRequest получает честный ok/degraded/failed СРАЗУ после
+            # persist. UI не ждёт matcher, но и не называет частичный scrape
+            # успешным.
             if request_id is not None:
-                req = session.get(storage.ScrapeRequest, request_id)
+                req = mark_scrape_request_terminal(session, request_id, run)
                 if req is not None:
-                    req.run_id = run.id
-                    req.status = "ok"
-                    req.completed_at = datetime.utcnow()
-                    session.commit()
                     log.info(
-                        "scrape_request_marked_ok_early",
+                        "scrape_request_marked_complete_early",
                         request_id=request_id,
                         run_id=run.id,
+                        status=quality_status,
                         products_scraped=count,
                     )
+
+            if quality_status == "failed":
+                run.finished_at = utcnow()
+                session.commit()
+                log.error(
+                    "run_quality_failed",
+                    run_id=run.id,
+                    quality=quality,
+                )
+                raise RunQualityFailure(run.error_message or "run quality failed")
+
+            if quality_status == "degraded":
+                log.warning(
+                    "run_quality_degraded",
+                    run_id=run.id,
+                    quality=quality,
+                )
 
             # === Smoke-test: per-site coverage drop ===
             # Если конкретный сайт собрал <50% от среднего за последние 5 ok-runs —
@@ -1966,7 +2488,7 @@ def run_cmd(
                     _release_matcher_lock(session)
 
             # === Real-time alerts ===
-            if not no_alerts:
+            if not no_alerts and is_run_financially_eligible(run):
                 from src import alerts as alerts_mod, notifications as notif_mod
 
                 fired = alerts_mod.evaluate_rules(session, run.id)
@@ -1980,6 +2502,12 @@ def run_cmd(
                     log.info("alerts_dispatched", count=len(fired))
                 elif fired:
                     log.info("alerts_dispatch_skipped_dry_run", count=len(fired))
+            elif not no_alerts:
+                log.warning(
+                    "alerts_skipped_run_quality",
+                    run_id=run.id,
+                    status=run.status,
+                )
             report = analyzer.analyze(session, run.id)
 
             html = reporter.render_html(report)
@@ -1997,7 +2525,21 @@ def run_cmd(
 
             # В hourly режиме пропускаем большой email-отчёт (только alerts).
             # SCRAPE_REPORT_EMAIL=0 отключает его глобально (см. _report_email_enabled).
-            if not dry_run and not hourly and _report_email_enabled():
+            report_inputs_ready = False
+            if is_run_financially_eligible(run):
+                from src import roi as roi_mod
+
+                report_inputs_ready = roi_mod.financial_inputs_are_fresh(
+                    session,
+                    tenant_id=run.tenant_id,
+                )
+            if (
+                report_inputs_ready
+                and run.tenant_id == 1
+                and not dry_run
+                and not hourly
+                and _report_email_enabled()
+            ):
                 notifier.send_email(
                     subject=subject,
                     html_body=html,
@@ -2009,28 +2551,51 @@ def run_cmd(
                         )
                     ],
                 )
+            elif not dry_run and not hourly and _report_email_enabled():
+                log.warning(
+                    "scrape_report_email_skipped_unverified_inputs",
+                    run_id=run.id,
+                    status=run.status,
+                )
 
-            run.status = "ok"
             run.finished_at = utcnow()
             session.commit()
-            log.info("run_ok", run_id=run_id, products=count)
+            log.info(
+                "run_finished",
+                run_id=run_id,
+                status=run.status,
+                products=count,
+            )
 
             # P0.1 (PO Audit 2026-05-17): pre-compute ROI actions для всех 3
             # сайтов и сохранить в roi_actions_cache. HTTP-handler
             # /dash/roi/actions читает оттуда → <50мс latency вместо
             # 15-30с inline compute (timeout'ило с 408 на 4 экранах).
             # Fail-soft — ошибка не валит run, max 5-10с overhead на пересчёт.
-            try:
-                from src import roi as _roi
+            if is_run_financially_eligible(run):
+                try:
+                    from src import roi as _roi
 
-                summary = _roi.refresh_all_cached_actions(session, run_id=run_id)
-                log.info("roi_cache_refreshed", run_id=run_id, **summary)
-            except Exception as cache_err:
+                    summary = _roi.refresh_all_cached_actions(
+                        session,
+                        run_id=run_id,
+                        tenant_id=run.tenant_id,
+                    )
+                    log.info("roi_cache_refreshed", run_id=run_id, **summary)
+                except Exception as cache_err:
+                    log.warning(
+                        "roi_cache_refresh_failed",
+                        run_id=run_id,
+                        error=str(cache_err),
+                    )
+            else:
                 log.warning(
-                    "roi_cache_refresh_failed",
+                    "roi_cache_refresh_skipped_run_quality",
                     run_id=run_id,
-                    error=str(cache_err),
+                    status=run.status,
                 )
+        except RunQualityFailure as e:
+            raise click.ClickException(str(e))
         except Exception as e:
             run.status = "failed"
             run.error_message = f"{type(e).__name__}: {e}"
@@ -2055,6 +2620,9 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
 
     Session = storage.make_session()
+    if not _hold_scrape_lock_until_command_exit(Session, wait=False):
+        click.echo("scrape: skipped because another scrape run is active")
+        return
     with Session() as session:
         maybe_seed_categories(session)
         run = storage.Run(status="running")
@@ -2065,22 +2633,55 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
                 s: watchlist.categories_for_site(session, s, only_category_id=category_id)
                 for s in sites
             }
+            quality_sites, slugs_by_site = scope_category_run_sites(
+                slugs_by_site,
+                sites,
+                category_id=category_id,
+            )
             baselines = baselines_for_sites(session, sites)
+            quality_baselines = run_quality_baselines_for_sites(
+                session,
+                sites,
+                tenant_id=run.tenant_id,
+            )
             results = asyncio.run(scrape_all(slugs_by_site, limit, ai_fallback_baselines=baselines))
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
             run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
-            run.sites_completed = ",".join(sites)
-            run.status = "ok"
+            run.sites_completed = ",".join(r.site for r in results)
+            quality_status, quality = classify_run_quality(
+                results,
+                quality_sites,
+                mode="category",
+                baselines=quality_baselines,
+                enforce_baseline=limit is None and category_id is None,
+            )
+            run.status = quality_status
+            run.run_quality = quality
+            run.error_message = run_quality_message(quality_status, quality)
             run.finished_at = utcnow()
             session.commit()
-            click.echo(f"Scraped {count} products in run #{run.id}")
+            if quality_status == "failed":
+                raise RunQualityFailure(run.error_message or "run quality failed")
+            click.echo(f"Scraped {count} products in run #{run.id} ({quality_status})")
+        except RunQualityFailure as e:
+            raise click.ClickException(str(e))
         except Exception as e:
             run.status = "failed"
             run.error_message = str(e)
+            run.finished_at = utcnow()
             session.commit()
             raise click.ClickException(str(e))
+
+
+def _intraday_product_limit() -> int:
+    """Bound an hourly point scan; full-catalog producers remain unlimited."""
+    try:
+        configured = int(os.environ.get("INTRADAY_PRODUCT_LIMIT", "600"))
+    except ValueError:
+        configured = 600
+    return max(1, min(configured, 600))
 
 
 @cli.command("intraday-tick")
@@ -2123,8 +2724,10 @@ def intraday_tick_cmd(dry_run: bool) -> None:
             return
 
         site, cat = target
+        product_limit = _intraday_product_limit()
         click.echo(
-            f"intraday-tick: site={site} category_id={cat.id} key={cat.key} label={cat.label_ru!r}"
+            f"intraday-tick: site={site} category_id={cat.id} key={cat.key} "
+            f"label={cat.label_ru!r} limit={product_limit}"
         )
 
         if dry_run:
@@ -2138,7 +2741,7 @@ def intraday_tick_cmd(dry_run: bool) -> None:
     ctx = click.get_current_context()
     ctx.invoke(
         scrape_cmd,
-        limit=None,
+        limit=product_limit,
         site=(site,),
         category_id=cat.id,
     )
@@ -2205,7 +2808,9 @@ def rematch_cmd(
                 if dry_run:
                     click.echo("(dry-run — ничего не изменено)")
                 else:
-                    click.echo(f"applied {len(swaps)} swap'ов (swap_alternative → кластер is_manual)")
+                    click.echo(
+                        f"applied {len(swaps)} swap'ов (swap_alternative → кластер is_manual)"
+                    )
                 return
 
             if revalidate:
@@ -2370,20 +2975,65 @@ def validate_links_cmd(
 @cli.command("report")
 @click.option("--run-id", type=int, default=None, help="ID прогона (по умолчанию — последний ok)")
 @click.option("--send", is_flag=True, help="Отправить по email")
-def report_cmd(run_id: int | None, send: bool) -> None:
+@click.option("--tenant-id", type=int, default=1, show_default=True)
+def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
     """Перегенерировать отчёт по существующему прогону."""
     Session = storage.make_session()
     with Session() as session:
+        run = None
         if run_id is None:
-            run = session.scalars(
+            recent = session.scalars(
                 select(storage.Run)
-                .where(storage.Run.status == "ok")
+                .where(
+                    storage.Run.status == "ok",
+                    storage.Run.tenant_id == tenant_id,
+                )
                 .order_by(storage.Run.id.desc())
-                .limit(1)
-            ).first()
+                .limit(100)
+            ).all()
+            run = (
+                next(
+                    (item for item in recent if storage.run_is_financially_eligible(item)),
+                    None,
+                )
+                if send
+                else (recent[0] if recent else None)
+            )
             if not run:
-                raise click.ClickException("No successful runs found.")
+                message = (
+                    "No financially eligible full-catalog runs found."
+                    if send
+                    else "No successful runs found."
+                )
+                raise click.ClickException(message)
             run_id = run.id
+        else:
+            run = session.get(storage.Run, run_id)
+            if run is None:
+                raise click.ClickException(f"Run #{run_id} not found.")
+            if run.tenant_id != tenant_id:
+                raise click.ClickException(f"Run #{run_id} does not belong to tenant #{tenant_id}.")
+
+        if send:
+            from src import roi as roi_mod
+
+            if tenant_id != 1:
+                raise click.ClickException(
+                    "Legacy scrape-report email delivery is only configured for tenant #1."
+                )
+
+            if not storage.run_is_financially_eligible(run):
+                raise click.ClickException(
+                    f"Run #{run_id} is not a verified full-catalog run; email blocked."
+                )
+            if not roi_mod.financial_inputs_are_fresh(
+                session,
+                tenant_id=run.tenant_id,
+            ):
+                raise click.ClickException(
+                    "Fresh verified full-catalog inputs are missing for one or more sites; "
+                    "email blocked."
+                )
 
         report = analyzer.analyze(session, run_id)
         html = reporter.render_html(report)

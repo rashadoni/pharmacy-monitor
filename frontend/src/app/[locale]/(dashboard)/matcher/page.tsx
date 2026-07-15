@@ -135,7 +135,11 @@ export default function MatcherPage() {
           <span className="text-xs uppercase tracking-wide text-muted-foreground font-semibold">
             {t("site_label")}
           </span>
-          <div className="inline-flex rounded-md border border-input bg-background p-0.5 gap-0.5">
+          <div
+            className="grid w-full grid-cols-3 gap-0.5 rounded-md border border-input bg-background p-0.5 sm:inline-flex sm:w-auto"
+            role="group"
+            aria-label={t("site_label")}
+          >
             {SITES.map((s) => {
               const Icon = SITE_ICON[s];
               const active = site === s;
@@ -144,7 +148,8 @@ export default function MatcherPage() {
                 <button
                   key={s}
                   onClick={() => updateParams({ site: s })}
-                  className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-sm transition-colors ${
+                  aria-pressed={active}
+                  className={`flex min-h-11 min-w-0 flex-col items-center justify-center gap-0 rounded px-1 py-1 text-[11px] transition-colors sm:min-h-9 sm:flex-row sm:gap-1.5 sm:px-3 sm:py-1.5 sm:text-sm ${
                     active
                       ? "bg-primary text-primary-foreground font-medium"
                       : "text-foreground hover:bg-muted/50"
@@ -200,7 +205,7 @@ function ModeTab({
   return (
     <button
       onClick={onClick}
-      className={`inline-flex items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors ${
+      className={`inline-flex min-h-11 items-center gap-2 px-4 py-2 text-sm border-b-2 -mb-px transition-colors md:min-h-9 ${
         active
           ? "border-primary text-foreground font-medium"
           : "border-transparent text-muted-foreground hover:text-foreground"
@@ -323,13 +328,14 @@ function AttachMode({
 
   return (
     <div className="space-y-4">
-      <div className="flex items-end justify-between gap-3 flex-wrap">
-        <div className="flex flex-col sm:flex-row sm:flex-wrap gap-2 flex-1">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:flex-wrap">
           <select
             data-testid="matcher-category-filter"
             value={category}
             onChange={(e) => setCategory(e.target.value)}
-            className="rounded-md border border-input bg-background px-3 py-2 text-sm md:w-72"
+            aria-label={t("category_filter_label")}
+            className="min-h-11 w-full min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm sm:w-auto md:min-h-9 md:w-72"
           >
             <option value="">{t("all_categories")}</option>
             {facetsQ.data?.categories.map((c) => (
@@ -340,14 +346,14 @@ function AttachMode({
           </select>
           <button
             onClick={() => handleSkipCheap(5)}
-            className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto md:min-h-9"
             title={t("skip_cheap_title")}
           >
             {t("skip_cheap")}
           </button>
           <button
             onClick={handleSkipAllOnPage}
-            className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto md:min-h-9"
             title={t("skip_page_title")}
           >
             {t("skip_page")}
@@ -355,7 +361,7 @@ function AttachMode({
           {skipped.size > 0 && (
             <button
               onClick={handleResetSkipped}
-              className="rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-muted-foreground hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto md:min-h-9"
               title={t("reset_skipped_title")}
             >
               {t("reset_skipped", { count: skipped.size })}
@@ -534,7 +540,7 @@ function PairCard({
         </div>
         <button
           onClick={() => onSkip(pair.match_id)}
-          className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 shrink-0 rounded px-1 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="text-xs text-muted-foreground hover:text-foreground flex min-h-11 items-center gap-1 shrink-0 rounded px-2 py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
           title={t("skip_one_title")}
         >
           <SkipForward className="h-3.5 w-3.5" />
@@ -568,7 +574,8 @@ function PairCard({
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder={t("search_site_placeholder", { site: SITE_LABEL[site] })}
-              className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label={t("search_site_label", { site: SITE_LABEL[site] })}
+              className="min-h-11 w-full rounded-md border border-input bg-background py-2 pl-8 pr-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
             />
           </div>
 

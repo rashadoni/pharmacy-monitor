@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "excluded": [
+    {
+      "site": "pharmonline",
+      "slug": "arabalar",
+      "reason": "Source category exists but returned zero products in Run #440 and a 2026-07-11 no-persist canary."
+    },
+    {
+      "site": "aptekonline",
+      "slug": "308",
+      "reason": "Source API returned HTTP 200 with total=0 in Run #440 and a 2026-07-11 no-persist canary."
+    },
+    {
+      "site": "aptekonline",
+      "slug": "374",
+      "reason": "Source API returned HTTP 200 with total=0 in Run #440 and a 2026-07-11 no-persist canary."
+    },
+    {
+      "site": "aptekonline",
+      "slug": "419",
+      "reason": "Source API returned HTTP 200 with total=0 in Run #440 and a 2026-07-11 no-persist canary."
+    },
+    {
+      "site": "aptekonline",
+      "slug": "425",
+      "reason": "Source API returned HTTP 200 with total=0 in Run #440 and a 2026-07-11 no-persist canary."
+    }
+  ]
+}

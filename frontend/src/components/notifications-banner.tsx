@@ -68,12 +68,13 @@ export function NotificationsBanner() {
         </div>
       </div>
       <button
+        type="button"
         onClick={handleDismiss}
-        className="text-muted-foreground hover:text-foreground p-1 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="-m-2 inline-flex h-11 w-11 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-warning/10 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:h-8 md:w-8"
         aria-label={t("hide_aria")}
         title={t("hide_title")}
       >
-        <X className="h-4 w-4" />
+        <X className="h-4 w-4" aria-hidden="true" />
       </button>
     </div>
   );

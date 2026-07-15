@@ -326,6 +326,7 @@ def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -
         )
         .order_by(desc(storage.AlertEvent.created_at))
     ).all()
+    events = [event for event in events if _event_is_digest_eligible(session, event)]
 
     if not events:
         log.info("digest_no_events", kind=kind, tenant=tenant_id)
@@ -342,6 +343,39 @@ def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -
             log.warning("digest_email_failed", user=user.email, kind=kind, error=str(e))
     log.info("digest_sent", kind=kind, recipients=sent, events=len(events))
     return sent
+
+
+_FINANCIAL_EVENT_TYPES = {
+    "undercut_threshold",
+    "price_drop_pct",
+    "new_product",
+    "promo_started",
+    "price_raise_opportunity",
+}
+
+
+def _event_is_digest_eligible(session: Session, event: storage.AlertEvent) -> bool:
+    """Fail closed for financial events created before verified run provenance."""
+    if event.rule_type not in _FINANCIAL_EVENT_TYPES:
+        return True
+    run_id = (event.payload or {}).get("source_run_id")
+    if not isinstance(run_id, int):
+        log.warning("digest_event_skipped_unverified", event_id=event.id, reason="no_source_run")
+        return False
+    run = session.get(storage.Run, run_id)
+    eligible = (
+        run is not None
+        and run.tenant_id == event.tenant_id
+        and storage.run_is_financially_eligible(run)
+    )
+    if not eligible:
+        log.warning(
+            "digest_event_skipped_unverified",
+            event_id=event.id,
+            source_run_id=run_id,
+            reason="run_not_financially_eligible",
+        )
+    return eligible
 
 
 # ─── Email templates ─────────────────────────────────────────────────────────

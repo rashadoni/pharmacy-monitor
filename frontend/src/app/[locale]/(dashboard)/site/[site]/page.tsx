@@ -1,16 +1,24 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { notFound, useParams } from "next/navigation";
+import { notFound, useParams, useSearchParams } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Building2, ExternalLink, Leaf, Pill, Search } from "lucide-react";
-import { api, friendlyError, type SiteProduct } from "@/lib/api";
+import {
+  api,
+  friendlyError,
+  isVerifiedScanPendingError,
+  type SiteProduct,
+} from "@/lib/api";
 import { ActionRow } from "@/components/action-row";
-import { KpiCard } from "@/components/kpi-card";
+import { MetricStrip } from "@/components/metric-strip";
 import { Sparkline } from "@/components/sparkline";
 import { useDebounce } from "@/lib/use-debounce";
-import { formatPrice, formatTime } from "@/lib/utils";
+import { formatPrice, formatRelative, formatTime } from "@/lib/utils";
+import { QueryErrorState } from "@/components/query-error-state";
+import { useRouter } from "@/i18n/navigation";
+import { integerParam, queryWithPatch } from "@/lib/filter-query";
 
 const PAGE_LIMIT = 50;
 
@@ -100,10 +108,13 @@ export default function SitePage() {
     queryKey: ["site", site, "brands"],
     queryFn: () => api.brandShare({ top_n: 50, site }),
   });
-  const roiQ = useQuery({
-    queryKey: ["site", site, "roi", locale],
-    queryFn: () => api.roiActions(site, locale),
+  const recommendationsQ = useQuery({
+    queryKey: ["site", site, "roi-recommendations", locale],
+    queryFn: () => api.roiRecommendations(site, locale),
+    enabled: site === "pharmonline",
   });
+  const roiWaitingForVerifiedScan = isVerifiedScanPendingError(recommendationsQ.error);
+  const pageDataError = summaryQ.error ?? facetsQ.error ?? brandsQ.error;
 
   return (
     <div className="space-y-6">
@@ -131,69 +142,109 @@ export default function SitePage() {
         </div>
       </header>
 
-      <section className="grid gap-4 grid-cols-2 md:grid-cols-4">
-        <KpiCard
-          label={t("kpi_total_products")}
-          value={summaryQ.data?.total_products ?? "—"}
-          loading={summaryQ.isLoading}
+      {pageDataError && (
+        <QueryErrorState
+          message={friendlyError(pageDataError, locale)}
+          retryLabel={tCommon("retry")}
+          onRetry={() => {
+            if (summaryQ.error) summaryQ.refetch();
+            if (facetsQ.error) facetsQ.refetch();
+            if (brandsQ.error) brandsQ.refetch();
+          }}
         />
-        <KpiCard
-          label={t("kpi_brands")}
-          value={summaryQ.data?.total_brands ?? "—"}
-          loading={summaryQ.isLoading}
-        />
-        <KpiCard
-          label={t("kpi_exclusive_brands")}
-          value={summaryQ.data?.exclusive_brands ?? "—"}
-          loading={summaryQ.isLoading}
-          hint={t("kpi_exclusive_hint", { competitors: competitors.join("/") })}
-        />
-        <KpiCard
-          label={t("kpi_on_sale")}
-          value={
-            summaryQ.data
-              ? `${summaryQ.data.on_sale_count} (${summaryQ.data.on_sale_pct.toFixed(1)}%)`
-              : "—"
-          }
-          loading={summaryQ.isLoading}
+      )}
+
+      <section aria-label={t("catalog_title", { site })}>
+        <MetricStrip
+          items={[
+            {
+              label: t("kpi_total_products"),
+              value: summaryQ.data?.total_products ?? "—",
+              loading: summaryQ.isLoading,
+            },
+            {
+              label: t("kpi_brands"),
+              value: summaryQ.data?.total_brands ?? "—",
+              loading: summaryQ.isLoading,
+            },
+            {
+              label: t("kpi_exclusive_brands"),
+              value: summaryQ.data?.exclusive_brands ?? "—",
+              loading: summaryQ.isLoading,
+              hint: t("kpi_exclusive_hint", { competitors: competitors.join("/") }),
+            },
+            {
+              label: t("kpi_on_sale"),
+              value: summaryQ.data
+                ? `${summaryQ.data.on_sale_count} (${summaryQ.data.on_sale_pct.toFixed(1)}%)`
+                : "—",
+              loading: summaryQ.isLoading,
+            },
+          ]}
         />
       </section>
 
-      <section>
+      {site === "pharmonline" ? <section>
         <h2 className="text-lg font-semibold mb-3">{t("roi_title")}</h2>
         <p className="text-xs text-muted-foreground mb-3">
           {t("roi_subtitle", { site, competitors: competitors.join("/") })}
         </p>
-        {roiQ.isLoading && (
+        {recommendationsQ.data?.provenance.run_id != null && (
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("roi_provenance", {
+              run: recommendationsQ.data.provenance.run_id,
+              completed: formatRelative(recommendationsQ.data.provenance.run_finished_at, locale),
+            })}
+          </p>
+        )}
+        {recommendationsQ.isLoading && (
           <div className="rounded-md border border-border bg-card p-3 text-sm text-muted-foreground flex items-center gap-2">
             <span className="inline-block h-2 w-2 rounded-full bg-primary animate-pulse" />
             {t("roi_loading")}
           </div>
         )}
-        {roiQ.error && (
-          <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive flex items-center justify-between gap-3">
+        {recommendationsQ.error && (
+          <div
+            className={`rounded-md border p-3 text-sm flex items-center justify-between gap-3 ${
+              roiWaitingForVerifiedScan
+                ? "border-warning/40 bg-warning/5 text-warning"
+                : "border-destructive/30 bg-destructive/10 text-destructive"
+            }`}
+          >
             <div>
-              {friendlyError(roiQ.error, locale)}
+              {roiWaitingForVerifiedScan
+                ? t("roi_waiting_verified")
+                : friendlyError(recommendationsQ.error, locale)}
             </div>
-            <button
-              onClick={() => roiQ.refetch()}
-              className="rounded border border-destructive/50 px-2 py-1 text-xs hover:bg-destructive/20"
-            >
-              {t("roi_retry")}
-            </button>
+            {!roiWaitingForVerifiedScan && (
+              <button
+                type="button"
+                onClick={() => recommendationsQ.refetch()}
+                className="min-h-11 rounded border border-destructive/50 px-3 py-1 text-xs hover:bg-destructive/20 md:min-h-9"
+              >
+                {t("roi_retry")}
+              </button>
+            )}
           </div>
         )}
-        {roiQ.data && roiQ.data.length === 0 && (
+        {recommendationsQ.data && recommendationsQ.data.items.length === 0 && (
           <div className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
             {t("roi_empty")}
           </div>
         )}
         <div className="space-y-2">
-          {roiQ.data?.slice(0, 10).map((a, i) => (
+          {recommendationsQ.data?.items.slice(0, 10).map((a, i) => (
             <ActionRow key={i} action={a} />
           ))}
         </div>
-      </section>
+      </section> : (
+        <section className="rounded-lg border border-border bg-card p-4">
+          <h2 className="text-lg font-semibold">{t("benchmark_title")}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {t("benchmark_desc", { site })}
+          </p>
+        </section>
+      )}
 
       <section className="grid gap-6 lg:grid-cols-2">
         <BrandsPanel
@@ -335,15 +386,37 @@ function ProductsSection({
 }) {
   const t = useTranslations("site");
   const tCommon = useTranslations("common");
-  const [search, setSearch] = useState("");
+  const locale = useLocale();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const queryRef = useRef(searchParams.toString());
+  useEffect(() => {
+    queryRef.current = searchParams.toString();
+  }, [searchParams]);
+  const parsedParams = new URLSearchParams(searchParams.toString());
+  const urlSearch = searchParams.get("q") ?? "";
+  const [search, setSearch] = useState(urlSearch);
+  useEffect(() => setSearch(urlSearch), [urlSearch]);
   const debouncedSearch = useDebounce(search, 300);
-  const [category, setCategory] = useState("");
-  const [brand, setBrand] = useState("");
-  const [onSaleOnly, setOnSaleOnly] = useState(false);
-  const [offset, setOffset] = useState(0);
+  const category = searchParams.get("category") ?? "";
+  const brand = searchParams.get("brand") ?? "";
+  const onSaleOnly = searchParams.get("sale") === "1";
+  const page = integerParam(parsedParams, "page", 1, { min: 1, max: 10_000 });
+  const offset = (page - 1) * PAGE_LIMIT;
 
-  const filterKey = JSON.stringify({ site, debouncedSearch, category, brand, onSaleOnly });
-  useFilterReset(filterKey, () => setOffset(0));
+  function updateFilters(
+    patch: Record<string, string | number | boolean | null>,
+    resetPage = true,
+    history: "push" | "replace" = "push",
+  ) {
+    const query = queryWithPatch(queryRef.current, {
+      ...patch,
+      ...(resetPage ? { page: null } : {}),
+    });
+    queryRef.current = query;
+    const href = query ? `/site/${site}?${query}` : `/site/${site}`;
+    router[history](href, { scroll: false });
+  }
 
   const productsQ = useQuery({
     queryKey: [
@@ -370,6 +443,18 @@ function ProductsSection({
 
   const total = productsQ.data?.total ?? 0;
   const items = productsQ.data?.items ?? [];
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_LIMIT));
+  const isCanonicalizingPage = productsQ.isSuccess && page > totalPages;
+
+  useEffect(() => {
+    if (!isCanonicalizingPage) return;
+    const query = queryWithPatch(queryRef.current, {
+      page: totalPages === 1 ? null : totalPages,
+    });
+    queryRef.current = query;
+    const href = query ? `/site/${site}?${query}` : `/site/${site}`;
+    router.replace(href, { scroll: false });
+  }, [isCanonicalizingPage, router, site, totalPages]);
 
   return (
     <section>
@@ -382,16 +467,24 @@ function ProductsSection({
             type="search"
             placeholder={t("search_placeholder")}
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={t("search_label")}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              updateFilters({ q: e.target.value || null }, true, "replace");
+            }}
+            className="min-h-11 w-full rounded-md border border-input bg-background py-2 pl-8 pr-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
           />
         </div>
         <select
           value={category}
-          onChange={(e) => setCategory(e.target.value)}
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+          onChange={(e) => updateFilters({ category: e.target.value || null })}
+          aria-label={t("category_filter_label")}
+          className="min-h-11 min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
         >
           <option value="">{t("filter_all_categories")}</option>
+          {category && !facets?.categories.some((item) => item.name === category) && (
+            <option value={category}>{category}</option>
+          )}
           {facets?.categories.map((c) => (
             <option key={c.name} value={c.name} title={c.name}>
               {prettyCategoryLabel(c)} ({c.count})
@@ -400,39 +493,45 @@ function ProductsSection({
         </select>
         <select
           value={brand}
-          onChange={(e) => setBrand(e.target.value)}
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+          onChange={(e) => updateFilters({ brand: e.target.value || null })}
+          aria-label={t("brand_filter_label")}
+          className="min-h-11 min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
         >
           <option value="">{t("filter_all_brands")}</option>
+          {brand && !facets?.brands.slice(0, 50).some((item) => item.name === brand) && (
+            <option value={brand}>{brand}</option>
+          )}
           {facets?.brands.slice(0, 50).map((b) => (
             <option key={b.name} value={b.name}>
               {b.name} ({b.count})
             </option>
           ))}
         </select>
-        <label className="inline-flex items-center gap-2 text-sm px-3 py-2 rounded-md border border-input bg-background cursor-pointer">
+        <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9">
           <input
             type="checkbox"
             checked={onSaleOnly}
-            onChange={(e) => setOnSaleOnly(e.target.checked)}
+            onChange={(e) => updateFilters({ sale: e.target.checked })}
             className="h-4 w-4"
           />
           {t("discount_label")}
         </label>
       </div>
 
-      {productsQ.isLoading && (
+      {(productsQ.isLoading || isCanonicalizingPage) && (
         <div className="text-sm text-muted-foreground py-6 text-center">
           {tCommon("loading")}
         </div>
       )}
       {productsQ.error && (
-        <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive">
-          {t("error_loading")}
-        </div>
+        <QueryErrorState
+          message={friendlyError(productsQ.error, locale)}
+          retryLabel={tCommon("retry")}
+          onRetry={() => productsQ.refetch()}
+        />
       )}
 
-      {!productsQ.isLoading && !productsQ.error && (
+      {!productsQ.isLoading && !productsQ.error && !isCanonicalizingPage && (
         <>
           <div className="hidden md:block rounded-lg border border-border overflow-hidden">
             <table className="w-full text-sm">
@@ -477,7 +576,12 @@ function ProductsSection({
             offset={offset}
             limit={PAGE_LIMIT}
             total={total}
-            onChange={setOffset}
+            onChange={(nextOffset) =>
+              updateFilters(
+                { page: nextOffset === 0 ? null : nextOffset / PAGE_LIMIT + 1 },
+                false,
+              )
+            }
           />
         </>
       )}
@@ -619,7 +723,7 @@ function Pagination({
         <button
           disabled={!canPrev}
           onClick={() => onChange(Math.max(0, offset - limit))}
-          className="rounded-md border border-input px-3 py-1.5 text-sm disabled:opacity-40 hover:bg-muted/50"
+          className="min-h-11 rounded-md border border-input px-3 py-1.5 text-sm hover:bg-muted/50 disabled:opacity-40 md:min-h-9"
         >
           {t("pagination_prev")}
         </button>
@@ -629,19 +733,11 @@ function Pagination({
         <button
           disabled={!canNext}
           onClick={() => onChange(offset + limit)}
-          className="rounded-md border border-input px-3 py-1.5 text-sm disabled:opacity-40 hover:bg-muted/50"
+          className="min-h-11 rounded-md border border-input px-3 py-1.5 text-sm hover:bg-muted/50 disabled:opacity-40 md:min-h-9"
         >
           {t("pagination_next")}
         </button>
       </div>
     </div>
   );
-}
-
-function useFilterReset(key: string, onChange: () => void) {
-  const [prev, setPrev] = useState(key);
-  if (prev !== key) {
-    setPrev(key);
-    onChange();
-  }
 }

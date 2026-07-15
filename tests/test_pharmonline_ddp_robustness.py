@@ -18,6 +18,7 @@ import json
 import pytest
 
 from src.scrapers import pharmonline_ddp
+from src.scrapers.base import SiteScrapeFatalError
 
 HANG = object()  # sentinel: recv/send зависает (симуляция half-open сокета)
 
@@ -260,3 +261,168 @@ def test_ddpclient_wraps_proxy_factory_and_string(monkeypatch):
 
     c3 = pharmonline_ddp._DDPClient(lambda: "wss://x")
     assert c3.proxy_url_factory() is None  # нет прокси → None
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_407_aborts_the_whole_site():
+    class FatalDDP:
+        async def call(self, *args, **kwargs):
+            raise ConnectionError("proxy rejected connection: HTTP 407")
+
+    scraper = pharmonline_ddp.PharmonlineDDPScraper()
+    scraper._ddp = FatalDDP()
+    scraper._locale = "az"
+    scraper._page_size = 100
+    scraper._cat_map = {}
+
+    with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+        _ = [p async for p in scraper.scrape_category("vitaminler")]
+
+
+@pytest.mark.asyncio
+async def test_ddp_initial_connect_407_is_site_fatal(monkeypatch):
+    async def reject_proxy(self):
+        raise ConnectionError("proxy rejected connection: HTTP 407")
+
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aenter__", reject_proxy)
+    scraper = pharmonline_ddp.PharmonlineDDPScraper()
+
+    with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+        await scraper.__aenter__()
+
+
+@pytest.mark.asyncio
+async def test_ddp_generic_initial_failure_still_closes_client(monkeypatch):
+    exits = []
+
+    async def reject_connect(self):
+        raise OSError("TLS handshake failed")
+
+    async def record_exit(self, exc_type, exc, tb):
+        exits.append(True)
+
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aenter__", reject_connect)
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aexit__", record_exit)
+    scraper = pharmonline_ddp.PharmonlineDDPScraper()
+
+    with pytest.raises(OSError, match="TLS handshake failed"):
+        await scraper.__aenter__()
+
+    assert exits == [True]
+
+
+@pytest.mark.asyncio
+async def test_ddp_connect_407_does_not_retry_or_expose_proxy_secret(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", "9")
+    client = pharmonline_ddp._DDPClient(lambda: "wss://example.invalid")
+    calls = []
+
+    async def reject_once():
+        calls.append(True)
+        raise ConnectionError(
+            "proxy http://user:top-secret@az.decodo.com:30001 rejected HTTP 407"
+        )
+
+    monkeypatch.setattr(client, "_connect_once", reject_once)
+
+    with pytest.raises(SiteScrapeFatalError) as exc_info:
+        await client._connect()
+
+    assert calls == [True]
+    assert str(exc_info.value) == "proxy access rejected: HTTP 407"
+    assert "top-secret" not in str(exc_info.value)
+    assert "az.decodo.com" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_ddp_transient_proxy_status_retries(monkeypatch):
+    from websockets.datastructures import Headers
+    from websockets.exceptions import InvalidProxyStatus
+    from websockets.http11 import Response
+
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", "2")
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_BACKOFF", "0")
+    client = pharmonline_ddp._DDPClient(lambda: "wss://example.invalid")
+    calls = []
+
+    async def flaky_connect():
+        calls.append(True)
+        if len(calls) == 1:
+            raise InvalidProxyStatus(Response(502, "Bad Gateway", Headers()))
+
+    monkeypatch.setattr(client, "_connect_once", flaky_connect)
+
+    await client._connect()
+
+    assert calls == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_ddp_invalid_proxy_is_fatal_before_raw_logging(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", "1")
+    client = pharmonline_ddp._DDPClient(lambda: "wss://example.invalid")
+    logged = []
+
+    async def reject_once():
+        raise OSError("InvalidProxy http://user:top-secret@proxy.invalid:9000")
+
+    class CaptureLog:
+        def error(self, event, **kwargs):
+            logged.append((event, kwargs))
+
+    monkeypatch.setattr(client, "_connect_once", reject_once)
+    monkeypatch.setattr(pharmonline_ddp, "log", CaptureLog())
+
+    with pytest.raises(SiteScrapeFatalError) as exc_info:
+        await client._connect()
+
+    assert str(exc_info.value) == "proxy configuration rejected"
+    assert logged == []
+
+
+@pytest.mark.asyncio
+async def test_ddp_call_407_does_not_reconnect(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_DDP_CALL_ATTEMPTS", "9")
+    client = pharmonline_ddp._DDPClient(lambda: "wss://example.invalid")
+    send_calls = []
+    reconnect_calls = []
+
+    async def reject_send(*args, **kwargs):
+        send_calls.append(True)
+        raise ConnectionError("proxy rejected connection: HTTP 407")
+
+    async def unexpected_reconnect():
+        reconnect_calls.append(True)
+
+    monkeypatch.setattr(client, "_send_and_wait", reject_send)
+    monkeypatch.setattr(client, "_reconnect", unexpected_reconnect)
+
+    with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+        await client.call("products", [], timeout=0.01)
+
+    assert send_calls == [True]
+    assert reconnect_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ddp_category_map_407_is_not_treated_as_optional(monkeypatch):
+    exits = []
+
+    async def enter_ok(self):
+        return self
+
+    async def fatal_map(self, *args, **kwargs):
+        raise SiteScrapeFatalError("proxy access rejected: HTTP 407")
+
+    async def record_exit(self, exc_type, exc, tb):
+        exits.append(True)
+
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aenter__", enter_ok)
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "call", fatal_map)
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aexit__", record_exit)
+
+    scraper = pharmonline_ddp.PharmonlineDDPScraper()
+    with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+        await scraper.__aenter__()
+
+    assert exits == [True]

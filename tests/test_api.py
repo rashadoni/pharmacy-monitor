@@ -84,7 +84,9 @@ def test_health_endpoint(client):
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "up"
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "missing"
+    assert body["full_catalog_verified"] is False
     assert "last_run_at" in body
     assert "last_run_status" in body
     # Phase 0.3 — deep health fields
@@ -104,13 +106,291 @@ def test_health_endpoint_db_ping_responds_quickly(client):
 
 
 def test_health_endpoint_redis_unset_returns_null(client, monkeypatch):
-    """No REDIS_URL → redis_ping_ms is null, but health still reports up."""
+    """No REDIS_URL is non-fatal; missing full-catalog history remains degraded."""
     monkeypatch.delenv("REDIS_URL", raising=False)
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
     assert body["redis_ping_ms"] is None
-    assert body["status"] == "up"
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "missing"
+
+
+def test_system_status_exposes_queue_proxy_and_real_digest_schedule(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    monkeypatch.setenv("DECODO_USERNAME", "configured-user")
+    monkeypatch.setenv("DECODO_PASSWORD", "configured-secret")
+    monkeypatch.setenv("DECODO_SITES", "aloe,pharmonline")
+    monkeypatch.setenv("DECODO_PORTS", "30001,30002")
+    monkeypatch.setenv("DAILY_DIGEST_ENABLED", "0")
+    monkeypatch.setenv("WEEKLY_DIGEST_ENABLED", "1")
+    monkeypatch.setenv("WEEKLY_DIGEST_SCHEDULE_BAKU", "Monday 10:00")
+    older = storage.ScrapeRequest(
+        tenant_id=1,
+        status="pending",
+        mode="all",
+        requested_at=utcnow() - timedelta(minutes=5),
+    )
+    running = storage.ScrapeRequest(
+        tenant_id=1,
+        status="running",
+        mode="category",
+    )
+    foreign = storage.ScrapeRequest(tenant_id=2, status="pending", mode="all")
+    setup_db.add_all([older, running, foreign])
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/system-status")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["queue"]["pending"] == 1
+    assert body["queue"]["running"] == 1
+    assert body["queue"]["oldest_pending_at"] is not None
+    assert body["proxy"] == {
+        "provider": "decodo",
+        "configured": True,
+        "sites": ["aloe", "pharmonline"],
+        "pool_size": 2,
+    }
+    assert body["digests"]["daily"]["enabled"] is False
+    assert body["digests"]["weekly"] == {
+        "enabled": True,
+        "schedule_baku": "Monday 10:00",
+    }
+    serialized = response.text
+    assert "configured-user" not in serialized
+    assert "configured-secret" not in serialized
+
+
+def test_system_status_reports_effective_default_decodo_port_range(
+    client, auth_cookie, monkeypatch
+):
+    monkeypatch.setenv("DECODO_USERNAME", "configured-user")
+    monkeypatch.setenv("DECODO_PASSWORD", "configured-secret")
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+    monkeypatch.delenv("DECODO_PORTS", raising=False)
+
+    body = client.get("/api/v1/dash/system-status").json()
+
+    assert body["proxy"]["pool_size"] == 10
+
+
+def test_health_endpoint_degraded_when_latest_run_degraded(client, setup_db):
+    setup_db.add(
+        storage.Run(
+            status="degraded",
+            finished_at=utcnow(),
+            run_quality={"sites": {"aloe": {"status": "degraded"}}},
+        )
+    )
+    setup_db.commit()
+    body = client.get("/health").json()
+    assert body["status"] == "degraded"
+    assert body["last_run_status"] == "degraded"
+
+
+def test_health_endpoint_does_not_hide_degraded_behind_running_run(client, setup_db):
+    setup_db.add_all(
+        [
+            storage.Run(
+                tenant_id=1,
+                started_at=utcnow() - timedelta(hours=1),
+                finished_at=utcnow() - timedelta(minutes=30),
+                status="degraded",
+                run_quality={"sites": {"aloe": {"status": "degraded"}}},
+            ),
+            storage.Run(tenant_id=1, started_at=utcnow(), status="running"),
+        ]
+    )
+    setup_db.commit()
+
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert response.json()["last_run_status"] == "degraded"
+
+
+def test_health_endpoint_ignores_post_processing_run(client, setup_db):
+    now = utcnow()
+    setup_db.add_all(
+        [
+            storage.Run(
+                tenant_id=1,
+                started_at=now - timedelta(hours=1),
+                finished_at=now - timedelta(minutes=30),
+                status="degraded",
+                run_quality={
+                    "baseline_enforced": True,
+                    "full_catalog_verified": False,
+                    "financially_eligible": False,
+                    "sites": {"pharmonline": {"status": "degraded"}},
+                },
+            ),
+            storage.Run(
+                tenant_id=1,
+                started_at=now,
+                finished_at=None,
+                status="ok",
+                run_quality={
+                    "baseline_enforced": True,
+                    "full_catalog_verified": True,
+                    "financially_eligible": True,
+                    "sites": {
+                        "pharmonline": {"status": "ok"},
+                        "aptekonline": {"status": "ok"},
+                        "aloe": {"status": "ok"},
+                    },
+                },
+            ),
+        ]
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["last_run_status"] == "degraded"
+    assert body["full_catalog_status"] == "degraded"
+    assert body["full_catalog_verified"] is False
+
+
+def test_health_endpoint_without_full_catalog_history_is_fail_closed(client, setup_db):
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=utcnow() - timedelta(hours=1),
+            finished_at=utcnow(),
+            status="ok",
+            run_quality={
+                "baseline_enforced": False,
+                "financially_eligible": False,
+                "sites": {"pharmonline": {"status": "ok"}},
+            },
+        )
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "missing"
+    assert body["full_catalog_run_at"] is None
+    assert body["full_catalog_verified"] is False
+
+
+def test_health_endpoint_orders_terminal_runs_by_completion(client, setup_db):
+    now = utcnow()
+    setup_db.add_all(
+        [
+            storage.Run(
+                tenant_id=1,
+                started_at=now - timedelta(hours=2),
+                finished_at=now,
+                status="degraded",
+                run_quality={"sites": {"pharmonline": {"status": "degraded"}}},
+            ),
+            storage.Run(
+                tenant_id=1,
+                started_at=now - timedelta(hours=1),
+                finished_at=now - timedelta(minutes=30),
+                status="ok",
+                run_quality={"financially_eligible": False},
+            ),
+        ]
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["last_run_status"] == "degraded"
+
+
+def test_health_endpoint_partial_ok_preserves_full_catalog_failure(client, setup_db):
+    now = utcnow()
+    full = storage.Run(
+        tenant_id=1,
+        started_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=1),
+        status="degraded",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"pharmonline": {"status": "degraded"}},
+        },
+    )
+    setup_db.add(full)
+    setup_db.flush()
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=now - timedelta(minutes=30),
+            finished_at=now,
+            status="ok",
+            run_quality={
+                "baseline_enforced": False,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {"pharmonline": {"status": "ok"}},
+            },
+        )
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["last_run_status"] == "ok"
+    assert body["full_catalog_status"] == "degraded"
+    assert body["full_catalog_verified"] is False
+    assert body["full_catalog_run_at"] is not None
+
+
+def test_health_endpoint_aloe_full_does_not_mask_other_degraded_sites(client, setup_db):
+    now = utcnow()
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=now - timedelta(hours=2),
+            finished_at=now - timedelta(hours=1),
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {
+                    "pharmonline": {"status": "degraded"},
+                    "aptekonline": {"status": "degraded"},
+                    "aloe": {"status": "ok"},
+                },
+            },
+        )
+    )
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=now - timedelta(minutes=30),
+            finished_at=now,
+            status="ok",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": True,
+                "financially_eligible": True,
+                "sites": {"aloe": {"status": "ok"}},
+            },
+        )
+    )
+    setup_db.commit()
+
+    body = client.get("/health").json()
+
+    assert body["last_run_status"] == "ok"
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "degraded"
+    assert body["full_catalog_verified"] is False
 
 
 def test_health_endpoint_flags_staleness(client, setup_db):
@@ -165,7 +445,9 @@ def test_health_endpoint_uses_weekly_aptekonline_threshold(client, setup_db):
     assert r.status_code == 200
     body = r.json()
     assert body["staleness_warning"] is False
-    assert body["status"] == "up"
+    # Staleness is healthy, but no verified full-catalog lineage exists.
+    assert body["status"] == "degraded"
+    assert body["full_catalog_status"] == "missing"
     sites = {s["site"]: s for s in body["sites"]}
     assert sites["aptekonline"]["hours_since"] >= 100
     assert sites["aptekonline"]["max_age_hours"] == 198
@@ -309,6 +591,263 @@ def test_dash_runs_latest_by_site_includes_weekly_site(client, auth_cookie, setu
     recent_ids = {row["id"] for row in recent.json()}
     assert other_tenant_newer.id not in recent_ids
     assert pharm.id in recent_ids
+
+
+def test_site_history_ignores_legacy_zero_placeholder_and_keeps_real_failure_visible(
+    client, auth_cookie, setup_db
+):
+    db = setup_db
+    base = utcnow()
+    successful = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(days=1),
+        finished_at=base - timedelta(days=1) + timedelta(minutes=10),
+        status="ok",
+        products_scraped=6300,
+        products_per_site={"aloe": 6300},
+        sites_completed="aloe",
+    )
+    # Historical producer wrote all sites with zero even though only
+    # pharmonline was in scope. It must not become aloe's latest attempt.
+    placeholder = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=2),
+        finished_at=base - timedelta(hours=2) + timedelta(minutes=1),
+        status="degraded",
+        products_scraped=200,
+        products_per_site={"pharmonline": 200, "aptekonline": 0, "aloe": 0},
+        sites_completed="pharmonline",
+    )
+    run_446_shape = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=3),
+        finished_at=base - timedelta(hours=3) + timedelta(minutes=6),
+        status="degraded",
+        products_scraped=606,
+        products_per_site={"pharmonline": 606, "aptekonline": 0, "aloe": 0},
+        sites_completed="pharmonline,aptekonline,aloe",
+        run_quality={
+            "sites": {
+                "pharmonline": {"status": "ok", "items_expected": 1, "products": 606},
+                "aptekonline": {"status": "failed", "items_expected": 0, "products": 0, "reasons": ["no_items_requested"]},
+                "aloe": {"status": "failed", "items_expected": 0, "products": 0, "reasons": ["no_items_requested"]},
+            }
+        },
+    )
+    # A real failed aloe attempt has expected work and remains visible as the
+    # latest attempt, while the trusted positive run remains the display run.
+    real_failure = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=1),
+        finished_at=base - timedelta(minutes=50),
+        status="degraded",
+        products_scraped=0,
+        products_per_site={"aloe": 0},
+        run_quality={
+            "sites": {
+                "aloe": {
+                    "status": "degraded",
+                    "items_expected": 6,
+                    "items_completed": 0,
+                    "items_failed": 6,
+                    "products": 0,
+                }
+            }
+        },
+    )
+    db.add_all([successful, run_446_shape, placeholder, real_failure])
+    db.commit()
+
+    rows = {
+        row["site"]: row
+        for row in client.get("/api/v1/dash/runs/latest-by-site").json()
+    }
+    assert rows["aloe"]["run"]["id"] == successful.id
+    assert rows["aloe"]["latest_attempt"]["id"] == real_failure.id
+    assert rows["aptekonline"]["run"] is None
+    assert rows["aptekonline"]["latest_attempt"] is None
+
+    summary = client.get("/api/v1/dash/products/summary?site=aloe").json()
+    assert summary["last_run_id"] == successful.id
+
+
+def test_site_summary_does_not_reuse_another_sites_latest_run(
+    client, auth_cookie, setup_db
+):
+    db = setup_db
+    aloe = storage.Run(
+        tenant_id=1,
+        status="ok",
+        started_at=utcnow() - timedelta(hours=2),
+        products_scraped=5,
+        products_per_site={"aloe": 5},
+        sites_completed="aloe",
+    )
+    pharm = storage.Run(
+        tenant_id=1,
+        status="ok",
+        started_at=utcnow() - timedelta(hours=1),
+        products_scraped=7,
+        products_per_site={"pharmonline": 7},
+        sites_completed="pharmonline",
+    )
+    db.add_all([aloe, pharm])
+    db.commit()
+
+    summary = client.get("/api/v1/dash/products/summary?site=aloe").json()
+    assert summary["last_run_id"] == aloe.id
+
+
+def test_run_history_filters_by_real_site_scope_and_paginates(
+    client, auth_cookie, setup_db
+):
+    rows = [
+        storage.Run(
+            tenant_id=1,
+            status="ok",
+            products_scraped=10 + i,
+            products_per_site={"aloe": 10 + i},
+            sites_completed="aloe",
+        )
+        for i in range(3)
+    ]
+    placeholder = storage.Run(
+        tenant_id=1,
+        status="degraded",
+        products_per_site={"aloe": 0, "pharmonline": 5},
+        sites_completed="pharmonline",
+    )
+    setup_db.add_all([*rows, placeholder])
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/runs/history?site=aloe&limit=2&offset=1")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 3
+    assert len(body["items"]) == 2
+    assert placeholder.id not in {item["id"] for item in body["items"]}
+
+
+def test_scrape_request_history_is_tenant_scoped_and_paginated(
+    client, auth_cookie, setup_db
+):
+    own = [
+        storage.ScrapeRequest(tenant_id=1, status="failed", mode="all")
+        for _ in range(3)
+    ]
+    setup_db.add_all(
+        [*own, storage.ScrapeRequest(tenant_id=2, status="failed", mode="all")]
+    )
+    setup_db.commit()
+
+    response = client.get(
+        "/api/v1/dash/scrape/requests/history?status=failed&limit=2"
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 3
+    assert len(body["items"]) == 2
+
+
+def test_successful_dashboard_mutation_is_audited_without_request_body(
+    client, auth_cookie, tenant_user, setup_db
+):
+    secret_marker = "22-08"
+    response = client.patch(
+        "/api/v1/dash/me/notifications",
+        json={"quiet_hours": secret_marker},
+    )
+    assert response.status_code == 200, response.text
+
+    audit = client.get("/api/v1/dash/audit-log")
+
+    assert audit.status_code == 200, audit.text
+    body = audit.json()
+    assert body["total"] >= 1
+    row = body["items"][0]
+    assert row["actor_user_id"] == tenant_user.id
+    assert row["actor_email"] == tenant_user.email
+    assert row["action"] == "PATCH"
+    assert row["resource"] == "/api/v1/dash/me/notifications"
+    assert row["response_status"] == 200
+    assert row["request_id"]
+    assert secret_marker not in audit.text
+
+
+def test_failed_dashboard_mutation_is_not_audited(client, auth_cookie):
+    response = client.patch(
+        "/api/v1/dash/me/notifications",
+        json={"email_severity_min": "not-a-level"},
+    )
+    assert response.status_code == 422
+
+    audit = client.get("/api/v1/dash/audit-log").json()
+    assert audit["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_middleware_uses_isolated_session(monkeypatch):
+    from fastapi import Request, Response
+
+    class FakeAuditSession:
+        def __init__(self):
+            self.added = []
+            self.commits = 0
+            self.rollbacks = 0
+            self.closed = 0
+
+        def add(self, row):
+            self.added.append(row)
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+        def close(self):
+            self.closed += 1
+
+    class BusinessSession:
+        commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    audit_session = FakeAuditSession()
+    business_session = BusinessSession()
+    monkeypatch.setattr(
+        storage, "make_session", lambda: (lambda: audit_session)
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "path": "/api/v1/dash/categories/1",
+            "query_string": b"",
+            "headers": [],
+            "server": ("test", 80),
+            "client": ("test", 123),
+            "scheme": "http",
+        }
+    )
+    request.state.request_id = "audit-test"
+
+    async def call_next(req):
+        req.state.tenant_id = 1
+        req.state.user_id = 7
+        req.state.db = business_session
+        return Response(status_code=200)
+
+    response = await api_module._dashboard_audit_middleware(request, call_next)
+
+    assert response.status_code == 200
+    assert business_session.commits == 0
+    assert audit_session.commits == 1
+    assert audit_session.closed == 1
+    assert len(audit_session.added) == 1
 
 
 def _make_match_with_prices(db, run, *, canonical, prices, tenant_id=1, category=None):
@@ -837,6 +1376,160 @@ def test_dash_alerts_without_cookie_401(client):
     assert r.status_code == 401
 
 
+def test_alert_page_filters_and_paginates_on_server(
+    client, auth_cookie, setup_db
+):
+    now = utcnow()
+    sites = ["pharmonline", "aloe", "aptekonline", "pharmonline"]
+    events = [
+        storage.AlertEvent(
+            tenant_id=1,
+            rule_type="price_drop_pct",
+            dedup_key=f"drop-{i}",
+            severity="warning",
+            title="pharmonline in title" if sites[i] == "aloe" else f"Drop {i}",
+            payload={"site": sites[i]},
+            created_at=now if i < 2 else now - timedelta(minutes=i),
+            is_read=False,
+        )
+        for i in range(4)
+    ]
+    read_without_site = storage.AlertEvent(
+        tenant_id=1,
+        rule_type="new_product",
+        dedup_key="read-one",
+        severity="info",
+        title="Read without site",
+        created_at=now,
+        is_read=True,
+    )
+    read_with_unknown_site = storage.AlertEvent(
+        tenant_id=1,
+        rule_type="new_product",
+        dedup_key="read-unknown-site",
+        severity="info",
+        title="Read with unknown site",
+        payload={"site": "unknown"},
+        created_at=now - timedelta(seconds=1),
+        is_read=True,
+    )
+    other_tenant = storage.AlertEvent(
+        tenant_id=2,
+        rule_type="price_drop_pct",
+        dedup_key="tenant-two",
+        severity="warning",
+        title="Tenant two aloe",
+        payload={"site": "aloe"},
+        created_at=now,
+        is_read=False,
+    )
+    setup_db.add_all(
+        [*events, read_without_site, read_with_unknown_site, other_tenant]
+    )
+    setup_db.commit()
+
+    first = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&severity=warning&limit=2"
+    )
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["total"] == 4
+    assert len(body["items"]) == 2
+    assert body["rule_types"] == ["new_product", "price_drop_pct"]
+    assert [item["id"] for item in body["items"]] == [events[1].id, events[0].id]
+    assert [item["site"] for item in body["items"]] == ["aloe", "pharmonline"]
+
+    second = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&severity=warning&limit=2&offset=2"
+    ).json()
+    assert len(second["items"]) == 2
+    assert {item["id"] for item in body["items"]}.isdisjoint(
+        {item["id"] for item in second["items"]}
+    )
+
+    aloe_page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&site=aloe&severity=warning"
+    ).json()
+    assert aloe_page["total"] == 1
+    assert aloe_page["items"][0]["id"] == events[1].id
+    assert aloe_page["items"][0]["title"] == "pharmonline in title"
+
+    pharm_page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&site=pharmonline&severity=warning&limit=1"
+    ).json()
+    assert pharm_page["total"] == 2
+    assert len(pharm_page["items"]) == 1
+
+    general_page = client.get(
+        "/api/v1/dash/alerts/page?view=read&site=general&hours=0"
+    ).json()
+    assert general_page["total"] == 2
+    assert {item["id"] for item in general_page["items"]} == {
+        read_without_site.id,
+        read_with_unknown_site.id,
+    }
+    assert all(item["site"] is None for item in general_page["items"])
+
+    oldest_page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&severity=warning&sort=oldest&hours=0"
+    ).json()
+    assert [item["id"] for item in oldest_page["items"]] == [
+        events[3].id,
+        events[2].id,
+        events[0].id,
+        events[1].id,
+    ]
+
+    site_page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&severity=warning&sort=site&hours=0"
+    ).json()
+    assert [item["site"] for item in site_page["items"]] == [
+        "aloe",
+        "aptekonline",
+        "pharmonline",
+        "pharmonline",
+    ]
+    assert [item["id"] for item in site_page["items"][-2:]] == [
+        events[0].id,
+        events[3].id,
+    ]
+
+
+@pytest.mark.parametrize("query", ["site=unknown", "sort=random"])
+def test_alert_page_rejects_unknown_site_or_sort(client, auth_cookie, query):
+    response = client.get(f"/api/v1/dash/alerts/page?{query}")
+    assert response.status_code == 422
+
+
+def test_alert_page_site_sort_places_general_last(client, auth_cookie, setup_db):
+    now = utcnow()
+    rows = [
+        storage.AlertEvent(
+            tenant_id=1,
+            rule_type="new_product",
+            dedup_key=f"site-sort-{site or 'general'}",
+            severity="info",
+            title=site or "General",
+            payload={"site": site} if site else None,
+            created_at=now,
+            is_read=False,
+        )
+        for site in ("pharmonline", None, "aloe", "aptekonline")
+    ]
+    setup_db.add_all(rows)
+    setup_db.commit()
+
+    page = client.get(
+        "/api/v1/dash/alerts/page?view=inbox&sort=site&hours=0"
+    ).json()
+    assert [item["site"] for item in page["items"]] == [
+        "aloe",
+        "aptekonline",
+        "pharmonline",
+        None,
+    ]
+
+
 # ─── Legacy ERP endpoints — require X-API-Key ────────────────────────────────
 
 
@@ -919,6 +1612,44 @@ def test_dash_categories_create_requires_auth(client):
         json={"key": "test", "label_ru": "Test", "label_az": "Test AZ"},
     )
     assert r.status_code == 401
+
+
+def test_categories_page_filters_paginates_and_returns_global_stats(
+    client, auth_cookie, setup_db
+):
+    setup_db.add_all(
+        [
+            storage.Category(
+                key=f"cat-{i}",
+                label_ru=f"Категория {i}",
+                label_az=f"Kateqoriya {i}",
+                pharmonline_slug=f"p-{i}",
+                aptekonline_slug=f"a-{i}" if i % 2 == 0 else None,
+                aloe_slug=f"l-{i}" if i == 0 else None,
+                is_active=i != 3,
+            )
+            for i in range(5)
+        ]
+    )
+    setup_db.commit()
+
+    response = client.get(
+        "/api/v1/dash/categories/page?coverage=cross2&limit=1&offset=1"
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 3
+    assert len(body["items"]) == 1
+    assert body["stats"] == {
+        "total": 5,
+        "active": 4,
+        "cross2": 3,
+        "cross3": 1,
+        "pharmonline": 5,
+        "aptekonline": 3,
+        "aloe": 1,
+    }
 
 
 def test_dash_categories_require_nonblank_az_label(client, auth_cookie):
@@ -1788,6 +2519,396 @@ def test_cost_csv_import_imports_valid_rows(client, tenant_user, setup_db):
     assert body["rows_processed"] == 3
     assert body["rows_imported"] == 1
     assert body["rows_skipped"] == 2
+    assert body["batch_id"] is not None
+
+
+def test_cost_csv_preview_is_read_only_then_import_can_be_rolled_back(
+    client, auth_cookie, setup_db
+):
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="ROLL-001",
+        url="http://x/roll",
+        name="Rollback product",
+        name_normalized="rollback product",
+    )
+    setup_db.add(product)
+    setup_db.flush()
+    original = storage.SupplierPrice(
+        product_id=product.id,
+        sku="ROLL-001",
+        supplier_name="Vendor",
+        purchase_price=3.0,
+        currency="AZN",
+        source="erp",
+    )
+    setup_db.add(original)
+    setup_db.commit()
+    csv_body = (
+        b"sku,supplier_name,purchase_price,currency\n"
+        b"ROLL-001,Vendor,4.50,AZN\n"
+    )
+
+    preview = client.post(
+        "/api/v1/dash/settings/costs/preview",
+        files={"file": ("costs.csv", csv_body, "text/csv")},
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["changes"][0]["before"]["purchase_price"] == 3.0
+    setup_db.refresh(original)
+    assert original.purchase_price == 3.0
+
+    imported = client.post(
+        "/api/v1/dash/settings/costs/import",
+        files={"file": ("costs.csv", csv_body, "text/csv")},
+    ).json()
+    setup_db.refresh(original)
+    assert original.purchase_price == 4.5
+    history = client.get("/api/v1/dash/settings/costs/imports").json()
+    assert history[0]["id"] == imported["batch_id"]
+    assert history[0]["can_rollback"] is True
+
+    rollback = client.post(
+        f"/api/v1/dash/settings/costs/imports/{imported['batch_id']}/rollback"
+    )
+    assert rollback.status_code == 200, rollback.text
+    setup_db.refresh(original)
+    assert original.purchase_price == 3.0
+    assert original.source == "erp"
+
+
+def test_cost_endpoints_reject_viewer(client, setup_db):
+    viewer = _make_user(setup_db, "cost-viewer@x.az", role="viewer")
+    token = tenants.issue_magic_token(setup_db, viewer.email)
+    client.get(f"/auth/verify?token={token}")
+    body = b"sku,supplier_name,purchase_price\nX,V,1\n"
+
+    assert client.put(
+        "/api/v1/dash/settings/pricing",
+        json={
+            "raise_threshold_pct": 1,
+            "undercut_threshold_pct": 1,
+            "max_spread_pct": 50,
+            "min_margin_pct": 5,
+            "max_per_type": 5,
+        },
+    ).status_code == 403
+    for endpoint in ("preview", "import"):
+        response = client.post(
+            f"/api/v1/dash/settings/costs/{endpoint}",
+            files={"file": ("costs.csv", body, "text/csv")},
+        )
+        assert response.status_code == 403
+    assert client.get("/api/v1/dash/settings/costs/imports").status_code == 403
+    assert (
+        client.post("/api/v1/dash/settings/costs/imports/1/rollback").status_code
+        == 403
+    )
+
+
+def test_cost_preview_uses_only_client_site_for_duplicate_external_id(
+    client, auth_cookie, setup_db
+):
+    pharm = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="SHARED-SKU",
+        url="https://pharmonline.az/shared",
+        name="Client product",
+        name_normalized="client product",
+    )
+    competitor = storage.Product(
+        tenant_id=1,
+        site="aloe",
+        external_id="SHARED-SKU",
+        url="https://aloe.az/shared",
+        name="Competitor product",
+        name_normalized="competitor product",
+    )
+    setup_db.add_all([pharm, competitor])
+    setup_db.commit()
+    body = b"sku,supplier_name,purchase_price\nSHARED-SKU,V,2.5\n"
+
+    preview = client.post(
+        "/api/v1/dash/settings/costs/preview",
+        files={"file": ("costs.csv", body, "text/csv")},
+    ).json()
+
+    assert preview["changes"][0]["product_id"] == pharm.id
+    assert preview["changes"][0]["product_name"] == "Client product"
+
+
+def test_dashboard_cost_then_erp_push_upserts_same_product_supplier(
+    client, auth_cookie, setup_db
+):
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="DASH-ERP-1",
+        url="https://pharmonline.az/dash-erp",
+        name="Dashboard ERP product",
+        name_normalized="dashboard erp product",
+    )
+    setup_db.add(product)
+    setup_db.commit()
+    dashboard_csv = b"sku,supplier_name,purchase_price\nDASH-ERP-1,Vendor,2.5\n"
+    imported = client.post(
+        "/api/v1/dash/settings/costs/import",
+        files={"file": ("costs.csv", dashboard_csv, "text/csv")},
+    )
+    assert imported.status_code == 200, imported.text
+
+    pushed = client.post(
+        "/api/v1/inventory/prices",
+        headers={"X-API-Key": "test-key-1234"},
+        json=[
+            {
+                "sku": "DASH-ERP-1",
+                "supplier_name": "Vendor",
+                "purchase_price": 4.25,
+                "currency": "AZN",
+            }
+        ],
+    )
+
+    assert pushed.status_code == 200, pushed.text
+    setup_db.expire_all()
+    rows = setup_db.scalars(
+        select(storage.SupplierPrice).where(
+            storage.SupplierPrice.product_id == product.id,
+            storage.SupplierPrice.supplier_name == "Vendor",
+        )
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].purchase_price == 4.25
+    assert rows[0].source == "api_erp"
+
+
+def test_cost_import_rolls_back_everything_when_cache_invalidation_fails(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    from sqlalchemy.orm import Query
+
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="ATOMIC-SKU",
+        url="https://pharmonline.az/atomic",
+        name="Atomic product",
+        name_normalized="atomic product",
+    )
+    setup_db.add(product)
+    setup_db.commit()
+    original_delete = Query.delete
+
+    def fail_roi_delete(query, *args, **kwargs):
+        entity = query.column_descriptions[0].get("entity")
+        if entity is storage.RoiActionsCache:
+            raise RuntimeError("cache delete failed")
+        return original_delete(query, *args, **kwargs)
+
+    monkeypatch.setattr(Query, "delete", fail_roi_delete)
+    body = b"sku,supplier_name,purchase_price\nATOMIC-SKU,V,2.5\n"
+    with pytest.raises(RuntimeError, match="cache delete failed"):
+        client.post(
+            "/api/v1/dash/settings/costs/import",
+            files={"file": ("costs.csv", body, "text/csv")},
+        )
+    setup_db.rollback()
+    assert setup_db.scalar(
+        select(storage.SupplierPrice).where(
+            storage.SupplierPrice.product_id == product.id
+        )
+    ) is None
+    assert setup_db.scalar(
+        select(storage.CostImportBatch).where(
+            storage.CostImportBatch.tenant_id == 1
+        )
+    ) is None
+
+
+def test_supplier_price_unique_product_supplier_invariant(setup_db):
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="UNIQUE-SKU",
+        url="https://pharmonline.az/unique",
+        name="Unique product",
+        name_normalized="unique product",
+    )
+    setup_db.add(product)
+    setup_db.flush()
+    setup_db.add_all(
+        [
+            storage.SupplierPrice(
+                product_id=product.id,
+                supplier_name="V",
+                purchase_price=1,
+            ),
+            storage.SupplierPrice(
+                product_id=product.id,
+                supplier_name="V",
+                purchase_price=2,
+            ),
+        ]
+    )
+    with pytest.raises(Exception):
+        setup_db.commit()
+    setup_db.rollback()
+
+
+def test_cost_import_lock_serializes_same_tenant(setup_db):
+    import threading
+    import time
+
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    entered_second = threading.Event()
+
+    def first():
+        with api_module.inv_mod.supplier_price_write_lock(setup_db, 1):
+            entered_first.set()
+            release_first.wait(timeout=2)
+
+    def second():
+        entered_first.wait(timeout=2)
+        with api_module.inv_mod.supplier_price_write_lock(setup_db, 1):
+            entered_second.set()
+
+    one = threading.Thread(target=first)
+    two = threading.Thread(target=second)
+    one.start()
+    two.start()
+    assert entered_first.wait(timeout=1)
+    time.sleep(0.05)
+    assert not entered_second.is_set()
+    release_first.set()
+    one.join(timeout=2)
+    two.join(timeout=2)
+    assert entered_second.is_set()
+
+
+def test_concurrent_erp_write_is_serialized_against_dashboard_rollback(
+    setup_db, tenant_user, monkeypatch
+):
+    import threading
+    import time
+
+    product = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="ERP-RB-1",
+        url="https://pharmonline.az/erp-rb",
+        name="ERP rollback product",
+        name_normalized="erp rollback product",
+    )
+    setup_db.add(product)
+    setup_db.flush()
+    setup_db.add(
+        storage.SupplierPrice(
+            product_id=product.id,
+            sku="ERP-RB-1",
+            supplier_name="Vendor",
+            purchase_price=2.5,
+            currency="AZN",
+            source="dashboard_csv",
+        )
+    )
+    batch = storage.CostImportBatch(
+        tenant_id=1,
+        actor_user_id=tenant_user.id,
+        rows_processed=1,
+        rows_imported=1,
+        rows_skipped=0,
+        changes=[
+            {
+                "product_id": product.id,
+                "supplier_name": "Vendor",
+                "before": None,
+                "after": {
+                    "purchase_price": 2.5,
+                    "currency": "AZN",
+                    "source": "dashboard_csv",
+                    "sku": "ERP-RB-1",
+                },
+            }
+        ],
+    )
+    setup_db.add(batch)
+    setup_db.commit()
+
+    SessionLocal = sessionmaker(setup_db.get_bind(), expire_on_commit=False)
+    erp_db = SessionLocal()
+    rollback_db = SessionLocal()
+    erp_entered = threading.Event()
+    release_erp = threading.Event()
+    rollback_done = threading.Event()
+    failures: list[BaseException] = []
+    original_find = api_module.inv_mod._find_product_by_sku_or_name
+
+    def blocking_find(*args, **kwargs):
+        erp_entered.set()
+        release_erp.wait(timeout=2)
+        return original_find(*args, **kwargs)
+
+    monkeypatch.setattr(
+        api_module.inv_mod, "_find_product_by_sku_or_name", blocking_find
+    )
+
+    def erp_write():
+        try:
+            api_module.push_prices(
+                [
+                    api_module.PurchasePriceIn(
+                        sku="ERP-RB-1",
+                        supplier_name="Vendor",
+                        purchase_price=4.0,
+                        currency="AZN",
+                    )
+                ],
+                source="api_erp",
+                db=erp_db,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    def rollback():
+        try:
+            api_module.dash_cost_import_rollback(
+                batch.id, user=tenant_user, db=rollback_db
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            rollback_done.set()
+
+    erp_thread = threading.Thread(target=erp_write)
+    rollback_thread = threading.Thread(target=rollback)
+    erp_thread.start()
+    assert erp_entered.wait(timeout=1)
+    rollback_thread.start()
+    time.sleep(0.05)
+    assert not rollback_done.is_set()
+    release_erp.set()
+    erp_thread.join(timeout=2)
+    rollback_thread.join(timeout=2)
+    erp_db.close()
+    rollback_db.close()
+
+    assert rollback_done.is_set()
+    assert len(failures) == 1
+    assert getattr(failures[0], "status_code", None) == 409
+    setup_db.expire_all()
+    current = setup_db.scalar(
+        select(storage.SupplierPrice).where(
+            storage.SupplierPrice.product_id == product.id,
+            storage.SupplierPrice.supplier_name == "Vendor",
+        )
+    )
+    assert current is not None
+    assert current.purchase_price == 4.0
+    assert current.source == "api_erp"
 
 
 # ─── Phase 5.2 prep — batch price-history endpoint ───────────────────────────
@@ -2937,3 +4058,310 @@ def test_recreate_email_after_soft_delete_still_409(client, auth_cookie, setup_d
         json={"email": "stillthere@x.az", "name": "X", "role": "viewer"},
     )
     assert r.status_code == 409
+
+
+def test_scrape_complete_preserves_degraded_terminal_status(client, setup_db):
+    run = storage.Run(tenant_id=1, status="degraded", finished_at=utcnow())
+    setup_db.add(run)
+    setup_db.flush()
+    request_row = storage.ScrapeRequest(
+        tenant_id=1,
+        mode="all",
+        status="degraded",
+        run_id=run.id,
+        completed_at=utcnow(),
+        error_message="aloe=degraded(incomplete_items)",
+    )
+    setup_db.add(request_row)
+    setup_db.commit()
+
+    response = client.post(
+        f"/api/v1/internal/scrape-complete/{request_row.id}",
+        headers={"X-API-Key": "test-key-1234"},
+        json={"run_id": run.id},
+    )
+    assert response.status_code == 200
+    assert response.json()["noop"] == "already degraded"
+    setup_db.refresh(request_row)
+    assert request_row.status == "degraded"
+    assert request_row.error_message == "aloe=degraded(incomplete_items)"
+
+
+def test_run_endpoints_serialize_quality(client, auth_cookie, setup_db):
+    run = storage.Run(
+        tenant_id=1,
+        status="degraded",
+        finished_at=utcnow(),
+        products_scraped=5,
+        products_per_site={"aloe": 5},
+        products_per_site_category={"aloe": {"cat": 5}},
+        run_quality={
+            "version": 1,
+            "mode": "category",
+            "financially_eligible": False,
+            "sites": {
+                "aloe": {
+                    "status": "degraded",
+                    "items_expected": 1,
+                    "items": {"dermanlar": {"status": "ok", "products": 5}},
+                }
+            },
+        },
+    )
+    setup_db.add(run)
+    setup_db.commit()
+
+    rows = client.get("/api/v1/dash/runs?limit=1").json()
+    assert rows[0]["run_quality"]["sites"]["aloe"]["status"] == "degraded"
+    assert rows[0]["run_quality"]["sites"]["aloe"]["items_expected"] == 1
+    assert "items" not in rows[0]["run_quality"]["sites"]["aloe"]
+    detail = client.get(f"/api/v1/dash/runs/{run.id}/breakdown").json()
+    assert detail["run_quality"]["financially_eligible"] is False
+    assert detail["run_quality"]["sites"]["aloe"]["items"]["dermanlar"]["products"] == 5
+
+
+def test_run_breakdown_is_tenant_scoped(client, auth_cookie, setup_db):
+    foreign_run = storage.Run(
+        tenant_id=2,
+        status="degraded",
+        run_quality={"sites": {"aloe": {"items": {"secret-url": {}}}}},
+    )
+    setup_db.add(foreign_run)
+    setup_db.commit()
+
+    response = client.get(f"/api/v1/dash/runs/{foreign_run.id}/breakdown")
+    assert response.status_code == 404
+
+
+def test_scrape_complete_rejects_cross_tenant_run(client, setup_db):
+    request_row = storage.ScrapeRequest(tenant_id=2, mode="all", status="running")
+    foreign_run = storage.Run(tenant_id=1, status="ok")
+    setup_db.add_all([request_row, foreign_run])
+    setup_db.commit()
+
+    response = client.post(
+        f"/api/v1/internal/scrape-complete/{request_row.id}",
+        headers={"X-API-Key": "test-key-1234"},
+        json={"run_id": foreign_run.id},
+    )
+    assert response.status_code == 400
+    setup_db.refresh(request_row)
+    assert request_row.status == "running"
+    assert request_row.run_id is None
+
+
+def test_pending_scrape_worker_ignores_non_pilot_tenant(client, setup_db):
+    foreign_request = storage.ScrapeRequest(tenant_id=2, mode="all", status="pending")
+    pilot_request = storage.ScrapeRequest(tenant_id=1, mode="all", status="pending")
+    setup_db.add_all([foreign_request, pilot_request])
+    setup_db.commit()
+
+    response = client.get(
+        "/api/v1/internal/pending-scrape",
+        headers={"X-API-Key": "test-key-1234"},
+    )
+    assert response.status_code == 200
+    assert response.json()["pending"]["id"] == pilot_request.id
+    setup_db.refresh(foreign_request)
+    assert foreign_request.status == "pending"
+
+
+def test_roi_actions_refuses_inline_compute_without_verified_cache(
+    client, auth_cookie
+):
+    response = client.get("/api/v1/dash/roi/actions")
+    assert response.status_code == 503
+    assert "Verified full-catalog" in response.json()["detail"]
+
+
+def test_roi_status_is_unavailable_without_verified_cache(client, auth_cookie):
+    response = client.get("/api/v1/dash/roi/status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "available": False,
+        "client_site": "pharmonline",
+        "run_id": None,
+        "computed_at": None,
+        "run_started_at": None,
+        "run_finished_at": None,
+        "item_count": 0,
+    }
+    recommendations = client.get("/api/v1/dash/roi/recommendations")
+    assert recommendations.status_code == 503
+    assert "Verified full-catalog" in recommendations.json()["detail"]
+
+
+def test_roi_actions_serves_cache_from_financially_eligible_run(
+    client, auth_cookie, setup_db
+):
+    run = storage.Run(
+        tenant_id=1,
+        status="ok",
+        finished_at=utcnow(),
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
+    setup_db.add(run)
+    setup_db.flush()
+    setup_db.add(
+        storage.RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            run_id=run.id,
+            computed_at=utcnow(),
+            payload=[],
+        )
+    )
+    setup_db.commit()
+    response = client.get("/api/v1/dash/roi/actions")
+    assert response.status_code == 200
+    assert response.json() == []
+
+    status = client.get("/api/v1/dash/roi/status").json()
+    assert status["available"] is True
+    assert status["run_id"] == run.id
+    assert status["item_count"] == 0
+    assert status["computed_at"] is not None
+    assert status["run_finished_at"] is not None
+
+    recommendations = client.get("/api/v1/dash/roi/recommendations").json()
+    assert recommendations["items"] == []
+    assert recommendations["provenance"]["run_id"] == run.id
+    assert recommendations["provenance"]["item_count"] == 0
+
+
+def test_roi_actions_rejects_cache_after_newer_degraded_full_run(
+    client, auth_cookie, setup_db
+):
+    cached_run = storage.Run(
+        tenant_id=1,
+        started_at=utcnow() - timedelta(hours=2),
+        finished_at=utcnow() - timedelta(hours=1),
+        status="ok",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
+    setup_db.add(cached_run)
+    setup_db.flush()
+    setup_db.add(
+        storage.RoiActionsCache(
+            tenant_id=1,
+            client_site="pharmonline",
+            run_id=cached_run.id,
+            computed_at=utcnow(),
+            payload=[],
+        )
+    )
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=utcnow() - timedelta(minutes=30),
+            finished_at=utcnow(),
+            status="degraded",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": False,
+                "financially_eligible": False,
+                "sites": {"pharmonline": {"status": "degraded"}},
+            },
+        )
+    )
+    setup_db.add(
+        storage.Run(
+            tenant_id=1,
+            started_at=utcnow() - timedelta(minutes=10),
+            finished_at=utcnow() + timedelta(seconds=1),
+            status="ok",
+            run_quality={
+                "baseline_enforced": True,
+                "full_catalog_verified": True,
+                "financially_eligible": True,
+                "sites": {"aloe": {"status": "ok"}},
+            },
+        )
+    )
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/roi/actions")
+
+    assert response.status_code == 503
+    assert "Verified full-catalog" in response.json()["detail"]
+    assert client.get("/api/v1/dash/roi/status").json()["available"] is False
+    assert client.get("/api/v1/dash/roi/recommendations").status_code == 503
+
+
+def test_normalize_stats_uses_product_units_and_tenant_scope(
+    client, auth_cookie, setup_db
+):
+    own_match = storage.Match(
+        tenant_id=1,
+        canonical_name="Review own",
+        confidence=0.5,
+        needs_review=True,
+    )
+    foreign_match = storage.Match(
+        tenant_id=2,
+        canonical_name="Review foreign",
+        confidence=0.5,
+        needs_review=True,
+    )
+    setup_db.add_all([own_match, foreign_match])
+    setup_db.flush()
+    setup_db.add_all(
+        [
+            storage.Product(
+                tenant_id=1,
+                site="pharmonline",
+                external_id="trust-own-1",
+                url="https://example.test/own-1",
+                name="Own one",
+                name_normalized="own one",
+                canonical_id=own_match.id,
+            ),
+            storage.Product(
+                tenant_id=1,
+                site="aloe",
+                external_id="trust-own-2",
+                url="https://example.test/own-2",
+                name="Own two",
+                name_normalized="own two",
+                canonical_id=own_match.id,
+            ),
+            storage.Product(
+                tenant_id=2,
+                site="aptekonline",
+                external_id="trust-foreign",
+                url="https://example.test/foreign",
+                name="Foreign",
+                name_normalized="foreign",
+                canonical_id=foreign_match.id,
+            ),
+        ]
+    )
+    setup_db.commit()
+
+    response = client.get("/api/v1/dash/normalize/stats")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["products_total"] == 2
+    assert body["matches_needing_review"] == 1
+    assert body["products_needing_review"] == 2
+    assert body["needs_review"] == 1

@@ -59,7 +59,9 @@ def check_health(
     """Запустить все проверки и вернуть совокупный отчёт."""
     report = HealthReport(status="ok")
 
-    last_run = session.scalars(select(Run).order_by(desc(Run.started_at)).limit(1)).first()
+    from src import storage
+
+    last_run = storage.latest_terminal_run(session, tenant_id=1)
 
     if last_run is None:
         report.status = "warning"
@@ -97,6 +99,88 @@ def check_health(
                 "last_run_failed",
                 f"Последний прогон #{last_run.id} упал: {last_run.error_message or '?'}",
                 context={"run_id": last_run.id, "error": last_run.error_message},
+            )
+        )
+
+    if last_run.status == "degraded":
+        quality = last_run.run_quality or {}
+        report.issues.append(
+            HealthIssue(
+                "warning",
+                "last_run_degraded",
+                f"Прогон #{last_run.id} завершён частично: "
+                f"{last_run.error_message or 'см. run_quality'}",
+                context={"run_id": last_run.id, "run_quality": quality},
+            )
+        )
+        for site, details in (quality.get("sites") or {}).items():
+            if details.get("status") != "failed":
+                continue
+            report.issues.append(
+                HealthIssue(
+                    "critical",
+                    "degraded_site_failed",
+                    f"Сайт {site} не дал пригодного результата в прогоне #{last_run.id}.",
+                    context={
+                        "site": site,
+                        "run_id": last_run.id,
+                        "reasons": details.get("reasons") or [],
+                    },
+                )
+            )
+
+    # A later partial tick may be operationally healthy, but it must never
+    # clear the trust failure of the most recent full-catalog attempt.
+    full_attempts = storage.latest_full_catalog_attempts_by_site(
+        session,
+        storage.FULL_CATALOG_SITES,
+        tenant_id=1,
+    )
+    unverified_sites: dict[str, dict] = {}
+    if not full_attempts:
+        unverified_sites = {
+            site: {"run_id": None, "status": "missing"}
+            for site in storage.FULL_CATALOG_SITES
+        }
+    else:
+        for site in storage.FULL_CATALOG_SITES:
+            attempt = full_attempts.get(site)
+            if attempt is None:
+                unverified_sites[site] = {"run_id": None, "status": "missing"}
+                continue
+            quality = attempt.run_quality or {}
+            site_status = ((quality.get("sites") or {}).get(site) or {}).get("status")
+            verified = (
+                attempt.status == "ok"
+                and quality.get("full_catalog_verified") is True
+                and quality.get("financially_eligible") is True
+                and site_status == "ok"
+            )
+            if not verified:
+                unverified_sites[site] = {
+                    "run_id": attempt.id,
+                    "status": attempt.status,
+                    "site_status": site_status,
+                }
+    if unverified_sites:
+        severity: Severity = (
+            "critical"
+            if any(
+                row.get("status") == "failed" or row.get("site_status") == "failed"
+                for row in unverified_sites.values()
+            )
+            else "warning"
+        )
+        summary = ", ".join(
+            f"{site}=#{row.get('run_id') or '—'}:{row.get('site_status') or row['status']}"
+            for site, row in unverified_sites.items()
+        )
+        report.issues.append(
+            HealthIssue(
+                severity,
+                "full_catalog_unverified",
+                f"Полный каталог не подтверждён: {summary}.",
+                context={"sites": unverified_sites},
             )
         )
 
