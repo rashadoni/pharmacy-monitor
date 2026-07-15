@@ -38,7 +38,14 @@ def _cosmetic_origin_false(m) -> bool:
     """The client's class: COMMODITY cluster where some cross-site pair differs in
     GRADE (one cosmetic/kosmetik, the other not) AND in COUNTRY of origin, and NO
     pair shares a consumer brand. Cosmetic ru-oil vs food az-oil = different product.
-    Conservative: same-brand (Medoil tr↔az), same-grade, or same-country are kept."""
+    Conservative: same-brand (Medoil tr↔az), same-grade, or same-country are kept.
+
+    NB: uses `_has_conflicting_legacy_country`, NOT `_has_conflicting_country`.
+    The latter was narrowed to verified `country_code_of` only, so a row whose
+    country is known solely from `manufacturer` or the URL slug reads as "no
+    conflict" and this audit would report falsely clean on the very policy it
+    exists to enforce. This audit is already commodity-gated, which is the guard
+    that made the legacy signal safe in the first place."""
     ms = list(m.products)
     if len({p.site for p in ms}) < 2 or not all(is_commodity_name(p.name) for p in ms):
         return False
@@ -46,7 +53,8 @@ def _cosmetic_origin_false(m) -> bool:
     if _same_recoverable_brand(pairs):
         return False
     return any(
-        _grade_tokens(a.name) != _grade_tokens(b.name) and matcher._has_conflicting_country(a, b)
+        _grade_tokens(a.name) != _grade_tokens(b.name)
+        and matcher._has_conflicting_legacy_country(a, b)
         for a, b in pairs
     )
 
@@ -64,7 +72,8 @@ def _strict_not_identical(m) -> bool:
     # client policy 2026-05-31: country must match too — NO same-brand exception
     # (Medoil Türkiyə ≠ Medoil Azərbaycan).
     return any(
-        matcher._has_conflicting_country(a, b) or _grade_tokens(a.name) != _grade_tokens(b.name)
+        matcher._has_conflicting_legacy_country(a, b)
+        or _grade_tokens(a.name) != _grade_tokens(b.name)
         for a, b in pairs
     )
 

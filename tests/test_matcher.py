@@ -1792,6 +1792,88 @@ def test_country_blocks_cross_country_match(db_session):
     assert a.canonical_id != b.canonical_id or (a.canonical_id is None and b.canonical_id is None)
 
 
+def test_trade_name_drug_with_conflicting_countries_does_not_cluster(db_session):
+    """Client policy 2026-07-13, end-to-end through match_products.
+
+    The predicate is covered in test_matcher_brand_guard, but nothing pinned the
+    whole pipeline for a *trade-name* drug (no commodity/botanical marker in the
+    name), which is exactly what the 07-13 policy newly covers. The old
+    exception matched these; it must not come back silently.
+    """
+    s = db_session
+    a = _make_product(
+        s,
+        site="aptekonline",
+        external_id="konkor-de",
+        name="Konkor 5 mq N30",
+        name_normalized="konkor",
+        brand="Konkor",
+        pack_size="30",
+    )
+    a.manufacturer_country_code = "de"
+    a.country_resolution_status = "resolved"
+    b = _make_product(
+        s,
+        site="pharmonline",
+        external_id="konkor-fr",
+        name="Konkor 5 mq N30",
+        name_normalized="konkor",
+        brand="Konkor",
+        pack_size="30",
+    )
+    b.manufacturer_country_code = "fr"
+    b.country_resolution_status = "resolved"
+    s.commit()
+    matcher.match_products(s)
+    s.refresh(a)
+    s.refresh(b)
+    assert a.canonical_id != b.canonical_id or (a.canonical_id is None and b.canonical_id is None)
+
+
+def test_country_guard_is_blind_to_unverified_country_characterization(db_session):
+    """Characterization: the guard sees VERIFIED country only. Known gap.
+
+    `_has_conflicting_country` reads `product_policy.country_code_of`, which is
+    None unless `country_resolution_status == 'resolved'`. A row whose country is
+    known only from legacy `manufacturer` / the URL slug therefore does NOT block,
+    even though `_country_of` can read it. On production 2026-07-15 this affects
+    ~2,217 of 43,323 products (5.1%) that are not `resolved`.
+
+    This test documents the gap rather than asserting it is desirable. If the
+    guard is ever widened to the legacy signal, this test SHOULD fail — update it
+    then, and drop the caveat in CLAUDE.md.
+    """
+    s = db_session
+    a = _make_product(
+        s,
+        site="aptekonline",
+        external_id="xbrain-tr-legacy",
+        name="X-Brain 150 ml",
+        name_normalized="x brain",
+        brand="X-Brain",
+        pack_size="150ml",
+    )
+    a.manufacturer = "TÜRKİYƏ"  # legacy signal only, never resolved
+    b = _make_product(
+        s,
+        site="pharmonline",
+        external_id="xbrain-az-legacy",
+        name="X-Brain 150 ml",
+        name_normalized="x brain",
+        brand="X-Brain",
+        pack_size="150ml",
+    )
+    b.manufacturer = "Azərbaycan"
+
+    # The signal is readable...
+    assert matcher._country_of(a) == "tr"
+    assert matcher._country_of(b) == "az"
+    assert matcher._has_conflicting_legacy_country(a, b) is True
+    # ...but the guard in _hard_conflict does not consume it.
+    assert matcher._has_conflicting_country(a, b) is False
+    assert matcher._hard_conflict(a, b) is False
+
+
 class TestDimensionGuard:
     def test_extract_basic(self):
         assert _dimensions("Alban 10 sm x 10 sm N25") == frozenset({(100.0, 100.0)})
