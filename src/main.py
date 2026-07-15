@@ -862,6 +862,23 @@ def classify_run_quality(
         reasons: list[str] = []
         ordered_items = list(result.item_results.items())
         ordered_items.sort(key=lambda item: item[1].get("status") == "ok")
+        route_total = len(result.route_statuses)
+        incomplete_route_details: dict[str, dict] = {}
+        for slug, status in list(result.route_statuses.items())[:_RUN_QUALITY_MAX_ITEMS]:
+            reason = _route_incomplete_reason(status)
+            if reason is None:
+                continue
+            incomplete_route_details[str(slug)[:300]] = {
+                "reason": reason[:200],
+                **({"item_failures": int(status.item_failures)} if status.item_failures else {}),
+                **({"pages_skipped": int(status.pages_skipped)} if status.pages_skipped else {}),
+                **(
+                    {"raw_items": int(status.raw_items), "parsed_items": int(status.parsed_items)}
+                    if status.raw_items or status.parsed_items
+                    else {}
+                ),
+            }
+
         persisted_items: dict[str, dict] = {}
         for index, (raw_key, raw_value) in enumerate(ordered_items[:_RUN_QUALITY_MAX_ITEMS]):
             key = str(raw_key)[:300]
@@ -926,24 +943,14 @@ def classify_run_quality(
             "items_truncated": max(0, len(ordered_items) - len(persisted_items)),
             # Route evidence is what full-catalog verification actually judges, and
             # it used to exist only in memory: `items_expected/completed` above are
-            # counted from the requested slugs (base.py), NOT from route_statuses,
-            # so a run could report 6/6 items completed while verification failed
-            # all 6 routes — and nothing recorded why. Persist the verdict.
-            "routes": {
-                str(slug)[:300]: {
-                    "complete": bool(status.complete),
-                    "incomplete_reason": _route_incomplete_reason(status),
-                    **({"abort_reason": str(status.abort_reason)[:100]} if status.abort_reason else {}),
-                    **(
-                        {"pages": f"{status.visited_pages}/{status.expected_pages}"}
-                        if status.expected_pages is not None
-                        else {}
-                    ),
-                    **({"item_failures": status.item_failures} if status.item_failures else {}),
-                    **({"pages_skipped": status.pages_skipped} if status.pages_skipped else {}),
-                }
-                for slug, status in list(result.route_statuses.items())[:_RUN_QUALITY_MAX_ITEMS]
-            },
+            # counted from the requested slugs (base.py:748,830), NOT from
+            # route_statuses, so a run could report 6/6 items completed while
+            # verification failed all 6 routes — and nothing recorded why.
+            # Only INCOMPLETE routes are persisted: a healthy 300-category run would
+            # otherwise add ~63 KB of "complete: true" to every row, while a failing
+            # run is exactly the one whose evidence must survive intact.
+            "routes_incomplete": incomplete_route_details,
+            "routes_complete_count": route_total - len(incomplete_route_details),
         }
 
     statuses = [row["status"] for row in site_details.values()]
@@ -1046,38 +1053,62 @@ def run_tenant_id_for_request(session: Session, request_id: int | None) -> int:
 _FULL_CATALOG_MIN_BASELINE_FRACTION = 0.90
 
 
-def _route_incomplete_reason(status) -> str | None:
-    """Why this route fails full-catalog verification, or None if it passes.
+_ROUTE_CAUSE_MAX_LEN = 40
+_MAX_CAUSE_KINDS_PER_SITE = 3
 
-    Mirrors the conditions in `_verify_full_catalog_results` exactly — keep the
-    two in sync. `RouteStatus` already carries `abort_reason`, but it was set in
-    16 places and read in none: the run only ever recorded
-    `incomplete_routes=aloe:6`, a COUNT with no cause, and the object died with
-    the process. The distinction matters because the causes need opposite fixes:
-    `pagination_incomplete` means the scraper under-fetched, while
-    `item_parse_failures` on a 99.9%-complete run means this check is too strict.
+
+def _route_incomplete_causes(status) -> list[str]:
+    """Every condition that makes this route fail verification; [] if it passes.
+
+    Non-empty exactly when `_verify_full_catalog_results` would reject the route
+    — the `fails` expression below is the gate, restated once. Everything after
+    it only explains; it can never change the verdict.
+
+    Reports ALL firing causes, not the first, and puts the scraper's own
+    `abort_reason` first. Ordering by field position is actively wrong here:
+    aloe sets `pages_skipped=total_card_failures` AND `item_failures=
+    total_card_failures` (src/scrapers/aloe.py:616,627) — the same card-failure
+    count in both — so reading `pages_skipped` first reports a parse failure as
+    a pagination gap. Those two need opposite fixes (under-fetch → fix the
+    scraper; parse failures at 99.9% coverage → this check is too strict), so a
+    confident wrong label is worse than the blank we had.
     """
     if status is None:
-        return "missing_route_status"
-    if status.pages_skipped > 0:
-        return f"pages_skipped({status.pages_skipped})"
-    if status.item_failures > 0:
-        return f"item_parse_failures({status.item_failures})"
-    if status.expected_items is not None and (
+        return ["missing_route_status"]
+
+    count_mismatch = status.expected_items is not None and (
         status.raw_items != status.expected_items or status.parsed_items != status.expected_items
-    ):
-        return (
-            f"item_count_mismatch(raw={status.raw_items},"
-            f"parsed={status.parsed_items},expected={status.expected_items})"
-        )
-    if not status.complete:
-        # `abort_reason` is the scraper's own words; fall back to page evidence.
-        if status.abort_reason:
-            return str(status.abort_reason)
-        if status.expected_pages is not None and status.visited_pages is not None:
-            return f"incomplete(pages={status.visited_pages}/{status.expected_pages})"
-        return "incomplete"
-    return None
+    )
+    fails = (
+        not status.complete
+        or status.pages_skipped > 0
+        or status.item_failures > 0
+        or count_mismatch
+    )
+    if not fails:
+        return []
+
+    causes: list[str] = []
+    if status.abort_reason:
+        causes.append(str(status.abort_reason)[:_ROUTE_CAUSE_MAX_LEN])
+    if status.item_failures > 0:
+        causes.append("item_parse_failures")
+    if status.pages_skipped > 0:
+        causes.append("pages_skipped")
+    if count_mismatch:
+        causes.append("item_count_mismatch")
+    return causes or ["incomplete"]
+
+
+def _route_incomplete_reason(status) -> str | None:
+    """Human-readable detail for one route, or None if it passes."""
+    causes = _route_incomplete_causes(status)
+    if not causes:
+        return None
+    detail = "+".join(causes)
+    if status is not None and status.expected_pages is not None:
+        detail += f"(pages={status.visited_pages}/{status.expected_pages})"
+    return detail
 
 
 def _verify_full_catalog_results(
@@ -1113,10 +1144,12 @@ def _verify_full_catalog_results(
             zero_categories[site] = zero_count
         # Single source of truth for "is this route complete", so the reason we
         # report can never drift from the condition we fail on.
+        # Single source of truth for "is this route complete", so the reason we
+        # report can never drift from the condition we fail on.
         incomplete = [
-            (slug, reason)
+            (slug, causes)
             for slug in slugs
-            if (reason := _route_incomplete_reason(result.route_statuses.get(slug))) is not None
+            if (causes := _route_incomplete_causes(result.route_statuses.get(slug)))
         ]
         if incomplete:
             incomplete_routes[site] = incomplete
@@ -1133,14 +1166,21 @@ def _verify_full_catalog_results(
     zero_summary = ",".join(
         f"{site}:{count}" for site, count in sorted(zero_categories.items())
     )
-    # Report WHY, not just how many. `aloe:6` told nobody anything; the reason
-    # string is capped at 300 chars, so aggregate by cause rather than per slug.
+    # Report WHY, not just how many — `aloe:6` told nobody anything. Aggregate by
+    # cause KIND (no embedded counts, or every route would be its own bucket) and
+    # keep only the top few per site: the column is varchar(300), and a blind
+    # `reason[:300]` used to drop whole trailing SITES, losing information the
+    # bare `aloe:40,zeytun:6` form had kept.
+    def _site_summary(site: str, routes: list) -> str:
+        kinds = Counter(cause for _slug, causes in routes for cause in causes)
+        shown = kinds.most_common(_MAX_CAUSE_KINDS_PER_SITE)
+        body = ",".join(f"{kind}x{count}" for kind, count in shown)
+        if len(kinds) > len(shown):
+            body += f",+{len(kinds) - len(shown)}more"
+        return f"{site}:{len(routes)}[{body}]"
+
     incomplete_summary = ",".join(
-        f"{site}:{len(routes)}[" + ",".join(
-            f"{cause}x{count}"
-            for cause, count in sorted(Counter(r for _slug, r in routes).items())
-        ) + "]"
-        for site, routes in sorted(incomplete_routes.items())
+        _site_summary(site, routes) for site, routes in sorted(incomplete_routes.items())
     )
     reason = (
         f"missing={','.join(missing_sites) or '-'};"
