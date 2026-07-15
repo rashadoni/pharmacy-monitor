@@ -259,6 +259,9 @@ def seed_demo(session: Session, force: bool = False) -> dict:
         sites_completed="pharmonline,aptekonline,aloe",
         products_scraped=n_seed_products,
         run_quality=dict(demo_quality),
+        catalog_scope="partial",
+        catalog_verified=False,
+        catalog_verification_reason="seed_demo",
     )
     run_today = Run(
         started_at=today,
@@ -267,6 +270,9 @@ def seed_demo(session: Session, force: bool = False) -> dict:
         sites_completed="pharmonline,aptekonline,aloe",
         products_scraped=n_seed_products,
         run_quality=dict(demo_quality),
+        catalog_scope="partial",
+        catalog_verified=False,
+        catalog_verification_reason="seed_demo",
     )
     session.add_all([run_yesterday, run_today])
     session.flush()

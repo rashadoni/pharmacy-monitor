@@ -17,7 +17,12 @@ import {
 import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
 import { useState } from "react";
-import { api, type CategoryComparisonRow, type ForecastMover } from "@/lib/api";
+import {
+  api,
+  isFullCatalogTrustError,
+  type CategoryComparisonRow,
+  type ForecastMover,
+} from "@/lib/api";
 
 const SITE_COLORS: Record<string, string> = {
   pharmonline: "#3b82f6",
@@ -31,9 +36,7 @@ export default function AnalyticsPage() {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
-        <p className="text-sm text-muted-foreground">
-          {t("subtitle")}
-        </p>
+        <p className="text-sm text-muted-foreground">{t("subtitle")}</p>
       </div>
 
       <MatchQualitySection />
@@ -58,9 +61,16 @@ function MatchQualitySection() {
       {data && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <Stat label={t("stat_total")} value={data.total_matches} />
-          <Stat label={t("stat_auto")} value={data.auto_matches} sub={t("stat_manual", { n: data.manual_matches })} />
-          <Stat label={t("stat_coverage")} value={`${data.coverage_pct.toFixed(1)}%`}
-            sub={`${data.products_matched} / ${data.products_total}`} />
+          <Stat
+            label={t("stat_auto")}
+            value={data.auto_matches}
+            sub={t("stat_manual", { n: data.manual_matches })}
+          />
+          <Stat
+            label={t("stat_coverage")}
+            value={`${data.coverage_pct.toFixed(1)}%`}
+            sub={`${data.products_matched} / ${data.products_total}`}
+          />
           <Stat label={t("stat_rejected")} value={data.rejected_pairs} />
         </div>
       )}
@@ -87,15 +97,40 @@ function BrandShareSection() {
       {isLoading && <Skeleton />}
       {isError && <QueryError onRetry={() => refetch()} />}
       {chartData && chartData.length > 0 && (
-        <ResponsiveContainer width="100%" height={Math.max(320, chartData.length * 28)}>
-          <BarChart data={chartData} layout="vertical" margin={{ top: 4, right: 24, left: 8, bottom: 4 }}>
-            <CartesianGrid strokeDasharray="3 3" opacity={0.3} horizontal={false} />
+        <ResponsiveContainer
+          width="100%"
+          height={Math.max(320, chartData.length * 28)}
+        >
+          <BarChart
+            data={chartData}
+            layout="vertical"
+            margin={{ top: 4, right: 24, left: 8, bottom: 4 }}
+          >
+            <CartesianGrid
+              strokeDasharray="3 3"
+              opacity={0.3}
+              horizontal={false}
+            />
             <XAxis type="number" fontSize={11} />
-            <YAxis dataKey="brand" type="category" width={140} fontSize={11} tick={{ fill: "var(--foreground)" }} />
+            <YAxis
+              dataKey="brand"
+              type="category"
+              width={140}
+              fontSize={11}
+              tick={{ fill: "var(--foreground)" }}
+            />
             <Tooltip formatter={(v: number, name: string) => [v, name]} />
             <Legend />
-            <Bar dataKey="pharmonline" stackId="a" fill={SITE_COLORS.pharmonline} />
-            <Bar dataKey="aptekonline" stackId="a" fill={SITE_COLORS.aptekonline} />
+            <Bar
+              dataKey="pharmonline"
+              stackId="a"
+              fill={SITE_COLORS.pharmonline}
+            />
+            <Bar
+              dataKey="aptekonline"
+              stackId="a"
+              fill={SITE_COLORS.aptekonline}
+            />
             <Bar dataKey="aloe" stackId="a" fill={SITE_COLORS.aloe} />
           </BarChart>
         </ResponsiveContainer>
@@ -111,13 +146,14 @@ function BrandShareSection() {
 
 function PriceIndexSection() {
   const t = useTranslations("analytics");
+  const tCommon = useTranslations("common");
   const locale = useLocale();
   const [page, setPage] = useState(0);
   const pageSize = 25;
   // 2026-05-29: было raw fetch → 500 (бэкенд бросал TypeError, см. analytics.py).
   // Теперь api.priceIndex() (typed, request() кидает на non-2xx) + строки
   // кликабельны: drill в /comparison?category=. Полная версия — /category-comparison.
-  const { data, isLoading, isError, refetch } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["category-comparison", locale],
     queryFn: () => api.categoryComparison(undefined, locale),
   });
@@ -125,7 +161,13 @@ function PriceIndexSection() {
   return (
     <Card title={t("price_index")}>
       {isLoading && <Skeleton />}
-      {isError && <QueryError onRetry={() => refetch()} />}
+      {error && (
+        <div className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+          {isFullCatalogTrustError(error)
+            ? tCommon("financial_data_paused")
+            : <QueryError onRetry={() => refetch()} />}
+        </div>
+      )}
       {data && data.length === 0 && (
         <div className="text-muted-foreground text-center py-8">
           {t("no_categories")}
@@ -186,7 +228,8 @@ function PriceIndexSection() {
 
 function ForecastSection() {
   const t = useTranslations("analytics");
-  const { data, isLoading, isError, refetch } = useQuery<ForecastMover[]>({
+  const tCommon = useTranslations("common");
+  const { data, isLoading, error, refetch } = useQuery<ForecastMover[]>({
     queryKey: ["forecast"],
     queryFn: api.forecastMovers,
   });
@@ -196,12 +239,13 @@ function ForecastSection() {
   // артефакт парсера (concat AZN-bug, e.g. "11.35 AZN 88 AZN" → 1135.88) либо
   // ошибочный matching. Показывать клиенту нет смысла — будет вопросы.
   const clean = (data ?? []).filter(
-    (m) => Math.abs(m.change_pct) <= 50 && m.first_price > 0 && m.last_price > 0,
+    (m) =>
+      Math.abs(m.change_pct) <= 50 && m.first_price > 0 && m.last_price > 0,
   );
 
   // Если данных вовсе нет — не рендерим раздел, чтобы не было placeholder'а
   // «появится через N дней». Forecast вернётся когда наберётся ≥3 прогона.
-  if (!isLoading && !isError && clean.length === 0) {
+  if (!isLoading && !error && clean.length === 0) {
     return null;
   }
 
@@ -211,7 +255,13 @@ function ForecastSection() {
         {t("forecast_desc")}
       </div>
       {isLoading && <Skeleton />}
-      {isError && <QueryError onRetry={() => refetch()} />}
+      {error && (
+        <div className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+          {isFullCatalogTrustError(error)
+            ? tCommon("financial_data_paused")
+            : <QueryError onRetry={() => refetch()} />}
+        </div>
+      )}
       {clean.length > 0 && (
         <div className="space-y-2">
           {clean.slice(0, 10).map((m) => (
@@ -232,7 +282,11 @@ function ForecastRow({ mover }: { mover: ForecastMover }) {
         ? "text-success"
         : "text-muted-foreground";
   const arrow =
-    mover.direction === "falling" ? "↓" : mover.direction === "rising" ? "↑" : "→";
+    mover.direction === "falling"
+      ? "↓"
+      : mover.direction === "rising"
+        ? "↑"
+        : "→";
 
   return (
     <div className="rounded-md border border-border p-3">
@@ -260,7 +314,10 @@ function ForecastRow({ mover }: { mover: ForecastMover }) {
       </div>
       {mover.forecast_7d_price != null && mover.forecast_7d_price > 0 && (
         <div className="text-xs text-muted-foreground mt-1.5 pt-1.5 border-t border-border/50">
-          {t("forecast_7d")} <span className="font-mono">{mover.forecast_7d_price.toFixed(2)} ₼</span>
+          {t("forecast_7d")}{" "}
+          <span className="font-mono">
+            {mover.forecast_7d_price.toFixed(2)} ₼
+          </span>
         </div>
       )}
     </div>
@@ -269,7 +326,13 @@ function ForecastRow({ mover }: { mover: ForecastMover }) {
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-function Card({ title, children }: { title: string; children: React.ReactNode }) {
+function Card({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="rounded-lg border border-border bg-card p-4 md:p-6">
       <h2 className="font-semibold mb-4">{title}</h2>

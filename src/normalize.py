@@ -628,7 +628,7 @@ def parse_price(text: str | None) -> float | None:
 #
 # КРИТИЧНО: исключаем числа с единицами объёма/веса/дозы (ml/g/q/mg/iu…), иначе
 # «50 ml» распарсится как count=50. Дизайн подтверждён Perplexity + Codex.
-_UNIT_SUFFIX = r"(?:ml|m2|l|mg|mcg|mkg|µg|g|gr|q|qr|kg|kq|%|iu|bv|me|ie|мл|мг|г|кг)"
+_UNIT_SUFFIX = r"(?:mm|cm|sm|ml|m2|m|l|mg|mcg|mkg|µg|g|gr|q|qr|kg|kq|%|iu|bv|me|ie|мл|мг|г|кг)"
 _PACK_MULT_RE = re.compile(r"\b(?:n|no)?\s*(\d{1,4})\s*[x×]\s*(\d{1,4})\b", re.IGNORECASE)
 _PACK_N_RE = re.compile(r"\b(?:n|no)\s*(\d{1,4})\b", re.IGNORECASE)
 _PACK_WORD_RE = re.compile(

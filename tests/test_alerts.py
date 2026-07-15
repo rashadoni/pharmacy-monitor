@@ -24,6 +24,9 @@ def _add_run(s, started_at=None, status="ok") -> Run:
         started_at=started_at,
         finished_at=started_at + timedelta(minutes=1),
         status=status,
+        catalog_scope="full" if status == "ok" else "unknown",
+        full_catalog_sites="pharmonline,aptekonline,aloe" if status == "ok" else None,
+        catalog_verified=status == "ok",
         run_quality=(
             {
                 "baseline_enforced": True,
@@ -327,6 +330,21 @@ def test_undercut_below_threshold_no_fire(db_session):
     assert fired == []
 
 
+def test_undercut_explicit_oos_competitor_no_fire(db_session):
+    match = _make_match(db_session, "OOS")
+    client = _add_product(db_session, "pharmonline", "OOS", "ph", canonical_id=match.id)
+    competitor = _add_product(db_session, "aloe", "OOS", "al", canonical_id=match.id)
+    competitor.offer_availability_status = "out_of_stock"
+    competitor.availability_observed_at = utcnow()
+    run = _add_run(db_session)
+    _add_snap(db_session, run, client, 10.0)
+    _add_snap(db_session, run, competitor, 5.0)
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session, run.id) == []
+
+
 def test_dedup_within_cooldown(db_session):
     """Один и тот же event не должен дублироваться в течение cooldown."""
     m = _make_match(db_session, "Foo")
@@ -398,6 +416,20 @@ def test_price_drop_ignores_newer_partial_snapshot_as_baseline(db_session):
     assert alerts.evaluate_rules(db_session, current.id) == []
 
 
+def test_price_drop_explicit_oos_product_no_fire(db_session):
+    product = _add_product(db_session, "aloe", "Unavailable", "oos")
+    product.offer_availability_status = "out_of_stock"
+    product.availability_observed_at = utcnow()
+    yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
+    today = _add_run(db_session, utcnow())
+    _add_snap(db_session, yesterday, product, 100.0)
+    _add_snap(db_session, today, product, 50.0)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session, today.id) == []
+
+
 def test_new_product_detected(db_session):
     yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
     today = _add_run(db_session, utcnow())
@@ -413,6 +445,18 @@ def test_new_product_detected(db_session):
     assert len(fired) == 1
     assert fired[0].rule_type == "new_product"
     assert "New SKU" in fired[0].title
+
+
+def test_new_product_explicit_oos_no_fire(db_session):
+    today = _add_run(db_session, utcnow())
+    product = _add_product(db_session, "aloe", "Unavailable new", "new-oos")
+    product.offer_availability_status = "out_of_stock"
+    product.availability_observed_at = utcnow()
+    _add_snap(db_session, today, product, 7.0)
+    _add_rule(db_session, "new_product")
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session, today.id) == []
 
 
 def test_promo_started_detected(db_session):

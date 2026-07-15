@@ -33,6 +33,9 @@ def _add_run(s):
         started_at=now,
         finished_at=now,
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": True,

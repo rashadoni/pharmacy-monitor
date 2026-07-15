@@ -147,6 +147,8 @@ def test_parse_price_multi_price_contamination():
         ("300q", None, (1, "low")),  # 300 грамм по-азербайджански
         ("500mg", None, (1, "low")),
         ("200 ml", None, (1, "low")),
+        (None, "Пластырь 10x20 sm", (1, "low")),
+        (None, "Bandage 10×20 cm", (1, "low")),
         (None, "Sirop 100 ml", (1, "low")),
         # ── одиночный товар без маркера ──
         (None, "Thiogamma turbo 50 ml", (1, "low")),

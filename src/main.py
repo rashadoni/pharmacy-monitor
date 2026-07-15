@@ -45,6 +45,10 @@ from src.scrapers.pharmonline import PharmonlineScraper  # noqa: E402
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "categories.yaml"
 
 
+class FullCatalogVerificationError(RuntimeError):
+    """A nominal full scan did not prove complete item-level coverage."""
+
+
 # Phase 1c (2026-05-27) — pharmonline DDP path uses reverse-engineered Meteor
 # protocol через WebSocket, обходит Cloudflare без Playwright. Opt-in via
 # PHARMONLINE_USE_DDP=1. Когда выключено — используется legacy Playwright путь.
@@ -135,39 +139,15 @@ def _report_email_enabled() -> bool:
     )
 
 
-_MATCHER_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
 _SCRAPE_ADVISORY_LOCK_KEY = SCRAPE_ADVISORY_LOCK_KEY
-
-
-def _is_postgres_session(session: Session) -> bool:
-    return str(session.get_bind().url).startswith("postgresql")
-
-
 def _acquire_matcher_lock(session: Session, *, wait: bool) -> bool:
     """Serialize matcher/rematch writes to products.canonical_id on Postgres."""
-    if not _is_postgres_session(session):
-        return True
-    if wait:
-        session.scalar(
-            text("SELECT pg_advisory_lock(hashtext(:key))"),
-            {"key": _MATCHER_ADVISORY_LOCK_KEY},
-        )
-        return True
-    acquired = session.scalar(
-        text("SELECT pg_try_advisory_lock(hashtext(:key))"),
-        {"key": _MATCHER_ADVISORY_LOCK_KEY},
-    )
-    return bool(acquired)
+    return matcher.acquire_match_mutation_lock(session, wait=wait)
 
 
 def _release_matcher_lock(session: Session) -> None:
-    if not _is_postgres_session(session):
-        return
     try:
-        session.scalar(
-            text("SELECT pg_advisory_unlock(hashtext(:key))"),
-            {"key": _MATCHER_ADVISORY_LOCK_KEY},
-        )
+        matcher.release_match_mutation_lock(session)
     except Exception as exc:
         log.warning("matcher_lock_release_failed", error=str(exc))
 
@@ -442,6 +422,7 @@ async def scrape_site(
     *,
     ai_fallback_baseline: int | None = None,
     on_category=None,
+    aloe_country_map: dict[str, dict[str, object]] | None = None,
 ) -> ScrapeResult:
     cls = SCRAPER_CLASSES[site]
     if not slugs:
@@ -450,11 +431,18 @@ async def scrape_site(
             site=site,
             errors=["no_categories_configured"],
         )
+    scraper_kwargs = (
+        {"country_id_map": aloe_country_map or {}} if site == "aloe" else {}
+    )
     try:
-        async with cls() as s:
+        async with cls(**scraper_kwargs) as s:
             result = await s.scrape(
                 slugs, limit_per_category=limit_per_category, on_category=on_category
             )
+            if site == "aloe":
+                result.verified_country_mappings.update(
+                    getattr(s, "verified_country_mappings", {})
+                )
     except SiteScrapeFatalError as exc:
         log.error(
             "site_scrape_start_aborted",
@@ -530,6 +518,7 @@ async def scrape_all(
     *,
     ai_fallback_baselines: dict[str, int | None] | None = None,
     on_category=None,
+    aloe_country_map: dict[str, dict[str, object]] | None = None,
 ) -> list[ScrapeResult]:
     baselines = ai_fallback_baselines or {}
     tasks = [
@@ -539,10 +528,78 @@ async def scrape_all(
             limit_per_category,
             ai_fallback_baseline=baselines.get(site),
             on_category=on_category,
+            aloe_country_map=aloe_country_map,
         )
         for site, slugs in sites_with_slugs.items()
     ]
     return await asyncio.gather(*tasks)
+
+
+def load_aloe_country_map(session: Session, *, tenant_id: int = 1) -> dict[str, dict[str, object]]:
+    rows = session.scalars(
+        select(storage.AloeCountryMapping).where(
+            storage.AloeCountryMapping.tenant_id == tenant_id
+        )
+    ).all()
+    return {
+        row.country_id: {
+            "country_code": row.country_code,
+            "country_raw": row.country_raw,
+            "source_url": row.source_url,
+            "sample_count": row.sample_count,
+            "version": row.version,
+        }
+        for row in rows
+    }
+
+
+def persist_aloe_country_mappings(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int = 1,
+) -> int:
+    """Upsert detail-verified Aloe country dictionary discoveries."""
+    changed = 0
+    for result in results:
+        if result.site != "aloe":
+            continue
+        for country_id, mapping in result.verified_country_mappings.items():
+            country_code = str(mapping.get("country_code") or "").lower()
+            country_raw = str(mapping.get("country_raw") or "").strip()
+            source_url = str(mapping.get("source_url") or "").strip()
+            if not country_code or not country_raw or not source_url:
+                continue
+            row = session.scalar(
+                select(storage.AloeCountryMapping).where(
+                    storage.AloeCountryMapping.tenant_id == tenant_id,
+                    storage.AloeCountryMapping.country_id == str(country_id),
+                )
+            )
+            if row is None:
+                row = storage.AloeCountryMapping(
+                    tenant_id=tenant_id,
+                    country_id=str(country_id),
+                    country_code=country_code,
+                    country_raw=country_raw,
+                    source_url=source_url,
+                    sample_count=int(mapping.get("sample_count") or 1),
+                    version=1,
+                    verified_at=utcnow(),
+                )
+                session.add(row)
+                changed += 1
+            elif row.country_code != country_code or row.country_raw != country_raw:
+                row.country_code = country_code
+                row.country_raw = country_raw
+                row.source_url = source_url
+                row.sample_count = int(mapping.get("sample_count") or 1)
+                row.version += 1
+                row.verified_at = utcnow()
+                changed += 1
+    if changed:
+        session.flush()
+    return changed
 
 
 async def scrape_watchlist_for_site(site: str, urls: list[str]) -> ScrapeResult:
@@ -625,17 +682,21 @@ async def scrape_watchlist_all(urls_by_site: dict[str, list[str]]) -> list[Scrap
     return await asyncio.gather(*tasks)
 
 
-def collect_watchlist_urls(session) -> dict[str, list[str]]:
+def collect_watchlist_urls(
+    session, *, tenant_id: int = 1
+) -> dict[str, list[str]]:
     """Собрать pinned URLs из watchlist, сгруппированные по сайту."""
     out: dict[str, list[str]] = {site: [] for site in SCRAPER_CLASSES}
-    for tp in watchlist.list_tracked(session, active_only=True):
+    for tp in watchlist.list_tracked(
+        session, active_only=True, tenant_id=tenant_id
+    ):
         for link in tp.links:
             if link.url and link.status == "confirmed" and link.site in out:
                 out[link.site].append(link.url)
     return out
 
 
-def auto_match_watchlist(session) -> int:
+def auto_match_watchlist(session, *, tenant_id: int = 1) -> int:
     """Привязать Product'ы к Match-кластеру для каждого TrackedProduct.
 
     Логика: для каждой TrackedProduct → получить или создать Match (canonical_name,
@@ -646,17 +707,24 @@ def auto_match_watchlist(session) -> int:
     """
     from sqlalchemy import select
 
+    from src.product_policy import policy_identity_eligibility, policy_offer_eligibility
+
+    matcher.acquire_match_mutation_xact_lock(session)
     linked = 0
-    for tp in watchlist.list_tracked(session, active_only=True):
+    for tp in watchlist.list_tracked(
+        session, active_only=True, tenant_id=tenant_id
+    ):
         # Найти/создать Match для этого TrackedProduct
         match = session.scalar(
             select(storage.Match).where(
                 storage.Match.canonical_name == tp.canonical_name,
                 storage.Match.is_manual.is_(True),
+                storage.Match.tenant_id == tenant_id,
             )
         )
         if not match:
             match = storage.Match(
+                tenant_id=tenant_id,
                 canonical_name=tp.canonical_name,
                 canonical_brand=tp.brand,
                 canonical_dosage=tp.dosage,
@@ -675,10 +743,42 @@ def auto_match_watchlist(session) -> int:
                 select(storage.Product).where(
                     storage.Product.site == link.site,
                     storage.Product.url == link.url,
+                    storage.Product.tenant_id == tenant_id,
                 )
             )
             if product and product.canonical_id != match.id:
+                # Do not trust ``match.products`` here: this loop mutates
+                # ``canonical_id`` directly and the already-loaded relationship
+                # can stay stale until it is expired.  Query the current cohort
+                # after an autoflush so every subsequent watchlist link is
+                # checked against products linked earlier in this same call.
+                cohort_members = list(
+                    session.scalars(
+                        select(storage.Product).where(
+                            storage.Product.canonical_id == match.id,
+                            storage.Product.tenant_id == tenant_id,
+                            storage.Product.url_dead_at.is_(None),
+                        )
+                    ).all()
+                )
+                cohort = [
+                    member
+                    for member in cohort_members
+                    if member.site != product.site and member.url_dead_at is None
+                ] + [product]
+                identity = policy_identity_eligibility(cohort)
+                offer = policy_offer_eligibility(product)
+                if not identity.eligible or not offer.eligible:
+                    log.warning(
+                        "watchlist_match_policy_rejected",
+                        tracked_product_id=tp.id,
+                        product_id=product.id,
+                        identity_reason=identity.reason,
+                        offer_reason=offer.reason,
+                    )
+                    continue
                 product.canonical_id = match.id
+                session.flush()
                 linked += 1
     session.commit()
     return linked
@@ -749,6 +849,14 @@ def classify_run_quality(
         expected = max(0, int(result.items_expected or 0))
         completed = max(0, int(result.items_completed or 0))
         failed = max(0, int(result.items_failed or 0))
+        if expected == 0 and result.route_statuses:
+            expected = len(result.route_statuses)
+            completed = sum(
+                1
+                for route in result.route_statuses.values()
+                if route.complete and route.pages_skipped == 0 and route.item_failures == 0
+            )
+            failed = expected - completed
         products = len(result.products)
         baseline = baselines.get(site)
         reasons: list[str] = []
@@ -913,6 +1021,86 @@ def run_tenant_id_for_request(session: Session, request_id: int | None) -> int:
             "Server-side scraping is not enabled for non-pilot tenants; request blocked."
         )
     return request.tenant_id
+
+
+_FULL_CATALOG_MIN_BASELINE_FRACTION = 0.90
+
+
+def _verify_full_catalog_results(
+    results: list[ScrapeResult],
+    *,
+    sites: list[str],
+    expected_slugs: dict[str, list[str]],
+    baselines: dict[str, int | None],
+) -> tuple[bool, str]:
+    """Verify an unbounded category scan with fail-closed route evidence."""
+    by_site = {result.site: result for result in results}
+    missing_sites = [site for site in sites if site not in by_site]
+    failed_sites: list[str] = []
+    coverage_failures: list[str] = []
+    zero_categories: dict[str, int] = {}
+    incomplete_routes: dict[str, list[str]] = {}
+    for site in sites:
+        result = by_site.get(site)
+        slugs = [str(slug) for slug in expected_slugs.get(site, []) if slug is not None]
+        if result is None:
+            continue
+        if not slugs or not result.products or bool(result.errors):
+            failed_sites.append(site)
+        baseline = baselines.get(site) or 0
+        if baseline > 0 and len(result.products) < baseline * _FULL_CATALOG_MIN_BASELINE_FRACTION:
+            coverage_failures.append(site)
+        zero_count = sum(
+            1 for slug in slugs if int(result.category_counts.get(slug, 0)) == 0
+        )
+        if zero_count:
+            zero_categories[site] = zero_count
+        incomplete = [
+            slug
+            for slug in slugs
+            if (
+                result.route_statuses.get(slug) is None
+                or not result.route_statuses[slug].complete
+                or result.route_statuses[slug].pages_skipped > 0
+                or result.route_statuses[slug].item_failures > 0
+                or (
+                    result.route_statuses[slug].expected_items is not None
+                    and (
+                        result.route_statuses[slug].raw_items
+                        != result.route_statuses[slug].expected_items
+                        or result.route_statuses[slug].parsed_items
+                        != result.route_statuses[slug].expected_items
+                    )
+                )
+            )
+        ]
+        if incomplete:
+            incomplete_routes[site] = incomplete
+
+    verified = not (
+        missing_sites
+        or failed_sites
+        or coverage_failures
+        or zero_categories
+        or incomplete_routes
+    )
+    if verified:
+        return True, "complete_nonzero_routes_coverage_ok"
+    zero_summary = ",".join(
+        f"{site}:{count}" for site, count in sorted(zero_categories.items())
+    )
+    incomplete_summary = ",".join(
+        f"{site}:{len(routes)}"
+        for site, routes in sorted(incomplete_routes.items())
+    )
+    reason = (
+        f"missing={','.join(missing_sites) or '-'};"
+        f"failed={','.join(failed_sites) or '-'};"
+        f"coverage={','.join(coverage_failures) or '-'};"
+        f"zero_categories={zero_summary or '-'};"
+        f"incomplete_routes={incomplete_summary or '-'}"
+    )
+    return False, reason[:300]
 
 
 def _smoke_test_per_site_coverage(
@@ -1081,6 +1269,7 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
     from src import brand_resolver
     from src.brand_catalog import extract_brand
     from src.normalize import extract_dosage, extract_pack_size, normalize_name
+    from src.product_observations import apply_product_observation
 
     def _compute_brand_verified(sp) -> str | None:
         """Настоящий бренд из АВТОРИТЕТНОГО источника (см. brand_resolver):
@@ -1184,6 +1373,22 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
             if new_products:
                 session.add_all(new_products)
                 session.flush()
+
+            # Identity and website-offer history are independent from diff-only
+            # price snapshots, so every explicit scrape observation is stored.
+            observed_at = utcnow()
+            observations: list[storage.OfferObservation] = []
+            for sp, _, _, _, _ in prepared:
+                product = existing_by_key[(sp.site, sp.external_id)]
+                observations.append(
+                    apply_product_observation(
+                        product,
+                        sp,
+                        run_id=run.id,
+                        observed_at=observed_at,
+                    )
+                )
+            session.add_all(observations)
 
             # === Pre-fetch latest snapshots — для diff-only решения ===
             existing_product_ids = [p.id for p in existing_by_key.values() if p.id is not None]
@@ -2170,7 +2375,12 @@ def ai_crawl_cmd(
     if not _hold_scrape_lock_until_command_exit(Session, wait=False):
         raise click.ClickException("AI crawl blocked because another scrape run is active")
     with Session() as session:
-        run = storage.Run(status="running")
+        run = storage.Run(
+            status="running",
+            catalog_scope="partial",
+            catalog_verified=False,
+            catalog_verification_reason="ai_crawl_not_full_catalog",
+        )
         session.add(run)
         session.commit()
         try:
@@ -2340,6 +2550,17 @@ def run_cmd(
         else:
             effective_mode = "category"
 
+        is_full_catalog = (
+            effective_mode == "category" and category_id is None and limit is None
+        )
+        run.catalog_scope = "full" if is_full_catalog else "partial"
+        run.full_catalog_sites = ",".join(sites) if is_full_catalog else None
+        run.catalog_verified = False
+        run.catalog_verification_reason = (
+            "pending" if is_full_catalog else "bounded_or_watchlist_run"
+        )
+        session.commit()
+
         log.info(
             "run_started",
             run_id=run_id,
@@ -2351,6 +2572,7 @@ def run_cmd(
             category_id=category_id,
         )
 
+        trust_context = None
         try:
             quality_sites: list[str] = list(sites)
             quality_baselines: dict[str, int | None] = {}
@@ -2398,8 +2620,10 @@ def run_cmd(
                         limit,
                         ai_fallback_baselines=baselines,
                         on_category=_persist_category,
+                        aloe_country_map=load_aloe_country_map(session),
                     )
                 )
+                persist_aloe_country_mappings(session, results)
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
@@ -2412,17 +2636,32 @@ def run_cmd(
                 baselines=quality_baselines,
                 enforce_baseline=enforce_quality_baseline,
             )
-            run.status = quality_status
+            if is_full_catalog:
+                run.catalog_verified, run.catalog_verification_reason = (
+                    _verify_full_catalog_results(
+                        results,
+                        sites=sites,
+                        expected_slugs=slugs_by_site,
+                        baselines=baselines,
+                    )
+                )
+                financial_ok = quality_status == "ok" and run.catalog_verified
+                quality["full_catalog_verified"] = financial_ok
+                quality["financially_eligible"] = financial_ok
+                quality["catalog_verification_reason"] = run.catalog_verification_reason
             run.run_quality = quality
             run.error_message = run_quality_message(quality_status, quality)
+            if is_full_catalog and quality_status == "ok" and run.catalog_verified:
+                run.status = "running"
+            else:
+                run.status = quality_status
             session.commit()
 
-            # === Early-complete для UI-triggered scrape (job queue) ===
-            # Если запущены через `pharmacy-monitor run --request-id N`, помечаем
-            # ScrapeRequest получает честный ok/degraded/failed СРАЗУ после
-            # persist. UI не ждёт matcher, но и не называет частичный scrape
-            # успешным.
-            if request_id is not None:
+            # === Early-complete для UI-triggered bounded scrape (job queue) ===
+            # Full-catalog runs stay running until matcher/alerts/analyzer/ROI
+            # finish, because publishing ok earlier would expose untrusted money
+            # output. Bounded/watchlist runs can surface scrape quality now.
+            if request_id is not None and not is_full_catalog:
                 req = mark_scrape_request_terminal(session, request_id, run)
                 if req is not None:
                     log.info(
@@ -2432,6 +2671,16 @@ def run_cmd(
                         status=quality_status,
                         products_scraped=count,
                     )
+
+            # A requested full scan that lost a page or even one source item is
+            # not a successful producer.  Stop before matcher, alerts, reports,
+            # or ROI publication; the exception handler records ``degraded``
+            # (distinct from a crash) and fails the queue request explicitly.
+            if is_full_catalog and not run.catalog_verified:
+                raise FullCatalogVerificationError(
+                    "full catalog verification failed: "
+                    f"{run.catalog_verification_reason or 'unknown reason'}"
+                )
 
             if quality_status == "failed":
                 run.finished_at = utcnow()
@@ -2476,7 +2725,10 @@ def run_cmd(
                     if split_actions:
                         log.info("revalidate_split", clusters=len(split_actions))
                 except Exception as _re:
-                    log.warning("revalidate_split_failed", error=str(_re))
+                    log.error("revalidate_split_failed", error=str(_re))
+                    raise RuntimeError(
+                        f"identity revalidation failed: {type(_re).__name__}: {_re}"
+                    ) from _re
                 try:
                     flagged = matcher.flag_suspected_mismatches(session)
                     if flagged:
@@ -2486,6 +2738,15 @@ def run_cmd(
             finally:
                 if lock_taken:
                     _release_matcher_lock(session)
+
+            # Internal consumers must calculate against this exact verified
+            # full Run before it is published as ``ok``.  External API calls
+            # do not inherit this context and therefore remain fail-closed.
+            if is_full_catalog and run.catalog_verified:
+                from src.product_policy import finalizing_trusted_run
+
+                trust_context = finalizing_trusted_run(run.id)
+                trust_context.__enter__()
 
             # === Real-time alerts ===
             if not no_alerts and is_run_financially_eligible(run):
@@ -2558,35 +2819,24 @@ def run_cmd(
                     status=run.status,
                 )
 
-            run.finished_at = utcnow()
-            session.commit()
-            log.info(
-                "run_finished",
-                run_id=run_id,
-                status=run.status,
-                products=count,
-            )
-
             # P0.1 (PO Audit 2026-05-17): pre-compute ROI actions для всех 3
             # сайтов и сохранить в roi_actions_cache. HTTP-handler
             # /dash/roi/actions читает оттуда → <50мс latency вместо
             # 15-30с inline compute (timeout'ило с 408 на 4 экранах).
-            # Fail-soft — ошибка не валит run, max 5-10с overhead на пересчёт.
-            if is_run_financially_eligible(run):
-                try:
-                    from src import roi as _roi
+            # A verified full Run is not published until every cache slice is
+            # refreshed for its exact trusted epoch.  Partial/watchlist runs
+            # never publish a new catalog epoch and therefore do not rewrite
+            # this cache.
+            if is_full_catalog and run.catalog_verified:
+                from src import roi as _roi
 
-                    summary = _roi.refresh_all_cached_actions(
-                        session,
-                        run_id=run_id,
-                        tenant_id=run.tenant_id,
-                    )
-                    log.info("roi_cache_refreshed", run_id=run_id, **summary)
-                except Exception as cache_err:
-                    log.warning(
-                        "roi_cache_refresh_failed",
-                        run_id=run_id,
-                        error=str(cache_err),
+                summary = _roi.refresh_all_cached_actions(session, run_id=run_id)
+                log.info("roi_cache_refreshed", run_id=run_id, **summary)
+                failed_sites = [site for site, value in summary.items() if value < 0]
+                if failed_sites:
+                    raise RuntimeError(
+                        "ROI refresh failed for trusted epoch: "
+                        + ",".join(sorted(failed_sites))
                     )
             else:
                 log.warning(
@@ -2594,12 +2844,42 @@ def run_cmd(
                     run_id=run_id,
                     status=run.status,
                 )
-        except RunQualityFailure as e:
-            raise click.ClickException(str(e))
+
+            if trust_context is not None:
+                trust_context.__exit__(None, None, None)
+                trust_context = None
+
+            if is_full_catalog and run.catalog_verified:
+                run.status = "ok"
+            run.finished_at = utcnow()
+            if request_id is not None:
+                req = session.get(storage.ScrapeRequest, request_id)
+                if req is not None:
+                    req.run_id = run.id
+                    req.status = run.status
+                    req.completed_at = utcnow()
+            session.commit()
+            log.info(
+                "run_finished",
+                run_id=run_id,
+                status=run.status,
+                products=count,
+            )
         except Exception as e:
-            run.status = "failed"
+            if trust_context is not None:
+                trust_context.__exit__(*sys.exc_info())
+                trust_context = None
+            run.status = (
+                "degraded" if isinstance(e, FullCatalogVerificationError) else "failed"
+            )
             run.error_message = f"{type(e).__name__}: {e}"
             run.finished_at = utcnow()
+            if request_id is not None:
+                req = session.get(storage.ScrapeRequest, request_id)
+                if req is not None:
+                    req.run_id = run.id
+                    req.status = run.status
+                    req.completed_at = utcnow()
             session.commit()
             log.exception("run_failed", run_id=run_id)
             raise click.ClickException(str(e))
@@ -2625,7 +2905,16 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
         return
     with Session() as session:
         maybe_seed_categories(session)
-        run = storage.Run(status="running")
+        # Diagnostic producer only.  It intentionally cannot publish a trust
+        # epoch because it does not run match revalidation, alerts or ROI
+        # finalization.  ``run`` is the sole full-catalog publisher.
+        run = storage.Run(
+            status="running",
+            catalog_scope="partial",
+            full_catalog_sites=None,
+            catalog_verified=False,
+            catalog_verification_reason="scrape_command_diagnostic_non_publishing",
+        )
         session.add(run)
         session.commit()
         try:
@@ -2644,7 +2933,15 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
                 sites,
                 tenant_id=run.tenant_id,
             )
-            results = asyncio.run(scrape_all(slugs_by_site, limit, ai_fallback_baselines=baselines))
+            results = asyncio.run(
+                scrape_all(
+                    slugs_by_site,
+                    limit,
+                    ai_fallback_baselines=baselines,
+                    aloe_country_map=load_aloe_country_map(session),
+                )
+            )
+            persist_aloe_country_mappings(session, results)
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
@@ -2656,6 +2953,11 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
                 mode="category",
                 baselines=quality_baselines,
                 enforce_baseline=limit is None and category_id is None,
+            )
+            quality["full_catalog_verified"] = False
+            quality["financially_eligible"] = False
+            quality["catalog_verification_reason"] = (
+                "scrape_command_diagnostic_non_publishing"
             )
             run.status = quality_status
             run.run_quality = quality
@@ -2820,7 +3122,9 @@ def rematch_cmd(
                 actions = matcher.revalidate_split(session, dry_run=dry_run)
                 for a in actions:
                     if a["action"] == "dissolve":
-                        click.echo(f"  cl{a['match_id']}: DISSOLVE {a['members']}")
+                        click.echo(
+                            f"  cl{a['match_id']}: DISSOLVE {a['unmatched']}"
+                        )
                     else:
                         click.echo(f"  cl{a['match_id']}: KEEP {a['keep']}, EJECT {a['eject']}")
                 if dry_run:

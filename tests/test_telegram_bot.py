@@ -15,6 +15,9 @@ def _add_run(s, started_at=None, products_scraped=10):
         finished_at=started_at,
         status="ok",
         products_scraped=products_scraped,
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": True,
@@ -110,6 +113,9 @@ def test_cmd_today_hides_old_cache_after_degraded_full_attempt(db_session):
             started_at=degraded_at,
             finished_at=degraded_at,
             status="degraded",
+            catalog_scope="full",
+            full_catalog_sites="pharmonline,aptekonline,aloe",
+            catalog_verified=False,
             run_quality={
                 "baseline_enforced": True,
                 "full_catalog_verified": False,

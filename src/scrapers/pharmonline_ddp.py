@@ -42,7 +42,8 @@ Response shape:
 Product fields used:
   _id, GUID, parentCode, postQuery (URL slug), name, i18n.{az,ru,en}.name,
   barcode (string, may be ""), images (array of image ids), totalMinPrice,
-  totalMaxPrice, category (slug), manufacturer (slug), totalCount (stock).
+  totalMaxPrice, category (slug), manufacturerCountry (dictionary id),
+  totalCount (stock).  The country dictionary is loaded through `allCountry`.
 
 For full category coverage call getCategoryCount first or iterate page_offset
 until response['products'] shorter than productLimit.
@@ -444,10 +445,38 @@ class _DDPClient:
                     return ddp.get("result", {})
 
 
+_MANUFACTURER_COUNTRY_CUSTOM_FIELD_ID = "arPsvL8wgPiZhJ4jm3"
+
+
+def _manufacturer_country_custom_field(raw: dict, locale: str) -> str | None:
+    """Return PharmOnline's legacy manufacturer-country text, when present.
+
+    Newer products use ``manufacturerCountry`` (an ``allCountry`` dictionary
+    id). A sizeable older cohort stores the same value only in this stable
+    custom-field id. The dictionary value remains authoritative; this helper
+    is strictly a fallback for ``none``/missing/unmapped dictionary values.
+    """
+    custom_fields = raw.get("customFields") or {}
+    inputs = custom_fields.get("input") if isinstance(custom_fields, dict) else None
+    for field in inputs if isinstance(inputs, list) else []:
+        if not isinstance(field, dict):
+            continue
+        if str(field.get("_id") or "") != _MANUFACTURER_COUNTRY_CUSTOM_FIELD_ID:
+            continue
+        localized = (field.get("i18n") or {}).get(locale) or {}
+        value = localized.get("value") or field.get("value")
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+    return None
+
+
 def _build_product(
     raw: dict,
     locale: str,
     category_id_to_slug: dict[str, str] | None = None,
+    country_id_to_code: dict[str, str] | None = None,
 ) -> ScrapedProduct | None:
     """Map pharmonline DDP product → our ScrapedProduct.
 
@@ -514,18 +543,40 @@ def _build_product(
     elif category is not None:
         category = str(category)
 
-    manufacturer = raw.get("manufacturer")
-    if isinstance(manufacturer, list):
-        manufacturer = manufacturer[0] if manufacturer else None
-    if manufacturer is not None:
-        manufacturer = str(manufacturer)
+    country_id = raw.get("manufacturerCountry")
+    country_source = None
+    if isinstance(country_id, list):
+        country_id = country_id[0] if country_id else None
+    country_raw = None
+    if country_id not in (None, "", "none"):
+        country_key = str(country_id)
+        country_raw = (
+            country_id_to_code.get(country_key)
+            if country_id_to_code is not None
+            else country_key
+        )
+        if country_raw is not None:
+            country_source = "pharmonline_ddp_all_country"
+    if country_raw is None:
+        country_raw = _manufacturer_country_custom_field(raw, locale)
+        if country_raw is not None:
+            country_source = "pharmonline_ddp_custom_field"
+
+    from src.product_policy import offer_from_quantity
+
+    availability_status, offer_quantity = offer_from_quantity(raw.get("totalCount"))
 
     return ScrapedProduct(
         site="pharmonline",
         external_id=str(raw["_id"]),
         url=f"https://pharmonline.az/product/{slug}",
         name=str(name)[:500],
-        manufacturer=manufacturer,
+        manufacturer=None,
+        manufacturer_country_raw=country_raw,
+        country_source=country_source,
+        offer_availability_status=availability_status,
+        offer_quantity=offer_quantity,
+        availability_source="pharmonline_ddp_total_count",
         category=category,
         image_url=image_url,
         description=(i18n.get(locale, {}) or {}).get("description") or None,
@@ -552,6 +603,7 @@ class PharmonlineDDPScraper(BaseScraper):
         # Don't init Playwright — DDP doesn't need it. Light alternative entry.
         self._ddp: _DDPClient | None = None
         self._cat_map: dict[str, str] = {}
+        self._country_map: dict[str, str] = {}
         self._locale = os.getenv("PHARMONLINE_DDP_LOCALE", "az").lower()
         self._page_size = int(os.getenv("PHARMONLINE_DDP_PAGE_SIZE", "100"))
         # Decodo (AZ residential, ротация порта на reconnect) первым; IPRoyal —
@@ -612,6 +664,22 @@ class PharmonlineDDPScraper(BaseScraper):
                 error=site_fatal_error_message(exc),
                 note="продукты получат raw Mongo _id в поле category",
             )
+        try:
+            countries = await self._ddp.call("allCountry", [], timeout=30.0)
+            for country in countries if isinstance(countries, list) else []:
+                country_id = country.get("_id")
+                geocode = str(country.get("geocode") or "").strip().lower()
+                if country_id and len(geocode) == 2:
+                    self._country_map[str(country_id)] = geocode
+            log.info(
+                "pharmonline_ddp_country_map_loaded",
+                count=len(self._country_map),
+            )
+        except Exception as exc:
+            log.warning(
+                "pharmonline_ddp_country_map_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
@@ -648,6 +716,10 @@ class PharmonlineDDPScraper(BaseScraper):
         )
         seen_external_ids: set[str] = set()
         zero_new_streak = 0  # подряд страниц с 0 новыми → break
+        raw_items = 0
+        parsed_items = 0
+        item_failures = 0
+        expected_items: int | None = None
 
         while yielded < max_yield:
             params = [
@@ -671,18 +743,89 @@ class PharmonlineDDPScraper(BaseScraper):
                     offset=offset,
                     error=site_fatal_error_message(e),
                 )
+                self._set_route_status(
+                    category_slug,
+                    complete=False,
+                    abort_reason=f"ddp_call_failed:{type(e).__name__}",
+                    visited_pages=offset,
+                    raw_items=raw_items,
+                    parsed_items=parsed_items,
+                    item_failures=item_failures,
+                    expected_items=expected_items,
+                )
                 break
 
             products = result.get("products") or []
+            raw_total = result.get("total")
+            if raw_total not in (None, ""):
+                try:
+                    page_expected = int(raw_total)
+                except (TypeError, ValueError):
+                    self._set_route_status(
+                        category_slug,
+                        complete=False,
+                        abort_reason="invalid_total",
+                        visited_pages=offset + 1,
+                        raw_items=raw_items,
+                        parsed_items=parsed_items,
+                        item_failures=item_failures,
+                    )
+                    break
+                if expected_items is None:
+                    expected_items = page_expected
+                elif expected_items != page_expected:
+                    self._set_route_status(
+                        category_slug,
+                        complete=False,
+                        abort_reason="total_changed_during_pagination",
+                        visited_pages=offset + 1,
+                        raw_items=raw_items,
+                        parsed_items=parsed_items,
+                        item_failures=item_failures,
+                        expected_items=expected_items,
+                    )
+                    break
             if not products:
+                self._set_route_status(
+                    category_slug,
+                    complete=(
+                        item_failures == 0
+                        and (
+                            expected_items is None
+                            or len(seen_external_ids) == expected_items
+                        )
+                    ),
+                    abort_reason=(
+                        None
+                        if item_failures == 0
+                        and (
+                            expected_items is None
+                            or len(seen_external_ids) == expected_items
+                        )
+                        else "item_count_mismatch"
+                    ),
+                    visited_pages=offset + 1,
+                    raw_items=raw_items,
+                    parsed_items=parsed_items,
+                    item_failures=item_failures,
+                    expected_items=expected_items,
+                )
                 break
+            raw_items += len(products)
 
             page_new = 0
             page_dup = 0
             for raw in products:
-                sp = _build_product(raw, self._locale, self._cat_map)
+                sp = _build_product(
+                    raw,
+                    self._locale,
+                    self._cat_map,
+                    getattr(self, "_country_map", {}),
+                )
                 if sp is None:
+                    item_failures += 1
                     continue
+                parsed_items += 1
                 if sp.external_id in seen_external_ids:
                     page_dup += 1
                     continue
@@ -691,6 +834,20 @@ class PharmonlineDDPScraper(BaseScraper):
                 yielded += 1
                 yield sp
                 if yielded >= max_yield:
+                    self._set_route_status(
+                        category_slug,
+                        complete=False,
+                        abort_reason=(
+                            "requested_limit_reached"
+                            if limit is not None
+                            else "safety_yield_limit_reached"
+                        ),
+                        visited_pages=offset + 1,
+                        raw_items=raw_items,
+                        parsed_items=parsed_items,
+                        item_failures=item_failures,
+                        expected_items=expected_items,
+                    )
                     return
 
             # Если на странице 0 новых — копим streak
@@ -703,6 +860,16 @@ class PharmonlineDDPScraper(BaseScraper):
                         pages=offset + 1,
                         yielded=yielded,
                         reason="3 pages in a row with 0 new products",
+                    )
+                    self._set_route_status(
+                        category_slug,
+                        complete=False,
+                        abort_reason="duplicate_loop_without_terminal",
+                        visited_pages=offset + 1,
+                        raw_items=raw_items,
+                        parsed_items=parsed_items,
+                        item_failures=item_failures,
+                        expected_items=expected_items,
                     )
                     break
             else:
@@ -721,6 +888,30 @@ class PharmonlineDDPScraper(BaseScraper):
 
             # If we got fewer than page_size, we've hit the end
             if len(products) < self._page_size:
+                self._set_route_status(
+                    category_slug,
+                    complete=(
+                        item_failures == 0
+                        and (
+                            expected_items is None
+                            or len(seen_external_ids) == expected_items
+                        )
+                    ),
+                    abort_reason=(
+                        None
+                        if item_failures == 0
+                        and (
+                            expected_items is None
+                            or len(seen_external_ids) == expected_items
+                        )
+                        else "item_count_mismatch"
+                    ),
+                    visited_pages=offset + 1,
+                    raw_items=raw_items,
+                    parsed_items=parsed_items,
+                    item_failures=item_failures,
+                    expected_items=expected_items,
+                )
                 break
             offset += 1  # offset is page-index in current DDP semantics
 

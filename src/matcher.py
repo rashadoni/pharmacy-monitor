@@ -32,47 +32,60 @@ from src.normalize import (
     extract_pack_size,
     extract_total_volume,
     normalize_name,
+    pack_unit_count,
     strip_accents,
 )
-from src.storage import Match, PriceSnapshot, Product, latest_snapshots_per_product
+from src.storage import (
+    Match,
+    MatchPolicyAudit,
+    MatchRejection,
+    PriceSnapshot,
+    Product,
+    latest_snapshots_per_product,
+)
 
 log = structlog.get_logger()
+
+MATCH_MUTATION_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
+
+
+def _is_postgres(session: Session) -> bool:
+    return session.get_bind().dialect.name == "postgresql"
+
+
+def acquire_match_mutation_xact_lock(session: Session) -> None:
+    """Serialize one transaction with every canonical topology mutation."""
+    if _is_postgres(session):
+        session.scalar(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
+        )
+
+
+def acquire_match_mutation_lock(session: Session, *, wait: bool = True) -> bool:
+    """Session-level lock for multi-transaction operations and rollback."""
+    if not _is_postgres(session):
+        return True
+    fn = "pg_advisory_lock" if wait else "pg_try_advisory_lock"
+    value = session.scalar(
+        text(f"SELECT {fn}(hashtext(:key))"),
+        {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
+    )
+    return True if wait else bool(value)
+
+
+def release_match_mutation_lock(session: Session) -> None:
+    if _is_postgres(session):
+        session.scalar(
+            text("SELECT pg_advisory_unlock(hashtext(:key))"),
+            {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
+        )
 
 FUZZY_THRESHOLD = 75  # 0..100, минимальный score для авто-матча.
 # Снижено с 78 → 75 (2026-05-26): bucket (brand, dosage, pack) уже строго
 # фильтрует — дополнительные 3 пункта дают ~2-4% recall на коротких именах
 # (5-6 токенов), где реальные матчи дают 75-77. False positives
 # фильтруются через match_actions UI.
-
-_MATCH_MUTATION_LOCK_KEY = "pharmacy-monitor:match-mutation"
-
-
-def acquire_match_mutation_lock(session: Session, *, wait: bool) -> bool:
-    """Serialize matcher/rematch writes to products.canonical_id on Postgres.
-
-    SQLite/local tests do not need this lock. On Postgres this is a session-level
-    advisory lock because match_products/revalidate_split may commit internally;
-    callers release it in a finally block.
-    """
-    bind = session.get_bind()
-    if not str(bind.url).startswith("postgresql"):
-        return True
-    fn = "pg_advisory_lock" if wait else "pg_try_advisory_lock"
-    acquired = session.scalar(
-        text(f"SELECT {fn}(hashtext(:key))"),
-        {"key": _MATCH_MUTATION_LOCK_KEY},
-    )
-    return True if wait else bool(acquired)
-
-
-def release_match_mutation_lock(session: Session) -> None:
-    bind = session.get_bind()
-    if not str(bind.url).startswith("postgresql"):
-        return
-    session.execute(
-        text("SELECT pg_advisory_unlock(hashtext(:key))"),
-        {"key": _MATCH_MUTATION_LOCK_KEY},
-    )
 
 # Фармацевтические модификаторы — однобуквенные/короткие токены, означающие
 # ДРУГОЙ состав препарата. Если у одного товара есть такой токен, а у другого
@@ -706,12 +719,9 @@ _COUNTRY_CANON: dict[str, str] = {
 
 def _country_token(raw: str | None) -> str | None:
     """Канон ISO-код страны из строки (apte manufacturer-поле = «olke»)."""
-    if not raw:
-        return None
-    tok = strip_accents(raw).lower().strip()
-    if tok in ("none", "null", ""):
-        return None
-    return _COUNTRY_CANON.get(tok)
+    from src.product_policy import normalize_country_code
+
+    return normalize_country_code(raw)
 
 
 def _country_from_url(url: str | None) -> str | None:
@@ -732,90 +742,30 @@ def _country_from_url(url: str | None) -> str | None:
 
 
 def _country_of(p) -> str | None:
-    """Страна производителя товара: поле manufacturer (apte) или хвост URL (phar)."""
-    return _country_token(getattr(p, "manufacturer", None)) or _country_from_url(
+    """Country with legacy fallbacks, for diagnostics and commodity rollout."""
+    from src.product_policy import country_code_of
+
+    return country_code_of(p) or _country_token(getattr(p, "manufacturer", None)) or _country_from_url(
         getattr(p, "url", None)
     )
 
 
 def _has_conflicting_country(a, b) -> bool:
-    """True если у ОБОИХ товаров определена страна и они РАЗНЫЕ.
+    """True only for two conflicting *verified SKU country* observations.
 
-    Разная страна происхождения = разный производитель/импорт = разный товар
-    (Talya Türkiyə глицерин ≠ Azerfarm Azərbaycan глицерин). Если у одного страна
-    неизвестна — не блокируем (консервативно, неполные данные)."""
-    ca, cb = _country_of(a), _country_of(b)
+    URL tails and overloaded legacy ``manufacturer`` values are not sufficient
+    to split ordinary medicines.  They remain available to the older,
+    commodity-gated rule below until the production backfill is complete.
+    """
+    from src.product_policy import country_code_of
+
+    ca, cb = country_code_of(a), country_code_of(b)
     return bool(ca) and bool(cb) and ca != cb
 
 
-_COUNTRY_IDENTITY_NAME_TOKENS: frozenset[str] = frozenset(
-    {
-        # generic pharmaceutical commodities
-        "qliserin",
-        "gliserin",
-        "glycerin",
-        "qlukoza",
-        "glukoza",
-        "natrium",
-        "xlorid",
-        "sodium",
-        "chloride",
-        "ringer",
-        "ammonyak",
-        "ammiak",
-        "inyeksiya",
-        "injection",
-        # medical supplies / consumer goods where manufacturing origin is identity
-        "maska",
-        "mask",
-        "spris",
-        "syringe",
-        "spiral",
-        "kepenek",
-        "kateter",
-        "catheter",
-        "bez",
-        "pampers",
-        "huggies",
-        "salfet",
-        "bandi",
-        "bandaj",
-        "plastir",
-        "leukoplast",
-    }
-)
-
-
-def _is_country_identity_name(name: str | None) -> bool:
-    """Products where origin country is part of commercial identity.
-
-    This intentionally remains narrower than "all products": botanicals/oils/tea
-    use the existing commodity gate, and generic pharma commodities or medical
-    supplies use the marker list above. Trade-name medicines like X-Brain or
-    Konkor stay outside this gate.
-    """
-    if is_commodity_name(name):
-        return True
-    if not name:
-        return False
-    tokens = set(strip_accents(name).lower().replace("-", " ").split())
-    return bool(tokens & _COUNTRY_IDENTITY_NAME_TOKENS)
-
-
-def _has_conflicting_identity_country(a, b) -> bool:
-    """Country is a hard identity signal only for country-sensitive products.
-
-    Client rule (2026-05-31): commodity identity includes country. Do not apply
-    this globally to trade-name medicines: the same drug can be sold from
-    different manufacturing plants/import origins, and those cases belong to
-    diagnostics/manual review unless another hard guard fires.
-    """
-    if not (
-        _is_country_identity_name(getattr(a, "name", None))
-        and _is_country_identity_name(getattr(b, "name", None))
-    ):
-        return False
-    return _has_conflicting_country(a, b)
+def _has_conflicting_legacy_country(a, b) -> bool:
+    ca, cb = _country_of(a), _country_of(b)
+    return bool(ca) and bool(cb) and ca != cb
 
 
 # Grade-слова: косметическое масло ≠ пищевое/обычное (разный товар, разная цена).
@@ -837,7 +787,11 @@ def _has_conflicting_origin_or_grade(a, b) -> bool:
     an, bn = getattr(a, "name", None), getattr(b, "name", None)
     if not (is_commodity_name(an) and is_commodity_name(bn)):
         return False
-    return _has_conflicting_identity_country(a, b) or _grade_tokens(an) != _grade_tokens(bn)
+    return (
+        _has_conflicting_country(a, b)
+        or _has_conflicting_legacy_country(a, b)
+        or _grade_tokens(an) != _grade_tokens(bn)
+    )
 
 
 # ── Габариты AxB (2026-05-29) ────────────────────────────────────────────────
@@ -1043,8 +997,38 @@ def _has_conflicting_pack_volume(a, b) -> bool:
     return pa[0] != pb[0]
 
 
+def _has_conflicting_pack_count(a, b) -> bool:
+    """Different explicit unit counts are different physical packs.
+
+    Both sides must carry a high-confidence count marker (N/№/ədəd/etc.).
+    Unknown counts stay recall-friendly, while volume and dose numbers are
+    excluded by ``pack_unit_count``.
+    """
+    count_a, confidence_a = pack_unit_count(
+        getattr(a, "pack_size", None), getattr(a, "name", None)
+    )
+    count_b, confidence_b = pack_unit_count(
+        getattr(b, "pack_size", None), getattr(b, "name", None)
+    )
+    return (
+        confidence_a == "high"
+        and confidence_b == "high"
+        and count_a != count_b
+    )
+
+
 # Сила дозы препарата: число + mg/mq/mkg/mcg (НЕ ml/g — то объём/вес упаковки).
 _DOSE_MG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(mg|mq|mkg|mcg|µg)(?![a-z])", re.IGNORECASE)
+
+# Some sites omit the dose from the visible title but retain it in a clean URL
+# slug (for example aptekonline ``/product/risek-40mg-n10``).  This parser is
+# deliberately stricter than the title parser: a dose must occupy a complete
+# path/slug segment, and a digit-hyphen prefix is rejected so decimal slugs such
+# as ``7-5mg`` are not misread as 5 mg.
+_URL_DOSE_MG_RE = re.compile(
+    r"(?<!\d)(?:^|[-_/])(\d+(?:[.,]\d+)?)(mg|mq|mkg|mcg|µg)(?=$|[-_/])",
+    re.IGNORECASE,
+)
 
 
 _SPACED_THOUSANDS_RE = re.compile(r"\b(\d{1,3})(?:\s(\d{3}))+\b")
@@ -1063,6 +1047,25 @@ def _doses_mg(text: str) -> frozenset[float]:
     return frozenset(out)
 
 
+def _doses_mg_from_url(url: str | None) -> frozenset[float]:
+    text = strip_accents(url or "").lower()
+    out = set()
+    for match in _URL_DOSE_MG_RE.finditer(text):
+        value = float(match.group(1).replace(",", "."))
+        if match.group(2) in ("mkg", "mcg", "µg"):
+            value /= 1000.0
+        out.add(round(value, 4))
+    return frozenset(out)
+
+
+def _doses_mg_for_product(product) -> frozenset[float]:
+    """Return title dose, falling back to a conservative URL slug parser."""
+    from_name = _doses_mg(getattr(product, "name", "") or "")
+    if from_name:
+        return from_name
+    return _doses_mg_from_url(getattr(product, "url", None))
+
+
 def _has_conflicting_dose(a, b) -> bool:
     """Разная сила дозы (mg) в ИМЕНАХ → разные товары.
 
@@ -1070,12 +1073,11 @@ def _has_conflicting_dose(a, b) -> bool:
     компонентных (5/1.25/10 vs 5/1.25/5). Требуется единица (не голое число, не
     объём ml/g) → нет ложных на pack-count. Одна сторона без дозы → не блок.
 
-    NB: читаем ТОЛЬКО имена, НЕ url: в slug десятичные/диапазоны ломаются дефисом
-    («7.5mg»→«7-5mg»→ложн.«5mg»; «5mg125mg10mg»→125 вместо 1.25) → массовые ложные
-    разрывы (dry-run 2026-05-31). Кейс aptek-без-mg-в-имени (Risek «N10 (toz)») —
-    редкий, чинится точечно, не этим guard'ом."""
-    da = _doses_mg(getattr(a, "name", "") or "")
-    db = _doses_mg(getattr(b, "name", "") or "")
+    URL читаем только fallback-ом и только по безопасным slug-сегментам: это
+    закрывает aptekonline title-poor кейсы вроде Risek «N10 (toz)» при URL
+    `risek-40mg-n10`, не возвращая старые false-positive на `7-5mg`."""
+    da = _doses_mg_for_product(a)
+    db = _doses_mg_for_product(b)
     return bool(da) and bool(db) and da != db
 
 
@@ -1109,7 +1111,7 @@ def ultra_equal(a, b) -> bool:
         and _size_letters(ra) == _size_letters(rb)
         and _ingredient_codes(ra) == _ingredient_codes(rb)
         and extract_pack_size(ra) == extract_pack_size(rb)
-        and _doses_mg(ra) == _doses_mg(rb)
+        and _doses_mg_for_product(a) == _doses_mg_for_product(b)
         and extract_form(ra) == extract_form(rb)
         and _variant_words(ra) == _variant_words(rb)
         # Не помечаем cross-brand коммодити «точным совпадением»: для масел/чаёв/
@@ -1134,10 +1136,11 @@ def _hard_conflict(a, b) -> bool:
     ar, br = a.name or "", b.name or ""
     return (
         _has_conflicting_brand(a, b)
-        or _has_conflicting_identity_country(a, b)
+        or _has_conflicting_country(a, b)
         or _has_conflicting_origin_or_grade(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
+        or _has_conflicting_pack_count(a, b)
         or _has_conflicting_pack_volume(a, b)
         or _has_conflicting_dose(a, b)
         or _has_conflicting_form(ar, br)
@@ -1156,12 +1159,9 @@ def _pairwise_spec_conflict(a, b) -> bool:
     тип/медь, одиночный вариант-атом, многозначная сила, габариты, %. Все требуют
     конфликтующего сигнала с ОБЕИХ сторон → near-zero false-positive на одном товаре.
 
-    НАМЕРЕННО уже, чем проходы: НЕ включаем global country/form/modifier/vtokens/
-    series — они имеют false-positive на verbose-vs-terse / параллельный-импорт
-    паре ОДНОГО trade-name товара (Novalans с/без «(Kapsulalar)», бренд с разной
-    страной, məhlul/şərbət), и авто-dissolve таких кластеров СЛОМАЛ БЫ верные
-    матчи. Country включается только через _has_conflicting_identity_country:
-    botanicals/generic commodities/medical supplies, где страна — часть identity.
+    Country is now included only from the dedicated verified SKU field.  The
+    former URL/manufacturer heuristic is still too noisy for irreversible
+    trade-name splits and is used only by the commodity rule.
 
     + brand-conflict (2026-05-31): brand_verified из АВТОРИТЕТНОГО источника
     (slug/page-JSON/aloe), оба потребительские и различаются — надёжный сигнал
@@ -1169,10 +1169,11 @@ def _pairwise_spec_conflict(a, b) -> bool:
     ar, br = a.name or "", b.name or ""
     return (
         _has_conflicting_brand(a, b)
-        or _has_conflicting_identity_country(a, b)
+        or _has_conflicting_country(a, b)
         or _has_conflicting_origin_or_grade(a, b)
         or _has_conflicting_ingredient_codes(a, b)
         or _has_conflicting_variant_words(a, b)
+        or _has_conflicting_pack_count(a, b)
         or _has_conflicting_pack_volume(a, b)
         or _has_conflicting_dose(a, b)
         or _has_conflicting_variant_marker(ar, br)
@@ -1183,7 +1184,12 @@ def _pairwise_spec_conflict(a, b) -> bool:
     )
 
 
-def find_conflicting_clusters(session: Session) -> list:
+def find_conflicting_clusters(
+    session: Session,
+    *,
+    tenant_id: int = 1,
+    match_ids: set[int] | None = None,
+) -> list:
     """Авто-Match'и, где хоть одна cross-site пара членов конфликтует по ТЕКУЩИМ
     guard'ам. Возвращает [(match, product_a, product_b)] — первая конфликтная пара
     на кластер. Корень «whack-a-mole»: инкрементальный матчинг переиспользует
@@ -1196,26 +1202,47 @@ def find_conflicting_clusters(session: Session) -> list:
 
     from sqlalchemy.orm import selectinload
 
+    if match_ids is not None and not match_ids:
+        return []
+    statement = select(Match).where(Match.tenant_id == tenant_id)
+    if match_ids is not None:
+        statement = statement.where(Match.id.in_(match_ids))
     matches = session.scalars(
-        select(Match).where(Match.is_manual.is_(False)).options(selectinload(Match.products))
+        statement.options(selectinload(Match.products))
     ).all()
     flagged = []
     for m in matches:
         prods = list(m.products)
+        # Availability is temporal, so OOS does not create a permanent
+        # rejection.  It does, however, remove the website offer from the
+        # active cross-site match until a later in-stock scrape can rematch it.
+        oos = next(
+            (
+                p
+                for p in prods
+                if getattr(p, "offer_availability_status", None) == "out_of_stock"
+            ),
+            None,
+        )
+        if oos is not None:
+            flagged.append((m, oos, oos))
+            continue
         for a, b in itertools.combinations(prods, 2):
-            if a.site != b.site and _pairwise_spec_conflict(a, b):
+            conflict = _has_conflicting_country(a, b) if m.is_manual else _pairwise_spec_conflict(a, b)
+            if a.site != b.site and conflict:
                 flagged.append((m, a, b))
                 break
     return flagged
 
 
-def _spec_coherent_groups(members: list) -> list[list]:
+def _spec_coherent_groups(members: list, conflict_fn=None) -> list[list]:
     """Группы членов, попарно НЕ конфликтующих по _pairwise_spec_conflict.
     Greedy connected-components: член идёт в первую группу, где не конфликтует ни с кем."""
+    conflict_fn = conflict_fn or _pairwise_spec_conflict
     groups: list[list] = []
     for p in members:
         for g in groups:
-            if all(not _pairwise_spec_conflict(p, q) for q in g):
+            if all(not conflict_fn(p, q) for q in g):
                 g.append(p)
                 break
         else:
@@ -1223,7 +1250,13 @@ def _spec_coherent_groups(members: list) -> list[list]:
     return groups
 
 
-def revalidate_split(session: Session, *, dry_run: bool = False) -> list[dict]:
+def revalidate_split(
+    session: Session,
+    *,
+    dry_run: bool = False,
+    tenant_id: int = 1,
+    match_ids: set[int] | None = None,
+) -> list[dict]:
     """Разбить кластеры с cross-site spec-конфликтом на spec-когерентные группы.
 
     Для каждого флагнутого кластера: бьём членов на группы, где никто не конфликтует
@@ -1241,43 +1274,215 @@ def revalidate_split(session: Session, *, dry_run: bool = False) -> list[dict]:
 
     from src import match_actions
 
+    acquire_match_mutation_xact_lock(session)
+
     actions: list[dict] = []
     seen: set[int] = set()
-    for m, _a, _b in find_conflicting_clusters(session):
+    for m, _a, _b in find_conflicting_clusters(
+        session, tenant_id=tenant_id, match_ids=match_ids
+    ):
         if m.id in seen:
+            continue
+        # Manual clusters encode an explicit user decision and are immutable
+        # under automatic revalidation. This also matches the CLI contract:
+        # `rematch --revalidate` must never dissolve or repartition them.
+        if m.is_manual:
             continue
         seen.add(m.id)
         members = list(m.products)
-        groups = sorted(_spec_coherent_groups(members), key=len, reverse=True)
-        keep = next((g for g in groups if len({p.site for p in g}) >= 2), None)
-        if keep is None:
-            for x, y in itertools.combinations(members, 2):
-                if not dry_run:
-                    match_actions.add_rejection(session, x.id, y.id, reason="revalidate-split")
-            for p in members:
-                if not dry_run:
-                    p.canonical_id = None
-            if not dry_run:
-                session.delete(m)
-            actions.append(
-                {"match_id": m.id, "action": "dissolve", "members": [p.id for p in members]}
+        oos_members = [
+            product
+            for product in members
+            if getattr(product, "offer_availability_status", None) == "out_of_stock"
+        ]
+        active_members = [product for product in members if product not in oos_members]
+        has_country_conflict = any(
+            left.site != right.site and _has_conflicting_country(left, right)
+            for left, right in itertools.combinations(active_members, 2)
+        )
+        repartition_strategy = (
+            "offer_repartition"
+            if oos_members
+            else "country_repartition"
+            if has_country_conflict
+            else "spec_repartition"
+        )
+        conflict_fn = _has_conflicting_country if m.is_manual else _pairwise_spec_conflict
+        groups = sorted(
+            _spec_coherent_groups(active_members, conflict_fn), key=len, reverse=True
+        )
+        viable = [g for g in groups if len({p.site for p in g}) >= 2]
+        leftovers = oos_members + [p for g in groups if g not in viable for p in g]
+        action = {
+            "match_id": m.id,
+            "action": "split" if viable else "dissolve",
+            "groups": [[p.id for p in group] for group in viable],
+            "unmatched": [p.id for p in leftovers],
+            "keep": [p.id for p in viable[0]] if viable else [],
+            "eject": [p.id for p in leftovers],
+        }
+        actions.append(action)
+        if dry_run:
+            continue
+
+        before = {
+            "match": {
+                "id": m.id,
+                "tenant_id": m.tenant_id,
+                "canonical_name": m.canonical_name,
+                "canonical_brand": m.canonical_brand,
+                "canonical_dosage": m.canonical_dosage,
+                "canonical_pack_size": m.canonical_pack_size,
+                "confidence": m.confidence,
+                "is_manual": m.is_manual,
+                "match_strategy": m.match_strategy,
+                "needs_review": m.needs_review,
+            },
+            "members": [p.id for p in members],
+        }
+
+        rejection_audits: list[dict] = []
+        for x, y in itertools.combinations(active_members, 2):
+            if x.site == y.site or not conflict_fn(x, y):
+                continue
+            country_conflict = _has_conflicting_country(x, y)
+            a_id, b_id = sorted((x.id, y.id))
+            previous = session.scalar(
+                select(MatchRejection).where(
+                    MatchRejection.product_a_id == a_id,
+                    MatchRejection.product_b_id == b_id,
+                )
             )
-        else:
-            eject = [p for p in members if p not in keep]
-            for p in eject:
-                for q in keep:
-                    if not dry_run:
-                        match_actions.add_rejection(session, p.id, q.id, reason="revalidate-split")
-                if not dry_run:
-                    p.canonical_id = None
-            actions.append(
+            before_rejection = (
                 {
-                    "match_id": m.id,
-                    "action": "split",
-                    "keep": [p.id for p in keep],
-                    "eject": [p.id for p in eject],
+                    "is_active": previous.is_active,
+                    "reason": previous.reason,
+                    "reason_type": previous.reason_type,
+                    "metadata_json": previous.metadata_json,
+                }
+                if previous is not None
+                else None
+            )
+            rejection = match_actions.add_rejection(
+                session,
+                x.id,
+                y.id,
+                reason="country-conflict" if country_conflict else "revalidate-split",
+                reason_type="system_country" if country_conflict else "system_spec",
+                metadata={"source_match_id": m.id, "policy_version": 1},
+            )
+            session.flush()
+            rejection_audits.append(
+                {
+                    "id": rejection.id,
+                    "before": before_rejection,
+                    "after": {
+                        "is_active": rejection.is_active,
+                        "reason": rejection.reason,
+                        "reason_type": rejection.reason_type,
+                        "metadata_json": rejection.metadata_json,
+                    },
                 }
             )
+
+        for product in members:
+            product.canonical_id = None
+
+        created_match_ids: list[int] = []
+        if viable:
+            for index, group in enumerate(viable):
+                target = m
+                if index > 0:
+                    target = Match(
+                        tenant_id=m.tenant_id,
+                        canonical_name=group[0].name,
+                        canonical_brand=group[0].brand,
+                        canonical_dosage=group[0].dosage,
+                        canonical_pack_size=group[0].pack_size,
+                        confidence=m.confidence,
+                        is_manual=m.is_manual,
+                        match_strategy=repartition_strategy,
+                        needs_review=False,
+                    )
+                    session.add(target)
+                    session.flush()
+                else:
+                    target.canonical_name = group[0].name
+                    target.canonical_brand = group[0].brand
+                    target.canonical_dosage = group[0].dosage
+                    target.canonical_pack_size = group[0].pack_size
+                    target.match_strategy = repartition_strategy
+                created_match_ids.append(target.id)
+                for product in group:
+                    product.canonical_id = target.id
+        else:
+            session.delete(m)
+
+        after_assignments = {
+            str(product.id): product.canonical_id for product in members
+        }
+        after_matches: dict[str, dict] = {}
+        for match_id in created_match_ids:
+            target = session.get(Match, match_id)
+            if target is None:
+                continue
+            after_matches[str(match_id)] = {
+                "canonical_name": target.canonical_name,
+                "canonical_brand": target.canonical_brand,
+                "canonical_dosage": target.canonical_dosage,
+                "canonical_pack_size": target.canonical_pack_size,
+                "confidence": target.confidence,
+                "is_manual": target.is_manual,
+                "match_strategy": target.match_strategy,
+                "needs_review": target.needs_review,
+                "members": sorted(
+                    product.id
+                    for product in members
+                    if product.canonical_id == match_id
+                ),
+            }
+
+        session.add(
+            MatchPolicyAudit(
+                tenant_id=m.tenant_id,
+                match_id=m.id,
+                action=(
+                    "offer_repartition"
+                    if oos_members and viable
+                    else "offer_dissolve"
+                    if oos_members
+                    else "country_repartition"
+                    if viable and has_country_conflict
+                    else "country_dissolve"
+                    if has_country_conflict
+                    else "spec_repartition"
+                    if viable
+                    else "spec_dissolve"
+                ),
+                payload={
+                    "policy_version": 2,
+                    "conflict_kind": (
+                        "offer"
+                        if oos_members
+                        else "country"
+                        if has_country_conflict
+                        else "spec"
+                    ),
+                    "before": before,
+                    "after": {
+                        "groups": action["groups"],
+                        "unmatched": action["unmatched"],
+                        "match_ids": created_match_ids,
+                        "assignments": after_assignments,
+                        "matches": after_matches,
+                        "original_match_exists": bool(
+                            viable and m.id in created_match_ids
+                        ),
+                    },
+                    "rejections": rejection_audits,
+                },
+            )
+        )
     if actions and not dry_run:
         session.commit()
     return actions
@@ -1497,13 +1702,21 @@ def _has_perunit_mismatch(
     return False
 
 
-def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> int:
+def match_products(
+    session: Session,
+    fuzzy_threshold: int = FUZZY_THRESHOLD,
+    *,
+    tenant_id: int = 1,
+) -> int:
     """Прогнать матчинг на всех товарах в БД.
 
     Не трогает товары с is_manual=True их Match.
     Возвращает количество новых/обновлённых связок.
     """
-    products = session.scalars(select(Product)).all()
+    acquire_match_mutation_xact_lock(session)
+    products = session.scalars(
+        select(Product).where(Product.tenant_id == tenant_id)
+    ).all()
     if not products:
         return 0
 
@@ -1654,32 +1867,42 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
     for bc, group in by_barcode.items():
         if len(group) < 2:
             continue
-        # Берём по одному продукту с каждого уникального сайта (если на одном
-        # сайте несколько продуктов с тем же barcode — это нормально для variants
-        # одного товара, но мы матчим cross-site).
-        seen_sites: set[str] = set()
-        cluster: list[Product] = []
-        for p in sorted(group, key=lambda x: x.id):  # deterministic order
-            if p.site in seen_sites:
+        # A dirty/reused barcode must not let one conflicting pack poison a
+        # correct pair. Build deterministic pack-compatible cohorts first;
+        # this also makes the result independent from product-id order.
+        pack_groups = _spec_coherent_groups(
+            sorted(group, key=lambda product: product.id),
+            conflict_fn=_has_conflicting_pack_count,
+        )
+        for pack_group in pack_groups:
+            # Берём по одному продукту с каждого уникального сайта (если на одном
+            # сайте несколько продуктов с тем же barcode — это нормально для variants
+            # одного товара, но мы матчим cross-site).
+            seen_sites: set[str] = set()
+            cluster: list[Product] = []
+            for p in pack_group:
+                if p.site in seen_sites:
+                    continue
+                if any(is_rejected(session, c.id, p.id) for c in cluster):
+                    continue
+                cluster.append(p)
+                seen_sites.add(p.site)
+            if len(cluster) < 2:
                 continue
-            if any(is_rejected(session, c.id, p.id) for c in cluster):
+            # Per-unit price sanity check ещё держим — даже одинаковый barcode на
+            # разных сайтах может быть продан per-pack vs per-piece.
+            if _has_perunit_mismatch(cluster, latest_prices):
+                log.warning(
+                    "matcher_barcode_perunit_mismatch",
+                    barcode=bc,
+                    products=[p.id for p in cluster],
+                )
                 continue
-            cluster.append(p)
-            seen_sites.add(p.site)
-        if len(cluster) < 2:
-            continue
-        # Per-unit price sanity check ещё держим — даже одинаковый barcode на
-        # разных сайтах может быть продан per-pack vs per-piece.
-        if _has_perunit_mismatch(cluster, latest_prices):
-            log.warning(
-                "matcher_barcode_perunit_mismatch",
-                barcode=bc,
-                products=[p.id for p in cluster],
-            )
-            continue
-        created_or_updated += _persist_match(session, cluster, confidence=1.0)
-        visited.update(c.id for c in cluster)
-        barcode_matches_created += 1
+            persisted = _persist_match(session, cluster, confidence=1.0)
+            if persisted:
+                created_or_updated += persisted
+                visited.update(c.id for c in cluster)
+                barcode_matches_created += persisted
 
     log.info(
         "matcher_barcode_pass",
@@ -1734,6 +1957,8 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 # (проверяем только против якоря — форма берётся из raw name)
                 if _has_conflicting_form(p.name or "", q.name or ""):
                     continue
+                if any(_has_conflicting_pack_count(c, q) for c in cluster):
+                    continue
                 # Sibling-form: у q нет формы, но на сайте q в этом bucket'е
                 # уже есть продукт с явной формой p → q НЕ является этой формой.
                 # И наоборот — у p нет формы, а на сайте p уже есть форма q.
@@ -1776,11 +2001,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
-                # Country is hard identity only for country-sensitive products:
-                # Talya(Türkiyə) glycerin ≠ Azerfarm(Azərbaycan) glycerin.
-                # Trade-name medicines with different origins go to diagnostics/review,
-                # not an automatic block.
-                if any(_has_conflicting_identity_country(c, q) for c in cluster):
+                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
+                # глицерин — разный товар, ложный 85% spread. Блок только если у
+                # обоих страна известна и различается (см. _has_conflicting_country).
+                if any(_has_conflicting_country(c, q) for c in cluster):
                     continue
                 # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
                 if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
@@ -1804,8 +2028,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = _min_score / 100.0
-                created_or_updated += _persist_match(session, cluster, confidence)
-                visited.update(c.id for c in cluster)
+                persisted = _persist_match(session, cluster, confidence)
+                if persisted:
+                    created_or_updated += persisted
+                    visited.update(c.id for c in cluster)
 
     # ── Secondary pass: (brand, pack) без досировки ─────────────────────────
     # Охватывает пары, где один сайт спарсил dosage, другой — нет.
@@ -1900,11 +2126,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
-                # Country is hard identity only for country-sensitive products:
-                # Talya(Türkiyə) glycerin ≠ Azerfarm(Azərbaycan) glycerin.
-                # Trade-name medicines with different origins go to diagnostics/review,
-                # not an automatic block.
-                if any(_has_conflicting_identity_country(c, q) for c in cluster):
+                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
+                # глицерин — разный товар, ложный 85% spread. Блок только если у
+                # обоих страна известна и различается (см. _has_conflicting_country).
+                if any(_has_conflicting_country(c, q) for c in cluster):
                     continue
                 # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
                 if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
@@ -1918,6 +2143,8 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
+                if any(_has_conflicting_pack_count(c, q) for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _SEC_THRESHOLD:
                     cluster.append(q)
@@ -1927,8 +2154,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = min(_min_score_sec / 100.0, _SEC_CONF_CAP)
-                created_or_updated += _persist_match(session, cluster, confidence)
-                visited.update(c.id for c in cluster)
+                persisted = _persist_match(session, cluster, confidence)
+                if persisted:
+                    created_or_updated += persisted
+                    visited.update(c.id for c in cluster)
 
     # ── Tertiary pass: (brand, dosage) без pack ─────────────────────────────
     # Охватывает пары, где один сайт не вытащил pack_size (или разный).
@@ -2026,11 +2255,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
-                # Country is hard identity only for country-sensitive products:
-                # Talya(Türkiyə) glycerin ≠ Azerfarm(Azərbaycan) glycerin.
-                # Trade-name medicines with different origins go to diagnostics/review,
-                # not an automatic block.
-                if any(_has_conflicting_identity_country(c, q) for c in cluster):
+                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
+                # глицерин — разный товар, ложный 85% spread. Блок только если у
+                # обоих страна известна и различается (см. _has_conflicting_country).
+                if any(_has_conflicting_country(c, q) for c in cluster):
                     continue
                 # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
                 if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
@@ -2044,6 +2272,8 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
+                if any(_has_conflicting_pack_count(c, q) for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _TERT_THRESHOLD:
                     cluster.append(q)
@@ -2053,8 +2283,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = min(_min_score_tert / 100.0, _TERT_CONF_CAP)
-                created_or_updated += _persist_match(session, cluster, confidence)
-                visited.update(c.id for c in cluster)
+                persisted = _persist_match(session, cluster, confidence)
+                if persisted:
+                    created_or_updated += persisted
+                    visited.update(c.id for c in cluster)
 
     # ── Quaternary pass: авто-обнаружение бренда по частоте слов ──────────────
     # Для no-brand продуктов определяет "бренд" из name_normalized автоматически:
@@ -2154,11 +2386,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
-                # Country is hard identity only for country-sensitive products:
-                # Talya(Türkiyə) glycerin ≠ Azerfarm(Azərbaycan) glycerin.
-                # Trade-name medicines with different origins go to diagnostics/review,
-                # not an automatic block.
-                if any(_has_conflicting_identity_country(c, q) for c in cluster):
+                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
+                # глицерин — разный товар, ложный 85% spread. Блок только если у
+                # обоих страна известна и различается (см. _has_conflicting_country).
+                if any(_has_conflicting_country(c, q) for c in cluster):
                     continue
                 # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
                 if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
@@ -2172,6 +2403,8 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                     _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
                 ):
                     continue
+                if any(_has_conflicting_pack_count(c, q) for c in cluster):
+                    continue
                 score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
                 if score >= _QUART_THRESHOLD:
                     cluster.append(q)
@@ -2181,8 +2414,10 @@ def match_products(session: Session, fuzzy_threshold: int = FUZZY_THRESHOLD) -> 
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
                 confidence = min(_min_score_q / 100.0, _QUART_CONF_CAP)
-                created_or_updated += _persist_match(session, cluster, confidence)
-                visited.update(c.id for c in cluster)
+                persisted = _persist_match(session, cluster, confidence)
+                if persisted:
+                    created_or_updated += persisted
+                    visited.update(c.id for c in cluster)
 
     session.commit()
     log.info("matcher_done", clusters=created_or_updated)
@@ -2206,8 +2441,73 @@ def _persist_match(session: Session, cluster: Sequence[Product], confidence: flo
     в следующем прогоне та пара заражала ещё одну — кластер раздувался
     до 70+ разных вариантов одного бренда.
     """
+    from src.product_policy import (
+        OFFER_OUT_OF_STOCK,
+        country_code_of,
+        country_policy_enforced,
+        current_offer_eligibility,
+        availability_policy_enforced,
+    )
+
+    tenant_ids = {int(getattr(product, "tenant_id", 1)) for product in cluster}
+    if len(tenant_ids) != 1:
+        log.error(
+            "persist_match_mixed_tenant_rejected",
+            product_ids=[product.id for product in cluster],
+            tenant_ids=sorted(tenant_ids),
+        )
+        return 0
+    tenant_id = next(iter(tenant_ids))
+
+    # Central invariant: every producer (barcode, fuzzy, recall) ends here.
+    # Compare candidates with existing members before any canonical_id mutation.
+    cohort = list(cluster)
+    existing_match_ids = {p.canonical_id for p in cohort if p.canonical_id}
+    for existing_match_id in existing_match_ids:
+        existing_match = session.get(Match, existing_match_id)
+        if existing_match:
+            if existing_match.tenant_id != tenant_id:
+                log.error(
+                    "persist_match_cross_tenant_rejected",
+                    match_id=existing_match.id,
+                    match_tenant_id=existing_match.tenant_id,
+                    product_tenant_id=tenant_id,
+                )
+                return 0
+            cohort.extend(
+                p
+                for p in existing_match.products
+                if p not in cohort and p.tenant_id == tenant_id
+            )
+    for idx, left in enumerate(cohort):
+        if getattr(left, "offer_availability_status", None) == OFFER_OUT_OF_STOCK:
+            return 0
+        if availability_policy_enforced() and not current_offer_eligibility(left).eligible:
+            return 0
+        if country_policy_enforced() and country_code_of(left) is None:
+            return 0
+        for right in cohort[idx + 1 :]:
+            if left.site != right.site and _has_conflicting_pack_count(left, right):
+                log.info(
+                    "persist_match_pack_count_conflict",
+                    left_id=left.id,
+                    right_id=right.id,
+                    left_pack_size=left.pack_size,
+                    right_pack_size=right.pack_size,
+                )
+                return 0
+            if left.site != right.site and _has_conflicting_country(left, right):
+                log.info(
+                    "persist_match_country_conflict",
+                    left_id=left.id,
+                    right_id=right.id,
+                    left_country=country_code_of(left),
+                    right_country=country_code_of(right),
+                )
+                return 0
+
     # Если у кого-то уже есть canonical_id — переиспользуем (если не is_manual)
-    existing_ids = {p.canonical_id for p in cluster if p.canonical_id}
+    existing_ids = existing_match_ids
     if existing_ids:
         match_id = next(iter(existing_ids))
         match = session.get(Match, match_id)
@@ -2232,6 +2532,7 @@ def _persist_match(session: Session, cluster: Sequence[Product], confidence: flo
     if not match:
         first = cluster[0]
         match = Match(
+            tenant_id=tenant_id,
             canonical_name=first.name,
             canonical_brand=first.brand,
             canonical_dosage=first.dosage,

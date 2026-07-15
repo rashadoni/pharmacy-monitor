@@ -495,6 +495,8 @@ async def test_scrape_without_on_category_is_unchanged():
     s = _StubScraper()
     result = await s.scrape(["a", "b"])
     assert len(result.products) == 3
+    assert result.route_statuses["a"].complete is False
+    assert result.route_statuses["a"].abort_reason == "missing_route_status"
 
 
 # ─── Bright Data residential (Phase 1.2) ────────────────────────────────────

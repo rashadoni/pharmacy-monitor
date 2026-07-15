@@ -19,7 +19,8 @@ from click.testing import CliRunner
 
 from src import main as main_mod
 from src import roi, storage, watchlist
-from src.scrapers.base import ScrapedProduct, ScrapeResult
+from src.product_policy import policy_fingerprint, trusted_catalog_epoch
+from src.scrapers.base import RouteStatus, ScrapedProduct, ScrapeResult
 
 
 class _FakeLockConnection:
@@ -270,15 +271,23 @@ def test_reap_old_classified_orphan_preserves_newer_healthy_lineage_and_cache(db
         started_at=now - timedelta(days=2),
         status="ok",
         run_quality=_full_quality(),
+        catalog_scope="full",
+        full_catalog_sites=",".join(storage.FULL_CATALOG_SITES),
+        catalog_verified=True,
     )
     healthy = storage.Run(
         started_at=now - timedelta(hours=20),
         finished_at=now - timedelta(hours=19),
         status="ok",
         run_quality=_full_quality(),
+        catalog_scope="full",
+        full_catalog_sites=",".join(storage.FULL_CATALOG_SITES),
+        catalog_verified=True,
     )
     db_session.add_all([orphan, healthy])
     db_session.flush()
+    epoch = trusted_catalog_epoch(db_session)
+    assert epoch is not None
     db_session.add(
         storage.RoiActionsCache(
             tenant_id=1,
@@ -286,6 +295,8 @@ def test_reap_old_classified_orphan_preserves_newer_healthy_lineage_and_cache(db
             payload=[{"title": "trusted"}],
             computed_at=now,
             run_id=healthy.id,
+            policy_fingerprint=policy_fingerprint(),
+            trust_epoch=epoch,
         )
     )
     db_session.commit()
@@ -310,14 +321,22 @@ def test_reap_newer_classified_orphan_supersedes_older_healthy_lineage(db_sessio
         finished_at=now - timedelta(hours=19),
         status="ok",
         run_quality=_full_quality(),
+        catalog_scope="full",
+        full_catalog_sites=",".join(storage.FULL_CATALOG_SITES),
+        catalog_verified=True,
     )
     orphan = storage.Run(
         started_at=now - timedelta(hours=7),
         status="ok",
         run_quality=_full_quality(),
+        catalog_scope="full",
+        full_catalog_sites=",".join(storage.FULL_CATALOG_SITES),
+        catalog_verified=True,
     )
     db_session.add_all([healthy, orphan])
     db_session.flush()
+    epoch = trusted_catalog_epoch(db_session)
+    assert epoch is not None
     db_session.add(
         storage.RoiActionsCache(
             tenant_id=1,
@@ -325,6 +344,8 @@ def test_reap_newer_classified_orphan_supersedes_older_healthy_lineage(db_sessio
             payload=[{"title": "superseded"}],
             computed_at=now,
             run_id=healthy.id,
+            policy_fingerprint=policy_fingerprint(),
+            trust_epoch=epoch,
         )
     )
     db_session.commit()
@@ -634,6 +655,91 @@ def test_auto_match_watchlist_skips_missing_products(db_session):
     assert n == 0
 
 
+def test_auto_match_watchlist_rejects_country_conflict_and_oos(db_session):
+    watchlist.add_tracked_product(
+        db_session,
+        canonical_name="Strict SKU",
+        pharmonline_url="https://ph.az/strict",
+        aloe_url="https://aloe.az/strict",
+        aptekonline_url="https://aptek.az/strict",
+    )
+    pharm = storage.Product(
+        site="pharmonline",
+        external_id="strict-ph",
+        url="https://ph.az/strict",
+        name="Strict SKU",
+        name_normalized="strict sku",
+        manufacturer_country_code="ua",
+        country_resolution_status="resolved",
+    )
+    aloe = storage.Product(
+        site="aloe",
+        external_id="strict-aloe",
+        url="https://aloe.az/strict",
+        name="Strict SKU",
+        name_normalized="strict sku",
+        manufacturer_country_code="rs",
+        country_resolution_status="resolved",
+    )
+    aptek = storage.Product(
+        site="aptekonline",
+        external_id="strict-aptek",
+        url="https://aptek.az/strict",
+        name="Strict SKU",
+        name_normalized="strict sku",
+        manufacturer_country_code="ua",
+        country_resolution_status="resolved",
+        offer_availability_status="out_of_stock",
+        availability_observed_at=main_mod.utcnow(),
+    )
+    db_session.add_all([pharm, aloe, aptek])
+    db_session.commit()
+
+    linked = main_mod.auto_match_watchlist(db_session)
+
+    assert linked == 1
+    assert pharm.canonical_id is not None
+    assert aloe.canonical_id is None
+    assert aptek.canonical_id is None
+
+
+def test_auto_match_watchlist_isolates_second_tenant(db_session):
+    url = "https://ph.example/shared-url"
+    watchlist.add_tracked_product(
+        db_session,
+        canonical_name="Tenant two SKU",
+        pharmonline_url=url,
+        tenant_id=2,
+    )
+    tenant_one = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="tenant-one-shared",
+        url=url,
+        name="Tenant one SKU",
+        name_normalized="tenant one sku",
+    )
+    tenant_two = storage.Product(
+        tenant_id=2,
+        site="pharmonline",
+        external_id="tenant-two-shared",
+        url=url,
+        name="Tenant two SKU",
+        name_normalized="tenant two sku",
+    )
+    db_session.add_all([tenant_one, tenant_two])
+    db_session.commit()
+
+    linked = main_mod.auto_match_watchlist(db_session, tenant_id=2)
+
+    assert linked == 1
+    assert tenant_one.canonical_id is None
+    assert tenant_two.canonical_id is not None
+    match = db_session.get(storage.Match, tenant_two.canonical_id)
+    assert match is not None
+    assert match.tenant_id == 2
+
+
 # === _per_category_breakdown ===
 
 
@@ -673,6 +779,123 @@ def test_per_category_breakdown_uncategorized_bucket():
 def test_per_category_breakdown_empty():
     """Пустой список results → пустой dict."""
     assert main_mod._per_category_breakdown([]) == {}
+
+
+def test_full_catalog_verifier_requires_every_category_route_nonzero():
+    result = ScrapeResult(
+        site="aloe",
+        products=[_sp("a", "meds")],
+        category_counts={"meds": 1, "cosmetics": 0},
+    )
+
+    verified, reason = main_mod._verify_full_catalog_results(
+        [result],
+        sites=["aloe"],
+        expected_slugs={"aloe": ["meds", "cosmetics"]},
+        baselines={"aloe": 1},
+    )
+
+    assert verified is False
+    assert "zero_categories=aloe:1" in reason
+
+
+def test_full_catalog_verifier_rejects_below_ninety_percent_baseline():
+    products = [_sp(str(index), "meds") for index in range(89)]
+    result = ScrapeResult(
+        site="aloe",
+        products=products,
+        category_counts={"meds": len(products)},
+    )
+
+    verified, reason = main_mod._verify_full_catalog_results(
+        [result],
+        sites=["aloe"],
+        expected_slugs={"aloe": ["meds"]},
+        baselines={"aloe": 100},
+    )
+
+    assert verified is False
+    assert "coverage=aloe" in reason
+
+
+def test_full_catalog_verifier_accepts_complete_routes_and_coverage():
+    products = [_sp(str(index), "meds") for index in range(90)]
+    result = ScrapeResult(
+        site="aloe",
+        products=products,
+        category_counts={"meds": 45, "cosmetics": 45},
+        route_statuses={
+            "meds": RouteStatus(complete=True, expected_pages=4, visited_pages=4),
+            "cosmetics": RouteStatus(
+                complete=True, expected_pages=4, visited_pages=4
+            ),
+        },
+    )
+
+    verified, reason = main_mod._verify_full_catalog_results(
+        [result],
+        sites=["aloe"],
+        expected_slugs={"aloe": ["meds", "cosmetics"]},
+        baselines={"aloe": 100},
+    )
+
+    assert verified is True
+    assert reason == "complete_nonzero_routes_coverage_ok"
+
+
+def test_full_catalog_verifier_rejects_silent_page_skip():
+    products = [_sp(str(index), "meds") for index in range(95)]
+    result = ScrapeResult(
+        site="aptekonline",
+        products=products,
+        category_counts={"meds": 95},
+        route_statuses={
+            "meds": RouteStatus(
+                complete=False,
+                pages_skipped=1,
+                abort_reason="consecutive_page_failures",
+                expected_pages=10,
+                visited_pages=9,
+            )
+        },
+    )
+
+    verified, reason = main_mod._verify_full_catalog_results(
+        [result],
+        sites=["aptekonline"],
+        expected_slugs={"aptekonline": ["meds"]},
+        baselines={"aptekonline": 100},
+    )
+
+    assert verified is False
+    assert "incomplete_routes=aptekonline:1" in reason
+
+
+def test_aloe_country_mapping_is_durable_and_versioned(db_session):
+    result = ScrapeResult(
+        site="aloe",
+        verified_country_mappings={
+            "14": {
+                "country_code": "gb",
+                "country_raw": "Англия",
+                "source_url": "https://aloe.az/ornafer/",
+                "sample_count": 2,
+            }
+        },
+    )
+
+    assert main_mod.persist_aloe_country_mappings(db_session, [result]) == 1
+    db_session.commit()
+    loaded = main_mod.load_aloe_country_map(db_session)
+    assert loaded["14"]["country_code"] == "gb"
+    assert loaded["14"]["version"] == 1
+
+    result.verified_country_mappings["14"].update(
+        country_code="rs", country_raw="Сербия"
+    )
+    assert main_mod.persist_aloe_country_mappings(db_session, [result]) == 1
+    db_session.commit()
+    assert main_mod.load_aloe_country_map(db_session)["14"]["version"] == 2
 
 
 # === _snapshot_payload_changed ===

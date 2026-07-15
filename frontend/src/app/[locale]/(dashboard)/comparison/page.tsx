@@ -3,10 +3,22 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, useMemo } from "react";
 import { useSearchParams } from "next/navigation";
-import { X, ChevronUp, ChevronDown, ChevronsUpDown, TrendingUp, TrendingDown } from "lucide-react";
+import {
+  X,
+  ChevronUp,
+  ChevronDown,
+  ChevronsUpDown,
+  TrendingUp,
+  TrendingDown,
+} from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
-import { api, ApiError, type ComparisonRow } from "@/lib/api";
+import {
+  api,
+  ApiError,
+  isFullCatalogTrustError,
+  type ComparisonRow,
+} from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatPct } from "@/lib/utils";
 import { OnboardingTip } from "@/components/onboarding-tip";
@@ -14,7 +26,7 @@ import { Sparkline } from "@/components/sparkline";
 import { TableSkeleton } from "@/components/skeleton";
 
 const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
-type SiteName = typeof SITES[number];
+type SiteName = (typeof SITES)[number];
 type SortKey = "name" | "brand" | "spread" | SiteName;
 
 function initialMinSites(value: string | null): number {
@@ -79,11 +91,14 @@ export default function ComparisonPage() {
     });
     const dir = sort.dir === "asc" ? 1 : -1;
     return [...rows].sort((a, b) => {
-      if (sort.key === "name") return (a.name ?? "").localeCompare(b.name ?? "") * dir;
+      if (sort.key === "name")
+        return (a.name ?? "").localeCompare(b.name ?? "") * dir;
       if (sort.key === "brand")
         return (a.brand ?? "").localeCompare(b.brand ?? "") * dir;
       if (sort.key === "spread")
-        return (Math.abs(a.spread_pct ?? 0) - Math.abs(b.spread_pct ?? 0)) * dir;
+        return (
+          (Math.abs(a.spread_pct ?? 0) - Math.abs(b.spread_pct ?? 0)) * dir
+        );
       // per-site price: отсутствующая цена всегда внизу, независимо от dir
       const av = a.prices[sort.key]?.price;
       const bv = b.prices[sort.key]?.price;
@@ -115,7 +130,7 @@ export default function ComparisonPage() {
       "id",
       "name",
       "brand",
-      ...SITES.flatMap((s) => [`${s}_price`, `${s}_url`]),
+      ...SITES.flatMap((s) => [`${s}_price`, `${s}_country`, `${s}_url`]),
       "spread_pct",
       "cheapest_site",
     ];
@@ -134,7 +149,10 @@ export default function ComparisonPage() {
         escape(r.brand ?? ""),
       ];
       for (const s of SITES) {
-        row.push(r.prices[s]?.price != null ? r.prices[s].price.toFixed(2) : "");
+        row.push(
+          r.prices[s]?.price != null ? r.prices[s].price.toFixed(2) : "",
+        );
+        row.push(escape(r.prices[s]?.country_code?.toUpperCase() ?? ""));
         row.push(escape(r.prices[s]?.url ?? ""));
       }
       row.push(r.spread_pct != null ? r.spread_pct.toFixed(2) : "");
@@ -159,7 +177,10 @@ export default function ComparisonPage() {
       // Optimistic: filter the row out immediately
       await queryClient.cancelQueries({ queryKey: ["comparison"] });
       const prev = queryClient.getQueryData<ComparisonRow[]>([
-        "comparison", debouncedSearch, minSites, category,
+        "comparison",
+        debouncedSearch,
+        minSites,
+        category,
       ]);
       queryClient.setQueryData<ComparisonRow[]>(
         ["comparison", debouncedSearch, minSites, category],
@@ -183,7 +204,9 @@ export default function ComparisonPage() {
   });
 
   function handleReject(row: ComparisonRow) {
-    if (!confirm(t("reject_confirm", { name: row.name, brand: row.brand ?? "—" }))) {
+    if (
+      !confirm(t("reject_confirm", { name: row.name, brand: row.brand ?? "—" }))
+    ) {
       return;
     }
     rejectMutation.mutate(row.canonical_id);
@@ -203,10 +226,10 @@ export default function ComparisonPage() {
 
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{t("page_title")}</h1>
-          <p className="text-sm text-muted-foreground">
-            {t("page_subtitle")}
-          </p>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {t("page_title")}
+          </h1>
+          <p className="text-sm text-muted-foreground">{t("page_subtitle")}</p>
         </div>
         <button
           onClick={handleExportCsv}
@@ -289,7 +312,10 @@ export default function ComparisonPage() {
 
       {/* Drill-down filter chip (из /category-comparison) */}
       {category && (
-        <div className="flex items-center gap-2 text-sm" data-testid="category-filter-chip">
+        <div
+          className="flex items-center gap-2 text-sm"
+          data-testid="category-filter-chip"
+        >
           <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 text-primary px-3 py-1">
             {t("category_filter", { category })}
             <button
@@ -316,12 +342,20 @@ export default function ComparisonPage() {
         </div>
       )}
       {error && (
-        <div className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive" data-testid="error">
-          {tCommon("error")}
+        <div
+          className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive"
+          data-testid="error"
+        >
+          {isFullCatalogTrustError(error)
+            ? tCommon("financial_data_paused")
+            : tCommon("error")}
         </div>
       )}
       {data && data.length === 0 && !isLoading && (
-        <div className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center" data-testid="empty">
+        <div
+          className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center"
+          data-testid="empty"
+        >
           {t("empty")}
         </div>
       )}
@@ -329,21 +363,53 @@ export default function ComparisonPage() {
       {/* Mobile: card list */}
       <div className="md:hidden space-y-2" data-testid="mobile-list">
         {filtered?.map((row) => (
-          <ComparisonCard key={row.canonical_id} row={row} onReject={handleReject} />
+          <ComparisonCard
+            key={row.canonical_id}
+            row={row}
+            onReject={handleReject}
+          />
         ))}
       </div>
 
       {/* Desktop: table */}
-      <div className="hidden md:block rounded-lg border border-border overflow-hidden" data-testid="desktop-table">
+      <div
+        className="hidden md:block rounded-lg border border-border overflow-hidden"
+        data-testid="desktop-table"
+      >
         <table className="w-full text-sm">
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
-              <SortableTh label={t("th_name")} col="name" active={sort} onClick={() => toggleSort("name")} align="left" />
-              <SortableTh label={t("th_brand")} col="brand" active={sort} onClick={() => toggleSort("brand")} align="left" />
+              <SortableTh
+                label={t("th_name")}
+                col="name"
+                active={sort}
+                onClick={() => toggleSort("name")}
+                align="left"
+              />
+              <SortableTh
+                label={t("th_brand")}
+                col="brand"
+                active={sort}
+                onClick={() => toggleSort("brand")}
+                align="left"
+              />
               {visibleSites.map((s) => (
-                <SortableTh key={s} label={s} col={s} active={sort} onClick={() => toggleSort(s)} align="right" />
+                <SortableTh
+                  key={s}
+                  label={s}
+                  col={s}
+                  active={sort}
+                  onClick={() => toggleSort(s)}
+                  align="right"
+                />
               ))}
-              <SortableTh label={t("th_spread")} col="spread" active={sort} onClick={() => toggleSort("spread")} align="right" />
+              <SortableTh
+                label={t("th_spread")}
+                col="spread"
+                active={sort}
+                onClick={() => toggleSort("spread")}
+                align="right"
+              />
               <th className="px-3 py-2 w-10"></th>
               <th className="px-3 py-2 w-10"></th>
             </tr>
@@ -368,7 +434,10 @@ export default function ComparisonPage() {
       </div>
 
       {filtered && filtered.length > 0 && (
-        <div className="text-xs text-muted-foreground text-center" data-testid="result-count">
+        <div
+          className="text-xs text-muted-foreground text-center"
+          data-testid="result-count"
+        >
           {t("result_count", { count: filtered.length })}
         </div>
       )}
@@ -404,8 +473,10 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
       title={
         (clientCheapest
           ? t("spread_we_cheaper", { pct: abs.toFixed(1) })
-          : t("spread_they_cheaper", { site: row.cheapest_site, pct: abs.toFixed(1) })) +
-        (isUnit ? ` · ${t("per_unit_note")}` : "")
+          : t("spread_they_cheaper", {
+              site: row.cheapest_site,
+              pct: abs.toFixed(1),
+            })) + (isUnit ? ` · ${t("per_unit_note")}` : "")
       }
     >
       <Icon />
@@ -435,16 +506,23 @@ function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
   // приглушаем и зачёркиваем, показываем бейдж «N дн. назад».
   const stale = p.stale === true;
   const isMin = !stale && row.min_price === cmpVal;
-  const isMax = !stale && row.max_price === cmpVal && row.min_price !== row.max_price;
+  const isMax =
+    !stale && row.max_price === cmpVal && row.min_price !== row.max_price;
   const showUnit =
-    !stale && isUnit && p.pack_count != null && p.pack_count > 1 && p.unit_price != null;
+    !stale &&
+    isUnit &&
+    p.pack_count != null &&
+    p.pack_count > 1 &&
+    p.unit_price != null;
   return (
     <a
       href={p.url}
       target="_blank"
       rel="noopener noreferrer"
       title={
-        stale && p.age_days != null ? t("stale_note", { days: p.age_days }) : undefined
+        stale && p.age_days != null
+          ? t("stale_note", { days: p.age_days })
+          : undefined
       }
       className={`inline-flex flex-col items-end tabular-nums hover:underline leading-tight ${
         stale
@@ -456,8 +534,26 @@ function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
               : ""
       }`}
     >
-      <span className={stale ? "line-through decoration-muted-foreground/40" : ""}>
+      <span
+        className={stale ? "line-through decoration-muted-foreground/40" : ""}
+      >
         {formatPrice(p.price, locale)}
+      </span>
+      <span
+        className={`mt-0.5 rounded-sm border px-1 py-px text-[9px] font-medium leading-none no-underline ${
+          p.country_resolution_status === "resolved" && p.country_code
+            ? "border-border text-muted-foreground"
+            : "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-400"
+        }`}
+        title={
+          p.country_resolution_status === "resolved" && p.country_code
+            ? t("country_verified", { code: p.country_code.toUpperCase() })
+            : t("country_unverified")
+        }
+      >
+        {p.country_resolution_status === "resolved" && p.country_code
+          ? p.country_code.toUpperCase()
+          : t("country_unknown_short")}
       </span>
       {stale && p.age_days != null && (
         <span className="text-[10px] font-normal text-amber-600 dark:text-amber-500">
@@ -466,8 +562,8 @@ function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
       )}
       {showUnit && (
         <span className="text-[10px] font-normal text-muted-foreground">
-          {formatPrice(p.unit_price!, locale)}/{t("unit_short")} · {p.pack_count}{" "}
-          {t("unit_short")}
+          {formatPrice(p.unit_price!, locale)}/{t("unit_short")} ·{" "}
+          {p.pack_count} {t("unit_short")}
         </span>
       )}
     </a>
@@ -503,13 +599,18 @@ function ComparisonRowDesktop({
                 aria-expanded={expanded}
                 data-testid={`fix-${row.canonical_id}`}
               >
-                ⚠ <span className="underline decoration-dotted">{t("relink_title")}</span>
+                ⚠{" "}
+                <span className="underline decoration-dotted">
+                  {t("relink_title")}
+                </span>
               </button>
             )}
             {row.confidence < 0.95 && (
               <span
                 className="text-muted-foreground/60 text-[10px] tabular-nums leading-none"
-                title={t("match_confidence", { pct: Math.round(row.confidence * 100) })}
+                title={t("match_confidence", {
+                  pct: Math.round(row.confidence * 100),
+                })}
               >
                 {Math.round(row.confidence * 100)}%
               </span>
@@ -597,7 +698,9 @@ function ComparisonCard({
         {row.confidence < 0.95 && (
           <span
             className="text-muted-foreground/60 text-[10px] tabular-nums leading-none"
-            title={t("match_confidence", { pct: Math.round(row.confidence * 100) })}
+            title={t("match_confidence", {
+              pct: Math.round(row.confidence * 100),
+            })}
           >
             {Math.round(row.confidence * 100)}%
           </span>
@@ -612,8 +715,12 @@ function ComparisonCard({
       <div className="grid grid-cols-3 gap-2 mt-3">
         {SITES.map((s) => (
           <div key={s} className="text-center">
-            <div className="text-[10px] text-muted-foreground uppercase">{s}</div>
-            <div className="mt-0.5"><PriceCell row={row} site={s} /></div>
+            <div className="text-[10px] text-muted-foreground uppercase">
+              {s}
+            </div>
+            <div className="mt-0.5">
+              <PriceCell row={row} site={s} />
+            </div>
           </div>
         ))}
       </div>
@@ -627,7 +734,8 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
   const sitesWithPrice = SITES.filter((s) => row.prices[s]);
   // Batch fetch: 1 запрос вместо N×3. Сортируем ids для стабильного queryKey.
   const productIds = useMemo(
-    () => sitesWithPrice.map((s) => row.prices[s].product_id).sort((a, b) => a - b),
+    () =>
+      sitesWithPrice.map((s) => row.prices[s].product_id).sort((a, b) => a - b),
     [row, sitesWithPrice],
   );
   const { data, isLoading, error } = useQuery({
@@ -653,7 +761,10 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
             {isLoading ? (
               <span className="text-muted-foreground">…</span>
             ) : error ? (
-              <span className="text-destructive/80 text-[11px]" title={String(error)}>
+              <span
+                className="text-destructive/80 text-[11px]"
+                title={String(error)}
+              >
                 {t("load_error")}
               </span>
             ) : !ph ? (
@@ -661,7 +772,9 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
             ) : ph.points.filter((p) => p.price != null).length < 2 ? (
               <span className="text-muted-foreground/70 text-[11px]">
                 {ph.current != null
-                  ? t("stable_price", { price: formatPrice(ph.current, locale) })
+                  ? t("stable_price", {
+                      price: formatPrice(ph.current, locale),
+                    })
                   : "—"}
               </span>
             ) : (
@@ -702,18 +815,29 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
 function RelinkPanel({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
   const queryClient = useQueryClient();
-  const [msg, setMsg] = useState<{ site: string; ok: boolean; text: string } | null>(null);
+  const [msg, setMsg] = useState<{
+    site: string;
+    ok: boolean;
+    text: string;
+  } | null>(null);
 
   const mutation = useMutation({
     mutationFn: ({ site, url }: { site: string; url: string }) =>
       api.matchRelink(row.canonical_id, site, url),
     onSuccess: (res, vars) => {
-      setMsg({ site: vars.site, ok: true, text: t("relink_ok", { name: res.name }) });
+      setMsg({
+        site: vars.site,
+        ok: true,
+        text: t("relink_ok", { name: res.name }),
+      });
       queryClient.invalidateQueries({ queryKey: ["comparison"] });
       queryClient.invalidateQueries({ queryKey: ["match-quality"] });
     },
     onError: (err: unknown, vars) => {
-      const text = err instanceof ApiError && err.message ? err.message : t("relink_error");
+      const text =
+        err instanceof ApiError && err.message
+          ? err.message
+          : t("relink_error");
       setMsg({ site: vars.site, ok: false, text });
     },
   });
@@ -724,8 +848,12 @@ function RelinkPanel({ row }: { row: ComparisonRow }) {
 
   return (
     <div className="mt-3 pt-3 border-t border-border/50">
-      <p className="text-xs font-medium text-foreground mb-0.5">{t("relink_title")}</p>
-      <p className="text-[11px] text-muted-foreground mb-2">{t("relink_hint")}</p>
+      <p className="text-xs font-medium text-foreground mb-0.5">
+        {t("relink_title")}
+      </p>
+      <p className="text-[11px] text-muted-foreground mb-2">
+        {t("relink_hint")}
+      </p>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         {SITES.map((s) => (
           <RelinkSite
@@ -782,7 +910,9 @@ function RelinkSite({
           {t("relink_current")}: {cur.url.split("/").filter(Boolean).pop()}
         </a>
       ) : (
-        <span className="text-[10px] text-muted-foreground/60">{t("relink_no_product")}</span>
+        <span className="text-[10px] text-muted-foreground/60">
+          {t("relink_no_product")}
+        </span>
       )}
 
       {/* «сначала — другие варианты» */}
@@ -795,9 +925,13 @@ function RelinkSite({
       </button>
       {showAlts && (
         <div className="flex flex-col gap-1">
-          {altsQ.isLoading && <span className="text-[10px] text-muted-foreground">…</span>}
+          {altsQ.isLoading && (
+            <span className="text-[10px] text-muted-foreground">…</span>
+          )}
           {altsQ.data && altsQ.data.items.length === 0 && (
-            <span className="text-[10px] text-muted-foreground">{t("alts_none")}</span>
+            <span className="text-[10px] text-muted-foreground">
+              {t("alts_none")}
+            </span>
           )}
           {altsQ.data?.items.map((a) => (
             <div
@@ -855,7 +989,9 @@ function RelinkSite({
         </button>
       </div>
       {msg && (
-        <span className={`text-[10px] ${msg.ok ? "text-success" : "text-destructive"}`}>
+        <span
+          className={`text-[10px] ${msg.ok ? "text-success" : "text-destructive"}`}
+        >
           {msg.text}
         </span>
       )}
@@ -879,7 +1015,9 @@ function SortableTh({
 }) {
   const isActive = active.key === col;
   return (
-    <th className={`px-3 py-2 font-medium ${align === "right" ? "text-right" : "text-left"}`}>
+    <th
+      className={`px-3 py-2 font-medium ${align === "right" ? "text-right" : "text-left"}`}
+    >
       <button
         onClick={onClick}
         className={`inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-1 hover:bg-muted hover:text-foreground ${

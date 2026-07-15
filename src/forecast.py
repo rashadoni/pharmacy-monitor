@@ -20,7 +20,14 @@ import structlog
 from sqlalchemy import asc, select
 from sqlalchemy.orm import Session
 
-from src.storage import Match, PriceSnapshot, Product, Run, latest_snapshots_per_product
+from src.storage import (
+    Match,
+    PriceSnapshot,
+    Product,
+    Run,
+    financially_eligible_run_ids,
+    latest_snapshots_per_product,
+)
 
 log = structlog.get_logger()
 
@@ -101,6 +108,7 @@ def compute_trend(
     *,
     days_window: int = 30,
     min_points: int = 3,
+    tenant_id: int = 1,
 ) -> PriceTrend | None:
     """Тренд по конкретному product_id за последние days_window дней.
 
@@ -111,12 +119,15 @@ def compute_trend(
     не просто исчез с сайта.
     """
     cutoff = utcnow() - timedelta(days=days_window)
+    eligible_run_ids = financially_eligible_run_ids(session, tenant_id=tenant_id)
+    if not eligible_run_ids:
+        return None
     snaps = session.scalars(
         select(PriceSnapshot)
         .join(Run, Run.id == PriceSnapshot.run_id)
         .where(
             PriceSnapshot.product_id == product_id,
-            Run.status == "ok",
+            PriceSnapshot.run_id.in_(eligible_run_ids),
             Run.started_at >= cutoff,
         )
         .order_by(asc(Run.started_at))
@@ -131,7 +142,7 @@ def compute_trend(
         timestamps.append(s.run.started_at)
 
     product = session.get(Product, product_id)
-    if not product:
+    if not product or product.tenant_id != tenant_id:
         return None
 
     # === Diff-only fast-path: продукт скрейпился, но цена не менялась ===
@@ -144,7 +155,12 @@ def compute_trend(
         # Продукт активен (last_seen_at свежий), но цена не менялась >days_window дней
         # → diff-only не писал снапшоты. Берём последнюю известную цену глобально.
         if not prices:
-            snap_map = latest_snapshots_per_product(session, [product_id])
+            snap_map = latest_snapshots_per_product(
+                session,
+                [product_id],
+                financially_eligible_only=True,
+                tenant_id=tenant_id,
+            )
             latest_snap = snap_map.get(product_id)
             if latest_snap is None:
                 return None
@@ -264,6 +280,7 @@ def top_movers(
     days_window: int = 30,
     min_change_pct: float = 5.0,
     limit: int = 50,
+    tenant_id: int = 1,
 ) -> list[PriceTrend]:
     """Товары с наибольшими движениями цены за окно (rising + falling).
 
@@ -271,6 +288,9 @@ def top_movers(
     по product_id в Python (вместо N запросов по одному product).
     """
     cutoff = utcnow() - timedelta(days=days_window)
+    eligible_run_ids = financially_eligible_run_ids(session, tenant_id=tenant_id)
+    if not eligible_run_ids:
+        return []
     # Один query: все snapshots в окне с join'ом на Run для started_at
     rows = session.execute(
         select(
@@ -280,7 +300,12 @@ def top_movers(
             Run.started_at,
         )
         .join(Run, Run.id == PriceSnapshot.run_id)
+        .join(Product, Product.id == PriceSnapshot.product_id)
         .where(Run.status == "ok", Run.started_at >= cutoff)
+        .where(
+            PriceSnapshot.run_id.in_(eligible_run_ids),
+            Product.tenant_id == tenant_id,
+        )
         .order_by(Run.started_at)
     ).all()
 
@@ -313,9 +338,11 @@ def top_movers(
                 Run.started_at,
             )
             .join(Run, Run.id == PriceSnapshot.run_id)
+            .join(Product, Product.id == PriceSnapshot.product_id)
             .where(
                 PriceSnapshot.product_id.in_(single_snap_pids),
-                Run.status == "ok",
+                PriceSnapshot.run_id.in_(eligible_run_ids),
+                Product.tenant_id == tenant_id,
                 Run.started_at < cutoff,
             )
             .order_by(PriceSnapshot.product_id, Run.started_at.desc())
@@ -333,6 +360,7 @@ def top_movers(
     products = {
         p.id: p
         for p in session.scalars(select(Product).where(Product.id.in_(history.keys()))).all()
+        if p.tenant_id == tenant_id
     }
 
     trends: list[PriceTrend] = []
@@ -345,6 +373,10 @@ def top_movers(
             continue
         product = products.get(pid)
         if not product:
+            continue
+        from src.product_policy import policy_offer_eligibility
+
+        if not policy_offer_eligibility(product).eligible:
             continue
         prices = [p for p, _ in points]
         timestamps = [ts for _, ts in points]
@@ -430,16 +462,33 @@ class CompetitorMoveProbability:
 
 
 def predict_competitor_moves(
-    session: Session, *, days_window: int = 7, max_n: int = 30
+    session: Session, *, days_window: int = 7, max_n: int = 30, tenant_id: int = 1
 ) -> list[CompetitorMoveProbability]:
     """Где у конкурентов выраженный тренд снижения — там клиенту готовиться."""
+    from src.product_policy import (
+        policy_identity_eligibility,
+        policy_offer_eligibility,
+        policy_rollout_eligibility,
+    )
+
+    if not policy_rollout_eligibility(session, tenant_id=tenant_id).eligible:
+        return []
     out: list[CompetitorMoveProbability] = []
-    matches = session.scalars(select(Match)).all()
+    matches = session.scalars(select(Match).where(Match.tenant_id == tenant_id)).all()
     for m in matches:
+        if not policy_identity_eligibility(list(m.products)).eligible:
+            continue
         for product in m.products:
             if product.site == "pharmonline":
                 continue
-            trend = compute_trend(session, product.id, days_window=days_window)
+            if not policy_offer_eligibility(product).eligible:
+                continue
+            trend = compute_trend(
+                session,
+                product.id,
+                days_window=days_window,
+                tenant_id=tenant_id,
+            )
             if trend is None or trend.direction == "stable":
                 continue
             if trend.direction != "falling":

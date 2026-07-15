@@ -118,7 +118,11 @@ def test_build_product_basic_fields():
     assert product.image_url and product.image_url.startswith(thumb)
     assert product.image_url.endswith(item["thumb1"])
     assert product.category == "114"
-    assert product.manufacturer == item["olke"]
+    assert product.manufacturer is None
+    assert product.manufacturer_country_raw == item["olke"]
+    assert product.country_source == "aptek_api_olke"
+    assert product.offer_availability_status == "in_stock"
+    assert product.offer_quantity == item["qaliq"]
     assert product.description == item["terkib"]
 
 
@@ -233,6 +237,37 @@ async def test_scrape_category_yields_products_from_api():
     assert len(products) == len(payload["data"])
     assert all(p.site == "aptekonline" for p in products)
     assert all(p.external_id for p in products)
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_marks_malformed_item_incomplete():
+    payload = {
+        "data": [
+            {
+                "url_id": "ok-1",
+                "name": "Valid item",
+                "price": 10,
+                "olke": "Serbiya",
+                "qaliq": 1,
+            },
+            {"url_id": "broken-no-name"},
+        ],
+        "total": 2,
+        "last_page": 1,
+        "next_page_url": None,
+    }
+    patcher, _ = _mock_httpx_client(payload)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+
+    assert len(products) == 1
+    status = scraper._route_statuses["114"]
+    assert status.complete is False
+    assert status.raw_items == 2
+    assert status.parsed_items == 1
+    assert status.item_failures == 1
+    assert status.expected_items == 2
 
 
 @pytest.mark.asyncio

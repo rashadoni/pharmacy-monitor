@@ -220,8 +220,19 @@ def _detect_undercuts(
     иметь snapshot'а в каждом run'е, если цена не менялась). Используем
     aggregate `MAX(captured_at) GROUP BY product_id` + JOIN.
     """
+    from src.product_policy import (
+        policy_identity_eligibility,
+        policy_offer_eligibility,
+        policy_rollout_eligibility,
+    )
+
+    rollout = policy_rollout_eligibility(session, tenant_id=tenant_id)
+    if not rollout.eligible:
+        log.warning("analyzer_policy_gate_closed", reason=rollout.reason, tenant_id=tenant_id)
+        return []
+
     matches = session.scalars(
-        select(Match).where(Match.products.any(), Match.tenant_id == tenant_id)
+        select(Match).where(Match.tenant_id == tenant_id, Match.products.any())
     ).all()
 
     # Все product_ids из всех matches
@@ -242,6 +253,8 @@ def _detect_undercuts(
 
     undercuts: list[CompetitorUndercut] = []
     for m in matches:
+        if not policy_identity_eligibility(list(m.products)).eligible:
+            continue
         client_product: Product | None = None
         competitor_products: list[Product] = []
         for p in m.products:
@@ -252,6 +265,8 @@ def _detect_undercuts(
 
         if not client_product:
             continue
+        if not policy_offer_eligibility(client_product).eligible:
+            continue
         client_snap = snaps_by_product.get(client_product.id)
         if not client_snap:
             continue
@@ -260,6 +275,8 @@ def _detect_undercuts(
             continue  # цена 0 = нет в наличии → иначе деление на 0 в diff_pct (run #311)
 
         for cp in competitor_products:
+            if not policy_offer_eligibility(cp).eligible:
+                continue
             comp_snap = snaps_by_product.get(cp.id)
             if not comp_snap:
                 continue

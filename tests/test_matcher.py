@@ -1,5 +1,7 @@
 """Тесты fuzzy-матчинга товаров между сайтами."""
 
+from sqlalchemy import func, select
+
 from src import match_actions, matcher, storage
 from src.matcher import (
     _concentrations,
@@ -9,10 +11,10 @@ from src.matcher import (
     _dimensions,
     _has_conflicting_concentration,
     _has_conflicting_country,
-    _has_conflicting_identity_country,
     _has_conflicting_dimensions,
     _has_conflicting_form,
     _has_conflicting_gender,
+    _has_conflicting_pack_count,
     _has_conflicting_series_number,
     _has_conflicting_strength_number,
     _has_conflicting_variant_atoms,
@@ -20,7 +22,6 @@ from src.matcher import (
     _has_conflicting_variant_tokens,
     _has_extreme_length_disparity,
     _has_perunit_mismatch,
-    _is_country_identity_name,
     _is_significant_variant_token,
     _pack_count,
     _strength_numbers,
@@ -31,6 +32,7 @@ from src.matcher import (
 
 def _make_product(s, **kw) -> storage.Product:
     p = storage.Product(
+        tenant_id=kw.get("tenant_id", 1),
         site=kw.get("site", "pharmonline"),
         external_id=kw.get("external_id", "id-1"),
         url=kw.get("url", "http://example.com/p"),
@@ -43,6 +45,72 @@ def _make_product(s, **kw) -> storage.Product:
     s.add(p)
     s.flush()
     return p
+
+
+def test_match_products_isolates_second_tenant(db_session):
+    tenant_one = _make_product(
+        db_session,
+        tenant_id=1,
+        site="pharmonline",
+        external_id="tenant-one",
+        name="Tenant product 500 mg N20",
+        name_normalized="tenant product",
+        brand="Brand",
+        dosage="500mg",
+        pack_size="n20",
+    )
+    tenant_two_a = _make_product(
+        db_session,
+        tenant_id=2,
+        site="pharmonline",
+        external_id="tenant-two-a",
+        name="Tenant product 500 mg N20",
+        name_normalized="tenant product",
+        brand="Brand",
+        dosage="500mg",
+        pack_size="n20",
+    )
+    tenant_two_b = _make_product(
+        db_session,
+        tenant_id=2,
+        site="aloe",
+        external_id="tenant-two-b",
+        name="Tenant product 500 mg N20",
+        name_normalized="tenant product",
+        brand="Brand",
+        dosage="500mg",
+        pack_size="n20",
+    )
+    db_session.commit()
+
+    matcher.match_products(db_session, tenant_id=2)
+
+    assert tenant_one.canonical_id is None
+    assert tenant_two_a.canonical_id == tenant_two_b.canonical_id
+    match = db_session.get(storage.Match, tenant_two_a.canonical_id)
+    assert match is not None
+    assert match.tenant_id == 2
+
+
+def test_persist_match_rejects_mixed_tenant_cluster(db_session):
+    left = _make_product(
+        db_session,
+        tenant_id=1,
+        site="pharmonline",
+        external_id="mixed-left",
+        name="Mixed tenant",
+    )
+    right = _make_product(
+        db_session,
+        tenant_id=2,
+        site="aloe",
+        external_id="mixed-right",
+        name="Mixed tenant",
+    )
+
+    assert matcher._persist_match(db_session, [left, right]) == 0
+    assert left.canonical_id is None
+    assert right.canonical_id is None
 
 
 def test_exact_match_across_sites(db_session):
@@ -736,6 +804,187 @@ class TestPackCount:
 
     def test_ml_volume(self):
         assert _pack_count("50ml") == 50.0
+
+
+class TestExplicitPackCountConflict:
+    @staticmethod
+    def _product(pack_size, name=""):
+        return type("ProductStub", (), {"pack_size": pack_size, "name": name})()
+
+    def test_blocks_client_reported_pack_mismatches(self):
+        pairs = (
+            ("n12", "n60"),  # Paddlers Protection size 2
+            ("n10", "n36"),  # Always Ultra Light
+            ("n5", "n12"),  # Predo Hypoallergenic size 2
+            ("n28", "n16"),  # Molped Daily Care
+        )
+        for left, right in pairs:
+            assert _has_conflicting_pack_count(
+                self._product(left), self._product(right)
+            )
+
+    def test_allows_same_or_unknown_count(self):
+        assert not _has_conflicting_pack_count(
+            self._product("n60"), self._product("n60")
+        )
+        assert not _has_conflicting_pack_count(
+            self._product(None), self._product("n60")
+        )
+
+    def test_does_not_confuse_volume_with_unit_count(self):
+        assert not _has_conflicting_pack_count(
+            self._product("200ml"), self._product("300ml")
+        )
+
+    def test_falls_back_to_explicit_count_in_name(self):
+        assert _has_conflicting_pack_count(
+            self._product(None, 'Uşaq bezi "Paddlers - 2" 3-6kg № 12'),
+            self._product(None, 'Paddlers Protection 3-6 kq N60 (2)'),
+        )
+
+
+def test_persist_match_enforces_pack_count_for_every_producer(db_session):
+    """The central persistence boundary blocks barcode/tertiary/quaternary bypasses."""
+    s = db_session
+    n12 = _make_product(
+        s,
+        site="pharmonline",
+        external_id="central-n12",
+        name='Uşaq bezi "Paddlers - 2" 3-6kg № 12',
+        name_normalized="usaq bezi paddlers 2",
+        brand="paddlers",
+        pack_size=None,
+    )
+    n60 = _make_product(
+        s,
+        site="aptekonline",
+        external_id="central-n60",
+        name='Uşaq bezi "Paddlers" Protection 3-6 kq N60 (2)',
+        name_normalized="usaq bezi paddlers protection 2",
+        brand="paddlers",
+        pack_size=None,
+    )
+    s.flush()
+
+    assert matcher._persist_match(s, [n12, n60], confidence=1.0) == 0
+    assert n12.canonical_id is None
+    assert n60.canonical_id is None
+
+
+def test_persist_match_allows_same_explicit_pack_count(db_session):
+    """A valid N80/N80 pair remains matchable after the central invariant."""
+    s = db_session
+    left = _make_product(
+        s,
+        site="pharmonline",
+        external_id="central-n80-left",
+        name="Paddlers size 4 N80",
+        name_normalized="paddlers size 4",
+        brand="paddlers",
+        pack_size="n80",
+    )
+    right = _make_product(
+        s,
+        site="aptekonline",
+        external_id="central-n80-right",
+        name="Paddlers ölçü 4 №80",
+        name_normalized="paddlers olcu 4",
+        brand="paddlers",
+        pack_size="n80",
+    )
+    s.flush()
+
+    assert matcher._persist_match(s, [left, right], confidence=1.0) == 1
+    assert left.canonical_id is not None
+    assert left.canonical_id == right.canonical_id
+
+
+def test_barcode_pass_keeps_valid_pack_pair_when_conflict_has_lower_id(db_session):
+    """A reused barcode N60 must not poison the later N12/N12 pair."""
+    s = db_session
+    bad_first = _make_product(
+        s,
+        site="aptekonline",
+        external_id="barcode-n60-first",
+        name="Paddlers size 2 N60",
+        name_normalized="paddlers size 2",
+        brand="paddlers",
+        pack_size="n60",
+    )
+    bad_first.barcode = "1234567890123"
+    good_left = _make_product(
+        s,
+        site="pharmonline",
+        external_id="barcode-n12-left",
+        name="Paddlers size 2 N12",
+        name_normalized="paddlers size 2",
+        brand="paddlers",
+        pack_size="n12",
+    )
+    good_left.barcode = "1234567890123"
+    good_right = _make_product(
+        s,
+        site="aloe",
+        external_id="barcode-n12-right",
+        name="Paddlers ölçü 2 №12",
+        name_normalized="paddlers size 2",
+        brand="paddlers",
+        pack_size="n12",
+    )
+    good_right.barcode = "1234567890123"
+    s.commit()
+
+    matcher.match_products(s)
+    for product in (bad_first, good_left, good_right):
+        s.refresh(product)
+
+    assert bad_first.canonical_id is None
+    assert good_left.canonical_id is not None
+    assert good_left.canonical_id == good_right.canonical_id
+
+
+def test_tertiary_pass_keeps_valid_pair_when_conflict_has_lower_id(db_session):
+    """Wide fuzzy buckets skip only N60 and still persist the N12/N12 pair."""
+    s = db_session
+    bad_first = _make_product(
+        s,
+        site="aptekonline",
+        external_id="tertiary-n60-first",
+        name="Paddlers Baby 3-6 kq N60",
+        name_normalized="paddlers baby",
+        brand="paddlers",
+        dosage="3-6kg",
+        pack_size="n60",
+    )
+    good_left = _make_product(
+        s,
+        site="pharmonline",
+        external_id="tertiary-n12-left",
+        name="Paddlers Baby 3-6 kq N12",
+        name_normalized="paddlers baby",
+        brand="paddlers",
+        dosage="3-6kg",
+        pack_size=None,
+    )
+    good_right = _make_product(
+        s,
+        site="aloe",
+        external_id="tertiary-n12-right",
+        name="Paddlers Baby 3-6 kq №12",
+        name_normalized="paddlers baby",
+        brand="paddlers",
+        dosage="3-6kg",
+        pack_size="n12",
+    )
+    s.commit()
+
+    matcher.match_products(s)
+    for product in (bad_first, good_left, good_right):
+        s.refresh(product)
+
+    assert bad_first.canonical_id is None
+    assert good_left.canonical_id is not None
+    assert good_left.canonical_id == good_right.canonical_id
 
 
 # ── _has_perunit_mismatch ────────────────────────────────────────────────────
@@ -1467,10 +1716,14 @@ class TestCountryGuard:
         class A:
             manufacturer = "TÜRKİYƏ"
             url = None
+            manufacturer_country_code = "tr"
+            country_resolution_status = "resolved"
 
         class B:
             manufacturer = None
             url = "https://pharmonline.az/product/qliserin-50-ml-azerfarm-mmc-azerbaycan"
+            manufacturer_country_code = "az"
+            country_resolution_status = "resolved"
 
         assert _has_conflicting_country(A(), B()) is True  # tr ≠ az
 
@@ -1478,10 +1731,14 @@ class TestCountryGuard:
         class A:
             manufacturer = "Rusiya"
             url = None
+            manufacturer_country_code = "ru"
+            country_resolution_status = "resolved"
 
         class B:
             manufacturer = None
             url = "https://pharmonline.az/product/drug-rusiya"
+            manufacturer_country_code = "ru"
+            country_resolution_status = "resolved"
 
         assert _has_conflicting_country(A(), B()) is False  # ru == ru
 
@@ -1489,10 +1746,14 @@ class TestCountryGuard:
         class A:
             manufacturer = "TÜRKİYƏ"
             url = None
+            manufacturer_country_code = "tr"
+            country_resolution_status = "resolved"
 
         class B:
             manufacturer = None
             url = "https://pharmonline.az/product/drug-no-country-tail"
+            manufacturer_country_code = None
+            country_resolution_status = "unknown"
 
         assert _has_conflicting_country(A(), B()) is False  # одна страна неизвестна → не блок
 
@@ -1510,6 +1771,8 @@ def test_country_blocks_cross_country_match(db_session):
         pack_size="50ml",
     )
     a.manufacturer = "TÜRKİYƏ"
+    a.manufacturer_country_code = "tr"
+    a.country_resolution_status = "resolved"
     b = _make_product(
         s,
         site="pharmonline",
@@ -1520,56 +1783,13 @@ def test_country_blocks_cross_country_match(db_session):
         pack_size="50ml",
         url="https://pharmonline.az/product/qliserin-50-ml-mehlul-azerfarm-mmc-azerbaycan",
     )
+    b.manufacturer_country_code = "az"
+    b.country_resolution_status = "resolved"
     s.commit()
     matcher.match_products(s)
     s.refresh(a)
     s.refresh(b)
     assert a.canonical_id != b.canonical_id or (a.canonical_id is None and b.canonical_id is None)
-
-
-def test_country_identity_name_covers_generic_medical_commodities():
-    assert _is_country_identity_name("Qliserin 50 ml") is True
-    assert _is_country_identity_name("Natrium xlorid 0.9% 400 ml") is True
-    assert _is_country_identity_name("Uşaq bezi Huggies №44") is True
-    assert _is_country_identity_name("X-Brain 150 ml") is False
-
-
-def test_trade_name_country_does_not_block_match(db_session):
-    """Trade-name medicine can be parallel/import-origin-different; country alone is diagnostic."""
-    s = db_session
-    a = _make_product(
-        s,
-        site="aloe",
-        external_id="xbrain-tr",
-        name="X-Brain 150 ml",
-        name_normalized="x brain",
-        brand="X-Brain",
-        pack_size="150ml",
-    )
-    a.manufacturer = "TÜRKİYƏ"
-    b = _make_product(
-        s,
-        site="aptekonline",
-        external_id="xbrain-az",
-        name="X-Brain 150 ml",
-        name_normalized="x brain",
-        brand="X-Brain",
-        pack_size="150ml",
-    )
-    b.manufacturer = "Azərbaycan"
-
-    assert _has_conflicting_country(a, b) is True
-    assert _has_conflicting_identity_country(a, b) is False
-
-    s.commit()
-    matcher.match_products(s)
-    s.refresh(a)
-    s.refresh(b)
-    assert a.canonical_id is not None
-    assert a.canonical_id == b.canonical_id
-
-
-# ── Габариты AxB + концентрация % (2026-05-29) ────────────────────────────────
 
 
 class TestDimensionGuard:
@@ -1736,6 +1956,110 @@ def test_find_conflicting_clusters(db_session):
     assert m_manual.id not in ids  # ручной матч не перепроверяется
 
 
+def test_revalidate_dissolves_different_explicit_pack_counts(db_session):
+    """Same diaper size but N12/N60 are different physical packs."""
+    s = db_session
+    match = storage.Match(
+        canonical_name='Uşaq bezi "Paddlers" Protection 3-6 kq N60 (2)',
+        confidence=0.68,
+        is_manual=False,
+    )
+    s.add(match)
+    s.flush()
+    left = _make_product(
+        s,
+        site="pharmonline",
+        external_id="paddlers-n12",
+        name='Uşaq bezi "Paddlers - 2" 3-6kg № 12',
+        name_normalized="usaq bezi paddlers 2",
+        brand="paddlers",
+        pack_size="n12",
+    )
+    right = _make_product(
+        s,
+        site="aptekonline",
+        external_id="paddlers-n60",
+        name='Uşaq bezi "Paddlers" Protection 3-6 kq N60 (2)',
+        name_normalized="usaq bezi paddlers protection 2",
+        brand="paddlers",
+        pack_size="n60",
+    )
+    left.canonical_id = match.id
+    right.canonical_id = match.id
+    s.commit()
+
+    plan = matcher.revalidate_split(s, dry_run=True)
+
+    assert plan == [
+        {
+            "match_id": match.id,
+            "action": "dissolve",
+            "groups": [],
+            "unmatched": [left.id, right.id],
+            "keep": [],
+            "eject": [left.id, right.id],
+        }
+    ]
+
+    matcher.revalidate_split(s, match_ids={match.id})
+    audit = s.scalar(
+        select(storage.MatchPolicyAudit).where(
+            storage.MatchPolicyAudit.match_id == match.id
+        )
+    )
+    assert audit.action == "spec_dissolve"
+    assert audit.payload["conflict_kind"] == "spec"
+
+
+def test_revalidate_can_target_only_confirmed_match_ids(db_session):
+    """A production cleanup can dissolve an audited subset without touching others."""
+    s = db_session
+
+    def _bad_cluster(ext_prefix: str):
+        match = storage.Match(
+            canonical_name=f"Paddlers {ext_prefix}", confidence=0.68, is_manual=False
+        )
+        s.add(match)
+        s.flush()
+        left = _make_product(
+            s,
+            site="pharmonline",
+            external_id=f"{ext_prefix}-n12",
+            name='Uşaq bezi "Paddlers - 2" 3-6kg № 12',
+            name_normalized="usaq bezi paddlers 2",
+            brand="paddlers",
+            pack_size="n12",
+        )
+        right = _make_product(
+            s,
+            site="aptekonline",
+            external_id=f"{ext_prefix}-n60",
+            name='Uşaq bezi "Paddlers" Protection 3-6 kq N60 (2)',
+            name_normalized="usaq bezi paddlers protection 2",
+            brand="paddlers",
+            pack_size="n60",
+        )
+        left.canonical_id = right.canonical_id = match.id
+        return match, left, right
+
+    selected, selected_left, selected_right = _bad_cluster("selected")
+    untouched, untouched_left, untouched_right = _bad_cluster("untouched")
+    s.commit()
+
+    actions = matcher.revalidate_split(s, match_ids={selected.id})
+
+    assert [action["match_id"] for action in actions] == [selected.id]
+    s.refresh(selected_left)
+    s.refresh(selected_right)
+    s.refresh(untouched_left)
+    s.refresh(untouched_right)
+    assert selected_left.canonical_id is None
+    assert selected_right.canonical_id is None
+    assert untouched_left.canonical_id == untouched.id
+    assert untouched_right.canonical_id == untouched.id
+    assert matcher.find_conflicting_clusters(s, match_ids=set()) == []
+
+
 def test_revalidate_split(db_session):
     """revalidate_split: dissolves a 2-member conflict, ejects ONLY the outlier from a
     3-member cluster (keeps the coherent cross-site pair), leaves clean clusters intact."""
@@ -1783,6 +2107,131 @@ def test_revalidate_split(db_session):
     assert t_ph.canonical_id == m_trio.id  # coherent pair kept
     s.expire_all()  # drop cached Match.products (session is expire_on_commit=False)
     assert matcher.find_conflicting_clusters(s) == []  # nothing left flagged
+
+
+def test_revalidate_country_repartitions_into_all_viable_groups(db_session):
+    """A legacy snowball cluster can contain two valid country-specific pairs."""
+    s = db_session
+    match = storage.Match(canonical_name="Ornafer", confidence=1.0, is_manual=False)
+    s.add(match)
+    s.flush()
+
+    members = []
+    for site, ext, country in (
+        ("pharmonline", "ua-ph", "ua"),
+        ("aloe", "ua-aloe", "ua"),
+        ("pharmonline", "rs-ph", "rs"),
+        ("aptekonline", "rs-aptek", "rs"),
+    ):
+        product = _make_product(
+            s,
+            site=site,
+            external_id=ext,
+            name="Ornafer N30",
+            name_normalized="ornafer n30",
+        )
+        product.manufacturer_country_code = country
+        product.country_resolution_status = "resolved"
+        product.canonical_id = match.id
+        members.append(product)
+    s.commit()
+
+    actions = matcher.revalidate_split(s)
+
+    assert actions[0]["action"] == "split"
+    assert len(actions[0]["groups"]) == 2
+    s.expire_all()
+    clusters = {
+        p.manufacturer_country_code: p.canonical_id
+        for p in s.scalars(
+            select(storage.Product).where(storage.Product.id.in_([p.id for p in members]))
+        )
+    }
+    assert clusters["ua"] is not None
+    assert clusters["rs"] is not None
+    assert clusters["ua"] != clusters["rs"]
+    assert s.scalar(select(func.count(storage.MatchPolicyAudit.id))) == 1
+
+
+def test_revalidate_detaches_oos_without_permanent_rejection(db_session):
+    """An explicit OOS offer is not an active match and may rematch after restock."""
+    s = db_session
+    match = storage.Match(canonical_name="Ornafer", confidence=1.0, is_manual=False)
+    s.add(match)
+    s.flush()
+
+    members = []
+    for site, ext, availability in (
+        ("pharmonline", "ornafer-ph", "in_stock"),
+        ("aloe", "ornafer-aloe", "in_stock"),
+        ("aptekonline", "ornafer-aptek", "out_of_stock"),
+    ):
+        product = _make_product(
+            s,
+            site=site,
+            external_id=ext,
+            name="Ornafer N30",
+            name_normalized="ornafer n30",
+        )
+        product.manufacturer_country_code = "gb"
+        product.country_resolution_status = "resolved"
+        product.offer_availability_status = availability
+        product.canonical_id = match.id
+        members.append(product)
+    s.commit()
+
+    actions = matcher.revalidate_split(s)
+
+    assert len(actions) == 1
+    assert actions[0]["match_id"] == match.id
+    assert actions[0]["action"] == "split"
+    assert {frozenset(group) for group in actions[0]["groups"]} == {
+        frozenset((members[0].id, members[1].id))
+    }
+    assert set(actions[0]["unmatched"]) == {members[2].id}
+    s.refresh(members[2])
+    assert members[2].canonical_id is None
+    assert members[0].canonical_id == members[1].canonical_id == match.id
+    assert s.scalar(select(func.count(storage.MatchRejection.id))) == 0
+    audit = s.scalar(select(storage.MatchPolicyAudit))
+    assert audit.action == "offer_repartition"
+
+
+def test_revalidate_never_mutates_manual_country_or_oos_cluster(db_session):
+    """Automatic revalidation must preserve an explicit operator decision."""
+    s = db_session
+    match = storage.Match(canonical_name="Manual Ornafer", confidence=1.0, is_manual=True)
+    s.add(match)
+    s.flush()
+
+    members = []
+    for site, ext, country, availability in (
+        ("pharmonline", "manual-de", "de", "in_stock"),
+        ("aloe", "manual-ua", "ua", "in_stock"),
+        ("aptekonline", "manual-oos", "de", "out_of_stock"),
+    ):
+        product = _make_product(
+            s,
+            site=site,
+            external_id=ext,
+            name="Manual Ornafer N30",
+            name_normalized="manual ornafer n30",
+        )
+        product.manufacturer_country_code = country
+        product.country_resolution_status = "resolved"
+        product.offer_availability_status = availability
+        product.canonical_id = match.id
+        members.append(product)
+    s.commit()
+
+    assert matcher.revalidate_split(s, match_ids={match.id}, dry_run=True) == []
+    assert matcher.revalidate_split(s, match_ids={match.id}) == []
+
+    s.expire_all()
+    assert s.get(storage.Match, match.id).is_manual is True
+    assert {s.get(storage.Product, p.id).canonical_id for p in members} == {match.id}
+    assert s.scalar(select(func.count(storage.MatchRejection.id))) == 0
+    assert s.scalar(select(func.count(storage.MatchPolicyAudit.id))) == 0
 
 
 def test_dimension_blocks_different_size(db_session):

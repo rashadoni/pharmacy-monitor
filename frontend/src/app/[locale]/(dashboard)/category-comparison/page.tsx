@@ -6,7 +6,11 @@ import { useSearchParams } from "next/navigation";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
-import { api, type CategoryComparisonRow } from "@/lib/api";
+import {
+  api,
+  isFullCatalogTrustError,
+  type CategoryComparisonRow,
+} from "@/lib/api";
 import { formatPrice } from "@/lib/utils";
 import { MetricStrip } from "@/components/metric-strip";
 import { TableSkeleton } from "@/components/skeleton";
@@ -78,7 +82,10 @@ export default function CategoryComparisonPage() {
     }
     const cheaperCats = visibleRows.filter((r) => r.index < 100).length;
     const totalSkus = visibleRows.reduce((s, r) => s + r.matched_skus, 0);
-    const weighted = visibleRows.reduce((s, r) => s + r.index * r.matched_skus, 0);
+    const weighted = visibleRows.reduce(
+      (s, r) => s + r.index * r.matched_skus,
+      0,
+    );
     const avgIndex = totalSkus > 0 ? weighted / totalSkus : null;
     return { cheaperCats, avgIndex, totalSkus };
   }, [visibleRows]);
@@ -133,7 +140,9 @@ export default function CategoryComparisonPage() {
       ];
       lines.push(row.join(","));
     }
-    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+    const blob = new Blob([lines.join("\n")], {
+      type: "text/csv;charset=utf-8",
+    });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -147,7 +156,9 @@ export default function CategoryComparisonPage() {
     <div className="space-y-4">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {t("title")}
+          </h1>
           <p className="text-sm text-muted-foreground">{t("subtitle")}</p>
           {selectedCategory && (
             <div className="mt-2 inline-flex items-center gap-2 rounded-full bg-primary/10 px-3 py-1 text-xs text-primary">
@@ -209,7 +220,9 @@ export default function CategoryComparisonPage() {
           className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive"
           data-testid="error"
         >
-          {tCommon("error")}
+          {isFullCatalogTrustError(error)
+            ? tCommon("financial_data_paused")
+            : tCommon("error")}
         </div>
       )}
       {isLoading && <TableSkeleton rows={8} cols={7} />}
@@ -225,7 +238,11 @@ export default function CategoryComparisonPage() {
       {/* Mobile cards */}
       <div className="md:hidden space-y-2" data-testid="mobile-list">
         {sorted?.map((row) => (
-          <CategoryCard key={row.category} row={row} onClick={() => drill(row.category)} />
+          <CategoryCard
+            key={row.category}
+            row={row}
+            onClick={() => drill(row.category)}
+          />
         ))}
       </div>
 
@@ -238,16 +255,46 @@ export default function CategoryComparisonPage() {
           <table className="w-full text-sm">
             <thead className="bg-muted/50 text-muted-foreground">
               <tr>
-                <SortableTh label={t("th_category")} active={sort} col="label" onClick={() => toggleSort("label")} align="left" />
-                <SortableTh label={t("th_skus")} active={sort} col="skus" onClick={() => toggleSort("skus")} align="right" />
-                <SortableTh label={t("th_client")} active={sort} col="client" onClick={() => toggleSort("client")} align="right" />
+                <SortableTh
+                  label={t("th_category")}
+                  active={sort}
+                  col="label"
+                  onClick={() => toggleSort("label")}
+                  align="left"
+                />
+                <SortableTh
+                  label={t("th_skus")}
+                  active={sort}
+                  col="skus"
+                  onClick={() => toggleSort("skus")}
+                  align="right"
+                />
+                <SortableTh
+                  label={t("th_client")}
+                  active={sort}
+                  col="client"
+                  onClick={() => toggleSort("client")}
+                  align="right"
+                />
                 {COMPETITORS.map((s) => (
                   <th key={s} className="px-3 py-2 text-right font-medium">
                     {s}
                   </th>
                 ))}
-                <SortableTh label={t("th_index")} active={sort} col="index" onClick={() => toggleSort("index")} align="right" />
-                <SortableTh label={t("th_cheaper")} active={sort} col="cheaper" onClick={() => toggleSort("cheaper")} align="right" />
+                <SortableTh
+                  label={t("th_index")}
+                  active={sort}
+                  col="index"
+                  onClick={() => toggleSort("index")}
+                  align="right"
+                />
+                <SortableTh
+                  label={t("th_cheaper")}
+                  active={sort}
+                  col="cheaper"
+                  onClick={() => toggleSort("cheaper")}
+                  align="right"
+                />
               </tr>
             </thead>
             <tbody>
@@ -259,7 +306,9 @@ export default function CategoryComparisonPage() {
                   title={t("drill_hint")}
                   data-testid={`cat-row-${row.category}`}
                 >
-                  <td className="px-3 py-2 max-w-xs truncate font-medium">{row.label}</td>
+                  <td className="px-3 py-2 max-w-xs truncate font-medium">
+                    {row.label}
+                  </td>
                   <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
                     {row.matched_skus}
                   </td>
@@ -315,7 +364,9 @@ function SortableTh({
 }) {
   const isActive = active.key === col;
   return (
-    <th className={`px-3 py-2 font-medium ${align === "right" ? "text-right" : "text-left"}`}>
+    <th
+      className={`px-3 py-2 font-medium ${align === "right" ? "text-right" : "text-left"}`}
+    >
       <button
         onClick={onClick}
         className={`inline-flex items-center gap-0.5 hover:text-foreground ${
@@ -338,7 +389,13 @@ function SortableTh({
  * Ценовой индекс: <100 клиент дешевле рынка (зелёный, хорошо), >100 дороже
  * (красный), ≈100 паритет (muted). Полоса ±0.5 вокруг 100 = паритет.
  */
-function IndexBadge({ index, t }: { index: number; t: ReturnType<typeof useTranslations> }) {
+function IndexBadge({
+  index,
+  t,
+}: {
+  index: number;
+  t: ReturnType<typeof useTranslations>;
+}) {
   const cheaper = index < 99.5;
   const pricier = index > 100.5;
   const color = cheaper
@@ -346,16 +403,29 @@ function IndexBadge({ index, t }: { index: number; t: ReturnType<typeof useTrans
     : pricier
       ? "text-destructive"
       : "text-muted-foreground";
-  const title = cheaper ? t("index_cheaper") : pricier ? t("index_pricier") : t("index_parity");
+  const title = cheaper
+    ? t("index_cheaper")
+    : pricier
+      ? t("index_pricier")
+      : t("index_parity");
   return (
-    <span className={`inline-flex items-center gap-0.5 tabular-nums font-medium ${color}`} title={title}>
+    <span
+      className={`inline-flex items-center gap-0.5 tabular-nums font-medium ${color}`}
+      title={title}
+    >
       {cheaper ? "▼" : pricier ? "▲" : "•"}
       {index.toFixed(1)}
     </span>
   );
 }
 
-function CategoryCard({ row, onClick }: { row: CategoryComparisonRow; onClick: () => void }) {
+function CategoryCard({
+  row,
+  onClick,
+}: {
+  row: CategoryComparisonRow;
+  onClick: () => void;
+}) {
   const t = useTranslations("category_comparison");
   const locale = useLocale();
   return (
@@ -369,18 +439,27 @@ function CategoryCard({ row, onClick }: { row: CategoryComparisonRow; onClick: (
         <IndexBadge index={row.index} t={t} />
       </div>
       <div className="text-xs text-muted-foreground mt-1">
-        {t("card_skus", { count: row.matched_skus })} · {t("card_cheaper", { pct: row.cheaper_pct.toFixed(0) })}
+        {t("card_skus", { count: row.matched_skus })} ·{" "}
+        {t("card_cheaper", { pct: row.cheaper_pct.toFixed(0) })}
       </div>
       <div className="grid grid-cols-3 gap-2 mt-2 text-center">
         <div>
-          <div className="text-[10px] text-muted-foreground uppercase">pharmonline</div>
-          <div className="tabular-nums text-sm">{formatPrice(row.avg_client_price, locale)}</div>
+          <div className="text-[10px] text-muted-foreground uppercase">
+            pharmonline
+          </div>
+          <div className="tabular-nums text-sm">
+            {formatPrice(row.avg_client_price, locale)}
+          </div>
         </div>
         {COMPETITORS.map((s) => (
           <div key={s}>
-            <div className="text-[10px] text-muted-foreground uppercase">{s}</div>
+            <div className="text-[10px] text-muted-foreground uppercase">
+              {s}
+            </div>
             <div className="tabular-nums text-sm">
-              {row.per_site_avg[s] != null ? formatPrice(row.per_site_avg[s], locale) : "—"}
+              {row.per_site_avg[s] != null
+                ? formatPrice(row.per_site_avg[s], locale)
+                : "—"}
             </div>
           </div>
         ))}

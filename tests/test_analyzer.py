@@ -21,7 +21,14 @@ def _add_product(s, site: str, name: str, ext_id: str, canonical_id=None):
 
 
 def _add_run(s, started_at, status="ok") -> storage.Run:
-    r = storage.Run(started_at=started_at, status=status, finished_at=started_at)
+    r = storage.Run(
+        started_at=started_at,
+        status=status,
+        finished_at=started_at,
+        catalog_scope="full" if status == "ok" else "unknown",
+        full_catalog_sites="pharmonline,aptekonline,aloe" if status == "ok" else None,
+        catalog_verified=status == "ok",
+    )
     s.add(r)
     s.flush()
     return r
@@ -29,9 +36,14 @@ def _add_run(s, started_at, status="ok") -> storage.Run:
 
 def _mark_financially_eligible(run, *sites):
     run.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": True,
         "financially_eligible": True,
         "sites": {site: {"status": "ok"} for site in sites},
     }
+    run.catalog_scope = "full"
+    run.full_catalog_sites = ",".join(sites)
+    run.catalog_verified = True
 
 
 def _add_snapshot(s, run, product, price, discount_price=None, is_on_sale=False):
@@ -157,6 +169,43 @@ def test_undercut_detected(db_session):
     assert u.client_price == 100.0
     assert u.competitor_price == 80.0
     assert u.diff_pct == 20.0
+
+
+def test_undercut_excludes_country_conflict_and_out_of_stock(db_session):
+    """Financial reports never compare a different-country SKU or inactive offer."""
+    conflict = storage.Match(canonical_name="Country conflict", confidence=1.0)
+    oos_match = storage.Match(canonical_name="OOS competitor", confidence=1.0)
+    db_session.add_all([conflict, oos_match])
+    db_session.flush()
+    conflict_client = _add_product(
+        db_session, "pharmonline", "Ornafer", "ph-country", canonical_id=conflict.id
+    )
+    conflict_comp = _add_product(
+        db_session, "aloe", "Ornafer", "al-country", canonical_id=conflict.id
+    )
+    conflict_client.manufacturer_country_code = "lv"
+    conflict_comp.manufacturer_country_code = "gb"
+    conflict_client.country_resolution_status = "resolved"
+    conflict_comp.country_resolution_status = "resolved"
+    oos_client = _add_product(
+        db_session, "pharmonline", "Tetracycline", "ph-oos", canonical_id=oos_match.id
+    )
+    oos_comp = _add_product(
+        db_session, "aptekonline", "Tetracycline", "ap-oos", canonical_id=oos_match.id
+    )
+    oos_comp.offer_availability_status = "out_of_stock"
+    oos_comp.availability_observed_at = utcnow()
+    run = _add_run(db_session, utcnow())
+    for product, price in (
+        (conflict_client, 100.0),
+        (conflict_comp, 80.0),
+        (oos_client, 100.0),
+        (oos_comp, 70.0),
+    ):
+        _add_snapshot(db_session, run, product, price)
+    db_session.commit()
+
+    assert analyzer.analyze(db_session, run.id).undercuts == []
 
 
 def test_diff_only_detects_change_across_skip_run(db_session):

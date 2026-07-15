@@ -7,6 +7,7 @@ from datetime import timedelta
 from src._time import utcnow
 
 from src import roi, storage
+from src.product_policy import policy_fingerprint, trusted_catalog_epoch
 from src.storage import Match, PriceSnapshot, Product, Promo, Run
 
 
@@ -45,6 +46,9 @@ def _make_run(s, products_with_prices: list[tuple[Product, float]]) -> Run:
         finished_at=now,
         status="ok",
         run_quality=_eligible_quality(),
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
     )
     s.add(r)
     s.flush()
@@ -82,10 +86,19 @@ def _shared_run(s) -> Run:
         finished_at=now,
         status="ok",
         run_quality=_eligible_quality(),
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
     )
     s.add(r)
     s.flush()
     return r
+
+
+def _trusted_epoch(s) -> str:
+    epoch = trusted_catalog_epoch(s)
+    assert epoch is not None
+    return epoch
 
 
 def test_price_raise_when_client_cheaper(db_session):
@@ -168,6 +181,9 @@ def test_promo_response_action(db_session):
         started_at=now,
         finished_at=now,
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
         run_quality=_eligible_quality(),
     )
     db_session.add(run)
@@ -194,6 +210,9 @@ def test_promo_responses_use_latest_verified_run_per_competitor_site(db_session)
         started_at=now,
         finished_at=now,
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="aptekonline",
+        catalog_verified=True,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": True,
@@ -205,6 +224,9 @@ def test_promo_responses_use_latest_verified_run_per_competitor_site(db_session)
         started_at=now,
         finished_at=now,
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=True,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": True,
@@ -216,6 +238,9 @@ def test_promo_responses_use_latest_verified_run_per_competitor_site(db_session)
         started_at=now,
         finished_at=now,
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline",
+        catalog_verified=True,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": True,
@@ -393,6 +418,8 @@ def test_get_cached_actions_returns_none_when_stale(db_session):
             payload=[{"type": "price_raise", "severity": "info", "title": "test"}],
             computed_at=utcnow() - timedelta(hours=48),
             run_id=eligible_run.id,
+            policy_fingerprint=policy_fingerprint(),
+            trust_epoch=_trusted_epoch(db_session),
         )
     )
     db_session.commit()
@@ -415,6 +442,8 @@ def test_roi_cache_rejected_after_newer_degraded_full_attempt(db_session):
             payload=[{"type": "price_raise", "severity": "info", "title": "trusted"}],
             computed_at=utcnow(),
             run_id=cached_run.id,
+            policy_fingerprint=policy_fingerprint(),
+            trust_epoch=_trusted_epoch(db_session),
         )
     )
     db_session.commit()
@@ -426,6 +455,9 @@ def test_roi_cache_rejected_after_newer_degraded_full_attempt(db_session):
             started_at=utcnow() - timedelta(minutes=30),
             finished_at=utcnow(),
             status="degraded",
+            catalog_scope="full",
+            full_catalog_sites="pharmonline,aptekonline,aloe",
+            catalog_verified=False,
             run_quality={
                 "baseline_enforced": True,
                 "full_catalog_verified": False,
@@ -450,6 +482,9 @@ def test_per_site_attempt_chain_stays_closed_until_failed_site_recovers(db_sessi
         started_at=utcnow() - timedelta(hours=2),
         finished_at=utcnow() - timedelta(hours=2),
         status="degraded",
+        catalog_scope="full",
+        full_catalog_sites="aptekonline",
+        catalog_verified=False,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": False,
@@ -462,6 +497,9 @@ def test_per_site_attempt_chain_stays_closed_until_failed_site_recovers(db_sessi
         started_at=utcnow() - timedelta(hours=1),
         finished_at=utcnow() - timedelta(hours=1),
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=True,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": True,
@@ -479,6 +517,9 @@ def test_per_site_attempt_chain_stays_closed_until_failed_site_recovers(db_sessi
         started_at=utcnow(),
         finished_at=utcnow(),
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="aptekonline",
+        catalog_verified=True,
         run_quality={
             "baseline_enforced": True,
             "full_catalog_verified": True,
@@ -506,6 +547,8 @@ def test_roi_cache_tie_breaks_equal_completion_by_run_id(db_session):
             payload=[],
             computed_at=completed_at,
             run_id=cached_run.id,
+            policy_fingerprint=policy_fingerprint(),
+            trust_epoch=_trusted_epoch(db_session),
         )
     )
     db_session.flush()
@@ -515,6 +558,9 @@ def test_roi_cache_tie_breaks_equal_completion_by_run_id(db_session):
             started_at=completed_at - timedelta(minutes=30),
             finished_at=completed_at,
             status="degraded",
+            catalog_scope="full",
+            full_catalog_sites="aptekonline",
+            catalog_verified=False,
             run_quality={
                 "baseline_enforced": True,
                 "full_catalog_verified": False,
@@ -528,7 +574,7 @@ def test_roi_cache_tie_breaks_equal_completion_by_run_id(db_session):
     assert roi.get_cached_actions(db_session, "pharmonline") is None
 
 
-def test_roi_cache_ignores_new_full_attempt_until_post_processing_finishes(db_session):
+def test_roi_cache_fails_closed_during_new_full_attempt_until_refresh(db_session):
     from src.storage import RoiActionsCache
 
     completed_at = utcnow() - timedelta(hours=1)
@@ -542,21 +588,27 @@ def test_roi_cache_ignores_new_full_attempt_until_post_processing_finishes(db_se
             payload=[{"type": "price_raise", "title": "trusted"}],
             computed_at=utcnow(),
             run_id=cached_run.id,
+            policy_fingerprint=policy_fingerprint(),
+            trust_epoch=_trusted_epoch(db_session),
         )
     )
     post_processing = Run(
         tenant_id=1,
         started_at=utcnow(),
         finished_at=None,
-        status="ok",
+        status="running",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
         run_quality=_eligible_quality(),
     )
     db_session.add(post_processing)
     db_session.commit()
 
     assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is True
-    assert roi.get_cached_actions(db_session, "pharmonline") is not None
+    assert roi.get_cached_actions(db_session, "pharmonline") is None
 
+    post_processing.status = "ok"
     post_processing.finished_at = utcnow()
     db_session.commit()
 
@@ -579,6 +631,9 @@ def test_direct_compute_fails_closed_after_degraded_full_attempt(db_session):
             started_at=degraded_at,
             finished_at=degraded_at,
             status="degraded",
+            catalog_scope="full",
+            full_catalog_sites="pharmonline,aptekonline,aloe",
+            catalog_verified=False,
             run_quality={
                 "baseline_enforced": True,
                 "full_catalog_verified": False,
@@ -699,9 +754,10 @@ def test_cache_actions_upserts_existing(db_session):
     actions = roi.compute_actions(db_session, client_site="pharmonline")
 
     first_run = _shared_run(db_session)
-    second_run = _shared_run(db_session)
     db_session.commit()
     roi.cache_actions(db_session, "pharmonline", actions, run_id=first_run.id)
+    second_run = _shared_run(db_session)
+    db_session.commit()
     roi.cache_actions(db_session, "pharmonline", actions, run_id=second_run.id)
 
     rows = db_session.query(RoiActionsCache).filter_by(client_site="pharmonline").all()
@@ -748,6 +804,9 @@ def test_roi_cache_rejects_eligible_run_from_another_tenant(db_session):
         tenant_id=2,
         started_at=utcnow(),
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
         run_quality=_eligible_quality(),
     )
     db_session.add(run)
@@ -763,7 +822,12 @@ def test_roi_cache_waits_until_every_site_has_verified_full_scan(db_session):
     run = Run(
         started_at=utcnow(),
         status="ok",
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=True,
         run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
             "financially_eligible": True,
             "sites": {"aloe": {"status": "ok"}},
         },
@@ -795,6 +859,10 @@ def test_roi_cache_rejects_stale_verified_site_inputs(db_session):
     run = Run(
         started_at=utcnow() - timedelta(hours=27),
         status="ok",
+        finished_at=utcnow() - timedelta(hours=27),
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
         run_quality=_eligible_quality(),
     )
     db_session.add(run)

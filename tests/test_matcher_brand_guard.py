@@ -11,9 +11,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from src.matcher import (
+    _doses_mg_from_url,
     _has_conflicting_brand,
     _has_conflicting_dose,
-    _has_conflicting_identity_country,
     _has_conflicting_ingredient_codes,
     _has_conflicting_origin_or_grade,
     _has_conflicting_pack_volume,
@@ -240,6 +240,20 @@ class TestBrandGuard:
         # mcg vs mg equivalence (1000 mcg == 1 mg) → no conflict
         assert _has_conflicting_dose(_p("X 1000 mcg", None), _p("X 1 mg", None)) is False
 
+    def test_dose_uses_safe_url_fallback_when_title_omits_strength(self):
+        title_poor = _p(
+            "Risek İnsta N10 (toz)",
+            None,
+            "https://www.aptekonline.az/product/risek-40mg-n10",
+        )
+        assert _doses_mg_from_url(title_poor.url) == frozenset({40.0})
+        assert _has_conflicting_dose(title_poor, _p("Risek Insta 20 mq № 10", None)) is True
+        assert _has_conflicting_dose(title_poor, _p("Risek Insta 40 mq № 10", None)) is False
+
+    def test_url_dose_fallback_rejects_ambiguous_slug_encodings(self):
+        assert _doses_mg_from_url("https://example.test/product/foo-7-5mg-n10") == frozenset()
+        assert _doses_mg_from_url("https://example.test/product/foo-5mg125mg10mg") == frozenset()
+
     def test_non_commodity_different_brands_no_conflict(self):
         # commodity gate: a trade-name drug with different brand strings must NOT
         # fire — aloe/pharmonline spell the same manufacturer differently
@@ -253,18 +267,18 @@ class TestBrandGuard:
 
 
 class TestStrictCommodityOrigin:
-    """Client policy 2026-05-31 «только идентичные товары»: COMMODITY differing in
-    country-of-origin OR grade (cosmetic) is NOT the same product — unless a shared
-    consumer brand confirms identity. Drugs (non-commodity) are unaffected."""
+    """Country is strict for every SKU; grade remains commodity-specific."""
 
     @staticmethod
-    def _pc(name, brand_verified=None, manufacturer=None, url=""):
+    def _pc(name, brand_verified=None, manufacturer=None, url="", country_code=None):
         return SimpleNamespace(
             name=name,
             name_normalized=name.lower(),
             brand_verified=brand_verified,
             manufacturer=manufacturer,
             url=url,
+            manufacturer_country_code=country_code,
+            country_resolution_status="resolved" if country_code else "unknown",
         )
 
     def test_diff_country_no_brand_conflicts(self):
@@ -293,13 +307,17 @@ class TestStrictCommodityOrigin:
         b = self._pc("Gənəgərçək yağı 30 ml", manufacturer="AZERBAYCAN")
         assert _has_conflicting_origin_or_grade(a, b) is False
 
-    def test_non_commodity_drug_diff_country_no_conflict(self):
-        # trade-name drug made in different plants is the SAME drug → commodity gate off
-        a = self._pc("Konkor 5 mg N30", "Merck", manufacturer="ALMANİYA")
-        b = self._pc("Konkor 5 mg N30", "Merck", manufacturer="FRANSA")
-        assert _has_conflicting_identity_country(a, b) is False
+    def test_non_commodity_drug_diff_country_conflicts_under_new_policy(self):
+        # Client policy 2026-07-13 supersedes the old trade-name exception.
+        a = self._pc(
+            "Konkor 5 mg N30", "Merck", manufacturer="ALMANİYA", country_code="de"
+        )
+        b = self._pc(
+            "Konkor 5 mg N30", "Merck", manufacturer="FRANSA", country_code="fr"
+        )
         assert _has_conflicting_origin_or_grade(a, b) is False
-        assert _hard_conflict(a, b) is False
+        assert _hard_conflict(a, b) is True
+        assert _pairwise_spec_conflict(a, b) is True
 
 
 class TestUltraEqual:

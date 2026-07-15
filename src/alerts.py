@@ -146,6 +146,10 @@ def _detect_price_drop(session: Session, run_id: int, params: dict) -> list[Cand
         if drop_pct < min_pct:
             continue
         product = snap.product
+        from src.product_policy import policy_offer_eligibility
+
+        if not policy_offer_eligibility(product).eligible:
+            continue
         if site_filter and product.site != site_filter:
             continue
         sev = "warning" if drop_pct < 20 else "critical"
@@ -193,6 +197,10 @@ def _detect_new_product(session: Session, run_id: int, params: dict) -> list[Can
         if snap.product_id in prev_by_product:
             continue
         product = snap.product
+        from src.product_policy import policy_offer_eligibility
+
+        if not policy_offer_eligibility(product).eligible:
+            continue
         if site_filter and product.site != site_filter:
             continue
         out.append(
@@ -400,6 +408,17 @@ def evaluate_rules(
         )
         return []
 
+    current_run = session.get(Run, run_id)
+    from src.product_policy import policy_rollout_eligibility
+
+    rollout = policy_rollout_eligibility(
+        session,
+        tenant_id=current_run.tenant_id if current_run is not None else 1,
+    )
+    if not rollout.eligible:
+        log.warning("alerts_policy_gate_closed", run_id=run_id, reason=rollout.reason)
+        return []
+
     stmt = select(AlertRule).where(AlertRule.is_active.is_(True))
     if rule_ids:
         stmt = stmt.where(AlertRule.id.in_(rule_ids))
@@ -509,6 +528,10 @@ def _prices_for_match(
     цена», что и нужно для realtime undercut alerts.
     """
     out: dict[str, float | None] = {CLIENT_SITE: None, "aptekonline": None, "aloe": None}
+    from src.product_policy import policy_identity_eligibility, policy_offer_eligibility
+
+    if not policy_identity_eligibility(list(match.products)).eligible:
+        return out
     if snapshots_cache is None:
         snaps = _financial_snapshots_for_matches(
             session,
@@ -519,6 +542,8 @@ def _prices_for_match(
     else:
         snaps = snapshots_cache
     for p in match.products:
+        if not policy_offer_eligibility(p).eligible:
+            continue
         snap = snaps.get(p.id)
         if snap is None:
             continue

@@ -303,8 +303,10 @@ def add_tracked_product(
     pharmonline_url: str | None = None,
     aptekonline_url: str | None = None,
     aloe_url: str | None = None,
+    tenant_id: int = 1,
 ) -> TrackedProduct:
     tp = TrackedProduct(
+        tenant_id=tenant_id,
         canonical_name=canonical_name.strip(),
         brand=brand.strip() if brand else None,
         dosage=dosage.strip() if dosage else None,
@@ -337,8 +339,15 @@ def add_tracked_product(
     return tp
 
 
-def list_tracked(session: Session, active_only: bool = True) -> list[TrackedProduct]:
+def list_tracked(
+    session: Session,
+    active_only: bool = True,
+    *,
+    tenant_id: int | None = None,
+) -> list[TrackedProduct]:
     stmt = select(TrackedProduct).order_by(TrackedProduct.canonical_name)
+    if tenant_id is not None:
+        stmt = stmt.where(TrackedProduct.tenant_id == tenant_id)
     if active_only:
         stmt = stmt.where(TrackedProduct.is_active.is_(True))
     return list(session.scalars(stmt).all())

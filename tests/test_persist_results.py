@@ -450,3 +450,55 @@ def test_persist_keeps_existing_url_when_scraper_returns_empty(db_session):
     products = db_session.scalars(select(storage.Product)).all()
     assert len(products) == 1
     assert products[0].url == "https://aloe.az/p/good-url", "пустой url не должен стирать good URL"
+
+
+def test_persist_missing_or_unknown_offer_never_becomes_out_of_stock(db_session):
+    """Absence is not evidence: only an explicit zero may mark website OOS."""
+    run1 = storage.Run(status="running")
+    db_session.add(run1)
+    db_session.commit()
+    known = ScrapedProduct(
+        site="aloe",
+        external_id="STOCK-1",
+        url="https://aloe.az/stock-1",
+        name="Stocked",
+        price=10.0,
+        manufacturer_country_raw="Serbia",
+        country_source="detail",
+        offer_availability_status="in_stock",
+        offer_quantity=4,
+        availability_source="quantity",
+    )
+    persist_results(db_session, run1, [ScrapeResult(site="aloe", products=[known])])
+
+    # A later full result that simply does not contain the product must not
+    # infer OOS. A later explicit "unknown" observation must not erase it.
+    run2 = storage.Run(status="running")
+    db_session.add(run2)
+    db_session.commit()
+    persist_results(db_session, run2, [ScrapeResult(site="aloe", products=[])])
+
+    run3 = storage.Run(status="running")
+    db_session.add(run3)
+    db_session.commit()
+    unknown = ScrapedProduct(
+        site="aloe",
+        external_id="STOCK-1",
+        url="https://aloe.az/stock-1",
+        name="Stocked",
+        price=10.0,
+    )
+    persist_results(db_session, run3, [ScrapeResult(site="aloe", products=[unknown])])
+
+    product = db_session.scalar(
+        select(storage.Product).where(storage.Product.external_id == "STOCK-1")
+    )
+    assert product is not None
+    assert product.offer_availability_status == "in_stock"
+    assert product.offer_quantity == 4
+    observations = db_session.scalars(
+        select(storage.OfferObservation)
+        .where(storage.OfferObservation.product_id == product.id)
+        .order_by(storage.OfferObservation.run_id)
+    ).all()
+    assert [row.availability_status for row in observations] == ["in_stock", "unknown"]

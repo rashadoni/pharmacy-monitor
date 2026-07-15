@@ -22,6 +22,7 @@ function event(partial: Partial<AlertEvent>): AlertEvent {
     title: "Raw title",
     detail: null,
     payload: null,
+    destination_url: null,
     site: null,
     created_at: "2026-07-12T00:00:00Z",
     is_read: false,

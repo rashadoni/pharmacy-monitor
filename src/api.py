@@ -58,6 +58,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
+from urllib.parse import urlsplit
 
 import structlog
 from fastapi import (
@@ -81,6 +82,7 @@ from src import analytics
 from src import inventory as inv_mod
 from src import storage, tenants
 from src._time import utcnow
+from src.category_taxonomy import classify_source_category, source_category_labels
 from src.normalize import pack_unit_count
 
 log = structlog.get_logger()
@@ -416,6 +418,7 @@ class HealthOut(BaseModel):
     full_catalog_run_at: datetime | None = None
     full_catalog_status: str | None = None
     full_catalog_verified: bool = False
+    product_policy: dict[str, Any] = Field(default_factory=dict)
 
 
 class RoiStatusOut(BaseModel):
@@ -695,6 +698,11 @@ def _health_snapshot(db: Session) -> HealthOut:
     status_label = (
         "degraded" if (stale or db_ms is None or run_unhealthy or full_unhealthy) else "up"
     )
+    from src.product_policy import full_catalog_trust_report
+
+    policy_report = full_catalog_trust_report(db)
+    if not policy_report["policy_ready"]:
+        status_label = "degraded"
     return HealthOut(
         status=status_label,
         last_run_at=last.started_at if last else None,
@@ -706,6 +714,7 @@ def _health_snapshot(db: Session) -> HealthOut:
         full_catalog_run_at=full_completed_at,
         full_catalog_status=full_status,
         full_catalog_verified=full_verified,
+        product_policy=policy_report,
     )
 
 
@@ -823,6 +832,21 @@ def dash_system_status(
             },
         },
     }
+
+
+def _require_financial_policy_ready(db: Session, *, tenant_id: int = 1) -> None:
+    """Return an explicit 503 instead of serving untrusted financial output."""
+    from src.product_policy import policy_rollout_eligibility
+
+    eligibility = policy_rollout_eligibility(db, tenant_id=tenant_id)
+    if not eligibility.eligible:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": eligibility.reason,
+                "message": "Financial comparisons are paused until a trusted full catalog is ready.",
+            },
+        )
 
 
 # ─── Auth endpoints (frontend) ───────────────────────────────────────────────
@@ -2058,6 +2082,7 @@ def dash_comparison(
     ложный гигантский spread в топе. is_manual=True матчи (подтверждены
     человеком) показываются всегда, независимо от confidence.
     """
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
     last_run = db.scalar(
         select(storage.Run.id)
         .where(storage.Run.status == "ok", storage.Run.tenant_id == user.tenant_id)
@@ -2091,16 +2116,60 @@ def dash_comparison(
     # после diff-only persist'а (2026-05-09) прошлая логика `WHERE run_id ==
     # last_run` пропускала продукты без price-changes в last_run.
     all_pids = [p.id for m in matches for p in m.products]
-    snaps_by_pid = storage.latest_snapshots_per_product(db, all_pids)
+    # Rollout starts in shadow mode.  Until the first financially-eligible full
+    # catalog exists there is no trusted snapshot lineage to select, and an
+    # unconditional lineage filter would turn a healthy comparison catalog into
+    # an empty 200 response.  In that bootstrap state only, shadow mode serves
+    # the latest snapshots while the hard product gates below still exclude
+    # known country conflicts, dead URLs and explicit out-of-stock offers.
+    # Enforce mode cannot reach this point without a trusted catalog because
+    # `_require_financial_policy_ready` fails closed with 503.
+    trusted_lineage_available = bool(
+        storage.financially_eligible_run_ids(db, tenant_id=user.tenant_id)
+    )
+    snaps_by_pid = storage.latest_snapshots_per_product(
+        db,
+        all_pids,
+        financially_eligible_only=trusted_lineage_available,
+        tenant_id=user.tenant_id,
+    )
 
     now = utcnow()  # naive UTC; last_seen_at тоже naive (src/_time) — вычитание ок
+    # Ярлыки тянем ОДИН раз до цикла: source_category_labels сканирует Category
+    # целиком, внутри цикла это был бы скан на каждый матч.
+    source_labels = source_category_labels(db) if category is not None else {}
+    # И мемоизируем классификацию по категории-источнику: order-independent
+    # классификатор прогоняет ВСЕ ~200 правил (в этом и смысл), поэтому вызов
+    # на каждый матч — это ~200 правил × ~5k матчей регэкспов на запрос вместо
+    # ~200 × ~178 категорий. Тот же приём, что в analytics.category_comparison.
+    _canonical_cache: dict[str, str | None] = {}
+
+    def _canonical_key_for(raw_category: str | None) -> str | None:
+        cache_key = raw_category or ""
+        if cache_key not in _canonical_cache:
+            label_ru, label_az = source_labels.get(("pharmonline", cache_key), (None, None))
+            resolved = classify_source_category(
+                "pharmonline", raw_category, label_ru=label_ru, label_az=label_az
+            )
+            _canonical_cache[cache_key] = resolved.key if resolved else None
+        return _canonical_cache[cache_key]
     out: list[ComparisonRowOut] = []
     for m in matches:
+        from src.product_policy import policy_identity_eligibility
+
+        if not policy_identity_eligibility(list(m.products)).eligible:
+            continue
         # Drill-down из /category-comparison: фильтр по категории товара-клиента
         # (pharmonline). None → без фильтра (обычный режим страницы сравнения).
         if category is not None:
             client_p = next((p for p in m.products if p.site == "pharmonline"), None)
-            if client_p is None or client_p.category != category:
+            if client_p is None:
+                continue
+            # Классифицируем ровно так же, как сводка /category-comparison —
+            # со слагом И ярлыками. Классификация только по слагу расходилась бы
+            # со сводкой: строка есть в сводке, а drill-down пуст.
+            canonical_key = _canonical_key_for(client_p.category)
+            if client_p.category != category and canonical_key != category:
                 continue
         # Confidence floor: низко-достоверные fuzzy-матчи (Bio Kolik ↔ Bio sprey)
         # дают ложный spread. Ручные (is_manual) показываем всегда.
@@ -2118,6 +2187,10 @@ def dash_comparison(
             # чтобы не показывать матч с мёртвой ссылкой на конкурента.
             if p.url_dead_at is not None:
                 continue
+            from src.product_policy import policy_offer_eligibility
+
+            if not policy_offer_eligibility(p, now=now).eligible:
+                continue
             snap = snaps_by_pid.get(p.id)
             price = (snap.discount_price or snap.price) if snap else None
             if price is not None and price > 0:
@@ -2130,6 +2203,10 @@ def dash_comparison(
                     "is_on_sale": snap.is_on_sale if snap else False,
                     "url": p.url,
                     "product_id": p.id,
+                    "country_code": p.manufacturer_country_code,
+                    "country_resolution_status": p.country_resolution_status,
+                    "availability_status": p.offer_availability_status,
+                    "availability_observed_at": p.availability_observed_at,
                     # pack_size + name нужны для per-unit нормализации (ниже)
                     "pack_size": p.pack_size,
                     "name": p.name,
@@ -2266,6 +2343,7 @@ def dash_roi_actions(
     from src import roi
 
     _require_site(client_site)
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
     locale = _normalize_locale(locale)
 
     cached = roi.get_cached_actions(db, client_site, tenant_id=user.tenant_id)
@@ -2381,7 +2459,7 @@ def dash_alerts(
             (storage.AlertEvent.snoozed_until.is_(None)) | (storage.AlertEvent.snoozed_until <= now)
         )
     events = db.scalars(stmt).all()
-    return [_alert_event_out(event) for event in events]
+    return _alert_events_out(events, db)
 
 
 _ALERT_GENERAL_SITE = "general"
@@ -2396,7 +2474,90 @@ def _alert_site_from_payload(payload: dict | None) -> str | None:
     return site if site in _VALID_SITES else None
 
 
-def _alert_event_out(event: storage.AlertEvent) -> dict:
+def _safe_alert_destination(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    try:
+        parsed = urlsplit(candidate)
+    except (ValueError, UnicodeError):
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return candidate
+
+
+def _alert_events_out(events: list[storage.AlertEvent], db: Session) -> list[dict]:
+    """Serialize alerts with one batched, tenant-safe external destination lookup."""
+    product_ids: set[int] = set()
+    match_ids: set[int] = set()
+    tenant_ids = {event.tenant_id for event in events}
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if isinstance(payload.get("product_id"), int):
+            product_ids.add(payload["product_id"])
+        if isinstance(payload.get("match_id"), int):
+            match_ids.add(payload["match_id"])
+
+    direct: dict[tuple[int, int], str] = {}
+    if product_ids:
+        products = db.scalars(
+            select(storage.Product)
+            .where(
+                storage.Product.id.in_(product_ids),
+                storage.Product.tenant_id.in_(tenant_ids),
+                storage.Product.url_dead_at.is_(None),
+            )
+            .order_by(storage.Product.id)
+        ).all()
+        for product in products:
+            url = _safe_alert_destination(product.url)
+            if url:
+                direct[(product.tenant_id, product.id)] = url
+
+    by_match_site: dict[tuple[int, int, str], str] = {}
+    if match_ids:
+        products = db.scalars(
+            select(storage.Product)
+            .where(
+                storage.Product.canonical_id.in_(match_ids),
+                storage.Product.tenant_id.in_(tenant_ids),
+                storage.Product.url_dead_at.is_(None),
+            )
+            .order_by(storage.Product.id)
+        ).all()
+        for product in products:
+            url = _safe_alert_destination(product.url)
+            if url and product.canonical_id is not None:
+                by_match_site.setdefault(
+                    (product.tenant_id, product.canonical_id, product.site), url
+                )
+
+    rows = []
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        destination = _safe_alert_destination(payload.get("url"))
+        product_id = payload.get("product_id")
+        match_id = payload.get("match_id")
+        if destination is None and isinstance(product_id, int):
+            destination = direct.get((event.tenant_id, product_id))
+        if destination is None and isinstance(match_id, int):
+            site = payload.get("site")
+            if site not in _VALID_SITES:
+                site = "pharmonline"
+            destination = by_match_site.get((event.tenant_id, match_id, site))
+        rows.append(_alert_event_out(event, destination_url=destination))
+    return rows
+
+
+def _alert_event_out(
+    event: storage.AlertEvent, *, destination_url: str | None = None
+) -> dict:
     return {
         "id": event.id,
         "rule_type": event.rule_type,
@@ -2404,6 +2565,7 @@ def _alert_event_out(event: storage.AlertEvent) -> dict:
         "title": event.title,
         "detail": event.detail,
         "payload": event.payload,
+        "destination_url": destination_url,
         "site": _alert_site_from_payload(event.payload),
         "created_at": event.created_at.isoformat(),
         "is_read": bool(event.is_read),
@@ -2521,7 +2683,7 @@ def dash_alerts_page(
     ).all()
 
     return {
-        "items": [_alert_event_out(event) for event in events],
+        "items": _alert_events_out(events, db),
         "total": int(total),
         "limit": limit,
         "offset": offset,
@@ -2853,10 +3015,16 @@ def dash_category_comparison(
     from src import analytics
 
     _require_site(client_site)
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
     if locale not in ("ru", "az", "en"):
         locale = "ru"
 
-    rows = analytics.category_comparison(db, client_site=client_site, tenant_id=user.tenant_id)
+    rows = analytics.category_comparison(
+        db,
+        client_site=client_site,
+        tenant_id=user.tenant_id,
+        canonical=True,
+    )
     resolved_labels = [
         _localized_category_label(
             label_ru=r.label_ru,
@@ -3135,7 +3303,8 @@ def dash_forecast_movers(
 ):
     from src import forecast
 
-    movers = forecast.top_movers(db, limit=limit)
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
+    movers = forecast.top_movers(db, limit=limit, tenant_id=user.tenant_id)
     return movers
 
 
@@ -4174,6 +4343,28 @@ def dash_match_suggestions(
     return out[: max(1, min(limit, 200))]
 
 
+def _require_match_policy(products: list[storage.Product]) -> None:
+    """Fail closed for known country conflicts and explicit website OOS."""
+    from src.product_policy import (
+        OFFER_OUT_OF_STOCK,
+        availability_policy_enforced,
+        country_policy_enforced,
+        current_offer_eligibility,
+        identity_eligibility,
+    )
+
+    identity = identity_eligibility(products)
+    if identity.reason == "country_conflict":
+        raise HTTPException(409, "Products have different manufacturing countries")
+    if country_policy_enforced() and not identity.eligible:
+        raise HTTPException(409, "Manufacturing country is not verified for every product")
+    for product in products:
+        if product.offer_availability_status == OFFER_OUT_OF_STOCK:
+            raise HTTPException(409, f"Product {product.id} is out of stock on {product.site}")
+        if availability_policy_enforced() and not current_offer_eligibility(product).eligible:
+            raise HTTPException(409, f"Product {product.id} has no fresh active offer")
+
+
 @app.post("/api/v1/dash/matches/{match_id}/confirm", status_code=204)
 def dash_match_confirm(
     match_id: int,
@@ -4191,6 +4382,7 @@ def dash_match_confirm(
     )
     if not match:
         raise HTTPException(404, "Match not found")
+    _require_match_policy(list(match.products))
     if not match.is_manual:
         match.is_manual = True
         # Clear needs_review since user just resolved it.
@@ -4299,6 +4491,8 @@ def dash_match_relink(
             409,
             f"Этот товар уже в другом сравнении (#{prod.canonical_id}) — сначала отклоните его там",
         )
+
+    _require_match_policy([p for p in match.products if p.site != site] + [prod])
 
     ok = match_actions.swap_alternative(db, match_id, site, prod.id)
     if not ok:
@@ -4939,6 +5133,7 @@ def dash_match_candidate_analogs(
             storage.Product.tenant_id == user.tenant_id,
             storage.Product.canonical_id.is_(None),
             storage.Product.url_dead_at.is_(None),
+            storage.Product.offer_availability_status != "out_of_stock",
             or_(*conds),
         )
         .limit(500)
@@ -5081,6 +5276,8 @@ def dash_match_add_product(
     if product.site in existing_sites:
         raise HTTPException(409, f"Match already has a product from {product.site}")
 
+    _require_match_policy(list(match.products) + [product])
+
     product.canonical_id = match.id
     match.is_manual = True
     match.match_strategy = "manual"
@@ -5139,6 +5336,8 @@ def dash_match_create_with_products(
     sites = [p.site for p in products]
     if len(set(sites)) != len(sites):
         raise HTTPException(409, "Products must come from distinct sites")
+
+    _require_match_policy(products)
 
     first = products[0]
     match = storage.Match(
@@ -5502,6 +5701,14 @@ def products_list(
 
 @app.get("/api/v1/comparisons", dependencies=[Depends(require_api_key)])
 def comparisons(db: Session = Depends(get_db)):
+    _require_financial_policy_ready(db)
+    # Keep the API-key endpoint aligned with the dashboard during a shadow
+    # rollout: before the first trusted full-catalog Run exists, serve the
+    # latest snapshots while identity/availability guards still filter unsafe
+    # offers. Enforce mode remains fail-closed above.
+    trusted_lineage_available = bool(
+        storage.financially_eligible_run_ids(db, tenant_id=1)
+    )
     last_run = db.scalar(
         select(storage.Run.id)
         .where(storage.Run.status == "ok")
@@ -5510,14 +5717,27 @@ def comparisons(db: Session = Depends(get_db)):
     )
     if not last_run:
         return []
-    matches = db.scalars(select(storage.Match)).all()
+    matches = db.scalars(select(storage.Match).where(storage.Match.tenant_id == 1)).all()
     # Diff-only-aware: латест на product_id, не последний run (см. /dash/comparison).
     all_pids = [p.id for m in matches for p in m.products]
-    snaps_by_pid = storage.latest_snapshots_per_product(db, all_pids)
+    snaps_by_pid = storage.latest_snapshots_per_product(
+        db,
+        all_pids,
+        financially_eligible_only=trusted_lineage_available,
+        tenant_id=1,
+    )
     out = []
     for m in matches:
+        from src.product_policy import policy_identity_eligibility
+
+        if not policy_identity_eligibility(list(m.products)).eligible:
+            continue
         prices: dict[str, Any] = {}
         for p in m.products:
+            from src.product_policy import policy_offer_eligibility
+
+            if not policy_offer_eligibility(p).eligible:
+                continue
             snap = snaps_by_pid.get(p.id)
             if snap:
                 prices[p.site] = {

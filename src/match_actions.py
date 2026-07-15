@@ -10,12 +10,22 @@ from __future__ import annotations
 
 import structlog
 from rapidfuzz import fuzz
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session
 
+from src._time import utcnow
 from src.storage import Match, MatchRejection, Product
 
 log = structlog.get_logger()
+_MATCH_MUTATION_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
+
+
+def _acquire_match_mutation_xact_lock(session: Session) -> None:
+    if session.get_bind().dialect.name == "postgresql":
+        session.scalar(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": _MATCH_MUTATION_ADVISORY_LOCK_KEY},
+        )
 
 
 def _ordered(a: int, b: int) -> tuple[int, int]:
@@ -24,9 +34,16 @@ def _ordered(a: int, b: int) -> tuple[int, int]:
 
 
 def add_rejection(
-    session: Session, product_a_id: int, product_b_id: int, reason: str | None = None
+    session: Session,
+    product_a_id: int,
+    product_b_id: int,
+    reason: str | None = None,
+    *,
+    reason_type: str = "manual",
+    metadata: dict | None = None,
 ) -> MatchRejection:
     """Создать (или вернуть существующую) запись отрицания пары."""
+    _acquire_match_mutation_xact_lock(session)
     if product_a_id == product_b_id:
         raise ValueError("Cannot reject pair with self")
     a, b = _ordered(product_a_id, product_b_id)
@@ -36,8 +53,26 @@ def add_rejection(
         )
     )
     if existing:
+        # Active rows are idempotent evidence: preserve the original reason
+        # and metadata on repeated calls.  A previously rolled-back system row
+        # may be reactivated by a later independent violation; in that case the
+        # new evidence intentionally replaces the resolved record's metadata.
+        if not existing.is_active:
+            existing.reason = reason or existing.reason
+            existing.reason_type = reason_type
+            existing.metadata_json = metadata
+        existing.is_active = True
+        existing.resolved_at = None
+        existing.updated_at = utcnow()
         return existing
-    rej = MatchRejection(product_a_id=a, product_b_id=b, reason=reason)
+    rej = MatchRejection(
+        product_a_id=a,
+        product_b_id=b,
+        reason=reason,
+        reason_type=reason_type,
+        metadata_json=metadata,
+        is_active=True,
+    )
     session.add(rej)
     session.flush()
     return rej
@@ -51,7 +86,9 @@ def is_rejected(session: Session, product_a_id: int, product_b_id: int) -> bool:
     return (
         session.scalar(
             select(MatchRejection.id).where(
-                MatchRejection.product_a_id == a, MatchRejection.product_b_id == b
+                MatchRejection.product_a_id == a,
+                MatchRejection.product_b_id == b,
+                MatchRejection.is_active.is_(True),
             )
         )
         is not None
@@ -60,6 +97,7 @@ def is_rejected(session: Session, product_a_id: int, product_b_id: int) -> bool:
 
 def confirm_match(session: Session, match_id: int) -> Match | None:
     """Пометить Match как ручной — auto-matcher больше его не тронет."""
+    _acquire_match_mutation_xact_lock(session)
     m = session.get(Match, match_id)
     if not m:
         return None
@@ -83,6 +121,7 @@ def break_match(
 
     Возвращает количество созданных rejection-записей.
     """
+    _acquire_match_mutation_xact_lock(session)
     m = session.get(Match, match_id)
     if not m:
         return 0
@@ -131,8 +170,10 @@ def find_alternatives(
         return []
     candidates = session.scalars(
         select(Product).where(
+            Product.tenant_id == m.tenant_id,
             Product.site == site,
             Product.canonical_id.is_(None),
+            Product.offer_availability_status != "out_of_stock",
         )
     ).all()
     if not candidates:
@@ -153,11 +194,23 @@ def swap_alternative(session: Session, match_id: int, site: str, new_product_id:
     - Существующий Product этого site → отвязывается + rejection с new_product
     - Новый Product получает canonical_id = match_id
     """
+    _acquire_match_mutation_xact_lock(session)
     m = session.get(Match, match_id)
     if not m:
         return False
     new_p = session.get(Product, new_product_id)
-    if not new_p or new_p.site != site:
+    if not new_p or new_p.site != site or new_p.tenant_id != m.tenant_id:
+        return False
+
+    from src.product_policy import (
+        policy_identity_eligibility,
+        policy_offer_eligibility,
+    )
+
+    cohort = [product for product in m.products if product.site != site] + [new_p]
+    if not policy_identity_eligibility(cohort).eligible:
+        return False
+    if any(not policy_offer_eligibility(product).eligible for product in cohort):
         return False
 
     # Найти текущий Product этого site в кластере
@@ -188,6 +241,7 @@ def list_rejections_for_product(session: Session, product_id: int) -> list[int]:
     """Список product_id'ов с которыми этот product НЕ должен матчиться."""
     rows = session.scalars(
         select(MatchRejection).where(
+            MatchRejection.is_active.is_(True),
             or_(
                 MatchRejection.product_a_id == product_id,
                 MatchRejection.product_b_id == product_id,

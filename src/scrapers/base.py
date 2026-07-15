@@ -330,6 +330,14 @@ class ScrapedProduct:
     name: str
     brand: str | None = None
     manufacturer: str | None = None
+    # Explicit manufacturing-country signal from the source.  This is not the
+    # manufacturer company and is normalized only during persistence.
+    manufacturer_country_raw: str | None = None
+    country_source: str | None = None
+    # Competitor website offer state.  Unknown is distinct from zero stock.
+    offer_availability_status: str = "unknown"
+    offer_quantity: float | None = None
+    availability_source: str | None = None
     category: str | None = None
     dosage: str | None = None
     pack_size: str | None = None
@@ -372,6 +380,29 @@ class ScrapeResult:
     items_completed: int = 0
     items_failed: int = 0
     item_results: dict[str, dict] = field(default_factory=dict)
+    # Exact route-level evidence for full-catalog trust.  Product.category is
+    # not a substitute: one SKU may belong to multiple site categories and the
+    # normalized category can differ from the route that was requested.
+    category_counts: dict[str, int] = field(default_factory=dict)
+    route_statuses: dict[str, "RouteStatus"] = field(default_factory=dict)
+    verified_country_mappings: dict[str, dict[str, object]] = field(
+        default_factory=dict
+    )
+
+
+@dataclass
+class RouteStatus:
+    """Explicit completeness evidence for one requested category route."""
+
+    complete: bool
+    pages_skipped: int = 0
+    abort_reason: str | None = None
+    expected_pages: int | None = None
+    visited_pages: int | None = None
+    raw_items: int = 0
+    parsed_items: int = 0
+    item_failures: int = 0
+    expected_items: int | None = None
 
 
 class BaseScraper(ABC):
@@ -401,6 +432,7 @@ class BaseScraper(ABC):
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        self._route_statuses: dict[str, RouteStatus] = {}
 
     async def __aenter__(self) -> BaseScraper:
         try:
@@ -735,6 +767,11 @@ class BaseScraper(ABC):
                     "error": message,
                     "error_kind": "site_fatal",
                 }
+                result.route_statuses[str(remaining_slug)] = RouteStatus(
+                    complete=False,
+                    abort_reason=message,
+                    parsed_items=current_products if remaining_index == 0 else 0,
+                )
             log.error(
                 "site_scrape_aborted",
                 site=self.site_name,
@@ -744,6 +781,8 @@ class BaseScraper(ABC):
             )
 
         for item_index, slug in enumerate(requested_slugs):
+            result.category_counts[str(slug)] = 0
+            self._route_statuses.pop(str(slug), None)
             try:
                 count = 0
                 cat_products = []
@@ -757,6 +796,15 @@ class BaseScraper(ABC):
                     category=slug,
                     products=count,
                 )
+                result.category_counts[str(slug)] = count
+                route_status = self._route_statuses.get(
+                    str(slug),
+                    RouteStatus(
+                        complete=False,
+                        abort_reason="missing_route_status",
+                    ),
+                )
+                result.route_statuses[str(slug)] = route_status
                 if count == 0:
                     msg = f"category={slug}: empty result"
                     result.errors.append(msg)
@@ -767,6 +815,17 @@ class BaseScraper(ABC):
                         "error": "category returned zero products",
                         "error_kind": "empty",
                     }
+                    if route_status.complete:
+                        result.route_statuses[str(slug)] = RouteStatus(
+                            complete=False,
+                            abort_reason="empty_result",
+                            expected_pages=route_status.expected_pages,
+                            visited_pages=route_status.visited_pages,
+                            raw_items=route_status.raw_items,
+                            parsed_items=route_status.parsed_items,
+                            item_failures=route_status.item_failures,
+                            expected_items=route_status.expected_items,
+                        )
                 else:
                     result.items_completed += 1
                     result.item_results[str(slug)] = {
@@ -800,6 +859,9 @@ class BaseScraper(ABC):
                     "error": str(e)[:500],
                     "error_kind": "captcha",
                 }
+                result.route_statuses[str(slug)] = RouteStatus(
+                    complete=False, abort_reason="captcha"
+                )
             except Exception as e:
                 fatal_reason = fatal_proxy_reason(e)
                 if fatal_reason is not None:
@@ -820,6 +882,10 @@ class BaseScraper(ABC):
                     "error": f"{type(e).__name__}: {e}"[:500],
                     "error_kind": "exception",
                 }
+                result.route_statuses[str(slug)] = RouteStatus(
+                    complete=False,
+                    abort_reason=f"{type(e).__name__}: {e}"[:200],
+                )
 
         if not site_aborted:
             try:
@@ -871,3 +937,32 @@ class BaseScraper(ABC):
         except Exception:
             pass
         return result
+
+    def _set_route_status(
+        self,
+        route: str,
+        *,
+        complete: bool,
+        pages_skipped: int = 0,
+        abort_reason: str | None = None,
+        expected_pages: int | None = None,
+        visited_pages: int | None = None,
+        raw_items: int = 0,
+        parsed_items: int = 0,
+        item_failures: int = 0,
+        expected_items: int | None = None,
+    ) -> None:
+        """Publish completeness from a scraper-specific paginator."""
+        if not hasattr(self, "_route_statuses"):
+            self._route_statuses = {}
+        self._route_statuses[str(route)] = RouteStatus(
+            complete=complete,
+            pages_skipped=pages_skipped,
+            abort_reason=abort_reason,
+            expected_pages=expected_pages,
+            visited_pages=visited_pages,
+            raw_items=raw_items,
+            parsed_items=parsed_items,
+            item_failures=item_failures,
+            expected_items=expected_items,
+        )

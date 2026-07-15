@@ -23,6 +23,7 @@ from src.storage import (
     Product,
     Promo,
     Run,
+    financially_eligible_run_ids,
     latest_snapshots_per_product,
 )
 
@@ -400,8 +401,18 @@ def _iter_matched_prices(
     Для каждого сайта-конкурента цена усредняется (если в матче >1 товар
     с этого сайта). Возвращаются только матчи с ценой клиента + ≥1 конкурента.
     """
+    from src.product_policy import policy_rollout_eligibility
+
     q = select(Match).options(selectinload(Match.products))
     if tenant_id is not None:
+        rollout = policy_rollout_eligibility(session, tenant_id=tenant_id)
+        if not rollout.eligible:
+            log.warning(
+                "analytics_policy_gate_closed",
+                tenant_id=tenant_id,
+                reason=rollout.reason,
+            )
+            return []
         q = q.where(Match.tenant_id == tenant_id)
     category_filter = set(categories) if categories is not None else None
     if category_filter is not None and not category_filter:
@@ -421,10 +432,51 @@ def _iter_matched_prices(
         ]
 
     all_pids = [p.id for m in matches for p in m.products]
-    snaps = latest_snapshots_per_product(session, all_pids)
+    if tenant_id is None:
+        pids_by_tenant: dict[int, list[int]] = defaultdict(list)
+        for m in matches:
+            for p in m.products:
+                pids_by_tenant[int(p.tenant_id or 1)].append(p.id)
+        snaps = {}
+        for current_tenant_id, tenant_pids in pids_by_tenant.items():
+            rollout = policy_rollout_eligibility(session, tenant_id=current_tenant_id)
+            if not rollout.eligible:
+                log.warning(
+                    "analytics_policy_gate_closed",
+                    tenant_id=current_tenant_id,
+                    reason=rollout.reason,
+                )
+                continue
+            trusted_lineage_available = bool(
+                financially_eligible_run_ids(session, tenant_id=current_tenant_id)
+            )
+            snaps.update(
+                latest_snapshots_per_product(
+                    session,
+                    tenant_pids,
+                    financially_eligible_only=trusted_lineage_available,
+                    tenant_id=current_tenant_id,
+                )
+            )
+    else:
+        # Mirror /comparison's safe bootstrap contract. In shadow policy mode
+        # there may be no newly verified full-catalog lineage yet; returning an
+        # empty 200 hides a healthy matched catalogue. Product identity/offer
+        # gates below still reject country conflicts, dead URLs and explicit OOS.
+        trusted_lineage_available = bool(financially_eligible_run_ids(session, tenant_id=tenant_id))
+        snaps = latest_snapshots_per_product(
+            session,
+            all_pids,
+            financially_eligible_only=trusted_lineage_available,
+            tenant_id=tenant_id,
+        )
 
     records: list[tuple[str, float, dict[str, float]]] = []
     for m in matches:
+        from src.product_policy import policy_identity_eligibility, policy_offer_eligibility
+
+        if not policy_identity_eligibility(list(m.products)).eligible:
+            continue
         conf = m.confidence if m.confidence is not None else 1.0
         if not m.is_manual and conf < min_confidence:
             continue
@@ -433,6 +485,7 @@ def _iter_matched_prices(
             for p in m.products
             if p.site == client_site
             and p.url_dead_at is None
+            and policy_offer_eligibility(p).eligible
             and (category_filter is None or (p.category or "(без категории)") in category_filter)
         ]
         if category_filter is None:
@@ -443,7 +496,11 @@ def _iter_matched_prices(
 
         comp_by_site: dict[str, list[float]] = defaultdict(list)
         for p in m.products:
-            if p.site == client_site or p.url_dead_at is not None:
+            if (
+                p.site == client_site
+                or p.url_dead_at is not None
+                or not policy_offer_eligibility(p).eligible
+            ):
                 continue
             price = _current_price(snaps.get(p.id))
             if price is not None:
@@ -510,6 +567,7 @@ def category_comparison(
     tenant_id: int | None = None,
     min_confidence: float = 0.70,
     categories: Collection[str] | None = None,
+    canonical: bool = False,
 ) -> list[CategoryComparison]:
     """Сравнение цен по категориям: per-site средние + index + win/lose.
 
@@ -527,6 +585,44 @@ def category_comparison(
     )
     if not records:
         return []
+
+    canonical_labels = {}
+    if canonical:
+        from src.category_taxonomy import (
+            CanonicalCategory,
+            classify_source_category,
+            source_category_labels,
+        )
+
+        source_labels = source_category_labels(session)
+        # Классификация зависит только от категории-источника, а не от матча:
+        # мемоизируем по raw_category (иначе ~200 правил × ~4k матчей регэкспов
+        # вместо ~200 × ~178 категорий).
+        resolved: dict[str, CanonicalCategory | None] = {}
+
+        def _canonical_for(raw_category: str) -> CanonicalCategory | None:
+            if raw_category not in resolved:
+                label_ru, label_az = source_labels.get((client_site, raw_category), (None, None))
+                resolved[raw_category] = classify_source_category(
+                    client_site,
+                    raw_category,
+                    label_ru=label_ru,
+                    label_az=label_az,
+                )
+            return resolved[raw_category]
+
+        canonical_records: list[tuple[str, float, dict[str, float]]] = []
+        for raw_category, client_price, comp_by_site in records:
+            mapped = _canonical_for(raw_category)
+            # Несопоставленная категория-источник (форма выпуска, широкий
+            # раздел, неоднозначность) НЕ становится строкой дашборда.
+            if mapped is None:
+                continue
+            canonical_records.append((mapped.key, client_price, comp_by_site))
+            canonical_labels[mapped.key] = mapped
+        records = canonical_records
+        if not records:
+            return []
 
     groups: dict[str, dict] = defaultdict(
         lambda: {
@@ -557,10 +653,17 @@ def category_comparison(
         else:
             g["parity"] += 1
 
-    # Ярлыки одним запросом: slug → (label_ru, label_az).
+    # Ярлыки одним запросом: slug → (label_ru, label_az). Canonical mode uses
+    # compact source-independent labels instead.
     slugs = list(groups.keys())
     labels: dict[str, tuple[str | None, str | None]] = {}
-    if slugs:
+    if canonical:
+        labels = {
+            key: (category.label_ru, category.label_az)
+            for key, category in canonical_labels.items()
+            if category is not None
+        }
+    elif slugs:
         for c in session.scalars(
             select(Category).where(Category.pharmonline_slug.in_(slugs))
         ).all():

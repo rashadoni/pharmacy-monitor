@@ -25,6 +25,8 @@
     "loading": "Loading…",
     "updating": "Updating…",
     "error": "Failed to load",
+    "financial_data_paused": "Financial comparisons are temporarily hidden while the system waits for a fresh, verified full catalog from all three sites with confirmed manufacturing country and availability.",
+    "system_degraded": "The latest run failed. Data and recommendations may be incomplete; check the run status.",
     "save": "Save",
     "cancel": "Cancel",
     "delete": "Delete",
@@ -149,7 +151,10 @@
     "alts_none": "No similar products found — paste your own link.",
     "alts_pick": "Pick",
     "category_filter": "Category: {category}",
-    "category_filter_clear": "Clear filter"
+    "category_filter_clear": "Clear filter",
+    "country_verified": "Manufacturing country verified: {code}",
+    "country_unverified": "Manufacturing country is not verified yet",
+    "country_unknown_short": "country ?"
   },
   "overview": {
     "title": "Overview",
@@ -346,6 +351,8 @@
     "tooltip_mark_read": "Mark as read",
     "tooltip_mark_unread": "Mark as unread",
     "tooltip_snooze_7d": "Hide for 7 days",
+    "open_product": "Open product",
+    "opens_new_tab": "opens in a new tab",
     "event_price_drop_title": "Price fell by {pct}%: {product}",
     "event_price_drop_detail": "{site}: {previous} → {current} ₼ (-{pct}%).",
     "event_undercut_title": "{site} is {pct}% cheaper: {product}",
@@ -736,7 +743,7 @@
   },
   "category_comparison": {
     "title": "📊 Category comparison",
-    "subtitle": "How much pharmonline is above or below competitors in each category. Click a row for that category's products.",
+    "subtitle": "Fine-grained source categories are combined into shared sections. Each section shows how pharmonline compares with competitors.",
     "export_csv_title": "Export to CSV",
     "th_category": "Category",
     "th_skus": "SKU",
