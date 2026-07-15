@@ -82,6 +82,7 @@ from src import analytics
 from src import inventory as inv_mod
 from src import storage, tenants
 from src._time import utcnow
+from src.category_taxonomy import classify_source_category, source_category_labels
 from src.normalize import pack_unit_count
 
 log = structlog.get_logger()
@@ -2134,6 +2135,9 @@ def dash_comparison(
     )
 
     now = utcnow()  # naive UTC; last_seen_at тоже naive (src/_time) — вычитание ок
+    # Ярлыки тянем ОДИН раз до цикла: source_category_labels сканирует Category
+    # целиком, внутри цикла это был бы скан на каждый матч.
+    source_labels = source_category_labels(db) if category is not None else {}
     out: list[ComparisonRowOut] = []
     for m in matches:
         from src.product_policy import policy_identity_eligibility
@@ -2146,14 +2150,19 @@ def dash_comparison(
             client_p = next((p for p in m.products if p.site == "pharmonline"), None)
             if client_p is None:
                 continue
-            from src.category_taxonomy import classify_source_category
-
-            canonical_category = classify_source_category(
-                "pharmonline", client_p.category
+            # Классифицируем ровно так же, как сводка /category-comparison —
+            # со слагом И ярлыками. Классификация только по слагу расходилась бы
+            # со сводкой: строка есть в сводке, а drill-down пуст.
+            label_ru, label_az = source_labels.get(
+                ("pharmonline", client_p.category or ""), (None, None)
             )
-            if client_p.category != category and (
-                canonical_category is None or canonical_category.key != category
-            ):
+            canonical = classify_source_category(
+                "pharmonline",
+                client_p.category,
+                label_ru=label_ru,
+                label_az=label_az,
+            )
+            if client_p.category != category and (canonical is None or canonical.key != category):
                 continue
         # Confidence floor: низко-достоверные fuzzy-матчи (Bio Kolik ↔ Bio sprey)
         # дают ложный spread. Ручные (is_manual) показываем всегда.

@@ -4093,11 +4093,21 @@ def test_category_comparison_groups_and_indexes(client, tenant_user, setup_db):
     run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
     s.add(run)
     s.flush()
+    # Реальные слаги pharmonline, а не синтетические: таксономия сознательно
+    # не знает англоязычных сигналов (в проде их нет ни одного).
     _make_match_with_prices(
-        s, run, canonical="v1", prices={"pharmonline": 10.0, "aloe": 8.0}, category="vitamins"
+        s,
+        run,
+        canonical="v1",
+        prices={"pharmonline": 10.0, "aloe": 8.0},
+        category="vitamin-ve-mineral-kompleks",
     )
     _make_match_with_prices(
-        s, run, canonical="p1", prices={"pharmonline": 20.0, "aloe": 20.0}, category="pain"
+        s,
+        run,
+        canonical="p1",
+        prices={"pharmonline": 20.0, "aloe": 20.0},
+        category="aghrikesiciler-ve-iltihabeleyhine-vasiteler",
     )
     token = tenants.issue_magic_token(s, tenant_user.email)
     client.get(f"/auth/verify?token={token}")

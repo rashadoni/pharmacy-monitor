@@ -463,9 +463,7 @@ def _iter_matched_prices(
         # there may be no newly verified full-catalog lineage yet; returning an
         # empty 200 hides a healthy matched catalogue. Product identity/offer
         # gates below still reject country conflicts, dead URLs and explicit OOS.
-        trusted_lineage_available = bool(
-            financially_eligible_run_ids(session, tenant_id=tenant_id)
-        )
+        trusted_lineage_available = bool(financially_eligible_run_ids(session, tenant_id=tenant_id))
         snaps = latest_snapshots_per_product(
             session,
             all_pids,
@@ -591,27 +589,37 @@ def category_comparison(
     canonical_labels = {}
     if canonical:
         from src.category_taxonomy import (
-            canonical_category,
+            CanonicalCategory,
             classify_source_category,
             source_category_labels,
         )
 
         source_labels = source_category_labels(session)
+        # Классификация зависит только от категории-источника, а не от матча:
+        # мемоизируем по raw_category (иначе ~200 правил × ~4k матчей регэкспов
+        # вместо ~200 × ~178 категорий).
+        resolved: dict[str, CanonicalCategory | None] = {}
+
+        def _canonical_for(raw_category: str) -> CanonicalCategory | None:
+            if raw_category not in resolved:
+                label_ru, label_az = source_labels.get((client_site, raw_category), (None, None))
+                resolved[raw_category] = classify_source_category(
+                    client_site,
+                    raw_category,
+                    label_ru=label_ru,
+                    label_az=label_az,
+                )
+            return resolved[raw_category]
+
         canonical_records: list[tuple[str, float, dict[str, float]]] = []
         for raw_category, client_price, comp_by_site in records:
-            label_ru, label_az = source_labels.get(
-                (client_site, raw_category), (None, None)
-            )
-            mapped = classify_source_category(
-                client_site,
-                raw_category,
-                label_ru=label_ru,
-                label_az=label_az,
-            )
+            mapped = _canonical_for(raw_category)
+            # Несопоставленная категория-источник (форма выпуска, широкий
+            # раздел, неоднозначность) НЕ становится строкой дашборда.
             if mapped is None:
                 continue
             canonical_records.append((mapped.key, client_price, comp_by_site))
-            canonical_labels[mapped.key] = canonical_category(mapped.key)
+            canonical_labels[mapped.key] = mapped
         records = canonical_records
         if not records:
             return []
