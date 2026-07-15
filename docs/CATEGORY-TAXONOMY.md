@@ -61,16 +61,27 @@ groups (`beyin qan` was in both `cardiovascular_blood` and `nervous_system`).
 ### The one segment policy
 
 The taxonomy mixes a body-system axis with a single customer-segment group
-(`mother_baby`). Both legitimately fire for "kids' oral care". The segment wins,
-by explicit policy, because the client's own tree merchandises kids buckets as
-`ushaq-*` (kids' skin care, kids' hair care). Before this was explicit, order
-decided silently and inconsistently: kids' oral care landed in `oral_care` while
-kids' skin care landed in `mother_baby`.
+(`mother_baby`). Both legitimately fire for "kids' oral care". The **kids
+signals** win, by explicit policy, because the client's own tree merchandises
+those buckets as `ushaq-*` (kids' skin care, kids' hair care). Before this was
+explicit, order decided silently and inconsistently: kids' oral care landed in
+`oral_care` while kids' skin care landed in `mother_baby`.
+
+The override is carried by `Rule.segment_override` on the five kids signals
+(`mb.usaq`, `mb.ana_usaq`, `mb.korpe`, `mb.baby`, `mb.pediatr`) — **never by the
+`mother_baby` key**. Keying it on the group looks equivalent and is not: it
+silently promotes `mb.hamile`, a *pregnancy* signal, and
+"Hamiləlikdən qorunma vasitələri (kontraseptivlər)" — contraception, the
+semantic inverse of the segment — was filed under "Мама и ребёнок". Pregnancy
+and obstetric signals (`hamile`, `dogus`, `laktasiya`) now fail closed to
+`ambiguous` on collision, which is where a contraceptive or a "vitamins for
+pregnant women" bucket belongs. `_validate_rules` rejects `segment_override` on
+any other group.
 
 This policy is a **judgement call, not a fact**. Every category it touches is
-listed under `segment_policy_source_categories` in the audit (8 categories in
-production) so it stays reviewable and can be flipped in one place
-(`_SEGMENT_KEY`).
+listed under `segment_policy_source_categories` in the audit (5 in production)
+so it stays reviewable, and it can be narrowed by dropping the flag from a
+signal.
 
 ## Why competitor categories are not a crosswalk
 
@@ -83,10 +94,10 @@ the client and a competitor category classify:
 | Medical devices | 17 | 0 | 100.0% |
 | Endocrinology and metabolism | 76 | 2 | 97.4% |
 | Respiratory and ENT | 223 | 10 | 95.7% |
+| Mother and baby | 46 | 7 | 86.8% |
 | Cardiovascular and blood | 262 | 44 | 85.6% |
 | Dermatology | 10 | 2 | 83.3% |
-| Mother and baby | 48 | 10 | 82.8% |
-| Urogenital and reproductive | 143 | 32 | 81.7% |
+| Urogenital and reproductive | 143 | 31 | 82.2% |
 | Personal care | 35 | 9 | 79.5% |
 | Digestive | 154 | 41 | 79.0% |
 | Nervous system | 41 | 18 | 69.5% |
@@ -95,6 +106,10 @@ the client and a competitor category classify:
 | Pain and musculoskeletal | 28 | 53 | 34.6% |
 | **Vitamins and supplements** | 4 | 66 | **5.7%** |
 | **Infections and immunity** | 0 | 81 | **0.0%** |
+
+Read `mother_baby` and `urogenital_reproductive` with care: the segment policy
+above is one input to their numbers, so those two rows are partly measuring our
+own choice rather than the sites' disagreement. The rest are independent.
 
 The bottom rows are the point. For products the matcher has **confirmed to be
 identical**, PharmOnline files "инфекционно-воспалительные заболевания кожи"
@@ -114,25 +129,33 @@ python -m scripts.audit_category_taxonomy --tenant-id 1 --strict \
   > artifacts/category-taxonomy-audit.json
 ```
 
-Source-category coverage across all 466 live `(site, category)` pairs:
+Source-category coverage (tenant-scoped, live products only):
 
 | Site | Categories mapped | Products mapped |
 |---|---:|---:|
-| pharmonline (client) | 86 / 178 | 5,965 / 10,480 (56.9%) |
-| aptekonline | 186 / 283 | 21,040 / 26,480 (79.5%) |
+| pharmonline (client) | 85 / 178 | 5,951 / 10,480 (56.8%) |
+| aptekonline | 184 / 283 | 20,932 / 26,358 (79.4%) |
 | aloe | 2 / 5 | 679 / 6,363 (10.7%) |
 
 Aloe is low **by design**: `dermanlar` (5,485 products) is a whole-catalogue
 department and is blocked.
 
 Classification outcomes: 266 matched, 145 no signal, 44 blocked as dosage form,
-8 resolved by segment policy, 2 blocked as broad buckets, **1 ambiguous**
-(AptekOnline 403 "Косметические контактные линзы" — `medical_devices` vs
-`personal_care`, genuinely both, correctly left unmapped).
+5 resolved by segment policy, 2 blocked as broad buckets, **4 ambiguous**:
+
+| Source category | Candidates |
+|---|---|
+| AptekOnline 403 "Косметические контактные линзы" | medical_devices / personal_care |
+| PharmOnline `hamileler-uchun-vitamin-mineral-kompleks` | mother_baby / vitamins_supplements |
+| AptekOnline 347 "Ортопедические средства для беременных" | mother_baby / pain_musculoskeletal |
+| AptekOnline 61 "Средства контрацепции" | mother_baby / urogenital_reproductive |
+
+All four are genuinely two things at once. They stay unmapped and are the review
+queue — not a guess.
 
 The dashboard renders **16 canonical rows from 148 raw client categories**,
-grouping 1,558 confirmed matched SKUs. 2,032 of 3,977 cross-site matches stay
-unclassified because their client category has no defensible mapping.
+grouping 1,553 confirmed matched SKUs. Most cross-site matches stay unclassified
+because their client category has no defensible mapping.
 
 ## Safe extension procedure
 

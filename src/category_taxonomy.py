@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
 
 from sqlalchemy import select
@@ -51,6 +52,13 @@ class Rule:
     Azerbaijani agglutination (``agiz boslug`` matches ``ağız boşluğunun``).
     ``mode='word'`` requires a whole word and is used for short signals that
     would otherwise hide inside longer words (``bad``/БАД vs ``badam``/almond).
+
+    ``segment_override`` marks the few signals that identify the mother/baby
+    *customer segment* itself and may therefore outrank a body-system signal.
+    It is a property of the SIGNAL, never of the canonical group: `hamile`
+    (pregnancy) also lives in ``mother_baby`` but must not override, or
+    "Hamiləlikdən qorunma vasitələri" (contraception — the semantic inverse of
+    the segment) would be reported as "Мама и ребёнок".
     """
 
     id: str
@@ -58,6 +66,7 @@ class Rule:
     phrase: str
     mode: Literal["prefix", "word"] = "prefix"
     supersedes: frozenset[str] = frozenset()
+    segment_override: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,11 +125,20 @@ _BY_KEY = {category.key: category for category in CANONICAL_CATEGORIES}
 
 # The taxonomy mixes a body-system axis with one customer-segment group
 # (`mother_baby`). Both can legitimately fire for "kids' oral care". Rather than
-# let rule order decide silently, the segment wins by an explicit, documented
-# policy: every client (PharmOnline) kids bucket is merchandised by the client
-# itself as `ushaq-*` (kids' skin care, kids' hair care), so grouping them under
-# "Мама и ребёнок" mirrors the client's own tree. The audit lists every category
-# resolved this way (`reason='segment_policy'`) so the policy stays reviewable.
+# let rule order decide silently, the kids-segment SIGNALS win by an explicit,
+# documented policy: every client (PharmOnline) kids bucket is merchandised by
+# the client itself as `ushaq-*` (kids' skin care, kids' hair care), so grouping
+# them under "Мама и ребёнок" mirrors the client's own tree. The audit lists
+# every category resolved this way (`reason='segment_policy'`) so the policy
+# stays reviewable.
+#
+# The override is carried by `Rule.segment_override` on those signals ONLY — not
+# by the `mother_baby` key. Keying it on the group would silently promote
+# `mb.hamile`/`mb.dogus`/`mb.laktasiya`, which are pregnancy/obstetric signals
+# rather than segment signals: "Hamiləlikdən qorunma vasitələri (kontraseptivlər)"
+# would then be filed under "Мама и ребёнок" despite being its inverse. Those
+# signals now fail closed to `ambiguous` when they collide, which is where a
+# contraceptive or a "vitamins for pregnant women" bucket belongs.
 _SEGMENT_KEY = "mother_baby"
 
 _RULES: tuple[Rule, ...] = (
@@ -146,14 +164,17 @@ _RULES: tuple[Rule, ...] = (
     Rule("eye.katarakta", "eye_health", "katarakta"),
     Rule("eye.gorme", "eye_health", "gorme zeif"),
     # ─── mother & baby ───
-    Rule("mb.ana_usaq", "mother_baby", "ana ve usaq"),
-    Rule("mb.usaq", "mother_baby", "usaq"),
+    # Only the kids-SEGMENT signals carry `segment_override` (see `_SEGMENT_KEY`).
+    Rule("mb.ana_usaq", "mother_baby", "ana ve usaq", segment_override=True),
+    Rule("mb.usaq", "mother_baby", "usaq", segment_override=True),
+    Rule("mb.korpe", "mother_baby", "korpe", segment_override=True),
+    Rule("mb.baby", "mother_baby", "baby", mode="word", segment_override=True),
+    Rule("mb.pediatr", "mother_baby", "pediatr", segment_override=True),
+    # Pregnancy/obstetric signals: same group, but NOT segment markers. They must
+    # fail closed on collision — `hamile` also fires on "protection FROM pregnancy".
     Rule("mb.hamile", "mother_baby", "hamile"),
     Rule("mb.laktasiya", "mother_baby", "laktasiya"),
     Rule("mb.dogus", "mother_baby", "dogus"),
-    Rule("mb.korpe", "mother_baby", "korpe"),
-    Rule("mb.baby", "mother_baby", "baby", mode="word"),
-    Rule("mb.pediatr", "mother_baby", "pediatr"),
     # ─── medical devices ───
     Rule("dev.tibbi_avadan", "medical_devices", "tibbi avadan"),
     Rule("dev.tibbi_vasite", "medical_devices", "tibbi vasite"),
@@ -402,6 +423,15 @@ _DIGRAPH_FOLDS: tuple[tuple[str, str], ...] = (("sh", "s"), ("ch", "c"), ("gh", 
 
 
 def _fold(text: str) -> str:
+    """Collapse both AZ spellings of the same sound to one form.
+
+    NB: not idempotent, and convergence is not universal. A digraph followed by
+    a real `h` diverges — `məşhur` folds to `mesur` while the transliterated
+    `meshhur` folds to `meshur`. No current signal has that shape and such words
+    are rare in this catalogue, but a phrase like `mesur` would pass the
+    folded-form validator while never matching the digraph spelling. Check any
+    new signal containing `sh`/`ch`/`gh` + `h` by hand.
+    """
     out = strip_accents(text).casefold()
     for digraph, letter in _DIGRAPH_FOLDS:
         out = out.replace(digraph, letter)
@@ -444,6 +474,32 @@ def _validate_rules(rules: tuple[Rule, ...]) -> list[str]:
         for target in sorted(rule.supersedes):
             if target not in seen_ids:
                 problems.append(f"{rule.id}: supersedes unknown rule id {target!r}")
+        if rule.id in rule.supersedes:
+            problems.append(f"{rule.id}: supersedes itself")
+        if rule.segment_override and rule.key != _SEGMENT_KEY:
+            problems.append(
+                f"{rule.id}: segment_override set on key {rule.key!r}, "
+                f"only {_SEGMENT_KEY!r} may carry it"
+            )
+    # A supersede cycle passes every check above and then annihilates: both rules
+    # veto each other, nothing stays live, and the category silently vanishes.
+    supersedes_by_id = {rule.id: rule.supersedes for rule in rules}
+    for cycle_id in sorted(supersedes_by_id):
+        seen: set[str] = set()
+        stack = [cycle_id]
+        while stack:
+            current = stack.pop()
+            for target in supersedes_by_id.get(current, frozenset()):
+                if target == cycle_id:
+                    problems.append(
+                        f"supersedes cycle involving {cycle_id!r} — both signals would "
+                        f"veto each other and the category would vanish silently"
+                    )
+                    stack = []
+                    break
+                if target not in seen:
+                    seen.add(target)
+                    stack.append(target)
     return problems
 
 
@@ -452,12 +508,18 @@ def rule_validation_problems() -> list[str]:
     return _validate_rules(_RULES)
 
 
+@lru_cache(maxsize=None)
+def _pattern_for(phrase: str, mode: str) -> re.Pattern[str]:
+    """Compile once per rule: `_matches` runs ~200×3 times per category."""
+    start = rf"(?<![{_TOKEN_CHARS}])"
+    end = rf"(?![{_TOKEN_CHARS}])" if mode == "word" else ""
+    return re.compile(start + re.escape(phrase) + end)
+
+
 def _matches(rule: Rule, text: str) -> bool:
     if not text:
         return False
-    start = rf"(?<![{_TOKEN_CHARS}])"
-    end = rf"(?![{_TOKEN_CHARS}])" if rule.mode == "word" else ""
-    return re.search(start + re.escape(rule.phrase) + end, text) is not None
+    return _pattern_for(rule.phrase, rule.mode).search(text) is not None
 
 
 def canonical_category(key: str) -> CanonicalCategory | None:
@@ -493,12 +555,19 @@ def classify_source_category_detailed(
     if not matched:
         return Classification(None, "no_signal")
 
+    # A supersede veto says "when my phrase matches, that other signal is a false
+    # positive IN THIS TEXT" — it is a statement about the text, not about the
+    # vetoing rule's own liveness. So vetoes are collected from every matched
+    # rule BEFORE filtering, and a superseded rule still vetoes. Do not "fix"
+    # this into a poset walk; it is also what makes specificity chains resolve.
     superseded: set[str] = set()
     for rule in matched:
         superseded |= rule.supersedes
     live = [rule for rule in matched if rule.id not in superseded]
-    if not live:  # pragma: no cover - only reachable if a rule set supersedes everything
-        return Classification(None, "no_signal")
+    if not live:
+        # Only reachable via a supersede cycle, which `_validate_rules` rejects.
+        # Distinct reason so the audit never mistakes it for "no rule matched".
+        return Classification(None, "superseded_out", tuple(sorted(rule.id for rule in matched)))
 
     keys = {rule.key for rule in live}
     rule_ids = tuple(sorted(rule.id for rule in live))
@@ -506,9 +575,10 @@ def classify_source_category_detailed(
     if len(keys) == 1:
         return Classification(_BY_KEY[next(iter(keys))], "matched", rule_ids, tuple(sorted(keys)))
 
-    # Documented segment policy (see `_SEGMENT_KEY`): a kids/pregnancy bucket is
-    # reported under "Мама и ребёнок" even when a body-system signal also fires.
-    if _SEGMENT_KEY in keys:
+    # Documented segment policy (see `_SEGMENT_KEY`): a KIDS bucket is reported
+    # under "Мама и ребёнок" even when a body-system signal also fires. Driven by
+    # the signal, not the group — pregnancy signals deliberately do not qualify.
+    if any(rule.segment_override for rule in live):
         return Classification(
             _BY_KEY[_SEGMENT_KEY], "segment_policy", rule_ids, tuple(sorted(keys))
         )

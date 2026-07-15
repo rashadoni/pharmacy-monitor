@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from src.category_taxonomy import (
+    Classification,
     classify_source_category_detailed,
     rule_validation_problems,
     source_category_labels,
@@ -40,9 +41,9 @@ def build_category_taxonomy_audit(session, *, tenant_id: int = 1) -> dict:
 
     # Классификация зависит только от (site, category) — мемоизируем, иначе на
     # каждый товар каждого матча прогоняется весь набор правил.
-    _classified: dict[tuple[str, str], object] = {}
+    _classified: dict[tuple[str, str], Classification] = {}
 
-    def classify(site: str, category: str | None):
+    def classify(site: str, category: str | None) -> Classification:
         cache_key = (site, category or "")
         if cache_key not in _classified:
             label_ru, label_az = labels.get(cache_key, (None, None))
@@ -63,8 +64,11 @@ def build_category_taxonomy_audit(session, *, tenant_id: int = 1) -> dict:
             continue
 
         client = clients[0]
+        # Сентинел НЕ считаем реальной категорией — иначе raw_client_categories
+        # завышается на 1 при первом же товаре без категории.
         raw_category = client.category or "(uncategorized)"
-        raw_client_categories.add(raw_category)
+        if client.category:
+            raw_client_categories.add(raw_category)
         client_key = mapped_key(client)
         if client_key is None:
             unclassified_client[raw_category] += 1
@@ -109,9 +113,15 @@ def build_category_taxonomy_audit(session, *, tenant_id: int = 1) -> dict:
 
     # Полная инвентаризация КАЖДОЙ категории-источника, а не только матченных:
     # покрытие по сайтам + причина, по которой категория осталась несопоставленной.
+    # Тот же tenant + только живые товары, что и в блоке матчей выше — иначе две
+    # половины отчёта считают разные популяции.
     inventory_rows = session.execute(
         select(Product.site, Product.category, func.count(Product.id))
-        .where(Product.category.is_not(None))
+        .where(
+            Product.category.is_not(None),
+            Product.tenant_id == tenant_id,
+            Product.url_dead_at.is_(None),
+        )
         .group_by(Product.site, Product.category)
     ).all()
 

@@ -144,6 +144,70 @@ def test_kids_buckets_are_reported_under_the_segment_consistently() -> None:
     assert _key("pharmonline", "ushaq-sachlari-uchun-qulluq") == "mother_baby"
 
 
+def test_pregnancy_signals_do_not_inherit_the_kids_segment_override() -> None:
+    """`hamile` also fires on "protection FROM pregnancy" — the segment's inverse.
+
+    Keying the override on the `mother_baby` group (rather than on the kids
+    signals) filed contraceptives under "Мама и ребёнок".
+    """
+    result = classify_source_category_detailed(
+        "aptekonline", "61", label_az="Hamiləlikdən qorunma vasitələri (kontraseptivlər)"
+    )
+    assert result.category is None
+    assert result.reason == "ambiguous"
+    assert set(result.candidates) == {"mother_baby", "urogenital_reproductive"}
+
+
+def test_pregnancy_bucket_still_maps_when_nothing_collides() -> None:
+    assert _key("aptekonline", "60", "Hamiləlik") == "mother_baby"
+
+
+def test_segment_override_is_carried_by_signals_not_by_the_group() -> None:
+    overriding = {r.id for r in taxonomy._RULES if r.segment_override}
+    assert overriding == {"mb.ana_usaq", "mb.usaq", "mb.korpe", "mb.baby", "mb.pediatr"}
+    assert all(
+        taxonomy._BY_KEY[r.key].key == "mother_baby" for r in taxonomy._RULES if r.segment_override
+    )
+
+
+def test_validation_rejects_segment_override_outside_the_segment_group() -> None:
+    problems = taxonomy._validate_rules(
+        (taxonomy.Rule("x.bad", "oral_care", "dental", segment_override=True),)
+    )
+    assert any("only 'mother_baby' may carry it" in p for p in problems)
+
+
+def test_validation_rejects_a_supersedes_cycle() -> None:
+    """A cycle passes every other check and then annihilates both signals."""
+    rules = (
+        taxonomy.Rule("a", "eye_health", "oftalm", supersedes=frozenset({"b"})),
+        taxonomy.Rule("b", "digestive_system", "hezm", supersedes=frozenset({"a"})),
+    )
+    assert any("supersedes cycle" in p for p in taxonomy._validate_rules(rules))
+
+
+def test_validation_rejects_self_supersede() -> None:
+    rules = (taxonomy.Rule("a", "eye_health", "oftalm", supersedes=frozenset({"a"})),)
+    problems = taxonomy._validate_rules(rules)
+    assert any("supersedes itself" in p for p in problems)
+
+
+def test_annihilated_signals_are_distinguishable_from_no_match(monkeypatch) -> None:
+    """A cycle must not look identical to "no rule matched" in the audit."""
+    monkeypatch.setattr(
+        taxonomy,
+        "_RULES",
+        (
+            taxonomy.Rule("a", "eye_health", "oftalm", supersedes=frozenset({"b"})),
+            taxonomy.Rule("b", "digestive_system", "hezm", supersedes=frozenset({"a"})),
+        ),
+    )
+    result = classify_source_category_detailed("pharmonline", "oftalm-ve-hezm")
+    assert result.category is None
+    assert result.reason == "superseded_out"
+    assert result.rule_ids == ("a", "b")
+
+
 def test_segment_policy_is_reported_as_such_for_audit() -> None:
     result = classify_source_category_detailed(
         "aptekonline", "361", label_az="Uşaqlar üçün ağız boşluğuna qulluq"

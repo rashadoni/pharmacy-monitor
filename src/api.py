@@ -2138,6 +2138,21 @@ def dash_comparison(
     # Ярлыки тянем ОДИН раз до цикла: source_category_labels сканирует Category
     # целиком, внутри цикла это был бы скан на каждый матч.
     source_labels = source_category_labels(db) if category is not None else {}
+    # И мемоизируем классификацию по категории-источнику: order-independent
+    # классификатор прогоняет ВСЕ ~200 правил (в этом и смысл), поэтому вызов
+    # на каждый матч — это ~200 правил × ~5k матчей регэкспов на запрос вместо
+    # ~200 × ~178 категорий. Тот же приём, что в analytics.category_comparison.
+    _canonical_cache: dict[str, object] = {}
+
+    def _canonical_key_for(raw_category: str | None) -> str | None:
+        cache_key = raw_category or ""
+        if cache_key not in _canonical_cache:
+            label_ru, label_az = source_labels.get(("pharmonline", cache_key), (None, None))
+            resolved = classify_source_category(
+                "pharmonline", raw_category, label_ru=label_ru, label_az=label_az
+            )
+            _canonical_cache[cache_key] = resolved.key if resolved else None
+        return _canonical_cache[cache_key]
     out: list[ComparisonRowOut] = []
     for m in matches:
         from src.product_policy import policy_identity_eligibility
@@ -2153,16 +2168,8 @@ def dash_comparison(
             # Классифицируем ровно так же, как сводка /category-comparison —
             # со слагом И ярлыками. Классификация только по слагу расходилась бы
             # со сводкой: строка есть в сводке, а drill-down пуст.
-            label_ru, label_az = source_labels.get(
-                ("pharmonline", client_p.category or ""), (None, None)
-            )
-            canonical = classify_source_category(
-                "pharmonline",
-                client_p.category,
-                label_ru=label_ru,
-                label_az=label_az,
-            )
-            if client_p.category != category and (canonical is None or canonical.key != category):
+            canonical_key = _canonical_key_for(client_p.category)
+            if client_p.category != category and canonical_key != category:
                 continue
         # Confidence floor: низко-достоверные fuzzy-матчи (Bio Kolik ↔ Bio sprey)
         # дают ложный spread. Ручные (is_manual) показываем всегда.
