@@ -26,7 +26,7 @@
     "updating": "Updating…",
     "error": "Failed to load",
     "financial_data_paused": "Financial comparisons are temporarily hidden while the system waits for a fresh, verified full catalog from all three sites with confirmed manufacturing country and availability.",
-    "system_degraded": "The latest run failed. Data and recommendations may be incomplete; check the run status.",
+    "system_degraded": "The system requires attention. Data and recommendations may be incomplete; check the system and run status.",
     "save": "Save",
     "cancel": "Cancel",
     "delete": "Delete",

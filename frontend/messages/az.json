@@ -26,7 +26,7 @@
     "updating": "Yenilənir…",
     "error": "Yükləmə xətası",
     "financial_data_paused": "Maliyyə müqayisələri müvəqqəti gizlədilib: sistem istehsal ölkəsi və mövcudluğu yoxlanmış hər üç saytın təzə, təsdiqlənmiş tam kataloqunu gözləyir.",
-    "system_degraded": "Son icra xəta ilə başa çatdı. Məlumatlar və tövsiyələr natamam ola bilər — icraların vəziyyətini yoxlayın.",
+    "system_degraded": "Sistem diqqət tələb edir. Məlumatlar və tövsiyələr natamam ola bilər — sistemin və icraların vəziyyətini yoxlayın.",
     "save": "Saxla",
     "cancel": "Ləğv et",
     "delete": "Sil",
