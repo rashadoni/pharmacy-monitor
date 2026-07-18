@@ -1023,7 +1023,7 @@ def financially_eligible_run_ids(
     deliberately excluded. ``include_run_id`` is the one explicit in-pipeline
     exception for a classified current run whose post-processing is not done.
     """
-    from sqlalchemy import and_, desc, or_, select
+    from sqlalchemy import or_, select
     from src.product_policy import is_finalizing_trusted_run
 
     completion_filter = Run.finished_at.is_not(None)
@@ -1058,7 +1058,7 @@ def has_unfinished_run(session, *, tenant_id: int = 1) -> bool:
     combine a completed snapshot lineage with that state while any run is
     unfinished.  Stale orphan runs also remain fail-closed until recovery.
     """
-    from sqlalchemy import desc, select
+    from sqlalchemy import select
     from src.product_policy import is_finalizing_trusted_run
 
     unfinished_ids = session.scalars(
@@ -1090,7 +1090,7 @@ def latest_terminal_run(session, *, tenant_id: int | None = 1) -> Run | None:
     can therefore let an earlier-finishing partial run hide a full run that
     completed later with degraded quality.
     """
-    from sqlalchemy import desc, select
+    from sqlalchemy import select
 
     stmt = select(Run).where(
         Run.status != "running",

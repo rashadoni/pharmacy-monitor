@@ -365,10 +365,17 @@ class AloeScraper(BaseScraper):
                 codes = {code for code, _raw, _url in samples}
                 required_samples = min(2, len(group))
                 if len(samples) < required_samples or len(codes) != 1:
-                    self._set_route_status(
-                        group[0].category or "unknown",
-                        complete=False,
-                        abort_reason=f"country_id_{country_id}_unresolved",
+                    # Country enrichment is optional product metadata, not
+                    # evidence that listing pagination or card parsing lost
+                    # catalog rows. Keep the numeric ID unresolved so policy
+                    # checks cannot mistake it for a verified country.
+                    log.warning(
+                        "aloe_country_id_unresolved",
+                        country_id=country_id,
+                        category=group[0].category or "unknown",
+                        samples=len(samples),
+                        required_samples=required_samples,
+                        distinct_codes=len(codes),
                     )
                     continue
                 code, country_raw, source_url = samples[0]
@@ -384,10 +391,12 @@ class AloeScraper(BaseScraper):
             country_raw = str(mapping.get("country_raw") or "").strip()
             code, status = country_resolution(country_raw)
             if not country_raw or code is None or status != COUNTRY_RESOLVED:
-                self._set_route_status(
-                    group[0].category or "unknown",
-                    complete=False,
-                    abort_reason=f"country_id_{country_id}_invalid_mapping",
+                log.warning(
+                    "aloe_country_id_invalid_mapping",
+                    country_id=country_id,
+                    category=group[0].category or "unknown",
+                    country_raw=country_raw,
+                    resolution_status=status,
                 )
                 continue
             for product in group:

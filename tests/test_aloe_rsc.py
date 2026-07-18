@@ -260,5 +260,36 @@ async def test_aloe_country_id_requires_two_samples_when_group_has_two(
 
     assert all(product.manufacturer_country_raw == "14" for product in products)
     assert scraper.verified_country_mappings == {}
-    assert scraper._route_statuses["dermanlar"].complete is False
-    assert "unresolved" in (scraper._route_statuses["dermanlar"].abort_reason or "")
+    assert "dermanlar" not in scraper._route_statuses
+
+
+@pytest.mark.asyncio
+async def test_aloe_unknown_country_id_does_not_poison_complete_listing_route(
+    monkeypatch,
+) -> None:
+    """Regression for production run #487."""
+    payload = _product_payload(product_id=487, name="Unknown country", slug="unknown-country")
+    payload["manufacturer_country"] = 1549
+    page = _flight_html(
+        '15:[[["$","$L","487",{"data":'
+        + json.dumps(payload)
+        + '}]],false,["$","$L",null,{"currentPage":1,"lastPage":1}]]'
+    )
+
+    async def fake_fetch(self, url: str) -> str:
+        if "/catalog/filters/" in url:
+            return page
+        return '"inStock":true'
+
+    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fake_fetch)
+    scraper = AloeScraper(rate_limit_sec=0)
+
+    products = [p async for p in scraper.scrape_category("usaq-dunyasi")]
+
+    assert len(products) == 1
+    assert products[0].manufacturer_country_raw == "1549"
+    assert products[0].country_source == "aloe_api_country_id"
+    status = scraper._route_statuses["usaq-dunyasi"]
+    assert status.complete is True
+    assert status.abort_reason is None
+    assert status.visited_pages == status.expected_pages == 1
