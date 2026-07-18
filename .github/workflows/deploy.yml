@@ -1,177 +1,87 @@
 name: Deploy to Hetzner
 
-# Manual deploy (workflow_dispatch). Запускать из Actions → "Run workflow" ПОСЛЕ
-# зелёного CI на нужном коммите. Прод-деплой = явное per-deploy решение (security).
-#
-# РЕАЛЬНОСТЬ ПРОДА (2026-05-30):
-#   * /opt/pharmacy-monitor — это RSYNC-деплой, НЕ git-чекаут. Поэтому здесь rsync,
-#     а НЕ `git reset --hard` (старый infra/deploy.sh так не работает — на проде нет
-#     рабочего .git). Катит то, что в checkout этого workflow (= коммит, который
-#     выбран для прогона).
-#   * Используем существующий секрет SSH_PRIVATE_KEY (pm-scoped, тот же что scrape.yml).
-#   * pm НЕ имеет passwordless sudo по умолчанию. ОДНОРАЗОВЫЙ ПРЕРЕКВИЗИТ на сервере —
-#     дать pm узкий sudo на два restart'а, иначе шаг restart упадёт:
-#       echo 'pm ALL=(root) NOPASSWD: /usr/bin/systemctl restart pharmacy-monitor-api.service, /usr/bin/systemctl restart pharmacy-monitor-frontend.service' \
-#         | sudo tee /etc/sudoers.d/pm-deploy && sudo chmod 440 /etc/sudoers.d/pm-deploy
-#   * АЛЕМБИК ПО УМОЛЧАНИЮ НЕ ЗАПУСКАЕТСЯ: миграции включаются явным флагом
-#     apply_migrations и только после проверенного backup. Канонический каталог
-#     versions синхронизируется с --delete; несколько heads останавливают deploy.
-
 on:
   workflow_dispatch:
     inputs:
       apply_migrations:
-        description: "After a verified backup, upgrade the production DB to the single Alembic head"
+        description: "Compatibility input; ignored by Aloe-only hotfix"
         type: boolean
         required: true
         default: false
 
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 jobs:
   deploy:
-    name: rsync deploy
+    name: aloe-only rsync deploy
     runs-on: ubuntu-latest
-    concurrency:
-      group: deploy-prod
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup SSH key (pm)
+      - name: Setup pinned SSH key (pm)
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          if [ -z "$SSH_PRIVATE_KEY" ]; then
-            echo "::error::secret SSH_PRIVATE_KEY is empty/unset — cannot deploy"
-            exit 1
-          fi
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
           mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' \
+            '|1|tVfkqCdl1dxn7v0V+vFAb8AGGDU=|+mE7K9OBJQ7+XZPA8mu+uZrBQnE= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            > ~/.ssh/known_hosts
 
-      - name: Preflight production DB revision against checkout
+      - name: Backup and deploy Aloe scraper
         run: |
           set -euo pipefail
-          current_output=$(ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            cd /opt/pharmacy-monitor
-            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
-            test -n "$db_url"
-            DATABASE_URL="$db_url" .venv/bin/alembic current')
-          printf '%s\n' "$current_output"
-          current_count=$(printf '%s\n' "$current_output" | sed '/^[[:space:]]*$/d' | wc -l)
-          test "$current_count" -eq 1
-          current_revision=$(printf '%s\n' "$current_output" | awk 'NF {print $1}')
-          if ! grep -Rqs --include='*.py' "revision: str = \"$current_revision\"" migrations/versions; then
-            echo "::error::production DB revision $current_revision is absent from checkout; refusing rsync --delete"
+          remote_path=/opt/pharmacy-monitor/src/scrapers/aloe.py
+          backup_path=/tmp/aloe.py.pre-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+          ssh_base="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15"
+
+          aloe_state=$($ssh_base pm@46.225.149.52 \
+            'systemctl is-active pharmacy-monitor-scrape@aloe.service || true')
+          if [ "$aloe_state" = active ]; then
+            echo "::error::Aloe scrape is active; refusing an in-place hotfix"
             exit 1
           fi
 
-      - name: Preflight deployment paths are writable
+          backup_sha=$($ssh_base pm@46.225.149.52 \
+            "set -euo pipefail; test -f '$remote_path'; test -w '$remote_path'; test ! -e '$backup_path'; cp --no-clobber -- '$remote_path' '$backup_path'; sha256sum '$backup_path'" \
+            | awk '{print $1}')
+          test -n "$backup_sha"
+          printf 'BACKUP_PATH=%s\nBACKUP_SHA=%s\n' "$backup_path" "$backup_sha" >> "$GITHUB_ENV"
+
+          rsync -z --checksum --inplace --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            src/scrapers/aloe.py "pm@46.225.149.52:$remote_path"
+
+      - name: Verify Aloe scraper and API
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            source_bad=$(find \
-              /opt/pharmacy-monitor/src \
-              /opt/pharmacy-monitor/migrations/versions \
-              -xdev \
-              \( -name __pycache__ -o -name "*.pyc" \) -prune -o \
-              ! -writable -print -quit)
-            if [ -n "$source_bad" ]; then
-              printf "deployment path is not writable by pm: %s\n" "$source_bad" >&2
-              exit 1
-            fi
+          remote_path=/opt/pharmacy-monitor/src/scrapers/aloe.py
+          ssh_base="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15"
+          local_sha=$(sha256sum src/scrapers/aloe.py | awk '{print $1}')
+          remote_sha=$($ssh_base pm@46.225.149.52 "sha256sum '$remote_path'" | awk '{print $1}')
+          printf 'local_sha=%s\nremote_sha=%s\nbackup=%s\n' \
+            "$local_sha" "$remote_sha" "$BACKUP_PATH"
+          test "$local_sha" = "$remote_sha"
+          $ssh_base pm@46.225.149.52 \
+            'cd /opt/pharmacy-monitor && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -c "from src.scrapers.aloe import AloeScraper"'
+          $ssh_base pm@46.225.149.52 \
+            'curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"'
 
-            frontend_bad=$(find /opt/pharmacy-monitor/frontend -xdev \
-              \( -name node_modules -o -name .next -o -name test-results \
-                 -o -name "*.tsbuildinfo" \) -prune -o \
-              ! -writable -print -quit)
-            if [ -n "$frontend_bad" ]; then
-              printf "deployment path is not writable by pm: %s\n" "$frontend_bad" >&2
-              exit 1
-            fi'
-
-      - name: Preflight least-privilege service restart
+      - name: Roll back Aloe scraper after failed deploy or verification
+        if: ${{ failure() && env.BACKUP_PATH != '' }}
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            for service in \
-              pharmacy-monitor-api.service \
-              pharmacy-monitor-frontend.service
-            do
-              test "$(systemctl show --property User --value "$service")" = pm
-
-              fragment=$(systemctl show --property FragmentPath --value "$service")
-              test -n "$fragment"
-              test "$(stat -c %U "$fragment")" = root
-              test ! -w "$fragment"
-
-              for dropin in $(systemctl show --property DropInPaths --value "$service")
-              do
-                test "$(stat -c %U "$dropin")" = root
-                test ! -w "$dropin"
-              done
-
-              sudo -n -l /usr/bin/systemctl restart "$service" >/dev/null
-            done'
-
-      - name: Rsync code -> prod (src + frontend + canonical migrations)
-        run: |
-          set -euo pipefail
-          rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
-            --exclude='__pycache__/' --exclude='*.pyc' \
-            src/ pm@46.225.149.52:/opt/pharmacy-monitor/src/
-          rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
-            --exclude='node_modules/' --exclude='.next/' --exclude='*.tsbuildinfo' --exclude='test-results/' \
-            frontend/ pm@46.225.149.52:/opt/pharmacy-monitor/frontend/
-          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
-            --exclude='__pycache__/' --exclude='*.pyc' \
-            frontend/src/ pm@46.225.149.52:/opt/pharmacy-monitor/frontend/src/
-          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
-            --exclude='__pycache__/' --exclude='*.pyc' \
-            migrations/versions/ pm@46.225.149.52:/opt/pharmacy-monitor/migrations/versions/
-
-      - name: Verify migration graph has one head
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            cd /opt/pharmacy-monitor
-            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
-            test -n "$db_url"
-            heads=$(.venv/bin/alembic heads)
-            printf "%s\n" "$heads"
-            test "$(printf "%s\n" "$heads" | sed "/^[[:space:]]*$/d" | wc -l)" -eq 1
-            DATABASE_URL="$db_url" .venv/bin/alembic current'
-
-      - name: Verified backup + apply migrations
-        if: ${{ inputs.apply_migrations }}
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            cd /opt/pharmacy-monitor
-            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
-            test -n "$db_url"
-            bash infra/scripts/backup.sh
-            DATABASE_URL="$db_url" .venv/bin/alembic upgrade head
-            current=$(DATABASE_URL="$db_url" .venv/bin/alembic current | awk "NF {print \$1}")
-            head=$(.venv/bin/alembic heads | awk "NF {print \$1}")
-            test "$current" = "$head"
-            printf "migration current=head=%s\n" "$current"'
-
-      - name: Build frontend + restart services
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            cd /opt/pharmacy-monitor/frontend
-            NODE_OPTIONS=--max-old-space-size=4096 pnpm install --frozen-lockfile
-            NODE_OPTIONS=--max-old-space-size=4096 pnpm build
-            sudo -n /usr/bin/systemctl restart pharmacy-monitor-api.service
-            sudo -n /usr/bin/systemctl restart pharmacy-monitor-frontend.service'
-
-      - name: Health check
-        run: |
-          set -euo pipefail
-          sleep 5
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"
-            curl -fsSL -o /dev/null -w "frontend HTTP %{http_code}\n" http://127.0.0.1:3000/ru/login
-            curl -fsSL http://127.0.0.1:3000/ru/login | grep -q "<html lang=\"ru\""'
+          remote_path=/opt/pharmacy-monitor/src/scrapers/aloe.py
+          ssh_base="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15"
+          $ssh_base pm@46.225.149.52 \
+            "set -euo pipefail; test -f '$BACKUP_PATH'; cp -- '$BACKUP_PATH' '$remote_path'"
+          restored_sha=$($ssh_base pm@46.225.149.52 "sha256sum '$remote_path'" | awk '{print $1}')
+          printf 'rollback_sha=%s\nexpected_backup_sha=%s\n' "$restored_sha" "$BACKUP_SHA"
+          test "$restored_sha" = "$BACKUP_SHA"
+          $ssh_base pm@46.225.149.52 \
+            'cd /opt/pharmacy-monitor && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -c "from src.scrapers.aloe import AloeScraper"'
