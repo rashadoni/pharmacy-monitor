@@ -16,6 +16,66 @@ def _session_factory(db_session):
     return sessionmaker(bind=db_session.get_bind(), expire_on_commit=False, autoflush=False)
 
 
+def _patch_verified_aloe_pipeline(db_session, monkeypatch):
+    from src import alerts
+
+    async def fake_scrape_all(*args, **kwargs):
+        return [
+            ScrapeResult(
+                site="aloe",
+                products=[
+                    ScrapedProduct(
+                        site="aloe",
+                        external_id="aloe-sku",
+                        url="https://aloe.example/sku",
+                        name="Trusted Aloe SKU",
+                        category="cat",
+                    )
+                ],
+                category_counts={"cat": 1},
+                route_statuses={
+                    "cat": RouteStatus(
+                        complete=True,
+                        raw_items=1,
+                        parsed_items=1,
+                        expected_items=1,
+                    )
+                },
+            )
+        ]
+
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "shadow")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "shadow")
+    monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "0")
+    monkeypatch.setattr(storage, "init_db", lambda: None)
+    monkeypatch.setattr(storage, "make_session", lambda: _session_factory(db_session))
+    monkeypatch.setattr(main_mod, "maybe_seed_categories", lambda session: None)
+    monkeypatch.setattr(
+        main_mod.watchlist,
+        "categories_for_site",
+        lambda session, site, only_category_id=None: ["cat"],
+    )
+    monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *args: {"aloe": 1})
+    monkeypatch.setattr(main_mod, "scrape_all", fake_scrape_all)
+    monkeypatch.setattr(main_mod, "persist_results", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(main_mod, "persist_aloe_country_mappings", lambda *args: None)
+    monkeypatch.setattr(main_mod, "load_aloe_country_map", lambda *args: {})
+    monkeypatch.setattr(main_mod, "_smoke_test_per_site_coverage", lambda *args: None)
+    monkeypatch.setattr(main_mod.matcher, "match_products", lambda session: 0)
+    monkeypatch.setattr(main_mod.matcher, "revalidate_split", lambda session: [])
+    monkeypatch.setattr(main_mod.matcher, "flag_suspected_mismatches", lambda session: 0)
+    monkeypatch.setattr(alerts, "evaluate_rules", lambda *args: [])
+    monkeypatch.setattr(
+        main_mod.analyzer,
+        "analyze",
+        lambda *args: SimpleNamespace(run_started_at=utcnow()),
+    )
+    monkeypatch.setattr(main_mod.reporter, "render_html", lambda report: "ok")
+    monkeypatch.setattr(main_mod.reporter, "render_excel", lambda report: b"ok")
+    monkeypatch.setattr(main_mod.reporter, "email_subject", lambda report: "ok")
+    monkeypatch.setattr(main_mod.reporter, "excel_filename", lambda report: "ok.xlsx")
+
+
 def test_revalidation_failure_marks_run_and_request_failed_before_outputs(db_session, monkeypatch):
     request = storage.ScrapeRequest(
         tenant_id=1,
@@ -228,6 +288,165 @@ def test_verified_full_run_finalizes_outputs_before_external_publish(db_session,
         assert {row.client_site for row in rows} == set(sites)
         assert all(f":{run.id}" in row.trust_epoch for row in rows)
         assert roi.get_cached_actions(verify, "pharmonline") == []
+    finally:
+        verify.close()
+
+
+def test_verified_single_site_run_defers_roi_when_other_site_attempt_is_degraded(
+    db_session,
+    monkeypatch,
+):
+    from src import roi
+
+    sites = ("pharmonline", "aptekonline", "aloe")
+    old_verified = storage.Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="ok",
+        catalog_scope="full",
+        full_catalog_sites=",".join(sites),
+        catalog_verified=True,
+        catalog_verification_reason="verified fixture",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {site: {"status": "ok"} for site in sites},
+        },
+    )
+    db_session.add(old_verified)
+    db_session.commit()
+
+    degraded_aptek = storage.Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        status="degraded",
+        catalog_scope="full",
+        full_catalog_sites="aptekonline",
+        catalog_verified=False,
+        catalog_verification_reason="fixture route loss",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"aptekonline": {"status": "degraded"}},
+        },
+    )
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add_all([degraded_aptek, request])
+    db_session.commit()
+    degraded_aptek_id = degraded_aptek.id
+    request_id = request.id
+
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is False
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+    refresh_calls: list[int] = []
+
+    def forbidden_refresh(session, *, run_id, tenant_id=1):
+        refresh_calls.append(run_id)
+        raise AssertionError("ROI refresh must be deferred while inputs are unverified")
+
+    monkeypatch.setattr(roi, "refresh_all_cached_actions", forbidden_refresh)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            main_mod.cli,
+            [
+                "run",
+                "--site",
+                "aloe",
+                "--mode",
+                "category",
+                "--no-alerts",
+                "--request-id",
+                str(request_id),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        saved_request = verify.get(storage.ScrapeRequest, request_id)
+        assert run is not None
+        assert run.status == "ok"
+        assert run.catalog_verified is True
+        assert run.error_message is None
+        assert saved_request is not None
+        assert saved_request.status == "ok"
+        assert saved_request.run_id == run.id
+        attempts = storage.latest_full_catalog_attempts_by_site(
+            verify,
+            sites,
+            tenant_id=1,
+        )
+        assert attempts["aloe"].id == run.id
+        assert attempts["aptekonline"].id == degraded_aptek_id
+        assert roi.financial_inputs_are_fresh(verify, tenant_id=1) is False
+    finally:
+        verify.close()
+    assert refresh_calls == []
+
+
+def test_verified_run_still_fails_when_ready_roi_refresh_returns_failure(
+    db_session,
+    monkeypatch,
+):
+    from src import roi
+
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add(request)
+    db_session.commit()
+    request_id = request.id
+
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+    monkeypatch.setattr(
+        roi,
+        "financial_inputs_are_fresh",
+        lambda session, *, tenant_id: True,
+    )
+    monkeypatch.setattr(
+        roi,
+        "refresh_all_cached_actions",
+        lambda session, *, run_id, tenant_id=1: {
+            "pharmonline": 0,
+            "aptekonline": -1,
+            "aloe": 0,
+        },
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            main_mod.cli,
+            [
+                "run",
+                "--site",
+                "aloe",
+                "--mode",
+                "category",
+                "--no-alerts",
+                "--request-id",
+                str(request_id),
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "ROI refresh failed for trusted epoch: aptekonline" in result.output
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        saved_request = verify.get(storage.ScrapeRequest, request_id)
+        assert run is not None
+        assert run.status == "failed"
+        assert run.catalog_verified is True
+        assert "ROI refresh failed for trusted epoch: aptekonline" in (run.error_message or "")
+        assert saved_request is not None
+        assert saved_request.status == "failed"
+        assert saved_request.run_id == run.id
     finally:
         verify.close()
 

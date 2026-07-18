@@ -2912,20 +2912,41 @@ def run_cmd(
             # сайтов и сохранить в roi_actions_cache. HTTP-handler
             # /dash/roi/actions читает оттуда → <50мс latency вместо
             # 15-30с inline compute (timeout'ило с 408 на 4 экранах).
-            # A verified full Run is not published until every cache slice is
-            # refreshed for its exact trusted epoch.  Partial/watchlist runs
-            # never publish a new catalog epoch and therefore do not rewrite
-            # this cache.
+            # When all three sites form a trusted epoch, every cache slice must
+            # refresh successfully before the current run is published.  If a
+            # different site's latest full attempt already closed that global
+            # gate, cache publication is deferred while this producer's own
+            # verified status remains truthful.  Partial/watchlist runs never
+            # publish a catalog epoch and therefore do not rewrite this cache.
             if is_full_catalog and run.catalog_verified:
                 from src import roi as _roi
 
-                summary = _roi.refresh_all_cached_actions(session, run_id=run_id)
-                log.info("roi_cache_refreshed", run_id=run_id, **summary)
-                failed_sites = [site for site, value in summary.items() if value < 0]
-                if failed_sites:
-                    raise RuntimeError(
-                        "ROI refresh failed for trusted epoch: "
-                        + ",".join(sorted(failed_sites))
+                if _roi.financial_inputs_are_fresh(
+                    session,
+                    tenant_id=run.tenant_id,
+                ):
+                    summary = _roi.refresh_all_cached_actions(
+                        session,
+                        run_id=run_id,
+                        tenant_id=run.tenant_id,
+                    )
+                    log.info("roi_cache_refreshed", run_id=run_id, **summary)
+                    failed_sites = [site for site, value in summary.items() if value < 0]
+                    if failed_sites:
+                        raise RuntimeError(
+                            "ROI refresh failed for trusted epoch: "
+                            + ",".join(sorted(failed_sites))
+                        )
+                else:
+                    # A verified per-site producer remains successful even when
+                    # another site's latest full attempt is degraded or stale.
+                    # ROI reads independently fail closed on the same freshness
+                    # guard; a later verified site run will refresh the cache
+                    # once the complete three-site epoch is trustworthy again.
+                    log.warning(
+                        "roi_cache_refresh_deferred_unverified_inputs",
+                        run_id=run_id,
+                        tenant_id=run.tenant_id,
                     )
             else:
                 log.warning(
