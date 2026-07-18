@@ -849,6 +849,28 @@ def _require_financial_policy_ready(db: Session, *, tenant_id: int = 1) -> None:
         )
 
 
+def _trusted_snapshot_lineage_available(
+    db: Session,
+    *,
+    tenant_id: int = 1,
+) -> bool:
+    """Whether every required site has a fresh verified full-catalog Run.
+
+    A single site's first financially eligible Run is not a complete price
+    lineage. With diff-only persistence that Run can legitimately contain no
+    PriceSnapshot rows when prices stayed unchanged. Enabling the eligible-run
+    filter at that point would discard the older effective prices for every
+    site and turn comparison endpoints into an empty 200 response.
+
+    Shadow mode therefore keeps the latest effective snapshots until a full
+    cross-site trusted epoch exists. Enforce mode remains fail-closed in
+    ``_require_financial_policy_ready`` above.
+    """
+    from src.product_policy import trusted_catalog_epoch
+
+    return trusted_catalog_epoch(db, tenant_id=tenant_id) is not None
+
+
 # ─── Auth endpoints (frontend) ───────────────────────────────────────────────
 
 
@@ -2116,16 +2138,15 @@ def dash_comparison(
     # после diff-only persist'а (2026-05-09) прошлая логика `WHERE run_id ==
     # last_run` пропускала продукты без price-changes в last_run.
     all_pids = [p.id for m in matches for p in m.products]
-    # Rollout starts in shadow mode.  Until the first financially-eligible full
-    # catalog exists there is no trusted snapshot lineage to select, and an
-    # unconditional lineage filter would turn a healthy comparison catalog into
-    # an empty 200 response.  In that bootstrap state only, shadow mode serves
-    # the latest snapshots while the hard product gates below still exclude
-    # known country conflicts, dead URLs and explicit out-of-stock offers.
-    # Enforce mode cannot reach this point without a trusted catalog because
-    # `_require_financial_policy_ready` fails closed with 503.
-    trusted_lineage_available = bool(
-        storage.financially_eligible_run_ids(db, tenant_id=user.tenant_id)
+    # Independent site producers reach their first verified full run at
+    # different times. A single site's eligible diff-only run is not a complete
+    # cross-site snapshot lineage and may contain zero snapshots when no prices
+    # changed. Keep the shadow fallback until every required site contributes a
+    # fresh verified full run; hard product gates below still exclude unsafe
+    # offers, and enforce mode already fails closed above.
+    trusted_lineage_available = _trusted_snapshot_lineage_available(
+        db,
+        tenant_id=user.tenant_id,
     )
     snaps_by_pid = storage.latest_snapshots_per_product(
         db,
@@ -5702,12 +5723,11 @@ def products_list(
 @app.get("/api/v1/comparisons", dependencies=[Depends(require_api_key)])
 def comparisons(db: Session = Depends(get_db)):
     _require_financial_policy_ready(db)
-    # Keep the API-key endpoint aligned with the dashboard during a shadow
-    # rollout: before the first trusted full-catalog Run exists, serve the
-    # latest snapshots while identity/availability guards still filter unsafe
-    # offers. Enforce mode remains fail-closed above.
-    trusted_lineage_available = bool(
-        storage.financially_eligible_run_ids(db, tenant_id=1)
+    # Keep the API-key endpoint aligned with the dashboard: a single trusted
+    # site's diff-only run is not a complete cross-site snapshot lineage.
+    trusted_lineage_available = _trusted_snapshot_lineage_available(
+        db,
+        tenant_id=1,
     )
     last_run = db.scalar(
         select(storage.Run.id)

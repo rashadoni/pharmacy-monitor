@@ -926,6 +926,102 @@ def test_dash_comparison_shadow_bootstraps_without_trusted_lineage(
     assert rows[0]["prices"]["aloe"]["price"] == 8.0
 
 
+def test_comparisons_keep_diff_only_history_with_one_trusted_site(
+    client, auth_cookie, setup_db, monkeypatch
+):
+    """One site's trusted run is not a complete cross-site price lineage."""
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "shadow")
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "shadow")
+    now = utcnow()
+    baseline = storage.Run(
+        tenant_id=1,
+        started_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        status="ok",
+        catalog_scope="partial",
+        catalog_verified=False,
+        run_quality={
+            "baseline_enforced": False,
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {},
+        },
+    )
+    setup_db.add(baseline)
+    setup_db.flush()
+    match = storage.Match(
+        tenant_id=1,
+        canonical_name="Partial trusted lineage",
+        confidence=1.0,
+    )
+    setup_db.add(match)
+    setup_db.flush()
+    for site, price in (("pharmonline", 10.0), ("aloe", 8.0)):
+        product = storage.Product(
+            tenant_id=1,
+            site=site,
+            external_id=f"partial-trusted-{site}",
+            url=f"https://example.com/{site}/partial-trusted",
+            name="Partial trusted lineage",
+            name_normalized="partial trusted lineage",
+            canonical_id=match.id,
+            manufacturer_country_code="rs",
+            country_resolution_status="resolved",
+            offer_availability_status="in_stock",
+            availability_observed_at=now,
+            last_seen_at=now,
+        )
+        setup_db.add(product)
+        setup_db.flush()
+        setup_db.add(
+            storage.PriceSnapshot(
+                run_id=baseline.id,
+                product_id=product.id,
+                price=price,
+            )
+        )
+
+    # Mirrors production run #491: Aloe completed a trusted full scan, but
+    # diff-only persistence emitted no PriceSnapshot because prices did not
+    # change. Pharmonline and Aptekonline still lack trusted full runs.
+    aloe_full = storage.Run(
+        tenant_id=1,
+        started_at=now,
+        finished_at=now,
+        status="ok",
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=True,
+        catalog_verification_reason="complete_nonzero_coverage_ok",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {"aloe": {"status": "ok"}},
+        },
+    )
+    setup_db.add(aloe_full)
+    setup_db.commit()
+
+    dashboard = client.get(
+        "/api/v1/dash/comparison?search=Partial%20trusted%20lineage"
+    )
+    legacy = client.get(
+        "/api/v1/comparisons",
+        headers={"X-API-Key": "test-key-1234"},
+    )
+
+    assert dashboard.status_code == 200, dashboard.text
+    assert legacy.status_code == 200, legacy.text
+    dashboard_row = dashboard.json()[0]
+    legacy_row = next(
+        row for row in legacy.json() if row["name"] == "Partial trusted lineage"
+    )
+    for row in (dashboard_row, legacy_row):
+        assert row["prices"]["pharmonline"]["price"] == 10.0
+        assert row["prices"]["aloe"]["price"] == 8.0
+
+
 def test_dash_runs_latest_by_site_includes_weekly_site(client, auth_cookie, setup_db):
     """Latest-by-site keeps aptekonline visible even when global recent runs are newer."""
 
