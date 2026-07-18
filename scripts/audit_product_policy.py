@@ -197,8 +197,7 @@ def main() -> None:
                     samples = [_fetch_aloe(product, client) for product in group[:2]]
                     samples = [sample for sample in samples if sample is not None]
                     codes = {
-                        country_resolution(sample.manufacturer_country_raw)[0]
-                        for sample in samples
+                        country_resolution(sample.manufacturer_country_raw)[0] for sample in samples
                     }
                     codes.discard(None)
                     required = min(2, len(group))
@@ -207,8 +206,7 @@ def main() -> None:
                     country_raw = next(
                         sample.manufacturer_country_raw
                         for sample in samples
-                        if country_resolution(sample.manufacturer_country_raw)[0]
-                        in codes
+                        if country_resolution(sample.manufacturer_country_raw)[0] in codes
                     )
                     country_code = country_resolution(country_raw)[0]
                     mapping = session.scalar(
@@ -231,10 +229,7 @@ def main() -> None:
                                 verified_at=observed_at,
                             )
                         )
-                    elif (
-                        mapping.country_code != country_code
-                        or mapping.country_raw != country_raw
-                    ):
+                    elif mapping.country_code != country_code or mapping.country_raw != country_raw:
                         mapping.country_code = country_code
                         mapping.country_raw = country_raw
                         mapping.source_url = source_url

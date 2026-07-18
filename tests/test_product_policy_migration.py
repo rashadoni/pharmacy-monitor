@@ -30,9 +30,7 @@ def test_identity_offer_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
     inspector = inspect(create_engine(db_url))
     product_columns = {column["name"] for column in inspector.get_columns("products")}
     run_columns = {column["name"] for column in inspector.get_columns("runs")}
-    roi_cache_columns = {
-        column["name"] for column in inspector.get_columns("roi_actions_cache")
-    }
+    roi_cache_columns = {column["name"] for column in inspector.get_columns("roi_actions_cache")}
     assert {
         "catalog_scope",
         "full_catalog_sites",
@@ -50,18 +48,14 @@ def test_identity_offer_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
         "offer_observations",
         "match_policy_audits",
         "aloe_country_mappings",
-    } <= set(
-        inspector.get_table_names()
-    )
+    } <= set(inspector.get_table_names())
 
     _alembic(db_url, "downgrade", "0016_supplier_price_unique")
     inspector = inspect(create_engine(db_url))
     assert "manufacturer_country_code" not in {
         column["name"] for column in inspector.get_columns("products")
     }
-    assert "catalog_verified" not in {
-        column["name"] for column in inspector.get_columns("runs")
-    }
+    assert "catalog_verified" not in {column["name"] for column in inspector.get_columns("runs")}
     assert "policy_fingerprint" not in {
         column["name"] for column in inspector.get_columns("roi_actions_cache")
     }

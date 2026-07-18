@@ -69,6 +69,7 @@ def is_finalizing_trusted_run(run_id: int | None) -> bool:
     """Return true only inside the scoped internal finalization window."""
     return run_id is not None and _FINALIZING_TRUSTED_RUN_ID.get() == run_id
 
+
 # ISO-3166 alpha-2 allowlist.  Accepting arbitrary two-letter strings (``xx``)
 # would turn dirty source values into false identity conflicts and auto-splits.
 _ISO_ALPHA2 = frozenset(
@@ -287,23 +288,85 @@ _COUNTRY_ALIASES: dict[str, str] = {
 # Source catalogs also contain ISO alpha-3 and a handful of established local
 # three-letter exports.  The map is explicit: unknown codes remain invalid.
 _ISO_ALPHA3_TO_ALPHA2: dict[str, str] = {
-    "alb": "al", "arg": "ar", "aze": "az", "aus": "au", "aut": "at",
-    "bel": "be", "bgd": "bd", "bgr": "bg", "bol": "bo", "bra": "br",
-    "can": "ca", "che": "ch", "chn": "cn", "cin": "cn", "col": "co",
-    "cyp": "cy", "cze": "cz", "deu": "de", "ger": "de", "dnk": "dk",
-    "egy": "eg", "eng": "gb", "esp": "es", "est": "ee", "fin": "fi",
-    "fra": "fr", "gbr": "gb", "geo": "ge", "grc": "gr", "gre": "gr",
-    "hrv": "hr", "hun": "hu", "idn": "id", "ind": "in", "irl": "ie",
-    "irn": "ir", "isr": "il", "ita": "it", "jap": "jp", "jpn": "jp",
-    "jor": "jo", "kaz": "kz", "kor": "kr", "lva": "lv", "lat": "lv",
-    "ltu": "lt", "mda": "md", "mkd": "mk", "mys": "my", "mal": "my",
-    "nld": "nl", "nor": "no", "nzl": "nz", "pak": "pk", "pol": "pl",
-    "prt": "pt", "rou": "ro", "rum": "ro", "rus": "ru", "sau": "sa",
-    "sgp": "sg", "srb": "rs", "svk": "sk", "svn": "si", "swe": "se",
-    "tha": "th", "tay": "th", "tkm": "tm", "tur": "tr", "ukr": "ua",
-    "usa": "us", "uzb": "uz", "vnm": "vn", "zaf": "za",
+    "alb": "al",
+    "arg": "ar",
+    "aze": "az",
+    "aus": "au",
+    "aut": "at",
+    "bel": "be",
+    "bgd": "bd",
+    "bgr": "bg",
+    "bol": "bo",
+    "bra": "br",
+    "can": "ca",
+    "che": "ch",
+    "chn": "cn",
+    "cin": "cn",
+    "col": "co",
+    "cyp": "cy",
+    "cze": "cz",
+    "deu": "de",
+    "ger": "de",
+    "dnk": "dk",
+    "egy": "eg",
+    "eng": "gb",
+    "esp": "es",
+    "est": "ee",
+    "fin": "fi",
+    "fra": "fr",
+    "gbr": "gb",
+    "geo": "ge",
+    "grc": "gr",
+    "gre": "gr",
+    "hrv": "hr",
+    "hun": "hu",
+    "idn": "id",
+    "ind": "in",
+    "irl": "ie",
+    "irn": "ir",
+    "isr": "il",
+    "ita": "it",
+    "jap": "jp",
+    "jpn": "jp",
+    "jor": "jo",
+    "kaz": "kz",
+    "kor": "kr",
+    "lva": "lv",
+    "lat": "lv",
+    "ltu": "lt",
+    "mda": "md",
+    "mkd": "mk",
+    "mys": "my",
+    "mal": "my",
+    "nld": "nl",
+    "nor": "no",
+    "nzl": "nz",
+    "pak": "pk",
+    "pol": "pl",
+    "prt": "pt",
+    "rou": "ro",
+    "rum": "ro",
+    "rus": "ru",
+    "sau": "sa",
+    "sgp": "sg",
+    "srb": "rs",
+    "svk": "sk",
+    "svn": "si",
+    "swe": "se",
+    "tha": "th",
+    "tay": "th",
+    "tkm": "tm",
+    "tur": "tr",
+    "ukr": "ua",
+    "usa": "us",
+    "uzb": "uz",
+    "vnm": "vn",
+    "zaf": "za",
     # Stable non-ISO exports observed in Aptekonline.
-    "isp": "es", "ior": "jo", "xor": "hr", "avs": "at",
+    "isp": "es",
+    "ior": "jo",
+    "xor": "hr",
+    "avs": "at",
 }
 
 
@@ -407,9 +470,7 @@ def full_catalog_trust_report(
             .where(
                 storage.Run.tenant_id == tenant_id,
                 storage.Run.catalog_scope == "full",
-                ("," + storage.Run.full_catalog_sites + ",").like(
-                    f"%,{site},%"
-                ),
+                ("," + storage.Run.full_catalog_sites + ",").like(f"%,{site},%"),
             )
             .order_by(desc(storage.Run.id))
             .limit(1)
@@ -443,48 +504,52 @@ def full_catalog_trust_report(
             == (relevant_run.id if relevant_run is not None else -1),
             storage.Product.site == site,
         )
-        total = session.scalar(
-            select(func.count(func.distinct(storage.OfferObservation.product_id)))
-            .join(
-                storage.Product,
-                storage.Product.id == storage.OfferObservation.product_id,
+        total = (
+            session.scalar(
+                select(func.count(func.distinct(storage.OfferObservation.product_id)))
+                .join(
+                    storage.Product,
+                    storage.Product.id == storage.OfferObservation.product_id,
+                )
+                .where(*observation_filters)
             )
-            .where(*observation_filters)
-        ) or 0
-        country_resolved = session.scalar(
-            select(func.count(func.distinct(storage.OfferObservation.product_id)))
-            .join(
-                storage.Product,
-                storage.Product.id == storage.OfferObservation.product_id,
+            or 0
+        )
+        country_resolved = (
+            session.scalar(
+                select(func.count(func.distinct(storage.OfferObservation.product_id)))
+                .join(
+                    storage.Product,
+                    storage.Product.id == storage.OfferObservation.product_id,
+                )
+                .where(
+                    *observation_filters,
+                    storage.OfferObservation.country_resolution_status == COUNTRY_RESOLVED,
+                    storage.OfferObservation.country_code.is_not(None),
+                )
             )
-            .where(
-                *observation_filters,
-                storage.OfferObservation.country_resolution_status
-                == COUNTRY_RESOLVED,
-                storage.OfferObservation.country_code.is_not(None),
+            or 0
+        )
+        availability_known = (
+            session.scalar(
+                select(func.count(func.distinct(storage.OfferObservation.product_id)))
+                .join(
+                    storage.Product,
+                    storage.Product.id == storage.OfferObservation.product_id,
+                )
+                .where(
+                    *observation_filters,
+                    storage.OfferObservation.availability_status.in_(
+                        (OFFER_IN_STOCK, OFFER_OUT_OF_STOCK)
+                    ),
+                )
             )
-        ) or 0
-        availability_known = session.scalar(
-            select(func.count(func.distinct(storage.OfferObservation.product_id)))
-            .join(
-                storage.Product,
-                storage.Product.id == storage.OfferObservation.product_id,
-            )
-            .where(
-                *observation_filters,
-                storage.OfferObservation.availability_status.in_(
-                    (OFFER_IN_STOCK, OFFER_OUT_OF_STOCK)
-                ),
-            )
-        ) or 0
+            or 0
+        )
         country_pct = round(country_resolved / total * 100, 2) if total else 0.0
-        availability_pct = (
-            round(availability_known / total * 100, 2) if total else 0.0
-        )
+        availability_pct = round(availability_known / total * 100, 2) if total else 0.0
         country_ready = total > 0 and country_pct >= _MIN_POLICY_COVERAGE_PCT
-        availability_ready = (
-            total > 0 and availability_pct >= _MIN_POLICY_COVERAGE_PCT
-        )
+        availability_ready = total > 0 and availability_pct >= _MIN_POLICY_COVERAGE_PCT
         sites.append(
             {
                 "site": site,
@@ -493,19 +558,13 @@ def full_catalog_trust_report(
                 "country_coverage_pct": country_pct,
                 "availability_known": availability_known,
                 "availability_coverage_pct": availability_pct,
-                "latest_full_attempt_id": (
-                    latest_attempt.id if latest_attempt else None
-                ),
-                "latest_full_attempt_status": (
-                    latest_attempt.status if latest_attempt else None
-                ),
+                "latest_full_attempt_id": (latest_attempt.id if latest_attempt else None),
+                "latest_full_attempt_status": (latest_attempt.status if latest_attempt else None),
                 "latest_full_attempt_verified": bool(
                     latest_attempt and latest_attempt.catalog_verified
                 ),
                 "latest_full_attempt_reason": (
-                    latest_attempt.catalog_verification_reason
-                    if latest_attempt
-                    else None
+                    latest_attempt.catalog_verification_reason if latest_attempt else None
                 ),
                 "full_catalog_run_id": relevant_run.id if relevant_run else None,
                 "full_catalog_at": run_at,
@@ -519,15 +578,12 @@ def full_catalog_trust_report(
 
     country_mode = "enforce" if country_policy_enforced() else "shadow"
     availability_mode = "enforce" if availability_policy_enforced() else "shadow"
-    country_ready = all(
-        row["full_catalog_fresh"] and row["country_ready"] for row in sites
-    )
+    country_ready = all(row["full_catalog_fresh"] and row["country_ready"] for row in sites)
     availability_ready = all(
         row["full_catalog_fresh"] and row["availability_ready"] for row in sites
     )
-    policy_ready = (
-        (not country_policy_enforced() or country_ready)
-        and (not availability_policy_enforced() or availability_ready)
+    policy_ready = (not country_policy_enforced() or country_ready) and (
+        not availability_policy_enforced() or availability_ready
     )
     return {
         "country_mode": country_mode,
@@ -687,8 +743,7 @@ def current_offer_sql(Product, *, now: datetime | None = None):
     site_terms = [
         and_(
             Product.site == site,
-            Product.availability_observed_at
-            >= current - timedelta(hours=max_age),
+            Product.availability_observed_at >= current - timedelta(hours=max_age),
         )
         for site, max_age in OFFER_MAX_AGE_HOURS.items()
     ]

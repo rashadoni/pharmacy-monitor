@@ -27,12 +27,8 @@ def _restore(session, audit: storage.MatchPolicyAudit) -> None:
     # changed.  The shared advisory lock prevents application-level rematch;
     # row locks close the preflight-to-write race for direct concurrent SQL.
     product_ids = {int(product_id) for product_id in member_ids}
-    product_ids.update(
-        int(product_id) for product_id in (after.get("assignments") or {})
-    )
-    match_ids = {
-        int(match_id) for match_id in (after.get("match_ids") or [])
-    }
+    product_ids.update(int(product_id) for product_id in (after.get("assignments") or {}))
+    match_ids = {int(match_id) for match_id in (after.get("match_ids") or [])}
     match_ids.update(int(match_id) for match_id in (after.get("matches") or {}))
     if match_data.get("id") is not None:
         match_ids.add(int(match_data["id"]))
@@ -42,18 +38,12 @@ def _restore(session, audit: storage.MatchPolicyAudit) -> None:
             predicates.append(storage.Product.id.in_(product_ids))
         if match_ids:
             predicates.append(storage.Product.canonical_id.in_(match_ids))
-        session.scalars(
-            select(storage.Product).where(or_(*predicates)).with_for_update()
-        ).all()
+        session.scalars(select(storage.Product).where(or_(*predicates)).with_for_update()).all()
     if match_ids:
         session.scalars(
-            select(storage.Match)
-            .where(storage.Match.id.in_(match_ids))
-            .with_for_update()
+            select(storage.Match).where(storage.Match.id.in_(match_ids)).with_for_update()
         ).all()
-    rejection_ids = {
-        int(state["id"]) for state in payload.get("rejections") or []
-    }
+    rejection_ids = {int(state["id"]) for state in payload.get("rejections") or []}
     if rejection_ids:
         session.scalars(
             select(storage.MatchRejection)
@@ -67,35 +57,25 @@ def _restore(session, audit: storage.MatchPolicyAudit) -> None:
             for product_id, match_id in (after.get("assignments") or {}).items()
         }
         current_products = session.scalars(
-            select(storage.Product).where(
-                storage.Product.id.in_(expected_assignments)
-            )
+            select(storage.Product).where(storage.Product.id.in_(expected_assignments))
         ).all()
         current_by_id = {product.id: product for product in current_products}
         for product_id, expected_match_id in expected_assignments.items():
             product = current_by_id.get(product_id)
             if product is None or product.canonical_id != expected_match_id:
-                raise RuntimeError(
-                    f"rollback conflict: product {product_id} topology changed"
-                )
+                raise RuntimeError(f"rollback conflict: product {product_id} topology changed")
 
         for match_id, expected in (after.get("matches") or {}).items():
             match = session.get(storage.Match, int(match_id))
             if match is None:
-                raise RuntimeError(
-                    f"rollback conflict: expected match {match_id} is missing"
-                )
+                raise RuntimeError(f"rollback conflict: expected match {match_id} is missing")
             current_members = sorted(
                 session.scalars(
-                    select(storage.Product.id).where(
-                        storage.Product.canonical_id == int(match_id)
-                    )
+                    select(storage.Product.id).where(storage.Product.canonical_id == int(match_id))
                 ).all()
             )
             if current_members != sorted(expected.get("members") or []):
-                raise RuntimeError(
-                    f"rollback conflict: match {match_id} membership changed"
-                )
+                raise RuntimeError(f"rollback conflict: match {match_id} membership changed")
             for field in (
                 "canonical_name",
                 "canonical_brand",
@@ -107,21 +87,15 @@ def _restore(session, audit: storage.MatchPolicyAudit) -> None:
                 "needs_review",
             ):
                 if getattr(match, field) != expected.get(field):
-                    raise RuntimeError(
-                        f"rollback conflict: match {match_id} field {field} changed"
-                    )
+                    raise RuntimeError(f"rollback conflict: match {match_id} field {field} changed")
 
         if not after.get("original_match_exists", False):
             original = session.get(storage.Match, match_data["id"])
             if original is not None:
-                raise RuntimeError(
-                    "rollback conflict: dissolved original match was recreated"
-                )
+                raise RuntimeError("rollback conflict: dissolved original match was recreated")
 
         for rejection_state in payload.get("rejections") or []:
-            rejection = session.get(
-                storage.MatchRejection, int(rejection_state["id"])
-            )
+            rejection = session.get(storage.MatchRejection, int(rejection_state["id"]))
             expected = rejection_state.get("after") or {}
             if rejection is None:
                 raise RuntimeError(
@@ -129,9 +103,7 @@ def _restore(session, audit: storage.MatchPolicyAudit) -> None:
                 )
             for field in ("is_active", "reason", "reason_type", "metadata_json"):
                 if getattr(rejection, field) != expected.get(field):
-                    raise RuntimeError(
-                        f"rollback conflict: rejection {rejection.id} changed"
-                    )
+                    raise RuntimeError(f"rollback conflict: rejection {rejection.id} changed")
 
     for match_id in after.get("match_ids") or []:
         if match_id == match_data.get("id"):
@@ -168,9 +140,7 @@ def _restore(session, audit: storage.MatchPolicyAudit) -> None:
 
     if policy_version >= 2:
         for rejection_state in payload.get("rejections") or []:
-            rejection = session.get(
-                storage.MatchRejection, int(rejection_state["id"])
-            )
+            rejection = session.get(storage.MatchRejection, int(rejection_state["id"]))
             previous = rejection_state.get("before")
             if rejection is None:
                 continue
@@ -221,11 +191,7 @@ def main() -> None:
             )
             if not args.all:
                 query = query.where(storage.MatchPolicyAudit.id.in_(args.audit_id))
-            audits = list(
-                session.scalars(
-                    query.order_by(storage.MatchPolicyAudit.id.desc())
-                ).all()
-            )
+            audits = list(session.scalars(query.order_by(storage.MatchPolicyAudit.id.desc())).all())
             for audit in audits:
                 _restore(session, audit)
             print(f"{'restored' if args.apply else 'would_restore'}={len(audits)}")

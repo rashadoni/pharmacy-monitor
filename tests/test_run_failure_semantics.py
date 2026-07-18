@@ -13,14 +13,10 @@ from src.scrapers.base import RouteStatus, ScrapedProduct, ScrapeResult
 
 
 def _session_factory(db_session):
-    return sessionmaker(
-        bind=db_session.get_bind(), expire_on_commit=False, autoflush=False
-    )
+    return sessionmaker(bind=db_session.get_bind(), expire_on_commit=False, autoflush=False)
 
 
-def test_revalidation_failure_marks_run_and_request_failed_before_outputs(
-    db_session, monkeypatch
-):
+def test_revalidation_failure_marks_run_and_request_failed_before_outputs(db_session, monkeypatch):
     request = storage.ScrapeRequest(
         tenant_id=1,
         mode="all",
@@ -121,16 +117,12 @@ def test_revalidation_failure_marks_run_and_request_failed_before_outputs(
     assert calls == {"alerts": 0, "analyze": 0, "roi": 0}
 
 
-def test_rematch_revalidate_dissolve_cli_uses_unmatched_key(
-    db_session, monkeypatch
-):
+def test_rematch_revalidate_dissolve_cli_uses_unmatched_key(db_session, monkeypatch):
     monkeypatch.setattr(storage, "make_session", lambda: _session_factory(db_session))
     monkeypatch.setattr(
         main_mod.matcher,
         "revalidate_split",
-        lambda session, dry_run=False: [
-            {"action": "dissolve", "match_id": 9, "unmatched": [1, 2]}
-        ],
+        lambda session, dry_run=False: [{"action": "dissolve", "match_id": 9, "unmatched": [1, 2]}],
     )
 
     result = CliRunner().invoke(main_mod.cli, ["rematch", "--revalidate"])
@@ -140,9 +132,7 @@ def test_rematch_revalidate_dissolve_cli_uses_unmatched_key(
     assert "revalidate: re-split 1" in result.output
 
 
-def test_verified_full_run_finalizes_outputs_before_external_publish(
-    db_session, monkeypatch
-):
+def test_verified_full_run_finalizes_outputs_before_external_publish(db_session, monkeypatch):
     from src import alerts, roi
     from src.product_policy import policy_rollout_eligibility
 
@@ -190,18 +180,14 @@ def test_verified_full_run_finalizes_outputs_before_external_publish(
         "categories_for_site",
         lambda session, site, only_category_id=None: [f"{site}-cat"],
     )
-    monkeypatch.setattr(
-        main_mod, "baselines_for_sites", lambda *args: dict.fromkeys(sites)
-    )
+    monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *args: dict.fromkeys(sites))
     monkeypatch.setattr(main_mod, "scrape_all", fake_scrape_all)
     monkeypatch.setattr(main_mod, "persist_aloe_country_mappings", lambda *args: None)
     monkeypatch.setattr(main_mod, "load_aloe_country_map", lambda *args: {})
     monkeypatch.setattr(main_mod, "_smoke_test_per_site_coverage", lambda *args: None)
     monkeypatch.setattr(main_mod.matcher, "match_products", lambda session: 0)
     monkeypatch.setattr(main_mod.matcher, "revalidate_split", lambda session: [])
-    monkeypatch.setattr(
-        main_mod.matcher, "flag_suspected_mismatches", lambda session: 0
-    )
+    monkeypatch.setattr(main_mod.matcher, "flag_suspected_mismatches", lambda session: 0)
 
     phases: list[str] = []
 
@@ -246,9 +232,7 @@ def test_verified_full_run_finalizes_outputs_before_external_publish(
         verify.close()
 
 
-def test_incomplete_full_run_is_degraded_and_stops_before_consumers(
-    db_session, monkeypatch
-):
+def test_incomplete_full_run_is_degraded_and_stops_before_consumers(db_session, monkeypatch):
     from src import alerts, roi
 
     request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
@@ -351,9 +335,7 @@ def test_incomplete_full_run_is_degraded_and_stops_before_consumers(
     assert calls == {"match": 0, "alerts": 0, "analyze": 0, "roi": 0}
 
 
-def test_scrape_command_is_non_publishing_diagnostic_producer(
-    db_session, monkeypatch
-):
+def test_scrape_command_is_non_publishing_diagnostic_producer(db_session, monkeypatch):
     async def fake_scrape_all(*args, **kwargs):
         return [
             ScrapeResult(
@@ -396,18 +378,12 @@ def test_scrape_command_is_non_publishing_diagnostic_producer(
         assert run.status == "ok"
         assert run.catalog_scope == "partial"
         assert run.catalog_verified is False
-        assert (
-            run.catalog_verification_reason
-            == "scrape_command_diagnostic_non_publishing"
-        )
+        assert run.catalog_verification_reason == "scrape_command_diagnostic_non_publishing"
         assert run.full_catalog_sites is None
         assert run.run_quality is not None
         assert run.run_quality["full_catalog_verified"] is False
         assert run.run_quality["financially_eligible"] is False
         assert storage.run_is_financially_eligible(run) is False
-        assert (
-            storage.financially_eligible_run_ids(verify, tenant_id=run.tenant_id)
-            == []
-        )
+        assert storage.financially_eligible_run_ids(verify, tenant_id=run.tenant_id) == []
     finally:
         verify.close()

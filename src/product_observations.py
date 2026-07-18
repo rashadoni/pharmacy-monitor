@@ -99,9 +99,7 @@ def observation_row(
     observed_at: datetime,
 ) -> storage.OfferObservation:
     """Build immutable history row from the raw signal, not inferred state."""
-    code, country_status = country_resolution(
-        getattr(scraped, "manufacturer_country_raw", None)
-    )
+    code, country_status = country_resolution(getattr(scraped, "manufacturer_country_raw", None))
     return storage.OfferObservation(
         tenant_id=product.tenant_id,
         run_id=run_id,
@@ -110,8 +108,7 @@ def observation_row(
         country_raw=getattr(scraped, "manufacturer_country_raw", None),
         country_resolution_status=country_status,
         country_source=getattr(scraped, "country_source", None),
-        availability_status=getattr(scraped, "offer_availability_status", "unknown")
-        or "unknown",
+        availability_status=getattr(scraped, "offer_availability_status", "unknown") or "unknown",
         quantity=getattr(scraped, "offer_quantity", None),
         availability_source=getattr(scraped, "availability_source", None),
         observed_at=observed_at,

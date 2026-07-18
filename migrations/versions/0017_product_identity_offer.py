@@ -39,9 +39,7 @@ def _create_index(name: str, table: str, columns: list[str]) -> None:
 def upgrade() -> None:
     _add_column(
         "runs",
-        sa.Column(
-            "catalog_scope", sa.String(20), nullable=False, server_default="unknown"
-        ),
+        sa.Column("catalog_scope", sa.String(20), nullable=False, server_default="unknown"),
     )
     _add_column("runs", sa.Column("full_catalog_sites", sa.String(200)))
     _add_column(
@@ -202,9 +200,7 @@ def upgrade() -> None:
             sa.Column("sample_count", sa.Integer(), nullable=False, server_default="1"),
             sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
             sa.Column("verified_at", sa.DateTime(), nullable=False),
-            sa.UniqueConstraint(
-                "tenant_id", "country_id", name="uq_aloe_country_mapping"
-            ),
+            sa.UniqueConstraint("tenant_id", "country_id", name="uq_aloe_country_mapping"),
         )
     for name, columns in (
         ("ix_aloe_country_mappings_tenant_id", ["tenant_id"]),

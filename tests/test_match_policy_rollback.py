@@ -69,9 +69,7 @@ def test_rollback_stops_if_product_was_manually_rematched(db_session) -> None:
 
     matcher.revalidate_split(db_session)
     audit = db_session.scalar(select(storage.MatchPolicyAudit))
-    manual_target = storage.Match(
-        canonical_name="Operator rematch", confidence=1.0, is_manual=True
-    )
+    manual_target = storage.Match(canonical_name="Operator rematch", confidence=1.0, is_manual=True)
     db_session.add(manual_target)
     db_session.flush()
     right.canonical_id = manual_target.id
