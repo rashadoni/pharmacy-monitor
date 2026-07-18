@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       apply_migrations:
-        description: "Compatibility input; ignored by Aloe-only hotfix"
+        description: "Compatibility input; ignored by main.py-only hotfix"
         type: boolean
         required: true
         default: false
@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: aloe-only rsync deploy
+    name: main.py-only rsync deploy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,17 +33,30 @@ jobs:
             '|1|tVfkqCdl1dxn7v0V+vFAb8AGGDU=|+mE7K9OBJQ7+XZPA8mu+uZrBQnE= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
             > ~/.ssh/known_hosts
 
-      - name: Backup and deploy Aloe scraper
+      - name: Backup and deploy run orchestrator
         run: |
           set -euo pipefail
-          remote_path=/opt/pharmacy-monitor/src/scrapers/aloe.py
-          backup_path=/tmp/aloe.py.pre-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+          remote_path=/opt/pharmacy-monitor/src/main.py
+          backup_path=/tmp/main.py.pre-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
           ssh_base="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15"
 
-          aloe_state=$($ssh_base pm@46.225.149.52 \
-            'systemctl is-active pharmacy-monitor-scrape@aloe.service || true')
-          if [ "$aloe_state" = active ]; then
-            echo "::error::Aloe scrape is active; refusing an in-place hotfix"
+          active_units=$($ssh_base pm@46.225.149.52 '
+            set -euo pipefail
+            for unit in \
+              pharmacy-monitor-scrape@pharmonline.service \
+              pharmacy-monitor-scrape@aptekonline.service \
+              pharmacy-monitor-scrape@aloe.service \
+              pharmacy-monitor-scrape-watcher.service \
+              pharmacy-monitor-intraday.service; do
+              state=$(systemctl is-active "$unit" || true)
+              if [ "$state" = active ]; then printf "%s\n" "$unit"; fi
+            done
+          ')
+          active_jobs=$($ssh_base pm@46.225.149.52 \
+            "pgrep -af '[p]harmacy-monitor (run|scrape|intraday-tick|rematch)( |\$)' || true")
+          if [ -n "$active_units" ] || [ -n "$active_jobs" ]; then
+            printf '::error::Scrape active; refusing hotfix. units=%s jobs=%s\n' \
+              "$active_units" "$active_jobs"
             exit 1
           fi
 
@@ -55,28 +68,28 @@ jobs:
 
           rsync -z --checksum --inplace --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            src/scrapers/aloe.py "pm@46.225.149.52:$remote_path"
+            src/main.py "pm@46.225.149.52:$remote_path"
 
-      - name: Verify Aloe scraper and API
+      - name: Verify run orchestrator and API
         run: |
           set -euo pipefail
-          remote_path=/opt/pharmacy-monitor/src/scrapers/aloe.py
+          remote_path=/opt/pharmacy-monitor/src/main.py
           ssh_base="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15"
-          local_sha=$(sha256sum src/scrapers/aloe.py | awk '{print $1}')
+          local_sha=$(sha256sum src/main.py | awk '{print $1}')
           remote_sha=$($ssh_base pm@46.225.149.52 "sha256sum '$remote_path'" | awk '{print $1}')
           printf 'local_sha=%s\nremote_sha=%s\nbackup=%s\n' \
             "$local_sha" "$remote_sha" "$BACKUP_PATH"
           test "$local_sha" = "$remote_sha"
           $ssh_base pm@46.225.149.52 \
-            'cd /opt/pharmacy-monitor && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -c "from src.scrapers.aloe import AloeScraper"'
+            'cd /opt/pharmacy-monitor && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -c "from src.main import cli"'
           $ssh_base pm@46.225.149.52 \
             'curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"'
 
-      - name: Roll back Aloe scraper after failed deploy or verification
+      - name: Roll back run orchestrator after failed deploy or verification
         if: ${{ failure() && env.BACKUP_PATH != '' }}
         run: |
           set -euo pipefail
-          remote_path=/opt/pharmacy-monitor/src/scrapers/aloe.py
+          remote_path=/opt/pharmacy-monitor/src/main.py
           ssh_base="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15"
           $ssh_base pm@46.225.149.52 \
             "set -euo pipefail; test -f '$BACKUP_PATH'; cp -- '$BACKUP_PATH' '$remote_path'"
@@ -84,4 +97,4 @@ jobs:
           printf 'rollback_sha=%s\nexpected_backup_sha=%s\n' "$restored_sha" "$BACKUP_SHA"
           test "$restored_sha" = "$BACKUP_SHA"
           $ssh_base pm@46.225.149.52 \
-            'cd /opt/pharmacy-monitor && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -c "from src.scrapers.aloe import AloeScraper"'
+            'cd /opt/pharmacy-monitor && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -c "from src.main import cli"'
