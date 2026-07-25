@@ -589,6 +589,7 @@ class AptekonlineScraper(BaseScraper):
         visited_pages = 0
         expected_pages: int | None = None
         expected_items: int | None = None
+        total_changed = False
         raw_items = 0
         parsed_items = 0
         item_failures = 0
@@ -659,10 +660,12 @@ class AptekonlineScraper(BaseScraper):
                 raw_last_page = payload.get("last_page")
                 if raw_last_page not in (None, ""):
                     try:
-                        expected_pages = int(raw_last_page)
+                        page_expected_pages = int(raw_last_page)
                     except (TypeError, ValueError):
                         abort_reason = "invalid_last_page"
                         return
+                    if expected_pages is None:
+                        expected_pages = page_expected_pages
                 raw_total = payload.get("total")
                 if raw_total not in (None, ""):
                     try:
@@ -673,8 +676,19 @@ class AptekonlineScraper(BaseScraper):
                     if expected_items is None:
                         expected_items = page_expected_items
                     elif expected_items != page_expected_items:
-                        abort_reason = "total_changed_during_pagination"
-                        return
+                        # У aptekonline категория 167 детерминированно отдаёт
+                        # другое `total` начиная со страницы 13, хотя сами 24
+                        # страницы и 2394 товара доступны полностью. Считаем
+                        # метаданные первой страницы авторитетными, дочитываем
+                        # маршрут и затем проверяем точное фактическое число.
+                        total_changed = True
+                        log.warning(
+                            "aptekonline_total_changed",
+                            category=category_slug,
+                            page=page_num,
+                            expected_total=expected_items,
+                            observed_total=page_expected_items,
+                        )
 
                 if page_num == 1:
                     log.info(
@@ -708,8 +722,7 @@ class AptekonlineScraper(BaseScraper):
                     yield product
 
                 # Pagination: stop at last page or when next_page_url отсутствует
-                last_page = payload.get("last_page")
-                if last_page and page_num >= int(last_page):
+                if expected_pages is not None and page_num >= expected_pages:
                     break
                 if not payload.get("next_page_url"):
                     break
@@ -721,6 +734,13 @@ class AptekonlineScraper(BaseScraper):
                     provider=proxied_via,
                 )
         finally:
+            if (
+                abort_reason is None
+                and total_changed
+                and expected_items is not None
+                and (raw_items != expected_items or parsed_items != expected_items)
+            ):
+                abort_reason = "total_changed_during_pagination"
             complete = (
                 abort_reason is None
                 and pages_skipped == 0

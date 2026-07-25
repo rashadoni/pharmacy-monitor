@@ -358,10 +358,11 @@ async def test_scrape_category_retries_whole_route_when_total_changes(monkeypatc
             "next_page_url": "next" if current == 1 else None,
         }
 
-    # Attempt 1 drifts 2→3 and is discarded. Attempt 2 is a stable 2-item snapshot.
+    # Attempt 1 drifts 3→4 and only returns 2 items, so it is discarded.
+    # Attempt 2 is a stable 2-item snapshot.
     payloads = [
-        page("a", total=2, current=1),
-        page("b", total=3, current=2),
+        page("a", total=3, current=1),
+        page("b", total=4, current=2),
         page("a", total=2, current=1),
         page("b", total=2, current=2),
     ]
@@ -376,6 +377,45 @@ async def test_scrape_category_retries_whole_route_when_total_changes(monkeypatc
     assert status.complete is True
     assert status.expected_items == 2
     assert status.parsed_items == 2
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_uses_first_page_metadata_when_later_total_is_wrong(
+    monkeypatch,
+):
+    """Known API bug: later pages may report bogus total while data is complete."""
+    _clear_decodo(monkeypatch)
+
+    def page(item_id: str, *, total: int, current: int) -> dict:
+        return {
+            "data": [
+                {
+                    "url_id": item_id,
+                    "name": f"Product {item_id}",
+                    "price": 1,
+                    "qaliq": 1,
+                }
+            ],
+            "total": total,
+            "current_page": current,
+            "last_page": 2 if current == 1 else 1,
+            "next_page_url": "next" if current == 1 else None,
+        }
+
+    patcher, calls = _mock_httpx_client(
+        [
+            page("a", total=2, current=1),
+            page("b", total=999, current=2),
+        ]
+    )
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("167")]
+
+    assert [product.external_id for product in products] == ["a", "b"]
+    assert calls["n"] == 2
+    assert scraper._route_statuses["167"].complete is True
+    assert scraper._route_statuses["167"].expected_items == 2
 
 
 # ─────────────────────────────────────────────────────────────────────
