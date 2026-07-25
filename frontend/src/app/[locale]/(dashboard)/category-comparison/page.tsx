@@ -45,6 +45,16 @@ export default function CategoryComparisonPage() {
     queryKey: ["category-comparison-catalog", "pharmonline", locale],
     queryFn: () => api.categoryCatalog("pharmonline", locale),
   });
+  const catalogByCategory = useMemo(
+    () =>
+      new Map(
+        (catalogRows ?? []).map((row) => [
+          row.category,
+          row.catalog_skus,
+        ]),
+      ),
+    [catalogRows],
+  );
 
   // Дефолт-сортировка — наибольший «мисприсинг» |index-100|×matched_skus:
   // вверху категории где клиент сильнее всего отклонён от рынка и с весом SKU.
@@ -61,7 +71,7 @@ export default function CategoryComparisonPage() {
         case "label":
           return r.label.toLowerCase();
         case "skus":
-          return r.matched_skus;
+          return catalogByCategory.get(r.category) ?? r.matched_skus;
         case "client":
           return r.avg_client_price;
         case "index":
@@ -81,23 +91,38 @@ export default function CategoryComparisonPage() {
       }
       return ((va as number) - (vb as number)) * dir;
     });
-  }, [visibleRows, sort]);
+  }, [visibleRows, sort, catalogByCategory]);
 
-  // KPI: категорий где клиент дешевле рынка (index<100), SKU-взвешенный средний
-  // индекс, всего matched SKU.
+  // KPI: количество берём из всего каталога; ценовой индекс по-прежнему
+  // взвешивается только по товарам, реально сопоставленным с конкурентами.
   const kpi = useMemo(() => {
     if (!visibleRows || visibleRows.length === 0) {
       return { cheaperCats: 0, avgIndex: null as number | null, totalSkus: 0 };
     }
     const cheaperCats = visibleRows.filter((r) => r.index < 100).length;
-    const totalSkus = visibleRows.reduce((s, r) => s + r.matched_skus, 0);
+    const totalSkus = selectedCategory
+      ? visibleRows.reduce(
+          (sum, row) =>
+            sum + (catalogByCategory.get(row.category) ?? row.matched_skus),
+          0,
+        )
+      : (coverage?.catalog_skus ??
+        visibleRows.reduce(
+          (sum, row) =>
+            sum + (catalogByCategory.get(row.category) ?? row.matched_skus),
+          0,
+        ));
+    const comparableSkus = visibleRows.reduce(
+      (sum, row) => sum + row.matched_skus,
+      0,
+    );
     const weighted = visibleRows.reduce(
       (s, r) => s + r.index * r.matched_skus,
       0,
     );
-    const avgIndex = totalSkus > 0 ? weighted / totalSkus : null;
+    const avgIndex = comparableSkus > 0 ? weighted / comparableSkus : null;
     return { cheaperCats, avgIndex, totalSkus };
-  }, [visibleRows]);
+  }, [visibleRows, catalogByCategory, coverage, selectedCategory]);
 
   function toggleSort(key: SortKey) {
     setSort((cur) =>
@@ -116,6 +141,7 @@ export default function CategoryComparisonPage() {
     const header = [
       "category",
       "label",
+      "catalog_skus",
       "matched_skus",
       "avg_client_price",
       ...COMPETITORS.map((s) => `${s}_avg`),
@@ -136,6 +162,7 @@ export default function CategoryComparisonPage() {
       const row = [
         escape(r.category),
         escape(r.label),
+        String(catalogByCategory.get(r.category) ?? r.matched_skus),
         String(r.matched_skus),
         r.avg_client_price.toFixed(2),
         ...COMPETITORS.map((s) =>
@@ -374,12 +401,15 @@ export default function CategoryComparisonPage() {
                   align="left"
                 />
                 <SortableTh
-                  label={t("th_skus")}
+                  label={t("catalog_all_skus")}
                   active={sort}
                   col="skus"
                   onClick={() => toggleSort("skus")}
                   align="right"
                 />
+                <th className="px-3 py-2 text-right font-medium">
+                  {t("catalog_comparable_skus")}
+                </th>
                 <SortableTh
                   label={t("th_client")}
                   active={sort}
@@ -425,6 +455,9 @@ export default function CategoryComparisonPage() {
                       {row.label}
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
+                      {catalogByCategory.get(row.category) ?? row.matched_skus}
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
                       {row.matched_skus}
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums">
@@ -462,7 +495,7 @@ export default function CategoryComparisonPage() {
                   </tr>
                   {expandedCategory === row.category && (
                     <tr key={`${row.category}-assign`} className="border-t border-border">
-                      <td colSpan={8} className="bg-muted/20 p-3">
+                      <td colSpan={9} className="bg-muted/20 p-3">
                         <InlineCategoryAssigner
                           categoryKey={row.category}
                           categoryLabel={row.label}
