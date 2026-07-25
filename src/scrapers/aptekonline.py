@@ -37,7 +37,6 @@ scrape_promos() остаётся на Playwright — главная страни
 from __future__ import annotations
 
 import asyncio
-import itertools
 import os
 from typing import AsyncIterator
 from urllib.parse import quote
@@ -468,10 +467,16 @@ class AptekonlineScraper(BaseScraper):
         # Crawlbase → ScraperAPI → direct. Decodo первым: единственный рабочий
         # азербайджанский residential-пул (aptek принимает только AZ-IP).
         decodo_ports = _decodo_ports("aptekonline")
-        port_cycle = itertools.cycle(decodo_ports) if decodo_ports else None
+        active_port: int | None = None
         persistent_client: httpx.AsyncClient | None = None
 
-        if port_cycle is not None:
+        if decodo_ports:
+            # Один sticky AZ-IP на всю пагинацию категории. Раньше порт
+            # менялся на каждой странице, и разные exits видели разные totals.
+            # Следующая полная попытка категории стартует уже с другого порта.
+            offset = getattr(self, "_decodo_port_offset", 0) % len(decodo_ports)
+            active_port = decodo_ports[offset]
+            self._decodo_port_offset = offset + 1
             proxied_via = "decodo"
             log.info(
                 "aptekonline_using_decodo",
@@ -515,10 +520,14 @@ class AptekonlineScraper(BaseScraper):
         async def _fetch_page(req_params: list) -> httpx.Response | None:
             """GET страницы. Decodo — ретрай по портам (порт = другой AZ-IP;
             ~38% IP дают транзиентный 522). Прочие — один persistent client."""
-            if port_cycle is not None:
+            nonlocal active_port
+            if active_port is not None:
                 last_resp: httpx.Response | None = None
-                for _ in range(_decodo_page_attempts()):
-                    purl = _decodo_httpx_proxy_for("aptekonline", next(port_cycle))
+                ordered_ports = [active_port] + [
+                    port for port in decodo_ports if port != active_port
+                ]
+                for port in ordered_ports[: _decodo_page_attempts()]:
+                    purl = _decodo_httpx_proxy_for("aptekonline", port)
                     try:
                         async with httpx.AsyncClient(
                             headers=_API_HEADERS,
@@ -528,6 +537,7 @@ class AptekonlineScraper(BaseScraper):
                         ) as c:
                             r = await c.get(_API_PRODUCT_LIST, params=req_params)
                         if r.status_code == 200:
+                            active_port = port
                             return r
                         last_resp = r
                         if r.status_code in {402, 407}:

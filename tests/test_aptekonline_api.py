@@ -702,6 +702,53 @@ async def test_scrape_category_decodo_retries_past_transient_522(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_scrape_category_keeps_same_decodo_port_across_pages(monkeypatch):
+    """Different sticky exits can expose different totals; one route must use one exit."""
+    _enable_decodo(monkeypatch)
+    proxies: list[str] = []
+
+    class StickyClient:
+        def __init__(self, *args, **kwargs):
+            proxies.append(kwargs["proxy"])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, _url, *, params):
+            page_num = int(dict(params)["page"])
+            item_id = "a" if page_num == 1 else "b"
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "url_id": item_id,
+                            "name": f"Product {item_id}",
+                            "price": 1,
+                            "qaliq": 1,
+                        }
+                    ],
+                    "total": 2,
+                    "current_page": page_num,
+                    "last_page": 2,
+                    "next_page_url": "next" if page_num == 1 else None,
+                },
+            )
+
+    with patch("src.scrapers.aptekonline.httpx.AsyncClient", StickyClient):
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+
+    assert [product.external_id for product in products] == ["a", "b"]
+    assert len(proxies) == 2
+    assert proxies[0] == proxies[1]
+    assert scraper._route_statuses["114"].complete is True
+
+
+@pytest.mark.asyncio
 async def test_scrape_category_decodo_skips_then_aborts_on_persistent_522(monkeypatch):
     """Постоянный 522: страница пропускается (skip), после 3 подряд — обрыв
     категории (не бесконечный перебор всех max_pages)."""
