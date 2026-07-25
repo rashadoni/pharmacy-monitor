@@ -3044,7 +3044,9 @@ def dash_category_comparison(
         db,
         client_site=client_site,
         tenant_id=user.tenant_id,
-        canonical=False,
+        # Keep canonical labels for known categories; analytics retains
+        # unclassified source categories as fallback rows.
+        canonical=True,
     )
     resolved_labels = [
         _localized_category_label(
