@@ -426,7 +426,8 @@ def _iter_matched_prices(
             if any(
                 p.site == client_site
                 and p.url_dead_at is None
-                and (p.category or "(без категории)") in category_filter
+                and (p.manual_category_key or p.category or "(без категории)")
+                in category_filter
                 for p in m.products
             )
         ]
@@ -490,7 +491,11 @@ def _iter_matched_prices(
             if p.site == client_site
             and p.url_dead_at is None
             and policy_offer_eligibility(p).eligible
-            and (category_filter is None or (p.category or "(без категории)") in category_filter)
+            and (
+                category_filter is None
+                or (p.manual_category_key or p.category or "(без категории)")
+                in category_filter
+            )
         ]
         if category_filter is None:
             client_products = client_products[:1]
@@ -517,7 +522,7 @@ def _iter_matched_prices(
             client_price = _current_price(snaps.get(client_p.id))
             if client_price is None:
                 continue
-            cat = client_p.category or "(без категории)"
+            cat = client_p.manual_category_key or client_p.category or "(без категории)"
             records.append((cat, client_price, comp_price_by_site))
     return records
 
@@ -594,18 +599,22 @@ def category_comparison(
     fallback_labels: dict[str, tuple[str | None, str | None]] = {}
     if canonical:
         from src.category_taxonomy import (
+            CANONICAL_CATEGORIES,
             CanonicalCategory,
             classify_source_category_detailed,
             source_category_labels,
         )
 
         source_labels = source_category_labels(session)
+        canonical_by_key = {category.key: category for category in CANONICAL_CATEGORIES}
         # Классификация зависит только от категории-источника, а не от матча:
         # мемоизируем по raw_category (иначе ~200 правил × ~4k матчей регэкспов
         # вместо ~200 × ~178 категорий).
         resolved: dict[str, tuple[CanonicalCategory | None, str]] = {}
 
         def _canonical_for(raw_category: str) -> tuple[CanonicalCategory | None, str]:
+            if raw_category in canonical_by_key:
+                return canonical_by_key[raw_category], "manual_override"
             if raw_category not in resolved:
                 label_ru, label_az = source_labels.get((client_site, raw_category), (None, None))
                 classification = classify_source_category_detailed(

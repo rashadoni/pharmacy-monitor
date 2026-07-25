@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { ChevronDown, ChevronUp } from "lucide-react";
@@ -31,10 +31,41 @@ export default function CategoryComparisonPage() {
     key: "misprice",
     dir: "desc",
   });
+  const [productSearch, setProductSearch] = useState("");
+  const [manualCategory, setManualCategory] = useState("");
+  const queryClient = useQueryClient();
 
   const { data, isLoading, error, isFetching } = useQuery({
     queryKey: ["category-comparison", locale],
     queryFn: () => api.categoryComparison("pharmonline", locale),
+  });
+  const { data: coverage, isLoading: isCoverageLoading } = useQuery({
+    queryKey: ["category-comparison-coverage", "pharmonline"],
+    queryFn: () => api.categoryComparisonCoverage("pharmonline"),
+  });
+  const { data: categoryOptions } = useQuery({
+    queryKey: ["manual-category-options", locale],
+    queryFn: () => api.manualCategoryOptions(locale),
+  });
+  const { data: productSuggestions, isFetching: isSearchingProducts } = useQuery({
+    queryKey: ["category-product-suggestions", productSearch],
+    queryFn: () => api.categoryProductSuggestions(productSearch),
+    enabled: productSearch.trim().length >= 2,
+  });
+  const assignCategory = useMutation({
+    mutationFn: (productId: number) =>
+      api.assignProductCategory(productId, manualCategory),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["category-comparison"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["category-comparison-coverage"],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["category-product-suggestions"],
+        }),
+      ]);
+    },
   });
 
   // Дефолт-сортировка — наибольший «мисприсинг» |index-100|×matched_skus:
@@ -204,9 +235,102 @@ export default function CategoryComparisonPage() {
               label: t("kpi_total_skus"),
               value: kpi.totalSkus || "—",
               loading: isLoading,
+              hint: t("kpi_total_skus_hint"),
             },
           ]}
         />
+      </section>
+
+      <section aria-label={t("coverage_title")}>
+        <h2 className="mb-2 text-sm font-medium">{t("coverage_title")}</h2>
+        <MetricStrip
+          items={[
+            {
+              label: t("coverage_catalog"),
+              value: coverage?.catalog_skus ?? "—",
+              loading: isCoverageLoading,
+            },
+            {
+              label: t("coverage_categorized"),
+              value: coverage
+                ? `${coverage.categorized_skus} (${coverage.categorization_pct.toFixed(1)}%)`
+                : "—",
+              loading: isCoverageLoading,
+            },
+            {
+              label: t("coverage_matched"),
+              value: coverage
+                ? `${coverage.matched_skus} (${coverage.matching_pct.toFixed(1)}%)`
+                : "—",
+              loading: isCoverageLoading,
+              hint: t("coverage_matched_hint"),
+            },
+          ]}
+        />
+      </section>
+
+      <section className="rounded-lg border border-border p-4">
+        <h2 className="font-medium">{t("manual_title")}</h2>
+        <p className="mt-1 text-xs text-muted-foreground">{t("manual_hint")}</p>
+        <div className="mt-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(220px,0.6fr)]">
+          <input
+            value={productSearch}
+            onChange={(event) => setProductSearch(event.target.value)}
+            placeholder={t("manual_search_placeholder")}
+            className="min-h-10 rounded-md border border-input bg-background px-3 text-sm"
+          />
+          <select
+            value={manualCategory}
+            onChange={(event) => setManualCategory(event.target.value)}
+            className="min-h-10 rounded-md border border-input bg-background px-3 text-sm"
+          >
+            <option value="">{t("manual_choose_category")}</option>
+            {categoryOptions?.map((category) => (
+              <option key={category.key} value={category.key}>
+                {category.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        {productSearch.trim().length >= 2 && (
+          <div className="mt-2 divide-y divide-border rounded-md border border-border">
+            {isSearchingProducts && (
+              <div className="p-3 text-xs text-muted-foreground">
+                {tCommon("loading")}
+              </div>
+            )}
+            {productSuggestions?.map((product) => (
+              <div
+                key={product.id}
+                className="flex items-center justify-between gap-3 p-3"
+              >
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium">{product.name}</div>
+                  <div className="truncate text-xs text-muted-foreground">
+                    {product.manual_category_key
+                      ? t("manual_current", {
+                          category: product.manual_category_key,
+                        })
+                      : product.source_category || t("manual_uncategorized")}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={!manualCategory || assignCategory.isPending}
+                  onClick={() => assignCategory.mutate(product.id)}
+                  className="shrink-0 rounded-md bg-primary px-3 py-2 text-xs text-primary-foreground disabled:opacity-40"
+                >
+                  {t("manual_assign")}
+                </button>
+              </div>
+            ))}
+            {!isSearchingProducts && productSuggestions?.length === 0 && (
+              <div className="p-3 text-xs text-muted-foreground">
+                {t("manual_no_results")}
+              </div>
+            )}
+          </div>
+        )}
       </section>
 
       {/* Status */}

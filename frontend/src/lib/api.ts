@@ -491,6 +491,27 @@ export interface CategoryComparisonRow {
   parity_pct: number;
 }
 
+export interface CategoryComparisonCoverage {
+  client_site: string;
+  catalog_skus: number;
+  categorized_skus: number;
+  matched_skus: number;
+  categorization_pct: number;
+  matching_pct: number;
+}
+
+export interface ManualCategoryOption {
+  key: string;
+  label: string;
+}
+
+export interface CategoryProductSuggestion {
+  id: number;
+  name: string;
+  source_category: string | null;
+  manual_category_key: string | null;
+}
+
 export interface SiteProduct {
   id: number;
   external_id: string;
@@ -1161,6 +1182,26 @@ export const api = {
       `/api/v1/dash/category-comparison${qs ? `?${qs}` : ""}`,
     );
   },
+  categoryComparisonCoverage: (client_site = "pharmonline") =>
+    request<CategoryComparisonCoverage>(
+      `/api/v1/dash/category-comparison/coverage?client_site=${encodeURIComponent(client_site)}`,
+    ),
+  manualCategoryOptions: (locale: string) =>
+    request<ManualCategoryOption[]>(
+      `/api/v1/dash/category-comparison/manual-categories?locale=${encodeURIComponent(locale)}`,
+    ),
+  categoryProductSuggestions: (q: string) =>
+    request<CategoryProductSuggestion[]>(
+      `/api/v1/dash/category-comparison/product-suggestions?q=${encodeURIComponent(q)}`,
+    ),
+  assignProductCategory: (productId: number, categoryKey: string | null) =>
+    request<CategoryProductSuggestion>(
+      `/api/v1/dash/category-comparison/products/${productId}/category`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ category_key: categoryKey }),
+      },
+    ),
   siteProducts: (params: {
     site: string;
     category?: string;

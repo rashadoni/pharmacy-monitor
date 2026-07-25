@@ -536,6 +536,19 @@ class CategoryComparisonOut(BaseModel):
     parity_pct: float
 
 
+class CategoryComparisonCoverageOut(BaseModel):
+    client_site: str
+    catalog_skus: int
+    categorized_skus: int
+    matched_skus: int
+    categorization_pct: float
+    matching_pct: float
+
+
+class ManualCategoryAssignmentIn(BaseModel):
+    category_key: str | None
+
+
 class CategoryIn(BaseModel):
     key: str
     label_ru: str
@@ -3088,6 +3101,145 @@ def dash_category_comparison(
             )
         )
     return out
+
+
+@app.get(
+    "/api/v1/dash/category-comparison/coverage",
+    response_model=CategoryComparisonCoverageOut,
+)
+def dash_category_comparison_coverage(
+    client_site: str = "pharmonline",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Покрытие всего живого каталога, отдельно от сравниваемых SKU."""
+    _require_site(client_site)
+    live = (
+        storage.Product.tenant_id == user.tenant_id,
+        storage.Product.site == client_site,
+        storage.Product.url_dead_at.is_(None),
+    )
+    catalog_skus = int(db.scalar(select(func.count(storage.Product.id)).where(*live)) or 0)
+    categorized_skus = int(
+        db.scalar(
+            select(func.count(storage.Product.id)).where(
+                *live,
+                storage.Product.category.is_not(None),
+                storage.Product.category != "",
+            )
+        )
+        or 0
+    )
+    matched_skus = int(
+        db.scalar(
+            select(func.count(storage.Product.id)).where(
+                *live,
+                storage.Product.canonical_id.is_not(None),
+            )
+        )
+        or 0
+    )
+    return CategoryComparisonCoverageOut(
+        client_site=client_site,
+        catalog_skus=catalog_skus,
+        categorized_skus=categorized_skus,
+        matched_skus=matched_skus,
+        categorization_pct=round(categorized_skus / catalog_skus * 100, 1)
+        if catalog_skus
+        else 0.0,
+        matching_pct=round(matched_skus / catalog_skus * 100, 1)
+        if catalog_skus
+        else 0.0,
+    )
+
+
+@app.get("/api/v1/dash/category-comparison/manual-categories")
+def dash_manual_category_options(
+    locale: str = "ru",
+    user: storage.TenantUser = Depends(require_user),
+):
+    """Канонические категории для ручного назначения."""
+    del user
+    from src.category_taxonomy import CANONICAL_CATEGORIES
+
+    locale = _normalize_locale(locale)
+    return [
+        {
+            "key": category.key,
+            "label": category.label_az if locale == "az" else category.label_ru,
+        }
+        for category in CANONICAL_CATEGORIES
+    ]
+
+
+@app.get("/api/v1/dash/category-comparison/product-suggestions")
+def dash_category_product_suggestions(
+    q: str,
+    client_site: str = "pharmonline",
+    limit: int = 12,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Autocomplete живых товаров клиента для ручной категоризации."""
+    _require_site(client_site)
+    term = q.strip()
+    if len(term) < 2:
+        return []
+    limit = max(1, min(limit, 30))
+    products = db.scalars(
+        select(storage.Product)
+        .where(
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.site == client_site,
+            storage.Product.url_dead_at.is_(None),
+            storage.Product.name.ilike(f"%{term}%"),
+        )
+        .order_by(storage.Product.name)
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "id": product.id,
+            "name": product.name,
+            "source_category": product.category,
+            "manual_category_key": product.manual_category_key,
+        }
+        for product in products
+    ]
+
+
+@app.patch("/api/v1/dash/category-comparison/products/{product_id}/category")
+def dash_assign_product_category(
+    product_id: int,
+    payload: ManualCategoryAssignmentIn,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Назначить или снять устойчивую ручную каноническую категорию."""
+    if user.role not in ("admin", "owner"):
+        raise HTTPException(403, "Admin role required")
+    from src.category_taxonomy import CANONICAL_CATEGORIES
+
+    allowed = {category.key for category in CANONICAL_CATEGORIES}
+    if payload.category_key is not None and payload.category_key not in allowed:
+        raise HTTPException(400, "Unknown canonical category")
+    product = db.scalar(
+        select(storage.Product).where(
+            storage.Product.id == product_id,
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.site == "pharmonline",
+        )
+    )
+    if product is None:
+        raise HTTPException(404, "Product not found")
+    product.manual_category_key = payload.category_key
+    db.commit()
+    return {
+        "id": product.id,
+        "name": product.name,
+        "source_category": product.category,
+        "manual_category_key": product.manual_category_key,
+    }
 
 
 @app.get("/api/v1/dash/products/{product_id}/price-history")

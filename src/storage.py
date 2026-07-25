@@ -218,6 +218,11 @@ class Product(Base):
         Integer, nullable=True, index=True
     )
     category: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    # Operator override for the source-independent comparison taxonomy.
+    # Kept separate from scraper-owned ``category`` so future runs do not erase it.
+    manual_category_key: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, index=True
+    )
     dosage: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 500mg, 10ml...
     pack_size: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 30 tab, 100ml...
     image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)

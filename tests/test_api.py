@@ -4142,6 +4142,64 @@ def test_category_comparison_without_cookie_401(client):
     assert r.status_code == 401
 
 
+def test_category_comparison_coverage_and_manual_product_assignment(
+    client,
+    auth_cookie,
+    setup_db,
+):
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    setup_db.add(run)
+    setup_db.flush()
+    match = _make_match_with_prices(
+        setup_db,
+        run,
+        canonical="manual-category-product",
+        prices={"pharmonline": 10.0, "aloe": 9.0},
+        category="unknown-source-bucket",
+    )
+    unmatched = storage.Product(
+        tenant_id=1,
+        site="pharmonline",
+        external_id="manual-unmatched",
+        url="https://pharmonline.example/manual-unmatched",
+        name="Manual searchable product",
+        name_normalized="manual searchable product",
+        category=None,
+    )
+    setup_db.add(unmatched)
+    setup_db.commit()
+
+    coverage = client.get("/api/v1/dash/category-comparison/coverage")
+    assert coverage.status_code == 200, coverage.text
+    assert coverage.json() == {
+        "client_site": "pharmonline",
+        "catalog_skus": 2,
+        "categorized_skus": 1,
+        "matched_skus": 1,
+        "categorization_pct": 50.0,
+        "matching_pct": 50.0,
+    }
+
+    suggestions = client.get(
+        "/api/v1/dash/category-comparison/product-suggestions?q=searchable"
+    )
+    assert suggestions.status_code == 200, suggestions.text
+    assert suggestions.json()[0]["id"] == unmatched.id
+
+    client_product = next(p for p in match.products if p.site == "pharmonline")
+    assigned = client.patch(
+        f"/api/v1/dash/category-comparison/products/{client_product.id}/category",
+        json={"category_key": "digestive_system"},
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["manual_category_key"] == "digestive_system"
+
+    rows = client.get("/api/v1/dash/category-comparison?locale=az")
+    assert rows.status_code == 200, rows.text
+    assert rows.json()[0]["category"] == "digestive_system"
+    assert rows.json()[0]["label"] == "Həzm sistemi"
+
+
 def test_mapping_create_keeps_az_category_views_free_of_russian(
     client,
     auth_cookie,
