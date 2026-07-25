@@ -67,11 +67,12 @@ test.describe("Legacy URL redirects (Phase 6.1 backward compat)", () => {
     });
   }
 
-  test("/ eventually reaches /az/* (root redirect chain)", async ({ page }) => {
-    // / → /az → /az/overview → /login → /az/login (auth gate cascade).
-    // Just verify final URL is some /az/* path (not 500 or stuck).
-    await page.goto("/");
-    await expect(page).toHaveURL(/\/az\//);
+  test("/ redirects directly to /az", async ({ request }) => {
+    const response = await request.get("/", { maxRedirects: 0 }).catch(
+      (err) => err.response ?? null,
+    );
+    expect(response?.status()).toBe(307);
+    expect(response?.headers()["location"]).toBe("/az");
   });
 });
 

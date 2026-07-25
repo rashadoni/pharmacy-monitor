@@ -49,6 +49,11 @@ const nextConfig = {
       "watchlist",
     ];
     return [
+      {
+        source: "/",
+        destination: "/az",
+        permanent: false,
+      },
       // 1:1 route redirects (legacy /comparison → /az/comparison)
       ...LEGACY_ROUTES.map((route) => ({
         source: `/${route}`,
