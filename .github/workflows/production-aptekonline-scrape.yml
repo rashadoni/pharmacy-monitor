@@ -27,14 +27,18 @@ jobs:
           set -euo pipefail
           ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
             cd /opt/pharmacy-monitor
-            if pgrep -u pm -f "pharmacy-monitor run.*--site aptekonline" >/dev/null; then
-              echo "an aptekonline scrape is already running" >&2
-              exit 1
+            if systemctl is-active --quiet pharmacy-monitor-scrape@aptekonline.service; then
+              echo "an aptekonline systemd scrape is already running; waiting for it"
+              while systemctl is-active --quiet pharmacy-monitor-scrape@aptekonline.service; do
+                sleep 30
+              done
+              test "$(systemctl show -p Result --value pharmacy-monitor-scrape@aptekonline.service)" = success
+              exit 0
             fi
             set -a
             . /etc/pharmacy-monitor/env
             set +a
-            exec .venv/bin/pharmacy-monitor run \
+            .venv/bin/pharmacy-monitor run \
               --site aptekonline \
               --mode category \
               --no-alerts'
