@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import ssl
 from typing import AsyncIterator
 from urllib.parse import quote
 
@@ -563,7 +564,7 @@ class AptekonlineScraper(BaseScraper):
                         if delay:
                             await asyncio.sleep(delay)
                         continue
-                    except httpx.RequestError:
+                    except (httpx.RequestError, ssl.SSLError):
                         delay = _decodo_retry_delay_seconds()
                         if delay:
                             await asyncio.sleep(delay)
@@ -581,7 +582,7 @@ class AptekonlineScraper(BaseScraper):
                 if reason is not None:
                     raise SiteScrapeFatalError(reason) from exc
                 return None
-            except httpx.RequestError:
+            except (httpx.RequestError, ssl.SSLError):
                 return None
 
         pages_skipped = 0

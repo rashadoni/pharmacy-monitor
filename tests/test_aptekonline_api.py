@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -762,6 +763,38 @@ async def test_scrape_category_decodo_retries_past_transient_522(monkeypatch):
         products = [p async for p in scraper.scrape_category("114")]
     assert len(products) == len(payload["data"])  # пробились на 3-м порту
     assert idx["n"] == 3  # два 522 отретраены, затем 200
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_decodo_retries_low_level_ssl_error(monkeypatch):
+    """Proxy TLS handshake may raise ssl.SSLError outside httpx.RequestError."""
+    _enable_decodo(monkeypatch)
+    payload = _load_fixture()
+    payload["last_page"] = 1
+    payload["next_page_url"] = None
+    calls = {"n": 0}
+
+    class FlakyTlsClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, _url, *, params):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ssl.SSLError("WRONG_VERSION_NUMBER")
+            return httpx.Response(200, json=payload)
+
+    with patch("src.scrapers.aptekonline.httpx.AsyncClient", FlakyTlsClient):
+        products = [p async for p in AptekonlineScraper().scrape_category("348")]
+
+    assert len(products) == len(payload["data"])
+    assert calls["n"] == 2
 
 
 @pytest.mark.asyncio
