@@ -24,10 +24,12 @@ from src.scrapers.aptekonline import (
     _DEFAULT_CHECKUS,
     _brightdata_httpx_proxy_for,
     _build_product_from_api,
+    _category_attempts,
     _decodo_enabled,
     _decodo_httpx_proxy_for,
     _decodo_page_attempts,
     _decodo_ports,
+    _decodo_retry_delay_seconds,
     _iproyal_httpx_proxy_for,
     _resolve_checkus_token,
     _scraperapi_httpx_proxy_for,
@@ -311,6 +313,48 @@ async def test_scrape_category_stops_on_empty_data():
     assert products == []
 
 
+@pytest.mark.asyncio
+async def test_scrape_category_retries_whole_route_when_total_changes(monkeypatch):
+    """Live catalog drift must restart from page 1 without publishing attempt 1."""
+    _clear_decodo(monkeypatch)
+    monkeypatch.setenv("APTEKONLINE_CATEGORY_ATTEMPTS", "2")
+
+    def page(item_id: str, *, total: int, current: int) -> dict:
+        return {
+            "data": [
+                {
+                    "url_id": item_id,
+                    "name": f"Product {item_id}",
+                    "price": 1,
+                    "qaliq": 1,
+                }
+            ],
+            "total": total,
+            "current_page": current,
+            "last_page": 2,
+            "next_page_url": "next" if current == 1 else None,
+        }
+
+    # Attempt 1 drifts 2→3 and is discarded. Attempt 2 is a stable 2-item snapshot.
+    payloads = [
+        page("a", total=2, current=1),
+        page("b", total=3, current=2),
+        page("a", total=2, current=1),
+        page("b", total=2, current=2),
+    ]
+    patcher, calls = _mock_httpx_client(payloads)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+
+    assert [product.external_id for product in products] == ["a", "b"]
+    assert calls["n"] == 4
+    status = scraper._route_statuses["114"]
+    assert status.complete is True
+    assert status.expected_items == 2
+    assert status.parsed_items == 2
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Phase 0.1 — APTEKONLINE_CHECKUS env resolution (rotation path).
 # Default остаётся как fallback; задаваемая через env строка имеет приоритет;
@@ -502,8 +546,7 @@ def test_scraperapi_httpx_proxy_country_and_premium_for_aptek(monkeypatch):
     monkeypatch.setenv("SCRAPER_API_PREMIUM_SITES", "aptekonline")
     url = _scraperapi_httpx_proxy_for("aptekonline")
     assert url == (
-        "http://scraperapi.country_code=az.premium=true:k3y"
-        "@proxy-server.scraperapi.com:8001"
+        "http://scraperapi.country_code=az.premium=true:k3y@proxy-server.scraperapi.com:8001"
     )
 
 
@@ -549,6 +592,8 @@ def _clear_decodo(mp):
         "DECODO_HOST",
         "DECODO_PORTS",
         "DECODO_PAGE_ATTEMPTS",
+        "DECODO_RETRY_DELAY_SECONDS",
+        "APTEKONLINE_CATEGORY_ATTEMPTS",
     ):
         mp.delenv(k, raising=False)
 
@@ -611,14 +656,24 @@ def test_decodo_proxy_custom_host_and_port(monkeypatch):
 
 def test_decodo_page_attempts_default_and_override(monkeypatch):
     _clear_decodo(monkeypatch)
-    assert _decodo_page_attempts() == 5
+    assert _decodo_page_attempts() == 10
     monkeypatch.setenv("DECODO_PAGE_ATTEMPTS", "3")
     assert _decodo_page_attempts() == 3
     # invalid / zero → safe default
     monkeypatch.setenv("DECODO_PAGE_ATTEMPTS", "0")
-    assert _decodo_page_attempts() == 5
+    assert _decodo_page_attempts() == 10
     monkeypatch.setenv("DECODO_PAGE_ATTEMPTS", "abc")
-    assert _decodo_page_attempts() == 5
+    assert _decodo_page_attempts() == 10
+
+
+def test_aptekonline_retry_configuration(monkeypatch):
+    _clear_decodo(monkeypatch)
+    assert _category_attempts() == 3
+    assert _decodo_retry_delay_seconds() == 0.5
+    monkeypatch.setenv("APTEKONLINE_CATEGORY_ATTEMPTS", "2")
+    monkeypatch.setenv("DECODO_RETRY_DELAY_SECONDS", "0")
+    assert _category_attempts() == 2
+    assert _decodo_retry_delay_seconds() == 0
 
 
 def _enable_decodo(monkeypatch):
@@ -627,6 +682,8 @@ def _enable_decodo(monkeypatch):
     monkeypatch.setenv("DECODO_PASSWORD", "p")
     monkeypatch.setenv("DECODO_SITES", "aptekonline")
     monkeypatch.setenv("DECODO_PAGE_ATTEMPTS", "5")
+    monkeypatch.setenv("DECODO_RETRY_DELAY_SECONDS", "0")
+    monkeypatch.setenv("APTEKONLINE_CATEGORY_ATTEMPTS", "1")
 
 
 @pytest.mark.asyncio

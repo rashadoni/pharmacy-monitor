@@ -36,6 +36,7 @@ scrape_promos() остаётся на Playwright — главная страни
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import os
 from typing import AsyncIterator
@@ -202,9 +203,24 @@ def _decodo_ports(site_name: str) -> list[int]:
 
 
 def _decodo_page_attempts() -> int:
-    """Сколько IP перебрать на одну страницу до отказа (деф. 5)."""
-    raw = os.getenv("DECODO_PAGE_ATTEMPTS", "5").strip()
-    return int(raw) if raw.isdigit() and int(raw) > 0 else 5
+    """Сколько IP перебрать на одну страницу до отказа (деф. весь пул из 10)."""
+    raw = os.getenv("DECODO_PAGE_ATTEMPTS", "10").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else 10
+
+
+def _decodo_retry_delay_seconds() -> float:
+    """Пауза между сменами IP после транзиентного ответа прокси."""
+    raw = os.getenv("DECODO_RETRY_DELAY_SECONDS", "0.5").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.5
+
+
+def _category_attempts() -> int:
+    """Число полных согласованных проходов категории перед отказом."""
+    raw = os.getenv("APTEKONLINE_CATEGORY_ATTEMPTS", "3").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else 3
 
 
 def _decodo_httpx_proxy_for(site_name: str, port: int) -> str | None:
@@ -365,6 +381,72 @@ class AptekonlineScraper(BaseScraper):
     async def scrape_category(
         self, category_slug: str, limit: int | None = None, max_pages: int = 50
     ) -> AsyncIterator[ScrapedProduct]:
+        """Буферизуем и при необходимости повторяем всю категорию.
+
+        Laravel paginator не является snapshot: добавление/удаление товара во
+        время обхода может изменить ``total`` и сдвинуть страницы. Кроме того,
+        отдельный AZ residential exit иногда отвечает 522. Частичный проход
+        нельзя отдавать наружу (incremental persist сохранит его как будто он
+        полный), поэтому публикуем товары только после согласованной попытки.
+        """
+        best_products: list[ScrapedProduct] = []
+        best_status = None
+        attempts = _category_attempts()
+        for attempt in range(1, attempts + 1):
+            products = [
+                product
+                async for product in self._scrape_category_once(
+                    category_slug,
+                    limit=limit,
+                    max_pages=max_pages,
+                )
+            ]
+            status = self._route_statuses.get(str(category_slug))
+            if status is not None and status.complete:
+                if attempt > 1:
+                    log.info(
+                        "aptekonline_category_retry_recovered",
+                        category=category_slug,
+                        attempt=attempt,
+                        products=len(products),
+                    )
+                for product in products:
+                    yield product
+                return
+
+            if len(products) > len(best_products) or best_status is None:
+                best_products = products
+                best_status = status
+            if (
+                status is None
+                or status.abort_reason
+                in {
+                    "invalid_category",
+                    "invalid_last_page",
+                    "invalid_total",
+                    "requested_limit_reached",
+                }
+                or (status.abort_reason or "").startswith("hard_block_")
+            ):
+                break
+            if attempt < attempts:
+                log.warning(
+                    "aptekonline_category_retrying",
+                    category=category_slug,
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    reason=status.abort_reason or "incomplete_route",
+                    pages_skipped=status.pages_skipped,
+                )
+
+        if best_status is not None:
+            self._route_statuses[str(category_slug)] = best_status
+        for product in best_products:
+            yield product
+
+    async def _scrape_category_once(
+        self, category_slug: str, limit: int | None = None, max_pages: int = 50
+    ) -> AsyncIterator[ScrapedProduct]:
         """Стримим продукты одной категории через JSON API.
 
         category_slug — строковый числовой ID (например "114"), как в БД сейчас.
@@ -375,9 +457,7 @@ class AptekonlineScraper(BaseScraper):
         category_id = str(category_slug).strip()
         if not category_id.isdigit():
             log.warning("aptekonline_skip_non_numeric_category", category=category_slug)
-            self._set_route_status(
-                category_slug, complete=False, abort_reason="invalid_category"
-            )
+            self._set_route_status(category_slug, complete=False, abort_reason="invalid_category")
             return
 
         seen: set[str] = set()
@@ -426,9 +506,7 @@ class AptekonlineScraper(BaseScraper):
                 log.info(
                     f"aptekonline_using_{proxied_via}",
                     country=os.getenv(
-                        _country_env_by_provider.get(
-                            proxied_via, "SCRAPER_API_COUNTRY"
-                        ),
+                        _country_env_by_provider.get(proxied_via, "SCRAPER_API_COUNTRY"),
                         "default",
                     ),
                 )
@@ -461,22 +539,28 @@ class AptekonlineScraper(BaseScraper):
                         # сразу, не жжём оставшиеся попытки/баланс прокси.
                         if r.status_code in _HARD_BLOCK_STATUSES:
                             return r
+                        delay = _decodo_retry_delay_seconds()
+                        if delay:
+                            await asyncio.sleep(delay)
                     except httpx.ProxyError as exc:
                         reason = fatal_proxy_reason(exc)
                         if reason is not None:
                             raise SiteScrapeFatalError(reason) from exc
+                        delay = _decodo_retry_delay_seconds()
+                        if delay:
+                            await asyncio.sleep(delay)
                         continue
                     except httpx.RequestError:
+                        delay = _decodo_retry_delay_seconds()
+                        if delay:
+                            await asyncio.sleep(delay)
                         continue
                 return last_resp
             try:
-                response = await persistent_client.get(
-                    _API_PRODUCT_LIST, params=req_params
-                )
+                response = await persistent_client.get(_API_PRODUCT_LIST, params=req_params)
                 if proxied_via and response.status_code in {402, 407}:
                     raise SiteScrapeFatalError(
-                        f"{proxied_via} proxy access rejected: "
-                        f"HTTP {response.status_code}"
+                        f"{proxied_via} proxy access rejected: HTTP {response.status_code}"
                     )
                 return response
             except httpx.ProxyError as exc:
@@ -603,10 +687,10 @@ class AptekonlineScraper(BaseScraper):
                     if not product:
                         item_failures += 1
                         continue
-                    parsed_items += 1
                     if product.external_id in seen:
                         continue
                     seen.add(product.external_id)
+                    parsed_items += 1
                     yielded += 1
                     yield product
 
