@@ -408,6 +408,46 @@ def test_category_comparison_diff_only_old_run(db_session):
     assert rows[0].index == 120.0  # 12/10*100, клиент дороже
 
 
+def test_category_comparison_keeps_prices_until_cross_site_trusted_epoch(db_session):
+    """Один eligible run сайта не должен включать неполный lineage-фильтр."""
+    old = Run(tenant_id=1, started_at=utcnow() - timedelta(days=1), status="ok")
+    db_session.add(old)
+    db_session.flush()
+
+    m = Match(tenant_id=1, canonical_name="Stable partial epoch", confidence=1.0)
+    db_session.add(m)
+    db_session.flush()
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Stable partial epoch",
+        canonical_id=m.id,
+        category="stable-category",
+        ext_id="stable-client",
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Stable partial epoch",
+        canonical_id=m.id,
+        ext_id="stable-aloe",
+    )
+    _add_snap_at(db_session, old, client, 12.0, captured_at=old.started_at)
+    _add_snap_at(db_session, old, competitor, 10.0, captured_at=old.started_at)
+
+    aloe_only = _add_run(db_session, started_at=utcnow())
+    aloe_only.full_catalog_sites = "aloe"
+    aloe_only.run_quality["sites"] = {"aloe": {"status": "ok"}}
+    db_session.commit()
+
+    assert storage.financially_eligible_run_ids(db_session, tenant_id=1) == [aloe_only.id]
+    rows = analytics.category_comparison(db_session, tenant_id=1)
+
+    assert len(rows) == 1
+    assert rows[0].category == "stable-category"
+    assert rows[0].matched_skus == 1
+
+
 def test_category_comparison_ignores_newer_untrusted_snapshot(db_session):
     trusted = _add_run(db_session, started_at=utcnow() - timedelta(hours=2))
     partial = Run(

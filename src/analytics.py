@@ -460,10 +460,14 @@ def _iter_matched_prices(
             )
     else:
         # Mirror /comparison's safe bootstrap contract. In shadow policy mode
-        # there may be no newly verified full-catalog lineage yet; returning an
-        # empty 200 hides a healthy matched catalogue. Product identity/offer
-        # gates below still reject country conflicts, dead URLs and explicit OOS.
-        trusted_lineage_available = bool(financially_eligible_run_ids(session, tenant_id=tenant_id))
+        # one site's eligible diff-only run is not a complete cross-site price
+        # lineage and may contain no snapshots. Keep effective prices until all
+        # required sites form a fresh trusted epoch, matching /comparison.
+        from src.product_policy import trusted_catalog_epoch
+
+        trusted_lineage_available = (
+            trusted_catalog_epoch(session, tenant_id=tenant_id) is not None
+        )
         snaps = latest_snapshots_per_product(
             session,
             all_pids,
