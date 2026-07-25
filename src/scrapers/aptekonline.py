@@ -376,6 +376,9 @@ def _build_product_from_api(
 class AptekonlineScraper(BaseScraper):
     site_name = "aptekonline"
     base_url = "https://www.aptekonline.az"
+    # JSON paginator distinguishes a genuinely empty category (`total: 0`)
+    # from a failed/blocked response, so such a route is valid catalog evidence.
+    allow_verified_empty_categories = True
 
     async def scrape_category(
         self, category_slug: str, limit: int | None = None, max_pages: int = 50

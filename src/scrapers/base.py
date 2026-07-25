@@ -414,6 +414,10 @@ class BaseScraper(ABC):
 
     site_name: str  # переопределить в подклассе
     base_url: str  # переопределить в подклассе
+    # Некоторые API явно сообщают, что существующая категория сейчас пуста.
+    # По умолчанию нулевой результат остаётся ошибкой: HTML-скрейперы не могут
+    # отличить пустую категорию от блока/сломавшегося селектора.
+    allow_verified_empty_categories: bool = False
 
     def __init__(
         self,
@@ -805,7 +809,20 @@ class BaseScraper(ABC):
                     ),
                 )
                 result.route_statuses[str(slug)] = route_status
-                if count == 0:
+                verified_empty = (
+                    count == 0
+                    and self.allow_verified_empty_categories
+                    and route_status.complete
+                    and route_status.expected_items == 0
+                )
+                if verified_empty:
+                    result.items_completed += 1
+                    result.item_results[str(slug)] = {
+                        "status": "ok",
+                        "products": 0,
+                        "verified_empty": True,
+                    }
+                elif count == 0:
                     msg = f"category={slug}: empty result"
                     result.errors.append(msg)
                     result.items_failed += 1

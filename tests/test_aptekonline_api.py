@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -311,6 +311,29 @@ async def test_scrape_category_stops_on_empty_data():
         scraper = AptekonlineScraper()
         products = [p async for p in scraper.scrape_category("114")]
     assert products == []
+
+
+@pytest.mark.asyncio
+async def test_scrape_accepts_api_confirmed_empty_category():
+    payload = {
+        "data": [],
+        "current_page": 1,
+        "last_page": 1,
+        "total": 0,
+        "next_page_url": None,
+    }
+    patcher, _ = _mock_httpx_client(payload)
+    with patcher, patch.object(
+        AptekonlineScraper, "scrape_promos", new_callable=AsyncMock, return_value=[]
+    ):
+        result = await AptekonlineScraper().scrape(["254"])
+
+    assert result.errors == []
+    assert result.items_completed == 1
+    assert result.items_failed == 0
+    assert result.item_results["254"]["verified_empty"] is True
+    assert result.route_statuses["254"].complete is True
+    assert result.route_statuses["254"].expected_items == 0
 
 
 @pytest.mark.asyncio

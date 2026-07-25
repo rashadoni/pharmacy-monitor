@@ -799,6 +799,37 @@ def test_full_catalog_verifier_requires_every_category_route_nonzero():
     assert "zero_categories=aloe:1" in reason
 
 
+def test_full_catalog_verifier_accepts_upstream_verified_empty_route():
+    result = ScrapeResult(
+        site="aptekonline",
+        products=[_sp("a", "meds")],
+        category_counts={"meds": 1, "empty": 0},
+        route_statuses={
+            "meds": RouteStatus(
+                complete=True,
+                expected_pages=1,
+                visited_pages=1,
+                raw_items=1,
+                parsed_items=1,
+                expected_items=1,
+            ),
+            "empty": RouteStatus(
+                complete=True, expected_pages=1, visited_pages=1, expected_items=0
+            ),
+        },
+    )
+
+    verified, reason = main_mod._verify_full_catalog_results(
+        [result],
+        sites=["aptekonline"],
+        expected_slugs={"aptekonline": ["meds", "empty"]},
+        baselines={"aptekonline": 1},
+    )
+
+    assert verified is True
+    assert reason == "complete_nonzero_routes_coverage_ok"
+
+
 def test_full_catalog_verifier_rejects_below_ninety_percent_baseline():
     products = [_sp(str(index), "meds") for index in range(89)]
     result = ScrapeResult(

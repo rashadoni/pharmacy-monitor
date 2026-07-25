@@ -1138,7 +1138,14 @@ def _verify_full_catalog_results(
         if baseline > 0 and len(result.products) < baseline * _FULL_CATALOG_MIN_BASELINE_FRACTION:
             coverage_failures.append(site)
         zero_count = sum(
-            1 for slug in slugs if int(result.category_counts.get(slug, 0)) == 0
+            1
+            for slug in slugs
+            if int(result.category_counts.get(slug, 0)) == 0
+            and not (
+                (status := result.route_statuses.get(slug)) is not None
+                and status.complete
+                and status.expected_items == 0
+            )
         )
         if zero_count:
             zero_categories[site] = zero_count
