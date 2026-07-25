@@ -35,9 +35,14 @@ jobs:
               test "$(systemctl show -p Result --value pharmacy-monitor-scrape@aptekonline.service)" = success
               exit 0
             fi
-            set -a
-            . /etc/pharmacy-monitor/env
-            set +a
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                ""|\#*) continue ;;
+              esac
+              key=${line%%=*}
+              value=${line#*=}
+              export "$key=$value"
+            done < /etc/pharmacy-monitor/env
             .venv/bin/pharmacy-monitor run \
               --site aptekonline \
               --mode category \
