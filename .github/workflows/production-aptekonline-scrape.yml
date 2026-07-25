@@ -1,0 +1,65 @@
+name: Production aptekonline full scrape
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: production-aptekonline-scrape
+      cancel-in-progress: false
+    steps:
+      - name: Setup SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Run full aptekonline scrape on production
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+            cd /opt/pharmacy-monitor
+            if pgrep -u pm -f "pharmacy-monitor run.*--site aptekonline" >/dev/null; then
+              echo "an aptekonline scrape is already running" >&2
+              exit 1
+            fi
+            set -a
+            . /etc/pharmacy-monitor/env
+            set +a
+            exec .venv/bin/pharmacy-monitor run \
+              --site aptekonline \
+              --mode category \
+              --no-alerts'
+
+      - name: Verify latest aptekonline catalog attempt
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          with urllib.request.urlopen("https://leaddrive.cloud/health", timeout=30) as response:
+              health = json.load(response)
+
+          sites = health.get("product_policy", {}).get("sites", [])
+          aptek = next((row for row in sites if row.get("site") == "aptekonline"), None)
+          if aptek is None:
+              raise SystemExit("aptekonline is absent from product_policy health")
+
+          print(
+              "aptekonline latest attempt:",
+              aptek.get("latest_full_attempt_id"),
+              aptek.get("latest_full_attempt_status"),
+              aptek.get("latest_full_attempt_reason"),
+          )
+          if not aptek.get("latest_full_attempt_verified"):
+              raise SystemExit("latest aptekonline full catalog attempt is not verified")
+          PY
