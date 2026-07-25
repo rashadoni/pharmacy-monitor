@@ -587,10 +587,11 @@ def category_comparison(
         return []
 
     canonical_labels = {}
+    fallback_labels: dict[str, tuple[str | None, str | None]] = {}
     if canonical:
         from src.category_taxonomy import (
             CanonicalCategory,
-            classify_source_category,
+            classify_source_category_detailed,
             source_category_labels,
         )
 
@@ -598,28 +599,38 @@ def category_comparison(
         # Классификация зависит только от категории-источника, а не от матча:
         # мемоизируем по raw_category (иначе ~200 правил × ~4k матчей регэкспов
         # вместо ~200 × ~178 категорий).
-        resolved: dict[str, CanonicalCategory | None] = {}
+        resolved: dict[str, tuple[CanonicalCategory | None, str]] = {}
 
-        def _canonical_for(raw_category: str) -> CanonicalCategory | None:
+        def _canonical_for(raw_category: str) -> tuple[CanonicalCategory | None, str]:
             if raw_category not in resolved:
                 label_ru, label_az = source_labels.get((client_site, raw_category), (None, None))
-                resolved[raw_category] = classify_source_category(
+                classification = classify_source_category_detailed(
                     client_site,
                     raw_category,
                     label_ru=label_ru,
                     label_az=label_az,
                 )
+                resolved[raw_category] = (classification.category, classification.reason)
             return resolved[raw_category]
 
         canonical_records: list[tuple[str, float, dict[str, float]]] = []
         for raw_category, client_price, comp_by_site in records:
-            mapped = _canonical_for(raw_category)
-            # Несопоставленная категория-источник (форма выпуска, широкий
-            # раздел, неоднозначность) НЕ становится строкой дашборда.
+            mapped, reason = _canonical_for(raw_category)
+            # Формы выпуска и заведомо широкие корневые разделы не являются
+            # товарными категориями и по-прежнему не создают шум в дашборде.
             if mapped is None:
-                continue
-            canonical_records.append((mapped.key, client_price, comp_by_site))
-            canonical_labels[mapped.key] = mapped
+                if reason in {"blocked_broad_bucket", "blocked_dosage_form", "no_slug"}:
+                    continue
+                # Неизвестная или неоднозначная категория не должна скрывать
+                # реально matched SKU. Показываем её отдельной строкой под
+                # исходным slug/label, пока taxonomy не научится её объединять.
+                canonical_records.append((raw_category, client_price, comp_by_site))
+                fallback_labels[raw_category] = source_labels.get(
+                    (client_site, raw_category), (None, None)
+                )
+            else:
+                canonical_records.append((mapped.key, client_price, comp_by_site))
+                canonical_labels[mapped.key] = mapped
         records = canonical_records
         if not records:
             return []
@@ -663,6 +674,7 @@ def category_comparison(
             for key, category in canonical_labels.items()
             if category is not None
         }
+        labels.update(fallback_labels)
     elif slugs:
         for c in session.scalars(
             select(Category).where(Category.pharmonline_slug.in_(slugs))

@@ -723,6 +723,38 @@ def test_category_comparison_canonical_skips_format_only_categories(db_session):
     assert analytics.category_comparison(db_session, canonical=True) == []
 
 
+def test_category_comparison_canonical_keeps_unclassified_matched_category(db_session):
+    run = _add_run(db_session)
+    match = Match(canonical_name="Unknown category product", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    client = _add_product(
+        db_session,
+        "pharmonline",
+        "Unknown category product",
+        canonical_id=match.id,
+        category="new-unclassified-category",
+        ext_id="unknown-category-client",
+    )
+    competitor = _add_product(
+        db_session,
+        "aloe",
+        "Unknown category product",
+        canonical_id=match.id,
+        category="dermanlar",
+        ext_id="unknown-category-aloe",
+    )
+    _add_snap_at(db_session, run, client, 10.0)
+    _add_snap_at(db_session, run, competitor, 9.0)
+    db_session.commit()
+
+    rows = analytics.category_comparison(db_session, canonical=True)
+
+    assert len(rows) == 1
+    assert rows[0].category == "new-unclassified-category"
+    assert rows[0].matched_skus == 1
+
+
 def test_category_comparison_shadow_bootstrap_uses_latest_prices(db_session):
     partial = Run(
         tenant_id=1,
