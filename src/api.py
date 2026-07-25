@@ -3153,6 +3153,81 @@ def dash_category_comparison_coverage(
     )
 
 
+@app.get("/api/v1/dash/category-comparison/catalog")
+def dash_category_catalog(
+    client_site: str = "pharmonline",
+    locale: str = "ru",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Категории всего каталога клиента, включая товары без competitor match."""
+    _require_site(client_site)
+    locale = _normalize_locale(locale)
+    from src.category_taxonomy import (
+        CANONICAL_CATEGORIES,
+        classify_source_category_detailed,
+        source_category_labels,
+    )
+
+    canonical_by_key = {category.key: category for category in CANONICAL_CATEGORIES}
+    source_labels = source_category_labels(db)
+    products = db.scalars(
+        select(storage.Product).where(
+            storage.Product.tenant_id == user.tenant_id,
+            storage.Product.site == client_site,
+            storage.Product.url_dead_at.is_(None),
+        )
+    ).all()
+    counts: dict[str, int] = defaultdict(int)
+    manual_counts: dict[str, int] = defaultdict(int)
+    labels: dict[str, str] = {}
+    for product in products:
+        raw = product.manual_category_key or product.category or "(без категории)"
+        canonical = canonical_by_key.get(raw)
+        if canonical is None and product.manual_category_key is None:
+            label_ru, label_az = source_labels.get((client_site, raw), (None, None))
+            canonical = classify_source_category_detailed(
+                client_site,
+                raw,
+                label_ru=label_ru,
+                label_az=label_az,
+            ).category
+        key = canonical.key if canonical else raw
+        counts[key] += 1
+        if product.manual_category_key:
+            manual_counts[key] += 1
+        if canonical:
+            labels[key] = canonical.label_az if locale == "az" else canonical.label_ru
+        else:
+            label_ru, label_az = source_labels.get((client_site, raw), (None, None))
+            labels[key] = _localized_category_label(
+                label_ru=label_ru,
+                label_az=label_az,
+                locale=locale,
+                fallback=raw,
+            )
+
+    comparable = {
+        row.category: row.matched_skus
+        for row in analytics.category_comparison(
+            db,
+            client_site=client_site,
+            tenant_id=user.tenant_id,
+            canonical=True,
+        )
+    }
+    return [
+        {
+            "category": key,
+            "label": labels[key],
+            "catalog_skus": count,
+            "comparable_skus": comparable.get(key, 0),
+            "manual_skus": manual_counts.get(key, 0),
+        }
+        for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
 @app.get("/api/v1/dash/category-comparison/manual-categories")
 def dash_manual_category_options(
     locale: str = "ru",
@@ -3221,6 +3296,20 @@ def dash_assign_product_category(
     from src.category_taxonomy import CANONICAL_CATEGORIES
 
     allowed = {category.key for category in CANONICAL_CATEGORIES}
+    allowed.update(
+        value
+        for value in db.scalars(
+            select(storage.Product.category)
+            .where(
+                storage.Product.tenant_id == user.tenant_id,
+                storage.Product.site == "pharmonline",
+                storage.Product.category.is_not(None),
+                storage.Product.category != "",
+            )
+            .distinct()
+        )
+        if value
+    )
     if payload.category_key is not None and payload.category_key not in allowed:
         raise HTTPException(400, "Unknown canonical category")
     product = db.scalar(

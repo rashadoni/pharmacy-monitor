@@ -335,6 +335,8 @@ export default function ComparisonPage() {
         </div>
       )}
 
+      {category && <CategoryProductAssigner categoryKey={category} />}
+
       {/* Status */}
       {(isLoading || isFetching) && (
         <div className="text-xs text-muted-foreground" data-testid="loading">
@@ -996,6 +998,88 @@ function RelinkSite({
         </span>
       )}
     </div>
+  );
+}
+
+function CategoryProductAssigner({ categoryKey }: { categoryKey: string }) {
+  const t = useTranslations("category_comparison");
+  const tCommon = useTranslations("common");
+  const [search, setSearch] = useState("");
+  const queryClient = useQueryClient();
+  const { data: suggestions, isFetching } = useQuery({
+    queryKey: ["category-product-suggestions", search],
+    queryFn: () => api.categoryProductSuggestions(search),
+    enabled: search.trim().length >= 2,
+  });
+  const assignment = useMutation({
+    mutationFn: (productId: number) =>
+      api.assignProductCategory(productId, categoryKey),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["comparison"] }),
+        queryClient.invalidateQueries({ queryKey: ["category-comparison"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["category-comparison-catalog"],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["category-product-suggestions"],
+        }),
+      ]);
+    },
+  });
+
+  return (
+    <section className="rounded-lg border border-primary/30 bg-primary/5 p-4">
+      <h2 className="text-sm font-medium">
+        {t("manual_add_to", { category: categoryKey })}
+      </h2>
+      <p className="mt-1 text-xs text-muted-foreground">{t("manual_hint")}</p>
+      <input
+        value={search}
+        onChange={(event) => setSearch(event.target.value)}
+        placeholder={t("manual_search_placeholder")}
+        className="mt-3 min-h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+      />
+      {search.trim().length >= 2 && (
+        <div className="mt-2 divide-y divide-border rounded-md border border-border bg-background">
+          {isFetching && (
+            <div className="p-3 text-xs text-muted-foreground">
+              {tCommon("loading")}
+            </div>
+          )}
+          {suggestions?.map((product) => (
+            <div
+              key={product.id}
+              className="flex items-center justify-between gap-3 p-3"
+            >
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium">{product.name}</div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {product.manual_category_key
+                    ? t("manual_current", {
+                        category: product.manual_category_key,
+                      })
+                    : product.source_category || t("manual_uncategorized")}
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={assignment.isPending}
+                onClick={() => assignment.mutate(product.id)}
+                className="shrink-0 rounded-md bg-primary px-3 py-2 text-xs text-primary-foreground disabled:opacity-40"
+              >
+                {assignment.isPending ? tCommon("loading") : t("manual_assign")}
+              </button>
+            </div>
+          ))}
+          {!isFetching && suggestions?.length === 0 && (
+            <div className="p-3 text-xs text-muted-foreground">
+              {t("manual_no_results")}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

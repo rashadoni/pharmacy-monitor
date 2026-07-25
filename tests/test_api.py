@@ -4179,6 +4179,14 @@ def test_category_comparison_coverage_and_manual_product_assignment(
         "categorization_pct": 50.0,
         "matching_pct": 50.0,
     }
+    catalog = client.get("/api/v1/dash/category-comparison/catalog?locale=az")
+    assert catalog.status_code == 200, catalog.text
+    assert sum(row["catalog_skus"] for row in catalog.json()) == 2
+    unknown_row = next(
+        row for row in catalog.json() if row["category"] == "unknown-source-bucket"
+    )
+    assert unknown_row["catalog_skus"] == 1
+    assert unknown_row["comparable_skus"] == 1
 
     suggestions = client.get(
         "/api/v1/dash/category-comparison/product-suggestions?q=searchable"

@@ -500,6 +500,14 @@ export interface CategoryComparisonCoverage {
   matching_pct: number;
 }
 
+export interface CategoryCatalogRow {
+  category: string;
+  label: string;
+  catalog_skus: number;
+  comparable_skus: number;
+  manual_skus: number;
+}
+
 export interface ManualCategoryOption {
   key: string;
   label: string;
@@ -1185,6 +1193,10 @@ export const api = {
   categoryComparisonCoverage: (client_site = "pharmonline") =>
     request<CategoryComparisonCoverage>(
       `/api/v1/dash/category-comparison/coverage?client_site=${encodeURIComponent(client_site)}`,
+    ),
+  categoryCatalog: (client_site: string, locale: string) =>
+    request<CategoryCatalogRow[]>(
+      `/api/v1/dash/category-comparison/catalog?client_site=${encodeURIComponent(client_site)}&locale=${encodeURIComponent(locale)}`,
     ),
   manualCategoryOptions: (locale: string) =>
     request<ManualCategoryOption[]>(

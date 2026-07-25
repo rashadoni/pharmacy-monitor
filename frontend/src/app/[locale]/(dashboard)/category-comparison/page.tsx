@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
@@ -31,9 +31,7 @@ export default function CategoryComparisonPage() {
     key: "misprice",
     dir: "desc",
   });
-  const [productSearch, setProductSearch] = useState("");
-  const [manualCategory, setManualCategory] = useState("");
-  const queryClient = useQueryClient();
+  const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
 
   const { data, isLoading, error, isFetching } = useQuery({
     queryKey: ["category-comparison", locale],
@@ -43,29 +41,9 @@ export default function CategoryComparisonPage() {
     queryKey: ["category-comparison-coverage", "pharmonline"],
     queryFn: () => api.categoryComparisonCoverage("pharmonline"),
   });
-  const { data: categoryOptions } = useQuery({
-    queryKey: ["manual-category-options", locale],
-    queryFn: () => api.manualCategoryOptions(locale),
-  });
-  const { data: productSuggestions, isFetching: isSearchingProducts } = useQuery({
-    queryKey: ["category-product-suggestions", productSearch],
-    queryFn: () => api.categoryProductSuggestions(productSearch),
-    enabled: productSearch.trim().length >= 2,
-  });
-  const assignCategory = useMutation({
-    mutationFn: (productId: number) =>
-      api.assignProductCategory(productId, manualCategory),
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["category-comparison"] }),
-        queryClient.invalidateQueries({
-          queryKey: ["category-comparison-coverage"],
-        }),
-        queryClient.invalidateQueries({
-          queryKey: ["category-product-suggestions"],
-        }),
-      ]);
-    },
+  const { data: catalogRows, isLoading: isCatalogLoading } = useQuery({
+    queryKey: ["category-comparison-catalog", "pharmonline", locale],
+    queryFn: () => api.categoryCatalog("pharmonline", locale),
   });
 
   // Дефолт-сортировка — наибольший «мисприсинг» |index-100|×matched_skus:
@@ -269,66 +247,75 @@ export default function CategoryComparisonPage() {
         />
       </section>
 
-      <section className="rounded-lg border border-border p-4">
-        <h2 className="font-medium">{t("manual_title")}</h2>
-        <p className="mt-1 text-xs text-muted-foreground">{t("manual_hint")}</p>
-        <div className="mt-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(220px,0.6fr)]">
-          <input
-            value={productSearch}
-            onChange={(event) => setProductSearch(event.target.value)}
-            placeholder={t("manual_search_placeholder")}
-            className="min-h-10 rounded-md border border-input bg-background px-3 text-sm"
-          />
-          <select
-            value={manualCategory}
-            onChange={(event) => setManualCategory(event.target.value)}
-            className="min-h-10 rounded-md border border-input bg-background px-3 text-sm"
-          >
-            <option value="">{t("manual_choose_category")}</option>
-            {categoryOptions?.map((category) => (
-              <option key={category.key} value={category.key}>
-                {category.label}
-              </option>
-            ))}
-          </select>
+      <section className="rounded-lg border border-border overflow-hidden">
+        <div className="border-b border-border p-4">
+          <h2 className="font-medium">{t("catalog_title")}</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t("catalog_hint")}
+          </p>
         </div>
-        {productSearch.trim().length >= 2 && (
-          <div className="mt-2 divide-y divide-border rounded-md border border-border">
-            {isSearchingProducts && (
-              <div className="p-3 text-xs text-muted-foreground">
-                {tCommon("loading")}
-              </div>
-            )}
-            {productSuggestions?.map((product) => (
-              <div
-                key={product.id}
-                className="flex items-center justify-between gap-3 p-3"
-              >
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-medium">{product.name}</div>
-                  <div className="truncate text-xs text-muted-foreground">
-                    {product.manual_category_key
-                      ? t("manual_current", {
-                          category: product.manual_category_key,
-                        })
-                      : product.source_category || t("manual_uncategorized")}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  disabled={!manualCategory || assignCategory.isPending}
-                  onClick={() => assignCategory.mutate(product.id)}
-                  className="shrink-0 rounded-md bg-primary px-3 py-2 text-xs text-primary-foreground disabled:opacity-40"
-                >
-                  {t("manual_assign")}
-                </button>
-              </div>
-            ))}
-            {!isSearchingProducts && productSuggestions?.length === 0 && (
-              <div className="p-3 text-xs text-muted-foreground">
-                {t("manual_no_results")}
-              </div>
-            )}
+        {isCatalogLoading ? (
+          <div className="p-4 text-sm text-muted-foreground">
+            {tCommon("loading")}
+          </div>
+        ) : (
+          <div className="max-h-[420px] overflow-auto">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-muted/90 text-muted-foreground">
+                <tr>
+                  <th className="px-3 py-2 text-left font-medium">
+                    {t("th_category")}
+                  </th>
+                  <th className="px-3 py-2 text-right font-medium">
+                    {t("catalog_all_skus")}
+                  </th>
+                  <th className="px-3 py-2 text-right font-medium">
+                    {t("catalog_comparable_skus")}
+                  </th>
+                  <th className="px-3 py-2 text-right font-medium">
+                    {t("manual_action")}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {catalogRows?.map((row) => (
+                  <Fragment key={`catalog-${row.category}`}>
+                    <tr className="border-t border-border">
+                      <td className="px-3 py-2 font-medium">{row.label}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">
+                        {row.catalog_skus}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
+                        {row.comparable_skus}
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedCategory((current) =>
+                              current === row.category ? null : row.category,
+                            )
+                          }
+                          className="rounded-md border border-input px-2 py-1 text-xs hover:bg-muted"
+                        >
+                          {t("manual_add_product")}
+                        </button>
+                      </td>
+                    </tr>
+                    {expandedCategory === row.category && (
+                      <tr className="border-t border-border">
+                        <td colSpan={4} className="bg-muted/20 p-3">
+                          <InlineCategoryAssigner
+                            categoryKey={row.category}
+                            categoryLabel={row.label}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </section>
@@ -419,42 +406,71 @@ export default function CategoryComparisonPage() {
                   onClick={() => toggleSort("cheaper")}
                   align="right"
                 />
+                <th className="px-3 py-2 text-right font-medium">
+                  {t("manual_action")}
+                </th>
               </tr>
             </thead>
             <tbody>
               {sorted?.map((row) => (
-                <tr
-                  key={row.category}
-                  onClick={() => drill(row.category)}
-                  className="border-t border-border hover:bg-muted/30 cursor-pointer"
-                  title={t("drill_hint")}
-                  data-testid={`cat-row-${row.category}`}
-                >
-                  <td className="px-3 py-2 max-w-xs truncate font-medium">
-                    {row.label}
-                  </td>
-                  <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
-                    {row.matched_skus}
-                  </td>
-                  <td className="px-3 py-2 text-right tabular-nums">
-                    {formatPrice(row.avg_client_price, locale)}
-                  </td>
-                  {COMPETITORS.map((s) => (
-                    <td key={s} className="px-3 py-2 text-right tabular-nums">
-                      {row.per_site_avg[s] != null ? (
-                        formatPrice(row.per_site_avg[s], locale)
-                      ) : (
-                        <span className="text-muted-foreground/50">—</span>
-                      )}
+                <Fragment key={row.category}>
+                  <tr
+                    key={row.category}
+                    onClick={() => drill(row.category)}
+                    className="border-t border-border hover:bg-muted/30 cursor-pointer"
+                    title={t("drill_hint")}
+                    data-testid={`cat-row-${row.category}`}
+                  >
+                    <td className="px-3 py-2 max-w-xs truncate font-medium">
+                      {row.label}
                     </td>
-                  ))}
-                  <td className="px-3 py-2 text-right">
-                    <IndexBadge index={row.index} t={t} />
-                  </td>
-                  <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
-                    {row.cheaper_pct.toFixed(0)}%
-                  </td>
-                </tr>
+                    <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
+                      {row.matched_skus}
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums">
+                      {formatPrice(row.avg_client_price, locale)}
+                    </td>
+                    {COMPETITORS.map((s) => (
+                      <td key={s} className="px-3 py-2 text-right tabular-nums">
+                        {row.per_site_avg[s] != null ? (
+                          formatPrice(row.per_site_avg[s], locale)
+                        ) : (
+                          <span className="text-muted-foreground/50">—</span>
+                        )}
+                      </td>
+                    ))}
+                    <td className="px-3 py-2 text-right">
+                      <IndexBadge index={row.index} t={t} />
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
+                      {row.cheaper_pct.toFixed(0)}%
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setExpandedCategory((current) =>
+                            current === row.category ? null : row.category,
+                          );
+                        }}
+                        className="rounded-md border border-input px-2 py-1 text-xs hover:bg-muted"
+                      >
+                        {t("manual_add_product")}
+                      </button>
+                    </td>
+                  </tr>
+                  {expandedCategory === row.category && (
+                    <tr key={`${row.category}-assign`} className="border-t border-border">
+                      <td colSpan={8} className="bg-muted/20 p-3">
+                        <InlineCategoryAssigner
+                          categoryKey={row.category}
+                          categoryLabel={row.label}
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
               ))}
             </tbody>
           </table>
@@ -467,6 +483,96 @@ export default function CategoryComparisonPage() {
           data-testid="result-count"
         >
           {t("result_count", { count: visibleRows.length })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InlineCategoryAssigner({
+  categoryKey,
+  categoryLabel,
+}: {
+  categoryKey: string;
+  categoryLabel: string;
+}) {
+  const t = useTranslations("category_comparison");
+  const tCommon = useTranslations("common");
+  const [search, setSearch] = useState("");
+  const queryClient = useQueryClient();
+  const { data: suggestions, isFetching } = useQuery({
+    queryKey: ["category-product-suggestions", search],
+    queryFn: () => api.categoryProductSuggestions(search),
+    enabled: search.trim().length >= 2,
+  });
+  const assignment = useMutation({
+    mutationFn: (productId: number) =>
+      api.assignProductCategory(productId, categoryKey),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["category-comparison"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["category-comparison-coverage"],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["category-comparison-catalog"],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["category-product-suggestions"],
+        }),
+      ]);
+    },
+  });
+
+  return (
+    <div>
+      <div className="text-xs font-medium">
+        {t("manual_add_to", { category: categoryLabel })}
+      </div>
+      <input
+        value={search}
+        onChange={(event) => setSearch(event.target.value)}
+        placeholder={t("manual_search_placeholder")}
+        autoFocus
+        className="mt-2 min-h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+      />
+      {search.trim().length >= 2 && (
+        <div className="mt-2 divide-y divide-border rounded-md border border-border bg-background">
+          {isFetching && (
+            <div className="p-3 text-xs text-muted-foreground">
+              {tCommon("loading")}
+            </div>
+          )}
+          {suggestions?.map((product) => (
+            <div
+              key={product.id}
+              className="flex items-center justify-between gap-3 p-3"
+            >
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium">{product.name}</div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {product.manual_category_key
+                    ? t("manual_current", {
+                        category: product.manual_category_key,
+                      })
+                    : product.source_category || t("manual_uncategorized")}
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={assignment.isPending}
+                onClick={() => assignment.mutate(product.id)}
+                className="shrink-0 rounded-md bg-primary px-3 py-2 text-xs text-primary-foreground disabled:opacity-40"
+              >
+                {assignment.isPending ? tCommon("loading") : t("manual_assign")}
+              </button>
+            </div>
+          ))}
+          {!isFetching && suggestions?.length === 0 && (
+            <div className="p-3 text-xs text-muted-foreground">
+              {t("manual_no_results")}
+            </div>
+          )}
         </div>
       )}
     </div>
