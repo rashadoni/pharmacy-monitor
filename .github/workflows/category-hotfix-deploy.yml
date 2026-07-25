@@ -1,0 +1,80 @@
+name: Deploy category comparison hotfix
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: api.py and analytics.py hotfix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Backup and deploy category comparison files
+        run: |
+          set -euo pipefail
+          ssh_base="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15"
+          backup_dir="/tmp/category-hotfix-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          $ssh_base pm@46.225.149.52 \
+            "set -euo pipefail
+             mkdir -- '$backup_dir'
+             test -w /opt/pharmacy-monitor/src/api.py
+             test -w /opt/pharmacy-monitor/src/analytics.py
+             cp -- /opt/pharmacy-monitor/src/api.py '$backup_dir/api.py'
+             cp -- /opt/pharmacy-monitor/src/analytics.py '$backup_dir/analytics.py'"
+          printf 'BACKUP_DIR=%s\n' "$backup_dir" >> "$GITHUB_ENV"
+
+          for file in api.py analytics.py
+          do
+            rsync -z --checksum --inplace --no-perms --no-owner --no-group \
+              -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+              "src/$file" "pm@46.225.149.52:/opt/pharmacy-monitor/src/$file"
+          done
+
+      - name: Verify, restart API, and health check
+        run: |
+          set -euo pipefail
+          ssh_base="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15"
+
+          for file in api.py analytics.py
+          do
+            local_sha=$(sha256sum "src/$file" | awk '{print $1}')
+            remote_sha=$($ssh_base pm@46.225.149.52 \
+              "sha256sum '/opt/pharmacy-monitor/src/$file'" | awk '{print $1}')
+            test "$local_sha" = "$remote_sha"
+          done
+
+          $ssh_base pm@46.225.149.52 \
+            'cd /opt/pharmacy-monitor &&
+             PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m py_compile src/api.py src/analytics.py &&
+             sudo -n /usr/bin/systemctl restart pharmacy-monitor-api.service'
+          sleep 5
+          $ssh_base pm@46.225.149.52 \
+            'curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"'
+
+      - name: Roll back after failed verification
+        if: ${{ failure() && env.BACKUP_DIR != '' }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            pm@46.225.149.52 \
+            "set -euo pipefail
+             cp -- '$BACKUP_DIR/api.py' /opt/pharmacy-monitor/src/api.py
+             cp -- '$BACKUP_DIR/analytics.py' /opt/pharmacy-monitor/src/analytics.py
+             sudo -n /usr/bin/systemctl restart pharmacy-monitor-api.service"
