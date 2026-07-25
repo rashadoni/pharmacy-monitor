@@ -3044,7 +3044,7 @@ def dash_category_comparison(
         db,
         client_site=client_site,
         tenant_id=user.tenant_id,
-        canonical=True,
+        canonical=False,
     )
     resolved_labels = [
         _localized_category_label(
