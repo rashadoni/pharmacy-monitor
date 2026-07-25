@@ -68,6 +68,39 @@ jobs:
           $ssh_base pm@46.225.149.52 \
             'curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"'
 
+      - name: Category comparison production smoke
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            pm@46.225.149.52 \
+            'set -euo pipefail
+             cd /opt/pharmacy-monitor
+             db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
+             test -n "$db_url"
+             DATABASE_URL="$db_url" .venv/bin/python -c "
+          from sqlalchemy import func, select
+          from src import analytics, storage
+          Session = storage.make_session()
+          with Session() as session:
+              tenant_ids = session.scalars(select(storage.TenantUser.tenant_id).distinct()).all()
+              for tenant_id in tenant_ids:
+                  matches = session.scalar(
+                      select(func.count()).select_from(storage.Match).where(
+                          storage.Match.tenant_id == tenant_id
+                      )
+                  )
+                  rows = analytics.category_comparison(
+                      session,
+                      client_site=\"pharmonline\",
+                      tenant_id=tenant_id,
+                      canonical=True,
+                  )
+                  print(
+                      f\"tenant={tenant_id} matches={matches} category_rows={len(rows)} \"
+                      f\"matched_skus={sum(row.matched_skus for row in rows)}\"
+                  )
+          "'
+
       - name: Roll back after failed verification
         if: ${{ failure() && env.BACKUP_DIR != '' }}
         run: |
