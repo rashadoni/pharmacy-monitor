@@ -13,12 +13,12 @@ import { test, expect } from "@playwright/test";
  */
 
 test.describe("Pricing Settings (unauthenticated)", () => {
-  test("/settings/pricing redirects to /ru/settings/pricing", async ({ request }) => {
+  test("/settings/pricing redirects to /az/settings/pricing", async ({ request }) => {
     const r = await request
       .get("/settings/pricing", { maxRedirects: 0 })
       .catch((err) => err.response ?? null);
     expect(r?.status()).toBe(307);
-    expect(r?.headers()["location"]).toBe("/ru/settings/pricing");
+    expect(r?.headers()["location"]).toBe("/az/settings/pricing");
   });
 
   test("/ru/settings/pricing requires auth", async ({ page }) => {

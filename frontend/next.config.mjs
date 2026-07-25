@@ -28,7 +28,7 @@ const nextConfig = {
   // Framework-level `redirects()` (НЕ middleware!) — обходит next-intl
   // issue #524 standalone recursion. Сервер вернёт HTTP 307 ДО page render.
   //
-  // Default locale = ru. Все legacy unprefixed URLs → /ru/<same-path>.
+  // Default locale = az. Все legacy unprefixed URLs → /az/<same-path>.
   async redirects() {
     const LEGACY_ROUTES = [
       "alerts",
@@ -49,16 +49,16 @@ const nextConfig = {
       "watchlist",
     ];
     return [
-      // 1:1 route redirects (legacy /comparison → /ru/comparison)
+      // 1:1 route redirects (legacy /comparison → /az/comparison)
       ...LEGACY_ROUTES.map((route) => ({
         source: `/${route}`,
-        destination: `/ru/${route}`,
+        destination: `/az/${route}`,
         permanent: false,
       })),
-      // Dynamic: /site/[site] → /ru/site/[site]
+      // Dynamic: /site/[site] → /az/site/[site]
       {
         source: "/site/:site",
-        destination: "/ru/site/:site",
+        destination: "/az/site/:site",
         permanent: false,
       },
     ];

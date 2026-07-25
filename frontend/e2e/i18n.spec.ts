@@ -4,7 +4,7 @@ import { test, expect } from "@playwright/test";
  * Phase 6.1 i18n routing regression tests.
  *
  * Verifies URL-based locale (`/ru/...`, `/az/...`, `/en/...`) + backward
- * compat redirects (`/comparison` → `/ru/comparison`) work correctly.
+ * compat redirects (`/comparison` → `/az/comparison`) work correctly.
  *
  * These tests are PUBLIC — don't need auth (login page renders for all locales,
  * legacy redirects don't require session).
@@ -56,22 +56,22 @@ test.describe("Legacy URL redirects (Phase 6.1 backward compat)", () => {
   ];
 
   for (const route of LEGACY_ROUTES) {
-    test(`/${route} → /ru/${route} (next.config.mjs redirect)`, async ({ request }) => {
+    test(`/${route} → /az/${route} (next.config.mjs redirect)`, async ({ request }) => {
       const response = await request.get(`/${route}`, {
         maxRedirects: 0,
       }).catch((err) => err.response ?? null);
       const status = response?.status() ?? 0;
       expect(status).toBe(307);
       const location = response?.headers()["location"];
-      expect(location).toBe(`/ru/${route}`);
+      expect(location).toBe(`/az/${route}`);
     });
   }
 
-  test("/ eventually reaches /ru/* (root redirect chain)", async ({ page }) => {
-    // / → /ru → /ru/overview → /login → /ru/login (auth gate cascade).
-    // Just verify final URL is some /ru/* path (not 500 or stuck).
+  test("/ eventually reaches /az/* (root redirect chain)", async ({ page }) => {
+    // / → /az → /az/overview → /login → /az/login (auth gate cascade).
+    // Just verify final URL is some /az/* path (not 500 or stuck).
     await page.goto("/");
-    await expect(page).toHaveURL(/\/ru\//);
+    await expect(page).toHaveURL(/\/az\//);
   });
 });
 

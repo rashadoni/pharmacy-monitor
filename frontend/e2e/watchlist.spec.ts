@@ -39,12 +39,12 @@ async function deleteWatchlistItem(
  */
 
 test.describe("Watchlist page (unauthenticated)", () => {
-  test("legacy /watchlist redirects to /ru/watchlist", async ({ request }) => {
+  test("legacy /watchlist redirects to /az/watchlist", async ({ request }) => {
     const r = await request
       .get("/watchlist", { maxRedirects: 0 })
       .catch((err) => err.response ?? null);
     expect(r?.status()).toBe(307);
-    expect(r?.headers()["location"]).toBe("/ru/watchlist");
+    expect(r?.headers()["location"]).toBe("/az/watchlist");
   });
 
   test("/ru/watchlist requires auth (redirects to login)", async ({ page }) => {

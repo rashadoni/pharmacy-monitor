@@ -6,7 +6,7 @@
  * через app/[locale]/... структуру.
  *
  * Используем 'always' префикс potому что в нашей setup НЕТ middleware → все
- * URLs ЯВНО префиксованы (включая default ru). Backward compat для
+ * URLs ЯВНО префиксованы (включая default az). Backward compat для
  * unprefixed URLs хэндлится next.config.mjs redirects, не middleware.
  *
  * Usage:
@@ -22,7 +22,7 @@ export const { Link, redirect, usePathname, useRouter, getPathname } =
     locales,
     defaultLocale,
     // 'always' — без middleware нет route-matching магии, поэтому проще
-    // ВСЕГДА указывать locale в URL (включая /ru/). Внутренние <Link> будут
-    // строить корректные /ru/foo, /az/foo автоматически.
+    // ВСЕГДА указывать locale в URL (включая /az/). Внутренние <Link> будут
+    // строить корректные /az/foo, /ru/foo автоматически.
     localePrefix: "always",
   });

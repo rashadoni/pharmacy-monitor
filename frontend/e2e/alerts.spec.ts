@@ -7,19 +7,19 @@ import { authenticate, hasE2EAuth } from "./helpers/auth";
  * Auth-gated; пропускаем без magic token или login/password.
  *
  * Что покрываем:
- *   - редирект /alerts → /ru/alerts
+ *   - редирект /alerts → /az/alerts
  *   - страница рендерится и показывает либо feed либо empty state
  *   - severity tabs/filters работают (если есть в DOM)
  *   - mark-as-read NOT triggered automatically (явное действие)
  */
 
 test.describe("Alerts inbox (unauthenticated)", () => {
-  test("legacy /alerts redirects to /ru/alerts", async ({ request }) => {
+  test("legacy /alerts redirects to /az/alerts", async ({ request }) => {
     const r = await request
       .get("/alerts", { maxRedirects: 0 })
       .catch((err) => err.response ?? null);
     expect(r?.status()).toBe(307);
-    expect(r?.headers()["location"]).toBe("/ru/alerts");
+    expect(r?.headers()["location"]).toBe("/az/alerts");
   });
 
   test("/ru/alerts requires auth", async ({ page }) => {
