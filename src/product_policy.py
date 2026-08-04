@@ -247,6 +247,21 @@ _COUNTRY_ALIASES: dict[str, str] = {
     "malayziya": "my",
     "malaziya": "my",
     "irelandiya": "ie",
+    # Написания из справочника pharmonline /api/products/countries (2026-08-04).
+    # Без них страна остаётся unknown → страновой guard матчера на этих товарах
+    # слепнет (политика identity от 2026-07-13). "irlandiya" — не опечатка
+    # соседней строки: сайт пишет "İrlandiya", это другой ключ после нормализации.
+    "irlandiya": "ie",
+    "ireland": "ie",
+    "ирландия": "ie",
+    "argentina": "ar",
+    "argentine": "ar",
+    "аргентина": "ar",
+    "albaniya": "al",
+    "albania": "al",
+    "албания": "al",
+    "san marino": "sm",
+    "сан марино": "sm",
     "slovakiya": "sk",
     "tailand": "th",
     "tayland": "th",

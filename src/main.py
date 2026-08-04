@@ -49,10 +49,17 @@ class FullCatalogVerificationError(RuntimeError):
     """A nominal full scan did not prove complete item-level coverage."""
 
 
-# Phase 1c (2026-05-27) — pharmonline DDP path uses reverse-engineered Meteor
-# protocol через WebSocket, обходит Cloudflare без Playwright. Opt-in via
-# PHARMONLINE_USE_DDP=1. Когда выключено — используется legacy Playwright путь.
+# Транспорт для pharmonline, в порядке приоритета:
+#   1. REST API нового Next.js-фронта (PHARMONLINE_USE_API=1) — актуальный путь.
+#   2. Meteor DDP через WebSocket (PHARMONLINE_USE_DDP=1) — Phase 1c, 2026-05-27.
+#      МЁРТВ с 2026-08-03: сайт переехал на Next.js, /sockjs удалён (404), клиент
+#      виснет на opening handshake. Оставлен на один релиз ради отката.
+#   3. Legacy Playwright DOM — тоже не переживёт новую вёрстку, последний резерв.
 def _pharmonline_scraper_class() -> type[BaseScraper]:
+    if os.environ.get("PHARMONLINE_USE_API", "").lower() in ("1", "true", "yes"):
+        from src.scrapers.pharmonline_api import PharmonlineAPIScraper
+
+        return PharmonlineAPIScraper
     if os.environ.get("PHARMONLINE_USE_DDP", "").lower() in ("1", "true", "yes"):
         from src.scrapers.pharmonline_ddp import PharmonlineDDPScraper
 
@@ -1144,8 +1151,6 @@ def _verify_full_catalog_results(
             zero_categories[site] = zero_count
         # Single source of truth for "is this route complete", so the reason we
         # report can never drift from the condition we fail on.
-        # Single source of truth for "is this route complete", so the reason we
-        # report can never drift from the condition we fail on.
         incomplete = [
             (slug, causes)
             for slug in slugs
@@ -1153,6 +1158,26 @@ def _verify_full_catalog_results(
         ]
         if incomplete:
             incomplete_routes[site] = incomplete
+            # Лог по КАЖДОМУ маршруту: в `catalog_verification_reason` (varchar 300)
+            # slug'и не влезают и схлопываются в счётчики причин, из-за чего постфактум
+            # нельзя было сказать, КАКАЯ категория сломалась. Без этого диагностика
+            # прогона #584 (aptekonline, `empty_page_before_last`) упёрлась в тупик:
+            # причина известна, категория — нет.
+            for slug, causes in incomplete:
+                status = result.route_statuses.get(slug)
+                log.warning(
+                    "full_catalog_route_incomplete",
+                    site=site,
+                    route=slug,
+                    causes=causes,
+                    expected_items=getattr(status, "expected_items", None),
+                    raw_items=getattr(status, "raw_items", None),
+                    parsed_items=getattr(status, "parsed_items", None),
+                    item_failures=getattr(status, "item_failures", None),
+                    expected_pages=getattr(status, "expected_pages", None),
+                    visited_pages=getattr(status, "visited_pages", None),
+                    pages_skipped=getattr(status, "pages_skipped", None),
+                )
 
     verified = not (
         missing_sites
@@ -3552,20 +3577,34 @@ def _sync_pharmonline_categories(session, discovered: list[tuple[str, str]]) -> 
 @category_group.command("sync-pharmonline")
 @click.option("--dry-run", is_flag=True, help="Только показать, сколько добавится")
 def category_sync_pharmonline(dry_run: bool) -> None:
-    """Авто-обнаружить ВСЕ категории pharmonline через DDP `getFilterParam` и
-    засеять недостающие в БД.
+    """Авто-обнаружить ВСЕ категории pharmonline и засеять недостающие в БД.
 
     Чинит неполное покрытие: было заведено 53 категории из 205 на сайте → ночной
     прогон видел ~половину каталога. После sync прогон покрывает весь pharmonline.
-    Требует IPROYAL_* + PHARMONLINE_USE_DDP в окружении (residential-прокси для DDP).
+
+    Источник справочника зависит от транспорта: при PHARMONLINE_USE_API=1 это
+    `GET /api/categories?type=category` нового Next.js-фронта, иначе — legacy
+    DDP-метод `getFilterParam` (мёртв с 2026-08-03, см. _pharmonline_scraper_class).
+    Обоим нужен AZ-residential прокси (DECODO_SITES/IPROYAL_*).
     """
     import asyncio
 
-    from src.scrapers.pharmonline_ddp import PharmonlineDDPScraper
-
     storage.init_db()
+    use_api = os.environ.get("PHARMONLINE_USE_API", "").lower() in ("1", "true", "yes")
 
-    async def _fetch() -> list[tuple[str, str]]:
+    async def _fetch_api() -> list[tuple[str, str]]:
+        from src.scrapers.pharmonline_api import PharmonlineAPIScraper
+
+        async with PharmonlineAPIScraper() as sc:
+            return [
+                (c.get("path"), c.get("name"))
+                for c in await sc.fetch_categories()
+                if c.get("path")
+            ]
+
+    async def _fetch_ddp() -> list[tuple[str, str]]:
+        from src.scrapers.pharmonline_ddp import PharmonlineDDPScraper
+
         async with PharmonlineDDPScraper() as sc:
             flt = await sc._ddp.call(
                 "getFilterParam",
@@ -3576,8 +3615,9 @@ def category_sync_pharmonline(dry_run: bool) -> None:
                 (c.get("path"), c.get("name")) for c in (flt.get("category") or []) if c.get("path")
             ]
 
-    discovered = asyncio.run(_fetch())
-    click.echo(f"DDP getFilterParam вернул {len(discovered)} категорий pharmonline")
+    discovered = asyncio.run(_fetch_api() if use_api else _fetch_ddp())
+    source = "REST /api/categories" if use_api else "DDP getFilterParam"
+    click.echo(f"{source} вернул {len(discovered)} категорий pharmonline")
 
     Session = storage.make_session()
     with Session() as s:

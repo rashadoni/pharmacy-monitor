@@ -502,8 +502,7 @@ def test_scraperapi_httpx_proxy_country_and_premium_for_aptek(monkeypatch):
     monkeypatch.setenv("SCRAPER_API_PREMIUM_SITES", "aptekonline")
     url = _scraperapi_httpx_proxy_for("aptekonline")
     assert url == (
-        "http://scraperapi.country_code=az.premium=true:k3y"
-        "@proxy-server.scraperapi.com:8001"
+        "http://scraperapi.country_code=az.premium=true:k3y@proxy-server.scraperapi.com:8001"
     )
 
 
@@ -739,3 +738,74 @@ async def test_scrape_promos_proxy_auth_is_not_swallowed(monkeypatch):
 
     with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
         await scraper.scrape_promos()
+
+
+# ─── Пустая страница посреди пагинации (регрессия прогона #584) ──────────────
+
+
+def _page(items: list[dict], *, last_page: int, page: int) -> dict:
+    return {
+        "data": items,
+        "last_page": last_page,
+        "total": 3,
+        "per_page": 100,
+        "next_page_url": None if page >= last_page else f"?page={page + 1}",
+    }
+
+
+def _item(url_id: str) -> dict:
+    return {"url_id": url_id, "name": f"Item {url_id}", "price": 10, "olke": "Serbiya"}
+
+
+@pytest.mark.asyncio
+async def test_empty_page_before_last_is_retried_and_recovered():
+    """Пустая страница посреди пагинации — транзиент, перечитываем её.
+
+    Регрессия прогона #584: одна такая страница молча обрывала категорию,
+    маршрут уходил в `empty_page_before_last`, и ВЕСЬ прогон становился
+    `degraded` → клиенту летел CRITICAL. Сервер сам обещал last_page=2, значит
+    пустая первая страница — это сбой пагинатора, а не конец каталога.
+    """
+    p1_empty = _page([], last_page=2, page=1)
+    p1_retry = _page([_item("a"), _item("b")], last_page=2, page=1)
+    p2 = _page([_item("c")], last_page=2, page=2)
+    patcher, _ = _mock_httpx_client([p1_empty, p1_retry, p2])
+
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+        status = scraper._route_statuses["114"]
+
+    assert [p.external_id for p in products] == ["a", "b", "c"]
+    assert status.complete is True
+    assert status.abort_reason is None
+
+
+@pytest.mark.asyncio
+async def test_empty_page_before_last_still_aborts_when_retry_also_empty():
+    """Если и повтор пуст — это уже не моргание, честно помечаем маршрут."""
+    p1_empty = _page([], last_page=2, page=1)
+    patcher, _ = _mock_httpx_client([p1_empty])
+
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+        status = scraper._route_statuses["114"]
+
+    assert products == []
+    assert status.complete is False
+    assert status.abort_reason == "empty_page_before_last"
+
+
+@pytest.mark.asyncio
+async def test_empty_last_page_is_not_retried():
+    """Пустая ПОСЛЕДНЯЯ страница — нормальный конец, перечитывать нечего."""
+    p1 = _page([_item("a")], last_page=1, page=1)
+    patcher, calls = _mock_httpx_client([p1, _page([], last_page=1, page=1)])
+
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+
+    assert [p.external_id for p in products] == ["a"]
+    assert calls["n"] == 1  # второй страницы вообще не запрашивали

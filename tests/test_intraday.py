@@ -246,6 +246,77 @@ def test_pick_next_scrape_target_falls_back_to_aloe_when_pharm_locked(db_session
     assert site == "aloe"
 
 
+def test_disabled_sites_parses_csv(monkeypatch):
+    """CSV, регистр и пробелы нормализуются; пусто → никого не глушим."""
+    monkeypatch.setenv("INTRADAY_DISABLED_SITES", " PharmOnline , aloe ,, ")
+    assert intraday.disabled_sites() == frozenset({"pharmonline", "aloe"})
+    monkeypatch.setenv("INTRADAY_DISABLED_SITES", "")
+    assert intraday.disabled_sites() == frozenset()
+    monkeypatch.delenv("INTRADAY_DISABLED_SITES", raising=False)
+    assert intraday.disabled_sites() == frozenset()
+
+
+def test_pick_next_scrape_target_skips_disabled_site(db_session, monkeypatch):
+    """Заглушённый сайт пропускается — и его lock НЕ расходуется.
+
+    Регрессия 2026-08-04: pharmonline переехал на Next.js, каждый его tick давал
+    failed-прогон и CRITICAL-письмо. Глушим через env, не трогая код ротации.
+    """
+    _add_category(db_session, "k1", "K1", ph_slug="ph", aloe_slug="aloe")
+    p = _add_product_with_category(db_session, "pharmonline", "p1", "P1", "ph")
+    _add_snaps(db_session, p, n_snaps=5)
+    db_session.commit()
+
+    monkeypatch.setenv("INTRADAY_DISABLED_SITES", "pharmonline")
+    redis_mock = MagicMock()
+    redis_mock.incr.return_value = 1
+    redis_mock.set.return_value = True
+
+    result = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
+    assert result is not None
+    site, _ = result
+    assert site == "aloe"
+    # ровно один acquire — на aloe; на заглушённый pharmonline lock не тратится
+    assert redis_mock.set.call_count == 1
+
+
+def test_pick_next_scrape_target_returns_none_when_all_sites_disabled(
+    db_session, monkeypatch
+):
+    """Все сайты заглушены → tick скипается, прогон не стартует."""
+    _add_category(db_session, "k1", "K1", ph_slug="ph", aloe_slug="aloe")
+    p = _add_product_with_category(db_session, "pharmonline", "p1", "P1", "ph")
+    _add_snaps(db_session, p, n_snaps=5)
+    db_session.commit()
+
+    monkeypatch.setenv("INTRADAY_DISABLED_SITES", "pharmonline,aloe")
+    redis_mock = MagicMock()
+    redis_mock.incr.return_value = 1
+    redis_mock.set.return_value = True
+
+    assert intraday.pick_next_scrape_target(db_session, redis_client=redis_mock) is None
+    assert redis_mock.set.call_count == 0
+
+
+def test_pick_next_scrape_target_unset_disabled_env_keeps_default(
+    db_session, monkeypatch
+):
+    """Без env-переменной поведение прежнее (opt-in, не opt-out)."""
+    _add_category(db_session, "k1", "K1", ph_slug="ph", aloe_slug="aloe")
+    p = _add_product_with_category(db_session, "pharmonline", "p1", "P1", "ph")
+    _add_snaps(db_session, p, n_snaps=5)
+    db_session.commit()
+
+    monkeypatch.delenv("INTRADAY_DISABLED_SITES", raising=False)
+    redis_mock = MagicMock()
+    redis_mock.incr.return_value = 1
+    redis_mock.set.return_value = True
+
+    result = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
+    assert result is not None
+    assert result[0] == "pharmonline"
+
+
 def test_pick_next_scrape_target_returns_none_when_all_locked(db_session):
     """Все сайты locked → None."""
     cat = _add_category(db_session, "k1", "K1", ph_slug="ph", aloe_slug="aloe")

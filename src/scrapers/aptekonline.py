@@ -590,8 +590,39 @@ class AptekonlineScraper(BaseScraper):
 
                 if not items:
                     if expected_pages is not None and page_num < expected_pages:
-                        abort_reason = "empty_page_before_last"
-                    break
+                        # Пустая страница ПОСРЕДИ пагинации — почти всегда транзиент
+                        # (Laravel-пагинатор моргнул под нагрузкой), а не конец
+                        # каталога: сервер сам обещал `last_page` больше текущей.
+                        # Прежде это молча обрывало категорию и роняло весь прогон
+                        # в `degraded` — так упал #584. Перечитываем страницу, и
+                        # только если она пуста снова, признаём обрыв.
+                        retry_resp = await _fetch_page(params)
+                        retry_items: list = []
+                        if retry_resp is not None and retry_resp.status_code == 200:
+                            try:
+                                retry_items = (retry_resp.json() or {}).get("data") or []
+                            except ValueError:
+                                retry_items = []
+                        if retry_items:
+                            log.info(
+                                "aptekonline_empty_page_recovered",
+                                category=category_slug,
+                                page=page_num,
+                                items=len(retry_items),
+                            )
+                            items = retry_items
+                            raw_items += len(items)
+                        else:
+                            log.warning(
+                                "aptekonline_empty_page_before_last",
+                                category=category_slug,
+                                page=page_num,
+                                expected_pages=expected_pages,
+                            )
+                            abort_reason = "empty_page_before_last"
+                            break
+                    else:
+                        break
 
                 for item in items:
                     if limit is not None and yielded >= limit:

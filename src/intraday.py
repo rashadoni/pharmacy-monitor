@@ -49,6 +49,19 @@ INTRADAY_PER_SITE_MIN_GAP_SEC = 2 * 3600  # 2 часа
 # внутридневного категорийного refresh.
 INTRADAY_SITES = ("pharmonline", "aloe")
 
+
+def disabled_sites() -> frozenset[str]:
+    """Сайты, временно исключённые из intraday-ротации (`INTRADAY_DISABLED_SITES`, CSV).
+
+    Читается ПРИ ВЫЗОВЕ, не на импорте — чтобы глушить сайт правкой
+    /etc/pharmacy-monitor/env без редеплоя (тот же приём, что у
+    SCRAPE_REPORT_EMAIL). Нужно, когда сайт временно нескрейпируем: иначе каждый
+    его tick = гарантированно failed-прогон, `last_run_failed` и CRITICAL-письмо.
+    Пустая строка/не задано → не глушим никого (opt-in).
+    """
+    raw = os.getenv("INTRADAY_DISABLED_SITES", "")
+    return frozenset(s.strip().lower() for s in raw.split(",") if s.strip())
+
 # Окно для подсчёта volatility (count price changes per category per N days).
 VOLATILITY_WINDOW_DAYS = 7
 
@@ -262,7 +275,16 @@ def pick_next_scrape_target(
         # лёгких внутридневных категорийных тиков.
     }
 
+    disabled = disabled_sites()
     for site in INTRADAY_SITES:
+        if site in disabled:
+            log.info(
+                "intraday_site_disabled",
+                site=site,
+                category_id=cat.id,
+                category_key=cat.key,
+            )
+            continue
         if not site_to_slug.get(site):
             continue
         if commit_state:

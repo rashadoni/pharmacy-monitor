@@ -394,9 +394,87 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
 
 | Сайт | Где | Чем | Proxy |
 |---|---|---|---|
-| **pharmonline.az** | Hetzner prod | **Meteor DDP WebSocket** (`src/scrapers/pharmonline_ddp.py`) | IPRoyal residential `geo.iproyal.com:12321` |
+| **pharmonline.az** | Hetzner prod | **httpx REST API** (`src/scrapers/pharmonline_api.py`), `PHARMONLINE_USE_API=1` | Decodo AZ residential |
 | **aloe.az** | Hetzner prod | RSC/HTTP parser (`src/scrapers/aloe.py`) | Direct (no proxy needed) |
 | **aptekonline.az** | Hetzner prod | httpx JSON API (`src/scrapers/aptekonline.py`) | Decodo AZ residential |
+
+> **2026-08-04 — pharmonline сменил транспорт.** Сайт переехал с Meteor на
+> Next.js, `wss://pharmonline.az/sockjs/...` удалён (404). DDP-скрейпер мёртв
+> навсегда: любой его прогон падает с `timed out during opening handshake` и
+> 0 товаров. Раздел «DDP recovery procedures» ниже оставлен как исторический —
+> **не пытаться чинить DDP, он не восстановится.** Актуальный путь — REST API
+> (см. «Pharmonline REST API» ниже).
+
+### Pharmonline REST API (2026-08-04)
+
+Эндпоинты нового фронта (те же Meteor-документы, что раньше отдавал DDP):
+
+```
+GET /api/products?lng=az&page=N&limit=100[&category=<meteor_id>]
+GET /api/categories?type=category      # 205 категорий
+GET /api/products/countries            # 58 стран, БЕЗ geocode
+```
+
+Что важно помнить:
+
+- **`limit` ≤ 100.** 500/1000 → HTTP 400. Не поднимать.
+- **Фильтр категории берёт Meteor `id`, не slug.** `category=<slug>` тихо вернёт
+  `total=0` — то есть «категория пустая», а не ошибка. Карта slug → id строится
+  в `__aenter__` из `/api/categories`.
+- **Троттлинг NestJS.** `{"statusCode":429,"message":"ThrottlerException"}`.
+  429 прилетает и на свежих exit-IP → счётчик, похоже, общий на весь сайт
+  (лимитер считает по IP Cloudflare-эджа). **Ротация портов Decodo не помогает.**
+  Регулируется паузой `PHARMONLINE_API_MIN_INTERVAL` (деф. 7 с). Окно короткое —
+  после 429 хватает ~минуты. Ускорять НЕ надо: полный каталог и так проходит
+  за ~40 мин против ~1.5 ч у старого DDP, а лимит мы делим с живыми покупателями сайта.
+- **Прямой доступ с Hetzner = HTTP 403** (Cloudflare). Без
+  `DECODO_SITES=...,pharmonline` прогон вернёт 0 товаров; скрейпер про это
+  предупреждает в лог (`pharmonline_api_no_proxy`).
+- **403 через прокси = плохой exit-IP, а не бан.** Скрейпер меняет адрес и
+  повторяет (`pharmonline_api_ip_blocked` в логе). Обрыв всего сайта
+  (`site_scrape_aborted`) наступает, только если заблокированы ВСЕ выданные
+  адреса — вот это уже похоже на системный бан, и тогда стоит подождать
+  и проверить пул Decodo. Отдельные `pharmonline_api_ip_blocked` в логе
+  успешного прогона — норма, чинить нечего.
+
+Настройки (все в `/etc/pharmacy-monitor/env`):
+
+| Переменная | Деф. | Зачем |
+|---|---|---|
+| `PHARMONLINE_USE_API` | — | `1` включает REST-путь (иначе откатится на мёртвый DDP) |
+| `PHARMONLINE_API_MIN_INTERVAL` | `7` | пауза между запросами, сек |
+| `PHARMONLINE_API_THROTTLE_BACKOFF` | `20` | стартовый backoff на 429, сек |
+| `PHARMONLINE_API_THROTTLE_ATTEMPTS` | `4` | сколько раз переждать 429 |
+| `PHARMONLINE_API_PAGE_SIZE` | `100` | режется до 100 в любом случае |
+
+### Прогон ушёл в `degraded` — какая категория виновата?
+
+`catalog_verification_reason` в БД — `varchar(300)`, туда влезают только счётчики
+причин (`incomplete_routes=aptekonline:1[empty_page_before_lastx1]`), сами slug'и
+схлопываются. Конкретные маршруты ищи в journald:
+
+```bash
+journalctl -u pharmacy-monitor-scrape@aptekonline --since "-7d" | grep full_catalog_route_incomplete
+```
+
+Строка содержит `site`, `route` (slug категории), `causes` и все счётчики
+(`expected_items` / `raw_items` / `parsed_items` / `item_failures` /
+`expected_pages` / `visited_pages` / `pages_skipped`) — этого хватает, чтобы
+отличить недобор строк от сбоя разбора и от пропущенной страницы.
+
+### Заглушить сайт в intraday-ротации
+
+Когда сайт временно нескрейпируем, каждый его intraday-тик = `failed`-прогон,
+`last_run_failed` и CRITICAL-письмо. Глушится без редеплоя:
+
+```bash
+# /etc/pharmacy-monitor/env — CSV, комментарий ТОЛЬКО отдельной строкой
+# (systemd EnvironmentFile не срезает inline-комментарии!)
+INTRADAY_DISABLED_SITES=pharmonline
+```
+
+Проверка: `pharmacy-monitor intraday-tick --dry-run` → в логе
+`intraday_site_disabled site=<...>`. Откат — убрать строку.
 
 Mac scraping is retired. `com.pharmacy-monitor.scrape` and
 `com.pharmacy-monitor.watch` should remain unloaded/disabled; the scripts under
