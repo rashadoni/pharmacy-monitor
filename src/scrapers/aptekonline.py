@@ -394,8 +394,10 @@ class AptekonlineScraper(BaseScraper):
         """
         best_products: list[ScrapedProduct] = []
         best_status = None
-        attempts = _category_attempts()
-        for attempt in range(1, attempts + 1):
+        configured_attempts = _category_attempts()
+        max_attempts = configured_attempts
+        attempt = 1
+        while attempt <= max_attempts:
             products = [
                 product
                 async for product in self._scrape_category_once(
@@ -420,6 +422,40 @@ class AptekonlineScraper(BaseScraper):
             if len(products) > len(best_products) or best_status is None:
                 best_products = products
                 best_status = status
+
+            # A residential exit may return HTTP 200 with a truncated Laravel
+            # paginator (most often an empty page before ``last_page``).  Page
+            # retries cannot distinguish that response from real data, and the
+            # old three category attempts exercised only 3 of the 10 configured
+            # sticky AZ sessions.  For a route whose item/page counts prove it
+            # incomplete, retry the *whole* category on every available sticky
+            # session.  Never merge attempts: only one internally consistent
+            # snapshot is published.
+            paginated_item_count_mismatch = bool(
+                status is not None
+                and status.expected_pages is not None
+                and status.expected_pages > 1
+                and status.expected_items is not None
+                and status.parsed_items != status.expected_items
+            )
+            retry_all_decodo_sessions = bool(
+                status is not None
+                and (
+                    status.abort_reason == "empty_page_before_last"
+                    or paginated_item_count_mismatch
+                )
+            )
+            if retry_all_decodo_sessions:
+                decodo_session_count = len(_decodo_ports("aptekonline"))
+                if decodo_session_count > max_attempts:
+                    max_attempts = decodo_session_count
+                    log.warning(
+                        "aptekonline_category_expanding_retries",
+                        category=category_slug,
+                        configured_attempts=configured_attempts,
+                        max_attempts=max_attempts,
+                        reason=status.abort_reason or "paginated_item_count_mismatch",
+                    )
             if (
                 status is None
                 or status.abort_reason
@@ -432,15 +468,16 @@ class AptekonlineScraper(BaseScraper):
                 or (status.abort_reason or "").startswith("hard_block_")
             ):
                 break
-            if attempt < attempts:
+            if attempt < max_attempts:
                 log.warning(
                     "aptekonline_category_retrying",
                     category=category_slug,
                     attempt=attempt,
-                    max_attempts=attempts,
+                    max_attempts=max_attempts,
                     reason=status.abort_reason or "incomplete_route",
                     pages_skipped=status.pages_skipped,
                 )
+            attempt += 1
 
         if best_status is not None:
             self._route_statuses[str(category_slug)] = best_status

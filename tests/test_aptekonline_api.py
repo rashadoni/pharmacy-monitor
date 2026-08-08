@@ -845,6 +845,63 @@ async def test_scrape_category_keeps_same_decodo_port_across_pages(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_scrape_category_tries_all_decodo_sessions_for_truncated_route(monkeypatch):
+    """A 200/empty page is retried as a whole route on every sticky AZ exit."""
+    _enable_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_PORTS", "30001-30003")
+    proxies: list[str] = []
+
+    class TruncatedByExitClient:
+        def __init__(self, *args, **kwargs):
+            self.proxy = kwargs["proxy"]
+            proxies.append(self.proxy)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, _url, *, params):
+            page_num = int(dict(params)["page"])
+            healthy_exit = self.proxy.endswith(":30003")
+            items = []
+            if page_num == 1 or healthy_exit:
+                item_id = "a" if page_num == 1 else "b"
+                items = [
+                    {
+                        "url_id": item_id,
+                        "name": f"Product {item_id}",
+                        "price": 1,
+                        "qaliq": 1,
+                    }
+                ]
+            return httpx.Response(
+                200,
+                json={
+                    "data": items,
+                    "total": 2,
+                    "current_page": page_num,
+                    "last_page": 2,
+                    "next_page_url": "next" if page_num == 1 else None,
+                },
+            )
+
+    with patch("src.scrapers.aptekonline.httpx.AsyncClient", TruncatedByExitClient):
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+
+    assert [product.external_id for product in products] == ["a", "b"]
+    assert len(proxies) == 6  # two pages per full-category attempt
+    assert {proxy.rsplit(":", 1)[-1] for proxy in proxies} == {
+        "30001",
+        "30002",
+        "30003",
+    }
+    assert scraper._route_statuses["114"].complete is True
+
+
+@pytest.mark.asyncio
 async def test_scrape_category_decodo_skips_then_aborts_on_persistent_522(monkeypatch):
     """Постоянный 522: страница пропускается (skip), после 3 подряд — обрыв
     категории (не бесконечный перебор всех max_pages)."""
