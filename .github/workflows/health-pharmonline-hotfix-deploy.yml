@@ -39,6 +39,49 @@ jobs:
               "$available_kib" "$swap_used_kib" "$disk_available_kib" "$user_slice_bytes"
             test "$user_slice_bytes" -lt $((8 * 1024 * 1024 * 1024))'
 
+      - name: Diagnose Pharmonline schedule and recent failures
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+            cd /opt/pharmacy-monitor
+            printf "== timer ==\n"
+            systemctl show pharmacy-monitor-scrape@pharmonline.timer \
+              -p ActiveState -p UnitFileState -p LastTriggerUSec -p NextElapseUSecRealtime
+            systemctl cat pharmacy-monitor-scrape@pharmonline.timer --no-pager \
+              | grep -E "OnCalendar|RandomizedDelaySec" || true
+            printf "== safe proxy config ==\n"
+            grep -E "^(DECODO_(SITES|HOST|PORTS)|PHARMONLINE_DDP_(OPEN_TIMEOUT|CONNECT_ATTEMPTS|CONNECT_BACKOFF|CONNECT_BACKOFF_MAX|CALL_ATTEMPTS))=" \
+              /etc/pharmacy-monitor/env || true
+            printf "== recent service failures ==\n"
+            journalctl -u pharmacy-monitor-scrape@pharmonline.service \
+              --since "14 days ago" --no-pager -o cat \
+              | grep -E "run_(started|ok|failed)|ddp_connect_(retry|exhausted|recovered)|opening handshake|HTTP 40[27]" \
+              | tail -n 160 || true
+            printf "== recent database runs ==\n"
+            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
+            test -n "$db_url"
+            DATABASE_URL="$db_url" .venv/bin/python - <<"PY"
+from sqlalchemy import select
+from src import storage
+
+Session = storage.make_session()
+with Session() as session:
+    rows = session.scalars(select(storage.Run).order_by(storage.Run.id.desc()).limit(80)).all()
+    for run in rows:
+        sites = run.sites_completed or ""
+        error = (run.error_message or "").replace("\n", " ")[:180]
+        if "pharmonline" in sites or "handshake" in error or run.catalog_scope == "full":
+            print(
+                run.id,
+                run.started_at,
+                run.status,
+                run.catalog_scope,
+                sites,
+                run.products_scraped,
+                error,
+            )
+PY'
+
       - name: Backup and deploy two Python files
         run: |
           set -euo pipefail
