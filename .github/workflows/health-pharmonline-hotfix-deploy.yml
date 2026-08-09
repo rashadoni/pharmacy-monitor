@@ -32,6 +32,7 @@ jobs:
             test "$available_kib" -ge $((4 * 1024 * 1024))
             disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk "NR==2 {print \$4}")
             test "$disk_available_kib" -ge $((4 * 1024 * 1024))
+            test -w /opt/pharmacy-monitor/data
             swap_used_kib=$(free -k | awk "/^Swap:/ {print \$3}")
             user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
             printf "available_ram_kib=%s swap_used_kib=%s disk_available_kib=%s user_slice_bytes=%s\n" \
@@ -43,17 +44,17 @@ jobs:
           set -euo pipefail
           stamp=$(date -u +%Y%m%dT%H%M%SZ)
           ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 "set -euo pipefail
-            mkdir -p /opt/pharmacy-monitor/backups/hotfix-$stamp/src/scrapers
+            mkdir -p /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/scrapers
             cp /opt/pharmacy-monitor/src/health.py \
-              /opt/pharmacy-monitor/backups/hotfix-$stamp/src/health.py
+              /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/health.py
             cp /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py \
-              /opt/pharmacy-monitor/backups/hotfix-$stamp/src/scrapers/pharmonline_ddp.py"
+              /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/scrapers/pharmonline_ddp.py"
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
             src/health.py pm@46.225.149.52:/opt/pharmacy-monitor/src/health.py
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
             src/scrapers/pharmonline_ddp.py \
             pm@46.225.149.52:/opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py
-          printf 'backup=/opt/pharmacy-monitor/backups/hotfix-%s\n' "$stamp"
+          printf 'backup=/opt/pharmacy-monitor/data/hotfix-backups/hotfix-%s\n' "$stamp"
 
       - name: Verify deployed code and health classification
         run: |
