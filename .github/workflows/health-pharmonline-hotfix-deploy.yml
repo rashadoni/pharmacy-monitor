@@ -60,27 +60,16 @@ jobs:
             printf "== recent database runs ==\n"
             db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
             test -n "$db_url"
-            DATABASE_URL="$db_url" .venv/bin/python - <<"PY"
-from sqlalchemy import select
-from src import storage
-
-Session = storage.make_session()
-with Session() as session:
-    rows = session.scalars(select(storage.Run).order_by(storage.Run.id.desc()).limit(80)).all()
-    for run in rows:
-        sites = run.sites_completed or ""
-        error = (run.error_message or "").replace("\n", " ")[:180]
-        if "pharmonline" in sites or "handshake" in error or run.catalog_scope == "full":
-            print(
-                run.id,
-                run.started_at,
-                run.status,
-                run.catalog_scope,
-                sites,
-                run.products_scraped,
-                error,
-            )
-PY'
+            psql_url=${db_url/postgresql+psycopg:/postgresql:}
+            psql "$psql_url" -P pager=off -c "
+              SELECT id, started_at, status, catalog_scope, sites_completed,
+                     products_scraped, left(coalesce(error_message, '\''\''), 180) AS error
+              FROM runs
+              WHERE started_at >= now() - interval '\''14 days'\''
+                AND (coalesce(sites_completed, '\''\'') LIKE '\''%pharmonline%\''
+                     OR coalesce(error_message, '\''\'') ILIKE '\''%handshake%\''
+                     OR catalog_scope = '\''full'\'')
+              ORDER BY id DESC;"'
 
       - name: Backup and deploy two Python files
         run: |
