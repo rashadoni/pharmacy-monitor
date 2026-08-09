@@ -14,13 +14,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from src._time import utcnow
 from typing import Literal
 
 import structlog
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
+from src._time import utcnow
 from src.storage import PriceSnapshot, Product, Run
 
 log = structlog.get_logger()
@@ -97,13 +97,24 @@ def check_health(
     # warning unless the site-level details below prove a full site failure.
     if last_run.status == "failed":
         issue_code = "last_run_failed"
+        # A bounded/watchlist run is an operational probe, not a catalog epoch.
+        # Its failure must stay visible, but it must not claim that the trusted
+        # full catalog is broken.  Legacy/unknown runs remain critical because
+        # we cannot safely prove that they were partial.
+        failed_severity: Severity = (
+            "warning" if last_run.catalog_scope == "partial" else "critical"
+        )
         report.issues.append(
             HealthIssue(
-                "critical",
+                failed_severity,
                 issue_code,
                 f"Последний прогон #{last_run.id} завершился со статусом "
                 f"{last_run.status}: {last_run.error_message or '?'}",
-                context={"run_id": last_run.id, "error": last_run.error_message},
+                context={
+                    "run_id": last_run.id,
+                    "error": last_run.error_message,
+                    "catalog_scope": last_run.catalog_scope,
+                },
             )
         )
 

@@ -1,9 +1,9 @@
 """Тесты health-check логики."""
 
 from datetime import timedelta
-from src._time import utcnow
 
 from src import storage
+from src._time import utcnow
 from src.health import alert_signature, check_health
 from src.storage import PriceSnapshot, Product, Run
 
@@ -338,6 +338,52 @@ def test_failed_run_critical(db_session):
     rep = check_health(db_session)
     assert rep.status == "critical"
     assert any(i.code == "last_run_failed" for i in rep.issues)
+
+
+def test_failed_partial_run_is_warning_when_full_catalog_is_verified(db_session):
+    full = _add_run(db_session, utcnow() - timedelta(hours=2))
+    full.run_quality = {
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {
+            "pharmonline": {"status": "ok"},
+            "aptekonline": {"status": "ok"},
+            "aloe": {"status": "ok"},
+        },
+    }
+    partial = _add_run(
+        db_session,
+        utcnow() - timedelta(hours=1),
+        status="failed",
+        products_scraped=0,
+    )
+    partial.catalog_scope = "partial"
+    partial.error_message = "timed out during opening handshake"
+    db_session.commit()
+
+    rep = check_health(db_session)
+
+    issues = [issue for issue in rep.issues if issue.code == "last_run_failed"]
+    assert rep.status == "warning"
+    assert len(issues) == 1
+    assert issues[0].severity == "warning"
+    assert issues[0].context["catalog_scope"] == "partial"
+
+
+def test_failed_full_run_remains_critical(db_session):
+    run = _add_run(db_session, utcnow() - timedelta(hours=1), status="failed")
+    run.catalog_scope = "full"
+    run.full_catalog_sites = "pharmonline"
+    run.error_message = "timed out during opening handshake"
+    db_session.commit()
+
+    rep = check_health(db_session)
+
+    assert rep.status == "critical"
+    assert any(
+        issue.code == "last_run_failed" and issue.severity == "critical"
+        for issue in rep.issues
+    )
 
 
 def test_degraded_full_run_critical(db_session):

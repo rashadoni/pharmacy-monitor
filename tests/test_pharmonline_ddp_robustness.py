@@ -79,6 +79,7 @@ def _patch_connect(monkeypatch, ws_per_attempt):
 def _fast_env(monkeypatch):
     monkeypatch.setenv("PHARMONLINE_DDP_OPEN_TIMEOUT", "0.05")
     monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_BACKOFF", "0.01")
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_BACKOFF_MAX", "0.01")
     monkeypatch.setenv("PHARMONLINE_DDP_CALL_RETRY_BACKOFF", "0")
 
 
@@ -112,6 +113,45 @@ async def test_connect_exhausts_and_raises(monkeypatch):
     with pytest.raises((TimeoutError, asyncio.TimeoutError)):
         await client._connect()
     assert calls["n"] == 2  # ровно attempts попыток
+
+
+@pytest.mark.asyncio
+async def test_default_connect_attempts_exhaust_full_decodo_pool(monkeypatch):
+    """Без env override перебираем все 10 sticky-сессий, затем сдаёмся."""
+    monkeypatch.delenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", raising=False)
+    monkeypatch.setenv("PHARMONLINE_DDP_OPEN_TIMEOUT", "0.001")
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_BACKOFF", "0")
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_BACKOFF_MAX", "0")
+    calls = _patch_connect(monkeypatch, lambda n: FakeWS([HANG]))
+    client = pharmonline_ddp._DDPClient(lambda: "wss://x")
+
+    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+        await client._connect()
+
+    assert calls["n"] == 10
+
+
+@pytest.mark.asyncio
+async def test_connect_backoff_is_capped(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", "4")
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_BACKOFF", "2")
+    monkeypatch.setenv("PHARMONLINE_DDP_CONNECT_BACKOFF_MAX", "3")
+    client = pharmonline_ddp._DDPClient(lambda: "wss://x")
+    sleeps = []
+
+    async def reject():
+        raise TimeoutError("handshake")
+
+    async def record_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(client, "_connect_once", reject)
+    monkeypatch.setattr(pharmonline_ddp.asyncio, "sleep", record_sleep)
+
+    with pytest.raises(TimeoutError):
+        await client._connect()
+
+    assert sleeps == [2, 3, 3]
 
 
 # ── Per-call timeout (hard-bounded) ──────────────────────────────────────────

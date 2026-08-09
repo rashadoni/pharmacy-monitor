@@ -159,18 +159,23 @@ def _decodo_proxy_factory():
 
 # ── DDP reliability tuning (2026-05-29) ──────────────────────────────────────
 # Читаются из env ПРИ ВЫЗОВЕ (не module-level) → прод-override без редеплоя +
-# тесты через monkeypatch.setenv. Дефолты: connect 4 попытки с backoff 2/4/8/16с,
-# каждая ограничена open_timeout; call 3 попытки с reconnect.
+# тесты через monkeypatch.setenv. Дефолты: connect 10 попыток (полный цикл по
+# стандартным 10 sticky-портам Decodo) с capped exponential backoff; каждая
+# ограничена open_timeout; call 3 попытки с reconnect.
 def _ddp_open_timeout() -> float:
     return float(os.getenv("PHARMONLINE_DDP_OPEN_TIMEOUT", "20"))
 
 
 def _ddp_connect_attempts() -> int:
-    return max(1, int(os.getenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", "4")))
+    return max(1, int(os.getenv("PHARMONLINE_DDP_CONNECT_ATTEMPTS", "10")))
 
 
 def _ddp_connect_backoff() -> float:
     return float(os.getenv("PHARMONLINE_DDP_CONNECT_BACKOFF", "2"))
+
+
+def _ddp_connect_backoff_max() -> float:
+    return max(0.0, float(os.getenv("PHARMONLINE_DDP_CONNECT_BACKOFF_MAX", "8")))
 
 
 def _ddp_call_attempts() -> int:
@@ -227,6 +232,7 @@ class _DDPClient:
         """
         attempts = _ddp_connect_attempts()
         backoff_base = _ddp_connect_backoff()
+        backoff_max = _ddp_connect_backoff_max()
         last_exc: Exception | None = None
         for attempt in range(attempts):
             try:
@@ -258,7 +264,7 @@ class _DDPClient:
                         pass
                     self._ws = None
                 if attempt < attempts - 1:
-                    backoff = backoff_base ** (attempt + 1)  # 2,4,8,16
+                    backoff = min(backoff_base ** (attempt + 1), backoff_max)
                     log.warning(
                         "ddp_connect_retry",
                         attempt=attempt + 1,

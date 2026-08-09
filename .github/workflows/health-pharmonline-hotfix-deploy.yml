@@ -1,0 +1,69 @@
+name: Deploy health and Pharmonline reliability hotfix
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup production SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Preflight production resources
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+            available_kib=$(awk "/MemAvailable:/ {print \$2}" /proc/meminfo)
+            test "$available_kib" -ge $((4 * 1024 * 1024))
+            disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk "NR==2 {print \$4}")
+            test "$disk_available_kib" -ge $((4 * 1024 * 1024))
+            swap_used_kib=$(free -k | awk "/^Swap:/ {print \$3}")
+            user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
+            printf "available_ram_kib=%s swap_used_kib=%s disk_available_kib=%s user_slice_bytes=%s\n" \
+              "$available_kib" "$swap_used_kib" "$disk_available_kib" "$user_slice_bytes"
+            test "$user_slice_bytes" -lt $((8 * 1024 * 1024 * 1024))'
+
+      - name: Backup and deploy two Python files
+        run: |
+          set -euo pipefail
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 "set -euo pipefail
+            mkdir -p /opt/pharmacy-monitor/backups/hotfix-$stamp/src/scrapers
+            cp /opt/pharmacy-monitor/src/health.py \
+              /opt/pharmacy-monitor/backups/hotfix-$stamp/src/health.py
+            cp /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py \
+              /opt/pharmacy-monitor/backups/hotfix-$stamp/src/scrapers/pharmonline_ddp.py"
+          rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
+            src/health.py pm@46.225.149.52:/opt/pharmacy-monitor/src/health.py
+          rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
+            src/scrapers/pharmonline_ddp.py \
+            pm@46.225.149.52:/opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py
+          printf 'backup=/opt/pharmacy-monitor/backups/hotfix-%s\n' "$stamp"
+
+      - name: Verify deployed code and health classification
+        run: |
+          set -euo pipefail
+          local_health=$(sha256sum src/health.py | awk '{print $1}')
+          local_ddp=$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print $1}')
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 "set -euo pipefail
+            cd /opt/pharmacy-monitor
+            test \"\$(sha256sum src/health.py | awk '{print \$1}')\" = '$local_health'
+            test \"\$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print \$1}')\" = '$local_ddp'
+            .venv/bin/python -m py_compile src/health.py src/scrapers/pharmonline_ddp.py
+            .venv/bin/pharmacy-monitor health-check --quiet-on-ok || rc=\$?
+            test \"\${rc:-0}\" -le 1"
