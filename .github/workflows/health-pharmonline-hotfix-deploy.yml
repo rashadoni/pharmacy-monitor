@@ -66,5 +66,10 @@ jobs:
             test \"\$(sha256sum src/health.py | awk '{print \$1}')\" = '$local_health'
             test \"\$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print \$1}')\" = '$local_ddp'
             .venv/bin/python -m py_compile src/health.py src/scrapers/pharmonline_ddp.py
-            .venv/bin/pharmacy-monitor health-check --quiet-on-ok || rc=\$?
+            db_url=\$(grep -m1 '^DATABASE_URL=' /etc/pharmacy-monitor/env | cut -d= -f2-)
+            test -n \"\$db_url\"
+            output=\$(DATABASE_URL=\"\$db_url\" .venv/bin/pharmacy-monitor health-check \
+              --quiet-on-ok 2>&1) || rc=\$?
+            printf '%s\\n' \"\$output\"
+            case \"\$output\" in *Traceback*) exit 1 ;; esac
             test \"\${rc:-0}\" -le 1"
