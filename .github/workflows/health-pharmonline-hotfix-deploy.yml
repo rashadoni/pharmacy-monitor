@@ -93,6 +93,9 @@ jobs:
             test \"\$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print \$1}')\" = '$local_ddp'
             .venv/bin/python -m py_compile \
               src/health.py src/intraday.py src/scrapers/pharmonline_ddp.py
+            .venv/bin/python -c \"from src.intraday import INTRADAY_SITES; \
+              print('production INTRADAY_SITES=', INTRADAY_SITES); \
+              assert INTRADAY_SITES == ('aloe',)\"
             db_url=\$(grep -m1 '^DATABASE_URL=' /etc/pharmacy-monitor/env | cut -d= -f2-)
             test -n \"\$db_url\"
             output=\$(DATABASE_URL=\"\$db_url\" .venv/bin/pharmacy-monitor health-check \
