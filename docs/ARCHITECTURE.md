@@ -264,15 +264,17 @@ Every hour 05-17 UTC ─ pharmacy-monitor-intraday.timer fires (Phase 5.1c)
   │     → SELECT count(snapshots) per category per site за 7d
   │     → Top-30 categories by volatility
   ├── Redis INCR "intraday:rotation:idx" → cats[i % 30]
-  ├── Round-robin sites (INTRADAY_SITES = ['pharmonline', 'aloe']):
-  │     - Try first site: SETNX "intraday:lock:site:pharmonline" с TTL=2h
-  │     - Если locked → try next site
-  │     - Если все locked → skip tick, log "all_sites_locked"
+  ├── Intraday site (INTRADAY_SITES = ['aloe']):
+  │     - SETNX "intraday:lock:site:aloe" с TTL=2h
+  │     - Pharmonline исключён: его Meteor WebSocket через residential proxy
+  │       обслуживается только полным недельным прогоном
+  │     - Если locked → skip tick, log "all_sites_locked"
   └── pharmacy-monitor run --site X --mode category --category-id N --no-alerts
         (no-alerts чтобы не дублировать с full nightly)
 ```
 
-Result: 13 supplemental scrapes/day, top-30 volatile categories refreshed every ~3 days.
+Result: до 7 supplemental Aloe scrapes/day; proxy-зависимые сайты не получают
+лишних intraday-подключений.
 
 ### User dashboard hit
 

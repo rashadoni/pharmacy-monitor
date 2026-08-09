@@ -57,21 +57,9 @@ jobs:
               --since "14 days ago" --no-pager -o cat \
               | grep -E "run_(started|ok|failed)|ddp_connect_(retry|exhausted|recovered)|opening handshake|HTTP 40[27]" \
               | tail -n 160 || true
-            printf "== recent database runs ==\n"
-            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
-            test -n "$db_url"
-            psql_url=${db_url/postgresql+psycopg:/postgresql:}
-            psql "$psql_url" -P pager=off -c "
-              SELECT id, started_at, status, catalog_scope, sites_completed,
-                     products_scraped, left(coalesce(error_message, '\''\''), 180) AS error
-              FROM runs
-              WHERE started_at >= now() - interval '\''14 days'\''
-                AND (coalesce(sites_completed, '\''\'') LIKE '\''%pharmonline%\''
-                     OR coalesce(error_message, '\''\'') ILIKE '\''%handshake%\''
-                     OR catalog_scope = '\''full'\'')
-              ORDER BY id DESC;"'
+            printf "journal access may be restricted for pm; timer and safe config remain authoritative\n"'
 
-      - name: Backup and deploy two Python files
+      - name: Backup and deploy Python hotfix files
         run: |
           set -euo pipefail
           stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -79,10 +67,14 @@ jobs:
             mkdir -p /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/scrapers
             cp /opt/pharmacy-monitor/src/health.py \
               /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/health.py
+            cp /opt/pharmacy-monitor/src/intraday.py \
+              /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/intraday.py
             cp /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py \
               /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/scrapers/pharmonline_ddp.py"
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
             src/health.py pm@46.225.149.52:/opt/pharmacy-monitor/src/health.py
+          rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
+            src/intraday.py pm@46.225.149.52:/opt/pharmacy-monitor/src/intraday.py
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
             src/scrapers/pharmonline_ddp.py \
             pm@46.225.149.52:/opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py
@@ -92,12 +84,15 @@ jobs:
         run: |
           set -euo pipefail
           local_health=$(sha256sum src/health.py | awk '{print $1}')
+          local_intraday=$(sha256sum src/intraday.py | awk '{print $1}')
           local_ddp=$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print $1}')
           ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 "set -euo pipefail
             cd /opt/pharmacy-monitor
             test \"\$(sha256sum src/health.py | awk '{print \$1}')\" = '$local_health'
+            test \"\$(sha256sum src/intraday.py | awk '{print \$1}')\" = '$local_intraday'
             test \"\$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print \$1}')\" = '$local_ddp'
-            .venv/bin/python -m py_compile src/health.py src/scrapers/pharmonline_ddp.py
+            .venv/bin/python -m py_compile \
+              src/health.py src/intraday.py src/scrapers/pharmonline_ddp.py
             db_url=\$(grep -m1 '^DATABASE_URL=' /etc/pharmacy-monitor/env | cut -d= -f2-)
             test -n \"\$db_url\"
             output=\$(DATABASE_URL=\"\$db_url\" .venv/bin/pharmacy-monitor health-check \

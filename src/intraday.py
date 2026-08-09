@@ -1,6 +1,6 @@
 """Phase 5.1 (Вариант C) — intraday category rotation.
 
-В отличие от full nightly scrape (01:00 UTC pharmonline, 03:00 aloe), intraday
+В отличие от full scheduled scrape, intraday
 делает СУПЛЕМЕНТАЛЬНЫЕ прогоны: каждый час business hours (05-17 UTC) выбирает
 одну категорию из top-N volatile и скрейпит её на одном сайте round-robin.
 
@@ -44,10 +44,12 @@ INTRADAY_TOP_N_CATEGORIES = 30
 # Мин промежуток между intraday-прогонами на ОДНОМ сайте (Redis TTL).
 INTRADAY_PER_SITE_MIN_GAP_SEC = 2 * 3600  # 2 часа
 
-# Какие сайты допустимы в intraday rotation. aptekonline исключён: его
-# server-side путь тяжёлый и недельный через AZ residential proxy, без лёгкого
-# внутридневного категорийного refresh.
-INTRADAY_SITES = ("pharmonline", "aloe")
+# Только Aloe допускается в intraday rotation. Pharmonline намеренно исключён:
+# каждый короткий тик открывал новый Meteor WebSocket через residential proxy и
+# 5–7 раз в день воспроизводил transient opening-handshake timeout. Его каталог
+# обновляет отдельный полный недельный timer с полноценной retry/verification
+# семантикой. Aptekonline также остаётся на отдельном полном расписании.
+INTRADAY_SITES = ("aloe",)
 
 # Окно для подсчёта volatility (count price changes per category per N days).
 VOLATILITY_WINDOW_DAYS = 7

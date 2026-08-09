@@ -3115,7 +3115,8 @@ def intraday_tick_cmd(dry_run: bool) -> None:
     Каждый вызов:
       1. Берёт top-30 volatile категорий (по count(price_snapshots) за 7 дней)
       2. Через Redis-rotation index выбирает следующую категорию
-      3. Round-robin'ит сайт (pharmonline → aloe) с per-site rate-limit 2ч
+      3. Выбирает Aloe с per-site rate-limit 2ч; proxy-зависимые Pharmonline и
+         Aptekonline обслуживаются только отдельными full-catalog таймерами
       4. Запускает scrape-only persist для этой категории.
 
     Запускается из systemd timer ежечасно во время business hours (05-17 UTC).

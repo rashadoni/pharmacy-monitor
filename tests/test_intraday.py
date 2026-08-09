@@ -224,11 +224,11 @@ def test_pick_next_scrape_target_returns_site_and_cat(db_session):
     assert result is not None
     site, picked_cat = result
     assert picked_cat.id == cat.id
-    assert site == "pharmonline"  # первый в INTRADAY_SITES order
+    assert site == "aloe"
 
 
-def test_pick_next_scrape_target_falls_back_to_aloe_when_pharm_locked(db_session):
-    """Pharmonline locked → пытаемся aloe."""
+def test_pick_next_scrape_target_never_attempts_pharmonline(db_session):
+    """Pharmonline исключён: intraday не открывает proxy WebSocket."""
     cat = _add_category(db_session, "k1", "K1", ph_slug="ph", aloe_slug="aloe")
     p = _add_product_with_category(db_session, "pharmonline", "p1", "P1", "ph")
     _add_snaps(db_session, p, n_snaps=5)
@@ -236,14 +236,18 @@ def test_pick_next_scrape_target_falls_back_to_aloe_when_pharm_locked(db_session
 
     redis_mock = MagicMock()
     redis_mock.incr.return_value = 1
-    # SET nx returns: None для pharmonline (locked), True для aloe (acquired)
-    redis_mock.set.side_effect = [None, True]
-    redis_mock.ttl.return_value = 3600
+    redis_mock.set.return_value = True
 
     result = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
     assert result is not None
     site, _ = result
     assert site == "aloe"
+    redis_mock.set.assert_called_once_with(
+        "intraday:lock:site:aloe",
+        "1",
+        nx=True,
+        ex=intraday.INTRADAY_PER_SITE_MIN_GAP_SEC,
+    )
 
 
 def test_pick_next_scrape_target_returns_none_when_all_locked(db_session):
@@ -306,7 +310,7 @@ def test_pick_next_scrape_target_commit_false_does_not_mutate_redis(db_session):
     )
     assert result is not None
     site, _ = result
-    assert site == "pharmonline"
+    assert site == "aloe"
 
     # State не изменился: НЕ должны вызваться INCR/SET/EXPIRE
     redis_mock.incr.assert_not_called()
@@ -318,7 +322,7 @@ def test_pick_next_scrape_target_commit_false_does_not_mutate_redis(db_session):
 
 
 def test_pick_next_scrape_target_commit_false_detects_existing_lock(db_session):
-    """В preview mode locked-сайт пропускается через EXISTS, не SET."""
+    """В preview mode locked Aloe даёт skip, не fallback на Pharmonline."""
     _add_category(db_session, "k1", "K1", ph_slug="ph", aloe_slug="aloe")
     p = _add_product_with_category(db_session, "pharmonline", "p1", "P1", "ph")
     _add_snaps(db_session, p, n_snaps=5)
@@ -326,16 +330,13 @@ def test_pick_next_scrape_target_commit_false_detects_existing_lock(db_session):
 
     redis_mock = MagicMock()
     redis_mock.get.return_value = b"0"
-    # pharmonline lock exists, aloe free
-    redis_mock.exists.side_effect = lambda k: 1 if "pharmonline" in k else 0
+    redis_mock.exists.side_effect = lambda k: 1 if "aloe" in k else 0
     redis_mock.ttl.return_value = 1234
 
     result = intraday.pick_next_scrape_target(
         db_session, redis_client=redis_mock, commit_state=False
     )
-    assert result is not None
-    site, _ = result
-    assert site == "aloe"
+    assert result is None
     redis_mock.set.assert_not_called()
 
 
