@@ -1146,8 +1146,6 @@ def latest_full_catalog_attempts_by_site(
             terminal_or_finalizing,
             Run.catalog_scope == "full",
             Run.full_catalog_sites.is_not(None),
-            Run.run_quality.is_not(None),
-            Run.run_quality["baseline_enforced"].as_boolean().is_(True),
         )
         .order_by(*ordering)
     ).yield_per(100)
@@ -1157,9 +1155,7 @@ def latest_full_catalog_attempts_by_site(
             for site in (run.full_catalog_sites or "").split(",")
             if site.strip()
         }
-        quality_sites = set(((run.run_quality or {}).get("sites") or {}).keys())
-        run_sites = declared_sites & quality_sites
-        for site in (wanted - out.keys()) & run_sites:
+        for site in (wanted - out.keys()) & declared_sites:
             out[site] = run
         if wanted.issubset(out):
             break

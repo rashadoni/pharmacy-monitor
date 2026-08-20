@@ -574,6 +574,51 @@ def _full_quality(*, eligible: bool = True) -> dict:
     }
 
 
+def test_latest_full_catalog_attempts_use_declared_sites_before_classification(db_session):
+    now = main_mod.utcnow()
+    healthy = storage.Run(
+        tenant_id=1,
+        started_at=now - timedelta(hours=3),
+        finished_at=now - timedelta(hours=2),
+        status="ok",
+        run_quality=_full_quality(),
+        catalog_scope="full",
+        full_catalog_sites=",".join(storage.FULL_CATALOG_SITES),
+        catalog_verified=True,
+    )
+    failed = storage.Run(
+        tenant_id=1,
+        started_at=now - timedelta(hours=1),
+        finished_at=now,
+        status="failed",
+        run_quality=None,
+        catalog_scope="full",
+        full_catalog_sites="pharmonline",
+        catalog_verified=False,
+        catalog_verification_reason="pending",
+        error_message="TimeoutError: opening handshake",
+    )
+    db_session.add_all([healthy, failed])
+    db_session.commit()
+
+    attempts = storage.latest_full_catalog_attempts_by_site(
+        db_session,
+        storage.FULL_CATALOG_SITES,
+    )
+
+    assert attempts["pharmonline"].id == failed.id
+    assert attempts["aptekonline"].id == healthy.id
+    assert attempts["aloe"].id == healthy.id
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is False
+
+    from src.health import check_health
+
+    report = check_health(db_session)
+    issue = next(item for item in report.issues if item.code == "full_catalog_unverified")
+    assert issue.severity == "critical"
+    assert issue.context["sites"]["pharmonline"]["run_id"] == failed.id
+
+
 def test_reap_old_classified_orphan_preserves_newer_healthy_lineage_and_cache(db_session):
     now = main_mod.utcnow()
     orphan = storage.Run(

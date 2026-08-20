@@ -143,6 +143,9 @@ def test_post_processing_run_is_not_terminal_until_finished_at(db_session):
 
 def test_partial_history_without_full_catalog_is_warning(db_session):
     partial = _add_run(db_session, utcnow() - timedelta(hours=1), status="ok")
+    partial.catalog_scope = "partial"
+    partial.full_catalog_sites = None
+    partial.catalog_verified = False
     partial.run_quality = {
         "baseline_enforced": False,
         "full_catalog_verified": False,
