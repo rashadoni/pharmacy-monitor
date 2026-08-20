@@ -408,7 +408,7 @@ jobs:
           PY
 
           printf '== bounded production DDP startup probe ==\n'
-          timeout 75s .venv/bin/python - <<'PY'
+          timeout 85s .venv/bin/python - <<'PY'
           import asyncio
           from contextlib import redirect_stderr, redirect_stdout
           import io
@@ -551,30 +551,17 @@ jobs:
               )
 
 
-          async def iproyal_probe_once() -> tuple[str, float]:
-              """One bounded IPRoyal handshake; return only a normalized class."""
+          async def single_handshake_once(
+              proxy_url,
+              *,
+              configured: bool = True,
+          ) -> tuple[str, float]:
+              """One four-second handshake returning only a normalized class."""
               started = time.monotonic()
-              previous_sites = os.environ.get("IPROYAL_SITES")
-              probe_sites = {
-                  site.strip()
-                  for site in (previous_sites or "").split(",")
-                  if site.strip()
-              }
-              probe_sites.add("pharmonline")
-              os.environ["IPROYAL_SITES"] = ",".join(sorted(probe_sites))
-              try:
-                  proxy = _iproyal_httpx_proxy()
-              except Exception:
-                  return "internal_error", time.monotonic() - started
-              finally:
-                  if previous_sites is None:
-                      os.environ.pop("IPROYAL_SITES", None)
-                  else:
-                      os.environ["IPROYAL_SITES"] = previous_sites
-              if proxy is None:
+              if not configured:
                   return "not_configured", time.monotonic() - started
 
-              # Process-local overrides only; the service environment is untouched.
+              # All overrides live only for this diagnostic Python process.
               os.environ["PHARMONLINE_DDP_OPEN_TIMEOUT"] = "4"
               os.environ["PHARMONLINE_DDP_CONNECT_ATTEMPTS"] = "1"
               os.environ["PHARMONLINE_DDP_CONNECT_BACKOFF"] = "0"
@@ -583,9 +570,9 @@ jobs:
               try:
                   client = _DDPClient(
                       lambda: SOCKJS_BASE + _new_sockjs_path(),
-                      proxy_url=proxy,
+                      proxy_url=proxy_url,
                   )
-                  await asyncio.wait_for(client.__aenter__(), timeout=4.5)
+                  await asyncio.wait_for(client.__aenter__(), timeout=4)
               except Exception as exc:
                   fatal_reason = fatal_proxy_reason(exc)
                   http_status = safe_http_status(exc)
@@ -621,6 +608,85 @@ jobs:
                       except Exception:
                           pass
               return result_class, handshake_elapsed
+
+
+          async def iproyal_probe_once() -> tuple[str, float]:
+              """Resolve configured IPRoyal once without persisting site flags."""
+              previous_sites = os.environ.get("IPROYAL_SITES")
+              probe_sites = {
+                  site.strip()
+                  for site in (previous_sites or "").split(",")
+                  if site.strip()
+              }
+              probe_sites.add("pharmonline")
+              os.environ["IPROYAL_SITES"] = ",".join(sorted(probe_sites))
+              try:
+                  proxy = _iproyal_httpx_proxy()
+              except Exception:
+                  return "internal_error", 0.0
+              finally:
+                  if previous_sites is None:
+                      os.environ.pop("IPROYAL_SITES", None)
+                  else:
+                      os.environ["IPROYAL_SITES"] = previous_sites
+              return await single_handshake_once(
+                  proxy,
+                  configured=proxy is not None,
+              )
+
+
+          async def direct_probe_once() -> tuple[str, float]:
+              """Connect directly without constructing any proxy URL."""
+              proxy_env_keys = (
+                  "HTTP_PROXY",
+                  "HTTPS_PROXY",
+                  "ALL_PROXY",
+                  "WS_PROXY",
+                  "WSS_PROXY",
+                  "http_proxy",
+                  "https_proxy",
+                  "all_proxy",
+                  "ws_proxy",
+                  "wss_proxy",
+              )
+              previous = {key: os.environ.get(key) for key in proxy_env_keys}
+              for key in proxy_env_keys:
+                  os.environ.pop(key, None)
+              try:
+                  return await single_handshake_once(None)
+              finally:
+                  for key, value in previous.items():
+                      if value is not None:
+                          os.environ[key] = value
+
+
+          async def decodo_generic_rotating_probe_once() -> tuple[str, float]:
+              """Resolve Decodo's generic rotating gateway, then restore env."""
+              keys = ("DECODO_HOST", "DECODO_PORTS", "DECODO_SITES")
+              previous = {key: os.environ.get(key) for key in keys}
+              probe_sites = {
+                  site.strip()
+                  for site in (previous["DECODO_SITES"] or "").split(",")
+                  if site.strip()
+              }
+              probe_sites.add("pharmonline")
+              os.environ["DECODO_HOST"] = "gate.decodo.com"
+              os.environ["DECODO_PORTS"] = "7000"
+              os.environ["DECODO_SITES"] = ",".join(sorted(probe_sites))
+              try:
+                  proxy_factory = _decodo_proxy_factory()
+              except Exception:
+                  return "internal_error", 0.0
+              finally:
+                  for key, value in previous.items():
+                      if value is None:
+                          os.environ.pop(key, None)
+                      else:
+                          os.environ[key] = value
+              return await single_handshake_once(
+                  proxy_factory,
+                  configured=proxy_factory is not None,
+              )
 
 
           async def run_probes():
@@ -664,14 +730,30 @@ jobs:
                       1,
                   )
               iproyal_diagnostic = await iproyal_probe_once()
-              return configured, rotating, iproyal_diagnostic
+              direct_diagnostic = await direct_probe_once()
+              decodo_generic_diagnostic = (
+                  await decodo_generic_rotating_probe_once()
+              )
+              return (
+                  configured,
+                  rotating,
+                  iproyal_diagnostic,
+                  direct_diagnostic,
+                  decodo_generic_diagnostic,
+              )
 
 
           # Suppress dependency/structlog output because endpoints may appear in
           # third-party exceptions. Emit only the allow-listed fields below.
           captured = io.StringIO()
           with redirect_stdout(captured), redirect_stderr(captured):
-              configured, rotating, iproyal_diagnostic = asyncio.run(run_probes())
+              (
+                  configured,
+                  rotating,
+                  iproyal_diagnostic,
+                  direct_diagnostic,
+                  decodo_generic_diagnostic,
+              ) = asyncio.run(run_probes())
           print(f"configured_provider={configured[0]}")
           print(f"configured_result={configured[1]}")
           print(f"configured_reason={configured[2]}")
@@ -684,6 +766,13 @@ jobs:
           print(f"rotating_elapsed_seconds={rotating[4]:.2f}")
           print(f"iproyal_probe_class={iproyal_diagnostic[0]}")
           print(f"iproyal_probe_elapsed_seconds={iproyal_diagnostic[1]:.2f}")
+          print(f"direct_probe_class={direct_diagnostic[0]}")
+          print(f"direct_probe_elapsed_seconds={direct_diagnostic[1]:.2f}")
+          print(f"decodo_generic_probe_class={decodo_generic_diagnostic[0]}")
+          print(
+              "decodo_generic_probe_elapsed_seconds="
+              f"{decodo_generic_diagnostic[1]:.2f}"
+          )
           PY
           REMOTE
 
