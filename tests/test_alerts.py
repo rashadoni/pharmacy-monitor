@@ -152,7 +152,7 @@ def test_auto_evaluate_selects_latest_completed_fresh_run(db_session):
     assert fired[0].rule_type == "undercut_threshold"
 
 
-def test_auto_evaluate_ignores_unfinished_eligible_run(db_session):
+def test_auto_evaluate_blocks_active_and_failed_newer_full_run(db_session):
     match = _make_match(db_session, "Auto blocked during run")
     client = _add_product(
         db_session,
@@ -184,9 +184,11 @@ def test_auto_evaluate_ignores_unfinished_eligible_run(db_session):
     unfinished.status = "failed"
     unfinished.run_quality = None
     db_session.commit()
-    fired = alerts.evaluate_rules(db_session)
-    assert len(fired) == 1
-    assert fired[0].payload["source_run_id"] == completed.id
+
+    # A terminal full attempt that failed before classification is still the
+    # newest declared producer.  Falling back to Run A would evaluate alerts
+    # against Product state that Run B may already have changed.
+    assert alerts.evaluate_rules(db_session) == []
 
 
 def test_auto_evaluate_skips_when_scrape_lock_is_busy(db_session, monkeypatch):
