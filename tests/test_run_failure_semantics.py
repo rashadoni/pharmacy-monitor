@@ -560,9 +560,7 @@ def test_incomplete_full_run_is_degraded_and_stops_before_consumers(db_session, 
     assert calls == {"match": 0, "alerts": 0, "analyze": 0, "roi": 0}
 
 
-def test_single_site_startup_failure_stays_failed_with_sanitized_cause(
-    db_session, monkeypatch
-):
+def test_single_site_startup_failure_stays_failed_with_sanitized_cause(db_session, monkeypatch):
     from src import alerts, roi
 
     request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
@@ -661,9 +659,7 @@ def test_single_site_startup_failure_stays_failed_with_sanitized_cause(
     assert calls == {"match": 0, "alerts": 0, "analyze": 0, "roi": 0}
 
 
-def test_multi_site_startup_failure_is_degraded_and_keeps_healthy_result(
-    db_session, monkeypatch
-):
+def test_multi_site_startup_failure_is_degraded_and_keeps_healthy_result(db_session, monkeypatch):
     request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
     db_session.add(request)
     db_session.commit()
