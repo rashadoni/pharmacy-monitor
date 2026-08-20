@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 
 import pytest
 
@@ -332,7 +333,7 @@ async def test_ddp_initial_connect_407_is_site_fatal(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ddp_generic_initial_failure_still_closes_client(monkeypatch):
+async def test_ddp_generic_initial_failure_is_persistable_and_closes_client(monkeypatch):
     exits = []
 
     async def reject_connect(self):
@@ -345,10 +346,43 @@ async def test_ddp_generic_initial_failure_still_closes_client(monkeypatch):
     monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aexit__", record_exit)
     scraper = pharmonline_ddp.PharmonlineDDPScraper()
 
-    with pytest.raises(OSError, match="TLS handshake failed"):
+    with pytest.raises(
+        SiteScrapeFatalError,
+        match="DDP startup failed: OSError: TLS handshake failed",
+    ):
         await scraper.__aenter__()
 
     assert exits == [True]
+
+
+@pytest.mark.asyncio
+async def test_ddp_generic_initial_failure_redacts_proxy_credentials(monkeypatch):
+    async def reject_connect(self):
+        raise OSError(
+            "opening handshake via "
+            "http://proxy-user:top-secret@az.decodo.com:30001 timed out"
+        )
+
+    async def record_exit(self, exc_type, exc, tb):
+        return None
+
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aenter__", reject_connect)
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aexit__", record_exit)
+
+    with pytest.raises(SiteScrapeFatalError) as exc_info:
+        await pharmonline_ddp.PharmonlineDDPScraper().__aenter__()
+
+    message = str(exc_info.value)
+    formatted_traceback = "".join(traceback.format_exception(exc_info.value))
+    assert message == (
+        "DDP startup failed: OSError: opening handshake via "
+        "[redacted-proxy-url] timed out"
+    )
+    assert "top-secret" not in message
+    assert "az.decodo.com" not in message
+    assert "top-secret" not in formatted_traceback
+    assert "az.decodo.com" not in formatted_traceback
+    assert "During handling of the above exception" not in formatted_traceback
 
 
 @pytest.mark.asyncio
@@ -452,7 +486,10 @@ async def test_ddp_category_map_407_is_not_treated_as_optional(monkeypatch):
         return self
 
     async def fatal_map(self, *args, **kwargs):
-        raise SiteScrapeFatalError("proxy access rejected: HTTP 407")
+        raise SiteScrapeFatalError(
+            "proxy http://proxy-user:category-secret@az.decodo.com:30001 "
+            "rejected connection: HTTP 407"
+        )
 
     async def record_exit(self, exc_type, exc, tb):
         exits.append(True)
@@ -462,7 +499,94 @@ async def test_ddp_category_map_407_is_not_treated_as_optional(monkeypatch):
     monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aexit__", record_exit)
 
     scraper = pharmonline_ddp.PharmonlineDDPScraper()
-    with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+    with pytest.raises(SiteScrapeFatalError, match="HTTP 407") as exc_info:
         await scraper.__aenter__()
 
     assert exits == [True]
+    formatted_traceback = "".join(traceback.format_exception(exc_info.value))
+    assert "category-secret" not in formatted_traceback
+    assert "az.decodo.com" not in formatted_traceback
+    assert "During handling of the above exception" not in formatted_traceback
+
+
+@pytest.mark.asyncio
+async def test_ddp_country_map_warning_redacts_proxy_credentials(monkeypatch):
+    logged = []
+
+    async def enter_ok(self):
+        return self
+
+    async def call(self, method, *args, **kwargs):
+        if method == "getFilterParam":
+            return {"category": []}
+        if method == "allCountry":
+            raise OSError(
+                "country lookup via "
+                "http://proxy-user:country-secret@az.decodo.com:30001 timed out"
+            )
+        raise AssertionError(method)
+
+    async def exit_ok(self, exc_type, exc, tb):
+        return None
+
+    class CaptureLog:
+        def info(self, event, **kwargs):
+            return None
+
+        def warning(self, event, **kwargs):
+            logged.append((event, kwargs))
+
+        def error(self, event, **kwargs):
+            return None
+
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aenter__", enter_ok)
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "call", call)
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aexit__", exit_ok)
+    monkeypatch.setattr(pharmonline_ddp, "log", CaptureLog())
+
+    scraper = pharmonline_ddp.PharmonlineDDPScraper()
+    assert await scraper.__aenter__() is scraper
+
+    country_warning = next(
+        fields for event, fields in logged if event == "pharmonline_ddp_country_map_failed"
+    )
+    assert country_warning["error"] == (
+        "OSError: country lookup via [redacted-proxy-url] timed out"
+    )
+    assert "country-secret" not in country_warning["error"]
+    assert "az.decodo.com" not in country_warning["error"]
+
+
+@pytest.mark.asyncio
+async def test_scrape_site_keeps_peer_safe_structured_startup_failure(monkeypatch):
+    from src import main as main_mod
+
+    async def reject_connect(self):
+        raise OSError(
+            "opening handshake via "
+            "http://proxy-user:startup-secret@az.decodo.com:30001 timed out"
+        )
+
+    async def exit_ok(self, exc_type, exc, tb):
+        return None
+
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aenter__", reject_connect)
+    monkeypatch.setattr(pharmonline_ddp._DDPClient, "__aexit__", exit_ok)
+    monkeypatch.setitem(
+        main_mod.SCRAPER_CLASSES,
+        "pharmonline",
+        pharmonline_ddp.PharmonlineDDPScraper,
+    )
+
+    result = await main_mod.scrape_site("pharmonline", ["vitaminler"], None)
+
+    assert result.site == "pharmonline"
+    assert result.site_fatal is True
+    assert result.products == []
+    assert result.items_expected == 1
+    assert result.items_failed == 1
+    assert result.item_results["vitaminler"]["error_kind"] == "site_fatal"
+    assert "DDP startup failed" in result.errors[0]
+    assert "[redacted-proxy-url]" in result.errors[0]
+    assert "startup-secret" not in repr(result.errors)
+    assert "az.decodo.com" not in repr(result.errors)

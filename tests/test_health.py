@@ -85,7 +85,7 @@ def test_degraded_run_is_warning_and_changes_alert_signature(db_session):
     report = check_health(db_session)
     assert report.status == "warning"
     assert any(issue.code == "last_run_degraded" for issue in report.issues)
-    assert "last_run_degraded:" in alert_signature(report)
+    assert '"code":"last_run_degraded"' in alert_signature(report)
 
 
 def test_running_run_does_not_hide_last_degraded_health(db_session):
@@ -803,8 +803,9 @@ def test_site_zero_scrape_ignores_in_flight_run(db_session):
 
 
 def test_alert_signature_stable_and_sorted():
-    """Подпись = отсортированный набор code:site по warning/critical; ok отброшен,
-    порядок issues не влияет."""
+    """Signature includes severity/code/site, ignores messages and issue order."""
+    import json
+
     from src.health import HealthIssue, HealthReport, alert_signature
 
     r = HealthReport(
@@ -816,9 +817,236 @@ def test_alert_signature_stable_and_sorted():
         ],
     )
     sig = alert_signature(r)
-    assert sig == "site_drop:pharmonline|site_zero_scrape:aloe"
+    assert json.loads(sig) == [
+        {
+            "code": "site_drop",
+            "context": {"site": "pharmonline"},
+            "severity": "warning",
+        },
+        {
+            "code": "site_zero_scrape",
+            "context": {"site": "aloe"},
+            "severity": "critical",
+        },
+    ]
     r2 = HealthReport(status="critical", issues=list(reversed(r.issues)))
-    assert alert_signature(r2) == sig  # порядок не влияет
+    assert alert_signature(r2) == sig
+
+    r3 = HealthReport(
+        status="critical",
+        issues=[
+            HealthIssue("critical", "site_zero_scrape", "new text", {"site": "aloe"}),
+            HealthIssue(
+                "warning",
+                "site_drop",
+                "changed counters",
+                {"site": "pharmonline", "ratio": 0.123, "products": 999},
+            ),
+        ],
+    )
+    assert alert_signature(r3) == sig
+
+
+def test_alert_signature_tracks_severity_and_nested_site_status_not_volatile_values():
+    from src.health import HealthIssue, HealthReport, alert_signature
+
+    def signature(*, severity="warning", site="aptekonline", status="degraded", run_id=631):
+        return alert_signature(
+            HealthReport(
+                status=severity,
+                issues=[
+                    HealthIssue(
+                        severity,
+                        "full_catalog_unverified",
+                        "catalog trust issue",
+                        {
+                            "sites": {
+                                site: {
+                                    "run_id": run_id,
+                                    "status": status,
+                                    "site_status": status,
+                                    "failed_routes": 17,
+                                }
+                            }
+                        },
+                    )
+                ],
+            )
+        )
+
+    base = signature()
+    assert signature(run_id=999) == base  # run ids/counts are volatile, not incident identity
+    assert signature(status="failed") != base
+    assert signature(site="pharmonline") != base
+    assert signature(severity="critical") != base
+
+
+def test_health_alert_state_machine_incident_reminder_recovery_and_recurrence():
+    from src.health import (
+        HealthIssue,
+        HealthReport,
+        health_alert_decision,
+        health_alert_state_after,
+    )
+
+    now = utcnow()
+    problem = HealthReport(
+        status="critical",
+        issues=[HealthIssue("critical", "site_silent", "silent", {"site": "pharmonline"})],
+    )
+    healthy = HealthReport(status="ok")
+
+    first = health_alert_decision(problem, None, now=now, reminder_hours=24)
+    assert first.action == "incident"
+    active_state = health_alert_state_after(first, None, now=now)
+    assert active_state["status"] == "active"
+    assert active_state["signature"] == first.signature
+
+    unchanged = health_alert_decision(
+        problem,
+        active_state,
+        now=now + timedelta(hours=23, minutes=59),
+        reminder_hours=24,
+    )
+    assert unchanged.action is None
+
+    reminder = health_alert_decision(
+        problem,
+        active_state,
+        now=now + timedelta(hours=24),
+        reminder_hours=24,
+    )
+    assert reminder.action == "reminder"
+    reminder_state = health_alert_state_after(
+        reminder,
+        active_state,
+        now=now + timedelta(hours=24),
+    )
+    assert reminder_state["incident_started_at"] == active_state["incident_started_at"]
+
+    recovery = health_alert_decision(
+        healthy,
+        reminder_state,
+        now=now + timedelta(hours=25),
+        reminder_hours=24,
+    )
+    assert recovery.action == "recovery"
+    healthy_state = health_alert_state_after(
+        recovery,
+        reminder_state,
+        now=now + timedelta(hours=25),
+    )
+    assert healthy_state["status"] == "ok"
+    assert healthy_state["signature"] is None
+
+    assert (
+        health_alert_decision(
+            healthy,
+            healthy_state,
+            now=now + timedelta(hours=26),
+            reminder_hours=24,
+        ).action
+        is None
+    )
+    assert (
+        health_alert_decision(
+            problem,
+            healthy_state,
+            now=now + timedelta(hours=26),
+            reminder_hours=24,
+        ).action
+        == "incident"
+    )
+
+
+def test_health_alert_changed_signature_is_immediate_and_legacy_state_is_supported():
+    from src.health import (
+        HealthIssue,
+        HealthReport,
+        health_alert_decision,
+        health_alert_state_after,
+    )
+
+    now = utcnow()
+    warning = HealthReport(
+        status="warning",
+        issues=[HealthIssue("warning", "site_silent", "silent", {"site": "pharmonline"})],
+    )
+    legacy_state = {
+        "signature": "site_silent:pharmonline",
+        "sent_at": (now - timedelta(hours=23)).isoformat(),
+    }
+    assert health_alert_decision(warning, legacy_state, now=now, reminder_hours=24).action is None
+
+    escalated = HealthReport(
+        status="critical",
+        issues=[HealthIssue("critical", "site_silent", "silent", {"site": "pharmonline"})],
+    )
+    assert (
+        health_alert_decision(escalated, legacy_state, now=now, reminder_hours=24).action
+        == "incident"
+    )
+
+    changed_site = HealthReport(
+        status="critical",
+        issues=[HealthIssue("critical", "site_silent", "silent", {"site": "aptekonline"})],
+    )
+    assert (
+        health_alert_decision(changed_site, legacy_state, now=now, reminder_hours=24).action
+        == "incident"
+    )
+    legacy_state["sent_at"] = (now - timedelta(hours=24)).isoformat()
+    reminder = health_alert_decision(warning, legacy_state, now=now, reminder_hours=24)
+    assert reminder.action == "reminder"
+    migrated = health_alert_state_after(reminder, legacy_state, now=now)
+    assert migrated["version"] == 2
+    assert migrated["signature"] != legacy_state["signature"]
+
+    nested_warning = HealthReport(
+        status="warning",
+        issues=[
+            HealthIssue(
+                "warning",
+                "full_catalog_unverified",
+                "degraded",
+                {"sites": {"aptekonline": {"status": "degraded"}}},
+            )
+        ],
+    )
+    nested_legacy = {
+        "signature": "full_catalog_unverified:",
+        "sent_at": (now - timedelta(hours=1)).isoformat(),
+    }
+    assert (
+        health_alert_decision(nested_warning, nested_legacy, now=now, reminder_hours=24).action
+        == "incident"
+    )
+
+
+def test_health_alert_invalid_aware_or_future_timestamp_fails_open():
+    from datetime import timezone
+
+    from src.health import HealthIssue, HealthReport, alert_signature, health_alert_decision
+
+    now = utcnow()
+    report = HealthReport(
+        status="warning",
+        issues=[HealthIssue("warning", "site_silent", "silent", {"site": "pharmonline"})],
+    )
+    signature = alert_signature(report)
+
+    for sent_at in (
+        "garbage",
+        (now + timedelta(hours=1)).isoformat(),
+        now.replace(tzinfo=timezone.utc).isoformat(),
+    ):
+        state = {
+            "version": 2,
+            "status": "active",
+            "signature": signature,
+            "last_sent_at": sent_at,
+        }
+        assert health_alert_decision(report, state, now=now, reminder_hours=24).action == "reminder"
 
 
 def test_alert_due_cooldown_logic():

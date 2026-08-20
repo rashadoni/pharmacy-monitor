@@ -102,12 +102,17 @@ def send_email(
     html_body: str,
     attachments: list[tuple[str, bytes, str]] | None = None,
     to: list[str] | None = None,
-) -> None:
-    """attachments: list of (filename, content_bytes, mimetype)."""
+) -> bool:
+    """Send an email, returning whether SMTP delivery was attempted successfully.
+
+    ``False`` means SMTP is not configured. Existing fire-and-forget callers may
+    ignore the return value; stateful callers must require ``True`` before they
+    mark a notification as delivered.
+    """
     smtp_host = os.environ.get("SMTP_HOST")
     if not smtp_host:
         log.info("email_skipped_no_smtp", subject=subject)
-        return
+        return False
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ["SMTP_USER"]
     smtp_pass = os.environ["SMTP_PASSWORD"]
@@ -137,3 +142,4 @@ def send_email(
         smtp.login(smtp_user, smtp_pass)
         smtp.send_message(msg)
     log.info("smtp_sent_ok")
+    return True

@@ -632,15 +632,17 @@ class PharmonlineDDPScraper(BaseScraper):
         )
         try:
             await self._ddp.__aenter__()
-        except SiteScrapeFatalError:
-            await self._ddp.__aexit__(None, None, None)
-            raise
         except Exception as exc:
             await self._ddp.__aexit__(None, None, None)
-            reason = fatal_proxy_reason(exc)
-            if reason is not None:
-                raise SiteScrapeFatalError(reason) from exc
-            raise
+            # Initial DDP startup is all-or-nothing for this site.  Use the
+            # structured site-fatal path so asyncio.gather can retain healthy
+            # peers; run-level classification decides failed vs degraded.
+            message = site_fatal_error_message(exc)
+            log.error("pharmonline_ddp_start_failed", error=message)
+            # Do not chain the original exception: proxy libraries may embed
+            # the raw proxy URL (including credentials) in it, and run_cmd's
+            # log.exception would otherwise render that context traceback.
+            raise SiteScrapeFatalError(f"DDP startup failed: {message}") from None
         # Pre-fetch category _id → slug map. Without this, products have raw
         # Mongo ObjectIds ("Fom7dQ8wnDWSgAeyn") as `category` field, breaking
         # frontend "click category → browse" UX. getFilterParam returns a list
@@ -657,14 +659,18 @@ class PharmonlineDDPScraper(BaseScraper):
                 if cid and slug:
                     self._cat_map[str(cid)] = str(slug)
             log.info("pharmonline_ddp_cat_map_loaded", count=len(self._cat_map))
-        except SiteScrapeFatalError:
+        except SiteScrapeFatalError as exc:
             await self._ddp.__aexit__(None, None, None)
-            raise
+            message = site_fatal_error_message(exc)
+            log.error("pharmonline_ddp_start_failed", stage="category_map", error=message)
+            raise SiteScrapeFatalError(
+                f"DDP startup failed while loading category map: {message}"
+            ) from None
         except Exception as exc:
             reason = fatal_proxy_reason(exc)
             if reason is not None:
                 await self._ddp.__aexit__(None, None, None)
-                raise SiteScrapeFatalError(reason) from exc
+                raise SiteScrapeFatalError(reason) from None
             log.warning(
                 "pharmonline_ddp_cat_map_failed",
                 error=site_fatal_error_message(exc),
@@ -684,7 +690,7 @@ class PharmonlineDDPScraper(BaseScraper):
         except Exception as exc:
             log.warning(
                 "pharmonline_ddp_country_map_failed",
-                error=f"{type(exc).__name__}: {exc}",
+                error=site_fatal_error_message(exc),
             )
         return self
 

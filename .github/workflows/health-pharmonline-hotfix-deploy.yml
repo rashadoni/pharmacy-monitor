@@ -1,14 +1,24 @@
-name: Deploy health and Pharmonline reliability hotfix
+name: Diagnose or deploy health and Pharmonline hotfix
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Read-only production diagnosis, or backed-up code-only deploy"
+        required: true
+        default: diagnose
+        type: choice
+        options:
+          - diagnose
+          - deploy
 
 concurrency:
   group: deploy-prod
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  production:
+    name: Production ${{ inputs.mode }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,84 +32,1007 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' \
+            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
+          test "$host_fingerprint" = \
+            'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
 
       - name: Preflight production resources
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            available_kib=$(awk "/MemAvailable:/ {print \$2}" /proc/meminfo)
-            test "$available_kib" -ge $((4 * 1024 * 1024))
-            disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk "NR==2 {print \$4}")
-            test "$disk_available_kib" -ge $((4 * 1024 * 1024))
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+            "bash -s -- ${{ inputs.mode }}" <<'REMOTE'
+          set -euo pipefail
+          mode=$1
+          min_available_kib=$((4 * 1024 * 1024))
+          max_swap_kib=$((2 * 1024 * 1024))
+          min_disk_kib=$((4 * 1024 * 1024))
+          # Leave at least 1 GiB below the configured 8 GiB user.slice high-water mark.
+          max_user_slice_bytes=$((7 * 1024 * 1024 * 1024))
+
+          available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+          swap_before_kib=$(free -k | awk '/^Swap:/ {print $3}')
+          disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk 'NR==2 {print $4}')
+          user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
+          sleep 5
+          swap_after_kib=$(free -k | awk '/^Swap:/ {print $3}')
+
+          printf 'available_ram_kib=%s required_kib=%s\n' \
+            "$available_kib" "$min_available_kib"
+          printf 'swap_before_kib=%s swap_after_kib=%s maximum_kib=%s\n' \
+            "$swap_before_kib" "$swap_after_kib" "$max_swap_kib"
+          printf 'disk_available_kib=%s required_kib=%s\n' \
+            "$disk_available_kib" "$min_disk_kib"
+          printf 'user_slice_bytes=%s conservative_limit_bytes=%s\n' \
+            "$user_slice_bytes" "$max_user_slice_bytes"
+
+          test "$available_kib" -ge "$min_available_kib"
+          test "$swap_after_kib" -le "$max_swap_kib"
+          test "$swap_after_kib" -le "$swap_before_kib"
+          test "$disk_available_kib" -ge "$min_disk_kib"
+          test "$user_slice_bytes" -lt "$max_user_slice_bytes"
+          test -r /etc/pharmacy-monitor/env
+          test -r /opt/pharmacy-monitor/src/health.py
+          test -r /opt/pharmacy-monitor/src/main.py
+          test -r /opt/pharmacy-monitor/src/notifier.py
+          test -r /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py
+
+          if [ "$mode" = deploy ]; then
+            if systemctl is-active --quiet pharmacy-monitor-scrape@pharmonline.service; then
+              printf 'refusing deploy: Pharmonline scrape is active\n' >&2
+              exit 1
+            fi
             test -w /opt/pharmacy-monitor/data
-            swap_used_kib=$(free -k | awk "/^Swap:/ {print \$3}")
-            user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
-            printf "available_ram_kib=%s swap_used_kib=%s disk_available_kib=%s user_slice_bytes=%s\n" \
-              "$available_kib" "$swap_used_kib" "$disk_available_kib" "$user_slice_bytes"
-            test "$user_slice_bytes" -lt $((8 * 1024 * 1024 * 1024))'
+            test -w /opt/pharmacy-monitor/src
+            test -w /opt/pharmacy-monitor/src/scrapers
+            test -w /opt/pharmacy-monitor/src/health.py
+            test -w /opt/pharmacy-monitor/src/main.py
+            test -w /opt/pharmacy-monitor/src/notifier.py
+            test -w /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py
+          fi
+          REMOTE
 
-      - name: Diagnose Pharmonline schedule and recent failures
+      - name: Diagnose units, health state, database, and DDP startup
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
-            cd /opt/pharmacy-monitor
-            printf "== timer ==\n"
-            systemctl show pharmacy-monitor-scrape@pharmonline.timer \
-              -p ActiveState -p UnitFileState -p LastTriggerUSec -p NextElapseUSecRealtime
-            systemctl cat pharmacy-monitor-scrape@pharmonline.timer --no-pager \
-              | grep -E "OnCalendar|RandomizedDelaySec" || true
-            printf "== safe proxy config ==\n"
-            grep -E "^(DECODO_(SITES|HOST|PORTS)|PHARMONLINE_DDP_(OPEN_TIMEOUT|CONNECT_ATTEMPTS|CONNECT_BACKOFF|CONNECT_BACKOFF_MAX|CALL_ATTEMPTS))=" \
-              /etc/pharmacy-monitor/env || true
-            printf "== recent service failures ==\n"
-            journalctl -u pharmacy-monitor-scrape@pharmonline.service \
-              --since "14 days ago" --no-pager -o cat \
-              | grep -E "run_(started|ok|failed)|ddp_connect_(retry|exhausted|recovered)|opening handshake|HTTP 40[27]" \
-              | tail -n 160 || true
-            printf "journal access may be restricted for pm; timer and safe config remain authoritative\n"'
-
-      - name: Backup and deploy Python hotfix files
-        run: |
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'bash -s' <<'REMOTE'
           set -euo pipefail
-          stamp=$(date -u +%Y%m%dT%H%M%SZ)
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 "set -euo pipefail
-            mkdir -p /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/scrapers
-            cp /opt/pharmacy-monitor/src/health.py \
-              /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/health.py
-            cp /opt/pharmacy-monitor/src/intraday.py \
-              /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/intraday.py
-            cp /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py \
-              /opt/pharmacy-monitor/data/hotfix-backups/hotfix-$stamp/src/scrapers/pharmonline_ddp.py"
+          cd /opt/pharmacy-monitor
+
+          printf '== selected unit state ==\n'
+          systemctl show \
+            pharmacy-monitor-health.timer \
+            pharmacy-monitor-health.service \
+            pharmacy-monitor-scrape@pharmonline.timer \
+            pharmacy-monitor-scrape@pharmonline.service \
+            -p Id -p LoadState -p ActiveState -p SubState -p UnitFileState \
+            -p Result -p ExecMainStatus -p LastTriggerUSec \
+            -p NextElapseUSecRealtime -p FragmentPath -p DropInPaths
+
+          printf '== safe effective timer directives ==\n'
+          for unit in \
+            pharmacy-monitor-health.timer \
+            pharmacy-monitor-scrape@pharmonline.timer
+          do
+            printf '[%s]\n' "$unit"
+            systemctl cat "$unit" --no-pager |
+              sed -n -E '/^[[:space:]]*(OnCalendar|RandomizedDelaySec|Persistent)=/p'
+          done
+
+          printf '== safe effective service directives ==\n'
+          for unit in \
+            pharmacy-monitor-health.service \
+            pharmacy-monitor-scrape@pharmonline.service
+          do
+            printf '[%s]\n' "$unit"
+            systemctl cat "$unit" --no-pager |
+              sed -n -E '/^[[:space:]]*(User|Group|WorkingDirectory|EnvironmentFile|ExecStart|ReadWritePaths)=/p'
+          done
+
+          printf '== safe production configuration ==\n'
+          .venv/bin/python - <<'PY'
+          from pathlib import Path
+          import re
+
+          env_path = Path("/etc/pharmacy-monitor/env")
+          entries: dict[str, str] = {}
+          for raw_line in env_path.read_text().splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#") or "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              entries[key.strip()] = value.strip().strip("\"'")
+
+          numeric_keys = (
+              "PHARMONLINE_DDP_OPEN_TIMEOUT",
+              "PHARMONLINE_DDP_CONNECT_ATTEMPTS",
+              "PHARMONLINE_DDP_CONNECT_BACKOFF",
+              "PHARMONLINE_DDP_CONNECT_BACKOFF_MAX",
+              "PHARMONLINE_DDP_CALL_ATTEMPTS",
+              "PHARMONLINE_DDP_CALL_RETRY_BACKOFF",
+          )
+          presence_only_keys = (
+              "DECODO_USERNAME",
+              "DECODO_PASSWORD",
+              "DECODO_HOST",
+              "DECODO_PORTS",
+              "IPROYAL_USERNAME",
+              "IPROYAL_PASSWORD",
+              "IPROYAL_HOST",
+              "HEALTH_ALERT_STATE_FILE",
+          )
+
+          ddp_enabled = entries.get("PHARMONLINE_USE_DDP", "<unset>").lower()
+          if ddp_enabled not in {"0", "1", "true", "false", "yes", "no", "<unset>"}:
+              ddp_enabled = "<set-nonstandard>"
+          print(f"PHARMONLINE_USE_DDP={ddp_enabled}")
+          decodo_sites = {item.strip() for item in entries.get("DECODO_SITES", "").split(",")}
+          iproyal_sites = {item.strip() for item in entries.get("IPROYAL_SITES", "").split(",")}
+          print(f"DECODO_SITES includes pharmonline={'pharmonline' in decodo_sites}")
+          print(f"IPROYAL_SITES includes pharmonline={'pharmonline' in iproyal_sites}")
+          for key in numeric_keys:
+              value = entries.get(key)
+              if value is None:
+                  print(f"{key}=<unset; code default applies>")
+              elif re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+                  print(f"{key}={value}")
+              else:
+                  print(f"{key}=<set-nonnumeric>")
+          for key in presence_only_keys:
+              print(f"{key}=<set>" if entries.get(key) else f"{key}=<unset>")
+          PY
+
+          printf '== health alert state metadata ==\n'
+          .venv/bin/python - <<'PY'
+          from datetime import datetime, timezone
+          from hashlib import sha256
+          import json
+          from pathlib import Path
+          import re
+          import stat
+
+          default_path = "/opt/pharmacy-monitor/data/health_alert_state.json"
+          configured_path = default_path
+          for raw_line in Path("/etc/pharmacy-monitor/env").read_text().splitlines():
+              line = raw_line.strip()
+              if line.startswith("HEALTH_ALERT_STATE_FILE="):
+                  configured_path = line.split("=", 1)[1].strip().strip("\"'") or default_path
+                  break
+
+          path = Path(configured_path)
+          allowed_root = Path("/opt/pharmacy-monitor/data").resolve()
+          try:
+              resolved = path.resolve()
+          except OSError:
+              resolved = path
+          if resolved != allowed_root and allowed_root not in resolved.parents:
+              print("state_path_scope=outside-approved-data-root")
+              raise SystemExit(0)
+          if not path.exists():
+              print("state_exists=false")
+              raise SystemExit(0)
+
+          metadata = path.stat()
+          print("state_exists=true")
+          print(f"state_mode={stat.filemode(metadata.st_mode)}")
+          print(f"state_size_bytes={metadata.st_size}")
+          print(
+              "state_mtime_utc="
+              f"{datetime.fromtimestamp(metadata.st_mtime, tz=timezone.utc).isoformat()}"
+          )
+          try:
+              state = json.loads(path.read_text())
+          except (OSError, ValueError, TypeError):
+              print("state_json_valid=false")
+          else:
+              if not isinstance(state, dict):
+                  print("state_json_valid=false")
+                  print("state_json_shape=non_object")
+                  raise SystemExit(0)
+              signature = str(state.get("signature") or "")
+
+              def safe_timestamp(key: str) -> str:
+                  value = str(state.get(key) or "")
+                  return value[:64] if re.fullmatch(r"[0-9T:+.Z-]{1,64}", value) else (
+                      "<missing>" if not value else "<set-invalid>"
+                  )
+
+              print("state_json_valid=true")
+              print(f"state_version={state.get('version', 1)}")
+              print(f"state_status={state.get('status', '<legacy>')}")
+              print(f"state_last_sent_at={safe_timestamp('last_sent_at')}")
+              print(f"state_legacy_sent_at={safe_timestamp('sent_at')}")
+              print(f"state_incident_started_at={safe_timestamp('incident_started_at')}")
+              print(f"state_recovered_at={safe_timestamp('recovered_at')}")
+              print(f"state_signature_present={bool(signature)}")
+              print(f"state_signature_bytes={len(signature.encode())}")
+              print(f"state_signature_sha256={sha256(signature.encode()).hexdigest()}")
+          PY
+
+          printf '== latest Pharmonline catalog attempt ==\n'
+          .venv/bin/python - <<'PY'
+          from hashlib import sha256
+          import re
+
+          from dotenv import load_dotenv
+          from sqlalchemy import desc, select
+
+          load_dotenv("/etc/pharmacy-monitor/env", override=True)
+
+          from src import storage
+
+
+          def redact(value: object) -> str:
+              text = str(value or "").replace("\n", " ")
+              text = re.sub(r"[a-z][a-z0-9+.-]*://\S+", "[redacted-url]", text, flags=re.I)
+              text = re.sub(r"\b[^\s:@]+:[^\s@]+@[^\s]+", "[redacted-credentials]", text)
+              return text[:500]
+
+
+          Session = storage.make_session()
+          with Session() as session:
+              attempts = storage.latest_full_catalog_attempts_by_site(
+                  session,
+                  ("pharmonline",),
+                  tenant_id=1,
+              )
+              run = attempts.get("pharmonline")
+              if run is None:
+                  print("latest_attempt=missing")
+              else:
+                  print(f"id={run.id}")
+                  print(f"started_at={run.started_at}")
+                  print(f"finished_at={run.finished_at}")
+                  print(f"status={run.status}")
+                  print(f"catalog_scope={run.catalog_scope}")
+                  print(f"catalog_verified={run.catalog_verified}")
+                  print(
+                      "catalog_verification_reason="
+                      f"{redact(run.catalog_verification_reason)}"
+                  )
+                  print(f"products_scraped={run.products_scraped}")
+                  error = redact(run.error_message)
+                  print(f"error={error or '<none>'}")
+                  print(f"error_sha256={sha256(error.encode()).hexdigest()}")
+
+              successful = None
+              successful_candidates = session.scalars(
+                  select(storage.Run)
+                  .where(
+                      storage.Run.tenant_id == 1,
+                      storage.Run.status == "ok",
+                      storage.Run.finished_at.is_not(None),
+                      storage.Run.catalog_scope == "full",
+                      storage.Run.catalog_verified.is_(True),
+                      storage.Run.full_catalog_sites.is_not(None),
+                  )
+                  .order_by(desc(storage.Run.finished_at), desc(storage.Run.id))
+              ).yield_per(100)
+              for candidate in successful_candidates:
+                  declared_sites = {
+                      site.strip()
+                      for site in (candidate.full_catalog_sites or "").split(",")
+                      if site.strip()
+                  }
+                  site_quality = (
+                      ((candidate.run_quality or {}).get("sites") or {}).get(
+                          "pharmonline"
+                      )
+                      or {}
+                  )
+                  if (
+                      "pharmonline" in declared_sites
+                      and site_quality.get("status", "ok") == "ok"
+                  ):
+                      successful = candidate
+                      break
+
+              if successful is None:
+                  print("last_successful_full_attempt=missing")
+              else:
+                  duration_seconds = (
+                      successful.finished_at - successful.started_at
+                  ).total_seconds()
+                  print(f"last_successful_full_id={successful.id}")
+                  print(f"last_successful_full_started_at={successful.started_at}")
+                  print(f"last_successful_full_finished_at={successful.finished_at}")
+                  print(
+                      "last_successful_full_duration_seconds="
+                      f"{duration_seconds:.1f}"
+                  )
+          PY
+
+          printf '== bounded production DDP startup probe ==\n'
+          timeout 70s .venv/bin/python - <<'PY'
+          import asyncio
+          from contextlib import redirect_stderr, redirect_stdout
+          import io
+          import os
+          import time
+
+          from dotenv import load_dotenv
+
+          load_dotenv("/etc/pharmacy-monitor/env", override=True)
+
+          from src.scrapers.base import fatal_proxy_reason
+          from src.scrapers.pharmonline_ddp import (
+              SOCKJS_BASE,
+              _DDPClient,
+              _decodo_ports_list,
+              _decodo_proxy_factory,
+              _iproyal_httpx_proxy,
+              _new_sockjs_path,
+          )
+
+
+          SAFE_HTTP_STATUSES = frozenset(
+              {
+                  400,
+                  401,
+                  402,
+                  403,
+                  404,
+                  407,
+                  408,
+                  409,
+                  425,
+                  426,
+                  429,
+                  500,
+                  501,
+                  502,
+                  503,
+                  504,
+                  520,
+                  521,
+                  522,
+                  523,
+                  524,
+              }
+          )
+
+
+          def safe_http_status(error: BaseException) -> int | None:
+              """Extract only an allow-listed status, never exception text."""
+              current: BaseException | None = error
+              seen: set[int] = set()
+              while current is not None and id(current) not in seen:
+                  seen.add(id(current))
+                  candidates = [getattr(current, "status_code", None)]
+                  response = getattr(current, "response", None)
+                  candidates.append(getattr(response, "status_code", None))
+                  for candidate in candidates:
+                      try:
+                          status = int(candidate)
+                      except (TypeError, ValueError):
+                          continue
+                      if status in SAFE_HTTP_STATUSES:
+                          return status
+                  current = current.__cause__ or current.__context__
+              return None
+
+
+          def decodo_rotating_proxy_factory():
+              """Reuse configured Decodo credentials with official rotating port."""
+              previous_ports = os.environ.get("DECODO_PORTS")
+              os.environ["DECODO_PORTS"] = "30000"
+              try:
+                  return _decodo_proxy_factory()
+              finally:
+                  if previous_ports is None:
+                      os.environ.pop("DECODO_PORTS", None)
+                  else:
+                      os.environ["DECODO_PORTS"] = previous_ports
+
+
+          async def probe(
+              proxy_factory,
+              provider: str,
+              attempt_budget: int,
+          ) -> tuple[str, str, str, int, float]:
+              if proxy_factory is None:
+                  return provider, "failed", "proxy_provider_not_configured", 0, 0.0
+
+              # Process-local bounds only. A failed Decodo startup rotates through
+              # every configured standard sticky session, capped at ten attempts.
+              os.environ["PHARMONLINE_DDP_OPEN_TIMEOUT"] = "4"
+              os.environ["PHARMONLINE_DDP_CONNECT_ATTEMPTS"] = str(attempt_budget)
+              os.environ["PHARMONLINE_DDP_CONNECT_BACKOFF"] = "0"
+              os.environ["PHARMONLINE_DDP_CONNECT_BACKOFF_MAX"] = "0"
+              os.environ["PHARMONLINE_DDP_CALL_ATTEMPTS"] = "1"
+
+              client = _DDPClient(
+                  lambda: SOCKJS_BASE + _new_sockjs_path(),
+                  proxy_url=proxy_factory,
+              )
+              started = time.monotonic()
+              try:
+                  await asyncio.wait_for(
+                      client.__aenter__(),
+                      timeout=min(attempt_budget * 4 + 5, 45),
+                  )
+              except Exception as exc:
+                  fatal_reason = fatal_proxy_reason(exc)
+                  http_status = safe_http_status(exc)
+                  if fatal_reason:
+                      reason = fatal_reason
+                  elif http_status == 403:
+                      reason = "http_403_forbidden"
+                  elif http_status is not None:
+                      reason = f"http_status_{http_status}"
+                  elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                      reason = "opening_handshake_timeout"
+                  else:
+                      reason = "transient_connection_failure"
+                  return (
+                      provider,
+                      "failed",
+                      f"{type(exc).__name__}:{reason}",
+                      attempt_budget,
+                      time.monotonic() - started,
+                  )
+              finally:
+                  try:
+                      await asyncio.wait_for(client.__aexit__(None, None, None), timeout=5)
+                  except Exception:
+                      pass
+              return (
+                  provider,
+                  "ok",
+                  "ddp_handshake_completed",
+                  attempt_budget,
+                  time.monotonic() - started,
+              )
+
+
+          async def run_probes():
+              decodo = _decodo_proxy_factory()
+              iproyal = None if decodo else _iproyal_httpx_proxy()
+              proxy_factory = decodo or iproyal
+              provider = "decodo" if decodo else "iproyal" if iproyal else "unconfigured"
+              attempt_budget = (
+                  min(max(len(_decodo_ports_list()), 1), 10) if decodo else 1
+              )
+              configured = await probe(proxy_factory, provider, attempt_budget)
+
+              if not decodo:
+                  rotating = (
+                      "decodo_rotating_30000",
+                      "not_applicable",
+                      "decodo_not_selected",
+                      0,
+                      0.0,
+                  )
+              elif configured[1] == "ok":
+                  rotating = (
+                      "decodo_rotating_30000",
+                      "skipped",
+                      "configured_pool_ok",
+                      0,
+                      0.0,
+                  )
+              elif "HTTP 402" in configured[2] or "HTTP 407" in configured[2]:
+                  rotating = (
+                      "decodo_rotating_30000",
+                      "skipped",
+                      "account_or_auth_failure",
+                      0,
+                      0.0,
+                  )
+              else:
+                  rotating = await probe(
+                      decodo_rotating_proxy_factory(),
+                      "decodo_rotating_30000",
+                      1,
+                  )
+              return configured, rotating
+
+
+          # Suppress dependency/structlog output because endpoints may appear in
+          # third-party exceptions. Emit only the allow-listed fields below.
+          captured = io.StringIO()
+          with redirect_stdout(captured), redirect_stderr(captured):
+              configured, rotating = asyncio.run(run_probes())
+          print(f"configured_provider={configured[0]}")
+          print(f"configured_result={configured[1]}")
+          print(f"configured_reason={configured[2]}")
+          print(f"configured_attempt_budget={configured[3]}")
+          print(f"configured_elapsed_seconds={configured[4]:.2f}")
+          print("rotating_port=30000")
+          print(f"rotating_result={rotating[1]}")
+          print(f"rotating_reason={rotating[2]}")
+          print(f"rotating_attempt_budget={rotating[3]}")
+          print(f"rotating_elapsed_seconds={rotating[4]:.2f}")
+          PY
+          REMOTE
+
+      - name: Backup and deploy Python hotfix files with rollback
+        id: deploy
+        if: ${{ inputs.mode == 'deploy' }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          deploy_id=gha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
+          backup_dir=/opt/pharmacy-monitor/data/hotfix-backups/hotfix-$deploy_id/src
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+            "bash -s -- $deploy_id" <<'REMOTE'
+          set -euo pipefail
+          deploy_id=$1
+          [[ "$deploy_id" =~ ^gha-[0-9]+-[0-9]+$ ]]
+          backup_dir=/opt/pharmacy-monitor/data/hotfix-backups/hotfix-$deploy_id/src
+          mkdir -p "$backup_dir/scrapers"
+          cp -p /opt/pharmacy-monitor/src/health.py "$backup_dir/health.py"
+          cp -p /opt/pharmacy-monitor/src/main.py "$backup_dir/main.py"
+          cp -p /opt/pharmacy-monitor/src/notifier.py "$backup_dir/notifier.py"
+          cp -p /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py \
+            "$backup_dir/scrapers/pharmonline_ddp.py"
+          cmp -s /opt/pharmacy-monitor/src/health.py "$backup_dir/health.py"
+          cmp -s /opt/pharmacy-monitor/src/main.py "$backup_dir/main.py"
+          cmp -s /opt/pharmacy-monitor/src/notifier.py "$backup_dir/notifier.py"
+          cmp -s /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py \
+            "$backup_dir/scrapers/pharmonline_ddp.py"
+          printf 'backup=%s\n' "$backup_dir"
+          REMOTE
+          printf 'backup_dir=%s\n' "$backup_dir" >> "$GITHUB_OUTPUT"
+
+          rollback() {
+            original_rc=$?
+            trap - ERR INT TERM
+            set +e
+            printf 'deploy failed; restoring backup in compatible reverse order\n' >&2
+            ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+              "bash -s -- $backup_dir" <<'ROLLBACK'
+          set -u
+          backup_dir=$1
+          [[ "$backup_dir" =~ ^/opt/pharmacy-monitor/data/hotfix-backups/hotfix-gha-[0-9]+-[0-9]+/src$ ]] \
+            || { printf 'invalid backup path; rollback refused\n' >&2; exit 1; }
+          rollback_failed=0
+          restore_file() {
+            source_file=$1
+            target_file=$2
+            if ! test -r "$source_file"; then
+              printf 'rollback source missing: %s\n' "$source_file" >&2
+              return 1
+            fi
+            temp_file=$(mktemp "${target_file}.rollback.XXXXXX") || return 1
+            if ! cp -p "$source_file" "$temp_file" \
+              || ! cmp -s "$source_file" "$temp_file" \
+              || ! mv -f "$temp_file" "$target_file" \
+              || ! cmp -s "$source_file" "$target_file"
+            then
+              rm -f -- "$temp_file"
+              return 1
+            fi
+          }
+          # Inverse of rollout: restore the old caller first.  Never downgrade
+          # dependencies while the new caller remains live.
+          if restore_file "$backup_dir/main.py" /opt/pharmacy-monitor/src/main.py; then
+            restore_file "$backup_dir/scrapers/pharmonline_ddp.py" \
+              /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py || rollback_failed=1
+            restore_file "$backup_dir/health.py" /opt/pharmacy-monitor/src/health.py \
+              || rollback_failed=1
+            restore_file "$backup_dir/notifier.py" /opt/pharmacy-monitor/src/notifier.py \
+              || rollback_failed=1
+          else
+            printf 'main rollback failed; keeping new dependencies in place\n' >&2
+            rollback_failed=1
+          fi
+          cd /opt/pharmacy-monitor
+          .venv/bin/python -m py_compile \
+            src/main.py src/scrapers/pharmonline_ddp.py src/health.py src/notifier.py \
+            || rollback_failed=1
+          if [ "$rollback_failed" -ne 0 ]; then
+            printf 'automatic rollback incomplete; backup=%s\n' "$backup_dir" >&2
+            exit 1
+          fi
+          printf 'automatic rollback complete; backup=%s\n' "$backup_dir" >&2
+          ROLLBACK
+            rollback_rc=$?
+            set -e
+            if [ "$rollback_rc" -ne 0 ]; then
+              printf 'automatic rollback command failed\n' >&2
+            fi
+            if [ "$original_rc" -eq 0 ]; then original_rc=1; fi
+            exit "$original_rc"
+          }
+          # Repeat the active gate immediately before the first live write.
+          # Unknown/missing/transitional unit state fails closed.
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          require_inactive() {
+            unit=$1
+            load_state=$(systemctl show "$unit" -p LoadState --value)
+            active_state=$(systemctl show "$unit" -p ActiveState --value)
+            test "$load_state" = loaded
+            case "$active_state" in
+              inactive|failed) ;;
+              *)
+                printf 'refusing deploy: %s state=%s\n' "$unit" "$active_state" >&2
+                exit 1
+                ;;
+            esac
+          }
+          require_inactive pharmacy-monitor-scrape@pharmonline.service
+          require_inactive pharmacy-monitor-health.service
+          REMOTE
+
+          trap rollback ERR INT TERM
+          # Dependencies first; main.py (the caller) is always published last.
+          rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
+            src/notifier.py pm@46.225.149.52:/opt/pharmacy-monitor/src/notifier.py
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
             src/health.py pm@46.225.149.52:/opt/pharmacy-monitor/src/health.py
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
-            src/intraday.py pm@46.225.149.52:/opt/pharmacy-monitor/src/intraday.py
-          rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
             src/scrapers/pharmonline_ddp.py \
             pm@46.225.149.52:/opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py
-          printf 'backup=/opt/pharmacy-monitor/data/hotfix-backups/hotfix-%s\n' "$stamp"
+          rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
+            src/main.py pm@46.225.149.52:/opt/pharmacy-monitor/src/main.py
+          trap - ERR INT TERM
 
-      - name: Verify deployed code and health classification
+      - name: Read-only verify and post-deploy DDP probe with rollback
+        id: verify
+        if: ${{ inputs.mode == 'deploy' }}
+        env:
+          BACKUP_DIR: /opt/pharmacy-monitor/data/hotfix-backups/hotfix-gha-${{ github.run_id }}-${{ github.run_attempt }}/src
+        run: |
+          set -Eeuo pipefail
+          backup_dir=$BACKUP_DIR
+          [[ "$backup_dir" =~ ^/opt/pharmacy-monitor/data/hotfix-backups/hotfix-gha-[0-9]+-[0-9]+/src$ ]] \
+            || { printf 'invalid backup path\n' >&2; exit 1; }
+
+          rollback() {
+            original_rc=$?
+            trap - ERR INT TERM
+            set +e
+            printf 'verification failed; restoring backup in compatible reverse order\n' >&2
+            ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+              "bash -s -- $backup_dir" <<'ROLLBACK'
+          set -u
+          backup_dir=$1
+          [[ "$backup_dir" =~ ^/opt/pharmacy-monitor/data/hotfix-backups/hotfix-gha-[0-9]+-[0-9]+/src$ ]] \
+            || { printf 'invalid backup path; rollback refused\n' >&2; exit 1; }
+          rollback_failed=0
+          restore_file() {
+            source_file=$1
+            target_file=$2
+            if ! test -r "$source_file"; then return 1; fi
+            temp_file=$(mktemp "${target_file}.rollback.XXXXXX") || return 1
+            if ! cp -p "$source_file" "$temp_file" \
+              || ! cmp -s "$source_file" "$temp_file" \
+              || ! mv -f "$temp_file" "$target_file" \
+              || ! cmp -s "$source_file" "$target_file"
+            then
+              rm -f -- "$temp_file"
+              return 1
+            fi
+          }
+          if restore_file "$backup_dir/main.py" /opt/pharmacy-monitor/src/main.py; then
+            restore_file "$backup_dir/scrapers/pharmonline_ddp.py" \
+              /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py || rollback_failed=1
+            restore_file "$backup_dir/health.py" /opt/pharmacy-monitor/src/health.py \
+              || rollback_failed=1
+            restore_file "$backup_dir/notifier.py" /opt/pharmacy-monitor/src/notifier.py \
+              || rollback_failed=1
+          else
+            printf 'main rollback failed; keeping new dependencies in place\n' >&2
+            rollback_failed=1
+          fi
+          cd /opt/pharmacy-monitor
+          .venv/bin/python -m py_compile \
+            src/main.py src/scrapers/pharmonline_ddp.py src/health.py src/notifier.py \
+            || rollback_failed=1
+          if [ "$rollback_failed" -ne 0 ]; then
+            printf 'automatic rollback incomplete; backup=%s\n' "$backup_dir" >&2
+            exit 1
+          fi
+          printf 'automatic rollback complete; backup=%s\n' "$backup_dir" >&2
+          ROLLBACK
+            rollback_rc=$?
+            set -e
+            if [ "$rollback_rc" -ne 0 ]; then
+              printf 'automatic rollback command failed\n' >&2
+            fi
+            if [ "$original_rc" -eq 0 ]; then original_rc=1; fi
+            exit "$original_rc"
+          }
+          trap rollback ERR INT TERM
+
+          local_health=$(sha256sum src/health.py | awk '{print $1}')
+          local_main=$(sha256sum src/main.py | awk '{print $1}')
+          local_notifier=$(sha256sum src/notifier.py | awk '{print $1}')
+          local_ddp=$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print $1}')
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+            "bash -s -- $local_health $local_main $local_notifier $local_ddp" <<'REMOTE'
+          set -euo pipefail
+          expected_health=$1
+          expected_main=$2
+          expected_notifier=$3
+          expected_ddp=$4
+          cd /opt/pharmacy-monitor
+          test "$(sha256sum src/health.py | awk '{print $1}')" = "$expected_health"
+          test "$(sha256sum src/main.py | awk '{print $1}')" = "$expected_main"
+          test "$(sha256sum src/notifier.py | awk '{print $1}')" = "$expected_notifier"
+          test "$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print $1}')" = "$expected_ddp"
+          .venv/bin/python -m py_compile \
+            src/health.py src/main.py src/notifier.py src/scrapers/pharmonline_ddp.py
+
+          printf '== structured read-only health verification ==\n'
+          timeout 60s .venv/bin/python - <<'PY'
+          from contextlib import redirect_stderr, redirect_stdout
+          import io
+          import re
+
+          from dotenv import load_dotenv
+          from sqlalchemy import text
+
+          load_dotenv("/etc/pharmacy-monitor/env", override=True)
+
+          from src import storage
+          from src.health import check_health
+
+
+          captured = io.StringIO()
+          try:
+              with redirect_stdout(captured), redirect_stderr(captured):
+                  Session = storage.make_session()
+                  with Session() as session:
+                      # This must be the first SQL statement in the transaction.
+                      session.execute(text("SET TRANSACTION READ ONLY"))
+                      report = check_health(session, max_age_hours=26, min_products=1)
+                      session.rollback()
+          except Exception as exc:
+              print("readonly_health_check=failed")
+              print(f"readonly_health_error_type={type(exc).__name__}")
+              raise SystemExit(1) from None
+
+          if report.status not in {"ok", "warning", "critical"}:
+              print("readonly_health_check=invalid_status")
+              raise SystemExit(1)
+          issue_codes = []
+          for issue in report.issues:
+              if issue.severity not in {"ok", "warning", "critical"}:
+                  raise SystemExit(1)
+              if not re.fullmatch(r"[a-z0-9_]{1,80}", issue.code):
+                  raise SystemExit(1)
+              issue_codes.append(issue.code)
+          last_status = report.last_run_status
+          if last_status not in {None, "running", "ok", "degraded", "failed"}:
+              last_status = "nonstandard"
+          print("readonly_health_check=ok")
+          print(f"health_status={report.status}")
+          print(f"health_last_run_id={report.last_run_id}")
+          print(f"health_last_run_status={last_status}")
+          print(f"health_issue_count={len(issue_codes)}")
+          print(f"health_issue_codes={','.join(issue_codes)}")
+          PY
+
+          printf '== bounded post-deploy DDP handshake probe ==\n'
+          timeout 55s .venv/bin/python - <<'PY'
+          import asyncio
+          from contextlib import redirect_stderr, redirect_stdout
+          import io
+          import os
+          import time
+
+          captured = io.StringIO()
+          try:
+              with redirect_stdout(captured), redirect_stderr(captured):
+                  from dotenv import load_dotenv
+                  import websockets
+
+                  load_dotenv("/etc/pharmacy-monitor/env", override=True)
+
+                  from src.scrapers.base import fatal_proxy_reason
+                  from src.scrapers.pharmonline_ddp import (
+                      SOCKJS_BASE,
+                      _DDPClient,
+                      _decodo_ports_list,
+                      _decodo_proxy_factory,
+                      _iproyal_httpx_proxy,
+                      _new_sockjs_path,
+                  )
+
+                  async def post_deploy_probe():
+                      decodo = _decodo_proxy_factory()
+                      iproyal = None if decodo else _iproyal_httpx_proxy()
+                      proxy_factory = decodo or iproyal
+                      provider = (
+                          "decodo"
+                          if decodo
+                          else "iproyal"
+                          if iproyal
+                          else "unconfigured"
+                      )
+                      attempts = (
+                          min(max(len(_decodo_ports_list()), 1), 10)
+                          if decodo
+                          else 1
+                      )
+                      if proxy_factory is None:
+                          return (
+                              provider,
+                              "external_config",
+                              "proxy_provider_not_configured",
+                              0,
+                              0.0,
+                          )
+
+                      os.environ["PHARMONLINE_DDP_OPEN_TIMEOUT"] = "4"
+                      os.environ["PHARMONLINE_DDP_CONNECT_ATTEMPTS"] = str(attempts)
+                      os.environ["PHARMONLINE_DDP_CONNECT_BACKOFF"] = "0"
+                      os.environ["PHARMONLINE_DDP_CONNECT_BACKOFF_MAX"] = "0"
+                      started = time.monotonic()
+                      client = None
+                      try:
+                          client = _DDPClient(
+                              lambda: SOCKJS_BASE + _new_sockjs_path(),
+                              proxy_url=proxy_factory,
+                          )
+                          await asyncio.wait_for(
+                              client.__aenter__(),
+                              timeout=min(attempts * 4 + 5, 45),
+                          )
+                      except Exception as exc:
+                          fatal_reason = fatal_proxy_reason(exc)
+                          known_external = isinstance(
+                              exc,
+                              (
+                                  TimeoutError,
+                                  asyncio.TimeoutError,
+                                  OSError,
+                                  ConnectionError,
+                                  websockets.exceptions.WebSocketException,
+                              ),
+                          )
+                          if fatal_reason is not None:
+                              result = "external_failure"
+                              reason = "proxy_access_or_configuration_rejected"
+                          elif known_external:
+                              result = "external_failure"
+                              reason = "upstream_or_network_unavailable"
+                          else:
+                              result = "internal_error"
+                              reason = type(exc).__name__
+                          return (
+                              provider,
+                              result,
+                              reason,
+                              attempts,
+                              time.monotonic() - started,
+                          )
+                      finally:
+                          if client is not None:
+                              try:
+                                  await asyncio.wait_for(
+                                      client.__aexit__(None, None, None), timeout=5
+                                  )
+                              except Exception:
+                                  pass
+                      return (
+                          provider,
+                          "ok",
+                          "ddp_handshake_completed",
+                          attempts,
+                          time.monotonic() - started,
+                      )
+
+                  provider, result, reason, attempts, elapsed = asyncio.run(
+                      post_deploy_probe()
+                  )
+          except BaseException as exc:
+              print("post_probe_result=internal_error")
+              print(f"post_probe_internal_error_type={type(exc).__name__}")
+              raise SystemExit(1) from None
+
+          if (
+              provider not in {"decodo", "iproyal", "unconfigured"}
+              or result
+              not in {"ok", "external_failure", "external_config", "internal_error"}
+              or not isinstance(attempts, int)
+              or attempts < 0
+          ):
+              print("post_probe_result=internal_error")
+              print("post_probe_internal_error_type=MalformedProbeResult")
+              raise SystemExit(1)
+          print(f"post_probe_provider={provider}")
+          print(f"post_probe_result={result}")
+          print(f"post_probe_reason={reason}")
+          print(f"post_probe_attempt_budget={attempts}")
+          print(f"post_probe_elapsed_seconds={elapsed:.2f}")
+          if result == "internal_error":
+              print("post_probe_gate=failed_internal")
+              raise SystemExit(1)
+          if result == "ok":
+              print("post_probe_gate=passed")
+          else:
+              print("post_probe_gate=warning_external")
+          PY
+          REMOTE
+          trap - ERR INT TERM
+
+      - name: Retry rollback after failed deploy or verification
+        id: rollback_retry
+        if: ${{ always() && inputs.mode == 'deploy' && (steps.deploy.outcome == 'failure' || steps.deploy.outcome == 'cancelled' || (steps.deploy.outcome == 'success' && steps.verify.outcome != 'success')) }}
+        env:
+          BACKUP_DIR: /opt/pharmacy-monitor/data/hotfix-backups/hotfix-gha-${{ github.run_id }}-${{ github.run_attempt }}/src
         run: |
           set -euo pipefail
-          local_health=$(sha256sum src/health.py | awk '{print $1}')
-          local_intraday=$(sha256sum src/intraday.py | awk '{print $1}')
-          local_ddp=$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print $1}')
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 "set -euo pipefail
-            cd /opt/pharmacy-monitor
-            test \"\$(sha256sum src/health.py | awk '{print \$1}')\" = '$local_health'
-            test \"\$(sha256sum src/intraday.py | awk '{print \$1}')\" = '$local_intraday'
-            test \"\$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print \$1}')\" = '$local_ddp'
-            .venv/bin/python -m py_compile \
-              src/health.py src/intraday.py src/scrapers/pharmonline_ddp.py
-            .venv/bin/python -c \"from src.intraday import INTRADAY_SITES; \
-              print('production INTRADAY_SITES=', INTRADAY_SITES); \
-              assert INTRADAY_SITES == ('aloe',)\"
-            db_url=\$(grep -m1 '^DATABASE_URL=' /etc/pharmacy-monitor/env | cut -d= -f2-)
-            test -n \"\$db_url\"
-            output=\$(DATABASE_URL=\"\$db_url\" .venv/bin/pharmacy-monitor health-check \
-              --quiet-on-ok 2>&1) || rc=\$?
-            printf '%s\\n' \"\$output\"
-            case \"\$output\" in *Traceback*) exit 1 ;; esac
-            test \"\${rc:-0}\" -le 1"
+          backup_dir=$BACKUP_DIR
+          [[ "$backup_dir" =~ ^/opt/pharmacy-monitor/data/hotfix-backups/hotfix-gha-[0-9]+-[0-9]+/src$ ]]
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+            "bash -s -- $backup_dir" <<'ROLLBACK'
+          set -u
+          backup_dir=$1
+          [[ "$backup_dir" =~ ^/opt/pharmacy-monitor/data/hotfix-backups/hotfix-gha-[0-9]+-[0-9]+/src$ ]] \
+            || { printf 'invalid backup path; rollback retry refused\n' >&2; exit 1; }
+
+          backup_complete=1
+          for source_file in \
+            "$backup_dir/main.py" \
+            "$backup_dir/scrapers/pharmonline_ddp.py" \
+            "$backup_dir/health.py" \
+            "$backup_dir/notifier.py"
+          do
+            if ! test -r "$source_file"; then
+              printf 'rollback retry source missing: %s\n' "$source_file" >&2
+              backup_complete=0
+            fi
+          done
+          if [ "$backup_complete" -eq 0 ]; then
+            printf 'rollback retry: no completed backup; no live writes were started\n'
+            exit 0
+          fi
+
+          # A pre-write gate failure needs no live rewrite.  This also makes
+          # cleanup an idempotent retry after a successful trap rollback.
+          if cmp -s "$backup_dir/main.py" /opt/pharmacy-monitor/src/main.py \
+            && cmp -s "$backup_dir/scrapers/pharmonline_ddp.py" \
+              /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py \
+            && cmp -s "$backup_dir/health.py" /opt/pharmacy-monitor/src/health.py \
+            && cmp -s "$backup_dir/notifier.py" /opt/pharmacy-monitor/src/notifier.py
+          then
+            printf 'rollback retry: live files already match backup\n'
+            exit 0
+          fi
+
+          rollback_failed=0
+          restore_file() {
+            source_file=$1
+            target_file=$2
+            temp_file=$(mktemp "${target_file}.rollback.XXXXXX") || return 1
+            if ! cp -p "$source_file" "$temp_file" \
+              || ! cmp -s "$source_file" "$temp_file" \
+              || ! mv -f "$temp_file" "$target_file" \
+              || ! cmp -s "$source_file" "$target_file"
+            then
+              rm -f -- "$temp_file"
+              return 1
+            fi
+          }
+
+          # Preserve compatibility: dependencies move back only after main.py.
+          if restore_file "$backup_dir/main.py" /opt/pharmacy-monitor/src/main.py; then
+            restore_file "$backup_dir/scrapers/pharmonline_ddp.py" \
+              /opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py || rollback_failed=1
+            restore_file "$backup_dir/health.py" /opt/pharmacy-monitor/src/health.py \
+              || rollback_failed=1
+            restore_file "$backup_dir/notifier.py" /opt/pharmacy-monitor/src/notifier.py \
+              || rollback_failed=1
+          else
+            printf 'main rollback retry failed; keeping new dependencies\n' >&2
+            rollback_failed=1
+          fi
+          cd /opt/pharmacy-monitor
+          .venv/bin/python -m py_compile \
+            src/main.py src/scrapers/pharmonline_ddp.py src/health.py src/notifier.py \
+            || rollback_failed=1
+          if [ "$rollback_failed" -ne 0 ]; then
+            printf 'rollback retry incomplete; backup=%s\n' "$backup_dir" >&2
+            exit 1
+          fi
+          printf 'rollback retry complete; backup=%s\n' "$backup_dir"
+          ROLLBACK

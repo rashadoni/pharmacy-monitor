@@ -66,6 +66,315 @@ class _FakeLockFactory:
         self.kw = {"bind": _FakeLockEngine(connection)}
 
 
+def test_health_alert_state_write_is_atomic(tmp_path, monkeypatch):
+    import json
+
+    state_path = tmp_path / "nested" / "health.json"
+    state = {
+        "version": 2,
+        "status": "active",
+        "signature": "incident",
+        "last_sent_at": "2026-08-20T10:00:00",
+    }
+    real_replace = main_mod.os.replace
+    replacements = []
+
+    def tracked_replace(source, destination):
+        replacements.append((source, destination))
+        assert source.parent == state_path.parent
+        assert destination == state_path
+        real_replace(source, destination)
+
+    monkeypatch.setattr(main_mod.os, "replace", tracked_replace)
+    main_mod._write_health_alert_state(str(state_path), state)
+
+    assert json.loads(state_path.read_text()) == state
+    assert len(replacements) == 1
+    assert list(state_path.parent.glob(".health.json.*.tmp")) == []
+
+
+def test_read_health_alert_state_validates_v2_and_legacy_schema(tmp_path):
+    import json
+
+    state_path = tmp_path / "health.json"
+    valid_states = [
+        {
+            "version": 2,
+            "status": "active",
+            "signature": "incident",
+            "last_sent_at": "2026-08-20T10:00:00",
+        },
+        {
+            "version": 2,
+            "status": "ok",
+            "signature": None,
+            "last_sent_at": "2026-08-20T10:00:00+00:00",
+        },
+        {"signature": "site_silent:pharmonline", "sent_at": "2026-08-20T10:00:00"},
+    ]
+    for state in valid_states:
+        state_path.write_text(json.dumps(state))
+        assert main_mod._read_health_alert_state(str(state_path)) == state
+
+    invalid_states = [
+        {},
+        {"status": "active"},
+        {"version": 2, "status": "active", "last_sent_at": "2026-08-20T10:00:00"},
+        {"version": 2, "status": "active", "signature": "x", "last_sent_at": "bad"},
+        {
+            "version": 2,
+            "status": "ok",
+            "signature": "must-be-none",
+            "last_sent_at": "2026-08-20T10:00:00",
+        },
+        {"version": 3, "status": "active", "signature": "x", "last_sent_at": "2026-08-20T10:00:00"},
+        {"signature": "legacy", "sent_at": "bad"},
+    ]
+    for state in invalid_states:
+        state_path.write_text(json.dumps(state))
+        assert main_mod._read_health_alert_state(str(state_path)) is None
+
+
+def test_malformed_state_sends_no_false_recovery_but_problem_starts_incident(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from src.health import HealthIssue, HealthReport
+
+    state_path = tmp_path / "health.json"
+    state_path.write_text(json.dumps({"status": "active"}))
+    sent = []
+    monkeypatch.setattr(
+        main_mod.notifier,
+        "send_email",
+        lambda **kwargs: sent.append(kwargs) or True,
+    )
+
+    assert (
+        main_mod._dispatch_health_alert_email(
+            HealthReport(status="ok"),
+            alert_state_file=str(state_path),
+            reminder_hours=24,
+            now=main_mod.utcnow(),
+        )
+        is None
+    )
+    assert sent == []
+
+    action = main_mod._dispatch_health_alert_email(
+        HealthReport(
+            status="warning",
+            issues=[HealthIssue("warning", "site_silent", "silent", {"site": "aloe"})],
+        ),
+        alert_state_file=str(state_path),
+        reminder_hours=24,
+        now=main_mod.utcnow(),
+    )
+    assert action == "incident"
+    assert len(sent) == 1
+    assert main_mod._read_health_alert_state(str(state_path))["status"] == "active"
+
+
+def test_health_email_dispatch_recovery_clears_active_state_and_recurrence_is_immediate(
+    tmp_path, monkeypatch
+):
+    from src.health import (
+        HealthIssue,
+        HealthReport,
+        health_alert_decision,
+        health_alert_state_after,
+    )
+
+    now = main_mod.utcnow()
+    state_path = tmp_path / "health.json"
+    problem = HealthReport(
+        status="critical",
+        issues=[HealthIssue("critical", "site_silent", "silent", {"site": "pharmonline"})],
+    )
+    healthy = HealthReport(status="ok")
+    initial = health_alert_decision(problem, None, now=now, reminder_hours=24)
+    main_mod._write_health_alert_state(
+        str(state_path),
+        health_alert_state_after(initial, None, now=now),
+    )
+    sent = []
+    monkeypatch.setattr(
+        main_mod.notifier,
+        "send_email",
+        lambda **kwargs: sent.append(kwargs) or True,
+    )
+
+    action = main_mod._dispatch_health_alert_email(
+        healthy,
+        alert_state_file=str(state_path),
+        reminder_hours=24,
+        now=now + timedelta(hours=1),
+    )
+    assert action == "recovery"
+    assert sent[-1]["subject"] == "Pharmacy Monitor — RECOVERED"
+    recovered_state = main_mod._read_health_alert_state(str(state_path))
+    assert recovered_state["status"] == "ok"
+    assert recovered_state["signature"] is None
+
+    assert (
+        main_mod._dispatch_health_alert_email(
+            healthy,
+            alert_state_file=str(state_path),
+            reminder_hours=24,
+            now=now + timedelta(hours=2),
+        )
+        is None
+    )
+    assert len(sent) == 1
+
+    action = main_mod._dispatch_health_alert_email(
+        problem,
+        alert_state_file=str(state_path),
+        reminder_hours=24,
+        now=now + timedelta(hours=2),
+    )
+    assert action == "incident"
+    assert sent[-1]["subject"] == "Pharmacy Monitor — CRITICAL"
+
+
+def test_health_email_dispatch_healthy_without_active_incident_stays_silent(tmp_path, monkeypatch):
+    from src.health import HealthReport
+
+    sent = []
+    monkeypatch.setattr(
+        main_mod.notifier,
+        "send_email",
+        lambda **kwargs: sent.append(kwargs) or True,
+    )
+
+    assert (
+        main_mod._dispatch_health_alert_email(
+            HealthReport(status="ok"),
+            alert_state_file=str(tmp_path / "missing.json"),
+            reminder_hours=24,
+            now=main_mod.utcnow(),
+        )
+        is None
+    )
+    assert sent == []
+
+
+def test_health_email_delivery_failure_leaves_active_state_unchanged(tmp_path, monkeypatch):
+    import pytest
+
+    from src.health import (
+        HealthIssue,
+        HealthReport,
+        health_alert_decision,
+        health_alert_state_after,
+    )
+
+    now = main_mod.utcnow()
+    state_path = tmp_path / "health.json"
+    problem = HealthReport(
+        status="warning",
+        issues=[HealthIssue("warning", "site_silent", "silent", {"site": "pharmonline"})],
+    )
+    initial = health_alert_decision(problem, None, now=now, reminder_hours=24)
+    active_state = health_alert_state_after(initial, None, now=now)
+    main_mod._write_health_alert_state(str(state_path), active_state)
+
+    def fail_delivery(**_kwargs):
+        raise RuntimeError("smtp unavailable")
+
+    monkeypatch.setattr(main_mod.notifier, "send_email", fail_delivery)
+    with pytest.raises(RuntimeError, match="smtp unavailable"):
+        main_mod._dispatch_health_alert_email(
+            HealthReport(status="ok"),
+            alert_state_file=str(state_path),
+            reminder_hours=24,
+            now=now + timedelta(hours=1),
+        )
+
+    assert main_mod._read_health_alert_state(str(state_path)) == active_state
+
+
+def test_health_email_smtp_skip_does_not_persist_incident_state(tmp_path, monkeypatch):
+    import pytest
+
+    from src.health import HealthIssue, HealthReport
+
+    state_path = tmp_path / "health.json"
+    monkeypatch.setattr(main_mod.notifier, "send_email", lambda **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match="SMTP is not configured"):
+        main_mod._dispatch_health_alert_email(
+            HealthReport(
+                status="warning",
+                issues=[HealthIssue("warning", "site_silent", "silent", {"site": "aloe"})],
+            ),
+            alert_state_file=str(state_path),
+            reminder_hours=24,
+            now=main_mod.utcnow(),
+        )
+
+    assert not state_path.exists()
+
+
+def test_health_check_quiet_ok_still_dispatches_recovery(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+
+    from src import health
+    from src.health import (
+        HealthIssue,
+        HealthReport,
+        health_alert_decision,
+        health_alert_state_after,
+    )
+
+    now = main_mod.utcnow()
+    state_path = tmp_path / "health.json"
+    problem = HealthReport(
+        status="warning",
+        issues=[HealthIssue("warning", "full_catalog_unverified", "degraded")],
+    )
+    initial = health_alert_decision(problem, None, now=now, reminder_hours=24)
+    main_mod._write_health_alert_state(
+        str(state_path),
+        health_alert_state_after(initial, None, now=now),
+    )
+    sent = []
+    monkeypatch.setattr(main_mod.storage, "init_db", lambda: None)
+    monkeypatch.setattr(main_mod.storage, "make_session", lambda: lambda: nullcontext(object()))
+    monkeypatch.setattr(health, "check_health", lambda *_args, **_kwargs: HealthReport(status="ok"))
+    monkeypatch.setattr(
+        main_mod.notifier,
+        "send_email",
+        lambda **kwargs: sent.append(kwargs) or True,
+    )
+
+    result = CliRunner().invoke(
+        main_mod.cli,
+        [
+            "health-check",
+            "--alert-email",
+            "--quiet-on-ok",
+            "--alert-state-file",
+            str(state_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output == ""
+    assert sent[0]["subject"] == "Pharmacy Monitor — RECOVERED"
+    assert main_mod._read_health_alert_state(str(state_path))["status"] == "ok"
+
+
+def test_health_check_default_reminder_is_24_hours():
+    option = next(
+        parameter
+        for parameter in main_mod.health_check_cmd.params
+        if parameter.name == "alert_cooldown_hours"
+    )
+    assert option.default == 24.0
+
+
 def test_scrape_lock_busy_closes_dedicated_connection():
     connection = _FakeLockConnection(acquired=False)
 

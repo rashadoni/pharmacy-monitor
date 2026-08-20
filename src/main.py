@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta
 from src._time import utcnow
 from pathlib import Path
 
@@ -1011,7 +1011,16 @@ def run_quality_message(status: str, quality: dict) -> str | None:
         if details.get("status") == "ok":
             continue
         reasons = ",".join(details.get("reasons") or ["unknown"])
-        fragments.append(f"{site}={details.get('status')}({reasons})")
+        fragment = f"{site}={details.get('status')}({reasons})"
+        # Site-fatal errors have already passed through
+        # site_fatal_error_message/site_fatal_result.  Retain one bounded cause
+        # in Run.error_message so operators can diagnose a failed producer
+        # without recovering it from an exception traceback.
+        if details.get("site_fatal"):
+            errors = details.get("errors") or []
+            if errors:
+                fragment += f": {str(errors[0])[:500]}"
+        fragments.append(fragment)
     if not fragments:
         fragments.append("no requested scrape work produced a valid result")
     return f"run quality {status}: " + "; ".join(fragments)
@@ -1731,30 +1740,153 @@ def reap_stale_runs_cmd(max_age_hours: float, reason: str) -> None:
 
 
 def _read_health_alert_state(path: str) -> dict | None:
-    """Прочитать состояние последнего отправленного health-алерта (для дедупа)."""
+    """Read the persisted health-email state, rejecting malformed payloads."""
     import json
-    from pathlib import Path
 
     try:
-        return json.loads(Path(path).read_text())
+        state = json.loads(Path(path).read_text())
     except (FileNotFoundError, ValueError, OSError):
         return None
+    if not isinstance(state, dict):
+        return None
+
+    def valid_timestamp(value) -> bool:
+        if not isinstance(value, str) or not value.strip():
+            return False
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return False
+        return True
+
+    version = state.get("version")
+    if type(version) is int and version == 2:
+        status = state.get("status")
+        signature = state.get("signature")
+        last_sent_at = state.get("last_sent_at")
+        if not valid_timestamp(last_sent_at):
+            return None
+        if status == "active":
+            if not isinstance(signature, str) or not signature.strip():
+                return None
+            normalized = {
+                "version": 2,
+                "status": "active",
+                "signature": signature,
+                "last_sent_at": last_sent_at,
+            }
+            incident_started_at = state.get("incident_started_at")
+            if "incident_started_at" in state and not valid_timestamp(incident_started_at):
+                return None
+            if "incident_started_at" in state:
+                normalized["incident_started_at"] = incident_started_at
+            return normalized
+        if status == "ok":
+            if signature is not None:
+                return None
+            normalized = {
+                "version": 2,
+                "status": "ok",
+                "signature": None,
+                "last_sent_at": last_sent_at,
+            }
+            if "recovered_signature" in state:
+                recovered_signature = state.get("recovered_signature")
+                if recovered_signature is not None and not isinstance(recovered_signature, str):
+                    return None
+                normalized["recovered_signature"] = recovered_signature
+            recovered_at = state.get("recovered_at")
+            if "recovered_at" in state and not valid_timestamp(recovered_at):
+                return None
+            if "recovered_at" in state:
+                normalized["recovered_at"] = recovered_at
+            return normalized
+        return None
+
+    # Legacy v1 had no explicit version/status and stored only signature+sent_at.
+    if "version" in state or "status" in state:
+        return None
+    signature = state.get("signature")
+    sent_at = state.get("sent_at")
+    if not isinstance(signature, str) or not signature.strip() or not valid_timestamp(sent_at):
+        return None
+    return {"signature": signature, "sent_at": sent_at}
 
 
-def _write_health_alert_state(path: str, signature: str) -> None:
-    """Записать подпись + время последнего отправленного алерта. Сбой записи не
-    фатален — деградируем до «слать всегда» (безопасно)."""
+def _write_health_alert_state(path: str, state: dict) -> None:
+    """Atomically persist health-email state.
+
+    The temporary file is created beside the destination, so ``os.replace`` is
+    atomic on the same filesystem. A write failure remains fail-open: the next
+    hourly check retries the notification instead of losing an incident.
+    """
     import json
-    from pathlib import Path
+    import tempfile
 
-    from src._time import utcnow
-
+    temp_path: Path | None = None
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"signature": signature, "sent_at": utcnow().isoformat()}))
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=p.parent,
+            prefix=f".{p.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(state, temp_file, sort_keys=True, separators=(",", ":"))
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, p)
+        temp_path = None
     except OSError as e:
         log.warning("health_alert_state_write_failed", path=path, error=str(e))
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _dispatch_health_alert_email(
+    report,
+    *,
+    alert_state_file: str,
+    reminder_hours: float,
+    now=None,
+) -> str | None:
+    """Send one state-machine transition email and persist it after success."""
+    from src.health import (
+        health_alert_decision,
+        health_alert_state_after,
+        render_alert_html,
+    )
+
+    transition_at = now or utcnow()
+    last_state = _read_health_alert_state(alert_state_file)
+    decision = health_alert_decision(
+        report,
+        last_state,
+        now=transition_at,
+        reminder_hours=reminder_hours,
+    )
+    if decision.action is None:
+        return None
+
+    subject = (
+        "Pharmacy Monitor — RECOVERED"
+        if decision.action == "recovery"
+        else f"Pharmacy Monitor — {report.status.upper()}"
+    )
+    delivered = notifier.send_email(subject=subject, html_body=render_alert_html(report))
+    if delivered is not True:
+        raise RuntimeError("health email was not delivered: SMTP is not configured")
+    next_state = health_alert_state_after(decision, last_state, now=transition_at)
+    _write_health_alert_state(alert_state_file, next_state)
+    return decision.action
 
 
 @cli.command("health-check")
@@ -1783,8 +1915,8 @@ def _write_health_alert_state(path: str, signature: str) -> None:
 @click.option(
     "--alert-cooldown-hours",
     type=float,
-    default=6.0,
-    help="Анти-спам: не слать ТОТ ЖЕ набор проблем чаще раза в N часов (деф. 6)",
+    default=24.0,
+    help="Напоминать о ТОМ ЖЕ активном инциденте раз в N часов (деф. 24)",
 )
 @click.option(
     "--alert-state-file",
@@ -1801,47 +1933,50 @@ def health_check_cmd(
     alert_state_file: str,
 ) -> None:
     """Проверить здоровье системы: stale/failed/empty/site-drop. Exit-code 0=ok, 1=warning, 2=critical."""
-    from src.health import check_health, render_alert_html
+    from src.health import check_health
 
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
         report = check_health(s, max_age_hours=max_age_hours, min_products=min_products)
 
-    if report.status == "ok" and quiet_on_ok:
-        return
+    quiet_healthy = report.status == "ok" and quiet_on_ok
+    if not quiet_healthy:
+        sev_emoji = {"ok": "✓", "warning": "⚠️", "critical": "🔴"}
+        click.echo(
+            f"{sev_emoji[report.status]} {report.status.upper()} — "
+            f"last run #{report.last_run_id} ({report.last_run_status}) "
+            f"at {report.last_run_at}"
+        )
+        for i in report.issues:
+            click.echo(f"  [{i.severity}] {i.code}: {i.message}")
 
-    sev_emoji = {"ok": "✓", "warning": "⚠️", "critical": "🔴"}
-    click.echo(
-        f"{sev_emoji[report.status]} {report.status.upper()} — "
-        f"last run #{report.last_run_id} ({report.last_run_status}) "
-        f"at {report.last_run_at}"
-    )
-    for i in report.issues:
-        click.echo(f"  [{i.severity}] {i.code}: {i.message}")
-
-    if alert_email and report.status != "ok":
-        from src._time import utcnow
-        from src.health import alert_due, alert_signature
-
-        sig = alert_signature(report)
-        state = _read_health_alert_state(alert_state_file)
-        if alert_due(sig, state, now=utcnow(), cooldown_hours=alert_cooldown_hours):
-            try:
-                html = render_alert_html(report)
-                notifier.send_email(
-                    subject=f"Pharmacy Monitor — {report.status.upper()}",
-                    html_body=html,
-                )
-                _write_health_alert_state(alert_state_file, sig)
-                click.echo("→ Email-алерт отправлен")
-            except Exception as e:
-                click.echo(f"⚠️ Не удалось отправить email-алерт: {e}", err=True)
-        else:
-            click.echo(
-                f"→ Email подавлен (cooldown {alert_cooldown_hours}ч — "
-                f"те же проблемы уже отправлены)"
+    # Do not return early on quiet+OK: an active incident still needs one
+    # recovery email and an atomic transition to the healthy state.
+    if alert_email:
+        try:
+            action = _dispatch_health_alert_email(
+                report,
+                alert_state_file=alert_state_file,
+                reminder_hours=alert_cooldown_hours,
             )
+            if not quiet_healthy:
+                if action == "incident":
+                    click.echo("→ Email-алерт отправлен")
+                elif action == "reminder":
+                    click.echo("→ Email-напоминание отправлено")
+                elif action == "recovery":
+                    click.echo("→ Email о восстановлении отправлен")
+                elif report.status != "ok":
+                    click.echo(
+                        f"→ Email подавлен (напоминание раз в {alert_cooldown_hours}ч — "
+                        "инцидент не изменился)"
+                    )
+        except Exception as e:
+            click.echo(f"⚠️ Не удалось отправить health email: {e}", err=True)
+
+    if quiet_healthy:
+        return
 
     # Exit code для cron-логики
     sys.exit({"ok": 0, "warning": 1, "critical": 2}[report.status])
@@ -2768,16 +2903,10 @@ def run_cmd(
                         products_scraped=count,
                     )
 
-            # A requested full scan that lost a page or even one source item is
-            # not a successful producer.  Stop before matcher, alerts, reports,
-            # or ROI publication; the exception handler records ``degraded``
-            # (distinct from a crash) and fails the queue request explicitly.
-            if is_full_catalog and not run.catalog_verified:
-                raise FullCatalogVerificationError(
-                    "full catalog verification failed: "
-                    f"{run.catalog_verification_reason or 'unknown reason'}"
-                )
-
+            # A total producer failure is stronger than failed full-catalog
+            # verification.  Handle it first so a one-site startup outage stays
+            # ``failed``; a multi-site run with a healthy peer is ``degraded``
+            # and follows the verification branch below.
             if quality_status == "failed":
                 run.finished_at = utcnow()
                 session.commit()
@@ -2787,6 +2916,18 @@ def run_cmd(
                     quality=quality,
                 )
                 raise RunQualityFailure(run.error_message or "run quality failed")
+
+            # A requested full scan that lost a page or even one source item is
+            # not a successful producer.  Stop before matcher, alerts, reports,
+            # or ROI publication; the exception handler records ``degraded``
+            # (distinct from a crash) and fails the queue request explicitly.
+            if is_full_catalog and not run.catalog_verified:
+                quality_detail = f"; {run.error_message}" if run.error_message else ""
+                raise FullCatalogVerificationError(
+                    "full catalog verification failed: "
+                    f"{run.catalog_verification_reason or 'unknown reason'}"
+                    f"{quality_detail}"
+                )
 
             if quality_status == "degraded":
                 log.warning(

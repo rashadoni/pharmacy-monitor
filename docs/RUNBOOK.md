@@ -75,6 +75,17 @@ Exit-code:
 - `1` — warning
 - `2` — critical (требуется вмешательство)
 
+Health-email работает как состояние инцидента, даже если проверка запускается
+каждый час:
+
+- новая проблема или изменение набора/уровня проблем отправляется сразу;
+- неизменившийся инцидент напоминается не чаще одного раза в 24 часа
+  (`--alert-cooldown-hours` меняет интервал);
+- первый успешный health-check после активного инцидента отправляет одно письмо
+  `Pharmacy Monitor — RECOVERED`; следующие успешные проверки молчат;
+- состояние хранится атомарно в `data/health_alert_state.json` (или в
+  `HEALTH_ALERT_STATE_FILE`) и обновляется только после подтверждённой SMTP-отправки.
+
 ### Посмотреть логи
 
 ```bash
@@ -394,7 +405,7 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
 
 | Сайт | Где | Чем | Proxy |
 |---|---|---|---|
-| **pharmonline.az** | Hetzner prod | **Meteor DDP WebSocket** (`src/scrapers/pharmonline_ddp.py`) | IPRoyal residential `geo.iproyal.com:12321` |
+| **pharmonline.az** | Hetzner prod | **Meteor DDP WebSocket** (`src/scrapers/pharmonline_ddp.py`) | Decodo AZ residential (IPRoyal only if Decodo is disabled) |
 | **aloe.az** | Hetzner prod | RSC/HTTP parser (`src/scrapers/aloe.py`) | Direct (no proxy needed) |
 | **aptekonline.az** | Hetzner prod | httpx JSON API (`src/scrapers/aptekonline.py`) | Decodo AZ residential |
 
@@ -404,6 +415,43 @@ Mac scraping is retired. `com.pharmacy-monitor.scrape` and
 set for an explicit disaster-recovery run.
 
 ### DDP recovery procedures
+
+**`catalog_verification_reason=pending` + failed full run**:
+- прогон оборвался до проверки каталога. Само значение `pending` не отличает
+  DDP startup от более позднего исключения до verification; `site_drop` при
+  этом является следствием старых данных, а не причиной падения;
+- для run `#656` публичный `/health` не содержит `error_message`, поэтому точную
+  причину брать только из строки Run или journal. Исторический run `#629` падал
+  на `timed out during opening handshake`, но это лишь диагностическая гипотеза
+  для `#656`, пока не прочитан его собственный error;
+- сначала посмотреть сохранённый `Run.error_message` и
+  `journalctl -u pharmacy-monitor-scrape@pharmonline.service --since '9 days ago'`;
+- проверить только безопасные признаки конфигурации: что `pharmonline` входит в
+  `DECODO_SITES`, заданы оба credential-поля, доступны все порты из
+  `DECODO_PORTS`, а в аккаунте Decodo есть баланс. Значения credentials не
+  печатать и не передавать в issue/log;
+- HTTP 402/407 означает баланс/credentials: исправить аккаунт/config и выполнить
+  один штатный full run. Таймаут после перебора всех sticky-портов означает
+  проблему WebSocket tunnel/exit pool; не маскировать её повышением health-порога;
+- восстановление подтверждено только когда full run имеет `status=ok`,
+  `catalog_verified=true`, а `MAX(products.last_seen_at)` для pharmonline свежий.
+
+Startup timeout/OSError/402/407 теперь превращается в sanitized
+`SiteScrapeFatalError: DDP startup failed: ...` без исходной exception-chain
+(`raise ... from None`). Это важно: proxy-библиотека может включить сырой URL с
+credentials в исключение, а `run_cmd` печатает traceback через `log.exception`.
+`scrape_site` перехватывает этот тип и возвращает структурированный
+`ScrapeResult(site_fatal=true)`, поэтому параллельный успешный сайт не отменяется
+через `asyncio.gather`. Первая безопасная причина сохраняется в `run_quality` и
+`Run.error_message` в ограниченном размере.
+
+Классификация выполняется до full-catalog verification: если все запрошенные
+сайты (в том числе единственный Pharmonline) завершились `site_fatal`, run имеет
+статус `failed`; если хотя бы один другой сайт отдал пригодный результат, общий
+run имеет статус `degraded`, сохраняет этот результат и затем fail-closed
+останавливается на проверке полного каталога. Не выбрасывать из `__aenter__`
+другой startup-тип, который обойдёт `scrape_site`: он отменит peer-задачи и
+потеряет уже полученные здоровые результаты.
 
 **HTTP 403 на WebSocket handshake** (наблюдалось 2026-05-27):
 - Cloudflare/IPRoyal session ban после high-volume scrape

@@ -9,7 +9,13 @@ from sqlalchemy.orm import sessionmaker
 from src import main as main_mod
 from src import storage
 from src._time import utcnow
-from src.scrapers.base import RouteStatus, ScrapedProduct, ScrapeResult
+from src.scrapers.base import (
+    RouteStatus,
+    ScrapedProduct,
+    ScrapeResult,
+    SiteScrapeFatalError,
+    site_fatal_result,
+)
 
 
 def _session_factory(db_session):
@@ -552,6 +558,211 @@ def test_incomplete_full_run_is_degraded_and_stops_before_consumers(db_session, 
     finally:
         verify.close()
     assert calls == {"match": 0, "alerts": 0, "analyze": 0, "roi": 0}
+
+
+def test_single_site_startup_failure_stays_failed_with_sanitized_cause(
+    db_session, monkeypatch
+):
+    from src import alerts, roi
+
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add(request)
+    db_session.commit()
+    request_id = request.id
+    calls = {"match": 0, "alerts": 0, "analyze": 0, "roi": 0}
+
+    async def fake_scrape_all(*args, **kwargs):
+        return [
+            site_fatal_result(
+                "pharmonline",
+                ["cat"],
+                SiteScrapeFatalError(
+                    "DDP startup failed: OSError: opening handshake via "
+                    "http://proxy-user:run-secret@az.decodo.com:30001 timed out"
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(storage, "init_db", lambda: None)
+    monkeypatch.setattr(storage, "make_session", lambda: _session_factory(db_session))
+    monkeypatch.setattr(main_mod, "maybe_seed_categories", lambda session: None)
+    monkeypatch.setattr(
+        main_mod.watchlist,
+        "categories_for_site",
+        lambda session, site, only_category_id=None: ["cat"],
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "baselines_for_sites",
+        lambda *args, **kwargs: {"pharmonline": 1},
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "run_quality_baselines_for_sites",
+        lambda *args, **kwargs: {"pharmonline": 1},
+    )
+    monkeypatch.setattr(main_mod, "scrape_all", fake_scrape_all)
+    monkeypatch.setattr(main_mod, "persist_results", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(main_mod, "persist_aloe_country_mappings", lambda *args: None)
+    monkeypatch.setattr(main_mod, "load_aloe_country_map", lambda *args: {})
+    monkeypatch.setattr(
+        main_mod.matcher,
+        "match_products",
+        lambda session: calls.__setitem__("match", calls["match"] + 1),
+    )
+    monkeypatch.setattr(
+        alerts,
+        "evaluate_rules",
+        lambda *args: calls.__setitem__("alerts", calls["alerts"] + 1),
+    )
+    monkeypatch.setattr(
+        main_mod.analyzer,
+        "analyze",
+        lambda *args: calls.__setitem__("analyze", calls["analyze"] + 1),
+    )
+    monkeypatch.setattr(
+        roi,
+        "refresh_all_cached_actions",
+        lambda *args, **kwargs: calls.__setitem__("roi", calls["roi"] + 1),
+    )
+
+    result = CliRunner().invoke(
+        main_mod.cli,
+        [
+            "run",
+            "--site",
+            "pharmonline",
+            "--mode",
+            "category",
+            "--request-id",
+            str(request_id),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "run quality failed" in result.output
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        saved_request = verify.get(storage.ScrapeRequest, request_id)
+        assert run is not None
+        assert run.status == "failed"
+        assert run.catalog_verified is False
+        assert run.run_quality["sites"]["pharmonline"]["status"] == "failed"
+        assert "DDP startup failed" in (run.error_message or "")
+        assert "[redacted-proxy-url]" in (run.error_message or "")
+        assert "run-secret" not in (run.error_message or "")
+        assert "az.decodo.com" not in (run.error_message or "")
+        assert saved_request is not None
+        assert saved_request.status == "failed"
+        assert saved_request.run_id == run.id
+    finally:
+        verify.close()
+    assert calls == {"match": 0, "alerts": 0, "analyze": 0, "roi": 0}
+
+
+def test_multi_site_startup_failure_is_degraded_and_keeps_healthy_result(
+    db_session, monkeypatch
+):
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add(request)
+    db_session.commit()
+    request_id = request.id
+    persisted_sites = []
+
+    async def fake_scrape_all(*args, **kwargs):
+        return [
+            site_fatal_result(
+                "pharmonline",
+                ["cat"],
+                SiteScrapeFatalError("DDP startup failed: TimeoutError: handshake timed out"),
+            ),
+            ScrapeResult(
+                site="aloe",
+                products=[
+                    ScrapedProduct(
+                        site="aloe",
+                        external_id="healthy-sku",
+                        url="https://aloe.example/healthy-sku",
+                        name="Healthy SKU",
+                        category="cat",
+                    )
+                ],
+                category_counts={"cat": 1},
+                route_statuses={
+                    "cat": RouteStatus(
+                        complete=True,
+                        expected_pages=1,
+                        visited_pages=1,
+                        raw_items=1,
+                        parsed_items=1,
+                        expected_items=1,
+                    )
+                },
+            ),
+        ]
+
+    def fake_persist(session, run, results):
+        persisted_sites.extend(result.site for result in results)
+        return sum(len(result.products) for result in results)
+
+    monkeypatch.setattr(storage, "init_db", lambda: None)
+    monkeypatch.setattr(storage, "make_session", lambda: _session_factory(db_session))
+    monkeypatch.setattr(main_mod, "maybe_seed_categories", lambda session: None)
+    monkeypatch.setattr(
+        main_mod.watchlist,
+        "categories_for_site",
+        lambda session, site, only_category_id=None: ["cat"],
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "baselines_for_sites",
+        lambda *args, **kwargs: {"pharmonline": 1, "aloe": 1},
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "run_quality_baselines_for_sites",
+        lambda *args, **kwargs: {"pharmonline": 1, "aloe": 1},
+    )
+    monkeypatch.setattr(main_mod, "scrape_all", fake_scrape_all)
+    monkeypatch.setattr(main_mod, "persist_results", fake_persist)
+    monkeypatch.setattr(main_mod, "persist_aloe_country_mappings", lambda *args: None)
+    monkeypatch.setattr(main_mod, "load_aloe_country_map", lambda *args: {})
+
+    result = CliRunner().invoke(
+        main_mod.cli,
+        [
+            "run",
+            "--site",
+            "pharmonline",
+            "--site",
+            "aloe",
+            "--mode",
+            "category",
+            "--request-id",
+            str(request_id),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "full catalog verification failed" in result.output
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        saved_request = verify.get(storage.ScrapeRequest, request_id)
+        assert run is not None
+        assert run.status == "degraded"
+        assert run.products_scraped == 1
+        assert run.products_per_site == {"pharmonline": 0, "aloe": 1}
+        assert run.run_quality["sites"]["pharmonline"]["status"] == "failed"
+        assert run.run_quality["sites"]["aloe"]["status"] == "ok"
+        assert "DDP startup failed" in (run.error_message or "")
+        assert saved_request is not None
+        assert saved_request.status == "degraded"
+        assert saved_request.run_id == run.id
+    finally:
+        verify.close()
+    assert persisted_sites == ["pharmonline", "aloe"]
 
 
 def test_scrape_command_is_non_publishing_diagnostic_producer(db_session, monkeypatch):

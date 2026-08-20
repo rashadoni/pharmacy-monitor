@@ -177,7 +177,7 @@ def test_send_email_skip_without_smtp_host(monkeypatch, caplog):
     """SMTP_HOST не задан → silent skip (не raise)."""
     monkeypatch.delenv("SMTP_HOST", raising=False)
     # Должно не упасть и не вызвать smtplib
-    notifier.send_email("Subject", "<p>html</p>")
+    assert notifier.send_email("Subject", "<p>html</p>") is False
 
 
 def test_send_email_no_recipients_raises(monkeypatch):
@@ -230,7 +230,7 @@ def test_send_email_sends_via_smtplib(monkeypatch):
             sent["subject"] = msg["Subject"]
 
     monkeypatch.setattr("smtplib.SMTP", FakeSMTP)
-    notifier.send_email("Test subject", "<p>Body</p>", to=["explicit@x"])
+    assert notifier.send_email("Test subject", "<p>Body</p>", to=["explicit@x"]) is True
     assert sent["host"] == "smtp.example.com"
     assert sent["port"] == 587
     assert sent["user"] == "u@x"
@@ -271,11 +271,14 @@ def test_send_email_with_attachment(monkeypatch):
             captured_messages.append(msg)
 
     monkeypatch.setattr("smtplib.SMTP", FakeSMTP)
-    notifier.send_email(
-        "S",
-        "<p>x</p>",
-        attachments=[("report.xlsx", b"fake-xlsx", "application/vnd.ms-excel")],
-        to=["r@x"],
+    assert (
+        notifier.send_email(
+            "S",
+            "<p>x</p>",
+            attachments=[("report.xlsx", b"fake-xlsx", "application/vnd.ms-excel")],
+            to=["r@x"],
+        )
+        is True
     )
     msg = captured_messages[0]
     # Walk через части — должна быть attachment с filename

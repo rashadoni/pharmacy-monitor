@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal
@@ -26,6 +27,7 @@ from src.storage import PriceSnapshot, Product, Run
 log = structlog.get_logger()
 
 Severity = Literal["ok", "warning", "critical"]
+HealthAlertAction = Literal["incident", "reminder", "recovery"]
 
 
 @dataclass
@@ -47,6 +49,15 @@ class HealthReport:
     @property
     def is_healthy(self) -> bool:
         return self.status == "ok"
+
+
+@dataclass(frozen=True)
+class HealthAlertDecision:
+    """One transition in the persisted health-email state machine."""
+
+    action: HealthAlertAction | None
+    signature: str | None = None
+    previous_signature: str | None = None
 
 
 def check_health(
@@ -248,17 +259,207 @@ def check_health(
 
 
 def alert_signature(report: HealthReport) -> str:
-    """Стабильная подпись набора АКТИВНЫХ проблем (code+site) — для дедупа алертов.
+    """Return a stable identity for the active health incident.
 
-    Одинаковый набор проблем → одинаковая подпись. Изменился набор (появилась/ушла
-    проблема) → подпись другая → алерт уходит сразу (новую проблему не глушим).
+    Messages and continuously changing measurements (for example
+    ``hours_silent``) are intentionally excluded so an hourly check does not
+    create a new incident every hour. Severity, issue code, direct site/status
+    identity and the nested per-site statuses used by
+    ``full_catalog_unverified`` are included so a real change is delivered
+    immediately.
     """
-    parts = sorted(
-        f"{i.code}:{i.context.get('site', '')}"
-        for i in report.issues
-        if i.severity in ("warning", "critical")
+
+    issue_keys: list[dict] = []
+    for issue in report.issues:
+        if issue.severity not in ("warning", "critical"):
+            continue
+
+        context: dict = {}
+        for key in ("site", "status", "site_status", "catalog_scope"):
+            value = issue.context.get(key)
+            if value is not None:
+                context[key] = value
+
+        nested_sites = issue.context.get("sites")
+        if isinstance(nested_sites, dict):
+            normalized_sites: dict[str, dict | str | int | float | bool | None] = {}
+            for site, details in sorted(nested_sites.items(), key=lambda row: str(row[0])):
+                if isinstance(details, dict):
+                    stable_details = {
+                        key: details[key]
+                        for key in ("status", "site_status")
+                        if details.get(key) is not None
+                    }
+                    normalized_sites[str(site)] = stable_details
+                elif details is None or isinstance(details, (str, int, float, bool)):
+                    normalized_sites[str(site)] = details
+                else:
+                    normalized_sites[str(site)] = str(details)
+            context["sites"] = normalized_sites
+
+        issue_keys.append(
+            {
+                "severity": issue.severity,
+                "code": issue.code,
+                "context": context,
+            }
+        )
+
+    issue_keys.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+    return json.dumps(issue_keys, sort_keys=True, separators=(",", ":"))
+
+
+def _health_state_is_active(last_state: dict | None) -> bool:
+    if not isinstance(last_state, dict):
+        return False
+    signature = last_state.get("signature")
+    if last_state.get("version") == 2:
+        return (
+            last_state.get("status") == "active"
+            and isinstance(signature, str)
+            and bool(signature.strip())
+            and isinstance(last_state.get("last_sent_at"), str)
+        )
+    # Backward compatibility with a validated v1 {signature, sent_at} state.
+    return (
+        "version" not in last_state
+        and "status" not in last_state
+        and isinstance(signature, str)
+        and bool(signature.strip())
+        and isinstance(last_state.get("sent_at"), str)
     )
-    return "|".join(parts)
+
+
+def _legacy_alert_signature(report: HealthReport) -> str:
+    """Reproduce the v1 ``code:site`` signature for a no-spam migration."""
+
+    return "|".join(
+        sorted(
+            f"{issue.code}:{issue.context.get('site', '')}"
+            for issue in report.issues
+            if issue.severity in ("warning", "critical")
+        )
+    )
+
+
+def _health_signature_matches(
+    report: HealthReport,
+    signature: str,
+    last_state: dict | None,
+) -> bool:
+    if not isinstance(last_state, dict):
+        return False
+    if last_state.get("version") == 2:
+        return signature == last_state.get("signature")
+    is_legacy = "version" not in last_state and "status" not in last_state
+    active_issues = [
+        issue for issue in report.issues if issue.severity in ("warning", "critical")
+    ]
+    # V1 did not record severity or nested affected-site statuses. Reuse its
+    # cooldown only when that lost identity cannot hide an escalation/change;
+    # otherwise send once immediately and upgrade the state to v2.
+    legacy_identity_is_safe = bool(active_issues) and all(
+        issue.severity == "warning" and "sites" not in issue.context
+        for issue in active_issues
+    )
+    return (
+        is_legacy
+        and legacy_identity_is_safe
+        and last_state.get("signature") == _legacy_alert_signature(report)
+    )
+
+
+def health_alert_decision(
+    report: HealthReport,
+    last_state: dict | None,
+    *,
+    now: datetime,
+    reminder_hours: float,
+) -> HealthAlertDecision:
+    """Choose the next email transition for the current health report.
+
+    - a new or changed incident is sent immediately;
+    - an unchanged incident is reminded after ``reminder_hours``;
+    - the first healthy check after an active incident sends one recovery;
+    - a healthy state stays quiet until a new incident appears.
+
+    Missing or malformed incident timestamps are fail-open: the active alert is
+    sent again rather than silently lost.
+    """
+
+    previous_signature = last_state.get("signature") if isinstance(last_state, dict) else None
+    was_active = _health_state_is_active(last_state)
+
+    if report.status == "ok":
+        if was_active:
+            return HealthAlertDecision(
+                "recovery",
+                previous_signature=previous_signature,
+            )
+        return HealthAlertDecision(None)
+
+    signature = alert_signature(report)
+    if not was_active or not _health_signature_matches(report, signature, last_state):
+        return HealthAlertDecision(
+            "incident",
+            signature=signature,
+            previous_signature=previous_signature,
+        )
+
+    sent_at = None
+    if isinstance(last_state, dict):
+        sent_at = last_state.get("last_sent_at") or last_state.get("sent_at")
+    try:
+        last_sent_at = datetime.fromisoformat(sent_at)
+        elapsed = now - last_sent_at
+        # A future timestamp usually means clock skew or a malformed state.
+        # Fail open so an active incident is not suppressed indefinitely.
+        reminder_due = elapsed < timedelta(0) or elapsed >= timedelta(hours=reminder_hours)
+    except (TypeError, ValueError):
+        reminder_due = True
+
+    if reminder_due:
+        return HealthAlertDecision(
+            "reminder",
+            signature=signature,
+            previous_signature=previous_signature,
+        )
+    return HealthAlertDecision(None, signature=signature, previous_signature=previous_signature)
+
+
+def health_alert_state_after(
+    decision: HealthAlertDecision,
+    last_state: dict | None,
+    *,
+    now: datetime,
+) -> dict:
+    """Build the state persisted after a transition email was sent."""
+
+    sent_at = now.isoformat()
+    if decision.action == "recovery":
+        return {
+            "version": 2,
+            "status": "ok",
+            "signature": None,
+            "recovered_signature": decision.previous_signature,
+            "recovered_at": sent_at,
+            "last_sent_at": sent_at,
+        }
+    if decision.action not in ("incident", "reminder") or not decision.signature:
+        raise ValueError("cannot persist a health state without an email transition")
+
+    incident_started_at = sent_at
+    if decision.action == "reminder" and isinstance(last_state, dict):
+        incident_started_at = last_state.get("incident_started_at") or (
+            last_state.get("sent_at") or sent_at
+        )
+    return {
+        "version": 2,
+        "status": "active",
+        "signature": decision.signature,
+        "incident_started_at": incident_started_at,
+        "last_sent_at": sent_at,
+    }
 
 
 def alert_due(
@@ -268,22 +469,22 @@ def alert_due(
     now: datetime,
     cooldown_hours: float,
 ) -> bool:
-    """Слать ли email-алерт сейчас (анти-спам для hourly health-check).
+    """Backward-compatible low-level cooldown helper.
 
-    - набор проблем ИЗМЕНИЛСЯ (подпись другая) → слать (новую проблему не глушим);
-    - тот же набор, прошёл `cooldown_hours` с прошлой отправки → слать (напоминание);
-    - тот же набор, в пределах cooldown → НЕ слать (раньше слали каждый час = спам).
+    New health-email code should use :func:`health_alert_decision` so recovery
+    transitions are represented as well.
     """
-    if not last_state or last_state.get("signature") != signature:
+    if not _health_state_is_active(last_state) or last_state.get("signature") != signature:
         return True
-    sent_at = last_state.get("sent_at")
+    sent_at = last_state.get("last_sent_at") or last_state.get("sent_at")
     if not sent_at:
         return True
     try:
         last_dt = datetime.fromisoformat(sent_at)
+        elapsed = now - last_dt
     except (TypeError, ValueError):
         return True
-    return (now - last_dt) >= timedelta(hours=cooldown_hours)
+    return elapsed < timedelta(0) or elapsed >= timedelta(hours=cooldown_hours)
 
 
 _SITE_FRESHNESS_DAYS: dict[str, int] = {
