@@ -176,47 +176,80 @@ jobs:
                   page: int,
                   *,
                   page_size: int,
+                  sort_by: str | None,
               ) -> str:
                   query = {
                       "lng": "az",
                       "page": str(page),
                       "limit": str(page_size),
-                      "sortBy": "price_asc",
                   }
+                  if sort_by is not None:
+                      query["sortBy"] = sort_by
                   return f"{BASE_URL}/api/products?{urlencode(query)}"
 
-              global_payload = await crawlbase_json(
-                  product_url(1, page_size=GLOBAL_PAGE_SIZE)
-              )
-              global_second_payload = await crawlbase_json(
-                  product_url(2, page_size=GLOBAL_PAGE_SIZE)
-              )
-              global_rows, global_total, global_pages = rows_and_meta(global_payload)
-              global_second_rows, global_second_total, global_second_pages = rows_and_meta(
-                  global_second_payload
-              )
+              candidate_sorts = ("name_asc", "name_desc", None, "price_asc")
+              candidates: list[tuple[str, list[dict], list[dict], int, int, int, bool]] = []
+              for sort_by in candidate_sorts:
+                  global_payload = await crawlbase_json(
+                      product_url(1, page_size=GLOBAL_PAGE_SIZE, sort_by=sort_by)
+                  )
+                  global_second_payload = await crawlbase_json(
+                      product_url(2, page_size=GLOBAL_PAGE_SIZE, sort_by=sort_by)
+                  )
+                  global_rows, global_total, global_pages = rows_and_meta(global_payload)
+                  global_second_rows, global_second_total, global_second_pages = rows_and_meta(
+                      global_second_payload
+                  )
+                  global_ids = {str(row.get("_id") or "") for row in global_rows}
+                  global_second_ids = {str(row.get("_id") or "") for row in global_second_rows}
+                  valid = (
+                      bool(global_rows)
+                      and bool(global_second_rows)
+                      and global_total >= len(global_rows)
+                      and global_pages >= 2
+                      and global_total == global_second_total
+                      and global_pages == global_second_pages
+                      and len(global_ids) == len(global_rows)
+                      and len(global_second_ids) == len(global_second_rows)
+                      and not (global_ids & global_second_ids)
+                      and all(
+                          _PHARMONLINE_METEOR_ID_RE.fullmatch(value)
+                          for value in global_ids | global_second_ids
+                      )
+                  )
+                  label = sort_by or "<default>"
+                  candidates.append(
+                      (
+                          label,
+                          global_rows,
+                          global_second_rows,
+                          global_total,
+                          global_pages,
+                          len(global_ids & global_second_ids),
+                          valid,
+                      )
+                  )
+                  if valid:
+                      break
+
+              (
+                  label,
+                  global_rows,
+                  global_second_rows,
+                  global_total,
+                  global_pages,
+                  global_overlap,
+                  selected_valid,
+              ) = candidates[-1]
               global_ids = {str(row.get("_id") or "") for row in global_rows}
               global_second_ids = {str(row.get("_id") or "") for row in global_second_rows}
-              if (
-                  not global_rows
-                  or not global_second_rows
-                  or global_total < len(global_rows)
-                  or global_pages < 2
-                  or global_total != global_second_total
-                  or global_pages != global_second_pages
-                  or len(global_ids) != len(global_rows)
-                  or len(global_second_ids) != len(global_second_rows)
-                  or global_ids & global_second_ids
-                  or not all(
-                      _PHARMONLINE_METEOR_ID_RE.fullmatch(value)
-                      for value in global_ids | global_second_ids
+              if not selected_valid:
+                  evidence = "; ".join(
+                      f"{sort}:items={len(first)}/{len(second)},total={total},pages={pages},overlap={overlap}"
+                      for sort, first, second, total, pages, overlap, _valid in candidates
                   )
-              ):
                   raise SystemExit(
-                      "public global catalog pagination is incomplete: "
-                      f"page1=(items={len(global_rows)}, total={global_total}, pages={global_pages}), "
-                      f"page2=(items={len(global_second_rows)}, total={global_second_total}, pages={global_second_pages}), "
-                      f"overlap={len(global_ids & global_second_ids)}"
+                      "no stable public global pagination order: " + evidence
                   )
 
               # Read-only DB evidence: current API IDs and canonical paths must
@@ -258,8 +291,9 @@ jobs:
               sample_keys = sorted(sample_rows[0])[:30]
               print(
                   "Pharmonline public API probe OK: "
+                  f"sort_by={label}, "
                   f"global_total={global_total}, global_pages={global_pages}, "
-                  f"global_page_size={len(global_rows)}, global_page_overlap={len(global_ids & global_second_ids)}, "
+                  f"global_page_size={len(global_rows)}, global_page_overlap={global_overlap}, "
                   f"sample_fields={sample_keys}, database_transaction=read_only"
               )
 
