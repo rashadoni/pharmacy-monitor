@@ -81,17 +81,9 @@ jobs:
           test "$host_fingerprint" = \
             'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
 
-      - name: Check production capacity and exact staged source
+      - name: Check production capacity and scraper state
         run: |
           set -euo pipefail
-          local_sha=$(sha256sum src/scrapers/pharmonline_public_api.py | awk '{print $1}')
-          remote_sha=$(ssh -i ~/.ssh/id_ed25519 \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=15 \
-            pm@46.225.149.52 \
-            "sha256sum /opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py" | awk '{print $1}')
-          test "$local_sha" = "$remote_sha"
           ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -122,23 +114,204 @@ jobs:
           test "$swap_after_kib" -le "$swap_before_kib"
           test "$disk_available_kib" -ge "$min_disk_kib"
           test "$user_slice_bytes" -lt "$max_user_slice_bytes"
-          if systemctl is-active --quiet pharmacy-monitor-scrape@pharmonline.service; then
-            echo "refusing recovery: a Pharmonline scrape is already active" >&2
-            exit 1
-          fi
+          for unit in \
+            pharmacy-monitor-scrape@pharmonline.service \
+            pharmacy-monitor-health.service
+          do
+            if systemctl is-active --quiet "$unit"; then
+              echo "refusing recovery: $unit is active" >&2
+              exit 1
+            fi
+          done
           REMOTE
 
-      - name: Run guarded full Decodo public-API recovery
+      - name: Back up and upload exact Decodo recovery source off-path
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 \
+          remote_backup=$(ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
             pm@46.225.149.52 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd /opt/pharmacy-monitor
-          # Preserve dollar signs and other literal credential characters.
+          backup_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-decodo-recovery.XXXXXX)
+          mkdir -p "$backup_dir/original/src/scrapers" \
+            "$backup_dir/staged/src/scrapers"
+
+          backup_one() {
+            relative_path=$1
+            marker=$2
+            target="/opt/pharmacy-monitor/$relative_path"
+            original="$backup_dir/original/$relative_path"
+            if [ -f "$target" ]; then
+              cp -p -- "$target" "$original"
+              : > "$backup_dir/$marker"
+            fi
+          }
+
+          backup_one src/main.py src_main_py.preexisting
+          backup_one src/scrapers/pharmonline_public_api.py public_api_py.preexisting
+          printf '%s' "$backup_dir"
+          REMOTE
+          )
+          case "$remote_backup" in
+            /opt/pharmacy-monitor/.codex-decodo-recovery.*) ;;
+            *)
+              echo "unexpected remote Decodo recovery backup path" >&2
+              exit 1
+              ;;
+          esac
+          echo "REMOTE_BACKUP_DIR=$remote_backup" >> "$GITHUB_ENV"
+
+          for file in src/main.py src/scrapers/pharmonline_public_api.py
+          do
+            local_sha=$(sha256sum "$file" | awk '{print $1}')
+            remote_stage="$remote_backup/staged/$file"
+            rsync -z --checksum --no-perms --no-owner --no-group \
+              -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+              "$file" "pm@46.225.149.52:$remote_stage"
+            remote_sha=$(ssh -i ~/.ssh/id_ed25519 \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 \
+              pm@46.225.149.52 "sha256sum '$remote_stage'" | awk '{print $1}')
+            test "$local_sha" = "$remote_sha"
+          done
+          echo "REMOTE_MAIN_SHA=$(sha256sum src/main.py | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "REMOTE_PUBLIC_API_SHA=$(sha256sum src/scrapers/pharmonline_public_api.py | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Atomically activate and run verified Decodo recovery
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 \
+            "bash -s -- '$REMOTE_BACKUP_DIR' '$REMOTE_MAIN_SHA' '$REMOTE_PUBLIC_API_SHA'" <<'REMOTE'
+          set -euo pipefail
+          backup_dir=$1
+          main_sha=$2
+          public_api_sha=$3
+          case "$backup_dir" in
+            /opt/pharmacy-monitor/.codex-decodo-recovery.*) ;;
+            *)
+              echo "unexpected remote Decodo recovery backup path" >&2
+              exit 1
+              ;;
+          esac
+
+          rollback_one() {
+            target=$1
+            original=$2
+            marker=$3
+            staged_sha=$4
+            label=$5
+            if [ -f "$backup_dir/$marker" ]; then
+              if [ -f "$target" ] && cmp -s -- "$original" "$target"; then
+                return 0
+              fi
+              if [ -f "$target" ] && \
+                [ "$(sha256sum "$target" | awk '{print $1}')" != "$staged_sha" ]; then
+                echo "refusing to overwrite divergent $label during rollback" >&2
+                return 1
+              fi
+              rollback_tmp=$(mktemp "$(dirname "$target")/.${label}.rollback.XXXXXX") || return 1
+              if ! cp -p -- "$original" "$rollback_tmp"; then
+                rm -f -- "$rollback_tmp"
+                return 1
+              fi
+              if ! cmp -s -- "$original" "$rollback_tmp"; then
+                rm -f -- "$rollback_tmp"
+                return 1
+              fi
+              if ! mv -f -- "$rollback_tmp" "$target"; then
+                rm -f -- "$rollback_tmp"
+                return 1
+              fi
+              cmp -s -- "$original" "$target"
+              return
+            fi
+            if [ ! -e "$target" ]; then
+              return 0
+            fi
+            if [ "$(sha256sum "$target" | awk '{print $1}')" != "$staged_sha" ]; then
+              echo "refusing to delete divergent $label during rollback" >&2
+              return 1
+            fi
+            rm -f -- "$target"
+            test ! -e "$target"
+          }
+
+          retain_source=0
+          cleanup() {
+            original_status=$?
+            trap - EXIT HUP INT TERM
+            if [ "$retain_source" -eq 1 ]; then
+              : > "$backup_dir/deployed_source_retained"
+              exit "$original_status"
+            fi
+            set +e
+            rollback_status=0
+            rollback_one /opt/pharmacy-monitor/src/main.py \
+              "$backup_dir/original/src/main.py" src_main_py.preexisting "$main_sha" main \
+              || rollback_status=1
+            rollback_one /opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py \
+              "$backup_dir/original/src/scrapers/pharmonline_public_api.py" \
+              public_api_py.preexisting "$public_api_sha" pharmonline_public_api \
+              || rollback_status=1
+            if [ "$rollback_status" -eq 0 ]; then
+              : > "$backup_dir/rollback_complete"
+            fi
+            if [ "$original_status" -ne 0 ]; then
+              exit "$original_status"
+            fi
+            exit "$rollback_status"
+          }
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          trap cleanup EXIT
+
+          for unit in \
+            pharmacy-monitor-scrape@pharmonline.service \
+            pharmacy-monitor-health.service
+          do
+            if systemctl is-active --quiet "$unit"; then
+              echo "refusing recovery: $unit is active" >&2
+              exit 1
+            fi
+          done
+
+          activate_one() {
+            staged=$1
+            target=$2
+            expected_sha=$3
+            test -f "$staged"
+            test "$(sha256sum "$staged" | awk '{print $1}')" = "$expected_sha"
+            test "$(stat -c '%d' "$(dirname "$staged")")" = \
+              "$(stat -c '%d' "$(dirname "$target")")"
+            mv -f -- "$staged" "$target"
+            test "$(sha256sum "$target" | awk '{print $1}')" = "$expected_sha"
+          }
+
+          activate_one "$backup_dir/staged/src/main.py" \
+            /opt/pharmacy-monitor/src/main.py "$main_sha"
+          activate_one "$backup_dir/staged/src/scrapers/pharmonline_public_api.py" \
+            /opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py "$public_api_sha"
+
+          cd /opt/pharmacy-monitor
+          PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
+          from src.main import _verify_pharmonline_public_api_identities
+          from src.scrapers.pharmonline_public_api import PharmonlinePublicAPIScraper
+
+          assert callable(_verify_pharmonline_public_api_identities)
+          assert PharmonlinePublicAPIScraper.__name__ == "PharmonlinePublicAPIScraper"
+          print("staged Decodo recovery source imported")
+          PY
+
+          # EnvironmentFile values are literal systemd values, not shell code.
           while IFS= read -r line || [ -n "$line" ]; do
             case "$line" in
               ''|\#*) continue ;;
@@ -147,6 +320,27 @@ jobs:
             value=${line#*=}
             export "$key=$value"
           done < /etc/pharmacy-monitor/env
+
+          before_run_id=$(PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
+          from sqlalchemy import text
+
+          from src import storage
+
+          Session = storage.make_session()
+          with Session() as session:
+              print(
+                  session.execute(
+                      text("SELECT COALESCE(MAX(id), 0) FROM runs WHERE tenant_id = 1")
+                  ).scalar_one()
+              )
+          PY
+          )
+          case "$before_run_id" in
+            ''|*[!0-9]*)
+              echo "could not determine prior production run ID" >&2
+              exit 1
+              ;;
+          esac
 
           PHARMONLINE_PUBLIC_API=required \
           PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
@@ -159,37 +353,19 @@ jobs:
             --mode public_api \
             --dry-run \
             --no-alerts
-          REMOTE
 
-      - name: Verify recovered run directly in production Postgres
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=15 \
-            pm@46.225.149.52 'bash -s' <<'REMOTE'
-          set -euo pipefail
-          cd /opt/pharmacy-monitor
-          while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-              ''|\#*) continue ;;
-            esac
-            key=${line%%=*}
-            value=${line#*=}
-            export "$key=$value"
-          done < /etc/pharmacy-monitor/env
-
-          PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
+          BEFORE_RUN_ID="$before_run_id" PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
           import json
           import os
 
-          from sqlalchemy import create_engine, text
+          from sqlalchemy import text
 
-          engine = create_engine(os.environ["DATABASE_URL"])
-          try:
-              with engine.connect() as connection:
-                  row = connection.execute(
+          from src import storage
+
+          before_run_id = int(os.environ["BEFORE_RUN_ID"])
+          Session = storage.make_session()
+          with Session() as session:
+              row = session.execute(
                       text(
                           """
                           SELECT id, status, catalog_scope, catalog_verified,
@@ -198,13 +374,13 @@ jobs:
                           FROM runs
                           WHERE tenant_id = 1
                             AND full_catalog_sites = 'pharmonline'
+                            AND id > :before_run_id
                           ORDER BY id DESC
                           LIMIT 1
                           """
-                      )
+                      ),
+                      {"before_run_id": before_run_id},
                   ).mappings().one_or_none()
-          finally:
-              engine.dispose()
 
           if row is None:
               raise SystemExit("no Pharmonline full-catalog run was created")
@@ -232,4 +408,93 @@ jobs:
           ):
               raise SystemExit("recovery did not produce a verified successful Pharmonline catalog")
           PY
+
+          retain_source=1
+          : > "$backup_dir/deployed_source_retained"
+          echo "verified Decodo recovery source retained"
+          REMOTE
+
+      - name: Confirm source pair after every recovery outcome
+        if: ${{ always() && env.REMOTE_BACKUP_DIR != '' }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 \
+            "bash -s -- '$REMOTE_BACKUP_DIR' '$REMOTE_MAIN_SHA' '$REMOTE_PUBLIC_API_SHA'" <<'REMOTE'
+          set -euo pipefail
+          backup_dir=$1
+          main_sha=$2
+          public_api_sha=$3
+          case "$backup_dir" in
+            /opt/pharmacy-monitor/.codex-decodo-recovery.*) ;;
+            *)
+              echo "unexpected remote Decodo recovery backup path" >&2
+              exit 1
+              ;;
+          esac
+          if [ -f "$backup_dir/deployed_source_retained" ]; then
+            echo "verified Decodo recovery source retained"
+            exit 0
+          fi
+          if [ -f "$backup_dir/rollback_complete" ]; then
+            echo "recovery source rollback confirmed"
+            exit 0
+          fi
+
+          rollback_one() {
+            target=$1
+            original=$2
+            marker=$3
+            staged_sha=$4
+            label=$5
+            if [ -f "$backup_dir/$marker" ]; then
+              if [ -f "$target" ] && cmp -s -- "$original" "$target"; then
+                return 0
+              fi
+              if [ -f "$target" ] && \
+                [ "$(sha256sum "$target" | awk '{print $1}')" != "$staged_sha" ]; then
+                echo "refusing to overwrite divergent $label during fallback rollback" >&2
+                return 1
+              fi
+              rollback_tmp=$(mktemp "$(dirname "$target")/.${label}.rollback.XXXXXX") || return 1
+              if ! cp -p -- "$original" "$rollback_tmp"; then
+                rm -f -- "$rollback_tmp"
+                return 1
+              fi
+              if ! cmp -s -- "$original" "$rollback_tmp"; then
+                rm -f -- "$rollback_tmp"
+                return 1
+              fi
+              if ! mv -f -- "$rollback_tmp" "$target"; then
+                rm -f -- "$rollback_tmp"
+                return 1
+              fi
+              cmp -s -- "$original" "$target"
+              return
+            fi
+            if [ ! -e "$target" ]; then
+              return 0
+            fi
+            if [ "$(sha256sum "$target" | awk '{print $1}')" != "$staged_sha" ]; then
+              echo "refusing to delete divergent $label during fallback rollback" >&2
+              return 1
+            fi
+            rm -f -- "$target"
+            test ! -e "$target"
+          }
+
+          rollback_status=0
+          rollback_one /opt/pharmacy-monitor/src/main.py \
+            "$backup_dir/original/src/main.py" src_main_py.preexisting "$main_sha" main \
+            || rollback_status=1
+          rollback_one /opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py \
+            "$backup_dir/original/src/scrapers/pharmonline_public_api.py" \
+            public_api_py.preexisting "$public_api_sha" pharmonline_public_api \
+            || rollback_status=1
+          test "$rollback_status" -eq 0
+          : > "$backup_dir/rollback_complete"
+          echo "fallback recovery source rollback completed"
           REMOTE
