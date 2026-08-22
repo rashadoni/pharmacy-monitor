@@ -503,7 +503,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             try:
                 response = await client.get(target_url, headers={"accept": accept})
                 break
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
                 if attempt == _MAX_CRAWLBASE_ATTEMPTS:
                     raise PharmonlinePublicAPIError("decodo_transient_request_failed") from None
                 log.warning(

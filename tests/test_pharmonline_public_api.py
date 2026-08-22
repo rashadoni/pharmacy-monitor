@@ -356,6 +356,46 @@ async def test_decodo_direct_request_keeps_one_context_on_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_decodo_direct_request_retries_a_closed_remote_connection(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._decodo_ports = (30001,)
+    scraper._decodo_session_ports = {"decodo-catalog-test": 30001}
+
+    class _Response:
+        status_code = 200
+        headers = {"cache-control": "public, max-age=60"}
+        text = '{"data": []}'
+
+    class _Client:
+        calls = 0
+
+        async def get(self, _url: str, *, headers: dict[str, str]) -> _Response:
+            self.calls += 1
+            assert headers == {"accept": "application/json"}
+            if self.calls == 1:
+                raise httpx.RemoteProtocolError("peer closed connection")
+            return _Response()
+
+    async def no_delay(_seconds: float) -> None:
+        return None
+
+    client = _Client()
+    scraper._decodo_clients = {"decodo-catalog-test": client}
+    monkeypatch.setattr("src.scrapers.pharmonline_public_api.asyncio.sleep", no_delay)
+
+    assert (
+        await scraper._decodo_body(
+            "https://pharmonline.az/api/products?lng=az&page=2",
+            accept="application/json",
+            crawlbase_session="decodo-catalog-test",
+        )
+        == '{"data": []}'
+    )
+    assert client.calls == 2
+    assert scraper._decodo_session_ports == {"decodo-catalog-test": 30001}
+
+
+@pytest.mark.asyncio
 async def test_source_json_selects_decodo_only_when_explicit(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
     scraper._public_api_transport = "decodo"
