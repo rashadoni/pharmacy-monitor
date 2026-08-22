@@ -8,7 +8,7 @@ on:
       category:
         description: "Pharmonline category slug for the small source probe"
         required: true
-        default: "antiallergik-vasiteler"
+        default: "sinir-sistemi-xestelikeri"
 
 permissions:
   contents: read
@@ -35,7 +35,7 @@ jobs:
           pip install -e .
           playwright install chromium --with-deps
 
-      - name: Fetch a few cards without persisting anything
+      - name: Fetch and parse a few cards without persisting anything
         env:
           CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
           CRAWLBASE_API_SITES: pharmonline
@@ -48,13 +48,47 @@ jobs:
           import asyncio
           import os
           import re
+          from urllib.parse import quote
 
+          import httpx
           from src.scrapers.pharmonline import PharmonlineScraper
 
 
           async def main() -> None:
               category = os.environ["PROBE_CATEGORY"]
+              target_url = f"https://pharmonline.az/products?category={quote(category, safe='')}"
+              api_url = (
+                  "https://api.crawlbase.com/?token="
+                  f"{quote(os.environ['CRAWLBASE_JS_TOKEN'], safe='')}&url="
+                  f"{quote(target_url, safe='')}"
+              )
+              async with httpx.AsyncClient(timeout=120.0) as client:
+                  response = await client.get(api_url)
+              html = response.text
+              title_match = re.search(r"<title[^>]*>\s*(.*?)\s*</title>", html, re.I | re.S)
+              title = re.sub(r"\s+", " ", title_match.group(1)).strip()[:120] if title_match else "<none>"
+              lower_html = html.lower()
+              signals = [
+                  signal
+                  for signal in ("cloudflare", "captcha", "access denied", "rate limit", "crawlbase error")
+                  if signal in lower_html
+              ]
+              card_markers = html.count("product_box_v2")
+              print(
+                  "Crawlbase response profile: "
+                  f"http={response.status_code}, bytes={len(html)}, title={title!r}, "
+                  f"card_markers={card_markers}, signals={signals or ['none']}"
+              )
+              if response.status_code != 200 or card_markers == 0:
+                  raise SystemExit("Crawlbase did not return a rendered Pharmonline category page")
+
               async with PharmonlineScraper() as scraper:
+                  async def render_prefetched_html(page, _url, check_captcha=True):
+                      # Exercise the real card/pagination parser against the one
+                      # rendered response above without issuing another request.
+                      await page.set_content(html, wait_until="domcontentloaded")
+
+                  scraper.goto = render_prefetched_html
                   # The limit keeps this to one rendered page in normal cases.
                   # This invokes no storage code and cannot alter production data.
                   result = await scraper.scrape([category], limit_per_category=5)
