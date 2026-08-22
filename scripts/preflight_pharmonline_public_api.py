@@ -78,8 +78,13 @@ async def main() -> None:
 
     Session = storage.make_session()
     with Session() as session:
-        session.execute(text("SET TRANSACTION READ ONLY"))
         try:
+            session.execute(text("SET TRANSACTION READ ONLY"))
+            transaction_read_only = str(
+                session.scalar(text("SHOW transaction_read_only"))
+            ).lower()
+            if transaction_read_only not in {"on", "true", "1"}:
+                fail("database transaction did not enter read-only mode")
             try:
                 verified_identities = _verify_pharmonline_public_api_identities(
                     session,
