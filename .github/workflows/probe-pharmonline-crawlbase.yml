@@ -75,11 +75,26 @@ jobs:
                   if signal in lower_html
               ]
               card_markers = html.count("product_box_v2")
+              class_tokens = sorted(
+                  {
+                      token
+                      for raw_classes in re.findall(r'\bclass=["\']([^"\']+)["\']', html, re.I)
+                      for token in raw_classes.split()
+                      if any(
+                          word in token.lower()
+                          for word in ("product", "card", "basket", "favorite", "price")
+                      )
+                  }
+              )
+              data_attributes = sorted(set(re.findall(r'\b(data-[\w-]+)=', html, re.I)))
               print(
                   "Crawlbase response profile: "
                   f"http={response.status_code}, bytes={len(html)}, title={title!r}, "
-                  f"card_markers={card_markers}, signals={signals or ['none']}"
+                  f"card_markers={card_markers}, product_hrefs={html.count('/product/')}, "
+                  f"data_id_count={html.count('data-id=')}, signals={signals or ['none']}"
               )
+              print(f"Crawlbase structural classes: {class_tokens[:80]}")
+              print(f"Crawlbase data attributes: {data_attributes[:80]}")
               if response.status_code != 200 or card_markers == 0:
                   raise SystemExit("Crawlbase did not return a rendered Pharmonline category page")
 
