@@ -93,6 +93,8 @@ jobs:
 
 
           BASE_URL = "https://pharmonline.az"
+          CATEGORY_PAGE_SIZE = 12
+          GLOBAL_PAGE_SIZE = 100
 
 
           async def crawlbase_json(target_url: str) -> dict | list:
@@ -156,6 +158,11 @@ jobs:
 
 
           def rows_and_meta(payload: dict) -> tuple[list[dict], int, int]:
+              if not isinstance(payload, dict):
+                  raise SystemExit(
+                      "public products response must be an object: "
+                      f"got={type(payload).__name__}"
+                  )
               rows = payload.get("data")
               if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
                   raise SystemExit(
@@ -197,19 +204,28 @@ jobs:
               if not _PHARMONLINE_METEOR_ID_RE.fullmatch(category_id):
                   raise SystemExit("current category has no valid stable ID")
 
-              def product_url(page: int, *, category_id: str | None = None) -> str:
+              def product_url(
+                  page: int,
+                  *,
+                  category_id: str | None = None,
+                  page_size: int,
+              ) -> str:
                   query = {
                       "lng": "az",
                       "page": str(page),
-                      "limit": "100",
+                      "limit": str(page_size),
                       "sortBy": "price_asc",
                   }
                   if category_id:
                       query["category"] = category_id
                   return f"{BASE_URL}/api/products?{urlencode(query)}"
 
-              first_payload = await crawlbase_json(product_url(1, category_id=category_id))
-              second_payload = await crawlbase_json(product_url(2, category_id=category_id))
+              first_payload = await crawlbase_json(
+                  product_url(1, category_id=category_id, page_size=CATEGORY_PAGE_SIZE)
+              )
+              second_payload = await crawlbase_json(
+                  product_url(2, category_id=category_id, page_size=CATEGORY_PAGE_SIZE)
+              )
               first_rows, category_total, category_pages = rows_and_meta(first_payload)
               second_rows, second_total, second_pages = rows_and_meta(second_payload)
               if (
@@ -218,7 +234,11 @@ jobs:
                   or category_total != second_total
                   or category_pages != second_pages
               ):
-                  raise SystemExit("public category pagination is not stable")
+                  raise SystemExit(
+                      "public category pagination is not stable: "
+                      f"page1=(items={len(first_rows)}, total={category_total}, pages={category_pages}), "
+                      f"page2=(items={len(second_rows)}, total={second_total}, pages={second_pages})"
+                  )
               first_ids = {str(row.get("_id") or "") for row in first_rows}
               second_ids = {str(row.get("_id") or "") for row in second_rows}
               if (
@@ -229,10 +249,39 @@ jobs:
               ):
                   raise SystemExit("public category pages do not expose disjoint stable product IDs")
 
-              global_payload = await crawlbase_json(product_url(1))
+              global_payload = await crawlbase_json(
+                  product_url(1, page_size=GLOBAL_PAGE_SIZE)
+              )
+              global_second_payload = await crawlbase_json(
+                  product_url(2, page_size=GLOBAL_PAGE_SIZE)
+              )
               global_rows, global_total, global_pages = rows_and_meta(global_payload)
-              if not global_rows or global_total < len(global_rows) or global_pages < 1:
-                  raise SystemExit("public global catalog response is incomplete")
+              global_second_rows, global_second_total, global_second_pages = rows_and_meta(
+                  global_second_payload
+              )
+              global_ids = {str(row.get("_id") or "") for row in global_rows}
+              global_second_ids = {str(row.get("_id") or "") for row in global_second_rows}
+              if (
+                  not global_rows
+                  or not global_second_rows
+                  or global_total < len(global_rows)
+                  or global_pages < 2
+                  or global_total != global_second_total
+                  or global_pages != global_second_pages
+                  or len(global_ids) != len(global_rows)
+                  or len(global_second_ids) != len(global_second_rows)
+                  or global_ids & global_second_ids
+                  or not all(
+                      _PHARMONLINE_METEOR_ID_RE.fullmatch(value)
+                      for value in global_ids | global_second_ids
+                  )
+              ):
+                  raise SystemExit(
+                      "public global catalog pagination is incomplete: "
+                      f"page1=(items={len(global_rows)}, total={global_total}, pages={global_pages}), "
+                      f"page2=(items={len(global_second_rows)}, total={global_second_total}, pages={global_second_pages}), "
+                      f"overlap={len(global_ids & global_second_ids)}"
+                  )
 
               # Read-only DB evidence: current API IDs and canonical paths must
               # agree with the pre-existing DDP catalogue before recovery code
@@ -277,6 +326,7 @@ jobs:
                   f"category_total={category_total}, category_pages={category_pages}, "
                   f"page_size={len(first_rows)}, page_overlap={len(first_ids & second_ids)}, "
                   f"global_total={global_total}, global_pages={global_pages}, "
+                  f"global_page_size={len(global_rows)}, global_page_overlap={len(global_ids & global_second_ids)}, "
                   f"sample_fields={sample_keys}, database_transaction=read_only"
               )
 
