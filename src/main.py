@@ -564,13 +564,13 @@ async def scrape_site(
     on_category=None,
     aloe_country_map: dict[str, dict[str, object]] | None = None,
 ) -> ScrapeResult:
-    # Pharmonline's recovery source is intentionally selected at scrape time,
-    # not only at module import time.  That keeps a long-lived CLI/test
-    # process from silently retaining the legacy class after the explicit
-    # recovery environment was enabled.
+    # The recovery source is selected at scrape time when (and only when) its
+    # explicit environment flag is on.  This avoids a long-lived process
+    # retaining the legacy class after recovery was enabled without changing
+    # normal DDP/legacy dispatch or its injectable class registry.
     cls = (
         _pharmonline_scraper_class()
-        if site == "pharmonline"
+        if site == "pharmonline" and _pharmonline_public_api_enabled()
         else SCRAPER_CLASSES[site]
     )
     if not slugs:
@@ -754,7 +754,7 @@ async def scrape_watchlist_for_site(site: str, urls: list[str]) -> ScrapeResult:
     """Watchlist-режим: ходим по конкретным URL'ам товаров на одном сайте."""
     cls = (
         _pharmonline_scraper_class()
-        if site == "pharmonline"
+        if site == "pharmonline" and _pharmonline_public_api_enabled()
         else SCRAPER_CLASSES[site]
     )
     if not urls:
