@@ -7,6 +7,11 @@ on:
         description: "Empty interrupted Run ID to close"
         required: true
         default: "671"
+      restart_api:
+        description: "Restart API after recovery so health uses current code"
+        required: true
+        type: boolean
+        default: false
 
 concurrency:
   group: production-run-recovery
@@ -147,6 +152,7 @@ jobs:
           REMOTE
 
       - name: Verify public health reports the attempt as failed
+        if: ${{ !inputs.restart_api }}
         env:
           RUN_ID: ${{ steps.input.outputs.run_id }}
         run: |
@@ -173,4 +179,51 @@ jobs:
               raise SystemExit("health did not expose the recovered run")
           if pharm.get("latest_full_attempt_status") != "failed":
               raise SystemExit("recovered run was not reported as failed")
+          PY
+
+      - name: Restart API and verify truthful health status
+        if: ${{ inputs.restart_api }}
+        env:
+          RUN_ID: ${{ steps.input.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            pm@46.225.149.52 \
+            'set -euo pipefail
+             sudo -n /usr/bin/systemctl restart pharmacy-monitor-api.service
+             sleep 5
+             curl --fail --silent --show-error --max-time 30 http://127.0.0.1:8080/health >/dev/null'
+
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          run_id = int(os.environ["RUN_ID"])
+          with urllib.request.urlopen("https://leaddrive.cloud/health", timeout=30) as response:
+              health = json.load(response)
+          sites = health.get("product_policy", {}).get("sites", [])
+          pharm = next((row for row in sites if row.get("site") == "pharmonline"), None)
+          if pharm is None:
+              raise SystemExit("pharmonline is absent from health response")
+          print(
+              "pharmonline latest attempt:",
+              pharm.get("latest_full_attempt_id"),
+              pharm.get("latest_full_attempt_status"),
+              pharm.get("latest_full_attempt_reason"),
+          )
+          print(
+              "public health:",
+              health.get("status"),
+              health.get("full_catalog_status"),
+              health.get("full_catalog_verified"),
+          )
+          if pharm.get("latest_full_attempt_id") != run_id:
+              raise SystemExit("health did not expose the recovered run")
+          if pharm.get("latest_full_attempt_status") != "failed":
+              raise SystemExit("recovered run was not reported as failed")
+          if health.get("full_catalog_status") != "failed":
+              raise SystemExit("health did not report the failed catalog attempt")
+          if health.get("full_catalog_verified") is not False:
+              raise SystemExit("health incorrectly reports the catalog as verified")
           PY
