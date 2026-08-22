@@ -172,7 +172,6 @@ jobs:
           test "$(sha256sum "$work_dir/incoming/src/scrapers/pharmonline_public_api.py" | awk '{print $1}')" = "$public_api_sha"
           test "$(sha256sum "$work_dir/incoming/scripts/preflight_pharmonline_public_api.py" | awk '{print $1}')" = "$preflight_script_sha"
           cp -a -- /opt/pharmacy-monitor/src "$runtime_dir"
-          cp -a -- /opt/pharmacy-monitor/config "$runtime_dir/config"
           mkdir -p "$runtime_dir/scripts"
           cp -p -- "$work_dir/incoming/src/main.py" "$runtime_dir/src/main.py"
           cp -p -- "$work_dir/incoming/src/scrapers/pharmonline_public_api.py" \
