@@ -1093,6 +1093,25 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             api_urls = {product.url for product in catalog}
             sitemap_urls = await self._fetch_sitemap_product_urls()
             if len(catalog) != expected_total or api_urls != sitemap_urls:
+                api_only = api_urls - sitemap_urls
+                sitemap_only = sitemap_urls - api_urls
+                # Counts and stable fingerprints make a rejected no-write
+                # recovery diagnosable without putting public product paths
+                # (or proxy diagnostics) into application logs.
+                log.warning(
+                    "pharmonline_public_api_sitemap_mismatch",
+                    expected_total=expected_total,
+                    api_urls=len(api_urls),
+                    sitemap_urls=len(sitemap_urls),
+                    api_only=len(api_only),
+                    sitemap_only=len(sitemap_only),
+                    api_only_fingerprint=hashlib.sha256(
+                        "\n".join(sorted(api_only)).encode()
+                    ).hexdigest()[:16],
+                    sitemap_only_fingerprint=hashlib.sha256(
+                        "\n".join(sorted(sitemap_only)).encode()
+                    ).hexdigest()[:16],
+                )
                 raise PharmonlinePublicAPIError("products_sitemap_set_mismatch")
         except SiteScrapeFatalError:
             raise
