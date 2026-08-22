@@ -563,7 +563,9 @@ async def test_scraperapi_direct_request_retries_in_the_same_sticky_context(monk
 
 
 @pytest.mark.asyncio
-async def test_scraperapi_retries_a_transient_gateway_status_in_the_same_sticky_context(monkeypatch):
+async def test_scraperapi_retries_a_transient_gateway_status_in_the_same_sticky_context(
+    monkeypatch,
+):
     scraper = PharmonlinePublicAPIScraper()
 
     class _Response:
