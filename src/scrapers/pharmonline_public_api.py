@@ -253,9 +253,8 @@ def _sitemap_covers_api_catalog(api_urls: set[str], sitemap_urls: set[str]) -> b
     if not api_urls or not sitemap_urls.issubset(api_urls):
         return False
     api_only = len(api_urls) - len(sitemap_urls)
-    return (
-        api_only <= _MAX_SITEMAP_API_LAG_ITEMS
-        and len(sitemap_urls) * 1000
+    return api_only <= _MAX_SITEMAP_API_LAG_ITEMS and (
+        len(sitemap_urls) * 1000
         >= len(api_urls) * _MIN_SITEMAP_API_COVERAGE_PER_THOUSAND
     )
 
