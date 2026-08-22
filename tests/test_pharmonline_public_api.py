@@ -319,11 +319,14 @@ async def test_decodo_direct_request_keeps_one_context_on_retry(monkeypatch):
     scraper._decodo_clients = {"decodo-catalog-test": client}
     monkeypatch.setattr("src.scrapers.pharmonline_public_api.asyncio.sleep", no_delay)
 
-    assert await scraper._decodo_body(
-        "https://pharmonline.az/api/products?lng=az&page=1",
-        accept="application/json",
-        crawlbase_session="decodo-catalog-test",
-    ) == '{"data": []}'
+    assert (
+        await scraper._decodo_body(
+            "https://pharmonline.az/api/products?lng=az&page=1",
+            accept="application/json",
+            crawlbase_session="decodo-catalog-test",
+        )
+        == '{"data": []}'
+    )
     assert client.calls == 2
     assert scraper._decodo_session_ports == {"decodo-catalog-test": 30001}
     assert scraper._origin_context_evidence() == "/api/products:1"

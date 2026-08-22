@@ -1,0 +1,201 @@
+name: Preflight full Pharmonline Decodo public API recovery (no persistence)
+
+# The Decodo transport runs only on production because its credentials remain
+# in the production EnvironmentFile. This workflow stages the exact guarded
+# source without restarting any service, executes two full read-only passes,
+# and restores the previous source automatically if the proof fails.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type PREFLIGHT to run the full read-only Decodo proof"
+        required: true
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: pharmonline-decodo-public-api-recovery
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Require explicit confirmation and matching CI
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "PREFLIGHT"
+          ci_run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow ci-pipeline.yml --commit "$GITHUB_SHA" --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          case "$ci_run_id" in
+            ''|*[!0-9]*)
+              echo "a successful Pharmacy Monitor CI run is required for this commit" >&2
+              exit 1
+              ;;
+          esac
+          echo "matching_ci_run_id=$ci_run_id"
+
+      - uses: actions/checkout@v4
+
+      - name: Setup production SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' \
+            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
+          test "$host_fingerprint" = \
+            'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
+
+      - name: Check production capacity and scraper state
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          min_available_kib=$((4 * 1024 * 1024))
+          max_swap_kib=$((2 * 1024 * 1024))
+          min_disk_kib=$((4 * 1024 * 1024))
+          max_user_slice_bytes=$((7 * 1024 * 1024 * 1024))
+
+          available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+          swap_before_kib=$(free -k | awk '/^Swap:/ {print $3}')
+          disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk 'NR==2 {print $4}')
+          user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
+          sleep 5
+          swap_after_kib=$(free -k | awk '/^Swap:/ {print $3}')
+
+          printf 'available_ram_kib=%s required_kib=%s\n' "$available_kib" "$min_available_kib"
+          printf 'swap_before_kib=%s swap_after_kib=%s maximum_kib=%s\n' \
+            "$swap_before_kib" "$swap_after_kib" "$max_swap_kib"
+          printf 'disk_available_kib=%s required_kib=%s\n' "$disk_available_kib" "$min_disk_kib"
+          printf 'user_slice_bytes=%s conservative_limit_bytes=%s\n' \
+            "$user_slice_bytes" "$max_user_slice_bytes"
+
+          test "$available_kib" -ge "$min_available_kib"
+          test "$swap_after_kib" -le "$max_swap_kib"
+          test "$swap_after_kib" -le "$swap_before_kib"
+          test "$disk_available_kib" -ge "$min_disk_kib"
+          test "$user_slice_bytes" -lt "$max_user_slice_bytes"
+          if systemctl is-active --quiet pharmacy-monitor-scrape@pharmonline.service; then
+            echo "refusing preflight: a Pharmonline scrape is already active" >&2
+            exit 1
+          fi
+          REMOTE
+
+      - name: Back up and stage exact guarded source without restart
+        run: |
+          set -euo pipefail
+          remote_backup=$(ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/pharmacy-monitor
+          backup_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-decodo-preflight.XXXXXX)
+          mkdir -p "$backup_dir/src/scrapers" "$backup_dir/scripts"
+          cp -p src/scrapers/pharmonline_public_api.py "$backup_dir/src/scrapers/"
+          if [ -f scripts/preflight_pharmonline_public_api.py ]; then
+            cp -p scripts/preflight_pharmonline_public_api.py "$backup_dir/scripts/"
+          fi
+          printf '%s' "$backup_dir"
+          REMOTE
+          )
+          test -n "$remote_backup"
+          echo "REMOTE_BACKUP_DIR=$remote_backup" >> "$GITHUB_ENV"
+          rsync -z --checksum --inplace --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            src/scrapers/pharmonline_public_api.py \
+            pm@46.225.149.52:/opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py
+          rsync -z --checksum --inplace --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            scripts/preflight_pharmonline_public_api.py \
+            pm@46.225.149.52:/opt/pharmacy-monitor/scripts/preflight_pharmonline_public_api.py
+          for file in src/scrapers/pharmonline_public_api.py scripts/preflight_pharmonline_public_api.py
+          do
+            local_sha=$(sha256sum "$file" | awk '{print $1}')
+            remote_sha=$(ssh -i ~/.ssh/id_ed25519 \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 \
+              pm@46.225.149.52 "sha256sum '/opt/pharmacy-monitor/$file'" | awk '{print $1}')
+            test "$local_sha" = "$remote_sha"
+          done
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/pharmacy-monitor
+          PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
+          from pathlib import Path
+
+          for filename in (
+              "src/scrapers/pharmonline_public_api.py",
+              "scripts/preflight_pharmonline_public_api.py",
+          ):
+              compile(Path(filename).read_text(encoding="utf-8"), filename, "exec")
+          print("staged Decodo recovery source compiled")
+          PY
+          REMOTE
+
+      - name: Prove full Decodo catalog and DDP identity without writes
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/pharmacy-monitor
+          # EnvironmentFile values are literal systemd values, not shell code.
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|\#*) continue ;;
+            esac
+            key=${line%%=*}
+            value=${line#*=}
+            export "$key=$value"
+          done < /etc/pharmacy-monitor/env
+
+          PHARMONLINE_PUBLIC_API=required \
+          PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
+          PHARMONLINE_USE_DDP=0 \
+          AI_FALLBACK_ENABLED=0 \
+          SCRAPE_REPORT_EMAIL=0 \
+          PYTHONDONTWRITEBYTECODE=1 \
+          .venv/bin/python scripts/preflight_pharmonline_public_api.py
+          REMOTE
+
+      - name: Restore prior source after failed preflight
+        if: ${{ failure() && env.REMOTE_BACKUP_DIR != '' }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 \
+            "cp -- '$REMOTE_BACKUP_DIR/src/scrapers/pharmonline_public_api.py' \
+              /opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py"

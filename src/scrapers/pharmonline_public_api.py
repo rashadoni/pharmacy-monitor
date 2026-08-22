@@ -81,9 +81,7 @@ def _env_enabled(name: str) -> bool:
 def _configured_decodo_ports() -> tuple[int, ...]:
     """Read the existing Decodo sticky-port configuration without logging it."""
     sites = {
-        value.strip()
-        for value in os.environ.get("DECODO_SITES", "").split(",")
-        if value.strip()
+        value.strip() for value in os.environ.get("DECODO_SITES", "").split(",") if value.strip()
     }
     if "pharmonline" not in sites:
         raise SiteScrapeFatalError("Decodo is not configured for Pharmonline")
@@ -522,9 +520,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                     raise SiteScrapeFatalError(proxy_reason) from None
                 raise PharmonlinePublicAPIError("decodo_request_failed") from None
         if response.status_code in {402, 407}:
-            raise SiteScrapeFatalError(
-                f"Decodo proxy access rejected: HTTP {response.status_code}"
-            )
+            raise SiteScrapeFatalError(f"Decodo proxy access rejected: HTTP {response.status_code}")
         if response.status_code != 200:
             raise PharmonlinePublicAPIError(f"decodo_http_{response.status_code}")
         self._record_origin_headers(target_url, response.headers)
