@@ -230,8 +230,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if not contexts:
             return "none"
         return ",".join(
-            f"{resource}:{len(fingerprints)}"
-            for resource, fingerprints in sorted(contexts.items())
+            f"{resource}:{len(fingerprints)}" for resource, fingerprints in sorted(contexts.items())
         )
 
     async def _crawlbase_body(self, target_url: str, *, accept: str) -> Any:
