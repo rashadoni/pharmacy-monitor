@@ -416,7 +416,9 @@ jobs:
               )
 
 
-          async def sitemap_product_urls(client: httpx.AsyncClient) -> frozenset[str]:
+          async def sitemap_product_urls(
+              client: httpx.AsyncClient,
+          ) -> tuple[frozenset[str], int]:
               index_url = f"{BASE_URL}/sitemap.xml"
               index_locs = list(xml_locs(await crawlbase_xml(client, index_url)))
               child_maps: set[str] = set()
@@ -430,6 +432,7 @@ jobs:
                   fail("product sitemap index contains no product child maps")
 
               product_urls: set[str] = set()
+              duplicate_product_url_entries = 0
               for child_map in sorted(child_maps):
                   locations = list(xml_locs(await crawlbase_xml(client, child_map)))
                   if not locations:
@@ -441,11 +444,17 @@ jobs:
                               f"invalid product URL in product child sitemap {child_map}: {location!r}"
                           )
                       if canonical_url in product_urls:
-                          fail(f"duplicate product URL across product sitemaps: {canonical_url!r}")
+                          # Pharmonline can repeat an unchanged canonical
+                          # product URL in multiple child sitemap files. The
+                          # exact API-versus-sitemap set comparison below is
+                          # still the coverage proof; this only ignores a
+                          # duplicate source entry.
+                          duplicate_product_url_entries += 1
+                          continue
                       product_urls.add(canonical_url)
               if not product_urls:
                   fail("product sitemaps contain no canonical product URLs")
-              return frozenset(product_urls)
+              return frozenset(product_urls), duplicate_product_url_entries
 
 
           def verify_read_only_database_identity(
@@ -625,7 +634,7 @@ jobs:
                           "the source is not stable enough to recover"
                       )
 
-                  sitemap_urls = await sitemap_product_urls(client)
+                  sitemap_urls, sitemap_duplicate_entries = await sitemap_product_urls(client)
               if sitemap_urls != first_pass.urls:
                   fail(
                       "public API and product sitemap URL sets differ: "
@@ -645,6 +654,7 @@ jobs:
                   f"sort_by={SORT_BY}, total={first_pass.total}, pages={first_pass.pages}, "
                   f"page_size={PAGE_SIZE}, two_passes=identical, "
                   f"sitemap_urls={len(sitemap_urls)}, "
+                  f"sitemap_duplicate_entries={sitemap_duplicate_entries}, "
                   f"api_identities={api_identity_count}, "
                   f"trusted_ddp_identities={trusted_identity_count}, "
                   f"trusted_ddp_history_products={trusted_history_products}, "

@@ -215,6 +215,41 @@ async def test_sitemap_fetch_rejects_external_index_and_product_urls(monkeypatch
         await scraper._fetch_sitemap_product_urls()
 
 
+@pytest.mark.asyncio
+async def test_sitemap_fetch_deduplicates_repeated_canonical_product_urls(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+
+    async def duplicated_product_urls(url: str) -> str:
+        if url.endswith("/sitemap.xml"):
+            return (
+                "<sitemapindex>"
+                "<sitemap><loc>/sitemap-products-1.xml</loc></sitemap>"
+                "<sitemap><loc>/sitemap-products-2.xml</loc></sitemap>"
+                "</sitemapindex>"
+            )
+        if url.endswith("sitemap-products-1.xml"):
+            return (
+                "<urlset>"
+                "<url><loc>/product/one</loc></url>"
+                "<url><loc>/product/two</loc></url>"
+                "</urlset>"
+            )
+        return (
+            "<urlset>"
+            "<url><loc>https://pharmonline.az/product/two</loc></url>"
+            "<url><loc>/product/three</loc></url>"
+            "</urlset>"
+        )
+
+    monkeypatch.setattr(scraper, "_crawlbase_xml", duplicated_product_urls)
+
+    assert await scraper._fetch_sitemap_product_urls() == {
+        "https://pharmonline.az/product/one",
+        "https://pharmonline.az/product/two",
+        "https://pharmonline.az/product/three",
+    }
+
+
 def test_crawlbase_json_body_accepts_direct_and_pre_rendered_json():
     payload = {"data": [{"_id": "PRODUCT0000000001"}]}
     assert _json_from_rendered_body(payload) == payload
