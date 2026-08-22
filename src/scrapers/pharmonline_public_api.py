@@ -870,6 +870,15 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             )
             return
         except Exception as exc:  # defensive boundary: never yield partial rows
+            last_traceback = exc.__traceback__
+            while last_traceback is not None and last_traceback.tb_next is not None:
+                last_traceback = last_traceback.tb_next
+            error_location = (
+                f"{os.path.basename(last_traceback.tb_frame.f_code.co_filename)}:"
+                f"{last_traceback.tb_lineno}"
+                if last_traceback is not None
+                else "unknown"
+            )
             reason = f"public_api_unexpected_{type(exc).__name__}"[:200]
             self._set_route_status(
                 category_slug,
@@ -879,6 +888,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             log.warning(
                 "pharmonline_public_api_catalog_failed",
                 error_type=type(exc).__name__,
+                error_location=error_location,
                 origin_contexts=self._origin_context_evidence(),
             )
             return
