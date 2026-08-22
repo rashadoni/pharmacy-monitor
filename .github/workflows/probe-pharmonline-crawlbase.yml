@@ -98,14 +98,17 @@ jobs:
           async def main() -> None:
               category = os.environ["PROBE_CATEGORY"]
               target_url = f"https://pharmonline.az/products?category={quote(category, safe='')}"
-              request_params = {
-                  "token": os.environ["CRAWLBASE_JS_TOKEN"],
-                  "url": target_url,
-                  "page_wait": "4000",
-                  "ajax_wait": "true",
-              }
-              async with httpx.AsyncClient(timeout=120.0) as client:
-                  response = await client.get("https://api.crawlbase.com/", params=request_params)
+              async def fetch_rendered(url: str):
+                  request_params = {
+                      "token": os.environ["CRAWLBASE_JS_TOKEN"],
+                      "url": url,
+                      "page_wait": "4000",
+                      "ajax_wait": "true",
+                  }
+                  async with httpx.AsyncClient(timeout=120.0) as client:
+                      return await client.get("https://api.crawlbase.com/", params=request_params)
+
+              response = await fetch_rendered(target_url)
               html = response.text
               title_match = re.search(r"<title[^>]*>\s*(.*?)\s*</title>", html, re.I | re.S)
               title = re.sub(r"\s+", " ", title_match.group(1)).strip()[:120] if title_match else "<none>"
@@ -146,6 +149,73 @@ jobs:
               print(f"Crawlbase data attributes: {data_attributes[:80]}")
               if response.status_code != 200 or card_markers == 0:
                   raise SystemExit("Crawlbase did not return a rendered Pharmonline category page")
+
+              # The current React storefront no longer follows the old
+              # ``?page=N`` contract reliably.  Keep this as a bounded,
+              # public-only diagnostic: it reveals pagination evidence and
+              # whether a requested second page has a different item set,
+              # without storing an item or creating a Run.
+              page_two_url = f"{target_url}&page=2"
+              page_two_response = await fetch_rendered(page_two_url)
+              page_two_html = page_two_response.text
+
+              def product_urls(document: str) -> list[str]:
+                  values = re.findall(
+                      r'''href=["']([^"']*(?:/|^)product/[^"'#?]+)[^"']*["']''',
+                      document,
+                      re.I,
+                  )
+                  return sorted(set(values))
+
+              def pagination_hints(document: str) -> list[str]:
+                  hints: list[str] = []
+                  for key in (
+                      "currentPage",
+                      "lastPage",
+                      "totalPages",
+                      "pageCount",
+                      "totalItems",
+                      "perPage",
+                      "pageSize",
+                  ):
+                      match = re.search(
+                          rf'''["']?{key}["']?\\s*[:=]\\s*["']?(\\d+)["']?''',
+                          document,
+                          re.I,
+                      )
+                      if match:
+                          hints.append(f"{key}={match.group(1)}")
+                  return hints
+
+              page_one_urls = product_urls(html)
+              page_two_urls = product_urls(page_two_html)
+              page_two_card_markers = len(
+                  re.findall(
+                      r'''\bclass=["']([^"']*\bproduct_box\b[^"']*)["']''',
+                      page_two_html,
+                      re.I,
+                  )
+              )
+              page_links = sorted(
+                  set(
+                      re.findall(
+                          r'''href=["']([^"']*[?&](?:page|pageNumber|page_num)=[^"']+)["']''',
+                          html,
+                          re.I,
+                      )
+                  )
+              )
+              print(
+                  "Crawlbase pagination diagnostic: "
+                  f"page1_cards={card_markers}, page1_urls={len(page_one_urls)}, "
+                  f"page2_http={page_two_response.status_code}, "
+                  f"page2_cards={page_two_card_markers}, "
+                  f"page2_urls={len(page_two_urls)}, "
+                  f"overlap={len(set(page_one_urls) & set(page_two_urls))}, "
+                  f"page1_hints={pagination_hints(html)}, "
+                  f"page2_hints={pagination_hints(page_two_html)}, "
+                  f"page_links={page_links[:20]}"
+              )
 
               async with PharmonlineScraper() as scraper:
                   async def render_prefetched_html(page, _url, check_captcha=True):
