@@ -113,12 +113,7 @@ def _same_origin_sitemap_url(value: Any) -> str | None:
     resolved = urljoin(f"{_BASE_URL}/", raw)
     parsed = urlsplit(resolved)
     host = parsed.netloc.lower().removeprefix("www.")
-    if (
-        parsed.scheme != "https"
-        or host != "pharmonline.az"
-        or parsed.query
-        or parsed.fragment
-    ):
+    if parsed.scheme != "https" or host != "pharmonline.az" or parsed.query or parsed.fragment:
         return None
     return f"{_BASE_URL}{parsed.path}"
 
@@ -215,9 +210,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                 f"Crawlbase proxy access rejected: HTTP {response.status_code}"
             )
         if response.status_code != 200:
-            raise PharmonlinePublicAPIError(
-                f"crawlbase_http_{response.status_code}"
-            )
+            raise PharmonlinePublicAPIError(f"crawlbase_http_{response.status_code}")
         try:
             envelope = response.json()
         except json.JSONDecodeError as exc:
@@ -228,13 +221,10 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         original_status = str(envelope.get("original_status") or "")
         if cb_status in {"402", "407"} or original_status in {"402", "407"}:
             rejected = cb_status if cb_status in {"402", "407"} else original_status
-            raise SiteScrapeFatalError(
-                f"Crawlbase proxy access rejected: HTTP {rejected}"
-            )
+            raise SiteScrapeFatalError(f"Crawlbase proxy access rejected: HTTP {rejected}")
         if cb_status != "200" or original_status != "200":
             raise PharmonlinePublicAPIError(
-                f"crawlbase_target_status_{cb_status or 'missing'}_"
-                f"{original_status or 'missing'}"
+                f"crawlbase_target_status_{cb_status or 'missing'}_{original_status or 'missing'}"
             )
         if "body" not in envelope:
             raise PharmonlinePublicAPIError("crawlbase_envelope_body_missing")
@@ -466,10 +456,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                     reason=str(exc)[:200],
                 )
             raw_rows, expected_total, expected_pages = await self._fetch_catalog()
-            products = [
-                self._build_product(raw, category_id_to_path)
-                for raw in raw_rows
-            ]
+            products = [self._build_product(raw, category_id_to_path) for raw in raw_rows]
             if any(product is None for product in products):
                 raise PharmonlinePublicAPIError("products_mapping_failed")
             catalog = [product for product in products if product is not None]

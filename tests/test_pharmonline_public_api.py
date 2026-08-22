@@ -73,14 +73,10 @@ def _pages(*, second_page: list[dict] | None = None) -> dict[int, dict]:
 
 @pytest.mark.asyncio
 async def test_public_api_buffers_then_yields_verified_full_catalog():
-    expected_urls = {
-        f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)
-    }
+    expected_urls = {f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)}
     scraper = _FakePublicAPIScraper(_pages(), sitemap_urls=expected_urls)
 
-    products = [
-        product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)
-    ]
+    products = [product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)]
 
     assert [product.external_id for product in products] == [
         "PRODUCT0000000001",
@@ -90,8 +86,7 @@ async def test_public_api_buffers_then_yields_verified_full_catalog():
     assert all(product.identity_verified for product in products)
     assert all(product.category == "vitaminler" for product in products)
     assert all(
-        product.availability_source == PUBLIC_API_AVAILABILITY_SOURCE
-        for product in products
+        product.availability_source == PUBLIC_API_AVAILABILITY_SOURCE for product in products
     )
     assert products[0].price == 12.0
     assert products[0].discount_price == 9.0
@@ -111,17 +106,13 @@ async def test_public_api_buffers_then_yields_verified_full_catalog():
 
 @pytest.mark.asyncio
 async def test_public_api_rejects_duplicate_id_before_any_yield():
-    expected_urls = {
-        f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)
-    }
+    expected_urls = {f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)}
     scraper = _FakePublicAPIScraper(
         _pages(second_page=[_raw_product(2)]),
         sitemap_urls=expected_urls,
     )
 
-    products = [
-        product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)
-    ]
+    products = [product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)]
 
     assert products == []
     status = scraper._route_statuses[PUBLIC_CATALOG_ROUTE]
@@ -136,9 +127,7 @@ async def test_public_api_rejects_sitemap_mismatch_before_any_yield():
         sitemap_urls={"https://pharmonline.az/product/product-1"},
     )
 
-    products = [
-        product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)
-    ]
+    products = [product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)]
 
     assert products == []
     status = scraper._route_statuses[PUBLIC_CATALOG_ROUTE]
@@ -148,18 +137,14 @@ async def test_public_api_rejects_sitemap_mismatch_before_any_yield():
 
 @pytest.mark.asyncio
 async def test_public_api_keeps_identity_proof_when_category_map_is_temporarily_unavailable():
-    expected_urls = {
-        f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)
-    }
+    expected_urls = {f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)}
     scraper = _FakePublicAPIScraper(
         _pages(),
         sitemap_urls=expected_urls,
         category_unavailable=True,
     )
 
-    products = [
-        product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)
-    ]
+    products = [product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)]
 
     assert len(products) == 3
     assert all(product.category is None for product in products)
@@ -184,9 +169,12 @@ def test_product_mapper_marks_explicit_zero_stock_and_current_price():
 
 
 def test_sitemap_url_canonicalizes_localized_product_url():
-    assert _canonical_product_url(
-        "https://pharmonline.az/ru/product/vitamin-c-1000", source_is_path=False
-    ) == "https://pharmonline.az/product/vitamin-c-1000"
+    assert (
+        _canonical_product_url(
+            "https://pharmonline.az/ru/product/vitamin-c-1000", source_is_path=False
+        )
+        == "https://pharmonline.az/product/vitamin-c-1000"
+    )
     assert _canonical_product_url("bad/path", source_is_path=True) is None
 
 
@@ -218,8 +206,7 @@ async def test_sitemap_fetch_rejects_external_index_and_product_urls(monkeypatch
     async def external_product(url: str) -> str:
         if url.endswith("/sitemap.xml"):
             return (
-                "<sitemapindex><sitemap><loc>/sitemap-products-1.xml</loc>"
-                "</sitemap></sitemapindex>"
+                "<sitemapindex><sitemap><loc>/sitemap-products-1.xml</loc></sitemap></sitemapindex>"
             )
         return "<urlset><url><loc>https://example.test/product/not-safe</loc></url></urlset>"
 
@@ -232,6 +219,4 @@ def test_crawlbase_json_body_accepts_direct_and_pre_rendered_json():
     payload = {"data": [{"_id": "PRODUCT0000000001"}]}
     assert _json_from_rendered_body(payload) == payload
     assert _json_from_rendered_body(json.dumps(payload)) == payload
-    assert _json_from_rendered_body(
-        f"<html><pre>{json.dumps(payload)}</pre></html>"
-    ) == payload
+    assert _json_from_rendered_body(f"<html><pre>{json.dumps(payload)}</pre></html>") == payload
