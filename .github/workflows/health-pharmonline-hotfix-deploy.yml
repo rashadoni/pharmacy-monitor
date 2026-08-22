@@ -578,7 +578,11 @@ jobs:
                   fatal_reason = fatal_proxy_reason(exc)
                   http_status = safe_http_status(exc)
                   if fatal_reason is not None:
-                      result_class = "proxy_rejected"
+                      result_class = (
+                          f"proxy_http_{http_status}"
+                          if http_status in {402, 407}
+                          else "proxy_rejected"
+                      )
                   elif http_status == 403:
                       result_class = "http_403"
                   elif http_status is not None:
