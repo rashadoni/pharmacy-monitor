@@ -1,0 +1,249 @@
+name: Probe Pharmonline public API (no persistence)
+
+# The storefront's current React paginator calls public JSON endpoints rather
+# than navigating its old HTML \`?page=N\` URL. This probe proves that Crawlbase
+# can fetch those endpoints and that their direct product IDs still match the
+# trusted DDP catalog. It never creates or changes a Run, Product, or snapshot.
+on:
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "Current Pharmonline category path to probe"
+        required: true
+        default: "sinir-sistemi-xestelikeri"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pharmonline-public-api-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install probe dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Setup production SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Open read-only production Postgres tunnel
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -N -L 5433:localhost:5432 \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 &
+          echo "TUNNEL_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            if nc -z localhost 5433 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "production Postgres tunnel did not come up" >&2
+          exit 1
+
+      - name: Verify current public API and DDP identity without writes
+        env:
+          DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
+          CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
+          PROBE_CATEGORY: ${{ inputs.category }}
+        run: |
+          set -euo pipefail
+          test -n "$CRAWLBASE_JS_TOKEN"
+          python - <<'PY'
+          import asyncio
+          import json
+          import os
+          from urllib.parse import urlencode
+
+          import httpx
+          from sqlalchemy import select, text
+
+          from src import storage
+          from src.main import (
+              _PHARMONLINE_DDP_AVAILABILITY_SOURCE,
+              _PHARMONLINE_METEOR_ID_RE,
+              _canonical_pharmonline_product_url,
+          )
+
+
+          BASE_URL = "https://pharmonline.az"
+
+
+          async def crawlbase_json(target_url: str) -> dict:
+              params = {
+                  "token": os.environ["CRAWLBASE_JS_TOKEN"],
+                  "url": target_url,
+                  "request_headers": "accept:application/json",
+              }
+              async with httpx.AsyncClient(timeout=120.0) as client:
+                  response = await client.get("https://api.crawlbase.com/", params=params)
+              if response.status_code != 200:
+                  raise SystemExit(
+                      f"Crawlbase public API probe failed: http={response.status_code}"
+                  )
+              try:
+                  payload = json.loads(response.text)
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(
+                      "Crawlbase public API probe did not return JSON"
+                  ) from exc
+              if not isinstance(payload, dict):
+                  raise SystemExit("Crawlbase public API response is not an object")
+              return payload
+
+
+          def rows_and_meta(payload: dict) -> tuple[list[dict], int, int]:
+              rows = payload.get("data")
+              if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                  raise SystemExit(
+                      f"public products response has invalid data field: keys={sorted(payload)[:20]}"
+                  )
+              try:
+                  total = int(payload["total"])
+                  pages = int(payload["pages"])
+              except (KeyError, TypeError, ValueError) as exc:
+                  raise SystemExit(
+                      f"public products response lacks usable total/pages: keys={sorted(payload)[:20]}"
+                  ) from exc
+              return rows, total, pages
+
+
+          async def main() -> None:
+              category_path = os.environ["PROBE_CATEGORY"]
+              categories = await crawlbase_json(f"{BASE_URL}/api/categories?type=category")
+              category_rows = categories.get("data")
+              if not isinstance(category_rows, list):
+                  raise SystemExit(
+                      f"public categories response has invalid data field: keys={sorted(categories)[:20]}"
+                  )
+              category = next(
+                  (
+                      row
+                      for row in category_rows
+                      if isinstance(row, dict) and str(row.get("path")) == category_path
+                  ),
+                  None,
+              )
+              if category is None:
+                  raise SystemExit(f"current category path is absent: {category_path}")
+              category_id = str(category.get("_id") or category.get("id") or "")
+              if not _PHARMONLINE_METEOR_ID_RE.fullmatch(category_id):
+                  raise SystemExit("current category has no valid stable ID")
+
+              def product_url(page: int, *, category_id: str | None = None) -> str:
+                  query = {
+                      "lng": "az",
+                      "page": str(page),
+                      "limit": "100",
+                      "sortBy": "price_asc",
+                  }
+                  if category_id:
+                      query["category"] = category_id
+                  return f"{BASE_URL}/api/products?{urlencode(query)}"
+
+              first_payload = await crawlbase_json(product_url(1, category_id=category_id))
+              second_payload = await crawlbase_json(product_url(2, category_id=category_id))
+              first_rows, category_total, category_pages = rows_and_meta(first_payload)
+              second_rows, second_total, second_pages = rows_and_meta(second_payload)
+              if (
+                  not first_rows
+                  or not second_rows
+                  or category_total != second_total
+                  or category_pages != second_pages
+              ):
+                  raise SystemExit("public category pagination is not stable")
+              first_ids = {str(row.get("_id") or "") for row in first_rows}
+              second_ids = {str(row.get("_id") or "") for row in second_rows}
+              if (
+                  len(first_ids) != len(first_rows)
+                  or len(second_ids) != len(second_rows)
+                  or first_ids & second_ids
+                  or not all(_PHARMONLINE_METEOR_ID_RE.fullmatch(value) for value in first_ids | second_ids)
+              ):
+                  raise SystemExit("public category pages do not expose disjoint stable product IDs")
+
+              global_payload = await crawlbase_json(product_url(1))
+              global_rows, global_total, global_pages = rows_and_meta(global_payload)
+              if not global_rows or global_total < len(global_rows) or global_pages < 1:
+                  raise SystemExit("public global catalog response is incomplete")
+
+              # Read-only DB evidence: current API IDs and canonical paths must
+              # agree with the pre-existing DDP catalogue before recovery code
+              # is allowed to use this source.
+              sample_rows = first_rows[:5]
+              sample_ids = [str(row["_id"]) for row in sample_rows]
+              Session = storage.make_session()
+              with Session() as session:
+                  session.execute(text("SET TRANSACTION READ ONLY"))
+                  try:
+                      existing = session.scalars(
+                          select(storage.Product).where(
+                              storage.Product.tenant_id == 1,
+                              storage.Product.site == "pharmonline",
+                              storage.Product.external_id.in_(sample_ids),
+                          )
+                      ).all()
+                  finally:
+                      session.rollback()
+
+              expected_urls = {
+                  product_id: _canonical_pharmonline_product_url(
+                      f"{BASE_URL}/product/{row.get('path') or ''}"
+                  )
+                  for product_id, row in zip(sample_ids, sample_rows, strict=True)
+              }
+              trusted = {
+                  str(row.external_id)
+                  for row in existing
+                  if row.availability_source == _PHARMONLINE_DDP_AVAILABILITY_SOURCE
+                  and _canonical_pharmonline_product_url(row.url) == expected_urls.get(str(row.external_id))
+              }
+              if trusted != set(sample_ids):
+                  raise SystemExit(
+                      "public API sample did not map exactly to existing DDP identities"
+                  )
+
+              sample_keys = sorted(sample_rows[0])[:30]
+              print(
+                  "Pharmonline public API probe OK: "
+                  f"category_path={category_path}, category_id={category_id}, "
+                  f"category_total={category_total}, category_pages={category_pages}, "
+                  f"page_size={len(first_rows)}, page_overlap={len(first_ids & second_ids)}, "
+                  f"global_total={global_total}, global_pages={global_pages}, "
+                  f"sample_fields={sample_keys}, database_transaction=read_only"
+              )
+
+
+          asyncio.run(main())
+          PY
+
+      - name: Close SSH tunnel
+        if: always()
+        run: |
+          if [ -n "${TUNNEL_PID:-}" ]; then
+            kill "$TUNNEL_PID" 2>/dev/null || true
+          fi
