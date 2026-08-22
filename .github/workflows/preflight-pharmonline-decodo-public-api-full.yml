@@ -113,15 +113,21 @@ jobs:
           cd /opt/pharmacy-monitor
           backup_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-decodo-preflight.XXXXXX)
           mkdir -p "$backup_dir/src/scrapers" "$backup_dir/scripts"
-          cp -p src/scrapers/pharmonline_public_api.py "$backup_dir/src/scrapers/"
+          if [ -f src/scrapers/pharmonline_public_api.py ]; then
+            cp -p src/scrapers/pharmonline_public_api.py "$backup_dir/src/scrapers/"
+            : > "$backup_dir/pharmonline_public_api.preexisting"
+          fi
           if [ -f scripts/preflight_pharmonline_public_api.py ]; then
             cp -p scripts/preflight_pharmonline_public_api.py "$backup_dir/scripts/"
+            : > "$backup_dir/preflight_script.preexisting"
           fi
           printf '%s' "$backup_dir"
           REMOTE
           )
           test -n "$remote_backup"
           echo "REMOTE_BACKUP_DIR=$remote_backup" >> "$GITHUB_ENV"
+          echo "REMOTE_PUBLIC_API_SHA=$(sha256sum src/scrapers/pharmonline_public_api.py | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "REMOTE_PREFLIGHT_SCRIPT_SHA=$(sha256sum scripts/preflight_pharmonline_public_api.py | awk '{print $1}')" >> "$GITHUB_ENV"
           rsync -z --checksum --inplace --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
             src/scrapers/pharmonline_public_api.py \
@@ -196,6 +202,23 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 \
-            "cp -- '$REMOTE_BACKUP_DIR/src/scrapers/pharmonline_public_api.py' \
-              /opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py"
+            pm@46.225.149.52 'bash -s' <<REMOTE
+          set -euo pipefail
+          backup_dir='$REMOTE_BACKUP_DIR'
+          source_path=/opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py
+          script_path=/opt/pharmacy-monitor/scripts/preflight_pharmonline_public_api.py
+
+          if [ -f "\$backup_dir/pharmonline_public_api.preexisting" ]; then
+            cp -- "\$backup_dir/src/scrapers/pharmonline_public_api.py" "\$source_path"
+          elif [ -f "\$source_path" ] && \
+            [ "\$(sha256sum "\$source_path" | awk '{print \$1}')" = '$REMOTE_PUBLIC_API_SHA' ]; then
+            rm -f -- "\$source_path"
+          fi
+
+          if [ -f "\$backup_dir/preflight_script.preexisting" ]; then
+            cp -- "\$backup_dir/scripts/preflight_pharmonline_public_api.py" "\$script_path"
+          elif [ -f "\$script_path" ] && \
+            [ "\$(sha256sum "\$script_path" | awk '{print \$1}')" = '$REMOTE_PREFLIGHT_SCRIPT_SHA' ]; then
+            rm -f -- "\$script_path"
+          fi
+          REMOTE
