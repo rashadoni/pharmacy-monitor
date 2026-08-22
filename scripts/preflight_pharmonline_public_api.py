@@ -20,7 +20,11 @@ from typing import NoReturn
 from sqlalchemy import text
 
 from src import storage
-from src.main import _verify_pharmonline_public_api_identities
+from src.main import (
+    PharmonlinePublicAPIIdentityError,
+    _diagnose_pharmonline_public_api_identities,
+    _verify_pharmonline_public_api_identities,
+)
 from src.scrapers.pharmonline_public_api import (
     PUBLIC_CATALOG_ROUTE,
     PharmonlinePublicAPIScraper,
@@ -76,11 +80,26 @@ async def main() -> None:
     with Session() as session:
         session.execute(text("SET TRANSACTION READ ONLY"))
         try:
-            verified_identities = _verify_pharmonline_public_api_identities(
-                session,
-                [first_pass],
-                tenant_id=1,
-            )
+            try:
+                verified_identities = _verify_pharmonline_public_api_identities(
+                    session,
+                    [first_pass],
+                    tenant_id=1,
+                )
+            except PharmonlinePublicAPIIdentityError as exc:
+                diagnostics = _diagnose_pharmonline_public_api_identities(
+                    session,
+                    [first_pass],
+                    tenant_id=1,
+                )
+                diagnostic_text = ", ".join(
+                    f"{key}={value}" for key, value in sorted(diagnostics.items())
+                )
+                print(
+                    "Pharmonline public API identity diagnostics "
+                    f"(read-only, aggregate-only): {diagnostic_text}"
+                )
+                fail(str(exc))
         finally:
             session.rollback()
 

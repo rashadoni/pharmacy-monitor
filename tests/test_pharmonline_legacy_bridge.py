@@ -352,6 +352,83 @@ def test_public_api_identity_proof_rejects_coverage_drop_below_threshold(db_sess
         )
 
 
+def test_public_api_identity_diagnostics_separate_stale_duplicates_from_new_ids(db_session):
+    """The read-only preflight evidence must not turn legacy rows into trust."""
+    exact_url = "https://pharmonline.az/product/exact-product"
+    duplicate_url = "https://pharmonline.az/product/duplicate-product"
+    missing_url = "https://pharmonline.az/product/missing-product"
+    db_session.add_all(
+        [
+            _stored_product(url=exact_url),
+            _stored_product(
+                url=duplicate_url,
+                external_id="6kHnwLLMpYXyebN8f",
+            ),
+            _stored_product(
+                url=duplicate_url,
+                external_id="legacy-duplicate",
+                availability_source=None,
+            ),
+            _stored_product(
+                url=missing_url,
+                external_id="legacy-missing",
+                availability_source=None,
+            ),
+            _stored_product(
+                url="https://pharmonline.az/product/retired-product",
+                external_id="qwertyuiopasdfghj",
+            ),
+        ]
+    )
+    db_session.commit()
+
+    diagnostics = main_mod._diagnose_pharmonline_public_api_identities(
+        db_session,
+        [
+            ScrapeResult(
+                site="pharmonline",
+                products=[
+                    _public_api_product(exact_url),
+                    _public_api_product(
+                        duplicate_url,
+                        external_id="6kHnwLLMpYXyebN8f",
+                    ),
+                    _public_api_product(
+                        missing_url,
+                        external_id="abcdefghijklmnopq",
+                    ),
+                ],
+            )
+        ],
+        tenant_id=1,
+    )
+
+    assert diagnostics == {
+        "api_ids": 3,
+        "invalid_api": 0,
+        "duplicate_api_ids": 0,
+        "duplicate_api_urls": 0,
+        "trusted_ids": 3,
+        "invalid_trusted": 0,
+        "duplicate_trusted_ids": 0,
+        "missing_trusted_ids": 1,
+        "retired_trusted_ids": 1,
+        "trusted_coverage_per_thousand": 1000,
+        "mismatched_urls": 0,
+        "api_urls_exact_trusted_only": 1,
+        "api_urls_exact_trusted_with_extra_rows": 1,
+        "api_urls_without_stored_rows": 0,
+        "api_urls_unique_nonexact_rows": 1,
+        "api_urls_multiple_nonexact_rows": 0,
+        "missing_id_existing_untrusted_row": 0,
+        "missing_id_absent_from_existing": 1,
+        "missing_id_no_url_row": 0,
+        "missing_id_unique_url_row": 1,
+        "missing_id_multiple_url_rows": 0,
+        "missing_id_url_has_other_trusted_row": 0,
+    }
+
+
 @pytest.mark.parametrize(
     ("raw_url", "expected"),
     [

@@ -350,6 +350,172 @@ def _verify_pharmonline_public_api_identities(
     return len(api_by_id)
 
 
+def _diagnose_pharmonline_public_api_identities(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+) -> dict[str, int]:
+    """Return aggregate-only evidence for a refused public-API identity proof.
+
+    This is deliberately diagnostic rather than a fallback policy: it never
+    changes a Product or treats a legacy row as trusted.  The recovery
+    preflight calls it only inside its read-only transaction after the strict
+    lineage proof has refused persistence.  Counts are sufficient to separate
+    stale duplicate URLs from genuinely unseen/rebound first-party IDs without
+    logging customer catalog names, paths, or identifiers.
+    """
+    from src.scrapers.pharmonline_public_api import PUBLIC_API_AVAILABILITY_SOURCE
+
+    api_by_id: dict[str, str] = {}
+    api_by_url: dict[str, str] = {}
+    invalid_api = 0
+    duplicate_api_ids = 0
+    duplicate_api_urls = 0
+    for result in results:
+        if result.site != "pharmonline":
+            continue
+        for product in result.products:
+            external_id = str(product.external_id)
+            canonical_url = _canonical_pharmonline_product_url(product.url)
+            if (
+                product.site != "pharmonline"
+                or not product.identity_verified
+                or _PHARMONLINE_METEOR_ID_RE.fullmatch(external_id) is None
+                or canonical_url is None
+                or product.availability_source != PUBLIC_API_AVAILABILITY_SOURCE
+            ):
+                invalid_api += 1
+                continue
+            if external_id in api_by_id:
+                duplicate_api_ids += 1
+                continue
+            if canonical_url in api_by_url:
+                duplicate_api_urls += 1
+                continue
+            api_by_id[external_id] = canonical_url
+            api_by_url[canonical_url] = external_id
+
+    existing = session.scalars(
+        select(storage.Product).where(
+            storage.Product.site == "pharmonline",
+            storage.Product.tenant_id == tenant_id,
+        )
+    ).all()
+    trusted_history_product_ids = set(
+        session.scalars(
+            select(storage.OfferObservation.product_id)
+            .where(
+                storage.OfferObservation.tenant_id == tenant_id,
+                storage.OfferObservation.availability_source
+                == _PHARMONLINE_DDP_AVAILABILITY_SOURCE,
+            )
+            .distinct()
+        ).all()
+    )
+    trusted_by_id: dict[str, storage.Product] = {}
+    all_by_id: dict[str, list[storage.Product]] = {}
+    all_by_url: dict[str, list[storage.Product]] = {}
+    invalid_trusted = 0
+    duplicate_trusted_ids = 0
+    for stored in existing:
+        external_id = str(stored.external_id)
+        canonical_url = _canonical_pharmonline_product_url(stored.url)
+        all_by_id.setdefault(external_id, []).append(stored)
+        if canonical_url is not None:
+            all_by_url.setdefault(canonical_url, []).append(stored)
+        if (
+            stored.availability_source != _PHARMONLINE_DDP_AVAILABILITY_SOURCE
+            and stored.id not in trusted_history_product_ids
+        ):
+            continue
+        if _PHARMONLINE_METEOR_ID_RE.fullmatch(external_id) is None or canonical_url is None:
+            invalid_trusted += 1
+            continue
+        if external_id in trusted_by_id:
+            duplicate_trusted_ids += 1
+            continue
+        trusted_by_id[external_id] = stored
+
+    api_ids = set(api_by_id)
+    trusted_ids = set(trusted_by_id)
+    missing_trusted_ids = api_ids - trusted_ids
+    trusted_product_ids = {product.id for product in trusted_by_id.values()}
+
+    exact_trusted_only = 0
+    exact_trusted_with_extra_rows = 0
+    no_stored_url_rows = 0
+    unique_nonexact_url_rows = 0
+    multiple_nonexact_url_rows = 0
+    mismatched_urls = 0
+    missing_id_existing_untrusted_row = 0
+    missing_id_absent_from_existing = 0
+    missing_id_no_url_row = 0
+    missing_id_unique_url_row = 0
+    missing_id_multiple_url_rows = 0
+    missing_id_url_has_other_trusted_row = 0
+    for external_id, canonical_url in api_by_id.items():
+        trusted = trusted_by_id.get(external_id)
+        trusted_matches_url = (
+            trusted is not None and _canonical_pharmonline_product_url(trusted.url) == canonical_url
+        )
+        if trusted is not None and not trusted_matches_url:
+            mismatched_urls += 1
+
+        url_rows = all_by_url.get(canonical_url, [])
+        if trusted_matches_url and len(url_rows) == 1 and url_rows[0].id == trusted.id:
+            exact_trusted_only += 1
+        elif trusted_matches_url and any(row.id == trusted.id for row in url_rows):
+            exact_trusted_with_extra_rows += 1
+        elif not url_rows:
+            no_stored_url_rows += 1
+        elif len(url_rows) == 1:
+            unique_nonexact_url_rows += 1
+        else:
+            multiple_nonexact_url_rows += 1
+
+        if external_id not in missing_trusted_ids:
+            continue
+        if all_by_id.get(external_id):
+            missing_id_existing_untrusted_row += 1
+        else:
+            missing_id_absent_from_existing += 1
+        if not url_rows:
+            missing_id_no_url_row += 1
+        elif len(url_rows) == 1:
+            missing_id_unique_url_row += 1
+        else:
+            missing_id_multiple_url_rows += 1
+        if any(row.id in trusted_product_ids for row in url_rows):
+            missing_id_url_has_other_trusted_row += 1
+
+    trusted_coverage_per_thousand = len(api_ids) * 1000 // len(trusted_ids) if trusted_ids else 0
+    return {
+        "api_ids": len(api_ids),
+        "invalid_api": invalid_api,
+        "duplicate_api_ids": duplicate_api_ids,
+        "duplicate_api_urls": duplicate_api_urls,
+        "trusted_ids": len(trusted_ids),
+        "invalid_trusted": invalid_trusted,
+        "duplicate_trusted_ids": duplicate_trusted_ids,
+        "missing_trusted_ids": len(missing_trusted_ids),
+        "retired_trusted_ids": len(trusted_ids - api_ids),
+        "trusted_coverage_per_thousand": trusted_coverage_per_thousand,
+        "mismatched_urls": mismatched_urls,
+        "api_urls_exact_trusted_only": exact_trusted_only,
+        "api_urls_exact_trusted_with_extra_rows": exact_trusted_with_extra_rows,
+        "api_urls_without_stored_rows": no_stored_url_rows,
+        "api_urls_unique_nonexact_rows": unique_nonexact_url_rows,
+        "api_urls_multiple_nonexact_rows": multiple_nonexact_url_rows,
+        "missing_id_existing_untrusted_row": missing_id_existing_untrusted_row,
+        "missing_id_absent_from_existing": missing_id_absent_from_existing,
+        "missing_id_no_url_row": missing_id_no_url_row,
+        "missing_id_unique_url_row": missing_id_unique_url_row,
+        "missing_id_multiple_url_rows": missing_id_multiple_url_rows,
+        "missing_id_url_has_other_trusted_row": missing_id_url_has_other_trusted_row,
+    }
+
+
 # Phase 1c (2026-05-27) — pharmonline DDP path uses reverse-engineered Meteor
 # protocol через WebSocket, обходит Cloudflare без Playwright. Opt-in via
 # PHARMONLINE_USE_DDP=1. Когда выключено — используется legacy Playwright путь.
