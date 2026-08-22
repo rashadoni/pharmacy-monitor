@@ -17,7 +17,7 @@ import sys
 from datetime import datetime, timedelta
 from src._time import utcnow
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import click
 import structlog
@@ -55,10 +55,15 @@ class PharmonlineLegacyIdentityBridgeError(RuntimeError):
     """The legacy HTML path could not prove DDP-compatible product identity."""
 
 
+class PharmonlinePublicAPIIdentityError(RuntimeError):
+    """The public API catalog disagrees with the trusted DDP identity map."""
+
+
 _PHARMONLINE_LEGACY_ID_BRIDGE_ENV = "PHARMONLINE_LEGACY_ID_BRIDGE"
 _PHARMONLINE_PUBLIC_API_ENV = "PHARMONLINE_PUBLIC_API"
 _PHARMONLINE_METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
 _PHARMONLINE_DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
+_PHARMONLINE_PUBLIC_API_MIN_TRUSTED_COVERAGE = 0.98
 
 
 def _pharmonline_legacy_id_bridge_enabled() -> bool:
@@ -87,22 +92,23 @@ def _pharmonline_public_api_enabled() -> bool:
 
 
 def _canonical_pharmonline_product_url(raw_url: str | None) -> str | None:
-    """Canonical URL key shared by locale HTML and locale-free DDP paths."""
+    """Canonical URL key shared by the public API and trusted DDP history."""
     if not raw_url:
         return None
     parsed = urlsplit(raw_url.strip())
     host = parsed.netloc.lower().removeprefix("www.")
-    path = parsed.path.rstrip("/")
+    path = unquote(parsed.path).strip().rstrip("/")
     for locale in ("az", "en", "ru"):
         prefix = f"/{locale}/product/"
         if path.startswith(prefix):
-            path = path[len(locale) + 1 :]
+            path = "/product/" + path[len(prefix) :]
             break
     if host not in {"", "pharmonline.az"} or not path.startswith("/product/"):
         return None
-    if path == "/product":
+    slug = path[len("/product/") :].strip("/")
+    if not slug or "/" in slug:
         return None
-    return f"https://pharmonline.az{path}"
+    return f"https://pharmonline.az/product/{quote(slug, safe='-._~')}"
 
 
 def _bridge_pharmonline_legacy_ids(
@@ -183,6 +189,165 @@ def _bridge_pharmonline_legacy_ids(
         unique_urls=len({url for _, url in legacy_products if url}),
     )
     return len(replacements)
+
+
+def _verify_pharmonline_public_api_identities(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+) -> int:
+    """Require every current API ID→URL pair to exist in trusted DDP history.
+
+    The public API and sitemap prove that the new source is internally
+    complete, but they cannot prove that a first-party ID has not been
+    reassigned. For this guarded recovery, every current API
+    `(external_id, canonical URL)` pair must exist in the prior DDP-trusted
+    map before the first Product, offer observation, or price snapshot write.
+    Current DDP fields and immutable DDP offer observations both establish that
+    lineage, so a guarded retry remains safe after a prior public-API write has
+    updated the mutable current availability source. Historic DDP-only rows are
+    permitted as normal delistings, but the current source must still cover at
+    least 98% of that trusted catalog. New or rebound API IDs intentionally
+    stop the recovery rather than being guessed into the historical catalog.
+    """
+    from src.scrapers.pharmonline_public_api import PUBLIC_API_AVAILABILITY_SOURCE
+
+    pharmonline_results = [result for result in results if result.site == "pharmonline"]
+    unexpected_results = len(results) - len(pharmonline_results)
+    unexpected_promos = sum(len(result.promos) for result in pharmonline_results)
+    if len(pharmonline_results) != 1 or unexpected_results or unexpected_promos:
+        raise PharmonlinePublicAPIIdentityError(
+            "public Pharmonline API identity proof refused persistence: "
+            f"pharmonline_results={len(pharmonline_results)}, "
+            f"unexpected_results={unexpected_results}, "
+            f"unexpected_promos={unexpected_promos}"
+        )
+
+    api_by_id: dict[str, str] = {}
+    api_by_url: dict[str, str] = {}
+    invalid_api = 0
+    duplicate_api_ids = 0
+    duplicate_api_urls = 0
+    for result in pharmonline_results:
+        for product in result.products:
+            external_id = str(product.external_id)
+            canonical_url = _canonical_pharmonline_product_url(product.url)
+            if (
+                product.site != "pharmonline"
+                or not product.identity_verified
+                or _PHARMONLINE_METEOR_ID_RE.fullmatch(external_id) is None
+                or canonical_url is None
+                or product.availability_source != PUBLIC_API_AVAILABILITY_SOURCE
+            ):
+                invalid_api += 1
+                continue
+            if external_id in api_by_id:
+                duplicate_api_ids += 1
+                continue
+            if canonical_url in api_by_url:
+                duplicate_api_urls += 1
+                continue
+            api_by_id[external_id] = canonical_url
+            api_by_url[canonical_url] = external_id
+
+    if invalid_api or duplicate_api_ids or duplicate_api_urls or not api_by_id:
+        raise PharmonlinePublicAPIIdentityError(
+            "public Pharmonline API identity proof refused persistence: "
+            f"api_ids={len(api_by_id)}, invalid_api={invalid_api}, "
+            f"duplicate_api_ids={duplicate_api_ids}, "
+            f"duplicate_api_urls={duplicate_api_urls}"
+        )
+
+    existing = session.scalars(
+        select(storage.Product).where(
+            storage.Product.site == "pharmonline",
+            storage.Product.tenant_id == tenant_id,
+        )
+    ).all()
+    trusted_history_product_ids = set(
+        session.scalars(
+            select(storage.OfferObservation.product_id)
+            .where(
+                storage.OfferObservation.tenant_id == tenant_id,
+                storage.OfferObservation.availability_source
+                == _PHARMONLINE_DDP_AVAILABILITY_SOURCE,
+            )
+            .distinct()
+        ).all()
+    )
+    trusted_by_id: dict[str, storage.Product] = {}
+    all_by_id: dict[str, list[storage.Product]] = {}
+    all_by_url: dict[str, list[storage.Product]] = {}
+    invalid_trusted = 0
+    duplicate_trusted_ids = 0
+    for stored in existing:
+        external_id = str(stored.external_id)
+        canonical_url = _canonical_pharmonline_product_url(stored.url)
+        all_by_id.setdefault(external_id, []).append(stored)
+        if canonical_url is not None:
+            all_by_url.setdefault(canonical_url, []).append(stored)
+        if (
+            stored.availability_source != _PHARMONLINE_DDP_AVAILABILITY_SOURCE
+            and stored.id not in trusted_history_product_ids
+        ):
+            continue
+        if _PHARMONLINE_METEOR_ID_RE.fullmatch(external_id) is None or canonical_url is None:
+            invalid_trusted += 1
+            continue
+        if external_id in trusted_by_id:
+            duplicate_trusted_ids += 1
+            continue
+        trusted_by_id[external_id] = stored
+
+    api_ids = set(api_by_id)
+    trusted_ids = set(trusted_by_id)
+    missing_trusted_ids = api_ids - trusted_ids
+    retired_trusted_ids = trusted_ids - api_ids
+    mismatched_urls = 0
+    id_collisions = 0
+    url_collisions = 0
+    for external_id, canonical_url in api_by_id.items():
+        trusted = trusted_by_id.get(external_id)
+        if trusted is not None and _canonical_pharmonline_product_url(trusted.url) != canonical_url:
+            mismatched_urls += 1
+        id_rows = all_by_id.get(external_id, [])
+        if trusted is None or len(id_rows) != 1 or id_rows[0].id != trusted.id:
+            id_collisions += 1
+        url_rows = all_by_url.get(canonical_url, [])
+        if trusted is None or len(url_rows) != 1 or url_rows[0].id != trusted.id:
+            url_collisions += 1
+
+    trusted_coverage = len(api_ids) / len(trusted_ids) if trusted_ids else 0.0
+    if (
+        invalid_trusted
+        or duplicate_trusted_ids
+        or missing_trusted_ids
+        or mismatched_urls
+        or id_collisions
+        or url_collisions
+        or trusted_coverage < _PHARMONLINE_PUBLIC_API_MIN_TRUSTED_COVERAGE
+    ):
+        raise PharmonlinePublicAPIIdentityError(
+            "public Pharmonline API identity proof refused persistence: "
+            f"api_ids={len(api_ids)}, trusted_ids={len(trusted_ids)}, "
+            f"invalid_trusted={invalid_trusted}, "
+            f"duplicate_trusted_ids={duplicate_trusted_ids}, "
+            f"missing_trusted_ids={len(missing_trusted_ids)}, "
+            f"retired_trusted_ids={len(retired_trusted_ids)}, "
+            f"trusted_coverage={trusted_coverage:.4f}, "
+            f"mismatched_urls={mismatched_urls}, id_collisions={id_collisions}, "
+            f"url_collisions={url_collisions}"
+        )
+
+    log.info(
+        "pharmonline_public_api_identity_verified",
+        products=len(api_by_id),
+        trusted_coverage=round(trusted_coverage, 4),
+        trusted_history_products=len(trusted_history_product_ids),
+        tenant_id=tenant_id,
+    )
+    return len(api_by_id)
 
 
 # Phase 1c (2026-05-27) — pharmonline DDP path uses reverse-engineered Meteor
@@ -3137,6 +3302,28 @@ def run_cmd(
                             "guarded catalog recovery refused persistence: "
                             f"{guarded_catalog_reason or 'full catalog verification failed'}"
                         )
+                if use_public_api:
+                    try:
+                        _verify_pharmonline_public_api_identities(
+                            session,
+                            results,
+                            tenant_id=run.tenant_id,
+                        )
+                    except PharmonlinePublicAPIIdentityError as exc:
+                        # The API+sitemap catalog itself was complete, but its
+                        # identities did not prove lineage to the trusted DDP
+                        # catalog.  Do not leave this attempt marked verified.
+                        guarded_catalog_verified = False
+                        guarded_catalog_reason = (
+                            f"public_api_identity_proof_failed:{str(exc).split(': ', 1)[-1]}"
+                        )[:300]
+                        run.catalog_verified = False
+                        run.catalog_verification_reason = guarded_catalog_reason
+                        quality["full_catalog_verified"] = False
+                        quality["financially_eligible"] = False
+                        quality["catalog_verification_reason"] = guarded_catalog_reason
+                        run.run_quality = quality
+                        raise
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}

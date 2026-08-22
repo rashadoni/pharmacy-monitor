@@ -183,6 +183,96 @@ def test_revalidation_failure_marks_run_and_request_failed_before_outputs(db_ses
     assert calls == {"alerts": 0, "analyze": 0, "roi": 0}
 
 
+def test_public_api_recovery_refuses_persistence_after_identity_proof_failure(
+    db_session, monkeypatch
+):
+    """A complete source still cannot write an untrusted ID→URL mapping."""
+    from src.scrapers.pharmonline_public_api import (
+        PUBLIC_API_AVAILABILITY_SOURCE,
+        PUBLIC_CATALOG_ROUTE,
+    )
+
+    async def untrusted_catalog(*args, **kwargs):
+        return [
+            ScrapeResult(
+                site="pharmonline",
+                products=[
+                    ScrapedProduct(
+                        site="pharmonline",
+                        external_id="xwJspdCx3iFBDqDWF",
+                        url="https://pharmonline.az/product/untrusted-product",
+                        name="Untrusted public API product",
+                        identity_verified=True,
+                        availability_source=PUBLIC_API_AVAILABILITY_SOURCE,
+                    )
+                ],
+                category_counts={PUBLIC_CATALOG_ROUTE: 1},
+                route_statuses={
+                    PUBLIC_CATALOG_ROUTE: RouteStatus(
+                        complete=True,
+                        raw_items=1,
+                        parsed_items=1,
+                        expected_items=1,
+                    )
+                },
+            )
+        ]
+
+    persisted = []
+    Session = _session_factory(db_session)
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_USE_DDP", "0")
+    monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "0")
+    monkeypatch.delenv("PHARMONLINE_LEGACY_ID_BRIDGE", raising=False)
+    monkeypatch.delenv("AI_FALLBACK_ENABLED", raising=False)
+    monkeypatch.setattr(storage, "init_db", lambda: None)
+    monkeypatch.setattr(storage, "make_session", lambda: Session)
+    monkeypatch.setattr(
+        main_mod, "_hold_scrape_lock_until_command_exit", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(main_mod, "maybe_seed_categories", lambda session: None)
+    monkeypatch.setattr(
+        main_mod,
+        "baselines_for_sites",
+        lambda *args, **kwargs: {"pharmonline": 1},
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "run_quality_baselines_for_sites",
+        lambda *args, **kwargs: {"pharmonline": 1},
+    )
+    monkeypatch.setattr(main_mod, "scrape_all", untrusted_catalog)
+    monkeypatch.setattr(
+        main_mod,
+        "persist_results",
+        lambda *args, **kwargs: persisted.append("called"),
+    )
+
+    result = CliRunner().invoke(
+        main_mod.cli,
+        ["run", "--site", "pharmonline", "--mode", "public_api", "--no-alerts"],
+    )
+
+    assert result.exit_code != 0
+    assert "identity proof refused persistence" in result.output
+    assert persisted == []
+    verify = Session()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        assert run is not None
+        assert run.status == "failed"
+        assert run.catalog_verified is False
+        assert (run.catalog_verification_reason or "").startswith(
+            "public_api_identity_proof_failed:"
+        )
+        assert "PharmonlinePublicAPIIdentityError" in (run.error_message or "")
+        assert verify.scalars(select(storage.Product)).all() == []
+        assert verify.scalars(select(storage.OfferObservation)).all() == []
+        assert verify.scalars(select(storage.PriceSnapshot)).all() == []
+    finally:
+        verify.close()
+
+
 def test_rematch_revalidate_dissolve_cli_uses_unmatched_key(db_session, monkeypatch):
     monkeypatch.setattr(storage, "make_session", lambda: _session_factory(db_session))
     monkeypatch.setattr(

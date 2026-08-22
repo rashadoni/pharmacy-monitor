@@ -53,6 +53,16 @@ jobs:
           test "$conclusion" = "success"
           test "$workflow_name" = "Preflight full Pharmonline public API recovery (no persistence)"
           test "$head_sha" = "$GITHUB_SHA"
+          ci_run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow ci-pipeline.yml --commit "$GITHUB_SHA" --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          case "$ci_run_id" in
+            ''|*[!0-9]*)
+              echo "a successful Pharmacy Monitor CI run is required for this commit" >&2
+              exit 1
+              ;;
+          esac
+          echo "matching_ci_run_id=$ci_run_id"
 
       - uses: actions/checkout@v4
 
@@ -75,7 +85,13 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' \
+            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
+          test "$host_fingerprint" = \
+            'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
 
       - name: Check production capacity and scraper state
         run: |

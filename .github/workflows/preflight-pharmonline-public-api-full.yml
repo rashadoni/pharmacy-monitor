@@ -57,7 +57,13 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' \
+            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
+          test "$host_fingerprint" = \
+            'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
 
       - name: Open read-only production Postgres tunnel
         run: |
@@ -97,7 +103,7 @@ jobs:
           from xml.etree import ElementTree
 
           import httpx
-          from sqlalchemy import bindparam, create_engine, text
+          from sqlalchemy import create_engine, text
 
 
           BASE_URL = "https://pharmonline.az"
@@ -107,7 +113,7 @@ jobs:
           METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
           PRODUCT_SITEMAP_RE = re.compile(r"/sitemap-products-\d+\.xml$", re.I)
           DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
-          DB_SAMPLE_SIZE = 20
+          MIN_TRUSTED_COVERAGE = 0.98
 
 
           @dataclass(frozen=True)
@@ -156,6 +162,35 @@ jobs:
                       break
               if source_is_path:
                   decoded_path = "/product/" + decoded_path.lstrip("/")
+              if not decoded_path.startswith("/product/"):
+                  return None
+              slug = decoded_path[len("/product/") :].strip("/")
+              if not slug or "/" in slug:
+                  return None
+              return f"{BASE_URL}/product/{quote(slug, safe='-._~')}"
+
+
+          def canonical_stored_product_url(value: object) -> str | None:
+              """Match the runtime identity guard for historical DDP rows.
+
+              Historic records may preserve a locale query or fragment. Those
+              do not identify a different product, so normalize them exactly
+              as the recovery command does before comparing a trusted DDP row
+              with the public API path.
+              """
+              raw = text_value(value)
+              if raw is None:
+                  return None
+              parsed = urlsplit(raw)
+              host = parsed.netloc.lower().removeprefix("www.")
+              if host not in {"", "pharmonline.az"}:
+                  return None
+              decoded_path = unquote(parsed.path).strip().rstrip("/")
+              for locale in ("az", "en", "ru"):
+                  prefix = f"/{locale}/product/"
+                  if decoded_path.startswith(prefix):
+                      decoded_path = "/product/" + decoded_path[len(prefix) :]
+                      break
               if not decoded_path.startswith("/product/"):
                   return None
               slug = decoded_path[len("/product/") :].strip("/")
@@ -413,24 +448,31 @@ jobs:
               return frozenset(product_urls)
 
 
-          def ordered_sample(catalog: CatalogPass) -> list[tuple[str, str]]:
-              flattened = [record for page in catalog.page_records for record in page]
-              if len(flattened) != catalog.total:
-                  fail("internal preflight sample coverage mismatch")
-              count = min(DB_SAMPLE_SIZE, len(flattened))
-              # Evenly spaced deterministic samples cover early, middle, and
-              # final paginator positions rather than only page one.
-              indices = {
-                  round(index * (len(flattened) - 1) / max(count - 1, 1))
-                  for index in range(count)
+          def verify_read_only_database_identity(
+              catalog: CatalogPass,
+          ) -> tuple[int, int, float, int]:
+              """Prove all current API ID→URL pairs are trusted DDP lineage.
+
+              A deterministic sample cannot safely establish that thousands of
+              public IDs still belong to the same records. Read every current
+              Pharmonline product under a read-only transaction and apply the
+              same fail-closed set proof as the write-enabled recovery command.
+              Current DDP fields and immutable DDP offer observations both
+              establish lineage, so a retry remains safe after a previous
+              public-API write updated the mutable current source. DDP-only
+              history is allowed as a delisting, but coverage must remain at
+              least 98 percent.
+              """
+              api_by_id = {
+                  external_id: canonical_url
+                  for page in catalog.page_records
+                  for external_id, canonical_url in page
               }
-              return [flattened[index] for index in sorted(indices)]
-
-
-          def verify_read_only_database_identity(catalog: CatalogPass) -> int:
-              samples = ordered_sample(catalog)
-              sample_ids = [external_id for external_id, _ in samples]
-              expected_urls = dict(samples)
+              if (
+                  len(api_by_id) != catalog.total
+                  or len(set(api_by_id.values())) != catalog.total
+              ):
+                  fail("internal preflight API identity coverage mismatch")
               engine = create_engine(
                   os.environ["DATABASE_URL"],
                   # The session setting protects this connection even if a
@@ -447,40 +489,123 @@ jobs:
                           ).scalar_one()
                           if str(read_only).lower() not in {"on", "true", "1"}:
                               fail("database transaction did not enter read-only mode")
-                          query = text(
-                              """
-                              SELECT external_id, url, availability_source
-                              FROM products
-                              WHERE tenant_id = :tenant_id
-                                AND site = 'pharmonline'
-                                AND external_id IN :external_ids
-                              """
-                          ).bindparams(bindparam("external_ids", expanding=True))
                           rows = connection.execute(
-                              query,
-                              {"tenant_id": 1, "external_ids": sample_ids},
+                              text(
+                                  """
+                                  SELECT p.id, p.external_id, p.url,
+                                         p.availability_source,
+                                         EXISTS (
+                                             SELECT 1
+                                             FROM offer_observations AS oo
+                                             WHERE oo.tenant_id = p.tenant_id
+                                               AND oo.product_id = p.id
+                                               AND oo.availability_source = :ddp_source
+                                         ) AS has_ddp_history
+                                  FROM products AS p
+                                  WHERE p.tenant_id = :tenant_id
+                                    AND p.site = 'pharmonline'
+                                  """
+                              ),
+                              {
+                                  "tenant_id": 1,
+                                  "ddp_source": DDP_AVAILABILITY_SOURCE,
+                              },
                           ).mappings().all()
-                          trusted = {
-                              str(row["external_id"])
-                              for row in rows
-                              if row["availability_source"] == DDP_AVAILABILITY_SOURCE
-                              and canonical_product_url(row["url"], source_is_path=False)
-                              == expected_urls.get(str(row["external_id"]))
-                          }
                       finally:
                           # Explicitly roll back the read-only transaction;
                           # this workflow never commits a database change.
                           transaction.rollback()
               finally:
                   engine.dispose()
-              if trusted != set(sample_ids):
-                  missing_or_untrusted = len(set(sample_ids) - trusted)
+
+              trusted_by_id: dict[str, dict] = {}
+              all_by_id: dict[str, list[dict]] = {}
+              all_by_url: dict[str, list[dict]] = {}
+              invalid_trusted = 0
+              duplicate_trusted_ids = 0
+              trusted_history_products = 0
+              for row in rows:
+                  external_id = text_value(row["external_id"])
+                  canonical_url = canonical_stored_product_url(row["url"])
+                  if external_id is not None:
+                      all_by_id.setdefault(external_id, []).append(row)
+                  if canonical_url is not None:
+                      all_by_url.setdefault(canonical_url, []).append(row)
+                  has_ddp_history = bool(row["has_ddp_history"])
+                  if has_ddp_history:
+                      trusted_history_products += 1
+                  if (
+                      row["availability_source"] != DDP_AVAILABILITY_SOURCE
+                      and not has_ddp_history
+                  ):
+                      continue
+                  if (
+                      external_id is None
+                      or METEOR_ID_RE.fullmatch(external_id) is None
+                      or canonical_url is None
+                  ):
+                      invalid_trusted += 1
+                      continue
+                  if external_id in trusted_by_id:
+                      duplicate_trusted_ids += 1
+                      continue
+                  trusted_by_id[external_id] = row
+
+              api_ids = set(api_by_id)
+              trusted_ids = set(trusted_by_id)
+              missing_trusted_ids = api_ids - trusted_ids
+              retired_trusted_ids = trusted_ids - api_ids
+              mismatched_urls = 0
+              id_collisions = 0
+              url_collisions = 0
+              for external_id, canonical_url in api_by_id.items():
+                  trusted = trusted_by_id.get(external_id)
+                  if trusted is not None and (
+                      canonical_stored_product_url(trusted["url"]) != canonical_url
+                  ):
+                      mismatched_urls += 1
+                  id_rows = all_by_id.get(external_id, [])
+                  if (
+                      trusted is None
+                      or len(id_rows) != 1
+                      or id_rows[0]["id"] != trusted["id"]
+                  ):
+                      id_collisions += 1
+                  url_rows = all_by_url.get(canonical_url, [])
+                  if (
+                      trusted is None
+                      or len(url_rows) != 1
+                      or url_rows[0]["id"] != trusted["id"]
+                  ):
+                      url_collisions += 1
+
+              trusted_coverage = len(api_ids) / len(trusted_ids) if trusted_ids else 0.0
+              if (
+                  invalid_trusted
+                  or duplicate_trusted_ids
+                  or missing_trusted_ids
+                  or mismatched_urls
+                  or id_collisions
+                  or url_collisions
+                  or trusted_coverage < MIN_TRUSTED_COVERAGE
+              ):
                   fail(
-                      "public API sample does not map exactly to existing DDP identities: "
-                      f"trusted={len(trusted)}, expected={len(sample_ids)}, "
-                      f"missing_or_untrusted={missing_or_untrusted}"
+                      "public API does not map exactly to existing DDP identities: "
+                      f"api_ids={len(api_ids)}, trusted_ids={len(trusted_ids)}, "
+                      f"invalid_trusted={invalid_trusted}, "
+                      f"duplicate_trusted_ids={duplicate_trusted_ids}, "
+                      f"missing_trusted_ids={len(missing_trusted_ids)}, "
+                      f"retired_trusted_ids={len(retired_trusted_ids)}, "
+                      f"trusted_coverage={trusted_coverage:.4f}, "
+                      f"mismatched_urls={mismatched_urls}, "
+                      f"id_collisions={id_collisions}, url_collisions={url_collisions}"
                   )
-              return len(sample_ids)
+              return (
+                  len(api_ids),
+                  len(trusted_ids),
+                  trusted_coverage,
+                  trusted_history_products,
+              )
 
 
           async def main() -> None:
@@ -509,12 +634,21 @@ jobs:
                       f"sitemap_only={len(sitemap_urls - first_pass.urls)}"
                   )
 
-              sample_count = verify_read_only_database_identity(first_pass)
+              (
+                  api_identity_count,
+                  trusted_identity_count,
+                  trusted_coverage,
+                  trusted_history_products,
+              ) = verify_read_only_database_identity(first_pass)
               print(
                   "Pharmonline public API full preflight OK: "
                   f"sort_by={SORT_BY}, total={first_pass.total}, pages={first_pass.pages}, "
                   f"page_size={PAGE_SIZE}, two_passes=identical, "
-                  f"sitemap_urls={len(sitemap_urls)}, db_samples={sample_count}, "
+                  f"sitemap_urls={len(sitemap_urls)}, "
+                  f"api_identities={api_identity_count}, "
+                  f"trusted_ddp_identities={trusted_identity_count}, "
+                  f"trusted_ddp_history_products={trusted_history_products}, "
+                  f"trusted_coverage={trusted_coverage:.4f}, "
                   "database_transaction=read_only, persistence=none"
               )
 
