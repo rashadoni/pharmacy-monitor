@@ -328,6 +328,10 @@ class ScrapedProduct:
     external_id: str
     url: str
     name: str
+    # True only when the scraper read a first-party stable item ID directly
+    # from the rendered source. Recovery-only bridges must verify such an ID
+    # against their URL mapping rather than silently replacing a disagreement.
+    identity_verified: bool = False
     brand: str | None = None
     manufacturer: str | None = None
     # Explicit manufacturing-country signal from the source.  This is not the

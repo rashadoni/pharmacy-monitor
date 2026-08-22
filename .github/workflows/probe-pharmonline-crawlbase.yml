@@ -1,7 +1,8 @@
 name: Probe Pharmonline via Crawlbase (no persistence)
 
-# This is intentionally a source-only probe: it exercises the live fallback
-# route but never opens a database connection or creates a Run/Product row.
+# This probe exercises the live fallback route and verifies a handful of
+# rendered URLs against the existing DDP catalog in a read-only transaction.
+# It never creates a Run, Product or snapshot.
 on:
   workflow_dispatch:
     inputs:
@@ -35,11 +36,43 @@ jobs:
           pip install -e .
           playwright install chromium --with-deps
 
+      - name: Setup production SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Open read-only production Postgres tunnel
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -N -L 5433:localhost:5432 \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 &
+          echo "TUNNEL_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            if nc -z localhost 5433 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "production Postgres tunnel did not come up" >&2
+          exit 1
+
       - name: Fetch and parse a few cards without persisting anything
         env:
+          DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
           CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
           CRAWLBASE_API_SITES: pharmonline
+          CRAWLBASE_PAGE_WAIT_MS: "4000"
           PHARMONLINE_USE_DDP: "0"
+          PHARMONLINE_LEGACY_ID_BRIDGE: "required"
           PROBE_CATEGORY: ${{ inputs.category }}
         run: |
           set -euo pipefail
@@ -51,6 +84,9 @@ jobs:
           from urllib.parse import quote
 
           import httpx
+          from sqlalchemy import text
+          from src import storage
+          from src.main import _bridge_pharmonline_legacy_ids
           from src.scrapers.pharmonline import PharmonlineScraper
 
 
@@ -74,7 +110,14 @@ jobs:
                   for signal in ("cloudflare", "captcha", "access denied", "rate limit", "crawlbase error")
                   if signal in lower_html
               ]
-              card_markers = html.count("product_box_v2")
+              class_values = re.findall(r'\bclass=["\']([^"\']+)["\']', html, re.I)
+              legacy_card_markers = sum(
+                  "product_box_v2" in raw_classes.split() for raw_classes in class_values
+              )
+              current_card_markers = sum(
+                  "product_box" in raw_classes.split() for raw_classes in class_values
+              )
+              card_markers = legacy_card_markers + current_card_markers
               class_tokens = sorted(
                   {
                       token
@@ -90,7 +133,8 @@ jobs:
               print(
                   "Crawlbase response profile: "
                   f"http={response.status_code}, bytes={len(html)}, title={title!r}, "
-                  f"card_markers={card_markers}, product_hrefs={html.count('/product/')}, "
+                  f"card_markers={card_markers} (legacy={legacy_card_markers}, current={current_card_markers}), "
+                  f"product_hrefs={html.count('/product/')}, "
                   f"data_id_count={html.count('data-id=')}, signals={signals or ['none']}"
               )
               print(f"Crawlbase structural classes: {class_tokens[:80]}")
@@ -109,24 +153,56 @@ jobs:
                   # This invokes no storage code and cannot alter production data.
                   result = await scraper.scrape([category], limit_per_category=5)
 
-              product_ids = [product.external_id for product in result.products]
+              raw_product_ids = [product.external_id for product in result.products]
               if result.errors:
                   raise SystemExit(f"Crawlbase probe errors: {result.errors[:3]}")
-              if len(product_ids) < 3:
-                  raise SystemExit(f"Crawlbase probe returned too few products: {len(product_ids)}")
-              if len(set(product_ids)) != len(product_ids):
+              if len(raw_product_ids) < 3:
+                  raise SystemExit(f"Crawlbase probe returned too few products: {len(raw_product_ids)}")
+              if len(set(raw_product_ids)) != len(raw_product_ids):
                   raise SystemExit("Crawlbase probe returned duplicate product IDs")
-              if not all(re.fullmatch(r"[A-Za-z0-9]{17}", product_id) for product_id in product_ids):
-                  raise SystemExit("Crawlbase probe returned a non-Meteor product ID")
 
               route = result.route_statuses.get(category)
               if route is None or route.abort_reason != "requested_limit_reached":
                   raise SystemExit("Crawlbase probe did not record the bounded-route guard")
+
+              # The bridge uses only SELECTs and updates only in-memory
+              # ScrapedProduct objects. Postgres additionally refuses any
+              # accidental write in this probe's transaction.
+              Session = storage.make_session()
+              with Session() as session:
+                  session.execute(text("SET TRANSACTION READ ONLY"))
+                  try:
+                      bridged = _bridge_pharmonline_legacy_ids(
+                          session,
+                          [result],
+                          tenant_id=1,
+                      )
+                  finally:
+                      session.rollback()
+
+              product_ids = [product.external_id for product in result.products]
+              if bridged != len(product_ids):
+                  raise SystemExit("Crawlbase probe did not bridge every rendered card")
+              if not all(re.fullmatch(r"[A-Za-z0-9]{17}", product_id) for product_id in product_ids):
+                  raise SystemExit("Crawlbase bridge returned a non-Meteor product ID")
+              identity_source = (
+                  "rendered_meteor_id"
+                  if all(re.fullmatch(r"[A-Za-z0-9]{17}", product_id) for product_id in raw_product_ids)
+                  else "url_to_existing_ddp_id"
+              )
               print(
                   f"Crawlbase source probe OK: category={category}, "
-                  f"products={len(product_ids)}, stable_meteor_ids=true"
+                  f"products={len(product_ids)}, identity_source={identity_source}, "
+                  "database_transaction=read_only"
               )
 
 
           asyncio.run(main())
           PY
+
+      - name: Close SSH tunnel
+        if: always()
+        run: |
+          if [ -n "${TUNNEL_PID:-}" ]; then
+            kill "$TUNNEL_PID" 2>/dev/null || true
+          fi

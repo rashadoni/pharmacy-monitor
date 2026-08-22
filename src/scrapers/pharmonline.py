@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import AsyncIterator
 
@@ -34,6 +35,22 @@ log = structlog.get_logger()
 # HTML/Crawlbase path: using the URL slug here would create a second Product row
 # next to the DDP record because persistence keys on ``(site, external_id)``.
 _METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
+_CARD_SELECTOR = ".product_box_v2, .product_box"
+_PRODUCT_LINK_SELECTOR = 'a[href*="/product/"]'
+_CARD_PRODUCT_LINK_SELECTOR = ", ".join(
+    f"{card_selector} {_PRODUCT_LINK_SELECTOR}"
+    for card_selector in _CARD_SELECTOR.split(", ")
+)
+
+
+def _legacy_id_bridge_enabled() -> bool:
+    """Allow a URL slug only for the guarded pre-persist identity bridge."""
+    return os.environ.get("PHARMONLINE_LEGACY_ID_BRIDGE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "required",
+    }
 
 
 def _meteor_id_from_card_values(values: list[str | None]) -> str | None:
@@ -102,7 +119,7 @@ class PharmonlineScraper(BaseScraper):
                     # пустота — ошибка; после успешных страниц — terminal page.
                     for _ in range(10):
                         count = await page.evaluate(
-                            "document.querySelectorAll('.product_box_v2').length"
+                            f"document.querySelectorAll('{_CARD_SELECTOR}').length"
                         )
                         if count >= 1:
                             break
@@ -120,7 +137,7 @@ class PharmonlineScraper(BaseScraper):
                     # ссылка. Оболочки без ссылок — не доказательство конца.
                     try:
                         await page.wait_for_selector(
-                            '.product_box_v2 a[href*="/product/"]',
+                            _CARD_PRODUCT_LINK_SELECTOR,
                             timeout=8000,
                             state="attached",
                         )
@@ -133,14 +150,14 @@ class PharmonlineScraper(BaseScraper):
                     # Lazy-load: scroll до стабилизации количества карточек
                     prev_count = -1
                     for _ in range(12):
-                        cards_now = await page.query_selector_all(".product_box_v2")
+                        cards_now = await page.query_selector_all(_CARD_SELECTOR)
                         if len(cards_now) == prev_count:
                             break
                         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                         await page.wait_for_timeout(700)
                         prev_count = len(cards_now)
 
-                    cards = await page.query_selector_all(".product_box_v2")
+                    cards = await page.query_selector_all(_CARD_SELECTOR)
                     total_cards_found += len(cards)
                     log.info(
                         "pharmonline_cards_found",
@@ -226,7 +243,7 @@ class PharmonlineScraper(BaseScraper):
               .second_price (цена)
               .old-price/s/del (если есть)
         """
-        link = await card.query_selector('a[href*="/product/"]')
+        link = await card.query_selector(_PRODUCT_LINK_SELECTOR)
         if not link:
             return None
         href = await link.get_attribute("href")
@@ -240,13 +257,20 @@ class PharmonlineScraper(BaseScraper):
             if identity_node:
                 identity_values.append(await identity_node.get_attribute("data-id"))
         external_id = _meteor_id_from_card_values(identity_values)
+        identity_verified = external_id is not None
         if external_id is None:
-            log.warning(
-                "pharmonline_card_missing_stable_id",
-                url=full_url,
-                observed_ids=identity_values,
-            )
-            return None
+            if _legacy_id_bridge_enabled():
+                # Newer markup no longer exposes `data-id` in every category
+                # card. This temporary slug is never persisted directly: main
+                # validates it against an existing DDP ID before any write.
+                external_id = _external_id_from_href(href)
+            else:
+                log.warning(
+                    "pharmonline_card_missing_stable_id",
+                    url=full_url,
+                    observed_ids=identity_values,
+                )
+                return None
 
         # Имя — в aria-label у ссылки, либо в alt у изображения
         name = await link.get_attribute("aria-label") or ""
@@ -296,6 +320,7 @@ class PharmonlineScraper(BaseScraper):
             external_id=external_id,
             url=full_url,
             name=name,
+            identity_verified=identity_verified,
             category=category,
             dosage=extract_dosage(name),
             pack_size=extract_pack_size(name),

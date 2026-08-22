@@ -1,7 +1,8 @@
 name: Recover Pharmonline catalog via Crawlbase
 
 # Manual, guarded recovery route. It uses the legacy HTML renderer only after
-# that renderer has been validated to emit the same Meteor IDs as DDP.
+# the no-write probe has validated each rendered URL against the existing DDP
+# catalog; the runtime repeats that all-or-nothing check before persistence.
 on:
   workflow_dispatch:
     inputs:
@@ -111,7 +112,9 @@ jobs:
           DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
           CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
           CRAWLBASE_API_SITES: pharmonline
+          CRAWLBASE_PAGE_WAIT_MS: "4000"
           PHARMONLINE_USE_DDP: "0"
+          PHARMONLINE_LEGACY_ID_BRIDGE: "required"
         run: |
           set -euo pipefail
           test -n "$CRAWLBASE_JS_TOKEN"

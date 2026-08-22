@@ -107,6 +107,42 @@ async def test_pharmonline_snapshot_yields_products():
     # here would silently recreate the historical duplicate-catalog incident.
     assert products[0].external_id == "xwJspdCx3iFBDqDWF"
     assert all(re.fullmatch(r"[A-Za-z0-9]{17}", product.external_id) for product in products)
+    assert all(product.identity_verified for product in products)
+
+
+@pytest.mark.asyncio
+async def test_pharmonline_current_card_needs_guarded_identity_bridge(monkeypatch):
+    """New ``.product_box`` markup has no card-level Meteor ``data-id``."""
+    from src.scrapers.pharmonline import PharmonlineScraper
+
+    html = """
+    <div class="product_box">
+      <a href="/product/current-product?lng=en" aria-label="Current product">
+        <img alt="Current product">
+      </a>
+      <span class="second_price">12.50 AZN</span>
+    </div>
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content(html, wait_until="domcontentloaded")
+            card = await page.query_selector(".product_box")
+            assert card is not None
+            scraper = PharmonlineScraper()
+
+            monkeypatch.delenv("PHARMONLINE_LEGACY_ID_BRIDGE", raising=False)
+            assert await scraper._parse_card(card, "test") is None
+
+            monkeypatch.setenv("PHARMONLINE_LEGACY_ID_BRIDGE", "required")
+            product = await scraper._parse_card(card, "test")
+        finally:
+            await browser.close()
+
+    assert product is not None
+    assert product.external_id == "current-product"
+    assert product.identity_verified is False
 
 
 @pytest.mark.asyncio

@@ -12,10 +12,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from src._time import utcnow
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import click
 import structlog
@@ -47,6 +49,124 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "categories.ya
 
 class FullCatalogVerificationError(RuntimeError):
     """A nominal full scan did not prove complete item-level coverage."""
+
+
+class PharmonlineLegacyIdentityBridgeError(RuntimeError):
+    """The legacy HTML path could not prove DDP-compatible product identity."""
+
+
+_PHARMONLINE_LEGACY_ID_BRIDGE_ENV = "PHARMONLINE_LEGACY_ID_BRIDGE"
+_PHARMONLINE_METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
+_PHARMONLINE_DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
+
+
+def _pharmonline_legacy_id_bridge_enabled() -> bool:
+    """Whether a guarded URL→Meteor-ID bridge is explicitly requested.
+
+    The legacy HTML source must never silently use URL slugs as persistent IDs.
+    This opt-in is for the documented recovery path only; it validates every
+    legacy card against an existing DDP product before any Products are saved.
+    """
+    return os.environ.get(_PHARMONLINE_LEGACY_ID_BRIDGE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "required",
+    }
+
+
+def _canonical_pharmonline_product_url(raw_url: str | None) -> str | None:
+    """Canonical URL key shared by the legacy HTML and DDP product paths."""
+    if not raw_url:
+        return None
+    parsed = urlsplit(raw_url.strip())
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.rstrip("/")
+    if host not in {"", "pharmonline.az"} or not path.startswith("/product/"):
+        return None
+    if path == "/product":
+        return None
+    return f"https://pharmonline.az{path}"
+
+
+def _bridge_pharmonline_legacy_ids(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+) -> int:
+    """Replace legacy slug IDs with the existing DDP Meteor ID, fail closed.
+
+    This runs before `persist_results()` and only for explicitly enabled
+    recovery jobs. Every Pharmonline card — including a 17-character value
+    supplied by old markup — must resolve to exactly one already stored
+    17-character DDP product for the same tenant and canonical public URL.
+    The existing row must carry the DDP-specific availability source rather
+    than merely look like a Meteor ID.
+    A direct rendered Meteor ID must agree with that mapping; a temporary URL
+    slug may be replaced only after the mapping is proven. This prevents a
+    coincidentally 17-character slug or a mismatched direct ID from bypassing
+    the guard. Unknown or ambiguous items abort the run before a
+    Product/snapshot write can happen.
+    """
+    legacy_products: list[tuple[ScrapedProduct, str | None]] = []
+    for result in results:
+        if result.site != "pharmonline":
+            continue
+        for product in result.products:
+            legacy_products.append((product, _canonical_pharmonline_product_url(product.url)))
+    if not legacy_products:
+        return 0
+
+    ddp_ids_by_url: dict[str, set[str]] = {}
+    existing = session.scalars(
+        select(storage.Product).where(
+            storage.Product.site == "pharmonline",
+            storage.Product.tenant_id == tenant_id,
+        )
+    ).all()
+    for product in existing:
+        external_id = str(product.external_id)
+        canonical_url = _canonical_pharmonline_product_url(product.url)
+        if (
+            canonical_url
+            and _PHARMONLINE_METEOR_ID_RE.fullmatch(external_id)
+            and product.availability_source == _PHARMONLINE_DDP_AVAILABILITY_SOURCE
+        ):
+            ddp_ids_by_url.setdefault(canonical_url, set()).add(external_id)
+
+    unresolved: set[str] = set()
+    ambiguous: set[str] = set()
+    mismatched: set[str] = set()
+    replacements: list[tuple[ScrapedProduct, str]] = []
+    for product, canonical_url in legacy_products:
+        candidate_ids = ddp_ids_by_url.get(canonical_url or "", set())
+        if len(candidate_ids) == 1:
+            candidate_id = next(iter(candidate_ids))
+            if product.identity_verified and product.external_id != candidate_id:
+                mismatched.add(canonical_url or "<invalid_product_url>")
+            else:
+                replacements.append((product, candidate_id))
+        elif len(candidate_ids) == 0:
+            unresolved.add(canonical_url or "<invalid_product_url>")
+        else:
+            ambiguous.add(canonical_url or "<invalid_product_url>")
+
+    if unresolved or ambiguous or mismatched:
+        raise PharmonlineLegacyIdentityBridgeError(
+            "legacy Pharmonline identity bridge refused persistence: "
+            f"unresolved_urls={len(unresolved)}, ambiguous_urls={len(ambiguous)}, "
+            f"mismatched_ids={len(mismatched)}"
+        )
+
+    for product, external_id in replacements:
+        product.external_id = external_id
+    log.info(
+        "pharmonline_legacy_identity_bridged",
+        products=len(replacements),
+        unique_urls=len({url for _, url in legacy_products if url}),
+    )
+    return len(replacements)
 
 
 # Phase 1c (2026-05-27) — pharmonline DDP path uses reverse-engineered Meteor
@@ -2749,8 +2869,13 @@ def run_cmd(
     request_id: int | None,
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
-    storage.init_db()
+    use_legacy_identity_bridge = _pharmonline_legacy_id_bridge_enabled()
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    if use_legacy_identity_bridge and set(sites) != {"pharmonline"}:
+        raise click.ClickException(
+            "PHARMONLINE_LEGACY_ID_BRIDGE is restricted to a Pharmonline-only run"
+        )
+    storage.init_db()
 
     Session = storage.make_session()
     # Full/manual runs wait for a short partial producer to finish. Conversely,
@@ -2831,51 +2956,107 @@ def run_cmd(
                 )
                 enforce_quality_baseline = limit is None and category_id is None
 
-                # Инкрементальный persist: сохраняем каждую категорию СРАЗУ (callback
-                # → persist_results коммитит per-result), чтобы медленный/оборванный/
-                # зависший прогон (pharmonline DDP ~7ч) не терял уже собранное — без
-                # него persist шёл только в конце = всё-или-ничего. Callback синхронный
-                # → сериализуется на однопоточном event loop, общая session безопасна.
-                # Финальный persist ниже остаётся (промо + count); повтор товаров
-                # безвреден (diff-only: те же товары → 0 новых snapshot).
-                def _persist_category(site_name, slug, cat_products):
-                    persist_results(
-                        session,
-                        run,
-                        [ScrapeResult(site=site_name, products=list(cat_products))],
-                    )
+                # Incremental persist normally bounds data loss for a slow DDP
+                # crawl. The guarded legacy recovery deliberately turns it off:
+                # all URL→Meteor identity checks must succeed before the first
+                # Product/snapshot write, otherwise an HTML markup change could
+                # re-create the historical slug-ID duplicate catalog.
+                on_category = None
+                if not use_legacy_identity_bridge:
+                    def _persist_category(site_name, slug, cat_products):
+                        persist_results(
+                            session,
+                            run,
+                            [ScrapeResult(site=site_name, products=list(cat_products))],
+                        )
+
+                    on_category = _persist_category
 
                 results = asyncio.run(
                     scrape_all(
                         slugs_by_site,
                         limit,
                         ai_fallback_baselines=baselines,
-                        on_category=_persist_category,
+                        on_category=on_category,
                         aloe_country_map=load_aloe_country_map(session),
                     )
                 )
                 persist_aloe_country_mappings(session, results)
+
+            quality_status: str | None = None
+            quality: dict | None = None
+            guarded_catalog_verified = False
+            guarded_catalog_reason: str | None = None
+            if use_legacy_identity_bridge:
+                _bridge_pharmonline_legacy_ids(
+                    session,
+                    results,
+                    tenant_id=run.tenant_id,
+                )
+                # A manual HTML recovery must prove the whole catalog before
+                # persistence. Normal scheduled DDP runs can persist each
+                # completed category, but this fallback has a deliberately
+                # stricter all-or-nothing rule to prevent partial markup from
+                # refreshing a subset of the existing catalog.
+                quality_status, quality = classify_run_quality(
+                    results,
+                    quality_sites,
+                    mode=effective_mode,
+                    baselines=quality_baselines,
+                    enforce_baseline=enforce_quality_baseline,
+                )
+                if is_full_catalog:
+                    guarded_catalog_verified, guarded_catalog_reason = (
+                        _verify_full_catalog_results(
+                            results,
+                            sites=sites,
+                            expected_slugs=slugs_by_site,
+                            baselines=baselines,
+                        )
+                    )
+                    financial_ok = quality_status == "ok" and guarded_catalog_verified
+                    quality["full_catalog_verified"] = financial_ok
+                    quality["financially_eligible"] = financial_ok
+                    quality["catalog_verification_reason"] = guarded_catalog_reason
+                    if not financial_ok:
+                        run.catalog_verified = False
+                        run.catalog_verification_reason = guarded_catalog_reason
+                        run.run_quality = quality
+                        run.error_message = run_quality_message(quality_status, quality)
+                        if quality_status == "failed":
+                            raise RunQualityFailure(
+                                run.error_message or "guarded legacy recovery failed"
+                            )
+                        raise FullCatalogVerificationError(
+                            "guarded legacy recovery refused persistence: "
+                            f"{guarded_catalog_reason or 'full catalog verification failed'}"
+                        )
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
             run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
             run.sites_completed = ",".join(r.site for r in results)
-            quality_status, quality = classify_run_quality(
-                results,
-                quality_sites,
-                mode=effective_mode,
-                baselines=quality_baselines,
-                enforce_baseline=enforce_quality_baseline,
-            )
-            if is_full_catalog:
-                run.catalog_verified, run.catalog_verification_reason = (
-                    _verify_full_catalog_results(
-                        results,
-                        sites=sites,
-                        expected_slugs=slugs_by_site,
-                        baselines=baselines,
-                    )
+            if quality_status is None or quality is None:
+                quality_status, quality = classify_run_quality(
+                    results,
+                    quality_sites,
+                    mode=effective_mode,
+                    baselines=quality_baselines,
+                    enforce_baseline=enforce_quality_baseline,
                 )
+            if is_full_catalog:
+                if use_legacy_identity_bridge:
+                    run.catalog_verified = guarded_catalog_verified
+                    run.catalog_verification_reason = guarded_catalog_reason
+                else:
+                    run.catalog_verified, run.catalog_verification_reason = (
+                        _verify_full_catalog_results(
+                            results,
+                            sites=sites,
+                            expected_slugs=slugs_by_site,
+                            baselines=baselines,
+                        )
+                    )
                 financial_ok = quality_status == "ok" and run.catalog_verified
                 quality["full_catalog_verified"] = financial_ok
                 quality["financially_eligible"] = financial_ok
@@ -3154,8 +3335,12 @@ def run_cmd(
 )
 def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None) -> None:
     """Только скрейпинг — без анализа и отправки."""
-    storage.init_db()
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    if _pharmonline_legacy_id_bridge_enabled() and set(sites) != {"pharmonline"}:
+        raise click.ClickException(
+            "PHARMONLINE_LEGACY_ID_BRIDGE is restricted to a Pharmonline-only scrape"
+        )
+    storage.init_db()
 
     Session = storage.make_session()
     if not _hold_scrape_lock_until_command_exit(Session, wait=False):
@@ -3200,6 +3385,12 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
                 )
             )
             persist_aloe_country_mappings(session, results)
+            if _pharmonline_legacy_id_bridge_enabled():
+                _bridge_pharmonline_legacy_ids(
+                    session,
+                    results,
+                    tenant_id=run.tenant_id,
+                )
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
