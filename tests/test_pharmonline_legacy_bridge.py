@@ -41,11 +41,7 @@ def _legacy_product(url: str, external_id: str = "legacy-url-slug") -> ScrapedPr
 
 
 def test_bridge_replaces_legacy_slug_with_same_tenant_ddp_id(db_session):
-    db_session.add(
-        _stored_product(
-            url="https://www.pharmonline.az/product/ringer-400-ml?lng=az"
-        )
-    )
+    db_session.add(_stored_product(url="https://www.pharmonline.az/product/ringer-400-ml?lng=az"))
     db_session.commit()
     rendered = _legacy_product("https://pharmonline.az/product/ringer-400-ml?lng=en")
 
@@ -61,9 +57,7 @@ def test_bridge_replaces_legacy_slug_with_same_tenant_ddp_id(db_session):
 
 def test_bridge_checks_url_even_when_rendered_value_looks_like_meteor_id(db_session):
     """A 17-character slug must not bypass the bridge by looking like a DDP ID."""
-    db_session.add(
-        _stored_product(url="https://pharmonline.az/product/known-product")
-    )
+    db_session.add(_stored_product(url="https://pharmonline.az/product/known-product"))
     db_session.commit()
     rendered = _legacy_product(
         "https://pharmonline.az/product/unknown-product",
