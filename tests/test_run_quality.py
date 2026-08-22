@@ -97,6 +97,52 @@ def test_intentional_partial_run_is_ok_but_not_financially_eligible():
     assert quality["financially_eligible"] is False
 
 
+def test_verified_public_api_full_run_is_financially_eligible():
+    status, quality = classify_run_quality(
+        [_result("pharmonline", 3, expected=1, completed=1)],
+        ["pharmonline"],
+        mode="public_api",
+        baselines={"pharmonline": 3},
+        enforce_baseline=True,
+    )
+
+    assert status == "ok"
+    assert quality["full_catalog_verified"] is True
+    assert quality["financially_eligible"] is True
+
+
+@pytest.mark.parametrize(
+    ("env_name", "env_value", "expected_message"),
+    [
+        (
+            "PHARMONLINE_USE_DDP",
+            "1",
+            "cannot be combined with PHARMONLINE_USE_DDP",
+        ),
+        (
+            "AI_FALLBACK_ENABLED",
+            "true",
+            "cannot be combined with AI_FALLBACK_ENABLED",
+        ),
+    ],
+)
+def test_public_api_recovery_refuses_mixed_sources(
+    monkeypatch, env_name, env_value, expected_message
+):
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.delenv("PHARMONLINE_USE_DDP", raising=False)
+    monkeypatch.delenv("AI_FALLBACK_ENABLED", raising=False)
+    monkeypatch.setenv(env_name, env_value)
+
+    result = CliRunner().invoke(
+        main_mod.cli,
+        ["run", "--site", "pharmonline", "--mode", "public_api"],
+    )
+
+    assert result.exit_code != 0
+    assert expected_message in result.output
+
+
 def test_single_category_run_only_requests_sites_with_configured_route():
     quality_sites, scrape_scope = scope_category_run_sites(
         {

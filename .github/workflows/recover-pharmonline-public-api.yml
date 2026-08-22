@@ -1,0 +1,209 @@
+name: Recover Pharmonline catalog via verified public API
+
+# This is the only write-enabled path for the public Pharmonline API.  It is
+# manually gated by a successful full no-write preflight on exactly this commit;
+# the CLI repeats its own full API+sitemap proof before it writes a SKU.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RECOVER to start the verified full-catalog recovery"
+        required: true
+        default: ""
+      preflight_run_id:
+        description: "Successful full no-write preflight run ID for this commit"
+        required: true
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+
+# Shared with the no-write preflight: source verification and persistence must
+# never overlap for the same catalog.
+concurrency:
+  group: pharmonline-public-api-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Require explicit recovery confirmation and matching preflight
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          PREFLIGHT_RUN_ID: ${{ inputs.preflight_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "RECOVER"
+          case "$PREFLIGHT_RUN_ID" in
+            ''|*[!0-9]*)
+              echo "preflight_run_id must be a numeric GitHub Actions run ID" >&2
+              exit 1
+              ;;
+          esac
+          metadata=$(gh run view "$PREFLIGHT_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json conclusion,workflowName,headSha \
+            --jq '[.conclusion, .workflowName, .headSha] | @tsv')
+          IFS=$'\t' read -r conclusion workflow_name head_sha <<EOF
+          $metadata
+          EOF
+          test "$conclusion" = "success"
+          test "$workflow_name" = "Preflight full Pharmonline public API recovery (no persistence)"
+          test "$head_sha" = "$GITHUB_SHA"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install recovery dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Setup production SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Check production capacity and scraper state
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          min_available_kib=$((4 * 1024 * 1024))
+          max_swap_kib=$((2 * 1024 * 1024))
+          min_disk_kib=$((4 * 1024 * 1024))
+          max_user_slice_bytes=$((7 * 1024 * 1024 * 1024))
+
+          available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+          swap_before_kib=$(free -k | awk '/^Swap:/ {print $3}')
+          disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk 'NR==2 {print $4}')
+          user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
+          sleep 5
+          swap_after_kib=$(free -k | awk '/^Swap:/ {print $3}')
+
+          printf 'available_ram_kib=%s required_kib=%s\n' "$available_kib" "$min_available_kib"
+          printf 'swap_before_kib=%s swap_after_kib=%s maximum_kib=%s\n' \
+            "$swap_before_kib" "$swap_after_kib" "$max_swap_kib"
+          printf 'disk_available_kib=%s required_kib=%s\n' "$disk_available_kib" "$min_disk_kib"
+          printf 'user_slice_bytes=%s conservative_limit_bytes=%s\n' \
+            "$user_slice_bytes" "$max_user_slice_bytes"
+
+          test "$available_kib" -ge "$min_available_kib"
+          test "$swap_after_kib" -le "$max_swap_kib"
+          test "$swap_after_kib" -le "$swap_before_kib"
+          test "$disk_available_kib" -ge "$min_disk_kib"
+          test "$user_slice_bytes" -lt "$max_user_slice_bytes"
+          if systemctl is-active --quiet pharmacy-monitor-scrape@pharmonline.service; then
+            echo "refusing recovery: a Pharmonline scrape is already active" >&2
+            exit 1
+          fi
+          REMOTE
+
+      - name: Open SSH tunnel to production Postgres
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -N -L 5433:localhost:5432 \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 &
+          echo "TUNNEL_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            if nc -z localhost 5433 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "production Postgres tunnel did not come up" >&2
+          exit 1
+
+      - name: Run guarded full public-API recovery
+        env:
+          DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
+          CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
+          PHARMONLINE_PUBLIC_API: required
+          PHARMONLINE_USE_DDP: "0"
+          AI_FALLBACK_ENABLED: "0"
+          SCRAPE_REPORT_EMAIL: "0"
+        run: |
+          set -euo pipefail
+          test -n "$CRAWLBASE_JS_TOKEN"
+          pharmacy-monitor run --site pharmonline --mode public_api --dry-run --no-alerts
+
+      - name: Verify the recovered run directly in production Postgres
+        env:
+          DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+          try:
+              with engine.connect() as connection:
+                  row = connection.execute(
+                      text(
+                          """
+                          SELECT id, status, catalog_scope, catalog_verified,
+                                 catalog_verification_reason, products_scraped,
+                                 products_per_site, run_quality
+                          FROM runs
+                          WHERE tenant_id = 1
+                            AND full_catalog_sites = 'pharmonline'
+                          ORDER BY id DESC
+                          LIMIT 1
+                          """
+                      )
+                  ).mappings().one_or_none()
+          finally:
+              engine.dispose()
+
+          if row is None:
+              raise SystemExit("no Pharmonline full-catalog run was created")
+          quality = row["run_quality"] or {}
+          site_quality = (quality.get("sites") or {}).get("pharmonline") or {}
+          evidence = {
+              "run_id": row["id"],
+              "status": row["status"],
+              "catalog_scope": row["catalog_scope"],
+              "catalog_verified": bool(row["catalog_verified"]),
+              "catalog_verification_reason": row["catalog_verification_reason"],
+              "products_scraped": row["products_scraped"],
+              "pharmonline_products": (row["products_per_site"] or {}).get("pharmonline"),
+              "quality_status": site_quality.get("status"),
+              "full_catalog_verified": quality.get("full_catalog_verified"),
+          }
+          print("Recovered Pharmonline run evidence: " + json.dumps(evidence, sort_keys=True))
+          if (
+              row["status"] != "ok"
+              or row["catalog_scope"] != "full"
+              or not row["catalog_verified"]
+              or quality.get("full_catalog_verified") is not True
+              or site_quality.get("status") != "ok"
+              or int(row["products_scraped"] or 0) < 1
+          ):
+              raise SystemExit("recovery did not produce a verified successful Pharmonline catalog")
+          PY
+
+      - name: Close SSH tunnel
+        if: always()
+        run: |
+          if [ -n "${TUNNEL_PID:-}" ]; then
+            kill "$TUNNEL_PID" 2>/dev/null || true
+          fi

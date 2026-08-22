@@ -813,3 +813,73 @@ def test_scrape_command_is_non_publishing_diagnostic_producer(db_session, monkey
         assert storage.financially_eligible_run_ids(verify, tenant_id=run.tenant_id) == []
     finally:
         verify.close()
+
+
+def test_public_api_recovery_refuses_persistence_after_catalog_proof_failure(
+    db_session, monkeypatch
+):
+    """The recovery source must not refresh any SKU when its proof is incomplete."""
+    from src.scrapers.pharmonline_public_api import PUBLIC_CATALOG_ROUTE
+
+    async def failed_catalog(*args, **kwargs):
+        return [
+            ScrapeResult(
+                site="pharmonline",
+                category_counts={PUBLIC_CATALOG_ROUTE: 0},
+                route_statuses={
+                    PUBLIC_CATALOG_ROUTE: RouteStatus(
+                        complete=False,
+                        abort_reason="products_sitemap_set_mismatch",
+                    )
+                },
+            )
+        ]
+
+    persisted = []
+    Session = _session_factory(db_session)
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_USE_DDP", "0")
+    monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "0")
+    monkeypatch.delenv("PHARMONLINE_LEGACY_ID_BRIDGE", raising=False)
+    monkeypatch.delenv("AI_FALLBACK_ENABLED", raising=False)
+    monkeypatch.setattr(storage, "init_db", lambda: None)
+    monkeypatch.setattr(storage, "make_session", lambda: Session)
+    monkeypatch.setattr(
+        main_mod, "_hold_scrape_lock_until_command_exit", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(main_mod, "maybe_seed_categories", lambda session: None)
+    monkeypatch.setattr(
+        main_mod,
+        "baselines_for_sites",
+        lambda *args, **kwargs: {"pharmonline": 1},
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "run_quality_baselines_for_sites",
+        lambda *args, **kwargs: {"pharmonline": 1},
+    )
+    monkeypatch.setattr(main_mod, "scrape_all", failed_catalog)
+    monkeypatch.setattr(
+        main_mod,
+        "persist_results",
+        lambda *args, **kwargs: persisted.append("called"),
+    )
+
+    result = CliRunner().invoke(
+        main_mod.cli,
+        ["run", "--site", "pharmonline", "--mode", "public_api", "--no-alerts"],
+    )
+
+    assert result.exit_code != 0
+    assert "run quality failed" in result.output
+    assert persisted == []
+    verify = Session()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        assert run is not None
+        assert run.status == "failed"
+        assert run.catalog_verified is False
+        assert "products_sitemap_set_mismatch" in (run.catalog_verification_reason or "")
+        assert "FullCatalogVerificationError" not in (run.error_message or "")
+    finally:
+        verify.close()

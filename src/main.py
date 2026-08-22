@@ -56,6 +56,7 @@ class PharmonlineLegacyIdentityBridgeError(RuntimeError):
 
 
 _PHARMONLINE_LEGACY_ID_BRIDGE_ENV = "PHARMONLINE_LEGACY_ID_BRIDGE"
+_PHARMONLINE_PUBLIC_API_ENV = "PHARMONLINE_PUBLIC_API"
 _PHARMONLINE_METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
 _PHARMONLINE_DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
 
@@ -68,6 +69,16 @@ def _pharmonline_legacy_id_bridge_enabled() -> bool:
     legacy card against an existing DDP product before any Products are saved.
     """
     return os.environ.get(_PHARMONLINE_LEGACY_ID_BRIDGE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "required",
+    }
+
+
+def _pharmonline_public_api_enabled() -> bool:
+    """Whether guarded public-API recovery is explicitly enabled."""
+    return os.environ.get(_PHARMONLINE_PUBLIC_API_ENV, "").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -178,6 +189,10 @@ def _bridge_pharmonline_legacy_ids(
 # protocol через WebSocket, обходит Cloudflare без Playwright. Opt-in via
 # PHARMONLINE_USE_DDP=1. Когда выключено — используется legacy Playwright путь.
 def _pharmonline_scraper_class() -> type[BaseScraper]:
+    if _pharmonline_public_api_enabled():
+        from src.scrapers.pharmonline_public_api import PharmonlinePublicAPIScraper
+
+        return PharmonlinePublicAPIScraper
     if os.environ.get("PHARMONLINE_USE_DDP", "").lower() in ("1", "true", "yes"):
         from src.scrapers.pharmonline_ddp import PharmonlineDDPScraper
 
@@ -549,7 +564,15 @@ async def scrape_site(
     on_category=None,
     aloe_country_map: dict[str, dict[str, object]] | None = None,
 ) -> ScrapeResult:
-    cls = SCRAPER_CLASSES[site]
+    # Pharmonline's recovery source is intentionally selected at scrape time,
+    # not only at module import time.  That keeps a long-lived CLI/test
+    # process from silently retaining the legacy class after the explicit
+    # recovery environment was enabled.
+    cls = (
+        _pharmonline_scraper_class()
+        if site == "pharmonline"
+        else SCRAPER_CLASSES[site]
+    )
     if not slugs:
         log.warning("no_categories_configured", site=site)
         return ScrapeResult(
@@ -729,7 +752,11 @@ def persist_aloe_country_mappings(
 
 async def scrape_watchlist_for_site(site: str, urls: list[str]) -> ScrapeResult:
     """Watchlist-режим: ходим по конкретным URL'ам товаров на одном сайте."""
-    cls = SCRAPER_CLASSES[site]
+    cls = (
+        _pharmonline_scraper_class()
+        if site == "pharmonline"
+        else SCRAPER_CLASSES[site]
+    )
     if not urls:
         return ScrapeResult(site=site, errors=["no_watchlist_urls"])
     result = ScrapeResult(site=site, items_expected=len(urls))
@@ -1086,7 +1113,11 @@ def classify_run_quality(
     else:
         overall = "ok"
 
-    full_catalog_verified = overall == "ok" and mode == "category" and enforce_baseline
+    full_catalog_verified = (
+        overall == "ok"
+        and mode in {"category", "public_api"}
+        and enforce_baseline
+    )
     return overall, {
         "version": 1,
         "mode": mode,
@@ -2835,9 +2866,9 @@ def seed_demo_cmd(force: bool) -> None:
 )
 @click.option(
     "--mode",
-    type=click.Choice(["auto", "watchlist", "category"]),
+    type=click.Choice(["auto", "watchlist", "category", "public_api"]),
     default="auto",
-    help="auto = watchlist если есть товары, иначе category. Можно форсировать.",
+    help="auto = watchlist если есть товары, иначе category. public_api — guarded Pharmonline recovery.",
 )
 @click.option(
     "--category-id",
@@ -2875,10 +2906,44 @@ def run_cmd(
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
     use_legacy_identity_bridge = _pharmonline_legacy_id_bridge_enabled()
+    use_public_api = _pharmonline_public_api_enabled()
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    if use_legacy_identity_bridge and use_public_api:
+        raise click.ClickException(
+            "PHARMONLINE_LEGACY_ID_BRIDGE and PHARMONLINE_PUBLIC_API cannot be enabled together"
+        )
+    if use_public_api and os.environ.get("PHARMONLINE_USE_DDP", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        raise click.ClickException(
+            "PHARMONLINE_PUBLIC_API recovery cannot be combined with PHARMONLINE_USE_DDP"
+        )
+    if use_public_api and _ai_fallback_enabled():
+        raise click.ClickException(
+            "PHARMONLINE_PUBLIC_API recovery cannot be combined with AI_FALLBACK_ENABLED"
+        )
     if use_legacy_identity_bridge and set(sites) != {"pharmonline"}:
         raise click.ClickException(
             "PHARMONLINE_LEGACY_ID_BRIDGE is restricted to a Pharmonline-only run"
+        )
+    if mode == "public_api":
+        if not use_public_api:
+            raise click.ClickException(
+                "public_api mode requires PHARMONLINE_PUBLIC_API=required"
+            )
+        if set(sites) != {"pharmonline"}:
+            raise click.ClickException(
+                "public_api mode is restricted to --site pharmonline"
+            )
+        if limit is not None or category_id is not None or hourly:
+            raise click.ClickException(
+                "public_api mode does not allow --limit, --category-id, or --hourly"
+            )
+    elif use_public_api:
+        raise click.ClickException(
+            "PHARMONLINE_PUBLIC_API requires --mode public_api"
         )
     storage.init_db()
 
@@ -2904,15 +2969,23 @@ def run_cmd(
             mode = "category"
 
         # Определяем режим
-        watchlist_urls = collect_watchlist_urls(session) if mode != "category" else {}
+        watchlist_urls = (
+            collect_watchlist_urls(session)
+            if mode not in {"category", "public_api"}
+            else {}
+        )
         total_pinned = sum(len(urls) for urls in watchlist_urls.values())
-        if mode == "watchlist" or (mode == "auto" and total_pinned > 0):
+        if mode == "public_api":
+            effective_mode = "public_api"
+        elif mode == "watchlist" or (mode == "auto" and total_pinned > 0):
             effective_mode = "watchlist"
         else:
             effective_mode = "category"
 
         is_full_catalog = (
-            effective_mode == "category" and category_id is None and limit is None
+            effective_mode in {"category", "public_api"}
+            and category_id is None
+            and limit is None
         )
         run.catalog_scope = "full" if is_full_catalog else "partial"
         run.full_catalog_sites = ",".join(sites) if is_full_catalog else None
@@ -2942,6 +3015,31 @@ def run_cmd(
                 filtered = {s: urls for s, urls in watchlist_urls.items() if s in sites and urls}
                 quality_sites = list(filtered)
                 results = asyncio.run(scrape_watchlist_all(filtered))
+            elif effective_mode == "public_api":
+                # One synthetic route represents the public global catalog.
+                # The scraper buffers every page and checks its sitemap before
+                # yielding, while the pre-persist guard below independently
+                # checks the resulting route evidence.
+                from src.scrapers.pharmonline_public_api import PUBLIC_CATALOG_ROUTE
+
+                slugs_by_site = {"pharmonline": [PUBLIC_CATALOG_ROUTE]}
+                quality_sites = ["pharmonline"]
+                baselines = baselines_for_sites(session, quality_sites)
+                quality_baselines = run_quality_baselines_for_sites(
+                    session,
+                    quality_sites,
+                    tenant_id=run.tenant_id,
+                )
+                enforce_quality_baseline = True
+                results = asyncio.run(
+                    scrape_all(
+                        slugs_by_site,
+                        None,
+                        ai_fallback_baselines=baselines,
+                        # Never incrementally persist the buffered recovery.
+                        on_category=None,
+                    )
+                )
             else:
                 # Категории из БД, опционально фильтр по одной category_id
                 slugs_by_site = {
@@ -2992,17 +3090,20 @@ def run_cmd(
             quality: dict | None = None
             guarded_catalog_verified = False
             guarded_catalog_reason: str | None = None
-            if use_legacy_identity_bridge:
-                _bridge_pharmonline_legacy_ids(
-                    session,
-                    results,
-                    tenant_id=run.tenant_id,
-                )
-                # A manual HTML recovery must prove the whole catalog before
-                # persistence. Normal scheduled DDP runs can persist each
-                # completed category, but this fallback has a deliberately
-                # stricter all-or-nothing rule to prevent partial markup from
-                # refreshing a subset of the existing catalog.
+            requires_pre_persist_catalog_guard = (
+                use_legacy_identity_bridge or use_public_api
+            )
+            if requires_pre_persist_catalog_guard:
+                if use_legacy_identity_bridge:
+                    _bridge_pharmonline_legacy_ids(
+                        session,
+                        results,
+                        tenant_id=run.tenant_id,
+                    )
+                # Manual recovery sources must prove the entire catalog before
+                # the first Product/snapshot write.  The public API scraper
+                # already buffers and verifies its data+sitemap; this second
+                # guard makes that contract explicit at the persistence edge.
                 quality_status, quality = classify_run_quality(
                     results,
                     quality_sites,
@@ -3030,10 +3131,10 @@ def run_cmd(
                         run.error_message = run_quality_message(quality_status, quality)
                         if quality_status == "failed":
                             raise RunQualityFailure(
-                                run.error_message or "guarded legacy recovery failed"
+                                run.error_message or "guarded catalog recovery failed"
                             )
                         raise FullCatalogVerificationError(
-                            "guarded legacy recovery refused persistence: "
+                            "guarded catalog recovery refused persistence: "
                             f"{guarded_catalog_reason or 'full catalog verification failed'}"
                         )
             count = persist_results(session, run, results)
@@ -3050,7 +3151,7 @@ def run_cmd(
                     enforce_baseline=enforce_quality_baseline,
                 )
             if is_full_catalog:
-                if use_legacy_identity_bridge:
+                if requires_pre_persist_catalog_guard:
                     run.catalog_verified = guarded_catalog_verified
                     run.catalog_verification_reason = guarded_catalog_reason
                 else:
@@ -3341,6 +3442,10 @@ def run_cmd(
 def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None) -> None:
     """Только скрейпинг — без анализа и отправки."""
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    if _pharmonline_public_api_enabled():
+        raise click.ClickException(
+            "PHARMONLINE_PUBLIC_API is recovery-only; use run --site pharmonline --mode public_api"
+        )
     if _pharmonline_legacy_id_bridge_enabled() and set(sites) != {"pharmonline"}:
         raise click.ClickException(
             "PHARMONLINE_LEGACY_ID_BRIDGE is restricted to a Pharmonline-only scrape"
