@@ -164,6 +164,7 @@ jobs:
               "IPROYAL_USERNAME",
               "IPROYAL_PASSWORD",
               "IPROYAL_HOST",
+              "IPROYAL_COUNTRY",
               "HEALTH_ALERT_STATE_FILE",
           )
 
@@ -635,6 +636,46 @@ jobs:
               )
 
 
+          async def iproyal_password_country_probe_once() -> tuple[str, float]:
+              """Test the documented IPRoyal country suffix without changing prod env.
+
+              IPRoyal encodes residential targeting in the password component.
+              This process-local probe distinguishes a bad target route from an
+              old username-suffix configuration without printing credentials.
+              """
+              keys = ("IPROYAL_SITES", "IPROYAL_COUNTRY", "IPROYAL_PASSWORD")
+              previous = {key: os.environ.get(key) for key in keys}
+              country = (previous["IPROYAL_COUNTRY"] or "").strip().lower()
+              password = previous["IPROYAL_PASSWORD"] or ""
+              if not country or not password:
+                  return "not_applicable", 0.0
+
+              sites = {
+                  site.strip()
+                  for site in (previous["IPROYAL_SITES"] or "").split(",")
+                  if site.strip()
+              }
+              sites.add("pharmonline")
+              os.environ["IPROYAL_SITES"] = ",".join(sorted(sites))
+              os.environ["IPROYAL_COUNTRY"] = ""
+              if "_country-" not in password:
+                  os.environ["IPROYAL_PASSWORD"] = f"{password}_country-{country}"
+              try:
+                  proxy = _iproyal_httpx_proxy()
+              except Exception:
+                  return "internal_error", 0.0
+              finally:
+                  for key, value in previous.items():
+                      if value is None:
+                          os.environ.pop(key, None)
+                      else:
+                          os.environ[key] = value
+              return await single_handshake_once(
+                  proxy,
+                  configured=proxy is not None,
+              )
+
+
           async def direct_probe_once() -> tuple[str, float]:
               """Connect directly without constructing any proxy URL."""
               proxy_env_keys = (
@@ -730,6 +771,9 @@ jobs:
                       1,
                   )
               iproyal_diagnostic = await iproyal_probe_once()
+              iproyal_password_country_diagnostic = (
+                  await iproyal_password_country_probe_once()
+              )
               direct_diagnostic = await direct_probe_once()
               decodo_generic_diagnostic = (
                   await decodo_generic_rotating_probe_once()
@@ -738,6 +782,7 @@ jobs:
                   configured,
                   rotating,
                   iproyal_diagnostic,
+                  iproyal_password_country_diagnostic,
                   direct_diagnostic,
                   decodo_generic_diagnostic,
               )
@@ -751,6 +796,7 @@ jobs:
                   configured,
                   rotating,
                   iproyal_diagnostic,
+                  iproyal_password_country_diagnostic,
                   direct_diagnostic,
                   decodo_generic_diagnostic,
               ) = asyncio.run(run_probes())
@@ -766,6 +812,14 @@ jobs:
           print(f"rotating_elapsed_seconds={rotating[4]:.2f}")
           print(f"iproyal_probe_class={iproyal_diagnostic[0]}")
           print(f"iproyal_probe_elapsed_seconds={iproyal_diagnostic[1]:.2f}")
+          print(
+              "iproyal_password_country_probe_class="
+              f"{iproyal_password_country_diagnostic[0]}"
+          )
+          print(
+              "iproyal_password_country_probe_elapsed_seconds="
+              f"{iproyal_password_country_diagnostic[1]:.2f}"
+          )
           print(f"direct_probe_class={direct_diagnostic[0]}")
           print(f"direct_probe_elapsed_seconds={direct_diagnostic[1]:.2f}")
           print(f"decodo_generic_probe_class={decodo_generic_diagnostic[0]}")
