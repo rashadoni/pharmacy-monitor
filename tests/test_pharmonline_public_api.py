@@ -391,8 +391,8 @@ async def test_scraperapi_transport_uses_isolated_named_sticky_sessions(monkeypa
         second_proxy = urlsplit(scraper._scraperapi_proxy_url_for_context(second_context))
         assert first_proxy.hostname == second_proxy.hostname == "proxy-server.scraperapi.com"
         assert first_proxy.port == second_proxy.port == 8001
-        first_username = first_proxy.username or ""
-        second_username = second_proxy.username or ""
+        first_username = unquote(first_proxy.username or "")
+        second_username = unquote(second_proxy.username or "")
         prefix = "scraperapi.session_number="
         assert first_username.startswith(prefix)
         assert second_username.startswith(prefix)
@@ -636,10 +636,13 @@ async def test_source_xml_selects_scraperapi_only_when_explicit(monkeypatch):
         return "<urlset />"
 
     monkeypatch.setattr(scraper, "_scraperapi_body", scraperapi_body)
-    assert await scraper._source_xml(
-        "https://pharmonline.az/sitemap.xml",
-        crawlbase_session="scraperapi-sitemap-test",
-    ) == "<urlset />"
+    assert (
+        await scraper._source_xml(
+            "https://pharmonline.az/sitemap.xml",
+            crawlbase_session="scraperapi-sitemap-test",
+        )
+        == "<urlset />"
+    )
     assert calls == [
         (
             "https://pharmonline.az/sitemap.xml",
