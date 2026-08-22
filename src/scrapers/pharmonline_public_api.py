@@ -49,6 +49,11 @@ _ORIGIN_CONTEXT_HEADERS = (
     "x-cache",
 )
 _MAX_CRAWLBASE_ATTEMPTS = 2
+# A Crawlbase browser context has proved stable for short runs but can return a
+# different paginator state after dozens of product requests.  Keep each
+# bounded page group sticky, then let the full API metadata, uniqueness and
+# sitemap proofs reject any mixed or incomplete catalog before persistence.
+_CATALOG_SESSION_PAGE_SPAN = 20
 
 
 class PharmonlinePublicAPIError(RuntimeError):
@@ -181,12 +186,12 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if token is None:
             raise SiteScrapeFatalError("Crawlbase JS token is not configured")
         self._crawlbase_token = token
-        # Keep API pagination and sitemap requests in one Crawlbase context.
-        # Pharmonline can vary its public catalog by browser/cookie/exit state;
-        # a fresh, opaque 32-character session prevents pages from being
-        # assembled from unrelated contexts while preserving the existing
-        # fail-closed API+sitemap proof.
+        # Non-product requests retain one short-lived context. Product pages
+        # use a bounded sticky context per page group in ``_fetch_catalog``:
+        # a single long Crawlbase context has empirically degraded after many
+        # requests, while fresh short contexts return stable public metadata.
         self._crawlbase_session = secrets.token_hex(16)
+        self._catalog_sessions: dict[int, str] = {}
         self._origin_contexts: dict[str, set[str]] = {}
         self._client = httpx.AsyncClient(timeout=120.0)
         return self
@@ -235,7 +240,26 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             f"{resource}:{len(fingerprints)}" for resource, fingerprints in sorted(contexts.items())
         )
 
-    async def _crawlbase_body(self, target_url: str, *, accept: str) -> Any:
+    def _catalog_session_for_page(self, page: int) -> str:
+        """Return a bounded sticky context for one product-page group."""
+        if page < 1:
+            raise PharmonlinePublicAPIError("products_page_number_invalid")
+        chunk = (page - 1) // _CATALOG_SESSION_PAGE_SPAN
+        sessions: dict[int, str] = getattr(self, "_catalog_sessions", {})
+        session = sessions.get(chunk)
+        if session is None:
+            session = secrets.token_hex(16)
+            sessions[chunk] = session
+            self._catalog_sessions = sessions
+        return session
+
+    async def _crawlbase_body(
+        self,
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> Any:
         client: httpx.AsyncClient | None = getattr(self, "_client", None)
         if client is None:
             raise PharmonlinePublicAPIError("public_api_client_not_open")
@@ -243,7 +267,10 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             "token": self._crawlbase_token,
             "url": target_url,
             "request_headers": f"accept:{accept}",
-            "cookies_session": self._crawlbase_session,
+            # A transient retry intentionally retains the exact session used
+            # by the page.  A new session is permitted only at an explicit
+            # product-page-group boundary, never as an implicit retry.
+            "cookies_session": crawlbase_session or self._crawlbase_session,
             "get_headers": "true",
             "format": "json",
         }
@@ -293,15 +320,30 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         self._record_origin_context(target_url, envelope)
         return envelope["body"]
 
-    async def _crawlbase_json(self, target_url: str) -> dict | list:
+    async def _crawlbase_json(
+        self,
+        target_url: str,
+        *,
+        crawlbase_session: str | None = None,
+    ) -> dict | list:
         return _json_from_rendered_body(
-            await self._crawlbase_body(target_url, accept="application/json")
+            await self._crawlbase_body(
+                target_url,
+                accept="application/json",
+                crawlbase_session=crawlbase_session,
+            )
         )
 
-    async def _crawlbase_xml(self, target_url: str) -> str:
+    async def _crawlbase_xml(
+        self,
+        target_url: str,
+        *,
+        crawlbase_session: str | None = None,
+    ) -> str:
         body = await self._crawlbase_body(
             target_url,
             accept="application/xml,text/xml;q=0.9,*/*;q=0.8",
+            crawlbase_session=crawlbase_session,
         )
         if not isinstance(body, str):
             raise PharmonlinePublicAPIError("sitemap_body_not_text")
@@ -323,6 +365,24 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if total < 1 or pages < 1:
             raise PharmonlinePublicAPIError("products_metadata_empty")
         return rows, total, pages
+
+    @staticmethod
+    def _page_identity_records(rows: list[dict]) -> tuple[tuple[str, str], ...]:
+        """Return ordered immutable identities for a page, or fail closed."""
+        records: list[tuple[str, str]] = []
+        for row in rows:
+            external_id = _text(row.get("_id"))
+            url = _canonical_product_url(row.get("path"), source_is_path=True)
+            if external_id is None or _METEOR_ID_RE.fullmatch(external_id) is None:
+                raise PharmonlinePublicAPIError("products_invalid_external_id")
+            if url is None:
+                raise PharmonlinePublicAPIError("products_invalid_product_path")
+            records.append((external_id, url))
+        if len({external_id for external_id, _ in records}) != len(records):
+            raise PharmonlinePublicAPIError("products_duplicate_external_id")
+        if len({url for _, url in records}) != len(records):
+            raise PharmonlinePublicAPIError("products_duplicate_product_url")
+        return tuple(records)
 
     @staticmethod
     def _category_map(payload: dict | list) -> dict[str, str]:
@@ -349,8 +409,16 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         return out
 
     async def _fetch_catalog(self) -> tuple[list[dict], int, int]:
-        first_payload = await self._crawlbase_json(self._product_api_url(1))
+        # A scraper instance is normally used once, but reset this map so a
+        # retry in the same process never turns a short chunk context into a
+        # long-lived one.
+        self._catalog_sessions = {}
+        first_payload = await self._crawlbase_json(
+            self._product_api_url(1),
+            crawlbase_session=self._catalog_session_for_page(1),
+        )
         first_rows, expected_total, expected_pages = self._page_payload(first_payload)
+        first_page_records = self._page_identity_records(first_rows)
         if expected_pages > self.max_pages:
             raise PharmonlinePublicAPIError("products_pages_exceed_safety_limit")
         if expected_pages != math.ceil(expected_total / self.page_size):
@@ -360,10 +428,28 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         seen_ids: set[str] = set()
         seen_urls: set[str] = set()
         for page in range(1, expected_pages + 1):
+            page_session = self._catalog_session_for_page(page)
+            if page > 1 and (page - 1) % _CATALOG_SESSION_PAGE_SPAN == 0:
+                # A fresh page-group context must first prove it sees the
+                # exact same ordered page one as the initial context. This
+                # prevents a different catalog variant from silently joining
+                # the buffered output; this anchor is not added twice below.
+                anchor_payload = await self._crawlbase_json(
+                    self._product_api_url(1),
+                    crawlbase_session=page_session,
+                )
+                anchor_rows, anchor_total, anchor_pages = self._page_payload(anchor_payload)
+                if anchor_total != expected_total or anchor_pages != expected_pages:
+                    raise PharmonlinePublicAPIError("products_chunk_anchor_metadata_changed")
+                if self._page_identity_records(anchor_rows) != first_page_records:
+                    raise PharmonlinePublicAPIError("products_chunk_anchor_changed")
             payload = (
                 first_payload
                 if page == 1
-                else await self._crawlbase_json(self._product_api_url(page))
+                else await self._crawlbase_json(
+                    self._product_api_url(page),
+                    crawlbase_session=page_session,
+                )
             )
             page_rows, total, pages = self._page_payload(payload)
             if total != expected_total or pages != expected_pages:
@@ -375,13 +461,11 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             )
             if len(page_rows) != expected_items:
                 raise PharmonlinePublicAPIError("products_page_size_mismatch")
-            for row in page_rows:
-                external_id = _text(row.get("_id"))
-                url = _canonical_product_url(row.get("path"), source_is_path=True)
-                if external_id is None or _METEOR_ID_RE.fullmatch(external_id) is None:
-                    raise PharmonlinePublicAPIError("products_invalid_external_id")
-                if url is None:
-                    raise PharmonlinePublicAPIError("products_invalid_product_path")
+            for row, (external_id, url) in zip(
+                page_rows,
+                self._page_identity_records(page_rows),
+                strict=True,
+            ):
                 if external_id in seen_ids:
                     raise PharmonlinePublicAPIError("products_duplicate_external_id")
                 if url in seen_urls:
@@ -394,8 +478,19 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         return rows, expected_total, expected_pages
 
     async def _fetch_sitemap_product_urls(self) -> set[str]:
+        # Sitemap traffic must not extend either a catalog chunk or the
+        # category-map context. It receives its own bounded sticky session,
+        # matching the no-write preflight proof.
+        sitemap_session = secrets.token_hex(16)
         index_url = f"{self.base_url}/sitemap.xml"
-        index_locs = list(_iter_xml_locs(await self._crawlbase_xml(index_url)))
+        index_locs = list(
+            _iter_xml_locs(
+                await self._crawlbase_xml(
+                    index_url,
+                    crawlbase_session=sitemap_session,
+                )
+            )
+        )
         sitemap_urls: set[str] = set()
         for loc in index_locs:
             sitemap_url = _same_origin_sitemap_url(loc)
@@ -407,7 +502,14 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             raise PharmonlinePublicAPIError("product_sitemap_index_missing")
         product_urls: set[str] = set()
         for sitemap_url in sorted(sitemap_urls):
-            child_locs = list(_iter_xml_locs(await self._crawlbase_xml(sitemap_url)))
+            child_locs = list(
+                _iter_xml_locs(
+                    await self._crawlbase_xml(
+                        sitemap_url,
+                        crawlbase_session=sitemap_session,
+                    )
+                )
+            )
             if not child_locs:
                 raise PharmonlinePublicAPIError("product_sitemap_empty")
             for loc in child_locs:
@@ -560,6 +662,8 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             "pharmonline_public_api_catalog_verified",
             products=expected_total,
             pages=expected_pages,
+            catalog_session_page_span=_CATALOG_SESSION_PAGE_SPAN,
+            catalog_session_chunks=len(getattr(self, "_catalog_sessions", {})),
             origin_contexts=self._origin_context_evidence(),
         )
         self._set_route_status(

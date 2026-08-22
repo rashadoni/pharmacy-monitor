@@ -49,9 +49,16 @@ class _FakePublicAPIScraper(PharmonlinePublicAPIScraper):
         self._sitemap_urls = sitemap_urls
         self._category_unavailable = category_unavailable
         self.requests: list[str] = []
+        self.crawlbase_sessions: list[tuple[str, str | None]] = []
 
-    async def _crawlbase_json(self, target_url: str):
+    async def _crawlbase_json(
+        self,
+        target_url: str,
+        *,
+        crawlbase_session: str | None = None,
+    ):
         self.requests.append(target_url)
+        self.crawlbase_sessions.append((target_url, crawlbase_session))
         if target_url.endswith("/api/categories?type=category"):
             if self._category_unavailable:
                 raise PharmonlinePublicAPIError("crawlbase_target_status_cb_520_origin_520")
@@ -69,6 +76,14 @@ def _pages(*, second_page: list[dict] | None = None) -> dict[int, dict]:
     return {
         1: {"data": first, "total": 3, "pages": 2},
         2: {"data": second, "total": 3, "pages": 2},
+    }
+
+
+def _three_pages() -> dict[int, dict]:
+    return {
+        1: {"data": [_raw_product(1), _raw_product(2)], "total": 5, "pages": 3},
+        2: {"data": [_raw_product(3), _raw_product(4)], "total": 5, "pages": 3},
+        3: {"data": [_raw_product(5)], "total": 5, "pages": 3},
     }
 
 
@@ -103,6 +118,80 @@ async def test_public_api_buffers_then_yields_verified_full_catalog():
     product_requests = [url for url in scraper.requests if "/api/products?" in url]
     assert [parse_qs(urlsplit(url).query)["page"][0] for url in product_requests] == ["1", "2"]
     assert all(parse_qs(urlsplit(url).query)["sortBy"][0] == "name_asc" for url in product_requests)
+
+
+@pytest.mark.asyncio
+async def test_public_api_uses_a_fresh_sticky_session_for_each_bounded_page_group(
+    monkeypatch,
+):
+    expected_urls = {f"https://pharmonline.az/product/product-{index}" for index in range(1, 6)}
+    scraper = _FakePublicAPIScraper(_three_pages(), sitemap_urls=expected_urls)
+    monkeypatch.setattr(
+        "src.scrapers.pharmonline_public_api._CATALOG_SESSION_PAGE_SPAN",
+        2,
+    )
+
+    products = [product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)]
+
+    assert len(products) == 5
+    product_sessions = [
+        (parse_qs(urlsplit(target_url).query)["page"][0], session)
+        for target_url, session in scraper.crawlbase_sessions
+        if "/api/products?" in target_url
+    ]
+    assert len(product_sessions) == 4
+    assert [page for page, _ in product_sessions] == ["1", "2", "1", "3"]
+    assert all(session is not None and len(session) == 32 for _, session in product_sessions)
+    assert product_sessions[0][1] == product_sessions[1][1]
+    assert product_sessions[1][1] != product_sessions[2][1]
+    assert product_sessions[2][1] == product_sessions[3][1]
+
+
+@pytest.mark.asyncio
+async def test_public_api_rejects_a_chunk_when_its_page_one_anchor_changes(monkeypatch):
+    expected_urls = {f"https://pharmonline.az/product/product-{index}" for index in range(1, 6)}
+
+    class _ChangingAnchorScraper(_FakePublicAPIScraper):
+        first_product_session: str | None = None
+
+        async def _crawlbase_json(
+            self,
+            target_url: str,
+            *,
+            crawlbase_session: str | None = None,
+        ):
+            payload = await super()._crawlbase_json(
+                target_url,
+                crawlbase_session=crawlbase_session,
+            )
+            if "/api/products?" not in target_url:
+                return payload
+            page = int(parse_qs(urlsplit(target_url).query)["page"][0])
+            if page != 1:
+                return payload
+            if self.first_product_session is None:
+                self.first_product_session = crawlbase_session
+                return payload
+            if crawlbase_session != self.first_product_session:
+                return {
+                    "data": [_raw_product(90), _raw_product(91)],
+                    "total": 5,
+                    "pages": 3,
+                }
+            return payload
+
+    scraper = _ChangingAnchorScraper(_three_pages(), sitemap_urls=expected_urls)
+    monkeypatch.setattr(
+        "src.scrapers.pharmonline_public_api._CATALOG_SESSION_PAGE_SPAN",
+        2,
+    )
+
+    products = [product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)]
+
+    assert products == []
+    status = scraper._route_statuses[PUBLIC_CATALOG_ROUTE]
+    assert status.complete is False
+    assert status.abort_reason == "products_chunk_anchor_changed"
 
 
 @pytest.mark.asyncio
@@ -194,7 +283,7 @@ def test_sitemap_index_urls_must_stay_on_pharmonline_origin():
 async def test_sitemap_fetch_rejects_external_index_and_product_urls(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
 
-    async def external_index(_url: str) -> str:
+    async def external_index(_url: str, *, crawlbase_session: str | None = None) -> str:
         return (
             "<sitemapindex><sitemap><loc>https://example.test/"
             "sitemap-products-1.xml</loc></sitemap></sitemapindex>"
@@ -204,7 +293,7 @@ async def test_sitemap_fetch_rejects_external_index_and_product_urls(monkeypatch
     with pytest.raises(PharmonlinePublicAPIError, match="product_sitemap_index_url_invalid"):
         await scraper._fetch_sitemap_product_urls()
 
-    async def external_product(url: str) -> str:
+    async def external_product(url: str, *, crawlbase_session: str | None = None) -> str:
         if url.endswith("/sitemap.xml"):
             return (
                 "<sitemapindex><sitemap><loc>/sitemap-products-1.xml</loc></sitemap></sitemapindex>"
@@ -258,7 +347,7 @@ async def test_crawlbase_requests_keep_one_sticky_session_and_origin_header_evid
 
 
 @pytest.mark.asyncio
-async def test_crawlbase_retries_one_transient_timeout_in_the_same_sticky_session(monkeypatch):
+async def test_crawlbase_retries_one_timeout_in_the_same_explicit_chunk_session(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
     scraper._crawlbase_token = "test-token"
     scraper._crawlbase_session = "b" * 32
@@ -291,16 +380,20 @@ async def test_crawlbase_retries_one_transient_timeout_in_the_same_sticky_sessio
     assert await scraper._crawlbase_body(
         "https://pharmonline.az/api/products?lng=az&page=52",
         accept="application/json",
+        crawlbase_session="c" * 32,
     ) == {"data": []}
     assert client.calls == 2
-    assert client.sessions == ["b" * 32, "b" * 32]
+    assert client.sessions == ["c" * 32, "c" * 32]
 
 
 @pytest.mark.asyncio
 async def test_sitemap_fetch_deduplicates_repeated_canonical_product_urls(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
+    scraper._crawlbase_session = "a" * 32
+    sitemap_sessions: list[str | None] = []
 
-    async def duplicated_product_urls(url: str) -> str:
+    async def duplicated_product_urls(url: str, *, crawlbase_session: str | None = None) -> str:
+        sitemap_sessions.append(crawlbase_session)
         if url.endswith("/sitemap.xml"):
             return (
                 "<sitemapindex>"
@@ -329,6 +422,10 @@ async def test_sitemap_fetch_deduplicates_repeated_canonical_product_urls(monkey
         "https://pharmonline.az/product/two",
         "https://pharmonline.az/product/three",
     }
+    assert len(sitemap_sessions) == 3
+    assert all(session is not None and len(session) == 32 for session in sitemap_sessions)
+    assert len(set(sitemap_sessions)) == 1
+    assert sitemap_sessions[0] != scraper._crawlbase_session
 
 
 def test_crawlbase_json_body_accepts_direct_and_pre_rendered_json():

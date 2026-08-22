@@ -117,10 +117,11 @@ jobs:
           DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
           MIN_TRUSTED_COVERAGE = 0.98
           MAX_CRAWLBASE_ATTEMPTS = 2
-          # Crawlbase accepts up to 32 characters. One value must cover every
-          # API page and sitemap request in this proof, otherwise catalog
-          # metadata can be assembled from unrelated browser/cookie contexts.
-          CRAWLBASE_SESSION = secrets.token_hex(16)
+          # Long Crawlbase browser contexts have empirically degraded after
+          # dozens of product pages. Keep each bounded group sticky, while the
+          # exact full-catalog/sitemap/DB proofs below reject any mixed result.
+          CATALOG_SESSION_PAGE_SPAN = 20
+          SITEMAP_SESSION = secrets.token_hex(16)
           ORIGIN_CONTEXT_HEADERS = (
               "cache-control",
               "vary",
@@ -140,6 +141,7 @@ jobs:
               page_records: tuple[tuple[tuple[str, str], ...], ...]
               ids: frozenset[str]
               urls: frozenset[str]
+              session_chunks: int
 
 
           def origin_context_evidence() -> str:
@@ -154,7 +156,7 @@ jobs:
           def fail(message: str) -> None:
               raise SystemExit(
                   "Pharmonline public API full preflight failed: "
-                  f"{message}; crawlbase_session=sticky, "
+                  f"{message}; crawlbase_sessions=short_chunks, "
                   f"origin_contexts={origin_context_evidence()}, "
                   f"transport_retries={TRANSIENT_TRANSPORT_RETRIES}"
               )
@@ -305,12 +307,16 @@ jobs:
               target_url: str,
               *,
               accept: str,
+              crawlbase_session: str,
           ) -> object:
               params = {
                   "token": os.environ["CRAWLBASE_JS_TOKEN"],
                   "url": target_url,
                   "request_headers": f"accept:{accept}",
-                  "cookies_session": CRAWLBASE_SESSION,
+                  # Transport retries preserve the exact same page-group
+                  # session. Only the enumerator may create a new session at
+                  # a bounded catalog page-group boundary.
+                  "cookies_session": crawlbase_session,
                   "get_headers": "true",
                   "format": "json",
               }
@@ -357,18 +363,34 @@ jobs:
               return envelope["body"]
 
 
-          async def crawlbase_json(client: httpx.AsyncClient, target_url: str) -> dict | list:
+          async def crawlbase_json(
+              client: httpx.AsyncClient,
+              target_url: str,
+              *,
+              crawlbase_session: str,
+          ) -> dict | list:
               return json_from_body(
-                  await crawlbase_body(client, target_url, accept="application/json"),
+                  await crawlbase_body(
+                      client,
+                      target_url,
+                      accept="application/json",
+                      crawlbase_session=crawlbase_session,
+                  ),
                   target_url=target_url,
               )
 
 
-          async def crawlbase_xml(client: httpx.AsyncClient, target_url: str) -> str:
+          async def crawlbase_xml(
+              client: httpx.AsyncClient,
+              target_url: str,
+              *,
+              crawlbase_session: str,
+          ) -> str:
               body = await crawlbase_body(
                   client,
                   target_url,
                   accept="application/xml,text/xml;q=0.9,*/*;q=0.8",
+                  crawlbase_session=crawlbase_session,
               )
               if not isinstance(body, str):
                   fail(f"Crawlbase returned a non-text sitemap body for {target_url}")
@@ -404,13 +426,56 @@ jobs:
               return rows, total, pages
 
 
+          def page_identity_records(
+              rows: list[dict],
+              *,
+              pass_name: str,
+              page: int,
+          ) -> tuple[tuple[str, str], ...]:
+              records: list[tuple[str, str]] = []
+              for position, row in enumerate(rows, start=1):
+                  external_id = text_value(row.get("_id"))
+                  canonical_url = canonical_product_url(row.get("path"), source_is_path=True)
+                  if external_id is None or METEOR_ID_RE.fullmatch(external_id) is None:
+                      fail(
+                          f"{pass_name}: page {page} item {position} has no direct 17-character ID"
+                      )
+                  if canonical_url is None:
+                      fail(
+                          f"{pass_name}: page {page} item {position} has an invalid product path"
+                      )
+                  records.append((external_id, canonical_url))
+              if len({external_id for external_id, _ in records}) != len(records):
+                  fail(f"{pass_name}: duplicate product ID on page {page}")
+              if len({canonical_url for _, canonical_url in records}) != len(records):
+                  fail(f"{pass_name}: duplicate canonical product URL on page {page}")
+              return tuple(records)
+
+
           async def enumerate_catalog(
               client: httpx.AsyncClient,
               *,
               pass_name: str,
           ) -> CatalogPass:
-              first_payload = await crawlbase_json(client, product_api_url(1))
+              catalog_sessions: dict[int, str] = {}
+
+              def session_for_page(page: int) -> str:
+                  if page < 1:
+                      fail(f"{pass_name}: invalid page number {page}")
+                  chunk = (page - 1) // CATALOG_SESSION_PAGE_SPAN
+                  return catalog_sessions.setdefault(chunk, secrets.token_hex(16))
+
+              first_payload = await crawlbase_json(
+                  client,
+                  product_api_url(1),
+                  crawlbase_session=session_for_page(1),
+              )
               first_rows, expected_total, expected_pages = parse_page(first_payload, page=1)
+              first_page_records = page_identity_records(
+                  first_rows,
+                  pass_name=pass_name,
+                  page=1,
+              )
               if expected_pages > MAX_PAGES:
                   fail(
                       f"{pass_name}: page count {expected_pages} exceeds safety limit {MAX_PAGES}"
@@ -425,8 +490,37 @@ jobs:
               seen_urls: set[str] = set()
               page_records: list[tuple[tuple[str, str], ...]] = []
               for page in range(1, expected_pages + 1):
-                  payload = first_payload if page == 1 else await crawlbase_json(
-                      client, product_api_url(page)
+                  page_session = session_for_page(page)
+                  if page > 1 and (page - 1) % CATALOG_SESSION_PAGE_SPAN == 0:
+                      anchor_payload = await crawlbase_json(
+                          client,
+                          product_api_url(1),
+                          crawlbase_session=page_session,
+                      )
+                      anchor_rows, anchor_total, anchor_pages = parse_page(anchor_payload, page=1)
+                      if anchor_total != expected_total or anchor_pages != expected_pages:
+                          fail(
+                              f"{pass_name}: chunk anchor metadata changed before page {page}: "
+                              f"got total={anchor_total},pages={anchor_pages}; "
+                              f"expected total={expected_total},pages={expected_pages}"
+                          )
+                      if (
+                          page_identity_records(
+                              anchor_rows,
+                              pass_name=pass_name,
+                              page=1,
+                          )
+                          != first_page_records
+                      ):
+                          fail(f"{pass_name}: chunk anchor changed before page {page}")
+                  payload = (
+                      first_payload
+                      if page == 1
+                      else await crawlbase_json(
+                          client,
+                          product_api_url(page),
+                          crawlbase_session=page_session,
+                      )
                   )
                   rows, total, pages = parse_page(payload, page=page)
                   if total != expected_total or pages != expected_pages:
@@ -446,28 +540,15 @@ jobs:
                           f"expected {expected_items}"
                       )
 
-                  records: list[tuple[str, str]] = []
-                  for position, row in enumerate(rows, start=1):
-                      external_id = text_value(row.get("_id"))
-                      canonical_url = canonical_product_url(
-                          row.get("path"), source_is_path=True
-                      )
-                      if external_id is None or METEOR_ID_RE.fullmatch(external_id) is None:
-                          fail(
-                              f"{pass_name}: page {page} item {position} has no direct 17-character ID"
-                          )
-                      if canonical_url is None:
-                          fail(
-                              f"{pass_name}: page {page} item {position} has an invalid product path"
-                          )
+                  records = page_identity_records(rows, pass_name=pass_name, page=page)
+                  for external_id, canonical_url in records:
                       if external_id in seen_ids:
                           fail(f"{pass_name}: duplicate product ID on page {page}")
                       if canonical_url in seen_urls:
                           fail(f"{pass_name}: duplicate canonical product URL on page {page}")
                       seen_ids.add(external_id)
                       seen_urls.add(canonical_url)
-                      records.append((external_id, canonical_url))
-                  page_records.append(tuple(records))
+                  page_records.append(records)
 
               if len(seen_ids) != expected_total or len(seen_urls) != expected_total:
                   fail(
@@ -480,14 +561,25 @@ jobs:
                   page_records=tuple(page_records),
                   ids=frozenset(seen_ids),
                   urls=frozenset(seen_urls),
+                  session_chunks=len(catalog_sessions),
               )
 
 
           async def sitemap_product_urls(
               client: httpx.AsyncClient,
+              *,
+              crawlbase_session: str,
           ) -> tuple[frozenset[str], int]:
               index_url = f"{BASE_URL}/sitemap.xml"
-              index_locs = list(xml_locs(await crawlbase_xml(client, index_url)))
+              index_locs = list(
+                  xml_locs(
+                      await crawlbase_xml(
+                          client,
+                          index_url,
+                          crawlbase_session=crawlbase_session,
+                      )
+                  )
+              )
               child_maps: set[str] = set()
               for location in index_locs:
                   child_map = same_origin_sitemap_url(location)
@@ -501,7 +593,15 @@ jobs:
               product_urls: set[str] = set()
               duplicate_product_url_entries = 0
               for child_map in sorted(child_maps):
-                  locations = list(xml_locs(await crawlbase_xml(client, child_map)))
+                  locations = list(
+                      xml_locs(
+                          await crawlbase_xml(
+                              client,
+                              child_map,
+                              crawlbase_session=crawlbase_session,
+                          )
+                      )
+                  )
                   if not locations:
                       fail(f"empty product child sitemap: {child_map}")
                   for location in locations:
@@ -701,7 +801,10 @@ jobs:
                           "the source is not stable enough to recover"
                       )
 
-                  sitemap_urls, sitemap_duplicate_entries = await sitemap_product_urls(client)
+                  sitemap_urls, sitemap_duplicate_entries = await sitemap_product_urls(
+                      client,
+                      crawlbase_session=SITEMAP_SESSION,
+                  )
               if sitemap_urls != first_pass.urls:
                   fail(
                       "public API and product sitemap URL sets differ: "
@@ -726,7 +829,10 @@ jobs:
                   f"trusted_ddp_identities={trusted_identity_count}, "
                   f"trusted_ddp_history_products={trusted_history_products}, "
                   f"trusted_coverage={trusted_coverage:.4f}, "
-                  f"crawlbase_session=sticky, origin_contexts={origin_context_evidence()}, "
+                  "crawlbase_sessions=short_chunks, "
+                  f"catalog_session_page_span={CATALOG_SESSION_PAGE_SPAN}, "
+                  f"catalog_session_chunks_per_pass={first_pass.session_chunks}, "
+                  f"origin_contexts={origin_context_evidence()}, "
                   f"transport_retries={TRANSIENT_TRANSPORT_RETRIES}, "
                   "database_transaction=read_only, persistence=none"
               )
