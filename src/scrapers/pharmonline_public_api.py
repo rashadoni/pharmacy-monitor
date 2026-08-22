@@ -15,11 +15,13 @@ to the normal persistence pipeline.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import math
 import os
 import re
+import secrets
 from collections.abc import AsyncIterator, Iterable
 from typing import Any
 from urllib.parse import quote, urlencode, unquote, urljoin, urlsplit
@@ -39,6 +41,12 @@ _BASE_URL = "https://pharmonline.az"
 _METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
 _PRODUCT_SITEMAP_RE = re.compile(r"/sitemap-products-\d+\.xml$", re.I)
 _XML_LOC_TAG = "loc"
+_ORIGIN_CONTEXT_HEADERS = (
+    "cache-control",
+    "vary",
+    "cf-cache-status",
+    "x-cache",
+)
 
 
 class PharmonlinePublicAPIError(RuntimeError):
@@ -171,6 +179,13 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if token is None:
             raise SiteScrapeFatalError("Crawlbase JS token is not configured")
         self._crawlbase_token = token
+        # Keep API pagination and sitemap requests in one Crawlbase context.
+        # Pharmonline can vary its public catalog by browser/cookie/exit state;
+        # a fresh, opaque 32-character session prevents pages from being
+        # assembled from unrelated contexts while preserving the existing
+        # fail-closed API+sitemap proof.
+        self._crawlbase_session = secrets.token_hex(16)
+        self._origin_contexts: dict[str, set[str]] = {}
         self._client = httpx.AsyncClient(timeout=120.0)
         return self
 
@@ -191,6 +206,34 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         )
         return f"{self.base_url}/api/products?{query}"
 
+    def _record_origin_context(self, target_url: str, envelope: dict[str, Any]) -> None:
+        """Record a non-sensitive fingerprint of selected origin cache headers."""
+        raw_headers = envelope.get("original_headers")
+        if not isinstance(raw_headers, dict):
+            return
+        headers = {str(name).lower(): _text(value) for name, value in raw_headers.items()}
+        selected = tuple(
+            (name, headers[name])
+            for name in _ORIGIN_CONTEXT_HEADERS
+            if headers.get(name) is not None
+        )
+        if not selected:
+            return
+        fingerprint = hashlib.sha256(repr(selected).encode("utf-8")).hexdigest()[:12]
+        resource = urlsplit(target_url).path
+        contexts: dict[str, set[str]] = getattr(self, "_origin_contexts", {})
+        contexts.setdefault(resource, set()).add(fingerprint)
+        self._origin_contexts = contexts
+
+    def _origin_context_evidence(self) -> str:
+        contexts: dict[str, set[str]] = getattr(self, "_origin_contexts", {})
+        if not contexts:
+            return "none"
+        return ",".join(
+            f"{resource}:{len(fingerprints)}"
+            for resource, fingerprints in sorted(contexts.items())
+        )
+
     async def _crawlbase_body(self, target_url: str, *, accept: str) -> Any:
         client: httpx.AsyncClient | None = getattr(self, "_client", None)
         if client is None:
@@ -199,6 +242,8 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             "token": self._crawlbase_token,
             "url": target_url,
             "request_headers": f"accept:{accept}",
+            "cookies_session": self._crawlbase_session,
+            "get_headers": "true",
             "format": "json",
         }
         try:
@@ -228,6 +273,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             )
         if "body" not in envelope:
             raise PharmonlinePublicAPIError("crawlbase_envelope_body_missing")
+        self._record_origin_context(target_url, envelope)
         return envelope["body"]
 
     async def _crawlbase_json(self, target_url: str) -> dict | list:
@@ -476,6 +522,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             log.warning(
                 "pharmonline_public_api_catalog_rejected",
                 reason=reason,
+                origin_contexts=self._origin_context_evidence(),
             )
             return
         except Exception as exc:  # defensive boundary: never yield partial rows
@@ -488,9 +535,16 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             log.warning(
                 "pharmonline_public_api_catalog_failed",
                 error_type=type(exc).__name__,
+                origin_contexts=self._origin_context_evidence(),
             )
             return
 
+        log.info(
+            "pharmonline_public_api_catalog_verified",
+            products=expected_total,
+            pages=expected_pages,
+            origin_contexts=self._origin_context_evidence(),
+        )
         self._set_route_status(
             category_slug,
             complete=True,

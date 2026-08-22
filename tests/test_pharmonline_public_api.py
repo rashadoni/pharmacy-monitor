@@ -216,6 +216,47 @@ async def test_sitemap_fetch_rejects_external_index_and_product_urls(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_crawlbase_requests_keep_one_sticky_session_and_origin_header_evidence():
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._crawlbase_token = "test-token"
+    scraper._crawlbase_session = "a" * 32
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "cb_status": "200",
+                "original_status": "200",
+                "body": {"data": []},
+                "original_headers": {
+                    "Cache-Control": "public, max-age=60",
+                    "CF-Cache-Status": "HIT",
+                },
+            }
+
+    class _Client:
+        params: dict | None = None
+
+        async def get(self, _url: str, *, params: dict) -> _Response:
+            self.params = params
+            return _Response()
+
+    client = _Client()
+    scraper._client = client
+
+    assert await scraper._crawlbase_body(
+        "https://pharmonline.az/api/products?lng=az&page=1",
+        accept="application/json",
+    ) == {"data": []}
+    assert client.params is not None
+    assert client.params["cookies_session"] == "a" * 32
+    assert client.params["get_headers"] == "true"
+    assert scraper._origin_context_evidence() == "/api/products:1"
+
+
+@pytest.mark.asyncio
 async def test_sitemap_fetch_deduplicates_repeated_canonical_product_urls(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
 
