@@ -6,6 +6,11 @@ name: Probe Pharmonline public API (no persistence)
 # trusted DDP catalog. It never creates or changes a Run, Product, or snapshot.
 on:
   workflow_dispatch:
+    inputs:
+      page_size:
+        description: "Public API page size to test (1-5000; no persistence)"
+        required: true
+        default: "100"
 
 permissions:
   contents: read
@@ -64,6 +69,7 @@ jobs:
         env:
           DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
           CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
+          PROBE_PAGE_SIZE: ${{ inputs.page_size }}
         run: |
           set -euo pipefail
           test -n "$CRAWLBASE_JS_TOKEN"
@@ -71,8 +77,10 @@ jobs:
           import asyncio
           import html
           import json
+          import math
           import os
           import re
+          import secrets
           from urllib.parse import urlencode
 
           import httpx
@@ -87,7 +95,13 @@ jobs:
 
 
           BASE_URL = "https://pharmonline.az"
-          GLOBAL_PAGE_SIZE = 100
+          try:
+              GLOBAL_PAGE_SIZE = int(os.environ["PROBE_PAGE_SIZE"])
+          except (KeyError, ValueError) as exc:
+              raise SystemExit("PROBE_PAGE_SIZE must be an integer") from exc
+          if not 1 <= GLOBAL_PAGE_SIZE <= 5000:
+              raise SystemExit("PROBE_PAGE_SIZE must be between 1 and 5000")
+          CRAWLBASE_SESSION = secrets.token_hex(16)
 
 
           async def crawlbase_json(target_url: str) -> dict | list:
@@ -95,6 +109,7 @@ jobs:
                   "token": os.environ["CRAWLBASE_JS_TOKEN"],
                   "url": target_url,
                   "request_headers": "accept:application/json",
+                  "cookies_session": CRAWLBASE_SESSION,
                   # Ask Crawlbase for a metadata envelope.  With a JavaScript
                   # token a JSON target may be rendered in a browser, so the
                   # actual target body is intentionally read from ``body``
@@ -209,6 +224,10 @@ jobs:
                       and global_pages >= 2
                       and global_total == global_second_total
                       and global_pages == global_second_pages
+                      and global_pages == math.ceil(global_total / GLOBAL_PAGE_SIZE)
+                      and len(global_rows) == GLOBAL_PAGE_SIZE
+                      and len(global_second_rows)
+                      == min(GLOBAL_PAGE_SIZE, global_total - GLOBAL_PAGE_SIZE)
                       and len(global_ids) == len(global_rows)
                       and len(global_second_ids) == len(global_second_rows)
                       and not (global_ids & global_second_ids)
@@ -296,7 +315,7 @@ jobs:
                   "Pharmonline public API probe OK: "
                   f"sort_by={label}, "
                   f"global_total={global_total}, global_pages={global_pages}, "
-                  f"global_page_size={len(global_rows)}, global_page_overlap={global_overlap}, "
+                  f"global_page_size={GLOBAL_PAGE_SIZE}, global_page_overlap={global_overlap}, "
                   f"sample_fields={sample_keys}, database_transaction=read_only"
               )
 
