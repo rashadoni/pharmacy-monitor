@@ -165,6 +165,18 @@ jobs:
               "IPROYAL_PASSWORD",
               "IPROYAL_HOST",
               "IPROYAL_COUNTRY",
+              "BRIGHTDATA_USERNAME",
+              "BRIGHTDATA_PASSWORD",
+              "BRIGHTDATA_HOST",
+              "BRIGHTDATA_COUNTRY",
+              "CRAWLBASE_NORMAL_TOKEN",
+              "CRAWLBASE_JS_TOKEN",
+              "SCRAPER_API_KEY",
+              "SCRAPER_API_COUNTRY",
+              "HTTP_PROXY",
+              "HTTPS_PROXY",
+              "ALL_PROXY",
+              "SCRAPE_PROXY",
               "HEALTH_ALERT_STATE_FILE",
           )
 
@@ -174,8 +186,20 @@ jobs:
           print(f"PHARMONLINE_USE_DDP={ddp_enabled}")
           decodo_sites = {item.strip() for item in entries.get("DECODO_SITES", "").split(",")}
           iproyal_sites = {item.strip() for item in entries.get("IPROYAL_SITES", "").split(",")}
+          brightdata_sites = {
+              item.strip() for item in entries.get("BRIGHTDATA_SITES", "").split(",")
+          }
+          crawlbase_sites = {
+              item.strip() for item in entries.get("CRAWLBASE_SITES", "").split(",")
+          }
+          scraperapi_sites = {
+              item.strip() for item in entries.get("SCRAPER_API_SITES", "").split(",")
+          }
           print(f"DECODO_SITES includes pharmonline={'pharmonline' in decodo_sites}")
           print(f"IPROYAL_SITES includes pharmonline={'pharmonline' in iproyal_sites}")
+          print(f"BRIGHTDATA_SITES includes pharmonline={'pharmonline' in brightdata_sites}")
+          print(f"CRAWLBASE_SITES includes pharmonline={'pharmonline' in crawlbase_sites}")
+          print(f"SCRAPER_API_SITES includes pharmonline={'pharmonline' in scraperapi_sites}")
           for key in numeric_keys:
               value = entries.get(key)
               if value is None:
