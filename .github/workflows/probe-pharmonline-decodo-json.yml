@@ -1,0 +1,258 @@
+name: Probe Pharmonline direct JSON via Decodo (no persistence)
+
+# This is intentionally a small, read-only transport probe.  It runs on the
+# production host only because the existing Decodo credentials live there; it
+# never opens Postgres, invokes the scraper CLI, or changes service state.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type PROBE to test Decodo's direct public-JSON path without persistence"
+        required: true
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pharmonline-decodo-json-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require explicit no-write probe confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "PROBE"
+
+      - name: Setup production SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' \
+            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
+          test "$host_fingerprint" = \
+            'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
+
+      - name: Verify Decodo direct API stability without writes
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          # Do not compete with the scheduled write-enabled Pharmonline job.
+          if systemctl is-active --quiet pharmacy-monitor-scrape@pharmonline.service; then
+            echo "refusing Decodo probe: a Pharmonline scrape is already active" >&2
+            exit 1
+          fi
+
+          test -r /etc/pharmacy-monitor/env
+          cd /opt/pharmacy-monitor
+          set -a
+          . /etc/pharmacy-monitor/env
+          set +a
+
+          PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
+          import asyncio
+          import json
+          import math
+          import os
+          import re
+          from urllib.parse import quote, urlencode
+
+          import httpx
+
+
+          BASE_URL = "https://pharmonline.az"
+          PAGE_SIZE = 100
+          SORT_BY = "name_asc"
+          ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
+
+
+          def fail(message: str) -> None:
+              raise SystemExit(f"Decodo direct JSON probe failed: {message}")
+
+
+          def decodo_ports() -> list[int]:
+              raw = os.environ.get("DECODO_PORTS", "30001-30010")
+              ports: list[int] = []
+              for token in raw.split(","):
+                  token = token.strip()
+                  if not token:
+                      continue
+                  if "-" in token:
+                      start_raw, end_raw = token.split("-", 1)
+                      try:
+                          start, end = int(start_raw), int(end_raw)
+                      except ValueError:
+                          fail("DECODO_PORTS contains a non-numeric range")
+                      if start < 1 or end < start or end > 65535:
+                          fail("DECODO_PORTS contains an invalid range")
+                      ports.extend(range(start, end + 1))
+                  else:
+                      try:
+                          port = int(token)
+                      except ValueError:
+                          fail("DECODO_PORTS contains a non-numeric port")
+                      if port < 1 or port > 65535:
+                          fail("DECODO_PORTS contains an invalid port")
+                      ports.append(port)
+              unique = list(dict.fromkeys(ports))
+              if not unique:
+                  fail("DECODO_PORTS is empty")
+              return unique
+
+
+          def product_url(page: int) -> str:
+              return f"{BASE_URL}/api/products?" + urlencode(
+                  {
+                      "lng": "az",
+                      "page": str(page),
+                      "limit": str(PAGE_SIZE),
+                      "sortBy": SORT_BY,
+                  }
+              )
+
+
+          def records_and_metadata(payload: object, *, page: int) -> tuple[tuple[tuple[str, str], ...], int, int]:
+              if not isinstance(payload, dict):
+                  fail(f"page {page} payload is not an object")
+              rows = payload.get("data")
+              if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                  fail(f"page {page} has invalid data rows")
+              try:
+                  total = int(payload["total"])
+                  pages = int(payload["pages"])
+              except (KeyError, TypeError, ValueError):
+                  fail(f"page {page} has invalid total/pages metadata")
+              if total < 1 or pages < 1 or pages != math.ceil(total / PAGE_SIZE):
+                  fail(f"page {page} has inconsistent total/pages metadata")
+              expected_size = PAGE_SIZE if page < pages else total - PAGE_SIZE * (pages - 1)
+              if len(rows) != expected_size:
+                  fail(f"page {page} has {len(rows)} rows; expected {expected_size}")
+              records: list[tuple[str, str]] = []
+              for row in rows:
+                  external_id = str(row.get("_id") or "")
+                  path = str(row.get("path") or "").strip("/")
+                  if ID_RE.fullmatch(external_id) is None or not path or "/" in path:
+                      fail(f"page {page} has an invalid product identity")
+                  records.append((external_id, path))
+              if len(set(records)) != len(records):
+                  fail(f"page {page} contains duplicate product identities")
+              return tuple(records), total, pages
+
+
+          async def read_page(
+              client: httpx.AsyncClient,
+              page: int,
+              *,
+              expected_total: int | None = None,
+              expected_pages: int | None = None,
+          ) -> tuple[tuple[tuple[str, str], ...], int, int]:
+              try:
+                  response = await client.get(
+                      product_url(page),
+                      headers={"accept": "application/json"},
+                  )
+              except httpx.HTTPError as exc:
+                  # Do not stringify the exception: proxy libraries can embed
+                  # credential-bearing URLs in their messages.
+                  fail(f"page {page} transport error: {type(exc).__name__}")
+              if response.status_code != 200:
+                  fail(f"page {page} returned HTTP {response.status_code}")
+              try:
+                  payload = response.json()
+              except json.JSONDecodeError:
+                  fail(f"page {page} response is not JSON")
+              records, total, pages = records_and_metadata(payload, page=page)
+              if expected_total is not None and (total != expected_total or pages != expected_pages):
+                  fail(
+                      f"page {page} metadata changed: got total={total},pages={pages}; "
+                      f"expected total={expected_total},pages={expected_pages}"
+                  )
+              return records, total, pages
+
+
+          async def probe_port(port: int, *, username: str, password: str, host: str) -> tuple[int, int]:
+              proxy_url = (
+                  f"http://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+              )
+              timeout = httpx.Timeout(45.0, connect=15.0)
+              async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout) as client:
+                  first_records, total, pages = await read_page(client, 1)
+                  sample_pages = tuple(sorted({1, (pages + 1) // 2, min(85, pages), pages}))
+                  sampled = {1: first_records}
+                  for page in sample_pages:
+                      if page == 1:
+                          continue
+                      records, _, _ = await read_page(
+                          client,
+                          page,
+                          expected_total=total,
+                          expected_pages=pages,
+                      )
+                      sampled[page] = records
+                  for page in sample_pages:
+                      repeated, _, _ = await read_page(
+                          client,
+                          page,
+                          expected_total=total,
+                          expected_pages=pages,
+                      )
+                      if repeated != sampled[page]:
+                          fail(f"page {page} changed on an immediate repeat")
+              return total, pages
+
+
+          async def main() -> None:
+              username = os.environ.get("DECODO_USERNAME", "").strip()
+              password = os.environ.get("DECODO_PASSWORD", "")
+              sites = {
+                  value.strip()
+                  for value in os.environ.get("DECODO_SITES", "").split(",")
+                  if value.strip()
+              }
+              host = os.environ.get("DECODO_HOST", "az.decodo.com").strip()
+              if not username or not password or "pharmonline" not in sites or not host:
+                  fail("Decodo is not configured for Pharmonline on production")
+
+              # Two independent sticky exits are enough for a bounded signal,
+              # while keeping this probe small and non-disruptive.
+              selected_ports = decodo_ports()[:2]
+              results = []
+              for port in selected_ports:
+                  results.append(
+                      await probe_port(port, username=username, password=password, host=host)
+                  )
+              if len(set(results)) != 1:
+                  fail("independent Decodo sessions disagree on total/pages")
+              total, pages = results[0]
+              print(
+                  "Decodo direct JSON probe OK: "
+                  f"total={total}, pages={pages}, page_size={PAGE_SIZE}, "
+                  f"sticky_sessions={len(selected_ports)}, "
+                  "sampled_pages=1,48,85,last, repeated_pages=identical, "
+                  "database=not_opened, persistence=none"
+              )
+
+
+          asyncio.run(main())
+          PY
+          REMOTE
