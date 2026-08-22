@@ -64,15 +64,22 @@ _CATALOG_SESSION_PAGE_SPAN = 20
 # small configured port pool eventually reuses the same exit. The anchors and
 # full source+sitemap proof remain mandatory before yielding one product.
 _DECODO_CATALOG_SESSION_PAGE_SPAN = 10
+# ScraperAPI keeps one proxy exit per named session. Keep those groups equally
+# bounded so a slow full-catalog pass never relies on a session close to the
+# provider's idle-expiry window.
+_SCRAPERAPI_CATALOG_SESSION_PAGE_SPAN = 10
 _MAX_DECODO_STICKY_PORTS = 64
 _PUBLIC_API_TRANSPORT_ENV = "PHARMONLINE_PUBLIC_API_TRANSPORT"
 _DECODO_BACKCONNECT_STICKY_ENV = "PHARMONLINE_DECODO_BACKCONNECT_STICKY"
 _CRAWLBASE_TRANSPORT = "crawlbase"
 _DECODO_TRANSPORT = "decodo"
+_SCRAPERAPI_TRANSPORT = "scraperapi"
 _DECODO_BACKCONNECT_HOST = "gate.decodo.com"
 _DECODO_BACKCONNECT_PORT = 7000
 _DECODO_BACKCONNECT_COUNTRY = "az"
 _DECODO_BACKCONNECT_SESSION_MINUTES = 30
+_SCRAPERAPI_PROXY_HOST = "proxy-server.scraperapi.com"
+_SCRAPERAPI_PROXY_PORT = 8001
 
 
 class PharmonlinePublicAPIError(RuntimeError):
@@ -100,6 +107,17 @@ def _require_decodo_pharmonline_site() -> None:
     }
     if "pharmonline" not in sites:
         raise SiteScrapeFatalError("Decodo is not configured for Pharmonline")
+
+
+def _require_scraperapi_pharmonline_site() -> None:
+    """Require an explicit ScraperAPI scope before opening its proxy."""
+    sites = {
+        value.strip()
+        for value in os.environ.get("SCRAPER_API_SITES", "").split(",")
+        if value.strip()
+    }
+    if "pharmonline" not in sites:
+        raise SiteScrapeFatalError("ScraperAPI is not configured for Pharmonline")
 
 
 def _configured_decodo_ports() -> tuple[int, ...]:
@@ -258,7 +276,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if not _env_enabled("PHARMONLINE_PUBLIC_API"):
             raise SiteScrapeFatalError("Pharmonline public API mode is not explicitly enabled")
         transport = os.environ.get(_PUBLIC_API_TRANSPORT_ENV, _CRAWLBASE_TRANSPORT).strip().lower()
-        if transport not in {_CRAWLBASE_TRANSPORT, _DECODO_TRANSPORT}:
+        if transport not in {_CRAWLBASE_TRANSPORT, _DECODO_TRANSPORT, _SCRAPERAPI_TRANSPORT}:
             raise SiteScrapeFatalError("Pharmonline public API transport is not supported")
 
         self._public_api_transport = transport
@@ -268,6 +286,8 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         self._client: httpx.AsyncClient | None = None
         self._decodo_clients: dict[str, httpx.AsyncClient] = {}
         self._decodo_session_ports: dict[str, int] = {}
+        self._scraperapi_clients: dict[str, httpx.AsyncClient] = {}
+        self._scraperapi_session_numbers: dict[str, int] = {}
 
         if transport == _CRAWLBASE_TRANSPORT:
             token = _text(os.environ.get("CRAWLBASE_JS_TOKEN"))
@@ -278,7 +298,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             # pages use a bounded sticky context per page group in
             # ``_fetch_catalog``.
             self._client = httpx.AsyncClient(timeout=120.0)
-        else:
+        elif transport == _DECODO_TRANSPORT:
             username = _text(os.environ.get("DECODO_USERNAME"))
             password = os.environ.get("DECODO_PASSWORD")
             use_backconnect_sticky = _decodo_backconnect_sticky_enabled()
@@ -309,6 +329,31 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                 "pharmonline_public_api_decodo_transport_configured",
                 connection="backconnect" if use_backconnect_sticky else "country_sticky_port",
             )
+        else:
+            key = _text(os.environ.get("SCRAPER_API_KEY"))
+            _require_scraperapi_pharmonline_site()
+            premium_sites = {
+                value.strip()
+                for value in os.environ.get("SCRAPER_API_PREMIUM_SITES", "").split(",")
+                if value.strip()
+            }
+            if "pharmonline" in premium_sites:
+                raise SiteScrapeFatalError(
+                    "ScraperAPI premium mode cannot be combined with sticky sessions"
+                )
+            if os.environ.get("SCRAPER_API_COUNTRY", "").strip():
+                raise SiteScrapeFatalError(
+                    "ScraperAPI country targeting is not enabled for public API recovery"
+                )
+            if key is None:
+                raise SiteScrapeFatalError("ScraperAPI credentials are not configured")
+            self._scraperapi_key = key
+            self._scraperapi_default_session = f"scraperapi-category-{secrets.token_hex(16)}"
+            log.info(
+                "pharmonline_public_api_scraperapi_transport_configured",
+                country="default",
+                sticky_sessions=True,
+            )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
@@ -320,6 +365,10 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             await decodo_client.aclose()
         self._decodo_clients = {}
         self._decodo_session_ports = {}
+        for scraperapi_client in getattr(self, "_scraperapi_clients", {}).values():
+            await scraperapi_client.aclose()
+        self._scraperapi_clients = {}
+        self._scraperapi_session_numbers = {}
 
     def _transport_name(self) -> str:
         """Use Crawlbase by default for backwards-compatible unit fixtures."""
@@ -328,6 +377,8 @@ class PharmonlinePublicAPIScraper(BaseScraper):
     def _catalog_session_page_span(self) -> int:
         if self._transport_name() == _DECODO_TRANSPORT:
             return _DECODO_CATALOG_SESSION_PAGE_SPAN
+        if self._transport_name() == _SCRAPERAPI_TRANSPORT:
+            return _SCRAPERAPI_CATALOG_SESSION_PAGE_SPAN
         return _CATALOG_SESSION_PAGE_SPAN
 
     def _product_api_url(self, page: int) -> str:
@@ -385,6 +436,8 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if session is None:
             if self._transport_name() == _DECODO_TRANSPORT:
                 session = f"decodo-catalog-{chunk}-{secrets.token_hex(16)}"
+            elif self._transport_name() == _SCRAPERAPI_TRANSPORT:
+                session = f"scraperapi-catalog-{chunk}-{secrets.token_hex(16)}"
             else:
                 session = secrets.token_hex(16)
             sessions[chunk] = session
@@ -395,6 +448,8 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         """Keep sitemap traffic out of every catalog context."""
         if self._transport_name() == _DECODO_TRANSPORT:
             return f"decodo-sitemap-{secrets.token_hex(16)}"
+        if self._transport_name() == _SCRAPERAPI_TRANSPORT:
+            return f"scraperapi-sitemap-{secrets.token_hex(16)}"
         return secrets.token_hex(16)
 
     async def _crawlbase_body(
@@ -575,6 +630,99 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         self._record_origin_headers(target_url, response.headers)
         return response.text
 
+    def _scraperapi_context(self, session: str | None) -> str:
+        if session is not None:
+            if not session.startswith("scraperapi-"):
+                raise PharmonlinePublicAPIError("scraperapi_session_context_invalid")
+            return session
+        context = getattr(self, "_scraperapi_default_session", None)
+        if not isinstance(context, str) or not context.startswith("scraperapi-"):
+            context = f"scraperapi-category-{secrets.token_hex(16)}"
+            self._scraperapi_default_session = context
+        return context
+
+    def _scraperapi_proxy_url_for_context(self, context: str) -> str:
+        """Build one non-logged ScraperAPI proxy URL for a logical context."""
+        key = getattr(self, "_scraperapi_key", "")
+        if not key:
+            raise SiteScrapeFatalError("ScraperAPI credentials are not configured")
+        session_number = self._scraperapi_session_number_for_context(context)
+        username = f"scraperapi.session_number={session_number}"
+        return (
+            f"http://{quote(username, safe='')}:{quote(key, safe='')}"
+            f"@{_SCRAPERAPI_PROXY_HOST}:{_SCRAPERAPI_PROXY_PORT}"
+        )
+
+    def _scraperapi_session_number_for_context(self, context: str) -> int:
+        """Allocate an unguessable, collision-free provider session number."""
+        sessions: dict[str, int] = getattr(self, "_scraperapi_session_numbers", {})
+        existing = sessions.get(context)
+        if existing is not None:
+            return existing
+        occupied = set(sessions.values())
+        for _ in range(32):
+            candidate = secrets.randbelow(2_000_000_000) + 1
+            if candidate not in occupied:
+                sessions[context] = candidate
+                self._scraperapi_session_numbers = sessions
+                return candidate
+        raise PharmonlinePublicAPIError("scraperapi_session_number_allocation_failed")
+
+    def _scraperapi_client_for_context(self, context: str) -> httpx.AsyncClient:
+        clients: dict[str, httpx.AsyncClient] = getattr(self, "_scraperapi_clients", {})
+        client = clients.get(context)
+        if client is None:
+            # ScraperAPI proxy mode terminates TLS, so the client must not
+            # verify the target certificate. The proxy URL is never logged.
+            client = httpx.AsyncClient(
+                proxy=self._scraperapi_proxy_url_for_context(context),
+                timeout=120.0,
+                trust_env=False,
+                verify=False,
+            )
+            clients[context] = client
+            self._scraperapi_clients = clients
+        return client
+
+    async def _scraperapi_body(
+        self,
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        """Fetch the native public response through one sticky ScraperAPI exit."""
+        context = self._scraperapi_context(crawlbase_session)
+        client = self._scraperapi_client_for_context(context)
+        for attempt in range(1, _MAX_CRAWLBASE_ATTEMPTS + 1):
+            try:
+                response = await client.get(target_url, headers={"accept": accept})
+                break
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                if attempt == _MAX_CRAWLBASE_ATTEMPTS:
+                    raise PharmonlinePublicAPIError("scraperapi_transient_request_failed") from None
+                log.warning(
+                    "pharmonline_public_api_transport_retry",
+                    transport=_SCRAPERAPI_TRANSPORT,
+                    resource=urlsplit(target_url).path,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                )
+                await asyncio.sleep(1)
+            except httpx.HTTPError as exc:
+                proxy_reason = fatal_proxy_reason(exc)
+                if proxy_reason is not None:
+                    raise SiteScrapeFatalError(proxy_reason) from None
+                raise PharmonlinePublicAPIError("scraperapi_request_failed") from None
+        if response.status_code in {402, 407}:
+            raise SiteScrapeFatalError(
+                f"ScraperAPI proxy access rejected: HTTP {response.status_code}"
+            )
+        if response.status_code != 200:
+            raise PharmonlinePublicAPIError(f"scraperapi_http_{response.status_code}")
+        self._record_origin_headers(target_url, response.headers)
+        return response.text
+
     async def _source_json(
         self,
         target_url: str,
@@ -584,6 +732,14 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if self._transport_name() == _DECODO_TRANSPORT:
             return _json_from_rendered_body(
                 await self._decodo_body(
+                    target_url,
+                    accept="application/json",
+                    crawlbase_session=crawlbase_session,
+                )
+            )
+        if self._transport_name() == _SCRAPERAPI_TRANSPORT:
+            return _json_from_rendered_body(
+                await self._scraperapi_body(
                     target_url,
                     accept="application/json",
                     crawlbase_session=crawlbase_session,
@@ -615,6 +771,12 @@ class PharmonlinePublicAPIScraper(BaseScraper):
     ) -> str:
         if self._transport_name() == _DECODO_TRANSPORT:
             return await self._decodo_body(
+                target_url,
+                accept="application/xml,text/xml;q=0.9,*/*;q=0.8",
+                crawlbase_session=crawlbase_session,
+            )
+        if self._transport_name() == _SCRAPERAPI_TRANSPORT:
+            return await self._scraperapi_body(
                 target_url,
                 accept="application/xml,text/xml;q=0.9,*/*;q=0.8",
                 crawlbase_session=crawlbase_session,

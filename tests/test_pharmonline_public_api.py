@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 import pytest
@@ -370,6 +370,80 @@ async def test_decodo_backconnect_rejects_unknown_flag_value(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_scraperapi_transport_uses_isolated_named_sticky_sessions(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "scraperapi")
+    monkeypatch.setenv("SCRAPER_API_KEY", "proxy:key@value")
+    monkeypatch.setenv("SCRAPER_API_SITES", "pharmonline")
+
+    scraper = PharmonlinePublicAPIScraper()
+    await scraper.__aenter__()
+    try:
+        first_context = scraper._catalog_session_for_page(1)
+        second_context = scraper._catalog_session_for_page(11)
+        sitemap_context = scraper._sitemap_session()
+
+        assert first_context.startswith("scraperapi-catalog-0-")
+        assert second_context.startswith("scraperapi-catalog-1-")
+        assert sitemap_context.startswith("scraperapi-sitemap-")
+
+        first_proxy = urlsplit(scraper._scraperapi_proxy_url_for_context(first_context))
+        second_proxy = urlsplit(scraper._scraperapi_proxy_url_for_context(second_context))
+        assert first_proxy.hostname == second_proxy.hostname == "proxy-server.scraperapi.com"
+        assert first_proxy.port == second_proxy.port == 8001
+        first_username = first_proxy.username or ""
+        second_username = second_proxy.username or ""
+        prefix = "scraperapi.session_number="
+        assert first_username.startswith(prefix)
+        assert second_username.startswith(prefix)
+        assert first_username.removeprefix(prefix).isdigit()
+        assert second_username.removeprefix(prefix).isdigit()
+        assert first_username != second_username
+        assert unquote(first_proxy.password or "") == "proxy:key@value"
+
+        first_client = scraper._scraperapi_client_for_context(first_context)
+        assert scraper._scraperapi_client_for_context(first_context) is first_client
+        assert scraper._scraperapi_client_for_context(sitemap_context) is not first_client
+    finally:
+        await scraper.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_scraperapi_transport_rejects_premium_with_sticky_sessions(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "scraperapi")
+    monkeypatch.setenv("SCRAPER_API_KEY", "proxy-key")
+    monkeypatch.setenv("SCRAPER_API_SITES", "pharmonline")
+    monkeypatch.setenv("SCRAPER_API_PREMIUM_SITES", "pharmonline")
+
+    with pytest.raises(SiteScrapeFatalError, match="premium mode cannot be combined"):
+        await PharmonlinePublicAPIScraper().__aenter__()
+
+
+@pytest.mark.asyncio
+async def test_scraperapi_transport_rejects_unproven_global_country_targeting(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "scraperapi")
+    monkeypatch.setenv("SCRAPER_API_KEY", "proxy-key")
+    monkeypatch.setenv("SCRAPER_API_SITES", "pharmonline")
+    monkeypatch.setenv("SCRAPER_API_COUNTRY", "az")
+
+    with pytest.raises(SiteScrapeFatalError, match="country targeting is not enabled"):
+        await PharmonlinePublicAPIScraper().__aenter__()
+
+
+@pytest.mark.asyncio
+async def test_scraperapi_transport_requires_explicit_pharmonline_scope(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "scraperapi")
+    monkeypatch.setenv("SCRAPER_API_KEY", "proxy-key")
+    monkeypatch.setenv("SCRAPER_API_SITES", "aptekonline")
+
+    with pytest.raises(SiteScrapeFatalError, match="not configured for Pharmonline"):
+        await PharmonlinePublicAPIScraper().__aenter__()
+
+
+@pytest.mark.asyncio
 async def test_decodo_direct_request_keeps_one_context_on_retry(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
     scraper._decodo_ports = (30001,)
@@ -451,6 +525,44 @@ async def test_decodo_direct_request_retries_a_closed_remote_connection(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_scraperapi_direct_request_retries_in_the_same_sticky_context(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+
+    class _Response:
+        status_code = 200
+        headers = {"cache-control": "public, max-age=60"}
+        text = '{"data": []}'
+
+    class _Client:
+        calls = 0
+
+        async def get(self, _url: str, *, headers: dict[str, str]) -> _Response:
+            self.calls += 1
+            assert headers == {"accept": "application/json"}
+            if self.calls == 1:
+                raise httpx.RemoteProtocolError("peer closed connection")
+            return _Response()
+
+    async def no_delay(_seconds: float) -> None:
+        return None
+
+    client = _Client()
+    scraper._scraperapi_clients = {"scraperapi-catalog-test": client}
+    monkeypatch.setattr("src.scrapers.pharmonline_public_api.asyncio.sleep", no_delay)
+
+    assert (
+        await scraper._scraperapi_body(
+            "https://pharmonline.az/api/products?lng=az&page=1",
+            accept="application/json",
+            crawlbase_session="scraperapi-catalog-test",
+        )
+        == '{"data": []}'
+    )
+    assert client.calls == 2
+    assert scraper._origin_context_evidence() == "/api/products:1"
+
+
+@pytest.mark.asyncio
 async def test_source_json_selects_decodo_only_when_explicit(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
     scraper._public_api_transport = "decodo"
@@ -477,6 +589,92 @@ async def test_source_json_selects_decodo_only_when_explicit(monkeypatch):
             "decodo-catalog-test",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_source_json_selects_scraperapi_only_when_explicit(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._public_api_transport = "scraperapi"
+    calls: list[tuple[str, str, str | None]] = []
+
+    async def scraperapi_body(
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        calls.append((target_url, accept, crawlbase_session))
+        return '{"data": []}'
+
+    monkeypatch.setattr(scraper, "_scraperapi_body", scraperapi_body)
+    assert await scraper._source_json(
+        "https://pharmonline.az/api/products?lng=az&page=1",
+        crawlbase_session="scraperapi-catalog-test",
+    ) == {"data": []}
+    assert calls == [
+        (
+            "https://pharmonline.az/api/products?lng=az&page=1",
+            "application/json",
+            "scraperapi-catalog-test",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_source_xml_selects_scraperapi_only_when_explicit(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._public_api_transport = "scraperapi"
+    calls: list[tuple[str, str, str | None]] = []
+
+    async def scraperapi_body(
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        calls.append((target_url, accept, crawlbase_session))
+        return "<urlset />"
+
+    monkeypatch.setattr(scraper, "_scraperapi_body", scraperapi_body)
+    assert await scraper._source_xml(
+        "https://pharmonline.az/sitemap.xml",
+        crawlbase_session="scraperapi-sitemap-test",
+    ) == "<urlset />"
+    assert calls == [
+        (
+            "https://pharmonline.az/sitemap.xml",
+            "application/xml,text/xml;q=0.9,*/*;q=0.8",
+            "scraperapi-sitemap-test",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scraperapi_exit_closes_and_forgets_context_clients():
+    scraper = PharmonlinePublicAPIScraper()
+
+    class _Client:
+        close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    first_client = _Client()
+    second_client = _Client()
+    scraper._scraperapi_clients = {
+        "scraperapi-catalog-test": first_client,
+        "scraperapi-sitemap-test": second_client,
+    }
+    scraper._scraperapi_session_numbers = {
+        "scraperapi-catalog-test": 1,
+        "scraperapi-sitemap-test": 2,
+    }
+
+    await scraper.__aexit__(None, None, None)
+
+    assert first_client.close_calls == second_client.close_calls == 1
+    assert scraper._scraperapi_clients == {}
+    assert scraper._scraperapi_session_numbers == {}
 
 
 @pytest.mark.asyncio
