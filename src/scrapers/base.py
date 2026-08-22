@@ -639,12 +639,25 @@ class BaseScraper(ABC):
         """Fetch URL через api.crawlbase.com → подать HTML в page.set_content.
 
         Crawlbase JS Token включает headless Chrome рендер у них на стороне,
-        отдаёт уже post-render HTML. Lazy-loaded cards гарантированно в DOM.
+        но без параметров ожидания API может вернуть HTML-shell до завершения
+        XHR-загрузки каталога. `ajax_wait` + небольшой `page_wait` дают DOM с
+        товарами, не полагаясь на локальный Playwright для чужой сети.
         """
         import httpx
-        from urllib.parse import quote
 
-        api_url = f"https://api.crawlbase.com/?token={token}&url={quote(url, safe='')}"
+        try:
+            page_wait_ms = int(os.getenv("CRAWLBASE_PAGE_WAIT_MS", "4000"))
+        except ValueError:
+            page_wait_ms = 4000
+        # Keep an accidental env typo or an excessive wait from pinning a full
+        # recovery forever. Crawlbase documents this as milliseconds.
+        page_wait_ms = max(0, min(page_wait_ms, 15_000))
+        request_params = {
+            "token": token,
+            "url": url,
+            "page_wait": str(page_wait_ms),
+            "ajax_wait": "true",
+        }
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(self.max_retries),
             wait=wait_exponential(multiplier=2, min=2, max=60),
@@ -654,7 +667,9 @@ class BaseScraper(ABC):
             with attempt:
                 # Crawlbase JS-rendering обычно занимает 3-10с на page
                 async with httpx.AsyncClient(timeout=120.0) as client:
-                    resp = await client.get(api_url)
+                    resp = await client.get(
+                        "https://api.crawlbase.com/", params=request_params
+                    )
                 if resp.status_code == 200:
                     # Подаём HTML — Playwright парсит как обычно
                     await page.set_content(resp.text, wait_until="domcontentloaded")

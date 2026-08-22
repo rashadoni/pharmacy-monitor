@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from src.scrapers import anti_detection, base, captcha
@@ -703,6 +704,54 @@ def test_base_scraper_reads_max_retries_from_env(monkeypatch):
 
     s = DummyScraper()
     assert s.max_retries == 7
+
+
+@pytest.mark.asyncio
+async def test_crawlbase_api_waits_for_rendered_catalog(monkeypatch):
+    """The JS-token path must not capture the pre-XHR HTML shell."""
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "<html><body>rendered</body></html>"
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, *, params):
+            captured["url"] = url
+            captured["params"] = params
+            return FakeResponse()
+
+    class DummyScraper(base.BaseScraper):
+        site_name = "dummy"
+        base_url = "https://dummy.test"
+
+        async def scrape_category(self, category_slug, limit=None):
+            yield  # type: ignore
+
+    monkeypatch.setenv("CRAWLBASE_PAGE_WAIT_MS", "999999")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    page = MagicMock()
+    page.set_content = AsyncMock()
+
+    await DummyScraper()._goto_via_crawlbase_api(page, "https://target.test/list", "secret")
+
+    assert captured["url"] == "https://api.crawlbase.com/"
+    assert captured["params"] == {
+        "token": "secret",
+        "url": "https://target.test/list",
+        "page_wait": "15000",
+        "ajax_wait": "true",
+    }
+    page.set_content.assert_awaited_once_with(
+        "<html><body>rendered</body></html>", wait_until="domcontentloaded"
+    )
 
 
 # ─── Backwards-compat: USER_AGENTS still exported ───────────────────────────

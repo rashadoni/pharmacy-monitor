@@ -57,13 +57,14 @@ jobs:
           async def main() -> None:
               category = os.environ["PROBE_CATEGORY"]
               target_url = f"https://pharmonline.az/products?category={quote(category, safe='')}"
-              api_url = (
-                  "https://api.crawlbase.com/?token="
-                  f"{quote(os.environ['CRAWLBASE_JS_TOKEN'], safe='')}&url="
-                  f"{quote(target_url, safe='')}"
-              )
+              request_params = {
+                  "token": os.environ["CRAWLBASE_JS_TOKEN"],
+                  "url": target_url,
+                  "page_wait": "4000",
+                  "ajax_wait": "true",
+              }
               async with httpx.AsyncClient(timeout=120.0) as client:
-                  response = await client.get(api_url)
+                  response = await client.get("https://api.crawlbase.com/", params=request_params)
               html = response.text
               title_match = re.search(r"<title[^>]*>\s*(.*?)\s*</title>", html, re.I | re.S)
               title = re.sub(r"\s+", " ", title_match.group(1)).strip()[:120] if title_match else "<none>"
