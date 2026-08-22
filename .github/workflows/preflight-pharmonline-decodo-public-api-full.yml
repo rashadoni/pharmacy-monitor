@@ -180,6 +180,7 @@ jobs:
           cp -p -- "$work_dir/incoming/scripts/preflight_pharmonline_public_api.py" \
             "$runtime_dir/scripts/preflight_pharmonline_public_api.py"
 
+          cd "$runtime_dir"
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<PY
           from pathlib import Path
@@ -205,7 +206,6 @@ jobs:
             export "$key=$value"
           done < /etc/pharmacy-monitor/env
 
-          cd "$runtime_dir"
           PHARMONLINE_PUBLIC_API=required \
           PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
           PHARMONLINE_USE_DDP=0 \
