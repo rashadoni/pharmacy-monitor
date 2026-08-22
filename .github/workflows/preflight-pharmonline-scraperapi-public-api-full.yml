@@ -173,13 +173,13 @@ jobs:
 
           import httpx
           import src.main
-          import src.models
+          import src.scrapers.base
           from src.main import _verify_pharmonline_public_api_identities
           from src.scrapers.pharmonline_public_api import PharmonlinePublicAPIScraper
 
           runtime = Path("$runtime_dir").resolve()
           assert Path(src.main.__file__).resolve().is_relative_to(runtime)
-          assert Path(src.models.__file__).resolve().is_relative_to(runtime)
+          assert Path(src.scrapers.base.__file__).resolve().is_relative_to(runtime)
           assert callable(_verify_pharmonline_public_api_identities)
           assert PharmonlinePublicAPIScraper.__name__ == "PharmonlinePublicAPIScraper"
           print(
