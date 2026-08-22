@@ -37,11 +37,9 @@ log = structlog.get_logger()
 # next to the DDP record because persistence keys on ``(site, external_id)``.
 _METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
 _CARD_SELECTOR = ".product_box_v2, .product_box"
-_PRODUCT_LINK_SELECTOR = 'a[href*="/product/"]'
-_CARD_PRODUCT_LINK_SELECTOR = ", ".join(
-    f"{card_selector} {_PRODUCT_LINK_SELECTOR}"
-    for card_selector in _CARD_SELECTOR.split(", ")
-)
+_CARD_CONTAINER_SELECTOR = ":is(.product_box_v2, .product_box)"
+_PRODUCT_LINK_SELECTOR = 'a:is([href*="/product/"], [href^="product/"])'
+_CARD_PRODUCT_LINK_SELECTOR = f"{_CARD_CONTAINER_SELECTOR} {_PRODUCT_LINK_SELECTOR}"
 
 
 def _legacy_id_bridge_enabled() -> bool:
