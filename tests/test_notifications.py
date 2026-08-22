@@ -211,7 +211,9 @@ def test_dispatch_event_telegram_when_bound(setup, tenant_user):
 def test_dispatch_event_respects_quiet_hours(setup, tenant_user, monkeypatch):
     s = setup
     tenant_user.telegram_chat_id = "100"
-    tenant_user.quiet_hours = "00-23"  # always quiet — telegram should be skipped
+    # Equal bounds denote the all-day quiet window.  ``00-23`` stops at
+    # 23:00, so it made this test depend on the wall-clock time in CI.
+    tenant_user.quiet_hours = "00-00"
     s.commit()
 
     event = storage.AlertEvent(
