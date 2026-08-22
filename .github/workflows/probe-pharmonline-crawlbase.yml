@@ -98,13 +98,14 @@ jobs:
           async def main() -> None:
               category = os.environ["PROBE_CATEGORY"]
               target_url = f"https://pharmonline.az/products?category={quote(category, safe='')}"
-              async def fetch_rendered(url: str):
+              async def fetch_rendered(url: str, **render_options):
                   request_params = {
                       "token": os.environ["CRAWLBASE_JS_TOKEN"],
                       "url": url,
                       "page_wait": "4000",
                       "ajax_wait": "true",
                   }
+                  request_params.update(render_options)
                   async with httpx.AsyncClient(timeout=120.0) as client:
                       return await client.get("https://api.crawlbase.com/", params=request_params)
 
@@ -158,6 +159,12 @@ jobs:
               page_two_url = f"{target_url}&page=2"
               page_two_response = await fetch_rendered(page_two_url)
               page_two_html = page_two_response.text
+              scroll_response = await fetch_rendered(
+                  target_url,
+                  scroll="true",
+                  scroll_interval="20",
+              )
+              scroll_html = scroll_response.text
 
               def product_urls(document: str) -> list[str]:
                   values = re.findall(
@@ -189,6 +196,7 @@ jobs:
 
               page_one_urls = product_urls(html)
               page_two_urls = product_urls(page_two_html)
+              scroll_urls = product_urls(scroll_html)
               page_two_card_markers = len(
                   re.findall(
                       r'''\bclass=["']([^"']*\bproduct_box\b[^"']*)["']''',
@@ -205,6 +213,22 @@ jobs:
                       )
                   )
               )
+              button_hints = []
+              for attrs, body in re.findall(
+                  r"<button\\b([^>]*)>(.*?)</button>", html, re.I | re.S
+              ):
+                  text = re.sub(r"<[^>]+>", " ", body)
+                  text = re.sub(r"\\s+", " ", text).strip()
+                  class_match = re.search(r'''\\bclass=["']([^"']+)''', attrs, re.I)
+                  aria_match = re.search(r'''\\baria-label=["']([^"']+)''', attrs, re.I)
+                  if text or aria_match:
+                      button_hints.append(
+                          {
+                              "text": text[:80],
+                              "class": class_match.group(1)[:120] if class_match else None,
+                              "aria": aria_match.group(1)[:80] if aria_match else None,
+                          }
+                      )
               print(
                   "Crawlbase pagination diagnostic: "
                   f"page1_cards={card_markers}, page1_urls={len(page_one_urls)}, "
@@ -214,7 +238,11 @@ jobs:
                   f"overlap={len(set(page_one_urls) & set(page_two_urls))}, "
                   f"page1_hints={pagination_hints(html)}, "
                   f"page2_hints={pagination_hints(page_two_html)}, "
-                  f"page_links={page_links[:20]}"
+                  f"page_links={page_links[:20]}, "
+                  f"scroll_http={scroll_response.status_code}, "
+                  f"scroll_urls={len(scroll_urls)}, "
+                  f"scroll_added={len(set(scroll_urls) - set(page_one_urls))}, "
+                  f"buttons={button_hints[:20]}"
               )
 
               async with PharmonlineScraper() as scraper:
