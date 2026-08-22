@@ -84,9 +84,14 @@ jobs:
           from urllib.parse import quote
 
           import httpx
-          from sqlalchemy import text
+          from sqlalchemy import select, text
           from src import storage
-          from src.main import _bridge_pharmonline_legacy_ids
+          from src.main import (
+              _PHARMONLINE_DDP_AVAILABILITY_SOURCE,
+              _PHARMONLINE_METEOR_ID_RE,
+              _bridge_pharmonline_legacy_ids,
+              _canonical_pharmonline_product_url,
+          )
           from src.scrapers.pharmonline import PharmonlineScraper
 
 
@@ -172,6 +177,34 @@ jobs:
               with Session() as session:
                   session.execute(text("SET TRANSACTION READ ONLY"))
                   try:
+                      existing = session.scalars(
+                          select(storage.Product).where(
+                              storage.Product.site == "pharmonline",
+                              storage.Product.tenant_id == 1,
+                          )
+                      ).all()
+                      for product in result.products:
+                          canonical_url = _canonical_pharmonline_product_url(product.url)
+                          url_matches = [
+                              row
+                              for row in existing
+                              if _canonical_pharmonline_product_url(row.url) == canonical_url
+                              and _PHARMONLINE_METEOR_ID_RE.fullmatch(str(row.external_id))
+                          ]
+                          confirmed_ids = sorted(
+                              {
+                                  str(row.external_id)
+                                  for row in url_matches
+                                  if row.availability_source
+                                  == _PHARMONLINE_DDP_AVAILABILITY_SOURCE
+                              }
+                          )
+                          print(
+                              "Crawlbase bridge diagnostic: "
+                              f"url={canonical_url}, "
+                              f"meteor_url_matches={len(url_matches)}, "
+                              f"ddp_confirmed_matches={len(confirmed_ids)}"
+                          )
                       bridged = _bridge_pharmonline_legacy_ids(
                           session,
                           [result],
