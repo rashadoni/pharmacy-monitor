@@ -190,6 +190,10 @@ def test_bridge_rejects_other_tenant_and_ambiguous_url_mappings(db_session):
             "https://www.pharmonline.az/product/example?lng=ru#reviews",
             "https://pharmonline.az/product/example",
         ),
+        (
+            "https://pharmonline.az/az/product/example?lng=az",
+            "https://pharmonline.az/product/example",
+        ),
         ("https://other.example/product/example", None),
         ("https://pharmonline.az/category/example", None),
     ],

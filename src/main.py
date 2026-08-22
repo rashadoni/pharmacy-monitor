@@ -76,12 +76,17 @@ def _pharmonline_legacy_id_bridge_enabled() -> bool:
 
 
 def _canonical_pharmonline_product_url(raw_url: str | None) -> str | None:
-    """Canonical URL key shared by the legacy HTML and DDP product paths."""
+    """Canonical URL key shared by locale HTML and locale-free DDP paths."""
     if not raw_url:
         return None
     parsed = urlsplit(raw_url.strip())
     host = parsed.netloc.lower().removeprefix("www.")
     path = parsed.path.rstrip("/")
+    for locale in ("az", "en", "ru"):
+        prefix = f"/{locale}/product/"
+        if path.startswith(prefix):
+            path = path[len(locale) + 1 :]
+            break
     if host not in {"", "pharmonline.az"} or not path.startswith("/product/"):
         return None
     if path == "/product":
