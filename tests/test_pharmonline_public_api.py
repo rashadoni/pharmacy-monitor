@@ -306,6 +306,10 @@ async def test_decodo_transport_uses_isolated_logical_contexts(monkeypatch):
         # The pool can be smaller than the number of contexts; reuse still
         # receives a new client/cookie jar and anchors remain mandatory.
         assert scraper._decodo_port_for_context(sitemap) == 30001
+        first_proxy = urlsplit(scraper._decodo_proxy_url_for_context(first_chunk, 30001))
+        assert first_proxy.hostname == "az.decodo.com"
+        assert first_proxy.port == 30001
+        assert first_proxy.username == "user"
 
         first_client = scraper._decodo_client_for_context(first_chunk, 30001)
         assert scraper._decodo_client_for_context(first_chunk, 30001) is first_client
@@ -322,7 +326,8 @@ async def test_decodo_backconnect_uses_a_named_sticky_session_per_context(monkey
     monkeypatch.setenv("DECODO_USERNAME", "proxy-user")
     monkeypatch.setenv("DECODO_PASSWORD", "pass")
     monkeypatch.setenv("DECODO_SITES", "pharmonline")
-    monkeypatch.setenv("DECODO_PORTS", "30001,30002")
+    monkeypatch.setenv("DECODO_HOST", "not-used.example")
+    monkeypatch.setenv("DECODO_PORTS", "not-a-port")
 
     scraper = PharmonlinePublicAPIScraper()
     await scraper.__aenter__()
@@ -342,8 +347,26 @@ async def test_decodo_backconnect_uses_a_named_sticky_session_per_context(monkey
         assert first_username.startswith("user-proxy-user-country-az-session-")
         assert first_username.endswith("-sessionduration-30")
         assert first_username != second_username
+        first_session = first_username.removeprefix(
+            "user-proxy-user-country-az-session-"
+        ).removesuffix("-sessionduration-30")
+        assert len(first_session) == 24
+        assert all(character in "0123456789abcdef" for character in first_session)
     finally:
         await scraper.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_decodo_backconnect_rejects_unknown_flag_value(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "decodo")
+    monkeypatch.setenv("PHARMONLINE_DECODO_BACKCONNECT_STICKY", "sometimes")
+    monkeypatch.setenv("DECODO_USERNAME", "proxy-user")
+    monkeypatch.setenv("DECODO_PASSWORD", "pass")
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+
+    with pytest.raises(SiteScrapeFatalError, match="backconnect mode is invalid"):
+        await PharmonlinePublicAPIScraper().__aenter__()
 
 
 @pytest.mark.asyncio

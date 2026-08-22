@@ -83,14 +83,28 @@ def _env_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "required"}
 
 
-def _configured_decodo_ports() -> tuple[int, ...]:
-    """Read the existing Decodo sticky-port configuration without logging it."""
+def _decodo_backconnect_sticky_enabled() -> bool:
+    """Read the opt-in recovery transport flag without silently falling back."""
+    value = os.environ.get(_DECODO_BACKCONNECT_STICKY_ENV, "").strip().lower()
+    if value in {"", "0", "false", "no"}:
+        return False
+    if value in {"1", "true", "yes", "required"}:
+        return True
+    raise SiteScrapeFatalError("Decodo backconnect mode is invalid")
+
+
+def _require_decodo_pharmonline_site() -> None:
+    """Require an explicit Decodo scope before opening any proxy connection."""
     sites = {
         value.strip() for value in os.environ.get("DECODO_SITES", "").split(",") if value.strip()
     }
     if "pharmonline" not in sites:
         raise SiteScrapeFatalError("Decodo is not configured for Pharmonline")
 
+
+def _configured_decodo_ports() -> tuple[int, ...]:
+    """Read the existing Decodo sticky-port configuration without logging it."""
+    _require_decodo_pharmonline_site()
     raw_ports = os.environ.get("DECODO_PORTS", "30001-30010")
     ports: list[int] = []
     for token in raw_ports.split(","):
@@ -267,7 +281,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         else:
             username = _text(os.environ.get("DECODO_USERNAME"))
             password = os.environ.get("DECODO_PASSWORD")
-            use_backconnect_sticky = _env_enabled(_DECODO_BACKCONNECT_STICKY_ENV)
+            use_backconnect_sticky = _decodo_backconnect_sticky_enabled()
             host = (
                 _DECODO_BACKCONNECT_HOST
                 if use_backconnect_sticky
@@ -285,11 +299,16 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             self._decodo_password = password
             self._decodo_host = host
             self._decodo_backconnect_sticky = use_backconnect_sticky
-            configured_ports = _configured_decodo_ports()
-            self._decodo_ports = (
-                (_DECODO_BACKCONNECT_PORT,) if use_backconnect_sticky else configured_ports
-            )
+            if use_backconnect_sticky:
+                _require_decodo_pharmonline_site()
+                self._decodo_ports = (_DECODO_BACKCONNECT_PORT,)
+            else:
+                self._decodo_ports = _configured_decodo_ports()
             self._decodo_default_session = f"decodo-category-{secrets.token_hex(16)}"
+            log.info(
+                "pharmonline_public_api_decodo_transport_configured",
+                connection="backconnect" if use_backconnect_sticky else "country_sticky_port",
+            )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
