@@ -257,6 +257,12 @@ jobs:
               # is allowed to use this source.
               sample_rows = global_rows[:5]
               sample_ids = [str(row["_id"]) for row in sample_rows]
+              expected_urls = {
+                  product_id: _canonical_pharmonline_product_url(
+                      f"{BASE_URL}/product/{row.get('path') or ''}"
+                  )
+                  for product_id, row in zip(sample_ids, sample_rows, strict=True)
+              }
               Session = storage.make_session()
               with Session() as session:
                   session.execute(text("SET TRANSACTION READ ONLY"))
@@ -268,21 +274,18 @@ jobs:
                               storage.Product.external_id.in_(sample_ids),
                           )
                       ).all()
+                      # Rollback expires ORM objects, so evaluate every
+                      # read-only identity predicate while they are attached.
+                      trusted = {
+                          str(row.external_id)
+                          for row in existing
+                          if row.availability_source == _PHARMONLINE_DDP_AVAILABILITY_SOURCE
+                          and _canonical_pharmonline_product_url(row.url)
+                          == expected_urls.get(str(row.external_id))
+                      }
                   finally:
                       session.rollback()
 
-              expected_urls = {
-                  product_id: _canonical_pharmonline_product_url(
-                      f"{BASE_URL}/product/{row.get('path') or ''}"
-                  )
-                  for product_id, row in zip(sample_ids, sample_rows, strict=True)
-              }
-              trusted = {
-                  str(row.external_id)
-                  for row in existing
-                  if row.availability_source == _PHARMONLINE_DDP_AVAILABILITY_SOURCE
-                  and _canonical_pharmonline_product_url(row.url) == expected_urls.get(str(row.external_id))
-              }
               if trusted != set(sample_ids):
                   raise SystemExit(
                       "public API sample did not map exactly to existing DDP identities"
