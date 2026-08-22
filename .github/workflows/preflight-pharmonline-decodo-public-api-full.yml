@@ -2,8 +2,8 @@ name: Preflight full Pharmonline Decodo public API recovery (no persistence)
 
 # The Decodo transport runs only on production because its credentials remain
 # in the production EnvironmentFile. This workflow stages the exact guarded
-# source without restarting any service, executes two full read-only passes,
-# and restores the previous source after every outcome.
+# source into an isolated temporary tree without restarting or replacing a
+# production service file, then executes two full read-only passes.
 on:
   workflow_dispatch:
     inputs:
@@ -101,199 +101,98 @@ jobs:
           fi
           REMOTE
 
-      - name: Back up and upload exact guarded source off-path
+      - name: Upload source and prove it from an isolated temporary tree
         run: |
           set -euo pipefail
-          remote_backup=$(ssh -i ~/.ssh/id_ed25519 \
+          main_sha=$(sha256sum src/main.py | awk '{print $1}')
+          public_api_sha=$(sha256sum src/scrapers/pharmonline_public_api.py | awk '{print $1}')
+          preflight_script_sha=$(sha256sum scripts/preflight_pharmonline_public_api.py | awk '{print $1}')
+          remote_work_dir=$(ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
             pm@46.225.149.52 'bash -s' <<'REMOTE'
           set -euo pipefail
-          cd /opt/pharmacy-monitor
-          backup_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-decodo-preflight.XXXXXX)
-          mkdir -p "$backup_dir/original/src/scrapers" \
-            "$backup_dir/original/scripts" \
-            "$backup_dir/staged/src/scrapers" \
-            "$backup_dir/staged/scripts"
-
-          backup_one() {
-            relative_path=$1
-            marker=$2
-            target="/opt/pharmacy-monitor/$relative_path"
-            original="$backup_dir/original/$relative_path"
-            if [ -f "$target" ]; then
-              cp -p -- "$target" "$original"
-              : > "$backup_dir/$marker"
-            fi
-          }
-
-          backup_one src/main.py src_main_py.preexisting
-          backup_one src/scrapers/pharmonline_public_api.py public_api_py.preexisting
-          backup_one scripts/preflight_pharmonline_public_api.py preflight_script_py.preexisting
-          printf '%s' "$backup_dir"
+          work_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-decodo-preflight.XXXXXX)
+          mkdir -p "$work_dir/incoming/src/scrapers" "$work_dir/incoming/scripts"
+          printf '%s' "$work_dir"
           REMOTE
           )
-          case "$remote_backup" in
+          case "$remote_work_dir" in
             /opt/pharmacy-monitor/.codex-decodo-preflight.*) ;;
             *)
-              echo "unexpected remote Decodo backup path" >&2
+              echo "unexpected remote Decodo preflight path" >&2
               exit 1
               ;;
           esac
-          echo "REMOTE_BACKUP_DIR=$remote_backup" >> "$GITHUB_ENV"
 
           for file in \
             src/main.py \
             src/scrapers/pharmonline_public_api.py \
             scripts/preflight_pharmonline_public_api.py
           do
-            local_sha=$(sha256sum "$file" | awk '{print $1}')
-            remote_stage="$remote_backup/staged/$file"
+            case "$file" in
+              src/main.py) expected_sha=$main_sha ;;
+              src/scrapers/pharmonline_public_api.py) expected_sha=$public_api_sha ;;
+              scripts/preflight_pharmonline_public_api.py) expected_sha=$preflight_script_sha ;;
+            esac
+            remote_file="$remote_work_dir/incoming/$file"
             rsync -z --checksum --no-perms --no-owner --no-group \
               -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-              "$file" "pm@46.225.149.52:$remote_stage"
+              "$file" "pm@46.225.149.52:$remote_file"
             remote_sha=$(ssh -i ~/.ssh/id_ed25519 \
               -o BatchMode=yes \
               -o IdentitiesOnly=yes \
               -o ConnectTimeout=15 \
-              pm@46.225.149.52 "sha256sum '$remote_stage'" | awk '{print $1}')
-            test "$local_sha" = "$remote_sha"
+              pm@46.225.149.52 "sha256sum '$remote_file'" | awk '{print $1}')
+            test "$remote_sha" = "$expected_sha"
           done
-          echo "REMOTE_MAIN_SHA=$(sha256sum src/main.py | awk '{print $1}')" >> "$GITHUB_ENV"
-          echo "REMOTE_PUBLIC_API_SHA=$(sha256sum src/scrapers/pharmonline_public_api.py | awk '{print $1}')" >> "$GITHUB_ENV"
-          echo "REMOTE_PREFLIGHT_SCRIPT_SHA=$(sha256sum scripts/preflight_pharmonline_public_api.py | awk '{print $1}')" >> "$GITHUB_ENV"
 
-      - name: Atomically activate, prove, and restore source without persistence
-        run: |
-          set -euo pipefail
           ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
             pm@46.225.149.52 \
-            "bash -s -- '$REMOTE_BACKUP_DIR' '$REMOTE_MAIN_SHA' '$REMOTE_PUBLIC_API_SHA' '$REMOTE_PREFLIGHT_SCRIPT_SHA'" <<'REMOTE'
+            "bash -s -- '$remote_work_dir' '$main_sha' '$public_api_sha' '$preflight_script_sha'" <<'REMOTE'
           set -euo pipefail
-          backup_dir=$1
+          work_dir=$1
           main_sha=$2
           public_api_sha=$3
           preflight_script_sha=$4
-          case "$backup_dir" in
+          case "$work_dir" in
             /opt/pharmacy-monitor/.codex-decodo-preflight.*) ;;
             *)
-              echo "unexpected remote Decodo backup path" >&2
+              echo "unexpected remote Decodo preflight path" >&2
               exit 1
               ;;
           esac
 
-          restore_one() {
-            target=$1
-            original=$2
-            marker=$3
-            staged_sha=$4
-            label=$5
-            if [ -f "$backup_dir/$marker" ]; then
-              if [ -f "$target" ] && cmp -s -- "$original" "$target"; then
-                return 0
-              fi
-              if [ -f "$target" ] && \
-                [ "$(sha256sum "$target" | awk '{print $1}')" != "$staged_sha" ]; then
-                echo "refusing to overwrite divergent $label during rollback" >&2
-                return 1
-              fi
-              rollback_tmp=$(mktemp "$(dirname "$target")/.${label}.rollback.XXXXXX") || return 1
-              if ! cp -p -- "$original" "$rollback_tmp"; then
-                rm -f -- "$rollback_tmp"
-                return 1
-              fi
-              if ! cmp -s -- "$original" "$rollback_tmp"; then
-                rm -f -- "$rollback_tmp"
-                return 1
-              fi
-              if ! mv -f -- "$rollback_tmp" "$target"; then
-                rm -f -- "$rollback_tmp"
-                return 1
-              fi
-              cmp -s -- "$original" "$target"
-              return
-            fi
-            if [ ! -e "$target" ]; then
-              return 0
-            fi
-            if [ "$(sha256sum "$target" | awk '{print $1}')" != "$staged_sha" ]; then
-              echo "refusing to delete divergent $label during rollback" >&2
-              return 1
-            fi
-            rm -f -- "$target"
-            test ! -e "$target"
-          }
+          runtime_dir="$work_dir/runtime"
+          test "$(sha256sum "$work_dir/incoming/src/main.py" | awk '{print $1}')" = "$main_sha"
+          test "$(sha256sum "$work_dir/incoming/src/scrapers/pharmonline_public_api.py" | awk '{print $1}')" = "$public_api_sha"
+          test "$(sha256sum "$work_dir/incoming/scripts/preflight_pharmonline_public_api.py" | awk '{print $1}')" = "$preflight_script_sha"
+          cp -a -- /opt/pharmacy-monitor/src "$runtime_dir"
+          cp -a -- /opt/pharmacy-monitor/config "$runtime_dir/config"
+          mkdir -p "$runtime_dir/scripts"
+          cp -p -- "$work_dir/incoming/src/main.py" "$runtime_dir/src/main.py"
+          cp -p -- "$work_dir/incoming/src/scrapers/pharmonline_public_api.py" \
+            "$runtime_dir/src/scrapers/pharmonline_public_api.py"
+          cp -p -- "$work_dir/incoming/scripts/preflight_pharmonline_public_api.py" \
+            "$runtime_dir/scripts/preflight_pharmonline_public_api.py"
 
-          cleanup() {
-            original_status=$?
-            trap - EXIT HUP INT TERM
-            set +e
-            restore_status=0
-            restore_one /opt/pharmacy-monitor/src/main.py \
-              "$backup_dir/original/src/main.py" src_main_py.preexisting "$main_sha" main \
-              || restore_status=1
-            restore_one /opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py \
-              "$backup_dir/original/src/scrapers/pharmonline_public_api.py" \
-              public_api_py.preexisting "$public_api_sha" pharmonline_public_api \
-              || restore_status=1
-            restore_one /opt/pharmacy-monitor/scripts/preflight_pharmonline_public_api.py \
-              "$backup_dir/original/scripts/preflight_pharmonline_public_api.py" \
-              preflight_script_py.preexisting "$preflight_script_sha" preflight_script \
-              || restore_status=1
-            if [ "$restore_status" -eq 0 ]; then
-              : > "$backup_dir/cleanup_complete"
-            fi
-            if [ "$original_status" -ne 0 ]; then
-              exit "$original_status"
-            fi
-            exit "$restore_status"
-          }
-          trap 'exit 129' HUP
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-          trap cleanup EXIT
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python - <<PY
+          from pathlib import Path
 
-          for unit in \
-            pharmacy-monitor-scrape@pharmonline.service \
-            pharmacy-monitor-health.service
-          do
-            if systemctl is-active --quiet "$unit"; then
-              echo "refusing preflight: $unit is active" >&2
-              exit 1
-            fi
-          done
-
-          activate_one() {
-            staged=$1
-            target=$2
-            expected_sha=$3
-            test -f "$staged"
-            test "$(sha256sum "$staged" | awk '{print $1}')" = "$expected_sha"
-            test "$(stat -c '%d' "$(dirname "$staged")")" = \
-              "$(stat -c '%d' "$(dirname "$target")")"
-            mv -f -- "$staged" "$target"
-            test "$(sha256sum "$target" | awk '{print $1}')" = "$expected_sha"
-          }
-
-          activate_one "$backup_dir/staged/src/main.py" \
-            /opt/pharmacy-monitor/src/main.py "$main_sha"
-          activate_one "$backup_dir/staged/src/scrapers/pharmonline_public_api.py" \
-            /opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py "$public_api_sha"
-          activate_one "$backup_dir/staged/scripts/preflight_pharmonline_public_api.py" \
-            /opt/pharmacy-monitor/scripts/preflight_pharmonline_public_api.py "$preflight_script_sha"
-
-          cd /opt/pharmacy-monitor
-          PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
+          import src.main
           from src.main import _verify_pharmonline_public_api_identities
           from src.scrapers.pharmonline_public_api import PharmonlinePublicAPIScraper
 
+          runtime = Path("$runtime_dir").resolve()
+          assert Path(src.main.__file__).resolve().is_relative_to(runtime)
           assert callable(_verify_pharmonline_public_api_identities)
           assert PharmonlinePublicAPIScraper.__name__ == "PharmonlinePublicAPIScraper"
-          print("staged Decodo recovery source imported")
+          print("isolated Decodo recovery source imported")
           PY
 
           # EnvironmentFile values are literal systemd values, not shell code.
@@ -306,97 +205,14 @@ jobs:
             export "$key=$value"
           done < /etc/pharmacy-monitor/env
 
+          cd "$runtime_dir"
           PHARMONLINE_PUBLIC_API=required \
           PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
           PHARMONLINE_USE_DDP=0 \
           AI_FALLBACK_ENABLED=0 \
           SCRAPE_REPORT_EMAIL=0 \
           PYTHONDONTWRITEBYTECODE=1 \
-          .venv/bin/python scripts/preflight_pharmonline_public_api.py
-          REMOTE
-
-      - name: Confirm isolated source cleanup after every outcome
-        if: ${{ always() && env.REMOTE_BACKUP_DIR != '' }}
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=15 \
-            pm@46.225.149.52 \
-            "bash -s -- '$REMOTE_BACKUP_DIR' '$REMOTE_MAIN_SHA' '$REMOTE_PUBLIC_API_SHA' '$REMOTE_PREFLIGHT_SCRIPT_SHA'" <<'REMOTE'
-          set -euo pipefail
-          backup_dir=$1
-          main_sha=$2
-          public_api_sha=$3
-          preflight_script_sha=$4
-          case "$backup_dir" in
-            /opt/pharmacy-monitor/.codex-decodo-preflight.*) ;;
-            *)
-              echo "unexpected remote Decodo backup path" >&2
-              exit 1
-              ;;
-          esac
-          if [ -f "$backup_dir/cleanup_complete" ]; then
-            echo "isolated source cleanup confirmed"
-            exit 0
-          fi
-
-          restore_one() {
-            target=$1
-            original=$2
-            marker=$3
-            staged_sha=$4
-            label=$5
-            if [ -f "$backup_dir/$marker" ]; then
-              if [ -f "$target" ] && cmp -s -- "$original" "$target"; then
-                return 0
-              fi
-              if [ -f "$target" ] && \
-                [ "$(sha256sum "$target" | awk '{print $1}')" != "$staged_sha" ]; then
-                echo "refusing to overwrite divergent $label during fallback rollback" >&2
-                return 1
-              fi
-              rollback_tmp=$(mktemp "$(dirname "$target")/.${label}.rollback.XXXXXX") || return 1
-              if ! cp -p -- "$original" "$rollback_tmp"; then
-                rm -f -- "$rollback_tmp"
-                return 1
-              fi
-              if ! cmp -s -- "$original" "$rollback_tmp"; then
-                rm -f -- "$rollback_tmp"
-                return 1
-              fi
-              if ! mv -f -- "$rollback_tmp" "$target"; then
-                rm -f -- "$rollback_tmp"
-                return 1
-              fi
-              cmp -s -- "$original" "$target"
-              return
-            fi
-            if [ ! -e "$target" ]; then
-              return 0
-            fi
-            if [ "$(sha256sum "$target" | awk '{print $1}')" != "$staged_sha" ]; then
-              echo "refusing to delete divergent $label during fallback rollback" >&2
-              return 1
-            fi
-            rm -f -- "$target"
-            test ! -e "$target"
-          }
-
-          restore_status=0
-          restore_one /opt/pharmacy-monitor/src/main.py \
-            "$backup_dir/original/src/main.py" src_main_py.preexisting "$main_sha" main \
-            || restore_status=1
-          restore_one /opt/pharmacy-monitor/src/scrapers/pharmonline_public_api.py \
-            "$backup_dir/original/src/scrapers/pharmonline_public_api.py" \
-            public_api_py.preexisting "$public_api_sha" pharmonline_public_api \
-            || restore_status=1
-          restore_one /opt/pharmacy-monitor/scripts/preflight_pharmonline_public_api.py \
-            "$backup_dir/original/scripts/preflight_pharmonline_public_api.py" \
-            preflight_script_py.preexisting "$preflight_script_sha" preflight_script \
-            || restore_status=1
-          test "$restore_status" -eq 0
-          : > "$backup_dir/cleanup_complete"
-          echo "fallback isolated source cleanup completed"
+          PYTHONPATH="$runtime_dir" \
+          /opt/pharmacy-monitor/.venv/bin/python \
+            "$runtime_dir/scripts/preflight_pharmonline_public_api.py"
           REMOTE

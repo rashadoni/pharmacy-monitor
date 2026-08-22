@@ -128,6 +128,10 @@ jobs:
       - name: Back up and upload exact Decodo recovery source off-path
         run: |
           set -euo pipefail
+          main_sha=$(sha256sum src/main.py | awk '{print $1}')
+          public_api_sha=$(sha256sum src/scrapers/pharmonline_public_api.py | awk '{print $1}')
+          echo "REMOTE_MAIN_SHA=$main_sha" >> "$GITHUB_ENV"
+          echo "REMOTE_PUBLIC_API_SHA=$public_api_sha" >> "$GITHUB_ENV"
           remote_backup=$(ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -166,7 +170,10 @@ jobs:
 
           for file in src/main.py src/scrapers/pharmonline_public_api.py
           do
-            local_sha=$(sha256sum "$file" | awk '{print $1}')
+            case "$file" in
+              src/main.py) local_sha=$main_sha ;;
+              src/scrapers/pharmonline_public_api.py) local_sha=$public_api_sha ;;
+            esac
             remote_stage="$remote_backup/staged/$file"
             rsync -z --checksum --no-perms --no-owner --no-group \
               -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
@@ -178,8 +185,6 @@ jobs:
               pm@46.225.149.52 "sha256sum '$remote_stage'" | awk '{print $1}')
             test "$local_sha" = "$remote_sha"
           done
-          echo "REMOTE_MAIN_SHA=$(sha256sum src/main.py | awk '{print $1}')" >> "$GITHUB_ENV"
-          echo "REMOTE_PUBLIC_API_SHA=$(sha256sum src/scrapers/pharmonline_public_api.py | awk '{print $1}')" >> "$GITHUB_ENV"
 
       - name: Atomically activate and run verified Decodo recovery
         run: |
