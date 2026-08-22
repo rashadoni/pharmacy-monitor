@@ -54,6 +54,12 @@ _ORIGIN_CONTEXT_HEADERS = (
     "x-cache",
 )
 _MAX_CRAWLBASE_ATTEMPTS = 2
+# ScraperAPI's proxy port can return a short-lived gateway response even when
+# the same public endpoint is otherwise healthy.  Its own documentation asks
+# callers to retry unsuccessful responses; keep that retry bounded and retain
+# the same sticky session so a recovered request cannot silently mix exits.
+_MAX_SCRAPERAPI_ATTEMPTS = 4
+_SCRAPERAPI_TRANSIENT_STATUSES = frozenset({429, 499, 500, 502, 503, 504})
 # A Crawlbase browser context has proved stable for short runs but can return a
 # different paginator state after dozens of product requests.  Keep each
 # bounded page group sticky, then let the full API metadata, uniqueness and
@@ -694,12 +700,12 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         """Fetch the native public response through one sticky ScraperAPI exit."""
         context = self._scraperapi_context(crawlbase_session)
         client = self._scraperapi_client_for_context(context)
-        for attempt in range(1, _MAX_CRAWLBASE_ATTEMPTS + 1):
+        response: httpx.Response | None = None
+        for attempt in range(1, _MAX_SCRAPERAPI_ATTEMPTS + 1):
             try:
                 response = await client.get(target_url, headers={"accept": accept})
-                break
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-                if attempt == _MAX_CRAWLBASE_ATTEMPTS:
+                if attempt == _MAX_SCRAPERAPI_ATTEMPTS:
                     raise PharmonlinePublicAPIError("scraperapi_transient_request_failed") from None
                 log.warning(
                     "pharmonline_public_api_transport_retry",
@@ -709,11 +715,34 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                     error_type=type(exc).__name__,
                 )
                 await asyncio.sleep(1)
+                continue
             except httpx.HTTPError as exc:
                 proxy_reason = fatal_proxy_reason(exc)
                 if proxy_reason is not None:
                     raise SiteScrapeFatalError(proxy_reason) from None
                 raise PharmonlinePublicAPIError("scraperapi_request_failed") from None
+            if response.status_code == 200:
+                break
+            if (
+                response.status_code in _SCRAPERAPI_TRANSIENT_STATUSES
+                and attempt < _MAX_SCRAPERAPI_ATTEMPTS
+            ):
+                # Do not stringify the provider response: proxy diagnostics
+                # can contain target details and credentials must never reach
+                # the application logs.  Status and request path are enough
+                # to explain a bounded retry.
+                log.warning(
+                    "pharmonline_public_api_transport_retry",
+                    transport=_SCRAPERAPI_TRANSPORT,
+                    resource=urlsplit(target_url).path,
+                    attempt=attempt,
+                    status_code=response.status_code,
+                )
+                await asyncio.sleep(1)
+                continue
+            break
+        if response is None:
+            raise PharmonlinePublicAPIError("scraperapi_response_missing")
         if response.status_code in {402, 407}:
             raise SiteScrapeFatalError(
                 f"ScraperAPI proxy access rejected: HTTP {response.status_code}"

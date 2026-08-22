@@ -563,6 +563,43 @@ async def test_scraperapi_direct_request_retries_in_the_same_sticky_context(monk
 
 
 @pytest.mark.asyncio
+async def test_scraperapi_retries_a_transient_gateway_status_in_the_same_sticky_context(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+
+    class _Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+            self.headers = {"cache-control": "public, max-age=60"}
+            self.text = '{"data": []}'
+
+    class _Client:
+        calls = 0
+
+        async def get(self, _url: str, *, headers: dict[str, str]) -> _Response:
+            self.calls += 1
+            assert headers == {"accept": "application/json"}
+            return _Response(499 if self.calls == 1 else 200)
+
+    async def no_delay(_seconds: float) -> None:
+        return None
+
+    client = _Client()
+    scraper._scraperapi_clients = {"scraperapi-catalog-test": client}
+    monkeypatch.setattr("src.scrapers.pharmonline_public_api.asyncio.sleep", no_delay)
+
+    assert (
+        await scraper._scraperapi_body(
+            "https://pharmonline.az/api/products?lng=az&page=1",
+            accept="application/json",
+            crawlbase_session="scraperapi-catalog-test",
+        )
+        == '{"data": []}'
+    )
+    assert client.calls == 2
+    assert scraper._origin_context_evidence() == "/api/products:1"
+
+
+@pytest.mark.asyncio
 async def test_source_json_selects_decodo_only_when_explicit(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
     scraper._public_api_transport = "decodo"
