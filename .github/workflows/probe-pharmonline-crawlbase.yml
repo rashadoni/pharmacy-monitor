@@ -81,7 +81,7 @@ jobs:
           import asyncio
           import os
           import re
-          from urllib.parse import quote
+          from urllib.parse import quote, urljoin
 
           import httpx
           from sqlalchemy import select, text
@@ -186,7 +186,7 @@ jobs:
                       "pageSize",
                   ):
                       match = re.search(
-                          rf'''["']?{key}["']?\\s*[:=]\\s*["']?(\\d+)["']?''',
+                          rf'''["']?{key}["']?\s*[:=]\s*["']?(\d+)["']?''',
                           document,
                           re.I,
                       )
@@ -197,6 +197,21 @@ jobs:
               page_one_urls = product_urls(html)
               page_two_urls = product_urls(page_two_html)
               scroll_urls = product_urls(scroll_html)
+              script_sources = sorted(
+                  {
+                      urljoin(target_url, src)
+                      for src in re.findall(
+                          r'''<script[^>]+\bsrc=["']([^"']+)["']''',
+                          html,
+                          re.I,
+                      )
+                  }
+              )
+              route_script_sources = [
+                  source
+                  for source in script_sources
+                  if "/_next/static/chunks/app/" in source
+              ]
               page_two_card_markers = len(
                   re.findall(
                       r'''\bclass=["']([^"']*\bproduct_box\b[^"']*)["']''',
@@ -215,16 +230,16 @@ jobs:
               )
               button_hints = []
               for attrs, body in re.findall(
-                  r"<button\\b([^>]*)>(.*?)</button>", html, re.I | re.S
+                  r"<button\b([^>]*)>(.*?)</button>", html, re.I | re.S
               ):
-                  text = re.sub(r"<[^>]+>", " ", body)
-                  text = re.sub(r"\\s+", " ", text).strip()
-                  class_match = re.search(r'''\\bclass=["']([^"']+)''', attrs, re.I)
-                  aria_match = re.search(r'''\\baria-label=["']([^"']+)''', attrs, re.I)
-                  if text or aria_match:
+                  button_text = re.sub(r"<[^>]+>", " ", body)
+                  button_text = re.sub(r"\s+", " ", button_text).strip()
+                  class_match = re.search(r'''\bclass=["']([^"']+)''', attrs, re.I)
+                  aria_match = re.search(r'''\baria-label=["']([^"']+)''', attrs, re.I)
+                  if button_text or aria_match:
                       button_hints.append(
                           {
-                              "text": text[:80],
+                              "text": button_text[:80],
                               "class": class_match.group(1)[:120] if class_match else None,
                               "aria": aria_match.group(1)[:80] if aria_match else None,
                           }
@@ -242,7 +257,8 @@ jobs:
                   f"scroll_http={scroll_response.status_code}, "
                   f"scroll_urls={len(scroll_urls)}, "
                   f"scroll_added={len(set(scroll_urls) - set(page_one_urls))}, "
-                  f"buttons={button_hints[:20]}"
+                  f"buttons={button_hints[:20]}, "
+                  f"route_scripts={route_script_sources[:30]}"
               )
 
               async with PharmonlineScraper() as scraper:
