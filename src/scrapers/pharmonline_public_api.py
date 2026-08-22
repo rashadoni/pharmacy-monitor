@@ -254,8 +254,7 @@ def _sitemap_covers_api_catalog(api_urls: set[str], sitemap_urls: set[str]) -> b
         return False
     api_only = len(api_urls) - len(sitemap_urls)
     return api_only <= _MAX_SITEMAP_API_LAG_ITEMS and (
-        len(sitemap_urls) * 1000
-        >= len(api_urls) * _MIN_SITEMAP_API_COVERAGE_PER_THOUSAND
+        len(sitemap_urls) * 1000 >= len(api_urls) * _MIN_SITEMAP_API_COVERAGE_PER_THOUSAND
     )
 
 
@@ -1119,9 +1118,8 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             catalog = [product for product in products if product is not None]
             api_urls = {product.url for product in catalog}
             sitemap_urls = await self._fetch_sitemap_product_urls()
-            if (
-                len(catalog) != expected_total
-                or not _sitemap_covers_api_catalog(api_urls, sitemap_urls)
+            if len(catalog) != expected_total or not _sitemap_covers_api_catalog(
+                api_urls, sitemap_urls
             ):
                 api_only = api_urls - sitemap_urls
                 sitemap_only = sitemap_urls - api_urls
