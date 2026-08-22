@@ -75,8 +75,10 @@ jobs:
           test -n "$CRAWLBASE_JS_TOKEN"
           python - <<'PY'
           import asyncio
+          import html
           import json
           import os
+          import re
           from urllib.parse import urlencode
 
           import httpx
@@ -98,6 +100,11 @@ jobs:
                   "token": os.environ["CRAWLBASE_JS_TOKEN"],
                   "url": target_url,
                   "request_headers": "accept:application/json",
+                  # Ask Crawlbase for a metadata envelope.  With a JavaScript
+                  # token a JSON target may be rendered in a browser, so the
+                  # actual target body is intentionally read from ``body``
+                  # rather than assuming the outer response is the catalog.
+                  "format": "json",
               }
               async with httpx.AsyncClient(timeout=120.0) as client:
                   response = await client.get("https://api.crawlbase.com/", params=params)
@@ -106,11 +113,40 @@ jobs:
                       f"Crawlbase public API probe failed: http={response.status_code}"
                   )
               try:
-                  payload = json.loads(response.text)
+                  envelope = json.loads(response.text)
               except json.JSONDecodeError as exc:
                   raise SystemExit(
-                      "Crawlbase public API probe did not return JSON"
+                      "Crawlbase public API probe did not return a JSON envelope: "
+                      f"content_type={response.headers.get('content-type', '<missing>')}, "
+                      f"cb_status={response.headers.get('cb_status', '<missing>')}, "
+                      f"original_status={response.headers.get('original_status', '<missing>')}, "
+                      f"body_prefix={response.text[:120]!r}"
                   ) from exc
+              if not isinstance(envelope, dict):
+                  raise SystemExit("Crawlbase public API envelope is not an object")
+              body = envelope.get("body")
+              if isinstance(body, dict):
+                  payload = body
+              elif isinstance(body, str):
+                  # Chromium sometimes represents application/json as an HTML
+                  # document with the raw source in <pre>.  Accept only that
+                  # deterministic rendering form; otherwise fail closed.
+                  raw_body = body
+                  pre_match = re.search(r"<pre[^>]*>(.*?)</pre>", body, re.I | re.S)
+                  if pre_match:
+                      raw_body = html.unescape(pre_match.group(1))
+                  try:
+                      payload = json.loads(raw_body)
+                  except json.JSONDecodeError as exc:
+                      raise SystemExit(
+                          "Crawlbase public API body was not JSON: "
+                          f"cb_status={envelope.get('cb_status', '<missing>')}, "
+                          f"original_status={envelope.get('original_status', '<missing>')}, "
+                          f"target_content_type={envelope.get('content_type', '<missing>')}, "
+                          f"body_prefix={raw_body[:120]!r}"
+                      ) from exc
+              else:
+                  raise SystemExit("Crawlbase public API envelope has no usable body")
               if not isinstance(payload, dict):
                   raise SystemExit("Crawlbase public API response is not an object")
               return payload
