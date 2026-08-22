@@ -683,11 +683,14 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             )
             if len(page_rows) != expected_items:
                 raise PharmonlinePublicAPIError("products_page_size_mismatch")
-            for row, (external_id, url) in zip(
-                page_rows,
-                self._page_identity_records(page_rows),
-                strict=True,
-            ):
+            page_records = self._page_identity_records(page_rows)
+            # The explicit count check preserves the no-truncation guarantee
+            # of ``zip(..., strict=True)`` while keeping the recovery adapter
+            # compatible with the older Python runtime that still powers the
+            # production scraper host.
+            if len(page_records) != len(page_rows):
+                raise PharmonlinePublicAPIError("products_identity_coverage_mismatch")
+            for row, (external_id, url) in zip(page_rows, page_records):
                 if external_id in seen_ids:
                     raise PharmonlinePublicAPIError("products_duplicate_external_id")
                 if url in seen_urls:

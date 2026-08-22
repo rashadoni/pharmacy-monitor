@@ -123,6 +123,29 @@ async def test_public_api_buffers_then_yields_verified_full_catalog():
 
 
 @pytest.mark.asyncio
+async def test_public_api_catalog_does_not_require_strict_zip_runtime(monkeypatch):
+    """Keep the recovery adapter usable on the existing production Python."""
+    import src.scrapers.pharmonline_public_api as public_api_module
+
+    native_zip = zip
+
+    def legacy_zip(*iterables):
+        return native_zip(*iterables)
+
+    monkeypatch.setattr(public_api_module, "zip", legacy_zip, raising=False)
+    expected_urls = {f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)}
+    scraper = _FakePublicAPIScraper(_pages(), sitemap_urls=expected_urls)
+
+    products = [product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)]
+
+    assert [product.external_id for product in products] == [
+        "PRODUCT0000000001",
+        "PRODUCT0000000002",
+        "PRODUCT0000000003",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_public_api_uses_a_fresh_sticky_session_for_each_bounded_page_group(
     monkeypatch,
 ):
