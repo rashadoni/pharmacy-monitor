@@ -116,6 +116,7 @@ jobs:
           PRODUCT_SITEMAP_RE = re.compile(r"/sitemap-products-\d+\.xml$", re.I)
           DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
           MIN_TRUSTED_COVERAGE = 0.98
+          MAX_CRAWLBASE_ATTEMPTS = 2
           # Crawlbase accepts up to 32 characters. One value must cover every
           # API page and sitemap request in this proof, otherwise catalog
           # metadata can be assembled from unrelated browser/cookie contexts.
@@ -127,6 +128,7 @@ jobs:
               "x-cache",
           )
           ORIGIN_CONTEXTS: dict[str, set[str]] = {}
+          TRANSIENT_TRANSPORT_RETRIES = 0
 
 
           @dataclass(frozen=True)
@@ -153,7 +155,8 @@ jobs:
               raise SystemExit(
                   "Pharmonline public API full preflight failed: "
                   f"{message}; crawlbase_session=sticky, "
-                  f"origin_contexts={origin_context_evidence()}"
+                  f"origin_contexts={origin_context_evidence()}, "
+                  f"transport_retries={TRANSIENT_TRANSPORT_RETRIES}"
               )
 
 
@@ -311,10 +314,24 @@ jobs:
                   "get_headers": "true",
                   "format": "json",
               }
-              try:
-                  response = await client.get("https://api.crawlbase.com/", params=params)
-              except httpx.HTTPError as exc:
-                  fail(f"Crawlbase request failed for {target_url}: {type(exc).__name__}")
+              global TRANSIENT_TRANSPORT_RETRIES
+              for attempt in range(1, MAX_CRAWLBASE_ATTEMPTS + 1):
+                  try:
+                      response = await client.get("https://api.crawlbase.com/", params=params)
+                      break
+                  except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                      if attempt == MAX_CRAWLBASE_ATTEMPTS:
+                          fail(
+                              "Crawlbase transient request failed after "
+                              f"{attempt} attempts for {target_url}: {type(exc).__name__}"
+                          )
+                      TRANSIENT_TRANSPORT_RETRIES += 1
+                      # Retry exactly once with the same sticky session. The
+                      # full two-pass and sitemap proofs below still reject
+                      # a partial or mixed catalog.
+                      await asyncio.sleep(1)
+                  except httpx.HTTPError as exc:
+                      fail(f"Crawlbase request failed for {target_url}: {type(exc).__name__}")
               if response.status_code != 200:
                   fail(f"Crawlbase HTTP {response.status_code} for {target_url}")
               try:
@@ -710,6 +727,7 @@ jobs:
                   f"trusted_ddp_history_products={trusted_history_products}, "
                   f"trusted_coverage={trusted_coverage:.4f}, "
                   f"crawlbase_session=sticky, origin_contexts={origin_context_evidence()}, "
+                  f"transport_retries={TRANSIENT_TRANSPORT_RETRIES}, "
                   "database_transaction=read_only, persistence=none"
               )
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 
 from src.scrapers.pharmonline_public_api import (
@@ -254,6 +255,45 @@ async def test_crawlbase_requests_keep_one_sticky_session_and_origin_header_evid
     assert client.params["cookies_session"] == "a" * 32
     assert client.params["get_headers"] == "true"
     assert scraper._origin_context_evidence() == "/api/products:1"
+
+
+@pytest.mark.asyncio
+async def test_crawlbase_retries_one_transient_timeout_in_the_same_sticky_session(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._crawlbase_token = "test-token"
+    scraper._crawlbase_session = "b" * 32
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {"cb_status": "200", "original_status": "200", "body": {"data": []}}
+
+    class _Client:
+        calls = 0
+        sessions: list[str] = []
+
+        async def get(self, _url: str, *, params: dict) -> _Response:
+            self.calls += 1
+            self.sessions.append(params["cookies_session"])
+            if self.calls == 1:
+                raise httpx.ReadTimeout("transient")
+            return _Response()
+
+    async def no_delay(_seconds: float) -> None:
+        return None
+
+    client = _Client()
+    scraper._client = client
+    monkeypatch.setattr("src.scrapers.pharmonline_public_api.asyncio.sleep", no_delay)
+
+    assert await scraper._crawlbase_body(
+        "https://pharmonline.az/api/products?lng=az&page=52",
+        accept="application/json",
+    ) == {"data": []}
+    assert client.calls == 2
+    assert client.sessions == ["b" * 32, "b" * 32]
 
 
 @pytest.mark.asyncio

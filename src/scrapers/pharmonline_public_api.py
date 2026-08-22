@@ -15,6 +15,7 @@ to the normal persistence pipeline.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import json
@@ -47,6 +48,7 @@ _ORIGIN_CONTEXT_HEADERS = (
     "cf-cache-status",
     "x-cache",
 )
+_MAX_CRAWLBASE_ATTEMPTS = 2
 
 
 class PharmonlinePublicAPIError(RuntimeError):
@@ -245,10 +247,26 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             "get_headers": "true",
             "format": "json",
         }
-        try:
-            response = await client.get("https://api.crawlbase.com/", params=params)
-        except httpx.HTTPError as exc:
-            raise PharmonlinePublicAPIError("crawlbase_request_failed") from exc
+        for attempt in range(1, _MAX_CRAWLBASE_ATTEMPTS + 1):
+            try:
+                response = await client.get("https://api.crawlbase.com/", params=params)
+                break
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt == _MAX_CRAWLBASE_ATTEMPTS:
+                    raise PharmonlinePublicAPIError("crawlbase_transient_request_failed") from exc
+                # A single timeout is transport noise, not permission to
+                # accept a partial catalog. Retry the exact same request once
+                # in the same sticky session; all catalog invariants are still
+                # checked before one product can be persisted.
+                log.warning(
+                    "pharmonline_public_api_transport_retry",
+                    resource=urlsplit(target_url).path,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                )
+                await asyncio.sleep(1)
+            except httpx.HTTPError as exc:
+                raise PharmonlinePublicAPIError("crawlbase_request_failed") from exc
         if response.status_code in {402, 407}:
             raise SiteScrapeFatalError(
                 f"Crawlbase proxy access rejected: HTTP {response.status_code}"
