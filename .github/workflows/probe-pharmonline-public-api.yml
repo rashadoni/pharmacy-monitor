@@ -95,7 +95,7 @@ jobs:
           BASE_URL = "https://pharmonline.az"
 
 
-          async def crawlbase_json(target_url: str) -> dict:
+          async def crawlbase_json(target_url: str) -> dict | list:
               params = {
                   "token": os.environ["CRAWLBASE_JS_TOKEN"],
                   "url": target_url,
@@ -147,8 +147,11 @@ jobs:
                       ) from exc
               else:
                   raise SystemExit("Crawlbase public API envelope has no usable body")
-              if not isinstance(payload, dict):
-                  raise SystemExit("Crawlbase public API response is not an object")
+              if not isinstance(payload, (dict, list)):
+                  raise SystemExit(
+                      "Crawlbase public API response has an unsupported JSON shape: "
+                      f"{type(payload).__name__}"
+                  )
               return payload
 
 
@@ -171,7 +174,11 @@ jobs:
           async def main() -> None:
               category_path = os.environ["PROBE_CATEGORY"]
               categories = await crawlbase_json(f"{BASE_URL}/api/categories?type=category")
-              category_rows = categories.get("data")
+              # The public categories endpoint currently returns a top-level
+              # list, whereas product pages return an object with data/total/
+              # pages.  Supporting both category envelopes here is deliberate;
+              # product pages remain strict below.
+              category_rows = categories.get("data") if isinstance(categories, dict) else categories
               if not isinstance(category_rows, list):
                   raise SystemExit(
                       f"public categories response has invalid data field: keys={sorted(categories)[:20]}"
