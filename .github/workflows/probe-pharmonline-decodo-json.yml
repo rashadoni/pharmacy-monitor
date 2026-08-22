@@ -65,9 +65,18 @@ jobs:
 
           test -r /etc/pharmacy-monitor/env
           cd /opt/pharmacy-monitor
-          set -a
-          . /etc/pharmacy-monitor/env
-          set +a
+          # A systemd EnvironmentFile is not a shell script: credentials may
+          # legally contain "$".  Preserve values literally and never print
+          # them, rather than sourcing the file and accidentally expanding a
+          # password fragment such as "$2" under `set -u`.
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|\#*) continue ;;
+            esac
+            key=${line%%=*}
+            value=${line#*=}
+            export "$key=$value"
+          done < /etc/pharmacy-monitor/env
 
           PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
           import asyncio
