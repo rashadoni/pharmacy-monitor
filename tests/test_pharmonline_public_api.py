@@ -315,6 +315,38 @@ async def test_decodo_transport_uses_isolated_logical_contexts(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_decodo_backconnect_uses_a_named_sticky_session_per_context(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "decodo")
+    monkeypatch.setenv("PHARMONLINE_DECODO_BACKCONNECT_STICKY", "1")
+    monkeypatch.setenv("DECODO_USERNAME", "proxy-user")
+    monkeypatch.setenv("DECODO_PASSWORD", "pass")
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+    monkeypatch.setenv("DECODO_PORTS", "30001,30002")
+
+    scraper = PharmonlinePublicAPIScraper()
+    await scraper.__aenter__()
+    try:
+        first_context = scraper._catalog_session_for_page(1)
+        second_context = scraper._catalog_session_for_page(11)
+        assert scraper._decodo_port_for_context(first_context) == 7000
+        assert scraper._decodo_port_for_context(second_context) == 7000
+
+        first_proxy = urlsplit(scraper._decodo_proxy_url_for_context(first_context, 7000))
+        second_proxy = urlsplit(scraper._decodo_proxy_url_for_context(second_context, 7000))
+        first_username = first_proxy.username or ""
+        second_username = second_proxy.username or ""
+
+        assert first_proxy.hostname == second_proxy.hostname == "gate.decodo.com"
+        assert first_proxy.port == second_proxy.port == 7000
+        assert first_username.startswith("user-proxy-user-country-az-session-")
+        assert first_username.endswith("-sessionduration-30")
+        assert first_username != second_username
+    finally:
+        await scraper.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_decodo_direct_request_keeps_one_context_on_retry(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
     scraper._decodo_ports = (30001,)

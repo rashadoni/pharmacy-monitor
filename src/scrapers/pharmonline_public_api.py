@@ -66,8 +66,13 @@ _CATALOG_SESSION_PAGE_SPAN = 20
 _DECODO_CATALOG_SESSION_PAGE_SPAN = 10
 _MAX_DECODO_STICKY_PORTS = 64
 _PUBLIC_API_TRANSPORT_ENV = "PHARMONLINE_PUBLIC_API_TRANSPORT"
+_DECODO_BACKCONNECT_STICKY_ENV = "PHARMONLINE_DECODO_BACKCONNECT_STICKY"
 _CRAWLBASE_TRANSPORT = "crawlbase"
 _DECODO_TRANSPORT = "decodo"
+_DECODO_BACKCONNECT_HOST = "gate.decodo.com"
+_DECODO_BACKCONNECT_PORT = 7000
+_DECODO_BACKCONNECT_COUNTRY = "az"
+_DECODO_BACKCONNECT_SESSION_MINUTES = 30
 
 
 class PharmonlinePublicAPIError(RuntimeError):
@@ -262,7 +267,12 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         else:
             username = _text(os.environ.get("DECODO_USERNAME"))
             password = os.environ.get("DECODO_PASSWORD")
-            host = _text(os.environ.get("DECODO_HOST", "az.decodo.com"))
+            use_backconnect_sticky = _env_enabled(_DECODO_BACKCONNECT_STICKY_ENV)
+            host = (
+                _DECODO_BACKCONNECT_HOST
+                if use_backconnect_sticky
+                else _text(os.environ.get("DECODO_HOST", "az.decodo.com"))
+            )
             if (
                 username is None
                 or not password
@@ -274,7 +284,11 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             self._decodo_username = username
             self._decodo_password = password
             self._decodo_host = host
-            self._decodo_ports = _configured_decodo_ports()
+            self._decodo_backconnect_sticky = use_backconnect_sticky
+            configured_ports = _configured_decodo_ports()
+            self._decodo_ports = (
+                (_DECODO_BACKCONNECT_PORT,) if use_backconnect_sticky else configured_ports
+            )
             self._decodo_default_session = f"decodo-category-{secrets.token_hex(16)}"
         return self
 
@@ -470,17 +484,33 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             self._decodo_session_ports = sessions
         return port
 
+    def _decodo_proxy_url_for_context(self, context: str, port: int) -> str:
+        """Build one non-logged Decodo URL for an explicit logical context.
+
+        The backconnect option follows Decodo's current sticky-session protocol:
+        a session token in the username, rather than relying on a country-port
+        mapping that may rotate an exit between otherwise related requests.
+        """
+        username = getattr(self, "_decodo_username", "")
+        password = getattr(self, "_decodo_password", "")
+        host = getattr(self, "_decodo_host", "")
+        if not username or not password or not host:
+            raise SiteScrapeFatalError("Decodo credentials are not configured")
+        if getattr(self, "_decodo_backconnect_sticky", False):
+            base_username = username if username.startswith("user-") else f"user-{username}"
+            session_id = hashlib.sha256(context.encode("utf-8")).hexdigest()[:24]
+            username = (
+                f"{base_username}-country-{_DECODO_BACKCONNECT_COUNTRY}-"
+                f"session-{session_id}-sessionduration-{_DECODO_BACKCONNECT_SESSION_MINUTES}"
+            )
+        return f"http://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+
     def _decodo_client_for_context(self, context: str, port: int) -> httpx.AsyncClient:
         clients: dict[str, httpx.AsyncClient] = getattr(self, "_decodo_clients", {})
         client = clients.get(context)
         if client is None:
-            username = quote(getattr(self, "_decodo_username", ""), safe="")
-            password = quote(getattr(self, "_decodo_password", ""), safe="")
-            host = getattr(self, "_decodo_host", "")
-            if not username or not password or not host:
-                raise SiteScrapeFatalError("Decodo credentials are not configured")
             client = httpx.AsyncClient(
-                proxy=f"http://{username}:{password}@{host}:{port}",
+                proxy=self._decodo_proxy_url_for_context(context, port),
                 timeout=120.0,
                 trust_env=False,
             )
