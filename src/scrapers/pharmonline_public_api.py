@@ -7,7 +7,10 @@ product it buffers the entire catalog and checks a set of invariants:
 
 * every advertised API page is present and has the expected size;
 * IDs and canonical product URLs are unique and total exactly matches;
-* the product URL set matches the public product sitemap.
+* the public product sitemap is an exact match, or a near-complete subset
+  with no URL outside the API catalog; and
+* every accepted API item is later matched to its trusted DDP ID→URL lineage
+  before persistence.
 
 Consequently a late pagination or sitemap failure cannot leak a partial result
 to the normal persistence pipeline.
@@ -86,6 +89,15 @@ _DECODO_BACKCONNECT_COUNTRY = "az"
 _DECODO_BACKCONNECT_SESSION_MINUTES = 30
 _SCRAPERAPI_PROXY_HOST = "proxy-server.scraperapi.com"
 _SCRAPERAPI_PROXY_PORT = 8001
+# The public sitemap can lag the first-party product API by a few recently
+# published URLs.  It is still useful as an independent evidence source, but
+# only as a near-complete subset: it must not introduce any URL absent from
+# the API, must cover at least 99.9% of the verified API catalog, and may
+# lag no more than the eight consistently observed API-only URLs.
+# The guarded recovery's exact trusted-DDP identity proof remains mandatory
+# for every API item before persistence.
+_MIN_SITEMAP_API_COVERAGE_PER_THOUSAND = 999
+_MAX_SITEMAP_API_LAG_ITEMS = 8
 
 
 class PharmonlinePublicAPIError(RuntimeError):
@@ -230,6 +242,22 @@ def _same_origin_sitemap_url(value: Any) -> str | None:
     if parsed.scheme != "https" or host != "pharmonline.az" or parsed.query or parsed.fragment:
         return None
     return f"{_BASE_URL}{parsed.path}"
+
+
+def _sitemap_covers_api_catalog(api_urls: set[str], sitemap_urls: set[str]) -> bool:
+    """Whether sitemap is a near-complete, non-expansive API witness.
+
+    The sitemap is allowed to lag a small number of new API items but may
+    never contain a URL that the verified API does not currently publish.
+    """
+    if not api_urls or not sitemap_urls.issubset(api_urls):
+        return False
+    api_only = len(api_urls) - len(sitemap_urls)
+    return (
+        api_only <= _MAX_SITEMAP_API_LAG_ITEMS
+        and len(sitemap_urls) * 1000
+        >= len(api_urls) * _MIN_SITEMAP_API_COVERAGE_PER_THOUSAND
+    )
 
 
 def _iter_xml_locs(document: str) -> Iterable[str]:
@@ -1092,7 +1120,10 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             catalog = [product for product in products if product is not None]
             api_urls = {product.url for product in catalog}
             sitemap_urls = await self._fetch_sitemap_product_urls()
-            if len(catalog) != expected_total or api_urls != sitemap_urls:
+            if (
+                len(catalog) != expected_total
+                or not _sitemap_covers_api_catalog(api_urls, sitemap_urls)
+            ):
                 api_only = api_urls - sitemap_urls
                 sitemap_only = sitemap_urls - api_urls
                 # Counts and stable fingerprints make a rejected no-write
@@ -1113,6 +1144,15 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                     ).hexdigest()[:16],
                 )
                 raise PharmonlinePublicAPIError("products_sitemap_set_mismatch")
+            if api_urls != sitemap_urls:
+                log.info(
+                    "pharmonline_public_api_sitemap_lag_accepted",
+                    expected_total=expected_total,
+                    api_urls=len(api_urls),
+                    sitemap_urls=len(sitemap_urls),
+                    api_only=len(api_urls - sitemap_urls),
+                    sitemap_coverage=round(len(sitemap_urls) / len(api_urls), 6),
+                )
         except SiteScrapeFatalError:
             raise
         except PharmonlinePublicAPIError as exc:

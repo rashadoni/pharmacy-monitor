@@ -17,6 +17,7 @@ from src.scrapers.pharmonline_public_api import (
     _configured_decodo_ports,
     _json_from_rendered_body,
     _same_origin_sitemap_url,
+    _sitemap_covers_api_catalog,
 )
 from src.scrapers.base import SiteScrapeFatalError
 
@@ -248,6 +249,21 @@ async def test_public_api_rejects_sitemap_mismatch_before_any_yield():
     status = scraper._route_statuses[PUBLIC_CATALOG_ROUTE]
     assert status.complete is False
     assert status.abort_reason == "products_sitemap_set_mismatch"
+
+
+def test_sitemap_can_lag_small_subset_of_verified_api_catalog():
+    api_urls = {f"https://pharmonline.az/product/product-{index}" for index in range(10_000)}
+    eight_missing = {
+        f"https://pharmonline.az/product/product-{index}" for index in range(9_992, 10_000)
+    }
+    nine_missing = eight_missing | {"https://pharmonline.az/product/product-9991"}
+
+    assert _sitemap_covers_api_catalog(api_urls, api_urls - eight_missing)
+    assert not _sitemap_covers_api_catalog(api_urls, api_urls - nine_missing)
+    assert not _sitemap_covers_api_catalog(
+        api_urls,
+        api_urls | {"https://pharmonline.az/product/not-in-api"},
+    )
 
 
 @pytest.mark.asyncio
