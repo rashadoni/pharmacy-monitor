@@ -14,9 +14,11 @@ from src.scrapers.pharmonline_public_api import (
     PharmonlinePublicAPIError,
     PharmonlinePublicAPIScraper,
     _canonical_product_url,
+    _configured_decodo_ports,
     _json_from_rendered_body,
     _same_origin_sitemap_url,
 )
+from src.scrapers.base import SiteScrapeFatalError
 
 
 def _raw_product(index: int, *, count: int | None = 4) -> dict:
@@ -239,6 +241,146 @@ async def test_public_api_keeps_identity_proof_when_category_map_is_temporarily_
     assert len(products) == 3
     assert all(product.category is None for product in products)
     assert scraper._route_statuses[PUBLIC_CATALOG_ROUTE].complete is True
+
+
+def test_decodo_ports_require_pharmonline_and_cap_large_ranges(monkeypatch):
+    monkeypatch.setenv("DECODO_SITES", "pharmonline,aptekonline")
+    monkeypatch.setenv("DECODO_PORTS", "30001-30003,30002")
+    assert _configured_decodo_ports() == (30001, 30002, 30003)
+
+    monkeypatch.setenv("DECODO_SITES", "aptekonline")
+    with pytest.raises(SiteScrapeFatalError, match="not configured"):
+        _configured_decodo_ports()
+
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+    monkeypatch.setenv("DECODO_PORTS", "1-65")
+    with pytest.raises(SiteScrapeFatalError, match="too many"):
+        _configured_decodo_ports()
+
+
+@pytest.mark.asyncio
+async def test_decodo_transport_uses_isolated_logical_contexts(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "decodo")
+    monkeypatch.setenv("DECODO_USERNAME", "user")
+    monkeypatch.setenv("DECODO_PASSWORD", "pass")
+    monkeypatch.setenv("DECODO_SITES", "pharmonline")
+    monkeypatch.setenv("DECODO_PORTS", "30001,30002")
+
+    scraper = PharmonlinePublicAPIScraper()
+    await scraper.__aenter__()
+    try:
+        first_chunk = scraper._catalog_session_for_page(1)
+        second_chunk = scraper._catalog_session_for_page(11)
+        sitemap = scraper._sitemap_session()
+
+        assert first_chunk.startswith("decodo-catalog-0-")
+        assert second_chunk.startswith("decodo-catalog-1-")
+        assert sitemap.startswith("decodo-sitemap-")
+        assert scraper._decodo_port_for_context(first_chunk) == 30001
+        assert scraper._decodo_port_for_context(first_chunk) == 30001
+        assert scraper._decodo_port_for_context(second_chunk) == 30002
+        # The pool can be smaller than the number of contexts; reuse still
+        # receives a new client/cookie jar and anchors remain mandatory.
+        assert scraper._decodo_port_for_context(sitemap) == 30001
+
+        first_client = scraper._decodo_client_for_context(first_chunk, 30001)
+        assert scraper._decodo_client_for_context(first_chunk, 30001) is first_client
+        assert scraper._decodo_client_for_context(sitemap, 30001) is not first_client
+    finally:
+        await scraper.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_decodo_direct_request_keeps_one_context_on_retry(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._decodo_ports = (30001,)
+    scraper._decodo_session_ports = {"decodo-catalog-test": 30001}
+
+    class _Response:
+        status_code = 200
+        headers = {"cache-control": "public, max-age=60"}
+        text = '{"data": []}'
+
+    class _Client:
+        calls = 0
+
+        async def get(self, _url: str, *, headers: dict[str, str]) -> _Response:
+            self.calls += 1
+            assert headers == {"accept": "application/json"}
+            if self.calls == 1:
+                raise httpx.ReadTimeout("transient")
+            return _Response()
+
+    async def no_delay(_seconds: float) -> None:
+        return None
+
+    client = _Client()
+    scraper._decodo_clients = {"decodo-catalog-test": client}
+    monkeypatch.setattr("src.scrapers.pharmonline_public_api.asyncio.sleep", no_delay)
+
+    assert await scraper._decodo_body(
+        "https://pharmonline.az/api/products?lng=az&page=1",
+        accept="application/json",
+        crawlbase_session="decodo-catalog-test",
+    ) == '{"data": []}'
+    assert client.calls == 2
+    assert scraper._decodo_session_ports == {"decodo-catalog-test": 30001}
+    assert scraper._origin_context_evidence() == "/api/products:1"
+
+
+@pytest.mark.asyncio
+async def test_source_json_selects_decodo_only_when_explicit(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._public_api_transport = "decodo"
+    calls: list[tuple[str, str, str | None]] = []
+
+    async def decodo_body(
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        calls.append((target_url, accept, crawlbase_session))
+        return '{"data": []}'
+
+    monkeypatch.setattr(scraper, "_decodo_body", decodo_body)
+    assert await scraper._source_json(
+        "https://pharmonline.az/api/products?lng=az&page=1",
+        crawlbase_session="decodo-catalog-test",
+    ) == {"data": []}
+    assert calls == [
+        (
+            "https://pharmonline.az/api/products?lng=az&page=1",
+            "application/json",
+            "decodo-catalog-test",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_decodo_direct_request_rejects_exhausted_proxy_without_url_leakage():
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._decodo_ports = (30001,)
+    scraper._decodo_session_ports = {"decodo-catalog-test": 30001}
+
+    class _Response:
+        status_code = 407
+        headers: dict[str, str] = {}
+        text = "proxy rejected"
+
+    class _Client:
+        async def get(self, _url: str, *, headers: dict[str, str]) -> _Response:
+            return _Response()
+
+    scraper._decodo_clients = {"decodo-catalog-test": _Client()}
+    with pytest.raises(SiteScrapeFatalError, match="HTTP 407") as exc_info:
+        await scraper._decodo_body(
+            "https://pharmonline.az/api/products?lng=az&page=1",
+            accept="application/json",
+            crawlbase_session="decodo-catalog-test",
+        )
+    assert "@" not in str(exc_info.value)
 
 
 def test_product_mapper_marks_explicit_zero_stock_and_current_price():

@@ -2,8 +2,8 @@
 
 This source is deliberately restricted to the manual recovery flow.  Unlike
 the legacy rendered-HTML path, it receives the site's native 17-character
-product IDs.  Before yielding one product it buffers the entire catalog and
-checks a set of invariants:
+product IDs through an explicitly selected transport. Before yielding one
+product it buffers the entire catalog and checks a set of invariants:
 
 * every advertised API page is present and has the expected size;
 * IDs and canonical product URLs are unique and total exactly matches;
@@ -32,7 +32,12 @@ import httpx
 import structlog
 
 from src.product_policy import offer_from_quantity
-from src.scrapers.base import BaseScraper, ScrapedProduct, SiteScrapeFatalError
+from src.scrapers.base import (
+    BaseScraper,
+    ScrapedProduct,
+    SiteScrapeFatalError,
+    fatal_proxy_reason,
+)
 
 log = structlog.get_logger()
 
@@ -54,6 +59,15 @@ _MAX_CRAWLBASE_ATTEMPTS = 2
 # bounded page group sticky, then let the full API metadata, uniqueness and
 # sitemap proofs reject any mixed or incomplete catalog before persistence.
 _CATALOG_SESSION_PAGE_SPAN = 20
+# Direct Decodo HTTP maps each 10-page group to a configured sticky proxy port.
+# Each logical group still owns a fresh HTTP client/cookie jar, even when a
+# small configured port pool eventually reuses the same exit. The anchors and
+# full source+sitemap proof remain mandatory before yielding one product.
+_DECODO_CATALOG_SESSION_PAGE_SPAN = 10
+_MAX_DECODO_STICKY_PORTS = 64
+_PUBLIC_API_TRANSPORT_ENV = "PHARMONLINE_PUBLIC_API_TRANSPORT"
+_CRAWLBASE_TRANSPORT = "crawlbase"
+_DECODO_TRANSPORT = "decodo"
 
 
 class PharmonlinePublicAPIError(RuntimeError):
@@ -62,6 +76,50 @@ class PharmonlinePublicAPIError(RuntimeError):
 
 def _env_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "required"}
+
+
+def _configured_decodo_ports() -> tuple[int, ...]:
+    """Read the existing Decodo sticky-port configuration without logging it."""
+    sites = {
+        value.strip()
+        for value in os.environ.get("DECODO_SITES", "").split(",")
+        if value.strip()
+    }
+    if "pharmonline" not in sites:
+        raise SiteScrapeFatalError("Decodo is not configured for Pharmonline")
+
+    raw_ports = os.environ.get("DECODO_PORTS", "30001-30010")
+    ports: list[int] = []
+    for token in raw_ports.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_raw, end_raw = token.split("-", 1)
+            try:
+                start, end = int(start_raw), int(end_raw)
+            except ValueError as exc:
+                raise SiteScrapeFatalError("Decodo port range is invalid") from exc
+            if start < 1 or end < start or end > 65535:
+                raise SiteScrapeFatalError("Decodo port range is invalid")
+            if len(ports) + end - start + 1 > _MAX_DECODO_STICKY_PORTS:
+                raise SiteScrapeFatalError("Decodo has too many configured sticky ports")
+            ports.extend(range(start, end + 1))
+            continue
+        try:
+            port = int(token)
+        except ValueError as exc:
+            raise SiteScrapeFatalError("Decodo port is invalid") from exc
+        if port < 1 or port > 65535:
+            raise SiteScrapeFatalError("Decodo port is invalid")
+        ports.append(port)
+        if len(ports) > _MAX_DECODO_STICKY_PORTS:
+            raise SiteScrapeFatalError("Decodo has too many configured sticky ports")
+
+    unique_ports = tuple(dict.fromkeys(ports))
+    if not unique_ports:
+        raise SiteScrapeFatalError("Decodo has no configured sticky ports")
+    return unique_ports
 
 
 def _as_number(value: Any) -> float | None:
@@ -171,7 +229,7 @@ def _json_from_rendered_body(body: Any) -> dict | list:
 
 
 class PharmonlinePublicAPIScraper(BaseScraper):
-    """Read the public catalog via Crawlbase and prove it before yielding."""
+    """Read the public catalog through one explicit transport and prove it first."""
 
     site_name = "pharmonline"
     base_url = _BASE_URL
@@ -182,18 +240,44 @@ class PharmonlinePublicAPIScraper(BaseScraper):
     async def __aenter__(self) -> "PharmonlinePublicAPIScraper":  # type: ignore[override]
         if not _env_enabled("PHARMONLINE_PUBLIC_API"):
             raise SiteScrapeFatalError("Pharmonline public API mode is not explicitly enabled")
-        token = _text(os.environ.get("CRAWLBASE_JS_TOKEN"))
-        if token is None:
-            raise SiteScrapeFatalError("Crawlbase JS token is not configured")
-        self._crawlbase_token = token
-        # Non-product requests retain one short-lived context. Product pages
-        # use a bounded sticky context per page group in ``_fetch_catalog``:
-        # a single long Crawlbase context has empirically degraded after many
-        # requests, while fresh short contexts return stable public metadata.
+        transport = os.environ.get(_PUBLIC_API_TRANSPORT_ENV, _CRAWLBASE_TRANSPORT).strip().lower()
+        if transport not in {_CRAWLBASE_TRANSPORT, _DECODO_TRANSPORT}:
+            raise SiteScrapeFatalError("Pharmonline public API transport is not supported")
+
+        self._public_api_transport = transport
         self._crawlbase_session = secrets.token_hex(16)
         self._catalog_sessions: dict[int, str] = {}
         self._origin_contexts: dict[str, set[str]] = {}
-        self._client = httpx.AsyncClient(timeout=120.0)
+        self._client: httpx.AsyncClient | None = None
+        self._decodo_clients: dict[str, httpx.AsyncClient] = {}
+        self._decodo_session_ports: dict[str, int] = {}
+
+        if transport == _CRAWLBASE_TRANSPORT:
+            token = _text(os.environ.get("CRAWLBASE_JS_TOKEN"))
+            if token is None:
+                raise SiteScrapeFatalError("Crawlbase JS token is not configured")
+            self._crawlbase_token = token
+            # Non-product requests retain one short-lived context. Product
+            # pages use a bounded sticky context per page group in
+            # ``_fetch_catalog``.
+            self._client = httpx.AsyncClient(timeout=120.0)
+        else:
+            username = _text(os.environ.get("DECODO_USERNAME"))
+            password = os.environ.get("DECODO_PASSWORD")
+            host = _text(os.environ.get("DECODO_HOST", "az.decodo.com"))
+            if (
+                username is None
+                or not password
+                or host is None
+                or any(character in host for character in ":/@?#")
+                or any(character.isspace() for character in host)
+            ):
+                raise SiteScrapeFatalError("Decodo credentials are not configured")
+            self._decodo_username = username
+            self._decodo_password = password
+            self._decodo_host = host
+            self._decodo_ports = _configured_decodo_ports()
+            self._decodo_default_session = f"decodo-category-{secrets.token_hex(16)}"
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
@@ -201,6 +285,19 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if client is not None:
             await client.aclose()
             self._client = None
+        for decodo_client in getattr(self, "_decodo_clients", {}).values():
+            await decodo_client.aclose()
+        self._decodo_clients = {}
+        self._decodo_session_ports = {}
+
+    def _transport_name(self) -> str:
+        """Use Crawlbase by default for backwards-compatible unit fixtures."""
+        return getattr(self, "_public_api_transport", _CRAWLBASE_TRANSPORT)
+
+    def _catalog_session_page_span(self) -> int:
+        if self._transport_name() == _DECODO_TRANSPORT:
+            return _DECODO_CATALOG_SESSION_PAGE_SPAN
+        return _CATALOG_SESSION_PAGE_SPAN
 
     def _product_api_url(self, page: int) -> str:
         query = urlencode(
@@ -217,6 +314,12 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         """Record a non-sensitive fingerprint of selected origin cache headers."""
         raw_headers = envelope.get("original_headers")
         if not isinstance(raw_headers, dict):
+            return
+        self._record_origin_headers(target_url, raw_headers)
+
+    def _record_origin_headers(self, target_url: str, raw_headers: Any) -> None:
+        """Record selected response headers without storing proxy cookies."""
+        if not isinstance(raw_headers, dict) and not hasattr(raw_headers, "items"):
             return
         headers = {str(name).lower(): _text(value) for name, value in raw_headers.items()}
         selected = tuple(
@@ -244,14 +347,24 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         """Return a bounded sticky context for one product-page group."""
         if page < 1:
             raise PharmonlinePublicAPIError("products_page_number_invalid")
-        chunk = (page - 1) // _CATALOG_SESSION_PAGE_SPAN
+        span = self._catalog_session_page_span()
+        chunk = (page - 1) // span
         sessions: dict[int, str] = getattr(self, "_catalog_sessions", {})
         session = sessions.get(chunk)
         if session is None:
-            session = secrets.token_hex(16)
+            if self._transport_name() == _DECODO_TRANSPORT:
+                session = f"decodo-catalog-{chunk}-{secrets.token_hex(16)}"
+            else:
+                session = secrets.token_hex(16)
             sessions[chunk] = session
             self._catalog_sessions = sessions
         return session
+
+    def _sitemap_session(self) -> str:
+        """Keep sitemap traffic out of every catalog context."""
+        if self._transport_name() == _DECODO_TRANSPORT:
+            return f"decodo-sitemap-{secrets.token_hex(16)}"
+        return secrets.token_hex(16)
 
     async def _crawlbase_body(
         self,
@@ -334,6 +447,105 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             )
         )
 
+    def _decodo_context(self, session: str | None) -> str:
+        if session is not None:
+            if not session.startswith("decodo-"):
+                raise PharmonlinePublicAPIError("decodo_session_context_invalid")
+            return session
+        context = getattr(self, "_decodo_default_session", None)
+        if not isinstance(context, str) or not context.startswith("decodo-"):
+            context = f"decodo-category-{secrets.token_hex(16)}"
+            self._decodo_default_session = context
+        return context
+
+    def _decodo_port_for_context(self, context: str) -> int:
+        ports: tuple[int, ...] = getattr(self, "_decodo_ports", ())
+        if not ports:
+            raise SiteScrapeFatalError("Decodo sticky ports are not configured")
+        sessions: dict[str, int] = getattr(self, "_decodo_session_ports", {})
+        port = sessions.get(context)
+        if port is None:
+            # Rotate only when allocating a new logical context. Retries reuse
+            # both the exact port and the exact HTTP client/cookie jar.
+            port = ports[len(sessions) % len(ports)]
+            sessions[context] = port
+            self._decodo_session_ports = sessions
+        return port
+
+    def _decodo_client_for_context(self, context: str, port: int) -> httpx.AsyncClient:
+        clients: dict[str, httpx.AsyncClient] = getattr(self, "_decodo_clients", {})
+        client = clients.get(context)
+        if client is None:
+            username = quote(getattr(self, "_decodo_username", ""), safe="")
+            password = quote(getattr(self, "_decodo_password", ""), safe="")
+            host = getattr(self, "_decodo_host", "")
+            if not username or not password or not host:
+                raise SiteScrapeFatalError("Decodo credentials are not configured")
+            client = httpx.AsyncClient(
+                proxy=f"http://{username}:{password}@{host}:{port}",
+                timeout=120.0,
+                trust_env=False,
+            )
+            clients[context] = client
+            self._decodo_clients = clients
+        return client
+
+    async def _decodo_body(
+        self,
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        """Fetch the native public response through one configured Decodo exit."""
+        context = self._decodo_context(crawlbase_session)
+        port = self._decodo_port_for_context(context)
+        client = self._decodo_client_for_context(context, port)
+        for attempt in range(1, _MAX_CRAWLBASE_ATTEMPTS + 1):
+            try:
+                response = await client.get(target_url, headers={"accept": accept})
+                break
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt == _MAX_CRAWLBASE_ATTEMPTS:
+                    raise PharmonlinePublicAPIError("decodo_transient_request_failed") from None
+                log.warning(
+                    "pharmonline_public_api_transport_retry",
+                    transport=_DECODO_TRANSPORT,
+                    resource=urlsplit(target_url).path,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                )
+                await asyncio.sleep(1)
+            except httpx.HTTPError as exc:
+                proxy_reason = fatal_proxy_reason(exc)
+                if proxy_reason is not None:
+                    raise SiteScrapeFatalError(proxy_reason) from None
+                raise PharmonlinePublicAPIError("decodo_request_failed") from None
+        if response.status_code in {402, 407}:
+            raise SiteScrapeFatalError(
+                f"Decodo proxy access rejected: HTTP {response.status_code}"
+            )
+        if response.status_code != 200:
+            raise PharmonlinePublicAPIError(f"decodo_http_{response.status_code}")
+        self._record_origin_headers(target_url, response.headers)
+        return response.text
+
+    async def _source_json(
+        self,
+        target_url: str,
+        *,
+        crawlbase_session: str | None = None,
+    ) -> dict | list:
+        if self._transport_name() == _DECODO_TRANSPORT:
+            return _json_from_rendered_body(
+                await self._decodo_body(
+                    target_url,
+                    accept="application/json",
+                    crawlbase_session=crawlbase_session,
+                )
+            )
+        return await self._crawlbase_json(target_url, crawlbase_session=crawlbase_session)
+
     async def _crawlbase_xml(
         self,
         target_url: str,
@@ -349,6 +561,20 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             raise PharmonlinePublicAPIError("sitemap_body_not_text")
         pre_match = re.search(r"<pre[^>]*>(.*?)</pre>", body, re.I | re.S)
         return html.unescape(pre_match.group(1)) if pre_match else body
+
+    async def _source_xml(
+        self,
+        target_url: str,
+        *,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        if self._transport_name() == _DECODO_TRANSPORT:
+            return await self._decodo_body(
+                target_url,
+                accept="application/xml,text/xml;q=0.9,*/*;q=0.8",
+                crawlbase_session=crawlbase_session,
+            )
+        return await self._crawlbase_xml(target_url, crawlbase_session=crawlbase_session)
 
     @staticmethod
     def _page_payload(payload: dict | list) -> tuple[list[dict], int, int]:
@@ -413,7 +639,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         # retry in the same process never turns a short chunk context into a
         # long-lived one.
         self._catalog_sessions = {}
-        first_payload = await self._crawlbase_json(
+        first_payload = await self._source_json(
             self._product_api_url(1),
             crawlbase_session=self._catalog_session_for_page(1),
         )
@@ -429,12 +655,12 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         seen_urls: set[str] = set()
         for page in range(1, expected_pages + 1):
             page_session = self._catalog_session_for_page(page)
-            if page > 1 and (page - 1) % _CATALOG_SESSION_PAGE_SPAN == 0:
+            if page > 1 and (page - 1) % self._catalog_session_page_span() == 0:
                 # A fresh page-group context must first prove it sees the
                 # exact same ordered page one as the initial context. This
                 # prevents a different catalog variant from silently joining
                 # the buffered output; this anchor is not added twice below.
-                anchor_payload = await self._crawlbase_json(
+                anchor_payload = await self._source_json(
                     self._product_api_url(1),
                     crawlbase_session=page_session,
                 )
@@ -446,7 +672,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             payload = (
                 first_payload
                 if page == 1
-                else await self._crawlbase_json(
+                else await self._source_json(
                     self._product_api_url(page),
                     crawlbase_session=page_session,
                 )
@@ -481,11 +707,11 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         # Sitemap traffic must not extend either a catalog chunk or the
         # category-map context. It receives its own bounded sticky session,
         # matching the no-write preflight proof.
-        sitemap_session = secrets.token_hex(16)
+        sitemap_session = self._sitemap_session()
         index_url = f"{self.base_url}/sitemap.xml"
         index_locs = list(
             _iter_xml_locs(
-                await self._crawlbase_xml(
+                await self._source_xml(
                     index_url,
                     crawlbase_session=sitemap_session,
                 )
@@ -504,7 +730,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         for sitemap_url in sorted(sitemap_urls):
             child_locs = list(
                 _iter_xml_locs(
-                    await self._crawlbase_xml(
+                    await self._source_xml(
                         sitemap_url,
                         crawlbase_session=sitemap_session,
                     )
@@ -611,7 +837,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             # category values during persistence.
             category_id_to_path: dict[str, str] = {}
             try:
-                category_payload = await self._crawlbase_json(
+                category_payload = await self._source_json(
                     f"{self.base_url}/api/categories?type=category"
                 )
                 category_id_to_path = self._category_map(category_payload)
@@ -662,7 +888,8 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             "pharmonline_public_api_catalog_verified",
             products=expected_total,
             pages=expected_pages,
-            catalog_session_page_span=_CATALOG_SESSION_PAGE_SPAN,
+            transport=self._transport_name(),
+            catalog_session_page_span=self._catalog_session_page_span(),
             catalog_session_chunks=len(getattr(self, "_catalog_sessions", {})),
             origin_contexts=self._origin_context_evidence(),
         )
