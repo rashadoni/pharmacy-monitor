@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 from typing import AsyncIterator
+from urllib.parse import urljoin
 
 import structlog
 
@@ -249,7 +250,11 @@ class PharmonlineScraper(BaseScraper):
         href = await link.get_attribute("href")
         if not href:
             return None
-        full_url = href if href.startswith("http") else f"{self.base_url}{href}"
+        # The current React markup uses both root-relative and path-relative
+        # product links. ``urljoin`` preserves absolute URLs and prevents a
+        # malformed ``https://pharmonline.azproduct/...`` key, which would
+        # make the guarded URL→DDP identity bridge correctly refuse a card.
+        full_url = urljoin(f"{self.base_url}/", href)
 
         identity_values: list[str | None] = []
         for selector in (".addFavorite[data-id]", ".js-add-basket[data-id]"):

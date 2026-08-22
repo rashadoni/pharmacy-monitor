@@ -201,7 +201,7 @@ jobs:
                           )
                           print(
                               "Crawlbase bridge diagnostic: "
-                              f"url={canonical_url}, "
+                              f"raw_url={product.url}, canonical_url={canonical_url}, "
                               f"meteor_url_matches={len(url_matches)}, "
                               f"ddp_confirmed_matches={len(confirmed_ids)}"
                           )

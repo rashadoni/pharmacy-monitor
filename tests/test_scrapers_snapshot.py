@@ -117,7 +117,7 @@ async def test_pharmonline_current_card_needs_guarded_identity_bridge(monkeypatc
 
     html = """
     <div class="product_box">
-      <a href="/product/current-product?lng=en" aria-label="Current product">
+      <a href="product/current-product?lng=en" aria-label="Current product">
         <img alt="Current product">
       </a>
       <span class="second_price">12.50 AZN</span>
@@ -142,6 +142,7 @@ async def test_pharmonline_current_card_needs_guarded_identity_bridge(monkeypatc
 
     assert product is not None
     assert product.external_id == "current-product"
+    assert product.url == "https://pharmonline.az/product/current-product?lng=en"
     assert product.identity_verified is False
 
 
