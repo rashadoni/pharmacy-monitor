@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import AsyncIterator
 
 import structlog
@@ -26,6 +27,27 @@ from src.normalize import (
 from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapedPromo
 
 log = structlog.get_logger()
+
+
+# Pharmonline's rendered category card exposes the same Meteor ``_id`` that the
+# DDP API returns.  It is deliberately the only identity accepted by the legacy
+# HTML/Crawlbase path: using the URL slug here would create a second Product row
+# next to the DDP record because persistence keys on ``(site, external_id)``.
+_METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
+
+
+def _meteor_id_from_card_values(values: list[str | None]) -> str | None:
+    """Return a verified Meteor ID only when every supplied card ID agrees.
+
+    A card can expose its ID in both the favourites and basket controls.  We
+    fail closed on a malformed or conflicting value rather than falling back to
+    a URL slug, which would silently reintroduce duplicate Pharmonline records.
+    """
+    ids = [value.strip() for value in values if value and value.strip()]
+    if not ids or any(_METEOR_ID_RE.fullmatch(value) is None for value in ids):
+        return None
+    unique_ids = set(ids)
+    return next(iter(unique_ids)) if len(unique_ids) == 1 else None
 
 
 def _external_id_from_href(href: str) -> str:
@@ -50,8 +72,10 @@ class PharmonlineScraper(BaseScraper):
     ) -> AsyncIterator[ScrapedProduct]:
         """Скрейпинг категории с пагинацией ?page=1,2,3...
 
-        max_pages=100 — safety net. Реально цикл обрывается через
-        `pharmonline_pagination_done` когда страница 0 новых уникальных.
+        max_pages=100 — safety net. Для полного каталога terminal condition
+        должна быть доказуемой: пустая следующая страница. Повтор уже виденных
+        карточек не считаем «концом», иначе полный прогон мог бы выглядеть
+        успешным при зацикленной пагинации.
         """
         if not category_slug:
             return
@@ -60,107 +84,138 @@ class PharmonlineScraper(BaseScraper):
         yielded = 0
         total_cards_found = 0
         total_card_failures = 0
+        pages_visited = 0
+        terminal_reason: str | None = None
+        complete = False
 
-        for page_num in range(1, max_pages + 1):
-            url = base if page_num == 1 else f"{base}&page={page_num}"
-            page = await self.new_page()
-            page_first_id: str | None = None
-            page_yielded = 0
-            try:
-                await self.goto(page, url)
-                # pharmonline нуждается ~3-4с для рендера карточек
-                await page.wait_for_timeout(3500)
-                # подстраховка: ждать пока появится хотя бы 1 карточка
-                for _ in range(10):
-                    count = await page.evaluate(
-                        "document.querySelectorAll('.product_box_v2').length"
-                    )
-                    if count >= 1:
-                        break
-                    await page.wait_for_timeout(800)
-                else:
-                    if page_num == 1:
-                        log.warning("pharmonline_no_cards", category=category_slug)
-                    break  # пустая страница — конец пагинации
-
-                # Ждём пока внутри хотя бы одной карточки появится реальная ссылка
-                # на товар — это признак полной гидрации DOM. Без этой проверки
-                # scraper видит оболочки .product_box_v2 до того как JS вставит
-                # href, и _parse_card возвращает None для всех карточек.
+        try:
+            for page_num in range(1, max_pages + 1):
+                url = base if page_num == 1 else f"{base}&page={page_num}"
+                page = await self.new_page()
+                page_yielded = 0
                 try:
-                    await page.wait_for_selector(
-                        '.product_box_v2 a[href*="/product/"]',
-                        timeout=8000,
-                        state="attached",
-                    )
-                except Exception:
-                    # Если ссылок нет после 8с — реально пустая страница
-                    if page_num == 1:
-                        log.warning("pharmonline_no_product_links", category=category_slug)
-                    break
-
-                # Lazy-load: scroll до стабилизации количества карточек
-                prev_count = -1
-                for _ in range(12):
-                    cards_now = await page.query_selector_all(".product_box_v2")
-                    if len(cards_now) == prev_count:
+                    pages_visited = page_num
+                    await self.goto(page, url)
+                    # pharmonline нуждается ~3-4с для рендера карточек
+                    await page.wait_for_timeout(3500)
+                    # Подстраховка: ждём появление cards. На первой странице
+                    # пустота — ошибка; после успешных страниц — terminal page.
+                    for _ in range(10):
+                        count = await page.evaluate(
+                            "document.querySelectorAll('.product_box_v2').length"
+                        )
+                        if count >= 1:
+                            break
+                        await page.wait_for_timeout(800)
+                    else:
+                        if page_num == 1:
+                            terminal_reason = "no_cards_first_page"
+                            log.warning("pharmonline_no_cards", category=category_slug)
+                        else:
+                            complete = total_card_failures == 0
+                            terminal_reason = None if complete else "card_parse_failure"
                         break
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(700)
-                    prev_count = len(cards_now)
 
-                cards = await page.query_selector_all(".product_box_v2")
-                total_cards_found += len(cards)
-                log.info(
-                    "pharmonline_cards_found",
-                    category=category_slug,
-                    page=page_num,
-                    count=len(cards),
-                )
-
-                page_dropped_dup = 0
-                page_dropped_empty = 0
-                for card in cards:
-                    if limit and yielded >= limit:
-                        return
+                    # Ждём пока внутри хотя бы одной карточки появится реальная
+                    # ссылка. Оболочки без ссылок — не доказательство конца.
                     try:
-                        product = await self._parse_card(card, category_slug)
-                        if not product:
-                            page_dropped_empty += 1
-                            continue
-                        if page_first_id is None:
-                            page_first_id = product.external_id
-                        if product.external_id in seen_external_ids:
-                            page_dropped_dup += 1
-                            continue  # дубликат с предыдущей страницы
-                        seen_external_ids.add(product.external_id)
-                        page_yielded += 1
-                        yielded += 1
-                        yield product
-                    except Exception as e:
-                        total_card_failures += 1
-                        log.warning("pharmonline_card_parse_failed", error=str(e))
-                if page_dropped_empty or page_dropped_dup:
-                    log.info(
-                        "pharmonline_page_drops",
-                        page=page_num,
-                        dropped_empty=page_dropped_empty,
-                        dropped_dup=page_dropped_dup,
-                    )
-            finally:
-                await page.close()
+                        await page.wait_for_selector(
+                            '.product_box_v2 a[href*="/product/"]',
+                            timeout=8000,
+                            state="attached",
+                        )
+                    except Exception:
+                        terminal_reason = "cards_without_product_links"
+                        if page_num == 1:
+                            log.warning("pharmonline_no_product_links", category=category_slug)
+                        break
 
-            # Если на странице 0 новых уникальных товаров — пагинация исчерпана
-            if page_yielded == 0:
-                log.info(
-                    "pharmonline_pagination_done",
-                    category=category_slug,
-                    pages=page_num,
-                    total_cards_found=total_cards_found,
-                    total_yielded=yielded,
-                    total_card_failures=total_card_failures,
-                )
-                break
+                    # Lazy-load: scroll до стабилизации количества карточек
+                    prev_count = -1
+                    for _ in range(12):
+                        cards_now = await page.query_selector_all(".product_box_v2")
+                        if len(cards_now) == prev_count:
+                            break
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await page.wait_for_timeout(700)
+                        prev_count = len(cards_now)
+
+                    cards = await page.query_selector_all(".product_box_v2")
+                    total_cards_found += len(cards)
+                    log.info(
+                        "pharmonline_cards_found",
+                        category=category_slug,
+                        page=page_num,
+                        count=len(cards),
+                    )
+
+                    page_dropped_dup = 0
+                    page_dropped_empty = 0
+                    for card in cards:
+                        if limit and yielded >= limit:
+                            terminal_reason = "requested_limit_reached"
+                            return
+                        try:
+                            product = await self._parse_card(card, category_slug)
+                            if not product:
+                                # Missing/conflicting Meteor ID is treated as
+                                # an item failure. Do not insert a slug-id row.
+                                page_dropped_empty += 1
+                                continue
+                            if product.external_id in seen_external_ids:
+                                page_dropped_dup += 1
+                                continue
+                            seen_external_ids.add(product.external_id)
+                            page_yielded += 1
+                            yielded += 1
+                            yield product
+                        except Exception as e:
+                            total_card_failures += 1
+                            log.warning("pharmonline_card_parse_failed", error=str(e))
+                    total_card_failures += page_dropped_empty
+                    if page_dropped_empty or page_dropped_dup:
+                        log.info(
+                            "pharmonline_page_drops",
+                            page=page_num,
+                            dropped_empty=page_dropped_empty,
+                            dropped_dup=page_dropped_dup,
+                        )
+                finally:
+                    await page.close()
+
+                # A non-empty page containing only duplicates is not evidence
+                # that pagination is complete; fail closed rather than publish a
+                # partially looped catalog as verified.
+                if page_yielded == 0:
+                    terminal_reason = (
+                        "card_parse_failure"
+                        if page_dropped_empty
+                        else "pagination_repeated_items"
+                    )
+                    log.warning(
+                        "pharmonline_pagination_incomplete",
+                        category=category_slug,
+                        pages=page_num,
+                        reason=terminal_reason,
+                        total_cards_found=total_cards_found,
+                        total_yielded=yielded,
+                        total_card_failures=total_card_failures,
+                    )
+                    break
+            else:
+                terminal_reason = "max_pages_reached"
+        finally:
+            route_complete = complete and total_card_failures == 0
+            self._set_route_status(
+                category_slug,
+                complete=route_complete,
+                abort_reason=None if route_complete else terminal_reason or "incomplete_route",
+                expected_pages=pages_visited if route_complete else None,
+                visited_pages=pages_visited,
+                raw_items=total_cards_found,
+                parsed_items=yielded,
+                item_failures=total_card_failures,
+            )
 
     async def _parse_card(self, card, category: str) -> ScrapedProduct | None:
         """Парс карточки .product_box_v2.
@@ -178,7 +233,20 @@ class PharmonlineScraper(BaseScraper):
         if not href:
             return None
         full_url = href if href.startswith("http") else f"{self.base_url}{href}"
-        external_id = _external_id_from_href(href)
+
+        identity_values: list[str | None] = []
+        for selector in (".addFavorite[data-id]", ".js-add-basket[data-id]"):
+            identity_node = await card.query_selector(selector)
+            if identity_node:
+                identity_values.append(await identity_node.get_attribute("data-id"))
+        external_id = _meteor_id_from_card_values(identity_values)
+        if external_id is None:
+            log.warning(
+                "pharmonline_card_missing_stable_id",
+                url=full_url,
+                observed_ids=identity_values,
+            )
+            return None
 
         # Имя — в aria-label у ссылки, либо в alt у изображения
         name = await link.get_attribute("aria-label") or ""

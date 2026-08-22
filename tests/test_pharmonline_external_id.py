@@ -5,7 +5,7 @@
 обрезаются → EN/AZ/RU мапятся на один external_id.
 """
 
-from src.scrapers.pharmonline import _external_id_from_href
+from src.scrapers.pharmonline import _external_id_from_href, _meteor_id_from_card_values
 
 
 def test_strips_locale_query():
@@ -30,3 +30,17 @@ def test_strips_trailing_slash_and_fragment():
 
 def test_multi_param_query():
     assert _external_id_from_href("/product/ringer-400-ml?lng=en&ref=cat") == "ringer-400-ml"
+
+
+def test_card_meteor_id_requires_one_valid_agreeing_value():
+    assert _meteor_id_from_card_values(["xwJspdCx3iFBDqDWF"]) == "xwJspdCx3iFBDqDWF"
+    assert (
+        _meteor_id_from_card_values(["xwJspdCx3iFBDqDWF", "xwJspdCx3iFBDqDWF"])
+        == "xwJspdCx3iFBDqDWF"
+    )
+
+
+def test_card_meteor_id_fails_closed_on_missing_invalid_or_conflicting_value():
+    assert _meteor_id_from_card_values([]) is None
+    assert _meteor_id_from_card_values(["slug-not-a-meteor-id"]) is None
+    assert _meteor_id_from_card_values(["xwJspdCx3iFBDqDWF", "6kHnwLLMpYXyebN8f"]) is None

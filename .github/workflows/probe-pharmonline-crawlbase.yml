@@ -1,0 +1,82 @@
+name: Probe Pharmonline via Crawlbase (no persistence)
+
+# This is intentionally a source-only probe: it exercises the live fallback
+# route but never opens a database connection or creates a Run/Product row.
+on:
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "Pharmonline category slug for the small source probe"
+        required: true
+        default: "antiallergik-vasiteler"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pharmonline-crawlbase-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scraper dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e .
+          playwright install chromium --with-deps
+
+      - name: Fetch a few cards without persisting anything
+        env:
+          CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
+          CRAWLBASE_API_SITES: pharmonline
+          PHARMONLINE_USE_DDP: "0"
+          PROBE_CATEGORY: ${{ inputs.category }}
+        run: |
+          set -euo pipefail
+          test -n "$CRAWLBASE_JS_TOKEN"
+          python - <<'PY'
+          import asyncio
+          import os
+          import re
+
+          from src.scrapers.pharmonline import PharmonlineScraper
+
+
+          async def main() -> None:
+              category = os.environ["PROBE_CATEGORY"]
+              async with PharmonlineScraper() as scraper:
+                  # The limit keeps this to one rendered page in normal cases.
+                  # This invokes no storage code and cannot alter production data.
+                  result = await scraper.scrape([category], limit_per_category=5)
+
+              product_ids = [product.external_id for product in result.products]
+              if result.errors:
+                  raise SystemExit(f"Crawlbase probe errors: {result.errors[:3]}")
+              if len(product_ids) < 3:
+                  raise SystemExit(f"Crawlbase probe returned too few products: {len(product_ids)}")
+              if len(set(product_ids)) != len(product_ids):
+                  raise SystemExit("Crawlbase probe returned duplicate product IDs")
+              if not all(re.fullmatch(r"[A-Za-z0-9]{17}", product_id) for product_id in product_ids):
+                  raise SystemExit("Crawlbase probe returned a non-Meteor product ID")
+
+              route = result.route_statuses.get(category)
+              if route is None or route.abort_reason != "requested_limit_reached":
+                  raise SystemExit("Crawlbase probe did not record the bounded-route guard")
+              print(
+                  f"Crawlbase source probe OK: category={category}, "
+                  f"products={len(product_ids)}, stable_meteor_ids=true"
+              )
+
+
+          asyncio.run(main())
+          PY

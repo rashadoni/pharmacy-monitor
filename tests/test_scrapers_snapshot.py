@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 from playwright.async_api import async_playwright
@@ -102,6 +103,10 @@ async def test_pharmonline_snapshot_yields_products():
     )
     assert n_cards >= 10, f"В HTML только {n_cards} cards"
     assert len(products) >= n_cards * 0.9
+    # Legacy/Crawlbase must persist the same Meteor key as DDP. A URL slug
+    # here would silently recreate the historical duplicate-catalog incident.
+    assert products[0].external_id == "xwJspdCx3iFBDqDWF"
+    assert all(re.fullmatch(r"[A-Za-z0-9]{17}", product.external_id) for product in products)
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,152 @@
+name: Recover Pharmonline catalog via Crawlbase
+
+# Manual, guarded recovery route. It uses the legacy HTML renderer only after
+# that renderer has been validated to emit the same Meteor IDs as DDP.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RECOVER to start the full, verified catalog recovery"
+        required: true
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-pharmonline-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Require explicit recovery confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "RECOVER"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scraper dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e .
+          playwright install chromium --with-deps
+
+      - name: Setup production SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Preflight production capacity and scraper state
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          min_available_kib=$((4 * 1024 * 1024))
+          max_swap_kib=$((2 * 1024 * 1024))
+          min_disk_kib=$((4 * 1024 * 1024))
+          max_user_slice_bytes=$((7 * 1024 * 1024 * 1024))
+
+          available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+          swap_before_kib=$(free -k | awk '/^Swap:/ {print $3}')
+          disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk 'NR==2 {print $4}')
+          user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
+          sleep 5
+          swap_after_kib=$(free -k | awk '/^Swap:/ {print $3}')
+
+          printf 'available_ram_kib=%s required_kib=%s\n' "$available_kib" "$min_available_kib"
+          printf 'swap_before_kib=%s swap_after_kib=%s maximum_kib=%s\n' \
+            "$swap_before_kib" "$swap_after_kib" "$max_swap_kib"
+          printf 'disk_available_kib=%s required_kib=%s\n' "$disk_available_kib" "$min_disk_kib"
+          printf 'user_slice_bytes=%s conservative_limit_bytes=%s\n' \
+            "$user_slice_bytes" "$max_user_slice_bytes"
+
+          test "$available_kib" -ge "$min_available_kib"
+          test "$swap_after_kib" -le "$max_swap_kib"
+          test "$swap_after_kib" -le "$swap_before_kib"
+          test "$disk_available_kib" -ge "$min_disk_kib"
+          test "$user_slice_bytes" -lt "$max_user_slice_bytes"
+          if systemctl is-active --quiet pharmacy-monitor-scrape@pharmonline.service; then
+            echo "refusing recovery: a Pharmonline scrape is already active" >&2
+            exit 1
+          fi
+          REMOTE
+
+      - name: Open SSH tunnel to production Postgres
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -N -L 5433:localhost:5432 \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 &
+          echo "TUNNEL_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            if nc -z localhost 5433 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "production Postgres tunnel did not come up" >&2
+          exit 1
+
+      - name: Run the guarded full catalog recovery
+        env:
+          DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
+          CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
+          CRAWLBASE_API_SITES: pharmonline
+          PHARMONLINE_USE_DDP: "0"
+        run: |
+          set -euo pipefail
+          test -n "$CRAWLBASE_JS_TOKEN"
+          pharmacy-monitor run --site pharmonline --mode category --no-alerts
+
+      - name: Close SSH tunnel
+        if: always()
+        run: |
+          if [ -n "${TUNNEL_PID:-}" ]; then
+            kill "$TUNNEL_PID" 2>/dev/null || true
+          fi
+
+      - name: Verify the new Pharmonline catalog is fresh and trusted
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          with urllib.request.urlopen("https://leaddrive.cloud/health", timeout=30) as response:
+              health = json.load(response)
+
+          sites = health.get("product_policy", {}).get("sites", [])
+          pharmonline = next((row for row in sites if row.get("site") == "pharmonline"), None)
+          if pharmonline is None:
+              raise SystemExit("pharmonline is absent from product-policy health")
+
+          print(
+              "pharmonline latest attempt:",
+              pharmonline.get("latest_full_attempt_id"),
+              pharmonline.get("latest_full_attempt_status"),
+              pharmonline.get("latest_full_attempt_reason"),
+          )
+          if pharmonline.get("latest_full_attempt_status") != "ok":
+              raise SystemExit("latest Pharmonline full catalog attempt is not ok")
+          if not pharmonline.get("latest_full_attempt_verified"):
+              raise SystemExit("latest Pharmonline full catalog attempt is not verified")
+          PY
