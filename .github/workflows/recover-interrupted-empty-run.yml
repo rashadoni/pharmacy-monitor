@@ -1,0 +1,176 @@
+name: Recover interrupted empty catalog run
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Empty interrupted Run ID to close"
+        required: true
+        default: "671"
+
+concurrency:
+  group: production-run-recovery
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate requested run ID
+        id: input
+        env:
+          REQUESTED_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          case "$REQUESTED_RUN_ID" in
+            ''|*[!0-9]*)
+              echo "run_id must be a positive integer" >&2
+              exit 1
+              ;;
+          esac
+          test "$REQUESTED_RUN_ID" -gt 0
+          printf 'run_id=%s\n' "$REQUESTED_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Set up production SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' \
+            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Preflight production and verify no scraper is active
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+          swap_before_kib=$(free -k | awk '/^Swap:/ {print $3}')
+          disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk 'NR==2 {print $4}')
+          user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
+
+          test "$available_kib" -ge $((4 * 1024 * 1024))
+          test "$swap_before_kib" -le $((2 * 1024 * 1024))
+          test "$disk_available_kib" -ge $((4 * 1024 * 1024))
+          test "$user_slice_bytes" -lt $((7 * 1024 * 1024 * 1024))
+          ! systemctl is-active --quiet pharmacy-monitor-scrape@pharmonline.service
+          ! pgrep -f 'pharmacy-monitor (run|scrape|intraday-tick|rematch)( |$)' >/dev/null 2>&1
+          REMOTE
+
+      - name: Close only an empty interrupted Pharmonline run
+        env:
+          RUN_ID: ${{ steps.input.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            pm@46.225.149.52 "bash -s -- '$RUN_ID'" <<'REMOTE'
+          set -euo pipefail
+          run_id=$1
+          cd /opt/pharmacy-monitor
+
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|\#*) continue ;;
+            esac
+            key=${line%%=*}
+            value=${line#*=}
+            export "$key=$value"
+          done < /etc/pharmacy-monitor/env
+
+          RUN_ID="$run_id" PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
+          import os
+          from sqlalchemy import func, select
+
+          from src import storage
+          from src.storage import utcnow
+
+          run_id = int(os.environ["RUN_ID"])
+          storage.init_db()
+          Session = storage.make_session()
+
+          with Session() as session:
+              run = session.get(storage.Run, run_id)
+              if run is None:
+                  raise SystemExit("requested run is absent")
+
+              if run.status != "running" or run.finished_at is not None:
+                  print(f"run_id={run.id} already_terminal=true status={run.status}")
+                  raise SystemExit(0)
+
+              sites = {item for item in (run.full_catalog_sites or "").split(",") if item}
+              snapshots = session.scalar(
+                  select(func.count())
+                  .select_from(storage.PriceSnapshot)
+                  .where(storage.PriceSnapshot.run_id == run.id)
+              )
+              if (
+                  run.catalog_scope != "full"
+                  or sites != {"pharmonline"}
+                  or int(run.products_scraped or 0) != 0
+                  or int(snapshots or 0) != 0
+              ):
+                  raise SystemExit("refusing to close a non-empty or non-Pharmonline run")
+
+              quality = dict(run.run_quality or {})
+              quality["full_catalog_verified"] = False
+              quality["financially_eligible"] = False
+              quality["recovery"] = {
+                  "reason": "cancelled unsafe legacy fallback before data collection",
+                  "recovered_at": utcnow().isoformat(),
+              }
+              run.run_quality = quality
+              run.status = "failed"
+              run.finished_at = utcnow()
+              run.catalog_verified = False
+              run.catalog_verification_reason = "cancelled_unsafe_legacy_fallback"
+              run.error_message = (
+                  "cancelled unsafe legacy fallback before data collection; "
+                  "no snapshots were written"
+              )
+              session.commit()
+              print(
+                  f"run_id={run.id} status={run.status} "
+                  f"products_scraped={run.products_scraped} snapshots={snapshots}"
+              )
+          PY
+          REMOTE
+
+      - name: Verify public health reports the attempt as failed
+        env:
+          RUN_ID: ${{ steps.input.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          run_id = int(os.environ["RUN_ID"])
+          with urllib.request.urlopen("https://leaddrive.cloud/health", timeout=30) as response:
+              health = json.load(response)
+          sites = health.get("product_policy", {}).get("sites", [])
+          pharm = next((row for row in sites if row.get("site") == "pharmonline"), None)
+          if pharm is None:
+              raise SystemExit("pharmonline is absent from health response")
+          print(
+              "pharmonline latest attempt:",
+              pharm.get("latest_full_attempt_id"),
+              pharm.get("latest_full_attempt_status"),
+              pharm.get("latest_full_attempt_reason"),
+          )
+          if pharm.get("latest_full_attempt_id") != run_id:
+              raise SystemExit("health did not expose the recovered run")
+          if pharm.get("latest_full_attempt_status") != "failed":
+              raise SystemExit("recovered run was not reported as failed")
+          PY
