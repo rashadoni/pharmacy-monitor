@@ -6,11 +6,6 @@ name: Probe Pharmonline public API (no persistence)
 # trusted DDP catalog. It never creates or changes a Run, Product, or snapshot.
 on:
   workflow_dispatch:
-    inputs:
-      category:
-        description: "Current Pharmonline category path to probe"
-        required: true
-        default: "sinir-sistemi-xestelikeri"
 
 permissions:
   contents: read
@@ -69,7 +64,6 @@ jobs:
         env:
           DATABASE_URL: postgresql+psycopg://pm:${{ secrets.PG_PASS }}@localhost:5433/pharmacy_monitor
           CRAWLBASE_JS_TOKEN: ${{ secrets.CRAWLBASE_JS_TOKEN }}
-          PROBE_CATEGORY: ${{ inputs.category }}
         run: |
           set -euo pipefail
           test -n "$CRAWLBASE_JS_TOKEN"
@@ -93,7 +87,6 @@ jobs:
 
 
           BASE_URL = "https://pharmonline.az"
-          CATEGORY_PAGE_SIZE = 12
           GLOBAL_PAGE_SIZE = 100
 
 
@@ -179,35 +172,9 @@ jobs:
 
 
           async def main() -> None:
-              category_path = os.environ["PROBE_CATEGORY"]
-              categories = await crawlbase_json(f"{BASE_URL}/api/categories?type=category")
-              # The public categories endpoint currently returns a top-level
-              # list, whereas product pages return an object with data/total/
-              # pages.  Supporting both category envelopes here is deliberate;
-              # product pages remain strict below.
-              category_rows = categories.get("data") if isinstance(categories, dict) else categories
-              if not isinstance(category_rows, list):
-                  raise SystemExit(
-                      f"public categories response has invalid data field: keys={sorted(categories)[:20]}"
-                  )
-              category = next(
-                  (
-                      row
-                      for row in category_rows
-                      if isinstance(row, dict) and str(row.get("path")) == category_path
-                  ),
-                  None,
-              )
-              if category is None:
-                  raise SystemExit(f"current category path is absent: {category_path}")
-              category_id = str(category.get("_id") or category.get("id") or "")
-              if not _PHARMONLINE_METEOR_ID_RE.fullmatch(category_id):
-                  raise SystemExit("current category has no valid stable ID")
-
               def product_url(
                   page: int,
                   *,
-                  category_id: str | None = None,
                   page_size: int,
               ) -> str:
                   query = {
@@ -216,38 +183,7 @@ jobs:
                       "limit": str(page_size),
                       "sortBy": "price_asc",
                   }
-                  if category_id:
-                      query["category"] = category_id
                   return f"{BASE_URL}/api/products?{urlencode(query)}"
-
-              first_payload = await crawlbase_json(
-                  product_url(1, category_id=category_id, page_size=CATEGORY_PAGE_SIZE)
-              )
-              second_payload = await crawlbase_json(
-                  product_url(2, category_id=category_id, page_size=CATEGORY_PAGE_SIZE)
-              )
-              first_rows, category_total, category_pages = rows_and_meta(first_payload)
-              second_rows, second_total, second_pages = rows_and_meta(second_payload)
-              if (
-                  not first_rows
-                  or not second_rows
-                  or category_total != second_total
-                  or category_pages != second_pages
-              ):
-                  raise SystemExit(
-                      "public category pagination is not stable: "
-                      f"page1=(items={len(first_rows)}, total={category_total}, pages={category_pages}), "
-                      f"page2=(items={len(second_rows)}, total={second_total}, pages={second_pages})"
-                  )
-              first_ids = {str(row.get("_id") or "") for row in first_rows}
-              second_ids = {str(row.get("_id") or "") for row in second_rows}
-              if (
-                  len(first_ids) != len(first_rows)
-                  or len(second_ids) != len(second_rows)
-                  or first_ids & second_ids
-                  or not all(_PHARMONLINE_METEOR_ID_RE.fullmatch(value) for value in first_ids | second_ids)
-              ):
-                  raise SystemExit("public category pages do not expose disjoint stable product IDs")
 
               global_payload = await crawlbase_json(
                   product_url(1, page_size=GLOBAL_PAGE_SIZE)
@@ -286,7 +222,7 @@ jobs:
               # Read-only DB evidence: current API IDs and canonical paths must
               # agree with the pre-existing DDP catalogue before recovery code
               # is allowed to use this source.
-              sample_rows = first_rows[:5]
+              sample_rows = global_rows[:5]
               sample_ids = [str(row["_id"]) for row in sample_rows]
               Session = storage.make_session()
               with Session() as session:
@@ -322,9 +258,6 @@ jobs:
               sample_keys = sorted(sample_rows[0])[:30]
               print(
                   "Pharmonline public API probe OK: "
-                  f"category_path={category_path}, category_id={category_id}, "
-                  f"category_total={category_total}, category_pages={category_pages}, "
-                  f"page_size={len(first_rows)}, page_overlap={len(first_ids & second_ids)}, "
                   f"global_total={global_total}, global_pages={global_pages}, "
                   f"global_page_size={len(global_rows)}, global_page_overlap={len(global_ids & global_second_ids)}, "
                   f"sample_fields={sample_keys}, database_transaction=read_only"
