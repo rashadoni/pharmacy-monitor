@@ -1,0 +1,281 @@
+name: Autonomous Pharmonline Decodo catalog refresh
+
+# This is the durable production path after the guarded public-API recovery.
+# It intentionally runs from a checksum-verified, isolated checkout on the
+# production host: a scheduled job must never depend on a manually staged
+# recovery directory, nor silently fall back to the legacy DDP scraper.
+
+on:
+  schedule:
+    # Staggered well away from the legacy systemd timer.  GitHub Actions uses UTC.
+    - cron: "20 03 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pharmonline-decodo-autonomous-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Verify and refresh full Pharmonline catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pinned production SSH access
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' \
+            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          test "$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')" = \
+            'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
+
+      - name: Check production capacity and avoid an overlapping writer
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          min_available_kib=$((4 * 1024 * 1024))
+          max_swap_kib=$((2 * 1024 * 1024))
+          min_disk_kib=$((4 * 1024 * 1024))
+          max_user_slice_bytes=$((7 * 1024 * 1024 * 1024))
+
+          available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+          swap_before_kib=$(free -k | awk '/^Swap:/ {print $3}')
+          disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk 'NR==2 {print $4}')
+          user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
+          sleep 5
+          swap_after_kib=$(free -k | awk '/^Swap:/ {print $3}')
+
+          test "$available_kib" -ge "$min_available_kib"
+          test "$swap_after_kib" -le "$max_swap_kib"
+          test "$swap_after_kib" -le "$swap_before_kib"
+          test "$disk_available_kib" -ge "$min_disk_kib"
+          test "$user_slice_bytes" -lt "$max_user_slice_bytes"
+          test -r /etc/pharmacy-monitor/env
+          test -x /opt/pharmacy-monitor/.venv/bin/python
+
+          # Never compete with an operator-started legacy service.  The
+          # application also takes a DB advisory lock, but fail fast here so a
+          # scheduled run cannot consume the same proxy allowance in parallel.
+          if systemctl is-active --quiet pharmacy-monitor-scrape@pharmonline.service; then
+            echo 'Pharmonline systemd scrape is active; autonomous refresh deferred' >&2
+            exit 75
+          fi
+          REMOTE
+
+      - name: Stage checksum-verified runtime source
+        id: stage
+        run: |
+          set -euo pipefail
+          manifest=$(mktemp)
+          trap 'rm -f "$manifest"' EXIT
+          git ls-files -z -- src migrations alembic.ini |
+            xargs -0 sha256sum | LC_ALL=C sort > "$manifest"
+          test -s "$manifest"
+
+          work_dir=$(ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 'mktemp -d /opt/pharmacy-monitor/.codex-pharmonline-auto.XXXXXX')
+          case "$work_dir" in
+            /opt/pharmacy-monitor/.codex-pharmonline-auto.*) ;;
+            *) echo 'unexpected remote staging path' >&2; exit 1 ;;
+          esac
+
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 \
+            "mkdir -p '$work_dir/runtime/src' '$work_dir/runtime/migrations' '$work_dir/incoming'"
+          rsync -az --checksum --delete --no-perms --no-owner --no-group \
+            --exclude='__pycache__/' \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            src/ "pm@46.225.149.52:$work_dir/runtime/src/"
+          rsync -az --checksum --delete --no-perms --no-owner --no-group \
+            --exclude='__pycache__/' \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            migrations/ "pm@46.225.149.52:$work_dir/runtime/migrations/"
+          rsync -z --checksum --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            alembic.ini "pm@46.225.149.52:$work_dir/runtime/alembic.ini"
+          rsync -z --checksum --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            "$manifest" "pm@46.225.149.52:$work_dir/incoming/source-manifest"
+          echo "work_dir=$work_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Run guarded Decodo refresh with bounded fresh-session retries
+        env:
+          WORK_DIR: ${{ steps.stage.outputs.work_dir }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=120 \
+            pm@46.225.149.52 \
+            "bash -s -- '$WORK_DIR'" <<'REMOTE'
+          set -euo pipefail
+          work_dir=$1
+          case "$work_dir" in
+            /opt/pharmacy-monitor/.codex-pharmonline-auto.*) ;;
+            *) echo 'unexpected remote staging path' >&2; exit 1 ;;
+          esac
+          runtime_dir="$work_dir/runtime"
+          cleanup() {
+            rm -rf -- "$work_dir"
+          }
+          trap cleanup EXIT
+
+          cd "$runtime_dir"
+          sha256sum -c "$work_dir/incoming/source-manifest"
+
+          # systemd EnvironmentFile syntax is literal KEY=VALUE, not shell
+          # source.  Parse it without evaluating its contents.
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|'#'*) continue ;;
+            esac
+            key=${line%%=*}
+            value=${line#*=}
+            case "$key" in
+              [A-Za-z_][A-Za-z0-9_]*) export "$key=$value" ;;
+              *) echo "invalid EnvironmentFile key: $key" >&2; exit 1 ;;
+            esac
+          done < /etc/pharmacy-monitor/env
+
+          current=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python -m alembic \
+              -c "$runtime_dir/alembic.ini" current | awk 'NF {print $1}')
+          head=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python -m alembic \
+              -c "$runtime_dir/alembic.ini" heads | awk 'NF {print $1}')
+          test -n "$current"
+          test "$current" = "$head"
+
+          before_run_id=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
+          from sqlalchemy import text
+          from src import storage
+
+          Session = storage.make_session()
+          with Session() as session:
+              print(session.execute(
+                  text("SELECT COALESCE(MAX(id), 0) FROM runs WHERE tenant_id = 1")
+              ).scalar_one())
+          PY
+          )
+          case "$before_run_id" in
+            ''|*[!0-9]*) echo 'could not determine prior run ID' >&2; exit 1 ;;
+          esac
+
+          attempt=1
+          succeeded=0
+          while [ "$attempt" -le 3 ]; do
+            echo "autonomous verified catalog attempt ${attempt}/3"
+            if PHARMONLINE_PUBLIC_API=required \
+              PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
+              PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
+              PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \
+              PHARMONLINE_USE_DDP=0 \
+              AI_FALLBACK_ENABLED=0 \
+              SCRAPE_REPORT_EMAIL=0 \
+              PYTHONDONTWRITEBYTECODE=1 \
+              PYTHONPATH="$runtime_dir" \
+              /opt/pharmacy-monitor/.venv/bin/python -m src.main run \
+                --site pharmonline \
+                --mode public_api \
+                --dry-run \
+                --no-alerts
+            then
+              succeeded=1
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              # A public-API rate limit or a transient empty sitemap must use
+              # a fresh proxy session after a real cooling period.  The data
+              # guards reject failed passes before product persistence.
+              echo 'attempt failed; waiting 300s before a fresh Decodo session' >&2
+              sleep 300
+            fi
+            attempt=$((attempt + 1))
+          done
+          test "$succeeded" -eq 1
+
+          BEFORE_RUN_ID="$before_run_id" PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="$runtime_dir" /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
+          import os
+          from sqlalchemy import text
+
+          from src import storage
+
+          before_run_id = int(os.environ["BEFORE_RUN_ID"])
+          Session = storage.make_session()
+          with Session() as session:
+              row = session.execute(
+                  text(
+                      """
+                      SELECT id, status, catalog_scope, catalog_verified,
+                             catalog_verification_reason, products_scraped,
+                             products_per_site, run_quality
+                      FROM runs
+                      WHERE tenant_id = 1
+                        AND full_catalog_sites = 'pharmonline'
+                        AND id > :before_run_id
+                      ORDER BY id DESC
+                      LIMIT 1
+                      """
+                  ),
+                  {"before_run_id": before_run_id},
+              ).mappings().one_or_none()
+          if row is None:
+              raise SystemExit('no new Pharmonline full-catalog run was created')
+          quality = row["run_quality"] or {}
+          site_quality = (quality.get("sites") or {}).get("pharmonline") or {}
+          if (
+              row["status"] != "ok"
+              or row["catalog_scope"] != "full"
+              or not row["catalog_verified"]
+              or quality.get("full_catalog_verified") is not True
+              or site_quality.get("status") != "ok"
+              or int(row["products_scraped"] or 0) < 1
+          ):
+              raise SystemExit('new catalog run did not meet the verified-full-catalog contract')
+          print(
+              'autonomous Pharmonline catalog verified: '
+              f'run_id={row["id"]} products={row["products_scraped"]} '
+              f'reason={row["catalog_verification_reason"]}'
+          )
+          PY
+          REMOTE
+
+      - name: Verify production health sees the successful catalog
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 \
+            'cd /opt/pharmacy-monitor && .venv/bin/pharmacy-monitor health-check --quiet-on-ok'
