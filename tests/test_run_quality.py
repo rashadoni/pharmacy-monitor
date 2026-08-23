@@ -143,6 +143,49 @@ def test_public_api_recovery_refuses_mixed_sources(
     assert expected_message in result.output
 
 
+def test_autonomous_marker_redirects_only_the_generic_pharmonline_timer(
+    monkeypatch, tmp_path
+):
+    marker = tmp_path / "pharmonline-public-api-autonomous-v1"
+    monkeypatch.setenv(
+        "PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER", str(marker)
+    )
+
+    assert not main_mod._pharmonline_public_api_autonomous_mode_requested(
+        ["pharmonline"], "auto"
+    )
+
+    marker.write_text(
+        main_mod._PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_CONTENT,
+        encoding="utf-8",
+    )
+    assert main_mod._pharmonline_public_api_autonomous_mode_requested(
+        ["pharmonline"], "auto"
+    )
+    assert not main_mod._pharmonline_public_api_autonomous_mode_requested(
+        ["pharmonline", "aloe"], "auto"
+    )
+    assert not main_mod._pharmonline_public_api_autonomous_mode_requested(
+        ["pharmonline"], "category"
+    )
+
+
+def test_autonomous_marker_replaces_legacy_ddp_for_its_process(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_USE_DDP", "1")
+    monkeypatch.setenv("AI_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "1")
+
+    main_mod._enable_pharmonline_public_api_autonomous_mode()
+
+    assert main_mod._pharmonline_public_api_enabled()
+    assert main_mod.os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] == "decodo"
+    assert main_mod.os.environ["PHARMONLINE_DECODO_BACKCONNECT_STICKY"] == "1"
+    assert main_mod.os.environ["PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE"] == "required"
+    assert main_mod.os.environ["PHARMONLINE_USE_DDP"] == "0"
+    assert main_mod.os.environ["AI_FALLBACK_ENABLED"] == "0"
+    assert main_mod.os.environ["SCRAPE_REPORT_EMAIL"] == "0"
+
+
 def test_single_category_run_only_requests_sites_with_configured_route():
     quality_sites, scrape_scope = scope_category_run_sites(
         {

@@ -67,6 +67,15 @@ class PharmonlinePublicAPIReconciliationError(RuntimeError):
 
 _PHARMONLINE_LEGACY_ID_BRIDGE_ENV = "PHARMONLINE_LEGACY_ID_BRIDGE"
 _PHARMONLINE_PUBLIC_API_ENV = "PHARMONLINE_PUBLIC_API"
+_PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_ENV = (
+    "PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER"
+)
+_PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_DEFAULT = Path(
+    "/opt/pharmacy-monitor/data/pharmonline-public-api-autonomous-v1"
+)
+_PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_CONTENT = (
+    "pharmonline_public_api_autonomous_v1\n"
+)
 _PHARMONLINE_METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
 _PHARMONLINE_DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
 _PHARMONLINE_PUBLIC_API_MIN_TRUSTED_COVERAGE = 0.98
@@ -108,6 +117,56 @@ def _pharmonline_public_api_enabled() -> bool:
         "yes",
         "required",
     }
+
+
+def _pharmonline_public_api_autonomous_marker_path() -> Path:
+    """Return the explicit on-host marker used by the Pharmonline timer.
+
+    The generic production systemd unit predates the public-API recovery and
+    can only execute ``pharmacy-monitor run --site pharmonline``.  A marker
+    written by the guarded activation workflow is therefore the narrow,
+    auditable opt-in that redirects *that exact auto-mode, single-site run* to
+    the verified public API.  It does not change ordinary multi-site or manual
+    category runs.
+    """
+    configured = os.environ.get(_PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_ENV, "").strip()
+    return Path(configured) if configured else _PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_DEFAULT
+
+
+def _pharmonline_public_api_autonomous_mode_requested(
+    sites: list[str], mode: str
+) -> bool:
+    """Whether the protected production timer may enter public-API mode.
+
+    A missing, unreadable, or malformed marker is fail-closed.  The exact
+    content prevents an unrelated empty file from silently changing scraper
+    identity semantics.
+    """
+    if mode != "auto" or set(sites) != {"pharmonline"}:
+        return False
+    try:
+        return (
+            _pharmonline_public_api_autonomous_marker_path().read_text(encoding="utf-8")
+            == _PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_CONTENT
+        )
+    except OSError:
+        return False
+
+
+def _enable_pharmonline_public_api_autonomous_mode() -> None:
+    """Set process-local, fail-closed settings for the verified source.
+
+    This is called only after the exact marker/scope test above.  It wins over
+    the legacy DDP values inherited from the old parameterized systemd unit,
+    without modifying its root-owned EnvironmentFile.
+    """
+    os.environ[_PHARMONLINE_PUBLIC_API_ENV] = "required"
+    os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] = "decodo"
+    os.environ["PHARMONLINE_DECODO_BACKCONNECT_STICKY"] = "1"
+    os.environ["PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE"] = "required"
+    os.environ["PHARMONLINE_USE_DDP"] = "0"
+    os.environ["AI_FALLBACK_ENABLED"] = "0"
+    os.environ["SCRAPE_REPORT_EMAIL"] = "0"
 
 
 def _canonical_pharmonline_product_url(raw_url: str | None) -> str | None:
@@ -4793,9 +4852,17 @@ def run_cmd(
     request_id: int | None,
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
+    sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    if _pharmonline_public_api_autonomous_mode_requested(sites, mode):
+        _enable_pharmonline_public_api_autonomous_mode()
+        # The root-owned generic systemd unit can only call ``run --site %i``.
+        # Its protected marker is thus the sole automatic bridge to the
+        # guarded full-catalog mode; manual category/multi-site commands stay
+        # unchanged because they never satisfy the scope predicate above.
+        mode = "public_api"
+
     use_legacy_identity_bridge = _pharmonline_legacy_id_bridge_enabled()
     use_public_api = _pharmonline_public_api_enabled()
-    sites = list(site) if site else list(SCRAPER_CLASSES.keys())
     if use_legacy_identity_bridge and use_public_api:
         raise click.ClickException(
             "PHARMONLINE_LEGACY_ID_BRIDGE and PHARMONLINE_PUBLIC_API cannot be enabled together"

@@ -67,7 +67,7 @@ jobs:
           test "$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')" = \
             'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
 
-      - name: Hand off Pharmonline scheduling to this verified workflow
+      - name: Verify the legacy timer is safely redirected to public API
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_ed25519 \
@@ -78,29 +78,15 @@ jobs:
           set -euo pipefail
           timer=pharmacy-monitor-scrape@pharmonline.timer
           service=pharmacy-monitor-scrape@pharmonline.service
-          enabled=$(systemctl is-enabled "$timer" 2>/dev/null || true)
-          case "$enabled" in
-            disabled|masked)
-              echo "legacy_timer_state=$enabled"
-              ;;
-            *)
-              if systemctl is-active --quiet "$service"; then
-                echo 'legacy Pharmonline scrape is active; refusing scheduler handoff' >&2
-                exit 1
-              fi
-              # This is deliberately narrow: only turn off the old weekly DDP
-              # timer after the verified public-API workflow has been enabled.
-              sudo -n /usr/bin/systemctl disable --now "$timer"
-              enabled=$(systemctl is-enabled "$timer" 2>/dev/null || true)
-              case "$enabled" in
-                disabled|masked) echo "legacy_timer_state=$enabled" ;;
-                *)
-                  echo "legacy Pharmonline timer remains enabled: $enabled" >&2
-                  exit 1
-                  ;;
-              esac
-              ;;
-          esac
+          marker=/opt/pharmacy-monitor/data/pharmonline-public-api-autonomous-v1
+          test -f "$marker"
+          test "$(cat "$marker")" = 'pharmonline_public_api_autonomous_v1'
+          if systemctl is-active --quiet "$service"; then
+            echo 'Pharmonline systemd scrape is active; refusing overlapping refresh' >&2
+            exit 1
+          fi
+          echo "systemd_timer_state=$(systemctl is-enabled "$timer" 2>/dev/null || true)"
+          echo 'systemd timer dispatch is redirected to verified public API'
           REMOTE
 
       - name: Check production capacity and avoid an overlapping writer
