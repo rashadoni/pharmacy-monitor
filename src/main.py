@@ -167,7 +167,11 @@ def _pharmonline_native_url_rebind_is_proven(
 
 def _pharmonline_public_api_recovery_tables_available(session: Session) -> bool:
     """Avoid treating an unapplied production migration as trusted evidence."""
-    tables = set(inspect(session.get_bind()).get_table_names())
+    # Inspect through the Session's live connection.  Inspecting the Engine
+    # obtains a second connection; with SQLite's StaticPool used by tests that
+    # is the same DBAPI connection and its cleanup can roll back the active
+    # session transaction behind SQLAlchemy's identity map.
+    tables = set(inspect(session.connection()).get_table_names())
     return {
         "pharmonline_public_api_identity_reconciliations",
         "pharmonline_public_api_catalog_baselines",
