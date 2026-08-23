@@ -478,20 +478,35 @@ jobs:
               ;;
           esac
 
-          PHARMONLINE_PUBLIC_API=required \
-          PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
-          PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
-          PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \
-          PHARMONLINE_USE_DDP=0 \
-          AI_FALLBACK_ENABLED=0 \
-          SCRAPE_REPORT_EMAIL=0 \
-          PYTHONDONTWRITEBYTECODE=1 \
-          PYTHONPATH="$runtime_dir" \
-          /opt/pharmacy-monitor/.venv/bin/python -m src.main run \
-            --site pharmonline \
-            --mode public_api \
-            --dry-run \
-            --no-alerts
+          publish_attempt=1
+          publish_succeeded=0
+          while [ "$publish_attempt" -le 3 ]; do
+            echo "verified catalog publication attempt ${publish_attempt}/3"
+            if PHARMONLINE_PUBLIC_API=required \
+              PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
+              PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
+              PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \
+              PHARMONLINE_USE_DDP=0 \
+              AI_FALLBACK_ENABLED=0 \
+              SCRAPE_REPORT_EMAIL=0 \
+              PYTHONDONTWRITEBYTECODE=1 \
+              PYTHONPATH="$runtime_dir" \
+              /opt/pharmacy-monitor/.venv/bin/python -m src.main run \
+                --site pharmonline \
+                --mode public_api \
+                --dry-run \
+                --no-alerts
+            then
+              publish_succeeded=1
+              break
+            fi
+            if [ "$publish_attempt" -lt 3 ]; then
+              echo "verified catalog publication attempt failed; waiting 60s before a fresh Decodo session" >&2
+              sleep 60
+            fi
+            publish_attempt=$((publish_attempt + 1))
+          done
+          test "$publish_succeeded" -eq 1
 
           BEFORE_RUN_ID="$before_run_id" PYTHONDONTWRITEBYTECODE=1 \
             PYTHONPATH="$runtime_dir" /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
