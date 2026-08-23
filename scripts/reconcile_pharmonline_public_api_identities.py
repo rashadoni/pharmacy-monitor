@@ -177,7 +177,9 @@ async def main(*, apply: bool) -> None:
                     trusted_ddp_item_count=metrics["trusted_ddp_identities"],
                     retired_ddp_item_count=metrics["retired_ddp_identities"],
                     reconciled_item_count=(
-                        metrics["reconciled_identities"] + metrics["legacy_rekeys_ready"]
+                        metrics["reconciled_identities"]
+                        + metrics["legacy_rekeys_ready"]
+                        + metrics["native_id_url_rebind_ready"]
                     ),
                     source_manifest_sha256=source_manifest_sha256,
                     catalog_fingerprint_sha256=fingerprint,

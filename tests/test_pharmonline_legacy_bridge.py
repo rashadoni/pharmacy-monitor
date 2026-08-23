@@ -6,6 +6,7 @@ import pytest
 
 from src import main as main_mod
 from src import storage
+from src.normalize import normalize_name
 from src.scrapers.base import ScrapedProduct, ScrapeResult
 from src.scrapers.pharmonline_public_api import PUBLIC_API_AVAILABILITY_SOURCE
 
@@ -19,15 +20,18 @@ def _stored_product(
     url: str,
     external_id: str = _METEOR_ID,
     availability_source: str | None = "pharmonline_ddp_total_count",
+    name: str = "Existing Pharmonline product",
+    barcode: str | None = None,
 ):
     return storage.Product(
         tenant_id=tenant_id,
         site="pharmonline",
         external_id=external_id,
         url=url,
-        name="Existing Pharmonline product",
-        name_normalized="existing pharmonline product",
+        name=name,
+        name_normalized=normalize_name(name),
         availability_source=availability_source,
+        barcode=barcode,
     )
 
 
@@ -183,14 +187,21 @@ def test_bridge_rejects_other_tenant_and_ambiguous_url_mappings(db_session):
         )
 
 
-def _public_api_product(url: str, external_id: str = _METEOR_ID) -> ScrapedProduct:
+def _public_api_product(
+    url: str,
+    external_id: str = _METEOR_ID,
+    *,
+    name: str = "Public API product",
+    barcode: str | None = None,
+) -> ScrapedProduct:
     return ScrapedProduct(
         site="pharmonline",
         external_id=external_id,
         url=url,
-        name="Public API product",
+        name=name,
         identity_verified=True,
         availability_source=PUBLIC_API_AVAILABILITY_SOURCE,
+        barcode=barcode,
     )
 
 
@@ -431,6 +442,21 @@ def test_public_api_reconciliation_rekeys_only_one_exact_non_ddp_legacy_url(db_s
     assert record.product_id == product_id
     assert record.legacy_external_id == "legacy-product-id"
     assert record.public_api_external_id == public.external_id
+    assert main_mod._pharmonline_public_api_recovery_tables_available(db_session)
+    assert record.proof_version == main_mod._PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION
+    assert record.source_manifest_sha256 == _RECOVERY_MANIFEST_SHA
+    assert record.catalog_fingerprint_sha256 == main_mod._pharmonline_public_api_catalog_fingerprint(
+        [ScrapeResult(site="pharmonline", products=[public])]
+    )
+    assert record.source_transport == "decodo"
+    assert record.preflight_run_ref == "123456"
+    valid_reconciliations, conflicts = main_mod._valid_pharmonline_public_api_reconciliations(
+        db_session,
+        [refreshed],
+        tenant_id=1,
+    )
+    assert conflicts == 0
+    assert valid_reconciliations == {public.external_id: refreshed}
     assert (
         main_mod._verify_pharmonline_public_api_identities(
             db_session,
@@ -438,6 +464,77 @@ def test_public_api_reconciliation_rekeys_only_one_exact_non_ddp_legacy_url(db_s
             tenant_id=1,
         )
         == 1
+    )
+
+
+def test_public_api_reconciliation_rebinds_native_id_only_with_barcode_and_name_proof(
+    db_session,
+):
+    old_url = "https://pharmonline.az/product/rebind-old-path"
+    new_url = "https://pharmonline.az/product/rebind-new-path"
+    name = "Rebind medicine 500 mg N20"
+    stored = _stored_product(
+        url=old_url,
+        name=name,
+        barcode="1234567890123",
+    )
+    db_session.add(stored)
+    db_session.commit()
+    product_id = stored.id
+
+    public = _public_api_product(
+        new_url,
+        name=name,
+        barcode="1234567890123",
+    )
+    metrics = _reconcile(db_session, [public])
+
+    refreshed = db_session.get(storage.Product, product_id)
+    record = db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).one()
+    assert metrics["native_id_url_rebind"] == 1
+    assert metrics["native_id_url_rebind_ready"] == 1
+    assert refreshed is not None
+    assert refreshed.id == product_id
+    assert refreshed.external_id == public.external_id
+    assert refreshed.url == new_url
+    assert record.product_id == product_id
+    assert record.legacy_canonical_url == old_url
+    assert record.public_api_canonical_url == new_url
+    assert record.proof_version == main_mod._PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION
+    assert (
+        main_mod._verify_pharmonline_public_api_identities(
+            db_session,
+            [ScrapeResult(site="pharmonline", products=[public])],
+            tenant_id=1,
+        )
+        == 1
+    )
+
+
+def test_public_api_reconciliation_refuses_native_id_rebind_without_two_signals(
+    db_session,
+):
+    old_url = "https://pharmonline.az/product/rebind-old-path"
+    new_url = "https://pharmonline.az/product/rebind-new-path"
+    stored = _stored_product(url=old_url, name="Old medicine 500 mg")
+    db_session.add(stored)
+    db_session.commit()
+
+    with pytest.raises(
+        main_mod.PharmonlinePublicAPIReconciliationError,
+        match="native_id_url_rebind_unproven=1",
+    ):
+        _reconcile(
+            db_session,
+            [_public_api_product(new_url, name="New medicine 500 mg")],
+        )
+
+    refreshed = db_session.get(storage.Product, stored.id)
+    assert refreshed is not None
+    assert refreshed.url == old_url
+    assert (
+        db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).count()
+        == 0
     )
 
 
@@ -493,6 +590,13 @@ def test_catalog_baseline_never_lowers_after_its_initial_recovery_proof(db_sessi
         preflight_run_ref="123456",
     )
     assert floor == 2
+    assert db_session.query(storage.PharmonlinePublicAPICatalogBaseline).count() == 1
+    assert (
+        db_session.query(storage.PharmonlinePublicAPICatalogBaseline)
+        .one()
+        .minimum_catalog_item_count
+        == 2
+    )
 
     one_product_results = [
         ScrapeResult(

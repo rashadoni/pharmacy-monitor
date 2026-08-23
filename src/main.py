@@ -71,6 +71,7 @@ _PHARMONLINE_METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
 _PHARMONLINE_DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
 _PHARMONLINE_PUBLIC_API_MIN_TRUSTED_COVERAGE = 0.98
 _PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION = "url_continuity_v1"
+_PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION = "native_id_url_continuity_v1"
 _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS = 9500
 _PHARMONLINE_PUBLIC_API_BASELINE_FRACTION_PER_THOUSAND = 980
@@ -123,12 +124,45 @@ def _canonical_pharmonline_product_url(raw_url: str | None) -> str | None:
 
 @dataclass(frozen=True)
 class _PharmonlinePublicAPIReconciliationAction:
-    """A fully prevalidated in-place legacy ID replacement."""
+    """A fully prevalidated in-place legacy identity continuity transition."""
 
     product_id: int
     legacy_external_id: str
     public_api_external_id: str
-    canonical_url: str
+    legacy_canonical_url: str
+    public_api_canonical_url: str
+    proof_version: str
+
+
+def _pharmonline_product_name_signature(value: str | None) -> str:
+    """Return a strict display-name signature without dropping SKU details."""
+    if not value:
+        return ""
+    from src.normalize import strip_accents
+
+    return re.sub(r"[^a-z0-9]+", "", strip_accents(value).lower())
+
+
+def _pharmonline_native_url_rebind_is_proven(
+    stored: storage.Product,
+    public_product: ScrapedProduct,
+) -> bool:
+    """Require two independent product signals before accepting a URL change.
+
+    A stable native ID alone does not prove that a product path was renamed
+    rather than reassigned. The public source must additionally carry the same
+    non-empty numeric barcode and an exact display-name signature that retains
+    dosage and pack information. If either signal is absent or differs, the
+    transition remains fail-closed for manual review.
+    """
+    stored_barcode = str(stored.barcode or "").strip()
+    public_barcode = str(public_product.barcode or "").strip()
+    return (
+        stored_barcode.isdigit()
+        and stored_barcode == public_barcode
+        and _pharmonline_product_name_signature(stored.name)
+        == _pharmonline_product_name_signature(public_product.name)
+    )
 
 
 def _pharmonline_public_api_recovery_tables_available(session: Session) -> bool:
@@ -267,14 +301,22 @@ def _valid_pharmonline_public_api_reconciliations(
         public_external_id = str(record.public_api_external_id)
         canonical_url = _canonical_pharmonline_product_url(record.public_api_canonical_url)
         legacy_url = _canonical_pharmonline_product_url(record.legacy_canonical_url)
+        exact_url_rekey = (
+            record.proof_version == _PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION
+            and canonical_url == legacy_url
+            and _PHARMONLINE_METEOR_ID_RE.fullmatch(str(record.legacy_external_id)) is None
+        )
+        native_url_rebind = (
+            record.proof_version == _PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION
+            and canonical_url != legacy_url
+            and str(record.legacy_external_id) == public_external_id
+        )
         if (
             product is None
-            or record.proof_version != _PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION
+            or not (exact_url_rekey or native_url_rebind)
             or _PHARMONLINE_METEOR_ID_RE.fullmatch(public_external_id) is None
             or canonical_url is None
             or legacy_url is None
-            or canonical_url != legacy_url
-            or _PHARMONLINE_METEOR_ID_RE.fullmatch(str(record.legacy_external_id)) is not None
             or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.source_manifest_sha256) is None
             or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256)
             is None
@@ -306,8 +348,8 @@ def _pharmonline_public_api_reconciliation_plan(
     A legacy row is eligible only when the public API's current canonical URL
     has exactly one row for this tenant, that row has no DDP lineage, its old
     identifier is not a native-looking ID, and the target native ID is unused
-    across every tenant.  URL changes under an existing native ID intentionally
-    remain a separate fail-closed case.
+    across every tenant. A native-ID URL change is accepted only with an exact
+    barcode plus full display-name proof; all other rebinding stays fail-closed.
     """
     api_records = _public_api_identity_records(results)
     product_statement = select(storage.Product).where(storage.Product.site == "pharmonline")
@@ -361,9 +403,11 @@ def _pharmonline_public_api_reconciliation_plan(
         "legacy_row_has_native_id": 0,
         "untrusted_existing_native_id": 0,
         "native_id_url_rebind": 0,
+        "native_id_url_rebind_ready": 0,
+        "native_id_url_rebind_unproven": 0,
         "reconciliation_record_conflict": reconciliation_conflicts,
     }
-    for external_id, (canonical_url, _) in api_records.items():
+    for external_id, (canonical_url, public_product) in api_records.items():
         trusted = trusted_by_id.get(external_id)
         if trusted is not None and _canonical_pharmonline_product_url(trusted.url) == canonical_url:
             metrics["already_trusted_identities"] += 1
@@ -381,6 +425,24 @@ def _pharmonline_public_api_reconciliation_plan(
             current = tenant_rows[0]
             if _canonical_pharmonline_product_url(current.url) != canonical_url:
                 metrics["native_id_url_rebind"] += 1
+                current_url = _canonical_pharmonline_product_url(current.url)
+                if current_url is None or not _pharmonline_native_url_rebind_is_proven(
+                    current,
+                    public_product,
+                ):
+                    metrics["native_id_url_rebind_unproven"] += 1
+                    continue
+                actions.append(
+                    _PharmonlinePublicAPIReconciliationAction(
+                        product_id=current.id,
+                        legacy_external_id=str(current.external_id),
+                        public_api_external_id=external_id,
+                        legacy_canonical_url=current_url,
+                        public_api_canonical_url=canonical_url,
+                        proof_version=_PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION,
+                    )
+                )
+                metrics["native_id_url_rebind_ready"] += 1
             else:
                 metrics["untrusted_existing_native_id"] += 1
             continue
@@ -408,7 +470,9 @@ def _pharmonline_public_api_reconciliation_plan(
                 product_id=legacy.id,
                 legacy_external_id=legacy_external_id,
                 public_api_external_id=external_id,
-                canonical_url=canonical_url,
+                legacy_canonical_url=canonical_url,
+                public_api_canonical_url=canonical_url,
+                proof_version=_PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION,
             )
         )
         metrics["legacy_rekeys_ready"] += 1
@@ -427,7 +491,7 @@ def _pharmonline_public_api_reconciliation_is_safe(metrics: dict[str, int]) -> b
             "legacy_row_has_ddp_lineage",
             "legacy_row_has_native_id",
             "untrusted_existing_native_id",
-            "native_id_url_rebind",
+            "native_id_url_rebind_unproven",
             "reconciliation_record_conflict",
         )
     )
@@ -462,7 +526,7 @@ def _apply_pharmonline_public_api_reconciliation(
     source_transport: str,
     preflight_run_ref: str,
 ) -> dict[str, int]:
-    """Apply only a completely prevalidated exact-URL legacy ID batch.
+    """Apply only a completely prevalidated identity continuity batch.
 
     Call this inside an explicit transaction owned by the dedicated recovery
     script.  It never deletes Products; all linked history remains attached to
@@ -497,21 +561,23 @@ def _apply_pharmonline_public_api_reconciliation(
             or product.tenant_id != tenant_id
             or product.site != "pharmonline"
             or str(product.external_id) != action.legacy_external_id
-            or _canonical_pharmonline_product_url(product.url) != action.canonical_url
+            or _canonical_pharmonline_product_url(product.url)
+            != action.legacy_canonical_url
         ):
             raise PharmonlinePublicAPIReconciliationError(
                 "public Pharmonline reconciliation state changed before apply"
             )
         product.external_id = action.public_api_external_id
+        product.url = action.public_api_canonical_url
         session.add(
             storage.PharmonlinePublicAPIIdentityReconciliation(
                 tenant_id=tenant_id,
                 product_id=product.id,
                 legacy_external_id=action.legacy_external_id,
                 public_api_external_id=action.public_api_external_id,
-                legacy_canonical_url=action.canonical_url,
-                public_api_canonical_url=action.canonical_url,
-                proof_version=_PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION,
+                legacy_canonical_url=action.legacy_canonical_url,
+                public_api_canonical_url=action.public_api_canonical_url,
+                proof_version=action.proof_version,
                 source_manifest_sha256=source_manifest_sha256,
                 catalog_fingerprint_sha256=catalog_fingerprint_sha256,
                 source_transport=source_transport,
