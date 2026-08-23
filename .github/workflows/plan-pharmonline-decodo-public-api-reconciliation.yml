@@ -208,6 +208,7 @@ jobs:
           PHARMONLINE_PUBLIC_API=required \
           PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
           PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
+          PHARMONLINE_PUBLIC_API_PLAN_EVIDENCE_PATH="$work_dir/plan-evidence.json" \
           PHARMONLINE_USE_DDP=0 \
           AI_FALLBACK_ENABLED=0 \
           SCRAPE_REPORT_EMAIL=0 \
@@ -216,6 +217,48 @@ jobs:
           /opt/pharmacy-monitor/.venv/bin/python \
             "$runtime_dir/scripts/reconcile_pharmonline_public_api_identities.py"
           REMOTE
+
+          scp -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            "pm@46.225.149.52:$remote_work_dir/plan-evidence.json" \
+            "$plan_evidence_dir/reconciliation-plan.json"
+          PLAN_EVIDENCE_FILE="$plan_evidence_dir/reconciliation-plan.json" \
+            python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["PLAN_EVIDENCE_FILE"])
+          data = json.loads(path.read_text())
+          required = {
+              "version",
+              "transport",
+              "product_count",
+              "catalog_fingerprint_sha256",
+              "candidate_manifest_sha256",
+              "metrics",
+          }
+          if set(data) != required:
+              raise SystemExit("unexpected reconciliation plan evidence shape")
+          if data["version"] != 2 or data["transport"] != "decodo":
+              raise SystemExit("reconciliation plan evidence transport/version is invalid")
+          if not isinstance(data["product_count"], int) or data["product_count"] < 9500:
+              raise SystemExit("reconciliation plan evidence product count is invalid")
+          for key in ("catalog_fingerprint_sha256", "candidate_manifest_sha256"):
+              value = data[key]
+              if not isinstance(value, str) or len(value) != 64 or any(
+                  character not in "0123456789abcdef" for character in value
+              ):
+                  raise SystemExit(f"reconciliation plan evidence {key} is invalid")
+          if data["metrics"].get("reconciliation_safe") != 1:
+              raise SystemExit("reconciliation plan evidence is not safe")
+          print(
+              "aggregate reconciliation evidence retained: "
+              f"products={data['product_count']}, version={data['version']}"
+          )
+          PY
 
       - name: Retain exact plan manifest
         if: ${{ success() && env.PLAN_EVIDENCE_DIR != '' }}

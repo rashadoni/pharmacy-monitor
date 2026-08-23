@@ -87,6 +87,50 @@ jobs:
           git ls-files -z -- src scripts/reconcile_pharmonline_public_api_identities.py |
             xargs -0 sha256sum | LC_ALL=C sort > "$current_plan_manifest"
           cmp -s -- "$plan_evidence_dir/source-manifest" "$current_plan_manifest"
+          PLAN_EVIDENCE_FILE="$plan_evidence_dir/reconciliation-plan.json" \
+            python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          data = json.loads(Path(os.environ["PLAN_EVIDENCE_FILE"]).read_text())
+          required = {
+              "version",
+              "transport",
+              "product_count",
+              "catalog_fingerprint_sha256",
+              "candidate_manifest_sha256",
+              "metrics",
+          }
+          if set(data) != required or data["version"] != 2 or data["transport"] != "decodo":
+              raise SystemExit("approved reconciliation plan evidence is invalid")
+          if not isinstance(data["product_count"], int) or data["product_count"] < 9500:
+              raise SystemExit("approved reconciliation plan product count is invalid")
+          for key in ("catalog_fingerprint_sha256", "candidate_manifest_sha256"):
+              value = data[key]
+              if not isinstance(value, str) or len(value) != 64 or any(
+                  character not in "0123456789abcdef" for character in value
+              ):
+                  raise SystemExit(f"approved reconciliation plan {key} is invalid")
+          metrics = data["metrics"]
+          if not isinstance(metrics, dict) or metrics.get("reconciliation_safe") != 1:
+              raise SystemExit("approved reconciliation plan is not safe")
+          github_env = Path(os.environ["GITHUB_ENV"])
+          with github_env.open("a") as output:
+              output.write(
+                  "PLAN_CATALOG_FINGERPRINT_SHA256="
+                  f"{data['catalog_fingerprint_sha256']}\n"
+              )
+              output.write(
+                  "PLAN_CANDIDATE_MANIFEST_SHA256="
+                  f"{data['candidate_manifest_sha256']}\n"
+              )
+              output.write(f"PLAN_PRODUCT_COUNT={data['product_count']}\n")
+          print(
+              "exact aggregate reconciliation plan evidence verified: "
+              f"products={data['product_count']}"
+          )
+          PY
           echo "verified_plan_manifest_sha256=$expected_plan_manifest_sha"
 
       - name: Setup production SSH key
@@ -226,17 +270,31 @@ jobs:
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
             pm@46.225.149.52 \
-            "bash -s -- '$remote_work_dir' '$source_manifest_sha' '$PLAN_RUN_ID'" <<'REMOTE'
+            "bash -s -- '$remote_work_dir' '$source_manifest_sha' '$PLAN_RUN_ID' '$PLAN_CATALOG_FINGERPRINT_SHA256' '$PLAN_CANDIDATE_MANIFEST_SHA256' '$PLAN_PRODUCT_COUNT'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
           source_manifest_sha=$2
           plan_run_id=$3
+          expected_plan_fingerprint=$4
+          expected_plan_manifest=$5
+          expected_plan_product_count=$6
           case "$work_dir" in
             /opt/pharmacy-monitor/.codex-decodo-reconciliation-apply.*) ;;
             *)
               echo "unexpected remote reconciliation apply path" >&2
               exit 1
               ;;
+          esac
+          if [[ ! "$expected_plan_fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "invalid approved catalog fingerprint" >&2
+            exit 1
+          fi
+          if [[ ! "$expected_plan_manifest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "invalid approved candidate manifest" >&2
+            exit 1
+          fi
+          case "$expected_plan_product_count" in
+            ''|*[!0-9]*) echo "invalid approved product count" >&2; exit 1 ;;
           esac
           runtime_dir="$work_dir/runtime"
           test "$(sha256sum "$work_dir/incoming/source-manifest" | awk '{print $1}')" = \
@@ -354,7 +412,7 @@ jobs:
             /opt/pharmacy-monitor/.venv/bin/python -m alembic -c "$runtime_dir/alembic.ini" upgrade head
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python -m alembic -c "$runtime_dir/alembic.ini" current | \
-            grep -F '0019_public_api_reconcile'
+            grep -F '0020_public_api_admissions'
 
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
@@ -376,6 +434,9 @@ jobs:
           SCRAPE_REPORT_EMAIL=0 \
           PHARMONLINE_PUBLIC_API_SOURCE_MANIFEST_SHA256="$source_manifest_sha" \
           PHARMONLINE_PUBLIC_API_PREFLIGHT_RUN_REF="$plan_run_id" \
+          PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_CATALOG_FINGERPRINT_SHA256="$expected_plan_fingerprint" \
+          PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_MANIFEST_SHA256="$expected_plan_manifest" \
+          PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_PRODUCT_COUNT="$expected_plan_product_count" \
           PYTHONDONTWRITEBYTECODE=1 \
           PYTHONPATH="$runtime_dir" \
           /opt/pharmacy-monitor/.venv/bin/python \

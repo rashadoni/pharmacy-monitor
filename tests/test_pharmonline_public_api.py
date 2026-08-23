@@ -15,7 +15,9 @@ from src.scrapers.pharmonline_public_api import (
     PharmonlinePublicAPIScraper,
     _canonical_product_url,
     _configured_decodo_ports,
+    _html_proves_public_product_identity,
     _json_from_rendered_body,
+    _same_origin_product_redirect_url,
     _same_origin_sitemap_url,
     _sitemap_covers_api_catalog,
     is_retryable_full_catalog_abort_reason,
@@ -787,6 +789,66 @@ async def test_decodo_direct_request_rejects_exhausted_proxy_without_url_leakage
             crawlbase_session="decodo-catalog-test",
         )
     assert "@" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_decodo_redirect_proof_requires_direct_permanent_identity_witness(monkeypatch):
+    old_url = "https://pharmonline.az/product/old-path"
+    new_url = "https://pharmonline.az/product/new-path"
+    native_id = "xwJspdCx3iFBDqDWF"
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._public_api_transport = "decodo"
+    scraper._decodo_ports = (30001,)
+    scraper._decodo_session_ports = {}
+
+    class _Response:
+        def __init__(self, status_code: int, *, headers=None, text: str = "") -> None:
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.text = text
+
+    class _Client:
+        async def get(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            follow_redirects: bool,
+        ) -> _Response:
+            assert headers == {"accept": "text/html,application/xhtml+xml"}
+            assert follow_redirects is False
+            if url == old_url:
+                return _Response(308, headers={"location": new_url})
+            assert url == new_url
+            return _Response(
+                200,
+                text=(
+                    f'<link rel="canonical" href="{new_url}">'
+                    f'<script>{{"_id":"{native_id}"}}</script>'
+                ),
+            )
+
+    monkeypatch.setattr(scraper, "_decodo_client_for_context", lambda _context, _port: _Client())
+    assert await scraper.prove_product_url_redirect(
+        legacy_url=old_url,
+        public_api_url=new_url,
+        public_api_external_id=native_id,
+    )
+
+
+def test_redirect_helpers_reject_cross_origin_or_missing_embedded_identity():
+    current = "https://pharmonline.az/product/old-path"
+    assert (
+        _same_origin_product_redirect_url(current, "https://other.example/product/new-path") is None
+    )
+    assert _same_origin_product_redirect_url(current, "/product/new-path?lng=az") == (
+        "https://pharmonline.az/product/new-path"
+    )
+    assert not _html_proves_public_product_identity(
+        '<link rel="canonical" href="https://pharmonline.az/product/new-path">',
+        canonical_url="https://pharmonline.az/product/new-path",
+        external_id="xwJspdCx3iFBDqDWF",
+    )
 
 
 def test_product_mapper_marks_explicit_zero_stock_and_current_price():

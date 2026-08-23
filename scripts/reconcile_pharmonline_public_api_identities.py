@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+from pathlib import Path
 from typing import NoReturn
 
 from sqlalchemy import text
@@ -24,7 +26,10 @@ from src.main import (
     _diagnose_pharmonline_public_api_reconciliation,
     _ensure_pharmonline_public_api_catalog_baseline,
     _pharmonline_public_api_catalog_fingerprint,
+    _pharmonline_public_api_reconciliation_plan,
+    _pharmonline_public_api_reconciliation_plan_manifest_sha256,
     _pharmonline_public_api_reconciliation_is_safe,
+    _pharmonline_public_api_redirect_challenges,
     _verify_pharmonline_public_api_identities,
 )
 from src.run_lock import try_exclusive_scrape_lock
@@ -114,12 +119,82 @@ def _workflow_evidence() -> tuple[str, str]:
     return source_manifest_sha256, preflight_run_ref
 
 
+def _expected_plan_evidence() -> tuple[str, str, int]:
+    """Read only the non-sensitive immutable output of the successful plan."""
+    fingerprint = os.environ.get(
+        "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_CATALOG_FINGERPRINT_SHA256", ""
+    ).strip()
+    manifest = os.environ.get("PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_MANIFEST_SHA256", "").strip()
+    raw_count = os.environ.get("PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_PRODUCT_COUNT", "").strip()
+    if len(fingerprint) != 64 or len(manifest) != 64 or not raw_count.isdigit():
+        fail("--apply requires the exact successful plan evidence artifact")
+    return fingerprint, manifest, int(raw_count)
+
+
+async def read_two_redirect_proofs(challenges, *, transport: str):
+    """Require two fresh direct first-party redirect observations per move."""
+    if not challenges:
+        return ()
+    if transport != "decodo":
+        fail("native URL redirect proof requires the explicit Decodo transport")
+
+    async def read_pass() -> tuple:
+        async with PharmonlinePublicAPIScraper() as scraper:
+            proven = []
+            for challenge in challenges:
+                if await scraper.prove_product_url_redirect(
+                    legacy_url=challenge.legacy_canonical_url,
+                    public_api_url=challenge.public_api_canonical_url,
+                    public_api_external_id=challenge.public_api_external_id,
+                ):
+                    proven.append(challenge)
+            return tuple(proven)
+
+    first_pass = await read_pass()
+    second_pass = await read_pass()
+    if first_pass != second_pass:
+        fail("two fresh permanent-redirect proof passes disagree")
+    return first_pass
+
+
+def write_plan_evidence(
+    *,
+    transport: str,
+    product_count: int,
+    catalog_fingerprint_sha256: str,
+    candidate_manifest_sha256: str,
+    metrics: dict[str, int],
+) -> None:
+    """Persist aggregate-only evidence for the exact gated apply workflow."""
+    raw_path = os.environ.get("PHARMONLINE_PUBLIC_API_PLAN_EVIDENCE_PATH", "").strip()
+    if not raw_path:
+        return
+    path = Path(raw_path)
+    payload = {
+        "version": 2,
+        "transport": transport,
+        "product_count": product_count,
+        "catalog_fingerprint_sha256": catalog_fingerprint_sha256,
+        "candidate_manifest_sha256": candidate_manifest_sha256,
+        "metrics": metrics,
+    }
+    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+
+
 async def main(*, apply: bool) -> None:
     transport = _transport()
     source_manifest_sha256 = ""
     preflight_run_ref = ""
+    expected_plan_fingerprint = ""
+    expected_plan_manifest = ""
+    expected_plan_product_count = 0
     if apply:
         source_manifest_sha256, preflight_run_ref = _workflow_evidence()
+        (
+            expected_plan_fingerprint,
+            expected_plan_manifest,
+            expected_plan_product_count,
+        ) = _expected_plan_evidence()
 
     # Take the producer lock before the first source read.  Both the plan and
     # apply paths prove a catalog sequence against mutable product state, so a
@@ -136,6 +211,25 @@ async def main(*, apply: bool) -> None:
                 verified_catalog = await read_two_identical_catalogs()
                 results = [verified_catalog]
                 fingerprint = _pharmonline_public_api_catalog_fingerprint(results)
+                redirect_challenges = _pharmonline_public_api_redirect_challenges(
+                    session,
+                    results,
+                    tenant_id=1,
+                )
+                # The challenge lookup starts an ORM transaction.  End it
+                # before any network I/O; the dedicated advisory lock remains
+                # held for the full source proof and apply sequence.
+                session.rollback()
+                redirect_proofs = await read_two_redirect_proofs(
+                    redirect_challenges,
+                    transport=transport,
+                )
+
+                if apply and (
+                    fingerprint != expected_plan_fingerprint
+                    or len(verified_catalog.products) != expected_plan_product_count
+                ):
+                    fail("fresh catalog differs from the approved read-only plan")
 
                 if not apply:
                     session.execute(
@@ -150,6 +244,20 @@ async def main(*, apply: bool) -> None:
                         session,
                         results,
                         tenant_id=1,
+                        redirect_proofs=redirect_proofs,
+                    )
+                    actions, admissions, plan_metrics = _pharmonline_public_api_reconciliation_plan(
+                        session,
+                        results,
+                        tenant_id=1,
+                        redirect_proofs=redirect_proofs,
+                    )
+                    plan_manifest_sha256 = (
+                        _pharmonline_public_api_reconciliation_plan_manifest_sha256(
+                            actions,
+                            admissions,
+                            plan_metrics,
+                        )
                     )
                     session.rollback()
                 else:
@@ -162,6 +270,8 @@ async def main(*, apply: bool) -> None:
                         catalog_fingerprint_sha256=fingerprint,
                         source_transport=transport,
                         preflight_run_ref=preflight_run_ref,
+                        redirect_proofs=redirect_proofs,
+                        expected_plan_manifest_sha256=expected_plan_manifest,
                     )
                     catalog_floor = _ensure_pharmonline_public_api_catalog_baseline(
                         session,
@@ -174,6 +284,9 @@ async def main(*, apply: bool) -> None:
                             metrics["reconciled_identities"]
                             + metrics["legacy_rekeys_ready"]
                             + metrics["native_id_url_rebind_ready"]
+                            + metrics["native_id_url_rebind_redirect_ready"]
+                            + metrics["existing_native_admissions_ready"]
+                            + metrics["new_public_product_admissions_ready"]
                         ),
                         source_manifest_sha256=source_manifest_sha256,
                         catalog_fingerprint_sha256=fingerprint,
@@ -200,6 +313,13 @@ async def main(*, apply: bool) -> None:
         )
         if not _pharmonline_public_api_reconciliation_is_safe(diagnostics):
             fail("one or more legacy identity transitions require manual proof")
+        write_plan_evidence(
+            transport=transport,
+            product_count=len(verified_catalog.products),
+            catalog_fingerprint_sha256=fingerprint,
+            candidate_manifest_sha256=plan_manifest_sha256,
+            metrics=diagnostics,
+        )
         return
 
     metric_text = ", ".join(f"{key}={value}" for key, value in sorted(metrics.items()))

@@ -57,6 +57,7 @@ _ORIGIN_CONTEXT_HEADERS = (
     "x-cache",
 )
 _MAX_CRAWLBASE_ATTEMPTS = 2
+_PERMANENT_REDIRECT_STATUSES = frozenset({301, 308})
 # ScraperAPI's proxy port can return a short-lived gateway response even when
 # the same public endpoint is otherwise healthy.  Its own documentation asks
 # callers to retry unsuccessful responses; keep that retry bounded and retain
@@ -251,6 +252,65 @@ def _canonical_product_url(value: Any, *, source_is_path: bool) -> str | None:
     if not slug or "/" in slug:
         return None
     return f"{_BASE_URL}/product/{quote(slug, safe='-._~')}"
+
+
+def _same_origin_product_redirect_url(current_url: str, location: Any) -> str | None:
+    """Canonicalize a redirect target without allowing an arbitrary fetch."""
+    raw_location = _text(location)
+    if raw_location is None:
+        return None
+    resolved = urljoin(current_url, raw_location)
+    parsed = urlsplit(resolved)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if parsed.scheme != "https" or host != "pharmonline.az":
+        return None
+    # Tracking query strings and fragments cannot change the product identity;
+    # omit them before passing the URL through the strict product canonicalizer.
+    return _canonical_product_url(f"{_BASE_URL}{parsed.path}", source_is_path=False)
+
+
+def _html_proves_public_product_identity(
+    document: str,
+    *,
+    canonical_url: str,
+    external_id: str,
+) -> bool:
+    """Require first-party page canonical and embedded native-ID witnesses.
+
+    A redirect alone can point at a generic page.  The destination must also
+    expose the expected canonical URL plus its exact public product ID in the
+    first-party HTML/hydration payload.  This parser returns only a boolean so
+    recovery logging never contains product names, paths, or response bodies.
+    """
+    decoded = html.unescape(document)
+    canonical_witness = False
+    for tag in re.findall(r"<(?:link|meta)\b[^>]*>", decoded, flags=re.I):
+        attributes: dict[str, str] = {}
+        for match in re.finditer(
+            r"""([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?""",
+            tag,
+        ):
+            name = match.group(1).lower()
+            value = next((item for item in match.groups()[1:] if item is not None), "")
+            attributes[name] = value
+        rel = attributes.get("rel", "").lower().split()
+        if ("canonical" in rel and attributes.get("href") == canonical_url) or (
+            attributes.get("property", "").lower() == "og:url"
+            and attributes.get("content") == canonical_url
+        ):
+            canonical_witness = True
+            break
+    if not canonical_witness:
+        return False
+
+    encoded_id = re.escape(external_id)
+    return bool(
+        re.search(
+            rf"""(?:["'](?:_id|id|productId|product_id)["']|data-(?:product-)?id)\s*[:=]\s*["']{encoded_id}["']""",
+            decoded,
+            flags=re.I,
+        )
+    )
 
 
 def _same_origin_sitemap_url(value: Any) -> str | None:
@@ -694,6 +754,98 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             raise PharmonlinePublicAPIError(f"decodo_http_{response.status_code}")
         self._record_origin_headers(target_url, response.headers)
         return response.text
+
+    async def _decodo_redirect_response(
+        self,
+        target_url: str,
+        *,
+        crawlbase_session: str,
+    ) -> httpx.Response:
+        """Read one redirect hop without following or exposing its target."""
+        context = self._decodo_context(crawlbase_session)
+        port = self._decodo_port_for_context(context)
+        client = self._decodo_client_for_context(context, port)
+        for attempt in range(1, _MAX_CRAWLBASE_ATTEMPTS + 1):
+            try:
+                response = await client.get(
+                    target_url,
+                    headers={"accept": "text/html,application/xhtml+xml"},
+                    follow_redirects=False,
+                )
+                break
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                if attempt == _MAX_CRAWLBASE_ATTEMPTS:
+                    raise PharmonlinePublicAPIError("decodo_redirect_request_failed") from None
+                log.warning(
+                    "pharmonline_public_api_transport_retry",
+                    transport=_DECODO_TRANSPORT,
+                    resource=urlsplit(target_url).path,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                )
+                await asyncio.sleep(1)
+            except httpx.HTTPError as exc:
+                proxy_reason = fatal_proxy_reason(exc)
+                if proxy_reason is not None:
+                    raise SiteScrapeFatalError(proxy_reason) from None
+                raise PharmonlinePublicAPIError("decodo_redirect_request_failed") from None
+        if response.status_code in {402, 407}:
+            raise SiteScrapeFatalError(f"Decodo proxy access rejected: HTTP {response.status_code}")
+        self._record_origin_headers(target_url, response.headers)
+        return response
+
+    async def prove_product_url_redirect(
+        self,
+        *,
+        legacy_url: str,
+        public_api_url: str,
+        public_api_external_id: str,
+    ) -> bool:
+        """Prove one native-ID URL move through direct permanent redirects.
+
+        This proof is intentionally limited to Decodo recovery.  It accepts a
+        single first-party 301/308 from the stored URL directly to the current
+        public API URL, then requires the final page to expose both its
+        canonical URL and the same native ID.  Temporary, cross-origin,
+        multi-hop, JS and soft redirects all fail closed.
+        """
+        if self._transport_name() != _DECODO_TRANSPORT:
+            raise PharmonlinePublicAPIError("native_url_redirect_proof_requires_decodo")
+        legacy_canonical = _canonical_product_url(legacy_url, source_is_path=False)
+        public_canonical = _canonical_product_url(public_api_url, source_is_path=False)
+        if (
+            legacy_canonical is None
+            or public_canonical is None
+            or legacy_canonical == public_canonical
+            or _METEOR_ID_RE.fullmatch(public_api_external_id) is None
+        ):
+            return False
+        context = f"decodo-redirect-proof-{secrets.token_hex(16)}"
+        redirect = await self._decodo_redirect_response(
+            legacy_canonical,
+            crawlbase_session=context,
+        )
+        if redirect.status_code not in _PERMANENT_REDIRECT_STATUSES:
+            return False
+        if (
+            _same_origin_product_redirect_url(
+                legacy_canonical,
+                redirect.headers.get("location"),
+            )
+            != public_canonical
+        ):
+            return False
+        final = await self._decodo_redirect_response(
+            public_canonical,
+            crawlbase_session=context,
+        )
+        if final.status_code != 200:
+            return False
+        return _html_proves_public_product_identity(
+            final.text,
+            canonical_url=public_canonical,
+            external_id=public_api_external_id,
+        )
 
     def _scraperapi_context(self, session: str | None) -> str:
         if session is not None:

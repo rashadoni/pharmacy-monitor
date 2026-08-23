@@ -72,6 +72,11 @@ _PHARMONLINE_DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
 _PHARMONLINE_PUBLIC_API_MIN_TRUSTED_COVERAGE = 0.98
 _PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION = "url_continuity_v1"
 _PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION = "native_id_url_continuity_v1"
+_PHARMONLINE_PUBLIC_API_REDIRECT_REBIND_PROOF_VERSION = "native_id_redirect_continuity_v1"
+_PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION = "public_api_identity_admission_v1"
+_PHARMONLINE_PUBLIC_API_ADMISSION_KINDS = frozenset(
+    {"existing_native_id", "new_public_product"}
+)
 _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS = 9500
 _PHARMONLINE_PUBLIC_API_BASELINE_FRACTION_PER_THOUSAND = 980
@@ -134,6 +139,27 @@ class _PharmonlinePublicAPIReconciliationAction:
     proof_version: str
 
 
+@dataclass(frozen=True)
+class _PharmonlinePublicAPIIdentityAdmissionAction:
+    """A current public identity which is safe to admit without a rekey."""
+
+    product_id: int | None
+    admission_kind: str
+    public_api_external_id: str
+    public_api_canonical_url: str
+    public_product: ScrapedProduct
+
+
+@dataclass(frozen=True)
+class _PharmonlinePublicAPIRedirectProof:
+    """A strict live first-party redirect witness for one native-ID URL move."""
+
+    product_id: int
+    public_api_external_id: str
+    legacy_canonical_url: str
+    public_api_canonical_url: str
+
+
 def _pharmonline_product_name_signature(value: str | None) -> str:
     """Return a strict display-name signature without dropping SKU details."""
     if not value:
@@ -174,6 +200,7 @@ def _pharmonline_public_api_recovery_tables_available(session: Session) -> bool:
     tables = set(inspect(session.connection()).get_table_names())
     return {
         "pharmonline_public_api_identity_reconciliations",
+        "pharmonline_public_api_identity_admissions",
         "pharmonline_public_api_catalog_baselines",
     }.issubset(tables)
 
@@ -335,7 +362,11 @@ def _pharmonline_public_api_reconciliation_invalid_reason(
         and _PHARMONLINE_METEOR_ID_RE.fullmatch(str(record.legacy_external_id)) is None
     )
     native_url_rebind = (
-        record.proof_version == _PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION
+        record.proof_version
+        in {
+            _PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION,
+            _PHARMONLINE_PUBLIC_API_REDIRECT_REBIND_PROOF_VERSION,
+        }
         and canonical_url != legacy_url
         and str(record.legacy_external_id) == public_external_id
     )
@@ -360,20 +391,138 @@ def _pharmonline_public_api_reconciliation_invalid_reason(
     return None
 
 
+def _valid_pharmonline_public_api_identity_admissions(
+    session: Session,
+    products: list[storage.Product],
+    *,
+    tenant_id: int,
+) -> tuple[dict[str, storage.Product], int]:
+    """Return only immutable public-source admissions matching live Products."""
+    if not _pharmonline_public_api_recovery_tables_available(session):
+        return {}, 0
+
+    products_by_id = {product.id: product for product in products}
+    admitted_by_id: dict[str, storage.Product] = {}
+    conflicting_ids: set[str] = set()
+    records = (
+        session.query(storage.PharmonlinePublicAPIIdentityAdmission)
+        .filter(storage.PharmonlinePublicAPIIdentityAdmission.tenant_id == tenant_id)
+        .all()
+    )
+    for record in records:
+        product = products_by_id.get(record.product_id)
+        if _pharmonline_public_api_admission_invalid_reason(record, product) is not None:
+            continue
+        public_external_id = str(record.public_api_external_id)
+        previous = admitted_by_id.get(public_external_id)
+        if previous is not None and previous.id != product.id:
+            conflicting_ids.add(public_external_id)
+            continue
+        admitted_by_id[public_external_id] = product
+    for external_id in conflicting_ids:
+        admitted_by_id.pop(external_id, None)
+    return admitted_by_id, len(conflicting_ids)
+
+
+def _pharmonline_public_api_admission_invalid_reason(
+    record: storage.PharmonlinePublicAPIIdentityAdmission,
+    product: storage.Product | None,
+) -> str | None:
+    """Return an aggregate-safe reason when a public admission is unusable."""
+    if product is None:
+        return "product_missing"
+    public_external_id = str(record.public_api_external_id)
+    canonical_url = _canonical_pharmonline_product_url(record.public_api_canonical_url)
+    if record.admission_kind not in _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS:
+        return "admission_kind"
+    if record.proof_version != _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION:
+        return "proof_version"
+    if _PHARMONLINE_METEOR_ID_RE.fullmatch(public_external_id) is None:
+        return "public_id"
+    if canonical_url is None:
+        return "canonical_url"
+    if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.source_manifest_sha256) is None:
+        return "source_manifest"
+    if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256) is None:
+        return "catalog_fingerprint"
+    if record.source_transport not in {"crawlbase", "decodo", "scraperapi"}:
+        return "transport"
+    if re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None:
+        return "preflight_run"
+    if (
+        product.tenant_id != record.tenant_id
+        or product.site != "pharmonline"
+        or str(product.external_id) != public_external_id
+        or _canonical_pharmonline_product_url(product.url) != canonical_url
+    ):
+        return "product_identity"
+    return None
+
+
+def _pharmonline_public_api_redirect_challenges(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+) -> tuple[_PharmonlinePublicAPIRedirectProof, ...]:
+    """Find only strict native-ID URL moves that need live redirect evidence.
+
+    The return value deliberately stays in-process.  It contains canonical
+    URLs only long enough for the reconciliation script to request the old
+    first-party path through Decodo; callers must never log or serialize it.
+    """
+    api_records = _public_api_identity_records(results)
+    all_site_products = session.scalars(
+        select(storage.Product).where(storage.Product.site == "pharmonline")
+    ).all()
+    all_by_external_id: dict[str, list[storage.Product]] = {}
+    for product in all_site_products:
+        all_by_external_id.setdefault(str(product.external_id), []).append(product)
+
+    challenges: list[_PharmonlinePublicAPIRedirectProof] = []
+    for external_id, (canonical_url, public_product) in api_records.items():
+        global_rows = all_by_external_id.get(external_id, [])
+        tenant_rows = [row for row in global_rows if row.tenant_id == tenant_id]
+        if len(global_rows) != 1 or len(tenant_rows) != 1:
+            continue
+        current = tenant_rows[0]
+        current_url = _canonical_pharmonline_product_url(current.url)
+        if (
+            current_url is None
+            or current_url == canonical_url
+            or _pharmonline_native_url_rebind_is_proven(current, public_product)
+        ):
+            continue
+        challenges.append(
+            _PharmonlinePublicAPIRedirectProof(
+                product_id=current.id,
+                public_api_external_id=external_id,
+                legacy_canonical_url=current_url,
+                public_api_canonical_url=canonical_url,
+            )
+        )
+    return tuple(challenges)
+
+
 def _pharmonline_public_api_reconciliation_plan(
     session: Session,
     results: list[ScrapeResult],
     *,
     tenant_id: int,
     lock_products: bool = False,
-) -> tuple[list[_PharmonlinePublicAPIReconciliationAction], dict[str, int]]:
-    """Plan exact URL-continuous legacy→native ID changes without writing.
+    redirect_proofs: tuple[_PharmonlinePublicAPIRedirectProof, ...] = (),
+) -> tuple[
+    list[_PharmonlinePublicAPIReconciliationAction],
+    list[_PharmonlinePublicAPIIdentityAdmissionAction],
+    dict[str, int],
+]:
+    """Classify every current public identity into a strict recovery class.
 
-    A legacy row is eligible only when the public API's current canonical URL
-    has exactly one row for this tenant, that row has no DDP lineage, its old
-    identifier is not a native-looking ID, and the target native ID is unused
-    across every tenant. A native-ID URL change is accepted only with an exact
-    barcode plus full display-name proof; all other rebinding stays fail-closed.
+    The plan is deliberately exhaustive: every verified public API identity
+    must be either already trusted DDP/audit lineage, an exact legacy rekey, a
+    two-signal or first-party-permanent-redirect native URL rebind, an exact
+    existing-native attestation, or a genuinely new public product.  Anything
+    outside those classes stays fail-closed and no mutation is possible.
     """
     api_records = _public_api_identity_records(results)
     product_statement = select(storage.Product).where(storage.Product.site == "pharmonline")
@@ -384,14 +533,17 @@ def _pharmonline_public_api_reconciliation_plan(
 
     all_by_external_id: dict[str, list[storage.Product]] = {}
     tenant_by_external_id: dict[str, list[storage.Product]] = {}
+    all_by_url: dict[str, list[storage.Product]] = {}
     tenant_by_url: dict[str, list[storage.Product]] = {}
     for product in all_site_products:
         external_id = str(product.external_id)
         all_by_external_id.setdefault(external_id, []).append(product)
+        canonical_url = _canonical_pharmonline_product_url(product.url)
+        if canonical_url is not None:
+            all_by_url.setdefault(canonical_url, []).append(product)
         if product.tenant_id != tenant_id:
             continue
         tenant_by_external_id.setdefault(external_id, []).append(product)
-        canonical_url = _canonical_pharmonline_product_url(product.url)
         if canonical_url is not None:
             tenant_by_url.setdefault(canonical_url, []).append(product)
 
@@ -405,31 +557,58 @@ def _pharmonline_public_api_reconciliation_plan(
         tenant_products,
         tenant_id=tenant_id,
     )
+    admitted_by_id, admission_conflicts = _valid_pharmonline_public_api_identity_admissions(
+        session,
+        tenant_products,
+        tenant_id=tenant_id,
+    )
     trusted_by_id = dict(ddp_by_id)
-    for external_id, product in reconciled_by_id.items():
-        trusted = trusted_by_id.get(external_id)
-        if trusted is None or trusted.id == product.id:
-            trusted_by_id[external_id] = product
+    trusted_identity_conflicts = 0
+    for evidence_by_id in (reconciled_by_id, admitted_by_id):
+        for external_id, product in evidence_by_id.items():
+            trusted = trusted_by_id.get(external_id)
+            if trusted is None:
+                trusted_by_id[external_id] = product
+            elif trusted.id != product.id:
+                trusted_identity_conflicts += 1
+
+    redirect_proof_keys = {
+        (
+            proof.product_id,
+            proof.public_api_external_id,
+            proof.legacy_canonical_url,
+            proof.public_api_canonical_url,
+        )
+        for proof in redirect_proofs
+    }
 
     actions: list[_PharmonlinePublicAPIReconciliationAction] = []
+    admissions: list[_PharmonlinePublicAPIIdentityAdmissionAction] = []
     metrics = {
         "api_identities": len(api_records),
         "trusted_ddp_identities": len(ddp_by_id),
         "reconciled_identities": len(reconciled_by_id),
+        "admitted_identities": len(admitted_by_id),
         "retired_ddp_identities": len(set(ddp_by_id) - set(api_records)),
         "already_trusted_identities": 0,
         "legacy_rekeys_ready": 0,
+        "existing_native_admissions_ready": 0,
+        "new_public_product_admissions_ready": 0,
         "target_id_cross_tenant": 0,
         "target_id_duplicate": 0,
-        "legacy_url_missing": 0,
         "legacy_url_ambiguous": 0,
+        "legacy_url_cross_tenant": 0,
         "legacy_row_has_ddp_lineage": 0,
         "legacy_row_has_native_id": 0,
-        "untrusted_existing_native_id": 0,
+        "admission_url_cross_tenant": 0,
+        "admission_url_conflict": 0,
         "native_id_url_rebind": 0,
         "native_id_url_rebind_ready": 0,
+        "native_id_url_rebind_redirect_ready": 0,
         "native_id_url_rebind_unproven": 0,
         "reconciliation_record_conflict": reconciliation_conflicts,
+        "admission_record_conflict": admission_conflicts,
+        "trusted_identity_conflict": trusted_identity_conflicts,
     }
     for external_id, (canonical_url, public_product) in api_records.items():
         trusted = trusted_by_id.get(external_id)
@@ -450,10 +629,21 @@ def _pharmonline_public_api_reconciliation_plan(
             if _canonical_pharmonline_product_url(current.url) != canonical_url:
                 metrics["native_id_url_rebind"] += 1
                 current_url = _canonical_pharmonline_product_url(current.url)
-                if current_url is None or not _pharmonline_native_url_rebind_is_proven(
-                    current,
-                    public_product,
-                ):
+                if current_url is None:
+                    metrics["native_id_url_rebind_unproven"] += 1
+                    continue
+                if _pharmonline_native_url_rebind_is_proven(current, public_product):
+                    proof_version = _PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION
+                    metrics["native_id_url_rebind_ready"] += 1
+                elif (
+                    current.id,
+                    external_id,
+                    current_url,
+                    canonical_url,
+                ) in redirect_proof_keys:
+                    proof_version = _PHARMONLINE_PUBLIC_API_REDIRECT_REBIND_PROOF_VERSION
+                    metrics["native_id_url_rebind_redirect_ready"] += 1
+                else:
                     metrics["native_id_url_rebind_unproven"] += 1
                     continue
                 actions.append(
@@ -463,17 +653,64 @@ def _pharmonline_public_api_reconciliation_plan(
                         public_api_external_id=external_id,
                         legacy_canonical_url=current_url,
                         public_api_canonical_url=canonical_url,
-                        proof_version=_PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION,
+                        proof_version=proof_version,
                     )
                 )
-                metrics["native_id_url_rebind_ready"] += 1
             else:
-                metrics["untrusted_existing_native_id"] += 1
+                foreign_url_rows = [
+                    row
+                    for row in all_by_url.get(canonical_url, [])
+                    if row.tenant_id != tenant_id
+                ]
+                conflicting_url_rows = [
+                    row
+                    for row in tenant_by_url.get(canonical_url, [])
+                    if row.id != current.id
+                    and (
+                        _PHARMONLINE_METEOR_ID_RE.fullmatch(str(row.external_id)) is not None
+                        or row.id in trusted_history_product_ids
+                    )
+                ]
+                if foreign_url_rows:
+                    metrics["admission_url_cross_tenant"] += 1
+                elif conflicting_url_rows:
+                    metrics["admission_url_conflict"] += 1
+                else:
+                    admissions.append(
+                        _PharmonlinePublicAPIIdentityAdmissionAction(
+                            product_id=current.id,
+                            admission_kind="existing_native_id",
+                            public_api_external_id=external_id,
+                            public_api_canonical_url=canonical_url,
+                            public_product=public_product,
+                        )
+                    )
+                    metrics["existing_native_admissions_ready"] += 1
             continue
 
         url_rows = tenant_by_url.get(canonical_url, [])
         if not url_rows:
-            metrics["legacy_url_missing"] += 1
+            foreign_url_rows = [
+                row
+                for row in all_by_url.get(canonical_url, [])
+                if row.tenant_id != tenant_id
+            ]
+            if foreign_url_rows:
+                metrics["admission_url_cross_tenant"] += 1
+            else:
+                admissions.append(
+                    _PharmonlinePublicAPIIdentityAdmissionAction(
+                        product_id=None,
+                        admission_kind="new_public_product",
+                        public_api_external_id=external_id,
+                        public_api_canonical_url=canonical_url,
+                        public_product=public_product,
+                    )
+                )
+                metrics["new_public_product_admissions_ready"] += 1
+            continue
+        if any(row.tenant_id != tenant_id for row in all_by_url.get(canonical_url, [])):
+            metrics["legacy_url_cross_tenant"] += 1
             continue
         if len(url_rows) != 1:
             metrics["legacy_url_ambiguous"] += 1
@@ -500,23 +737,88 @@ def _pharmonline_public_api_reconciliation_plan(
             )
         )
         metrics["legacy_rekeys_ready"] += 1
-    return actions, metrics
+    metrics["classified_identities"] = (
+        metrics["already_trusted_identities"]
+        + metrics["legacy_rekeys_ready"]
+        + metrics["existing_native_admissions_ready"]
+        + metrics["new_public_product_admissions_ready"]
+        + metrics["native_id_url_rebind_ready"]
+        + metrics["native_id_url_rebind_redirect_ready"]
+    )
+    metrics["unclassified_api_identities"] = max(
+        0,
+        metrics["api_identities"] - metrics["classified_identities"],
+    )
+    return actions, admissions, metrics
+
+
+def _pharmonline_public_api_reconciliation_plan_manifest_sha256(
+    actions: list[_PharmonlinePublicAPIReconciliationAction],
+    admissions: list[_PharmonlinePublicAPIIdentityAdmissionAction],
+    metrics: dict[str, int],
+) -> str:
+    """Hash the exact private candidate classification without disclosing it."""
+    lines = ["pharmonline_public_api_reconciliation_plan_v2"]
+    lines.extend(
+        "reconcile\t{product_id}\t{legacy_external_id}\t{public_api_external_id}\t"
+        "{legacy_canonical_url}\t{public_api_canonical_url}\t{proof_version}".format(
+            product_id=action.product_id,
+            legacy_external_id=action.legacy_external_id,
+            public_api_external_id=action.public_api_external_id,
+            legacy_canonical_url=action.legacy_canonical_url,
+            public_api_canonical_url=action.public_api_canonical_url,
+            proof_version=action.proof_version,
+        )
+        for action in sorted(
+            actions,
+            key=lambda item: (
+                item.public_api_external_id,
+                item.product_id,
+                item.proof_version,
+            ),
+        )
+    )
+    lines.extend(
+        "admission\t{product_id}\t{admission_kind}\t{public_api_external_id}\t"
+        "{public_api_canonical_url}".format(
+            product_id=action.product_id if action.product_id is not None else "new",
+            admission_kind=action.admission_kind,
+            public_api_external_id=action.public_api_external_id,
+            public_api_canonical_url=action.public_api_canonical_url,
+        )
+        for action in sorted(
+            admissions,
+            key=lambda item: (
+                item.public_api_external_id,
+                item.product_id if item.product_id is not None else -1,
+                item.admission_kind,
+            ),
+        )
+    )
+    lines.extend(f"metric\t{key}\t{value}" for key, value in sorted(metrics.items()))
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 def _pharmonline_public_api_reconciliation_is_safe(metrics: dict[str, int]) -> bool:
-    """Whether a plan has no unproven/rebound/cross-tenant identity cases."""
+    """Whether an exhaustive plan has no unproven or cross-tenant case."""
+    if metrics.get("classified_identities") != metrics.get("api_identities"):
+        return False
     return not any(
         metrics[key]
         for key in (
             "target_id_cross_tenant",
             "target_id_duplicate",
-            "legacy_url_missing",
             "legacy_url_ambiguous",
+            "legacy_url_cross_tenant",
             "legacy_row_has_ddp_lineage",
             "legacy_row_has_native_id",
-            "untrusted_existing_native_id",
+            "admission_url_cross_tenant",
+            "admission_url_conflict",
             "native_id_url_rebind_unproven",
             "reconciliation_record_conflict",
+            "admission_record_conflict",
+            "trusted_identity_conflict",
+            "unclassified_api_identities",
         )
     )
 
@@ -549,12 +851,15 @@ def _apply_pharmonline_public_api_reconciliation(
     catalog_fingerprint_sha256: str,
     source_transport: str,
     preflight_run_ref: str,
+    redirect_proofs: tuple[_PharmonlinePublicAPIRedirectProof, ...] = (),
+    expected_plan_manifest_sha256: str | None = None,
 ) -> dict[str, int]:
-    """Apply only a completely prevalidated identity continuity batch.
+    """Apply only a completely prevalidated identity recovery batch.
 
     Call this inside an explicit transaction owned by the dedicated recovery
-    script.  It never deletes Products; all linked history remains attached to
-    the same product primary key.
+    script.  It never deletes Products; legacy rekeys preserve every linked
+    record on the same primary key, and public genesis is allowed only where
+    no Product identity exists in any tenant.
     """
     _require_pharmonline_public_api_reconciliation_proof(
         source_manifest_sha256=source_manifest_sha256,
@@ -566,12 +871,27 @@ def _apply_pharmonline_public_api_reconciliation(
         raise PharmonlinePublicAPIReconciliationError(
             "public Pharmonline reconciliation audit schema is not migrated"
         )
-    actions, metrics = _pharmonline_public_api_reconciliation_plan(
+    actions, admissions, metrics = _pharmonline_public_api_reconciliation_plan(
         session,
         results,
         tenant_id=tenant_id,
         lock_products=True,
+        redirect_proofs=redirect_proofs,
     )
+    plan_manifest_sha256 = _pharmonline_public_api_reconciliation_plan_manifest_sha256(
+        actions,
+        admissions,
+        metrics,
+    )
+    if expected_plan_manifest_sha256 is not None:
+        if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(expected_plan_manifest_sha256) is None:
+            raise PharmonlinePublicAPIReconciliationError(
+                "public Pharmonline reconciliation requires a valid plan manifest hash"
+            )
+        if plan_manifest_sha256 != expected_plan_manifest_sha256:
+            raise PharmonlinePublicAPIReconciliationError(
+                "public Pharmonline reconciliation source plan differs from its read-only proof"
+            )
     if not _pharmonline_public_api_reconciliation_is_safe(metrics):
         diagnostic_text = ", ".join(f"{key}={value}" for key, value in sorted(metrics.items()))
         raise PharmonlinePublicAPIReconciliationError(
@@ -616,7 +936,106 @@ def _apply_pharmonline_public_api_reconciliation(
             reconciliation_rows,
         )
         session.flush()
+
+    admission_rows: list[dict[str, object]] = []
+    for action in admissions:
+        if action.admission_kind not in _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS:
+            raise PharmonlinePublicAPIReconciliationError(
+                "public Pharmonline reconciliation admission kind is invalid"
+            )
+        if action.product_id is None:
+            existing_site_products = session.scalars(
+                select(storage.Product).where(storage.Product.site == "pharmonline")
+            ).all()
+            if any(
+                str(product.external_id) == action.public_api_external_id
+                or _canonical_pharmonline_product_url(product.url)
+                == action.public_api_canonical_url
+                for product in existing_site_products
+            ):
+                raise PharmonlinePublicAPIReconciliationError(
+                    "public Pharmonline genesis identity exists before apply"
+                )
+            product = _new_pharmonline_public_api_identity_product(
+                action.public_product,
+                tenant_id=tenant_id,
+                canonical_url=action.public_api_canonical_url,
+            )
+            session.add(product)
+            session.flush()
+        else:
+            product = session.get(storage.Product, action.product_id)
+            if (
+                product is None
+                or product.tenant_id != tenant_id
+                or product.site != "pharmonline"
+                or str(product.external_id) != action.public_api_external_id
+                or _canonical_pharmonline_product_url(product.url)
+                != action.public_api_canonical_url
+            ):
+                raise PharmonlinePublicAPIReconciliationError(
+                    "public Pharmonline admission state changed before apply"
+                )
+        admission_rows.append(
+            {
+                "tenant_id": tenant_id,
+                "product_id": product.id,
+                "admission_kind": action.admission_kind,
+                "public_api_external_id": action.public_api_external_id,
+                "public_api_canonical_url": action.public_api_canonical_url,
+                "proof_version": _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION,
+                "source_manifest_sha256": source_manifest_sha256,
+                "catalog_fingerprint_sha256": catalog_fingerprint_sha256,
+                "source_transport": source_transport,
+                "preflight_run_ref": preflight_run_ref,
+            }
+        )
+    if admission_rows:
+        session.execute(
+            storage.PharmonlinePublicAPIIdentityAdmission.__table__.insert(),
+            admission_rows,
+        )
+        session.flush()
     return metrics
+
+
+def _new_pharmonline_public_api_identity_product(
+    public_product: ScrapedProduct,
+    *,
+    tenant_id: int,
+    canonical_url: str,
+) -> storage.Product:
+    """Build the minimal current-product row required by a genesis admission.
+
+    The subsequent verified public API run remains the only step that writes
+    offer observations and price snapshots.  This narrow constructor merely
+    establishes the new identity needed for that run and does not relabel it
+    as a DDP-derived product.
+    """
+    from src import brand_resolver
+    from src.brand_catalog import extract_brand
+    from src.normalize import extract_dosage, extract_pack_size, normalize_name
+
+    name = public_product.name
+    return storage.Product(
+        tenant_id=tenant_id,
+        site="pharmonline",
+        external_id=public_product.external_id,
+        url=canonical_url,
+        name=name,
+        name_normalized=normalize_name(name),
+        brand=public_product.brand or extract_brand(name),
+        brand_verified=brand_resolver.brand_from_pharmonline_slug(canonical_url),
+        manufacturer=public_product.manufacturer,
+        manufacturer_country_raw=public_product.manufacturer_country_raw,
+        country_source=public_product.country_source,
+        category=public_product.category,
+        dosage=public_product.dosage or extract_dosage(name),
+        pack_size=public_product.pack_size or extract_pack_size(name),
+        image_url=public_product.image_url,
+        description=public_product.description,
+        barcode=public_product.barcode,
+    )
 
 
 def _ensure_pharmonline_public_api_catalog_baseline(
@@ -776,11 +1195,12 @@ def _verify_pharmonline_public_api_identities(
 ) -> int:
     """Require every current API ID→URL pair to have immutable lineage.
 
-    Current IDs must resolve to prior DDP history or an exact, append-only
-    legacy-ID reconciliation record.  The historic DDP catalog can legitimately
-    contain delisted SKUs after an outage, so catalog continuity is protected by
-    a separate non-ratcheting public-API floor rather than by treating every
-    retired DDP identity as a current-source defect.
+    Current IDs must resolve to prior DDP history, an exact append-only
+    legacy-ID reconciliation, or an append-only public-source admission.  The
+    historic DDP catalog can legitimately contain delisted SKUs after an
+    outage, so catalog continuity is protected by a separate non-ratcheting
+    public-API floor rather than by treating every retired DDP identity as a
+    current-source defect.
     """
     api_records = _public_api_identity_records(results)
     api_by_id = {
@@ -801,13 +1221,19 @@ def _verify_pharmonline_public_api_identities(
         existing,
         tenant_id=tenant_id,
     )
+    admitted_by_id, admission_conflicts = _valid_pharmonline_public_api_identity_admissions(
+        session,
+        existing,
+        tenant_id=tenant_id,
+    )
     trusted_by_id = dict(ddp_by_id)
-    for external_id, product in reconciled_by_id.items():
-        trusted = trusted_by_id.get(external_id)
-        if trusted is not None and trusted.id != product.id:
-            duplicate_trusted_ids += 1
-            continue
-        trusted_by_id[external_id] = product
+    for evidence_by_id in (reconciled_by_id, admitted_by_id):
+        for external_id, product in evidence_by_id.items():
+            trusted = trusted_by_id.get(external_id)
+            if trusted is not None and trusted.id != product.id:
+                duplicate_trusted_ids += 1
+                continue
+            trusted_by_id[external_id] = product
 
     all_by_id: dict[str, list[storage.Product]] = {}
     all_by_url: dict[str, list[storage.Product]] = {}
@@ -869,6 +1295,7 @@ def _verify_pharmonline_public_api_identities(
         invalid_trusted
         or duplicate_trusted_ids
         or reconciliation_conflicts
+        or admission_conflicts
         or missing_trusted_ids
         or mismatched_urls
         or id_collisions
@@ -883,6 +1310,7 @@ def _verify_pharmonline_public_api_identities(
             f"invalid_trusted={invalid_trusted}, "
             f"duplicate_trusted_ids={duplicate_trusted_ids}, "
             f"reconciliation_conflicts={reconciliation_conflicts}, "
+            f"admission_conflicts={admission_conflicts}, "
             f"missing_trusted_ids={len(missing_trusted_ids)}, "
             f"retired_trusted_ids={len(retired_trusted_ids)}, "
             f"trusted_coverage={trusted_coverage:.4f}, "
@@ -899,6 +1327,7 @@ def _verify_pharmonline_public_api_identities(
         trusted_coverage=round(trusted_coverage, 4),
         trusted_history_products=len(trusted_history_product_ids),
         reconciled_identities=len(reconciled_by_id),
+        admitted_identities=len(admitted_by_id),
         catalog_floor=catalog_floor or None,
         tenant_id=tenant_id,
     )
@@ -1076,12 +1505,14 @@ def _diagnose_pharmonline_public_api_reconciliation(
     results: list[ScrapeResult],
     *,
     tenant_id: int,
+    redirect_proofs: tuple[_PharmonlinePublicAPIRedirectProof, ...] = (),
 ) -> dict[str, int]:
     """Return aggregate-only readiness evidence for the explicit rekey step."""
-    _, metrics = _pharmonline_public_api_reconciliation_plan(
+    _actions, _admissions, metrics = _pharmonline_public_api_reconciliation_plan(
         session,
         results,
         tenant_id=tenant_id,
+        redirect_proofs=redirect_proofs,
     )
     schema_migrated = _pharmonline_public_api_recovery_tables_available(session)
     baselines: list[storage.PharmonlinePublicAPICatalogBaseline] = []

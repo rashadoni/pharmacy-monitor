@@ -307,6 +307,50 @@ class PharmonlinePublicAPIIdentityReconciliation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 
+class PharmonlinePublicAPIIdentityAdmission(Base):
+    """Immutable first-party admission proof for a current public identity.
+
+    Unlike ``PharmonlinePublicAPIIdentityReconciliation``, this ledger never
+    claims a legacy-ID transition.  It records either a current native-ID row
+    that was already present in the tenant catalog or a genuinely new product
+    created from a fully verified public catalog.  Those two cases must remain
+    explicit: a public-source admission is trusted only for the guarded public
+    API path and never changes or impersonates DDP provenance.
+    """
+
+    __tablename__ = "pharmonline_public_api_identity_admissions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "product_id",
+            name="uq_pharmonline_public_api_admission_product",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "public_api_external_id",
+            name="uq_pharmonline_public_api_admission_public_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="RESTRICT"), index=True
+    )
+    # ``existing_native_id`` means the exact native ID and URL were already
+    # stored. ``new_public_product`` means no Product with that ID or URL was
+    # present in any tenant before the guarded creation.
+    admission_kind: Mapped[str] = mapped_column(String(40))
+    public_api_external_id: Mapped[str] = mapped_column(String(200))
+    public_api_canonical_url: Mapped[str] = mapped_column(String(500))
+    proof_version: Mapped[str] = mapped_column(String(40))
+    source_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
+    source_transport: Mapped[str] = mapped_column(String(40))
+    preflight_run_ref: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
 class PharmonlinePublicAPICatalogBaseline(Base):
     """Append-only non-ratcheting catalog floor for public-API recovery."""
 

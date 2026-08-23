@@ -395,6 +395,8 @@ def _reconcile(
     products: list[ScrapedProduct],
     *,
     preflight_run_ref: str = "123456",
+    redirect_proofs=(),
+    expected_plan_manifest_sha256: str | None = None,
 ):
     results = [ScrapeResult(site="pharmonline", products=products)]
     return main_mod._apply_pharmonline_public_api_reconciliation(
@@ -405,6 +407,8 @@ def _reconcile(
         catalog_fingerprint_sha256=main_mod._pharmonline_public_api_catalog_fingerprint(results),
         source_transport="decodo",
         preflight_run_ref=preflight_run_ref,
+        redirect_proofs=redirect_proofs,
+        expected_plan_manifest_sha256=expected_plan_manifest_sha256,
     )
 
 
@@ -524,6 +528,104 @@ def test_public_api_reconciliation_rebinds_native_id_only_with_barcode_and_name_
         )
         == 1
     )
+
+
+def test_public_api_reconciliation_rebinds_native_id_with_strict_redirect_proof(
+    db_session,
+):
+    old_url = "https://pharmonline.az/product/rebind-redirect-old-path"
+    new_url = "https://pharmonline.az/product/rebind-redirect-new-path"
+    stored = _stored_product(url=old_url, name="Old medicine")
+    db_session.add(stored)
+    db_session.commit()
+    public = _public_api_product(new_url, name="Current medicine")
+    redirect_proof = main_mod._PharmonlinePublicAPIRedirectProof(
+        product_id=stored.id,
+        public_api_external_id=public.external_id,
+        legacy_canonical_url=old_url,
+        public_api_canonical_url=new_url,
+    )
+
+    metrics = _reconcile(db_session, [public], redirect_proofs=(redirect_proof,))
+
+    refreshed = db_session.get(storage.Product, stored.id)
+    record = db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).one()
+    assert metrics["native_id_url_rebind_redirect_ready"] == 1
+    assert refreshed is not None and refreshed.url == new_url
+    assert record.proof_version == main_mod._PHARMONLINE_PUBLIC_API_REDIRECT_REBIND_PROOF_VERSION
+
+
+def test_public_api_reconciliation_attests_an_existing_exact_native_identity(db_session):
+    url = "https://pharmonline.az/product/existing-native-public-product"
+    stored = _stored_product(url=url, availability_source=None)
+    db_session.add(stored)
+    db_session.commit()
+
+    public = _public_api_product(url)
+    metrics = _reconcile(db_session, [public])
+
+    refreshed = db_session.get(storage.Product, stored.id)
+    admission = db_session.query(storage.PharmonlinePublicAPIIdentityAdmission).one()
+    assert metrics["existing_native_admissions_ready"] == 1
+    assert refreshed is not None and refreshed.id == stored.id
+    assert admission.product_id == stored.id
+    assert admission.admission_kind == "existing_native_id"
+    assert admission.public_api_external_id == public.external_id
+    assert main_mod._pharmonline_public_api_admission_invalid_reason(admission, refreshed) is None
+    assert (
+        main_mod._verify_pharmonline_public_api_identities(
+            db_session,
+            [ScrapeResult(site="pharmonline", products=[public])],
+            tenant_id=1,
+        )
+        == 1
+    )
+
+
+def test_public_api_reconciliation_creates_only_a_guarded_new_public_identity(db_session):
+    url = "https://pharmonline.az/product/new-public-product"
+    public = _public_api_product(url, name="New public medicine 500 mg N20")
+
+    metrics = _reconcile(db_session, [public])
+
+    product = (
+        db_session.query(storage.Product)
+        .filter_by(site="pharmonline", external_id=public.external_id)
+        .one()
+    )
+    admission = db_session.query(storage.PharmonlinePublicAPIIdentityAdmission).one()
+    assert metrics["new_public_product_admissions_ready"] == 1
+    assert product.url == url
+    assert product.availability_source is None
+    assert admission.product_id == product.id
+    assert admission.admission_kind == "new_public_product"
+    assert db_session.query(storage.PriceSnapshot).count() == 0
+    assert (
+        main_mod._verify_pharmonline_public_api_identities(
+            db_session,
+            [ScrapeResult(site="pharmonline", products=[public])],
+            tenant_id=1,
+        )
+        == 1
+    )
+
+
+def test_public_api_reconciliation_rejects_a_different_approved_plan_manifest(db_session):
+    url = "https://pharmonline.az/product/new-public-product-plan-mismatch"
+    public = _public_api_product(url)
+
+    with pytest.raises(
+        main_mod.PharmonlinePublicAPIReconciliationError,
+        match="differs from its read-only proof",
+    ):
+        _reconcile(
+            db_session,
+            [public],
+            expected_plan_manifest_sha256="b" * 64,
+        )
+
+    assert db_session.query(storage.Product).count() == 0
+    assert db_session.query(storage.PharmonlinePublicAPIIdentityAdmission).count() == 0
 
 
 def test_public_api_reconciliation_refuses_native_id_rebind_without_two_signals(

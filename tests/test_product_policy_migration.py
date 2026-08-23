@@ -64,11 +64,11 @@ def test_identity_offer_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
     assert "aloe_country_mappings" not in inspector.get_table_names()
 
 
-def test_pharmonline_public_api_reconciliation_migration_is_reversible(
+def test_pharmonline_public_api_reconciliation_migrations_are_reversible(
     tmp_path: Path,
 ) -> None:
     db_url = f"sqlite:///{tmp_path / 'pharmonline-public-api-reconciliation.sqlite'}"
-    _alembic(db_url, "upgrade", "0019_public_api_reconcile")
+    _alembic(db_url, "upgrade", "0020_public_api_admissions")
 
     inspector = inspect(create_engine(db_url))
     reconciliation_columns = {
@@ -78,6 +78,10 @@ def test_pharmonline_public_api_reconciliation_migration_is_reversible(
     baseline_columns = {
         column["name"]
         for column in inspector.get_columns("pharmonline_public_api_catalog_baselines")
+    }
+    admission_columns = {
+        column["name"]
+        for column in inspector.get_columns("pharmonline_public_api_identity_admissions")
     }
     assert {
         "tenant_id",
@@ -98,6 +102,16 @@ def test_pharmonline_public_api_reconciliation_migration_is_reversible(
         "retired_ddp_item_count",
         "reconciled_item_count",
     } <= baseline_columns
+    assert {
+        "tenant_id",
+        "product_id",
+        "admission_kind",
+        "public_api_external_id",
+        "public_api_canonical_url",
+        "source_manifest_sha256",
+        "catalog_fingerprint_sha256",
+        "preflight_run_ref",
+    } <= admission_columns
     unique_constraints = inspector.get_unique_constraints(
         "pharmonline_public_api_identity_reconciliations"
     )
@@ -106,8 +120,16 @@ def test_pharmonline_public_api_reconciliation_migration_is_reversible(
         "uq_pharmonline_public_api_reconciliation_legacy_id",
         "uq_pharmonline_public_api_reconciliation_public_id",
     } <= {constraint["name"] for constraint in unique_constraints}
+    admission_unique_constraints = inspector.get_unique_constraints(
+        "pharmonline_public_api_identity_admissions"
+    )
+    assert {
+        "uq_pharmonline_public_api_admission_product",
+        "uq_pharmonline_public_api_admission_public_id",
+    } <= {constraint["name"] for constraint in admission_unique_constraints}
 
     _alembic(db_url, "downgrade", "0018_product_manual_category")
     inspector = inspect(create_engine(db_url))
     assert "pharmonline_public_api_identity_reconciliations" not in inspector.get_table_names()
+    assert "pharmonline_public_api_identity_admissions" not in inspector.get_table_names()
     assert "pharmonline_public_api_catalog_baselines" not in inspector.get_table_names()
