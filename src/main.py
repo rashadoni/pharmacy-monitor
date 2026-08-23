@@ -291,11 +291,11 @@ def _valid_pharmonline_public_api_reconciliations(
     products_by_id = {product.id: product for product in products}
     reconciled_by_id: dict[str, storage.Product] = {}
     conflicting_ids: set[str] = set()
-    records = session.scalars(
-        select(storage.PharmonlinePublicAPIIdentityReconciliation).where(
-            storage.PharmonlinePublicAPIIdentityReconciliation.tenant_id == tenant_id,
-        )
-    ).all()
+    records = (
+        session.query(storage.PharmonlinePublicAPIIdentityReconciliation)
+        .filter(storage.PharmonlinePublicAPIIdentityReconciliation.tenant_id == tenant_id)
+        .all()
+    )
     for record in records:
         product = products_by_id.get(record.product_id)
         invalid_reason = _pharmonline_public_api_reconciliation_invalid_reason(
@@ -634,12 +634,14 @@ def _ensure_pharmonline_public_api_catalog_baseline(
             "public Pharmonline catalog baseline schema is not migrated"
         )
     catalog_item_count = len(_public_api_identity_records(results))
-    existing_floor = int(
-        session.scalar(
-            select(func.max(storage.PharmonlinePublicAPICatalogBaseline.minimum_catalog_item_count))
-            .where(storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id)
-        )
-        or 0
+    baselines = (
+        session.query(storage.PharmonlinePublicAPICatalogBaseline)
+        .filter(storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id)
+        .all()
+    )
+    existing_floor = max(
+        (baseline.minimum_catalog_item_count for baseline in baselines),
+        default=0,
     )
     if existing_floor:
         if catalog_item_count < existing_floor:
@@ -837,12 +839,14 @@ def _verify_pharmonline_public_api_identities(
 
     catalog_floor = 0
     if _pharmonline_public_api_recovery_tables_available(session):
-        catalog_floor = int(
-            session.scalar(
-                select(func.max(storage.PharmonlinePublicAPICatalogBaseline.minimum_catalog_item_count))
-                .where(storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id)
-            )
-            or 0
+        baselines = (
+            session.query(storage.PharmonlinePublicAPICatalogBaseline)
+            .filter(storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id)
+            .all()
+        )
+        catalog_floor = max(
+            (baseline.minimum_catalog_item_count for baseline in baselines),
+            default=0,
         )
     require_catalog_floor = os.environ.get(
         "PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE", ""
@@ -1069,29 +1073,21 @@ def _diagnose_pharmonline_public_api_reconciliation(
         tenant_id=tenant_id,
     )
     schema_migrated = _pharmonline_public_api_recovery_tables_available(session)
-    baseline_records = 0
-    catalog_baseline_floor = 0
+    baselines: list[storage.PharmonlinePublicAPICatalogBaseline] = []
     if schema_migrated:
-        baseline_records = int(
-            session.scalar(
-                select(func.count(storage.PharmonlinePublicAPICatalogBaseline.id)).where(
-                    storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id,
-                )
-            )
-            or 0
-        )
-        catalog_baseline_floor = int(
-            session.scalar(
-                select(func.max(storage.PharmonlinePublicAPICatalogBaseline.minimum_catalog_item_count))
-                .where(storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id)
-            )
-            or 0
+        baselines = (
+            session.query(storage.PharmonlinePublicAPICatalogBaseline)
+            .filter(storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id)
+            .all()
         )
     metrics.update(
         {
             "recovery_schema_migrated": int(schema_migrated),
-            "catalog_baseline_records": baseline_records,
-            "catalog_baseline_floor": catalog_baseline_floor,
+            "catalog_baseline_records": len(baselines),
+            "catalog_baseline_floor": max(
+                (baseline.minimum_catalog_item_count for baseline in baselines),
+                default=0,
+            ),
             "reconciliation_safe": int(_pharmonline_public_api_reconciliation_is_safe(metrics)),
         }
     )
