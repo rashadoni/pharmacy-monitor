@@ -116,6 +116,8 @@ _RETRYABLE_FULL_CATALOG_ABORT_REASONS = frozenset(
         # A provider/target rate limit is likewise retryable only as a whole
         # catalog read.  The caller never mixes rows from the rejected pass.
         "decodo_http_429",
+        "decodo_request_failed",
+        "decodo_transient_request_failed",
         # A 403 from the target through one sticky ScraperAPI exit can be
         # exit-specific. The rejected attempt has yielded no rows, so a fresh
         # full session may retry it; any partial result remains unusable.

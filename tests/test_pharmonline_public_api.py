@@ -265,6 +265,8 @@ async def test_public_api_rejects_sitemap_mismatch_before_any_yield():
         "product_sitemap_index_missing",
         "product_sitemap_empty",
         "decodo_http_429",
+        "decodo_request_failed",
+        "decodo_transient_request_failed",
         "scraperapi_http_403",
     ],
 )
