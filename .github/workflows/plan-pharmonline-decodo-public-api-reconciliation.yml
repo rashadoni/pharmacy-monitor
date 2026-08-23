@@ -1,0 +1,247 @@
+name: Plan Pharmonline Decodo public API reconciliation (no persistence)
+
+# This is intentionally a separate gate from the normal public-API preflight:
+# existing legacy rows are expected until the reconciliation has been proven.
+# It makes two fresh catalog reads and produces only aggregate evidence.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type PLAN to run the read-only Decodo reconciliation proof"
+        required: true
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: pharmonline-decodo-public-api-recovery
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Require explicit confirmation and matching CI
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "PLAN"
+          ci_run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow ci-pipeline.yml --commit "$GITHUB_SHA" --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          case "$ci_run_id" in
+            ''|*[!0-9]*)
+              echo "a successful Pharmacy Monitor CI run is required for this commit" >&2
+              exit 1
+              ;;
+          esac
+          echo "matching_ci_run_id=$ci_run_id"
+
+      - uses: actions/checkout@v4
+
+      - name: Setup production SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' \
+            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
+          test "$host_fingerprint" = \
+            'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
+
+      - name: Check production capacity and scraper state
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          min_available_kib=$((4 * 1024 * 1024))
+          max_swap_kib=$((2 * 1024 * 1024))
+          min_disk_kib=$((4 * 1024 * 1024))
+          max_user_slice_bytes=$((7 * 1024 * 1024 * 1024))
+
+          available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+          swap_before_kib=$(free -k | awk '/^Swap:/ {print $3}')
+          disk_available_kib=$(df -Pk /opt/pharmacy-monitor | awk 'NR==2 {print $4}')
+          user_slice_bytes=$(systemctl show user.slice -p MemoryCurrent --value)
+          sleep 5
+          swap_after_kib=$(free -k | awk '/^Swap:/ {print $3}')
+
+          printf 'available_ram_kib=%s required_kib=%s\n' "$available_kib" "$min_available_kib"
+          printf 'swap_before_kib=%s swap_after_kib=%s maximum_kib=%s\n' \
+            "$swap_before_kib" "$swap_after_kib" "$max_swap_kib"
+          printf 'disk_available_kib=%s required_kib=%s\n' "$disk_available_kib" "$min_disk_kib"
+          printf 'user_slice_bytes=%s conservative_limit_bytes=%s\n' \
+            "$user_slice_bytes" "$max_user_slice_bytes"
+
+          test "$available_kib" -ge "$min_available_kib"
+          test "$swap_after_kib" -le "$max_swap_kib"
+          test "$swap_after_kib" -le "$swap_before_kib"
+          test "$disk_available_kib" -ge "$min_disk_kib"
+          test "$user_slice_bytes" -lt "$max_user_slice_bytes"
+          if systemctl is-active --quiet pharmacy-monitor-scrape@pharmonline.service; then
+            echo "refusing reconciliation plan: a Pharmonline scrape is already active" >&2
+            exit 1
+          fi
+          REMOTE
+
+      - name: Stage exact source and calculate the read-only reconciliation plan
+        run: |
+          set -euo pipefail
+          source_manifest=$(mktemp)
+          trap 'rm -f "$source_manifest"' EXIT
+          git ls-files -z -- src scripts/reconcile_pharmonline_public_api_identities.py |
+            xargs -0 sha256sum | LC_ALL=C sort > "$source_manifest"
+          test -s "$source_manifest"
+          source_manifest_sha=$(sha256sum "$source_manifest" | awk '{print $1}')
+          echo "source_manifest_sha256=$source_manifest_sha"
+          plan_evidence_dir=$(mktemp -d "$RUNNER_TEMP/pharmonline-reconciliation-plan.XXXXXX")
+          cp -- "$source_manifest" "$plan_evidence_dir/source-manifest"
+          printf '%s\n' "$source_manifest_sha" > "$plan_evidence_dir/source-manifest.sha256"
+          printf '%s\n' "$GITHUB_SHA" > "$plan_evidence_dir/commit-sha"
+          echo "PLAN_EVIDENCE_DIR=$plan_evidence_dir" >> "$GITHUB_ENV"
+          remote_work_dir=$(ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          work_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-decodo-reconciliation-plan.XXXXXX)
+          mkdir -p "$work_dir/incoming" "$work_dir/runtime/src" "$work_dir/runtime/scripts"
+          printf '%s' "$work_dir"
+          REMOTE
+          )
+          case "$remote_work_dir" in
+            /opt/pharmacy-monitor/.codex-decodo-reconciliation-plan.*) ;;
+            *)
+              echo "unexpected remote reconciliation plan path" >&2
+              exit 1
+              ;;
+          esac
+          echo "REMOTE_WORK_DIR=$remote_work_dir" >> "$GITHUB_ENV"
+
+          rsync -az --checksum --delete --no-perms --no-owner --no-group \
+            --exclude '__pycache__/' \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            src/ "pm@46.225.149.52:$remote_work_dir/runtime/src/"
+          rsync -z --checksum --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            scripts/reconcile_pharmonline_public_api_identities.py \
+            "pm@46.225.149.52:$remote_work_dir/runtime/scripts/reconcile_pharmonline_public_api_identities.py"
+          rsync -z --checksum --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            "$source_manifest" "pm@46.225.149.52:$remote_work_dir/incoming/source-manifest"
+
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 \
+            "bash -s -- '$remote_work_dir' '$source_manifest_sha'" <<'REMOTE'
+          set -euo pipefail
+          work_dir=$1
+          source_manifest_sha=$2
+          case "$work_dir" in
+            /opt/pharmacy-monitor/.codex-decodo-reconciliation-plan.*) ;;
+            *)
+              echo "unexpected remote reconciliation plan path" >&2
+              exit 1
+              ;;
+          esac
+          runtime_dir="$work_dir/runtime"
+          test "$(sha256sum "$work_dir/incoming/source-manifest" | awk '{print $1}')" = \
+            "$source_manifest_sha"
+          (cd "$runtime_dir" && sha256sum -c "$work_dir/incoming/source-manifest")
+
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python - <<PY
+          import sys
+          from pathlib import Path
+
+          import src.main
+          import src.run_lock
+          import src.scrapers.pharmonline_public_api
+          import src.storage
+          from src.main import _diagnose_pharmonline_public_api_reconciliation
+
+          runtime = Path("$runtime_dir").resolve()
+          assert Path(src.main.__file__).resolve().is_relative_to(runtime)
+          assert Path(src.storage.__file__).resolve().is_relative_to(runtime)
+          assert Path(src.run_lock.__file__).resolve().is_relative_to(runtime)
+          assert Path(src.scrapers.pharmonline_public_api.__file__).resolve().is_relative_to(runtime)
+          script = runtime / "scripts/reconcile_pharmonline_public_api_identities.py"
+          assert script.is_file() and script.resolve().is_relative_to(runtime)
+          assert callable(_diagnose_pharmonline_public_api_reconciliation)
+          print(
+              "isolated Decodo reconciliation-plan source imported: "
+              f"python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}, "
+              f"script={script.relative_to(runtime)}"
+          )
+          PY
+
+          # EnvironmentFile values are literal systemd values, not shell code.
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|\#*) continue ;;
+            esac
+            key=${line%%=*}
+            value=${line#*=}
+            export "$key=$value"
+          done < /etc/pharmacy-monitor/env
+
+          PHARMONLINE_PUBLIC_API=required \
+          PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
+          PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
+          PHARMONLINE_USE_DDP=0 \
+          AI_FALLBACK_ENABLED=0 \
+          SCRAPE_REPORT_EMAIL=0 \
+          PYTHONDONTWRITEBYTECODE=1 \
+          PYTHONPATH="$runtime_dir" \
+          /opt/pharmacy-monitor/.venv/bin/python \
+            "$runtime_dir/scripts/reconcile_pharmonline_public_api_identities.py"
+          REMOTE
+
+      - name: Retain exact plan manifest
+        if: ${{ success() && env.PLAN_EVIDENCE_DIR != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pharmonline-reconciliation-plan-evidence
+          path: ${{ env.PLAN_EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove isolated read-only plan workspace
+        if: ${{ always() && env.REMOTE_WORK_DIR != '' }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            pm@46.225.149.52 "bash -s -- '$REMOTE_WORK_DIR'" <<'REMOTE'
+          set -euo pipefail
+          work_dir=$1
+          case "$work_dir" in
+            /opt/pharmacy-monitor/.codex-decodo-reconciliation-plan.*) ;;
+            *)
+              echo "unexpected remote reconciliation plan cleanup path" >&2
+              exit 1
+              ;;
+          esac
+          rm -rf -- "$work_dir"
+          REMOTE
