@@ -181,14 +181,40 @@ def _pharmonline_native_url_rebind_is_proven(
     dosage and pack information. If either signal is absent or differs, the
     transition remains fail-closed for manual review.
     """
+    barcode_evidence, name_evidence = _pharmonline_native_url_rebind_evidence(
+        stored,
+        public_product,
+    )
+    return barcode_evidence == "barcode_match" and name_evidence == "name_match"
+
+
+def _pharmonline_native_url_rebind_evidence(
+    stored: storage.Product,
+    public_product: ScrapedProduct,
+) -> tuple[str, str]:
+    """Return controlled aggregate-only two-signal evidence categories."""
     stored_barcode = str(stored.barcode or "").strip()
     public_barcode = str(public_product.barcode or "").strip()
-    return (
-        stored_barcode.isdigit()
-        and stored_barcode == public_barcode
-        and _pharmonline_product_name_signature(stored.name)
-        == _pharmonline_product_name_signature(public_product.name)
-    )
+    if not stored_barcode.isdigit():
+        barcode_evidence = "stored_barcode_missing"
+    elif not public_barcode.isdigit():
+        barcode_evidence = "public_barcode_missing"
+    elif stored_barcode != public_barcode:
+        barcode_evidence = "barcode_mismatch"
+    else:
+        barcode_evidence = "barcode_match"
+
+    stored_name = _pharmonline_product_name_signature(stored.name)
+    public_name = _pharmonline_product_name_signature(public_product.name)
+    if not stored_name:
+        name_evidence = "stored_name_missing"
+    elif not public_name:
+        name_evidence = "public_name_missing"
+    elif stored_name != public_name:
+        name_evidence = "name_mismatch"
+    else:
+        name_evidence = "name_match"
+    return barcode_evidence, name_evidence
 
 
 def _pharmonline_public_api_recovery_tables_available(session: Session) -> bool:
@@ -606,6 +632,14 @@ def _pharmonline_public_api_reconciliation_plan(
         "native_id_url_rebind_ready": 0,
         "native_id_url_rebind_redirect_ready": 0,
         "native_id_url_rebind_unproven": 0,
+        "native_id_url_rebind_barcode_match": 0,
+        "native_id_url_rebind_stored_barcode_missing": 0,
+        "native_id_url_rebind_public_barcode_missing": 0,
+        "native_id_url_rebind_barcode_mismatch": 0,
+        "native_id_url_rebind_name_match": 0,
+        "native_id_url_rebind_stored_name_missing": 0,
+        "native_id_url_rebind_public_name_missing": 0,
+        "native_id_url_rebind_name_mismatch": 0,
         "reconciliation_record_conflict": reconciliation_conflicts,
         "admission_record_conflict": admission_conflicts,
         "trusted_identity_conflict": trusted_identity_conflicts,
@@ -628,11 +662,17 @@ def _pharmonline_public_api_reconciliation_plan(
             current = tenant_rows[0]
             if _canonical_pharmonline_product_url(current.url) != canonical_url:
                 metrics["native_id_url_rebind"] += 1
+                barcode_evidence, name_evidence = _pharmonline_native_url_rebind_evidence(
+                    current,
+                    public_product,
+                )
+                metrics[f"native_id_url_rebind_{barcode_evidence}"] += 1
+                metrics[f"native_id_url_rebind_{name_evidence}"] += 1
                 current_url = _canonical_pharmonline_product_url(current.url)
                 if current_url is None:
                     metrics["native_id_url_rebind_unproven"] += 1
                     continue
-                if _pharmonline_native_url_rebind_is_proven(current, public_product):
+                if barcode_evidence == "barcode_match" and name_evidence == "name_match":
                     proof_version = _PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION
                     metrics["native_id_url_rebind_ready"] += 1
                 elif (

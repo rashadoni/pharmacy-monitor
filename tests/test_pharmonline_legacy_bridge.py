@@ -512,6 +512,8 @@ def test_public_api_reconciliation_rebinds_native_id_only_with_barcode_and_name_
     record = db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).one()
     assert metrics["native_id_url_rebind"] == 1
     assert metrics["native_id_url_rebind_ready"] == 1
+    assert metrics["native_id_url_rebind_barcode_match"] == 1
+    assert metrics["native_id_url_rebind_name_match"] == 1
     assert refreshed is not None
     assert refreshed.id == product_id
     assert refreshed.external_id == public.external_id
@@ -636,6 +638,11 @@ def test_public_api_reconciliation_refuses_native_id_rebind_without_two_signals(
     stored = _stored_product(url=old_url, name="Old medicine 500 mg")
     db_session.add(stored)
     db_session.commit()
+
+    assert main_mod._pharmonline_native_url_rebind_evidence(
+        stored,
+        _public_api_product(new_url, name="New medicine 500 mg"),
+    ) == ("stored_barcode_missing", "name_mismatch")
 
     with pytest.raises(
         main_mod.PharmonlinePublicAPIReconciliationError,
