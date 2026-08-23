@@ -70,8 +70,11 @@ _SCRAPERAPI_TRANSIENT_STATUSES = frozenset({429, 499, 500, 502, 503, 504})
 _CATALOG_SESSION_PAGE_SPAN = 20
 # Direct Decodo HTTP maps each 10-page group to a configured sticky proxy port.
 # Each logical group still owns a fresh HTTP client/cookie jar, even when a
-# small configured port pool eventually reuses the same exit. The anchors and
-# full source+sitemap proof remain mandatory before yielding one product.
+# small configured port pool eventually reuses the same exit. Backconnect
+# recovery instead keeps the whole bounded catalog behind one named session:
+# changing proxy sessions during an active catalog refresh can otherwise mix
+# two cache variants before the mandatory anchors have a chance to reject it.
+# The source+sitemap proof remains mandatory before yielding one product.
 _DECODO_CATALOG_SESSION_PAGE_SPAN = 10
 # ScraperAPI keeps one proxy exit per named session. Keep those groups equally
 # bounded so a slow full-catalog pass never relies on a session close to the
@@ -431,6 +434,13 @@ class PharmonlinePublicAPIScraper(BaseScraper):
 
     def _catalog_session_page_span(self) -> int:
         if self._transport_name() == _DECODO_TRANSPORT:
+            # A Decodo backconnect session is explicitly sticky for 30
+            # minutes, while the bounded 96-page catalog has completed well
+            # inside that window. Keeping it as one context removes proxy
+            # cache-variant joins; direct country-port operation retains the
+            # short groups and their page-one anchors.
+            if getattr(self, "_decodo_backconnect_sticky", False):
+                return self.max_pages
             return _DECODO_CATALOG_SESSION_PAGE_SPAN
         if self._transport_name() == _SCRAPERAPI_TRANSPORT:
             return _SCRAPERAPI_CATALOG_SESSION_PAGE_SPAN

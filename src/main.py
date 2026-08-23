@@ -10,10 +10,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from src._time import utcnow
 from pathlib import Path
@@ -23,7 +25,7 @@ import click
 import structlog
 import yaml
 from dotenv import load_dotenv
-from sqlalchemy import desc, func, select, text
+from sqlalchemy import desc, func, inspect, select, text
 from sqlalchemy.orm import Session
 
 load_dotenv(override=True)
@@ -59,11 +61,19 @@ class PharmonlinePublicAPIIdentityError(RuntimeError):
     """The public API catalog disagrees with the trusted DDP identity map."""
 
 
+class PharmonlinePublicAPIReconciliationError(RuntimeError):
+    """A one-time legacy-to-public-API identity transition is not proven safe."""
+
+
 _PHARMONLINE_LEGACY_ID_BRIDGE_ENV = "PHARMONLINE_LEGACY_ID_BRIDGE"
 _PHARMONLINE_PUBLIC_API_ENV = "PHARMONLINE_PUBLIC_API"
 _PHARMONLINE_METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
 _PHARMONLINE_DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
 _PHARMONLINE_PUBLIC_API_MIN_TRUSTED_COVERAGE = 0.98
+_PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION = "url_continuity_v1"
+_PHARMONLINE_PUBLIC_API_PROOF_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS = 9500
+_PHARMONLINE_PUBLIC_API_BASELINE_FRACTION_PER_THOUSAND = 980
 
 
 def _pharmonline_legacy_id_bridge_enabled() -> bool:
@@ -109,6 +119,476 @@ def _canonical_pharmonline_product_url(raw_url: str | None) -> str | None:
     if not slug or "/" in slug:
         return None
     return f"https://pharmonline.az/product/{quote(slug, safe='-._~')}"
+
+
+@dataclass(frozen=True)
+class _PharmonlinePublicAPIReconciliationAction:
+    """A fully prevalidated in-place legacy ID replacement."""
+
+    product_id: int
+    legacy_external_id: str
+    public_api_external_id: str
+    canonical_url: str
+
+
+def _pharmonline_public_api_recovery_tables_available(session: Session) -> bool:
+    """Avoid treating an unapplied production migration as trusted evidence."""
+    tables = set(inspect(session.get_bind()).get_table_names())
+    return {
+        "pharmonline_public_api_identity_reconciliations",
+        "pharmonline_public_api_catalog_baselines",
+    }.issubset(tables)
+
+
+def _public_api_identity_records(
+    results: list[ScrapeResult],
+) -> dict[str, tuple[str, ScrapedProduct]]:
+    """Validate the current first-party ID→canonical-URL sequence once."""
+    from src.scrapers.pharmonline_public_api import PUBLIC_API_AVAILABILITY_SOURCE
+
+    pharmonline_results = [result for result in results if result.site == "pharmonline"]
+    unexpected_results = len(results) - len(pharmonline_results)
+    unexpected_promos = sum(len(result.promos) for result in pharmonline_results)
+    if len(pharmonline_results) != 1 or unexpected_results or unexpected_promos:
+        raise PharmonlinePublicAPIIdentityError(
+            "public Pharmonline API identity proof refused persistence: "
+            f"pharmonline_results={len(pharmonline_results)}, "
+            f"unexpected_results={unexpected_results}, "
+            f"unexpected_promos={unexpected_promos}"
+        )
+
+    records: dict[str, tuple[str, ScrapedProduct]] = {}
+    urls: set[str] = set()
+    invalid_api = 0
+    duplicate_api_ids = 0
+    duplicate_api_urls = 0
+    for product in pharmonline_results[0].products:
+        external_id = str(product.external_id)
+        canonical_url = _canonical_pharmonline_product_url(product.url)
+        if (
+            product.site != "pharmonline"
+            or not product.identity_verified
+            or _PHARMONLINE_METEOR_ID_RE.fullmatch(external_id) is None
+            or canonical_url is None
+            or product.availability_source != PUBLIC_API_AVAILABILITY_SOURCE
+        ):
+            invalid_api += 1
+            continue
+        if external_id in records:
+            duplicate_api_ids += 1
+            continue
+        if canonical_url in urls:
+            duplicate_api_urls += 1
+            continue
+        records[external_id] = (canonical_url, product)
+        urls.add(canonical_url)
+
+    if invalid_api or duplicate_api_ids or duplicate_api_urls or not records:
+        raise PharmonlinePublicAPIIdentityError(
+            "public Pharmonline API identity proof refused persistence: "
+            f"api_ids={len(records)}, invalid_api={invalid_api}, "
+            f"duplicate_api_ids={duplicate_api_ids}, "
+            f"duplicate_api_urls={duplicate_api_urls}"
+        )
+    return records
+
+
+def _pharmonline_public_api_catalog_fingerprint(
+    results: list[ScrapeResult],
+) -> str:
+    """Return a non-reversible audit fingerprint for a verified API identity set."""
+    records = _public_api_identity_records(results)
+    payload = "\n".join(
+        f"{external_id}\t{canonical_url}"
+        for external_id, (canonical_url, _) in sorted(records.items())
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _trusted_ddp_products_by_id(
+    session: Session,
+    products: list[storage.Product],
+    *,
+    tenant_id: int,
+) -> tuple[dict[str, storage.Product], set[int], int, int]:
+    """Build only the historic DDP-derived portion of the identity map."""
+    trusted_history_product_ids = set(
+        session.scalars(
+            select(storage.OfferObservation.product_id)
+            .where(
+                storage.OfferObservation.tenant_id == tenant_id,
+                storage.OfferObservation.availability_source
+                == _PHARMONLINE_DDP_AVAILABILITY_SOURCE,
+            )
+            .distinct()
+        ).all()
+    )
+    trusted_by_id: dict[str, storage.Product] = {}
+    invalid_trusted = 0
+    duplicate_trusted_ids = 0
+    for stored in products:
+        if (
+            stored.availability_source != _PHARMONLINE_DDP_AVAILABILITY_SOURCE
+            and stored.id not in trusted_history_product_ids
+        ):
+            continue
+        external_id = str(stored.external_id)
+        canonical_url = _canonical_pharmonline_product_url(stored.url)
+        if _PHARMONLINE_METEOR_ID_RE.fullmatch(external_id) is None or canonical_url is None:
+            invalid_trusted += 1
+            continue
+        if external_id in trusted_by_id:
+            duplicate_trusted_ids += 1
+            continue
+        trusted_by_id[external_id] = stored
+    return trusted_by_id, trusted_history_product_ids, invalid_trusted, duplicate_trusted_ids
+
+
+def _valid_pharmonline_public_api_reconciliations(
+    session: Session,
+    products: list[storage.Product],
+    *,
+    tenant_id: int,
+) -> tuple[dict[str, storage.Product], int]:
+    """Return only immutable records that still exactly match a live Product."""
+    if not _pharmonline_public_api_recovery_tables_available(session):
+        return {}, 0
+
+    products_by_id = {product.id: product for product in products}
+    reconciled_by_id: dict[str, storage.Product] = {}
+    conflicting_ids: set[str] = set()
+    records = session.scalars(
+        select(storage.PharmonlinePublicAPIIdentityReconciliation).where(
+            storage.PharmonlinePublicAPIIdentityReconciliation.tenant_id == tenant_id,
+        )
+    ).all()
+    for record in records:
+        product = products_by_id.get(record.product_id)
+        public_external_id = str(record.public_api_external_id)
+        canonical_url = _canonical_pharmonline_product_url(record.public_api_canonical_url)
+        legacy_url = _canonical_pharmonline_product_url(record.legacy_canonical_url)
+        if (
+            product is None
+            or record.proof_version != _PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION
+            or _PHARMONLINE_METEOR_ID_RE.fullmatch(public_external_id) is None
+            or canonical_url is None
+            or legacy_url is None
+            or canonical_url != legacy_url
+            or _PHARMONLINE_METEOR_ID_RE.fullmatch(str(record.legacy_external_id)) is not None
+            or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.source_manifest_sha256) is None
+            or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256)
+            is None
+            or record.source_transport not in {"crawlbase", "decodo", "scraperapi"}
+            or re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None
+            or str(product.external_id) != public_external_id
+            or _canonical_pharmonline_product_url(product.url) != canonical_url
+        ):
+            continue
+        previous = reconciled_by_id.get(public_external_id)
+        if previous is not None and previous.id != product.id:
+            conflicting_ids.add(public_external_id)
+            continue
+        reconciled_by_id[public_external_id] = product
+    for external_id in conflicting_ids:
+        reconciled_by_id.pop(external_id, None)
+    return reconciled_by_id, len(conflicting_ids)
+
+
+def _pharmonline_public_api_reconciliation_plan(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+    lock_products: bool = False,
+) -> tuple[list[_PharmonlinePublicAPIReconciliationAction], dict[str, int]]:
+    """Plan exact URL-continuous legacy→native ID changes without writing.
+
+    A legacy row is eligible only when the public API's current canonical URL
+    has exactly one row for this tenant, that row has no DDP lineage, its old
+    identifier is not a native-looking ID, and the target native ID is unused
+    across every tenant.  URL changes under an existing native ID intentionally
+    remain a separate fail-closed case.
+    """
+    api_records = _public_api_identity_records(results)
+    product_statement = select(storage.Product).where(storage.Product.site == "pharmonline")
+    if lock_products:
+        product_statement = product_statement.with_for_update()
+    all_site_products = session.scalars(product_statement).all()
+    tenant_products = [product for product in all_site_products if product.tenant_id == tenant_id]
+
+    all_by_external_id: dict[str, list[storage.Product]] = {}
+    tenant_by_external_id: dict[str, list[storage.Product]] = {}
+    tenant_by_url: dict[str, list[storage.Product]] = {}
+    for product in all_site_products:
+        external_id = str(product.external_id)
+        all_by_external_id.setdefault(external_id, []).append(product)
+        if product.tenant_id != tenant_id:
+            continue
+        tenant_by_external_id.setdefault(external_id, []).append(product)
+        canonical_url = _canonical_pharmonline_product_url(product.url)
+        if canonical_url is not None:
+            tenant_by_url.setdefault(canonical_url, []).append(product)
+
+    ddp_by_id, trusted_history_product_ids, _, _ = _trusted_ddp_products_by_id(
+        session,
+        tenant_products,
+        tenant_id=tenant_id,
+    )
+    reconciled_by_id, reconciliation_conflicts = _valid_pharmonline_public_api_reconciliations(
+        session,
+        tenant_products,
+        tenant_id=tenant_id,
+    )
+    trusted_by_id = dict(ddp_by_id)
+    for external_id, product in reconciled_by_id.items():
+        trusted = trusted_by_id.get(external_id)
+        if trusted is None or trusted.id == product.id:
+            trusted_by_id[external_id] = product
+
+    actions: list[_PharmonlinePublicAPIReconciliationAction] = []
+    metrics = {
+        "api_identities": len(api_records),
+        "trusted_ddp_identities": len(ddp_by_id),
+        "reconciled_identities": len(reconciled_by_id),
+        "retired_ddp_identities": len(set(ddp_by_id) - set(api_records)),
+        "already_trusted_identities": 0,
+        "legacy_rekeys_ready": 0,
+        "target_id_cross_tenant": 0,
+        "target_id_duplicate": 0,
+        "legacy_url_missing": 0,
+        "legacy_url_ambiguous": 0,
+        "legacy_row_has_ddp_lineage": 0,
+        "legacy_row_has_native_id": 0,
+        "untrusted_existing_native_id": 0,
+        "native_id_url_rebind": 0,
+        "reconciliation_record_conflict": reconciliation_conflicts,
+    }
+    for external_id, (canonical_url, _) in api_records.items():
+        trusted = trusted_by_id.get(external_id)
+        if trusted is not None and _canonical_pharmonline_product_url(trusted.url) == canonical_url:
+            metrics["already_trusted_identities"] += 1
+            continue
+
+        global_rows = all_by_external_id.get(external_id, [])
+        tenant_rows = tenant_by_external_id.get(external_id, [])
+        if global_rows and not tenant_rows:
+            metrics["target_id_cross_tenant"] += 1
+            continue
+        if len(global_rows) > 1 or len(tenant_rows) > 1:
+            metrics["target_id_duplicate"] += 1
+            continue
+        if tenant_rows:
+            current = tenant_rows[0]
+            if _canonical_pharmonline_product_url(current.url) != canonical_url:
+                metrics["native_id_url_rebind"] += 1
+            else:
+                metrics["untrusted_existing_native_id"] += 1
+            continue
+
+        url_rows = tenant_by_url.get(canonical_url, [])
+        if not url_rows:
+            metrics["legacy_url_missing"] += 1
+            continue
+        if len(url_rows) != 1:
+            metrics["legacy_url_ambiguous"] += 1
+            continue
+        legacy = url_rows[0]
+        legacy_external_id = str(legacy.external_id)
+        if (
+            legacy.availability_source == _PHARMONLINE_DDP_AVAILABILITY_SOURCE
+            or legacy.id in trusted_history_product_ids
+        ):
+            metrics["legacy_row_has_ddp_lineage"] += 1
+            continue
+        if _PHARMONLINE_METEOR_ID_RE.fullmatch(legacy_external_id) is not None:
+            metrics["legacy_row_has_native_id"] += 1
+            continue
+        actions.append(
+            _PharmonlinePublicAPIReconciliationAction(
+                product_id=legacy.id,
+                legacy_external_id=legacy_external_id,
+                public_api_external_id=external_id,
+                canonical_url=canonical_url,
+            )
+        )
+        metrics["legacy_rekeys_ready"] += 1
+    return actions, metrics
+
+
+def _pharmonline_public_api_reconciliation_is_safe(metrics: dict[str, int]) -> bool:
+    """Whether a plan has no unproven/rebound/cross-tenant identity cases."""
+    return not any(
+        metrics[key]
+        for key in (
+            "target_id_cross_tenant",
+            "target_id_duplicate",
+            "legacy_url_missing",
+            "legacy_url_ambiguous",
+            "legacy_row_has_ddp_lineage",
+            "legacy_row_has_native_id",
+            "untrusted_existing_native_id",
+            "native_id_url_rebind",
+            "reconciliation_record_conflict",
+        )
+    )
+
+
+def _require_pharmonline_public_api_reconciliation_proof(
+    *,
+    source_manifest_sha256: str,
+    catalog_fingerprint_sha256: str,
+    source_transport: str,
+    preflight_run_ref: str,
+) -> None:
+    """Validate non-secret, immutable evidence supplied by the gated workflow."""
+    if (
+        _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(source_manifest_sha256) is None
+        or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(catalog_fingerprint_sha256) is None
+        or source_transport not in {"crawlbase", "decodo", "scraperapi"}
+        or re.fullmatch(r"[0-9]{1,20}", preflight_run_ref) is None
+    ):
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline reconciliation requires valid immutable workflow evidence"
+        )
+
+
+def _apply_pharmonline_public_api_reconciliation(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+    source_manifest_sha256: str,
+    catalog_fingerprint_sha256: str,
+    source_transport: str,
+    preflight_run_ref: str,
+) -> dict[str, int]:
+    """Apply only a completely prevalidated exact-URL legacy ID batch.
+
+    Call this inside an explicit transaction owned by the dedicated recovery
+    script.  It never deletes Products; all linked history remains attached to
+    the same product primary key.
+    """
+    _require_pharmonline_public_api_reconciliation_proof(
+        source_manifest_sha256=source_manifest_sha256,
+        catalog_fingerprint_sha256=catalog_fingerprint_sha256,
+        source_transport=source_transport,
+        preflight_run_ref=preflight_run_ref,
+    )
+    if not _pharmonline_public_api_recovery_tables_available(session):
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline reconciliation audit schema is not migrated"
+        )
+    actions, metrics = _pharmonline_public_api_reconciliation_plan(
+        session,
+        results,
+        tenant_id=tenant_id,
+        lock_products=True,
+    )
+    if not _pharmonline_public_api_reconciliation_is_safe(metrics):
+        diagnostic_text = ", ".join(f"{key}={value}" for key, value in sorted(metrics.items()))
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline reconciliation refused persistence: " + diagnostic_text
+        )
+
+    for action in actions:
+        product = session.get(storage.Product, action.product_id)
+        if (
+            product is None
+            or product.tenant_id != tenant_id
+            or product.site != "pharmonline"
+            or str(product.external_id) != action.legacy_external_id
+            or _canonical_pharmonline_product_url(product.url) != action.canonical_url
+        ):
+            raise PharmonlinePublicAPIReconciliationError(
+                "public Pharmonline reconciliation state changed before apply"
+            )
+        product.external_id = action.public_api_external_id
+        session.add(
+            storage.PharmonlinePublicAPIIdentityReconciliation(
+                tenant_id=tenant_id,
+                product_id=product.id,
+                legacy_external_id=action.legacy_external_id,
+                public_api_external_id=action.public_api_external_id,
+                legacy_canonical_url=action.canonical_url,
+                public_api_canonical_url=action.canonical_url,
+                proof_version=_PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION,
+                source_manifest_sha256=source_manifest_sha256,
+                catalog_fingerprint_sha256=catalog_fingerprint_sha256,
+                source_transport=source_transport,
+                preflight_run_ref=preflight_run_ref,
+            )
+        )
+    session.flush()
+    return metrics
+
+
+def _ensure_pharmonline_public_api_catalog_baseline(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+    verified_identity_count: int,
+    trusted_ddp_item_count: int,
+    retired_ddp_item_count: int,
+    reconciled_item_count: int,
+    source_manifest_sha256: str,
+    catalog_fingerprint_sha256: str,
+    source_transport: str,
+    preflight_run_ref: str,
+) -> int:
+    """Create a one-time conservative floor, never automatically lower it."""
+    _require_pharmonline_public_api_reconciliation_proof(
+        source_manifest_sha256=source_manifest_sha256,
+        catalog_fingerprint_sha256=catalog_fingerprint_sha256,
+        source_transport=source_transport,
+        preflight_run_ref=preflight_run_ref,
+    )
+    if not _pharmonline_public_api_recovery_tables_available(session):
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline catalog baseline schema is not migrated"
+        )
+    catalog_item_count = len(_public_api_identity_records(results))
+    baselines = session.scalars(
+        select(storage.PharmonlinePublicAPICatalogBaseline).where(
+            storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id,
+        )
+    ).all()
+    existing_floor = max(
+        (baseline.minimum_catalog_item_count for baseline in baselines),
+        default=0,
+    )
+    if existing_floor:
+        if catalog_item_count < existing_floor:
+            raise PharmonlinePublicAPIReconciliationError(
+                "public Pharmonline catalog is below its immutable recovery floor"
+            )
+        return existing_floor
+    if catalog_item_count < _PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS:
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline catalog is below the one-time bootstrap floor"
+        )
+    minimum_catalog_item_count = max(
+        _PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS,
+        (catalog_item_count * _PHARMONLINE_PUBLIC_API_BASELINE_FRACTION_PER_THOUSAND + 999) // 1000,
+    )
+    session.add(
+        storage.PharmonlinePublicAPICatalogBaseline(
+            tenant_id=tenant_id,
+            catalog_item_count=catalog_item_count,
+            minimum_catalog_item_count=minimum_catalog_item_count,
+            verified_identity_count=verified_identity_count,
+            trusted_ddp_item_count=trusted_ddp_item_count,
+            retired_ddp_item_count=retired_ddp_item_count,
+            reconciled_item_count=reconciled_item_count,
+            proof_version=_PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION,
+            source_manifest_sha256=source_manifest_sha256,
+            catalog_fingerprint_sha256=catalog_fingerprint_sha256,
+            source_transport=source_transport,
+            preflight_run_ref=preflight_run_ref,
+        )
+    )
+    session.flush()
+    return minimum_catalog_item_count
 
 
 def _bridge_pharmonline_legacy_ids(
@@ -197,67 +677,18 @@ def _verify_pharmonline_public_api_identities(
     *,
     tenant_id: int,
 ) -> int:
-    """Require every current API ID→URL pair to exist in trusted DDP history.
+    """Require every current API ID→URL pair to have immutable lineage.
 
-    The public API and sitemap prove that the new source is internally
-    complete, but they cannot prove that a first-party ID has not been
-    reassigned. For this guarded recovery, every current API
-    `(external_id, canonical URL)` pair must exist in the prior DDP-trusted
-    map before the first Product, offer observation, or price snapshot write.
-    Current DDP fields and immutable DDP offer observations both establish that
-    lineage, so a guarded retry remains safe after a prior public-API write has
-    updated the mutable current availability source. Historic DDP-only rows are
-    permitted as normal delistings, but the current source must still cover at
-    least 98% of that trusted catalog. New or rebound API IDs intentionally
-    stop the recovery rather than being guessed into the historical catalog.
+    Current IDs must resolve to prior DDP history or an exact, append-only
+    legacy-ID reconciliation record.  The historic DDP catalog can legitimately
+    contain delisted SKUs after an outage, so catalog continuity is protected by
+    a separate non-ratcheting public-API floor rather than by treating every
+    retired DDP identity as a current-source defect.
     """
-    from src.scrapers.pharmonline_public_api import PUBLIC_API_AVAILABILITY_SOURCE
-
-    pharmonline_results = [result for result in results if result.site == "pharmonline"]
-    unexpected_results = len(results) - len(pharmonline_results)
-    unexpected_promos = sum(len(result.promos) for result in pharmonline_results)
-    if len(pharmonline_results) != 1 or unexpected_results or unexpected_promos:
-        raise PharmonlinePublicAPIIdentityError(
-            "public Pharmonline API identity proof refused persistence: "
-            f"pharmonline_results={len(pharmonline_results)}, "
-            f"unexpected_results={unexpected_results}, "
-            f"unexpected_promos={unexpected_promos}"
-        )
-
-    api_by_id: dict[str, str] = {}
-    api_by_url: dict[str, str] = {}
-    invalid_api = 0
-    duplicate_api_ids = 0
-    duplicate_api_urls = 0
-    for result in pharmonline_results:
-        for product in result.products:
-            external_id = str(product.external_id)
-            canonical_url = _canonical_pharmonline_product_url(product.url)
-            if (
-                product.site != "pharmonline"
-                or not product.identity_verified
-                or _PHARMONLINE_METEOR_ID_RE.fullmatch(external_id) is None
-                or canonical_url is None
-                or product.availability_source != PUBLIC_API_AVAILABILITY_SOURCE
-            ):
-                invalid_api += 1
-                continue
-            if external_id in api_by_id:
-                duplicate_api_ids += 1
-                continue
-            if canonical_url in api_by_url:
-                duplicate_api_urls += 1
-                continue
-            api_by_id[external_id] = canonical_url
-            api_by_url[canonical_url] = external_id
-
-    if invalid_api or duplicate_api_ids or duplicate_api_urls or not api_by_id:
-        raise PharmonlinePublicAPIIdentityError(
-            "public Pharmonline API identity proof refused persistence: "
-            f"api_ids={len(api_by_id)}, invalid_api={invalid_api}, "
-            f"duplicate_api_ids={duplicate_api_ids}, "
-            f"duplicate_api_urls={duplicate_api_urls}"
-        )
+    api_records = _public_api_identity_records(results)
+    api_by_id = {
+        external_id: canonical_url for external_id, (canonical_url, _) in api_records.items()
+    }
 
     existing = session.scalars(
         select(storage.Product).where(
@@ -265,67 +696,88 @@ def _verify_pharmonline_public_api_identities(
             storage.Product.tenant_id == tenant_id,
         )
     ).all()
-    trusted_history_product_ids = set(
-        session.scalars(
-            select(storage.OfferObservation.product_id)
-            .where(
-                storage.OfferObservation.tenant_id == tenant_id,
-                storage.OfferObservation.availability_source
-                == _PHARMONLINE_DDP_AVAILABILITY_SOURCE,
-            )
-            .distinct()
-        ).all()
+    ddp_by_id, trusted_history_product_ids, invalid_trusted, duplicate_trusted_ids = (
+        _trusted_ddp_products_by_id(session, existing, tenant_id=tenant_id)
     )
-    trusted_by_id: dict[str, storage.Product] = {}
+    reconciled_by_id, reconciliation_conflicts = _valid_pharmonline_public_api_reconciliations(
+        session,
+        existing,
+        tenant_id=tenant_id,
+    )
+    trusted_by_id = dict(ddp_by_id)
+    for external_id, product in reconciled_by_id.items():
+        trusted = trusted_by_id.get(external_id)
+        if trusted is not None and trusted.id != product.id:
+            duplicate_trusted_ids += 1
+            continue
+        trusted_by_id[external_id] = product
+
     all_by_id: dict[str, list[storage.Product]] = {}
     all_by_url: dict[str, list[storage.Product]] = {}
-    invalid_trusted = 0
-    duplicate_trusted_ids = 0
     for stored in existing:
         external_id = str(stored.external_id)
         canonical_url = _canonical_pharmonline_product_url(stored.url)
         all_by_id.setdefault(external_id, []).append(stored)
         if canonical_url is not None:
             all_by_url.setdefault(canonical_url, []).append(stored)
-        if (
-            stored.availability_source != _PHARMONLINE_DDP_AVAILABILITY_SOURCE
-            and stored.id not in trusted_history_product_ids
-        ):
-            continue
-        if _PHARMONLINE_METEOR_ID_RE.fullmatch(external_id) is None or canonical_url is None:
-            invalid_trusted += 1
-            continue
-        if external_id in trusted_by_id:
-            duplicate_trusted_ids += 1
-            continue
-        trusted_by_id[external_id] = stored
 
     api_ids = set(api_by_id)
     trusted_ids = set(trusted_by_id)
     missing_trusted_ids = api_ids - trusted_ids
-    retired_trusted_ids = trusted_ids - api_ids
+    retired_trusted_ids = set(ddp_by_id) - api_ids
+    trusted_product_ids = {product.id for product in trusted_by_id.values()}
     mismatched_urls = 0
     id_collisions = 0
     url_collisions = 0
+    current_identity_matches = 0
     for external_id, canonical_url in api_by_id.items():
         trusted = trusted_by_id.get(external_id)
-        if trusted is not None and _canonical_pharmonline_product_url(trusted.url) != canonical_url:
+        trusted_matches_url = (
+            trusted is not None and _canonical_pharmonline_product_url(trusted.url) == canonical_url
+        )
+        if trusted is not None and not trusted_matches_url:
             mismatched_urls += 1
+        if trusted_matches_url:
+            current_identity_matches += 1
         id_rows = all_by_id.get(external_id, [])
         if trusted is None or len(id_rows) != 1 or id_rows[0].id != trusted.id:
             id_collisions += 1
-        url_rows = all_by_url.get(canonical_url, [])
-        if trusted is None or len(url_rows) != 1 or url_rows[0].id != trusted.id:
+        # Legacy URL shadows are historical, non-trusted rows and do not alter
+        # the target native product. A second trusted identity at the same URL
+        # remains a hard failure.
+        trusted_url_rows = [
+            row for row in all_by_url.get(canonical_url, []) if row.id in trusted_product_ids
+        ]
+        if trusted is None or len(trusted_url_rows) != 1 or trusted_url_rows[0].id != trusted.id:
             url_collisions += 1
 
-    trusted_coverage = len(api_ids) / len(trusted_ids) if trusted_ids else 0.0
+    catalog_floor = 0
+    if _pharmonline_public_api_recovery_tables_available(session):
+        baselines = session.scalars(
+            select(storage.PharmonlinePublicAPICatalogBaseline).where(
+                storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id,
+            )
+        ).all()
+        catalog_floor = max(
+            (baseline.minimum_catalog_item_count for baseline in baselines),
+            default=0,
+        )
+    require_catalog_floor = os.environ.get(
+        "PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE", ""
+    ).strip().lower() in {"1", "true", "yes", "required"}
+    catalog_floor_missing = require_catalog_floor and catalog_floor < 1
+    catalog_floor_failed = bool(catalog_floor and len(api_ids) < catalog_floor)
+    trusted_coverage = current_identity_matches / len(api_ids) if api_ids else 0.0
     if (
         invalid_trusted
         or duplicate_trusted_ids
+        or reconciliation_conflicts
         or missing_trusted_ids
         or mismatched_urls
         or id_collisions
         or url_collisions
+        or catalog_floor_missing
+        or catalog_floor_failed
         or trusted_coverage < _PHARMONLINE_PUBLIC_API_MIN_TRUSTED_COVERAGE
     ):
         raise PharmonlinePublicAPIIdentityError(
@@ -333,9 +785,13 @@ def _verify_pharmonline_public_api_identities(
             f"api_ids={len(api_ids)}, trusted_ids={len(trusted_ids)}, "
             f"invalid_trusted={invalid_trusted}, "
             f"duplicate_trusted_ids={duplicate_trusted_ids}, "
+            f"reconciliation_conflicts={reconciliation_conflicts}, "
             f"missing_trusted_ids={len(missing_trusted_ids)}, "
             f"retired_trusted_ids={len(retired_trusted_ids)}, "
             f"trusted_coverage={trusted_coverage:.4f}, "
+            f"catalog_floor={catalog_floor}, "
+            f"catalog_floor_missing={int(catalog_floor_missing)}, "
+            f"catalog_floor_failed={int(catalog_floor_failed)}, "
             f"mismatched_urls={mismatched_urls}, id_collisions={id_collisions}, "
             f"url_collisions={url_collisions}"
         )
@@ -345,6 +801,8 @@ def _verify_pharmonline_public_api_identities(
         products=len(api_by_id),
         trusted_coverage=round(trusted_coverage, 4),
         trusted_history_products=len(trusted_history_product_ids),
+        reconciled_identities=len(reconciled_by_id),
+        catalog_floor=catalog_floor or None,
         tenant_id=tenant_id,
     )
     return len(api_by_id)
@@ -514,6 +972,40 @@ def _diagnose_pharmonline_public_api_identities(
         "missing_id_multiple_url_rows": missing_id_multiple_url_rows,
         "missing_id_url_has_other_trusted_row": missing_id_url_has_other_trusted_row,
     }
+
+
+def _diagnose_pharmonline_public_api_reconciliation(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+) -> dict[str, int]:
+    """Return aggregate-only readiness evidence for the explicit rekey step."""
+    _, metrics = _pharmonline_public_api_reconciliation_plan(
+        session,
+        results,
+        tenant_id=tenant_id,
+    )
+    schema_migrated = _pharmonline_public_api_recovery_tables_available(session)
+    baselines: list[storage.PharmonlinePublicAPICatalogBaseline] = []
+    if schema_migrated:
+        baselines = session.scalars(
+            select(storage.PharmonlinePublicAPICatalogBaseline).where(
+                storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id,
+            )
+        ).all()
+    metrics.update(
+        {
+            "recovery_schema_migrated": int(schema_migrated),
+            "catalog_baseline_records": len(baselines),
+            "catalog_baseline_floor": max(
+                (baseline.minimum_catalog_item_count for baseline in baselines),
+                default=0,
+            ),
+            "reconciliation_safe": int(_pharmonline_public_api_reconciliation_is_safe(metrics)),
+        }
+    )
+    return metrics
 
 
 # Phase 1c (2026-05-27) — pharmonline DDP path uses reverse-engineered Meteor

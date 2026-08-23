@@ -262,6 +262,72 @@ class Product(Base):
     canonical: Mapped[Match | None] = relationship(back_populates="products")
 
 
+class PharmonlinePublicAPIIdentityReconciliation(Base):
+    """Immutable proof for a guarded Pharmonline legacy-ID reconciliation.
+
+    The recovery changes a Product in place, preserving its primary key and
+    every attached snapshot, observation, match, stock and supplier record.
+    This append-only record preserves the before/after identifiers, exact
+    staged source and catalog proof; it is never a mutable trust flag.
+    """
+
+    __tablename__ = "pharmonline_public_api_identity_reconciliations"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "product_id",
+            name="uq_pharmonline_public_api_reconciliation_product",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "legacy_external_id",
+            name="uq_pharmonline_public_api_reconciliation_legacy_id",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "public_api_external_id",
+            name="uq_pharmonline_public_api_reconciliation_public_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="RESTRICT"), index=True
+    )
+    legacy_external_id: Mapped[str] = mapped_column(String(200))
+    public_api_external_id: Mapped[str] = mapped_column(String(200))
+    legacy_canonical_url: Mapped[str] = mapped_column(String(500))
+    public_api_canonical_url: Mapped[str] = mapped_column(String(500))
+    proof_version: Mapped[str] = mapped_column(String(40))
+    source_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
+    source_transport: Mapped[str] = mapped_column(String(40))
+    preflight_run_ref: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class PharmonlinePublicAPICatalogBaseline(Base):
+    """Append-only non-ratcheting catalog floor for public-API recovery."""
+
+    __tablename__ = "pharmonline_public_api_catalog_baselines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    catalog_item_count: Mapped[int] = mapped_column(Integer)
+    minimum_catalog_item_count: Mapped[int] = mapped_column(Integer)
+    verified_identity_count: Mapped[int] = mapped_column(Integer)
+    trusted_ddp_item_count: Mapped[int] = mapped_column(Integer)
+    retired_ddp_item_count: Mapped[int] = mapped_column(Integer)
+    reconciled_item_count: Mapped[int] = mapped_column(Integer)
+    proof_version: Mapped[str] = mapped_column(String(40))
+    source_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
+    source_transport: Mapped[str] = mapped_column(String(40))
+    preflight_run_ref: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
 class PriceSnapshot(Base):
     """Цена и промо-статус товара на момент конкретного прогона."""
 

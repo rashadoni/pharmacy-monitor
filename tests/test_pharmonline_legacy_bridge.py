@@ -194,7 +194,7 @@ def _public_api_product(url: str, external_id: str = _METEOR_ID) -> ScrapedProdu
     )
 
 
-def test_public_api_identity_proof_allows_only_retired_trusted_ddp_rows(db_session, monkeypatch):
+def test_public_api_identity_proof_allows_only_retired_trusted_ddp_rows(db_session):
     current_url = "https://pharmonline.az/product/current-product"
     db_session.add_all(
         [
@@ -206,8 +206,6 @@ def test_public_api_identity_proof_allows_only_retired_trusted_ddp_rows(db_sessi
         ]
     )
     db_session.commit()
-    monkeypatch.setattr(main_mod, "_PHARMONLINE_PUBLIC_API_MIN_TRUSTED_COVERAGE", 0.5)
-
     verified = main_mod._verify_pharmonline_public_api_identities(
         db_session,
         [ScrapeResult(site="pharmonline", products=[_public_api_product(current_url)])],
@@ -328,7 +326,9 @@ def test_public_api_identity_proof_rejects_rebound_id_url(db_session):
         )
 
 
-def test_public_api_identity_proof_rejects_coverage_drop_below_threshold(db_session):
+def test_public_api_identity_proof_does_not_misclassify_retired_ddp_rows_as_a_source_drop(
+    db_session,
+):
     current_url = "https://pharmonline.az/product/current-product"
     db_session.add_all(
         [
@@ -341,14 +341,183 @@ def test_public_api_identity_proof_rejects_coverage_drop_below_threshold(db_sess
     )
     db_session.commit()
 
-    with pytest.raises(
-        main_mod.PharmonlinePublicAPIIdentityError,
-        match="trusted_coverage=0.5000",
-    ):
+    assert (
         main_mod._verify_pharmonline_public_api_identities(
             db_session,
             [ScrapeResult(site="pharmonline", products=[_public_api_product(current_url)])],
             tenant_id=1,
+        )
+        == 1
+    )
+
+
+def test_public_api_identity_proof_ignores_a_non_ddp_legacy_url_shadow(db_session):
+    current_url = "https://pharmonline.az/product/current-product"
+    db_session.add_all(
+        [
+            _stored_product(url=current_url),
+            _stored_product(
+                url=current_url,
+                external_id="legacy-current-product",
+                availability_source=None,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    assert (
+        main_mod._verify_pharmonline_public_api_identities(
+            db_session,
+            [ScrapeResult(site="pharmonline", products=[_public_api_product(current_url)])],
+            tenant_id=1,
+        )
+        == 1
+    )
+
+
+_RECOVERY_MANIFEST_SHA = "a" * 64
+
+
+def _reconcile(
+    db_session,
+    products: list[ScrapedProduct],
+    *,
+    preflight_run_ref: str = "123456",
+):
+    results = [ScrapeResult(site="pharmonline", products=products)]
+    return main_mod._apply_pharmonline_public_api_reconciliation(
+        db_session,
+        results,
+        tenant_id=1,
+        source_manifest_sha256=_RECOVERY_MANIFEST_SHA,
+        catalog_fingerprint_sha256=main_mod._pharmonline_public_api_catalog_fingerprint(results),
+        source_transport="decodo",
+        preflight_run_ref=preflight_run_ref,
+    )
+
+
+def test_public_api_reconciliation_rekeys_only_one_exact_non_ddp_legacy_url(db_session):
+    url = "https://pharmonline.az/product/legacy-product"
+    legacy = _stored_product(
+        url=url,
+        external_id="legacy-product-id",
+        availability_source=None,
+    )
+    db_session.add(legacy)
+    db_session.commit()
+    product_id = legacy.id
+    run = storage.Run(status="ok")
+    db_session.add(run)
+    db_session.commit()
+    observation = storage.OfferObservation(
+        tenant_id=1,
+        run_id=run.id,
+        product_id=legacy.id,
+        availability_source="legacy_rendered_html",
+    )
+    db_session.add(observation)
+    db_session.commit()
+
+    public = _public_api_product(url, external_id="6kHnwLLMpYXyebN8f")
+    metrics = _reconcile(db_session, [public])
+
+    refreshed = db_session.get(storage.Product, product_id)
+    record = db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).one()
+    assert metrics["legacy_rekeys_ready"] == 1
+    assert refreshed is not None
+    assert refreshed.id == product_id
+    assert refreshed.external_id == public.external_id
+    assert observation.product_id == product_id
+    assert record.product_id == product_id
+    assert record.legacy_external_id == "legacy-product-id"
+    assert record.public_api_external_id == public.external_id
+    assert (
+        main_mod._verify_pharmonline_public_api_identities(
+            db_session,
+            [ScrapeResult(site="pharmonline", products=[public])],
+            tenant_id=1,
+        )
+        == 1
+    )
+
+
+def test_public_api_reconciliation_refuses_an_ambiguous_legacy_url_without_mutation(db_session):
+    url = "https://pharmonline.az/product/ambiguous-legacy-product"
+    db_session.add_all(
+        [
+            _stored_product(url=url, external_id="legacy-one", availability_source=None),
+            _stored_product(url=url, external_id="legacy-two", availability_source=None),
+        ]
+    )
+    db_session.commit()
+
+    with pytest.raises(
+        main_mod.PharmonlinePublicAPIReconciliationError,
+        match="legacy_url_ambiguous=1",
+    ):
+        _reconcile(db_session, [_public_api_product(url, external_id="6kHnwLLMpYXyebN8f")])
+
+    assert {
+        product.external_id
+        for product in db_session.query(storage.Product).filter_by(site="pharmonline").all()
+    } == {"legacy-one", "legacy-two"}
+    assert db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).count() == 0
+
+
+def test_catalog_baseline_never_lowers_after_its_initial_recovery_proof(db_session, monkeypatch):
+    monkeypatch.setattr(main_mod, "_PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS", 2)
+    first_results = [
+        ScrapeResult(
+            site="pharmonline",
+            products=[
+                _public_api_product("https://pharmonline.az/product/one"),
+                _public_api_product(
+                    "https://pharmonline.az/product/two",
+                    external_id="6kHnwLLMpYXyebN8f",
+                ),
+            ],
+        )
+    ]
+    fingerprint = main_mod._pharmonline_public_api_catalog_fingerprint(first_results)
+    floor = main_mod._ensure_pharmonline_public_api_catalog_baseline(
+        db_session,
+        first_results,
+        tenant_id=1,
+        verified_identity_count=2,
+        trusted_ddp_item_count=2,
+        retired_ddp_item_count=0,
+        reconciled_item_count=0,
+        source_manifest_sha256=_RECOVERY_MANIFEST_SHA,
+        catalog_fingerprint_sha256=fingerprint,
+        source_transport="decodo",
+        preflight_run_ref="123456",
+    )
+    assert floor == 2
+
+    one_product_results = [
+        ScrapeResult(
+            site="pharmonline",
+            products=[_public_api_product("https://pharmonline.az/product/one")],
+        )
+    ]
+    with pytest.raises(
+        main_mod.PharmonlinePublicAPIReconciliationError,
+        match="immutable recovery floor",
+    ):
+        main_mod._ensure_pharmonline_public_api_catalog_baseline(
+            db_session,
+            one_product_results,
+            tenant_id=1,
+            verified_identity_count=1,
+            trusted_ddp_item_count=1,
+            retired_ddp_item_count=1,
+            reconciled_item_count=0,
+            source_manifest_sha256=_RECOVERY_MANIFEST_SHA,
+            catalog_fingerprint_sha256=main_mod._pharmonline_public_api_catalog_fingerprint(
+                one_product_results
+            ),
+            source_transport="decodo",
+            preflight_run_ref="123456",
         )
 
 

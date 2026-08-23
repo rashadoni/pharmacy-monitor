@@ -22,7 +22,9 @@ from sqlalchemy import text
 from src import storage
 from src.main import (
     PharmonlinePublicAPIIdentityError,
+    _diagnose_pharmonline_public_api_reconciliation,
     _diagnose_pharmonline_public_api_identities,
+    _pharmonline_public_api_catalog_fingerprint,
     _verify_pharmonline_public_api_identities,
 )
 from src.scrapers.pharmonline_public_api import (
@@ -116,12 +118,24 @@ async def main() -> None:
                     [first_pass],
                     tenant_id=1,
                 )
+                reconciliation_diagnostics = _diagnose_pharmonline_public_api_reconciliation(
+                    session,
+                    [first_pass],
+                    tenant_id=1,
+                )
                 diagnostic_text = ", ".join(
                     f"{key}={value}" for key, value in sorted(diagnostics.items())
+                )
+                reconciliation_text = ", ".join(
+                    f"{key}={value}" for key, value in sorted(reconciliation_diagnostics.items())
                 )
                 print(
                     "Pharmonline public API identity diagnostics "
                     f"(read-only, aggregate-only): {diagnostic_text}"
+                )
+                print(
+                    "Pharmonline public API reconciliation diagnostics "
+                    f"(read-only, aggregate-only): {reconciliation_text}"
                 )
                 fail(str(exc))
         finally:
@@ -133,6 +147,7 @@ async def main() -> None:
         f"transport={transport}, products={len(first_pass.products)}, "
         f"pages={route.expected_pages}, two_passes=identical, "
         f"trusted_ddp_identities={verified_identities}, "
+        f"catalog_fingerprint_sha256={_pharmonline_public_api_catalog_fingerprint([first_pass])}, "
         "database_transaction=read_only, persistence=none"
     )
 

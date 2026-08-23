@@ -363,7 +363,7 @@ async def test_decodo_transport_uses_isolated_logical_contexts(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_decodo_backconnect_uses_a_named_sticky_session_per_context(monkeypatch):
+async def test_decodo_backconnect_keeps_the_whole_catalog_in_one_named_session(monkeypatch):
     monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
     monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "decodo")
     monkeypatch.setenv("PHARMONLINE_DECODO_BACKCONNECT_STICKY", "1")
@@ -380,6 +380,7 @@ async def test_decodo_backconnect_uses_a_named_sticky_session_per_context(monkey
         second_context = scraper._catalog_session_for_page(11)
         assert scraper._decodo_port_for_context(first_context) == 7000
         assert scraper._decodo_port_for_context(second_context) == 7000
+        assert first_context == second_context
 
         first_proxy = urlsplit(scraper._decodo_proxy_url_for_context(first_context, 7000))
         second_proxy = urlsplit(scraper._decodo_proxy_url_for_context(second_context, 7000))
@@ -390,7 +391,7 @@ async def test_decodo_backconnect_uses_a_named_sticky_session_per_context(monkey
         assert first_proxy.port == second_proxy.port == 7000
         assert first_username.startswith("user-proxy-user-country-az-session-")
         assert first_username.endswith("-sessionduration-30")
-        assert first_username != second_username
+        assert first_username == second_username
         first_session = first_username.removeprefix(
             "user-proxy-user-country-az-session-"
         ).removesuffix("-sessionduration-30")

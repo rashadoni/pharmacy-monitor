@@ -62,3 +62,52 @@ def test_identity_offer_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
     assert "offer_observations" not in inspector.get_table_names()
     assert "match_policy_audits" not in inspector.get_table_names()
     assert "aloe_country_mappings" not in inspector.get_table_names()
+
+
+def test_pharmonline_public_api_reconciliation_migration_is_reversible(
+    tmp_path: Path,
+) -> None:
+    db_url = f"sqlite:///{tmp_path / 'pharmonline-public-api-reconciliation.sqlite'}"
+    _alembic(db_url, "upgrade", "0019_pharmonline_public_api_reconciliation")
+
+    inspector = inspect(create_engine(db_url))
+    reconciliation_columns = {
+        column["name"]
+        for column in inspector.get_columns("pharmonline_public_api_identity_reconciliations")
+    }
+    baseline_columns = {
+        column["name"]
+        for column in inspector.get_columns("pharmonline_public_api_catalog_baselines")
+    }
+    assert {
+        "tenant_id",
+        "product_id",
+        "legacy_external_id",
+        "public_api_external_id",
+        "legacy_canonical_url",
+        "public_api_canonical_url",
+        "source_manifest_sha256",
+        "catalog_fingerprint_sha256",
+        "preflight_run_ref",
+    } <= reconciliation_columns
+    assert {
+        "catalog_item_count",
+        "minimum_catalog_item_count",
+        "verified_identity_count",
+        "trusted_ddp_item_count",
+        "retired_ddp_item_count",
+        "reconciled_item_count",
+    } <= baseline_columns
+    unique_constraints = inspector.get_unique_constraints(
+        "pharmonline_public_api_identity_reconciliations"
+    )
+    assert {
+        "uq_pharmonline_public_api_reconciliation_product",
+        "uq_pharmonline_public_api_reconciliation_legacy_id",
+        "uq_pharmonline_public_api_reconciliation_public_id",
+    } <= {constraint["name"] for constraint in unique_constraints}
+
+    _alembic(db_url, "downgrade", "0018_product_manual_category")
+    inspector = inspect(create_engine(db_url))
+    assert "pharmonline_public_api_identity_reconciliations" not in inspector.get_table_names()
+    assert "pharmonline_public_api_catalog_baselines" not in inspector.get_table_names()
