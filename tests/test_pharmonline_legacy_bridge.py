@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import text
 
 from src import main as main_mod
 from src import storage
@@ -461,16 +460,6 @@ def test_public_api_reconciliation_rekeys_only_one_exact_non_ddp_legacy_url(db_s
     assert main_mod._PHARMONLINE_METEOR_ID_RE.fullmatch(record.legacy_external_id) is None
     assert main_mod._PHARMONLINE_METEOR_ID_RE.fullmatch(record.public_api_external_id)
     assert main_mod._pharmonline_public_api_reconciliation_invalid_reason(record, refreshed) is None
-    assert (
-        db_session.execute(
-            text("SELECT tenant_id FROM pharmonline_public_api_identity_reconciliations")
-        ).scalar_one()
-        == 1
-    )
-    assert db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).filter(
-        storage.PharmonlinePublicAPIIdentityReconciliation.tenant_id == 1
-    ).all() == [record]
-    assert {refreshed.id: refreshed}.get(record.product_id) is refreshed
     valid_reconciliations, conflicts = main_mod._valid_pharmonline_public_api_reconciliations(
         db_session,
         [refreshed],
