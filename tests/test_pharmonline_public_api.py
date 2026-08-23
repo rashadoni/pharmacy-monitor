@@ -258,9 +258,10 @@ async def test_public_api_rejects_sitemap_mismatch_before_any_yield():
         "products_metadata_changed_during_pagination",
         "products_chunk_anchor_metadata_changed",
         "products_chunk_anchor_changed",
+        "product_sitemap_index_missing",
     ],
 )
-def test_only_discarded_live_catalog_consistency_failures_are_retryable(reason):
+def test_only_discarded_transient_catalog_failures_are_retryable(reason):
     assert is_retryable_full_catalog_abort_reason(reason) is True
 
 

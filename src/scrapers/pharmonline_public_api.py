@@ -103,6 +103,7 @@ _RETRYABLE_FULL_CATALOG_ABORT_REASONS = frozenset(
         "products_metadata_changed_during_pagination",
         "products_chunk_anchor_metadata_changed",
         "products_chunk_anchor_changed",
+        "product_sitemap_index_missing",
     }
 )
 
@@ -114,10 +115,10 @@ class PharmonlinePublicAPIError(RuntimeError):
 def is_retryable_full_catalog_abort_reason(reason: str | None) -> bool:
     """Whether a discarded full read may be retried from a fresh API session.
 
-    A page or chunk-anchor metadata change proves that this *attempt* mixed
-    live catalog versions, so the scraper itself must yield nothing. A caller
-    may start over only when it discards the entire attempt and later proves
-    two complete fresh reads identical before persistence.
+    A page/chunk-anchor metadata change or an empty sitemap index proves that
+    this *attempt* is incomplete, so the scraper itself must yield nothing. A
+    caller may start over only when it discards the entire attempt and later
+    proves two complete fresh reads identical before persistence.
     """
     return reason in _RETRYABLE_FULL_CATALOG_ABORT_REASONS
 
