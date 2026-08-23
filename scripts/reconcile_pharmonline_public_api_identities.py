@@ -33,7 +33,7 @@ from src.main import (
     _pharmonline_public_api_redirect_challenges,
     _verify_pharmonline_public_api_identities,
 )
-from src.run_lock import try_exclusive_scrape_lock
+from src.run_lock import wait_for_exclusive_scrape_lock
 from src.scrapers.pharmonline_public_api import (
     PUBLIC_CATALOG_ROUTE,
     PharmonlinePublicAPIScraper,
@@ -42,6 +42,8 @@ from src.scrapers.pharmonline_public_api import (
 
 
 _MAX_FRESH_CATALOG_READ_ATTEMPTS = 3
+_MAX_PRODUCTION_LOCK_WAIT_SECONDS = 45 * 60
+_PRODUCTION_LOCK_POLL_SECONDS = 15
 
 
 def fail(message: str) -> NoReturn:
@@ -132,6 +134,22 @@ def _expected_plan_evidence() -> tuple[str, str, int]:
     return fingerprint, manifest, int(raw_count)
 
 
+def _production_lock_wait_seconds() -> int:
+    """Read the bounded workflow wait without allowing an unbounded job."""
+    raw = os.environ.get("PHARMONLINE_PUBLIC_API_LOCK_WAIT_SECONDS", "0").strip()
+    if not raw:
+        return 0
+    if not raw.isdigit():
+        fail("PHARMONLINE_PUBLIC_API_LOCK_WAIT_SECONDS must be a whole number")
+    seconds = int(raw)
+    if seconds > _MAX_PRODUCTION_LOCK_WAIT_SECONDS:
+        fail(
+            "PHARMONLINE_PUBLIC_API_LOCK_WAIT_SECONDS exceeds the safe "
+            f"maximum of {_MAX_PRODUCTION_LOCK_WAIT_SECONDS} seconds"
+        )
+    return seconds
+
+
 async def read_two_redirect_proofs(challenges, *, transport: str):
     """Classify two fresh direct first-party redirect observations per move.
 
@@ -210,6 +228,7 @@ def write_plan_evidence(
 
 async def main(*, apply: bool) -> None:
     transport = _transport()
+    lock_wait_seconds = _production_lock_wait_seconds()
     source_manifest_sha256 = ""
     preflight_run_ref = ""
     expected_plan_fingerprint = ""
@@ -226,14 +245,28 @@ async def main(*, apply: bool) -> None:
     # Take the producer lock before the first source read.  Both the plan and
     # apply paths prove a catalog sequence against mutable product state, so a
     # concurrent scrape must not be able to change that state halfway through
-    # the proof.  The lock itself uses a dedicated connection and does not
-    # turn the later read-only/SERIALIZABLE Session transaction into a write.
+    # the proof. The bounded workflow wait permits an already-running producer
+    # to finish; it never overlaps or bypasses the lock. The lock itself uses
+    # a dedicated connection and does not turn the later
+    # read-only/SERIALIZABLE Session transaction into a write.
     Session = storage.make_session()
     with Session() as session:
         try:
-            with try_exclusive_scrape_lock(session) as acquired:
+            if lock_wait_seconds:
+                print(
+                    "Pharmonline public API reconciliation will wait for the "
+                    f"production run lock for at most {lock_wait_seconds} seconds"
+                )
+            async with wait_for_exclusive_scrape_lock(
+                session,
+                timeout_seconds=lock_wait_seconds,
+                poll_seconds=_PRODUCTION_LOCK_POLL_SECONDS,
+            ) as acquired:
                 if not acquired:
-                    fail("an active scrape or recovery holds the production run lock")
+                    fail(
+                        "an active scrape or recovery held the production run lock "
+                        f"for {lock_wait_seconds} seconds"
+                    )
 
                 verified_catalog = await read_two_identical_catalogs()
                 results = [verified_catalog]

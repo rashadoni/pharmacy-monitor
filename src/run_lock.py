@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Iterator
+import asyncio
+from contextlib import asynccontextmanager, contextmanager
+from typing import AsyncIterator, Iterator
 
 import structlog
 from sqlalchemy import text
@@ -59,6 +60,40 @@ def try_exclusive_scrape_lock(session: Session) -> Iterator[bool]:
                 connection.rollback()
                 log.warning("scrape_lock_release_failed", error=str(exc))
         connection.close()
+
+
+@asynccontextmanager
+async def wait_for_exclusive_scrape_lock(
+    session: Session,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 15,
+) -> AsyncIterator[bool]:
+    """Acquire the producer lock eventually, without bypassing it.
+
+    Each probe uses the same non-blocking, dedicated session-level advisory
+    lock as the regular producer.  This is suitable for a bounded maintenance
+    window: it lets an already-running scrape finish, but never overlaps it
+    and returns ``False`` when the deadline expires.
+    """
+    if timeout_seconds < 0:
+        raise ValueError("timeout_seconds must be non-negative")
+    if poll_seconds <= 0:
+        raise ValueError("poll_seconds must be positive")
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        with try_exclusive_scrape_lock(session) as acquired:
+            if acquired:
+                yield True
+                return
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            yield False
+            return
+        await asyncio.sleep(min(poll_seconds, remaining))
 
 
 @contextmanager
