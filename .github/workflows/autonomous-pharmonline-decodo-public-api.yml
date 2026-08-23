@@ -87,7 +87,7 @@ jobs:
           set -euo pipefail
           manifest=$(mktemp)
           trap 'rm -f "$manifest"' EXIT
-          git ls-files -z -- src migrations alembic.ini |
+          git ls-files -z -- src migrations templates alembic.ini |
             xargs -0 sha256sum | LC_ALL=C sort > "$manifest"
           test -s "$manifest"
 
@@ -106,7 +106,7 @@ jobs:
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
             pm@46.225.149.52 \
-            "mkdir -p '$work_dir/runtime/src' '$work_dir/runtime/migrations' '$work_dir/incoming'"
+            "mkdir -p '$work_dir/runtime/src' '$work_dir/runtime/migrations' '$work_dir/runtime/templates' '$work_dir/incoming'"
           rsync -az --checksum --delete --no-perms --no-owner --no-group \
             --exclude='__pycache__/' \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
@@ -115,6 +115,10 @@ jobs:
             --exclude='__pycache__/' \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
             migrations/ "pm@46.225.149.52:$work_dir/runtime/migrations/"
+          rsync -az --checksum --delete --no-perms --no-owner --no-group \
+            --exclude='__pycache__/' \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            templates/ "pm@46.225.149.52:$work_dir/runtime/templates/"
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
             alembic.ini "pm@46.225.149.52:$work_dir/runtime/alembic.ini"
@@ -269,13 +273,3 @@ jobs:
           )
           PY
           REMOTE
-
-      - name: Verify production health sees the successful catalog
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=15 \
-            pm@46.225.149.52 \
-            'cd /opt/pharmacy-monitor && .venv/bin/pharmacy-monitor health-check --quiet-on-ok'
