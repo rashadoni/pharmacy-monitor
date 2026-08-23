@@ -611,6 +611,7 @@ def _apply_pharmonline_public_api_reconciliation(
             storage.PharmonlinePublicAPIIdentityReconciliation.__table__.insert(),
             reconciliation_rows,
         )
+        session.flush()
     return metrics
 
 
@@ -679,6 +680,7 @@ def _ensure_pharmonline_public_api_catalog_baseline(
             preflight_run_ref=preflight_run_ref,
         )
     )
+    session.flush()
     return minimum_catalog_item_count
 
 
