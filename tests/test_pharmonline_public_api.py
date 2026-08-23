@@ -259,6 +259,7 @@ async def test_public_api_rejects_sitemap_mismatch_before_any_yield():
         "products_chunk_anchor_metadata_changed",
         "products_chunk_anchor_changed",
         "product_sitemap_index_missing",
+        "scraperapi_http_403",
     ],
 )
 def test_only_discarded_transient_catalog_failures_are_retryable(reason):
