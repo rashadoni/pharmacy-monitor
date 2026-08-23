@@ -396,6 +396,7 @@ def _reconcile(
     *,
     preflight_run_ref: str = "123456",
     redirect_proofs=(),
+    legacy_self_redirect_proofs=(),
     expected_plan_manifest_sha256: str | None = None,
 ):
     results = [ScrapeResult(site="pharmonline", products=products)]
@@ -408,6 +409,7 @@ def _reconcile(
         source_transport="decodo",
         preflight_run_ref=preflight_run_ref,
         redirect_proofs=redirect_proofs,
+        legacy_self_redirect_proofs=legacy_self_redirect_proofs,
         expected_plan_manifest_sha256=expected_plan_manifest_sha256,
     )
 
@@ -557,6 +559,212 @@ def test_public_api_reconciliation_rebinds_native_id_with_strict_redirect_proof(
     assert record.proof_version == main_mod._PHARMONLINE_PUBLIC_API_REDIRECT_REBIND_PROOF_VERSION
 
 
+def test_public_api_reconciliation_quarantines_a_legacy_self_redirect_without_merging_history(
+    db_session,
+):
+    old_url = "https://pharmonline.az/product/legacy-self-redirect-old"
+    new_url = "https://pharmonline.az/product/legacy-self-redirect-current"
+    legacy = _stored_product(
+        url=old_url,
+        name="Legacy medicine 100 mg",
+        barcode=None,
+    )
+    db_session.add(legacy)
+    db_session.commit()
+    legacy_product_id = legacy.id
+    run = storage.Run(status="ok")
+    db_session.add(run)
+    db_session.commit()
+    observation = storage.OfferObservation(
+        tenant_id=1,
+        run_id=run.id,
+        product_id=legacy_product_id,
+        availability_source="pharmonline_ddp_total_count",
+    )
+    snapshot = storage.PriceSnapshot(run_id=run.id, product_id=legacy_product_id)
+    db_session.add_all([observation, snapshot])
+    db_session.commit()
+
+    public = _public_api_product(
+        new_url,
+        name="Current medicine 200 mg",
+        barcode="1234567890123",
+    )
+    self_redirect_proof = main_mod._PharmonlinePublicAPILegacySelfRedirectProof(
+        product_id=legacy_product_id,
+        public_api_external_id=public.external_id,
+        legacy_canonical_url=old_url,
+        public_api_canonical_url=new_url,
+    )
+    results = [ScrapeResult(site="pharmonline", products=[public])]
+    actions, admissions, quarantines, plan_metrics = (
+        main_mod._pharmonline_public_api_reconciliation_plan(
+            db_session,
+            results,
+            tenant_id=1,
+            legacy_self_redirect_proofs=(self_redirect_proof,),
+        )
+    )
+    assert actions == []
+    assert admissions == []
+    assert quarantines == [
+        main_mod._PharmonlinePublicAPIIdentityQuarantineAction(
+            legacy_product_id=legacy_product_id,
+            legacy_external_id=public.external_id,
+            legacy_canonical_url=old_url,
+            public_api_external_id=public.external_id,
+            public_api_canonical_url=new_url,
+            public_product=public,
+        )
+    ]
+    expected_plan_manifest_sha256 = (
+        main_mod._pharmonline_public_api_reconciliation_plan_manifest_sha256(
+            actions,
+            admissions,
+            quarantines,
+            plan_metrics,
+        )
+    )
+    assert expected_plan_manifest_sha256 != (
+        main_mod._pharmonline_public_api_reconciliation_plan_manifest_sha256(
+            actions,
+            admissions,
+            [],
+            plan_metrics,
+        )
+    )
+
+    metrics = _reconcile(
+        db_session,
+        [public],
+        legacy_self_redirect_proofs=(self_redirect_proof,),
+        expected_plan_manifest_sha256=expected_plan_manifest_sha256,
+    )
+
+    archived = db_session.get(storage.Product, legacy_product_id)
+    replacement = (
+        db_session.query(storage.Product)
+        .filter_by(site="pharmonline", external_id=public.external_id)
+        .one()
+    )
+    admission = (
+        db_session.query(storage.PharmonlinePublicAPIIdentityAdmission)
+        .filter_by(product_id=replacement.id)
+        .one()
+    )
+    quarantine = db_session.query(storage.PharmonlinePublicAPIIdentityQuarantine).one()
+    assert metrics["native_id_url_rebind"] == 1
+    assert metrics["identity_splits_ready"] == 1
+    assert metrics["native_id_url_rebind_unproven"] == 0
+    assert archived is not None
+    assert archived.id == legacy_product_id
+    assert archived.external_id == main_mod._pharmonline_public_api_quarantined_external_id(
+        product_id=legacy_product_id,
+        legacy_external_id=public.external_id,
+    )
+    assert archived.url == old_url
+    assert archived.offer_availability_status == "unknown"
+    assert archived.offer_quantity is None
+    assert (
+        archived.availability_source
+        == main_mod._PHARMONLINE_PUBLIC_API_QUARANTINE_AVAILABILITY_SOURCE
+    )
+    assert archived.availability_run_id is None
+    assert archived.availability_observed_at is not None
+    assert observation.product_id == legacy_product_id
+    assert snapshot.product_id == legacy_product_id
+    assert replacement.id != legacy_product_id
+    assert replacement.url == new_url
+    assert replacement.name == public.name
+    assert (
+        db_session.query(storage.OfferObservation).filter_by(product_id=replacement.id).count() == 0
+    )
+    assert db_session.query(storage.PriceSnapshot).filter_by(product_id=replacement.id).count() == 0
+    assert admission.admission_kind == "quarantined_public_product"
+    assert admission.public_api_external_id == public.external_id
+    assert quarantine.legacy_product_id == legacy_product_id
+    assert quarantine.replacement_product_id == replacement.id
+    assert quarantine.legacy_external_id == public.external_id
+    assert quarantine.archived_external_id == archived.external_id
+    assert quarantine.public_api_external_id == public.external_id
+    assert quarantine.legacy_canonical_url == old_url
+    assert quarantine.public_api_canonical_url == new_url
+    assert quarantine.quarantine_kind == main_mod._PHARMONLINE_PUBLIC_API_QUARANTINE_KIND
+    assert quarantine.proof_version == main_mod._PHARMONLINE_PUBLIC_API_QUARANTINE_PROOF_VERSION
+    assert (
+        main_mod._pharmonline_public_api_quarantine_invalid_reason(
+            quarantine,
+            archived,
+            replacement,
+        )
+        is None
+    )
+    valid_legacy_ids, valid_replacement_ids, conflicts = (
+        main_mod._valid_pharmonline_public_api_identity_quarantines(
+            db_session,
+            [archived, replacement],
+            tenant_id=1,
+        )
+    )
+    assert valid_legacy_ids == {legacy_product_id}
+    assert valid_replacement_ids == {replacement.id}
+    assert conflicts == 0
+    assert (
+        main_mod._verify_pharmonline_public_api_identities(
+            db_session,
+            [ScrapeResult(site="pharmonline", products=[public])],
+            tenant_id=1,
+        )
+        == 1
+    )
+
+
+def test_public_api_identity_verifier_rejects_a_tampered_quarantine_ledger(db_session):
+    old_url = "https://pharmonline.az/product/tampered-self-redirect-old"
+    new_url = "https://pharmonline.az/product/tampered-self-redirect-current"
+    legacy = _stored_product(url=old_url, name="Legacy medicine")
+    db_session.add(legacy)
+    db_session.commit()
+    run = storage.Run(status="ok")
+    db_session.add(run)
+    db_session.commit()
+    db_session.add(
+        storage.OfferObservation(
+            tenant_id=1,
+            run_id=run.id,
+            product_id=legacy.id,
+            availability_source="pharmonline_ddp_total_count",
+        )
+    )
+    db_session.commit()
+    public = _public_api_product(new_url, name="Current medicine")
+    self_redirect_proof = main_mod._PharmonlinePublicAPILegacySelfRedirectProof(
+        product_id=legacy.id,
+        public_api_external_id=public.external_id,
+        legacy_canonical_url=old_url,
+        public_api_canonical_url=new_url,
+    )
+    _reconcile(
+        db_session,
+        [public],
+        legacy_self_redirect_proofs=(self_redirect_proof,),
+    )
+
+    quarantine = db_session.query(storage.PharmonlinePublicAPIIdentityQuarantine).one()
+    quarantine.archived_external_id = "tampered-quarantine-id"
+    db_session.flush()
+
+    with pytest.raises(
+        main_mod.PharmonlinePublicAPIIdentityError,
+        match="quarantine_conflicts=1",
+    ):
+        main_mod._verify_pharmonline_public_api_identities(
+            db_session,
+            [ScrapeResult(site="pharmonline", products=[public])],
+            tenant_id=1,
+        )
+
+
 def test_public_api_reconciliation_attests_an_existing_exact_native_identity(db_session):
     url = "https://pharmonline.az/product/existing-native-public-product"
     stored = _stored_product(url=url, availability_source=None)
@@ -657,6 +865,54 @@ def test_public_api_reconciliation_refuses_native_id_rebind_without_two_signals(
     assert refreshed is not None
     assert refreshed.url == old_url
     assert db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).count() == 0
+
+
+def test_public_api_reconciliation_refuses_to_chain_a_prior_legacy_audit_into_a_split(
+    db_session,
+):
+    old_url = "https://pharmonline.az/product/prior-audit-old"
+    new_url = "https://pharmonline.az/product/prior-audit-current"
+    legacy = _stored_product(url=old_url, name="Legacy medicine")
+    db_session.add(legacy)
+    db_session.commit()
+    db_session.add(
+        storage.PharmonlinePublicAPIIdentityAdmission(
+            tenant_id=1,
+            product_id=legacy.id,
+            admission_kind="existing_native_id",
+            public_api_external_id=legacy.external_id,
+            public_api_canonical_url=old_url,
+            proof_version=main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION,
+            source_manifest_sha256=_RECOVERY_MANIFEST_SHA,
+            catalog_fingerprint_sha256="b" * 64,
+            source_transport="decodo",
+            preflight_run_ref="123456",
+        )
+    )
+    db_session.commit()
+    public = _public_api_product(new_url, name="Current medicine")
+    self_redirect_proof = main_mod._PharmonlinePublicAPILegacySelfRedirectProof(
+        product_id=legacy.id,
+        public_api_external_id=public.external_id,
+        legacy_canonical_url=old_url,
+        public_api_canonical_url=new_url,
+    )
+
+    with pytest.raises(
+        main_mod.PharmonlinePublicAPIReconciliationError,
+        match="identity_split_prior_audit=1",
+    ):
+        _reconcile(
+            db_session,
+            [public],
+            legacy_self_redirect_proofs=(self_redirect_proof,),
+        )
+
+    refreshed = db_session.get(storage.Product, legacy.id)
+    assert refreshed is not None
+    assert refreshed.external_id == public.external_id
+    assert refreshed.url == old_url
+    assert db_session.query(storage.PharmonlinePublicAPIIdentityQuarantine).count() == 0
 
 
 def test_public_api_reconciliation_refuses_an_ambiguous_legacy_url_without_mutation(db_session):

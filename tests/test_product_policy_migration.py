@@ -68,7 +68,7 @@ def test_pharmonline_public_api_reconciliation_migrations_are_reversible(
     tmp_path: Path,
 ) -> None:
     db_url = f"sqlite:///{tmp_path / 'pharmonline-public-api-reconciliation.sqlite'}"
-    _alembic(db_url, "upgrade", "0020_public_api_admissions")
+    _alembic(db_url, "upgrade", "0021_public_api_quarantines")
 
     inspector = inspect(create_engine(db_url))
     reconciliation_columns = {
@@ -82,6 +82,10 @@ def test_pharmonline_public_api_reconciliation_migrations_are_reversible(
     admission_columns = {
         column["name"]
         for column in inspector.get_columns("pharmonline_public_api_identity_admissions")
+    }
+    quarantine_columns = {
+        column["name"]
+        for column in inspector.get_columns("pharmonline_public_api_identity_quarantines")
     }
     assert {
         "tenant_id",
@@ -112,6 +116,20 @@ def test_pharmonline_public_api_reconciliation_migrations_are_reversible(
         "catalog_fingerprint_sha256",
         "preflight_run_ref",
     } <= admission_columns
+    assert {
+        "tenant_id",
+        "legacy_product_id",
+        "replacement_product_id",
+        "quarantine_kind",
+        "legacy_external_id",
+        "archived_external_id",
+        "legacy_canonical_url",
+        "public_api_external_id",
+        "public_api_canonical_url",
+        "source_manifest_sha256",
+        "catalog_fingerprint_sha256",
+        "preflight_run_ref",
+    } <= quarantine_columns
     unique_constraints = inspector.get_unique_constraints(
         "pharmonline_public_api_identity_reconciliations"
     )
@@ -127,9 +145,24 @@ def test_pharmonline_public_api_reconciliation_migrations_are_reversible(
         "uq_pharmonline_public_api_admission_product",
         "uq_pharmonline_public_api_admission_public_id",
     } <= {constraint["name"] for constraint in admission_unique_constraints}
+    quarantine_unique_constraints = inspector.get_unique_constraints(
+        "pharmonline_public_api_identity_quarantines"
+    )
+    assert {
+        "uq_pharmonline_public_api_quarantine_legacy_product",
+        "uq_pharmonline_public_api_quarantine_replacement_product",
+        "uq_pharmonline_public_api_quarantine_public_id",
+    } <= {constraint["name"] for constraint in quarantine_unique_constraints}
+    quarantine_check_constraints = inspector.get_check_constraints(
+        "pharmonline_public_api_identity_quarantines"
+    )
+    assert "ck_pharmonline_public_api_quarantine_distinct_products" in {
+        constraint["name"] for constraint in quarantine_check_constraints
+    }
 
     _alembic(db_url, "downgrade", "0018_product_manual_category")
     inspector = inspect(create_engine(db_url))
     assert "pharmonline_public_api_identity_reconciliations" not in inspector.get_table_names()
     assert "pharmonline_public_api_identity_admissions" not in inspector.get_table_names()
+    assert "pharmonline_public_api_identity_quarantines" not in inspector.get_table_names()
     assert "pharmonline_public_api_catalog_baselines" not in inspector.get_table_names()

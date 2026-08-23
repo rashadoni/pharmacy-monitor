@@ -242,7 +242,7 @@ jobs:
           }
           if set(data) != required:
               raise SystemExit("unexpected reconciliation plan evidence shape")
-          if data["version"] != 2 or data["transport"] != "decodo":
+          if data["version"] != 3 or data["transport"] != "decodo":
               raise SystemExit("reconciliation plan evidence transport/version is invalid")
           if not isinstance(data["product_count"], int) or data["product_count"] < 9500:
               raise SystemExit("reconciliation plan evidence product count is invalid")

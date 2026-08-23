@@ -19,6 +19,7 @@ from pathlib import Path
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -341,6 +342,63 @@ class PharmonlinePublicAPIIdentityAdmission(Base):
     # stored. ``new_public_product`` means no Product with that ID or URL was
     # present in any tenant before the guarded creation.
     admission_kind: Mapped[str] = mapped_column(String(40))
+    public_api_external_id: Mapped[str] = mapped_column(String(200))
+    public_api_canonical_url: Mapped[str] = mapped_column(String(500))
+    proof_version: Mapped[str] = mapped_column(String(40))
+    source_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
+    source_transport: Mapped[str] = mapped_column(String(40))
+    preflight_run_ref: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class PharmonlinePublicAPIIdentityQuarantine(Base):
+    """Immutable separation proof for a contradicted legacy native identity.
+
+    A first-party legacy URL can prove that an old stored product is still a
+    distinct page even when the current public API reuses its native ID at a
+    different URL.  In that narrow case the old Product remains in place so
+    all attached observations and snapshots retain their original meaning;
+    its external ID is archived and a separate current Product is admitted.
+    This ledger records both sides of that split and is deliberately not a
+    mutable trust flag.
+    """
+
+    __tablename__ = "pharmonline_public_api_identity_quarantines"
+    __table_args__ = (
+        CheckConstraint(
+            "legacy_product_id <> replacement_product_id",
+            name="ck_pharmonline_public_api_quarantine_distinct_products",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "legacy_product_id",
+            name="uq_pharmonline_public_api_quarantine_legacy_product",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "replacement_product_id",
+            name="uq_pharmonline_public_api_quarantine_replacement_product",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "public_api_external_id",
+            name="uq_pharmonline_public_api_quarantine_public_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    legacy_product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="RESTRICT"), index=True
+    )
+    replacement_product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="RESTRICT"), index=True
+    )
+    quarantine_kind: Mapped[str] = mapped_column(String(40))
+    legacy_external_id: Mapped[str] = mapped_column(String(200))
+    archived_external_id: Mapped[str] = mapped_column(String(200))
+    legacy_canonical_url: Mapped[str] = mapped_column(String(500))
     public_api_external_id: Mapped[str] = mapped_column(String(200))
     public_api_canonical_url: Mapped[str] = mapped_column(String(500))
     proof_version: Mapped[str] = mapped_column(String(40))

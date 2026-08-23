@@ -4,9 +4,9 @@
 The default mode is read-only.  It proves two fresh, identical full public API
 catalogs, then reports only aggregate candidate counts.  ``--apply`` is for
 the exact-SHA gated recovery workflow only: it repeats the same source proof,
-locks the relevant Product rows, updates eligible IDs in place, records the
-immutable evidence, establishes a non-ratcheting catalog floor, and verifies
-the resulting map before committing.
+locks the relevant Product rows, applies only proven rekeys or quarantined
+identity splits, records immutable evidence, establishes a non-ratcheting
+catalog floor, and verifies the resulting map before committing.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from sqlalchemy import text
 
 from src import storage
 from src.main import (
+    _PharmonlinePublicAPILegacySelfRedirectProof,
     _apply_pharmonline_public_api_reconciliation,
     _diagnose_pharmonline_public_api_reconciliation,
     _ensure_pharmonline_public_api_catalog_baseline,
@@ -132,15 +133,22 @@ def _expected_plan_evidence() -> tuple[str, str, int]:
 
 
 async def read_two_redirect_proofs(challenges, *, transport: str):
-    """Require two fresh direct first-party redirect observations per move."""
+    """Classify two fresh direct first-party redirect observations per move.
+
+    A redirect to the current public URL proves safe continuity. A permanent
+    redirect back to the old canonical URL proves the opposite: it is admitted
+    only as a separately typed legacy-self witness for a quarantined split.
+    Every other outcome remains unproven.
+    """
     if not challenges:
-        return (), {}
+        return (), (), {}
     if transport != "decodo":
         fail("native URL redirect proof requires the explicit Decodo transport")
 
-    async def read_pass() -> tuple[tuple, tuple[str, ...], dict[str, int]]:
+    async def read_pass() -> tuple[tuple, tuple, tuple[str, ...], dict[str, int]]:
         async with PharmonlinePublicAPIScraper() as scraper:
             proven = []
+            legacy_self = []
             verdicts = []
             reason_counts: dict[str, int] = {}
             for challenge in challenges:
@@ -153,17 +161,27 @@ async def read_two_redirect_proofs(challenges, *, transport: str):
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
                 if reason == "verified":
                     proven.append(challenge)
-            return tuple(proven), tuple(verdicts), reason_counts
+                elif reason == "redirect_target_legacy_product":
+                    legacy_self.append(
+                        _PharmonlinePublicAPILegacySelfRedirectProof(
+                            product_id=challenge.product_id,
+                            public_api_external_id=challenge.public_api_external_id,
+                            legacy_canonical_url=challenge.legacy_canonical_url,
+                            public_api_canonical_url=challenge.public_api_canonical_url,
+                        )
+                    )
+            return tuple(proven), tuple(legacy_self), tuple(verdicts), reason_counts
 
-    first_proven, first_verdicts, first_reasons = await read_pass()
-    second_proven, second_verdicts, second_reasons = await read_pass()
+    first_proven, first_legacy_self, first_verdicts, first_reasons = await read_pass()
+    second_proven, second_legacy_self, second_verdicts, second_reasons = await read_pass()
     if (
         first_proven != second_proven
+        or first_legacy_self != second_legacy_self
         or first_verdicts != second_verdicts
         or first_reasons != second_reasons
     ):
         fail("two fresh permanent-redirect proof passes disagree")
-    return first_proven, first_reasons
+    return first_proven, first_legacy_self, first_reasons
 
 
 def write_plan_evidence(
@@ -180,7 +198,7 @@ def write_plan_evidence(
         return
     path = Path(raw_path)
     payload = {
-        "version": 2,
+        "version": 3,
         "transport": transport,
         "product_count": product_count,
         "catalog_fingerprint_sha256": catalog_fingerprint_sha256,
@@ -229,7 +247,11 @@ async def main(*, apply: bool) -> None:
                 # before any network I/O; the dedicated advisory lock remains
                 # held for the full source proof and apply sequence.
                 session.rollback()
-                redirect_proofs, redirect_reason_counts = await read_two_redirect_proofs(
+                (
+                    redirect_proofs,
+                    legacy_self_redirect_proofs,
+                    redirect_reason_counts,
+                ) = await read_two_redirect_proofs(
                     redirect_challenges,
                     transport=transport,
                 )
@@ -241,7 +263,8 @@ async def main(*, apply: bool) -> None:
                     print(
                         "Pharmonline native URL redirect proof "
                         f"(aggregate-only): candidates={len(redirect_challenges)}, "
-                        f"verified={len(redirect_proofs)}, {reason_text}"
+                        f"verified={len(redirect_proofs)}, "
+                        f"legacy_self={len(legacy_self_redirect_proofs)}, {reason_text}"
                     )
 
                 if apply and (
@@ -264,17 +287,25 @@ async def main(*, apply: bool) -> None:
                         results,
                         tenant_id=1,
                         redirect_proofs=redirect_proofs,
+                        legacy_self_redirect_proofs=legacy_self_redirect_proofs,
                     )
-                    actions, admissions, plan_metrics = _pharmonline_public_api_reconciliation_plan(
+                    (
+                        actions,
+                        admissions,
+                        quarantines,
+                        plan_metrics,
+                    ) = _pharmonline_public_api_reconciliation_plan(
                         session,
                         results,
                         tenant_id=1,
                         redirect_proofs=redirect_proofs,
+                        legacy_self_redirect_proofs=legacy_self_redirect_proofs,
                     )
                     plan_manifest_sha256 = (
                         _pharmonline_public_api_reconciliation_plan_manifest_sha256(
                             actions,
                             admissions,
+                            quarantines,
                             plan_metrics,
                         )
                     )
@@ -290,6 +321,7 @@ async def main(*, apply: bool) -> None:
                         source_transport=transport,
                         preflight_run_ref=preflight_run_ref,
                         redirect_proofs=redirect_proofs,
+                        legacy_self_redirect_proofs=legacy_self_redirect_proofs,
                         expected_plan_manifest_sha256=expected_plan_manifest,
                     )
                     catalog_floor = _ensure_pharmonline_public_api_catalog_baseline(
@@ -304,6 +336,7 @@ async def main(*, apply: bool) -> None:
                             + metrics["legacy_rekeys_ready"]
                             + metrics["native_id_url_rebind_ready"]
                             + metrics["native_id_url_rebind_redirect_ready"]
+                            + metrics["identity_splits_ready"]
                             + metrics["existing_native_admissions_ready"]
                             + metrics["new_public_product_admissions_ready"]
                         ),

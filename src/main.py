@@ -74,8 +74,11 @@ _PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION = "url_continuity_v1"
 _PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION = "native_id_url_continuity_v1"
 _PHARMONLINE_PUBLIC_API_REDIRECT_REBIND_PROOF_VERSION = "native_id_redirect_continuity_v1"
 _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION = "public_api_identity_admission_v1"
+_PHARMONLINE_PUBLIC_API_QUARANTINE_PROOF_VERSION = "legacy_self_redirect_identity_split_v1"
+_PHARMONLINE_PUBLIC_API_QUARANTINE_KIND = "legacy_self_redirect"
+_PHARMONLINE_PUBLIC_API_QUARANTINE_AVAILABILITY_SOURCE = "pharmonline_identity_quarantine"
 _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS = frozenset(
-    {"existing_native_id", "new_public_product"}
+    {"existing_native_id", "new_public_product", "quarantined_public_product"}
 )
 _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS = 9500
@@ -160,6 +163,28 @@ class _PharmonlinePublicAPIRedirectProof:
     public_api_canonical_url: str
 
 
+@dataclass(frozen=True)
+class _PharmonlinePublicAPILegacySelfRedirectProof:
+    """Two fresh direct legacy-self redirects that contradict URL continuity."""
+
+    product_id: int
+    public_api_external_id: str
+    legacy_canonical_url: str
+    public_api_canonical_url: str
+
+
+@dataclass(frozen=True)
+class _PharmonlinePublicAPIIdentityQuarantineAction:
+    """A fail-closed identity split that never inherits legacy history."""
+
+    legacy_product_id: int
+    legacy_external_id: str
+    legacy_canonical_url: str
+    public_api_external_id: str
+    public_api_canonical_url: str
+    public_product: ScrapedProduct
+
+
 def _pharmonline_product_name_signature(value: str | None) -> str:
     """Return a strict display-name signature without dropping SKU details."""
     if not value:
@@ -217,8 +242,8 @@ def _pharmonline_native_url_rebind_evidence(
     return barcode_evidence, name_evidence
 
 
-def _pharmonline_public_api_recovery_tables_available(session: Session) -> bool:
-    """Avoid treating an unapplied production migration as trusted evidence."""
+def _pharmonline_public_api_identity_tables_available(session: Session) -> bool:
+    """Whether the original immutable public-API evidence ledgers exist."""
     # Inspect through the Session's live connection.  Inspecting the Engine
     # obtains a second connection; with SQLite's StaticPool used by tests that
     # is the same DBAPI connection and its cleanup can roll back the active
@@ -229,6 +254,14 @@ def _pharmonline_public_api_recovery_tables_available(session: Session) -> bool:
         "pharmonline_public_api_identity_admissions",
         "pharmonline_public_api_catalog_baselines",
     }.issubset(tables)
+
+
+def _pharmonline_public_api_recovery_tables_available(session: Session) -> bool:
+    """Avoid applying a split before its immutable audit migration exists."""
+    return _pharmonline_public_api_identity_tables_available(session) and (
+        "pharmonline_public_api_identity_quarantines"
+        in set(inspect(session.connection()).get_table_names())
+    )
 
 
 def _public_api_identity_records(
@@ -301,8 +334,15 @@ def _trusted_ddp_products_by_id(
     products: list[storage.Product],
     *,
     tenant_id: int,
+    quarantined_product_ids: set[int] | frozenset[int] = frozenset(),
 ) -> tuple[dict[str, storage.Product], set[int], int, int]:
-    """Build only the historic DDP-derived portion of the identity map."""
+    """Build only the historic DDP-derived portion of the identity map.
+
+    A valid quarantine deliberately preserves legacy DDP observations on the
+    archived row, but those observations must never make the archived ID a
+    current public identity again.  Invalid or missing ledgers are not
+    excluded: they remain an ``invalid_trusted`` failure instead.
+    """
     trusted_history_product_ids = set(
         session.scalars(
             select(storage.OfferObservation.product_id)
@@ -318,6 +358,8 @@ def _trusted_ddp_products_by_id(
     invalid_trusted = 0
     duplicate_trusted_ids = 0
     for stored in products:
+        if stored.id in quarantined_product_ids:
+            continue
         if (
             stored.availability_source != _PHARMONLINE_DDP_AVAILABILITY_SOURCE
             and stored.id not in trusted_history_product_ids
@@ -342,7 +384,7 @@ def _valid_pharmonline_public_api_reconciliations(
     tenant_id: int,
 ) -> tuple[dict[str, storage.Product], int]:
     """Return only immutable records that still exactly match a live Product."""
-    if not _pharmonline_public_api_recovery_tables_available(session):
+    if not _pharmonline_public_api_identity_tables_available(session):
         return {}, 0
 
     products_by_id = {product.id: product for product in products}
@@ -422,9 +464,10 @@ def _valid_pharmonline_public_api_identity_admissions(
     products: list[storage.Product],
     *,
     tenant_id: int,
+    quarantined_replacement_product_ids: set[int] | frozenset[int] = frozenset(),
 ) -> tuple[dict[str, storage.Product], int]:
     """Return only immutable public-source admissions matching live Products."""
-    if not _pharmonline_public_api_recovery_tables_available(session):
+    if not _pharmonline_public_api_identity_tables_available(session):
         return {}, 0
 
     products_by_id = {product.id: product for product in products}
@@ -438,6 +481,11 @@ def _valid_pharmonline_public_api_identity_admissions(
     for record in records:
         product = products_by_id.get(record.product_id)
         if _pharmonline_public_api_admission_invalid_reason(record, product) is not None:
+            continue
+        if (
+            record.admission_kind == "quarantined_public_product"
+            and record.product_id not in quarantined_replacement_product_ids
+        ):
             continue
         public_external_id = str(record.public_api_external_id)
         previous = admitted_by_id.get(public_external_id)
@@ -485,6 +533,193 @@ def _pharmonline_public_api_admission_invalid_reason(
     return None
 
 
+def _pharmonline_public_api_quarantined_external_id(
+    *,
+    product_id: int,
+    legacy_external_id: str,
+) -> str:
+    """Return a deterministic non-native ID for an archived legacy row.
+
+    The source-wide unique key is ``(site, external_id)``.  A split therefore
+    needs a stable archival value before a distinct current Product can take
+    the native ID.  The original ID stays only in the immutable ledger; the
+    digest avoids exposing it through a currently selectable Product key.
+    """
+    payload = f"pharmonline-public-api-quarantine-v1:{product_id}:{legacy_external_id}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+    return f"pharmonline-quarantine-{product_id}-{digest}"
+
+
+def _pharmonline_public_api_quarantine_invalid_reason(
+    record: storage.PharmonlinePublicAPIIdentityQuarantine,
+    legacy_product: storage.Product | None,
+    replacement_product: storage.Product | None,
+) -> str | None:
+    """Return why an immutable quarantine record cannot exclude DDP history."""
+    if legacy_product is None or replacement_product is None:
+        return "product_missing"
+    if legacy_product.id == replacement_product.id:
+        return "same_product"
+    legacy_external_id = str(record.legacy_external_id)
+    public_external_id = str(record.public_api_external_id)
+    legacy_url = _canonical_pharmonline_product_url(record.legacy_canonical_url)
+    public_url = _canonical_pharmonline_product_url(record.public_api_canonical_url)
+    if (
+        record.quarantine_kind != _PHARMONLINE_PUBLIC_API_QUARANTINE_KIND
+        or record.proof_version != _PHARMONLINE_PUBLIC_API_QUARANTINE_PROOF_VERSION
+    ):
+        return "proof_shape"
+    if (
+        _PHARMONLINE_METEOR_ID_RE.fullmatch(legacy_external_id) is None
+        or legacy_external_id != public_external_id
+    ):
+        return "native_id"
+    if legacy_url is None or public_url is None or legacy_url == public_url:
+        return "canonical_url"
+    if str(record.archived_external_id) != _pharmonline_public_api_quarantined_external_id(
+        product_id=legacy_product.id,
+        legacy_external_id=legacy_external_id,
+    ):
+        return "archived_id"
+    if (
+        _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.source_manifest_sha256) is None
+        or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256)
+        is None
+    ):
+        return "proof_hash"
+    if record.source_transport != "decodo":
+        return "transport"
+    if re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None:
+        return "preflight_run"
+    if (
+        legacy_product.tenant_id != record.tenant_id
+        or replacement_product.tenant_id != record.tenant_id
+        or legacy_product.site != "pharmonline"
+        or replacement_product.site != "pharmonline"
+    ):
+        return "product_tenant"
+    if (
+        str(legacy_product.external_id) != str(record.archived_external_id)
+        or _canonical_pharmonline_product_url(legacy_product.url) != legacy_url
+        or legacy_product.offer_availability_status != "unknown"
+        or legacy_product.offer_quantity is not None
+        or legacy_product.availability_source
+        != _PHARMONLINE_PUBLIC_API_QUARANTINE_AVAILABILITY_SOURCE
+        or legacy_product.availability_run_id is not None
+        or legacy_product.availability_observed_at is None
+    ):
+        return "legacy_state"
+    if (
+        str(replacement_product.external_id) != public_external_id
+        or _canonical_pharmonline_product_url(replacement_product.url) != public_url
+    ):
+        return "replacement_state"
+    return None
+
+
+def _pharmonline_public_api_quarantine_admission_matches(
+    record: storage.PharmonlinePublicAPIIdentityQuarantine,
+    admission: storage.PharmonlinePublicAPIIdentityAdmission | None,
+) -> bool:
+    """Whether the replacement has the exact immutable split admission."""
+    return bool(
+        admission is not None
+        and admission.tenant_id == record.tenant_id
+        and admission.product_id == record.replacement_product_id
+        and admission.admission_kind == "quarantined_public_product"
+        and str(admission.public_api_external_id) == str(record.public_api_external_id)
+        and _canonical_pharmonline_product_url(admission.public_api_canonical_url)
+        == _canonical_pharmonline_product_url(record.public_api_canonical_url)
+        and admission.proof_version == _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION
+        and admission.source_manifest_sha256 == record.source_manifest_sha256
+        and admission.catalog_fingerprint_sha256 == record.catalog_fingerprint_sha256
+        and admission.source_transport == record.source_transport
+        and admission.preflight_run_ref == record.preflight_run_ref
+    )
+
+
+def _valid_pharmonline_public_api_identity_quarantines(
+    session: Session,
+    products: list[storage.Product],
+    *,
+    tenant_id: int,
+) -> tuple[set[int], set[int], int]:
+    """Return legacy Product IDs excluded by unambiguous immutable splits.
+
+    Every malformed or contradictory ledger row keeps recovery fail-closed.
+    It must not silently hide historic DDP observations from the verifier.
+    """
+    if not _pharmonline_public_api_recovery_tables_available(session):
+        return set(), set(), 0
+
+    products_by_id = {product.id: product for product in products}
+    records = (
+        session.query(storage.PharmonlinePublicAPIIdentityQuarantine)
+        .filter(storage.PharmonlinePublicAPIIdentityQuarantine.tenant_id == tenant_id)
+        .all()
+    )
+    admissions_by_product_id: dict[int, list[storage.PharmonlinePublicAPIIdentityAdmission]] = {}
+    for admission in (
+        session.query(storage.PharmonlinePublicAPIIdentityAdmission)
+        .filter(storage.PharmonlinePublicAPIIdentityAdmission.tenant_id == tenant_id)
+        .all()
+    ):
+        admissions_by_product_id.setdefault(admission.product_id, []).append(admission)
+    valid_records: list[storage.PharmonlinePublicAPIIdentityQuarantine] = []
+    invalid_records = 0
+    for record in records:
+        if (
+            _pharmonline_public_api_quarantine_invalid_reason(
+                record,
+                products_by_id.get(record.legacy_product_id),
+                products_by_id.get(record.replacement_product_id),
+            )
+            is not None
+        ):
+            invalid_records += 1
+            continue
+        replacement_admissions = admissions_by_product_id.get(record.replacement_product_id, [])
+        if len(replacement_admissions) != 1 or not _pharmonline_public_api_quarantine_admission_matches(
+            record,
+            replacement_admissions[0],
+        ):
+            invalid_records += 1
+            continue
+        valid_records.append(record)
+
+    seen_legacy: dict[int, int] = {}
+    seen_replacement: dict[int, int] = {}
+    seen_public_id: dict[str, int] = {}
+    conflicting_records: set[int] = set()
+    for record in valid_records:
+        for seen, key in (
+            (seen_legacy, record.legacy_product_id),
+            (seen_replacement, record.replacement_product_id),
+            (seen_public_id, str(record.public_api_external_id)),
+        ):
+            previous = seen.get(key)
+            if previous is None:
+                seen[key] = record.id
+            elif previous != record.id:
+                conflicting_records.update({previous, record.id})
+
+    quarantined_product_ids = {
+        record.legacy_product_id
+        for record in valid_records
+        if record.id not in conflicting_records
+    }
+    quarantined_replacement_product_ids = {
+        record.replacement_product_id
+        for record in valid_records
+        if record.id not in conflicting_records
+    }
+    return (
+        quarantined_product_ids,
+        quarantined_replacement_product_ids,
+        invalid_records + len(conflicting_records),
+    )
+
+
 def _pharmonline_public_api_redirect_challenges(
     session: Session,
     results: list[ScrapeResult],
@@ -530,6 +765,47 @@ def _pharmonline_public_api_redirect_challenges(
     return tuple(challenges)
 
 
+def _pharmonline_public_api_prior_audit_product_ids(
+    session: Session,
+    *,
+    tenant_id: int,
+) -> set[int]:
+    """Return raw audit-linked Product IDs that must never be split again.
+
+    A second transition would turn an append-only proof chain into a mutable
+    identity graph.  The plan treats even malformed historical records as a
+    blocker; a human must resolve them before another identity operation.
+    """
+    tables = set(inspect(session.connection()).get_table_names())
+    product_ids: set[int] = set()
+    if "pharmonline_public_api_identity_reconciliations" in tables:
+        product_ids.update(
+            session.scalars(
+                select(storage.PharmonlinePublicAPIIdentityReconciliation.product_id).where(
+                    storage.PharmonlinePublicAPIIdentityReconciliation.tenant_id == tenant_id
+                )
+            ).all()
+        )
+    if "pharmonline_public_api_identity_admissions" in tables:
+        product_ids.update(
+            session.scalars(
+                select(storage.PharmonlinePublicAPIIdentityAdmission.product_id).where(
+                    storage.PharmonlinePublicAPIIdentityAdmission.tenant_id == tenant_id
+                )
+            ).all()
+        )
+    if "pharmonline_public_api_identity_quarantines" in tables:
+        quarantine_rows = session.execute(
+            select(
+                storage.PharmonlinePublicAPIIdentityQuarantine.legacy_product_id,
+                storage.PharmonlinePublicAPIIdentityQuarantine.replacement_product_id,
+            ).where(storage.PharmonlinePublicAPIIdentityQuarantine.tenant_id == tenant_id)
+        ).all()
+        for legacy_product_id, replacement_product_id in quarantine_rows:
+            product_ids.update({legacy_product_id, replacement_product_id})
+    return product_ids
+
+
 def _pharmonline_public_api_reconciliation_plan(
     session: Session,
     results: list[ScrapeResult],
@@ -537,18 +813,21 @@ def _pharmonline_public_api_reconciliation_plan(
     tenant_id: int,
     lock_products: bool = False,
     redirect_proofs: tuple[_PharmonlinePublicAPIRedirectProof, ...] = (),
+    legacy_self_redirect_proofs: tuple[_PharmonlinePublicAPILegacySelfRedirectProof, ...] = (),
 ) -> tuple[
     list[_PharmonlinePublicAPIReconciliationAction],
     list[_PharmonlinePublicAPIIdentityAdmissionAction],
+    list[_PharmonlinePublicAPIIdentityQuarantineAction],
     dict[str, int],
 ]:
     """Classify every current public identity into a strict recovery class.
 
     The plan is deliberately exhaustive: every verified public API identity
     must be either already trusted DDP/audit lineage, an exact legacy rekey, a
-    two-signal or first-party-permanent-redirect native URL rebind, an exact
-    existing-native attestation, or a genuinely new public product.  Anything
-    outside those classes stays fail-closed and no mutation is possible.
+    two-signal or first-party-permanent-redirect native URL rebind, a
+    first-party legacy-self-redirect identity split, an exact existing-native
+    attestation, or a genuinely new public product. Anything outside those
+    classes stays fail-closed and no mutation is possible.
     """
     api_records = _public_api_identity_records(results)
     product_statement = select(storage.Product).where(storage.Product.site == "pharmonline")
@@ -573,10 +852,20 @@ def _pharmonline_public_api_reconciliation_plan(
         if canonical_url is not None:
             tenant_by_url.setdefault(canonical_url, []).append(product)
 
+    (
+        quarantined_legacy_product_ids,
+        quarantined_replacement_product_ids,
+        quarantine_conflicts,
+    ) = _valid_pharmonline_public_api_identity_quarantines(
+        session,
+        tenant_products,
+        tenant_id=tenant_id,
+    )
     ddp_by_id, trusted_history_product_ids, _, _ = _trusted_ddp_products_by_id(
         session,
         tenant_products,
         tenant_id=tenant_id,
+        quarantined_product_ids=quarantined_legacy_product_ids,
     )
     reconciled_by_id, reconciliation_conflicts = _valid_pharmonline_public_api_reconciliations(
         session,
@@ -587,6 +876,7 @@ def _pharmonline_public_api_reconciliation_plan(
         session,
         tenant_products,
         tenant_id=tenant_id,
+        quarantined_replacement_product_ids=quarantined_replacement_product_ids,
     )
     trusted_by_id = dict(ddp_by_id)
     trusted_identity_conflicts = 0
@@ -607,14 +897,30 @@ def _pharmonline_public_api_reconciliation_plan(
         )
         for proof in redirect_proofs
     }
+    legacy_self_redirect_proof_keys = {
+        (
+            proof.product_id,
+            proof.public_api_external_id,
+            proof.legacy_canonical_url,
+            proof.public_api_canonical_url,
+        )
+        for proof in legacy_self_redirect_proofs
+    }
+    prior_audit_product_ids = _pharmonline_public_api_prior_audit_product_ids(
+        session,
+        tenant_id=tenant_id,
+    )
 
     actions: list[_PharmonlinePublicAPIReconciliationAction] = []
     admissions: list[_PharmonlinePublicAPIIdentityAdmissionAction] = []
+    quarantines: list[_PharmonlinePublicAPIIdentityQuarantineAction] = []
     metrics = {
         "api_identities": len(api_records),
         "trusted_ddp_identities": len(ddp_by_id),
         "reconciled_identities": len(reconciled_by_id),
         "admitted_identities": len(admitted_by_id),
+        "quarantined_legacy_identities": len(quarantined_legacy_product_ids),
+        "quarantined_current_identities": len(quarantined_replacement_product_ids),
         "retired_ddp_identities": len(set(ddp_by_id) - set(api_records)),
         "already_trusted_identities": 0,
         "legacy_rekeys_ready": 0,
@@ -631,6 +937,8 @@ def _pharmonline_public_api_reconciliation_plan(
         "native_id_url_rebind": 0,
         "native_id_url_rebind_ready": 0,
         "native_id_url_rebind_redirect_ready": 0,
+        "identity_splits_ready": 0,
+        "identity_split_prior_audit": 0,
         "native_id_url_rebind_unproven": 0,
         "native_id_url_rebind_barcode_match": 0,
         "native_id_url_rebind_stored_barcode_missing": 0,
@@ -642,6 +950,7 @@ def _pharmonline_public_api_reconciliation_plan(
         "native_id_url_rebind_name_mismatch": 0,
         "reconciliation_record_conflict": reconciliation_conflicts,
         "admission_record_conflict": admission_conflicts,
+        "quarantine_record_conflict": quarantine_conflicts,
         "trusted_identity_conflict": trusted_identity_conflicts,
     }
     for external_id, (canonical_url, public_product) in api_records.items():
@@ -683,6 +992,28 @@ def _pharmonline_public_api_reconciliation_plan(
                 ) in redirect_proof_keys:
                     proof_version = _PHARMONLINE_PUBLIC_API_REDIRECT_REBIND_PROOF_VERSION
                     metrics["native_id_url_rebind_redirect_ready"] += 1
+                elif (
+                    current.id,
+                    external_id,
+                    current_url,
+                    canonical_url,
+                ) in legacy_self_redirect_proof_keys:
+                    if current.id in prior_audit_product_ids:
+                        metrics["identity_split_prior_audit"] += 1
+                        metrics["native_id_url_rebind_unproven"] += 1
+                        continue
+                    quarantines.append(
+                        _PharmonlinePublicAPIIdentityQuarantineAction(
+                            legacy_product_id=current.id,
+                            legacy_external_id=str(current.external_id),
+                            legacy_canonical_url=current_url,
+                            public_api_external_id=external_id,
+                            public_api_canonical_url=canonical_url,
+                            public_product=public_product,
+                        )
+                    )
+                    metrics["identity_splits_ready"] += 1
+                    continue
                 else:
                     metrics["native_id_url_rebind_unproven"] += 1
                     continue
@@ -784,21 +1115,23 @@ def _pharmonline_public_api_reconciliation_plan(
         + metrics["new_public_product_admissions_ready"]
         + metrics["native_id_url_rebind_ready"]
         + metrics["native_id_url_rebind_redirect_ready"]
+        + metrics["identity_splits_ready"]
     )
     metrics["unclassified_api_identities"] = max(
         0,
         metrics["api_identities"] - metrics["classified_identities"],
     )
-    return actions, admissions, metrics
+    return actions, admissions, quarantines, metrics
 
 
 def _pharmonline_public_api_reconciliation_plan_manifest_sha256(
     actions: list[_PharmonlinePublicAPIReconciliationAction],
     admissions: list[_PharmonlinePublicAPIIdentityAdmissionAction],
+    quarantines: list[_PharmonlinePublicAPIIdentityQuarantineAction],
     metrics: dict[str, int],
 ) -> str:
     """Hash the exact private candidate classification without disclosing it."""
-    lines = ["pharmonline_public_api_reconciliation_plan_v2"]
+    lines = ["pharmonline_public_api_reconciliation_plan_v3"]
     lines.extend(
         "reconcile\t{product_id}\t{legacy_external_id}\t{public_api_external_id}\t"
         "{legacy_canonical_url}\t{public_api_canonical_url}\t{proof_version}".format(
@@ -816,6 +1149,20 @@ def _pharmonline_public_api_reconciliation_plan_manifest_sha256(
                 item.product_id,
                 item.proof_version,
             ),
+        )
+    )
+    lines.extend(
+        "quarantine\t{legacy_product_id}\t{legacy_external_id}\t"
+        "{public_api_external_id}\t{legacy_canonical_url}\t{public_api_canonical_url}".format(
+            legacy_product_id=action.legacy_product_id,
+            legacy_external_id=action.legacy_external_id,
+            public_api_external_id=action.public_api_external_id,
+            legacy_canonical_url=action.legacy_canonical_url,
+            public_api_canonical_url=action.public_api_canonical_url,
+        )
+        for action in sorted(
+            quarantines,
+            key=lambda item: (item.public_api_external_id, item.legacy_product_id),
         )
     )
     lines.extend(
@@ -857,7 +1204,9 @@ def _pharmonline_public_api_reconciliation_is_safe(metrics: dict[str, int]) -> b
             "native_id_url_rebind_unproven",
             "reconciliation_record_conflict",
             "admission_record_conflict",
+            "quarantine_record_conflict",
             "trusted_identity_conflict",
+            "identity_split_prior_audit",
             "unclassified_api_identities",
         )
     )
@@ -892,6 +1241,7 @@ def _apply_pharmonline_public_api_reconciliation(
     source_transport: str,
     preflight_run_ref: str,
     redirect_proofs: tuple[_PharmonlinePublicAPIRedirectProof, ...] = (),
+    legacy_self_redirect_proofs: tuple[_PharmonlinePublicAPILegacySelfRedirectProof, ...] = (),
     expected_plan_manifest_sha256: str | None = None,
 ) -> dict[str, int]:
     """Apply only a completely prevalidated identity recovery batch.
@@ -911,16 +1261,18 @@ def _apply_pharmonline_public_api_reconciliation(
         raise PharmonlinePublicAPIReconciliationError(
             "public Pharmonline reconciliation audit schema is not migrated"
         )
-    actions, admissions, metrics = _pharmonline_public_api_reconciliation_plan(
+    actions, admissions, quarantines, metrics = _pharmonline_public_api_reconciliation_plan(
         session,
         results,
         tenant_id=tenant_id,
         lock_products=True,
         redirect_proofs=redirect_proofs,
+        legacy_self_redirect_proofs=legacy_self_redirect_proofs,
     )
     plan_manifest_sha256 = _pharmonline_public_api_reconciliation_plan_manifest_sha256(
         actions,
         admissions,
+        quarantines,
         metrics,
     )
     if expected_plan_manifest_sha256 is not None:
@@ -936,6 +1288,10 @@ def _apply_pharmonline_public_api_reconciliation(
         diagnostic_text = ", ".join(f"{key}={value}" for key, value in sorted(metrics.items()))
         raise PharmonlinePublicAPIReconciliationError(
             "public Pharmonline reconciliation refused persistence: " + diagnostic_text
+        )
+    if quarantines and source_transport != "decodo":
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline quarantine split requires the Decodo transport"
         )
 
     reconciliation_rows: list[dict[str, object]] = []
@@ -978,6 +1334,121 @@ def _apply_pharmonline_public_api_reconciliation(
         session.flush()
 
     admission_rows: list[dict[str, object]] = []
+    quarantine_rows: list[dict[str, object]] = []
+    for action in quarantines:
+        legacy_product = session.get(storage.Product, action.legacy_product_id)
+        if (
+            legacy_product is None
+            or legacy_product.tenant_id != tenant_id
+            or legacy_product.site != "pharmonline"
+            or str(legacy_product.external_id) != action.legacy_external_id
+            or _canonical_pharmonline_product_url(legacy_product.url)
+            != action.legacy_canonical_url
+            or _PHARMONLINE_METEOR_ID_RE.fullmatch(action.legacy_external_id) is None
+            or action.legacy_external_id != action.public_api_external_id
+            or _canonical_pharmonline_product_url(action.public_api_canonical_url) is None
+            or action.legacy_canonical_url == action.public_api_canonical_url
+            or str(action.public_product.external_id) != action.public_api_external_id
+            or _canonical_pharmonline_product_url(action.public_product.url)
+            != action.public_api_canonical_url
+            or not action.public_product.identity_verified
+        ):
+            raise PharmonlinePublicAPIReconciliationError(
+                "public Pharmonline quarantine split state changed before apply"
+            )
+        if legacy_product.id in _pharmonline_public_api_prior_audit_product_ids(
+            session,
+            tenant_id=tenant_id,
+        ):
+            raise PharmonlinePublicAPIReconciliationError(
+                "public Pharmonline quarantine split cannot chain prior audit evidence"
+            )
+
+        all_site_products = session.scalars(
+            select(storage.Product).where(storage.Product.site == "pharmonline")
+        ).all()
+        target_id_rows = [
+            product
+            for product in all_site_products
+            if str(product.external_id) == action.public_api_external_id
+        ]
+        target_url_rows = [
+            product
+            for product in all_site_products
+            if _canonical_pharmonline_product_url(product.url)
+            == action.public_api_canonical_url
+        ]
+        archived_external_id = _pharmonline_public_api_quarantined_external_id(
+            product_id=legacy_product.id,
+            legacy_external_id=action.legacy_external_id,
+        )
+        if (
+            len(archived_external_id) > 200
+            or _PHARMONLINE_METEOR_ID_RE.fullmatch(archived_external_id) is not None
+            or len(target_id_rows) != 1
+            or target_id_rows[0].id != legacy_product.id
+            or target_url_rows
+            or any(
+                str(product.external_id) == archived_external_id
+                for product in all_site_products
+            )
+        ):
+            raise PharmonlinePublicAPIReconciliationError(
+                "public Pharmonline quarantine split identity is not globally unique"
+            )
+
+        # Keep the original Product primary key and every linked historical
+        # record untouched.  Its archived non-native ID makes it impossible
+        # for a later public-API run to mistake that history for the current
+        # product, while the replacement begins with no inherited history.
+        legacy_product.external_id = archived_external_id
+        legacy_product.offer_availability_status = "unknown"
+        legacy_product.offer_quantity = None
+        legacy_product.availability_source = _PHARMONLINE_PUBLIC_API_QUARANTINE_AVAILABILITY_SOURCE
+        legacy_product.availability_observed_at = utcnow()
+        legacy_product.availability_run_id = None
+        session.flush()
+
+        replacement_product = _new_pharmonline_public_api_identity_product(
+            action.public_product,
+            tenant_id=tenant_id,
+            canonical_url=action.public_api_canonical_url,
+        )
+        session.add(replacement_product)
+        session.flush()
+        admission_rows.append(
+            {
+                "tenant_id": tenant_id,
+                "product_id": replacement_product.id,
+                "admission_kind": "quarantined_public_product",
+                "public_api_external_id": action.public_api_external_id,
+                "public_api_canonical_url": action.public_api_canonical_url,
+                "proof_version": _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION,
+                "source_manifest_sha256": source_manifest_sha256,
+                "catalog_fingerprint_sha256": catalog_fingerprint_sha256,
+                "source_transport": source_transport,
+                "preflight_run_ref": preflight_run_ref,
+            }
+        )
+        quarantine_rows.append(
+            {
+                "tenant_id": tenant_id,
+                "legacy_product_id": legacy_product.id,
+                "replacement_product_id": replacement_product.id,
+                "quarantine_kind": _PHARMONLINE_PUBLIC_API_QUARANTINE_KIND,
+                "legacy_external_id": action.legacy_external_id,
+                "archived_external_id": archived_external_id,
+                "legacy_canonical_url": action.legacy_canonical_url,
+                "public_api_external_id": action.public_api_external_id,
+                "public_api_canonical_url": action.public_api_canonical_url,
+                "proof_version": _PHARMONLINE_PUBLIC_API_QUARANTINE_PROOF_VERSION,
+                "source_manifest_sha256": source_manifest_sha256,
+                "catalog_fingerprint_sha256": catalog_fingerprint_sha256,
+                "source_transport": source_transport,
+                "preflight_run_ref": preflight_run_ref,
+            }
+        )
+
     for action in admissions:
         if action.admission_kind not in _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS:
             raise PharmonlinePublicAPIReconciliationError(
@@ -1034,6 +1505,12 @@ def _apply_pharmonline_public_api_reconciliation(
         session.execute(
             storage.PharmonlinePublicAPIIdentityAdmission.__table__.insert(),
             admission_rows,
+        )
+        session.flush()
+    if quarantine_rows:
+        session.execute(
+            storage.PharmonlinePublicAPIIdentityQuarantine.__table__.insert(),
+            quarantine_rows,
         )
         session.flush()
     return metrics
@@ -1253,8 +1730,22 @@ def _verify_pharmonline_public_api_identities(
             storage.Product.tenant_id == tenant_id,
         )
     ).all()
+    (
+        quarantined_legacy_product_ids,
+        quarantined_replacement_product_ids,
+        quarantine_conflicts,
+    ) = _valid_pharmonline_public_api_identity_quarantines(
+        session,
+        existing,
+        tenant_id=tenant_id,
+    )
     ddp_by_id, trusted_history_product_ids, invalid_trusted, duplicate_trusted_ids = (
-        _trusted_ddp_products_by_id(session, existing, tenant_id=tenant_id)
+        _trusted_ddp_products_by_id(
+            session,
+            existing,
+            tenant_id=tenant_id,
+            quarantined_product_ids=quarantined_legacy_product_ids,
+        )
     )
     reconciled_by_id, reconciliation_conflicts = _valid_pharmonline_public_api_reconciliations(
         session,
@@ -1265,6 +1756,7 @@ def _verify_pharmonline_public_api_identities(
         session,
         existing,
         tenant_id=tenant_id,
+        quarantined_replacement_product_ids=quarantined_replacement_product_ids,
     )
     trusted_by_id = dict(ddp_by_id)
     for evidence_by_id in (reconciled_by_id, admitted_by_id):
@@ -1336,6 +1828,7 @@ def _verify_pharmonline_public_api_identities(
         or duplicate_trusted_ids
         or reconciliation_conflicts
         or admission_conflicts
+        or quarantine_conflicts
         or missing_trusted_ids
         or mismatched_urls
         or id_collisions
@@ -1351,6 +1844,7 @@ def _verify_pharmonline_public_api_identities(
             f"duplicate_trusted_ids={duplicate_trusted_ids}, "
             f"reconciliation_conflicts={reconciliation_conflicts}, "
             f"admission_conflicts={admission_conflicts}, "
+            f"quarantine_conflicts={quarantine_conflicts}, "
             f"missing_trusted_ids={len(missing_trusted_ids)}, "
             f"retired_trusted_ids={len(retired_trusted_ids)}, "
             f"trusted_coverage={trusted_coverage:.4f}, "
@@ -1368,6 +1862,7 @@ def _verify_pharmonline_public_api_identities(
         trusted_history_products=len(trusted_history_product_ids),
         reconciled_identities=len(reconciled_by_id),
         admitted_identities=len(admitted_by_id),
+        quarantined_legacy_identities=len(quarantined_legacy_product_ids),
         catalog_floor=catalog_floor or None,
         tenant_id=tenant_id,
     )
@@ -1546,13 +2041,15 @@ def _diagnose_pharmonline_public_api_reconciliation(
     *,
     tenant_id: int,
     redirect_proofs: tuple[_PharmonlinePublicAPIRedirectProof, ...] = (),
+    legacy_self_redirect_proofs: tuple[_PharmonlinePublicAPILegacySelfRedirectProof, ...] = (),
 ) -> dict[str, int]:
     """Return aggregate-only readiness evidence for the explicit rekey step."""
-    _actions, _admissions, metrics = _pharmonline_public_api_reconciliation_plan(
+    _actions, _admissions, _quarantines, metrics = _pharmonline_public_api_reconciliation_plan(
         session,
         results,
         tenant_id=tenant_id,
         redirect_proofs=redirect_proofs,
+        legacy_self_redirect_proofs=legacy_self_redirect_proofs,
     )
     schema_migrated = _pharmonline_public_api_recovery_tables_available(session)
     baselines: list[storage.PharmonlinePublicAPICatalogBaseline] = []

@@ -102,7 +102,7 @@ jobs:
               "candidate_manifest_sha256",
               "metrics",
           }
-          if set(data) != required or data["version"] != 2 or data["transport"] != "decodo":
+          if set(data) != required or data["version"] != 3 or data["transport"] != "decodo":
               raise SystemExit("approved reconciliation plan evidence is invalid")
           if not isinstance(data["product_count"], int) or data["product_count"] < 9500:
               raise SystemExit("approved reconciliation plan product count is invalid")
@@ -412,7 +412,7 @@ jobs:
             /opt/pharmacy-monitor/.venv/bin/python -m alembic -c "$runtime_dir/alembic.ini" upgrade head
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python -m alembic -c "$runtime_dir/alembic.ini" current | \
-            grep -F '0020_public_api_admissions'
+            grep -F '0021_public_api_quarantines'
 
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
@@ -501,6 +501,16 @@ jobs:
                   )
                   or 0
               )
+              quarantine_count = int(
+                  session.scalar(
+                      text(
+                          "SELECT COUNT(*) "
+                          "FROM pharmonline_public_api_identity_quarantines "
+                          "WHERE tenant_id = 1"
+                      )
+                  )
+                  or 0
+              )
               catalog_floor = int(
                   session.scalar(
                       text(
@@ -543,6 +553,7 @@ jobs:
               "quality_status": site_quality.get("status"),
               "full_catalog_verified": quality.get("full_catalog_verified"),
               "reconciliation_audit_records": audit_count,
+              "quarantine_audit_records": quarantine_count,
               "public_api_catalog_floor": catalog_floor,
           }
           print("Recovered Pharmonline Decodo evidence: " + json.dumps(evidence, sort_keys=True))
