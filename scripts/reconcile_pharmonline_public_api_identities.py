@@ -134,27 +134,36 @@ def _expected_plan_evidence() -> tuple[str, str, int]:
 async def read_two_redirect_proofs(challenges, *, transport: str):
     """Require two fresh direct first-party redirect observations per move."""
     if not challenges:
-        return ()
+        return (), {}
     if transport != "decodo":
         fail("native URL redirect proof requires the explicit Decodo transport")
 
-    async def read_pass() -> tuple:
+    async def read_pass() -> tuple[tuple, tuple[str, ...], dict[str, int]]:
         async with PharmonlinePublicAPIScraper() as scraper:
             proven = []
+            verdicts = []
+            reason_counts: dict[str, int] = {}
             for challenge in challenges:
-                if await scraper.prove_product_url_redirect(
+                reason = await scraper.product_url_redirect_proof_reason(
                     legacy_url=challenge.legacy_canonical_url,
                     public_api_url=challenge.public_api_canonical_url,
                     public_api_external_id=challenge.public_api_external_id,
-                ):
+                )
+                verdicts.append(reason)
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                if reason == "verified":
                     proven.append(challenge)
-            return tuple(proven)
+            return tuple(proven), tuple(verdicts), reason_counts
 
-    first_pass = await read_pass()
-    second_pass = await read_pass()
-    if first_pass != second_pass:
+    first_proven, first_verdicts, first_reasons = await read_pass()
+    second_proven, second_verdicts, second_reasons = await read_pass()
+    if (
+        first_proven != second_proven
+        or first_verdicts != second_verdicts
+        or first_reasons != second_reasons
+    ):
         fail("two fresh permanent-redirect proof passes disagree")
-    return first_pass
+    return first_proven, first_reasons
 
 
 def write_plan_evidence(
@@ -220,10 +229,20 @@ async def main(*, apply: bool) -> None:
                 # before any network I/O; the dedicated advisory lock remains
                 # held for the full source proof and apply sequence.
                 session.rollback()
-                redirect_proofs = await read_two_redirect_proofs(
+                redirect_proofs, redirect_reason_counts = await read_two_redirect_proofs(
                     redirect_challenges,
                     transport=transport,
                 )
+                if redirect_challenges:
+                    reason_text = ", ".join(
+                        f"{reason}={count}"
+                        for reason, count in sorted(redirect_reason_counts.items())
+                    )
+                    print(
+                        "Pharmonline native URL redirect proof "
+                        f"(aggregate-only): candidates={len(redirect_challenges)}, "
+                        f"verified={len(redirect_proofs)}, {reason_text}"
+                    )
 
                 if apply and (
                     fingerprint != expected_plan_fingerprint

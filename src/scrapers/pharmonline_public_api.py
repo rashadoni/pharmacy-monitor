@@ -269,18 +269,18 @@ def _same_origin_product_redirect_url(current_url: str, location: Any) -> str | 
     return _canonical_product_url(f"{_BASE_URL}{parsed.path}", source_is_path=False)
 
 
-def _html_proves_public_product_identity(
+def _html_public_product_identity_proof_reason(
     document: str,
     *,
     canonical_url: str,
     external_id: str,
-) -> bool:
-    """Require first-party page canonical and embedded native-ID witnesses.
+) -> str:
+    """Return the first failing canonical/native-ID witness category.
 
     A redirect alone can point at a generic page.  The destination must also
     expose the expected canonical URL plus its exact public product ID in the
-    first-party HTML/hydration payload.  This parser returns only a boolean so
-    recovery logging never contains product names, paths, or response bodies.
+    first-party HTML/hydration payload.  Its controlled categories keep
+    recovery diagnostics aggregate-only: no names, paths, or response bodies.
     """
     decoded = html.unescape(document)
     canonical_witness = False
@@ -301,15 +301,32 @@ def _html_proves_public_product_identity(
             canonical_witness = True
             break
     if not canonical_witness:
-        return False
+        return "destination_canonical_missing"
 
     encoded_id = re.escape(external_id)
-    return bool(
-        re.search(
-            rf"""(?:["'](?:_id|id|productId|product_id)["']|data-(?:product-)?id)\s*[:=]\s*["']{encoded_id}["']""",
-            decoded,
-            flags=re.I,
+    if not re.search(
+        rf"""(?:["'](?:_id|id|productId|product_id)["']|data-(?:product-)?id)\s*[:=]\s*["']{encoded_id}["']""",
+        decoded,
+        flags=re.I,
+    ):
+        return "destination_native_id_missing"
+    return "verified"
+
+
+def _html_proves_public_product_identity(
+    document: str,
+    *,
+    canonical_url: str,
+    external_id: str,
+) -> bool:
+    """Compatibility wrapper for callers that only need a boolean proof."""
+    return (
+        _html_public_product_identity_proof_reason(
+            document,
+            canonical_url=canonical_url,
+            external_id=external_id,
         )
+        == "verified"
     )
 
 
@@ -794,14 +811,14 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         self._record_origin_headers(target_url, response.headers)
         return response
 
-    async def prove_product_url_redirect(
+    async def product_url_redirect_proof_reason(
         self,
         *,
         legacy_url: str,
         public_api_url: str,
         public_api_external_id: str,
-    ) -> bool:
-        """Prove one native-ID URL move through direct permanent redirects.
+    ) -> str:
+        """Return only aggregate-safe evidence for one native-ID URL move.
 
         This proof is intentionally limited to Decodo recovery.  It accepts a
         single first-party 301/308 from the stored URL directly to the current
@@ -819,14 +836,14 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             or legacy_canonical == public_canonical
             or _METEOR_ID_RE.fullmatch(public_api_external_id) is None
         ):
-            return False
+            return "input_invalid"
         context = f"decodo-redirect-proof-{secrets.token_hex(16)}"
         redirect = await self._decodo_redirect_response(
             legacy_canonical,
             crawlbase_session=context,
         )
         if redirect.status_code not in _PERMANENT_REDIRECT_STATUSES:
-            return False
+            return f"legacy_status_{redirect.status_code}"
         if (
             _same_origin_product_redirect_url(
                 legacy_canonical,
@@ -834,17 +851,34 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             )
             != public_canonical
         ):
-            return False
+            return "redirect_target_mismatch"
         final = await self._decodo_redirect_response(
             public_canonical,
             crawlbase_session=context,
         )
         if final.status_code != 200:
-            return False
-        return _html_proves_public_product_identity(
+            return f"destination_status_{final.status_code}"
+        return _html_public_product_identity_proof_reason(
             final.text,
             canonical_url=public_canonical,
             external_id=public_api_external_id,
+        )
+
+    async def prove_product_url_redirect(
+        self,
+        *,
+        legacy_url: str,
+        public_api_url: str,
+        public_api_external_id: str,
+    ) -> bool:
+        """Return whether one native-ID URL move has strict redirect proof."""
+        return (
+            await self.product_url_redirect_proof_reason(
+                legacy_url=legacy_url,
+                public_api_url=public_api_url,
+                public_api_external_id=public_api_external_id,
+            )
+            == "verified"
         )
 
     def _scraperapi_context(self, session: str | None) -> str:

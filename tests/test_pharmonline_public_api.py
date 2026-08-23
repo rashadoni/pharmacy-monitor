@@ -15,6 +15,7 @@ from src.scrapers.pharmonline_public_api import (
     PharmonlinePublicAPIScraper,
     _canonical_product_url,
     _configured_decodo_ports,
+    _html_public_product_identity_proof_reason,
     _html_proves_public_product_identity,
     _json_from_rendered_body,
     _same_origin_product_redirect_url,
@@ -829,10 +830,78 @@ async def test_decodo_redirect_proof_requires_direct_permanent_identity_witness(
             )
 
     monkeypatch.setattr(scraper, "_decodo_client_for_context", lambda _context, _port: _Client())
+    assert (
+        await scraper.product_url_redirect_proof_reason(
+            legacy_url=old_url,
+            public_api_url=new_url,
+            public_api_external_id=native_id,
+        )
+        == "verified"
+    )
     assert await scraper.prove_product_url_redirect(
         legacy_url=old_url,
         public_api_url=new_url,
         public_api_external_id=native_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("legacy_status", "location", "destination_status", "destination_html", "expected"),
+    [
+        (200, None, None, "", "legacy_status_200"),
+        (301, "/product/wrong-path", None, "", "redirect_target_mismatch"),
+        (308, "/product/new-path", 503, "", "destination_status_503"),
+        (
+            308,
+            "/product/new-path",
+            200,
+            '<script>{"_id":"xwJspdCx3iFBDqDWF"}</script>',
+            "destination_canonical_missing",
+        ),
+        (
+            308,
+            "/product/new-path",
+            200,
+            '<link rel="canonical" href="https://pharmonline.az/product/new-path">',
+            "destination_native_id_missing",
+        ),
+    ],
+)
+async def test_decodo_redirect_proof_reason_is_aggregate_safe(
+    monkeypatch,
+    legacy_status,
+    location,
+    destination_status,
+    destination_html,
+    expected,
+):
+    old_url = "https://pharmonline.az/product/old-path"
+    new_url = "https://pharmonline.az/product/new-path"
+    native_id = "xwJspdCx3iFBDqDWF"
+    scraper = PharmonlinePublicAPIScraper()
+
+    class _Response:
+        def __init__(self, status_code: int, *, headers=None, text: str = "") -> None:
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.text = text
+
+    responses = [_Response(legacy_status, headers={"location": location} if location else {})]
+    if destination_status is not None:
+        responses.append(_Response(destination_status, text=destination_html))
+
+    async def _redirect_response(*_args, **_kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr(scraper, "_decodo_redirect_response", _redirect_response)
+    assert (
+        await scraper.product_url_redirect_proof_reason(
+            legacy_url=old_url,
+            public_api_url=new_url,
+            public_api_external_id=native_id,
+        )
+        == expected
     )
 
 
@@ -848,6 +917,22 @@ def test_redirect_helpers_reject_cross_origin_or_missing_embedded_identity():
         '<link rel="canonical" href="https://pharmonline.az/product/new-path">',
         canonical_url="https://pharmonline.az/product/new-path",
         external_id="xwJspdCx3iFBDqDWF",
+    )
+    assert (
+        _html_public_product_identity_proof_reason(
+            '<link rel="canonical" href="https://pharmonline.az/product/new-path">',
+            canonical_url="https://pharmonline.az/product/new-path",
+            external_id="xwJspdCx3iFBDqDWF",
+        )
+        == "destination_native_id_missing"
+    )
+    assert (
+        _html_public_product_identity_proof_reason(
+            '<script>{"_id":"xwJspdCx3iFBDqDWF"}</script>',
+            canonical_url="https://pharmonline.az/product/new-path",
+            external_id="xwJspdCx3iFBDqDWF",
+        )
+        == "destination_canonical_missing"
     )
 
 
