@@ -880,6 +880,7 @@ async def test_decodo_redirect_proof_reason_is_aggregate_safe(
     new_url = "https://pharmonline.az/product/new-path"
     native_id = "xwJspdCx3iFBDqDWF"
     scraper = PharmonlinePublicAPIScraper()
+    scraper._public_api_transport = "decodo"
 
     class _Response:
         def __init__(self, status_code: int, *, headers=None, text: str = "") -> None:
