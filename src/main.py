@@ -574,7 +574,7 @@ def _apply_pharmonline_public_api_reconciliation(
             "public Pharmonline reconciliation refused persistence: " + diagnostic_text
         )
 
-    reconciliation_records: list[storage.PharmonlinePublicAPIIdentityReconciliation] = []
+    reconciliation_rows: list[dict[str, object]] = []
     for action in actions:
         product = session.get(storage.Product, action.product_id)
         if (
@@ -590,22 +590,27 @@ def _apply_pharmonline_public_api_reconciliation(
             )
         product.external_id = action.public_api_external_id
         product.url = action.public_api_canonical_url
-        reconciliation_record = storage.PharmonlinePublicAPIIdentityReconciliation(
-            tenant_id=tenant_id,
-            product_id=product.id,
-            legacy_external_id=action.legacy_external_id,
-            public_api_external_id=action.public_api_external_id,
-            legacy_canonical_url=action.legacy_canonical_url,
-            public_api_canonical_url=action.public_api_canonical_url,
-            proof_version=action.proof_version,
-            source_manifest_sha256=source_manifest_sha256,
-            catalog_fingerprint_sha256=catalog_fingerprint_sha256,
-            source_transport=source_transport,
-            preflight_run_ref=preflight_run_ref,
+        reconciliation_rows.append(
+            {
+                "tenant_id": tenant_id,
+                "product_id": product.id,
+                "legacy_external_id": action.legacy_external_id,
+                "public_api_external_id": action.public_api_external_id,
+                "legacy_canonical_url": action.legacy_canonical_url,
+                "public_api_canonical_url": action.public_api_canonical_url,
+                "proof_version": action.proof_version,
+                "source_manifest_sha256": source_manifest_sha256,
+                "catalog_fingerprint_sha256": catalog_fingerprint_sha256,
+                "source_transport": source_transport,
+                "preflight_run_ref": preflight_run_ref,
+            }
         )
-        reconciliation_records.append(reconciliation_record)
-        session.add(reconciliation_record)
     session.flush()
+    if reconciliation_rows:
+        session.execute(
+            storage.PharmonlinePublicAPIIdentityReconciliation.__table__.insert(),
+            reconciliation_rows,
+        )
     return metrics
 
 
@@ -658,22 +663,22 @@ def _ensure_pharmonline_public_api_catalog_baseline(
         _PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS,
         (catalog_item_count * _PHARMONLINE_PUBLIC_API_BASELINE_FRACTION_PER_THOUSAND + 999) // 1000,
     )
-    baseline = storage.PharmonlinePublicAPICatalogBaseline(
-        tenant_id=tenant_id,
-        catalog_item_count=catalog_item_count,
-        minimum_catalog_item_count=minimum_catalog_item_count,
-        verified_identity_count=verified_identity_count,
-        trusted_ddp_item_count=trusted_ddp_item_count,
-        retired_ddp_item_count=retired_ddp_item_count,
-        reconciled_item_count=reconciled_item_count,
-        proof_version=_PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION,
-        source_manifest_sha256=source_manifest_sha256,
-        catalog_fingerprint_sha256=catalog_fingerprint_sha256,
-        source_transport=source_transport,
-        preflight_run_ref=preflight_run_ref,
+    session.execute(
+        storage.PharmonlinePublicAPICatalogBaseline.__table__.insert().values(
+            tenant_id=tenant_id,
+            catalog_item_count=catalog_item_count,
+            minimum_catalog_item_count=minimum_catalog_item_count,
+            verified_identity_count=verified_identity_count,
+            trusted_ddp_item_count=trusted_ddp_item_count,
+            retired_ddp_item_count=retired_ddp_item_count,
+            reconciled_item_count=reconciled_item_count,
+            proof_version=_PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION,
+            source_manifest_sha256=source_manifest_sha256,
+            catalog_fingerprint_sha256=catalog_fingerprint_sha256,
+            source_transport=source_transport,
+            preflight_run_ref=preflight_run_ref,
+        )
     )
-    session.add(baseline)
-    session.flush()
     return minimum_catalog_item_count
 
 
