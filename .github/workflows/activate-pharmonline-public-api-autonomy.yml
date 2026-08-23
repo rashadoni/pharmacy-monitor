@@ -120,6 +120,7 @@ jobs:
             /opt/pharmacy-monitor/.codex-pharmonline-activate.*) ;;
             *) echo 'unexpected remote staging path' >&2; exit 1 ;;
           esac
+          echo "work_dir=$work_dir" >> "$GITHUB_OUTPUT"
           ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -144,7 +145,6 @@ jobs:
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
             "$manifest" "pm@46.225.149.52:$work_dir/incoming/source-manifest"
-          echo "work_dir=$work_dir" >> "$GITHUB_OUTPUT"
 
       - name: Back up source, activate marker, and verify the dispatch
         env:
@@ -254,6 +254,25 @@ jobs:
           chmod 600 "$marker_tmp"
           mv -f "$marker_tmp" "$marker"
           test "$(cat "$marker")" = 'pharmonline_public_api_autonomous_v1'
+
+          # Verify the exact source that systemd resolves from its documented
+          # WorkingDirectory and the real, default marker path.  This prevents
+          # a marker left behind by a future deployment from silently reviving
+          # the legacy DDP mode.
+          cd /opt/pharmacy-monitor
+          env -u PYTHONPATH -u PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER \
+            /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
+          from pathlib import Path
+
+          from src import main
+
+          expected = Path('/opt/pharmacy-monitor/src/main.py').resolve()
+          actual = Path(main.__file__).resolve()
+          assert actual == expected, f'expected deployed main.py {expected}, got {actual}'
+          assert main._pharmonline_public_api_autonomous_mode_requested(
+              ['pharmonline'], 'auto'
+          )
+          PY
           echo "autonomous_public_api_marker=$marker"
           echo "retained_rollback_backup=$backup_dir"
           trap - ERR INT TERM

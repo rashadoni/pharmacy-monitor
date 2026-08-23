@@ -142,7 +142,7 @@ def _pharmonline_public_api_autonomous_mode_requested(
     content prevents an unrelated empty file from silently changing scraper
     identity semantics.
     """
-    if mode != "auto" or set(sites) != {"pharmonline"}:
+    if mode != "auto" or sites != ["pharmonline"]:
         return False
     try:
         return (

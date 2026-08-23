@@ -155,6 +155,9 @@ def test_autonomous_marker_redirects_only_the_generic_pharmonline_timer(monkeypa
     )
     assert main_mod._pharmonline_public_api_autonomous_mode_requested(["pharmonline"], "auto")
     assert not main_mod._pharmonline_public_api_autonomous_mode_requested(
+        ["pharmonline", "pharmonline"], "auto"
+    )
+    assert not main_mod._pharmonline_public_api_autonomous_mode_requested(
         ["pharmonline", "aloe"], "auto"
     )
     assert not main_mod._pharmonline_public_api_autonomous_mode_requested(

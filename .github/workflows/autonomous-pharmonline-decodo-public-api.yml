@@ -81,6 +81,20 @@ jobs:
           marker=/opt/pharmacy-monitor/data/pharmonline-public-api-autonomous-v1
           test -f "$marker"
           test "$(cat "$marker")" = 'pharmonline_public_api_autonomous_v1'
+          cd /opt/pharmacy-monitor
+          env -u PYTHONPATH -u PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER \
+            /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
+          from pathlib import Path
+
+          from src import main
+
+          expected = Path('/opt/pharmacy-monitor/src/main.py').resolve()
+          actual = Path(main.__file__).resolve()
+          assert actual == expected, f'expected deployed main.py {expected}, got {actual}'
+          assert main._pharmonline_public_api_autonomous_mode_requested(
+              ['pharmonline'], 'auto'
+          )
+          PY
           if systemctl is-active --quiet "$service"; then
             echo 'Pharmonline systemd scrape is active; refusing overlapping refresh' >&2
             exit 1
@@ -146,6 +160,8 @@ jobs:
             /opt/pharmacy-monitor/.codex-pharmonline-auto.*) ;;
             *) echo 'unexpected remote staging path' >&2; exit 1 ;;
           esac
+          echo "work_dir=$work_dir" >> "$GITHUB_OUTPUT"
+          echo "REMOTE_WORK_DIR=$work_dir" >> "$GITHUB_ENV"
 
           ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
@@ -171,8 +187,6 @@ jobs:
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
             "$manifest" "pm@46.225.149.52:$work_dir/incoming/source-manifest"
-          echo "work_dir=$work_dir" >> "$GITHUB_OUTPUT"
-          echo "REMOTE_WORK_DIR=$work_dir" >> "$GITHUB_ENV"
 
       - name: Run guarded Decodo refresh with bounded fresh-session retries
         env:
