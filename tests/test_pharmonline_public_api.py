@@ -18,6 +18,7 @@ from src.scrapers.pharmonline_public_api import (
     _html_public_product_identity_proof_reason,
     _html_proves_public_product_identity,
     _json_from_rendered_body,
+    _product_redirect_target_proof_reason,
     _same_origin_product_redirect_url,
     _same_origin_sitemap_url,
     _sitemap_covers_api_catalog,
@@ -850,7 +851,7 @@ async def test_decodo_redirect_proof_requires_direct_permanent_identity_witness(
     ("legacy_status", "location", "destination_status", "destination_html", "expected"),
     [
         (200, None, None, "", "legacy_status_200"),
-        (301, "/product/wrong-path", None, "", "redirect_target_mismatch"),
+        (301, "/product/wrong-path", None, "", "redirect_target_different_product"),
         (308, "/product/new-path", 503, "", "destination_status_503"),
         (
             308,
@@ -913,6 +914,22 @@ def test_redirect_helpers_reject_cross_origin_or_missing_embedded_identity():
     )
     assert _same_origin_product_redirect_url(current, "/product/new-path?lng=az") == (
         "https://pharmonline.az/product/new-path"
+    )
+    assert (
+        _product_redirect_target_proof_reason(
+            current,
+            "https://other.example/product/new-path",
+            expected_canonical_url="https://pharmonline.az/product/new-path",
+        )
+        == "redirect_target_cross_origin"
+    )
+    assert (
+        _product_redirect_target_proof_reason(
+            current,
+            "/product/old-path",
+            expected_canonical_url="https://pharmonline.az/product/new-path",
+        )
+        == "redirect_target_legacy_product"
     )
     assert not _html_proves_public_product_identity(
         '<link rel="canonical" href="https://pharmonline.az/product/new-path">',

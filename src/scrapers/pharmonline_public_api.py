@@ -269,6 +269,33 @@ def _same_origin_product_redirect_url(current_url: str, location: Any) -> str | 
     return _canonical_product_url(f"{_BASE_URL}{parsed.path}", source_is_path=False)
 
 
+def _product_redirect_target_proof_reason(
+    current_url: str,
+    location: Any,
+    *,
+    expected_canonical_url: str,
+) -> str:
+    """Classify a redirect target without exposing its URL in diagnostics."""
+    raw_location = _text(location)
+    if raw_location is None:
+        return "redirect_location_missing"
+    resolved = urljoin(current_url, raw_location)
+    parsed = urlsplit(resolved)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if parsed.scheme != "https":
+        return "redirect_target_non_https"
+    if host != "pharmonline.az":
+        return "redirect_target_cross_origin"
+    target = _canonical_product_url(f"{_BASE_URL}{parsed.path}", source_is_path=False)
+    if target is None:
+        return "redirect_target_not_product"
+    if target == expected_canonical_url:
+        return "verified"
+    if target == _canonical_product_url(current_url):
+        return "redirect_target_legacy_product"
+    return "redirect_target_different_product"
+
+
 def _html_public_product_identity_proof_reason(
     document: str,
     *,
@@ -844,14 +871,13 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         )
         if redirect.status_code not in _PERMANENT_REDIRECT_STATUSES:
             return f"legacy_status_{redirect.status_code}"
-        if (
-            _same_origin_product_redirect_url(
-                legacy_canonical,
-                redirect.headers.get("location"),
-            )
-            != public_canonical
-        ):
-            return "redirect_target_mismatch"
+        redirect_target_reason = _product_redirect_target_proof_reason(
+            legacy_canonical,
+            redirect.headers.get("location"),
+            expected_canonical_url=public_canonical,
+        )
+        if redirect_target_reason != "verified":
+            return redirect_target_reason
         final = await self._decodo_redirect_response(
             public_canonical,
             crawlbase_session=context,
