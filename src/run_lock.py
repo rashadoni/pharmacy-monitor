@@ -19,6 +19,49 @@ def _is_postgres_bind(bind) -> bool:
 
 
 @contextmanager
+def try_exclusive_scrape_lock(session: Session) -> Iterator[bool]:
+    """Hold a non-blocking exclusive scrape lock for an isolated maintenance job.
+
+    The regular producer command keeps this same session-level advisory lock
+    for its whole lifetime.  A maintenance command cannot use Click's command
+    lifetime hook, so it owns a separate checked-out connection and releases
+    the lock explicitly.  The lock connection commits immediately after each
+    advisory-lock operation and never remains idle in a transaction.
+    """
+    bind = session.get_bind()
+    if not _is_postgres_bind(bind):
+        yield True
+        return
+
+    connection = bind.connect()
+    acquired = False
+    try:
+        acquired = bool(
+            connection.scalar(
+                text("SELECT pg_try_advisory_lock(hashtext(:key))"),
+                {"key": SCRAPE_ADVISORY_LOCK_KEY},
+            )
+        )
+        connection.commit()
+        yield acquired
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        if acquired:
+            try:
+                connection.scalar(
+                    text("SELECT pg_advisory_unlock(hashtext(:key))"),
+                    {"key": SCRAPE_ADVISORY_LOCK_KEY},
+                )
+                connection.commit()
+            except Exception as exc:
+                connection.rollback()
+                log.warning("scrape_lock_release_failed", error=str(exc))
+        connection.close()
+
+
+@contextmanager
 def try_shared_scrape_read_lock(session: Session) -> Iterator[bool]:
     """Hold a non-blocking shared lock while reading mutable product state.
 

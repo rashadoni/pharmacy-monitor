@@ -68,7 +68,7 @@ def test_pharmonline_public_api_reconciliation_migration_is_reversible(
     tmp_path: Path,
 ) -> None:
     db_url = f"sqlite:///{tmp_path / 'pharmonline-public-api-reconciliation.sqlite'}"
-    _alembic(db_url, "upgrade", "0019_pharmonline_public_api_reconciliation")
+    _alembic(db_url, "upgrade", "0019_public_api_reconcile")
 
     inspector = inspect(create_engine(db_url))
     reconciliation_columns = {

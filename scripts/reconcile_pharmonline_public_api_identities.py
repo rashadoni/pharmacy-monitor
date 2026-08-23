@@ -27,6 +27,7 @@ from src.main import (
     _pharmonline_public_api_reconciliation_is_safe,
     _verify_pharmonline_public_api_identities,
 )
+from src.run_lock import try_exclusive_scrape_lock
 from src.scrapers.pharmonline_public_api import (
     PUBLIC_CATALOG_ROUTE,
     PharmonlinePublicAPIScraper,
@@ -123,17 +124,22 @@ async def main(*, apply: bool) -> None:
     if not apply:
         with Session() as session:
             try:
-                session.execute(text("SET TRANSACTION READ ONLY"))
-                transaction_read_only = str(
-                    session.scalar(text("SHOW transaction_read_only"))
-                ).lower()
-                if transaction_read_only not in {"on", "true", "1"}:
-                    fail("database transaction did not enter read-only mode")
-                diagnostics = _diagnose_pharmonline_public_api_reconciliation(
-                    session,
-                    results,
-                    tenant_id=1,
-                )
+                with try_exclusive_scrape_lock(session) as acquired:
+                    if not acquired:
+                        fail("an active scrape or recovery holds the production run lock")
+                    session.execute(
+                        text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    )
+                    transaction_read_only = str(
+                        session.scalar(text("SHOW transaction_read_only"))
+                    ).lower()
+                    if transaction_read_only not in {"on", "true", "1"}:
+                        fail("database transaction did not enter read-only mode")
+                    diagnostics = _diagnose_pharmonline_public_api_reconciliation(
+                        session,
+                        results,
+                        tenant_id=1,
+                    )
             finally:
                 session.rollback()
         diagnostic_text = ", ".join(f"{key}={value}" for key, value in sorted(diagnostics.items()))
@@ -150,36 +156,40 @@ async def main(*, apply: bool) -> None:
     source_manifest_sha256, preflight_run_ref = _workflow_evidence()
     with Session() as session:
         try:
-            metrics = _apply_pharmonline_public_api_reconciliation(
-                session,
-                results,
-                tenant_id=1,
-                source_manifest_sha256=source_manifest_sha256,
-                catalog_fingerprint_sha256=fingerprint,
-                source_transport=transport,
-                preflight_run_ref=preflight_run_ref,
-            )
-            catalog_floor = _ensure_pharmonline_public_api_catalog_baseline(
-                session,
-                results,
-                tenant_id=1,
-                verified_identity_count=len(verified_catalog.products),
-                trusted_ddp_item_count=metrics["trusted_ddp_identities"],
-                retired_ddp_item_count=metrics["retired_ddp_identities"],
-                reconciled_item_count=(
-                    metrics["reconciled_identities"] + metrics["legacy_rekeys_ready"]
-                ),
-                source_manifest_sha256=source_manifest_sha256,
-                catalog_fingerprint_sha256=fingerprint,
-                source_transport=transport,
-                preflight_run_ref=preflight_run_ref,
-            )
-            verified_identities = _verify_pharmonline_public_api_identities(
-                session,
-                results,
-                tenant_id=1,
-            )
-            session.commit()
+            with try_exclusive_scrape_lock(session) as acquired:
+                if not acquired:
+                    fail("an active scrape or recovery holds the production run lock")
+                session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                metrics = _apply_pharmonline_public_api_reconciliation(
+                    session,
+                    results,
+                    tenant_id=1,
+                    source_manifest_sha256=source_manifest_sha256,
+                    catalog_fingerprint_sha256=fingerprint,
+                    source_transport=transport,
+                    preflight_run_ref=preflight_run_ref,
+                )
+                catalog_floor = _ensure_pharmonline_public_api_catalog_baseline(
+                    session,
+                    results,
+                    tenant_id=1,
+                    verified_identity_count=len(verified_catalog.products),
+                    trusted_ddp_item_count=metrics["trusted_ddp_identities"],
+                    retired_ddp_item_count=metrics["retired_ddp_identities"],
+                    reconciled_item_count=(
+                        metrics["reconciled_identities"] + metrics["legacy_rekeys_ready"]
+                    ),
+                    source_manifest_sha256=source_manifest_sha256,
+                    catalog_fingerprint_sha256=fingerprint,
+                    source_transport=transport,
+                    preflight_run_ref=preflight_run_ref,
+                )
+                verified_identities = _verify_pharmonline_public_api_identities(
+                    session,
+                    results,
+                    tenant_id=1,
+                )
+                session.commit()
         except Exception:
             session.rollback()
             raise

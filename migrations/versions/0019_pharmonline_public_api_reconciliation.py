@@ -1,6 +1,6 @@
 """retain immutable Pharmonline public-API recovery proofs
 
-Revision ID: 0019_pharmonline_public_api_reconciliation
+Revision ID: 0019_public_api_reconcile
 Revises: 0018_product_manual_category
 Create Date: 2026-08-23
 """
@@ -12,7 +12,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0019_pharmonline_public_api_reconciliation"
+revision: str = "0019_public_api_reconcile"
 down_revision: str | None = "0018_product_manual_category"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
