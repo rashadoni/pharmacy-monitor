@@ -28,7 +28,11 @@ from src.main import (
 from src.scrapers.pharmonline_public_api import (
     PUBLIC_CATALOG_ROUTE,
     PharmonlinePublicAPIScraper,
+    is_retryable_full_catalog_abort_reason,
 )
+
+
+_MAX_FRESH_CATALOG_READ_ATTEMPTS = 3
 
 
 def fail(message: str) -> NoReturn:
@@ -36,28 +40,45 @@ def fail(message: str) -> NoReturn:
 
 
 async def read_catalog_pass(pass_name: str):
-    async with PharmonlinePublicAPIScraper() as scraper:
-        result = await scraper.scrape([PUBLIC_CATALOG_ROUTE])
+    for attempt in range(1, _MAX_FRESH_CATALOG_READ_ATTEMPTS + 1):
+        async with PharmonlinePublicAPIScraper() as scraper:
+            result = await scraper.scrape([PUBLIC_CATALOG_ROUTE])
 
-    route = result.route_statuses.get(PUBLIC_CATALOG_ROUTE)
-    if (
-        result.site_fatal
-        or result.errors
-        or route is None
-        or not route.complete
-        or len(result.products) < 1
-    ):
+        route = result.route_statuses.get(PUBLIC_CATALOG_ROUTE)
+        complete = (
+            not result.site_fatal
+            and not result.errors
+            and route is not None
+            and route.complete
+            and len(result.products) > 0
+        )
+        if complete:
+            if route.expected_items != len(result.products):
+                fail(
+                    f"{pass_name} route coverage mismatch: "
+                    f"expected_items={route.expected_items}, products={len(result.products)}"
+                )
+            return result
+
+        reason = route.abort_reason if route is not None else None
+        if (
+            is_retryable_full_catalog_abort_reason(reason)
+            and attempt < _MAX_FRESH_CATALOG_READ_ATTEMPTS
+        ):
+            print(
+                "Pharmonline public API preflight discarded an inconsistent "
+                f"{pass_name} read; retrying from a fresh session "
+                f"attempt={attempt}, reason={reason}"
+            )
+            await asyncio.sleep(attempt)
+            continue
         fail(
             f"{pass_name} did not produce one verified full catalog: "
             f"site_fatal={result.site_fatal}, errors={len(result.errors)}, "
-            f"products={len(result.products)}, route_complete={bool(route and route.complete)}"
+            f"products={len(result.products)}, route_complete={bool(route and route.complete)}, "
+            f"abort_reason={reason or 'none'}, attempts={attempt}"
         )
-    if route.expected_items != len(result.products):
-        fail(
-            f"{pass_name} route coverage mismatch: "
-            f"expected_items={route.expected_items}, products={len(result.products)}"
-        )
-    return result
+    raise AssertionError("unreachable")
 
 
 def identity_sequence(result) -> tuple[tuple[str, str], ...]:

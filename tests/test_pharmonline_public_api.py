@@ -18,6 +18,7 @@ from src.scrapers.pharmonline_public_api import (
     _json_from_rendered_body,
     _same_origin_sitemap_url,
     _sitemap_covers_api_catalog,
+    is_retryable_full_catalog_abort_reason,
 )
 from src.scrapers.base import SiteScrapeFatalError
 
@@ -249,6 +250,31 @@ async def test_public_api_rejects_sitemap_mismatch_before_any_yield():
     status = scraper._route_statuses[PUBLIC_CATALOG_ROUTE]
     assert status.complete is False
     assert status.abort_reason == "products_sitemap_set_mismatch"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "products_metadata_changed_during_pagination",
+        "products_chunk_anchor_metadata_changed",
+        "products_chunk_anchor_changed",
+    ],
+)
+def test_only_discarded_live_catalog_consistency_failures_are_retryable(reason):
+    assert is_retryable_full_catalog_abort_reason(reason) is True
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        None,
+        "products_sitemap_set_mismatch",
+        "products_duplicate_external_id",
+        "scraperapi_http_499",
+    ],
+)
+def test_other_public_api_abort_reasons_are_not_retryable(reason):
+    assert is_retryable_full_catalog_abort_reason(reason) is False
 
 
 def test_sitemap_can_lag_small_subset_of_verified_api_catalog():

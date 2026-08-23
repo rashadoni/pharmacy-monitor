@@ -98,10 +98,28 @@ _SCRAPERAPI_PROXY_PORT = 8001
 # for every API item before persistence.
 _MIN_SITEMAP_API_COVERAGE_PER_THOUSAND = 999
 _MAX_SITEMAP_API_LAG_ITEMS = 8
+_RETRYABLE_FULL_CATALOG_ABORT_REASONS = frozenset(
+    {
+        "products_metadata_changed_during_pagination",
+        "products_chunk_anchor_metadata_changed",
+        "products_chunk_anchor_changed",
+    }
+)
 
 
 class PharmonlinePublicAPIError(RuntimeError):
     """The public source did not prove a complete, stable catalog."""
+
+
+def is_retryable_full_catalog_abort_reason(reason: str | None) -> bool:
+    """Whether a discarded full read may be retried from a fresh API session.
+
+    A page or chunk-anchor metadata change proves that this *attempt* mixed
+    live catalog versions, so the scraper itself must yield nothing. A caller
+    may start over only when it discards the entire attempt and later proves
+    two complete fresh reads identical before persistence.
+    """
+    return reason in _RETRYABLE_FULL_CATALOG_ABORT_REASONS
 
 
 def _env_enabled(name: str) -> bool:
