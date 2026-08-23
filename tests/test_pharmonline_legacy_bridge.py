@@ -462,10 +462,7 @@ def test_public_api_reconciliation_rekeys_only_one_exact_non_ddp_legacy_url(db_s
     assert main_mod._PHARMONLINE_METEOR_ID_RE.fullmatch(record.public_api_external_id)
     assert main_mod._pharmonline_public_api_reconciliation_invalid_reason(record, refreshed) is None
     raw_reconciliation_rows = db_session.execute(
-        text(
-            "SELECT id, tenant_id FROM pharmonline_public_api_identity_reconciliations "
-            "WHERE tenant_id = 1"
-        )
+        text("SELECT id, tenant_id FROM pharmonline_public_api_identity_reconciliations")
     ).all()
     assert raw_reconciliation_rows == [(record.id, 1)]
     valid_reconciliations, conflicts = main_mod._valid_pharmonline_public_api_reconciliations(
