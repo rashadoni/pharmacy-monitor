@@ -269,6 +269,8 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=120 \
             pm@46.225.149.52 \
             "bash -s -- '$remote_work_dir' '$source_manifest_sha' '$PLAN_RUN_ID' '$PLAN_CATALOG_FINGERPRINT_SHA256' '$PLAN_CANDIDATE_MANIFEST_SHA256' '$PLAN_PRODUCT_COUNT'" <<'REMOTE'
           set -euo pipefail
