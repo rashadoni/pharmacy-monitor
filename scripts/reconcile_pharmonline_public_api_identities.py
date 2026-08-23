@@ -77,12 +77,22 @@ async def read_catalog_pass(pass_name: str):
             is_retryable_full_catalog_abort_reason(reason)
             and attempt < _MAX_FRESH_CATALOG_READ_ATTEMPTS
         ):
+            retry_delay = (
+                300
+                if reason
+                in {
+                    "decodo_http_429",
+                    "decodo_request_failed",
+                    "decodo_transient_request_failed",
+                }
+                else attempt
+            )
             print(
                 "Pharmonline public API reconciliation discarded an inconsistent "
                 f"{pass_name} read; retrying from a fresh session "
-                f"attempt={attempt}, reason={reason}"
+                f"attempt={attempt}, reason={reason}, delay_seconds={retry_delay}"
             )
-            await asyncio.sleep(attempt)
+            await asyncio.sleep(retry_delay)
             continue
         fail(
             f"{pass_name} did not produce one verified full catalog: "
