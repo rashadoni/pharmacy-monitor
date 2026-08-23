@@ -291,7 +291,7 @@ def _product_redirect_target_proof_reason(
         return "redirect_target_not_product"
     if target == expected_canonical_url:
         return "verified"
-    if target == _canonical_product_url(current_url):
+    if target == _canonical_product_url(current_url, source_is_path=False):
         return "redirect_target_legacy_product"
     return "redirect_target_different_product"
 
