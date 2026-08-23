@@ -443,6 +443,17 @@ jobs:
           /opt/pharmacy-monitor/.venv/bin/python \
             "$runtime_dir/scripts/reconcile_pharmonline_public_api_identities.py" --apply
 
+          # The guarded apply intentionally reads the full public catalog twice
+          # before it writes.  Give the first-party API a complete cooling
+          # window before the independent, persisted full-catalog run below:
+          # a third back-to-back full pass has previously been rate-limited.
+          # This is a wait only; no producer lock or database transaction is
+          # kept open, and the final run still proves its own catalog before it
+          # can publish data.
+          decodo_publish_cooldown_seconds=1860
+          echo "Decodo verified-source cooldown before catalog publication: ${decodo_publish_cooldown_seconds}s"
+          sleep "$decodo_publish_cooldown_seconds"
+
           before_run_id=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
           from sqlalchemy import text
