@@ -167,6 +167,7 @@ jobs:
           test "$(sha256sum "$work_dir/incoming/source-manifest" | awk '{print $1}')" = \
             "$source_manifest_sha"
           (cd "$runtime_dir" && sha256sum -c "$work_dir/incoming/source-manifest")
+          cd "$runtime_dir"
 
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<PY

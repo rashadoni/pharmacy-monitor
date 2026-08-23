@@ -244,6 +244,7 @@ jobs:
           (cd "$runtime_dir" && sha256sum -c "$work_dir/incoming/plan-source-manifest")
           (cd "$runtime_dir" && sha256sum -c "$work_dir/incoming/source-manifest")
           echo "exact isolated reconciliation source manifests verified"
+          cd "$runtime_dir"
 
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<PY
