@@ -169,10 +169,11 @@ def test_autonomous_marker_replaces_legacy_ddp_for_its_process(monkeypatch):
         "PHARMONLINE_DECODO_BACKCONNECT_STICKY",
         "PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE",
     ):
-        # Register absent keys with monkeypatch before the helper writes them
-        # directly, so its process-local configuration cannot leak to another
-        # CLI test.
-        monkeypatch.delenv(name, raising=False)
+        # Register each key with monkeypatch before the helper writes it
+        # directly.  ``delenv(..., raising=False)`` does not register a key
+        # that was absent, so it would not undo the helper's process-local
+        # configuration after this test.
+        monkeypatch.setenv(name, "")
     monkeypatch.setenv("PHARMONLINE_USE_DDP", "1")
     monkeypatch.setenv("AI_FALLBACK_ENABLED", "true")
     monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "1")
