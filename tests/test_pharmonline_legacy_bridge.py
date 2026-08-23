@@ -439,17 +439,27 @@ def test_public_api_reconciliation_rekeys_only_one_exact_non_ddp_legacy_url(db_s
     assert refreshed.id == product_id
     assert refreshed.external_id == public.external_id
     assert observation.product_id == product_id
+    assert record.tenant_id == 1
     assert record.product_id == product_id
     assert record.legacy_external_id == "legacy-product-id"
     assert record.public_api_external_id == public.external_id
     assert main_mod._pharmonline_public_api_recovery_tables_available(db_session)
     assert record.proof_version == main_mod._PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION
     assert record.source_manifest_sha256 == _RECOVERY_MANIFEST_SHA
-    assert record.catalog_fingerprint_sha256 == main_mod._pharmonline_public_api_catalog_fingerprint(
-        [ScrapeResult(site="pharmonline", products=[public])]
+    assert (
+        record.catalog_fingerprint_sha256
+        == main_mod._pharmonline_public_api_catalog_fingerprint(
+            [ScrapeResult(site="pharmonline", products=[public])]
+        )
     )
     assert record.source_transport == "decodo"
     assert record.preflight_run_ref == "123456"
+    assert main_mod._canonical_pharmonline_product_url(record.legacy_canonical_url) == url
+    assert main_mod._canonical_pharmonline_product_url(record.public_api_canonical_url) == url
+    assert main_mod._canonical_pharmonline_product_url(refreshed.url) == url
+    assert main_mod._PHARMONLINE_METEOR_ID_RE.fullmatch(record.legacy_external_id) is None
+    assert main_mod._PHARMONLINE_METEOR_ID_RE.fullmatch(record.public_api_external_id)
+    assert main_mod._pharmonline_public_api_reconciliation_invalid_reason(record, refreshed) is None
     valid_reconciliations, conflicts = main_mod._valid_pharmonline_public_api_reconciliations(
         db_session,
         [refreshed],
@@ -532,10 +542,7 @@ def test_public_api_reconciliation_refuses_native_id_rebind_without_two_signals(
     refreshed = db_session.get(storage.Product, stored.id)
     assert refreshed is not None
     assert refreshed.url == old_url
-    assert (
-        db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).count()
-        == 0
-    )
+    assert db_session.query(storage.PharmonlinePublicAPIIdentityReconciliation).count() == 0
 
 
 def test_public_api_reconciliation_refuses_an_ambiguous_legacy_url_without_mutation(db_session):

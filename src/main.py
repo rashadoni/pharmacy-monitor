@@ -298,34 +298,13 @@ def _valid_pharmonline_public_api_reconciliations(
     ).all()
     for record in records:
         product = products_by_id.get(record.product_id)
-        public_external_id = str(record.public_api_external_id)
-        canonical_url = _canonical_pharmonline_product_url(record.public_api_canonical_url)
-        legacy_url = _canonical_pharmonline_product_url(record.legacy_canonical_url)
-        exact_url_rekey = (
-            record.proof_version == _PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION
-            and canonical_url == legacy_url
-            and _PHARMONLINE_METEOR_ID_RE.fullmatch(str(record.legacy_external_id)) is None
+        invalid_reason = _pharmonline_public_api_reconciliation_invalid_reason(
+            record,
+            product,
         )
-        native_url_rebind = (
-            record.proof_version == _PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION
-            and canonical_url != legacy_url
-            and str(record.legacy_external_id) == public_external_id
-        )
-        if (
-            product is None
-            or not (exact_url_rekey or native_url_rebind)
-            or _PHARMONLINE_METEOR_ID_RE.fullmatch(public_external_id) is None
-            or canonical_url is None
-            or legacy_url is None
-            or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.source_manifest_sha256) is None
-            or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256)
-            is None
-            or record.source_transport not in {"crawlbase", "decodo", "scraperapi"}
-            or re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None
-            or str(product.external_id) != public_external_id
-            or _canonical_pharmonline_product_url(product.url) != canonical_url
-        ):
+        if invalid_reason is not None:
             continue
+        public_external_id = str(record.public_api_external_id)
         previous = reconciled_by_id.get(public_external_id)
         if previous is not None and previous.id != product.id:
             conflicting_ids.add(public_external_id)
@@ -334,6 +313,47 @@ def _valid_pharmonline_public_api_reconciliations(
     for external_id in conflicting_ids:
         reconciled_by_id.pop(external_id, None)
     return reconciled_by_id, len(conflicting_ids)
+
+
+def _pharmonline_public_api_reconciliation_invalid_reason(
+    record: storage.PharmonlinePublicAPIIdentityReconciliation,
+    product: storage.Product | None,
+) -> str | None:
+    """Return a stable aggregate-safe reason when an audit record is unusable."""
+    if product is None:
+        return "product_missing"
+    public_external_id = str(record.public_api_external_id)
+    canonical_url = _canonical_pharmonline_product_url(record.public_api_canonical_url)
+    legacy_url = _canonical_pharmonline_product_url(record.legacy_canonical_url)
+    exact_url_rekey = (
+        record.proof_version == _PHARMONLINE_PUBLIC_API_RECONCILIATION_PROOF_VERSION
+        and canonical_url == legacy_url
+        and _PHARMONLINE_METEOR_ID_RE.fullmatch(str(record.legacy_external_id)) is None
+    )
+    native_url_rebind = (
+        record.proof_version == _PHARMONLINE_PUBLIC_API_REBIND_PROOF_VERSION
+        and canonical_url != legacy_url
+        and str(record.legacy_external_id) == public_external_id
+    )
+    if not (exact_url_rekey or native_url_rebind):
+        return "proof_shape"
+    if _PHARMONLINE_METEOR_ID_RE.fullmatch(public_external_id) is None:
+        return "public_id"
+    if canonical_url is None or legacy_url is None:
+        return "canonical_url"
+    if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.source_manifest_sha256) is None:
+        return "source_manifest"
+    if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256) is None:
+        return "catalog_fingerprint"
+    if record.source_transport not in {"crawlbase", "decodo", "scraperapi"}:
+        return "transport"
+    if re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None:
+        return "preflight_run"
+    if str(product.external_id) != public_external_id:
+        return "product_id"
+    if _canonical_pharmonline_product_url(product.url) != canonical_url:
+        return "product_url"
+    return None
 
 
 def _pharmonline_public_api_reconciliation_plan(
@@ -614,14 +634,12 @@ def _ensure_pharmonline_public_api_catalog_baseline(
             "public Pharmonline catalog baseline schema is not migrated"
         )
     catalog_item_count = len(_public_api_identity_records(results))
-    baselines = session.scalars(
-        select(storage.PharmonlinePublicAPICatalogBaseline).where(
-            storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id,
+    existing_floor = int(
+        session.scalar(
+            select(func.max(storage.PharmonlinePublicAPICatalogBaseline.minimum_catalog_item_count))
+            .where(storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id)
         )
-    ).all()
-    existing_floor = max(
-        (baseline.minimum_catalog_item_count for baseline in baselines),
-        default=0,
+        or 0
     )
     if existing_floor:
         if catalog_item_count < existing_floor:
@@ -819,14 +837,12 @@ def _verify_pharmonline_public_api_identities(
 
     catalog_floor = 0
     if _pharmonline_public_api_recovery_tables_available(session):
-        baselines = session.scalars(
-            select(storage.PharmonlinePublicAPICatalogBaseline).where(
-                storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id,
+        catalog_floor = int(
+            session.scalar(
+                select(func.max(storage.PharmonlinePublicAPICatalogBaseline.minimum_catalog_item_count))
+                .where(storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id)
             )
-        ).all()
-        catalog_floor = max(
-            (baseline.minimum_catalog_item_count for baseline in baselines),
-            default=0,
+            or 0
         )
     require_catalog_floor = os.environ.get(
         "PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE", ""
@@ -1053,21 +1069,29 @@ def _diagnose_pharmonline_public_api_reconciliation(
         tenant_id=tenant_id,
     )
     schema_migrated = _pharmonline_public_api_recovery_tables_available(session)
-    baselines: list[storage.PharmonlinePublicAPICatalogBaseline] = []
+    baseline_records = 0
+    catalog_baseline_floor = 0
     if schema_migrated:
-        baselines = session.scalars(
-            select(storage.PharmonlinePublicAPICatalogBaseline).where(
-                storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id,
+        baseline_records = int(
+            session.scalar(
+                select(func.count(storage.PharmonlinePublicAPICatalogBaseline.id)).where(
+                    storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id,
+                )
             )
-        ).all()
+            or 0
+        )
+        catalog_baseline_floor = int(
+            session.scalar(
+                select(func.max(storage.PharmonlinePublicAPICatalogBaseline.minimum_catalog_item_count))
+                .where(storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id)
+            )
+            or 0
+        )
     metrics.update(
         {
             "recovery_schema_migrated": int(schema_migrated),
-            "catalog_baseline_records": len(baselines),
-            "catalog_baseline_floor": max(
-                (baseline.minimum_catalog_item_count for baseline in baselines),
-                default=0,
-            ),
+            "catalog_baseline_records": baseline_records,
+            "catalog_baseline_floor": catalog_baseline_floor,
             "reconciliation_safe": int(_pharmonline_public_api_reconciliation_is_safe(metrics)),
         }
     )
