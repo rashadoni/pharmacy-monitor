@@ -108,6 +108,14 @@ _RETRYABLE_FULL_CATALOG_ABORT_REASONS = frozenset(
         "products_chunk_anchor_metadata_changed",
         "products_chunk_anchor_changed",
         "product_sitemap_index_missing",
+        # Decodo can occasionally return an empty sitemap body for one
+        # sticky session even while the API catalog is healthy.  Discard the
+        # entire attempt and let the bounded reconciliation retry start from
+        # a fresh session; no partial catalog may escape this gate.
+        "product_sitemap_empty",
+        # A provider/target rate limit is likewise retryable only as a whole
+        # catalog read.  The caller never mixes rows from the rejected pass.
+        "decodo_http_429",
         # A 403 from the target through one sticky ScraperAPI exit can be
         # exit-specific. The rejected attempt has yielded no rows, so a fresh
         # full session may retry it; any partial result remains unusable.
