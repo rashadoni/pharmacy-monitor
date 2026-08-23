@@ -143,25 +143,17 @@ def test_public_api_recovery_refuses_mixed_sources(
     assert expected_message in result.output
 
 
-def test_autonomous_marker_redirects_only_the_generic_pharmonline_timer(
-    monkeypatch, tmp_path
-):
+def test_autonomous_marker_redirects_only_the_generic_pharmonline_timer(monkeypatch, tmp_path):
     marker = tmp_path / "pharmonline-public-api-autonomous-v1"
-    monkeypatch.setenv(
-        "PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER", str(marker)
-    )
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER", str(marker))
 
-    assert not main_mod._pharmonline_public_api_autonomous_mode_requested(
-        ["pharmonline"], "auto"
-    )
+    assert not main_mod._pharmonline_public_api_autonomous_mode_requested(["pharmonline"], "auto")
 
     marker.write_text(
         main_mod._PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_CONTENT,
         encoding="utf-8",
     )
-    assert main_mod._pharmonline_public_api_autonomous_mode_requested(
-        ["pharmonline"], "auto"
-    )
+    assert main_mod._pharmonline_public_api_autonomous_mode_requested(["pharmonline"], "auto")
     assert not main_mod._pharmonline_public_api_autonomous_mode_requested(
         ["pharmonline", "aloe"], "auto"
     )
@@ -171,6 +163,16 @@ def test_autonomous_marker_redirects_only_the_generic_pharmonline_timer(
 
 
 def test_autonomous_marker_replaces_legacy_ddp_for_its_process(monkeypatch):
+    for name in (
+        "PHARMONLINE_PUBLIC_API",
+        "PHARMONLINE_PUBLIC_API_TRANSPORT",
+        "PHARMONLINE_DECODO_BACKCONNECT_STICKY",
+        "PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE",
+    ):
+        # Register absent keys with monkeypatch before the helper writes them
+        # directly, so its process-local configuration cannot leak to another
+        # CLI test.
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PHARMONLINE_USE_DDP", "1")
     monkeypatch.setenv("AI_FALLBACK_ENABLED", "true")
     monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "1")
