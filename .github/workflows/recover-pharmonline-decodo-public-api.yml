@@ -206,8 +206,8 @@ jobs:
             xargs -0 sha256sum | LC_ALL=C sort > "$plan_manifest"
           git ls-files -z -- \
             src \
-            config \
             migrations \
+            templates \
             scripts/reconcile_pharmonline_public_api_identities.py \
             alembic.ini |
             xargs -0 sha256sum | LC_ALL=C sort > "$source_manifest"
@@ -225,7 +225,7 @@ jobs:
           work_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-decodo-reconciliation-apply.XXXXXX)
           mkdir -p "$work_dir/incoming" "$work_dir/runtime/src" \
             "$work_dir/runtime/scripts" "$work_dir/runtime/migrations" \
-            "$work_dir/runtime/config"
+            "$work_dir/runtime/templates"
           printf '%s' "$work_dir"
           REMOTE
           )
@@ -246,11 +246,11 @@ jobs:
           rsync -az --checksum --delete --no-perms --no-owner --no-group \
             --exclude '__pycache__/' \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            config/ "pm@46.225.149.52:$remote_work_dir/runtime/config/"
+            migrations/ "pm@46.225.149.52:$remote_work_dir/runtime/migrations/"
           rsync -az --checksum --delete --no-perms --no-owner --no-group \
             --exclude '__pycache__/' \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            migrations/ "pm@46.225.149.52:$remote_work_dir/runtime/migrations/"
+            templates/ "pm@46.225.149.52:$remote_work_dir/runtime/templates/"
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
             scripts/reconcile_pharmonline_public_api_identities.py \
@@ -594,6 +594,10 @@ jobs:
               exit 1
               ;;
           esac
+          if [ ! -f "$work_dir/incoming/source-manifest" ]; then
+            echo "recovery staging did not complete; no production backup was created" >&2
+            exit 0
+          fi
           test "$(sha256sum "$work_dir/incoming/source-manifest" | awk '{print $1}')" = \
             "$source_manifest_sha"
           test -f "$work_dir/production-before-reconciliation.dump"
