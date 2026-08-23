@@ -104,9 +104,12 @@ jobs:
       - name: Upload source and prove it from an isolated temporary tree
         run: |
           set -euo pipefail
-          main_sha=$(sha256sum src/main.py | awk '{print $1}')
-          public_api_sha=$(sha256sum src/scrapers/pharmonline_public_api.py | awk '{print $1}')
-          preflight_script_sha=$(sha256sum scripts/preflight_pharmonline_public_api.py | awk '{print $1}')
+          source_manifest=$(mktemp)
+          trap 'rm -f "$source_manifest"' EXIT
+          git ls-files -z -- src scripts/preflight_pharmonline_public_api.py |
+            xargs -0 sha256sum | LC_ALL=C sort > "$source_manifest"
+          test -s "$source_manifest"
+          source_manifest_sha=$(sha256sum "$source_manifest" | awk '{print $1}')
           remote_work_dir=$(ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -114,7 +117,7 @@ jobs:
             pm@46.225.149.52 'bash -s' <<'REMOTE'
           set -euo pipefail
           work_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-decodo-preflight.XXXXXX)
-          mkdir -p "$work_dir/incoming/src/scrapers" "$work_dir/incoming/scripts"
+          mkdir -p "$work_dir/incoming" "$work_dir/runtime/src" "$work_dir/runtime/scripts"
           printf '%s' "$work_dir"
           REMOTE
           )
@@ -126,39 +129,30 @@ jobs:
               ;;
           esac
 
-          for file in \
-            src/main.py \
-            src/scrapers/pharmonline_public_api.py \
-            scripts/preflight_pharmonline_public_api.py
-          do
-            case "$file" in
-              src/main.py) expected_sha=$main_sha ;;
-              src/scrapers/pharmonline_public_api.py) expected_sha=$public_api_sha ;;
-              scripts/preflight_pharmonline_public_api.py) expected_sha=$preflight_script_sha ;;
-            esac
-            remote_file="$remote_work_dir/incoming/$file"
-            rsync -z --checksum --no-perms --no-owner --no-group \
-              -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-              "$file" "pm@46.225.149.52:$remote_file"
-            remote_sha=$(ssh -i ~/.ssh/id_ed25519 \
-              -o BatchMode=yes \
-              -o IdentitiesOnly=yes \
-              -o ConnectTimeout=15 \
-              pm@46.225.149.52 "sha256sum '$remote_file'" | awk '{print $1}')
-            test "$remote_sha" = "$expected_sha"
-          done
+          # The production source can lag behind this exact commit. Stage the
+          # complete tracked package, not just the edited modules, so
+          # dataclasses and persistence code cannot be mixed across versions.
+          rsync -az --checksum --delete --no-perms --no-owner --no-group \
+            --exclude '__pycache__/' \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            src/ "pm@46.225.149.52:$remote_work_dir/runtime/src/"
+          rsync -z --checksum --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            scripts/preflight_pharmonline_public_api.py \
+            "pm@46.225.149.52:$remote_work_dir/runtime/scripts/preflight_pharmonline_public_api.py"
+          rsync -z --checksum --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
+            "$source_manifest" "pm@46.225.149.52:$remote_work_dir/incoming/source-manifest"
 
           ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
             pm@46.225.149.52 \
-            "bash -s -- '$remote_work_dir' '$main_sha' '$public_api_sha' '$preflight_script_sha'" <<'REMOTE'
+            "bash -s -- '$remote_work_dir' '$source_manifest_sha'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
-          main_sha=$2
-          public_api_sha=$3
-          preflight_script_sha=$4
+          source_manifest_sha=$2
           case "$work_dir" in
             /opt/pharmacy-monitor/.codex-decodo-preflight.*) ;;
             *)
@@ -168,17 +162,9 @@ jobs:
           esac
 
           runtime_dir="$work_dir/runtime"
-          test "$(sha256sum "$work_dir/incoming/src/main.py" | awk '{print $1}')" = "$main_sha"
-          test "$(sha256sum "$work_dir/incoming/src/scrapers/pharmonline_public_api.py" | awk '{print $1}')" = "$public_api_sha"
-          test "$(sha256sum "$work_dir/incoming/scripts/preflight_pharmonline_public_api.py" | awk '{print $1}')" = "$preflight_script_sha"
-          mkdir -p "$runtime_dir"
-          cp -a -- /opt/pharmacy-monitor/src "$runtime_dir/src"
-          mkdir -p "$runtime_dir/scripts"
-          cp -p -- "$work_dir/incoming/src/main.py" "$runtime_dir/src/main.py"
-          cp -p -- "$work_dir/incoming/src/scrapers/pharmonline_public_api.py" \
-            "$runtime_dir/src/scrapers/pharmonline_public_api.py"
-          cp -p -- "$work_dir/incoming/scripts/preflight_pharmonline_public_api.py" \
-            "$runtime_dir/scripts/preflight_pharmonline_public_api.py"
+          test "$(sha256sum "$work_dir/incoming/source-manifest" | awk '{print $1}')" = \
+            "$source_manifest_sha"
+          (cd "$runtime_dir" && sha256sum -c "$work_dir/incoming/source-manifest")
 
           cd "$runtime_dir"
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
@@ -188,11 +174,13 @@ jobs:
 
           import httpx
           import src.main
+          import src.scrapers.base
           from src.main import _verify_pharmonline_public_api_identities
           from src.scrapers.pharmonline_public_api import PharmonlinePublicAPIScraper
 
           runtime = Path("$runtime_dir").resolve()
           assert Path(src.main.__file__).resolve().is_relative_to(runtime)
+          assert Path(src.scrapers.base.__file__).resolve().is_relative_to(runtime)
           assert callable(_verify_pharmonline_public_api_identities)
           assert PharmonlinePublicAPIScraper.__name__ == "PharmonlinePublicAPIScraper"
           print(
