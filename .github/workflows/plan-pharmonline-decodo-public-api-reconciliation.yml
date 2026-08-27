@@ -147,10 +147,15 @@ jobs:
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
             "$source_manifest" "pm@46.225.149.52:$remote_work_dir/incoming/source-manifest"
 
+          # A retryable Decodo failure deliberately sleeps for up to five
+          # minutes. Keep this long-lived plan connection alive during that
+          # quiet interval so the runner does not turn it into exit 255.
           ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=120 \
             pm@46.225.149.52 \
             "bash -s -- '$remote_work_dir' '$source_manifest_sha'" <<'REMOTE'
           set -euo pipefail
