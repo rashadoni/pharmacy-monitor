@@ -84,6 +84,7 @@ async def read_catalog_pass(pass_name: str):
                     "decodo_http_429",
                     "decodo_request_failed",
                     "decodo_transient_request_failed",
+                    "product_sitemap_empty",
                 }
                 else attempt
             )
