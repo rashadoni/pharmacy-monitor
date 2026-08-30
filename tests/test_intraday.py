@@ -367,3 +367,80 @@ def test_intraday_tick_invokes_bounded_point_scrape(db_session, monkeypatch):
     assert result.exit_code == 0, result.output
     assert invoked == {"limit": 321, "site": ("aloe",), "category_id": category.id}
     assert "limit=321" in result.output
+
+
+def test_watchlist_tick_invokes_alerting_priority_run(db_session, monkeypatch):
+    """The scheduled priority command uses run/watchlist/hourly without --no-alerts."""
+    tracked = storage.TrackedProduct(canonical_name="Critical SKU", is_active=True)
+    db_session.add(tracked)
+    db_session.flush()
+    db_session.add(
+        storage.TrackedProductLink(
+            tracked_product_id=tracked.id,
+            site="aloe",
+            url="https://aloe.az/product/critical",
+            status="confirmed",
+        )
+    )
+    db_session.commit()
+
+    SessionLocal = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main_mod.storage, "init_db", lambda: None)
+    monkeypatch.setattr(main_mod.storage, "make_session", lambda: SessionLocal)
+    invoked = {}
+
+    @click.command()
+    def fake_run(**kwargs):
+        invoked.update(kwargs)
+
+    monkeypatch.setattr(main_mod, "run_cmd", fake_run)
+
+    result = CliRunner().invoke(main_mod.cli, ["watchlist-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert invoked == {
+        "dry_run": False,
+        "limit": None,
+        "site": ("aloe",),
+        "mode": "watchlist",
+        "category_id": None,
+        "hourly": True,
+        "no_alerts": False,
+        "request_id": None,
+    }
+    assert "refreshing 1 confirmed URLs" in result.output
+
+
+def test_watchlist_tick_defers_pharmonline_when_public_api_is_guarded(db_session, monkeypatch):
+    """Do not silently weaken the full-catalog Pharmonline identity proof."""
+    for site in ("pharmonline", "aloe"):
+        tracked = storage.TrackedProduct(canonical_name=f"Critical {site}", is_active=True)
+        db_session.add(tracked)
+        db_session.flush()
+        db_session.add(
+            storage.TrackedProductLink(
+                tracked_product_id=tracked.id,
+                site=site,
+                url=f"https://{site}.example/product/critical",
+                status="confirmed",
+            )
+        )
+    db_session.commit()
+
+    SessionLocal = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main_mod.storage, "init_db", lambda: None)
+    monkeypatch.setattr(main_mod.storage, "make_session", lambda: SessionLocal)
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    invoked = {}
+
+    @click.command()
+    def fake_run(**kwargs):
+        invoked.update(kwargs)
+
+    monkeypatch.setattr(main_mod, "run_cmd", fake_run)
+
+    result = CliRunner().invoke(main_mod.cli, ["watchlist-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert invoked["site"] == ("aloe",)
+    assert "1 Pharmonline URLs deferred" in result.output

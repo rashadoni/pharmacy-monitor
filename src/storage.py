@@ -112,6 +112,28 @@ def run_is_financially_eligible(run: Run | None) -> bool:
     return False
 
 
+def run_is_watchlist_price_alert_eligible(run: Run | None) -> bool:
+    """Whether a completed pinned-SKU tick may emit *local* price-drop alerts.
+
+    A watchlist refresh is deliberately not a financial catalog epoch: it must
+    never refresh ROI, cross-site comparisons, or undercut recommendations.
+    It can nevertheless safely report that the *same pinned product URL*
+    changed price, provided every requested URL completed successfully.  Keep
+    this narrow exception separate from :func:`run_is_financially_eligible` so
+    a partial run can never accidentally unlock money-facing consumers.
+    """
+    if run is None or run.status != "ok" or run.catalog_scope != "partial":
+        return False
+    quality = run.run_quality or {}
+    if quality.get("mode") != "watchlist":
+        return False
+    sites = quality.get("sites")
+    return bool(sites) and all(
+        isinstance(details, dict) and details.get("status") == "ok"
+        for details in sites.values()
+    )
+
+
 class ScrapeRequest(Base):
     """Очередь scrape-запросов, запущенных пользователем через UI.
 
@@ -662,7 +684,7 @@ class AlertRule(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
     rule_type: Mapped[str] = mapped_column(String(50), index=True)
-    # Типы: undercut_threshold, price_drop_pct, new_product, promo_started,
+    # Типы: undercut_threshold, price_drop_pct, price_change_pct, new_product, promo_started,
     #       price_raise_opportunity
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=dict)
     # channels — список: ["email", "telegram"]

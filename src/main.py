@@ -4303,6 +4303,7 @@ def alert_group() -> None:
 _RULE_TYPES = (
     "undercut_threshold",
     "price_drop_pct",
+    "price_change_pct",
     "new_product",
     "promo_started",
     "price_raise_opportunity",
@@ -4896,9 +4897,9 @@ def run_cmd(
             raise click.ClickException(
                 "public_api mode does not allow --limit, --category-id, or --hourly"
             )
-    elif use_public_api:
+    elif use_public_api and "pharmonline" in sites:
         raise click.ClickException(
-            "PHARMONLINE_PUBLIC_API requires --mode public_api"
+            "PHARMONLINE_PUBLIC_API requires --mode public_api for pharmonline"
         )
     storage.init_db()
 
@@ -5250,7 +5251,10 @@ def run_cmd(
                 trust_context.__enter__()
 
             # === Real-time alerts ===
-            if not no_alerts and is_run_financially_eligible(run):
+            alerts_allowed = is_run_financially_eligible(
+                run
+            ) or storage.run_is_watchlist_price_alert_eligible(run)
+            if not no_alerts and alerts_allowed:
                 from src import alerts as alerts_mod, notifications as notif_mod
 
                 fired = alerts_mod.evaluate_rules(session, run.id)
@@ -5269,6 +5273,7 @@ def run_cmd(
                     "alerts_skipped_run_quality",
                     run_id=run.id,
                     status=run.status,
+                    mode=effective_mode,
                 )
             report = analyzer.analyze(session, run.id)
 
@@ -5520,6 +5525,94 @@ def _intraday_product_limit() -> int:
     except ValueError:
         configured = 600
     return max(1, min(configured, 600))
+
+
+def _watchlist_tick_url_limit() -> int:
+    """Return an explicit bounded capacity for the scheduled priority list.
+
+    The watchlist timer is for a curated client-critical list, not a hidden
+    second full crawler.  Refuse to silently sample a larger list: an operator
+    must raise the env value deliberately after checking proxy capacity.
+    """
+    try:
+        configured = int(os.environ.get("WATCHLIST_TICK_MAX_URLS", "100"))
+    except ValueError:
+        configured = 100
+    return max(1, min(configured, 500))
+
+
+@cli.command("watchlist-tick")
+def watchlist_tick_cmd() -> None:
+    """Refresh confirmed priority URLs and send only safe local price alerts.
+
+    A successful tick is intentionally a partial run.  It may notify about a
+    price change of the exact pinned product, but it cannot publish cross-site
+    undercuts or refresh ROI.  The full daily catalog jobs remain the source
+    of truth for those outputs.
+    """
+    storage.init_db()
+    Session = storage.make_session()
+
+    with Session() as session:
+        urls_by_site = collect_watchlist_urls(session)
+        total_pinned = sum(len(urls) for urls in urls_by_site.values())
+        if total_pinned == 0:
+            click.echo("watchlist-tick: skipped (no confirmed pinned URLs)")
+            return
+
+        # The guarded Pharmonline public API deliberately exposes only a
+        # verified whole-catalog route.  Falling back to an unproven HTML
+        # product request here would weaken its identity contract.  Its daily
+        # full run remains authoritative; the timer can still refresh pinned
+        # URLs for Aloe/Aptekonline in the same environment.
+        skipped_pharmonline = 0
+        if _pharmonline_public_api_enabled():
+            skipped_pharmonline = len(urls_by_site.get("pharmonline", []))
+            urls_by_site["pharmonline"] = []
+            if skipped_pharmonline:
+                log.warning(
+                    "watchlist_tick_pharmonline_deferred_to_full_catalog",
+                    urls=skipped_pharmonline,
+                )
+
+        selected_sites = tuple(
+            site for site, urls in urls_by_site.items() if urls
+        )
+        selected_urls = sum(len(urls_by_site[site]) for site in selected_sites)
+        if selected_urls == 0:
+            click.echo(
+                "watchlist-tick: skipped (Pharmonline priority URLs wait for the "
+                "verified daily public-API catalog)"
+            )
+            return
+
+        limit = _watchlist_tick_url_limit()
+        if selected_urls > limit:
+            raise click.ClickException(
+                "watchlist-tick refuses to sample a partial priority list: "
+                f"{selected_urls} confirmed URLs exceed WATCHLIST_TICK_MAX_URLS={limit}"
+            )
+
+        click.echo(
+            "watchlist-tick: refreshing "
+            f"{selected_urls} confirmed URLs across {','.join(selected_sites)}"
+            + (f"; {skipped_pharmonline} Pharmonline URLs deferred" if skipped_pharmonline else "")
+        )
+
+    # New Session / transaction: mirror intraday-tick and keep the lock held
+    # by ``run`` for the entire scrape → matcher → alert sequence.
+    ctx = click.get_current_context()
+    ctx.invoke(
+        run_cmd,
+        dry_run=False,
+        limit=None,
+        site=selected_sites,
+        mode="watchlist",
+        category_id=None,
+        hourly=True,
+        no_alerts=False,
+        request_id=None,
+    )
 
 
 @cli.command("intraday-tick")

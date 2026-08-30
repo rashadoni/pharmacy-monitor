@@ -397,8 +397,8 @@ class SiteStaleness(BaseModel):
 
     `hours_since` aggregates the gap between now and the max `last_seen_at`
     across all products tagged with `site`. `max_age_hours` is the site-specific
-    threshold used by backend health checks; daily sites use the default, while
-    weekly scrapes such as aptekonline/pharmonline have a larger threshold.
+    threshold used by backend health checks.  The production contract is a
+    daily full scan for every monitored site, with a 30-hour retry margin.
     """
 
     site: str
@@ -592,8 +592,8 @@ class WatchlistCategoryIn(BaseModel):
 
 
 # Default per-site staleness threshold (hours) for daily-cadence sites (>30h = at
-# least one scheduled run skipped). Non-daily sites override via
-# health._SITE_MAX_AGE_HOURS (aptekonline weekly → 198h), единый источник порогов.
+# least one scheduled run skipped). ``health._SITE_MAX_AGE_HOURS`` is the
+# single source for the three monitored sites.
 # Surfaced in `/health.staleness_warning`.
 _HEALTH_STALENESS_HOURS = 30
 

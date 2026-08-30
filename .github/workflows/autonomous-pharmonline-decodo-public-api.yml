@@ -270,9 +270,7 @@ jobs:
               PYTHONPATH="$runtime_dir" \
               /opt/pharmacy-monitor/.venv/bin/python -m src.main run \
                 --site pharmonline \
-                --mode public_api \
-                --dry-run \
-                --no-alerts
+                --mode public_api
             then
               succeeded=1
               break

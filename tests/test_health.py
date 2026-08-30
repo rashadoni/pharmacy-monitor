@@ -266,17 +266,17 @@ def test_degraded_run_with_failed_site_is_critical(db_session):
 
 
 def test_site_silence_critical_when_one_site_stale(db_session):
-    """Per-site freshness: pharmonline молчит 9 дней (>198ч), aloe скрейпился час назад.
+    """Per-site freshness: pharmonline молчит 9 дней (>30ч), aloe скрейпился час назад.
 
     `stale_run` смотрит на ПОСЛЕДНИЙ run и пропускает (aloe свежий), но per-site
     silence check должен поймать pharmonline. Реальный сценарий: Mac launchd
-    уснул, aloe на проде продолжает скрейпиться. (pharmonline недельный → порог
-    198ч, поэтому «молчит» = >8 суток, а не 3 дня.)
+    уснул, aloe на проде продолжает скрейпиться. Daily cadence must surface the
+    missing Pharmonline data promptly instead of accepting a weekly gap.
     """
     # aloe свежий
     aloe_run = _add_run(db_session, utcnow() - timedelta(hours=1))
     _add_snap(db_session, aloe_run, "aloe", 50)
-    # pharmonline молчит 9 дней (> 198ч недельного порога)
+    # pharmonline молчит 9 дней (> 30ч суточного порога)
     old_pharm_run = _add_run(db_session, utcnow() - timedelta(days=9))
     _add_snap(
         db_session,
@@ -295,12 +295,8 @@ def test_site_silence_critical_when_one_site_stale(db_session):
     assert "aloe" not in silent_sites  # aloe свежий — не должен попасть
 
 
-def test_site_silence_respects_weekly_aptekonline_threshold(db_session):
-    """aptekonline скрейпится РАЗ В НЕДЕЛЮ (Decodo) → порог 198ч, не суточные 26ч.
-
-    100ч давности для aptek — норма (НЕ alert), иначе hourly health-check спамил
-    бы critical 6 из 7 дней. Для aloe (суточный) те же 100ч — реальный alert.
-    """
+def test_site_silence_flags_aptekonline_after_daily_slo(db_session):
+    """Daily Aptekonline data older than 30h is an actionable outage."""
     now = utcnow()
     apt_run = _add_run(db_session, now - timedelta(hours=100))
     _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=100))
@@ -310,13 +306,12 @@ def test_site_silence_respects_weekly_aptekonline_threshold(db_session):
 
     rep = check_health(db_session, max_age_hours=26)
     silent_sites = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
-    assert "aptekonline" not in silent_sites  # 100ч < 198ч недельного порога
-    assert "aloe" in silent_sites  # 100ч > 26ч суточного порога
+    assert "aptekonline" in silent_sites
+    assert "aloe" in silent_sites
 
 
-def test_site_silence_flags_aptekonline_past_weekly_threshold(db_session):
-    """aptekonline молчит >8 дней (порог 198ч) → alert: реальный сбой Decodo/баланса
-    больше не маскируется недельной частотой."""
+def test_site_silence_flags_long_aptekonline_outage(db_session):
+    """A long Aptekonline outage remains critical under the daily SLO."""
     now = utcnow()
     apt_run = _add_run(db_session, now - timedelta(hours=210))
     _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=210))
@@ -324,7 +319,7 @@ def test_site_silence_flags_aptekonline_past_weekly_threshold(db_session):
 
     rep = check_health(db_session, max_age_hours=26)
     silent_sites = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
-    assert "aptekonline" in silent_sites  # 210ч > 198ч → действительно молчит
+    assert "aptekonline" in silent_sites
 
 
 def test_stale_run_critical(db_session):
@@ -417,10 +412,10 @@ def test_site_drop_warning(db_session):
     """Если за окно покрытия видели <50% живого каталога — alert."""
     base = utcnow()
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=30)
-    # Живой каталог: 100 товаров, виденных 18 дней назад (в окне свежести 21д,
-    # но ВНЕ окна покрытия 14д) — недавние скрейпы их НЕ переснимали.
-    old = _add_run(db_session, base - timedelta(days=18), products_scraped=100)
-    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=18))
+    # Живой каталог: 100 товаров, виденных 2.5 дня назад (в окне свежести 3д,
+    # но ВНЕ окна покрытия 2д) — недавние скрейпы их НЕ переснимали.
+    old = _add_run(db_session, base - timedelta(days=2, hours=12), products_scraped=100)
+    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=2, hours=12))
     # Недавнее покрытие: только 30 товаров за окно покрытия.
     _add_snap(db_session, cur, "pharmonline", 30, last_seen_at=base - timedelta(hours=1))
     db_session.commit()
@@ -440,9 +435,9 @@ def test_site_drop_robust_to_partial_intraday_run(db_session):
     Окно покрытия включает прежний ПОЛНЫЙ прогон → seen считается от него.
     """
     base = utcnow()
-    # Полный прогон 2 дня назад: 200 товаров (в окне покрытия 9д).
-    full = _add_run(db_session, base - timedelta(days=2), products_scraped=200)
-    _add_snap(db_session, full, "pharmonline", 200, last_seen_at=base - timedelta(days=2))
+    # Полный прогон 44 часа назад: 200 товаров (в окне покрытия 2д).
+    full = _add_run(db_session, base - timedelta(hours=44), products_scraped=200)
+    _add_snap(db_session, full, "pharmonline", 200, last_seen_at=base - timedelta(hours=44))
     # Частичный intraday-прогон СЕЙЧАС: всего 5 товаров (latest run).
     partial = _add_run(db_session, base - timedelta(minutes=10), products_scraped=5)
     _add_snap(db_session, partial, "pharmonline", 5, last_seen_at=base - timedelta(minutes=10))
@@ -450,22 +445,15 @@ def test_site_drop_robust_to_partial_intraday_run(db_session):
 
     rep = check_health(db_session, site_drop_threshold=0.5)
     drop = [i for i in rep.issues if i.code == "site_drop"]
-    # seen(14д)=205 (200 полного + 5 частичного), total(21д)=205 → 100%, без ложного drop
+    # seen(2д)=205 (200 полного + 5 частичного), total(3д)=205 → 100%, без ложного drop
     assert not drop, "Частичный intraday-прогон не должен давать ложный site_drop"
 
 
-def test_site_drop_tolerates_slightly_late_weekly_run(db_session):
-    """Слегка опоздавший недельный прогон (в пределах окна покрытия 14д) — не drop.
-
-    Закрепляет выбор окна покрытия (14д > 7д каденции + запас): полный прогон
-    10 дней назад ещё в окне → seen считается от него, даже если поверх идёт
-    мелкий intraday-прогон. Реальный дроп (полный прогон СТАРШЕ 14д) ловит
-    test_site_drop_warning; полный отказ скрейпа ловит site_silent.
-    """
+def test_site_drop_tolerates_slightly_late_daily_run(db_session):
+    """A 28-hour old daily full run remains inside the coverage buffer."""
     base = utcnow()
-    # Полный недельный прогон 10 дней назад (опоздал, но в окне покрытия 14д).
-    full = _add_run(db_session, base - timedelta(days=10), products_scraped=200)
-    _add_snap(db_session, full, "pharmonline", 200, last_seen_at=base - timedelta(days=10))
+    full = _add_run(db_session, base - timedelta(hours=28), products_scraped=200)
+    _add_snap(db_session, full, "pharmonline", 200, last_seen_at=base - timedelta(hours=28))
     # Мелкий intraday сейчас.
     cur = _add_run(db_session, base - timedelta(minutes=5), products_scraped=3)
     _add_snap(db_session, cur, "pharmonline", 3, last_seen_at=base - timedelta(minutes=5))
@@ -473,8 +461,8 @@ def test_site_drop_tolerates_slightly_late_weekly_run(db_session):
 
     rep = check_health(db_session, site_drop_threshold=0.5)
     drop = [i for i in rep.issues if i.code == "site_drop"]
-    # seen(14д)=203, total(21д)=203 → 100%
-    assert not drop, "Опоздавший недельный прогон в пределах окна не должен давать drop"
+    # seen(2д)=203, total(3д)=203 → 100%
+    assert not drop, "Слегка опоздавший daily-run не должен давать drop"
 
 
 def test_site_drop_excludes_stale_orphans_from_denominator(db_session):
@@ -482,14 +470,14 @@ def test_site_drop_excludes_stale_orphans_from_denominator(db_session):
 
     Регрессия 2026-06-16: pharmonline показывал 49% (9840/19811 — все ряды),
     т.к. в total попадали ~9.8K Playwright-дублей при живом каталоге ~9951.
-    Freshness-окно (21д для pharmonline) исключает ряды старше окна → ratio
+    Freshness-окно (3д для pharmonline) исключает ряды старше окна → ratio
     считается от живого каталога, и ложного site_drop нет.
     """
     base = utcnow()
     # Текущий прогон видит 100 «живых» товаров
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=100)
     _add_snap(db_session, cur, "pharmonline", 100, last_seen_at=base - timedelta(hours=1))
-    # Старый прогон оставил 200 осиротевших рядов, не виденных 40 дней (> окна 21д)
+    # Старый прогон оставил 200 осиротевших рядов, не виденных 40 дней (> окна 3д)
     old = _add_run(db_session, base - timedelta(days=40), products_scraped=200)
     _add_snap(db_session, old, "pharmonline", 200, last_seen_at=base - timedelta(days=40))
     db_session.commit()
@@ -640,15 +628,15 @@ def test_brand_coverage_partial_intraday_tick_skipped(db_session):
 def test_site_drop_below_20_percent_critical(db_session):
     base = utcnow()
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=10)
-    # Каталог 100 виден 18 дней назад (вне окна покрытия), недавно — лишь 10.
-    old = _add_run(db_session, base - timedelta(days=18), products_scraped=100)
-    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=18))
+    # Каталог 100 виден 2.5 дня назад (вне окна покрытия), недавно — лишь 10.
+    old = _add_run(db_session, base - timedelta(days=2, hours=12), products_scraped=100)
+    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=2, hours=12))
     _add_snap(db_session, cur, "pharmonline", 10, last_seen_at=base - timedelta(hours=1))
     db_session.commit()
 
     rep = check_health(db_session, site_drop_threshold=0.5)
     drop_issues = [i for i in rep.issues if i.code == "site_drop"]
-    # seen(9д)=10, total(21д)=110 → 9% → critical
+    # seen(2д)=10, total(3д)=110 → 9% → critical
     assert any(i.severity == "critical" for i in drop_issues)
 
 

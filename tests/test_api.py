@@ -475,8 +475,8 @@ def test_health_endpoint_flags_staleness(client, setup_db):
     assert sites["aloe"]["max_age_hours"] == 30
 
 
-def test_health_endpoint_uses_weekly_aptekonline_threshold(client, setup_db):
-    """aptekonline is weekly: 100h old is still inside the 198h backend threshold."""
+def test_health_endpoint_uses_daily_aptekonline_threshold(client, setup_db):
+    """Aptekonline older than the 30h daily SLO is explicitly stale."""
 
     db = setup_db
     old = datetime.now(timezone.utc) - timedelta(hours=100)
@@ -484,10 +484,10 @@ def test_health_endpoint_uses_weekly_aptekonline_threshold(client, setup_db):
         storage.Product(
             tenant_id=1,
             site="aptekonline",
-            external_id="weekly-ok-1",
+            external_id="daily-stale-1",
             url="https://example.com/aptek",
-            name="Weekly OK",
-            name_normalized="weekly ok",
+            name="Daily stale",
+            name_normalized="daily stale",
             last_seen_at=old,
             first_seen_at=old,
         )
@@ -497,13 +497,12 @@ def test_health_endpoint_uses_weekly_aptekonline_threshold(client, setup_db):
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
-    assert body["staleness_warning"] is False
-    # Staleness is healthy, but no verified full-catalog lineage exists.
+    assert body["staleness_warning"] is True
     assert body["status"] == "degraded"
     assert body["full_catalog_status"] == "missing"
     sites = {s["site"]: s for s in body["sites"]}
     assert sites["aptekonline"]["hours_since"] >= 100
-    assert sites["aptekonline"]["max_age_hours"] == 198
+    assert sites["aptekonline"]["max_age_hours"] == 30
 
 
 def test_health_endpoint_degrades_on_latest_failed_run(client, setup_db):
