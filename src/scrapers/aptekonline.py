@@ -223,6 +223,21 @@ def _category_attempts() -> int:
     return int(raw) if raw.isdigit() and int(raw) > 0 else 3
 
 
+def _category_recovery_delay_seconds() -> float:
+    """Пауза перед одной отложенной повторной попыткой категории.
+
+    Иногда backend Aptekonline короткое время отдаёт ``200`` с пустой
+    промежуточной страницей всем AZ-IP одновременно. Смена sticky-сессии это
+    не лечит; короткая пауза перед новым цельным проходом даёт API восстановить
+    согласованный paginator. Значение можно обнулить для экстренной отладки.
+    """
+    raw = os.getenv("APTEKONLINE_CATEGORY_RECOVERY_DELAY_SECONDS", "120").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 120.0
+
+
 def _decodo_httpx_proxy_for(site_name: str, port: int) -> str | None:
     """Decodo residential proxy URL для одного порта (sticky AZ-сессия).
 
@@ -396,6 +411,7 @@ class AptekonlineScraper(BaseScraper):
         best_status = None
         configured_attempts = _category_attempts()
         max_attempts = configured_attempts
+        delayed_recovery_used = False
         attempt = 1
         while attempt <= max_attempts:
             products = [
@@ -468,6 +484,30 @@ class AptekonlineScraper(BaseScraper):
                 or (status.abort_reason or "").startswith("hard_block_")
             ):
                 break
+
+            # Если все независимые sticky-сессии подряд получили один и тот
+            # же 200/пустую промежуточную страницу, это уже не проблема
+            # конкретного IP. Такой paginator обычно восстанавливается после
+            # короткой паузы. Делаем ровно один новый *цельный* проход, не
+            # склеивая данные из разных попыток и не принимая частичный ответ.
+            if (
+                retry_all_decodo_sessions
+                and _decodo_ports("aptekonline")
+                and attempt == max_attempts
+                and not delayed_recovery_used
+            ):
+                delayed_recovery_used = True
+                recovery_delay = _category_recovery_delay_seconds()
+                max_attempts += 1
+                log.warning(
+                    "aptekonline_category_delayed_recovery",
+                    category=category_slug,
+                    completed_sticky_sessions=attempt,
+                    wait_seconds=recovery_delay,
+                    reason=status.abort_reason or "paginated_item_count_mismatch",
+                )
+                if recovery_delay:
+                    await asyncio.sleep(recovery_delay)
             if attempt < max_attempts:
                 log.warning(
                     "aptekonline_category_retrying",
@@ -740,6 +780,14 @@ class AptekonlineScraper(BaseScraper):
                 if not items:
                     if expected_pages is not None and page_num < expected_pages:
                         abort_reason = "empty_page_before_last"
+                        log.warning(
+                            "aptekonline_empty_page_before_last",
+                            category=category_slug,
+                            page=page_num,
+                            expected_pages=expected_pages,
+                            expected_items=expected_items,
+                            provider=proxied_via,
+                        )
                     break
 
                 for item in items:
