@@ -497,6 +497,112 @@ async def test_scraperapi_transport_requires_explicit_pharmonline_scope(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_firecrawl_transport_requires_an_explicit_api_key(monkeypatch):
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "firecrawl")
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+
+    with pytest.raises(SiteScrapeFatalError, match="API key is not configured"):
+        await PharmonlinePublicAPIScraper().__aenter__()
+
+
+@pytest.mark.asyncio
+async def test_firecrawl_raw_transport_forces_fresh_basic_one_credit_response():
+    scraper = PharmonlinePublicAPIScraper()
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "success": True,
+                "data": {
+                    "rawHtml": '{"data": []}',
+                    "metadata": {
+                        "statusCode": 200,
+                        "proxyUsed": "basic",
+                        "creditsUsed": 1,
+                        "contentType": "application/json; charset=utf-8",
+                    },
+                },
+            }
+
+    class _Client:
+        calls = 0
+
+        async def post(self, url: str, *, headers: dict, json: dict) -> _Response:
+            self.calls += 1
+            assert url == "https://api.firecrawl.dev/v2/scrape"
+            assert headers == {
+                "Authorization": "Bearer test-firecrawl-key",
+                "Content-Type": "application/json",
+            }
+            assert json == {
+                "url": "https://pharmonline.az/api/products?lng=az&page=1",
+                "formats": ["rawHtml"],
+                "onlyMainContent": False,
+                "maxAge": 0,
+                "storeInCache": False,
+                "proxy": "basic",
+                "timeout": 60_000,
+                "location": {"country": "AZ", "languages": ["az"]},
+            }
+            return _Response()
+
+    client = _Client()
+    scraper._firecrawl_client = client
+    scraper._firecrawl_api_key = "test-firecrawl-key"
+    scraper._firecrawl_max_requests = 1
+
+    target = "https://pharmonline.az/api/products?lng=az&page=1"
+    assert await scraper._firecrawl_body(target, accept="application/json") == '{"data": []}'
+    assert scraper._firecrawl_requests == scraper._firecrawl_credits == 1
+    with pytest.raises(PharmonlinePublicAPIError, match="request_budget_exhausted"):
+        await scraper._firecrawl_body(target, accept="application/json")
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_firecrawl_rejects_an_unexpected_credit_charge():
+    scraper = PharmonlinePublicAPIScraper()
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "success": True,
+                "data": {
+                    "rawHtml": '{"data": []}',
+                    "metadata": {
+                        "statusCode": 200,
+                        "proxyUsed": "basic",
+                        "creditsUsed": 2,
+                        "contentType": "application/json",
+                    },
+                },
+            }
+
+    class _Client:
+        async def post(self, *_args, **_kwargs) -> _Response:
+            return _Response()
+
+    scraper._firecrawl_client = _Client()
+    scraper._firecrawl_api_key = "test-firecrawl-key"
+    scraper._firecrawl_max_requests = 1
+
+    with pytest.raises(PharmonlinePublicAPIError, match="unexpected_credits"):
+        await scraper._firecrawl_body(
+            "https://pharmonline.az/api/products?lng=az&page=1",
+            accept="application/json",
+        )
+    assert scraper._firecrawl_requests == 1
+    assert scraper._firecrawl_credits == 0
+
+
+@pytest.mark.asyncio
 async def test_decodo_direct_request_keeps_one_context_on_retry(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
     scraper._decodo_ports = (30001,)
@@ -713,6 +819,35 @@ async def test_source_json_selects_scraperapi_only_when_explicit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_source_json_selects_firecrawl_only_when_explicit(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._public_api_transport = "firecrawl"
+    calls: list[tuple[str, str, str | None]] = []
+
+    async def firecrawl_body(
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        calls.append((target_url, accept, crawlbase_session))
+        return '{"data": []}'
+
+    monkeypatch.setattr(scraper, "_firecrawl_body", firecrawl_body)
+    assert await scraper._source_json(
+        "https://pharmonline.az/api/products?lng=az&page=1",
+        crawlbase_session="firecrawl-catalog-test",
+    ) == {"data": []}
+    assert calls == [
+        (
+            "https://pharmonline.az/api/products?lng=az&page=1",
+            "application/json",
+            "firecrawl-catalog-test",
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_source_xml_selects_scraperapi_only_when_explicit(monkeypatch):
     scraper = PharmonlinePublicAPIScraper()
     scraper._public_api_transport = "scraperapi"
@@ -740,6 +875,38 @@ async def test_source_xml_selects_scraperapi_only_when_explicit(monkeypatch):
             "https://pharmonline.az/sitemap.xml",
             "application/xml,text/xml;q=0.9,*/*;q=0.8",
             "scraperapi-sitemap-test",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_source_xml_selects_firecrawl_only_when_explicit(monkeypatch):
+    scraper = PharmonlinePublicAPIScraper()
+    scraper._public_api_transport = "firecrawl"
+    calls: list[tuple[str, str, str | None]] = []
+
+    async def firecrawl_body(
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        calls.append((target_url, accept, crawlbase_session))
+        return "<urlset />"
+
+    monkeypatch.setattr(scraper, "_firecrawl_body", firecrawl_body)
+    assert (
+        await scraper._source_xml(
+            "https://pharmonline.az/sitemap.xml",
+            crawlbase_session="firecrawl-sitemap-test",
+        )
+        == "<urlset />"
+    )
+    assert calls == [
+        (
+            "https://pharmonline.az/sitemap.xml",
+            "application/xml,text/xml;q=0.9,*/*;q=0.8",
+            "firecrawl-sitemap-test",
         )
     ]
 

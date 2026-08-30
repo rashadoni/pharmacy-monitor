@@ -173,6 +173,7 @@ jobs:
               "CRAWLBASE_JS_TOKEN",
               "SCRAPER_API_KEY",
               "SCRAPER_API_COUNTRY",
+              "FIRECRAWL_API_KEY",
               "HTTP_PROXY",
               "HTTPS_PROXY",
               "ALL_PROXY",
@@ -305,6 +306,7 @@ jobs:
                   "IPROYAL_USERNAME",
                   "IPROYAL_PASSWORD",
                   "IPROYAL_HOST",
+                  "FIRECRAWL_API_KEY",
               ):
                   sensitive = os.getenv(key, "")
                   if len(sensitive) >= 4:

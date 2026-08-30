@@ -84,15 +84,24 @@ _SCRAPERAPI_CATALOG_SESSION_PAGE_SPAN = 10
 _MAX_DECODO_STICKY_PORTS = 64
 _PUBLIC_API_TRANSPORT_ENV = "PHARMONLINE_PUBLIC_API_TRANSPORT"
 _DECODO_BACKCONNECT_STICKY_ENV = "PHARMONLINE_DECODO_BACKCONNECT_STICKY"
+_FIRECRAWL_MAX_REQUESTS_ENV = "PHARMONLINE_FIRECRAWL_MAX_REQUESTS"
 _CRAWLBASE_TRANSPORT = "crawlbase"
 _DECODO_TRANSPORT = "decodo"
 _SCRAPERAPI_TRANSPORT = "scraperapi"
+_FIRECRAWL_TRANSPORT = "firecrawl"
 _DECODO_BACKCONNECT_HOST = "gate.decodo.com"
 _DECODO_BACKCONNECT_PORT = 7000
 _DECODO_BACKCONNECT_COUNTRY = "az"
 _DECODO_BACKCONNECT_SESSION_MINUTES = 30
 _SCRAPERAPI_PROXY_HOST = "proxy-server.scraperapi.com"
 _SCRAPERAPI_PROXY_PORT = 8001
+_FIRECRAWL_SCRAPE_ENDPOINT = "https://api.firecrawl.dev/v2/scrape"
+# The current catalog is 96 API pages, 29 product sitemaps, a sitemap index,
+# one category map and four page-one consistency anchors: 131 requests. Keep
+# a little headroom for normal catalog growth but stop before a provider-side
+# change can turn the fallback into an open-ended credit burn.
+_FIRECRAWL_DEFAULT_MAX_REQUESTS = 140
+_FIRECRAWL_HARD_MAX_REQUESTS = 500
 # The public sitemap can lag the first-party product API by a few recently
 # published URLs.  It is still useful as an independent evidence source, but
 # only as a near-complete subset: it must not introduce any URL absent from
@@ -153,6 +162,25 @@ def _decodo_backconnect_sticky_enabled() -> bool:
     if value in {"1", "true", "yes", "required"}:
         return True
     raise SiteScrapeFatalError("Decodo backconnect mode is invalid")
+
+
+def _firecrawl_max_requests() -> int:
+    """Read a bounded whole-catalog Firecrawl request budget.
+
+    Firecrawl bills successful `/scrape` calls per target URL.  The limit is
+    deliberately local to one scraper instance, so a failed catalog cannot
+    continue spending credits through retries or a changed sitemap shape.
+    """
+    raw = os.environ.get(_FIRECRAWL_MAX_REQUESTS_ENV, "").strip()
+    if not raw:
+        return _FIRECRAWL_DEFAULT_MAX_REQUESTS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise SiteScrapeFatalError("Firecrawl request budget is invalid") from exc
+    if value < 1 or value > _FIRECRAWL_HARD_MAX_REQUESTS:
+        raise SiteScrapeFatalError("Firecrawl request budget is outside the safe range")
+    return value
 
 
 def _require_decodo_pharmonline_site() -> None:
@@ -448,7 +476,12 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if not _env_enabled("PHARMONLINE_PUBLIC_API"):
             raise SiteScrapeFatalError("Pharmonline public API mode is not explicitly enabled")
         transport = os.environ.get(_PUBLIC_API_TRANSPORT_ENV, _CRAWLBASE_TRANSPORT).strip().lower()
-        if transport not in {_CRAWLBASE_TRANSPORT, _DECODO_TRANSPORT, _SCRAPERAPI_TRANSPORT}:
+        if transport not in {
+            _CRAWLBASE_TRANSPORT,
+            _DECODO_TRANSPORT,
+            _SCRAPERAPI_TRANSPORT,
+            _FIRECRAWL_TRANSPORT,
+        }:
             raise SiteScrapeFatalError("Pharmonline public API transport is not supported")
 
         self._public_api_transport = transport
@@ -460,6 +493,10 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         self._decodo_session_ports: dict[str, int] = {}
         self._scraperapi_clients: dict[str, httpx.AsyncClient] = {}
         self._scraperapi_session_numbers: dict[str, int] = {}
+        self._firecrawl_client: httpx.AsyncClient | None = None
+        self._firecrawl_requests = 0
+        self._firecrawl_credits = 0
+        self._firecrawl_max_requests = 0
 
         if transport == _CRAWLBASE_TRANSPORT:
             token = _text(os.environ.get("CRAWLBASE_JS_TOKEN"))
@@ -501,7 +538,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                 "pharmonline_public_api_decodo_transport_configured",
                 connection="backconnect" if use_backconnect_sticky else "country_sticky_port",
             )
-        else:
+        elif transport == _SCRAPERAPI_TRANSPORT:
             key = _text(os.environ.get("SCRAPER_API_KEY"))
             _require_scraperapi_pharmonline_site()
             premium_sites = {
@@ -526,6 +563,19 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                 country="default",
                 sticky_sessions=True,
             )
+        else:
+            key = _text(os.environ.get("FIRECRAWL_API_KEY"))
+            if key is None:
+                raise SiteScrapeFatalError("Firecrawl API key is not configured")
+            self._firecrawl_api_key = key
+            self._firecrawl_max_requests = _firecrawl_max_requests()
+            self._firecrawl_client = httpx.AsyncClient(timeout=90.0)
+            log.info(
+                "pharmonline_public_api_firecrawl_transport_configured",
+                max_requests=self._firecrawl_max_requests,
+                proxy="basic",
+                fresh_only=True,
+            )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
@@ -541,6 +591,10 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             await scraperapi_client.aclose()
         self._scraperapi_clients = {}
         self._scraperapi_session_numbers = {}
+        firecrawl_client = getattr(self, "_firecrawl_client", None)
+        if firecrawl_client is not None:
+            await firecrawl_client.aclose()
+        self._firecrawl_client = None
 
     def _transport_name(self) -> str:
         """Use Crawlbase by default for backwards-compatible unit fixtures."""
@@ -1033,6 +1087,118 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         self._record_origin_headers(target_url, response.headers)
         return response.text
 
+    async def _firecrawl_body(
+        self,
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        """Fetch one fresh native Pharmonline response through Firecrawl.
+
+        Firecrawl's Markdown/JSON extraction may omit fields that are
+        material to the existing identity proof.  ``rawHtml`` is therefore
+        used as an opaque transport envelope: the JSON/XML is parsed only by
+        the same local validators used for Decodo and ScraperAPI.
+
+        The provider cache is explicitly disabled and ``basic`` is pinned. A
+        successful enhanced-proxy escalation would cost more and conceal a
+        changed access path, so it fails this catalog instead of silently
+        spending credits or mixing source semantics.
+        """
+        del crawlbase_session  # Firecrawl has no sticky-session contract here.
+        parsed_target = urlsplit(target_url)
+        if (
+            parsed_target.scheme != "https"
+            or parsed_target.netloc.lower() != "pharmonline.az"
+        ):
+            raise PharmonlinePublicAPIError("firecrawl_target_url_invalid")
+        client = getattr(self, "_firecrawl_client", None)
+        api_key = getattr(self, "_firecrawl_api_key", None)
+        if client is None or not isinstance(api_key, str) or not api_key:
+            raise SiteScrapeFatalError("Firecrawl transport is not initialized")
+        request_limit = int(getattr(self, "_firecrawl_max_requests", 0) or 0)
+        request_count = int(getattr(self, "_firecrawl_requests", 0) or 0)
+        if request_limit < 1 or request_count >= request_limit:
+            raise PharmonlinePublicAPIError("firecrawl_request_budget_exhausted")
+
+        # Reserve before dispatch. A malformed or interrupted response must
+        # consume capacity locally too, otherwise retries could exceed the
+        # operator's intended maximum during a provider outage.
+        request_count += 1
+        self._firecrawl_requests = request_count
+        try:
+            response = await client.post(
+                _FIRECRAWL_SCRAPE_ENDPOINT,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "url": target_url,
+                    "formats": ["rawHtml"],
+                    "onlyMainContent": False,
+                    "maxAge": 0,
+                    "storeInCache": False,
+                    "proxy": "basic",
+                    "timeout": 60_000,
+                    "location": {"country": "AZ", "languages": ["az"]},
+                },
+            )
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+            raise PharmonlinePublicAPIError("firecrawl_request_failed") from None
+        except httpx.HTTPError:
+            raise PharmonlinePublicAPIError("firecrawl_request_failed") from None
+
+        if response.status_code in {401, 402, 403}:
+            raise SiteScrapeFatalError(
+                f"Firecrawl access rejected: HTTP {response.status_code}"
+            )
+        if response.status_code != 200:
+            raise PharmonlinePublicAPIError(f"firecrawl_http_{response.status_code}")
+        try:
+            envelope = response.json()
+        except ValueError:
+            raise PharmonlinePublicAPIError("firecrawl_response_not_json") from None
+        if not isinstance(envelope, dict) or envelope.get("success") is not True:
+            raise PharmonlinePublicAPIError("firecrawl_unsuccessful_response")
+        data = envelope.get("data")
+        if not isinstance(data, dict):
+            raise PharmonlinePublicAPIError("firecrawl_response_data_invalid")
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            raise PharmonlinePublicAPIError("firecrawl_response_metadata_invalid")
+        if metadata.get("statusCode") != 200:
+            raise PharmonlinePublicAPIError("firecrawl_target_status_invalid")
+        if metadata.get("proxyUsed") != "basic":
+            raise PharmonlinePublicAPIError("firecrawl_proxy_mode_invalid")
+        raw_body = data.get("rawHtml")
+        if not isinstance(raw_body, str) or not raw_body.strip():
+            raise PharmonlinePublicAPIError("firecrawl_raw_body_missing")
+        content_type = str(metadata.get("contentType") or "").lower()
+        if accept == "application/json":
+            if not content_type.startswith("application/json"):
+                raise PharmonlinePublicAPIError("firecrawl_content_type_invalid")
+        elif "xml" not in content_type:
+            raise PharmonlinePublicAPIError("firecrawl_content_type_invalid")
+        try:
+            credits_used = int(metadata.get("creditsUsed"))
+        except (TypeError, ValueError):
+            raise PharmonlinePublicAPIError("firecrawl_credits_missing") from None
+        if credits_used != 1:
+            raise PharmonlinePublicAPIError("firecrawl_unexpected_credits")
+        self._firecrawl_credits = (
+            int(getattr(self, "_firecrawl_credits", 0) or 0) + credits_used
+        )
+        log.info(
+            "pharmonline_public_api_firecrawl_response_verified",
+            resource=parsed_target.path,
+            request_count=request_count,
+            request_limit=request_limit,
+            credits_used=credits_used,
+        )
+        return raw_body
+
     async def _source_json(
         self,
         target_url: str,
@@ -1050,6 +1216,14 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if self._transport_name() == _SCRAPERAPI_TRANSPORT:
             return _json_from_rendered_body(
                 await self._scraperapi_body(
+                    target_url,
+                    accept="application/json",
+                    crawlbase_session=crawlbase_session,
+                )
+            )
+        if self._transport_name() == _FIRECRAWL_TRANSPORT:
+            return _json_from_rendered_body(
+                await self._firecrawl_body(
                     target_url,
                     accept="application/json",
                     crawlbase_session=crawlbase_session,
@@ -1087,6 +1261,12 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             )
         if self._transport_name() == _SCRAPERAPI_TRANSPORT:
             return await self._scraperapi_body(
+                target_url,
+                accept="application/xml,text/xml;q=0.9,*/*;q=0.8",
+                crawlbase_session=crawlbase_session,
+            )
+        if self._transport_name() == _FIRECRAWL_TRANSPORT:
+            return await self._firecrawl_body(
                 target_url,
                 accept="application/xml,text/xml;q=0.9,*/*;q=0.8",
                 crawlbase_session=crawlbase_session,
@@ -1452,6 +1632,16 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             catalog_session_page_span=self._catalog_session_page_span(),
             catalog_session_chunks=len(getattr(self, "_catalog_sessions", {})),
             origin_contexts=self._origin_context_evidence(),
+            firecrawl_requests=(
+                int(getattr(self, "_firecrawl_requests", 0) or 0)
+                if self._transport_name() == _FIRECRAWL_TRANSPORT
+                else None
+            ),
+            firecrawl_credits=(
+                int(getattr(self, "_firecrawl_credits", 0) or 0)
+                if self._transport_name() == _FIRECRAWL_TRANSPORT
+                else None
+            ),
         )
         self._set_route_status(
             category_slug,

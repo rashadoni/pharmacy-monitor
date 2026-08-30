@@ -116,6 +116,14 @@ send the bulky HTML/Excel scrape report. The priority watchlist is a separate
 curated list of confirmed URLs and runs every three hours; it can notify only
 about a local price change, never publish a partial cross-site recommendation.
 
+For Pharmonline, Decodo remains the default verified transport. Firecrawl is
+an optional, whole-catalog fallback for the autonomous workflow after all
+Decodo retries fail. Add `FIRECRAWL_API_KEY`,
+`PHARMONLINE_PUBLIC_API_FIRECRAWL_FALLBACK=required`, and a bounded
+`PHARMONLINE_FIRECRAWL_MAX_REQUESTS=140` only after a separately approved
+production configuration change. Do not replace Decodo or enable keyless mode
+in the production EnvironmentFile.
+
 ## Phase 7 — Caddy reverse proxy
 
 ```bash

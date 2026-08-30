@@ -507,7 +507,7 @@ def _pharmonline_public_api_reconciliation_invalid_reason(
         return "source_manifest"
     if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256) is None:
         return "catalog_fingerprint"
-    if record.source_transport not in {"crawlbase", "decodo", "scraperapi"}:
+    if record.source_transport not in {"crawlbase", "decodo", "scraperapi", "firecrawl"}:
         return "transport"
     if re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None:
         return "preflight_run"
@@ -578,7 +578,7 @@ def _pharmonline_public_api_admission_invalid_reason(
         return "source_manifest"
     if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256) is None:
         return "catalog_fingerprint"
-    if record.source_transport not in {"crawlbase", "decodo", "scraperapi"}:
+    if record.source_transport not in {"crawlbase", "decodo", "scraperapi", "firecrawl"}:
         return "transport"
     if re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None:
         return "preflight_run"
@@ -1282,7 +1282,7 @@ def _require_pharmonline_public_api_reconciliation_proof(
     if (
         _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(source_manifest_sha256) is None
         or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(catalog_fingerprint_sha256) is None
-        or source_transport not in {"crawlbase", "decodo", "scraperapi"}
+        or source_transport not in {"crawlbase", "decodo", "scraperapi", "firecrawl"}
         or re.fullmatch(r"[0-9]{1,20}", preflight_run_ref) is None
     ):
         raise PharmonlinePublicAPIReconciliationError(

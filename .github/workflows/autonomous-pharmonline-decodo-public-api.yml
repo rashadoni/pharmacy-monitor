@@ -284,6 +284,39 @@ jobs:
             fi
             attempt=$((attempt + 1))
           done
+
+          # Firecrawl is an explicit, budgeted whole-catalog fallback, never
+          # a silent substitute for Decodo.  It runs only after all three
+          # fresh Decodo attempts have failed, and only when the production
+          # EnvironmentFile contains both its key and this exact opt-in.
+          if [ "$succeeded" -ne 1 ]; then
+            case "${PHARMONLINE_PUBLIC_API_FIRECRAWL_FALLBACK:-}" in
+              1|true|yes|required)
+                if [ -n "${FIRECRAWL_API_KEY:-}" ]; then
+                  echo 'Decodo attempts exhausted; trying one verified Firecrawl catalog' >&2
+                  if PHARMONLINE_PUBLIC_API=required \
+                    PHARMONLINE_PUBLIC_API_TRANSPORT=firecrawl \
+                    PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \
+                    PHARMONLINE_USE_DDP=0 \
+                    AI_FALLBACK_ENABLED=0 \
+                    SCRAPE_REPORT_EMAIL=0 \
+                    PYTHONDONTWRITEBYTECODE=1 \
+                    PYTHONPATH="$runtime_dir" \
+                    /opt/pharmacy-monitor/.venv/bin/python -m src.main run \
+                      --site pharmonline \
+                      --mode public_api
+                  then
+                    succeeded=1
+                  fi
+                else
+                  echo 'Firecrawl fallback requested but no API key is configured' >&2
+                fi
+                ;;
+              *)
+                echo 'Decodo attempts exhausted; Firecrawl fallback is disabled' >&2
+                ;;
+            esac
+          fi
           test "$succeeded" -eq 1
 
           BEFORE_RUN_ID="$before_run_id" PYTHONDONTWRITEBYTECODE=1 \

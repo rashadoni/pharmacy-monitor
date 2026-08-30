@@ -190,6 +190,24 @@ per-user тумблеры daily/weekly (`tenant_users`, страница «По�
 нужен только когда снижение требует отдельной политики. Не включайте оба
 правила на один и тот же сайт/порог, если не хотите два сообщения о снижении.
 
+### Firecrawl fallback для Pharmonline
+
+Decodo остаётся основным источником. Автоматический workflow переходит на
+Firecrawl **только** после трёх неуспешных свежих попыток Decodo и лишь при
+явном включении в `/etc/pharmacy-monitor/env`:
+
+```bash
+FIRECRAWL_API_KEY=fc-...  # секрет, не коммитить
+PHARMONLINE_PUBLIC_API_FIRECRAWL_FALLBACK=required
+PHARMONLINE_FIRECRAWL_MAX_REQUESTS=140
+```
+
+Fallback читает `rawHtml` API/ sitemap c `maxAge=0`, `storeInCache=false` и
+`proxy=basic`. Каждый ответ обязан быть HTTP 200, basic и ровно 1 credit;
+изменение тарифа, cache/advanced-proxy или неполный sitemap отклоняют весь
+прогон без обновления каталога. На текущем каталоге ожидается до 131 запроса
+за полный проход; лимит 140 — предохранитель, а не цель для расхода.
+
 ```bash
 # Текущее состояние всех email-потоков
 ssh root@46.225.149.52 '
