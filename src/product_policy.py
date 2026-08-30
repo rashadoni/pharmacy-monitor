@@ -35,12 +35,15 @@ OFFER_UNKNOWN = "unknown"
 COUNTRY_POLICY_MODES = {"shadow", "enforce"}
 AVAILABILITY_POLICY_MODES = {"shadow", "enforce"}
 
-# Website scrape cadence plus a safety margin.  A stale observation is not a
-# trusted active offer, but it is also not rewritten to out_of_stock.
+# Daily full-catalog cadence plus a safety margin.  A stale observation is not
+# a trusted active offer, but it is also not rewritten to out_of_stock.  The
+# systemd schedule is installed by infra/scripts/install_systemd_schedule.sh;
+# keep this business promise in code instead of silently accepting a weekly
+# timer override.
 OFFER_MAX_AGE_HOURS = {
     "aloe": 30,
-    "aptekonline": 198,
-    "pharmonline": 198,
+    "aptekonline": 30,
+    "pharmonline": 30,
 }
 
 REQUIRED_CATALOG_SITES = ("pharmonline", "aptekonline", "aloe")

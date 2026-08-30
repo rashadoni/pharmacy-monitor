@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh Pharmacy Monitor priority watchlist every three hours
+Documentation=https://github.com/rashadrahimov/pharmacy-monitor
+
+[Timer]
+# UTC.  01:15, 04:15, … is 05:15, 08:15, … Asia/Baku and is deliberately
+# offset from the daily full-catalog jobs at 01:00–03:00.
+OnCalendar=*-*-* 01,04,07,10,13,16,19,22:15:00
+Persistent=true
+Unit=pharmacy-monitor-watchlist.service
+
+[Install]
+WantedBy=timers.target

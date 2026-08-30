@@ -2004,6 +2004,7 @@ with tab_alerts:
                         options=[
                             "undercut_threshold",
                             "price_drop_pct",
+                            "price_change_pct",
                             "new_product",
                             "promo_started",
                             "price_raise_opportunity",
@@ -2011,6 +2012,7 @@ with tab_alerts:
                         format_func=lambda t: {
                             "undercut_threshold": "🔴 Конкурент дешевле клиента (порог %)",
                             "price_drop_pct": "📉 Резкое падение цены (%)",
+                            "price_change_pct": "↕️ Любое изменение цены (±%)",
                             "new_product": "🆕 Новый товар на сайте",
                             "promo_started": "🎯 Новая промо-кампания",
                             "price_raise_opportunity": "💰 Возможность поднять цену",
@@ -2042,6 +2044,7 @@ with tab_alerts:
                     if new_type in (
                         "undercut_threshold",
                         "price_drop_pct",
+                        "price_change_pct",
                         "price_raise_opportunity",
                     ):
                         params["min_pct"] = float(new_min_pct)

@@ -10,6 +10,7 @@
 Поддерживаемые типы правил:
 - `undercut_threshold` — конкурент дешевле клиента на ≥ params["min_pct"]
 - `price_drop_pct` — клиент или любой сайт уронил цену на ≥ params["min_pct"] vs предыдущий прогон
+- `price_change_pct` — цена конкретного товара изменилась на ≥ params["min_pct"] в любую сторону
 - `new_product` — на сайте появился новый SKU (был не в предыдущем прогоне)
 - `promo_started` — на конкуренте запустилась новая промо-кампания
 - `price_raise_opportunity` — клиент дешевле всех на ≥ params["min_pct"]
@@ -36,6 +37,7 @@ from src.storage import (
     has_unfinished_run,
     latest_financial_run_ids_by_site,
     run_is_financially_eligible,
+    run_is_watchlist_price_alert_eligible,
 )
 from src.run_lock import try_shared_scrape_read_lock
 
@@ -168,6 +170,75 @@ def _detect_price_drop(session: Session, run_id: int, params: dict) -> list[Cand
                     "prev_price": prev_price,
                     "curr_price": curr_price,
                     "drop_pct": round(drop_pct, 2),
+                },
+            )
+        )
+    return out
+
+
+def _detect_price_change(session: Session, run_id: int, params: dict) -> list[CandidateEvent]:
+    """Любая заметная смена цены относительно последнего verified snapshot'а.
+
+    В отличие от ``price_drop_pct`` это правило намеренно ловит и рост, и
+    снижение. Для частичного watchlist-прогона базовая цена всё равно берётся
+    только из предыдущего финансово-eligible полного каталога: короткий тик
+    сообщает один локальный факт, а не строит вывод из двух неполных выборок.
+    """
+    from src.storage import curr_and_prev_snapshots_for_run
+
+    min_pct = float(params.get("min_pct", 5.0))
+    site_filter = params.get("site")
+    out: list[CandidateEvent] = []
+
+    current_run = session.get(Run, run_id)
+    if current_run is None:
+        return []
+
+    curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(
+        session,
+        current_run,
+        financially_eligible_only=True,
+    )
+    for snap in curr_snaps:
+        prev = prev_by_product.get(snap.product_id)
+        if prev is None:
+            continue
+        prev_price = prev.discount_price or prev.price
+        curr_price = snap.discount_price or snap.price
+        if prev_price is None or curr_price is None or prev_price <= 0:
+            continue
+        change_pct = (curr_price - prev_price) / prev_price * 100
+        if abs(change_pct) < min_pct:
+            continue
+        product = snap.product
+        from src.product_policy import policy_offer_eligibility
+
+        if not policy_offer_eligibility(product).eligible:
+            continue
+        if site_filter and product.site != site_filter:
+            continue
+        direction = "up" if change_pct > 0 else "down"
+        amount = abs(change_pct)
+        change_word = "выросла" if direction == "up" else "снизилась"
+        sign = "+" if direction == "up" else "−"
+        severity = "critical" if amount >= 20 else "warning"
+        out.append(
+            CandidateEvent(
+                rule_type="price_change_pct",
+                dedup_key=f"change|p={product.id}|direction={direction}",
+                severity=severity,
+                title=f"Цена {change_word} на {amount:.1f}%: {product.name[:60]}",
+                detail=(
+                    f"{product.site}: {prev_price:.2f} → {curr_price:.2f} ₼ "
+                    f"({sign}{amount:.1f}%)."
+                ),
+                payload={
+                    "product_id": product.id,
+                    "site": product.site,
+                    "prev_price": prev_price,
+                    "curr_price": curr_price,
+                    "change_pct": round(change_pct, 2),
+                    "direction": direction,
                 },
             )
         )
@@ -327,11 +398,28 @@ def _noop_detector(*_args, **_kwargs) -> list[CandidateEvent]:
 DETECTORS: dict[str, Callable[[Session, int, dict], list[CandidateEvent]]] = {
     "undercut_threshold": _detect_undercut_threshold,
     "price_drop_pct": _detect_price_drop,
+    "price_change_pct": _detect_price_change,
     "new_product": _detect_new_product,
     "promo_started": _detect_promo_started,
     "price_raise_opportunity": _detect_price_raise_opportunity,
     "site_drop_smoke": _noop_detector,
 }
+
+# A confirmed watchlist URL is enough evidence for one local fact: the price
+# of this very product changed relative to its last verified catalog value.
+# It is *not* enough to publish a catalogue-wide undercut, assortment, promo,
+# or price-raise recommendation, because the other side of that comparison may
+# not have been refreshed in this short tick.
+_WATCHLIST_REALTIME_RULE_TYPES = frozenset({"price_drop_pct", "price_change_pct"})
+
+
+def _allowed_rule_types_for_run(run: Run | None) -> set[str] | None:
+    """Return ``None`` for a full trusted run, or a narrow partial allowlist."""
+    if run_is_financially_eligible(run):
+        return None
+    if run_is_watchlist_price_alert_eligible(run):
+        return set(_WATCHLIST_REALTIME_RULE_TYPES)
+    return set()
 
 
 # === EVALUATION ENGINE ===
@@ -400,9 +488,10 @@ def evaluate_rules(
         if run is not None:
             tenant_id = run.tenant_id
 
-    if not run_is_financially_eligible(run):
+    allowed_rule_types = _allowed_rule_types_for_run(run)
+    if not allowed_rule_types and not run_is_financially_eligible(run):
         log.warning(
-            "alerts_run_not_financially_eligible",
+            "alerts_run_not_eligible",
             run_id=run_id,
             status=run.status if run else None,
         )
@@ -422,6 +511,8 @@ def evaluate_rules(
     stmt = select(AlertRule).where(AlertRule.is_active.is_(True))
     if rule_ids:
         stmt = stmt.where(AlertRule.id.in_(rule_ids))
+    if allowed_rule_types is not None:
+        stmt = stmt.where(AlertRule.rule_type.in_(allowed_rule_types))
     rules = session.scalars(stmt).all()
 
     fired: list[AlertEvent] = []

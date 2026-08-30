@@ -129,6 +129,14 @@ jobs:
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
             migrations/versions/ pm@46.225.149.52:/opt/pharmacy-monitor/migrations/versions/
+          # Root-owned systemd installation remains an explicit post-release
+          # operation, but its versioned units and reconciliation script must
+          # be present in the runtime checkout for that operation to be
+          # reproducible.
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            infra/systemd/ pm@46.225.149.52:/opt/pharmacy-monitor/infra/systemd/
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            infra/scripts/ pm@46.225.149.52:/opt/pharmacy-monitor/infra/scripts/
 
       - name: Verify migration graph has one head
         run: |

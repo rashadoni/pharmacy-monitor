@@ -488,11 +488,13 @@ def alert_due(
 
 
 _SITE_FRESHNESS_DAYS: dict[str, int] = {
-    "pharmonline": 21,  # недельный таймер → ~3 цикла
-    "aptekonline": 21,  # недельный таймер
-    "aloe": 10,  # ежедневный → запас на простой
+    # A current catalog must be no more than one missed daily run old.  The
+    # larger values used to hide a broken weekly production override for days.
+    "pharmonline": 3,
+    "aptekonline": 3,
+    "aloe": 3,
 }
-_DEFAULT_FRESHNESS_DAYS = 21
+_DEFAULT_FRESHNESS_DAYS = 3
 
 # Окно ПОКРЫТИЯ для числителя site_drop: сколько РАЗНЫХ товаров сайта видели за
 # последние N дней (≥ один полный цикл скрейпа + запас). Берём окно, а НЕ
@@ -501,11 +503,14 @@ _DEFAULT_FRESHNESS_DAYS = 21
 # дал бы ложный site_drop. Окно включает последний ПОЛНЫЙ прогон → одиночный
 # частичный прогон метрику не роняет. Должно быть < _SITE_FRESHNESS_DAYS.
 _SITE_COVERAGE_DAYS: dict[str, int] = {
-    "pharmonline": 14,  # недельный цикл (7д) + запас на слип/пропуск одного прогона
-    "aptekonline": 14,  # недельный цикл + запас
-    "aloe": 4,  # дневной цикл + запас
+    # A partial/watchlist tick must not make the latest full daily scan look
+    # like a coverage drop.  Two days include yesterday's verified full pass
+    # while detecting a missed cadence promptly.
+    "pharmonline": 2,
+    "aptekonline": 2,
+    "aloe": 2,
 }
-_DEFAULT_COVERAGE_DAYS = 14
+_DEFAULT_COVERAGE_DAYS = 2
 
 
 def _check_site_drops(
@@ -528,7 +533,7 @@ def _check_site_drops(
 
     Реальные кейсы (2026-06-16): (1) pharmonline 9840/19811=49% из-за ~9.8K
     Playwright-дублей при живом каталоге ~9951; (2) после их чистки — 127/10333=1%
-    из-за частичного run_277. Окно покрытия (14д) + свежести (21д) → ~99%.
+    из-за частичного run_277. Окно покрытия (2д) + свежести (3д) → ~99%.
     """
     sites = ["pharmonline", "aptekonline", "aloe"]
     issues: list[HealthIssue] = []
@@ -748,16 +753,13 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
     return []
 
 
-# Per-site пороги «молчания» (часы). Дефолт = суточная частота (26ч = 24ч + jitter).
-# Сайты с НЕ-суточным расписанием переопределяются: aptekonline скрейпится РАЗ В
-# НЕДЕЛЮ (Decodo, Пн 02:00 UTC) — «молчит» только если нет обновлений >8 дней,
-# иначе hourly health-check спамил бы critical 6 из 7 дней (alert fatigue, маскирует
-# реальные сбои Decodo/баланса).
+# Per-site пороги «молчания» (часы). 30ч = ежедневный запуск + разумный запас
+# на jitter/retry.  Values live here rather than in an undocumented systemd
+# override so health fails closed when the promised daily cadence stops.
 _SITE_MAX_AGE_HOURS: dict[str, int] = {
-    "aptekonline": 8 * 24 + 6,  # 198ч = 8 суток + 6ч jitter (недельный таймер)
-    # pharmonline тоже недельный таймер (Mon 01:00). Без этого override default
-    # 26ч давал бы ложный site_silent 6 из 7 дней.
-    "pharmonline": 8 * 24 + 6,
+    "aptekonline": 30,
+    "pharmonline": 30,
+    "aloe": 30,
 }
 
 

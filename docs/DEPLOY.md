@@ -98,29 +98,31 @@ sudo -u pm bash -c 'cd /opt/pharmacy-monitor && .venv/bin/python scripts/sqlite_
 cp /opt/pharmacy-monitor/infra/systemd/*.{service,timer} /etc/systemd/system/
 systemctl daemon-reload
 
-# Stagger scrape times via override files
-mkdir -p /etc/systemd/system/pharmacy-monitor-scrape@aptekonline.timer.d
-cat > /etc/systemd/system/pharmacy-monitor-scrape@aptekonline.timer.d/override.conf <<EOF
-[Timer]
-OnCalendar=
-OnCalendar=*-*-* 02:00:00
-EOF
+# Install the versioned daily cadence and the 3-hour priority-watchlist timer.
+# This is required after a release that changes infra/systemd: it neutralizes
+# old weekly / --no-alerts drop-ins with final ``zz-*`` overrides instead of
+# relying on undocumented files in /etc.
+/opt/pharmacy-monitor/infra/scripts/install_systemd_schedule.sh
 
-mkdir -p /etc/systemd/system/pharmacy-monitor-scrape@aloe.timer.d
-cat > /etc/systemd/system/pharmacy-monitor-scrape@aloe.timer.d/override.conf <<EOF
-[Timer]
-OnCalendar=
-OnCalendar=*-*-* 03:00:00
-EOF
-
-# Enable + start
+# Enable remaining services.
 systemctl enable --now pharmacy-monitor-api.service
-systemctl enable --now pharmacy-monitor-scrape@pharmonline.timer
-systemctl enable --now pharmacy-monitor-scrape@aptekonline.timer
-systemctl enable --now pharmacy-monitor-scrape@aloe.timer
 systemctl enable --now pharmacy-monitor-health.timer
 systemctl enable --now pharmacy-monitor-backup.timer
 ```
+
+The daily full scans run at 01:00 (Pharmonline), 02:00 (Aptekonline), and
+03:00 UTC (Aloe). They evaluate real-time alert rules but deliberately do not
+send the bulky HTML/Excel scrape report. The priority watchlist is a separate
+curated list of confirmed URLs and runs every three hours; it can notify only
+about a local price change, never publish a partial cross-site recommendation.
+
+For Pharmonline, Decodo remains the default verified transport. Firecrawl is
+an optional, whole-catalog fallback for the autonomous workflow after all
+Decodo retries fail. Add `FIRECRAWL_API_KEY`,
+`PHARMONLINE_PUBLIC_API_FIRECRAWL_FALLBACK=required`, and a bounded
+`PHARMONLINE_FIRECRAWL_MAX_REQUESTS=140` only after a separately approved
+production configuration change. Do not replace Decodo or enable keyless mode
+in the production EnvironmentFile.
 
 ## Phase 7 — Caddy reverse proxy
 

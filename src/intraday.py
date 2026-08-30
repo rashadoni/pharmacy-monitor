@@ -260,7 +260,7 @@ def pick_next_scrape_target(
         "pharmonline": cat.pharmonline_slug,
         "aloe": cat.aloe_slug,
         # aptekonline исключён из intraday: прод-скрейп server-side, но тяжёлый
-        # weekly-путь через AZ residential proxy пока не используется для
+        # full-catalog путь через AZ residential proxy пока не используется для
         # лёгких внутридневных категорийных тиков.
     }
 

@@ -401,6 +401,54 @@ def test_price_drop_detects_yesterday_to_today(db_session):
     assert fired[0].payload["drop_pct"] == 30.0
 
 
+def test_confirmed_watchlist_tick_only_emits_local_price_change(db_session):
+    """A successful pinned-SKU tick cannot emit cross-site money advice."""
+    product = _add_product(db_session, "aloe", "Pinned", "pinned")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    watchlist_tick = Run(
+        started_at=utcnow(),
+        status="ok",
+        catalog_scope="partial",
+        catalog_verified=False,
+        catalog_verification_reason="bounded_or_watchlist_run",
+        run_quality={
+            "mode": "watchlist",
+            "financially_eligible": False,
+            "sites": {"aloe": {"status": "ok", "items_failed": 0}},
+        },
+    )
+    db_session.add(watchlist_tick)
+    db_session.flush()
+    _add_snap(db_session, previous_full, product, 100.0)
+    _add_snap(db_session, watchlist_tick, product, 115.0)
+    _add_rule(db_session, "price_change_pct", {"min_pct": 10.0})
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, watchlist_tick.id)
+
+    assert storage.run_is_watchlist_price_alert_eligible(watchlist_tick)
+    assert [event.rule_type for event in fired] == ["price_change_pct"]
+    assert fired[0].payload["source_run_id"] == watchlist_tick.id
+    assert fired[0].payload["direction"] == "up"
+    assert fired[0].payload["change_pct"] == 15.0
+
+
+def test_degraded_watchlist_tick_cannot_emit_price_drop(db_session):
+    tick = Run(
+        started_at=utcnow(),
+        status="degraded",
+        catalog_scope="partial",
+        run_quality={"mode": "watchlist", "sites": {"aloe": {"status": "degraded"}}},
+    )
+    db_session.add(tick)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    assert not storage.run_is_watchlist_price_alert_eligible(tick)
+    assert alerts.evaluate_rules(db_session, tick.id) == []
+
+
 def test_price_drop_ignores_newer_partial_snapshot_as_baseline(db_session):
     product = _add_product(db_session, "aloe", "Trusted", "trusted")
     trusted = _add_run(db_session, utcnow() - timedelta(days=2))

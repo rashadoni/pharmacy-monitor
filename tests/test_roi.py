@@ -857,9 +857,9 @@ def test_roi_cache_waits_until_every_site_has_verified_full_scan(db_session):
 
 def test_roi_cache_rejects_stale_verified_site_inputs(db_session):
     run = Run(
-        started_at=utcnow() - timedelta(hours=27),
+        started_at=utcnow() - timedelta(hours=31),
         status="ok",
-        finished_at=utcnow() - timedelta(hours=27),
+        finished_at=utcnow() - timedelta(hours=31),
         catalog_scope="full",
         full_catalog_sites="pharmonline,aptekonline,aloe",
         catalog_verified=True,

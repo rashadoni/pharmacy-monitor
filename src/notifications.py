@@ -348,6 +348,7 @@ def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -
 _FINANCIAL_EVENT_TYPES = {
     "undercut_threshold",
     "price_drop_pct",
+    "price_change_pct",
     "new_product",
     "promo_started",
     "price_raise_opportunity",
@@ -363,10 +364,16 @@ def _event_is_digest_eligible(session: Session, event: storage.AlertEvent) -> bo
         log.warning("digest_event_skipped_unverified", event_id=event.id, reason="no_source_run")
         return False
     run = session.get(storage.Run, run_id)
-    eligible = (
+    eligible = bool(
         run is not None
         and run.tenant_id == event.tenant_id
-        and storage.run_is_financially_eligible(run)
+        and (
+            storage.run_is_financially_eligible(run)
+            or (
+                event.rule_type in {"price_drop_pct", "price_change_pct"}
+                and storage.run_is_watchlist_price_alert_eligible(run)
+            )
+        )
     )
     if not eligible:
         log.warning(

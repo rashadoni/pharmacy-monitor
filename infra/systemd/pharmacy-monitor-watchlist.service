@@ -1,0 +1,28 @@
+[Unit]
+Description=Pharmacy Monitor — priority watchlist refresh
+Documentation=https://github.com/rashadrahimov/pharmacy-monitor
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pm
+Group=pm
+WorkingDirectory=/opt/pharmacy-monitor
+EnvironmentFile=/etc/pharmacy-monitor/env
+# The command exits successfully when the curated list is empty.  A list above
+# WATCHLIST_TICK_MAX_URLS deliberately fails rather than silently sampling it.
+ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor watchlist-tick
+TimeoutStartSec=1800
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/pharmacy-monitor/data /opt/pharmacy-monitor/logs /opt/pharmacy-monitor/reports
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pharmacy-monitor-watchlist
+
+[Install]
+WantedBy=multi-user.target
