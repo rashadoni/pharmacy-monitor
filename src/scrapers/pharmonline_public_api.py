@@ -1108,10 +1108,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         """
         del crawlbase_session  # Firecrawl has no sticky-session contract here.
         parsed_target = urlsplit(target_url)
-        if (
-            parsed_target.scheme != "https"
-            or parsed_target.netloc.lower() != "pharmonline.az"
-        ):
+        if parsed_target.scheme != "https" or parsed_target.netloc.lower() != "pharmonline.az":
             raise PharmonlinePublicAPIError("firecrawl_target_url_invalid")
         client = getattr(self, "_firecrawl_client", None)
         api_key = getattr(self, "_firecrawl_api_key", None)
@@ -1151,9 +1148,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             raise PharmonlinePublicAPIError("firecrawl_request_failed") from None
 
         if response.status_code in {401, 402, 403}:
-            raise SiteScrapeFatalError(
-                f"Firecrawl access rejected: HTTP {response.status_code}"
-            )
+            raise SiteScrapeFatalError(f"Firecrawl access rejected: HTTP {response.status_code}")
         if response.status_code != 200:
             raise PharmonlinePublicAPIError(f"firecrawl_http_{response.status_code}")
         try:
@@ -1187,9 +1182,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             raise PharmonlinePublicAPIError("firecrawl_credits_missing") from None
         if credits_used != 1:
             raise PharmonlinePublicAPIError("firecrawl_unexpected_credits")
-        self._firecrawl_credits = (
-            int(getattr(self, "_firecrawl_credits", 0) or 0) + credits_used
-        )
+        self._firecrawl_credits = int(getattr(self, "_firecrawl_credits", 0) or 0) + credits_used
         log.info(
             "pharmonline_public_api_firecrawl_response_verified",
             resource=parsed_target.path,
