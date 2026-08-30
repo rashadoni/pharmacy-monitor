@@ -19,13 +19,13 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from src.scrapers.base import SiteScrapeFatalError
 from src.scrapers.aptekonline import (
-    AptekonlineScraper,
     _DEFAULT_CHECKUS,
+    AptekonlineScraper,
     _brightdata_httpx_proxy_for,
     _build_product_from_api,
     _category_attempts,
+    _category_recovery_delay_seconds,
     _decodo_enabled,
     _decodo_httpx_proxy_for,
     _decodo_page_attempts,
@@ -35,6 +35,7 @@ from src.scrapers.aptekonline import (
     _resolve_checkus_token,
     _scraperapi_httpx_proxy_for,
 )
+from src.scrapers.base import SiteScrapeFatalError
 
 
 def _mock_httpx_client(payload: dict | list[dict] | None = None, status: int = 200):
@@ -658,6 +659,7 @@ def _clear_decodo(mp):
         "DECODO_PAGE_ATTEMPTS",
         "DECODO_RETRY_DELAY_SECONDS",
         "APTEKONLINE_CATEGORY_ATTEMPTS",
+        "APTEKONLINE_CATEGORY_RECOVERY_DELAY_SECONDS",
     ):
         mp.delenv(k, raising=False)
 
@@ -733,10 +735,13 @@ def test_decodo_page_attempts_default_and_override(monkeypatch):
 def test_aptekonline_retry_configuration(monkeypatch):
     _clear_decodo(monkeypatch)
     assert _category_attempts() == 3
+    assert _category_recovery_delay_seconds() == 120
     assert _decodo_retry_delay_seconds() == 0.5
     monkeypatch.setenv("APTEKONLINE_CATEGORY_ATTEMPTS", "2")
+    monkeypatch.setenv("APTEKONLINE_CATEGORY_RECOVERY_DELAY_SECONDS", "3.5")
     monkeypatch.setenv("DECODO_RETRY_DELAY_SECONDS", "0")
     assert _category_attempts() == 2
+    assert _category_recovery_delay_seconds() == 3.5
     assert _decodo_retry_delay_seconds() == 0
 
 
@@ -898,6 +903,63 @@ async def test_scrape_category_tries_all_decodo_sessions_for_truncated_route(mon
         "30002",
         "30003",
     }
+    assert scraper._route_statuses["114"].complete is True
+
+
+@pytest.mark.asyncio
+async def test_scrape_category_retries_once_after_delayed_upstream_recovery(monkeypatch):
+    """После сбоя на всех AZ-IP ждём и заново проверяем цельную категорию.
+
+    Это моделирует реальный сбой Aptekonline: ответ 200 приходит, но одна
+    промежуточная страница пустая для всех sticky-сессий. Категория принимается
+    только после согласованного полного прохода, а не склейкой попыток.
+    """
+    _enable_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_PORTS", "30001-30003")
+    monkeypatch.setenv("APTEKONLINE_CATEGORY_RECOVERY_DELAY_SECONDS", "0")
+    route_attempts = {"count": 0}
+
+    class RecoveringPaginatorClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, _url, *, params):
+            page_num = int(dict(params)["page"])
+            if page_num == 1:
+                route_attempts["count"] += 1
+            recovered = route_attempts["count"] >= 4
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "url_id": "first" if page_num == 1 else "second",
+                            "name": "Product",
+                            "price": 1,
+                            "qaliq": 1,
+                        }
+                    ]
+                    if page_num == 1 or recovered
+                    else [],
+                    "total": 2,
+                    "current_page": page_num,
+                    "last_page": 2,
+                    "next_page_url": "next" if page_num == 1 else None,
+                },
+            )
+
+    with patch("src.scrapers.aptekonline.httpx.AsyncClient", RecoveringPaginatorClient):
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("114")]
+
+    assert route_attempts["count"] == 4
+    assert [product.external_id for product in products] == ["first", "second"]
     assert scraper._route_statuses["114"].complete is True
 
 
