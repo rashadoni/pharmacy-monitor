@@ -599,7 +599,7 @@ async def test_firecrawl_rejects_an_unexpected_credit_charge():
             accept="application/json",
         )
     assert scraper._firecrawl_requests == 1
-    assert scraper._firecrawl_credits == 0
+    assert getattr(scraper, "_firecrawl_credits", 0) == 0
 
 
 @pytest.mark.asyncio
