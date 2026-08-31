@@ -76,11 +76,7 @@ def test_recent_ok_run_returns_ok(db_session):
 def test_degraded_run_is_warning_and_changes_alert_signature(db_session):
     run = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
     run.error_message = "aloe=degraded(incomplete_items)"
-    run.run_quality = {
-        "sites": {
-            "aloe": {"status": "degraded", "reasons": ["incomplete_items"]}
-        }
-    }
+    run.run_quality = {"sites": {"aloe": {"status": "degraded", "reasons": ["incomplete_items"]}}}
     db_session.commit()
     report = check_health(db_session)
     assert report.status == "warning"
@@ -379,8 +375,7 @@ def test_failed_full_run_remains_critical(db_session):
 
     assert rep.status == "critical"
     assert any(
-        issue.code == "last_run_failed" and issue.severity == "critical"
-        for issue in rep.issues
+        issue.code == "last_run_failed" and issue.severity == "critical" for issue in rep.issues
     )
 
 

@@ -293,11 +293,7 @@ async def test_public_api_retries_a_transient_sitemap_failure_with_a_new_snapsho
 
     assert len(products) == 3
     assert scraper.sitemap_attempts == 2
-    product_calls = [
-        url
-        for url in scraper.requests
-        if "/api/products?" in url
-    ]
+    product_calls = [url for url in scraper.requests if "/api/products?" in url]
     assert [parse_qs(urlsplit(url).query)["page"][0] for url in product_calls] == [
         "1",
         "2",

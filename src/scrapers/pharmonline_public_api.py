@@ -1473,9 +1473,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
             await self._reset_catalog_attempt_state()
             try:
                 raw_rows, expected_total, expected_pages = await self._fetch_catalog_once()
-                products = [
-                    self._build_product(raw, category_id_to_path) for raw in raw_rows
-                ]
+                products = [self._build_product(raw, category_id_to_path) for raw in raw_rows]
                 if any(product is None for product in products):
                     raise PharmonlinePublicAPIError("products_mapping_failed")
                 catalog = [product for product in products if product is not None]

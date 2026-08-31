@@ -186,8 +186,7 @@ def check_health(
     unverified_sites: dict[str, dict] = {}
     if not full_attempts:
         unverified_sites = {
-            site: {"run_id": None, "status": "missing"}
-            for site in storage.FULL_CATALOG_SITES
+            site: {"run_id": None, "status": "missing"} for site in storage.FULL_CATALOG_SITES
         }
     else:
         for site in storage.FULL_CATALOG_SITES:
@@ -204,19 +203,19 @@ def check_health(
                 and site_status == "ok"
             )
             if not verified:
+                prior = fresh_verified_catalogs.get(site)
+                fresh_fallback = prior is not None and _run_explicitly_rejected_site(attempt, site)
                 unverified_sites[site] = {
                     "run_id": attempt.id,
                     "status": attempt.status,
                     "site_status": site_status,
+                    "fresh_verified_catalog": fresh_fallback,
                 }
-                prior = fresh_verified_catalogs.get(site)
-                if prior is not None:
+                if fresh_fallback:
                     unverified_sites[site].update(
                         {
                             "last_verified_run_id": prior.id,
-                            "last_verified_hours_ago": round(
-                                _run_age_hours(prior), 1
-                            ),
+                            "last_verified_hours_ago": round(_run_age_hours(prior), 1),
                         }
                     )
     if unverified_sites:
@@ -224,7 +223,7 @@ def check_health(
             "critical"
             if any(
                 (row.get("status") == "failed" or row.get("site_status") == "failed")
-                and site not in fresh_verified_catalogs
+                and not row.get("fresh_verified_catalog")
                 for site, row in unverified_sites.items()
             )
             else "warning"
@@ -233,7 +232,9 @@ def check_health(
             f"{site}=#{row.get('run_id') or '—'}:{row.get('site_status') or row['status']}"
             for site, row in unverified_sites.items()
         )
-        has_fresh_fallback = all(site in fresh_verified_catalogs for site in unverified_sites)
+        has_fresh_fallback = all(
+            row.get("fresh_verified_catalog") for row in unverified_sites.values()
+        )
         report.issues.append(
             HealthIssue(
                 severity,
@@ -320,10 +321,7 @@ def _fresh_verified_catalogs_by_site(
     if not run_ids:
         return {}
     runs = {
-        run.id: run
-        for run in session.scalars(
-            select(Run).where(Run.id.in_(set(run_ids.values())))
-        )
+        run.id: run for run in session.scalars(select(Run).where(Run.id.in_(set(run_ids.values()))))
     }
     fresh: dict[str, Run] = {}
     for site, run_id in run_ids.items():
@@ -338,12 +336,21 @@ def _run_has_fresh_verified_catalogs(run: Run, catalogs_by_site: dict[str, Run])
     """Whether every site in this failed full pass still has safe prior data."""
     if run.catalog_scope != "full":
         return False
-    sites = {
-        site.strip()
-        for site in (run.full_catalog_sites or "").split(",")
-        if site.strip()
-    }
-    return bool(sites) and sites.issubset(catalogs_by_site)
+    sites = {site.strip() for site in (run.full_catalog_sites or "").split(",") if site.strip()}
+    return bool(sites) and all(
+        site in catalogs_by_site and _run_explicitly_rejected_site(run, site) for site in sites
+    )
+
+
+def _run_explicitly_rejected_site(run: Run, site: str) -> bool:
+    """Whether a terminal run proves this source pass was rejected, not unknown.
+
+    Do not downgrade old or malformed failed-run records: an absent site-level
+    quality envelope does not prove that the prior verified catalog can safely
+    represent the failed attempt.
+    """
+    details = ((run.run_quality or {}).get("sites") or {}).get(site) or {}
+    return details.get("status") in {"failed", "degraded"}
 
 
 def alert_signature(report: HealthReport) -> str:
@@ -440,15 +447,12 @@ def _health_signature_matches(
     if last_state.get("version") == 2:
         return signature == last_state.get("signature")
     is_legacy = "version" not in last_state and "status" not in last_state
-    active_issues = [
-        issue for issue in report.issues if issue.severity in ("warning", "critical")
-    ]
+    active_issues = [issue for issue in report.issues if issue.severity in ("warning", "critical")]
     # V1 did not record severity or nested affected-site statuses. Reuse its
     # cooldown only when that lost identity cannot hide an escalation/change;
     # otherwise send once immediately and upgrade the state to v2.
     legacy_identity_is_safe = bool(active_issues) and all(
-        issue.severity == "warning" and "sites" not in issue.context
-        for issue in active_issues
+        issue.severity == "warning" and "sites" not in issue.context for issue in active_issues
     )
     return (
         is_legacy
@@ -933,22 +937,23 @@ def _check_site_zero_scrape(
                 seen.add(site)
                 if (pps.get(site) or 0) == 0:
                     prior = fresh_verified_catalogs.get(site)
+                    fresh_fallback = prior is not None and _run_explicitly_rejected_site(run, site)
                     issues.append(
                         HealthIssue(
-                            "warning" if prior is not None else "critical",
+                            "warning" if fresh_fallback else "critical",
                             "site_zero_scrape",
                             (
                                 f"Сайт {site}: последний прогон #{run.id} собрал 0 товаров, "
                                 f"но сохранён свежий проверенный каталог #{prior.id}."
-                                if prior is not None
+                                if fresh_fallback
                                 else f"Сайт {site}: последний прогон #{run.id} собрал 0 товаров "
                                 "(сайт лёг / прокси упал / сменилась вёрстка?)."
                             ),
                             context={
                                 "site": site,
                                 "run_id": run.id,
-                                "fresh_verified_catalog": prior is not None,
-                                "last_verified_run_id": prior.id if prior is not None else None,
+                                "fresh_verified_catalog": fresh_fallback,
+                                "last_verified_run_id": prior.id if fresh_fallback else None,
                             },
                         )
                     )
