@@ -85,6 +85,10 @@ _MAX_DECODO_STICKY_PORTS = 64
 _PUBLIC_API_TRANSPORT_ENV = "PHARMONLINE_PUBLIC_API_TRANSPORT"
 _DECODO_BACKCONNECT_STICKY_ENV = "PHARMONLINE_DECODO_BACKCONNECT_STICKY"
 _FIRECRAWL_MAX_REQUESTS_ENV = "PHARMONLINE_FIRECRAWL_MAX_REQUESTS"
+_CATALOG_ATTEMPTS_ENV = "PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS"
+_CATALOG_RETRY_DELAY_SECONDS_ENV = "PHARMONLINE_PUBLIC_API_CATALOG_RETRY_DELAY_SECONDS"
+_MAX_CATALOG_ATTEMPTS = 3
+_DEFAULT_DECODO_CATALOG_RETRY_DELAY_SECONDS = 60
 _CRAWLBASE_TRANSPORT = "crawlbase"
 _DECODO_TRANSPORT = "decodo"
 _SCRAPERAPI_TRANSPORT = "scraperapi"
@@ -684,6 +688,66 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if self._transport_name() == _SCRAPERAPI_TRANSPORT:
             return f"scraperapi-sitemap-{secrets.token_hex(16)}"
         return secrets.token_hex(16)
+
+    def _catalog_attempt_limit(self) -> int:
+        """Return a bounded number of fresh whole-catalog reads.
+
+        The internal retry is deliberately limited to Decodo by default: it
+        is the production transport with an explicit fresh-session contract.
+        Other transports keep their existing one-pass semantics unless an
+        operator explicitly opts in.  A retry never reuses any row from the
+        rejected pass.
+        """
+        default = _MAX_CATALOG_ATTEMPTS if self._transport_name() == _DECODO_TRANSPORT else 1
+        raw = os.environ.get(_CATALOG_ATTEMPTS_ENV, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            return default
+        return min(_MAX_CATALOG_ATTEMPTS, max(1, value))
+
+    def _catalog_retry_delay_seconds(self) -> int:
+        """Return the bounded cooling period between discarded Decodo reads."""
+        default = (
+            _DEFAULT_DECODO_CATALOG_RETRY_DELAY_SECONDS
+            if self._transport_name() == _DECODO_TRANSPORT
+            else 0
+        )
+        raw = os.environ.get(_CATALOG_RETRY_DELAY_SECONDS_ENV, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            return default
+        return min(300, max(0, value))
+
+    async def _reset_catalog_attempt_state(self) -> None:
+        """Discard every sticky context owned by a rejected catalog snapshot.
+
+        The catalog is a single atomic observation.  Reusing a proxy client,
+        cookie jar or cache-context after a rejected pass could join two
+        source variants; start the next pass with new logical sessions instead.
+        """
+        self._catalog_sessions = {}
+        self._origin_contexts = {}
+
+        if self._transport_name() == _DECODO_TRANSPORT:
+            clients = list(getattr(self, "_decodo_clients", {}).values())
+            self._decodo_clients = {}
+            self._decodo_session_ports = {}
+            self._decodo_default_session = f"decodo-category-{secrets.token_hex(16)}"
+            for client in clients:
+                await client.aclose()
+        elif self._transport_name() == _SCRAPERAPI_TRANSPORT:
+            clients = list(getattr(self, "_scraperapi_clients", {}).values())
+            self._scraperapi_clients = {}
+            self._scraperapi_session_numbers = {}
+            self._scraperapi_default_session = f"scraperapi-category-{secrets.token_hex(16)}"
+            for client in clients:
+                await client.aclose()
 
     async def _crawlbase_body(
         self,
@@ -1324,11 +1388,8 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                     pending.extend(nested)
         return out
 
-    async def _fetch_catalog(self) -> tuple[list[dict], int, int]:
-        # A scraper instance is normally used once, but reset this map so a
-        # retry in the same process never turns a short chunk context into a
-        # long-lived one.
-        self._catalog_sessions = {}
+    async def _fetch_catalog_once(self) -> tuple[list[dict], int, int]:
+        """Read exactly one complete product-API snapshot, or reject it."""
         first_payload = await self._source_json(
             self._product_api_url(1),
             crawlbase_session=self._catalog_session_for_page(1),
@@ -1395,6 +1456,79 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if len(rows) != expected_total or len(seen_ids) != expected_total:
             raise PharmonlinePublicAPIError("products_total_coverage_mismatch")
         return rows, expected_total, expected_pages
+
+    async def _fetch_verified_catalog(
+        self,
+        category_id_to_path: dict[str, str],
+    ) -> tuple[list[ScrapedProduct], int, int]:
+        """Return one proven catalog after bounded fresh-snapshot retries.
+
+        Retry only failures that explicitly mean the *entire* source snapshot
+        was discarded (a pagination transition, a transient Decodo request,
+        or an empty sitemap response).  Identity, duplicate and coverage
+        failures remain fail-closed and are never retried into persistence.
+        """
+        attempts = self._catalog_attempt_limit()
+        for attempt in range(1, attempts + 1):
+            await self._reset_catalog_attempt_state()
+            try:
+                raw_rows, expected_total, expected_pages = await self._fetch_catalog_once()
+                products = [
+                    self._build_product(raw, category_id_to_path) for raw in raw_rows
+                ]
+                if any(product is None for product in products):
+                    raise PharmonlinePublicAPIError("products_mapping_failed")
+                catalog = [product for product in products if product is not None]
+                api_urls = {product.url for product in catalog}
+                sitemap_urls = await self._fetch_sitemap_product_urls()
+                if len(catalog) != expected_total or not _sitemap_covers_api_catalog(
+                    api_urls, sitemap_urls
+                ):
+                    api_only = api_urls - sitemap_urls
+                    sitemap_only = sitemap_urls - api_urls
+                    # Counts and stable fingerprints make a rejected no-write
+                    # recovery diagnosable without putting public product paths
+                    # (or proxy diagnostics) into application logs.
+                    log.warning(
+                        "pharmonline_public_api_sitemap_mismatch",
+                        expected_total=expected_total,
+                        api_urls=len(api_urls),
+                        sitemap_urls=len(sitemap_urls),
+                        api_only=len(api_only),
+                        sitemap_only=len(sitemap_only),
+                        api_only_fingerprint=hashlib.sha256(
+                            "\n".join(sorted(api_only)).encode()
+                        ).hexdigest()[:16],
+                        sitemap_only_fingerprint=hashlib.sha256(
+                            "\n".join(sorted(sitemap_only)).encode()
+                        ).hexdigest()[:16],
+                    )
+                    raise PharmonlinePublicAPIError("products_sitemap_set_mismatch")
+                if api_urls != sitemap_urls:
+                    log.info(
+                        "pharmonline_public_api_sitemap_lag_accepted",
+                        expected_total=expected_total,
+                        api_urls=len(api_urls),
+                        sitemap_urls=len(sitemap_urls),
+                        api_only=len(api_urls - sitemap_urls),
+                        sitemap_coverage=round(len(sitemap_urls) / len(api_urls), 6),
+                    )
+                return catalog, expected_total, expected_pages
+            except PharmonlinePublicAPIError as exc:
+                reason = str(exc)[:200]
+                if attempt >= attempts or not is_retryable_full_catalog_abort_reason(reason):
+                    raise
+                delay = self._catalog_retry_delay_seconds()
+                log.warning(
+                    "pharmonline_public_api_catalog_snapshot_retry",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    delay_seconds=delay,
+                    reason=reason,
+                )
+                if delay:
+                    await asyncio.sleep(delay)
+        raise AssertionError("catalog retry loop exhausted without a terminal result")
 
     async def _fetch_sitemap_product_urls(self) -> set[str]:
         # Sitemap traffic must not extend either a catalog chunk or the
@@ -1539,45 +1673,9 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                     "pharmonline_public_api_category_map_unavailable",
                     reason=str(exc)[:200],
                 )
-            raw_rows, expected_total, expected_pages = await self._fetch_catalog()
-            products = [self._build_product(raw, category_id_to_path) for raw in raw_rows]
-            if any(product is None for product in products):
-                raise PharmonlinePublicAPIError("products_mapping_failed")
-            catalog = [product for product in products if product is not None]
-            api_urls = {product.url for product in catalog}
-            sitemap_urls = await self._fetch_sitemap_product_urls()
-            if len(catalog) != expected_total or not _sitemap_covers_api_catalog(
-                api_urls, sitemap_urls
-            ):
-                api_only = api_urls - sitemap_urls
-                sitemap_only = sitemap_urls - api_urls
-                # Counts and stable fingerprints make a rejected no-write
-                # recovery diagnosable without putting public product paths
-                # (or proxy diagnostics) into application logs.
-                log.warning(
-                    "pharmonline_public_api_sitemap_mismatch",
-                    expected_total=expected_total,
-                    api_urls=len(api_urls),
-                    sitemap_urls=len(sitemap_urls),
-                    api_only=len(api_only),
-                    sitemap_only=len(sitemap_only),
-                    api_only_fingerprint=hashlib.sha256(
-                        "\n".join(sorted(api_only)).encode()
-                    ).hexdigest()[:16],
-                    sitemap_only_fingerprint=hashlib.sha256(
-                        "\n".join(sorted(sitemap_only)).encode()
-                    ).hexdigest()[:16],
-                )
-                raise PharmonlinePublicAPIError("products_sitemap_set_mismatch")
-            if api_urls != sitemap_urls:
-                log.info(
-                    "pharmonline_public_api_sitemap_lag_accepted",
-                    expected_total=expected_total,
-                    api_urls=len(api_urls),
-                    sitemap_urls=len(sitemap_urls),
-                    api_only=len(api_urls - sitemap_urls),
-                    sitemap_coverage=round(len(sitemap_urls) / len(api_urls), 6),
-                )
+            catalog, expected_total, expected_pages = await self._fetch_verified_catalog(
+                category_id_to_path
+            )
         except SiteScrapeFatalError:
             raise
         except PharmonlinePublicAPIError as exc:

@@ -384,6 +384,46 @@ def test_failed_full_run_remains_critical(db_session):
     )
 
 
+def test_failed_full_refresh_is_warning_when_prior_verified_catalog_is_fresh(db_session):
+    """A transient source failure must not claim that safe client data vanished."""
+    verified = _add_run(db_session, utcnow() - timedelta(hours=2))
+    verified.run_quality = {
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {
+            "pharmonline": {"status": "ok"},
+            "aptekonline": {"status": "ok"},
+            "aloe": {"status": "ok"},
+        },
+    }
+    failed = _add_run(db_session, utcnow() - timedelta(hours=1), status="failed")
+    failed.catalog_scope = "full"
+    failed.full_catalog_sites = "pharmonline"
+    failed.error_message = "RunQualityFailure: pharmonline=failed(zero_products)"
+    failed.products_per_site = {"pharmonline": 0}
+    failed.run_quality = {
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {"pharmonline": {"status": "failed"}},
+    }
+    db_session.commit()
+
+    report = check_health(db_session)
+
+    assert report.status == "warning"
+    last_failed = next(issue for issue in report.issues if issue.code == "last_run_failed")
+    catalog_issue = next(
+        issue for issue in report.issues if issue.code == "full_catalog_unverified"
+    )
+    assert last_failed.severity == "warning"
+    assert last_failed.context["fresh_verified_catalog"] is True
+    assert catalog_issue.severity == "warning"
+    assert catalog_issue.context["sites"]["pharmonline"]["last_verified_run_id"] == verified.id
+    zero_scrape = next(issue for issue in report.issues if issue.code == "site_zero_scrape")
+    assert zero_scrape.severity == "warning"
+    assert zero_scrape.context["last_verified_run_id"] == verified.id
+
+
 def test_degraded_full_run_critical(db_session):
     run = _add_run(db_session, utcnow() - timedelta(hours=1), status="degraded")
     run.catalog_scope = "full"

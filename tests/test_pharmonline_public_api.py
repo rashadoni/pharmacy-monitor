@@ -226,6 +226,87 @@ async def test_public_api_rejects_a_chunk_when_its_page_one_anchor_changes(monke
 
 
 @pytest.mark.asyncio
+async def test_public_api_retries_a_discarded_catalog_snapshot_from_fresh_contexts(monkeypatch):
+    """A transient paginator change must not create a second failed run."""
+    expected_urls = {f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)}
+
+    class _ChangesOnceScraper(_FakePublicAPIScraper):
+        failed_once = False
+
+        async def _crawlbase_json(
+            self,
+            target_url: str,
+            *,
+            crawlbase_session: str | None = None,
+        ):
+            payload = await super()._crawlbase_json(
+                target_url,
+                crawlbase_session=crawlbase_session,
+            )
+            if "/api/products?" not in target_url:
+                return payload
+            page = int(parse_qs(urlsplit(target_url).query)["page"][0])
+            if page == 2 and not self.failed_once:
+                self.failed_once = True
+                return {"data": [_raw_product(3)], "total": 4, "pages": 2}
+            return payload
+
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS", "2")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_CATALOG_RETRY_DELAY_SECONDS", "0")
+    scraper = _ChangesOnceScraper(_pages(), sitemap_urls=expected_urls)
+
+    products = [product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)]
+
+    assert [product.external_id for product in products] == [
+        "PRODUCT0000000001",
+        "PRODUCT0000000002",
+        "PRODUCT0000000003",
+    ]
+    product_calls = [
+        (parse_qs(urlsplit(url).query)["page"][0], session)
+        for url, session in scraper.crawlbase_sessions
+        if "/api/products?" in url
+    ]
+    assert [page for page, _ in product_calls] == ["1", "2", "1", "2"]
+    assert product_calls[0][1] != product_calls[2][1]
+    assert scraper._route_statuses[PUBLIC_CATALOG_ROUTE].complete is True
+
+
+@pytest.mark.asyncio
+async def test_public_api_retries_a_transient_sitemap_failure_with_a_new_snapshot(monkeypatch):
+    expected_urls = {f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)}
+
+    class _EmptySitemapOnceScraper(_FakePublicAPIScraper):
+        sitemap_attempts = 0
+
+        async def _fetch_sitemap_product_urls(self) -> set[str]:
+            self.sitemap_attempts += 1
+            if self.sitemap_attempts == 1:
+                raise PharmonlinePublicAPIError("product_sitemap_empty")
+            return self._sitemap_urls
+
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS", "2")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_CATALOG_RETRY_DELAY_SECONDS", "0")
+    scraper = _EmptySitemapOnceScraper(_pages(), sitemap_urls=expected_urls)
+
+    products = [product async for product in scraper.scrape_category(PUBLIC_CATALOG_ROUTE)]
+
+    assert len(products) == 3
+    assert scraper.sitemap_attempts == 2
+    product_calls = [
+        url
+        for url in scraper.requests
+        if "/api/products?" in url
+    ]
+    assert [parse_qs(urlsplit(url).query)["page"][0] for url in product_calls] == [
+        "1",
+        "2",
+        "1",
+        "2",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_public_api_rejects_duplicate_id_before_any_yield():
     expected_urls = {f"https://pharmonline.az/product/product-{index}" for index in (1, 2, 3)}
     scraper = _FakePublicAPIScraper(
