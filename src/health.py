@@ -102,65 +102,6 @@ def check_health(
             )
         )
 
-    # 2. Failed/degraded check.  ``degraded`` means the process returned but a
-    # nominal full catalog could not prove item-level completeness; treating it
-    # as healthy would reopen financial output on partial source data. It is a
-    # warning unless the site-level details below prove a full site failure.
-    if last_run.status == "failed":
-        issue_code = "last_run_failed"
-        # A bounded/watchlist run is an operational probe, not a catalog epoch.
-        # Its failure must stay visible, but it must not claim that the trusted
-        # full catalog is broken.  Legacy/unknown runs remain critical because
-        # we cannot safely prove that they were partial.
-        failed_severity: Severity = (
-            "warning" if last_run.catalog_scope == "partial" else "critical"
-        )
-        report.issues.append(
-            HealthIssue(
-                failed_severity,
-                issue_code,
-                f"Последний прогон #{last_run.id} завершился со статусом "
-                f"{last_run.status}: {last_run.error_message or '?'}",
-                context={
-                    "run_id": last_run.id,
-                    "error": last_run.error_message,
-                    "catalog_scope": last_run.catalog_scope,
-                },
-            )
-        )
-
-    if last_run.status == "degraded":
-        quality = last_run.run_quality or {}
-        degraded_severity: Severity = (
-            "critical"
-            if last_run.catalog_scope == "full" and not last_run.catalog_verified
-            else "warning"
-        )
-        report.issues.append(
-            HealthIssue(
-                degraded_severity,
-                "last_run_degraded",
-                f"Прогон #{last_run.id} завершён частично: "
-                f"{last_run.error_message or 'см. run_quality'}",
-                context={"run_id": last_run.id, "run_quality": quality},
-            )
-        )
-        for site, details in (quality.get("sites") or {}).items():
-            if details.get("status") != "failed":
-                continue
-            report.issues.append(
-                HealthIssue(
-                    "critical",
-                    "degraded_site_failed",
-                    f"Сайт {site} не дал пригодного результата в прогоне #{last_run.id}.",
-                    context={
-                        "site": site,
-                        "run_id": last_run.id,
-                        "reasons": details.get("reasons") or [],
-                    },
-                )
-            )
-
     # A later partial tick may be operationally healthy, but it must never
     # clear the trust failure of the most recent full-catalog attempt.
     full_attempts = storage.latest_full_catalog_attempts_by_site(
@@ -168,11 +109,84 @@ def check_health(
         storage.FULL_CATALOG_SITES,
         tenant_id=1,
     )
+    fresh_verified_catalogs = _fresh_verified_catalogs_by_site(
+        session,
+        storage,
+        max_age_hours=max_age_hours,
+    )
+
+    # 2. Failed/degraded check. A bounded/watchlist failure is never a
+    # catalog epoch. Equally, a rejected full refresh must stay visible but
+    # may not be escalated to an outage while the same sites still have a
+    # recent, financially verified catalog. This prevents transient Decodo
+    # cache/pagination failures from claiming that client data disappeared.
+    last_run_has_fresh_verified_catalog = _run_has_fresh_verified_catalogs(
+        last_run,
+        fresh_verified_catalogs,
+    )
+    if last_run.status == "failed":
+        failed_severity: Severity = (
+            "warning"
+            if last_run.catalog_scope == "partial" or last_run_has_fresh_verified_catalog
+            else "critical"
+        )
+        report.issues.append(
+            HealthIssue(
+                failed_severity,
+                "last_run_failed",
+                f"Последний прогон #{last_run.id} завершился со статусом "
+                f"{last_run.status}: {last_run.error_message or '?'}",
+                context={
+                    "run_id": last_run.id,
+                    "error": last_run.error_message,
+                    "catalog_scope": last_run.catalog_scope,
+                    "fresh_verified_catalog": last_run_has_fresh_verified_catalog,
+                },
+            )
+        )
+
+    if last_run.status == "degraded":
+        quality = last_run.run_quality or {}
+        degraded_severity: Severity = (
+            "warning"
+            if last_run_has_fresh_verified_catalog
+            or not (last_run.catalog_scope == "full" and not last_run.catalog_verified)
+            else "critical"
+        )
+        report.issues.append(
+            HealthIssue(
+                degraded_severity,
+                "last_run_degraded",
+                f"Прогон #{last_run.id} завершён частично: "
+                f"{last_run.error_message or 'см. run_quality'}",
+                context={
+                    "run_id": last_run.id,
+                    "run_quality": quality,
+                    "fresh_verified_catalog": last_run_has_fresh_verified_catalog,
+                },
+            )
+        )
+        for site, details in (quality.get("sites") or {}).items():
+            if details.get("status") != "failed":
+                continue
+            report.issues.append(
+                HealthIssue(
+                    "warning" if site in fresh_verified_catalogs else "critical",
+                    "degraded_site_failed",
+                    f"Сайт {site} не дал пригодного результата в прогоне #{last_run.id}.",
+                    context={
+                        "site": site,
+                        "run_id": last_run.id,
+                        "reasons": details.get("reasons") or [],
+                        "fresh_verified_catalog": site in fresh_verified_catalogs,
+                    },
+                )
+            )
+
     unverified_sites: dict[str, dict] = {}
     if not full_attempts:
         unverified_sites = {
-            site: {"run_id": None, "status": "missing"}
-            for site in storage.FULL_CATALOG_SITES
+            site: {"run_id": None, "status": "missing"} for site in storage.FULL_CATALOG_SITES
         }
     else:
         for site in storage.FULL_CATALOG_SITES:
@@ -189,17 +203,28 @@ def check_health(
                 and site_status == "ok"
             )
             if not verified:
+                prior = fresh_verified_catalogs.get(site)
+                fresh_fallback = prior is not None and _run_explicitly_rejected_site(attempt, site)
                 unverified_sites[site] = {
                     "run_id": attempt.id,
                     "status": attempt.status,
                     "site_status": site_status,
+                    "fresh_verified_catalog": fresh_fallback,
                 }
+                if fresh_fallback:
+                    unverified_sites[site].update(
+                        {
+                            "last_verified_run_id": prior.id,
+                            "last_verified_hours_ago": round(_run_age_hours(prior), 1),
+                        }
+                    )
     if unverified_sites:
         severity: Severity = (
             "critical"
             if any(
-                row.get("status") == "failed" or row.get("site_status") == "failed"
-                for row in unverified_sites.values()
+                (row.get("status") == "failed" or row.get("site_status") == "failed")
+                and not row.get("fresh_verified_catalog")
+                for site, row in unverified_sites.items()
             )
             else "warning"
         )
@@ -207,12 +232,24 @@ def check_health(
             f"{site}=#{row.get('run_id') or '—'}:{row.get('site_status') or row['status']}"
             for site, row in unverified_sites.items()
         )
+        has_fresh_fallback = all(
+            row.get("fresh_verified_catalog") for row in unverified_sites.values()
+        )
         report.issues.append(
             HealthIssue(
                 severity,
                 "full_catalog_unverified",
-                f"Полный каталог не подтверждён: {summary}.",
-                context={"sites": unverified_sites},
+                (
+                    "Новое полное обновление не подтверждено, но сохранён "
+                    "свежий проверенный каталог: "
+                    if has_fresh_fallback
+                    else "Полный каталог не подтверждён: "
+                )
+                + f"{summary}.",
+                context={
+                    "sites": unverified_sites,
+                    "fresh_verified_catalog": has_fresh_fallback,
+                },
             )
         )
 
@@ -243,11 +280,12 @@ def check_health(
     report.issues.extend(_check_site_silence(session, max_age_hours))
 
     # 8. Полный отказ сайта: последний прогон, включавший сайт, собрал РОВНО 0
-    # товаров → critical сразу (в течение часа), не дожидаясь суточного порога
-    # site_silent. Раньше это терялось: smoke-test пропускал `current == 0`, а
+    # товаров → немедленный сигнал (critical, если нет свежего подтверждённого
+    # каталога), не дожидаясь суточного порога site_silent. Раньше это терялось:
+    # smoke-test пропускал `current == 0`, а
     # `empty_run` смотрит только на последний прогон в принципе (его маскировал
     # intraday-прогон другого сайта).
-    report.issues.extend(_check_site_zero_scrape(session))
+    report.issues.extend(_check_site_zero_scrape(session, fresh_verified_catalogs))
 
     # Совокупный статус
     if any(i.severity == "critical" for i in report.issues):
@@ -256,6 +294,63 @@ def check_health(
         report.status = "warning"
 
     return report
+
+
+def _run_age_hours(run: Run) -> float:
+    observed_at = run.finished_at or run.started_at
+    return max(0.0, (utcnow() - observed_at).total_seconds() / 3600)
+
+
+def _fresh_verified_catalogs_by_site(
+    session: Session,
+    storage_module,
+    *,
+    max_age_hours: int,
+) -> dict[str, Run]:
+    """Return site catalogs that are still safe to serve after a failed refresh.
+
+    This is deliberately based on the financial eligibility lineage, not on
+    product `last_seen_at`: a rejected run must never masquerade as a verified
+    catalog merely because it reached the scraper before being discarded.
+    """
+    run_ids = storage_module.latest_financial_run_ids_by_site(
+        session,
+        storage_module.FULL_CATALOG_SITES,
+        tenant_id=1,
+    )
+    if not run_ids:
+        return {}
+    runs = {
+        run.id: run for run in session.scalars(select(Run).where(Run.id.in_(set(run_ids.values()))))
+    }
+    fresh: dict[str, Run] = {}
+    for site, run_id in run_ids.items():
+        run = runs.get(run_id)
+        threshold = _SITE_MAX_AGE_HOURS.get(site, max_age_hours)
+        if run is not None and _run_age_hours(run) <= threshold:
+            fresh[site] = run
+    return fresh
+
+
+def _run_has_fresh_verified_catalogs(run: Run, catalogs_by_site: dict[str, Run]) -> bool:
+    """Whether every site in this failed full pass still has safe prior data."""
+    if run.catalog_scope != "full":
+        return False
+    sites = {site.strip() for site in (run.full_catalog_sites or "").split(",") if site.strip()}
+    return bool(sites) and all(
+        site in catalogs_by_site and _run_explicitly_rejected_site(run, site) for site in sites
+    )
+
+
+def _run_explicitly_rejected_site(run: Run, site: str) -> bool:
+    """Whether a terminal run proves this source pass was rejected, not unknown.
+
+    Do not downgrade old or malformed failed-run records: an absent site-level
+    quality envelope does not prove that the prior verified catalog can safely
+    represent the failed attempt.
+    """
+    details = ((run.run_quality or {}).get("sites") or {}).get(site) or {}
+    return details.get("status") in {"failed", "degraded"}
 
 
 def alert_signature(report: HealthReport) -> str:
@@ -352,15 +447,12 @@ def _health_signature_matches(
     if last_state.get("version") == 2:
         return signature == last_state.get("signature")
     is_legacy = "version" not in last_state and "status" not in last_state
-    active_issues = [
-        issue for issue in report.issues if issue.severity in ("warning", "critical")
-    ]
+    active_issues = [issue for issue in report.issues if issue.severity in ("warning", "critical")]
     # V1 did not record severity or nested affected-site statuses. Reuse its
     # cooldown only when that lost identity cannot hide an escalation/change;
     # otherwise send once immediately and upgrade the state to v2.
     legacy_identity_is_safe = bool(active_issues) and all(
-        issue.severity == "warning" and "sites" not in issue.context
-        for issue in active_issues
+        issue.severity == "warning" and "sites" not in issue.context for issue in active_issues
     )
     return (
         is_legacy
@@ -810,8 +902,11 @@ def _check_site_silence(session: Session, max_age_hours: int = 26) -> list[Healt
     return issues
 
 
-def _check_site_zero_scrape(session: Session) -> list[HealthIssue]:
-    """Per-site: последний прогон, ВКЛЮЧАВШИЙ сайт, собрал РОВНО 0 товаров → critical.
+def _check_site_zero_scrape(
+    session: Session,
+    fresh_verified_catalogs: dict[str, Run] | None = None,
+) -> list[HealthIssue]:
+    """Report a zero scrape, preserving the severity of a real stale outage.
 
     Ловит полный отказ сайта (лёг / прокси умер / сменилась вёрстка) в течение
     часа (hourly health-check + --alert-email), не дожидаясь порога site_silent
@@ -819,11 +914,15 @@ def _check_site_zero_scrape(session: Session) -> list[HealthIssue]:
     0 товаров, но не алертнул — `_smoke_test_per_site_coverage` пропускал
     `current == 0` (самый худший случай!), а `empty_run` маскировался intraday.
 
+    Если сохранён свежий финансово подтверждённый каталог этого сайта, сигнал
+    остаётся warning: данные клиента не пропали, но обновление требует внимания.
+
     Порог именно ==0: intraday-блипы (частичные ~100-250 шт) НЕ триггерят. Берём
     последний прогон С ЭТИМ сайтом в `products_per_site`, поэтому intraday-прогон
     другого сайта (pharmonline featured) не маскирует 0 у aloe/aptek.
     """
     sites = {"pharmonline", "aptekonline", "aloe"}
+    fresh_verified_catalogs = fresh_verified_catalogs or {}
     issues: list[HealthIssue] = []
     seen: set[str] = set()
     # limit с запасом: intraday-прогоны (hourly, pharmonline) плодят ~24 Run/день,
@@ -837,13 +936,25 @@ def _check_site_zero_scrape(session: Session) -> list[HealthIssue]:
             if site in pps:
                 seen.add(site)
                 if (pps.get(site) or 0) == 0:
+                    prior = fresh_verified_catalogs.get(site)
+                    fresh_fallback = prior is not None and _run_explicitly_rejected_site(run, site)
                     issues.append(
                         HealthIssue(
-                            "critical",
+                            "warning" if fresh_fallback else "critical",
                             "site_zero_scrape",
-                            f"Сайт {site}: последний прогон #{run.id} собрал 0 товаров "
-                            f"(сайт лёг / прокси упал / сменилась вёрстка?).",
-                            context={"site": site, "run_id": run.id},
+                            (
+                                f"Сайт {site}: последний прогон #{run.id} собрал 0 товаров, "
+                                f"но сохранён свежий проверенный каталог #{prior.id}."
+                                if fresh_fallback
+                                else f"Сайт {site}: последний прогон #{run.id} собрал 0 товаров "
+                                "(сайт лёг / прокси упал / сменилась вёрстка?)."
+                            ),
+                            context={
+                                "site": site,
+                                "run_id": run.id,
+                                "fresh_verified_catalog": fresh_fallback,
+                                "last_verified_run_id": prior.id if fresh_fallback else None,
+                            },
                         )
                     )
         if seen == sites:

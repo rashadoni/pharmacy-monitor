@@ -255,39 +255,34 @@ jobs:
             ''|*[!0-9]*) echo 'could not determine prior run ID' >&2; exit 1 ;;
           esac
 
-          attempt=1
+          # The scraper owns the bounded retry loop. It discards an entire
+          # rejected snapshot, recreates all sticky Decodo contexts and only
+          # then retries. Running three separate CLI commands here used to
+          # create three failed Run records (and three customer-facing health
+          # incidents) for one transient source fluctuation.
           succeeded=0
-          while [ "$attempt" -le 3 ]; do
-            echo "autonomous verified catalog attempt ${attempt}/3"
-            if PHARMONLINE_PUBLIC_API=required \
-              PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
-              PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
-              PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \
-              PHARMONLINE_USE_DDP=0 \
-              AI_FALLBACK_ENABLED=0 \
-              SCRAPE_REPORT_EMAIL=0 \
-              PYTHONDONTWRITEBYTECODE=1 \
-              PYTHONPATH="$runtime_dir" \
-              /opt/pharmacy-monitor/.venv/bin/python -m src.main run \
-                --site pharmonline \
-                --mode public_api
-            then
-              succeeded=1
-              break
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              # A public-API rate limit or a transient empty sitemap must use
-              # a fresh proxy session after a real cooling period.  The data
-              # guards reject failed passes before product persistence.
-              echo 'attempt failed; waiting 300s before a fresh Decodo session' >&2
-              sleep 300
-            fi
-            attempt=$((attempt + 1))
-          done
+          echo 'autonomous verified catalog attempt (internally bounded to three fresh snapshots)'
+          if PHARMONLINE_PUBLIC_API=required \
+            PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
+            PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
+            PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS=3 \
+            PHARMONLINE_PUBLIC_API_CATALOG_RETRY_DELAY_SECONDS=60 \
+            PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \
+            PHARMONLINE_USE_DDP=0 \
+            AI_FALLBACK_ENABLED=0 \
+            SCRAPE_REPORT_EMAIL=0 \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python -m src.main run \
+              --site pharmonline \
+              --mode public_api
+          then
+            succeeded=1
+          fi
 
           # Firecrawl is an explicit, budgeted whole-catalog fallback, never
-          # a silent substitute for Decodo.  It runs only after all three
-          # fresh Decodo attempts have failed, and only when the production
+          # a silent substitute for Decodo.  It runs only after the scraper
+          # has exhausted its three fresh Decodo snapshots, and only when the production
           # EnvironmentFile contains both its key and this exact opt-in.
           if [ "$succeeded" -ne 1 ]; then
             case "${PHARMONLINE_PUBLIC_API_FIRECRAWL_FALLBACK:-}" in
