@@ -40,7 +40,8 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 ## Current production state (last updated: 2026-05-27)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
-**Login**: `admin` / `pharmacy2026`
+**Login**: `admin` (или email админа `rashadrahimov@gmail.com`) / `password2026!` — сброшен 2026-09-02 через одноразовый workflow `reset-admin-password.yml`.
+⚠️ Пароль живёт в `tenant_users.password_hash` (bcrypt), а НЕ в env: `auth_login` берёт `user.password_hash or env ADMIN_PASSWORD_HASH`, поэтому env-переменная — только bootstrap-фолбэк и с момента первой смены пароля не действует. Прежний `pharmacy2026` мёртв с 2026-08-23.
 **Server**: Hetzner cx33 (Falkenstein DE), 4 vCPU / 8GB / 80GB · €7.99/mo · IP `46.225.149.52`
 **SSH**: `ssh -i ~/.ssh/id_ed25519 root@46.225.149.52` (root + pm users active; pm home is `/opt/pharmacy-monitor`, NOT `/home/pm`; `pm` does not have passwordless sudo — use root for systemctl/sudo ops)
 **DNS**: leaddrive.cloud at Namecheap; A `@` and `www` → 46.225.149.52
