@@ -40,7 +40,7 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' \
-            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
             > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
           host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
@@ -54,7 +54,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 'bash -s' <<'REMOTE'
+            pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
 
           # Do not spend proxy credits or contend with the scheduled

@@ -59,7 +59,7 @@ jobs:
           mkdir -p ~/.ssh
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H 13.140.186.143 >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Open SSH tunnel to prod Postgres
         run: |
@@ -67,7 +67,7 @@ jobs:
             -o ExitOnForwardFailure=yes \
             -o ServerAliveInterval=30 \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 &
+            pm@13.140.186.143 &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
           # Подождать пока туннель встанет (до 15с)
           for i in $(seq 1 30); do

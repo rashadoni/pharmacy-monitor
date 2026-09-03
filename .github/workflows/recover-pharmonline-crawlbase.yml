@@ -52,12 +52,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H 13.140.186.143 >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Preflight production capacity and scraper state
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'bash -s' <<'REMOTE'
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           min_available_kib=$((4 * 1024 * 1024))
           max_swap_kib=$((2 * 1024 * 1024))
@@ -96,7 +96,7 @@ jobs:
             -o ExitOnForwardFailure=yes \
             -o ServerAliveInterval=30 \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 &
+            pm@13.140.186.143 &
           echo "TUNNEL_PID=$!" >> "$GITHUB_ENV"
           for _ in $(seq 1 30); do
             if nc -z localhost 5433 2>/dev/null; then

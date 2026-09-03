@@ -20,12 +20,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H 13.140.186.143 >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Run full aptekonline scrape on production
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             cd /opt/pharmacy-monitor
             if systemctl is-active --quiet pharmacy-monitor-scrape@aptekonline.service; then
               echo "an aptekonline systemd scrape is already running; waiting for it"

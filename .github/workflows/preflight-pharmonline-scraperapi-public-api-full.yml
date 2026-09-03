@@ -54,7 +54,7 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' \
-            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
             > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
           host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
@@ -68,7 +68,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 'bash -s' <<'REMOTE'
+            pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           min_available_kib=$((4 * 1024 * 1024))
           max_swap_kib=$((2 * 1024 * 1024))
@@ -113,7 +113,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 'bash -s' <<'REMOTE'
+            pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           work_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-scraperapi-preflight.XXXXXX)
           mkdir -p "$work_dir/incoming" "$work_dir/runtime/src" "$work_dir/runtime/scripts"
@@ -134,20 +134,20 @@ jobs:
           rsync -az --checksum --delete --no-perms --no-owner --no-group \
             --exclude '__pycache__/' \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            src/ "pm@46.225.149.52:$remote_work_dir/runtime/src/"
+            src/ "pm@13.140.186.143:$remote_work_dir/runtime/src/"
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
             scripts/preflight_pharmonline_public_api.py \
-            "pm@46.225.149.52:$remote_work_dir/runtime/scripts/preflight_pharmonline_public_api.py"
+            "pm@13.140.186.143:$remote_work_dir/runtime/scripts/preflight_pharmonline_public_api.py"
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            "$source_manifest" "pm@46.225.149.52:$remote_work_dir/incoming/source-manifest"
+            "$source_manifest" "pm@13.140.186.143:$remote_work_dir/incoming/source-manifest"
 
           ssh -i ~/.ssh/id_ed25519 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 \
+            pm@13.140.186.143 \
             "bash -s -- '$remote_work_dir' '$source_manifest_sha'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
