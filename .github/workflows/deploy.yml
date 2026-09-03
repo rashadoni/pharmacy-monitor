@@ -47,12 +47,12 @@ jobs:
           mkdir -p ~/.ssh
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 46.225.149.52 >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H 13.140.186.143 >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Preflight production DB revision against checkout
         run: |
           set -euo pipefail
-          current_output=$(ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+          current_output=$(ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             cd /opt/pharmacy-monitor
             db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
             test -n "$db_url"
@@ -69,7 +69,7 @@ jobs:
       - name: Preflight deployment paths are writable
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             source_bad=$(find \
               /opt/pharmacy-monitor/src \
               /opt/pharmacy-monitor/migrations/versions \
@@ -93,7 +93,7 @@ jobs:
       - name: Preflight least-privilege service restart
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             for service in \
               pharmacy-monitor-api.service \
               pharmacy-monitor-frontend.service
@@ -119,29 +119,29 @@ jobs:
           set -euo pipefail
           rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
-            src/ pm@46.225.149.52:/opt/pharmacy-monitor/src/
+            src/ pm@13.140.186.143:/opt/pharmacy-monitor/src/
           rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='node_modules/' --exclude='.next/' --exclude='*.tsbuildinfo' --exclude='test-results/' \
-            frontend/ pm@46.225.149.52:/opt/pharmacy-monitor/frontend/
+            frontend/ pm@13.140.186.143:/opt/pharmacy-monitor/frontend/
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
-            frontend/src/ pm@46.225.149.52:/opt/pharmacy-monitor/frontend/src/
+            frontend/src/ pm@13.140.186.143:/opt/pharmacy-monitor/frontend/src/
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
-            migrations/versions/ pm@46.225.149.52:/opt/pharmacy-monitor/migrations/versions/
+            migrations/versions/ pm@13.140.186.143:/opt/pharmacy-monitor/migrations/versions/
           # Root-owned systemd installation remains an explicit post-release
           # operation, but its versioned units and reconciliation script must
           # be present in the runtime checkout for that operation to be
           # reproducible.
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
-            infra/systemd/ pm@46.225.149.52:/opt/pharmacy-monitor/infra/systemd/
+            infra/systemd/ pm@13.140.186.143:/opt/pharmacy-monitor/infra/systemd/
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
-            infra/scripts/ pm@46.225.149.52:/opt/pharmacy-monitor/infra/scripts/
+            infra/scripts/ pm@13.140.186.143:/opt/pharmacy-monitor/infra/scripts/
 
       - name: Verify migration graph has one head
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             cd /opt/pharmacy-monitor
             db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
             test -n "$db_url"
@@ -154,7 +154,7 @@ jobs:
         if: ${{ inputs.apply_migrations }}
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             cd /opt/pharmacy-monitor
             db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
             test -n "$db_url"
@@ -168,7 +168,7 @@ jobs:
       - name: Build frontend + restart services
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             cd /opt/pharmacy-monitor/frontend
             NODE_OPTIONS=--max-old-space-size=4096 pnpm install --frozen-lockfile
             NODE_OPTIONS=--max-old-space-size=4096 pnpm build
@@ -179,7 +179,7 @@ jobs:
         run: |
           set -euo pipefail
           sleep 5
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"
             curl -fsSL -o /dev/null -w "frontend HTTP %{http_code}\n" http://127.0.0.1:3000/ru/login
             curl -fsSL http://127.0.0.1:3000/ru/login | grep -q "<html lang=\"ru\""'

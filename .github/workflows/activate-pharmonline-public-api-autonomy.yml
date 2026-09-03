@@ -57,7 +57,7 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' \
-            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
             > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
           test "$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')" = \
@@ -70,7 +70,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 'bash -s' <<'REMOTE'
+            pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           min_available_kib=$((4 * 1024 * 1024))
           max_swap_kib=$((2 * 1024 * 1024))
@@ -115,7 +115,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 'mktemp -d /opt/pharmacy-monitor/.codex-pharmonline-activate.XXXXXX')
+            pm@13.140.186.143 'mktemp -d /opt/pharmacy-monitor/.codex-pharmonline-activate.XXXXXX')
           case "$work_dir" in
             /opt/pharmacy-monitor/.codex-pharmonline-activate.*) ;;
             *) echo 'unexpected remote staging path' >&2; exit 1 ;;
@@ -125,26 +125,26 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 \
+            pm@13.140.186.143 \
             "mkdir -p '$work_dir/runtime/src' '$work_dir/runtime/migrations' '$work_dir/runtime/templates' '$work_dir/incoming'"
           rsync -az --checksum --delete --no-perms --no-owner --no-group \
             --exclude='__pycache__/' \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            src/ "pm@46.225.149.52:$work_dir/runtime/src/"
+            src/ "pm@13.140.186.143:$work_dir/runtime/src/"
           rsync -az --checksum --delete --no-perms --no-owner --no-group \
             --exclude='__pycache__/' \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            migrations/ "pm@46.225.149.52:$work_dir/runtime/migrations/"
+            migrations/ "pm@13.140.186.143:$work_dir/runtime/migrations/"
           rsync -az --checksum --delete --no-perms --no-owner --no-group \
             --exclude='__pycache__/' \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            templates/ "pm@46.225.149.52:$work_dir/runtime/templates/"
+            templates/ "pm@13.140.186.143:$work_dir/runtime/templates/"
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            alembic.ini "pm@46.225.149.52:$work_dir/runtime/alembic.ini"
+            alembic.ini "pm@13.140.186.143:$work_dir/runtime/alembic.ini"
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            "$manifest" "pm@46.225.149.52:$work_dir/incoming/source-manifest"
+            "$manifest" "pm@13.140.186.143:$work_dir/incoming/source-manifest"
 
       - name: Back up source, activate marker, and verify the dispatch
         env:
@@ -155,7 +155,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 \
+            pm@13.140.186.143 \
             "bash -s -- '$WORK_DIR' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT'" <<'REMOTE'
           set -Eeuo pipefail
           work_dir=$1
@@ -288,7 +288,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 "bash -s -- '$WORK_DIR'" <<'REMOTE'
+            pm@13.140.186.143 "bash -s -- '$WORK_DIR'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
           case "$work_dir" in

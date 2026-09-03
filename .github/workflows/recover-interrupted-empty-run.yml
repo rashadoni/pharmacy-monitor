@@ -50,7 +50,7 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' \
-            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
             > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
-            pm@46.225.149.52 'bash -s' <<'REMOTE'
+            pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
           swap_before_kib=$(free -k | awk '/^Swap:/ {print $3}')
@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
-            pm@46.225.149.52 "bash -s -- '$RUN_ID'" <<'REMOTE'
+            pm@13.140.186.143 "bash -s -- '$RUN_ID'" <<'REMOTE'
           set -euo pipefail
           run_id=$1
           cd /opt/pharmacy-monitor
@@ -188,7 +188,7 @@ jobs:
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
-            pm@46.225.149.52 \
+            pm@13.140.186.143 \
             'set -euo pipefail
              sudo -n /usr/bin/systemctl restart pharmacy-monitor-api.service
              sleep 5

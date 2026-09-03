@@ -33,7 +33,7 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' \
-            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
             > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
           host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
@@ -43,7 +43,7 @@ jobs:
       - name: Preflight production resources
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 \
             "bash -s -- ${{ inputs.mode }}" <<'REMOTE'
           set -euo pipefail
           mode=$1
@@ -100,7 +100,7 @@ jobs:
       - name: Diagnose units, health state, database, and DDP startup
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'bash -s' <<'REMOTE'
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd /opt/pharmacy-monitor
 
@@ -869,7 +869,7 @@ jobs:
           [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
           deploy_id=gha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
           backup_dir=/opt/pharmacy-monitor/data/hotfix-backups/hotfix-$deploy_id/src
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 \
             "bash -s -- $deploy_id" <<'REMOTE'
           set -euo pipefail
           deploy_id=$1
@@ -897,7 +897,7 @@ jobs:
             trap - ERR INT TERM
             set +e
             printf 'deploy failed; restoring backup in compatible reverse order\n' >&2
-            ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+            ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 \
               "bash -s -- $backup_dir" <<'ROLLBACK'
           set -u
           backup_dir=$1
@@ -957,7 +957,7 @@ jobs:
           }
           # Repeat the active gate immediately before the first live write.
           # Unknown/missing/transitional unit state fails closed.
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 'bash -s' <<'REMOTE'
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           require_inactive() {
             unit=$1
@@ -979,16 +979,16 @@ jobs:
           trap rollback ERR INT TERM
           # Dependencies first; main.py (the caller) is always published last.
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
-            src/notifier.py pm@46.225.149.52:/opt/pharmacy-monitor/src/notifier.py
+            src/notifier.py pm@13.140.186.143:/opt/pharmacy-monitor/src/notifier.py
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
-            src/storage.py pm@46.225.149.52:/opt/pharmacy-monitor/src/storage.py
+            src/storage.py pm@13.140.186.143:/opt/pharmacy-monitor/src/storage.py
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
-            src/health.py pm@46.225.149.52:/opt/pharmacy-monitor/src/health.py
+            src/health.py pm@13.140.186.143:/opt/pharmacy-monitor/src/health.py
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
             src/scrapers/pharmonline_ddp.py \
-            pm@46.225.149.52:/opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py
+            pm@13.140.186.143:/opt/pharmacy-monitor/src/scrapers/pharmonline_ddp.py
           rsync -az --delay-updates -e "ssh -i ~/.ssh/id_ed25519" \
-            src/main.py pm@46.225.149.52:/opt/pharmacy-monitor/src/main.py
+            src/main.py pm@13.140.186.143:/opt/pharmacy-monitor/src/main.py
           trap - ERR INT TERM
 
       - name: Read-only verify and post-deploy DDP probe with rollback
@@ -1007,7 +1007,7 @@ jobs:
             trap - ERR INT TERM
             set +e
             printf 'verification failed; restoring backup in compatible reverse order\n' >&2
-            ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+            ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 \
               "bash -s -- $backup_dir" <<'ROLLBACK'
           set -u
           backup_dir=$1
@@ -1067,7 +1067,7 @@ jobs:
           local_notifier=$(sha256sum src/notifier.py | awk '{print $1}')
           local_storage=$(sha256sum src/storage.py | awk '{print $1}')
           local_ddp=$(sha256sum src/scrapers/pharmonline_ddp.py | awk '{print $1}')
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 \
             "bash -s -- $local_health $local_main $local_notifier $local_storage $local_ddp" <<'REMOTE'
           set -euo pipefail
           expected_health=$1
@@ -1288,7 +1288,7 @@ jobs:
           set -euo pipefail
           backup_dir=$BACKUP_DIR
           [[ "$backup_dir" =~ ^/opt/pharmacy-monitor/data/hotfix-backups/hotfix-gha-[0-9]+-[0-9]+/src$ ]]
-          ssh -i ~/.ssh/id_ed25519 pm@46.225.149.52 \
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 \
             "bash -s -- $backup_dir" <<'ROLLBACK'
           set -u
           backup_dir=$1

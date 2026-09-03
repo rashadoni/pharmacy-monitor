@@ -54,7 +54,7 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' \
-            '46.225.149.52 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
             > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
           host_fingerprint=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')
@@ -68,7 +68,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 'bash -s' <<'REMOTE'
+            pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           min_available_kib=$((4 * 1024 * 1024))
           max_swap_kib=$((2 * 1024 * 1024))
@@ -119,7 +119,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 'bash -s' <<'REMOTE'
+            pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           work_dir=$(mktemp -d /opt/pharmacy-monitor/.codex-decodo-reconciliation-plan.XXXXXX)
           mkdir -p "$work_dir/incoming" "$work_dir/runtime/src" "$work_dir/runtime/scripts"
@@ -138,14 +138,14 @@ jobs:
           rsync -az --checksum --delete --no-perms --no-owner --no-group \
             --exclude '__pycache__/' \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            src/ "pm@46.225.149.52:$remote_work_dir/runtime/src/"
+            src/ "pm@13.140.186.143:$remote_work_dir/runtime/src/"
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
             scripts/reconcile_pharmonline_public_api_identities.py \
-            "pm@46.225.149.52:$remote_work_dir/runtime/scripts/reconcile_pharmonline_public_api_identities.py"
+            "pm@13.140.186.143:$remote_work_dir/runtime/scripts/reconcile_pharmonline_public_api_identities.py"
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15" \
-            "$source_manifest" "pm@46.225.149.52:$remote_work_dir/incoming/source-manifest"
+            "$source_manifest" "pm@13.140.186.143:$remote_work_dir/incoming/source-manifest"
 
           # A retryable Decodo failure deliberately sleeps for up to five
           # minutes. Keep this long-lived plan connection alive during that
@@ -156,7 +156,7 @@ jobs:
             -o ConnectTimeout=15 \
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=120 \
-            pm@46.225.149.52 \
+            pm@13.140.186.143 \
             "bash -s -- '$remote_work_dir' '$source_manifest_sha'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
@@ -228,7 +228,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            "pm@46.225.149.52:$remote_work_dir/plan-evidence.json" \
+            "pm@13.140.186.143:$remote_work_dir/plan-evidence.json" \
             "$plan_evidence_dir/reconciliation-plan.json"
           PLAN_EVIDENCE_FILE="$plan_evidence_dir/reconciliation-plan.json" \
             python - <<'PY'
@@ -283,7 +283,7 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=15 \
-            pm@46.225.149.52 "bash -s -- '$REMOTE_WORK_DIR'" <<'REMOTE'
+            pm@13.140.186.143 "bash -s -- '$REMOTE_WORK_DIR'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
           case "$work_dir" in
