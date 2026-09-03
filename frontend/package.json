@@ -49,5 +49,11 @@
     "@testing-library/jest-dom": "^6.6.3",
     "jsdom": "^25.0.1",
     "@playwright/test": "^1.48.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "unrs-resolver"
+    ]
   }
 }
