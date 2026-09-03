@@ -126,6 +126,13 @@ _RETRYABLE_FULL_CATALOG_ABORT_REASONS = frozenset(
         # entire attempt and let the bounded reconciliation retry start from
         # a fresh session; no partial catalog may escape this gate.
         "product_sitemap_empty",
+        # The same sticky session can also return a *partially* populated
+        # sitemap: some shards answer, others come back short, and the union
+        # then looks like a genuine API/sitemap set disagreement.  A retry
+        # only discards the whole attempt and re-reads both sources from a
+        # fresh session, so a real disagreement still fails closed once the
+        # bounded attempts are exhausted.
+        "products_sitemap_set_mismatch",
         # A provider/target rate limit is likewise retryable only as a whole
         # catalog read.  The caller never mixes rows from the rejected pass.
         "decodo_http_429",
