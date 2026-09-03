@@ -90,7 +90,13 @@ _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS = frozenset(
     {"existing_native_id", "new_public_product", "quarantined_public_product"}
 )
 _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
-_PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS = 9500
+# One-time bootstrap floor for a catalog that has never been baselined.  It
+# only has to be low enough to reject a truncated first read, so it must stay
+# well below the smallest catalog the source plausibly publishes.  The former
+# value (9500) was set within 0.7% of the then-current catalog and was pinning
+# the effective floor above the fraction rule; ordinary source churn then took
+# the catalog under it and deadlocked both the run and its recovery path.
+_PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS = 9000
 _PHARMONLINE_PUBLIC_API_BASELINE_FRACTION_PER_THOUSAND = 980
 
 
