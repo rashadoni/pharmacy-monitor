@@ -3,6 +3,13 @@
 # their postinstall: esbuild links its platform binary and unrs-resolver is a
 # native napi addon. The package.json field is kept alongside this for the
 # pnpm 10 toolchains that still read it.
+#
+# This app is a single package, but older pnpm treats the presence of this file
+# as declaring a workspace and refuses to install without a packages field, so
+# the root is listed as the only member.
+packages:
+  - .
+
 allowBuilds:
   esbuild: true
   unrs-resolver: true
