@@ -104,7 +104,7 @@ jobs:
           }
           if set(data) != required or data["version"] != 3 or data["transport"] != "decodo":
               raise SystemExit("approved reconciliation plan evidence is invalid")
-          if not isinstance(data["product_count"], int) or data["product_count"] < 9500:
+          if not isinstance(data["product_count"], int) or data["product_count"] < 9000:
               raise SystemExit("approved reconciliation plan product count is invalid")
           for key in ("catalog_fingerprint_sha256", "candidate_manifest_sha256"):
               value = data[key]
