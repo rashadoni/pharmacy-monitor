@@ -1,0 +1,8 @@
+# pnpm 11+ no longer reads the "pnpm" field in package.json; build-script
+# permissions live here instead (https://pnpm.io/settings). Both packages need
+# their postinstall: esbuild links its platform binary and unrs-resolver is a
+# native napi addon. The package.json field is kept alongside this for the
+# pnpm 10 toolchains that still read it.
+allowBuilds:
+  esbuild: true
+  unrs-resolver: true
