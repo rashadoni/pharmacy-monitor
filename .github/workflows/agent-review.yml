@@ -1,0 +1,119 @@
+name: Agent review
+
+# Layer 2 of docs/DELIVERY-ARCHITECTURE.md: every pull request is read by an
+# agent that did not write it. This is the ONLY required check on main, so it
+# must run for every pull request — including documentation-only ones, which
+# heavier workflows deliberately skip. It is therefore cheap by construction:
+# one short job, no build, no install, ~30 seconds.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: agent-review-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: agent-review
+    # This repository has no self-hosted runner. The job is seconds long and
+    # installs nothing, so hosted minutes here are noise.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the merge result
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Collect the diff under review
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git diff --stat "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/diffstat.txt" || true
+          # A cap keeps one enormous refactor from turning the review into a
+          # bill. Anything larger is reported as unreviewable rather than
+          # silently half-read.
+          git diff "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/full.diff" || true
+          bytes="$(wc -c < "$RUNNER_TEMP/full.diff")"
+          echo "bytes=$bytes" >> "$GITHUB_OUTPUT"
+          echo "Diff size: $bytes bytes"
+          cat "$RUNNER_TEMP/diffstat.txt"
+
+      - name: Review the change
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DIFF_BYTES: ${{ steps.diff.outputs.bytes }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            # The check stays green so a missing secret cannot stop all delivery
+            # — but it must say so ON the pull request, not only in a workflow
+            # log nobody opens.
+            echo "::warning::ANTHROPIC_API_KEY is not set, so this pull request was NOT reviewed by an agent. Add the secret to switch layer 2 on; see docs/DELIVERY-ARCHITECTURE.md."
+            cat > "$RUNNER_TEMP/review.json" <<'EOF'
+          {"summary":"Ревью не выполнено: в секретах репозитория нет ANTHROPIC_API_KEY.","findings":[],"markdown":"### Ревью агентом\n\n**Не выполнено.** В секретах репозитория нет `ANTHROPIC_API_KEY`, поэтому это изменение **никто не разобрал**.\n\nПроверка намеренно зелёная, чтобы отсутствие ключа не остановило всю доставку. Но мерж сейчас — это мерж непроверенного. Добавь секрет (см. `docs/DELIVERY-ARCHITECTURE.md`, слой 2) и перезапусти проверку, либо скажи владельцу прямо, что сливаешь без разбора."}
+          EOF
+            echo "verdict=unconfigured" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$DIFF_BYTES" -gt 400000 ]; then
+            echo "::error::This change is too large to review in one pass (${DIFF_BYTES} bytes). Split it into smaller pull requests."
+            exit 1
+          fi
+
+          # The script writes review.json and the job summary first, then exits 1
+          # if a blocking finding survives its own second look — so the verdict
+          # and the record of it never depend on a second inline program here.
+          node .github/scripts/agent-review.mjs \
+            --diff "$RUNNER_TEMP/full.diff" \
+            --out "$RUNNER_TEMP/review.json"
+
+      # Posting the findings must never be what fails the check: the verdict is
+      # the review step above, and the job summary always carries the text.
+      # Runs in every case, including "no key": an unreviewed change must be
+      # visible where the merge button is, not only in the Actions log.
+      - name: Say so on the pull request
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          [ -f "$RUNNER_TEMP/review.json" ] || exit 0
+          node --input-type=module -e '
+            const { readFileSync } = await import("node:fs")
+            const r = JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/review.json", "utf8"))
+            const body = r.markdown ?? "No findings."
+            const url = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/issues/${process.env.PR}/comments`
+            const res = await fetch(url, {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${process.env.GH_TOKEN}`,
+                accept: "application/vnd.github+json",
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({ body }),
+            })
+            if (!res.ok) {
+              console.log(`::warning::Could not post the review comment (${res.status}); it is in the job summary.`)
+            }
+          '
