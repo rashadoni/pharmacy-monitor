@@ -10,6 +10,22 @@
 увидит пользователь, владельцу показывают короткий список человеческим языком и
 ждут «давай».
 
+## ⚠️ Репозиторий публичный — секретам здесь не место
+
+`github.com/rashadoni/pharmacy-monitor` открыт всему интернету, и этот файл в нём
+закоммичен. Всё, что сюда попадает, читают посторонние: 23 сентября 2026 продавец
+прокси написал владельцу на почту, найдя репозиторий обходом GitHub по упоминанию
+`ScraperAPI`.
+
+Поэтому в CLAUDE.md **не пишутся**: пароли, токены и их префиксы, ключи, строки
+подключения, почта клиентов и их сотрудников. Значения живут в
+`/etc/pharmacy-monitor/env` на проде и в `data/.prod-secrets-DO-NOT-COMMIT` локально
+(оба вне git) — сюда пишется только, где их взять.
+
+Удаление из этого файла не отменяет утечку: что было закоммичено, остаётся в
+git-истории до её переписывания. Всё, что здесь когда-либо лежало, считать
+скомпрометированным и ротировать.
+
 This file is auto-loaded in every Claude Code session. Read it first.
 
 ## Verification Protocol (CRITICAL)
@@ -50,8 +66,8 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 ## Current production state (last updated: 2026-05-27)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
-**Login**: `admin` (или email админа `rashadrahimov@gmail.com`) / `password2026!` — сброшен 2026-09-02 через одноразовый workflow `reset-admin-password.yml`.
-⚠️ Пароль живёт в `tenant_users.password_hash` (bcrypt), а НЕ в env: `auth_login` берёт `user.password_hash or env ADMIN_PASSWORD_HASH`, поэтому env-переменная — только bootstrap-фолбэк и с момента первой смены пароля не действует. Прежний `pharmacy2026` мёртв с 2026-08-23.
+**Login**: `admin` (или email админа `rashadrahimov@gmail.com`). **Пароль здесь не хранится** — файл публичный, см. раздел выше. Плейнтекста нет нигде: в проде лежит только bcrypt-хеш, а локальный `data/.prod-secrets-DO-NOT-COMMIT` держит PG/JWT/API-ключи, но не пароль дашборда — если владелец захочет его записать, то туда (файл вне git). Забытый пароль не восстанавливается, а сбрасывается: одноразовый workflow `reset-admin-password.yml` (в репозитории его нет, восстанавливается из коммита `da5f4b47`) или magic-link `POST /auth/request` — ссылка живёт 30 минут, кнопки в UI логина для неё нет. ⚠️ Пароли, которые стояли в этом файле до 2026-09-23 (в т.ч. сброшенный 2026-09-02), лежали в публичном репозитории — они скомпрометированы.
+⚠️ Пароль живёт в `tenant_users.password_hash` (bcrypt), а НЕ в env: `auth_login` берёт `user.password_hash or env ADMIN_PASSWORD_HASH`, поэтому env-переменная — только bootstrap-фолбэк и с момента первой смены пароля не действует. Прежний пароль мёртв с 2026-08-23.
 **Server**: Hetzner cx33 (Falkenstein DE), 4 vCPU / 8GB / 80GB · €7.99/mo · IP `46.225.149.52`
 **SSH**: `ssh -i ~/.ssh/id_ed25519 root@46.225.149.52` (root + pm users active; pm home is `/opt/pharmacy-monitor`, NOT `/home/pm`; `pm` does not have passwordless sudo — use root for systemctl/sudo ops)
 **DNS**: leaddrive.cloud at Namecheap; A `@` and `www` → 46.225.149.52
@@ -119,7 +135,7 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 - **(г) Новая страница** [settings/users/page.tsx](frontend/src/app/[locale]/(dashboard)/settings/users/page.tsx) (admin-only, как `/settings/pricing`): список юзеров (card-per-user, мобайл), добавление по email, смена роли admin/viewer, тумблеры daily/weekly дайджест + active + severity, soft-delete. Ссылка-карточка в `/settings` (только для admin). Роут добавлен в `LEGACY_ROUTES` (next.config). i18n ru/az/en (namespace `users`, 32 ключа, сверены node-скриптом).
 - **(б) Управление юзерами/ролями** — теперь self-serve через эту страницу. **(в) Периодичность дайджеста** — per-user тумблеры + нота с реальным расписанием (daily 05:00 UTC=09:00 Баку, weekly Пн 06:00 UTC=10:00 Баку; systemd-таймеры).
 - **Бэкенд-гард `_is_last_active_admin`** (architect #3): PATCH/DELETE блокируют (400) демоут/удаление ПОСЛЕДНЕГО активного админа (достижимо только в edge: деактивированный админ с живым JWT; для нормального актора недостижимо — он сам активный админ → НЕ переблокирует легит-демоут). +6 тестов (helper, role-gate, create+normalize, self-guards ×2, no-over-block). **Двойной architect-review APPROVE-WITH-NITS** → все NITs (фронт `["me"]`-инвалидация + error/empty-состояния, бэкенд last-admin гард) исправлены.
-- Задеплоено: rsync api.py + frontend/src + messages → `pnpm build` (pm) → restart api+frontend. Verified: build ок, `/ru/settings/users` 307 (auth-gate, не 404/500), `/health` 200, 6 тестов зелёные. **NB**: viewer (`rashad.aliyev@zeytunpharma.az`) — только чтение, правки дают 403. **Гоча rsync**: путь с `[locale]`/`(dashboard)` ломает rsync (скобки=glob) → синкать `frontend/src/` целиком (рекурсия в скобки идёт внутри rsync).
+- Задеплоено: rsync api.py + frontend/src + messages → `pnpm build` (pm) → restart api+frontend. Verified: build ок, `/ru/settings/users` 307 (auth-gate, не 404/500), `/health` 200, 6 тестов зелёные. **NB**: у роли viewer (сотрудник клиента) — только чтение, правки дают 403. **Гоча rsync**: путь с `[locale]`/`(dashboard)` ломает rsync (скобки=glob) → синкать `frontend/src/` целиком (рекурсия в скобки идёт внутри rsync).
 - **В git НЕ коммичено** (деплой через rsync); health-фикс этого же дня закоммичен отдельно (`28a4590`).
 
 **Just finished (2026-06-16): pharmonline «49% покрытие» — ДИАГНОЗ = дубли от двух скрейперов (НЕ gap/делистинг) + freshness/coverage-aware site_drop + чистка 9478 дублей.** Клиент: проверить aloe-direct, разобраться с «пропавшими» ~9860 pharmonline, сделать метрику покрытия честной.
@@ -267,11 +283,15 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 Backup 04:02 UTC ✓ (GPG encrypted, 10MB). /health up, db 0.97ms, redis 3.03ms, all sites < 4h fresh.
 
-### Exposed API keys (rotate when convenient):
-- Perplexity: `pplx-9JgqRvCJ...` — perplexity.ai/settings/api → Regenerate
-- Firecrawl: `fc-d0f71c2c...` — firecrawl.dev/dashboard → API Keys → Regenerate
-- Brave: `BSAMo35R...` — api-dashboard.search.brave.com/app/keys → Revoke + new
-- GitHub PAT: `github_pat_11BZ7WQWY00X...` — github.com/settings/personal-access-tokens → revoke
+### Exposed API keys — ротировать, все четыре
+
+Префиксы этих ключей были выписаны прямо здесь, в публичном репозитории. Из файла они
+убраны, но остались в git-истории, поэтому «ротировать, когда будет удобно» больше не
+вариант:
+- Perplexity — perplexity.ai/settings/api → Regenerate
+- Firecrawl — firecrawl.dev/dashboard → API Keys → Regenerate
+- Brave — api-dashboard.search.brave.com/app/keys → Revoke + new
+- GitHub PAT — github.com/settings/personal-access-tokens → revoke
 
 After rotation, re-register via `claude mcp remove <name> -s user && claude mcp add ...`.
 
