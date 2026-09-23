@@ -18,9 +18,10 @@
 `ScraperAPI`.
 
 Поэтому в CLAUDE.md **не пишутся**: пароли, токены и их префиксы, ключи, строки
-подключения, почта клиентов и их сотрудников. Значения живут в
-`/etc/pharmacy-monitor/env` на проде и в `data/.prod-secrets-DO-NOT-COMMIT` локально
-(оба вне git) — сюда пишется только, где их взять.
+подключения, почта клиентов и их сотрудников. Значения живут вне git: прод-сервис —
+`/etc/pharmacy-monitor/env`, локально — `data/.prod-secrets-DO-NOT-COMMIT`, ключи
+MCP-серверов — `~/.claude.json`, деплой и разовые workflow — секреты репозитория на
+GitHub. Сюда пишется только, где их взять.
 
 Удаление из этого файла не отменяет утечку: что было закоммичено, остаётся в
 git-истории до её переписывания. Всё, что здесь когда-либо лежало, считать
@@ -66,8 +67,14 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 ## Current production state (last updated: 2026-05-27)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
-**Login**: `admin` (или email админа `rashadrahimov@gmail.com`). **Пароль здесь не хранится** — файл публичный, см. раздел выше. Плейнтекста нет нигде: в проде лежит только bcrypt-хеш, а локальный `data/.prod-secrets-DO-NOT-COMMIT` держит PG/JWT/API-ключи, но не пароль дашборда — если владелец захочет его записать, то туда (файл вне git). Забытый пароль не восстанавливается, а сбрасывается: одноразовый workflow `reset-admin-password.yml` (в репозитории его нет, восстанавливается из коммита `da5f4b47`) или magic-link `POST /auth/request` — ссылка живёт 30 минут, кнопки в UI логина для неё нет. ⚠️ Пароли, которые стояли в этом файле до 2026-09-23 (в т.ч. сброшенный 2026-09-02), лежали в публичном репозитории — они скомпрометированы.
-⚠️ Пароль живёт в `tenant_users.password_hash` (bcrypt), а НЕ в env: `auth_login` берёт `user.password_hash or env ADMIN_PASSWORD_HASH`, поэтому env-переменная — только bootstrap-фолбэк и с момента первой смены пароля не действует. Прежний пароль мёртв с 2026-08-23.
+**Login**: `admin` (или email админа `rashadrahimov@gmail.com`). Пароль здесь больше не пишется — файл публичный, см. раздел выше.
+
+🔴 **Пароль, стоявший в этой строке до 2026-09-23, скомпрометирован — сменить на проде.** Он был задан 2026-09-02 и 21 день лежал открытым текстом в публичном репозитории. Удаление строки ничего не закрыло: он по-прежнему действует, пока его не сменили, и по-прежнему читается — он остался в 15 коммитах, ближайший `git show 7dfcf954:CLAUDE.md`. Логин и адрес дашборда тоже публичны, так что пара полная. Считать это открытым доступом к https://leaddrive.cloud до смены пароля.
+
+**Сменить** — одноразовым workflow `reset-admin-password.yml`: в HEAD его нет, восстанавливается из коммита `40938ae7` (им же делался сброс 2026-09-02), требует секретов репозитория `SSH_PRIVATE_KEY` и `TEMP_ADMIN_PASSWORD_HASH_B64` — их ставит владелец, без них прогон упадёт на середине. **Если пароль просто забыт**, есть вход без него: magic-link `POST /auth/request` → ссылка на `/auth/verify`, живёт 30 минут. Это вход, а не сброс (пароль остаётся прежним), кнопки в UI логина для него нет, и он требует живого SMTP.
+
+**Новый пароль в этот файл не вписывать.** Место для него — `data/.prod-secrets-DO-NOT-COMMIT` (вне git); сейчас там PG/JWT/API-ключи, но не пароль дашборда. В самом проде плейнтекста нет — только bcrypt-хеш.
+⚠️ Источник истины по паролю — `tenant_users.password_hash` (bcrypt), а НЕ env: `auth_login` берёт `user.password_hash or env ADMIN_PASSWORD_HASH`, поэтому `ADMIN_PASSWORD_HASH` — только bootstrap-фолбэк и с момента первой смены пароля не действует (и фолбэк этот есть только на ветке входа по логину `admin`, не по email). При жалобе «не пускает в панель» смотреть БД, а не env и не эту документацию. Прежний пароль мёртв с 2026-08-23.
 **Server**: Hetzner cx33 (Falkenstein DE), 4 vCPU / 8GB / 80GB · €7.99/mo · IP `46.225.149.52`
 **SSH**: `ssh -i ~/.ssh/id_ed25519 root@46.225.149.52` (root + pm users active; pm home is `/opt/pharmacy-monitor`, NOT `/home/pm`; `pm` does not have passwordless sudo — use root for systemctl/sudo ops)
 **DNS**: leaddrive.cloud at Namecheap; A `@` and `www` → 46.225.149.52
