@@ -430,6 +430,7 @@ jobs:
 
           PHARMONLINE_PUBLIC_API=required \
           PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
+          DECODO_SITES=pharmonline \
           PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
           PHARMONLINE_PUBLIC_API_LOCK_WAIT_SECONDS=2700 \
           PHARMONLINE_USE_DDP=0 \
@@ -484,6 +485,7 @@ jobs:
             echo "verified catalog publication attempt ${publish_attempt}/3"
             if PHARMONLINE_PUBLIC_API=required \
               PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
+              DECODO_SITES=pharmonline \
               PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
               PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \
               PHARMONLINE_USE_DDP=0 \
