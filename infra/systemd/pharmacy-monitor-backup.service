@@ -8,13 +8,19 @@ User=pm
 Group=pm
 WorkingDirectory=/opt/pharmacy-monitor
 EnvironmentFile=/etc/pharmacy-monitor/env
+# Каталог создаётся здесь, а не в backup.sh: ReadWritePaths проверяется при настройке
+# namespace, то есть ДО любого Exec*, поэтому mkdir внутри скрипта не успевает сработать.
+# Префикс '+' выполняет команду от root и вне песочницы.
+ExecStartPre=+/usr/bin/install -d -o pm -g pm -m 0750 /var/backups/pharmacy-monitor
 ExecStart=/opt/pharmacy-monitor/infra/scripts/backup.sh
 
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/backups/pharmacy-monitor
+# Именно /var/backups, а не подкаталог: несуществующий путь в ReadWritePaths роняет
+# юнит с 226/NAMESPACE ещё до запуска. Так бэкапы молча падали 30 дней после переезда.
+ReadWritePaths=/var/backups
 StandardOutput=journal
 StandardError=journal
 
