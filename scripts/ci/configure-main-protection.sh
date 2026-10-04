@@ -9,33 +9,43 @@
 # What it configures on `main`:
 #   - changes arrive only through a pull request (no direct push, no force push,
 #     no branch deletion)
-#   - `agent-review` must be green before merge
+#   - the three CI jobs must be green before merge
 #   - no required approvals: the owner works alone, and a rule nobody can
 #     satisfy is how production became undeployable in the first place
+#
+# Changed 2026-10-04. This script used to pin `agent-review` as the single
+# required context. That check reports green on every pull request when its
+# API key is missing, so for as long as it was the only required one the gate
+# was decorative: tests, lint and the frontend build did not affect merging at
+# all. The workflow is deleted and must not come back — see Layer 2 of
+# docs/DELIVERY-ARCHITECTURE.md.
 #
 # Usage:  bash scripts/ci/configure-main-protection.sh [owner/repo]
 set -euo pipefail
 
-REPO="${1:-rashadrahimov/pharmacy-monitor}"
+# The repository moved to the rashadoni account; the old default would have
+# configured protection on a repository nobody uses any more.
+REPO="${1:-rashadoni/pharmacy-monitor}"
 BRANCH="${BRANCH:-main}"
 
 command -v gh >/dev/null || { echo "gh is required" >&2; exit 1; }
 
 echo "Configuring branch protection on ${REPO}@${BRANCH}"
 
-# `required_status_checks.contexts` is deliberately just agent-review: it is the
-# one check that runs for every pull request, including documentation-only ones.
-# The heavy jobs keep their path filters, and requiring a check that never
-# starts would leave such a pull request unmergeable for ever.
+# These three are the jobs of ci-pipeline.yml. That workflow has NO path
+# filters: it runs on every pull request to main, documentation-only ones
+# included, so none of them can hang waiting for a check that never starts.
+# Keep that property — a path-filtered required check is unmergeable for ever.
+# Context strings must match the job `name:` values exactly.
 gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" \
   -H "Accept: application/vnd.github+json" \
   --input - <<'JSON'
 {
   "required_status_checks": {
     "strict": false,
-    "contexts": ["agent-review"]
+    "contexts": ["Lint (ruff)", "Test (pytest)", "Frontend (Next.js)"]
   },
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": null,
   "restrictions": null,
   "allow_force_pushes": false,
@@ -57,6 +67,8 @@ gh api "repos/${REPO}/branches/${BRANCH}/protection" \
   }'
 
 echo
-echo "Note: enforce_admins is false on purpose. The owner must retain a way to"
-echo "recover production when a check itself is broken — that is a break-glass"
-echo "path, not a routine one. Using it is worth saying out loud in the report."
+echo "Note: enforce_admins is true here, matching the live state as of"
+echo "2026-10-04 — the rules apply to the owner too, so a red pull request"
+echo "cannot be merged by anyone. If a check itself breaks and production has"
+echo "to be recovered, turn it off deliberately for that one merge and turn it"
+echo "back on; using that path is worth saying out loud in the report."
