@@ -76,6 +76,9 @@ _PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_DEFAULT = Path(
 _PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_CONTENT = (
     "pharmonline_public_api_autonomous_v1\n"
 )
+# Транспорты, которыми автономному прогону разрешено ходить. Список закрытый:
+# см. _enable_pharmonline_public_api_autonomous_mode.
+_PHARMONLINE_AUTONOMOUS_TRANSPORTS = frozenset({"decodo", "direct"})
 _PHARMONLINE_METEOR_ID_RE = re.compile(r"^[A-Za-z0-9]{17}$")
 _PHARMONLINE_DDP_AVAILABILITY_SOURCE = "pharmonline_ddp_total_count"
 _PHARMONLINE_PUBLIC_API_MIN_TRUSTED_COVERAGE = 0.98
@@ -167,8 +170,30 @@ def _enable_pharmonline_public_api_autonomous_mode() -> None:
     without modifying its root-owned EnvironmentFile.
     """
     os.environ[_PHARMONLINE_PUBLIC_API_ENV] = "required"
-    os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] = "decodo"
-    os.environ["PHARMONLINE_DECODO_BACKCONNECT_STICKY"] = "1"
+    # Транспорт выбирает оператор через EnvironmentFile, а не эта функция.
+    # Здесь стояло жёсткое "decodo", и оно молча перетирало выставленный
+    # оператором direct — прогон уходил в decodo-ветку и падал на
+    # _require_decodo_pharmonline_site(), потому что pharmonline из
+    # DECODO_SITES к тому моменту намеренно убрали.
+    #
+    # Список закрытый, и пустое или незнакомое значение роняет прогон: дефолт
+    # самого скрейпера — платный crawlbase, и тихо уехать туда хуже, чем
+    # остановиться. Смысл функции при этом сохранён: устаревший root-овый
+    # EnvironmentFile по-прежнему не может увести прогон куда попало.
+    transport = os.environ.get("PHARMONLINE_PUBLIC_API_TRANSPORT", "").strip().lower()
+    if transport not in _PHARMONLINE_AUTONOMOUS_TRANSPORTS:
+        raise click.ClickException(
+            "PHARMONLINE_PUBLIC_API_TRANSPORT must be one of "
+            + ", ".join(sorted(_PHARMONLINE_AUTONOMOUS_TRANSPORTS))
+            + " for the autonomous Pharmonline run"
+        )
+    os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] = transport
+    if transport == "decodo":
+        # Флаг читают только внутри decodo-ветки, но взведённым при direct его
+        # оставлять нельзя: любой возврат в ту ветку снова упрётся в
+        # DECODO_SITES, из которого pharmonline убран, и воспроизведёт ровно
+        # это падение.
+        os.environ["PHARMONLINE_DECODO_BACKCONNECT_STICKY"] = "1"
     os.environ["PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE"] = "required"
     os.environ["PHARMONLINE_USE_DDP"] = "0"
     os.environ["AI_FALLBACK_ENABLED"] = "0"

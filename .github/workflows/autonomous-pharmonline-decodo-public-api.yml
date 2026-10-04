@@ -263,8 +263,7 @@ jobs:
           succeeded=0
           echo 'autonomous verified catalog attempt (internally bounded to three fresh snapshots)'
           if PHARMONLINE_PUBLIC_API=required \
-            PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
-            PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
+            PHARMONLINE_PUBLIC_API_TRANSPORT=direct \
             PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS=3 \
             PHARMONLINE_PUBLIC_API_CATALOG_RETRY_DELAY_SECONDS=60 \
             PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \

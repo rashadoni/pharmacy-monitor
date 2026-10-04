@@ -227,7 +227,11 @@ jobs:
 
           probe_marker="$work_dir/dispatch-probe-marker"
           printf '%s\n' 'pharmonline_public_api_autonomous_v1' > "$probe_marker"
+          # Транспорт пробе надо передать явно: с тех пор как
+          # _enable_pharmonline_public_api_autonomous_mode перестала
+          # прошивать decodo, пустое значение — это намеренный отказ.
           PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER="$probe_marker" \
+            PHARMONLINE_PUBLIC_API_TRANSPORT="${PHARMONLINE_PUBLIC_API_TRANSPORT:-direct}" \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
           import os
           from src.main import (
@@ -244,7 +248,7 @@ jobs:
           )
           _enable_pharmonline_public_api_autonomous_mode()
           assert _pharmonline_public_api_enabled()
-          assert os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] == "decodo"
+          assert os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] in {"decodo", "direct"}
           assert os.environ["PHARMONLINE_USE_DDP"] == "0"
           assert os.environ["AI_FALLBACK_ENABLED"] == "0"
           PY

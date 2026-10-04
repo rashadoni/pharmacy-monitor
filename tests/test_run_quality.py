@@ -180,6 +180,9 @@ def test_autonomous_marker_replaces_legacy_ddp_for_its_process(monkeypatch):
     monkeypatch.setenv("PHARMONLINE_USE_DDP", "1")
     monkeypatch.setenv("AI_FALLBACK_ENABLED", "true")
     monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "1")
+    # Транспорт больше не прошит в функции — его выбирает оператор, поэтому
+    # decodo-случай обязан задать его явно.
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "decodo")
 
     main_mod._enable_pharmonline_public_api_autonomous_mode()
 
@@ -190,6 +193,77 @@ def test_autonomous_marker_replaces_legacy_ddp_for_its_process(monkeypatch):
     assert main_mod.os.environ["PHARMONLINE_USE_DDP"] == "0"
     assert main_mod.os.environ["AI_FALLBACK_ENABLED"] == "0"
     assert main_mod.os.environ["SCRAPE_REPORT_EMAIL"] == "0"
+
+
+# ── выбор транспорта в автономном режиме ────────────────────────────────────
+# Раньше функция прошивала "decodo" поверх EnvironmentFile. Оператор выставил
+# на проде direct, значение молча потерялось, прогон ушёл в decodo-ветку и упал
+# на "Decodo is not configured for Pharmonline". Эти три теста держат новый
+# контракт: значение оператора доезжает, decodo-флаг не остаётся взведённым, а
+# пустое или незнакомое значение останавливает прогон вместо тихого ухода в
+# платный crawlbase (дефолт самого скрейпера).
+
+
+def _blank_autonomous_env(monkeypatch):
+    for name in (
+        "PHARMONLINE_PUBLIC_API",
+        "PHARMONLINE_PUBLIC_API_TRANSPORT",
+        "PHARMONLINE_DECODO_BACKCONNECT_STICKY",
+        "PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE",
+    ):
+        monkeypatch.setenv(name, "")
+    monkeypatch.setenv("PHARMONLINE_USE_DDP", "1")
+    monkeypatch.setenv("AI_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "1")
+
+
+def test_autonomous_mode_keeps_the_operator_direct_transport(monkeypatch):
+    _blank_autonomous_env(monkeypatch)
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "direct")
+
+    main_mod._enable_pharmonline_public_api_autonomous_mode()
+
+    assert main_mod.os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] == "direct"
+    # Взведённый флаг вернул бы прогон в decodo-ветку к проверке DECODO_SITES.
+    assert main_mod.os.environ["PHARMONLINE_DECODO_BACKCONNECT_STICKY"] == ""
+    # Остальные предохранители режима обязаны устоять и при direct.
+    assert main_mod._pharmonline_public_api_enabled()
+    assert main_mod.os.environ["PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE"] == "required"
+    assert main_mod.os.environ["PHARMONLINE_USE_DDP"] == "0"
+    assert main_mod.os.environ["AI_FALLBACK_ENABLED"] == "0"
+    assert main_mod.os.environ["SCRAPE_REPORT_EMAIL"] == "0"
+
+
+@pytest.mark.parametrize("value", ["", "   ", "crawlbase", "scraperapi", "firecrawl", "dircet"])
+def test_autonomous_mode_refuses_an_unlisted_transport(monkeypatch, value):
+    _blank_autonomous_env(monkeypatch)
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", value)
+
+    with pytest.raises(ClickException):
+        main_mod._enable_pharmonline_public_api_autonomous_mode()
+
+
+def test_autonomous_mode_accepts_padded_and_uppercased_transport(monkeypatch):
+    _blank_autonomous_env(monkeypatch)
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "  DIRECT ")
+
+    main_mod._enable_pharmonline_public_api_autonomous_mode()
+
+    assert main_mod.os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] == "direct"
+
+
+def test_provenance_guards_still_reject_a_direct_ledger_row():
+    """Разрешив direct скрейпить, мы не разрешали ему писать в реестры.
+
+    Эти гарды защищают необратимые записи и остаются decodo-only.
+    """
+    with pytest.raises(Exception):
+        main_mod._require_pharmonline_public_api_reconciliation_proof(
+            source_manifest_sha256="0" * 64,
+            catalog_fingerprint_sha256="0" * 64,
+            source_transport="direct",
+            preflight_run_ref="1",
+        )
 
 
 def test_single_category_run_only_requests_sites_with_configured_route():
