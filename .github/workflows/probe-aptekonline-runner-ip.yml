@@ -1,0 +1,79 @@
+name: probe-aptekonline-runner-ip
+
+# Диагностика на $0, запускается руками.
+#
+# aptekonline.az отдаёт 403 с Cloudflare-страницей любому IP Contabo — и прода,
+# и dev-бокса. Поэтому сайт собирают через платный прокси. Но проверено
+# 2026-10-04: сайт НЕ заперт по стране, чистый выход ScraperAPI (US/EU, даже без
+# premium) получает настоящие данные. Значит дело в репутации датацентрового
+# ASN, а не в географии — и возникает вопрос, который до сих пор никто не задал:
+# а проходит ли IP раннера GitHub?
+#
+# Существующий production-aptekonline-scrape.yml ответа не даёт: он заходит на
+# прод по SSH и ходит на сайт оттуда, с того же забаненного адреса.
+#
+# Если раннер проходит, прокси для aptekonline не нужен вообще и расход на него
+# становится нулевым. Если нет — мы на $0 закрыли вопрос и покупаем прокси
+# осознанно.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [probe/aptekonline-runner-ip]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Показать, откуда идёт запрос
+        run: |
+          echo "Выходной IP раннера: $(curl -s --max-time 20 https://api.ipify.org || echo '(не определить)')"
+
+      - name: Прочитать токен checkus из исходника
+        id: token
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          src = open("src/scrapers/aptekonline.py").read()
+          m = re.search(r'_DEFAULT_CHECKUS\s*=\s*"([^"]+)"', src)
+          # Это не наш секрет: статичный токен самого сайта, он лежит в их
+          # публичном assets/js/main.js и уже закоммичен в этом репозитории.
+          print(f"checkus={m.group(1) if m else ''}")
+          PY
+
+      - name: Запросить JSON-каталог напрямую
+        env:
+          CHECKUS: ${{ steps.token.outputs.checkus }}
+        run: |
+          set -o pipefail
+          UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
+          URL='https://www.aptekonline.az/shop/productList?categoryId%5B%5D=25&lang=az&page=1'
+
+          code=$(curl -s -o body.json -w '%{http_code}' --max-time 45 \
+                   -A "$UA" -H "checkus: $CHECKUS" -H 'Accept: application/json' "$URL" || true)
+          echo "HTTP $code, $(wc -c < body.json) байт"
+
+          if grep -q '_cf_chl_opt\|Just a moment' body.json; then
+            echo "::warning::Cloudflare показал челлендж — IP раннера тоже заблокирован. Прокси для aptekonline нужен."
+            head -c 200 body.json; echo
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("body.json"))
+          total, rows = d.get("total"), len(d.get("data") or [])
+          print(f"total={total}  строк на странице={rows}")
+          if rows:
+              print("первый товар:", (d["data"][0].get("name") or "")[:60])
+          if not rows:
+              print("::warning::Ответ валидный, но пустой — категория могла опустеть, проверь другую.")
+              sys.exit(1)
+          print("::notice::Раннер GitHub проходит Cloudflare. Прокси для aptekonline не нужен.")
+          PY
