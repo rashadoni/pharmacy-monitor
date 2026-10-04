@@ -89,6 +89,19 @@ _CATALOG_ATTEMPTS_ENV = "PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS"
 _CATALOG_RETRY_DELAY_SECONDS_ENV = "PHARMONLINE_PUBLIC_API_CATALOG_RETRY_DELAY_SECONDS"
 _MAX_CATALOG_ATTEMPTS = 3
 _DEFAULT_DECODO_CATALOG_RETRY_DELAY_SECONDS = 60
+# The public catalog answers this server directly, without any intermediary.
+# Keep the retry budget and transient-status set in line with the proxied
+# transports: a direct request can still meet a brief origin hiccup, and a
+# partial catalog must fail closed exactly as it does behind a proxy.
+_MAX_DIRECT_ATTEMPTS = 3
+_DIRECT_TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
+# Mirrors a current desktop browser. The public endpoints answer a default
+# httpx agent with 403, which would be indistinguishable from a real block.
+_DIRECT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+)
+_DIRECT_TRANSPORT = "direct"
 _CRAWLBASE_TRANSPORT = "crawlbase"
 _DECODO_TRANSPORT = "decodo"
 _SCRAPERAPI_TRANSPORT = "scraperapi"
@@ -483,6 +496,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         if transport not in {
             _CRAWLBASE_TRANSPORT,
             _DECODO_TRANSPORT,
+            _DIRECT_TRANSPORT,
             _SCRAPERAPI_TRANSPORT,
             _FIRECRAWL_TRANSPORT,
         }:
@@ -502,7 +516,18 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         self._firecrawl_credits = 0
         self._firecrawl_max_requests = 0
 
-        if transport == _CRAWLBASE_TRANSPORT:
+        if transport == _DIRECT_TRANSPORT:
+            # No credentials, no session juggling: one exit, this host. The
+            # sticky-session machinery of the proxied transports exists only
+            # to stop two proxy exits serving different cache variants into
+            # one catalog, which cannot happen when there is no proxy.
+            self._client = httpx.AsyncClient(
+                timeout=60.0,
+                follow_redirects=True,
+                headers={"user-agent": _DIRECT_USER_AGENT},
+            )
+            log.info("pharmonline_public_api_direct_transport_configured")
+        elif transport == _CRAWLBASE_TRANSPORT:
             token = _text(os.environ.get("CRAWLBASE_JS_TOKEN"))
             if token is None:
                 raise SiteScrapeFatalError("Crawlbase JS token is not configured")
@@ -1151,6 +1176,68 @@ class PharmonlinePublicAPIScraper(BaseScraper):
         self._record_origin_headers(target_url, response.headers)
         return response.text
 
+    async def _direct_body(
+        self,
+        target_url: str,
+        *,
+        accept: str,
+        crawlbase_session: str | None = None,
+    ) -> str:
+        """Fetch the native public response straight from the origin."""
+        # ``crawlbase_session`` is accepted for signature parity and ignored:
+        # a direct run has a single exit, so page groups cannot diverge.
+        del crawlbase_session
+        client: httpx.AsyncClient | None = getattr(self, "_client", None)
+        if client is None:
+            raise PharmonlinePublicAPIError("public_api_client_not_open")
+        response: httpx.Response | None = None
+        for attempt in range(1, _MAX_DIRECT_ATTEMPTS + 1):
+            try:
+                response = await client.get(target_url, headers={"accept": accept})
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                if attempt == _MAX_DIRECT_ATTEMPTS:
+                    raise PharmonlinePublicAPIError("direct_transient_request_failed") from None
+                log.warning(
+                    "pharmonline_public_api_transport_retry",
+                    transport=_DIRECT_TRANSPORT,
+                    resource=urlsplit(target_url).path,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                )
+                await asyncio.sleep(1)
+                continue
+            except httpx.HTTPError:
+                raise PharmonlinePublicAPIError("direct_request_failed") from None
+            if response.status_code == 200:
+                break
+            if (
+                response.status_code in _DIRECT_TRANSIENT_STATUSES
+                and attempt < _MAX_DIRECT_ATTEMPTS
+            ):
+                log.warning(
+                    "pharmonline_public_api_transport_retry",
+                    transport=_DIRECT_TRANSPORT,
+                    resource=urlsplit(target_url).path,
+                    attempt=attempt,
+                    status_code=response.status_code,
+                )
+                await asyncio.sleep(1)
+                continue
+            break
+        if response is None:
+            raise PharmonlinePublicAPIError("direct_response_missing")
+        if response.status_code in {401, 403, 451}:
+            # The origin itself refused this host. That is a site-level block,
+            # not a bad page: stop the run instead of reporting an empty
+            # catalog, exactly as a rejected proxy does.
+            raise SiteScrapeFatalError(
+                f"Pharmonline direct access rejected: HTTP {response.status_code}"
+            )
+        if response.status_code != 200:
+            raise PharmonlinePublicAPIError(f"direct_http_{response.status_code}")
+        self._record_origin_headers(target_url, response.headers)
+        return response.text
+
     async def _firecrawl_body(
         self,
         target_url: str,
@@ -1270,6 +1357,14 @@ class PharmonlinePublicAPIScraper(BaseScraper):
                     crawlbase_session=crawlbase_session,
                 )
             )
+        if self._transport_name() == _DIRECT_TRANSPORT:
+            return _json_from_rendered_body(
+                await self._direct_body(
+                    target_url,
+                    accept="application/json",
+                    crawlbase_session=crawlbase_session,
+                )
+            )
         if self._transport_name() == _SCRAPERAPI_TRANSPORT:
             return _json_from_rendered_body(
                 await self._scraperapi_body(
@@ -1312,6 +1407,12 @@ class PharmonlinePublicAPIScraper(BaseScraper):
     ) -> str:
         if self._transport_name() == _DECODO_TRANSPORT:
             return await self._decodo_body(
+                target_url,
+                accept="application/xml,text/xml;q=0.9,*/*;q=0.8",
+                crawlbase_session=crawlbase_session,
+            )
+        if self._transport_name() == _DIRECT_TRANSPORT:
+            return await self._direct_body(
                 target_url,
                 accept="application/xml,text/xml;q=0.9,*/*;q=0.8",
                 crawlbase_session=crawlbase_session,
