@@ -1387,6 +1387,94 @@ def latest_financial_run_ids_by_site(
     return out
 
 
+def _latest_snapshot_stmt(
+    session,
+    entities,
+    product_ids,
+    *,
+    financially_eligible_only: bool,
+    tenant_id: int,
+    include_run_id: int | None,
+):
+    """SELECT последнего snapshot'а на товар; `None`, если выбирать нечего.
+
+    Общая часть `latest_snapshots_per_product` (ORM-объекты) и
+    `latest_prices_per_product` (только нужные колонки): правило «какой snapshot
+    считать текущим» должно жить в одном месте.
+    """
+    from sqlalchemy import func, select
+
+    product_ids = list(product_ids) if not isinstance(product_ids, list) else product_ids
+    if not product_ids:
+        return None
+
+    eligible_run_ids: list[int] | None = None
+    if financially_eligible_only:
+        eligible_run_ids = financially_eligible_run_ids(
+            session,
+            tenant_id=tenant_id,
+            include_run_id=include_run_id,
+        )
+        if not eligible_run_ids:
+            return None
+
+    filters = [PriceSnapshot.product_id.in_(product_ids)]
+    if eligible_run_ids is not None:
+        filters.append(PriceSnapshot.run_id.in_(eligible_run_ids))
+
+    latest_at_subq = (
+        select(
+            PriceSnapshot.product_id,
+            func.max(PriceSnapshot.captured_at).label("max_at"),
+        )
+        .where(*filters)
+        .group_by(PriceSnapshot.product_id)
+        .subquery()
+    )
+    latest_stmt = select(*entities).join(
+        latest_at_subq,
+        (PriceSnapshot.product_id == latest_at_subq.c.product_id)
+        & (PriceSnapshot.captured_at == latest_at_subq.c.max_at),
+    )
+    if eligible_run_ids is not None:
+        latest_stmt = latest_stmt.where(PriceSnapshot.run_id.in_(eligible_run_ids))
+    return latest_stmt.order_by(PriceSnapshot.product_id, PriceSnapshot.id.desc())
+
+
+def latest_prices_per_product(
+    session,
+    product_ids,
+    *,
+    financially_eligible_only: bool = False,
+    tenant_id: int = 1,
+) -> dict[int, tuple[float | None, float | None, bool]]:
+    """`product_id → (price, discount_price, is_on_sale)` последнего snapshot'а.
+
+    То же правило выбора, что у `latest_snapshots_per_product`, но без сборки
+    ORM-объектов: страница сравнения читает цены тысяч товаров на каждый запрос,
+    и гидратация `PriceSnapshot` стоила там больше, чем сам SQL.
+    """
+    latest_stmt = _latest_snapshot_stmt(
+        session,
+        (
+            PriceSnapshot.product_id,
+            PriceSnapshot.price,
+            PriceSnapshot.discount_price,
+            PriceSnapshot.is_on_sale,
+        ),
+        product_ids,
+        financially_eligible_only=financially_eligible_only,
+        tenant_id=tenant_id,
+        include_run_id=None,
+    )
+    if latest_stmt is None:
+        return {}
+    out: dict[int, tuple[float | None, float | None, bool]] = {}
+    for product_id, price, discount_price, is_on_sale in session.execute(latest_stmt):
+        out.setdefault(product_id, (price, discount_price, bool(is_on_sale)))
+    return out
+
+
 def latest_snapshots_per_product(
     session,
     product_ids,
@@ -1411,45 +1499,17 @@ def latest_snapshots_per_product(
     Дубли по `(product_id, captured_at)` — крайне маловероятны, но
     разрулятся: возвращается первый встреченный.
     """
-    from sqlalchemy import func, select
-
-    product_ids = list(product_ids) if not isinstance(product_ids, list) else product_ids
-    if not product_ids:
-        return {}
-
-    eligible_run_ids: list[int] | None = None
-    if financially_eligible_only:
-        eligible_run_ids = financially_eligible_run_ids(
-            session,
-            tenant_id=tenant_id,
-            include_run_id=include_run_id,
-        )
-        if not eligible_run_ids:
-            return {}
-
-    filters = [PriceSnapshot.product_id.in_(product_ids)]
-    if eligible_run_ids is not None:
-        filters.append(PriceSnapshot.run_id.in_(eligible_run_ids))
-
-    latest_at_subq = (
-        select(
-            PriceSnapshot.product_id,
-            func.max(PriceSnapshot.captured_at).label("max_at"),
-        )
-        .where(*filters)
-        .group_by(PriceSnapshot.product_id)
-        .subquery()
+    latest_stmt = _latest_snapshot_stmt(
+        session,
+        (PriceSnapshot,),
+        product_ids,
+        financially_eligible_only=financially_eligible_only,
+        tenant_id=tenant_id,
+        include_run_id=include_run_id,
     )
-    latest_stmt = select(PriceSnapshot).join(
-            latest_at_subq,
-            (PriceSnapshot.product_id == latest_at_subq.c.product_id)
-            & (PriceSnapshot.captured_at == latest_at_subq.c.max_at),
-        )
-    if eligible_run_ids is not None:
-        latest_stmt = latest_stmt.where(PriceSnapshot.run_id.in_(eligible_run_ids))
-    snaps = session.scalars(
-        latest_stmt.order_by(PriceSnapshot.product_id, PriceSnapshot.id.desc())
-    ).all()
+    if latest_stmt is None:
+        return {}
+    snaps = session.scalars(latest_stmt).all()
     out: dict[int, PriceSnapshot] = {}
     for s in snaps:
         out.setdefault(s.product_id, s)
