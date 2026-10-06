@@ -447,10 +447,10 @@ def test_health_endpoint_aloe_full_does_not_mask_other_degraded_sites(client, se
 
 
 def test_health_endpoint_flags_staleness(client, setup_db):
-    """Daily-cadence site older than 30h → staleness_warning=true, status=degraded."""
+    """Пропущенный недельный сбор (>174ч) → staleness_warning=true, status=degraded."""
 
     db = setup_db
-    old = datetime.now(timezone.utc) - timedelta(hours=48)
+    old = datetime.now(timezone.utc) - timedelta(hours=200)
     db.add(
         storage.Product(
             tenant_id=1,
@@ -471,8 +471,9 @@ def test_health_endpoint_flags_staleness(client, setup_db):
     assert body["status"] == "degraded"
     sites = {s["site"]: s for s in body["sites"]}
     assert "aloe" in sites
-    assert sites["aloe"]["hours_since"] >= 48
-    assert sites["aloe"]["max_age_hours"] == 30
+    assert sites["aloe"]["hours_since"] >= 200
+    assert sites["aloe"]["cadence_hours"] == 168
+    assert sites["aloe"]["max_age_hours"] == 174
 
 
 def _add_aptekonline_product(db, *, hours_ago: int, external_id: str) -> None:
@@ -490,6 +491,31 @@ def _add_aptekonline_product(db, *, hours_ago: int, external_id: str) -> None:
         )
     )
     db.commit()
+
+
+def test_health_endpoint_stays_calm_mid_weekly_cycle(client, setup_db):
+    """Данные на 100ч — середина недельного цикла, тревоги быть не должно."""
+
+    db = setup_db
+    seen = datetime.now(timezone.utc) - timedelta(hours=100)
+    for i, site in enumerate(("pharmonline", "aptekonline", "aloe")):
+        db.add(
+            storage.Product(
+                tenant_id=1,
+                site=site,
+                external_id=f"midcycle-{i}",
+                url="https://example.com/x",
+                name="Mid cycle",
+                name_normalized="mid cycle",
+                last_seen_at=seen,
+                first_seen_at=seen,
+            )
+        )
+    db.commit()
+
+    body = client.get("/health").json()
+    assert body["staleness_warning"] is False
+    assert all(s["cadence_hours"] == 168 for s in body["sites"])
 
 
 def test_health_endpoint_uses_weekly_aptekonline_threshold(client, setup_db):

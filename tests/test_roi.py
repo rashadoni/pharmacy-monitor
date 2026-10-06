@@ -856,10 +856,11 @@ def test_roi_cache_waits_until_every_site_has_verified_full_scan(db_session):
 
 
 def test_roi_cache_rejects_stale_verified_site_inputs(db_session):
+    # 175ч — чуть за недельным порогом (ритм 168ч + запас 6ч, см. src/cadence.py).
     run = Run(
-        started_at=utcnow() - timedelta(hours=31),
+        started_at=utcnow() - timedelta(hours=175),
         status="ok",
-        finished_at=utcnow() - timedelta(hours=31),
+        finished_at=utcnow() - timedelta(hours=175),
         catalog_scope="full",
         full_catalog_sites="pharmonline,aptekonline,aloe",
         catalog_verified=True,

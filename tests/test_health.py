@@ -291,26 +291,22 @@ def test_site_silence_critical_when_one_site_stale(db_session):
     assert "aloe" not in silent_sites  # aloe свежий — не должен попасть
 
 
-def test_site_silence_respects_weekly_aptekonline_cadence(db_session):
-    """Регрессия: недельный aptekonline на 100ч идёт по графику, а не молчит.
+def test_site_silence_respects_weekly_cadence(db_session):
+    """Регрессия: на 100ч данные идут по графику, а не «молчат».
 
-    Aptekonline собирается раз в неделю (решение владельца 2026-10-04), aloe —
-    ежедневно. Один и тот же возраст данных означает для них разное: для aloe
-    это пропущенные четверо суток, для aptekonline — середина штатного цикла.
-    До правки оба сравнивались с 30ч, и дашборд красил aptekonline красным
-    6 дней из 7.
+    С 2026-10-06 все три сайта собираются полным каталогом раз в неделю, поэтому
+    четырёхсуточный возраст данных — штатная середина цикла. Пока пороги были
+    суточными (30ч), дашборд красил сайт красным 6 дней из 7 и слал CRITICAL.
     """
     now = utcnow()
-    apt_run = _add_run(db_session, now - timedelta(hours=100))
-    _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=100))
-    aloe_run = _add_run(db_session, now - timedelta(hours=100))
-    _add_snap(db_session, aloe_run, "aloe", 30, last_seen_at=now - timedelta(hours=100))
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        run = _add_run(db_session, now - timedelta(hours=100))
+        _add_snap(db_session, run, site, 30, last_seen_at=now - timedelta(hours=100))
     db_session.commit()
 
     rep = check_health(db_session, max_age_hours=26)
     silent_sites = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
-    assert "aptekonline" not in silent_sites
-    assert "aloe" in silent_sites
+    assert silent_sites == set()
 
 
 def test_site_thresholds_follow_declared_cadence():
@@ -318,18 +314,18 @@ def test_site_thresholds_follow_declared_cadence():
     from src import health as h
     from src.cadence import site_cadence_hours
 
-    # Суточные сайты сохраняют исторические значения 30ч / 3д / 2д.
-    for site in ("pharmonline", "aloe"):
-        assert site_cadence_hours(site) == 24
-        assert h._SITE_MAX_AGE_HOURS[site] == 30
-        assert h._SITE_FRESHNESS_DAYS[site] == 3
-        assert h._SITE_COVERAGE_DAYS[site] == 2
+    # Недельный ритм у всех трёх сайтов (решение владельца 2026-10-06).
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        assert site_cadence_hours(site) == 168
+        assert h._SITE_MAX_AGE_HOURS[site] == 174
+        assert h._SITE_FRESHNESS_DAYS[site] == 9
+        assert h._SITE_COVERAGE_DAYS[site] == 8
 
-    # Недельный сайт получает пропорционально широкие окна.
-    assert site_cadence_hours("aptekonline") == 168
-    assert h._SITE_MAX_AGE_HOURS["aptekonline"] == 174
-    assert h._SITE_FRESHNESS_DAYS["aptekonline"] == 9
-    assert h._SITE_COVERAGE_DAYS["aptekonline"] == 8
+    # Формула не ломает суточный случай: сайт без объявленного ритма получает
+    # ровно исторические 30ч, чтобы новый сайт не стартовал с недельным окном.
+    from src.cadence import site_max_age_hours
+
+    assert site_max_age_hours("site-without-declared-cadence") == 30
 
     # Инвариант site_drop: окно покрытия всегда строго уже окна свежести,
     # иначе частичный тик уронит метрику (см. docstring _check_site_drops).
@@ -338,7 +334,7 @@ def test_site_thresholds_follow_declared_cadence():
 
 
 def test_site_silence_flags_long_aptekonline_outage(db_session):
-    """Пропущенный недельный сбор (>174ч) — всё ещё critical."""
+    """Пропущенный недельный сбор (>174ч) — всё ещё critical, тревога не глушится."""
     now = utcnow()
     apt_run = _add_run(db_session, now - timedelta(hours=210))
     _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=210))
@@ -478,10 +474,11 @@ def test_site_drop_warning(db_session):
     """Если за окно покрытия видели <50% живого каталога — alert."""
     base = utcnow()
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=30)
-    # Живой каталог: 100 товаров, виденных 2.5 дня назад (в окне свежести 3д,
-    # но ВНЕ окна покрытия 2д) — недавние скрейпы их НЕ переснимали.
-    old = _add_run(db_session, base - timedelta(days=2, hours=12), products_scraped=100)
-    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=2, hours=12))
+    # Живой каталог: 100 товаров, виденных 8.5 дней назад (в окне свежести 9д,
+    # но ВНЕ окна покрытия 8д) — недавние скрейпы их НЕ переснимали. Возраст
+    # привязан к недельному ритму: окна выводятся из него (src/cadence.py).
+    old = _add_run(db_session, base - timedelta(days=8, hours=12), products_scraped=100)
+    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=8, hours=12))
     # Недавнее покрытие: только 30 товаров за окно покрытия.
     _add_snap(db_session, cur, "pharmonline", 30, last_seen_at=base - timedelta(hours=1))
     db_session.commit()
@@ -694,15 +691,15 @@ def test_brand_coverage_partial_intraday_tick_skipped(db_session):
 def test_site_drop_below_20_percent_critical(db_session):
     base = utcnow()
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=10)
-    # Каталог 100 виден 2.5 дня назад (вне окна покрытия), недавно — лишь 10.
-    old = _add_run(db_session, base - timedelta(days=2, hours=12), products_scraped=100)
-    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=2, hours=12))
+    # Каталог 100 виден 8.5 дней назад (вне окна покрытия), недавно — лишь 10.
+    old = _add_run(db_session, base - timedelta(days=8, hours=12), products_scraped=100)
+    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=8, hours=12))
     _add_snap(db_session, cur, "pharmonline", 10, last_seen_at=base - timedelta(hours=1))
     db_session.commit()
 
     rep = check_health(db_session, site_drop_threshold=0.5)
     drop_issues = [i for i in rep.issues if i.code == "site_drop"]
-    # seen(2д)=10, total(3д)=110 → 9% → critical
+    # seen(8д)=10, total(9д)=110 → 9% → critical
     assert any(i.severity == "critical" for i in drop_issues)
 
 
