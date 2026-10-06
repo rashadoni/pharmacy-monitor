@@ -187,3 +187,45 @@ def test_weekly_site_offer_goes_stale_after_missed_scan():
         product = _product(site)
         product.availability_observed_at = now - timedelta(hours=200)
         assert offer_is_fresh(product, now=now) is False, site
+
+
+def test_full_verification_reason_prefers_untruncated_run_quality():
+    """Причина отказа читается целиком, а не обрезанной до varchar(300).
+
+    Регрессия по реальному кейсу: у pharmonline строка обрывалась на
+    `catalog_floor_missing` без значения, и это читалось как отказ из-за
+    catalog_floor, хотя настоящая причина — `missing_trusted_ids=15`, а
+    различающие счётчики (mismatched_urls, id_collisions, url_collisions)
+    в колонку вообще не помещались.
+    """
+    from types import SimpleNamespace
+
+    from src.product_policy import _full_verification_reason
+
+    full = "public_api_identity_proof_failed:" + "detail=1, " * 40
+    run = SimpleNamespace(
+        run_quality={"catalog_verification_reason_full": full},
+        catalog_verification_reason=full[:300],
+    )
+    assert _full_verification_reason(run) == full
+    assert len(_full_verification_reason(run)) > 300
+
+
+def test_full_verification_reason_falls_back_to_column():
+    """Старые прогоны без run_quality по-прежнему отдают, что есть в колонке."""
+    from types import SimpleNamespace
+
+    from src.product_policy import _full_verification_reason
+
+    assert (
+        _full_verification_reason(
+            SimpleNamespace(run_quality=None, catalog_verification_reason="legacy_reason")
+        )
+        == "legacy_reason"
+    )
+    assert (
+        _full_verification_reason(
+            SimpleNamespace(run_quality={}, catalog_verification_reason="legacy_reason")
+        )
+        == "legacy_reason"
+    )

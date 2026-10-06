@@ -570,8 +570,11 @@ def full_catalog_trust_report(
                 "latest_full_attempt_verified": bool(
                     latest_attempt and latest_attempt.catalog_verified
                 ),
+                # Предпочитаем необрезанную причину из run_quality: колонка
+                # catalog_verification_reason — varchar(300), и срез съедает
+                # ровно те счётчики, которые объясняют отказ.
                 "latest_full_attempt_reason": (
-                    latest_attempt.catalog_verification_reason if latest_attempt else None
+                    _full_verification_reason(latest_attempt) if latest_attempt else None
                 ),
                 "full_catalog_run_id": relevant_run.id if relevant_run else None,
                 "full_catalog_at": run_at,
@@ -601,6 +604,21 @@ def full_catalog_trust_report(
         "policy_ready": policy_ready,
         "sites": sites,
     }
+
+
+def _full_verification_reason(run: Any) -> str | None:
+    """Полная причина отказа проверки каталога, если она сохранена.
+
+    `Run.catalog_verification_reason` — varchar(300); при длинном отказе хвост
+    со счётчиками теряется, а именно он и объясняет, что пошло не так. Пайплайн
+    дублирует полную строку в `run_quality` (JSON, без лимита) — читаем её, а на
+    колонку падаем только для старых прогонов, записанных до этой правки.
+    """
+    quality = getattr(run, "run_quality", None) or {}
+    full = quality.get("catalog_verification_reason_full")
+    if isinstance(full, str) and full:
+        return full
+    return getattr(run, "catalog_verification_reason", None)
 
 
 def trusted_catalog_epoch(
