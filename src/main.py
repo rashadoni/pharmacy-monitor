@@ -5235,14 +5235,24 @@ def run_cmd(
                         # identities did not prove lineage to the trusted DDP
                         # catalog.  Do not leave this attempt marked verified.
                         guarded_catalog_verified = False
-                        guarded_catalog_reason = (
+                        full_reason = (
                             f"public_api_identity_proof_failed:{str(exc).split(': ', 1)[-1]}"
-                        )[:300]
+                        )
+                        # Колонка catalog_verification_reason — varchar(300), и
+                        # обрезка приходится ровно на хвост: mismatched_urls,
+                        # id_collisions, url_collisions. Именно эти счётчики и
+                        # различают причины отказа, а в БД от них не остаётся
+                        # ничего — строка обрывается на catalog_floor_missing
+                        # без значения, что читается как «отказ из-за floor»,
+                        # хотя floor тут ни при чём. Полную причину кладём в
+                        # run_quality: это JSON, без лимита длины.
+                        guarded_catalog_reason = full_reason[:300]
                         run.catalog_verified = False
                         run.catalog_verification_reason = guarded_catalog_reason
                         quality["full_catalog_verified"] = False
                         quality["financially_eligible"] = False
                         quality["catalog_verification_reason"] = guarded_catalog_reason
+                        quality["catalog_verification_reason_full"] = full_reason
                         run.run_quality = quality
                         raise
             count = persist_results(session, run, results)
