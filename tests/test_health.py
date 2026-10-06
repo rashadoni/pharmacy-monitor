@@ -316,16 +316,17 @@ def test_site_silence_respects_weekly_aptekonline_cadence(db_session):
 def test_site_thresholds_follow_declared_cadence():
     """Пороги выводятся из ритма сбора, а не прибиты гвоздями по сайтам."""
     from src import health as h
+    from src.cadence import site_cadence_hours
 
     # Суточные сайты сохраняют исторические значения 30ч / 3д / 2д.
     for site in ("pharmonline", "aloe"):
-        assert h.site_cadence_hours(site) == 24
+        assert site_cadence_hours(site) == 24
         assert h._SITE_MAX_AGE_HOURS[site] == 30
         assert h._SITE_FRESHNESS_DAYS[site] == 3
         assert h._SITE_COVERAGE_DAYS[site] == 2
 
     # Недельный сайт получает пропорционально широкие окна.
-    assert h.site_cadence_hours("aptekonline") == 168
+    assert site_cadence_hours("aptekonline") == 168
     assert h._SITE_MAX_AGE_HOURS["aptekonline"] == 174
     assert h._SITE_FRESHNESS_DAYS["aptekonline"] == 9
     assert h._SITE_COVERAGE_DAYS["aptekonline"] == 8

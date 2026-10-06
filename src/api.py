@@ -595,7 +595,7 @@ class WatchlistCategoryIn(BaseModel):
 
 
 # Fallback staleness threshold (hours) for a site with no declared cadence
-# (>30h = at least one daily run skipped). ``health.SITE_SCRAPE_CADENCE_HOURS``
+# (>30h = at least one daily run skipped). ``cadence.SITE_SCRAPE_CADENCE_HOURS``
 # and the ``health._SITE_MAX_AGE_HOURS`` derived from it are the single source
 # for the three monitored sites. Surfaced in `/health.staleness_warning`.
 _HEALTH_STALENESS_HOURS = 30
@@ -610,7 +610,7 @@ def _site_staleness_threshold(site: str) -> int:
 
 def _site_cadence_hours(site: str) -> int:
     """How often this site is scheduled for a full scan (hours)."""
-    from src.health import site_cadence_hours
+    from src.cadence import site_cadence_hours
 
     return site_cadence_hours(site)
 
