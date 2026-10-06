@@ -475,24 +475,47 @@ def test_health_endpoint_flags_staleness(client, setup_db):
     assert sites["aloe"]["max_age_hours"] == 30
 
 
-def test_health_endpoint_uses_daily_aptekonline_threshold(client, setup_db):
-    """Aptekonline older than the 30h daily SLO is explicitly stale."""
-
-    db = setup_db
-    old = datetime.now(timezone.utc) - timedelta(hours=100)
+def _add_aptekonline_product(db, *, hours_ago: int, external_id: str) -> None:
+    seen = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
     db.add(
         storage.Product(
             tenant_id=1,
             site="aptekonline",
-            external_id="daily-stale-1",
+            external_id=external_id,
             url="https://example.com/aptek",
-            name="Daily stale",
-            name_normalized="daily stale",
-            last_seen_at=old,
-            first_seen_at=old,
+            name="Aptek",
+            name_normalized="aptek",
+            last_seen_at=seen,
+            first_seen_at=seen,
         )
     )
     db.commit()
+
+
+def test_health_endpoint_uses_weekly_aptekonline_threshold(client, setup_db):
+    """Регрессия: недельный aptekonline на 100ч НЕ поднимает тревогу.
+
+    Сайт собирается раз в неделю, поэтому четырёхсуточные данные — штатная
+    середина цикла. До правки порог был суточный (30ч), и клиент видел красную
+    карточку плюс баннер «система требует внимания» почти всю неделю подряд.
+    """
+
+    _add_aptekonline_product(setup_db, hours_ago=100, external_id="weekly-fresh-1")
+
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["staleness_warning"] is False
+    sites = {s["site"]: s for s in body["sites"]}
+    assert sites["aptekonline"]["hours_since"] >= 100
+    assert sites["aptekonline"]["cadence_hours"] == 168
+    assert sites["aptekonline"]["max_age_hours"] == 174
+
+
+def test_health_endpoint_flags_missed_weekly_aptekonline_scan(client, setup_db):
+    """Пропущенный недельный сбор (>174ч) по-прежнему помечается как stale."""
+
+    _add_aptekonline_product(setup_db, hours_ago=200, external_id="weekly-stale-1")
 
     r = client.get("/health")
     assert r.status_code == 200
@@ -501,8 +524,7 @@ def test_health_endpoint_uses_daily_aptekonline_threshold(client, setup_db):
     assert body["status"] == "degraded"
     assert body["full_catalog_status"] == "missing"
     sites = {s["site"]: s for s in body["sites"]}
-    assert sites["aptekonline"]["hours_since"] >= 100
-    assert sites["aptekonline"]["max_age_hours"] == 30
+    assert sites["aptekonline"]["hours_since"] >= 200
 
 
 def test_health_endpoint_degrades_on_latest_failed_run(client, setup_db):

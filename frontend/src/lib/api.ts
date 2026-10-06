@@ -867,6 +867,9 @@ export interface HealthSite {
   last_seen_at: string | null;
   hours_since: number | null;
   max_age_hours: number;
+  /** How often this site is scheduled for a full scan. Optional: an older
+   *  backend does not send it yet, so consumers must tolerate `undefined`. */
+  cadence_hours?: number;
 }
 
 export interface Health {

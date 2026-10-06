@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal
@@ -579,12 +580,43 @@ def alert_due(
     return elapsed < timedelta(0) or elapsed >= timedelta(hours=cooldown_hours)
 
 
+# ─── Ритм сбора per-site ─────────────────────────────────────────────────────
+# ЕДИНСТВЕННЫЙ источник правды для всех порогов ниже (молчание, свежесть,
+# покрытие). Обязан совпадать с systemd-таймерами на проде:
+#   infra/systemd/overrides/pharmacy-monitor-scrape@<site>.timer.d/zz-*-cadence.conf
+#
+# Рассинхрон этих двух мест уже стоил ложной тревоги: 2026-10-04 aptekonline
+# перевели на недельный ритм (его Cloudflare обходится только платным выходом,
+# ежедневно ≈$149/мес против $49 за недельный), а пороги остались суточными —
+# дашборд красил сайт красным 6 дней из 7, хотя он собирался ровно по графику.
+SITE_SCRAPE_CADENCE_HOURS: dict[str, int] = {
+    "pharmonline": 24,
+    "aptekonline": 168,  # недельный ритм, решение владельца 2026-10-04
+    "aloe": 24,
+}
+_DEFAULT_CADENCE_HOURS = 24
+
+# Запас поверх ритма на jitter/retry и длительность самого прогона: сайт
+# считается молчащим только когда пропущен ЦЕЛЫЙ запуск плюс этот запас.
+_CADENCE_GRACE_HOURS = 6
+
+
+def site_cadence_hours(site: str) -> int:
+    """Ожидаемый интервал между полными сборами сайта (часы)."""
+    return SITE_SCRAPE_CADENCE_HOURS.get(site, _DEFAULT_CADENCE_HOURS)
+
+
+def _cadence_days(site: str) -> int:
+    """Ритм сбора в днях, вверх: суточный → 1, недельный → 7."""
+    return max(1, math.ceil(site_cadence_hours(site) / 24))
+
+
+# Окно СВЕЖЕСТИ для знаменателя site_drop: живым считается каталог, виденный за
+# один цикл сбора + 2 дня запаса (суточный сайт → 3д, недельный → 9д). Раньше
+# тут стояла константа 3 для всех — у недельного сайта она обнуляла знаменатель
+# уже на четвёртый день, и проверка покрытия молча отключалась.
 _SITE_FRESHNESS_DAYS: dict[str, int] = {
-    # A current catalog must be no more than one missed daily run old.  The
-    # larger values used to hide a broken weekly production override for days.
-    "pharmonline": 3,
-    "aptekonline": 3,
-    "aloe": 3,
+    site: _cadence_days(site) + 2 for site in SITE_SCRAPE_CADENCE_HOURS
 }
 _DEFAULT_FRESHNESS_DAYS = 3
 
@@ -594,13 +626,10 @@ _DEFAULT_FRESHNESS_DAYS = 3
 # (pharmonline run_277 = 127 товаров featured-выборки), тогда seen=127/каталог
 # дал бы ложный site_drop. Окно включает последний ПОЛНЫЙ прогон → одиночный
 # частичный прогон метрику не роняет. Должно быть < _SITE_FRESHNESS_DAYS.
+# Один цикл сбора + 1 день запаса (суточный → 2д, недельный → 8д) — окно всегда
+# захватывает последний ПОЛНЫЙ прогон и всегда уже окна свежести.
 _SITE_COVERAGE_DAYS: dict[str, int] = {
-    # A partial/watchlist tick must not make the latest full daily scan look
-    # like a coverage drop.  Two days include yesterday's verified full pass
-    # while detecting a missed cadence promptly.
-    "pharmonline": 2,
-    "aptekonline": 2,
-    "aloe": 2,
+    site: _cadence_days(site) + 1 for site in SITE_SCRAPE_CADENCE_HOURS
 }
 _DEFAULT_COVERAGE_DAYS = 2
 
@@ -845,13 +874,12 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
     return []
 
 
-# Per-site пороги «молчания» (часы). 30ч = ежедневный запуск + разумный запас
-# на jitter/retry.  Values live here rather than in an undocumented systemd
-# override so health fails closed when the promised daily cadence stops.
+# Per-site пороги «молчания» (часы) = ритм сбора + запас (см.
+# SITE_SCRAPE_CADENCE_HOURS выше): суточный сайт → 30ч, недельный → 174ч.
+# Values live here rather than in an undocumented systemd override so health
+# fails closed when the promised cadence stops.
 _SITE_MAX_AGE_HOURS: dict[str, int] = {
-    "aptekonline": 30,
-    "pharmonline": 30,
-    "aloe": 30,
+    site: cadence + _CADENCE_GRACE_HOURS for site, cadence in SITE_SCRAPE_CADENCE_HOURS.items()
 }
 
 
