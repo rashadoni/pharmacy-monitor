@@ -447,23 +447,33 @@ class CatalogIndex:
 
 # ─── Кэш индекса в процессе ──────────────────────────────────────────────────
 
-# Индекс пересобирается, когда меняется «отпечаток» каталога (появились товары
-# или завершился прогон), и в любом случае раз в _MAX_AGE_SECONDS: правка
-# названия без нового прогона не должна оставаться невидимой надолго.
+# Индекс обновляется, когда меняется «отпечаток» каталога (появились товары или
+# завершился прогон), и в любом случае раз в _MAX_AGE_SECONDS: правка названия
+# без нового прогона не должна оставаться невидимой надолго.
 _MAX_AGE_SECONDS = 30 * 60
 # …но не чаще раза в _MIN_AGE_SECONDS: пока прогон пишет товары пачками,
-# отпечаток меняется каждые несколько секунд, и без этого порога каждый запрос
-# поиска во время прогона платил бы за пересборку.
+# отпечаток меняется каждые несколько секунд.
 _MIN_AGE_SECONDS = 60
 
-_lock = threading.Lock()
-_cache: dict[int, tuple[tuple[Any, ...], float, CatalogIndex]] = {}
+_Cached = tuple[tuple[Any, ...], float, CatalogIndex]  # (отпечаток, когда собран, индекс)
+
+_lock = threading.Lock()  # сборка индекса: одна за раз
+_refresh_lock = threading.Lock()  # учёт фоновых потоков; не ждёт сборку
+_cache: dict[int, _Cached] = {}
+_refreshing: dict[int, threading.Thread] = {}
 
 
 def reset_cache() -> None:
-    """Сбросить индекс (тесты; после массовой правки каталога)."""
+    """Сбросить индекс В ЭТОМ процессе (тесты).
+
+    У каждого воркера API свой индекс; скрипт обслуживания чужой процесс так не
+    сбросит — воркеры подхватят правку сами в пределах `_MAX_AGE_SECONDS`.
+    """
+    for thread in list(_refreshing.values()):
+        thread.join(timeout=30)
     with _lock:
         _cache.clear()
+        _refreshing.clear()
 
 
 def _stamp(session: Any, tenant_id: int) -> tuple[Any, ...]:
@@ -472,7 +482,9 @@ def _stamp(session: Any, tenant_id: int) -> tuple[Any, ...]:
 
     from src import storage
 
-    max_product_id = session.scalar(select(func.max(storage.Product.id)))
+    max_product_id = session.scalar(
+        select(func.max(storage.Product.id)).where(storage.Product.tenant_id == tenant_id)
+    )
     last_run = session.execute(
         select(func.max(storage.Run.id), func.max(storage.Run.finished_at)).where(
             storage.Run.tenant_id == tenant_id
@@ -481,57 +493,113 @@ def _stamp(session: Any, tenant_id: int) -> tuple[Any, ...]:
     return (max_product_id, last_run[0], last_run[1])
 
 
-def _fresh(cached: tuple[tuple[Any, ...], float, CatalogIndex] | None, stamp, now: float):
-    if cached is None:
-        return None
+def _is_fresh(cached: _Cached, stamp: tuple[Any, ...], now: float) -> bool:
     age = now - cached[1]
-    if age < _MIN_AGE_SECONDS or (cached[0] == stamp and age < _MAX_AGE_SECONDS):
-        return cached[2]
-    return None
+    return age < _MIN_AGE_SECONDS or (cached[0] == stamp and age < _MAX_AGE_SECONDS)
 
 
-def get_index(session: Any, *, tenant_id: int = 1) -> CatalogIndex:
-    """Актуальный индекс арендатора; собирает его при первом обращении."""
+def _build(session: Any, tenant_id: int) -> _Cached:
     from sqlalchemy import select
 
     from src import storage
 
+    started = time.perf_counter()
     stamp = _stamp(session, tenant_id)
-    now = time.monotonic()
-    index = _fresh(_cache.get(tenant_id), stamp, now)
-    if index is not None:
-        return index
+    rows = session.execute(
+        select(
+            storage.Product.id,
+            storage.Product.site,
+            storage.Product.name,
+            storage.Product.brand,
+            storage.Product.brand_verified,
+        ).where(
+            storage.Product.tenant_id == tenant_id,
+            storage.Product.url_dead_at.is_(None),
+        )
+    ).all()
+    # `brand` на двух сайтах из трёх — первое слово названия, настоящий
+    # производитель лежит в `brand_verified`; искать нужно по обоим.
+    index = CatalogIndex(
+        [
+            (pid, site, name, " ".join(b for b in (brand, verified) if b) or None)
+            for pid, site, name, brand, verified in rows
+        ]
+    )
+    log.info(
+        "catalog_search_index_built",
+        tenant_id=tenant_id,
+        products=len(index),
+        seconds=round(time.perf_counter() - started, 3),
+    )
+    return (stamp, time.monotonic(), index)
+
+
+def _refresh_in_background(tenant_id: int, session_factory: Any) -> None:
+    """Пересобрать индекс в отдельном потоке, не задерживая запрос."""
+
+    def work() -> None:
+        try:
+            with session_factory() as session:
+                built = _build(session, tenant_id)
+            _cache[tenant_id] = built
+        except Exception as exc:  # следующий запрос попробует снова
+            log.warning("catalog_search_index_refresh_failed", tenant_id=tenant_id, error=str(exc))
+        finally:
+            _refreshing.pop(tenant_id, None)
+
+    with _refresh_lock:
+        if tenant_id in _refreshing:
+            return
+        thread = threading.Thread(target=work, name=f"catalog-search-{tenant_id}", daemon=True)
+        _refreshing[tenant_id] = thread
+    thread.start()
+
+
+def get_index(
+    session: Any,
+    *,
+    tenant_id: int = 1,
+    session_factory: Any | None = None,
+) -> CatalogIndex:
+    """Индекс арендатора.
+
+    Сборка на каталоге в десятки тысяч товаров занимает около секунды, поэтому
+    запрос её ждёт только когда индекса ещё нет совсем. Если индекс есть, но
+    устарел, отдаём его как есть и обновляем в фоне (`session_factory` — чем
+    открыть для этого отдельную сессию): устаревший индекс безвреден, в нём
+    только названия, а цены, пары и наличие вызывающий код читает из БД свежими.
+    Без `session_factory` устаревший индекс пересобирается на месте.
+    """
+    cached = _cache.get(tenant_id)
+    if cached is not None:
+        if _is_fresh(cached, _stamp(session, tenant_id), time.monotonic()):
+            return cached[2]
+        if session_factory is not None:
+            _refresh_in_background(tenant_id, session_factory)
+            return cached[2]
 
     with _lock:
-        index = _fresh(_cache.get(tenant_id), stamp, now)
-        if index is not None:
-            return index
-        started = time.perf_counter()
-        rows = session.execute(
-            select(
-                storage.Product.id,
-                storage.Product.site,
-                storage.Product.name,
-                storage.Product.brand,
-                storage.Product.brand_verified,
-            ).where(
-                storage.Product.tenant_id == tenant_id,
-                storage.Product.url_dead_at.is_(None),
-            )
-        ).all()
-        # `brand` на двух сайтах из трёх — первое слово названия, настоящий
-        # производитель лежит в `brand_verified`; искать нужно по обоим.
-        index = CatalogIndex(
-            [
-                (pid, site, name, " ".join(b for b in (brand, verified) if b) or None)
-                for pid, site, name, brand, verified in rows
-            ]
-        )
-        _cache[tenant_id] = (stamp, now, index)
-        log.info(
-            "catalog_search_index_built",
-            tenant_id=tenant_id,
-            products=len(index),
-            seconds=round(time.perf_counter() - started, 3),
-        )
-        return index
+        current = _cache.get(tenant_id)
+        # Пока ждали замок, индекс мог собрать соседний поток.
+        if current is not None and current is not cached:
+            return current[2]
+        built = _build(session, tenant_id)
+        _cache[tenant_id] = built
+        return built[2]
+
+
+def warm(session_factory: Any) -> None:
+    """Собрать индексы всех арендаторов заранее (старт воркера API).
+
+    Иначе первый поиск после каждого рестарта ждал бы сборку.
+    """
+    from sqlalchemy import select
+
+    from src import storage
+
+    try:
+        with session_factory() as session:
+            for tenant_id in session.scalars(select(storage.Tenant.id)).all():
+                get_index(session, tenant_id=tenant_id)
+    except Exception as exc:  # прогрев — удобство, а не условие старта
+        log.warning("catalog_search_warm_failed", error=str(exc))

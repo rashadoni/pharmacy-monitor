@@ -23,7 +23,6 @@ import {
   api,
   ApiError,
   isFullCatalogTrustError,
-  type ComparisonOther,
   type ComparisonRow,
   type ComparisonSearchResult,
 } from "@/lib/api";
@@ -32,9 +31,10 @@ import { formatPrice, formatPct } from "@/lib/utils";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { Sparkline } from "@/components/sparkline";
 import { TableSkeleton } from "@/components/skeleton";
+import { OthersSection } from "./others-section";
+import { MIN_SEARCH_CHARS, SearchBox } from "./search-box";
+import { SITES, type SiteName } from "./sites";
 
-const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
-type SiteName = (typeof SITES)[number];
 type SortKey = "name" | "brand" | "spread" | SiteName;
 
 function initialMinSites(value: string | null): number {
@@ -56,10 +56,6 @@ function initialSort(value: string | null): { key: SortKey; dir: "asc" | "desc" 
 // тысячи строк; отрисованные разом (и в таблице, и в мобильных карточках),
 // они подвешивали страницу на каждом нажатии клавиши в поиске.
 const PAGE_SIZE = 100;
-// С одной буквы поиск вернул бы пол-каталога — ждём вторую.
-const MIN_SEARCH_CHARS = 2;
-
-type ComparisonCache = ComparisonRow[] | ComparisonSearchResult;
 
 export default function ComparisonPage() {
   const t = useTranslations("comparison");
@@ -78,7 +74,12 @@ export default function ComparisonPage() {
   const writtenSearches = useRef(new Set([urlSearch]));
   const lastWrittenSearch = useRef(urlSearch);
   useEffect(() => {
-    if (!writtenSearches.current.has(urlSearch)) {
+    if (urlSearch === lastWrittenSearch.current) {
+      // Адрес догнал нашу последнюю запись — прежние больше не «в пути».
+      // Иначе пустой поиск остался бы «своим» навсегда, и клик по пункту меню
+      // «Сравнение» (адрес без поиска) не сбрасывал бы поле.
+      writtenSearches.current = new Set([urlSearch]);
+    } else if (!writtenSearches.current.has(urlSearch)) {
       writtenSearches.current = new Set([urlSearch]);
       lastWrittenSearch.current = urlSearch;
       setSearch(urlSearch);
@@ -150,7 +151,16 @@ export default function ComparisonPage() {
   const filtered = useMemo(() => {
     if (!data) return data;
     const rows = data.filter((r) => {
-      if (diffOnly && (!r.spread_pct || r.spread_pct < 0.5)) return false;
+      // «Цены разные» — буквально: min ≠ max среди сравнимых цен. То же
+      // правило у первого листа Excel (comparison_export.has_price_difference);
+      // прежний порог 0.5% давал на экране меньше строк, чем в файле.
+      if (
+        diffOnly &&
+        (r.spread_pct == null ||
+          r.min_price == null ||
+          r.min_price === r.max_price)
+      )
+        return false;
       if (withAloe && !r.prices["aloe"]) return false;
       return true;
     });
@@ -251,29 +261,36 @@ export default function ComparisonPage() {
     mutationFn: (id: number) => api.rejectMatch(id),
     onMutate: async (id: number) => {
       // Optimistic: filter the row out immediately — и из полного списка, и из
-      // результатов поиска (оба лежат под ключом ["comparison", …]).
+      // результатов поиска. У них разные ключи и разная форма данных.
       await queryClient.cancelQueries({ queryKey: ["comparison"] });
-      const prev = queryClient.getQueriesData<ComparisonCache>({
-        queryKey: ["comparison"],
+      const prevLists = queryClient.getQueriesData<ComparisonRow[]>({
+        queryKey: ["comparison", "list"],
       });
-      queryClient.setQueriesData<ComparisonCache>(
-        { queryKey: ["comparison"] },
-        (old) => {
-          if (!old) return old;
-          if (Array.isArray(old)) {
-            return old.filter((r) => r.canonical_id !== id);
-          }
-          return {
+      const prevSearches = queryClient.getQueriesData<ComparisonSearchResult>({
+        queryKey: ["comparison", "search"],
+      });
+      queryClient.setQueriesData<ComparisonRow[]>(
+        { queryKey: ["comparison", "list"] },
+        (old) => old?.filter((r) => r.canonical_id !== id),
+      );
+      queryClient.setQueriesData<ComparisonSearchResult>(
+        { queryKey: ["comparison", "search"] },
+        (old) =>
+          old && {
             ...old,
             rows: old.rows.filter((r) => r.canonical_id !== id),
-          };
-        },
+          },
       );
-      return { prev };
+      return { prevLists, prevSearches };
     },
     onError: (_err, _id, ctx) => {
       // Rollback
-      ctx?.prev.forEach(([key, value]) => queryClient.setQueryData(key, value));
+      ctx?.prevLists.forEach(([key, value]) =>
+        queryClient.setQueryData(key, value),
+      );
+      ctx?.prevSearches.forEach(([key, value]) =>
+        queryClient.setQueryData(key, value),
+      );
     },
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["comparison"] });
@@ -561,238 +578,6 @@ export default function ComparisonPage() {
 
       {others.length > 0 && <OthersSection others={others} total={othersTotal} />}
     </div>
-  );
-}
-
-/**
- * Поле поиска с подсказками при наборе — «как в Google»: предлагает торговые
- * имена из каталога (и исправляет опечатки), выбор подставляет имя в поиск.
- */
-function SearchBox({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (next: string) => void;
-}) {
-  const t = useTranslations("comparison");
-  const [open, setOpen] = useState(false);
-  const [active, setActive] = useState(-1);
-  const term = useDebounce(value.trim(), 120);
-  const enabled = term.length >= MIN_SEARCH_CHARS;
-  const { data } = useQuery({
-    queryKey: ["comparison-suggest", term],
-    queryFn: () => api.comparisonSuggest(term),
-    enabled,
-    staleTime: 5 * 60_000,
-    placeholderData: keepPreviousData,
-  });
-  // Единственную подсказку, равную набранному, не показываем — она ничего не даёт.
-  const suggestions = useMemo(() => {
-    if (!enabled || !data) return [];
-    const typed = value.trim().toLowerCase();
-    return data.length === 1 && data[0].text.toLowerCase() === typed ? [] : data;
-  }, [data, enabled, value]);
-  const visible = open && suggestions.length > 0;
-  useEffect(() => setActive(-1), [suggestions]);
-
-  function pick(text: string) {
-    onChange(text);
-    setOpen(false);
-  }
-
-  return (
-    <div className="relative flex-1 md:min-w-64">
-      <input
-        type="search"
-        role="combobox"
-        aria-expanded={visible}
-        aria-controls="comparison-suggestions"
-        aria-autocomplete="list"
-        aria-activedescendant={
-          visible && active >= 0 ? `comparison-suggestion-${active}` : undefined
-        }
-        autoComplete="off"
-        maxLength={100}
-        placeholder={t("search_placeholder")}
-        aria-label={t("search_label")}
-        value={value}
-        onChange={(e) => {
-          onChange(e.target.value);
-          setOpen(true);
-        }}
-        onFocus={() => setOpen(true)}
-        onBlur={() => setOpen(false)}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            // У type="search" Escape по умолчанию стирает набранное. Первое
-            // нажатие должно только закрыть подсказки.
-            if (visible) e.preventDefault();
-            setOpen(false);
-            return;
-          }
-          if (!visible) return;
-          if (e.key === "ArrowDown") {
-            e.preventDefault();
-            setActive((i) => (i + 1) % suggestions.length);
-          } else if (e.key === "ArrowUp") {
-            e.preventDefault();
-            setActive((i) => (i <= 0 ? suggestions.length - 1 : i - 1));
-          } else if (e.key === "Enter" && active >= 0) {
-            e.preventDefault();
-            pick(suggestions[active].text);
-          }
-        }}
-        className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
-        data-testid="search-input"
-      />
-      {visible && (
-        <ul
-          id="comparison-suggestions"
-          role="listbox"
-          aria-label={t("suggest_label")}
-          className="absolute left-0 right-0 top-full z-20 mt-1 overflow-hidden rounded-md border border-border bg-background shadow-lg"
-          data-testid="search-suggestions"
-        >
-          {suggestions.map((s, i) => (
-            <li
-              key={s.text}
-              id={`comparison-suggestion-${i}`}
-              role="option"
-              aria-selected={i === active}
-              // mousedown, а не click: иначе поле успевает потерять фокус и
-              // список закрывается раньше, чем сработает выбор.
-              onMouseDown={(e) => {
-                e.preventDefault();
-                pick(s.text);
-              }}
-              onMouseEnter={() => setActive(i)}
-              className={`flex min-h-11 cursor-pointer items-center justify-between gap-3 px-3 py-2 text-sm md:min-h-9 ${
-                i === active ? "bg-muted" : ""
-              }`}
-            >
-              <span className="truncate">{s.text}</span>
-              <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                {s.count}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-/**
- * Найдено поиском, но в таблице сравнения нет: у товара пока нет пары на другом
- * сайте. Без этого блока такой товар для пользователя «не находится», хотя на
- * сайте он есть (жалоба клиента 2026-10-06: veqovi, ozempik, kreon).
- */
-function OthersSection({
-  others,
-  total,
-}: {
-  others: ComparisonOther[];
-  total: number;
-}) {
-  const t = useTranslations("comparison");
-  return (
-    <section className="space-y-2" data-testid="search-others">
-      <div>
-        <h2 className="text-base font-semibold">
-          {t("others_title", { count: total })}
-        </h2>
-        <p className="text-sm text-muted-foreground">{t("others_hint")}</p>
-      </div>
-
-      {/* Mobile: карточки */}
-      <div className="md:hidden space-y-2">
-        {others.map((o) => (
-          <div
-            key={o.product_id}
-            className="flex items-start justify-between gap-3 rounded-lg border border-border bg-card p-3"
-          >
-            <div className="min-w-0">
-              <div className="text-sm font-medium">{o.name}</div>
-              <div className="mt-0.5 text-[10px] uppercase text-muted-foreground">
-                {o.site}
-              </div>
-            </div>
-            <OtherPrice other={o} />
-          </div>
-        ))}
-      </div>
-
-      {/* Desktop: те же колонки сайтов, что в таблице сравнения */}
-      <div className="hidden md:block rounded-lg border border-border overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="bg-muted/50 text-muted-foreground">
-            <tr>
-              <th className="px-3 py-2 text-left font-medium">{t("th_name")}</th>
-              {SITES.map((s) => (
-                <th key={s} className="px-3 py-2 text-right font-medium">
-                  {s}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {others.map((o) => (
-              <tr
-                key={o.product_id}
-                className="border-t border-border hover:bg-muted/30"
-              >
-                <td className="px-3 py-2 max-w-md truncate">{o.name}</td>
-                {SITES.map((s) => (
-                  <td key={s} className="px-3 py-2 text-right">
-                    {o.site === s ? (
-                      <OtherPrice other={o} />
-                    ) : (
-                      <span className="text-muted-foreground/50">—</span>
-                    )}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {total > others.length && (
-        <p className="text-xs text-muted-foreground">
-          {t("others_truncated", { shown: others.length, total })}
-        </p>
-      )}
-    </section>
-  );
-}
-
-function OtherPrice({ other }: { other: ComparisonOther }) {
-  const t = useTranslations("comparison");
-  const locale = useLocale();
-  const outOfStock = other.availability_status === "out_of_stock";
-  const faded = other.stale || outOfStock;
-  return (
-    <a
-      href={other.url}
-      target="_blank"
-      rel="noopener noreferrer"
-      className={`inline-flex shrink-0 flex-col items-end tabular-nums leading-tight hover:underline ${
-        faded ? "text-muted-foreground/70" : ""
-      }`}
-    >
-      <span>{formatPrice(other.price, locale)}</span>
-      {outOfStock && (
-        <span className="text-[10px] font-normal text-amber-600 dark:text-amber-500">
-          {t("out_of_stock")}
-        </span>
-      )}
-      {other.stale && other.age_days != null && (
-        <span className="text-[10px] font-normal text-amber-600 dark:text-amber-500">
-          {t("stale_badge", { days: other.age_days })}
-        </span>
-      )}
-    </a>
   );
 }
 

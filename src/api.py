@@ -55,10 +55,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Iterator
 from urllib.parse import urlsplit
 
 import structlog
@@ -87,6 +89,7 @@ from src import storage, tenants
 from src._time import utcnow
 from src.category_taxonomy import classify_source_category, source_category_labels
 from src.normalize import pack_unit_count
+from src.product_policy import POLICY_PRODUCT_FIELDS
 
 log = structlog.get_logger()
 
@@ -112,10 +115,25 @@ init_observability(service="api")
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    # Индекс поиска по каталогу собирается около секунды. Прогреваем его в фоне
+    # при старте воркера — иначе сборку ждал бы первый поиск после каждого
+    # рестарта API. Старт воркера прогрев не задерживает и уронить не может.
+    threading.Thread(
+        target=catalog_search.warm,
+        args=(storage.make_session(),),
+        name="catalog-search-warm",
+        daemon=True,
+    ).start()
+    yield
+
+
 app = FastAPI(
     title="Pharmacy Monitor API",
     description="REST API for ERP integration and frontend dashboard",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # CORS for frontend (Next.js on :3000 in dev, same-origin in prod via Caddy)
@@ -2122,21 +2140,22 @@ _SITE_ORDER = {"pharmonline": 0, "aptekonline": 1, "aloe": 2}
 
 # Колонки товара, которые читает сборка строк сравнения. Грузим ровно их и
 # без ORM-объектов: в `products` лежат тяжёлые `description`/`normalized_attrs`,
-# а строк в полном списке — тысячи на каждый запрос.
-_COMPARISON_PRODUCT_COLUMNS = (
-    storage.Product.id,
-    storage.Product.canonical_id,
-    storage.Product.site,
-    storage.Product.url,
-    storage.Product.name,
-    storage.Product.category,
-    storage.Product.pack_size,
-    storage.Product.last_seen_at,
-    storage.Product.url_dead_at,
-    storage.Product.manufacturer_country_code,
-    storage.Product.country_resolution_status,
-    storage.Product.offer_availability_status,
-    storage.Product.availability_observed_at,
+# а строк в полном списке — тысячи на каждый запрос. Поля, нужные политике
+# стран и наличия, берём из её собственного списка — см. POLICY_PRODUCT_FIELDS.
+_COMPARISON_PRODUCT_COLUMNS = tuple(
+    getattr(storage.Product, field)
+    for field in dict.fromkeys(
+        (
+            "id",
+            "canonical_id",
+            "url",
+            "name",
+            "category",
+            "pack_size",
+            "last_seen_at",
+            *POLICY_PRODUCT_FIELDS,
+        )
+    )
 )
 
 
@@ -2399,88 +2418,41 @@ _ID_CHUNK = 5000
 _SEARCH_OTHERS_MAX_AGE_DAYS = 60
 
 
-def _search_match_ids(db: Session, *, tenant_id: int, product_ids: list[int]) -> set[int]:
-    match_ids: set[int] = set()
-    for start in range(0, len(product_ids), _ID_CHUNK):
-        match_ids.update(
-            db.scalars(
-                select(storage.Product.canonical_id).where(
-                    storage.Product.id.in_(product_ids[start : start + _ID_CHUNK]),
-                    storage.Product.tenant_id == tenant_id,
-                    storage.Product.canonical_id.is_not(None),
-                )
-            )
-        )
-    return match_ids
-
-
-def _comparison_match_ids_for_search(db: Session, *, tenant_id: int, search: str) -> set[int]:
-    """Кластеры, отвечающие поисковой строке страницы сравнения.
-
-    Раньше — только ILIKE по canonical_name/brand кластера: запрос «creon» не
-    находил кластер, названный по сайту, где препарат пишется «Kreon». Теперь к
-    прежней выборке добавляются кластеры, в которых запросу соответствует
-    название товара ЛЮБОГО из сайтов.
-    """
-    like = f"%{search.strip().lower()}%"
-    match_ids = set(
-        db.scalars(
-            select(storage.Match.id).where(
-                storage.Match.tenant_id == tenant_id,
-                storage.Match.canonical_name.ilike(like) | storage.Match.canonical_brand.ilike(like),
-            )
-        )
-    )
-    hits = catalog_search.get_index(db, tenant_id=tenant_id).search(search)
-    return match_ids | _search_match_ids(
-        db, tenant_id=tenant_id, product_ids=[h.product_id for h in hits]
+def _catalog_index(db: Session, tenant_id: int) -> catalog_search.CatalogIndex:
+    return catalog_search.get_index(
+        db, tenant_id=tenant_id, session_factory=storage.make_session()
     )
 
 
-# response_model — только для /docs: эндпоинт отдаёт готовый Response, и FastAPI
-# его не перевалидирует (на тысячах строк это стоило секунду).
-@app.get("/api/v1/dash/comparison", response_model=list[ComparisonRowOut])
-def dash_comparison(
-    search: str | None = Query(None, max_length=_SEARCH_MAX_LENGTH),
-    min_sites: int = 2,
-    site_filter: str | None = None,
-    limit: int = 5000,
-    min_confidence: float = 0.70,
-    category: str | None = None,
-    user: storage.TenantUser = Depends(require_user),
-    db: Session = Depends(get_db),
-):
-    """Cross-site comparison rows. Filtered by tenant_id automatically."""
-    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
-    if not _has_ok_run(db, tenant_id=user.tenant_id):
-        return []
-
-    match_ids: set[int] | None = None
-    if search and search.strip():
-        match_ids = _comparison_match_ids_for_search(db, tenant_id=user.tenant_id, search=search)
-    rows = _comparison_rows(
-        db,
-        tenant_id=user.tenant_id,
-        min_sites=min_sites,
-        site_filter=site_filter,
-        min_confidence=min_confidence,
-        category=category,
-        match_ids=match_ids,
-    )
-    return _fast_json(rows[:limit])
-
-
-def _catalog_search_products(
+def _comparison_search(
     db: Session, *, tenant_id: int, query: str
-) -> tuple[dict[int, int], list[Any]]:
-    """Товары каталога, отвечающие запросу: (место в выдаче по id, строки БД).
+) -> tuple[dict[int, int], list[Any], set[int]]:
+    """Единое правило поиска страницы сравнения.
+
+    Возвращает (место товара в выдаче по id, найденные товары, кластеры). Им
+    пользуются и поиск страницы, и старый параметр `search`, и выгрузка в Excel
+    — иначе один и тот же запрос находил бы на экране одно, а в файле другое.
+
+    Кластер попадает в выборку двумя путями:
+      - запросу отвечает название (или бренд) товара ЛЮБОГО из сайтов — через
+        индекс каталога, со свёрткой написания («creon» находит «Kreon»);
+      - запрос — подстрока названия или бренда самого кластера. Это прежнее
+        правило, и убрать его нельзя: кластер из списка наблюдения носит имя,
+        которое дал ему пользователь, и в названиях товаров его может не быть.
 
     Индекс знает только названия; всё, что может поменяться между прогонами
     (пара, ссылка, наличие), читаем из БД свежим.
     """
-    hits = catalog_search.get_index(db, tenant_id=tenant_id).search(query)
-    if not hits:
-        return {}, []
+    match_ids = set(
+        db.scalars(
+            select(storage.Match.id).where(
+                storage.Match.tenant_id == tenant_id,
+                storage.Match.canonical_name.icontains(query, autoescape=True)
+                | storage.Match.canonical_brand.icontains(query, autoescape=True),
+            )
+        )
+    )
+    hits = _catalog_index(db, tenant_id).search(query)
     order = {hit.product_id: position for position, hit in enumerate(hits)}
     ids = list(order)
     found: list[Any] = []
@@ -2505,7 +2477,43 @@ def _catalog_search_products(
                 )
             ).all()
         )
-    return order, found
+    match_ids.update(p.canonical_id for p in found if p.canonical_id is not None)
+    return order, found, match_ids
+
+
+# response_model — только для /docs: эндпоинт отдаёт готовый Response, и FastAPI
+# его не перевалидирует (на тысячах строк это стоило секунду).
+@app.get("/api/v1/dash/comparison", response_model=list[ComparisonRowOut])
+def dash_comparison(
+    search: str | None = Query(None, max_length=_SEARCH_MAX_LENGTH),
+    min_sites: int = 2,
+    site_filter: str | None = None,
+    limit: int = 5000,
+    min_confidence: float = 0.70,
+    category: str | None = None,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Cross-site comparison rows. Filtered by tenant_id automatically."""
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
+    if not _has_ok_run(db, tenant_id=user.tenant_id):
+        return []
+
+    match_ids: set[int] | None = None
+    if search and search.strip():
+        _order, _found, match_ids = _comparison_search(
+            db, tenant_id=user.tenant_id, query=search.strip()
+        )
+    rows = _comparison_rows(
+        db,
+        tenant_id=user.tenant_id,
+        min_sites=min_sites,
+        site_filter=site_filter,
+        min_confidence=min_confidence,
+        category=category,
+        match_ids=match_ids,
+    )
+    return _fast_json(rows[:limit])
 
 
 @app.get("/api/v1/dash/comparison/search")
@@ -2519,8 +2527,8 @@ def dash_comparison_search(
 ):
     """Поиск по ВСЕМУ каталогу для страницы сравнения.
 
-    `rows` — строки сравнения по кластерам, где запросу соответствует товар
-    хотя бы одного сайта. `others` — найденные товары, которых в этих строках
+    `rows` — строки сравнения по кластерам, отобранным `_comparison_search`.
+    `others` — найденные товары, которых в этих строках
     нет: без пары на другом сайте либо с парой, не прошедшей фильтры страницы.
     Без `others` товар, который есть на сайте, для пользователя «не находится».
     """
@@ -2530,8 +2538,8 @@ def dash_comparison_search(
     if not query or not _has_ok_run(db, tenant_id=user.tenant_id):
         return empty
 
-    order, found = _catalog_search_products(db, tenant_id=user.tenant_id, query=query)
-    if not found:
+    order, found, match_ids = _comparison_search(db, tenant_id=user.tenant_id, query=query)
+    if not found and not match_ids:
         return empty
 
     rows = _comparison_rows(
@@ -2540,7 +2548,7 @@ def dash_comparison_search(
         min_sites=min_sites,
         min_confidence=min_confidence,
         category=category,
-        match_ids={p.canonical_id for p in found if p.canonical_id is not None},
+        match_ids=match_ids,
     )
     shown_match_ids = {row["canonical_id"] for row in rows}
 
@@ -2620,8 +2628,9 @@ def dash_comparison_export(
     if _has_ok_run(db, tenant_id=user.tenant_id):
         match_ids: set[int] | None = None
         if query:
-            _order, found = _catalog_search_products(db, tenant_id=user.tenant_id, query=query)
-            match_ids = {p.canonical_id for p in found if p.canonical_id is not None}
+            _order, _found, match_ids = _comparison_search(
+                db, tenant_id=user.tenant_id, query=query
+            )
         rows = _comparison_rows(
             db,
             tenant_id=user.tenant_id,
@@ -2675,7 +2684,7 @@ def dash_comparison_suggest(
 ):
     """Подсказки при наборе в поиске сравнения: торговые имена из каталога."""
     limit = max(1, min(limit, 20))
-    suggestions = catalog_search.get_index(db, tenant_id=user.tenant_id).suggest(q, limit=limit)
+    suggestions = _catalog_index(db, user.tenant_id).suggest(q, limit=limit)
     return [{"text": s.text, "count": s.count} for s in suggestions]
 
 

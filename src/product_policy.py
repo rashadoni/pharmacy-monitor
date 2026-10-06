@@ -699,6 +699,25 @@ def policy_rollout_eligibility(
     return Eligibility(True)
 
 
+# Поля товара, которые читают функции политики ниже (`country_code_of`,
+# `offer_is_fresh`, `current_offer_eligibility` и всё, что на них построено).
+#
+# Функции принимают любой объект и читают поля через getattr с умолчанием —
+# удобно для строк запроса вместо ORM-объектов, но опасно: если политика начнёт
+# читать новое поле, а вызывающий код его не выбрал, она молча получит
+# «неизвестно», и в shadow-режиме это значит «допустимо». Поэтому тот, кто
+# собирает товары колонками, обязан брать список отсюда, а тест следит, чтобы
+# сама политика за его пределы не выходила.
+POLICY_PRODUCT_FIELDS = (
+    "site",
+    "url_dead_at",
+    "manufacturer_country_code",
+    "country_resolution_status",
+    "offer_availability_status",
+    "availability_observed_at",
+)
+
+
 def country_code_of(product: Any) -> str | None:
     if getattr(product, "country_resolution_status", None) == COUNTRY_RESOLVED:
         return getattr(product, "manufacturer_country_code", None)

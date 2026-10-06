@@ -5547,6 +5547,114 @@ def test_comparison_search_matches_any_site_spelling(client, tenant_user, setup_
     assert [row["name"] for row in legacy] == ["Kreon 25000"]
 
 
+def test_comparison_search_page_legacy_param_and_export_select_the_same_clusters(
+    client, tenant_user, setup_db
+):
+    """Кластер из списка наблюдения носит имя, которого нет в названиях товаров.
+
+    Поиск страницы, старый параметр `search` и Excel обязаны находить его
+    одинаково — иначе на экране одно, а в файле другое.
+    """
+    s = setup_db
+    run = _search_run(s)
+    match = _make_match_with_prices(
+        s,
+        run,
+        canonical="Ферменты поджелудочной 25000",
+        prices={"pharmonline": 19.0, "aloe": 21.0},
+    )
+    match.canonical_brand = "Abbott"
+    for product in match.products:
+        product.name = "Kreon 25000 N20" if product.site == "pharmonline" else "Creon 25000 20 əd."
+    s.commit()
+    _make_match_with_prices(
+        s, run, canonical="Nurofen 200", prices={"pharmonline": 3.0, "aptekonline": 4.0}
+    )
+    _login(client, tenant_user, s)
+
+    # по названию кластера, по его бренду, по названию товара сайта — и «%» буквально
+    for query, expected in [
+        ("поджелудочной", ["Ферменты поджелудочной 25000"]),
+        ("abbott", ["Ферменты поджелудочной 25000"]),
+        ("creon", ["Ферменты поджелудочной 25000"]),
+        ("%", []),
+    ]:
+        page = client.get("/api/v1/dash/comparison/search", params={"q": query}).json()
+        legacy = client.get("/api/v1/dash/comparison", params={"search": query}).json()
+        wb = _load_export(
+            client.get("/api/v1/dash/comparison/export.xlsx", params={"search": query})
+        )
+        in_file = [row[0] for row in wb.worksheets[1].iter_rows(min_row=2, values_only=True)]
+        assert [row["name"] for row in page["rows"]] == expected, query
+        assert [row["name"] for row in legacy] == expected, query
+        assert in_file == expected, query
+        assert page["others"] == [], query
+
+
+def test_comparison_rows_keep_the_documented_contract(client, tenant_user, setup_db):
+    """Эндпоинты отдают готовый JSON мимо валидации — контракт держит этот тест."""
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_packs(
+        s,
+        run,
+        canonical="Maska contract",
+        prods=[
+            ("pharmonline", 10.0, "N50", "Maska contract N50"),
+            ("aloe", 0.25, "N1", "Maska contract 1 əd"),
+        ],
+    )
+    _login(client, tenant_user, s)
+
+    listed = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    searched = client.get("/api/v1/dash/comparison/search?q=maska").json()
+
+    assert set(searched) == {"rows", "others", "others_total"}
+    assert listed == searched["rows"]
+    row = listed[0]
+    assert set(row) == set(api_module.ComparisonRowOut.model_fields)
+    assert api_module.ComparisonRowOut.model_validate(row).spread_basis == "unit"
+    assert set(row["prices"]["pharmonline"]) == {
+        "price",
+        "is_on_sale",
+        "url",
+        "product_id",
+        "country_code",
+        "country_resolution_status",
+        "availability_status",
+        "availability_observed_at",
+        "pack_size",
+        "age_days",
+        "stale",
+        "pack_count",
+        "unit_price",
+    }
+
+
+def test_comparison_loads_every_product_field_the_policy_reads():
+    """Политика читает поля через getattr с умолчанием: невыбранное поле она
+    молча приняла бы за «неизвестно», а в shadow-режиме это «допустимо»."""
+    from src import product_policy
+
+    class Recorder:
+        def __init__(self):
+            object.__setattr__(self, "seen", set())
+
+        def __getattr__(self, name):
+            self.seen.add(name)
+            raise AttributeError(name)
+
+    probe = Recorder()
+    product_policy.policy_identity_eligibility([probe])
+    product_policy.policy_offer_eligibility(probe)
+    product_policy.financially_eligible([probe])
+    product_policy.policy_financial_eligibility([probe])
+
+    assert probe.seen <= set(product_policy.POLICY_PRODUCT_FIELDS), probe.seen
+    loaded = {column.key for column in api_module._COMPARISON_PRODUCT_COLUMNS}
+    assert set(product_policy.POLICY_PRODUCT_FIELDS) <= loaded
+
+
 def test_comparison_search_lists_product_whose_row_is_filtered_out(
     client, tenant_user, setup_db
 ):
@@ -5865,7 +5973,11 @@ def test_comparison_export_xlsx_follows_page_filters(client, tenant_user, setup_
 
 def test_trusted_catalog_epoch_matches_trust_report(setup_db):
     """Эпоха считается без отчёта о покрытии, но обязана с ним совпадать."""
-    from src.product_policy import full_catalog_trust_report, trusted_catalog_epoch
+    from src.product_policy import (
+        finalizing_trusted_run,
+        full_catalog_trust_report,
+        trusted_catalog_epoch,
+    )
 
     s = setup_db
     assert trusted_catalog_epoch(s) is None
@@ -5879,17 +5991,37 @@ def test_trusted_catalog_epoch_matches_trust_report(setup_db):
     assert all(row["full_catalog_fresh"] for row in report["sites"])
     assert trusted_catalog_epoch(s) == expected == f"v1|pharmonline:{run.id}|aptekonline:{run.id}|aloe:{run.id}"
 
-    # Более свежая неудачная попытка полного сбора закрывает эпоху — как и в отчёте.
-    s.add(
-        storage.Run(
-            tenant_id=1,
-            started_at=utcnow(),
-            status="failed",
-            catalog_scope="full",
-            full_catalog_sites="pharmonline",
-            catalog_verified=False,
-        )
+    # Прогон устарел по возрасту: эпохи нет, отчёт говорит то же.
+    later = utcnow() + timedelta(days=60)
+    assert trusted_catalog_epoch(s, now=later) is None
+    assert not any(
+        row["full_catalog_fresh"] for row in full_catalog_trust_report(s, now=later)["sites"]
     )
+
+    # Более свежая неудачная попытка полного сбора закрывает эпоху — как и в отчёте.
+    failed = storage.Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        status="failed",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline",
+        catalog_verified=False,
+    )
+    s.add(failed)
     s.commit()
     assert trusted_catalog_epoch(s) is None
     assert full_catalog_trust_report(s)["sites"][0]["full_catalog_run_id"] is None
+
+    # Проверенный прогон в финализации (ещё «running») виден только изнутри
+    # самой финализации — и эпохе, и отчёту одинаково.
+    failed.status = "running"
+    failed.catalog_verified = True
+    s.commit()
+    assert trusted_catalog_epoch(s) is None
+    with finalizing_trusted_run(failed.id):
+        inside = full_catalog_trust_report(s)["sites"][0]
+        assert inside["internal_finalization"] is True
+        assert trusted_catalog_epoch(s) == (
+            f"v1|pharmonline:{failed.id}|aptekonline:{run.id}|aloe:{run.id}"
+        )
+    assert trusted_catalog_epoch(s) is None

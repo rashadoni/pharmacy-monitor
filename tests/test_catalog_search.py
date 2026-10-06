@@ -255,3 +255,59 @@ def test_get_index_rebuilds_when_catalog_changes(db_session, monkeypatch):
     rebuilt = catalog_search.get_index(db_session)
     assert rebuilt is not first
     assert [hit.product_id for hit in rebuilt.search("ozempik")] == [2]
+
+
+def test_stale_index_is_served_while_it_refreshes_in_the_background(db_session, monkeypatch):
+    """Запрос не ждёт пересборку: получает прежний индекс, новый приходит следом."""
+    from sqlalchemy.orm import sessionmaker
+
+    factory = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    _product(db_session, 1, "pharmonline", "Veqovi 1 mq")
+    db_session.commit()
+    first = catalog_search.get_index(db_session, session_factory=factory)
+
+    _product(db_session, 2, "aptekonline", "Ozempik 1 mq")
+    db_session.commit()
+    monkeypatch.setattr(catalog_search, "_MIN_AGE_SECONDS", 0)
+    served = catalog_search.get_index(db_session, session_factory=factory)
+    assert served is first  # устаревший, но мгновенно
+    assert served.search("ozempik") == []
+
+    for thread in list(catalog_search._refreshing.values()):
+        thread.join(timeout=10)
+    refreshed = catalog_search.get_index(db_session, session_factory=factory)
+    assert refreshed is not first
+    assert [hit.product_id for hit in refreshed.search("ozempik")] == [2]
+
+
+def test_background_refresh_failure_keeps_the_old_index(db_session, monkeypatch):
+    _product(db_session, 1, "pharmonline", "Veqovi 1 mq")
+    db_session.commit()
+    first = catalog_search.get_index(db_session)
+    monkeypatch.setattr(catalog_search, "_MIN_AGE_SECONDS", 0)
+    monkeypatch.setattr(catalog_search, "_MAX_AGE_SECONDS", 0)
+
+    def broken_factory():
+        raise RuntimeError("database is away")
+
+    assert catalog_search.get_index(db_session, session_factory=broken_factory) is first
+    for thread in list(catalog_search._refreshing.values()):
+        thread.join(timeout=10)
+    assert catalog_search._refreshing == {}
+    assert catalog_search.get_index(db_session, session_factory=broken_factory) is first
+
+
+def test_warm_builds_the_index_before_the_first_request(db_session):
+    from sqlalchemy.orm import sessionmaker
+
+    db_session.add(storage.Tenant(id=1, name="default", slug="default"))
+    _product(db_session, 1, "pharmonline", "Veqovi 1 mq")
+    db_session.commit()
+
+    catalog_search.warm(sessionmaker(db_session.get_bind(), expire_on_commit=False))
+
+    assert 1 in catalog_search._cache
+    warmed = catalog_search._cache[1][2]
+    assert catalog_search.get_index(db_session) is warmed
+    # Сбой прогрева не должен ронять старт воркера.
+    catalog_search.warm(lambda: (_ for _ in ()).throw(RuntimeError("no database")))
