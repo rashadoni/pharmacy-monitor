@@ -73,11 +73,14 @@ export default function ComparisonPage() {
   const [search, setSearch] = useState(urlSearch);
   // Адрес обновляется с задержкой (ниже), поэтому из адреса в поле переносим
   // только то, что записали не мы сами: иначе наша же запоздавшая запись «kre»
-  // стёрла бы уже набранное «kreon».
-  const writtenSearch = useRef(urlSearch);
+  // стёрла бы уже набранное «kreon». Помним все свои записи, а не последнюю:
+  // навигации могут завершиться не в том порядке, в каком были отправлены.
+  const writtenSearches = useRef(new Set([urlSearch]));
+  const lastWrittenSearch = useRef(urlSearch);
   useEffect(() => {
-    if (urlSearch !== writtenSearch.current) {
-      writtenSearch.current = urlSearch;
+    if (!writtenSearches.current.has(urlSearch)) {
+      writtenSearches.current = new Set([urlSearch]);
+      lastWrittenSearch.current = urlSearch;
       setSearch(urlSearch);
     }
   }, [urlSearch]);
@@ -95,9 +98,15 @@ export default function ComparisonPage() {
   );
   const queryClient = useQueryClient();
 
-  function updateQuery(key: string, value: string | null) {
+  // Любая запись в адрес уносит с собой и текущий текст поиска. Иначе фильтр,
+  // переключённый сразу после набора, записал бы адрес без поиска, а запоздавшая
+  // запись поиска — без фильтра: обе собираются из адреса на момент вызова.
+  function updateQuery(key: string | null, value: string | null = null) {
     const next = new URLSearchParams(searchParams.toString());
-    value ? next.set(key, value) : next.delete(key);
+    search ? next.set("search", search) : next.delete("search");
+    writtenSearches.current.add(search);
+    lastWrittenSearch.current = search;
+    if (key) value ? next.set(key, value) : next.delete(key);
     const target = next.toString();
     router.replace(target ? `/comparison?${target}` : "/comparison", { scroll: false });
   }
@@ -105,9 +114,8 @@ export default function ComparisonPage() {
   // Поиск в адресе — чтобы ссылкой можно было поделиться, — но пишем его после
   // паузы в наборе: навигация на каждую букву перерисовывала всю страницу.
   useEffect(() => {
-    if (debouncedSearch === writtenSearch.current) return;
-    writtenSearch.current = debouncedSearch;
-    updateQuery("search", debouncedSearch || null);
+    if (debouncedSearch === lastWrittenSearch.current) return;
+    updateQuery(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedSearch]);
 
@@ -282,8 +290,14 @@ export default function ComparisonPage() {
     rejectMutation.mutate(row.canonical_id);
   }
 
-  const nothingFound =
-    !!data && data.length === 0 && others.length === 0 && !isLoading;
+  // Пока едет ответ на новый запрос, на экране результаты прежнего
+  // (keepPreviousData) — по ним нельзя говорить «по запросу X ничего нет».
+  const settled =
+    !!data && !isLoading && !(searching && searchQuery.isPlaceholderData);
+  // Считаем по отфильтрованному набору: галочки «только различия» / «с aloe»
+  // тоже могут оставить страницу пустой, и тогда нужно сообщение, а не белый лист.
+  const nothingToShow = settled && total === 0 && others.length === 0;
+  const nothingFound = nothingToShow && (data?.length ?? 0) === 0;
 
   return (
     <div className="space-y-4">
@@ -426,15 +440,17 @@ export default function ComparisonPage() {
             : tCommon("error")}
         </div>
       )}
-      {nothingFound && (
+      {nothingToShow && (
         <div
           className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center"
           data-testid="empty"
         >
-          {searching ? t("search_no_results", { query }) : t("empty")}
+          {searching && nothingFound
+            ? t("search_no_results", { query })
+            : t("empty")}
         </div>
       )}
-      {searching && !!data && data.length === 0 && others.length > 0 && (
+      {searching && settled && total === 0 && others.length > 0 && (
         <p className="text-sm text-muted-foreground" data-testid="search-no-rows">
           {t("search_no_rows")}
         </p>
@@ -597,6 +613,7 @@ function SearchBox({
           visible && active >= 0 ? `comparison-suggestion-${active}` : undefined
         }
         autoComplete="off"
+        maxLength={100}
         placeholder={t("search_placeholder")}
         aria-label={t("search_label")}
         value={value}
@@ -608,6 +625,9 @@ function SearchBox({
         onBlur={() => setOpen(false)}
         onKeyDown={(e) => {
           if (e.key === "Escape") {
+            // У type="search" Escape по умолчанию стирает набранное. Первое
+            // нажатие должно только закрыть подсказки.
+            if (visible) e.preventDefault();
             setOpen(false);
             return;
           }

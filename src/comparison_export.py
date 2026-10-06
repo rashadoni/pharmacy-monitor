@@ -289,7 +289,7 @@ def _write_sheet(ws: Any, rows: list[dict[str, Any]], t: dict[str, str]) -> None
                 elif value == row["max_price"]:
                     cell.font = _HIGH_FONT
             url = entry.get("url") or ""
-            if url.startswith(("http://", "https://")):
+            if url.startswith(("http://", "https://")) and not ILLEGAL_CHARACTERS_RE.search(url):
                 link = ws.cell(row=index, column=link_col[site], value=SITE_TITLES[site])
                 link.hyperlink = url
                 link.font = _LINK_FONT

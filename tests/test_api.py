@@ -5625,6 +5625,37 @@ def test_comparison_search_is_tenant_scoped(client, tenant_user, setup_db):
     assert suggestions == [{"text": "Ksarelto", "count": 1}]
 
 
+def test_comparison_search_rejects_overlong_query(client, tenant_user, setup_db):
+    """Поисковая строка ограничена: каждое слово — проход по каталогу."""
+    s = setup_db
+    _search_run(s)
+    s.commit()
+    _login(client, tenant_user, s)
+    long_query = "a" * 101
+
+    for path in (
+        f"/api/v1/dash/comparison/search?q={long_query}",
+        f"/api/v1/dash/comparison/suggest?q={long_query}",
+        f"/api/v1/dash/comparison?search={long_query}",
+        f"/api/v1/dash/comparison/export.xlsx?search={long_query}",
+    ):
+        assert client.get(path).status_code == 422, path
+    assert client.get(f"/api/v1/dash/comparison/search?q={'a' * 100}").status_code == 200
+
+
+def test_comparison_search_cyrillic_with_capital_letter(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _unmatched_product(s, run, site="pharmonline", name="Kreon 10000 №20", price=10.49)
+    _login(client, tenant_user, s)
+
+    for query in ("Креон", "КРЕОН", "креон"):
+        body = client.get("/api/v1/dash/comparison/search", params={"q": query}).json()
+        assert [o["name"] for o in body["others"]] == ["Kreon 10000 №20"], query
+    suggestions = client.get("/api/v1/dash/comparison/suggest", params={"q": "Кре"}).json()
+    assert [item["text"] for item in suggestions] == ["Kreon"]
+
+
 def test_comparison_search_empty_query_and_no_hits(client, tenant_user, setup_db):
     s = setup_db
     run = _search_run(s)

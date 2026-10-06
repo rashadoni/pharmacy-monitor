@@ -46,15 +46,14 @@ log = structlog.get_logger()
 
 # ─── Свёртка написания ───────────────────────────────────────────────────────
 
-# Азербайджанская латиница и кириллица → латиница без диакритики.
-#  - «İ».lower() в Python даёт «i» + точку-диакритику, поэтому заглавные
-#    переводим до lower();
+# Азербайджанская латиница и кириллица → латиница без диакритики. Таблица
+# применяется к строке, уже приведённой к нижнему регистру (см. `_lower`).
 #  - «ц» → «s» (Цефазолин/Sefazolin), «х» → «x» (как в az-латинице),
 #    «ч» → «c» (чай/çay), «ш»/«щ» → «s» (шприц/şpris);
 #  - последняя группа — az-кириллица, встречается в старых названиях.
 _CHAR_MAP = str.maketrans(
-    "İIıəƏğĞşŞçÇöÖüÜабвгдеёжзийклмнопрстуфхцчшщыэәғҝөүһҹј",
-    "iiieeggssccoouuabvgdeejziiklmnoprstufxscssieeggouhcy",
+    "ıəğşçöüабвгдеёжзийклмнопрстуфхцчшщыэәғҝөүһҹј",
+    "iegscouabvgdeejziiklmnoprstufxscssieeggouhcy",
 )
 # «№» — знак, а не часть слова: без этого «№20» давало бы слово «no20».
 _CHAR_MAP.update(str.maketrans({"ъ": "", "ь": "", "ю": "yu", "я": "ya", "№": " "}))
@@ -66,17 +65,31 @@ _REPEAT_RE = re.compile(r"([a-z])\1+")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _LONE_C_MARK = "\x01"
+# Кириллические буквы-обозначения, которые выглядят как латинские: «витамин с»
+# — это Vitamin C, «в12» — это B12. По звучанию они дали бы «s» и «v12».
+_CYR_LONE_C_RE = re.compile(r"(?<![^\W_])с(?![^\W_])")
+_CYR_B_CODE_RE = re.compile(r"(?<![^\W_])в(?=\d)")
+
+
+def _lower(text: str) -> str:
+    # «İ».lower() в Python даёт «i» + точку-диакритику — убираем её заранее.
+    return text.replace("İ", "i").lower()
 
 
 def fold(text: str | None) -> str:
     """Ключ поиска: слова из [a-z0-9], разделённые одним пробелом."""
     if not text:
         return ""
-    s = text.translate(_CHAR_MAP)
+    s = _lower(text)
     if not s.isascii():
-        # NFKD до lower(): совместимые формы раскрываются в заглавные («™» → «TM»).
-        s = "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
-    s = _NON_ALNUM_RE.sub(" ", s.lower()).strip()
+        s = _CYR_B_CODE_RE.sub("b", _CYR_LONE_C_RE.sub("c", s)).translate(_CHAR_MAP)
+        if not s.isascii():
+            # Совместимые формы раскрываются в заглавные («™» → «TM») — отсюда
+            # второй lower().
+            s = "".join(
+                ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch)
+            ).lower()
+    s = _NON_ALNUM_RE.sub(" ", s).strip()
     s = s.replace("ph", "f").replace("th", "t").replace("sh", "s")
     s = s.replace("ch", "c").replace("ck", "k")
     s = _QU_RE.sub("kv", s)  # Quetiapine ↔ Kvetiapin
@@ -91,6 +104,9 @@ def fold(text: str | None) -> str:
 
 _fold_cached = lru_cache(maxsize=100_000)(fold)
 
+# Название товара — до десятка слов; в запросе длиннее смысла нет.
+_MAX_QUERY_TOKENS = 8
+
 
 def _query_tokens(query: str) -> list[list[str]]:
     """Слова запроса; у каждого — варианты написания.
@@ -101,17 +117,24 @@ def _query_tokens(query: str) -> list[list[str]]:
     ozempik). Для таких слов пробуем оба чтения.
     """
     tokens: list[list[str]] = []
+    seen: set[str] = set()
     for word in _WORD_RE.findall(query):
         variants = [t for t in fold(word).split() if t]
         if not variants:
             continue
         last = variants[-1]
-        tokens.extend([v] for v in variants[:-1])
         alternatives = [last]
-        if len(last) > 1 and last.endswith("k") and word.translate(_CHAR_MAP).lower().endswith("c"):
+        if len(last) > 1 and last.endswith("k") and _lower(word).translate(_CHAR_MAP).endswith("c"):
             alternatives.append(last[:-1] + "s")
-        tokens.append(alternatives)
-    return tokens
+        for group in (*([v] for v in variants[:-1]), alternatives):
+            # Повтор слова ничего не уточняет, а каждое слово — проход по
+            # каталогу: «mq mq mq …» из сотен слов держал бы запрос секундами.
+            if group[0] not in seen:
+                seen.add(group[0])
+                tokens.append(group)
+        if len(tokens) >= _MAX_QUERY_TOKENS:
+            break
+    return tokens[:_MAX_QUERY_TOKENS]
 
 
 # ─── Подсказки: какие слова считать началом торгового имени ──────────────────
@@ -280,7 +303,7 @@ class CatalogIndex:
         )
         return [value for value, _distance, _index in matches]
 
-    def search(self, query: str, *, limit: int = 300) -> list[SearchHit]:
+    def search(self, query: str, *, limit: int | None = None) -> list[SearchHit]:
         """Товары, в названии (или бренде) которых есть все слова запроса."""
         tokens = _query_tokens(query)
         if not tokens:
@@ -334,7 +357,7 @@ class CatalogIndex:
         # Запасной проход: одно слово внутри другого («kreon» → Lipakreon).
         # В конец списка, и только если запрос достаточно длинный, чтобы не
         # тащить всё подряд.
-        if len(tokens) == 1 and len(phrase) >= 4 and len(ranked) < limit:
+        if len(tokens) == 1 and len(phrase) >= 4:
             seen = set(candidates)
             for i, key in enumerate(self._name_keys):
                 if i not in seen and phrase in key:

@@ -69,6 +69,7 @@ from fastapi import (
     File,
     HTTPException,
     Header,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -2221,9 +2222,13 @@ def _comparison_rows(
     #    (pharmonline) первым, чтобы паритет не рисовался как «конкурент дешевле»;
     #  - на одном сайте в кластере иногда два товара (старый дубль), в
     #    `prices[site]` остаётся последний — по id это новейший.
-    product_stmt = select(*_COMPARISON_PRODUCT_COLUMNS).order_by(
-        case(_SITE_ORDER, value=storage.Product.site, else_=len(_SITE_ORDER)),
-        storage.Product.id,
+    product_stmt = (
+        select(*_COMPARISON_PRODUCT_COLUMNS)
+        .where(storage.Product.tenant_id == tenant_id)
+        .order_by(
+            case(_SITE_ORDER, value=storage.Product.site, else_=len(_SITE_ORDER)),
+            storage.Product.id,
+        )
     )
     if match_ids is None:
         product_stmt = product_stmt.where(storage.Product.canonical_id.is_not(None))
@@ -2380,28 +2385,33 @@ def _comparison_rows(
     return out
 
 
-# Сколько найденных товаров превращаем в строки сравнения и сколько «прочих»
-# (без пары на другом сайте) отдаём странице. Запрос из одной-двух букв находит
-# тысячи строк; такой список никто не читает, а ответ раздувает.
-_SEARCH_HIT_LIMIT = 1000
+# Сколько «прочих» товаров (без строки в сравнении) отдаём странице. Запрос из
+# двух букв находит тысячи; такой список никто не читает, а ответ раздувает —
+# страница получает первые и общее число. Строки сравнения при этом НЕ режем:
+# их может понадобиться выгрузить в Excel целиком.
 _SEARCH_OTHERS_LIMIT = 100
+# Длина поисковой строки. Название товара — до сотни знаков; длиннее — не поиск.
+_SEARCH_MAX_LENGTH = 100
+# PostgreSQL принимает до 65 535 параметров на запрос — id передаём порциями.
+_ID_CHUNK = 5000
 # Товар, которого нет на сайте дольше этого срока, с сайта снят: показывать его
 # в «найдено на сайтах» с ценой трёхмесячной давности — значит обманывать.
 _SEARCH_OTHERS_MAX_AGE_DAYS = 60
 
 
 def _search_match_ids(db: Session, *, tenant_id: int, product_ids: list[int]) -> set[int]:
-    if not product_ids:
-        return set()
-    return set(
-        db.scalars(
-            select(storage.Product.canonical_id).where(
-                storage.Product.id.in_(product_ids),
-                storage.Product.tenant_id == tenant_id,
-                storage.Product.canonical_id.is_not(None),
+    match_ids: set[int] = set()
+    for start in range(0, len(product_ids), _ID_CHUNK):
+        match_ids.update(
+            db.scalars(
+                select(storage.Product.canonical_id).where(
+                    storage.Product.id.in_(product_ids[start : start + _ID_CHUNK]),
+                    storage.Product.tenant_id == tenant_id,
+                    storage.Product.canonical_id.is_not(None),
+                )
             )
         )
-    )
+    return match_ids
 
 
 def _comparison_match_ids_for_search(db: Session, *, tenant_id: int, search: str) -> set[int]:
@@ -2421,7 +2431,7 @@ def _comparison_match_ids_for_search(db: Session, *, tenant_id: int, search: str
             )
         )
     )
-    hits = catalog_search.get_index(db, tenant_id=tenant_id).search(search, limit=_SEARCH_HIT_LIMIT)
+    hits = catalog_search.get_index(db, tenant_id=tenant_id).search(search)
     return match_ids | _search_match_ids(
         db, tenant_id=tenant_id, product_ids=[h.product_id for h in hits]
     )
@@ -2431,7 +2441,7 @@ def _comparison_match_ids_for_search(db: Session, *, tenant_id: int, search: str
 # его не перевалидирует (на тысячах строк это стоило секунду).
 @app.get("/api/v1/dash/comparison", response_model=list[ComparisonRowOut])
 def dash_comparison(
-    search: str | None = None,
+    search: str | None = Query(None, max_length=_SEARCH_MAX_LENGTH),
     min_sites: int = 2,
     site_filter: str | None = None,
     limit: int = 5000,
@@ -2468,34 +2478,39 @@ def _catalog_search_products(
     Индекс знает только названия; всё, что может поменяться между прогонами
     (пара, ссылка, наличие), читаем из БД свежим.
     """
-    hits = catalog_search.get_index(db, tenant_id=tenant_id).search(query, limit=_SEARCH_HIT_LIMIT)
+    hits = catalog_search.get_index(db, tenant_id=tenant_id).search(query)
     if not hits:
         return {}, []
     order = {hit.product_id: position for position, hit in enumerate(hits)}
-    found = db.execute(
-        select(
-            storage.Product.id,
-            storage.Product.canonical_id,
-            storage.Product.site,
-            storage.Product.name,
-            storage.Product.brand,
-            storage.Product.url,
-            storage.Product.last_seen_at,
-            storage.Product.url_dead_at,
-            storage.Product.manufacturer_country_code,
-            storage.Product.country_resolution_status,
-            storage.Product.offer_availability_status,
-        ).where(
-            storage.Product.id.in_(list(order)),
-            storage.Product.tenant_id == tenant_id,
+    ids = list(order)
+    found: list[Any] = []
+    for start in range(0, len(ids), _ID_CHUNK):
+        found.extend(
+            db.execute(
+                select(
+                    storage.Product.id,
+                    storage.Product.canonical_id,
+                    storage.Product.site,
+                    storage.Product.name,
+                    storage.Product.brand,
+                    storage.Product.url,
+                    storage.Product.last_seen_at,
+                    storage.Product.url_dead_at,
+                    storage.Product.manufacturer_country_code,
+                    storage.Product.country_resolution_status,
+                    storage.Product.offer_availability_status,
+                ).where(
+                    storage.Product.id.in_(ids[start : start + _ID_CHUNK]),
+                    storage.Product.tenant_id == tenant_id,
+                )
+            ).all()
         )
-    ).all()
     return order, found
 
 
 @app.get("/api/v1/dash/comparison/search")
 def dash_comparison_search(
-    q: str,
+    q: str = Query(..., max_length=_SEARCH_MAX_LENGTH),
     min_sites: int = 2,
     min_confidence: float = 0.70,
     category: str | None = None,
@@ -2580,13 +2595,13 @@ def dash_comparison_search(
 
 @app.get("/api/v1/dash/comparison/export.xlsx")
 def dash_comparison_export(
-    search: str | None = None,
+    search: str | None = Query(None, max_length=_SEARCH_MAX_LENGTH),
     min_sites: int = 2,
     min_confidence: float = 0.70,
     category: str | None = None,
     with_aloe: bool = False,
     diff_only: bool = False,
-    locale: str = "az",
+    locale: str = "ru",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -2653,7 +2668,7 @@ def dash_comparison_export(
 
 @app.get("/api/v1/dash/comparison/suggest")
 def dash_comparison_suggest(
-    q: str,
+    q: str = Query(..., max_length=_SEARCH_MAX_LENGTH),
     limit: int = 8,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),

@@ -61,10 +61,27 @@ def _ids(index, query):
         ("чай", "çay"),
         ("İbuprofen", "ibuprofen"),
         ("Dərman", "derman"),
+        # Заглавные: телефонная клавиатура ставит первую букву большой.
+        ("Креон", "kreon"),
+        ("КРЕОН", "kreon"),
+        ("Оземпик", "ozempik"),
+        ("Но-Шпа", "no-şpa"),
+        ("ŞPRİS", "spris"),
+        # Кириллические буквы-обозначения, которые читаются как латинские.
+        ("витамин с", "Vitamin C"),
+        ("Витамин С", "vitamin c"),
+        ("в12", "B12"),
     ],
 )
 def test_fold_brings_spellings_together(left, right):
     assert fold(left) == fold(right)
+
+
+def test_fold_drops_nothing_from_cyrillic_names():
+    """Regression: заглавные кириллические буквы терялись («Креон» → «reon»)."""
+    assert fold("Креон") == "kreon"
+    assert fold("Кальций Д3") == "kalsi d3"
+    assert fold('Südlü qarışıq "Малютка" Gold-2') == "sudlu garisig maliutka gold 2"
 
 
 def test_fold_keeps_letter_codes_apart():
@@ -117,6 +134,28 @@ def test_search_by_brand_ranks_after_name_matches(index):
     hits = index.search("abbot")
     assert {hit.product_id for hit in hits} == {5, 7, 20}
     assert all(hit.rank == 3 for hit in hits)
+
+
+@pytest.mark.parametrize("query", ["Креон", "КРЕОН", "креон"])
+def test_search_cyrillic_in_any_case(index, query):
+    assert set(_ids(index, query)) == {5, 6, 7, 8, 9, 20}
+    assert _ids(index, "Витамин С") == [13]
+
+
+def test_search_is_not_capped_unless_asked(index):
+    """Строки сравнения строятся по ВСЕМ найденным товарам (нужны в Excel целиком)."""
+    big = CatalogIndex([(i, "aloe", f"Tablet {i:05d}", None) for i in range(1, 2501)])
+    assert len(big.search("tablet")) == 2500
+    assert len(big.search("tablet", limit=10)) == 10
+
+
+def test_long_repetitive_query_is_bounded(index):
+    from src.catalog_search import _MAX_QUERY_TOKENS, _query_tokens
+
+    assert _query_tokens("mq " * 500) == [["mg"]]
+    many = " ".join(f"slovo{i}" for i in range(200))
+    assert len(_query_tokens(many)) == _MAX_QUERY_TOKENS
+    assert index.search(many) == []
 
 
 def test_search_empty_and_punctuation_only(index):
