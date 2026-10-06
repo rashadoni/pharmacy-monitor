@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the versioned daily scrape/alert schedule after an application release.
+# Install the versioned scrape/alert schedule after an application release.
 #
 # Run only as root on the Pharmacy Monitor production host:
 #   /opt/pharmacy-monitor/infra/scripts/install_systemd_schedule.sh
@@ -32,13 +32,26 @@ do
   install -m 0644 "$source_dir/$unit" "$unit_dir/$unit"
 done
 
-for override in \
-  "pharmacy-monitor-scrape@.service.d/zz-realtime-alerts.conf" \
-  "pharmacy-monitor-scrape@pharmonline.timer.d/zz-daily-cadence.conf" \
-  "pharmacy-monitor-scrape@aptekonline.timer.d/zz-daily-cadence.conf" \
-  "pharmacy-monitor-scrape@aloe.timer.d/zz-daily-cadence.conf"
-do
-  install -D -m 0644 "$source_dir/overrides/$override" "$unit_dir/$override"
+# Устанавливаем ВСЁ, что лежит в overrides/, а не поимённый список. Список
+# ломался при переименовании: 2026-10-04 aptekonline перевели на недельный ритм
+# и файл стал zz-weekly-cadence.conf, а здесь остался zz-daily-cadence.conf —
+# при set -e скрипт падал на `install` ещё до daemon-reload, то есть расписание
+# молча не применялось вовсе. Обход каталога делает такой рассинхрон
+# невозможным: что в Git — то и на проде.
+shopt -s nullglob
+overrides=()
+for override_path in "$source_dir"/overrides/*/*.conf; do
+  overrides+=("$override_path")
+done
+shopt -u nullglob
+if [[ ${#overrides[@]} -eq 0 ]]; then
+  echo "no drop-ins found under $source_dir/overrides" >&2
+  exit 3
+fi
+for override_path in "${overrides[@]}"; do
+  override=${override_path#"$source_dir/overrides/"}
+  echo "installing drop-in: $override"
+  install -D -m 0644 "$override_path" "$unit_dir/$override"
 done
 
 systemctl daemon-reload

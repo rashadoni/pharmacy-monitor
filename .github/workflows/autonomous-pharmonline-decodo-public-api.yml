@@ -7,8 +7,16 @@ name: Autonomous Pharmonline Decodo catalog refresh
 
 on:
   schedule:
-    # Staggered well away from the legacy systemd timer.  GitHub Actions uses UTC.
-    - cron: "20 03 * * *"
+    # Недельный ритм, решение владельца 2026-10-06: полный каталог собирается раз
+    # в неделю, по понедельникам. Это ЖИВОЙ путь pharmonline — systemd-таймер
+    # pharmacy-monitor-scrape@pharmonline остался легаси, и прод обновляется
+    # именно отсюда (сверено по Product.last_seen_at против времени прогонов).
+    # Час разнесён с systemd-таймерами. GitHub Actions считает в UTC; его
+    # планировщик регулярно опаздывает на часы, но день не сдвигает.
+    #
+    # Ритм продублирован в src/cadence.py — пороги «данные устарели» выводятся
+    # оттуда. Меняешь расписание здесь — меняй и там.
+    - cron: "20 03 * * 1"
   workflow_dispatch:
 
 permissions:

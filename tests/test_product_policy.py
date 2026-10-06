@@ -156,26 +156,26 @@ def test_offer_freshness_window_follows_site_cadence():
     жёсткие 30ч объявляли его собственный успешный сбор несвежим уже через
     полтора дня — полный каталог не подтверждался 6 дней из 7.
     """
+    from src.cadence import site_max_age_hours
     from src.product_policy import OFFER_MAX_AGE_HOURS
 
-    assert OFFER_MAX_AGE_HOURS["aloe"] == 30
-    assert OFFER_MAX_AGE_HOURS["pharmonline"] == 30
-    assert OFFER_MAX_AGE_HOURS["aptekonline"] == 174
+    # Все три сайта на недельном ритме (решение владельца 2026-10-06).
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        assert OFFER_MAX_AGE_HOURS[site] == 174
+
+    # Формула не ломает суточный случай: сайт без объявленного ритма — 30ч.
+    assert site_max_age_hours("site-without-declared-cadence") == 30
 
 
 def test_weekly_site_offer_stays_fresh_mid_cycle():
-    """Наблюдение aptekonline на 100ч — середина штатного недельного цикла."""
+    """Наблюдение на 100ч — середина штатного недельного цикла у любого сайта."""
     from src.product_policy import offer_is_fresh
 
     now = utcnow()
-    weekly = _product("aptekonline")
-    weekly.availability_observed_at = now - timedelta(hours=100)
-    assert offer_is_fresh(weekly, now=now) is True
-
-    # Суточный сайт на том же возрасте — это четверо пропущенных сборов.
-    daily = _product("aloe")
-    daily.availability_observed_at = now - timedelta(hours=100)
-    assert offer_is_fresh(daily, now=now) is False
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        product = _product(site)
+        product.availability_observed_at = now - timedelta(hours=100)
+        assert offer_is_fresh(product, now=now) is True, site
 
 
 def test_weekly_site_offer_goes_stale_after_missed_scan():
@@ -183,6 +183,7 @@ def test_weekly_site_offer_goes_stale_after_missed_scan():
     from src.product_policy import offer_is_fresh
 
     now = utcnow()
-    weekly = _product("aptekonline")
-    weekly.availability_observed_at = now - timedelta(hours=200)
-    assert offer_is_fresh(weekly, now=now) is False
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        product = _product(site)
+        product.availability_observed_at = now - timedelta(hours=200)
+        assert offer_is_fresh(product, now=now) is False, site

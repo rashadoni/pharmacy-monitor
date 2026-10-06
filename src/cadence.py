@@ -20,9 +20,13 @@ from __future__ import annotations
 import math
 
 SITE_SCRAPE_CADENCE_HOURS: dict[str, int] = {
-    "pharmonline": 24,
-    "aptekonline": 168,  # недельный ритм, решение владельца 2026-10-04
-    "aloe": 24,
+    # Все три сайта — недельный полный сбор, решение владельца 2026-10-06.
+    # aptekonline ушёл на неделю раньше, 2026-10-04 (цена обхода Cloudflare).
+    # Частичные тики (intraday, watchlist) живут отдельно и остаются суточными —
+    # они обновляют приоритетные товары и кормят мгновенные ценовые алерты.
+    "pharmonline": 168,
+    "aptekonline": 168,
+    "aloe": 168,
 }
 _DEFAULT_CADENCE_HOURS = 24
 
