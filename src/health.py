@@ -22,6 +22,11 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from src._time import utcnow
+from src.cadence import (
+    SITE_SCRAPE_CADENCE_HOURS,
+    site_cadence_days,
+    site_max_age_hours,
+)
 from src.storage import PriceSnapshot, Product, Run
 
 log = structlog.get_logger()
@@ -579,12 +584,12 @@ def alert_due(
     return elapsed < timedelta(0) or elapsed >= timedelta(hours=cooldown_hours)
 
 
+# Окно СВЕЖЕСТИ для знаменателя site_drop: живым считается каталог, виденный за
+# один цикл сбора + 2 дня запаса (суточный сайт → 3д, недельный → 9д). Раньше
+# тут стояла константа 3 для всех — у недельного сайта она обнуляла знаменатель
+# уже на четвёртый день, и проверка покрытия молча отключалась.
 _SITE_FRESHNESS_DAYS: dict[str, int] = {
-    # A current catalog must be no more than one missed daily run old.  The
-    # larger values used to hide a broken weekly production override for days.
-    "pharmonline": 3,
-    "aptekonline": 3,
-    "aloe": 3,
+    site: site_cadence_days(site) + 2 for site in SITE_SCRAPE_CADENCE_HOURS
 }
 _DEFAULT_FRESHNESS_DAYS = 3
 
@@ -594,13 +599,10 @@ _DEFAULT_FRESHNESS_DAYS = 3
 # (pharmonline run_277 = 127 товаров featured-выборки), тогда seen=127/каталог
 # дал бы ложный site_drop. Окно включает последний ПОЛНЫЙ прогон → одиночный
 # частичный прогон метрику не роняет. Должно быть < _SITE_FRESHNESS_DAYS.
+# Один цикл сбора + 1 день запаса (суточный → 2д, недельный → 8д) — окно всегда
+# захватывает последний ПОЛНЫЙ прогон и всегда уже окна свежести.
 _SITE_COVERAGE_DAYS: dict[str, int] = {
-    # A partial/watchlist tick must not make the latest full daily scan look
-    # like a coverage drop.  Two days include yesterday's verified full pass
-    # while detecting a missed cadence promptly.
-    "pharmonline": 2,
-    "aptekonline": 2,
-    "aloe": 2,
+    site: site_cadence_days(site) + 1 for site in SITE_SCRAPE_CADENCE_HOURS
 }
 _DEFAULT_COVERAGE_DAYS = 2
 
@@ -845,13 +847,11 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
     return []
 
 
-# Per-site пороги «молчания» (часы). 30ч = ежедневный запуск + разумный запас
-# на jitter/retry.  Values live here rather than in an undocumented systemd
-# override so health fails closed when the promised daily cadence stops.
+# Per-site пороги «молчания» (часы) = ритм сбора + запас (src/cadence.py):
+# суточный сайт → 30ч, недельный → 174ч. Расписание описано в коде, а не только
+# в systemd-override, чтобы health падал закрыто, когда ритм прервался.
 _SITE_MAX_AGE_HOURS: dict[str, int] = {
-    "aptekonline": 30,
-    "pharmonline": 30,
-    "aloe": 30,
+    site: site_max_age_hours(site) for site in SITE_SCRAPE_CADENCE_HOURS
 }
 
 

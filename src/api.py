@@ -396,15 +396,18 @@ class SiteStaleness(BaseModel):
     """Per-site freshness: when did we last successfully see a product on it?
 
     `hours_since` aggregates the gap between now and the max `last_seen_at`
-    across all products tagged with `site`. `max_age_hours` is the site-specific
-    threshold used by backend health checks.  The production contract is a
-    daily full scan for every monitored site, with a 30-hour retry margin.
+    across all products tagged with `site`. `cadence_hours` is how often that
+    site is scheduled for a full scan, and `max_age_hours` is the staleness
+    threshold derived from it (cadence + retry margin). The cadence is NOT the
+    same for every site: aloe and pharmonline run daily, aptekonline weekly —
+    so a card must be coloured against its own schedule, not a global one.
     """
 
     site: str
     last_seen_at: datetime | None
     hours_since: float | None
     max_age_hours: int
+    cadence_hours: int = 24
 
 
 class HealthOut(BaseModel):
@@ -591,10 +594,10 @@ class WatchlistCategoryIn(BaseModel):
 # ─── Public endpoints ────────────────────────────────────────────────────────
 
 
-# Default per-site staleness threshold (hours) for daily-cadence sites (>30h = at
-# least one scheduled run skipped). ``health._SITE_MAX_AGE_HOURS`` is the
-# single source for the three monitored sites.
-# Surfaced in `/health.staleness_warning`.
+# Fallback staleness threshold (hours) for a site with no declared cadence
+# (>30h = at least one daily run skipped). ``cadence.SITE_SCRAPE_CADENCE_HOURS``
+# and the ``health._SITE_MAX_AGE_HOURS`` derived from it are the single source
+# for the three monitored sites. Surfaced in `/health.staleness_warning`.
 _HEALTH_STALENESS_HOURS = 30
 
 
@@ -603,6 +606,13 @@ def _site_staleness_threshold(site: str) -> int:
     from src.health import _SITE_MAX_AGE_HOURS
 
     return _SITE_MAX_AGE_HOURS.get(site, _HEALTH_STALENESS_HOURS)
+
+
+def _site_cadence_hours(site: str) -> int:
+    """How often this site is scheduled for a full scan (hours)."""
+    from src.cadence import site_cadence_hours
+
+    return site_cadence_hours(site)
 
 
 def _ping_db(db: Session) -> float | None:
@@ -661,6 +671,7 @@ def _staleness_per_site(db: Session) -> list[SiteStaleness]:
                 last_seen_at=last_seen,
                 hours_since=hours,
                 max_age_hours=_site_staleness_threshold(site),
+                cadence_hours=_site_cadence_hours(site),
             )
         )
     return out

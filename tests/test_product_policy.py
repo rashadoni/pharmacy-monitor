@@ -146,3 +146,43 @@ def test_unknown_country_does_not_mask_two_resolved_country_conflicts() -> None:
     rs.country_resolution_status = COUNTRY_RESOLVED
 
     assert identity_eligibility([ua, rs, unknown]).reason == "country_conflict"
+
+
+def test_offer_freshness_window_follows_site_cadence():
+    """Окно свежести оффера выводится из ритма сбора, а не из общих 30ч.
+
+    aptekonline собирается раз в неделю (решение владельца 2026-10-04), поэтому
+    самое свежее наблюдение по нему физически бывает недельной давности. Прежние
+    жёсткие 30ч объявляли его собственный успешный сбор несвежим уже через
+    полтора дня — полный каталог не подтверждался 6 дней из 7.
+    """
+    from src.product_policy import OFFER_MAX_AGE_HOURS
+
+    assert OFFER_MAX_AGE_HOURS["aloe"] == 30
+    assert OFFER_MAX_AGE_HOURS["pharmonline"] == 30
+    assert OFFER_MAX_AGE_HOURS["aptekonline"] == 174
+
+
+def test_weekly_site_offer_stays_fresh_mid_cycle():
+    """Наблюдение aptekonline на 100ч — середина штатного недельного цикла."""
+    from src.product_policy import offer_is_fresh
+
+    now = utcnow()
+    weekly = _product("aptekonline")
+    weekly.availability_observed_at = now - timedelta(hours=100)
+    assert offer_is_fresh(weekly, now=now) is True
+
+    # Суточный сайт на том же возрасте — это четверо пропущенных сборов.
+    daily = _product("aloe")
+    daily.availability_observed_at = now - timedelta(hours=100)
+    assert offer_is_fresh(daily, now=now) is False
+
+
+def test_weekly_site_offer_goes_stale_after_missed_scan():
+    """Пропущенный недельный сбор (>174ч) по-прежнему делает оффер несвежим."""
+    from src.product_policy import offer_is_fresh
+
+    now = utcnow()
+    weekly = _product("aptekonline")
+    weekly.availability_observed_at = now - timedelta(hours=200)
+    assert offer_is_fresh(weekly, now=now) is False

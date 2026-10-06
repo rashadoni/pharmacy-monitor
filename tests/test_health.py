@@ -291,8 +291,15 @@ def test_site_silence_critical_when_one_site_stale(db_session):
     assert "aloe" not in silent_sites  # aloe свежий — не должен попасть
 
 
-def test_site_silence_flags_aptekonline_after_daily_slo(db_session):
-    """Daily Aptekonline data older than 30h is an actionable outage."""
+def test_site_silence_respects_weekly_aptekonline_cadence(db_session):
+    """Регрессия: недельный aptekonline на 100ч идёт по графику, а не молчит.
+
+    Aptekonline собирается раз в неделю (решение владельца 2026-10-04), aloe —
+    ежедневно. Один и тот же возраст данных означает для них разное: для aloe
+    это пропущенные четверо суток, для aptekonline — середина штатного цикла.
+    До правки оба сравнивались с 30ч, и дашборд красил aptekonline красным
+    6 дней из 7.
+    """
     now = utcnow()
     apt_run = _add_run(db_session, now - timedelta(hours=100))
     _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=100))
@@ -302,12 +309,36 @@ def test_site_silence_flags_aptekonline_after_daily_slo(db_session):
 
     rep = check_health(db_session, max_age_hours=26)
     silent_sites = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
-    assert "aptekonline" in silent_sites
+    assert "aptekonline" not in silent_sites
     assert "aloe" in silent_sites
 
 
+def test_site_thresholds_follow_declared_cadence():
+    """Пороги выводятся из ритма сбора, а не прибиты гвоздями по сайтам."""
+    from src import health as h
+    from src.cadence import site_cadence_hours
+
+    # Суточные сайты сохраняют исторические значения 30ч / 3д / 2д.
+    for site in ("pharmonline", "aloe"):
+        assert site_cadence_hours(site) == 24
+        assert h._SITE_MAX_AGE_HOURS[site] == 30
+        assert h._SITE_FRESHNESS_DAYS[site] == 3
+        assert h._SITE_COVERAGE_DAYS[site] == 2
+
+    # Недельный сайт получает пропорционально широкие окна.
+    assert site_cadence_hours("aptekonline") == 168
+    assert h._SITE_MAX_AGE_HOURS["aptekonline"] == 174
+    assert h._SITE_FRESHNESS_DAYS["aptekonline"] == 9
+    assert h._SITE_COVERAGE_DAYS["aptekonline"] == 8
+
+    # Инвариант site_drop: окно покрытия всегда строго уже окна свежести,
+    # иначе частичный тик уронит метрику (см. docstring _check_site_drops).
+    for site in h.SITE_SCRAPE_CADENCE_HOURS:
+        assert h._SITE_COVERAGE_DAYS[site] < h._SITE_FRESHNESS_DAYS[site]
+
+
 def test_site_silence_flags_long_aptekonline_outage(db_session):
-    """A long Aptekonline outage remains critical under the daily SLO."""
+    """Пропущенный недельный сбор (>174ч) — всё ещё critical."""
     now = utcnow()
     apt_run = _add_run(db_session, now - timedelta(hours=210))
     _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=210))

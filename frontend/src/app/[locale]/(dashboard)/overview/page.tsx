@@ -658,11 +658,16 @@ function SiteStalenessCell({ site }: { site: HealthSite }) {
   const t = useTranslations("staleness");
   const hours = site.hours_since;
   const maxAgeHours = site.max_age_hours;
-  const warningAfterHours = maxAgeHours <= 30 ? 8 : maxAgeHours * 0.75;
+  // Каждый сайт красится по СВОЕМУ расписанию: aloe и pharmonline собираются
+  // раз в сутки, aptekonline — раз в неделю. Пока его срок не наступил, сайт
+  // просто идёт по графику, и любой «тревожный» цвет клиент читает как поломку.
+  // Старое правило (жёлтый с 8ч / с 75% порога) красило недельный сайт в
+  // предупреждение за два дня до планового сбора.
+  const cadenceHours = site.cadence_hours ?? Math.min(24, maxAgeHours);
   // Threshold rules:
-  //   green:  comfortably inside the site's scrape cadence
-  //   yellow: near the backend staleness threshold
-  //   red:    beyond the backend staleness threshold, or no data
+  //   green:  следующий сбор ещё не наступил — всё по расписанию
+  //   yellow: срок наступил, сбора пока нет (в пределах запаса на retry)
+  //   red:    пропущен целый цикл сбора, либо данных нет вовсе
   let tone: "green" | "yellow" | "red" = "green";
   let Icon = CheckCircle2;
   if (hours === null) {
@@ -671,7 +676,7 @@ function SiteStalenessCell({ site }: { site: HealthSite }) {
   } else if (hours > maxAgeHours) {
     tone = "red";
     Icon = AlertCircle;
-  } else if (hours >= warningAfterHours) {
+  } else if (hours >= cadenceHours) {
     tone = "yellow";
     Icon = AlertTriangle;
   }

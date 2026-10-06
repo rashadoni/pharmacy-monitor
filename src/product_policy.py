@@ -21,6 +21,7 @@ from typing import Any
 from sqlalchemy import and_, desc, func, or_, select
 
 from src._time import utcnow
+from src.cadence import SITE_SCRAPE_CADENCE_HOURS, site_max_age_hours
 from src.normalize import strip_accents
 
 COUNTRY_RESOLVED = "resolved"
@@ -35,16 +36,19 @@ OFFER_UNKNOWN = "unknown"
 COUNTRY_POLICY_MODES = {"shadow", "enforce"}
 AVAILABILITY_POLICY_MODES = {"shadow", "enforce"}
 
-# Daily full-catalog cadence plus a safety margin.  A stale observation is not
-# a trusted active offer, but it is also not rewritten to out_of_stock.  The
-# systemd schedule is installed by infra/scripts/install_systemd_schedule.sh;
-# keep this business promise in code instead of silently accepting a weekly
-# timer override.
-OFFER_MAX_AGE_HOURS = {
-    "aloe": 30,
-    "aptekonline": 30,
-    "pharmonline": 30,
-}
+# Ритм полного сбора + запас (src/cadence.py): суточный сайт → 30ч, недельный
+# → 174ч. Устаревшее наблюдение не считается достоверным активным оффером, но и
+# не переписывается в out_of_stock. Расписание ставится
+# infra/scripts/install_systemd_schedule.sh.
+#
+# Раньше здесь стояли жёсткие 30ч для всех трёх сайтов — страховка от того, что
+# недельный timer-override проскочит молча. С 2026-10-04 недельный ритм
+# aptekonline — осознанное решение владельца (обход Cloudflare платный:
+# ежедневно ≈$149/мес против $49), и те же 30ч стали означать обратное:
+# собственный успешный недельный сбор объявлялся несвежим через полтора дня,
+# из-за чего полный каталог не подтверждался 6 дней из 7, а на дашборде висело
+# «Tam kataloq: Təsdiqlənməyib — tövsiyələr bağlıdır».
+OFFER_MAX_AGE_HOURS = {site: site_max_age_hours(site) for site in SITE_SCRAPE_CADENCE_HOURS}
 
 REQUIRED_CATALOG_SITES = ("pharmonline", "aptekonline", "aloe")
 _MIN_POLICY_COVERAGE_PCT = 98.0
