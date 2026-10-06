@@ -4827,6 +4827,79 @@ def seed_demo_cmd(force: bool) -> None:
     )
 
 
+def _is_scheduled_full_scan(
+    *,
+    mode: str,
+    category_id: int | None,
+    limit: int | None,
+    hourly: bool,
+    dry_run: bool,
+    request_id: int | None = None,
+) -> bool:
+    """Это плановый полный сбор каталога, запущенный таймером?
+
+    Намеренно узко: ровно та форма, которую зовёт root-овый systemd-юнит
+    (`run --site %i --mode category`). Ручные прогоны (`--mode auto`, выбранная
+    категория, `--limit`, watchlist-тик, dry-run) гвард не трогает — иначе
+    оператор, запустивший сбор руками, молча получил бы «пропущено».
+
+    `--request-id` тоже исключён: это кнопка «Запустить scrape» в дашборде.
+    Пропустить её молча — ровно тот класс бага, когда запрос навсегда виснет в
+    `running` (чинили 2026-06-11). Нажали кнопку — собираем, ритм не спорит.
+    """
+    return (
+        mode == "category"
+        and category_id is None
+        and limit is None
+        and not hourly
+        and not dry_run
+        and request_id is None
+    )
+
+
+def _sites_due_for_full_scan(
+    session,
+    sites: list[str],
+    *,
+    tenant_id: int = 1,
+    now: datetime | None = None,
+) -> tuple[list[str], dict[str, float]]:
+    """Какие сайты пора собирать полностью, а какие ещё в пределах своего ритма.
+
+    Ритм берётся из src/cadence.py — там же, откуда выводятся пороги «данные
+    устарели», так что расписание и мониторинг не могут разъехаться.
+
+    Зачем это нужно: сменить root-овый systemd-таймер мы не можем (нет root на
+    прод-хосте), а суточный таймер при недельном ритме делал бы шесть лишних
+    полных сборов в неделю. Код деплоится обычным rsync, поэтому фактическое
+    расписание задаётся здесь: таймер по-прежнему просыпается каждый день, но
+    реально собирает только когда ритм истёк.
+
+    Учитывается ТОЛЬКО успешная (`status == "ok"`) полная попытка: упавший сбор
+    не должен блокировать повтор на следующий день.
+    """
+    from src.cadence import site_cadence_hours
+
+    current = now or utcnow()
+    attempts = storage.latest_full_catalog_attempts_by_site(
+        session, sites, tenant_id=tenant_id
+    )
+    due: list[str] = []
+    covered: dict[str, float] = {}
+    for site_name in sites:
+        attempt = attempts.get(site_name)
+        completed_at = (attempt.finished_at or attempt.started_at) if attempt else None
+        if attempt is None or attempt.status != "ok" or completed_at is None:
+            due.append(site_name)
+            continue
+        age_hours = (current - completed_at).total_seconds() / 3600
+        if age_hours >= site_cadence_hours(site_name):
+            due.append(site_name)
+        else:
+            covered[site_name] = age_hours
+    return due, covered
+
+
 @cli.command("run")
 @click.option(
     "--dry-run", is_flag=True, help="Не отправлять email, только сгенерировать отчёт в reports/"
@@ -4866,6 +4939,12 @@ def seed_demo_cmd(force: bool) -> None:
     help="Пропустить evaluation алертов после прогона (по умолчанию запускается)",
 )
 @click.option(
+    "--force",
+    is_flag=True,
+    help="Собрать полный каталог, даже если сайт уже собран в пределах своего ритма "
+    "(см. src/cadence.py). Без флага плановый полный сбор пропускается до срока.",
+)
+@click.option(
     "--request-id",
     type=int,
     default=None,
@@ -4881,6 +4960,7 @@ def run_cmd(
     category_id: int | None,
     hourly: bool,
     no_alerts: bool,
+    force: bool,
     request_id: int | None,
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
@@ -4942,6 +5022,25 @@ def run_cmd(
         maybe_seed_categories(session)
 
         run_tenant_id = run_tenant_id_for_request(session, request_id)
+        if not force and _is_scheduled_full_scan(
+            mode=mode,
+            category_id=category_id,
+            limit=limit,
+            hourly=hourly,
+            dry_run=dry_run,
+            request_id=request_id,
+        ):
+            due, covered = _sites_due_for_full_scan(session, sites, tenant_id=run_tenant_id)
+            if not due:
+                log.info(
+                    "run_skipped_within_cadence",
+                    sites=sites,
+                    covered_hours_ago={k: round(v, 1) for k, v in covered.items()},
+                    hint="--force чтобы собрать досрочно",
+                )
+                return
+            sites = due
+
         run = storage.Run(status="running", tenant_id=run_tenant_id)
         session.add(run)
         session.commit()
