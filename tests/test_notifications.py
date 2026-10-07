@@ -1243,7 +1243,7 @@ def test_run_email_big_run_is_summary_plus_capped_lists(setup, tenant_user):
         # Это не дайджест: ни его шапки, ни подписи про отписку.
         assert "айджест" not in body
 
-    assert "99 алертов за прогон" in alice
+    assert "<title>99 алертов за прогон</title>" in alice
     assert ">78 критичных, 21 предупреждение</div>" in alice
     assert "31 из 99, самые важные" in alice
     assert "Новые товары" not in alice and "информационн" not in alice
@@ -1312,10 +1312,76 @@ def test_run_email_small_run_lists_every_event(setup, tenant_user):
     assert ">3 критичных, 4 предупреждения, 5 информационных</div>" in body
     assert "Ещё " not in body
     assert "самые важные" not in body and "только сводка" not in body
-    # Как и раньше, сначала критичные, затем предупреждения, затем информационные.
-    assert body.index("detail of UNDERCUT0") < body.index("detail of DROPWARN0")
-    assert body.index("detail of DROPWARN0") < body.index("detail of NEWPRODUCT0")
     assert subjects["alice@example.com"] == "[CRITICAL] Pharmacy Monitor — 12 алертов"
+
+
+def test_run_email_groups_rows_by_type_not_by_severity_alone():
+    """Строки идут блоками по типам: выше тип, у которого есть событие важнее,
+    внутри типа — по важности. Раньше письмо шло одним списком строго по
+    важности; теперь предупреждение может стоять выше критичного другого типа."""
+    events = [
+        _loose_event("price_drop_pct", "critical", "PD_CRIT"),
+        _loose_event("new_product", "info", "NP_INFO"),
+        _loose_event("undercut_threshold", "info", "UC_INFO"),
+        _loose_event("undercut_threshold", "warning", "UC_WARN"),
+        _loose_event("undercut_threshold", "critical", "UC_CRIT"),
+        _loose_event("site_drop_smoke", "warning", "SD_WARN"),
+    ]
+    html = notifications._render_batch_email(events)
+
+    order = ["UC_CRIT", "UC_WARN", "UC_INFO", "PD_CRIT", "SD_WARN", "NP_INFO"]
+    positions = [html.index(title) for title in order]
+    assert positions == sorted(positions)
+    assert _event_rows(html) == 6
+
+
+def test_run_email_two_events_get_the_batch_subject(setup, tenant_user):
+    """Старая тема — только у одиночного события; два — уже сводка."""
+    s = setup
+    events = [
+        _run_event(s, tenant_user.tenant_id, "price_drop_pct", severity, f"PAIR{i}")
+        for i, severity in enumerate(("warning", "critical"))
+    ]
+    s.commit()
+
+    _, subjects = _run_emails(s, events)
+
+    assert subjects["alice@example.com"] == "[CRITICAL] Pharmacy Monitor — 2 алерта"
+
+
+def test_run_email_failed_send_marks_nothing_and_can_be_retried(setup, tenant_user):
+    """Письмо не ушло — метки нет ни у одного события, в том числе у тех, что
+    остались бы числом в сводке: следующий вызов шлёт письмо целиком."""
+    s = setup
+    info, loud = _big_run(s, tenant_user.tenant_id)
+
+    with patch("src.notifier.send_email", side_effect=RuntimeError("smtp down")) as mock_email:
+        result = notifications.dispatch_events_batch(s, info + loud)
+    assert mock_email.call_count == 1
+    assert result == {"email": 0, "telegram": 0}
+    for e in info + loud:
+        s.refresh(e)
+        assert not e.channels_sent
+
+    bodies, _ = _run_emails(s, info + loud)
+    assert "99 алертов за прогон" in bodies["alice@example.com"]
+    assert all(e.channels_sent == ["email"] for e in loud)
+
+
+def test_digest_keeps_its_own_header_and_footer():
+    """Тело у дайджеста и письма о прогоне общее, шапка и подвал — свои."""
+    events = [_loose_event("undercut_threshold", "critical", "X")]
+
+    digest = notifications._render_digest_email(events, kind="weekly", since=utcnow())
+    assert "<title>Дайджест за неделю</title>" in digest
+    assert ">Дайджест за неделю</div>" in digest
+    assert ">Все события за неделю — в дашборде →</a>" in digest
+    assert "Отписаться от дайджеста" in digest
+    assert "за прогон" not in digest and "Открыть в дашборде" not in digest
+
+    run = notifications._render_batch_email(events)
+    assert ">Открыть в дашборде →</a>" in run
+    assert "Все события за" not in run
 
 
 def test_run_email_single_event_keeps_subject_and_lists_it(setup, tenant_user):
