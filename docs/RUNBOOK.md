@@ -861,12 +861,18 @@ UTC), 13 тиков в день. Тик обслуживает только aloe
 |---|---|---|
 | `site_rate_limited` | На aloe уже был intraday-прогон меньше двух часов назад. Очередь остаётся у той же категории | Ничего — так выходит примерно каждый второй тик |
 | `no_servable_category` | За 7 дней цены не менялись ни в одной категории с разделом aloe | Проверить, идут ли сборы aloe вообще |
-| `rotation_state_unavailable` | Redis недоступен или `REDIS_URL` не задан | Чинить Redis |
+| `rotation_state_unavailable` | Redis недоступен, `REDIS_URL` не задан или Redis не принимает запись | Чинить Redis |
 
 ```bash
 ssh root@13.140.186.143 'journalctl -u pharmacy-monitor-intraday.service \
-  --since today -o cat | grep -E "intraday_(picked|skipped)"'
+  --since today -o cat | grep -E "intraday_(picked|skipped)|^Scraped|^scrape: skipped"'
 ```
+
+`intraday_picked` — тик выбрал цель и передал очередь дальше. Сбор состоялся,
+если следом идёт строка `Scraped N products`. Строка `scrape: skipped because
+another scrape run is active` значит, что в это время шёл другой сбор: очередь
+этой категории и двухчасовой лимит потрачены впустую. За 2026-09-23…10-07 такого
+не было ни разу.
 
 До 2026-10-07 любой пропуск назывался `intraday_all_sites_locked`, даже когда
 замка не было: ротация шла по top-30 всех сайтов и выбирала категории, которых
@@ -888,7 +894,7 @@ ssh root@13.140.186.143 'systemctl start pharmacy-monitor-intraday.service'
 
 ```bash
 ssh root@13.140.186.143 '
-  redis-cli get "intraday:rotation:idx"  # сколько прогонов взято; очередь = idx % число категорий
+  redis-cli get "intraday:rotation:idx"  # указатель; очередь = idx % число категорий в ротации
   redis-cli ttl "intraday:lock:site:aloe"  # TTL до next tick allowed
 '
 ```

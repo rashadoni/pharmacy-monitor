@@ -5862,7 +5862,8 @@ def intraday_tick_cmd(dry_run: bool) -> None:
         с разделом на Aloe (новый деплой, мало данных)
       - site_rate_limited: последний intraday на Aloe < 2ч назад; очередь
         категории сохраняется
-      - rotation_state_unavailable: Redis недоступен или не настроен
+      - rotation_state_unavailable: Redis недоступен, не настроен или не
+        принимает запись
 
     Failures (exit 1):
       - Сам scrape упал (network, proxy и т.п.) — поднимаем error чтобы systemd

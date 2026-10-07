@@ -1,7 +1,7 @@
 """Phase 5.1 (Вариант C) — intraday category rotation.
 
 В отличие от full scheduled scrape, intraday
-делает СУПЛЕМЕНТАЛЬНЫЕ прогоны: каждый час business hours (05-17 UTC) выбирает
+делает СУПЛЕМЕНТАЛЬНЫЕ прогоны: каждый час с 05 до 17 по времени хоста выбирает
 одну категорию из top-N volatile и скрейпит её на одном сайте round-robin.
 
 Это даёт квази-intraday обновление цен по самым активным категориям без
@@ -23,8 +23,8 @@ Design:
 который picks one (site, category) и делает category-mode scrape.
 
 Пропуск тика — штатный исход; причина пишется в лог событием
-`intraday_skipped` с полем `reason` (см. SKIP_*). Если Redis unreachable —
-тоже пропуск (intraday не critical).
+`intraday_skipped` с полем `reason` (см. SKIP_*). Если Redis unreachable или
+не принимает запись — тоже пропуск (intraday не critical).
 """
 
 from __future__ import annotations
@@ -75,7 +75,8 @@ _ROTATION_KEY = "intraday:rotation:idx"
 SKIP_NO_SERVABLE_CATEGORY = "no_servable_category"
 # Категория выбрана, но сайт недавно уже получил intraday-прогон.
 SKIP_SITE_RATE_LIMITED = "site_rate_limited"
-# Указатель ротации прочитать не удалось (Redis недоступен или не настроен).
+# Указатель ротации не удалось прочитать или сдвинуть (Redis недоступен, не
+# настроен или не принимает запись).
 SKIP_ROTATION_UNAVAILABLE = "rotation_state_unavailable"
 
 
@@ -225,20 +226,21 @@ def _peek_rotation_pick(
         return None
 
 
-def _advance_rotation(redis_client: Any) -> None:
-    """Передать очередь следующей категории (atomic INCR).
+def _advance_rotation(redis_client: Any) -> bool:
+    """Передать очередь следующей категории (atomic INCR). False если не вышло.
 
     Зовётся только когда тик взял прогон. TTL 90 дней — чтоб ключ не висел
-    вечно если intraday отключат. Сбой Redis здесь прогон не отменяет: та же
-    категория просто получит ещё один тик.
+    вечно если intraday отключат.
     """
     if redis_client is None:
-        return
+        return False
     try:
         redis_client.incr(_ROTATION_KEY)
         redis_client.expire(_ROTATION_KEY, 90 * 24 * 3600)
+        return True
     except Exception as e:  # noqa: BLE001
         log.warning("intraday_redis_incr_failed", error=str(e))
+        return False
 
 
 # ─── Per-site rate-limit ──────────────────────────────────────────────────────
@@ -305,8 +307,12 @@ def pick_next_scrape_target(
     2. Читаем указатель ротации: чья очередь.
     3. Среди сайтов категории берём первый, у которого lock can be acquired
        (последний прогон > 2h назад).
-    4. Прогон взят → сдвигаем указатель. Не взят → указатель на месте, та же
-       категория получит следующий тик.
+    4. Прогон взят → сдвигаем указатель. Не взят → указатель на месте.
+
+    Тики не должны идти одновременно: указатель читается и сдвигается двумя
+    командами. При одном сайте второй тик остановит замок; при нескольких два
+    одновременных тика взяли бы одну категорию на разных сайтах. Таймер
+    (oneshot) параллельно не запускается.
 
     Returns: TickDecision с `target` либо с причиной пропуска.
     """
@@ -331,7 +337,7 @@ def pick_next_scrape_target(
             "rotation state unavailable (Redis unreachable or REDIS_URL not set)",
         )
 
-    longest_wait = 0
+    waits: list[int] = []
     for site in servable_sites(cat):
         if commit_state:
             acquired = acquire_site_lock(redis_client, site)
@@ -340,7 +346,7 @@ def pick_next_scrape_target(
             acquired = _peek_site_lock_free(redis_client, site)
         if not acquired:
             ttl = time_until_lock_expires(redis_client, site) or 0
-            longest_wait = max(longest_wait, ttl)
+            waits.append(ttl)
             log.info(
                 "intraday_site_locked",
                 site=site,
@@ -350,8 +356,17 @@ def pick_next_scrape_target(
             )
             continue
         # Lock acquired — этот сайт берёт прогон, очередь переходит дальше.
-        if commit_state:
-            _advance_rotation(redis_client)
+        # Не сдвинулась (Redis отдаёт чтение, но не принимает запись) — прогон
+        # не берём: иначе каждый тик собирал бы одну и ту же категорию, а замок
+        # в таком Redis тоже не держится.
+        if commit_state and not _advance_rotation(redis_client):
+            return _skip(
+                SKIP_ROTATION_UNAVAILABLE,
+                "rotation state unavailable (Redis rejected the write)",
+                site=site,
+                category_id=cat.id,
+                category_key=cat.key,
+            )
         log.info(
             "intraday_picked",
             site=site,
@@ -363,13 +378,14 @@ def pick_next_scrape_target(
         return TickDecision(target=(site, cat))
 
     cat_sites = ",".join(servable_sites(cat))
+    soonest = min(waits, default=0)
     return _skip(
         SKIP_SITE_RATE_LIMITED,
         f"{cat_sites} already had an intraday run within the last "
-        f"{INTRADAY_PER_SITE_MIN_GAP_SEC // 3600}h (free in {longest_wait}s); "
-        f"category {cat.key} keeps its turn",
+        f"{INTRADAY_PER_SITE_MIN_GAP_SEC // 3600}h (free in {soonest}s); "
+        f"rotation not advanced, next in line: {cat.key}",
         sites=cat_sites,
-        ttl_sec=longest_wait,
+        ttl_sec=soonest,
         category_id=cat.id,
         category_key=cat.key,
     )

@@ -315,7 +315,7 @@ Services (all systemd):
 - pharmacy-monitor-frontend.service     → Next.js :3000 (standalone)
 - pharmacy-monitor-scrape@<site>.timer  → daily scrape
 - pharmacy-monitor-scrape@<site>.service → triggered by timer
-- pharmacy-monitor-intraday.timer       → hourly 05-17 UTC (Phase 5.1c)
+- pharmacy-monitor-intraday.timer       → hourly 05–17 по времени хоста (Phase 5.1c)
 - pharmacy-monitor-intraday.service     → intraday-tick
 - pharmacy-monitor-health.timer         → hourly
 - pharmacy-monitor-backup.timer         → daily 04:00 UTC

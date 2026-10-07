@@ -180,6 +180,33 @@ def test_top_volatile_categories_skips_old_snapshots(db_session):
     assert result == [], "старые snapshots не должны попадать в volatility"
 
 
+def test_top_volatile_categories_orders_ties_by_id(db_session, monkeypatch):
+    """Равная volatility → по id, в каком бы порядке БД ни отдала строки.
+
+    По этому списку ходит указатель ротации; Postgres без ORDER BY отдаёт
+    строки в порядке кучи, и он меняется после UPDATE.
+    """
+    cats = [
+        _add_volatile_category(db_session, f"tie{i}", "aloe", f"tie-{i}", n_snaps=3)
+        for i in range(3)
+    ]
+    db_session.commit()
+
+    real_scalars = db_session.scalars
+
+    class _HeapOrder:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return list(reversed(self._rows))
+
+    monkeypatch.setattr(db_session, "scalars", lambda stmt: _HeapOrder(real_scalars(stmt).all()))
+
+    result = intraday.top_volatile_categories(db_session)
+    assert [c.id for c in result] == sorted(c.id for c in cats)
+
+
 def test_top_volatile_categories_returns_empty_when_no_data(db_session):
     """Нет ни одного snapshot → пустой list (graceful)."""
     _add_category(db_session, "a", "A", ph_slug="cat-a")
@@ -236,11 +263,12 @@ def test_peek_rotation_pick_returns_none_on_redis_error():
     assert intraday._peek_rotation_pick(redis_mock, fake_cats) is None
 
 
-def test_advance_rotation_swallows_redis_error():
-    """INCR raises → прогон не отменяется, просто очередь не сдвинулась."""
+def test_advance_rotation_reports_redis_error():
+    """INCR raises → не бросает, но сообщает, что очередь не сдвинулась."""
     redis_mock = MagicMock()
     redis_mock.incr.side_effect = Exception("connection lost")
-    intraday._advance_rotation(redis_mock)  # не бросает
+    assert intraday._advance_rotation(redis_mock) is False
+    assert intraday._advance_rotation(_FakeRedis()) is True
 
 
 # ─── acquire_site_lock ───────────────────────────────────────────────────────
@@ -386,13 +414,32 @@ def test_rate_limited_tick_keeps_the_category_turn(db_session):
     throttled = intraday.pick_next_scrape_target(db_session, redis_client=redis)
     assert throttled.target is None
     assert throttled.skip_reason == intraday.SKIP_SITE_RATE_LIMITED
-    assert "aloe1 keeps its turn" in throttled.skip_detail
+    assert "next in line: aloe1" in throttled.skip_detail
     assert f"free in {intraday.INTRADAY_PER_SITE_MIN_GAP_SEC}s" in throttled.skip_detail
     assert redis.data[ROTATION_KEY] == 1, "пропущенный тик очередь не сдвигает"
 
     redis.delete(ALOE_LOCK)
     third = intraday.pick_next_scrape_target(db_session, redis_client=redis)
     assert third.target[1].key == "aloe1"
+
+
+def test_rate_limited_skip_reports_the_soonest_free_site(db_session, monkeypatch):
+    """Два сайта под лимитом → срок считается по тому, что освободится первым."""
+    monkeypatch.setattr(intraday, "INTRADAY_SITES", ("pharmonline", "aloe"))
+    cat = _add_category(db_session, "both", "Both", ph_slug="ph-both", aloe_slug="aloe-both")
+    p = _add_product_with_category(db_session, "aloe", "p-both", "P both", "aloe-both")
+    _add_snaps(db_session, p, n_snaps=5)
+    db_session.commit()
+
+    redis = _FakeRedis()
+    redis.set("intraday:lock:site:pharmonline", "1", ex=5000)
+    redis.set(ALOE_LOCK, "1", ex=100)
+
+    decision = intraday.pick_next_scrape_target(db_session, redis_client=redis)
+    assert decision.skip_reason == intraday.SKIP_SITE_RATE_LIMITED
+    assert "pharmonline,aloe" in decision.skip_detail
+    assert "free in 100s" in decision.skip_detail
+    assert f"next in line: {cat.key}" in decision.skip_detail
 
 
 def test_pick_next_scrape_target_skips_when_no_volatile_cats(db_session):
@@ -416,6 +463,26 @@ def test_skip_names_redis_when_rotation_state_is_unavailable(db_session, monkeyp
     assert decision.target is None
     assert decision.skip_reason == intraday.SKIP_ROTATION_UNAVAILABLE
     assert "Redis" in decision.skip_detail
+
+
+def test_redis_that_rejects_writes_skips_instead_of_repeating_a_category(db_session):
+    """Redis читает, но не пишет (диск полон) → пропуск, а не сбор без лимита.
+
+    SETNX в таком Redis падает, и замок по правилу fail-open считается взятым.
+    Если при этом брать прогон, каждый тик собирал бы одну и ту же категорию.
+    """
+    _add_volatile_category(db_session, "aloe0", "aloe", "aloe-0", n_snaps=5)
+    db_session.commit()
+
+    redis_mock = MagicMock()
+    redis_mock.get.return_value = b"3"
+    redis_mock.set.side_effect = Exception("MISCONF Redis is configured to save RDB snapshots")
+    redis_mock.incr.side_effect = Exception("MISCONF Redis is configured to save RDB snapshots")
+
+    decision = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
+    assert decision.target is None
+    assert decision.skip_reason == intraday.SKIP_ROTATION_UNAVAILABLE
+    assert "rejected the write" in decision.skip_detail
 
 
 def test_pick_next_scrape_target_skips_sites_without_slug(db_session):
