@@ -2,11 +2,13 @@
 
 Покрывает:
   - top_volatile_categories: ранжирует категории по count(price_snapshots) за 7д
-  - next_rotation_pick: stub Redis INCR, проверка wraparound по модулю
+  - указатель ротации: чтение без сдвига, сдвиг, wraparound по модулю
   - acquire_site_lock: SETNX atomic semantics, fail-open если Redis недоступен
-  - pick_next_scrape_target: end-to-end orchestration с моками
+  - pick_next_scrape_target: end-to-end orchestration — ротация только по
+    категориям, которые тик может обслужить, и причина пропуска
 
-Redis замокан unittest.mock.MagicMock для контролируемого поведения.
+Redis замокан unittest.mock.MagicMock для контролируемого поведения; там, где
+важна последовательность тиков, — _FakeRedis с состоянием в памяти.
 """
 
 from __future__ import annotations
@@ -74,6 +76,58 @@ def _add_snaps(session, product, n_snaps, when=None):
     session.flush()
 
 
+class _FakeRedis:
+    """Redis в памяти: ровно те команды, что зовёт intraday.
+
+    TTL не истекает сам — «прошло два часа» в тесте это `delete` замка.
+    """
+
+    def __init__(self):
+        self.data: dict[str, object] = {}
+        self.ttls: dict[str, int] = {}
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def incr(self, key):
+        self.data[key] = int(self.data.get(key, 0)) + 1
+        return self.data[key]
+
+    def expire(self, key, seconds):
+        self.ttls[key] = seconds
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.data:
+            return None
+        self.data[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
+        return True
+
+    def ttl(self, key):
+        return self.ttls.get(key, -1) if key in self.data else -2
+
+    def exists(self, key):
+        return int(key in self.data)
+
+    def delete(self, key):
+        self.data.pop(key, None)
+        self.ttls.pop(key, None)
+
+
+ROTATION_KEY = "intraday:rotation:idx"
+ALOE_LOCK = "intraday:lock:site:aloe"
+
+
+def _add_volatile_category(session, key, site, slug, n_snaps) -> storage.Category:
+    """Категория с разделом на одном сайте и n_snaps изменений цены за окно."""
+    slug_kw = {"pharmonline": "ph_slug", "aptekonline": "apt_slug", "aloe": "aloe_slug"}[site]
+    cat = _add_category(session, key, key.upper(), **{slug_kw: slug})
+    product = _add_product_with_category(session, site, f"p-{key}", f"P {key}", slug)
+    _add_snaps(session, product, n_snaps=n_snaps)
+    return cat
+
+
 # ─── top_volatile_categories ──────────────────────────────────────────────────
 
 
@@ -126,6 +180,33 @@ def test_top_volatile_categories_skips_old_snapshots(db_session):
     assert result == [], "старые snapshots не должны попадать в volatility"
 
 
+def test_top_volatile_categories_orders_ties_by_id(db_session, monkeypatch):
+    """Равная volatility → по id, в каком бы порядке БД ни отдала строки.
+
+    По этому списку ходит указатель ротации; Postgres без ORDER BY отдаёт
+    строки в порядке кучи, и он меняется после UPDATE.
+    """
+    cats = [
+        _add_volatile_category(db_session, f"tie{i}", "aloe", f"tie-{i}", n_snaps=3)
+        for i in range(3)
+    ]
+    db_session.commit()
+
+    real_scalars = db_session.scalars
+
+    class _HeapOrder:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return list(reversed(self._rows))
+
+    monkeypatch.setattr(db_session, "scalars", lambda stmt: _HeapOrder(real_scalars(stmt).all()))
+
+    result = intraday.top_volatile_categories(db_session)
+    assert [c.id for c in result] == sorted(c.id for c in cats)
+
+
 def test_top_volatile_categories_returns_empty_when_no_data(db_session):
     """Нет ни одного snapshot → пустой list (graceful)."""
     _add_category(db_session, "a", "A", ph_slug="cat-a")
@@ -133,42 +214,61 @@ def test_top_volatile_categories_returns_empty_when_no_data(db_session):
     assert intraday.top_volatile_categories(db_session) == []
 
 
-# ─── next_rotation_pick ──────────────────────────────────────────────────────
+# ─── Указатель ротации ───────────────────────────────────────────────────────
 
 
-def test_next_rotation_pick_increments_atomically():
-    """INCR вызывается, возвращается categories[(idx-1) % len]."""
-    redis_mock = MagicMock()
-    redis_mock.incr.side_effect = [1, 2, 3, 4]  # 4 sequential calls
-
+def test_rotation_pointer_walks_the_list_and_wraps():
+    """Чтение + сдвиг дают round-robin с wraparound."""
+    redis = _FakeRedis()
     fake_cats = [MagicMock(id=i) for i in [10, 11, 12]]
 
-    picks = [intraday.next_rotation_pick(redis_mock, fake_cats) for _ in range(4)]
-    assert [p.id for p in picks] == [10, 11, 12, 10], "round-robin с wraparound"
+    picks = []
+    for _ in range(4):
+        picks.append(intraday._peek_rotation_pick(redis, fake_cats).id)
+        intraday._advance_rotation(redis)
 
-    # Каждый INCR должен установить expire (TTL = 90д)
-    assert redis_mock.expire.call_count == 4
+    assert picks == [10, 11, 12, 10], "round-robin с wraparound"
+    # Каждый сдвиг продлевает TTL ключа (90д)
+    assert redis.ttls[ROTATION_KEY] == 90 * 24 * 3600
 
 
-def test_next_rotation_pick_returns_none_on_empty():
-    """Empty list → None, INCR не вызывается."""
+def test_peek_rotation_pick_does_not_move_the_pointer():
+    """Сколько ни читай — очередь остаётся у той же категории."""
+    redis = _FakeRedis()
+    redis.data[ROTATION_KEY] = b"4"  # настоящий Redis отдаёт bytes
+    fake_cats = [MagicMock(id=i) for i in [10, 11, 12]]
+
+    assert [intraday._peek_rotation_pick(redis, fake_cats).id for _ in range(3)] == [11] * 3
+    assert redis.data[ROTATION_KEY] == b"4"
+
+
+def test_peek_rotation_pick_returns_none_on_empty():
+    """Empty list → None, Redis не трогаем."""
     redis_mock = MagicMock()
-    assert intraday.next_rotation_pick(redis_mock, []) is None
-    redis_mock.incr.assert_not_called()
+    assert intraday._peek_rotation_pick(redis_mock, []) is None
+    redis_mock.get.assert_not_called()
 
 
-def test_next_rotation_pick_returns_none_when_redis_none():
+def test_peek_rotation_pick_returns_none_when_redis_none():
     """Redis None → None (graceful, не падаем)."""
     fake_cats = [MagicMock(id=1)]
-    assert intraday.next_rotation_pick(None, fake_cats) is None
+    assert intraday._peek_rotation_pick(None, fake_cats) is None
 
 
-def test_next_rotation_pick_returns_none_on_redis_error():
-    """INCR raises → silent None."""
+def test_peek_rotation_pick_returns_none_on_redis_error():
+    """GET raises → silent None."""
+    redis_mock = MagicMock()
+    redis_mock.get.side_effect = Exception("connection lost")
+    fake_cats = [MagicMock(id=1)]
+    assert intraday._peek_rotation_pick(redis_mock, fake_cats) is None
+
+
+def test_advance_rotation_reports_redis_error():
+    """INCR raises → не бросает, но сообщает, что очередь не сдвинулась."""
     redis_mock = MagicMock()
     redis_mock.incr.side_effect = Exception("connection lost")
-    fake_cats = [MagicMock(id=1)]
-    assert intraday.next_rotation_pick(redis_mock, fake_cats) is None
+    assert intraday._advance_rotation(redis_mock) is False
+    assert intraday._advance_rotation(_FakeRedis()) is True
 
 
 # ─── acquire_site_lock ───────────────────────────────────────────────────────
@@ -217,14 +317,16 @@ def test_pick_next_scrape_target_returns_site_and_cat(db_session):
     db_session.commit()
 
     redis_mock = MagicMock()
-    redis_mock.incr.return_value = 1  # picks cats[0]
+    redis_mock.get.return_value = None  # указателя ещё нет → cats[0]
     redis_mock.set.return_value = True  # lock acquired
 
-    result = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
-    assert result is not None
-    site, picked_cat = result
+    decision = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
+    assert decision.skip_reason is None
+    site, picked_cat = decision.target
     assert picked_cat.id == cat.id
     assert site == "aloe"
+    # Прогон взят → очередь передана следующей категории.
+    redis_mock.incr.assert_called_once_with(ROTATION_KEY)
 
 
 def test_pick_next_scrape_target_never_attempts_pharmonline(db_session):
@@ -235,63 +337,166 @@ def test_pick_next_scrape_target_never_attempts_pharmonline(db_session):
     db_session.commit()
 
     redis_mock = MagicMock()
-    redis_mock.incr.return_value = 1
+    redis_mock.get.return_value = None
     redis_mock.set.return_value = True
 
-    result = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
-    assert result is not None
-    site, _ = result
-    assert site == "aloe"
+    decision = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
+    assert decision.target == ("aloe", cat)
     redis_mock.set.assert_called_once_with(
-        "intraday:lock:site:aloe",
+        ALOE_LOCK,
         "1",
         nx=True,
         ex=intraday.INTRADAY_PER_SITE_MIN_GAP_SEC,
     )
 
 
-def test_pick_next_scrape_target_returns_none_when_all_locked(db_session):
-    """Все сайты locked → None."""
-    cat = _add_category(db_session, "k1", "K1", ph_slug="ph", aloe_slug="aloe")
-    p = _add_product_with_category(db_session, "pharmonline", "p1", "P1", "ph")
+def test_rotation_serves_only_categories_the_tick_can_scrape(db_session):
+    """Сколько бы чужих категорий ни стояло выше по volatility, тик идёт по aloe.
+
+    Прод 2026-10-05…07: полные сборы aptekonline и pharmonline заняли своими
+    категориями 24–26 мест из top-30. Раздела aloe у них нет, тик выбирал их по
+    очереди и выходил пропуском — 29 раз из 32.
+    """
+    foreign = intraday.INTRADAY_TOP_N_CATEGORIES
+    for i in range(foreign):
+        site = "aptekonline" if i % 2 else "pharmonline"
+        _add_volatile_category(db_session, f"foreign{i}", site, f"{site}-{i}", n_snaps=20)
+    for i, n_snaps in enumerate([5, 3, 1]):
+        _add_volatile_category(db_session, f"aloe{i}", "aloe", f"aloe-{i}", n_snaps=n_snaps)
+    db_session.commit()
+
+    # Исходное условие с прода: в общем top-30 нет ни одной категории aloe.
+    unfiltered = intraday.top_volatile_categories(db_session)
+    assert len(unfiltered) == foreign
+    assert not any(c.aloe_slug for c in unfiltered)
+
+    redis = _FakeRedis()
+    picked = []
+    for _ in range(6):
+        decision = intraday.pick_next_scrape_target(db_session, redis_client=redis)
+        assert decision.target is not None, decision.skip_detail
+        site, cat = decision.target
+        assert site == "aloe"
+        picked.append(cat.key)
+        redis.delete(ALOE_LOCK)  # до следующего тика прошло больше двух часов
+
+    assert picked == ["aloe0", "aloe1", "aloe2"] * 2
+
+
+def test_skip_names_missing_section_not_a_lock(db_session):
+    """Цены менялись только там, где раздела aloe нет → причина названа прямо.
+
+    Раньше это выходило как `intraday_all_sites_locked`, хотя замка не было.
+    """
+    _add_volatile_category(db_session, "apt", "aptekonline", "17", n_snaps=5)
+    db_session.commit()
+
+    redis = _FakeRedis()
+    decision = intraday.pick_next_scrape_target(db_session, redis_client=redis)
+
+    assert decision.target is None
+    assert decision.skip_reason == intraday.SKIP_NO_SERVABLE_CATEGORY
+    assert "section on aloe" in decision.skip_detail
+    assert redis.data == {}, "ни сдвига очереди, ни замка — тик ничего не взял"
+
+
+def test_rate_limited_tick_keeps_the_category_turn(db_session):
+    """Сайт под лимитом частоты → пропуск, но очередь категории не сгорает."""
+    _add_volatile_category(db_session, "aloe0", "aloe", "aloe-0", n_snaps=5)
+    _add_volatile_category(db_session, "aloe1", "aloe", "aloe-1", n_snaps=3)
+    db_session.commit()
+    redis = _FakeRedis()
+
+    first = intraday.pick_next_scrape_target(db_session, redis_client=redis)
+    assert first.target[1].key == "aloe0"
+
+    # Следующий тик через час: замок aloe ещё держится.
+    throttled = intraday.pick_next_scrape_target(db_session, redis_client=redis)
+    assert throttled.target is None
+    assert throttled.skip_reason == intraday.SKIP_SITE_RATE_LIMITED
+    assert "next in line: aloe1" in throttled.skip_detail
+    assert f"free in {intraday.INTRADAY_PER_SITE_MIN_GAP_SEC}s" in throttled.skip_detail
+    assert redis.data[ROTATION_KEY] == 1, "пропущенный тик очередь не сдвигает"
+
+    redis.delete(ALOE_LOCK)
+    third = intraday.pick_next_scrape_target(db_session, redis_client=redis)
+    assert third.target[1].key == "aloe1"
+
+
+def test_rate_limited_skip_reports_the_soonest_free_site(db_session, monkeypatch):
+    """Два сайта под лимитом → срок считается по тому, что освободится первым."""
+    monkeypatch.setattr(intraday, "INTRADAY_SITES", ("pharmonline", "aloe"))
+    cat = _add_category(db_session, "both", "Both", ph_slug="ph-both", aloe_slug="aloe-both")
+    p = _add_product_with_category(db_session, "aloe", "p-both", "P both", "aloe-both")
     _add_snaps(db_session, p, n_snaps=5)
     db_session.commit()
 
-    redis_mock = MagicMock()
-    redis_mock.incr.return_value = 1
-    redis_mock.set.return_value = None  # все locked
-    redis_mock.ttl.return_value = 3600
+    redis = _FakeRedis()
+    redis.set("intraday:lock:site:pharmonline", "1", ex=5000)
+    redis.set(ALOE_LOCK, "1", ex=100)
 
-    result = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
-    assert result is None
+    decision = intraday.pick_next_scrape_target(db_session, redis_client=redis)
+    assert decision.skip_reason == intraday.SKIP_SITE_RATE_LIMITED
+    assert "pharmonline,aloe" in decision.skip_detail
+    assert "free in 100s" in decision.skip_detail
+    assert f"next in line: {cat.key}" in decision.skip_detail
 
 
-def test_pick_next_scrape_target_returns_none_when_no_volatile_cats(db_session):
-    """0 категорий с volatility → None."""
-    _add_category(db_session, "k1", "K1", ph_slug="ph")  # без snapshots
+def test_pick_next_scrape_target_skips_when_no_volatile_cats(db_session):
+    """0 категорий с volatility → пропуск."""
+    _add_category(db_session, "k1", "K1", aloe_slug="aloe")  # без snapshots
     db_session.commit()
 
     redis_mock = MagicMock()
-    result = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
-    assert result is None
+    decision = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
+    assert decision.target is None
+    assert decision.skip_reason == intraday.SKIP_NO_SERVABLE_CATEGORY
+
+
+def test_skip_names_redis_when_rotation_state_is_unavailable(db_session, monkeypatch):
+    """Redis не настроен → тик пропущен, и причина — Redis, а не категории."""
+    _add_volatile_category(db_session, "aloe0", "aloe", "aloe-0", n_snaps=5)
+    db_session.commit()
+    monkeypatch.delenv("REDIS_URL", raising=False)
+
+    decision = intraday.pick_next_scrape_target(db_session)
+    assert decision.target is None
+    assert decision.skip_reason == intraday.SKIP_ROTATION_UNAVAILABLE
+    assert "Redis" in decision.skip_detail
+
+
+def test_redis_that_rejects_writes_skips_instead_of_repeating_a_category(db_session):
+    """Redis читает, но не пишет (диск полон) → пропуск, а не сбор без лимита.
+
+    SETNX в таком Redis падает, и замок по правилу fail-open считается взятым.
+    Если при этом брать прогон, каждый тик собирал бы одну и ту же категорию.
+    """
+    _add_volatile_category(db_session, "aloe0", "aloe", "aloe-0", n_snaps=5)
+    db_session.commit()
+
+    redis_mock = MagicMock()
+    redis_mock.get.return_value = b"3"
+    redis_mock.set.side_effect = Exception("MISCONF Redis is configured to save RDB snapshots")
+    redis_mock.incr.side_effect = Exception("MISCONF Redis is configured to save RDB snapshots")
+
+    decision = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
+    assert decision.target is None
+    assert decision.skip_reason == intraday.SKIP_ROTATION_UNAVAILABLE
+    assert "rejected the write" in decision.skip_detail
 
 
 def test_pick_next_scrape_target_skips_sites_without_slug(db_session):
     """Категория без pharmonline_slug → берём только aloe."""
-    cat = _add_category(db_session, "k1", "K1", aloe_slug="aloe-only")
-    # snapshots должны быть привязаны к aloe (slug-matching)
-    p = _add_product_with_category(db_session, "aloe", "p1", "P1", "aloe-only")
-    _add_snaps(db_session, p, n_snaps=5)
+    _add_volatile_category(db_session, "k1", "aloe", "aloe-only", n_snaps=5)
     db_session.commit()
 
     redis_mock = MagicMock()
-    redis_mock.incr.return_value = 1
+    redis_mock.get.return_value = None
     redis_mock.set.return_value = True
 
-    result = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
-    assert result is not None
-    site, _ = result
-    assert site == "aloe"  # pharmonline pomp пропущен — нет slug
+    decision = intraday.pick_next_scrape_target(db_session, redis_client=redis_mock)
+    site, _ = decision.target
+    assert site == "aloe"  # pharmonline пропущен — нет slug
 
 
 def test_pick_next_scrape_target_commit_false_does_not_mutate_redis(db_session):
@@ -305,11 +510,10 @@ def test_pick_next_scrape_target_commit_false_does_not_mutate_redis(db_session):
     redis_mock.get.return_value = b"0"  # текущий idx
     redis_mock.exists.return_value = 0  # lock free
 
-    result = intraday.pick_next_scrape_target(
+    decision = intraday.pick_next_scrape_target(
         db_session, redis_client=redis_mock, commit_state=False
     )
-    assert result is not None
-    site, _ = result
+    site, _ = decision.target
     assert site == "aloe"
 
     # State не изменился: НЕ должны вызваться INCR/SET/EXPIRE
@@ -333,10 +537,12 @@ def test_pick_next_scrape_target_commit_false_detects_existing_lock(db_session):
     redis_mock.exists.side_effect = lambda k: 1 if "aloe" in k else 0
     redis_mock.ttl.return_value = 1234
 
-    result = intraday.pick_next_scrape_target(
+    decision = intraday.pick_next_scrape_target(
         db_session, redis_client=redis_mock, commit_state=False
     )
-    assert result is None
+    assert decision.target is None
+    assert decision.skip_reason == intraday.SKIP_SITE_RATE_LIMITED
+    assert "free in 1234s" in decision.skip_detail
     redis_mock.set.assert_not_called()
 
 
@@ -351,7 +557,7 @@ def test_intraday_tick_invokes_bounded_point_scrape(db_session, monkeypatch):
     monkeypatch.setattr(
         intraday,
         "pick_next_scrape_target",
-        lambda session, commit_state: ("aloe", category),
+        lambda session, commit_state: intraday.TickDecision(target=("aloe", category)),
     )
     monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "321")
     invoked = {}
@@ -367,6 +573,31 @@ def test_intraday_tick_invokes_bounded_point_scrape(db_session, monkeypatch):
     assert result.exit_code == 0, result.output
     assert invoked == {"limit": 321, "site": ("aloe",), "category_id": category.id}
     assert "limit=321" in result.output
+
+
+def test_intraday_tick_prints_why_it_skipped(db_session, monkeypatch):
+    """В journald попадает настоящая причина пропуска, а не «all sites locked»."""
+    _add_volatile_category(db_session, "apt", "aptekonline", "17", n_snaps=5)
+    db_session.commit()
+    SessionLocal = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main_mod.storage, "init_db", lambda: None)
+    monkeypatch.setattr(main_mod.storage, "make_session", lambda: SessionLocal)
+    monkeypatch.setattr(intraday, "_redis_client", _FakeRedis)
+
+    @click.command()
+    def fake_scrape(limit, site, category_id):
+        raise AssertionError("пропущенный тик не должен запускать сбор")
+
+    monkeypatch.setattr(main_mod, "scrape_cmd", fake_scrape)
+
+    result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1] == (
+        "intraday-tick: skipped (no category with a section on aloe "
+        "had price changes in the last 7 days)"
+    )
+    assert "locked" not in result.output
 
 
 def test_watchlist_tick_invokes_alerting_priority_run(db_session, monkeypatch):
