@@ -258,6 +258,10 @@ def cache_actions(
 
     Безопасно вызывать многократно — UNIQUE(tenant_id, client_site) гарантирует
     один row per срез. Никаких внешних зависимостей, sync операция.
+
+    Несвежие входы — тот же отказ `RecommendationsNotComputed`, что в расчёте:
+    порог свежести может быть перейдён, пока срез считался. Чужой или
+    непроверенный прогон — ошибка вызывающего, ValueError.
     """
     from src.storage import RoiActionsCache
 
@@ -265,7 +269,7 @@ def cache_actions(
     if run is None or run.tenant_id != tenant_id or not storage.run_is_financially_eligible(run):
         raise ValueError("ROI cache requires a financially eligible full-catalog run")
     if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
-        raise ValueError("ROI cache requires fresh verified full-catalog inputs for every site")
+        raise RecommendationsNotComputed(NOT_COMPUTED_INPUTS_UNVERIFIED)
     from src.product_policy import policy_fingerprint, trusted_catalog_epoch
 
     payload = [_action_to_dict(a) for a in actions]
