@@ -249,8 +249,10 @@ def _detect_new_product(session: Session, run_id: int, params: dict) -> list[Can
     """Появились товары впервые в БД (нет snapshot'ов до текущего прогона).
 
     Diff-only-aware (2026-05-09): «новый» = нет snapshot'ов до current_run.
+    Плюс товар должен был появиться после прошлого проверенного сбора сайта —
+    см. `storage.new_product_cutoffs_by_site`.
     """
-    from src.storage import curr_and_prev_snapshots_for_run
+    from src.storage import curr_and_prev_snapshots_for_run, new_product_cutoffs_by_site
 
     site_filter = params.get("site")
     out: list[CandidateEvent] = []
@@ -264,10 +266,15 @@ def _detect_new_product(session: Session, run_id: int, params: dict) -> list[Can
         current_run,
         financially_eligible_only=True,
     )
+    cutoffs = new_product_cutoffs_by_site(
+        session, current_run, {snap.product.site for snap in curr_snaps}
+    )
     for snap in curr_snaps:
         if snap.product_id in prev_by_product:
             continue
         product = snap.product
+        if product.first_seen_at < cutoffs[product.site]:
+            continue
         from src.product_policy import policy_offer_eligibility
 
         if not policy_offer_eligibility(product).eligible:

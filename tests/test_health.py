@@ -346,11 +346,138 @@ def test_site_silence_flags_long_aptekonline_outage(db_session):
 
 
 def test_stale_run_critical(db_session):
-    _add_run(db_session, utcnow() - timedelta(hours=48))
+    """Прогонов нет дольше недельного ритма с запасом — планировщик умер."""
+    _add_run(db_session, utcnow() - timedelta(hours=200))
     db_session.commit()
     rep = check_health(db_session, max_age_hours=26)
     assert rep.status == "critical"
     assert any(i.code == "stale_run" for i in rep.issues)
+
+
+def test_weekly_cadence_does_not_raise_stale_run_between_collections(db_session):
+    """Двое суток без прогонов при недельном сборе — штатно, не тревога.
+
+    Плановый запуск в ночи, когда сайт уже собран, выходит без прогона, а
+    частичные тики прогон дают не каждый день: на проде 2026-10-06 он был один,
+    2026-10-07 до полудня — ни одного. Порог 26ч поднимал бы «Проверьте cron»
+    на исправном недельном графике.
+    """
+    _add_run(db_session, utcnow() - timedelta(hours=48))
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+
+    assert not any(i.code == "stale_run" for i in rep.issues)
+
+
+def test_stale_run_follows_the_most_frequent_site(db_session, monkeypatch):
+    """Вернётся суточный сайт — вернётся и суточный порог «давно не было прогонов»."""
+    from src import health
+
+    monkeypatch.setattr(
+        health, "_SITE_MAX_AGE_HOURS", {**health._SITE_MAX_AGE_HOURS, "aloe": 30}
+    )
+    _add_run(db_session, utcnow() - timedelta(hours=48))
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+
+    assert any(i.code == "stale_run" for i in rep.issues)
+
+
+def _verified_full_run(db_session, *, hours_ago: float):
+    run = _add_run(db_session, utcnow() - timedelta(hours=hours_ago))
+    run.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {
+            "pharmonline": {"status": "ok"},
+            "aptekonline": {"status": "ok"},
+            "aloe": {"status": "ok"},
+        },
+    }
+    return run
+
+
+def test_overdue_full_collection_is_reported_even_when_partial_ticks_keep_the_site_fresh(
+    db_session,
+):
+    """Недельный сбор перестал происходить, а частичные тики идут.
+
+    Плановый запуск внутри недели выходит молча, поэтому «сбор не случился»
+    нельзя оставлять на `site_silent`: тик освежает `last_seen_at` товаров
+    aloe, и сайт выглядит живым сколько угодно долго.
+    """
+    _verified_full_run(db_session, hours_ago=200)
+    tick = Run(
+        started_at=utcnow() - timedelta(hours=1),
+        finished_at=utcnow() - timedelta(hours=1),
+        status="ok",
+        products_scraped=10,
+        catalog_scope="partial",
+    )
+    db_session.add(tick)
+    db_session.flush()
+    _add_snap(db_session, tick, "aloe", 10)
+    db_session.commit()
+
+    rep = check_health(db_session)
+
+    overdue = {i.context["site"] for i in rep.issues if i.code == "full_catalog_overdue"}
+    silent = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
+    assert "aloe" in overdue
+    assert "aloe" not in silent
+    assert rep.status == "critical"
+
+
+def test_full_collection_is_overdue_only_past_cadence_plus_grace(db_session):
+    """Порог сторожа — ритм сайта с запасом (174ч), а не сам ритм (168ч).
+
+    Между недельными сборами проходит до 169ч (перевод часов), и новый сбор
+    ещё должен успеть закончиться. Сторож на 168ч кричал бы каждую осень.
+    """
+    from src.cadence import site_max_age_hours
+
+    assert site_max_age_hours("aloe") == 174
+    run = _verified_full_run(db_session, hours_ago=173)
+    db_session.commit()
+    assert not any(i.code == "full_catalog_overdue" for i in check_health(db_session).issues)
+
+    run.started_at = utcnow() - timedelta(hours=175)
+    run.finished_at = run.started_at + timedelta(minutes=1)
+    db_session.commit()
+    overdue = {
+        i.context["site"] for i in check_health(db_session).issues if i.code == "full_catalog_overdue"
+    }
+    assert overdue == {"pharmonline", "aptekonline", "aloe"}
+
+
+def test_overdue_is_reported_when_every_retry_since_was_degraded(db_session):
+    """Неделя degraded-повторов оставляет данные такими же старыми, как неделя пропусков."""
+    _verified_full_run(db_session, hours_ago=200)
+    retry = Run(
+        started_at=utcnow() - timedelta(hours=3),
+        finished_at=utcnow() - timedelta(hours=2),
+        status="degraded",
+        products_scraped=10,
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=False,
+        run_quality={
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"aloe": {"status": "degraded"}},
+        },
+    )
+    db_session.add(retry)
+    db_session.commit()
+
+    rep = check_health(db_session)
+
+    overdue = {i.context["site"] for i in rep.issues if i.code == "full_catalog_overdue"}
+    assert "aloe" in overdue
+    assert rep.status == "critical"
 
 
 def test_failed_run_critical(db_session):

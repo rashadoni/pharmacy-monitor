@@ -3704,15 +3704,19 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                     .subquery()
                 )
                 latest_rows = session.scalars(
-                    select(storage.PriceSnapshot).join(
+                    select(storage.PriceSnapshot)
+                    .join(
                         latest_at_subq,
                         (storage.PriceSnapshot.product_id == latest_at_subq.c.product_id)
                         & (storage.PriceSnapshot.captured_at == latest_at_subq.c.max_at),
                     )
+                    .order_by(storage.PriceSnapshot.product_id, storage.PriceSnapshot.id.desc())
                 ).all()
                 for snap in latest_rows:
-                    # Берём первое попавшееся (если несколько с одинаковым
-                    # max_at, что маловероятно, дубль разрулится).
+                    # При одинаковом max_at последней считается запись с большим
+                    # id — как у читателей (`storage._latest_snapshot_stmt`) и у
+                    # подтверждения цен. Иначе сравнение шло бы с одной записью,
+                    # а доверие получала бы другая.
                     if snap.product_id not in latest_snapshots:
                         latest_snapshots[snap.product_id] = {
                             "price": snap.price,
@@ -4086,7 +4090,9 @@ def _dispatch_health_alert_email(
     "--max-age-hours",
     type=int,
     default=26,
-    help="Алерт если последний прогон старше N часов (по умолчанию 26 — суточный cron + jitter)",
+    help="Порог «данные устарели» для сайта без объявленного ритма (часы). Сайтам из "
+    "src/cadence.py порог задаёт их ритм; тревогу «давно не было прогонов» опция "
+    "может только отодвинуть.",
 )
 @click.option(
     "--min-products",
@@ -4897,29 +4903,34 @@ def seed_demo_cmd(force: bool) -> None:
 
 def _is_scheduled_full_scan(
     *,
-    mode: str,
-    category_id: int | None,
-    limit: int | None,
-    hourly: bool,
+    requested_mode: str,
+    is_full_catalog: bool,
     dry_run: bool,
     request_id: int | None = None,
 ) -> bool:
-    """Это плановый полный сбор каталога, запущенный таймером?
+    """Это плановый полный сбор каталога, который обязан уважать ритм?
 
-    Намеренно узко: ровно та форма, которую зовёт root-овый systemd-юнит
-    (`run --site %i --mode category`). Ручные прогоны (`--mode auto`, выбранная
-    категория, `--limit`, watchlist-тик, dry-run) гвард не трогает — иначе
-    оператор, запустивший сбор руками, молча получил бы «пропущено».
+    Решает то, во что прогон РАЗРЕШИЛСЯ (`is_full_catalog`), а не сырой
+    `--mode`. Root-овый systemd-юнит зовёт `run --site %i` без `--mode`: режим
+    `auto` становится полным сбором только после разбора watchlist, а у
+    pharmonline маркер уводит его в public_api. Гвард, смотревший на сырое
+    значение, не сработал на проде ни разу — aloe собирался каждую ночь.
 
-    `--request-id` тоже исключён: это кнопка «Запустить scrape» в дашборде.
-    Пропустить её молча — ровно тот класс бага, когда запрос навсегда виснет в
-    `running` (чинили 2026-06-11). Нажали кнопку — собираем, ритм не спорит.
+    Мимо ритма идёт только то, о чём человек попросил явно:
+      * выбранная категория, `--limit`, watchlist- и hourly-тики — это не
+        полный сбор, `is_full_catalog` у них False;
+      * `--dry-run`;
+      * `--request-id` — кнопка «Запустить scrape» в дашборде. Пропустить её
+        молча — ровно тот класс бага, когда запрос навсегда виснет в `running`
+        (чинили 2026-06-11). Нажали кнопку — собираем, ритм не спорит;
+      * явный `--mode public_api` — guarded workflow pharmonline со своим
+        недельным cron: после запуска он проверяет, что появился новый прогон,
+        и молчаливый пропуск уронил бы эту проверку;
+      * `--force` — проверяется вызывающим.
     """
     return (
-        mode == "category"
-        and category_id is None
-        and limit is None
-        and not hourly
+        is_full_catalog
+        and requested_mode != "public_api"
         and not dry_run
         and request_id is None
     )
@@ -4932,7 +4943,7 @@ def _sites_due_for_full_scan(
     tenant_id: int = 1,
     now: datetime | None = None,
 ) -> tuple[list[str], dict[str, float]]:
-    """Какие сайты пора собирать полностью, а какие ещё в пределах своего ритма.
+    """Какие сайты пора собирать полностью, а какие в этом окне ритма уже собраны.
 
     Ритм берётся из src/cadence.py — там же, откуда выводятся пороги «данные
     устарели», так что расписание и мониторинг не могут разъехаться.
@@ -4941,12 +4952,14 @@ def _sites_due_for_full_scan(
     прод-хосте), а суточный таймер при недельном ритме делал бы шесть лишних
     полных сборов в неделю. Код деплоится обычным rsync, поэтому фактическое
     расписание задаётся здесь: таймер по-прежнему просыпается каждый день, но
-    реально собирает только когда ритм истёк.
+    реально собирает первый раз в каждом окне ритма (`cadence_window_start`).
 
-    Учитывается ТОЛЬКО успешная (`status == "ok"`) полная попытка: упавший сбор
-    не должен блокировать повтор на следующий день.
+    Сайт собран, если его последняя полная попытка успешна и началась в текущем
+    окне. Упавший сбор окно не закрывает: повтор идёт на следующем же запуске.
+
+    Возвращает (пора собирать, {уже собранный сайт: часов с конца сбора}).
     """
-    from src.cadence import site_cadence_hours
+    from src.cadence import cadence_window_start
 
     current = now or utcnow()
     attempts = storage.latest_full_catalog_attempts_by_site(
@@ -4956,15 +4969,14 @@ def _sites_due_for_full_scan(
     covered: dict[str, float] = {}
     for site_name in sites:
         attempt = attempts.get(site_name)
-        completed_at = (attempt.finished_at or attempt.started_at) if attempt else None
-        if attempt is None or attempt.status != "ok" or completed_at is None:
+        if attempt is None or attempt.status != "ok" or attempt.started_at is None:
             due.append(site_name)
             continue
-        age_hours = (current - completed_at).total_seconds() / 3600
-        if age_hours >= site_cadence_hours(site_name):
+        if attempt.started_at < cadence_window_start(site_name, current):
             due.append(site_name)
         else:
-            covered[site_name] = age_hours
+            completed_at = attempt.finished_at or attempt.started_at
+            covered[site_name] = (current - completed_at).total_seconds() / 3600
     return due, covered
 
 
@@ -5033,6 +5045,9 @@ def run_cmd(
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    # Как режим задал вызывающий — до того, как его перепишут маркер ниже и
+    # разбор watchlist. Нужен гварду ритма: явный public_api идёт мимо него.
+    requested_mode = mode
     if _pharmonline_public_api_autonomous_mode_requested(sites, mode):
         _enable_pharmonline_public_api_autonomous_mode()
         # The root-owned generic systemd unit can only call ``run --site %i``.
@@ -5090,29 +5105,6 @@ def run_cmd(
         maybe_seed_categories(session)
 
         run_tenant_id = run_tenant_id_for_request(session, request_id)
-        if not force and _is_scheduled_full_scan(
-            mode=mode,
-            category_id=category_id,
-            limit=limit,
-            hourly=hourly,
-            dry_run=dry_run,
-            request_id=request_id,
-        ):
-            due, covered = _sites_due_for_full_scan(session, sites, tenant_id=run_tenant_id)
-            if not due:
-                log.info(
-                    "run_skipped_within_cadence",
-                    sites=sites,
-                    covered_hours_ago={k: round(v, 1) for k, v in covered.items()},
-                    hint="--force чтобы собрать досрочно",
-                )
-                return
-            sites = due
-
-        run = storage.Run(status="running", tenant_id=run_tenant_id)
-        session.add(run)
-        session.commit()
-        run_id = run.id
 
         # --hourly → форсируем watchlist mode + skip categories + skip report email
         if hourly:
@@ -5122,7 +5114,8 @@ def run_cmd(
         if category_id is not None and mode == "auto":
             mode = "category"
 
-        # Определяем режим
+        # Определяем режим. Обязательно ДО гварда ритма: полный это сбор или
+        # нет, при `--mode auto` известно только после разбора watchlist.
         watchlist_urls = (
             collect_watchlist_urls(session)
             if mode not in {"category", "public_api"}
@@ -5141,6 +5134,46 @@ def run_cmd(
             and category_id is None
             and limit is None
         )
+
+        if not force and _is_scheduled_full_scan(
+            requested_mode=requested_mode,
+            is_full_catalog=is_full_catalog,
+            dry_run=dry_run,
+            request_id=request_id,
+        ):
+            from src.cadence import cadence_window_start, site_cadence_hours
+
+            now = utcnow()
+            due, covered = _sites_due_for_full_scan(
+                session, sites, tenant_id=run_tenant_id, now=now
+            )
+            if not due:
+                click.echo(
+                    "run: полный сбор пропущен — "
+                    + ", ".join(sorted(covered))
+                    + " на этой неделе уже собран. Собрать досрочно: --force"
+                )
+                log.info(
+                    "run_skipped_within_cadence",
+                    sites=sites,
+                    covered_hours_ago={k: round(v, 1) for k, v in covered.items()},
+                    next_window_utc={
+                        k: (
+                            cadence_window_start(k, now)
+                            + timedelta(hours=site_cadence_hours(k))
+                        ).isoformat(timespec="minutes")
+                        for k in covered
+                    },
+                    hint="--force чтобы собрать досрочно",
+                )
+                return
+            sites = due
+
+        run = storage.Run(status="running", tenant_id=run_tenant_id)
+        session.add(run)
+        session.commit()
+        run_id = run.id
+
         run.catalog_scope = "full" if is_full_catalog else "partial"
         run.full_catalog_sites = ",".join(sites) if is_full_catalog else None
         run.catalog_verified = False
@@ -5477,6 +5510,19 @@ def run_cmd(
 
                 trust_context = finalizing_trusted_run(run.id)
                 trust_context.__enter__()
+
+            # Diff-only не пишет snapshot, когда цена прежняя, поэтому за
+            # проверенным сбором остаётся цена только изменившихся товаров.
+            # Подтверждаем остальное до алертов и ROI: они читают только
+            # доверенные записи — и свои, и чужих сайтов. Поэтому заодно
+            # подтверждаются последние проверенные сборы всех сайтов, включая
+            # предыдущий сбор своего: до 2026-10-07 проверенные сборы цен не
+            # подтверждали, и первому сбору после выкладки иначе не с чем
+            # сравнивать. Повтор ничего не меняет.
+            if is_run_financially_eligible(run):
+                confirmed = storage.confirm_prices_of_latest_verified_runs(session, run)
+                session.commit()
+                log.info("prices_confirmed_by_verified_runs", run_id=run.id, snapshots=confirmed)
 
             # === Real-time alerts ===
             alerts_allowed = is_run_financially_eligible(

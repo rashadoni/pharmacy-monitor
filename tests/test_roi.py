@@ -406,27 +406,68 @@ def test_get_cached_actions_returns_none_when_empty(db_session):
 
 
 def test_get_cached_actions_returns_none_when_stale(db_session):
-    """Кэш старше max_age_hours → None (forces fallback на inline compute)."""
+    """Кэш старше срока жизни → None. Срок — ритм сбора с запасом, 174ч."""
     from datetime import timedelta
     from src.storage import RoiActionsCache
 
+    assert roi._CACHE_MAX_AGE_HOURS == 174
     eligible_run = _shared_run(db_session)
+    cache_row = RoiActionsCache(
+        tenant_id=1,
+        client_site="pharmonline",
+        payload=[{"type": "price_raise", "severity": "info", "title": "test"}],
+        computed_at=utcnow() - timedelta(hours=175),
+        run_id=eligible_run.id,
+        policy_fingerprint=policy_fingerprint(),
+        trust_epoch=_trusted_epoch(db_session),
+    )
+    db_session.add(cache_row)
+    db_session.commit()
+
+    assert roi.get_cached_actions(db_session, "pharmonline") is None
+    # Но если повысить порог — возвращается
+    assert roi.get_cached_actions(db_session, "pharmonline", max_age_hours=240) is not None
+
+    cache_row.computed_at = utcnow() - timedelta(hours=173)
+    db_session.commit()
+    assert roi.get_cached_actions(db_session, "pharmonline") is not None
+
+
+def test_cached_actions_survive_between_weekly_collections(db_session):
+    """Рекомендации видны всю неделю, а не сутки после понедельничного сбора.
+
+    Кэш пишется только в конце подтверждённого полного сбора. При недельном
+    ритме прежний срок жизни 26ч скрывал бы его со вторника до понедельника.
+    """
+    from datetime import timedelta
+    from src.storage import RoiActionsCache
+
+    collected_at = utcnow() - timedelta(hours=72)
+    weekly_run = Run(
+        started_at=collected_at,
+        finished_at=collected_at,
+        status="ok",
+        run_quality=_eligible_quality(),
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
+    )
+    db_session.add(weekly_run)
+    db_session.flush()
     db_session.add(
         RoiActionsCache(
             tenant_id=1,
             client_site="pharmonline",
             payload=[{"type": "price_raise", "severity": "info", "title": "test"}],
-            computed_at=utcnow() - timedelta(hours=48),
-            run_id=eligible_run.id,
+            computed_at=collected_at,
+            run_id=weekly_run.id,
             policy_fingerprint=policy_fingerprint(),
             trust_epoch=_trusted_epoch(db_session),
         )
     )
     db_session.commit()
 
-    assert roi.get_cached_actions(db_session, "pharmonline") is None
-    # Но если повысить порог — возвращается
-    assert roi.get_cached_actions(db_session, "pharmonline", max_age_hours=72) is not None
+    assert roi.get_cached_actions(db_session, "pharmonline") is not None
 
 
 def test_roi_cache_rejected_after_newer_degraded_full_attempt(db_session):

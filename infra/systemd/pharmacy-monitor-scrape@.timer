@@ -2,8 +2,13 @@
 Description=Daily scrape timer for %i
 
 [Timer]
-# Stagger sites: pharmonline 01:00, aptekonline 02:00, aloe 03:00
-# Override per instance via /etc/systemd/system/pharmacy-monitor-scrape@<site>.timer.d/override.conf
+# Будильник суточный, а полный сбор недельный: в ночи, когда сайт на этой
+# неделе уже собран, `run` выходит без сбора (src/cadence.py). Суточный
+# будильник оставлен намеренно — упавший сбор повторяется следующей же ночью.
+# Недельный drop-in есть только у aptekonline: его сбор платный.
+#
+# Час срабатывания связан с границей недельного окна CADENCE_ANCHOR_UTC:
+# меняешь его здесь или в drop-in — гони tests/test_cadence_guard.py.
 OnCalendar=*-*-* 01:00:00
 RandomizedDelaySec=300
 Persistent=true

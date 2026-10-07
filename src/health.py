@@ -4,7 +4,7 @@
 или встраивается в основной прогон.
 
 Что детектируется:
-1. **Stale**: последний успешный run был >max_age_hours назад
+1. **Stale**: последнего прогона нет дольше ритма самого частого сайта
 2. **Failed**: последний run завершился со status='failed'
 3. **Empty**: последний run ok но < min_products (полностью пустой)
 4. **Site-drop**: сайт покрыл <50% живого каталога за окно покрытия
@@ -68,7 +68,7 @@ class HealthAlertDecision:
 def check_health(
     session: Session,
     *,
-    max_age_hours: int = 26,  # с запасом за суточный cron + jitter
+    max_age_hours: int = 26,  # порог для сайта без объявленного ритма (суточный cron + jitter)
     min_products: int = 1,
     site_drop_threshold: float = 0.5,  # порог: доля живого каталога за окно покрытия
 ) -> HealthReport:
@@ -94,15 +94,19 @@ def check_health(
     report.last_run_at = last_run.started_at
     report.last_run_status = last_run.status
 
-    # 1. Stale check — относительно сейчас
+    # 1. Stale check — относительно сейчас. Порог — ритм самого частого сайта:
+    # при недельном сборе плановый запуск в остальные ночи выходит без прогона
+    # (гвард ритма в `run`), а частичные тики прогон дают не каждый день. С
+    # прежними 26ч исправный недельный график сам поднимал бы эту тревогу.
+    stale_after_hours = max(max_age_hours, min(_SITE_MAX_AGE_HOURS.values(), default=0))
     age = utcnow() - last_run.started_at
-    if age > timedelta(hours=max_age_hours):
+    if age > timedelta(hours=stale_after_hours):
         report.issues.append(
             HealthIssue(
                 "critical",
                 "stale_run",
                 f"Последний прогон был {age.total_seconds() / 3600:.1f}ч назад "
-                f"(порог {max_age_hours}ч). Проверьте cron.",
+                f"(порог {stale_after_hours}ч). Проверьте cron.",
                 context={"hours_ago": age.total_seconds() / 3600},
             )
         )
@@ -114,11 +118,39 @@ def check_health(
         storage.FULL_CATALOG_SITES,
         tenant_id=1,
     )
-    fresh_verified_catalogs = _fresh_verified_catalogs_by_site(
-        session,
-        storage,
-        max_age_hours=max_age_hours,
-    )
+    verified_catalogs = _latest_verified_catalogs_by_site(session, storage)
+    fresh_verified_catalogs = {
+        site: run
+        for site, run in verified_catalogs.items()
+        if _run_age_hours(run) <= _SITE_MAX_AGE_HOURS.get(site, max_age_hours)
+    }
+
+    # Сторож ритма. Гвард в `run` пропускает лишние ночи молча (exit 0, без
+    # прогона), а `site_silent` за этим не уследит: частичный тик освежает
+    # `last_seen_at` и без полного сбора. Поэтому возраст последнего
+    # ПОДТВЕРЖДЁННОГО каталога сверяем с ритмом сайта напрямую — и неважно, чем
+    # кончилась самая свежая попытка: неделя degraded-повторов оставляет данные
+    # такими же старыми, как неделя пропусков.
+    for site, run in verified_catalogs.items():
+        if site in fresh_verified_catalogs:
+            continue
+        overdue_after = _SITE_MAX_AGE_HOURS.get(site, max_age_hours)
+        age_hours = _run_age_hours(run)
+        report.issues.append(
+            HealthIssue(
+                "critical",
+                "full_catalog_overdue",
+                f"Подтверждённого полного сбора {site} нет {age_hours:.0f}ч "
+                f"(порог {overdue_after}ч): плановый сбор не сработал, не прошёл "
+                "проверку или ещё идёт.",
+                context={
+                    "site": site,
+                    "run_id": run.id,
+                    "hours_ago": age_hours,
+                    "threshold_hours": overdue_after,
+                },
+            )
+        )
 
     # 2. Failed/degraded check. A bounded/watchlist failure is never a
     # catalog epoch. Equally, a rejected full refresh must stay visible but
@@ -286,7 +318,7 @@ def check_health(
 
     # 8. Полный отказ сайта: последний прогон, включавший сайт, собрал РОВНО 0
     # товаров → немедленный сигнал (critical, если нет свежего подтверждённого
-    # каталога), не дожидаясь суточного порога site_silent. Раньше это терялось:
+    # каталога), не дожидаясь порога site_silent. Раньше это терялось:
     # smoke-test пропускал `current == 0`, а
     # `empty_run` смотрит только на последний прогон в принципе (его маскировал
     # intraday-прогон другого сайта).
@@ -306,17 +338,13 @@ def _run_age_hours(run: Run) -> float:
     return max(0.0, (utcnow() - observed_at).total_seconds() / 3600)
 
 
-def _fresh_verified_catalogs_by_site(
-    session: Session,
-    storage_module,
-    *,
-    max_age_hours: int,
-) -> dict[str, Run]:
-    """Return site catalogs that are still safe to serve after a failed refresh.
+def _latest_verified_catalogs_by_site(session: Session, storage_module) -> dict[str, Run]:
+    """Return each site's latest verified catalog, however old it is.
 
     This is deliberately based on the financial eligibility lineage, not on
     product `last_seen_at`: a rejected run must never masquerade as a verified
     catalog merely because it reached the scraper before being discarded.
+    Callers decide what "still fresh" means for their purpose.
     """
     run_ids = storage_module.latest_financial_run_ids_by_site(
         session,
@@ -328,13 +356,7 @@ def _fresh_verified_catalogs_by_site(
     runs = {
         run.id: run for run in session.scalars(select(Run).where(Run.id.in_(set(run_ids.values()))))
     }
-    fresh: dict[str, Run] = {}
-    for site, run_id in run_ids.items():
-        run = runs.get(run_id)
-        threshold = _SITE_MAX_AGE_HOURS.get(site, max_age_hours)
-        if run is not None and _run_age_hours(run) <= threshold:
-            fresh[site] = run
-    return fresh
+    return {site: runs[run_id] for site, run_id in run_ids.items() if run_id in runs}
 
 
 def _run_has_fresh_verified_catalogs(run: Run, catalogs_by_site: dict[str, Run]) -> bool:

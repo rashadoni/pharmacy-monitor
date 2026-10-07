@@ -9,6 +9,9 @@ User=pm
 Group=pm
 WorkingDirectory=/opt/pharmacy-monitor
 EnvironmentFile=/etc/pharmacy-monitor/env
+# Недельный ритм держит не таймер, а сам `run` (src/cadence.py): в ночи, когда
+# сайт на этой неделе уже собран, команда выходит с кодом 0 без сбора. Эту
+# строку читает tests/test_cadence_guard.py — меняешь её, гони тест.
 ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor run --site %i
 # 10h max for full mega-scrape (pharmonline DDP can run ~7h)
 TimeoutStartSec=36000
