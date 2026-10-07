@@ -199,6 +199,80 @@ async def test_aloe_country_id_is_resolved_and_cached_from_detail(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_aloe_country_id_two_country_label_stays_unresolved(monkeypatch) -> None:
+    """«Türkiyə-Almaniya» на карточке — две страны сразу: id остаётся числом.
+
+    В словарь соответствий такой id не попадает, поэтому и страна товара
+    остаётся неразрешённой, а не превращается в одну из двух наугад.
+    """
+    products = [
+        ScrapedProduct(
+            site="aloe",
+            external_id=f"floramin-{index}",
+            url=f"https://aloe.az/floramin-{index}/",
+            name="Floramin",
+            category="dermanlar",
+            manufacturer_country_raw="7",
+        )
+        for index in (1, 2)
+    ]
+
+    async def fake_fetch(self, url: str) -> str:
+        return '<span>Ölkə:</span><span>Türkiyə-Almaniya</span> "inStock":true'
+
+    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fake_fetch)
+    scraper = AloeScraper(rate_limit_sec=0)
+
+    await scraper._enrich_listing_country_ids(products)
+
+    assert all(product.manufacturer_country_raw == "7" for product in products)
+    assert all(product.country_source is None for product in products)
+    assert scraper.verified_country_mappings == {}
+
+
+@pytest.mark.asyncio
+async def test_aloe_country_id_known_mapping_with_new_spelling_is_applied(
+    monkeypatch,
+) -> None:
+    """Соответствие из таблицы применяется, когда словарь знает его название.
+
+    Регрессия: id 117 лежал в aloe_country_mappings как «Аргентина», словарь
+    этого написания не знал — соответствие считалось негодным, и товар в каждом
+    сборе записывался со страной-числом.
+    """
+    product = ScrapedProduct(
+        site="aloe",
+        external_id="meloprid",
+        url="https://aloe.az/meloprid-10-ed/",
+        name="Meloprid 10 əd",
+        category="dermanlar",
+        manufacturer_country_raw="117",
+    )
+
+    async def fail_fetch(self, url: str) -> str:
+        raise AssertionError("verified country ID must not refetch detail")
+
+    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fail_fetch)
+    scraper = AloeScraper(
+        rate_limit_sec=0,
+        country_id_map={
+            "117": {
+                "country_code": "ar",
+                "country_raw": "Аргентина",
+                "source_url": "https://aloe.az/meloprid-10-ed/",
+                "sample_count": 1,
+                "version": 1,
+            }
+        },
+    )
+
+    await scraper._enrich_listing_country_ids([product])
+
+    assert product.manufacturer_country_raw == "Аргентина"
+    assert product.country_source == "aloe_country_id_verified_detail"
+
+
+@pytest.mark.asyncio
 async def test_aloe_country_id_uses_durable_map_without_detail_fetch(monkeypatch) -> None:
     product = ScrapedProduct(
         site="aloe",
