@@ -668,7 +668,7 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
   `systemctl status pharmacy-monitor-scrape@pharmonline`,
   `journalctl -u pharmacy-monitor-scrape@pharmonline -n 100`,
   `curl -fsS http://127.0.0.1:8080/health`; какие ключи заданы —
-  `cut -d= -f1 /etc/pharmacy-monitor/env` (имена без значений), состояние
+  `cut -s -d= -f1 /etc/pharmacy-monitor/env` (имена без значений), состояние
   алертов — `/opt/pharmacy-monitor/data/health_alert_state.json`;
 - `activate-pharmonline-public-api-autonomy.yml` — разовая активация 23 августа,
   `src/`, `migrations/` и `templates/` целиком.

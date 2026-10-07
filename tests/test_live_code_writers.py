@@ -33,6 +33,9 @@
   своя shell-функция и обёртки не из `WRAPPERS`
 - скрипт из репозитория, который workflow исполняет на сервере
   (`bash -s < infra/…sh`): в сам скрипт тест не заглядывает
+- готовое действие вместо команды (`uses: appleboy/scp-action` с `target:`)
+- workflow, исправленный в ветке и запущенный с неё (`--ref`): CI такую ветку
+  проверит, только если из неё открыт PR
 - код чекаута, запущенный из чернового каталога против боевой базы, и
   `alembic upgrade` мимо `deploy.yml` — живой каталог при этом не меняется, а
   схема может
@@ -88,6 +91,10 @@ REDIRECT = re.compile(r"(?:^|[\s\"')])\d?>>?\s*([^\s&|<>][^\s|<>]*)")
 STEP_START = re.compile(r"\s*(?:-\s+)?(?:run|uses):|\s*-\s+(?:name|id):")
 CAPTION = re.compile(r"\s*#|\s*(?:-\s+)?(?:name|description):")
 HEREDOC = re.compile(r"<<-?\s*[\"']?([A-Za-z_]\w*)[\"']?")
+# Тело такого heredoc читает интерпретатор python, а не оболочка: `cp = root / "src"`
+# там присваивание. Слова «python» где-то в строке мало — `bash -s -- '$python_bin'`
+# открывает обычный shell, и запись в нём пропускать нельзя.
+PYTHON_STDIN = re.compile(r"python[\d.]*\s+-\s+<<")
 
 
 def _commands(line: str) -> list[str]:
@@ -222,6 +229,9 @@ def _writes(command: str, cwd: str) -> bool:
 
 
 def _odd(line: str, quote: str) -> bool:
+    # Кавычка другого вида внутри закрытой пары — текст: `echo "can't reach"`.
+    other = "'" if quote == '"' else '"'
+    line = re.sub(rf"{other}[^{other}]*{other}", "", line)
     return len(re.findall(rf"(?<!\\){quote}", line)) % 2 == 1
 
 
@@ -234,16 +244,19 @@ def _writes_live_code(script: str) -> list[str]:
     """
     found: list[str] = []
     cwd = ""
-    heredocs: list[str] = []  # слова, которыми закроются открытые heredoc
+    heredocs: list[tuple[str, bool]] = []  # слово-окончание и «тело читает python»
     open_quote = ""  # аргумент ssh в кавычках, не закрытый на своей строке
     for line in re.sub(r"\\\n\s*", " ", script).splitlines():
         if STEP_START.match(line):
             cwd, open_quote, heredocs = "", "", []
         inside = bool(heredocs)
-        if inside and line.strip() == heredocs[-1]:
-            heredocs.pop()
-            cwd = cwd if heredocs else ""
-            continue
+        if inside:
+            if line.strip() == heredocs[-1][0]:
+                heredocs.pop()
+                cwd = cwd if heredocs else ""
+                continue
+            if heredocs[-1][1]:
+                continue
         if CAPTION.match(line):
             continue
         in_one_line_argument = False
@@ -262,7 +275,7 @@ def _writes_live_code(script: str) -> list[str]:
             elif in_one_line_argument:
                 cwd = ""
         if opened := HEREDOC.search(line):
-            heredocs.append(opened.group(1))
+            heredocs.append((opened.group(1), bool(PYTHON_STDIN.search(line))))
     return found
 
 
@@ -357,6 +370,11 @@ WRITES = {
         ssh pm@13.140.186.143 cp /tmp/main.py /opt/pharmacy-monitor/src/main.py
     """,
     "относительный путь у команды ssh": "ssh pm@13.140.186.143 'cp /tmp/main.py src/main.py'",
+    "heredoc оболочки со словом python в строке ssh": """
+        ssh pm@13.140.186.143 "bash -s -- '$WORK_DIR' '$python_bin'" <<'REMOTE'
+        cp /tmp/x.py /opt/pharmacy-monitor/src/x.py
+        REMOTE
+    """,
     "относительный путь после cd в heredoc": """
         ssh pm@13.140.186.143 'bash -s' <<'REMOTE'
         set -euo pipefail
@@ -428,6 +446,18 @@ READS = {
         if total > src:
             raise SystemExit(1)
         PY
+    """,
+    "имена команд в python-вставке": """
+        cd /opt/pharmacy-monitor
+        .venv/bin/python - <<'PY'
+        cp = root / "src"
+        print("expected > /opt/pharmacy-monitor/src")
+        PY
+    """,
+    "апостроф в сообщении перед cd на сервере": """
+        echo "can't reach the server yet"
+        ssh pm@13.140.186.143 'cd /opt/pharmacy-monitor && ls'
+        tar xzf artifact.tgz
     """,
     "файл с двоеточием в имени": "cp report.txt notes:",
     "скачать бэкап после cd на сервере": """
