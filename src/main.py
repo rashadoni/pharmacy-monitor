@@ -5527,7 +5527,9 @@ def run_cmd(
                 # записи. Весь порядок шагов — в _run_matching_stage; тот же этап
                 # выполняет команда `rematch`.
                 _run_matching_stage(session)
-                roi_refresh_owed = True
+                # Подтверждённый полный прогон кэш пишет сам, а упав — сам же
+                # отменяет доверие: заявка за него была бы закрыта `skipped`.
+                roi_refresh_owed = not (is_full_catalog and run.catalog_verified)
             finally:
                 if lock_taken:
                     _release_matcher_lock(session)
@@ -5658,7 +5660,6 @@ def run_cmd(
                             "ROI refresh failed for trusted epoch: "
                             + ",".join(sorted(failed_sites))
                         )
-                    roi_refresh_owed = False
                 else:
                     # A verified per-site producer remains successful even when
                     # another site's latest full attempt is degraded or stale.
@@ -6158,15 +6159,18 @@ def rematch_cmd(
         # посреди rematch не начнётся: он читает каталог под shared-блокировкой
         # сбора, а rematch держит эксклюзивную до выхода из команды — заявка
         # успевает закоммититься раньше, чем блокировка отпущена.
-        # Флаг ставится ПОСЛЕ удачного шага: упавший этап мог оставить пары,
-        # которые revalidate не проверил, и пересчёт опубликовал бы рекомендации
-        # по ним. Полный сбор в таком случае рекомендации скрывает; здесь прежний
-        # кэш просто остаётся до следующей заявки или сбора.
+        # Флаг ставится ПОСЛЕ удачного шага (кроме --relink-dead): упавший этап
+        # мог оставить пары, которые revalidate не проверил, и пересчёт
+        # опубликовал бы рекомендации по ним. Полный сбор в таком случае
+        # рекомендации скрывает; здесь прежний кэш просто остаётся до следующей
+        # заявки или сбора.
         pairs_may_have_changed = False
         try:
             if relink_dead:
-                plan = matcher.relink_dead_members(session, dry_run=dry_run)
+                # Здесь флаг — до шага: каждая замена проверяется и коммитится
+                # отдельно, и упавший на середине проход уже изменил пары.
                 pairs_may_have_changed = not dry_run
+                plan = matcher.relink_dead_members(session, dry_run=dry_run)
                 swaps = [r for r in plan if r["action"] == "swap"]
                 skips = [r for r in plan if r["action"] != "swap"]
                 click.echo(f"relink-dead: {len(swaps)} swap, {len(skips)} skip")

@@ -889,10 +889,17 @@ def test_interrupted_rematch_does_not_commit_half_done_pairs(api_db, monkeypatch
 
 
 @pytest.mark.parametrize(
-    ("flag", "step"),
-    [("--revalidate", "revalidate_split"), ("--relink-dead", "relink_dead_members")],
+    ("flag", "step", "queued"),
+    [
+        # Разбиение упало: какие пары остались непроверенными — неизвестно.
+        ("--revalidate", "revalidate_split", []),
+        # Замены проверяются и коммитятся по одной: сделанное до сбоя уже в базе.
+        ("--relink-dead", "relink_dead_members", ["rematch"]),
+    ],
 )
-def test_failed_targeted_rematch_queues_nothing(api_db, monkeypatch, flag, step):
+def test_failed_targeted_rematch_queues_only_for_work_already_committed(
+    api_db, monkeypatch, flag, step, queued
+):
     from src import matcher
 
     def boom(session, dry_run=False):
@@ -903,7 +910,7 @@ def test_failed_targeted_rematch_queues_nothing(api_db, monkeypatch, flag, step)
     result = CliRunner().invoke(main_mod.cli, ["rematch", flag])
 
     assert result.exit_code != 0
-    assert _requests(api_db) == []
+    assert [request.reason for request in _requests(api_db)] == queued
 
 
 def test_rematch_request_does_not_commit_what_the_stage_left_unfinished(api_db, monkeypatch):
@@ -993,16 +1000,18 @@ def test_partial_run_queues_a_refresh_with_its_own_commit(
 
 
 @pytest.mark.parametrize(
-    ("failing_step", "queued"),
+    ("extra_args", "failing_step", "queued"),
     [
         # Упал отчёт: пары уже закоммичены и проверены — заявка уходит с упавшим прогоном.
-        ("analyze", ["partial_run"]),
+        (["--limit", "5"], "analyze", ["partial_run"]),
         # Упал сам этап сопоставления: пары не проверены — рекомендации по ним не считаем.
-        ("matching", []),
+        (["--limit", "5"], "matching", []),
+        # Упал полный подтверждённый прогон: он сам отменил доверие, считать не от чего.
+        ([], "analyze", []),
     ],
 )
-def test_failed_partial_run_owes_a_refresh_only_after_a_completed_matching_stage(
-    db_session, monkeypatch, failing_step, queued
+def test_failed_run_owes_a_refresh_only_when_one_could_be_computed(
+    db_session, monkeypatch, extra_args, failing_step, queued
 ):
     from tests.test_run_failure_semantics import _patch_verified_aloe_pipeline
 
@@ -1019,7 +1028,7 @@ def test_failed_partial_run_owes_a_refresh_only_after_a_completed_matching_stage
     with runner.isolated_filesystem():
         result = runner.invoke(
             main_mod.cli,
-            ["run", "--site", "aloe", "--mode", "category", "--no-alerts", "--limit", "5"],
+            ["run", "--site", "aloe", "--mode", "category", "--no-alerts", *extra_args],
         )
 
     assert result.exit_code != 0
@@ -1051,6 +1060,15 @@ def test_scrape_waits_out_a_short_catalog_reader_but_not_a_scrape(monkeypatch):
     )
     assert main_mod._hold_scrape_lock_after_readers(object()) is False
     assert clock["now"] == main_mod._SCRAPE_LOCK_READER_GRACE_SECONDS
+
+    # Отсрочка — минуты: её хватает на пересчёт, и она не съедает предел, который
+    # systemd даёт плановому rematch (а многочасовой сбор так не переждать).
+    import re
+    from pathlib import Path
+
+    unit = Path(__file__).resolve().parents[1] / "infra/systemd/pharmacy-monitor-rematch.service"
+    unit_limit = int(re.search(r"^TimeoutStartSec=(\d+)", unit.read_text(), re.M).group(1))
+    assert 60 <= main_mod._SCRAPE_LOCK_READER_GRACE_SECONDS <= 300 < unit_limit
 
 
 def test_manual_cli_refresh_reports_refusal_with_nonzero_exit(api_db):
@@ -1149,6 +1167,30 @@ def test_health_does_not_count_the_time_a_scrape_was_running(db_session):
     scrape.finished_at = utcnow() - timedelta(minutes=40)
     db_session.commit()
     assert "roi_refresh_stuck" in _health_codes(db_session)
+
+
+def test_orphan_run_does_not_silence_the_watchdog_forever(db_session):
+    """Сирот убирает сам watcher. Встал он — «идущий» прогон не должен глушить сторожа."""
+    run = _full_run(db_session, finished_at=utcnow() - timedelta(hours=20))
+    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    _pending_since(db_session, hours=12)
+    db_session.add(Run(tenant_id=1, started_at=utcnow() - timedelta(hours=13), status="running"))
+    db_session.commit()
+
+    # Прогон начался раньше заявки и «идёт» до сих пор. Сбор дольше десяти
+    # часов не живёт: последние три часа — уже простой, а не ожидание по делу.
+    assert "roi_refresh_stuck" in _health_codes(db_session)
+
+
+def test_scrape_of_another_tenant_counts_as_waiting_for_a_reason(db_session):
+    """Блокировка сбора одна на всех тенантов — чужой сбор пересчёт тоже ждёт."""
+    run = _full_run(db_session, finished_at=utcnow() - timedelta(hours=9))
+    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    _pending_since(db_session, hours=4)
+    db_session.add(Run(tenant_id=2, started_at=utcnow() - timedelta(hours=5), status="running"))
+    db_session.commit()
+
+    assert "roi_refresh_stuck" not in _health_codes(db_session)
 
 
 def test_overlapping_runs_are_not_counted_twice(db_session):
