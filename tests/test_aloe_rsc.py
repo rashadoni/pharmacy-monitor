@@ -555,6 +555,7 @@ def _unresolved_rows(seen: list[dict]) -> list[dict]:
         pytest.param((None, None), id="card_has_no_country"),
         pytest.param(("Англия", "Германия"), id="samples_disagree"),
         pytest.param(("Англия", "НВ"), id="one_sample_of_two"),
+        pytest.param(("НВ", None), id="not_a_country_and_no_label"),
     ],
 )
 async def test_aloe_unresolvable_country_id_is_sampled_once_per_run(
@@ -628,7 +629,28 @@ async def test_aloe_real_card_without_country_closes_id_for_the_run(monkeypatch)
     assert not [row for row in seen if row["event"] == "aloe_country_detail_failed"]
 
 
-@pytest.mark.parametrize("blip", ["read_timeout", "http_404", "http_503", "not_a_card"])
+async def test_aloe_labelled_card_without_stock_marker_counts_as_read(monkeypatch) -> None:
+    """Подпись страны есть, остатка нет — карточка прочитана: «не карточка» только без обоих."""
+    requested: list[str] = []
+
+    async def fake_fetch(self, url: str) -> str:
+        requested.append(url)
+        return "<span>Ölkə:</span><span>Türkiyə-Almaniya</span>"
+
+    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fake_fetch)
+    scraper = AloeScraper(rate_limit_sec=0)
+
+    with capture_logs() as seen:
+        for page in (1, 2):
+            await scraper._enrich_listing_country_ids(_country_page(page, "7", size=1))
+
+    assert requested == ["https://aloe.az/p1-1/"]
+    assert [row["retry"] for row in _unresolved_rows(seen)] == [False]
+
+
+@pytest.mark.parametrize(
+    "blip", ["read_timeout", "timeout_without_text", "http_404", "http_503", "not_a_card"]
+)
 async def test_aloe_country_id_is_rechecked_after_unread_detail(monkeypatch, blip: str) -> None:
     """Непрочитанная карточка — не отказ сайта: на следующей странице проверяем заново."""
     requested: list[str] = []
@@ -638,6 +660,9 @@ async def test_aloe_country_id_is_rechecked_after_unread_detail(monkeypatch, bli
         if request.url.path == "/p1-2/":
             if blip == "read_timeout":
                 raise httpx.ReadTimeout("no answer", request=request)
+            if blip == "timeout_without_text":
+                # У настоящих таймаутов httpx текст ошибки часто пустой.
+                raise httpx.ReadTimeout("", request=request)
             if blip == "not_a_card":
                 # Настоящая страница aloe.az, но не карточка: листинг.
                 listing = (_FIXTURES / "aloe_bestseller.html").read_text()
