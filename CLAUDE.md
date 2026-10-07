@@ -520,7 +520,7 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
     - **NB:** матчинг-фаза Mac-скрейпа ~3-4ч (каждый DB-query через туннель = latency; на сервере 2 мин). Отрабатывает за ночь — ок.
     - **Чтобы снять зависимость от Mac:** нужен прокси с **AZ-residential** пулом (IPRoyal/ScraperAPI/BrightData его НЕ имеют для aptek) ИЛИ разблокировать BrightData-биллинг (но AZ-пул у них не гарантирован). До тех пор — aptek = Mac.
   - (Прежние записи «RESOLVED via BrightData / Mac-зависимость снята» — УСТАРЕЛИ, см. строки ~151/328/342.)
-- 🔴 **Копии бэкапа вне сервера нет (проверено 2026-10-07).** `pharmacy-monitor-backup.timer` каждую ночь кладёт шифрованный дамп в `/var/backups/pharmacy-monitor/` на самом сервере (хранение 14 дней; на 2026-10-07 там 4 дампа, с 4 октября — до починки бэкап месяц падал). Наружу ничего не уходит: B2 не настроен (`B2 upload skipped` в journald), других заданий на сервере нет. Единственный путь наружу — ручной `infra/local/fetch-backup.sh`, и он до 2026-10-07 по умолчанию смотрел на удалённый Hetzner. Потеря сервера сейчас = потеря базы. Дамп зашифрован `BACKUP_GPG_PASSPHRASE` из `/etc/pharmacy-monitor/env`: без копии этого пароля вне сервера забранный файл не расшифровать. Как забрать копию — [docs/RUNBOOK.md](docs/RUNBOOK.md) «Копия бэкапа вне сервера».
+- 🔴 **Копии бэкапа вне сервера нет (проверено 2026-10-07).** `pharmacy-monitor-backup.timer` каждую ночь кладёт шифрованный дамп в `/var/backups/pharmacy-monitor/` на самом сервере (хранение 14 дней; самый ранний дамп — от 4 октября, до починки бэкап месяц падал). Наружу ничего не уходит: B2 не настроен (`B2 upload skipped` в journald), других заданий на сервере нет. Единственный путь наружу — ручной `infra/local/fetch-backup.sh`, и он до 2026-10-07 по умолчанию смотрел на удалённый Hetzner. Потеря сервера сейчас = потеря базы. Дамп зашифрован `BACKUP_GPG_PASSPHRASE` из `/etc/pharmacy-monitor/env`: без копии этого пароля вне сервера забранный файл не расшифровать. Как забрать копию — [docs/RUNBOOK.md](docs/RUNBOOK.md) «Копия бэкапа вне сервера».
 - Project under git с 2026-05-11. Initial commit `c7fde84` зафиксировал diff-only state. **Remote**: `origin` = `https://github.com/rashadoni/pharmacy-monitor.git` (до переезда репозитория — `rashadrahimov/pharmacy-monitor`). В `main` только через PR — `docs/DELIVERY-ARCHITECTURE.md`.
 - ~~forecast.py не рефакторен под diff-only~~ **DONE 2026-05-28**: `compute_trend` имеет Case A/B/C для sparse data (0 snaps в окне → latest globally; 1-2 snaps same price → stable). `top_movers` имеет pre-cutoff lookup для single-snapshot products. 3 diff-only regression теста в `tests/test_forecast.py` (`test_compute_trend_diff_only_sparse_active_pricing`, `test_predict_competitor_moves_diff_only_skips_truly_stable`, `test_top_movers_diff_only_sparse_change`). 18/18 forecast тестов проходят.
 - 7 false matches in matcher (Friso 3 Gold ↔ Friso Prematures etc) — needs manual reject via UI on /comparison
@@ -540,8 +540,8 @@ docker compose up -d                        # Postgres + Redis
 cd frontend && pnpm dev                     # Next.js
 .venv/bin/pytest -q                         # 80 unit tests
 
-# Deploy — workflow deploy.yml; запускать после зелёного CI на main (так требует
-# шапка самого workflow, сам он CI не проверяет). Ручной rsync всего дерева с
+# Deploy — workflow deploy.yml; запускать после зелёного CI на выкладываемом
+# коммите (так требует шапка workflow, сам он CI не проверяет). Ручной rsync всего дерева с
 # локальной машины, стоявший здесь раньше, устарел: он шёл мимо проверок,
 # которые deploy.yml делает перед выкладкой.
 gh workflow run deploy.yml --ref main -f apply_migrations=false

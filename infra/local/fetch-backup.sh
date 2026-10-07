@@ -55,8 +55,15 @@ case "${1:-}" in
         # Encrypted dumps first: while backup.sh is running, the newest file is
         # its unfinished, still-plaintext .sql.gz.
         target=$(ssh "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST" "ls -t $REMOTE_DIR/pharmacy-monitor-*.sql.gz.gpg 2>/dev/null | head -1")
+        newest=$(ssh "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST" "ls -t $REMOTE_DIR/pharmacy-monitor-*.sql.gz* 2>/dev/null | head -1")
         if [[ -z "$target" ]]; then
-            target=$(ssh "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST" "ls -t $REMOTE_DIR/pharmacy-monitor-*.sql.gz 2>/dev/null | head -1")
+            target="$newest"
+        elif [[ "$newest" != "$target" ]]; then
+            # Either the nightly job is running right now, or encryption got
+            # switched off on the server and the encrypted dumps are going stale.
+            echo "WARN: newest file on prod is unencrypted: $(basename "$newest")" >&2
+            echo "      fetching the last encrypted dump instead: $(basename "$target")" >&2
+            echo "      if this repeats, check BACKUP_GPG_PASSPHRASE on the server." >&2
         fi
         if [[ -z "$target" ]]; then
             echo "ERROR: no backups found on prod in $REMOTE_DIR" >&2
@@ -64,8 +71,8 @@ case "${1:-}" in
         fi
         ;;
     *)
-        # Explicit filename
-        target="$REMOTE_DIR/$1"
+        # Explicit filename (a full path from --list is accepted too)
+        target="$REMOTE_DIR/$(basename "$1")"
         ;;
 esac
 

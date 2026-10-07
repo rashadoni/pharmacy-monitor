@@ -51,5 +51,7 @@ PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 PROD_HOST=13.140.186.143 bash infra/local/r
 
 `PROD_HOST` must be the IP exactly as written: the pinned key is filed under it,
 so a hostname is refused. Errors go to the script's log file, not the terminal.
+This path has not been run against the Contabo server: the Mac's SSH key may not
+be authorised there at all.
 
 After the DR run, confirm the Mac launchd scrape/watch units are still disabled.

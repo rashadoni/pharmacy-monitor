@@ -32,7 +32,7 @@ RETIRED_IPS = ("46.225.149.52",)
 EXECUTABLE_DIRS = (".github", "infra", "scripts")
 TRUSTS_NETWORK = re.compile(
     r"ssh-keyscan"
-    r"|StrictHostKeyChecking[\s=]+[\"']?(accept-new|no|off)\b"
+    r"|StrictHostKeyChecking[\s=]+[\"']?(accept-new|no|off|false)\b"
     r"|UserKnownHostsFile[\s=]+[\"']?/dev/null",
     re.IGNORECASE,
 )
@@ -68,7 +68,10 @@ def test_workflows_reaching_prod_pin_the_same_host_key():
     # Ключ должен не просто встречаться в файле, а записываться в known_hosts.
     writes_pinned_key = re.compile(re.escape(f"'{pinned}'") + r" \\\n\s+> ~/\.ssh/known_hosts\n")
     unpinned = [path.name for path in reaching if not writes_pinned_key.search(path.read_text())]
-    assert not unpinned, f"host key не прошит или отличается от infra/prod_known_hosts: {unpinned}"
+    assert not unpinned, (
+        "host key не прошит, отличается от infra/prod_known_hosts или шаг записан иначе, "
+        f"чем в остальных workflow (printf … > ~/.ssh/known_hosts): {unpinned}"
+    )
 
 
 def test_scripts_reaching_prod_require_the_pinned_key():
