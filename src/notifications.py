@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, time, timedelta
+from html import escape
 from typing import Iterable
+from urllib.parse import urlencode
 
 import structlog
 from sqlalchemy import desc, select
@@ -78,8 +80,19 @@ def _format_event_text(event: storage.AlertEvent) -> str:
     return out
 
 
+def _clip(text: str | None, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _format_event_html(event: storage.AlertEvent) -> str:
-    """HTML snippet for one event in email digest."""
+    """HTML snippet for one event in email digest.
+
+    Название и описание приходят с чужих сайтов (имя товара, заголовок промо),
+    поэтому экранируются и обрезаются. На живых данных обрезка не срабатывает
+    (самое длинное название — 139 знаков, описание — 134); она нужна, чтобы у
+    размера письма был потолок.
+    """
     color = {
         "critical": "#dc2626",
         "warning": "#f59e0b",
@@ -87,14 +100,16 @@ def _format_event_html(event: storage.AlertEvent) -> str:
         "opportunity": "#22c55e",
     }.get(event.severity, "#71717a")
     when = event.created_at.strftime("%d.%m.%Y %H:%M")
+    title = escape(_clip(event.title, 200), quote=False)
+    detail = escape(_clip(event.detail, 200), quote=False)
     return f"""
 <tr>
   <td style="padding:10px;border-left:3px solid {color};background:#fafafa;">
     <div style="font-size:11px;color:#71717a;text-transform:uppercase;font-weight:600;">
-      {event.severity} · {when}
+      {escape(event.severity or "", quote=False)} · {when}
     </div>
-    <div style="font-weight:600;margin-top:4px;color:#18181b;">{event.title}</div>
-    {f'<div style="font-size:13px;color:#52525b;margin-top:4px;">{event.detail}</div>' if event.detail else ""}
+    <div style="font-weight:600;margin-top:4px;color:#18181b;">{title}</div>
+    {f'<div style="font-size:13px;color:#52525b;margin-top:4px;">{detail}</div>' if detail else ""}
   </td>
 </tr>
 """.strip()
@@ -332,12 +347,19 @@ def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -
         log.info("digest_no_events", kind=kind, tenant=tenant_id)
         return 0
 
-    html = _render_digest_email(events, kind=kind, since=since)
-    subject = f"Pharmacy Monitor — {kind} digest ({len(events)} events)"
+    subject = _digest_subject(events, kind)
+    # Письмо зависит от порога получателя: события ниже порога идут в него
+    # числом, а не строками. Получателей с одним порогом рендерим один раз.
+    rendered: dict[str, str] = {}
     sent = 0
     for user in users:
+        threshold = user.email_severity_min or DEFAULT_EMAIL_SEVERITY
+        if threshold not in rendered:
+            rendered[threshold] = _render_digest_email(
+                events, kind=kind, since=since, severity_min=threshold
+            )
         try:
-            notifier.send_email(subject=subject, html_body=html, to=[user.email])
+            notifier.send_email(subject=subject, html_body=rendered[threshold], to=[user.email])
             sent += 1
         except Exception as e:
             log.warning("digest_email_failed", user=user.email, kind=kind, error=str(e))
@@ -410,27 +432,288 @@ def _render_single_event_email(event: storage.AlertEvent) -> str:
 """.strip()
 
 
-def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since: datetime) -> str:
-    rows = "\n".join(_format_event_html(e) for e in events)
-    title = "Daily" if kind == "daily" else "Weekly"
-    period = since.strftime("%d.%m %H:%M")
+# ─── Digest: сводка и ограниченные списки ────────────────────────────────────
+#
+# 2026-10-05 недельное письмо ушло на 1 229 строк: одна сверка каталога дала
+# 1 094 события «новый товар», а письмо клало по строке на каждое событие за
+# окно. Теперь наверху сводка по типам, ниже — списки с потолком. Всё, что не
+# попало в строки, остаётся числом в сводке и ссылкой на дашборд.
+
+# Строк на один тип события; сверх этого — только самые крупные.
+_DIGEST_TYPE_CAP = 30
+# Строк на всё письмо. Вместе с обрезкой в `_format_event_html` держит HTML под
+# 102 КБ даже на самых длинных названиях — больший объём Gmail сворачивает
+# («Message clipped»), и конец письма со ссылкой на дашборд пропадает.
+_DIGEST_ROW_BUDGET = 60
+
+# Подписи типов; порядок — порядок в письме при равной важности.
+_RULE_TYPE_LABELS = {
+    "undercut_threshold": "Конкурент дешевле",
+    "price_drop_pct": "Цена упала",
+    "price_change_pct": "Цена изменилась",
+    "promo_started": "Новые промо",
+    "site_drop_smoke": "Сайт собран не полностью",
+    "price_raise_opportunity": "Можно поднять цену",
+    "new_product": "Новые товары",
+}
+_BUCKET_RANK = {"critical": 0, "warning": 1, "info": 2}
+_BUCKET_WORDS = {
+    "critical": ("критичное", "критичных", "критичных"),
+    "warning": ("предупреждение", "предупреждения", "предупреждений"),
+    "info": ("информационное", "информационных", "информационных"),
+}
+# Поля payload с размером события в процентах — по ним выбираются «самые крупные».
+_MAGNITUDE_KEYS = ("diff_pct", "drop_pct", "change_pct", "gap_pct")
+
+
+def _digest_bucket(severity: str | None) -> str:
+    """critical и warning как есть; всё остальное (info, opportunity, …) — информационное."""
+    return severity if severity in ("critical", "warning") else "info"
+
+
+def _event_magnitude(event: storage.AlertEvent) -> float:
+    payload = event.payload or {}
+    for key in _MAGNITUDE_KEYS:
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return abs(float(value))
+    return 0.0
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return many
+    n %= 10
+    if n == 1:
+        return one
+    return few if 2 <= n <= 4 else many
+
+
+def _num(n: int) -> str:
+    """1909 → «1 909» (неразрывный пробел, чтобы число не рвалось переносом)."""
+    return f"{n:,}".replace(",", "\u00a0")
+
+
+def _bucket_counts(events: Iterable[storage.AlertEvent]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for e in events:
+        bucket = _digest_bucket(e.severity)
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
+
+
+def _severity_phrase(counts: dict[str, int]) -> str:
+    """{'critical': 58, 'warning': 15} → «58 критичных, 15 предупреждений»."""
+    return ", ".join(
+        f"{_num(counts[b])} {_plural(counts[b], *_BUCKET_WORDS[b])}"
+        for b in _BUCKET_RANK
+        if counts.get(b)
+    )
+
+
+def _site_phrase(events: Iterable[storage.AlertEvent]) -> str:
+    """«aloe 1 900, pharmonline 9» — пусто, если у событий типа нет сайта."""
+    counts: dict[str, int] = {}
+    for e in events:
+        site = (e.payload or {}).get("site")
+        if isinstance(site, str) and site:
+            counts[site] = counts.get(site, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ", ".join(f"{escape(site, quote=False)} {_num(n)}" for site, n in ordered)
+
+
+def _digest_groups(
+    events: list[storage.AlertEvent],
+) -> list[tuple[str, list[storage.AlertEvent]]]:
+    """События по типам: сначала типы с критичными, затем с предупреждениями."""
+    by_type: dict[str, list[storage.AlertEvent]] = {}
+    for e in events:
+        by_type.setdefault(e.rule_type or "other", []).append(e)
+    order = list(_RULE_TYPE_LABELS)
+
+    def position(item: tuple[str, list[storage.AlertEvent]]) -> tuple[int, int, str]:
+        rule_type, group = item
+        worst = min(_BUCKET_RANK[_digest_bucket(e.severity)] for e in group)
+        return (worst, order.index(rule_type) if rule_type in order else len(order), rule_type)
+
+    return sorted(by_type.items(), key=position)
+
+
+def _digest_listable(event: storage.AlertEvent, severity_min: str) -> bool:
+    """Проходит ли событие порог получателя. Незнакомая важность считается
+    информационной — так же, как её считает сводка."""
+    return _severity_passes(severity_min, _digest_bucket(event.severity), DEFAULT_EMAIL_SEVERITY)
+
+
+def _digest_rows(
+    group: list[storage.AlertEvent], severity_min: str, limit: int
+) -> list[storage.AlertEvent]:
+    """Какие события одного типа идут в письмо строками.
+
+    Ниже порога получателя — никогда: они остаются числом в сводке. Если
+    остальное не помещается в `limit`, строками идут только критичные и
+    предупреждения, самые крупные. Информационные тогда тоже остаются числом:
+    тридцать случайных «новых товаров» из двух тысяч ничего не сообщают.
+    """
+    rows = [e for e in group if _digest_listable(e, severity_min)]
+    # Сортировка устойчивая: при равном размере сохраняется порядок «новые сверху».
+    rows.sort(key=lambda e: (_BUCKET_RANK[_digest_bucket(e.severity)], -_event_magnitude(e)))
+    if len(rows) > limit:
+        rows = [e for e in rows if _digest_bucket(e.severity) != "info"][:limit]
+    return rows
+
+
+def _alerts_url(kind: str, **filters: str) -> str:
+    """Ссылка на страницу алертов с тем же окном, что у дайджеста."""
     public = os.environ.get("PHARMACY_PUBLIC_URL", "")
+    params = {"hours": "24" if kind == "daily" else "168", **filters}
+    return escape(f"{public}/alerts?{urlencode(params)}")
+
+
+def _digest_period_name(kind: str) -> str:
+    return "сутки" if kind == "daily" else "неделю"
+
+
+def _digest_subject(events: list[storage.AlertEvent], kind: str) -> str:
+    total = len(events)
+    subject = (
+        f"Pharmacy Monitor — дайджест за {_digest_period_name(kind)}: "
+        f"{_num(total)} {_plural(total, 'событие', 'события', 'событий')}"
+    )
+    critical = _bucket_counts(events).get("critical", 0)
+    if critical:
+        subject += f", из них {_num(critical)} {_plural(critical, *_BUCKET_WORDS['critical'])}"
+    return subject
+
+
+def _digest_summary_row(rule_type: str, group: list[storage.AlertEvent], kind: str) -> str:
+    """Строка сводки: тип, сколько событий, разбивка по важности и по сайтам."""
+    counts = _bucket_counts(group)
+    facts = []
+    if counts.get("critical") or counts.get("warning"):
+        facts.append(_severity_phrase(counts))
+    sites = _site_phrase(group)
+    if sites:
+        facts.append(sites)
+    label = escape(_RULE_TYPE_LABELS.get(rule_type, rule_type), quote=False)
+    facts_html = (
+        f'<div style="font-size:12px;color:#71717a;margin-top:2px;">{" · ".join(facts)}</div>'
+        if facts
+        else ""
+    )
+    return f"""
+<tr>
+  <td style="padding:8px 24px;border-top:1px solid #f4f4f5;">
+    <table style="width:100%;border-collapse:collapse;"><tr>
+      <td>
+        <a href="{_alerts_url(kind, type=rule_type)}" style="color:#18181b;font-weight:600;text-decoration:none;">{label}</a>
+        {facts_html}
+      </td>
+      <td style="text-align:right;vertical-align:top;font-size:18px;font-weight:600;color:#18181b;white-space:nowrap;">{_num(len(group))}</td>
+    </tr></table>
+  </td>
+</tr>
+""".strip()
+
+
+def _digest_block(
+    rule_type: str,
+    group: list[storage.AlertEvent],
+    rows: list[storage.AlertEvent],
+    kind: str,
+) -> str:
+    """Список событий одного типа с заголовком и ссылкой на остаток."""
+    label = escape(_RULE_TYPE_LABELS.get(rule_type, rule_type), quote=False)
+    rest = len(group) - len(rows)
+    count = f"{_num(len(rows))} из {_num(len(group))}" if rest else _num(len(group))
+    more = (
+        f"""
+<tr><td style="padding:8px 24px 4px;font-size:12px;">
+  <a href="{_alerts_url(kind, type=rule_type)}" style="color:#3b82f6;">Ещё {_num(rest)} — в дашборде →</a>
+</td></tr>"""
+        if rest
+        else ""
+    )
+    return f"""
+<tr><td style="padding:18px 24px 8px;border-top:1px solid #e4e4e7;font-size:14px;font-weight:600;color:#18181b;">
+  {label} <span style="font-weight:400;color:#71717a;">· {count}</span>
+</td></tr>
+{chr(10).join(_format_event_html(e) for e in rows)}{more}
+""".strip()
+
+
+def _render_digest_email(
+    events: Iterable[storage.AlertEvent],
+    kind: str,
+    since: datetime,
+    severity_min: str | None = None,
+) -> str:
+    """Письмо-дайджест: сводка по типам, затем списки с потолком.
+
+    `severity_min` — порог получателя (`email_severity_min`): события ниже него
+    в списки не попадают и остаются числом в сводке. Без порога перечисляется
+    всё, что помещается в потолки.
+    """
+    events = list(events)
+    threshold = severity_min or "info"
+    total = len(events)
+
+    summary_rows: list[str] = []
+    blocks: list[str] = []
+    budget = _DIGEST_ROW_BUDGET
+    for rule_type, group in _digest_groups(events):
+        summary_rows.append(_digest_summary_row(rule_type, group, kind))
+        rows = _digest_rows(group, threshold, min(_DIGEST_TYPE_CAP, budget))
+        if rows:
+            budget -= len(rows)
+            blocks.append(_digest_block(rule_type, group, rows, kind))
+    listed = _DIGEST_ROW_BUDGET - budget
+
+    if listed == total:
+        scope_note = ""
+    elif listed:
+        scope_note = (
+            f"Ниже по строке на событие — {_num(listed)} из {_num(total)}, самые важные. "
+            "Остальное — числами в сводке и в дашборде."
+        )
+    else:
+        scope_note = "В этом письме только сводка. Сами события — в дашборде."
+    below_threshold = any(not _digest_listable(e, threshold) for e in events)
+    threshold_note = (
+        "События ниже порога важности, заданного для вашей почты, идут в письме только числом. "
+        if below_threshold
+        else ""
+    )
+
+    period_name = _digest_period_name(kind)
+    period = f"{since.strftime('%d.%m')} – {utcnow().strftime('%d.%m')}"
+    totals = f"{_num(total)} {_plural(total, 'событие', 'события', 'событий')}"
+    if total:
+        totals += f": {_severity_phrase(_bucket_counts(events))}"
+    scope_html = (
+        f'<tr><td style="padding:12px 24px 16px;font-size:12px;color:#71717a;">{scope_note}</td></tr>'
+        if scope_note
+        else ""
+    )
     return f"""
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>{title} digest</title></head>
+<head><meta charset="utf-8"><title>Дайджест за {period_name}</title></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
   <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
-    <tr><td style="padding:24px;border-bottom:1px solid #e4e4e7;">
+    <tr><td style="padding:24px;">
       <div style="font-size:14px;color:#71717a;margin-bottom:4px;">Pharmacy Monitor</div>
-      <div style="font-size:22px;font-weight:600;color:#18181b;">{title} digest</div>
-      <div style="font-size:13px;color:#71717a;margin-top:4px;">События с {period}</div>
+      <div style="font-size:22px;font-weight:600;color:#18181b;">Дайджест за {period_name}</div>
+      <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
     </td></tr>
-    {rows}
+    {chr(10).join(summary_rows)}
+    {scope_html}
+    {chr(10).join(blocks)}
     <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
-      <a href="{public}/alerts" style="color:#3b82f6;">Открыть в дашборде →</a>
+      <a href="{_alerts_url(kind)}" style="color:#3b82f6;">Все события за {period_name} — в дашборде →</a>
       <br><br>
-      Чтобы отписаться от этого digest — настройки → notifications.
+      {threshold_note}Кому приходит дайджест и с какого порога важности — настраивается в дашборде: Настройки → Пользователи.
     </td></tr>
   </table>
 </body>

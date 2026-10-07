@@ -502,3 +502,285 @@ def test_send_daily_digest_skips_old_events(setup, tenant_user):
         sent = notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
         assert sent == 0
         assert not mock_email.called
+
+
+# ─── Digest: сводка и ограниченные списки ───────────────────────────────────
+
+# Письмо больше 102 КБ Gmail сворачивает («Message clipped»).
+GMAIL_CLIP_BYTES = 102 * 1024
+NBSP = "\u00a0"
+
+
+def _eligible_run(s, tenant_id):
+    """Полный проверенный прогон — без него финансовые события в дайджест не идут."""
+    run = storage.Run(
+        tenant_id=tenant_id,
+        status="ok",
+        started_at=utcnow(),
+        finished_at=utcnow(),
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {
+                "pharmonline": {"status": "ok"},
+                "aptekonline": {"status": "ok"},
+                "aloe": {"status": "ok"},
+            },
+        },
+    )
+    s.add(run)
+    s.flush()
+    return run
+
+
+def _digest_event(s, run, rule_type, severity, title, **payload):
+    e = storage.AlertEvent(
+        rule_type=rule_type,
+        dedup_key=f"digest|{title}",
+        severity=severity,
+        title=title,
+        detail=f"detail of {title}",
+        tenant_id=run.tenant_id,
+        created_at=utcnow(),
+        payload={**payload, "source_run_id": run.id},
+    )
+    s.add(e)
+    return e
+
+
+def _event_rows(html: str) -> int:
+    """Сколько событий письмо показывает строками (у каждой — цветная полоса слева)."""
+    return html.count("border-left:3px solid")
+
+
+def _weekly_bodies(s, tenant_id) -> tuple[dict[str, str], str]:
+    with patch("src.notifier.send_email") as mock_email:
+        notifications.send_weekly_digest(s, tenant_id=tenant_id)
+    bodies = {c.kwargs["to"][0]: c.kwargs["html_body"] for c in mock_email.call_args_list}
+    subject = mock_email.call_args.kwargs["subject"] if mock_email.called else ""
+    return bodies, subject
+
+
+def test_weekly_digest_big_week_is_summary_plus_capped_lists(setup, tenant_user):
+    """Неделя на 2 039 событий (как после добавления разделов aloe) — письмо со
+    сводкой и списком до потолка, а не строка на каждое событие."""
+    s = setup  # порог alice — warning
+    tenant_user.weekly_digest = True
+    run = _eligible_run(s, tenant_user.tenant_id)
+    for i in range(1900):
+        _digest_event(s, run, "new_product", "info", f"Новый товар на aloe: N{i}", site="aloe")
+    for i in range(9):
+        _digest_event(s, run, "new_product", "info", f"Новый товар на ph: N{i}", site="pharmonline")
+    for i in range(85):
+        _digest_event(
+            s,
+            run,
+            "price_drop_pct",
+            "critical",
+            f"DROPCRIT{i:02d}",
+            site="aptekonline",
+            drop_pct=20 + i,
+        )
+    for i in range(22):
+        _digest_event(
+            s,
+            run,
+            "price_drop_pct",
+            "warning",
+            f"DROPWARN{i:02d}",
+            site="aptekonline",
+            drop_pct=10 + i / 10,
+        )
+    for i in range(5):
+        _digest_event(
+            s,
+            run,
+            "undercut_threshold",
+            "critical",
+            f"UNDERCUT{i}",
+            site="aloe",
+            diff_pct=10 + i,
+        )
+    for i in range(18):
+        _digest_event(s, run, "price_raise_opportunity", "info", f"RAISE{i:02d}", gap_pct=7 + i)
+    s.commit()
+
+    bodies, subject = _weekly_bodies(s, tenant_user.tenant_id)
+    body = bodies["alice@example.com"]
+
+    assert len(bodies) == 1
+    assert len(body.encode()) < GMAIL_CLIP_BYTES
+    assert _event_rows(body) == 5 + notifications._DIGEST_TYPE_CAP
+    assert _event_rows(body) <= notifications._DIGEST_ROW_BUDGET
+
+    # Сводка: каждый тип одной строкой, новые товары — числом с разбивкой по сайтам.
+    assert "Новые товары" in body
+    assert f"aloe 1{NBSP}900, pharmonline 9" in body
+    assert "85 критичных, 22 предупреждения · aptekonline 107" in body
+    assert "Можно поднять цену" in body
+    # …и ни один из 1 909 новых товаров строкой.
+    assert "Новый товар на" not in body
+    assert "RAISE" not in body  # info ниже порога alice — только числом
+
+    # Малочисленное, но главное («конкурент дешевле») не вытеснено сотней падений цены.
+    for i in range(5):
+        assert f"UNDERCUT{i}" in body
+    # Из падений цены — самые крупные; остальное за ссылкой с фильтром по типу.
+    assert "DROPCRIT84" in body
+    assert "DROPCRIT55" in body
+    assert "DROPCRIT54" not in body
+    assert "DROPWARN" not in body
+    assert "30 из 107" in body
+    assert "Ещё 77 — в дашборде" in body
+    assert "https://example.com/alerts?hours=168&amp;type=price_drop_pct" in body
+
+    assert subject == (
+        f"Pharmacy Monitor — дайджест за неделю: 2{NBSP}039 событий, из них 90 критичных"
+    )
+
+
+def test_weekly_digest_small_week_lists_every_event(setup, tenant_user):
+    """Мало событий — как раньше: каждое строкой, ничего не спрятано за ссылку."""
+    s = setup
+    tenant_user.weekly_digest = True
+    tenant_user.email_severity_min = "info"
+    run = _eligible_run(s, tenant_user.tenant_id)
+    titles = []
+    for i in range(3):
+        titles.append(f"UNDERCUT{i}")
+        _digest_event(s, run, "undercut_threshold", "critical", titles[-1], site="aloe")
+    for i in range(4):
+        titles.append(f"DROPWARN{i}")
+        _digest_event(s, run, "price_drop_pct", "warning", titles[-1], site="aptekonline")
+    for i in range(5):
+        titles.append(f"NEWPRODUCT{i}")
+        _digest_event(s, run, "new_product", "info", titles[-1], site="aloe")
+    for i in range(2):
+        titles.append(f"RAISE{i}")
+        _digest_event(s, run, "price_raise_opportunity", "info", titles[-1])
+    s.commit()
+
+    bodies, subject = _weekly_bodies(s, tenant_user.tenant_id)
+    body = bodies["alice@example.com"]
+
+    assert _event_rows(body) == len(titles) == 14
+    for title in titles:
+        assert title in body
+        assert f"detail of {title}" in body
+    assert "Ещё " not in body
+    assert "самые важные" not in body
+    assert "ниже порога важности" not in body
+    # Критичные идут раньше информационных.
+    assert body.index("UNDERCUT0") < body.index("DROPWARN0") < body.index("NEWPRODUCT0")
+    assert subject == "Pharmacy Monitor — дайджест за неделю: 14 событий, из них 3 критичных"
+
+
+def test_weekly_digest_respects_recipient_threshold(setup, tenant_user):
+    """События ниже порога получателя — числом в сводке, не строками."""
+    s = setup  # alice: warning
+    tenant_user.weekly_digest = True
+    s.add(
+        storage.TenantUser(
+            tenant_id=tenant_user.tenant_id,
+            email="bob@example.com",
+            name="Bob",
+            role="viewer",
+            is_active=True,
+            created_at=utcnow(),
+            email_severity_min="info",
+            weekly_digest=True,
+        )
+    )
+    run = _eligible_run(s, tenant_user.tenant_id)
+    _digest_event(s, run, "undercut_threshold", "critical", "CRITTITLE", site="aloe")
+    _digest_event(s, run, "new_product", "info", "INFOTITLE", site="aloe")
+    s.commit()
+
+    bodies, _ = _weekly_bodies(s, tenant_user.tenant_id)
+    alice, bob = bodies["alice@example.com"], bodies["bob@example.com"]
+
+    assert "CRITTITLE" in alice and "CRITTITLE" in bob
+    assert "INFOTITLE" in bob
+    assert "INFOTITLE" not in alice
+    # У alice новый товар не пропал — он посчитан в сводке, и письмо говорит почему.
+    assert "Новые товары" in alice
+    assert "1 из 2, самые важные" in alice
+    assert "ниже порога важности" in alice
+    assert "ниже порога важности" not in bob
+
+
+def test_digest_size_is_bounded_on_longest_texts(setup):
+    """Потолок размера держится и на предельно длинных названиях и описаниях."""
+    events = [
+        storage.AlertEvent(
+            rule_type=rule_type,
+            dedup_key=f"long-{rule_type}-{i}",
+            severity="critical",
+            title="Ж" * 500,
+            detail="Щ" * 5000,
+            tenant_id=1,
+            created_at=utcnow(),
+            payload={"site": "aloe", "drop_pct": i},
+        )
+        for rule_type in [*notifications._RULE_TYPE_LABELS, "some_future_rule"]
+        for i in range(100)
+    ]
+    html = notifications._render_digest_email(events, kind="weekly", since=utcnow())
+
+    assert _event_rows(html) == notifications._DIGEST_ROW_BUDGET
+    assert len(html.encode()) < GMAIL_CLIP_BYTES
+    assert "some_future_rule" in html  # незнакомый тип виден в сводке под своим именем
+
+
+def test_digest_escapes_scraped_text(setup):
+    """Имя товара приходит с чужого сайта — в письме это текст, а не разметка."""
+    event = storage.AlertEvent(
+        rule_type="new_product",
+        dedup_key="esc",
+        severity="info",
+        title='Новый товар: <a href="https://evil.example">Johnson & Johnson</a>',
+        detail="<b>жирный</b>",
+        tenant_id=1,
+        created_at=utcnow(),
+        payload={"site": "aloe"},
+    )
+    html = notifications._render_digest_email([event], kind="weekly", since=utcnow())
+
+    assert '<a href="https://evil.example">' not in html
+    assert '&lt;a href="https://evil.example"&gt;Johnson &amp; Johnson&lt;/a&gt;' in html
+    assert "&lt;b&gt;жирный&lt;/b&gt;" in html
+
+
+def test_daily_digest_links_to_day_window(setup, tenant_user):
+    s = setup
+    tenant_user.daily_digest = True
+    run = _eligible_run(s, tenant_user.tenant_id)
+    _digest_event(s, run, "undercut_threshold", "critical", "Today event", site="aloe")
+    s.commit()
+
+    with patch("src.notifier.send_email") as mock_email:
+        notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
+    assert mock_email.call_args.kwargs["subject"] == (
+        "Pharmacy Monitor — дайджест за сутки: 1 событие, из них 1 критичное"
+    )
+    assert "https://example.com/alerts?hours=24" in mock_email.call_args.kwargs["html_body"]
+
+
+@pytest.mark.parametrize(
+    ("n", "expected"),
+    [
+        (1, "событие"),
+        (2, "события"),
+        (5, "событий"),
+        (11, "событий"),
+        (21, "событие"),
+        (112, "событий"),
+        (1094, "события"),
+    ],
+)
+def test_plural(n, expected):
+    assert notifications._plural(n, "событие", "события", "событий") == expected
