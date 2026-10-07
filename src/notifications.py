@@ -365,7 +365,7 @@ def _send_digest(
             else storage.TenantUser.weekly_digest.is_(True),
         )
     ).all()
-    if only_email:
+    if only_email is not None:
         users = [u for u in users if u.email.lower() == only_email.strip().lower()]
     if not users:
         log.info("digest_no_recipients", kind=kind, tenant=tenant_id)
@@ -432,7 +432,7 @@ def _event_is_digest_eligible(session: Session, event: storage.AlertEvent) -> bo
     """Fail closed for financial events created before verified run provenance."""
     if event.rule_type not in _FINANCIAL_EVENT_TYPES:
         return True
-    run_id = (event.payload or {}).get("source_run_id")
+    run_id = _payload(event).get("source_run_id")
     if not isinstance(run_id, int):
         log.warning("digest_event_skipped_unverified", event_id=event.id, reason="no_source_run")
         return False
@@ -610,7 +610,9 @@ def _digest_selection(
     крупные по проценту.
 
     Информационные события идут строками, только если тип помещается целиком:
-    тридцать случайных «новых товаров» из двух тысяч ничего не сообщают.
+    тридцать случайных «новых товаров» из двух тысяч ничего не сообщают. Поэтому
+    их остаток не делят, а отдают типам по порядку — каждому целиком, пока есть
+    место; тип, который не поместился, не отнимает строк у следующего.
     """
     chosen: dict[str, list[storage.AlertEvent]] = {rule_type: [] for rule_type, _ in groups}
     budget = _DIGEST_ROW_BUDGET
@@ -624,11 +626,17 @@ def _digest_selection(
             # Сортировка устойчивая: при равном размере остаётся порядок «новые сверху».
             events.sort(key=lambda e: -_event_magnitude(e))
             wanted[rule_type] = events[:room]
+        if bucket == "info":
+            for rule_type, events in wanted.items():
+                if len(events) <= budget:
+                    chosen[rule_type].extend(events)
+                    budget -= len(events)
+            continue
         # Сначала типы, которым нужно меньше: их недобор достаётся остальным.
+        # Доля округляется вверх, иначе при остатке меньше числа типов самый
+        # малый тип не получил бы ничего.
         for i, rule_type in enumerate(sorted(wanted, key=lambda t: len(wanted[t]))):
-            share = budget // (len(wanted) - i)
-            if bucket == "info" and len(wanted[rule_type]) > share:
-                continue
+            share = -(-budget // (len(wanted) - i))
             taken = wanted[rule_type][:share]
             chosen[rule_type].extend(taken)
             budget -= len(taken)
