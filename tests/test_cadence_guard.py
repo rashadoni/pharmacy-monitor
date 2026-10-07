@@ -22,7 +22,12 @@ from sqlalchemy.orm import sessionmaker
 from src import main as main_mod
 from src import storage
 from src._time import utcnow
-from src.cadence import cadence_window_start, site_cadence_hours, site_max_age_hours
+from src.cadence import (
+    CADENCE_GRACE_HOURS,
+    cadence_window_start,
+    site_cadence_hours,
+    site_max_age_hours,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 SCRAPE_UNIT = REPO / "infra/systemd/pharmacy-monitor-scrape@.service"
@@ -81,33 +86,53 @@ def _berlin_weekday(moment_utc: datetime) -> int:
 # ─── Окно ритма ──────────────────────────────────────────────────────────────
 
 
-def test_weekly_window_opens_at_monday_midnight_baku():
-    """Неделя сбора начинается в понедельник 00:00 по Баку = вс 20:00 UTC."""
+def test_weekly_window_opens_in_the_night_to_monday():
+    """Неделя сбора открывается в воскресенье 22:00 UTC."""
     wednesday = datetime(2026, 10, 7, 12, 0)
 
     start = cadence_window_start("aloe", wednesday)
 
-    assert start == datetime(2026, 10, 4, 20, 0)
-    baku = start + timedelta(hours=4)
-    assert (baku.weekday(), baku.hour, baku.minute) == (0, 0, 0)
+    assert start == datetime(2026, 10, 4, 22, 0)
+    assert start.weekday() == 6
 
 
 def test_window_boundary_belongs_to_the_new_window():
-    boundary = datetime(2026, 10, 11, 20, 0)
+    boundary = datetime(2026, 10, 11, 22, 0)
 
     assert cadence_window_start("aloe", boundary) == boundary
     assert cadence_window_start("aloe", boundary - timedelta(seconds=1)) == datetime(
-        2026, 10, 4, 20, 0
+        2026, 10, 4, 22, 0
     )
 
 
 def test_site_without_declared_cadence_gets_daily_windows():
-    """Сайт вне карты ритма — суточный: окно открывается каждую полночь по Баку."""
+    """Сайт вне карты ритма — суточный: окно открывается каждый вечер."""
     assert site_cadence_hours("unknown-site") == 24
 
     start = cadence_window_start("unknown-site", datetime(2026, 10, 7, 12, 0))
 
-    assert start == datetime(2026, 10, 6, 20, 0)
+    assert start == datetime(2026, 10, 6, 22, 0)
+
+
+@pytest.mark.parametrize("hour", [1, 2, 3])
+def test_window_boundary_fits_the_monday_night_timers(hour):
+    """Граница окна стоит раньше ночных таймеров понедельника и рядом с ними.
+
+    Таймеры полного сбора — 01:00, 02:00 и 03:00 по времени хоста. Перебираем
+    каждый понедельник трёх лет, то есть оба перевода часов.
+    """
+    jitter = timedelta(seconds=300)  # RandomizedDelaySec таймера
+    monday = date(2026, 1, 5)
+    while monday < date(2029, 1, 1):
+        fire = _timer_fire_utc(monday, hour)
+        since_boundary = fire - cadence_window_start("aloe", fire)
+        # Понедельничный запуск открывает новую неделю, а не дособирает старую.
+        assert timedelta(hours=1) <= since_boundary < timedelta(hours=24), monday
+        # Сбор вручную сразу после границы сдвигает следующий плановый на этот
+        # зазор; с задержкой таймера и часом на разницу в длительности прогонов
+        # он обязан уложиться в запас ритма.
+        assert since_boundary + jitter <= timedelta(hours=CADENCE_GRACE_HOURS - 1), monday
+        monday += timedelta(days=7)
 
 
 # ─── Какие сайты пора собирать ───────────────────────────────────────────────
@@ -195,24 +220,45 @@ def test_weekly_timer_is_not_skipped_after_midweek_recovery(db_session):
     assert due == ["aptekonline"]
 
 
-def test_collection_just_after_window_opens_covers_the_week(db_session):
-    """Сбор между открытием окна и ночным таймером закрывает неделю.
+def test_manual_collection_right_after_window_opens_keeps_next_week_fresh(db_session):
+    """Худший случай для порога «данные устарели».
 
-    Следующий сбор — через неделю на первом же будильнике, и разрыв укладывается
-    в порог «данные устарели»: граница окна стоит не дальше запаса ритма от
-    таймеров.
+    Сбор вручную через секунды после открытия окна закрывает неделю, и
+    следующий плановый приходит позже обычного на зазор между границей и
+    таймером. Берём самый поздний таймер прода (aptekonline, 02:00 зимой),
+    полную случайную задержку и прогон вдвое длиннее обычного.
     """
-    early = _full_run(db_session, "aloe", started_at=datetime(2026, 10, 11, 20, 0, 5))
+    this_monday = _timer_fire_utc(date(2026, 11, 9), hour=2)
+    opened = cadence_window_start("aptekonline", this_monday)
+    early = _full_run(db_session, "aptekonline", started_at=opened + timedelta(seconds=5))
+
+    due, _ = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=this_monday)
+    assert due == []
+
+    next_monday = _timer_fire_utc(date(2026, 11, 16), hour=2) + timedelta(seconds=300)
+    due, _ = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=next_monday)
+    assert due == ["aptekonline"]
+    refreshed_by = next_monday + timedelta(minutes=65)
+    gap_hours = (refreshed_by - early.started_at).total_seconds() / 3600
+    assert gap_hours <= site_max_age_hours("aptekonline")
+
+
+def test_run_started_before_the_window_does_not_cover_it(db_session):
+    """Неделю закрывает сбор, который в ней НАЧАЛСЯ.
+
+    Сбор, начатый до границы и законченный после неё, несёт данные прошлой
+    недели — понедельничный таймер собирает заново.
+    """
+    boundary = datetime(2026, 10, 11, 22, 0)
+    straddling = _full_run(
+        db_session, "aloe", started_at=boundary - timedelta(minutes=10), minutes=40
+    )
+    assert straddling.finished_at > boundary
 
     monday_timer = _timer_fire_utc(date(2026, 10, 12), hour=1)
     due, _ = main_mod._sites_due_for_full_scan(db_session, ["aloe"], now=monday_timer)
-    assert due == []
 
-    next_timer = _timer_fire_utc(date(2026, 10, 19), hour=1)
-    due, _ = main_mod._sites_due_for_full_scan(db_session, ["aloe"], now=next_timer)
     assert due == ["aloe"]
-    gap_hours = (next_timer - early.finished_at).total_seconds() / 3600 + 0.5
-    assert gap_hours <= site_max_age_hours("aloe")
 
 
 def test_failed_attempt_does_not_block_retry(db_session):
@@ -284,9 +330,13 @@ class _ScrapeReached(Exception):
 
 
 @pytest.fixture
-def scrape_calls(db_session, monkeypatch):
+def scrape_calls(db_session, monkeypatch, tmp_path):
     """`run` на тестовой БД; скрейперы подменены и записывают, что их позвали."""
     calls: list[tuple[str, list[str]]] = []
+    # Одни часы на подготовку данных и на сам `run`: иначе тест, попавший на
+    # секунду открытия окна, увидел бы «собрано на этой неделе» как прошлую.
+    frozen = utcnow()
+    monkeypatch.setattr(main_mod, "utcnow", lambda: frozen)
 
     async def fake_scrape_all(sites_with_slugs, *args, **kwargs):
         calls.append(("catalog", sorted(sites_with_slugs)))
@@ -324,12 +374,20 @@ def scrape_calls(db_session, monkeypatch):
         "SCRAPE_REPORT_EMAIL",
     ):
         monkeypatch.setenv(name, "")
+    # Маркер автономного режима по умолчанию ищется в /opt — на хосте, где он
+    # есть, тест не должен зависеть от него.
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER", str(tmp_path / "no-marker"))
     return calls
 
 
 def _collected_this_week(db_session, site: str) -> None:
-    """Сайт уже собран в текущем окне ритма."""
-    _full_run(db_session, site, started_at=cadence_window_start(site, utcnow()), minutes=0)
+    """Сайт уже собран в текущем окне ритма (часы — те же, что у `run`)."""
+    opened = cadence_window_start(site, main_mod.utcnow())
+    _full_run(db_session, site, started_at=opened, minutes=0)
+
+
+def _collected_last_week(db_session, site: str) -> None:
+    _full_run(db_session, site, started_at=main_mod.utcnow() - timedelta(days=8))
 
 
 def _run_count(db_session) -> int:
@@ -362,7 +420,7 @@ def test_systemd_unit_command_is_skipped_inside_the_week(db_session, scrape_call
 
 def test_systemd_unit_command_collects_in_a_new_week(db_session, scrape_calls):
     """Та же команда, прошлый сбор — на прошлой неделе: собираем полный каталог."""
-    _full_run(db_session, "aloe", started_at=utcnow() - timedelta(days=8))
+    _collected_last_week(db_session, "aloe")
 
     result = CliRunner().invoke(main_mod.cli, _unit_run_args(SCRAPE_UNIT, "aloe"))
 
@@ -373,14 +431,19 @@ def test_systemd_unit_command_collects_in_a_new_week(db_session, scrape_calls):
     assert (run.catalog_scope, run.full_catalog_sites) == ("full", "aloe")
 
 
-def test_pharmonline_timer_in_autonomous_mode_is_skipped_inside_the_week(
-    db_session, scrape_calls, monkeypatch, tmp_path
-):
-    """Легаси-таймер pharmonline: маркер уводит `auto` в public_api — это тоже полный сбор."""
+def _enable_pharmonline_marker(monkeypatch, tmp_path) -> None:
+    """Как на проде: маркер на месте, транспорт выбран в EnvironmentFile."""
     marker = tmp_path / "pharmonline-public-api-autonomous-v1"
     marker.write_text(main_mod._PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_CONTENT, encoding="utf-8")
     monkeypatch.setenv("PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER", str(marker))
     monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "direct")
+
+
+def test_pharmonline_timer_in_autonomous_mode_is_skipped_inside_the_week(
+    db_session, scrape_calls, monkeypatch, tmp_path
+):
+    """Легаси-таймер pharmonline: маркер уводит `auto` в public_api — это тоже полный сбор."""
+    _enable_pharmonline_marker(monkeypatch, tmp_path)
     _collected_this_week(db_session, "pharmonline")
     runs_before = _run_count(db_session)
 
@@ -389,6 +452,20 @@ def test_pharmonline_timer_in_autonomous_mode_is_skipped_inside_the_week(
     assert result.exit_code == 0, result.output
     assert scrape_calls == []
     assert _run_count(db_session) == runs_before
+
+
+def test_pharmonline_timer_in_autonomous_mode_collects_in_a_new_week(
+    db_session, scrape_calls, monkeypatch, tmp_path
+):
+    _enable_pharmonline_marker(monkeypatch, tmp_path)
+    _collected_last_week(db_session, "pharmonline")
+
+    CliRunner().invoke(main_mod.cli, _unit_run_args(SCRAPE_UNIT, "pharmonline"))
+
+    assert scrape_calls == [("catalog", ["pharmonline"])]
+    db_session.expire_all()
+    run = db_session.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+    assert (run.catalog_scope, run.full_catalog_sites) == ("full", "pharmonline")
 
 
 def test_explicit_public_api_workflow_is_never_skipped(db_session, scrape_calls, monkeypatch):
@@ -444,7 +521,10 @@ def test_dashboard_button_collects_inside_the_week(db_session, scrape_calls):
 
 
 def test_watchlist_tick_form_is_not_a_full_scan(db_session, scrape_calls):
-    """watchlist-тик зовёт `run` с mode=watchlist и hourly — ритм полного сбора не про него."""
+    """Форма watchlist-тика: `run` с mode=watchlist и hourly — ритм полного сбора не про неё.
+
+    Что `watchlist-tick` зовёт `run` именно так, закреплено в test_intraday.py.
+    """
     _collected_this_week(db_session, "aloe")
 
     CliRunner().invoke(main_mod.cli, ["run", "--site", "aloe", "--mode", "watchlist", "--hourly"])

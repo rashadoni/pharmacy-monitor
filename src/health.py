@@ -4,7 +4,7 @@
 или встраивается в основной прогон.
 
 Что детектируется:
-1. **Stale**: последний успешный run был >max_age_hours назад
+1. **Stale**: последнего прогона нет дольше ритма самого частого сайта
 2. **Failed**: последний run завершился со status='failed'
 3. **Empty**: последний run ok но < min_products (полностью пустой)
 4. **Site-drop**: сайт покрыл <50% живого каталога за окно покрытия
@@ -68,7 +68,7 @@ class HealthAlertDecision:
 def check_health(
     session: Session,
     *,
-    max_age_hours: int = 26,  # с запасом за суточный cron + jitter
+    max_age_hours: int = 26,  # порог для сайта без объявленного ритма (суточный cron + jitter)
     min_products: int = 1,
     site_drop_threshold: float = 0.5,  # порог: доля живого каталога за окно покрытия
 ) -> HealthReport:
@@ -94,15 +94,19 @@ def check_health(
     report.last_run_at = last_run.started_at
     report.last_run_status = last_run.status
 
-    # 1. Stale check — относительно сейчас
+    # 1. Stale check — относительно сейчас. Порог — ритм самого частого сайта:
+    # при недельном сборе плановый запуск в остальные ночи выходит без прогона
+    # (гвард ритма в `run`), а частичные тики прогон дают не каждый день. С
+    # прежними 26ч исправный недельный график сам поднимал бы эту тревогу.
+    stale_after_hours = max(max_age_hours, min(_SITE_MAX_AGE_HOURS.values(), default=0))
     age = utcnow() - last_run.started_at
-    if age > timedelta(hours=max_age_hours):
+    if age > timedelta(hours=stale_after_hours):
         report.issues.append(
             HealthIssue(
                 "critical",
                 "stale_run",
                 f"Последний прогон был {age.total_seconds() / 3600:.1f}ч назад "
-                f"(порог {max_age_hours}ч). Проверьте cron.",
+                f"(порог {stale_after_hours}ч). Проверьте cron.",
                 context={"hours_ago": age.total_seconds() / 3600},
             )
         )

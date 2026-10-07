@@ -346,10 +346,42 @@ def test_site_silence_flags_long_aptekonline_outage(db_session):
 
 
 def test_stale_run_critical(db_session):
-    _add_run(db_session, utcnow() - timedelta(hours=48))
+    """Прогонов нет дольше недельного ритма с запасом — планировщик умер."""
+    _add_run(db_session, utcnow() - timedelta(hours=200))
     db_session.commit()
     rep = check_health(db_session, max_age_hours=26)
     assert rep.status == "critical"
+    assert any(i.code == "stale_run" for i in rep.issues)
+
+
+def test_weekly_cadence_does_not_raise_stale_run_between_collections(db_session):
+    """Двое суток без прогонов при недельном сборе — штатно, не тревога.
+
+    Плановый запуск в ночи, когда сайт уже собран, выходит без прогона, а
+    частичные тики прогон дают не каждый день: на проде 2026-10-06 он был один,
+    2026-10-07 до полудня — ни одного. Порог 26ч поднимал бы «Проверьте cron»
+    на исправном недельном графике.
+    """
+    _add_run(db_session, utcnow() - timedelta(hours=48))
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+
+    assert not any(i.code == "stale_run" for i in rep.issues)
+
+
+def test_stale_run_follows_the_most_frequent_site(db_session, monkeypatch):
+    """Вернётся суточный сайт — вернётся и суточный порог «давно не было прогонов»."""
+    from src import health
+
+    monkeypatch.setattr(
+        health, "_SITE_MAX_AGE_HOURS", {**health._SITE_MAX_AGE_HOURS, "aloe": 30}
+    )
+    _add_run(db_session, utcnow() - timedelta(hours=48))
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+
     assert any(i.code == "stale_run" for i in rep.issues)
 
 
