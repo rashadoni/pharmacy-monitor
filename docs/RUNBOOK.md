@@ -901,6 +901,55 @@ Priority order in `src/scrapers/base.py`:
 3. ScraperAPI default pool (3rd-priority, free tier)
 4. Direct connection (fallback)
 
+### Сверка личностей pharmonline
+
+**Когда.** Полный сбор pharmonline отказывает на проверке личностей: в `runs`
+статус `failed`, причина начинается с `public_api_identity_proof_failed`
+(`PharmonlinePublicAPIIdentityError: … refused persistence`).
+
+**Чем.** Два ручных workflow, оба исполняют код своего чекаута из чернового
+каталога на сервере, живой каталог не трогают:
+
+1. `plan-pharmonline-decodo-public-api-reconciliation.yml` — план, ничего не
+   пишет;
+2. `recover-pharmonline-decodo-public-api.yml` — бэкап базы, сверка
+   (`--apply`), через полчаса полный сбор. Параметры: `confirmation=RECONCILE`
+   и `plan_run_id` — номер успешного прогона плана.
+
+Оба требуют зелёный CI на том же коммите, а второй — ещё и успешный план с
+того же коммита.
+
+**Сверка не мигрирует.** Схему двигает только `deploy.yml`. До бэкапа и до любой
+записи второй workflow сверяет ревизию базы с головой миграций своего коммита и
+при расхождении отказывает:
+
+```
+refusing reconciliation: production DB is at migration <ревизия базы>, this commit's
+migrations end at <голова коммита>; deploy this commit with deploy.yml
+(apply_migrations=true) first; this workflow does not migrate
+```
+
+Значит, порядок такой: если миграции коммита впереди базы — сначала выкладка
+(`gh workflow run deploy.yml --ref main -f apply_migrations=true`), потом план,
+потом сверка. Отказ «revision cannot be read with this commit's migrations» —
+обратный случай: база ушла вперёд коммита, запускать надо с выложенного.
+
+```bash
+# где база и где коммит
+ssh root@13.140.186.143 "sudo -u postgres psql -X -At pharmacy_monitor \
+  -c 'select version_num from alembic_version'"
+ls migrations/versions | tail -1
+```
+
+До 2026-10-07 этот workflow сам исполнял `alembic upgrade head` и сверял
+результат с прошитой `0021_…`: на голове 0023 он падал уже после бэкапа, а с
+коммита с новой миграцией двинул бы схему мимо проверок `deploy.yml`.
+
+**Что остаётся на сервере.** Каждый запуск оставляет
+`/opt/pharmacy-monitor/.codex-decodo-reconciliation-apply.*` с исходниками и
+копией базы до сверки (`production-before-reconciliation.dump`). Сами каталоги
+не удаляются; на 2026-10-07 их девять.
+
 ### Firecrawl as scraper backup (Phase 6 — Firecrawl MCP)
 
 Бэкап путь когда нативные скрейперы падают:
