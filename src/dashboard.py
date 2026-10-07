@@ -456,7 +456,8 @@ def run_pharmacy_monitor(
     mode: str = "auto",
 ) -> tuple[int, str]:
     """Запустить `pharmacy-monitor run` через subprocess. Возвращает (returncode, log)."""
-    args = ["uv", "run", "pharmacy-monitor", "run", "--mode", mode]
+    # Кнопку нажал человек — собираем сейчас, недельный ритм не спорит.
+    args = ["uv", "run", "pharmacy-monitor", "run", "--mode", mode, "--force"]
     if dry_run:
         args.append("--dry-run")
     for s in sites or []:

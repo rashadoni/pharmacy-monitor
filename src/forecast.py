@@ -27,6 +27,7 @@ from src.storage import (
     Run,
     financially_eligible_run_ids,
     latest_snapshots_per_product,
+    trusted_snapshot_filter,
 )
 
 log = structlog.get_logger()
@@ -127,7 +128,7 @@ def compute_trend(
         .join(Run, Run.id == PriceSnapshot.run_id)
         .where(
             PriceSnapshot.product_id == product_id,
-            PriceSnapshot.run_id.in_(eligible_run_ids),
+            trusted_snapshot_filter(eligible_run_ids),
             Run.started_at >= cutoff,
         )
         .order_by(asc(Run.started_at))
@@ -301,9 +302,12 @@ def top_movers(
         )
         .join(Run, Run.id == PriceSnapshot.run_id)
         .join(Product, Product.id == PriceSnapshot.product_id)
-        .where(Run.status == "ok", Run.started_at >= cutoff)
+        # Статус прогона-автора не проверяем: доверие записи задаёт
+        # trusted_snapshot_filter. Изменение цены мог первым записать сбор, не
+        # прошедший проверку, а подтвердить — следующий проверенный.
+        .where(Run.started_at >= cutoff)
         .where(
-            PriceSnapshot.run_id.in_(eligible_run_ids),
+            trusted_snapshot_filter(eligible_run_ids),
             Product.tenant_id == tenant_id,
         )
         .order_by(Run.started_at)
@@ -341,7 +345,7 @@ def top_movers(
             .join(Product, Product.id == PriceSnapshot.product_id)
             .where(
                 PriceSnapshot.product_id.in_(single_snap_pids),
-                PriceSnapshot.run_id.in_(eligible_run_ids),
+                trusted_snapshot_filter(eligible_run_ids),
                 Product.tenant_id == tenant_id,
                 Run.started_at < cutoff,
             )

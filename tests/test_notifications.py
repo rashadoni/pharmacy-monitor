@@ -774,7 +774,7 @@ def test_digest_rows_are_shared_between_types_of_same_severity():
 
 
 def test_digest_info_type_is_listed_whole_or_counted():
-    """Информационный тип идёт строками, только если помещается целиком."""
+    """Информационный тип без процента: помещается — целиком, нет — числом."""
     fits = [
         _loose_event("price_raise_opportunity", "info", f"RAISE{i:02d}")
         for i in range(notifications._DIGEST_TYPE_CAP)
@@ -844,6 +844,32 @@ def test_digest_ranked_info_type_shows_largest_when_letter_is_short_of_rows():
     assert "Можно поднять цену <span" in html and "23 из 28" in html
     assert "Ещё 5 — в дашборде" in html
     assert "NEWPRODUCT" not in html
+
+
+def test_digest_ranked_info_type_above_cap_shows_largest():
+    """«Можно поднять цену» больше потолка — 30 самых крупных, а не одно число."""
+    events = [
+        _loose_event("price_raise_opportunity", "info", f"RAISE{i:02d}", {"gap_pct": 7 + i})
+        for i in range(45)
+    ]
+    html = notifications._render_digest_email(events, kind="weekly", since=utcnow())
+
+    assert html.count("RAISE") == notifications._DIGEST_TYPE_CAP == 30
+    assert "RAISE44" in html and "RAISE15" in html and "RAISE14" not in html
+    assert "30 из 45" in html and "Ещё 15 — в дашборде" in html
+
+
+def test_digest_type_cap_counts_rows_of_every_severity():
+    """Потолок 30 — на тип целиком: критичные и информационные одного типа вместе."""
+    events = [_loose_event("price_change_pct", "critical", f"CRIT{i:02d}") for i in range(20)] + [
+        _loose_event("price_change_pct", "info", f"INFO{i:02d}", {"change_pct": i + 1})
+        for i in range(15)
+    ]
+    html = notifications._render_digest_email(events, kind="weekly", since=utcnow())
+
+    assert html.count("CRIT") == 20
+    assert html.count("INFO") == 10
+    assert "INFO14" in html and "INFO05" in html and "INFO04" not in html
 
 
 def test_digest_info_type_is_ranked_only_by_percent():
