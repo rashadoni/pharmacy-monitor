@@ -246,6 +246,38 @@ def test_unfinished_run_defers_instead_of_caching_an_empty_list(db_session):
     assert [item["type"] for item in payload] == ["price_raise"]
 
 
+def test_block_that_appears_mid_refresh_defers_and_leaves_no_half_written_cache(
+    db_session, monkeypatch
+):
+    """Помеха возникла уже после проверок — расчёт отказался сам, посреди срезов.
+
+    Это не сбой: заявка ждёт следующего тика, повтор не ставится. В кэше не
+    остаётся ни пустого списка за несчитанные срезы, ни смеси нового со старым.
+    """
+    run = _full_run(db_session)
+    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    roi_refresh.refresh_from_trusted_epoch(db_session)
+    _queue(db_session)
+    real_cache_actions = roi.cache_actions
+
+    def cache_then_orphan(session, client_site, actions, **kwargs):
+        real_cache_actions(session, client_site, actions, **kwargs)
+        session.add(Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running"))
+        session.commit()
+
+    monkeypatch.setattr(roi, "cache_actions", cache_then_orphan)
+
+    result = roi_refresh.run_refresh(db_session, only_if_requested=True)
+
+    assert (result.outcome, result.reason) == ("busy", "run_unfinished")
+    assert [(request.reason, request.status) for request in _requests(db_session)] == [
+        ("test", "pending")
+    ]
+    # Незакоммиченное команда watcher'а потеряла бы на выходе.
+    db_session.rollback()
+    assert db_session.scalars(select(RoiActionsCache)).all() == []
+
+
 def test_second_refresh_does_not_start_while_one_is_running(db_session, monkeypatch):
     @contextmanager
     def taken(_session):

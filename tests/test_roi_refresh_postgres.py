@@ -191,3 +191,83 @@ def test_database_error_mid_refresh_is_survived_on_postgres(monkeypatch):
         with admin.connect() as connection:
             connection.execute(text(f"DROP DATABASE IF EXISTS {database}"))
         admin.dispose()
+
+
+def test_orphan_run_at_the_end_of_a_verified_run_is_survived_on_postgres(monkeypatch):
+    """Осиротевший прогон в конце подтверждённого сбора — настоящими командами.
+
+    На SQLite блокировок нет. Здесь `run` держит эксклюзивную блокировку сбора
+    до выхода из команды, а `roi refresh` и `reap-stale-runs` берут свои: весь
+    путь «сбор отложил расчёт → watcher снял сироту → тик посчитал» обязан
+    пройти без того, чтобы команды заперли друг друга.
+    """
+    from click.testing import CliRunner
+
+    from src._time import utcnow
+    from tests.test_roi_refresh import _cluster, _full_run
+    from tests.test_run_failure_semantics import _patch_verified_aloe_pipeline
+
+    base_url = os.environ.get("DATABASE_URL", "")
+    if not base_url.startswith("postgresql"):
+        pytest.skip("PostgreSQL DATABASE_URL is required")
+    database = f"roi_run_end_orphan_{os.getpid()}"
+    admin = create_engine(base_url, isolation_level="AUTOCOMMIT")
+    with admin.connect() as connection:
+        connection.execute(text(f"DROP DATABASE IF EXISTS {database}"))
+        connection.execute(text(f"CREATE DATABASE {database}"))
+    engine = create_engine(base_url.rsplit("/", 1)[0] + f"/{database}")
+    try:
+        storage.Base.metadata.create_all(engine)
+        Session = sessionmaker(engine, expire_on_commit=False, autoflush=False)
+        runner = CliRunner()
+        with Session() as session:
+            trusted = _full_run(session)
+            _cluster(
+                session, trusted, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5}
+            )
+            session.add(
+                storage.Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running")
+            )
+            session.commit()
+            _patch_verified_aloe_pipeline(session, monkeypatch)
+
+            with runner.isolated_filesystem():
+                # --force: у aloe в этом окне ритма уже есть полный сбор (фикстура).
+                finished = runner.invoke(
+                    main_mod.cli,
+                    ["run", "--site", "aloe", "--mode", "category", "--no-alerts", "--force"],
+                )
+        assert finished.exit_code == 0, finished.output
+
+        with Session() as session:
+            run = session.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+            assert (run.status, run.error_message) == ("ok", None)
+            assert session.scalars(select(storage.RoiActionsCache)).all() == []
+            owed = session.scalars(select(storage.RoiRefreshRequest)).all()
+            assert [(item.reason, item.status) for item in owed] == [
+                ("full_run_deferred", "pending")
+            ]
+
+        waiting = runner.invoke(main_mod.cli, ["roi", "refresh", "--pending"])
+        assert waiting.exit_code == 0, waiting.output
+        assert "отложено — есть незавершённый прогон" in waiting.output
+
+        reaped = runner.invoke(main_mod.cli, ["reap-stale-runs", "--max-age-hours", "0"])
+        assert reaped.exit_code == 0, reaped.output
+        assert "reaped 1 stale running run(s)" in reaped.output
+
+        computed = runner.invoke(main_mod.cli, ["roi", "refresh", "--pending"])
+        assert computed.exit_code == 0, computed.output
+        assert f"пересчитано по прогону #{run.id}" in computed.output
+
+        with Session() as session:
+            cached = roi.get_cached_actions(session, "pharmonline")
+            assert cached is not None
+            assert [item["type"] for item in cached] == ["price_raise"]
+            owed = session.scalars(select(storage.RoiRefreshRequest)).all()
+            assert [(item.reason, item.status) for item in owed] == [("full_run_deferred", "done")]
+    finally:
+        engine.dispose()
+        with admin.connect() as connection:
+            connection.execute(text(f"DROP DATABASE IF EXISTS {database}"))
+        admin.dispose()

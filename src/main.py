@@ -2293,11 +2293,13 @@ def _hold_scrape_lock_after_readers(SessionFactory) -> bool:
         time.sleep(_SCRAPE_LOCK_POLL_SECONDS)
 
 
-def _queue_roi_refresh_owed_by_run(session: Session, run: storage.Run) -> None:
+def _queue_roi_refresh_owed_by_run(
+    session: Session, run: storage.Run, *, reason: str = "partial_run"
+) -> None:
     """Заявка на пересчёт рекомендаций — в коммит самого прогона, без своего."""
     from src import roi_refresh
 
-    roi_refresh.request_refresh(session, tenant_id=run.tenant_id, reason="partial_run")
+    roi_refresh.request_refresh(session, tenant_id=run.tenant_id, reason=reason)
 
 
 def _request_roi_refresh(session: Session, *, reason: str, tenant_id: int = 1) -> None:
@@ -5648,18 +5650,38 @@ def run_cmd(
                     session,
                     tenant_id=run.tenant_id,
                 ):
-                    summary = _roi.refresh_all_cached_actions(
-                        session,
-                        run_id=run_id,
-                        tenant_id=run.tenant_id,
-                    )
-                    log.info("roi_cache_refreshed", run_id=run_id, **summary)
-                    failed_sites = [site for site, value in summary.items() if value < 0]
-                    if failed_sites:
-                        raise RuntimeError(
-                            "ROI refresh failed for trusted epoch: "
-                            + ",".join(sorted(failed_sites))
+                    try:
+                        summary = _roi.refresh_all_cached_actions(
+                            session,
+                            run_id=run_id,
+                            tenant_id=run.tenant_id,
                         )
+                    except _roi.RecommendationsNotComputed as not_computed:
+                        # Расчёт не состоялся, и виноват не этот сбор: его каталог
+                        # подтверждён, а считать помешало чужое состояние. Прогон
+                        # остаётся ok, кэш не пишется — пустой список в нём значил
+                        # бы «рекомендаций нет» до следующего полного сбора.
+                        log.warning(
+                            "roi_cache_refresh_deferred_not_computed",
+                            run_id=run_id,
+                            tenant_id=run.tenant_id,
+                            reason=not_computed.reason,
+                        )
+                        if not_computed.reason == _roi.NOT_COMPUTED_RUN_UNFINISHED:
+                            # Блокировка сбора у нас, значит чужой незавершённый
+                            # прогон — сирота упавшего процесса. Её снимет watcher
+                            # (`reap-stale-runs`), и он же исполнит эту заявку.
+                            # При прочих причинах заявку не ставим: пересчёт без
+                            # сбора упёрся бы в то же самое и закрыл её `skipped`.
+                            _queue_roi_refresh_owed_by_run(session, run, reason="full_run_deferred")
+                    else:
+                        log.info("roi_cache_refreshed", run_id=run_id, **summary)
+                        failed_sites = [site for site, value in summary.items() if value < 0]
+                        if failed_sites:
+                            raise RuntimeError(
+                                "ROI refresh failed for trusted epoch: "
+                                + ",".join(sorted(failed_sites))
+                            )
                 else:
                     # A verified per-site producer remains successful even when
                     # another site's latest full attempt is degraded or stale.

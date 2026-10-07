@@ -547,6 +547,145 @@ def test_verified_run_still_fails_when_ready_roi_refresh_returns_failure(
         verify.close()
 
 
+def _trusted_catalog_with_one_recommendation(db_session) -> None:
+    """Подтверждённый каталог всех сайтов и пара, по которой есть что советовать."""
+    from tests.test_roi_refresh import _cluster, _full_run
+
+    trusted = _full_run(db_session)
+    _cluster(db_session, trusted, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+
+
+def _run_verified_aloe(request_id: int):
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        return runner.invoke(
+            main_mod.cli,
+            [
+                "run",
+                "--site",
+                "aloe",
+                "--mode",
+                "category",
+                "--no-alerts",
+                "--request-id",
+                str(request_id),
+            ],
+        )
+
+
+def test_orphan_run_neither_fails_a_verified_run_nor_empties_recommendations(
+    db_session,
+    monkeypatch,
+):
+    """Строка `running` от упавшего раньше тика мешает расчёту в конце сбора.
+
+    Сбор от этого не становится failed, а в кэш не ложится пустой список —
+    дашборд показывал бы «Нет рекомендаций» до следующего полного сбора. Прогон
+    оставляет заявку; watcher снимает сироту и тем же тиком считает.
+    """
+    from src import roi, roi_refresh
+
+    _trusted_catalog_with_one_recommendation(db_session)
+    orphan = storage.Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running")
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add_all([orphan, request])
+    db_session.commit()
+    request_id = request.id
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+
+    result = _run_verified_aloe(request_id)
+
+    assert result.exit_code == 0, result.output
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        saved_request = verify.get(storage.ScrapeRequest, request_id)
+        assert run is not None
+        assert run.status == "ok"
+        assert run.catalog_verified is True
+        assert run.error_message is None
+        assert saved_request is not None
+        assert saved_request.status == "ok"
+        assert verify.scalars(select(storage.RoiActionsCache)).all() == []
+        assert roi.get_cached_actions(verify, "pharmonline") is None
+        owed = verify.scalars(select(storage.RoiRefreshRequest)).all()
+        assert [(item.reason, item.status) for item in owed] == [("full_run_deferred", "pending")]
+
+        # Пока сирота висит, пересчёт ждёт и заявку не закрывает.
+        assert roi_refresh.run_refresh(verify, only_if_requested=True).outcome == "busy"
+        assert main_mod.reap_stale_running_runs(verify, max_age_hours=0) == 1
+        refreshed = roi_refresh.run_refresh(verify, only_if_requested=True)
+
+        assert (refreshed.outcome, refreshed.run_id) == ("refreshed", run.id)
+        cached = roi.get_cached_actions(verify, "pharmonline")
+        assert cached is not None
+        assert [item["type"] for item in cached] == ["price_raise"]
+    finally:
+        verify.close()
+
+
+def test_closed_policy_gate_neither_fails_a_verified_run_nor_empties_recommendations(
+    db_session,
+    monkeypatch,
+):
+    """Гейт политики закрыт: расчёта нет, но и ответа «рекомендаций нет» тоже.
+
+    Заявка не ставится: пересчёт без сбора упёрся бы в тот же гейт и закрыл её
+    `skipped` — открывает его только следующий подтверждённый полный сбор.
+    """
+    from src import product_policy, roi
+
+    _trusted_catalog_with_one_recommendation(db_session)
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add(request)
+    db_session.commit()
+    request_id = request.id
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+    monkeypatch.setattr(
+        product_policy,
+        "policy_rollout_eligibility",
+        lambda *args, **kwargs: product_policy.Eligibility(False, "full_catalog_trust_not_ready"),
+    )
+
+    result = _run_verified_aloe(request_id)
+
+    assert result.exit_code == 0, result.output
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        assert run is not None
+        assert run.status == "ok"
+        assert run.error_message is None
+        assert verify.scalars(select(storage.RoiActionsCache)).all() == []
+        assert roi.get_cached_actions(verify, "pharmonline") is None
+        assert verify.scalars(select(storage.RoiRefreshRequest)).all() == []
+    finally:
+        verify.close()
+
+
+def test_verified_run_writes_recommendations_when_nothing_blocks_them(db_session, monkeypatch):
+    """Парный к двум тестам выше: та же обвязка без помехи кэш пишет."""
+    from src import roi
+
+    _trusted_catalog_with_one_recommendation(db_session)
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add(request)
+    db_session.commit()
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+
+    result = _run_verified_aloe(request.id)
+
+    assert result.exit_code == 0, result.output
+    verify = _session_factory(db_session)()
+    try:
+        cached = roi.get_cached_actions(verify, "pharmonline")
+        assert cached is not None
+        assert [item["type"] for item in cached] == ["price_raise"]
+        assert verify.scalars(select(storage.RoiRefreshRequest)).all() == []
+    finally:
+        verify.close()
+
+
 def test_incomplete_full_run_is_degraded_and_stops_before_consumers(db_session, monkeypatch):
     from src import alerts, roi
 

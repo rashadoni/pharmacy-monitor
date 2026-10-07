@@ -328,7 +328,9 @@ sudo systemctl reload nginx
   остаётся, до пересчёта видны прежние рекомендации; `pharmacy-monitor rematch`
   без `--dry-run`; любой `run`, который сам кэш не пишет (сбор одной категории
   по кнопке, watchlist-тик) — его матчер тоже меняет пары. Подтверждение пары (`/confirm`) заявку не кладёт: оно меняет
-  только флаги, которых расчёт не читает.
+  только флаги, которых расчёт не читает. Подтверждённый полный сбор кладёт
+  заявку `full_run_deferred`, когда посчитать в его конце помешал осиротевший
+  незавершённый прогон: сам сбор при этом `ok`, кэш он не пишет.
 - **Кто исполняет:** тик `pharmacy-monitor-scrape-watcher.timer` (раз в минуту)
   зовёт `pharmacy-monitor roi refresh --pending`. Сам пересчёт — около минуты.
   Скрипт watcher'а исполняется из чекаута (`infra/server/watch-scrape-queue.sh`)
@@ -352,6 +354,7 @@ journalctl -u pharmacy-monitor-scrape-watcher.service --since -1h -o cat | grep 
 |---|---|
 | `skipped`, в `detail` сайт и прогон (`pharmonline:run=986,status=failed`) | У сайта нет свежего подтверждённого каталога — считать не от чего. Рекомендаций нет и без всякой заявки; вернёт их только подтверждённый полный сбор этого сайта, он же пересчитает кэш. Чинить сбор, а не очередь. |
 | `pending` дольше пары минут, в журнале `отложено — …` | Идёт сбор, rematch или висит незавершённый прогон. Пересчёт не читает каталог и пары, пока те пишутся; после заявку подберёт следующий тик. Осиротевший прогон watcher снимает сам через 6 часов (`reap-stale-runs`). |
+| `full_run_deferred` в `pending`, дашборд часами пишет «пересчитываются» | Полный сбор прошёл и подтверждён, но в его конце висел осиротевший прогон упавшего раньше тика (в журнале сбора — `roi_cache_refresh_deferred_not_computed reason=run_unfinished`). Рекомендации вернутся сами, когда watcher снимет сироту — через 6 часов после её старта. Какой прогон мешает: `select id, started_at, status from runs where finished_at is null`. Ждать не обязательно: снять её командой ниже — следующий тик посчитает. |
 | `pending`, а в журнале нет строк `roi refresh` | Watcher не доходит до пересчёта: таймер остановлен, или на проде старый `watch-scrape-queue.sh` (сверить `sha256sum` с репозиторием). health-check поднимает `roi_refresh_stuck`, когда из ожидания заявки больше получаса не шёл ни один прогон. |
 | `failed`, `detail` = `sites:…` или `error:…` | Пересчёт упал: срез (`sites:`) или весь расчёт (`error:` — ошибка базы посреди работы). Устаревший кэш удалён. Пересчёт сам ставит себе один повтор (заявка `retry_after_failure`); если упал и он — health-check показывает `roi_refresh_failed`. Причина — в журнале по `roi_actions_cache_failed` и `roi_refresh_crashed`. Повторить руками: команда ниже. |
 
@@ -363,6 +366,16 @@ journalctl -u pharmacy-monitor-scrape-watcher.service --since -1h -o cat | grep 
 systemd-run --quiet --wait --pipe --collect -p User=pm -p Group=pm \
   -p EnvironmentFile=/etc/pharmacy-monitor/env -p WorkingDirectory=/opt/pharmacy-monitor \
   /opt/pharmacy-monitor/.venv/bin/pharmacy-monitor roi refresh
+```
+
+Снять осиротевший прогон, не дожидаясь шести часов. Команда берёт блокировку
+сбора и отказывается (`recovery refused`), пока идёт `run`, `scrape`, тик или
+`rematch`, так что живой прогон она не тронет:
+
+```bash
+systemd-run --quiet --wait --pipe --collect -p User=pm -p Group=pm \
+  -p EnvironmentFile=/etc/pharmacy-monitor/env -p WorkingDirectory=/opt/pharmacy-monitor \
+  /opt/pharmacy-monitor/.venv/bin/pharmacy-monitor reap-stale-runs --max-age-hours 0
 ```
 
 Без `--pending` команда считает всегда и выходит с кодом 1, если посчитать не

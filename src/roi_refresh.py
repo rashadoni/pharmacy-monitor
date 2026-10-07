@@ -153,9 +153,9 @@ def refresh_from_trusted_epoch(session: Session, *, tenant_id: int = 1) -> Refre
 def _refresh_locked(session: Session, *, tenant_id: int) -> RefreshResult:
     from src.product_policy import policy_rollout_eligibility, trusted_catalog_epoch
 
-    # Каждая проверка ниже повторяет ту, на которой `_compute_actions_locked`
-    # молча вернул бы пустой список. Здесь пустой список нельзя отличить от
-    # «рекомендаций нет», и он лёг бы в кэш как настоящий ответ.
+    # Проверки ниже повторяют те, на которых расчёт отказывается сам
+    # (`roi.RecommendationsNotComputed`). Здесь они затем, чтобы назвать исход
+    # до расчёта: незавершённый прогон — подождать, нет доверия — закрыть заявку.
     if storage.has_unfinished_run(session, tenant_id=tenant_id):
         return RefreshResult("busy", reason="run_unfinished")
 
@@ -173,6 +173,16 @@ def _refresh_locked(session: Session, *, tenant_id: int) -> RefreshResult:
 
     try:
         counts = roi.refresh_all_cached_actions(session, run_id=anchor.id, tenant_id=tenant_id)
+    except roi.RecommendationsNotComputed as not_computed:
+        # Проверки выше прошли, а расчёт отказался: что-то переменилось посреди
+        # него (вход перешагнул порог свежести между срезами). Это не сбой:
+        # заявку не закрываем и повтор не ставим — следующий тик пройдёт те же
+        # проверки заново и назовёт исход точно. Но часть срезов уже переписана,
+        # а часть осталась от прошлого расчёта; такой кэш не оставляем, как и
+        # при сбое ниже.
+        _drop_cache(session, tenant_id=tenant_id)
+        session.commit()
+        return RefreshResult("busy", reason=not_computed.reason)
     except Exception as exc:
         # Ошибка уровня базы посреди расчёта (оборванное соединение, прерванная
         # транзакция) обходит разбор «срез упал» внутри
