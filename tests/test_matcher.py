@@ -720,9 +720,14 @@ class TestHasConflictingVariantTokens:
             )
             is True
         )
-        # «d3» (2 символа, буква+цифра) — значащий код витамина → блокируем
-        # Makson ≠ Makson D3
-        assert _has_conflicting_variant_tokens("makson maxon", "makson d3") is True
+        # «d3» (2 символа, буква+цифра) — значащий код витамина → блокируем,
+        # когда у другой стороны есть своё уникальное слово
+        assert _has_conflicting_variant_tokens("makson kids", "makson d3") is True
+        # «maxon» — латинское написание того же «makson» (aptekonline дописывает
+        # его в скобках), а не признак варианта: остаётся опущение «d3» у одной
+        # стороны, как у «DetriBus» / «DetriBus D3». На проде это один товар:
+        # «Makson damcı 20 ml (Maxon)» и «Makson D3 20 ml (Damcı)», цена 20.5 / 20.0.
+        assert _has_conflicting_variant_tokens("makson maxon", "makson d3") is False
         # «2x» (2 символа, буква+цифра) — значащий формульный код → блокируем
         assert (
             _has_conflicting_variant_tokens("amoksiklav 2x", "amoksiklav") is False
@@ -1016,8 +1021,11 @@ class TestTwoCharAlphaVariantCodes:
     def test_sk_vs_gk_blocked(self):
         assert _has_conflicting_variant_tokens("akriderm sk", "akriderm gk") is True
 
-    def test_qk_vs_gk_blocked(self):
-        assert _has_conflicting_variant_tokens("akriderm qk", "akriderm gk") is True
+    def test_qk_and_gk_are_one_code(self):
+        # «QK» — азербайджанская запись «GK» (q = g): на проде «Akriderm GK 15 q»
+        # (aloe) и «Akriderm QK krem 15 q» (aptekonline, pharmonline) — один
+        # кластер с одной ценой. Разные формулы — SK и GK, см. тесты выше.
+        assert _has_conflicting_variant_tokens("akriderm qk", "akriderm gk") is False
 
     def test_same_code_allowed(self):
         # Оба SK — один и тот же вариант → матч разрешён

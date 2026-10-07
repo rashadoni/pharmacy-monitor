@@ -425,8 +425,8 @@ class SiteStaleness(BaseModel):
     across all products tagged with `site`. `cadence_hours` is how often that
     site is scheduled for a full scan, and `max_age_hours` is the staleness
     threshold derived from it (cadence + retry margin). The cadence is NOT the
-    same for every site: aloe and pharmonline run daily, aptekonline weekly —
-    so a card must be coloured against its own schedule, not a global one.
+    same for every site by design (see ``src/cadence.py``), so a card must be
+    coloured against its own schedule, not a global one.
     """
 
     site: str
@@ -915,6 +915,10 @@ def _trusted_snapshot_lineage_available(
     Shadow mode therefore keeps the latest effective snapshots until a full
     cross-site trusted epoch exists. Enforce mode remains fail-closed in
     ``_require_financial_policy_ready`` above.
+
+    Within an epoch an unchanged price is still trusted: the verified run
+    confirms the snapshot it compared against, see
+    ``storage.trusted_snapshot_filter``.
     """
     from src.product_policy import trusted_catalog_epoch
 

@@ -497,6 +497,54 @@ def test_new_product_detected(db_session):
     assert "New SKU" in fired[0].title
 
 
+def _add_untrusted_run(s, started_at) -> Run:
+    """Частичный тик: status=ok, но денежным выводам не доверен."""
+    run = Run(
+        started_at=started_at,
+        finished_at=started_at + timedelta(minutes=1),
+        status="ok",
+        catalog_scope="partial",
+        run_quality={"financially_eligible": False},
+    )
+    s.add(run)
+    s.flush()
+    return run
+
+
+def test_new_product_ignores_old_product_without_trusted_price(db_session):
+    """2026-10-04: 774 товара с мая объявлены «новыми» — у них просто не было
+    проверенной цены, пока она не изменилась."""
+    tick = _add_untrusted_run(db_session, utcnow() - timedelta(days=30))
+    _add_run(db_session, utcnow() - timedelta(days=7))
+    today = _add_run(db_session, utcnow())
+    old = _add_product(db_session, "aloe", "On the shelf since spring", "old")
+    old.first_seen_at = utcnow() - timedelta(days=30)
+    _add_snap(db_session, tick, old, 5.0)
+    _add_snap(db_session, today, old, 6.0)
+    _add_rule(db_session, "new_product")
+    db_session.commit()
+
+    assert alerts.evaluate_rules(db_session, today.id) == []
+
+
+def test_new_product_first_seen_by_untrusted_run_is_still_reported(db_session):
+    """Товар появился между проверенными сборами, первым его увидел тик, а
+    проверенный сбор застал уже другую цену (иначе своей записи у него нет)."""
+    _add_run(db_session, utcnow() - timedelta(days=7))
+    tick = _add_untrusted_run(db_session, utcnow() - timedelta(days=2))
+    today = _add_run(db_session, utcnow())
+    fresh = _add_product(db_session, "aloe", "Arrived this week", "fresh")
+    fresh.first_seen_at = utcnow() - timedelta(days=2)
+    _add_snap(db_session, tick, fresh, 5.0)
+    _add_snap(db_session, today, fresh, 6.0)
+    _add_rule(db_session, "new_product")
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, today.id)
+    assert [event.rule_type for event in fired] == ["new_product"]
+    assert "Arrived this week" in fired[0].title
+
+
 def test_new_product_explicit_oos_no_fire(db_session):
     today = _add_run(db_session, utcnow())
     product = _add_product(db_session, "aloe", "Unavailable new", "new-oos")
