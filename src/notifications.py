@@ -629,7 +629,7 @@ def _digest_selection(
     for bucket in ("critical", "warning"):
         wanted: dict[str, list[storage.AlertEvent]] = {}
         for rule_type, group in groups:
-            room = _DIGEST_TYPE_CAP - len(chosen[rule_type])
+            room = max(0, _DIGEST_TYPE_CAP - len(chosen[rule_type]))
             events = largest_first(group, bucket)[:room]
             if events:
                 wanted[rule_type] = events
@@ -644,7 +644,7 @@ def _digest_selection(
 
     for rule_type, group in groups:
         events = largest_first(group, "info")
-        room = min(_DIGEST_TYPE_CAP - len(chosen[rule_type]), budget)
+        room = max(0, min(_DIGEST_TYPE_CAP - len(chosen[rule_type]), budget))
         if len(events) > room:
             if not any(_event_magnitude(e) for e in events):
                 continue

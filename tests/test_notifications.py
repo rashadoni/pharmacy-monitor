@@ -774,7 +774,7 @@ def test_digest_rows_are_shared_between_types_of_same_severity():
 
 
 def test_digest_info_type_is_listed_whole_or_counted():
-    """Информационный тип идёт строками, только если помещается целиком."""
+    """Информационный тип без процента: помещается — целиком, нет — числом."""
     fits = [
         _loose_event("price_raise_opportunity", "info", f"RAISE{i:02d}")
         for i in range(notifications._DIGEST_TYPE_CAP)
