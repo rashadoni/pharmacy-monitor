@@ -80,6 +80,10 @@ def _format_event_text(event: storage.AlertEvent) -> str:
     return out
 
 
+# По этой полосе слева строка-событие узнаётся в готовом письме.
+_EVENT_ROW_MARK = "border-left:3px solid"
+
+
 def _clip(text: str | None, limit: int) -> str:
     text = text or ""
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
@@ -104,7 +108,7 @@ def _format_event_html(event: storage.AlertEvent) -> str:
     detail = escape(_clip(event.detail, 200), quote=False)
     return f"""
 <tr>
-  <td style="padding:10px;border-left:3px solid {color};background:#fafafa;">
+  <td style="padding:10px;{_EVENT_ROW_MARK} {color};background:#fafafa;">
     <div style="font-size:11px;color:#71717a;text-transform:uppercase;font-weight:600;">
       {escape(event.severity or "", quote=False)} · {when}
     </div>
@@ -310,16 +314,48 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
 # ─── Daily / weekly digest ───────────────────────────────────────────────────
 
 
-def send_daily_digest(session: Session, tenant_id: int = 1) -> int:
+def send_daily_digest(
+    session: Session, tenant_id: int = 1, *, only_email: str | None = None, dry_run: bool = False
+) -> int:
     """Send daily digest to opted-in users. Returns count of emails sent."""
-    return _send_digest(session, tenant_id, kind="daily", since=utcnow() - timedelta(hours=24))
+    return _send_digest(
+        session,
+        tenant_id,
+        kind="daily",
+        since=utcnow() - timedelta(hours=24),
+        only_email=only_email,
+        dry_run=dry_run,
+    )
 
 
-def send_weekly_digest(session: Session, tenant_id: int = 1) -> int:
-    return _send_digest(session, tenant_id, kind="weekly", since=utcnow() - timedelta(days=7))
+def send_weekly_digest(
+    session: Session, tenant_id: int = 1, *, only_email: str | None = None, dry_run: bool = False
+) -> int:
+    return _send_digest(
+        session,
+        tenant_id,
+        kind="weekly",
+        since=utcnow() - timedelta(days=7),
+        only_email=only_email,
+        dry_run=dry_run,
+    )
 
 
-def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -> int:
+def _send_digest(
+    session: Session,
+    tenant_id: int,
+    kind: str,
+    since: datetime,
+    *,
+    only_email: str | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Собрать и разослать дайджест. Возвращает число получателей.
+
+    `only_email` — отправить одному получателю из включивших дайджест: так
+    письмо смотрят на живых данных, не трогая остальных. `dry_run` — собрать
+    письма и записать в лог тему, размер и число строк, ничего не отправляя.
+    """
     users = session.scalars(
         select(storage.TenantUser).where(
             storage.TenantUser.tenant_id == tenant_id,
@@ -329,6 +365,8 @@ def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -
             else storage.TenantUser.weekly_digest.is_(True),
         )
     ).all()
+    if only_email:
+        users = [u for u in users if u.email.lower() == only_email.strip().lower()]
     if not users:
         log.info("digest_no_recipients", kind=kind, tenant=tenant_id)
         return 0
@@ -358,12 +396,28 @@ def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -
             rendered[threshold] = _render_digest_email(
                 events, kind=kind, since=since, severity_min=threshold
             )
+        if dry_run:
+            log.info(
+                "digest_dry_run",
+                kind=kind,
+                user=user.email,
+                subject=subject,
+                kb=round(len(rendered[threshold].encode()) / 1024, 1),
+                rows=rendered[threshold].count(_EVENT_ROW_MARK),
+            )
+            sent += 1
+            continue
         try:
             notifier.send_email(subject=subject, html_body=rendered[threshold], to=[user.email])
             sent += 1
         except Exception as e:
             log.warning("digest_email_failed", user=user.email, kind=kind, error=str(e))
-    log.info("digest_sent", kind=kind, recipients=sent, events=len(events))
+    log.info(
+        "digest_dry_run_done" if dry_run else "digest_sent",
+        kind=kind,
+        recipients=sent,
+        events=len(events),
+    )
     return sent
 
 
@@ -414,7 +468,7 @@ def _render_single_event_email(event: storage.AlertEvent) -> str:
     return f"""
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>{event.title}</title></head>
+<head><meta charset="utf-8"><title>{escape(event.title or "", quote=False)}</title></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
   <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
     <tr><td style="padding:24px;border-bottom:1px solid #e4e4e7;">
@@ -441,9 +495,10 @@ def _render_single_event_email(event: storage.AlertEvent) -> str:
 
 # Строк на один тип события; сверх этого — только самые крупные.
 _DIGEST_TYPE_CAP = 30
-# Строк на всё письмо. Вместе с обрезкой в `_format_event_html` держит HTML под
-# 102 КБ даже на самых длинных названиях — больший объём Gmail сворачивает
-# («Message clipped»), и конец письма со ссылкой на дашборд пропадает.
+# Строк на всё письмо. Gmail сворачивает письмо после 102 КБ («Message clipped»),
+# и конец со ссылкой на дашборд пропадает. 60 строк с самыми длинными названиями
+# из боевых данных — 62 КБ, обычное письмо — 20–35 КБ. Это потолок по числу
+# строк, а не по байтам: названия из одних `&` или эмодзи дали бы больше.
 _DIGEST_ROW_BUDGET = 60
 
 # Подписи типов; порядок — порядок в письме при равной важности.
@@ -471,8 +526,13 @@ def _digest_bucket(severity: str | None) -> str:
     return severity if severity in ("critical", "warning") else "info"
 
 
+def _payload(event: storage.AlertEvent) -> dict:
+    """payload — колонка JSON: там может оказаться и не словарь."""
+    return event.payload if isinstance(event.payload, dict) else {}
+
+
 def _event_magnitude(event: storage.AlertEvent) -> float:
-    payload = event.payload or {}
+    payload = _payload(event)
     for key in _MAGNITUDE_KEYS:
         value = payload.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -516,7 +576,7 @@ def _site_phrase(events: Iterable[storage.AlertEvent]) -> str:
     """«aloe 1 900, pharmonline 9» — пусто, если у событий типа нет сайта."""
     counts: dict[str, int] = {}
     for e in events:
-        site = (e.payload or {}).get("site")
+        site = _payload(e).get("site")
         if isinstance(site, str) and site:
             counts[site] = counts.get(site, 0) + 1
     ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -546,22 +606,48 @@ def _digest_listable(event: storage.AlertEvent, severity_min: str) -> bool:
     return _severity_passes(severity_min, _digest_bucket(event.severity), DEFAULT_EMAIL_SEVERITY)
 
 
-def _digest_rows(
-    group: list[storage.AlertEvent], severity_min: str, limit: int
-) -> list[storage.AlertEvent]:
-    """Какие события одного типа идут в письмо строками.
+def _digest_selection(
+    groups: list[tuple[str, list[storage.AlertEvent]]], severity_min: str
+) -> dict[str, list[storage.AlertEvent]]:
+    """Какие события идут в письмо строками, по типам.
 
-    Ниже порога получателя — никогда: они остаются числом в сводке. Если
-    остальное не помещается в `limit`, строками идут только критичные и
-    предупреждения, самые крупные. Информационные тогда тоже остаются числом:
+    Ниже порога получателя — никогда: они остаются числом в сводке.
+
+    Строки раздаются по важности: сначала критичные всех типов, потом
+    предупреждения, потом информационные — иначе предупреждения одного типа
+    вытеснили бы критичные другого. Внутри одной важности остаток делится между
+    типами поровну (типу не дают больше, чем у него есть), так что сотня падений
+    цены не оставит без строк пять «конкурент дешевле». Внутри типа идут самые
+    крупные по проценту.
+
+    Информационные события идут строками, только если тип помещается целиком:
     тридцать случайных «новых товаров» из двух тысяч ничего не сообщают.
     """
-    rows = [e for e in group if _digest_listable(e, severity_min)]
-    # Сортировка устойчивая: при равном размере сохраняется порядок «новые сверху».
-    rows.sort(key=lambda e: (_BUCKET_RANK[_digest_bucket(e.severity)], -_event_magnitude(e)))
-    if len(rows) > limit:
-        rows = [e for e in rows if _digest_bucket(e.severity) != "info"][:limit]
-    return rows
+    chosen: dict[str, list[storage.AlertEvent]] = {rule_type: [] for rule_type, _ in groups}
+    budget = _DIGEST_ROW_BUDGET
+    for bucket in _BUCKET_RANK:
+        wanted: dict[str, list[storage.AlertEvent]] = {}
+        for rule_type, group in groups:
+            events = [
+                e
+                for e in group
+                if _digest_bucket(e.severity) == bucket and _digest_listable(e, severity_min)
+            ]
+            room = _DIGEST_TYPE_CAP - len(chosen[rule_type])
+            if not events or (bucket == "info" and len(events) > room):
+                continue
+            # Сортировка устойчивая: при равном размере остаётся порядок «новые сверху».
+            events.sort(key=lambda e: -_event_magnitude(e))
+            wanted[rule_type] = events[:room]
+        # Сначала типы, которым нужно меньше: их недобор достаётся остальным.
+        for i, rule_type in enumerate(sorted(wanted, key=lambda t: len(wanted[t]))):
+            share = budget // (len(wanted) - i)
+            if bucket == "info" and len(wanted[rule_type]) > share:
+                continue
+            taken = wanted[rule_type][:share]
+            chosen[rule_type].extend(taken)
+            budget -= len(taken)
+    return chosen
 
 
 def _alerts_url(kind: str, **filters: str) -> str:
@@ -659,16 +745,15 @@ def _render_digest_email(
     threshold = severity_min or "info"
     total = len(events)
 
-    summary_rows: list[str] = []
-    blocks: list[str] = []
-    budget = _DIGEST_ROW_BUDGET
-    for rule_type, group in _digest_groups(events):
-        summary_rows.append(_digest_summary_row(rule_type, group, kind))
-        rows = _digest_rows(group, threshold, min(_DIGEST_TYPE_CAP, budget))
-        if rows:
-            budget -= len(rows)
-            blocks.append(_digest_block(rule_type, group, rows, kind))
-    listed = _DIGEST_ROW_BUDGET - budget
+    groups = _digest_groups(events)
+    chosen = _digest_selection(groups, threshold)
+    summary_rows = [_digest_summary_row(rule_type, group, kind) for rule_type, group in groups]
+    blocks = [
+        _digest_block(rule_type, group, chosen[rule_type], kind)
+        for rule_type, group in groups
+        if chosen[rule_type]
+    ]
+    listed = sum(len(rows) for rows in chosen.values())
 
     if listed == total:
         scope_note = ""
@@ -713,7 +798,7 @@ def _render_digest_email(
     <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
       <a href="{_alerts_url(kind)}" style="color:#3b82f6;">Все события за {period_name} — в дашборде →</a>
       <br><br>
-      {threshold_note}Кому приходит дайджест и с какого порога важности — настраивается в дашборде: Настройки → Пользователи.
+      {threshold_note}Отписаться или изменить порог важности: администратор делает это в дашборде, Настройки → Пользователи.
     </td></tr>
   </table>
 </body>
