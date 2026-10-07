@@ -21,7 +21,15 @@ from src import main as main_mod
 from src import roi, roi_refresh, storage, tenants
 from src._time import utcnow
 from src.cadence import site_max_age_hours
-from src.storage import Match, PriceSnapshot, Product, RoiActionsCache, RoiRefreshRequest, Run
+from src.storage import (
+    Match,
+    MatchRejection,
+    PriceSnapshot,
+    Product,
+    RoiActionsCache,
+    RoiRefreshRequest,
+    Run,
+)
 
 SITES = ("pharmonline", "aptekonline", "aloe")
 
@@ -676,6 +684,39 @@ def test_rejected_match_leaves_recommendations_without_a_scrape(client, api_db):
     assert fresh["provenance"]["run_id"] == run.id
     assert _run_count(api_db) == runs_before
     assert [(r.reason, r.status) for r in _requests(api_db)] == [("match_reject", "done")]
+
+
+def test_reject_does_not_reach_a_match_of_another_tenant(client, api_db):
+    """Пара чужого тенанта по id не отклоняется: для пользователя её нет (404)."""
+    foreign = Match(tenant_id=2, canonical_name="Paracetamol", confidence=1.0)
+    api_db.add(foreign)
+    api_db.flush()
+    api_db.add_all(
+        Product(
+            tenant_id=2,
+            site=site,
+            external_id=f"foreign-{site}",
+            url=f"http://{site}.az/p/foreign",
+            name="Paracetamol",
+            name_normalized="paracetamol",
+            canonical_id=foreign.id,
+        )
+        for site in ("pharmonline", "aptekonline")
+    )
+    api_db.commit()
+    foreign_id = foreign.id
+
+    response = client.post(f"/api/v1/dash/matches/{foreign_id}/reject")
+
+    assert response.status_code == 404
+    # Ответ самого эндпоинта, а не роутера: тот же, что для несуществующего id.
+    assert response.json() == {"detail": "Match not found"}
+    api_db.expire_all()
+    assert api_db.get(Match, foreign_id) is not None
+    still_paired = api_db.scalars(select(Product.site).where(Product.canonical_id == foreign_id))
+    assert sorted(still_paired) == ["aptekonline", "pharmonline"]
+    assert api_db.scalar(select(func.count(MatchRejection.id))) == 0
+    assert _requests(api_db) == []
 
 
 def test_purchase_cost_import_and_its_rollback_reach_recommendations(client, api_db):

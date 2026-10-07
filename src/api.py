@@ -5105,7 +5105,11 @@ def dash_match_reject(
     """Manually reject a match: remove canonical_id from products + record rejection pair."""
     from src import match_actions
 
-    match = db.scalar(select(storage.Match).where(storage.Match.id == match_id))
+    match = db.scalar(
+        select(storage.Match).where(
+            storage.Match.id == match_id, storage.Match.tenant_id == user.tenant_id
+        )
+    )
     if not match:
         raise HTTPException(404, "Match not found")
     products = list(match.products)
