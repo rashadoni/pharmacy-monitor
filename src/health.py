@@ -211,6 +211,29 @@ def check_health(
                 and quality.get("financially_eligible") is True
                 and site_status == "ok"
             )
+            if verified:
+                # Гвард ритма в `run` пропускает лишние ночи молча (exit 0, без
+                # прогона), а `site_silent` за этим не уследит: частичный тик
+                # освежает `last_seen_at` и без полного сбора. Поэтому возраст
+                # последнего подтверждённого полного сбора сверяем напрямую.
+                overdue_after = _SITE_MAX_AGE_HOURS.get(site, max_age_hours)
+                age_hours = _run_age_hours(attempt)
+                if age_hours > overdue_after:
+                    report.issues.append(
+                        HealthIssue(
+                            "critical",
+                            "full_catalog_overdue",
+                            f"Полный сбор {site} не проходил {age_hours:.0f}ч "
+                            f"(порог {overdue_after}ч). Плановый запуск не собирает "
+                            "или не срабатывает.",
+                            context={
+                                "site": site,
+                                "run_id": attempt.id,
+                                "hours_ago": age_hours,
+                                "threshold_hours": overdue_after,
+                            },
+                        )
+                    )
             if not verified:
                 prior = fresh_verified_catalogs.get(site)
                 fresh_fallback = prior is not None and _run_explicitly_rejected_site(attempt, site)
@@ -290,7 +313,7 @@ def check_health(
 
     # 8. Полный отказ сайта: последний прогон, включавший сайт, собрал РОВНО 0
     # товаров → немедленный сигнал (critical, если нет свежего подтверждённого
-    # каталога), не дожидаясь суточного порога site_silent. Раньше это терялось:
+    # каталога), не дожидаясь порога site_silent. Раньше это терялось:
     # smoke-test пропускал `current == 0`, а
     # `empty_run` смотрит только на последний прогон в принципе (его маскировал
     # intraday-прогон другого сайта).

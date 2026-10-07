@@ -33,6 +33,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from src._time import utcnow
+from src.cadence import site_max_age_hours
 
 from src import storage  # for load_pricing_config + RoiActionsCache
 from src.storage import (
@@ -140,9 +141,19 @@ def _preload_snapshots(
 # 15с возвращал 408 на 4 экранах из 11 (P0.1 PO Audit). Решение:
 # pre-compute после scrape success → DB-cache → serve из кэша.
 
+# Порог свежести входных данных для сайта без объявленного ритма сбора.
+_UNDECLARED_SITE_MAX_AGE_HOURS = 26
+
 # Cache freshness threshold. Старше — игнорируем и показываем unavailable;
 # inline fallback запрещён, потому что он может прочитать непроверенные данные.
-_CACHE_MAX_AGE_HOURS = 26
+#
+# Кэш пишется один раз — в конце подтверждённого полного сбора, поэтому жить он
+# обязан не меньше, чем длится ритм сбора (src/cadence.py). Здесь стояли 26ч, и
+# при недельном ритме рекомендации были бы видны сутки после понедельничного
+# сбора и скрыты до следующего. Настоящую свежесть проверяют
+# `financial_inputs_are_fresh`, эпоха каталога и проверка superseded; этот порог
+# — только страховка поверх них.
+_CACHE_MAX_AGE_HOURS = max(site_max_age_hours(site) for site in ALL_SITES)
 
 
 def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
@@ -194,7 +205,7 @@ def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
         run = runs.get(run_id)
         if run is None:
             return False
-        max_age_hours = _SITE_MAX_AGE_HOURS.get(site, _CACHE_MAX_AGE_HOURS)
+        max_age_hours = _SITE_MAX_AGE_HOURS.get(site, _UNDECLARED_SITE_MAX_AGE_HOURS)
         if now - run.started_at > timedelta(hours=max_age_hours):
             return False
     return True

@@ -385,6 +385,64 @@ def test_stale_run_follows_the_most_frequent_site(db_session, monkeypatch):
     assert any(i.code == "stale_run" for i in rep.issues)
 
 
+def _verified_full_run(db_session, *, hours_ago: float):
+    run = _add_run(db_session, utcnow() - timedelta(hours=hours_ago))
+    run.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {
+            "pharmonline": {"status": "ok"},
+            "aptekonline": {"status": "ok"},
+            "aloe": {"status": "ok"},
+        },
+    }
+    return run
+
+
+def test_overdue_full_collection_is_reported_even_when_partial_ticks_keep_the_site_fresh(
+    db_session,
+):
+    """Недельный сбор перестал происходить, а частичные тики идут.
+
+    Плановый запуск внутри недели выходит молча, поэтому «сбор не случился»
+    нельзя оставлять на `site_silent`: тик освежает `last_seen_at` товаров
+    aloe, и сайт выглядит живым сколько угодно долго.
+    """
+    _verified_full_run(db_session, hours_ago=200)
+    tick = Run(
+        started_at=utcnow() - timedelta(hours=1),
+        finished_at=utcnow() - timedelta(hours=1),
+        status="ok",
+        products_scraped=10,
+        catalog_scope="partial",
+    )
+    db_session.add(tick)
+    db_session.flush()
+    _add_snap(db_session, tick, "aloe", 10)
+    db_session.commit()
+
+    rep = check_health(db_session)
+
+    overdue = {i.context["site"] for i in rep.issues if i.code == "full_catalog_overdue"}
+    silent = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
+    assert "aloe" in overdue
+    assert "aloe" not in silent
+    assert rep.status == "critical"
+
+
+def test_full_collection_inside_its_cadence_is_not_overdue(db_session):
+    """Шестой день после недельного сбора — штатно."""
+    run = _verified_full_run(db_session, hours_ago=150)
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        _add_snap(db_session, run, site, 10, last_seen_at=utcnow() - timedelta(hours=150))
+    db_session.commit()
+
+    rep = check_health(db_session)
+
+    assert not any(i.code == "full_catalog_overdue" for i in rep.issues)
+
+
 def test_failed_run_critical(db_session):
     _add_run(db_session, utcnow() - timedelta(hours=1), status="failed")
     db_session.commit()

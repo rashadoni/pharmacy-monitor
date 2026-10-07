@@ -425,8 +425,8 @@ class SiteStaleness(BaseModel):
     across all products tagged with `site`. `cadence_hours` is how often that
     site is scheduled for a full scan, and `max_age_hours` is the staleness
     threshold derived from it (cadence + retry margin). The cadence is NOT the
-    same for every site: aloe and pharmonline run daily, aptekonline weekly —
-    so a card must be coloured against its own schedule, not a global one.
+    same for every site by design (see ``src/cadence.py``), so a card must be
+    coloured against its own schedule, not a global one.
     """
 
     site: str

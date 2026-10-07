@@ -4037,7 +4037,9 @@ def _dispatch_health_alert_email(
     "--max-age-hours",
     type=int,
     default=26,
-    help="Алерт если последний прогон старше N часов (по умолчанию 26 — суточный cron + jitter)",
+    help="Порог «данные устарели» для сайта без объявленного ритма (часы). Сайтам из "
+    "src/cadence.py порог задаёт их ритм; тревогу «давно не было прогонов» опция "
+    "может только отодвинуть.",
 )
 @click.option(
     "--min-products",
@@ -5083,6 +5085,11 @@ def run_cmd(
                 session, sites, tenant_id=run_tenant_id, now=now
             )
             if not due:
+                click.echo(
+                    "run: полный сбор пропущен — "
+                    + ", ".join(sorted(covered))
+                    + " на этой неделе уже собран. Собрать досрочно: --force"
+                )
                 log.info(
                     "run_skipped_within_cadence",
                     sites=sites,

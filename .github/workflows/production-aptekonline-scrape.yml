@@ -48,10 +48,14 @@ jobs:
               value=${line#*=}
               export "$key=$value"
             done < /etc/pharmacy-monitor/env
+            # --force: ручной запуск — явная просьба. Без него гвард недельного
+            # ритма пропустил бы сбор, если aptekonline на этой неделе уже
+            # собран, а шаг проверки ниже прошёл бы по старому прогону.
             .venv/bin/pharmacy-monitor run \
               --site aptekonline \
               --mode category \
-              --no-alerts'
+              --no-alerts \
+              --force'
 
       - name: Verify latest aptekonline catalog attempt
         run: |

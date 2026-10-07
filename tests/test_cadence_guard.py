@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -34,6 +35,10 @@ SCRAPE_UNIT = REPO / "infra/systemd/pharmacy-monitor-scrape@.service"
 SCRAPE_UNIT_DROPIN = (
     REPO / "infra/systemd/overrides/pharmacy-monitor-scrape@.service.d/zz-realtime-alerts.conf"
 )
+SCRAPE_TIMER = REPO / "infra/systemd/pharmacy-monitor-scrape@.timer"
+SCRAPE_TIMER_DROPINS = sorted(
+    (REPO / "infra/systemd/overrides").glob("pharmacy-monitor-scrape@*.timer.d/*.conf")
+)
 BERLIN = ZoneInfo("Europe/Berlin")  # часовой пояс прод-хоста: в нём заданы OnCalendar
 
 
@@ -49,6 +54,25 @@ def _unit_run_args(unit_file: Path, site: str) -> list[str]:
     argv = shlex.split(commands[0].replace("%i", site))
     assert argv[0].endswith("/pharmacy-monitor")
     return argv[1:]
+
+
+def _timer_schedule(timer_file: Path) -> tuple[int, int]:
+    """(час срабатывания по времени хоста, RandomizedDelaySec) из файла таймера."""
+    hours: list[int] = []
+    delay: int | None = None
+    for line in timer_file.read_text(encoding="utf-8").splitlines():
+        if line.startswith("OnCalendar="):
+            value = line.removeprefix("OnCalendar=").strip()
+            if not value:  # пустое значение в drop-in сбрасывает расписание
+                hours = []
+                continue
+            clock = re.search(r"(\d{2}):00:00$", value)
+            assert clock, f"{timer_file.name}: тест умеет только расписание на ровный час"
+            hours.append(int(clock[1]))
+        elif line.startswith("RandomizedDelaySec="):
+            delay = int(line.removeprefix("RandomizedDelaySec="))
+    assert len(hours) == 1 and delay is not None, timer_file
+    return hours[0], delay
 
 
 def _full_run(
@@ -114,14 +138,27 @@ def test_site_without_declared_cadence_gets_daily_windows():
     assert start == datetime(2026, 10, 6, 22, 0)
 
 
-@pytest.mark.parametrize("hour", [1, 2, 3])
-def test_window_boundary_fits_the_monday_night_timers(hour):
+def test_scrape_timers_in_repo_are_the_ones_the_boundary_was_chosen_for():
+    assert _timer_schedule(SCRAPE_TIMER) == (1, 300)
+    assert {path.parent.name: _timer_schedule(path) for path in SCRAPE_TIMER_DROPINS} == {
+        "pharmacy-monitor-scrape@aptekonline.timer.d": (2, 300)
+    }
+
+
+@pytest.mark.parametrize(
+    "timer_file",
+    [SCRAPE_TIMER, *SCRAPE_TIMER_DROPINS],
+    ids=lambda path: path.parent.name if path.suffix == ".conf" else path.name,
+)
+def test_window_boundary_fits_the_monday_night_timers(timer_file):
     """Граница окна стоит раньше ночных таймеров понедельника и рядом с ними.
 
-    Таймеры полного сбора — 01:00, 02:00 и 03:00 по времени хоста. Перебираем
+    Часы и случайная задержка берутся из самих файлов таймеров: перенесёшь
+    таймер, не пересчитав `CADENCE_ANCHOR_UTC`, — упадёт этот тест. Перебираем
     каждый понедельник трёх лет, то есть оба перевода часов.
     """
-    jitter = timedelta(seconds=300)  # RandomizedDelaySec таймера
+    hour, delay_sec = _timer_schedule(timer_file)
+    jitter = timedelta(seconds=delay_sec)
     monday = date(2026, 1, 5)
     while monday < date(2029, 1, 1):
         fire = _timer_fire_utc(monday, hour)
@@ -416,6 +453,9 @@ def test_systemd_unit_command_is_skipped_inside_the_week(db_session, scrape_call
     assert result.exit_code == 0, result.output
     assert scrape_calls == []
     assert _run_count(db_session) == runs_before
+    # Человек, запустивший ту же команду руками, должен увидеть, что сбора не было.
+    assert "полный сбор пропущен" in result.output
+    assert "--force" in result.output
 
 
 def test_systemd_unit_command_collects_in_a_new_week(db_session, scrape_calls):
