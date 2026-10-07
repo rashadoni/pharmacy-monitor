@@ -33,6 +33,8 @@
   своя shell-функция и обёртки не из `WRAPPERS`
 - скрипт из репозитория, который workflow исполняет на сервере
   (`bash -s < infra/…sh`): в сам скрипт тест не заглядывает
+- запись через `$(…)` внутри python-вставки без кавычек у слова-окончания
+  (`python - <<PY`) и слова `python - <<` в комментарии к обычному heredoc
 - готовое действие вместо команды (`uses: appleboy/scp-action` с `target:`)
 - workflow, исправленный в ветке и запущенный с неё (`--ref`): CI такую ветку
   проверит, только если из неё открыт PR
@@ -90,7 +92,7 @@ WRAPPERS = {"ssh", "bash", "sh", "su", "flock", "retry"}
 REDIRECT = re.compile(r"(?:^|[\s\"')])\d?>>?\s*([^\s&|<>][^\s|<>]*)")
 STEP_START = re.compile(r"\s*(?:-\s+)?(?:run|uses):|\s*-\s+(?:name|id):")
 CAPTION = re.compile(r"\s*#|\s*(?:-\s+)?(?:name|description):")
-HEREDOC = re.compile(r"<<-?\s*[\"']?([A-Za-z_]\w*)[\"']?")
+HEREDOC = re.compile(r"<<-?\s*[\"']?([A-Za-z_][^\s\"'<>|;&()]*)")
 # Тело такого heredoc читает интерпретатор python, а не оболочка: `cp = root / "src"`
 # там присваивание. Слова «python» где-то в строке мало — `bash -s -- '$python_bin'`
 # открывает обычный shell, и запись в нём пропускать нельзя.
@@ -230,8 +232,9 @@ def _writes(command: str, cwd: str) -> bool:
 
 def _odd(line: str, quote: str) -> bool:
     # Кавычка другого вида внутри закрытой пары — текст: `echo "can't reach"`.
-    other = "'" if quote == '"' else '"'
-    line = re.sub(rf"{other}[^{other}]*{other}", "", line)
+    # В двойных кавычках `\"` пару не закрывает, в одинарных экранирования нет.
+    closed_pair = r"'[^']*'" if quote == '"' else r'"(?:\\.|[^"\\])*"'
+    line = re.sub(closed_pair, "", line)
     return len(re.findall(rf"(?<!\\){quote}", line)) % 2 == 1
 
 
@@ -375,6 +378,12 @@ WRITES = {
         cp /tmp/x.py /opt/pharmacy-monitor/src/x.py
         REMOTE
     """,
+    "после python-вставки с дефисом в слове-окончании": """
+        python3 - <<'PY-END'
+        print("ok")
+        PY-END
+        cp main.py /opt/pharmacy-monitor/src/main.py
+    """,
     "относительный путь после cd в heredoc": """
         ssh pm@13.140.186.143 'bash -s' <<'REMOTE'
         set -euo pipefail
@@ -475,6 +484,12 @@ READS = {
         ssh pm@13.140.186.143 'set -euo pipefail
           cd /opt/pharmacy-monitor
           ls src'
+        cp report.txt templates/report.txt
+    """,
+    "копия на раннере после строки ssh с экранированными кавычками": """
+        ssh pm@13.140.186.143 'set -euo pipefail
+          cd /opt/pharmacy-monitor
+          curl -fsSL http://127.0.0.1:3000/ru/login | grep -q "<html lang=\\"ru\\""'
         cp report.txt templates/report.txt
     """,
     "cd из прошлого шага": """
