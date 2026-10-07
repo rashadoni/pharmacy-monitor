@@ -140,6 +140,8 @@ def _preload_snapshots(
 # compute_actions для 3000+ матчей занимает 15-30с. HTTP-handler с таймаутом
 # 15с возвращал 408 на 4 экранах из 11 (P0.1 PO Audit). Решение:
 # pre-compute после scrape success → DB-cache → serve из кэша.
+# Между сборами кэш пересчитывает `src/roi_refresh.py` — по заявке, командой
+# `pharmacy-monitor roi refresh`, тоже не в HTTP-обработчике.
 
 # Cache freshness threshold. Старше — игнорируем и показываем unavailable;
 # inline fallback запрещён, потому что он может прочитать непроверенные данные.
@@ -428,8 +430,13 @@ def refresh_all_cached_actions(
     run_id: int | None = None,
     tenant_id: int = 1,
 ) -> dict[str, int]:
-    """Пересчитать кэш для всех 3 сайтов. Вызывается из main.py после
-    подтверждённого full-catalog run. Возвращает {site: count}.
+    """Пересчитать кэш для всех 3 сайтов. Возвращает {site: count}.
+
+    Зовут двое: конец подтверждённого full-catalog run в main.py (держит
+    эксклюзивную блокировку сбора) и `roi_refresh.refresh_from_trusted_epoch`
+    (держит shared). Сама функция блокировку не берёт и считает через
+    `_compute_actions_locked`, который при закрытом гейте политики или
+    незавершённом прогоне молча отдаёт [] — вызывающий обязан исключить это сам.
     """
     run = session.get(Run, run_id) if run_id is not None else None
     if run is None or run.tenant_id != tenant_id or not storage.run_is_financially_eligible(run):

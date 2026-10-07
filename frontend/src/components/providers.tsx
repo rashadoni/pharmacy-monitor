@@ -2,7 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
-import { isVerifiedScanPendingError } from "@/lib/api";
+import { isRecommendationsRecalculatingError, isVerifiedScanPendingError } from "@/lib/api";
 
 export function Providers({ children }: { children: ReactNode }) {
   const [queryClient] = useState(
@@ -15,6 +15,8 @@ export function Providers({ children }: { children: ReactNode }) {
             retry: (failureCount, error: any) => {
               // A verified full scan is required; retrying cannot make this request succeed.
               if (isVerifiedScanPendingError(error)) return false;
+              // A queued recalculation is polled by the query itself (roiRecalculationPollMs).
+              if (isRecommendationsRecalculatingError(error)) return false;
               // Don't retry 401/403/404
               if (error?.status >= 400 && error?.status < 500) return false;
               return failureCount < 2;

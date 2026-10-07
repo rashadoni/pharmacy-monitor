@@ -34,12 +34,21 @@ export default function PricingSettingsPage() {
     if (cfgQ.data && !form) setForm(cfgQ.data);
   }, [cfgQ.data, form]);
 
+  // Пороги и себестоимость меняют рекомендации: сервер убирает прежние и
+  // пересчитывает. Запросы рекомендаций живут под разными ключами (обзор,
+  // страница сайта) — сбрасываем все, чтобы страницы сразу показали
+  // «пересчитываются», а не список из кэша браузера.
+  const invalidateRecommendations = () =>
+    qc.invalidateQueries({
+      predicate: (query) => query.queryKey.includes("roi-recommendations"),
+    });
+
   const updateM = useMutation({
     mutationFn: (cfg: PricingConfig) => api.pricingUpdate(cfg),
     onSuccess: (data) => {
       setForm(data);
       qc.invalidateQueries({ queryKey: ["pricing-config"] });
-      qc.invalidateQueries({ queryKey: ["roi-actions"] });
+      invalidateRecommendations();
     },
   });
 
@@ -70,14 +79,14 @@ export default function PricingSettingsPage() {
       setPreviewResult(null);
       setSelectedFile(null);
       if (fileRef.current) fileRef.current.value = "";
-      qc.invalidateQueries({ queryKey: ["roi-actions"] });
+      invalidateRecommendations();
       qc.invalidateQueries({ queryKey: ["cost-import-history"] });
     },
   });
   const rollbackM = useMutation({
     mutationFn: (batchId: number) => api.costImportRollback(batchId),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["roi-actions"] });
+      invalidateRecommendations();
       qc.invalidateQueries({ queryKey: ["cost-import-history"] });
     },
   });

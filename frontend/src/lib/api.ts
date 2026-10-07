@@ -84,18 +84,46 @@ export class ApiError extends Error {
 
 const VERIFIED_SCAN_PENDING_DETAIL =
   "Verified full-catalog recommendations are not available yet";
+const RECOMMENDATIONS_RECALCULATING_DETAIL = "Recommendations are being recalculated";
 
-/** Expected fail-closed state while financial lineage awaits a verified full scan. */
-export function isVerifiedScanPendingError(err: unknown): err is ApiError {
+function isUnavailableWithDetail(err: unknown, detail: string): err is ApiError {
   if (!(err instanceof ApiError) || err.status !== 503) return false;
 
-  if (err.detail === VERIFIED_SCAN_PENDING_DETAIL) return true;
+  if (err.detail === detail) return true;
   try {
     const payload = JSON.parse(err.detail);
-    return payload?.detail === VERIFIED_SCAN_PENDING_DETAIL;
+    return payload?.detail === detail;
   } catch {
     return false;
   }
+}
+
+/** Expected fail-closed state while financial lineage awaits a verified full scan. */
+export function isVerifiedScanPendingError(err: unknown): err is ApiError {
+  return isUnavailableWithDetail(err, VERIFIED_SCAN_PENDING_DETAIL);
+}
+
+/**
+ * Thresholds or purchase costs were just changed: the old recommendations are
+ * withdrawn and the server is recomputing them (minutes, no scan involved).
+ */
+export function isRecommendationsRecalculatingError(err: unknown): err is ApiError {
+  return isUnavailableWithDetail(err, RECOMMENDATIONS_RECALCULATING_DETAIL);
+}
+
+const ROI_RECALCULATION_POLL_MS = 20_000;
+
+/**
+ * `refetchInterval` for the recommendations query: poll while a recalculation
+ * is queued so the result appears without a reload, stay quiet otherwise.
+ */
+export function roiRecalculationPollMs(state: {
+  data?: RoiRecommendations;
+  error: unknown;
+}): number | false {
+  if (isRecommendationsRecalculatingError(state.error)) return ROI_RECALCULATION_POLL_MS;
+  if (state.data?.provenance.refresh_pending) return ROI_RECALCULATION_POLL_MS;
+  return false;
 }
 
 /** True when financial views are intentionally paused by the fail-closed gate. */
@@ -673,6 +701,8 @@ export interface RoiStatus {
   run_started_at: string | null;
   run_finished_at: string | null;
   item_count: number;
+  /** A change made since these were computed is waiting to be recalculated. */
+  refresh_pending?: boolean;
 }
 
 export interface RoiRecommendations {
