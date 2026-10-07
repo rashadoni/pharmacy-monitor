@@ -585,6 +585,19 @@ sudo find /opt/pharmacy-monitor/data/backups/ -mtime +90 -delete
 > `pharmacy-monitor-frontend`). Выкладка — workflow `deploy.yml`
 > (`gh workflow run deploy.yml --ref main -f apply_migrations=false`) после
 > зелёного CI.
+>
+> **Выкладка с миграцией** — `-f apply_migrations=true`; без флага при
+> непримененной миграции workflow остановится до копирования кода. Код при этом
+> копируется раньше, чем обновляется база: около минуты (бэкап + `alembic
+> upgrade`) новый код лежит на старой схеме, и процесс, который таймер запустил
+> в это окно, упадёт на первом запросе к изменённой таблице. API не задет — он
+> держит старый код в памяти до рестарта. Поэтому запускать не в первые минуты
+> часа (intraday-тик и health на `:00`, watchlist на `:15` каждый третий час),
+> не во время ночных сборов (с 01:00) и бэкапа (04:00 — его `pg_dump` держит
+> блокировку, за которой встанет `ALTER TABLE`, а за ним и чтения этой таблицы).
+> Время — по часам сервера, он живёт в CEST (UTC+2): `systemctl list-timers
+> 'pharmacy-monitor*'`. Перед запуском убедиться, что нет прогона в работе:
+> `select id, status from runs where finished_at is null`.
 
 ```bash
 # На VPS
