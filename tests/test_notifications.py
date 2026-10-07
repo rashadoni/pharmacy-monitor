@@ -1131,6 +1131,310 @@ def test_notify_digest_cli_dry_run_and_only(setup, tenant_user, monkeypatch):
         assert mock_email.call_count == 1
 
 
+# ─── Письмо о прогоне: та же сводка и те же потолки ─────────────────────────
+
+
+def _run_event(s, tenant_id, rule_type, severity, title, **payload):
+    e = storage.AlertEvent(
+        rule_type=rule_type,
+        dedup_key=f"run|{title}",
+        severity=severity,
+        title=title,
+        detail=f"detail of {title}",
+        tenant_id=tenant_id,
+        created_at=utcnow(),
+        payload=payload,
+    )
+    s.add(e)
+    return e
+
+
+def _big_run(s, tenant_id):
+    """Прогон 973 от 2026-10-04 (77 критичных и 21 предупреждение «цена упала»,
+    один «конкурент дешевле») вместе со сверкой каталога aloe от 2026-10-07
+    (1 934 новых товара)."""
+    info = [
+        _run_event(s, tenant_id, "new_product", "info", f"Новый товар на aloe: N{i}", site="aloe")
+        for i in range(1934)
+    ]
+    loud = [
+        # Проценты вперемешку с порядком создания: «самые крупные» нельзя
+        # получить, взяв первые или последние события.
+        _run_event(
+            s,
+            tenant_id,
+            "price_drop_pct",
+            "critical",
+            f"DROPCRIT{20 + (i * 37) % 77:03d}",
+            site="aptekonline",
+            drop_pct=20 + (i * 37) % 77,
+        )
+        for i in range(77)
+    ]
+    loud += [
+        # Предупреждения «крупнее» критичных — и всё равно идут после них.
+        _run_event(
+            s,
+            tenant_id,
+            "price_drop_pct",
+            "warning",
+            f"DROPWARN{i:02d}",
+            site="aptekonline",
+            drop_pct=200 + i,
+        )
+        for i in range(21)
+    ]
+    loud.append(_run_event(s, tenant_id, "undercut_threshold", "critical", "UNDERCUT", site="aloe"))
+    s.commit()
+    return info, loud
+
+
+def _run_emails(s, events) -> tuple[dict[str, str], dict[str, str]]:
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
+    ):
+        notifications.dispatch_events_batch(s, events)
+        assert not mock_tg.called
+    bodies = {c.kwargs["to"][0]: c.kwargs["html_body"] for c in mock_email.call_args_list}
+    subjects = {c.kwargs["to"][0]: c.kwargs["subject"] for c in mock_email.call_args_list}
+    assert len(bodies) == mock_email.call_count
+    return bodies, subjects
+
+
+def test_run_email_big_run_is_summary_plus_capped_lists(setup, tenant_user):
+    """Большой прогон — сводка и списки с теми же потолками, что у дайджеста, а
+    не строка на каждое событие. Порог у каждого получателя свой: ниже порога
+    события нет ни строкой, ни в сводке."""
+    s = setup  # alice: warning
+    s.add(
+        storage.TenantUser(
+            tenant_id=tenant_user.tenant_id,
+            email="bob@example.com",
+            role="viewer",
+            is_active=True,
+            created_at=utcnow(),
+            email_severity_min="info",
+        )
+    )
+    info, loud = _big_run(s, tenant_user.tenant_id)
+
+    bodies, subjects = _run_emails(s, info + loud)
+    alice, bob = bodies["alice@example.com"], bodies["bob@example.com"]
+
+    for body in (alice, bob):
+        assert len(body.encode()) < GMAIL_CLIP_BYTES
+        # «Цена упала» упирается в потолок типа, единственный «конкурент
+        # дешевле» не вытеснен сотней падений цены.
+        assert _event_rows(body) == 1 + notifications._DIGEST_TYPE_CAP
+        assert "detail of UNDERCUT" in body
+        for pct in range(67, 97):
+            assert f"DROPCRIT{pct:03d}" in body
+        assert "DROPCRIT066" not in body
+        assert body.index("DROPCRIT096") < body.index("DROPCRIT095") < body.index("DROPCRIT067")
+        assert "DROPWARN" not in body
+        assert "77 критичных, 21 предупреждение · aptekonline 98" in body
+        assert "30 из 98" in body
+        assert "Ещё 68 — в дашборде" in body
+        # Ссылки ведут на последние сутки: и общая, и по типу (в сводке и под списком).
+        assert 'href="https://example.com/alerts?hours=24"' in body
+        assert body.count('href="https://example.com/alerts?hours=24&amp;type=price_drop_pct"') == 2
+        assert "hours=168" not in body
+        # Это не дайджест: ни его шапки, ни подписи про отписку.
+        assert "айджест" not in body
+
+    assert "<title>99 алертов за прогон</title>" in alice
+    assert ">78 критичных, 21 предупреждение</div>" in alice
+    assert "31 из 99, самые важные" in alice
+    assert "Новые товары" not in alice and "информационн" not in alice
+    assert subjects["alice@example.com"] == "[CRITICAL] Pharmacy Monitor — 99 алертов"
+
+    assert f"2{NBSP}033 алерта за прогон" in bob
+    assert f">78 критичных, 21 предупреждение, 1{NBSP}934 информационных</div>" in bob
+    # Новые товары — числом по сайтам в сводке и ни одного строкой.
+    assert f"aloe 1{NBSP}934" in bob
+    assert f">1{NBSP}934</td>" in bob
+    assert "Новый товар на" not in bob
+    assert "Новые товары <span" not in bob
+    assert f"31 из 2{NBSP}033, самые важные" in bob
+    assert subjects["bob@example.com"] == f"[CRITICAL] Pharmacy Monitor — 2{NBSP}033 алерта"
+
+    # Помечены все события отправленного письма — и те, что остались числом.
+    for e in info + loud:
+        s.refresh(e)
+        assert e.channels_sent == ["email"]
+
+
+def test_run_email_marks_events_behind_the_cap_and_does_not_resend(setup, tenant_user):
+    """Событие, оставшееся числом в сводке, считается вошедшим в письмо:
+    повторный вызов на тех же событиях не шлёт остаток вторым письмом. Событие
+    ниже порога не вошло никак и метки не получает."""
+    s = setup  # единственный получатель, порог warning
+    info, loud = _big_run(s, tenant_user.tenant_id)
+
+    bodies, _ = _run_emails(s, info + loud)
+    assert _event_rows(bodies["alice@example.com"]) == 31
+
+    for e in info + loud:
+        s.refresh(e)
+    assert all(e.channels_sent == ["email"] for e in loud)
+    assert not any(e.channels_sent for e in info)
+
+    bodies, _ = _run_emails(s, info + loud)
+    assert bodies == {}
+
+
+def test_run_email_small_run_lists_every_event(setup, tenant_user):
+    """Мало событий — как раньше: каждое строкой, ничего не спрятано за ссылку."""
+    s = setup
+    tenant_user.email_severity_min = "info"
+    t = tenant_user.tenant_id
+    titles = []
+    for i in range(3):
+        titles.append(f"UNDERCUT{i}")
+        _run_event(s, t, "undercut_threshold", "critical", titles[-1], site="aloe")
+    for i in range(4):
+        titles.append(f"DROPWARN{i}")
+        _run_event(s, t, "price_drop_pct", "warning", titles[-1], site="aptekonline")
+    for i in range(5):
+        titles.append(f"NEWPRODUCT{i}")
+        _run_event(s, t, "new_product", "info", titles[-1], site="aloe")
+    s.commit()
+    events = s.query(storage.AlertEvent).all()
+
+    bodies, subjects = _run_emails(s, events)
+    body = bodies["alice@example.com"]
+
+    assert _event_rows(body) == len(titles) == 12
+    for title in titles:
+        assert f"detail of {title}" in body
+    assert "12 алертов за прогон" in body
+    assert ">3 критичных, 4 предупреждения, 5 информационных</div>" in body
+    assert "Ещё " not in body
+    assert "самые важные" not in body and "только сводка" not in body
+    assert subjects["alice@example.com"] == "[CRITICAL] Pharmacy Monitor — 12 алертов"
+
+
+def test_run_email_groups_rows_by_type_not_by_severity_alone():
+    """Строки идут блоками по типам: выше тип, у которого есть событие важнее,
+    внутри типа — по важности. Раньше письмо шло одним списком строго по
+    важности; теперь предупреждение может стоять выше критичного другого типа."""
+    events = [
+        _loose_event("undercut_threshold", "warning", "UC_WARN"),
+        _loose_event("new_product", "info", "NP_INFO"),
+        _loose_event("price_change_pct", "info", "PC_INFO"),
+        _loose_event("price_change_pct", "warning", "PC_WARN"),
+        _loose_event("price_change_pct", "critical", "PC_CRIT"),
+        _loose_event("site_drop_smoke", "critical", "SD_CRIT"),
+    ]
+    html = notifications._render_batch_email(events)
+
+    # «Конкурент дешевле» в списке подписей первый, но критичных у него нет.
+    order = ["PC_CRIT", "PC_WARN", "PC_INFO", "SD_CRIT", "UC_WARN", "NP_INFO"]
+    positions = [html.index(title) for title in order]
+    assert positions == sorted(positions)
+    assert _event_rows(html) == 6
+
+
+def test_run_email_two_events_get_the_batch_subject(setup, tenant_user):
+    """Старая тема — только у одиночного события; два — уже сводка."""
+    s = setup
+    events = [
+        _run_event(s, tenant_user.tenant_id, "price_drop_pct", severity, f"PAIR{i}")
+        for i, severity in enumerate(("warning", "critical"))
+    ]
+    s.commit()
+
+    _, subjects = _run_emails(s, events)
+
+    assert subjects["alice@example.com"] == "[CRITICAL] Pharmacy Monitor — 2 алерта"
+
+
+def test_run_email_failed_send_marks_nothing_and_can_be_retried(setup, tenant_user):
+    """Письмо не ушло — метки нет ни у одного события, в том числе у тех, что
+    остались бы числом в сводке: следующий вызов шлёт письмо целиком."""
+    s = setup
+    info, loud = _big_run(s, tenant_user.tenant_id)
+
+    with patch("src.notifier.send_email", side_effect=RuntimeError("smtp down")) as mock_email:
+        result = notifications.dispatch_events_batch(s, info + loud)
+    assert mock_email.call_count == 1
+    assert result == {"email": 0, "telegram": 0}
+    for e in info + loud:
+        s.refresh(e)
+        assert not e.channels_sent
+
+    bodies, _ = _run_emails(s, info + loud)
+    assert "99 алертов за прогон" in bodies["alice@example.com"]
+    assert all(e.channels_sent == ["email"] for e in loud)
+
+
+def test_digest_keeps_its_own_header_and_footer():
+    """Тело у дайджеста и письма о прогоне общее, шапка и подвал — свои."""
+    events = [_loose_event("undercut_threshold", "critical", "X")]
+
+    digest = notifications._render_digest_email(events, kind="weekly", since=utcnow())
+    assert "<title>Дайджест за неделю</title>" in digest
+    assert ">Дайджест за неделю</div>" in digest
+    assert ">Все события за неделю — в дашборде →</a>" in digest
+    assert "Отписаться от дайджеста" in digest
+    assert "за прогон" not in digest and "Открыть в дашборде" not in digest
+
+    run = notifications._render_batch_email(events)
+    assert ">Открыть в дашборде →</a>" in run
+    assert "Все события за" not in run
+
+
+def test_run_email_single_event_keeps_subject_and_lists_it(setup, tenant_user):
+    s = setup
+    e = _run_event(s, tenant_user.tenant_id, "price_drop_pct", "warning", "Solo alert")
+    s.commit()
+
+    bodies, subjects = _run_emails(s, [e])
+    body = bodies["alice@example.com"]
+
+    assert subjects["alice@example.com"] == "[WARNING] Solo alert"
+    assert _event_rows(body) == 1
+    assert "1 алерт за прогон" in body and "detail of Solo alert" in body
+
+
+def test_run_email_with_nothing_to_list_is_summary_only(setup, tenant_user):
+    """Одни новые товары сверх потолка: письмо из одной сводки, помечены все."""
+    s = setup
+    tenant_user.email_severity_min = "info"
+    events = [
+        _run_event(s, tenant_user.tenant_id, "new_product", "info", f"NEWPRODUCT{i}", site="aloe")
+        for i in range(notifications._DIGEST_TYPE_CAP + 1)
+    ]
+    s.commit()
+
+    bodies, subjects = _run_emails(s, events)
+    body = bodies["alice@example.com"]
+
+    assert _event_rows(body) == 0
+    assert "NEWPRODUCT" not in body
+    assert "aloe 31" in body and "В этом письме только сводка" in body
+    assert subjects["alice@example.com"] == "[INFO] Pharmacy Monitor — 31 алерт"
+    for e in events:
+        s.refresh(e)
+        assert e.channels_sent == ["email"]
+
+
+def test_run_email_size_is_bounded_by_row_budget():
+    """Сколько бы событий и типов ни пришло, строк не больше бюджета письма, и
+    на длинных кириллических названиях оно остаётся под порогом Gmail."""
+    events = [
+        _loose_event(rule_type, "critical", "Ж" * 500, {"site": "aloe", "drop_pct": i}, "Щ" * 5000)
+        for rule_type in [*notifications._RULE_TYPE_LABELS, "some_future_rule"]
+        for i in range(100)
+    ]
+    html = notifications._render_batch_email(events)
+
+    assert _event_rows(html) == notifications._DIGEST_ROW_BUDGET == 60
+    assert len(html.encode()) < GMAIL_CLIP_BYTES
+    assert "800 алертов за прогон" in html
+
+
 @pytest.mark.parametrize(
     ("n", "expected"),
     [
