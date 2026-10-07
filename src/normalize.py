@@ -688,12 +688,11 @@ _PAREN_GROUP_RE = re.compile(r"\(([^()]*)\)")
 _PAREN_WORD_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
 
 
-# Написания, которых список стран в product_policy не узнаёт (там ключи с
-# опечатками: «rumıniya» с ı, «seudiye»). Для вырезания из названия хватает
-# этого набора; сам список — часть страновой политики и здесь не правится.
-_EXTRA_COUNTRY_NAMES = frozenset(
-    {"san marino", "ruminiya", "seudiyye erebistani", "seudiyye erebistan"}
-)
+# Написания страны, которых в словаре product_policy нет. «San Marino» там нет
+# намеренно: какие написания считать страной товара — вопрос страновой
+# политики (см. CLAUDE.md про словарь стран). Здесь задача уже: убрать из
+# названия пояснение в скобках, и для неё хватает этого набора.
+_EXTRA_COUNTRY_NAMES = frozenset({"san marino", "seudiyye erebistani", "seudiyye erebistan"})
 
 
 def _is_country_name(text: str) -> bool:
@@ -728,13 +727,14 @@ def _strip_descriptor_parens(s: str) -> str:
 # регистр, диакритика, азербайджанские буквы, кириллица → латиница и типовые
 # расхождения транслитерации (c/k/s, w/v, q/g, y/i, x/ks, ph/f, удвоения).
 # Важна не «правильность» транслитерации, а то, что оба написания сходятся.
-# Та же свёртка стоит за поиском на странице сравнения (src/catalog_search.py).
-_FOLD_CHAR_MAP = str.maketrans(
+# Ею же пользуется поиск на странице сравнения (src/catalog_search.py берёт
+# функцию и таблицу отсюда), поэтому правка правил меняет и поиск.
+FOLD_CHAR_MAP = str.maketrans(
     "ıəğşçöüабвгдеёжзийклмнопрстуфхцчшщыэәғҝөүһҹј",
     "iegscouabvgdeejziiklmnoprstufxscssieeggouhcy",
 )
 # «№» — знак, а не часть слова: без этого «№20» давало бы слово «no20».
-_FOLD_CHAR_MAP.update(str.maketrans({"ъ": "", "ь": "", "ю": "yu", "я": "ya", "№": " "}))
+FOLD_CHAR_MAP.update(str.maketrans({"ъ": "", "ь": "", "ю": "yu", "я": "ya", "№": " "}))
 _FOLD_QU_RE = re.compile(r"qu(?=[aeio])")
 _FOLD_SOFT_C_RE = re.compile(r"c(?=[ei])")
 _FOLD_LONE_C_RE = re.compile(r"(?<![a-z0-9])c(?![a-z0-9])")
@@ -754,7 +754,7 @@ def fold_spelling(text: str | None) -> str:
     # «İ».lower() в Python даёт «i» + точку-диакритику — убираем её заранее.
     s = text.replace("İ", "i").lower()
     if not s.isascii():
-        s = _FOLD_CYR_B_CODE_RE.sub("b", _FOLD_CYR_LONE_C_RE.sub("c", s)).translate(_FOLD_CHAR_MAP)
+        s = _FOLD_CYR_B_CODE_RE.sub("b", _FOLD_CYR_LONE_C_RE.sub("c", s)).translate(FOLD_CHAR_MAP)
         if not s.isascii():
             # Совместимые формы раскрываются в заглавные («™» → «TM») — отсюда
             # второй lower().
