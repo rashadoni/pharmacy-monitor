@@ -4951,7 +4951,8 @@ def _sites_due_for_full_scan(
     "--mode",
     type=click.Choice(["auto", "watchlist", "category", "public_api"]),
     default="auto",
-    help="auto = category (сбор каталога); содержимое watchlist на режим не влияет. "
+    help="auto = category (сбор каталога); для `--site pharmonline` с маркером "
+    "автономного режима — public_api. Содержимое watchlist на режим не влияет. "
     "watchlist — только закреплённые ссылки, задаётся явно. "
     "public_api — guarded Pharmonline recovery.",
 )
@@ -5067,9 +5068,10 @@ def run_cmd(
         # Раньше `auto` при непустом watchlist становился watchlist-прогоном, и
         # режим планового запуска решала таблица, а не команда: одна
         # подтверждённая ссылка на любом сайте — и юнит `run --site %i` навсегда
-        # перестал бы собирать полный каталог, без единой ошибки. Закреплённые
-        # ссылки обновляет свой таймер (`watchlist-tick`), он зовёт
-        # mode="watchlist" явно.
+        # перестал бы собирать полный каталог. Молча — там, где ссылка лежит на
+        # том же сайте (частичный прогон со статусом ok); на остальных сайтах
+        # прогон падал бы каждую ночь. Закреплённые ссылки обновляет свой таймер
+        # (`watchlist-tick`), он зовёт mode="watchlist" явно.
         if mode == "auto":
             mode = "category"
 

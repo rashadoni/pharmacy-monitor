@@ -577,9 +577,10 @@ def test_watchlist_tick_form_is_not_a_full_scan(db_session, scrape_calls):
 #
 # Режим по умолчанию раньше зависел от таблицы watchlist: одна подтверждённая
 # ссылка на ЛЮБОМ сайте — и команда юнита для aloe и aptekonline становилась
-# watchlist-прогоном. Полный каталог перестал бы собираться совсем, без ошибки;
-# на проде это не стреляло только потому, что watchlist был пуст. Тесты выше
-# идут с пустым watchlist и этого не видят.
+# watchlist-прогоном. Полный каталог перестал бы собираться совсем: на сайте со
+# ссылкой — молча (частичный прогон со статусом ok), на остальных — с упавшим
+# прогоном каждую ночь. На проде это не стреляло только потому, что watchlist
+# был пуст. Тесты выше идут с пустым watchlist и этого не видят.
 
 
 def _pin_confirmed_url(db_session, site: str) -> None:
@@ -694,6 +695,28 @@ def test_default_mode_without_site_is_full_catalog_with_pinned_watchlist(
 
     assert scrape_calls == [("catalog", ["aloe", "aptekonline", "pharmonline"])]
     assert _latest_run(db_session).catalog_scope == "full"
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "scope"),
+    [
+        (["--force"], "full"),
+        (["--dry-run"], "full"),
+        (["--limit", "5"], "partial"),
+        (["--category-id", "7"], "partial"),
+    ],
+)
+def test_explicit_human_forms_collect_catalog_with_pinned_watchlist(
+    db_session, scrape_calls, extra_args, scope
+):
+    """Ручные формы без `--mode` при непустом watchlist — тоже сбор каталога."""
+    _pin_confirmed_url(db_session, "aloe")
+    _collected_this_week(db_session, "aloe")
+
+    CliRunner().invoke(main_mod.cli, ["run", "--site", "aloe", *extra_args])
+
+    assert scrape_calls == [("catalog", ["aloe"])]
+    assert _latest_run(db_session).catalog_scope == scope
 
 
 @pytest.mark.parametrize(

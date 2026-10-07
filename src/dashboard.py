@@ -503,6 +503,21 @@ def render_run_panel(*, key_prefix: str, default_dry_run: bool = True) -> None:
             key=f"{key_prefix}_btn",
         )
     if clicked:
+        with get_session() as s:
+            pinned_sites = {
+                link.site
+                for tp in wl.list_tracked(s, active_only=True)
+                for link in tp.links
+                if link.url and link.status == "confirmed"
+            }
+        if not pinned_sites & set(sites_chosen or SITES):
+            # Без этого прогон завершился бы ошибкой «no requested scrape work» и
+            # оставил в базе упавший Run.
+            st.info(
+                "В watchlist нет подтверждённых ссылок для выбранных сайтов — "
+                "собирать нечего. Добавь товар с URL ниже."
+            )
+            return
         with st.spinner("🔄 Запускаю scraping... обычно 30-90 сек, не закрывай вкладку"):
             try:
                 # Панель стоит на вкладке Watchlist и обещает прогон по закреплённым
@@ -1162,7 +1177,8 @@ with tab_compare:
             "👉 **Что делать:**\n"
             "1. Открой вкладку **📋 Watchlist**\n"
             "2. Добавь товар с URL'ами на каждом из 3 сайтов\n"
-            "3. Запусти прогон: `uv run pharmacy-monitor run`\n"
+            "3. Запусти прогон по watchlist — кнопкой на той же вкладке или "
+            "`uv run pharmacy-monitor run --mode watchlist`\n"
             "4. Вернись сюда — здесь появится сравнение"
         )
     else:
@@ -2397,8 +2413,8 @@ with tab_watchlist:
     st.subheader("📋 Watchlist — отслеживаемые товары")
     st.caption(
         "Каждый товар можно привязать к конкретной странице на каждом из 3 сайтов. "
-        "Когда URL зафиксирован, по нему ходит прогон по watchlist (кнопка ниже "
-        "и таймер `watchlist-tick`); ежедневный прогон собирает каталог."
+        "Когда URL зафиксирован, по нему ходит прогон по watchlist — кнопка ниже "
+        "или команда `pharmacy-monitor watchlist-tick`; ежедневный прогон собирает каталог."
     )
 
     with st.container(border=True):

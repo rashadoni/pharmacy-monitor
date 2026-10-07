@@ -147,6 +147,11 @@ sudo -u "$SERVICE_USER" bash -c '
 echo ""
 echo "[5/7] Установка systemd-юнитов..."
 
+# Юнит зовёт "run" без --mode — это сбор каталога всех сайтов, что бы ни лежало
+# в watchlist. Закреплённые ссылки он не обновляет: для них есть команда
+# "pharmacy-monitor watchlist-tick", таймер на неё этот скрипт не ставит.
+# Строку ExecStart читает tests/test_cadence_guard.py.
+# (Комментарий намеренно снаружи heredoc: внутри bash исполнил бы обратные кавычки.)
 cat > /etc/systemd/system/pharmacy-monitor-run.service <<EOF
 [Unit]
 Description=Pharmacy Monitor — daily scrape + report
@@ -157,9 +162,6 @@ Type=oneshot
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
 Environment="PATH=/home/$SERVICE_USER/.local/bin:/usr/bin:/bin"
-# `run` без --mode — сбор каталога всех сайтов, что бы ни лежало в watchlist.
-# Закреплённые ссылки этот юнит не обновляет: для них `pharmacy-monitor
-# watchlist-tick`. Строку ниже читает tests/test_cadence_guard.py.
 ExecStart=/home/$SERVICE_USER/.local/bin/uv run pharmacy-monitor run
 StandardOutput=append:$INSTALL_DIR/logs/run.log
 StandardError=append:$INSTALL_DIR/logs/run.log
