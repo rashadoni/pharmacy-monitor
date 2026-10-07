@@ -384,35 +384,38 @@ class AloeScraper(BaseScraper):
                 if country_id in self._unresolvable_country_ids:
                     continue
                 samples: list[tuple[str, str, str]] = []
+                labels: set[str] = set()
                 unread_details = 0
+                unlabeled_details = 0
                 for product in group[:2]:
+                    error: str | None = None
                     try:
                         html_text = await self._fetch_listing_html(product.url)
                         raw, availability = aloe_product_detail_signals(html_text)
                     except (httpx.HTTPError, ValueError) as exc:
+                        error = str(exc)
+                    else:
+                        if raw is None and availability == OFFER_UNKNOWN:
+                            # Ответ 200 без подписи страны и без остатка — не
+                            # карточка товара (заглушка, листинг, обрезанная
+                            # страница). Настоящая карточка без страны остаток
+                            # несёт: tests/fixtures/aloe_product_no_country.html.
+                            error = "no country label and no stock marker"
+                    if error is not None:
                         unread_details += 1
                         log.warning(
                             "aloe_country_detail_failed",
                             country_id=country_id,
                             url=product.url,
-                            error=str(exc),
+                            error=error,
                         )
                         continue
-                    if raw is None and availability == OFFER_UNKNOWN:
-                        # Ответ 200, но в нём нет ни подписи страны, ни остатка:
-                        # пришла не карточка товара (заглушка, обрезанная
-                        # страница). Настоящая карточка без страны остаток
-                        # всё равно несёт.
-                        unread_details += 1
-                        log.warning(
-                            "aloe_country_detail_failed",
-                            country_id=country_id,
-                            url=product.url,
-                            error="no country label and no stock marker",
-                        )
+                    if raw is None:
+                        unlabeled_details += 1
                         continue
+                    labels.add(raw)
                     code, status = country_resolution(raw)
-                    if code is not None and status == COUNTRY_RESOLVED and raw:
+                    if code is not None and status == COUNTRY_RESOLVED:
                         samples.append((code, raw, product.url))
                 codes = {code for code, _raw, _url in samples}
                 required_samples = min(2, len(group))
@@ -422,13 +425,18 @@ class AloeScraper(BaseScraper):
                     # catalog rows. Keep the numeric ID unresolved so policy
                     # checks cannot mistake it for a verified country.
                     #
-                    # Запоминаем id до конца сбора, только если прочитаны ВСЕ
-                    # взятые карточки: тогда отказ — ответ сайта, и следующая
-                    # страница скажет то же самое. Непрочитанная карточка
-                    # (сеть, 404, заглушка) ничего про страну не говорит —
-                    # такой id перепроверяется на следующей странице, иначе
-                    # один сбой оставил бы страну без названия на весь сбор.
-                    retry = unread_details > 0
+                    # До конца сбора id запоминается, только когда сайт ответил
+                    # отказом: все взятые карточки прочитаны, а страны на них
+                    # нет, подпись не страна или образцы разошлись — следующая
+                    # страница скажет то же самое. Во всех прочих случаях id
+                    # перепроверяется на следующей странице: карточку не
+                    # прочитали (сеть, 404, заглушка) либо одна назвала страну,
+                    # а на другой подписи нет вовсе — молчание не возражение.
+                    # Иначе один сбой оставил бы страну без названия на весь
+                    # сбор.
+                    retry = unread_details > 0 or (
+                        len(codes) == 1 and unlabeled_details > 0
+                    )
                     if not retry:
                         self._unresolvable_country_ids.add(country_id)
                     elif country_id in self._country_retry_logged:
@@ -444,6 +452,8 @@ class AloeScraper(BaseScraper):
                         samples=len(samples),
                         required_samples=required_samples,
                         distinct_codes=len(codes),
+                        labels=sorted(labels),
+                        unlabeled_details=unlabeled_details,
                         unread_details=unread_details,
                         retry=retry,
                     )

@@ -516,13 +516,18 @@ async def test_aloe_listing_retry_is_logged(monkeypatch) -> None:
 # ─── неразрешимый id страны запоминается на один сбор ────────────────────────
 
 
-def _country_page(page: int, country_id: str, *, size: int = 2) -> list[ScrapedProduct]:
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _country_page(
+    page: int, country_id: str, *, size: int = 2, tag: str = "p"
+) -> list[ScrapedProduct]:
     """Товары одной страницы листинга с одним и тем же числовым id страны."""
     return [
         ScrapedProduct(
             site="aloe",
-            external_id=f"p{page}-{index}",
-            url=f"https://aloe.az/p{page}-{index}/",
+            external_id=f"{tag}{page}-{index}",
+            url=f"https://aloe.az/{tag}{page}-{index}/",
             name=f"Item {page}-{index}",
             category="dermanlar",
             manufacturer_country_raw=country_id,
@@ -584,6 +589,43 @@ async def test_aloe_unresolvable_country_id_is_sampled_once_per_run(
     assert unresolved[0]["country_id"] == "7"
     assert unresolved[0]["retry"] is False
     assert unresolved[0]["unread_details"] == 0
+    # В единственной строке на сбор видно, что именно написано на карточках.
+    assert unresolved[0]["labels"] == sorted({label for label in labels if label})
+    assert unresolved[0]["unlabeled_details"] == sum(label is None for label in labels)
+
+
+def test_aloe_real_card_without_country_still_carries_stock() -> None:
+    """Опора правила «это не карточка»: настоящая карточка без страны остаток несёт.
+
+    Фикстура — карточка товара с id страны 0, снятая с aloe.az 2026-10-07;
+    листинг того же сайта не даёт ни страны, ни остатка.
+    """
+    card = (_FIXTURES / "aloe_product_no_country.html").read_text()
+    listing = (_FIXTURES / "aloe_bestseller.html").read_text()
+
+    assert aloe_product_detail_signals(card) == (None, OFFER_IN_STOCK)
+    assert aloe_product_detail_signals(listing) == (None, "unknown")
+
+
+async def test_aloe_real_card_without_country_closes_id_for_the_run(monkeypatch) -> None:
+    """id 0 на живой карточке: страны нет, карточка прочитана — второй раз не открываем."""
+    card = (_FIXTURES / "aloe_product_no_country.html").read_text()
+    requested: list[str] = []
+
+    async def fake_fetch(self, url: str) -> str:
+        requested.append(url)
+        return card
+
+    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fake_fetch)
+    scraper = AloeScraper(rate_limit_sec=0)
+
+    with capture_logs() as seen:
+        for page in (1, 2):
+            await scraper._enrich_listing_country_ids(_country_page(page, "0", size=1))
+
+    assert requested == ["https://aloe.az/p1-1/"]
+    assert [row["retry"] for row in _unresolved_rows(seen)] == [False]
+    assert not [row for row in seen if row["event"] == "aloe_country_detail_failed"]
 
 
 @pytest.mark.parametrize("blip", ["read_timeout", "http_404", "http_503", "not_a_card"])
@@ -597,7 +639,9 @@ async def test_aloe_country_id_is_rechecked_after_unread_detail(monkeypatch, bli
             if blip == "read_timeout":
                 raise httpx.ReadTimeout("no answer", request=request)
             if blip == "not_a_card":
-                return httpx.Response(200, text="<html><body>Bir az sonra</body></html>")
+                # Настоящая страница aloe.az, но не карточка: листинг.
+                listing = (_FIXTURES / "aloe_bestseller.html").read_text()
+                return httpx.Response(200, text=listing)
             return httpx.Response(int(blip.removeprefix("http_")))
         return httpx.Response(200, text=_detail_card("Англия"))
 
@@ -619,6 +663,28 @@ async def test_aloe_country_id_is_rechecked_after_unread_detail(monkeypatch, bli
     assert scraper.verified_country_mappings["14"]["sample_count"] == 2
     # Сбой карточки по-прежнему не повторяется и в счётчик повторов не идёт.
     assert scraper.fetch_retries == 0
+
+
+async def test_aloe_page_that_is_not_a_card_does_not_close_the_id(monkeypatch) -> None:
+    """Ответ 200 без страны и без остатка — не карточка: id не закрывается и на одном образце."""
+    listing = (_FIXTURES / "aloe_bestseller.html").read_text()
+    requested: list[str] = []
+
+    async def fake_fetch(self, url: str) -> str:
+        requested.append(url)
+        return listing if url.endswith("/p1-1/") else _detail_card("Türkiyə-Almaniya")
+
+    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fake_fetch)
+    scraper = AloeScraper(rate_limit_sec=0)
+
+    with capture_logs() as seen:
+        for page in (1, 2, 3):
+            await scraper._enrich_listing_country_ids(_country_page(page, "7", size=1))
+
+    assert requested == ["https://aloe.az/p1-1/", "https://aloe.az/p2-1/"]
+    assert [row["retry"] for row in _unresolved_rows(seen)] == [True, False]
+    failed = [row for row in seen if row["event"] == "aloe_country_detail_failed"]
+    assert [row["url"] for row in failed] == ["https://aloe.az/p1-1/"]
 
 
 async def test_aloe_unresolvable_label_with_unread_sample_waits_for_full_read(
@@ -648,6 +714,88 @@ async def test_aloe_unresolvable_label_with_unread_sample_waits_for_full_read(
     ]
     assert [row["retry"] for row in _unresolved_rows(seen)] == [True, False]
     assert scraper.verified_country_mappings == {}
+
+
+async def test_aloe_silent_card_next_to_resolved_one_does_not_close_the_id(monkeypatch) -> None:
+    """Одна карточка назвала страну, на другой подписи нет: молчание — не возражение."""
+    requested: list[str] = []
+
+    async def fake_fetch(self, url: str) -> str:
+        requested.append(url)
+        return _detail_card(None if url.endswith("/p1-2/") else "Англия")
+
+    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fake_fetch)
+    scraper = AloeScraper(rate_limit_sec=0)
+    first, second = _country_page(1, "14"), _country_page(2, "14")
+
+    with capture_logs() as seen:
+        await scraper._enrich_listing_country_ids(first)
+        await scraper._enrich_listing_country_ids(second)
+
+    assert len(requested) == 4
+    assert all(product.manufacturer_country_raw == "14" for product in first)
+    assert all(product.manufacturer_country_raw == "Англия" for product in second)
+    assert scraper.verified_country_mappings["14"]["sample_count"] == 2
+    unresolved = _unresolved_rows(seen)
+    assert len(unresolved) == 1
+    assert unresolved[0]["retry"] is True
+    assert unresolved[0]["unread_details"] == 0
+    assert unresolved[0]["unlabeled_details"] == 1
+
+
+async def test_aloe_country_id_memory_is_per_id(monkeypatch) -> None:
+    """Закрытый или сбойный id не мешает остальным id той же страницы."""
+    cards = {"tr": "Türkiyə-Almaniya", "uk": "Англия", "de": "Германия"}
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        slug = request.url.path.strip("/")
+        requested.append(slug)
+        label = cards.get(slug[:2])
+        if label is None:
+            return httpx.Response(404)
+        return httpx.Response(200, text=_detail_card(label))
+
+    scraper = _scraper_with_transport(monkeypatch, handler)
+    first = (
+        _country_page(1, "7", tag="tr")
+        + _country_page(1, "60", tag="gone", size=1)
+        + _country_page(1, "14", tag="uk")
+    )
+    second = (
+        _country_page(2, "7", tag="tr")
+        + _country_page(2, "60", tag="gone", size=1)
+        + _country_page(2, "14", tag="uk")
+        + _country_page(2, "15", tag="de")
+        + _country_page(2, "61", tag="lost", size=1)
+    )
+
+    with capture_logs() as seen:
+        await scraper._enrich_listing_country_ids(first)
+        await scraper._enrich_listing_country_ids(second)
+
+    first_page = ["tr1-1", "tr1-2", "gone1-1", "uk1-1", "uk1-2"]
+    # Вторая страница: 7 закрыт, 14 берётся из словаря, 60 перепроверяется.
+    second_page = ["gone2-1", "de2-1", "de2-2", "lost2-1"]
+    assert requested == first_page + second_page
+    seen_countries: dict[str, set[str | None]] = {}
+    for product in first + second:
+        tag = product.external_id.rstrip("0123456789-")
+        seen_countries.setdefault(tag, set()).add(product.manufacturer_country_raw)
+    assert seen_countries == {
+        "tr": {"7"},
+        "gone": {"60"},
+        # На первой странице 14 разрешился сразу, поэтому числа не осталось.
+        "uk": {"Англия"},
+        "de": {"Германия"},
+        "lost": {"61"},
+    }
+    assert sorted(scraper.verified_country_mappings) == ["14", "15"]
+    assert [(row["country_id"], row["retry"]) for row in _unresolved_rows(seen)] == [
+        ("7", False),
+        ("60", True),
+        ("61", True),
+    ]
 
 
 async def test_aloe_unreadable_country_detail_is_retried_but_logged_once(monkeypatch) -> None:
