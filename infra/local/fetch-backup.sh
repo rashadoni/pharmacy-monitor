@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 #
-# Fetch latest prod Postgres backup to this Mac.
+# Fetch latest prod Postgres backup to this machine.
 #
 # User-initiated offsite backup: pulls newest pharmacy-monitor-*.sql.gz.gpg
-# from /var/backups/pharmacy-monitor/ on Hetzner into ~/Backups/pharmacy/.
+# from /var/backups/pharmacy-monitor/ on the production server into
+# ~/Backups/pharmacy/. Runs from any machine whose SSH key the server accepts.
+#
+# The server keeps 14 days of dumps on its own disk and nothing pushes them
+# anywhere else: a copy outside the server exists only if this script ran.
+# Until 2026-10-07 its default target was the Hetzner host deleted in 2026-09,
+# so with defaults it could not fetch anything after the move to Contabo
+# (2026-09-03).
 #
 # Recommended cadence: once a week. Run when leaving for vacation /
 # after big DB changes / before risky deployments.
@@ -13,16 +20,24 @@
 #   bash infra/local/fetch-backup.sh --list     # list available backups on prod
 #   bash infra/local/fetch-backup.sh <name>     # fetch specific backup
 #
-# Decryption (recover from backup):
-#   passphrase=$(security find-generic-password -a pm -s pharmacy-monitor-gpg -w)
-#   gpg --batch --yes --passphrase "$passphrase" -d backup.sql.gz.gpg | gunzip > backup.sql
+# Decryption (recover from backup) needs BACKUP_GPG_PASSPHRASE, the value the
+# server encrypts with (/etc/pharmacy-monitor/env). A fetched dump is useless
+# without it, so the passphrase must also live somewhere that is not the
+# server (on the Mac: Keychain item pharmacy-monitor-gpg).
+#   gpg --batch --yes --passphrase-fd 0 -d backup.sql.gz.gpg | gunzip > backup.sql
 #   psql -h <host> -U pm pharmacy_monitor < backup.sql
 
 set -euo pipefail
 
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
-PROD_HOST="${PROD_HOST:-46.225.149.52}"
+PROD_HOST="${PROD_HOST:-13.140.186.143}"
 PROD_USER="${PROD_USER:-root}"
+# Pinned host key: refuse anything that is not the production server instead
+# of trusting whatever answers on the address. ControlPath=none because a
+# multiplexed connection (ControlMaster in ~/.ssh/config) skips the check.
+KNOWN_HOSTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/prod_known_hosts"
+SSH_OPTS=(-i "$SSH_KEY" -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=yes
+          -o ControlPath=none)
 REMOTE_DIR="/var/backups/pharmacy-monitor"
 LOCAL_DIR="${LOCAL_DIR:-$HOME/Backups/pharmacy}"
 
@@ -31,12 +46,12 @@ mkdir -p "$LOCAL_DIR"
 case "${1:-}" in
     --list|-l)
         echo "Available backups on prod (newest first):"
-        ssh -i "$SSH_KEY" "$PROD_USER@$PROD_HOST" "ls -lhS $REMOTE_DIR/pharmacy-monitor-*.sql.gz* 2>/dev/null | awk '{print \$NF, \"(\" \$5 \")\"}'"
+        ssh "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST" "ls -lht $REMOTE_DIR/pharmacy-monitor-*.sql.gz* 2>/dev/null | awk '{print \$NF, \"(\" \$5 \")\"}'"
         exit 0
         ;;
     "")
         # No arg: fetch latest. -t = sort by mtime descending, head -1 = newest.
-        target=$(ssh -i "$SSH_KEY" "$PROD_USER@$PROD_HOST" "ls -t $REMOTE_DIR/pharmacy-monitor-*.sql.gz* 2>/dev/null | head -1")
+        target=$(ssh "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST" "ls -t $REMOTE_DIR/pharmacy-monitor-*.sql.gz* 2>/dev/null | head -1")
         if [[ -z "$target" ]]; then
             echo "ERROR: no backups found on prod in $REMOTE_DIR" >&2
             exit 1
@@ -58,7 +73,7 @@ if [[ -f "$local_path" ]]; then
 fi
 
 echo "==> Fetching $basename from prod..."
-scp -i "$SSH_KEY" "$PROD_USER@$PROD_HOST:$target" "$local_path"
+scp "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST:$target" "$local_path"
 
 size=$(du -h "$local_path" | cut -f1)
 echo "==> Saved → $local_path ($size)"
@@ -76,6 +91,5 @@ fi
 echo
 echo "==> Done. Total local backups: $(ls "$LOCAL_DIR"/pharmacy-monitor-*.sql.gz* 2>/dev/null | wc -l | tr -d ' ')"
 echo
-echo "To decrypt (emergency restore):"
-echo "  passphrase=\$(security find-generic-password -a pm -s pharmacy-monitor-gpg -w)"
-echo "  gpg --batch --yes --passphrase \"\$passphrase\" -d \"$local_path\" | gunzip > restore.sql"
+echo "To decrypt (emergency restore) you need BACKUP_GPG_PASSPHRASE kept off the server:"
+echo "  gpg --batch --yes --passphrase-fd 0 -d \"$local_path\" | gunzip > restore.sql"

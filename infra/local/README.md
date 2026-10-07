@@ -5,18 +5,25 @@ the scrape path:
 
 | Site | Runtime |
 |---|---|
-| pharmonline.az | Hetzner prod, DDP through paid proxy |
-| aptekonline.az | Hetzner prod, Decodo AZ residential proxy |
-| aloe.az | Hetzner prod, direct RSC/HTTP parser |
+| pharmonline.az | prod server, see CLAUDE.md "Расписание сбора" |
+| aptekonline.az | prod server, Decodo AZ residential proxy |
+| aloe.az | prod server, direct RSC/HTTP parser |
+
+The production server moved from Hetzner to Contabo on 2026-09-03 and the
+Hetzner host was deleted. Nothing in this directory defaults to the old address
+any more: the retired scripts have no default target at all, and every SSH call
+accepts only the host key pinned in `infra/prod_known_hosts`.
 
 `com.pharmacy-monitor.scrape` and `com.pharmacy-monitor.watch` must stay
 unloaded/disabled. The local scrape scripts are fail-closed and exit without
 scraping unless `PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1` is set for an explicit
 one-off disaster-recovery run.
 
-The only local launchd job that may remain active is
-`com.pharmacy-monitor.db-tunnel`, which is a diagnostics/Postgres tunnel and not
-a scraper.
+`com.pharmacy-monitor.db-tunnel` (a diagnostics/Postgres tunnel, not a scraper)
+is stale too: it pointed at the deleted Hetzner host. Unload it on the Mac
+(`launchctl bootout gui/$UID/com.pharmacy-monitor.db-tunnel`); the copy here
+carries a placeholder instead of an address until someone decides the tunnel is
+still wanted.
 
 ## Files
 
@@ -24,8 +31,10 @@ a scraper.
 - `watch-scrape-queue.sh` - retired UI queue watcher; exits unless explicitly enabled.
 - `com.pharmacy-monitor.scrape.plist` - retired launchd unit; keep unloaded.
 - `com.pharmacy-monitor.watch.plist` - retired launchd unit; keep unloaded.
-- `com.pharmacy-monitor.db-tunnel.plist` - diagnostics DB tunnel; not a scraper.
-- `fetch-backup.sh` - local backup fetch helper; not a scraper.
+- `com.pharmacy-monitor.db-tunnel.plist` - stale diagnostics DB tunnel; placeholder target, keep unloaded.
+- `fetch-backup.sh` - pulls the newest encrypted DB dump off the production
+  server. The only way a copy leaves the server today; runs from any machine
+  whose SSH key the server accepts, not just the Mac.
 
 ## Emergency DR Only
 
@@ -34,7 +43,7 @@ services, proxy balances, and systemd timers. If an explicit one-off DR run is
 approved, run the script manually with:
 
 ```bash
-PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 bash infra/local/run-scrape.sh --site <site> --mode category --no-alerts
+PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 PROD_HOST=<prod address> bash infra/local/run-scrape.sh --site <site> --mode category --no-alerts
 ```
 
 After the DR run, confirm the Mac launchd scrape/watch units are still disabled.

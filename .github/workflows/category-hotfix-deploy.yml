@@ -23,7 +23,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 13.140.186.143 >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' \
+            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDVrem8NrMZMjV9cDiB8/8wOwOn1wrfSU7S5vfaLHM+R' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          test "$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')" = \
+            'SHA256:Hx7TYOZC2diIb6ZwI9LRv4bybasYCijb+lKnQQmGk/I'
 
       - name: Backup and deploy category comparison files
         run: |

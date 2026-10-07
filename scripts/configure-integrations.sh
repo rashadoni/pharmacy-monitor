@@ -13,20 +13,35 @@
 # После каждого блока обновляет /etc/pharmacy-monitor/env на проде
 # и перезапускает pharmacy-monitor-api.
 #
-# Запуск: bash scripts/configure-integrations.sh
+# Запуск: PROD_HOST=<адрес прода> bash scripts/configure-integrations.sh
+#
+# УСТАРЕЛ (помечено 2026-10-07). Адреса по умолчанию больше нет: скрипт был
+# нацелен на Hetzner-сервер, удалённый в сентябре 2026, а он отправляет на
+# PROD_HOST вводимые ключи. Теперь адрес задаётся явно, и соединение принимается
+# только с host key из infra/prod_known_hosts.
+# Перед запуском учесть, что блоки писались под май 2026:
+#   1, 3 (SMTP, Sentry) — уже настроены на проде;
+#   4 (ScraperAPI)      — НЕ запускать: aptekonline давно собирается на проде
+#                         через Decodo, блок перепишет SCRAPER_API_SITES;
+#   5 (GitHub remote)   — НЕ запускать: репозиторий давно на GitHub, а прямой
+#                         push в main запрещён (docs/DELIVERY-ARCHITECTURE.md).
 
 set -e
 trap 'echo "Прерывание. Существующая конфигурация на проде не изменена." ; exit 130' INT
 
-PROD_HOST="46.225.149.52"
+PROD_HOST="${PROD_HOST:-}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+KNOWN_HOSTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/infra/prod_known_hosts"
 PROD_ENV_FILE="/etc/pharmacy-monitor/env"
 
 # ────────────────────────────────────────────────────────────────────────────
 # helpers
 # ────────────────────────────────────────────────────────────────────────────
 
-ssh_root() { ssh -i "$SSH_KEY" -l root "$PROD_HOST" "$@"; }
+ssh_root() {
+    ssh -i "$SSH_KEY" -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=yes \
+        -o ControlPath=none -l root "$PROD_HOST" "$@"
+}
 
 # update_env KEY VALUE — set or replace KEY=VALUE in prod env file
 update_env() {
@@ -230,6 +245,11 @@ configure_github() {
 # ────────────────────────────────────────────────────────────────────────────
 
 main() {
+    if [[ -z "$PROD_HOST" ]]; then
+        echo "PROD_HOST не задан. Прежний сервер удалён, адреса по умолчанию нет —" >&2
+        echo "см. шапку скрипта и CLAUDE.md («Server»)." >&2
+        exit 1
+    fi
     cd "$(dirname "$0")/.."
     echo "Pharmacy Monitor — interactive integration setup"
     echo "Production target: root@$PROD_HOST (ssh key: $SSH_KEY)"
