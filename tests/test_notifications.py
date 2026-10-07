@@ -582,7 +582,7 @@ def _weekly_bodies(s, tenant_id) -> tuple[dict[str, str], str]:
 def test_weekly_digest_big_week_is_summary_plus_capped_lists(setup, tenant_user):
     """Неделя на 2 039 событий (как после добавления разделов aloe) — письмо со
     сводкой и списком до потолка, а не строка на каждое событие."""
-    s = setup  # порог alice — warning
+    s = setup
     tenant_user.weekly_digest = True
     run = _eligible_run(s, tenant_user.tenant_id)
     for i in range(1900):
@@ -626,7 +626,7 @@ def test_weekly_digest_big_week_is_summary_plus_capped_lists(setup, tenant_user)
 
     assert len(bodies) == 1
     assert len(body.encode()) < GMAIL_CLIP_BYTES
-    assert _event_rows(body) == 5 + notifications._DIGEST_TYPE_CAP
+    assert _event_rows(body) == 5 + notifications._DIGEST_TYPE_CAP + 18
 
     # Шапка и сводка: каждый тип одной строкой, новые товары — числом по сайтам.
     assert f"2{NBSP}039 событий: 90 критичных, 22 предупреждения, 1{NBSP}927 информационных" in body
@@ -637,7 +637,9 @@ def test_weekly_digest_big_week_is_summary_plus_capped_lists(setup, tenant_user)
     assert "Можно поднять цену" in body
     # …и ни один из 1 909 новых товаров строкой.
     assert "Новый товар на" not in body
-    assert "RAISE" not in body  # info ниже порога alice — только числом
+    # «Можно поднять цену» помещается целиком — идёт строками, крупные сверху.
+    assert body.count("detail of RAISE") == 18
+    assert body.index("RAISE17") < body.index("RAISE00")
 
     # Малочисленное, но главное («конкурент дешевле») не вытеснено сотней падений цены.
     for i in range(5):
@@ -653,7 +655,7 @@ def test_weekly_digest_big_week_is_summary_plus_capped_lists(setup, tenant_user)
     assert "Ещё 77 — в дашборде" in body
     assert 'href="https://example.com/alerts?hours=168&amp;type=price_drop_pct"' in body
     assert 'href="https://example.com/alerts?hours=168"' in body
-    assert f"35 из 2{NBSP}039, самые важные" in body
+    assert f"53 из 2{NBSP}039, самые важные" in body
 
     assert subject == (
         f"Pharmacy Monitor — дайджест за неделю: 2{NBSP}039 событий, из них 90 критичных"
@@ -662,9 +664,8 @@ def test_weekly_digest_big_week_is_summary_plus_capped_lists(setup, tenant_user)
 
 def test_weekly_digest_small_week_lists_every_event(setup, tenant_user):
     """Мало событий — как раньше: каждое строкой, ничего не спрятано за ссылку."""
-    s = setup
+    s = setup  # порог alice — warning; на дайджест он не действует
     tenant_user.weekly_digest = True
-    tenant_user.email_severity_min = "info"
     run = _eligible_run(s, tenant_user.tenant_id)
     titles = []
     for i in range(3):
@@ -690,15 +691,19 @@ def test_weekly_digest_small_week_lists_every_event(setup, tenant_user):
         assert f"detail of {title}" in body
     assert "Ещё " not in body
     assert "самые важные" not in body
-    assert "ниже порога важности" not in body
     assert subject == "Pharmacy Monitor — дайджест за неделю: 14 событий, из них 3 критичных"
 
 
-def test_weekly_digest_respects_recipient_threshold(setup, tenant_user):
-    """События ниже порога получателя — числом в сводке, не строками."""
+def test_weekly_digest_ignores_recipient_threshold(setup, tenant_user):
+    """«Порог email-уведомлений» получателя на дайджест не действует (решение
+    владельца 2026-10-07): письмо у всех одно, информационные события в нём есть."""
     s = setup  # alice: warning
     tenant_user.weekly_digest = True
-    for email, threshold in (("bob@example.com", "info"), ("carol@example.com", None)):
+    for email, threshold in (
+        ("bob@example.com", "critical"),
+        ("carol@example.com", "off"),
+        ("dave@example.com", None),
+    ):
         s.add(
             storage.TenantUser(
                 tenant_id=tenant_user.tenant_id,
@@ -716,18 +721,11 @@ def test_weekly_digest_respects_recipient_threshold(setup, tenant_user):
     s.commit()
 
     bodies, _ = _weekly_bodies(s, tenant_user.tenant_id)
-    alice, bob, carol = (bodies[f"{name}@example.com"] for name in ("alice", "bob", "carol"))
 
-    assert "CRITTITLE" in alice and "CRITTITLE" in bob
-    assert "INFOTITLE" in bob
-    assert "INFOTITLE" not in alice
-    # У alice новый товар не пропал — он посчитан в сводке, и письмо говорит почему.
-    assert "Новые товары" in alice
-    assert "1 из 2, самые важные" in alice
-    assert "ниже порога важности" in alice
-    assert "ниже порога важности" not in bob
-    # Порог не задан — действует тот же, что и для мгновенных писем (warning).
-    assert carol == alice
+    assert len(bodies) == 4
+    assert len(set(bodies.values())) == 1
+    assert "CRITTITLE" in bodies["bob@example.com"]
+    assert "INFOTITLE" in bodies["bob@example.com"]
 
 
 def test_digest_rows_go_to_critical_of_every_type_first():
@@ -775,9 +773,7 @@ def test_digest_info_type_is_listed_whole_or_counted():
         _loose_event("new_product", "info", f"NEWPRODUCT{i:02d}", {"site": "aloe"})
         for i in range(notifications._DIGEST_TYPE_CAP + 1)
     ]
-    html = notifications._render_digest_email(
-        fits + overflows, kind="weekly", since=utcnow(), severity_min="info"
-    )
+    html = notifications._render_digest_email(fits + overflows, kind="weekly", since=utcnow())
 
     assert html.count("RAISE") == 30
     assert "NEWPRODUCT" not in html
@@ -792,9 +788,7 @@ def test_digest_info_type_is_not_cut_to_fit_remaining_rows():
         + [_loose_event("price_drop_pct", "critical", f"PD{i:02d}") for i in range(28)]
         + [_loose_event("new_product", "info", f"NEWPRODUCT{i:02d}") for i in range(10)]
     )
-    html = notifications._render_digest_email(
-        events, kind="weekly", since=utcnow(), severity_min="info"
-    )
+    html = notifications._render_digest_email(events, kind="weekly", since=utcnow())
 
     assert _event_rows(html) == 56
     assert "NEWPRODUCT" not in html

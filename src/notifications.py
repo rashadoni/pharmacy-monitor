@@ -385,30 +385,27 @@ def _send_digest(
         log.info("digest_no_events", kind=kind, tenant=tenant_id)
         return 0
 
+    # Письмо одно на всех получателей. «Порог email-уведомлений» получателя
+    # (`email_severity_min`) на дайджест не действует — решение владельца
+    # 2026-10-07: размер держат потолки, а с порогом `warning` из почты совсем
+    # пропали бы названия товаров из «Можно поднять цену».
+    html = _render_digest_email(events, kind=kind, since=since)
     subject = _digest_subject(events, kind)
-    # Письмо зависит от порога получателя: события ниже порога идут в него
-    # числом, а не строками. Получателей с одним порогом рендерим один раз.
-    rendered: dict[str, str] = {}
     sent = 0
     for user in users:
-        threshold = user.email_severity_min or DEFAULT_EMAIL_SEVERITY
-        if threshold not in rendered:
-            rendered[threshold] = _render_digest_email(
-                events, kind=kind, since=since, severity_min=threshold
-            )
         if dry_run:
             log.info(
                 "digest_dry_run",
                 kind=kind,
                 user=user.email,
                 subject=subject,
-                kb=round(len(rendered[threshold].encode()) / 1024, 1),
-                rows=rendered[threshold].count(_EVENT_ROW_MARK),
+                kb=round(len(html.encode()) / 1024, 1),
+                rows=html.count(_EVENT_ROW_MARK),
             )
             sent += 1
             continue
         try:
-            notifier.send_email(subject=subject, html_body=rendered[threshold], to=[user.email])
+            notifier.send_email(subject=subject, html_body=html, to=[user.email])
             sent += 1
         except Exception as e:
             log.warning("digest_email_failed", user=user.email, kind=kind, error=str(e))
@@ -600,18 +597,10 @@ def _digest_groups(
     return sorted(by_type.items(), key=position)
 
 
-def _digest_listable(event: storage.AlertEvent, severity_min: str) -> bool:
-    """Проходит ли событие порог получателя. Незнакомая важность считается
-    информационной — так же, как её считает сводка."""
-    return _severity_passes(severity_min, _digest_bucket(event.severity), DEFAULT_EMAIL_SEVERITY)
-
-
 def _digest_selection(
-    groups: list[tuple[str, list[storage.AlertEvent]]], severity_min: str
+    groups: list[tuple[str, list[storage.AlertEvent]]],
 ) -> dict[str, list[storage.AlertEvent]]:
     """Какие события идут в письмо строками, по типам.
-
-    Ниже порога получателя — никогда: они остаются числом в сводке.
 
     Строки раздаются по важности: сначала критичные всех типов, потом
     предупреждения, потом информационные — иначе предупреждения одного типа
@@ -628,13 +617,9 @@ def _digest_selection(
     for bucket in _BUCKET_RANK:
         wanted: dict[str, list[storage.AlertEvent]] = {}
         for rule_type, group in groups:
-            events = [
-                e
-                for e in group
-                if _digest_bucket(e.severity) == bucket and _digest_listable(e, severity_min)
-            ]
+            events = [e for e in group if _digest_bucket(e.severity) == bucket]
             room = _DIGEST_TYPE_CAP - len(chosen[rule_type])
-            if not events or (bucket == "info" and len(events) > room):
+            if not events or room <= 0 or (bucket == "info" and len(events) > room):
                 continue
             # Сортировка устойчивая: при равном размере остаётся порядок «новые сверху».
             events.sort(key=lambda e: -_event_magnitude(e))
@@ -729,24 +714,13 @@ def _digest_block(
 """.strip()
 
 
-def _render_digest_email(
-    events: Iterable[storage.AlertEvent],
-    kind: str,
-    since: datetime,
-    severity_min: str | None = None,
-) -> str:
-    """Письмо-дайджест: сводка по типам, затем списки с потолком.
-
-    `severity_min` — порог получателя (`email_severity_min`): события ниже него
-    в списки не попадают и остаются числом в сводке. Без порога перечисляется
-    всё, что помещается в потолки.
-    """
+def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since: datetime) -> str:
+    """Письмо-дайджест: сводка по типам, затем списки с потолком."""
     events = list(events)
-    threshold = severity_min or "info"
     total = len(events)
 
     groups = _digest_groups(events)
-    chosen = _digest_selection(groups, threshold)
+    chosen = _digest_selection(groups)
     summary_rows = [_digest_summary_row(rule_type, group, kind) for rule_type, group in groups]
     blocks = [
         _digest_block(rule_type, group, chosen[rule_type], kind)
@@ -764,13 +738,6 @@ def _render_digest_email(
         )
     else:
         scope_note = "В этом письме только сводка. Сами события — в дашборде."
-    below_threshold = any(not _digest_listable(e, threshold) for e in events)
-    threshold_note = (
-        "События ниже порога важности, заданного для вашей почты, идут в письме только числом. "
-        if below_threshold
-        else ""
-    )
-
     period_name = _digest_period_name(kind)
     period = f"{since.strftime('%d.%m')} – {utcnow().strftime('%d.%m')}"
     totals = f"{_num(total)} {_plural(total, 'событие', 'события', 'событий')}"
@@ -798,7 +765,7 @@ def _render_digest_email(
     <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
       <a href="{_alerts_url(kind)}" style="color:#3b82f6;">Все события за {period_name} — в дашборде →</a>
       <br><br>
-      {threshold_note}Отписаться или изменить порог важности: администратор делает это в дашборде, Настройки → Пользователи.
+      Отписаться от дайджеста: администратор отключает его в дашборде, Настройки → Пользователи.
     </td></tr>
   </table>
 </body>
