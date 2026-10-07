@@ -201,7 +201,7 @@ def test_full_scan_records_one_observation_per_scraped_entry(db_session, monkeyp
 
 
 def test_category_larger_than_one_write_batch_is_observed_once(db_session, monkeypatch):
-    """Запись идёт пачками, и учёт «наблюдение уже есть» ведётся по пачкам."""
+    """Категория больше одной пачки записи: наблюдение по-прежнему одно на запись."""
     monkeypatch.setattr(main_mod, "_PERSIST_CHUNK", 2)
     catalog = {"cat-a": [_scraped(f"p{n}", 1.0 + n, "cat-a") for n in range(5)]}
 
@@ -209,6 +209,32 @@ def test_category_larger_than_one_write_batch_is_observed_once(db_session, monke
 
     assert _observations(db_session, run) == {f"p{n}": 1 for n in range(5)}
     assert run.products_scraped == 5
+
+
+def test_write_that_fails_midway_keeps_what_it_already_recorded(db_session, monkeypatch):
+    """Запись категории упала на второй пачке, первая уже в базе вместе с
+    наблюдением. Финальный проход добавляет наблюдение только второй: учёт
+    ведётся по закоммиченным пачкам, а не по вызовам."""
+    from src import normalize
+
+    monkeypatch.setattr(main_mod, "_PERSIST_CHUNK", 1)
+    catalog = {"cat-a": [_scraped("first", 5.0, "cat-a"), _scraped("second", 7.0, "cat-a")]}
+    real_normalize_name = normalize.normalize_name
+    failed_once: list[str] = []
+
+    def flaky_normalize_name(name):
+        if name == "Product second" and not failed_once:
+            failed_once.append(name)
+            raise RuntimeError("normalization failed")
+        return real_normalize_name(name)
+
+    monkeypatch.setattr(normalize, "normalize_name", flaky_normalize_name)
+
+    run = _run_aloe(db_session, monkeypatch, catalog)
+
+    assert failed_once == ["Product second"]
+    assert _observations(db_session, run) == {"first": 1, "second": 1}
+    assert run.products_scraped == 2
 
 
 def test_final_pass_observes_the_category_whose_incremental_write_failed(db_session, monkeypatch):
@@ -364,7 +390,8 @@ def test_repeated_entry_is_observed_once_but_its_product_is_still_updated(db_ses
     persist_results(
         db_session, run, [ScrapeResult(site="aloe", products=[entry])], observed=observed
     )
-    stamped_by_first_pass = _product(db_session, "one").availability_observed_at
+    first_pass = _product(db_session, "one")
+    stamped_by_first_pass = (first_pass.availability_observed_at, first_pass.last_seen_at)
 
     entry.category = "second"
     count = persist_results(
@@ -375,7 +402,8 @@ def test_repeated_entry_is_observed_once_but_its_product_is_still_updated(db_ses
     assert _observation_count(db_session, run) == 1
     product = _product(db_session, "one")
     assert product.category == "second"
-    assert product.availability_observed_at > stamped_by_first_pass
+    assert product.availability_observed_at > stamped_by_first_pass[0]
+    assert product.last_seen_at > stamped_by_first_pass[1]
 
 
 def test_entries_are_told_apart_by_object_not_by_product(db_session):
