@@ -132,27 +132,22 @@ def test_country_normalization_keeps_ambiguous_aloe_labels_unresolved() -> None:
         assert country_resolution(raw) == (None, COUNTRY_INVALID), raw
 
 
-def test_country_dictionary_spellings_survive_key_folding() -> None:
-    """Каждое написание из словаря находится после свёртки ключа.
+def test_every_country_dictionary_spelling_is_reachable() -> None:
+    """Каждое написание из словаря разрешается через публичную функцию.
 
     Регрессия: «китай», «швейцария», «азербайджан» и «rumıniya» лежали в
     словаре буквально, а входное значение сворачивалось (й→и, ı→i) — ключ не
-    совпадал, и страна молча оставалась неразрешённой.
+    совпадал, и страна молча оставалась неразрешённой. Тем же способом был
+    мёртв ключ «uk»: две буквы сверяются только со списком ISO.
     """
-    from src.product_policy import (
-        _COUNTRY_ALIASES,
-        _COUNTRY_SPELLINGS,
-        _ISO_ALPHA2,
-        _country_key,
-    )
+    from src.product_policy import _COUNTRY_SPELLINGS, _ISO_ALPHA2, _country_key
 
     folded: dict[str, str] = {}
     for spelling, code in _COUNTRY_SPELLINGS.items():
         assert code in _ISO_ALPHA2, spelling
-        key = _country_key(spelling)
+        assert normalize_country_code(spelling) == code, spelling
         # Два написания не должны сворачиваться в один ключ с разными странами.
-        assert folded.setdefault(key, code) == code, spelling
-        assert _COUNTRY_ALIASES[key] == code, spelling
+        assert folded.setdefault(_country_key(spelling), code) == code, spelling
 
     assert normalize_country_code("Китай") == "cn"
     assert normalize_country_code("Швейцария") == "ch"
