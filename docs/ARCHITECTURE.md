@@ -275,8 +275,10 @@ Every hour 05-17 ─ pharmacy-monitor-intraday.timer fires (Phase 5.1c)
   │     - Если locked → skip tick, log "intraday_skipped reason=site_rate_limited",
   │       очередь остаётся у той же категории
   ├── Прогон взят → Redis INCR "intraday:rotation:idx"
-  └── pharmacy-monitor scrape --site aloe --category-id N --limit 600
-        (только сбор: матчер, алерты и ROI тик не запускает)
+  ├── pharmacy-monitor scrape --site aloe --category-id N --limit 600
+  │     (только сбор: матчер, журнал алертов и ROI тик не трогает)
+  └── alerts.local_price_alerts_for_partial_run → письмо admin/owner
+        (падения цены, которые тик увидел сам; в базе не хранятся)
 ```
 
 Result: 5–7 supplemental Aloe scrapes/day (13 тиков при лимите один прогон на

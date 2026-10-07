@@ -288,6 +288,89 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
     return {"email": emails_sent, "telegram": tg_sent}
 
 
+# ─── События, которых нет в журнале: только администраторам ──────────────────
+
+# Кому идут письма «только администраторам» — те же роли, что API считает
+# администраторскими. Это роль, а не лично владелец: у сотрудника клиента роль
+# должна быть viewer.
+ADMIN_ROLES = ("admin", "owner")
+
+_ADMIN_ONLY_TELEGRAM_NOTE = "Только администраторам: частичный сбор, в журнал алертов не попадает."
+
+
+def mail_unstored_events_to_admins(
+    session: Session, events: list[storage.AlertEvent], *, note: str
+) -> dict[str, int]:
+    """Одно письмо на администратора о событиях, которых нет в журнале алертов.
+
+    Для событий частичного сбора (`alerts.local_price_alerts_for_partial_run`):
+    клиенту они не показываются и в базе не хранятся. Отсюда отличия от
+    `dispatch_events_batch`:
+
+    - получатели — только активные пользователи с ролью из `ADMIN_ROLES`;
+    - `daily_digest` письмо не отменяет: в дайджест такое событие не попадёт,
+      его нет в базе;
+    - `channels_sent` не ведётся и ничего не коммитится. Повторной отправки
+      нет: что не ушло, то потеряно, и вызывающий узнаёт об этом из `failed`.
+
+    Пороги важности и тихие часы действуют как обычно. `note` — пояснение под
+    заголовком письма.
+
+    Возвращает {'email': писем, 'telegram': сообщений, 'failed': сбоев}.
+    """
+    counts = {"email": 0, "telegram": 0, "failed": 0}
+    by_tenant: dict[int, list[storage.AlertEvent]] = {}
+    for e in events:
+        by_tenant.setdefault(getattr(e, "tenant_id", 1) or 1, []).append(e)
+
+    for tenant_id, tevents in by_tenant.items():
+        admins = session.scalars(
+            select(storage.TenantUser).where(
+                storage.TenantUser.tenant_id == tenant_id,
+                storage.TenantUser.is_active.is_(True),
+                storage.TenantUser.role.in_(ADMIN_ROLES),
+            )
+        ).all()
+        for user in admins:
+            ev_email = [
+                e
+                for e in tevents
+                if _severity_passes(user.email_severity_min, e.severity, DEFAULT_EMAIL_SEVERITY)
+            ]
+            if ev_email:
+                try:
+                    delivered = notifier.send_email(
+                        subject=_batch_subject(ev_email),
+                        html_body=_render_batch_email(ev_email, note=note),
+                        to=[user.email],
+                    )
+                except Exception as exc:
+                    delivered = False
+                    log.warning("email_batch_failed", user=user.email, error=str(exc))
+                counts["email" if delivered else "failed"] += 1
+
+            if user.telegram_chat_id and not _in_quiet_hours(user.quiet_hours):
+                ev_tg = [
+                    e
+                    for e in tevents
+                    if _severity_passes(
+                        user.telegram_severity_min, e.severity, DEFAULT_TELEGRAM_SEVERITY
+                    )
+                ]
+                if ev_tg:
+                    try:
+                        delivered = notifier.send_telegram_message(
+                            user.telegram_chat_id,
+                            f"{_format_batch_text(ev_tg)}\n{_ADMIN_ONLY_TELEGRAM_NOTE}",
+                        )
+                    except Exception as exc:
+                        delivered = False
+                        log.warning("telegram_batch_failed", user=user.email, error=str(exc))
+                    counts["telegram" if delivered else "failed"] += 1
+
+    return counts
+
+
 # ─── Telegram /start binding ─────────────────────────────────────────────────
 
 
@@ -805,8 +888,14 @@ def _batch_subject(events: list[storage.AlertEvent]) -> str:
     return f"[{worst.upper()}] Pharmacy Monitor — {len(events)} алертов"
 
 
-def _render_batch_email(events: list[storage.AlertEvent]) -> str:
+def _render_batch_email(events: list[storage.AlertEvent], *, note: str | None = None) -> str:
     """ОДНО письмо со списком всех событий прогона (critical → warning → info)."""
+    note_row = (
+        '<tr><td style="padding:12px 24px;background:#fffbeb;border-bottom:1px solid #e4e4e7;'
+        f'font-size:13px;color:#52525b;">{escape(note, quote=False)}</td></tr>'
+        if note
+        else ""
+    )
     ordered = sorted(events, key=lambda e: -SEVERITY_ORDER.get(e.severity, 0))
     rows = "\n".join(_format_event_html(e) for e in ordered)
     public = os.environ.get("PHARMACY_PUBLIC_URL", "")
@@ -828,6 +917,7 @@ def _render_batch_email(events: list[storage.AlertEvent]) -> str:
       <div style="font-size:22px;font-weight:600;color:#18181b;">{len(events)} алертов за прогон</div>
       <div style="font-size:13px;color:#71717a;margin-top:4px;">{summary}</div>
     </td></tr>
+    {note_row}
     {rows}
     <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
       <a href="{public}/alerts" style="color:#3b82f6;">Открыть в дашборде →</a>

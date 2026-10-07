@@ -387,6 +387,155 @@ def test_dispatch_events_batch_two_users_different_thresholds(setup, tenant_user
     assert warn.channels_sent == ["email"]  # ушёл alice → помечен
 
 
+# ─── mail_unstored_events_to_admins (события частичного сбора) ───────────────
+
+
+def _add_user(s, tenant_id, email, role, **fields):
+    user = storage.TenantUser(
+        tenant_id=tenant_id,
+        email=email,
+        role=role,
+        is_active=True,
+        created_at=utcnow(),
+        email_severity_min="warning",
+        **fields,
+    )
+    s.add(user)
+    return user
+
+
+def test_unstored_events_reach_admins_and_never_viewers(setup, tenant_user):
+    """Письмо и Telegram — только admin/owner; сотрудник клиента не получает ничего."""
+    s = setup  # tenant_user (alice) — admin, Telegram не привязан
+    t = tenant_user.tenant_id
+    # У сотрудника клиента привязан Telegram и самый низкий порог: если бы круг
+    # получателей не резался по роли, сообщение ушло бы и ему.
+    _add_user(
+        s, t, "bob@example.com", "viewer", telegram_chat_id="111", telegram_severity_min="info"
+    )
+    _add_user(
+        s, t, "carol@example.com", "owner", telegram_chat_id="222", telegram_severity_min="info"
+    )
+    _add_user(s, t, "gone@example.com", "admin").is_active = False
+    s.commit()
+    # Событие вне базы — так приходят изменения цены с частичного сбора.
+    event = _loose_event("price_drop_pct", "critical", "Цена упала на 20.0%: X")
+
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
+    ):
+        result = notifications.mail_unstored_events_to_admins(
+            s, [event], note="Частичный сбор aloe <b>, только администраторам"
+        )
+
+    assert sorted(c.kwargs["to"][0] for c in mock_email.call_args_list) == [
+        "alice@example.com",
+        "carol@example.com",
+    ]
+    assert [c.args[0] for c in mock_tg.call_args_list] == ["222"]
+    assert "Только администраторам" in mock_tg.call_args.args[1]
+    assert result == {"email": 2, "telegram": 1, "failed": 0}
+    body = mock_email.call_args.kwargs["html_body"]
+    assert "Частичный сбор aloe &lt;b&gt;, только администраторам" in body
+    # В журнал событие не попало, и рассылка ничего о нём не записала.
+    assert s.query(storage.AlertEvent).count() == 0
+    assert event.channels_sent is None
+
+
+def test_unstored_events_ignore_the_daily_digest_opt_out(setup, tenant_user):
+    """Админ «на дайджесте» письмо всё равно получает: в дайджест такое событие
+    не попадёт — его нет в базе, а обычная рассылка его бы молча пропустила."""
+    s = setup
+    tenant_user.daily_digest = True
+    s.commit()
+    event = _loose_event("price_drop_pct", "critical", "Цена упала")
+
+    with patch("src.notifier.send_email") as mock_email:
+        assert notifications.dispatch_events_batch(s, [event])["email"] == 0
+        event.channels_sent = None
+        result = notifications.mail_unstored_events_to_admins(s, [event], note="n")
+
+    assert mock_email.call_count == 1
+    assert result["email"] == 1
+
+
+def test_unstored_events_respect_the_admin_severity_threshold(setup, tenant_user):
+    s = setup
+    tenant_user.email_severity_min = "critical"
+    s.commit()
+    warning = _loose_event("price_drop_pct", "warning", "WARNONLY")
+    critical = _loose_event("price_drop_pct", "critical", "CRITONLY")
+
+    with patch("src.notifier.send_email") as mock_email:
+        result = notifications.mail_unstored_events_to_admins(s, [warning, critical], note="n")
+        body = mock_email.call_args.kwargs["html_body"]
+        assert "CRITONLY" in body and "WARNONLY" not in body
+
+        tenant_user.email_severity_min = "off"
+        s.commit()
+        silent = notifications.mail_unstored_events_to_admins(s, [warning, critical], note="n")
+
+    assert result == {"email": 1, "telegram": 0, "failed": 0}
+    assert silent == {"email": 0, "telegram": 0, "failed": 0}
+    assert mock_email.call_count == 1
+
+
+def test_unstored_events_keep_telegram_quiet_hours(setup, tenant_user, monkeypatch):
+    """Тихие часы админа действуют: Telegram молчит, письмо уходит."""
+    s = setup
+    tenant_user.telegram_chat_id = "777"
+    tenant_user.telegram_severity_min = "info"
+    tenant_user.quiet_hours = "22-08"
+    s.commit()
+    event = _loose_event("price_drop_pct", "critical", "Цена упала")
+    monkeypatch.setattr(
+        notifications, "_in_quiet_hours", lambda quiet_hours: quiet_hours == "22-08"
+    )
+
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
+    ):
+        result = notifications.mail_unstored_events_to_admins(s, [event], note="n")
+
+    assert mock_email.call_count == 1
+    assert not mock_tg.called
+    assert result == {"email": 1, "telegram": 0, "failed": 0}
+
+
+def test_unstored_events_report_a_letter_that_did_not_go(setup, tenant_user):
+    """Сбой почты не бросает исключение, но и «отправлено» не считается."""
+    s = setup
+    event = _loose_event("price_drop_pct", "critical", "Цена упала")
+
+    with patch("src.notifier.send_email", side_effect=ConnectionRefusedError("smtp down")):
+        refused = notifications.mail_unstored_events_to_admins(s, [event], note="n")
+    # SMTP не настроен: send_email возвращает False, письма не было.
+    with patch("src.notifier.send_email", return_value=False):
+        unconfigured = notifications.mail_unstored_events_to_admins(s, [event], note="n")
+
+    assert refused == {"email": 0, "telegram": 0, "failed": 1}
+    assert unconfigured == {"email": 0, "telegram": 0, "failed": 1}
+
+
+def test_dispatch_events_batch_reaches_every_role(setup, tenant_user):
+    """Обычная рассылка о прогоне по-прежнему идёт всем и без пояснения."""
+    s = setup
+    _add_user(s, tenant_user.tenant_id, "bob@example.com", "viewer")
+    event = _mk_event(s, tenant_user.tenant_id, "everyone", "critical", "For all")
+    s.commit()
+
+    with patch("src.notifier.send_email") as mock_email:
+        notifications.dispatch_events_batch(s, [event])
+
+    assert sorted(c.kwargs["to"][0] for c in mock_email.call_args_list) == [
+        "alice@example.com",
+        "bob@example.com",
+    ]
+    assert "#fffbeb" not in mock_email.call_args.kwargs["html_body"]
+
+
 def test_dispatch_events_batch_all_below_threshold_redispatchable(setup, tenant_user):
     """Все события ниже порога → 0 писем и channels_sent НЕ ставится (re-dispatch)."""
     s = setup

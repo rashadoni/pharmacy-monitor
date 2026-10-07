@@ -449,6 +449,204 @@ def test_degraded_watchlist_tick_cannot_emit_price_drop(db_session):
     assert alerts.evaluate_rules(db_session, tick.id) == []
 
 
+def _add_category_tick(s, *, status="ok", site_status="ok") -> Run:
+    """Частичный сбор одной категории — то, что оставляет `intraday-tick`."""
+    tick = Run(
+        started_at=utcnow(),
+        status=status,
+        catalog_scope="partial",
+        catalog_verified=False,
+        catalog_verification_reason="scrape_command_diagnostic_non_publishing",
+        run_quality={
+            "mode": "category",
+            "financially_eligible": False,
+            "sites": {"aloe": {"status": site_status}},
+        },
+    )
+    s.add(tick)
+    s.flush()
+    return tick
+
+
+def test_category_tick_reports_local_price_drop_without_touching_the_journal(db_session):
+    """Тик видит падение цены, но в общий журнал алертов его не кладёт."""
+    product = _add_product(db_session, "aloe", "Ticked", "ticked")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    _add_snap(db_session, previous_full, product, 100.0)
+    _add_snap(db_session, tick, product, 80.0)
+    rule = _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    events = alerts.local_price_alerts_for_partial_run(db_session, tick.id)
+
+    assert [(e.rule_type, e.severity) for e in events] == [("price_drop_pct", "critical")]
+    assert events[0].rule_id == rule.id
+    assert events[0].payload["drop_pct"] == 20.0
+    assert events[0].payload["source_run_id"] == tick.id
+    assert events[0].created_at is not None
+    # Событие существует только в памяти: ни в сессии, ни в базе его нет.
+    assert events[0] not in db_session
+    db_session.commit()
+    assert db_session.query(AlertEvent).count() == 0
+    # Путь, который пишет в журнал и шлёт всем, для такого прогона закрыт.
+    assert alerts.evaluate_rules(db_session, tick.id) == []
+    assert db_session.query(AlertEvent).count() == 0
+
+
+def test_category_tick_evaluates_only_local_price_rules(db_session):
+    """Промо, новый товар и «конкурент дешевле» по частичной выборке не считаются.
+
+    Сборщик aloe читает промо и в сборе одной категории, так что у тика они
+    есть — и правило `promo_started` на таком прогоне сработало бы.
+    """
+    product = _add_product(db_session, "aloe", "Seen first by tick", "fresh")
+    _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    _add_snap(db_session, tick, product, 50.0)
+    db_session.add(Promo(run_id=tick.id, site="aloe", title="-30% на всё"))
+    promo_rule = _add_rule(db_session, "promo_started", {})
+    _add_rule(db_session, "new_product", {})
+    _add_rule(db_session, "undercut_threshold", {"min_pct": 5.0})
+    db_session.commit()
+
+    # Само правило на этом прогоне срабатывает — значит, молчание ниже не случайно.
+    assert alerts.DETECTORS["promo_started"](db_session, tick.id, promo_rule.params)
+
+    assert alerts.local_price_alerts_for_partial_run(db_session, tick.id) == []
+
+
+def test_category_tick_below_threshold_or_without_rule_reports_nothing(db_session):
+    product = _add_product(db_session, "aloe", "Small move", "small")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    _add_snap(db_session, previous_full, product, 100.0)
+    _add_snap(db_session, tick, product, 95.0)
+    db_session.commit()
+
+    # Правила нет вовсе.
+    assert alerts.local_price_alerts_for_partial_run(db_session, tick.id) == []
+
+    rule = _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+    assert alerts.local_price_alerts_for_partial_run(db_session, tick.id) == []
+
+    # Порог правила действует и здесь: при 5% то же изменение уже событие.
+    rule.params = {"min_pct": 5.0}
+    db_session.commit()
+    assert len(alerts.local_price_alerts_for_partial_run(db_session, tick.id)) == 1
+
+    rule.is_active = False
+    db_session.commit()
+    assert alerts.local_price_alerts_for_partial_run(db_session, tick.id) == []
+
+
+def test_unclean_or_full_run_gives_no_local_price_alerts(db_session):
+    """Сбор, не дошедший до конца, и полный сбор сюда не относятся."""
+    product = _add_product(db_session, "aloe", "Dropped", "dropped")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=2))
+    _add_snap(db_session, previous_full, product, 100.0)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+
+    degraded = _add_category_tick(db_session, status="degraded", site_status="degraded")
+    _add_snap(db_session, degraded, product, 70.0)
+    site_failed = _add_category_tick(db_session, status="ok", site_status="degraded")
+    _add_snap(db_session, site_failed, product, 60.0)
+    full = _add_run(db_session, utcnow())
+    _add_snap(db_session, full, product, 50.0)
+    db_session.commit()
+
+    # Статус самого прогона решает и тогда, когда сайты в отчёте числятся ok.
+    unfinished = _add_category_tick(db_session, status="running", site_status="ok")
+    _add_snap(db_session, unfinished, product, 40.0)
+    db_session.commit()
+
+    assert not storage.run_is_partial_price_alert_eligible(degraded)
+    assert not storage.run_is_partial_price_alert_eligible(site_failed)
+    assert not storage.run_is_partial_price_alert_eligible(full)
+    assert not storage.run_is_partial_price_alert_eligible(unfinished)
+    for run in (degraded, site_failed, full, unfinished):
+        assert alerts.local_price_alerts_for_partial_run(db_session, run.id) == []
+    assert alerts.local_price_alerts_for_partial_run(db_session, 10_000) == []
+
+
+def test_category_tick_does_not_repeat_a_drop_already_in_the_journal(db_session):
+    """То же падение уже ушло всем из проверенного сбора → админу не дублируем."""
+    product = _add_product(db_session, "aloe", "Known drop", "known")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    _add_snap(db_session, previous_full, product, 100.0)
+    _add_snap(db_session, tick, product, 80.0)
+    rule = _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0}, cooldown=48)
+    db_session.add(
+        AlertEvent(
+            rule_id=rule.id,
+            rule_type="price_drop_pct",
+            dedup_key=f"drop|p={product.id}",
+            severity="warning",
+            title="earlier",
+            created_at=utcnow() - timedelta(hours=3),
+        )
+    )
+    db_session.commit()
+
+    assert alerts.local_price_alerts_for_partial_run(db_session, tick.id) == []
+
+
+def test_category_tick_does_not_repeat_a_drop_when_only_the_label_changed(db_session):
+    """Snapshot пишется и при смене одной метки акции. Цена к оплате прежняя —
+    значит, о падении уже сообщил тик, который его застал."""
+    product = _add_product(db_session, "aloe", "Relabelled", "relabel")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=2))
+    _add_snap(db_session, previous_full, product, 10.0)
+    first = _add_category_tick(db_session)
+    first.started_at = utcnow() - timedelta(hours=4)
+    _add_snap(db_session, first, product, 8.0)
+    relabel = _add_category_tick(db_session)
+    relabel.started_at = utcnow() - timedelta(hours=2)
+    db_session.add(
+        PriceSnapshot(run_id=relabel.id, product_id=product.id, price=8.0, promo_label="Хит")
+    )
+    moved_again = _add_category_tick(db_session)
+    _add_snap(db_session, moved_again, product, 7.5)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    def drops(run):
+        return [
+            e.payload["curr_price"]
+            for e in alerts.local_price_alerts_for_partial_run(db_session, run.id)
+        ]
+
+    assert drops(first) == [8.0]
+    assert drops(relabel) == []
+    # Настоящее новое изменение — отдельное письмо, cooldown между тиками нет.
+    assert drops(moved_again) == [7.5]
+
+
+def test_category_tick_lists_a_product_once_even_if_scraped_twice(db_session):
+    product = _add_product(db_session, "aloe", "Listed twice", "twice")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    _add_snap(db_session, previous_full, product, 100.0)
+    _add_snap(db_session, tick, product, 80.0)
+    _add_snap(db_session, tick, product, 80.0)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    assert len(alerts.local_price_alerts_for_partial_run(db_session, tick.id)) == 1
+
+
+def test_partial_eligibility_keeps_the_journal_closed_for_category_ticks(db_session):
+    """Право на письмо админу не открывает частичному сбору общий журнал."""
+    tick = _add_category_tick(db_session)
+    db_session.commit()
+
+    assert storage.run_is_partial_price_alert_eligible(tick)
+    assert not storage.run_is_watchlist_price_alert_eligible(tick)
+    assert alerts._allowed_rule_types_for_run(tick) == set()
+
+
 def test_price_drop_ignores_newer_partial_snapshot_as_baseline(db_session):
     product = _add_product(db_session, "aloe", "Trusted", "trusted")
     trusted = _add_run(db_session, utcnow() - timedelta(days=2))
