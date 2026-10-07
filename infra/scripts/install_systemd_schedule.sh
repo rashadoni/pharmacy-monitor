@@ -59,7 +59,7 @@ done
 systemctl daemon-reload
 
 # Местный drop-in в /etc переживает установку юнита. Полный сброс пар из
-# недельного юнита пережить её не должен: проверяем то, что systemd реально
+# планового юнита пережить её не должен: проверяем то, что systemd реально
 # запустит, а не файл из Git.
 if systemctl show --property ExecStart --value pharmacy-monitor-rematch.service \
     | grep -q -- '--reset'; then
