@@ -124,12 +124,26 @@ def run_is_watchlist_price_alert_eligible(run: Run | None) -> bool:
     this narrow exception separate from :func:`run_is_financially_eligible` so
     a partial run can never accidentally unlock money-facing consumers.
     """
+    return (
+        run_is_partial_price_alert_eligible(run)
+        and (run.run_quality or {}).get("mode") == "watchlist"
+    )
+
+
+def run_is_partial_price_alert_eligible(run: Run | None) -> bool:
+    """Whether a completed partial run may report *local* price changes at all.
+
+    True for any partial producer whose every requested site finished ``ok`` —
+    the watchlist tick above and the diagnostic ``scrape`` behind
+    ``intraday-tick`` alike.  On its own this unlocks nothing in
+    ``alerts.evaluate_rules``: only the watchlist tick may publish to the
+    shared alert journal.  Other partial runs are read through
+    ``alerts.local_price_alerts_for_partial_run``, whose events are never
+    stored and go to administrators only.
+    """
     if run is None or run.status != "ok" or run.catalog_scope != "partial":
         return False
-    quality = run.run_quality or {}
-    if quality.get("mode") != "watchlist":
-        return False
-    sites = quality.get("sites")
+    sites = (run.run_quality or {}).get("sites")
     return bool(sites) and all(
         isinstance(details, dict) and details.get("status") == "ok"
         for details in sites.values()

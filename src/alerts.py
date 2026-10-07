@@ -37,6 +37,7 @@ from src.storage import (
     has_unfinished_run,
     latest_financial_run_ids_by_site,
     run_is_financially_eligible,
+    run_is_partial_price_alert_eligible,
     run_is_watchlist_price_alert_eligible,
 )
 from src.run_lock import try_shared_scrape_read_lock
@@ -570,6 +571,108 @@ def evaluate_rules(
     except Exception:
         pass
     return fired
+
+
+def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[AlertEvent]:
+    """Смены цены, которые частичный сбор увидел сам, — БЕЗ записи в журнал.
+
+    Частичный сбор (intraday-тик) событий не публикует: журнал алертов читают
+    дашборд, дайджест и письмо о прогоне, то есть клиент. Но цену, которую тик
+    записал первым, проверенный сбор потом подтверждает молча, и алерта о таком
+    изменении не будет вовсе. Поэтому оно считается здесь и отдаётся вызывающему
+    несохранёнными AlertEvent — их шлют только администраторам через
+    `notifications.mail_unstored_events_to_admins`. В `dispatch_events_batch`
+    их отдавать нельзя: та рассылка идёт всем ролям.
+
+    Правила — как у watchlist-тика: только локальные ценовые
+    (`_WATCHLIST_REALTIME_RULE_TYPES`), активные, со своими параметрами; база
+    сравнения — последняя доверенная цена товара.
+
+    Что не повторяется: событие с тем же ключом, уже лежащее в журнале в
+    пределах cooldown правила, и товар, у которого цена к оплате с прошлого
+    наблюдения не изменилась. Второе нужно потому, что snapshot пишется и при
+    смене одной лишь метки акции или процента скидки — без этой проверки
+    каждый такой тик повторял бы письмо о давнем падении. Сами события не
+    хранятся, поэтому cooldown между тиками не действует: цена, которая за это
+    время менялась несколько раз и осталась ниже доверенной, даст письмо на
+    каждое изменение.
+    """
+    run = session.get(Run, run_id)
+    if not run_is_partial_price_alert_eligible(run):
+        log.warning(
+            "alerts_partial_run_not_eligible",
+            run_id=run_id,
+            status=run.status if run else None,
+        )
+        return []
+
+    from src.product_policy import policy_rollout_eligibility
+
+    rollout = policy_rollout_eligibility(session, tenant_id=run.tenant_id)
+    if not rollout.eligible:
+        log.warning("alerts_policy_gate_closed", run_id=run_id, reason=rollout.reason)
+        return []
+
+    rules = session.scalars(
+        select(AlertRule).where(
+            AlertRule.is_active.is_(True),
+            AlertRule.rule_type.in_(_WATCHLIST_REALTIME_RULE_TYPES),
+        )
+    ).all()
+
+    from src.storage import curr_and_prev_snapshots_for_run
+
+    def payable(snap: PriceSnapshot) -> float | None:
+        return snap.discount_price or snap.price
+
+    # Товары, чью цену к оплате этот прогон действительно застал изменившейся
+    # (или увидел впервые) — против предыдущей записи любого прогона.
+    curr_snaps, last_seen = curr_and_prev_snapshots_for_run(session, run)
+    price_moved = {
+        snap.product_id
+        for snap in curr_snaps
+        if snap.product_id not in last_seen or payable(last_seen[snap.product_id]) != payable(snap)
+    }
+
+    now = utcnow()
+    found: list[AlertEvent] = []
+    seen_keys: set[str] = set()
+    for rule in rules:
+        try:
+            candidates = DETECTORS[rule.rule_type](session, run_id, rule.params or {})
+        except Exception as e:
+            log.exception("alerts_detector_failed", rule_type=rule.rule_type, error=str(e))
+            continue
+        for cand in candidates:
+            if (cand.payload or {}).get("product_id") not in price_moved:
+                continue
+            if cand.dedup_key in seen_keys:
+                continue
+            seen_keys.add(cand.dedup_key)
+            if _is_duplicate(
+                session,
+                cand.dedup_key,
+                rule.cooldown_hours,
+                tenant_id=run.tenant_id,
+            ):
+                continue
+            # В сессию не добавляем: событие существует только на время письма.
+            found.append(
+                AlertEvent(
+                    rule_id=rule.id,
+                    rule_type=cand.rule_type,
+                    dedup_key=cand.dedup_key,
+                    severity=cand.severity,
+                    title=cand.title,
+                    detail=cand.detail,
+                    payload={**(cand.payload or {}), "source_run_id": run_id},
+                    tenant_id=run.tenant_id,
+                    created_at=now,
+                )
+            )
+
+    log.info("alerts_partial_run_local", run_id=run_id, found=len(found), rules=len(rules))
+    return found
 
 
 def _is_duplicate(

@@ -2270,6 +2270,61 @@ def _release_matcher_lock(session: Session) -> None:
         log.warning("matcher_lock_release_failed", error=str(exc))
 
 
+def _run_matching_stage(
+    session: Session, *, fuzzy_threshold: int | None = None
+) -> dict[str, int | None]:
+    """Этап сопоставления — один и тот же в конце полного сбора и в `rematch`.
+
+    Порядок: пересчёт выводимых полей по названию → замена давно не виденных
+    членов кластеров их живыми двойниками → `match_products` → `revalidate_split`
+    → флаги подозрительной разницы цен.
+
+    Раньше `rematch` делал только часть этого (без замены устаревших строк и без
+    revalidate), и «прогнать сопоставление руками после выкладки» давало не тот
+    результат, что обычный сбор. Замок сопоставления берёт вызывающий.
+
+    Подготовительные шаги откатываются каждый к своей точке сохранения: сбой
+    одного не отменяет ни второй, ни само сопоставление (в сводке — None).
+    Сбой revalidate — ошибка этапа: после него в базе могут остаться пары,
+    которые текущие правила запрещают.
+    """
+    summary: dict[str, int | None] = {"refreshed": None, "relinked": None}
+    for key, prepare in (
+        ("refreshed", matcher.refresh_derived_fields),
+        ("relinked", matcher.relink_stale_members),
+    ):
+        try:
+            with session.begin_nested():
+                result = prepare(session)
+            summary[key] = result if isinstance(result, int) else len(result)
+        except Exception:
+            log.exception("matcher_preparation_failed", step=prepare.__name__)
+    if fuzzy_threshold is None:
+        summary["clusters"] = matcher.match_products(session)
+    else:
+        summary["clusters"] = matcher.match_products(session, fuzzy_threshold=fuzzy_threshold)
+    # Auto-revalidate: match_products линкует широко (bucket+fuzzy) и НЕ
+    # блокирует guard-конфликты в primary-проходе → бренд/состав/вариант/сила
+    # несоответствия пересоздаются каждый прогон. Чистим их сразу когерентным
+    # split'ом (корень «whack-a-mole» — раньше требовался ручной rematch).
+    try:
+        split_actions = matcher.revalidate_split(session)
+    except Exception as _re:
+        log.error("revalidate_split_failed", error=str(_re))
+        raise RuntimeError(f"identity revalidation failed: {type(_re).__name__}: {_re}") from _re
+    summary["revalidated"] = len(split_actions)
+    if split_actions:
+        log.info("revalidate_split", clusters=len(split_actions))
+    summary["flagged"] = None
+    try:
+        summary["flagged"] = matcher.flag_suspected_mismatches(session)
+        if summary["flagged"]:
+            log.info("price_mismatch_flags_updated", changed=summary["flagged"])
+    except Exception as _fe:
+        log.warning("flag_mismatches_failed", error=str(_fe))
+    return summary
+
+
 def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
     """Hold one checked-out connection's session lock without an idle transaction."""
     bind = SessionFactory.kw.get("bind")
@@ -4863,9 +4918,9 @@ def _is_scheduled_full_scan(
 
     Решает то, во что прогон РАЗРЕШИЛСЯ (`is_full_catalog`), а не сырой
     `--mode`. Root-овый systemd-юнит зовёт `run --site %i` без `--mode`: режим
-    `auto` становится полным сбором только после разбора watchlist, а у
-    pharmonline маркер уводит его в public_api. Гвард, смотревший на сырое
-    значение, не сработал на проде ни разу — aloe собирался каждую ночь.
+    `auto` становится category уже внутри `run`, а у pharmonline маркер уводит
+    его в public_api. Гвард, смотревший на сырое значение, не сработал на проде
+    ни разу — aloe собирался каждую ночь.
 
     Мимо ритма идёт только то, о чём человек попросил явно:
       * выбранная категория, `--limit`, watchlist- и hourly-тики — это не
@@ -4951,7 +5006,10 @@ def _sites_due_for_full_scan(
     "--mode",
     type=click.Choice(["auto", "watchlist", "category", "public_api"]),
     default="auto",
-    help="auto = watchlist если есть товары, иначе category. public_api — guarded Pharmonline recovery.",
+    help="auto = category (сбор каталога); для `--site pharmonline` с маркером "
+    "автономного режима — public_api. Содержимое watchlist на режим не влияет. "
+    "watchlist — только закреплённые ссылки, задаётся явно. "
+    "public_api — guarded Pharmonline recovery.",
 )
 @click.option(
     "--category-id",
@@ -4997,7 +5055,7 @@ def run_cmd(
     """Полный прогон: scrape → match → analyze → report."""
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
     # Как режим задал вызывающий — до того, как его перепишут маркер ниже и
-    # разбор watchlist. Нужен гварду ритма: явный public_api идёт мимо него.
+    # разбор режима. Нужен гварду ритма: явный public_api идёт мимо него.
     requested_mode = mode
     if _pharmonline_public_api_autonomous_mode_requested(sites, mode):
         _enable_pharmonline_public_api_autonomous_mode()
@@ -5061,24 +5119,22 @@ def run_cmd(
         if hourly:
             mode = "watchlist"
 
-        # Если задан --category-id → форсируем category-режим (даже если watchlist непустой)
-        if category_id is not None and mode == "auto":
+        # Режим по умолчанию — сбор каталога, что бы ни лежало в watchlist.
+        # Раньше `auto` при непустом watchlist становился watchlist-прогоном, и
+        # режим планового запуска решала таблица, а не команда: одна
+        # подтверждённая ссылка на любом сайте — и юнит `run --site %i` навсегда
+        # перестал бы собирать полный каталог. Молча — там, где ссылка лежит на
+        # том же сайте (частичный прогон со статусом ok); на остальных сайтах
+        # прогон падал бы каждую ночь. Закреплённые ссылки обновляет свой таймер
+        # (`watchlist-tick`), он зовёт mode="watchlist" явно.
+        if mode == "auto":
             mode = "category"
 
-        # Определяем режим. Обязательно ДО гварда ритма: полный это сбор или
-        # нет, при `--mode auto` известно только после разбора watchlist.
-        watchlist_urls = (
-            collect_watchlist_urls(session)
-            if mode not in {"category", "public_api"}
-            else {}
-        )
+        # Определяем режим. Обязательно ДО гварда ритма: он решает по тому, во
+        # что прогон разрешился.
+        effective_mode = mode
+        watchlist_urls = collect_watchlist_urls(session) if mode == "watchlist" else {}
         total_pinned = sum(len(urls) for urls in watchlist_urls.values())
-        if mode == "public_api":
-            effective_mode = "public_api"
-        elif mode == "watchlist" or (mode == "auto" and total_pinned > 0):
-            effective_mode = "watchlist"
-        else:
-            effective_mode = "category"
 
         is_full_catalog = (
             effective_mode in {"category", "public_api"}
@@ -5409,40 +5465,12 @@ def run_cmd(
                 if effective_mode == "watchlist":
                     linked = auto_match_watchlist(session)
                     log.info("watchlist_auto_matched", linked=linked)
-                # Поля, на которых стоит матчинг, пересчитываем по названию для
+                # Поля, на которых стоит матчинг, пересчитываются по названию для
                 # всего каталога, а не только для собранного сейчас сайта: иначе
                 # после правки нормализации сайты неделю сравниваются в разной
-                # записи. Затем отдаём место в кластере живым двойникам строк,
-                # которые сбор больше не видит.
-                # Оба шага — подготовка: сбой каждого откатывается к своей
-                # точке сохранения и не отменяет ни второй шаг, ни само
-                # сопоставление.
-                for _prepare in (matcher.refresh_derived_fields, matcher.relink_stale_members):
-                    try:
-                        with session.begin_nested():
-                            _prepare(session)
-                    except Exception:
-                        log.exception("matcher_preparation_failed", step=_prepare.__name__)
-                matcher.match_products(session)
-                # Auto-revalidate: match_products линкует широко (bucket+fuzzy) и НЕ
-                # блокирует guard-конфликты в primary-проходе → бренд/состав/вариант/сила
-                # несоответствия пересоздаются каждый прогон. Чистим их сразу когерентным
-                # split'ом (корень «whack-a-mole» — раньше требовался ручной rematch).
-                try:
-                    split_actions = matcher.revalidate_split(session)
-                    if split_actions:
-                        log.info("revalidate_split", clusters=len(split_actions))
-                except Exception as _re:
-                    log.error("revalidate_split_failed", error=str(_re))
-                    raise RuntimeError(
-                        f"identity revalidation failed: {type(_re).__name__}: {_re}"
-                    ) from _re
-                try:
-                    flagged = matcher.flag_suspected_mismatches(session)
-                    if flagged:
-                        log.info("price_mismatch_flags_updated", changed=flagged)
-                except Exception as _fe:
-                    log.warning("flag_mismatches_failed", error=str(_fe))
+                # записи. Весь порядок шагов — в _run_matching_stage; тот же этап
+                # выполняет команда `rematch`.
+                _run_matching_stage(session)
             finally:
                 if lock_taken:
                     _release_matcher_lock(session)
@@ -5640,8 +5668,11 @@ def run_cmd(
     default=None,
     help="Скрейпить ТОЛЬКО эту категорию (по id из таблицы categories).",
 )
-def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None) -> None:
-    """Только скрейпинг — без анализа и отправки."""
+def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None) -> int | None:
+    """Только скрейпинг — без анализа и отправки.
+
+    Возвращает id прогона (для `ctx.invoke`), None если сбор не состоялся.
+    """
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
     if _pharmonline_public_api_enabled():
         raise click.ClickException(
@@ -5727,6 +5758,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
             if quality_status == "failed":
                 raise RunQualityFailure(run.error_message or "run quality failed")
             click.echo(f"Scraped {count} products in run #{run.id} ({quality_status})")
+            return run.id
         except RunQualityFailure as e:
             raise click.ClickException(str(e))
         except Exception as e:
@@ -5845,18 +5877,27 @@ def intraday_tick_cmd(dry_run: bool) -> None:
 
     Каждый вызов:
       1. Берёт top-30 volatile категорий (по count(price_snapshots) за 7 дней)
-      2. Через Redis-rotation index выбирает следующую категорию
+         — только тех, у которых есть раздел на Aloe: другие сайты тик не
+         обслуживает
+      2. По Redis-rotation index смотрит, чья очередь
       3. Выбирает Aloe с per-site rate-limit 2ч; proxy-зависимые Pharmonline и
          Aptekonline обслуживаются только отдельными full-catalog таймерами
-      4. Запускает scrape-only persist для этой категории.
+      4. Запускает scrape-only persist для этой категории и передаёт очередь
+         следующей.
 
-    Запускается из systemd timer ежечасно во время business hours (05-17 UTC).
-    No-alerts чтобы не дублировать notifications с full nightly run.
+    Запускается из systemd timer ежечасно, 13 раз в день (05–17 по времени хоста).
+    В журнал алертов тик ничего не пишет: `scrape` — только сбор. Смены цены,
+    которые он увидел, уходят письмом только администраторам
+    (`_mail_tick_price_changes_to_admins`).
 
-    Skip-conditions (silent no-op, exit 0):
-      - Redis недоступен → можем работать без rate-limit, продолжаем
-      - 0 volatile categories (новый деплой, мало данных) → skip
-      - Все sites locked (последний intraday на каждом < 2ч назад) → skip
+    Skip-conditions (no-op, exit 0; причина — в выводе и в событии
+    `intraday_skipped`, поле `reason`):
+      - no_servable_category: за 7 дней цены не менялись ни в одной категории
+        с разделом на Aloe (новый деплой, мало данных)
+      - site_rate_limited: последний intraday на Aloe < 2ч назад; очередь
+        категории сохраняется
+      - rotation_state_unavailable: Redis недоступен, не настроен или не
+        принимает запись
 
     Failures (exit 1):
       - Сам scrape упал (network, proxy и т.п.) — поднимаем error чтобы systemd
@@ -5869,12 +5910,13 @@ def intraday_tick_cmd(dry_run: bool) -> None:
 
     with Session() as session:
         # dry_run → preview mode (без INCR rotation idx и без SETNX lock'а).
-        target = intraday.pick_next_scrape_target(session, commit_state=not dry_run)
-        if target is None:
-            click.echo("intraday-tick: skipped (no volatile categories or all sites locked)")
+        decision = intraday.pick_next_scrape_target(session, commit_state=not dry_run)
+        if decision.target is None:
+            click.echo(f"intraday-tick: skipped ({decision.skip_detail})")
             return
 
-        site, cat = target
+        site, cat = decision.target
+        category_key = cat.key
         product_limit = _intraday_product_limit()
         click.echo(
             f"intraday-tick: site={site} category_id={cat.id} key={cat.key} "
@@ -5890,12 +5932,57 @@ def intraday_tick_cmd(dry_run: bool) -> None:
     # остаётся за nightly/manual full run, иначе 20-минутный systemd timeout
     # убивает тик посреди matcher и оставляет Run в status='running'.
     ctx = click.get_current_context()
-    ctx.invoke(
+    run_id = ctx.invoke(
         scrape_cmd,
         limit=product_limit,
         site=(site,),
         category_id=cat.id,
     )
+    if run_id is not None:
+        _mail_tick_price_changes_to_admins(Session, run_id, site=site, category_key=category_key)
+
+
+def _mail_tick_price_changes_to_admins(
+    Session, run_id: int, *, site: str, category_key: str
+) -> None:
+    """Смены цены, которые увидел тик, — письмом только администраторам.
+
+    Тик событий не публикует: журнал алертов и письмо о прогоне читает клиент.
+    А проверенный сбор цену, записанную тиком, потом подтверждает молча, и
+    алерта о таком изменении иначе не было бы вовсе. Сбой здесь тик не роняет:
+    сбор уже записан.
+    """
+    from src import alerts as alerts_mod, notifications as notif_mod
+
+    try:
+        with Session() as session:
+            events = alerts_mod.local_price_alerts_for_partial_run(session, run_id)
+            if not events:
+                return
+            sent = notif_mod.mail_unstored_events_to_admins(
+                session,
+                events,
+                note=(
+                    f"Частичный сбор {site}, раздел {category_key}, прогон #{run_id}. "
+                    "Письмо получают только администраторы: в журнал алертов и в "
+                    "дайджест эти события не попадают."
+                ),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("intraday_price_alerts_failed", run_id=run_id, error=str(e))
+        return
+
+    # Событий нет в базе, повторной отправки не будет: что не ушло — потеряно,
+    # и журнал должен говорить об этом прямо.
+    if sent["failed"]:
+        log.warning("intraday_price_alerts_failed", run_id=run_id, events=len(events), **sent)
+    elif sent["email"] or sent["telegram"]:
+        log.info("intraday_price_alerts_mailed", run_id=run_id, events=len(events), **sent)
+    else:
+        log.warning("intraday_price_alerts_no_recipient", run_id=run_id, events=len(events))
+
+
+REMATCH_RESET_CONFIRM_FLAG = "--i-accept-full-rebuild"
 
 
 @cli.command("rematch")
@@ -5926,19 +6013,68 @@ def intraday_tick_cmd(dry_run: bool) -> None:
 @click.option(
     "--dry-run", is_flag=True, default=False, help="С --revalidate/--relink-dead: только показать"
 )
+@click.option(
+    REMATCH_RESET_CONFIRM_FLAG,
+    "accept_full_rebuild",
+    is_flag=True,
+    default=False,
+    help="Обязателен вместе с --reset: подтверждает удаление всех автоматических пар",
+)
 def rematch_cmd(
-    reset: bool, threshold: int | None, revalidate: bool, relink_dead: bool, dry_run: bool
+    reset: bool,
+    threshold: int | None,
+    revalidate: bool,
+    relink_dead: bool,
+    dry_run: bool,
+    accept_full_rebuild: bool,
 ) -> None:
     """Перезапустить матчинг (без скрейпинга). Полезно после изменения нормализации.
 
-    С --reset: сбрасывает все авто-canonical_id и пересчитывает заново (78% churn!).
+    Без флагов выполняет тот же этап, что и конец сбора: пересчёт выводимых
+    полей, замена устаревших строк их живыми двойниками, сопоставление,
+    revalidate, флаги цен. Пары не сбрасывает: существующий кластер меняют
+    только замена устаревшей строки и revalidate. Это штатный шаг после
+    выкладки правок сопоставления. Пока идёт сбор, тик или другой rematch,
+    команда не работает — выходит с сообщением, чтобы не делить строки товаров
+    с записью прогона.
+
+    С --reset: сначала удаляет ВСЕ автоматические пары и собирает их заново.
+    На проде не запускать: меняются номера всех пар (а с ними пропадают
+    привязанные к паре остатки и цены поставщиков), и с нуля собирается не то
+    же самое (замер 2026-10-07: пару теряют 184 товара клиента из 4 099,
+    получают 48, подробности — docs/RUNBOOK.md). Без второго флага
+    --i-accept-full-rebuild команда откажет, ничего не тронув: так старый юнит
+    или привычка не сотрут пары молча.
     С --revalidate: ТОЧЕЧНО разбивает только те существующие кластеры, где cross-site
     пара конфликтует по текущим guard'ам (закрывает «whack-a-mole» старых матчей без
     churn полного --reset). Ручные матчи (is_manual=True) никогда не трогаются.
     """
     from sqlalchemy import update as sa_update
 
+    if dry_run and not (revalidate or relink_dead):
+        raise click.UsageError(
+            "--dry-run работает только с --revalidate или --relink-dead; "
+            "обычный rematch и --reset пишут в базу."
+        )
+    if accept_full_rebuild and not reset:
+        raise click.UsageError(f"{REMATCH_RESET_CONFIRM_FLAG} имеет смысл только вместе с --reset.")
+    if reset and not accept_full_rebuild:
+        raise click.UsageError(
+            "--reset удаляет все автоматические пары и собирает их заново: меняются "
+            "номера всех пар, часть пар с нуля не собирается. На проде не запускать. "
+            f"Для копии базы или стенда добавь {REMATCH_RESET_CONFIRM_FLAG}."
+        )
+
     Session = storage.make_session()
+    # Запись прогона и сопоставление правят одни и те же строки товаров. Сбор
+    # держит этот замок всю команду, а замок сопоставления — только на сам этап,
+    # так что без проверки rematch шёл бы одновременно с записью прогона.
+    if not dry_run and not _hold_scrape_lock_until_command_exit(Session, wait=False):
+        click.echo(
+            "rematch: skipped because the run lock is busy (scrape, tick or another "
+            "rematch); retry when it finishes."
+        )
+        return
     with Session() as session:
         lock_taken = _acquire_matcher_lock(session, wait=False)
         if not lock_taken:
@@ -6006,22 +6142,35 @@ def rematch_cmd(
                     session.commit()
                     click.echo(f"Reset {len(auto_match_ids)} auto-matches.")
 
-            # Заново выводим из названия name_normalized, dosage и pack_size
-            # (с учётом последних изменений нормализации)
-            click.echo("Re-normalizing derived fields…")
-            changed = matcher.refresh_derived_fields(session)
-            session.commit()
-            click.echo(f"Re-normalized: {changed} products changed.")
-
-            # Запуск матчинга
+            # Тот же этап, что в конце полного сбора (см. _run_matching_stage):
+            # пересчёт выводимых полей с учётом последних правок нормализации,
+            # замена устаревших строк, сопоставление, revalidate, флаги цен.
             thr = threshold if threshold is not None else matcher.FUZZY_THRESHOLD
-            click.echo(f"Running matcher (threshold={thr})…")
-            clusters = matcher.match_products(session, fuzzy_threshold=thr)
-            click.echo(f"Matcher done: {clusters} clusters created/updated.")
+            click.echo(f"Running matching stage (threshold={thr})…")
+            try:
+                summary = _run_matching_stage(session, fuzzy_threshold=threshold)
+            except RuntimeError as exc:
+                # ClickException печатает одну строку — стек оставляем в журнале.
+                log.exception("rematch_stage_failed")
+                raise click.ClickException(str(exc)) from exc
 
-            # Флагирование подозрительных расхождений цен
-            flagged = matcher.flag_suspected_mismatches(session)
-            click.echo(f"Price-spread flags updated: {flagged} matches changed.")
+            def _shown(value: int | None) -> str:
+                return "FAILED, see log" if value is None else str(value)
+
+            click.echo(f"Products re-normalized: {_shown(summary['refreshed'])}.")
+            click.echo(f"Stale members relinked: {_shown(summary['relinked'])}.")
+            click.echo(f"Matcher done: {summary['clusters']} clusters created/updated.")
+            click.echo(f"Revalidate: re-split {summary['revalidated']} clusters.")
+            click.echo(f"Price-spread flags changed: {_shown(summary['flagged'])}.")
+            # В сборе сбой подготовки не отменяет прогон; здесь команду запустили
+            # ради самого этапа, и молчаливый «успех» недельного юнита скрыл бы,
+            # что пересчёт полей или замена строк не выполнились.
+            failed = [key for key in ("refreshed", "relinked") if summary[key] is None]
+            if failed:
+                raise click.ClickException(
+                    "matching stage finished, but a preparation step failed: "
+                    + ", ".join(failed)
+                )
         finally:
             _release_matcher_lock(session)
 

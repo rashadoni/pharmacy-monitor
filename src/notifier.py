@@ -97,6 +97,13 @@ def resolve_recipients(explicit: list[str] | None = None) -> list[str]:
     return [s.strip() for s in os.environ.get("EMAIL_TO", "").split(",") if s.strip()]
 
 
+# Без таймаута smtplib ждёт зависший сервер бесконечно, а письмо шлют и
+# короткие таймерные задачи (intraday-тик с 20-минутным лимитом systemd).
+# Таймаут — на каждую сетевую операцию (отправка тела письма — одна операция),
+# поэтому с запасом на письма с вложениями.
+SMTP_TIMEOUT_SEC = 60
+
+
 def send_email(
     subject: str,
     html_body: str,
@@ -137,7 +144,7 @@ def send_email(
         msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=fname)
 
     log.info("smtp_send", host=smtp_host, port=smtp_port, recipients=recipients)
-    with smtplib.SMTP(smtp_host, smtp_port) as smtp:
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=SMTP_TIMEOUT_SEC) as smtp:
         smtp.starttls()
         smtp.login(smtp_user, smtp_pass)
         smtp.send_message(msg)

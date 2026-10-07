@@ -255,26 +255,34 @@ State management: React Query (TanStack). Cache invalidation после mutation
   └── pg_dump → /var/backups/pharmacy-monitor/*.sql.gz.gpg (GPG encrypted)
 ```
 
-### Intraday rotation (05:00-17:00 UTC, business hours)
+### Intraday rotation (05:00–17:00 по времени хоста)
+
+Часы в `OnCalendar` — местные для сервера. Прод стоит в Europe/Berlin, поэтому
+летом тики идут в 03–15 UTC.
 
 ```
-Every hour 05-17 UTC ─ pharmacy-monitor-intraday.timer fires (Phase 5.1c)
+Every hour 05-17 ─ pharmacy-monitor-intraday.timer fires (Phase 5.1c)
   ├── pharmacy-monitor intraday-tick
-  ├── src/intraday.py:top_volatile_categories
+  ├── src/intraday.py:top_volatile_categories(sites=INTRADAY_SITES)
   │     → SELECT count(snapshots) per category per site за 7d
-  │     → Top-30 categories by volatility
-  ├── Redis INCR "intraday:rotation:idx" → cats[i % 30]
+  │     → только категории с разделом на сайте из INTRADAY_SITES
+  │     → Top-30 by volatility
+  ├── Redis GET "intraday:rotation:idx" → cats[i % len] (чья очередь)
   ├── Intraday site (INTRADAY_SITES = ['aloe']):
   │     - SETNX "intraday:lock:site:aloe" с TTL=2h
   │     - Pharmonline исключён: его Meteor WebSocket через residential proxy
   │       обслуживается только полным недельным прогоном
-  │     - Если locked → skip tick, log "all_sites_locked"
-  └── pharmacy-monitor run --site X --mode category --category-id N --no-alerts
-        (no-alerts чтобы не дублировать с full nightly)
+  │     - Если locked → skip tick, log "intraday_skipped reason=site_rate_limited",
+  │       очередь остаётся у той же категории
+  ├── Прогон взят → Redis INCR "intraday:rotation:idx"
+  ├── pharmacy-monitor scrape --site aloe --category-id N --limit 600
+  │     (только сбор: матчер, журнал алертов и ROI тик не трогает)
+  └── alerts.local_price_alerts_for_partial_run → письмо admin/owner
+        (падения цены, которые тик увидел сам; в базе не хранятся)
 ```
 
-Result: до 7 supplemental Aloe scrapes/day; proxy-зависимые сайты не получают
-лишних intraday-подключений.
+Result: 5–7 supplemental Aloe scrapes/day (13 тиков при лимите один прогон на
+сайт в 2 часа); proxy-зависимые сайты не получают лишних intraday-подключений.
 
 ### User dashboard hit
 
@@ -309,11 +317,11 @@ Services (all systemd):
 - pharmacy-monitor-frontend.service     → Next.js :3000 (standalone)
 - pharmacy-monitor-scrape@<site>.timer  → daily scrape
 - pharmacy-monitor-scrape@<site>.service → triggered by timer
-- pharmacy-monitor-intraday.timer       → hourly 05-17 UTC (Phase 5.1c)
+- pharmacy-monitor-intraday.timer       → hourly 05–17 по времени хоста (Phase 5.1c)
 - pharmacy-monitor-intraday.service     → intraday-tick
 - pharmacy-monitor-health.timer         → hourly
 - pharmacy-monitor-backup.timer         → daily 04:00 UTC
-- pharmacy-monitor-rematch.timer        → weekly Monday 05:00 UTC
+- pharmacy-monitor-rematch.timer        → Tuesday and Friday 04:30 по времени хоста; `rematch` без `--reset` (тот же этап, что конец сбора)
 - pharmacy-monitor-digest@daily.timer   → daily 05:00 UTC
 
 Network:
@@ -365,7 +373,9 @@ Persistent state:
 - **`Run.products_scraped`** = page hits, не unique products. Уникальных по `external_id` будет меньше.
 - **Scrape concurrency** — server watcher skips when any `pharmacy-monitor run`,
   `scrape`, `intraday-tick`, or `rematch` is active; matcher/rematch uses a
-  Postgres advisory lock for `canonical_id` writes.
+  Postgres advisory lock for `canonical_id` writes. `rematch` also try-locks the
+  run lock and exits with "skipped" while a scrape, a tick or another `rematch`
+  holds it.
 
 ### Scraping
 

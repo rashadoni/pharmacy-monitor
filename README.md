@@ -64,6 +64,9 @@ sudo bash scripts/provision_vps.sh \
 ```bash
 # Прогон
 pharmacy-monitor run [--dry-run] [--mode auto|watchlist|category] [--hourly]
+#   auto (по умолчанию) = category: сбор каталога, содержимое watchlist на режим не влияет
+#   (на проде `--site pharmonline` с маркером автономного режима уходит в public_api).
+#   Закреплённые ссылки собирают только --mode watchlist, --hourly и `watchlist-tick`.
 pharmacy-monitor scrape [--site SITE] [--limit N]
 pharmacy-monitor report --send
 
