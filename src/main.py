@@ -5641,8 +5641,11 @@ def run_cmd(
     default=None,
     help="Скрейпить ТОЛЬКО эту категорию (по id из таблицы categories).",
 )
-def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None) -> None:
-    """Только скрейпинг — без анализа и отправки."""
+def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None) -> int | None:
+    """Только скрейпинг — без анализа и отправки.
+
+    Возвращает id прогона (для `ctx.invoke`), None если сбор не состоялся.
+    """
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
     if _pharmonline_public_api_enabled():
         raise click.ClickException(
@@ -5728,6 +5731,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
             if quality_status == "failed":
                 raise RunQualityFailure(run.error_message or "run quality failed")
             click.echo(f"Scraped {count} products in run #{run.id} ({quality_status})")
+            return run.id
         except RunQualityFailure as e:
             raise click.ClickException(str(e))
         except Exception as e:
@@ -5855,7 +5859,9 @@ def intraday_tick_cmd(dry_run: bool) -> None:
          следующей.
 
     Запускается из systemd timer ежечасно, 13 раз в день (05–17 по времени хоста).
-    Алерты тик не считает: `scrape` — только сбор.
+    В журнал алертов тик ничего не пишет: `scrape` — только сбор. Смены цены,
+    которые он увидел, уходят письмом только администраторам
+    (`_mail_tick_price_changes_to_admins`).
 
     Skip-conditions (no-op, exit 0; причина — в выводе и в событии
     `intraday_skipped`, поле `reason`):
@@ -5883,6 +5889,7 @@ def intraday_tick_cmd(dry_run: bool) -> None:
             return
 
         site, cat = decision.target
+        category_key = cat.key
         product_limit = _intraday_product_limit()
         click.echo(
             f"intraday-tick: site={site} category_id={cat.id} key={cat.key} "
@@ -5898,12 +5905,54 @@ def intraday_tick_cmd(dry_run: bool) -> None:
     # остаётся за nightly/manual full run, иначе 20-минутный systemd timeout
     # убивает тик посреди matcher и оставляет Run в status='running'.
     ctx = click.get_current_context()
-    ctx.invoke(
+    run_id = ctx.invoke(
         scrape_cmd,
         limit=product_limit,
         site=(site,),
         category_id=cat.id,
     )
+    if run_id is not None:
+        _mail_tick_price_changes_to_admins(Session, run_id, site=site, category_key=category_key)
+
+
+def _mail_tick_price_changes_to_admins(
+    Session, run_id: int, *, site: str, category_key: str
+) -> None:
+    """Смены цены, которые увидел тик, — письмом только администраторам.
+
+    Тик событий не публикует: журнал алертов и письмо о прогоне читает клиент.
+    А проверенный сбор цену, записанную тиком, потом подтверждает молча, и
+    алерта о таком изменении иначе не было бы вовсе. Сбой здесь тик не роняет:
+    сбор уже записан.
+    """
+    from src import alerts as alerts_mod, notifications as notif_mod
+
+    try:
+        with Session() as session:
+            events = alerts_mod.local_price_alerts_for_partial_run(session, run_id)
+            if not events:
+                return
+            sent = notif_mod.mail_unstored_events_to_admins(
+                session,
+                events,
+                note=(
+                    f"Частичный сбор {site}, раздел {category_key}, прогон #{run_id}. "
+                    "Письмо получают только администраторы: в журнал алертов и в "
+                    "дайджест эти события не попадают."
+                ),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("intraday_price_alerts_failed", run_id=run_id, error=str(e))
+        return
+
+    # Событий нет в базе, повторной отправки не будет: что не ушло — потеряно,
+    # и журнал должен говорить об этом прямо.
+    if sent["failed"]:
+        log.warning("intraday_price_alerts_failed", run_id=run_id, events=len(events), **sent)
+    elif sent["email"] or sent["telegram"]:
+        log.info("intraday_price_alerts_mailed", run_id=run_id, events=len(events), **sent)
+    else:
+        log.warning("intraday_price_alerts_no_recipient", run_id=run_id, events=len(events))
 
 
 @cli.command("rematch")

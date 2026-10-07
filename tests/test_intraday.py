@@ -14,15 +14,16 @@ Redis замокан unittest.mock.MagicMock для контролируемог
 from __future__ import annotations
 
 from datetime import timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import click
 from click.testing import CliRunner
 from sqlalchemy.orm import sessionmaker
 
-from src import intraday, storage
+from src import alerts, intraday, storage, tenants
 from src import main as main_mod
 from src._time import utcnow
+from src.scrapers.base import ScrapedProduct, ScrapeResult
 
 
 # ─── Helpers для setup ────────────────────────────────────────────────────────
@@ -573,6 +574,226 @@ def test_intraday_tick_invokes_bounded_point_scrape(db_session, monkeypatch):
     assert result.exit_code == 0, result.output
     assert invoked == {"limit": 321, "site": ("aloe",), "category_id": category.id}
     assert "limit=321" in result.output
+
+
+class _LogRecorder:
+    """Имена событий, которые команда пишет в журнал.
+
+    `capture_logs` здесь не годится: вход в CLI заново настраивает structlog.
+    """
+
+    def __init__(self):
+        self.events: list[str] = []
+
+    def __getattr__(self, level):
+        def record(event, **fields):
+            self.events.append(event)
+
+        return record
+
+
+def _tick_that_sees_a_price_drop(db_session, monkeypatch, *, clean=True, lock_free=True):
+    """Тик, чей сбор видит на aloe цену 80 у товара с доверенной ценой 100.
+
+    Подменён только поход на сайт (`scrape_all`) и межпроцессный замок. Команда
+    `scrape`, запись цен и всё после сбора — настоящие.
+    """
+    tenant = tenants.get_or_create_default(db_session)
+    db_session.add(
+        storage.TenantUser(
+            tenant_id=tenant.id,
+            email="admin@example.com",
+            role="admin",
+            is_active=True,
+            email_severity_min="warning",
+        )
+    )
+    # У сотрудника клиента привязан Telegram и самый низкий порог: утечка в
+    # любой из каналов была бы видна.
+    db_session.add(
+        storage.TenantUser(
+            tenant_id=tenant.id,
+            email="client@example.com",
+            role="viewer",
+            is_active=True,
+            email_severity_min="info",
+            telegram_chat_id="555",
+            telegram_severity_min="info",
+        )
+    )
+    category = _add_category(db_session, "aloe_bad", "БАД", aloe_slug="bad")
+    product = _add_product_with_category(db_session, "aloe", "drop", "Dropped item", "bad")
+    started = utcnow() - timedelta(days=1)
+    verified = storage.Run(
+        started_at=started,
+        finished_at=started + timedelta(minutes=30),
+        status="ok",
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=True,
+        run_quality={
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {"aloe": {"status": "ok"}},
+        },
+    )
+    db_session.add(verified)
+    db_session.flush()
+    db_session.add(
+        storage.PriceSnapshot(
+            run_id=verified.id, product_id=product.id, price=100.0, captured_at=started
+        )
+    )
+    db_session.add(
+        storage.AlertRule(
+            name="drop",
+            rule_type="price_drop_pct",
+            params={"min_pct": 10.0},
+            channels=["email"],
+            cooldown_hours=48,
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    SessionLocal = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main_mod.storage, "init_db", lambda *a, **kw: None)
+    monkeypatch.setattr(main_mod.storage, "make_session", lambda *a, **kw: SessionLocal)
+    monkeypatch.setattr(
+        main_mod, "_hold_scrape_lock_until_command_exit", lambda *a, **kw: lock_free
+    )
+    monkeypatch.setattr(main_mod, "maybe_seed_categories", lambda *a, **kw: None)
+    monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *a, **kw: {})
+    monkeypatch.setattr(main_mod, "run_quality_baselines_for_sites", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        intraday,
+        "pick_next_scrape_target",
+        lambda session, commit_state: intraday.TickDecision(target=("aloe", category)),
+    )
+
+    async def fake_scrape_all(slugs_by_site, limit, **kwargs):
+        return [
+            ScrapeResult(
+                site="aloe",
+                products=[
+                    ScrapedProduct(
+                        site="aloe",
+                        external_id="drop",
+                        url="http://aloe.az/p/drop",
+                        name="Dropped item",
+                        category="bad",
+                        price=80.0,
+                    )
+                ],
+                items_expected=1 if clean else 2,
+                items_completed=1,
+                items_failed=0 if clean else 1,
+                item_results={"bad": {"status": "ok", "products": 1}},
+            )
+        ]
+
+    monkeypatch.setattr(main_mod, "scrape_all", fake_scrape_all)
+    return SessionLocal
+
+
+def test_intraday_tick_mails_price_drop_to_admins_only(db_session, monkeypatch):
+    """Решение владельца 2026-10-07: алерты с тиков — только админу.
+
+    Письмо уходит администратору; сотруднику клиента — ни письма, ни Telegram;
+    в журнале алертов (его читают дашборд и дайджест) события не появляется.
+    """
+    SessionLocal = _tick_that_sees_a_price_drop(db_session, monkeypatch)
+
+    journal = _LogRecorder()
+    monkeypatch.setattr(main_mod, "log", journal)
+
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
+    ):
+        result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert [c.kwargs["to"] for c in mock_email.call_args_list] == [["admin@example.com"]]
+    assert not mock_tg.called
+    sent = mock_email.call_args.kwargs
+    assert "Цена упала на 20.0%" in sent["subject"]
+    assert "Dropped item" in sent["html_body"]
+    assert "раздел aloe_bad" in sent["html_body"]
+    assert "только администраторы" in sent["html_body"]
+    with SessionLocal() as s:
+        tick = s.query(storage.Run).filter(storage.Run.catalog_scope == "partial").one()
+        assert tick.status == "ok"
+        assert f"прогон #{tick.id}" in sent["html_body"]
+        assert s.query(storage.AlertEvent).count() == 0
+    assert "intraday_price_alerts_mailed" in journal.events
+    assert "intraday_price_alerts_failed" not in journal.events
+
+
+def test_intraday_tick_with_unclean_scrape_mails_nothing(db_session, monkeypatch):
+    """Сбор категории завершился не чисто → по его ценам писем нет."""
+    SessionLocal = _tick_that_sees_a_price_drop(db_session, monkeypatch, clean=False)
+
+    with patch("src.notifier.send_email") as mock_email:
+        result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    with SessionLocal() as s:
+        tick = s.query(storage.Run).filter(storage.Run.catalog_scope == "partial").one()
+        assert tick.status == "degraded"
+    assert not mock_email.called
+
+
+def test_intraday_tick_says_so_when_the_letter_did_not_go(db_session, monkeypatch):
+    """Почта не работает: тик не падает, а журнал не называет письмо отправленным."""
+    _tick_that_sees_a_price_drop(db_session, monkeypatch)
+
+    journal = _LogRecorder()
+    monkeypatch.setattr(main_mod, "log", journal)
+
+    with patch("src.notifier.send_email", side_effect=ConnectionRefusedError("smtp down")):
+        result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert "intraday_price_alerts_failed" in journal.events
+    assert "intraday_price_alerts_mailed" not in journal.events
+
+
+def test_intraday_tick_survives_a_failure_in_price_alerts(db_session, monkeypatch):
+    """Сбор уже записан: сбой при подсчёте алертов тик не роняет."""
+    _tick_that_sees_a_price_drop(db_session, monkeypatch)
+
+    def boom(session, run_id):
+        raise RuntimeError("alerts are broken")
+
+    monkeypatch.setattr(alerts, "local_price_alerts_for_partial_run", boom)
+
+    journal = _LogRecorder()
+    monkeypatch.setattr(main_mod, "log", journal)
+
+    with patch("src.notifier.send_email") as mock_email:
+        result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert not mock_email.called
+    assert "intraday_price_alerts_failed" in journal.events
+
+
+def test_intraday_tick_without_a_scrape_run_evaluates_no_alerts(db_session, monkeypatch):
+    """Шёл другой сбор, `scrape` вышел без прогона → считать нечего."""
+    SessionLocal = _tick_that_sees_a_price_drop(db_session, monkeypatch, lock_free=False)
+    called = []
+    monkeypatch.setattr(
+        alerts, "local_price_alerts_for_partial_run", lambda *a, **kw: called.append(a)
+    )
+
+    result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert "skipped because another scrape run is active" in result.output
+    assert called == []
+    with SessionLocal() as s:
+        assert s.query(storage.Run).filter(storage.Run.catalog_scope == "partial").count() == 0
 
 
 def test_intraday_tick_prints_why_it_skipped(db_session, monkeypatch):
