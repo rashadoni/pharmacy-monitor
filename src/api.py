@@ -915,6 +915,10 @@ def _trusted_snapshot_lineage_available(
     Shadow mode therefore keeps the latest effective snapshots until a full
     cross-site trusted epoch exists. Enforce mode remains fail-closed in
     ``_require_financial_policy_ready`` above.
+
+    Within an epoch an unchanged price is still trusted: the verified run
+    confirms the snapshot it compared against, see
+    ``storage.trusted_snapshot_filter``.
     """
     from src.product_policy import trusted_catalog_epoch
 

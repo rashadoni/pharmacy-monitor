@@ -70,6 +70,32 @@ jobs:
             echo "::error::production DB revision $current_revision is absent from checkout; refusing rsync --delete"
             exit 1
           fi
+          # A pending migration with apply_migrations=false would rsync the new
+          # code and restart it on the old schema: a new column in the models
+          # fails every query that selects it, for the API and the scrapers.
+          head_revision=$(python3 - <<'PY'
+          import pathlib
+          import re
+
+          revisions, parents = set(), set()
+          for path in pathlib.Path("migrations/versions").glob("*.py"):
+              text = path.read_text(encoding="utf-8")
+              revision = re.search(r'^revision: str = "([^"]+)"', text, re.M)
+              parent = re.search(r'^down_revision: str \| None = "([^"]+)"', text, re.M)
+              if revision:
+                  revisions.add(revision.group(1))
+              if parent:
+                  parents.add(parent.group(1))
+          heads = sorted(revisions - parents)
+          if len(heads) != 1:
+              raise SystemExit(f"expected one migration head in checkout, found {heads}")
+          print(heads[0])
+          PY
+          )
+          if [ "$current_revision" != "$head_revision" ] && [ "${{ inputs.apply_migrations }}" != "true" ]; then
+            echo "::error::checkout is at migration $head_revision, production DB is at $current_revision — re-run with apply_migrations=true; refusing to put new code on the old schema"
+            exit 1
+          fi
 
       - name: Preflight deployment paths are writable
         run: |
