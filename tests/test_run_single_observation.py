@@ -258,6 +258,44 @@ def test_scan_without_incremental_writes_is_unchanged(db_session, monkeypatch):
     assert run.products_scraped == 2
 
 
+def test_verified_scan_still_confirms_the_price_it_saw_unchanged(db_session, monkeypatch):
+    """Подтверждение цен ищет запись по моменту последнего наблюдения товара в
+    прогоне. Раньше последним было наблюдение финального прохода; теперь оно
+    единственное на запись сбора и делается тем же вызовом, что сравнил цену."""
+    same = _seen_earlier_at(db_session, "same", 10.0)
+    changed = _seen_earlier_at(db_session, "changed", 10.0)
+    catalog = {
+        "cat-a": [_scraped("same", 10.0, "cat-a"), _scraped("changed", 8.0, "cat-a")],
+        "cat-b": [_scraped("same", 10.0, "cat-b"), _scraped("new", 3.0, "cat-b")],
+    }
+
+    run = _run_aloe(db_session, monkeypatch, catalog)
+
+    assert (run.status, run.catalog_verified) == ("ok", True), run.error_message
+    assert _observations(db_session, run) == {"same": 2, "changed": 1, "new": 1}
+    rows = [
+        (snap.run_id, snap.price, snap.confirmed_run_id)
+        for snap in db_session.scalars(
+            select(storage.PriceSnapshot).order_by(storage.PriceSnapshot.id)
+        )
+    ]
+    assert rows == [
+        (same.run_id, 10.0, run.id),  # цена прежняя — подтверждена проверенным сбором
+        (changed.run_id, 10.0, None),  # сбор увидел другую цену — прежнюю не подтверждает
+        (run.id, 8.0, None),
+        (run.id, 3.0, None),
+    ]
+    ids = dict(db_session.execute(select(storage.Product.external_id, storage.Product.id)).all())
+    trusted = storage.latest_prices_per_product(
+        db_session, list(ids.values()), financially_eligible_only=True
+    )
+    assert {ext_id: trusted[pid][0] for ext_id, pid in ids.items()} == {
+        "same": 10.0,
+        "changed": 8.0,
+        "new": 3.0,
+    }
+
+
 # ─── Отбор остатка ───────────────────────────────────────────────────────────
 
 
