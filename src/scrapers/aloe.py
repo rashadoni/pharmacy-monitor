@@ -34,6 +34,12 @@ from typing import AsyncIterator
 
 import httpx
 import structlog
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from src.normalize import (
     extract_dosage,
@@ -126,6 +132,18 @@ def aloe_listing_page_info(html_text: str) -> tuple[int | None, int | None]:
     current = int(current_matches[-1]) if current_matches else None
     last = int(last_matches[-1]) if last_matches else None
     return current, last
+
+
+def _is_transient_fetch_error(exc: BaseException) -> bool:
+    """Сбой, который имеет смысл повторить: сеть, 5xx или 429.
+
+    Прочие 4xx — это ответ сайта (блок, нет страницы), а не помеха: повтор
+    ничего не изменит и только отложит честный отказ.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status >= 500 or status == 429
+    return isinstance(exc, httpx.TransportError)
 
 
 def _media_url(path: str | None) -> str | None:
@@ -512,8 +530,23 @@ class AloeScraper(BaseScraper):
             )
 
     async def _fetch_listing_html(self, url: str) -> str:
-        await self._throttle()
         timeout = float(os.getenv("ALOE_HTTP_TIMEOUT_SEC", str(self.timeout_sec)))
+        # Один не отданный листинг рушит проверку ВСЕГО каталога (маршрут
+        # неполон → catalog_verified=false), а полный сбор — это ~700 страниц.
+        # За сентябрь–октябрь 2026 три ночи из 28 пропали из-за единственного
+        # ReadError/ReadTimeout. Поэтому у httpx-пути тот же ограниченный повтор,
+        # что у Playwright-пути в `goto`; страница, не отдавшаяся и с повторами,
+        # по-прежнему роняет маршрут.
+        retrying = AsyncRetrying(
+            stop=stop_after_attempt(self.max_retries),
+            wait=wait_exponential(multiplier=2, min=2, max=60),
+            retry=retry_if_exception(_is_transient_fetch_error),
+            reraise=True,
+        )
+        return await retrying(self._fetch_html_once, url, timeout)
+
+    async def _fetch_html_once(self, url: str, timeout: float) -> str:
+        await self._throttle()
         async with httpx.AsyncClient(
             headers=_ALOE_HTTP_HEADERS,
             timeout=timeout,

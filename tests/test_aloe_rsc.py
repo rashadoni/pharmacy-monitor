@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
 
+import httpx
 import pytest
+from tenacity import wait_none
 
 from src.scrapers.aloe import (
     AloeScraper,
@@ -293,3 +295,91 @@ async def test_aloe_unknown_country_id_does_not_poison_complete_listing_route(
     assert status.complete is True
     assert status.abort_reason is None
     assert status.visited_pages == status.expected_pages == 1
+
+
+# ─── повтор загрузки страницы (httpx подменяется на MockTransport) ───────────
+
+
+def _listing_page(product_id: int, *, current: int, last: int) -> str:
+    payload = _product_payload(
+        product_id=product_id, name=f"Item {product_id}", slug=f"item-{product_id}"
+    )
+    return _flight_html(
+        f'15:[[["$","$L","{product_id}",{{"data":'
+        + json.dumps(payload)
+        + f'}}]],false,["$","$L",null,{{"currentPage":{current},"lastPage":{last}}}]]'
+    )
+
+
+def _scraper_with_transport(monkeypatch, handler) -> AloeScraper:
+    """Скрейпер, чьи запросы идут в `handler`, а паузы между повторами нулевые."""
+    transport = httpx.MockTransport(handler)
+    real_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        return real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+    monkeypatch.setattr("src.scrapers.aloe.wait_exponential", lambda **_: wait_none())
+    return AloeScraper(rate_limit_sec=0.001, max_retries=3)
+
+
+@pytest.mark.parametrize("blip", ["read_error", "http_503", "http_429"])
+async def test_aloe_listing_survives_one_transient_failure(monkeypatch, blip: str) -> None:
+    """Одиночный сбой сети не должен стоить проверки всего каталога (прогон #952)."""
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = request.url.params.get("page", "1")
+        requests.append(page)
+        if page == "2" and requests.count("2") == 1:
+            if blip == "read_error":
+                raise httpx.ReadError("connection reset", request=request)
+            return httpx.Response(int(blip.removeprefix("http_")))
+        return httpx.Response(200, text=_listing_page(int(page), current=int(page), last=2))
+
+    scraper = _scraper_with_transport(monkeypatch, handler)
+
+    products = [p async for p in scraper.scrape_category("kosmetika")]
+
+    assert [p.external_id for p in products] == ["item-1", "item-2"]
+    assert requests == ["1", "2", "2"]
+    status = scraper._route_statuses["kosmetika"]
+    assert status.complete is True
+    assert status.visited_pages == status.expected_pages == 2
+
+
+async def test_aloe_listing_gives_up_after_bounded_retries(monkeypatch) -> None:
+    """Страница, не отдавшаяся и с повторами, по-прежнему роняет маршрут."""
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        raise httpx.ReadTimeout("no answer", request=request)
+
+    scraper = _scraper_with_transport(monkeypatch, handler)
+
+    with pytest.raises(httpx.ReadTimeout):
+        [p async for p in scraper.scrape_category("kosmetika")]
+
+    assert requests == 3
+    assert "kosmetika" not in scraper._route_statuses
+
+
+async def test_aloe_listing_does_not_retry_a_refusal(monkeypatch) -> None:
+    """403/404 — ответ сайта, а не помеха: один запрос и честный отказ."""
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(403)
+
+    scraper = _scraper_with_transport(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        [p async for p in scraper.scrape_category("kosmetika")]
+
+    assert requests == 1

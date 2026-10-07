@@ -21,7 +21,14 @@ from src.storage import (
 )
 
 SITES = ("pharmonline", "aptekonline", "aloe")
-ALOE_BROAD_CATEGORY_SLUGS = {"dermanlar", "bad", "usaq-dunyasi", "uşaq-qidası"}
+ALOE_BROAD_CATEGORY_SLUGS = {
+    "dermanlar",
+    "bad",
+    "usaq-dunyasi",
+    "uşaq-qidası",
+    "kosmetika",
+    "gigiyena",
+}
 
 
 def _aloe_category_sort_rank(slug_field) -> object:
