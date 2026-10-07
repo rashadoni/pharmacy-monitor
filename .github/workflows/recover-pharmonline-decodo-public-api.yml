@@ -354,7 +354,8 @@ jobs:
           # one with a new column fails on its first query.  Refuse unless the
           # DB is exactly at this commit's single migration head.  This is the
           # first thing that touches the DB, before the backup and before any
-          # write, so a refusal leaves nothing behind.
+          # write: a refusal changes nothing in the DB and takes no backup (the
+          # staged source stays on the host for audit).
           cd "$runtime_dir"
           if ! db_revision=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python -m alembic \
@@ -655,7 +656,14 @@ jobs:
           fi
           test "$(sha256sum "$work_dir/incoming/source-manifest" | awk '{print $1}')" = \
             "$source_manifest_sha"
-          test -f "$work_dir/production-before-reconciliation.dump"
+          if [ ! -f "$work_dir/production-before-reconciliation.dump" ]; then
+            if [ -f "$work_dir/reconciliation-and-catalog-recovery-verified" ]; then
+              echo "recovery is marked verified but its production backup is missing" >&2
+              exit 1
+            fi
+            echo "recovery stopped before the production backup; staged source retained for audit" >&2
+            exit 0
+          fi
           if [ -f "$work_dir/reconciliation-and-catalog-recovery-verified" ]; then
             echo "verified recovery evidence and immutable backup retained"
           else

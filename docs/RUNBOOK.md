@@ -929,26 +929,46 @@ migrations end at <голова коммита>; deploy this commit with deploy.
 (apply_migrations=true) first; this workflow does not migrate
 ```
 
-Значит, порядок такой: если миграции коммита впереди базы — сначала выкладка
-(`gh workflow run deploy.yml --ref main -f apply_migrations=true`), потом план,
-потом сверка. Отказ «revision cannot be read with this commit's migrations» —
-обратный случай: база ушла вперёд коммита, запускать надо с выложенного.
+**Сравнить ревизии до плана.** План их не сверяет и идёт долго — расхождение
+всплыло бы только на втором workflow:
 
 ```bash
-# где база и где коммит
+# база
 ssh root@13.140.186.143 "sudo -u postgres psql -X -At pharmacy_monitor \
   -c 'select version_num from alembic_version'"
-ls migrations/versions | tail -1
+# коммит, с которого собираешься запускать (базу не трогает)
+uv run alembic heads
 ```
 
-До 2026-10-07 этот workflow сам исполнял `alembic upgrade head` и сверял
-результат с прошитой `0021_…`: на голове 0023 он падал уже после бэкапа, а с
-коммита с новой миграцией двинул бы схему мимо проверок `deploy.yml`.
+Если миграции коммита впереди базы, выходов два:
 
-**Что остаётся на сервере.** Каждый запуск оставляет
-`/opt/pharmacy-monitor/.codex-decodo-reconciliation-apply.*` с исходниками и
-копией базы до сверки (`production-before-reconciliation.dump`). Сами каталоги
-не удаляются; на 2026-10-07 их девять.
+- выложить этот коммит с миграцией
+  (`gh workflow run deploy.yml --ref main -f apply_migrations=true`), потом
+  план и сверка с `main`;
+- не выкладывать посреди инцидента, а запустить план и сверку с того коммита,
+  который выложен: `gh run list --workflow deploy.yml --status success --limit 1
+  --json headSha`, ветка от этого коммита, оба workflow с `--ref <ветка>`.
+  Workflow при этом берётся тоже с ветки, поэтому годятся только коммиты новее
+  2026-10-07: до этой даты сверка сама исполняла `alembic upgrade head`.
+
+Отказ «revision cannot be read with this commit's migrations» — обратный случай:
+база ушла вперёд коммита, запускать надо с выложенного.
+
+**Пока идёт сверка, выкладку с миграцией не запускать** (и в понедельник, пока
+идёт еженедельный сбор, — тоже). Ревизия сверяется один раз, до первой записи;
+между ней и сбором каталога проходит больше получаса, а группа `concurrency` у
+`deploy.yml` своя, так что одно другого не ждёт.
+
+До 2026-10-07 этот workflow сам исполнял `alembic upgrade head` и сверял
+результат с прошитой `0021_…`: на голове 0023 он упал бы уже после бэкапа и
+миграции, а с коммита с новой миграцией двинул бы схему мимо проверок
+`deploy.yml`.
+
+**Что остаётся на сервере.** Каждый запуск, дошедший до сервера, оставляет
+черновой каталог `/opt/pharmacy-monitor/.codex-decodo-reconciliation-apply.*` с
+исходниками, а если дело дошло до бэкапа — и с копией базы до сверки. Сами
+каталоги не удаляются: убирать руками, когда копия больше не нужна. Последний
+шаг workflow пишет, что именно осталось.
 
 ### Firecrawl as scraper backup (Phase 6 — Firecrawl MCP)
 

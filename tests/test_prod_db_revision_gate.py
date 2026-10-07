@@ -5,7 +5,7 @@
 `storage.init_db()`, а тот — `create_all`: коммит с таблицей, которой в базе
 ещё нет, создал бы её мимо Alembic, а коммит с новой колонкой упал бы на первом
 запросе. Один из пяти сам исполнял `alembic upgrade head` и следом сверял
-ревизию с прошитой `0021_…` — на голове 0023 он падал уже после миграции.
+ревизию с прошитой `0021_…` — на голове 0023 он упал бы уже после миграции.
 
 Четыре удалены (маршруты, которыми pharmonline с августа не собирается). У
 пятого — сверки личностей через Decodo — миграции больше нет: схему двигает
@@ -16,6 +16,8 @@
 - список workflow, которые исполняют код чекаута против боевой базы, совпадает
   со списком `GATED`: новый такой workflow роняет тест, пока его шаги не
   исполняются в стенде ниже
+- в workflow из `GATED` команда, способная менять базу, стоит только в шагах,
+  которые стенд исполняет: новый шаг с такой командой роняет тест
 - распознаватель видит команды из `WRITES` (ими писали удалённые workflow) и не
   принимает за запись то, что в `READS`
 - стенд берёт шаги из самих файлов и исполняет их: `ssh` выполняет удалённую
@@ -23,27 +25,38 @@
   на каталоги песочницы, `rsync` копирует туда же настоящим rsync, Alembic
   настоящий, база — SQLite со схемой из моделей
 - база отстаёт от коммита, ушла вперёд или не имеет ревизии — шаг отказывает,
-  не дойдя ни до бэкапа, ни до `--apply`, ни до `run`, и файл базы не меняется
+  не дойдя ни до бэкапа, ни до `--apply`, ни до `run`; файл базы не меняется, и
+  таблицы, которой в ней не было, не появляется
 - база на голове коммита — шаг доходит до первой записи, и `alembic upgrade`
   по дороге не зовётся
+- у сверки: коммит с двумя головами миграций — отказ; шаг, который идёт после
+  любого исхода, объясняет, что осталось на сервере
 
 Чего тест не видит:
 - запись другими командами: `psql`, python-вставка с `session.commit()`, скрипт
-  из `scripts/` без `--apply`
-- workflow без `actions/checkout`: он исполняет код живого каталога, который
-  кладёт `deploy.yml` со своей сверкой (`production-aptekonline-scrape.yml`,
-  `recover-interrupted-empty-run.yml`)
+  из `scripts/` без `--apply` и `--commit`, CLI через переменную или
+  shell-функцию (`$PM run`, `run_cli run`)
+- дорогу к базе, записанную не адресом сервера и не секретом `PG_PASS`: имя
+  хоста, адрес из другого секрета
+- workflow без `actions/checkout`: он исполняет код живого каталога
+  (`production-aptekonline-scrape.yml`, `recover-interrupted-empty-run.yml`).
+  Что туда попадает только через сверку `deploy.yml` — забота не этого теста:
+  2026-10-07 три workflow ещё копировали туда файлы мимо неё
 - workflow, исправленный в ветке и запущенный с неё (`--ref`): CI такую ветку
   проверит, только если из неё открыт PR
 - всё после первой записи: сценарий «база на голове» стенд заканчивает на
   публикации каталога — дальше сеть, полчаса ожидания и JSON-колонки, которые
   SQLite отдаёт строкой. Хвост проверен только на синтаксис (`bash -n`)
+- выкладку с миграцией, начатую, пока шаг уже работает: сверка одна, до первой
+  записи, а группы `concurrency` у выкладки и у этих workflow разные
 - настоящие ssh, права на сервере, PostgreSQL и `pg_dump`
 - модель без миграции: сверка сравнивает ревизии, а не таблицы, и `create_all`
   такую таблицу создаст на любой ревизии
 
 Сверку стенд узнаёт по поведению, а не по тексту: как она записана, ему
-неважно, важно, что при чужой ревизии до записи дело не доходит.
+неважно, важно, что при чужой ревизии до записи дело не доходит. Стенд — тот же
+приём, что в `tests/test_deploy_workflow.py` (#35); когда оба в `main`, общую
+часть стоит вынести в один модуль.
 """
 
 from __future__ import annotations
@@ -62,8 +75,9 @@ import pytest
 import yaml
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 
+from src.main import cli
 from src.storage import Base
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -85,13 +99,18 @@ GATED = {
 SCHEMA_OWNER = {"deploy.yml"}
 
 # После этих команд код чекаута может изменить базу. Любая команда CLI зовёт
-# `storage.init_db()` → `create_all`, поэтому важна не подкоманда, а сам вызов.
+# `storage.init_db()` → `create_all`, поэтому важна не подкоманда, а сам вызов;
+# список подкоманд берётся из самого CLI, чтобы «pharmacy-monitor is healthy» в
+# сообщении записью не считалось.
+CLI_COMMANDS = "|".join(sorted(map(re.escape, cli.commands), key=len, reverse=True))
 WRITER = re.compile(
-    r"pharmacy-monitor[ \t]+[a-z]"
-    r"|-m[ \t]+src\.main[ \t]+[a-z]"
-    r"|\balembic\b[^\n]*?[ \t](?:upgrade|downgrade|stamp)\b"
+    rf"pharmacy-monitor[\"']?[ \t]+[\"']?(?:\$|(?:{CLI_COMMANDS})\b)"
+    r"|-m[ \t]+src\.main\b"
+    # без границы слова слева: #35 зовёт миграцию через функцию `staged_alembic`
+    r"|alembic\b[^\n]*?[ \t](?:upgrade|downgrade|stamp)\b"
     r"|\binit_db\(|\bcreate_all\("
-    r"|(?<![\w-])--apply\b"
+    # флаги, которыми скрипты из `scripts/` включают запись
+    r"|\.py\b[^\n]*?\s--(?:apply|commit|i-accept-full-rebuild)\b"
 )
 
 WRITES = [
@@ -114,6 +133,13 @@ WRITES = [
     "storage.init_db()",
     "Base.metadata.create_all(engine)",
     "python scripts/cleanup_false_matches.py data/false_matches.csv --apply",
+    "python scripts/recall_candidates.py --ultra --fuzz 90 --commit",
+    "python scripts/full_rematch.py --i-accept-full-rebuild",
+    '"$runtime_dir/.venv/bin/pharmacy-monitor" run --site aloe',
+    'pharmacy-monitor "$command" --site aloe',
+    '/opt/pharmacy-monitor/.venv/bin/python -m src.main "$command"',
+    # так миграцию зовёт deploy.yml в #35
+    'if staged_alembic upgrade head 2>&1 | tee "$log"; then',
 ]
 
 READS = [
@@ -135,13 +161,22 @@ READS = [
     "rsync -az src/ pm@13.140.186.143:/opt/pharmacy-monitor/src/",
     "python -m pip install --upgrade pip",
     "name: Pharmacy Monitor CI",
+    "- name: Restart pharmacy-monitor api",
+    'echo "pharmacy-monitor is healthy"',
+    'grep -- "--apply" scripts/reconcile_pharmonline_public_api_identities.py',
+    'gh run list --workflow ci-pipeline.yml --commit "$GITHUB_SHA" --status success',
+    "scripts/preflight_pharmonline_public_api.py \\\n"
+    '  "pm@13.140.186.143:$remote_work_dir/runtime/scripts/preflight_pharmonline_public_api.py"',
 ]
 
 
+CAPTION = re.compile(r"\s*(?:#|(?:-\s+)?(?:name|description):)")
+
+
 def _code(workflow_text: str) -> str:
-    """Текст workflow без комментариев и с команд, склеенных из строк с `\\`."""
+    """Текст workflow без комментариев и подписей, команды склеены из строк с `\\`."""
     joined = re.sub(r"\\\n[ \t]*", " ", workflow_text)
-    return "\n".join(line for line in joined.splitlines() if not line.lstrip().startswith("#"))
+    return "\n".join(line for line in joined.splitlines() if not CAPTION.match(line))
 
 
 def _writers(workflow_text: str) -> list[str]:
@@ -251,6 +286,21 @@ def test_every_workflow_running_checkout_code_on_prod_db_is_executed_in_the_sand
     assert not stale, f"{stale}: в GATED, но код чекаута против боевой базы больше не исполняет"
 
 
+@pytest.mark.parametrize("workflow", sorted(GATED))
+def test_gated_workflow_reaches_the_db_only_in_steps_the_sandbox_executes(workflow: str):
+    """Список выше — по файлам, стенд — по шагам: новый шаг не должен пройти между ними."""
+    outside = [
+        step.get("name", "<без имени>")
+        for step in _steps(workflow)
+        if _writers(step.get("run", "")) and step.get("name") not in GATED[workflow]
+    ]
+    assert not outside, (
+        f"{workflow}: шаги {outside} зовут команду, способную менять базу, а стенд их не "
+        "исполняет. Внести в GATED по порядку исполнения — тогда стенд покажет, что до сверки "
+        "они базу не трогают."
+    )
+
+
 # --- стенд -------------------------------------------------------------------
 
 SBX_HELPER = r"""
@@ -320,6 +370,8 @@ sys.exit(result.returncode)
 """,
     "rsync": r"""
 import os
+import shutil
+import subprocess
 import sys
 
 import _sbx
@@ -339,6 +391,12 @@ while index < len(args):
 if not remote:
     sys.exit("stub rsync: no remote destination")
 real = os.environ["SBX_REAL_RSYNC"]
+second_head = os.environ.get("SBX_SECOND_HEAD")
+if second_head and translated[-1].endswith("/runtime/migrations/"):
+    # коммит с двумя головами: вторая миграция приезжает вместе с остальными
+    subprocess.run([real, *translated], check=True)
+    shutil.copy(second_head, translated[-1] + "versions/")
+    sys.exit(0)
 os.execv(real, [real, *translated])
 """,
     "sleep": r"""
@@ -399,7 +457,21 @@ BEHIND_THE_GATE = {
     "alembic stamp",
 }
 EXPRESSION = re.compile(r"\$\{\{\s*(.+?)\s*\}\}")
+# Ключи, которые стенд умеет исполнять. Незнакомый (`defaults`, `env` у джобы,
+# `shell`, `continue-on-error`…) меняет то, как шаг работает на раннере, поэтому
+# роняет стенд: сначала научить, потом верить.
+KNOWN_WORKFLOW_KEYS = {
+    "name",
+    True,
+    "permissions",
+    "concurrency",
+    "jobs",
+}  # `on:` YAML читает как True
+KNOWN_JOB_KEYS = {"name", "runs-on", "timeout-minutes", "steps"}
 KNOWN_STEP_KEYS = {"name", "id", "env", "run"}
+RETAIN = "Retain recovery evidence and immutable backup"
+RETAIN_CONDITION = "${{ always() && env.REMOTE_WORK_DIR != '' }}"
+SECOND_HEAD = "9998_second_head"
 
 
 def _migration_head_and_parent() -> tuple[str, str]:
@@ -446,14 +518,29 @@ def _write_executable(path: Path, body: str) -> None:
 def _steps(workflow: str) -> list[dict]:
     data = yaml.safe_load((WORKFLOWS / workflow).read_text(encoding="utf-8"))
     (job,) = data["jobs"].values()
+    unknown = (set(data) - KNOWN_WORKFLOW_KEYS) | (set(job) - KNOWN_JOB_KEYS)
+    assert not unknown, f"{workflow}: стенд не знает ключи {sorted(map(str, unknown))} — научить"
     return job["steps"]
 
 
 class Sandbox:
-    def __init__(self, root: Path, *, db_state: str):
+    def __init__(self, root: Path, *, db_state: str, second_head: bool = False):
         self.root = root
         self.db_state = db_state
-        db_revision = DB_STATES[db_state]
+        db_revisions = [DB_STATES[db_state]] if DB_STATES[db_state] is not None else []
+        self.second_head: Path | None = None
+        if second_head:
+            # Вторая голова в коммите, и база стоит на обеих: `alembic current`
+            # и `alembic heads` печатают одно и то же.
+            self.second_head = root / f"{SECOND_HEAD}.py"
+            self.second_head.write_text(
+                f'revision: str = "{SECOND_HEAD}"\n'
+                f'down_revision: str | None = "{PARENT}"\n'
+                "branch_labels = None\ndepends_on = None\n\n\n"
+                "def upgrade() -> None:\n    pass\n\n\ndef downgrade() -> None:\n    pass\n",
+                encoding="utf-8",
+            )
+            db_revisions.append(SECOND_HEAD)
         self.bin = root / "bin"
         self.server = root / "server"
         self.database = self.server / "data" / "db.sqlite"
@@ -488,21 +575,34 @@ class Sandbox:
         )
         self.database.parent.mkdir(parents=True)
         engine = create_engine(f"sqlite:///{self.database}")
-        Base.metadata.create_all(engine)
-        if db_revision is not None:
+        tables = list(Base.metadata.sorted_tables)
+        # База не на голове коммита — значит, в ней нет чего-то, что есть в его
+        # моделях. Убираем таблицу, на которую никто не ссылается: если код
+        # чекаута доберётся до `create_all`, она появится.
+        self.missing_table = None if db_state == "at head" else tables.pop().name
+        Base.metadata.create_all(engine, tables=tables)
+        if db_revisions:
             with engine.begin() as connection:
                 connection.execute(
                     text("CREATE TABLE alembic_version (version_num VARCHAR(64) NOT NULL)")
                 )
-                connection.execute(
-                    text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
-                    {"revision": db_revision},
-                )
+                for revision in db_revisions:
+                    connection.execute(
+                        text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+                        {"revision": revision},
+                    )
         engine.dispose()
 
     @property
     def events(self) -> list[str]:
         return [json.loads(line) for line in self.events_file.read_text().splitlines()]
+
+    def tables(self) -> set[str]:
+        engine = create_engine(f"sqlite:///{self.database}")
+        try:
+            return set(inspect(engine).get_table_names())
+        finally:
+            engine.dispose()
 
     def db_fingerprint(self) -> str:
         return hashlib.sha256(self.database.read_bytes()).hexdigest()
@@ -515,9 +615,13 @@ class Sandbox:
 
         return EXPRESSION.sub(replace, str(value))
 
-    def run_step(self, workflow: str, name: str) -> subprocess.CompletedProcess[str]:
+    def run_step(
+        self, workflow: str, name: str, *, condition: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Исполняет шаг. `condition` — его `if:`, если тест сам решил, что оно истинно."""
         (step,) = [candidate for candidate in _steps(workflow) if candidate.get("name") == name]
-        unknown = set(step) - KNOWN_STEP_KEYS
+        assert step.get("if") == condition, f"у шага «{name}» другое условие: {step.get('if')}"
+        unknown = set(step) - KNOWN_STEP_KEYS - {"if"}
         assert not unknown, f"стенд не знает ключи шага {sorted(unknown)} — научить, потом верить"
         env = {
             **{key: os.environ[key] for key in ("LANG", "LC_ALL") if key in os.environ},
@@ -533,6 +637,8 @@ class Sandbox:
             "GITHUB_ENV": str(self.github_env),
             "GITHUB_OUTPUT": str(self.github_output),
         }
+        if self.second_head is not None:
+            env["SBX_SECOND_HEAD"] = str(self.second_head)
         for line in self.github_env.read_text(encoding="utf-8").splitlines():
             key, _, value = line.partition("=")
             env[key] = value
@@ -593,9 +699,26 @@ def test_refuses_before_any_write_when_the_db_is_not_at_the_commit_head(
     assert "alembic current" in events, _log(result)
     assert not BEHIND_THE_GATE & set(events), f"{events}\n{_log(result)}"
     assert sandbox.db_fingerprint() == before
+    assert sandbox.missing_table not in sandbox.tables()
     if workflow == RECOVER:
         for phrase in RECOVER_REFUSAL[sandbox.db_state]:
             assert phrase in result.stderr, _log(result)
+        # Шаг `always()` после отказа: бэкапа нет, и это не ошибка самого шага.
+        retained = sandbox.run_step(RECOVER, RETAIN, condition=RETAIN_CONDITION)
+        assert retained.returncode == 0, _log(retained)
+        assert "recovery stopped before the production backup" in retained.stderr
+
+
+def test_recovery_refuses_a_commit_with_two_migration_heads(tmp_path: Path):
+    sandbox = Sandbox(tmp_path, db_state="at head", second_head=True)
+    before = sandbox.db_fingerprint()
+
+    result = sandbox.run_gated(RECOVER)
+
+    assert result.returncode != 0, _log(result)
+    assert sandbox.events == ["alembic current", "alembic heads"], _log(result)
+    assert "this commit must have exactly one migration head" in result.stderr, _log(result)
+    assert sandbox.db_fingerprint() == before
 
 
 @pytest.mark.parametrize("sandbox", ["at head"], indirect=True)
@@ -613,6 +736,10 @@ def test_recovery_at_the_commit_head_backs_up_and_reconciles_without_migrating(s
     assert order[4:] == ["cli run"] * 3, events
     assert result.returncode != 0
     assert "sandbox: the scenario ends at the first catalog publication" in result.stderr
+    # Каталог не опубликован, бэкап снят: шаг `always()` говорит, что осталось.
+    retained = sandbox.run_step(RECOVER, RETAIN, condition=RETAIN_CONDITION)
+    assert retained.returncode == 0, _log(retained)
+    assert "staged evidence and backup retained for audit" in retained.stderr
 
 
 @pytest.mark.parametrize("sandbox", ["at head"], indirect=True)
