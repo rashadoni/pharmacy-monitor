@@ -822,6 +822,30 @@ def test_digest_info_type_that_does_not_fit_takes_no_rows_from_the_next(new_prod
     assert html.count("NEWPRODUCT") == (7 if new_products == 7 else 0)
 
 
+def test_digest_ranked_info_type_shows_largest_when_letter_is_short_of_rows():
+    """Живой случай 2026-10-07: после 37 критичных осталось 23 строки, а «можно
+    поднять цену» — 28. Тип меньше потолка и ранжируется по проценту, поэтому
+    идут 23 самых крупных, а не одно число."""
+    events = (
+        [_loose_event("undercut_threshold", "critical", f"UC{i:02d}") for i in range(7)]
+        + [_loose_event("price_drop_pct", "critical", f"PD{i:03d}") for i in range(136)]
+        + [
+            _loose_event("price_raise_opportunity", "info", f"RAISE{i:02d}", {"gap_pct": 7 + i})
+            for i in range(28)
+        ]
+        + [_loose_event("new_product", "info", f"NEWPRODUCT{i:04d}") for i in range(3043)]
+    )
+    html = notifications._render_digest_email(events, kind="weekly", since=utcnow())
+
+    assert _event_rows(html) == 60
+    assert html.count("RAISE") == 23
+    assert "RAISE27" in html and "RAISE05" in html
+    assert "RAISE04" not in html
+    assert "Можно поднять цену <span" in html and "23 из 28" in html
+    assert "Ещё 5 — в дашборде" in html
+    assert "NEWPRODUCT" not in html
+
+
 def test_digest_last_rows_go_to_smallest_type_first():
     """Остаток меньше числа типов — единственное предупреждение о сбое сбора
     не теряется за десятками предупреждений о ценах."""
