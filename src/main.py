@@ -4863,9 +4863,9 @@ def _is_scheduled_full_scan(
 
     Решает то, во что прогон РАЗРЕШИЛСЯ (`is_full_catalog`), а не сырой
     `--mode`. Root-овый systemd-юнит зовёт `run --site %i` без `--mode`: режим
-    `auto` становится полным сбором только после разбора watchlist, а у
-    pharmonline маркер уводит его в public_api. Гвард, смотревший на сырое
-    значение, не сработал на проде ни разу — aloe собирался каждую ночь.
+    `auto` становится category уже внутри `run`, а у pharmonline маркер уводит
+    его в public_api. Гвард, смотревший на сырое значение, не сработал на проде
+    ни разу — aloe собирался каждую ночь.
 
     Мимо ритма идёт только то, о чём человек попросил явно:
       * выбранная категория, `--limit`, watchlist- и hourly-тики — это не
@@ -4951,7 +4951,10 @@ def _sites_due_for_full_scan(
     "--mode",
     type=click.Choice(["auto", "watchlist", "category", "public_api"]),
     default="auto",
-    help="auto = watchlist если есть товары, иначе category. public_api — guarded Pharmonline recovery.",
+    help="auto = category (сбор каталога); для `--site pharmonline` с маркером "
+    "автономного режима — public_api. Содержимое watchlist на режим не влияет. "
+    "watchlist — только закреплённые ссылки, задаётся явно. "
+    "public_api — guarded Pharmonline recovery.",
 )
 @click.option(
     "--category-id",
@@ -4997,7 +5000,7 @@ def run_cmd(
     """Полный прогон: scrape → match → analyze → report."""
     sites = list(site) if site else list(SCRAPER_CLASSES.keys())
     # Как режим задал вызывающий — до того, как его перепишут маркер ниже и
-    # разбор watchlist. Нужен гварду ритма: явный public_api идёт мимо него.
+    # разбор режима. Нужен гварду ритма: явный public_api идёт мимо него.
     requested_mode = mode
     if _pharmonline_public_api_autonomous_mode_requested(sites, mode):
         _enable_pharmonline_public_api_autonomous_mode()
@@ -5061,24 +5064,22 @@ def run_cmd(
         if hourly:
             mode = "watchlist"
 
-        # Если задан --category-id → форсируем category-режим (даже если watchlist непустой)
-        if category_id is not None and mode == "auto":
+        # Режим по умолчанию — сбор каталога, что бы ни лежало в watchlist.
+        # Раньше `auto` при непустом watchlist становился watchlist-прогоном, и
+        # режим планового запуска решала таблица, а не команда: одна
+        # подтверждённая ссылка на любом сайте — и юнит `run --site %i` навсегда
+        # перестал бы собирать полный каталог. Молча — там, где ссылка лежит на
+        # том же сайте (частичный прогон со статусом ok); на остальных сайтах
+        # прогон падал бы каждую ночь. Закреплённые ссылки обновляет свой таймер
+        # (`watchlist-tick`), он зовёт mode="watchlist" явно.
+        if mode == "auto":
             mode = "category"
 
-        # Определяем режим. Обязательно ДО гварда ритма: полный это сбор или
-        # нет, при `--mode auto` известно только после разбора watchlist.
-        watchlist_urls = (
-            collect_watchlist_urls(session)
-            if mode not in {"category", "public_api"}
-            else {}
-        )
+        # Определяем режим. Обязательно ДО гварда ритма: он решает по тому, во
+        # что прогон разрешился.
+        effective_mode = mode
+        watchlist_urls = collect_watchlist_urls(session) if mode == "watchlist" else {}
         total_pinned = sum(len(urls) for urls in watchlist_urls.values())
-        if mode == "public_api":
-            effective_mode = "public_api"
-        elif mode == "watchlist" or (mode == "auto" and total_pinned > 0):
-            effective_mode = "watchlist"
-        else:
-            effective_mode = "category"
 
         is_full_catalog = (
             effective_mode in {"category", "public_api"}

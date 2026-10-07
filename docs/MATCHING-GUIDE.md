@@ -80,7 +80,9 @@ aloe-Diazolin не в матче. Тогда:
 2. Введи имя ("Friso Gold 1 800 g")
 3. Вставь **3 URL'а** — точные ссылки на pharmonline, aptekonline, aloe
 4. Сохрани
-5. На следующем прогоне — auto-match создаст Match-кластер с этими 3 товарами
+5. На следующем прогоне по watchlist (таймер `watchlist-tick`, кнопка на вкладке или
+   `pharmacy-monitor run --mode watchlist`) auto-match создаст Match-кластер с этими
+   3 товарами. Обычный `run` без `--mode` собирает каталог и закреплённые ссылки не трогает.
 
 Это **100% точный матч** через URL, без fuzzy-алгоритма.
 
