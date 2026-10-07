@@ -387,6 +387,68 @@ def test_dispatch_events_batch_two_users_different_thresholds(setup, tenant_user
     assert warn.channels_sent == ["email"]  # ушёл alice → помечен
 
 
+def test_dispatch_events_batch_roles_keep_the_letter_from_viewers(setup, tenant_user):
+    """roles=ADMIN_ROLES → письмо получает админ, сотрудник клиента — нет."""
+    s = setup  # tenant_user (alice) — admin
+    t = tenant_user.tenant_id
+    for email, role in (("bob@example.com", "viewer"), ("carol@example.com", "owner")):
+        s.add(
+            storage.TenantUser(
+                tenant_id=t,
+                email=email,
+                role=role,
+                is_active=True,
+                created_at=utcnow(),
+                email_severity_min="warning",
+            )
+        )
+    s.commit()
+    # Событие вне базы — так приходят изменения цены с частичного сбора.
+    event = _loose_event("price_drop_pct", "critical", "Цена упала на 20.0%: X")
+
+    with patch("src.notifier.send_email") as mock_email:
+        result = notifications.dispatch_events_batch(
+            s,
+            [event],
+            roles=notifications.ADMIN_ROLES,
+            note="Частичный сбор aloe <b>, только администраторам",
+        )
+
+    recipients = sorted(c.kwargs["to"][0] for c in mock_email.call_args_list)
+    assert recipients == ["alice@example.com", "carol@example.com"]
+    assert result["email"] == 2
+    body = mock_email.call_args.kwargs["html_body"]
+    assert "Частичный сбор aloe &lt;b&gt;, только администраторам" in body
+    # В журнал событие не попало: рассылка его не сохраняет.
+    assert s.query(storage.AlertEvent).count() == 0
+
+
+def test_dispatch_events_batch_without_roles_still_reaches_everyone(setup, tenant_user):
+    """По умолчанию круг получателей прежний, а пояснения в письме нет."""
+    s = setup
+    s.add(
+        storage.TenantUser(
+            tenant_id=tenant_user.tenant_id,
+            email="bob@example.com",
+            role="viewer",
+            is_active=True,
+            created_at=utcnow(),
+            email_severity_min="warning",
+        )
+    )
+    event = _mk_event(s, tenant_user.tenant_id, "everyone", "critical", "For all")
+    s.commit()
+
+    with patch("src.notifier.send_email") as mock_email:
+        notifications.dispatch_events_batch(s, [event])
+
+    assert sorted(c.kwargs["to"][0] for c in mock_email.call_args_list) == [
+        "alice@example.com",
+        "bob@example.com",
+    ]
+    assert "#fffbeb" not in mock_email.call_args.kwargs["html_body"]
+
+
 def test_dispatch_events_batch_all_below_threshold_redispatchable(setup, tenant_user):
     """Все события ниже порога → 0 писем и channels_sent НЕ ставится (re-dispatch)."""
     s = setup

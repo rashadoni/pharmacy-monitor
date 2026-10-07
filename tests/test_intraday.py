@@ -14,13 +14,13 @@ Redis замокан unittest.mock.MagicMock для контролируемог
 from __future__ import annotations
 
 from datetime import timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import click
 from click.testing import CliRunner
 from sqlalchemy.orm import sessionmaker
 
-from src import intraday, storage
+from src import alerts, intraday, storage, tenants
 from src import main as main_mod
 from src._time import utcnow
 
@@ -573,6 +573,170 @@ def test_intraday_tick_invokes_bounded_point_scrape(db_session, monkeypatch):
     assert result.exit_code == 0, result.output
     assert invoked == {"limit": 321, "site": ("aloe",), "category_id": category.id}
     assert "limit=321" in result.output
+
+
+def _tick_with_recorded_drop(db_session, monkeypatch, *, tick_status="ok"):
+    """Тик, чей сбор записал падение цены 100 → 80 на товаре aloe.
+
+    Настоящий `scrape` заменён функцией, которая оставляет в базе то же, что
+    оставил бы он: частичный прогон и snapshot. Всё после сбора — настоящее.
+    """
+    tenant = tenants.get_or_create_default(db_session)
+    for email, role in (("admin@example.com", "admin"), ("client@example.com", "viewer")):
+        db_session.add(
+            storage.TenantUser(
+                tenant_id=tenant.id,
+                email=email,
+                role=role,
+                is_active=True,
+                email_severity_min="warning",
+            )
+        )
+    category = _add_category(db_session, "aloe_bad", "БАД", aloe_slug="bad")
+    product = _add_product_with_category(db_session, "aloe", "drop", "Dropped item", "bad")
+    started = utcnow() - timedelta(days=1)
+    verified = storage.Run(
+        started_at=started,
+        finished_at=started + timedelta(minutes=30),
+        status="ok",
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=True,
+        run_quality={
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {"aloe": {"status": "ok"}},
+        },
+    )
+    db_session.add(verified)
+    db_session.flush()
+    db_session.add(storage.PriceSnapshot(run_id=verified.id, product_id=product.id, price=100.0))
+    db_session.add(
+        storage.AlertRule(
+            name="drop",
+            rule_type="price_drop_pct",
+            params={"min_pct": 10.0},
+            channels=["email"],
+            cooldown_hours=48,
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    SessionLocal = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main_mod.storage, "init_db", lambda: None)
+    monkeypatch.setattr(main_mod.storage, "make_session", lambda: SessionLocal)
+    monkeypatch.setattr(
+        intraday,
+        "pick_next_scrape_target",
+        lambda session, commit_state: intraday.TickDecision(target=("aloe", category)),
+    )
+
+    @click.command()
+    def fake_scrape(limit, site, category_id):
+        with SessionLocal() as s:
+            run = storage.Run(
+                started_at=utcnow(),
+                finished_at=utcnow(),
+                status=tick_status,
+                catalog_scope="partial",
+                catalog_verified=False,
+                run_quality={
+                    "mode": "category",
+                    "financially_eligible": False,
+                    "sites": {"aloe": {"status": tick_status}},
+                },
+            )
+            s.add(run)
+            s.flush()
+            s.add(storage.PriceSnapshot(run_id=run.id, product_id=product.id, price=80.0))
+            s.commit()
+            return run.id
+
+    monkeypatch.setattr(main_mod, "scrape_cmd", fake_scrape)
+    return SessionLocal
+
+
+def test_intraday_tick_mails_price_drop_to_admins_only(db_session, monkeypatch):
+    """Решение владельца 2026-10-07: алерты с тиков — только админу.
+
+    Письмо уходит администратору, сотруднику клиента — нет, и в журнале
+    алертов (его читают дашборд и дайджест) события не появляется.
+    """
+    SessionLocal = _tick_with_recorded_drop(db_session, monkeypatch)
+
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
+    ):
+        result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert [c.kwargs["to"] for c in mock_email.call_args_list] == [["admin@example.com"]]
+    assert not mock_tg.called
+    sent = mock_email.call_args.kwargs
+    assert "Цена упала на 20.0%" in sent["subject"]
+    assert "Dropped item" in sent["html_body"]
+    assert "раздел aloe_bad" in sent["html_body"]
+    assert "только администраторы" in sent["html_body"]
+    with SessionLocal() as s:
+        assert s.query(storage.AlertEvent).count() == 0
+
+
+def test_intraday_tick_with_unclean_scrape_mails_nothing(db_session, monkeypatch):
+    """Сбор категории завершился не чисто → по его ценам писем нет."""
+    _tick_with_recorded_drop(db_session, monkeypatch, tick_status="degraded")
+
+    with patch("src.notifier.send_email") as mock_email:
+        result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert not mock_email.called
+
+
+def test_intraday_tick_survives_a_failure_in_price_alerts(db_session, monkeypatch):
+    """Сбор уже записан: сбой при подсчёте алертов тик не роняет."""
+    _tick_with_recorded_drop(db_session, monkeypatch)
+
+    def boom(session, run_id):
+        raise RuntimeError("alerts are broken")
+
+    monkeypatch.setattr(alerts, "local_price_alerts_for_partial_run", boom)
+
+    with patch("src.notifier.send_email") as mock_email:
+        result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert not mock_email.called
+
+
+def test_intraday_tick_without_a_scrape_run_evaluates_no_alerts(db_session, monkeypatch):
+    """`scrape` вышел без прогона (шёл другой сбор) → считать нечего."""
+    category = _add_category(db_session, "aloe_bad", "БАД", aloe_slug="bad")
+    db_session.commit()
+    SessionLocal = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(main_mod.storage, "init_db", lambda: None)
+    monkeypatch.setattr(main_mod.storage, "make_session", lambda: SessionLocal)
+    monkeypatch.setattr(
+        intraday,
+        "pick_next_scrape_target",
+        lambda session, commit_state: intraday.TickDecision(target=("aloe", category)),
+    )
+
+    @click.command()
+    def fake_scrape(limit, site, category_id):
+        return None
+
+    monkeypatch.setattr(main_mod, "scrape_cmd", fake_scrape)
+    called = []
+    monkeypatch.setattr(
+        alerts, "local_price_alerts_for_partial_run", lambda *a, **kw: called.append(a)
+    )
+
+    result = CliRunner().invoke(main_mod.cli, ["intraday-tick"])
+
+    assert result.exit_code == 0, result.output
+    assert called == []
 
 
 def test_intraday_tick_prints_why_it_skipped(db_session, monkeypatch):

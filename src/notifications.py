@@ -185,8 +185,23 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
     return {c: f"sent_{len(r)}" for c, r in results.items()}
 
 
-def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) -> dict[str, int]:
+# Кому идут письма «только администраторам» — те же роли, что API считает
+# администраторскими.
+ADMIN_ROLES = ("admin", "owner")
+
+
+def dispatch_events_batch(
+    session: Session,
+    events: list[storage.AlertEvent],
+    *,
+    roles: tuple[str, ...] | None = None,
+    note: str | None = None,
+) -> dict[str, int]:
     """Слить ВСЕ события одного прогона в ОДНО письмо-сводку на получателя.
+
+    `roles` — слать только получателям с этими ролями (`ADMIN_ROLES` для
+    событий частичного сбора, которые клиенту не показываются). `note` —
+    строка-пояснение под заголовком письма.
 
     Замена циклу `for ev: dispatch_event(ev)` (одно письмо на событие → поток:
     переоценка линейки из 15 товаров = 15 писем). Теперь одно письмо со списком
@@ -224,6 +239,8 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                 storage.TenantUser.is_active.is_(True),
             )
         ).all()
+        if roles is not None:
+            users = [u for u in users if u.role in roles]
         by_obj = {id(e): e for e in tevents}
         for user in users:
             sent_now: dict[int, set[str]] = {}
@@ -239,7 +256,7 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                     try:
                         notifier.send_email(
                             subject=_batch_subject(ev_email),
-                            html_body=_render_batch_email(ev_email),
+                            html_body=_render_batch_email(ev_email, note=note),
                             to=[user.email],
                         )
                         emails_sent += 1
@@ -805,8 +822,14 @@ def _batch_subject(events: list[storage.AlertEvent]) -> str:
     return f"[{worst.upper()}] Pharmacy Monitor — {len(events)} алертов"
 
 
-def _render_batch_email(events: list[storage.AlertEvent]) -> str:
+def _render_batch_email(events: list[storage.AlertEvent], *, note: str | None = None) -> str:
     """ОДНО письмо со списком всех событий прогона (critical → warning → info)."""
+    note_row = (
+        '<tr><td style="padding:12px 24px;background:#fffbeb;border-bottom:1px solid #e4e4e7;'
+        f'font-size:13px;color:#52525b;">{escape(note, quote=False)}</td></tr>'
+        if note
+        else ""
+    )
     ordered = sorted(events, key=lambda e: -SEVERITY_ORDER.get(e.severity, 0))
     rows = "\n".join(_format_event_html(e) for e in ordered)
     public = os.environ.get("PHARMACY_PUBLIC_URL", "")
@@ -828,6 +851,7 @@ def _render_batch_email(events: list[storage.AlertEvent]) -> str:
       <div style="font-size:22px;font-weight:600;color:#18181b;">{len(events)} алертов за прогон</div>
       <div style="font-size:13px;color:#71717a;margin-top:4px;">{summary}</div>
     </td></tr>
+    {note_row}
     {rows}
     <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
       <a href="{public}/alerts" style="color:#3b82f6;">Открыть в дашборде →</a>
