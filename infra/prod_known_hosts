@@ -6,8 +6,10 @@
 # StrictHostKeyChecking=yes, so they refuse to talk to anything else that
 # answers on the address. The same key is pinned in every workflow under
 # .github/workflows/ that reaches the server; tests/test_prod_host_pinning.py
-# fails when a workflow carries a different key. If the server is rebuilt, read
-# the new key from
+# fails when a workflow carries a different key or a fingerprint that is not
+# this key's. If the server is rebuilt, read the new key from
 # /etc/ssh/ssh_host_ed25519_key.pub on the server itself, not from the network,
-# and replace it here and in the workflows together.
+# and replace BOTH the key and the SHA256 fingerprint, here and in every
+# workflow, in one change. (Keeping a copy of the server's private host key off
+# the server and restoring it on rebuild avoids the rotation altogether.)
 13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDVrem8NrMZMjV9cDiB8/8wOwOn1wrfSU7S5vfaLHM+R

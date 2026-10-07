@@ -4606,8 +4606,19 @@ def notify_group() -> None:
 @notify_group.command("digest")
 @click.argument("kind", type=click.Choice(["daily", "weekly"]))
 @click.option("--tenant-id", type=int, default=1, help="Send digest for this tenant only")
-@click.option("--dry-run", is_flag=True, help="Compute digest content but don't send emails")
-def notify_digest(kind: str, tenant_id: int, dry_run: bool) -> None:
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Собрать письма и показать в логе тему, размер и число строк, ничего не отправляя",
+)
+@click.option(
+    "--only",
+    "only_email",
+    default=None,
+    help="Отправить только этому получателю (из включивших дайджест) — посмотреть письмо, "
+    "не трогая остальных",
+)
+def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | None) -> None:
     """Send digest email to opted-in users for the tenant.
 
     Daily includes events from last 24h, weekly from last 7d. Recipients are
@@ -4620,15 +4631,14 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool) -> None:
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        if dry_run:
-            click.echo(f"[dry-run] would send {kind} digest for tenant_id={tenant_id}")
-            return
-        sent = (
-            notifications.send_daily_digest(s, tenant_id=tenant_id)
-            if kind == "daily"
-            else notifications.send_weekly_digest(s, tenant_id=tenant_id)
+        send = (
+            notifications.send_daily_digest if kind == "daily" else notifications.send_weekly_digest
         )
-        click.echo(f"OK: {kind} digest sent to {sent} recipients")
+        sent = send(s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run)
+        if dry_run:
+            click.echo(f"[dry-run] {kind} digest: {sent} recipients, nothing sent")
+        else:
+            click.echo(f"OK: {kind} digest sent to {sent} recipients")
 
 
 @notify_group.command("test")

@@ -9,6 +9,7 @@
 Покрываем:
 - каждый workflow, который ходит на прод, пишет в known_hosts тот же ключ, что
   лежит в `infra/prod_known_hosts`
+- отпечатки, с которыми workflow сверяют ключ, посчитаны от него же
 - скрипты, которые ходят на прод, требуют прошитый ключ
 - в исполняемых каталогах никто не доверяет ключу, полученному из сети
 - адрес удалённого сервера не возвращается в исполняемые каталоги
@@ -22,6 +23,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
 from pathlib import Path
 
@@ -48,6 +51,13 @@ def _pinned_line() -> str:
     return lines[0]
 
 
+def _fingerprint(known_hosts_line: str) -> str:
+    """Отпечаток в том виде, в каком его печатает `ssh-keygen -lf … -E sha256`."""
+    blob = base64.b64decode(known_hosts_line.split()[2])
+    digest = base64.b64encode(hashlib.sha256(blob).digest()).decode()
+    return "SHA256:" + digest.rstrip("=")
+
+
 def _executable_files() -> list[Path]:
     return [
         path
@@ -71,6 +81,36 @@ def test_workflows_reaching_prod_pin_the_same_host_key():
     assert not unpinned, (
         "host key не прошит, отличается от infra/prod_known_hosts или шаг записан иначе, "
         f"чем в остальных workflow (printf … > ~/.ssh/known_hosts): {unpinned}"
+    )
+
+
+def test_fingerprint_literals_match_the_pinned_key():
+    # Большинство workflow после записи ключа сверяют его отпечаток с литералом.
+    # Сменится ключ сервера, а литерал забудут — тесты выше останутся зелёными,
+    # а каждый workflow упадёт на подготовке SSH, причём уже во время аварии.
+    expected = _fingerprint(_pinned_line())
+
+    noted = re.findall(r"SHA256:\S+", (ROOT / "infra" / "prod_known_hosts").read_text())
+    assert noted == [expected], (
+        f"infra/prod_known_hosts называет отпечаток {noted}, а не {expected}"
+    )
+
+    # Берём строку в кавычках целиком — ровно то, с чем workflow сравнит вывод
+    # ssh-keygen: лишний символ внутри кавычек уронит его так же, как чужой отпечаток.
+    compared = re.compile(
+        r"ssh-keygen -lf ~/\.ssh/known_hosts -E sha256.*?=\s*\\\n\s*'([^']*)'", re.DOTALL
+    )
+    stale = {}
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+        text = path.read_text()
+        if PROD_IP not in text:
+            continue
+        found = compared.findall(text)
+        if len(found) != text.count("ssh-keygen -lf") or any(item != expected for item in found):
+            stale[path.name] = found
+    assert not stale, (
+        f"отпечаток не от прошитого ключа (ожидается {expected}) или сверка записана иначе, "
+        f"чем в остальных workflow: {stale}"
     )
 
 

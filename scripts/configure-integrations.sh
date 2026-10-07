@@ -6,8 +6,7 @@
 #   1. SMTP (Resend) — для email magic-link и daily reports
 #   2. Telegram bot — для push-алертов
 #   3. Sentry — для error tracking
-#   4. GitHub remote — для backup кода (если ещё не настроен)
-#   5. (опц.) ScraperAPI Hobby — если есть подписка $49/мес
+#   (блоки «GitHub remote» и «ScraperAPI Hobby» сняты 2026-10-07 — см. ниже)
 #
 # Каждый блок — отдельная функция, можно skip любую.
 # После каждого блока обновляет /etc/pharmacy-monitor/env на проде
@@ -19,13 +18,15 @@
 # нацелен на Hetzner-сервер, удалённый в сентябре 2026, а он отправляет на
 # PROD_HOST вводимые ключи. Теперь адрес задаётся явно, и соединение принимается
 # только с host key из infra/prod_known_hosts.
-# Перед запуском учесть, что блоки писались под май 2026 (скрипт по-прежнему
-# предлагает все пять — на устаревшие отвечать «нет»):
+# Блоки писались под май 2026:
 #   SMTP, Sentry      — уже настроены на проде;
-#   ScraperAPI Hobby  — НЕ запускать: aptekonline давно собирается на проде
-#                       через Decodo, блок перепишет SCRAPER_API_SITES;
-#   GitHub remote     — НЕ запускать: репозиторий давно на GitHub, а прямой
-#                       push в main запрещён (docs/DELIVERY-ARCHITECTURE.md).
+#   ScraperAPI Hobby  — снят, main() его не вызывает: aptekonline давно
+#                       собирается на проде через Decodo, блок переписал бы
+#                       SCRAPER_API_SITES;
+#   GitHub remote     — снят, main() его не вызывает: репозиторий давно на
+#                       GitHub, а прямой push в main запрещён
+#                       (docs/DELIVERY-ARCHITECTURE.md).
+# Функции обоих снятых блоков оставлены в файле как история.
 
 set -e
 trap 'echo "Прерывание. Существующая конфигурация на проде не изменена." ; exit 130' INT
@@ -255,18 +256,19 @@ main() {
     echo "Pharmacy Monitor — interactive integration setup"
     echo "Production target: root@$PROD_HOST (ssh key: $SSH_KEY)"
     echo
-    echo "Скрипт пройдёт по 5 блокам. Каждый можно пропустить нажав 'n'."
+    echo "Скрипт пройдёт по 3 блокам. Каждый можно пропустить нажав 'n'."
     echo
 
     configure_smtp
     configure_telegram
     configure_sentry
-    configure_scraperapi
-    configure_github
+    # configure_scraperapi и configure_github сняты 2026-10-07 — см. шапку.
+    echo
+    echo "Блоки «ScraperAPI Hobby» и «GitHub remote» сняты: они переписали бы рабочие настройки."
 
     section "Готово"
     echo "Текущая конфигурация прода (заполненные ключи):"
-    ssh_root "grep -E '^(SMTP_HOST|TELEGRAM_BOT_TOKEN|SENTRY_DSN|SCRAPER_API_SITES)=' '$PROD_ENV_FILE' | sed 's/=.*/=<set>/'"
+    ssh_root "grep -E '^(SMTP_HOST|TELEGRAM_BOT_TOKEN|SENTRY_DSN)=' '$PROD_ENV_FILE' | sed 's/=.*/=<set>/'"
     echo
     echo "Что дальше:"
     echo "  • Открой https://leaddrive.cloud/settings — проверь что нотификации показывают ✓"

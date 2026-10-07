@@ -23,10 +23,20 @@ scraping unless `PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1` is set for an explicit
 one-off disaster-recovery run.
 
 `com.pharmacy-monitor.db-tunnel` (a diagnostics/Postgres tunnel, not a scraper)
-is stale too: it pointed at the deleted Hetzner host. Unload it on the Mac
-(`launchctl bootout gui/$UID/com.pharmacy-monitor.db-tunnel`); the copy here
-carries a placeholder instead of an address until someone decides the tunnel is
-still wanted.
+is stale too: it pointed at the deleted Hetzner host. Remove it on the Mac —
+both steps, because `bootout` alone lasts only until the next login, when the
+installed copy (old address, `RunAtLoad`, `KeepAlive`) is loaded again:
+
+```bash
+launchctl bootout gui/$UID/com.pharmacy-monitor.db-tunnel
+rm ~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist
+```
+
+Do this before cleaning the old address out of the Mac's `~/.ssh/known_hosts`:
+the stored Hetzner key is what makes the installed agent refuse a stranger on
+that address. The copy here carries a placeholder instead of an address until
+someone decides the tunnel is still wanted. The Mac's checkout of this
+repository also keeps the pre-2026-10-07 scripts until it is pulled.
 
 ## Files
 
