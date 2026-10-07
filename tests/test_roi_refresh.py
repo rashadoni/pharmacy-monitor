@@ -859,6 +859,44 @@ def test_queued_refresh_is_not_promised_while_the_catalog_is_untrusted(client, a
     assert [r.status for r in _requests(api_db)] == ["skipped"]
 
 
+def test_full_run_deferred_by_an_orphan_run_shows_recalculating_not_an_empty_list(
+    client, api_db, monkeypatch
+):
+    """Что видит пользователь, пока конец сбора ждёт снятия осиротевшего прогона.
+
+    Не «Нет рекомендаций» и не список прошлого сбора, а «пересчитываются» — и
+    настоящий список, как только watcher снял сироту.
+    """
+    from tests.test_run_failure_semantics import _patch_verified_aloe_pipeline
+
+    run = _full_run(api_db)
+    _cluster(api_db, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    roi_refresh.refresh_from_trusted_epoch(api_db)
+    assert [item["type"] for item in _recommendations(client)["items"]] == ["price_raise"]
+    api_db.add(Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running"))
+    api_db.commit()
+    _patch_verified_aloe_pipeline(api_db, monkeypatch)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        # --force: у aloe в этом окне ритма уже есть полный сбор (фикстура).
+        finished = runner.invoke(
+            main_mod.cli,
+            ["run", "--site", "aloe", "--mode", "category", "--no-alerts", "--force"],
+        )
+    assert finished.exit_code == 0, finished.output
+
+    for path in ("/api/v1/dash/roi/recommendations", "/api/v1/dash/roi/actions"):
+        waiting = client.get(path)
+        assert waiting.status_code == 503, path
+        assert waiting.json()["detail"] == "Recommendations are being recalculated", path
+    assert "отложено — есть незавершённый прогон" in _watcher_tick()
+
+    assert main_mod.reap_stale_running_runs(api_db, max_age_hours=0) == 1
+    assert "пересчитано" in _watcher_tick()
+    assert [item["type"] for item in _recommendations(client)["items"]] == ["price_raise"]
+
+
 _STAGE_SUMMARY = {"refreshed": 0, "relinked": 0, "clusters": 0, "revalidated": 0, "flagged": 0}
 
 

@@ -5637,12 +5637,13 @@ def run_cmd(
             # сайтов и сохранить в roi_actions_cache. HTTP-handler
             # /dash/roi/actions читает оттуда → <50мс latency вместо
             # 15-30с inline compute (timeout'ило с 408 на 4 экранах).
-            # When all three sites form a trusted epoch, every cache slice must
-            # refresh successfully before the current run is published.  If a
-            # different site's latest full attempt already closed that global
-            # gate, cache publication is deferred while this producer's own
-            # verified status remains truthful.  Partial/watchlist runs never
-            # publish a catalog epoch and therefore do not rewrite this cache.
+            # When all three sites form a trusted epoch, a cache slice that
+            # fails to refresh fails the current run before it is published.
+            # If a different site's latest full attempt already closed that
+            # global gate, or the calculation could not take place at all,
+            # cache publication is deferred while this producer's own verified
+            # status remains truthful.  Partial/watchlist runs never publish a
+            # catalog epoch and therefore do not rewrite this cache.
             if is_full_catalog and run.catalog_verified:
                 from src import roi as _roi
 
@@ -5670,9 +5671,11 @@ def run_cmd(
                         if not_computed.reason == _roi.NOT_COMPUTED_RUN_UNFINISHED:
                             # Блокировка сбора у нас, значит чужой незавершённый
                             # прогон — сирота упавшего процесса. Её снимет watcher
-                            # (`reap-stale-runs`), и он же исполнит эту заявку.
-                            # При прочих причинах заявку не ставим: пересчёт без
-                            # сбора упёрся бы в то же самое и закрыл её `skipped`.
+                            # (`reap-stale-runs`), и он же исполнит эту заявку:
+                            # посчитает, а если сиротой был полный сбор другого
+                            # сайта и доверия после её снятия нет — закроет
+                            # `skipped`. При прочих причинах заявку не ставим:
+                            # пересчёт без сбора упёрся бы в то же самое.
                             _queue_roi_refresh_owed_by_run(session, run, reason="full_run_deferred")
                     else:
                         log.info("roi_cache_refreshed", run_id=run_id, **summary)

@@ -891,13 +891,29 @@ def test_refresh_writes_nothing_when_the_policy_gate_is_closed(db_session, monke
 
     assert refused.value.reason == "policy_gate:full_catalog_trust_not_ready"
     assert _cached_payloads(db_session) == {}
+    # Отказавшийся расчёт не оставляет в сессии и побочных записей.
+    assert db_session.query(storage.PricingConfig).count() == 0
+
+
+def test_refresh_refuses_stale_inputs_the_same_way_before_and_between_slices(db_session):
+    """Несвежие входы на входе — тот же отказ, что и посреди срезов, а не сбой."""
+    run = _shared_run(db_session)
+    run.started_at = utcnow() - timedelta(hours=175)
+    run.finished_at = run.started_at
+    db_session.commit()
+
+    with pytest.raises(roi.RecommendationsNotComputed) as refused:
+        roi.refresh_all_cached_actions(db_session, run_id=run.id)
+
+    assert refused.value.reason == roi.NOT_COMPUTED_INPUTS_UNVERIFIED
+    assert _cached_payloads(db_session) == {}
 
 
 @pytest.mark.parametrize(
     ("interruption", "reason"),
     [
         ("orphan_run", roi.NOT_COMPUTED_RUN_UNFINISHED),
-        ("stale_inputs", "inputs_unverified"),
+        ("stale_inputs", roi.NOT_COMPUTED_INPUTS_UNVERIFIED),
     ],
 )
 def test_refresh_interrupted_between_slices_caches_no_empty_list(
@@ -929,6 +945,31 @@ def test_refresh_interrupted_between_slices_caches_no_empty_list(
     payloads = _cached_payloads(db_session)
     assert list(payloads) == ["pharmonline"]
     assert [item["type"] for item in payloads["pharmonline"]] == ["price_raise"]
+
+
+def test_slice_failure_is_not_hidden_by_a_refusal_on_the_next_slice(db_session, monkeypatch):
+    """Срез упал, следующий отказался: вызывающий обязан узнать о сбое."""
+    run = _shared_run(db_session)
+    _make_cluster(
+        db_session,
+        "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+        run=run,
+    )
+    real_compute = roi._compute_actions_locked
+
+    def fail_first_slice_then_orphan(session, *, client_site=None, **kwargs):
+        if client_site == "pharmonline":
+            _orphan_run(session)
+            raise RuntimeError("boom")
+        return real_compute(session, client_site=client_site, **kwargs)
+
+    monkeypatch.setattr(roi, "_compute_actions_locked", fail_first_slice_then_orphan)
+
+    summary = roi.refresh_all_cached_actions(db_session, run_id=run.id)
+
+    assert summary == {"pharmonline": -1}
+    assert _cached_payloads(db_session) == {}
 
 
 def test_refresh_still_caches_a_computed_empty_list(db_session):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from click.testing import CliRunner
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
@@ -586,6 +587,13 @@ def test_orphan_run_neither_fails_a_verified_run_nor_empties_recommendations(
     from src import roi, roi_refresh
 
     _trusted_catalog_with_one_recommendation(db_session)
+    # Рекомендации прошлого сбора уже лежат в кэше.
+    assert roi_refresh.refresh_from_trusted_epoch(db_session).outcome == "refreshed"
+    cached_before = {
+        row.client_site: (row.run_id, row.computed_at, list(row.payload))
+        for row in db_session.scalars(select(storage.RoiActionsCache)).all()
+    }
+    assert len(cached_before) == 3
     orphan = storage.Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running")
     request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
     db_session.add_all([orphan, request])
@@ -606,7 +614,13 @@ def test_orphan_run_neither_fails_a_verified_run_nor_empties_recommendations(
         assert run.error_message is None
         assert saved_request is not None
         assert saved_request.status == "ok"
-        assert verify.scalars(select(storage.RoiActionsCache)).all() == []
+        # Кэш не тронут: ни пустого списка, ни удаления. Прежние рекомендации
+        # при этом не отдаются — они от прошлой эпохи каталога.
+        cached_after = {
+            row.client_site: (row.run_id, row.computed_at, list(row.payload))
+            for row in verify.scalars(select(storage.RoiActionsCache)).all()
+        }
+        assert cached_after == cached_before
         assert roi.get_cached_actions(verify, "pharmonline") is None
         owed = verify.scalars(select(storage.RoiRefreshRequest)).all()
         assert [(item.reason, item.status) for item in owed] == [("full_run_deferred", "pending")]
@@ -658,6 +672,38 @@ def test_closed_policy_gate_neither_fails_a_verified_run_nor_empties_recommendat
         assert run.error_message is None
         assert verify.scalars(select(storage.RoiActionsCache)).all() == []
         assert roi.get_cached_actions(verify, "pharmonline") is None
+        assert verify.scalars(select(storage.RoiRefreshRequest)).all() == []
+    finally:
+        verify.close()
+
+
+@pytest.mark.parametrize("error", [ValueError("wrong run"), RuntimeError("epoch is gone")])
+def test_only_a_refusal_to_compute_is_forgiven_at_the_end_of_a_verified_run(
+    db_session, monkeypatch, error
+):
+    """Любая другая ошибка пересчёта по-прежнему роняет прогон."""
+    from src import roi
+
+    _trusted_catalog_with_one_recommendation(db_session)
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add(request)
+    db_session.commit()
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+
+    def broken_refresh(session, *, run_id, tenant_id=1):
+        raise error
+
+    monkeypatch.setattr(roi, "refresh_all_cached_actions", broken_refresh)
+
+    result = _run_verified_aloe(request.id)
+
+    assert result.exit_code != 0
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        assert run is not None
+        assert run.status == "failed"
+        assert str(error) in (run.error_message or "")
         assert verify.scalars(select(storage.RoiRefreshRequest)).all() == []
     finally:
         verify.close()
