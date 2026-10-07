@@ -185,23 +185,8 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
     return {c: f"sent_{len(r)}" for c, r in results.items()}
 
 
-# Кому идут письма «только администраторам» — те же роли, что API считает
-# администраторскими.
-ADMIN_ROLES = ("admin", "owner")
-
-
-def dispatch_events_batch(
-    session: Session,
-    events: list[storage.AlertEvent],
-    *,
-    roles: tuple[str, ...] | None = None,
-    note: str | None = None,
-) -> dict[str, int]:
+def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) -> dict[str, int]:
     """Слить ВСЕ события одного прогона в ОДНО письмо-сводку на получателя.
-
-    `roles` — слать только получателям с этими ролями (`ADMIN_ROLES` для
-    событий частичного сбора, которые клиенту не показываются). `note` —
-    строка-пояснение под заголовком письма.
 
     Замена циклу `for ev: dispatch_event(ev)` (одно письмо на событие → поток:
     переоценка линейки из 15 товаров = 15 писем). Теперь одно письмо со списком
@@ -239,8 +224,6 @@ def dispatch_events_batch(
                 storage.TenantUser.is_active.is_(True),
             )
         ).all()
-        if roles is not None:
-            users = [u for u in users if u.role in roles]
         by_obj = {id(e): e for e in tevents}
         for user in users:
             sent_now: dict[int, set[str]] = {}
@@ -256,7 +239,7 @@ def dispatch_events_batch(
                     try:
                         notifier.send_email(
                             subject=_batch_subject(ev_email),
-                            html_body=_render_batch_email(ev_email, note=note),
+                            html_body=_render_batch_email(ev_email),
                             to=[user.email],
                         )
                         emails_sent += 1
@@ -303,6 +286,89 @@ def dispatch_events_batch(
         telegram=tg_sent,
     )
     return {"email": emails_sent, "telegram": tg_sent}
+
+
+# ─── События, которых нет в журнале: только администраторам ──────────────────
+
+# Кому идут письма «только администраторам» — те же роли, что API считает
+# администраторскими. Это роль, а не лично владелец: у сотрудника клиента роль
+# должна быть viewer.
+ADMIN_ROLES = ("admin", "owner")
+
+_ADMIN_ONLY_TELEGRAM_NOTE = "Только администраторам: частичный сбор, в журнал алертов не попадает."
+
+
+def mail_unstored_events_to_admins(
+    session: Session, events: list[storage.AlertEvent], *, note: str
+) -> dict[str, int]:
+    """Одно письмо на администратора о событиях, которых нет в журнале алертов.
+
+    Для событий частичного сбора (`alerts.local_price_alerts_for_partial_run`):
+    клиенту они не показываются и в базе не хранятся. Отсюда отличия от
+    `dispatch_events_batch`:
+
+    - получатели — только активные пользователи с ролью из `ADMIN_ROLES`;
+    - `daily_digest` письмо не отменяет: в дайджест такое событие не попадёт,
+      его нет в базе;
+    - `channels_sent` не ведётся и ничего не коммитится. Повторной отправки
+      нет: что не ушло, то потеряно, и вызывающий узнаёт об этом из `failed`.
+
+    Пороги важности и тихие часы действуют как обычно. `note` — пояснение под
+    заголовком письма.
+
+    Возвращает {'email': писем, 'telegram': сообщений, 'failed': сбоев}.
+    """
+    counts = {"email": 0, "telegram": 0, "failed": 0}
+    by_tenant: dict[int, list[storage.AlertEvent]] = {}
+    for e in events:
+        by_tenant.setdefault(getattr(e, "tenant_id", 1) or 1, []).append(e)
+
+    for tenant_id, tevents in by_tenant.items():
+        admins = session.scalars(
+            select(storage.TenantUser).where(
+                storage.TenantUser.tenant_id == tenant_id,
+                storage.TenantUser.is_active.is_(True),
+                storage.TenantUser.role.in_(ADMIN_ROLES),
+            )
+        ).all()
+        for user in admins:
+            ev_email = [
+                e
+                for e in tevents
+                if _severity_passes(user.email_severity_min, e.severity, DEFAULT_EMAIL_SEVERITY)
+            ]
+            if ev_email:
+                try:
+                    delivered = notifier.send_email(
+                        subject=_batch_subject(ev_email),
+                        html_body=_render_batch_email(ev_email, note=note),
+                        to=[user.email],
+                    )
+                except Exception as exc:
+                    delivered = False
+                    log.warning("email_batch_failed", user=user.email, error=str(exc))
+                counts["email" if delivered else "failed"] += 1
+
+            if user.telegram_chat_id and not _in_quiet_hours(user.quiet_hours):
+                ev_tg = [
+                    e
+                    for e in tevents
+                    if _severity_passes(
+                        user.telegram_severity_min, e.severity, DEFAULT_TELEGRAM_SEVERITY
+                    )
+                ]
+                if ev_tg:
+                    try:
+                        delivered = notifier.send_telegram_message(
+                            user.telegram_chat_id,
+                            f"{_format_batch_text(ev_tg)}\n{_ADMIN_ONLY_TELEGRAM_NOTE}",
+                        )
+                    except Exception as exc:
+                        delivered = False
+                        log.warning("telegram_batch_failed", user=user.email, error=str(exc))
+                    counts["telegram" if delivered else "failed"] += 1
+
+    return counts
 
 
 # ─── Telegram /start binding ─────────────────────────────────────────────────

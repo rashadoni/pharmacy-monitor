@@ -580,17 +580,22 @@ def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[Al
     дашборд, дайджест и письмо о прогоне, то есть клиент. Но цену, которую тик
     записал первым, проверенный сбор потом подтверждает молча, и алерта о таком
     изменении не будет вовсе. Поэтому оно считается здесь и отдаётся вызывающему
-    несохранёнными AlertEvent — их шлют только администраторам
-    (`notifications.dispatch_events_batch(..., roles=ADMIN_ROLES)`).
+    несохранёнными AlertEvent — их шлют только администраторам через
+    `notifications.mail_unstored_events_to_admins`. В `dispatch_events_batch`
+    их отдавать нельзя: та рассылка идёт всем ролям.
 
     Правила — как у watchlist-тика: только локальные ценовые
     (`_WATCHLIST_REALTIME_RULE_TYPES`), активные, со своими параметрами; база
-    сравнения — последняя доверенная цена товара. Событие с тем же ключом, уже
-    лежащее в журнале в пределах cooldown правила, не повторяется. Между тиками
-    повтора нет по построению: snapshot пишется только при смене цены. Но раз
-    сами события не хранятся, cooldown между тиками не действует: цена, которая
-    за это время менялась несколько раз и осталась ниже доверенной, даст письмо
-    на каждое изменение.
+    сравнения — последняя доверенная цена товара.
+
+    Что не повторяется: событие с тем же ключом, уже лежащее в журнале в
+    пределах cooldown правила, и товар, у которого цена к оплате с прошлого
+    наблюдения не изменилась. Второе нужно потому, что snapshot пишется и при
+    смене одной лишь метки акции или процента скидки — без этой проверки
+    каждый такой тик повторял бы письмо о давнем падении. Сами события не
+    хранятся, поэтому cooldown между тиками не действует: цена, которая за это
+    время менялась несколько раз и осталась ниже доверенной, даст письмо на
+    каждое изменение.
     """
     run = session.get(Run, run_id)
     if not run_is_partial_price_alert_eligible(run):
@@ -615,8 +620,23 @@ def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[Al
         )
     ).all()
 
+    from src.storage import curr_and_prev_snapshots_for_run
+
+    def payable(snap: PriceSnapshot) -> float | None:
+        return snap.discount_price or snap.price
+
+    # Товары, чью цену к оплате этот прогон действительно застал изменившейся
+    # (или увидел впервые) — против предыдущей записи любого прогона.
+    curr_snaps, last_seen = curr_and_prev_snapshots_for_run(session, run)
+    price_moved = {
+        snap.product_id
+        for snap in curr_snaps
+        if snap.product_id not in last_seen or payable(last_seen[snap.product_id]) != payable(snap)
+    }
+
     now = utcnow()
     found: list[AlertEvent] = []
+    seen_keys: set[str] = set()
     for rule in rules:
         try:
             candidates = DETECTORS[rule.rule_type](session, run_id, rule.params or {})
@@ -624,6 +644,11 @@ def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[Al
             log.exception("alerts_detector_failed", rule_type=rule.rule_type, error=str(e))
             continue
         for cand in candidates:
+            if (cand.payload or {}).get("product_id") not in price_moved:
+                continue
+            if cand.dedup_key in seen_keys:
+                continue
+            seen_keys.add(cand.dedup_key)
             if _is_duplicate(
                 session,
                 cand.dedup_key,

@@ -207,9 +207,10 @@ def test_send_email_sends_via_smtplib(monkeypatch):
     sent: dict = {}
 
     class FakeSMTP:
-        def __init__(self, host, port):
+        def __init__(self, host, port, timeout=None):
             sent["host"] = host
             sent["port"] = port
+            sent["timeout"] = timeout
 
         def __enter__(self):
             return self
@@ -233,6 +234,8 @@ def test_send_email_sends_via_smtplib(monkeypatch):
     assert notifier.send_email("Test subject", "<p>Body</p>", to=["explicit@x"]) is True
     assert sent["host"] == "smtp.example.com"
     assert sent["port"] == 587
+    # Без таймаута зависший SMTP держал бы таймерную задачу до лимита systemd.
+    assert sent["timeout"] == notifier.SMTP_TIMEOUT_SEC
     assert sent["user"] == "u@x"
     assert sent["password"] == "secret"
     assert sent["starttls"] is True
@@ -252,7 +255,7 @@ def test_send_email_with_attachment(monkeypatch):
     captured_messages = []
 
     class FakeSMTP:
-        def __init__(self, *a):
+        def __init__(self, *a, **kw):
             pass
 
         def __enter__(self):
@@ -305,7 +308,7 @@ def test_send_email_smtp_failure_propagates(monkeypatch):
     monkeypatch.setattr(wl, "active_recipient_emails", lambda _s: [])
 
     class BoomSMTP:
-        def __init__(self, *a):
+        def __init__(self, *a, **kw):
             raise ConnectionRefusedError("nope")
 
         def __enter__(self):

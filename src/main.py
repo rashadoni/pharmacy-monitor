@@ -5932,19 +5932,27 @@ def _mail_tick_price_changes_to_admins(
             events = alerts_mod.local_price_alerts_for_partial_run(session, run_id)
             if not events:
                 return
-            sent = notif_mod.dispatch_events_batch(
+            sent = notif_mod.mail_unstored_events_to_admins(
                 session,
                 events,
-                roles=notif_mod.ADMIN_ROLES,
                 note=(
                     f"Частичный сбор {site}, раздел {category_key}, прогон #{run_id}. "
                     "Письмо получают только администраторы: в журнал алертов и в "
                     "дайджест эти события не попадают."
                 ),
             )
-            log.info("intraday_price_alerts_mailed", run_id=run_id, events=len(events), **sent)
     except Exception as e:  # noqa: BLE001
         log.warning("intraday_price_alerts_failed", run_id=run_id, error=str(e))
+        return
+
+    # Событий нет в базе, повторной отправки не будет: что не ушло — потеряно,
+    # и журнал должен говорить об этом прямо.
+    if sent["failed"]:
+        log.warning("intraday_price_alerts_failed", run_id=run_id, events=len(events), **sent)
+    elif sent["email"] or sent["telegram"]:
+        log.info("intraday_price_alerts_mailed", run_id=run_id, events=len(events), **sent)
+    else:
+        log.warning("intraday_price_alerts_no_recipient", run_id=run_id, events=len(events))
 
 
 @cli.command("rematch")

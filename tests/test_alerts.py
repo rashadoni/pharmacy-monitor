@@ -593,6 +593,50 @@ def test_category_tick_does_not_repeat_a_drop_already_in_the_journal(db_session)
     assert alerts.local_price_alerts_for_partial_run(db_session, tick.id) == []
 
 
+def test_category_tick_does_not_repeat_a_drop_when_only_the_label_changed(db_session):
+    """Snapshot пишется и при смене одной метки акции. Цена к оплате прежняя —
+    значит, о падении уже сообщил тик, который его застал."""
+    product = _add_product(db_session, "aloe", "Relabelled", "relabel")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=2))
+    _add_snap(db_session, previous_full, product, 10.0)
+    first = _add_category_tick(db_session)
+    first.started_at = utcnow() - timedelta(hours=4)
+    _add_snap(db_session, first, product, 8.0)
+    relabel = _add_category_tick(db_session)
+    relabel.started_at = utcnow() - timedelta(hours=2)
+    db_session.add(
+        PriceSnapshot(run_id=relabel.id, product_id=product.id, price=8.0, promo_label="Хит")
+    )
+    moved_again = _add_category_tick(db_session)
+    _add_snap(db_session, moved_again, product, 7.5)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    def drops(run):
+        return [
+            e.payload["curr_price"]
+            for e in alerts.local_price_alerts_for_partial_run(db_session, run.id)
+        ]
+
+    assert drops(first) == [8.0]
+    assert drops(relabel) == []
+    # Настоящее новое изменение — отдельное письмо, cooldown между тиками нет.
+    assert drops(moved_again) == [7.5]
+
+
+def test_category_tick_lists_a_product_once_even_if_scraped_twice(db_session):
+    product = _add_product(db_session, "aloe", "Listed twice", "twice")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    _add_snap(db_session, previous_full, product, 100.0)
+    _add_snap(db_session, tick, product, 80.0)
+    _add_snap(db_session, tick, product, 80.0)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    assert len(alerts.local_price_alerts_for_partial_run(db_session, tick.id)) == 1
+
+
 def test_partial_eligibility_keeps_the_journal_closed_for_category_ticks(db_session):
     """Право на письмо админу не открывает частичному сбору общий журнал."""
     tick = _add_category_tick(db_session)
