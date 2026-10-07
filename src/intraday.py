@@ -10,21 +10,27 @@ expensive full rescrape (полный pharmonline = 50 мин, 272k visits).
 Design:
 - top_volatile_categories(): top-30 категорий с самыми частыми price-changes
   за последние 7 дней (через price_snapshots count). Не зависит от watchlist.
-- next_rotation_pick(): Redis INCR на ключ `intraday:rotation:idx`, возвращает
-  i % len(categories) — atomic, безопасно при race condition.
-- rate_limit_per_site(): Redis SETNX с TTL 2 часа per site — гарантия что один
+  Для ротации берутся только категории, у которых есть раздел на сайте из
+  INTRADAY_SITES: остальные тик обслужить не может.
+- Указатель ротации — Redis-ключ `intraday:rotation:idx`. Тик читает его (GET),
+  а сдвигает (INCR) только когда прогон действительно взят: пропущенный тик
+  очередь категории не съедает.
+- acquire_site_lock(): Redis SETNX с TTL 2 часа per site — гарантия что один
   сайт не получит больше одного intraday-прогона каждые 2 часа.
 
 Запуск из systemd:
     pharmacy-monitor intraday-tick
 который picks one (site, category) и делает category-mode scrape.
 
-Если Redis unreachable — silent no-op (intraday не critical).
+Пропуск тика — штатный исход; причина пишется в лог событием
+`intraday_skipped` с полем `reason` (см. SKIP_*). Если Redis unreachable —
+тоже пропуск (intraday не critical).
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -54,14 +60,60 @@ INTRADAY_SITES = ("aloe",)
 # Окно для подсчёта volatility (count price changes per category per N days).
 VOLATILITY_WINDOW_DAYS = 7
 
+# В каком поле Category лежит раздел сайта. Пустое поле = у категории на этом
+# сайте раздела нет, и тик этого сайта её обслужить не может.
+_SITE_SLUG_FIELD = {
+    "pharmonline": "pharmonline_slug",
+    "aptekonline": "aptekonline_slug",
+    "aloe": "aloe_slug",
+}
+
+_ROTATION_KEY = "intraday:rotation:idx"
+
+# Причины пропуска тика (поле `reason` события `intraday_skipped`).
+# Ни у одной категории с разделом на сайте из INTRADAY_SITES не менялись цены.
+SKIP_NO_SERVABLE_CATEGORY = "no_servable_category"
+# Категория выбрана, но сайт недавно уже получил intraday-прогон.
+SKIP_SITE_RATE_LIMITED = "site_rate_limited"
+# Указатель ротации прочитать не удалось (Redis недоступен или не настроен).
+SKIP_ROTATION_UNAVAILABLE = "rotation_state_unavailable"
+
+
+@dataclass(frozen=True)
+class TickDecision:
+    """Что делать тику: либо цель, либо причина пропуска.
+
+    `skip_detail` — та же причина словами, для вывода команды в journald.
+    """
+
+    target: tuple[str, storage.Category] | None = None
+    skip_reason: str | None = None
+    skip_detail: str = ""
+
+
+def servable_sites(cat: storage.Category, sites: tuple[str, ...] | None = None) -> tuple[str, ...]:
+    """Сайты тика, на которых у категории есть раздел (в порядке `sites`)."""
+    if sites is None:
+        sites = INTRADAY_SITES
+    return tuple(s for s in sites if s in _SITE_SLUG_FIELD and getattr(cat, _SITE_SLUG_FIELD[s]))
+
 
 # ─── Volatility scoring ───────────────────────────────────────────────────────
 
 
 def top_volatile_categories(
-    session: Session, n: int = INTRADAY_TOP_N_CATEGORIES
+    session: Session,
+    n: int = INTRADAY_TOP_N_CATEGORIES,
+    *,
+    sites: tuple[str, ...] | None = None,
 ) -> list[storage.Category]:
     """Top-N категорий с наибольшей price-change активностью за окно.
+
+    `sites` — оставить только категории, у которых есть раздел хотя бы на одном
+    из этих сайтов. Отбор идёт ДО среза top-N: иначе N мест занимают категории
+    сайтов, которые тик не обслуживает, и ротация крутится вхолостую (прод,
+    2026-10-05…07: после полных сборов aptekonline и pharmonline 24–26 мест из
+    30 достались их категориям, 29 тиков из 32 вышли пропуском).
 
     Volatility = count(price_snapshots) per category за `VOLATILITY_WINDOW_DAYS` дней.
     После diff-only persist snapshots пишутся только при реальном изменении цены,
@@ -115,6 +167,8 @@ def top_volatile_categories(
 
     cat_score: dict[int, int] = {}  # category.id → volatility score
     for cat in all_cats:
+        if sites is not None and not servable_sites(cat, sites):
+            continue
         slugs = {cat.pharmonline_slug, cat.aptekonline_slug, cat.aloe_slug}
         # Берём max score среди slugs этой категории (на случай если slugs разные
         # на разных сайтах, но категория концептуально одна).
@@ -125,8 +179,9 @@ def top_volatile_categories(
     if not cat_score:
         return []
 
-    # Top-N по убыванию score.
-    top_ids = sorted(cat_score.keys(), key=lambda cid: -cat_score[cid])[:n]
+    # Top-N по убыванию score. При равном score — по id: порядок строк из БД не
+    # гарантирован, а ротация ходит по этому списку по индексу.
+    top_ids = sorted(cat_score.keys(), key=lambda cid: (-cat_score[cid], cid))[:n]
 
     # Возвращаем в том же порядке.
     by_id = {c.id: c for c in all_cats}
@@ -152,27 +207,38 @@ def _redis_client() -> Any | None:
         return None
 
 
-def next_rotation_pick(
+def _peek_rotation_pick(
     redis_client: Any, categories: list[storage.Category]
 ) -> storage.Category | None:
-    """Atomic Redis INCR → возвращаем categories[i % len].
+    """Чья очередь: categories[idx % len], БЕЗ сдвига указателя.
 
-    None если список пустой или Redis недоступен. INCR создаёт ключ при первом
-    вызове (стартовое значение 1) — то есть первая итерация возьмёт index 0.
-
-    Wraparound автоматически через модуль. Ключ TTL = 90 дней (perm-style),
-    обновляется на каждом INCR.
+    None если список пустой или Redis недоступен. Ключа ещё нет → idx 0, то
+    есть первая категория списка.
     """
     if not categories or redis_client is None:
         return None
     try:
-        idx = int(redis_client.incr("intraday:rotation:idx"))
-        # TTL 90 дней — чтоб ключ не висел вечно если intraday отключат.
-        redis_client.expire("intraday:rotation:idx", 90 * 24 * 3600)
-        return categories[(idx - 1) % len(categories)]
+        raw = redis_client.get(_ROTATION_KEY)
+        return categories[(int(raw) if raw else 0) % len(categories)]
+    except Exception as e:  # noqa: BLE001
+        log.warning("intraday_redis_peek_failed", error=str(e))
+        return None
+
+
+def _advance_rotation(redis_client: Any) -> None:
+    """Передать очередь следующей категории (atomic INCR).
+
+    Зовётся только когда тик взял прогон. TTL 90 дней — чтоб ключ не висел
+    вечно если intraday отключат. Сбой Redis здесь прогон не отменяет: та же
+    категория просто получит ещё один тик.
+    """
+    if redis_client is None:
+        return
+    try:
+        redis_client.incr(_ROTATION_KEY)
+        redis_client.expire(_ROTATION_KEY, 90 * 24 * 3600)
     except Exception as e:  # noqa: BLE001
         log.warning("intraday_redis_incr_failed", error=str(e))
-        return None
 
 
 # ─── Per-site rate-limit ──────────────────────────────────────────────────────
@@ -213,60 +279,60 @@ def time_until_lock_expires(redis_client: Any, site: str) -> int | None:
 # ─── Orchestration ────────────────────────────────────────────────────────────
 
 
+def _skip(reason: str, detail: str, **fields: Any) -> TickDecision:
+    log.info("intraday_skipped", reason=reason, **fields)
+    return TickDecision(skip_reason=reason, skip_detail=detail)
+
+
 def pick_next_scrape_target(
     session: Session,
     redis_client: Any | None = None,
     *,
     commit_state: bool = True,
-) -> tuple[str, storage.Category] | None:
+) -> TickDecision:
     """Выбрать (site, category) для следующего intraday-прогона.
 
     Args:
         session: SQLAlchemy session для DB queries.
         redis_client: Redis client (auto-lookup из REDIS_URL если None).
-        commit_state: True (default) → INCR rotation index + SETNX lock.
+        commit_state: True (default) → SETNX lock + INCR rotation index.
             False → read-only preview: видим что выбрали бы, но не меняем
             Redis state. Используется в `intraday-tick --dry-run`.
 
     Логика:
-    1. Получаем top-N volatile категории.
-    2. (commit_state=True) Через Redis INCR берём следующую в rotation.
-       (commit_state=False) Читаем текущий idx через GET (+1 если не задан).
-    3. Среди INTRADAY_SITES берём первый, у которого:
-       - есть slug для этой category
-       - lock can be acquired (последний прогон > 2h назад)
-    4. Если ни один не подходит → возвращаем None (skip tick).
+    1. Top-N volatile категорий — только тех, что тик может обслужить (есть
+       раздел на сайте из INTRADAY_SITES).
+    2. Читаем указатель ротации: чья очередь.
+    3. Среди сайтов категории берём первый, у которого lock can be acquired
+       (последний прогон > 2h назад).
+    4. Прогон взят → сдвигаем указатель. Не взят → указатель на месте, та же
+       категория получит следующий тик.
 
-    Returns: (site, category) или None.
+    Returns: TickDecision с `target` либо с причиной пропуска.
     """
     if redis_client is None:
         redis_client = _redis_client()
 
-    cats = top_volatile_categories(session)
+    sites_label = ",".join(INTRADAY_SITES)
+    cats = top_volatile_categories(session, sites=INTRADAY_SITES)
     if not cats:
-        log.info("intraday_skipped_no_categories")
-        return None
+        return _skip(
+            SKIP_NO_SERVABLE_CATEGORY,
+            f"no category with a section on {sites_label} had price changes "
+            f"in the last {VOLATILITY_WINDOW_DAYS} days",
+            sites=sites_label,
+            window_days=VOLATILITY_WINDOW_DAYS,
+        )
 
-    if commit_state:
-        cat = next_rotation_pick(redis_client, cats)
-    else:
-        # Preview: peek текущий index без INCR.
-        cat = _peek_rotation_pick(redis_client, cats)
+    cat = _peek_rotation_pick(redis_client, cats)
     if cat is None:
-        return None
+        return _skip(
+            SKIP_ROTATION_UNAVAILABLE,
+            "rotation state unavailable (Redis unreachable or REDIS_URL not set)",
+        )
 
-    # Какие сайты доступны для этой категории?
-    site_to_slug = {
-        "pharmonline": cat.pharmonline_slug,
-        "aloe": cat.aloe_slug,
-        # aptekonline исключён из intraday: прод-скрейп server-side, но тяжёлый
-        # full-catalog путь через AZ residential proxy пока не используется для
-        # лёгких внутридневных категорийных тиков.
-    }
-
-    for site in INTRADAY_SITES:
-        if not site_to_slug.get(site):
-            continue
+    longest_wait = 0
+    for site in servable_sites(cat):
         if commit_state:
             acquired = acquire_site_lock(redis_client, site)
         else:
@@ -274,6 +340,7 @@ def pick_next_scrape_target(
             acquired = _peek_site_lock_free(redis_client, site)
         if not acquired:
             ttl = time_until_lock_expires(redis_client, site) or 0
+            longest_wait = max(longest_wait, ttl)
             log.info(
                 "intraday_site_locked",
                 site=site,
@@ -282,38 +349,30 @@ def pick_next_scrape_target(
                 category_key=cat.key,
             )
             continue
-        # Lock acquired — этот сайт берёт прогон.
+        # Lock acquired — этот сайт берёт прогон, очередь переходит дальше.
+        if commit_state:
+            _advance_rotation(redis_client)
         log.info(
             "intraday_picked",
             site=site,
             category_id=cat.id,
             category_key=cat.key,
+            rotation_size=len(cats),
             dry_run=not commit_state,
         )
-        return (site, cat)
+        return TickDecision(target=(site, cat))
 
-    log.info(
-        "intraday_all_sites_locked",
+    cat_sites = ",".join(servable_sites(cat))
+    return _skip(
+        SKIP_SITE_RATE_LIMITED,
+        f"{cat_sites} already had an intraday run within the last "
+        f"{INTRADAY_PER_SITE_MIN_GAP_SEC // 3600}h (free in {longest_wait}s); "
+        f"category {cat.key} keeps its turn",
+        sites=cat_sites,
+        ttl_sec=longest_wait,
         category_id=cat.id,
         category_key=cat.key,
     )
-    return None
-
-
-def _peek_rotation_pick(
-    redis_client: Any, categories: list[storage.Category]
-) -> storage.Category | None:
-    """Read-only вариант next_rotation_pick: возвращает что взяли бы следующим
-    БЕЗ инкремента. Используется в dry-run mode."""
-    if not categories or redis_client is None:
-        return None
-    try:
-        raw = redis_client.get("intraday:rotation:idx")
-        idx = (int(raw) if raw else 0) + 1
-        return categories[(idx - 1) % len(categories)]
-    except Exception as e:  # noqa: BLE001
-        log.warning("intraday_redis_peek_failed", error=str(e))
-        return None
 
 
 def _peek_site_lock_free(redis_client: Any, site: str) -> bool:

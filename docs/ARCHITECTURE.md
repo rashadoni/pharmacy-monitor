@@ -255,26 +255,32 @@ State management: React Query (TanStack). Cache invalidation после mutation
   └── pg_dump → /var/backups/pharmacy-monitor/*.sql.gz.gpg (GPG encrypted)
 ```
 
-### Intraday rotation (05:00-17:00 UTC, business hours)
+### Intraday rotation (05:00–17:00 по времени хоста)
+
+Часы в `OnCalendar` — местные для сервера. Прод стоит в Europe/Berlin, поэтому
+летом тики идут в 03–15 UTC.
 
 ```
-Every hour 05-17 UTC ─ pharmacy-monitor-intraday.timer fires (Phase 5.1c)
+Every hour 05-17 ─ pharmacy-monitor-intraday.timer fires (Phase 5.1c)
   ├── pharmacy-monitor intraday-tick
-  ├── src/intraday.py:top_volatile_categories
+  ├── src/intraday.py:top_volatile_categories(sites=INTRADAY_SITES)
   │     → SELECT count(snapshots) per category per site за 7d
-  │     → Top-30 categories by volatility
-  ├── Redis INCR "intraday:rotation:idx" → cats[i % 30]
+  │     → только категории с разделом на сайте из INTRADAY_SITES
+  │     → Top-30 by volatility
+  ├── Redis GET "intraday:rotation:idx" → cats[i % len] (чья очередь)
   ├── Intraday site (INTRADAY_SITES = ['aloe']):
   │     - SETNX "intraday:lock:site:aloe" с TTL=2h
   │     - Pharmonline исключён: его Meteor WebSocket через residential proxy
   │       обслуживается только полным недельным прогоном
-  │     - Если locked → skip tick, log "all_sites_locked"
-  └── pharmacy-monitor run --site X --mode category --category-id N --no-alerts
-        (no-alerts чтобы не дублировать с full nightly)
+  │     - Если locked → skip tick, log "intraday_skipped reason=site_rate_limited",
+  │       очередь остаётся у той же категории
+  ├── Прогон взят → Redis INCR "intraday:rotation:idx"
+  └── pharmacy-monitor scrape --site aloe --category-id N --limit 600
+        (только сбор: матчер, алерты и ROI тик не запускает)
 ```
 
-Result: до 7 supplemental Aloe scrapes/day; proxy-зависимые сайты не получают
-лишних intraday-подключений.
+Result: 5–7 supplemental Aloe scrapes/day (13 тиков при лимите один прогон на
+сайт в 2 часа); proxy-зависимые сайты не получают лишних intraday-подключений.
 
 ### User dashboard hit
 

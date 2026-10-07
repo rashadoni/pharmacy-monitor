@@ -5845,18 +5845,24 @@ def intraday_tick_cmd(dry_run: bool) -> None:
 
     Каждый вызов:
       1. Берёт top-30 volatile категорий (по count(price_snapshots) за 7 дней)
-      2. Через Redis-rotation index выбирает следующую категорию
+         — только тех, у которых есть раздел на Aloe: другие сайты тик не
+         обслуживает
+      2. По Redis-rotation index смотрит, чья очередь
       3. Выбирает Aloe с per-site rate-limit 2ч; proxy-зависимые Pharmonline и
          Aptekonline обслуживаются только отдельными full-catalog таймерами
-      4. Запускает scrape-only persist для этой категории.
+      4. Запускает scrape-only persist для этой категории и передаёт очередь
+         следующей.
 
-    Запускается из systemd timer ежечасно во время business hours (05-17 UTC).
-    No-alerts чтобы не дублировать notifications с full nightly run.
+    Запускается из systemd timer ежечасно, 13 раз в день (05–17 по времени хоста).
+    Алерты тик не считает: `scrape` — только сбор.
 
-    Skip-conditions (silent no-op, exit 0):
-      - Redis недоступен → можем работать без rate-limit, продолжаем
-      - 0 volatile categories (новый деплой, мало данных) → skip
-      - Все sites locked (последний intraday на каждом < 2ч назад) → skip
+    Skip-conditions (no-op, exit 0; причина — в выводе и в событии
+    `intraday_skipped`, поле `reason`):
+      - no_servable_category: за 7 дней цены не менялись ни в одной категории
+        с разделом на Aloe (новый деплой, мало данных)
+      - site_rate_limited: последний intraday на Aloe < 2ч назад; очередь
+        категории сохраняется
+      - rotation_state_unavailable: Redis недоступен или не настроен
 
     Failures (exit 1):
       - Сам scrape упал (network, proxy и т.п.) — поднимаем error чтобы systemd
@@ -5869,12 +5875,12 @@ def intraday_tick_cmd(dry_run: bool) -> None:
 
     with Session() as session:
         # dry_run → preview mode (без INCR rotation idx и без SETNX lock'а).
-        target = intraday.pick_next_scrape_target(session, commit_state=not dry_run)
-        if target is None:
-            click.echo("intraday-tick: skipped (no volatile categories or all sites locked)")
+        decision = intraday.pick_next_scrape_target(session, commit_state=not dry_run)
+        if decision.target is None:
+            click.echo(f"intraday-tick: skipped ({decision.skip_detail})")
             return
 
-        site, cat = target
+        site, cat = decision.target
         product_limit = _intraday_product_limit()
         click.echo(
             f"intraday-tick: site={site} category_id={cat.id} key={cat.key} "
