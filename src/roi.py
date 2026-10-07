@@ -33,6 +33,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from src._time import utcnow
+from src.cadence import site_max_age_hours
 
 from src import storage  # for load_pricing_config + RoiActionsCache
 from src.storage import (
@@ -142,13 +143,18 @@ def _preload_snapshots(
 
 # Cache freshness threshold. Старше — игнорируем и показываем unavailable;
 # inline fallback запрещён, потому что он может прочитать непроверенные данные.
-_CACHE_MAX_AGE_HOURS = 26
+#
+# Кэш пишется один раз — в конце подтверждённого полного сбора, поэтому жить он
+# обязан не меньше, чем длится ритм сбора (src/cadence.py). Здесь стояли 26ч, и
+# при недельном ритме рекомендации были бы видны сутки после понедельничного
+# сбора и скрыты до следующего. Настоящую свежесть проверяют
+# `financial_inputs_are_fresh`, эпоха каталога и проверка superseded; этот порог
+# — только страховка поверх них.
+_CACHE_MAX_AGE_HOURS = max(site_max_age_hours(site) for site in ALL_SITES)
 
 
 def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
     """Every site must have verified lineage within its real scrape cadence."""
-    from src.health import _SITE_MAX_AGE_HOURS
-
     run_ids = storage.latest_financial_run_ids_by_site(
         session,
         ALL_SITES,
@@ -194,7 +200,7 @@ def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
         run = runs.get(run_id)
         if run is None:
             return False
-        max_age_hours = _SITE_MAX_AGE_HOURS.get(site, _CACHE_MAX_AGE_HOURS)
+        max_age_hours = site_max_age_hours(site)
         if now - run.started_at > timedelta(hours=max_age_hours):
             return False
     return True
