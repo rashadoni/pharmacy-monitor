@@ -449,6 +449,70 @@ def policy_fingerprint() -> str:
     )
 
 
+@dataclass(frozen=True)
+class _SiteFullRunState:
+    """Which full-catalog Run (if any) currently backs one site's data."""
+
+    latest_attempt: Any
+    relevant_run: Any
+    run_at: datetime | None
+    run_fresh: bool
+    internal_finalization: bool
+
+
+def _site_full_run_state(
+    session: Any,
+    site: str,
+    *,
+    tenant_id: int,
+    current: datetime,
+) -> _SiteFullRunState:
+    """Resolve the Run that is allowed to stand behind a site's catalog.
+
+    Cheap by design (one indexed lookup): callers that only need to know
+    *whether* a trusted lineage exists must not pay for coverage counts.
+    """
+    from src import storage
+
+    cutoff = current - timedelta(hours=OFFER_MAX_AGE_HOURS[site])
+    # The latest *attempt* is authoritative. Falling back to an older
+    # verified run after a newer full scan lost pages would keep financial
+    # output open precisely while the source is known to be degraded.
+    latest_attempt = session.scalar(
+        select(storage.Run)
+        .where(
+            storage.Run.tenant_id == tenant_id,
+            storage.Run.catalog_scope == "full",
+            ("," + storage.Run.full_catalog_sites + ",").like(f"%,{site},%"),
+        )
+        .order_by(desc(storage.Run.id))
+        .limit(1)
+    )
+    finalizing_run_id = _FINALIZING_TRUSTED_RUN_ID.get()
+    published = bool(
+        latest_attempt is not None
+        and latest_attempt.status == "ok"
+        and bool(latest_attempt.catalog_verified)
+    )
+    internal_finalization = bool(
+        latest_attempt is not None
+        and latest_attempt.id == finalizing_run_id
+        and latest_attempt.status == "running"
+        and bool(latest_attempt.catalog_verified)
+    )
+    relevant_run = latest_attempt if published or internal_finalization else None
+    run_at = (
+        (relevant_run.finished_at or relevant_run.started_at) if relevant_run is not None else None
+    )
+    return _SiteFullRunState(
+        latest_attempt=latest_attempt,
+        relevant_run=relevant_run,
+        run_at=run_at,
+        run_fresh=bool(run_at is not None and run_at >= cutoff),
+        internal_finalization=internal_finalization,
+    )
+
+
 def full_catalog_trust_report(
     session: Any,
     *,
@@ -467,40 +531,12 @@ def full_catalog_trust_report(
     current = now or utcnow()
     sites: list[dict[str, Any]] = []
     for site in REQUIRED_CATALOG_SITES:
-        max_age_hours = OFFER_MAX_AGE_HOURS[site]
-        cutoff = current - timedelta(hours=max_age_hours)
-        # The latest *attempt* is authoritative. Falling back to an older
-        # verified run after a newer full scan lost pages would keep financial
-        # output open precisely while the source is known to be degraded.
-        latest_attempt = session.scalar(
-            select(storage.Run)
-            .where(
-                storage.Run.tenant_id == tenant_id,
-                storage.Run.catalog_scope == "full",
-                ("," + storage.Run.full_catalog_sites + ",").like(f"%,{site},%"),
-            )
-            .order_by(desc(storage.Run.id))
-            .limit(1)
-        )
-        finalizing_run_id = _FINALIZING_TRUSTED_RUN_ID.get()
-        published = bool(
-            latest_attempt is not None
-            and latest_attempt.status == "ok"
-            and bool(latest_attempt.catalog_verified)
-        )
-        internal_finalization = bool(
-            latest_attempt is not None
-            and latest_attempt.id == finalizing_run_id
-            and latest_attempt.status == "running"
-            and bool(latest_attempt.catalog_verified)
-        )
-        relevant_run = latest_attempt if published or internal_finalization else None
-        run_at = (
-            (relevant_run.finished_at or relevant_run.started_at)
-            if relevant_run is not None
-            else None
-        )
-        run_fresh = bool(run_at is not None and run_at >= cutoff)
+        state = _site_full_run_state(session, site, tenant_id=tenant_id, current=current)
+        latest_attempt = state.latest_attempt
+        relevant_run = state.relevant_run
+        run_at = state.run_at
+        run_fresh = state.run_fresh
+        internal_finalization = state.internal_finalization
 
         # Trust evidence is immutable and run-scoped.  Mutable Product state
         # can be refreshed by a later partial/watchlist run and must never make
@@ -633,13 +669,18 @@ def trusted_catalog_epoch(
     whenever every required site has a fresh verified full Run; enforce-mode
     callers additionally pass through ``policy_rollout_eligibility``.
     """
-    report = full_catalog_trust_report(session, tenant_id=tenant_id, now=now)
+    # Deliberately NOT full_catalog_trust_report(): the epoch depends only on
+    # which Run backs each site, while the report additionally counts coverage
+    # over offer_observations (nine count(distinct) scans, ~0.4-0.7 s on prod).
+    # Every dashboard read asks for the epoch, so that cost was paid on each
+    # keystroke of the comparison search.
+    current = now or utcnow()
     parts: list[str] = []
-    for row in report["sites"]:
-        run_id = row["full_catalog_run_id"]
-        if run_id is None or not row["full_catalog_fresh"]:
+    for site in REQUIRED_CATALOG_SITES:
+        state = _site_full_run_state(session, site, tenant_id=tenant_id, current=current)
+        if state.relevant_run is None or not state.run_fresh:
             return None
-        parts.append(f"{row['site']}:{run_id}")
+        parts.append(f"{site}:{state.relevant_run.id}")
     return "v1|" + "|".join(parts)
 
 
@@ -656,6 +697,25 @@ def policy_rollout_eligibility(
     if not report["policy_ready"]:
         return Eligibility(False, "full_catalog_trust_not_ready")
     return Eligibility(True)
+
+
+# Поля товара, которые читают функции политики ниже (`country_code_of`,
+# `offer_is_fresh`, `current_offer_eligibility` и всё, что на них построено).
+#
+# Функции принимают любой объект и читают поля через getattr с умолчанием —
+# удобно для строк запроса вместо ORM-объектов, но опасно: если политика начнёт
+# читать новое поле, а вызывающий код его не выбрал, она молча получит
+# «неизвестно», и в shadow-режиме это значит «допустимо». Поэтому тот, кто
+# собирает товары колонками, обязан брать список отсюда, а тест следит, чтобы
+# сама политика за его пределы не выходила.
+POLICY_PRODUCT_FIELDS = (
+    "site",
+    "url_dead_at",
+    "manufacturer_country_code",
+    "country_resolution_status",
+    "offer_availability_status",
+    "availability_observed_at",
+)
 
 
 def country_code_of(product: Any) -> str | None:

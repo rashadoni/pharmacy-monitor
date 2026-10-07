@@ -53,11 +53,14 @@ Endpoints (v1):
 
 from __future__ import annotations
 
+import json
 import os
+import threading
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Iterator
 from urllib.parse import urlsplit
 
 import structlog
@@ -68,22 +71,25 @@ from fastapi import (
     File,
     HTTPException,
     Header,
+    Query,
     Request,
     Response,
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.orm import Session, aliased, selectinload
 
-from src import analytics
+from src import analytics, catalog_search
 from src import inventory as inv_mod
 from src import storage, tenants
 from src._time import utcnow
 from src.category_taxonomy import classify_source_category, source_category_labels
 from src.normalize import pack_unit_count
+from src.product_policy import POLICY_PRODUCT_FIELDS
 
 log = structlog.get_logger()
 
@@ -109,10 +115,25 @@ init_observability(service="api")
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    # Индекс поиска по каталогу собирается около секунды. Прогреваем его в фоне
+    # при старте воркера — иначе сборку ждал бы первый поиск после каждого
+    # рестарта API. Старт воркера прогрев не задерживает и уронить не может.
+    threading.Thread(
+        target=catalog_search.warm,
+        args=(storage.make_session(),),
+        name="catalog-search-warm",
+        daemon=True,
+    ).start()
+    yield
+
+
 app = FastAPI(
     title="Pharmacy Monitor API",
     description="REST API for ERP integration and frontend dashboard",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # CORS for frontend (Next.js on :3000 in dev, same-origin in prod via Caddy)
@@ -127,6 +148,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Сжатие ответов. Список сравнения — 4 МБ JSON; без сжатия он ехал к клиенту
+# секундами (Caddy перед API ответы не сжимает). Уровень 5: на этих данных
+# почти тот же размер, что у 9, втрое дешевле по CPU.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 # Prometheus /metrics endpoint
 install_metrics_endpoint(app)
@@ -2109,18 +2135,81 @@ def _comparison_spread(
     return basis, mn, mx, cheap, spr
 
 
-@app.get("/api/v1/dash/comparison")
-def dash_comparison(
-    search: str | None = None,
+# Клиент — первым: это порядок колонок на странице и приоритет при равных ценах.
+_SITE_ORDER = {"pharmonline": 0, "aptekonline": 1, "aloe": 2}
+
+# Колонки товара, которые читает сборка строк сравнения. Грузим ровно их и
+# без ORM-объектов: в `products` лежат тяжёлые `description`/`normalized_attrs`,
+# а строк в полном списке — тысячи на каждый запрос. Поля, нужные политике
+# стран и наличия, берём из её собственного списка — см. POLICY_PRODUCT_FIELDS.
+_COMPARISON_PRODUCT_COLUMNS = tuple(
+    getattr(storage.Product, field)
+    for field in dict.fromkeys(
+        (
+            "id",
+            "canonical_id",
+            "url",
+            "name",
+            "category",
+            "pack_size",
+            "last_seen_at",
+            *POLICY_PRODUCT_FIELDS,
+        )
+    )
+)
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _fast_json(payload: Any) -> Response:
+    """JSON-ответ мимо `jsonable_encoder`.
+
+    Для списка сравнения (тысячи строк с вложенными словарями) рекурсивный
+    энкодер FastAPI занимал около секунды — столько же, сколько вся выборка.
+    Здесь данные уже собраны из простых типов, формат вывода тот же, что у
+    штатного JSONResponse.
+    """
+    return Response(
+        content=json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            default=_json_default,
+        ),
+        media_type="application/json",
+    )
+
+
+def _has_ok_run(db: Session, *, tenant_id: int) -> bool:
+    return (
+        db.scalar(
+            select(storage.Run.id)
+            .where(storage.Run.status == "ok", storage.Run.tenant_id == tenant_id)
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def _comparison_rows(
+    db: Session,
+    *,
+    tenant_id: int,
     min_sites: int = 2,
     site_filter: str | None = None,
-    limit: int = 5000,
     min_confidence: float = 0.70,
     category: str | None = None,
-    user: storage.TenantUser = Depends(require_user),
-    db: Session = Depends(get_db),
-):
-    """Cross-site comparison rows. Filtered by tenant_id automatically.
+    match_ids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Строки таблицы сравнения (формат `ComparisonRowOut`), по spread убыв.
+
+    `match_ids` ограничивает выборку конкретными кластерами (поиск); `None` —
+    все кластеры арендатора.
 
     `min_confidence` (default 0.70): отсекаем низко-достоверные fuzzy-матчи —
     они почти всегда РАЗНЫЕ товары (Bio Kolik капли ↔ Bio sprey, Vitamin C
@@ -2128,55 +2217,73 @@ def dash_comparison(
     ложный гигантский spread в топе. is_manual=True матчи (подтверждены
     человеком) показываются всегда, независимо от confidence.
     """
-    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
-    last_run = db.scalar(
-        select(storage.Run.id)
-        .where(storage.Run.status == "ok", storage.Run.tenant_id == user.tenant_id)
-        .order_by(desc(storage.Run.id))
-        .limit(1)
-    )
-    if not last_run:
-        return []
+    from src.product_policy import policy_identity_eligibility, policy_offer_eligibility
 
-    # Bug fix 2026-05-29: раньше `.limit(limit)` стоял на raw matches query —
-    # бралось первые 500 matches по id, ПОТОМ фильтровалось по min_sites +
-    # свежести цен → итог всегда ~497 независимо от объёма скрейпа (при 4824
-    # matches видно только 10%). Теперь fetch ВСЕ matches, фильтруем, сортируем
-    # по spread desc, и limit применяем к ОТФИЛЬТРОВАННОМУ выходу.
-    # `selectinload(products)` грузит products одним доп. запросом — устраняет
-    # N+1 (4824 lazy-load'а превратились бы в 4824 SELECT'а).
-    matches_q = (
-        select(storage.Match)
-        .where(storage.Match.tenant_id == user.tenant_id)
-        .options(selectinload(storage.Match.products))
-    )
-    if search:
-        like = f"%{search.lower()}%"
-        matches_q = matches_q.where(
-            storage.Match.canonical_name.ilike(like) | storage.Match.canonical_brand.ilike(like)
+    # Bug fix 2026-05-29: `limit` нельзя ставить на запрос кластеров — сначала
+    # фильтр по min_sites и свежести цен, потом сортировка, и только потом срез
+    # (иначе при 4824 кластерах было видно 10%). Поэтому здесь читаются ВСЕ
+    # кластеры выборки, а limit применяет вызывающий код к готовому списку.
+    match_stmt = (
+        select(
+            storage.Match.id,
+            storage.Match.canonical_name,
+            storage.Match.canonical_brand,
+            storage.Match.canonical_pack_size,
+            storage.Match.is_manual,
+            storage.Match.confidence,
         )
-    matches = db.scalars(matches_q).all()
+        .where(storage.Match.tenant_id == tenant_id)
+        .order_by(storage.Match.id)
+    )
+    # Порядок товаров внутри кластера влияет на результат в двух местах, и раньше
+    # он был случайным (как вернёт БД):
+    #  - при РАВНЫХ ценах `cheapest_site` — первый по порядку; ставим клиента
+    #    (pharmonline) первым, чтобы паритет не рисовался как «конкурент дешевле»;
+    #  - на одном сайте в кластере иногда два товара (старый дубль), в
+    #    `prices[site]` остаётся последний — по id это новейший.
+    product_stmt = (
+        select(*_COMPARISON_PRODUCT_COLUMNS)
+        .where(storage.Product.tenant_id == tenant_id)
+        .order_by(
+            case(_SITE_ORDER, value=storage.Product.site, else_=len(_SITE_ORDER)),
+            storage.Product.id,
+        )
+    )
+    if match_ids is None:
+        product_stmt = product_stmt.where(storage.Product.canonical_id.is_not(None))
+    else:
+        if not match_ids:
+            return []
+        wanted = sorted(match_ids)
+        match_stmt = match_stmt.where(storage.Match.id.in_(wanted))
+        product_stmt = product_stmt.where(storage.Product.canonical_id.in_(wanted))
+    matches = db.execute(match_stmt).all()
+    if not matches:
+        return []
+    known_match_ids = {m.id for m in matches}
+    products_by_match: dict[int, list[Any]] = defaultdict(list)
+    all_pids: list[int] = []
+    for product in db.execute(product_stmt):
+        if product.canonical_id in known_match_ids:
+            products_by_match[product.canonical_id].append(product)
+            all_pids.append(product.id)
 
-    # Pre-fetch latest snapshots для всех product_id одной агрегатной SELECT'ой.
-    # Раньше делалось N+1 (snapshot per match × per site = ~3 за match), плюс
-    # после diff-only persist'а (2026-05-09) прошлая логика `WHERE run_id ==
-    # last_run` пропускала продукты без price-changes в last_run.
-    all_pids = [p.id for m in matches for p in m.products]
+    # Последняя цена на товар одной агрегатной SELECT'ой (после diff-only
+    # persist'а 2026-05-09 `WHERE run_id == last_run` пропускал товары без
+    # изменения цены в последнем прогоне).
+    #
     # Independent site producers reach their first verified full run at
     # different times. A single site's eligible diff-only run is not a complete
     # cross-site snapshot lineage and may contain zero snapshots when no prices
     # changed. Keep the shadow fallback until every required site contributes a
     # fresh verified full run; hard product gates below still exclude unsafe
-    # offers, and enforce mode already fails closed above.
-    trusted_lineage_available = _trusted_snapshot_lineage_available(
-        db,
-        tenant_id=user.tenant_id,
-    )
-    snaps_by_pid = storage.latest_snapshots_per_product(
+    # offers, and enforce mode already fails closed in the endpoint.
+    trusted_lineage_available = _trusted_snapshot_lineage_available(db, tenant_id=tenant_id)
+    prices_by_pid = storage.latest_prices_per_product(
         db,
         all_pids,
         financially_eligible_only=trusted_lineage_available,
-        tenant_id=user.tenant_id,
+        tenant_id=tenant_id,
     )
 
     now = utcnow()  # naive UTC; last_seen_at тоже naive (src/_time) — вычитание ок
@@ -2198,16 +2305,16 @@ def dash_comparison(
             )
             _canonical_cache[cache_key] = resolved.key if resolved else None
         return _canonical_cache[cache_key]
-    out: list[ComparisonRowOut] = []
-    for m in matches:
-        from src.product_policy import policy_identity_eligibility
 
-        if not policy_identity_eligibility(list(m.products)).eligible:
+    out: list[dict[str, Any]] = []
+    for m in matches:
+        products = products_by_match.get(m.id, [])
+        if not policy_identity_eligibility(products).eligible:
             continue
         # Drill-down из /category-comparison: фильтр по категории товара-клиента
         # (pharmonline). None → без фильтра (обычный режим страницы сравнения).
         if category is not None:
-            client_p = next((p for p in m.products if p.site == "pharmonline"), None)
+            client_p = next((p for p in products if p.site == "pharmonline"), None)
             if client_p is None:
                 continue
             # Классифицируем ровно так же, как сводка /category-comparison —
@@ -2224,28 +2331,26 @@ def dash_comparison(
         # Если товар-КЛИЕНТ (pharmonline) мёртв (404) — матч бесполезен (нечего
         # сравнивать с ценой клиента), дропаем целиком, а не показываем competitor-only
         # строку (аудит M1; зеркалит analytics._iter_matched_prices).
-        if any(p.site == "pharmonline" and p.url_dead_at is not None for p in m.products):
+        if any(p.site == "pharmonline" and p.url_dead_at is not None for p in products):
             continue
-        raw_prices: dict[str, dict[str, Any]] = {}
-        for p in m.products:
+        prices: dict[str, dict[str, Any]] = {}
+        for p in products:
             # «Фантомные» товары (страница 404, помечены validate-links) — скрываем,
             # чтобы не показывать матч с мёртвой ссылкой на конкурента.
             if p.url_dead_at is not None:
                 continue
-            from src.product_policy import policy_offer_eligibility
-
             if not policy_offer_eligibility(p, now=now).eligible:
                 continue
-            snap = snaps_by_pid.get(p.id)
-            price = (snap.discount_price or snap.price) if snap else None
+            latest = prices_by_pid.get(p.id)
+            price = (latest[1] or latest[0]) if latest else None
             if price is not None and price > 0:
                 # Свежесть по last_seen_at (видели в прогоне), НЕ по captured_at:
                 # под diff-only стабильная цена имеет старый captured_at, но свежий
                 # last_seen_at — товар активен. last_seen_at=NULL → не stale.
                 age_days = _price_age_days(now, p.last_seen_at)
-                raw_prices[p.site] = {
+                prices[p.site] = {
                     "price": price,
-                    "is_on_sale": snap.is_on_sale if snap else False,
+                    "is_on_sale": latest[2] if latest else False,
                     "url": p.url,
                     "product_id": p.id,
                     "country_code": p.manufacturer_country_code,
@@ -2264,7 +2369,6 @@ def dash_comparison(
         # штуку). `_comparison_spread` нормализует цену за штуку когда фасовки
         # различаются и это уменьшает spread, и дропает parse-ошибки на unit-цене.
         # Мутирует prices (annotate + drop).
-        prices = dict(raw_prices)
         basis, min_p, max_p, cheapest, spread = _comparison_spread(prices)
 
         sites_with_price = len(prices)
@@ -2277,27 +2381,311 @@ def dash_comparison(
             d.pop("name", None)
             d.pop("count_conf", None)
         out.append(
-            ComparisonRowOut(
-                canonical_id=m.id,
-                name=m.canonical_name,
-                brand=m.canonical_brand,
-                pack_size=m.canonical_pack_size,
-                is_manual=m.is_manual,
-                sites_with_price=sites_with_price,
-                min_price=min_p,
-                max_price=max_p,
-                spread_pct=spread,
-                cheapest_site=cheapest,
-                prices=prices,
-                confidence=m.confidence if m.confidence is not None else 1.0,
-                needs_review=(spread is not None and spread >= 50.0),
-                spread_basis=basis,
-            )
+            {
+                "canonical_id": m.id,
+                "name": m.canonical_name,
+                "brand": m.canonical_brand,
+                "pack_size": m.canonical_pack_size,
+                "is_manual": bool(m.is_manual),
+                "sites_with_price": sites_with_price,
+                "min_price": min_p,
+                "max_price": max_p,
+                "spread_pct": spread,
+                "cheapest_site": cheapest,
+                "prices": prices,
+                "confidence": conf,
+                "needs_review": spread is not None and spread >= 50.0,
+                "spread_basis": basis,
+            }
         )
     # Сортируем по |spread| desc (самое полезное для PO — где конкурент бьёт
-    # по цене / где можно поднять) и применяем limit к отфильтрованному выходу.
-    out.sort(key=lambda r: r.spread_pct if r.spread_pct is not None else -1.0, reverse=True)
-    return out[:limit]
+    # по цене / где можно поднять).
+    out.sort(key=lambda r: r["spread_pct"] if r["spread_pct"] is not None else -1.0, reverse=True)
+    return out
+
+
+# Сколько «прочих» товаров (без строки в сравнении) отдаём странице. Запрос из
+# двух букв находит тысячи; такой список никто не читает, а ответ раздувает —
+# страница получает первые и общее число. Строки сравнения при этом НЕ режем:
+# их может понадобиться выгрузить в Excel целиком.
+_SEARCH_OTHERS_LIMIT = 100
+# Длина поисковой строки. Название товара — до сотни знаков; длиннее — не поиск.
+_SEARCH_MAX_LENGTH = 100
+# PostgreSQL принимает до 65 535 параметров на запрос — id передаём порциями.
+_ID_CHUNK = 5000
+# Товар, которого нет на сайте дольше этого срока, с сайта снят: показывать его
+# в «найдено на сайтах» с ценой трёхмесячной давности — значит обманывать.
+_SEARCH_OTHERS_MAX_AGE_DAYS = 60
+
+
+def _catalog_index(db: Session, tenant_id: int) -> catalog_search.CatalogIndex:
+    return catalog_search.get_index(
+        db, tenant_id=tenant_id, session_factory=storage.make_session()
+    )
+
+
+def _comparison_search(
+    db: Session, *, tenant_id: int, query: str
+) -> tuple[dict[int, int], list[Any], set[int]]:
+    """Единое правило поиска страницы сравнения.
+
+    Возвращает (место товара в выдаче по id, найденные товары, кластеры). Им
+    пользуются и поиск страницы, и старый параметр `search`, и выгрузка в Excel
+    — иначе один и тот же запрос находил бы на экране одно, а в файле другое.
+
+    Кластер попадает в выборку двумя путями:
+      - запросу отвечает название (или бренд) товара ЛЮБОГО из сайтов — через
+        индекс каталога, со свёрткой написания («creon» находит «Kreon»);
+      - запрос — подстрока названия или бренда самого кластера. Это прежнее
+        правило, и убрать его нельзя: кластер из списка наблюдения носит имя,
+        которое дал ему пользователь, и в названиях товаров его может не быть.
+
+    Индекс знает только названия; всё, что может поменяться между прогонами
+    (пара, ссылка, наличие), читаем из БД свежим.
+    """
+    match_ids = set(
+        db.scalars(
+            select(storage.Match.id).where(
+                storage.Match.tenant_id == tenant_id,
+                storage.Match.canonical_name.icontains(query, autoescape=True)
+                | storage.Match.canonical_brand.icontains(query, autoescape=True),
+            )
+        )
+    )
+    hits = _catalog_index(db, tenant_id).search(query)
+    order = {hit.product_id: position for position, hit in enumerate(hits)}
+    ids = list(order)
+    found: list[Any] = []
+    for start in range(0, len(ids), _ID_CHUNK):
+        found.extend(
+            db.execute(
+                select(
+                    storage.Product.id,
+                    storage.Product.canonical_id,
+                    storage.Product.site,
+                    storage.Product.name,
+                    storage.Product.brand,
+                    storage.Product.url,
+                    storage.Product.last_seen_at,
+                    storage.Product.url_dead_at,
+                    storage.Product.manufacturer_country_code,
+                    storage.Product.country_resolution_status,
+                    storage.Product.offer_availability_status,
+                ).where(
+                    storage.Product.id.in_(ids[start : start + _ID_CHUNK]),
+                    storage.Product.tenant_id == tenant_id,
+                )
+            ).all()
+        )
+    match_ids.update(p.canonical_id for p in found if p.canonical_id is not None)
+    return order, found, match_ids
+
+
+# response_model — только для /docs: эндпоинт отдаёт готовый Response, и FastAPI
+# его не перевалидирует (на тысячах строк это стоило секунду).
+@app.get("/api/v1/dash/comparison", response_model=list[ComparisonRowOut])
+def dash_comparison(
+    search: str | None = Query(None, max_length=_SEARCH_MAX_LENGTH),
+    min_sites: int = 2,
+    site_filter: str | None = None,
+    limit: int = 5000,
+    min_confidence: float = 0.70,
+    category: str | None = None,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Cross-site comparison rows. Filtered by tenant_id automatically."""
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
+    if not _has_ok_run(db, tenant_id=user.tenant_id):
+        return []
+
+    match_ids: set[int] | None = None
+    if search and search.strip():
+        _order, _found, match_ids = _comparison_search(
+            db, tenant_id=user.tenant_id, query=search.strip()
+        )
+    rows = _comparison_rows(
+        db,
+        tenant_id=user.tenant_id,
+        min_sites=min_sites,
+        site_filter=site_filter,
+        min_confidence=min_confidence,
+        category=category,
+        match_ids=match_ids,
+    )
+    return _fast_json(rows[:limit])
+
+
+@app.get("/api/v1/dash/comparison/search")
+def dash_comparison_search(
+    q: str = Query(..., max_length=_SEARCH_MAX_LENGTH),
+    min_sites: int = 2,
+    min_confidence: float = 0.70,
+    category: str | None = None,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Поиск по ВСЕМУ каталогу для страницы сравнения.
+
+    `rows` — строки сравнения по кластерам, отобранным `_comparison_search`.
+    `others` — найденные товары, которых в этих строках
+    нет: без пары на другом сайте либо с парой, не прошедшей фильтры страницы.
+    Без `others` товар, который есть на сайте, для пользователя «не находится».
+    """
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
+    query = q.strip()
+    empty = {"rows": [], "others": [], "others_total": 0}
+    if not query or not _has_ok_run(db, tenant_id=user.tenant_id):
+        return empty
+
+    order, found, match_ids = _comparison_search(db, tenant_id=user.tenant_id, query=query)
+    if not found and not match_ids:
+        return empty
+
+    rows = _comparison_rows(
+        db,
+        tenant_id=user.tenant_id,
+        min_sites=min_sites,
+        min_confidence=min_confidence,
+        category=category,
+        match_ids=match_ids,
+    )
+    shown_match_ids = {row["canonical_id"] for row in rows}
+
+    now = utcnow()
+    candidates = []
+    for product in found:
+        if product.url_dead_at is not None:
+            continue
+        if product.canonical_id is not None and product.canonical_id in shown_match_ids:
+            continue
+        age_days = _price_age_days(now, product.last_seen_at)
+        if age_days is not None and age_days > _SEARCH_OTHERS_MAX_AGE_DAYS:
+            continue
+        candidates.append((product, age_days))
+    # Сначала то, что можно купить; внутри — по близости к запросу.
+    candidates.sort(
+        key=lambda item: (
+            item[0].offer_availability_status == "out_of_stock",
+            order[item[0].id],
+            _SITE_ORDER.get(item[0].site, 9),
+        )
+    )
+    page = candidates[:_SEARCH_OTHERS_LIMIT]
+    prices_by_pid = storage.latest_prices_per_product(
+        db,
+        [product.id for product, _age in page],
+        financially_eligible_only=_trusted_snapshot_lineage_available(db, tenant_id=user.tenant_id),
+        tenant_id=user.tenant_id,
+    )
+    others = []
+    for product, age_days in page:
+        latest = prices_by_pid.get(product.id)
+        price = (latest[1] or latest[0]) if latest else None
+        others.append(
+            {
+                "product_id": product.id,
+                "site": product.site,
+                "name": product.name,
+                "brand": product.brand,
+                "url": product.url,
+                "price": price if price is not None and price > 0 else None,
+                "is_on_sale": latest[2] if latest else False,
+                "country_code": product.manufacturer_country_code,
+                "country_resolution_status": product.country_resolution_status,
+                "availability_status": product.offer_availability_status,
+                "age_days": age_days,
+                "stale": age_days is not None and age_days > _COMPARISON_STALE_DAYS,
+            }
+        )
+    return _fast_json({"rows": rows, "others": others, "others_total": len(candidates)})
+
+
+@app.get("/api/v1/dash/comparison/export.xlsx")
+def dash_comparison_export(
+    search: str | None = Query(None, max_length=_SEARCH_MAX_LENGTH),
+    min_sites: int = 2,
+    min_confidence: float = 0.70,
+    category: str | None = None,
+    with_aloe: bool = False,
+    diff_only: bool = False,
+    locale: str = "ru",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Excel: товары с разной ценой + вся текущая выборка страницы сравнения.
+
+    Параметры повторяют фильтры страницы, чтобы в файле было ровно то, что
+    пользователь видит (и, первым листом, то, о чём просил клиент: все товары,
+    у которых цены на сайтах различаются).
+    """
+    from src import comparison_export
+
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
+    locale = _normalize_locale(locale)
+    query = (search or "").strip()
+    rows: list[dict[str, Any]] = []
+    if _has_ok_run(db, tenant_id=user.tenant_id):
+        match_ids: set[int] | None = None
+        if query:
+            _order, _found, match_ids = _comparison_search(
+                db, tenant_id=user.tenant_id, query=query
+            )
+        rows = _comparison_rows(
+            db,
+            tenant_id=user.tenant_id,
+            min_sites=min_sites,
+            min_confidence=min_confidence,
+            category=category,
+            match_ids=match_ids,
+        )
+    if with_aloe:
+        rows = [row for row in rows if "aloe" in row["prices"]]
+    if diff_only:
+        rows = [row for row in rows if comparison_export.has_price_difference(row)]
+
+    generated_at = utcnow()
+    content = comparison_export.build_workbook(
+        rows,
+        locale=locale,
+        generated_at=generated_at,
+        search=query or None,
+        category=category,
+        min_sites=min_sites,
+        with_aloe=with_aloe,
+        diff_only=diff_only,
+    )
+    log.info(
+        "comparison_export",
+        user_id=user.id,
+        rows=len(rows),
+        bytes=len(content),
+        search=bool(query),
+        category=category,
+    )
+    return Response(
+        content=content,
+        media_type=comparison_export.XLSX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{comparison_export.filename(locale, generated_at)}"'
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/api/v1/dash/comparison/suggest")
+def dash_comparison_suggest(
+    q: str = Query(..., max_length=_SEARCH_MAX_LENGTH),
+    limit: int = 8,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Подсказки при наборе в поиске сравнения: торговые имена из каталога."""
+    limit = max(1, min(limit, 20))
+    suggestions = _catalog_index(db, user.tenant_id).suggest(q, limit=limit)
+    return [{"text": s.text, "count": s.count} for s in suggestions]
 
 
 _VALID_SITES = ("pharmonline", "aptekonline", "aloe")

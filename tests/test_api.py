@@ -5447,3 +5447,581 @@ def test_normalize_stats_uses_product_units_and_tenant_scope(
     assert body["matches_needing_review"] == 1
     assert body["products_needing_review"] == 2
     assert body["needs_review"] == 1
+
+
+# ─── /comparison: поиск по всему каталогу, подсказки, Excel (2026-10) ─────────
+#
+# Жалобы клиента 2026-10-06: поиск грузится долго; «veqovi», «ozempik», «kreon»
+# не находятся, хотя товары есть на сайтах; нет подсказок при наборе; нужна
+# выгрузка в Excel всех товаров с разной ценой.
+
+
+def _search_run(session) -> storage.Run:
+    run = storage.Run(tenant_id=1, started_at=utcnow(), status="ok")
+    session.add(run)
+    session.flush()
+    return _mark_trusted_full_run(session, run)
+
+
+def _unmatched_product(session, run, *, site, name, price, tenant_id=1, **attrs):
+    """Товар без пары на другом сайте — то, чего прежний поиск не видел."""
+    product = storage.Product(
+        tenant_id=tenant_id,
+        site=site,
+        external_id=f"{site}-{name}",
+        url=f"https://{site}.example/{name}",
+        name=name,
+        name_normalized=name.lower(),
+        **attrs,
+    )
+    session.add(product)
+    session.flush()
+    if price is not None:
+        session.add(
+            storage.PriceSnapshot(
+                run_id=run.id, product_id=product.id, price=price, captured_at=utcnow()
+            )
+        )
+    session.commit()
+    return product
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/dash/comparison/search?q=kreon",
+        "/api/v1/dash/comparison/suggest?q=kre",
+        "/api/v1/dash/comparison/export.xlsx",
+    ],
+)
+def test_comparison_search_endpoints_require_cookie(client, path):
+    assert client.get(path).status_code == 401
+
+
+def test_comparison_search_finds_products_without_a_pair(client, tenant_user, setup_db):
+    """Regression: клиент набирал «veqovi» и видел пустую страницу."""
+    s = setup_db
+    run = _search_run(s)
+    _unmatched_product(s, run, site="pharmonline", name="Veqovi 1 mq № 1", price=233.28)
+    _unmatched_product(s, run, site="aptekonline", name="Veqovi 1 mq/doza N1 (Wegovy)", price=177.29)
+    _unmatched_product(s, run, site="aloe", name="Ozempik 1 mq 3ml", price=233.4)
+    _login(client, tenant_user, s)
+
+    # Прежний эндпоинт по-прежнему отдаёт только сопоставленные строки…
+    assert client.get("/api/v1/dash/comparison?search=veqovi&min_sites=1").json() == []
+
+    # …а поиск показывает и товары без пары, с ценой и сайтом.
+    for query in ("veqovi", "wegovy", "вегови"):
+        body = client.get(f"/api/v1/dash/comparison/search?q={query}").json()
+        assert body["rows"] == []
+        assert body["others_total"] == 2
+        assert [(o["site"], o["price"]) for o in body["others"]] == [
+            ("pharmonline", 233.28),
+            ("aptekonline", 177.29),
+        ]
+        assert body["others"][0]["url"].startswith("https://pharmonline.example/")
+        assert body["others"][0]["stale"] is False
+
+
+def test_comparison_search_matches_any_site_spelling(client, tenant_user, setup_db):
+    """Кластер назван «Kreon», на одном из сайтов препарат записан «Creon»."""
+    s = setup_db
+    run = _search_run(s)
+    match = _make_match_with_prices(
+        s, run, canonical="Kreon 25000", prices={"pharmonline": 19.39, "aloe": 19.5}
+    )
+    aloe = next(p for p in match.products if p.site == "aloe")
+    aloe.name = "Creon 25000 20 əd."
+    s.commit()
+    _unmatched_product(s, run, site="aptekonline", name="Kreon 25000 N20", price=19.39)
+    _login(client, tenant_user, s)
+
+    body = client.get("/api/v1/dash/comparison/search?q=creon").json()
+
+    assert [row["name"] for row in body["rows"]] == ["Kreon 25000"]
+    assert set(body["rows"][0]["prices"]) == {"pharmonline", "aloe"}
+    # Товары показанного кластера во «прочих» не дублируются.
+    assert [o["site"] for o in body["others"]] == ["aptekonline"]
+    # Старый параметр `search` тоже находит кластер по названию товара сайта.
+    legacy = client.get("/api/v1/dash/comparison?search=creon").json()
+    assert [row["name"] for row in legacy] == ["Kreon 25000"]
+
+
+def test_comparison_search_page_legacy_param_and_export_select_the_same_clusters(
+    client, tenant_user, setup_db
+):
+    """Кластер из списка наблюдения носит имя, которого нет в названиях товаров.
+
+    Поиск страницы, старый параметр `search` и Excel обязаны находить его
+    одинаково — иначе на экране одно, а в файле другое.
+    """
+    s = setup_db
+    run = _search_run(s)
+    match = _make_match_with_prices(
+        s,
+        run,
+        canonical="Ферменты поджелудочной 25000",
+        prices={"pharmonline": 19.0, "aloe": 21.0},
+    )
+    match.canonical_brand = "Abbott"
+    for product in match.products:
+        product.name = "Kreon 25000 N20" if product.site == "pharmonline" else "Creon 25000 20 əd."
+    s.commit()
+    _make_match_with_prices(
+        s, run, canonical="Nurofen 200", prices={"pharmonline": 3.0, "aptekonline": 4.0}
+    )
+    _login(client, tenant_user, s)
+
+    # по названию кластера, по его бренду, по названию товара сайта — и «%» буквально
+    for query, expected in [
+        ("поджелудочной", ["Ферменты поджелудочной 25000"]),
+        ("abbott", ["Ферменты поджелудочной 25000"]),
+        ("creon", ["Ферменты поджелудочной 25000"]),
+        ("%", []),
+    ]:
+        page = client.get("/api/v1/dash/comparison/search", params={"q": query}).json()
+        legacy = client.get("/api/v1/dash/comparison", params={"search": query}).json()
+        wb = _load_export(
+            client.get("/api/v1/dash/comparison/export.xlsx", params={"search": query})
+        )
+        in_file = [row[0] for row in wb.worksheets[1].iter_rows(min_row=2, values_only=True)]
+        assert [row["name"] for row in page["rows"]] == expected, query
+        assert [row["name"] for row in legacy] == expected, query
+        assert in_file == expected, query
+        assert page["others"] == [], query
+
+
+def test_comparison_rows_keep_the_documented_contract(client, tenant_user, setup_db):
+    """Эндпоинты отдают готовый JSON мимо валидации — контракт держит этот тест."""
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_packs(
+        s,
+        run,
+        canonical="Maska contract",
+        prods=[
+            ("pharmonline", 10.0, "N50", "Maska contract N50"),
+            ("aloe", 0.25, "N1", "Maska contract 1 əd"),
+        ],
+    )
+    _login(client, tenant_user, s)
+
+    listed = client.get("/api/v1/dash/comparison?min_sites=2").json()
+    searched = client.get("/api/v1/dash/comparison/search?q=maska").json()
+
+    assert set(searched) == {"rows", "others", "others_total"}
+    assert listed == searched["rows"]
+    row = listed[0]
+    assert set(row) == set(api_module.ComparisonRowOut.model_fields)
+    assert api_module.ComparisonRowOut.model_validate(row).spread_basis == "unit"
+    assert set(row["prices"]["pharmonline"]) == {
+        "price",
+        "is_on_sale",
+        "url",
+        "product_id",
+        "country_code",
+        "country_resolution_status",
+        "availability_status",
+        "availability_observed_at",
+        "pack_size",
+        "age_days",
+        "stale",
+        "pack_count",
+        "unit_price",
+    }
+
+
+def test_comparison_loads_every_product_field_the_policy_reads():
+    """Политика читает поля через getattr с умолчанием: невыбранное поле она
+    молча приняла бы за «неизвестно», а в shadow-режиме это «допустимо»."""
+    from src import product_policy
+
+    class Recorder:
+        def __init__(self):
+            object.__setattr__(self, "seen", set())
+
+        def __getattr__(self, name):
+            self.seen.add(name)
+            raise AttributeError(name)
+
+    probe = Recorder()
+    product_policy.policy_identity_eligibility([probe])
+    product_policy.policy_offer_eligibility(probe)
+    product_policy.financially_eligible([probe])
+    product_policy.policy_financial_eligibility([probe])
+
+    assert probe.seen <= set(product_policy.POLICY_PRODUCT_FIELDS), probe.seen
+    loaded = {column.key for column in api_module._COMPARISON_PRODUCT_COLUMNS}
+    assert set(product_policy.POLICY_PRODUCT_FIELDS) <= loaded
+
+
+def test_comparison_search_lists_product_whose_row_is_filtered_out(
+    client, tenant_user, setup_db
+):
+    """Пара есть, но строка не прошла фильтр «на 2+ сайтах» — товар всё равно виден."""
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(s, run, canonical="Siplor 100 ml", prices={"pharmonline": 7.5})
+    _login(client, tenant_user, s)
+
+    body = client.get("/api/v1/dash/comparison/search?q=siplor&min_sites=2").json()
+    assert body["rows"] == []
+    assert [(o["site"], o["price"]) for o in body["others"]] == [("pharmonline", 7.5)]
+
+    body = client.get("/api/v1/dash/comparison/search?q=siplor&min_sites=1").json()
+    assert [row["name"] for row in body["rows"]] == ["Siplor 100 ml"]
+    assert body["others"] == []
+
+
+def test_comparison_search_hides_dead_and_delisted_products(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    now = utcnow()
+    _unmatched_product(s, run, site="pharmonline", name="Antepsin live", price=5.0)
+    _unmatched_product(
+        s, run, site="aptekonline", name="Antepsin dead link", price=5.0, url_dead_at=now
+    )
+    _unmatched_product(
+        s,
+        run,
+        site="aloe",
+        name="Antepsin delisted",
+        price=5.0,
+        last_seen_at=now - timedelta(days=90),
+    )
+    _unmatched_product(
+        s,
+        run,
+        site="aloe",
+        name="Antepsin old price",
+        price=6.0,
+        last_seen_at=now - timedelta(days=20),
+    )
+    _unmatched_product(
+        s,
+        run,
+        site="aptekonline",
+        name="Antepsin sold out",
+        price=4.0,
+        offer_availability_status="out_of_stock",
+    )
+    _login(client, tenant_user, s)
+
+    others = client.get("/api/v1/dash/comparison/search?q=antepsin").json()["others"]
+
+    by_name = {o["name"]: o for o in others}
+    assert set(by_name) == {"Antepsin live", "Antepsin old price", "Antepsin sold out"}
+    assert by_name["Antepsin old price"]["stale"] is True
+    assert by_name["Antepsin old price"]["age_days"] == 20
+    # Нет в наличии — показываем, но после того, что можно купить.
+    assert others[-1]["name"] == "Antepsin sold out"
+    assert others[-1]["availability_status"] == "out_of_stock"
+
+
+def test_comparison_search_is_tenant_scoped(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _unmatched_product(s, run, site="pharmonline", name="Ksarelto own", price=50.0)
+    _unmatched_product(
+        s, run, site="aptekonline", name="Ksarelto foreign", price=40.0, tenant_id=2
+    )
+    _login(client, tenant_user, s)
+
+    body = client.get("/api/v1/dash/comparison/search?q=xarelto").json()
+    assert [o["name"] for o in body["others"]] == ["Ksarelto own"]
+    suggestions = client.get("/api/v1/dash/comparison/suggest?q=ksa").json()
+    assert suggestions == [{"text": "Ksarelto", "count": 1}]
+
+
+def test_comparison_search_rejects_overlong_query(client, tenant_user, setup_db):
+    """Поисковая строка ограничена: каждое слово — проход по каталогу."""
+    s = setup_db
+    _search_run(s)
+    s.commit()
+    _login(client, tenant_user, s)
+    long_query = "a" * 101
+
+    for path in (
+        f"/api/v1/dash/comparison/search?q={long_query}",
+        f"/api/v1/dash/comparison/suggest?q={long_query}",
+        f"/api/v1/dash/comparison?search={long_query}",
+        f"/api/v1/dash/comparison/export.xlsx?search={long_query}",
+    ):
+        assert client.get(path).status_code == 422, path
+    assert client.get(f"/api/v1/dash/comparison/search?q={'a' * 100}").status_code == 200
+
+
+def test_comparison_search_cyrillic_with_capital_letter(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _unmatched_product(s, run, site="pharmonline", name="Kreon 10000 №20", price=10.49)
+    _login(client, tenant_user, s)
+
+    for query in ("Креон", "КРЕОН", "креон"):
+        body = client.get("/api/v1/dash/comparison/search", params={"q": query}).json()
+        assert [o["name"] for o in body["others"]] == ["Kreon 10000 №20"], query
+    suggestions = client.get("/api/v1/dash/comparison/suggest", params={"q": "Кре"}).json()
+    assert [item["text"] for item in suggestions] == ["Kreon"]
+
+
+def test_comparison_search_empty_query_and_no_hits(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _unmatched_product(s, run, site="pharmonline", name="Nurofen 200 mq", price=3.0)
+    _login(client, tenant_user, s)
+
+    empty = {"rows": [], "others": [], "others_total": 0}
+    assert client.get("/api/v1/dash/comparison/search?q=%20").json() == empty
+    assert client.get("/api/v1/dash/comparison/search?q=zzzzqqq").json() == empty
+
+
+def test_comparison_suggest_completes_trade_names(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    for site, name in [
+        ("pharmonline", "Kreon 10000 №20 (Kapsula)"),
+        ("aptekonline", "Kreon 10000  N20"),
+        ("aloe", "Creon 10000 20 əd."),
+        ("aptekonline", "Kreon  25000  N20"),
+        ("pharmonline", "Ozempik 1.0 mq/doza 3.0 ml № 1"),
+    ]:
+        _unmatched_product(s, run, site=site, name=name, price=10.0)
+    _login(client, tenant_user, s)
+
+    def texts(query: str) -> list[str]:
+        response = client.get("/api/v1/dash/comparison/suggest", params={"q": query})
+        assert response.status_code == 200
+        return [item["text"] for item in response.json()]
+
+    assert texts("kre") == ["Kreon"]
+    assert texts("креон") == ["Kreon", "Kreon 10000", "Kreon 25000"]
+    assert texts("oze") == ["Ozempik"]
+    assert texts("ozenpik") == ["Ozempik"]  # опечатка
+    assert texts("o") == []
+
+
+def test_comparison_equal_prices_name_client_site_as_cheapest(client, tenant_user, setup_db):
+    """При паритете `cheapest_site` — клиент, а не случайный по порядку БД сайт.
+
+    Страница красит строку красным («конкурент дешевле»), когда cheapest_site не
+    pharmonline; раньше при равных ценах это зависело от порядка строк в БД.
+    """
+    s = setup_db
+    run = _search_run(s)
+    # Конкурент создан первым (меньший id) — прежний код назвал бы его.
+    match = storage.Match(tenant_id=1, canonical_name="Parity product", confidence=1.0)
+    s.add(match)
+    s.flush()
+    for site in ("aloe", "aptekonline", "pharmonline"):
+        product = storage.Product(
+            tenant_id=1,
+            site=site,
+            external_id=f"parity-{site}",
+            url=f"https://{site}.example/parity",
+            name=f"Parity product {site}",
+            name_normalized="parity product",
+            canonical_id=match.id,
+        )
+        s.add(product)
+        s.flush()
+        s.add(
+            storage.PriceSnapshot(
+                run_id=run.id, product_id=product.id, price=12.0, captured_at=utcnow()
+            )
+        )
+    s.commit()
+    _login(client, tenant_user, s)
+
+    row = client.get("/api/v1/dash/comparison?min_sites=2").json()[0]
+
+    assert row["spread_pct"] == 0.0
+    assert row["cheapest_site"] == "pharmonline"
+    assert list(row["prices"]) == ["pharmonline", "aptekonline", "aloe"]
+
+
+def test_comparison_query_count_does_not_grow_with_rows(client, tenant_user, setup_db):
+    """Список сравнения читается фиксированным числом запросов (без N+1)."""
+    from sqlalchemy import event
+
+    s = setup_db
+    run = _search_run(s)
+    _login(client, tenant_user, s)
+    statements: list[str] = []
+    engine = s.get_bind()
+
+    def _count(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    def _queries_for_listing() -> int:
+        statements.clear()
+        event.listen(engine, "before_cursor_execute", _count)
+        try:
+            assert client.get("/api/v1/dash/comparison?min_sites=2").status_code == 200
+        finally:
+            event.remove(engine, "before_cursor_execute", _count)
+        return len(statements)
+
+    _make_match_with_prices(s, run, canonical="first", prices={"pharmonline": 1.0, "aloe": 2.0})
+    few = _queries_for_listing()
+    for i in range(25):
+        _make_match_with_prices(
+            s, run, canonical=f"more{i}", prices={"pharmonline": 1.0 + i, "aloe": 2.0 + i}
+        )
+    many = _queries_for_listing()
+
+    assert many == few
+    # И ни одного запроса к журналу наблюдений: покрытие считает только
+    # full_catalog_trust_report, а не каждое чтение дашборда.
+    assert not any("offer_observations" in statement for statement in statements)
+
+
+def test_comparison_large_response_is_compressed(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    for i in range(12):
+        _make_match_with_prices(
+            s, run, canonical=f"gzip{i}", prices={"pharmonline": 1.0 + i, "aloe": 2.0 + i}
+        )
+    _login(client, tenant_user, s)
+
+    response = client.get(
+        "/api/v1/dash/comparison?min_sites=2", headers={"Accept-Encoding": "gzip"}
+    )
+
+    assert response.headers.get("content-encoding") == "gzip"
+    assert len(response.json()) == 12
+
+
+def _load_export(response):
+    import io
+
+    from openpyxl import load_workbook
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    return load_workbook(io.BytesIO(response.content))
+
+
+def test_comparison_export_xlsx_lists_products_with_different_prices(
+    client, tenant_user, setup_db
+):
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(
+        s, run, canonical="Differs a lot", prices={"pharmonline": 10.0, "aptekonline": 8.0}
+    )
+    _make_match_with_prices(
+        s, run, canonical="Differs a bit", prices={"pharmonline": 10.0, "aloe": 10.03}
+    )
+    _make_match_with_prices(
+        s, run, canonical="Same price", prices={"pharmonline": 5.0, "aptekonline": 5.0}
+    )
+    _make_match_with_prices(s, run, canonical="One site only", prices={"pharmonline": 3.0})
+    _login(client, tenant_user, s)
+
+    response = client.get("/api/v1/dash/comparison/export.xlsx?locale=az")
+    wb = _load_export(response)
+
+    assert 'filename="qiymet-ferqleri-' in response.headers["content-disposition"]
+    assert wb.sheetnames == ["Fərqli qiymətlər", "Bütün müqayisə", "Məlumat"]
+    differing = [row for row in wb["Fərqli qiymətlər"].iter_rows(min_row=2, values_only=True)]
+    # Только строки, где цены не равны; 10.00 против 10.03 (0.3%) тоже разница.
+    assert [row[0] for row in differing] == ["Differs a lot", "Differs a bit"]
+    name, _brand, pharm, aptek, aloe, cheapest, diff_azn, diff_pct, position = differing[0][:9]
+    assert (pharm, aptek, aloe) == (10.0, 8.0, None)
+    assert cheapest == "Aptekonline"
+    assert diff_azn == 2.0
+    assert diff_pct == pytest.approx(0.2)
+    assert position == "Ən baha"
+    everything = [row[0] for row in wb["Bütün müqayisə"].iter_rows(min_row=2, values_only=True)]
+    assert everything == ["Differs a lot", "Differs a bit", "Same price"]
+    # Ссылка на товар сайта — рабочая гиперссылка.
+    link = wb["Fərqli qiymətlər"].cell(row=2, column=11)
+    assert link.value == "Pharmonline"
+    assert link.hyperlink.target == "https://pharmonline.example/Differs a lot"
+
+
+def test_comparison_export_xlsx_follows_page_filters(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(
+        s, run, canonical="Kreon 25000", prices={"pharmonline": 19.0, "aloe": 21.0}
+    )
+    _make_match_with_prices(
+        s, run, canonical="Nurofen 200", prices={"pharmonline": 3.0, "aptekonline": 4.0}
+    )
+    _make_match_with_prices(
+        s, run, canonical="Nurofen same", prices={"pharmonline": 3.0, "aptekonline": 3.0}
+    )
+    _login(client, tenant_user, s)
+
+    def names(query: str, sheet: int = 0) -> list[str]:
+        wb = _load_export(client.get(f"/api/v1/dash/comparison/export.xlsx?{query}"))
+        return [row[0] for row in wb.worksheets[sheet].iter_rows(min_row=2, values_only=True)]
+
+    assert names("locale=ru&search=creon") == ["Kreon 25000"]
+    assert names("locale=ru&with_aloe=true", sheet=1) == ["Kreon 25000"]
+    assert names("locale=ru&search=nurofen", sheet=1) == ["Nurofen 200", "Nurofen same"]
+    # «Только различия» на странице → второй лист был бы копией первого.
+    wb = _load_export(client.get("/api/v1/dash/comparison/export.xlsx?locale=ru&diff_only=true"))
+    assert wb.sheetnames == ["Разные цены", "О файле"]
+    # Незнакомая локаль не роняет выгрузку.
+    assert _load_export(client.get("/api/v1/dash/comparison/export.xlsx?locale=xx"))
+
+
+def test_trusted_catalog_epoch_matches_trust_report(setup_db):
+    """Эпоха считается без отчёта о покрытии, но обязана с ним совпадать."""
+    from src.product_policy import (
+        finalizing_trusted_run,
+        full_catalog_trust_report,
+        trusted_catalog_epoch,
+    )
+
+    s = setup_db
+    assert trusted_catalog_epoch(s) is None
+    run = _search_run(s)
+    s.commit()
+
+    report = full_catalog_trust_report(s)
+    expected = "v1|" + "|".join(
+        f"{row['site']}:{row['full_catalog_run_id']}" for row in report["sites"]
+    )
+    assert all(row["full_catalog_fresh"] for row in report["sites"])
+    assert trusted_catalog_epoch(s) == expected == f"v1|pharmonline:{run.id}|aptekonline:{run.id}|aloe:{run.id}"
+
+    # Прогон устарел по возрасту: эпохи нет, отчёт говорит то же.
+    later = utcnow() + timedelta(days=60)
+    assert trusted_catalog_epoch(s, now=later) is None
+    assert not any(
+        row["full_catalog_fresh"] for row in full_catalog_trust_report(s, now=later)["sites"]
+    )
+
+    # Более свежая неудачная попытка полного сбора закрывает эпоху — как и в отчёте.
+    failed = storage.Run(
+        tenant_id=1,
+        started_at=utcnow(),
+        status="failed",
+        catalog_scope="full",
+        full_catalog_sites="pharmonline",
+        catalog_verified=False,
+    )
+    s.add(failed)
+    s.commit()
+    assert trusted_catalog_epoch(s) is None
+    assert full_catalog_trust_report(s)["sites"][0]["full_catalog_run_id"] is None
+
+    # Проверенный прогон в финализации (ещё «running») виден только изнутри
+    # самой финализации — и эпохе, и отчёту одинаково.
+    failed.status = "running"
+    failed.catalog_verified = True
+    s.commit()
+    assert trusted_catalog_epoch(s) is None
+    with finalizing_trusted_run(failed.id):
+        inside = full_catalog_trust_report(s)["sites"][0]
+        assert inside["internal_finalization"] is True
+        assert trusted_catalog_epoch(s) == (
+            f"v1|pharmonline:{failed.id}|aptekonline:{run.id}|aloe:{run.id}"
+        )
+    assert trusted_catalog_epoch(s) is None

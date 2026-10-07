@@ -25,3 +25,13 @@ def db_session():
     with Session() as session:
         yield session
     engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _reset_catalog_search_index():
+    """Индекс поиска живёт в памяти процесса — у каждого теста своя БД."""
+    from src import catalog_search
+
+    catalog_search.reset_cache()
+    yield
+    catalog_search.reset_cache()
