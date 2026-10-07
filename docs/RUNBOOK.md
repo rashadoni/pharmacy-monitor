@@ -646,7 +646,8 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
   репозитории нет). Он откажется, если в том коммите нет ревизии, на которой
   стоит база: после миграции назад — только новым коммитом. ⚠️ `--ref` берёт и
   сам `deploy.yml` того коммита: отказ при непримененной миграции появился в
-  нём 2026-10-07, так что на коммиты старше этой даты так не откатываться.
+  нём с коммитом `365add9a` (2026-10-07), так что на коммиты старше него так
+  не откатываться.
 - **Всего репозитория.** Что именно он возит, смотреть в его шаге копирования.
   `templates/` (шаблон отчёта, его читает `src/reporter.py`) и `scripts/` он не
   возит; единственным workflow, который когда-либо клал на сервер `templates/`,
@@ -665,8 +666,10 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
   сбор с 23 августа не ходит. Теперь это смотрят по SSH под root:
   `systemctl list-timers 'pharmacy-monitor*'`,
   `systemctl status pharmacy-monitor-scrape@pharmonline`,
-  `journalctl -u pharmacy-monitor-scrape@pharmonline -n 100` и
-  `curl -fsS http://127.0.0.1:8080/health`;
+  `journalctl -u pharmacy-monitor-scrape@pharmonline -n 100`,
+  `curl -fsS http://127.0.0.1:8080/health`; какие ключи заданы —
+  `cut -d= -f1 /etc/pharmacy-monitor/env` (имена без значений), состояние
+  алертов — `/opt/pharmacy-monitor/data/health_alert_state.json`;
 - `activate-pharmonline-public-api-autonomy.yml` — разовая активация 23 августа,
   `src/`, `migrations/` и `templates/` целиком.
 

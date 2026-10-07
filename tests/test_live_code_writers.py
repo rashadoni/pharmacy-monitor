@@ -22,10 +22,15 @@
   каталога, копию в черновой каталог, текст сообщений
 
 Чего тест не видит:
-- каталог из переменной (`$app/src/`, `cd "$app"`) и домашний каталог без пути
-  (`cd ~`, голый `cd`, `tar xzf -` во второй строке многострочной команды ssh)
+- каталог из переменной (`$app/src/`, `cd "$app"`)
+- путь от домашнего каталога `pm` там, где он не назван: `~/src/…`, `cd ~`,
+  голый `cd`, относительный путь в теле `bash -s <<'REMOTE'` без `cd` или с
+  `cd` в самой строке ssh, `ssh host 'cat > src/api.py'`
+- второй `cd` относительно первого (`cd /opt/pharmacy-monitor`, затем `cd src`)
+  и `pushd`
 - запись другими командами: `sed -i`, `patch`, `unzip -d`, `curl -o`,
-  `git pull` или `git reset` в каталоге, python, своя shell-функция
+  `git pull` или `git reset` в каталоге, `find -exec`, `xargs -I`, python,
+  своя shell-функция и обёртки не из `WRAPPERS`
 - скрипт из репозитория, который workflow исполняет на сервере
   (`bash -s < infra/…sh`): в сам скрипт тест не заглядывает
 - код чекаута, запущенный из чернового каталога против боевой базы, и
@@ -229,19 +234,16 @@ def _writes_live_code(script: str) -> list[str]:
     """
     found: list[str] = []
     cwd = ""
-    heredocs: list[tuple[str, bool]] = []  # слово-окончание и «внутри shell, не python»
+    heredocs: list[str] = []  # слова, которыми закроются открытые heredoc
     open_quote = ""  # аргумент ssh в кавычках, не закрытый на своей строке
     for line in re.sub(r"\\\n\s*", " ", script).splitlines():
         if STEP_START.match(line):
             cwd, open_quote, heredocs = "", "", []
         inside = bool(heredocs)
-        if inside:
-            if line.strip() == heredocs[-1][0]:
-                heredocs.pop()
-                cwd = cwd if heredocs else ""
-                continue
-            if not heredocs[-1][1]:
-                continue
+        if inside and line.strip() == heredocs[-1]:
+            heredocs.pop()
+            cwd = cwd if heredocs else ""
+            continue
         if CAPTION.match(line):
             continue
         in_one_line_argument = False
@@ -260,7 +262,7 @@ def _writes_live_code(script: str) -> list[str]:
             elif in_one_line_argument:
                 cwd = ""
         if opened := HEREDOC.search(line):
-            heredocs.append((opened.group(1), "python" not in line))
+            heredocs.append(opened.group(1))
     return found
 
 
