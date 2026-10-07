@@ -321,7 +321,7 @@ Services (all systemd):
 - pharmacy-monitor-intraday.service     → intraday-tick
 - pharmacy-monitor-health.timer         → hourly
 - pharmacy-monitor-backup.timer         → daily 04:00 UTC
-- pharmacy-monitor-rematch.timer        → weekly Monday 05:00 UTC
+- pharmacy-monitor-rematch.timer        → Tuesday and Friday 04:30 по времени хоста; `rematch` без `--reset` (тот же этап, что конец сбора)
 - pharmacy-monitor-digest@daily.timer   → daily 05:00 UTC
 
 Network:
@@ -373,7 +373,9 @@ Persistent state:
 - **`Run.products_scraped`** = page hits, не unique products. Уникальных по `external_id` будет меньше.
 - **Scrape concurrency** — server watcher skips when any `pharmacy-monitor run`,
   `scrape`, `intraday-tick`, or `rematch` is active; matcher/rematch uses a
-  Postgres advisory lock for `canonical_id` writes.
+  Postgres advisory lock for `canonical_id` writes. `rematch` also try-locks the
+  run lock and exits with "skipped" while a scrape, a tick or another `rematch`
+  holds it.
 
 ### Scraping
 

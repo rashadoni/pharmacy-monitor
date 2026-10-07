@@ -2270,6 +2270,61 @@ def _release_matcher_lock(session: Session) -> None:
         log.warning("matcher_lock_release_failed", error=str(exc))
 
 
+def _run_matching_stage(
+    session: Session, *, fuzzy_threshold: int | None = None
+) -> dict[str, int | None]:
+    """Этап сопоставления — один и тот же в конце полного сбора и в `rematch`.
+
+    Порядок: пересчёт выводимых полей по названию → замена давно не виденных
+    членов кластеров их живыми двойниками → `match_products` → `revalidate_split`
+    → флаги подозрительной разницы цен.
+
+    Раньше `rematch` делал только часть этого (без замены устаревших строк и без
+    revalidate), и «прогнать сопоставление руками после выкладки» давало не тот
+    результат, что обычный сбор. Замок сопоставления берёт вызывающий.
+
+    Подготовительные шаги откатываются каждый к своей точке сохранения: сбой
+    одного не отменяет ни второй, ни само сопоставление (в сводке — None).
+    Сбой revalidate — ошибка этапа: после него в базе могут остаться пары,
+    которые текущие правила запрещают.
+    """
+    summary: dict[str, int | None] = {"refreshed": None, "relinked": None}
+    for key, prepare in (
+        ("refreshed", matcher.refresh_derived_fields),
+        ("relinked", matcher.relink_stale_members),
+    ):
+        try:
+            with session.begin_nested():
+                result = prepare(session)
+            summary[key] = result if isinstance(result, int) else len(result)
+        except Exception:
+            log.exception("matcher_preparation_failed", step=prepare.__name__)
+    if fuzzy_threshold is None:
+        summary["clusters"] = matcher.match_products(session)
+    else:
+        summary["clusters"] = matcher.match_products(session, fuzzy_threshold=fuzzy_threshold)
+    # Auto-revalidate: match_products линкует широко (bucket+fuzzy) и НЕ
+    # блокирует guard-конфликты в primary-проходе → бренд/состав/вариант/сила
+    # несоответствия пересоздаются каждый прогон. Чистим их сразу когерентным
+    # split'ом (корень «whack-a-mole» — раньше требовался ручной rematch).
+    try:
+        split_actions = matcher.revalidate_split(session)
+    except Exception as _re:
+        log.error("revalidate_split_failed", error=str(_re))
+        raise RuntimeError(f"identity revalidation failed: {type(_re).__name__}: {_re}") from _re
+    summary["revalidated"] = len(split_actions)
+    if split_actions:
+        log.info("revalidate_split", clusters=len(split_actions))
+    summary["flagged"] = None
+    try:
+        summary["flagged"] = matcher.flag_suspected_mismatches(session)
+        if summary["flagged"]:
+            log.info("price_mismatch_flags_updated", changed=summary["flagged"])
+    except Exception as _fe:
+        log.warning("flag_mismatches_failed", error=str(_fe))
+    return summary
+
+
 def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
     """Hold one checked-out connection's session lock without an idle transaction."""
     bind = SessionFactory.kw.get("bind")
@@ -5410,40 +5465,12 @@ def run_cmd(
                 if effective_mode == "watchlist":
                     linked = auto_match_watchlist(session)
                     log.info("watchlist_auto_matched", linked=linked)
-                # Поля, на которых стоит матчинг, пересчитываем по названию для
+                # Поля, на которых стоит матчинг, пересчитываются по названию для
                 # всего каталога, а не только для собранного сейчас сайта: иначе
                 # после правки нормализации сайты неделю сравниваются в разной
-                # записи. Затем отдаём место в кластере живым двойникам строк,
-                # которые сбор больше не видит.
-                # Оба шага — подготовка: сбой каждого откатывается к своей
-                # точке сохранения и не отменяет ни второй шаг, ни само
-                # сопоставление.
-                for _prepare in (matcher.refresh_derived_fields, matcher.relink_stale_members):
-                    try:
-                        with session.begin_nested():
-                            _prepare(session)
-                    except Exception:
-                        log.exception("matcher_preparation_failed", step=_prepare.__name__)
-                matcher.match_products(session)
-                # Auto-revalidate: match_products линкует широко (bucket+fuzzy) и НЕ
-                # блокирует guard-конфликты в primary-проходе → бренд/состав/вариант/сила
-                # несоответствия пересоздаются каждый прогон. Чистим их сразу когерентным
-                # split'ом (корень «whack-a-mole» — раньше требовался ручной rematch).
-                try:
-                    split_actions = matcher.revalidate_split(session)
-                    if split_actions:
-                        log.info("revalidate_split", clusters=len(split_actions))
-                except Exception as _re:
-                    log.error("revalidate_split_failed", error=str(_re))
-                    raise RuntimeError(
-                        f"identity revalidation failed: {type(_re).__name__}: {_re}"
-                    ) from _re
-                try:
-                    flagged = matcher.flag_suspected_mismatches(session)
-                    if flagged:
-                        log.info("price_mismatch_flags_updated", changed=flagged)
-                except Exception as _fe:
-                    log.warning("flag_mismatches_failed", error=str(_fe))
+                # записи. Весь порядок шагов — в _run_matching_stage; тот же этап
+                # выполняет команда `rematch`.
+                _run_matching_stage(session)
             finally:
                 if lock_taken:
                     _release_matcher_lock(session)
@@ -5955,6 +5982,9 @@ def _mail_tick_price_changes_to_admins(
         log.warning("intraday_price_alerts_no_recipient", run_id=run_id, events=len(events))
 
 
+REMATCH_RESET_CONFIRM_FLAG = "--i-accept-full-rebuild"
+
+
 @cli.command("rematch")
 @click.option(
     "--reset",
@@ -5983,19 +6013,68 @@ def _mail_tick_price_changes_to_admins(
 @click.option(
     "--dry-run", is_flag=True, default=False, help="С --revalidate/--relink-dead: только показать"
 )
+@click.option(
+    REMATCH_RESET_CONFIRM_FLAG,
+    "accept_full_rebuild",
+    is_flag=True,
+    default=False,
+    help="Обязателен вместе с --reset: подтверждает удаление всех автоматических пар",
+)
 def rematch_cmd(
-    reset: bool, threshold: int | None, revalidate: bool, relink_dead: bool, dry_run: bool
+    reset: bool,
+    threshold: int | None,
+    revalidate: bool,
+    relink_dead: bool,
+    dry_run: bool,
+    accept_full_rebuild: bool,
 ) -> None:
     """Перезапустить матчинг (без скрейпинга). Полезно после изменения нормализации.
 
-    С --reset: сбрасывает все авто-canonical_id и пересчитывает заново (78% churn!).
+    Без флагов выполняет тот же этап, что и конец сбора: пересчёт выводимых
+    полей, замена устаревших строк их живыми двойниками, сопоставление,
+    revalidate, флаги цен. Пары не сбрасывает: существующий кластер меняют
+    только замена устаревшей строки и revalidate. Это штатный шаг после
+    выкладки правок сопоставления. Пока идёт сбор, тик или другой rematch,
+    команда не работает — выходит с сообщением, чтобы не делить строки товаров
+    с записью прогона.
+
+    С --reset: сначала удаляет ВСЕ автоматические пары и собирает их заново.
+    На проде не запускать: меняются номера всех пар (а с ними пропадают
+    привязанные к паре остатки и цены поставщиков), и с нуля собирается не то
+    же самое (замер 2026-10-07: пару теряют 184 товара клиента из 4 099,
+    получают 48, подробности — docs/RUNBOOK.md). Без второго флага
+    --i-accept-full-rebuild команда откажет, ничего не тронув: так старый юнит
+    или привычка не сотрут пары молча.
     С --revalidate: ТОЧЕЧНО разбивает только те существующие кластеры, где cross-site
     пара конфликтует по текущим guard'ам (закрывает «whack-a-mole» старых матчей без
     churn полного --reset). Ручные матчи (is_manual=True) никогда не трогаются.
     """
     from sqlalchemy import update as sa_update
 
+    if dry_run and not (revalidate or relink_dead):
+        raise click.UsageError(
+            "--dry-run работает только с --revalidate или --relink-dead; "
+            "обычный rematch и --reset пишут в базу."
+        )
+    if accept_full_rebuild and not reset:
+        raise click.UsageError(f"{REMATCH_RESET_CONFIRM_FLAG} имеет смысл только вместе с --reset.")
+    if reset and not accept_full_rebuild:
+        raise click.UsageError(
+            "--reset удаляет все автоматические пары и собирает их заново: меняются "
+            "номера всех пар, часть пар с нуля не собирается. На проде не запускать. "
+            f"Для копии базы или стенда добавь {REMATCH_RESET_CONFIRM_FLAG}."
+        )
+
     Session = storage.make_session()
+    # Запись прогона и сопоставление правят одни и те же строки товаров. Сбор
+    # держит этот замок всю команду, а замок сопоставления — только на сам этап,
+    # так что без проверки rematch шёл бы одновременно с записью прогона.
+    if not dry_run and not _hold_scrape_lock_until_command_exit(Session, wait=False):
+        click.echo(
+            "rematch: skipped because the run lock is busy (scrape, tick or another "
+            "rematch); retry when it finishes."
+        )
+        return
     with Session() as session:
         lock_taken = _acquire_matcher_lock(session, wait=False)
         if not lock_taken:
@@ -6063,22 +6142,35 @@ def rematch_cmd(
                     session.commit()
                     click.echo(f"Reset {len(auto_match_ids)} auto-matches.")
 
-            # Заново выводим из названия name_normalized, dosage и pack_size
-            # (с учётом последних изменений нормализации)
-            click.echo("Re-normalizing derived fields…")
-            changed = matcher.refresh_derived_fields(session)
-            session.commit()
-            click.echo(f"Re-normalized: {changed} products changed.")
-
-            # Запуск матчинга
+            # Тот же этап, что в конце полного сбора (см. _run_matching_stage):
+            # пересчёт выводимых полей с учётом последних правок нормализации,
+            # замена устаревших строк, сопоставление, revalidate, флаги цен.
             thr = threshold if threshold is not None else matcher.FUZZY_THRESHOLD
-            click.echo(f"Running matcher (threshold={thr})…")
-            clusters = matcher.match_products(session, fuzzy_threshold=thr)
-            click.echo(f"Matcher done: {clusters} clusters created/updated.")
+            click.echo(f"Running matching stage (threshold={thr})…")
+            try:
+                summary = _run_matching_stage(session, fuzzy_threshold=threshold)
+            except RuntimeError as exc:
+                # ClickException печатает одну строку — стек оставляем в журнале.
+                log.exception("rematch_stage_failed")
+                raise click.ClickException(str(exc)) from exc
 
-            # Флагирование подозрительных расхождений цен
-            flagged = matcher.flag_suspected_mismatches(session)
-            click.echo(f"Price-spread flags updated: {flagged} matches changed.")
+            def _shown(value: int | None) -> str:
+                return "FAILED, see log" if value is None else str(value)
+
+            click.echo(f"Products re-normalized: {_shown(summary['refreshed'])}.")
+            click.echo(f"Stale members relinked: {_shown(summary['relinked'])}.")
+            click.echo(f"Matcher done: {summary['clusters']} clusters created/updated.")
+            click.echo(f"Revalidate: re-split {summary['revalidated']} clusters.")
+            click.echo(f"Price-spread flags changed: {_shown(summary['flagged'])}.")
+            # В сборе сбой подготовки не отменяет прогон; здесь команду запустили
+            # ради самого этапа, и молчаливый «успех» недельного юнита скрыл бы,
+            # что пересчёт полей или замена строк не выполнились.
+            failed = [key for key in ("refreshed", "relinked") if summary[key] is None]
+            if failed:
+                raise click.ClickException(
+                    "matching stage finished, but a preparation step failed: "
+                    + ", ".join(failed)
+                )
         finally:
             _release_matcher_lock(session)
 

@@ -1,0 +1,26 @@
+[Unit]
+Description=Pharmacy Monitor scheduled rematch (incremental, no reset)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=pm
+Group=pm
+WorkingDirectory=/opt/pharmacy-monitor
+EnvironmentFile=/etc/pharmacy-monitor/env
+# Без --reset. Команда выполняет тот же этап сопоставления, что и конец сбора
+# (main._run_matching_stage), и пары не сбрасывает. Это страховка на неделю,
+# когда ни один сбор до этапа не дошёл. Пока идёт сбор, тик или другой rematch,
+# команда выходит с «skipped» и кодом 0.
+#
+# До 2026-10-07 на проде здесь стоял `rematch --reset` (юнит положили руками
+# 2026-05-26, в Git его не было): каждый понедельник все автоматические пары
+# удалялись и собирались заново — менялись номера всех пар, и часть пар с нуля
+# не собиралась. tests/test_rematch_unit.py не даст вернуть флаг, а сама
+# команда без --i-accept-full-rebuild сброс не выполнит.
+ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor rematch
+# Этап занимает минуты. Без предела зависшая команда держала бы замок
+# сопоставления, и следующий сбор ждал бы его до собственного таймаута.
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal

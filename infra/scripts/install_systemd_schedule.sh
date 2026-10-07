@@ -27,7 +27,9 @@ for unit in \
   pharmacy-monitor-scrape@.service \
   pharmacy-monitor-scrape@.timer \
   pharmacy-monitor-watchlist.service \
-  pharmacy-monitor-watchlist.timer
+  pharmacy-monitor-watchlist.timer \
+  pharmacy-monitor-rematch.service \
+  pharmacy-monitor-rematch.timer
 do
   install -m 0644 "$source_dir/$unit" "$unit_dir/$unit"
 done
@@ -55,11 +57,23 @@ for override_path in "${overrides[@]}"; do
 done
 
 systemctl daemon-reload
+
+# Местный drop-in в /etc переживает установку юнита. Полный сброс пар из
+# недельного юнита пережить её не должен: проверяем то, что systemd реально
+# запустит, а не файл из Git.
+if systemctl show --property ExecStart --value pharmacy-monitor-rematch.service \
+    | grep -q -- '--reset'; then
+  echo "pharmacy-monitor-rematch.service still runs rematch --reset:" >&2
+  systemctl cat pharmacy-monitor-rematch.service >&2
+  exit 4
+fi
+
 for timer in \
   pharmacy-monitor-scrape@pharmonline.timer \
   pharmacy-monitor-scrape@aptekonline.timer \
   pharmacy-monitor-scrape@aloe.timer \
-  pharmacy-monitor-watchlist.timer
+  pharmacy-monitor-watchlist.timer \
+  pharmacy-monitor-rematch.timer
 do
   systemctl enable --now "$timer"
   systemctl restart "$timer"
@@ -69,4 +83,5 @@ systemctl list-timers --all \
   pharmacy-monitor-scrape@pharmonline.timer \
   pharmacy-monitor-scrape@aptekonline.timer \
   pharmacy-monitor-scrape@aloe.timer \
-  pharmacy-monitor-watchlist.timer
+  pharmacy-monitor-watchlist.timer \
+  pharmacy-monitor-rematch.timer
