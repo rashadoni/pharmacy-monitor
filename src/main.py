@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from src._time import utcnow
 from pathlib import Path
@@ -3466,6 +3466,55 @@ def _smoke_test_per_site_coverage(
     session.commit()
 
 
+class _PersistedEntries:
+    """Записи сбора, которые колбэк по категориям уже отдал в `persist_results`.
+
+    Запись — это объект `ScrapedProduct`, а не товар: один товар приходит из
+    нескольких категорий отдельными записями (у aptekonline в среднем 3,5 на
+    товар), и у каждой своё наблюдение. Поэтому сверка по объекту, а не по
+    `(site, external_id)`.
+
+    Объекты удерживаются: адрес освободившегося объекта Python отдаёт
+    следующему, а результат сайта при фатальном сбое заменяется целиком
+    (`site_fatal_result`) — без ссылки чужой товар мог бы получить адрес уже
+    записанного и остаться незаписанным.
+    """
+
+    def __init__(self) -> None:
+        self._by_id: dict[int, ScrapedProduct] = {}
+
+    def add(self, products: list[ScrapedProduct]) -> None:
+        for product in products:
+            self._by_id[id(product)] = product
+
+    def __contains__(self, product: object) -> bool:
+        return self._by_id.get(id(product)) is product
+
+
+def _split_persisted(
+    results: list[ScrapeResult], persisted: _PersistedEntries
+) -> tuple[list[ScrapeResult], int]:
+    """Что осталось записать финальному проходу и сколько записей уже записано.
+
+    Колбэк по категориям пишет товары по ходу сбора, поэтому финальному проходу
+    остаётся только то, что мимо колбэка прошло: категория, на которой колбэк
+    упал; товары категории, оборвавшейся на середине; товары запасного
+    ИИ-сборщика; промо. До 2026-10-07 он писал всё заново. Снимки цен от этого
+    не двоились (diff-only), а `offer_observations` — да: две строки на каждую
+    запись сбора, 3,1 млн лишних из 6,5 млн.
+
+    Исходные результаты не меняются — по ним дальше считаются качество прогона
+    и разбивка по категориям.
+    """
+    pending: list[ScrapeResult] = []
+    already_persisted = 0
+    for result in results:
+        remaining = [product for product in result.products if product not in persisted]
+        already_persisted += len(result.products) - len(remaining)
+        pending.append(replace(result, products=remaining))
+    return pending, already_persisted
+
+
 _PERSIST_CHUNK = 200
 """Размер чанка для pre-fetch / flush / commit. Для SSH-туннеля к prod Postgres
 важно держать INSERT'ы небольшими — на 1000-row INSERT с RETURNING туннель
@@ -5112,6 +5161,7 @@ def run_cmd(
         )
 
         trust_context = None
+        persisted_by_category = _PersistedEntries()
         try:
             quality_sites: list[str] = list(sites)
             quality_baselines: dict[str, int | None] = {}
@@ -5172,11 +5222,15 @@ def run_cmd(
                 on_category = None
                 if not use_legacy_identity_bridge:
                     def _persist_category(site_name, slug, cat_products):
+                        batch = list(cat_products)
                         persist_results(
                             session,
                             run,
-                            [ScrapeResult(site=site_name, products=list(cat_products))],
+                            [ScrapeResult(site=site_name, products=batch)],
                         )
+                        # Только после успешной записи: категорию, на которой
+                        # запись упала, целиком допишет финальный проход.
+                        persisted_by_category.add(batch)
 
                     on_category = _persist_category
 
@@ -5274,7 +5328,8 @@ def run_cmd(
                         quality["catalog_verification_reason_full"] = full_reason
                         run.run_quality = quality
                         raise
-            count = persist_results(session, run, results)
+            pending_results, already_persisted = _split_persisted(results, persisted_by_category)
+            count = already_persisted + persist_results(session, run, pending_results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
             run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
