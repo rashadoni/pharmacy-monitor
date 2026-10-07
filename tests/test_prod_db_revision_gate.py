@@ -104,7 +104,9 @@ SCHEMA_OWNER = {"deploy.yml"}
 # сообщении записью не считалось.
 CLI_COMMANDS = "|".join(sorted(map(re.escape, cli.commands), key=len, reverse=True))
 WRITER = re.compile(
-    rf"pharmacy-monitor[\"']?[ \t]+[\"']?(?:\$|(?:{CLI_COMMANDS})\b)"
+    # сама программа, а не каталог `/opt/pharmacy-monitor`; дальше подкоманда,
+    # переменная или параметр группы (`--log-level INFO init-db`)
+    rf"(?<!/opt/)(?<!/etc/)pharmacy-monitor[\"']?[ \t]+[\"']?(?:\$|-|(?:{CLI_COMMANDS})\b)"
     r"|-m[ \t]+src\.main\b"
     # без границы слова слева: #35 зовёт миграцию через функцию `staged_alembic`
     r"|alembic\b[^\n]*?[ \t](?:upgrade|downgrade|stamp)\b"
@@ -137,6 +139,9 @@ WRITES = [
     "python scripts/full_rematch.py --i-accept-full-rebuild",
     '"$runtime_dir/.venv/bin/pharmacy-monitor" run --site aloe',
     'pharmacy-monitor "$command" --site aloe',
+    "/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor --log-level INFO init-db",
+    # закомментированная строка с `\\` на конце следующую не прячет: bash её исполнит
+    "# PHARMONLINE_USE_DDP=0 \\\n.venv/bin/pharmacy-monitor rematch",
     '/opt/pharmacy-monitor/.venv/bin/python -m src.main "$command"',
     # так миграцию зовёт deploy.yml в #35
     'if staged_alembic upgrade head 2>&1 | tee "$log"; then',
@@ -163,6 +168,8 @@ READS = [
     "name: Pharmacy Monitor CI",
     "- name: Restart pharmacy-monitor api",
     'echo "pharmacy-monitor is healthy"',
+    "find /opt/pharmacy-monitor -maxdepth 1 -name '.codex-*'",
+    "ls /opt/pharmacy-monitor $work_dir",
     'grep -- "--apply" scripts/reconcile_pharmonline_public_api_identities.py',
     'gh run list --workflow ci-pipeline.yml --commit "$GITHUB_SHA" --status success',
     "scripts/preflight_pharmonline_public_api.py \\\n"
@@ -174,9 +181,13 @@ CAPTION = re.compile(r"\s*(?:#|(?:-\s+)?(?:name|description):)")
 
 
 def _code(workflow_text: str) -> str:
-    """Текст workflow без комментариев и подписей, команды склеены из строк с `\\`."""
-    joined = re.sub(r"\\\n[ \t]*", " ", workflow_text)
-    return "\n".join(line for line in joined.splitlines() if not CAPTION.match(line))
+    """Текст workflow без комментариев и подписей, команды склеены из строк с `\\`.
+
+    Сначала убираем комментарии, потом склеиваем: `\\` в конце комментария строку
+    не продолжает, и команду под ним bash исполнит.
+    """
+    code = "\n".join(line for line in workflow_text.splitlines() if not CAPTION.match(line))
+    return re.sub(r"\\\n[ \t]*", " ", code)
 
 
 def _writers(workflow_text: str) -> list[str]:
@@ -597,6 +608,14 @@ class Sandbox:
     def events(self) -> list[str]:
         return [json.loads(line) for line in self.events_file.read_text().splitlines()]
 
+    def work_dir(self) -> Path:
+        """Черновой каталог шага на «сервере» — куда его записал сам шаг."""
+        for line in self.github_env.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key == "REMOTE_WORK_DIR":
+                return self.server / value.lstrip("/")
+        raise AssertionError("шаг не записал REMOTE_WORK_DIR")
+
     def tables(self) -> set[str]:
         engine = create_engine(f"sqlite:///{self.database}")
         try:
@@ -707,6 +726,11 @@ def test_refuses_before_any_write_when_the_db_is_not_at_the_commit_head(
         retained = sandbox.run_step(RECOVER, RETAIN, condition=RETAIN_CONDITION)
         assert retained.returncode == 0, _log(retained)
         assert "recovery stopped before the production backup" in retained.stderr
+        # А отметка «сверено» без бэкапа — уже ошибка, и шаг её не глотает.
+        (sandbox.work_dir() / "reconciliation-and-catalog-recovery-verified").touch()
+        anomaly = sandbox.run_step(RECOVER, RETAIN, condition=RETAIN_CONDITION)
+        assert anomaly.returncode != 0, _log(anomaly)
+        assert "marked verified but its production backup is missing" in anomaly.stderr
 
 
 def test_recovery_refuses_a_commit_with_two_migration_heads(tmp_path: Path):
