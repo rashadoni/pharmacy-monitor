@@ -26,7 +26,11 @@
 # server (on the Mac: Keychain item pharmacy-monitor-gpg).
 #   gpg --batch --yes --passphrase-fd 0 -d backup.sql.gz.gpg | gunzip > backup.sql
 #   psql -h <host> -U pm pharmacy_monitor < backup.sql
-# (gpg waits for the passphrase on stdin: type it and press Enter.)
+# gpg waits for the passphrase on stdin. Typed by hand it is echoed; on the Mac
+# feed it from the Keychain instead:
+#   security find-generic-password -a pm -s pharmacy-monitor-gpg -w \
+#     | gpg --batch --yes --passphrase-fd 0 -d backup.sql.gz.gpg | gunzip > backup.sql
+# Restoring such a dump on the Contabo server has never been rehearsed.
 
 set -euo pipefail
 
@@ -68,6 +72,14 @@ case "${1:-}" in
         if [[ -z "$target" ]]; then
             echo "ERROR: no backups found on prod in $REMOTE_DIR" >&2
             exit 1
+        fi
+        # The nightly job has already died silently for a month once. "Newest"
+        # proves nothing by itself, so say when the newest dump is old.
+        dump_date=$(basename "$target" | sed -nE 's/^pharmacy-monitor-([0-9]{4}-[0-9]{2}-[0-9]{2})T.*/\1/p')
+        cutoff=$(date -u -d '2 days ago' +%F 2>/dev/null || date -u -v-2d +%F)
+        if [[ -n "$dump_date" && "$dump_date" < "$cutoff" ]]; then
+            echo "WARN: newest dump on prod is from $dump_date — the nightly backup looks broken." >&2
+            echo "      check: systemctl show -p Result pharmacy-monitor-backup.service" >&2
         fi
         ;;
     *)

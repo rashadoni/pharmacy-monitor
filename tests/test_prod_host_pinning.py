@@ -9,6 +9,7 @@
 Покрываем:
 - каждый workflow, который ходит на прод, пишет в known_hosts тот же ключ, что
   лежит в `infra/prod_known_hosts`
+- отпечатки, с которыми workflow сверяют ключ, посчитаны от него же
 - скрипты, которые ходят на прод, требуют прошитый ключ
 - в исполняемых каталогах никто не доверяет ключу, полученному из сети
 - адрес удалённого сервера не возвращается в исполняемые каталоги
@@ -22,6 +23,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
 from pathlib import Path
 
@@ -48,6 +51,13 @@ def _pinned_line() -> str:
     return lines[0]
 
 
+def _fingerprint(known_hosts_line: str) -> str:
+    """Отпечаток в том виде, в каком его печатает `ssh-keygen -lf … -E sha256`."""
+    blob = base64.b64decode(known_hosts_line.split()[2])
+    digest = base64.b64encode(hashlib.sha256(blob).digest()).decode()
+    return "SHA256:" + digest.rstrip("=")
+
+
 def _executable_files() -> list[Path]:
     return [
         path
@@ -72,6 +82,27 @@ def test_workflows_reaching_prod_pin_the_same_host_key():
         "host key не прошит, отличается от infra/prod_known_hosts или шаг записан иначе, "
         f"чем в остальных workflow (printf … > ~/.ssh/known_hosts): {unpinned}"
     )
+
+
+def test_fingerprint_literals_match_the_pinned_key():
+    # Большинство workflow после записи ключа сверяют его отпечаток с литералом.
+    # Сменится ключ сервера, а литерал забудут — тесты выше останутся зелёными,
+    # а каждый workflow упадёт на подготовке SSH, причём уже во время аварии.
+    expected = _fingerprint(_pinned_line())
+    literal = re.compile(r"SHA256:[A-Za-z0-9+/]+")
+
+    files = [ROOT / "infra" / "prod_known_hosts"]
+    files += [
+        path
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
+        if PROD_IP in path.read_text()
+    ]
+    stale = {
+        str(path.relative_to(ROOT)): sorted(set(literal.findall(path.read_text())) - {expected})
+        for path in files
+    }
+    stale = {name: found for name, found in stale.items() if found}
+    assert not stale, f"отпечаток не от прошитого ключа (ожидается {expected}): {stale}"
 
 
 def test_scripts_reaching_prod_require_the_pinned_key():

@@ -3,8 +3,11 @@
 Operational manual для VPS-инсталляции. Используется когда что-то ломается.
 
 > **Боевой сервер с 2026-09-03 — Contabo `13.140.186.143`
-> (`vmi3552946.contaboserver.net`).** Прежний Hetzner-сервер удалён; команды
-> ниже переведены на новый адрес 2026-10-07. Host key сервера прошит в
+> (`vmi3552946.contaboserver.net`).** Прежний Hetzner-сервер удалён; адрес в
+> командах ниже заменён 2026-10-07. Сами разделы тогда целиком не
+> перепроверялись: часть из них описывает ранние версии системы (SQLite,
+> пользователь `pharmacy`, выкладка через `git pull`) и помечена там же, где
+> встречается. Host key сервера прошит в
 > `infra/prod_known_hosts`. На машине, которая сервер ещё не знает, сначала
 > добавить этот ключ (из корня репозитория):
 > `grep -v '^#' infra/prod_known_hosts >> ~/.ssh/known_hosts` — и только потом
@@ -351,7 +354,11 @@ bash infra/local/fetch-backup.sh --list   # что лежит на сервер�
 bash infra/local/fetch-backup.sh          # забрать свежий в ~/Backups/pharmacy/
 ```
 
-Запускать с машины, чей SSH-ключ принимает сервер (сейчас это dev-бокс).
+Запускать с машины, чей SSH-ключ принимает сервер (сейчас это dev-бокс). Он
+тоже стоит у Contabo: копия там переживёт потерю машины, но не аккаунта —
+настоящая внешняя копия должна лежать ещё где-то. Скрипт предупредит, если
+самый свежий дамп на сервере старше двух суток: ночной бэкап уже однажды месяц
+молча падал.
 Дамп зашифрован `BACKUP_GPG_PASSPHRASE` из `/etc/pharmacy-monitor/env`: без
 копии этого пароля вне сервера забранный файл не расшифровать. Проверять
 расшифровкой до конца, а не наличием файла (команда молча ждёт пароль на stdin:
@@ -359,6 +366,18 @@ bash infra/local/fetch-backup.sh          # забрать свежий в ~/Bac
 
 ```bash
 gpg --batch --yes --passphrase-fd 0 -d <файл>.sql.gz.gpg | gunzip -t && echo "дамп цел"
+```
+
+Проверка паролем, прочитанным с сервера, доказывает только целость дампа. Что
+пароль есть и вне сервера, она не доказывает — а на 2026-10-07 это не
+установлено.
+
+Восстановление (ни разу не проверялось на этом сервере — первый раз делать на
+пустой базе, а не поверх боевой):
+
+```bash
+gpg --batch --yes --passphrase-fd 0 -d <файл>.sql.gz.gpg | gunzip > restore.sql
+psql "postgresql://pm:<пароль>@localhost:5432/pharmacy_monitor" < restore.sql
 ```
 
 ---
@@ -397,6 +416,11 @@ journalctl -u grafana-server -n 50               # логи Grafana
 
 ### Полная потеря VPS
 
+> ⚠️ Шаги ниже — времён SQLite (помечено 2026-10-07): `.sqlite.gz` больше не
+> существует, «восстановить, см. выше» ведёт в устаревший раздел. Сейчас база —
+> Postgres, дамп лежит только на самом сервере; что есть и чего нет вне его —
+> «Копия бэкапа вне сервера».
+
 1. Поднять новый VPS
 2. Запустить `provision_vps.sh` (см. Начальная настройка)
 3. Если есть бэкап с предыдущего сервера (S3 / отдельный диск):
@@ -406,6 +430,8 @@ journalctl -u grafana-server -n 50               # логи Grafana
 **Recommendation:** настроить off-site бэкап (S3, Backblaze B2, dropbox).
 
 ### БД повреждена
+
+> ⚠️ Устарело (помечено 2026-10-07): команда для SQLite, база давно Postgres.
 
 ```bash
 sudo -u pharmacy sqlite3 /opt/pharmacy-monitor/data/db.sqlite "PRAGMA integrity_check;"
@@ -439,6 +465,12 @@ sudo find /opt/pharmacy-monitor/data/backups/ -mtime +90 -delete
 ---
 
 ## 🔄 Обновления / деплой нового кода
+
+> ⚠️ Устарело (помечено 2026-10-07): прод — не git-чекаут, а rsync-снимок, и
+> сервисы называются иначе (`pharmacy-monitor-api`,
+> `pharmacy-monitor-frontend`). Выкладка — workflow `deploy.yml`
+> (`gh workflow run deploy.yml --ref main -f apply_migrations=false`) после
+> зелёного CI.
 
 ```bash
 # На VPS
@@ -687,7 +719,9 @@ ssh root@13.140.186.143 'systemctl disable --now pharmacy-monitor-intraday.timer
 ### Postgres MCP — SSH tunnel auto-start
 
 > ⚠️ **Устарело с 2026-09-03 (помечено 2026-10-07).** Агент на Маке смотрит на
-> удалённый Hetzner-сервер. Из команд ниже нужна одна — `bootout` (выгрузить);
+> удалённый Hetzner-сервер. Из команд ниже нужна одна — `bootout` (выгрузить),
+> и сразу за ней `rm ~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist`:
+> без удаления файла агент загрузится снова при следующем входе в систему.
 > `bootstrap` не выполнять. Копия plist в репозитории обезврежена, см.
 > `infra/local/README.md`.
 

@@ -19,13 +19,15 @@
 # нацелен на Hetzner-сервер, удалённый в сентябре 2026, а он отправляет на
 # PROD_HOST вводимые ключи. Теперь адрес задаётся явно, и соединение принимается
 # только с host key из infra/prod_known_hosts.
-# Перед запуском учесть, что блоки писались под май 2026 (скрипт по-прежнему
-# предлагает все пять — на устаревшие отвечать «нет»):
+# Блоки писались под май 2026:
 #   SMTP, Sentry      — уже настроены на проде;
-#   ScraperAPI Hobby  — НЕ запускать: aptekonline давно собирается на проде
-#                       через Decodo, блок перепишет SCRAPER_API_SITES;
-#   GitHub remote     — НЕ запускать: репозиторий давно на GitHub, а прямой
-#                       push в main запрещён (docs/DELIVERY-ARCHITECTURE.md).
+#   ScraperAPI Hobby  — снят, main() его не вызывает: aptekonline давно
+#                       собирается на проде через Decodo, блок переписал бы
+#                       SCRAPER_API_SITES;
+#   GitHub remote     — снят, main() его не вызывает: репозиторий давно на
+#                       GitHub, а прямой push в main запрещён
+#                       (docs/DELIVERY-ARCHITECTURE.md).
+# Функции обоих снятых блоков оставлены в файле как история.
 
 set -e
 trap 'echo "Прерывание. Существующая конфигурация на проде не изменена." ; exit 130' INT
@@ -255,14 +257,15 @@ main() {
     echo "Pharmacy Monitor — interactive integration setup"
     echo "Production target: root@$PROD_HOST (ssh key: $SSH_KEY)"
     echo
-    echo "Скрипт пройдёт по 5 блокам. Каждый можно пропустить нажав 'n'."
+    echo "Скрипт пройдёт по 3 блокам. Каждый можно пропустить нажав 'n'."
     echo
 
     configure_smtp
     configure_telegram
     configure_sentry
-    configure_scraperapi
-    configure_github
+    # configure_scraperapi и configure_github сняты 2026-10-07 — см. шапку.
+    echo
+    echo "Блоки «ScraperAPI Hobby» и «GitHub remote» сняты: они переписали бы рабочие настройки."
 
     section "Готово"
     echo "Текущая конфигурация прода (заполненные ключи):"
