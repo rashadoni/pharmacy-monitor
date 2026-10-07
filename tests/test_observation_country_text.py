@@ -21,12 +21,20 @@ from src import storage
 from src._time import utcnow
 from src.main import persist_results
 from src.product_observations import apply_product_observation
-from src.product_policy import COUNTRY_INVALID
+from src.product_policy import COUNTRY_INVALID, COUNTRY_RESOLVED, country_resolution
 from src.scrapers.base import ScrapedProduct, ScrapeResult
 
 _PRODUCT_COLUMN = storage.Product.__table__.c.manufacturer_country_raw
 _OBSERVATION_COLUMN = storage.OfferObservation.__table__.c.country_raw
 _LONG_COUNTRY = "Türkiyə, Almaniya, Fransa, İtaliya, İspaniya; " * 12
+
+
+def _without_postgresql(reason: str) -> None:
+    """Локально — пропуск. В CI пропуск молча убрал бы единственный вариант,
+    в котором база отказывает в записи."""
+    if os.environ.get("CI"):
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 @pytest.fixture(params=["sqlite", "postgresql"])
@@ -36,10 +44,10 @@ def db_session(request, db_session):
         return
     database_url = os.environ.get("DATABASE_URL", "")
     if not database_url.startswith("postgresql"):
-        pytest.skip("PostgreSQL DATABASE_URL is required")
+        _without_postgresql("PostgreSQL DATABASE_URL is required")
     # `src.main` подгружает `.env`: тест не создаёт схемы в базе, которая не тестовая.
     if not (make_url(database_url).database or "").endswith("_test"):
-        pytest.skip("PostgreSQL DATABASE_URL must point at a *_test database")
+        _without_postgresql("PostgreSQL DATABASE_URL must point at a *_test database")
     # Своя схема на тест: общая база CI уже размечена миграциями.
     schema = f"country_text_{uuid4().hex[:12]}"
     admin = create_engine(database_url, isolation_level="AUTOCOMMIT")
@@ -148,7 +156,8 @@ def test_country_is_resolved_from_the_whole_text_not_from_the_stored_part():
         product, _scraped("x", two_countries), run_id=1, observed_at=utcnow()
     )
 
-    assert observation.country_raw.strip() == "Türkiyə"
+    # Сохранённая часть сама по себе — страна: иначе тест ничего не различает.
+    assert country_resolution(observation.country_raw) == ("tr", COUNTRY_RESOLVED)
     assert (observation.country_code, observation.country_resolution_status) == (
         None,
         COUNTRY_INVALID,
