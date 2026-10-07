@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from functools import lru_cache
 from typing import Sequence
 
 import structlog
@@ -28,10 +29,14 @@ from src.brand_catalog import is_brand_blacklisted
 from src.brand_resolver import brands_conflict, is_commodity_name
 from src.match_actions import is_rejected
 from src.normalize import (
+    ROUTE_CLASSES,
     extract_form,
     extract_pack_size,
+    expand_dose_lists,
     extract_total_volume,
+    fold_spelling,
     normalize_name,
+    normalize_numbers,
     pack_unit_count,
     strip_accents,
 )
@@ -160,6 +165,21 @@ def _has_conflicting_series_number(name_a: str, name_b: str) -> bool:
 
 
 # ── Форма выпуска ────────────────────────────────────────────────────────────
+# Тара и её содержимое — не разные формы: один сайт пишет «(Ampulalar)», другой
+# «(oral məhlul)» про те же ампулы; «(Saşe)» на одном — это «(toz)» на другом.
+_COMPATIBLE_FORMS: frozenset[frozenset[str]] = frozenset(
+    frozenset(pair)
+    for pair in (
+        ("ampoule", "solution"),
+        ("ampoule", "powder"),
+        ("sachet", "powder"),
+        ("sachet", "solution"),
+        ("sachet", "syrup"),
+        ("sachet", "gel"),
+    )
+)
+
+
 def _has_conflicting_form(name_raw_a: str, name_raw_b: str) -> bool:
     """True если формы выпуска явно конфликтуют (drops ≠ spray, cream ≠ ointment).
 
@@ -171,7 +191,28 @@ def _has_conflicting_form(name_raw_a: str, name_raw_b: str) -> bool:
     form_b = extract_form(name_raw_b)
     if form_a is None or form_b is None:
         return False  # форма неизвестна — не блокируем
-    return form_a != form_b
+    return form_a != form_b and frozenset((form_a, form_b)) not in _COMPATIBLE_FORMS
+
+
+# ── Путь введения (2026-10-07) ───────────────────────────────────────────────
+# «X (göz damcısı)» и «X (qulaq damcısı)» — разные товары одной линейки, хотя
+# форма у обоих «капли». Раньше их разводили слова «goz»/«qulaq», остававшиеся в
+# нормализованном имени; теперь пояснения в скобках из имени вырезаются, и путь
+# введения сверяется явно, по исходному названию — по той же таблице слов
+# (normalize.ROUTE_CLASSES), по которой они вырезаются.
+_ROUTE_TOKEN_RE = re.compile(r"[a-z]+")
+
+
+@lru_cache(maxsize=200_000)
+def _routes(raw_name: str) -> frozenset[str]:
+    tokens = _ROUTE_TOKEN_RE.findall(strip_accents(raw_name).lower())
+    return frozenset(ROUTE_CLASSES[t] for t in tokens if t in ROUTE_CLASSES)
+
+
+def _has_conflicting_route(name_raw_a: str, name_raw_b: str) -> bool:
+    """True если путь введения назван у обоих и ни один не совпадает."""
+    ra, rb = _routes(name_raw_a or ""), _routes(name_raw_b or "")
+    return bool(ra) and bool(rb) and ra.isdisjoint(rb)
 
 
 # ── Диспропорция длины (stub vs полное имя) ──────────────────────────────────
@@ -193,21 +234,46 @@ def _has_conflicting_form(name_raw_a: str, name_raw_b: str) -> bool:
 #   «mezim forte 3500» vs «mezim forte 3500» → OK (одинаковые)
 #   «paracetamol» vs «paracetamol» → OK (нет чисел)
 _MULTI_DIGIT_RE = re.compile(r"\b(\d{2,})\b")
+# Количество в упаковке — не «количество вещества»: N20, №20, 20 əd.
+_QTY_PACK_RE = re.compile(
+    r"№\s*\d+|\b(?:n|no\.?)\s*\d+\b|\b\d{1,3}\s*(?:eded|ed|dest|sase|sashe|st|saise)\b",
+    re.IGNORECASE,
+)
+_QTY_NUMBER_RE = re.compile(r"(?<![\d.,])\d{2,}(?![\d.,])")
 
 
-def _has_conflicting_orphan_number(name_a: str, name_b: str) -> bool:
+def _quantity_numbers(raw_name: str) -> frozenset[str]:
+    """Целые 2+-значные числа исходного названия, кроме количества в упаковке."""
+    low = normalize_numbers(strip_accents(raw_name or "").lower())
+    low = _QTY_PACK_RE.sub(" ", _THOUSAND_SPACE_RE.sub(r"\1\2", low))
+    return frozenset(_QTY_NUMBER_RE.findall(low))
+
+
+def _has_conflicting_orphan_number(
+    name_a: str, name_b: str, raw_a: str = "", raw_b: str = ""
+) -> bool:
     """True если в name_normalized осталось незачищенное 2+-значное число,
     и оно разное (или есть только у одного).
 
     Защищает от ложных матчей типа Mezim forte 10000 İU ↔ Mezim forte 3500 ED:
     первый нормализуется в «mezim forte» (İU → strip_accents → IU, dosage срипнут),
     второй в «mezim forte 3500 ed» (ED не был в _DOSAGE_RE → осталось).
+
+    С исходными названиями (`raw_a`, `raw_b`) число, которого нет в нормализованном
+    имени другой стороны, не считается расхождением, если оно стоит в её исходном
+    названии с единицей: «Aspirin 500 N20» и «Aspirin 500 mq № 20» — один товар,
+    просто единица записана только на одном сайте. Количество в упаковке при этом
+    не учитывается: «30» из «Brand 30 N10» не совпадает с «№30».
     """
     nums_a = frozenset(m.group(1) for m in _MULTI_DIGIT_RE.finditer(name_a))
     nums_b = frozenset(m.group(1) for m in _MULTI_DIGIT_RE.finditer(name_b))
     if nums_a == nums_b:  # {} vs {} или {3500} vs {3500}
         return False
-    return True  # разные числа или одно пустое → блокируем
+    if not raw_a and not raw_b:
+        return True  # разные числа или одно пустое → блокируем
+    return bool(nums_a - nums_b - _quantity_numbers(raw_b)) or bool(
+        nums_b - nums_a - _quantity_numbers(raw_a)
+    )
 
 
 _DISPARITY_MAX_RATIO = 0.40
@@ -324,16 +390,30 @@ def _has_extreme_length_disparity(name_a: str, name_b: str, brand_hint: str = ""
     return True  # короткое — brand/generic stub → блокируем
 
 
+def _modifier_tokens(name: str) -> frozenset[str]:
+    """Слова названия, включая части слов через дефис: модификатор пишут и так
+    («Lopril-H», «Smektit-Plus», «Klion-D», «Neo-Terjinan»). Одиночная буква в
+    начале составного слова или всего названия модификатором не считается:
+    «D-3», «D-pantenol», «D-Kolerol», «D colerol» — это название, а не «D» при нём."""
+    tokens: set[str] = set()
+    for position, token in enumerate(name.split()):
+        parts = [part for part in token.split("-") if part]
+        if len(parts) > 1 and len(parts[0]) == 1:
+            parts = parts[1:]
+        elif position == 0 and len(token) == 1:
+            continue  # то же название через пробел: «D colerol»
+        tokens.update(parts)
+    return frozenset(tokens)
+
+
 def _has_conflicting_modifier(name_a: str, name_b: str) -> bool:
     """True если одно название содержит фарма-модификатор, а другое — нет.
 
     Это означает разные препараты (разный состав/формула) → матчинг запрещён.
     Работает на уже нормализованных именах (lowercase, без дозировки/упаковки).
     """
-    tokens_a = frozenset(name_a.split())
-    tokens_b = frozenset(name_b.split())
-    mod_a = tokens_a & _PHARMA_MODIFIERS
-    mod_b = tokens_b & _PHARMA_MODIFIERS
+    mod_a = _modifier_tokens(name_a) & _PHARMA_MODIFIERS
+    mod_b = _modifier_tokens(name_b) & _PHARMA_MODIFIERS
     # Если модификаторы у обоих одинаковы — ок (оба H, оба SR и т.д.)
     # Если у одного есть модификатор, а у другого нет — разные препараты
     return mod_a != mod_b
@@ -404,6 +484,42 @@ _HARD_DISTINCT_TOKENS: frozenset[str] = frozenset({"toxumu", "toxum"})
 # D3 → "d3", 2X → "2x") — значащие идентификаторы продуктов, даже если короткие.
 
 
+_fold_token = lru_cache(maxsize=200_000)(fold_spelling)
+
+
+def _spelling_distinct(tokens: frozenset[str], other: frozenset[str]) -> set[str]:
+    """Токены из `tokens`, которых нет в `other` ни буквально, ни в другом написании."""
+    missing = tokens - other
+    if not missing:
+        return set()
+    # По словам свёрнутого написания: «sitramon-p» — это «sitramon» и «p»,
+    # «amoksi-denk» — «amoksi» и «denk».
+    other_words = {word for t in other for word in _fold_token(t).split()}
+    return {t for t in missing if not set(_fold_token(t).split()) <= other_words}
+
+
+def _half_matched_compound(tokens: frozenset[str], other: frozenset[str]) -> bool:
+    """Слово через дефис, от которого у другой стороны нет буквенного кода.
+
+    Код — одна-две буквы («-H», «-E», «-SR»): так пишут вариант состава или
+    высвобождения. Длинный остаток — производитель или латинское написание в
+    скобках («Sefazolin-Akos», «Kolxikum-Dispert (Colchicum-Dispert)»), число —
+    доза («Azirag-500»): первое допустимо как подробность одной стороны, второе
+    сверяет проверка чисел.
+    """
+    compounds = [t for t in tokens - other if "-" in t.strip("-")]
+    if not compounds:
+        return False
+    other_words = {word for t in other for word in _fold_token(t).split()}
+    for token in compounds:
+        words = set(_fold_token(token).split())
+        if words & other_words and any(
+            word.isalpha() and len(word) <= 2 for word in words - other_words
+        ):
+            return True
+    return False
+
+
 def _is_significant_variant_token(t: str) -> bool:
     """True если токен значащий: длина ≥ 3, или длина ≥ 2 и содержит и букву и цифру.
 
@@ -411,6 +527,10 @@ def _is_significant_variant_token(t: str) -> bool:
                       "d3" (2, буква+цифра), "2x" (2, буква+цифра).
     Примеры незначащих: "b" (1), "h" (1), "50" (только цифры), "ml" (только буквы, 2).
     """
+    if t.isdigit():
+        # Числа сверяют orphan-/series-/strength-guard'ы по своим правилам; здесь
+        # «500» из «Aspirin 500 N20» против «(Kapsula)» дало бы ложный конфликт.
+        return False
     if len(t) >= _MIN_VARIANT_TOKEN_LEN:
         return True
     # Короткие (2 символа) алфавитно-цифровые: витамины B12/D3, формулы 2X/C3 и т.д.
@@ -444,16 +564,25 @@ def _has_conflicting_variant_tokens(name_a: str, name_b: str) -> bool:
     # разные товары. Блокируем даже без встречного уникального токена.
     if (tokens_a & _HARD_DISTINCT_TOKENS) != (tokens_b & _HARD_DISTINCT_TOKENS):
         return True
-    unique_a = {t for t in tokens_a - tokens_b if _is_significant_variant_token(t)}
-    unique_b = {t for t in tokens_b - tokens_a if _is_significant_variant_token(t)}
+    # Буквенный код через дефис — часть названия: «Lopril-H» и «Lopril»,
+    # «Qlükoza-E» и «Qlükoza», «Bivoksa-D» и «Bivoksa» — разные товары.
+    # «Sitramon-P» и «Sitramon P» — один: код есть у другой стороны.
+    if _half_matched_compound(tokens_a, tokens_b) or _half_matched_compound(tokens_b, tokens_a):
+        return True
+    # Токен, который у другой стороны есть в другом написании (kreon/creon,
+    # orniksil/ornicsil, «azirag-»/«aziraq»), уникальным не считается.
+    only_a = _spelling_distinct(tokens_a, tokens_b)
+    only_b = _spelling_distinct(tokens_b, tokens_a)
+    unique_a = {t for t in only_a if _is_significant_variant_token(t)}
+    unique_b = {t for t in only_b if _is_significant_variant_token(t)}
     if unique_a and unique_b:
         return True
     # 2-буквенные all-alpha фармкоды: SK/QK/GK/GC и подобные.
     # Срабатывает только когда у ОБОИХ имён есть разный 2-буквенный суффикс —
     # это чёткий сигнал разных формул. Одиночный 2-буквенный токен у одного
     # из имён пропускаем (неполные данные).
-    alpha2_a = {t for t in tokens_a - tokens_b if len(t) == 2 and t.isalpha()}
-    alpha2_b = {t for t in tokens_b - tokens_a if len(t) == 2 and t.isalpha()}
+    alpha2_a = {t for t in only_a if len(t) == 2 and t.isalpha()}
+    alpha2_b = {t for t in only_b if len(t) == 2 and t.isalpha()}
     return bool(alpha2_a) and bool(alpha2_b)
 
 
@@ -476,7 +605,7 @@ _VA_AZ_PACK_UNIT_RE = re.compile(r"\b\d+\s*(?:eded|ed|dest|sase|sashe|st|saise)\
 _VA_RANGE_RE = re.compile(r"\d+\s*-\s*\d+")
 _VA_AGE_RE = re.compile(r"\b\d+\s*(?:ay(?:liq|indan|inda|dan)?|il|yas(?:inda)?)\b", re.I)
 _VA_NUM_UNIT_RE = re.compile(
-    r"\b\d+[.,]?\d*\s*(?:mg|ml|mq|mkg|mcg|kg|kq|qr|g|q|l|iu|tv|ed|bv|mln|million)\b",
+    r"\b\d+[.,]?\d*\s*(?:mg|ml|mq|mkg|mkq|mcg|kg|kq|qr|g|q|l|iu|tv|ed|bv|mln|million)\b",
     re.I,
 )
 _VA_MULTIDIGIT_RE = re.compile(r"\b\d{2,}\b")
@@ -486,7 +615,7 @@ _VA_UNIT_LETTERS: frozenset[str] = frozenset({"q", "g", "l"})  # грамм(AZ)/
 # 2/3/4 mg). pharm пишет «2 mq» (доза, иначе ушла бы в _VA_NUM_UNIT), aptek «4 N30»
 # (голая цифра) → сводим в общий atom-space. Lookbehind (?<![.\d]) исключает
 # дробные/многозначные (2.5 mg → не «5», 500 mg → не «0»).
-_VA_SINGLE_MASS_RE = re.compile(r"(?<![.\d])([1-9])\s*(?:mg|mq|mcg|mkg)\b", re.I)
+_VA_SINGLE_MASS_RE = re.compile(r"(?<![.\d])([1-9])\s*(?:mg|mq|mcg|mkg|mkq)\b", re.I)
 
 
 def _variant_atoms(raw_name: str) -> frozenset[str]:
@@ -868,6 +997,23 @@ def _significant_name_tokens(name_norm: str | None) -> frozenset[str]:
     )
 
 
+def _significant_name_keys(name_norm: str | None) -> frozenset[str]:
+    """Те же значащие слова, но в свёрнутом написании и по частям составных слов.
+
+    Для сравнения названий РАЗНЫХ сайтов: «doctor qorlo» — подмножество «doktor
+    qorlo portagal», «spris-qelem» — это «spris» и «qelem». Без свёртки генерик
+    одного сайта не распознаётся как генерик относительно товара другого.
+    `_significant_name_tokens` оставлена как есть: её слова — это слова самого
+    name_normalized, по ним строит поиск эндпоинт подсказок аналогов.
+    """
+    return frozenset(
+        word
+        for t in _significant_name_tokens(name_norm)
+        for word in _fold_token(t).split()
+        if len(word) >= 3
+    )
+
+
 def _has_conflicting_brand(a, b) -> bool:
     """Разные ПОТРЕБИТЕЛЬСКИЕ бренды (brand_verified) → разные товары — но ТОЛЬКО
     для товаров-коммодити (масла/семена/чаи/экстракты с дженерик-именем).
@@ -978,6 +1124,26 @@ def _parse_volume(s: str | None) -> tuple[float, str] | None:
     return float(m.group(1).replace(",", ".")), _VOL_FAMILY[m.group(2)]
 
 
+_PER_VOLUME_RE = re.compile(r"/\s*(\d+(?:\.\d+)?)\s*ml\b", re.IGNORECASE)
+
+
+def _unit_volumes_ml(raw_name: str, total: tuple[float, str] | None):
+    """(есть ли знаменатель, объёмы одной ампулы/флакона в мл). None, если их нет.
+
+    Объём единицы — это число в знаменателе («75 mq/3 ml») и объём, записанный
+    отдельно: у штучной фасовки («75 mq 3 ml N10») либо рядом со знаменателем
+    («200 mq/5 ml 15 ml» — другой сайт пишет тот же флакон как «200 mq/15 ml»).
+    «/ml» и «/1 ml» — единица концентрации, а одинокий объём флакона без счёта
+    штук («100 ml») — упаковка целиком: с объёмом ампулы они не сравниваются.
+    """
+    text = expand_dose_lists(normalize_numbers(strip_accents(raw_name).lower()))
+    per = {float(m.group(1)) for m in _PER_VOLUME_RE.finditer(text)} - {1.0}
+    volumes = set(per)
+    if total and total[1] == "ml" and (per or (extract_pack_size(raw_name) or "").startswith("n")):
+        volumes.add(total[0])
+    return (bool(per), volumes) if volumes else None
+
+
 def _has_conflicting_pack_volume(a, b) -> bool:
     """Разный ОБЪЁМ упаковки (флакон/туба) → разные товары.
 
@@ -992,9 +1158,13 @@ def _has_conflicting_pack_volume(a, b) -> bool:
     → не блок (recall цел)."""
     pa = _parse_volume(extract_total_volume(a.name or ""))
     pb = _parse_volume(extract_total_volume(b.name or ""))
-    if not pa or not pb or pa[1] != pb[1]:
-        return False
-    return pa[0] != pb[0]
+    if pa and pb and pa[1] == pb[1] and pa[0] != pb[0]:
+        return True
+    # Объём одной ампулы/флакона сайты пишут и знаменателем («75 mq/3 ml»), и
+    # отдельно («75 mq 3 ml»). Конфликт — когда объёмы названы у обоих и среди
+    # них нет ни одного общего: «75 mq/3 ml» против «75 mq 2 ml».
+    va, vb = _unit_volumes_ml(a.name or "", pa), _unit_volumes_ml(b.name or "", pb)
+    return bool(va) and bool(vb) and bool(va[0] or vb[0]) and va[1].isdisjoint(vb[1])
 
 
 def _has_conflicting_pack_count(a, b) -> bool:
@@ -1018,7 +1188,8 @@ def _has_conflicting_pack_count(a, b) -> bool:
 
 
 # Сила дозы препарата: число + mg/mq/mkg/mcg (НЕ ml/g — то объём/вес упаковки).
-_DOSE_MG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(mg|mq|mkg|mcg|µg)(?![a-z])", re.IGNORECASE)
+_DOSE_MG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(mg|mq|mkg|mkq|mcg|µg)(?![a-z])", re.IGNORECASE)
+_MICRO_UNITS = ("mkg", "mkq", "mcg", "µg")
 
 # Some sites omit the dose from the visible title but retain it in a clean URL
 # slug (for example aptekonline ``/product/risek-40mg-n10``).  This parser is
@@ -1026,7 +1197,7 @@ _DOSE_MG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(mg|mq|mkg|mcg|µg)(?![a-z])", re
 # path/slug segment, and a digit-hyphen prefix is rejected so decimal slugs such
 # as ``7-5mg`` are not misread as 5 mg.
 _URL_DOSE_MG_RE = re.compile(
-    r"(?<!\d)(?:^|[-_/])(\d+(?:[.,]\d+)?)(mg|mq|mkg|mcg|µg)(?=$|[-_/])",
+    r"(?<!\d)(?:^|[-_/])(\d+(?:[.,]\d+)?)(mg|mq|mkg|mkq|mcg|µg)(?=$|[-_/])",
     re.IGNORECASE,
 )
 
@@ -1034,17 +1205,46 @@ _URL_DOSE_MG_RE = re.compile(
 _SPACED_THOUSANDS_RE = re.compile(r"\b(\d{1,3})(?:\s(\d{3}))+\b")
 
 
+# «0.25 mq/0.5 mq/doza» — цепочка доз шприц-ручки или ингалятора: все числа «на дозу».
+_PER_DOSE_CHAIN_RE = re.compile(
+    r"((?:\d+(?:\.\d+)?\s*(?:mg|mq|mkg|mkq|mcg|µg)\s*/\s*)*"
+    r"\d+(?:\.\d+)?\s*(?:mg|mq|mkg|mkq|mcg|µg))\s*/\s*doza\b",
+    re.IGNORECASE,
+)
+_PER_ML_RE = re.compile(r"\s*/\s*ml\b", re.IGNORECASE)
+
+
+def _dose_value(number: str, unit: str) -> float:
+    value = float(number.replace(",", "."))
+    return round(value / 1000.0 if unit.lower() in _MICRO_UNITS else value, 4)
+
+
 def _doses_mg(text: str) -> frozenset[float]:
-    # «1 000 mq» → «1000 mq» (иначе regex берёт «000 mq» = 0)
+    """Набор доз из названия, мг.
+
+    У одного товара в названии бывает несколько величин разного смысла, и сайты
+    выбирают разные: «Veqovi 0.25 mq (0.68 mq/ml) 1.5 ml» — доза и концентрация,
+    «Veqovi 0.25 mq/doza 1 mq 1.5 ml» — доза и содержимое ручки. Идентичность
+    товара — доза, поэтому: если есть величины «на дозу», берём только их;
+    иначе, если есть обычные дозы, концентрацию «на мл» считаем пояснением;
+    и только когда кроме концентрации ничего нет, сравниваем её.
+    """
+    # «1 000 mq» → «1000 mq» (иначе regex берёт «000 mq» = 0); «(10+5)mq» →
+    # «10 mq/5 mq» — иначе у комбинированного препарата доза в названии не
+    # находилась вовсе и подставлялась склейка из URL («…-105mq» = 105 мг).
     t = strip_accents(text or "").lower()
     t = _SPACED_THOUSANDS_RE.sub(lambda m: m.group(0).replace(" ", ""), t)
-    out = set()
+    t = expand_dose_lists(normalize_numbers(t))
+    per_dose: set[float] = set()
+    for chain in _PER_DOSE_CHAIN_RE.finditer(t):
+        per_dose.update(_dose_value(m.group(1), m.group(2)) for m in _DOSE_MG_RE.finditer(chain.group(1)))
+    if per_dose:
+        return frozenset(per_dose)
+    plain: set[float] = set()
+    per_ml: set[float] = set()
     for m in _DOSE_MG_RE.finditer(t):
-        v = float(m.group(1).replace(",", "."))
-        if m.group(2) in ("mkg", "mcg", "µg"):
-            v /= 1000.0
-        out.add(round(v, 4))
-    return frozenset(out)
+        (per_ml if _PER_ML_RE.match(t, m.end()) else plain).add(_dose_value(m.group(1), m.group(2)))
+    return frozenset(plain or per_ml)
 
 
 def _doses_mg_from_url(url: str | None) -> frozenset[float]:
@@ -1052,18 +1252,33 @@ def _doses_mg_from_url(url: str | None) -> frozenset[float]:
     out = set()
     for match in _URL_DOSE_MG_RE.finditer(text):
         value = float(match.group(1).replace(",", "."))
-        if match.group(2) in ("mkg", "mcg", "µg"):
+        if match.group(2) in _MICRO_UNITS:
             value /= 1000.0
         out.add(round(value, 4))
     return frozenset(out)
 
 
-def _doses_mg_for_product(product) -> frozenset[float]:
-    """Return title dose, falling back to a conservative URL slug parser."""
+def _doses_with_source(product) -> tuple[frozenset[float], bool]:
+    """Дозы товара и признак «взяты из URL, а не из названия»."""
     from_name = _doses_mg(getattr(product, "name", "") or "")
     if from_name:
-        return from_name
-    return _doses_mg_from_url(getattr(product, "url", None))
+        return from_name, False
+    return _doses_mg_from_url(getattr(product, "url", None)), True
+
+
+def _doses_mg_for_product(product) -> frozenset[float]:
+    """Return title dose, falling back to a conservative URL slug parser."""
+    return _doses_with_source(product)[0]
+
+
+def _dose_digits(value: float) -> str:
+    """Цифры дозы без разделителя: 12.5 → «125». Так дозу пишет URL-слаг."""
+    return f"{value:g}".replace(".", "").lstrip("0")
+
+
+def _is_total_of(single: frozenset[float], parts: frozenset[float]) -> bool:
+    """Одна сторона называет суммарную массу, другая — состав: 500 = 100 + 400."""
+    return len(single) == 1 and len(parts) > 1 and abs(sum(parts) - next(iter(single))) < 1e-6
 
 
 def _has_conflicting_dose(a, b) -> bool:
@@ -1075,10 +1290,22 @@ def _has_conflicting_dose(a, b) -> bool:
 
     URL читаем только fallback-ом и только по безопасным slug-сегментам: это
     закрывает aptekonline title-poor кейсы вроде Risek «N10 (toz)» при URL
-    `risek-40mg-n10`, не возвращая старые false-positive на `7-5mg`."""
-    da = _doses_mg_for_product(a)
-    db = _doses_mg_for_product(b)
-    return bool(da) and bool(db) and da != db
+    `risek-40mg-n10`, не возвращая старые false-positive на `7-5mg`.
+
+    Не считаются расхождением:
+    - суммарная масса против состава: «ketoclin-500mg» и «Ketoklin (100+400)mq»;
+    - доза из URL, отличающаяся только потерянным десятичным разделителем:
+      слаг «mesartan-20mq-125mq» — это «Mesartan 20/12,5 mq».
+    """
+    da, a_from_url = _doses_with_source(a)
+    db, b_from_url = _doses_with_source(b)
+    if not da or not db or da == db:
+        return False
+    if _is_total_of(da, db) or _is_total_of(db, da):
+        return False
+    if a_from_url or b_from_url:
+        return {_dose_digits(v) for v in da} != {_dose_digits(v) for v in db}
+    return True
 
 
 # Буквенные размеры (подгузники/одежда/бельё): M ≠ L — разный товар. Отдельно от
@@ -1144,9 +1371,10 @@ def _hard_conflict(a, b) -> bool:
         or _has_conflicting_pack_volume(a, b)
         or _has_conflicting_dose(a, b)
         or _has_conflicting_form(ar, br)
+        or _has_conflicting_route(ar, br)
         or _has_conflicting_gender(an, bn)
         or _has_conflicting_series_number(an, bn)
-        or _has_conflicting_orphan_number(an, bn)
+        or _has_conflicting_orphan_number(an, bn, ar, br)
         or _has_conflicting_variant_tokens(an, bn)
         or _has_conflicting_variant_atoms(ar, br)
         or _has_conflicting_strength_number(ar, br)
@@ -1579,6 +1807,174 @@ def relink_dead_members(
     return results
 
 
+@lru_cache(maxsize=200_000)
+def _fuzzy_key(name_norm: str) -> str:
+    """Имя для нечёткого сравнения: в свёрнутом написании и без чисел.
+
+    Написание: «kreon»/«creon», «spris-qelem»/«spris qelem» — одно и то же.
+    Числа сверяют guard'ы (orphan/series/strength), и сверяют строго. В нечётком
+    сравнении они только шумят: «aspirin 500» (единица не записана) против
+    «aspirin kapsula» (доза с единицей вырезана) набирало меньше порога.
+    """
+    folded = fold_spelling(name_norm)
+    return " ".join(t for t in folded.split() if not t.isdigit()) or folded
+
+
+def _name_similarity(a, b) -> float:
+    return fuzz.token_set_ratio(
+        _fuzzy_key(a.name_normalized or ""), _fuzzy_key(b.name_normalized or "")
+    )
+
+
+def refresh_derived_fields(session: Session, *, tenant_id: int = 1) -> int:
+    """Пересчитать по названию поля, на которых стоит матчинг.
+
+    `name_normalized`, `dosage` и `pack_size` выводятся из названия при записи
+    товара и обновляются только когда сайт собран заново. После правки
+    нормализации каталог неделю живёт в смешанном состоянии: один сайт уже
+    пересчитан, другой нет, и пары между ними не находятся. Этот проход
+    пересчитывает всё сразу, теми же правилами, что и запись прогона
+    (`dosage`/`pack_size` не затираются пустым). Возвращает число изменённых
+    товаров; коммит — за вызывающим кодом.
+    """
+    from src.normalize import extract_dosage
+
+    changed = 0
+    for product in session.scalars(select(Product).where(Product.tenant_id == tenant_id)):
+        name = product.name or ""
+        fresh = (
+            normalize_name(name),
+            extract_dosage(name) or product.dosage,
+            extract_pack_size(name) or product.pack_size,
+        )
+        if fresh != (product.name_normalized, product.dosage, product.pack_size):
+            product.name_normalized, product.dosage, product.pack_size = fresh
+            changed += 1
+    if changed:
+        log.info("matcher_derived_fields_refreshed", changed=changed)
+    return changed
+
+
+# Товар считается пропавшим с сайта, если не встретился в двух полных сборах подряд.
+_STALE_MEMBER_CYCLES = 2
+
+
+def relink_stale_members(
+    session: Session, *, tenant_id: int = 1, now=None, dry_run: bool = False
+) -> list[dict]:
+    """Передать место в кластере от пропавшей строки товара её живому двойнику.
+
+    Сайт меняет идентификатор товара (pharmonline — со слага на `_id`, aloe —
+    слаг), и в каталоге остаются две строки одного товара: старая, которую сбор
+    больше не видит, и новая. Пара с конкурентом осталась у старой, а новая —
+    та, что показывается клиенту как текущая, — пары не имеет и получить её не
+    может: место её сайта в кластере занято.
+
+    Двойник — строка того же сайта без пары, виденная в свежем сборе, с тем же
+    адресом страницы либо с тем же названием, дозой и фасовкой. Он должен быть
+    единственным и не конфликтовать с остальными членами кластера. Ручные
+    кластеры не трогаем. Возвращает список передач; при `dry_run` БД не меняется.
+    """
+    from datetime import timedelta
+
+    from src._time import utcnow
+    from src.cadence import CADENCE_GRACE_HOURS, site_cadence_hours
+    from src.product_policy import country_code_of
+
+    acquire_match_mutation_xact_lock(session)
+    current = now or utcnow()
+    products = session.scalars(select(Product).where(Product.tenant_id == tenant_id)).all()
+
+    def stale_before(site: str):
+        hours = _STALE_MEMBER_CYCLES * site_cadence_hours(site) + CADENCE_GRACE_HOURS
+        return current - timedelta(hours=hours)
+
+    def is_stale(product: Product) -> bool:
+        return product.last_seen_at is None or product.last_seen_at < stale_before(product.site)
+
+    by_url: dict[tuple, list[Product]] = defaultdict(list)
+    by_name: dict[tuple, list[Product]] = defaultdict(list)
+    members: dict[int, list[Product]] = defaultdict(list)
+    for product in products:
+        if product.canonical_id is not None:
+            members[product.canonical_id].append(product)
+        elif (
+            not is_stale(product)
+            and product.url_dead_at is None
+            and _unmatchable_reason(product) is None
+        ):
+            if product.url:
+                by_url[(product.site, product.url)].append(product)
+            by_name[
+                (product.site, product.name_normalized, product.dosage, product.pack_size)
+            ].append(product)
+
+    manual_ids = set(
+        session.scalars(
+            select(Match.id).where(Match.tenant_id == tenant_id, Match.is_manual.is_(True))
+        )
+    )
+    relinked: list[dict] = []
+    taken: set[int] = set()
+    for match_id, cluster in members.items():
+        if match_id in manual_ids:
+            continue
+        lineup = list(cluster)  # состав кластера с учётом уже сделанных передач
+        for stale in [member for member in cluster if is_stale(member)]:
+            twins = by_url.get((stale.site, stale.url)) if stale.url else None
+            if not twins:
+                twins = by_name.get(
+                    (stale.site, stale.name_normalized, stale.dosage, stale.pack_size), []
+                )
+            twins = [twin for twin in twins if twin.id not in taken]
+            if len(twins) != 1:
+                continue
+            twin = twins[0]
+            # Страна — часть идентичности: двойник не должен знать о ней меньше.
+            stale_country = country_code_of(stale)
+            if stale_country and country_code_of(twin) != stale_country:
+                continue
+            # Двойник — тот же товар, что и строка, которую он сменяет: из
+            # нормализованного имени вырезаны форма и путь введения, поэтому
+            # «(göz damcısı)» и «(qulaq damcısı)» совпадают по имени и
+            # различаются только этими проверками.
+            if _hard_conflict(stale, twin) or _pairwise_spec_conflict(stale, twin):
+                continue
+            if any(
+                is_rejected(session, other.id, twin.id)
+                or _hard_conflict(other, twin)
+                or _pairwise_spec_conflict(other, twin)
+                for other in lineup
+                if other.site != stale.site
+            ):
+                continue
+            taken.add(twin.id)
+            lineup = [twin if member is stale else member for member in lineup]
+            relinked.append(
+                {"match_id": match_id, "site": stale.site, "old": stale.id, "new": twin.id}
+            )
+            if not dry_run:
+                stale.canonical_id = None
+                twin.canonical_id = match_id
+    if relinked and not dry_run:
+        # Сессии проекта — без autoflush: следующий шаг (match_products) читает
+        # состав кластера из БД и без flush увидел бы прежних членов — старая
+        # строка «занимает» сайт, двойника в кластере «нет».
+        session.flush()
+        for match_id in {item["match_id"] for item in relinked}:
+            match = session.get(Match, match_id)
+            if match is not None:
+                session.expire(match, ["products"])
+    if relinked:
+        log.info(
+            "matcher_stale_members_relinked",
+            count=len(relinked),
+            dry_run=dry_run,
+            pairs=[(item["old"], item["new"]) for item in relinked[:50]],
+        )
+    return relinked
+
+
 def _build_word_freq(products: list) -> dict[str, int]:
     """Частота слов по всем name_normalized.
 
@@ -1618,7 +2014,7 @@ def _norm_units(s: str) -> str:
 
     Унифицирует азербайджанские/русские/немецкие аббревиатуры с международными:
     - mq → mg   (милиграм по-азербайджански = milligram)
-    - mkg → mcg (микрограм)
+    - mkg, mkq → mcg (микрограм)
     - цифра+q (напр. «5q», «0.5q») → цифра+g (gram)
     - цифра+bv → цифра+iu  (BV = Bioloji Vahid ≈ IU — Ukraferon/interferon, aptekonline)
     - цифра+me → цифра+iu  (ME = Mezinárodní jednotka = IU — aptekonline URL-slugs)
@@ -1634,7 +2030,7 @@ def _norm_units(s: str) -> str:
     «500000i̇u» (İU после .lower() в старом extract_dosage) → «500000iu».
     """
     s = strip_accents(s)  # İ → i (combining dot removed), Ü → u и т.п.
-    s = s.replace("mq", "mg").replace("mkg", "mcg")
+    s = s.replace("mq", "mg").replace("mkg", "mcg").replace("mkq", "mcg")
     s = re.sub(r"(\d)q\b", r"\1g", s)
     # Международные единицы: bv/me/ie → iu
     s = re.sub(r"(\d)(bv|me|ie)\b", r"\1iu", s)
@@ -1702,6 +2098,173 @@ def _has_perunit_mismatch(
     return False
 
 
+def _dose_components(p) -> tuple[str, ...]:
+    """Компоненты дозы в порядке записи на сайте: «5mq/10mq» → («5mg», «10mg»)."""
+    dosage = _norm_units((p.dosage or "").lower().replace(" ", ""))
+    return tuple(dosage.split("/")) if dosage else ()
+
+
+def _dose_order_ambiguous(p, q, orders_by_site_brand: dict, bucket_of: dict) -> bool:
+    """Состав один, порядок записи разный, и порядок здесь различает товары.
+
+    «Ramloden 10 mq/5 mq» на одном сайте и «Ramloden 5 mq/10 mq» на другом —
+    один товар: вещества просто перечислены в разном порядке. Но «Prestans
+    5/10» и «Prestans 10/5» — два разных товара, и оба продаются на одном
+    сайте. Отличить одно от другого можно только так: если хотя бы один из двух
+    сайтов держит у этого бренда оба порядка, порядок значим и должен совпасть.
+    """
+    order_p, order_q = _dose_components(p), _dose_components(q)
+    if order_p == order_q or sorted(order_p) != sorted(order_q):
+        return False
+    return any(
+        len(orders_by_site_brand.get((x.site, *bucket_of[x.id][:2]), ())) > 1 for x in (p, q)
+    )
+
+
+def _pair(a: int, b: int) -> tuple[int, int]:
+    return (a, b) if a < b else (b, a)
+
+
+# Сколько товаров каталога должно начинаться с одного слова, чтобы считать это
+# слово категорией или крупным брендом, а не торговым именем препарата. У
+# торгового имени — несколько фасовок на трёх сайтах (Kreon 7, Prestans 12,
+# Genopril 16); у категорий и больших брендов — десятки и сотни (Şpris 95,
+# Doğadan 59, Solgar 122, Uşaq … 709).
+_CROWDED_FIRST_TOKEN = 25
+
+
+def _first_name_token(p) -> str:
+    return next(iter(fold_spelling(p.name_normalized).split()), "")
+
+
+@lru_cache(maxsize=200_000)
+def _strict_name_tokens(name_norm: str) -> frozenset[str]:
+    """Слова названия для строгого сравнения: всё, кроме чисел и одиночных букв.
+
+    Там, где первое слово названия общее у десятков товаров, товар определяет
+    остальное название, и «лишнее» слово — это другой товар, а не подробность:
+    «Şpris 5 ml» и «Şpris 5 ml Braun», «Uşaq pudrası» и «Uşaq pudrası Predo
+    Baby», «Doğadan çay razyana» и «Doğadan yaşıl çay razyana». Числа и
+    одиночные буквы сверяют свои guard'ы.
+    """
+    return frozenset(
+        t for t in fold_spelling(name_norm).split() if len(t) > 1 and not t.isdigit()
+    )
+
+
+@lru_cache(maxsize=200_000)
+def _name_tokens(name_norm: str) -> frozenset[str]:
+    return frozenset(fold_spelling(name_norm).split())
+
+
+def _unmatchable_reason(product) -> str | None:
+    """Почему товар сейчас не может войти ни в один кластер.
+
+    Единые правила для отбора кандидатов и для `_persist_match`. Раньше их знал
+    только `_persist_match`: проход собирал кластер, включая товар не в наличии,
+    и запись отвергала кластер целиком — вместе с парой, у которой оба товара
+    в наличии. Так без пары оставались товары, у которых на третьем сайте
+    (или в устаревшей строке того же сайта) нашёлся двойник не в наличии.
+    """
+    from src.product_policy import (
+        OFFER_OUT_OF_STOCK,
+        availability_policy_enforced,
+        country_code_of,
+        country_policy_enforced,
+        current_offer_eligibility,
+    )
+
+    if getattr(product, "offer_availability_status", None) == OFFER_OUT_OF_STOCK:
+        return "out_of_stock"
+    if availability_policy_enforced() and not current_offer_eligibility(product).eligible:
+        return "offer_not_eligible"
+    if country_policy_enforced() and country_code_of(product) is None:
+        return "country_unknown"
+    return None
+
+
+def _name_gap(a, b) -> int:
+    """Сколько слов названия не совпадает (в свёрнутом написании)."""
+    return len(_name_tokens(a.name_normalized or "") ^ _name_tokens(b.name_normalized or ""))
+
+
+def _closest_first(p, candidates: list) -> list:
+    """Кандидаты в порядке близости к якорю `p`.
+
+    Проход берёт первого подходящего кандидата с каждого сайта, а «подходит»
+    и точный двойник, и товар с лишним словом («Brand» и «Brand Kids» оба
+    проходят у якоря «Brand»). Без сортировки выигрывал тот, кто раньше лежит
+    в базе. Сначала идут уже состоящие в одном кластере с якорем (их не
+    вытесняем), затем — по числу несовпадающих слов; среди одинаково близких
+    первым идёт тот, чьё предложение подтверждено свежим сбором (у сайта бывают
+    две строки одного товара: актуальная и давно не виденная). Дальше порядок
+    прежний.
+    """
+    from src.product_policy import current_offer_eligibility
+
+    return sorted(
+        candidates,
+        key=lambda q: (
+            not (p.canonical_id is not None and q.canonical_id == p.canonical_id),
+            _name_gap(p, q),
+            not current_offer_eligibility(q).eligible,
+        ),
+    )
+
+
+def _belongs_elsewhere(cluster: list, q) -> bool:
+    """`q` уже состоит в другом кластере, чем собираемый: не перетаскиваем.
+
+    Иначе товар, у которого пара уже есть, уходит к новому соседу по бакету, а
+    от старого кластера остаётся огрызок из одного товара.
+    """
+    if q.canonical_id is None:
+        return False
+    ids = {c.canonical_id for c in cluster if c.canonical_id is not None}
+    return bool(ids) and q.canonical_id not in ids
+
+
+def _bucket_key(p) -> tuple:
+    """Ключ бакета (бренд, доза, фасовка): сравниваются только товары одного бакета.
+
+    Бренд берётся в свёрнутом написании (`fold_spelling`): «Atiqen» и «Atigen»,
+    «Aziraq» и «Azirag-», «Kreon» и «Creon» — один бакет. Это только ключ для
+    отбора кандидатов; решение о паре принимают нечёткое сравнение и guard'ы.
+    """
+    brand = (p.brand or "").lower().strip()
+    # Blacklist-фильтр (2026-05-29): generic AZ-слова (baby, sabun, günəş,
+    # qoruyucu…) массово извлекаются как «бренд» и раздувают/искажают
+    # bucket → пропущенные cross-site матчи. Если brand в блок-листе —
+    # трактуем как пустой, чтобы упасть на name-based fallback (ниже).
+    if brand and is_brand_blacklisted(brand):
+        brand = ""
+    # _norm_units: mq→mg, mkg→mcg, (\d)q→\1g — унифицирует AZ/RU единицы
+    # с международными, чтобы «250mq» и «250mg» попадали в один bucket.
+    # Порядок компонентов в ключ не входит («10mg/5mg» и «5mg/10mg» — один
+    # бакет): сайты перечисляют действующие вещества в разном порядке. Там, где
+    # порядок различает товары, пару отсекает _dose_order_ambiguous.
+    # Знаменатель («/2 ml», «/doza») в ключ тоже не входит: «50 mq/2 ml» на одном
+    # сайте и «50 mq 2 ml» на другом — одна ампула. Разный объём отсекает
+    # _has_conflicting_pack_volume.
+    components = _dose_components(p)
+    dosage = "/".join(
+        sorted(c for c in components if not c.endswith(("ml", "doza"))) or sorted(components)
+    )
+    pack = _norm_units((p.pack_size or "").lower().replace(" ", ""))
+    tokens = fold_spelling(p.name_normalized).split()
+    # Ключ бренда — одно слово: первое слово поля brand, которое есть в названии.
+    # Сайты заполняют brand по-разному: «Memoqinkar» и «Memoginkar-Q»,
+    # «Ko-Amlessa» и пусто, а aloe пишет туда производителя (Alcon, Abbot,
+    # İlaçsan Medikal), которого в названии нет вовсе. Во всех этих случаях ключ
+    # должен выйти одним и тем же, поэтому при пустом brand и при brand-
+    # производителе берём первое слово названия — обычно это и есть торговое имя.
+    name_tokens = set(tokens)
+    brand_key = next((w for w in fold_spelling(brand).split() if w in name_tokens), "")
+    if not brand_key:
+        brand_key = tokens[0] if tokens else ""
+    return (brand_key, dosage, pack)
+
+
 def match_products(
     session: Session,
     fuzzy_threshold: int = FUZZY_THRESHOLD,
@@ -1733,40 +2296,8 @@ def match_products(
     all_ids = [p.id for p in products]
     latest_prices: dict[int, PriceSnapshot] = latest_snapshots_per_product(session, all_ids)
 
-    # Группируем по эвристическому ключу для O(N*K) вместо O(N^2).
-    # Если brand пустой — fallback на первые 2 значащих слова из name_normalized
-    # (это сильно улучшает recall на товарах где скрейпер не вытащил brand —
-    # таких как Friso Gold 1 / Pampers Premium — имя само по себе различимо).
-    #
-    # Дополнение (2026-05-25): aloe.az хранит ПРОИЗВОДИТЕЛЯ в brand (Alcon,
-    # Bausch+Lomb, İlaçsan Medikal), а не торговое название продукта. Такой brand
-    # не встречается в name_normalized («tobradex», «renu multiplus») → кластер
-    # попадает не в тот bucket. Эвристика: если бренд НЕ встречается подстрокой в
-    # name_normalized — это имя производителя, а не продукта → падаем на первое
-    # слово name_normalized, которое обычно и есть торговое название.
-    def bucket_key(p: Product) -> tuple:
-        brand = (p.brand or "").lower().strip()
-        # Blacklist-фильтр (2026-05-29): generic AZ-слова (baby, sabun, günəş,
-        # qoruyucu…) массово извлекаются как «бренд» и раздувают/искажают
-        # bucket → пропущенные cross-site матчи. Если brand в блок-листе —
-        # трактуем как пустой, чтобы упасть на name-based fallback (ниже).
-        if brand and is_brand_blacklisted(brand):
-            brand = ""
-        # _norm_units: mq→mg, mkg→mcg, (\d)q→\1g — унифицирует AZ/RU единицы
-        # с международными, чтобы «250mq» и «250mg» попадали в один bucket.
-        dosage = _norm_units((p.dosage or "").lower().replace(" ", ""))
-        pack = _norm_units((p.pack_size or "").lower().replace(" ", ""))
-        name_norm = (p.name_normalized or "").lower()
-        tokens = name_norm.split()
-        if brand:
-            # Проверяем, встречается ли хотя бы одно слово brand в name_normalized.
-            # Если нет — это имя производителя (aloe-паттерн), используем первое
-            # слово name_normalized как ключ (торговое название).
-            if not any(word in name_norm for word in brand.split()):
-                brand = tokens[0] if tokens else brand
-        else:
-            brand = "_".join(tokens[:2]) if tokens else ""
-        return (brand, dosage, pack)
+    # Группируем по эвристическому ключу для O(N*K) вместо O(N^2) — см. _bucket_key.
+    bucket_key = _bucket_key
 
     buckets: dict[tuple, list[Product]] = defaultdict(list)
     for p in products:
@@ -1785,35 +2316,66 @@ def match_products(
     for _agrp in buckets.values():
         if len(_agrp) < 3:
             continue
-        _sig = {p.id: _significant_name_tokens(p.name_normalized) for p in _agrp}
+        _sig = {p.id: _significant_name_keys(p.name_normalized) for p in _agrp}
+        # Совместимость пары считается один раз на бакет: в больших бакетах
+        # (очки, зубные щётки — сотни товаров) одни и те же пары проверялись бы
+        # для каждого q заново.
+        _conflict_cache: dict[tuple[int, int], bool] = {}
+
+        def _conflict(a: Product, b: Product) -> bool:
+            key = _pair(a.id, b.id)
+            if key not in _conflict_cache:
+                _conflict_cache[key] = _hard_conflict(a, b)
+            return _conflict_cache[key]
+
         for q in _agrp:
             _qsig = _sig[q.id]
-            _extras: set[frozenset[str]] = set()
-            for p in _agrp:
-                if p.site == q.site or p.id == q.id:
-                    continue
-                if (
-                    fuzz.token_set_ratio(q.name_normalized or "", p.name_normalized or "")
-                    < fuzzy_threshold
-                ):
-                    continue
-                # Считаем кандидата, только если настоящий проход его НЕ отверг бы
-                # (иначе Nutrilon Premium 1 ложно неоднозначен из-за Comfort/Pepti).
-                if _hard_conflict(q, p):
-                    continue
-                # Считаем «лишнее» ТОЛЬКО когда q — генерик ОТНОСИТЕЛЬНО p (q ⊆ p):
-                # тогда p добавляет бренд/вариант, которого у q нет. Если бренды
-                # ВЗАИМНО различаются (Medoil vs Fitooil — ни один не подмножество),
-                # это просто разные товары, q не генерик → не считаем (иначе легит
-                # same-brand Medoil↔Medoil ложно подавляется соседом Fitooil).
-                _psig = _sig[p.id]
-                if _qsig <= _psig:
-                    _extra = _psig - _qsig
-                    if _extra:
-                        _extras.add(_extra)
-            # Неоднозначен, если q-генерик подходит к ≥2 кандидатам с РАЗНЫМИ
-            # добавочными токенами (разные бренды/варианты: Altay vs Mirrolla vs Seide).
-            if len(_extras) >= 2:
+            # Кандидаты: товары других сайтов, которые настоящий проход НЕ отверг бы
+            # (иначе Nutrilon Premium 1 ложно неоднозначен из-за Comfort/Pepti).
+            _cands = [
+                p
+                for p in _agrp
+                if p.site != q.site
+                and _name_similarity(q, p) >= fuzzy_threshold
+                and not _conflict(q, p)
+            ]
+            # «Лишнее» считаем ТОЛЬКО когда q — генерик ОТНОСИТЕЛЬНО p (q ⊆ p):
+            # тогда p добавляет бренд/вариант, которого у q нет. Если бренды
+            # ВЗАИМНО различаются (Medoil vs Fitooil — ни один не подмножество),
+            # это просто разные товары, q не генерик → не считаем (иначе легит
+            # same-brand Medoil↔Medoil ложно подавляется соседом Fitooil).
+            _extra = {p.id: _sig[p.id] - _qsig for p in _cands if _qsig <= _sig[p.id]}
+            # Неоднозначен, если q подходит к двум РАЗНЫМ товарам:
+            #  • на одном сайте — два одинаково близких по названию товара,
+            #    несовместимых между собой (саше и таблетки, две страны), а у q нет
+            #    признака, по которому выбрать: «Montel 4 mq 28 əd» подходит и к
+            #    «Montel 4 mq №28 (Saşe)», и к «Montel 4 mq №28 (Tabletlər)». Товар
+            #    с более далёким названием не в счёт — у q есть точный двойник;
+            #  • с разными добавочными словами (Altay vs Mirrolla vs Seide) — на
+            #    одном сайте либо несовместимых между собой. Два кандидата с разных
+            #    сайтов, которые сами друг другу подходят, — один и тот же товар
+            #    («amoksisillin suspenziya» и «amoksisillin suspenziya serbiya»), и
+            #    генерик третьего сайта к нему присоединяется.
+            _gap = {p.id: _name_gap(q, p) for p in _cands}
+            _closest = {
+                site: min(_gap[p.id] for p in _cands if p.site == site)
+                for site in {p.site for p in _cands}
+            }
+            if any(
+                (
+                    a.site == b.site
+                    and _gap[a.id] == _gap[b.id] == _closest[a.site]
+                    and _conflict(a, b)
+                )
+                or (
+                    _extra.get(a.id)
+                    and _extra.get(b.id)
+                    and _extra[a.id] != _extra[b.id]
+                    and (a.site == b.site or _conflict(a, b))
+                )
+                for i, a in enumerate(_cands)
+                for b in _cands[i + 1 :]
+            ):
                 ambiguous_ids.add(q.id)
     if ambiguous_ids:
         log.info("matcher_ambiguous_generics_suppressed", count=len(ambiguous_ids))
@@ -1830,15 +2392,39 @@ def match_products(
     #
     # _prod_form  : product.id → extracted form (or None)
     # _prod_bk    : product.id → bucket_key(product)
-    # site_bucket_forms : (site, bucket_key) → set of forms present on that site
+    # site_bucket_forms : (site, bucket_key, название) → set of forms present on that site
     _prod_form: dict[int, str | None] = {p.id: extract_form(p.name or "") for p in products}
     _prod_bk: dict[int, tuple] = {p.id: bucket_key(p) for p in products}
+
+    # «Сосед» — товар того же сайта с тем же названием (без формы и чисел), а не
+    # любой товар бренда: «Polifleks Natrium xlorid (məhlul)» ничего не говорит о
+    # форме «Polifleks Ringer», и из-за него Ringer двух сайтов не сходились.
+    def _form_scope(x: Product) -> tuple:
+        return (x.site, _prod_bk[x.id], _fuzzy_key(x.name_normalized or ""))
 
     site_bucket_forms: dict[tuple, set[str]] = defaultdict(set)
     for p in products:
         f = _prod_form[p.id]
         if f is not None:
-            site_bucket_forms[(p.site, _prod_bk[p.id])].add(f)
+            site_bucket_forms[_form_scope(p)].add(f)
+
+    # (site, бренд, состав дозы) → в каком порядке компоненты записаны на сайте.
+    site_brand_dose_orders: dict[tuple, set[tuple]] = defaultdict(set)
+    for p in products:
+        order = _dose_components(p)
+        if len(order) > 1:
+            site_brand_dose_orders[(p.site, *_prod_bk[p.id][:2])].add(order)
+
+    # Активные анти-матчи одним запросом: проверка пары — поиск в множестве, а не
+    # запрос к БД на каждого кандидата (на них уходила большая часть времени прохода).
+    rejected_pairs: set[tuple[int, int]] = {
+        _pair(a, b)
+        for a, b in session.execute(
+            select(MatchRejection.product_a_id, MatchRejection.product_b_id).where(
+                MatchRejection.is_active.is_(True)
+            )
+        )
+    }
 
     created_or_updated = 0
     visited: set[int] = set()
@@ -1883,7 +2469,7 @@ def match_products(
             for p in pack_group:
                 if p.site in seen_sites:
                     continue
-                if any(is_rejected(session, c.id, p.id) for c in cluster):
+                if any(_pair(c.id, p.id) in rejected_pairs for c in cluster):
                     continue
                 cluster.append(p)
                 seen_sites.add(p.site)
@@ -1914,138 +2500,151 @@ def match_products(
     # fuzzy-прохода их пропускали (не матчили ни анкером, ни кандидатом). Barcode-
     # матч их не трогает — у генериков нет штрихкода.
     visited |= ambiguous_ids
+    # Товары, которым запись в кластер всё равно откажет (нет в наличии и т.п.),
+    # и товары с мёртвой ссылкой не участвуют в проходах ни якорем, ни кандидатом.
+    visited |= {
+        p.id for p in products if p.url_dead_at is not None or _unmatchable_reason(p) is not None
+    }
 
-    for key, group in buckets.items():
-        if len(group) < 2:
-            continue
-        # внутри ведра — попарно искать матчи между сайтами
-        # group:[p1, p2, ...]
-        for i, p in enumerate(group):
-            if p.id in visited:
-                continue
-            cluster = [p]
-            _min_score = 100.0  # минимальный fuzzy score в кластере → confidence
-            for q in group[i + 1 :]:
-                if q.id in visited:
-                    continue
-                if q.site == p.site:
-                    continue
-                if any(c.site == q.site for c in cluster):
-                    continue  # уже есть товар с этого сайта в кластере
-                # Анти-матч: пара уже была развязана вручную — пропускаем
-                if any(is_rejected(session, c.id, q.id) for c in cluster):
-                    continue
-                # ── Проверки против ВСЕХ членов кластера (не только якоря p) ──
-                # Предотвращает транзитивные ложные матчи: «голое» имя-якорь
-                # (fosfoqliv, spris) не конфликтует с собой → становится мостом
-                # между несовместимыми вариантами. Теперь q проверяется против
-                # всего кластера перед добавлением.
-                #
+    # Первое слово названия у категорий («Şpris», «Uşaq …», «Tibbi …») и крупных
+    # брендов (Solgar, Doğadan) стоит у десятков товаров — см. _CROWDED_FIRST_TOKEN.
+    first_token_freq: dict[str, int] = defaultdict(int)
+    for p in products:
+        first_token_freq[_first_name_token(p)] += 1
+
+    def crowded_mismatch(p: Product, q: Product) -> bool:
+        if max(first_token_freq[_first_name_token(p)], first_token_freq[_first_name_token(q)]) < (
+            _CROWDED_FIRST_TOKEN
+        ):
+            return False
+        return _strict_name_tokens(p.name_normalized or "") != _strict_name_tokens(
+            q.name_normalized or ""
+        )
+
+    def blocked(p: Product, q: Product, cluster: list[Product]) -> bool:
+        """Общие для всех проходов причины не добавлять `q` в кластер с якорем `p`."""
+        if q.id in visited or q.site == p.site:
+            return True
+        if any(c.site == q.site for c in cluster):
+            return True  # уже есть товар с этого сайта в кластере
+        if _belongs_elsewhere(cluster, q):
+            return True
+        pn, qn = p.name_normalized or "", q.name_normalized or ""
+        # ── Проверки против ВСЕХ членов кластера (не только якоря p) ──
+        # Предотвращает транзитивные ложные матчи: «голое» имя-якорь (fosfoqliv,
+        # spris) не конфликтует с собой → становится мостом между несовместимыми
+        # вариантами.
+        for c in cluster:
+            cn = c.name_normalized or ""
+            if (
                 # Фарма-модификатор: Lopril vs Lopril H → разные препараты
-                if any(
-                    _has_conflicting_modifier(c.name_normalized or "", q.name_normalized or "")
-                    for c in cluster
-                ):
-                    continue
+                _has_conflicting_modifier(cn, qn)
                 # Серийный номер/ступень: Nutrilon 1 vs Nutrilon 4 → разные
-                if any(
-                    _has_conflicting_series_number(c.name_normalized or "", q.name_normalized or "")
-                    for c in cluster
-                ):
-                    continue
-                # Форма выпуска: drops vs spray, cream vs ointment → разные
-                # (проверяем только против якоря — форма берётся из raw name)
-                if _has_conflicting_form(p.name or "", q.name or ""):
-                    continue
-                if any(_has_conflicting_pack_count(c, q) for c in cluster):
-                    continue
-                # Sibling-form: у q нет формы, но на сайте q в этом bucket'е
-                # уже есть продукт с явной формой p → q НЕ является этой формой.
-                # И наоборот — у p нет формы, а на сайте p уже есть форма q.
-                _fp, _fq = _prod_form[p.id], _prod_form[q.id]
-                if _fp is not None and _fq is None:
-                    if _fp in site_bucket_forms.get((q.site, _prod_bk[q.id]), set()):
-                        continue
-                if _fq is not None and _fp is None:
-                    if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
-                        continue
-                # Stub vs полное имя: «venatura» vs «venatura vitamin a palmitate…»
-                # (проверяем только против якоря — длина якоря самая репрезентативная)
-                if _has_extreme_length_disparity(
-                    p.name_normalized or "",
-                    q.name_normalized or "",
-                    brand_hint=(p.brand or q.brand or ""),
-                ):
-                    continue
-                # Осиротевшее число дозировки: «mezim forte» vs «mezim forte 3500 ed»
-                if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
-                    continue
-                # Гендерный конфликт: мальчики vs девочки → разные продукты
-                if _has_conflicting_gender(p.name_normalized or "", q.name_normalized or ""):
-                    continue
-                # Вариантный конфликт: splat aktiv vs splat lavandasept → разные варианты
-                # Проверяем против ВСЕХ членов кластера (транзитивная защита).
-                if any(
-                    _has_conflicting_variant_tokens(
-                        c.name_normalized or "", q.name_normalized or ""
-                    )
-                    for c in cluster
-                ):
-                    continue
-                # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
-                # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
-                if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Многозначная сила: Mikrazim 25000 ED ≠ 10000 (enzyme/IU единицы).
-                if any(
-                    _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
-                ):
-                    continue
-                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
-                # глицерин — разный товар, ложный 85% spread. Блок только если у
-                # обоих страна известна и различается (см. _has_conflicting_country).
-                if any(_has_conflicting_country(c, q) for c in cluster):
-                    continue
-                # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
-                if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
-                if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Вариант-маркеры (СИММЕТРИЧНО, взаимно-уникальные): Ag↔Tip1, type1↔type2,
-                # Ag↔Cu380. Односторонний (Ag vs без маркера) НЕ блокирует.
-                if any(
-                    _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
-                ):
-                    continue
-                score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
-                if score >= fuzzy_threshold:
-                    cluster.append(q)
-                    _min_score = min(_min_score, float(score))
+                or _has_conflicting_series_number(cn, qn)
+                # Вариантный конфликт: splat aktiv vs splat lavandasept
+                or _has_conflicting_variant_tokens(cn, qn)
+                # Страна, состав, доза, фасовка, вариант-атомы/маркеры, сила,
+                # габариты, концентрация. Те же проверки делает revalidate_split
+                # после прохода; здесь они не дают создать пару, которую он тут
+                # же распустит с постоянным отказом.
+                or _pairwise_spec_conflict(c, q)
+            ):
+                return True
+        # ── Проверки против якоря ──
+        # Форма выпуска: drops vs spray, cream vs ointment → разные
+        if _has_conflicting_form(p.name or "", q.name or ""):
+            return True
+        # Путь введения — против всех членов: göz damcısı vs qulaq damcısı
+        if any(_has_conflicting_route(c.name or "", q.name or "") for c in cluster):
+            return True
+        # Sibling-form: у q нет формы, но на сайте q у товара с тем же названием
+        # форма p указана явно → q НЕ является этой формой. И наоборот.
+        fp, fq = _prod_form[p.id], _prod_form[q.id]
+        if fp is not None and fq is None and fp in site_bucket_forms.get(_form_scope(q), ()):
+            return True
+        if fq is not None and fp is None and fq in site_bucket_forms.get(_form_scope(p), ()):
+            return True
+        # Stub vs полное имя: «venatura» vs «venatura vitamin a palmitate…»
+        if _has_extreme_length_disparity(pn, qn, brand_hint=(p.brand or q.brand or "")):
+            return True
+        # Осиротевшее число дозировки: «mezim forte» vs «mezim forte 3500 ed»
+        if _has_conflicting_orphan_number(pn, qn, p.name or "", q.name or ""):
+            return True
+        # Гендерный конфликт: мальчики vs девочки → разные продукты
+        if _has_conflicting_gender(pn, qn):
+            return True
+        if _dose_order_ambiguous(p, q, site_brand_dose_orders, _prod_bk):
+            return True
+        if crowded_mismatch(p, q):
+            return True
+        # Анти-матч: пара уже была развязана (вручную или revalidate_split)
+        return any(_pair(c.id, q.id) in rejected_pairs for c in cluster)
 
-            if len(cluster) >= 2:
+    def run_pass(groups, *, threshold: int, conf_cap: float | None = None, allowed=None) -> None:
+        """Собрать кластеры внутри каждой группы: якорь + по одному товару с сайта."""
+        nonlocal created_or_updated
+        for group in groups:
+            if len(group) < 2:
+                continue
+            for i, p in enumerate(group):
+                if p.id in visited:
+                    continue
+                cluster = [p]
+                min_score = 100.0  # минимальный fuzzy score в кластере → confidence
+                for q in _closest_first(p, group[i + 1 :]):
+                    if allowed is not None and not allowed(p, q):
+                        continue
+                    if blocked(p, q, cluster):
+                        continue
+                    score = _name_similarity(p, q)
+                    if score < threshold:
+                        continue
+                    # У q на сайте якоря есть товар ближе по названию, и он тоже
+                    # подходит: «Foral» другого сайта — пара для «Foral», а не для
+                    # «Foral baby», хотя якорем первым оказался «Foral baby».
+                    # Соперник в счёт, даже если уже занят: остаток «Almagel A»
+                    # не становится парой для «Almaqel» оттого, что его двойник
+                    # «Almaqel A» уже состоит в кластере.
+                    gap = _name_gap(p, q)
+                    if gap and any(
+                        rival.site == p.site
+                        and rival.id != p.id
+                        and _name_gap(rival, q) < gap
+                        and (allowed is None or allowed(rival, q))
+                        and not blocked(rival, q, [rival])
+                        and _name_similarity(rival, q) >= threshold
+                        for rival in group
+                    ):
+                        continue
+                    cluster.append(q)
+                    min_score = min(min_score, float(score))
+                if len(cluster) < 2:
+                    continue
                 # Проверка: не смешиваем цену-за-штуку с ценой-за-упаковку
                 if _has_perunit_mismatch(cluster, latest_prices):
                     continue
-                confidence = _min_score / 100.0
+                confidence = conf_cap if conf_cap is not None else min_score / 100.0
                 persisted = _persist_match(session, cluster, confidence)
                 if persisted:
                     created_or_updated += persisted
                     visited.update(c.id for c in cluster)
 
+    # ── Primary pass: полный ключ (brand, dosage, pack) ─────────────────────
+    run_pass(buckets.values(), threshold=fuzzy_threshold)
+
     # ── Secondary pass: (brand, pack) без досировки ─────────────────────────
     # Охватывает пары, где один сайт спарсил dosage, другой — нет.
     # Пример: aptekonline ('alvis', '', 'n40') ↔ pharmonline ('alvis', '60mg/300mg', 'n40').
     # После первого прохода оба остаются unvisited (разные bucket_key).
-    # Используем порог 85 (строже базового 78), чтобы компенсировать
-    # ослабленное ограничение на dosage.
+    # Используем порог 85 (строже базового), чтобы компенсировать ослабленное
+    # ограничение на dosage; уверенность ниже — dosage не совпал.
     _SEC_THRESHOLD = 85
-    _SEC_CONF_CAP = 0.80  # вторичный проход: dosage не совпал → ниже уверенность
+    _SEC_CONF_CAP = 0.80
     by_brand_pack: dict[tuple, list[Product]] = defaultdict(list)
     for p in products:
         if p.id in visited:
             continue
-        bk = bucket_key(p)
+        bk = _prod_bk[p.id]
         bp_key = (bk[0], bk[2])  # (brand, pack)
         if not bp_key[0] or not bp_key[1]:
             continue  # без бренда или упаковки — слишком широкий bucket
@@ -2056,108 +2655,15 @@ def match_products(
         brand_pack_buckets=len(by_brand_pack),
         candidates=sum(len(g) for g in by_brand_pack.values()),
     )
-
-    for _bp_key, group in by_brand_pack.items():
-        if len(group) < 2:
-            continue
-        for i, p in enumerate(group):
-            if p.id in visited:
-                continue
-            dosage_p = _norm_units((p.dosage or "").lower().replace(" ", ""))
-            cluster = [p]
-            _min_score_sec = float(_SEC_THRESHOLD)
-            for q in group[i + 1 :]:
-                if q.id in visited:
-                    continue
-                if q.site == p.site:
-                    continue
-                if any(c.site == q.site for c in cluster):
-                    continue
-                dosage_q = _norm_units((q.dosage or "").lower().replace(" ", ""))
-                # Вторичный проход: только если хотя бы у одного пустая дозировка.
-                # Пары с двумя непустыми разными дозировками — это явно разные
-                # препараты (даже если brand+pack совпадают), не матчим.
-                if dosage_p and dosage_q:
-                    continue
-                if any(is_rejected(session, c.id, q.id) for c in cluster):
-                    continue
-                if any(
-                    _has_conflicting_modifier(c.name_normalized or "", q.name_normalized or "")
-                    for c in cluster
-                ):
-                    continue
-                if any(
-                    _has_conflicting_series_number(c.name_normalized or "", q.name_normalized or "")
-                    for c in cluster
-                ):
-                    continue
-                if _has_conflicting_form(p.name or "", q.name or ""):
-                    continue
-                _fp, _fq = _prod_form[p.id], _prod_form[q.id]
-                if _fp is not None and _fq is None:
-                    if _fp in site_bucket_forms.get((q.site, _prod_bk[q.id]), set()):
-                        continue
-                if _fq is not None and _fp is None:
-                    if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
-                        continue
-                if _has_extreme_length_disparity(
-                    p.name_normalized or "",
-                    q.name_normalized or "",
-                    brand_hint=(p.brand or q.brand or ""),
-                ):
-                    continue
-                if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
-                    continue
-                if _has_conflicting_gender(p.name_normalized or "", q.name_normalized or ""):
-                    continue
-                if any(
-                    _has_conflicting_variant_tokens(
-                        c.name_normalized or "", q.name_normalized or ""
-                    )
-                    for c in cluster
-                ):
-                    continue
-                # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
-                # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
-                if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Многозначная сила: Mikrazim 25000 ED ≠ 10000 (enzyme/IU единицы).
-                if any(
-                    _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
-                ):
-                    continue
-                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
-                # глицерин — разный товар, ложный 85% spread. Блок только если у
-                # обоих страна известна и различается (см. _has_conflicting_country).
-                if any(_has_conflicting_country(c, q) for c in cluster):
-                    continue
-                # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
-                if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
-                if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Вариант-маркеры (СИММЕТРИЧНО, взаимно-уникальные): Ag↔Tip1, type1↔type2,
-                # Ag↔Cu380. Односторонний (Ag vs без маркера) НЕ блокирует.
-                if any(
-                    _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
-                ):
-                    continue
-                if any(_has_conflicting_pack_count(c, q) for c in cluster):
-                    continue
-                score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
-                if score >= _SEC_THRESHOLD:
-                    cluster.append(q)
-                    _min_score_sec = min(_min_score_sec, float(score))
-
-            if len(cluster) >= 2:
-                if _has_perunit_mismatch(cluster, latest_prices):
-                    continue
-                confidence = min(_min_score_sec / 100.0, _SEC_CONF_CAP)
-                persisted = _persist_match(session, cluster, confidence)
-                if persisted:
-                    created_or_updated += persisted
-                    visited.update(c.id for c in cluster)
+    # Только если хотя бы у одного пустая дозировка. Пары с двумя непустыми
+    # разными дозировками — это явно разные препараты (даже если brand+pack
+    # совпадают), не матчим.
+    run_pass(
+        by_brand_pack.values(),
+        threshold=_SEC_THRESHOLD,
+        conf_cap=_SEC_CONF_CAP,
+        allowed=lambda p, q: not (_prod_bk[p.id][1] and _prod_bk[q.id][1]),
+    )
 
     # ── Tertiary pass: (brand, dosage) без pack ─────────────────────────────
     # Охватывает пары, где один сайт не вытащил pack_size (или разный).
@@ -2174,7 +2680,7 @@ def match_products(
     for p in products:
         if p.id in visited:
             continue
-        bk = bucket_key(p)
+        bk = _prod_bk[p.id]
         bd_key = (bk[0], bk[1])  # (brand, dosage)
         if not bd_key[0] or not bd_key[1]:
             continue  # без бренда или дозировки — слишком широкий bucket
@@ -2185,108 +2691,15 @@ def match_products(
         brand_dosage_buckets=len(by_brand_dosage),
         candidates=sum(len(g) for g in by_brand_dosage.values()),
     )
-
-    for _bd_key, group in by_brand_dosage.items():
-        if len(group) < 2:
-            continue
-        for i, p in enumerate(group):
-            if p.id in visited:
-                continue
-            pack_p = _norm_units((p.pack_size or "").lower().replace(" ", ""))
-            cluster = [p]
-            _min_score_tert = float(_TERT_THRESHOLD)
-            for q in group[i + 1 :]:
-                if q.id in visited:
-                    continue
-                if q.site == p.site:
-                    continue
-                if any(c.site == q.site for c in cluster):
-                    continue
-                pack_q = _norm_units((q.pack_size or "").lower().replace(" ", ""))
-                # Tertiary: только если у кого-то из пары нет pack_size.
-                # Если оба с pack — они разошлись бы в primary (разный pack),
-                # что значит они осознанно разные SKU (N10 vs N20 etc.).
-                if pack_p and pack_q:
-                    continue
-                if any(is_rejected(session, c.id, q.id) for c in cluster):
-                    continue
-                if any(
-                    _has_conflicting_modifier(c.name_normalized or "", q.name_normalized or "")
-                    for c in cluster
-                ):
-                    continue
-                if any(
-                    _has_conflicting_series_number(c.name_normalized or "", q.name_normalized or "")
-                    for c in cluster
-                ):
-                    continue
-                if _has_conflicting_form(p.name or "", q.name or ""):
-                    continue
-                _fp, _fq = _prod_form[p.id], _prod_form[q.id]
-                if _fp is not None and _fq is None:
-                    if _fp in site_bucket_forms.get((q.site, _prod_bk[q.id]), set()):
-                        continue
-                if _fq is not None and _fp is None:
-                    if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
-                        continue
-                if _has_extreme_length_disparity(
-                    p.name_normalized or "",
-                    q.name_normalized or "",
-                    brand_hint=(p.brand or q.brand or ""),
-                ):
-                    continue
-                if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
-                    continue
-                if _has_conflicting_gender(p.name_normalized or "", q.name_normalized or ""):
-                    continue
-                if any(
-                    _has_conflicting_variant_tokens(
-                        c.name_normalized or "", q.name_normalized or ""
-                    )
-                    for c in cluster
-                ):
-                    continue
-                # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
-                # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
-                if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Многозначная сила: Mikrazim 25000 ED ≠ 10000 (enzyme/IU единицы).
-                if any(
-                    _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
-                ):
-                    continue
-                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
-                # глицерин — разный товар, ложный 85% spread. Блок только если у
-                # обоих страна известна и различается (см. _has_conflicting_country).
-                if any(_has_conflicting_country(c, q) for c in cluster):
-                    continue
-                # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
-                if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
-                if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Вариант-маркеры (СИММЕТРИЧНО, взаимно-уникальные): Ag↔Tip1, type1↔type2,
-                # Ag↔Cu380. Односторонний (Ag vs без маркера) НЕ блокирует.
-                if any(
-                    _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
-                ):
-                    continue
-                if any(_has_conflicting_pack_count(c, q) for c in cluster):
-                    continue
-                score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
-                if score >= _TERT_THRESHOLD:
-                    cluster.append(q)
-                    _min_score_tert = min(_min_score_tert, float(score))
-
-            if len(cluster) >= 2:
-                if _has_perunit_mismatch(cluster, latest_prices):
-                    continue
-                confidence = min(_min_score_tert / 100.0, _TERT_CONF_CAP)
-                persisted = _persist_match(session, cluster, confidence)
-                if persisted:
-                    created_or_updated += persisted
-                    visited.update(c.id for c in cluster)
+    # Только если у кого-то из пары нет pack_size. Если оба с pack — они
+    # разошлись бы в primary (разный pack), что значит они осознанно разные SKU
+    # (N10 vs N20 etc.).
+    run_pass(
+        by_brand_dosage.values(),
+        threshold=_TERT_THRESHOLD,
+        conf_cap=_TERT_CONF_CAP,
+        allowed=lambda p, q: not (_prod_bk[p.id][2] and _prod_bk[q.id][2]),
+    )
 
     # ── Quaternary pass: авто-обнаружение бренда по частоте слов ──────────────
     # Для no-brand продуктов определяет "бренд" из name_normalized автоматически:
@@ -2323,101 +2736,7 @@ def match_products(
         auto_brand_buckets=len(by_auto_brand),
         candidates=sum(len(g) for g in by_auto_brand.values()),
     )
-
-    for _ab_key, group in by_auto_brand.items():
-        if len(group) < 2:
-            continue
-        for i, p in enumerate(group):
-            if p.id in visited:
-                continue
-            cluster = [p]
-            _min_score_q = float(_QUART_THRESHOLD)
-            for q in group[i + 1 :]:
-                if q.id in visited:
-                    continue
-                if q.site == p.site:
-                    continue
-                if any(c.site == q.site for c in cluster):
-                    continue
-                if any(is_rejected(session, c.id, q.id) for c in cluster):
-                    continue
-                if any(
-                    _has_conflicting_modifier(c.name_normalized or "", q.name_normalized or "")
-                    for c in cluster
-                ):
-                    continue
-                if any(
-                    _has_conflicting_series_number(c.name_normalized or "", q.name_normalized or "")
-                    for c in cluster
-                ):
-                    continue
-                if _has_conflicting_form(p.name or "", q.name or ""):
-                    continue
-                _fp, _fq = _prod_form[p.id], _prod_form[q.id]
-                if _fp is not None and _fq is None:
-                    if _fp in site_bucket_forms.get((q.site, _prod_bk[q.id]), set()):
-                        continue
-                if _fq is not None and _fp is None:
-                    if _fq in site_bucket_forms.get((p.site, _prod_bk[p.id]), set()):
-                        continue
-                if _has_extreme_length_disparity(
-                    p.name_normalized or "",
-                    q.name_normalized or "",
-                    brand_hint=(p.brand or q.brand or ""),
-                ):
-                    continue
-                if _has_conflicting_orphan_number(p.name_normalized or "", q.name_normalized or ""):
-                    continue
-                if _has_conflicting_gender(p.name_normalized or "", q.name_normalized or ""):
-                    continue
-                if any(
-                    _has_conflicting_variant_tokens(
-                        c.name_normalized or "", q.name_normalized or ""
-                    )
-                    for c in cluster
-                ):
-                    continue
-                # Вариант-атомы из RAW (буква/серийная цифра, вырезанные
-                # нормализатором): Lorinden C ≠ A, Vitamin A ≠ C, Normoqlip M ≠ 2.
-                if any(_has_conflicting_variant_atoms(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Многозначная сила: Mikrazim 25000 ED ≠ 10000 (enzyme/IU единицы).
-                if any(
-                    _has_conflicting_strength_number(c.name or "", q.name or "") for c in cluster
-                ):
-                    continue
-                # Разная страна производителя: Talya(Türkiyə) ≠ Azerfarm(Azərbaycan)
-                # глицерин — разный товар, ложный 85% spread. Блок только если у
-                # обоих страна известна и различается (см. _has_conflicting_country).
-                if any(_has_conflicting_country(c, q) for c in cluster):
-                    continue
-                # Габариты: пластырь 10×10 sm ≠ 10×25 sm (разный размер = разный товар).
-                if any(_has_conflicting_dimensions(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Концентрация: Tetrasiklin 3% ≠ 1%, Novokain 2% ≠ 0.5%.
-                if any(_has_conflicting_concentration(c.name or "", q.name or "") for c in cluster):
-                    continue
-                # Вариант-маркеры (СИММЕТРИЧНО, взаимно-уникальные): Ag↔Tip1, type1↔type2,
-                # Ag↔Cu380. Односторонний (Ag vs без маркера) НЕ блокирует.
-                if any(
-                    _has_conflicting_variant_marker(c.name or "", q.name or "") for c in cluster
-                ):
-                    continue
-                if any(_has_conflicting_pack_count(c, q) for c in cluster):
-                    continue
-                score = fuzz.token_set_ratio(p.name_normalized, q.name_normalized)
-                if score >= _QUART_THRESHOLD:
-                    cluster.append(q)
-                    _min_score_q = min(_min_score_q, float(score))
-
-            if len(cluster) >= 2:
-                if _has_perunit_mismatch(cluster, latest_prices):
-                    continue
-                confidence = min(_min_score_q / 100.0, _QUART_CONF_CAP)
-                persisted = _persist_match(session, cluster, confidence)
-                if persisted:
-                    created_or_updated += persisted
-                    visited.update(c.id for c in cluster)
+    run_pass(by_auto_brand.values(), threshold=_QUART_THRESHOLD, conf_cap=_QUART_CONF_CAP)
 
     session.commit()
     log.info("matcher_done", clusters=created_or_updated)
@@ -2441,13 +2760,7 @@ def _persist_match(session: Session, cluster: Sequence[Product], confidence: flo
     в следующем прогоне та пара заражала ещё одну — кластер раздувался
     до 70+ разных вариантов одного бренда.
     """
-    from src.product_policy import (
-        OFFER_OUT_OF_STOCK,
-        country_code_of,
-        country_policy_enforced,
-        current_offer_eligibility,
-        availability_policy_enforced,
-    )
+    from src.product_policy import country_code_of
 
     tenant_ids = {int(getattr(product, "tenant_id", 1)) for product in cluster}
     if len(tenant_ids) != 1:
@@ -2479,12 +2792,36 @@ def _persist_match(session: Session, cluster: Sequence[Product], confidence: flo
                 for p in existing_match.products
                 if p not in cohort and p.tenant_id == tenant_id
             )
+    # Проход сверяет кандидата только с теми членами кластера, что лежат в его
+    # бакете. Остальные (другая запись дозы, другой бренд в поле brand) новичку
+    # не встречались — сверяем здесь, иначе «(qulaq damcısı)» входит в кластер
+    # с «göz damcısı» через третьего, краткого, члена.
+    listed = {id(product) for product in cluster}
+    for newcomer in cluster:
+        if newcomer.canonical_id is not None:
+            continue
+        for member in cohort:
+            if id(member) in listed or member.site == newcomer.site:
+                continue
+            if _hard_conflict(member, newcomer) or is_rejected(session, member.id, newcomer.id):
+                log.info(
+                    "persist_match_member_conflict",
+                    product_id=newcomer.id,
+                    member_id=member.id,
+                    match_id=member.canonical_id,
+                )
+                return 0
+    if len(existing_match_ids) > 1:
+        # Товары уже состоят в разных кластерах. Раньше выбирался произвольный
+        # из них и остальные перетаскивались в него — автоматически так не делаем.
+        log.info(
+            "persist_match_spans_clusters",
+            product_ids=[product.id for product in cluster],
+            match_ids=sorted(existing_match_ids),
+        )
+        return 0
     for idx, left in enumerate(cohort):
-        if getattr(left, "offer_availability_status", None) == OFFER_OUT_OF_STOCK:
-            return 0
-        if availability_policy_enforced() and not current_offer_eligibility(left).eligible:
-            return 0
-        if country_policy_enforced() and country_code_of(left) is None:
+        if _unmatchable_reason(left) is not None:
             return 0
         for right in cohort[idx + 1 :]:
             if left.site != right.site and _has_conflicting_pack_count(left, right):
@@ -2548,6 +2885,12 @@ def _persist_match(session: Session, cluster: Sequence[Product], confidence: flo
 
     for p in cluster:
         p.canonical_id = match.id
+    # Сессии проекта — без autoflush, а состав кластера (`match.products`) ниже
+    # и в следующих вызовах читается из БД: без flush товар, принятый минуту
+    # назад, в составе не виден, его сайт считается свободным, и в кластер
+    # входит второй товар того же сайта.
+    session.flush()
+    session.expire(match, ["products"])
 
     return 1
 
