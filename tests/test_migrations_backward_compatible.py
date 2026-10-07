@@ -2,29 +2,35 @@
 
 Зачем тест: `deploy.yml` сначала обновляет базу и только потом копирует код и
 рестартует сервисы — иначе новый код оказывался на старой схеме, и процессы,
-которые таймеры запускают весь день, падали. Цена этого порядка: между
-миграцией и рестартом (около минуты) на НОВОЙ схеме работает ПРОШЛЫЙ релиз —
-API из памяти и CLI с диска. Добавленную колонку или таблицу он не замечает.
-Удалённую или переименованную — читает и падает; на новую обязательную колонку
-без значения по умолчанию не может вставить строку.
+которые таймеры запускают весь день, падали. Цена этого порядка: после
+миграции на НОВОЙ схеме какое-то время работает ПРОШЛЫЙ релиз — API из памяти
+до рестарта, CLI с диска, сбор, начатый до выкладки, до своего конца. Новую
+необязательную колонку или таблицу он не замечает. Удалённую или
+переименованную — читает и падает; на новую обязательную колонку или новое
+ограничение натыкается при записи.
 
-Такое изменение делается в два релиза: сначала код, который этим больше не
-пользуется, следующим релизом — миграция. Во втором релизе в файле миграции
-пишется `PREVIOUS_RELEASE_COMPATIBLE = "<почему прошлый релиз этого не заметит>"`
-— тест её пропустит, а разбирающий PR увидит, на что автор опирается.
+Тест устроен как разрешительный список, а не как список запретов: известно
+безопасное — новая таблица, новый неуникальный индекс, новая колонка, которую
+можно не заполнять, и чтение (`SELECT`). Всё остальное, что миграция делает со
+схемой или данными, требует письменного объяснения в самом файле:
 
-Покрываем каждую миграцию в каталоге (на 2026-10-07 ни одна из 23 под запрет не
-попадает, так что отсчёт с какого-то номера не нужен):
-- удаление и переименование таблиц и колонок, `alter_column`
-- новую колонку NOT NULL без `server_default`
-- `DROP TABLE` и `ALTER TABLE … DROP / RENAME / ALTER COLUMN / SET NOT NULL`,
-  записанные сырым SQL в `op.execute` / `sa.text`
+    PREVIOUS_RELEASE_COMPATIBLE = "почему прошлый релиз этого не заметит"
 
-Чего тест не видит: смысл. Он читает текст миграции, а не код прошлого релиза,
-поэтому не знает, пользуется ли тот удаляемой колонкой, и не заметит запрет,
-записанный непривычно (SQL, собранный из частей; ограничение, добавленное
-отдельным `create_check_constraint`). Это сторож от привычной ошибки, а не
-доказательство совместимости.
+Так незнакомое — красное. Список запретов пропускал бы всё, чего в нём нет:
+ограничение уникальности, обязательную колонку сырым SQL, SQL из переменной.
+
+Удаление и переименование делается в два релиза: сначала код, который этим
+больше не пользуется, следующим релизом — миграция с объяснением.
+
+Покрываем миграции с 0024: всё до неё применено на проде при прежнем порядке
+выкладки. Смотрим только то, что достижимо из `upgrade`: откат прошлому релизу
+не мешает.
+
+Чего тест не видит: правду. Он читает текст миграции, а не код прошлого релиза,
+и не знает, верно ли объяснение, — его читает тот, кто разбирает PR. Не видит и
+обход, записанный так, что вызов не похож на вызов (`getattr(op, name)(…)`).
+Это сторож, который заставляет автора остановиться и написать, на что он
+опирается, а не доказательство совместимости.
 """
 
 from __future__ import annotations
@@ -36,25 +42,28 @@ from pathlib import Path
 import pytest
 
 VERSIONS = Path(__file__).resolve().parent.parent / "migrations" / "versions"
+FIRST_GUARDED = 24
 MARKER = "PREVIOUS_RELEASE_COMPATIBLE"
-MARKER_MIN_LENGTH = 40
+NOTE_MIN_WORDS = 6
 
-BREAKING_OPS = {"drop_column", "drop_table", "rename_table", "alter_column"}
-SQL_CALLS = {"execute", "text"}
-# Оператор целиком, а не слово где-нибудь в строке: «drop table» в данных,
-# которые миграция вставляет, запретом не считается.
-DROP_TABLE_SQL = re.compile(r"DROP\s+TABLE\b", re.IGNORECASE)
-ALTER_TABLE_SQL = re.compile(r"ALTER\s+TABLE\b", re.IGNORECASE)
-# Внутри ALTER TABLE — всё, что отнимает или меняет уже существующее.
-# DROP CONSTRAINT / DROP DEFAULT / DROP NOT NULL только ослабляют схему.
-ALTER_TABLE_BREAKING = re.compile(
-    r"\b(DROP\s+(?!CONSTRAINT\b|DEFAULT\b|NOT\s+NULL\b)|RENAME\b|ALTER\s+COLUMN\b.*\bTYPE\b"
-    r"|SET\s+NOT\s+NULL\b)",
-    re.IGNORECASE | re.DOTALL,
-)
+# Вызовы `op.…`, которые прошлый релиз не замечает. `add_column` и
+# `create_index` — с оговорками, см. `_op_finding`.
+ALWAYS_SAFE_OPS = {"create_table", "get_bind", "get_context", "f"}
+# Через эти методы в базу уходит SQL — у `op`, соединения или сессии.
+SQL_METHODS = {"execute", "exec_driver_sql", "executemany", "scalar", "scalars"}
+SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
 
 
-def _call_name(node: ast.Call) -> str:
+def _is_op_call(node: ast.Call) -> bool:
+    function = node.func
+    return (
+        isinstance(function, ast.Attribute)
+        and isinstance(function.value, ast.Name)
+        and function.value.id == "op"
+    )
+
+
+def _called_name(node: ast.Call) -> str:
     if isinstance(node.func, ast.Attribute):
         return node.func.attr
     if isinstance(node.func, ast.Name):
@@ -62,65 +71,111 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
-def _outside_downgrade(tree: ast.Module):
-    """Все узлы модуля, кроме тела `downgrade`: откат прошлому релизу не мешает."""
-    pending: list[ast.AST] = [tree]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, ast.FunctionDef) and node.name == "downgrade":
-            continue
-        yield node
-        pending.extend(ast.iter_child_nodes(node))
+def _keywords(node: ast.Call) -> dict[str | None, ast.expr]:
+    return {keyword.arg: keyword.value for keyword in node.keywords}
+
+
+def _is_constant(node: ast.expr | None, value: object) -> bool:
+    return isinstance(node, ast.Constant) and node.value is value
 
 
 def _adds_required_column(call: ast.Call) -> bool:
     for node in ast.walk(call):
-        if not (isinstance(node, ast.Call) and _call_name(node) == "Column"):
+        if not (isinstance(node, ast.Call) and _called_name(node) == "Column"):
             continue
-        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        keywords = _keywords(node)
         nullable = keywords.get("nullable")
-        if (
-            isinstance(nullable, ast.Constant)
-            and nullable.value is False
-            and "server_default" not in keywords
-        ):
+        # nullable=True или не задан — колонку можно не заполнять. Всё прочее
+        # (False, выражение) без значения по умолчанию ломает вставку.
+        optional = nullable is None or _is_constant(nullable, True)
+        if not optional and "server_default" not in keywords:
             return True
     return False
 
 
-def _breaking_sql(sql: str) -> list[str]:
-    findings = []
-    for statement in sql.split(";"):
-        statement = statement.strip()
-        if DROP_TABLE_SQL.match(statement):
-            findings.append("DROP TABLE")
-        elif ALTER_TABLE_SQL.match(statement) and ALTER_TABLE_BREAKING.search(statement):
-            findings.append("ALTER TABLE, который отнимает или меняет существующее")
-    return findings
+def _sql_finding(node: ast.Call) -> str | None:
+    """SQL безопасен, только если он записан прямо здесь и это чтение."""
+    if not node.args and not node.keywords:
+        return None  # `.scalar()` у готового результата — SQL сюда не передан
+    literals = [
+        part.value
+        for part in ast.walk(node)
+        if isinstance(part, ast.Constant) and isinstance(part.value, str)
+    ]
+    statements = [
+        statement.strip()
+        for literal in literals
+        for statement in SQL_COMMENT.sub(" ", literal).split(";")
+        if statement.strip()
+    ]
+    if not statements:
+        return "SQL не записан литералом — что он делает, отсюда не видно"
+    for statement in statements:
+        verb = statement.split()[0].upper()
+        if verb != "SELECT":
+            return f"SQL: {verb}"
+    return None
 
 
-def breaking_changes(source: str) -> list[str]:
-    """Что в миграции сломает код, написанный до неё."""
-    findings: list[str] = []
-    for node in _outside_downgrade(ast.parse(source)):
-        if not isinstance(node, ast.Call):
+def _op_finding(node: ast.Call) -> str | None:
+    name = _called_name(node)
+    if name in ALWAYS_SAFE_OPS:
+        return None
+    if name == "add_column":
+        return "add_column NOT NULL без server_default" if _adds_required_column(node) else None
+    if name == "create_index":
+        unique = _keywords(node).get("unique")
+        return None if unique is None or _is_constant(unique, False) else "create_index unique"
+    if name in SQL_METHODS:
+        return _sql_finding(node)
+    return f"op.{name}"
+
+
+def _reachable_from_upgrade(tree: ast.Module) -> list[ast.AST]:
+    """Тело `upgrade`, функции модуля, на которые оно ссылается, и код вне функций."""
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    reached: list[str] = []
+    queue = ["upgrade"]
+    while queue:
+        name = queue.pop()
+        if name in reached or name not in functions:
             continue
-        name = _call_name(node)
-        if name in BREAKING_OPS:
-            findings.append(f"{name} (строка {node.lineno})")
-        elif name == "add_column" and _adds_required_column(node):
-            findings.append(f"add_column NOT NULL без server_default (строка {node.lineno})")
-        elif name in SQL_CALLS:
-            for part in ast.walk(node):
-                if isinstance(part, ast.Constant) and isinstance(part.value, str):
-                    findings.extend(
-                        f"SQL: {found} (строка {part.lineno})"
-                        for found in _breaking_sql(part.value)
-                    )
-    return sorted(set(findings))
+        reached.append(name)
+        queue.extend(
+            node.id
+            for node in ast.walk(functions[name])
+            if isinstance(node, ast.Name) and node.id in functions
+        )
+    module_level = [
+        node for node in tree.body if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    ]
+    return [functions[name] for name in reached] + module_level
+
+
+def unexplained_changes(source: str) -> list[str]:
+    """Что миграция делает сверх известного безопасного."""
+    findings: set[str] = set()
+    for root in _reachable_from_upgrade(ast.parse(source)):
+        for node in ast.walk(root):
+            if not isinstance(node, ast.Call):
+                continue
+            if _is_op_call(node):
+                finding = _op_finding(node)
+            elif _called_name(node) in SQL_METHODS and isinstance(node.func, ast.Attribute):
+                finding = _sql_finding(node)
+            else:
+                finding = None
+            if finding:
+                findings.add(f"{finding} (строка {node.lineno})")
+    return sorted(findings)
 
 
 def compatibility_note(source: str) -> str | None:
+    """Объяснение автора: строка на уровне модуля, не короче нескольких слов."""
     for node in ast.parse(source).body:
         targets: list[ast.expr] = []
         if isinstance(node, ast.Assign):
@@ -130,7 +185,11 @@ def compatibility_note(source: str) -> str | None:
         if not any(isinstance(target, ast.Name) and target.id == MARKER for target in targets):
             continue
         value = node.value
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        if (
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+            and len(value.value.split()) >= NOTE_MIN_WORDS
+        ):
             return value.value
     return None
 
@@ -142,37 +201,40 @@ def _number(path: Path) -> int:
 
 
 def test_every_migration_is_numbered_so_none_escapes_the_guard() -> None:
+    """Сторож отбирает миграции по номеру: файл без номера прошёл бы мимо него."""
     files = sorted(VERSIONS.glob("*.py"))
     assert files, "каталог миграций пуст — путь в тесте устарел?"
     numbers = [_number(path) for path in files]
     assert len(numbers) == len(set(numbers)), "два файла миграций с одним номером"
+    assert max(numbers) >= FIRST_GUARDED - 1, "отсчёт сторожа опередил каталог миграций"
 
 
 def test_new_migrations_keep_the_previous_release_working() -> None:
     problems = []
     for path in sorted(VERSIONS.glob("*.py")):
+        if _number(path) < FIRST_GUARDED:
+            continue
         source = path.read_text(encoding="utf-8")
-        findings = breaking_changes(source)
-        note = compatibility_note(source)
-        if findings and (note is None or len(note.strip()) < MARKER_MIN_LENGTH):
+        findings = unexplained_changes(source)
+        if findings and compatibility_note(source) is None:
             problems.append(f"{path.name}: {', '.join(findings)}")
     assert not problems, (
-        "Миграция меняет схему так, что код прошлого релиза на ней не работает:\n  "
+        "Миграция делает то, о чём неизвестно, переживёт ли это код прошлого релиза:\n  "
         + "\n  ".join(problems)
-        + "\ndeploy.yml применяет миграцию ДО копирования кода и рестарта: около минуты "
-        "на новой схеме живёт прошлый релиз (API из памяти, CLI таймеров с диска). "
-        "Раздели на два релиза: сначала код, который этим не пользуется, следующим "
-        "релизом — миграция. Если прошлый релиз этим уже не пользуется, запиши в файле "
-        f'миграции {MARKER} = "<почему>" (не короче {MARKER_MIN_LENGTH} знаков).'
+        + "\ndeploy.yml применяет миграцию ДО копирования кода и рестарта: на новой схеме "
+        "какое-то время живёт прошлый релиз (API из памяти, CLI таймеров с диска, сбор, "
+        "начатый до выкладки). Удаление и переименование — в два релиза: сначала код, "
+        "который этим не пользуется, следующим релизом миграция. Если прошлый релиз "
+        f'изменения не заметит, напиши в файле миграции {MARKER} = "<почему>" '
+        f"(не короче {NOTE_MIN_WORDS} слов) — это прочтёт тот, кто разбирает PR."
     )
 
 
-def _kinds(source: str) -> list[str]:
-    """Находки без номеров строк: тест про то, ЧТО найдено."""
-    return [re.sub(r" \(строка \d+\)$", "", finding) for finding in breaking_changes(source)]
+def test_the_additive_migration_that_prompted_the_rule_needs_no_note() -> None:
+    """0023 добавила необязательную колонку — ровно то, что порядок разрешает."""
+    (path,) = VERSIONS.glob("0023_*.py")
+    assert unexplained_changes(path.read_text(encoding="utf-8")) == []
 
-
-ALTERS = "SQL: ALTER TABLE, который отнимает или меняет существующее"
 
 MIGRATION = """
 import sqlalchemy as sa
@@ -193,33 +255,49 @@ def _migration(upgrade: str, *, downgrade: str = "    pass", header: str = "") -
     return MIGRATION.format(upgrade=upgrade, downgrade=downgrade, header=header)
 
 
+def _kinds(source: str) -> list[str]:
+    """Находки без номеров строк: тест про то, ЧТО найдено."""
+    return [re.sub(r" \(строка \d+\)$", "", finding) for finding in unexplained_changes(source)]
+
+
+NOT_LITERAL = "SQL не записан литералом — что он делает, отсюда не видно"
+
+
 @pytest.mark.parametrize(
     ("upgrade", "expected"),
     [
-        ('    op.drop_column("t", "c")', ["drop_column"]),
-        ('    op.drop_table("t")', ["drop_table"]),
-        ('    op.rename_table("t", "u")', ["rename_table"]),
-        ('    op.alter_column("t", "c", new_column_name="d")', ["alter_column"]),
+        ('    op.drop_column("t", "c")', ["op.drop_column"]),
+        ('    op.drop_table("t")', ["op.drop_table"]),
+        ('    op.rename_table("t", "u")', ["op.rename_table"]),
+        ('    op.alter_column("t", "c", new_column_name="d")', ["op.alter_column"]),
         (
             '    with op.batch_alter_table("t") as batch:\n        batch.drop_column("c")',
-            ["drop_column"],
+            ["op.batch_alter_table"],
         ),
         (
             '    op.add_column("t", sa.Column("c", sa.Integer(), nullable=False))',
             ["add_column NOT NULL без server_default"],
         ),
-        ('    op.execute("DROP TABLE t")', ["SQL: DROP TABLE"]),
-        ('    op.execute("ALTER TABLE t DROP COLUMN c")', [ALTERS]),
-        # В PostgreSQL слово COLUMN необязательно.
-        ('    op.execute("ALTER TABLE t DROP c")', [ALTERS]),
-        ('    op.execute(sa.text("alter table t  rename  to u"))', [ALTERS]),
-        ('    op.execute("ALTER TABLE t ALTER COLUMN c SET NOT NULL")', [ALTERS]),
-        ('    op.execute("ALTER TABLE t ALTER COLUMN c TYPE text")', [ALTERS]),
-        ('    op.execute("UPDATE t SET c = 1; DROP TABLE old_t")', ["SQL: DROP TABLE"]),
+        # Ограничение прошлый релиз встретит при записи.
+        ('    op.create_unique_constraint("uq", "t", ["c"])', ["op.create_unique_constraint"]),
+        ('    op.create_check_constraint("ck", "t", "c > 0")', ["op.create_check_constraint"]),
+        ('    op.create_index("ix", "t", ["c"], unique=True)', ["create_index unique"]),
+        ('    op.execute("DROP TABLE t")', ["SQL: DROP"]),
+        ('    op.execute("ALTER TABLE t ADD COLUMN c int NOT NULL")', ["SQL: ALTER"]),
+        ('    op.execute(sa.text("alter table t rename to u"))', ["SQL: ALTER"]),
+        ('    op.execute("-- чистка\\nDROP TABLE t")', ["SQL: DROP"]),
+        ('    op.execute("SELECT 1; DELETE FROM t")', ["SQL: DELETE"]),
+        ('    op.execute("UPDATE t SET c = 1")', ["SQL: UPDATE"]),
+        ('    op.get_bind().exec_driver_sql("TRUNCATE t")', ["SQL: TRUNCATE"]),
+        ('    op.get_bind().execute(sa.text("INSERT INTO t (c) VALUES (1)"))', ["SQL: INSERT"]),
+        # Что уйдёт в базу, отсюда не видно — значит, объяснять.
+        ("    op.execute(SQL)", [NOT_LITERAL]),
+        ("    op.get_bind().execute(sa.insert(table).values(c=1))", [NOT_LITERAL]),
+        ('    op.bulk_insert(table, [{"c": 1}])', ["op.bulk_insert"]),
     ],
 )
-def test_breaking_changes_are_found(upgrade: str, expected: list[str]) -> None:
-    assert _kinds(_migration(upgrade)) == expected
+def test_anything_beyond_the_safe_list_is_reported(upgrade: str, expected: list[str]) -> None:
+    assert _kinds(_migration(upgrade, header='SQL = "DROP TABLE t"')) == expected
 
 
 @pytest.mark.parametrize(
@@ -230,38 +308,53 @@ def test_breaking_changes_are_found(upgrade: str, expected: list[str]) -> None:
         '    op.add_column("t", sa.Column("c", sa.Integer(), nullable=False, server_default="0"))',
         '    op.create_table("t", sa.Column("id", sa.Integer(), primary_key=True))',
         '    op.create_index("ix_t_c", "t", ["c"])',
-        "    op.execute(\"INSERT INTO t (c) VALUES ('drop table t')\")",
-        '    op.execute("ALTER TABLE t ADD COLUMN c integer")',
-        '    op.execute("ALTER TABLE t DROP CONSTRAINT t_c_check")',
-        '    op.execute("ALTER TABLE t ALTER COLUMN c DROP NOT NULL")',
-        '    op.execute("ALTER TABLE t ALTER COLUMN c SET DEFAULT 0")',
+        '    op.create_index(op.f("ix_t_c"), "t", ["c"], unique=False)',
+        '    columns = sa.inspect(op.get_bind()).get_columns("t")',
+        '    rows = op.get_bind().execute(sa.text("SELECT id FROM t")).scalars().all()',
+        '    count = op.get_bind().execute(sa.text("SELECT count(*) FROM t")).scalar()',
         '    """drop column — только слова в описании"""\n    op.create_index("ix", "t", ["c"])',
     ],
 )
-def test_additive_changes_pass(upgrade: str) -> None:
-    assert breaking_changes(_migration(upgrade)) == []
+def test_known_safe_changes_need_no_note(upgrade: str) -> None:
+    assert _kinds(_migration(upgrade)) == []
 
 
-def test_downgrade_may_remove_what_upgrade_added() -> None:
+def test_downgrade_and_its_helpers_are_not_examined() -> None:
     source = _migration(
         '    op.add_column("t", sa.Column("c", sa.Integer(), nullable=True))',
-        downgrade='    op.drop_column("t", "c")',
+        downgrade="    _undo()",
+        header='def _undo() -> None:\n    op.drop_column("t", "c")\n',
     )
-    assert breaking_changes(source) == []
+    assert _kinds(source) == []
 
 
-def test_a_helper_called_from_upgrade_does_not_hide_the_change() -> None:
-    source = _migration(
+def test_a_helper_reached_from_upgrade_is_examined() -> None:
+    called = _migration(
         "    _cleanup()", header='def _cleanup() -> None:\n    op.drop_table("t")\n'
     )
-    assert _kinds(source) == ["drop_table"]
+    assert _kinds(called) == ["op.drop_table"]
+    passed_around = _migration(
+        "    for step in (_cleanup,):\n        step()",
+        header='def _cleanup() -> None:\n    op.drop_table("t")\n',
+    )
+    assert _kinds(passed_around) == ["op.drop_table"]
 
 
-def test_the_note_is_read_only_as_a_module_level_string() -> None:
-    reason = "колонку перестал читать релиз от 2026-10-01; здесь она только удаляется"
+def test_a_function_named_downgrade_inside_upgrade_hides_nothing() -> None:
+    source = _migration(
+        '    def downgrade() -> None:\n        op.drop_table("t")\n\n    downgrade()'
+    )
+    assert _kinds(source) == ["op.drop_table"]
+
+
+def test_the_note_must_be_a_module_level_sentence() -> None:
+    reason = "колонку перестал читать релиз от 2026-10-01, здесь она только удаляется"
     assert compatibility_note(_migration("    pass", header=f'{MARKER} = "{reason}"')) == reason
     assert (
         compatibility_note(_migration("    pass", header=f'{MARKER}: str = "{reason}"')) == reason
     )
     assert compatibility_note(_migration("    pass", header=f"{MARKER} = True")) is None
     assert compatibility_note(_migration(f'    {MARKER} = "{reason}"')) is None
+    # Отписка вместо объяснения не считается.
+    assert compatibility_note(_migration("    pass", header=f'{MARKER} = "{"x" * 60}"')) is None
+    assert compatibility_note(_migration("    pass", header=f'{MARKER} = "всё хорошо"')) is None

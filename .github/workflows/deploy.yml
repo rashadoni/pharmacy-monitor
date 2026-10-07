@@ -28,16 +28,24 @@ name: Deploy to production
 #     3. бэкап и `alembic upgrade` исполняются из этого каталога, то есть
 #        миграция видит src и env.py своего релиза, а не прошлого;
 #     4. код копируется в живой каталог, только если ревизия базы равна голове
-#        релиза. Любой отказ до этого места оставляет прод как был.
+#        релиза.
+#   Отказ ДО миграции оставляет прод как был. Отказ ПОСЛЕ неё (обрыв связи,
+#   отмена, упавший rsync) оставляет новую схему под прошлым кодом — это то же
+#   состояние, в котором выкладка и так проводит около минуты, и её можно
+#   запустить заново: ревизия базы читается из самой базы, а не через файлы
+#   миграций живого каталога. Вернуть прошлый коммит после миграции нельзя —
+#   в нём нет ревизии базы; чинить новым коммитом.
 #   Миграция ждёт блокировку таблицы не дольше MIGRATION_LOCK_TIMEOUT_MS и
 #   повторяется MIGRATION_LOCK_ATTEMPTS раз: пока она ждёт, за ней стоят все
-#   запросы к этой таблице, в том числе чтения API.
+#   запросы к этой таблице, в том числе чтения API. Предел — на ожидание, не на
+#   саму миграцию: долгая миграция держит таблицу, пока не закончит.
 #
-#   ЧЕГО ЭТО ТРЕБУЕТ ОТ МИГРАЦИИ: между миграцией и рестартом (~1 мин) на новой
-#   схеме работает ПРОШЛЫЙ релиз — API из памяти и CLI с диска. Миграция обязана
-#   быть с ним совместима: добавлять можно, удалять и переименовывать то, что
-#   он читает или пишет, — только следующим релизом после кода. Сторож —
-#   tests/test_migrations_backward_compatible.py.
+#   ЧЕГО ЭТО ТРЕБУЕТ ОТ МИГРАЦИИ: между миграцией и рестартом на новой схеме
+#   работает ПРОШЛЫЙ релиз — API из памяти (около минуты: копирование кода и
+#   сборка фронтенда), CLI с диска (секунды), сбор, начатый до выкладки, — до
+#   своего конца. Миграция обязана быть с ним совместима: добавлять можно,
+#   удалять и переименовывать то, что он читает или пишет, — только следующим
+#   релизом после кода. Сторож — tests/test_migrations_backward_compatible.py.
 
 on:
   workflow_dispatch:
@@ -79,11 +87,29 @@ jobs:
       - name: Preflight production DB revision against checkout
         run: |
           set -euo pipefail
-          current_output=$(ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
-            cd /opt/pharmacy-monitor
-            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
-            test -n "$db_url"
-            DATABASE_URL="$db_url" .venv/bin/alembic current')
+          # Straight from the database, not through `alembic current` in the
+          # live directory: Alembic resolves the revision against the migration
+          # files it finds there and refuses one it has no file for. That is
+          # exactly the state a deploy leaves when it dies after its migration
+          # and before the files are copied — and that deploy must be
+          # re-runnable.
+          current_output=$(ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/pharmacy-monitor
+          db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
+          test -n "$db_url"
+          DATABASE_URL="$db_url" .venv/bin/python - <<'PY'
+          import os
+
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+          with engine.connect() as connection:
+              for (revision,) in connection.execute(text("SELECT version_num FROM alembic_version")):
+                  print(revision)
+          PY
+          REMOTE
+          )
           printf '%s\n' "$current_output"
           current_count=$(printf '%s\n' "$current_output" | sed '/^[[:space:]]*$/d' | wc -l)
           test "$current_count" -eq 1
@@ -237,10 +263,12 @@ jobs:
           sha256sum --quiet -c "$work_dir/incoming/source-manifest"
           db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
           test -n "$db_url"
+          # </dev/null: this script itself arrives on stdin (bash -s); a child
+          # that read stdin would swallow the rest of it.
           staged_alembic() {
             PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" DATABASE_URL="$db_url" \
               /opt/pharmacy-monitor/.venv/bin/python -m alembic \
-              -c "$runtime_dir/alembic.ini" "$@"
+              -c "$runtime_dir/alembic.ini" "$@" </dev/null
           }
           heads=$(staged_alembic heads)
           printf '%s\n' "$heads"
@@ -252,9 +280,12 @@ jobs:
         if: ${{ inputs.apply_migrations }}
         env:
           WORK_DIR: ${{ steps.stage.outputs.work_dir }}
-          # How long one DDL statement may wait for its table lock. While it
-          # waits, every other query on that table queues behind it, so this
-          # is also the longest stall the API sees per attempt.
+          # How long one DDL statement may WAIT for its table lock; while it
+          # waits, every other query on that table queues behind it. It does
+          # not limit how long the lock is then HELD: the upgrade is one
+          # transaction, so a slow migration (a backfill, an index, several
+          # revisions at once) blocks readers of the tables it has already
+          # altered until it commits.
           MIGRATION_LOCK_TIMEOUT_MS: "5000"
           MIGRATION_LOCK_ATTEMPTS: "3"
         run: |
@@ -283,13 +314,15 @@ jobs:
           # migrations/env.py reads it and opens its connection with this
           # lock_timeout.
           export MIGRATION_LOCK_TIMEOUT_MS="$lock_timeout_ms"
+          # </dev/null: this script itself arrives on stdin (bash -s); a child
+          # that read stdin would swallow the rest of it.
           staged_alembic() {
             PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" DATABASE_URL="$db_url" \
               /opt/pharmacy-monitor/.venv/bin/python -m alembic \
-              -c "$runtime_dir/alembic.ini" "$@"
+              -c "$runtime_dir/alembic.ini" "$@" </dev/null
           }
 
-          bash "$runtime_dir/infra/scripts/backup.sh"
+          bash "$runtime_dir/infra/scripts/backup.sh" </dev/null
 
           # On PostgreSQL the whole upgrade is one transaction: an attempt that
           # times out on a lock changes nothing and can simply be repeated.
@@ -338,10 +371,12 @@ jobs:
           cd "$runtime_dir"
           db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
           test -n "$db_url"
+          # </dev/null: this script itself arrives on stdin (bash -s); a child
+          # that read stdin would swallow the rest of it.
           staged_alembic() {
             PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" DATABASE_URL="$db_url" \
               /opt/pharmacy-monitor/.venv/bin/python -m alembic \
-              -c "$runtime_dir/alembic.ini" "$@"
+              -c "$runtime_dir/alembic.ini" "$@" </dev/null
           }
           current=$(staged_alembic current | awk 'NF {print $1}')
           head=$(staged_alembic heads | awk 'NF {print $1}')
@@ -356,6 +391,17 @@ jobs:
       - name: Rsync code -> prod (src + frontend + canonical migrations)
         run: |
           set -euo pipefail
+          # Migrations first: the database may already be ahead of the files
+          # in the live directory, and until they catch up `alembic` run by
+          # hand from /opt/pharmacy-monitor cannot name the current revision.
+          # The whole directory, not only versions/: env.py carries the lock
+          # timeout, and that manual run must get the same protection the
+          # staged run above had.
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            --exclude='__pycache__/' --exclude='*.pyc' \
+            migrations/ pm@13.140.186.143:/opt/pharmacy-monitor/migrations/
+          rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
+            alembic.ini pm@13.140.186.143:/opt/pharmacy-monitor/alembic.ini
           rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
             src/ pm@13.140.186.143:/opt/pharmacy-monitor/src/
@@ -365,15 +411,6 @@ jobs:
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
             frontend/src/ pm@13.140.186.143:/opt/pharmacy-monitor/frontend/src/
-          # The whole migrations directory, not only versions/: env.py carries
-          # the lock timeout, and an operator who runs `alembic upgrade` by
-          # hand from /opt/pharmacy-monitor must get the same protection the
-          # staged run above had.
-          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
-            --exclude='__pycache__/' --exclude='*.pyc' \
-            migrations/ pm@13.140.186.143:/opt/pharmacy-monitor/migrations/
-          rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
-            alembic.ini pm@13.140.186.143:/opt/pharmacy-monitor/alembic.ini
           # Root-owned systemd installation remains an explicit post-release
           # operation, but its versioned units and reconciliation script must
           # be present in the runtime checkout for that operation to be

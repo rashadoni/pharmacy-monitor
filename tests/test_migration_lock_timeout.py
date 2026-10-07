@@ -9,9 +9,11 @@
 `migrations/env.py` открывает соединение с `lock_timeout`; `deploy.yml`
 повторяет попытку ограниченное число раз и отказывает с понятным текстом.
 
-Покрываем на настоящем PostgreSQL (в CI он есть, локально нужен DATABASE_URL):
+Покрываем на настоящем PostgreSQL (в CI он обязателен — там пропуск считается
+падением; локально нужен DATABASE_URL):
 - миграция за занятой таблицей падает за секунды, а не висит
-- упавшая попытка не меняет ни схему, ни ревизию — повтор проходит
+- упавшая попытка не меняет ни схему, ни ревизию, даже если до занятой таблицы
+  успела пройти другая миграция, — поэтому её можно повторять
 - текст ошибки содержит `LockNotAvailable`: по нему `deploy.yml` отличает
   «таблица занята» от настоящей ошибки миграции
 - предел по умолчанию, свой предел и опции из самой строки подключения
@@ -41,8 +43,8 @@ MIGRATION_TEMPLATE = '''"""probe"""
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0001_probe"
-down_revision: str | None = None
+revision: str = "{revision}"
+down_revision: str | None = {down_revision}
 branch_labels = None
 depends_on = None
 
@@ -56,6 +58,7 @@ def downgrade() -> None:
 '''
 
 ADD_COLUMN = '    op.add_column("probe", sa.Column("added", sa.Integer(), nullable=True))'
+CREATE_FIRST_STEP = '    op.create_table("first_step", sa.Column("id", sa.Integer()))'
 RECORD_SETTINGS = (
     "    op.execute(\n"
     '        "CREATE TABLE seen AS SELECT "\n'
@@ -67,9 +70,13 @@ RECORD_SETTINGS = (
 
 def _postgres_url() -> str:
     database_url = os.environ.get("DATABASE_URL", "")
-    if not database_url.startswith("postgresql"):
-        pytest.skip("PostgreSQL DATABASE_URL is required")
-    return database_url
+    if database_url.startswith("postgresql"):
+        return database_url
+    reason = "PostgreSQL DATABASE_URL is required"
+    if os.environ.get("CI"):
+        # В CI пропущенный тест зелёный: предел ожидания остался бы без проверки.
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 @pytest.fixture
@@ -88,15 +95,26 @@ def scratch_db_url():
         admin.dispose()
 
 
-def _project(tmp_path: Path, body: str) -> Path:
-    """Alembic-проект с настоящими alembic.ini и env.py и одной пробной миграцией."""
+def _project(tmp_path: Path, *bodies: str) -> Path:
+    """Alembic-проект с настоящими alembic.ini и env.py и цепочкой пробных миграций."""
     project = tmp_path / "project"
     versions = project / "migrations" / "versions"
     versions.mkdir(parents=True)
     shutil.copy(ROOT / "alembic.ini", project / "alembic.ini")
     shutil.copy(ROOT / "migrations" / "env.py", project / "migrations" / "env.py")
     shutil.copy(ROOT / "migrations" / "script.py.mako", project / "migrations" / "script.py.mako")
-    (versions / "0001_probe.py").write_text(MIGRATION_TEMPLATE.format(body=body), encoding="utf-8")
+    previous = None
+    for number, body in enumerate(bodies, start=1):
+        revision = f"{number:04d}_probe"
+        (versions / f"{revision}.py").write_text(
+            MIGRATION_TEMPLATE.format(
+                revision=revision,
+                down_revision=f'"{previous}"' if previous else "None",
+                body=body,
+            ),
+            encoding="utf-8",
+        )
+        previous = revision
     return project
 
 
@@ -122,7 +140,8 @@ def _alembic(
 def test_migration_behind_a_long_reader_fails_fast_and_changes_nothing(
     tmp_path: Path, scratch_db_url: str
 ) -> None:
-    project = _project(tmp_path, ADD_COLUMN)
+    # Первая миграция занятую таблицу не трогает и проходит, вторая упирается.
+    project = _project(tmp_path, CREATE_FIRST_STEP, ADD_COLUMN)
     engine = create_engine(scratch_db_url)
     with engine.begin() as connection:
         connection.execute(text("CREATE TABLE probe (id integer)"))
@@ -143,8 +162,9 @@ def test_migration_behind_a_long_reader_fails_fast_and_changes_nothing(
 
         observer = inspect(create_engine(scratch_db_url))
         assert [column["name"] for column in observer.get_columns("probe")] == ["id"]
-        # Вся попытка — одна транзакция: даже таблица ревизий не появилась.
-        assert "alembic_version" not in observer.get_table_names()
+        # Вся попытка — одна транзакция: откатилась и уже прошедшая первая
+        # миграция, и сама таблица ревизий. На этом держится повтор в deploy.yml.
+        assert observer.get_table_names() == ["probe"]
     finally:
         reader.rollback()
         reader.close()
@@ -154,10 +174,11 @@ def test_migration_behind_a_long_reader_fails_fast_and_changes_nothing(
 
     observer = inspect(create_engine(scratch_db_url))
     assert [column["name"] for column in observer.get_columns("probe")] == ["id", "added"]
+    assert "first_step" in observer.get_table_names()
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalars().all() == ["0001_probe"]
+        ).scalars().all() == ["0002_probe"]
     engine.dispose()
 
 

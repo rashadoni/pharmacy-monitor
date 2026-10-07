@@ -188,6 +188,7 @@ def event(kind, **fields):
 
 STUBS = {
     "ssh": r"""
+import os
 import subprocess
 import sys
 
@@ -202,12 +203,20 @@ if destination != "pm@13.140.186.143":
     sys.exit(f"stub ssh: unexpected destination {destination}")
 script = sys.stdin.read()
 _sbx.event("ssh", remote=remote, script=script)
+# ssh не переносит окружение: на сервер попадает только то, что передано
+# аргументами или выставлено в самом удалённом скрипте.
+server_env = {
+    key: value
+    for key, value in os.environ.items()
+    if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"} or key.startswith("SBX_")
+}
 result = subprocess.run(
     ["bash", "-c", _sbx.to_sandbox(remote)],
     input=_sbx.to_sandbox(script),
     text=True,
     capture_output=True,
     cwd=_sbx.LIVE,  # домашний каталог pm на сервере
+    env=server_env,
 )
 sys.stdout.write(_sbx.from_sandbox(result.stdout))
 sys.stderr.write(_sbx.from_sandbox(result.stderr))
@@ -233,7 +242,10 @@ while index < len(args):
     index += 1
 if destination is None:
     sys.exit("stub rsync: no remote destination")
-_sbx.event("rsync", destination=destination, live=".deploy-stage." not in destination)
+live = ".deploy-stage." not in destination
+_sbx.event("rsync", destination=destination, live=live)
+if live and (_sbx.SBX / "live-rsync-must-fail").exists():
+    sys.exit("rsync: connection unexpectedly closed")
 real = os.environ["SBX_REAL_RSYNC"]
 os.execv(real, [real, *translated])
 """,
@@ -257,6 +269,8 @@ import sys
 import _sbx
 
 _sbx.event("curl", argv=sys.argv[1:])
+if (_sbx.SBX / "api-is-down").exists() and any(":8080" in arg for arg in sys.argv[1:]):
+    sys.exit(7)  # connection refused
 print('<html lang="ru">')
 """,
     "sleep": r"""
@@ -307,6 +321,9 @@ if args[:2] == ["-m", "alembic"]:
     if rest[:1] == ["-c"]:
         rest = rest[2:]
     command = rest[0]
+    # Скрипт шага приходит на сервер через stdin (`bash -s`). Миграция, которая
+    # читает stdin, съела бы его остаток, и шаг завершился бы зелёным на середине.
+    sys.stdin.read()
     _sbx.event(
         "alembic",
         command=command,
@@ -328,20 +345,29 @@ if args[:2] == ["-m", "alembic"]:
             }
             print(messages[failure], file=sys.stderr)
             sys.exit(1)
+# На сервере пакет поставлен в режиме разработки: .pth держит живой каталог на
+# sys.path. Здесь то же самое место занимает хвост PYTHONPATH — после каталога
+# релиза, если шаг его задал.
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    part for part in (os.environ.get("PYTHONPATH"), str(_sbx.LIVE)) if part
+)
 real = os.environ["SBX_REAL_PYTHON"]
 os.execv(real, [real, *args])
 """
 
 BACKUP_STUB = r"""#!/usr/bin/env bash
 set -eo pipefail
-"$SBX_REAL_PYTHON" - <<'PY'
+# Скрипт шага приходит на сервер через stdin (`bash -s`). Бэкап, который читает
+# stdin, съел бы его остаток — миграция не запустилась бы, а шаг был бы зелёным.
+cat >/dev/null
+BACKUP_SCRIPT="$0" "$SBX_REAL_PYTHON" - <<'PY'
 import os
 import sys
 
 sys.path.insert(0, os.environ["SBX_BIN"])
 import _sbx
 
-_sbx.event("backup")
+_sbx.event("backup", script=_sbx.from_sandbox(os.path.abspath(os.environ["BACKUP_SCRIPT"])))
 PY
 if [[ -e "$SBX_ROOT/backup-must-fail" ]]; then
     echo "pg_dump: error: connection to server failed" >&2
@@ -368,10 +394,10 @@ def _write_release(target: Path, *, release: str, revisions: list[str]) -> None:
         encoding="utf-8",
     )
     (target / "src" / "RELEASE").write_text(release + "\n", encoding="utf-8")
-    if release == "new":
-        (target / "src" / "release_probe.py").write_text(
-            'VALUE = "from the staged release"\n', encoding="utf-8"
-        )
+    # Модуль есть в обоих релизах и на sys.path оба каталога: по значению видно,
+    # чей src взяла миграция.
+    source = "the staged release" if release == "new" else "the live directory"
+    (target / "src" / "release_probe.py").write_text(f'VALUE = "from {source}"\n', encoding="utf-8")
 
     versions = target / "migrations" / "versions"
     versions.mkdir(parents=True)
@@ -379,12 +405,13 @@ def _write_release(target: Path, *, release: str, revisions: list[str]) -> None:
     for name in ("env.py", "script.py.mako", "README"):
         shutil.copy(ROOT / "migrations" / name, target / "migrations" / name)
     if release == "old":
-        # На сервере env.py прошлого релиза: правка обязана доехать выкладкой.
-        (target / "migrations" / "env.py").write_text(
-            (target / "migrations" / "env.py").read_text(encoding="utf-8")
-            + "\n# previous release\n",
-            encoding="utf-8",
-        )
+        # На сервере env.py и alembic.ini прошлого релиза: правка обязана
+        # доехать выкладкой. И файл, которого в релизе уже нет.
+        for stale in (target / "migrations" / "env.py", target / "alembic.ini"):
+            stale.write_text(
+                stale.read_text(encoding="utf-8") + "\n# previous release\n", encoding="utf-8"
+            )
+        (versions / "removed_from_the_release.txt").write_text("stale\n", encoding="utf-8")
     for revision in revisions:
         (versions / f"{revision}.py").write_text(MIGRATIONS[revision], encoding="utf-8")
 
@@ -577,7 +604,16 @@ def run_workflow(
     ``without`` — шаги, которых как будто нет в workflow: так проверяется, что
     следующая проверка держит и одна. ``before`` — что сделать перед шагом.
     """
-    steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["deploy"]["steps"]
+    job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["deploy"]
+    # Стенд исполняет только то, что понимает. `continue-on-error`, `shell`,
+    # `working-directory`, `env` на уровне джобы меняют поведение раннера —
+    # молча пропустить их значило бы проверять не тот workflow.
+    unknown = set(job) - {"name", "runs-on", "concurrency", "steps"}
+    assert not unknown, f"стенд не знает ключи джобы: {sorted(unknown)}"
+    steps = job["steps"]
+    for step in steps:
+        unknown = set(step) - {"name", "id", "if", "env", "run", "uses"}
+        assert not unknown, f"стенд не знает ключи шага {step.get('name')!r}: {sorted(unknown)}"
     context = {
         "inputs": {"apply_migrations": apply_migrations},
         "secrets": {"SSH_PRIVATE_KEY": "not-a-real-key"},
@@ -636,16 +672,26 @@ def run_workflow(
     return result
 
 
-pytestmark = [
-    pytest.mark.skipif(
-        not all(shutil.which(tool) for tool in ("rsync", "git", "ssh-keygen", "sha256sum")),
-        reason="стенду выкладки нужны rsync, git, ssh-keygen и sha256sum",
-    ),
-    pytest.mark.skipif(
-        hasattr(os, "geteuid") and os.geteuid() == 0,
-        reason="под root не проверить, что юнит недоступен для записи",
-    ),
-]
+@pytest.fixture(autouse=True)
+def _stand_requirements() -> None:
+    """Без инструментов стенд ничего не проверяет.
+
+    Локально это пропуск. В CI — падение: пропущенный тест там зелёный, и
+    порядок выкладки остался бы без проверки, а никто бы не заметил.
+    """
+    missing = [
+        tool for tool in ("rsync", "git", "ssh-keygen", "sha256sum") if not shutil.which(tool)
+    ]
+    reason = None
+    if missing:
+        reason = f"стенду выкладки не хватает: {', '.join(missing)}"
+    elif hasattr(os, "geteuid") and os.geteuid() == 0:
+        reason = "под root не проверить, что юнит недоступен для записи"
+    if reason is None:
+        return
+    if os.environ.get("CI"):
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 @pytest.fixture
@@ -692,13 +738,17 @@ def test_migration_runs_while_the_previous_release_is_still_live(
     # …и идёт она из отдельного каталога, на src и env.py своего релиза.
     assert re.fullmatch(r"/opt/pharmacy-monitor/\.deploy-stage\.\w{6}/runtime", upgrade["cwd"])
     assert upgrade["pythonpath"] == upgrade["cwd"]
+    # Предел ожидания блокировки выставляет сам удалённый скрипт: окружение
+    # шага на сервер не переносится.
     assert upgrade["lock_timeout_ms"] == "5000"
+    # Модуль с тем же именем лежит и в живом каталоге, и он тоже на sys.path.
     assert sandbox.probe_rows() == [(1, "from the staged release")]
 
     backups = sandbox.events("backup")
     assert len(backups) == 1
     assert backups[0]["at"] < upgrade["at"], "бэкап должен быть снят до миграции"
     assert backups[0]["db_revision"] == BASE
+    assert backups[0]["script"] == f"{upgrade['cwd']}/infra/scripts/backup.sh"
 
     live_copies = sandbox.events("rsync", live=True)
     assert live_copies, "код так и не скопирован в живой каталог"
@@ -708,12 +758,16 @@ def test_migration_runs_while_the_previous_release_is_still_live(
     staged_copies = sandbox.events("rsync", live=False)
     assert max(event["at"] for event in staged_copies) < upgrade["at"]
 
+    # Файлы миграций — первыми: база уже впереди живого каталога.
+    assert live_copies[0]["destination"] == "/opt/pharmacy-monitor/migrations/"
+
     assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "new"
-    assert (sandbox.live / "migrations" / "versions" / f"{HEAD}.py").exists()
+    versions = sandbox.live / "migrations" / "versions"
+    assert (versions / f"{HEAD}.py").exists()
+    assert not (versions / "removed_from_the_release.txt").exists()
     # env.py несёт lock_timeout: ручной `alembic upgrade` на сервере его тоже получит.
-    assert (sandbox.live / "migrations" / "env.py").read_bytes() == (
-        ROOT / "migrations" / "env.py"
-    ).read_bytes()
+    for relative in ("migrations/env.py", "alembic.ini"):
+        assert (sandbox.live / relative).read_bytes() == (ROOT / relative).read_bytes(), relative
 
     restarts = _restarts(sandbox)
     assert [event["argv"][-1] for event in restarts] == [
@@ -780,6 +834,39 @@ def test_failed_backup_stops_before_the_migration_and_the_code(pending_migration
     assert GATE in result.skipped
     assert result.step(CLEANUP).returncode == 0
     _assert_production_untouched(sandbox, before, BASE)
+
+
+@pytest.mark.parametrize("apply_migrations_again", [True, False])
+def test_deploy_that_died_after_its_migration_can_be_run_again(
+    pending_migration: Sandbox, apply_migrations_again: bool
+) -> None:
+    """Обрыв между миграцией и копированием кода не запирает выкладку.
+
+    База уже на новой ревизии, а файла этой ревизии в живом каталоге ещё нет.
+    `alembic current` оттуда такую ревизию назвать не может — поэтому preflight
+    читает её прямо из базы.
+    """
+    sandbox = pending_migration
+    (sandbox.root / "live-rsync-must-fail").touch()
+
+    first = run_workflow(sandbox, apply_migrations=True)
+
+    assert first.failed_step.name == RSYNC, first.describe()
+    assert sandbox.db_revision() == HEAD
+    assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "old"
+    assert not (sandbox.live / "migrations" / "versions" / f"{HEAD}.py").exists()
+    assert _restarts(sandbox) == []
+    assert sandbox.staging_dirs() == []
+
+    (sandbox.root / "live-rsync-must-fail").unlink()
+    second = run_workflow(sandbox, apply_migrations=apply_migrations_again)
+
+    assert second.failed_step is None, second.describe()
+    assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "new"
+    assert (sandbox.live / "migrations" / "versions" / f"{HEAD}.py").exists()
+    assert sandbox.probe_rows() == [(1, "from the staged release")], "миграция прошла ровно раз"
+    assert len(_restarts(sandbox)) == 2
+    assert sandbox.staging_dirs() == []
 
 
 def test_lock_timeout_is_retried_and_the_deploy_goes_on(pending_migration: Sandbox) -> None:
@@ -875,7 +962,10 @@ def test_production_revision_unknown_to_the_release_is_refused(tmp_path: Path) -
     _assert_production_untouched(sandbox, before, "0009_only_on_prod")
 
 
-def test_release_altered_after_upload_is_not_executed(pending_migration: Sandbox) -> None:
+@pytest.mark.parametrize("step", [VERIFY_GRAPH, MIGRATE])
+def test_release_altered_after_upload_is_not_executed(
+    pending_migration: Sandbox, step: str
+) -> None:
     """Миграция исполняется только на том, что сошлось с контрольными суммами коммита."""
     sandbox = pending_migration
     before = sandbox.live_digest()
@@ -886,9 +976,9 @@ def test_release_altered_after_upload_is_not_executed(pending_migration: Sandbox
             MIGRATIONS[HEAD].replace("note=VALUE", "note='tampered'"), encoding="utf-8"
         )
 
-    result = run_workflow(sandbox, apply_migrations=True, before={MIGRATE: tamper})
+    result = run_workflow(sandbox, apply_migrations=True, before={step: tamper})
 
-    assert result.failed_step.name == MIGRATE, result.describe()
+    assert result.failed_step.name == step, result.describe()
     assert sandbox.events("backup") == []
     assert sandbox.events("alembic", command="upgrade") == []
     _assert_production_untouched(sandbox, before, BASE)
@@ -928,3 +1018,22 @@ def test_failed_health_check_still_removes_the_staging_directory(
     assert result.failed_step.name == "Health check", result.describe()
     assert result.step(CLEANUP).returncode == 0
     assert sandbox.staging_dirs() == []
+
+
+def test_stand_refuses_a_workflow_key_it_does_not_execute(
+    pending_migration: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`continue-on-error` на шаге-стороже пустил бы код на старую схему.
+
+    Стенд такой ключ не исполняет — и потому обязан упасть, а не показать
+    зелёный прогон workflow, который на GitHub повёл бы себя иначе.
+    """
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    gate = next(step for step in workflow["jobs"]["deploy"]["steps"] if step.get("name") == GATE)
+    gate["continue-on-error"] = True
+    altered = pending_migration.root / "deploy-altered.yml"
+    altered.write_text(yaml.safe_dump(workflow, sort_keys=False), encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "WORKFLOW", altered)
+
+    with pytest.raises(AssertionError, match="continue-on-error"):
+        run_workflow(pending_migration, apply_migrations=True)
