@@ -555,9 +555,9 @@ class AloeScraper(BaseScraper):
         return await retrying(self._fetch_listing_html, url)
 
     def _note_fetch_retry(self, retry_state: RetryCallState) -> None:
-        # Повтор гасит сбой, но прятать его не должен: счётчик уходит в
-        # Run.run_quality, иначе деградация сайта пропадёт из виду до дня, когда
-        # повторов перестанет хватать.
+        # Повтор гасит сбой, но прятать его не должен: счётчик повторных
+        # запросов уходит в Run.run_quality, иначе деградация сайта пропадёт из
+        # виду до дня, когда повторов перестанет хватать.
         self.fetch_retries += 1
         outcome = retry_state.outcome
         error = outcome.exception() if outcome is not None else None

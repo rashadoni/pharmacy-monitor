@@ -3,6 +3,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 from tenacity import wait_none
 
 from src.scrapers.aloe import (
@@ -416,10 +417,6 @@ async def test_aloe_detail_fetch_is_not_retried(monkeypatch) -> None:
 
 async def test_aloe_listing_retry_is_logged(monkeypatch) -> None:
     """Повтор гасит сбой, но не прячет его: в логе остаётся след."""
-    seen: list[dict] = []
-    monkeypatch.setattr(
-        "src.scrapers.aloe.log.warning", lambda event, **kw: seen.append({"event": event, **kw})
-    )
     attempts = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -431,7 +428,8 @@ async def test_aloe_listing_retry_is_logged(monkeypatch) -> None:
 
     scraper = _scraper_with_transport(monkeypatch, handler)
 
-    html_text = await scraper._fetch_listing_page("https://aloe.az/catalog/filters/?page=1")
+    with capture_logs() as seen:
+        html_text = await scraper._fetch_listing_page("https://aloe.az/catalog/filters/?page=1")
 
     assert "item-1" in html_text
     retries = [row for row in seen if row["event"] == "aloe_fetch_retry"]

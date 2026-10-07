@@ -3082,9 +3082,14 @@ def classify_run_quality(
             # run is exactly the one whose evidence must survive intact.
             "routes_incomplete": incomplete_route_details,
             "routes_complete_count": route_total - len(incomplete_route_details),
-            # Повторы, которыми скрейпер погасил сбои сети: прогон остаётся ok,
-            # но рост этого числа от ночи к ночи — ранний признак, что сайт сдаёт.
-            "fetch_retries": max(0, int(getattr(result, "fetch_retries", 0) or 0)),
+            # Повторные запросы страниц из-за сбоев сети. Прогон остаётся ok, но
+            # рост этого числа от ночи к ночи — ранний признак, что сайт сдаёт.
+            # Ключа нет у сайтов, чей скрейпер повторы не считает.
+            **(
+                {"fetch_retries": max(0, int(result.fetch_retries))}
+                if result.fetch_retries is not None
+                else {}
+            ),
         }
 
     statuses = [row["status"] for row in site_details.values()]
