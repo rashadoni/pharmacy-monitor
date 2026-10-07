@@ -288,8 +288,8 @@ def test_cleanup_dry_run_writes_nothing(cleanup_db, tmp_path):
     }
 
 
-def test_cleanup_rerun_with_same_csv_changes_nothing(cleanup_db, tmp_path):
-    """Повторный запуск попадает в ветку «уже отвязан» и не плодит отказы."""
+def test_cleanup_rerun_with_same_csv_adds_no_rows(cleanup_db, tmp_path):
+    """Повторный запуск попадает в ветку «уже отвязан»: записей не прибавляется."""
     (match_id,), ids = _seed(cleanup_db, [("x", 1), ("y", 1), ("z", 1)])
     csv_path = _write_csv(tmp_path, (match_id, ids["x"]))
 
@@ -303,3 +303,95 @@ def test_cleanup_rerun_with_same_csv_changes_nothing(cleanup_db, tmp_path):
         cleanup_db, lambda s: len(s.scalars(select(storage.MatchRejection.id)).all())
     )
     assert rows == 2
+
+
+def test_cleanup_reactivates_a_resolved_rejection(cleanup_db, tmp_path):
+    """Снятый раньше отказ строка «уже отвязан» включает снова — и это сохраняется."""
+    (match_id,), ids = _seed(cleanup_db, [("a", 1), ("b", 1)], loose=("gone", 1))
+
+    def resolve(s):
+        rejection = match_actions.add_rejection(s, ids["gone"], ids["a"], reason="old")
+        rejection.is_active = False
+        s.commit()
+
+    _in_new_session(cleanup_db, resolve)
+
+    cleanup(_write_csv(tmp_path, (match_id, ids["gone"])), apply=True)
+
+    active = _in_new_session(
+        cleanup_db,
+        lambda s: {
+            (a, b): is_active
+            for a, b, is_active in s.execute(
+                select(
+                    storage.MatchRejection.product_a_id,
+                    storage.MatchRejection.product_b_id,
+                    storage.MatchRejection.is_active,
+                )
+            )
+        },
+    )
+    assert active == {
+        _pair(ids["gone"], ids["a"]): True,
+        _pair(ids["gone"], ids["b"]): True,
+    }
+
+
+def test_cleanup_rejects_only_against_current_members(cleanup_db, tmp_path):
+    """Кластер, из которого этот же запуск уже отвязал товар.
+
+    Список участников в сессии к этому моменту устарел: в нём ещё числится
+    отвязанный. Отказ с ним навсегда запретил бы свести два товара, которых в
+    кластере нет.
+    """
+    (match_id,), ids = _seed(cleanup_db, [("x", 1), ("y", 1), ("z", 1)], loose=("gone", 1))
+    csv_path = _write_csv(tmp_path, (match_id, ids["x"]), (match_id, ids["gone"]))
+
+    written = cleanup(csv_path, apply=True)
+
+    assert written == 4
+    assert _committed_pairs(cleanup_db) == {
+        _pair(ids["x"], ids["y"]),
+        _pair(ids["x"], ids["z"]),
+        _pair(ids["gone"], ids["y"]),
+        _pair(ids["gone"], ids["z"]),
+    }
+
+
+def test_cleanup_survives_the_same_row_twice(cleanup_db, tmp_path):
+    """Повтор строки в одном файле — не «отказ товара с самим собой» и не обрыв запуска."""
+    (match_id,), ids = _seed(cleanup_db, [("x", 1), ("y", 1), ("z", 1)])
+    csv_path = _write_csv(tmp_path, (match_id, ids["x"]), (match_id, ids["x"]))
+
+    cleanup(csv_path, apply=True)
+
+    assert _committed_pairs(cleanup_db) == {
+        _pair(ids["x"], ids["y"]),
+        _pair(ids["x"], ids["z"]),
+    }
+
+
+def test_cleanup_keeps_already_detached_row_when_a_later_row_fails(
+    cleanup_db, tmp_path, monkeypatch
+):
+    """Строка «уже отвязан» сохраняется сразу, как обычная: обрыв запуска на
+    следующей строке её отказы не уносит."""
+    (m_detached, m_break), ids = _seed(
+        cleanup_db,
+        [("a", 1), ("b", 1)],
+        [("x", 1), ("y", 1)],
+        loose=("gone", 1),
+    )
+    csv_path = _write_csv(tmp_path, (m_detached, ids["gone"]), (m_break, ids["x"]))
+
+    def connection_lost(*args, **kwargs):
+        raise RuntimeError("connection lost")
+
+    monkeypatch.setattr(match_actions, "break_match", connection_lost)
+    with pytest.raises(RuntimeError, match="connection lost"):
+        cleanup(csv_path, apply=True)
+
+    assert _committed_pairs(cleanup_db) == {
+        _pair(ids["gone"], ids["a"]),
+        _pair(ids["gone"], ids["b"]),
+    }
