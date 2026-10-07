@@ -6491,6 +6491,7 @@ _ROI_REFRESH_MESSAGES = {
     "another_refresh_running": "другой пересчёт уже идёт",
     "scrape_in_progress": "идёт сбор или rematch — каталог сейчас пишется",
     "run_unfinished": "есть незавершённый прогон",
+    "inputs_unverified": "каталог перестал быть свежим посреди расчёта",
 }
 
 

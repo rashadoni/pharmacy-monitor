@@ -198,6 +198,11 @@ def _refresh_locked(session: Session, *, tenant_id: int) -> RefreshResult:
         return RefreshResult("failed", reason=f"error:{type(exc).__name__}", run_id=anchor.id)
     failed_sites = sorted(site for site, count in counts.items() if count < 0)
     if failed_sites:
+        if set(counts) != set(roi.ALL_SITES):
+            # После сбоя среза расчёт ещё и отказался: срезы, до которых он не
+            # дошёл, остались от прошлого расчёта. Смесь не оставляем.
+            _drop_cache(session, tenant_id=tenant_id)
+            session.commit()
         log.error(
             "roi_refresh_failed",
             tenant_id=tenant_id,

@@ -278,6 +278,32 @@ def test_block_that_appears_mid_refresh_defers_and_leaves_no_half_written_cache(
     assert db_session.scalars(select(RoiActionsCache)).all() == []
 
 
+def test_slice_failure_followed_by_a_refusal_fails_and_leaves_no_mixed_cache(
+    db_session, monkeypatch
+):
+    """Срез упал, следующий отказался: исход — сбой, смеси срезов в кэше нет."""
+    run = _full_run(db_session)
+    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    roi_refresh.refresh_from_trusted_epoch(db_session)
+    real_compute = roi._compute_actions_locked
+
+    def fail_first_slice_then_orphan(session, *, client_site=None, **kwargs):
+        if client_site == "pharmonline":
+            session.add(Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running"))
+            session.commit()
+            raise RuntimeError("boom")
+        return real_compute(session, client_site=client_site, **kwargs)
+
+    monkeypatch.setattr(roi, "_compute_actions_locked", fail_first_slice_then_orphan)
+
+    result = roi_refresh.refresh_from_trusted_epoch(db_session)
+
+    assert (result.outcome, result.reason) == ("failed", "sites:pharmonline")
+    # Незакоммиченное команда watcher'а потеряла бы на выходе.
+    db_session.rollback()
+    assert db_session.scalars(select(RoiActionsCache)).all() == []
+
+
 def test_second_refresh_does_not_start_while_one_is_running(db_session, monkeypatch):
     @contextmanager
     def taken(_session):

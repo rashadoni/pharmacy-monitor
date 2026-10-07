@@ -488,9 +488,18 @@ def test_verified_single_site_run_defers_roi_when_other_site_attempt_is_degraded
     assert refresh_calls == []
 
 
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"pharmonline": 0, "aptekonline": -1, "aloe": 0},
+        # Срез упал, а на следующем расчёт отказался: ответ неполный, но сбой в нём есть.
+        {"pharmonline": 0, "aptekonline": -1},
+    ],
+)
 def test_verified_run_still_fails_when_ready_roi_refresh_returns_failure(
     db_session,
     monkeypatch,
+    summary,
 ):
     from src import roi
 
@@ -508,11 +517,7 @@ def test_verified_run_still_fails_when_ready_roi_refresh_returns_failure(
     monkeypatch.setattr(
         roi,
         "refresh_all_cached_actions",
-        lambda session, *, run_id, tenant_id=1: {
-            "pharmonline": 0,
-            "aptekonline": -1,
-            "aloe": 0,
-        },
+        lambda session, *, run_id, tenant_id=1: summary,
     )
 
     runner = CliRunner()

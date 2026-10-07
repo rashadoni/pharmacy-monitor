@@ -371,14 +371,15 @@ systemd-run --quiet --wait --pipe --collect -p User=pm -p Group=pm \
 Снять осиротевший прогон, не дожидаясь шести часов. Команда берёт блокировку
 сбора и отказывается (`recovery refused`), пока идёт `run`, `scrape`, тик,
 `rematch` или пересчёт рекомендаций (он длится около минуты — повторить).
-Watcher перед тем же шагом ещё и смотрит список процессов; вручную сделать то
-же — первая строка должна ничего не вывести:
+Watcher перед тем же шагом ещё и смотрит список процессов; команда ниже делает
+то же и при живом процессе печатает его вместо снятия:
 
 ```bash
-pgrep -af "pharmacy-monitor (run|scrape|intraday-tick|rematch)( |$)"
-systemd-run --quiet --wait --pipe --collect -p User=pm -p Group=pm \
-  -p EnvironmentFile=/etc/pharmacy-monitor/env -p WorkingDirectory=/opt/pharmacy-monitor \
-  /opt/pharmacy-monitor/.venv/bin/pharmacy-monitor reap-stale-runs --max-age-hours 0
+if ! pgrep -af "pharmacy-monitor (run|scrape|intraday-tick|rematch)( |$)"; then
+  systemd-run --quiet --wait --pipe --collect -p User=pm -p Group=pm \
+    -p EnvironmentFile=/etc/pharmacy-monitor/env -p WorkingDirectory=/opt/pharmacy-monitor \
+    /opt/pharmacy-monitor/.venv/bin/pharmacy-monitor reap-stale-runs --max-age-hours 0
+fi
 ```
 
 Без `--pending` команда считает всегда и выходит с кодом 1, если посчитать не
