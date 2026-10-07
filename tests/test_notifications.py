@@ -1320,16 +1320,17 @@ def test_run_email_groups_rows_by_type_not_by_severity_alone():
     внутри типа — по важности. Раньше письмо шло одним списком строго по
     важности; теперь предупреждение может стоять выше критичного другого типа."""
     events = [
-        _loose_event("price_drop_pct", "critical", "PD_CRIT"),
-        _loose_event("new_product", "info", "NP_INFO"),
-        _loose_event("undercut_threshold", "info", "UC_INFO"),
         _loose_event("undercut_threshold", "warning", "UC_WARN"),
-        _loose_event("undercut_threshold", "critical", "UC_CRIT"),
-        _loose_event("site_drop_smoke", "warning", "SD_WARN"),
+        _loose_event("new_product", "info", "NP_INFO"),
+        _loose_event("price_change_pct", "info", "PC_INFO"),
+        _loose_event("price_change_pct", "warning", "PC_WARN"),
+        _loose_event("price_change_pct", "critical", "PC_CRIT"),
+        _loose_event("site_drop_smoke", "critical", "SD_CRIT"),
     ]
     html = notifications._render_batch_email(events)
 
-    order = ["UC_CRIT", "UC_WARN", "UC_INFO", "PD_CRIT", "SD_WARN", "NP_INFO"]
+    # «Конкурент дешевле» в списке подписей первый, но критичных у него нет.
+    order = ["PC_CRIT", "PC_WARN", "PC_INFO", "SD_CRIT", "UC_WARN", "NP_INFO"]
     positions = [html.index(title) for title in order]
     assert positions == sorted(positions)
     assert _event_rows(html) == 6
