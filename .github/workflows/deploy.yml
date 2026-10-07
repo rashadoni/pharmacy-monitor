@@ -15,7 +15,29 @@ name: Deploy to production
 #         | sudo tee /etc/sudoers.d/pm-deploy && sudo chmod 440 /etc/sudoers.d/pm-deploy
 #   * АЛЕМБИК ПО УМОЛЧАНИЮ НЕ ЗАПУСКАЕТСЯ: миграции включаются явным флагом
 #     apply_migrations и только после проверенного backup. Канонический каталог
-#     versions синхронизируется с --delete; несколько heads останавливают deploy.
+#     migrations синхронизируется с --delete; несколько heads останавливают deploy.
+#
+# ПОРЯДОК (2026-10-07): СНАЧАЛА БАЗА, ПОТОМ КОД.
+#   Таймеры запускают CLI из /opt/pharmacy-monitor весь день (вотчер очереди —
+#   раз в минуту). Раньше код копировался до бэкапа и миграции, и ~50 секунд
+#   новый код лежал на старой схеме: процесс, стартовавший в это окно, падал на
+#   первом запросе к новой колонке. Теперь:
+#     1. релиз (src, migrations, alembic.ini, backup.sh) кладётся в отдельный
+#        каталог .deploy-stage.* — в живом каталоге не меняется ничего;
+#     2. граф миграций проверяется там же;
+#     3. бэкап и `alembic upgrade` исполняются из этого каталога, то есть
+#        миграция видит src и env.py своего релиза, а не прошлого;
+#     4. код копируется в живой каталог, только если ревизия базы равна голове
+#        релиза. Любой отказ до этого места оставляет прод как был.
+#   Миграция ждёт блокировку таблицы не дольше MIGRATION_LOCK_TIMEOUT_MS и
+#   повторяется MIGRATION_LOCK_ATTEMPTS раз: пока она ждёт, за ней стоят все
+#   запросы к этой таблице, в том числе чтения API.
+#
+#   ЧЕГО ЭТО ТРЕБУЕТ ОТ МИГРАЦИИ: между миграцией и рестартом (~1 мин) на новой
+#   схеме работает ПРОШЛЫЙ релиз — API из памяти и CLI с диска. Миграция обязана
+#   быть с ним совместима: добавлять можно, удалять и переименовывать то, что
+#   он читает или пишет, — только следующим релизом после кода. Сторож —
+#   tests/test_migrations_backward_compatible.py.
 
 on:
   workflow_dispatch:
@@ -103,7 +125,8 @@ jobs:
           ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             source_bad=$(find \
               /opt/pharmacy-monitor/src \
-              /opt/pharmacy-monitor/migrations/versions \
+              /opt/pharmacy-monitor/migrations \
+              /opt/pharmacy-monitor/alembic.ini \
               -xdev \
               \( -name __pycache__ -o -name "*.pyc" \) -prune -o \
               ! -writable -print -quit)
@@ -145,6 +168,191 @@ jobs:
               sudo -n -l /usr/bin/systemctl restart "$service" >/dev/null
             done'
 
+      # --- Schema before code ---------------------------------------------
+      # Until the database is at the revision this release expects, nothing in
+      # /opt/pharmacy-monitor changes. The release is uploaded to a private
+      # directory next to it and Alembic runs from there.
+      - name: Stage release runtime (nothing live changes)
+        id: stage
+        run: |
+          set -euo pipefail
+          manifest=$(mktemp)
+          trap 'rm -f "$manifest"' EXIT
+          git ls-files -z -- src migrations alembic.ini infra/scripts/backup.sh |
+            xargs -0 sha256sum | LC_ALL=C sort > "$manifest"
+          test -s "$manifest"
+
+          work_dir=$(ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          # Leftovers of a run whose cleanup step never ran (the runner died).
+          # deploy-prod concurrency allows one deploy at a time, so a day-old
+          # directory cannot belong to a live one.
+          find /opt/pharmacy-monitor -maxdepth 1 -type d -name '.deploy-stage.*' \
+            -mmin +1440 -exec rm -rf -- {} +
+          work_dir=$(mktemp -d /opt/pharmacy-monitor/.deploy-stage.XXXXXX)
+          mkdir -p "$work_dir/incoming" "$work_dir/runtime/src" \
+            "$work_dir/runtime/migrations" "$work_dir/runtime/infra/scripts"
+          printf '%s' "$work_dir"
+          REMOTE
+          )
+          if [[ ! "$work_dir" =~ ^/opt/pharmacy-monitor/\.deploy-stage\.[A-Za-z0-9]{6}$ ]]; then
+            echo "::error::unexpected remote staging path"
+            exit 1
+          fi
+          echo "work_dir=$work_dir" >> "$GITHUB_OUTPUT"
+
+          rsync -az --checksum --delete --no-perms --no-owner --no-group \
+            --exclude='__pycache__/' --exclude='*.pyc' \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            src/ "pm@13.140.186.143:$work_dir/runtime/src/"
+          rsync -az --checksum --delete --no-perms --no-owner --no-group \
+            --exclude='__pycache__/' --exclude='*.pyc' \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            migrations/ "pm@13.140.186.143:$work_dir/runtime/migrations/"
+          rsync -z --checksum --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            alembic.ini "pm@13.140.186.143:$work_dir/runtime/alembic.ini"
+          rsync -z --checksum --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            infra/scripts/backup.sh \
+            "pm@13.140.186.143:$work_dir/runtime/infra/scripts/backup.sh"
+          rsync -z --checksum --no-perms --no-owner --no-group \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            "$manifest" "pm@13.140.186.143:$work_dir/incoming/source-manifest"
+
+      - name: Verify staged migration graph has one head
+        env:
+          WORK_DIR: ${{ steps.stage.outputs.work_dir }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WORK_DIR" =~ ^/opt/pharmacy-monitor/\.deploy-stage\.[A-Za-z0-9]{6}$ ]]; then
+            echo "::error::unexpected remote staging path"
+            exit 1
+          fi
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 "bash -s -- '$WORK_DIR'" <<'REMOTE'
+          set -euo pipefail
+          work_dir=$1
+          runtime_dir="$work_dir/runtime"
+          cd "$runtime_dir"
+          sha256sum --quiet -c "$work_dir/incoming/source-manifest"
+          db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
+          test -n "$db_url"
+          staged_alembic() {
+            PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" DATABASE_URL="$db_url" \
+              /opt/pharmacy-monitor/.venv/bin/python -m alembic \
+              -c "$runtime_dir/alembic.ini" "$@"
+          }
+          heads=$(staged_alembic heads)
+          printf '%s\n' "$heads"
+          test "$(printf '%s\n' "$heads" | sed '/^[[:space:]]*$/d' | wc -l)" -eq 1
+          staged_alembic current
+          REMOTE
+
+      - name: Verified backup + apply migrations (before any code is replaced)
+        if: ${{ inputs.apply_migrations }}
+        env:
+          WORK_DIR: ${{ steps.stage.outputs.work_dir }}
+          # How long one DDL statement may wait for its table lock. While it
+          # waits, every other query on that table queues behind it, so this
+          # is also the longest stall the API sees per attempt.
+          MIGRATION_LOCK_TIMEOUT_MS: "5000"
+          MIGRATION_LOCK_ATTEMPTS: "3"
+        run: |
+          set -euo pipefail
+          if [[ ! "$WORK_DIR" =~ ^/opt/pharmacy-monitor/\.deploy-stage\.[A-Za-z0-9]{6}$ ]]; then
+            echo "::error::unexpected remote staging path"
+            exit 1
+          fi
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 \
+            "bash -s -- '$WORK_DIR' '$MIGRATION_LOCK_TIMEOUT_MS' '$MIGRATION_LOCK_ATTEMPTS'" <<'REMOTE'
+          set -euo pipefail
+          work_dir=$1
+          lock_timeout_ms=$2
+          max_attempts=$3
+          for number in "$lock_timeout_ms" "$max_attempts"; do
+            case "$number" in
+              ''|*[!0-9]*) echo 'lock timeout and attempts must be whole numbers' >&2; exit 1 ;;
+            esac
+          done
+          test "$max_attempts" -ge 1
+          runtime_dir="$work_dir/runtime"
+          cd "$runtime_dir"
+          sha256sum --quiet -c "$work_dir/incoming/source-manifest"
+          db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
+          test -n "$db_url"
+          # migrations/env.py reads it and opens its connection with this
+          # lock_timeout.
+          export MIGRATION_LOCK_TIMEOUT_MS="$lock_timeout_ms"
+          staged_alembic() {
+            PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" DATABASE_URL="$db_url" \
+              /opt/pharmacy-monitor/.venv/bin/python -m alembic \
+              -c "$runtime_dir/alembic.ini" "$@"
+          }
+
+          bash "$runtime_dir/infra/scripts/backup.sh"
+
+          # On PostgreSQL the whole upgrade is one transaction: an attempt that
+          # times out on a lock changes nothing and can simply be repeated.
+          upgrade_log=$(mktemp)
+          trap 'rm -f "$upgrade_log"' EXIT
+          attempt=1
+          while :; do
+            if staged_alembic upgrade head 2>&1 | tee "$upgrade_log"; then
+              break
+            fi
+            if ! grep -q 'LockNotAvailable' "$upgrade_log"; then
+              echo "::error::alembic upgrade failed. Code and services on the server were not touched; the previous release keeps running."
+              exit 1
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::the migration could not take its table lock: $max_attempts attempts of $lock_timeout_ms ms each. A long transaction holds the table (a scrape, a report, the nightly pg_dump). Nothing was changed — schema, code and services are as before. Re-run the deploy when that work has finished."
+              exit 75
+            fi
+            echo "::warning::migration lock timeout, attempt $attempt of $max_attempts; retrying in 10 s"
+            attempt=$((attempt + 1))
+            sleep 10
+          done
+
+          current=$(staged_alembic current | awk 'NF {print $1}')
+          head=$(staged_alembic heads | awk 'NF {print $1}')
+          test -n "$current"
+          test "$current" = "$head"
+          printf 'migration current=head=%s\n' "$current"
+          REMOTE
+
+      # The one invariant of this workflow, checked right before the action it
+      # protects and independently of the two steps above.
+      - name: Refuse to replace code unless the DB is at the staged head
+        env:
+          WORK_DIR: ${{ steps.stage.outputs.work_dir }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WORK_DIR" =~ ^/opt/pharmacy-monitor/\.deploy-stage\.[A-Za-z0-9]{6}$ ]]; then
+            echo "::error::unexpected remote staging path"
+            exit 1
+          fi
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 "bash -s -- '$WORK_DIR'" <<'REMOTE'
+          set -euo pipefail
+          work_dir=$1
+          runtime_dir="$work_dir/runtime"
+          cd "$runtime_dir"
+          db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
+          test -n "$db_url"
+          staged_alembic() {
+            PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" DATABASE_URL="$db_url" \
+              /opt/pharmacy-monitor/.venv/bin/python -m alembic \
+              -c "$runtime_dir/alembic.ini" "$@"
+          }
+          current=$(staged_alembic current | awk 'NF {print $1}')
+          head=$(staged_alembic heads | awk 'NF {print $1}')
+          test -n "$head"
+          if [ "$current" != "$head" ]; then
+            echo "::error::production DB is at ${current:-no revision}, this release needs $head. Nothing on the server was changed. Re-run with apply_migrations=true; new code is never put on the old schema."
+            exit 1
+          fi
+          printf 'schema ready for the new code: current=head=%s\n' "$head"
+          REMOTE
+
       - name: Rsync code -> prod (src + frontend + canonical migrations)
         run: |
           set -euo pipefail
@@ -157,9 +365,15 @@ jobs:
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
             frontend/src/ pm@13.140.186.143:/opt/pharmacy-monitor/frontend/src/
+          # The whole migrations directory, not only versions/: env.py carries
+          # the lock timeout, and an operator who runs `alembic upgrade` by
+          # hand from /opt/pharmacy-monitor must get the same protection the
+          # staged run above had.
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
-            migrations/versions/ pm@13.140.186.143:/opt/pharmacy-monitor/migrations/versions/
+            migrations/ pm@13.140.186.143:/opt/pharmacy-monitor/migrations/
+          rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
+            alembic.ini pm@13.140.186.143:/opt/pharmacy-monitor/alembic.ini
           # Root-owned systemd installation remains an explicit post-release
           # operation, but its versioned units and reconciliation script must
           # be present in the runtime checkout for that operation to be
@@ -168,33 +382,6 @@ jobs:
             infra/systemd/ pm@13.140.186.143:/opt/pharmacy-monitor/infra/systemd/
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             infra/scripts/ pm@13.140.186.143:/opt/pharmacy-monitor/infra/scripts/
-
-      - name: Verify migration graph has one head
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
-            cd /opt/pharmacy-monitor
-            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
-            test -n "$db_url"
-            heads=$(.venv/bin/alembic heads)
-            printf "%s\n" "$heads"
-            test "$(printf "%s\n" "$heads" | sed "/^[[:space:]]*$/d" | wc -l)" -eq 1
-            DATABASE_URL="$db_url" .venv/bin/alembic current'
-
-      - name: Verified backup + apply migrations
-        if: ${{ inputs.apply_migrations }}
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
-            cd /opt/pharmacy-monitor
-            db_url=$(grep -m1 "^DATABASE_URL=" /etc/pharmacy-monitor/env | cut -d= -f2-)
-            test -n "$db_url"
-            bash infra/scripts/backup.sh
-            DATABASE_URL="$db_url" .venv/bin/alembic upgrade head
-            current=$(DATABASE_URL="$db_url" .venv/bin/alembic current | awk "NF {print \$1}")
-            head=$(.venv/bin/alembic heads | awk "NF {print \$1}")
-            test "$current" = "$head"
-            printf "migration current=head=%s\n" "$current"'
 
       - name: Build frontend + restart services
         run: |
@@ -214,3 +401,15 @@ jobs:
             curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"
             curl -fsSL -o /dev/null -w "frontend HTTP %{http_code}\n" http://127.0.0.1:3000/ru/login
             curl -fsSL http://127.0.0.1:3000/ru/login | grep -q "<html lang=\"ru\""'
+
+      - name: Remove staged release runtime
+        if: ${{ always() && steps.stage.outputs.work_dir != '' }}
+        env:
+          WORK_DIR: ${{ steps.stage.outputs.work_dir }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WORK_DIR" =~ ^/opt/pharmacy-monitor/\.deploy-stage\.[A-Za-z0-9]{6}$ ]]; then
+            echo "::error::unexpected remote staging path"
+            exit 1
+          fi
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 "rm -rf -- '$WORK_DIR'"
