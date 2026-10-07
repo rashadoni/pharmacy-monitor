@@ -3521,6 +3521,41 @@ def _smoke_test_per_site_coverage(
     session.commit()
 
 
+class _ObservedEntries:
+    """Записи сбора, для которых прогон уже сохранил наблюдение.
+
+    Команда `run` отдаёт каждую запись в `persist_results` дважды: колбэк по
+    категориям — сразу после категории, финальный проход — в конце целиком и в
+    порядке категорий. Финальный проход нужен: он пишет то, что мимо колбэка
+    прошло (раздел, оборвавшийся на середине, — у aloe так регулярно обрывается
+    `dermanlar`), и оставляет товару категорию последнего раздела. Но строка
+    `offer_observations` на запись сбора должна быть одна. До 2026-10-07 их было
+    две: 3,1 млн лишних строк из 6,5 млн.
+
+    Запись — это объект `ScrapedProduct`, а не товар: один товар приходит из
+    нескольких категорий отдельными записями (у aptekonline в среднем 3,5 на
+    товар), и у каждой своё наблюдение. Поэтому сверка по объекту, а не по
+    `(site, external_id)`. Отсюда требование к сборщикам: на каждую запись —
+    свой объект, и после выдачи он не меняется. Один объект, выданный дважды,
+    получит одно наблюдение.
+
+    Объекты удерживаются: адрес освободившегося объекта Python отдаёт
+    следующему, а результат сайта при фатальном сбое заменяется целиком
+    (`site_fatal_result`) — без ссылки чужая запись могла бы получить адрес
+    уже учтённой и остаться без наблюдения.
+    """
+
+    def __init__(self) -> None:
+        self._by_id: dict[int, ScrapedProduct] = {}
+
+    def add(self, products: list[ScrapedProduct]) -> None:
+        for product in products:
+            self._by_id[id(product)] = product
+
+    def __contains__(self, product: object) -> bool:
+        return self._by_id.get(id(product)) is product
+
+
 _PERSIST_CHUNK = 200
 """Размер чанка для pre-fetch / flush / commit. Для SSH-туннеля к prod Postgres
 важно держать INSERT'ы небольшими — на 1000-row INSERT с RETURNING туннель
@@ -3544,7 +3579,13 @@ def _snapshot_payload_changed(last: dict | None, sp: ScrapedProduct) -> bool:
     )
 
 
-def persist_results(session: Session, run: storage.Run, results: list[ScrapeResult]) -> int:
+def persist_results(
+    session: Session,
+    run: storage.Run,
+    results: list[ScrapeResult],
+    *,
+    observed: _ObservedEntries | None = None,
+) -> int:
     """Сохранить ScrapedProduct/Promo в БД, обновить last_seen_at, добавить snapshots.
 
     Diff-only persist (2026-05-09): для существующих товаров pre-fetch'им
@@ -3562,6 +3603,12 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
     Per-chunk: pre-fetch existing → pre-fetch latest snapshots → ORM
     `add_all + flush` для новых продуктов (нужен RETURNING id для FK) →
     Core `insert` для diff-snapshots → commit.
+
+    `observed` — записи, для которых этот прогон уже сохранил наблюдение. Таким
+    записям строка `offer_observations` повторно не добавляется; всё остальное
+    (карточка товара, сравнение цены) делается как обычно. Записи каждого
+    закоммиченного чанка добавляются в `observed`. Без `observed` наблюдение
+    пишется на каждую запись каждого вызова.
 
     Returns: общее число spарсенных продуктов (НЕ записанных snapshot'ов —
     после diff-only snapshots может быть существенно меньше, чем products).
@@ -3679,18 +3726,20 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
 
             # Identity and website-offer history are independent from diff-only
             # price snapshots, so every explicit scrape observation is stored.
+            # Stored once: the final pass of `run` replays entries the category
+            # callback has already observed, and must not add a second row.
             observed_at = utcnow()
             observations: list[storage.OfferObservation] = []
             for sp, _, _, _, _ in prepared:
                 product = existing_by_key[(sp.site, sp.external_id)]
-                observations.append(
-                    apply_product_observation(
-                        product,
-                        sp,
-                        run_id=run.id,
-                        observed_at=observed_at,
-                    )
+                observation = apply_product_observation(
+                    product,
+                    sp,
+                    run_id=run.id,
+                    observed_at=observed_at,
                 )
+                if observed is None or sp not in observed:
+                    observations.append(observation)
             session.add_all(observations)
 
             # === Pre-fetch latest snapshots — для diff-only решения ===
@@ -3760,6 +3809,8 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
 
             # === Commit per chunk — bounds transaction, friendly to SSH tunnel ===
             session.commit()
+            if observed is not None:
+                observed.add(chunk_products)
 
         # === Promos обычно мало (десятки), один batch ОК ===
         if result.promos:
@@ -5201,6 +5252,7 @@ def run_cmd(
         )
 
         trust_context = None
+        observed_entries = _ObservedEntries()
         try:
             quality_sites: list[str] = list(sites)
             quality_baselines: dict[str, int | None] = {}
@@ -5265,6 +5317,7 @@ def run_cmd(
                             session,
                             run,
                             [ScrapeResult(site=site_name, products=list(cat_products))],
+                            observed=observed_entries,
                         )
 
                     on_category = _persist_category
@@ -5363,7 +5416,7 @@ def run_cmd(
                         quality["catalog_verification_reason_full"] = full_reason
                         run.run_quality = quality
                         raise
-            count = persist_results(session, run, results)
+            count = persist_results(session, run, results, observed=observed_entries)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
             run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}

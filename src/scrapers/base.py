@@ -771,6 +771,13 @@ class BaseScraper(ABC):
         идёт только в конце прогона (`run_cmd`), и медленный/оборванный/зависший
         прогон (pharmonline DDP ~7ч) теряет ВСЁ собранное. Callback сохраняет каждую
         категорию сразу. Ошибка callback'а НЕ валит скрейп (логируется и идём дальше).
+
+        Колбэк получает те же объекты, что остаются в `result.products`, и `run_cmd`
+        по ним узнаёт записи, для которых наблюдение уже сохранено
+        (`main._ObservedEntries`). Отсюда требование к `scrape_category`: на каждую
+        запись — свой объект, и после выдачи он не меняется. Иначе запись останется
+        без строки в `offer_observations` или сохранит в ней устаревшие страну и
+        наличие.
         """
         requested_slugs = [slug for slug in category_slugs if slug is not None]
         result = ScrapeResult(site=self.site_name, items_expected=len(requested_slugs))
