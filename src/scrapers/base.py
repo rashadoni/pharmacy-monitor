@@ -392,6 +392,11 @@ class ScrapeResult:
     verified_country_mappings: dict[str, dict[str, object]] = field(
         default_factory=dict
     )
+    # Сколько повторных запросов страниц сделал скрейпер из-за сбоев сети
+    # (считается каждая повторная попытка, удачная или нет). Статус прогона не
+    # ухудшает, но остаётся в Run.run_quality как сигнал о сайте. None — этот
+    # скрейпер повторы не считает; это «не измеряли», а не «повторов не было».
+    fetch_retries: int | None = None
 
 
 @dataclass
