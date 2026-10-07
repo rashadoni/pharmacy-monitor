@@ -5,9 +5,11 @@ Operational manual для VPS-инсталляции. Используется �
 > **Боевой сервер с 2026-09-03 — Contabo `13.140.186.143`
 > (`vmi3552946.contaboserver.net`).** Прежний Hetzner-сервер удалён; команды
 > ниже переведены на новый адрес 2026-10-07. Host key сервера прошит в
-> `infra/prod_known_hosts`. С машины, которая сервер ещё не знает, первый вход —
-> `ssh -o UserKnownHostsFile=infra/prod_known_hosts -o StrictHostKeyChecking=yes root@13.140.186.143`,
-> а не согласие на ключ, который предъявит сеть.
+> `infra/prod_known_hosts`. На машине, которая сервер ещё не знает, сначала
+> добавить этот ключ (из корня репозитория):
+> `grep -v '^#' infra/prod_known_hosts >> ~/.ssh/known_hosts` — и только потом
+> выполнять команды ниже. На вопрос ssh «принять ключ?» не соглашаться: так
+> принимается то, что предъявила сеть.
 
 ## 🚀 Начальная настройка
 
@@ -293,6 +295,11 @@ sudo -u pharmacy uv run --directory /opt/pharmacy-monitor pharmacy-monitor \
 
 ### Текущая стратегия
 
+> ⚠️ Список ниже и раздел «Восстановление из бэкапа» — времён SQLite, устарели
+> (помечено 2026-10-07). Сейчас: Postgres, `pg_dump` каждую ночь в 04:00 по
+> времени сервера, `/var/backups/pharmacy-monitor/`, хранение 14 дней — см.
+> «Сделать бэкап вручную» и «Копия бэкапа вне сервера».
+
 - **Когда:** ежедневно в 02:00 UTC (`pharmacy-monitor-backup.timer`)
 - **Где:** `/opt/pharmacy-monitor/data/backups/db-YYYY-MM-DD.sqlite.gz`
 - **Срок хранения:** 90 дней
@@ -347,7 +354,8 @@ bash infra/local/fetch-backup.sh          # забрать свежий в ~/Bac
 Запускать с машины, чей SSH-ключ принимает сервер (сейчас это dev-бокс).
 Дамп зашифрован `BACKUP_GPG_PASSPHRASE` из `/etc/pharmacy-monitor/env`: без
 копии этого пароля вне сервера забранный файл не расшифровать. Проверять
-расшифровкой, а не наличием файла:
+расшифровкой, а не наличием файла (команда молча ждёт пароль на stdin: ввести
+его и нажать Enter):
 
 ```bash
 gpg --batch --yes --passphrase-fd 0 -d <файл>.sql.gz.gpg | gunzip | head -5
@@ -678,6 +686,11 @@ ssh root@13.140.186.143 'systemctl disable --now pharmacy-monitor-intraday.timer
 
 ### Postgres MCP — SSH tunnel auto-start
 
+> ⚠️ **Устарело с 2026-09-03 (помечено 2026-10-07).** Агент на Маке смотрит на
+> удалённый Hetzner-сервер. Из команд ниже нужна одна — `bootout` (выгрузить);
+> `bootstrap` не выполнять. Копия plist в репозитории обезврежена, см.
+> `infra/local/README.md`.
+
 `~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist` (auto-restart, persistent).
 
 Управление:
@@ -828,8 +841,10 @@ EOF
 > Учение проверено только на прежнем Hetzner-сервере. На Contabo архивов
 > `frontend-src-pre-*.tgz` нет: шаг 2 сначала удаляет `frontend/src`, а
 > распаковывать после этого нечего. Адрес в командах заменён заглушкой
-> `<server>` намеренно. Откат фронтенда сейчас — повторная выкладка `deploy.yml`
-> с ветки или тега, где он был исправен.
+> `<server>` намеренно. Отдельного отката одного фронтенда сейчас нет:
+> `deploy.yml` выкладывает бэкенд и фронтенд вместе и откажется работать, если
+> ревизии базы прода нет в выбранном коммите. Сломанный фронтенд чинится новым
+> коммитом через PR и обычной выкладкой.
 
 ```bash
 # 1. Find latest pre-deploy backup

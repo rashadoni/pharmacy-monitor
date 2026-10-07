@@ -11,8 +11,11 @@ the scrape path:
 
 The production server moved from Hetzner to Contabo on 2026-09-03 and the
 Hetzner host was deleted. Nothing in this directory defaults to the old address
-any more: the retired scripts have no default target at all, and every SSH call
-accepts only the host key pinned in `infra/prod_known_hosts`.
+any more: the retired scripts have no default target at all, and every SSH
+connection they open themselves accepts only the host key pinned in
+`infra/prod_known_hosts`. One gap remains in the retired pair: both use whatever
+already listens on `localhost:5433` instead of opening their own tunnel, so
+make sure nothing else holds that port before a DR run.
 
 `com.pharmacy-monitor.scrape` and `com.pharmacy-monitor.watch` must stay
 unloaded/disabled. The local scrape scripts are fail-closed and exit without
@@ -43,7 +46,10 @@ services, proxy balances, and systemd timers. If an explicit one-off DR run is
 approved, run the script manually with:
 
 ```bash
-PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 PROD_HOST=<prod address> bash infra/local/run-scrape.sh --site <site> --mode category --no-alerts
+PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 PROD_HOST=13.140.186.143 bash infra/local/run-scrape.sh --site <site> --mode category --no-alerts
 ```
+
+`PROD_HOST` must be the IP exactly as written: the pinned key is filed under it,
+so a hostname is refused. Errors go to the script's log file, not the terminal.
 
 After the DR run, confirm the Mac launchd scrape/watch units are still disabled.

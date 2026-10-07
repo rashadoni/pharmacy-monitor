@@ -69,20 +69,20 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 - If a marker reads ambiguously at small sizes — **fix the rendering** (filled dot + ring beats a 9px emoji), do not claim it's «already visible»
 - **Reason**: 2026-05-27 in another project Claude saw a 1-letter macro provenance marker and confidently called it the new ⏳ hourglass marker. User trusted the false positive until manually zooming and discovering nothing was there. False positives erode trust faster than missing features. A confident wrong answer is worse than «I can't clearly see X».
 
-## Current production state (last updated: 2026-05-27)
+## Current production state (last updated: 2026-05-27; сервер, SSH и DNS — 2026-10-07)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
 **Login**: `admin` (или email админа `rashadrahimov@gmail.com`). Пароль здесь больше не пишется — файл публичный, см. раздел выше.
 
 🔴 **Пароль, стоявший в этой строке до 2026-09-23, скомпрометирован — сменить на проде.** Он был задан 2026-09-02 и 21 день лежал открытым текстом в публичном репозитории. Удаление строки ничего не закрыло: он по-прежнему действует, пока его не сменили, и по-прежнему читается — он остался в 15 коммитах, ближайший `git show 7dfcf954:CLAUDE.md`. Логин и адрес дашборда тоже публичны, так что пара полная. Считать это открытым доступом к https://leaddrive.cloud до смены пароля.
 
-**Сменить** — одноразовым workflow `reset-admin-password.yml`: в HEAD его нет, восстанавливается из коммита `40938ae7` (им же делался сброс 2026-09-02), требует секретов репозитория `SSH_PRIVATE_KEY` и `TEMP_ADMIN_PASSWORD_HASH_B64` — их ставит владелец, без них прогон упадёт на середине. **Если пароль просто забыт**, есть вход без него: magic-link `POST /auth/request` → ссылка на `/auth/verify`, живёт 30 минут. Это вход, а не сброс (пароль остаётся прежним), кнопки в UI логина для него нет, и он требует живого SMTP.
+**Сменить** — одноразовым workflow `reset-admin-password.yml`: в HEAD его нет, восстанавливается из коммита `40938ae7` (им же делался сброс 2026-09-02), требует секретов репозитория `SSH_PRIVATE_KEY` и `TEMP_ADMIN_PASSWORD_HASH_B64` — их ставит владелец, без них прогон упадёт на середине. ⚠️ Файл из того коммита нацелен на удалённый Hetzner-сервер и прошит его host key: перед запуском заменить и адрес, и ключ на текущие (шаг настройки SSH взять из `deploy.yml`), иначе прогон упадёт на первом же ssh. **Если пароль просто забыт**, есть вход без него: magic-link `POST /auth/request` → ссылка на `/auth/verify`, живёт 30 минут. Это вход, а не сброс (пароль остаётся прежним), кнопки в UI логина для него нет, и он требует живого SMTP.
 
 **Новый пароль в этот файл не вписывать.** Место для него — `data/.prod-secrets-DO-NOT-COMMIT` (вне git); сейчас там PG/JWT/API-ключи, но не пароль дашборда. В самом проде плейнтекста нет — только bcrypt-хеш.
 ⚠️ Источник истины по паролю — `tenant_users.password_hash` (bcrypt), а НЕ env: `auth_login` берёт `user.password_hash or env ADMIN_PASSWORD_HASH`, поэтому `ADMIN_PASSWORD_HASH` — только bootstrap-фолбэк и с момента первой смены пароля не действует (и фолбэк этот есть только на ветке входа по логину `admin`, не по email). При жалобе «не пускает в панель» смотреть БД, а не env и не эту документацию. Прежний пароль мёртв с 2026-08-23.
 **Server**: Contabo VPS `13.140.186.143` (`vmi3552946.contaboserver.net`), 4 vCPU / 8GB / 96GB, Ubuntu 24.04 — с переезда 2026-09-03.
 ⚠️ Прежний Hetzner cx33 `46.225.149.52` **удалён** (владелец ушёл с Hetzner в сентябре 2026). По SSH туда не ходить и запасным продом не считать: освобождённый облачный адрес могут выдать чужой машине. Всё ниже по файлу, где упомянуты Hetzner или этот адрес, — история, а не инструкция.
-**SSH**: `ssh root@13.140.186.143` — с dev-бокса, ключом по умолчанию; CI ходит как `pm@` ключом из секрета репозитория `SSH_PRIVATE_KEY`. Host key сервера прошит в `infra/prod_known_hosts` и в каждом workflow; брать ключ у сети (`ssh-keyscan`, `StrictHostKeyChecking=accept-new`) нельзя — за этим следит `tests/test_prod_host_pinning.py`. (root + pm users active; pm home is `/opt/pharmacy-monitor`, NOT `/home/pm`; `pm` does not have passwordless sudo — use root for systemctl/sudo ops)
+**SSH**: `ssh root@13.140.186.143` — с dev-бокса, ключом по умолчанию; CI ходит как `pm@` ключом из секрета репозитория `SSH_PRIVATE_KEY`. Host key сервера прошит в `infra/prod_known_hosts` и в каждом workflow; брать ключ у сети (`ssh-keyscan`, `StrictHostKeyChecking=accept-new`) нельзя — `tests/test_prod_host_pinning.py` ловит возврат этих приёмов и старого адреса в `.github/`, `infra/`, `scripts/`. С машины, которая сервер ещё не знает, сначала добавить прошитый ключ: `grep -v '^#' infra/prod_known_hosts >> ~/.ssh/known_hosts`. (root + pm users active; pm home is `/opt/pharmacy-monitor`, NOT `/home/pm`; `pm` does not have passwordless sudo — use root for systemctl/sudo ops)
 **DNS**: leaddrive.cloud at Namecheap; A `@` and `www` → 13.140.186.143
 
 ### What's running
@@ -506,7 +506,7 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
 - NOTE: `pharmacy-monitor notify test` для smoke-теста доставки запускать с загруженным env (systemd EnvironmentFile НЕ грузится при ручном CLI): `set -a; source /etc/pharmacy-monitor/env; .venv/bin/pharmacy-monitor notify test`.
 - ~~22317 AZN bug in aptekonline price parser~~ FIXED 2026-05-07. Root cause: aptekonline's Angular template `'<del>' + price + 'AZN </del>' + p.discount_price + ' AZN '` renders with no separator, so `inner_text` of `.new-price` returns e.g. `"22AZN 317 AZN"` for a discounted product. Old `parse_price` stripped non-digits → `"22317"`. Fix: extract only the FIRST digit-run-with-dots/commas via regex. Existing bad rows перезатираются следующим aptekonline-прогоном (Mac launchd 18:00 Asia/Baku ежедневно); для немедленной очистки: `DELETE FROM price_snapshots WHERE site='aptekonline' AND price > 5000;`
 - pharmonline.az has NO `/sitemap.xml` (returns SPA HTML); aptekonline returns empty `<urlset>` — both need BFS fallback (regular Playwright scrapers continue to work via category pages)
-- ⚠️ **Пункт ниже устарел (помечено 2026-10-07)** — он про адрес удалённого Hetzner-сервера и про сбор aptekonline с Мака. Сейчас все три сайта собираются на сервере Contabo (таймеры проверены 2026-10-07), сбор с Мака снят 2026-07-03, туннель `com.pharmacy-monitor.db-tunnel` не нужен. Оставлен как история того, почему появились прокси.
+- ⚠️ **Пункт ниже устарел (помечено 2026-10-07)** — он про адрес удалённого Hetzner-сервера и про сбор aptekonline с Мака. Сейчас ни один сайт с Мака не собирается (сбор снят 2026-07-03; кто и когда собирает — «Расписание сбора» выше), туннель `com.pharmacy-monitor.db-tunnel` для сбора не нужен. Оставлен как история того, почему появились прокси.
 - **Hetzner DE IP banned by pharmonline.az + aptekonline.az** — частично обойдено:
   - **pharmonline → IPRoyal (DDP)** на проде — ✅ работает, daily.
   - **aloe → direct** на проде — ✅ работает.
@@ -540,9 +540,10 @@ docker compose up -d                        # Postgres + Redis
 cd frontend && pnpm dev                     # Next.js
 .venv/bin/pytest -q                         # 80 unit tests
 
-# Deploy — только workflow, после зелёного CI на main (docs/DELIVERY-ARCHITECTURE.md).
-# Ручной rsync всего дерева с локальной машины, стоявший здесь раньше, устарел:
-# он шёл мимо проверок, которые deploy.yml делает перед выкладкой.
+# Deploy — workflow deploy.yml; запускать после зелёного CI на main (так требует
+# шапка самого workflow, сам он CI не проверяет). Ручной rsync всего дерева с
+# локальной машины, стоявший здесь раньше, устарел: он шёл мимо проверок,
+# которые deploy.yml делает перед выкладкой.
 gh workflow run deploy.yml --ref main -f apply_migrations=false
 
 # Sync deps after pyproject.toml change (server has no `uv` and no `pip` in venv —
@@ -614,9 +615,9 @@ SELECT COUNT(*) FROM products;
 > ⚠️ **Скрипт устарел (помечено 2026-10-07).** Он писался под май 2026 и по
 > умолчанию отправлял вводимые ключи на удалённый Hetzner-адрес. Адреса по
 > умолчанию больше нет — нужен явный `PROD_HOST`, соединение принимается только с
-> прошитым host key. SMTP и Sentry уже настроены; блоки 4 (ScraperAPI) и 5
-> (GitHub remote) не запускать — они перепишут рабочие настройки. По сути из
-> него жив один блок Telegram.
+> прошитым host key. SMTP и Sentry уже настроены; на вопросы блоков «ScraperAPI
+> Hobby» и «GitHub remote» отвечать «нет» — они перепишут рабочие настройки
+> (скрипт их по-прежнему предлагает). По сути из него жив один блок Telegram.
 
 Для настройки SMTP / Telegram / Sentry / GitHub remote / ScraperAPI Hobby:
 

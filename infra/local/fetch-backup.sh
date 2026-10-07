@@ -26,6 +26,7 @@
 # server (on the Mac: Keychain item pharmacy-monitor-gpg).
 #   gpg --batch --yes --passphrase-fd 0 -d backup.sql.gz.gpg | gunzip > backup.sql
 #   psql -h <host> -U pm pharmacy_monitor < backup.sql
+# (gpg waits for the passphrase on stdin: type it and press Enter.)
 
 set -euo pipefail
 
@@ -51,7 +52,12 @@ case "${1:-}" in
         ;;
     "")
         # No arg: fetch latest. -t = sort by mtime descending, head -1 = newest.
-        target=$(ssh "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST" "ls -t $REMOTE_DIR/pharmacy-monitor-*.sql.gz* 2>/dev/null | head -1")
+        # Encrypted dumps first: while backup.sh is running, the newest file is
+        # its unfinished, still-plaintext .sql.gz.
+        target=$(ssh "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST" "ls -t $REMOTE_DIR/pharmacy-monitor-*.sql.gz.gpg 2>/dev/null | head -1")
+        if [[ -z "$target" ]]; then
+            target=$(ssh "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST" "ls -t $REMOTE_DIR/pharmacy-monitor-*.sql.gz 2>/dev/null | head -1")
+        fi
         if [[ -z "$target" ]]; then
             echo "ERROR: no backups found on prod in $REMOTE_DIR" >&2
             exit 1
@@ -73,7 +79,12 @@ if [[ -f "$local_path" ]]; then
 fi
 
 echo "==> Fetching $basename from prod..."
-scp "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST:$target" "$local_path"
+# Download under a temporary name: an interrupted copy must not leave a
+# truncated file that passes for a finished backup on the next run.
+partial="$LOCAL_DIR/.partial-$basename"
+trap 'rm -f "$partial"' EXIT
+scp "${SSH_OPTS[@]}" "$PROD_USER@$PROD_HOST:$target" "$partial"
+mv "$partial" "$local_path"
 
 size=$(du -h "$local_path" | cut -f1)
 echo "==> Saved → $local_path ($size)"
@@ -91,5 +102,6 @@ fi
 echo
 echo "==> Done. Total local backups: $(ls "$LOCAL_DIR"/pharmacy-monitor-*.sql.gz* 2>/dev/null | wc -l | tr -d ' ')"
 echo
-echo "To decrypt (emergency restore) you need BACKUP_GPG_PASSPHRASE kept off the server:"
+echo "To decrypt (emergency restore) you need BACKUP_GPG_PASSPHRASE kept off the server."
+echo "The command waits for it on stdin (type it, press Enter):"
 echo "  gpg --batch --yes --passphrase-fd 0 -d \"$local_path\" | gunzip > restore.sql"
