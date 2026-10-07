@@ -105,3 +105,30 @@ def test_keeps_a_section_the_operator_already_entered(tmp_path: Path) -> None:
     # Откат убирает только строки в том виде, в каком их создала миграция.
     _alembic(db_url, "downgrade", PREVIOUS)
     assert _aloe_rows(engine) == expected
+
+
+def test_does_not_become_the_whole_route_list_on_a_database_without_aloe(tmp_path: Path) -> None:
+    """На базе без маршрутов aloe миграция ничего не заводит.
+
+    Иначе новый сервер после `alembic upgrade head` собирал бы одну косметику с
+    гигиеной и считал это полным проверенным каталогом — а пустая таблица
+    раньше честно отказывала (`no_categories_configured`).
+    """
+    db_url = f"sqlite:///{tmp_path / 'aloe-sections-empty.sqlite'}"
+    _alembic(db_url, "upgrade", PREVIOUS)
+    engine = create_engine(db_url)
+    with engine.begin() as connection:
+        # Категория другого сайта не делает базу «собирающей aloe».
+        connection.execute(
+            text(
+                "INSERT INTO categories (key, label_ru, pharmonline_slug, is_active, created_at) "
+                "VALUES ('pharma_x', 'X', 'x', 1, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    _alembic(db_url, "upgrade", REVISION)
+
+    assert _aloe_rows(engine) == {}
+    with engine.connect() as connection:
+        total = connection.execute(text("SELECT count(*) FROM categories")).scalar_one()
+    assert total == 1

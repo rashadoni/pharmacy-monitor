@@ -15,6 +15,11 @@ left out on purpose: it is not pharmacy assortment.
 The rows are data, not schema, but they live in a migration so that the write
 reaches production through ``deploy.yml`` with ``apply_migrations`` — behind
 its verified backup — instead of a hand-typed statement.
+
+It only EXTENDS an Aloe route list that already exists.  On a database with no
+Aloe route at all (a fresh server, CI) it inserts nothing: two rows there would
+be the whole list, and a scan of cosmetics and hygiene alone would pass as a
+verified full catalogue where an empty table used to refuse to run.
 """
 
 from __future__ import annotations
@@ -63,6 +68,14 @@ def upgrade() -> None:
     # Naive UTC, like `Category.created_at` written by the application; the
     # production server is not on UTC, so a database-side now() would differ.
     created_at = datetime.now(UTC).replace(tzinfo=None)
+    configured = bind.scalar(
+        sa.select(sa.func.count())
+        .select_from(categories)
+        .where(categories.c.aloe_slug.is_not(None))
+    )
+    if not configured:
+        log.warning("no aloe route in categories yet: cosmetics and hygiene not added")
+        return
     for key, label_ru, label_az, aloe_slug in _ROUTES:
         # An operator may already have entered the section by hand (`category
         # add`, the dashboard), possibly switched off or under another key.
