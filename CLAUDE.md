@@ -69,20 +69,21 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 - If a marker reads ambiguously at small sizes — **fix the rendering** (filled dot + ring beats a 9px emoji), do not claim it's «already visible»
 - **Reason**: 2026-05-27 in another project Claude saw a 1-letter macro provenance marker and confidently called it the new ⏳ hourglass marker. User trusted the false positive until manually zooming and discovering nothing was there. False positives erode trust faster than missing features. A confident wrong answer is worse than «I can't clearly see X».
 
-## Current production state (last updated: 2026-05-27)
+## Current production state (last updated: 2026-05-27; сервер, SSH и DNS — 2026-10-07)
 
 **Live URL**: https://leaddrive.cloud (also www.leaddrive.cloud) — TLS via Let's Encrypt, auto-renew (cert valid until 2026-08-04)
 **Login**: `admin` (или email админа `rashadrahimov@gmail.com`). Пароль здесь больше не пишется — файл публичный, см. раздел выше.
 
 🔴 **Пароль, стоявший в этой строке до 2026-09-23, скомпрометирован — сменить на проде.** Он был задан 2026-09-02 и 21 день лежал открытым текстом в публичном репозитории. Удаление строки ничего не закрыло: он по-прежнему действует, пока его не сменили, и по-прежнему читается — он остался в 15 коммитах, ближайший `git show 7dfcf954:CLAUDE.md`. Логин и адрес дашборда тоже публичны, так что пара полная. Считать это открытым доступом к https://leaddrive.cloud до смены пароля.
 
-**Сменить** — одноразовым workflow `reset-admin-password.yml`: в HEAD его нет, восстанавливается из коммита `40938ae7` (им же делался сброс 2026-09-02), требует секретов репозитория `SSH_PRIVATE_KEY` и `TEMP_ADMIN_PASSWORD_HASH_B64` — их ставит владелец, без них прогон упадёт на середине. **Если пароль просто забыт**, есть вход без него: magic-link `POST /auth/request` → ссылка на `/auth/verify`, живёт 30 минут. Это вход, а не сброс (пароль остаётся прежним), кнопки в UI логина для него нет, и он требует живого SMTP.
+**Сменить** — одноразовым workflow `reset-admin-password.yml`: в HEAD его нет, восстанавливается из коммита `40938ae7` (им же делался сброс 2026-09-02), требует секретов репозитория `SSH_PRIVATE_KEY` и `TEMP_ADMIN_PASSWORD_HASH_B64` — их ставит владелец, без них прогон упадёт на середине. ⚠️ Файл из того коммита нацелен на удалённый Hetzner-сервер и прошит его host key: перед запуском заменить и адрес, и ключ на текущие (шаг настройки SSH взять из `deploy.yml`), иначе прогон упадёт на первом же ssh. **Если пароль просто забыт**, есть вход без него: magic-link `POST /auth/request` → ссылка на `/auth/verify`, живёт 30 минут. Это вход, а не сброс (пароль остаётся прежним), кнопки в UI логина для него нет, и он требует живого SMTP.
 
 **Новый пароль в этот файл не вписывать.** Место для него — `data/.prod-secrets-DO-NOT-COMMIT` (вне git); сейчас там PG/JWT/API-ключи, но не пароль дашборда. В самом проде плейнтекста нет — только bcrypt-хеш.
 ⚠️ Источник истины по паролю — `tenant_users.password_hash` (bcrypt), а НЕ env: `auth_login` берёт `user.password_hash or env ADMIN_PASSWORD_HASH`, поэтому `ADMIN_PASSWORD_HASH` — только bootstrap-фолбэк и с момента первой смены пароля не действует (и фолбэк этот есть только на ветке входа по логину `admin`, не по email). При жалобе «не пускает в панель» смотреть БД, а не env и не эту документацию. Прежний пароль мёртв с 2026-08-23.
-**Server**: Hetzner cx33 (Falkenstein DE), 4 vCPU / 8GB / 80GB · €7.99/mo · IP `46.225.149.52`
-**SSH**: `ssh -i ~/.ssh/id_ed25519 root@46.225.149.52` (root + pm users active; pm home is `/opt/pharmacy-monitor`, NOT `/home/pm`; `pm` does not have passwordless sudo — use root for systemctl/sudo ops)
-**DNS**: leaddrive.cloud at Namecheap; A `@` and `www` → 46.225.149.52
+**Server**: Contabo VPS `13.140.186.143` (`vmi3552946.contaboserver.net`), 4 vCPU / 8GB / 96GB, Ubuntu 24.04 — с переезда 2026-09-03.
+⚠️ Прежний Hetzner cx33 `46.225.149.52` **удалён** (владелец ушёл с Hetzner в сентябре 2026). По SSH туда не ходить и запасным продом не считать: освобождённый облачный адрес могут выдать чужой машине. Всё ниже по файлу, где упомянуты Hetzner или этот адрес, — история, а не инструкция.
+**SSH**: `ssh root@13.140.186.143` — с dev-бокса, ключом по умолчанию; CI ходит как `pm@` ключом из секрета репозитория `SSH_PRIVATE_KEY`. Host key сервера прошит в `infra/prod_known_hosts` и в каждом workflow; брать ключ у сети (`ssh-keyscan`, `StrictHostKeyChecking=accept-new`) нельзя — `tests/test_prod_host_pinning.py` ловит возврат этих приёмов и старого адреса в `.github/`, `infra/`, `scripts/`. С машины, которая сервер ещё не знает, сначала добавить прошитый ключ: `grep -v '^#' infra/prod_known_hosts >> ~/.ssh/known_hosts`. (root + pm users active; pm home is `/opt/pharmacy-monitor`, NOT `/home/pm`; `pm` does not have passwordless sudo — use root for systemctl/sudo ops)
+**DNS**: leaddrive.cloud at Namecheap; A `@` and `www` → 13.140.186.143
 
 ### What's running
 | Service | Status | Notes |
@@ -132,9 +133,28 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 Осознанные эвристики (точны на сегодняшних данных, следить): «5/10» и «10/5» считаются одним товаром, пока ни один из двух сайтов не держит у бренда оба порядка (`_dose_order_ambiguous`); доза из URL сравнивается без десятичного разделителя; «500 mq» = «(100+400) mq»; «50 mq/5 ml» и «50 mq/ml» не различаются (сайты сами пишут один товар и так, и так); производитель после дефиса («Sefazolin-Akos» и «Sefazolin») — подробность одной стороны, а буквенный код («Lopril-H» и «Lopril») — другой товар. Что осталось несопоставленным и почему — в описании PR; главный остаток — разная подтверждённая страна (политика клиента, не трогать).
 
-**Страны у aloe (показать владельцу, политика не менялась):** у одноимённых однозначных пар с подтверждённой страной на обоих сайтах страна расходится в 8% случаев между pharmonline и aptekonline и в 24–25% — между aloe и остальными (566 пар с pharmonline; в 80% из них цена совпадает до 3%, то есть это тот же товар). aloe пишет «Украина» там, где остальные — Турция, Индия, Германия; «Россия» и «Турция» там, где остальные — Азербайджан. Источник у aloe — `aloe_country_id_verified_detail`. Отдельно: в `product_policy._COUNTRY_ALIASES` ключи «rumıniya» (с ı) и «seudiye erebistani» не совпадают ни с одним входом после `_country_key`, а «San Marino» отсутствует — текстовое значение такой страны не распознаётся.
+**Страны у aloe (показать владельцу, политика не менялась).** Замер на копии каталога от утра 2026-10-07, до правки словаря стран из PR #19 (запись ниже): у одноимённых однозначных пар с подтверждённой страной на обоих сайтах страна расходится в 8% случаев между pharmonline и aptekonline и в 24–25% — между aloe и остальными (566 пар с pharmonline; в 80% из них цена совпадает до 3%, то есть это тот же товар). aloe пишет «Украина» там, где остальные — Турция, Индия, Германия; «Россия» и «Турция» там, где остальные — Азербайджан. Источник у aloe — `aloe_country_id_verified_detail`. Это тот же вывод, что в записи про словарь стран: сайты подписывают страну одного товара по-разному, и это вопрос к клиенту о правиле. После разной страны главный остаток несопоставленного — именно он (≈390 товаров клиента с одноимённым товаром у конкурента).
 
 Замеры: одноразовый Postgres с копией прода, клон базы на каждый прогон, сессия как в `storage.make_session` (без autoflush) — рецепт в памяти сессий `pharmacy-monitor-local-verification`. **Мерить каждую правку матчера: новые кластеры, изменённые назначения (должно быть 0), дубли сайта в кластере (0), второй прогон (сходится), выборка на глаз.**
+**На разборе (2026-10-07): словарь стран — написания с карточек aloe (PR #19).** Смержен ли и выложен — проверять по `git log` и таблице `aloe_country_mappings`, а не по этой записи: изменение видимое и ждало «давай» владельца.
+
+- **Что было.** aloe отдаёт в листинге числовой id страны, название читается с карточки и разрешается словарём. Словарь не разрешал 39 написаний («Израиль», «Британия», «Малайзия», «Босния»…), и в полном сборе 987 страна осталась неразрешённой у 329 товаров из 6 017 — 94,5% при пороге 98%. Четыре из них («Argentina», «Аргентина», «Ирландия», «Сан-Марино») уже лежали в `aloe_country_mappings`: их завела ветка `claude/error-investigation-d5f200`, выложенная на прод в августе rsync'ом и не смерженная.
+- **Как вносить написание.** В `product_policy._COUNTRY_SPELLINGS`, так, как пишет сайт: `_COUNTRY_ALIASES` собирается из него через `_country_key`. Свёртка превращает «й» в «и» и «ı» в «i» — ключи, записанные буквально, не находились никогда («китай», «швейцария», «азербайджан», «rumıniya»). Двухбуквенных ключей не заводить: две буквы сверяются только со списком ISO.
+- **Словарь общий для всех сайтов.** У aptekonline поле `olke` — свободный текст, поэтому любое латинское написание меняет и его: «Rumıniya» и «Argentina» дали страну 324 товарам aptekonline. pharmonline не затронут — его живой путь отдаёт двухбуквенный код.
+- **Что НЕ разрешается намеренно:** «Türkiyə-Almaniya» (id 7, 62 товара) и «Турция-Гер» — две страны; «Курган», «Санкт-Пете» — город; «Специфарма» — фирма; «НВ» — сокращение; «Country» — заглушка сайта. Не добавлять ради процента покрытия.
+- **Эффект на пары (замер на копии прода):** страну получают 540 товаров, 111 кластеров подтверждаются, **33 расходятся** — 14 строк сравнения теряют третий сайт, 14 строк с товаром клиента исчезают, 5 пар без клиента распадаются.
+- ⚠️ **Сайты подписывают страну одного и того же товара по-разному.** В 21 из 33 разошедшихся кластеров цены совпадают до 3%. Prestans и Tripliksam: aptekonline «İrlandiya», остальные «Франция», цена одна до копейки; линейка Erbozeta: aptekonline «San-Marino», aloe «Италия». Поэтому написания, которыми страну подписывает только aptekonline (İrlandiya, San-Marino, Albaniya — 113 товаров, ещё 19 кластеров), в словарь **не внесены**: это вопрос к клиенту о правиле, а не техническая правка.
+- **Как мерить перед любой правкой словаря:** копия каталога, новый `country_resolution` применить к `manufacturer_country_raw` (aloe — через id → название из `aloe_country_mappings`), `matcher.revalidate_split(dry_run=True)` до и после. Список разошедшихся пар — владельцу до мержа.
+
+**Just finished (2026-10-07): страница сравнения — быстрый поиск по всему каталогу, подсказки, Excel (PR #14).** Жалобы клиента 2026-10-06: поиск грузится долго; «veqovi / ozempik / kreon» не находятся, хотя товары на сайтах есть; нет подсказок при наборе; нужен Excel со всеми товарами с разной ценой.
+
+- **Почему было медленно.** Полный список — 3–8 с и 4 МБ без сжатия; каждая буква — 0,7–1,3 с даже при пустом ответе: `trusted_catalog_epoch` на каждое чтение звал `full_catalog_trust_report` (девять `count(distinct)` по `offer_observations`), хотя эпохе нужны только id прогонов. Теперь эпоха считается через общий `_site_full_run_state`, отчёт не изменился. Строки сравнения собирает `_comparison_rows` на колонках вместо ORM, ответ уходит мимо `jsonable_encoder`, включён GZip. ⚠️ Выигрыш на эпохе есть только в shadow-режиме политик: в `enforce` `_require_financial_policy_ready` снова считает полный отчёт на каждый запрос — перед включением `enforce` закэшировать покрытие по (сайт, id прогона).
+- **Почему «не находило».** Поиск был `ILIKE` по `matches.canonical_name`, то есть видел только сопоставленные кластеры (3 785 из ~44 600 товаров). У Veqovi, Ozempik, Kreon 10000 пары нет. Теперь поиск идёт по индексу названий в памяти процесса (`src/catalog_search.py`) со свёрткой написания (кириллица, az-буквы, c/k/s, w/v, q/g, y/i, x/ks) и нечётким проходом на опечатки. `GET /api/v1/dash/comparison/search` отдаёт строки сравнения плюс `others` — найденные товары, которых в строках нет. Единое правило отбора — `_comparison_search`: им пользуются поиск страницы, старый параметр `search` и Excel.
+- **Подсказки:** `GET /api/v1/dash/comparison/suggest` — торговые имена и их продолжения («Kreon», «Kreon 10000»).
+- **Excel:** `GET /api/v1/dash/comparison/export.xlsx` (`src/comparison_export.py`): лист 1 — товары с разной ценой (min ≠ max; то же правило у галочки «только с различием» на странице), лист 2 — вся выборка, лист 3 — когда и с какими фильтрами. Кнопка CSV убрана.
+- **Поведение, изменившееся попутно:** при равных ценах `cheapest_site` теперь всегда клиент (раньше зависел от порядка строк в БД).
+- **Эксплуатация индекса** — в [docs/RUNBOOK.md](docs/RUNBOOK.md) «Поиск на странице сравнения…»: свой у каждого воркера, прогрев при старте, обновление в фоне, сброс только рестартом API.
+- **Что это НЕ чинит:** сопоставление. Пара у конкурента есть только у трети каталога клиента; поиск теперь такие товары показывает отдельным блоком, но в одну строку сравнения они не попадают.
 
 **Just finished (2026-06-22): два алерт-фикса по жалобам клиента (оба rsync-задеплоены + в git).**
 
@@ -295,6 +315,14 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 | `chrome-devtools` | Debug live Chrome (Network/Console/Perf) | Free local | 30+ (navigate, click, list_network_requests, performance_*, lighthouse, take_heapsnapshot) | Google Chrome team official |
 
 ### Persistent SSH tunnel for Postgres MCP
+
+> ⚠️ **Устарело с 2026-09-03 (помечено 2026-10-07).** Туннель смотрел на удалённый
+> Hetzner-адрес. Агент на Маке убрать в два шага — `launchctl bootout
+> gui/$UID/com.pharmacy-monitor.db-tunnel` и `rm
+> ~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist`: один `bootout`
+> держится до следующего входа в систему. Копия plist в репозитории обезврежена
+> (вместо адреса — заглушка). Базу прода сейчас смотрят с
+> dev-бокса: `ssh root@13.140.186.143 'sudo -u postgres psql -X pharmacy_monitor'`.
 
 - launchd plist: `~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist`
 - Tracked в проекте: `infra/local/com.pharmacy-monitor.db-tunnel.plist`
@@ -465,6 +493,28 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 > **Меняешь systemd-таймер или cron — меняй и `cadence.py`.** Рассинхрон уже
 > стоил ложной тревоги: после перевода aptekonline на неделю 2026-10-04 пороги
 > остались суточными, и дашборд красил штатный сбор красным 6 дней из 7.
+>
+> ⚠️ **Замер 2026-10-07: aloe (и легаси-таймер pharmonline) по-прежнему
+> запускаются каждую ночь, ~23:00 UTC.** Гвард недельного ритма
+> `_is_scheduled_full_scan` ждёт `--mode category`, а юнит на проде зовёт
+> `run --site %i` без него (режим `auto`), поэтому гвард не срабатывает. Пока
+> это не исправлено, «раз в неделю» выше для aloe — намерение, а не факт.
+
+> **Что собирается с aloe (обновлено 2026-10-07).** Ровно те разделы, что
+> заведены строками `categories` с непустым `aloe_slug`. Раздел сайта, которого
+> там нет, не собирается вовсе и нигде не числится пропущенным — проверка полноты
+> видит только заведённые маршруты. У aloe шесть разделов верхнего уровня (дерево
+> лежит JSON-ом `categories` в HTML любой страницы `/catalog/filters/`).
+> Собираются пять: `dermanlar`, `bad`, `usaq-dunyasi` и, начиная с миграции 0022,
+> `kosmetika` и `gigiyena` — плюс подразделы `tibbi-vasitələr`, `uşaq-qidası` и
+> фильтр хитов. Оптика `novooptika-lcsye` не собирается намеренно: не аптечный
+> ассортимент, добавлять только по слову владельца. Новый раздел верхнего уровня
+> вносить и в `watchlist.ALOE_BROAD_CATEGORY_SLUGS`, иначе он пройдёт после
+> точных подразделов и перезапишет товарам категорию.
+
+> Сервер — Contabo (см. «Server» в начале файла). «Hetzner prod», «Hetzner-IP
+> бан» и сбор с Мака в записях ниже — про машину, удалённую в сентябре 2026, и
+> про схему, снятую 2026-07-03 (`infra/local/README.md`).
 
 
 **⚠️ Поправка 2026-05-29 (проверено):** запись ниже про «Mac launchd только / прод-таймеры
@@ -504,6 +554,7 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
 - NOTE: `pharmacy-monitor notify test` для smoke-теста доставки запускать с загруженным env (systemd EnvironmentFile НЕ грузится при ручном CLI): `set -a; source /etc/pharmacy-monitor/env; .venv/bin/pharmacy-monitor notify test`.
 - ~~22317 AZN bug in aptekonline price parser~~ FIXED 2026-05-07. Root cause: aptekonline's Angular template `'<del>' + price + 'AZN </del>' + p.discount_price + ' AZN '` renders with no separator, so `inner_text` of `.new-price` returns e.g. `"22AZN 317 AZN"` for a discounted product. Old `parse_price` stripped non-digits → `"22317"`. Fix: extract only the FIRST digit-run-with-dots/commas via regex. Existing bad rows перезатираются следующим aptekonline-прогоном (Mac launchd 18:00 Asia/Baku ежедневно); для немедленной очистки: `DELETE FROM price_snapshots WHERE site='aptekonline' AND price > 5000;`
 - pharmonline.az has NO `/sitemap.xml` (returns SPA HTML); aptekonline returns empty `<urlset>` — both need BFS fallback (regular Playwright scrapers continue to work via category pages)
+- ⚠️ **Пункт ниже устарел (помечено 2026-10-07)** — он про адрес удалённого Hetzner-сервера и про сбор aptekonline с Мака. Сейчас ни один сайт с Мака не собирается (сбор снят 2026-07-03; кто и когда собирает — «Расписание сбора» выше), туннель `com.pharmacy-monitor.db-tunnel` для сбора не нужен. Оставлен как история того, почему появились прокси.
 - **Hetzner DE IP banned by pharmonline.az + aptekonline.az** — частично обойдено:
   - **pharmonline → IPRoyal (DDP)** на проде — ✅ работает, daily.
   - **aloe → direct** на проде — ✅ работает.
@@ -517,7 +568,8 @@ ScraperAPI: `SCRAPER_API_KEY`, `SCRAPER_API_SITES=pharmonline,aptekonline` в `/
     - **NB:** матчинг-фаза Mac-скрейпа ~3-4ч (каждый DB-query через туннель = latency; на сервере 2 мин). Отрабатывает за ночь — ок.
     - **Чтобы снять зависимость от Mac:** нужен прокси с **AZ-residential** пулом (IPRoyal/ScraperAPI/BrightData его НЕ имеют для aptek) ИЛИ разблокировать BrightData-биллинг (но AZ-пул у них не гарантирован). До тех пор — aptek = Mac.
   - (Прежние записи «RESOLVED via BrightData / Mac-зависимость снята» — УСТАРЕЛИ, см. строки ~151/328/342.)
-- Project under git с 2026-05-11. Initial commit `c7fde84` зафиксировал diff-only state. **Remote**: `origin` = `https://github.com/rashadrahimov/pharmacy-monitor.git`. Auth работает через cached creds (`git push origin main` без проблем).
+- 🔴 **Копии бэкапа вне сервера нет (проверено 2026-10-07).** `pharmacy-monitor-backup.timer` каждую ночь кладёт шифрованный дамп в `/var/backups/pharmacy-monitor/` на самом сервере (хранение 14 дней; самый ранний дамп — от 4 октября, до починки бэкап месяц падал). Наружу ничего не уходит: B2 не настроен (`B2 upload skipped` в journald), других заданий на сервере нет. Единственный путь наружу — ручной `infra/local/fetch-backup.sh`, и он до 2026-10-07 по умолчанию смотрел на удалённый Hetzner. Потеря сервера сейчас = потеря базы. Дамп зашифрован `BACKUP_GPG_PASSPHRASE` из `/etc/pharmacy-monitor/env`: без копии этого пароля вне сервера забранный файл не расшифровать, и на 2026-10-07 не установлено, есть ли такая копия (в Keychain на Маке мог остаться пароль времён Hetzner). Dev-бокс, с которого скрипт сейчас может ходить на сервер, — тоже Contabo: копия там переживёт потерю машины, но не аккаунта. Восстановление из такого дампа на этом сервере ни разу не проверялось. Как забрать копию — [docs/RUNBOOK.md](docs/RUNBOOK.md) «Копия бэкапа вне сервера».
+- Project under git с 2026-05-11. Initial commit `c7fde84` зафиксировал diff-only state. **Remote**: `origin` = `https://github.com/rashadoni/pharmacy-monitor.git` (до переезда репозитория — `rashadrahimov/pharmacy-monitor`). В `main` только через PR — `docs/DELIVERY-ARCHITECTURE.md`.
 - ~~forecast.py не рефакторен под diff-only~~ **DONE 2026-05-28**: `compute_trend` имеет Case A/B/C для sparse data (0 snaps в окне → latest globally; 1-2 snaps same price → stable). `top_movers` имеет pre-cutoff lookup для single-snapshot products. 3 diff-only regression теста в `tests/test_forecast.py` (`test_compute_trend_diff_only_sparse_active_pricing`, `test_predict_competitor_moves_diff_only_skips_truly_stable`, `test_top_movers_diff_only_sparse_change`). 18/18 forecast тестов проходят.
 - 7 false matches in matcher (Friso 3 Gold ↔ Friso Prematures etc) — needs manual reject via UI on /comparison
 - `admin off` in `/etc/caddy/Caddyfile` — `systemctl reload caddy` fails, use `restart` instead
@@ -536,27 +588,27 @@ docker compose up -d                        # Postgres + Redis
 cd frontend && pnpm dev                     # Next.js
 .venv/bin/pytest -q                         # 80 unit tests
 
-# Deploy
-rsync -avz -e "ssh -i ~/.ssh/id_ed25519" \
-  --exclude='.venv/' --exclude='node_modules/' --exclude='.next/' \
-  --exclude='__pycache__/' --exclude='.git/' --exclude='data/db.sqlite*' \
-  ./ "pm@46.225.149.52:/opt/pharmacy-monitor/"
+# Deploy — workflow deploy.yml; запускать после зелёного CI на выкладываемом
+# коммите (так требует шапка workflow, сам он CI не проверяет). Ручной rsync всего дерева с
+# локальной машины, стоявший здесь раньше, устарел: он шёл мимо проверок,
+# которые deploy.yml делает перед выкладкой.
+gh workflow run deploy.yml --ref main -f apply_migrations=false
 
 # Sync deps after pyproject.toml change (server has no `uv` and no `pip` in venv —
 # use ensurepip + python -m pip):
-ssh -i ~/.ssh/id_ed25519 -l root 46.225.149.52 \
+ssh root@13.140.186.143 \
   'cd /opt/pharmacy-monitor && .venv/bin/python -m ensurepip --upgrade && \
    .venv/bin/python -m pip install -q -e .'
 
 # Server ops (root user — pm has no passwordless sudo)
-ssh -i ~/.ssh/id_ed25519 -l root 46.225.149.52
+ssh root@13.140.186.143
 systemctl restart pharmacy-monitor-api       # restart backend
 systemctl restart pharmacy-monitor-frontend  # restart frontend
 systemctl restart caddy                      # restart proxy (reload fails — admin off)
 systemctl start pharmacy-monitor-scrape@pharmonline  # manual scrape
 
 # DB inspection (root)
-ssh -i ~/.ssh/id_ed25519 -l root 46.225.149.52
+ssh root@13.140.186.143
 sudo -u postgres psql pharmacy_monitor
 \dt
 SELECT COUNT(*) FROM products;
@@ -575,8 +627,7 @@ SELECT COUNT(*) FROM products;
 - User is in Baku (Asia/Baku timezone, UTC+4)
 - User speaks Russian primarily, prefers concise communication
 - User trusts auto mode — minimize confirmation prompts
-- Hetzner project ID: `14487088` (`pharmacy-monitor`)
-- API token revoked after deploy — to create another: console.hetzner.com → Security → API Tokens
+- Hetzner (project ID `14487088`, API-токены в console.hetzner.com) — **устарело**: сервер удалён, владелец ушёл с Hetzner в сентябре 2026. Хостинг прода — Contabo.
 
 ## Roadmap state (12-week plan, all in docs/PRODUCTION_OVERVIEW.md)
 
@@ -609,13 +660,22 @@ SELECT COUNT(*) FROM products;
 
 ## Integration setup (one-shot)
 
-Для настройки SMTP / Telegram / Sentry / GitHub remote / ScraperAPI Hobby:
+> ⚠️ **Скрипт устарел (помечено 2026-10-07).** Он писался под май 2026 и по
+> умолчанию отправлял вводимые ключи на удалённый Hetzner-адрес. Адреса по
+> умолчанию больше нет — нужен явный `PROD_HOST`, соединение принимается только с
+> прошитым host key. SMTP и Sentry уже настроены; блоки «ScraperAPI Hobby» и
+> «GitHub remote» сняты — скрипт их больше не предлагает, они переписали бы
+> рабочие настройки. По сути из него жив один блок Telegram. Страница «Настройки»
+> дашборда всё ещё показывает команду запуска без `PROD_HOST` — в таком виде
+> скрипт завершится с ошибкой.
+
+Для настройки SMTP / Telegram / Sentry:
 
 ```bash
-bash scripts/configure-integrations.sh
+PROD_HOST=13.140.186.143 bash scripts/configure-integrations.sh
 ```
 
-Интерактивный скрипт — 5 блоков, каждый можно пропустить. Обновляет
+Интерактивный скрипт — 3 блока, каждый можно пропустить. Обновляет
 `/etc/pharmacy-monitor/env` на проде, рестартит `pharmacy-monitor-api`.
 Ссылки на signup-страницы каждого сервиса встроены в подсказки.
 

@@ -4,6 +4,7 @@ from src._time import utcnow
 from src.product_observations import apply_product_observation
 from src.product_policy import (
     COUNTRY_AMBIGUOUS,
+    COUNTRY_INVALID,
     COUNTRY_RESOLVED,
     OFFER_IN_STOCK,
     OFFER_OUT_OF_STOCK,
@@ -57,6 +58,101 @@ def test_country_normalization_rejects_non_iso_two_letter_noise() -> None:
     assert normalize_country_code("XX") is None
     assert normalize_country_code("AB") is None
     assert country_resolution("zz") == (None, "invalid")
+
+
+def test_country_normalization_handles_aloe_card_spellings() -> None:
+    """Написания, которыми aloe.az подписывает страну на карточке (замер 2026-10-07).
+
+    Пока словарь их не знал, числовой id страны из листинга оставался
+    неразрешённым, и гард сопоставления такую страну не видел.
+    """
+    observed = {
+        "Израиль": "il",
+        "Британия": "gb",
+        "Britain": "gb",
+        "Шотландия": "gb",
+        "Fransiya": "fr",
+        "ЮАР": "za",
+        "Южная Корея": "kr",
+        "Бангладеш": "bd",
+        "Rumıniya": "ro",
+        "Австралия": "au",
+        "Niderlandiya": "nl",
+        "Голландия": "nl",
+        "Пуерто-Рико": "pr",
+        "Саудовская-Арабия": "sa",
+        "Иордания": "jo",
+        "Канада": "ca",
+        "Уругвай": "uy",
+        "Малайзия": "my",
+        "Словакия": "sk",
+        "Кипр": "cy",
+        "Оман": "om",
+        "Черногория": "me",
+        "Босния": "ba",
+        "Таиланд": "th",
+        "Бразилия": "br",
+        "Мальта": "mt",
+        "Туркменистан": "tm",
+        "Белоруссия": "by",
+        "Индонезия": "id",
+        "Филлипины": "ph",
+        "Мексика": "mx",
+        "Перу": "pe",
+        "Сингапур": "sg",
+        "Колумбия": "co",
+        "Агрентина": "ar",
+        # Уже лежали в aloe_country_mappings, но словарём не разрешались.
+        "Argentina": "ar",
+        "Аргентина": "ar",
+        "Ирландия": "ie",
+        "Сан-Марино": "sm",
+    }
+    for raw, code in observed.items():
+        assert country_resolution(raw) == (code, COUNTRY_RESOLVED), raw
+
+
+def test_country_normalization_keeps_ambiguous_aloe_labels_unresolved() -> None:
+    """Страновая политика не ослабляется ради процента покрытия.
+
+    Две страны сразу, город, название фирмы, непонятное сокращение и заглушка
+    сайта — не страна происхождения. Такое значение должно остаться
+    неразрешённым, иначе гард разведёт пары по выдуманному признаку.
+    """
+    for raw in (
+        "Türkiyə-Almaniya",
+        "Турция-Гер",
+        "Курган",
+        "Санкт-Пете",
+        "Специфарма",
+        "НВ",
+        "Country",
+    ):
+        assert normalize_country_code(raw) is None, raw
+        assert country_resolution(raw) == (None, COUNTRY_INVALID), raw
+
+
+def test_every_country_dictionary_spelling_is_reachable() -> None:
+    """Каждое написание из словаря разрешается через публичную функцию.
+
+    Регрессия: «китай», «швейцария», «азербайджан» и «rumıniya» лежали в
+    словаре буквально, а входное значение сворачивалось (й→и, ı→i) — ключ не
+    совпадал, и страна молча оставалась неразрешённой. Тем же способом был
+    мёртв ключ «uk»: две буквы сверяются только со списком ISO.
+    """
+    from src.product_policy import _COUNTRY_SPELLINGS, _ISO_ALPHA2, _country_key
+
+    folded: dict[str, str] = {}
+    for spelling, code in _COUNTRY_SPELLINGS.items():
+        assert code in _ISO_ALPHA2, spelling
+        assert normalize_country_code(spelling) == code, spelling
+        # Два написания не должны сворачиваться в один ключ с разными странами.
+        assert folded.setdefault(_country_key(spelling), code) == code, spelling
+
+    assert normalize_country_code("Китай") == "cn"
+    assert normalize_country_code("Швейцария") == "ch"
+    assert normalize_country_code("Азербайджан") == "az"
+    assert normalize_country_code("RUMINİYA") == "ro"
 
 
 def test_quantity_is_tri_state_not_missing_equals_zero() -> None:

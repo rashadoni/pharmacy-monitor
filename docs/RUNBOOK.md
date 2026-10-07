@@ -2,6 +2,19 @@
 
 Operational manual для VPS-инсталляции. Используется когда что-то ломается.
 
+> **Боевой сервер с 2026-09-03 — Contabo `13.140.186.143`
+> (`vmi3552946.contaboserver.net`).** Прежний Hetzner-сервер удалён; адрес в
+> командах ниже заменён 2026-10-07. Сами разделы тогда целиком не
+> перепроверялись, и помечены как устаревшие лишь некоторые. Раздел, где
+> встречаются пользователь `pharmacy`, `uv run`, `provision_vps.sh`, SQLite или
+> сервисы `pharmacy-monitor-dashboard` / `-telegram` / `-run`, описывает раннюю
+> версию системы, даже если пометки на нём нет. Host key сервера прошит в
+> `infra/prod_known_hosts`. На машине, которая сервер ещё не знает, сначала
+> добавить этот ключ (из корня репозитория):
+> `grep -v '^#' infra/prod_known_hosts >> ~/.ssh/known_hosts` — и только потом
+> выполнять команды ниже. На вопрос ssh «принять ключ?» не соглашаться: так
+> принимается то, что предъявила сеть.
+
 ## 🚀 Начальная настройка
 
 ### Запуск с нуля на чистой Ubuntu 22.04+
@@ -210,7 +223,7 @@ Fallback читает `rawHtml` API/ sitemap c `maxAge=0`, `storeInCache=false` 
 
 ```bash
 # Текущее состояние всех email-потоков
-ssh root@46.225.149.52 '
+ssh root@13.140.186.143 '
   grep "^SCRAPE_REPORT_EMAIL=" /etc/pharmacy-monitor/env || echo "(report email: ON — флаг не задан)"
   systemctl is-enabled pharmacy-monitor-digest@daily.timer pharmacy-monitor-digest-weekly.timer
   systemctl list-timers --all | grep -i digest
@@ -238,6 +251,30 @@ sudo systemctl restart pharmacy-monitor-dashboard
 sudo systemctl reload nginx
 ```
 
+### Поиск на странице сравнения не находит товар / находит не сразу
+
+Поиск, подсказки и выгрузка в Excel на `/comparison` работают через индекс
+названий в памяти процесса API (`src/catalog_search.py`), а не через SQL.
+
+- **У каждого воркера свой индекс.** Он собирается при старте воркера в фоне
+  (в журнале `catalog_search_index_built products=… seconds=…`) и обновляется
+  тоже в фоне: когда завершился прогон или появились новые товары, но не чаще
+  раза в минуту, и в любом случае раз в 30 минут. Запрос обновление не ждёт —
+  до его конца отдаётся прежний индекс.
+- **Товар только что появился в базе, а поиск его не видит** — это нормально в
+  пределах минуты. Дольше 30 минут — смотреть журнал на
+  `catalog_search_index_refresh_failed`. Сбросить индекс принудительно можно
+  только рестартом `pharmacy-monitor-api`: `catalog_search.reset_cache()`
+  действует на тот процесс, где вызван, скрипт обслуживания воркеры не сбросит.
+- **В индексе только названия и бренды.** Цены, пары и наличие читаются из базы
+  на каждый запрос, поэтому устаревший индекс не может показать неверную цену
+  или чужого арендатора — только не найти новый товар.
+- **Товар найден, но в блоке «найдено на сайтах, но не в сравнении»** — у него
+  нет пары на другом сайте (или пара скрыта фильтром «на N сайтах»). Это вопрос
+  сопоставления, а не сбора: связать вручную можно на странице «Подбор матчей».
+- **Память:** около 50 МБ на воркер при 45 тыс. товаров, вдвое больше на время
+  пересборки.
+
 ### Telegram бот молчит
 
 **Симптом:** клиент пишет `/today` боту → нет ответа.
@@ -261,6 +298,11 @@ sudo -u pharmacy uv run --directory /opt/pharmacy-monitor pharmacy-monitor \
 ## 💾 Бэкапы
 
 ### Текущая стратегия
+
+> ⚠️ Список ниже и раздел «Восстановление из бэкапа» — времён SQLite, устарели
+> (помечено 2026-10-07). Сейчас: Postgres, `pg_dump` каждую ночь в 04:00 по
+> времени сервера, `/var/backups/pharmacy-monitor/`, хранение 14 дней — см.
+> «Сделать бэкап вручную» и «Копия бэкапа вне сервера».
 
 - **Когда:** ежедневно в 02:00 UTC (`pharmacy-monitor-backup.timer`)
 - **Где:** `/opt/pharmacy-monitor/data/backups/db-YYYY-MM-DD.sqlite.gz`
@@ -301,6 +343,54 @@ sudo systemctl start pharmacy-monitor-backup.service
 # или напрямую: sudo bash /opt/pharmacy-monitor/infra/scripts/backup.sh
 ```
 
+### Копия бэкапа вне сервера
+
+Сервер хранит 14 дней дампов только на собственном диске. B2 не настроен
+(`B2 upload skipped` в journald сервиса), других заданий, уносящих дамп наружу,
+на сервере нет. **На 2026-10-07 копии вне сервера нет.** Наружу дамп уходит
+только вручную:
+
+```bash
+bash infra/local/fetch-backup.sh --list   # что лежит на сервере
+bash infra/local/fetch-backup.sh          # забрать свежий в ~/Backups/pharmacy/
+```
+
+Запускать с машины, чей SSH-ключ принимает сервер (сейчас это dev-бокс). Он
+тоже стоит у Contabo: копия там переживёт потерю машины, но не аккаунта —
+настоящая внешняя копия должна лежать ещё где-то. Скрипт предупредит, если
+ночной бэкап пропустил хотя бы одну ночь (самый свежий файл на сервере —
+позавчерашний или старше): однажды он уже месяц молча падал.
+Дамп зашифрован `BACKUP_GPG_PASSPHRASE` из `/etc/pharmacy-monitor/env`: без
+копии этого пароля вне сервера забранный файл не расшифровать. Проверять
+расшифровкой до конца, а не наличием файла (команда молча ждёт пароль на stdin:
+ввести его и нажать Enter; обрезанный файл даст ошибку, а не «дамп цел»):
+
+```bash
+gpg --batch --yes --passphrase-fd 0 -d <файл>.sql.gz.gpg | gunzip -t && echo "дамп цел"
+```
+
+Проверка паролем, прочитанным с сервера, доказывает только целость дампа. Что
+пароль есть и вне сервера, она не доказывает — а на 2026-10-07 это не
+установлено.
+
+Восстановление — в отдельную пустую базу, не в боевую. На этом сервере оно ни
+разу не проверялось, команды ниже собраны по тому, как устроен дамп:
+
+```bash
+# НЕ направлять в pharmacy_monitor: дамп сделан с --clean и начинается с удаления
+# всех таблиц, а без ON_ERROR_STOP psql пройдёт мимо ошибок и оставит смесь
+# старого и нового.
+sudo -u postgres createdb -O pm pharmacy_monitor_restore
+gpg --batch --yes --passphrase-fd 0 -d <файл>.sql.gz.gpg | gunzip > restore.sql
+# Подключаться как pm, а не как postgres: дамп снят с --no-owner, и таблицы
+# достанутся тому, кто восстанавливает.
+psql -v ON_ERROR_STOP=1 --single-transaction \
+  "postgresql://pm:<пароль>@localhost:5432/pharmacy_monitor_restore" < restore.sql
+```
+
+Переключение приложения на восстановленную базу (остановить API и таймеры,
+подменить базу) здесь не описано — такого учения не было.
+
 ---
 
 ## Observability (Prometheus + Grafana)
@@ -315,7 +405,7 @@ sudo systemctl start pharmacy-monitor-backup.service
 
 **Доступ:** дефолтный `admin/admin` **отключён** (сброшен на случайный, нигде не сохранён — 2026-05-29, чтобы публичная Grafana не висела с дефолт-кредами). Поставь свой пароль и войди:
 ```bash
-ssh root@46.225.149.52 'grafana cli admin reset-admin-password <YOUR_PASSWORD>'
+ssh root@13.140.186.143 'grafana cli admin reset-admin-password <YOUR_PASSWORD>'
 # затем логин admin / <YOUR_PASSWORD> на https://leaddrive.cloud/grafana
 ```
 
@@ -337,6 +427,11 @@ journalctl -u grafana-server -n 50               # логи Grafana
 
 ### Полная потеря VPS
 
+> ⚠️ Шаги ниже — времён SQLite (помечено 2026-10-07): `.sqlite.gz` больше не
+> существует, «восстановить, см. выше» ведёт в устаревший раздел. Сейчас база —
+> Postgres, дамп лежит только на самом сервере; что есть и чего нет вне его —
+> «Копия бэкапа вне сервера».
+
 1. Поднять новый VPS
 2. Запустить `provision_vps.sh` (см. Начальная настройка)
 3. Если есть бэкап с предыдущего сервера (S3 / отдельный диск):
@@ -346,6 +441,8 @@ journalctl -u grafana-server -n 50               # логи Grafana
 **Recommendation:** настроить off-site бэкап (S3, Backblaze B2, dropbox).
 
 ### БД повреждена
+
+> ⚠️ Устарело (помечено 2026-10-07): команда для SQLite, база давно Postgres.
 
 ```bash
 sudo -u pharmacy sqlite3 /opt/pharmacy-monitor/data/db.sqlite "PRAGMA integrity_check;"
@@ -379,6 +476,12 @@ sudo find /opt/pharmacy-monitor/data/backups/ -mtime +90 -delete
 ---
 
 ## 🔄 Обновления / деплой нового кода
+
+> ⚠️ Устарело (помечено 2026-10-07): прод — не git-чекаут, а rsync-снимок, и
+> сервисы называются иначе (`pharmacy-monitor-api`,
+> `pharmacy-monitor-frontend`). Выкладка — workflow `deploy.yml`
+> (`gh workflow run deploy.yml --ref main -f apply_migrations=false`) после
+> зелёного CI.
 
 ```bash
 # На VPS
@@ -416,7 +519,7 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
 ## 📞 Контакты для эскалации
 
 - Скрейпер сломался → разработчик (auto-alert через email)
-- VPS недоступен → хостинг (Hetzner/DigitalOcean)
+- VPS недоступен → хостинг (Contabo)
 - Email не идёт → Gmail support / новый App Password
 - Telegram молчит → @BotFather
 
@@ -428,9 +531,12 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 20
 
 | Сайт | Где | Чем | Proxy |
 |---|---|---|---|
-| **pharmonline.az** | Hetzner prod | **Meteor DDP WebSocket** (`src/scrapers/pharmonline_ddp.py`) | Decodo AZ residential (IPRoyal only if Decodo is disabled) |
-| **aloe.az** | Hetzner prod | RSC/HTTP parser (`src/scrapers/aloe.py`) | Direct (no proxy needed) |
-| **aptekonline.az** | Hetzner prod | httpx JSON API (`src/scrapers/aptekonline.py`) | Decodo AZ residential |
+| **pharmonline.az** | прод (Contabo) | **Meteor DDP WebSocket** (`src/scrapers/pharmonline_ddp.py`) | Decodo AZ residential (IPRoyal only if Decodo is disabled) |
+| **aloe.az** | прод (Contabo) | RSC/HTTP parser (`src/scrapers/aloe.py`) | Direct (no proxy needed) |
+| **aptekonline.az** | прод (Contabo) | httpx JSON API (`src/scrapers/aptekonline.py`) | Decodo AZ residential |
+
+Колонка «Где» обновлена 2026-10-07. Способы сбора и прокси в таблице тогда не
+перепроверялись; действующее расписание — CLAUDE.md, «Расписание сбора».
 
 Mac scraping is retired. `com.pharmacy-monitor.scrape` and
 `com.pharmacy-monitor.watch` should remain unloaded/disabled; the scripts under
@@ -570,18 +676,18 @@ Hourly during business hours (05-17 UTC), rotates через top-30 volatile к�
 
 ```bash
 # Dry-run (preview без mutation)
-ssh root@46.225.149.52 'cd /opt/pharmacy-monitor && \
+ssh root@13.140.186.143 'cd /opt/pharmacy-monitor && \
   sudo -u pm bash -c "set -a; source /etc/pharmacy-monitor/env; \
   .venv/bin/pharmacy-monitor intraday-tick --dry-run"'
 
 # Real tick
-ssh root@46.225.149.52 'systemctl start pharmacy-monitor-intraday.service'
+ssh root@13.140.186.143 'systemctl start pharmacy-monitor-intraday.service'
 ```
 
 ### Inspect rotation state (Redis)
 
 ```bash
-ssh root@46.225.149.52 '
+ssh root@13.140.186.143 '
   redis-cli get "intraday:rotation:idx"  # current index
   redis-cli ttl "intraday:lock:site:pharmonline"  # TTL до next tick allowed
   redis-cli ttl "intraday:lock:site:aloe"
@@ -591,7 +697,7 @@ ssh root@46.225.149.52 '
 ### Reset rotation (если зависло)
 
 ```bash
-ssh root@46.225.149.52 '
+ssh root@13.140.186.143 '
   redis-cli del "intraday:rotation:idx" "intraday:lock:site:pharmonline" "intraday:lock:site:aloe"
 '
 # Next tick перезапустится с idx=1
@@ -600,7 +706,7 @@ ssh root@46.225.149.52 '
 ### Disable intraday (если жрёт proxy credits)
 
 ```bash
-ssh root@46.225.149.52 'systemctl disable --now pharmacy-monitor-intraday.timer'
+ssh root@13.140.186.143 'systemctl disable --now pharmacy-monitor-intraday.timer'
 ```
 
 ---
@@ -622,6 +728,13 @@ ssh root@46.225.149.52 'systemctl disable --now pharmacy-monitor-intraday.timer'
 | `mcp__openrouter-sonar__*` | Sonar models (если OpenRouter credits ok) |
 
 ### Postgres MCP — SSH tunnel auto-start
+
+> ⚠️ **Устарело с 2026-09-03 (помечено 2026-10-07).** Агент на Маке смотрит на
+> удалённый Hetzner-сервер. Из команд ниже нужна одна — `bootout` (выгрузить),
+> и сразу за ней `rm ~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist`:
+> без удаления файла агент загрузится снова при следующем входе в систему.
+> `bootstrap` не выполнять. Копия plist в репозитории обезврежена, см.
+> `infra/local/README.md`.
 
 `~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist` (auto-restart, persistent).
 
@@ -769,13 +882,22 @@ EOF
 
 **Recovery scenario**: восстановить frontend после failed deploy (i18n rollback experience).
 
+> ⚠️ **Устарело — на текущем сервере не выполнять (помечено 2026-10-07).**
+> Учение проверено только на прежнем Hetzner-сервере. На Contabo архивов
+> `frontend-src-pre-*.tgz` нет: шаг 2 сначала удаляет `frontend/src`, а
+> распаковывать после этого нечего. Адрес в командах заменён заглушкой
+> `<server>` намеренно. Отдельного отката одного фронтенда сейчас нет:
+> `deploy.yml` выкладывает бэкенд и фронтенд вместе и откажется работать, если
+> ревизии базы прода нет в выбранном коммите. Сломанный фронтенд чинится новым
+> коммитом через PR и обычной выкладкой.
+
 ```bash
 # 1. Find latest pre-deploy backup
-LATEST=$(ssh root@46.225.149.52 'ls -t /var/backups/pharmacy-monitor/frontend-src-pre-*.tgz | head -1')
+LATEST=$(ssh root@<server> 'ls -t /var/backups/pharmacy-monitor/frontend-src-pre-*.tgz | head -1')
 echo "Will restore from: $LATEST"
 
 # 2. Restore
-ssh root@46.225.149.52 '
+ssh root@<server> '
   cd /opt/pharmacy-monitor
   rm -rf frontend/src
   tar xzf '"$LATEST"'
@@ -783,7 +905,7 @@ ssh root@46.225.149.52 '
 '
 
 # 3. Rebuild + restart
-ssh root@46.225.149.52 '
+ssh root@<server> '
   cd /opt/pharmacy-monitor/frontend
   sudo -u pm bash -c "NODE_OPTIONS=--max-old-space-size=4096 pnpm build"
   systemctl restart pharmacy-monitor-frontend

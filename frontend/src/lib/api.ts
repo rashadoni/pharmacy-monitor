@@ -471,6 +471,36 @@ export interface ForecastMover {
   confidence: "low" | "medium" | "high";
 }
 
+/** Товар, найденный поиском, которого нет в строках сравнения (нет пары). */
+export interface ComparisonOther {
+  product_id: number;
+  site: string;
+  name: string;
+  brand: string | null;
+  url: string;
+  /** null — цена ещё не собрана. */
+  price: number | null;
+  is_on_sale: boolean;
+  country_code?: string | null;
+  country_resolution_status?: "resolved" | "unknown" | "ambiguous" | "invalid";
+  availability_status?: "in_stock" | "out_of_stock" | "unknown";
+  age_days: number | null;
+  stale: boolean;
+}
+
+export interface ComparisonSearchResult {
+  rows: ComparisonRow[];
+  others: ComparisonOther[];
+  /** Всего найдено «прочих»; `others` может быть обрезан сервером. */
+  others_total: number;
+}
+
+export interface ComparisonSuggestion {
+  text: string;
+  /** Сколько товаров каталога носят это имя. */
+  count: number;
+}
+
 export interface CategoryComparisonRow {
   /** slug (Product.category) — ключ drill-down в /comparison?category=. */
   category: string;
@@ -945,6 +975,53 @@ export const api = {
     if (params.limit) q.set("limit", String(params.limit));
     if (params.category) q.set("category", params.category);
     return request<ComparisonRow[]>(`/api/v1/dash/comparison?${q}`);
+  },
+  /** Поиск по всему каталогу: строки сравнения + товары без пары. */
+  comparisonSearch: (params: {
+    q: string;
+    min_sites?: number;
+    category?: string;
+  }) => {
+    const q = new URLSearchParams({ q: params.q });
+    if (params.min_sites != null) q.set("min_sites", String(params.min_sites));
+    if (params.category) q.set("category", params.category);
+    return request<ComparisonSearchResult>(
+      `/api/v1/dash/comparison/search?${q}`,
+    );
+  },
+  comparisonSuggest: (q: string) =>
+    request<ComparisonSuggestion[]>(
+      `/api/v1/dash/comparison/suggest?q=${encodeURIComponent(q)}`,
+    ),
+  /** Excel текущей выборки; первым листом — товары с разной ценой. */
+  comparisonExport: async (params: {
+    search?: string;
+    min_sites?: number;
+    category?: string;
+    with_aloe?: boolean;
+    diff_only?: boolean;
+    locale: string;
+  }): Promise<{ blob: Blob; filename: string }> => {
+    const q = new URLSearchParams({ locale: params.locale });
+    if (params.search) q.set("search", params.search);
+    if (params.min_sites != null) q.set("min_sites", String(params.min_sites));
+    if (params.category) q.set("category", params.category);
+    if (params.with_aloe) q.set("with_aloe", "true");
+    if (params.diff_only) q.set("diff_only", "true");
+    const res = await fetch(`${BASE}/api/v1/dash/comparison/export.xlsx?${q}`, {
+      credentials: "include",
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new ApiError(res.status, text || res.statusText);
+    }
+    const named = /filename="([^"]+)"/.exec(
+      res.headers.get("Content-Disposition") ?? "",
+    );
+    return {
+      blob: await res.blob(),
+      filename: named?.[1] ?? "comparison.xlsx",
+    };
   },
   // Phase 4 — Pricing config + cost CSV upload
   pricingGet: () => request<PricingConfig>("/api/v1/dash/settings/pricing"),

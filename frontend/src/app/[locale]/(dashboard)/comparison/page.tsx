@@ -1,13 +1,19 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState, useMemo } from "react";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import {
   X,
   ChevronUp,
   ChevronDown,
   ChevronsUpDown,
+  FileSpreadsheet,
   TrendingUp,
   TrendingDown,
 } from "lucide-react";
@@ -18,15 +24,17 @@ import {
   ApiError,
   isFullCatalogTrustError,
   type ComparisonRow,
+  type ComparisonSearchResult,
 } from "@/lib/api";
 import { useDebounce } from "@/lib/use-debounce";
 import { formatPrice, formatPct } from "@/lib/utils";
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { Sparkline } from "@/components/sparkline";
 import { TableSkeleton } from "@/components/skeleton";
+import { OthersSection } from "./others-section";
+import { MIN_SEARCH_CHARS, SearchBox } from "./search-box";
+import { SITES, type SiteName } from "./sites";
 
-const SITES = ["pharmonline", "aptekonline", "aloe"] as const;
-type SiteName = (typeof SITES)[number];
 type SortKey = "name" | "brand" | "spread" | SiteName;
 
 function initialMinSites(value: string | null): number {
@@ -44,40 +52,98 @@ function initialSort(value: string | null): { key: SortKey; dir: "asc" | "desc" 
   };
 }
 
+// Сколько строк рисуем сразу и докладываем при прокрутке. Полный список —
+// тысячи строк; отрисованные разом (и в таблице, и в мобильных карточках),
+// они подвешивали страницу на каждом нажатии клавиши в поиске.
+const PAGE_SIZE = 100;
+
 export default function ComparisonPage() {
   const t = useTranslations("comparison");
   const tCommon = useTranslations("common");
+  const locale = useLocale();
   const searchParams = useSearchParams();
   const router = useRouter();
   // Drill-down из /category-comparison: фильтр по категории товара-клиента.
   const category = searchParams.get("category");
   const urlSearch = searchParams.get("search") ?? "";
   const [search, setSearch] = useState(urlSearch);
-  useEffect(() => setSearch(urlSearch), [urlSearch]);
-  const debouncedSearch = useDebounce(search, 300);
+  // Адрес обновляется с задержкой (ниже), поэтому из адреса в поле переносим
+  // только то, что записали не мы сами: иначе наша же запоздавшая запись «kre»
+  // стёрла бы уже набранное «kreon». Помним все свои записи, а не последнюю:
+  // навигации могут завершиться не в том порядке, в каком были отправлены.
+  const writtenSearches = useRef(new Set([urlSearch]));
+  const lastWrittenSearch = useRef(urlSearch);
+  useEffect(() => {
+    if (urlSearch === lastWrittenSearch.current) {
+      // Адрес догнал нашу последнюю запись — прежние больше не «в пути».
+      // Иначе пустой поиск остался бы «своим» навсегда, и клик по пункту меню
+      // «Сравнение» (адрес без поиска) не сбрасывал бы поле.
+      writtenSearches.current = new Set([urlSearch]);
+    } else if (!writtenSearches.current.has(urlSearch)) {
+      writtenSearches.current = new Set([urlSearch]);
+      lastWrittenSearch.current = urlSearch;
+      setSearch(urlSearch);
+    }
+  }, [urlSearch]);
+  const debouncedSearch = useDebounce(search, 250);
+  const query = debouncedSearch.trim();
+  const searching = query.length >= MIN_SEARCH_CHARS;
   const minSites = initialMinSites(searchParams.get("min_sites"));
   const diffOnly = searchParams.get("diff") === "1";
   const withAloe = searchParams.get("aloe") === "1";
   const [expandedId, setExpandedId] = useState<number | null>(null);
-  const sort = initialSort(searchParams.get("sort"));
+  const { key: sortKey, dir: sortDir } = initialSort(searchParams.get("sort"));
+  const sort = useMemo(
+    () => ({ key: sortKey, dir: sortDir }),
+    [sortKey, sortDir],
+  );
   const queryClient = useQueryClient();
 
-  function updateQuery(key: string, value: string | null) {
+  // Любая запись в адрес уносит с собой и текущий текст поиска. Иначе фильтр,
+  // переключённый сразу после набора, записал бы адрес без поиска, а запоздавшая
+  // запись поиска — без фильтра: обе собираются из адреса на момент вызова.
+  function updateQuery(key: string | null, value: string | null = null) {
     const next = new URLSearchParams(searchParams.toString());
-    value ? next.set(key, value) : next.delete(key);
+    search ? next.set("search", search) : next.delete("search");
+    writtenSearches.current.add(search);
+    lastWrittenSearch.current = search;
+    if (key) value ? next.set(key, value) : next.delete(key);
     const target = next.toString();
     router.replace(target ? `/comparison?${target}` : "/comparison", { scroll: false });
   }
 
-  const { data, isLoading, error, isFetching } = useQuery({
-    queryKey: ["comparison", debouncedSearch, minSites, category],
+  // Поиск в адресе — чтобы ссылкой можно было поделиться, — но пишем его после
+  // паузы в наборе: навигация на каждую букву перерисовывала всю страницу.
+  useEffect(() => {
+    if (debouncedSearch === lastWrittenSearch.current) return;
+    updateQuery(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearch]);
+
+  // Без запроса — весь список сопоставленных товаров. С запросом — поиск по
+  // ВСЕМУ каталогу: строки сравнения плюс товары, у которых пары пока нет.
+  const listQuery = useQuery({
+    queryKey: ["comparison", "list", minSites, category],
     queryFn: () =>
-      api.comparison({
-        search: debouncedSearch,
+      api.comparison({ min_sites: minSites, category: category ?? undefined }),
+    enabled: !searching,
+  });
+  const searchQuery = useQuery({
+    queryKey: ["comparison", "search", query, minSites, category],
+    queryFn: () =>
+      api.comparisonSearch({
+        q: query,
         min_sites: minSites,
         category: category ?? undefined,
       }),
+    enabled: searching,
+    // Пока едет ответ на следующую букву, оставляем прежние результаты.
+    placeholderData: keepPreviousData,
   });
+  const data = searching ? searchQuery.data?.rows : listQuery.data;
+  const others = searching ? (searchQuery.data?.others ?? []) : [];
+  const othersTotal = searching ? (searchQuery.data?.others_total ?? 0) : 0;
+  const { isLoading, isFetching, error } = searching ? searchQuery : listQuery;
 
   // Client-side filters + user sort. Дефолт: |spread_pct| desc — самое полезное
   // для PO (где конкурент бьёт по цене / где можем поднять). Клик по заголовку
@@ -85,29 +151,68 @@ export default function ComparisonPage() {
   const filtered = useMemo(() => {
     if (!data) return data;
     const rows = data.filter((r) => {
-      if (diffOnly && (!r.spread_pct || r.spread_pct < 0.5)) return false;
+      // «Цены разные» — буквально: min ≠ max среди сравнимых цен. То же
+      // правило у первого листа Excel (comparison_export.has_price_difference);
+      // прежний порог 0.5% давал на экране меньше строк, чем в файле.
+      if (
+        diffOnly &&
+        (r.spread_pct == null ||
+          r.min_price == null ||
+          r.min_price === r.max_price)
+      )
+        return false;
       if (withAloe && !r.prices["aloe"]) return false;
       return true;
     });
-    const dir = sort.dir === "asc" ? 1 : -1;
+    const dir = sortDir === "asc" ? 1 : -1;
     return [...rows].sort((a, b) => {
-      if (sort.key === "name")
+      if (sortKey === "name")
         return (a.name ?? "").localeCompare(b.name ?? "") * dir;
-      if (sort.key === "brand")
+      if (sortKey === "brand")
         return (a.brand ?? "").localeCompare(b.brand ?? "") * dir;
-      if (sort.key === "spread")
+      if (sortKey === "spread")
         return (
           (Math.abs(a.spread_pct ?? 0) - Math.abs(b.spread_pct ?? 0)) * dir
         );
       // per-site price: отсутствующая цена всегда внизу, независимо от dir
-      const av = a.prices[sort.key]?.price;
-      const bv = b.prices[sort.key]?.price;
+      const av = a.prices[sortKey]?.price;
+      const bv = b.prices[sortKey]?.price;
       if (av == null && bv == null) return 0;
       if (av == null) return 1;
       if (bv == null) return -1;
       return (av - bv) * dir;
     });
-  }, [data, diffOnly, withAloe, sort]);
+  }, [data, diffOnly, withAloe, sortKey, sortDir]);
+
+  // Рисуем первые PAGE_SIZE строк и добавляем по мере прокрутки. Сортировка и
+  // фильтры при этом работают по всему набору — он целиком в памяти.
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+  }, [query, searching, minSites, category, diffOnly, withAloe, sortKey, sortDir]);
+  const total = filtered?.length ?? 0;
+  const shown = useMemo(
+    () => filtered?.slice(0, visibleCount),
+    [filtered, visibleCount],
+  );
+  const hasMore = total > visibleCount;
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el || !hasMore || typeof IntersectionObserver === "undefined") return;
+    // Наблюдатель пересоздаётся после каждой порции: если маркер конца списка
+    // всё ещё на экране, новый observe() сообщит об этом сразу.
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisibleCount((count) => count + PAGE_SIZE);
+        }
+      },
+      { rootMargin: "800px 0px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasMore, visibleCount]);
 
   function toggleSort(key: SortKey) {
     const next = sort.key === key
@@ -123,79 +228,69 @@ export default function ComparisonPage() {
     return SITES.filter((s) => filtered.some((r) => r.prices[s] != null));
   }, [filtered]);
 
-  // P1.2: Export CSV. Берёт уже-отфильтрованный + отсортированный набор.
-  function handleExportCsv() {
-    if (!filtered || filtered.length === 0) return;
-    const header = [
-      "id",
-      "name",
-      "brand",
-      ...SITES.flatMap((s) => [`${s}_price`, `${s}_country`, `${s}_url`]),
-      "spread_pct",
-      "cheapest_site",
-    ];
-    const escape = (v: unknown): string => {
-      if (v == null) return "";
-      const s = String(v);
-      // RFC 4180: escape если содержит ", , или newline
-      if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-      return s;
-    };
-    const lines = [header.join(",")];
-    for (const r of filtered) {
-      const row: string[] = [
-        String(r.canonical_id),
-        escape(r.name),
-        escape(r.brand ?? ""),
-      ];
-      for (const s of SITES) {
-        row.push(
-          r.prices[s]?.price != null ? r.prices[s].price.toFixed(2) : "",
-        );
-        row.push(escape(r.prices[s]?.country_code?.toUpperCase() ?? ""));
-        row.push(escape(r.prices[s]?.url ?? ""));
-      }
-      row.push(r.spread_pct != null ? r.spread_pct.toFixed(2) : "");
-      row.push(escape(r.cheapest_site ?? ""));
-      lines.push(row.join(","));
+  // Excel собирает сервер по тем же фильтрам, что на экране. Раньше здесь был
+  // CSV из браузера: в Excel он открывался одной колонкой и с битыми буквами.
+  const [exporting, setExporting] = useState(false);
+  const [exportFailed, setExportFailed] = useState(false);
+  async function handleExportExcel() {
+    setExporting(true);
+    setExportFailed(false);
+    try {
+      const { blob, filename } = await api.comparisonExport({
+        search: searching ? query : undefined,
+        min_sites: minSites,
+        category: category ?? undefined,
+        with_aloe: withAloe,
+        diff_only: diffOnly,
+        locale,
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setExportFailed(true);
+    } finally {
+      setExporting(false);
     }
-    const blob = new Blob([lines.join("\n")], {
-      type: "text/csv;charset=utf-8",
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const today = new Date().toISOString().slice(0, 10);
-    a.download = `comparison_${today}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
   }
 
   const rejectMutation = useMutation({
     mutationFn: (id: number) => api.rejectMatch(id),
     onMutate: async (id: number) => {
-      // Optimistic: filter the row out immediately
+      // Optimistic: filter the row out immediately — и из полного списка, и из
+      // результатов поиска. У них разные ключи и разная форма данных.
       await queryClient.cancelQueries({ queryKey: ["comparison"] });
-      const prev = queryClient.getQueryData<ComparisonRow[]>([
-        "comparison",
-        debouncedSearch,
-        minSites,
-        category,
-      ]);
-      queryClient.setQueryData<ComparisonRow[]>(
-        ["comparison", debouncedSearch, minSites, category],
+      const prevLists = queryClient.getQueriesData<ComparisonRow[]>({
+        queryKey: ["comparison", "list"],
+      });
+      const prevSearches = queryClient.getQueriesData<ComparisonSearchResult>({
+        queryKey: ["comparison", "search"],
+      });
+      queryClient.setQueriesData<ComparisonRow[]>(
+        { queryKey: ["comparison", "list"] },
         (old) => old?.filter((r) => r.canonical_id !== id),
       );
-      return { prev };
+      queryClient.setQueriesData<ComparisonSearchResult>(
+        { queryKey: ["comparison", "search"] },
+        (old) =>
+          old && {
+            ...old,
+            rows: old.rows.filter((r) => r.canonical_id !== id),
+          },
+      );
+      return { prevLists, prevSearches };
     },
     onError: (_err, _id, ctx) => {
       // Rollback
-      if (ctx?.prev) {
-        queryClient.setQueryData(
-          ["comparison", debouncedSearch, minSites, category],
-          ctx.prev,
-        );
-      }
+      ctx?.prevLists.forEach(([key, value]) =>
+        queryClient.setQueryData(key, value),
+      );
+      ctx?.prevSearches.forEach(([key, value]) =>
+        queryClient.setQueryData(key, value),
+      );
     },
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["comparison"] });
@@ -211,6 +306,15 @@ export default function ComparisonPage() {
     }
     rejectMutation.mutate(row.canonical_id);
   }
+
+  // Пока едет ответ на новый запрос, на экране результаты прежнего
+  // (keepPreviousData) — по ним нельзя говорить «по запросу X ничего нет».
+  const settled =
+    !!data && !isLoading && !(searching && searchQuery.isPlaceholderData);
+  // Считаем по отфильтрованному набору: галочки «только различия» / «с aloe»
+  // тоже могут оставить страницу пустой, и тогда нужно сообщение, а не белый лист.
+  const nothingToShow = settled && total === 0 && others.length === 0;
+  const nothingFound = nothingToShow && (data?.length ?? 0) === 0;
 
   return (
     <div className="space-y-4">
@@ -232,29 +336,29 @@ export default function ComparisonPage() {
           <p className="text-sm text-muted-foreground">{t("page_subtitle")}</p>
         </div>
         <button
-          onClick={handleExportCsv}
-          disabled={!filtered || filtered.length === 0}
-          className="shrink-0 inline-flex min-h-11 items-center gap-1.5 rounded-md border border-input bg-background px-3 py-2 text-sm hover:bg-muted/50 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
-          title={t("export_csv_title")}
+          onClick={handleExportExcel}
+          disabled={exporting || !data || data.length === 0}
+          className="shrink-0 inline-flex min-h-11 items-center gap-1.5 rounded-md border border-input bg-background px-3 py-2 text-sm font-medium hover:bg-muted/50 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+          title={t("export_excel_title")}
+          data-testid="export-excel"
         >
-          ⬇ CSV
+          <FileSpreadsheet className="h-4 w-4" aria-hidden />
+          {exporting ? t("export_excel_busy") : t("export_excel")}
         </button>
       </div>
+      {exportFailed && (
+        <div
+          role="alert"
+          className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive"
+          data-testid="export-error"
+        >
+          {t("export_excel_error")}
+        </div>
+      )}
 
       {/* Filters */}
       <div className="flex flex-col gap-2 md:flex-row md:flex-wrap">
-        <input
-          type="search"
-          placeholder={t("search_placeholder")}
-          aria-label={t("search_label")}
-          value={search}
-          onChange={(e) => {
-            setSearch(e.target.value);
-            updateQuery("search", e.target.value || null);
-          }}
-          className="min-h-11 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9 md:min-w-64"
-          data-testid="search-input"
-        />
+        <SearchBox value={search} onChange={setSearch} />
         <select
           value={minSites}
           onChange={(e) => updateQuery("min_sites", e.target.value === "2" ? null : e.target.value)}
@@ -353,18 +457,25 @@ export default function ComparisonPage() {
             : tCommon("error")}
         </div>
       )}
-      {data && data.length === 0 && !isLoading && (
+      {nothingToShow && (
         <div
           className="text-muted-foreground rounded-lg border border-dashed border-border p-8 text-center"
           data-testid="empty"
         >
-          {t("empty")}
+          {searching && nothingFound
+            ? t("search_no_results", { query })
+            : t("empty")}
         </div>
+      )}
+      {searching && settled && total === 0 && others.length > 0 && (
+        <p className="text-sm text-muted-foreground" data-testid="search-no-rows">
+          {t("search_no_rows")}
+        </p>
       )}
 
       {/* Mobile: card list */}
       <div className="md:hidden space-y-2" data-testid="mobile-list">
-        {filtered?.map((row) => (
+        {shown?.map((row) => (
           <ComparisonCard
             key={row.canonical_id}
             row={row}
@@ -374,75 +485,98 @@ export default function ComparisonPage() {
       </div>
 
       {/* Desktop: table */}
-      <div
-        className="hidden md:block rounded-lg border border-border overflow-hidden"
-        data-testid="desktop-table"
-      >
-        <table className="w-full text-sm">
-          <thead className="bg-muted/50 text-muted-foreground">
-            <tr>
-              <SortableTh
-                label={t("th_name")}
-                col="name"
-                active={sort}
-                onClick={() => toggleSort("name")}
-                align="left"
-              />
-              <SortableTh
-                label={t("th_brand")}
-                col="brand"
-                active={sort}
-                onClick={() => toggleSort("brand")}
-                align="left"
-              />
-              {visibleSites.map((s) => (
+      {total > 0 && (
+        <div
+          className="hidden md:block rounded-lg border border-border overflow-hidden"
+          data-testid="desktop-table"
+        >
+          <table className="w-full text-sm">
+            <thead className="bg-muted/50 text-muted-foreground">
+              <tr>
                 <SortableTh
-                  key={s}
-                  label={s}
-                  col={s}
+                  label={t("th_name")}
+                  col="name"
                   active={sort}
-                  onClick={() => toggleSort(s)}
+                  onClick={() => toggleSort("name")}
+                  align="left"
+                />
+                <SortableTh
+                  label={t("th_brand")}
+                  col="brand"
+                  active={sort}
+                  onClick={() => toggleSort("brand")}
+                  align="left"
+                />
+                {visibleSites.map((s) => (
+                  <SortableTh
+                    key={s}
+                    label={s}
+                    col={s}
+                    active={sort}
+                    onClick={() => toggleSort(s)}
+                    align="right"
+                  />
+                ))}
+                <SortableTh
+                  label={t("th_spread")}
+                  col="spread"
+                  active={sort}
+                  onClick={() => toggleSort("spread")}
                   align="right"
                 />
+                <th className="px-3 py-2 w-10"></th>
+                <th className="px-3 py-2 w-10"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {shown?.map((row) => (
+                <ComparisonRowDesktop
+                  key={row.canonical_id}
+                  row={row}
+                  sites={visibleSites}
+                  expanded={expandedId === row.canonical_id}
+                  onToggleExpand={() =>
+                    setExpandedId((id) =>
+                      id === row.canonical_id ? null : row.canonical_id,
+                    )
+                  }
+                  onReject={handleReject}
+                />
               ))}
-              <SortableTh
-                label={t("th_spread")}
-                col="spread"
-                active={sort}
-                onClick={() => toggleSort("spread")}
-                align="right"
-              />
-              <th className="px-3 py-2 w-10"></th>
-              <th className="px-3 py-2 w-10"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered?.map((row) => (
-              <ComparisonRowDesktop
-                key={row.canonical_id}
-                row={row}
-                sites={visibleSites}
-                expanded={expandedId === row.canonical_id}
-                onToggleExpand={() =>
-                  setExpandedId((id) =>
-                    id === row.canonical_id ? null : row.canonical_id,
-                  )
-                }
-                onReject={handleReject}
-              />
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {filtered && filtered.length > 0 && (
-        <div
-          className="text-xs text-muted-foreground text-center"
-          data-testid="result-count"
-        >
-          {t("result_count", { count: filtered.length })}
+            </tbody>
+          </table>
         </div>
       )}
+
+      {total > 0 && (
+        <div className="flex flex-col items-center gap-2">
+          <div
+            className="text-xs text-muted-foreground text-center"
+            data-testid="result-count"
+          >
+            {t("shown_count", {
+              shown: Math.min(visibleCount, total),
+              total,
+            })}
+          </div>
+          {hasMore && (
+            <>
+              <div ref={sentinelRef} aria-hidden />
+              <button
+                onClick={() => setVisibleCount((count) => count + PAGE_SIZE)}
+                className="inline-flex min-h-11 items-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
+                data-testid="show-more"
+              >
+                {t("show_more", {
+                  count: Math.min(PAGE_SIZE, total - visibleCount),
+                })}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {others.length > 0 && <OthersSection others={others} total={othersTotal} />}
     </div>
   );
 }
