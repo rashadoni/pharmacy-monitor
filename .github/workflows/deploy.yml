@@ -435,7 +435,13 @@ jobs:
           set -euo pipefail
           sleep 5
           ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
-            curl -fsS http://127.0.0.1:8080/health >/dev/null && echo "API ok"
+            # On a line of its own: as the left side of `&&` a failing curl
+            # does not stop a `set -e` script, and a dead API passed this step
+            # as long as the frontend answered. The retries give uvicorn the
+            # time it needs to come up after the restart.
+            curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 10 \
+              http://127.0.0.1:8080/health >/dev/null
+            echo "API ok"
             curl -fsSL -o /dev/null -w "frontend HTTP %{http_code}\n" http://127.0.0.1:3000/ru/login
             curl -fsSL http://127.0.0.1:3000/ru/login | grep -q "<html lang=\"ru\""'
 

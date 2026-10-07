@@ -1020,6 +1020,22 @@ def test_failed_health_check_still_removes_the_staging_directory(
     assert sandbox.staging_dirs() == []
 
 
+def test_dead_api_fails_the_health_check(pending_migration: Sandbox) -> None:
+    """Фронтенд отвечает, API — нет: выкладка не должна считаться удачной.
+
+    Раньше строка была `curl … && echo "API ok"`: слева от `&&` упавшая команда
+    не останавливает скрипт с `set -e`, и шаг проходил по одному фронтенду.
+    """
+    sandbox = pending_migration
+    (sandbox.root / "api-is-down").touch()
+
+    result = run_workflow(sandbox, apply_migrations=True)
+
+    assert result.failed_step.name == "Health check", result.describe()
+    assert "API ok" not in result.failed_step.stdout
+    assert result.step(CLEANUP).returncode == 0
+
+
 def test_stand_refuses_a_workflow_key_it_does_not_execute(
     pending_migration: Sandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
