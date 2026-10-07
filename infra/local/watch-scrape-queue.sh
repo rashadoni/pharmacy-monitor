@@ -7,6 +7,11 @@
 # fail-closed unless explicitly enabled for a one-off DR run with
 # PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1.
 #
+# The Hetzner host this watcher used to tunnel into was deleted in 2026-09.
+# There is deliberately no default target any more: a DR run must name the
+# server in PROD_HOST, and the connection is accepted only for the host key
+# pinned in infra/prod_known_hosts.
+#
 # Каждые 60 секунд (тикает launchd) опрашивает прод API:
 #   GET /api/v1/internal/pending-scrape
 #
@@ -30,7 +35,8 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/Users/rashadrahimov/pharmacy-monitor}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
-PROD_HOST="${PROD_HOST:-46.225.149.52}"
+PROD_HOST="${PROD_HOST:-}"
+KNOWN_HOSTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/prod_known_hosts"
 LOCAL_PG_PORT="${LOCAL_PG_PORT:-5433}"
 API_BASE="${API_BASE:-https://leaddrive.cloud}"
 KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-pharmacy-monitor-db}"
@@ -64,6 +70,12 @@ if [[ "${PHARMACY_MONITOR_ENABLE_MAC_SCRAPE:-0}" != "1" ]]; then
     echo "DISABLED: Mac scrape watcher is retired. Server-side watcher owns the queue."
     echo "Set PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 only for an explicit DR run."
     exit 0
+fi
+
+if [[ -z "$PROD_HOST" ]]; then
+    echo "ERROR: PROD_HOST is not set. The server this watcher used to target was"
+    echo "decommissioned in 2026-09 and there is no default any more."
+    exit 1
 fi
 
 cd "$PROJECT_DIR"
@@ -208,6 +220,7 @@ echo "  spawning detached: pharmacy-monitor ${ARGS[*]}"
         echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | :$LOCAL_PG_PORT free — bringing up own ssh tunnel"
         ssh -i "$SSH_KEY" -N -L "$LOCAL_PG_PORT:localhost:5432" \
             -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ConnectTimeout=15 \
+            -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=yes -o ControlPath=none \
             "root@$PROD_HOST" &
         TUNNEL_PID=$!
         for _i in $(seq 1 20); do

@@ -1,0 +1,13 @@
+# SSH host key of the pharmacy-monitor production server
+# (Contabo, vmi3552946.contaboserver.net). Fingerprint:
+#   SHA256:Hx7TYOZC2diIb6ZwI9LRv4bybasYCijb+lKnQQmGk/I
+#
+# Scripts pass this file as UserKnownHostsFile together with
+# StrictHostKeyChecking=yes, so they refuse to talk to anything else that
+# answers on the address. The same key is pinned in every workflow under
+# .github/workflows/ that reaches the server; tests/test_prod_host_pinning.py
+# fails when a workflow carries a different key. If the server is rebuilt, read
+# the new key from
+# /etc/ssh/ssh_host_ed25519_key.pub on the server itself, not from the network,
+# and replace it here and in the workflows together.
+13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDVrem8NrMZMjV9cDiB8/8wOwOn1wrfSU7S5vfaLHM+R

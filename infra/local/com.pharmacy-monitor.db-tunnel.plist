@@ -1,11 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  STALE since 2026-09-03.
+  This tunnel fed the Postgres MCP on the owner's Mac and pointed at the Hetzner
+  production host, which was deleted in 2026-09. Production now lives on Contabo
+  (see CLAUDE.md). A copy of this agent that is still loaded keeps retrying the
+  dead address every 30 seconds. Unload it:
+    launchctl bootout gui/$UID/com.pharmacy-monitor.db-tunnel
+    rm ~/Library/LaunchAgents/com.pharmacy-monitor.db-tunnel.plist
+
+  The target below is a placeholder on purpose: the file must not connect
+  anywhere until someone decides the tunnel is still wanted and points it at the
+  current server with its host key pinned (infra/prod_known_hosts).
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.pharmacy-monitor.db-tunnel</string>
 
-    <!-- SSH tunnel: Mac:5433 → prod 46.225.149.52:5432 for Postgres MCP -->
+    <!-- SSH tunnel: Mac:5433 → prod:5432 for Postgres MCP -->
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/ssh</string>
@@ -26,10 +39,10 @@
         <!-- non-interactive (no password prompts) -->
         <string>-o</string>
         <string>BatchMode=yes</string>
-        <!-- accept new host keys automatically (we already trust this host) -->
+        <!-- never trust a host key on first use -->
         <string>-o</string>
-        <string>StrictHostKeyChecking=accept-new</string>
-        <string>root@46.225.149.52</string>
+        <string>StrictHostKeyChecking=yes</string>
+        <string>root@prod-host-not-set.invalid</string>
     </array>
 
     <!-- Start when user logs in (or `launchctl load`) -->
