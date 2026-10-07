@@ -39,6 +39,7 @@ SCRAPE_TIMER = REPO / "infra/systemd/pharmacy-monitor-scrape@.timer"
 SCRAPE_TIMER_DROPINS = sorted(
     (REPO / "infra/systemd/overrides").glob("pharmacy-monitor-scrape@*.timer.d/*.conf")
 )
+PROVISION_SCRIPT = REPO / "scripts/provision_vps.sh"
 BERLIN = ZoneInfo("Europe/Berlin")  # часовой пояс прод-хоста: в нём заданы OnCalendar
 
 
@@ -570,3 +571,158 @@ def test_watchlist_tick_form_is_not_a_full_scan(db_session, scrape_calls):
     CliRunner().invoke(main_mod.cli, ["run", "--site", "aloe", "--mode", "watchlist", "--hourly"])
 
     assert scrape_calls == [("watchlist", [])]
+
+
+# ─── Непустой watchlist ──────────────────────────────────────────────────────
+#
+# Режим по умолчанию раньше зависел от таблицы watchlist: одна подтверждённая
+# ссылка на ЛЮБОМ сайте — и команда юнита для aloe и aptekonline становилась
+# watchlist-прогоном. Полный каталог перестал бы собираться совсем, без ошибки;
+# на проде это не стреляло только потому, что watchlist был пуст. Тесты выше
+# идут с пустым watchlist и этого не видят.
+
+
+def _pin_confirmed_url(db_session, site: str) -> None:
+    """Закреплённый товар с подтверждённой ссылкой на сайте."""
+    main_mod.watchlist.add_tracked_product(
+        db_session,
+        canonical_name=f"Закреплённый товар {site}",
+        **{f"{site}_url": f"https://{site}.az/product/pinned"},
+    )
+    assert main_mod.collect_watchlist_urls(db_session)[site]
+
+
+def _provision_run_args() -> list[str]:
+    """Аргументы `pharmacy-monitor`, с которыми сбор зовёт юнит из provision_vps.sh."""
+    commands = [
+        shlex.split(line.removeprefix("ExecStart="))
+        for line in PROVISION_SCRIPT.read_text(encoding="utf-8").splitlines()
+        if line.startswith("ExecStart=") and line.rstrip().endswith(" pharmacy-monitor run")
+    ]
+    assert len(commands) == 1, f"{PROVISION_SCRIPT.name}: ожидался один юнит сбора, {commands}"
+    argv = commands[0]
+    return argv[argv.index("pharmacy-monitor") + 1 :]
+
+
+def _latest_run(db_session) -> storage.Run:
+    db_session.expire_all()
+    return db_session.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+
+
+@pytest.mark.parametrize("site", ["aloe", "aptekonline", "pharmonline"])
+@pytest.mark.parametrize("pinned_site", ["aloe", "aptekonline", "pharmonline"])
+def test_systemd_unit_command_collects_full_catalog_with_pinned_watchlist(
+    db_session, scrape_calls, site, pinned_site
+):
+    """Команда из юнита при непустом watchlist — всё равно полный сбор каталога."""
+    _pin_confirmed_url(db_session, pinned_site)
+    _collected_last_week(db_session, site)
+
+    CliRunner().invoke(main_mod.cli, _unit_run_args(SCRAPE_UNIT, site))
+
+    assert scrape_calls == [("catalog", [site])]
+    run = _latest_run(db_session)
+    assert (run.catalog_scope, run.full_catalog_sites) == ("full", site)
+
+
+def test_systemd_unit_command_with_pinned_watchlist_is_skipped_inside_the_week(
+    db_session, scrape_calls
+):
+    """Внутри недели плановый запуск не превращается в watchlist-прогон.
+
+    Закреплённые ссылки обновляет свой таймер (`watchlist-tick`), а не ночной
+    сбор каталога: тот в неделю, когда сайт уже собран, не делает ничего.
+    """
+    _pin_confirmed_url(db_session, "aloe")
+    _collected_this_week(db_session, "aloe")
+    runs_before = _run_count(db_session)
+
+    result = CliRunner().invoke(main_mod.cli, _unit_run_args(SCRAPE_UNIT, "aloe"))
+
+    assert result.exit_code == 0, result.output
+    assert scrape_calls == []
+    assert _run_count(db_session) == runs_before
+
+
+def test_pharmonline_timer_in_autonomous_mode_stays_on_public_api(
+    db_session, scrape_calls, monkeypatch, tmp_path
+):
+    """Маркер переводит `auto` в public_api раньше, чем `auto` становится category.
+
+    Поменять их местами — и легаси-таймер pharmonline молча уйдёт с проверенного
+    публичного API на категорийный сбор: оба пути зовут один `scrape_all`, и
+    отличает их только маршрут.
+    """
+    from src.scrapers.pharmonline_public_api import PUBLIC_CATALOG_ROUTE
+
+    routes: dict[str, list[str]] = {}
+
+    async def fake_scrape_all(sites_with_slugs, *args, **kwargs):
+        routes.update(sites_with_slugs)
+        raise _ScrapeReached
+
+    monkeypatch.setattr(main_mod, "scrape_all", fake_scrape_all)
+    _enable_pharmonline_marker(monkeypatch, tmp_path)
+    _pin_confirmed_url(db_session, "pharmonline")
+    _collected_last_week(db_session, "pharmonline")
+
+    CliRunner().invoke(main_mod.cli, _unit_run_args(SCRAPE_UNIT, "pharmonline"))
+
+    assert routes == {"pharmonline": [PUBLIC_CATALOG_ROUTE]}
+    assert _latest_run(db_session).catalog_scope == "full"
+
+
+def test_provision_script_unit_calls_run_without_site_or_mode():
+    """Форма легаси-юнита: правило «`--site` задан → полный сбор» её бы не закрыло."""
+    assert _provision_run_args() == ["run"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(None, id="provision_vps-unit"),
+        pytest.param(["run", "--mode", "auto"], id="explicit-auto"),
+    ],
+)
+def test_default_mode_without_site_is_full_catalog_with_pinned_watchlist(
+    db_session, scrape_calls, args
+):
+    """Остальные, кто зовёт режим по умолчанию: полный сбор всех сайтов."""
+    _pin_confirmed_url(db_session, "aloe")
+
+    CliRunner().invoke(main_mod.cli, args or _provision_run_args())
+
+    assert scrape_calls == [("catalog", ["aloe", "aptekonline", "pharmonline"])]
+    assert _latest_run(db_session).catalog_scope == "full"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(["--mode", "watchlist", "--hourly"], id="tick-form"),
+        pytest.param(["--hourly"], id="hourly-alone"),
+        pytest.param(["--mode", "watchlist"], id="explicit-mode"),
+    ],
+)
+def test_explicit_watchlist_forms_still_scrape_pinned_urls(db_session, scrape_calls, args):
+    """Watchlist-прогон остаётся — но только по явной просьбе."""
+    _pin_confirmed_url(db_session, "aloe")
+    _pin_confirmed_url(db_session, "aptekonline")  # чужой сайт в прогон не попадает
+    _collected_this_week(db_session, "aloe")  # ритм полного сбора тику не указ
+
+    CliRunner().invoke(main_mod.cli, ["run", "--site", "aloe", *args])
+
+    assert scrape_calls == [("watchlist", ["aloe"])]
+    run = _latest_run(db_session)
+    assert (run.catalog_scope, run.full_catalog_sites) == ("partial", None)
+
+
+def test_watchlist_tick_command_still_reaches_the_watchlist_scraper(db_session, scrape_calls):
+    """Таймер закреплённых ссылок целиком: `watchlist-tick` → `run` → скрейпер ссылок."""
+    _pin_confirmed_url(db_session, "aloe")
+    _collected_this_week(db_session, "aloe")
+
+    CliRunner().invoke(main_mod.cli, ["watchlist-tick"])
+
+    assert scrape_calls == [("watchlist", ["aloe"])]
+    assert _latest_run(db_session).catalog_scope == "partial"

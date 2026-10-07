@@ -157,6 +157,9 @@ Type=oneshot
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
 Environment="PATH=/home/$SERVICE_USER/.local/bin:/usr/bin:/bin"
+# `run` без --mode — сбор каталога всех сайтов, что бы ни лежало в watchlist.
+# Закреплённые ссылки этот юнит не обновляет: для них `pharmacy-monitor
+# watchlist-tick`. Строку ниже читает tests/test_cadence_guard.py.
 ExecStart=/home/$SERVICE_USER/.local/bin/uv run pharmacy-monitor run
 StandardOutput=append:$INSTALL_DIR/logs/run.log
 StandardError=append:$INSTALL_DIR/logs/run.log

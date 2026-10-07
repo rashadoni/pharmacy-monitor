@@ -505,7 +505,12 @@ def render_run_panel(*, key_prefix: str, default_dry_run: bool = True) -> None:
     if clicked:
         with st.spinner("🔄 Запускаю scraping... обычно 30-90 сек, не закрывай вкладку"):
             try:
-                rc, log = run_pharmacy_monitor(dry_run=dry, sites=sites_chosen or None, mode="auto")
+                # Панель стоит на вкладке Watchlist и обещает прогон по закреплённым
+                # ссылкам. Режим по умолчанию (`auto`) — сбор каталога, поэтому
+                # watchlist просим явно.
+                rc, log = run_pharmacy_monitor(
+                    dry_run=dry, sites=sites_chosen or None, mode="watchlist"
+                )
             except subprocess.TimeoutExpired:
                 rc, log = -1, "⛔ Превышен timeout 15 мин — прогон убит."
         if rc == 0:
@@ -2392,7 +2397,8 @@ with tab_watchlist:
     st.subheader("📋 Watchlist — отслеживаемые товары")
     st.caption(
         "Каждый товар можно привязать к конкретной странице на каждом из 3 сайтов. "
-        "Когда URL зафиксирован, ежедневный прогон будет ходить именно по нему."
+        "Когда URL зафиксирован, по нему ходит прогон по watchlist (кнопка ниже "
+        "и таймер `watchlist-tick`); ежедневный прогон собирает каталог."
     )
 
     with st.container(border=True):
