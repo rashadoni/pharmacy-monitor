@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import weakref
 from types import SimpleNamespace
@@ -31,11 +32,11 @@ from src.main import _ObservedEntries, persist_results
 from src.scrapers.base import BaseScraper, ScrapedProduct, ScrapedPromo, ScrapeResult
 
 
-def _scraped(ext_id: str, price: float, category: str) -> ScrapedProduct:
+def _scraped(ext_id: str, price: float, category: str, site: str = "aloe") -> ScrapedProduct:
     return ScrapedProduct(
-        site="aloe",
+        site=site,
         external_id=ext_id,
-        url=f"https://aloe.invalid/p/{ext_id}",
+        url=f"https://{site}.invalid/p/{ext_id}",
         name=f"Product {ext_id}",
         price=price,
         category=category,
@@ -70,6 +71,8 @@ class _CatalogScraper(BaseScraper):
     async def scrape_category(self, category_slug: str, limit: int | None = None):
         products = type(self).catalog[category_slug]
         for product in products:
+            # Отдаём управление циклу: сайты одного прогона собираются вперемешку.
+            await asyncio.sleep(0)
             yield product
         if category_slug in type(self).broken_after_yield:
             raise RuntimeError("listing page failed")
@@ -82,7 +85,16 @@ class _CatalogScraper(BaseScraper):
         )
 
     async def scrape_promos(self):
-        return [ScrapedPromo(site="aloe", title="Promo")]
+        return [ScrapedPromo(site=self.site_name, title="Promo")]
+
+
+class _SecondSiteScraper(_CatalogScraper):
+    """Второй сайт того же прогона — со своим каталогом."""
+
+    site_name = "aptekonline"
+    base_url = "https://aptekonline.invalid"
+    catalog: dict[str, list[ScrapedProduct]] = {}
+    broken_after_yield: set[str] = set()
 
 
 def _session_factory(db_session):
@@ -90,12 +102,24 @@ def _session_factory(db_session):
 
 
 def _run_aloe(
-    db_session, monkeypatch, catalog, *, broken_after_yield=(), verified: bool = True
+    db_session,
+    monkeypatch,
+    catalog,
+    *,
+    broken_after_yield=(),
+    verified: bool = True,
+    second_site_catalog=None,
 ) -> storage.Run:
     """Полный сбор aloe командой `run`; подменён только сайт и шаги после записи.
 
     `verified=False` — сбор, который не должен пройти проверку каталога.
+    `second_site_catalog` — в том же прогоне собирается ещё и aptekonline.
     """
+    catalogs = {"aloe": catalog}
+    if second_site_catalog is not None:
+        catalogs["aptekonline"] = second_site_catalog
+        monkeypatch.setattr(_SecondSiteScraper, "catalog", second_site_catalog)
+        monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "aptekonline", _SecondSiteScraper)
     monkeypatch.setattr(_CatalogScraper, "catalog", catalog)
     monkeypatch.setattr(_CatalogScraper, "broken_after_yield", set(broken_after_yield))
     monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "aloe", _CatalogScraper)
@@ -108,9 +132,9 @@ def _run_aloe(
     monkeypatch.setattr(
         main_mod.watchlist,
         "categories_for_site",
-        lambda session, site, only_category_id=None: list(catalog),
+        lambda session, site, only_category_id=None: list(catalogs[site]),
     )
-    monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *args: {"aloe": 1})
+    monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *args: dict.fromkeys(catalogs, 1))
     monkeypatch.setattr(main_mod, "persist_aloe_country_mappings", lambda *args: None)
     monkeypatch.setattr(main_mod, "load_aloe_country_map", lambda *args: {})
     monkeypatch.setattr(main_mod, "_smoke_test_per_site_coverage", lambda *args: None)
@@ -130,7 +154,8 @@ def _run_aloe(
 
     runner = CliRunner()
     with runner.isolated_filesystem():
-        result = runner.invoke(main_mod.cli, ["run", "--site", "aloe", "--mode", "category"])
+        site_args = [arg for site in catalogs for arg in ("--site", site)]
+        result = runner.invoke(main_mod.cli, ["run", *site_args, "--mode", "category"])
     db_session.expire_all()
     run = db_session.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
     assert (result.exit_code == 0) is verified, result.output
@@ -312,6 +337,25 @@ def test_products_added_by_the_fallback_crawler_are_observed_once(db_session, mo
 
     assert _observations(db_session, run) == {"only-a": 1, "from-fallback": 1}
     assert run.products_scraped == 2
+
+
+def test_two_sites_in_one_run_share_the_tracking(db_session, monkeypatch):
+    """Сайты одного прогона собираются одновременно и пишут через один колбэк с
+    общим учётом: записи одного сайта не должны сойти за учтённые записи другого."""
+    aloe = {"cat-a": [_scraped("a1", 5.0, "cat-a"), _scraped("a2", 6.0, "cat-a")]}
+    aptekonline = {
+        "cat-x": [_scraped("x1", 7.0, "cat-x", "aptekonline")],
+        "cat-y": [
+            _scraped("x1", 7.0, "cat-y", "aptekonline"),
+            _scraped("x2", 8.0, "cat-y", "aptekonline"),
+        ],
+    }
+
+    run = _run_aloe(db_session, monkeypatch, aloe, second_site_catalog=aptekonline)
+
+    assert _observations(db_session, run) == {"a1": 1, "a2": 1, "x1": 2, "x2": 1}
+    assert run.products_scraped == 5
+    assert run.products_per_site == {"aloe": 2, "aptekonline": 3}
 
 
 def test_scan_without_incremental_writes_is_unchanged(db_session, monkeypatch):
