@@ -883,8 +883,83 @@ def test_interrupted_rematch_does_not_commit_half_done_pairs(api_db, monkeypatch
     api_db.expire_all()
     paired = api_db.scalars(select(Product).where(Product.canonical_id == match.id)).all()
     assert len(paired) == 2
-    # Что-то могло и успеть закоммититься — пересчёт всё равно заказан.
-    assert [(r.reason, r.status) for r in _requests(api_db)] == [("rematch", "pending")]
+    # Этап не прошёл — пары могли остаться непроверенными. Рекомендации по ним
+    # публиковать нельзя: заявка не ставится, прежний кэш остаётся.
+    assert _requests(api_db) == []
+
+
+@pytest.mark.parametrize(
+    ("flag", "step"),
+    [("--revalidate", "revalidate_split"), ("--relink-dead", "relink_dead_members")],
+)
+def test_failed_targeted_rematch_queues_nothing(api_db, monkeypatch, flag, step):
+    from src import matcher
+
+    def boom(session, dry_run=False):
+        raise RuntimeError("died halfway")
+
+    monkeypatch.setattr(matcher, step, boom)
+
+    result = CliRunner().invoke(main_mod.cli, ["rematch", flag])
+
+    assert result.exit_code != 0
+    assert _requests(api_db) == []
+
+
+def test_rematch_request_does_not_commit_what_the_stage_left_unfinished(api_db, monkeypatch):
+    """Шаг флагов упал, успев тронуть строки: этап это переживает и идёт дальше.
+
+    Раньше недописанное откатывало закрытие сессии. Коммит заявки не должен
+    записать его вместо этого.
+    """
+    run = _full_run(api_db)
+    match = _cluster(api_db, run, "Aspirin", {"pharmonline": 10.0, "aptekonline": 7.0})
+
+    def stage_whose_flag_step_died(session, fuzzy_threshold=None):
+        session.get(Match, match.id).canonical_name = "half-written"
+        session.flush()
+        return {**_STAGE_SUMMARY, "flagged": None}
+
+    monkeypatch.setattr(main_mod, "_run_matching_stage", stage_whose_flag_step_died)
+
+    result = CliRunner().invoke(main_mod.cli, ["rematch"])
+
+    assert result.exit_code == 0, result.output
+    api_db.expire_all()
+    assert api_db.get(Match, match.id).canonical_name == "Aspirin"
+    assert [request.reason for request in _requests(api_db)] == ["rematch"]
+
+
+def test_rematch_with_a_failed_preparation_step_still_queues_a_refresh(api_db, monkeypatch):
+    """Сопоставление и revalidate прошли — пары проверены, хоть команда и вышла с ошибкой."""
+    monkeypatch.setattr(
+        main_mod,
+        "_run_matching_stage",
+        lambda session, fuzzy_threshold=None: {**_STAGE_SUMMARY, "relinked": None},
+    )
+
+    result = CliRunner().invoke(main_mod.cli, ["rematch"])
+
+    assert result.exit_code != 0
+    assert "preparation step failed" in result.output
+    assert [request.reason for request in _requests(api_db)] == ["rematch"]
+
+
+def test_rematch_waits_out_a_refresh_instead_of_skipping(api_db, monkeypatch):
+    """Пропуск планового rematch никто не повторяет, а пересчёт идёт минуту."""
+    attempts = iter([False, True])
+    monkeypatch.setattr(
+        main_mod, "_hold_scrape_lock_until_command_exit", lambda factory, wait: next(attempts)
+    )
+    monkeypatch.setattr(main_mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        main_mod, "_run_matching_stage", lambda session, fuzzy_threshold=None: _STAGE_SUMMARY
+    )
+
+    result = CliRunner().invoke(main_mod.cli, ["rematch"])
+
+    assert result.exit_code == 0, result.output
+    assert "skipped" not in result.output
 
 
 @pytest.mark.parametrize(
@@ -914,6 +989,43 @@ def test_partial_run_queues_a_refresh_with_its_own_commit(
     db_session.expire_all()
     run = db_session.scalar(select(Run).order_by(Run.id.desc()))
     assert (run.catalog_scope, run.finished_at is not None) == (scope, True)
+    assert [request.reason for request in _requests(db_session)] == queued
+
+
+@pytest.mark.parametrize(
+    ("failing_step", "queued"),
+    [
+        # Упал отчёт: пары уже закоммичены и проверены — заявка уходит с упавшим прогоном.
+        ("analyze", ["partial_run"]),
+        # Упал сам этап сопоставления: пары не проверены — рекомендации по ним не считаем.
+        ("matching", []),
+    ],
+)
+def test_failed_partial_run_owes_a_refresh_only_after_a_completed_matching_stage(
+    db_session, monkeypatch, failing_step, queued
+):
+    from tests.test_run_failure_semantics import _patch_verified_aloe_pipeline
+
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError(f"{failing_step} failed")
+
+    if failing_step == "analyze":
+        monkeypatch.setattr(main_mod.analyzer, "analyze", boom)
+    else:
+        monkeypatch.setattr(main_mod, "_run_matching_stage", boom)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            main_mod.cli,
+            ["run", "--site", "aloe", "--mode", "category", "--no-alerts", "--limit", "5"],
+        )
+
+    assert result.exit_code != 0
+    db_session.expire_all()
+    run = db_session.scalar(select(Run).order_by(Run.id.desc()))
+    assert run.status == "failed"
     assert [request.reason for request in _requests(db_session)] == queued
 
 
@@ -989,40 +1101,98 @@ def _health_codes(s) -> set[str]:
     return {issue.code for issue in check_health(s).issues}
 
 
-def test_health_flags_a_request_nobody_executes(db_session):
-    """Watcher встал: заявка ждёт часами, хотя сбор давно закончился."""
-    run = _full_run(db_session, finished_at=utcnow() - timedelta(hours=5))
-    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+def _pending_since(s, **ago) -> RoiRefreshRequest:
     request = RoiRefreshRequest(
         tenant_id=1,
         reason="pricing_config",
         status="pending",
-        requested_at=utcnow() - timedelta(hours=1, minutes=55),
+        requested_at=utcnow() - timedelta(**ago),
     )
-    db_session.add(request)
-    db_session.commit()
+    s.add(request)
+    s.commit()
+    return request
+
+
+def test_health_flags_a_request_nobody_executes(db_session):
+    """Watcher встал: заявка ждёт, хотя сборы не идут."""
+    run = _full_run(db_session, finished_at=utcnow() - timedelta(hours=5))
+    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    request = _pending_since(db_session, minutes=25)
     assert "roi_refresh_stuck" not in _health_codes(db_session)
 
-    request.requested_at = utcnow() - timedelta(hours=2, minutes=5)
+    request.requested_at = utcnow() - timedelta(minutes=35)
     db_session.commit()
     assert "roi_refresh_stuck" in _health_codes(db_session)
 
-    # Идёт сбор — заявка ждёт по делу, это не поломка.
-    running = Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running")
-    db_session.add(running)
+
+def test_health_does_not_count_the_time_a_scrape_was_running(db_session):
+    """Пока идёт сбор, заявка ждёт по делу — сколько бы он ни шёл."""
+    run = _full_run(db_session, finished_at=utcnow() - timedelta(hours=9))
+    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    _pending_since(db_session, hours=4)
+    scrape = Run(
+        tenant_id=1,
+        started_at=utcnow() - timedelta(hours=5),
+        finished_at=None,
+        status="running",
+    )
+    db_session.add(scrape)
     db_session.commit()
     assert "roi_refresh_stuck" not in _health_codes(db_session)
 
-    # Сбор только что закончился: заявке четыре часа, но ждать стало нечего
-    # минуту назад — тик watcher'а ещё просто не наступил.
-    request.requested_at = utcnow() - timedelta(hours=4)
-    running.status = "ok"
-    running.finished_at = utcnow() - timedelta(minutes=1)
+    # Сбор только что закончился: тик watcher'а ещё просто не наступил.
+    scrape.status = "ok"
+    scrape.finished_at = utcnow() - timedelta(minutes=10)
     db_session.commit()
     assert "roi_refresh_stuck" not in _health_codes(db_session)
 
-    running.finished_at = utcnow() - timedelta(hours=2, minutes=5)
+    scrape.finished_at = utcnow() - timedelta(minutes=40)
     db_session.commit()
+    assert "roi_refresh_stuck" in _health_codes(db_session)
+
+
+def test_overlapping_runs_are_not_counted_twice(db_session):
+    """Сбор с GitHub и тик на сервере могут идти одновременно — время одно."""
+    run = _full_run(db_session, finished_at=utcnow() - timedelta(hours=12))
+    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    _pending_since(db_session, hours=3)
+    now = utcnow()
+    for started_ago, finished_ago in ((3.0, 1.0), (2.5, 1.5)):
+        db_session.add(
+            Run(
+                tenant_id=1,
+                started_at=now - timedelta(hours=started_ago),
+                finished_at=now - timedelta(hours=finished_ago),
+                status="ok",
+            )
+        )
+    db_session.commit()
+
+    # Последний час не шло ничего. Сложи длительности прогонов — вышло бы, что
+    # заявка все три часа ждала «по делу».
+    assert "roi_refresh_stuck" in _health_codes(db_session)
+
+
+def test_short_ticks_do_not_hide_a_dead_watcher(db_session):
+    """Минутные частичные тики идут весь день; ожидание они не обнуляют."""
+    run = _full_run(db_session, finished_at=utcnow() - timedelta(hours=12))
+    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    _pending_since(db_session, hours=10)
+    for hours_ago in range(1, 10):
+        started = utcnow() - timedelta(hours=hours_ago)
+        db_session.add(
+            Run(
+                tenant_id=1,
+                started_at=started,
+                finished_at=started + timedelta(minutes=2),
+                status="ok",
+                catalog_scope="partial",
+            )
+        )
+    # И один идёт прямо сейчас — как тик, стартующий в :00 вместе с проверкой.
+    db_session.add(Run(tenant_id=1, started_at=utcnow() - timedelta(seconds=20), status="running"))
+    db_session.commit()
+
     assert "roi_refresh_stuck" in _health_codes(db_session)
 
 

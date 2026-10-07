@@ -2293,6 +2293,13 @@ def _hold_scrape_lock_after_readers(SessionFactory) -> bool:
         time.sleep(_SCRAPE_LOCK_POLL_SECONDS)
 
 
+def _queue_roi_refresh_owed_by_run(session: Session, run: storage.Run) -> None:
+    """Заявка на пересчёт рекомендаций — в коммит самого прогона, без своего."""
+    from src import roi_refresh
+
+    roi_refresh.request_refresh(session, tenant_id=run.tenant_id, reason="partial_run")
+
+
 def _request_roi_refresh(session: Session, *, reason: str, tenant_id: int = 1) -> None:
     """Оставить заявку на пересчёт рекомендаций после правки пар из CLI.
 
@@ -5245,6 +5252,11 @@ def run_cmd(
         )
 
         trust_context = None
+        # Этап сопоставления прошёл целиком (включая revalidate), пары могли
+        # измениться, а кэш рекомендаций этот прогон ещё не переписал и заявку
+        # на пересчёт не оставил. Пока этап не прошёл, заявка не ставится:
+        # пересчёт по парам, которые revalidate не проверил, хуже устаревшего.
+        roi_refresh_owed = False
         try:
             quality_sites: list[str] = list(sites)
             quality_baselines: dict[str, int | None] = {}
@@ -5515,6 +5527,7 @@ def run_cmd(
                 # записи. Весь порядок шагов — в _run_matching_stage; тот же этап
                 # выполняет команда `rematch`.
                 _run_matching_stage(session)
+                roi_refresh_owed = True
             finally:
                 if lock_taken:
                     _release_matcher_lock(session)
@@ -5645,6 +5658,7 @@ def run_cmd(
                             "ROI refresh failed for trusted epoch: "
                             + ",".join(sorted(failed_sites))
                         )
+                    roi_refresh_owed = False
                 else:
                     # A verified per-site producer remains successful even when
                     # another site's latest full attempt is degraded or stale.
@@ -5668,11 +5682,8 @@ def run_cmd(
                 # сбора. Заявка уходит в коммит самого прогона; пересчёт пойдёт
                 # от последней подтверждённой эпохи, цены этого прогона в него
                 # не попадут (`src/roi_refresh.py`).
-                from src import roi_refresh as _roi_refresh
-
-                _roi_refresh.request_refresh(
-                    session, tenant_id=run.tenant_id, reason="partial_run"
-                )
+                _queue_roi_refresh_owed_by_run(session, run)
+                roi_refresh_owed = False
 
             if trust_context is not None:
                 trust_context.__exit__(None, None, None)
@@ -5703,6 +5714,10 @@ def run_cmd(
             )
             run.error_message = f"{type(e).__name__}: {e}"
             run.finished_at = utcnow()
+            if roi_refresh_owed:
+                # Упали уже после сопоставления (анализ, алерты, отчёт): пары
+                # закоммичены и проверены, заявка должна уйти и с упавшим прогоном.
+                _queue_roi_refresh_owed_by_run(session, run)
             if request_id is not None:
                 req = session.get(storage.ScrapeRequest, request_id)
                 if req is not None:
@@ -6124,7 +6139,9 @@ def rematch_cmd(
     # Запись прогона и сопоставление правят одни и те же строки товаров. Сбор
     # держит этот замок всю команду, а замок сопоставления — только на сам этап,
     # так что без проверки rematch шёл бы одновременно с записью прогона.
-    if not dry_run and not _hold_scrape_lock_until_command_exit(Session, wait=False):
+    # Короткого читателя каталога (пересчёт рекомендаций — около минуты)
+    # пережидаем: пропуск планового rematch никто не повторяет.
+    if not dry_run and not _hold_scrape_lock_after_readers(Session):
         click.echo(
             "rematch: skipped because the run lock is busy (scrape, tick or another "
             "rematch); retry when it finishes."
@@ -6141,11 +6158,15 @@ def rematch_cmd(
         # посреди rematch не начнётся: он читает каталог под shared-блокировкой
         # сбора, а rematch держит эксклюзивную до выхода из команды — заявка
         # успевает закоммититься раньше, чем блокировка отпущена.
+        # Флаг ставится ПОСЛЕ удачного шага: упавший этап мог оставить пары,
+        # которые revalidate не проверил, и пересчёт опубликовал бы рекомендации
+        # по ним. Полный сбор в таком случае рекомендации скрывает; здесь прежний
+        # кэш просто остаётся до следующей заявки или сбора.
         pairs_may_have_changed = False
         try:
             if relink_dead:
-                pairs_may_have_changed = not dry_run
                 plan = matcher.relink_dead_members(session, dry_run=dry_run)
+                pairs_may_have_changed = not dry_run
                 swaps = [r for r in plan if r["action"] == "swap"]
                 skips = [r for r in plan if r["action"] != "swap"]
                 click.echo(f"relink-dead: {len(swaps)} swap, {len(skips)} skip")
@@ -6167,8 +6188,8 @@ def rematch_cmd(
                 # Coherent split (keep largest spec-coherent cross-site group, eject
                 # outliers; dissolve only if none). Same logic now auto-runs after
                 # match_products in the scrape pipeline.
-                pairs_may_have_changed = not dry_run
                 actions = matcher.revalidate_split(session, dry_run=dry_run)
+                pairs_may_have_changed = not dry_run
                 for a in actions:
                     if a["action"] == "dissolve":
                         click.echo(
@@ -6182,7 +6203,6 @@ def rematch_cmd(
                     click.echo(f"revalidate: re-split {len(actions)} кластеров (+rejections)")
                 return
 
-            pairs_may_have_changed = True
             if reset:
                 # Сброс canonical_id только у авто-матчей
                 auto_match_ids = session.scalars(
@@ -6218,6 +6238,7 @@ def rematch_cmd(
                 # ClickException печатает одну строку — стек оставляем в журнале.
                 log.exception("rematch_stage_failed")
                 raise click.ClickException(str(exc)) from exc
+            pairs_may_have_changed = True
 
             def _shown(value: int | None) -> str:
                 return "FAILED, see log" if value is None else str(value)

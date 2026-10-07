@@ -343,10 +343,33 @@ def _run_age_hours(run: Run) -> float:
     return max(0.0, (utcnow() - observed_at).total_seconds() / 3600)
 
 
-# Watcher тикает раз в минуту, сам пересчёт — минуты. Частичные тики сбора
-# держат блокировку недолго, а полный сбор виден как незавершённый прогон и в
-# расчёт не идёт. Два часа ожидания — уже не очередь, а неработающий исполнитель.
-_ROI_REFRESH_STUCK_HOURS = 2
+# Watcher тикает раз в минуту, сам пересчёт — около минуты. Полчаса ожидания,
+# в которые ни один прогон не шёл, — уже не очередь, а неработающий исполнитель.
+# Время, пока шёл какой-нибудь прогон, в ожидание не идёт: заявка тогда ждала по
+# делу, будь это семичасовой сбор или минутный тик.
+_ROI_REFRESH_STUCK_MINUTES = 30
+
+
+def _minutes_without_a_run(
+    session: Session, since: datetime, now: datetime, *, tenant_id: int
+) -> float:
+    """Сколько минут из [since, now] не шёл ни один прогон."""
+    runs = session.execute(
+        select(Run.started_at, Run.finished_at).where(
+            Run.tenant_id == tenant_id,
+            Run.started_at < now,
+            (Run.finished_at.is_(None)) | (Run.finished_at > since),
+        )
+    ).all()
+    spans = sorted((max(started, since), min(finished or now, now)) for started, finished in runs)
+    busy = timedelta()
+    covered_until = since
+    for start, end in spans:
+        start = max(start, covered_until)
+        if end > start:
+            busy += end - start
+            covered_until = end
+    return ((now - since) - busy).total_seconds() / 60
 
 
 def _check_roi_refresh_queue(session: Session, *, tenant_id: int = 1) -> list[HealthIssue]:
@@ -362,27 +385,24 @@ def _check_roi_refresh_queue(session: Session, *, tenant_id: int = 1) -> list[He
             Request.status == "pending",
         )
     )
-    if oldest_pending is not None and not storage.has_unfinished_run(
-        session, tenant_id=tenant_id
-    ):
-        # Пока шёл сбор, заявка ждала по делу. Отсчёт — с момента, когда ждать
-        # стало нечего: иначе первая же проверка после семичасового сбора
-        # объявила бы «ждёт 4ч», хотя тик watcher'а ещё просто не наступил.
-        last_run_finished = session.scalar(
-            select(func.max(Run.finished_at)).where(Run.tenant_id == tenant_id)
-        )
-        waiting_since = max(oldest_pending, last_run_finished or oldest_pending)
-        waiting_hours = (utcnow() - waiting_since).total_seconds() / 3600
-        if waiting_hours > _ROI_REFRESH_STUCK_HOURS:
+    if oldest_pending is not None:
+        now = utcnow()
+        idle_minutes = _minutes_without_a_run(session, oldest_pending, now, tenant_id=tenant_id)
+        if idle_minutes > _ROI_REFRESH_STUCK_MINUTES:
+            waiting_hours = (now - oldest_pending).total_seconds() / 3600
             issues.append(
                 HealthIssue(
                     "warning",
                     "roi_refresh_stuck",
-                    f"Заявка на пересчёт рекомендаций ждёт {waiting_hours:.1f}ч "
-                    f"(порог {_ROI_REFRESH_STUCK_HOURS}ч) после конца последнего сбора. Очередь "
-                    "исполняет pharmacy-monitor-scrape-watcher.timer: проверьте, что он "
-                    "работает и что `pharmacy-monitor roi refresh --pending` проходит.",
-                    context={"waiting_hours": round(waiting_hours, 1)},
+                    f"Заявка на пересчёт рекомендаций ждёт {waiting_hours:.1f}ч, из них "
+                    f"{idle_minutes:.0f} мин ни один сбор не шёл (порог "
+                    f"{_ROI_REFRESH_STUCK_MINUTES} мин). Очередь исполняет "
+                    "pharmacy-monitor-scrape-watcher.timer: проверьте, что он работает и "
+                    "что `pharmacy-monitor roi refresh --pending` проходит.",
+                    context={
+                        "waiting_hours": round(waiting_hours, 1),
+                        "idle_minutes": round(idle_minutes),
+                    },
                 )
             )
 
