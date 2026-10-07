@@ -609,34 +609,30 @@ def _digest_selection(
     цены не оставит без строк пять «конкурент дешевле». Внутри типа идут самые
     крупные по проценту.
 
-    Информационный тип больше потолка идёт только числом: тридцать случайных
-    «новых товаров» из двух тысяч ничего не сообщают. Остальные получают остаток
-    по порядку, целиком. Если типу не хватает места в письме, он идёт числом —
-    кроме типа, у событий которого есть размер в процентах («можно поднять
-    цену»): у него показываются самые крупные, сколько помещается. Обрезанный
-    список имеет смысл, только когда понятно, что в него попало главное.
+    У информационных событий остаток не делят, а отдают типам по порядку. Тип,
+    который помещается (и в потолок типа, и в остаток письма), идёт целиком.
+    Который не помещается — зависит от того, есть ли у его событий размер в
+    процентах: «можно поднять цену» показывает самые крупные, сколько влезает, а
+    «новые товары» остаются числом — тридцать случайных из двух тысяч ничего не
+    сообщают. Обрезанный список имеет смысл, только когда в нём главное.
     """
     chosen: dict[str, list[storage.AlertEvent]] = {rule_type: [] for rule_type, _ in groups}
     budget = _DIGEST_ROW_BUDGET
-    for bucket in _BUCKET_RANK:
+
+    def largest_first(group: list[storage.AlertEvent], bucket: str) -> list[storage.AlertEvent]:
+        # Сортировка устойчивая: при равном размере остаётся порядок «новые сверху».
+        return sorted(
+            (e for e in group if _digest_bucket(e.severity) == bucket),
+            key=lambda e: -_event_magnitude(e),
+        )
+
+    for bucket in ("critical", "warning"):
         wanted: dict[str, list[storage.AlertEvent]] = {}
         for rule_type, group in groups:
-            events = [e for e in group if _digest_bucket(e.severity) == bucket]
             room = _DIGEST_TYPE_CAP - len(chosen[rule_type])
-            if not events or room <= 0 or (bucket == "info" and len(events) > room):
-                continue
-            # Сортировка устойчивая: при равном размере остаётся порядок «новые сверху».
-            events.sort(key=lambda e: -_event_magnitude(e))
-            wanted[rule_type] = events[:room]
-        if bucket == "info":
-            for rule_type, events in wanted.items():
-                if len(events) > budget:
-                    if not any(_event_magnitude(e) for e in events):
-                        continue
-                    events = events[:budget]
-                chosen[rule_type].extend(events)
-                budget -= len(events)
-            continue
+            events = largest_first(group, bucket)[:room]
+            if events:
+                wanted[rule_type] = events
         # Сначала типы, которым нужно меньше: их недобор достаётся остальным.
         # Доля округляется вверх, иначе при остатке меньше числа типов самый
         # малый тип не получил бы ничего.
@@ -645,6 +641,16 @@ def _digest_selection(
             taken = wanted[rule_type][:share]
             chosen[rule_type].extend(taken)
             budget -= len(taken)
+
+    for rule_type, group in groups:
+        events = largest_first(group, "info")
+        room = min(_DIGEST_TYPE_CAP - len(chosen[rule_type]), budget)
+        if len(events) > room:
+            if not any(_event_magnitude(e) for e in events):
+                continue
+            events = events[:room]
+        chosen[rule_type].extend(events)
+        budget -= len(events)
     return chosen
 
 
