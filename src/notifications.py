@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, time, timedelta
+from html import escape
 from typing import Iterable
+from urllib.parse import urlencode
 
 import structlog
 from sqlalchemy import desc, select
@@ -78,8 +80,23 @@ def _format_event_text(event: storage.AlertEvent) -> str:
     return out
 
 
+# По этой полосе слева строка-событие узнаётся в готовом письме.
+_EVENT_ROW_MARK = "border-left:3px solid"
+
+
+def _clip(text: str | None, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _format_event_html(event: storage.AlertEvent) -> str:
-    """HTML snippet for one event in email digest."""
+    """HTML snippet for one event in email digest.
+
+    Название и описание приходят с чужих сайтов (имя товара, заголовок промо),
+    поэтому экранируются и обрезаются. На живых данных обрезка не срабатывает
+    (самое длинное название — 139 знаков, описание — 134); она нужна, чтобы у
+    размера письма был потолок.
+    """
     color = {
         "critical": "#dc2626",
         "warning": "#f59e0b",
@@ -87,14 +104,16 @@ def _format_event_html(event: storage.AlertEvent) -> str:
         "opportunity": "#22c55e",
     }.get(event.severity, "#71717a")
     when = event.created_at.strftime("%d.%m.%Y %H:%M")
+    title = escape(_clip(event.title, 200), quote=False)
+    detail = escape(_clip(event.detail, 200), quote=False)
     return f"""
 <tr>
-  <td style="padding:10px;border-left:3px solid {color};background:#fafafa;">
+  <td style="padding:10px;{_EVENT_ROW_MARK} {color};background:#fafafa;">
     <div style="font-size:11px;color:#71717a;text-transform:uppercase;font-weight:600;">
-      {event.severity} · {when}
+      {escape(event.severity or "", quote=False)} · {when}
     </div>
-    <div style="font-weight:600;margin-top:4px;color:#18181b;">{event.title}</div>
-    {f'<div style="font-size:13px;color:#52525b;margin-top:4px;">{event.detail}</div>' if event.detail else ""}
+    <div style="font-weight:600;margin-top:4px;color:#18181b;">{title}</div>
+    {f'<div style="font-size:13px;color:#52525b;margin-top:4px;">{detail}</div>' if detail else ""}
   </td>
 </tr>
 """.strip()
@@ -295,16 +314,48 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
 # ─── Daily / weekly digest ───────────────────────────────────────────────────
 
 
-def send_daily_digest(session: Session, tenant_id: int = 1) -> int:
+def send_daily_digest(
+    session: Session, tenant_id: int = 1, *, only_email: str | None = None, dry_run: bool = False
+) -> int:
     """Send daily digest to opted-in users. Returns count of emails sent."""
-    return _send_digest(session, tenant_id, kind="daily", since=utcnow() - timedelta(hours=24))
+    return _send_digest(
+        session,
+        tenant_id,
+        kind="daily",
+        since=utcnow() - timedelta(hours=24),
+        only_email=only_email,
+        dry_run=dry_run,
+    )
 
 
-def send_weekly_digest(session: Session, tenant_id: int = 1) -> int:
-    return _send_digest(session, tenant_id, kind="weekly", since=utcnow() - timedelta(days=7))
+def send_weekly_digest(
+    session: Session, tenant_id: int = 1, *, only_email: str | None = None, dry_run: bool = False
+) -> int:
+    return _send_digest(
+        session,
+        tenant_id,
+        kind="weekly",
+        since=utcnow() - timedelta(days=7),
+        only_email=only_email,
+        dry_run=dry_run,
+    )
 
 
-def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -> int:
+def _send_digest(
+    session: Session,
+    tenant_id: int,
+    kind: str,
+    since: datetime,
+    *,
+    only_email: str | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Собрать и разослать дайджест. Возвращает число получателей.
+
+    `only_email` — отправить одному получателю из включивших дайджест: так
+    письмо смотрят на живых данных, не трогая остальных. `dry_run` — собрать
+    письма и записать в лог тему, размер и число строк, ничего не отправляя.
+    """
     users = session.scalars(
         select(storage.TenantUser).where(
             storage.TenantUser.tenant_id == tenant_id,
@@ -314,6 +365,8 @@ def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -
             else storage.TenantUser.weekly_digest.is_(True),
         )
     ).all()
+    if only_email is not None:
+        users = [u for u in users if u.email.lower() == only_email.strip().lower()]
     if not users:
         log.info("digest_no_recipients", kind=kind, tenant=tenant_id)
         return 0
@@ -332,16 +385,36 @@ def _send_digest(session: Session, tenant_id: int, kind: str, since: datetime) -
         log.info("digest_no_events", kind=kind, tenant=tenant_id)
         return 0
 
+    # Письмо одно на всех получателей. «Порог email-уведомлений» получателя
+    # (`email_severity_min`) на дайджест не действует — решение владельца
+    # 2026-10-07: размер держат потолки, а с порогом `warning` из почты совсем
+    # пропали бы названия товаров из «Можно поднять цену».
     html = _render_digest_email(events, kind=kind, since=since)
-    subject = f"Pharmacy Monitor — {kind} digest ({len(events)} events)"
+    subject = _digest_subject(events, kind)
     sent = 0
     for user in users:
+        if dry_run:
+            log.info(
+                "digest_dry_run",
+                kind=kind,
+                user=user.email,
+                subject=subject,
+                kb=round(len(html.encode()) / 1024, 1),
+                rows=html.count(_EVENT_ROW_MARK),
+            )
+            sent += 1
+            continue
         try:
             notifier.send_email(subject=subject, html_body=html, to=[user.email])
             sent += 1
         except Exception as e:
             log.warning("digest_email_failed", user=user.email, kind=kind, error=str(e))
-    log.info("digest_sent", kind=kind, recipients=sent, events=len(events))
+    log.info(
+        "digest_dry_run_done" if dry_run else "digest_sent",
+        kind=kind,
+        recipients=sent,
+        events=len(events),
+    )
     return sent
 
 
@@ -359,7 +432,7 @@ def _event_is_digest_eligible(session: Session, event: storage.AlertEvent) -> bo
     """Fail closed for financial events created before verified run provenance."""
     if event.rule_type not in _FINANCIAL_EVENT_TYPES:
         return True
-    run_id = (event.payload or {}).get("source_run_id")
+    run_id = _payload(event).get("source_run_id")
     if not isinstance(run_id, int):
         log.warning("digest_event_skipped_unverified", event_id=event.id, reason="no_source_run")
         return False
@@ -392,7 +465,7 @@ def _render_single_event_email(event: storage.AlertEvent) -> str:
     return f"""
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>{event.title}</title></head>
+<head><meta charset="utf-8"><title>{escape(event.title or "", quote=False)}</title></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
   <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
     <tr><td style="padding:24px;border-bottom:1px solid #e4e4e7;">
@@ -410,27 +483,297 @@ def _render_single_event_email(event: storage.AlertEvent) -> str:
 """.strip()
 
 
-def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since: datetime) -> str:
-    rows = "\n".join(_format_event_html(e) for e in events)
-    title = "Daily" if kind == "daily" else "Weekly"
-    period = since.strftime("%d.%m %H:%M")
+# ─── Digest: сводка и ограниченные списки ────────────────────────────────────
+#
+# 2026-10-05 недельное письмо ушло на 1 229 строк: одна сверка каталога дала
+# 1 094 события «новый товар», а письмо клало по строке на каждое событие за
+# окно. Теперь наверху сводка по типам, ниже — списки с потолком. Всё, что не
+# попало в строки, остаётся числом в сводке и ссылкой на дашборд.
+
+# Строк на один тип события; сверх этого — только самые крупные.
+_DIGEST_TYPE_CAP = 30
+# Строк на всё письмо. Gmail сворачивает письмо после 102 КБ («Message clipped»),
+# и конец со ссылкой на дашборд пропадает. 60 строк с самыми длинными названиями
+# из боевых данных — 62 КБ, обычное письмо — 20–35 КБ. Это потолок по числу
+# строк, а не по байтам: названия из одних `&` или эмодзи дали бы больше.
+_DIGEST_ROW_BUDGET = 60
+
+# Подписи типов; порядок — порядок в письме при равной важности.
+_RULE_TYPE_LABELS = {
+    "undercut_threshold": "Конкурент дешевле",
+    "price_drop_pct": "Цена упала",
+    "price_change_pct": "Цена изменилась",
+    "promo_started": "Новые промо",
+    "site_drop_smoke": "Сайт собран не полностью",
+    "price_raise_opportunity": "Можно поднять цену",
+    "new_product": "Новые товары",
+}
+_BUCKET_RANK = {"critical": 0, "warning": 1, "info": 2}
+_BUCKET_WORDS = {
+    "critical": ("критичное", "критичных", "критичных"),
+    "warning": ("предупреждение", "предупреждения", "предупреждений"),
+    "info": ("информационное", "информационных", "информационных"),
+}
+# Поля payload с размером события в процентах — по ним выбираются «самые крупные».
+_MAGNITUDE_KEYS = ("diff_pct", "drop_pct", "change_pct", "gap_pct")
+
+
+def _digest_bucket(severity: str | None) -> str:
+    """critical и warning как есть; всё остальное (info, opportunity, …) — информационное."""
+    return severity if severity in ("critical", "warning") else "info"
+
+
+def _payload(event: storage.AlertEvent) -> dict:
+    """payload — колонка JSON: там может оказаться и не словарь."""
+    return event.payload if isinstance(event.payload, dict) else {}
+
+
+def _event_magnitude(event: storage.AlertEvent) -> float:
+    payload = _payload(event)
+    for key in _MAGNITUDE_KEYS:
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return abs(float(value))
+    return 0.0
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return many
+    n %= 10
+    if n == 1:
+        return one
+    return few if 2 <= n <= 4 else many
+
+
+def _num(n: int) -> str:
+    """1909 → «1 909» (неразрывный пробел, чтобы число не рвалось переносом)."""
+    return f"{n:,}".replace(",", "\u00a0")
+
+
+def _bucket_counts(events: Iterable[storage.AlertEvent]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for e in events:
+        bucket = _digest_bucket(e.severity)
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
+
+
+def _severity_phrase(counts: dict[str, int]) -> str:
+    """{'critical': 58, 'warning': 15} → «58 критичных, 15 предупреждений»."""
+    return ", ".join(
+        f"{_num(counts[b])} {_plural(counts[b], *_BUCKET_WORDS[b])}"
+        for b in _BUCKET_RANK
+        if counts.get(b)
+    )
+
+
+def _site_phrase(events: Iterable[storage.AlertEvent]) -> str:
+    """«aloe 1 900, pharmonline 9» — пусто, если у событий типа нет сайта."""
+    counts: dict[str, int] = {}
+    for e in events:
+        site = _payload(e).get("site")
+        if isinstance(site, str) and site:
+            counts[site] = counts.get(site, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ", ".join(f"{escape(site, quote=False)} {_num(n)}" for site, n in ordered)
+
+
+def _digest_groups(
+    events: list[storage.AlertEvent],
+) -> list[tuple[str, list[storage.AlertEvent]]]:
+    """События по типам: сначала типы с критичными, затем с предупреждениями."""
+    by_type: dict[str, list[storage.AlertEvent]] = {}
+    for e in events:
+        by_type.setdefault(e.rule_type or "other", []).append(e)
+    order = list(_RULE_TYPE_LABELS)
+
+    def position(item: tuple[str, list[storage.AlertEvent]]) -> tuple[int, int, str]:
+        rule_type, group = item
+        worst = min(_BUCKET_RANK[_digest_bucket(e.severity)] for e in group)
+        return (worst, order.index(rule_type) if rule_type in order else len(order), rule_type)
+
+    return sorted(by_type.items(), key=position)
+
+
+def _digest_selection(
+    groups: list[tuple[str, list[storage.AlertEvent]]],
+) -> dict[str, list[storage.AlertEvent]]:
+    """Какие события идут в письмо строками, по типам.
+
+    Строки раздаются по важности: сначала критичные всех типов, потом
+    предупреждения, потом информационные — иначе предупреждения одного типа
+    вытеснили бы критичные другого. Внутри одной важности остаток делится между
+    типами поровну (типу не дают больше, чем у него есть), так что сотня падений
+    цены не оставит без строк пять «конкурент дешевле». Внутри типа идут самые
+    крупные по проценту.
+
+    Информационные события идут строками, только если тип помещается целиком:
+    тридцать случайных «новых товаров» из двух тысяч ничего не сообщают. Поэтому
+    их остаток не делят, а отдают типам по порядку — каждому целиком, пока есть
+    место; тип, который не поместился, не отнимает строк у следующего.
+    """
+    chosen: dict[str, list[storage.AlertEvent]] = {rule_type: [] for rule_type, _ in groups}
+    budget = _DIGEST_ROW_BUDGET
+    for bucket in _BUCKET_RANK:
+        wanted: dict[str, list[storage.AlertEvent]] = {}
+        for rule_type, group in groups:
+            events = [e for e in group if _digest_bucket(e.severity) == bucket]
+            room = _DIGEST_TYPE_CAP - len(chosen[rule_type])
+            if not events or room <= 0 or (bucket == "info" and len(events) > room):
+                continue
+            # Сортировка устойчивая: при равном размере остаётся порядок «новые сверху».
+            events.sort(key=lambda e: -_event_magnitude(e))
+            wanted[rule_type] = events[:room]
+        if bucket == "info":
+            for rule_type, events in wanted.items():
+                if len(events) <= budget:
+                    chosen[rule_type].extend(events)
+                    budget -= len(events)
+            continue
+        # Сначала типы, которым нужно меньше: их недобор достаётся остальным.
+        # Доля округляется вверх, иначе при остатке меньше числа типов самый
+        # малый тип не получил бы ничего.
+        for i, rule_type in enumerate(sorted(wanted, key=lambda t: len(wanted[t]))):
+            share = -(-budget // (len(wanted) - i))
+            taken = wanted[rule_type][:share]
+            chosen[rule_type].extend(taken)
+            budget -= len(taken)
+    return chosen
+
+
+def _alerts_url(kind: str, **filters: str) -> str:
+    """Ссылка на страницу алертов с тем же окном, что у дайджеста."""
     public = os.environ.get("PHARMACY_PUBLIC_URL", "")
+    params = {"hours": "24" if kind == "daily" else "168", **filters}
+    return escape(f"{public}/alerts?{urlencode(params)}")
+
+
+def _digest_period_name(kind: str) -> str:
+    return "сутки" if kind == "daily" else "неделю"
+
+
+def _digest_subject(events: list[storage.AlertEvent], kind: str) -> str:
+    total = len(events)
+    subject = (
+        f"Pharmacy Monitor — дайджест за {_digest_period_name(kind)}: "
+        f"{_num(total)} {_plural(total, 'событие', 'события', 'событий')}"
+    )
+    critical = _bucket_counts(events).get("critical", 0)
+    if critical:
+        subject += f", из них {_num(critical)} {_plural(critical, *_BUCKET_WORDS['critical'])}"
+    return subject
+
+
+def _digest_summary_row(rule_type: str, group: list[storage.AlertEvent], kind: str) -> str:
+    """Строка сводки: тип, сколько событий, разбивка по важности и по сайтам."""
+    counts = _bucket_counts(group)
+    facts = []
+    if counts.get("critical") or counts.get("warning"):
+        facts.append(_severity_phrase(counts))
+    sites = _site_phrase(group)
+    if sites:
+        facts.append(sites)
+    label = escape(_RULE_TYPE_LABELS.get(rule_type, rule_type), quote=False)
+    facts_html = (
+        f'<div style="font-size:12px;color:#71717a;margin-top:2px;">{" · ".join(facts)}</div>'
+        if facts
+        else ""
+    )
+    return f"""
+<tr>
+  <td style="padding:8px 24px;border-top:1px solid #f4f4f5;">
+    <table style="width:100%;border-collapse:collapse;"><tr>
+      <td>
+        <a href="{_alerts_url(kind, type=rule_type)}" style="color:#18181b;font-weight:600;text-decoration:none;">{label}</a>
+        {facts_html}
+      </td>
+      <td style="text-align:right;vertical-align:top;font-size:18px;font-weight:600;color:#18181b;white-space:nowrap;">{_num(len(group))}</td>
+    </tr></table>
+  </td>
+</tr>
+""".strip()
+
+
+def _digest_block(
+    rule_type: str,
+    group: list[storage.AlertEvent],
+    rows: list[storage.AlertEvent],
+    kind: str,
+) -> str:
+    """Список событий одного типа с заголовком и ссылкой на остаток."""
+    label = escape(_RULE_TYPE_LABELS.get(rule_type, rule_type), quote=False)
+    rest = len(group) - len(rows)
+    count = f"{_num(len(rows))} из {_num(len(group))}" if rest else _num(len(group))
+    more = (
+        f"""
+<tr><td style="padding:8px 24px 4px;font-size:12px;">
+  <a href="{_alerts_url(kind, type=rule_type)}" style="color:#3b82f6;">Ещё {_num(rest)} — в дашборде →</a>
+</td></tr>"""
+        if rest
+        else ""
+    )
+    return f"""
+<tr><td style="padding:18px 24px 8px;border-top:1px solid #e4e4e7;font-size:14px;font-weight:600;color:#18181b;">
+  {label} <span style="font-weight:400;color:#71717a;">· {count}</span>
+</td></tr>
+{chr(10).join(_format_event_html(e) for e in rows)}{more}
+""".strip()
+
+
+def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since: datetime) -> str:
+    """Письмо-дайджест: сводка по типам, затем списки с потолком."""
+    events = list(events)
+    total = len(events)
+
+    groups = _digest_groups(events)
+    chosen = _digest_selection(groups)
+    summary_rows = [_digest_summary_row(rule_type, group, kind) for rule_type, group in groups]
+    blocks = [
+        _digest_block(rule_type, group, chosen[rule_type], kind)
+        for rule_type, group in groups
+        if chosen[rule_type]
+    ]
+    listed = sum(len(rows) for rows in chosen.values())
+
+    if listed == total:
+        scope_note = ""
+    elif listed:
+        scope_note = (
+            f"Ниже по строке на событие — {_num(listed)} из {_num(total)}, самые важные. "
+            "Остальное — числами в сводке и в дашборде."
+        )
+    else:
+        scope_note = "В этом письме только сводка. Сами события — в дашборде."
+    period_name = _digest_period_name(kind)
+    period = f"{since.strftime('%d.%m')} – {utcnow().strftime('%d.%m')}"
+    totals = f"{_num(total)} {_plural(total, 'событие', 'события', 'событий')}"
+    if total:
+        totals += f": {_severity_phrase(_bucket_counts(events))}"
+    scope_html = (
+        f'<tr><td style="padding:12px 24px 16px;font-size:12px;color:#71717a;">{scope_note}</td></tr>'
+        if scope_note
+        else ""
+    )
     return f"""
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>{title} digest</title></head>
+<head><meta charset="utf-8"><title>Дайджест за {period_name}</title></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
   <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
-    <tr><td style="padding:24px;border-bottom:1px solid #e4e4e7;">
+    <tr><td style="padding:24px;">
       <div style="font-size:14px;color:#71717a;margin-bottom:4px;">Pharmacy Monitor</div>
-      <div style="font-size:22px;font-weight:600;color:#18181b;">{title} digest</div>
-      <div style="font-size:13px;color:#71717a;margin-top:4px;">События с {period}</div>
+      <div style="font-size:22px;font-weight:600;color:#18181b;">Дайджест за {period_name}</div>
+      <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
     </td></tr>
-    {rows}
+    {chr(10).join(summary_rows)}
+    {scope_html}
+    {chr(10).join(blocks)}
     <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
-      <a href="{public}/alerts" style="color:#3b82f6;">Открыть в дашборде →</a>
+      <a href="{_alerts_url(kind)}" style="color:#3b82f6;">Все события за {period_name} — в дашборде →</a>
       <br><br>
-      Чтобы отписаться от этого digest — настройки → notifications.
+      Отписаться от дайджеста: администратор отключает его в дашборде, Настройки → Пользователи.
     </td></tr>
   </table>
 </body>
