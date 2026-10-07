@@ -847,7 +847,36 @@ curl -sSI https://leaddrive.cloud/az/comparison | grep -i location
 
 ## 🕐 Intraday rotation (Phase 5.1c, 2026-05-28)
 
-Hourly during business hours (05-17 UTC), rotates через top-30 volatile категорий.
+Ежечасно с 05 до 17 по времени сервера (прод в Europe/Berlin — летом это 03–15
+UTC), 13 тиков в день. Тик обслуживает только aloe (`intraday.INTRADAY_SITES`) и
+идёт по очереди по top-30 volatile категорий, у которых есть раздел aloe. Между
+прогонами на одном сайте не меньше двух часов, поэтому из 13 тиков сбором
+заканчиваются 5–7. Алерты тик не считает: он зовёт `scrape`, а не `run`.
+
+### Почему тик пропущен
+
+Причина — в выводе команды и в событии `intraday_skipped`, поле `reason`:
+
+| `reason` | Что значит | Что делать |
+|---|---|---|
+| `site_rate_limited` | На aloe уже был intraday-прогон меньше двух часов назад. Очередь остаётся у той же категории | Ничего — так выходит примерно каждый второй тик |
+| `no_servable_category` | За 7 дней цены не менялись ни в одной категории с разделом aloe | Проверить, идут ли сборы aloe вообще |
+| `rotation_state_unavailable` | Redis недоступен, `REDIS_URL` не задан или Redis не принимает запись | Чинить Redis |
+
+```bash
+ssh root@13.140.186.143 'journalctl -u pharmacy-monitor-intraday.service \
+  --since today -o cat | grep -E "intraday_(picked|skipped)|^Scraped|^scrape: skipped"'
+```
+
+`intraday_picked` — тик выбрал цель и передал очередь дальше. Сбор состоялся,
+если следом идёт строка `Scraped N products`. Строка `scrape: skipped because
+another scrape run is active` значит, что в это время шёл другой сбор: очередь
+этой категории и двухчасовой лимит потрачены впустую. За 2026-09-23…10-07 такого
+не было ни разу.
+
+До 2026-10-07 любой пропуск назывался `intraday_all_sites_locked`, даже когда
+замка не было: ротация шла по top-30 всех сайтов и выбирала категории, которых
+на aloe нет. За 2026-10-05…07 так вышли 29 тиков из 32.
 
 ### Manual trigger
 
@@ -865,9 +894,8 @@ ssh root@13.140.186.143 'systemctl start pharmacy-monitor-intraday.service'
 
 ```bash
 ssh root@13.140.186.143 '
-  redis-cli get "intraday:rotation:idx"  # current index
-  redis-cli ttl "intraday:lock:site:pharmonline"  # TTL до next tick allowed
-  redis-cli ttl "intraday:lock:site:aloe"
+  redis-cli get "intraday:rotation:idx"  # указатель; очередь = idx % число категорий в ротации
+  redis-cli ttl "intraday:lock:site:aloe"  # TTL до next tick allowed
 '
 ```
 
@@ -877,7 +905,7 @@ ssh root@13.140.186.143 '
 ssh root@13.140.186.143 '
   redis-cli del "intraday:rotation:idx" "intraday:lock:site:pharmonline" "intraday:lock:site:aloe"
 '
-# Next tick перезапустится с idx=1
+# Next tick начнёт с первой категории списка
 ```
 
 ### Disable intraday (если жрёт proxy credits)

@@ -513,13 +513,20 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 >
 > Таймеры частичных тиков суточные: `pharmacy-monitor-intraday` (13 запусков в
 > день) и `pharmacy-monitor-watchlist` (каждые 3 часа). ⚠️ Запуск тика — ещё не
-> обновление и тем более не алерт. Замер 2026-10-05…07: 29 из 32 intraday-тиков
-> вышли с `intraday_all_sites_locked` — тик обслуживает только aloe
-> (`intraday.INTRADAY_SITES`), а ротация раз за разом выбирала категории без
-> раздела aloe. Алерты intraday не считает вовсе (`scrape`, не `run`), а
-> watchlist на проде пуст. Итог: между недельными сборами каталог почти не
-> обновляется, и ценовые алерты по всем трём сайтам приходят раз в неделю —
-> после полного сбора.
+> обновление и тем более не алерт. Intraday обслуживает только aloe
+> (`intraday.INTRADAY_SITES`): по очереди собирает категории с разделом aloe, до
+> 600 товаров за раз и не чаще раза в два часа, то есть сбором заканчиваются
+> 5–7 тиков из 13. Остальные выходят пропуском; причина — в событии
+> `intraday_skipped`, поле `reason` ([docs/RUNBOOK.md](docs/RUNBOOK.md)
+> «Почему тик пропущен»). До правки 2026-10-07 очередь шла по top-30 категорий
+> всех сайтов и после первых удачных сборов aptekonline и pharmonline почти
+> целиком состояла из категорий без раздела aloe: за 2026-10-05…07 пропуском
+> вышли 29 тиков из 32, в журнале это называлось `intraday_all_sites_locked`.
+> Выложена ли правка — смотреть по журналу тика, а не по этой записи. Алерты
+> intraday не считает вовсе (`scrape`, не `run`), а watchlist на проде пуст.
+> Итог: pharmonline и aptekonline между недельными сборами не обновляются, aloe
+> — частями, и ценовые алерты по всем трём сайтам приходят раз в неделю — после
+> полного сбора.
 >
 > Единственный источник правды о ритме в коде — [src/cadence.py](src/cadence.py).
 > Из него выводятся ВСЕ пороги «данные устарели»: health (`_SITE_MAX_AGE_HOURS`,
@@ -545,6 +552,21 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 > дашборде, `pharmacy-monitor run --site aloe --force` под `pm` с загруженным
 > env, а для aptekonline ещё и ручной workflow
 > `production-aptekonline-scrape.yml` (он зовёт `--force`).
+>
+> **Режим прогона задаёт команда, а не таблица.** `run` без `--mode` (режим
+> `auto`, так зовёт юнит) — всегда сбор каталога; у pharmonline маркер переводит
+> его в `public_api`. Прогон по закреплённым ссылкам бывает только по явной
+> просьбе: `--mode watchlist`, `--hourly`, таймер `watchlist-tick`. До
+> 2026-10-07 `auto` при непустом watchlist сам становился watchlist-прогоном, и
+> считались ссылки ВСЕХ сайтов: одна закреплённая ссылка — и ночные таймеры aloe
+> и aptekonline перестали бы собирать каталог совсем. На сайте, где лежит
+> ссылка, — молча (частичный прогон со статусом ok); на остальных прогон падал
+> бы каждую ночь с «no requested scrape work». Не стреляло только потому, что
+> watchlist на проде был пуст. Не возвращать режим, который зависит от
+> содержимого БД: `tests/test_cadence_guard.py` гоняет команду юнита с непустым
+> watchlist. ⚠️ Закреплённые ссылки теперь обновляет ТОЛЬКО `watchlist-tick`, а
+> он отказывается работать, если ссылок больше `WATCHLIST_TICK_MAX_URLS` (100):
+> падает с ошибкой и не собирает ни одной.
 >
 > **Кто следит, что сбор случился.** Пропуск внутри недели следа в БД не
 > оставляет, поэтому health сверяет возраст последнего подтверждённого полного
@@ -604,7 +626,7 @@ _Историческая запись (устарела, см. поправку
 | **pharmonline.az** | **Прод (Hetzner) — DDP + IPRoyal** | Meteor DDP WebSocket (см. [src/scrapers/pharmonline_ddp.py](src/scrapers/pharmonline_ddp.py)) — pierces Cloudflare без браузера, через IPRoyal residential proxy ($1.75/GB). | systemd timer `pharmacy-monitor-scrape@pharmonline` 01:00 UTC. Активирован 2026-05-27 после run 104=ok с 266,718 products. Reconnect-on-close logic выживает persist phase. Mac launchd теперь DR-fallback только: `bash infra/local/run-scrape.sh --site pharmonline --site aptekonline`. |
 | **aptekonline.az** | **Mac launchd только** | httpx JSON API (см. [src/scrapers/aptekonline.py](src/scrapers/aptekonline.py)) | Mac launchd `com.pharmacy-monitor.scrape` 18:00 Asia/Baku. **Прод-таймер отключён 2026-05-08** (`systemctl disable --now pharmacy-monitor-scrape@aptekonline.timer`) — ScraperAPI default pool отдаёт HTTP 403, нужен residential (Hobby $49/мес). Endpoint: `GET /shop/productList?categoryId[]=N&lang=az&page=N` (Laravel paginator), header `checkus: $2y$10$...` из `main.js`. 12 тестов в [tests/test_aptekonline_api.py](tests/test_aptekonline_api.py). |
 
-Systemd unit на проде: `/etc/systemd/system/pharmacy-monitor-scrape@.service`, ExecStart=`pharmacy-monitor run --site %i --mode category`. Активны таймеры **pharmonline + aloe** (aptekonline отключён 2026-05-08).
+Systemd unit на проде: `/etc/systemd/system/pharmacy-monitor-scrape@.service`, ExecStart=`pharmacy-monitor run --site %i` (без `--mode`; сверено `systemctl cat` 2026-10-07 — раньше здесь стояло `--mode category`, которого в юните нет). Активны таймеры **pharmonline + aloe** (aptekonline отключён 2026-05-08).
 
 Mac launchd: [infra/local/com.pharmacy-monitor.scrape.plist](infra/local/com.pharmacy-monitor.scrape.plist) → [infra/local/run-scrape.sh](infra/local/run-scrape.sh). `DEFAULT_ARGS=--site pharmonline --site aptekonline --mode category --no-alerts`. Открывает SSH-туннель Mac:5433 → prod:5432, тянет PG_PASS из Keychain (`security add-generic-password -a pm -s pharmacy-monitor-db -w '<pwd>'`). Логи: `~/Library/Logs/pharmacy-monitor.log`. Управление: `launchctl load|unload|start ~/Library/LaunchAgents/com.pharmacy-monitor.scrape.plist`.
 
