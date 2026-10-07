@@ -119,11 +119,13 @@ def cleanup(csv_path: Path, apply: bool = False) -> int:
                 )
                 if apply:
                     # Создадим rejection с каждым из текущих участников кластера.
+                    # Для пары из разных тенантов add_rejection записи не создаёт
+                    # и возвращает None — такую пару не считаем.
                     for other in match.products:
-                        match_actions.add_rejection(
+                        if match_actions.add_rejection(
                             db, r.detach_product_id, other.id, reason=r.reason or "bulk_cleanup"
-                        )
-                        rejections_written += 1
+                        ):
+                            rejections_written += 1
                 continue
 
             cluster_before = len(match.products)
@@ -143,6 +145,13 @@ def cleanup(csv_path: Path, apply: bool = False) -> int:
             cluster_after = sum(1 for p in match.products if p.id != r.detach_product_id)
             if cluster_after < 2:
                 matches_dissolved += 1
+
+        if apply:
+            # break_match коммитит сам, а ветка «уже не в этом кластере» пишет
+            # через add_rejection, который делает только flush. Без этого коммита
+            # её отказы сохранялись, лишь если после неё шла строка, дошедшая до
+            # break_match; последняя или единственная такая строка терялась.
+            db.commit()
 
     if not apply:
         print("\nDry-run. Pass --apply to commit changes.")
