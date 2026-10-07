@@ -85,6 +85,60 @@ def test_classify_run_quality_matrix(
     assert quality["financially_eligible"] is (expected_status == "ok" and enforce_baseline)
 
 
+def test_fetch_retries_are_recorded_without_degrading_the_run():
+    """Погашенный повтором сбой прогон не портит, но в run_quality остаётся."""
+    result = _result("aloe", 20)
+    result.fetch_retries = 3
+
+    status, quality = classify_run_quality(
+        [result, _result("aptekonline", 20)],
+        ["aloe", "aptekonline"],
+        mode="category",
+        baselines={"aloe": 20, "aptekonline": 20},
+        enforce_baseline=True,
+    )
+
+    assert status == "ok"
+    assert quality["full_catalog_verified"] is True
+    assert quality["sites"]["aloe"]["fetch_retries"] == 3
+    # Скрейпер, который повторы не считает, нуля не получает: ноль читался бы
+    # как «сбоев не было».
+    assert "fetch_retries" not in quality["sites"]["aptekonline"]
+
+
+@pytest.mark.asyncio
+async def test_scrape_site_carries_aloe_fetch_retries_into_the_result(monkeypatch):
+    """Счётчик живёт на скрейпере; без переноса в результат он молча равен нулю."""
+
+    class _RetryingAloe:
+        def __init__(self, country_id_map=None):
+            self.verified_country_mappings = {}
+            self.fetch_retries = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def scrape(self, slugs, **kwargs):
+            self.fetch_retries = 2
+            return ScrapeResult(
+                site="aloe",
+                products=[_product("aloe", "one")],
+                items_expected=1,
+                items_completed=1,
+            )
+
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "aloe", _RetryingAloe)
+
+    result = await main_mod.scrape_site("aloe", ["dermanlar"], None)
+
+    assert result.fetch_retries == 2
+    _status, quality = classify_run_quality([result], ["aloe"], mode="category")
+    assert quality["sites"]["aloe"]["fetch_retries"] == 2
+
+
 def test_intentional_partial_run_is_ok_but_not_financially_eligible():
     status, quality = classify_run_quality(
         [_result("aloe", 2, expected=1, completed=1)],
