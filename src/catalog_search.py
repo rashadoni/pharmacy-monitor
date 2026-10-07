@@ -32,7 +32,6 @@ import bisect
 import re
 import threading
 import time
-import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -42,64 +41,23 @@ import structlog
 from rapidfuzz import process
 from rapidfuzz.distance import Levenshtein
 
+from src.normalize import FOLD_CHAR_MAP, fold_spelling
+
 log = structlog.get_logger()
 
 # ─── Свёртка написания ───────────────────────────────────────────────────────
 
-# Азербайджанская латиница и кириллица → латиница без диакритики. Таблица
-# применяется к строке, уже приведённой к нижнему регистру (см. `_lower`).
-#  - «ц» → «s» (Цефазолин/Sefazolin), «х» → «x» (как в az-латинице),
-#    «ч» → «c» (чай/çay), «ш»/«щ» → «s» (шприц/şpris);
-#  - последняя группа — az-кириллица, встречается в старых названиях.
-_CHAR_MAP = str.maketrans(
-    "ıəğşçöüабвгдеёжзийклмнопрстуфхцчшщыэәғҝөүһҹј",
-    "iegscouabvgdeejziiklmnoprstufxscssieeggouhcy",
-)
-# «№» — знак, а не часть слова: без этого «№20» давало бы слово «no20».
-_CHAR_MAP.update(str.maketrans({"ъ": "", "ь": "", "ю": "yu", "я": "ya", "№": " "}))
-
-_QU_RE = re.compile(r"qu(?=[aeio])")
-_SOFT_C_RE = re.compile(r"c(?=[ei])")
-_LONE_C_RE = re.compile(r"(?<![a-z0-9])c(?![a-z0-9])")
-_REPEAT_RE = re.compile(r"([a-z])\1+")
-_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+# Сама свёртка — `normalize.fold_spelling`: ею же матчер сводит написания при
+# сопоставлении товаров между сайтами (Kreon/Creon в одном бакете). Правка её
+# правил меняет и поиск, и сопоставление — мерить оба.
+fold = fold_spelling
+_CHAR_MAP = FOLD_CHAR_MAP
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
-_LONE_C_MARK = "\x01"
-# Кириллические буквы-обозначения, которые выглядят как латинские: «витамин с»
-# — это Vitamin C, «в12» — это B12. По звучанию они дали бы «s» и «v12».
-_CYR_LONE_C_RE = re.compile(r"(?<![^\W_])с(?![^\W_])")
-_CYR_B_CODE_RE = re.compile(r"(?<![^\W_])в(?=\d)")
 
 
 def _lower(text: str) -> str:
     # «İ».lower() в Python даёт «i» + точку-диакритику — убираем её заранее.
     return text.replace("İ", "i").lower()
-
-
-def fold(text: str | None) -> str:
-    """Ключ поиска: слова из [a-z0-9], разделённые одним пробелом."""
-    if not text:
-        return ""
-    s = _lower(text)
-    if not s.isascii():
-        s = _CYR_B_CODE_RE.sub("b", _CYR_LONE_C_RE.sub("c", s)).translate(_CHAR_MAP)
-        if not s.isascii():
-            # Совместимые формы раскрываются в заглавные («™» → «TM») — отсюда
-            # второй lower().
-            s = "".join(
-                ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch)
-            ).lower()
-    s = _NON_ALNUM_RE.sub(" ", s).strip()
-    s = s.replace("ph", "f").replace("th", "t").replace("sh", "s")
-    s = s.replace("ch", "c").replace("ck", "k")
-    s = _QU_RE.sub("kv", s)  # Quetiapine ↔ Kvetiapin
-    s = s.replace("q", "g").replace("w", "v").replace("y", "i").replace("x", "ks")
-    # Отдельно стоящая «c» — это буква-обозначение, а не звук: «Vitamin C» не
-    # должен схлопнуться с «Vitamin K».
-    s = _LONE_C_RE.sub(_LONE_C_MARK, s)
-    s = _SOFT_C_RE.sub("s", s).replace("c", "k")  # Cefazolin ↔ Sefazolin, Creon ↔ Kreon
-    s = s.replace(_LONE_C_MARK, "c")
-    return _REPEAT_RE.sub(r"\1", s)  # Allegra ↔ Aleqra, кальций → kalsi
 
 
 _fold_cached = lru_cache(maxsize=100_000)(fold)

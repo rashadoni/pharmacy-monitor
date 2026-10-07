@@ -5376,6 +5376,20 @@ def run_cmd(
                 if effective_mode == "watchlist":
                     linked = auto_match_watchlist(session)
                     log.info("watchlist_auto_matched", linked=linked)
+                # Поля, на которых стоит матчинг, пересчитываем по названию для
+                # всего каталога, а не только для собранного сейчас сайта: иначе
+                # после правки нормализации сайты неделю сравниваются в разной
+                # записи. Затем отдаём место в кластере живым двойникам строк,
+                # которые сбор больше не видит.
+                # Оба шага — подготовка: сбой каждого откатывается к своей
+                # точке сохранения и не отменяет ни второй шаг, ни само
+                # сопоставление.
+                for _prepare in (matcher.refresh_derived_fields, matcher.relink_stale_members):
+                    try:
+                        with session.begin_nested():
+                            _prepare(session)
+                    except Exception:
+                        log.exception("matcher_preparation_failed", step=_prepare.__name__)
                 matcher.match_products(session)
                 # Auto-revalidate: match_products линкует широко (bucket+fuzzy) и НЕ
                 # блокирует guard-конфликты в primary-проходе → бренд/состав/вариант/сила
@@ -5946,15 +5960,12 @@ def rematch_cmd(
                     session.commit()
                     click.echo(f"Reset {len(auto_match_ids)} auto-matches.")
 
-            # Заново нормализуем name_normalized (с учётом последних изменений пайплайна)
-            click.echo("Re-normalizing name_normalized…")
-            from src.normalize import normalize_name
-
-            products = session.scalars(select(storage.Product)).all()
-            for p in products:
-                p.name_normalized = normalize_name(p.name or "")
+            # Заново выводим из названия name_normalized, dosage и pack_size
+            # (с учётом последних изменений нормализации)
+            click.echo("Re-normalizing derived fields…")
+            changed = matcher.refresh_derived_fields(session)
             session.commit()
-            click.echo(f"Re-normalized {len(products)} products.")
+            click.echo(f"Re-normalized: {changed} products changed.")
 
             # Запуск матчинга
             thr = threshold if threshold is not None else matcher.FUZZY_THRESHOLD
