@@ -6,8 +6,7 @@
 #   1. SMTP (Resend) — для email magic-link и daily reports
 #   2. Telegram bot — для push-алертов
 #   3. Sentry — для error tracking
-#   4. GitHub remote — для backup кода (если ещё не настроен)
-#   5. (опц.) ScraperAPI Hobby — если есть подписка $49/мес
+#   (блоки «GitHub remote» и «ScraperAPI Hobby» сняты 2026-10-07 — см. ниже)
 #
 # Каждый блок — отдельная функция, можно skip любую.
 # После каждого блока обновляет /etc/pharmacy-monitor/env на проде
@@ -269,7 +268,7 @@ main() {
 
     section "Готово"
     echo "Текущая конфигурация прода (заполненные ключи):"
-    ssh_root "grep -E '^(SMTP_HOST|TELEGRAM_BOT_TOKEN|SENTRY_DSN|SCRAPER_API_SITES)=' '$PROD_ENV_FILE' | sed 's/=.*/=<set>/'"
+    ssh_root "grep -E '^(SMTP_HOST|TELEGRAM_BOT_TOKEN|SENTRY_DSN)=' '$PROD_ENV_FILE' | sed 's/=.*/=<set>/'"
     echo
     echo "Что дальше:"
     echo "  • Открой https://leaddrive.cloud/settings — проверь что нотификации показывают ✓"

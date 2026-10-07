@@ -27,7 +27,8 @@
 #   gpg --batch --yes --passphrase-fd 0 -d backup.sql.gz.gpg | gunzip > backup.sql
 #   psql -h <host> -U pm pharmacy_monitor < backup.sql
 # gpg waits for the passphrase on stdin. Typed by hand it is echoed; on the Mac
-# feed it from the Keychain instead:
+# feed it from the Keychain instead (if that item still holds the passphrase of
+# the Hetzner-era server, gpg answers "Bad session key"):
 #   security find-generic-password -a pm -s pharmacy-monitor-gpg -w \
 #     | gpg --batch --yes --passphrase-fd 0 -d backup.sql.gz.gpg | gunzip > backup.sql
 # Restoring such a dump on the Contabo server has never been rehearsed.
@@ -74,12 +75,16 @@ case "${1:-}" in
             exit 1
         fi
         # The nightly job has already died silently for a month once. "Newest"
-        # proves nothing by itself, so say when the newest dump is old.
-        dump_date=$(basename "$target" | sed -nE 's/^pharmacy-monitor-([0-9]{4}-[0-9]{2}-[0-9]{2})T.*/\1/p')
-        cutoff=$(date -u -d '2 days ago' +%F 2>/dev/null || date -u -v-2d +%F)
-        if [[ -n "$dump_date" && "$dump_date" < "$cutoff" ]]; then
-            echo "WARN: newest dump on prod is from $dump_date — the nightly backup looks broken." >&2
-            echo "      check: systemctl show -p Result pharmacy-monitor-backup.service" >&2
+        # proves nothing by itself, so say when the job has skipped a night:
+        # a healthy server's newest file is dated today or yesterday (UTC).
+        # Judged by the newest file of any kind, so that encryption being off
+        # (warned about above) is not reported as a dead job. Advisory only:
+        # a host without GNU or BSD date skips the check instead of aborting.
+        newest_date=$(basename "$newest" | sed -nE 's/^pharmacy-monitor-([0-9]{4}-[0-9]{2}-[0-9]{2})T.*/\1/p')
+        cutoff=$(date -u -d '1 day ago' +%F 2>/dev/null || date -u -v-1d +%F 2>/dev/null || true)
+        if [[ -n "$newest_date" && -n "$cutoff" && "$newest_date" < "$cutoff" ]]; then
+            echo "WARN: newest dump on prod is from $newest_date — the nightly backup looks broken." >&2
+            echo "      check on the server: systemctl show -p Result pharmacy-monitor-backup.service" >&2
         fi
         ;;
     *)

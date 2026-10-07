@@ -89,20 +89,29 @@ def test_fingerprint_literals_match_the_pinned_key():
     # Сменится ключ сервера, а литерал забудут — тесты выше останутся зелёными,
     # а каждый workflow упадёт на подготовке SSH, причём уже во время аварии.
     expected = _fingerprint(_pinned_line())
-    literal = re.compile(r"SHA256:[A-Za-z0-9+/]+")
 
-    files = [ROOT / "infra" / "prod_known_hosts"]
-    files += [
-        path
-        for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
-        if PROD_IP in path.read_text()
-    ]
-    stale = {
-        str(path.relative_to(ROOT)): sorted(set(literal.findall(path.read_text())) - {expected})
-        for path in files
-    }
-    stale = {name: found for name, found in stale.items() if found}
-    assert not stale, f"отпечаток не от прошитого ключа (ожидается {expected}): {stale}"
+    noted = re.findall(r"SHA256:\S+", (ROOT / "infra" / "prod_known_hosts").read_text())
+    assert noted == [expected], (
+        f"infra/prod_known_hosts называет отпечаток {noted}, а не {expected}"
+    )
+
+    # Берём строку в кавычках целиком — ровно то, с чем workflow сравнит вывод
+    # ssh-keygen: лишний символ внутри кавычек уронит его так же, как чужой отпечаток.
+    compared = re.compile(
+        r"ssh-keygen -lf ~/\.ssh/known_hosts -E sha256.*?=\s*\\\n\s*'([^']*)'", re.DOTALL
+    )
+    stale = {}
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+        text = path.read_text()
+        if PROD_IP not in text:
+            continue
+        found = compared.findall(text)
+        if len(found) != text.count("ssh-keygen -lf") or any(item != expected for item in found):
+            stale[path.name] = found
+    assert not stale, (
+        f"отпечаток не от прошитого ключа (ожидается {expected}) или сверка записана иначе, "
+        f"чем в остальных workflow: {stale}"
+    )
 
 
 def test_scripts_reaching_prod_require_the_pinned_key():
