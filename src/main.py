@@ -2741,7 +2741,11 @@ def persist_aloe_country_mappings(
     *,
     tenant_id: int = 1,
 ) -> int:
-    """Upsert detail-verified Aloe country dictionary discoveries."""
+    """Upsert detail-verified Aloe country dictionary discoveries.
+
+    Коммитит сам: словарь проверен по карточкам и от судьбы записи сбора не
+    зависит, а `persist_results`, упав, откатывает всё незакоммиченное.
+    """
     changed = 0
     for result in results:
         if result.site != "aloe":
@@ -2780,7 +2784,7 @@ def persist_aloe_country_mappings(
                 row.verified_at = utcnow()
                 changed += 1
     if changed:
-        session.flush()
+        session.commit()
     return changed
 
 
@@ -3586,6 +3590,32 @@ def persist_results(
     *,
     observed: _ObservedEntries | None = None,
 ) -> int:
+    """Записать сбор пачками; что и как пишется — в `_persist_chunks`.
+
+    Пачки коммитит сама функция, поэтому недописанную она сама и откатывает:
+    после любого исключения сессия остаётся рабочей, закоммиченные пачки — в
+    базе, от недописанной не остаётся ничего. Вместе с ней откатывается и то,
+    что вызывающий не закоммитил до вызова.
+
+    До 2026-10-07 отката не было. Колбэк `run` зовёт запись на каждую категорию,
+    а сборщик его исключение ловит и идёт дальше: после одного сбоя базы
+    следующие категории и финальный проход падали на той же сессии, обработчик
+    ошибок не мог записать итог, и прогон оставался `running`.
+    """
+    try:
+        return _persist_chunks(session, run, results, observed=observed)
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _persist_chunks(
+    session: Session,
+    run: storage.Run,
+    results: list[ScrapeResult],
+    *,
+    observed: _ObservedEntries | None = None,
+) -> int:
     """Сохранить ScrapedProduct/Promo в БД, обновить last_seen_at, добавить snapshots.
 
     Diff-only persist (2026-05-09): для существующих товаров pre-fetch'им
@@ -3809,6 +3839,8 @@ def persist_results(
 
             # === Commit per chunk — bounds transaction, friendly to SSH tunnel ===
             session.commit()
+            # Только после коммита: пачка, которая не закоммитилась, откатывается
+            # целиком, и наблюдения её записям обязан добавить следующий проход.
             if observed is not None:
                 observed.add(chunk_products)
 
@@ -5696,19 +5728,51 @@ def run_cmd(
             if trust_context is not None:
                 trust_context.__exit__(*sys.exc_info())
                 trust_context = None
-            run.status = (
+
+            failure_status = (
                 "degraded" if isinstance(e, FullCatalogVerificationError) else "failed"
             )
-            run.error_message = f"{type(e).__name__}: {e}"
-            run.finished_at = utcnow()
-            if request_id is not None:
-                req = session.get(storage.ScrapeRequest, request_id)
-                if req is not None:
-                    req.run_id = run.id
-                    req.status = run.status
-                    req.completed_at = utcnow()
-            session.commit()
+            failure_message = f"{type(e).__name__}: {e}"
+
+            def record_failure() -> None:
+                """Всё, что обработчик добавляет к итогу, ставится здесь: после
+                отката функция выполняется заново."""
+                run.status = failure_status
+                run.error_message = failure_message
+                run.finished_at = utcnow()
+                if request_id is not None:
+                    req = session.get(storage.ScrapeRequest, request_id)
+                    if req is not None:
+                        req.run_id = run.id
+                        req.status = run.status
+                        req.completed_at = utcnow()
+                session.commit()
+
+            # Причина — в журнал до записи итога: если база недоступна и итог
+            # записать не удастся, строка останется.
             log.exception("run_failed", run_id=run_id)
+
+            # Шаг, упавший на ошибке базы, оставляет сессию с транзакцией,
+            # которую надо откатить, — иначе итог не запишется, и прогон
+            # останется `running`. Откат — только когда писать иначе нельзя: в
+            # рабочей сессии вместе с итогом сохраняются поля `run`,
+            # выставленные прямо перед исключением (причина отказа, run_quality).
+            if not session.is_active:
+                # Упал flush: несохранённое SQLAlchemy уже отменил сам, а запись
+                # в такую транзакцию отбросил бы с предупреждением.
+                session.rollback()
+            try:
+                record_failure()
+            except Exception as write_error:
+                # Упал запрос мимо flush: сессия считает транзакцию рабочей, а
+                # PostgreSQL до отката не выполняет в ней ничего.
+                log.warning(
+                    "run_failure_write_retried_after_rollback",
+                    run_id=run_id,
+                    error=f"{type(write_error).__name__}: {write_error}",
+                )
+                session.rollback()
+                record_failure()
             raise click.ClickException(str(e))
 
 

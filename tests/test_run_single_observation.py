@@ -109,11 +109,15 @@ def _run_aloe(
     broken_after_yield=(),
     verified: bool = True,
     second_site_catalog=None,
+    expected_status: str | None = None,
+    command_line: tuple[str, ...] = ("run", "--mode", "category"),
 ) -> storage.Run:
     """Полный сбор aloe командой `run`; подменён только сайт и шаги после записи.
 
     `verified=False` — сбор, который не должен пройти проверку каталога.
     `second_site_catalog` — в том же прогоне собирается ещё и aptekonline.
+    `expected_status` — чем прогон обязан кончиться, если не `ok` и не `degraded`.
+    `command_line` — команда и её параметры; сайты подставляются сами.
     """
     catalogs = {"aloe": catalog}
     if second_site_catalog is not None:
@@ -155,12 +159,14 @@ def _run_aloe(
     runner = CliRunner()
     with runner.isolated_filesystem():
         site_args = [arg for site in catalogs for arg in ("--site", site)]
-        result = runner.invoke(main_mod.cli, ["run", *site_args, "--mode", "category"])
+        result = runner.invoke(main_mod.cli, [command_line[0], *site_args, *command_line[1:]])
     db_session.expire_all()
     run = db_session.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
-    assert (result.exit_code == 0) is verified, result.output
-    expected = ("ok", True) if verified else ("degraded", False)
-    assert (run.status, bool(run.catalog_verified)) == expected, run.error_message
+    status = expected_status or ("ok" if verified else "degraded")
+    assert (result.exit_code == 0) is (status == "ok"), result.output
+    assert run.status == status, run.error_message
+    if expected_status is None:
+        assert bool(run.catalog_verified) is verified, run.error_message
     return run
 
 
