@@ -199,6 +199,13 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
     только у событий, реально вошедших в отправленную сводку) и коммитится
     per-получатель — чтобы сбой commit не дал повторную рассылку всей пачки.
 
+    «Вошедшее» — событие, прошедшее порог получателя, чьё письмо ушло: и то,
+    что показано строкой, и то, что из-за потолка осталось числом в сводке со
+    ссылкой на дашборд. Метка отвечает на вопрос «слать ли ещё раз», а не
+    «видел ли получатель название»: без неё повторный вызов на тех же событиях
+    слал бы остаток письмо за письмом — тот самый поток, который убрали. Так же
+    с первого дня ведёт себя Telegram (30 строк и «…и ещё N», помечены все).
+
     Возвращает {'email': писем, 'telegram': сообщений}.
     """
     # Dedup: не трогаем уже отправленные (retry-safe, как dispatch_event).
@@ -648,10 +655,15 @@ def _digest_selection(
     return chosen
 
 
+# Окно страницы алертов в часах, по виду письма. По номеру прогона страница не
+# отбирает, поэтому письмо о прогоне ведёт на последние сутки.
+_ALERTS_WINDOW_HOURS = {"daily": 24, "weekly": 168, "run": 24}
+
+
 def _alerts_url(kind: str, **filters: str) -> str:
-    """Ссылка на страницу алертов с тем же окном, что у дайджеста."""
+    """Ссылка на страницу алертов с тем же окном, что у письма."""
     public = os.environ.get("PHARMACY_PUBLIC_URL", "")
-    params = {"hours": "24" if kind == "daily" else "168", **filters}
+    params = {"hours": str(_ALERTS_WINDOW_HOURS[kind]), **filters}
     return escape(f"{public}/alerts?{urlencode(params)}")
 
 
@@ -727,9 +739,14 @@ def _digest_block(
 """.strip()
 
 
-def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since: datetime) -> str:
-    """Письмо-дайджест: сводка по типам, затем списки с потолком."""
-    events = list(events)
+def _render_summary_email(
+    events: list[storage.AlertEvent], *, kind: str, heading: str, subheading: str, footer: str
+) -> str:
+    """Письмо со сводкой по типам и списками с потолком.
+
+    Общее тело дайджеста и письма о прогоне: у них разные шапка, подвал и окно
+    ссылок на дашборд (`kind`), а сводка, отбор строк и потолки — одни.
+    """
     total = len(events)
 
     groups = _digest_groups(events)
@@ -751,11 +768,6 @@ def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since:
         )
     else:
         scope_note = "В этом письме только сводка. Сами события — в дашборде."
-    period_name = _digest_period_name(kind)
-    period = f"{since.strftime('%d.%m')} – {utcnow().strftime('%d.%m')}"
-    totals = f"{_num(total)} {_plural(total, 'событие', 'события', 'событий')}"
-    if total:
-        totals += f": {_severity_phrase(_bucket_counts(events))}"
     scope_html = (
         f'<tr><td style="padding:12px 24px 16px;font-size:12px;color:#71717a;">{scope_note}</td></tr>'
         if scope_note
@@ -764,21 +776,19 @@ def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since:
     return f"""
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>Дайджест за {period_name}</title></head>
+<head><meta charset="utf-8"><title>{heading}</title></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
   <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
     <tr><td style="padding:24px;">
       <div style="font-size:14px;color:#71717a;margin-bottom:4px;">Pharmacy Monitor</div>
-      <div style="font-size:22px;font-weight:600;color:#18181b;">Дайджест за {period_name}</div>
-      <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
+      <div style="font-size:22px;font-weight:600;color:#18181b;">{heading}</div>
+      <div style="font-size:13px;color:#71717a;margin-top:4px;">{subheading}</div>
     </td></tr>
     {chr(10).join(summary_rows)}
     {scope_html}
     {chr(10).join(blocks)}
     <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
-      <a href="{_alerts_url(kind)}" style="color:#3b82f6;">Все события за {period_name} — в дашборде →</a>
-      <br><br>
-      Отписаться от дайджеста: администратор отключает его в дашборде, Настройки → Пользователи.
+      {footer}
     </td></tr>
   </table>
 </body>
@@ -786,7 +796,37 @@ def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since:
 """.strip()
 
 
+def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since: datetime) -> str:
+    """Письмо-дайджест: сводка по типам, затем списки с потолком."""
+    events = list(events)
+    total = len(events)
+    period_name = _digest_period_name(kind)
+    period = f"{since.strftime('%d.%m')} – {utcnow().strftime('%d.%m')}"
+    totals = f"{_num(total)} {_plural(total, 'событие', 'события', 'событий')}"
+    if total:
+        totals += f": {_severity_phrase(_bucket_counts(events))}"
+    return _render_summary_email(
+        events,
+        kind=kind,
+        heading=f"Дайджест за {period_name}",
+        subheading=f"{period} · {totals}",
+        footer=f"""<a href="{_alerts_url(kind)}" style="color:#3b82f6;">Все события за {period_name} — в дашборде →</a>
+      <br><br>
+      Отписаться от дайджеста: администратор отключает его в дашборде, Настройки → Пользователи.""",
+    )
+
+
 # ─── Per-run batch (consolidated single email) ───────────────────────────────
+#
+# Письмо о прогоне собирает то же тело, что дайджест. До 2026-10-07 оно клало
+# строку на каждое событие прогона без потолка: прогон 973 дал письмо на 99
+# строк, а получатель с порогом `info` после сверки каталога получил бы около
+# двух тысяч. Отличия от дайджеста — не в письме, а до него: сюда приходят
+# только события, прошедшие порог получателя (`dispatch_events_batch`).
+
+
+def _alert_count(n: int) -> str:
+    return f"{_num(n)} {_plural(n, 'алерт', 'алерта', 'алертов')}"
 
 
 def _batch_subject(events: list[storage.AlertEvent]) -> str:
@@ -796,40 +836,19 @@ def _batch_subject(events: list[storage.AlertEvent]) -> str:
         e = events[0]
         return f"[{e.severity.upper()}] {(e.title or '')[:80]}"
     worst = max(events, key=lambda e: SEVERITY_ORDER.get(e.severity, 0)).severity
-    return f"[{worst.upper()}] Pharmacy Monitor — {len(events)} алертов"
+    return f"[{worst.upper()}] Pharmacy Monitor — {_alert_count(len(events))}"
 
 
 def _render_batch_email(events: list[storage.AlertEvent]) -> str:
-    """ОДНО письмо со списком всех событий прогона (critical → warning → info)."""
-    ordered = sorted(events, key=lambda e: -SEVERITY_ORDER.get(e.severity, 0))
-    rows = "\n".join(_format_event_html(e) for e in ordered)
-    public = os.environ.get("PHARMACY_PUBLIC_URL", "")
-    sev_counts: dict[str, int] = {}
-    for e in events:
-        sev_counts[e.severity] = sev_counts.get(e.severity, 0) + 1
-    summary = " · ".join(
-        f"{v} {k}"
-        for k, v in sorted(sev_counts.items(), key=lambda kv: -SEVERITY_ORDER.get(kv[0], 0))
+    """ОДНО письмо о событиях прогона: сводка по типам, затем списки с потолком."""
+    events = list(events)
+    return _render_summary_email(
+        events,
+        kind="run",
+        heading=f"{_alert_count(len(events))} за прогон",
+        subheading=_severity_phrase(_bucket_counts(events)),
+        footer=f'<a href="{_alerts_url("run")}" style="color:#3b82f6;">Открыть в дашборде →</a>',
     )
-    return f"""
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>{len(events)} alerts</title></head>
-<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
-  <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
-    <tr><td style="padding:24px;border-bottom:1px solid #e4e4e7;">
-      <div style="font-size:14px;color:#71717a;margin-bottom:4px;">Pharmacy Monitor</div>
-      <div style="font-size:22px;font-weight:600;color:#18181b;">{len(events)} алертов за прогон</div>
-      <div style="font-size:13px;color:#71717a;margin-top:4px;">{summary}</div>
-    </td></tr>
-    {rows}
-    <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:12px;color:#71717a;">
-      <a href="{public}/alerts" style="color:#3b82f6;">Открыть в дашборде →</a>
-    </td></tr>
-  </table>
-</body>
-</html>
-""".strip()
 
 
 def _format_batch_text(events: list[storage.AlertEvent]) -> str:
