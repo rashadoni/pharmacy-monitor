@@ -1,4 +1,4 @@
-"""Этап сопоставления один — в конце сбора и в `rematch`; недельный юнит его не сбрасывает.
+"""Этап сопоставления один — в конце сбора и в `rematch`; плановый юнит его не сбрасывает.
 
 2026-10-07, после выкладки правок сопоставления (PR #21), выяснилось сразу два
 расхождения между «как задумано» и «как на проде»:
@@ -7,9 +7,10 @@
   устаревших строк и без revalidate), а `intraday-tick` и пустой `watchlist-tick`
   сопоставление не запускают вовсе — «прогнать руками после выкладки» давало
   другой результат, а сами новые пары до понедельника не появились бы;
-* на проде с 2026-05-26 стоял положенный руками юнит `pharmacy-monitor-rematch`
-  с `rematch --reset`: каждый понедельник все автоматические пары удалялись и
-  собирались заново, хотя полный сброс на проде считался запрещённым.
+* на прод 2026-05-26 руками положили юнит `pharmacy-monitor-rematch` с
+  `rematch --reset`: каждый понедельник все автоматические пары удалялись и
+  собирались заново, хотя полный сброс на проде считался запрещённым. Заменён
+  ли он, эти тесты не знают — они проверяют файлы в Git и саму команду.
 
 Команда здесь берётся из самого файла юнита — как в test_cadence_guard.py.
 """
@@ -119,7 +120,7 @@ def _exec_args(*unit_files: Path) -> list[str]:
     return argv[1:]
 
 
-def test_weekly_rematch_unit_runs_the_incremental_stage_only():
+def test_scheduled_rematch_unit_runs_the_incremental_stage_only():
     """Ни `--reset`, ни других флагов: юнит зовёт обычный этап сопоставления."""
     assert _exec_args(REMATCH_UNIT, *REMATCH_DROPINS) == ["rematch"]
     # Сброс не спрятан и в соседних командах юнита.
@@ -131,7 +132,7 @@ def test_weekly_rematch_unit_runs_the_incremental_stage_only():
     assert other_commands == []
 
 
-def test_weekly_rematch_unit_cannot_hold_the_matcher_lock_forever():
+def test_scheduled_rematch_unit_cannot_hold_the_matcher_lock_forever():
     """У oneshot без TimeoutStartSec предела нет: зависшая команда держала бы замок."""
     timeouts = [
         line.removeprefix("TimeoutStartSec=")
@@ -287,7 +288,7 @@ def test_rematch_steps_aside_while_a_scrape_run_is_active(db_session, monkeypatc
 
 
 def test_rematch_does_not_wait_for_the_scrape_lock(db_session, monkeypatch):
-    """Ждать нельзя: недельный юнит провисел бы весь многочасовой сбор."""
+    """Ждать нельзя: плановый юнит провисел бы весь многочасовой сбор."""
     waits: list[bool] = []
     _record_stage(monkeypatch)
     monkeypatch.setattr(
@@ -359,7 +360,7 @@ def test_failed_preparation_step_does_not_cancel_matching_but_fails_the_command(
 
     assert _steps(calls) == STAGE  # этап дошёл до конца
     assert "FAILED, see log" in result.output
-    # …но недельный юнит не должен отчитаться успехом.
+    # …но плановый юнит не должен отчитаться успехом.
     assert result.exit_code != 0
     assert "preparation step failed" in result.output
 
