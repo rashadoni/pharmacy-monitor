@@ -392,6 +392,9 @@ class ScrapeResult:
     verified_country_mappings: dict[str, dict[str, object]] = field(
         default_factory=dict
     )
+    # Сколько раз страница отдалась только с повтора. Успешный повтор не
+    # ухудшает статус прогона, но остаётся в Run.run_quality как сигнал о сайте.
+    fetch_retries: int = 0
 
 
 @dataclass

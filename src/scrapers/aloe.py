@@ -34,6 +34,13 @@ from typing import AsyncIterator
 
 import httpx
 import structlog
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from src.normalize import (
     extract_dosage,
@@ -126,6 +133,20 @@ def aloe_listing_page_info(html_text: str) -> tuple[int | None, int | None]:
     current = int(current_matches[-1]) if current_matches else None
     last = int(last_matches[-1]) if last_matches else None
     return current, last
+
+
+def _is_transient_fetch_error(exc: BaseException) -> bool:
+    """Сбой, который имеет смысл повторить: обрыв или таймаут сети либо 5xx.
+
+    Любой 4xx — это ответ сайта (блок, нет страницы, 429 «помедленнее»), а не
+    помеха: быстрый повтор ничего не изменит и только утроит запросы. Ошибки
+    прокси и протокола на нашей стороне тоже не повторяем — они не проходят сами.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(
+        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+    )
 
 
 def _media_url(path: str | None) -> str | None:
@@ -330,6 +351,7 @@ class AloeScraper(BaseScraper):
         super().__init__(*args, **kwargs)
         self.country_id_map = country_id_map or {}
         self.verified_country_mappings: dict[str, dict[str, object]] = {}
+        self.fetch_retries = 0
 
     async def _enrich_listing_country_ids(
         self, products: list[ScrapedProduct]
@@ -429,7 +451,7 @@ class AloeScraper(BaseScraper):
         else:
             base_url = f"{self.base_url}/catalog/filters/?category_slug={category_slug}"
 
-        first_html = await self._fetch_listing_html(base_url)
+        first_html = await self._fetch_listing_page(base_url)
         current_page, last_page = aloe_listing_page_info(first_html)
         if not last_page:
             last_page = 1
@@ -443,7 +465,7 @@ class AloeScraper(BaseScraper):
         parsed_items = 0
         item_failures = 0
         for page_num in range(1, last_page + 1):
-            html_text = first_html if page_num == 1 else await self._fetch_listing_html(
+            html_text = first_html if page_num == 1 else await self._fetch_listing_page(
                 f"{base_url}&page={page_num}"
             )
             products, page_raw, page_parsed, page_failures = (
@@ -510,6 +532,41 @@ class AloeScraper(BaseScraper):
                 parsed_items=parsed_items,
                 item_failures=item_failures,
             )
+
+    async def _fetch_listing_page(self, url: str) -> str:
+        """Страница листинга с ограниченным повтором при сбое сети.
+
+        Один не отданный листинг рушит проверку ВСЕГО каталога (маршрут неполон
+        → catalog_verified=false), а полный сбор — это сотни страниц. За
+        сентябрь–октябрь 2026 три полных сбора из 30 пропали из-за единственного
+        ReadError/ReadTimeout. Страница, не отдавшаяся и с повторами, по-прежнему
+        роняет маршрут.
+
+        Только листинги: сбой карточки товара (определение страны) маршрут и так
+        не роняет, повтор там ничего не даёт проверке и лишь растягивает прогон.
+        """
+        retrying = AsyncRetrying(
+            stop=stop_after_attempt(self.max_retries),
+            wait=wait_exponential(multiplier=2, min=2, max=60),
+            retry=retry_if_exception(_is_transient_fetch_error),
+            before_sleep=self._note_fetch_retry,
+            reraise=True,
+        )
+        return await retrying(self._fetch_listing_html, url)
+
+    def _note_fetch_retry(self, retry_state: RetryCallState) -> None:
+        # Повтор гасит сбой, но прятать его не должен: счётчик уходит в
+        # Run.run_quality, иначе деградация сайта пропадёт из виду до дня, когда
+        # повторов перестанет хватать.
+        self.fetch_retries += 1
+        outcome = retry_state.outcome
+        error = outcome.exception() if outcome is not None else None
+        log.warning(
+            "aloe_fetch_retry",
+            url=retry_state.args[0] if retry_state.args else None,
+            attempt=retry_state.attempt_number,
+            error=f"{type(error).__name__}: {error}"[:200],
+        )
 
     async def _fetch_listing_html(self, url: str) -> str:
         await self._throttle()

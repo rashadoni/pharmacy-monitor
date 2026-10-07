@@ -85,6 +85,25 @@ def test_classify_run_quality_matrix(
     assert quality["financially_eligible"] is (expected_status == "ok" and enforce_baseline)
 
 
+def test_fetch_retries_are_recorded_without_degrading_the_run():
+    """Погашенный повтором сбой прогон не портит, но в run_quality остаётся."""
+    result = _result("aloe", 20)
+    result.fetch_retries = 3
+
+    status, quality = classify_run_quality(
+        [result, _result("aptekonline", 20)],
+        ["aloe", "aptekonline"],
+        mode="category",
+        baselines={"aloe": 20, "aptekonline": 20},
+        enforce_baseline=True,
+    )
+
+    assert status == "ok"
+    assert quality["full_catalog_verified"] is True
+    assert quality["sites"]["aloe"]["fetch_retries"] == 3
+    assert quality["sites"]["aptekonline"]["fetch_retries"] == 0
+
+
 def test_intentional_partial_run_is_ok_but_not_financially_eligible():
     status, quality = classify_run_quality(
         [_result("aloe", 2, expected=1, completed=1)],

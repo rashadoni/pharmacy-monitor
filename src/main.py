@@ -2569,6 +2569,7 @@ async def scrape_site(
                 result.verified_country_mappings.update(
                     getattr(s, "verified_country_mappings", {})
                 )
+                result.fetch_retries = int(getattr(s, "fetch_retries", 0) or 0)
     except SiteScrapeFatalError as exc:
         log.error(
             "site_scrape_start_aborted",
@@ -3081,6 +3082,9 @@ def classify_run_quality(
             # run is exactly the one whose evidence must survive intact.
             "routes_incomplete": incomplete_route_details,
             "routes_complete_count": route_total - len(incomplete_route_details),
+            # Повторы, которыми скрейпер погасил сбои сети: прогон остаётся ok,
+            # но рост этого числа от ночи к ночи — ранний признак, что сайт сдаёт.
+            "fetch_retries": max(0, int(getattr(result, "fetch_retries", 0) or 0)),
         }
 
     statuses = [row["status"] for row in site_details.values()]
