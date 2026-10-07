@@ -325,7 +325,7 @@ def _scraper_with_transport(monkeypatch, handler) -> AloeScraper:
     return AloeScraper(rate_limit_sec=0.001, max_retries=3)
 
 
-@pytest.mark.parametrize("blip", ["read_error", "http_503", "http_429"])
+@pytest.mark.parametrize("blip", ["read_error", "remote_closed", "http_503"])
 async def test_aloe_listing_survives_one_transient_failure(monkeypatch, blip: str) -> None:
     """Одиночный сбой сети не должен стоить проверки всего каталога (прогон #952)."""
     requests: list[str] = []
@@ -336,6 +336,8 @@ async def test_aloe_listing_survives_one_transient_failure(monkeypatch, blip: st
         if page == "2" and requests.count("2") == 1:
             if blip == "read_error":
                 raise httpx.ReadError("connection reset", request=request)
+            if blip == "remote_closed":
+                raise httpx.RemoteProtocolError("server disconnected", request=request)
             return httpx.Response(int(blip.removeprefix("http_")))
         return httpx.Response(200, text=_listing_page(int(page), current=int(page), last=2))
 
@@ -368,14 +370,15 @@ async def test_aloe_listing_gives_up_after_bounded_retries(monkeypatch) -> None:
     assert "kosmetika" not in scraper._route_statuses
 
 
-async def test_aloe_listing_does_not_retry_a_refusal(monkeypatch) -> None:
-    """403/404 — ответ сайта, а не помеха: один запрос и честный отказ."""
+@pytest.mark.parametrize("status", [403, 404, 429])
+async def test_aloe_listing_does_not_retry_a_refusal(monkeypatch, status: int) -> None:
+    """Любой 4xx — ответ сайта, а не помеха: один запрос и честный отказ."""
     requests = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal requests
         requests += 1
-        return httpx.Response(403)
+        return httpx.Response(status)
 
     scraper = _scraper_with_transport(monkeypatch, handler)
 
@@ -383,3 +386,30 @@ async def test_aloe_listing_does_not_retry_a_refusal(monkeypatch) -> None:
         [p async for p in scraper.scrape_category("kosmetika")]
 
     assert requests == 1
+
+
+async def test_aloe_listing_retry_is_logged(monkeypatch) -> None:
+    """Повтор гасит сбой, но не прячет его: в логе остаётся след."""
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        "src.scrapers.aloe.log.warning", lambda event, **kw: seen.append({"event": event, **kw})
+    )
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectTimeout("slow", request=request)
+        return httpx.Response(200, text=_listing_page(1, current=1, last=1))
+
+    scraper = _scraper_with_transport(monkeypatch, handler)
+
+    html_text = await scraper._fetch_listing_html("https://aloe.az/catalog/filters/?page=1")
+
+    assert "item-1" in html_text
+    retries = [row for row in seen if row["event"] == "aloe_fetch_retry"]
+    assert len(retries) == 1
+    assert retries[0]["attempt"] == 1
+    assert retries[0]["url"].endswith("?page=1")
+    assert retries[0]["error"].startswith("ConnectTimeout")

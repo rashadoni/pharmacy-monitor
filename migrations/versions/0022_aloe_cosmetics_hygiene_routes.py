@@ -5,7 +5,7 @@ Revises: 0021_public_api_quarantines
 Create Date: 2026-10-07
 
 Aloe.az has six top-level sections; the full scan walks the rows of
-``categories`` that carry an ``aloe_slug`` and only four of the six were ever
+``categories`` that carry an ``aloe_slug`` and only three of the six were ever
 entered (``dermanlar``, ``bad``, ``usaq-dunyasi`` plus the sub-sections
 ``tibbi-vasitələr``/``uşaq-qidası`` and the bestseller filter).  ``kosmetika``
 (149 listing pages) and ``gigiyena`` (26) were never scraped — about 1,950
@@ -19,6 +19,7 @@ its verified backup — instead of a hand-typed statement.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
@@ -29,6 +30,10 @@ revision: str = "0022_aloe_cosmetics_hygiene"
 down_revision: str | None = "0021_public_api_quarantines"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+# Child of Alembic's own logger, so the lines land in the deploy log next to
+# "Running upgrade …".
+log = logging.getLogger("alembic.runtime.migration.aloe_sections")
 
 
 # (key, label_ru, label_az, aloe_slug) — keys follow `aloe_dermanlar`.
@@ -70,7 +75,11 @@ def upgrade() -> None:
             .where(sa.or_(categories.c.key == key, categories.c.aloe_slug == aloe_slug))
         )
         if taken:
+            # Say so: a deploy that goes green while the section is still switched
+            # off, or filed under another key, must not look like a new route.
+            log.warning("aloe section %s already present in categories, left as is", aloe_slug)
             continue
+        log.info("aloe section %s added as category %s", aloe_slug, key)
         bind.execute(
             categories.insert().values(
                 key=key,
@@ -87,7 +96,9 @@ def downgrade() -> None:
     categories = _categories()
     for key, label_ru, label_az, aloe_slug in _ROUTES:
         # Remove only a row that still looks exactly like the one inserted
-        # above; anything an operator has since edited stays.
+        # above; anything an operator has since edited or switched off stays.
+        # The delete cascades to `tracked_categories`: a pin the client put on
+        # the section goes with it. Products already scraped keep their slug.
         op.execute(
             categories.delete()
             .where(categories.c.key == key)
@@ -96,4 +107,5 @@ def downgrade() -> None:
             .where(categories.c.label_az == label_az)
             .where(categories.c.pharmonline_slug.is_(None))
             .where(categories.c.aptekonline_slug.is_(None))
+            .where(categories.c.is_active.is_(True))
         )

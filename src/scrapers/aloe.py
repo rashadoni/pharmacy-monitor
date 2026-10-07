@@ -36,6 +36,7 @@ import httpx
 import structlog
 from tenacity import (
     AsyncRetrying,
+    RetryCallState,
     retry_if_exception,
     stop_after_attempt,
     wait_exponential,
@@ -135,15 +136,30 @@ def aloe_listing_page_info(html_text: str) -> tuple[int | None, int | None]:
 
 
 def _is_transient_fetch_error(exc: BaseException) -> bool:
-    """Сбой, который имеет смысл повторить: сеть, 5xx или 429.
+    """Сбой, который имеет смысл повторить: обрыв или таймаут сети либо 5xx.
 
-    Прочие 4xx — это ответ сайта (блок, нет страницы), а не помеха: повтор
-    ничего не изменит и только отложит честный отказ.
+    Любой 4xx — это ответ сайта (блок, нет страницы, 429 «помедленнее»), а не
+    помеха: быстрый повтор ничего не изменит и только утроит запросы. Ошибки
+    прокси и протокола на нашей стороне тоже не повторяем — они не проходят сами.
     """
     if isinstance(exc, httpx.HTTPStatusError):
-        status = exc.response.status_code
-        return status >= 500 or status == 429
-    return isinstance(exc, httpx.TransportError)
+        return exc.response.status_code >= 500
+    return isinstance(
+        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+    )
+
+
+def _log_fetch_retry(retry_state: RetryCallState) -> None:
+    # Повторы обязаны оставаться видимыми: иначе деградация сайта, которую они
+    # гасят, исчезает из логов до того дня, когда повторов перестанет хватать.
+    outcome = retry_state.outcome
+    error = outcome.exception() if outcome is not None else None
+    log.warning(
+        "aloe_fetch_retry",
+        url=retry_state.args[0] if retry_state.args else None,
+        attempt=retry_state.attempt_number,
+        error=f"{type(error).__name__}: {error}"[:200],
+    )
 
 
 def _media_url(path: str | None) -> str | None:
@@ -534,13 +550,14 @@ class AloeScraper(BaseScraper):
         # Один не отданный листинг рушит проверку ВСЕГО каталога (маршрут
         # неполон → catalog_verified=false), а полный сбор — это ~700 страниц.
         # За сентябрь–октябрь 2026 три ночи из 28 пропали из-за единственного
-        # ReadError/ReadTimeout. Поэтому у httpx-пути тот же ограниченный повтор,
-        # что у Playwright-пути в `goto`; страница, не отдавшаяся и с повторами,
+        # ReadError/ReadTimeout. Поэтому у httpx-пути ограниченный повтор, как у
+        # Playwright-пути в `goto`; страница, не отдавшаяся и с повторами,
         # по-прежнему роняет маршрут.
         retrying = AsyncRetrying(
             stop=stop_after_attempt(self.max_retries),
             wait=wait_exponential(multiplier=2, min=2, max=60),
             retry=retry_if_exception(_is_transient_fetch_error),
+            before_sleep=_log_fetch_retry,
             reraise=True,
         )
         return await retrying(self._fetch_html_once, url, timeout)
