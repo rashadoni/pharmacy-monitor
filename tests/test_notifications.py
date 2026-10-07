@@ -859,6 +859,19 @@ def test_digest_ranked_info_type_above_cap_shows_largest():
     assert "30 из 45" in html and "Ещё 15 — в дашборде" in html
 
 
+def test_digest_type_cap_counts_rows_of_every_severity():
+    """Потолок 30 — на тип целиком: критичные и информационные одного типа вместе."""
+    events = [_loose_event("price_change_pct", "critical", f"CRIT{i:02d}") for i in range(20)] + [
+        _loose_event("price_change_pct", "info", f"INFO{i:02d}", {"change_pct": i + 1})
+        for i in range(15)
+    ]
+    html = notifications._render_digest_email(events, kind="weekly", since=utcnow())
+
+    assert html.count("CRIT") == 20
+    assert html.count("INFO") == 10
+    assert "INFO14" in html and "INFO05" in html and "INFO04" not in html
+
+
 def test_digest_info_type_is_ranked_only_by_percent():
     """Осталось 10 строк. «Ранжируемый» — тот, у событий которого есть процент:
     хватает и части событий, а payload без процента (как у новых товаров) типом
