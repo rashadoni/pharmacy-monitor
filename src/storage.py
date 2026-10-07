@@ -92,7 +92,9 @@ class Run(Base):
         String(300), nullable=True
     )
 
-    snapshots: Mapped[list["PriceSnapshot"]] = relationship(back_populates="run")
+    snapshots: Mapped[list["PriceSnapshot"]] = relationship(
+        back_populates="run", foreign_keys="PriceSnapshot.run_id"
+    )
 
 
 def run_is_financially_eligible(run: Run | None) -> bool:
@@ -466,8 +468,14 @@ class PriceSnapshot(Base):
     is_on_sale: Mapped[bool] = mapped_column(Boolean, default=False)
     promo_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Проверенный полный сбор, который увидел товар с этой же ценой и ничего не
+    # записал (diff-only). Строка остаётся «изменением цены» прогона `run_id`, но
+    # денежным выводам она доверена — см. `trusted_snapshot_filter`.
+    confirmed_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
+    )
 
-    run: Mapped[Run] = relationship(back_populates="snapshots")
+    run: Mapped[Run] = relationship(back_populates="snapshots", foreign_keys=[run_id])
     product: Mapped[Product] = relationship(back_populates="snapshots")
 
 
@@ -1178,7 +1186,7 @@ def curr_and_prev_snapshots_for_run(
             session,
             tenant_id=current_run.tenant_id,
         )
-        previous_filters.append(PriceSnapshot.run_id.in_(eligible_ids))
+        previous_filters.append(trusted_snapshot_filter(eligible_ids))
     prev_max_subq = (
         select(
             PriceSnapshot.product_id,
@@ -1195,7 +1203,7 @@ def curr_and_prev_snapshots_for_run(
             & (PriceSnapshot.captured_at == prev_max_subq.c.max_at),
         )
     if eligible_ids is not None:
-        prev_stmt = prev_stmt.where(PriceSnapshot.run_id.in_(eligible_ids))
+        prev_stmt = prev_stmt.where(trusted_snapshot_filter(eligible_ids))
     prev_snaps = session.scalars(
         prev_stmt.order_by(PriceSnapshot.product_id, PriceSnapshot.id.desc())
     ).all()
@@ -1203,6 +1211,141 @@ def curr_and_prev_snapshots_for_run(
     for s in prev_snaps:
         prev_by_product.setdefault(s.product_id, s)
     return curr_snaps, prev_by_product
+
+
+def trusted_snapshot_filter(eligible_run_ids):
+    """Условие «этой записи о цене доверяют денежные выводы».
+
+    Запись доверена, если её сделал проверенный полный сбор ИЛИ такой сбор позже
+    увидел товар с той же ценой (`confirmed_run_id`). Второе нужно из-за
+    diff-only: проверенный сбор, увидевший прежнюю цену, своей строки не пишет.
+    До 2026-10-07 доверие читалось только по `run_id`, и цена, записанная до
+    появления проверки, частичным тиком или сбором, не прошедшим её, оставалась
+    недоверенной, пока не изменится: на проде так выпали 85% товаров.
+
+    Любой запрос, выбирающий snapshot'ы «только проверенные», обязан брать
+    условие отсюда, а не писать `PriceSnapshot.run_id.in_(...)` сам —
+    `tests/test_trusted_prices.py` следит за этим.
+    """
+    from sqlalchemy import or_
+
+    return or_(
+        PriceSnapshot.run_id.in_(eligible_run_ids),
+        PriceSnapshot.confirmed_run_id.in_(eligible_run_ids),
+    )
+
+
+def confirm_prices_observed_by_run(session, run: "Run") -> int:
+    """Проверенный полный сбор подтверждает цены, которые увидел без изменений.
+
+    Для каждого товара, который `run` наблюдал (`offer_observations`) и для
+    которого не записал snapshot, берётся запись, с которой `persist_results`
+    сравнил цену и счёл её прежней, — последняя на момент наблюдения. Если ей
+    ещё не доверяют, в неё ставится `confirmed_run_id = run.id`. Новых строк нет:
+    `price_snapshots` остаётся журналом изменений цены.
+
+    Сбор, не прошедший проверку, ничего не подтверждает. Подтверждение другого
+    проверенного сбора не затирается: если `run` позже упадёт в постобработке,
+    прежнее доверие должно остаться. Повторный вызов ничего не меняет.
+
+    Возвращает число помеченных записей. Коммит — за вызывающим.
+    """
+    from sqlalchemy import func, or_, select, update
+
+    if not run_is_financially_eligible(run):
+        return 0
+    trusted_run_ids = financially_eligible_run_ids(
+        session,
+        tenant_id=run.tenant_id,
+        include_run_id=run.id,
+    )
+    if run.id not in trusted_run_ids:
+        return 0
+
+    observed = (
+        select(
+            OfferObservation.product_id,
+            func.max(OfferObservation.observed_at).label("observed_at"),
+        )
+        .where(OfferObservation.run_id == run.id)
+        .group_by(OfferObservation.product_id)
+        .subquery()
+    )
+    # Товар, цену которого записал сам `run`, в подтверждении не нуждается, а
+    # его предыдущая запись — это как раз НЕ та цена, которую `run` увидел.
+    written_by_run = select(PriceSnapshot.product_id).where(PriceSnapshot.run_id == run.id)
+    compared_at = (
+        select(
+            PriceSnapshot.product_id,
+            func.max(PriceSnapshot.captured_at).label("max_at"),
+        )
+        .join(observed, observed.c.product_id == PriceSnapshot.product_id)
+        .where(
+            PriceSnapshot.captured_at <= observed.c.observed_at,
+            PriceSnapshot.product_id.not_in(written_by_run),
+        )
+        .group_by(PriceSnapshot.product_id)
+        .subquery()
+    )
+    # Несколько записей с одним captured_at (товар дважды в одном чанке):
+    # последней считается запись с большим id — так же решают и
+    # `persist_results`, и читатели (`_latest_snapshot_stmt`).
+    compared = (
+        select(func.max(PriceSnapshot.id).label("id"))
+        .join(
+            compared_at,
+            (PriceSnapshot.product_id == compared_at.c.product_id)
+            & (PriceSnapshot.captured_at == compared_at.c.max_at),
+        )
+        .group_by(PriceSnapshot.product_id)
+        .subquery()
+    )
+    result = session.execute(
+        update(PriceSnapshot)
+        .where(
+            PriceSnapshot.id.in_(select(compared.c.id)),
+            PriceSnapshot.run_id.not_in(trusted_run_ids),
+            or_(
+                PriceSnapshot.confirmed_run_id.is_(None),
+                PriceSnapshot.confirmed_run_id.not_in(trusted_run_ids),
+            ),
+        )
+        .values(confirmed_run_id=run.id)
+        # Пайплайн живёт в одной сессии, и эти же записи в ней уже загружены
+        # (`persist_results`): пометка должна дойти и до них.
+        .execution_options(synchronize_session="fetch")
+    )
+    return int(result.rowcount or 0)
+
+
+def confirm_prices_of_latest_verified_runs(session, current_run: "Run") -> dict[int, int]:
+    """Подтвердить цены `current_run` и последних проверенных сборов каждого сайта.
+
+    Кроме текущего прогона берутся последний проверенный сбор каждого сайта и
+    последний проверенный сбор ДО текущего. Первое даёт алертам и ROI этого
+    прогона доверенные цены чужих сайтов, второе — доверенную ПРЕЖНЮЮ цену
+    своего: без неё первый сбор сайта после 2026-10-07 не с чем сравнить, и
+    падение цены в нём осталось бы без алерта. Проверенные сборы до этой даты
+    цен не подтверждали; подтвердить задним числом можно, потому что
+    `confirm_prices_observed_by_run` смотрит на момент наблюдения.
+
+    Возвращает `{run_id: число помеченных записей}`. Коммит — за вызывающим.
+    """
+    run_ids = {current_run.id}
+    for before_run_id in (None, current_run.id):
+        run_ids.update(
+            latest_financial_run_ids_by_site(
+                session,
+                FULL_CATALOG_SITES,
+                tenant_id=current_run.tenant_id,
+                before_run_id=before_run_id,
+            ).values()
+        )
+    confirmed: dict[int, int] = {}
+    for run_id in sorted(run_ids):
+        run = current_run if run_id == current_run.id else session.get(Run, run_id)
+        confirmed[run_id] = confirm_prices_observed_by_run(session, run)
+    return confirmed
 
 
 def financially_eligible_run_ids(
@@ -1387,6 +1530,43 @@ def latest_financial_run_ids_by_site(
     return out
 
 
+def new_product_cutoffs_by_site(session, current_run: "Run", sites) -> dict[str, datetime]:
+    """С какого момента товар сайта считается «новым» для проверенного прогона.
+
+    «Нет проверенной цены в прошлом» не значит «товар новый»: цену могли записать
+    до появления проверки, частичным тиком или сбором, не прошедшим проверку.
+    2026-10-04 первый за месяц проверенный сбор aptekonline так объявил новыми
+    774 товара, лежавших в каталоге с мая. Новым считается товар, появившийся
+    после начала предыдущего проверенного полного сбора своего сайта; если
+    такого сбора ещё не было — появившийся в текущем прогоне.
+
+    Это только нижняя граница даты появления. Кандидаты по-прежнему — записи
+    текущего прогона, поэтому товар, который первым увидел частичный тик и чья
+    цена к проверенному сбору не изменилась, новым не объявляется: записи в
+    проверенном сборе у него нет. Так было и до этой правки.
+    """
+    from sqlalchemy import select
+
+    wanted = set(sites)
+    cutoffs = {site: current_run.started_at for site in wanted}
+    previous_by_site = latest_financial_run_ids_by_site(
+        session,
+        wanted,
+        tenant_id=current_run.tenant_id,
+        before_run_id=current_run.id,
+    )
+    if previous_by_site:
+        started_at_by_run = dict(
+            session.execute(
+                select(Run.id, Run.started_at).where(Run.id.in_(set(previous_by_site.values())))
+            ).all()
+        )
+        for site, run_id in previous_by_site.items():
+            if run_id in started_at_by_run:
+                cutoffs[site] = started_at_by_run[run_id]
+    return cutoffs
+
+
 def _latest_snapshot_stmt(
     session,
     entities,
@@ -1420,7 +1600,7 @@ def _latest_snapshot_stmt(
 
     filters = [PriceSnapshot.product_id.in_(product_ids)]
     if eligible_run_ids is not None:
-        filters.append(PriceSnapshot.run_id.in_(eligible_run_ids))
+        filters.append(trusted_snapshot_filter(eligible_run_ids))
 
     latest_at_subq = (
         select(
@@ -1437,7 +1617,7 @@ def _latest_snapshot_stmt(
         & (PriceSnapshot.captured_at == latest_at_subq.c.max_at),
     )
     if eligible_run_ids is not None:
-        latest_stmt = latest_stmt.where(PriceSnapshot.run_id.in_(eligible_run_ids))
+        latest_stmt = latest_stmt.where(trusted_snapshot_filter(eligible_run_ids))
     return latest_stmt.order_by(PriceSnapshot.product_id, PriceSnapshot.id.desc())
 
 

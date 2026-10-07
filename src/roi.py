@@ -953,7 +953,7 @@ def _map_violations(
             Product.brand.is_not(None),
             offer_predicate,
             PriceSnapshot.captured_at >= floor_window_start,
-            PriceSnapshot.run_id.in_(eligible_run_ids),
+            storage.trusted_snapshot_filter(eligible_run_ids),
             effective_price.is_not(None),
             effective_price >= _MIN_PLAUSIBLE_PRICE,
         )

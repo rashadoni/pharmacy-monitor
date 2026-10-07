@@ -3655,15 +3655,19 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                     .subquery()
                 )
                 latest_rows = session.scalars(
-                    select(storage.PriceSnapshot).join(
+                    select(storage.PriceSnapshot)
+                    .join(
                         latest_at_subq,
                         (storage.PriceSnapshot.product_id == latest_at_subq.c.product_id)
                         & (storage.PriceSnapshot.captured_at == latest_at_subq.c.max_at),
                     )
+                    .order_by(storage.PriceSnapshot.product_id, storage.PriceSnapshot.id.desc())
                 ).all()
                 for snap in latest_rows:
-                    # Берём первое попавшееся (если несколько с одинаковым
-                    # max_at, что маловероятно, дубль разрулится).
+                    # При одинаковом max_at последней считается запись с большим
+                    # id — как у читателей (`storage._latest_snapshot_stmt`) и у
+                    # подтверждения цен. Иначе сравнение шло бы с одной записью,
+                    # а доверие получала бы другая.
                     if snap.product_id not in latest_snapshots:
                         latest_snapshots[snap.product_id] = {
                             "price": snap.price,
@@ -5451,6 +5455,19 @@ def run_cmd(
 
                 trust_context = finalizing_trusted_run(run.id)
                 trust_context.__enter__()
+
+            # Diff-only не пишет snapshot, когда цена прежняя, поэтому за
+            # проверенным сбором остаётся цена только изменившихся товаров.
+            # Подтверждаем остальное до алертов и ROI: они читают только
+            # доверенные записи — и свои, и чужих сайтов. Поэтому заодно
+            # подтверждаются последние проверенные сборы всех сайтов, включая
+            # предыдущий сбор своего: до 2026-10-07 проверенные сборы цен не
+            # подтверждали, и первому сбору после выкладки иначе не с чем
+            # сравнивать. Повтор ничего не меняет.
+            if is_run_financially_eligible(run):
+                confirmed = storage.confirm_prices_of_latest_verified_runs(session, run)
+                session.commit()
+                log.info("prices_confirmed_by_verified_runs", run_id=run.id, snapshots=confirmed)
 
             # === Real-time alerts ===
             alerts_allowed = is_run_financially_eligible(
