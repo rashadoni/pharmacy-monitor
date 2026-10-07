@@ -351,13 +351,26 @@ class AloeScraper(BaseScraper):
         super().__init__(*args, **kwargs)
         self.country_id_map = country_id_map or {}
         self.verified_country_mappings: dict[str, dict[str, object]] = {}
+        # id стран, чьи карточки в ЭТОМ сборе прочитаны, а страна так и не
+        # определилась (две страны в подписи, не страна, подписи нет). Без этой
+        # памяти те же две карточки открывались заново на каждой странице
+        # листинга с таким id. Живёт вместе с экземпляром и в
+        # aloe_country_mappings не уходит: сайт может исправить подпись, и
+        # следующий сбор должен это увидеть.
+        self._unresolvable_country_ids: set[str] = set()
+        # id, про которые aloe_country_id_unresolved с retry=True уже записан.
+        self._country_retry_logged: set[str] = set()
         self.fetch_retries = 0
 
     async def _enrich_listing_country_ids(
         self, products: list[ScrapedProduct]
     ) -> None:
         """Resolve Aloe numeric country IDs from durable map or detail pages."""
-        from src.product_policy import COUNTRY_RESOLVED, country_resolution
+        from src.product_policy import (
+            COUNTRY_RESOLVED,
+            OFFER_UNKNOWN,
+            country_resolution,
+        )
 
         groups: dict[str, list[ScrapedProduct]] = {}
         for product in products:
@@ -368,17 +381,34 @@ class AloeScraper(BaseScraper):
         for country_id, group in groups.items():
             mapping = self.country_id_map.get(country_id)
             if mapping is None:
+                if country_id in self._unresolvable_country_ids:
+                    continue
                 samples: list[tuple[str, str, str]] = []
+                unread_details = 0
                 for product in group[:2]:
                     try:
                         html_text = await self._fetch_listing_html(product.url)
-                        raw, _availability = aloe_product_detail_signals(html_text)
+                        raw, availability = aloe_product_detail_signals(html_text)
                     except (httpx.HTTPError, ValueError) as exc:
+                        unread_details += 1
                         log.warning(
                             "aloe_country_detail_failed",
                             country_id=country_id,
                             url=product.url,
                             error=str(exc),
+                        )
+                        continue
+                    if raw is None and availability == OFFER_UNKNOWN:
+                        # Ответ 200, но в нём нет ни подписи страны, ни остатка:
+                        # пришла не карточка товара (заглушка, обрезанная
+                        # страница). Настоящая карточка без страны остаток
+                        # всё равно несёт.
+                        unread_details += 1
+                        log.warning(
+                            "aloe_country_detail_failed",
+                            country_id=country_id,
+                            url=product.url,
+                            error="no country label and no stock marker",
                         )
                         continue
                     code, status = country_resolution(raw)
@@ -391,6 +421,22 @@ class AloeScraper(BaseScraper):
                     # evidence that listing pagination or card parsing lost
                     # catalog rows. Keep the numeric ID unresolved so policy
                     # checks cannot mistake it for a verified country.
+                    #
+                    # Запоминаем id до конца сбора, только если прочитаны ВСЕ
+                    # взятые карточки: тогда отказ — ответ сайта, и следующая
+                    # страница скажет то же самое. Непрочитанная карточка
+                    # (сеть, 404, заглушка) ничего про страну не говорит —
+                    # такой id перепроверяется на следующей странице, иначе
+                    # один сбой оставил бы страну без названия на весь сбор.
+                    retry = unread_details > 0
+                    if not retry:
+                        self._unresolvable_country_ids.add(country_id)
+                    elif country_id in self._country_retry_logged:
+                        # Каждая неудачная карточка уже в логе отдельной
+                        # строкой; итог по id на каждой странице не повторяем.
+                        continue
+                    else:
+                        self._country_retry_logged.add(country_id)
                     log.warning(
                         "aloe_country_id_unresolved",
                         country_id=country_id,
@@ -398,6 +444,8 @@ class AloeScraper(BaseScraper):
                         samples=len(samples),
                         required_samples=required_samples,
                         distinct_codes=len(codes),
+                        unread_details=unread_details,
+                        retry=retry,
                     )
                     continue
                 code, country_raw, source_url = samples[0]
