@@ -264,13 +264,21 @@ import _sbx
 _sbx.event("pnpm", argv=sys.argv[1:])
 """,
     "curl": r"""
+import re
 import sys
 
 import _sbx
 
 _sbx.event("curl", argv=sys.argv[1:])
-if (_sbx.SBX / "api-is-down").exists() and any(":8080" in arg for arg in sys.argv[1:]):
-    sys.exit(7)  # connection refused
+args = sys.argv[1:]
+state = _sbx.SBX / "api-state"
+if state.exists() and any(":8080" in arg for arg in args):
+    if state.read_text().strip() == "refuses connections":
+        sys.exit(7)
+    # Отвечает 500: curl считает это ошибкой только с -f / --fail.
+    if "--fail" in args or any(re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", arg) for arg in args):
+        sys.exit(22)
+    sys.exit(0)
 print('<html lang="ru">')
 """,
     "sleep": r"""
@@ -604,10 +612,15 @@ def run_workflow(
     ``without`` — шаги, которых как будто нет в workflow: так проверяется, что
     следующая проверка держит и одна. ``before`` — что сделать перед шагом.
     """
-    job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["deploy"]
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     # Стенд исполняет только то, что понимает. `continue-on-error`, `shell`,
-    # `working-directory`, `env` на уровне джобы меняют поведение раннера —
-    # молча пропустить их значило бы проверять не тот workflow.
+    # `working-directory`, `env` и `defaults` на любом уровне меняют поведение
+    # раннера — молча пропустить их значило бы проверять не тот workflow.
+    # (`on:` YAML читает как булево True.)
+    unknown = set(workflow) - {"name", True, "jobs"}
+    assert not unknown, f"стенд не знает ключи workflow: {sorted(map(str, unknown))}"
+    assert set(workflow["jobs"]) == {"deploy"}, "стенд исполняет одну джобу — deploy"
+    job = workflow["jobs"]["deploy"]
     unknown = set(job) - {"name", "runs-on", "concurrency", "steps"}
     assert not unknown, f"стенд не знает ключи джобы: {sorted(unknown)}"
     steps = job["steps"]
@@ -962,6 +975,22 @@ def test_production_revision_unknown_to_the_release_is_refused(tmp_path: Path) -
     _assert_production_untouched(sandbox, before, "0009_only_on_prod")
 
 
+def test_database_without_a_revision_is_refused_with_a_message(
+    pending_migration: Sandbox,
+) -> None:
+    sandbox = pending_migration
+    before = sandbox.live_digest()
+    with sqlite3.connect(sandbox.database) as connection:
+        connection.execute("DELETE FROM alembic_version")
+
+    result = run_workflow(sandbox, apply_migrations=True)
+
+    assert result.failed_step.name == PREFLIGHT_REVISION, result.describe()
+    assert "expected exactly one revision in alembic_version" in result.failed_step.stdout
+    assert sandbox.live_digest() == before
+    assert sandbox.events("rsync") == []
+
+
 @pytest.mark.parametrize("step", [VERIFY_GRAPH, MIGRATE])
 def test_release_altered_after_upload_is_not_executed(
     pending_migration: Sandbox, step: str
@@ -1020,14 +1049,15 @@ def test_failed_health_check_still_removes_the_staging_directory(
     assert sandbox.staging_dirs() == []
 
 
-def test_dead_api_fails_the_health_check(pending_migration: Sandbox) -> None:
+@pytest.mark.parametrize("api", ["refuses connections", "answers 500"])
+def test_dead_api_fails_the_health_check(pending_migration: Sandbox, api: str) -> None:
     """Фронтенд отвечает, API — нет: выкладка не должна считаться удачной.
 
     Раньше строка была `curl … && echo "API ok"`: слева от `&&` упавшая команда
     не останавливает скрипт с `set -e`, и шаг проходил по одному фронтенду.
     """
     sandbox = pending_migration
-    (sandbox.root / "api-is-down").touch()
+    (sandbox.root / "api-state").write_text(api, encoding="utf-8")
 
     result = run_workflow(sandbox, apply_migrations=True)
 
@@ -1052,4 +1082,11 @@ def test_stand_refuses_a_workflow_key_it_does_not_execute(
     monkeypatch.setattr(sys.modules[__name__], "WORKFLOW", altered)
 
     with pytest.raises(AssertionError, match="continue-on-error"):
+        run_workflow(pending_migration, apply_migrations=True)
+
+    # То же уровнем выше: `defaults` поменял бы оболочку каждого шага.
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    workflow["defaults"] = {"run": {"shell": "sh"}}
+    altered.write_text(yaml.safe_dump(workflow, sort_keys=False), encoding="utf-8")
+    with pytest.raises(AssertionError, match="defaults"):
         run_workflow(pending_migration, apply_migrations=True)

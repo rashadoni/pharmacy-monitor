@@ -112,7 +112,10 @@ jobs:
           )
           printf '%s\n' "$current_output"
           current_count=$(printf '%s\n' "$current_output" | sed '/^[[:space:]]*$/d' | wc -l)
-          test "$current_count" -eq 1
+          if [ "$current_count" -ne 1 ]; then
+            echo "::error::expected exactly one revision in alembic_version on production, found $current_count; refusing to deploy"
+            exit 1
+          fi
           current_revision=$(printf '%s\n' "$current_output" | awk 'NF {print $1}')
           if ! grep -Rqs --include='*.py' "revision: str = \"$current_revision\"" migrations/versions; then
             echo "::error::production DB revision $current_revision is absent from checkout; refusing rsync --delete"
