@@ -140,6 +140,8 @@ def _preload_snapshots(
 # compute_actions для 3000+ матчей занимает 15-30с. HTTP-handler с таймаутом
 # 15с возвращал 408 на 4 экранах из 11 (P0.1 PO Audit). Решение:
 # pre-compute после scrape success → DB-cache → serve из кэша.
+# Между сборами кэш пересчитывает `src/roi_refresh.py` — по заявке, командой
+# `pharmacy-monitor roi refresh`, тоже не в HTTP-обработчике.
 
 # Cache freshness threshold. Старше — игнорируем и показываем unavailable;
 # inline fallback запрещён, потому что он может прочитать непроверенные данные.
@@ -151,6 +153,24 @@ def _preload_snapshots(
 # `financial_inputs_are_fresh`, эпоха каталога и проверка superseded; этот порог
 # — только страховка поверх них.
 _CACHE_MAX_AGE_HOURS = max(site_max_age_hours(site) for site in ALL_SITES)
+
+# Машинные причины отказа (`RecommendationsNotComputed.reason`); третья —
+# `policy_gate:<почему>`. Пересчёт без сбора имеет смысл только после первой:
+# незавершённый прогон когда-нибудь завершится или будет снят как осиротевший.
+NOT_COMPUTED_RUN_UNFINISHED = "run_unfinished"
+NOT_COMPUTED_INPUTS_UNVERIFIED = "inputs_unverified"
+
+
+class RecommendationsNotComputed(Exception):
+    """Расчёт не состоялся: это «не знаем», а не «рекомендаций нет».
+
+    Бросает сам расчёт, поэтому сохранить его результат как ответ, не заметив
+    отказа, нельзя. `reason` — машинная причина, см. константы выше.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"recommendations were not computed: {reason}")
+        self.reason = reason
 
 
 def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
@@ -238,6 +258,10 @@ def cache_actions(
 
     Безопасно вызывать многократно — UNIQUE(tenant_id, client_site) гарантирует
     один row per срез. Никаких внешних зависимостей, sync операция.
+
+    Несвежие входы — тот же отказ `RecommendationsNotComputed`, что в расчёте:
+    порог свежести может быть перейдён, пока срез считался. Чужой или
+    непроверенный прогон — ошибка вызывающего, ValueError.
     """
     from src.storage import RoiActionsCache
 
@@ -245,7 +269,7 @@ def cache_actions(
     if run is None or run.tenant_id != tenant_id or not storage.run_is_financially_eligible(run):
         raise ValueError("ROI cache requires a financially eligible full-catalog run")
     if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
-        raise ValueError("ROI cache requires fresh verified full-catalog inputs for every site")
+        raise RecommendationsNotComputed(NOT_COMPUTED_INPUTS_UNVERIFIED)
     from src.product_policy import policy_fingerprint, trusted_catalog_epoch
 
     payload = [_action_to_dict(a) for a in actions]
@@ -428,20 +452,35 @@ def refresh_all_cached_actions(
     run_id: int | None = None,
     tenant_id: int = 1,
 ) -> dict[str, int]:
-    """Пересчитать кэш для всех 3 сайтов. Вызывается из main.py после
-    подтверждённого full-catalog run. Возвращает {site: count}.
+    """Пересчитать кэш для всех 3 сайтов. Возвращает {site: count}.
+
+    Зовут двое: конец подтверждённого full-catalog run в main.py (держит
+    эксклюзивную блокировку сбора) и `roi_refresh.refresh_from_trusted_epoch`
+    (держит shared). Сама функция блокировку не берёт.
+
+    Если расчёт не состоялся (закрыт гейт политики, есть незавершённый прогон,
+    входы не свежие), бросает `RecommendationsNotComputed`: пустой список лёг бы
+    в кэш как ответ «рекомендаций нет», а удалять прежний ответ не за что. Срезы,
+    посчитанные до отказа, остаются записанными — что с ними делать, решает
+    вызывающий. Это не сбой среза: сбой по-прежнему даёт -1 в ответе, и отказ на
+    следующем срезе его не отменяет — тогда возвращается ответ с -1.
     """
     run = session.get(Run, run_id) if run_id is not None else None
     if run is None or run.tenant_id != tenant_id or not storage.run_is_financially_eligible(run):
         raise ValueError("ROI refresh requires a financially eligible full-catalog run")
     if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
-        raise ValueError("ROI refresh requires fresh verified full-catalog inputs for every site")
+        raise RecommendationsNotComputed(NOT_COMPUTED_INPUTS_UNVERIFIED)
     out: dict[str, int] = {}
     for site in ALL_SITES:
         try:
             actions = _compute_actions_locked(session, client_site=site, tenant_id=tenant_id)
             cache_actions(session, site, actions, run_id=run_id, tenant_id=tenant_id)
             out[site] = len(actions)
+        except RecommendationsNotComputed:
+            if any(count < 0 for count in out.values()):
+                # Сбой среза уже случился, отказ после него сбоя не отменяет.
+                return out
+            raise
         except Exception as e:
             log.warning(
                 "roi_actions_cache_failed",
@@ -469,7 +508,11 @@ def compute_actions(
     max_per_type: int | None = None,
     min_margin_pct: float | None = None,
 ) -> list[ActionItem]:
-    """External live computation guarded against concurrent scrape writes."""
+    """External live computation guarded against concurrent scrape writes.
+
+    Отдаёт [] и тогда, когда считать нельзя, поэтому результат нельзя сохранять
+    как ответ — кэш пишет только `refresh_all_cached_actions`.
+    """
     with try_shared_scrape_read_lock(session) as acquired:
         if not acquired:
             log.warning(
@@ -478,16 +521,20 @@ def compute_actions(
                 tenant_id=tenant_id,
             )
             return []
-        return _compute_actions_locked(
-            session,
-            client_site=client_site,
-            tenant_id=tenant_id,
-            raise_threshold_pct=raise_threshold_pct,
-            undercut_threshold_pct=undercut_threshold_pct,
-            max_spread_pct=max_spread_pct,
-            max_per_type=max_per_type,
-            min_margin_pct=min_margin_pct,
-        )
+        try:
+            return _compute_actions_locked(
+                session,
+                client_site=client_site,
+                tenant_id=tenant_id,
+                raise_threshold_pct=raise_threshold_pct,
+                undercut_threshold_pct=undercut_threshold_pct,
+                max_spread_pct=max_spread_pct,
+                max_per_type=max_per_type,
+                min_margin_pct=min_margin_pct,
+            )
+        except RecommendationsNotComputed:
+            # Живому читателю «не знаем» и «нет» показывать одинаково.
+            return []
 
 
 def _compute_actions_locked(
@@ -502,6 +549,10 @@ def _compute_actions_locked(
     min_margin_pct: float | None = None,
 ) -> list[ActionItem]:
     """Главная точка: собрать все действия, отсортировать по spread desc.
+
+    Когда считать нельзя (закрыт гейт политики, есть незавершённый прогон, входы
+    не свежие), бросает `RecommendationsNotComputed` и ничего не пишет. Пустой
+    список здесь — всегда посчитанный ответ «рекомендаций нет».
 
     `client_site` (optional) — какой сайт рассматривать как «свой» (с perspective
     которого считаем undercut/raise/assortment-gap). По умолчанию используется
@@ -522,7 +573,23 @@ def _compute_actions_locked(
     rollout = policy_rollout_eligibility(session, tenant_id=tenant_id)
     if not rollout.eligible:
         log.warning("roi_policy_gate_closed", reason=rollout.reason, tenant_id=tenant_id)
-        return []
+        raise RecommendationsNotComputed(f"policy_gate:{rollout.reason}")
+
+    if storage.has_unfinished_run(session, tenant_id=tenant_id):
+        log.warning(
+            "roi_compute_run_in_progress",
+            client_site=client_site or CLIENT_SITE,
+            tenant_id=tenant_id,
+        )
+        raise RecommendationsNotComputed(NOT_COMPUTED_RUN_UNFINISHED)
+
+    if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
+        log.warning(
+            "roi_compute_inputs_unverified",
+            client_site=client_site or CLIENT_SITE,
+            tenant_id=tenant_id,
+        )
+        raise RecommendationsNotComputed(NOT_COMPUTED_INPUTS_UNVERIFIED)
 
     # Load per-tenant config (creates default row if missing).
     cfg = storage.load_pricing_config(session, tenant_id)
@@ -534,22 +601,6 @@ def _compute_actions_locked(
     max_spread = max_spread_pct if max_spread_pct is not None else cfg.max_spread_pct
     per_type = max_per_type if max_per_type is not None else cfg.max_per_type
     min_margin = min_margin_pct if min_margin_pct is not None else cfg.min_margin_pct
-
-    if storage.has_unfinished_run(session, tenant_id=tenant_id):
-        log.warning(
-            "roi_compute_run_in_progress",
-            client_site=client_site or CLIENT_SITE,
-            tenant_id=tenant_id,
-        )
-        return []
-
-    if not financial_inputs_are_fresh(session, tenant_id=tenant_id):
-        log.warning(
-            "roi_compute_inputs_unverified",
-            client_site=client_site or CLIENT_SITE,
-            tenant_id=tenant_id,
-        )
-        return []
 
     effective_client = client_site or CLIENT_SITE
     if effective_client not in ALL_SITES:
