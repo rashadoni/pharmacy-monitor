@@ -1855,8 +1855,10 @@ def refresh_derived_fields(session: Session, *, tenant_id: int = 1) -> int:
     return changed
 
 
-# Товар считается пропавшим с сайта, если не встретился в двух полных сборах подряд.
+# Строка считается пропавшей с сайта, если её не видели дольше двух циклов сбора…
 _STALE_MEMBER_CYCLES = 2
+# …и при этом за то же время видели хотя бы половину каталога сайта.
+_STALE_RELINK_MIN_FRESH_SHARE = 0.5
 
 
 def relink_stale_members(
@@ -1871,9 +1873,16 @@ def relink_stale_members(
     может: место её сайта в кластере занято.
 
     Двойник — строка того же сайта без пары, виденная в свежем сборе, с тем же
-    адресом страницы либо с тем же названием, дозой и фасовкой. Он должен быть
-    единственным и не конфликтовать с остальными членами кластера. Ручные
-    кластеры не трогаем. Возвращает список передач; при `dry_run` БД не меняется.
+    нормализованным названием, дозой и фасовкой. Он должен быть единственным
+    (среди нескольких решает совпадение адреса страницы) и не конфликтовать ни
+    со сменяемой строкой, ни с остальными членами кластера. Одного совпадения
+    адреса мало: на aptekonline оттенки краски и модели очков делят один URL.
+
+    Сайт пропускается, если недавно видели меньше половины его каталога:
+    «строку давно не видели» тогда значит «полный сбор не проходил» (идут только
+    частичные тики), а не «товар ушёл с сайта».
+    Ручные кластеры не трогаем. Возвращает список передач; при `dry_run` БД не
+    меняется.
     """
     from datetime import timedelta
 
@@ -1892,22 +1901,32 @@ def relink_stale_members(
     def is_stale(product: Product) -> bool:
         return product.last_seen_at is None or product.last_seen_at < stale_before(product.site)
 
-    by_url: dict[tuple, list[Product]] = defaultdict(list)
+    seen_recently: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # сайт → [свежих, всего]
+    for product in products:
+        if product.url_dead_at is None:
+            seen_recently[product.site][0] += not is_stale(product)
+            seen_recently[product.site][1] += 1
+    fully_scraped = {
+        site
+        for site, (fresh, total) in seen_recently.items()
+        if fresh >= total * _STALE_RELINK_MIN_FRESH_SHARE
+    }
+
+    def identity(product: Product) -> tuple:
+        return (product.site, product.name_normalized, product.dosage, product.pack_size)
+
     by_name: dict[tuple, list[Product]] = defaultdict(list)
     members: dict[int, list[Product]] = defaultdict(list)
     for product in products:
         if product.canonical_id is not None:
             members[product.canonical_id].append(product)
         elif (
-            not is_stale(product)
+            product.site in fully_scraped
+            and not is_stale(product)
             and product.url_dead_at is None
             and _unmatchable_reason(product) is None
         ):
-            if product.url:
-                by_url[(product.site, product.url)].append(product)
-            by_name[
-                (product.site, product.name_normalized, product.dosage, product.pack_size)
-            ].append(product)
+            by_name[identity(product)].append(product)
 
     manual_ids = set(
         session.scalars(
@@ -1921,12 +1940,9 @@ def relink_stale_members(
             continue
         lineup = list(cluster)  # состав кластера с учётом уже сделанных передач
         for stale in [member for member in cluster if is_stale(member)]:
-            twins = by_url.get((stale.site, stale.url)) if stale.url else None
-            if not twins:
-                twins = by_name.get(
-                    (stale.site, stale.name_normalized, stale.dosage, stale.pack_size), []
-                )
-            twins = [twin for twin in twins if twin.id not in taken]
+            twins = [twin for twin in by_name.get(identity(stale), []) if twin.id not in taken]
+            if len(twins) > 1 and stale.url:
+                twins = [twin for twin in twins if twin.url == stale.url]
             if len(twins) != 1:
                 continue
             twin = twins[0]
@@ -1970,7 +1986,7 @@ def relink_stale_members(
             "matcher_stale_members_relinked",
             count=len(relinked),
             dry_run=dry_run,
-            pairs=[(item["old"], item["new"]) for item in relinked[:50]],
+            pairs=[(item["match_id"], item["old"], item["new"]) for item in relinked],
         )
     return relinked
 
@@ -2277,8 +2293,11 @@ def match_products(
     Возвращает количество новых/обновлённых связок.
     """
     acquire_match_mutation_xact_lock(session)
+    # По id: проходы жадные, и при равных кандидатах пару получает тот, кто
+    # раньше в списке. Без сортировки порядок — физический порядок строк, а его
+    # меняет любой UPDATE (в том числе пересчёт выводимых полей).
     products = session.scalars(
-        select(Product).where(Product.tenant_id == tenant_id)
+        select(Product).where(Product.tenant_id == tenant_id).order_by(Product.id)
     ).all()
     if not products:
         return 0

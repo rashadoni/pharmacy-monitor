@@ -5371,14 +5371,15 @@ def run_cmd(
                 # после правки нормализации сайты неделю сравниваются в разной
                 # записи. Затем отдаём место в кластере живым двойникам строк,
                 # которые сбор больше не видит.
-                # Оба шага — подготовка: их сбой откатывается к точке
-                # сохранения и не отменяет само сопоставление.
-                try:
-                    with session.begin_nested():
-                        matcher.refresh_derived_fields(session)
-                        matcher.relink_stale_members(session)
-                except Exception as _pe:
-                    log.error("matcher_preparation_failed", error=str(_pe))
+                # Оба шага — подготовка: сбой каждого откатывается к своей
+                # точке сохранения и не отменяет ни второй шаг, ни само
+                # сопоставление.
+                for _prepare in (matcher.refresh_derived_fields, matcher.relink_stale_members):
+                    try:
+                        with session.begin_nested():
+                            _prepare(session)
+                    except Exception:
+                        log.exception("matcher_preparation_failed", step=_prepare.__name__)
                 matcher.match_products(session)
                 # Auto-revalidate: match_products линкует широко (bucket+fuzzy) и НЕ
                 # блокирует guard-конфликты в primary-проходе → бренд/состав/вариант/сила

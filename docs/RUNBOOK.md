@@ -499,6 +499,65 @@ sudo systemctl restart pharmacy-monitor-telegram
 sudo journalctl -u pharmacy-monitor-dashboard -n 20
 ```
 
+### Выкладка правок сопоставления (`src/matcher.py`, `src/normalize.py`)
+
+**Сливать в `main` и выкладывать — за один присест.** У пайплайна два
+исполнителя, и код они берут из разных мест:
+
+- еженедельный сбор pharmonline (`autonomous-pharmonline-decodo-public-api.yml`,
+  понедельник 03:20 UTC) делает checkout `main` и запускает пайплайн из своей
+  копии `src/` — для него слияние в `main` уже и есть выкладка;
+- таймеры на сервере (watchlist, intraday, ночные сборы) работают из копии,
+  которую положил `deploy.yml`.
+
+Если правила сопоставления в этих двух копиях разные, они портят работу друг
+друга: новый код создаёт пару, старый `revalidate_split` после следующего тика
+считает её конфликтом, распускает и пишет постоянный отказ в
+`match_rejections` (`reason_type` `system_spec`). Отказ переживает выкладку —
+пара не вернётся, пока его не снимут. Так было бы, например, с Veqovi: старое
+правило дозы видит «0.25 mq (0.68 mq/ml)» и «0.25 mq/doza 1 mq» как разные дозы.
+
+**Перед выкладкой** — снять состояние сопоставления и унести его с сервера
+(ночной бэкап лежит на том же хосте):
+
+```bash
+sudo -u postgres psql -X pharmacy_monitor -c "\copy (select id, canonical_id, name_normalized, dosage, pack_size from products) to '/tmp/pm-matching-before.csv' csv"
+```
+
+```bash
+sudo -u postgres psql -X -At pharmacy_monitor -c "select 'matches', max(id) from matches union all select 'match_rejections', max(id) from match_rejections union all select 'match_policy_audits', max(id) from match_policy_audits"
+```
+
+**После выкладки** — один прогон под присмотром (ближайший тик или
+`systemctl start pharmacy-monitor-watchlist.service`) и сверка с замером из PR.
+В journald: `matcher_derived_fields_refreshed`, `matcher_stale_members_relinked`,
+`matcher_done`; `matcher_preparation_failed` быть не должно. Первый полный сбор
+после выкладки пришлёт одно письмо с алертами по всем новым парам, где конкурент
+дешевле, — это ожидаемо.
+
+**Откат — сначала данные, потом код.** Просто вернуть код нельзя: старый
+`revalidate_split` начнёт распускать новые пары с постоянными отказами.
+
+1. Остановить таймеры (`systemctl list-timers 'pharmacy-monitor*'`, затем
+   `systemctl stop` для scrape/intraday/watchlist) и не запускать сбор pharmonline.
+2. Пока на сервере новый код, вернуть назначения из снятого файла (`:m` —
+   сохранённый `max(id)` из `matches`):
+
+   ```sql
+   create temp table before (id int primary key, canonical_id int, name_normalized text, dosage text, pack_size text);
+   \copy before from '/tmp/pm-matching-before.csv' csv
+   begin;
+   update products p set canonical_id = b.canonical_id, name_normalized = b.name_normalized,
+          dosage = b.dosage, pack_size = b.pack_size
+     from before b where p.id = b.id;
+   update products set canonical_id = null where canonical_id > :m;
+   delete from matches where id > :m;
+   commit;
+   ```
+
+3. Вернуть `main` (revert merge-коммита), дождаться зелёного CI, выложить
+   `deploy.yml`, включить таймеры.
+
 ---
 
 ## 📊 Регулярные проверки

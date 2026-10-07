@@ -598,3 +598,51 @@ def test_relink_checks_twins_against_each_other(db_session):
 
     assert len(relinked) == 1
     assert sum(1 for twin in twins if twin.canonical_id == match.id) == 1
+
+
+def test_relink_needs_the_same_name_not_just_the_same_url(db_session):
+    """На aptekonline оттенки краски и модели очков делят один адрес страницы."""
+    match = storage.Match(tenant_id=1, canonical_name="Maxx Deluxe 6.0", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    url = "https://aptekonline.example/product/kr-maxx-deluxe"
+    old = _product(
+        db_session,
+        "aptekonline",
+        'Saç boyası "Maxx Deluxe" 6.0 tünd sarışın 2x50 ml',
+        external_id="shade-6",
+        url=url,
+        canonical_id=match.id,
+        last_seen_at=utcnow() - timedelta(days=120),
+    )
+    _product(
+        db_session, "pharmonline", "Saç boyası Maxx Deluxe 6.0 tünd sarışın", canonical_id=match.id
+    )
+    other_shade = _product(
+        db_session,
+        "aptekonline",
+        'Saç boyası "Maxx Deluxe" 7.1 küllü sarışın 2x50 ml',
+        external_id="shade-7",
+        url=url,
+    )
+    db_session.commit()
+
+    assert matcher.relink_stale_members(db_session) == []
+    assert (old.canonical_id, other_shade.canonical_id) == (match.id, None)
+
+
+def test_relink_waits_until_most_of_the_site_catalog_was_seen_recently(db_session):
+    """Идут только частичные тики: «давно не видели» — это «сбор не проходил»."""
+    match, old, _partner, twin = _stale_cluster(db_session, twin_url_same=True)
+    for i in range(3):
+        _product(
+            db_session,
+            "pharmonline",
+            f"Unseen product {i} № 10",
+            external_id=f"unseen-{i}",
+            last_seen_at=utcnow() - timedelta(days=120),
+        )
+    db_session.commit()
+
+    assert matcher.relink_stale_members(db_session) == []
+    assert (old.canonical_id, twin.canonical_id) == (match.id, None)
