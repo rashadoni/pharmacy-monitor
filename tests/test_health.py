@@ -431,16 +431,53 @@ def test_overdue_full_collection_is_reported_even_when_partial_ticks_keep_the_si
     assert rep.status == "critical"
 
 
-def test_full_collection_inside_its_cadence_is_not_overdue(db_session):
-    """Шестой день после недельного сбора — штатно."""
-    run = _verified_full_run(db_session, hours_ago=150)
-    for site in ("pharmonline", "aptekonline", "aloe"):
-        _add_snap(db_session, run, site, 10, last_seen_at=utcnow() - timedelta(hours=150))
+def test_full_collection_is_overdue_only_past_cadence_plus_grace(db_session):
+    """Порог сторожа — ритм сайта с запасом (174ч), а не сам ритм (168ч).
+
+    Между недельными сборами проходит до 169ч (перевод часов), и новый сбор
+    ещё должен успеть закончиться. Сторож на 168ч кричал бы каждую осень.
+    """
+    from src.cadence import site_max_age_hours
+
+    assert site_max_age_hours("aloe") == 174
+    run = _verified_full_run(db_session, hours_ago=173)
+    db_session.commit()
+    assert not any(i.code == "full_catalog_overdue" for i in check_health(db_session).issues)
+
+    run.started_at = utcnow() - timedelta(hours=175)
+    run.finished_at = run.started_at + timedelta(minutes=1)
+    db_session.commit()
+    overdue = {
+        i.context["site"] for i in check_health(db_session).issues if i.code == "full_catalog_overdue"
+    }
+    assert overdue == {"pharmonline", "aptekonline", "aloe"}
+
+
+def test_overdue_is_reported_when_every_retry_since_was_degraded(db_session):
+    """Неделя degraded-повторов оставляет данные такими же старыми, как неделя пропусков."""
+    _verified_full_run(db_session, hours_ago=200)
+    retry = Run(
+        started_at=utcnow() - timedelta(hours=3),
+        finished_at=utcnow() - timedelta(hours=2),
+        status="degraded",
+        products_scraped=10,
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=False,
+        run_quality={
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"aloe": {"status": "degraded"}},
+        },
+    )
+    db_session.add(retry)
     db_session.commit()
 
     rep = check_health(db_session)
 
-    assert not any(i.code == "full_catalog_overdue" for i in rep.issues)
+    overdue = {i.context["site"] for i in rep.issues if i.code == "full_catalog_overdue"}
+    assert "aloe" in overdue
+    assert rep.status == "critical"
 
 
 def test_failed_run_critical(db_session):

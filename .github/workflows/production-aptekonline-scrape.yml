@@ -32,12 +32,23 @@ jobs:
           set -euo pipefail
           ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             cd /opt/pharmacy-monitor
-            if systemctl is-active --quiet pharmacy-monitor-scrape@aptekonline.service; then
+            # The unit is Type=oneshot: while its scrape runs (or waits for the
+            # scrape lock) it is "activating" and never "active", so is-active
+            # would report it as idle and --force below would pay for a second
+            # collection right behind the scheduled one.
+            unit=pharmacy-monitor-scrape@aptekonline.service
+            scrape_running() {
+              case "$(systemctl show -p ActiveState --value "$unit")" in
+                activating|active) return 0 ;;
+                *) return 1 ;;
+              esac
+            }
+            if scrape_running; then
               echo "an aptekonline systemd scrape is already running; waiting for it"
-              while systemctl is-active --quiet pharmacy-monitor-scrape@aptekonline.service; do
+              while scrape_running; do
                 sleep 30
               done
-              test "$(systemctl show -p Result --value pharmacy-monitor-scrape@aptekonline.service)" = success
+              test "$(systemctl show -p Result --value "$unit")" = success
               exit 0
             fi
             while IFS= read -r line || [ -n "$line" ]; do

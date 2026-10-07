@@ -141,9 +141,6 @@ def _preload_snapshots(
 # 15с возвращал 408 на 4 экранах из 11 (P0.1 PO Audit). Решение:
 # pre-compute после scrape success → DB-cache → serve из кэша.
 
-# Порог свежести входных данных для сайта без объявленного ритма сбора.
-_UNDECLARED_SITE_MAX_AGE_HOURS = 26
-
 # Cache freshness threshold. Старше — игнорируем и показываем unavailable;
 # inline fallback запрещён, потому что он может прочитать непроверенные данные.
 #
@@ -158,8 +155,6 @@ _CACHE_MAX_AGE_HOURS = max(site_max_age_hours(site) for site in ALL_SITES)
 
 def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
     """Every site must have verified lineage within its real scrape cadence."""
-    from src.health import _SITE_MAX_AGE_HOURS
-
     run_ids = storage.latest_financial_run_ids_by_site(
         session,
         ALL_SITES,
@@ -205,7 +200,7 @@ def financial_inputs_are_fresh(session: Session, *, tenant_id: int) -> bool:
         run = runs.get(run_id)
         if run is None:
             return False
-        max_age_hours = _SITE_MAX_AGE_HOURS.get(site, _UNDECLARED_SITE_MAX_AGE_HOURS)
+        max_age_hours = site_max_age_hours(site)
         if now - run.started_at > timedelta(hours=max_age_hours):
             return False
     return True
