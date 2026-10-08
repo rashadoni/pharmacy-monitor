@@ -305,6 +305,27 @@ def test_cleanup_rerun_with_same_csv_adds_no_rows(cleanup_db, tmp_path):
     assert rows == 2
 
 
+def test_cleanup_counts_confirmed_pairs_per_row_not_new_records(cleanup_db, tmp_path, capsys):
+    """`rejections_written` — подтверждённые пары по строкам, а не новые записи.
+
+    Строка добавляет в счёт пары «её товар — участник кластера на момент
+    строки», по которым отказ в силе, в том числе уже существовавшие. Здесь
+    кластер из трёх и одна строка: её повтор в файле и повторный запуск считают
+    те же две пары ещё раз, записей не добавляя. Так задумано: ноль значил бы
+    «ничего не защищено», а не «всё уже было».
+    """
+    (match_id,), ids = _seed(cleanup_db, [("x", 1), ("y", 1), ("z", 1)])
+    row = (match_id, ids["x"])
+
+    assert cleanup(_write_csv(tmp_path, row, row), apply=True) == 4
+    assert cleanup(_write_csv(tmp_path, row), apply=True) == 2
+
+    out = capsys.readouterr().out
+    assert "rejections_written=4 matches_dissolved=0 skipped=0" in out
+    assert "rejections_written=2 matches_dissolved=0 skipped=0" in out
+    assert len(_committed_pairs(cleanup_db)) == 2
+
+
 def test_cleanup_reactivates_a_resolved_rejection(cleanup_db, tmp_path):
     """Снятый раньше отказ строка «уже отвязан» включает снова — и это сохраняется."""
     (match_id,), ids = _seed(cleanup_db, [("a", 1), ("b", 1)], loose=("gone", 1))
@@ -369,6 +390,72 @@ def test_cleanup_survives_the_same_row_twice(cleanup_db, tmp_path):
         _pair(ids["x"], ids["y"]),
         _pair(ids["x"], ids["z"]),
     }
+
+
+def _clusters(url: str) -> tuple[dict[str, int | None], set[int]]:
+    """Привязки товаров (external_id → кластер) и id живых кластеров."""
+    return _in_new_session(
+        url,
+        lambda s: (
+            {
+                ext: canonical_id
+                for ext, canonical_id in s.execute(
+                    select(storage.Product.external_id, storage.Product.canonical_id)
+                )
+            },
+            set(s.scalars(select(storage.Match.id))),
+        ),
+    )
+
+
+@pytest.mark.parametrize("detached_row_between", [False, True])
+def test_cleanup_two_rows_of_one_cluster_dissolve_it(
+    cleanup_db, tmp_path, capsys, detached_row_between
+):
+    """Пример из шапки скрипта: две строки на один кластер из трёх товаров.
+
+    Вторая отвязка видела в сессии состав до первой: писала отказ с уже
+    отвязанным товаром и оставляла кластер из одного товара. Итог не должен
+    зависеть и от того, стоит ли между строками строка «уже отвязан» — она
+    перечитывает состав сама.
+    """
+    (match_id,), ids = _seed(cleanup_db, [("x", 1), ("y", 1), ("z", 1)], loose=("gone", 1))
+    rows = [(match_id, ids["x"]), (match_id, ids["y"])]
+    expected = {_pair(ids["x"], ids["y"]), _pair(ids["x"], ids["z"]), _pair(ids["y"], ids["z"])}
+    if detached_row_between:
+        rows.insert(1, (match_id, ids["gone"]))
+        expected |= {_pair(ids["gone"], ids["y"]), _pair(ids["gone"], ids["z"])}
+
+    written = cleanup(_write_csv(tmp_path, *rows), apply=True)
+
+    out = capsys.readouterr().out
+    assert _clusters(cleanup_db) == ({"x": None, "y": None, "z": None, "gone": None}, set())
+    assert _committed_pairs(cleanup_db) == expected
+    # Отчёт совпадает с базой: каждый отказ посчитан один раз, кластер распущен.
+    assert written == len(expected)
+    assert f"rejections_written={len(expected)} matches_dissolved=1 skipped=0" in out
+    # Вторая строка печатает кластер таким, каким он стал после первой.
+    assert f"detach product_id={ids['y']} (cluster size 2)" in out
+
+
+def test_cleanup_skips_a_row_of_a_cluster_this_run_dissolved(cleanup_db, tmp_path, capsys):
+    """Три строки на кластер из трёх: вторая его распускает, третьей делать нечего.
+
+    Раньше третья отвязывала последний товар от кластера, которого не должно
+    было остаться, — и оставляла в базе кластер без единого товара.
+    """
+    (match_id,), ids = _seed(cleanup_db, [("x", 1), ("y", 1), ("z", 1)])
+    csv_path = _write_csv(
+        tmp_path, (match_id, ids["x"]), (match_id, ids["y"]), (match_id, ids["z"])
+    )
+
+    written = cleanup(csv_path, apply=True)
+
+    out = capsys.readouterr().out
+    assert _clusters(cleanup_db) == ({"x": None, "y": None, "z": None}, set())
+    assert written == len(_committed_pairs(cleanup_db)) == 3
+    assert f"SKIP: match_id={match_id} not found" in out
+    assert "rejections_written=3 matches_dissolved=1 skipped=1" in out
 
 
 def test_cleanup_keeps_already_detached_row_when_a_later_row_fails(
