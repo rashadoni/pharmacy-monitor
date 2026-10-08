@@ -162,20 +162,101 @@ sudo journalctl -u pharmacy-monitor-run -f
 
 ### Email не приходит
 
-**Симптом:** клиент не получает ежедневный отчёт.
+**Симптом:** получатель не получил письмо — о прогоне, дайджест, ссылку на вход.
 
-**Действия:**
+Адресов в журнале нет: получатель назван `user_id`, ошибка — классом и кодом
+ответа SMTP. Почему так — ниже, «Адреса в журнал не пишутся».
+
+**1. Что сказал журнал.** Где он лежит, зависит от того, кто слал:
+
+- плановые сборы — `journalctl -u 'pharmacy-monitor-scrape@*' --since '2 days ago'`;
+- еженедельный сбор pharmonline — журнал шага GitHub Actions, `gh run view <id> --log`;
+- письмо админу с тика — `-u pharmacy-monitor-intraday`;
+- недельный дайджест — `-u pharmacy-monitor-digest-weekly`;
+- письмо о здоровье — `-u pharmacy-monitor-health`;
+- ссылка на вход — `-u pharmacy-monitor-api`.
+
+| В журнале | Что значит |
+|---|---|
+| `smtp_send recipients=N`, следом `smtp_sent_ok` | Почтовый сервер письмо принял. Дальше — не у нас: доставку смотреть в кабинете Resend |
+| `…_failed user_id=… error_type=…` | Не ушло; причина — в `error_type`, таблица ниже. События: `email_batch_failed` (письмо о прогоне и письмо админу с тика), `digest_email_failed`, `login_link_email_failed`, `email_dispatch_failed`, `alert_email_failed`, `error_email_failed`. Строки `smtp_send` перед ним может и не быть: до разговора с сервером дело не дошло |
+| `email_skipped_no_smtp` | В окружении нет `SMTP_HOST` — обычно ручной запуск без загруженного env |
+| Нет ни `smtp_send`, ни `…_failed` | Письмо и не собирались слать: нет событий, порог важности получателя, включённый `daily_digest`, запуск с `--no-alerts` |
+
+**2. Что значит `error_type`.** Рядом с ним — числа, по которым случаи
+различаются: `smtp_code` (ответ сервера, 550), `smtp_status` (уточнение из того
+же ответа, `5.1.1`), у сетевых ошибок — `errno`.
+
+| `error_type` | Причина |
+|---|---|
+| `SMTPAuthenticationError` (535) | Не подходят `SMTP_USER` / `SMTP_PASSWORD` — ключ отозван или заменён |
+| `SMTPSenderRefused` | Сервер не принял отправителя: `SMTP_FROM`, домен не подтверждён |
+| `SMTPRecipientsRefused` | Сервер отказал в адресе получателя (`5.1.1` — такого ящика нет) — проверить адрес у пользователя `user_id` |
+| `SMTPDataError` | Письмо отклонено целиком: размер, лимит отправки, содержимое |
+| `SMTPServerDisconnected`, `TimeoutError`, `ConnectionRefusedError`, `gaierror`, `OSError` | Почтовый сервер недоступен или сеть |
+| `KeyError` | В окружении нет `SMTP_USER` или `SMTP_PASSWORD` |
+| `ValueError` | Некому слать: получатели не заданы |
+
+**3. Кто такой `user_id`** — на сервере (адрес остаётся в терминале оператора):
+
 ```bash
-# 1. Проверить SMTP credentials
-sudo -u pharmacy uv run --directory /opt/pharmacy-monitor python -c "
-from src import notifier
-notifier.send_email('test', '<p>Hi</p>', to=['admin@pharmonline.az'])
-"
+sudo -u postgres psql -X pharmacy_monitor -c \
+  "select id, email, role, is_active, email_severity_min, daily_digest, weekly_digest
+   from tenant_users where id = <user_id>;"
+```
 
-# 2. Получатель в БД?
-sudo -u pharmacy uv run --directory /opt/pharmacy-monitor pharmacy-monitor recipient list
+**4. Полный ответ сервера** в журнал не пишется. Его печатает проверка доставки,
+которую запускают руками:
 
-# 3. Gmail App Password rotated? Создать новый: https://myaccount.google.com/apppasswords
+```bash
+# на сервере, под pm, с загруженным env
+set -a; source /etc/pharmacy-monitor/env; set +a
+.venv/bin/pharmacy-monitor notify test --email <свой адрес>
+# email:    FAIL — SMTPDataError (SMTP 554 5.7.1): <ответ сервера, адреса вырезаны>
+```
+
+Проверка воспроизводит только отказ, который повторяется. От разового сбоя
+остаются класс ошибки и коды в журнале.
+
+Без `--email` тестовое письмо уйдёт по старому списку: таблица `recipients`, а
+если она пуста — `EMAIL_TO`.
+
+#### Адреса в журнал не пишутся
+
+Репозиторий публичный, и журнал шага GitHub Actions читает любой пользователь
+GitHub; хранится он 90 дней. Еженедельный сбор pharmonline идёт оттуда и
+рассылает письма о прогоне — всё, что команда печатает, оказывается в этом
+журнале. Получатели — администратор и сотрудник клиента.
+
+- Вызов журнала не получает ни адрес, ни Telegram-идентификатор: пишется
+  `user_id` или число получателей.
+- Текст ошибки отправки в журнал не идёт — smtplib кладёт адрес и в него.
+  Пишутся класс ошибки и код ответа: `**notifier.delivery_error_fields(exc)`.
+  Отказ SMTP выходит из `notifier.send_email` как `EmailDeliveryError` уже без
+  адреса в тексте — на случай, если ошибку поймают выше и напечатают целиком.
+- Вывод журнала CLI вырезает из готовой строки всё, что похоже на адрес
+  (`logging_setup.masking`), — последняя линия, а не разрешение писать адреса и
+  не защита секретов: шаблон простой, адрес необычной записи он вырежет не
+  целиком. Заодно под него попадает и не-адрес той же формы, например имя юнита
+  `…@….service`.
+
+Возврат ловит `tests/test_log_carries_no_address.py`: читает в `src/` вызовы
+журнала, `print` и `click.echo` и зовёт почтовые пути, у которых есть свой
+обработчик сбоя. Маска стоит только на журнале CLI. Мимо неё идут `click.echo`
+и `print`, а журнал API не замаскирован вовсе — он пишет в journald и наружу не
+выходит. Команды, которые печатают адрес по назначению, перечислены в том же
+тесте (`recipient …`, `tenant add-user`, `tenant issue-token` — последняя
+печатает ещё и токен входа), и он же следит, чтобы ни один workflow их не
+запускал. `telegram poll` печатает имена и идентификаторы из Telegram — тоже
+только руками.
+
+Если адрес в журнал Actions всё же попал — журнал прогона удаляется целиком,
+необратимо и только по слову владельца:
+
+```bash
+# сначала убедиться, что это тот прогон: строки журнала команды с адресом
+gh run view <id> --log | grep -E 'recipients=|user=|email=' | grep -c '@'
+gh api -X DELETE repos/rashadoni/pharmacy-monitor/actions/runs/<id>/logs
 ```
 
 ### Email — слишком много писем (volume controls)
@@ -238,7 +319,7 @@ per-user тумблеры daily/weekly (`tenant_users`, страница «По�
 ```bash
 # на сервере, под pm, с загруженным env (systemd-EnvironmentFile вручную не грузится)
 set -a; source /etc/pharmacy-monitor/env; set +a
-# ничего не шлёт: получатели, тема, размер и число строк — в логе
+# ничего не шлёт: получатель (`user_id`), тема, размер и число строк — в логе
 .venv/bin/pharmacy-monitor notify digest weekly --dry-run
 # шлёт одному адресу из тех, у кого дайджест включён
 .venv/bin/pharmacy-monitor notify digest weekly --only admin@example.com
