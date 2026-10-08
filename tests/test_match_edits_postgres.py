@@ -40,6 +40,7 @@ from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
+from structlog.testing import capture_logs
 
 from src import api, match_actions, match_lock, matcher
 from src import main as main_module
@@ -464,7 +465,7 @@ def _relink(db: Session, seeded: object) -> object:
     ids=["reject", "confirm", "relink", "add-product", "create-with-products"],
 )
 def test_an_edit_made_while_the_stage_runs_is_refused_and_changes_nothing(
-    engines, monkeypatch, edit
+    engines, monkeypatch, request, edit
 ):
     """Этап держит замок дольше, чем запрос готов ждать: отказ с кодом, база прежняя."""
     monkeypatch.setattr(api, "MATCH_EDIT_LOCK_WAIT_SECONDS", 0.3)
@@ -478,7 +479,11 @@ def test_an_edit_made_while_the_stage_runs_is_refused_and_changes_nothing(
     before = _stored(stage_engine)
     thread, outcome, statements = _request_thread(api_engine, lambda db: edit(db, seeded))
 
-    with stage_engine.connect() as connection, _session(connection) as stage:
+    with (
+        stage_engine.connect() as connection,
+        _session(connection) as stage,
+        capture_logs() as logs,
+    ):
         assert matcher.acquire_match_mutation_lock(stage, wait=False)
         try:
             thread.start()
@@ -487,10 +492,15 @@ def test_an_edit_made_while_the_stage_runs_is_refused_and_changes_nothing(
         finally:
             matcher.release_match_mutation_lock(stage)
             stage.commit()
-    thread.join(30)
+        thread.join(30)
 
     assert refused_while_the_stage_ran, "запрос ждал этап дольше отведённого"
     assert outcome == [409]
+    # В журнале отказ назван вместе с правкой: по нему видно, что не записалось.
+    refusals = [entry for entry in logs if entry["event"] == "match_edit_refused"]
+    assert [(entry["reason"], entry["action"]) for entry in refusals] == [
+        ("matching_in_progress", request.node.callspec.id)
+    ]
     assert [s for s in statements if any(table in s for table in _APP_TABLES)] == []
     assert _stored(stage_engine) == before
 

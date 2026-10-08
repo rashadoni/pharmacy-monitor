@@ -67,10 +67,12 @@ def acquire_match_mutation_xact_lock(session: Session) -> None:
     ожидания остаётся прежним — а этап за это время менял именно эти строки.
     """
     if _is_postgres(session):
+        _require_the_lock_connection(session)
         _take_xact_lock(session)
 
 
-def _take_xact_lock(session: Session) -> None:
+def _require_the_lock_connection(session: Session) -> None:
+    """Сессия, державшая сессионный замок, обязана быть на его соединении."""
     held = session.info.get(_LOCK_CONNECTION_INFO_KEY)
     if held is not None and not held.intact():
         # После обрыва или Ctrl-C и rollback сессия идёт уже через пул: без
@@ -78,6 +80,9 @@ def _take_xact_lock(session: Session) -> None:
         raise RuntimeError(
             "the session is no longer on the connection that holds the match mutation lock"
         )
+
+
+def _take_xact_lock(session: Session) -> None:
     session.scalar(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
         {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
@@ -100,6 +105,7 @@ def acquire_match_mutation_xact_lock_within(session: Session, seconds: float) ->
     """
     if not _is_postgres(session):
         return True
+    _require_the_lock_connection(session)
     # SET не принимает параметров; число собрано здесь же, не из запроса.
     session.execute(text(f"SET LOCAL lock_timeout = {max(1, round(seconds * 1000))}"))
     try:
