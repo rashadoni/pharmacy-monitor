@@ -31,7 +31,7 @@ from collections.abc import Callable, Iterator
 
 import pytest
 import structlog
-from sqlalchemy import Engine, create_engine, func, select, text
+from sqlalchemy import Engine, create_engine, event, func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -108,7 +108,7 @@ def engines(schema) -> Iterator[tuple[Callable[..., Engine], Engine]]:
     url, options = schema
     created: list[Engine] = []
 
-    def stage_engine(*, pool_recycle: int = 1800) -> Engine:
+    def stage_engine(*, pool_recycle: int = 1800, pool_pre_ping: bool = True) -> Engine:
         engine = create_engine(
             url,
             # По имени приложения сеансы «процесса этапа» отличимы от чужих в той же базе.
@@ -117,7 +117,7 @@ def engines(schema) -> Iterator[tuple[Callable[..., Engine], Engine]]:
             max_overflow=5,
             pool_timeout=10,
             pool_recycle=pool_recycle,
-            pool_pre_ping=True,
+            pool_pre_ping=pool_pre_ping,
             pool_use_lifo=True,
         )
         created.append(engine)
@@ -130,6 +130,15 @@ def engines(schema) -> Iterator[tuple[Callable[..., Engine], Engine]]:
         for engine in created:
             engine.dispose()
         with outsider.begin() as connection:
+            # Соединение замка — вне пула, dispose его не закрывает: упавший между
+            # взятием и снятием тест оставил бы замок всем следующим файлам.
+            connection.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE application_name = :application"
+                ),
+                {"application": _STAGE_APPLICATION},
+            )
             connection.execute(text("TRUNCATE products, matches CASCADE"))
         outsider.dispose()
 
@@ -211,14 +220,15 @@ def test_lock_survives_a_connection_the_pool_recycles_between_commits(engines):
     engine = make_stage_engine(pool_recycle=_POOL_RECYCLE_SECONDS)
 
     with _session(engine) as witness, _session(engine) as session:
-        # Свидетель — обычная сессия того же пула: по ней видно, что пул в этом
-        # прогоне действительно пересоздаёт соединение, а не тест прошёл впустую.
-        witness_pid = _backend_pid(witness)
-        witness.commit()
-
         assert matcher.acquire_match_mutation_lock(session, wait=True)
         holders = _lock_holders(outsider)
         assert len(holders) == 1
+
+        # Свидетель — обычная сессия того же пула: по ней видно, что пул в этом
+        # прогоне действительно пересоздаёт соединение, а не тест прошёл впустую.
+        # Соединение он берёт после замка: то, что лежало в пуле, забрал замок.
+        witness_pid = _backend_pid(witness)
+        witness.commit()
 
         session.execute(text("SELECT 1"))
         session.commit()
@@ -301,10 +311,15 @@ def test_edit_queued_behind_the_stage_runs_only_after_its_last_step(engines, mon
     monkeypatch.setattr(matcher, "flag_suspected_mismatches", flag_after_revalidate)
 
     def manual_edit() -> None:
-        with outsider.begin() as connection:
-            connection.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), _KEY)
-            # Отметка — до commit: этап не продолжит раньше, чем она поставлена.
-            order.append("manual edit")
+        try:
+            with outsider.begin() as connection:
+                # Правка ждёт весь этап; общий короткий lock_timeout здесь мешал бы.
+                connection.execute(text("SET LOCAL lock_timeout = '60s'"))
+                connection.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), _KEY)
+                # Отметка — до commit: этап не продолжит раньше, чем она поставлена.
+                order.append("manual edit")
+        except Exception as failed:
+            order.append(f"manual edit failed: {failed!r}")
 
     with _session(engine) as session, structlog.testing.capture_logs() as logs:
         # Как в конце сбора: сессия к этапу уже поработала и зафиксировала своё.
@@ -366,6 +381,28 @@ def test_release_leaves_the_open_transaction_to_its_owner(engines, ending):
         assert _backend_pid(session) != holders[0]
 
 
+def test_pool_never_gets_the_closed_lock_connection_back(engines):
+    """Соединение замка закрывается, а не возвращается в пул закрытым.
+
+    Замок забирает из пула то соединение, которым сессия пользовалась до этапа.
+    Вернись оно в пул после закрытия, следующий запрос сессии получил бы мёртвое
+    соединение; на проде это скрыл бы `pool_pre_ping`, здесь он выключен.
+    """
+    make_stage_engine, outsider = engines
+    engine = make_stage_engine(pool_pre_ping=False)
+
+    with _session(engine) as session:
+        before = _backend_pid(session)
+        session.commit()
+        assert matcher.acquire_match_mutation_lock(session, wait=True)
+        assert _lock_holders(outsider) == [before]
+        matcher.release_match_mutation_lock(session)
+
+        assert _backend_pid(session) != before
+        session.commit()
+    assert engine.pool.checkedout() == 0
+
+
 def test_busy_lock_is_refused_and_leaves_the_session_on_the_pool(engines, recwarn):
     """Замок занят: отказ, сессия остаётся на пуле, лишнего соединения не остаётся."""
     make_stage_engine, outsider = engines
@@ -416,6 +453,24 @@ def test_work_pending_before_the_lock_is_committed_not_lost(engines):
     assert _lock_holders(outsider) == []
 
 
+def test_refused_acquire_has_already_committed_the_open_transaction(engines):
+    """Фиксация идёт до попытки взять замок: при отказе работа сессии уже в базе."""
+    make_stage_engine, outsider = engines
+    engine = make_stage_engine()
+
+    with outsider.connect() as holder, _session(engine) as session:
+        assert holder.scalar(text("SELECT pg_try_advisory_lock(hashtext(:key))"), _KEY)
+        holder.commit()
+        _product(session, "aloe", "written-before-the-refusal")
+
+        assert matcher.acquire_match_mutation_lock(session, wait=False) is False
+
+        assert _products_seen_by(outsider) == 1
+        assert not session.in_transaction()
+        holder.scalar(text("SELECT pg_advisory_unlock(hashtext(:key))"), _KEY)
+        holder.commit()
+
+
 def test_session_bound_to_a_connection_keeps_the_lock_on_it(engines):
     """Сессию, которую вызывающий сам посадил на соединение, функция не перепривязывает."""
     make_stage_engine, outsider = engines
@@ -435,8 +490,14 @@ def test_session_bound_to_a_connection_keeps_the_lock_on_it(engines):
         assert _lock_holders(outsider) == []
 
 
-def test_lock_is_gone_even_when_it_could_not_be_released_by_query(engines):
-    """Транзакция этапа оборвана ошибкой SQL: снять замок запросом нельзя, но он не остаётся."""
+@pytest.mark.parametrize("ending", ["rollback", "close"])
+def test_lock_leaves_with_the_transaction_when_the_query_could_not_release_it(engines, ending):
+    """Транзакция этапа оборвана ошибкой SQL: снять замок запросом нельзя, но он не остаётся.
+
+    Соединение замка закрывается, как только сессия закончит на нём транзакцию:
+    в `rematch` и в `run` это выход из `with Session()` (обработчик сбоя `run`
+    на оборванной транзакции падает сам и до rollback не доходит).
+    """
     make_stage_engine, outsider = engines
     engine = make_stage_engine()
 
@@ -451,12 +512,70 @@ def test_lock_is_gone_even_when_it_could_not_be_released_by_query(engines):
         assert [entry["event"] for entry in logs] == ["matcher_lock_release_failed"]
         assert session.get_bind() is engine
 
-        # Так сессию приводит в порядок обработчик сбоя; вместе с транзакцией
-        # закрывается соединение замка — и замок уходит с ним.
-        session.rollback()
+        getattr(session, ending)()
         _wait_until_backend_is_gone(outsider, holders[0])
         assert _lock_holders(outsider) == []
         assert _outsider_can_take_the_lock(outsider)
+
+
+def test_lock_leaves_with_the_transaction_after_an_interrupt_mid_query(engines):
+    """Ctrl-C посреди запроса этапа: SQLAlchemy бросает соединение вне пула открытым.
+
+    После исключения-выхода он считает соединение потерянным и отпускает его;
+    пуловое при этом закрывается, а отсоединённое остаётся жить на сервере
+    вместе с замком — пока его не подберёт сборщик мусора. Закрываем сами.
+    """
+    make_stage_engine, outsider = engines
+    engine = make_stage_engine()
+
+    @event.listens_for(engine, "do_execute")
+    def interrupt(cursor, statement, parameters, context):
+        if "interrupted" in statement:
+            raise KeyboardInterrupt
+
+    with _session(engine) as session:
+        assert main_mod._acquire_matcher_lock(session, wait=True)
+        holders = _lock_holders(outsider)
+        # Ссылка держит объект соединения живым: сборщик мусора тест не выручит.
+        raw = session.info[matcher._LOCK_CONNECTION_INFO_KEY].raw
+        with pytest.raises(KeyboardInterrupt):
+            session.execute(text("SELECT 'interrupted'"))
+        main_mod._release_matcher_lock(session)
+
+        session.close()
+        assert raw.closed
+        _wait_until_backend_is_gone(outsider, holders[0])
+        assert _lock_holders(outsider) == []
+
+
+def test_step_refuses_to_continue_after_the_lock_connection_died(engines):
+    """Соединение замка оборвано: шаг этапа не продолжает на соединении из пула без замка."""
+    make_stage_engine, outsider = engines
+    engine = make_stage_engine()
+
+    with _session(engine) as session:
+        assert matcher.acquire_match_mutation_lock(session, wait=True)
+        holders = _lock_holders(outsider)
+        matcher.acquire_match_mutation_xact_lock(session)
+        session.commit()
+
+        with outsider.connect() as connection:
+            connection.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": holders[0]})
+            connection.commit()
+        with pytest.raises(DBAPIError):
+            session.execute(text("SELECT 1"))
+        # После rollback SQLAlchemy переподключает сессию через пул — уже без замка.
+        session.rollback()
+        assert _lock_holders(outsider) == []
+
+        with pytest.raises(RuntimeError, match="lock is gone"):
+            matcher.acquire_match_mutation_xact_lock(session)
+        with structlog.testing.capture_logs() as logs:
+            matcher.release_match_mutation_lock(session)
+        assert [entry["event"] for entry in logs] == ["matcher_lock_not_held_at_release"]
+        session.rollback()
+        assert session.get_bind() is engine
+    assert engine.pool.checkedout() == 0
 
 
 def test_second_acquire_on_the_same_session_is_refused(engines):
