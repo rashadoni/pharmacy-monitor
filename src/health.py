@@ -8,6 +8,7 @@
 2. **Failed**: последний run завершился со status='failed'
 3. **Empty**: последний run ok но < min_products (полностью пустой)
 4. **Site-drop**: сайт покрыл <50% живого каталога за окно покрытия
+5. **Catalog floor**: каталогу pharmonline осталось мало до нижней границы
 """
 
 from __future__ import annotations
@@ -32,7 +33,12 @@ from src.storage import PriceSnapshot, Product, Run
 log = structlog.get_logger()
 
 Severity = Literal["ok", "warning", "critical"]
-HealthAlertAction = Literal["incident", "reminder", "recovery"]
+HealthAlertAction = Literal["incident", "reminder", "recovery", "notice"]
+
+# Как часто письмо напоминает о долгом предупреждении (`HealthIssue.standing`).
+# Неделя, а не сутки, как у инцидента: между полными сборами нового замера нет,
+# а висит такое предупреждение месяцами.
+STANDING_REMINDER_HOURS = 7 * 24
 
 
 @dataclass
@@ -41,6 +47,16 @@ class HealthIssue:
     code: str
     message: str
     context: dict = field(default_factory=dict)
+    # Долгое предупреждение: известно заранее, висит неделями и поломкой не
+    # является (запас до нижней границы каталога). В отчёте и в статусе оно как
+    # любое другое, а в письмах идёт своей дорожкой — см. health_alert_decision.
+    # Действует только на warning: critical требует действий сейчас и остаётся
+    # инцидентом, как бы его ни пометили.
+    standing: bool = False
+
+    @property
+    def is_standing(self) -> bool:
+        return self.standing and self.severity == "warning"
 
 
 @dataclass
@@ -55,6 +71,14 @@ class HealthReport:
     def is_healthy(self) -> bool:
         return self.status == "ok"
 
+    @property
+    def has_incident(self) -> bool:
+        """Есть ли в отчёте что-то кроме долгих предупреждений."""
+        if self.status == "ok":
+            return False
+        active = [issue for issue in self.issues if issue.severity in ("warning", "critical")]
+        return not active or any(not issue.is_standing for issue in active)
+
 
 @dataclass(frozen=True)
 class HealthAlertDecision:
@@ -63,6 +87,8 @@ class HealthAlertDecision:
     action: HealthAlertAction | None
     signature: str | None = None
     previous_signature: str | None = None
+    # Долгие предупреждения, попавшие в это письмо: им записывается время отправки.
+    standing_keys: tuple[str, ...] = ()
 
 
 def check_health(
@@ -310,6 +336,10 @@ def check_health(
         # 6. Brand-coverage drop (если предыдущий имел brand'ы, а сейчас нет — алерт)
         report.issues.extend(_check_brand_coverage_drop(session, last_run.id))
 
+    # Запас до нижней границы каталога pharmonline: отказ сбора по границе виден
+    # за недели, и сказать о нём надо до того, как он случится.
+    report.issues.extend(_check_pharmonline_catalog_floor(session))
+
     # 7. Per-site silence — `stale_run` смотрит только на ПОСЛЕДНИЙ run в БД, но
     # один сайт может молчать неделю пока другие отрабатывают. Например aloe-run
     # может быть свежим, а недельный pharmonline/aptekonline timer не обновлялся.
@@ -389,11 +419,15 @@ def alert_signature(report: HealthReport) -> str:
     identity and the nested per-site statuses used by
     ``full_catalog_unverified`` are included so a real change is delivered
     immediately.
+
+    Standing warnings are not part of the incident: they have their own keys
+    (:func:`standing_alert_keys`), so one appearing or changing never restarts
+    the incident, and the incident closing is still reported as a recovery.
     """
 
     issue_keys: list[dict] = []
     for issue in report.issues:
-        if issue.severity not in ("warning", "critical"):
+        if issue.severity not in ("warning", "critical") or issue.is_standing:
             continue
 
         context: dict = {}
@@ -431,6 +465,70 @@ def alert_signature(report: HealthReport) -> str:
     return json.dumps(issue_keys, sort_keys=True, separators=(",", ":"))
 
 
+def standing_alert_keys(report: HealthReport) -> tuple[str, ...]:
+    """Ключи долгих предупреждений отчёта: код, сайт и ступень.
+
+    Ступень (`context["stage"]`) входит в ключ, чтобы переход на следующую
+    давал письмо сразу. Сайт и ступень — из короткого постоянного набора
+    значений: число или дата в любом из них сделали бы каждый замер новым
+    предупреждением, то есть письмом на каждую проверку.
+    """
+    return tuple(
+        sorted(
+            {
+                "|".join(
+                    (
+                        issue.code,
+                        str(issue.context.get("site") or ""),
+                        str(issue.context.get("stage") or ""),
+                    )
+                )
+                for issue in report.issues
+                if issue.is_standing
+            }
+        )
+    )
+
+
+def _standing_notice_due(
+    keys: tuple[str, ...],
+    last_state: dict | None,
+    *,
+    now: datetime,
+    reminder_hours: float,
+) -> bool:
+    """Пора ли писать о долгих предупреждениях.
+
+    Да, если хотя бы об одном ещё не писали или писали раньше, чем
+    ``reminder_hours`` назад. Время хранится по ключу, поэтому предупреждение,
+    которое пропало и вернулось (замер колеблется у порога), второго письма до
+    срока не даёт. Нечитаемая запись — писать: лишнее письмо лучше потерянного.
+    """
+    if not keys:
+        return False
+    sent = last_state.get("standing") if isinstance(last_state, dict) else None
+    if not isinstance(sent, dict):
+        return True
+    for key in keys:
+        try:
+            elapsed = now - datetime.fromisoformat(sent[key])
+        except (KeyError, TypeError, ValueError):
+            return True
+        if elapsed < timedelta(0) or elapsed >= timedelta(hours=reminder_hours):
+            return True
+    return False
+
+
+def _standing_entry_is_recent(sent_at: object, now: datetime) -> bool:
+    if not isinstance(sent_at, str):
+        return False
+    try:
+        elapsed = now - datetime.fromisoformat(sent_at)
+    except (TypeError, ValueError):
+        return False
+    return elapsed < timedelta(hours=4 * STANDING_REMINDER_HOURS)
+
+
 def _health_state_is_active(last_state: dict | None) -> bool:
     if not isinstance(last_state, dict):
         return False
@@ -459,7 +557,7 @@ def _legacy_alert_signature(report: HealthReport) -> str:
         sorted(
             f"{issue.code}:{issue.context.get('site', '')}"
             for issue in report.issues
-            if issue.severity in ("warning", "critical")
+            if issue.severity in ("warning", "critical") and not issue.is_standing
         )
     )
 
@@ -494,6 +592,7 @@ def health_alert_decision(
     *,
     now: datetime,
     reminder_hours: float,
+    standing_reminder_hours: float = STANDING_REMINDER_HOURS,
 ) -> HealthAlertDecision:
     """Choose the next email transition for the current health report.
 
@@ -502,19 +601,39 @@ def health_alert_decision(
     - the first healthy check after an active incident sends one recovery;
     - a healthy state stays quiet until a new incident appears.
 
+    Долгие предупреждения (`HealthIssue.standing`) инцидентом не считаются и
+    идут второй дорожкой: письмо при появлении и при смене ступени, дальше — не
+    чаще раза в ``standing_reminder_hours``. Без этого предупреждение, которое
+    висит месяцами, давало бы письмо каждые ``reminder_hours``, а отчёт никогда
+    не становился бы «ok» — и о закрытии настоящего инцидента письма не было бы.
+    Письмо об инциденте несёт отчёт целиком и засчитывается долгим
+    предупреждениям. Письмо о восстановлении — нет: его читают как «делать
+    нечего», и новое предупреждение или новая ступень, впервые показанные под
+    темой RECOVERED, остались бы незамеченными на неделю. О них уйдёт отдельное
+    письмо со следующей проверкой.
+
     Missing or malformed incident timestamps are fail-open: the active alert is
     sent again rather than silently lost.
     """
 
     previous_signature = last_state.get("signature") if isinstance(last_state, dict) else None
     was_active = _health_state_is_active(last_state)
+    standing_keys = standing_alert_keys(report)
+    standing_due = _standing_notice_due(
+        standing_keys,
+        last_state,
+        now=now,
+        reminder_hours=standing_reminder_hours,
+    )
 
-    if report.status == "ok":
+    if not report.has_incident:
         if was_active:
             return HealthAlertDecision(
                 "recovery",
                 previous_signature=previous_signature,
             )
+        if standing_due:
+            return HealthAlertDecision("notice", standing_keys=standing_keys)
         return HealthAlertDecision(None)
 
     signature = alert_signature(report)
@@ -523,6 +642,7 @@ def health_alert_decision(
             "incident",
             signature=signature,
             previous_signature=previous_signature,
+            standing_keys=standing_keys,
         )
 
     sent_at = None
@@ -537,11 +657,15 @@ def health_alert_decision(
     except (TypeError, ValueError):
         reminder_due = True
 
-    if reminder_due:
+    # Долгое предупреждение, о котором пора написать, едет в письме об
+    # инциденте: отчёт в нём тот же, а отдельного действия для активного
+    # инцидента заводить незачем.
+    if reminder_due or standing_due:
         return HealthAlertDecision(
             "reminder",
             signature=signature,
             previous_signature=previous_signature,
+            standing_keys=standing_keys,
         )
     return HealthAlertDecision(None, signature=signature, previous_signature=previous_signature)
 
@@ -556,7 +680,7 @@ def health_alert_state_after(
 
     sent_at = now.isoformat()
     if decision.action == "recovery":
-        return {
+        state = {
             "version": 2,
             "status": "ok",
             "signature": None,
@@ -564,21 +688,48 @@ def health_alert_state_after(
             "recovered_at": sent_at,
             "last_sent_at": sent_at,
         }
-    if decision.action not in ("incident", "reminder") or not decision.signature:
+    elif decision.action == "notice":
+        # Инцидента нет и не было: меняется только дорожка долгих предупреждений.
+        state = {
+            "version": 2,
+            "status": "ok",
+            "signature": None,
+            "last_sent_at": sent_at,
+        }
+        if isinstance(last_state, dict) and last_state.get("status") == "ok":
+            for key in ("recovered_signature", "recovered_at"):
+                if key in last_state:
+                    state[key] = last_state[key]
+    elif decision.action in ("incident", "reminder") and decision.signature:
+        incident_started_at = sent_at
+        if decision.action == "reminder" and isinstance(last_state, dict):
+            incident_started_at = last_state.get("incident_started_at") or (
+                last_state.get("sent_at") or sent_at
+            )
+        state = {
+            "version": 2,
+            "status": "active",
+            "signature": decision.signature,
+            "incident_started_at": incident_started_at,
+            "last_sent_at": sent_at,
+        }
+    else:
         raise ValueError("cannot persist a health state without an email transition")
 
-    incident_started_at = sent_at
-    if decision.action == "reminder" and isinstance(last_state, dict):
-        incident_started_at = last_state.get("incident_started_at") or (
-            last_state.get("sent_at") or sent_at
-        )
-    return {
-        "version": 2,
-        "status": "active",
-        "signature": decision.signature,
-        "incident_started_at": incident_started_at,
-        "last_sent_at": sent_at,
+    # Время отправки — по каждому ключу. Прежние записи остаются: по ним
+    # предупреждение, которое пропало и вернулось, не шлётся заново до срока.
+    # Записи старше нескольких сроков напоминания уже ни на что не влияют и
+    # выбрасываются, чтобы файл не рос.
+    previous = last_state.get("standing") if isinstance(last_state, dict) else None
+    standing = {
+        key: value
+        for key, value in (previous.items() if isinstance(previous, dict) else ())
+        if isinstance(key, str) and _standing_entry_is_recent(value, now)
     }
+    standing.update(dict.fromkeys(decision.standing_keys, sent_at))
+    if standing:
+        state["standing"] = standing
+    return state
 
 
 def alert_due(
@@ -984,19 +1135,183 @@ def _check_site_zero_scrape(
     return issues
 
 
-def render_alert_html(report: HealthReport) -> str:
-    """Простое HTML-письмо для алерта."""
+# Нижняя граница каталога pharmonline. Полный сбор в режиме public_api
+# отказывает, когда товаров в API меньше границы из
+# `pharmonline_public_api_catalog_baselines` (счётчик `catalog_floor_failed` в
+# `main._verify_pharmonline_public_api_identities`), и ниже границы отказывает
+# же ручная сверка — его штатный путь восстановления. Сама граница не
+# опускается, а каталог убывает, так что отказ виден заранее.
+#
+# Пороги — в товарах, а не в неделях. Убыль идёт рывками (замер 2026-10-08: с
+# 6 сентября по 4 октября −3 товара, затем по 6 в день; со 2 на 3 сентября за
+# сутки ушло от 82 до 102), и срок, посчитанный по среднему темпу, ошибается в
+# разы. Первый порог — около двух-трёх месяцев при 3–6 товарах в день, второй —
+# одна такая разовая чистка каталога.
+_PHARMONLINE_FLOOR_MARGIN_LOW = 300
+_PHARMONLINE_FLOOR_MARGIN_VERY_LOW = 100
+
+# С этого начинается причина отказа, когда каталог прочитан целиком, а не
+# прошла только сверка личностей (её пишет `run_cmd` в src/main.py). Такое
+# чтение уже прошло и полноту маршрута, и сверку с sitemap, и порог 0.90 от
+# прошлых прогонов, поэтому его размер годится для сравнения с границей.
+_PUBLIC_API_IDENTITY_REFUSAL_PREFIX = "public_api_identity_proof_failed:"
+
+# Сколько последних полных прогонов pharmonline просматривать в поисках такого
+# чтения. Месяц ежедневных сбоев до сверки (прокси, сентябрь 2026) — 30 строк.
+_PHARMONLINE_FLOOR_SCAN_RUNS = 200
+
+
+def _pharmonline_catalog_floor(session: Session, *, tenant_id: int = 1) -> int | None:
+    """Действующая нижняя граница каталога или None, если её нет.
+
+    Берётся так же, как в сборе: наибольшее значение среди строк тенанта.
+    """
+    from sqlalchemy import inspect
+
+    from src.storage import PharmonlinePublicAPICatalogBaseline as Baseline
+
+    # Через соединение сессии, а не через Engine: см. комментарий в
+    # main._pharmonline_public_api_identity_tables_available.
+    if Baseline.__table__.name not in set(inspect(session.connection()).get_table_names()):
+        return None
+    floor = session.scalar(
+        select(func.max(Baseline.minimum_catalog_item_count)).where(Baseline.tenant_id == tenant_id)
+    )
+    return int(floor) if floor else None
+
+
+def _latest_complete_pharmonline_catalog_read(
+    session: Session,
+    *,
+    tenant_id: int = 1,
+) -> tuple[int, datetime, int] | None:
+    """Последний полный сбор pharmonline, прочитавший каталог API целиком.
+
+    Возвращает номер прогона, время его конца и число товаров. Годится и сбор,
+    которому отказала только сверка личностей: он считает те же товары, что
+    сравниваются с границей, а подтверждённые сборы бывают реже (до автодопуска
+    новых товаров сбор отказывал неделями). Сбор, остановленный раньше — сбой
+    сайта, неполный маршрут, меньше 0.90 прошлого каталога, — размером каталога
+    не считается.
+    """
+    rows = session.execute(
+        select(
+            Run.id,
+            Run.finished_at,
+            Run.run_quality,
+            Run.catalog_verification_reason,
+        )
+        .where(
+            Run.tenant_id == tenant_id,
+            Run.status != "running",
+            Run.finished_at.is_not(None),
+            Run.catalog_scope == "full",
+            Run.full_catalog_sites.contains("pharmonline"),
+        )
+        .order_by(desc(Run.finished_at), desc(Run.id))
+        .limit(_PHARMONLINE_FLOOR_SCAN_RUNS)
+    )
+    for run_id, finished_at, run_quality, column_reason in rows:
+        quality = run_quality or {}
+        if quality.get("mode") != "public_api":
+            continue
+        details = (quality.get("sites") or {}).get("pharmonline") or {}
+        products = details.get("products")
+        if details.get("status") != "ok" or type(products) is not int or products < 1:
+            continue
+        # Отметку «каталог подтверждён» сбор ставит после всех проверок чтения и
+        # снимает, если отказала сверка личностей, — тогда остаётся причина.
+        reason = str(quality.get("catalog_verification_reason") or column_reason or "")
+        if quality.get("full_catalog_verified") is True or reason.startswith(
+            _PUBLIC_API_IDENTITY_REFUSAL_PREFIX
+        ):
+            return run_id, finished_at, products
+    return None
+
+
+def _check_pharmonline_catalog_floor(session: Session) -> list[HealthIssue]:
+    """Сколько товаров осталось до нижней границы каталога pharmonline.
+
+    Малый запас — долгое предупреждение двух ступеней; каталог ниже границы —
+    уже поломка: сбор отказывает и сам не восстановится. Нет границы или нет
+    ни одного целиком прочитанного каталога — сравнивать нечего.
+    """
+    floor = _pharmonline_catalog_floor(session)
+    if floor is None:
+        return []
+    observed = _latest_complete_pharmonline_catalog_read(session)
+    if observed is None:
+        return []
+    run_id, finished_at, products = observed
+    margin = products - floor
+    if margin > _PHARMONLINE_FLOOR_MARGIN_LOW:
+        return []
+
+    read = f"сбор #{run_id} от {finished_at:%Y-%m-%d}"
+    runbook = "docs/RUNBOOK.md, «Нижняя граница каталога pharmonline»"
+    context = {
+        "site": "pharmonline",
+        "run_id": run_id,
+        "products": products,
+        "floor": floor,
+        "margin": margin,
+    }
+    # Сбор отказывает при «меньше границы»: ровно на границе он ещё проходит.
+    if margin < 0:
+        return [
+            HealthIssue(
+                "critical",
+                "pharmonline_catalog_floor",
+                f"pharmonline: каталог ниже нижней границы — {products} при границе {floor} "
+                f"({read}). Плановый сбор и ручная сверка отказывают, пока границу не "
+                f"опустят: {runbook}.",
+                context={**context, "stage": "below"},
+            )
+        ]
+    return [
+        HealthIssue(
+            "warning",
+            "pharmonline_catalog_floor",
+            f"pharmonline: запас до нижней границы каталога — {margin} "
+            f"(товаров {products}, граница {floor}, {read}). Ниже границы откажут и "
+            f"плановый сбор, и ручная сверка, а сама граница не опускается: {runbook}.",
+            context={
+                **context,
+                "stage": "very_low" if margin <= _PHARMONLINE_FLOOR_MARGIN_VERY_LOW else "low",
+            },
+            standing=True,
+        )
+    ]
+
+
+def render_alert_html(report: HealthReport, *, recovered: bool = False) -> str:
+    """Простое HTML-письмо для алерта.
+
+    ``recovered`` — письмо о закрытии инцидента. Если при этом остаются долгие
+    предупреждения, отчёт не «ok», и без флажка письмо с темой RECOVERED
+    открывалось бы заголовком «Внимание».
+    """
     color = {"ok": "#34c759", "warning": "#ff9500", "critical": "#ff3b30"}[report.status]
     title = {"ok": "✓ OK", "warning": "⚠️ Внимание", "critical": "🔴 Проблема"}[report.status]
+    if recovered and report.issues and not report.has_incident:
+        color = "#34c759"
+        title = "✓ Инцидент закрыт"
 
     rows = []
     for i in report.issues:
         sev_color = {"warning": "#ff9500", "critical": "#ff3b30", "ok": "#34c759"}[i.severity]
+        note = (
+            "<div style='font-size:11px;color:#86868b;margin-top:4px;'>"
+            f"Долгое предупреждение: напоминание раз в {STANDING_REMINDER_HOURS // 24} дней."
+            "</div>"
+            if i.is_standing
+            else ""
+        )
         rows.append(
             f"<tr><td style='padding:8px;border-bottom:1px solid #eee;'>"
             f"<span style='color:{sev_color};font-weight:600;'>{i.severity.upper()}</span> "
             f"<code style='font-size:11px;color:#86868b;'>{i.code}</code></td>"
-            f"<td style='padding:8px;border-bottom:1px solid #eee;'>{i.message}</td></tr>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee;'>{i.message}{note}</td></tr>"
         )
 
     return f"""
