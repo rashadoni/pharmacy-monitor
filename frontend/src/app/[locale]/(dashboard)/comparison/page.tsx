@@ -22,6 +22,7 @@ import { useRouter } from "@/i18n/navigation";
 import {
   api,
   ApiError,
+  friendlyError,
   isFullCatalogTrustError,
   type ComparisonRow,
   type ComparisonSearchResult,
@@ -257,9 +258,12 @@ export default function ComparisonPage() {
     }
   }
 
+  // Отказ отклонения раньше был не виден: строка молча возвращалась на место.
+  const [rejectError, setRejectError] = useState<string | null>(null);
   const rejectMutation = useMutation({
     mutationFn: (id: number) => api.rejectMatch(id),
     onMutate: async (id: number) => {
+      setRejectError(null);
       // Optimistic: filter the row out immediately — и из полного списка, и из
       // результатов поиска. У них разные ключи и разная форма данных.
       await queryClient.cancelQueries({ queryKey: ["comparison"] });
@@ -283,7 +287,8 @@ export default function ComparisonPage() {
       );
       return { prevLists, prevSearches };
     },
-    onError: (_err, _id, ctx) => {
+    onError: (err, _id, ctx) => {
+      setRejectError(friendlyError(err, locale));
       // Rollback
       ctx?.prevLists.forEach(([key, value]) =>
         queryClient.setQueryData(key, value),
@@ -353,6 +358,15 @@ export default function ComparisonPage() {
           data-testid="export-error"
         >
           {t("export_excel_error")}
+        </div>
+      )}
+      {rejectError && (
+        <div
+          role="alert"
+          className="rounded-md bg-destructive/10 border border-destructive/30 p-3 text-sm text-destructive"
+          data-testid="reject-error"
+        >
+          {rejectError}
         </div>
       )}
 
@@ -950,6 +964,7 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
 // старый товар сайта отвязывается (+rejection), новый привязывается, is_manual.
 function RelinkPanel({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
+  const locale = useLocale();
   const queryClient = useQueryClient();
   const [msg, setMsg] = useState<{
     site: string;
@@ -970,10 +985,10 @@ function RelinkPanel({ row }: { row: ComparisonRow }) {
       queryClient.invalidateQueries({ queryKey: ["match-quality"] });
     },
     onError: (err: unknown, vars) => {
+      // Причину отказа называет бэкенд; `err.message` — это «API 409: {…}»,
+      // сырой ответ, а не текст для оператора.
       const text =
-        err instanceof ApiError && err.message
-          ? err.message
-          : t("relink_error");
+        err instanceof ApiError ? friendlyError(err, locale) : t("relink_error");
       setMsg({ site: vars.site, ok: false, text });
     },
   });

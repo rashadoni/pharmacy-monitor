@@ -36,13 +36,20 @@ export default function MatchesReviewPage() {
       }),
   });
 
+  // Отказ правки раньше был не виден: кнопка отжималась, карточка оставалась.
+  const [editError, setEditError] = useState<string | null>(null);
+
   const confirm = useMutation({
     mutationFn: (id: number) => api.matchConfirm(id),
+    onMutate: () => setEditError(null),
+    onError: (err: unknown) => setEditError(friendlyError(err, locale)),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["matches-suggestions"] }),
   });
 
   const reject = useMutation({
     mutationFn: (id: number) => api.matchReject(id),
+    onMutate: () => setEditError(null),
+    onError: (err: unknown) => setEditError(friendlyError(err, locale)),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["matches-suggestions"] }),
   });
 
@@ -90,6 +97,11 @@ export default function MatchesReviewPage() {
       )}
       {q.error && (
         <p className="text-sm text-destructive">{friendlyError(q.error, locale)}</p>
+      )}
+      {editError && (
+        <p role="alert" className="text-sm text-destructive" data-testid="edit-error">
+          {editError}
+        </p>
       )}
       {q.data && q.data.length === 0 && !q.isLoading && (
         <div className="rounded-lg border border-border bg-card p-8 text-center">
