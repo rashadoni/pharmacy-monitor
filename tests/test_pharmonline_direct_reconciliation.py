@@ -336,6 +336,27 @@ def test_direct_proof_version_is_refused_with_any_other_transport(db_session, tr
     _assert_nothing_written(db_session, products=0)
 
 
+def test_direct_reconciliation_does_not_write_over_an_unusable_ledger_row(db_session):
+    """Чего сверка напрямую не чинит (как и через Decodo): у товара уже лежит
+    запись журнала допусков, которую проверка не признаёт. Вторая запись на тот
+    же товар упирается в уникальный ключ — сверка падает, ничего не записав."""
+    from sqlalchemy.exc import IntegrityError
+
+    returned = _stored(2, "returned", availability_source=None)
+    db_session.add_all([_stored(1, "known"), returned])
+    db_session.commit()
+    db_session.add(_admission_row(returned, proof_version="stale_v0"))
+    db_session.commit()
+    results = _catalog(_api(1, "known"), _api(2, "returned"), _api(3, "brand-new"))
+
+    with pytest.raises(IntegrityError):
+        _apply(db_session, results)
+    db_session.rollback()
+
+    assert [row.proof_version for row in _admissions(db_session)] == ["stale_v0"]
+    assert _product_count(db_session) == 2
+
+
 def test_plan_refusal_names_counts_only():
     """Строка идёт в журнал шага Actions, а он открыт: счётчики без товаров."""
     refusal = main_mod._pharmonline_public_api_plain_admission_refusal
