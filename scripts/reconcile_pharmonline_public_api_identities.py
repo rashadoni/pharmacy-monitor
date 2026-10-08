@@ -292,6 +292,11 @@ async def main(*, apply: bool) -> None:
     plain_admissions_only = _pharmonline_public_api_proof_version_is_plain_only(
         admission_proof_version
     )
+    if plain_admissions_only:
+        # One attempt means one at every layer: the scraper has a whole-catalog
+        # retry of its own, switched on by this variable.  Pinned here, after
+        # ``src.main`` has loaded any ``.env`` over the environment.
+        os.environ["PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS"] = "1"
     plan_refusal = None
     floor_refusal = None
     lock_wait_seconds = _production_lock_wait_seconds()

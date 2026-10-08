@@ -74,6 +74,8 @@ PLAIN_METRICS = {
     "existing_native_admissions_ready": 3,
 }
 DECODO_SETTINGS = {"DECODO_SITES": "pharmonline", "PHARMONLINE_DECODO_BACKCONNECT_STICKY": "1"}
+# Напрямую — одна попытка и у самого скрейпера (у него свой повтор всего каталога).
+DIRECT_SETTINGS = {"PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS": "1"}
 
 # `.venv/bin/python` сервера: записывает, с каким окружением вызваны скрипт
 # сверки и сбор, за скрипт плана пишет свидетельство (транспорт — тот, что ему
@@ -96,7 +98,12 @@ if kind is not None:
         key: value
         for key, value in os.environ.items()
         if key.startswith(("DECODO_", "PHARMONLINE_DECODO_"))
-        or key in ("PHARMONLINE_PUBLIC_API_TRANSPORT", "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT")
+        or key
+        in (
+            "PHARMONLINE_PUBLIC_API_TRANSPORT",
+            "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT",
+            "PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS",
+        )
     }
     with open(root / "calls.jsonl", "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"kind": kind, "env": passed}) + "\n")
@@ -414,10 +421,27 @@ def test_plan_passes_the_chosen_transport_to_the_script(tmp_path: Path, transpor
     assert call["kind"] == "plan"
     assert call["env"].pop("PHARMONLINE_PUBLIC_API_TRANSPORT") == transport
     # Настройки Decodo — только с Decodo: план напрямую от него не зависит.
-    assert call["env"] == (DECODO_SETTINGS if transport == "decodo" else {})
+    assert call["env"] == (DECODO_SETTINGS if transport == "decodo" else DIRECT_SETTINGS)
     evidence = json.loads((stand.publish_plan_artifact() / "reconciliation-plan.json").read_text())
     assert evidence["transport"] == transport
     assert f"transport={transport}" in result.stdout
+
+
+@pytest.mark.parametrize(("transport", "attempts"), [("direct", "1"), ("decodo", "3")])
+def test_server_environment_cannot_make_a_direct_read_retry(
+    tmp_path: Path, transport: str, attempts: str
+):
+    """В окружении сервера оператор включил повторы чтения каталога (так стоит у
+    понедельничного сбора). Через Decodo они действуют, напрямую — нет."""
+    stand = ReconciliationSandbox(tmp_path, transport=transport)
+    with (stand.server / "etc" / "pharmacy-monitor" / "env").open("a") as handle:
+        handle.write("PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS=3\n")
+
+    result = stand.run_step(PLAN, PLAN_STEP)
+
+    assert result.returncode == 0, _log(result)
+    (call,) = stand.calls
+    assert call["env"]["PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS"] == attempts
 
 
 @pytest.mark.parametrize("deployed", OLD_DEPLOYMENTS)
@@ -645,7 +669,7 @@ def test_plan_and_apply_go_through_the_same_transport(tmp_path: Path, transport:
         # Скрипту записи транспорт плана назван ещё раз — он сверяет его со своим.
         if call["kind"] == "apply":
             assert call["env"].pop("PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT") == transport
-        assert call["env"] == (DECODO_SETTINGS if transport == "decodo" else {}), call
+        assert call["env"] == (DECODO_SETTINGS if transport == "decodo" else DIRECT_SETTINGS), call
     # Сторож выложенного кода спрашивает только при сверке напрямую.
     for step in (planned, applied):
         assert ("deployed code recognises direct admissions" in step.stdout) == (

@@ -325,7 +325,12 @@ jobs:
               publish_attempts=3
               ;;
             direct)
-              transport_env=(PHARMONLINE_PUBLIC_API_TRANSPORT=direct)
+              # One attempt at every layer: the scraper's own whole-catalog
+              # retry is pinned too, whatever the server environment says.
+              transport_env=(
+                PHARMONLINE_PUBLIC_API_TRANSPORT=direct
+                PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS=1
+              )
               # Directly there is no fresh session: a retry is one more full
               # read from this host's own address, which the source limits
               # (429) and which the nightly collection needs.  One attempt; a

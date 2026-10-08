@@ -690,6 +690,7 @@ class Site:
         self.catalogs: list[tuple] = []
         self.reads = 0
         self.transports: list[str] = []
+        self.scraper_attempts: list[str | None] = []
         self.redirect_requests = 0
 
     def serve(self, *catalogs: tuple) -> None:
@@ -701,6 +702,9 @@ class Site:
         class FakeScraper:
             async def __aenter__(self):
                 site.transports.append(os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"])
+                site.scraper_attempts.append(
+                    os.environ.get("PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS")
+                )
                 return self
 
             async def __aexit__(self, exc_type, exc_value, traceback):
@@ -742,6 +746,8 @@ def stand(monkeypatch, tmp_path) -> Iterator["Stand"]:
             "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT",
         ):
             monkeypatch.delenv(variable, raising=False)
+        # Оператор включил у скрейпера повторы чтения всего каталога.
+        monkeypatch.setenv("PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS", "3")
         yield Stand(sessionmaker(engine, expire_on_commit=False), site, monkeypatch, tmp_path)
     finally:
         engine.dispose()
@@ -855,6 +861,8 @@ async def test_script_reconciles_plain_admissions_directly_with_one_read_each(st
     # Запись — второе чтение; вместе с чтением плана их два, и они совпали.
     assert stand.site.reads == 2
     assert stand.site.transports == ["direct", "direct"]
+    # У самого скрейпера тоже одна попытка, что бы ни стояло в окружении.
+    assert stand.site.scraper_attempts == ["1", "1"]
     assert stand.site.redirect_requests == 0
     after = stand.state()
     assert after["admissions"] == sorted(
@@ -1040,6 +1048,8 @@ async def test_script_through_decodo_still_reads_twice_and_writes_the_manual_ver
     await stand.apply("decodo", evidence)
 
     assert stand.site.reads == 4
+    # Через Decodo повторы скрейпера остаются такими, как их выставил оператор.
+    assert stand.site.scraper_attempts == ["3"] * 4
     after = stand.state()
     assert after["admissions"] == [("new_public_product", MANUAL, "decodo", PLAN_RUN)]
     assert after["reconciliations"] == 1
