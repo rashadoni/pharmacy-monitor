@@ -422,15 +422,15 @@ def test_create_refuses_products_the_stage_made_incompatible(engines):
     assert clusters == {}
 
 
-def test_create_with_a_repeated_product_does_not_wait_for_the_stage(engines):
-    """Отказ, видный из самого запроса, приходит сразу, а не после этапа."""
+def test_create_with_a_repeated_product_does_not_wait_for_the_stage(engines, monkeypatch):
+    """Отказ, видный из самого запроса, приходит сразу и своим кодом."""
+    monkeypatch.setattr(api, "MATCH_EDIT_LOCK_WAIT_SECONDS", 0.3)
     stage_engine, api_engine = engines
     with stage_engine.connect() as connection, _session(connection) as stage:
         assert matcher.acquire_match_mutation_lock(stage, wait=False)
         try:
             with _session(api_engine) as db, pytest.raises(HTTPException) as refused:
-                # Ожидание замка здесь оборвалось бы ошибкой базы, а не отказом 404.
-                db.execute(text("SET LOCAL lock_timeout = '2s'"))
+                # Встав на замок, запрос получил бы 409 «идёт сопоставление».
                 api.dash_match_create_with_products(
                     api._CreateMatchPayload(product_ids=[5, 5]), user=_OPERATOR, db=db
                 )
@@ -493,8 +493,6 @@ def test_an_edit_made_while_the_stage_runs_is_refused_and_changes_nothing(
     assert outcome == [409]
     assert [s for s in statements if any(table in s for table in _APP_TABLES)] == []
     assert _stored(stage_engine) == before
-    # Отказавший запрос ничего не держит: ни замка, ни соединения пула.
-    assert api_engine.pool.checkedout() == 0
 
 
 def test_the_refusal_names_its_reason_for_the_dashboard(engines, monkeypatch):
@@ -562,11 +560,22 @@ def test_a_lock_wait_that_ran_out_leaves_the_session_usable(engines):
                 # Транзакция откатана, соединение вернулось в пул.
                 assert api_engine.pool.checkedout() == 0
                 assert db.scalar(text("SELECT 1")) == 1
+                # Ноль — отказ сразу, а не ожидание без предела (у PostgreSQL
+                # lock_timeout = 0 значит «не ограничивать»). Будь оно так,
+                # ожидание оборвал бы statement_timeout — ошибкой, а не отказом.
+                db.execute(text("SET LOCAL statement_timeout = 3000"))
+                assert match_lock.acquire_match_mutation_xact_lock_within(db, 0) is False
         finally:
             matcher.release_match_mutation_lock(stage)
 
     with _session(api_engine) as db:
         assert match_lock.acquire_match_mutation_xact_lock_within(db, 0.2) is True
+        db.commit()
+    # Срок жил только в той транзакции: у соединения, вернувшегося в пул, он
+    # прежний (стенд задаёт 20 с параметром подключения).
+    assert api_engine.pool.checkedout() == 0
+    with _session(api_engine) as db:
+        assert db.scalar(text("SHOW lock_timeout")) == "20s"
 
 
 def test_a_lock_wait_broken_by_something_else_is_an_error_not_a_refusal(engines):

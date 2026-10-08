@@ -259,7 +259,13 @@ export default function ComparisonPage() {
   }
 
   // Отказ отклонения раньше был не виден: строка молча возвращалась на место.
+  // Гаснет сам: следующее действие на странице может быть и не отклонением.
   const [rejectError, setRejectError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!rejectError) return;
+    const timer = setTimeout(() => setRejectError(null), 15_000);
+    return () => clearTimeout(timer);
+  }, [rejectError]);
   const rejectMutation = useMutation({
     mutationFn: (id: number) => api.rejectMatch(id),
     onMutate: async (id: number) => {

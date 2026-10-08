@@ -32,11 +32,13 @@ describe("match edit refusals", () => {
   });
 
   it("falls back to the status text for a code it does not know", () => {
+    const conflict =
+      "Məlumat ziddiyyəti var. Səhifəni yeniləyib dəyişiklikləri yoxlayın.";
     const unknown = refusal(409, "brand_new_code", "Что-то новое");
     expect(friendlyError(unknown, "ru")).toBe("Что-то новое");
-    expect(friendlyError(unknown, "az")).toBe(
-      "Məlumat ziddiyyəti var. Səhifəni yeniləyib dəyişiklikləri yoxlayın.",
-    );
+    expect(friendlyError(unknown, "az")).toBe(conflict);
+    // Имя метода объекта — не код отказа.
+    expect(friendlyError(refusal(409, "constructor", "…"), "az")).toBe(conflict);
   });
 });
 

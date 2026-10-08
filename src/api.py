@@ -5032,6 +5032,29 @@ def _require_match_policy(products: list[storage.Product]) -> None:
             raise HTTPException(409, f"Product {product.id} has no fresh active offer")
 
 
+# Все коды отказов правки состава. Тот же перечень — ключи `MATCH_EDIT_COPY` во
+# фронте, для az и для en; сверяет `tests/test_api.py` (vitest в CI не идёт).
+MATCH_EDIT_REFUSAL_CODES = frozenset(
+    {
+        "matching_in_progress",
+        "match_gone",
+        "relink_bad_link",
+        "relink_not_in_catalog",
+        "product_in_other_match",
+        "already_current",
+        "dead_link_new",
+        "dead_link_member",
+        "out_of_stock_new",
+        "out_of_stock_member",
+        "country_conflict",
+        "country_unverified",
+        "offer_not_fresh_new",
+        "offer_not_fresh_member",
+        "swap_refused",
+    }
+)
+
+
 class MatchEditRefused(HTTPException):
     """Отказ правки состава кластера с кодом причины.
 
@@ -5043,6 +5066,8 @@ class MatchEditRefused(HTTPException):
     """
 
     def __init__(self, status_code: int, code: str, detail: str, **params: Any) -> None:
+        if code not in MATCH_EDIT_REFUSAL_CODES:
+            raise ValueError(f"unknown match edit refusal code: {code!r}")
         super().__init__(status_code, detail)
         self.code = code
         self.params = params
@@ -5064,7 +5089,7 @@ async def _match_edit_refused(request: Request, exc: MatchEditRefused) -> JSONRe
 MATCH_EDIT_LOCK_WAIT_SECONDS = 5.0
 
 
-def _lock_match_edits(db: Session) -> None:
+def _lock_match_edits(db: Session, action: str) -> None:
     """Замок сопоставления — до первого чтения того, что запрос собирается менять.
 
     Этап сопоставления (конец сбора, `rematch`) держит этот замок полторы — три
@@ -5087,7 +5112,7 @@ def _lock_match_edits(db: Session) -> None:
     from src import match_lock
 
     if not match_lock.acquire_match_mutation_xact_lock_within(db, MATCH_EDIT_LOCK_WAIT_SECONDS):
-        log.info("match_edit_refused", reason="matching_in_progress")
+        log.info("match_edit_refused", reason="matching_in_progress", action=action)
         raise MatchEditRefused(
             409,
             "matching_in_progress",
@@ -5105,7 +5130,7 @@ def dash_match_confirm(
     """Confirm a borderline match — sets is_manual=true so auto-matcher won't
     re-cluster on next nightly run. Inverse of /reject. Used by suggestion UI.
     """
-    _lock_match_edits(db)
+    _lock_match_edits(db, "confirm")
     match = db.scalar(
         select(storage.Match).where(
             storage.Match.id == match_id,
@@ -5136,7 +5161,7 @@ def dash_match_reject(
     # Состав читается под замком: отказы ниже пишутся по каждой паре, а кластер
     # удаляется целиком — по составу, прочитанному до ожидания, запрос выдёргивал
     # товар из пары, в которую его за это время свёл этап.
-    _lock_match_edits(db)
+    _lock_match_edits(db, "reject")
     match = db.scalar(select(storage.Match).where(storage.Match.id == match_id))
     if not match:
         raise HTTPException(404, "Match not found")
@@ -5288,7 +5313,7 @@ def dash_match_relink(
     # Замок — до первого чтения, а не внутри замены: кластер и товар ниже
     # ищутся по тенанту, и этап за время ожидания мог изменить и то, и другое
     # (свести кандидата в другую пару, распустить кластер).
-    _lock_match_edits(db)
+    _lock_match_edits(db, "relink")
 
     match = db.scalar(
         select(storage.Match).where(
@@ -6081,7 +6106,7 @@ def dash_match_add_product(
     - Если product был в другом match'е — переезжает (старый match теряет связь)
     Метит Match.is_manual=True (ручной выбор → защищён от auto-перематчивания).
     """
-    _lock_match_edits(db)
+    _lock_match_edits(db, "add-product")
     match = db.scalar(
         select(storage.Match).where(
             storage.Match.id == match_id,
@@ -6161,7 +6186,7 @@ def dash_match_create_with_products(
     if len(set(payload.product_ids)) != len(payload.product_ids):
         raise HTTPException(404, "One or more products not found")
 
-    _lock_match_edits(db)
+    _lock_match_edits(db, "create-with-products")
     products = list(
         db.scalars(
             select(storage.Product).where(

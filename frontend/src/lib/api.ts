@@ -267,9 +267,12 @@ export function friendlyError(err: unknown, locale = "ru"): string {
     const refusal = matchEditRefusal(err);
     if (refusal) {
       if (normalizedLocale === "ru") return refusal.detail;
-      const render = MATCH_EDIT_COPY[normalizedLocale][refusal.code];
-      // Незнакомый код — ниже, общим текстом по статусу.
-      if (render) return render(refusal.params);
+      const texts = MATCH_EDIT_COPY[normalizedLocale];
+      // Незнакомый код — ниже, общим текстом по статусу. Только свои ключи:
+      // код вроде "constructor" не должен достать метод объекта.
+      if (Object.prototype.hasOwnProperty.call(texts, refusal.code)) {
+        return texts[refusal.code](refusal.params);
+      }
     }
     // Pydantic 422 detail обычно JSON: [{loc, msg, type}, ...]
     if (err.status === 422 && err.detail.startsWith("{")) {

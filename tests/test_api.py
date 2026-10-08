@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -4409,6 +4410,76 @@ def test_relink_refusals_cover_every_reason_the_swap_can_give():
 
     assert documented >= {"match_not_found", "already_current", "identity", "offer"}
     assert generic == {"product_not_found", "product_site_mismatch", "product_tenant_mismatch"}
+
+
+def test_match_relink_of_another_tenants_comparison_is_not_found(client, tenant_user, setup_db):
+    s = setup_db
+    foreign = _make_match_with_products(
+        s, confidence=0.8, canonical="Foreign", tenant_id=2, products_per_site=2
+    )
+    _relink_candidate(s, "aptekonline", "fresh-1")
+
+    r = _relink_as_operator(client, tenant_user, s, foreign.id, "aptekonline", "fresh-1")
+
+    assert (r.status_code, r.json()["code"]) == (404, "match_gone")
+
+
+def test_a_refusal_code_must_be_declared():
+    with pytest.raises(ValueError, match="unknown match edit refusal code"):
+        api_module.MatchEditRefused(409, "brand_new_code", "текст")
+
+
+_DASHBOARD_API = Path(__file__).resolve().parent.parent / "frontend" / "src" / "lib" / "api.ts"
+
+
+def test_every_refusal_code_has_text_in_the_dashboard():
+    """Код без текста во фронте оператор на az и en увидит как общее «конфликт данных».
+
+    Интерфейсом пользуются на азербайджанском. Тест читает таблицу
+    `MATCH_EDIT_COPY` из `frontend/src/lib/api.ts`: vitest в CI не запускается, а
+    pytest запускается.
+    """
+    source = _DASHBOARD_API.read_text(encoding="utf-8")
+    table = source[source.index("const MATCH_EDIT_COPY") : source.index("function matchEditRefusal")]
+    locales = dict(re.findall(r"^  (az|en): \{\n(.*?)^  \},$", table, flags=re.S | re.M))
+
+    assert set(locales) == {"az", "en"}
+    for locale, block in locales.items():
+        keys = set(re.findall(r"^    (\w+): \(", block, flags=re.M))
+        assert keys == api_module.MATCH_EDIT_REFUSAL_CODES, locale
+
+
+def test_every_declared_refusal_code_is_used():
+    """Перечень кодов не длиннее того, что эндпоинты в самом деле отдают."""
+    source = Path(api_module.__file__).read_text(encoding="utf-8")
+    body = source[source.index("class MatchEditRefused") :]
+    quoted = set(re.findall(r'"([a-z_]+)"', body))
+
+    unused = {code for code in api_module.MATCH_EDIT_REFUSAL_CODES if code not in quoted}
+    assert unused == set()
+
+
+def test_an_edit_gives_up_on_the_matcher_lock_well_before_the_dashboard_gives_up():
+    """Срок ожидания замка — меньше таймаута дашборда и таймаута пула соединений.
+
+    Дашборд обрывает запрос и предлагает повторить; правка, которая ждала бы
+    дольше, записалась бы уже после этого «не удалось». А запрос, ждущий замок,
+    держит соединение пула: посторонние запросы ждут его не дольше
+    `DB_POOL_TIMEOUT`.
+    """
+    source = _DASHBOARD_API.read_text(encoding="utf-8")
+    dashboard_timeout_ms = int(
+        re.search(r"init\?\.timeoutMs \?\? ([\d_]+);", source).group(1).replace("_", "")
+    )
+    pool_timeout_s = int(
+        re.search(
+            r'_env_int\("DB_POOL_TIMEOUT", (\d+)',
+            Path(storage.__file__).read_text(encoding="utf-8"),
+        ).group(1)
+    )
+
+    assert api_module.MATCH_EDIT_LOCK_WAIT_SECONDS * 1000 * 2 <= dashboard_timeout_ms
+    assert api_module.MATCH_EDIT_LOCK_WAIT_SECONDS * 2 <= pool_timeout_s
 
 
 def test_match_relink_requires_auth(client, setup_db):

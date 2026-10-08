@@ -372,15 +372,15 @@ def test_relink_of_a_cluster_the_stage_dissolved_meanwhile_is_not_found(engines)
     assert rejections == set()
 
 
-def test_relink_with_a_bad_request_does_not_wait_for_the_stage(engines):
-    """Отказ, видный из самого запроса, приходит сразу, а не после этапа."""
+def test_relink_with_a_bad_request_does_not_wait_for_the_stage(engines, monkeypatch):
+    """Отказ, видный из самого запроса, приходит сразу и своим кодом."""
+    monkeypatch.setattr(api, "MATCH_EDIT_LOCK_WAIT_SECONDS", 0.3)
     stage_engine, api_engine = engines
     with stage_engine.connect() as connection, _session(connection) as stage:
         assert matcher.acquire_match_mutation_lock(stage, wait=False)
         try:
             with _session(api_engine) as db, pytest.raises(HTTPException) as refused:
-                # Ожидание замка здесь оборвалось бы ошибкой базы, а не отказом 400.
-                db.execute(text("SET LOCAL lock_timeout = '2s'"))
+                # Встав на замок, запрос получил бы 409 «идёт сопоставление».
                 api.dash_match_relink(
                     1,
                     api.MatchRelinkIn(site="unknown-site", url="https://x.example/product/y"),
