@@ -155,7 +155,9 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
                 )
                 results["email"].append(user.email)
             except Exception as e:
-                log.warning("email_dispatch_failed", user=user.email, error=str(e))
+                log.warning(
+                    "email_dispatch_failed", user_id=user.id, **notifier.delivery_error_fields(e)
+                )
 
         # Telegram (respects quiet hours)
         if (
@@ -169,7 +171,11 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
                 notifier.send_telegram_message(user.telegram_chat_id, _format_event_text(event))
                 results["telegram"].append(user.telegram_chat_id)
             except Exception as e:
-                log.warning("telegram_dispatch_failed", user=user.email, error=str(e))
+                log.warning(
+                    "telegram_dispatch_failed",
+                    user_id=user.id,
+                    **notifier.delivery_error_fields(e),
+                )
 
     # Mark as dispatched
     channels_used = [c for c, recipients in results.items() if recipients]
@@ -246,7 +252,11 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                         for e in ev_email:
                             sent_now.setdefault(id(e), set()).add("email")
                     except Exception as exc:
-                        log.warning("email_batch_failed", user=user.email, error=str(exc))
+                        log.warning(
+                            "email_batch_failed",
+                            user_id=user.id,
+                            **notifier.delivery_error_fields(exc),
+                        )
 
             # Telegram — одним сообщением, уважает quiet hours
             if user.telegram_chat_id and not _in_quiet_hours(user.quiet_hours):
@@ -266,7 +276,11 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                         for e in ev_tg:
                             sent_now.setdefault(id(e), set()).add("telegram")
                     except Exception as exc:
-                        log.warning("telegram_batch_failed", user=user.email, error=str(exc))
+                        log.warning(
+                            "telegram_batch_failed",
+                            user_id=user.id,
+                            **notifier.delivery_error_fields(exc),
+                        )
 
             # Коммитим прогресс СРАЗУ после каждого получателя: успешно отправленное
             # помечаем channels_sent и фиксируем. Если commit упадёт (например,
@@ -346,7 +360,11 @@ def mail_unstored_events_to_admins(
                     )
                 except Exception as exc:
                     delivered = False
-                    log.warning("email_batch_failed", user=user.email, error=str(exc))
+                    log.warning(
+                        "email_batch_failed",
+                        user_id=user.id,
+                        **notifier.delivery_error_fields(exc),
+                    )
                 counts["email" if delivered else "failed"] += 1
 
             if user.telegram_chat_id and not _in_quiet_hours(user.quiet_hours):
@@ -365,7 +383,11 @@ def mail_unstored_events_to_admins(
                         )
                     except Exception as exc:
                         delivered = False
-                        log.warning("telegram_batch_failed", user=user.email, error=str(exc))
+                        log.warning(
+                            "telegram_batch_failed",
+                            user_id=user.id,
+                            **notifier.delivery_error_fields(exc),
+                        )
                     counts["telegram" if delivered else "failed"] += 1
 
     return counts
@@ -390,7 +412,7 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
         return False
     user.telegram_chat_id = str(chat_id)
     session.commit()
-    log.info("telegram_bound", user=email, chat_id=chat_id)
+    log.info("telegram_bound", user_id=user.id)
     return True
 
 
@@ -480,7 +502,7 @@ def _send_digest(
             log.info(
                 "digest_dry_run",
                 kind=kind,
-                user=user.email,
+                user_id=user.id,
                 subject=subject,
                 kb=round(len(html.encode()) / 1024, 1),
                 rows=html.count(_EVENT_ROW_MARK),
@@ -491,7 +513,12 @@ def _send_digest(
             notifier.send_email(subject=subject, html_body=html, to=[user.email])
             sent += 1
         except Exception as e:
-            log.warning("digest_email_failed", user=user.email, kind=kind, error=str(e))
+            log.warning(
+                "digest_email_failed",
+                user_id=user.id,
+                kind=kind,
+                **notifier.delivery_error_fields(e),
+            )
     log.info(
         "digest_dry_run_done" if dry_run else "digest_sent",
         kind=kind,
