@@ -81,10 +81,12 @@ _PERSON_NAMES = {
     "chat_id",
 }
 _COUNTING = {"len", "bool"}
-_SENDERS = {"send_email", "send_telegram_message"}
+# `_send_email` — разговор с сервером под `send_email`: его ошибки ещё несут адрес.
+_SENDERS = {"send_email", "_send_email", "send_telegram_message"}
 _EXCEPTION_SUMMARIES = {"type", "delivery_error_fields"}
-# Чем достают текст пойманной ошибки, не называя её по имени: любая функция
-# модуля `traceback`, `sys.exc_info()` и они же, импортированные по имени.
+# Чем достают текст пойманной ошибки, не называя её по имени: функции модуля
+# `traceback` (кроме тех, что про стек вызовов), `sys.exc_info()`,
+# `sys.exception()` — и вот эти, если их импортировали по имени.
 _ERROR_TEXT_GETTERS = {
     "format_exc",
     "format_exception",
@@ -93,34 +95,46 @@ _ERROR_TEXT_GETTERS = {
     "print_exception",
     "exc_info",
 }
+# Методы, которыми текст докладывают в уже существующую переменную.
+_COLLECTING_METHODS = {"append", "extend", "insert", "add", "update", "setdefault"}
 
 # ── Исключения из правила «обработчик сбоя отправки не выводит текст ошибки» ──
-# Каждое — с причиной. Список точный: строка, которая ничего не разрешает,
-# роняет `test_the_lists_of_excused_handlers_are_exact`.
+# Каждое — с причиной. Строка, которая ничего не разрешает, роняет
+# `test_no_excuse_from_the_exception_text_rule_is_dead`.
 
 # События журнала, которым трассировка с текстом ошибки разрешена: `try` такого
 # обработчика держит целый шаг работы, отправка в нём — одна из стадий, и без
-# трассировки сбой шага не разобрать.
+# трассировки сбой шага не разобрать. Событие названо вместе с функцией: то же
+# имя события в другом месте исключением не считается.
 _LOGS_THE_ERROR_TEXT_BY_DESIGN = {
     # Обработчик всего сбора: в его `try` лежит весь пайплайн. От адреса
-    # трассировку страхуют слои 2 и 3 — это проверяет
+    # трассировку страхуют слой 2 (текст отказа SMTP чист уже на выходе из
+    # `send_email`) и слой 3 — его на этом обработчике проверяет
     # `test_run_failure_output_carries_no_address`.
-    "run_failed",
+    ("run_cmd", "run_failed"),
     # Цикл Telegram-бота вокруг `handle_update`. Та отвечает пользователю через
     # `send_telegram_message`, а она свой сбой не бросает (ловит всё и возвращает
     # False): сюда приходит только сбой разбора входящего сообщения, и разбирать
     # его без трассировки нечем. Адресов почты в этом пути нет; строку страхует
     # слой 3.
-    "telegram_handle_update_failed",
+    ("run_polling", "telegram_handle_update_failed"),
+}
+# Функции, которые бросают текст пойманной ошибки дальше новой ошибкой: click
+# печатает его строкой «Error: …» мимо маски журнала.
+_RAISES_THE_ERROR_TEXT_BY_DESIGN = {
+    # Сбой сбора: текст пропущен через `mask_addresses` прямо в `raise`. Что
+    # адреса в выводе нет, проверяет `test_run_failure_output_carries_no_address`.
+    "run_cmd",
 }
 # Команды, которые печатают текст сбоя отправки: причину читает человек, а не
-# журнал Actions. `click.echo` идёт мимо маски, от адреса текст страхует только
-# слой 2 — поэтому из workflow их не запускают, как и команды из списка ниже.
+# журнал Actions. `click.echo` идёт мимо маски; текст отказа SMTP чист только
+# слоем 2, а текст остальных ошибок не чистит ничто — поэтому из workflow эти
+# команды не запускают, как и команды из списка ниже.
 _PRINTS_A_DELIVERY_ERROR_BY_DESIGN = {
-    # Проверка доставки, которую оператор запускает руками: печатает класс
-    # ошибки с кодами и ответ сервера (`server_reply`, адреса в нём вырезаны).
-    # Больше полный ответ сервера не печатает никто — docs/RUNBOOK.md «Email не
-    # приходит».
+    # Проверка доставки, которую оператор запускает руками. Об отказе SMTP
+    # печатает класс ошибки с кодами и ответ сервера (`server_reply`, адреса в
+    # нём вырезаны) — больше полный ответ не печатает никто, docs/RUNBOOK.md
+    # «Email не приходит». Любую другую ошибку печатает как есть.
     "notify_test": "notify test",
     # Часовая проверка здоровья под systemd: причина, по которой письмо о
     # тревоге не ушло, идёт в stderr юнита, то есть в journald сервера.
@@ -140,6 +154,12 @@ _PRINTS_AN_ADDRESS_BY_DESIGN = {
 }
 # Функция команды → как её зовут в CLI. Имена сверяются с деревом click.
 _NOT_FROM_A_WORKFLOW = {**_PRINTS_AN_ADDRESS_BY_DESIGN, **_PRINTS_A_DELIVERY_ERROR_BY_DESIGN}
+# Все исключения из правила о тексте ошибки — в том виде, в каком правило их узнаёт.
+_EXCUSED = (
+    {("event", function, event) for function, event in _LOGS_THE_ERROR_TEXT_BY_DESIGN}
+    | {("print", function) for function in _PRINTS_A_DELIVERY_ERROR_BY_DESIGN}
+    | {("raise", function) for function in _RAISES_THE_ERROR_TEXT_BY_DESIGN}
+)
 
 _HOW_TO_FIX_AN_ADDRESS = (
     "В журнал и в вывод команды уходит адрес или идентификатор человека. "
@@ -156,25 +176,33 @@ _HOW_TO_FIX_THE_LIST_OF_PRINTERS = (
     "оператору — добавь строку «функция: имя в CLI» и убедись, что ни один "
     "workflow команду не запускает. В списке, но не печатает: {stale} — команда "
     "перестала выводить адрес или её функцию переименовали: убери или поправь "
-    "строку."
+    "строку. В список идут только команды CLI: если адрес печатает "
+    "вспомогательная функция, перенеси печать в саму команду."
 )
 _HOW_TO_FIX_EXCEPTION_TEXT = (
     "Обработчик сбоя отправки выводит текст ошибки — полем журнала, трассировкой "
-    "(`log.exception`, `exc_info=`, `traceback.*`) или печатью, — а smtplib кладёт "
-    "в этот текст адрес получателя. Пиши `**notifier.delivery_error_fields(exc)`: "
-    "класс ошибки и коды. Обработчик считается и тогда, когда письмо шлёт не он "
-    "сам, а функция из его `try`, которая свой сбой не ловит. Если текст нужен "
-    "человеку в терминале (как у `notify test`) — внеси функцию команды в "
+    "(`log.exception`, `exc_info=`, `traceback.*`), печатью или новой ошибкой с "
+    "этим текстом (`raise X(str(exc))`, `sys.exit`), — а smtplib кладёт в текст "
+    "адрес получателя. Пиши `**notifier.delivery_error_fields(exc)`: класс ошибки "
+    "и коды. Обработчик считается и тогда, когда письмо шлёт не он сам, а "
+    "функция из его `try`, которая сбой не ловит или бросает дальше; такими "
+    "сейчас считаются {wrappers}. Имена сверяются без разбора импортов: если "
+    "в списке оказалась функция, которая писем не шлёт, — у неё общее имя с "
+    "отправителем, переименуй её. Если текст нужен человеку в терминале (как у "
+    "`notify test`) — внеси функцию команды в "
     "`_PRINTS_A_DELIVERY_ERROR_BY_DESIGN` с причиной; из workflow её тогда не "
     "запускают."
 )
 _HOW_TO_FIX_A_WORKFLOW = (
-    "Workflow запускает команду, вывод которой идёт мимо маски журнала: она "
-    "печатает адрес или текст сбоя отправки через `click.echo`. Журнал шага "
-    "Actions публичен. Убери команду из workflow; если она нужна именно там — "
-    "сначала пусть печатает `user_id` и `notifier.delivery_error_fields(exc)`, "
-    "затем убери её из `_PRINTS_AN_ADDRESS_BY_DESIGN` или "
-    "`_PRINTS_A_DELIVERY_ERROR_BY_DESIGN`."
+    "В workflow после имени CLI стоит команда, вывод которой идёт мимо маски "
+    "журнала: она печатает адрес или текст сбоя отправки через `click.echo`. "
+    "Журнал шага Actions публичен. Убери команду из workflow; если она нужна "
+    "именно там — сначала пусть печатает `user_id` и "
+    "`notifier.delivery_error_fields(exc)`, затем убери её из "
+    "`_PRINTS_AN_ADDRESS_BY_DESIGN` или `_PRINTS_A_DELIVERY_ERROR_BY_DESIGN`. "
+    "Проверка читает текст, а не исполняет его: если это строка `echo` с "
+    "описанием, а не запуск, — перефразируй её (комментарии и `name:` шага "
+    "проверка пропускает сама)."
 )
 _HOW_TO_FIX_A_COMMAND_NAME = (
     "В списке исключений названа команда, которой в CLI нет под этим именем или "
@@ -206,15 +234,16 @@ def _is_log_call(node: ast.AST) -> bool:
 
 
 def _is_print_call(node: ast.AST) -> bool:
+    """`print`, `click.echo`, `sys.exit("…")`, `sys.stderr.write` — вывод мимо журнала."""
     if not isinstance(node, ast.Call):
         return False
     if isinstance(node.func, ast.Name):
         return node.func.id == "print"
     return (
         isinstance(node.func, ast.Attribute)
-        and node.func.attr in {"echo", "secho"}
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "click"
+        and node.func.attr in {"echo", "secho", "exit", "write"}
+        and ast.unparse(node.func)
+        in {"click.echo", "click.secho", "sys.exit", "sys.stdout.write", "sys.stderr.write"}
     )
 
 
@@ -271,29 +300,41 @@ def address_leaks(source: str, *, by_design: frozenset[str] | None = None) -> li
     return sorted(set(found))
 
 
-def _catches_everything(handler: ast.ExceptHandler) -> bool:
-    return handler.type is None or any(
+def _reference(node: ast.AST) -> str | None:
+    """Имя, которым код называет функцию: вызов это или передача аргументом."""
+    if isinstance(node, ast.Name):
+        return node.id
+    return node.attr if isinstance(node, ast.Attribute) else None
+
+
+def _stops_the_failure(handler: ast.ExceptHandler) -> bool:
+    """Обработчик ловит всё и дальше ничего не бросает. `except OSError` отказ
+    почтового сервера не ловит; «записал и бросил дальше» сбой не останавливает."""
+    catches_everything = handler.type is None or any(
         isinstance(node, ast.Name) and node.id in {"Exception", "BaseException"}
         for node in ast.walk(handler.type)
     )
+    return catches_everything and not any(isinstance(node, ast.Raise) for node in ast.walk(handler))
 
 
-def _escaping_calls(node: ast.AST, caught: bool = False):
-    """Имена вызовов, чей сбой выходит из функции: вызов не стоит в `try`, который
-    ловит всё. Вложенная функция — отдельная, её вызовы считаются за ней."""
-    if isinstance(node, ast.Call) and not caught:
-        yield _called_name(node)
+def _escaping_references(node: ast.AST, stopped: bool = False):
+    """Имена функций, чей сбой выходит из этой функции: имя названо вне `try`,
+    который сбой останавливает. Считается и вызов, и передача аргументом —
+    `ctx.invoke(report_cmd)` зовёт команду не по имени. Вложенная функция —
+    отдельная, её имена считаются за ней."""
+    if not stopped and _reference(node):
+        yield _reference(node)
     for field, value in ast.iter_fields(node):
-        inside = caught or (
+        inside = stopped or (
             field == "body"
             and isinstance(node, ast.Try)
-            and any(map(_catches_everything, node.handlers))
+            and any(map(_stops_the_failure, node.handlers))
         )
         for child in value if isinstance(value, list) else [value]:
             if isinstance(child, ast.AST) and not isinstance(
                 child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
             ):
-                yield from _escaping_calls(child, inside)
+                yield from _escaping_references(child, inside)
 
 
 def senders_in(sources) -> frozenset[str]:
@@ -303,17 +344,18 @@ def senders_in(sources) -> frozenset[str]:
     `_dispatch_health_alert_email` шлёт письмо и сбой не ловит — ловит его
     `health_check_cmd`. Обработчик сбоя отправки — тот, в который сбой приходит,
     а не только тот, в чьём `try` стоит сам `send_email`. Сверка по имени
-    функции: импорты не разбираются, одноимённые функции считаются одной.
+    функции: импорты не разбираются, одноимённые функции считаются одной —
+    обёртка с именем вроде `send` записала бы в отправители все `x.send(...)`.
     """
     escaping = [
-        (node.name, set(_escaping_calls(node)))
+        (node.name, set(_escaping_references(node)))
         for source in sources
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
     ]
     senders = set(_SENDERS)
     while True:
-        wrappers = {name for name, calls in escaping if calls & senders} - senders
+        wrappers = {name for name, named in escaping if named & senders} - senders
         if not wrappers:
             return frozenset(senders)
         senders |= wrappers
@@ -325,7 +367,9 @@ def _reads_the_caught_error(node: ast.AST) -> bool:
         return False
     func = node.func
     if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-        return func.value.id == "traceback" or (func.value.id, func.attr) == ("sys", "exc_info")
+        if func.value.id == "traceback":
+            return "stack" not in func.attr  # `print_stack` — стек вызовов, не ошибка
+        return func.value.id == "sys" and func.attr in {"exc_info", "exception"}
     return isinstance(func, ast.Name) and func.id in _ERROR_TEXT_GETTERS
 
 
@@ -336,26 +380,36 @@ def _carries_error_text(value: ast.AST, names: set[str]) -> bool:
     )
 
 
+def _variable(target: ast.AST) -> str | None:
+    """Переменная, в которую кладут значение: `text = …` и `fields["error"] = …`.
+    Атрибут (`run.error_message = …`) — запись в объект, а не в переменную."""
+    if isinstance(target, ast.Subscript):
+        target = target.value
+    return target.id if isinstance(target, ast.Name) else None
+
+
 def _error_text_names(handler: ast.ExceptHandler) -> set[str]:
-    """Имя пойманной ошибки и переменные обработчика, в которые переложен её текст
-    (`text = traceback.format_exc()`, `reason = str(exc)`)."""
+    """Имя пойманной ошибки и переменные обработчика, в которые переложен её
+    текст: `text = traceback.format_exc()`, `fields["error"] = str(exc)`,
+    `errors.append(f"{exc}")`."""
     names = {handler.name} if handler.name else set()
     while True:
         fresh = set()
         for node in ast.walk(handler):
             if isinstance(node, ast.Assign):
-                targets = node.targets
+                targets, values = node.targets, [node.value]
             elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
-                targets = [node.target]
+                targets, values = [node.target], [node.value] if node.value else []
+            elif _called_name(node) in _COLLECTING_METHODS and isinstance(node.func, ast.Attribute):
+                targets, values = [node.func.value], _values(node)
             else:
                 continue
-            if node.value is not None and _carries_error_text(node.value, names):
+            if any(_carries_error_text(value, names) for value in values):
                 fresh |= {
-                    name.id
+                    _variable(part)
                     for target in targets
-                    for name in (target.elts if isinstance(target, ast.Tuple) else [target])
-                    if isinstance(name, ast.Name)
-                }
+                    for part in (target.elts if isinstance(target, ast.Tuple) else [target])
+                } - {None}
         if fresh <= names:
             return names
         names |= fresh
@@ -373,51 +427,53 @@ def _asks_for_a_traceback(call: ast.Call) -> bool:
 
 def _exception_text_findings(tree: ast.AST, senders: frozenset[str]):
     """Каждый вывод текста ошибки из обработчика сбоя отправки: строка, код и
-    под каким именем его можно разрешить — `("event", событие)` для журнала,
-    `("command", функция)` для печати, `None`, если разрешить нельзя."""
+    под каким именем его можно разрешить — `("event", функция, событие)` для
+    журнала, `("print", функция)` для печати, `("raise", функция)` для новой
+    ошибки с этим текстом, `None`, если разрешить нельзя."""
     for node, owner in _nodes_with_owner(tree):
         if not isinstance(node, ast.Try):
             continue
-        if not any(
-            _called_name(inner) in senders for stmt in node.body for inner in ast.walk(stmt)
-        ):
+        if not any(_reference(inner) in senders for stmt in node.body for inner in ast.walk(stmt)):
             continue
         for handler in node.handlers:
             names = _error_text_names(handler)
-            for call in ast.walk(handler):
-                excuse = None
-                if _is_log_call(call):
-                    event = call.args[0] if call.args else None
-                    excuse = ("event", event.value if isinstance(event, ast.Constant) else None)
-                    leaks = _asks_for_a_traceback(call)
-                elif _is_print_call(call):
-                    excuse = ("command", owner)
-                    leaks = False
-                elif _reads_the_caught_error(call) and _called_name(call).startswith("print_"):
+            for inner in ast.walk(handler):
+                call, excuse, leaks = inner, None, False
+                if _is_log_call(inner):
+                    event = inner.args[0] if inner.args else None
+                    event = event.value if isinstance(event, ast.Constant) else None
+                    excuse = ("event", owner, event)
+                    leaks = _asks_for_a_traceback(inner)
+                elif _is_print_call(inner):
+                    excuse = ("print", owner)
+                elif isinstance(inner, ast.Raise) and isinstance(inner.exc, ast.Call):
+                    # `raise click.ClickException(str(exc))`: click напечатает «Error: …».
+                    call, excuse = inner.exc, ("raise", owner)
+                elif _reads_the_caught_error(inner) and _called_name(inner).startswith("print_"):
                     leaks = True  # `traceback.print_exc()` пишет в stderr сам
                 else:
                     continue
                 if leaks or any(_carries_error_text(value, names) for value in _values(call)):
-                    yield call.lineno, ast.unparse(call), excuse
+                    yield inner.lineno, ast.unparse(inner), excuse
 
 
 def exception_text_leaks(
     source: str, *, senders: frozenset[str] | None = None, excused: bool = True
 ) -> list[str]:
-    """Обработчики сбоя отправки, которые выводят саму ошибку: в журнал или печатью.
+    """Обработчики сбоя отправки, которые выводят саму ошибку: в журнал, печатью
+    или новой ошибкой с её текстом.
 
-    Чего правило не видит: текст, который обработчик бросает дальше
-    (`raise X(str(exc))`), и вывод не через `log`, `print`, `click.echo`.
+    Чего правило не видит: текст, который вывели уже после обработчика
+    (собрали в список — напечатали за циклом); журнал не под именем `log` и
+    модули под другим именем (`import traceback as tb`); ошибку, брошенную
+    дальше как есть (`raise`), — её текст чистит слой 2.
     """
     known = senders_in([source]) if senders is None else senders
-    allowed = {("event", event) for event in _LOGS_THE_ERROR_TEXT_BY_DESIGN} | {
-        ("command", function) for function in _PRINTS_A_DELIVERY_ERROR_BY_DESIGN
-    }
     return sorted(
         {
             f"{line}: {code}"
             for line, code, excuse in _exception_text_findings(ast.parse(source), known)
-            if not (excused and excuse in allowed)
+            if not (excused and excuse in _EXCUSED)
         }
     )
 
@@ -440,30 +496,25 @@ def test_no_log_or_print_call_in_src_is_given_an_address():
 def test_no_send_failure_handler_in_src_writes_out_the_exception_text():
     senders = senders_in(_src_sources().values())
     found = _across_src(lambda source: exception_text_leaks(source, senders=senders))
-    assert found == [], _HOW_TO_FIX_EXCEPTION_TEXT
+    assert found == [], _HOW_TO_FIX_EXCEPTION_TEXT.format(wrappers=sorted(senders - _SENDERS))
 
 
-def test_the_lists_of_excused_handlers_are_exact():
+def test_no_excuse_from_the_exception_text_rule_is_dead():
     """Исключение, под которое в коде ничего не попадает, — не страховка, а дыра
-    на будущее: новый обработчик с тем же именем пройдёт без разбора."""
+    на будущее. Обратное этот тест не ловит: второй вывод текста в той же
+    функции (а у события — под тем же именем) пройдёт по уже выданному
+    исключению."""
     senders = senders_in(_src_sources().values())
     used = {
         excuse
         for source in _src_sources().values()
         for _, _, excuse in _exception_text_findings(ast.parse(source), senders)
-        if excuse is not None
     }
-    unused_events = _LOGS_THE_ERROR_TEXT_BY_DESIGN - {
-        name for kind, name in used if kind == "event"
-    }
-    unused_commands = set(_PRINTS_A_DELIVERY_ERROR_BY_DESIGN) - {
-        name for kind, name in used if kind == "command"
-    }
-    assert (unused_events, unused_commands) == (set(), set()), (
+    assert _EXCUSED - used == set(), (
         "В списках исключений из правила о тексте ошибки есть строки, которые "
-        "ничего не разрешают: обработчик исправили, убрали или переименовали. "
-        "Убери их из `_LOGS_THE_ERROR_TEXT_BY_DESIGN` / "
-        "`_PRINTS_A_DELIVERY_ERROR_BY_DESIGN`."
+        "ничего не разрешают: обработчик исправили, убрали или переименовали "
+        "его функцию. Убери или поправь их в `_LOGS_THE_ERROR_TEXT_BY_DESIGN`, "
+        "`_RAISES_THE_ERROR_TEXT_BY_DESIGN`, `_PRINTS_A_DELIVERY_ERROR_BY_DESIGN`."
     )
 
 
@@ -496,9 +547,12 @@ def test_every_excused_command_is_a_cli_command_under_that_name():
     assert problems == [], _HOW_TO_FIX_A_COMMAND_NAME.format(problems="; ".join(problems))
 
 
-# Точка входа CLI в тексте workflow: консольный скрипт или модуль.
-_CLI_ENTRY_POINT = re.compile(r"""(?:pharmacy-monitor|src\.main|src/main\.py)["']?[ \t]""")
+# Точка входа CLI в тексте workflow: консольный скрипт или модуль — в кавычках,
+# в `${PM:-pharmacy-monitor}` или как есть.
+_CLI_ENTRY_POINT = re.compile(r"""(?:pharmacy-monitor|src\.main|src/main\.py)["'}]*[ \t]""")
 _END_OF_SHELL_COMMAND = re.compile(r"&&|\|\||[;|\n]")
+# Строки, которые ничего не запускают: комментарий и имя шага.
+_NOT_A_COMMAND_LINE = re.compile(r"^[ \t]*(?:#|-?[ \t]*name:).*$", re.M)
 
 
 def _cli_command(words: list[str]) -> str:
@@ -510,7 +564,7 @@ def _cli_command(words: list[str]) -> str:
     """
     group, path = main.cli, []
     for word in words:
-        name = word.strip("'\"`()")
+        name = re.split(r"[<>]", word.strip("'\"`()"))[0]  # `health-check>out.txt`
         command = group.commands.get(name)
         if command is None:
             continue
@@ -524,11 +578,17 @@ def _cli_command(words: list[str]) -> str:
 def cli_commands_run(text: str) -> list[tuple[int, str]]:
     """Команды CLI, которые запускает текст workflow: номер строки и команда.
 
-    Перенос строки через `\\` — продолжение той же команды. Чего разбор не
-    видит: команду за переменной оболочки (`$PM recipient list`) и команду
-    внутри скрипта, который workflow запускает.
+    Перенос строки через `\\` — продолжение той же команды. Текст читается, а
+    не исполняется, поэтому команду разбор видит и в строке `echo` с её
+    описанием. Чего он не видит: команду за переменной оболочки (`$PM recipient
+    list`), внутри скрипта, который workflow запускает, вызов из Python
+    (`cli([...])`) и команду, разбитую по строкам без `\\` (YAML `run: >`).
     """
-    joined = re.sub(r"\\\r?\n", lambda found: " " * len(found.group()), text)
+
+    def blank(found: re.Match) -> str:
+        return " " * len(found.group())  # той же длины: номера строк не съезжают
+
+    joined = re.sub(r"\\\r?\n", blank, _NOT_A_COMMAND_LINE.sub(blank, text))
     commands = []
     for entry in _CLI_ENTRY_POINT.finditer(joined):
         tail = _END_OF_SHELL_COMMAND.split(joined[entry.end() :], maxsplit=1)[0]
@@ -549,8 +609,7 @@ def _skips_the_mask(command: str) -> bool:
 
 def test_no_workflow_runs_a_command_whose_output_skips_the_mask():
     """Журнал шага Actions публичен, а `click.echo` маска не трогает."""
-    workflows = sorted((SRC.parent / ".github" / "workflows").glob("*.yml"))
-    assert workflows
+    workflows = sorted((SRC.parent / ".github" / "workflows").glob("*.y*ml"))
     run = {path.name: cli_commands_run(path.read_text(encoding="utf-8")) for path in workflows}
     found = [
         f"{name}:{line}: {command}"
@@ -559,8 +618,10 @@ def test_no_workflow_runs_a_command_whose_output_skips_the_mask():
         if _skips_the_mask(command)
     ]
     assert found == [], _HOW_TO_FIX_A_WORKFLOW
-    # Разбор не ослеп: сбор, который workflow заведомо запускают, он видит.
-    assert "run" in {command for commands in run.values() for _, command in commands}
+    # Разбор не ослеп: в workflow, ради которого всё это, — еженедельном сборе
+    # pharmonline, который шлёт письма, — он видит запуск сбора.
+    weekly = run["autonomous-pharmonline-decodo-public-api.yml"]
+    assert "run" in {command for _, command in weekly}, weekly
 
 
 @pytest.mark.parametrize(
@@ -587,12 +648,19 @@ def test_no_workflow_runs_a_command_whose_output_skips_the_mask():
         ("pharmacy-monitor health-check --alert-email || true", [(1, "health-check")]),
         # Подкоманда в переменной: названа только группа.
         ('pharmacy-monitor recipient "$ACTION"', [(1, "recipient")]),
+        # Точка входа в подстановке по умолчанию; вывод, перенаправленный в файл.
+        ("${PM:-pharmacy-monitor} recipient list", [(1, "recipient list")]),
+        ("pharmacy-monitor health-check>/tmp/health.txt 2>&1", [(1, "health-check")]),
         ("pharmacy-monitor run --site aloe; echo recipient list", [(1, "run")]),
         ("cd /opt/pharmacy-monitor && ls recipient list", []),
         ("from src.main import (", []),
+        # Комментарий и имя шага ничего не запускают.
+        ("  # после выкладки руками: pharmacy-monitor notify test", []),
+        ("      - name: Restart pharmacy-monitor health-check timer", []),
+        ("#!/bin/sh\npharmacy-monitor \\\n  notify test\n", [(2, "notify test")]),
     ],
 )
-def test_the_workflow_check_reads_the_command_the_way_click_does(text, commands):
+def test_the_workflow_check_finds_the_command_behind_options_and_line_breaks(text, commands):
     assert cli_commands_run(text) == commands
 
 
@@ -693,6 +761,14 @@ except Exception as exc:
         'text = traceback.format_exc()\n    log.warning("email_batch_failed", error=text)',
         'reason = str(exc)\n    short = reason[:200]\n    click.echo(f"email: FAIL — {short}")',
         'fields = {"error": str(exc)}\n    log.warning("email_batch_failed", **fields)',
+        'fields["error"] = str(exc)\n    log.warning("email_batch_failed", **fields)',
+        'errors.append(f"{user.id}: {exc}")\n    click.echo("; ".join(errors))',
+        'log.warning("email_batch_failed", error=str(sys.exception()))',
+        # Новая ошибка с тем же текстом: click печатает её строкой «Error: …».
+        'raise click.ClickException(f"email: FAIL — {exc}")',
+        "raise RuntimeError(str(exc)) from None",
+        'sys.exit(f"email: FAIL — {exc}")',
+        "sys.stderr.write(str(exc))",
     ],
 )
 def test_the_code_check_sees_exception_text_in_a_send_failure_handler(body):
@@ -712,19 +788,39 @@ def test_the_code_check_sees_exception_text_in_a_send_failure_handler(body):
         "print(notifier.delivery_error_fields(exc))",
         # Запись в базу — не вывод: её это правило не касается.
         'run.error_message = f"{type(exc).__name__}: {exc}"\n    log.warning("x", run_id=run.id)',
+        # Ошибка, брошенная дальше как есть или без текста пойманной.
+        "raise",
+        'raise click.ClickException("письмо не ушло")',
+        'raise click.ClickException(f"письмо не ушло: {type(exc).__name__}")',
+        "sys.exit(1)",
+        # Стек вызовов — не текст ошибки.
+        "traceback.print_stack()",
     ],
 )
 def test_the_code_check_lets_the_error_class_through(body):
     assert exception_text_leaks(_HANDLER.format(body=body)) == []
 
 
-def test_the_code_check_excuses_only_the_listed_events():
-    assert exception_text_leaks(_HANDLER.format(body='log.exception("run_failed", run_id=1)')) == []
-    assert exception_text_leaks(_HANDLER.format(body='log.exception("report_failed")')) != []
-    # Без списка исключений правило видит и разрешённое.
-    excused = _HANDLER.format(body='log.warning("run_failed", exc_info=True)')
-    assert exception_text_leaks(excused) == []
-    assert len(exception_text_leaks(excused, excused=False)) == 1
+def test_the_code_check_excuses_an_event_only_in_the_function_it_is_listed_for():
+    source = """
+def run_cmd():
+    try:
+        notifier.send_email(subject="x", html_body="y")
+    except Exception as e:
+        log.exception("run_failed", run_id=1)
+        log.exception("report_failed", run_id=1)
+        raise click.ClickException(mask_addresses(str(e)))
+
+def report_cmd():
+    try:
+        notifier.send_email(subject="x", html_body="y")
+    except Exception as e:
+        log.exception("run_failed", run_id=1)
+        raise click.ClickException(mask_addresses(str(e)))
+"""
+    assert [line.split(":")[0] for line in exception_text_leaks(source)] == ["14", "15", "7"]
+    # Без списков исключений правило видит и разрешённое.
+    assert len(exception_text_leaks(source, excused=False)) == 5
 
 
 def test_the_code_check_excuses_printing_the_error_only_inside_the_listed_commands():
@@ -766,35 +862,50 @@ def deliver_past_a_narrow_handler(report):
     except OSError:
         pass
 
+def deliver_and_reraise(report):
+    try:
+        notifier.send_email(subject="x", html_body=render(report))
+    except Exception as exc:
+        log.warning("report_email_failed", **notifier.delivery_error_fields(exc))
+        raise
+
 def command(report):
     try:
-        {wrapper}(report)
+        {call}
     except Exception as exc:
         click.echo(f"report: FAIL — {{exc}}")
 """
 
 
 @pytest.mark.parametrize(
-    ("wrapper", "leaks"),
+    ("call", "leaks"),
     [
-        ("deliver", 1),
+        ("deliver(report)", 1),
         # Сбой выходит и через вторую обёртку.
-        ("deliver_and_record", 1),
+        ("deliver_and_record(report)", 1),
         # `except OSError` отказ почтового сервера не ловит.
-        ("deliver_past_a_narrow_handler", 1),
+        ("deliver_past_a_narrow_handler(report)", 1),
+        # Записала и бросила дальше — сбой не остановлен.
+        ("deliver_and_reraise(report)", 1),
+        # Обёртку зовут не по имени, а передают аргументом.
+        ("ctx.invoke(deliver, report)", 1),
+        # Под `send_email`: ошибка отсюда ещё с адресом в тексте.
+        ("notifier._send_email(subject, html, None, None)", 1),
         # Эта свой сбой поймала сама: в `command` приходит уже не он.
-        ("deliver_quietly", 0),
-        ("record", 0),
+        ("deliver_quietly(report)", 0),
+        ("record(report)", 0),
     ],
 )
-def test_the_code_check_follows_a_send_failure_to_the_handler_that_gets_it(wrapper, leaks):
-    assert len(exception_text_leaks(_WRAPPED_SENDER.format(wrapper=wrapper))) == leaks
+def test_the_code_check_follows_a_send_failure_to_the_handler_that_gets_it(call, leaks):
+    assert len(exception_text_leaks(_WRAPPED_SENDER.format(call=call))) == leaks
 
 
 def test_the_code_check_knows_which_functions_in_src_let_a_send_failure_out():
-    """`health_check_cmd` ловит сбой не `send_email`, а этой обёртки над ним."""
     senders = senders_in(_src_sources().values())
+    # `health_check_cmd` ловит сбой не `send_email`, а этой обёртки над ним.
     assert "_dispatch_health_alert_email" in senders
+    # Сбой сбора записан и брошен дальше: `run` сбой письма о прогоне выпускает.
+    assert "run_cmd" in senders
     # Эти сбой отправки ловят сами.
     assert not {"dispatch_events_batch", "mail_unstored_events_to_admins"} & senders
 
@@ -1266,6 +1377,9 @@ def test_third_party_logging_never_prints_an_address(
         raise smtplib.SMTPRecipientsRefused({ADDRESS: (550, SMTP_REPLY.encode())})
     except smtplib.SMTPException:
         library.exception("delivery to %s failed", "почта@пример.рф")
+    # Сообщение не сошлось с аргументами: `logging` такую запись печатает сам,
+    # мимо формата и вместе с аргументами.
+    library.warning("sent to %s and %s", ADDRESS)
 
     for handler in logging.getLogger().handlers:
         handler.flush()
@@ -1276,3 +1390,5 @@ def test_third_party_logging_never_prints_an_address(
         assert "550 <<address>>: Recipient address rejected" in written
         assert "delivery to <address> failed" in written
         assert "SMTPRecipientsRefused" in written and "Traceback" in written
+        assert "'sent to %s and %s' % ('<address>',)" in written
+        assert "Logging error" not in written
