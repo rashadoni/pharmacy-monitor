@@ -8,7 +8,9 @@ import { Building2, ExternalLink, Leaf, Pill, Search } from "lucide-react";
 import {
   api,
   friendlyError,
+  isRecommendationsRecalculatingError,
   isVerifiedScanPendingError,
+  roiRecalculationPollMs,
   type SiteProduct,
 } from "@/lib/api";
 import { ActionRow } from "@/components/action-row";
@@ -112,8 +114,15 @@ export default function SitePage() {
     queryKey: ["site", site, "roi-recommendations", locale],
     queryFn: () => api.roiRecommendations(site, locale),
     enabled: site === "pharmonline",
+    refetchInterval: (query) => roiRecalculationPollMs(query.state),
   });
-  const roiWaitingForVerifiedScan = isVerifiedScanPendingError(recommendationsQ.error);
+  const roiRecalculating = isRecommendationsRecalculatingError(recommendationsQ.error);
+  // Both are expected, self-resolving states: no red box and no retry button.
+  const roiWaitingForVerifiedScan =
+    roiRecalculating || isVerifiedScanPendingError(recommendationsQ.error);
+  // После неудачного обновления запрос хранит прежний ответ. Когда сервер
+  // рекомендации отозвал, прежний список под плашкой показывать нельзя.
+  const recommendations = roiWaitingForVerifiedScan ? undefined : recommendationsQ.data;
   const pageDataError = summaryQ.error ?? facetsQ.error ?? brandsQ.error;
 
   return (
@@ -189,13 +198,16 @@ export default function SitePage() {
         <p className="text-xs text-muted-foreground mb-3">
           {t("roi_subtitle", { site, competitors: competitors.join("/") })}
         </p>
-        {recommendationsQ.data?.provenance.run_id != null && (
+        {recommendations?.provenance.run_id != null && (
           <p className="mb-3 text-xs text-muted-foreground">
             {t("roi_provenance", {
-              run: recommendationsQ.data.provenance.run_id,
-              completed: formatRelative(recommendationsQ.data.provenance.run_finished_at, locale),
+              run: recommendations.provenance.run_id,
+              completed: formatRelative(recommendations.provenance.run_finished_at, locale),
             })}
           </p>
+        )}
+        {recommendations?.provenance.refresh_pending && (
+          <p className="mb-3 text-xs text-muted-foreground">{t("roi_refresh_pending")}</p>
         )}
         {recommendationsQ.isLoading && (
           <div className="rounded-md border border-border bg-card p-3 text-sm text-muted-foreground flex items-center gap-2">
@@ -212,9 +224,11 @@ export default function SitePage() {
             }`}
           >
             <div>
-              {roiWaitingForVerifiedScan
-                ? t("roi_waiting_verified")
-                : friendlyError(recommendationsQ.error, locale)}
+              {roiRecalculating
+                ? t("roi_recalculating")
+                : roiWaitingForVerifiedScan
+                  ? t("roi_waiting_verified")
+                  : friendlyError(recommendationsQ.error, locale)}
             </div>
             {!roiWaitingForVerifiedScan && (
               <button
@@ -227,13 +241,13 @@ export default function SitePage() {
             )}
           </div>
         )}
-        {recommendationsQ.data && recommendationsQ.data.items.length === 0 && (
+        {recommendations && recommendations.items.length === 0 && (
           <div className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
             {t("roi_empty")}
           </div>
         )}
         <div className="space-y-2">
-          {recommendationsQ.data?.items.slice(0, 10).map((a, i) => (
+          {recommendations?.items.slice(0, 10).map((a, i) => (
             <ActionRow key={i} action={a} />
           ))}
         </div>

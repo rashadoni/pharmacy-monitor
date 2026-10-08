@@ -85,7 +85,7 @@ from sqlalchemy.orm import Session, aliased, selectinload
 
 from src import analytics, catalog_search
 from src import inventory as inv_mod
-from src import storage, tenants
+from src import roi_refresh, storage, tenants
 from src._time import utcnow
 from src.category_taxonomy import classify_source_category, source_category_labels
 from src.normalize import pack_unit_count
@@ -460,6 +460,9 @@ class RoiStatusOut(BaseModel):
     run_started_at: datetime | None = None
     run_finished_at: datetime | None = None
     item_count: int = 0
+    # A change made since these recommendations were computed (thresholds,
+    # costs, a match edit) is waiting for the watcher to recalculate them.
+    refresh_pending: bool = False
 
 
 class RoiRecommendationsOut(BaseModel):
@@ -2758,6 +2761,26 @@ def _category_label_priority(
     return (key == f"{prefix}_{slug}", bool(is_active), category_id)
 
 
+_ROI_WAITING_FOR_SCAN_DETAIL = "Verified full-catalog recommendations are not available yet"
+_ROI_RECALCULATING_DETAIL = "Recommendations are being recalculated"
+
+
+def _roi_unavailable(db: Session, *, tenant_id: int) -> HTTPException:
+    """Why the cache cannot be served: a scan is needed, or a refresh is queued.
+
+    The two differ for the reader by a week: a queued refresh brings the
+    recommendations back within minutes, a missing verified catalogue only
+    after the next full scan.  "Being recalculated" is claimed only while the
+    catalogue is trusted — otherwise the queued refresh will be skipped and the
+    honest answer is still "wait for the scan".
+    """
+    if roi_refresh.has_pending_request(
+        db, tenant_id=tenant_id
+    ) and _trusted_snapshot_lineage_available(db, tenant_id=tenant_id):
+        return HTTPException(503, _ROI_RECALCULATING_DETAIL)
+    return HTTPException(503, _ROI_WAITING_FOR_SCAN_DETAIL)
+
+
 @app.get("/api/v1/dash/roi/actions")
 def dash_roi_actions(
     client_site: str = "pharmonline",
@@ -2787,10 +2810,7 @@ def dash_roi_actions(
     if cached is not None:
         return [roi.translate_action(a, locale) for a in cached]
 
-    raise HTTPException(
-        503,
-        "Verified full-catalog recommendations are not available yet",
-    )
+    raise _roi_unavailable(db, tenant_id=user.tenant_id)
 
 
 @app.get("/api/v1/dash/roi/recommendations", response_model=RoiRecommendationsOut)
@@ -2811,10 +2831,7 @@ def dash_roi_recommendations(
         tenant_id=user.tenant_id,
     )
     if snapshot is None:
-        raise HTTPException(
-            503,
-            "Verified full-catalog recommendations are not available yet",
-        )
+        raise _roi_unavailable(db, tenant_id=user.tenant_id)
 
     payload, cache_row, run = snapshot
     items = [roi.translate_action(item, locale) for item in payload]
@@ -2828,6 +2845,7 @@ def dash_roi_recommendations(
             run_started_at=run.started_at,
             run_finished_at=run.finished_at,
             item_count=len(items),
+            refresh_pending=roi_refresh.has_pending_request(db, tenant_id=user.tenant_id),
         ),
     )
 
@@ -2846,9 +2864,14 @@ def dash_roi_status(
     from src import roi
 
     _require_site(client_site)
+    refresh_pending = roi_refresh.has_pending_request(db, tenant_id=user.tenant_id)
     snapshot = roi.get_cached_actions_snapshot(db, client_site, tenant_id=user.tenant_id)
     if snapshot is None:
-        return RoiStatusOut(available=False, client_site=client_site)
+        return RoiStatusOut(
+            available=False,
+            client_site=client_site,
+            refresh_pending=refresh_pending,
+        )
 
     cached, cache_row, run = snapshot
 
@@ -2860,6 +2883,7 @@ def dash_roi_status(
         run_started_at=run.started_at,
         run_finished_at=run.finished_at,
         item_count=len(cached),
+        refresh_pending=refresh_pending,
     )
 
 
@@ -5032,6 +5056,19 @@ def _require_match_policy(products: list[storage.Product]) -> None:
             raise HTTPException(409, f"Product {product.id} has no fresh active offer")
 
 
+def _queue_roi_refresh_after_match_edit(db: Session, tenant_id: int, reason: str) -> None:
+    """Состав пары изменился — рекомендации надо пересчитать, не дожидаясь сбора.
+
+    Кэш при этом НЕ сбрасывается: до пересчёта (около минуты) дашборд показывает
+    прежние рекомендации, а не пустой экран после каждого клика оператора.
+    Заявка уходит в транзакцию самой правки (`roi_refresh.request_refresh`).
+
+    `/confirm` заявку не оставляет: он меняет только `is_manual`/`needs_review`,
+    а расчёт рекомендаций эти флаги не читает.
+    """
+    roi_refresh.request_refresh(db, tenant_id=tenant_id, reason=reason)
+
+
 @app.post("/api/v1/dash/matches/{match_id}/confirm", status_code=204)
 def dash_match_confirm(
     match_id: int,
@@ -5068,7 +5105,11 @@ def dash_match_reject(
     """Manually reject a match: remove canonical_id from products + record rejection pair."""
     from src import match_actions
 
-    match = db.scalar(select(storage.Match).where(storage.Match.id == match_id))
+    match = db.scalar(
+        select(storage.Match).where(
+            storage.Match.id == match_id, storage.Match.tenant_id == user.tenant_id
+        )
+    )
     if not match:
         raise HTTPException(404, "Match not found")
     products = list(match.products)
@@ -5082,6 +5123,7 @@ def dash_match_reject(
         p.canonical_id = None
     # Delete the match itself
     db.delete(match)
+    _queue_roi_refresh_after_match_edit(db, match.tenant_id, "match_reject")
     db.commit()
     return Response(status_code=204)
 
@@ -5161,6 +5203,9 @@ def dash_match_relink(
 
     _require_match_policy([p for p in match.products if p.site != site] + [prod])
 
+    # swap_alternative commits by itself — the request has to be in the session
+    # before it does.  A refused swap commits nothing, the request included.
+    _queue_roi_refresh_after_match_edit(db, user.tenant_id, "match_relink")
     ok = match_actions.swap_alternative(db, match_id, site, prod.id)
     if not ok:
         raise HTTPException(400, "Не удалось переназначить (возможно, это уже текущий товар сайта)")
@@ -5258,7 +5303,13 @@ def dash_pricing_update(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """Update pricing thresholds. Invalidates ROI cache so next request re-computes."""
+    """Update pricing thresholds and queue a recalculation of the ROI cache.
+
+    The cache is dropped here and is NOT recomputed by the next request: a
+    request never computes (see "Persistent cache" in ``src/roi.py``).  The
+    queued refresh is executed by the server watcher within about a minute;
+    until then ``/roi/*`` answers 503 "being recalculated".
+    """
     _require_admin(user)
     cfg = storage.load_pricing_config(db, tenant_id=user.tenant_id)
     cfg.raise_threshold_pct = payload.raise_threshold_pct
@@ -5267,10 +5318,11 @@ def dash_pricing_update(
     cfg.min_margin_pct = payload.min_margin_pct
     cfg.max_per_type = payload.max_per_type
     cfg.updated_at = utcnow()
-    # Invalidate ROI cache so next /roi/actions re-computes with new thresholds.
-    db.query(storage.RoiActionsCache).filter(
-        storage.RoiActionsCache.tenant_id == user.tenant_id
-    ).delete()
+    # Recommendations computed with the old thresholds must not stay visible.
+    # The refresh request commits together with the thresholds it is about.
+    roi_refresh.drop_cache_and_request_refresh(
+        db, tenant_id=user.tenant_id, reason=roi_refresh.REASON_PRICING_CONFIG
+    )
     db.commit()
     log.info("pricing_config_updated", tenant_id=user.tenant_id, user_id=user.id)
     return PricingConfigOut(
@@ -5481,11 +5533,12 @@ async def dash_cost_csv_import(
             )
             db.add(batch)
             db.flush()
-            # Costs, batch provenance and cache invalidation are one atomic
-            # transaction. Any failure rolls the entire import back.
-            db.query(storage.RoiActionsCache).filter(
-                storage.RoiActionsCache.tenant_id == user.tenant_id
-            ).delete()
+            # Costs, batch provenance, cache invalidation and the request to
+            # recompute the cache are one atomic transaction. Any failure rolls
+            # the entire import back.
+            roi_refresh.drop_cache_and_request_refresh(
+                db, tenant_id=user.tenant_id, reason=roi_refresh.REASON_COST_IMPORT
+            )
             db.commit()
     except Exception:
         db.rollback()
@@ -5612,9 +5665,9 @@ def dash_cost_import_rollback(
                 current.updated_at = utcnow()
             batch.rolled_back_at = utcnow()
             batch.rolled_back_by_user_id = user.id
-            db.query(storage.RoiActionsCache).filter(
-                storage.RoiActionsCache.tenant_id == user.tenant_id
-            ).delete()
+            roi_refresh.drop_cache_and_request_refresh(
+                db, tenant_id=user.tenant_id, reason=roi_refresh.REASON_COST_IMPORT_ROLLBACK
+            )
             db.commit()
     except HTTPException:
         db.rollback()
@@ -5950,6 +6003,7 @@ def dash_match_add_product(
     match.match_strategy = "manual"
     if match.confidence is None or match.confidence < 1.0:
         match.confidence = 1.0
+    _queue_roi_refresh_after_match_edit(db, user.tenant_id, "match_add_product")
     db.commit()
 
     log.info(
@@ -6021,6 +6075,7 @@ def dash_match_create_with_products(
     db.flush()
     for p in products:
         p.canonical_id = match.id
+    _queue_roi_refresh_after_match_edit(db, user.tenant_id, "match_create")
     db.commit()
     db.refresh(match)
 

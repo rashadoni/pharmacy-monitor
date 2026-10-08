@@ -13,6 +13,10 @@ from sqlalchemy.orm import Session
 log = structlog.get_logger()
 
 SCRAPE_ADVISORY_LOCK_KEY = "pharmacy_monitor_scrape"
+# Один пересчёт кэша рекомендаций за раз (`src/roi_refresh.py`). Отдельный ключ:
+# читатели каталога делят между собой shared-блокировку сбора, и два пересчёта
+# под ней друг другу не мешали бы — оба вставили бы одну и ту же строку кэша.
+ROI_REFRESH_ADVISORY_LOCK_KEY = "pharmacy_monitor_roi_refresh"
 
 
 def _is_postgres_bind(bind) -> bool:
@@ -29,6 +33,19 @@ def try_exclusive_scrape_lock(session: Session) -> Iterator[bool]:
     the lock explicitly.  The lock connection commits immediately after each
     advisory-lock operation and never remains idle in a transaction.
     """
+    with _try_exclusive_lock(session, SCRAPE_ADVISORY_LOCK_KEY) as acquired:
+        yield acquired
+
+
+@contextmanager
+def try_exclusive_roi_refresh_lock(session: Session) -> Iterator[bool]:
+    """Non-blocking mutex between concurrent ROI cache refreshes."""
+    with _try_exclusive_lock(session, ROI_REFRESH_ADVISORY_LOCK_KEY) as acquired:
+        yield acquired
+
+
+@contextmanager
+def _try_exclusive_lock(session: Session, key: str) -> Iterator[bool]:
     bind = session.get_bind()
     if not _is_postgres_bind(bind):
         yield True
@@ -40,7 +57,7 @@ def try_exclusive_scrape_lock(session: Session) -> Iterator[bool]:
         acquired = bool(
             connection.scalar(
                 text("SELECT pg_try_advisory_lock(hashtext(:key))"),
-                {"key": SCRAPE_ADVISORY_LOCK_KEY},
+                {"key": key},
             )
         )
         connection.commit()
@@ -53,12 +70,12 @@ def try_exclusive_scrape_lock(session: Session) -> Iterator[bool]:
             try:
                 connection.scalar(
                     text("SELECT pg_advisory_unlock(hashtext(:key))"),
-                    {"key": SCRAPE_ADVISORY_LOCK_KEY},
+                    {"key": key},
                 )
                 connection.commit()
             except Exception as exc:
                 connection.rollback()
-                log.warning("scrape_lock_release_failed", error=str(exc))
+                log.warning("scrape_lock_release_failed", key=key, error=str(exc))
         connection.close()
 
 

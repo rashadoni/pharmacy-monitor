@@ -13,7 +13,9 @@ import { useState } from "react";
 import {
   api,
   friendlyError,
+  isRecommendationsRecalculatingError,
   isVerifiedScanPendingError,
+  roiRecalculationPollMs,
   type RunBreakdown,
   type RunRow,
   type RoiAction,
@@ -37,7 +39,16 @@ export default function OverviewPage() {
   const recommendationsQ = useQuery({
     queryKey: ["roi-recommendations", "pharmonline", locale],
     queryFn: () => api.roiRecommendations(undefined, locale),
+    refetchInterval: (query) => roiRecalculationPollMs(query.state),
   });
+  // После неудачного обновления запрос хранит прежний ответ. Когда сервер
+  // рекомендации отозвал (пересчитываются или ждут сбора), прежний список под
+  // плашкой показывать нельзя.
+  const recommendations =
+    isRecommendationsRecalculatingError(recommendationsQ.error) ||
+    isVerifiedScanPendingError(recommendationsQ.error)
+      ? undefined
+      : recommendationsQ.data;
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
   const latestBySiteQ = useQuery({
     queryKey: ["runs-latest-by-site"],
@@ -126,27 +137,32 @@ export default function OverviewPage() {
       {/* Today's actions */}
       <div>
         <h2 className="text-lg font-semibold mb-3">{t("today_actions")}</h2>
-        {recommendationsQ.data?.provenance.run_id != null && (
+        {recommendations?.provenance.run_id != null && (
           <p className="mb-3 text-xs text-muted-foreground">
             {t("recommendations_provenance", {
-              run: recommendationsQ.data.provenance.run_id,
-              completed: formatRelative(recommendationsQ.data.provenance.run_finished_at, locale),
+              run: recommendations.provenance.run_id,
+              completed: formatRelative(recommendations.provenance.run_finished_at, locale),
             })}
           </p>
+        )}
+        {recommendations?.provenance.refresh_pending && (
+          <p className="mb-3 text-xs text-muted-foreground">{t("recommendations_refresh_pending")}</p>
         )}
         {recommendationsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
         {recommendationsQ.isError && (
           <div className="rounded-md border border-warning/40 bg-warning/5 p-3 text-sm text-warning">
-            {isVerifiedScanPendingError(recommendationsQ.error)
-              ? t("recommendations_waiting_verified")
-              : friendlyError(recommendationsQ.error, locale)}
+            {isRecommendationsRecalculatingError(recommendationsQ.error)
+              ? t("recommendations_recalculating")
+              : isVerifiedScanPendingError(recommendationsQ.error)
+                ? t("recommendations_waiting_verified")
+                : friendlyError(recommendationsQ.error, locale)}
           </div>
         )}
-        {recommendationsQ.data && recommendationsQ.data.items.length === 0 && (
+        {recommendations && recommendations.items.length === 0 && (
           <div className="text-muted-foreground">{t("no_actions")}</div>
         )}
         <div className="space-y-2">
-          {recommendationsQ.data?.items.slice(0, 10).map((a, i) => (
+          {recommendations?.items.slice(0, 10).map((a, i) => (
             <ActionRow key={i} action={a} />
           ))}
         </div>

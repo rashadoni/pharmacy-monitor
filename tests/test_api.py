@@ -5263,6 +5263,7 @@ def test_roi_status_is_unavailable_without_verified_cache(client, auth_cookie):
         "run_started_at": None,
         "run_finished_at": None,
         "item_count": 0,
+        "refresh_pending": False,
     }
     recommendations = client.get("/api/v1/dash/roi/recommendations")
     assert recommendations.status_code == 503
