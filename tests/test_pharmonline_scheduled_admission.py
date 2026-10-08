@@ -112,6 +112,68 @@ def _assert_nothing_written(db_session, *, products: int) -> None:
     assert db_session.query(storage.PharmonlinePublicAPIIdentityQuarantine).count() == 0
 
 
+def test_proof_version_strings_are_a_data_contract():
+    """Эти строки лежат в журнале допусков на проде. Переименовать константу —
+    значит объявить все прежние допуски недействительными: сбор откажет, а
+    ручная сверка упадёт на уникальном ключе журнала. Менять только вместе с
+    данными."""
+    assert SCHEDULED == "public_api_scheduled_admission_v1"
+    assert MANUAL == "public_api_identity_admission_v1"
+    assert set(main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF) == {SCHEDULED, MANUAL}
+    scheduled_transports, scheduled_kinds = (
+        main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF[SCHEDULED]
+    )
+    # Писателю без присмотра — только транспорты плановых путей и два класса.
+    assert scheduled_transports == {"decodo", "direct", "firecrawl"}
+    assert scheduled_kinds == {"new_public_product", "existing_native_id"}
+    manual_transports, manual_kinds = main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF[
+        MANUAL
+    ]
+    assert manual_transports == {"crawlbase", "decodo", "scraperapi", "firecrawl"}
+    assert manual_kinds == {
+        "new_public_product",
+        "existing_native_id",
+        "quarantined_public_product",
+    }
+
+
+def test_manual_reconciliation_script_names_its_proof_version():
+    """У записи допуска нет версии по умолчанию. Ручная сверка обязана называть
+    свою — иначе её workflow упадёт уже на проде, на вызове записи."""
+    import ast
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / (
+        "scripts/reconcile_pharmonline_public_api_identities.py"
+    )
+    calls = [
+        node
+        for node in ast.walk(ast.parse(script.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "_apply_pharmonline_public_api_reconciliation"
+    ]
+    (call,) = calls
+    (keyword,) = [kw for kw in call.keywords if kw.arg == "admission_proof_version"]
+    assert getattr(keyword.value, "id", "") == "_PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION"
+
+    import scripts.reconcile_pharmonline_public_api_identities as reconcile
+
+    assert reconcile._PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION == MANUAL
+
+
+def test_write_without_a_named_proof_version_is_a_programming_error(db_session):
+    with pytest.raises(TypeError, match="admission_proof_version"):
+        main_mod._apply_pharmonline_public_api_reconciliation(
+            db_session,
+            _catalog(_api(2, "brand-new")),
+            tenant_id=1,
+            source_manifest_sha256="c" * 64,
+            catalog_fingerprint_sha256="d" * 64,
+            source_transport="decodo",
+            preflight_run_ref="501",
+        )
+
+
 # ─── Что допускается ─────────────────────────────────────────────────────────
 
 
@@ -311,8 +373,11 @@ def test_returned_product_with_an_unusable_ledger_row_refuses(db_session):
     assert [row.proof_version for row in _admissions(db_session)] == ["some_future_proof_v9"]
 
 
-def test_unknown_transport_refuses(db_session):
-    summary, _ = _admit(db_session, _catalog(_api(2, "brand-new")), transport="tor")
+@pytest.mark.parametrize("transport", ["tor", "crawlbase", "scraperapi"])
+def test_transport_outside_the_scheduled_paths_refuses(db_session, transport):
+    """Незнакомый транспорт и транспорты старых ручных workflow: писать допуск
+    без присмотра можно только с тех, которыми ходит плановый сбор."""
+    summary, _ = _admit(db_session, _catalog(_api(2, "brand-new")), transport=transport)
 
     assert summary["status"] == "refused"
     assert summary["reason"] == "transport"
@@ -727,6 +792,10 @@ def _ledger_row(product: storage.Product, **overrides):
     [
         ({}, None),
         ({"source_transport": "decodo"}, None),
+        ({"source_transport": "firecrawl"}, None),
+        # Транспорты старых ручных workflow плановой версии не положены.
+        ({"source_transport": "crawlbase"}, "transport"),
+        ({"source_transport": "scraperapi"}, "transport"),
         ({"admission_kind": "existing_native_id"}, None),
         ({"proof_version": MANUAL, "source_transport": "decodo"}, None),
         # Ручная версия с direct — такой строки ручная сверка написать не могла.
@@ -985,8 +1054,13 @@ def test_run_failing_after_the_admission_keeps_it_and_shows_it(
     assert run.status == "failed"
     assert "database went away" in run.error_message
     assert run.run_quality["pharmonline_identity_admission"]["status"] == "admitted"
+    assert run.run_quality["pharmonline_identity_admission"]["mail"] == {"email": 1, "failed": 0}
     # Упавший прогон не должен выглядеть пригодным для денежных выводов.
     assert run.run_quality["financially_eligible"] is False
+    assert run.run_quality["full_catalog_verified"] is False
+    # Форма та же, что у любого прогона: её читает дашборд.
+    assert run.run_quality["mode"] == "public_api"
+    assert "pharmonline" in run.run_quality["sites"]
     (admission,) = _admissions(db_session)
     assert admission.preflight_run_ref == str(run.id)
     assert db_session.get(storage.Product, admission.product_id) is not None
@@ -1000,8 +1074,12 @@ def test_run_failing_after_the_admission_keeps_it_and_shows_it(
     assert admitted == []
 
 
-def test_dry_run_admits_but_sends_no_mail(db_session, scheduled_run, monkeypatch):
-    """`--dry-run` обещает не слать писем; сбор и допуск при этом настоящие."""
+def test_dry_run_admission_is_real_and_still_mails_the_admin(
+    db_session, scheduled_run, monkeypatch
+):
+    """`--dry-run` придерживает то, что читает клиент (алерты, отчёт). Допуск
+    при этом настоящий, и служебное письмо о нём уходит: с `--dry-run` зовут
+    `run` workflow ручной сверки, и допуск, сделанный там, не должен быть тихим."""
     monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
     monkeypatch.setenv("PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER", "/nonexistent/marker")
     scheduled_run.args = ["run", "--site", "pharmonline", "--mode", "public_api", "--dry-run"]
@@ -1012,7 +1090,9 @@ def test_dry_run_admits_but_sends_no_mail(db_session, scheduled_run, monkeypatch
     run = _latest_run(db_session)
     assert run.run_quality["pharmonline_identity_admission"]["status"] == "admitted"
     assert len(_admissions(db_session)) == 1
-    assert scheduled_run.sent == []
+    (mail,) = scheduled_run.sent
+    assert mail["to"] == ["owner@example.test"]
+    assert run.run_quality["pharmonline_identity_admission"]["mail"] == {"email": 1, "failed": 0}
 
 
 def test_run_without_a_qualifying_admin_still_admits_and_says_so(db_session, scheduled_run):
@@ -1029,6 +1109,8 @@ def test_run_without_a_qualifying_admin_still_admits_and_says_so(db_session, sch
     assert run.run_quality["pharmonline_identity_admission"]["status"] == "admitted"
     # CLI настраивает журнал сам, поэтому событие ищем в его выводе.
     assert "pharmonline_scheduled_admission_mail_no_recipient" in result.output
+    # И в самом прогоне видно, что письма не было.
+    assert run.run_quality["pharmonline_identity_admission"]["mail"] == {"email": 0, "failed": 0}
 
 
 def test_failed_mail_does_not_stop_the_run(db_session, scheduled_run, monkeypatch):
@@ -1042,6 +1124,7 @@ def test_failed_mail_does_not_stop_the_run(db_session, scheduled_run, monkeypatc
     assert "_AfterPersist" in result.output
     run = _latest_run(db_session)
     assert run.run_quality["pharmonline_identity_admission"]["status"] == "admitted"
+    assert run.run_quality["pharmonline_identity_admission"]["mail"] == {"email": 0, "failed": 1}
     assert db_session.query(storage.PriceSnapshot).filter_by(run_id=run.id).count() == 1
 
 
@@ -1133,3 +1216,164 @@ def test_admission_mail_is_not_sent_for_an_empty_list(db_session, monkeypatch):
 
     assert counts == {"email": 0, "failed": 0}
     assert sent == []
+
+
+# ─── PostgreSQL: транзакция допуска на настоящей базе ────────────────────────
+
+
+@pytest.fixture
+def postgres_session():
+    """Сессия на PostgreSQL из DATABASE_URL (в CI он есть); без него — пропуск.
+
+    База общая для всех тестов, поэтому у теста свой тенант и свои
+    идентификаторы, а строки за собой он удаляет.
+    """
+    import os
+    import secrets
+
+    from sqlalchemy import text
+
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url.startswith("postgresql"):
+        pytest.skip("PostgreSQL DATABASE_URL is required")
+    tenant_id = 900_000 + secrets.randbelow(90_000)
+    tag = secrets.token_hex(3)
+    session = storage.make_session(database_url)()
+    try:
+        yield session, tenant_id, tag
+    finally:
+        session.rollback()
+        for statement in (
+            "DELETE FROM pharmonline_public_api_identity_admissions WHERE tenant_id = :t",
+            "DELETE FROM products WHERE tenant_id = :t",
+            "DELETE FROM runs WHERE tenant_id = :t",
+        ):
+            session.execute(text(statement), {"t": tenant_id})
+        session.commit()
+        session.close()
+
+
+def _pg_api(tag: str, letter: str, slug: str) -> ScrapedProduct:
+    return ScrapedProduct(
+        site="pharmonline",
+        external_id=f"PgAdm{tag}{letter * 6}",
+        url=_url(f"pg-{tag}-{slug}"),
+        name=f"Postgres {slug}",
+        price=10.0,
+        identity_verified=True,
+        availability_source=PUBLIC_API_AVAILABILITY_SOURCE,
+    )
+
+
+def test_admission_runs_serializable_under_row_locks_on_postgres(postgres_session, monkeypatch):
+    """То, чего SQLite не исполняет: SERIALIZABLE первой командой транзакции,
+    блокировка строк, возврат к обычному уровню после фиксации."""
+    from sqlalchemy import text
+
+    session, tenant_id, tag = postgres_session
+    run = storage.Run(status="running", tenant_id=tenant_id)
+    session.add(run)
+    known = _pg_api(tag, "k", "known")
+    session.add(
+        storage.Product(
+            tenant_id=tenant_id,
+            site="pharmonline",
+            external_id=known.external_id,
+            url=known.url,
+            name=known.name,
+            name_normalized=normalize_name(known.name),
+            availability_source=DDP,
+        )
+    )
+    session.commit()
+    seen: dict[str, object] = {}
+    original_apply = main_mod._apply_pharmonline_public_api_reconciliation
+
+    def observing_apply(apply_session, results, **kwargs):
+        metrics = original_apply(apply_session, results, **kwargs)
+        seen["isolation"] = apply_session.scalar(text("SHOW transaction_isolation"))
+        seen["row_locks"] = apply_session.scalar(
+            text(
+                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+                "WHERE c.relname = 'products' AND l.pid = pg_backend_pid() "
+                "AND l.mode = 'RowShareLock'"
+            )
+        )
+        return metrics
+
+    monkeypatch.setattr(main_mod, "_apply_pharmonline_public_api_reconciliation", observing_apply)
+    results = _catalog(known, _pg_api(tag, "n", "brand-new"))
+
+    summary, admitted = main_mod._admit_pharmonline_public_api_scheduled_identities(
+        session, results, tenant_id=tenant_id, run_id=run.id, source_transport="direct"
+    )
+
+    assert summary["status"] == "admitted", summary
+    assert len(admitted) == 1
+    assert seen == {"isolation": "serializable", "row_locks": 1}
+    # Уровень изоляции не утекает в запись сбора, которая идёт следом.
+    assert session.scalar(text("SHOW transaction_isolation")) == "read committed"
+    session.rollback()
+    (row,) = session.query(storage.PharmonlinePublicAPIIdentityAdmission).filter_by(
+        tenant_id=tenant_id
+    )
+    assert (row.proof_version, row.source_transport, row.preflight_run_ref) == (
+        SCHEDULED,
+        "direct",
+        str(run.id),
+    )
+
+
+def test_database_error_in_the_middle_of_a_batch_on_postgres(postgres_session):
+    """PostgreSQL после ошибки прерывает транзакцию целиком: без отката на ней
+    упала бы и проверка личностей, и запись сбора. SQLite это «прощает»."""
+    from sqlalchemy import text
+
+    session, tenant_id, tag = postgres_session
+    run = storage.Run(status="running", tenant_id=tenant_id)
+    session.add(run)
+    known = _pg_api(tag, "k", "known")
+    bystander = storage.Product(
+        tenant_id=tenant_id,
+        site="pharmonline",
+        external_id=known.external_id,
+        url=known.url,
+        name=known.name,
+        name_normalized=normalize_name(known.name),
+        availability_source=DDP,
+    )
+    session.add(bystander)
+    session.flush()
+    colliding = _pg_api(tag, "c", "collides")
+    # Старая непригодная строка журнала на идентификатор, который сайт назовёт новым.
+    session.add(
+        storage.PharmonlinePublicAPIIdentityAdmission(
+            tenant_id=tenant_id,
+            product_id=bystander.id,
+            admission_kind="new_public_product",
+            public_api_external_id=colliding.external_id,
+            public_api_canonical_url=colliding.url,
+            proof_version="stale_v0",
+            source_manifest_sha256="a" * 64,
+            catalog_fingerprint_sha256="b" * 64,
+            source_transport="direct",
+            preflight_run_ref="1",
+        )
+    )
+    session.commit()
+    results = _catalog(known, _pg_api(tag, "n", "brand-new"), colliding)
+
+    summary, admitted = main_mod._admit_pharmonline_public_api_scheduled_identities(
+        session, results, tenant_id=tenant_id, run_id=run.id, source_transport="direct"
+    )
+
+    assert summary["status"] == "refused"
+    assert summary["reason"] == "apply_failed:IntegrityError"
+    assert admitted == []
+    # Сессия после отката рабочая, и от пачки ничего не осталось.
+    assert (
+        session.scalar(text("SELECT count(*) FROM products WHERE tenant_id = :t"), {"t": tenant_id})
+        == 1
+    )
+    with pytest.raises(main_mod.PharmonlinePublicAPIIdentityError, match="missing_trusted_ids=2"):
+        main_mod._verify_pharmonline_public_api_identities(session, results, tenant_id=tenant_id)

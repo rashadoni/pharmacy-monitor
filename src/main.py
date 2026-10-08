@@ -101,8 +101,9 @@ _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS = frozenset(
 # ручными, и свои правила:
 #   * только два класса — оба не требуют свидетельства со стороны сайта;
 #     разведение (quarantined_public_product) остаётся за ручной сверкой;
-#   * транспорт — любой, которым ходит сбор, включая direct (список ручной
-#     сверки старше прямого транспорта и его не знает);
+#   * транспорт — те, которыми сбор ходит без присмотра: decodo и direct у
+#     ночного таймера, direct и запасной firecrawl у еженедельного сбора из
+#     Actions (список ручной сверки старше прямого транспорта и его не знает);
 #   * preflight_run_ref — номер прогона (runs.id), а не прогона Actions;
 #   * source_manifest_sha256 — хеш плана, который этот прогон применил
 #     (манифеста исходников у планового сбора нет).
@@ -110,18 +111,21 @@ _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS = frozenset(
 # отказывает — см. docs/RUNBOOK.md «Сбор pharmonline: новые товары допускаются
 # сами…», абзац «Откат».
 _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION = "public_api_scheduled_admission_v1"
-_PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS = (
-    _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS | {"direct"}
-)
+_PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS = frozenset({"decodo", "direct", "firecrawl"})
 _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS = frozenset(
     {"existing_native_id", "new_public_product"}
 )
-_PHARMONLINE_PUBLIC_API_ADMISSION_TRANSPORTS_BY_PROOF = {
+# Версия доказательства → (допустимые транспорты, допустимые классы допуска).
+# Единственное место, где записано, что какой версии можно: по нему проверяется
+# и запись допуска, и каждая строка журнала при чтении.
+_PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF = {
     _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION: (
-        _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS
+        _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS,
+        _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS,
     ),
     _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION: (
-        _PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS
+        _PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS,
+        _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS,
     ),
 }
 # Потолок автодопуска за один прогон. Недельный приток новых товаров за
@@ -642,15 +646,11 @@ def _pharmonline_public_api_admission_invalid_reason(
     canonical_url = _canonical_pharmonline_product_url(record.public_api_canonical_url)
     if record.admission_kind not in _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS:
         return "admission_kind"
-    allowed_transports = _PHARMONLINE_PUBLIC_API_ADMISSION_TRANSPORTS_BY_PROOF.get(
-        record.proof_version
-    )
-    if allowed_transports is None:
+    rules = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF.get(record.proof_version)
+    if rules is None:
         return "proof_version"
-    if (
-        record.proof_version == _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION
-        and record.admission_kind not in _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS
-    ):
+    allowed_transports, allowed_kinds = rules
+    if record.admission_kind not in allowed_kinds:
         # Плановый сбор не разводит личности: строка «разведение + допуск
         # планового сбора» может появиться только мимо кода.
         return "admission_kind"
@@ -1392,7 +1392,7 @@ def _apply_pharmonline_public_api_reconciliation(
     redirect_proofs: tuple[_PharmonlinePublicAPIRedirectProof, ...] = (),
     legacy_self_redirect_proofs: tuple[_PharmonlinePublicAPILegacySelfRedirectProof, ...] = (),
     expected_plan_manifest_sha256: str | None = None,
-    admission_proof_version: str = _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION,
+    admission_proof_version: str,
 ) -> dict[str, int]:
     """Apply only a completely prevalidated identity recovery batch.
 
@@ -1402,7 +1402,8 @@ def _apply_pharmonline_public_api_reconciliation(
     no Product identity exists in any tenant.
 
     ``admission_proof_version`` — версия доказательства, с которой пишутся
-    допуски. Плановый сбор передаёт свою
+    допуски; умолчания нет намеренно: вызывающий обязан назвать, от чьего имени
+    пишет. Плановый сбор передаёт свою
     (`_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION`), и тогда
     функция применяет только допуски двух простых классов: перекодировку,
     смену адреса и разведение она с этой версией не выполняет.
@@ -1410,13 +1411,12 @@ def _apply_pharmonline_public_api_reconciliation(
     scheduled = (
         admission_proof_version == _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION
     )
-    allowed_transports = _PHARMONLINE_PUBLIC_API_ADMISSION_TRANSPORTS_BY_PROOF.get(
-        admission_proof_version
-    )
-    if allowed_transports is None:
+    rules = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF.get(admission_proof_version)
+    if rules is None:
         raise PharmonlinePublicAPIReconciliationError(
             "public Pharmonline reconciliation admission proof version is invalid"
         )
+    allowed_transports, allowed_kinds = rules
     _require_pharmonline_public_api_reconciliation_proof(
         source_manifest_sha256=source_manifest_sha256,
         catalog_fingerprint_sha256=catalog_fingerprint_sha256,
@@ -1463,10 +1463,7 @@ def _apply_pharmonline_public_api_reconciliation(
     if scheduled and (
         actions
         or quarantines
-        or any(
-            action.admission_kind not in _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS
-            for action in admissions
-        )
+        or any(action.admission_kind not in allowed_kinds for action in admissions)
     ):
         # Вторая линия: вызывающий уже отказал бы такому плану. Здесь проверка
         # стоит у самой записи, чтобы версия планового сбора не могла попасть
@@ -2288,12 +2285,14 @@ def _mail_pharmonline_scheduled_admission_to_admins(
     session: Session,
     run: storage.Run,
     admitted: list[_PharmonlinePublicAPIIdentityAdmissionAction],
-) -> None:
+) -> dict[str, int]:
     """Автодопуск не бывает тихим: список допущенного — письмом администраторам.
 
     Допуски к этому моменту уже зафиксированы. Сбой почты сбор не роняет: то же
     самое записано в журнале (`pharmonline_public_api_scheduled_admission`), в
-    run_quality прогона и в журнале допусков.
+    run_quality прогона и в журнале допусков. Повторной отправки нет, поэтому
+    итог возвращается и кладётся в run_quality: `{"email": писем, "failed":
+    сбоев}`; оба нуля — писать было некому.
     """
     from src import notifications as notif_mod
 
@@ -2316,14 +2315,19 @@ def _mail_pharmonline_scheduled_admission_to_admins(
         # только читала), а сбой чтения получателей оставил бы транзакцию
         # Postgres в состоянии «aborted» — и на ней упала бы запись сбора.
         session.rollback()
-        log.warning("pharmonline_scheduled_admission_mail_failed", run_id=run.id, error=str(e))
-        return
+        log.warning(
+            "pharmonline_scheduled_admission_mail_failed",
+            run_id=run.id,
+            error_type=type(e).__name__,
+        )
+        return {"email": 0, "failed": 1}
     if sent["failed"]:
         log.warning("pharmonline_scheduled_admission_mail_failed", run_id=run.id, **sent)
     elif sent["email"]:
         log.info("pharmonline_scheduled_admission_mailed", run_id=run.id, **sent)
     else:
         log.warning("pharmonline_scheduled_admission_mail_no_recipient", run_id=run.id)
+    return sent
 
 
 def _diagnose_pharmonline_public_api_identities(
@@ -5763,24 +5767,29 @@ def run_cmd(
                             ) from exc
                         raise
                     if admitted:
+                        # Письмо уходит и при --dry-run: флаг придерживает то,
+                        # что читает клиент (алерты, отчёт), а это служебное
+                        # сообщение о настоящей записи. С --dry-run зовут `run`
+                        # и workflow ручной сверки — допуск, сделанный там, тоже
+                        # не должен быть тихим.
+                        admission["mail"] = _mail_pharmonline_scheduled_admission_to_admins(
+                            session,
+                            run,
+                            admitted,
+                        )
                         # Допуск зафиксирован, а запись сбора ещё впереди и может
                         # упасть. Прогон должен показывать допуск и тогда, поэтому
                         # отметка ставится сейчас; итог качества её заменит.
-                        run.run_quality = {
-                            "full_catalog_verified": False,
-                            "financially_eligible": False,
-                            "pharmonline_identity_admission": admission,
-                        }
+                        # Копия — полная (те же ключи, что у любого прогона) и
+                        # отдельная: правка `quality` ниже не должна выглядеть
+                        # для ORM как «значение не изменилось».
+                        import copy
+
+                        early_quality = copy.deepcopy(quality)
+                        early_quality["full_catalog_verified"] = False
+                        early_quality["financially_eligible"] = False
+                        run.run_quality = early_quality
                         session.commit()
-                        # --dry-run обещает не слать писем; допуск при этом
-                        # настоящий (как и запись сбора) и виден в журнале и в
-                        # прогоне.
-                        if not dry_run:
-                            _mail_pharmonline_scheduled_admission_to_admins(
-                                session,
-                                run,
-                                admitted,
-                            )
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
