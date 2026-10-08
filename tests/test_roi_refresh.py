@@ -1278,6 +1278,94 @@ def test_orphan_run_does_not_silence_the_watchdog_forever(db_session):
     assert "roi_refresh_stuck" in _health_codes(db_session)
 
 
+def test_time_behind_an_orphan_run_counts_as_waiting_until_it_was_reaped(db_session):
+    """Снятой сироте конец ставят равным началу — а мешала она до самого снятия.
+
+    Сирот снимает и сбор на своём старте; заявку watcher исполнит уже после
+    него. Проверка здоровья, попавшая в этот промежуток, не должна звать
+    чинить исправный watcher.
+    """
+    from src import health
+
+    run = _full_run(db_session, finished_at=utcnow() - timedelta(hours=20))
+    _cluster(db_session, run, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+    request = _pending_since(db_session, minutes=90)
+    db_session.add(Run(tenant_id=1, started_at=utcnow() - timedelta(minutes=120), status="running"))
+    db_session.commit()
+    assert main_mod.reap_stale_running_runs(db_session, max_age_hours=0) == 1
+    reaped_at = utcnow()
+
+    assert "roi_refresh_stuck" not in _health_codes(db_session)
+    # Дальше счёт идёт как обычно: после снятия никто не работал.
+    idle = health._minutes_without_a_run(
+        db_session, request.requested_at, reaped_at + timedelta(minutes=40)
+    )
+    assert 39.5 < idle < 40.5
+
+
+def test_reaped_orphan_older_than_any_scrape_can_run_does_not_count_as_waiting(db_session):
+    """Сироту сняли через сутки: больше десяти часов сбор идти не мог."""
+    from src import health
+
+    since = utcnow() - timedelta(hours=20)
+    db_session.add(Run(tenant_id=1, started_at=since - timedelta(hours=1), status="running"))
+    db_session.commit()
+    assert main_mod.reap_stale_running_runs(db_session, max_age_hours=0) == 1
+
+    idle = health._minutes_without_a_run(db_session, since, utcnow())
+
+    # Из двадцати часов занятыми считаются девять: до десятого часа сироты.
+    assert 11 * 60 - 1 < idle < 11 * 60 + 1
+
+
+def test_failed_run_that_was_not_reaped_blocks_nothing(db_session):
+    """Конец, равный началу, сам по себе ничего не значит — нужна пометка снятия."""
+    from src import health
+
+    since = utcnow() - timedelta(hours=2)
+    moment = utcnow() - timedelta(hours=1)
+    for error_message in ("RuntimeError: scraper refused to start", None):
+        db_session.add(
+            Run(
+                tenant_id=1,
+                started_at=moment,
+                finished_at=moment,
+                status="failed",
+                error_message=error_message,
+            )
+        )
+    db_session.commit()
+
+    assert 119 < health._minutes_without_a_run(db_session, since, utcnow()) < 121
+
+
+def test_reap_moment_is_read_from_the_note_without_ever_failing_the_health_check():
+    from datetime import datetime
+
+    from src import health
+
+    started = datetime(2026, 10, 7, 13, 0, 0)
+    note = "boom | reaped stale run (previous_status=running, recovered_at={})"
+
+    # Обычная пометка; последняя из двух, если строку открывали и снимали заново.
+    assert health._blocked_until(
+        started, started, note.format("2026-10-07T15:00:03.250000")
+    ) == datetime(2026, 10, 7, 15, 0, 3, 250000)
+    assert health._blocked_until(
+        started,
+        started,
+        note.format("2026-10-07T14:00:00") + " | " + note.format("2026-10-07T16:30:00"),
+    ) == datetime(2026, 10, 7, 16, 30)
+    # Пометку правили руками: проверка здоровья идёт каждый час и падать не должна.
+    for broken in ("2026-13-45T99:99:99", "2026-10-07T15:00:03."):
+        assert health._blocked_until(started, started, note.format(broken)) == started
+    # Незавершённый и обычный завершённый прогон.
+    assert health._blocked_until(started, None, None) == started + health._RUN_HARD_LIMIT
+    assert health._blocked_until(started, datetime(2026, 10, 7, 13, 40), note.format("x")) == (
+        datetime(2026, 10, 7, 13, 40)
+    )
+
+
 def test_scrape_of_another_tenant_counts_as_waiting_for_a_reason(db_session):
     """Блокировка сбора одна на всех тенантов — чужой сбор пересчёт тоже ждёт."""
     run = _full_run(db_session, finished_at=utcnow() - timedelta(hours=9))

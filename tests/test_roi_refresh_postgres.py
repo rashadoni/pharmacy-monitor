@@ -193,8 +193,13 @@ def test_database_error_mid_refresh_is_survived_on_postgres(monkeypatch):
         admin.dispose()
 
 
-def test_orphan_run_at_the_end_of_a_verified_run_is_survived_on_postgres(monkeypatch):
-    """Осиротевший прогон в конце подтверждённого сбора — настоящими командами.
+def test_unfinished_run_at_the_end_of_a_verified_run_is_survived_on_postgres(monkeypatch):
+    """Чужой незавершённый прогон в конце подтверждённого сбора — настоящими командами.
+
+    Сирот сбор снимает на старте (`tests/test_orphan_runs_before_scrape.py`),
+    так что к концу незавершённый прогон остаётся, только если его не тронули
+    (рядом жил другой процесс сбора) или он появился уже при сборе. Это
+    запасной путь.
 
     На SQLite блокировок нет. Здесь `run` держит эксклюзивную блокировку сбора
     до выхода из команды, а `roi refresh` и `reap-stale-runs` берут свои: весь
@@ -225,11 +230,22 @@ def test_orphan_run_at_the_end_of_a_verified_run_is_survived_on_postgres(monkeyp
             _cluster(
                 session, trusted, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5}
             )
-            session.add(
-                storage.Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running")
-            )
-            session.commit()
             _patch_verified_aloe_pipeline(session, monkeypatch)
+            scrape = main_mod.scrape_all
+
+            async def scrape_next_to_another_producer(*args, **kwargs):
+                with Session() as other:
+                    other.add(
+                        storage.Run(
+                            tenant_id=1, started_at=utcnow(), finished_at=None, status="running"
+                        )
+                    )
+                    other.commit()
+                return await scrape(*args, **kwargs)
+
+            monkeypatch.setattr(main_mod, "scrape_all", scrape_next_to_another_producer)
+            # Что запущено на машине, где идут тесты, на исход влиять не должно.
+            monkeypatch.setattr(main_mod, "_other_run_owner_processes", lambda: [])
 
             with runner.isolated_filesystem():
                 # --force: у aloe в этом окне ритма уже есть полный сбор (фикстура).
@@ -240,7 +256,12 @@ def test_orphan_run_at_the_end_of_a_verified_run_is_survived_on_postgres(monkeyp
         assert finished.exit_code == 0, finished.output
 
         with Session() as session:
-            run = session.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+            # Последний по номеру — прогон соседа: он появился уже при сборе.
+            run = session.scalar(
+                select(storage.Run)
+                .where(storage.Run.catalog_scope == "full")
+                .order_by(storage.Run.id.desc())
+            )
             assert (run.status, run.error_message) == ("ok", None)
             assert session.scalars(select(storage.RoiActionsCache)).all() == []
             owed = session.scalars(select(storage.RoiRefreshRequest)).all()

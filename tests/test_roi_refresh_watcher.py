@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -30,7 +31,14 @@ def _stub(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def _tick(tmp_path: Path, *, job_active: bool, refresh_exit: int = 0, pending_scrape: str = "null"):
+def _tick(
+    tmp_path: Path,
+    *,
+    job_active: bool,
+    refresh_exit: int = 0,
+    pending_scrape: str = "null",
+    extra_env: dict[str, str] | None = None,
+):
     """Один тик watcher'а в песочнице. Возвращает (вызовы CLI, stdout)."""
     venv_bin = tmp_path / "venv-bin"
     path_bin = tmp_path / "path-bin"
@@ -52,6 +60,7 @@ def _tick(tmp_path: Path, *, job_active: bool, refresh_exit: int = 0, pending_sc
             "PHARMACY_API_KEY": "test-key",
             "PROJECT_DIR": str(tmp_path),
             "VENV_BIN": str(venv_bin),
+            **(extra_env or {}),
         },
         capture_output=True,
         text=True,
@@ -72,6 +81,62 @@ def test_tick_does_not_refresh_while_a_scrape_job_is_active(tmp_path):
 
     assert calls == []
     assert "already active" in output
+
+
+def test_idle_tick_reaps_orphan_runs_at_once_and_before_the_refresh(tmp_path):
+    """Сирота не ждёт шести часов: пересчёт в том же тике уже не «отложено».
+
+    Доказательство — не возраст: команда сама берёт блокировку сбора и сама
+    смотрит, нет ли на хосте другого процесса сбора.
+    """
+    calls, _ = _tick(tmp_path, job_active=False)
+
+    reap = next(call for call in calls if call.startswith("reap-stale-runs "))
+    assert reap.startswith("reap-stale-runs --max-age-hours 0 --reason ")
+    assert calls.index(reap) < calls.index("roi refresh --pending")
+
+
+def test_orphan_run_age_threshold_can_be_restored_from_the_environment(tmp_path):
+    calls, _ = _tick(tmp_path, job_active=False, extra_env={"ORPHAN_RUN_MAX_AGE_HOURS": "6"})
+
+    assert any(call.startswith("reap-stale-runs --max-age-hours 6 ") for call in calls)
+
+
+def _process_pattern() -> str:
+    (pattern,) = re.findall(r'pgrep -f "([^"]+)"', WATCHER.read_text())
+    return pattern
+
+
+def test_watcher_sees_every_process_that_may_own_a_run():
+    """Пока идёт сбор, watcher не трогает ни очередь запусков, ни пересчёт.
+
+    Снятие сирот от этого шаблона не зависит — команда `reap-stale-runs`
+    смотрит процессы сама, — но список команд у них общий.
+    """
+    pattern = _process_pattern()
+    entry_points, commands = re.fullmatch(r"\((.+?)\) \((.+?)\)\( \|\$\)", pattern).groups()
+
+    assert set(commands.split("|")) == set(main_mod.RUN_OWNER_COMMANDS) | {"rematch"}
+    assert set(entry_points.split("|")) == {"pharmacy-monitor", r"src\.main"}
+
+    venv = "/opt/pharmacy-monitor/.venv/bin"
+    seen = [
+        f"{venv}/python {venv}/pharmacy-monitor run --site aloe",
+        f"{venv}/python {venv}/pharmacy-monitor intraday-tick",
+        f"{venv}/python {venv}/pharmacy-monitor watchlist-tick",
+        f"{venv}/python {venv}/pharmacy-monitor ai-crawl --site aloe --max-urls 50",
+        f"{venv}/python {venv}/pharmacy-monitor rematch",
+        f"{venv}/python -m src.main run --site pharmonline --mode public_api",
+    ]
+    not_seen = [
+        f"{venv}/python {venv}/pharmacy-monitor roi refresh --pending",
+        f"{venv}/python {venv}/pharmacy-monitor reap-stale-runs --max-age-hours 0",
+        f"{venv}/python {venv}/pharmacy-monitor report --run-id 7",
+        "/bin/bash /opt/pharmacy-monitor/infra/server/watch-scrape-queue.sh",
+        f"{venv}/uvicorn src.api:app --workers 2",
+    ]
+    assert [line for line in seen if not re.search(pattern, line)] == []
+    assert [line for line in not_seen if re.search(pattern, line)] == []
 
 
 def test_failed_refresh_is_logged_and_does_not_stop_the_scrape_queue(tmp_path):

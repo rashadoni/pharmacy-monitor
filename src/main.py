@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from src._time import utcnow
@@ -26,7 +27,7 @@ import click
 import structlog
 import yaml
 from dotenv import load_dotenv
-from sqlalchemy import desc, func, inspect, select, text
+from sqlalchemy import desc, func, inspect, select, text, update
 from sqlalchemy.orm import Session
 
 load_dotenv(override=True)
@@ -2378,6 +2379,19 @@ def _run_matching_stage(
     return summary
 
 
+# Контексты команд, которые сами взяли НАСТОЯЩУЮ эксклюзивную блокировку сбора и
+# ещё её держат. На SQLite блокировок нет, и сюда там ничего не попадает. Метка
+# привязана к своему контексту, а не к общему для цепочки `Context.meta`: команда,
+# вызванная через `ctx.invoke`, не наследует блокировку вызвавшей — иначе она
+# сочла бы сиротой прогон, который та уже создала.
+_CONTEXTS_HOLDING_SCRAPE_LOCK: weakref.WeakSet[click.Context] = weakref.WeakSet()
+
+
+def _exclusive_scrape_lock_is_held() -> bool:
+    context = click.get_current_context(silent=True)
+    return context is not None and context in _CONTEXTS_HOLDING_SCRAPE_LOCK
+
+
 def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
     """Hold one checked-out connection's session lock without an idle transaction."""
     bind = SessionFactory.kw.get("bind")
@@ -2418,6 +2432,7 @@ def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
         raise RuntimeError("scrape lock requires an active Click command context")
 
     def release() -> None:
+        _CONTEXTS_HOLDING_SCRAPE_LOCK.discard(context)
         try:
             connection.scalar(
                 text("SELECT pg_advisory_unlock(hashtext(:key))"),
@@ -2431,6 +2446,7 @@ def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
             connection.close()
 
     context.call_on_close(release)
+    _CONTEXTS_HOLDING_SCRAPE_LOCK.add(context)
     return True
 
 
@@ -2601,7 +2617,29 @@ def reap_stale_running_runs(
             storage.Run.finished_at.is_(None),
         )
         .order_by(storage.Run.started_at)
+        # Строки берём под замок: прогон, который в эту секунду сам ставит себе
+        # `finished_at` (`_claim_run_for_publication`), после нас увидит, что его
+        # уже закрыли. Без замка оба записали бы своё, и `ok` лёг бы поверх
+        # `failed` или наоборот. Занятую строку пропускаем, а не ждём: с ней
+        # работает живая транзакция — сам прогон публикуется или пишет свои
+        # снимки (их внешний ключ держит строку), — значит, это не сирота.
+        .with_for_update(skip_locked=True)
     ).all()
+    busy = sorted(
+        set(
+            session.scalars(
+                select(storage.Run.id).where(
+                    storage.Run.started_at < cutoff,
+                    storage.Run.finished_at.is_(None),
+                )
+            )
+        )
+        - {run.id for run in stale}
+    )
+    if busy:
+        # Не сняли и не ждали — но молчать нельзя: пока держится та транзакция,
+        # прогон остаётся незавершённым, и рекомендации не считаются.
+        log.warning("stale_run_reap_skipped_busy_row", run_ids=busy)
     if not stale:
         return 0
     recovered_at = utcnow()
@@ -2627,7 +2665,213 @@ def reap_stale_running_runs(
         )
         run.error_message = ((run.error_message or "") + f" | {recovery_note}").strip(" |")
     session.commit()
+    for run in stale:
+        log.warning(
+            "stale_run_reaped",
+            run_id=run.id,
+            tenant_id=run.tenant_id,
+            started_at=run.started_at.isoformat(),
+            catalog_scope=run.catalog_scope,
+            full_catalog_sites=run.full_catalog_sites,
+            reason=reason,
+        )
     return len(stale)
+
+
+# Пометка «reaped stale» — та же, по которой ищут снятые watcher'ом прогоны.
+_ORPHAN_REAP_REASON = (
+    "reaped stale unfinished run at the start of the next scrape: "
+    "its process no longer held the scrape lock"
+)
+
+# Команды, чей процесс может владеть незавершённым прогоном: сами создают Run
+# или зовут создающую через `ctx.invoke`. Тот же список (плюс `rematch`) смотрит
+# watcher в `infra/server/watch-scrape-queue.sh` — `tests/test_roi_refresh_watcher.py`
+# не даёт им разойтись.
+RUN_OWNER_COMMANDS = ("run", "scrape", "intraday-tick", "watchlist-tick", "ai-crawl")
+
+
+def _cli_arguments(arguments: list[str]) -> list[str] | None:
+    """Аргументы нашего CLI в командной строке процесса; None — это не он.
+
+    Процесс CLI — всегда интерпретатор Python: консольный скрипт
+    (`python …/pharmacy-monitor …`, так его показывает ядро и при запуске по
+    shebang), `python -m src.main …` или `python …/src/main.py …`. Обёртки
+    вокруг него (`systemd-run`, `sudo`, `timeout`, `uv run`) сюда не попадают,
+    хотя несут ту же строку: сбор, запущенный через обёртку, иначе видел бы
+    «соседа» в собственном родителе.
+    """
+    if not arguments or not os.path.basename(arguments[0]).startswith("python"):
+        return None
+    for position, argument in enumerate(arguments[1:], start=1):
+        if os.path.basename(argument) == "pharmacy-monitor" or argument.endswith("src/main.py"):
+            return arguments[position + 1 :]
+        if argument.endswith("src.main") and _is_python_module_flag(
+            # Раздельно (`-m src.main`, `-um src.main`) или слитно (`-msrc.main`).
+            arguments[position - 1] if argument == "src.main" else argument[: -len("src.main")]
+        ):
+            return arguments[position + 1 :]
+    return None
+
+
+def _is_python_module_flag(argument: str) -> bool:
+    """`-m` и склеенные с ним короткие ключи интерпретатора: `-um`, `-Bum`."""
+    return argument.startswith("-") and not argument.startswith("--") and argument.endswith("m")
+
+
+def _other_run_owner_processes(proc_root: Path = Path("/proc")) -> list[tuple[int, str]] | None:
+    """Другие процессы этого хоста, которые могут владеть незавершённым прогоном.
+
+    None — список процессов недоступен (не Linux): тогда второго доказательства
+    нет. Команда ищется с запасом — любое слово после точки входа, равное её
+    имени: перед командой может стоять параметр группы (`--log-level DEBUG run`),
+    а ложное совпадение стоит лишь отказа от снятия.
+
+    Процесс на другой машине отсюда не виден: такой сбор защищает только
+    блокировка. Так собирают три ручных workflow — `scrape.yml`,
+    `recover-pharmonline-crawlbase.yml`, `recover-pharmonline-public-api.yml`:
+    на раннере GitHub, с базой через туннель.
+    """
+    if not proc_root.is_dir():
+        return None
+    own_pid = os.getpid()
+    found: list[tuple[int, str]] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == own_pid:
+            continue
+        try:
+            arguments = [
+                part.decode("utf-8", "replace")
+                for part in (entry / "cmdline").read_bytes().split(b"\0")
+                if part
+            ]
+        except OSError:
+            # Процесс завершился, пока читали, или чужой и скрыт от нас.
+            continue
+        cli_arguments = _cli_arguments(arguments)
+        if cli_arguments is not None and any(
+            word in RUN_OWNER_COMMANDS for word in cli_arguments
+        ):
+            found.append((int(entry.name), " ".join(arguments)[:200]))
+    return found
+
+
+def _why_unfinished_runs_may_be_alive() -> tuple[str, list[tuple[int, str]]] | None:
+    """Причина не снимать незавершённые прогоны, хотя блокировка сбора у нас.
+
+    Блокировка сессионная: сбор, у которого оборвалось её соединение
+    (перезапуск PostgreSQL), продолжает писать, не зная, что она свободна, —
+    рабочая сессия переподключается сама. Жив ли он, видно только по списку
+    процессов. None — других процессов сбора на хосте нет.
+    """
+    others = _other_run_owner_processes()
+    if others is None:
+        return "process list unavailable", []
+    if others:
+        return "another scrape process is alive", others
+    return None
+
+
+def _reap_orphan_runs_before_own_run(SessionFactory, *, command: str) -> int:
+    """Снять осиротевшие прогоны до создания собственного — под блокировкой сбора.
+
+    Каждый, кто создаёт Run (`run`, `scrape`, `ai-crawl`), сначала берёт
+    эксклюзивную блокировку сбора и держит её до выхода из команды. Раз она у
+    нас, незавершённый прогон остался от процесса, которого уже нет, сколько бы
+    ему ни было часов; на том же стоит `reap-stale-runs`, которую раз в минуту
+    зовёт watcher. Здесь — запасной путь к нему: сирота, появившаяся прямо перед
+    сбором, и время, когда watcher стоит. Пока сирота есть, рекомендации не
+    считаются — ни в конце этого сбора, ни пересчётом без сбора.
+
+    Звать ДО создания своего прогона: своя строка тоже без `finished_at`.
+
+    Блокировка — первое доказательство, и без настоящей (SQLite, подмена в
+    тестах) чужой прогон не трогаем. Второе — на хосте нет другого процесса
+    сбора (`_why_unfinished_runs_may_be_alive`). Ждущий блокировку `run` выглядит
+    так же, как идущий сбор, и сам, дождавшись, застаёт предшественника ещё не
+    вышедшим: когда сборы идут подряд, отказываются оба, и сироту снимает
+    watcher после них.
+
+    Отказ и сбой сбор не роняют: оставшийся незавершённый прогон переживёт конец
+    сбора (заявка `full_run_deferred`).
+    """
+    if not _exclusive_scrape_lock_is_held():
+        return 0
+    try:
+        with SessionFactory() as session:
+            unfinished = session.scalars(
+                select(storage.Run.id).where(storage.Run.finished_at.is_(None))
+            ).all()
+            if not unfinished:
+                return 0
+            refusal = _why_unfinished_runs_may_be_alive()
+            if refusal is not None:
+                reason, processes = refusal
+                log.warning(
+                    "orphan_run_reap_skipped",
+                    command=command,
+                    run_ids=sorted(unfinished),
+                    reason=reason,
+                    processes=processes,
+                )
+                return 0
+            reaped = reap_stale_running_runs(
+                session, max_age_hours=0, reason=_ORPHAN_REAP_REASON
+            )
+    except Exception:
+        log.exception("orphan_run_reap_failed", command=command)
+        return 0
+    if reaped:
+        log.warning("orphan_runs_reaped_before_run", command=command, count=reaped)
+    return reaped
+
+
+class RunClosedAsOrphan(RuntimeError):
+    """Незавершённый прогон закрыт извне, пока его процесс ещё работал."""
+
+
+def _closed_as_orphan(run: storage.Run, *, stage: str) -> RunClosedAsOrphan:
+    return RunClosedAsOrphan(
+        f"run {run.id} was closed from outside as an orphan while it was still "
+        f"running (noticed before {stage}); its result is not published"
+    )
+
+
+def _fail_if_closed_as_orphan(session: Session, run: storage.Run, *, stage: str) -> None:
+    """Остановить прогон, который кто-то уже закрыл как осиротевший.
+
+    `finished_at` своей строке до конца ставит только сам прогон. Если оно уже
+    стоит, строку закрыли извне: `reap-stale-runs` (руками или watcher'ом),
+    workflow восстановления, запрос в базе — либо следующий сбор, получивший
+    блокировку, которую этот процесс потерял вместе с её соединением. В любом
+    случае рядом мог работать другой сбор, и ручаться за результат нельзя:
+    дальше не сопоставляем, не шлём алерты и не публикуем.
+    """
+    closed_at = session.scalar(
+        select(storage.Run.finished_at).where(storage.Run.id == run.id)
+    )
+    if closed_at is not None:
+        raise _closed_as_orphan(run, stage=stage)
+
+
+def _claim_run_for_publication(session: Session, run: storage.Run) -> datetime:
+    """Поставить своему прогону `finished_at` — только если его не закрыли извне.
+
+    Одним запросом с условием, а не «проверил, потом записал»: между чтением и
+    записью строку успели бы закрыть, и `ok` лёг бы поверх чужого `failed` — с
+    уже снятым денежным доверием и закрытым на неделю окном ритма. Запись идёт в
+    транзакцию вызывающего и фиксируется его коммитом.
+    """
+    finished_at = utcnow()
+    claimed = session.execute(
+        update(storage.Run)
+        .where(storage.Run.id == run.id, storage.Run.finished_at.is_(None))
+        .values(finished_at=finished_at)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if claimed != 1:
+        raise _closed_as_orphan(run, stage="publication")
+    return finished_at
 
 
 def count_duplicate_products(session: Session) -> int:
@@ -3980,8 +4224,10 @@ def db_check_cmd(fix: bool) -> None:
 def reap_stale_runs_cmd(max_age_hours: float, reason: str) -> None:
     """Mark orphaned runs without ``finished_at`` as failed.
 
-    Intended for server watcher use after it confirms no scrape/rematch process
-    is active. Does not kill processes.
+    The command proves that the runs are orphans itself and refuses otherwise:
+    it takes the scrape lock, and it checks that no other scrape process is
+    alive on this host — a scrape whose lock connection was dropped keeps
+    writing while the lock is free. Does not kill processes.
     """
     storage.init_db()
     Session = storage.make_session()
@@ -3990,7 +4236,18 @@ def reap_stale_runs_cmd(max_age_hours: float, reason: str) -> None:
             "recovery refused: an active scrape/rematch producer holds the run lock"
         )
     with Session() as s:
-        count = reap_stale_running_runs(s, max_age_hours=max_age_hours, reason=reason)
+        count = 0
+        # Нет незавершённых — нечего и доказывать: watcher зовёт команду каждую
+        # минуту, и отказ из-за процесса рядом был бы шумом в его журнале.
+        if s.scalar(select(storage.Run.id).where(storage.Run.finished_at.is_(None)).limit(1)):
+            refusal = _why_unfinished_runs_may_be_alive()
+            if refusal is not None:
+                cause, processes = refusal
+                raise click.ClickException(
+                    f"recovery refused: {cause}"
+                    + "".join(f"\n  pid {pid}: {command}" for pid, command in processes)
+                )
+            count = reap_stale_running_runs(s, max_age_hours=max_age_hours, reason=reason)
     click.echo(f"reaped {count} stale running run(s)")
 
 
@@ -4873,6 +5130,7 @@ def ai_crawl_cmd(
     Session = storage.make_session()
     if not _hold_scrape_lock_until_command_exit(Session, wait=False):
         raise click.ClickException("AI crawl blocked because another scrape run is active")
+    _reap_orphan_runs_before_own_run(Session, command="ai-crawl")
     with Session() as session:
         run = storage.Run(
             status="running",
@@ -5163,6 +5421,9 @@ def run_cmd(
     # Full/manual runs wait for a short partial producer to finish. Conversely,
     # scrape-only/intraday producers below fail-fast while this lock is held.
     _hold_scrape_lock_until_command_exit(Session, wait=True)
+    # До гварда ритма: снятый полный сбор этого сайта окно не закрывает, и
+    # ночной запуск, который гвард пропустил бы, тоже убирает сирот.
+    _reap_orphan_runs_before_own_run(Session, command="run")
     with Session() as session:
         maybe_seed_categories(session)
 
@@ -5515,6 +5776,9 @@ def run_cmd(
             except Exception as e:
                 log.warning("smoke_test_failed", error=str(e))
 
+            # Сбор шёл минуты или часы: закрыть прогон извне могли за это время.
+            _fail_if_closed_as_orphan(session, run, stage="matching")
+
             lock_taken = False
             try:
                 log.info("matcher_lock_wait", run_id=run.id)
@@ -5535,6 +5799,11 @@ def run_cmd(
             finally:
                 if lock_taken:
                     _release_matcher_lock(session)
+
+            # До подтверждения цен и алертов: письмо уже не отзовёшь. Дальше
+            # отчёт и кэш рекомендаций читают доверие из базы и закрытому
+            # прогону откажут сами.
+            _fail_if_closed_as_orphan(session, run, stage="alerts")
 
             # Internal consumers must calculate against this exact verified
             # full Run before it is published as ``ok``.  External API calls
@@ -5669,13 +5938,16 @@ def run_cmd(
                             reason=not_computed.reason,
                         )
                         if not_computed.reason == _roi.NOT_COMPUTED_RUN_UNFINISHED:
-                            # Блокировка сбора у нас, значит чужой незавершённый
-                            # прогон — сирота упавшего процесса. Её снимет watcher
-                            # (`reap-stale-runs`), и он же исполнит эту заявку:
-                            # посчитает, а если сиротой был полный сбор другого
-                            # сайта и доверия после её снятия нет — закроет
-                            # `skipped`. При прочих причинах заявку не ставим:
-                            # пересчёт без сбора упёрся бы в то же самое.
+                            # Сирот этот сбор снял на старте
+                            # (`_reap_orphan_runs_before_own_run`), так что сюда
+                            # приходим редко: на базе без блокировок, после сбоя
+                            # снятия или когда рядом жив другой процесс сбора и
+                            # его прогон мы не тронули. Заявку исполнит watcher —
+                            # когда тот прогон закончится или когда он сам снимет
+                            # его (`reap-stale-runs`): посчитает, а если сиротой
+                            # был полный сбор другого сайта и доверия после снятия
+                            # нет — закроет `skipped`. При прочих причинах заявку
+                            # не ставим: пересчёт без сбора упёрся бы в то же.
                             _queue_roi_refresh_owed_by_run(session, run, reason="full_run_deferred")
                     else:
                         log.info("roi_cache_refreshed", run_id=run_id, **summary)
@@ -5715,9 +5987,9 @@ def run_cmd(
                 trust_context.__exit__(None, None, None)
                 trust_context = None
 
+            run.finished_at = _claim_run_for_publication(session, run)
             if is_full_catalog and run.catalog_verified:
                 run.status = "ok"
-            run.finished_at = utcnow()
             if request_id is not None:
                 req = session.get(storage.ScrapeRequest, request_id)
                 if req is not None:
@@ -5784,6 +6056,9 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
     if not _hold_scrape_lock_after_readers(Session):
         click.echo("scrape: skipped because another scrape run is active")
         return
+    # Тик собирает несколько раз в день: дневная сирота не ждёт ни ночного
+    # сбора, ни шести часов watcher'а.
+    _reap_orphan_runs_before_own_run(Session, command="scrape")
     with Session() as session:
         maybe_seed_categories(session)
         # Diagnostic producer only.  It intentionally cannot publish a trust

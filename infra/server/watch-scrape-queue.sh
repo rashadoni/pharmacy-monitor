@@ -33,11 +33,20 @@ API_BASE="${API_BASE:-http://127.0.0.1:8080}"
 API_KEY="${PHARMACY_API_KEY:-}"            # X-API-Key, из EnvironmentFile
 PROJECT_DIR="${PROJECT_DIR:-/opt/pharmacy-monitor}"
 VENV_BIN="${VENV_BIN:-$PROJECT_DIR/.venv/bin}"
-SCRAPE_MAX_HOURS="${SCRAPE_MAX_HOURS:-6}"  # дольше = прогон/запрос считаем зависшим
+SCRAPE_MAX_HOURS="${SCRAPE_MAX_HOURS:-6}"  # дольше = запрос из очереди считаем зависшим
+# Осиротевший прогон снимаем сразу, без выдержки: доказательство здесь не
+# возраст. Команда `reap-stale-runs` сама берёт блокировку сбора и сама
+# смотрит, нет ли на сервере другого процесса сбора. Вернуть выдержку —
+# выставить число часов.
+ORPHAN_RUN_MAX_AGE_HOURS="${ORPHAN_RUN_MAX_AGE_HOURS:-0}"
 
 log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | $*"; }
+# Пока идёт сбор или rematch, этот тик не трогает ни очередь запусков, ни
+# пересчёт. Способы запуска: консольный скрипт (юниты, этот watcher) и
+# `python -m src.main` (workflow pharmonline). Список команд, владеющих
+# прогоном, — тот же, что `RUN_OWNER_COMMANDS` в src/main.py, плюс rematch.
 active_pharmacy_monitor_job() {
-    pgrep -f "pharmacy-monitor (run|scrape|intraday-tick|rematch)( |$)" >/dev/null 2>&1
+    pgrep -f "(pharmacy-monitor|src\.main) (run|scrape|intraday-tick|watchlist-tick|ai-crawl|rematch)( |$)" >/dev/null 2>&1
 }
 
 log "watch-scrape-queue tick (server)"
@@ -48,11 +57,13 @@ if [[ -z "$API_KEY" ]]; then
 fi
 cd "$PROJECT_DIR" || { log "ERROR: cannot cd $PROJECT_DIR"; exit 1; }
 
-# === Reap зависших 'running' запросов =======================================
+# === Reap зависших 'running' запросов и осиротевших прогонов ================
 # При синхронной модели запрос остаётся 'running' только если вотчер убили
 # в середине скрейпа (reboot / TimeoutStartSec). Если активного scrape/rematch
 # процесса нет, а запрос висит 'running' > SCRAPE_MAX_HOURS —
 # метим failed, чтобы UI-антиспам (409) разблокировался. Best-effort, не фатально.
+# Прогон без finished_at при тех же условиях снимаем сразу: пока он есть,
+# рекомендации не считаются, а блок пересчёта ниже ответит «отложено».
 if ! active_pharmacy_monitor_job; then
     "$VENV_BIN/python" - "$SCRAPE_MAX_HOURS" <<'PY' 2>/dev/null || true
 import sys, datetime
@@ -80,7 +91,7 @@ with Session() as s:
         print(f"reaped {len(stale)} stale running request(s)")
 PY
     "$VENV_BIN/pharmacy-monitor" reap-stale-runs \
-        --max-age-hours "$SCRAPE_MAX_HOURS" \
+        --max-age-hours "$ORPHAN_RUN_MAX_AGE_HOURS" \
         --reason "reaped stale running run after interrupted/timeout process" || true
 fi
 

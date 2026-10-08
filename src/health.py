@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal
@@ -355,6 +356,30 @@ _ROI_REFRESH_STUCK_MINUTES = 30
 # именно он, вечно «идущий» прогон глушил бы сторожа без срока.
 _RUN_HARD_LIMIT = timedelta(hours=10)
 
+# Момент снятия осиротевшего прогона — из пометки, которую оставляет
+# `main.reap_stale_running_runs` в `runs.error_message`.
+_REAPED_AT = re.compile(r"recovered_at=(\d{4}-\d{2}-\d{2}T[\d:.]+)")
+
+
+def _blocked_until(started: datetime, finished: datetime | None, note: str | None) -> datetime:
+    """До какого момента прогон не давал пересчитать рекомендации."""
+    if finished is None:
+        return started + _RUN_HARD_LIMIT
+    if finished == started and note:
+        # Снятой сироте конец ставят равным началу, чтобы она не встала в
+        # истории позже здоровых прогонов. Мешала она до самого снятия: сирот
+        # снимает и сбор на своём старте, а заявку исполняет watcher уже после
+        # него — без этого ожидание за сиротой выглядело бы простоем.
+        moments = _REAPED_AT.findall(note)
+        try:
+            reaped_at = datetime.fromisoformat(moments[-1]) if moments else None
+        except ValueError:
+            # Пометку правили руками. Проверка здоровья из-за неё не падает.
+            reaped_at = None
+        if reaped_at is not None:
+            return min(reaped_at, started + _RUN_HARD_LIMIT)
+    return finished
+
 
 def _minutes_without_a_run(session: Session, since: datetime, now: datetime) -> float:
     """Сколько минут из [since, now] не шёл ни один прогон.
@@ -363,14 +388,20 @@ def _minutes_without_a_run(session: Session, since: datetime, now: datetime) -> 
     ждёт чужой сбор так же, как свой.
     """
     runs = session.execute(
-        select(Run.started_at, Run.finished_at).where(
+        select(Run.started_at, Run.finished_at, Run.error_message).where(
             Run.started_at < now,
-            (Run.finished_at.is_(None)) | (Run.finished_at > since),
+            (Run.finished_at.is_(None))
+            | (Run.finished_at > since)
+            | (
+                (Run.finished_at == Run.started_at)
+                & (Run.started_at > since - _RUN_HARD_LIMIT)
+                & Run.error_message.contains("recovered_at=")
+            ),
         )
     ).all()
     spans = sorted(
-        (max(started, since), min(finished or started + _RUN_HARD_LIMIT, now))
-        for started, finished in runs
+        (max(started, since), min(_blocked_until(started, finished, note), now))
+        for started, finished, note in runs
     )
     busy = timedelta()
     covered_until = since
