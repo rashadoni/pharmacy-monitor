@@ -322,7 +322,8 @@ def try_swap_alternative(
     session.flush()
     session.expire(m, ["products"])
     # По id: у связи порядка нет, а от него зависело бы, какой из двух
-    # непригодных товаров назван причиной отказа.
+    # непригодных товаров назван причиной отказа — и какой товар сайта убирает
+    # замена, если их в кластере два (быть не должно).
     members = sorted(m.products, key=lambda product: product.id)
 
     cohort = [product for product in members if product.site != site] + [new_p]
