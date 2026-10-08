@@ -29,6 +29,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -36,7 +37,7 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from src import api, matcher
+from src import api, match_actions, matcher
 from src.storage import Base, Match, MatchRejection, Product
 
 _WAITING_FOR_ADVISORY_LOCK = text(
@@ -317,3 +318,85 @@ def test_relink_with_a_bad_request_does_not_wait_for_the_stage(engines):
             matcher.release_match_mutation_lock(stage)
 
     assert refused.value.status_code == 400
+
+
+# --- relink-dead: план не зависит от того, как строки лежат в таблице ----------
+#
+# Без ORDER BY PostgreSQL отдаёт строки в порядке хранения, а запись в строку
+# переносит её в конец — сбор же пишет в товары постоянно. Пробный прогон сегодня
+# и настоящий завтра обязаны дать один план: и очерёдность кластеров, и выбор
+# между одинаково похожими кандидатами. На SQLite не воспроизводится: там
+# порядок без ORDER BY совпадает с порядком id.
+
+
+def test_relink_dead_plan_does_not_depend_on_row_storage_order(engines):
+    stage_engine, _api_engine = engines
+    with _session(stage_engine) as session:
+        clusters = []
+        for index in (1, 2):
+            match = Match(tenant_id=1, canonical_name="Aspirin", confidence=1.0, is_manual=False)
+            session.add(match)
+            session.flush()
+            _product(session, "pharmonline", f"anchor-{index}", canonical_id=match.id)
+            dead = _product(session, "aloe", f"dead-{index}", canonical_id=match.id)
+            dead.url_dead_at = datetime(2026, 5, 30)
+            clusters.append(match.id)
+        candidates = [_product(session, "aloe", f"live-{index}").id for index in (1, 2)]
+        session.commit()
+        # Запись в индексированную колонку (её пишет каждый сбор) — строка
+        # переезжает и в таблице, и в индексах.
+        session.execute(
+            text(
+                "UPDATE products SET availability_run_id = 1 "
+                "WHERE external_id IN ('dead-1', 'live-1')"
+            )
+        )
+        session.commit()
+        # Иначе тест ничего не проверяет: те же выборки без ORDER BY должны
+        # отдать строки не в порядке id.
+        unordered_dead = "SELECT external_id FROM products WHERE url_dead_at IS NOT NULL"
+        unordered_free = (
+            "SELECT external_id FROM products WHERE site = 'aloe' AND canonical_id IS NULL"
+        )
+        assert list(session.scalars(text(unordered_dead))) == ["dead-2", "dead-1"]
+        assert list(session.scalars(text(unordered_free))) == ["live-2", "live-1"]
+
+        plan = matcher.relink_dead_members(session, dry_run=True)
+
+    assert [(entry["match_id"], entry["action"], entry["new"]) for entry in plan] == [
+        (clusters[0], "swap", candidates[0]),
+        (clusters[1], "swap", candidates[1]),
+    ]
+
+
+def test_swap_refusal_names_the_same_member_whatever_the_storage_order(engines):
+    """Непригодных товаров в кластере два — причиной назван один и тот же."""
+    stage_engine, _api_engine = engines
+    with _session(stage_engine) as session:
+        match = Match(tenant_id=1, canonical_name="Aspirin", confidence=1.0, is_manual=False)
+        session.add(match)
+        session.flush()
+        dead = _product(session, "pharmonline", "dead-member", canonical_id=match.id)
+        dead.url_dead_at = datetime(2026, 5, 30)
+        sold_out = _product(session, "aptekonline", "sold-out-member", canonical_id=match.id)
+        sold_out.offer_availability_status = "out_of_stock"
+        candidate = _product(session, "aloe", "candidate")
+        session.commit()
+        session.execute(
+            text("UPDATE products SET availability_run_id = 1 WHERE external_id = 'dead-member'")
+        )
+        session.commit()
+        # Иначе тест ничего не проверяет: без ORDER BY первым идёт не меньший id.
+        unordered = text("SELECT external_id FROM products WHERE canonical_id = :match")
+        assert list(session.scalars(unordered, {"match": match.id})) == [
+            "sold-out-member",
+            "dead-member",
+        ]
+
+        outcome = match_actions.try_swap_alternative(
+            session, match.id, "aloe", candidate.id, dry_run=True
+        )
+
+    assert outcome == match_actions.SwapOutcome(
+        False, f"offer:dead_url product={dead.id} site=pharmonline"
+    )

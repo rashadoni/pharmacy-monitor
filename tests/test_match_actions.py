@@ -412,6 +412,105 @@ def test_swap_alternative_leaves_the_current_members_in_the_session(db_session):
     assert {p.id for p in m.products} == {x.id, n1.id}
 
 
+# --- try_swap_alternative: почему замена не записана ---------------------------
+
+
+def test_try_swap_alternative_names_the_reason_and_changes_nothing(db_session):
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    other_site = _make_product(db_session, site="aptekonline", external_id="ap", name="Aspirin")
+    foreign = _make_product(
+        db_session, tenant_id=2, site="aloe", external_id="aloe-foreign", name="Aspirin"
+    )
+    db_session.commit()
+    before = _stored_clusters(db_session)
+
+    def refusal(match_id: int, site: str, product_id: int) -> str | None:
+        outcome = ma.try_swap_alternative(db_session, match_id, site, product_id)
+        assert outcome.accepted is False
+        # Булев вариант отвечает тем же: замены нет.
+        assert ma.swap_alternative(db_session, match_id, site, product_id) is False
+        return outcome.reason
+
+    assert refusal(m.id + 1000, "aloe", z.id) == "match_not_found"
+    assert refusal(m.id, "aloe", z.id + 1000) == "product_not_found"
+    assert refusal(m.id, "aloe", other_site.id) == "product_site_mismatch"
+    assert refusal(m.id, "aloe", foreign.id) == "product_tenant_mismatch"
+    assert refusal(m.id, "aloe", z.id) == "already_current"
+
+    assert _stored_clusters(db_session) == before
+    assert _stored_rejections(db_session) == set()
+    assert db_session.scalar(select(Match.is_manual)) is False
+
+
+def test_try_swap_alternative_names_the_member_that_blocks_the_swap(db_session):
+    """Отказ из-за другого товара кластера называет этот товар, а не кандидата."""
+    m, [x, y, z] = _make_match_cluster(
+        db_session, "Aspirin", ["pharmonline", "aptekonline", "aloe"]
+    )
+    y.offer_availability_status = "out_of_stock"
+    candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    db_session.commit()
+
+    outcome = ma.try_swap_alternative(db_session, m.id, "aloe", candidate.id)
+
+    assert outcome == ma.SwapOutcome(False, f"offer:out_of_stock product={y.id} site=aptekonline")
+    assert candidate.canonical_id is None
+
+
+def test_try_swap_alternative_names_a_country_conflict(db_session):
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    for product, code in ((x, "tr"), (candidate, "az")):
+        product.manufacturer_country_code = code
+        product.country_resolution_status = "resolved"
+    db_session.commit()
+
+    outcome = ma.try_swap_alternative(db_session, m.id, "aloe", candidate.id)
+
+    assert outcome == ma.SwapOutcome(False, "identity:country_conflict")
+
+
+def test_try_swap_alternative_dry_run_checks_without_writing(db_session):
+    """Пробный вызов отвечает тем же, что настоящий, и ничего не записывает."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    db_session.commit()
+    before = _stored_clusters(db_session)
+
+    would_apply = ma.try_swap_alternative(db_session, m.id, "aloe", candidate.id, dry_run=True)
+    refused = ma.try_swap_alternative(db_session, m.id, "aloe", z.id, dry_run=True)
+
+    assert would_apply == ma.SwapOutcome(True)
+    assert refused == ma.SwapOutcome(False, "already_current")
+    db_session.rollback()  # несохранённого после пробного вызова быть не должно
+    assert _stored_clusters(db_session) == before
+    assert _stored_rejections(db_session) == set()
+    assert db_session.scalar(select(Match.is_manual)) is False
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_try_swap_alternative_takes_the_matcher_lock_in_both_modes(
+    db_session, monkeypatch, dry_run
+):
+    """Пробный ответ верен только для состава, который в эту секунду никто не меняет."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    db_session.commit()
+    seen_before_lock: list[bool] = []
+    monkeypatch.setattr(
+        ma,
+        "_acquire_match_mutation_xact_lock",
+        # Замок — раньше чтения состава: список участников ещё не загружен.
+        lambda session: seen_before_lock.append("products" in m.__dict__),
+    )
+
+    outcome = ma.try_swap_alternative(db_session, m.id, "aloe", candidate.id, dry_run=dry_run)
+
+    assert outcome.accepted is True
+    # Настоящая замена берёт замок ещё раз, записывая отказ прежнему товару сайта.
+    assert seen_before_lock[0] is False and len(seen_before_lock) == (1 if dry_run else 2)
+
+
 def test_list_rejections_for_product(db_session):
     p1 = _make_product(db_session, name="A", external_id="1")
     p2 = _make_product(db_session, name="B", external_id="2")
@@ -837,6 +936,9 @@ def test_relink_dead_dry_run_no_change(db_session):
     assert any(r["action"] == "swap" for r in res)  # план показывает swap
     db_session.refresh(live)
     assert live.canonical_id is None  # но БД не тронута
+    db_session.rollback()
+    assert _stored_rejections(db_session) == set()
+    assert db_session.scalar(select(Match.is_manual)) is False
 
 
 def test_relink_dead_skips_manual_cluster(db_session):
@@ -853,3 +955,291 @@ def test_relink_dead_skips_manual_cluster(db_session):
     assert res == []  # ручной кластер не трогаем
     db_session.refresh(live)
     assert live.canonical_id is None
+
+
+def _cluster_with_two_dead(s) -> tuple[Match, Product, Product, Product, Product]:
+    """Мёртвые товары на двух сайтах и по живому кандидату на каждый."""
+    m, _anchor, dead_apt = _cluster_with_dead(s)
+    dead_aloe = _mk(
+        s,
+        site="aloe",
+        external_id="al-dead",
+        name="Asiklovir 200 mq N20",
+        canonical_id=m.id,
+        pack_size="N20",
+        url_dead_at=_DEAD,
+    )
+    live_apt = _mk(
+        s, site="aptekonline", external_id="ap-live", name="Asiklovir 200 mq N20", pack_size="N20"
+    )
+    live_aloe = _mk(
+        s, site="aloe", external_id="al-live", name="Asiklovir 200 mq N20", pack_size="N20"
+    )
+    s.commit()
+    return m, dead_apt, dead_aloe, live_apt, live_aloe
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_relink_dead_reports_a_refused_swap_with_its_reason(db_session, dry_run):
+    """Замену не пропустила проверка самой замены — в плане это не `swap`.
+
+    Кандидат на каждый сайт есть, но второй мёртвый товар кластера делает любую
+    замену недопустимой. Раньше обе строки шли как `swap`, а команда печатала
+    «applied 2». Пробный прогон отвечает тем же, что настоящий.
+    """
+    m, dead_apt, dead_aloe, live_apt, live_aloe = _cluster_with_two_dead(db_session)
+    before = _stored_clusters(db_session)
+
+    res = matcher.relink_dead_members(db_session, dry_run=dry_run)
+
+    assert sorted(res, key=lambda r: r["site"]) == [
+        {
+            "match_id": m.id,
+            "site": "aloe",
+            "old": dead_aloe.id,
+            "new": live_aloe.id,
+            "score": 100,
+            "action": "swap-rejected",
+            "reason": f"offer:dead_url product={dead_apt.id} site=aptekonline",
+        },
+        {
+            "match_id": m.id,
+            "site": "aptekonline",
+            "old": dead_apt.id,
+            "new": live_apt.id,
+            "score": 100,
+            "action": "swap-rejected",
+            "reason": f"offer:dead_url product={dead_aloe.id} site=aloe",
+        },
+    ]
+    assert _stored_clusters(db_session) == before
+    assert _stored_rejections(db_session) == set()
+    assert db_session.scalar(select(Match.is_manual)) is False
+
+
+def test_relink_dead_applied_swap_carries_no_reason(db_session):
+    m, _anchor, dead = _cluster_with_dead(db_session)
+    live = _mk(
+        db_session,
+        site="aptekonline",
+        external_id="ap-live",
+        name="Asiklovir 200 mq N20",
+        pack_size="N20",
+    )
+    db_session.commit()
+
+    res = matcher.relink_dead_members(db_session)
+
+    assert res == [
+        {
+            "match_id": m.id,
+            "site": "aptekonline",
+            "old": dead.id,
+            "new": live.id,
+            "score": 100,
+            "action": "swap",
+        }
+    ]
+    assert _stored_clusters(db_session)[0][live.id] == m.id
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_relink_dead_gives_one_candidate_to_one_cluster(db_session, dry_run):
+    """Кандидат один, кластеров с мёртвым товаром два — замена одна в обоих режимах.
+
+    Пробный прогон обещал кандидата обоим кластерам: он ничего не записывает, и
+    для второго кластера кандидат всё ещё выглядел свободным.
+    """
+    first, _anchor, _dead = _cluster_with_dead(db_session)
+    second = _second_cluster_with_dead(db_session)
+    live = _mk(
+        db_session,
+        site="aptekonline",
+        external_id="ap-live",
+        name="Asiklovir 200 mq N20",
+        pack_size="N20",
+    )
+    db_session.commit()
+
+    res = matcher.relink_dead_members(db_session, dry_run=dry_run)
+
+    assert [(r["match_id"], r["action"], r["new"]) for r in res] == [
+        (first.id, "swap", live.id),
+        (second.id, "skip-no-live-alt", None),
+    ]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_relink_dead_refused_candidate_stays_available(db_session, dry_run):
+    """Кандидат, чью замену отклонили, достаётся следующему кластеру — в обоих режимах."""
+    refused, dead_apt, _dead_aloe, live_apt, _live_aloe = _cluster_with_two_dead(db_session)
+    other = _second_cluster_with_dead(db_session)
+    db_session.commit()
+
+    res = matcher.relink_dead_members(db_session, dry_run=dry_run)
+
+    aptekonline = [(r["match_id"], r["action"], r["new"]) for r in res if r["site"] == "aptekonline"]
+    assert sorted(aptekonline) == [
+        (refused.id, "swap-rejected", live_apt.id),
+        (other.id, "swap", live_apt.id),
+    ]
+
+
+def _second_cluster_with_dead(s) -> Match:
+    """Ещё один кластер с тем же названием и мёртвым товаром aptekonline."""
+    m = Match(canonical_name="Asiklovir 200 mq N20", confidence=1.0, is_manual=False)
+    s.add(m)
+    s.flush()
+    for site, tag, dead_at in (("pharmonline", "ph2", None), ("aptekonline", "ap-dead2", _DEAD)):
+        _mk(
+            s,
+            site=site,
+            external_id=tag,
+            name="Asiklovir 200 mq N20",
+            canonical_id=m.id,
+            pack_size="N20",
+            url_dead_at=dead_at,
+        )
+    return m
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_relink_dead_window_skips_candidates_that_are_already_given(db_session, dry_run):
+    """Окно в 25 кандидатов считается среди свободных — одинаково в обоих режимах.
+
+    Подходящих кандидатов два, между ними 24 товара с тем же названием и другой
+    фасовкой. Первый кластер берёт первого; для второго настоящий прогон первого
+    уже не видит и доходит до второго кандидата. Пробный прогон первого видел
+    (он ничего не записал), окно кончалось раньше второго — «замены нет».
+    """
+    first, _anchor, _dead = _cluster_with_dead(db_session)
+    second = _second_cluster_with_dead(db_session)
+
+    def candidate(tag: str, pack: str) -> Product:
+        return _mk(
+            db_session,
+            site="aptekonline",
+            external_id=tag,
+            name="Asiklovir 200 mq N20",
+            pack_size=pack,
+        )
+
+    nearest = candidate("ap-live-1", "N20")
+    for index in range(24):
+        candidate(f"ap-other-pack-{index}", "N25")
+    beyond = candidate("ap-live-26", "N20")
+    db_session.commit()
+
+    res = matcher.relink_dead_members(db_session, dry_run=dry_run)
+
+    assert [(r["match_id"], r["action"], r["new"]) for r in res] == [
+        (first.id, "swap", nearest.id),
+        (second.id, "swap", beyond.id),
+    ]
+
+
+def test_relink_dead_checks_the_candidate_against_every_live_member(db_session):
+    """Кандидат, несовместимый хотя бы с одним товаром кластера, не подходит.
+
+    Сверка шла с одним товаром — первым в списке участников. Здесь первым лежит
+    тот, у кого в названии нет состава: с ним D3+K2 не спорит, а с D3 — спорит.
+    Замена сводила D3 с D3+K2 в кластере, который после неё считается ручным.
+    """
+    m = Match(canonical_name="Venatura Vitamin D3 20 ml", confidence=1.0, is_manual=False)
+    db_session.add(m)
+    db_session.flush()
+    for site, name, normalized, dead_at in (
+        ("aptekonline", "Venatura Vitamin 20 ml", "venatura vitamin", None),
+        ("pharmonline", "Venatura Vitamin D3 20 ml", "venatura vitamin d3", None),
+        ("aloe", "Venatura Vitamin D3 20 ml", "venatura vitamin d3", _DEAD),
+    ):
+        _mk(
+            db_session,
+            site=site,
+            external_id=f"{site}-member",
+            name=name,
+            name_normalized=normalized,
+            canonical_id=m.id,
+            url_dead_at=dead_at,
+        )
+    _mk(
+        db_session,
+        site="aloe",
+        external_id="aloe-d3-k2",
+        name="Venatura Vitamin D3 K2 20 ml",
+        name_normalized="venatura vitamin d3 k2",
+    )
+    db_session.commit()
+
+    res = matcher.relink_dead_members(db_session)
+
+    assert [r["action"] for r in res] == ["skip-no-live-alt"]
+    assert db_session.scalar(select(Match.is_manual)) is False
+
+
+def test_relink_dead_looks_at_the_25_most_similar_candidates_only(db_session):
+    """Подходящий кандидат за окном не рассматривается — как и до правки окна."""
+    _cluster_with_dead(db_session)
+    for index in range(25):
+        _mk(
+            db_session,
+            site="aptekonline",
+            external_id=f"ap-other-pack-{index}",
+            name="Asiklovir 200 mq N20",
+            pack_size="N25",
+        )
+    _mk(
+        db_session,
+        site="aptekonline",
+        external_id="ap-live-26",
+        name="Asiklovir 200 mq N20",
+        pack_size="N20",
+    )
+    db_session.commit()
+
+    res = matcher.relink_dead_members(db_session)
+
+    assert [r["action"] for r in res] == ["skip-no-live-alt"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_relink_dead_leaves_a_cluster_with_two_products_of_the_site(db_session, dry_run):
+    """На сайте мёртвого товара в кластере есть ещё один — замены нет.
+
+    Замена не выбирает, какой товар сайта убрать: убранным оказывался живой (с
+    постоянным отказом), мёртвый оставался, а в плане значилась замена мёртвого.
+    """
+    m, _anchor, dead = _cluster_with_dead(db_session)
+    _mk(
+        db_session,
+        site="aptekonline",
+        external_id="ap-live-member",
+        name="Asiklovir 200 mq N20",
+        canonical_id=m.id,
+        pack_size="N20",
+    )
+    _mk(
+        db_session,
+        site="aptekonline",
+        external_id="ap-live",
+        name="Asiklovir 200 mq N20",
+        pack_size="N20",
+    )
+    db_session.commit()
+    before = _stored_clusters(db_session)
+
+    res = matcher.relink_dead_members(db_session, dry_run=dry_run)
+
+    assert res == [
+        {
+            "match_id": m.id,
+            "site": "aptekonline",
+            "old": dead.id,
+            "new": None,
+            "score": None,
+            "action": "skip-several-on-site",
+        }
+    ]
+    assert _stored_clusters(db_session) == before
+    assert _stored_rejections(db_session) == set()
+
