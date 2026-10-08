@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from src._time import utcnow
 from pathlib import Path
@@ -1794,6 +1794,311 @@ def _bridge_pharmonline_legacy_ids(
     return len(replacements)
 
 
+_ALOE_ADOPT_QUERY_CHUNK = 500
+# Предохранитель в базе: его ставит миграция 0024_aloe_product_numbers. Он же
+# включает правило «товар aloe узнаётся по номеру» (см. ниже).
+ALOE_NUMBER_IDENTITY_TRIGGER = "products_aloe_number_identity"
+
+
+def _aloe_number_identity_active(session: Session) -> bool:
+    """Включено ли правило «товар aloe узнаётся по номеру на сайте».
+
+    Включает его миграция `0024_aloe_product_numbers`, а не выкладка кода: пока
+    в базе нет её предохранителя, товары aloe пишутся под слагом, как раньше.
+    Так правило и защита от кода, который его не знает, появляются одновременно:
+    сбор, попавший между копированием кода и миграцией, ничего не переводит, а
+    `alembic downgrade` выключает правило без выкладки прежнего кода.
+
+    В SQLite (разработка, тесты) предохранителя нет и правило действует всегда.
+    """
+    if session.get_bind().dialect.name != "postgresql":
+        return True
+    return bool(
+        session.scalar(
+            text(
+                "select exists (select 1 from pg_trigger where tgname = :name"
+                " and tgrelid = to_regclass('products') and not tgisinternal)"
+            ),
+            {"name": ALOE_NUMBER_IDENTITY_TRIGGER},
+        )
+    )
+
+
+def _aloe_products_under_slug(
+    session: Session, products: list[ScrapedProduct]
+) -> list[ScrapedProduct]:
+    """Товары aloe в том виде, в каком их писал сборщик до перехода на номер.
+
+    Идентификатор — первые сто знаков слага, адрес — со слагом; товар без слага
+    не пишется. Из нескольких товаров одного слага остаётся тот, что стоит
+    первым в последнем разделе, где слаг встретился: прежний сборщик писал по
+    разделам, и строка оставалась за ним. Нужно, пока правило «по номеру» не
+    включено миграцией.
+
+    Если товары этих слагов уже записаны под номером, а строки под слагом у
+    них нет, запись отказывает: правило выключено не откатом, а потерей
+    предохранителя, и запись под слагом завела бы каталог второй раз.
+    """
+    from src.scrapers.aloe import aloe_slug_address, aloe_slug_from_url
+
+    legacy_of = {
+        id(scraped): aloe_slug_address(scraped.url)
+        for scraped in products
+        if scraped.site == "aloe" and scraped.identity_verified
+    }
+    holder: dict[str, tuple[str | None, str]] = {}
+    for scraped in products:
+        legacy = legacy_of.get(id(scraped))
+        if legacy is None:
+            continue
+        held = holder.get(legacy[0])
+        if held is None or held[0] != scraped.category:
+            holder[legacy[0]] = (scraped.category, scraped.external_id)
+
+    kept: list[ScrapedProduct] = []
+    for scraped in products:
+        if id(scraped) in legacy_of:
+            legacy = legacy_of[id(scraped)]
+            if legacy is None or holder[legacy[0]][1] != scraped.external_id:
+                continue
+            scraped = replace(scraped, external_id=legacy[0], url=legacy[1])
+        kept.append(scraped)
+
+    slug_of = {legacy[0]: aloe_slug_from_url(legacy[1]) for legacy in legacy_of.values() if legacy}
+    if slug_of:
+        numbered_slugs = {
+            aloe_slug_from_url(url)
+            for url in session.scalars(
+                select(storage.Product.url).where(
+                    storage.Product.site == "aloe", storage.Product.url.like("%/#%")
+                )
+            )
+        }
+        suspects = sorted(key for key, slug in slug_of.items() if slug in numbered_slugs)
+        under_slug: set[str] = set()
+        for start in range(0, len(suspects), _ALOE_ADOPT_QUERY_CHUNK):
+            under_slug.update(
+                session.scalars(
+                    select(storage.Product.external_id).where(
+                        storage.Product.site == "aloe",
+                        storage.Product.external_id.in_(
+                            suspects[start : start + _ALOE_ADOPT_QUERY_CHUNK]
+                        ),
+                    )
+                )
+            )
+        orphaned = [key for key in suspects if key not in under_slug]
+        if orphaned:
+            raise RuntimeError(
+                f"aloe: {len(orphaned)} товаров уже записаны под номером, а правило «по номеру» "
+                f"выключено (нет триггера {ALOE_NUMBER_IDENTITY_TRIGGER}); запись под слагом "
+                f"завела бы им вторые строки, например {orphaned[0]!r}. docs/RUNBOOK.md, "
+                "«Идентификаторы aloe: номер товара»"
+            )
+    return kept
+
+
+def _aloe_claim(
+    row: storage.Product,
+    scraped: ScrapedProduct,
+    last_snapshot: storage.PriceSnapshot | None,
+) -> tuple[bool, bool, bool, int] | None:
+    """Насколько товар из сбора похож на записанный в строке; None — страна другая."""
+    from src.product_policy import COUNTRY_RESOLVED, country_resolution
+
+    code, status = country_resolution(scraped.manufacturer_country_raw)
+    row_code = row.manufacturer_country_code
+    # Страна, которую сбор уже видел у этой строки один раз и держит на
+    # проверке, — не чужая: сайт мог поправить подпись у того же товара.
+    if (
+        status == COUNTRY_RESOLVED
+        and row_code
+        and code not in (row_code, row.country_candidate_code)
+    ):
+        return None
+    brand = (scraped.brand or "").strip().casefold()
+    return (
+        bool(row_code) and code == row_code,
+        bool(brand) and brand == (row.brand_verified or "").strip().casefold(),
+        last_snapshot is not None
+        and (last_snapshot.price, last_snapshot.discount_price)
+        == (scraped.price, scraped.discount_price),
+        # При прочих равных — меньший номер: его открывает адрес, записанный в строке.
+        -int(scraped.external_id),
+    )
+
+
+def _aloe_claim_is_proven(
+    row: storage.Product,
+    claim: tuple[bool, bool, bool, int],
+    last_snapshot: storage.PriceSnapshot | None,
+) -> bool:
+    """Можно ли отдать строку товару, не видя остальных товаров сайта.
+
+    Частичный сбор не знает, есть ли у слага другие товары. Строку он отдаёт
+    только товару, который в ней и записан: совпало всё, что строка о товаре
+    знает, — страна, бренд и последняя цена. Чего в строке нет, то не
+    проверяется; строка без страны, бренда и цены достаётся пришедшему.
+    Одного совпадения мало: у двух товаров слага цена бывает одинаковой, а
+    бренд — общим.
+    """
+    country_same, brand_same, price_same, _ = claim
+    if row.manufacturer_country_code and not country_same:
+        return False
+    if (row.brand_verified or "").strip() and not brand_same:
+        return False
+    return last_snapshot is None or price_same
+
+
+def _adopt_aloe_product_numbers(
+    session: Session, products: list[ScrapedProduct], *, whole_catalog: bool
+) -> set[str]:
+    """Строке aloe, записанной под слагом, дать номер товара на сайте — на месте.
+
+    До 2026-10-08 товар aloe искался по слагу, а слаг сайт сам даёт нескольким
+    товарам: они записывались одной строкой. Теперь идентификатор — номер
+    товара (см. шапку `src/scrapers/aloe.py`). Товар, записанный по-старому, по
+    номеру не находится: без этого шага каждый товар aloe получил бы вторую
+    строку, а первая осталась бы с историей цен и местом в кластере.
+
+    Строку под слагом получает один товар. Кому она достаётся, решается по всем
+    товарам слага сразу, поэтому решает только полный сбор сайта
+    (`whole_catalog`): тому, чью страну строка носит; при равенстве — чей бренд
+    в ней записан; затем чья цена записана в ней последней; затем товару с
+    меньшим номером. Товар другой страны строку не получает никогда: страна —
+    часть того, какой это товар. Остальные товары слага получают свои строки.
+
+    Частичный сбор (тик, раздел, страница товара) остальных товаров слага не
+    видит. Он переводит строку, только когда пришедший товар в ней и записан
+    (`_aloe_claim_is_proven`); иначе, пока строка под слагом свободна, товар в
+    этом сборе не пишется вовсе и ждёт полного сбора — вторая строка для него
+    была бы хуже пропущенного тика. Номера таких товаров функция возвращает.
+
+    Шаг стоит в записи сбора, а не в миграции: номер товара знает только сбор.
+    Сборы идут по одному (замок сбора). Вызывается из `persist_results` один
+    раз на вызов, до разбивки на пачки; чтобы в полном сборе это был один раз
+    на сайт, `run` пишет товары aloe в конце сбора, а не по разделам.
+
+    Код без этой правки строку под номером не найдёт и попробует завести товару
+    вторую — под слагом; на PostgreSQL такую вставку отвергает предохранитель
+    миграции 0024. Откат — docs/RUNBOOK.md, «Идентификаторы aloe: номер товара».
+    """
+    numbered: dict[str, ScrapedProduct] = {}
+    for scraped in products:
+        # Номер прочитан у сайта, а не выведен из названия или адреса.
+        if scraped.site == "aloe" and scraped.identity_verified:
+            numbered.setdefault(scraped.external_id, scraped)
+    if not numbered:
+        return set()
+    # Только теперь: запись сбора другого сайта не должна зависеть от модуля aloe.
+    from src.scrapers.aloe import aloe_legacy_external_ids, aloe_slug_from_url
+
+    def chunks(values: set[str] | dict[str, ScrapedProduct]) -> list[list[str]]:
+        ordered = sorted(values)
+        return [
+            ordered[start : start + _ALOE_ADOPT_QUERY_CHUNK]
+            for start in range(0, len(ordered), _ALOE_ADOPT_QUERY_CHUNK)
+        ]
+
+    known: set[str] = set()
+    for chunk in chunks(numbered):
+        known.update(
+            session.scalars(
+                select(storage.Product.external_id).where(
+                    storage.Product.site == "aloe", storage.Product.external_id.in_(chunk)
+                )
+            )
+        )
+    claimants: dict[str, list[ScrapedProduct]] = {}
+    for number, scraped in numbered.items():
+        slug = aloe_slug_from_url(scraped.url)
+        if number not in known and slug:
+            claimants.setdefault(slug, []).append(scraped)
+    if not claimants:
+        return set()
+
+    rows_by_slug: dict[str, list[storage.Product]] = {}
+    for chunk in chunks({key for slug in claimants for key in aloe_legacy_external_ids(slug)}):
+        for row in session.scalars(
+            select(storage.Product).where(
+                storage.Product.site == "aloe", storage.Product.external_id.in_(chunk)
+            )
+        ):
+            # Обрезок слага общий у товаров с общим началом длинного названия:
+            # строка принадлежит тому слагу, чей адрес в ней записан.
+            slug = aloe_slug_from_url(row.url)
+            if slug in claimants:
+                rows_by_slug.setdefault(slug, []).append(row)
+
+    # Цена нужна, когда претендентов несколько, а частичному сбору — всегда.
+    priced = [
+        row.id
+        for slug, rows in rows_by_slug.items()
+        if not whole_catalog or len(claimants[slug]) > 1
+        for row in rows
+    ]
+    last_snapshots = storage.latest_snapshots_per_product(session, priced) if priced else {}
+
+    adopted = other_country = 0
+    deferred: set[str] = set()
+    for slug, rows in rows_by_slug.items():
+        free = list(claimants[slug])
+        unproven: set[str] = set()
+        taken = 0
+        # Сначала строка, которую сбор видел последней.
+        for row in sorted(rows, key=lambda r: (r.last_seen_at, r.id), reverse=True):
+            if not free:
+                break
+            last = last_snapshots.get(row.id)
+            claims = {
+                scraped.external_id: claim
+                for scraped in free
+                if (claim := _aloe_claim(row, scraped, last)) is not None
+            }
+            if not claims:
+                other_country += 1
+                continue
+            if not whole_catalog:
+                proven = {
+                    number: claim
+                    for number, claim in claims.items()
+                    if _aloe_claim_is_proven(row, claim, last)
+                }
+                unproven.update(claims.keys() - proven.keys())
+                claims = proven
+                if not claims:
+                    continue
+            heir = numbered[max(claims, key=claims.__getitem__)]
+            free.remove(heir)
+            # Номер и адрес — вместе: запись сбора коммитит пачками, и сбой
+            # между пачками оставил бы строку с номером при адресе со слагом.
+            row.external_id = heir.external_id
+            row.url = heir.url
+            adopted += 1
+            taken += 1
+        if taken < len(rows):
+            # Кому из них достанется свободная строка, решит полный сбор; новая
+            # строка сейчас отняла бы её у товара навсегда. Товар другой страны
+            # не ждёт: эту строку он не получит никогда.
+            deferred.update(unproven.intersection(scraped.external_id for scraped in free))
+    if adopted:
+        # Сразу, а не вместе со вставкой новых строк: порядок UPDATE и INSERT
+        # внутри одного flush — внутреннее дело SQLAlchemy.
+        session.flush()
+    if adopted or other_country or deferred:
+        log.info(
+            "aloe_product_numbers_adopted",
+            products=adopted,
+            whole_catalog=whole_catalog,
+            shared_slugs=sum(1 for slug in rows_by_slug if len(claimants[slug]) > 1),
+            left_for_other_country=other_country,
+            left_for_full_scan=len(deferred),
+            # Кто именно ждёт: по счётчику товар не найти.
+            waiting=sorted(deferred, key=int)[:30],
+        )
+    return deferred
+
+
 def _verify_pharmonline_public_api_identities(
     session: Session,
     results: list[ScrapeResult],
@@ -2641,8 +2946,12 @@ async def scrape_site(
 
     # Phase 1.4 — optional AI crawler fallback when primary yield collapses.
     # Only kicks in if AI_FALLBACK_ENABLED=1 in env (off by default — costs $).
-    if not result.site_fatal and _should_trigger_ai_fallback(
-        len(result.products), ai_fallback_baseline
+    # aloe — мимо: запасной сборщик называет товар aloe по-своему и завёл бы
+    # ему вторую строку (товар aloe узнаётся по номеру, см. src/scrapers/aloe.py).
+    if (
+        site != "aloe"
+        and not result.site_fatal
+        and _should_trigger_ai_fallback(len(result.products), ai_fallback_baseline)
     ):
         ai_cls = AI_CRAWLER_BY_SITE.get(site)
         if ai_cls is None:
@@ -2937,6 +3246,23 @@ def auto_match_watchlist(session, *, tenant_id: int = 1) -> int:
                     storage.Product.tenant_id == tenant_id,
                 )
             )
+            if product is None and link.site == "aloe":
+                # Адрес в строке aloe — с номером товара; закрепляют обычно
+                # адрес со слагом, каким его показывает сайт.
+                from src import match_actions
+
+                found = match_actions.aloe_products_at_address(
+                    session, link.url, tenant_id=tenant_id
+                )
+                if len(found) > 1:
+                    log.warning(
+                        "watchlist_aloe_address_names_several_products",
+                        tracked_product_id=tp.id,
+                        url=link.url,
+                        products=[candidate.external_id for candidate in found],
+                    )
+                elif found:
+                    product = found[0]
             if product and product.canonical_id != match.id:
                 # Do not trust ``match.products`` here: this loop mutates
                 # ``canonical_id`` directly and the already-loaded relationship
@@ -3595,9 +3921,34 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
         if not result.products and not result.promos:
             continue
 
+        products = result.products
+        if result.site == "aloe" and any(sp.identity_verified for sp in products):
+            if _aloe_number_identity_active(session):
+                # Строку общего слага делит только полный сбор сайта, прошедший
+                # все разделы: иначе часть претендентов не видна.
+                whole_catalog = (
+                    run.catalog_scope == "full"
+                    and bool(result.route_statuses)
+                    and all(status.complete for status in result.route_statuses.values())
+                )
+                waiting = _adopt_aloe_product_numbers(
+                    session, products, whole_catalog=whole_catalog
+                )
+                if waiting:
+                    products = [
+                        sp
+                        for sp in products
+                        if not (sp.identity_verified and sp.external_id in waiting)
+                    ]
+                    # Товар собран, хотя и не записан: счётчик прогона — о сборе.
+                    total += len(result.products) - len(products)
+            else:
+                products = _aloe_products_under_slug(session, products)
+                total += len(result.products) - len(products)
+
         # === Чанкуем продукты внутри одного ScrapeResult ===
-        for chunk_start in range(0, len(result.products), _PERSIST_CHUNK):
-            chunk_products = result.products[chunk_start : chunk_start + _PERSIST_CHUNK]
+        for chunk_start in range(0, len(products), _PERSIST_CHUNK):
+            chunk_products = products[chunk_start : chunk_start + _PERSIST_CHUNK]
             if not chunk_products:
                 continue
 
@@ -3759,6 +4110,15 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                         "captured_at": now,
                     }
                 )
+                # Товар, стоящий в пачке дважды (два раздела сайта), сравнивается
+                # уже с этой записью: одна смена цены — одна запись.
+                latest_snapshots[product.id] = {
+                    "price": sp.price,
+                    "discount_price": sp.discount_price,
+                    "discount_percent": sp.discount_percent,
+                    "is_on_sale": sp.is_on_sale,
+                    "promo_label": sp.promo_label,
+                }
                 total += 1
             if snapshot_rows:
                 session.execute(sa_insert(storage.PriceSnapshot), snapshot_rows)
@@ -5270,6 +5630,11 @@ def run_cmd(
                 on_category = None
                 if not use_legacy_identity_bridge:
                     def _persist_category(site_name, slug, cat_products):
+                        if site_name == "aloe":
+                            # Пишется целиком в конце сбора: кому достаётся
+                            # строка, записанная под общим слагом, решается по
+                            # всем товарам сайта сразу (`_adopt_aloe_product_numbers`).
+                            return
                         persist_results(
                             session,
                             run,
