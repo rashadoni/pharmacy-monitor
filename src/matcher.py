@@ -1599,6 +1599,9 @@ def revalidate_split(
                 reason_type="system_country" if country_conflict else "system_spec",
                 metadata={"source_match_id": m.id, "policy_version": 1},
             )
+            if rejection is None:
+                # Товары из разных тенантов: отказа нет, кластер разбираем дальше.
+                continue
             session.flush()
             rejection_audits.append(
                 {

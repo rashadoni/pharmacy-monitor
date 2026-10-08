@@ -33,6 +33,34 @@ def _ordered(a: int, b: int) -> tuple[int, int]:
     return (a, b) if a < b else (b, a)
 
 
+def _pair_tenant_id(session: Session, product_a_id: int, product_b_id: int) -> int | None:
+    """Тенант отказа — тенант товаров пары; None, если товары из разных тенантов.
+
+    У колонки ``match_rejections.tenant_id`` значение по умолчанию 1: отказ,
+    записанный без тенанта, достаётся первому тенанту, чья бы пара ни была.
+    Тенант однозначно следует из товаров, поэтому у вызывающих его не спрашиваем
+    — забыть его передать нельзя.
+    """
+    tenants = dict(
+        session.execute(
+            select(Product.id, Product.tenant_id).where(
+                Product.id.in_((product_a_id, product_b_id))
+            )
+        ).all()
+    )
+    missing = sorted({product_a_id, product_b_id} - tenants.keys())
+    if missing:
+        raise ValueError(f"Cannot reject pair: product(s) {missing} not found")
+    if tenants[product_a_id] != tenants[product_b_id]:
+        log.error(
+            "rejection_cross_tenant_skipped",
+            product_ids=[product_a_id, product_b_id],
+            tenant_ids=[tenants[product_a_id], tenants[product_b_id]],
+        )
+        return None
+    return tenants[product_a_id]
+
+
 def add_rejection(
     session: Session,
     product_a_id: int,
@@ -41,12 +69,27 @@ def add_rejection(
     *,
     reason_type: str = "manual",
     metadata: dict | None = None,
-) -> MatchRejection:
-    """Создать (или вернуть существующую) запись отрицания пары."""
+) -> MatchRejection | None:
+    """Создать (или вернуть существующую) запись отрицания пары.
+
+    Запись получает тенант товаров пары. ``MatchRejection`` создаётся только
+    здесь: второй писатель обошёл бы тенант (вызов конструктора в другом месте
+    ловит ``tests/test_match_actions.py``).
+
+    Для пары товаров из разных тенантов записи нет и возвращается None: матчер
+    сводит товары только внутри тенанта, так что запрещать нечего, а строка не
+    принадлежала бы ни одному из двух. Исключения нет намеренно: отклонение,
+    отвязка и перепроверка кластера, в котором оказался чужой товар (его быть
+    не должно), обязаны дойти до конца. След — событие
+    ``rejection_cross_tenant_skipped`` в журнале.
+    """
     _acquire_match_mutation_xact_lock(session)
     if product_a_id == product_b_id:
         raise ValueError("Cannot reject pair with self")
     a, b = _ordered(product_a_id, product_b_id)
+    tenant_id = _pair_tenant_id(session, a, b)
+    if tenant_id is None:
+        return None
     existing = session.scalar(
         select(MatchRejection).where(
             MatchRejection.product_a_id == a, MatchRejection.product_b_id == b
@@ -64,8 +107,12 @@ def add_rejection(
         existing.is_active = True
         existing.resolved_at = None
         existing.updated_at = utcnow()
+        # Пара у записи одна, поэтому искать её по тенанту незачем. Строка,
+        # записанная до появления тенанта у отказов, получает его здесь.
+        existing.tenant_id = tenant_id
         return existing
     rej = MatchRejection(
+        tenant_id=tenant_id,
         product_a_id=a,
         product_b_id=b,
         reason=reason,
@@ -133,8 +180,8 @@ def break_match(
     others = [p for p in m.products if p.id != detach_product_id]
     rej_count = 0
     for other in others:
-        add_rejection(session, detach_product_id, other.id, reason=reason or "manual break")
-        rej_count += 1
+        if add_rejection(session, detach_product_id, other.id, reason=reason or "manual break"):
+            rej_count += 1
 
     detach.canonical_id = None
     session.flush()
