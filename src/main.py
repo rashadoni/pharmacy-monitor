@@ -2464,29 +2464,30 @@ def _setup_logging(level: str = "INFO") -> None:
     Файл-логи читаются ELK / Loki / простым `jq`. Ротация — logrotate
     (см. provision_vps.sh — еженедельно, 8 архивов, gzip).
     """
+    # Вывод команды бывает публичным: еженедельный сбор pharmonline идёт из
+    # GitHub Actions, и журнал его шага открыт. Почтовый адрес из готовой
+    # строки вырезается, что бы ни передал вызов журнала, — и у structlog, и у
+    # stdlib `logging`, которым в тот же вывод пишут сторонние библиотеки.
+    from src.logging_setup import MaskingFormatter, masking
+
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # File handler — JSONL
     file_handler = logging.FileHandler(log_dir / "app.jsonl", encoding="utf-8")
     file_handler.setLevel(level)
-    file_handler.setFormatter(logging.Formatter("%(message)s"))
+    file_handler.setFormatter(MaskingFormatter("%(message)s"))
 
     # Stream handler — terminal
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(level)
-    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    stream_handler.setFormatter(MaskingFormatter("%(message)s"))
 
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
     root.setLevel(level)
-
-    # Вывод команды бывает публичным: еженедельный сбор pharmonline идёт из
-    # GitHub Actions, и журнал его шага открыт. Почтовый адрес из готовой
-    # строки вырезается, что бы ни передал вызов журнала.
-    from src.logging_setup import masking
 
     structlog.configure(
         processors=[

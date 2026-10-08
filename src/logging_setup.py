@@ -72,6 +72,31 @@ def masking(renderer):
     return render
 
 
+class MaskingFormatter(logging.Formatter):
+    """Формат корневых обработчиков stdlib `logging`: адреса вырезаются из строки.
+
+    `masking` стоит на structlog, а в тот же вывод пишут ещё и сторонние
+    библиотеки — через корневые обработчики, мимо него. Источника адреса среди
+    них не найдено; формат стоит, чтобы появление такого источника ничего не
+    изменило. Вырезается всё, что формат отдаёт обработчику: сообщение,
+    трассировка, `stack_info`. Мимо остаётся только то, что `logging` печатает
+    в stderr сам, когда строку не принял поток или запись не удалось даже
+    показать через `repr`.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            text = super().format(record)
+        except Exception:
+            # Сообщение не сошлось со своими аргументами. `logging` в ответ
+            # печатает запись в stderr сам — мимо формата и вместе с аргументами.
+            text = (
+                f"unformattable log record from {record.name} "
+                f"({record.pathname}:{record.lineno}): {record.msg!r} % {record.args!r}"
+            )
+        return mask_addresses(text)
+
+
 def configure_logging(service: str = "app") -> None:
     """Configure structlog → either JSON (production) or pretty (dev).
 
@@ -111,7 +136,7 @@ def configure_logging(service: str = "app") -> None:
 
     # Stdlib logging → forward to structlog so 3rd-party libs get same format
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setFormatter(MaskingFormatter("%(message)s"))
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
@@ -129,7 +154,7 @@ def configure_logging(service: str = "app") -> None:
             backupCount=backups,
             encoding="utf-8",
         )
-        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        file_handler.setFormatter(MaskingFormatter("%(message)s"))
         root.addHandler(file_handler)
 
 
