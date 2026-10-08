@@ -22,7 +22,9 @@ from typing import Sequence
 
 import structlog
 from rapidfuzz import fuzz
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Session
 
 from src.brand_catalog import is_brand_blacklisted
@@ -52,6 +54,29 @@ from src.storage import (
 log = structlog.get_logger()
 
 MATCH_MUTATION_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
+# Session.info: соединение, на котором сессия держит сессионный замок (_HeldLock).
+_LOCK_CONNECTION_INFO_KEY = "match_mutation_lock_connection"
+
+
+class _HeldLock:
+    __slots__ = ("connection", "raw", "previous_bind")
+
+    def __init__(self, connection: Connection, raw, previous_bind) -> None:
+        self.connection = connection
+        # Соединение драйвера под ним. После обрыва или Ctrl-C посреди запроса
+        # SQLAlchemy соединение вне пула не закрывает, а только отпускает, и при
+        # следующем запросе молча берёт вместо него другое — из пула.
+        self.raw = raw
+        self.previous_bind = previous_bind
+
+    def intact(self) -> bool:
+        """Сессия всё ещё ходит через то самое соединение, на котором лежит замок."""
+        try:
+            return self.connection.connection.dbapi_connection is self.raw
+        except InvalidRequestError:
+            # Соединение потеряно, а транзакция на нём ещё не откачена: SQLAlchemy
+            # отказывается его выдавать («can't reconnect until … rolled back»).
+            return False
 
 
 def _is_postgres(session: Session) -> bool:
@@ -61,6 +86,13 @@ def _is_postgres(session: Session) -> bool:
 def acquire_match_mutation_xact_lock(session: Session) -> None:
     """Serialize one transaction with every canonical topology mutation."""
     if _is_postgres(session):
+        held = session.info.get(_LOCK_CONNECTION_INFO_KEY)
+        if held is not None and not held.intact():
+            # После обрыва или Ctrl-C и rollback сессия идёт уже через пул: без
+            # сессионного замка либо в очередь за собственным брошенным соединением.
+            raise RuntimeError(
+                "the session is no longer on the connection that holds the match mutation lock"
+            )
         session.scalar(
             text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
             {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
@@ -68,23 +100,120 @@ def acquire_match_mutation_xact_lock(session: Session) -> None:
 
 
 def acquire_match_mutation_lock(session: Session, *, wait: bool = True) -> bool:
-    """Session-level lock for multi-transaction operations and rollback."""
+    """Session-level lock for multi-transaction operations and rollback.
+
+    Сессионный замок принадлежит соединению с базой, а сессия, привязанная к
+    движку, после каждого commit возвращает соединение в пул и на следующий
+    запрос берёт его заново. Пул вправе отдать другое: соединение старше
+    `pool_recycle` он закрывает и открывает новое. Замок тогда пропадает посреди
+    операции, а снятие уходит в соединение, которое его не держит. На проде так
+    закончились 12 этапов сопоставления из 39 с 3 сентября по 7 октября 2026.
+
+    Поэтому замок берётся на отдельном соединении, которое в пул не
+    возвращается, и до снятия замка сессия работает только через него. Держать
+    замок на одном соединении, а писать через другое нельзя: шаги операции
+    берут транзакционный замок с тем же ключом
+    (`acquire_match_mutation_xact_lock`) и встали бы в очередь за собственным
+    процессом.
+
+    Перевести сессию на другое соединение можно только между транзакциями,
+    поэтому открытая транзакция завершается через `session.commit()` — как её
+    завершил бы первый же commit самой операции — ещё до попытки взять замок,
+    то есть и тогда, когда замок занят и функция вернёт False. Транзакцию,
+    оборванную ошибкой SQL, сервер при этом откатывает.
+
+    Пока замок держится, `session.get_bind()` — соединение, а не движок: код,
+    которому нужен движок (`run_lock.try_shared_scrape_read_lock`), под замком
+    не вызывать. Если соединение замка потеряно (обрыв, Ctrl-C посреди
+    запроса), запросы сессии падают, а после rollback SQLAlchemy переподключил
+    бы её через пул, уже мимо замка — поэтому `acquire_match_mutation_xact_lock`
+    тогда отказывает. Шаг, который транзакционный замок не берёт, этой проверки
+    не проходит: откатывать и продолжать под замком нельзя.
+
+    Сессию, которую вызывающий сам привязал к соединению, функция не трогает:
+    замок ложится на это соединение.
+    """
     if not _is_postgres(session):
         return True
     fn = "pg_advisory_lock" if wait else "pg_try_advisory_lock"
-    value = session.scalar(
-        text(f"SELECT {fn}(hashtext(:key))"),
-        {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
-    )
-    return True if wait else bool(value)
+    statement = text(f"SELECT {fn}(hashtext(:key))")
+    params = {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY}
+    if _LOCK_CONNECTION_INFO_KEY in session.info:
+        raise RuntimeError("this session already holds the match mutation lock")
+    bind = session.get_bind()
+    if isinstance(bind, Connection):
+        value = session.scalar(statement, params)
+        return True if wait else bool(value)
+
+    if session.in_transaction():
+        session.commit()
+    connection = bind.connect()
+    raw = None
+    try:
+        # Вне пула: закрытие такого соединения — конец сеанса на сервере, и
+        # замок уходит вместе с ним, даже если явное снятие не удалось.
+        connection.detach()
+        raw = connection.connection.dbapi_connection
+        value = connection.scalar(statement, params)
+        # Сессионный замок переживает COMMIT; транзакцию самого запроса
+        # закрываем, чтобы сессия начала на этом соединении свою.
+        connection.commit()
+    except BaseException:
+        _close_lock_connection(connection, raw)
+        raise
+    if not wait and not value:
+        _close_lock_connection(connection, raw)
+        return False
+    session.info[_LOCK_CONNECTION_INFO_KEY] = _HeldLock(connection, raw, session.bind)
+    session.bind = connection
+    return True
 
 
 def release_match_mutation_lock(session: Session) -> None:
-    if _is_postgres(session):
-        session.scalar(
-            text("SELECT pg_advisory_unlock(hashtext(:key))"),
-            {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
-        )
+    """Снять замок, взятый `acquire_match_mutation_lock`.
+
+    Незавершённую транзакцию сессии функция не фиксирует и не откатывает:
+    транзакция доживает на выделенном соединении, и оно закрывается вместе с
+    ней. Следующая транзакция сессии снова идёт через пул.
+    """
+    if not _is_postgres(session):
+        return
+    statement = text("SELECT pg_advisory_unlock(hashtext(:key))")
+    params = {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY}
+    held = session.info.pop(_LOCK_CONNECTION_INFO_KEY, None)
+    if held is None:
+        if not session.scalar(statement, params):
+            log.warning("matcher_lock_not_held_at_release")
+        return
+    try:
+        if not held.connection.scalar(statement, params):
+            log.warning("matcher_lock_not_held_at_release")
+    finally:
+        session.bind = held.previous_bind
+        _close_after_session_transaction(session, held)
+
+
+def _close_after_session_transaction(session: Session, held: _HeldLock) -> None:
+    """Закрыть выделенное соединение, когда сессия закончит на нём транзакцию."""
+    if not session.in_transaction():
+        _close_lock_connection(held.connection, held.raw)
+        return
+
+    def close(_session: Session, transaction) -> None:
+        # Точки сохранения (вложенные транзакции) соединение не освобождают.
+        if transaction.parent is None and not held.connection.closed:
+            _close_lock_connection(held.connection, held.raw)
+
+    event.listen(session, "after_transaction_end", close)
+
+
+def _close_lock_connection(connection: Connection, raw) -> None:
+    try:
+        connection.close()
+    finally:
+        if raw is not None:
+            raw.close()
+
 
 FUZZY_THRESHOLD = 75  # 0..100, минимальный score для авто-матча.
 # Снижено с 78 → 75 (2026-05-26): bucket (brand, dosage, pack) уже строго
