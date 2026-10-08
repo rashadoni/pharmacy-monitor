@@ -2729,8 +2729,9 @@ def _other_run_owner_processes(proc_root: Path = Path("/proc")) -> list[tuple[in
 
     Процесс на другой машине отсюда не виден: такой сбор защищает только
     блокировка. Так собирают три ручных workflow — `scrape.yml`,
-    `recover-pharmonline-crawlbase.yml`, `recover-pharmonline-public-api.yml`:
-    на раннере GitHub, с базой через туннель.
+    `recover-pharmonline-crawlbase.yml`, `recover-pharmonline-public-api.yml`
+    (на раннере GitHub, с базой через туннель) — и устаревший
+    `infra/local/run-scrape.sh`.
     """
     if not proc_root.is_dir():
         return None
@@ -2788,9 +2789,10 @@ def _reap_orphan_runs_before_own_run(SessionFactory, *, command: str) -> int:
     Блокировка — первое доказательство, и без настоящей (SQLite, подмена в
     тестах) чужой прогон не трогаем. Второе — на хосте нет другого процесса
     сбора (`_why_unfinished_runs_may_be_alive`). Ждущий блокировку `run` выглядит
-    так же, как идущий сбор, и сам, дождавшись, застаёт предшественника ещё не
-    вышедшим: когда сборы идут подряд, отказываются оба, и сироту снимает
-    watcher после них.
+    так же, как идущий сбор, а сам, дождавшись, застаёт предшественника ещё не
+    вышедшим: когда сборы идут подряд и первый завершился сам, отказываются
+    оба, и сироту снимает watcher после них. Если первого убили — тогда сирота
+    и появляется, — его процесса уже нет, и дождавшийся её снимает.
 
     Отказ и сбой сбор не роняют: оставшийся незавершённый прогон переживёт конец
     сбора (заявка `full_run_deferred`).
@@ -4213,8 +4215,9 @@ def db_check_cmd(fix: bool) -> None:
 @click.option(
     "--max-age-hours",
     type=float,
-    default=6.0,
-    help="Mark unfinished runs older than N hours as failed.",
+    default=0.0,
+    help="Leave alone unfinished runs younger than N hours. Age is not the proof "
+    "that a run is orphaned (the lock and the process list are), so the default is 0.",
 )
 @click.option(
     "--reason",

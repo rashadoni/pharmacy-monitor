@@ -522,11 +522,11 @@ def test_live_run_closed_from_outside_fails_instead_of_publishing(pg_sessions, m
         assert session.scalars(select(RoiRefreshRequest)).all() == []
 
 
-def _reap_command(db_session, monkeypatch):
+def _reap_command(db_session, monkeypatch, *options: str):
     factory = sessionmaker(db_session.get_bind(), expire_on_commit=False, autoflush=False)
     monkeypatch.setattr(storage, "init_db", lambda *args, **kwargs: None)
     monkeypatch.setattr(storage, "make_session", lambda *args, **kwargs: factory)
-    return CliRunner().invoke(main_mod.cli, ["reap-stale-runs", "--max-age-hours", "0"])
+    return CliRunner().invoke(main_mod.cli, ["reap-stale-runs", *options])
 
 
 @pytest.mark.parametrize(
@@ -556,6 +556,7 @@ def test_reap_command_refuses_while_another_scrape_process_may_be_alive(
 
 
 def test_reap_command_reaps_when_no_scrape_process_is_left(db_session, monkeypatch):
+    """Без флага возраста: он не доказательство, и по умолчанию выдержки нет."""
     orphan_id = _unfinished_run(db_session, minutes_ago=1)
 
     result = _reap_command(db_session, monkeypatch)
@@ -565,6 +566,18 @@ def test_reap_command_reaps_when_no_scrape_process_is_left(db_session, monkeypat
     db_session.expire_all()
     orphan = db_session.get(Run, orphan_id)
     assert (orphan.status, orphan.finished_at) == ("failed", orphan.started_at)
+
+
+def test_reap_command_keeps_the_age_threshold_when_asked(db_session, monkeypatch):
+    """Аварийный рычаг watcher'а: `ORPHAN_RUN_MAX_AGE_HOURS` уходит сюда флагом."""
+    young_id = _unfinished_run(db_session, minutes_ago=60)
+
+    result = _reap_command(db_session, monkeypatch, "--max-age-hours", "6")
+
+    assert result.exit_code == 0, result.output
+    assert "reaped 0 stale running run(s)" in result.output
+    db_session.expire_all()
+    _assert_untouched(db_session.get(Run, young_id))
 
 
 def test_reap_command_with_nothing_to_reap_does_not_refuse(db_session, monkeypatch):
