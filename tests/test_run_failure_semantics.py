@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from click.testing import CliRunner
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
@@ -487,9 +488,18 @@ def test_verified_single_site_run_defers_roi_when_other_site_attempt_is_degraded
     assert refresh_calls == []
 
 
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"pharmonline": 0, "aptekonline": -1, "aloe": 0},
+        # Срез упал, а на следующем расчёт отказался: ответ неполный, но сбой в нём есть.
+        {"pharmonline": 0, "aptekonline": -1},
+    ],
+)
 def test_verified_run_still_fails_when_ready_roi_refresh_returns_failure(
     db_session,
     monkeypatch,
+    summary,
 ):
     from src import roi
 
@@ -507,11 +517,7 @@ def test_verified_run_still_fails_when_ready_roi_refresh_returns_failure(
     monkeypatch.setattr(
         roi,
         "refresh_all_cached_actions",
-        lambda session, *, run_id, tenant_id=1: {
-            "pharmonline": 0,
-            "aptekonline": -1,
-            "aloe": 0,
-        },
+        lambda session, *, run_id, tenant_id=1: summary,
     )
 
     runner = CliRunner()
@@ -543,6 +549,194 @@ def test_verified_run_still_fails_when_ready_roi_refresh_returns_failure(
         assert saved_request is not None
         assert saved_request.status == "failed"
         assert saved_request.run_id == run.id
+    finally:
+        verify.close()
+
+
+def _trusted_catalog_with_one_recommendation(db_session) -> None:
+    """Подтверждённый каталог всех сайтов и пара, по которой есть что советовать."""
+    from tests.test_roi_refresh import _cluster, _full_run
+
+    trusted = _full_run(db_session)
+    _cluster(db_session, trusted, "Aspirin", {"pharmonline": 5.0, "aptekonline": 7.0, "aloe": 6.5})
+
+
+def _run_verified_aloe(request_id: int):
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        return runner.invoke(
+            main_mod.cli,
+            [
+                "run",
+                "--site",
+                "aloe",
+                "--mode",
+                "category",
+                "--no-alerts",
+                "--request-id",
+                str(request_id),
+            ],
+        )
+
+
+def test_orphan_run_neither_fails_a_verified_run_nor_empties_recommendations(
+    db_session,
+    monkeypatch,
+):
+    """Строка `running` от упавшего раньше тика мешает расчёту в конце сбора.
+
+    Сбор от этого не становится failed, а в кэш не ложится пустой список —
+    дашборд показывал бы «Нет рекомендаций» до следующего полного сбора. Прогон
+    оставляет заявку; watcher снимает сироту и тем же тиком считает.
+
+    Это запасной путь: под настоящей блокировкой сбор снимает сирот на старте
+    сам (`tests/test_orphan_runs_before_scrape.py`). Здесь SQLite, блокировок
+    нет — и доказательства, что чужой прогон осиротел, тоже.
+    """
+    from src import roi, roi_refresh
+
+    _trusted_catalog_with_one_recommendation(db_session)
+    # Рекомендации прошлого сбора уже лежат в кэше.
+    assert roi_refresh.refresh_from_trusted_epoch(db_session).outcome == "refreshed"
+    cached_before = {
+        row.client_site: (row.run_id, row.computed_at, list(row.payload))
+        for row in db_session.scalars(select(storage.RoiActionsCache)).all()
+    }
+    assert len(cached_before) == 3
+    orphan = storage.Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running")
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add_all([orphan, request])
+    db_session.commit()
+    request_id = request.id
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+
+    result = _run_verified_aloe(request_id)
+
+    assert result.exit_code == 0, result.output
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        saved_request = verify.get(storage.ScrapeRequest, request_id)
+        assert run is not None
+        assert run.status == "ok"
+        assert run.catalog_verified is True
+        assert run.error_message is None
+        assert saved_request is not None
+        assert saved_request.status == "ok"
+        # Кэш не тронут: ни пустого списка, ни удаления. Прежние рекомендации
+        # при этом не отдаются — они от прошлой эпохи каталога.
+        cached_after = {
+            row.client_site: (row.run_id, row.computed_at, list(row.payload))
+            for row in verify.scalars(select(storage.RoiActionsCache)).all()
+        }
+        assert cached_after == cached_before
+        assert roi.get_cached_actions(verify, "pharmonline") is None
+        owed = verify.scalars(select(storage.RoiRefreshRequest)).all()
+        assert [(item.reason, item.status) for item in owed] == [("full_run_deferred", "pending")]
+
+        # Пока сирота висит, пересчёт ждёт и заявку не закрывает.
+        assert roi_refresh.run_refresh(verify, only_if_requested=True).outcome == "busy"
+        assert main_mod.reap_stale_running_runs(verify, max_age_hours=0) == 1
+        refreshed = roi_refresh.run_refresh(verify, only_if_requested=True)
+
+        assert (refreshed.outcome, refreshed.run_id) == ("refreshed", run.id)
+        cached = roi.get_cached_actions(verify, "pharmonline")
+        assert cached is not None
+        assert [item["type"] for item in cached] == ["price_raise"]
+    finally:
+        verify.close()
+
+
+def test_closed_policy_gate_neither_fails_a_verified_run_nor_empties_recommendations(
+    db_session,
+    monkeypatch,
+):
+    """Гейт политики закрыт: расчёта нет, но и ответа «рекомендаций нет» тоже.
+
+    Заявка не ставится: пересчёт без сбора упёрся бы в тот же гейт и закрыл её
+    `skipped` — открывает его только следующий подтверждённый полный сбор.
+    """
+    from src import product_policy, roi
+
+    _trusted_catalog_with_one_recommendation(db_session)
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add(request)
+    db_session.commit()
+    request_id = request.id
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+    monkeypatch.setattr(
+        product_policy,
+        "policy_rollout_eligibility",
+        lambda *args, **kwargs: product_policy.Eligibility(False, "full_catalog_trust_not_ready"),
+    )
+
+    result = _run_verified_aloe(request_id)
+
+    assert result.exit_code == 0, result.output
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        assert run is not None
+        assert run.status == "ok"
+        assert run.error_message is None
+        assert verify.scalars(select(storage.RoiActionsCache)).all() == []
+        assert roi.get_cached_actions(verify, "pharmonline") is None
+        assert verify.scalars(select(storage.RoiRefreshRequest)).all() == []
+    finally:
+        verify.close()
+
+
+@pytest.mark.parametrize("error", [ValueError("wrong run"), RuntimeError("epoch is gone")])
+def test_only_a_refusal_to_compute_is_forgiven_at_the_end_of_a_verified_run(
+    db_session, monkeypatch, error
+):
+    """Любая другая ошибка пересчёта по-прежнему роняет прогон."""
+    from src import roi
+
+    _trusted_catalog_with_one_recommendation(db_session)
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add(request)
+    db_session.commit()
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+
+    def broken_refresh(session, *, run_id, tenant_id=1):
+        raise error
+
+    monkeypatch.setattr(roi, "refresh_all_cached_actions", broken_refresh)
+
+    result = _run_verified_aloe(request.id)
+
+    assert result.exit_code != 0
+    verify = _session_factory(db_session)()
+    try:
+        run = verify.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
+        assert run is not None
+        assert run.status == "failed"
+        assert str(error) in (run.error_message or "")
+        assert verify.scalars(select(storage.RoiRefreshRequest)).all() == []
+    finally:
+        verify.close()
+
+
+def test_verified_run_writes_recommendations_when_nothing_blocks_them(db_session, monkeypatch):
+    """Парный к двум тестам выше: та же обвязка без помехи кэш пишет."""
+    from src import roi
+
+    _trusted_catalog_with_one_recommendation(db_session)
+    request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
+    db_session.add(request)
+    db_session.commit()
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+
+    result = _run_verified_aloe(request.id)
+
+    assert result.exit_code == 0, result.output
+    verify = _session_factory(db_session)()
+    try:
+        cached = roi.get_cached_actions(verify, "pharmonline")
+        assert cached is not None
+        assert [item["type"] for item in cached] == ["price_raise"]
+        assert verify.scalars(select(storage.RoiRefreshRequest)).all() == []
     finally:
         verify.close()
 

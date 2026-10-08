@@ -4,6 +4,8 @@ from contextlib import contextmanager
 
 from datetime import timedelta
 
+import pytest
+
 from src._time import utcnow
 
 from src import roi, storage
@@ -825,6 +827,205 @@ def test_refresh_all_cached_actions_covers_three_sites(db_session):
     assert all(r.run_id == eligible_run.id for r in rows)
 
 
+# ─── «Не считали» — не то же, что «рекомендаций нет» ──────────────────────────
+#
+# Живому читателю (`compute_actions`) обе ситуации отдаются пустым списком — это
+# закреплено в test_direct_compute_blocks_during_run_… выше. В кэш пустой список
+# ложится как настоящий ответ: дашборд показывает «Нет рекомендаций» до
+# следующего полного сбора, то есть до недели.
+
+
+def _cached_payloads(s) -> dict[str, list]:
+    from src.storage import RoiActionsCache
+
+    s.expire_all()
+    return {row.client_site: list(row.payload) for row in s.query(RoiActionsCache).all()}
+
+
+def _orphan_run(s) -> Run:
+    """Прогон упавшего раньше тика: строка осталась `running` без времени конца."""
+    orphan = Run(tenant_id=1, started_at=utcnow(), finished_at=None, status="running")
+    s.add(orphan)
+    s.commit()
+    return orphan
+
+
+def test_refresh_keeps_the_cache_when_another_run_is_unfinished(db_session):
+    run = _shared_run(db_session)
+    _make_cluster(
+        db_session,
+        "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+        run=run,
+    )
+    assert roi.refresh_all_cached_actions(db_session, run_id=run.id)["pharmonline"] == 1
+    before = _cached_payloads(db_session)
+    _orphan_run(db_session)
+
+    with pytest.raises(roi.RecommendationsNotComputed) as refused:
+        roi.refresh_all_cached_actions(db_session, run_id=run.id)
+
+    assert refused.value.reason == roi.NOT_COMPUTED_RUN_UNFINISHED
+    assert _cached_payloads(db_session) == before
+    assert [item["type"] for item in before["pharmonline"]] == ["price_raise"]
+
+
+def test_refresh_writes_nothing_when_the_policy_gate_is_closed(db_session, monkeypatch):
+    from src import product_policy
+
+    run = _shared_run(db_session)
+    _make_cluster(
+        db_session,
+        "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+        run=run,
+    )
+    monkeypatch.setattr(
+        product_policy,
+        "policy_rollout_eligibility",
+        lambda *args, **kwargs: product_policy.Eligibility(False, "full_catalog_trust_not_ready"),
+    )
+
+    with pytest.raises(roi.RecommendationsNotComputed) as refused:
+        roi.refresh_all_cached_actions(db_session, run_id=run.id)
+
+    assert refused.value.reason == "policy_gate:full_catalog_trust_not_ready"
+    assert _cached_payloads(db_session) == {}
+    # Отказавшийся расчёт не оставляет в сессии и побочных записей.
+    assert db_session.query(storage.PricingConfig).count() == 0
+
+
+def test_refresh_refuses_stale_inputs_the_same_way_before_and_between_slices(db_session):
+    """Несвежие входы на входе — тот же отказ, что и посреди срезов, а не сбой."""
+    run = _shared_run(db_session)
+    run.started_at = utcnow() - timedelta(hours=175)
+    run.finished_at = run.started_at
+    db_session.commit()
+
+    with pytest.raises(roi.RecommendationsNotComputed) as refused:
+        roi.refresh_all_cached_actions(db_session, run_id=run.id)
+
+    assert refused.value.reason == roi.NOT_COMPUTED_INPUTS_UNVERIFIED
+    assert _cached_payloads(db_session) == {}
+
+
+@pytest.mark.parametrize(
+    ("interruption", "reason"),
+    [
+        ("orphan_run", roi.NOT_COMPUTED_RUN_UNFINISHED),
+        ("stale_inputs", roi.NOT_COMPUTED_INPUTS_UNVERIFIED),
+    ],
+)
+def test_refresh_interrupted_between_slices_caches_no_empty_list(
+    db_session, monkeypatch, interruption, reason
+):
+    """Помеха появилась, когда первый срез уже записан: остальные не пишутся."""
+    run = _shared_run(db_session)
+    _make_cluster(
+        db_session,
+        "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+        run=run,
+    )
+    real_cache_actions = roi.cache_actions
+
+    def cache_then_interrupt(session, client_site, actions, **kwargs):
+        real_cache_actions(session, client_site, actions, **kwargs)
+        if interruption == "orphan_run":
+            _orphan_run(session)
+        else:
+            monkeypatch.setattr(roi, "financial_inputs_are_fresh", lambda *a, **kw: False)
+
+    monkeypatch.setattr(roi, "cache_actions", cache_then_interrupt)
+
+    with pytest.raises(roi.RecommendationsNotComputed) as refused:
+        roi.refresh_all_cached_actions(db_session, run_id=run.id)
+
+    assert refused.value.reason == reason
+    payloads = _cached_payloads(db_session)
+    assert list(payloads) == ["pharmonline"]
+    assert [item["type"] for item in payloads["pharmonline"]] == ["price_raise"]
+
+
+def test_calculation_itself_refuses_stale_inputs(db_session):
+    """Пустой список из расчёта — всегда посчитанный ответ, кто бы его ни звал."""
+    run = _shared_run(db_session)
+    run.started_at = utcnow() - timedelta(hours=175)
+    run.finished_at = run.started_at
+    db_session.commit()
+
+    with pytest.raises(roi.RecommendationsNotComputed) as refused:
+        roi._compute_actions_locked(db_session, client_site="pharmonline")
+
+    assert refused.value.reason == roi.NOT_COMPUTED_INPUTS_UNVERIFIED
+
+
+def test_inputs_going_stale_while_a_slice_is_computed_is_a_refusal(db_session, monkeypatch):
+    """Порог свежести перейдён между расчётом среза и его записью.
+
+    Это тот же отказ, что до и после, а не сбой среза: иначе подтверждённый
+    сбор стал бы failed из-за секунды на часах.
+    """
+    run = _shared_run(db_session)
+    _make_cluster(
+        db_session,
+        "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+        run=run,
+    )
+    real_compute = roi._compute_actions_locked
+
+    def compute_then_go_stale(session, **kwargs):
+        actions = real_compute(session, **kwargs)
+        monkeypatch.setattr(roi, "financial_inputs_are_fresh", lambda *a, **kw: False)
+        return actions
+
+    monkeypatch.setattr(roi, "_compute_actions_locked", compute_then_go_stale)
+
+    with pytest.raises(roi.RecommendationsNotComputed) as refused:
+        roi.refresh_all_cached_actions(db_session, run_id=run.id)
+
+    assert refused.value.reason == roi.NOT_COMPUTED_INPUTS_UNVERIFIED
+    assert _cached_payloads(db_session) == {}
+
+
+def test_slice_failure_is_not_hidden_by_a_refusal_on_the_next_slice(db_session, monkeypatch):
+    """Срез упал, следующий отказался: вызывающий обязан узнать о сбое."""
+    run = _shared_run(db_session)
+    _make_cluster(
+        db_session,
+        "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+        run=run,
+    )
+    real_compute = roi._compute_actions_locked
+
+    def fail_first_slice_then_orphan(session, *, client_site=None, **kwargs):
+        if client_site == "pharmonline":
+            _orphan_run(session)
+            raise RuntimeError("boom")
+        return real_compute(session, client_site=client_site, **kwargs)
+
+    monkeypatch.setattr(roi, "_compute_actions_locked", fail_first_slice_then_orphan)
+
+    summary = roi.refresh_all_cached_actions(db_session, run_id=run.id)
+
+    assert summary == {"pharmonline": -1}
+    assert _cached_payloads(db_session) == {}
+
+
+def test_refresh_still_caches_a_computed_empty_list(db_session):
+    """Расчёт состоялся и ничего не нашёл — это ответ, он обязан лечь в кэш."""
+    run = _shared_run(db_session)
+    db_session.commit()
+
+    summary = roi.refresh_all_cached_actions(db_session, run_id=run.id)
+
+    assert summary == {"pharmonline": 0, "aptekonline": 0, "aloe": 0}
+    assert _cached_payloads(db_session) == {"pharmonline": [], "aptekonline": [], "aloe": []}
+    assert roi.get_cached_actions(db_session, "pharmonline") == []
+
+
 def test_roi_cache_rejects_unverified_run(db_session):
     run = Run(
         started_at=utcnow(),
@@ -878,7 +1079,7 @@ def test_roi_cache_waits_until_every_site_has_verified_full_scan(db_session):
 
     import pytest
 
-    with pytest.raises(ValueError, match="every site"):
+    with pytest.raises(roi.RecommendationsNotComputed):
         roi.cache_actions(db_session, "pharmonline", [], run_id=run.id)
 
     from src.storage import RoiActionsCache
@@ -912,7 +1113,7 @@ def test_roi_cache_rejects_stale_verified_site_inputs(db_session):
 
     import pytest
 
-    with pytest.raises(ValueError, match="fresh verified"):
+    with pytest.raises(roi.RecommendationsNotComputed):
         roi.cache_actions(db_session, "pharmonline", [], run_id=run.id)
 
 

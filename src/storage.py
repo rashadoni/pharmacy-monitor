@@ -808,6 +808,41 @@ class RoiActionsCache(Base):
     )
 
 
+class RoiRefreshRequest(Base):
+    """Заявка «пересчитай кэш рекомендаций без нового сбора».
+
+    Кэш (`RoiActionsCache`) пишет конец подтверждённого полного сбора, а сбор
+    идёт раз в неделю. Всё, что меняет рекомендации между сборами — пороги,
+    себестоимость, правка пары, — кладёт сюда строку, а серверный watcher
+    исполняет очередь командой `pharmacy-monitor roi refresh --pending`
+    (см. `src/roi_refresh.py`).
+
+    Одна строка на изменение, без склейки при вставке: заявка обязана стать
+    видимой не раньше самого изменения, иначе пересчёт, начатый до него, закрыл
+    бы её, не увидев новых данных. Склеивает исполнитель — один пересчёт
+    закрывает все заявки, видимые на его старте.
+
+    Состояния: pending → done | skipped | failed. Отдельного «running» нет
+    намеренно: убитый посреди работы пересчёт оставляет заявку в pending, и её
+    подбирает следующий тик.
+    """
+
+    __tablename__ = "roi_refresh_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    # Что изменилось: pricing_config / cost_import / match_reject / … — для
+    # разбора «почему рекомендации пересчитались» по журналу.
+    reason: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Полный прогон, от эпохи которого посчитан кэш (для done).
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Почему skipped/failed.
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class PricingConfig(Base):
     """Per-tenant configurable ROI thresholds (Phase 4.1, 2026-05-27).
 
