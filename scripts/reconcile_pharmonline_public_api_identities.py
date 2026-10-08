@@ -7,6 +7,19 @@ the exact-SHA gated recovery workflow only: it repeats the same source proof,
 locks the relevant Product rows, applies only proven rekeys or quarantined
 identity splits, records immutable evidence, establishes a non-ratcheting
 catalog floor, and verifies the resulting map before committing.
+
+The ``direct`` transport is the narrow way through when Decodo is down: it
+admits plain identities only (a new product, or a product already stored under
+the same ID and URL).  A plan that needs a legacy rekey, any URL move or a split
+is refused and must be rerun through Decodo.  It never creates or lowers the
+catalog floor.  Every read then leaves from the production host itself, so each
+invocation makes one catalog pass, in one attempt, instead of two passes with
+retries: the plan's pass and the apply's pass are the two fresh reads, and
+nothing is written unless the second equals the approved first.  That is weaker
+than the proxied proof in one respect and is accepted knowingly: both reads
+come from the same address, so a catalog variant served consistently to this
+host would not be noticed, where two proxy exits would disagree.  The nightly
+collection reads from the same address and admits the same two classes.
 """
 
 from __future__ import annotations
@@ -22,15 +35,20 @@ from sqlalchemy import text
 
 from src import storage
 from src.main import (
+    PharmonlinePublicAPIReconciliationError,
     _PharmonlinePublicAPILegacySelfRedirectProof,
     _apply_pharmonline_public_api_reconciliation,
     _diagnose_pharmonline_public_api_reconciliation,
     _ensure_pharmonline_public_api_catalog_baseline,
     _pharmonline_public_api_catalog_fingerprint,
+    _pharmonline_public_api_manual_admission_proof_version,
+    _pharmonline_public_api_plain_admission_refusal,
+    _pharmonline_public_api_proof_version_is_plain_only,
     _pharmonline_public_api_reconciliation_plan,
     _pharmonline_public_api_reconciliation_plan_manifest_sha256,
     _pharmonline_public_api_reconciliation_is_safe,
     _pharmonline_public_api_redirect_challenges,
+    _require_pharmonline_public_api_catalog_floor,
     _verify_pharmonline_public_api_identities,
 )
 from src.run_lock import wait_for_exclusive_scrape_lock
@@ -50,9 +68,11 @@ def fail(message: str) -> NoReturn:
     raise SystemExit(f"Pharmonline public API reconciliation failed: {message}")
 
 
-async def read_catalog_pass(pass_name: str):
+async def read_catalog_pass(
+    pass_name: str, *, max_attempts: int = _MAX_FRESH_CATALOG_READ_ATTEMPTS
+):
     """Return one complete catalog or discard the entire inconsistent attempt."""
-    for attempt in range(1, _MAX_FRESH_CATALOG_READ_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         async with PharmonlinePublicAPIScraper() as scraper:
             result = await scraper.scrape([PUBLIC_CATALOG_ROUTE])
 
@@ -73,10 +93,7 @@ async def read_catalog_pass(pass_name: str):
             return result
 
         reason = route.abort_reason if route is not None else None
-        if (
-            is_retryable_full_catalog_abort_reason(reason)
-            and attempt < _MAX_FRESH_CATALOG_READ_ATTEMPTS
-        ):
+        if is_retryable_full_catalog_abort_reason(reason) and attempt < max_attempts:
             retry_delay = (
                 300
                 if reason
@@ -116,6 +133,21 @@ async def read_two_identical_catalogs():
     return first_pass
 
 
+async def read_verified_catalog(*, single_pass: bool):
+    """Two identical back-to-back passes; one attempt at one pass when direct.
+
+    Direct reads all leave from the production host, and the source answers a
+    host that reads the full catalog five times within an hour with 429 — the
+    same address the nightly collection depends on.  So a direct invocation
+    reads once and does not retry a discarded read: it fails, and the operator
+    dispatches again later.  The second read is the other invocation's: the
+    apply's pass must equal the approved plan's pass before anything is written.
+    """
+    if single_pass:
+        return await read_catalog_pass("direct pass", max_attempts=1)
+    return await read_two_identical_catalogs()
+
+
 def _transport() -> str:
     transport = os.environ.get("PHARMONLINE_PUBLIC_API_TRANSPORT", "").strip().lower()
     if not transport:
@@ -131,6 +163,21 @@ def _workflow_evidence() -> tuple[str, str]:
     if not source_manifest_sha256 or not preflight_run_ref:
         fail("--apply requires immutable exact-SHA workflow evidence")
     return source_manifest_sha256, preflight_run_ref
+
+
+def _require_plan_transport(transport: str) -> None:
+    """The apply goes through the transport its approved plan was made with.
+
+    The workflow passes the plan's transport twice: as the transport to use
+    and as the plan's.  A value overridden on the way (``src.main`` loads a
+    ``.env`` over the environment) or a crossed dispatch stops here, before
+    the first read.
+    """
+    plan_transport = (
+        os.environ.get("PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT", "").strip().lower()
+    )
+    if not plan_transport or plan_transport != transport:
+        fail("--apply must use the transport of the approved plan")
 
 
 def _expected_plan_evidence() -> tuple[str, str, int]:
@@ -239,6 +286,19 @@ def write_plan_evidence(
 
 async def main(*, apply: bool) -> None:
     transport = _transport()
+    # The transport names the proof version the admissions are written with:
+    # direct has its own, limited to plain admissions.
+    admission_proof_version = _pharmonline_public_api_manual_admission_proof_version(transport)
+    plain_admissions_only = _pharmonline_public_api_proof_version_is_plain_only(
+        admission_proof_version
+    )
+    if plain_admissions_only:
+        # One attempt means one at every layer: the scraper has a whole-catalog
+        # retry of its own, switched on by this variable.  Pinned here, after
+        # ``src.main`` has loaded any ``.env`` over the environment.
+        os.environ["PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS"] = "1"
+    plan_refusal = None
+    floor_refusal = None
     lock_wait_seconds = _production_lock_wait_seconds()
     source_manifest_sha256 = ""
     preflight_run_ref = ""
@@ -246,6 +306,7 @@ async def main(*, apply: bool) -> None:
     expected_plan_manifest = ""
     expected_plan_product_count = 0
     if apply:
+        _require_plan_transport(transport)
         source_manifest_sha256, preflight_run_ref = _workflow_evidence()
         (
             expected_plan_fingerprint,
@@ -279,7 +340,7 @@ async def main(*, apply: bool) -> None:
                         f"for {lock_wait_seconds} seconds"
                     )
 
-                verified_catalog = await read_two_identical_catalogs()
+                verified_catalog = await read_verified_catalog(single_pass=plain_admissions_only)
                 results = [verified_catalog]
                 fingerprint = _pharmonline_public_api_catalog_fingerprint(results)
                 redirect_challenges = _pharmonline_public_api_redirect_challenges(
@@ -353,6 +414,23 @@ async def main(*, apply: bool) -> None:
                             plan_metrics,
                         )
                     )
+                    plan_refusal = _pharmonline_public_api_plain_admission_refusal(
+                        admission_proof_version,
+                        actions,
+                        admissions,
+                        quarantines,
+                    )
+                    if plain_admissions_only:
+                        # Refuse here rather than after the approval: the apply
+                        # would stop at the same floor check.
+                        try:
+                            _require_pharmonline_public_api_catalog_floor(
+                                session,
+                                results,
+                                tenant_id=1,
+                            )
+                        except PharmonlinePublicAPIReconciliationError as exc:
+                            floor_refusal = str(exc)
                     session.rollback()
                 else:
                     session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
@@ -367,28 +445,38 @@ async def main(*, apply: bool) -> None:
                         redirect_proofs=redirect_proofs,
                         legacy_self_redirect_proofs=legacy_self_redirect_proofs,
                         expected_plan_manifest_sha256=expected_plan_manifest,
+                        admission_proof_version=admission_proof_version,
                     )
-                    catalog_floor = _ensure_pharmonline_public_api_catalog_baseline(
-                        session,
-                        results,
-                        tenant_id=1,
-                        verified_identity_count=len(verified_catalog.products),
-                        trusted_ddp_item_count=metrics["trusted_ddp_identities"],
-                        retired_ddp_item_count=metrics["retired_ddp_identities"],
-                        reconciled_item_count=(
-                            metrics["reconciled_identities"]
-                            + metrics["legacy_rekeys_ready"]
-                            + metrics["native_id_url_rebind_ready"]
-                            + metrics["native_id_url_rebind_redirect_ready"]
-                            + metrics["identity_splits_ready"]
-                            + metrics["existing_native_admissions_ready"]
-                            + metrics["new_public_product_admissions_ready"]
-                        ),
-                        source_manifest_sha256=source_manifest_sha256,
-                        catalog_fingerprint_sha256=fingerprint,
-                        source_transport=transport,
-                        preflight_run_ref=preflight_run_ref,
-                    )
+                    if plain_admissions_only:
+                        # A direct reconciliation checks the catalog against
+                        # the floor that already exists; it never writes one.
+                        catalog_floor = _require_pharmonline_public_api_catalog_floor(
+                            session,
+                            results,
+                            tenant_id=1,
+                        )
+                    else:
+                        catalog_floor = _ensure_pharmonline_public_api_catalog_baseline(
+                            session,
+                            results,
+                            tenant_id=1,
+                            verified_identity_count=len(verified_catalog.products),
+                            trusted_ddp_item_count=metrics["trusted_ddp_identities"],
+                            retired_ddp_item_count=metrics["retired_ddp_identities"],
+                            reconciled_item_count=(
+                                metrics["reconciled_identities"]
+                                + metrics["legacy_rekeys_ready"]
+                                + metrics["native_id_url_rebind_ready"]
+                                + metrics["native_id_url_rebind_redirect_ready"]
+                                + metrics["identity_splits_ready"]
+                                + metrics["existing_native_admissions_ready"]
+                                + metrics["new_public_product_admissions_ready"]
+                            ),
+                            source_manifest_sha256=source_manifest_sha256,
+                            catalog_fingerprint_sha256=fingerprint,
+                            source_transport=transport,
+                            preflight_run_ref=preflight_run_ref,
+                        )
                     verified_identities = _verify_pharmonline_public_api_identities(
                         session,
                         results,
@@ -409,6 +497,13 @@ async def main(*, apply: bool) -> None:
         )
         if not _pharmonline_public_api_reconciliation_is_safe(diagnostics):
             fail("one or more legacy identity transitions require manual proof")
+        if plan_refusal is not None:
+            fail(
+                f"the {transport} transport admits plain identities only; "
+                f"rerun the plan with the decodo transport: {plan_refusal}"
+            )
+        if floor_refusal is not None:
+            fail(floor_refusal)
         write_plan_evidence(
             transport=transport,
             product_count=len(verified_catalog.products),

@@ -92,6 +92,88 @@ _PHARMONLINE_PUBLIC_API_QUARANTINE_AVAILABILITY_SOURCE = "pharmonline_identity_q
 _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS = frozenset(
     {"existing_native_id", "new_public_product", "quarantined_public_product"}
 )
+# Транспорты, которыми ходит ручная сверка (workflow с двумя чтениями каталога).
+_PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS = frozenset(
+    {"crawlbase", "decodo", "scraperapi", "firecrawl"}
+)
+# Допуск, который плановый сбор записал сам, без ручной сверки. У него своя
+# версия доказательства, чтобы такие строки журнала нельзя было спутать с
+# ручными, и свои правила:
+#   * только два класса — оба не требуют свидетельства со стороны сайта;
+#     разведение (quarantined_public_product) остаётся за ручной сверкой;
+#   * транспорт — те, которыми сбор ходит без присмотра: decodo и direct у
+#     ночного таймера, direct и запасной firecrawl у еженедельного сбора из
+#     Actions (список ручной сверки старше прямого транспорта и его не знает);
+#   * preflight_run_ref — номер прогона (runs.id), а не прогона Actions;
+#   * source_manifest_sha256 — хеш плана, который этот прогон применил
+#     (манифеста исходников у планового сбора нет).
+# Код, не знающий этой версии, считает такие допуски недействительными и
+# отказывает — см. docs/RUNBOOK.md «Сбор pharmonline: новые товары допускаются
+# сами…», абзац «Откат».
+_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION = "public_api_scheduled_admission_v1"
+_PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS = frozenset({"decodo", "direct", "firecrawl"})
+_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS = frozenset(
+    {"existing_native_id", "new_public_product"}
+)
+# Допуск, который записала ручная сверка, прочитав каталог напрямую, без Decodo.
+# Запрет на direct в журнале держался на том, что обычный сбор в журналы не
+# пишет; с автодопуском это неверно, и одобренный человеком путь остался строже
+# автомата без причины: всплеск простых товаров при недоступном Decodo
+# разобрать было нечем. Версия своя, а не расширение ручной:
+#   * только direct и только два простых класса — им свидетельство со стороны
+#     сайта не нужно. Перекодировка, смена адреса и разведение остаются за
+#     транспортами ручной сверки, разведение — за Decodo;
+#   * `public_api_identity_admission_v1` по-прежнему не принимает direct: такая
+#     строка, как и раньше, значит «написано мимо кода»;
+#   * от автодопуска её отличают отсутствие потолка и одобренный человеком
+#     план: preflight_run_ref — прогон плана в Actions, source_manifest_sha256 —
+#     манифест исходников, как у ручной сверки.
+# Код, не знающий этой версии, считает такие допуски недействительными — см.
+# docs/RUNBOOK.md «Сбор pharmonline: новые товары допускаются сами…», абзац
+# «Ручная сверка без Decodo».
+_PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION = (
+    "public_api_manual_direct_admission_v1"
+)
+_PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_PROOF_TRANSPORTS = frozenset({"direct"})
+_PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_KINDS = frozenset(
+    {"existing_native_id", "new_public_product"}
+)
+# Версия доказательства → (допустимые транспорты, допустимые классы допуска).
+# Единственное место, где записано, что какой версии можно: по нему проверяется
+# и запись допуска, и каждая строка журнала при чтении.
+_PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF = {
+    _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION: (
+        _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS,
+        _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS,
+    ),
+    _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION: (
+        _PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS,
+        _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS,
+    ),
+    _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION: (
+        _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_PROOF_TRANSPORTS,
+        _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_KINDS,
+    ),
+}
+# Версии, с которыми запись может менять личности: перекодировка, смена адреса,
+# разведение. Список разрешающий: версия, которой здесь нет, — и любая будущая,
+# которую забудут сюда внести, — пишет только простые допуски. Он отдельный, а
+# не выведен из классов выше: версия, которой разрешили новый класс допуска, не
+# должна заодно получить право менять идентификаторы и адреса.
+_PHARMONLINE_PUBLIC_API_IDENTITY_TRANSITION_PROOF_VERSIONS = frozenset(
+    {_PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION}
+)
+# Потолок автодопуска за один прогон. Недельный приток новых товаров за
+# июнь–сентябрь 2026 — от 6 до ~60 (при сборе раз в неделю это и есть размер
+# одного допуска); 150 покрывает две пропущенные недели. Больше — уже не «появились
+# новые товары», а всплеск: массовый импорт, смена идентификаторов на сайте или
+# долгий простой сбора. Его разбирает человек ручной сверкой.
+_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT = 150
+# Может только снизить потолок; 0 выключает автодопуск целиком (сбор снова
+# отказывает на первом же новом товаре, как до 2026-10-08).
+_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV = (
+    "PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT"
+)
 _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 # One-time bootstrap floor for a catalog that has never been baselined.  It
 # only has to be low enough to reject a truncated first read, so it must stay
@@ -538,7 +620,7 @@ def _pharmonline_public_api_reconciliation_invalid_reason(
         return "source_manifest"
     if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256) is None:
         return "catalog_fingerprint"
-    if record.source_transport not in {"crawlbase", "decodo", "scraperapi", "firecrawl"}:
+    if record.source_transport not in _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS:
         return "transport"
     if re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None:
         return "preflight_run"
@@ -599,8 +681,14 @@ def _pharmonline_public_api_admission_invalid_reason(
     canonical_url = _canonical_pharmonline_product_url(record.public_api_canonical_url)
     if record.admission_kind not in _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS:
         return "admission_kind"
-    if record.proof_version != _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION:
+    rules = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF.get(record.proof_version)
+    if rules is None:
         return "proof_version"
+    allowed_transports, allowed_kinds = rules
+    if record.admission_kind not in allowed_kinds:
+        # Плановый сбор не разводит личности: строка «разведение + допуск
+        # планового сбора» может появиться только мимо кода.
+        return "admission_kind"
     if _PHARMONLINE_METEOR_ID_RE.fullmatch(public_external_id) is None:
         return "public_id"
     if canonical_url is None:
@@ -609,7 +697,7 @@ def _pharmonline_public_api_admission_invalid_reason(
         return "source_manifest"
     if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256) is None:
         return "catalog_fingerprint"
-    if record.source_transport not in {"crawlbase", "decodo", "scraperapi", "firecrawl"}:
+    if record.source_transport not in allowed_transports:
         return "transport"
     if re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None:
         return "preflight_run"
@@ -922,7 +1010,12 @@ def _pharmonline_public_api_reconciliation_plan(
     api_records = _public_api_identity_records(results)
     product_statement = select(storage.Product).where(storage.Product.site == "pharmonline")
     if lock_products:
-        product_statement = product_statement.with_for_update()
+        # Блокировка строк ничего не стоит, если сами строки взяты из памяти
+        # сессии: объект, оставшийся от чтения без блокировки, отдал бы прежние
+        # идентификатор и адрес. Перечитываем из базы.
+        product_statement = product_statement.with_for_update().execution_options(
+            populate_existing=True
+        )
     all_site_products = session.scalars(product_statement).all()
     tenant_products = [product for product in all_site_products if product.tenant_id == tenant_id]
 
@@ -1276,29 +1369,72 @@ def _pharmonline_public_api_reconciliation_plan_manifest_sha256(
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
+_PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS = (
+    "target_id_cross_tenant",
+    "target_id_duplicate",
+    "legacy_url_ambiguous",
+    "legacy_url_cross_tenant",
+    "legacy_row_has_ddp_lineage",
+    "legacy_row_has_native_id",
+    "admission_url_cross_tenant",
+    "admission_url_conflict",
+    "native_id_url_rebind_unproven",
+    "reconciliation_record_conflict",
+    "admission_record_conflict",
+    "quarantine_record_conflict",
+    "trusted_identity_conflict",
+    "identity_split_prior_audit",
+    "unclassified_api_identities",
+)
+
+
 def _pharmonline_public_api_reconciliation_is_safe(metrics: dict[str, int]) -> bool:
     """Whether an exhaustive plan has no unproven or cross-tenant case."""
     if metrics.get("classified_identities") != metrics.get("api_identities"):
         return False
-    return not any(
-        metrics[key]
-        for key in (
-            "target_id_cross_tenant",
-            "target_id_duplicate",
-            "legacy_url_ambiguous",
-            "legacy_url_cross_tenant",
-            "legacy_row_has_ddp_lineage",
-            "legacy_row_has_native_id",
-            "admission_url_cross_tenant",
-            "admission_url_conflict",
-            "native_id_url_rebind_unproven",
-            "reconciliation_record_conflict",
-            "admission_record_conflict",
-            "quarantine_record_conflict",
-            "trusted_identity_conflict",
-            "identity_split_prior_audit",
-            "unclassified_api_identities",
-        )
+    return not any(metrics[key] for key in _PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS)
+
+
+def _pharmonline_public_api_manual_admission_proof_version(source_transport: str) -> str:
+    """Версия доказательства, которой ручная сверка пишет допуски при этом транспорте.
+
+    Напрямую — своя версия, только простые допуски; любым другим транспортом —
+    прежняя версия ручной сверки. Незнакомый транспорт здесь не отсеивается: его
+    отвергнет проверка доказательства у самой записи.
+    """
+    if source_transport in _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_PROOF_TRANSPORTS:
+        return _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION
+    return _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION
+
+
+def _pharmonline_public_api_proof_version_is_plain_only(admission_proof_version: str) -> bool:
+    """С этой версией доказательства запись выполняет только простые допуски."""
+    return (
+        admission_proof_version not in _PHARMONLINE_PUBLIC_API_IDENTITY_TRANSITION_PROOF_VERSIONS
+    )
+
+
+def _pharmonline_public_api_plain_admission_refusal(
+    admission_proof_version: str,
+    actions: list[_PharmonlinePublicAPIReconciliationAction],
+    admissions: list[_PharmonlinePublicAPIIdentityAdmissionAction],
+    quarantines: list[_PharmonlinePublicAPIIdentityQuarantineAction],
+) -> str | None:
+    """Почему план нельзя записать этой версией доказательства; None — можно.
+
+    Для версий, которым разрешены только простые допуски, план обязан состоять
+    из них одних. Возвращает счётчики без идентификаторов и адресов: строка идёт
+    в журнал шага Actions, а он открыт.
+    """
+    if not _pharmonline_public_api_proof_version_is_plain_only(admission_proof_version):
+        return None
+    _, allowed_kinds = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF[admission_proof_version]
+    other_kinds = sum(1 for action in admissions if action.admission_kind not in allowed_kinds)
+    if not (actions or quarantines or other_kinds):
+        return None
+    return (
+        f"identity_transitions={len(actions)}, identity_splits={len(quarantines)}, "
+        f"other_admission_kinds={other_kinds}"
     )
 
 
@@ -1308,12 +1444,13 @@ def _require_pharmonline_public_api_reconciliation_proof(
     catalog_fingerprint_sha256: str,
     source_transport: str,
     preflight_run_ref: str,
+    allowed_transports: frozenset[str] = _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS,
 ) -> None:
     """Validate non-secret, immutable evidence supplied by the gated workflow."""
     if (
         _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(source_manifest_sha256) is None
         or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(catalog_fingerprint_sha256) is None
-        or source_transport not in {"crawlbase", "decodo", "scraperapi", "firecrawl"}
+        or source_transport not in allowed_transports
         or re.fullmatch(r"[0-9]{1,20}", preflight_run_ref) is None
     ):
         raise PharmonlinePublicAPIReconciliationError(
@@ -1333,6 +1470,7 @@ def _apply_pharmonline_public_api_reconciliation(
     redirect_proofs: tuple[_PharmonlinePublicAPIRedirectProof, ...] = (),
     legacy_self_redirect_proofs: tuple[_PharmonlinePublicAPILegacySelfRedirectProof, ...] = (),
     expected_plan_manifest_sha256: str | None = None,
+    admission_proof_version: str,
 ) -> dict[str, int]:
     """Apply only a completely prevalidated identity recovery batch.
 
@@ -1340,12 +1478,28 @@ def _apply_pharmonline_public_api_reconciliation(
     script.  It never deletes Products; legacy rekeys preserve every linked
     record on the same primary key, and public genesis is allowed only where
     no Product identity exists in any tenant.
+
+    ``admission_proof_version`` — версия доказательства, с которой пишутся
+    допуски; умолчания нет намеренно: вызывающий обязан назвать, от чьего имени
+    пишет. Плановый сбор передаёт свою
+    (`_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION`), ручная
+    сверка напрямую — свою
+    (`_PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION`), и с
+    любой из них функция применяет только допуски двух простых классов:
+    перекодировку, смену адреса и разведение она не выполняет.
     """
+    rules = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF.get(admission_proof_version)
+    if rules is None:
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline reconciliation admission proof version is invalid"
+        )
+    allowed_transports, _ = rules
     _require_pharmonline_public_api_reconciliation_proof(
         source_manifest_sha256=source_manifest_sha256,
         catalog_fingerprint_sha256=catalog_fingerprint_sha256,
         source_transport=source_transport,
         preflight_run_ref=preflight_run_ref,
+        allowed_transports=allowed_transports,
     )
     if not _pharmonline_public_api_recovery_tables_available(session):
         raise PharmonlinePublicAPIReconciliationError(
@@ -1382,6 +1536,25 @@ def _apply_pharmonline_public_api_reconciliation(
     if quarantines and source_transport != "decodo":
         raise PharmonlinePublicAPIReconciliationError(
             "public Pharmonline quarantine split requires the Decodo transport"
+        )
+    if (
+        _pharmonline_public_api_plain_admission_refusal(
+            admission_proof_version,
+            actions,
+            admissions,
+            quarantines,
+        )
+        is not None
+    ):
+        # Вторая линия: вызывающий уже отказал бы такому плану. Здесь проверка
+        # стоит у самой записи, чтобы версия планового сбора и версия сверки
+        # напрямую не могли попасть на перекодировку, смену адреса или
+        # разведение ни при каком вызове.
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline scheduled admission is limited to plain admissions"
+            if admission_proof_version
+            == _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION
+            else "public Pharmonline direct reconciliation is limited to plain admissions"
         )
 
     reconciliation_rows: list[dict[str, object]] = []
@@ -1539,20 +1712,34 @@ def _apply_pharmonline_public_api_reconciliation(
             }
         )
 
+    # Занятые идентификаторы и адреса читаем один раз на пачку и дополняем
+    # своими же вставками. Раньше каталог перечитывался на каждый новый товар —
+    # десятки секунд под блокировкой строк на пачке в сотню. Писатель в этой
+    # транзакции один (замок сбора, блокировка строк), а от чужой вставки с тем
+    # же идентификатором защищает уникальный ключ (site, external_id).
+    taken_ids: set[str] | None = None
+    taken_urls: set[str] = set()
     for action in admissions:
         if action.admission_kind not in _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS:
             raise PharmonlinePublicAPIReconciliationError(
                 "public Pharmonline reconciliation admission kind is invalid"
             )
         if action.product_id is None:
-            existing_site_products = session.scalars(
-                select(storage.Product).where(storage.Product.site == "pharmonline")
-            ).all()
-            if any(
-                str(product.external_id) == action.public_api_external_id
-                or _canonical_pharmonline_product_url(product.url)
-                == action.public_api_canonical_url
-                for product in existing_site_products
+            if taken_ids is None:
+                site_rows = session.execute(
+                    select(storage.Product.external_id, storage.Product.url).where(
+                        storage.Product.site == "pharmonline"
+                    )
+                ).all()
+                taken_ids = {str(external_id) for external_id, _ in site_rows}
+                taken_urls = {
+                    canonical_url
+                    for _, url in site_rows
+                    if (canonical_url := _canonical_pharmonline_product_url(url)) is not None
+                }
+            if (
+                action.public_api_external_id in taken_ids
+                or action.public_api_canonical_url in taken_urls
             ):
                 raise PharmonlinePublicAPIReconciliationError(
                     "public Pharmonline genesis identity exists before apply"
@@ -1564,6 +1751,8 @@ def _apply_pharmonline_public_api_reconciliation(
             )
             session.add(product)
             session.flush()
+            taken_ids.add(action.public_api_external_id)
+            taken_urls.add(action.public_api_canonical_url)
         else:
             product = session.get(storage.Product, action.product_id)
             if (
@@ -1584,7 +1773,7 @@ def _apply_pharmonline_public_api_reconciliation(
                 "admission_kind": action.admission_kind,
                 "public_api_external_id": action.public_api_external_id,
                 "public_api_canonical_url": action.public_api_canonical_url,
-                "proof_version": _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION,
+                "proof_version": admission_proof_version,
                 "source_manifest_sha256": source_manifest_sha256,
                 "catalog_fingerprint_sha256": catalog_fingerprint_sha256,
                 "source_transport": source_transport,
@@ -1712,6 +1901,43 @@ def _ensure_pharmonline_public_api_catalog_baseline(
     )
     session.flush()
     return minimum_catalog_item_count
+
+
+def _require_pharmonline_public_api_catalog_floor(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+) -> int:
+    """Сверить каталог с уже заведённой нижней границей, ничего не записывая.
+
+    Для ручной сверки напрямую. Границу заводит только сверка через свои
+    транспорты (`_ensure_pharmonline_public_api_catalog_baseline`): строки с
+    транспортом direct в её журнале не появляется, и опустить границу этот путь
+    не может. Нет границы — отказ: первую сверку каталога напрямую не делают.
+    """
+    if not _pharmonline_public_api_recovery_tables_available(session):
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline catalog baseline schema is not migrated"
+        )
+    catalog_item_count = len(_public_api_identity_records(results))
+    existing_floor = max(
+        session.scalars(
+            select(storage.PharmonlinePublicAPICatalogBaseline.minimum_catalog_item_count).where(
+                storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id
+            )
+        ).all(),
+        default=0,
+    )
+    if existing_floor < 1:
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline direct reconciliation requires an existing catalog floor"
+        )
+    if catalog_item_count < existing_floor:
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline catalog is below its immutable recovery floor"
+        )
+    return existing_floor
 
 
 def _bridge_pharmonline_legacy_ids(
@@ -1957,6 +2183,273 @@ def _verify_pharmonline_public_api_identities(
         tenant_id=tenant_id,
     )
     return len(api_by_id)
+
+
+def _pharmonline_public_api_scheduled_admission_limit() -> int:
+    """Сколько товаров плановый сбор может допустить сам; 0 — автодопуск выключен.
+
+    Переменная окружения может только снизить потолок. Нечитаемое значение
+    выключает автодопуск: опечатка в настройке не должна ничего допускать.
+    """
+    raw = os.environ.get(_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV, "").strip()
+    if not raw:
+        return _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT
+    if not (raw.isascii() and raw.isdigit()):
+        return 0
+    return min(int(raw), _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT)
+
+
+def _admit_pharmonline_public_api_scheduled_identities(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+    run_id: int,
+    source_transport: str,
+) -> tuple[dict[str, object], list[_PharmonlinePublicAPIIdentityAdmissionAction]]:
+    """Допустить новые товары планового сбора, если весь план — простые допуски.
+
+    Ручная сверка допускает товар после двух одинаковых чтений каталога и
+    одобренного человеком плана. Плановый сбор делает это сам, но только там,
+    где свидетельство со стороны сайта не нужно вовсе:
+
+    * ``new_public_product`` — ни идентификатора, ни адреса нет ни у одного
+      тенанта: новой строке не с чем совпасть и нечью историю унаследовать;
+    * ``existing_native_id`` — строка с этим идентификатором И этим адресом уже
+      лежит у тенанта, и сайт сейчас называет ту же пару. Это строже, чем у
+      нового товара: совпали обе половины личности.
+
+    Вместо второго чтения:
+
+    * допуск и запись сбора идут из ОДНОГО чтения — того, что уже прошло
+      проверку полноты и сверку с sitemap; плану не с чем разойтись (ручная
+      сверка читает каталог сама, а сбор через полчаса читает его заново);
+    * план должен быть безопасен целиком и состоять только из этих допусков:
+      одна перекодировка, смена адреса, конфликт записей или чужой тенант — и
+      не допускается ничего;
+    * не больше потолка за прогон (всплеск — отказ, а не допуск);
+    * после допуска в той же транзакции идёт полная проверка личностей; не
+      прошла — допуски откатываются.
+
+    Транзакция та же, что у ручной сверки: SERIALIZABLE, строки товаров под
+    блокировкой, план перед записью сверяется по хешу с тем, по которому
+    принято решение.
+
+    Допуск фиксируется до записи сбора. Если сбор после этого упадёт, останутся
+    товар без цены и его допуск — то же состояние, что между ручной сверкой и
+    следующим сбором: допуск утверждает только «сайт назвал эту личность, и в
+    базе ей ничто не противоречило», а это верно и без цен. Следующий сбор
+    увидит товар доверенным и запишет цену.
+
+    Возвращает (сводка для run_quality, применённые допуски). Отказ — не
+    исключение: прогон остановит проверка личностей, с точными счётчиками.
+    """
+    from collections import Counter
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    limit = _pharmonline_public_api_scheduled_admission_limit()
+    summary: dict[str, object] = {
+        "status": "nothing_to_admit",
+        "reason": None,
+        "new_public_product": 0,
+        "existing_native_id": 0,
+        "limit": limit,
+    }
+    actions, admissions, quarantines, metrics = _pharmonline_public_api_reconciliation_plan(
+        session,
+        results,
+        tenant_id=tenant_id,
+    )
+    by_kind = Counter(action.admission_kind for action in admissions)
+    summary["new_public_product"] = by_kind.get("new_public_product", 0)
+    summary["existing_native_id"] = by_kind.get("existing_native_id", 0)
+    unsafe = {
+        key: metrics[key]
+        for key in _PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS
+        if metrics.get(key)
+    }
+    if not (actions or admissions or quarantines or unsafe):
+        return summary, []
+
+    def refused(reason: str) -> tuple[dict[str, object], list]:
+        summary.update(status="refused", reason=reason)
+        log.warning(
+            "pharmonline_public_api_scheduled_admission_refused",
+            run_id=run_id,
+            tenant_id=tenant_id,
+            reason=reason,
+            candidates=len(admissions),
+            limit=limit,
+        )
+        return summary, []
+
+    if limit < 1:
+        return refused(f"disabled:candidates={len(admissions)}")
+    if unsafe:
+        # unclassified_api_identities — сумма остальных счётчиков: каждый
+        # небезопасный случай остаётся неразобранным. Называем сам случай, а
+        # сумму — только если кроме неё сказать нечего.
+        named = {
+            key: value for key, value in unsafe.items() if key != "unclassified_api_identities"
+        } or unsafe
+        return refused(
+            "plan_unsafe:" + ",".join(f"{key}={value}" for key, value in sorted(named.items()))
+        )
+    if actions or quarantines:
+        return refused(
+            "identity_transition_required:"
+            f"legacy_rekeys={metrics['legacy_rekeys_ready']},"
+            "url_rebinds="
+            f"{metrics['native_id_url_rebind_ready'] + metrics['native_id_url_rebind_redirect_ready']},"
+            f"splits={metrics['identity_splits_ready']}"
+        )
+    if any(
+        action.admission_kind not in _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS
+        for action in admissions
+    ):
+        return refused("admission_kind")
+    if len(admissions) > limit:
+        return refused(f"limit_exceeded:candidates={len(admissions)},limit={limit}")
+    if source_transport not in _PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS:
+        return refused("transport")
+    if not _pharmonline_public_api_recovery_tables_available(session):
+        return refused("audit_schema_missing")
+    # Строка с любой записью в журналах, которую проверка при этом не считает
+    # доверенной, — это испорченное или незнакомое доказательство. Второй допуск
+    # поверх него не пишем: такое разбирает человек.
+    prior_audit_product_ids = _pharmonline_public_api_prior_audit_product_ids(
+        session,
+        tenant_id=tenant_id,
+    )
+    chained = sum(
+        1
+        for action in admissions
+        if action.product_id is not None and action.product_id in prior_audit_product_ids
+    )
+    if chained:
+        return refused(f"existing_identity_has_prior_audit={chained}")
+
+    plan_manifest_sha256 = _pharmonline_public_api_reconciliation_plan_manifest_sha256(
+        actions,
+        admissions,
+        quarantines,
+        metrics,
+    )
+    catalog_fingerprint_sha256 = _pharmonline_public_api_catalog_fingerprint(results)
+    # Решение принято на чтении без блокировок. Закрываем эту транзакцию и
+    # применяем в новой: она перечитывает план под блокировкой строк и
+    # откажет, если он успел измениться.
+    session.commit()
+    try:
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+        _apply_pharmonline_public_api_reconciliation(
+            session,
+            results,
+            tenant_id=tenant_id,
+            source_manifest_sha256=plan_manifest_sha256,
+            catalog_fingerprint_sha256=catalog_fingerprint_sha256,
+            source_transport=source_transport,
+            preflight_run_ref=str(run_id),
+            expected_plan_manifest_sha256=plan_manifest_sha256,
+            admission_proof_version=_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION,
+        )
+        _verify_pharmonline_public_api_identities(session, results, tenant_id=tenant_id)
+        session.commit()
+    except PharmonlinePublicAPIIdentityError:
+        # Дело не в новых товарах (нижняя граница каталога, конфликт записей…):
+        # допуск ничего бы не исправил. Откатываем его; причину со счётчиками
+        # назовёт проверка личностей у вызывающего.
+        session.rollback()
+        return refused("identity_proof_failed_after_admission")
+    except PharmonlinePublicAPIReconciliationError as exc:
+        session.rollback()
+        return refused(f"apply_refused:{str(exc)[:120]}")
+    except SQLAlchemyError as exc:
+        # Текст ошибки базы в причину не кладём: в нём бывают значения строк.
+        session.rollback()
+        return refused(f"apply_failed:{type(exc).__name__}")
+    except BaseException:
+        # Что бы ни случилось между первой записью и фиксацией — откат здесь.
+        # Иначе обработчик сбоя прогона, сохраняя статус, зафиксировал бы и
+        # недописанный, непроверенный допуск.
+        session.rollback()
+        raise
+
+    summary.update(
+        status="admitted",
+        proof_version=_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION,
+        source_transport=source_transport,
+        note=(
+            f"Плановый сбор сам допустил {len(admissions)} тов. pharmonline без ручной "
+            f"сверки: новых — {summary['new_public_product']}, вернувшихся под прежним "
+            f"идентификатором и адресом — {summary['existing_native_id']}."
+        ),
+    )
+    log.warning(
+        "pharmonline_public_api_scheduled_admission",
+        run_id=run_id,
+        tenant_id=tenant_id,
+        admitted=len(admissions),
+        new_public_product=summary["new_public_product"],
+        existing_native_id=summary["existing_native_id"],
+        limit=limit,
+        source_transport=source_transport,
+        proof_version=_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION,
+        catalog_fingerprint=catalog_fingerprint_sha256[:16],
+        plan_manifest=plan_manifest_sha256[:16],
+    )
+    return summary, list(admissions)
+
+
+def _mail_pharmonline_scheduled_admission_to_admins(
+    session: Session,
+    run: storage.Run,
+    admitted: list[_PharmonlinePublicAPIIdentityAdmissionAction],
+) -> dict[str, int]:
+    """Автодопуск не бывает тихим: список допущенного — письмом администраторам.
+
+    Допуски к этому моменту уже зафиксированы. Сбой почты сбор не роняет: то же
+    самое записано в журнале (`pharmonline_public_api_scheduled_admission`), в
+    run_quality прогона и в журнале допусков. Повторной отправки нет, поэтому
+    итог возвращается и кладётся в run_quality: `{"email": писем, "failed":
+    сбоев}`; оба нуля — писать было некому.
+    """
+    from src import notifications as notif_mod
+
+    try:
+        sent = notif_mod.mail_pharmonline_admission_to_admins(
+            session,
+            tenant_id=run.tenant_id,
+            run_id=run.id,
+            items=[
+                (
+                    action.admission_kind,
+                    action.public_product.name,
+                    action.public_api_canonical_url,
+                )
+                for action in admitted
+            ],
+        )
+    except Exception as e:  # noqa: BLE001
+        # Несохранённого в сессии здесь нет (допуски зафиксированы, проверка
+        # только читала), а сбой чтения получателей оставил бы транзакцию
+        # Postgres в состоянии «aborted» — и на ней упала бы запись сбора.
+        session.rollback()
+        log.warning(
+            "pharmonline_scheduled_admission_mail_failed",
+            run_id=run.id,
+            error_type=type(e).__name__,
+        )
+        return {"email": 0, "failed": 1}
+    if sent["failed"]:
+        log.warning("pharmonline_scheduled_admission_mail_failed", run_id=run.id, **sent)
+    elif sent["email"]:
+        log.info("pharmonline_scheduled_admission_mailed", run_id=run.id, **sent)
+    else:
+        log.warning("pharmonline_scheduled_admission_mail_no_recipient", run_id=run.id)
+    return sent
 
 
 def _diagnose_pharmonline_public_api_identities(
@@ -5341,7 +5834,24 @@ def run_cmd(
                             f"{guarded_catalog_reason or 'full catalog verification failed'}"
                         )
                 if use_public_api:
+                    from src.scrapers.pharmonline_public_api import (
+                        configured_public_api_transport,
+                    )
+
+                    admission: dict[str, object] | None = None
+                    admitted: list[_PharmonlinePublicAPIIdentityAdmissionAction] = []
                     try:
+                        # Новые товары на сайте — обычное дело, а не расхождение
+                        # личностей: простые случаи сбор допускает сам, остальное
+                        # отказывает ниже, как и раньше.
+                        admission, admitted = _admit_pharmonline_public_api_scheduled_identities(
+                            session,
+                            results,
+                            tenant_id=run.tenant_id,
+                            run_id=run.id,
+                            source_transport=configured_public_api_transport(),
+                        )
+                        quality["pharmonline_identity_admission"] = admission
                         _verify_pharmonline_public_api_identities(
                             session,
                             results,
@@ -5355,6 +5865,15 @@ def run_cmd(
                         full_reason = (
                             f"public_api_identity_proof_failed:{str(exc).split(': ', 1)[-1]}"
                         )
+                        # Почему сбор не допустил сам — рядом со счётчиками: по
+                        # этой строке видно, что нужна ручная сверка и какой
+                        # именно случай её требует.
+                        admission_verdict = (
+                            f"; scheduled_admission=refused({admission['reason']})"
+                            if admission is not None and admission["status"] == "refused"
+                            else ""
+                        )
+                        full_reason += admission_verdict
                         # Колонка catalog_verification_reason — varchar(300), и
                         # обрезка приходится ровно на хвост: mismatched_urls,
                         # id_collisions, url_collisions. Именно эти счётчики и
@@ -5371,7 +5890,37 @@ def run_cmd(
                         quality["catalog_verification_reason"] = guarded_catalog_reason
                         quality["catalog_verification_reason_full"] = full_reason
                         run.run_quality = quality
+                        if admission_verdict:
+                            # Run.error_message (его показывают health и список
+                            # прогонов) берётся из текста исключения.
+                            raise PharmonlinePublicAPIIdentityError(
+                                f"{exc}{admission_verdict}"
+                            ) from exc
                         raise
+                    if admitted:
+                        # Письмо уходит и при --dry-run: флаг придерживает то,
+                        # что читает клиент (алерты, отчёт), а это служебное
+                        # сообщение о настоящей записи. С --dry-run зовут `run`
+                        # и workflow ручной сверки — допуск, сделанный там, тоже
+                        # не должен быть тихим.
+                        admission["mail"] = _mail_pharmonline_scheduled_admission_to_admins(
+                            session,
+                            run,
+                            admitted,
+                        )
+                        # Допуск зафиксирован, а запись сбора ещё впереди и может
+                        # упасть. Прогон должен показывать допуск и тогда, поэтому
+                        # отметка ставится сейчас; итог качества её заменит.
+                        # Копия — полная (те же ключи, что у любого прогона) и
+                        # отдельная: правка `quality` ниже не должна выглядеть
+                        # для ORM как «значение не изменилось».
+                        import copy
+
+                        early_quality = copy.deepcopy(quality)
+                        early_quality["full_catalog_verified"] = False
+                        early_quality["financially_eligible"] = False
+                        run.run_quality = early_quality
+                        session.commit()
             count = persist_results(session, run, results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}

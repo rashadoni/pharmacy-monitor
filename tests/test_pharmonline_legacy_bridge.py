@@ -411,6 +411,7 @@ def _reconcile(
         redirect_proofs=redirect_proofs,
         legacy_self_redirect_proofs=legacy_self_redirect_proofs,
         expected_plan_manifest_sha256=expected_plan_manifest_sha256,
+        admission_proof_version=main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION,
     )
 
 

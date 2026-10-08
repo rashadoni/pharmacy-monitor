@@ -2,18 +2,29 @@ name: Reconcile and recover Pharmonline catalog via verified Decodo public API
 
 # This is the only write-enabled Decodo route.  It never replaces the running
 # production source tree.  A successful exact-commit, read-only reconciliation
-# plan is required first; the job then stages its own verified source, retains a
-# production DB backup, creates the additive audit schema, performs the guarded
-# in-place legacy ID rekey, and only then publishes a verified full catalog.
+# plan is required first; the job then stages its own verified source, refuses
+# unless the production DB is at this commit's migration head, retains a
+# production DB backup, performs the guarded in-place legacy ID rekey, and only
+# then publishes a verified full catalog.
+#
+# It does not migrate.  deploy.yml is the only thing that moves the production
+# schema; a commit whose migrations are ahead of the DB is deployed first
+# (apply_migrations=true) and this workflow is dispatched afterwards.
+#
+# The transport is not an input here: it is read from the approved plan, so a
+# plan and its apply cannot go through different transports.  A plan made with
+# the direct transport (Decodo is down) carries plain admissions only; this
+# workflow then reads the catalog from the production host itself and refuses
+# unless the deployed code already recognises direct admissions.
 on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Type RECONCILE to apply the proven Decodo reconciliation"
+        description: "Type RECONCILE to apply the proven reconciliation"
         required: true
         default: ""
       plan_run_id:
-        description: "Successful no-write Decodo reconciliation-plan run ID for this commit"
+        description: "Successful no-write reconciliation-plan run ID for this commit (its transport is reused)"
         required: true
         default: ""
 
@@ -102,8 +113,11 @@ jobs:
               "candidate_manifest_sha256",
               "metrics",
           }
-          if set(data) != required or data["version"] != 3 or data["transport"] != "decodo":
+          if set(data) != required or data["version"] != 3:
               raise SystemExit("approved reconciliation plan evidence is invalid")
+          transport = data["transport"]
+          if transport not in ("decodo", "direct"):
+              raise SystemExit("approved reconciliation plan transport is invalid")
           if not isinstance(data["product_count"], int) or data["product_count"] < 9000:
               raise SystemExit("approved reconciliation plan product count is invalid")
           for key in ("catalog_fingerprint_sha256", "candidate_manifest_sha256"):
@@ -115,8 +129,24 @@ jobs:
           metrics = data["metrics"]
           if not isinstance(metrics, dict) or metrics.get("reconciliation_safe") != 1:
               raise SystemExit("approved reconciliation plan is not safe")
+          if transport == "direct":
+              # A direct plan carries plain admissions only.  The script
+              # refuses anything else itself; this is the second line, read
+              # from the approved evidence before any production step.
+              for key in (
+                  "legacy_rekeys_ready",
+                  "native_id_url_rebind",
+                  "native_id_url_rebind_ready",
+                  "native_id_url_rebind_redirect_ready",
+                  "identity_splits_ready",
+              ):
+                  if type(metrics.get(key)) is not int or metrics[key] != 0:
+                      raise SystemExit(
+                          f"approved direct reconciliation plan has an identity transition: {key}"
+                      )
           github_env = Path(os.environ["GITHUB_ENV"])
           with github_env.open("a") as output:
+              output.write(f"PLAN_TRANSPORT={transport}\n")
               output.write(
                   "PLAN_CATALOG_FINGERPRINT_SHA256="
                   f"{data['catalog_fingerprint_sha256']}\n"
@@ -128,7 +158,7 @@ jobs:
               output.write(f"PLAN_PRODUCT_COUNT={data['product_count']}\n")
           print(
               "exact aggregate reconciliation plan evidence verified: "
-              f"products={data['product_count']}"
+              f"products={data['product_count']}, transport={transport}"
           )
           PY
           echo "verified_plan_manifest_sha256=$expected_plan_manifest_sha"
@@ -272,7 +302,7 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=120 \
             pm@13.140.186.143 \
-            "bash -s -- '$remote_work_dir' '$source_manifest_sha' '$PLAN_RUN_ID' '$PLAN_CATALOG_FINGERPRINT_SHA256' '$PLAN_CANDIDATE_MANIFEST_SHA256' '$PLAN_PRODUCT_COUNT'" <<'REMOTE'
+            "bash -s -- '$remote_work_dir' '$source_manifest_sha' '$PLAN_RUN_ID' '$PLAN_CATALOG_FINGERPRINT_SHA256' '$PLAN_CANDIDATE_MANIFEST_SHA256' '$PLAN_PRODUCT_COUNT' '$PLAN_TRANSPORT'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
           source_manifest_sha=$2
@@ -280,6 +310,38 @@ jobs:
           expected_plan_fingerprint=$4
           expected_plan_manifest=$5
           expected_plan_product_count=$6
+          plan_transport=$7
+          # The apply and the catalog publication below go through the
+          # transport of the approved plan.  Decodo settings are passed only
+          # with Decodo: a direct reconciliation must not depend on it.
+          case "$plan_transport" in
+            decodo)
+              transport_env=(
+                PHARMONLINE_PUBLIC_API_TRANSPORT=decodo
+                DECODO_SITES=pharmonline
+                PHARMONLINE_DECODO_BACKCONNECT_STICKY=1
+              )
+              # A failed publication is retried from a fresh Decodo session.
+              publish_attempts=3
+              ;;
+            direct)
+              # One attempt at every layer: the scraper's own whole-catalog
+              # retry is pinned too, whatever the server environment says.
+              transport_env=(
+                PHARMONLINE_PUBLIC_API_TRANSPORT=direct
+                PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS=1
+              )
+              # Directly there is no fresh session: a retry is one more full
+              # read from this host's own address, which the source limits
+              # (429) and which the nightly collection needs.  One attempt; a
+              # failure is left to that collection or to a later dispatch.
+              publish_attempts=1
+              ;;
+            *)
+              echo "invalid approved plan transport" >&2
+              exit 1
+              ;;
+          esac
           case "$work_dir" in
             /opt/pharmacy-monitor/.codex-decodo-reconciliation-apply.*) ;;
             *)
@@ -327,11 +389,43 @@ jobs:
           script = runtime / "scripts/reconcile_pharmonline_public_api_identities.py"
           assert script.is_file() and script.resolve().is_relative_to(runtime)
           print(
-              "isolated Decodo reconciliation source imported: "
+              "isolated reconciliation source imported: "
               f"python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}, "
               f"script={script.relative_to(runtime)}"
           )
           PY
+
+          if [ "$plan_transport" = direct ]; then
+            # Admissions written by a direct reconciliation carry their own
+            # proof version.  The nightly timer runs the deployed code, not
+            # this checkout: code that does not know that version treats the
+            # admitted products as unknown and fails every night until it is
+            # deployed.  Ask the deployed code itself, before the catalog is
+            # read and before anything is written; anything but an explicit
+            # yes refuses.  (No command substitution around the here-document:
+            # bash 5.2 fails to parse one after a continued line.)  The answer
+            # goes to a file in this run's own fresh work directory.
+            deployed_code_answer="$work_dir/deployed-code-knows-direct"
+            (
+              cd /opt/pharmacy-monitor || exit 1
+              PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/pharmacy-monitor \
+                /opt/pharmacy-monitor/.venv/bin/python - > "$deployed_code_answer" <<'PY'
+          from pathlib import Path
+
+          from src import main
+
+          # The deployed copy, not the staged one and not an installed package.
+          assert Path(main.__file__).resolve() == Path("/opt/pharmacy-monitor/src/main.py").resolve()
+          rules = getattr(main, "_PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF", {})
+          print("yes" if "public_api_manual_direct_admission_v1" in rules else "no")
+          PY
+            ) || true
+            if [ "$(cat "$deployed_code_answer" 2>/dev/null || true)" != yes ]; then
+              echo "refusing direct reconciliation: the deployed code does not recognise direct admissions (public_api_manual_direct_admission_v1); deploy this commit with deploy.yml first, then dispatch again" >&2
+              exit 1
+            fi
+            echo "deployed code recognises direct admissions"
+          fi
 
           # EnvironmentFile values are literal systemd values, not shell code.
           while IFS= read -r line || [ -n "$line" ]; do
@@ -342,6 +436,34 @@ jobs:
             value=${line#*=}
             export "$key=$value"
           done < /etc/pharmacy-monitor/env
+
+          # This job runs the code of its own checkout against the production
+          # DB: every CLI command calls storage.init_db() -> create_all, so a
+          # commit with a table the DB lacks would create it past Alembic, and
+          # one with a new column fails on its first query.  Refuse unless the
+          # DB is exactly at this commit's single migration head.  This is the
+          # first thing that touches the DB, before the backup and before any
+          # write: a refusal changes nothing in the DB and takes no backup (the
+          # staged source stays on the host for audit).
+          cd "$runtime_dir"
+          if ! db_revision=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python -m alembic \
+              -c "$runtime_dir/alembic.ini" current | awk 'NF {print $1}'); then
+            echo "refusing reconciliation: the production DB revision cannot be read with this commit's migrations (the DB is ahead of this commit, or unreachable); dispatch from the deployed commit" >&2
+            exit 1
+          fi
+          source_head=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python -m alembic \
+              -c "$runtime_dir/alembic.ini" heads | awk 'NF {print $1}')
+          if [ "$(printf '%s\n' "$source_head" | sed '/^$/d' | wc -l)" -ne 1 ]; then
+            echo "refusing reconciliation: this commit must have exactly one migration head, found: ${source_head:-none}" >&2
+            exit 1
+          fi
+          if [ "$db_revision" != "$source_head" ]; then
+            echo "refusing reconciliation: production DB is at migration ${db_revision:-none}, this commit's migrations end at $source_head; deploy this commit with deploy.yml (apply_migrations=true) first; this workflow does not migrate" >&2
+            exit 1
+          fi
+          echo "production DB is at this commit's migration head: $db_revision"
 
           backup_path="$work_dir/production-before-reconciliation.dump"
           BACKUP_PATH="$backup_path" PYTHONDONTWRITEBYTECODE=1 \
@@ -409,13 +531,6 @@ jobs:
           )
           PY
 
-          cd "$runtime_dir"
-          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
-            /opt/pharmacy-monitor/.venv/bin/python -m alembic -c "$runtime_dir/alembic.ini" upgrade head
-          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
-            /opt/pharmacy-monitor/.venv/bin/python -m alembic -c "$runtime_dir/alembic.ini" current | \
-            grep -F '0021_public_api_quarantines'
-
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
           from src import storage
@@ -424,14 +539,12 @@ jobs:
           Session = storage.make_session()
           with Session() as session:
               if not _pharmonline_public_api_recovery_tables_available(session):
-                  raise SystemExit("reconciliation audit schema is not available after migration")
+                  raise SystemExit("reconciliation audit schema is not available")
           print("reconciliation audit schema verified")
           PY
 
+          env "${transport_env[@]}" \
           PHARMONLINE_PUBLIC_API=required \
-          PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
-          DECODO_SITES=pharmonline \
-          PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
           PHARMONLINE_PUBLIC_API_LOCK_WAIT_SECONDS=2700 \
           PHARMONLINE_USE_DDP=0 \
           AI_FALLBACK_ENABLED=0 \
@@ -441,21 +554,24 @@ jobs:
           PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_CATALOG_FINGERPRINT_SHA256="$expected_plan_fingerprint" \
           PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_MANIFEST_SHA256="$expected_plan_manifest" \
           PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_PRODUCT_COUNT="$expected_plan_product_count" \
+          PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT="$plan_transport" \
           PYTHONDONTWRITEBYTECODE=1 \
           PYTHONPATH="$runtime_dir" \
           /opt/pharmacy-monitor/.venv/bin/python \
             "$runtime_dir/scripts/reconcile_pharmonline_public_api_identities.py" --apply
 
-          # The guarded apply intentionally reads the full public catalog twice
-          # before it writes.  Give the first-party API a complete cooling
-          # window before the independent, persisted full-catalog run below:
-          # a third back-to-back full pass has previously been rate-limited.
-          # This is a wait only; no producer lock or database transaction is
-          # kept open, and the final run still proves its own catalog before it
-          # can publish data.
-          decodo_publish_cooldown_seconds=1860
-          echo "Decodo verified-source cooldown before catalog publication: ${decodo_publish_cooldown_seconds}s"
-          sleep "$decodo_publish_cooldown_seconds"
+          # The guarded apply intentionally reads the full public catalog
+          # before it writes: twice through Decodo, once directly (its second
+          # identical read is the plan's).  Give the first-party API a complete
+          # cooling window before the independent, persisted full-catalog run
+          # below: a third back-to-back full pass has previously been
+          # rate-limited, and a direct read leaves from this host's own
+          # address.  This is a wait only; no producer lock or database
+          # transaction is kept open, and the final run still proves its own
+          # catalog before it can publish data.
+          publish_cooldown_seconds=1860
+          echo "verified-source cooldown before catalog publication: ${publish_cooldown_seconds}s"
+          sleep "$publish_cooldown_seconds"
 
           before_run_id=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
@@ -481,12 +597,10 @@ jobs:
 
           publish_attempt=1
           publish_succeeded=0
-          while [ "$publish_attempt" -le 3 ]; do
-            echo "verified catalog publication attempt ${publish_attempt}/3"
-            if PHARMONLINE_PUBLIC_API=required \
-              PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
-              DECODO_SITES=pharmonline \
-              PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
+          while [ "$publish_attempt" -le "$publish_attempts" ]; do
+            echo "verified catalog publication attempt ${publish_attempt}/${publish_attempts}"
+            if env "${transport_env[@]}" \
+              PHARMONLINE_PUBLIC_API=required \
               PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \
               PHARMONLINE_USE_DDP=0 \
               AI_FALLBACK_ENABLED=0 \
@@ -502,8 +616,8 @@ jobs:
               publish_succeeded=1
               break
             fi
-            if [ "$publish_attempt" -lt 3 ]; then
-              echo "verified catalog publication attempt failed; waiting 60s before a fresh Decodo session" >&2
+            if [ "$publish_attempt" -lt "$publish_attempts" ]; then
+              echo "verified catalog publication attempt failed; waiting 60s before a fresh session" >&2
               sleep 60
             fi
             publish_attempt=$((publish_attempt + 1))
@@ -587,7 +701,7 @@ jobs:
               "quarantine_audit_records": quarantine_count,
               "public_api_catalog_floor": catalog_floor,
           }
-          print("Recovered Pharmonline Decodo evidence: " + json.dumps(evidence, sort_keys=True))
+          print("Recovered Pharmonline evidence: " + json.dumps(evidence, sort_keys=True))
           if (
               row["status"] != "ok"
               or row["catalog_scope"] != "full"
@@ -601,7 +715,7 @@ jobs:
           PY
 
           : > "$work_dir/reconciliation-and-catalog-recovery-verified"
-          echo "verified Decodo reconciliation and catalog recovery completed"
+          echo "verified reconciliation and catalog recovery completed"
           REMOTE
 
       - name: Retain recovery evidence and immutable backup
@@ -630,7 +744,14 @@ jobs:
           fi
           test "$(sha256sum "$work_dir/incoming/source-manifest" | awk '{print $1}')" = \
             "$source_manifest_sha"
-          test -f "$work_dir/production-before-reconciliation.dump"
+          if [ ! -f "$work_dir/production-before-reconciliation.dump" ]; then
+            if [ -f "$work_dir/reconciliation-and-catalog-recovery-verified" ]; then
+              echo "recovery is marked verified but its production backup is missing" >&2
+              exit 1
+            fi
+            echo "recovery stopped before the production backup; staged source retained for audit" >&2
+            exit 0
+          fi
           if [ -f "$work_dir/reconciliation-and-catalog-recovery-verified" ]; then
             echo "verified recovery evidence and immutable backup retained"
           else
