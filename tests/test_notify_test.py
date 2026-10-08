@@ -53,6 +53,26 @@ def test_email_failure_reported_not_raised(monkeypatch):
     assert "telegram: skipped" in r.output
 
 
+def test_smtp_refusal_shows_the_server_reply_without_the_address(monkeypatch):
+    """Ответ сервера нужен оператору, а адреса в нём — нет."""
+    monkeypatch.setenv("SMTP_HOST", "smtp.test")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+    def _refused(**kw):
+        raise notifier.EmailDeliveryError(
+            "SMTPRecipientsRefused", 550, "5.1.1 <address>: Recipient address rejected"
+        )
+
+    monkeypatch.setattr(notifier, "send_email", _refused)
+    r = CliRunner().invoke(cli, ["notify", "test", "--email", "viewer@client.example"])
+    assert r.exit_code == 0, r.output
+    assert (
+        "email:    FAIL — SMTPRecipientsRefused (SMTP 550 5.1.1): "
+        "5.1.1 <address>: Recipient address rejected"
+    ) in r.output
+    assert "@" not in r.output
+
+
 def test_chat_id_override(monkeypatch):
     monkeypatch.delenv("SMTP_HOST", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
