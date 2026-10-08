@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import structlog
 from rapidfuzz import fuzz
 from sqlalchemy import or_, select, text
@@ -166,7 +168,9 @@ def break_match(
     - Снимает canonical_id с detach_product
     - Если в кластере остался <2 Product'ов — Match удаляется
 
-    Возвращает количество созданных rejection-записей.
+    Возвращает число пар «отвязанный — оставшийся», по которым отказ теперь в
+    силе: запись создана, включена снова или уже была (тогда она подтверждена).
+    Пара товаров из разных тенантов записи не получает и в счёт не входит.
     """
     _acquire_match_mutation_xact_lock(session)
     m = session.get(Match, match_id)
@@ -177,9 +181,18 @@ def break_match(
         log.warning("break_match_skip", reason="product_not_in_match", product=detach_product_id)
         return 0
 
-    others = [p for p in m.products if p.id != detach_product_id]
+    # Состав кластера читаем из базы, а не из сессии. Сессии проекта не
+    # сбрасывают объекты после commit, а запись в `canonical_id` список
+    # `m.products` не меняет: товар, отвязанный или заменённый в этой же сессии,
+    # в нём остаётся. По такому списку вторая отвязка пишет отказ с товаром,
+    # которого в кластере уже нет, и не удаляет кластер, в котором остался один.
+    # flush — чтобы чтение увидело и то, что сессия ещё не записала (autoflush
+    # выключен).
+    session.flush()
+    session.expire(m, ["products"])
+    remaining = [p for p in m.products if p.id != detach_product_id]
     rej_count = 0
-    for other in others:
+    for other in remaining:
         if add_rejection(session, detach_product_id, other.id, reason=reason or "manual break"):
             rej_count += 1
 
@@ -187,13 +200,15 @@ def break_match(
     session.flush()
 
     # Если осталось <2 продукта в кластере — Match теряет смысл
-    remaining = [p for p in m.products if p.id != detach_product_id]
     if len(remaining) < 2:
         for p in remaining:
             p.canonical_id = None
         session.delete(m)
         log.info("match_dissolved", match_id=match_id, reason="cluster_too_small")
     else:
+        # Список в сессии снова устарел на отвязанный товар: следующий читатель
+        # (вызывающий, другая операция над кластером) перечитает его из базы.
+        session.expire(m, ["products"])
         log.info(
             "match_partial_break",
             match_id=match_id,
@@ -206,22 +221,28 @@ def break_match(
 
 
 def find_alternatives(
-    session: Session, match_id: int, site: str, limit: int = 50
+    session: Session, match_id: int, site: str, limit: int | None = 50
 ) -> list[tuple[Product, int]]:
     """Найти unmatched Product'ы на site, отсортированные по похожести на canonical_name.
 
     Возвращает список (Product, score) где score 0..100 от rapidfuzz.token_set_ratio.
+    ``limit=None`` — весь список: похожесть считается для всех кандидатов в любом
+    случае, предел только обрезает результат.
     """
     m = session.get(Match, match_id)
     if not m:
         return []
+    # Порядок по id: при равной похожести кандидаты идут одинаково от вызова к
+    # вызову, а не как их вернула база.
     candidates = session.scalars(
-        select(Product).where(
+        select(Product)
+        .where(
             Product.tenant_id == m.tenant_id,
             Product.site == site,
             Product.canonical_id.is_(None),
             Product.offer_availability_status != "out_of_stock",
         )
+        .order_by(Product.id)
     ).all()
     if not candidates:
         return []
@@ -240,30 +261,88 @@ def swap_alternative(session: Session, match_id: int, site: str, new_product_id:
 
     - Существующий Product этого site → отвязывается + rejection с new_product
     - Новый Product получает canonical_id = match_id
+
+    False — замена не записана; почему, говорит `try_swap_alternative`.
+    """
+    return try_swap_alternative(session, match_id, site, new_product_id).accepted
+
+
+@dataclass(frozen=True)
+class SwapOutcome:
+    """Итог `try_swap_alternative`.
+
+    ``accepted`` — замена прошла проверки. Без ``dry_run`` это значит, что она
+    записана и закоммичена; с ``dry_run`` — что была бы.
+    ``reason`` — почему нет; начинается с кода: ``match_not_found``,
+    ``product_not_found``, ``product_site_mismatch``, ``product_tenant_mismatch``,
+    ``identity:<код>``, ``offer:<код> product=<id> site=<сайт>`` (товар, из-за
+    которого отказ), ``already_current``.
+    """
+
+    accepted: bool
+    reason: str | None = None
+
+
+def try_swap_alternative(
+    session: Session,
+    match_id: int,
+    site: str,
+    new_product_id: int,
+    *,
+    dry_run: bool = False,
+) -> SwapOutcome:
+    """То же, что `swap_alternative`, но с причиной отказа.
+
+    Отказ ничего не меняет: кластер и товары остаются как были. При ``dry_run``
+    не меняет ничего и согласие. Замок сопоставления берётся и при ``dry_run``:
+    ответ верен только для состава, который в эту секунду никто не меняет.
     """
     _acquire_match_mutation_xact_lock(session)
     m = session.get(Match, match_id)
     if not m:
-        return False
+        return SwapOutcome(False, "match_not_found")
     new_p = session.get(Product, new_product_id)
-    if not new_p or new_p.site != site or new_p.tenant_id != m.tenant_id:
-        return False
+    if not new_p:
+        return SwapOutcome(False, "product_not_found")
+    if new_p.site != site:
+        return SwapOutcome(False, "product_site_mismatch")
+    if new_p.tenant_id != m.tenant_id:
+        return SwapOutcome(False, "product_tenant_mismatch")
 
     from src.product_policy import (
         policy_identity_eligibility,
         policy_offer_eligibility,
     )
 
-    cohort = [product for product in m.products if product.site != site] + [new_p]
-    if not policy_identity_eligibility(cohort).eligible:
-        return False
-    if any(not policy_offer_eligibility(product).eligible for product in cohort):
-        return False
+    # Состав кластера читаем из базы, а не из сессии — по той же причине, что в
+    # break_match: список `m.products`, прочитанный раньше в этой сессии, не
+    # знает о товаре, привязанном или отвязанном после. По такому списку «текущим
+    # товаром сайта» оказывался тот, кого в кластере уже нет, а настоящий
+    # оставался рядом с новым — два товара одного сайта в кластере.
+    session.flush()
+    session.expire(m, ["products"])
+    # По id: у связи порядка нет, а от него зависело бы, какой из двух
+    # непригодных товаров назван причиной отказа — и какой товар сайта убирает
+    # замена, если их в кластере два (быть не должно).
+    members = sorted(m.products, key=lambda product: product.id)
+
+    cohort = [product for product in members if product.site != site] + [new_p]
+    identity = policy_identity_eligibility(cohort)
+    if not identity.eligible:
+        return SwapOutcome(False, f"identity:{identity.reason}")
+    for product in cohort:
+        offer = policy_offer_eligibility(product)
+        if not offer.eligible:
+            return SwapOutcome(
+                False, f"offer:{offer.reason} product={product.id} site={product.site}"
+            )
 
     # Найти текущий Product этого site в кластере
-    current = next((p for p in m.products if p.site == site), None)
+    current = next((p for p in members if p.site == site), None)
     if current and current.id == new_product_id:
-        return False  # уже этот
+        return SwapOutcome(False, "already_current")
+    if dry_run:
+        return SwapOutcome(True)
 
     if current:
         # Создаём rejection между текущим и новым (чтобы matcher не вернул)
@@ -274,6 +353,8 @@ def swap_alternative(session: Session, match_id: int, site: str, new_product_id:
     # Помечаем match как manual чтобы auto-matcher не пересматчил
     m.is_manual = True
     session.commit()
+    # Список в сессии устарел на оба товара: следующий читатель перечитает его.
+    session.expire(m, ["products"])
     log.info(
         "match_swapped",
         match_id=match_id,
@@ -281,7 +362,7 @@ def swap_alternative(session: Session, match_id: int, site: str, new_product_id:
         old=current.id if current else None,
         new=new_product_id,
     )
-    return True
+    return SwapOutcome(True)
 
 
 def list_rejections_for_product(session: Session, product_id: int) -> list[int]:

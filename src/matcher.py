@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from functools import lru_cache
+from itertools import islice
 from typing import Sequence
 
 import structlog
@@ -1731,20 +1732,30 @@ def relink_dead_members(
 
     Безопасность кандидата: (1) живой + unmatched (find_alternatives отдаёт только
     canonical_id IS NULL), (2) тот же pack_count и strength, что у мёртвого (один
-    сайт → единый формат), (3) НЕ конфликтует с живым cross-site anchor'ом по
-    _hard_conflict/_pairwise_spec_conflict, (4) fuzzy score >= min_score. Ручные
+    сайт → единый формат), (3) НЕ конфликтует ни с одним живым товаром других
+    сайтов по _hard_conflict/_pairwise_spec_conflict, (4) fuzzy score >= min_score. Ручные
     (is_manual) кластеры не трогаем. Возвращает план [{match_id,site,old,new,score,
-    action}]; при dry_run БД не меняется (swap_alternative не вызывается)."""
+    action}]. `swap` — замена записана (при dry_run — прошла бы, БД не меняется);
+    `swap-rejected` — кандидат нашёлся, но замену не пропустила проверка самой
+    замены, причина в поле `reason` (например, в кластере есть ещё один мёртвый
+    товар). Отклонённая замена в базе ничего не меняет. Пробный прогон отдаёт
+    тот же план, что отдал бы настоящий на тех же данных."""
     from src import match_actions
 
     results: list[dict] = []
     dead_members = session.scalars(
-        select(Product).where(
+        select(Product)
+        .where(
             Product.url_dead_at.is_not(None),
             Product.canonical_id.is_not(None),
         )
+        .order_by(Product.id)
     ).all()
     seen: set[tuple[int, str]] = set()
+    # Кандидаты, уже отданные кластеру в этом вызове. Настоящий прогон их и так
+    # не предложит второй раз (они больше не без пары); пробному это надо
+    # помнить самому, иначе один кандидат обещан двум кластерам.
+    taken: set[int] = set()
     for d in dead_members:
         key = (d.canonical_id, d.site)
         if key in seen:
@@ -1753,8 +1764,28 @@ def relink_dead_members(
         m = session.get(Match, d.canonical_id)
         if m is None or m.is_manual:
             continue
-        anchor = next((p for p in m.products if p.url_dead_at is None and p.site != d.site), None)
-        if anchor is None:
+        # Замена убирает из кластера «товар сайта», не выбирая какой. Если на
+        # сайте их несколько (быть не должно), убранным оказался бы и живой — с
+        # постоянным отказом, а мёртвый остался бы; в плане при этом значилась
+        # бы замена мёртвого. Такой кластер разбирают руками.
+        if [p.id for p in m.products if p.site == d.site] != [d.id]:
+            results.append(
+                {
+                    "match_id": m.id,
+                    "site": d.site,
+                    "old": d.id,
+                    "new": None,
+                    "score": None,
+                    "action": "skip-several-on-site",
+                }
+            )
+            continue
+        # Кандидат сверяется со всеми живыми товарами других сайтов, а не с
+        # первым попавшимся: иначе от порядка строк в таблице зависело, сведёт
+        # ли замена запрещённую пару (D3 с D3+K2) — и уже в ручном кластере,
+        # который revalidate_split не разбирает.
+        anchors = [p for p in m.products if p.url_dead_at is None and p.site != d.site]
+        if not anchors:
             results.append(
                 {
                     "match_id": d.canonical_id,
@@ -1769,16 +1800,25 @@ def relink_dead_members(
         d_pack = _pack_count(d.pack_size or "")
         d_str = _strength_numbers(d.name or "")
         chosen = None
-        for cand, score in match_actions.find_alternatives(session, m.id, d.site, limit=25):
+        # Окно — 25 самых похожих среди живых и ещё не отданных. Отсев идёт до
+        # окна: в настоящем прогоне отданный кандидат пропадает из списка сам, а
+        # отвязанный мёртвый в нём появляется — пробный обязан видеть то же окно.
+        available = (
+            (cand, score)
+            for cand, score in match_actions.find_alternatives(session, m.id, d.site, limit=None)
+            if cand.url_dead_at is None and cand.id not in taken
+        )
+        for cand, score in islice(available, 25):
             if score < min_score:
                 break  # отсортировано по убыванию
-            if cand.url_dead_at is not None:
-                continue
             if _pack_count(cand.pack_size or "") != d_pack:
                 continue
             if _strength_numbers(cand.name or "") != d_str:
                 continue
-            if _hard_conflict(anchor, cand) or _pairwise_spec_conflict(anchor, cand):
+            if any(
+                _hard_conflict(anchor, cand) or _pairwise_spec_conflict(anchor, cand)
+                for anchor in anchors
+            ):
                 continue
             chosen = (cand, score)
             break
@@ -1795,18 +1835,22 @@ def relink_dead_members(
             )
             continue
         cand, score = chosen
-        results.append(
-            {
-                "match_id": m.id,
-                "site": d.site,
-                "old": d.id,
-                "new": cand.id,
-                "score": score,
-                "action": "swap",
-            }
+        outcome = match_actions.try_swap_alternative(
+            session, m.id, d.site, cand.id, dry_run=dry_run
         )
-        if not dry_run:
-            match_actions.swap_alternative(session, m.id, d.site, cand.id)
+        entry = {
+            "match_id": m.id,
+            "site": d.site,
+            "old": d.id,
+            "new": cand.id,
+            "score": score,
+            "action": "swap" if outcome.accepted else "swap-rejected",
+        }
+        if outcome.accepted:
+            taken.add(cand.id)
+        else:
+            entry["reason"] = outcome.reason
+        results.append(entry)
     return results
 
 

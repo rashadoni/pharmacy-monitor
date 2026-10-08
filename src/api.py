@@ -5116,7 +5116,25 @@ def dash_match_relink(
     Если сайта в кластере ещё не было — товар просто добавляется.
     Товар должен быть в нашем каталоге (иначе нет данных о цене).
     """
-    from src import match_actions
+    from src import match_actions, matcher
+
+    # То, что видно из самого запроса, проверяем до замка: отказу из-за опечатки
+    # незачем ждать этап сопоставления.
+    site = (body.site or "").strip().lower()
+    if site not in ("pharmonline", "aptekonline", "aloe"):
+        raise HTTPException(400, f"Неизвестный сайт: {site!r}")
+
+    ext = _external_id_from_url(body.url)
+    if not ext:
+        raise HTTPException(400, "Не удалось разобрать ссылку")
+
+    # Замок сопоставления — до первого чтения, а не внутри swap_alternative.
+    # Запрос, пришедший во время этапа сопоставления, ждёт замок; если ждать с
+    # уже прочитанными кластером и товаром, проверки ниже и сама замена работают
+    # с тем, что было до ожидания, — а этап за это время менял именно эти строки
+    # (сводил кандидата в другую пару, распускал кластер). Замок транзакционный:
+    # держится до commit замены или до закрытия сессии при отказе.
+    matcher.acquire_match_mutation_xact_lock(db)
 
     match = db.scalar(
         select(storage.Match).where(
@@ -5125,14 +5143,6 @@ def dash_match_relink(
     )
     if not match:
         raise HTTPException(404, "Match not found")
-
-    site = (body.site or "").strip().lower()
-    if site not in ("pharmonline", "aptekonline", "aloe"):
-        raise HTTPException(400, f"Неизвестный сайт: {site!r}")
-
-    ext = _external_id_from_url(body.url)
-    if not ext:
-        raise HTTPException(400, "Не удалось разобрать ссылку")
 
     prod = db.scalar(
         select(storage.Product).where(

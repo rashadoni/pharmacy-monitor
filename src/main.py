@@ -6084,13 +6084,26 @@ def rematch_cmd(
             if relink_dead:
                 plan = matcher.relink_dead_members(session, dry_run=dry_run)
                 swaps = [r for r in plan if r["action"] == "swap"]
-                skips = [r for r in plan if r["action"] != "swap"]
-                click.echo(f"relink-dead: {len(swaps)} swap, {len(skips)} skip")
+                rejected = [r for r in plan if r["action"] == "swap-rejected"]
+                skips = [r for r in plan if r["action"] not in ("swap", "swap-rejected")]
+                click.echo(
+                    f"relink-dead: {len(swaps)} swap, {len(rejected)} отклонено, "
+                    f"{len(skips)} skip"
+                )
                 for r in swaps:
                     click.echo(
                         f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} → live#{r['new']} (score {r['score']})"
                     )
-                for r in skips[:20]:
+                for r in rejected:
+                    click.echo(
+                        f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} → live#{r['new']} "
+                        f"— отклонено: {r['reason']}"
+                    )
+                # Пары, которые команда не трогает и которые надо разобрать руками,
+                # печатаются все; остальные пропуски — первые двадцать.
+                by_hand = [r for r in skips if r["action"] == "skip-several-on-site"]
+                routine = [r for r in skips if r["action"] != "skip-several-on-site"]
+                for r in by_hand + routine[:20]:
                     click.echo(f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} — {r['action']}")
                 if dry_run:
                     click.echo("(dry-run — ничего не изменено)")
