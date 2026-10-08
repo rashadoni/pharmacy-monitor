@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from functools import lru_cache
-from typing import Any, NamedTuple, Sequence
+from typing import Sequence
 
 import structlog
 from rapidfuzz import fuzz
@@ -57,12 +57,20 @@ MATCH_MUTATION_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
 _LOCK_CONNECTION_INFO_KEY = "match_mutation_lock_connection"
 
 
-class _HeldLock(NamedTuple):
-    connection: Connection
-    # Соединение драйвера под ним. SQLAlchemy после обрыва или Ctrl-C посреди
-    # запроса соединение вне пула не закрывает, а только отпускает — закрываем сами.
-    raw: Any
-    previous_bind: Any
+class _HeldLock:
+    __slots__ = ("connection", "raw", "previous_bind")
+
+    def __init__(self, connection: Connection, raw, previous_bind) -> None:
+        self.connection = connection
+        # Соединение драйвера под ним. После обрыва или Ctrl-C посреди запроса
+        # SQLAlchemy соединение вне пула не закрывает, а только отпускает, и при
+        # следующем запросе молча берёт вместо него другое — из пула.
+        self.raw = raw
+        self.previous_bind = previous_bind
+
+    def intact(self) -> bool:
+        """Сессия всё ещё ходит через то самое соединение, на котором лежит замок."""
+        return self.connection.connection.dbapi_connection is self.raw
 
 
 def _is_postgres(session: Session) -> bool:
@@ -73,11 +81,11 @@ def acquire_match_mutation_xact_lock(session: Session) -> None:
     """Serialize one transaction with every canonical topology mutation."""
     if _is_postgres(session):
         held = session.info.get(_LOCK_CONNECTION_INFO_KEY)
-        if held is not None and held.raw.closed:
-            # После обрыва и rollback SQLAlchemy молча переподключил бы сессию
-            # через пул, и шаг пошёл бы дальше без сессионного замка.
+        if held is not None and not held.intact():
+            # После обрыва или Ctrl-C и rollback сессия идёт уже через пул: без
+            # сессионного замка либо в очередь за собственным брошенным соединением.
             raise RuntimeError(
-                "the connection holding the match mutation lock is gone, and the lock with it"
+                "the session is no longer on the connection that holds the match mutation lock"
             )
         session.scalar(
             text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
@@ -110,9 +118,11 @@ def acquire_match_mutation_lock(session: Session, *, wait: bool = True) -> bool:
 
     Пока замок держится, `session.get_bind()` — соединение, а не движок: код,
     которому нужен движок (`run_lock.try_shared_scrape_read_lock`), под замком
-    не вызывать. Если соединение замка оборвётся, запросы сессии падают, а
-    `acquire_match_mutation_xact_lock` отказывает и после rollback: без этого
-    SQLAlchemy переподключил бы сессию через пул, уже без замка.
+    не вызывать. Если соединение замка потеряно (обрыв, Ctrl-C посреди
+    запроса), запросы сессии падают, а после rollback SQLAlchemy переподключил
+    бы её через пул, уже мимо замка — поэтому `acquire_match_mutation_xact_lock`
+    тогда отказывает. Шаг, который транзакционный замок не берёт, этой проверки
+    не проходит: откатывать и продолжать под замком нельзя.
 
     Сессию, которую вызывающий сам привязал к соединению, функция не трогает:
     замок ложится на это соединение.
@@ -191,7 +201,7 @@ def _close_after_session_transaction(session: Session, held: _HeldLock) -> None:
     event.listen(session, "after_transaction_end", close)
 
 
-def _close_lock_connection(connection: Connection, raw: Any) -> None:
+def _close_lock_connection(connection: Connection, raw) -> None:
     try:
         connection.close()
     finally:

@@ -61,7 +61,9 @@ _KEY = {"key": matcher.MATCH_MUTATION_ADVISORY_LOCK_KEY}
 # Пауза длиннее `pool_recycle` движка этапа: следующую выдачу пул начнёт с
 # закрытия соединения.
 _POOL_RECYCLE_SECONDS = 1
-_STAGE_APPLICATION = "matcher_lock_stage"
+# Имя приложения у сеансов «процесса этапа» — своё на каждый запуск pytest: по нему
+# их считают и убирают, не задевая чужие прогоны на том же сервере.
+_STAGE_APPLICATION = f"matcher_lock_stage_{uuid.uuid4().hex[:8]}"
 _OLDER_THAN_POOL_RECYCLE = 1.3
 
 
@@ -135,7 +137,7 @@ def engines(schema) -> Iterator[tuple[Callable[..., Engine], Engine]]:
             connection.execute(
                 text(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE application_name = :application"
+                    "WHERE datname = current_database() AND application_name = :application"
                 ),
                 {"application": _STAGE_APPLICATION},
             )
@@ -540,12 +542,43 @@ def test_lock_leaves_with_the_transaction_after_an_interrupt_mid_query(engines):
         raw = session.info[matcher._LOCK_CONNECTION_INFO_KEY].raw
         with pytest.raises(KeyboardInterrupt):
             session.execute(text("SELECT 'interrupted'"))
+        # Откатили и пошли дальше: сессия уже на соединении из пула, и шаг встал бы
+        # на транзакционный замок за брошенным соединением — он отказывает сразу.
+        session.rollback()
+        with pytest.raises(RuntimeError, match="no longer on the connection"):
+            matcher.acquire_match_mutation_xact_lock(session)
         main_mod._release_matcher_lock(session)
 
         session.close()
         assert raw.closed
         _wait_until_backend_is_gone(outsider, holders[0])
         assert _lock_holders(outsider) == []
+    assert engine.pool.checkedout() == 0
+
+
+def test_interrupt_while_waiting_for_the_lock_leaves_no_connection_behind(engines):
+    """Ctrl-C во время ожидания замка: соединение, на котором его ждали, закрыто."""
+    make_stage_engine, outsider = engines
+    engine = make_stage_engine()
+
+    @event.listens_for(engine, "do_execute")
+    def interrupt(cursor, statement, parameters, context):
+        if "pg_advisory_lock" in statement:
+            raise KeyboardInterrupt
+
+    with _session(engine) as session:
+        # excinfo держит кадры стека с брошенным соединением: сборщик мусора не выручит.
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            matcher.acquire_match_mutation_lock(session, wait=True)
+        assert excinfo.traceback
+        assert session.get_bind() is engine
+        assert session.info == {}
+        assert _settles(
+            outsider,
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = :application",
+            0,
+            application=_STAGE_APPLICATION,
+        )
 
 
 def test_step_refuses_to_continue_after_the_lock_connection_died(engines):
@@ -568,7 +601,7 @@ def test_step_refuses_to_continue_after_the_lock_connection_died(engines):
         session.rollback()
         assert _lock_holders(outsider) == []
 
-        with pytest.raises(RuntimeError, match="lock is gone"):
+        with pytest.raises(RuntimeError, match="no longer on the connection"):
             matcher.acquire_match_mutation_xact_lock(session)
         with structlog.testing.capture_logs() as logs:
             matcher.release_match_mutation_lock(session)
