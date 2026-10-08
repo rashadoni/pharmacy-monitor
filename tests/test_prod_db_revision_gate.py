@@ -27,10 +27,17 @@
 - база отстаёт от коммита, ушла вперёд или не имеет ревизии — шаг отказывает,
   не дойдя ни до бэкапа, ни до `--apply`, ни до `run`; файл базы не меняется, и
   таблицы, которой в ней не было, не появляется
+- отказ у обоих с объяснением: где база, где коммит и что делать, и ровно один
+  раз. Еженедельный сбор до 2026-10-08 отказывал голым `test`: база отстала или
+  без ревизии — красный шаг без единой строки, база впереди — одна ошибка
+  Alembic без совета
 - база на голове коммита — шаг доходит до первой записи, и `alembic upgrade`
   по дороге не зовётся
-- у сверки: коммит с двумя головами миграций — отказ; шаг, который идёт после
-  любого исхода, объясняет, что осталось на сервере
+- коммит с двумя головами миграций — отказ у обоих, даже если база стоит на
+  обеих (еженедельный сбор раньше в этом случае то проходил, то молча
+  отказывал — как легли строки `alembic current` и `alembic heads`)
+- у сверки: шаг, который идёт после любого исхода, объясняет, что осталось на
+  сервере
 
 Чего тест не видит:
 - запись другими командами: `psql`, python-вставка с `session.commit()`, скрипт
@@ -518,6 +525,28 @@ RECOVER_REFUSAL = {
         "dispatch from the deployed commit",
     ],
 }
+# Еженедельный сбор говорит то же своими словами: его запускает расписание, и
+# читать отказ будут в журнале упавшего прогона, без оператора рядом.
+WEEKLY_REFUSAL = {
+    "behind the commit": [
+        f"refusing weekly refresh: production DB is at migration {PARENT}",
+        f"this commit's migrations end at {HEAD}",
+        "deploy this commit with deploy.yml (apply_migrations=true)",
+        "then dispatch this workflow again",
+    ],
+    "without a revision": [
+        "refusing weekly refresh: production DB is at migration none",
+        f"this commit's migrations end at {HEAD}",
+    ],
+    "ahead of the commit": [
+        "refusing weekly refresh: the production DB revision cannot be read",
+        "see the alembic error above",
+        "merge the deployed migration into main or dispatch this workflow from the deployed",
+    ],
+}
+REFUSAL = {RECOVER: RECOVER_REFUSAL, AUTONOMOUS: WEEKLY_REFUSAL}
+# Отказ один: второй «refusing …» значил бы, что шаг после первого пошёл дальше.
+REFUSAL_PREFIX = {RECOVER: "refusing reconciliation:", AUTONOMOUS: "refusing weekly refresh:"}
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -719,9 +748,10 @@ def test_refuses_before_any_write_when_the_db_is_not_at_the_commit_head(
     assert not BEHIND_THE_GATE & set(events), f"{events}\n{_log(result)}"
     assert sandbox.db_fingerprint() == before
     assert sandbox.missing_table not in sandbox.tables()
+    for phrase in REFUSAL[workflow][sandbox.db_state]:
+        assert phrase in result.stderr, _log(result)
+    assert result.stderr.count(REFUSAL_PREFIX[workflow]) == 1, _log(result)
     if workflow == RECOVER:
-        for phrase in RECOVER_REFUSAL[sandbox.db_state]:
-            assert phrase in result.stderr, _log(result)
         # Шаг `always()` после отказа: бэкапа нет, и это не ошибка самого шага.
         retained = sandbox.run_step(RECOVER, RETAIN, condition=RETAIN_CONDITION)
         assert retained.returncode == 0, _log(retained)
@@ -733,15 +763,17 @@ def test_refuses_before_any_write_when_the_db_is_not_at_the_commit_head(
         assert "marked verified but its production backup is missing" in anomaly.stderr
 
 
-def test_recovery_refuses_a_commit_with_two_migration_heads(tmp_path: Path):
+@pytest.mark.parametrize("workflow", sorted(GATED))
+def test_refuses_a_commit_with_two_migration_heads(tmp_path: Path, workflow: str):
     sandbox = Sandbox(tmp_path, db_state="at head", second_head=True)
     before = sandbox.db_fingerprint()
 
-    result = sandbox.run_gated(RECOVER)
+    result = sandbox.run_gated(workflow)
 
     assert result.returncode != 0, _log(result)
     assert sandbox.events == ["alembic current", "alembic heads"], _log(result)
     assert "this commit must have exactly one migration head" in result.stderr, _log(result)
+    assert result.stderr.count(REFUSAL_PREFIX[workflow]) == 1, _log(result)
     assert sandbox.db_fingerprint() == before
 
 
@@ -770,6 +802,9 @@ def test_recovery_at_the_commit_head_backs_up_and_reconciles_without_migrating(s
 def test_weekly_refresh_at_the_commit_head_reaches_the_catalog_run(sandbox: Sandbox):
     result = sandbox.run_gated(AUTONOMOUS)
 
+    assert f"production DB is at this commit's migration head: {HEAD}" in result.stdout, _log(
+        result
+    )
     assert sandbox.events == ["alembic current", "alembic heads", "cli run"], _log(result)
     assert result.returncode != 0
     assert "sandbox: the scenario ends at the first catalog publication" in result.stderr

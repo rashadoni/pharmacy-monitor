@@ -978,6 +978,48 @@ uv run alembic heads
 каталоги не удаляются: убирать руками, когда копия больше не нужна. Последний
 шаг workflow пишет, что именно осталось.
 
+### Еженедельный сбор pharmonline отказал на ревизии базы
+
+Понедельничный сбор (`autonomous-pharmonline-decodo-public-api.yml`) исполняет
+код `main` из чернового каталога на сервере и до первого обращения к базе
+сверяет её ревизию с головой миграций своего коммита. При расхождении шаг
+«Run guarded Decodo refresh…» красный, в его журнале:
+
+```
+refusing weekly refresh: production DB is at migration <ревизия базы>, this commit's
+migrations end at <голова коммита>; deploy this commit with deploy.yml
+(apply_migrations=true), then dispatch this workflow again; it does not migrate
+```
+
+Причина почти всегда одна: миграцию смержили в `main`, а выкладки с
+`apply_migrations=true` не было. Сбор при этом ничего не записал. Выложить
+(когда можно — «Обновления / деплой нового кода»), **дождаться зелёной
+выкладки** и только потом запустить сбор руками, не дожидаясь следующего
+понедельника. Запущенный сразу следом сбор дойдёт до сверки раньше, чем
+выкладка применит миграцию, и откажет второй раз:
+
+```bash
+gh workflow run deploy.yml --ref main -f apply_migrations=true
+gh run list --workflow deploy.yml --limit 1   # ждать: completed, success
+gh workflow run autonomous-pharmonline-decodo-public-api.yml --ref main
+```
+
+Другие два отказа того же шага:
+
+- `the production DB revision cannot be read with this commit's migrations` —
+  `alembic current` не отработал; почему — в строке Alembic прямо над отказом.
+  `Can't locate revision identified by …` значит, что база ушла вперёд `main`:
+  выложена ветка с миграцией, которой в `main` нет, — смержить миграцию либо
+  запустить сбор с выложенного коммита (`--ref`). Любая другая ошибка — база
+  недоступна или код коммита не импортируется на сервере: чинить её, совет про
+  миграцию тут ни при чём;
+- `this commit must have exactly one migration head` — в коммите две головы
+  миграций, свести в одну.
+
+До 2026-10-08 шаг в этих случаях падал голым `test`: если база отстала или не
+имела ревизии — без единой строки в журнале, если ушла вперёд — с одной ошибкой
+Alembic и без совета.
+
 ### Firecrawl as scraper backup (Phase 6 — Firecrawl MCP)
 
 Бэкап путь когда нативные скрейперы падают:
