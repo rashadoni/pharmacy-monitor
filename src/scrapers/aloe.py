@@ -26,6 +26,7 @@ URL synth (Task #33 fix, 2026-05-28):
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -111,6 +112,40 @@ def aloe_slug(name: str) -> str:
     s = re.sub(r"-+", "-", s)
     s = s.strip("-")
     return s
+
+
+# Ширина колонки `products.external_id`: значение длиннее PostgreSQL не примет,
+# и вместе с ним не запишется вся пачка сбора.
+_EXTERNAL_ID_MAX = 200
+_EXTERNAL_ID_DIGEST = 12
+# Столько знаков слага сборщик писал в идентификатор до 2026-10-08.
+ALOE_LEGACY_ID_CUT = 100
+
+
+def aloe_external_id(slug: str) -> str:
+    """Идентификатор товара aloe — его слаг целиком.
+
+    До 2026-10-08 бралось `slug[:ALOE_LEGACY_ID_CUT]`: два товара, чьи слаги
+    совпадают в первых ста знаках (одна линейка, разный объём в хвосте длинного
+    названия), записались бы одной строкой `products` — с ценой, названием и
+    адресом того, кто встретился последним. Слаг, который не помещается в
+    колонку, получает хвост из хеша полного слага, а не голую обрезку: разные
+    слаги остаются разными идентификаторами. «~» в слагах сайта не встречается,
+    поэтому такой идентификатор не совпадёт с настоящим слагом.
+
+    Правило записано в базе идентификаторами. Строки, записанные по-старому,
+    переводит на него запись сбора (`main._adopt_aloe_cut_identifiers`); сменить
+    правило ещё раз без такого же перевода — завести товарам вторые строки.
+    """
+    if len(slug) <= _EXTERNAL_ID_MAX:
+        return slug
+    digest = hashlib.sha256(slug.encode("utf-8")).hexdigest()[:_EXTERNAL_ID_DIGEST]
+    return f"{slug[: _EXTERNAL_ID_MAX - _EXTERNAL_ID_DIGEST - 1]}~{digest}"
+
+
+def aloe_slug_from_url(url: str) -> str:
+    """Слаг из адреса товара `https://aloe.az/{slug}/`."""
+    return url.rstrip("/").split("/")[-1]
 
 
 def _decode_next_flight(html_text: str) -> str:
@@ -258,7 +293,7 @@ def _aloe_product_from_payload(
 
     return ScrapedProduct(
         site="aloe",
-        external_id=slug[:100],
+        external_id=aloe_external_id(slug),
         url=f"{base_url}/{slug}/",
         name=name,
         brand=brand,
@@ -825,7 +860,7 @@ class AloeScraper(BaseScraper):
         # Task #33 (2026-05-28): используем aloe_slug, идентичен URL slug → стабильность
         # внешнего id между runs + точное соответствие detail page URL.
         slug = aloe_slug(name)
-        external_id = slug[:100] if slug else name.lower().replace(" ", "-")[:100]
+        external_id = aloe_external_id(slug or name.lower().replace(" ", "-"))
 
         # URL synthesis (Task #33 fix): aloe.az/{slug}/ — verified via Playwright MCP
         # click-navigation. Fallback на listing_url если slugification failed
@@ -898,7 +933,7 @@ class AloeScraper(BaseScraper):
             )
             image_url = await img_handle.get_attribute("src") if img_handle else None
 
-            external_id = url.rstrip("/").split("/")[-1]
+            external_id = aloe_external_id(aloe_slug_from_url(url))
 
             # Phase 2.2 — try to extract barcode from JSON-LD injected post-
             # hydration. Next.js apps put <script type="application/ld+json">

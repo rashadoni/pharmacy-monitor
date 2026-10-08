@@ -1794,6 +1794,78 @@ def _bridge_pharmonline_legacy_ids(
     return len(replacements)
 
 
+def _adopt_aloe_cut_identifiers(
+    session: Session,
+    chunk_products: list[ScrapedProduct],
+    existing_by_key: dict[tuple[str, str], storage.Product],
+) -> int:
+    """Строке aloe с обрезанным идентификатором дать полный — на месте.
+
+    До 2026-10-08 сборщик писал в `external_id` первые сто знаков слага, теперь —
+    слаг целиком (`aloe_external_id`). Товар, записанный по-старому, по новому
+    идентификатору не находится: без этого шага он получил бы вторую строку, а
+    первая осталась бы с историей цен и местом в кластере.
+
+    Строка переходит к товару, чей адрес в ней записан: у двух товаров с общими
+    первыми ста знаками слага обрезок один, а адрес у каждого свой. Строку, у
+    которой уже есть двойник с полным идентификатором, шаг не трогает.
+
+    Шаг стоит в записи сбора, а не в миграции: выкладка кладёт код и применяет
+    миграции не одновременно, и сбор, попавший в промежуток, завёл бы товару
+    вторую строку при любом их порядке. Сборы идут по одному (замок сбора),
+    поэтому здесь промежутка нет. Код без этой правки, запущенный после неё,
+    переведённую строку не найдёт — порядок отката в docs/RUNBOOK.md.
+
+    Вызывается из `persist_results` на каждую пачку, сразу после выборки уже
+    записанных строк.
+    """
+    candidates = [
+        sp
+        for sp in chunk_products
+        # Запись без адреса не с чем сверять; её отвергнет база.
+        if sp.site == "aloe" and sp.url and (sp.site, sp.external_id) not in existing_by_key
+    ]
+    if not candidates:
+        return 0
+    # Только теперь: пачка другого сайта не должна зависеть от модуля aloe.
+    from src.scrapers.aloe import ALOE_LEGACY_ID_CUT, aloe_external_id, aloe_slug_from_url
+
+    wanted: dict[str, dict[str, ScrapedProduct]] = {}
+    for sp in candidates:
+        slug = aloe_slug_from_url(sp.url)
+        if len(slug) > ALOE_LEGACY_ID_CUT and aloe_external_id(slug) == sp.external_id:
+            wanted.setdefault(slug[:ALOE_LEGACY_ID_CUT], {})[slug] = sp
+    if not wanted:
+        return 0
+
+    rows = session.scalars(
+        select(storage.Product).where(
+            storage.Product.site == "aloe",
+            storage.Product.external_id.in_(list(wanted)),
+        )
+    ).all()
+    adopted = 0
+    for row in rows:
+        cut = row.external_id
+        sp = wanted[cut].get(aloe_slug_from_url(row.url))
+        if sp is None:
+            continue
+        row.external_id = sp.external_id
+        existing_by_key[(sp.site, sp.external_id)] = row
+        # Обрезок свободен. Товар той же пачки, чей слаг целиком равен ему, —
+        # другой товар и получает свою строку. (Встретившись пачкой раньше, он
+        # занял бы эту строку сам, как и до правки.)
+        existing_by_key.pop((sp.site, cut), None)
+        adopted += 1
+    if adopted:
+        # Сразу, а не вместе со вставкой новых строк: одна из них может занять
+        # освободившийся обрезок, и порядок UPDATE/INSERT внутри одного flush —
+        # внутреннее дело SQLAlchemy.
+        session.flush()
+        log.info("aloe_cut_identifiers_adopted", products=adopted)
+    return adopted
+
+
 def _verify_pharmonline_public_api_identities(
     session: Session,
     results: list[ScrapeResult],
@@ -3612,6 +3684,8 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
                 ).all()
                 for p in rows:
                     existing_by_key[(p.site, p.external_id)] = p
+
+            _adopt_aloe_cut_identifiers(session, chunk_products, existing_by_key)
 
             # === Process: update existing in-place, queue new ===
             new_products: list[storage.Product] = []
