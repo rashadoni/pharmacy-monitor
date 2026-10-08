@@ -662,6 +662,9 @@ def _tick_that_sees_a_price_drop(db_session, monkeypatch, *, clean=True, lock_fr
     monkeypatch.setattr(
         main_mod, "_hold_scrape_lock_until_command_exit", lambda *a, **kw: lock_free
     )
+    # `scrape` пережидает короткого читателя каталога до двух минут настоящего
+    # времени; здесь блокировка «занята» навсегда, ждать её в тесте незачем.
+    monkeypatch.setattr(main_mod, "_SCRAPE_LOCK_READER_GRACE_SECONDS", 0.0)
     monkeypatch.setattr(main_mod, "maybe_seed_categories", lambda *a, **kw: None)
     monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *a, **kw: {})
     monkeypatch.setattr(main_mod, "run_quality_baselines_for_sites", lambda *a, **kw: {})

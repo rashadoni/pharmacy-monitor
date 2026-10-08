@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from src._time import utcnow
@@ -2268,6 +2269,58 @@ def _release_matcher_lock(session: Session) -> None:
         matcher.release_match_mutation_lock(session)
     except Exception as exc:
         log.warning("matcher_lock_release_failed", error=str(exc))
+
+
+# Читатели каталога (пересчёт рекомендаций — около минуты) держат shared-блокировку
+# сбора недолго. Отказ с первой попытки стоил бы intraday-тику целого круга: к
+# этому моменту он уже сдвинул ротацию категорий и поставил двухчасовой замок сайта.
+_SCRAPE_LOCK_READER_GRACE_SECONDS = 120.0
+_SCRAPE_LOCK_POLL_SECONDS = 5.0
+
+
+def _hold_scrape_lock_after_readers(SessionFactory) -> bool:
+    """Взять блокировку сбора, переждав короткого читателя, но не идущий сбор.
+
+    Идущий сбор держит блокировку часами — его не пережидаем: по истечении
+    отсрочки отказ тот же, что и раньше.
+    """
+    deadline = time.monotonic() + _SCRAPE_LOCK_READER_GRACE_SECONDS
+    while True:
+        if _hold_scrape_lock_until_command_exit(SessionFactory, wait=False):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_SCRAPE_LOCK_POLL_SECONDS)
+
+
+def _queue_roi_refresh_owed_by_run(
+    session: Session, run: storage.Run, *, reason: str = "partial_run"
+) -> None:
+    """Заявка на пересчёт рекомендаций — в коммит самого прогона, без своего."""
+    from src import roi_refresh
+
+    roi_refresh.request_refresh(session, tenant_id=run.tenant_id, reason=reason)
+
+
+def _request_roi_refresh(session: Session, *, reason: str, tenant_id: int = 1) -> None:
+    """Оставить заявку на пересчёт рекомендаций после правки пар из CLI.
+
+    Не роняет команду: заявка — следствие уже сделанной работы, а не её часть.
+    """
+    from src import roi_refresh
+
+    try:
+        # Сначала откат: сюда приходят и из `finally` после исключения или
+        # Ctrl-C посреди матчера. Коммит заявки не должен записать его
+        # недоделанную работу — до заявок её откатывало закрытие сессии. На
+        # успешном пути всё уже закоммичено самим матчером, откат ничего не
+        # теряет; после ошибки базы без него не прошёл бы и сам коммит заявки.
+        session.rollback()
+        roi_refresh.request_refresh(session, tenant_id=tenant_id, reason=reason)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        log.warning("roi_refresh_request_failed", reason=reason, error=str(exc))
 
 
 def _run_matching_stage(
@@ -5201,6 +5254,11 @@ def run_cmd(
         )
 
         trust_context = None
+        # Этап сопоставления прошёл целиком (включая revalidate), пары могли
+        # измениться, а кэш рекомендаций этот прогон ещё не переписал и заявку
+        # на пересчёт не оставил. Пока этап не прошёл, заявка не ставится:
+        # пересчёт по парам, которые revalidate не проверил, хуже устаревшего.
+        roi_refresh_owed = False
         try:
             quality_sites: list[str] = list(sites)
             quality_baselines: dict[str, int | None] = {}
@@ -5471,6 +5529,9 @@ def run_cmd(
                 # записи. Весь порядок шагов — в _run_matching_stage; тот же этап
                 # выполняет команда `rematch`.
                 _run_matching_stage(session)
+                # Подтверждённый полный прогон кэш пишет сам, а упав — сам же
+                # отменяет доверие: заявка за него была бы закрыта `skipped`.
+                roi_refresh_owed = not (is_full_catalog and run.catalog_verified)
             finally:
                 if lock_taken:
                     _release_matcher_lock(session)
@@ -5576,12 +5637,13 @@ def run_cmd(
             # сайтов и сохранить в roi_actions_cache. HTTP-handler
             # /dash/roi/actions читает оттуда → <50мс latency вместо
             # 15-30с inline compute (timeout'ило с 408 на 4 экранах).
-            # When all three sites form a trusted epoch, every cache slice must
-            # refresh successfully before the current run is published.  If a
-            # different site's latest full attempt already closed that global
-            # gate, cache publication is deferred while this producer's own
-            # verified status remains truthful.  Partial/watchlist runs never
-            # publish a catalog epoch and therefore do not rewrite this cache.
+            # When all three sites form a trusted epoch, a cache slice that
+            # fails to refresh fails the current run before it is published.
+            # If a different site's latest full attempt already closed that
+            # global gate, or the calculation could not take place at all,
+            # cache publication is deferred while this producer's own verified
+            # status remains truthful.  Partial/watchlist runs never publish a
+            # catalog epoch and therefore do not rewrite this cache.
             if is_full_catalog and run.catalog_verified:
                 from src import roi as _roi
 
@@ -5589,18 +5651,40 @@ def run_cmd(
                     session,
                     tenant_id=run.tenant_id,
                 ):
-                    summary = _roi.refresh_all_cached_actions(
-                        session,
-                        run_id=run_id,
-                        tenant_id=run.tenant_id,
-                    )
-                    log.info("roi_cache_refreshed", run_id=run_id, **summary)
-                    failed_sites = [site for site, value in summary.items() if value < 0]
-                    if failed_sites:
-                        raise RuntimeError(
-                            "ROI refresh failed for trusted epoch: "
-                            + ",".join(sorted(failed_sites))
+                    try:
+                        summary = _roi.refresh_all_cached_actions(
+                            session,
+                            run_id=run_id,
+                            tenant_id=run.tenant_id,
                         )
+                    except _roi.RecommendationsNotComputed as not_computed:
+                        # Расчёт не состоялся, и виноват не этот сбор: его каталог
+                        # подтверждён, а считать помешало чужое состояние. Прогон
+                        # остаётся ok, кэш не пишется — пустой список в нём значил
+                        # бы «рекомендаций нет» до следующего полного сбора.
+                        log.warning(
+                            "roi_cache_refresh_deferred_not_computed",
+                            run_id=run_id,
+                            tenant_id=run.tenant_id,
+                            reason=not_computed.reason,
+                        )
+                        if not_computed.reason == _roi.NOT_COMPUTED_RUN_UNFINISHED:
+                            # Блокировка сбора у нас, значит чужой незавершённый
+                            # прогон — сирота упавшего процесса. Её снимет watcher
+                            # (`reap-stale-runs`), и он же исполнит эту заявку:
+                            # посчитает, а если сиротой был полный сбор другого
+                            # сайта и доверия после её снятия нет — закроет
+                            # `skipped`. При прочих причинах заявку не ставим:
+                            # пересчёт без сбора упёрся бы в то же самое.
+                            _queue_roi_refresh_owed_by_run(session, run, reason="full_run_deferred")
+                    else:
+                        log.info("roi_cache_refreshed", run_id=run_id, **summary)
+                        failed_sites = [site for site, value in summary.items() if value < 0]
+                        if failed_sites:
+                            raise RuntimeError(
+                                "ROI refresh failed for trusted epoch: "
+                                + ",".join(sorted(failed_sites))
+                            )
                 else:
                     # A verified per-site producer remains successful even when
                     # another site's latest full attempt is degraded or stale.
@@ -5618,6 +5702,14 @@ def run_cmd(
                     run_id=run_id,
                     status=run.status,
                 )
+                # Этот прогон кэш не пишет, но матчер и авто-разбиение в нём
+                # отработали так же, как в полном: пары могли измениться, а
+                # рекомендация по разбитой паре жила бы до следующего полного
+                # сбора. Заявка уходит в коммит самого прогона; пересчёт пойдёт
+                # от последней подтверждённой эпохи, цены этого прогона в него
+                # не попадут (`src/roi_refresh.py`).
+                _queue_roi_refresh_owed_by_run(session, run)
+                roi_refresh_owed = False
 
             if trust_context is not None:
                 trust_context.__exit__(None, None, None)
@@ -5648,6 +5740,10 @@ def run_cmd(
             )
             run.error_message = f"{type(e).__name__}: {e}"
             run.finished_at = utcnow()
+            if roi_refresh_owed:
+                # Упали уже после сопоставления (анализ, алерты, отчёт): пары
+                # закоммичены и проверены, заявка должна уйти и с упавшим прогоном.
+                _queue_roi_refresh_owed_by_run(session, run)
             if request_id is not None:
                 req = session.get(storage.ScrapeRequest, request_id)
                 if req is not None:
@@ -5685,7 +5781,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
     storage.init_db()
 
     Session = storage.make_session()
-    if not _hold_scrape_lock_until_command_exit(Session, wait=False):
+    if not _hold_scrape_lock_after_readers(Session):
         click.echo("scrape: skipped because another scrape run is active")
         return
     with Session() as session:
@@ -6069,7 +6165,9 @@ def rematch_cmd(
     # Запись прогона и сопоставление правят одни и те же строки товаров. Сбор
     # держит этот замок всю команду, а замок сопоставления — только на сам этап,
     # так что без проверки rematch шёл бы одновременно с записью прогона.
-    if not dry_run and not _hold_scrape_lock_until_command_exit(Session, wait=False):
+    # Короткого читателя каталога (пересчёт рекомендаций — около минуты)
+    # пережидаем: пропуск планового rematch никто не повторяет.
+    if not dry_run and not _hold_scrape_lock_after_readers(Session):
         click.echo(
             "rematch: skipped because the run lock is busy (scrape, tick or another "
             "rematch); retry when it finishes."
@@ -6080,8 +6178,23 @@ def rematch_cmd(
         if not lock_taken:
             click.echo("Another matcher/rematch is already running; skipped.")
             return
+        # Пары меняются здесь без сбора, а кэш рекомендаций пишет только сбор —
+        # оставляем заявку на пересчёт (`src/roi_refresh.py`), иначе рекомендация
+        # по разбитой паре жила бы до следующего полного сбора. Сам пересчёт
+        # посреди rematch не начнётся: он читает каталог под shared-блокировкой
+        # сбора, а rematch держит эксклюзивную до выхода из команды — заявка
+        # успевает закоммититься раньше, чем блокировка отпущена.
+        # Флаг ставится ПОСЛЕ удачного шага (кроме --relink-dead): упавший этап
+        # мог оставить пары, которые revalidate не проверил, и пересчёт
+        # опубликовал бы рекомендации по ним. Полный сбор в таком случае
+        # рекомендации скрывает; здесь прежний кэш просто остаётся до следующей
+        # заявки или сбора.
+        pairs_may_have_changed = False
         try:
             if relink_dead:
+                # Здесь флаг — до шага: каждая замена проверяется и коммитится
+                # отдельно, и упавший на середине проход уже изменил пары.
+                pairs_may_have_changed = not dry_run
                 plan = matcher.relink_dead_members(session, dry_run=dry_run)
                 swaps = [r for r in plan if r["action"] == "swap"]
                 skips = [r for r in plan if r["action"] != "swap"]
@@ -6105,6 +6218,7 @@ def rematch_cmd(
                 # outliers; dissolve only if none). Same logic now auto-runs after
                 # match_products in the scrape pipeline.
                 actions = matcher.revalidate_split(session, dry_run=dry_run)
+                pairs_may_have_changed = not dry_run
                 for a in actions:
                     if a["action"] == "dissolve":
                         click.echo(
@@ -6153,6 +6267,7 @@ def rematch_cmd(
                 # ClickException печатает одну строку — стек оставляем в журнале.
                 log.exception("rematch_stage_failed")
                 raise click.ClickException(str(exc)) from exc
+            pairs_may_have_changed = True
 
             def _shown(value: int | None) -> str:
                 return "FAILED, see log" if value is None else str(value)
@@ -6172,6 +6287,8 @@ def rematch_cmd(
                     + ", ".join(failed)
                 )
         finally:
+            if pairs_may_have_changed:
+                _request_roi_refresh(session, reason="rematch")
             _release_matcher_lock(session)
 
 
@@ -6358,6 +6475,91 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
                 ],
             )
             click.echo("Email sent.")
+
+
+# ============================================================================
+# ROI — пересчёт кэша рекомендаций без сбора
+# ============================================================================
+
+
+@cli.group("roi")
+def roi_group() -> None:
+    """Рекомендации ROI."""
+
+
+_ROI_REFRESH_MESSAGES = {
+    "another_refresh_running": "другой пересчёт уже идёт",
+    "scrape_in_progress": "идёт сбор или rematch — каталог сейчас пишется",
+    "run_unfinished": "есть незавершённый прогон",
+    "inputs_unverified": "каталог перестал быть свежим посреди расчёта",
+}
+
+
+@roi_group.command("refresh")
+@click.option(
+    "--pending",
+    "pending_only",
+    is_flag=True,
+    default=False,
+    help="Режим watcher'а: считать только если в очереди есть заявки (все тенанты).",
+)
+@click.option("--tenant-id", type=int, default=1, show_default=True)
+def roi_refresh_cmd(pending_only: bool, tenant_id: int) -> None:
+    """Пересчитать кэш рекомендаций от последней подтверждённой эпохи каталога.
+
+    Сбор не запускается и новый Run не создаётся. Проверки доверия те же, что
+    в конце полного сбора: без свежего подтверждённого каталога всех сайтов
+    кэш не пишется. Пока идёт сбор, пересчёт откладывается.
+
+    Без --pending считает всегда (ручной запуск после правки вне дашборда).
+    С --pending выходит сразу, если заявок нет; так его зовёт серверный watcher.
+
+    Exit-code: 0 — посчитано, нечего делать или отложено watcher'ом;
+    1 — пересчёт упал либо ручной запуск не смог посчитать.
+    """
+    from src import roi_refresh
+
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as session:
+        tenant_ids = (
+            roi_refresh.tenants_with_pending_requests(session) if pending_only else [tenant_id]
+        )
+        if not tenant_ids:
+            click.echo("roi refresh: заявок нет")
+            return
+        failed = False
+        for current_tenant in tenant_ids:
+            result = roi_refresh.run_refresh(
+                session,
+                tenant_id=current_tenant,
+                only_if_requested=pending_only,
+            )
+            prefix = f"roi refresh (tenant {current_tenant}):"
+            if result.outcome == "refreshed":
+                counts = ", ".join(f"{site}={count}" for site, count in result.counts.items())
+                click.echo(
+                    f"{prefix} пересчитано по прогону #{result.run_id} — {counts}; "
+                    f"заявок закрыто: {result.requests_closed}"
+                )
+            elif result.outcome == "idle":
+                click.echo(f"{prefix} заявок нет")
+            elif result.outcome == "busy":
+                why = _ROI_REFRESH_MESSAGES.get(result.reason or "", result.reason)
+                click.echo(f"{prefix} отложено — {why}")
+                failed = failed or not pending_only
+            elif result.outcome == "untrusted":
+                click.echo(
+                    f"{prefix} не посчитано — нет свежего подтверждённого каталога "
+                    f"всех сайтов ({result.reason}). Рекомендации вернёт следующий "
+                    "подтверждённый полный сбор."
+                )
+                failed = failed or not pending_only
+            else:
+                click.echo(f"{prefix} пересчёт упал ({result.reason}); подробности в журнале")
+                failed = True
+        if failed:
+            raise click.exceptions.Exit(1)
 
 
 # ============================================================================

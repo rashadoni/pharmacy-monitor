@@ -276,6 +276,9 @@ def test_rematch_steps_aside_while_a_scrape_run_is_active(db_session, monkeypatc
     monkeypatch.setattr(
         main_mod, "_hold_scrape_lock_until_command_exit", lambda factory, *, wait: False
     )
+    # Короткого читателя каталога rematch пережидает до двух минут настоящего
+    # времени; здесь блокировка «занята» сбором, ждать её в тесте незачем.
+    monkeypatch.setattr(main_mod, "_SCRAPE_LOCK_READER_GRACE_SECONDS", 0.0)
     monkeypatch.setattr(
         main_mod, "_acquire_matcher_lock", lambda *a, **kw: matcher_lock.append("taken") or True
     )

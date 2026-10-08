@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { ApiError, friendlyError, isVerifiedScanPendingError } from "./api";
+import {
+  ApiError,
+  friendlyError,
+  isRecommendationsRecalculatingError,
+  isVerifiedScanPendingError,
+  roiRecalculationPollMs,
+} from "./api";
 
 describe("friendlyError locale handling", () => {
   it("localizes common HTTP errors", () => {
@@ -50,5 +56,43 @@ describe("isVerifiedScanPendingError", () => {
     expect(isVerifiedScanPendingError(new ApiError(503, "service unavailable"))).toBe(false);
     expect(isVerifiedScanPendingError(new ApiError(500, "database unavailable"))).toBe(false);
     expect(isVerifiedScanPendingError(new Error("network failure"))).toBe(false);
+  });
+});
+
+describe("recommendations being recalculated", () => {
+  const recalculating = new ApiError(
+    503,
+    JSON.stringify({ detail: "Recommendations are being recalculated" }),
+  );
+  const waitingForScan = new ApiError(
+    503,
+    JSON.stringify({ detail: "Verified full-catalog recommendations are not available yet" }),
+  );
+  const provenance = {
+    available: true,
+    client_site: "pharmonline",
+    run_id: 1,
+    computed_at: null,
+    run_started_at: null,
+    run_finished_at: null,
+    item_count: 0,
+  };
+
+  it("is a different state from waiting for a verified scan", () => {
+    expect(isRecommendationsRecalculatingError(recalculating)).toBe(true);
+    expect(isVerifiedScanPendingError(recalculating)).toBe(false);
+    expect(isRecommendationsRecalculatingError(waitingForScan)).toBe(false);
+  });
+
+  it("polls only while a recalculation is queued", () => {
+    expect(roiRecalculationPollMs({ error: recalculating })).toBe(20_000);
+    expect(
+      roiRecalculationPollMs({
+        error: null,
+        data: { items: [], provenance: { ...provenance, refresh_pending: true } },
+      }),
+    ).toBe(20_000);
+    expect(roiRecalculationPollMs({ error: waitingForScan })).toBe(false);
+    expect(roiRecalculationPollMs({ error: null, data: { items: [], provenance } })).toBe(false);
   });
 });

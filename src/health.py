@@ -324,6 +324,11 @@ def check_health(
     # intraday-прогон другого сайта).
     report.issues.extend(_check_site_zero_scrape(session, fresh_verified_catalogs))
 
+    # 9. Очередь пересчёта рекомендаций. Её читает один-единственный
+    # исполнитель — тик серверного watcher'а; встанет он, и рекомендации после
+    # смены порогов молча пропадут до следующего полного сбора.
+    report.issues.extend(_check_roi_refresh_queue(session))
+
     # Совокупный статус
     if any(i.severity == "critical" for i in report.issues):
         report.status = "critical"
@@ -336,6 +341,111 @@ def check_health(
 def _run_age_hours(run: Run) -> float:
     observed_at = run.finished_at or run.started_at
     return max(0.0, (utcnow() - observed_at).total_seconds() / 3600)
+
+
+# Watcher тикает раз в минуту, сам пересчёт — около минуты. Полчаса ожидания,
+# в которые ни один прогон не шёл, — уже не очередь, а неработающий исполнитель.
+# Время, пока шёл какой-нибудь прогон, в ожидание не идёт: заявка тогда ждала по
+# делу, будь это семичасовой сбор или минутный тик.
+_ROI_REFRESH_STUCK_MINUTES = 30
+
+
+# Дольше сбор идти не может: юнит убивает его по TimeoutStartSec=36000.
+# Незавершённый прогон старше — сирота. Убирает сирот сам watcher, и если встал
+# именно он, вечно «идущий» прогон глушил бы сторожа без срока.
+_RUN_HARD_LIMIT = timedelta(hours=10)
+
+
+def _minutes_without_a_run(session: Session, since: datetime, now: datetime) -> float:
+    """Сколько минут из [since, now] не шёл ни один прогон.
+
+    Прогоны берутся всех тенантов: блокировка сбора одна на всех, и пересчёт
+    ждёт чужой сбор так же, как свой.
+    """
+    runs = session.execute(
+        select(Run.started_at, Run.finished_at).where(
+            Run.started_at < now,
+            (Run.finished_at.is_(None)) | (Run.finished_at > since),
+        )
+    ).all()
+    spans = sorted(
+        (max(started, since), min(finished or started + _RUN_HARD_LIMIT, now))
+        for started, finished in runs
+    )
+    busy = timedelta()
+    covered_until = since
+    for start, end in spans:
+        start = max(start, covered_until)
+        if end > start:
+            busy += end - start
+            covered_until = end
+    return ((now - since) - busy).total_seconds() / 60
+
+
+def _check_roi_refresh_queue(session: Session, *, tenant_id: int = 1) -> list[HealthIssue]:
+    """Заявки на пересчёт рекомендаций не исполняются или пересчёт упал."""
+    from src import storage
+
+    Request = storage.RoiRefreshRequest
+    issues: list[HealthIssue] = []
+
+    oldest_pending = session.scalar(
+        select(func.min(Request.requested_at)).where(
+            Request.tenant_id == tenant_id,
+            Request.status == "pending",
+        )
+    )
+    if oldest_pending is not None:
+        now = utcnow()
+        idle_minutes = _minutes_without_a_run(session, oldest_pending, now)
+        if idle_minutes > _ROI_REFRESH_STUCK_MINUTES:
+            waiting_hours = (now - oldest_pending).total_seconds() / 3600
+            issues.append(
+                HealthIssue(
+                    "warning",
+                    "roi_refresh_stuck",
+                    f"Заявка на пересчёт рекомендаций ждёт {waiting_hours:.1f}ч, из них "
+                    f"{idle_minutes:.0f} мин ни один сбор не шёл (порог "
+                    f"{_ROI_REFRESH_STUCK_MINUTES} мин). Очередь исполняет "
+                    "pharmacy-monitor-scrape-watcher.timer: проверьте, что он работает и "
+                    "что `pharmacy-monitor roi refresh --pending` проходит.",
+                    context={
+                        "waiting_hours": round(waiting_hours, 1),
+                        "idle_minutes": round(idle_minutes),
+                    },
+                )
+            )
+
+    last_closed = session.scalar(
+        select(Request)
+        .where(Request.tenant_id == tenant_id, Request.status != "pending")
+        .order_by(desc(Request.completed_at), desc(Request.id))
+        .limit(1)
+    )
+    # Пока в очереди что-то есть, упавший пересчёт ещё не итог: за ним стоит его
+    # единственный повтор или новая заявка. Не дождутся — сработает сторож выше.
+    if oldest_pending is None and last_closed is not None and last_closed.status == "failed":
+        # Тревогу снимает любой последующий успех — пересчёт или полный сбор:
+        # оба переписывают кэш всех срезов.
+        rewritten = session.scalar(
+            select(func.count(storage.RoiActionsCache.id)).where(
+                storage.RoiActionsCache.tenant_id == tenant_id,
+                storage.RoiActionsCache.computed_at >= last_closed.completed_at,
+            )
+        )
+        if (rewritten or 0) < len(storage.FULL_CATALOG_SITES):
+            issues.append(
+                HealthIssue(
+                    "warning",
+                    "roi_refresh_failed",
+                    f"Пересчёт рекомендаций упал ({last_closed.detail}); часть "
+                    "рекомендаций скрыта до следующего полного сбора. Причина — в "
+                    "журнале по `roi_actions_cache_failed`; повторить вручную: "
+                    "`pharmacy-monitor roi refresh`.",
+                    context={"request_id": last_closed.id, "detail": last_closed.detail},
+                )
+            )
+    return issues
 
 
 def _latest_verified_catalogs_by_site(session: Session, storage_module) -> dict[str, Run]:

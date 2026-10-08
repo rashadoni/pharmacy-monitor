@@ -19,7 +19,12 @@
 #   3. --request-id N: `pharmacy-monitor run` сам пометит ScrapeRequest 'ok'
 #      сразу после persist. Вотчер дёргает /scrape-complete только на ошибку.
 #
+#   4. Тот же тик исполняет заявки на пересчёт рекомендаций ROI
+#      (`pharmacy-monitor roi refresh --pending`) — см. блок ниже.
+#
 # Запускается из pharmacy-monitor-scrape-watcher.timer (каждые ~60с в простое).
+# Исполняется прямо из чекаута: правка файла доезжает до прода выкладкой
+# (deploy.yml синхронизирует infra/server/), рестарт таймера не нужен.
 
 # NB: НЕ `set -e` — упавший curl/scrape не должен оборвать пометку статуса.
 set -uo pipefail
@@ -88,6 +93,18 @@ fi
 if active_pharmacy_monitor_job; then
     log "skip: a pharmacy-monitor scrape/matcher job is already active"
     exit 0
+fi
+
+# === Пересчёт рекомендаций по заявкам =======================================
+# Смена порогов, импорт себестоимости и правка пары в дашборде кладут заявку в
+# roi_refresh_requests: кэш рекомендаций пишет только полный сбор, а он идёт раз
+# в неделю. Команда считает кэш от последней подтверждённой эпохи каталога, без
+# сбора; заявок нет — выходит сразу. До неё доходим только когда сборов нет
+# (guard выше), а если сбор стартует в эту же секунду, команда отложит пересчёт
+# сама: каталог она читает под shared-блокировкой сбора.
+# Не фатально: упавший пересчёт не должен останавливать очередь скрейпов.
+if ! "$VENV_BIN/pharmacy-monitor" roi refresh --pending; then
+    log "roi refresh --pending FAILED — recommendations cache was not recalculated"
 fi
 
 # === Опрос pending-запроса ==================================================
