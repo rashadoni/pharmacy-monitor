@@ -267,6 +267,28 @@ def test_reads_that_stopped_before_the_identity_proof_do_not_count(db_session, n
     assert issue.context["products"] == 9250
 
 
+@pytest.mark.parametrize(
+    "run_quality",
+    [
+        ["not", "a", "dict"],
+        {"mode": "public_api", "sites": ["pharmonline"]},
+        {"mode": "public_api", "sites": {"pharmonline": "ok"}},
+        {"mode": "public_api", "sites": {"pharmonline": {"status": "ok", "products": "9100"}}},
+    ],
+)
+def test_malformed_run_quality_is_skipped_not_fatal(db_session, run_quality):
+    """Проверка справочная: странная строка прогона не должна ронять весь health."""
+    _floor(db_session, 9000)
+    complete = _read(db_session, 9250, hours_ago=30)
+    odd = _read(db_session, 100, verified=False)
+    odd.run_quality = run_quality
+    db_session.flush()
+
+    (issue,) = _floor_issues(db_session)
+
+    assert issue.context["run_id"] == complete.id
+
+
 def test_run_still_in_progress_is_not_a_read(db_session):
     """Незавершённый прогон ничего не доказывает, даже с готовой причиной отказа.
 

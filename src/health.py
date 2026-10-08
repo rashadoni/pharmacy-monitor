@@ -1212,10 +1212,15 @@ def _latest_complete_pharmonline_catalog_read(
         .limit(_PHARMONLINE_FLOOR_SCAN_RUNS)
     )
     for run_id, finished_at, run_quality, column_reason in rows:
-        quality = run_quality or {}
+        # Проверка справочная: строка непривычной формы пропускается, а не роняет
+        # весь health вместе с письмами о настоящих поломках.
+        quality = run_quality if isinstance(run_quality, dict) else {}
         if quality.get("mode") != "public_api":
             continue
-        details = (quality.get("sites") or {}).get("pharmonline") or {}
+        sites = quality.get("sites")
+        details = sites.get("pharmonline") if isinstance(sites, dict) else None
+        if not isinstance(details, dict):
+            continue
         products = details.get("products")
         if details.get("status") != "ok" or type(products) is not int or products < 1:
             continue
