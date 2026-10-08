@@ -597,9 +597,13 @@ def test_step_refuses_to_continue_after_the_lock_connection_died(engines):
             connection.commit()
         with pytest.raises(DBAPIError):
             session.execute(text("SELECT 1"))
+        assert _lock_holders(outsider) == []
+        # Так обрыв застаёт настоящий этап: транзакция ещё не откачена. Отказ —
+        # тот же RuntimeError, который `rematch` печатает одной строкой.
+        with pytest.raises(RuntimeError, match="no longer on the connection"):
+            matcher.acquire_match_mutation_xact_lock(session)
         # После rollback SQLAlchemy переподключает сессию через пул — уже без замка.
         session.rollback()
-        assert _lock_holders(outsider) == []
 
         with pytest.raises(RuntimeError, match="no longer on the connection"):
             matcher.acquire_match_mutation_xact_lock(session)

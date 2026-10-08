@@ -24,6 +24,7 @@ import structlog
 from rapidfuzz import fuzz
 from sqlalchemy import event, select, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Session
 
 from src.brand_catalog import is_brand_blacklisted
@@ -70,7 +71,12 @@ class _HeldLock:
 
     def intact(self) -> bool:
         """Сессия всё ещё ходит через то самое соединение, на котором лежит замок."""
-        return self.connection.connection.dbapi_connection is self.raw
+        try:
+            return self.connection.connection.dbapi_connection is self.raw
+        except InvalidRequestError:
+            # Соединение потеряно, а транзакция на нём ещё не откачена: SQLAlchemy
+            # отказывается его выдавать («can't reconnect until … rolled back»).
+            return False
 
 
 def _is_postgres(session: Session) -> bool:
