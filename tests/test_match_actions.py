@@ -337,6 +337,81 @@ def test_swap_alternative_enforce_rejects_stale_offer(db_session, monkeypatch):
     assert candidate.canonical_id is None
 
 
+# --- swap_alternative: состав кластера менялся в этой же сессии ----------------
+#
+# Тот же класс, что у break_match выше: запись в `canonical_id` список
+# `match.products` не обновляет, и он переживает commit. Замена по такому списку
+# считает «текущим товаром сайта» того, кого в кластере уже нет, и оставляет в
+# кластере двух товаров одного сайта.
+
+
+def test_swap_alternative_twice_in_one_session_keeps_one_product_per_site(db_session):
+    """Вторая замена на том же сайте убирает товар, поставленный первой."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    n1 = _make_product(db_session, site="aloe", external_id="aloe-n1", name="Aspirin")
+    n2 = _make_product(db_session, site="aloe", external_id="aloe-n2", name="Aspirin")
+    db_session.commit()
+
+    assert ma.swap_alternative(db_session, m.id, "aloe", n1.id) is True
+    assert ma.swap_alternative(db_session, m.id, "aloe", n2.id) is True
+
+    assert _stored_clusters(db_session) == (
+        {x.id: m.id, z.id: None, n1.id: None, n2.id: m.id},
+        {m.id},
+    )
+    assert _stored_rejections(db_session) == {_pair(z, n1), _pair(n1, n2)}
+
+
+def test_swap_alternative_rereads_members_changed_by_another_writer(db_session):
+    """Список прочитан раньше, а товар сайта привязан мимо него — замена это видит.
+
+    Так пишут `dash_match_add_product` и матчер: прямо в `canonical_id`.
+    """
+    m, [x, y] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aptekonline"])
+    n1 = _make_product(db_session, site="aloe", external_id="aloe-n1", name="Aspirin")
+    n2 = _make_product(db_session, site="aloe", external_id="aloe-n2", name="Aspirin")
+    db_session.commit()
+    assert {p.id for p in m.products} == {x.id, y.id}
+    n1.canonical_id = m.id
+    db_session.commit()
+
+    assert ma.swap_alternative(db_session, m.id, "aloe", n2.id) is True
+
+    assert _stored_clusters(db_session) == (
+        {x.id: m.id, y.id: m.id, n1.id: None, n2.id: m.id},
+        {m.id},
+    )
+    assert _stored_rejections(db_session) == {_pair(n1, n2)}
+
+
+def test_swap_alternative_sees_a_member_attached_without_flush(db_session):
+    """Состав читается из базы вместе с тем, что сессия ещё не записала."""
+    m, [x, y] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aptekonline"])
+    n1 = _make_product(db_session, site="aloe", external_id="aloe-n1", name="Aspirin")
+    n2 = _make_product(db_session, site="aloe", external_id="aloe-n2", name="Aspirin")
+    db_session.commit()
+    n1.canonical_id = m.id  # autoflush выключен: в базе n1 пока без кластера
+
+    assert ma.swap_alternative(db_session, m.id, "aloe", n2.id) is True
+
+    assert _stored_clusters(db_session) == (
+        {x.id: m.id, y.id: m.id, n1.id: None, n2.id: m.id},
+        {m.id},
+    )
+    assert _stored_rejections(db_session) == {_pair(n1, n2)}
+
+
+def test_swap_alternative_leaves_the_current_members_in_the_session(db_session):
+    """После замены вызывающий видит в `match.products` новый состав."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    n1 = _make_product(db_session, site="aloe", external_id="aloe-n1", name="Aspirin")
+    db_session.commit()
+
+    assert ma.swap_alternative(db_session, m.id, "aloe", n1.id) is True
+
+    assert {p.id for p in m.products} == {x.id, n1.id}
+
+
 def test_list_rejections_for_product(db_session):
     p1 = _make_product(db_session, name="A", external_id="1")
     p2 = _make_product(db_session, name="B", external_id="2")

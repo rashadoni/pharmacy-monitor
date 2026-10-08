@@ -267,14 +267,23 @@ def swap_alternative(session: Session, match_id: int, site: str, new_product_id:
         policy_offer_eligibility,
     )
 
-    cohort = [product for product in m.products if product.site != site] + [new_p]
+    # Состав кластера читаем из базы, а не из сессии — по той же причине, что в
+    # break_match: список `m.products`, прочитанный раньше в этой сессии, не
+    # знает о товаре, привязанном или отвязанном после. По такому списку «текущим
+    # товаром сайта» оказывался тот, кого в кластере уже нет, а настоящий
+    # оставался рядом с новым — два товара одного сайта в кластере.
+    session.flush()
+    session.expire(m, ["products"])
+    members = list(m.products)
+
+    cohort = [product for product in members if product.site != site] + [new_p]
     if not policy_identity_eligibility(cohort).eligible:
         return False
     if any(not policy_offer_eligibility(product).eligible for product in cohort):
         return False
 
     # Найти текущий Product этого site в кластере
-    current = next((p for p in m.products if p.site == site), None)
+    current = next((p for p in members if p.site == site), None)
     if current and current.id == new_product_id:
         return False  # уже этот
 
@@ -287,6 +296,8 @@ def swap_alternative(session: Session, match_id: int, site: str, new_product_id:
     # Помечаем match как manual чтобы auto-matcher не пересматчил
     m.is_manual = True
     session.commit()
+    # Список в сессии устарел на оба товара: следующий читатель перечитает его.
+    session.expire(m, ["products"])
     log.info(
         "match_swapped",
         match_id=match_id,
