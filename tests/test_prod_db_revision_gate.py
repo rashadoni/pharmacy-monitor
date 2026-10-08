@@ -564,7 +564,10 @@ class Sandbox:
         self.github_env.write_text(
             f"PLAN_CATALOG_FINGERPRINT_SHA256={'a' * 64}\n"
             f"PLAN_CANDIDATE_MANIFEST_SHA256={'b' * 64}\n"
-            "PLAN_PRODUCT_COUNT=9400\n",
+            "PLAN_PRODUCT_COUNT=9400\n"
+            # Транспорт сверка берёт из одобренного плана; что он туда попадает
+            # и что с ним делает шаг — tests/test_pharmonline_reconciliation_workflows.py.
+            "PLAN_TRANSPORT=decodo\n",
             encoding="utf-8",
         )
         self.github_output.write_text("", encoding="utf-8")

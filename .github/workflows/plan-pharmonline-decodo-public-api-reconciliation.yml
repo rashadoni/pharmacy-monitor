@@ -3,13 +3,28 @@ name: Plan Pharmonline Decodo public API reconciliation (no persistence)
 # This is intentionally a separate gate from the normal public-API preflight:
 # existing legacy rows are expected until the reconciliation has been proven.
 # It makes two fresh catalog reads and produces only aggregate evidence.
+#
+# The transport is chosen here and nowhere else: the apply workflow reads it
+# from this plan's evidence.  decodo is the default and the only transport
+# that can prove an address change or a split.  direct is for the case when
+# Decodo is down and the catalog has only plain admissions to make (a burst of
+# new products): it reads the catalog once, from the production host itself,
+# and the plan fails if anything but a plain admission is needed.
 on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Type PLAN to run the read-only Decodo reconciliation proof"
+        description: "Type PLAN to run the read-only reconciliation proof"
         required: true
         default: ""
+      transport:
+        description: "decodo: any identity change. direct: plain admissions only, when Decodo is down"
+        required: true
+        type: choice
+        default: decodo
+        options:
+          - decodo
+          - direct
 
 permissions:
   actions: read
@@ -101,8 +116,17 @@ jobs:
           REMOTE
 
       - name: Stage exact source and calculate the read-only reconciliation plan
+        env:
+          RECONCILIATION_TRANSPORT: ${{ inputs.transport }}
         run: |
           set -euo pipefail
+          case "$RECONCILIATION_TRANSPORT" in
+            decodo|direct) ;;
+            *)
+              echo "transport must be decodo or direct" >&2
+              exit 1
+              ;;
+          esac
           source_manifest=$(mktemp)
           trap 'rm -f "$source_manifest"' EXIT
           git ls-files -z -- src scripts/reconcile_pharmonline_public_api_identities.py |
@@ -157,10 +181,28 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=120 \
             pm@13.140.186.143 \
-            "bash -s -- '$remote_work_dir' '$source_manifest_sha'" <<'REMOTE'
+            "bash -s -- '$remote_work_dir' '$source_manifest_sha' '$RECONCILIATION_TRANSPORT'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
           source_manifest_sha=$2
+          # Decodo settings are passed only with Decodo: a direct plan must not
+          # depend on it.
+          case "$3" in
+            decodo)
+              transport_env=(
+                PHARMONLINE_PUBLIC_API_TRANSPORT=decodo
+                DECODO_SITES=pharmonline
+                PHARMONLINE_DECODO_BACKCONNECT_STICKY=1
+              )
+              ;;
+            direct)
+              transport_env=(PHARMONLINE_PUBLIC_API_TRANSPORT=direct)
+              ;;
+            *)
+              echo "unexpected reconciliation plan transport" >&2
+              exit 1
+              ;;
+          esac
           case "$work_dir" in
             /opt/pharmacy-monitor/.codex-decodo-reconciliation-plan.*) ;;
             *)
@@ -194,7 +236,7 @@ jobs:
           assert script.is_file() and script.resolve().is_relative_to(runtime)
           assert callable(_diagnose_pharmonline_public_api_reconciliation)
           print(
-              "isolated Decodo reconciliation-plan source imported: "
+              "isolated reconciliation-plan source imported: "
               f"python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}, "
               f"script={script.relative_to(runtime)}"
           )
@@ -210,10 +252,8 @@ jobs:
             export "$key=$value"
           done < /etc/pharmacy-monitor/env
 
+          env "${transport_env[@]}" \
           PHARMONLINE_PUBLIC_API=required \
-          PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
-          DECODO_SITES=pharmonline \
-          PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
           PHARMONLINE_PUBLIC_API_LOCK_WAIT_SECONDS=2700 \
           PHARMONLINE_PUBLIC_API_PLAN_EVIDENCE_PATH="$work_dir/plan-evidence.json" \
           PHARMONLINE_USE_DDP=0 \
@@ -249,7 +289,10 @@ jobs:
           }
           if set(data) != required:
               raise SystemExit("unexpected reconciliation plan evidence shape")
-          if data["version"] != 3 or data["transport"] != "decodo":
+          transport = os.environ["RECONCILIATION_TRANSPORT"]
+          if transport not in ("decodo", "direct"):
+              raise SystemExit("reconciliation plan transport is invalid")
+          if data["version"] != 3 or data["transport"] != transport:
               raise SystemExit("reconciliation plan evidence transport/version is invalid")
           if not isinstance(data["product_count"], int) or data["product_count"] < 9000:
               raise SystemExit("reconciliation plan evidence product count is invalid")
@@ -259,11 +302,28 @@ jobs:
                   character not in "0123456789abcdef" for character in value
               ):
                   raise SystemExit(f"reconciliation plan evidence {key} is invalid")
-          if data["metrics"].get("reconciliation_safe") != 1:
+          metrics = data["metrics"]
+          if not isinstance(metrics, dict) or metrics.get("reconciliation_safe") != 1:
               raise SystemExit("reconciliation plan evidence is not safe")
+          if transport == "direct":
+              # A direct plan carries plain admissions only.  The script
+              # refuses anything else itself; this is the second line, read
+              # from the evidence that the apply workflow will be given.
+              for key in (
+                  "legacy_rekeys_ready",
+                  "native_id_url_rebind",
+                  "native_id_url_rebind_ready",
+                  "native_id_url_rebind_redirect_ready",
+                  "identity_splits_ready",
+              ):
+                  if type(metrics.get(key)) is not int or metrics[key] != 0:
+                      raise SystemExit(
+                          f"direct reconciliation plan has an identity transition: {key}"
+                      )
           print(
               "aggregate reconciliation evidence retained: "
-              f"products={data['product_count']}, version={data['version']}"
+              f"products={data['product_count']}, version={data['version']}, "
+              f"transport={transport}"
           )
           PY
 
