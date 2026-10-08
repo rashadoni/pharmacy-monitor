@@ -143,7 +143,9 @@ def send_email(
         maintype, subtype = mime.split("/", 1)
         msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=fname)
 
-    log.info("smtp_send", host=smtp_host, port=smtp_port, recipients=recipients)
+    # Число, а не адреса: журнал еженедельного сбора pharmonline — это журнал
+    # шага GitHub Actions публичного репозитория.
+    log.info("smtp_send", host=smtp_host, port=smtp_port, recipients=len(recipients))
     with smtplib.SMTP(smtp_host, smtp_port, timeout=SMTP_TIMEOUT_SEC) as smtp:
         smtp.starttls()
         smtp.login(smtp_user, smtp_pass)

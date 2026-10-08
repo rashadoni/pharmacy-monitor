@@ -371,6 +371,114 @@ def mail_unstored_events_to_admins(
     return counts
 
 
+# Сколько товаров перечислять в письме об автодопуске; остальное — числом.
+PHARMONLINE_ADMISSION_MAIL_ROWS = 60
+
+_PHARMONLINE_ADMISSION_KIND_LABELS = {
+    "new_public_product": "новый",
+    "existing_native_id": "вернулся",
+}
+
+
+def _render_pharmonline_admission_email(run_id: int, items: list[tuple[str, str, str]]) -> str:
+    """Письмо о товарах, которые плановый сбор pharmonline допустил сам."""
+    new_count = sum(1 for kind, _, _ in items if kind == "new_public_product")
+    returned_count = len(items) - new_count
+    shown = items[:PHARMONLINE_ADMISSION_MAIL_ROWS]
+
+    def _row(kind: str, name: str, url: str) -> str:
+        label = escape(_PHARMONLINE_ADMISSION_KIND_LABELS.get(kind, kind))
+        title = escape(_clip(name, 160) or url, quote=False)
+        # Ссылкой становится только адрес товара pharmonline: функция не должна
+        # зависеть от того, что вызывающий передал проверенный адрес.
+        if url.startswith("https://pharmonline.az/product/"):
+            title = f'<a href="{escape(url, quote=True)}" style="color:#18181b;">{title}</a>'
+        return (
+            '<tr><td style="padding:8px 24px;border-bottom:1px solid #f4f4f5;font-size:13px;">'
+            f'<span style="color:#71717a;">{label}</span> · {title}</td></tr>'
+        )
+
+    rows = "\n".join(_row(kind, name, url) for kind, name, url in shown)
+    hidden = len(items) - len(shown)
+    more_row = (
+        '<tr><td style="padding:8px 24px;font-size:13px;color:#71717a;">'
+        f"…и ещё {hidden}. Полный список — в журнале допусков, запрос в RUNBOOK.</td></tr>"
+        if hidden
+        else ""
+    )
+    return f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>pharmonline: допущено {len(items)}</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
+  <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
+    <tr><td style="padding:24px;border-bottom:1px solid #e4e4e7;">
+      <div style="font-size:14px;color:#71717a;margin-bottom:4px;">Pharmacy Monitor</div>
+      <div style="font-size:22px;font-weight:600;color:#18181b;">Сбор pharmonline сам допустил {len(items)} тов.</div>
+      <div style="font-size:13px;color:#71717a;margin-top:4px;">новых — {new_count} · вернувшихся под прежним идентификатором и адресом — {returned_count} · прогон #{run_id}</div>
+    </td></tr>
+    <tr><td style="padding:12px 24px;background:#fffbeb;border-bottom:1px solid #e4e4e7;font-size:13px;color:#52525b;">
+      Раньше каждый такой товар требовал ручной сверки, и до неё сбор не шёл. Теперь сбор
+      допускает их сам и сообщает об этом. Письмо получают только администраторы. Смена
+      адреса товара и всё остальное по-прежнему останавливают сбор до ручной сверки.
+      Как проверить и как выключить — docs/RUNBOOK.md, «Сбор pharmonline: новые товары
+      допускаются сами».
+    </td></tr>
+    {rows}
+    {more_row}
+  </table>
+</body>
+</html>
+""".strip()
+
+
+def mail_pharmonline_admission_to_admins(
+    session: Session,
+    *,
+    tenant_id: int,
+    run_id: int,
+    items: list[tuple[str, str, str]],
+) -> dict[str, int]:
+    """Одно письмо на администратора: что плановый сбор pharmonline допустил сам.
+
+    `items` — (класс допуска, название, адрес). Получатели — только активные
+    пользователи с ролью из `ADMIN_ROLES`: это служебное сообщение, клиенту оно
+    не нужно. Важность письма — warning, порог пользователя действует как обычно.
+    Ничего не хранит и не коммитит; допуски уже лежат в журнале допусков.
+
+    Возвращает {'email': писем, 'failed': сбоев}.
+    """
+    counts = {"email": 0, "failed": 0}
+    if not items:
+        return counts
+    admins = session.scalars(
+        select(storage.TenantUser).where(
+            storage.TenantUser.tenant_id == tenant_id,
+            storage.TenantUser.is_active.is_(True),
+            storage.TenantUser.role.in_(ADMIN_ROLES),
+        )
+    ).all()
+    subject = f"Pharmacy Monitor — сбор pharmonline сам допустил {len(items)} тов."
+    html_body = _render_pharmonline_admission_email(run_id, items)
+    for user in admins:
+        if not _severity_passes(user.email_severity_min, "warning", DEFAULT_EMAIL_SEVERITY):
+            continue
+        try:
+            delivered = notifier.send_email(subject=subject, html_body=html_body, to=[user.email])
+        except Exception as exc:
+            delivered = False
+            # Без адреса и без текста ошибки (SMTP кладёт адрес и в него):
+            # еженедельный сбор идёт из GitHub Actions, а журнал его шагов у
+            # публичного репозитория открыт.
+            log.warning(
+                "pharmonline_admission_mail_failed",
+                user_id=user.id,
+                error_type=type(exc).__name__,
+            )
+        counts["email" if delivered else "failed"] += 1
+    return counts
+
+
 # ─── Telegram /start binding ─────────────────────────────────────────────────
 
 
