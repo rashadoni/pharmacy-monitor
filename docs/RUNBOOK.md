@@ -1061,6 +1061,83 @@ Priority order in `src/scrapers/base.py`:
 3. ScraperAPI default pool (3rd-priority, free tier)
 4. Direct connection (fallback)
 
+### Сверка личностей pharmonline
+
+**Когда.** Полный сбор pharmonline отказывает на проверке личностей: в `runs`
+статус `failed`, причина начинается с `public_api_identity_proof_failed`
+(`PharmonlinePublicAPIIdentityError: … refused persistence`).
+
+**Чем.** Два ручных workflow, оба исполняют код своего чекаута из чернового
+каталога на сервере, живой каталог не трогают:
+
+1. `plan-pharmonline-decodo-public-api-reconciliation.yml` — план, ничего не
+   пишет;
+2. `recover-pharmonline-decodo-public-api.yml` — бэкап базы, сверка
+   (`--apply`), через полчаса полный сбор. Параметры: `confirmation=RECONCILE`
+   и `plan_run_id` — номер успешного прогона плана.
+
+Оба требуют зелёный CI на том же коммите, а второй — ещё и успешный план с
+того же коммита.
+
+Оба ходят на сайт через Decodo (`PHARMONLINE_PUBLIC_API_TRANSPORT=decodo`
+прошит в файлах; еженедельный сбор с 2026-10-04 ходит `direct`). Если Decodo не
+отвечает, план падает с `decodo_request_failed`, и сверку запустить нечем — так
+упал план 2026-10-06. Смотреть в журнале шага плана, причина — в строке
+`pharmonline_public_api_catalog_rejected`.
+
+**Сверка не мигрирует.** Схему двигает только `deploy.yml`. До бэкапа и до любой
+записи второй workflow сверяет ревизию базы с головой миграций своего коммита и
+при расхождении отказывает:
+
+```
+refusing reconciliation: production DB is at migration <ревизия базы>, this commit's
+migrations end at <голова коммита>; deploy this commit with deploy.yml
+(apply_migrations=true) first; this workflow does not migrate
+```
+
+**Сравнить ревизии до плана.** План их не сверяет и идёт долго — расхождение
+всплыло бы только на втором workflow:
+
+```bash
+# база
+ssh root@13.140.186.143 "sudo -u postgres psql -X -At pharmacy_monitor \
+  -c 'select version_num from alembic_version'"
+# коммит, с которого собираешься запускать (базу не трогает)
+uv run alembic heads
+```
+
+Если миграции коммита впереди базы, выходов два:
+
+- выложить этот коммит с миграцией
+  (`gh workflow run deploy.yml --ref main -f apply_migrations=true`), потом
+  план и сверка с `main`;
+- не выкладывать посреди инцидента, а запустить план и сверку с коммита, чья
+  голова миграций равна ревизии базы: обычно это последний коммит `main` перед
+  непримененной миграцией (`git log --oneline -- migrations/versions`). Ветка от
+  него, оба workflow с `--ref <ветка>`. Выложен ли этот коммит, неважно — сверка
+  живой каталог не трогает. Workflow при этом берётся тоже с ветки, поэтому
+  годятся только коммиты, в которых эта правка уже есть (PR #44): в более ранних
+  сверка сама исполняет `alembic upgrade head`.
+
+Отказ «revision cannot be read with this commit's migrations» — обратный случай:
+база ушла вперёд коммита, запускать надо с выложенного.
+
+**Пока идёт сверка, выкладку с миграцией не запускать** (и в понедельник, пока
+идёт еженедельный сбор, — тоже). Ревизия сверяется один раз, до первой записи;
+между ней и сбором каталога проходит больше получаса, а группа `concurrency` у
+`deploy.yml` своя, так что одно другого не ждёт.
+
+До 2026-10-07 этот workflow сам исполнял `alembic upgrade head` и сверял
+результат с прошитой `0021_…`: на голове 0023 он упал бы уже после бэкапа и
+миграции, а с коммита с новой миграцией двинул бы схему мимо проверок
+`deploy.yml`.
+
+**Что остаётся на сервере.** Каждый запуск, дошедший до сервера, оставляет
+черновой каталог `/opt/pharmacy-monitor/.codex-decodo-reconciliation-apply.*` с
+исходниками, а если дело дошло до бэкапа — и с копией базы до сверки. Сами
+каталоги не удаляются: убирать руками, когда копия больше не нужна. Последний
+шаг workflow пишет, что именно осталось.
+
 ### Firecrawl as scraper backup (Phase 6 — Firecrawl MCP)
 
 Бэкап путь когда нативные скрейперы падают:
