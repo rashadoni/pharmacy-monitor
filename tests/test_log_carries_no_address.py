@@ -84,6 +84,11 @@ _PERSON_NAMES = {
 _COUNTING = {"len", "bool"}
 # `_send_email` — разговор с сервером под `send_email`: его ошибки ещё несут адрес.
 _SENDERS = {"send_email", "_send_email", "send_telegram_message"}
+# Отправители, чей сбой выходит наружу. `send_telegram_message` свой ловит сама и
+# возвращает False (`test_the_telegram_sender_keeps_its_own_failure`): функция,
+# которая зовёт Telegram, сбой отправки не выпускает, и обработчики тех, кто
+# зовёт её, под правило не попадают.
+_RAISING_SENDERS = _SENDERS - {"send_telegram_message"}
 _EXCEPTION_SUMMARIES = {"type", "delivery_error_fields"}
 # Чем достают текст пойманной ошибки, не называя её по имени: функции модуля
 # `traceback` (кроме тех, что про стек вызовов), `sys.exc_info()`,
@@ -122,12 +127,6 @@ _LOGS_THE_ERROR_TEXT_BY_DESIGN = {
     # `send_email`) и слой 3 — его на этом обработчике проверяет
     # `test_run_failure_output_carries_no_address`.
     ("run_cmd", "run_failed"),
-    # Цикл Telegram-бота вокруг `handle_update`. Та отвечает пользователю через
-    # `send_telegram_message`, а она свой сбой не бросает (ловит всё и возвращает
-    # False): сюда приходит только сбой разбора входящего сообщения, и разбирать
-    # его без трассировки нечем. Адресов почты в этом пути нет; строку страхует
-    # слой 3.
-    ("run_polling", "telegram_handle_update_failed"),
 }
 # Функции, которые бросают текст пойманной ошибки дальше новой ошибкой: click
 # печатает его строкой «Error: …» мимо маски журнала.
@@ -195,13 +194,15 @@ _HOW_TO_FIX_EXCEPTION_TEXT = (
     "этим текстом (`raise X(str(exc))`, `sys.exit`), — а smtplib кладёт в текст "
     "адрес получателя. Пиши `**notifier.delivery_error_fields(exc)`: класс ошибки "
     "и коды. Обработчик считается и тогда, когда письмо шлёт не он сам, а "
-    "функция из его `try`, которая сбой не ловит или бросает дальше; такими "
-    "сейчас считаются {wrappers}. Имена сверяются без разбора импортов: если "
+    "функция из его `try`, которая сбой не ловит или бросает дальше (у каждой "
+    "находки после стрелки названо, через что она признана почтовой); такими "
+    "сейчас считаются {wrappers}. Если обработчик дальний и текст в нём нужен "
+    "для чужих сбоев — поймай сбой отправки там, где шлёшь: до дальнего он "
+    "тогда не дойдёт. Имена сверяются без разбора импортов: если "
     "в этом списке функции, которые писем не шлют, — у какой-то обёртки над "
     "отправкой слишком общее имя (вроде `send` или `report`), и за неё приняты "
     "чужие одноимённые вызовы: дай обёртке имя поточнее. Если текст нужен "
-    "человеку в терминале (как у "
-    "`notify test`) — внеси функцию команды в "
+    "человеку в терминале (как у `notify test`) — внеси функцию команды в "
     "`_PRINTS_A_DELIVERY_ERROR_BY_DESIGN` с причиной; из workflow её тогда не "
     "запускают."
 )
@@ -379,8 +380,7 @@ def _escaping_references(node: ast.AST, local: frozenset[str], stopped: bool = F
 
 
 def senders_in(sources) -> frozenset[str]:
-    """`send_email`, `send_telegram_message` и функции, из которых сбой отправки
-    выходит наружу.
+    """Отправители и функции, из которых сбой отправки выходит наружу.
 
     `_dispatch_health_alert_email` шлёт письмо и сбой не ловит — ловит его
     `health_check_cmd`. Обработчик сбоя отправки — тот, в который сбой приходит,
@@ -394,12 +394,12 @@ def senders_in(sources) -> frozenset[str]:
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
     ]
-    senders = set(_SENDERS)
+    raising = set(_RAISING_SENDERS)
     while True:
-        wrappers = {name for name, named in escaping if named & senders} - senders
+        wrappers = {name for name, named in escaping if named & raising} - raising
         if not wrappers:
-            return frozenset(senders)
-        senders |= wrappers
+            return frozenset(raising | _SENDERS)
+        raising |= wrappers
 
 
 def _reads_the_caught_error(node: ast.AST) -> bool:
@@ -476,13 +476,18 @@ def _exception_text_findings(tree: ast.AST, senders: frozenset[str]):
         if not isinstance(node, ast.Try):
             continue
         owner, local = function.name if function else None, _local_names(function)
-        if not any(
-            name in senders
-            for stmt in node.body
-            for inner in ast.walk(stmt)
-            for name in _functions_named(inner, local)
-        ):
+        sent_by = sorted(
+            {
+                name
+                for stmt in node.body
+                for inner in ast.walk(stmt)
+                for name in _functions_named(inner, local)
+                if name in senders
+            }
+        )
+        if not sent_by:
             continue
+        via = f"  ← отправка в его try: {', '.join(sent_by)}"
         for handler in node.handlers:
             names = _error_text_names(handler)
             for inner in ast.walk(handler):
@@ -509,7 +514,7 @@ def _exception_text_findings(tree: ast.AST, senders: frozenset[str]):
                     isinstance(call, ast.Call)
                     and any(_carries_error_text(value, names) for value in _values(call))
                 ):
-                    yield inner.lineno, ast.unparse(inner), excuse
+                    yield inner.lineno, ast.unparse(inner) + via, excuse
 
 
 def exception_text_leaks(
@@ -676,8 +681,13 @@ def test_no_workflow_runs_a_command_whose_output_skips_the_mask():
     assert found == [], _HOW_TO_FIX_A_WORKFLOW
     # Разбор не ослеп: в workflow, ради которого всё это, — еженедельном сборе
     # pharmonline, который шлёт письма, — он видит запуск сбора.
-    weekly = run["autonomous-pharmonline-decodo-public-api.yml"]
-    assert "run" in {command for _, command in weekly}, weekly
+    weekly = "autonomous-pharmonline-decodo-public-api.yml"
+    assert "run" in {command for _, command in run.get(weekly, [])}, (
+        f"Проверка не видит запуск сбора в {weekly}. Если файл переименован — "
+        "поправь имя здесь; если сбор теперь запускается иначе — научи "
+        "`cli_commands_run` читать новую форму, иначе запрет на команды из "
+        "списков исключений этот workflow не проверяет."
+    )
 
 
 @pytest.mark.parametrize(
@@ -942,6 +952,9 @@ def deliver_and_reraise_refusals(report):
     except Exception as exc:
         log.warning("report_email_failed", **notifier.delivery_error_fields(exc))
 
+def ping(report):
+    notifier.send_telegram_message(report.chat_id, "готово")
+
 def command(report):
     try:
         {call}
@@ -966,6 +979,10 @@ def command(report):
         ("ctx.invoke(deliver, report)", 1),
         # Под `send_email`: ошибка отсюда ещё с адресом в тексте.
         ("notifier._send_email(subject, html, None, None)", 1),
+        # Сам вызов Telegram в `try` — отправка; обёртка над ним сбой не выпускает:
+        # `send_telegram_message` ловит его сама.
+        ("notifier.send_telegram_message(report.chat_id, text)", 1),
+        ("ping(report)", 0),
         # Эта свой сбой поймала сама: в `command` приходит уже не он.
         ("deliver_quietly(report)", 0),
         ("record(report)", 0),
@@ -978,13 +995,31 @@ def test_the_code_check_follows_a_send_failure_to_the_handler_that_gets_it(call,
 
 
 def test_the_code_check_knows_which_functions_in_src_let_a_send_failure_out():
+    """Образцы из живого кода. Упал после переименования или переделки одной из
+    этих функций — поправь имя здесь; правило при этом проверяй мутацией."""
     senders = senders_in(_src_sources().values())
     # `health_check_cmd` ловит сбой не `send_email`, а этой обёртки над ним.
-    assert "_dispatch_health_alert_email" in senders
+    assert "_dispatch_health_alert_email" in senders, sorted(senders)
     # Сбой сбора записан и брошен дальше: `run` сбой письма о прогоне выпускает.
-    assert "run_cmd" in senders
-    # Эти сбой отправки ловят сами.
-    assert not {"dispatch_events_batch", "mail_unstored_events_to_admins"} & senders
+    assert "run_cmd" in senders, sorted(senders)
+    # Эти сбой отправки ловят сами, а `handle_update` шлёт только в Telegram.
+    quiet = {"dispatch_events_batch", "mail_unstored_events_to_admins", "handle_update"}
+    assert not quiet & senders, sorted(quiet & senders)
+
+
+def test_the_telegram_sender_keeps_its_own_failure():
+    """На этом стоит `_RAISING_SENDERS`: функция с вызовом Telegram не считается
+    выпускающей сбой отправки, пока сам отправитель ловит всё, что бросает сеть."""
+    sender = next(
+        node
+        for node in ast.walk(ast.parse(_src_sources()["src/notifier.py"]))
+        if isinstance(node, ast.FunctionDef) and node.name == "send_telegram_message"
+    )
+    assert "urlopen" not in set(_escaping_references(sender, _local_names(sender))), (
+        "`send_telegram_message` перестала ловить сбой сети сама. Теперь он "
+        "выходит к вызывающим: убери её из вычитания в `_RAISING_SENDERS`, и "
+        "правило пойдёт за этим сбоем так же, как за сбоем почты."
+    )
 
 
 def test_the_code_check_ignores_handlers_that_send_nothing():
@@ -1467,5 +1502,6 @@ def test_third_party_logging_never_prints_an_address(
         assert "550 <<address>>: Recipient address rejected" in written
         assert "delivery to <address> failed" in written
         assert "SMTPRecipientsRefused" in written and "Traceback" in written
+        assert "unformattable log record from some.library" in written
         assert "'sent to %s and %s' % ('<address>',)" in written
         assert "Logging error" not in written

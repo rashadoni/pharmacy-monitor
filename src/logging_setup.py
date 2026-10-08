@@ -90,7 +90,10 @@ class MaskingFormatter(logging.Formatter):
         except Exception:
             # Сообщение не сошлось со своими аргументами. `logging` в ответ
             # печатает запись в stderr сам — мимо формата и вместе с аргументами.
-            text = f"{record.msg!r} % {record.args!r}"
+            text = (
+                f"unformattable log record from {record.name} "
+                f"({record.pathname}:{record.lineno}): {record.msg!r} % {record.args!r}"
+            )
         return mask_addresses(text)
 
 
