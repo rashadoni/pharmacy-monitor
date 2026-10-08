@@ -115,6 +115,29 @@ _PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS = frozenset({"decodo", "direc
 _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS = frozenset(
     {"existing_native_id", "new_public_product"}
 )
+# Допуск, который записала ручная сверка, прочитав каталог напрямую, без Decodo.
+# Запрет на direct в журнале держался на том, что обычный сбор в журналы не
+# пишет; с автодопуском это неверно, и одобренный человеком путь остался строже
+# автомата без причины: всплеск простых товаров при недоступном Decodo
+# разобрать было нечем. Версия своя, а не расширение ручной:
+#   * только direct и только два простых класса — им свидетельство со стороны
+#     сайта не нужно. Перекодировка, смена адреса и разведение остаются за
+#     транспортами ручной сверки, разведение — за Decodo;
+#   * `public_api_identity_admission_v1` по-прежнему не принимает direct: такая
+#     строка, как и раньше, значит «написано мимо кода»;
+#   * от автодопуска её отличают отсутствие потолка и одобренный человеком
+#     план: preflight_run_ref — прогон плана в Actions, source_manifest_sha256 —
+#     манифест исходников, как у ручной сверки.
+# Код, не знающий этой версии, считает такие допуски недействительными — см.
+# docs/RUNBOOK.md «Сбор pharmonline: новые товары допускаются сами…», абзац
+# «Ручная сверка без Decodo».
+_PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION = (
+    "public_api_manual_direct_admission_v1"
+)
+_PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_PROOF_TRANSPORTS = frozenset({"direct"})
+_PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_KINDS = frozenset(
+    {"existing_native_id", "new_public_product"}
+)
 # Версия доказательства → (допустимые транспорты, допустимые классы допуска).
 # Единственное место, где записано, что какой версии можно: по нему проверяется
 # и запись допуска, и каждая строка журнала при чтении.
@@ -127,7 +150,21 @@ _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF = {
         _PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS,
         _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS,
     ),
+    _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION: (
+        _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_PROOF_TRANSPORTS,
+        _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_KINDS,
+    ),
 }
+# Версии, с которыми запись выполняет только простые допуски: ни перекодировки,
+# ни смены адреса, ни разведения. Список явный, а не выведенный из классов выше:
+# версия, которой разрешили новый класс допуска, не должна заодно получить право
+# менять идентификаторы и адреса.
+_PHARMONLINE_PUBLIC_API_PLAIN_ADMISSION_PROOF_VERSIONS = frozenset(
+    {
+        _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION,
+        _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION,
+    }
+)
 # Потолок автодопуска за один прогон. Недельный приток новых товаров за
 # июнь–сентябрь 2026 — от 6 до ~60 (при сборе раз в неделю это и есть размер
 # одного допуска); 150 покрывает две пропущенные недели. Больше — уже не «появились
@@ -1360,6 +1397,42 @@ def _pharmonline_public_api_reconciliation_is_safe(metrics: dict[str, int]) -> b
     return not any(metrics[key] for key in _PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS)
 
 
+def _pharmonline_public_api_manual_admission_proof_version(source_transport: str) -> str:
+    """Версия доказательства, которой ручная сверка пишет допуски при этом транспорте.
+
+    Напрямую — своя версия, только простые допуски; любым другим транспортом —
+    прежняя версия ручной сверки. Незнакомый транспорт здесь не отсеивается: его
+    отвергнет проверка доказательства у самой записи.
+    """
+    if source_transport in _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_PROOF_TRANSPORTS:
+        return _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION
+    return _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION
+
+
+def _pharmonline_public_api_plain_admission_refusal(
+    admission_proof_version: str,
+    actions: list[_PharmonlinePublicAPIReconciliationAction],
+    admissions: list[_PharmonlinePublicAPIIdentityAdmissionAction],
+    quarantines: list[_PharmonlinePublicAPIIdentityQuarantineAction],
+) -> str | None:
+    """Почему план нельзя записать этой версией доказательства; None — можно.
+
+    Для версий, которым разрешены только простые допуски, план обязан состоять
+    из них одних. Возвращает счётчики без идентификаторов и адресов: строка идёт
+    в журнал шага Actions, а он открыт.
+    """
+    if admission_proof_version not in _PHARMONLINE_PUBLIC_API_PLAIN_ADMISSION_PROOF_VERSIONS:
+        return None
+    _, allowed_kinds = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF[admission_proof_version]
+    other_kinds = sum(1 for action in admissions if action.admission_kind not in allowed_kinds)
+    if not (actions or quarantines or other_kinds):
+        return None
+    return (
+        f"identity_transitions={len(actions)}, identity_splits={len(quarantines)}, "
+        f"other_admission_kinds={other_kinds}"
+    )
+
+
 def _require_pharmonline_public_api_reconciliation_proof(
     *,
     source_manifest_sha256: str,
@@ -1404,19 +1477,18 @@ def _apply_pharmonline_public_api_reconciliation(
     ``admission_proof_version`` — версия доказательства, с которой пишутся
     допуски; умолчания нет намеренно: вызывающий обязан назвать, от чьего имени
     пишет. Плановый сбор передаёт свою
-    (`_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION`), и тогда
-    функция применяет только допуски двух простых классов: перекодировку,
-    смену адреса и разведение она с этой версией не выполняет.
+    (`_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION`), ручная
+    сверка напрямую — свою
+    (`_PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION`), и с
+    любой из них функция применяет только допуски двух простых классов:
+    перекодировку, смену адреса и разведение она не выполняет.
     """
-    scheduled = (
-        admission_proof_version == _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION
-    )
     rules = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF.get(admission_proof_version)
     if rules is None:
         raise PharmonlinePublicAPIReconciliationError(
             "public Pharmonline reconciliation admission proof version is invalid"
         )
-    allowed_transports, allowed_kinds = rules
+    allowed_transports, _ = rules
     _require_pharmonline_public_api_reconciliation_proof(
         source_manifest_sha256=source_manifest_sha256,
         catalog_fingerprint_sha256=catalog_fingerprint_sha256,
@@ -1460,16 +1532,24 @@ def _apply_pharmonline_public_api_reconciliation(
         raise PharmonlinePublicAPIReconciliationError(
             "public Pharmonline quarantine split requires the Decodo transport"
         )
-    if scheduled and (
-        actions
-        or quarantines
-        or any(action.admission_kind not in allowed_kinds for action in admissions)
+    if (
+        _pharmonline_public_api_plain_admission_refusal(
+            admission_proof_version,
+            actions,
+            admissions,
+            quarantines,
+        )
+        is not None
     ):
         # Вторая линия: вызывающий уже отказал бы такому плану. Здесь проверка
-        # стоит у самой записи, чтобы версия планового сбора не могла попасть
-        # на перекодировку, смену адреса или разведение ни при каком вызове.
+        # стоит у самой записи, чтобы версия планового сбора и версия сверки
+        # напрямую не могли попасть на перекодировку, смену адреса или
+        # разведение ни при каком вызове.
         raise PharmonlinePublicAPIReconciliationError(
             "public Pharmonline scheduled admission is limited to plain admissions"
+            if admission_proof_version
+            == _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION
+            else "public Pharmonline direct reconciliation is limited to plain admissions"
         )
 
     reconciliation_rows: list[dict[str, object]] = []
@@ -1816,6 +1896,43 @@ def _ensure_pharmonline_public_api_catalog_baseline(
     )
     session.flush()
     return minimum_catalog_item_count
+
+
+def _require_pharmonline_public_api_catalog_floor(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+) -> int:
+    """Сверить каталог с уже заведённой нижней границей, ничего не записывая.
+
+    Для ручной сверки напрямую. Границу заводит только сверка через свои
+    транспорты (`_ensure_pharmonline_public_api_catalog_baseline`): строки с
+    транспортом direct в её журнале не появляется, и опустить границу этот путь
+    не может. Нет границы — отказ: первую сверку каталога напрямую не делают.
+    """
+    if not _pharmonline_public_api_recovery_tables_available(session):
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline catalog baseline schema is not migrated"
+        )
+    catalog_item_count = len(_public_api_identity_records(results))
+    existing_floor = max(
+        session.scalars(
+            select(storage.PharmonlinePublicAPICatalogBaseline.minimum_catalog_item_count).where(
+                storage.PharmonlinePublicAPICatalogBaseline.tenant_id == tenant_id
+            )
+        ).all(),
+        default=0,
+    )
+    if existing_floor < 1:
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline direct reconciliation requires an existing catalog floor"
+        )
+    if catalog_item_count < existing_floor:
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline catalog is below its immutable recovery floor"
+        )
+    return existing_floor
 
 
 def _bridge_pharmonline_legacy_ids(

@@ -28,6 +28,7 @@ from tests.test_cadence_guard import SCRAPE_UNIT, _unit_run_args
 
 SCHEDULED = main_mod._PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION
 MANUAL = main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION
+MANUAL_DIRECT = main_mod._PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION
 DDP = "pharmonline_ddp_total_count"
 
 
@@ -119,7 +120,13 @@ def test_proof_version_strings_are_a_data_contract():
     данными."""
     assert SCHEDULED == "public_api_scheduled_admission_v1"
     assert MANUAL == "public_api_identity_admission_v1"
-    assert set(main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF) == {SCHEDULED, MANUAL}
+    # Третья версия — ручная сверка напрямую; её договор закреплён в
+    # tests/test_pharmonline_direct_reconciliation.py.
+    assert set(main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF) == {
+        SCHEDULED,
+        MANUAL,
+        MANUAL_DIRECT,
+    }
     scheduled_transports, scheduled_kinds = (
         main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF[SCHEDULED]
     )
@@ -139,7 +146,9 @@ def test_proof_version_strings_are_a_data_contract():
 
 def test_manual_reconciliation_script_names_its_proof_version():
     """У записи допуска нет версии по умолчанию. Ручная сверка обязана называть
-    свою — иначе её workflow упадёт уже на проде, на вызове записи."""
+    свою — иначе её workflow упадёт уже на проде, на вызове записи. Версию она
+    берёт по транспорту: любым транспортом ручной сверки — прежнюю, напрямую —
+    свою (tests/test_pharmonline_direct_reconciliation.py)."""
     import ast
     from pathlib import Path
 
@@ -154,11 +163,24 @@ def test_manual_reconciliation_script_names_its_proof_version():
     ]
     (call,) = calls
     (keyword,) = [kw for kw in call.keywords if kw.arg == "admission_proof_version"]
-    assert getattr(keyword.value, "id", "") == "_PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION"
+    assert getattr(keyword.value, "id", "") == "admission_proof_version"
+    # Имя присвоено один раз — из транспорта, функцией, которая знает обе версии.
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    (assigned,) = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(getattr(target, "id", "") == "admission_proof_version" for target in node.targets)
+    ]
+    assert isinstance(assigned, ast.Call)
+    assert assigned.func.id == "_pharmonline_public_api_manual_admission_proof_version"
+    assert [getattr(arg, "id", "") for arg in assigned.args] == ["transport"]
 
     import scripts.reconcile_pharmonline_public_api_identities as reconcile
 
-    assert reconcile._PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION == MANUAL
+    version_for = reconcile._pharmonline_public_api_manual_admission_proof_version
+    assert version_for is main_mod._pharmonline_public_api_manual_admission_proof_version
+    assert version_for("decodo") == MANUAL
 
 
 def test_write_without_a_named_proof_version_is_a_programming_error(db_session):
