@@ -2976,6 +2976,11 @@ def _setup_logging(level: str = "INFO") -> None:
     root.addHandler(stream_handler)
     root.setLevel(level)
 
+    # Вывод команды бывает публичным: еженедельный сбор pharmonline идёт из
+    # GitHub Actions, и журнал его шага открыт. Почтовый адрес из готовой
+    # строки вырезается, что бы ни передал вызов журнала.
+    from src.logging_setup import masking
+
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -2984,7 +2989,7 @@ def _setup_logging(level: str = "INFO") -> None:
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             # Дашборд / VPS — JSON; для интерактивного terminal — ConsoleRenderer
-            (
+            masking(
                 structlog.processors.JSONRenderer()
                 if os.environ.get("PHARMACY_LOG_JSON") == "1"
                 else structlog.dev.ConsoleRenderer(colors=False)
@@ -5218,6 +5223,10 @@ def notify_test(email_to: str | None, chat_id: str | None) -> None:
                 to=[email_to] if email_to else None,
             )
             click.echo("email:    OK (отправлено)")
+        except notifier.EmailDeliveryError as e:
+            # Ответ сервера — только здесь, оператору в терминал; в журнале его
+            # нет. Адреса из него вырезаны.
+            click.echo(f"email:    FAIL — {e}: {e.server_reply}")
         except Exception as e:
             click.echo(f"email:    FAIL — {e}")
     else:
@@ -6205,7 +6214,10 @@ def run_cmd(
                     req.completed_at = utcnow()
             session.commit()
             log.exception("run_failed", run_id=run_id)
-            raise click.ClickException(str(e))
+            # click печатает этот текст сам, мимо маски журнала.
+            from src.logging_setup import mask_addresses
+
+            raise click.ClickException(mask_addresses(str(e)))
 
 
 @cli.command("scrape")

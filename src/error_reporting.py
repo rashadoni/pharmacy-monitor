@@ -110,7 +110,9 @@ def report_error(
                 html_body=html,
             )
         except Exception as e:
-            log.warning("error_email_failed", error=str(e))
+            from src.notifier import delivery_error_fields
+
+            log.warning("error_email_failed", **delivery_error_fields(e))
 
 
 def install_global_handler() -> None:

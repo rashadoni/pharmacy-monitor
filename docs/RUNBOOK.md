@@ -162,20 +162,101 @@ sudo journalctl -u pharmacy-monitor-run -f
 
 ### Email не приходит
 
-**Симптом:** клиент не получает ежедневный отчёт.
+**Симптом:** получатель не получил письмо — о прогоне, дайджест, ссылку на вход.
 
-**Действия:**
+Адресов в журнале нет: получатель назван `user_id`, ошибка — классом и кодом
+ответа SMTP. Почему так — ниже, «Адреса в журнал не пишутся».
+
+**1. Что сказал журнал.** Где он лежит, зависит от того, кто слал:
+
+- плановые сборы — `journalctl -u 'pharmacy-monitor-scrape@*' --since '2 days ago'`;
+- еженедельный сбор pharmonline — журнал шага GitHub Actions, `gh run view <id> --log`;
+- письмо админу с тика — `-u pharmacy-monitor-intraday`;
+- недельный дайджест — `-u pharmacy-monitor-digest-weekly`;
+- письмо о здоровье — `-u pharmacy-monitor-health`;
+- ссылка на вход — `-u pharmacy-monitor-api`.
+
+| В журнале | Что значит |
+|---|---|
+| `smtp_send recipients=N`, следом `smtp_sent_ok` | Почтовый сервер письмо принял. Дальше — не у нас: доставку смотреть в кабинете Resend |
+| `…_failed user_id=… error_type=…` | Не ушло; причина — в `error_type`, таблица ниже. События: `email_batch_failed` (письмо о прогоне и письмо админу с тика), `digest_email_failed`, `login_link_email_failed`, `email_dispatch_failed`, `alert_email_failed`, `error_email_failed`. Строки `smtp_send` перед ним может и не быть: до разговора с сервером дело не дошло |
+| `email_skipped_no_smtp` | В окружении нет `SMTP_HOST` — обычно ручной запуск без загруженного env |
+| Нет ни `smtp_send`, ни `…_failed` | Письмо и не собирались слать: нет событий, порог важности получателя, включённый `daily_digest`, запуск с `--no-alerts` |
+
+**2. Что значит `error_type`.** Рядом с ним — числа, по которым случаи
+различаются: `smtp_code` (ответ сервера, 550), `smtp_status` (уточнение из того
+же ответа, `5.1.1`), у сетевых ошибок — `errno`.
+
+| `error_type` | Причина |
+|---|---|
+| `SMTPAuthenticationError` (535) | Не подходят `SMTP_USER` / `SMTP_PASSWORD` — ключ отозван или заменён |
+| `SMTPSenderRefused` | Сервер не принял отправителя: `SMTP_FROM`, домен не подтверждён |
+| `SMTPRecipientsRefused` | Сервер отказал в адресе получателя (`5.1.1` — такого ящика нет) — проверить адрес у пользователя `user_id` |
+| `SMTPDataError` | Письмо отклонено целиком: размер, лимит отправки, содержимое |
+| `SMTPServerDisconnected`, `TimeoutError`, `ConnectionRefusedError`, `gaierror`, `OSError` | Почтовый сервер недоступен или сеть |
+| `KeyError` | В окружении нет `SMTP_USER` или `SMTP_PASSWORD` |
+| `ValueError` | Некому слать: получатели не заданы |
+
+**3. Кто такой `user_id`** — на сервере (адрес остаётся в терминале оператора):
+
 ```bash
-# 1. Проверить SMTP credentials
-sudo -u pharmacy uv run --directory /opt/pharmacy-monitor python -c "
-from src import notifier
-notifier.send_email('test', '<p>Hi</p>', to=['admin@pharmonline.az'])
-"
+sudo -u postgres psql -X pharmacy_monitor -c \
+  "select id, email, role, is_active, email_severity_min, daily_digest, weekly_digest
+   from tenant_users where id = <user_id>;"
+```
 
-# 2. Получатель в БД?
-sudo -u pharmacy uv run --directory /opt/pharmacy-monitor pharmacy-monitor recipient list
+**4. Полный ответ сервера** в журнал не пишется. Его печатает проверка доставки,
+которую запускают руками:
 
-# 3. Gmail App Password rotated? Создать новый: https://myaccount.google.com/apppasswords
+```bash
+# на сервере, под pm, с загруженным env
+set -a; source /etc/pharmacy-monitor/env; set +a
+.venv/bin/pharmacy-monitor notify test --email <свой адрес>
+# email:    FAIL — SMTPDataError (SMTP 554 5.7.1): <ответ сервера, адреса вырезаны>
+```
+
+Проверка воспроизводит только отказ, который повторяется. От разового сбоя
+остаются класс ошибки и коды в журнале.
+
+Без `--email` тестовое письмо уйдёт по старому списку: таблица `recipients`, а
+если она пуста — `EMAIL_TO`.
+
+#### Адреса в журнал не пишутся
+
+Репозиторий публичный, и журнал шага GitHub Actions читает любой пользователь
+GitHub; хранится он 90 дней. Еженедельный сбор pharmonline идёт оттуда и
+рассылает письма о прогоне — всё, что команда печатает, оказывается в этом
+журнале. Получатели — администратор и сотрудник клиента.
+
+- Вызов журнала не получает ни адрес, ни Telegram-идентификатор: пишется
+  `user_id` или число получателей.
+- Текст ошибки отправки в журнал не идёт — smtplib кладёт адрес и в него.
+  Пишутся класс ошибки и код ответа: `**notifier.delivery_error_fields(exc)`.
+  Отказ SMTP выходит из `notifier.send_email` как `EmailDeliveryError` уже без
+  адреса в тексте — на случай, если ошибку поймают выше и напечатают целиком.
+- Вывод журнала CLI вырезает из готовой строки всё, что похоже на адрес
+  (`logging_setup.masking`), — последняя линия, а не разрешение писать адреса и
+  не защита секретов: шаблон простой, адрес необычной записи он вырежет не
+  целиком. Заодно под него попадает и не-адрес той же формы, например имя юнита
+  `…@….service`.
+
+Возврат ловит `tests/test_log_carries_no_address.py`: читает в `src/` вызовы
+журнала, `print` и `click.echo` и зовёт почтовые пути, у которых есть свой
+обработчик сбоя. Маска стоит только на журнале CLI. Мимо неё идут `click.echo`
+и `print`, а журнал API не замаскирован вовсе — он пишет в journald и наружу не
+выходит. Команды, которые печатают адрес по назначению, перечислены в том же
+тесте (`recipient …`, `tenant add-user`, `tenant issue-token` — последняя
+печатает ещё и токен входа), и он же следит, чтобы ни один workflow их не
+запускал. `telegram poll` печатает имена и идентификаторы из Telegram — тоже
+только руками.
+
+Если адрес в журнал Actions всё же попал — журнал прогона удаляется целиком,
+необратимо и только по слову владельца:
+
+```bash
+# сначала убедиться, что это тот прогон: строки журнала команды с адресом
+gh run view <id> --log | grep -E 'recipients=|user=|email=' | grep -c '@'
+gh api -X DELETE repos/rashadoni/pharmacy-monitor/actions/runs/<id>/logs
 ```
 
 ### Email — слишком много писем (volume controls)
@@ -238,7 +319,7 @@ per-user тумблеры daily/weekly (`tenant_users`, страница «По�
 ```bash
 # на сервере, под pm, с загруженным env (systemd-EnvironmentFile вручную не грузится)
 set -a; source /etc/pharmacy-monitor/env; set +a
-# ничего не шлёт: получатели, тема, размер и число строк — в логе
+# ничего не шлёт: получатель (`user_id`), тема, размер и число строк — в логе
 .venv/bin/pharmacy-monitor notify digest weekly --dry-run
 # шлёт одному адресу из тех, у кого дайджест включён
 .venv/bin/pharmacy-monitor notify digest weekly --only admin@example.com
@@ -641,6 +722,90 @@ grep TELEGRAM_BOT_TOKEN /opt/pharmacy-monitor/.env
 sudo -u pharmacy uv run --directory /opt/pharmacy-monitor pharmacy-monitor \
   telegram send-test CHAT_ID --text "manual test"
 ```
+
+### Замок сопоставления потерян посреди этапа
+
+**Симптом** — в журнале PostgreSQL, а не приложения:
+
+```bash
+zgrep -h "you don't own a lock" /var/log/postgresql/postgresql-16-main.log*
+```
+
+Строка через несколько секунд после `matcher_done` в журнале сбора значит, что
+этап сопоставления снимал замок, которого у него уже не было. Этап (конец `run`,
+`rematch`) держит сессионный advisory-замок `pharmacy_monitor_matcher` и под ним
+делает несколько транзакций. До 2026-10-08 замок брался запросом через обычную
+сессию, а она после каждого commit возвращает соединение в пул. Соединение
+старше `DB_POOL_RECYCLE` (30 минут) пул на следующей выдаче закрывает — вместе с
+замком. Дальше этап шёл без него, и правка пары из дашборда, ждавшая замок,
+проходила между `match_products` и `revalidate_split`.
+
+Замер 2026-10-08 по журналам прода: так кончились 12 этапов из 39 с 3 сентября
+по 7 октября — ровно те, у которых тридцатая минута процесса пришлась между
+взятием замка и commit `match_products` (у aloe 12 из 30: его сбор длится
+полчаса). Тридцатая минута процесса — приближение: пул считает возраст
+соединения, а сессия открывает его в первые секунды команды. Ручных правок пар за это время не было вовсе — ни одного ручного
+отказа в `match_rejections`, ни одного запроса на изменение пар в журнале
+Caddy, — так что в окно никто не попал.
+
+Теперь замок берётся на отдельном соединении вне пула, и до снятия сессия этапа
+работает только через него (`matcher.acquire_match_mutation_lock`). Правка
+(PR #56) действует на сервере только после выкладки — сначала проверить её:
+
+```bash
+grep -c _HeldLock /opt/pharmacy-monitor/src/matcher.py
+```
+
+`0` — на сервере прежний код, и строка в журнале PostgreSQL — та самая потеря
+замка: событий в журнале сбора при ней нет и не будет. Лечится выкладкой
+(`deploy.yml`), порядок любой: старый и новый код берут один и тот же замок и
+друг друга исключают.
+
+Если правка выложена, новых строк быть не должно. Появилась:
+
+- в журнале сбора рядом будет `matcher_lock_not_held_at_release` или
+  `matcher_lock_release_failed` — по времени найти прогон и смотреть, что
+  случилось с соединением (перезапуск PostgreSQL, обрыв);
+- если этих событий нет — замок снимает кто-то мимо общих функций: искать
+  `pg_advisory_unlock` в `src/` и `scripts/`.
+
+**Этап оборвался посреди работы** — отказом `the session is no longer on the
+connection that holds the match mutation lock` (соединение замка потеряно) или
+любой другой ошибкой после `matcher_done`. К этому моменту `match_products`
+свои пары уже зафиксировал, а `revalidate_split` мог не пройти: в базе могут
+остаться пары, которые текущие правила запрещают. Раньше обрыв соединения
+между шагами проходил молча, теперь это отказ. Что сделать:
+
+1. Повторить этап: `pharmacy-monitor rematch` без флагов (как запускать на
+   сервере — «Выкладка правок сопоставления» ниже). Он доделает `revalidate`.
+2. Проверить статус прогона: `select id, status, error_message from runs order
+   by id desc limit 3`. После ошибки SQL посреди этапа обработчик сбоя `run`
+   падает сам, и прогон остаётся в `running` — так было и до этой правки.
+
+Кто держит замки сбора и сопоставления прямо сейчас:
+
+```bash
+sudo -u postgres psql -X pharmacy_monitor -c "
+  select case l.objid::bigint
+           when hashtext('pharmacy_monitor_matcher')::bigint & 4294967295 then 'сопоставление'
+           when hashtext('pharmacy_monitor_scrape')::bigint & 4294967295 then 'сбор'
+           else l.objid::text end as lock,
+         l.pid, l.granted, a.state, a.xact_start, left(a.query, 60) as query
+  from pg_locks l join pg_stat_activity a using (pid)
+  where l.locktype = 'advisory'"
+```
+
+Замок сбора всю команду лежит на соединении в состоянии `idle` без
+`xact_start` — это штатно. Замок сопоставления держит то же соединение, через
+которое этап пишет: строка одна, `pid` у замка и у запросов этапа совпадает.
+Строка с `granted = f` — кто-то ждёт: правка пары из дашборда во время этапа.
+
+Когда этап закончился (после `matcher_done` идут ещё `revalidate_split` и флаги
+цен), тот же `pid` может какое-то время числиться держателем. Это уже не замок
+этапа, а транзакционный замок `revalidate_split`: когда разбивать нечего, он
+не фиксирует транзакцию, и замок живёт до следующего commit
+команды (в сборе с `--limit` он держался ещё во время анализа прогона). Правка
+пары всё это время тоже ждёт. Так было и до 2026-10-08.
 
 ---
 
