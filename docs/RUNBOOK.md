@@ -617,6 +617,70 @@ sudo systemctl restart pharmacy-monitor-telegram
 sudo journalctl -u pharmacy-monitor-dashboard -n 20
 ```
 
+### Срочная правка — тем же `deploy.yml`
+
+Код на прод кладёт один workflow — `deploy.yml`. Отдельной «быстрой» выкладки
+пары файлов нет, и заводить её не нужно:
+
+- `deploy.yml` до копирования сверяет ревизию базы с миграциями выкладываемого
+  коммита: без `apply_migrations=true` он отказывает, если в коммите есть
+  непримененная миграция. Копия пары файлов этой сверки не делает: возьми её с
+  коммита, где модели ушли вперёд базы, — и новый код лежит на старой схеме,
+  каждый запрос к изменённой таблице падает, и у API, и у сборщиков;
+- он занимает полторы-две минуты (одиннадцать выкладок 2026-10-07: от 77 до
+  128 секунд) — срочность на этом не выигрывается;
+- файл из `main` рассчитан на остальной `src/` того же коммита; поверх каталога
+  другой ревизии он может не импортироваться вовсе.
+
+Чего у `deploy.yml` нет и что с этим делать:
+
+- **Пути «только бэкенд».** Он копирует код, потом собирает фронтенд и только
+  после сборки перезапускает API. Сборка упала — новый `src/` уже на сервере
+  (таймеры и сборщики берут его сразу), а API работает на прошлом коде из
+  памяти. Если правка была ради API — перезапустить его под root:
+  `systemctl restart pharmacy-monitor-api`, затем
+  `curl -fsS http://127.0.0.1:8080/health`.
+- **Автоматического отката.** Вернуть прошлый код — новым коммитом: `git revert`
+  через PR и обычная выкладка из `main`. Быстрее — создать ветку от прошлого
+  коммита `main` и запустить `deploy.yml` с неё (`--ref <ветка>`; тегов в
+  репозитории нет). Он откажется, если в том коммите нет ревизии, на которой
+  стоит база: после миграции назад — только новым коммитом. ⚠️ `--ref` берёт и
+  сам `deploy.yml` того коммита: отказ при непримененной миграции появился в
+  нём с коммитом `365add9a` (2026-10-07), так что на коммиты старше него так
+  не откатываться.
+- **Всего репозитория.** Что именно он возит, смотреть в его шаге копирования.
+  `templates/` (шаблон отчёта, его читает `src/reporter.py`) и `scripts/` он не
+  возит; единственным workflow, который когда-либо клал на сервер `templates/`,
+  была удалённая активация. Сверка 2026-10-07: `templates/`, `alembic.ini` и
+  `migrations/env.py` на сервере совпадают с `main`. Правка шаблона сама на
+  прод не попадёт.
+
+До 2026-10-07 workflow, копировавших файлы мимо `deploy.yml`, было три. Все
+удалены:
+
+- `category-hotfix-deploy.yml` — 25 июля, `api.py` и `analytics.py`;
+- `health-pharmonline-hotfix-deploy.yml` — 9–20 августа, пять файлов, среди них
+  `storage.py` с моделями базы. Его режим `diagnose` только читал: состояние
+  юнитов и таймеров pharmonline, какие ключи заданы в env, состояние алертов
+  health, последний сбор pharmonline и пробу DDP-маршрута, которым плановый
+  сбор с 23 августа не ходит. Теперь это смотрят по SSH под root:
+  `systemctl list-timers 'pharmacy-monitor*'`,
+  `systemctl status pharmacy-monitor-scrape@pharmonline`,
+  `journalctl -u pharmacy-monitor-scrape@pharmonline -n 100`,
+  `curl -fsS http://127.0.0.1:8080/health`; какие ключи заданы —
+  `cut -s -d= -f1 /etc/pharmacy-monitor/env` (имена без значений), состояние
+  алертов — `/opt/pharmacy-monitor/data/health_alert_state.json`;
+- `activate-pharmonline-public-api-autonomy.yml` — разовая активация 23 августа,
+  `src/`, `migrations/` и `templates/` целиком.
+
+В новом репозитории ни один не запускался. `tests/test_live_code_writers.py`
+роняет CI, если workflow, кроме `deploy.yml`, снова копирует файлы в каталоги
+кода прода; чего тест не видит, перечислено в его шапке.
+
+Копии прежнего кода, которые снимали второй и третий, остались на сервере в
+`/opt/pharmacy-monitor/data/hotfix-backups/` (август 2026). Это история: код с
+тех пор менялся, для отката они не годятся.
+
 ### Выкладка правок сопоставления (`src/matcher.py`, `src/normalize.py`)
 
 **Сливать в `main` и выкладывать — за один присест.** У пайплайна два
@@ -833,6 +897,52 @@ Mac scraping is retired. `com.pharmacy-monitor.scrape` and
 `com.pharmacy-monitor.watch` should remain unloaded/disabled; the scripts under
 `infra/local/` are fail-closed unless `PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1` is
 set for an explicit disaster-recovery run.
+
+### Маркер автономного сбора pharmonline
+
+Плановый сбор pharmonline ходит через публичный API, а не через DDP, пока на
+сервере лежит файл `/opt/pharmacy-monitor/data/pharmonline-public-api-autonomous-v1`
+с единственной строкой `pharmonline_public_api_autonomous_v1` (владелец `pm`,
+права 600; поставлен 2026-08-23). Строка pharmonline в таблице выше описывает
+то, что было до маркера.
+
+Маркер действует на любой запуск `run --site pharmonline` без `--mode`: и на
+таймер `pharmacy-monitor-scrape@pharmonline`, и на тот же запуск руками (с
+`--category-id` или `--limit` такой запуск откажется работать). Запуск с явным
+`--mode` — так зовёт сбор кнопка «Запустить scrape» (`--mode category`) — и
+запуск с несколькими сайтами идут мимо него.
+
+Файла нет, он не читается или содержимое другое:
+
+- запуск без `--mode` возвращается на DDP: в `/etc/pharmacy-monitor/env`
+  по-прежнему стоит `PHARMONLINE_USE_DDP=1`;
+- понедельничный сбор из GitHub Actions
+  (`autonomous-pharmonline-decodo-public-api.yml`) падает на первой же проверке
+  сервера — он требует маркер. Красный прогон этого workflow и есть сигнал.
+
+Каталог `data/` выкладка не трогает, так что сам маркер не пропадает.
+Проверить:
+
+```bash
+# на сервере; True — плановый сбор пойдёт через публичный API
+cd /opt/pharmacy-monitor && sudo -u pm .venv/bin/python -B -c \
+  "from src import main; print(main._pharmonline_public_api_autonomous_mode_requested(['pharmonline'], 'auto'))"
+```
+
+Вернуть пропавший (сервер восстановлен без `data/`) — под `pm`, пока сбор
+pharmonline не идёт, и повторить проверку:
+
+```bash
+sudo -u pm sh -c 'umask 077; printf "%s\n" pharmonline_public_api_autonomous_v1 \
+  > /opt/pharmacy-monitor/data/pharmonline-public-api-autonomous-v1'
+```
+
+Больше маркер никто не ставит, и код для этого копировать не нужно. Workflow
+активации, который поставил его в августе, заодно заменял на сервере `src/`,
+`migrations/` и `templates/` целиком мимо проверок `deploy.yml` и поэтому
+удалён 2026-10-07. Транспорт автономного сбора задаёт
+`PHARMONLINE_PUBLIC_API_TRANSPORT` в env (`direct` или `decodo`); пустое или
+другое значение роняет прогон намеренно.
 
 ### DDP recovery procedures
 

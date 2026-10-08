@@ -133,7 +133,8 @@ def _pharmonline_public_api_autonomous_marker_path() -> Path:
 
     The generic production systemd unit predates the public-API recovery and
     can only execute ``pharmacy-monitor run --site pharmonline``.  A marker
-    written by the guarded activation workflow is therefore the narrow,
+    written once by the activation workflow (removed 2026-10-07; checking and
+    restoring the marker by hand is in docs/RUNBOOK.md) is therefore the narrow,
     auditable opt-in that redirects *that exact auto-mode, single-site run* to
     the verified public API.  It does not change ordinary multi-site or manual
     category runs.
