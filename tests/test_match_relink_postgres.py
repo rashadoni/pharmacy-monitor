@@ -1,10 +1,10 @@
 """Ручная замена товара в кластере, пришедшая во время этапа сопоставления.
 
 Этап (конец сбора, `rematch`) держит сессионный замок сопоставления полторы —
-три с половиной минуты и всё это время меняет `products.canonical_id`. Запрос оператора
-`POST /api/v1/dash/matches/{id}/relink` в эти минуты ждёт тот же замок. Пока
-эндпоинт сначала читал кластер и товар, а на замок вставал уже внутри
-`swap_alternative`, после ожидания он работал с прочитанным до него:
+три с половиной минуты и всё это время меняет `products.canonical_id`. Запрос
+оператора `POST /api/v1/dash/matches/{id}/relink` в эти минуты встаёт на тот же
+замок. Пока эндпоинт сначала читал кластер и товар, а на замок вставал уже
+внутри `swap_alternative`, после ожидания он работал с прочитанным до него:
 
 * товар того же сайта, добавленный или поставленный этапом, оставался в
   кластере рядом с новым;
@@ -12,14 +12,19 @@
   уже в другом сравнении» смотрела на строку, прочитанную до ожидания;
 * по распущенному кластеру запрос падал (500) вместо «не найдено».
 
-Правок две, и держат они разное. Первый случай закрывает любая из двух: замена
-перечитывает состав кластера под замком, и эндпоинт читает его уже после замка
-— первые два теста падают, только если убрать обе. Второй и третий случай
-закрывает только замок до первого чтения в эндпоинте: кандидат и кластер —
-строки, которые замена не перечитывает.
+Держат это две правки. Эндпоинт берёт замок до первого чтения — стенд ниже
+проверяет это сам: запрос обязан встать на замок, не прочитав до него ни одной
+таблицы сопоставления. И замена читает кластер, кандидата и состав из базы
+сама, под замком, — это видят тесты в `tests/test_match_actions.py`, где «другой
+писатель» меняет строки мимо сессии.
+
+Запрос ждёт замок недолго (`api.MATCH_EDIT_LOCK_WAIT_SECONDS`) и, не дождавшись,
+отказывает — это в `tests/test_match_edits_postgres.py`. Здесь этап отпускает
+замок сразу после своей записи, и запрос успевает.
 
 Воспроизводится только на двух настоящих соединениях PostgreSQL: на SQLite
-замка нет, тесты пропускаются.
+замка нет, тесты пропускаются. Ключ замка один на базу, а не на схему: два
+прогона этих тестов в одной базе одновременно мешают друг другу.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from src import api, match_actions, matcher
@@ -49,8 +54,7 @@ _WAITING_FOR_ADVISORY_LOCK = text(
 )
 
 
-@pytest.fixture
-def engines():
+def _fresh_schema_engines():
     """Два пула на одну свежую схему: сбор и API — разные процессы.
 
     В общем пуле запрос может получить то самое соединение, которое держит
@@ -77,6 +81,11 @@ def engines():
         with admin.begin() as connection:
             connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         admin.dispose()
+
+
+@pytest.fixture
+def engines():
+    yield from _fresh_schema_engines()
 
 
 def _session(bind) -> Session:
@@ -108,63 +117,12 @@ def _cluster(session: Session, sites: list[str]) -> Match:
     return match
 
 
-def _relink_while_the_stage_holds_the_lock(
-    engines,
-    seed: Callable[[Session], int],
-    stage_change: Callable[[Session], None],
-    *,
-    site: str = "aloe",
-    candidate: str = "candidate",
-) -> tuple[object, dict[str, int | None], dict[int, bool], set[tuple[str, str]]]:
-    """Запрос приходит под замком этапа; этап меняет базу и отпускает замок.
+_APP_TABLES = ("matches", "products", "match_rejections")
 
-    Возвращает ответ эндпоинта (или код отказа), привязки товаров, кластеры
-    {id: is_manual} и пары отказов — как они лежат в базе после запроса.
-    """
-    stage_engine, api_engine = engines
-    with _session(stage_engine) as session:
-        match_id = seed(session)
-        session.commit()
 
-    outcome: list[object] = []
-
-    def request() -> None:
-        with _session(api_engine) as db:
-            try:
-                outcome.append(
-                    api.dash_match_relink(
-                        match_id,
-                        api.MatchRelinkIn(
-                            site=site, url=f"https://{site}.example/product/{candidate}"
-                        ),
-                        user=SimpleNamespace(id=7, tenant_id=1),
-                        db=db,
-                    )
-                )
-            except HTTPException as refused:
-                outcome.append(refused.status_code)
-            except Exception as crashed:
-                outcome.append(crashed)
-
-    # Одно соединение на весь «этап»: сессионный замок принадлежит соединению.
-    with stage_engine.connect() as connection, _session(connection) as stage:
-        assert matcher.acquire_match_mutation_lock(stage, wait=False)
-        thread = threading.Thread(target=request, daemon=True)
-        thread.start()
-        deadline = time.monotonic() + 15
-        while thread.is_alive() and time.monotonic() < deadline:
-            if stage.scalar(_WAITING_FOR_ADVISORY_LOCK):
-                break
-            time.sleep(0.02)
-        assert thread.is_alive(), f"запрос не встал на замок сопоставления: {outcome}"
-        stage_change(stage)
-        stage.commit()
-        matcher.release_match_mutation_lock(stage)
-        stage.commit()
-    thread.join(30)
-    assert not thread.is_alive(), "запрос не завершился после снятия замка"
-
-    with _session(stage_engine) as session:
+def _stored(engine) -> tuple[dict[str, int | None], dict[int, bool], set[tuple[str, str]]]:
+    """Привязки товаров, кластеры {id: is_manual} и пары отказов — как в базе."""
+    with _session(engine) as session:
         tags = dict(session.execute(select(Product.id, Product.external_id)).all())
         pairing = dict(session.execute(select(Product.external_id, Product.canonical_id)).all())
         clusters = dict(session.execute(select(Match.id, Match.is_manual)).all())
@@ -174,7 +132,122 @@ def _relink_while_the_stage_holds_the_lock(
                 select(MatchRejection.product_a_id, MatchRejection.product_b_id)
             )
         }
-    return outcome[0], pairing, clusters, rejections
+    return pairing, clusters, rejections
+
+
+def _wait_until_the_request_is_on_the_lock(stage: Session, thread: threading.Thread) -> bool:
+    deadline = time.monotonic() + 15
+    while thread.is_alive() and time.monotonic() < deadline:
+        if stage.scalar(_WAITING_FOR_ADVISORY_LOCK):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _request_thread(
+    api_engine, call: Callable[[Session], object]
+) -> tuple[threading.Thread, list[object], list[str]]:
+    """Запрос оператора в своём потоке и на своём пуле соединений.
+
+    Отдаёт поток, список с ответом (или кодом отказа, или сбоем) и запросы,
+    которые этот пул выполнил, — по ним видно, что запрос успел до замка.
+    """
+    outcome: list[object] = []
+    statements: list[str] = []
+
+    def remember(conn, cursor, statement, parameters, context, executemany) -> None:
+        statements.append(" ".join(statement.split()))
+
+    event.listen(api_engine, "before_cursor_execute", remember)
+
+    def request() -> None:
+        with _session(api_engine) as db:
+            try:
+                outcome.append(call(db))
+            except HTTPException as refused:
+                outcome.append(refused.status_code)
+            except Exception as crashed:
+                outcome.append(crashed)
+
+    return threading.Thread(target=request, daemon=True), outcome, statements
+
+
+def _assert_nothing_was_read_before_the_lock(statements: list[str]) -> None:
+    """До замка запрос не трогал ни кластеры, ни товары, ни отказы.
+
+    `statements` — всё, что запрос выполнил к моменту, когда встал на замок.
+    """
+    assert statements, "запрос не выполнил ни одного запроса"
+    assert "pg_advisory_xact_lock" in statements[-1], statements
+    read_too_early = [
+        statement
+        for statement in statements[:-1]
+        if any(table in statement for table in _APP_TABLES)
+    ]
+    assert read_too_early == []
+
+
+def _request_while_the_stage_holds_the_lock(
+    engines,
+    seed: Callable[[Session], object],
+    stage_change: Callable[[Session], None],
+    call: Callable[[Session, object], object],
+) -> tuple[object, dict[str, int | None], dict[int, bool], set[tuple[str, str]]]:
+    """Запрос приходит под замком этапа; этап меняет базу и отпускает замок.
+
+    `call(db, seeded)` — сам запрос; `seeded` — то, что вернул `seed`. Возвращает
+    ответ (или код отказа), привязки товаров, кластеры {id: is_manual} и пары
+    отказов — как они лежат в базе после запроса.
+
+    Проверяет сама: запрос встал на замок и до него не прочитал ни одной таблицы
+    сопоставления.
+    """
+    stage_engine, api_engine = engines
+    with _session(stage_engine) as session:
+        seeded = seed(session)
+        session.commit()
+
+    thread, outcome, statements = _request_thread(api_engine, lambda db: call(db, seeded))
+
+    try:
+        # Одно соединение на весь «этап»: сессионный замок принадлежит соединению.
+        with stage_engine.connect() as connection, _session(connection) as stage:
+            assert matcher.acquire_match_mutation_lock(stage, wait=False)
+            thread.start()
+            waiting = _wait_until_the_request_is_on_the_lock(stage, thread)
+            assert waiting, f"запрос не встал на замок сопоставления: {outcome}"
+            _assert_nothing_was_read_before_the_lock(list(statements))
+            stage_change(stage)
+            stage.commit()
+            matcher.release_match_mutation_lock(stage)
+            stage.commit()
+    finally:
+        # И при упавшей проверке: запрос, оставшийся в полёте, держит блокировки
+        # в схеме, и её удаление после теста встало бы с ним в тупик.
+        if thread.ident is not None:
+            thread.join(30)
+    assert not thread.is_alive(), "запрос не завершился после снятия замка"
+
+    return outcome[0], *_stored(stage_engine)
+
+
+def _relink_while_the_stage_holds_the_lock(
+    engines,
+    seed: Callable[[Session], int],
+    stage_change: Callable[[Session], None],
+    *,
+    site: str = "aloe",
+    candidate: str = "candidate",
+) -> tuple[object, dict[str, int | None], dict[int, bool], set[tuple[str, str]]]:
+    def relink(db: Session, match_id: object) -> object:
+        return api.dash_match_relink(
+            match_id,
+            api.MatchRelinkIn(site=site, url=f"https://{site}.example/product/{candidate}"),
+            user=SimpleNamespace(id=7, tenant_id=1),
+            db=db,
+        )
+
+    return _request_while_the_stage_holds_the_lock(engines, seed, stage_change, relink)
 
 
 def _by_tag(session: Session, tag: str) -> Product:

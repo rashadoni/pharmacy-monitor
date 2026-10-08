@@ -12,6 +12,7 @@ Coverage:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -4171,6 +4172,243 @@ def test_match_relink_409_already_matched(client, tenant_user, setup_db):
         json={"site": "aptekonline", "url": "https://www.aptekonline.az/product/busy-777"},
     )
     assert r.status_code == 409
+
+
+# Отказ замены называет причину: `detail` по-русски, `code` и `params` — чтобы
+# дашборд показал текст на языке оператора. Раньше на любой отказ самой замены
+# шло «возможно, это уже текущий товар сайта».
+
+
+def _relink_candidate(s, site: str, tag: str, **fields) -> storage.Product:
+    product = storage.Product(
+        tenant_id=1,
+        site=site,
+        external_id=tag,
+        url=f"https://{site}.example/product/{tag}",
+        name="Candidate",
+        name_normalized="candidate",
+        **fields,
+    )
+    s.add(product)
+    s.commit()
+    return product
+
+
+def _relink_as_operator(client, tenant_user, s, match_id: int, site: str, tag: str):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    token = tenants.issue_magic_token(s, tenant_user.email)
+    client.get(f"/auth/verify?token={token}")
+    return client.post(
+        f"/api/v1/dash/matches/{match_id}/relink",
+        json={"site": site, "url": f"https://{site}.example/product/{tag}"},
+    )
+
+
+def test_match_relink_names_a_dead_link_of_another_member(client, tenant_user, setup_db):
+    """Мешает мёртвая ссылка у ДРУГОГО товара пары — так и сказано, с его сайтом."""
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="DeadMember", products_per_site=2)
+    dead = next(p for p in m.products if p.site == "pharmonline")
+    dead.url_dead_at = datetime(2026, 5, 30)
+    current = next(p for p in m.products if p.site == "aptekonline")
+    candidate = _relink_candidate(s, "aptekonline", "fresh-1")
+
+    r = _relink_as_operator(client, tenant_user, s, m.id, "aptekonline", "fresh-1")
+
+    assert r.status_code == 409
+    assert r.json() == {
+        "detail": "У товара pharmonline в этом сравнении страница больше не открывается. "
+        "Сначала замените его, потом этот.",
+        "code": "dead_link_member",
+        "params": {"site": "pharmonline"},
+    }
+    s.refresh(candidate)
+    s.refresh(current)
+    assert (candidate.canonical_id, current.canonical_id) == (None, m.id)
+
+
+def test_match_relink_names_a_dead_link_of_the_new_product(client, tenant_user, setup_db):
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="DeadNew", products_per_site=2)
+    _relink_candidate(s, "aptekonline", "gone-1", url_dead_at=datetime(2026, 5, 30))
+
+    r = _relink_as_operator(client, tenant_user, s, m.id, "aptekonline", "gone-1")
+
+    assert (r.status_code, r.json()["code"], r.json()["params"]) == (
+        409,
+        "dead_link_new",
+        {"site": "aptekonline"},
+    )
+    assert "Страница этого товара на aptekonline больше не открывается" in r.json()["detail"]
+
+
+def test_match_relink_names_the_current_product(client, tenant_user, setup_db):
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="Same", products_per_site=2)
+    current = next(p for p in m.products if p.site == "aptekonline")
+    current.external_id = "current-1"
+    current.url = "https://aptekonline.example/product/current-1"
+    s.commit()
+
+    r = _relink_as_operator(client, tenant_user, s, m.id, "aptekonline", "current-1")
+
+    assert (r.status_code, r.json()["code"], r.json()["params"]) == (
+        409,
+        "already_current",
+        {"site": "aptekonline"},
+    )
+    assert "менять нечего" in r.json()["detail"]
+
+
+def test_match_relink_names_the_other_comparison(client, tenant_user, setup_db):
+    s = setup_db
+    m1 = _make_match_with_products(s, confidence=0.8, canonical="ClusterA", products_per_site=2)
+    m2 = _make_match_with_products(s, confidence=0.8, canonical="ClusterB", products_per_site=2)
+    other = next(p for p in m2.products if p.site == "aptekonline")
+    other.external_id = "busy-777"
+    other.url = "https://aptekonline.example/product/busy-777"
+    s.commit()
+
+    r = _relink_as_operator(client, tenant_user, s, m1.id, "aptekonline", "busy-777")
+
+    assert (r.status_code, r.json()["code"], r.json()["params"]) == (
+        409,
+        "product_in_other_match",
+        {"match_id": m2.id},
+    )
+    assert f"(№{m2.id})" in r.json()["detail"]
+    s.refresh(other)
+    assert other.canonical_id == m2.id
+
+
+def test_match_relink_names_a_link_outside_the_catalog(client, tenant_user, setup_db):
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="NoTarget", products_per_site=2)
+
+    r = _relink_as_operator(client, tenant_user, s, m.id, "aptekonline", "does-not-exist")
+
+    assert (r.status_code, r.json()["code"], r.json()["params"]) == (
+        404,
+        "relink_not_in_catalog",
+        {"site": "aptekonline"},
+    )
+
+
+def test_match_relink_of_a_missing_comparison_and_of_a_bad_link(client, tenant_user, setup_db):
+    s = setup_db
+    _relink_candidate(s, "aptekonline", "fresh-1")
+
+    gone = _relink_as_operator(client, tenant_user, s, 99999, "aptekonline", "fresh-1")
+    bad = client.post(
+        "/api/v1/dash/matches/99999/relink", json={"site": "aptekonline", "url": "///"}
+    )
+
+    assert (gone.status_code, gone.json()["code"]) == (404, "match_gone")
+    assert (bad.status_code, bad.json()["code"]) == (400, "relink_bad_link")
+
+
+@pytest.mark.parametrize(
+    ("reason", "status", "code", "params", "says"),
+    [
+        ("match_not_found", 404, "match_gone", {}, "сравнения уже нет"),
+        ("already_current", 409, "already_current", {"site": "aloe"}, "менять нечего"),
+        ("identity:country_conflict", 409, "country_conflict", {}, "разной страной"),
+        ("identity:country_unknown", 409, "country_unverified", {}, "не подтверждена страна"),
+        (
+            "product_in_other_match match=41",
+            409,
+            "product_in_other_match",
+            {"match_id": 41},
+            "(№41)",
+        ),
+        (
+            "offer:dead_url product=7 site=aloe",
+            409,
+            "dead_link_new",
+            {"site": "aloe"},
+            "Страница этого товара на aloe",
+        ),
+        (
+            "offer:dead_url product=8 site=pharmonline",
+            409,
+            "dead_link_member",
+            {"site": "pharmonline"},
+            "У товара pharmonline в этом сравнении",
+        ),
+        (
+            "offer:out_of_stock product=7 site=aloe",
+            409,
+            "out_of_stock_new",
+            {"site": "aloe"},
+            "Этого товара сейчас нет в наличии на aloe",
+        ),
+        (
+            "offer:out_of_stock product=8 site=aptekonline",
+            409,
+            "out_of_stock_member",
+            {"site": "aptekonline"},
+            "Товара aptekonline из этого сравнения сейчас нет в наличии",
+        ),
+        (
+            "offer:availability_stale product=7 site=aloe",
+            409,
+            "offer_not_fresh_new",
+            {"site": "aloe"},
+            "Наличие этого товара на aloe давно не проверялось",
+        ),
+        (
+            "offer:availability_unknown product=8 site=pharmonline",
+            409,
+            "offer_not_fresh_member",
+            {"site": "pharmonline"},
+            "Наличие товара pharmonline из этого сравнения",
+        ),
+        (
+            "product_site_mismatch",
+            409,
+            "swap_refused",
+            {"reason": "product_site_mismatch"},
+            "причина: product_site_mismatch",
+        ),
+    ],
+)
+def test_relink_refusal_for_every_reason_of_the_swap(reason, status, code, params, says):
+    """Новый товар здесь — №7; №8 — другой товар того же сравнения."""
+    refusal = api_module._relink_refusal(reason, site="aloe", product_id=7)
+
+    assert (refusal.status_code, refusal.code, refusal.params) == (status, code, params)
+    assert says in refusal.detail
+
+
+def test_relink_refusals_cover_every_reason_the_swap_can_give():
+    """Причина, которую замена научится называть, не должна молча уйти в общий отказ.
+
+    Сверяет коды из докстринга `SwapOutcome` с тем, что знает `_relink_refusal`:
+    общий отказ (`swap_refused`) остаётся только трём причинам, до которых
+    эндпоинт не доходит.
+    """
+    from src import match_actions
+
+    documented = set(re.findall(r"``([a-z_]+)[:` ]", match_actions.SwapOutcome.__doc__))
+    documented -= {"accepted", "reason", "dry_run"}
+    samples = {
+        "identity": ["identity:country_conflict", "identity:country_unknown"],
+        "offer": [
+            f"offer:{why} product=7 site=aloe"
+            for why in ("dead_url", "out_of_stock", "availability_unknown", "availability_stale")
+        ],
+        "product_in_other_match": ["product_in_other_match match=1"],
+    }
+    generic = {
+        code
+        for code in documented
+        for reason in samples.get(code, [code])
+        if api_module._relink_refusal(reason, site="aloe", product_id=7).code == "swap_refused"
+    }
+
+    assert documented >= {"match_not_found", "already_current", "identity", "offer"}
+    assert generic == {"product_not_found", "product_site_mismatch", "product_tenant_mismatch"}
 
 
 def test_match_relink_requires_auth(client, setup_db):

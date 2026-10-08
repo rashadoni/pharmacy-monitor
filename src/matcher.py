@@ -23,12 +23,21 @@ from typing import Sequence
 
 import structlog
 from rapidfuzz import fuzz
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.brand_catalog import is_brand_blacklisted
 from src.brand_resolver import brands_conflict, is_commodity_name
 from src.match_actions import is_rejected
+
+# Замок сопоставления определён один раз, в src.match_lock. Здесь — прежние
+# имена: сбор, rematch, эндпоинты и скрипты зовут их как matcher.<имя>.
+from src.match_lock import (  # noqa: F401
+    MATCH_MUTATION_ADVISORY_LOCK_KEY,
+    acquire_match_mutation_lock,
+    acquire_match_mutation_xact_lock,
+    release_match_mutation_lock,
+)
 from src.normalize import (
     ROUTE_CLASSES,
     extract_form,
@@ -51,41 +60,6 @@ from src.storage import (
 )
 
 log = structlog.get_logger()
-
-MATCH_MUTATION_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
-
-
-def _is_postgres(session: Session) -> bool:
-    return session.get_bind().dialect.name == "postgresql"
-
-
-def acquire_match_mutation_xact_lock(session: Session) -> None:
-    """Serialize one transaction with every canonical topology mutation."""
-    if _is_postgres(session):
-        session.scalar(
-            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-            {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
-        )
-
-
-def acquire_match_mutation_lock(session: Session, *, wait: bool = True) -> bool:
-    """Session-level lock for multi-transaction operations and rollback."""
-    if not _is_postgres(session):
-        return True
-    fn = "pg_advisory_lock" if wait else "pg_try_advisory_lock"
-    value = session.scalar(
-        text(f"SELECT {fn}(hashtext(:key))"),
-        {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
-    )
-    return True if wait else bool(value)
-
-
-def release_match_mutation_lock(session: Session) -> None:
-    if _is_postgres(session):
-        session.scalar(
-            text("SELECT pg_advisory_unlock(hashtext(:key))"),
-            {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
-        )
 
 FUZZY_THRESHOLD = 75  # 0..100, минимальный score для авто-матча.
 # Снижено с 78 → 75 (2026-05-26): bucket (brand, dosage, pack) уже строго

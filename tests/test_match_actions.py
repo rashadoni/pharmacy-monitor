@@ -7,10 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from structlog.testing import capture_logs
 
-from src import analytics, matcher
+from src import analytics, match_lock, matcher
 from src import match_actions as ma
 from src.storage import Match, MatchPolicyAudit, MatchRejection, Product
 
@@ -406,10 +406,28 @@ def test_swap_alternative_leaves_the_current_members_in_the_session(db_session):
     m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
     n1 = _make_product(db_session, site="aloe", external_id="aloe-n1", name="Aspirin")
     db_session.commit()
+    assert {p.id for p in m.products} == {x.id, z.id}  # список прочитан до замены
 
     assert ma.swap_alternative(db_session, m.id, "aloe", n1.id) is True
 
     assert {p.id for p in m.products} == {x.id, n1.id}
+
+
+def test_refused_swap_leaves_the_current_members_in_the_session(db_session):
+    """И после отказа: список, прочитанный раньше, заменён тем, что лежит в базе."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    joined = _make_product(db_session, site="aptekonline", external_id="ap", name="Aspirin")
+    db_session.commit()
+    assert {p.id for p in m.products} == {x.id, z.id}
+    db_session.execute(
+        Product.__table__.update().where(Product.id == joined.id).values(canonical_id=m.id)
+    )
+    db_session.commit()
+    assert {p.id for p in m.products} == {x.id, z.id}  # сессия о чужой записи не знает
+
+    assert ma.swap_alternative(db_session, m.id, "aloe", z.id) is False
+
+    assert {p.id for p in m.products} == {x.id, z.id, joined.id}
 
 
 # --- try_swap_alternative: почему замена не записана ---------------------------
@@ -496,19 +514,229 @@ def test_try_swap_alternative_takes_the_matcher_lock_in_both_modes(
     m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
     candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
     db_session.commit()
-    seen_before_lock: list[bool] = []
+    statements: list[str] = []
+    event.listen(
+        db_session.get_bind(),
+        "before_cursor_execute",
+        lambda conn, cursor, statement, *rest: statements.append(statement),
+    )
+    read_before_lock: list[int] = []
     monkeypatch.setattr(
         ma,
-        "_acquire_match_mutation_xact_lock",
-        # Замок — раньше чтения состава: список участников ещё не загружен.
-        lambda session: seen_before_lock.append("products" in m.__dict__),
+        "acquire_match_mutation_xact_lock",
+        # Замок — раньше любого чтения: до него замена не выполнила ни запроса.
+        lambda session: read_before_lock.append(len(statements)),
     )
 
     outcome = ma.try_swap_alternative(db_session, m.id, "aloe", candidate.id, dry_run=dry_run)
 
     assert outcome.accepted is True
     # Настоящая замена берёт замок ещё раз, записывая отказ прежнему товару сайта.
-    assert seen_before_lock[0] is False and len(seen_before_lock) == (1 if dry_run else 2)
+    assert read_before_lock[0] == 0 and len(read_before_lock) == (1 if dry_run else 2)
+    assert statements, "замена не выполнила ни одного запроса — тест ничего не проверяет"
+
+
+# --- try_swap_alternative: всё, по чему замена решает, она читает из базы сама --
+#
+# Вызывающий мог прочитать кластер и товары раньше — до ожидания замка или в
+# начале долгой работы. Сессии проекта объекты после commit не сбрасывают, и
+# `session.get` отдал бы прочитанное тогда. «Другой писатель» ниже пишет мимо
+# сессии (`__table__.update()`): `update(Model)` сам поправил бы объекты в ней, и
+# тест проходил бы при любом коде.
+
+
+def _another_writer(s, table, where, **values) -> None:
+    s.execute(table.update().where(where).values(**values))
+    s.commit()
+
+
+def test_try_swap_alternative_refuses_a_product_from_another_cluster(db_session):
+    """Товар из другого кластера замена не уводит: там осталась бы пара без него."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    other = Match(tenant_id=1, canonical_name="Aspirin 2", confidence=0.9, is_manual=False)
+    db_session.add(other)
+    db_session.flush()
+    partner = _make_product(
+        db_session, site="aptekonline", external_id="ap", name="Aspirin", canonical_id=other.id
+    )
+    taken = _make_product(
+        db_session, site="aloe", external_id="aloe-taken", name="Aspirin", canonical_id=other.id
+    )
+    db_session.commit()
+    before = _stored_clusters(db_session)
+
+    for dry_run in (True, False):
+        outcome = ma.try_swap_alternative(db_session, m.id, "aloe", taken.id, dry_run=dry_run)
+        assert outcome == ma.SwapOutcome(False, f"product_in_other_match match={other.id}")
+
+    assert _stored_clusters(db_session) == before
+    assert before[0][taken.id] == before[0][partner.id] == other.id
+    assert _stored_rejections(db_session) == set()
+    assert db_session.scalar(select(Match.is_manual).where(Match.id == m.id)) is False
+
+
+def test_try_swap_alternative_rereads_a_candidate_paired_by_another_writer(db_session):
+    """Кандидат прочитан без пары, а в базе уже стоит в другом кластере."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    other = Match(tenant_id=1, canonical_name="Aspirin 2", confidence=0.9, is_manual=False)
+    db_session.add(other)
+    candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    db_session.commit()
+    assert candidate.canonical_id is None
+    _another_writer(
+        db_session, Product.__table__, Product.id == candidate.id, canonical_id=other.id
+    )
+    assert candidate.canonical_id is None  # сессия о чужой записи не знает
+
+    outcome = ma.try_swap_alternative(db_session, m.id, "aloe", candidate.id)
+
+    assert outcome == ma.SwapOutcome(False, f"product_in_other_match match={other.id}")
+    assert _stored_clusters(db_session)[0] == {x.id: m.id, z.id: m.id, candidate.id: other.id}
+    assert _stored_rejections(db_session) == set()
+
+
+def test_try_swap_alternative_rereads_a_cluster_deleted_by_another_writer(db_session):
+    """Кластер прочитан, а в базе распущен: «не найден», а не запись в удалённую строку."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    db_session.commit()
+    match_id = m.id
+    _another_writer(
+        db_session, Product.__table__, Product.canonical_id == match_id, canonical_id=None
+    )
+    db_session.execute(Match.__table__.delete().where(Match.id == match_id))
+    db_session.commit()
+    assert db_session.get(Match, match_id) is m  # сессия о чужой записи не знает
+
+    outcome = ma.try_swap_alternative(db_session, match_id, "aloe", candidate.id)
+
+    assert outcome == ma.SwapOutcome(False, "match_not_found")
+    assert _stored_clusters(db_session) == ({x.id: None, z.id: None, candidate.id: None}, set())
+
+
+def test_try_swap_alternative_checks_members_as_they_are_in_the_database(db_session):
+    """Товар кластера прочитан живым, а в базе его ссылка уже мёртвая."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    db_session.commit()
+    assert [p.url_dead_at for p in m.products] == [None, None]
+    _another_writer(
+        db_session,
+        Product.__table__,
+        Product.id == x.id,
+        url_dead_at=datetime.datetime(2026, 5, 30),
+    )
+    assert x.url_dead_at is None  # сессия о чужой записи не знает
+
+    outcome = ma.try_swap_alternative(db_session, m.id, "aloe", candidate.id)
+
+    assert outcome == ma.SwapOutcome(False, f"offer:dead_url product={x.id} site=pharmonline")
+
+
+def test_try_swap_alternative_keeps_what_the_caller_has_not_flushed(db_session):
+    """Чтение из базы не затирает правки вызывающего, ещё не записанные сессией."""
+    m, [x, z] = _make_match_cluster(db_session, "Aspirin", ["pharmonline", "aloe"])
+    candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    db_session.commit()
+    m.canonical_name = "renamed cluster"  # autoflush выключен: в базе пока прежнее
+    candidate.name = "renamed candidate"
+    x.name = "renamed member"
+
+    assert ma.swap_alternative(db_session, m.id, "aloe", candidate.id) is True
+
+    assert db_session.scalar(select(Match.canonical_name)) == "renamed cluster"
+    names = dict(db_session.execute(select(Product.id, Product.name)).all())
+    assert (names[candidate.id], names[x.id]) == ("renamed candidate", "renamed member")
+
+
+# --- swap_alternative: на сайте в кластере больше одного товара ----------------
+#
+# Быть так не должно (один товар сайта на кластер), но бывало: замена, пришедшая
+# во время этапа, оставляла рядом прежний и новый. Оператор называет товар сайта
+# для сравнения — после замены на сайте остаётся он один.
+
+
+def _cluster_with_two_aloe(s) -> tuple[Match, Product, Product, Product]:
+    m, [x, z1] = _make_match_cluster(s, "Aspirin", ["pharmonline", "aloe"])
+    z2 = _make_product(s, site="aloe", external_id="aloe-second", name="Aspirin", canonical_id=m.id)
+    s.commit()
+    return m, x, z1, z2
+
+
+def test_swap_alternative_removes_every_product_of_the_site(db_session):
+    m, x, z1, z2 = _cluster_with_two_aloe(db_session)
+    candidate = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    db_session.commit()
+
+    with capture_logs() as logs:
+        assert ma.swap_alternative(db_session, m.id, "aloe", candidate.id) is True
+
+    assert _stored_clusters(db_session) == (
+        {x.id: m.id, z1.id: None, z2.id: None, candidate.id: m.id},
+        {m.id},
+    )
+    assert _stored_rejections(db_session) == {_pair(z1, candidate), _pair(z2, candidate)}
+    assert db_session.scalar(select(Match.is_manual)) is True
+    swapped = [entry for entry in logs if entry["event"] == "match_swapped"]
+    assert [(entry["old"], entry["new"]) for entry in swapped] == [([z1.id, z2.id], candidate.id)]
+
+
+@pytest.mark.parametrize("keep", ["first", "second"])
+def test_swap_alternative_to_one_of_two_products_of_the_site_removes_the_other(db_session, keep):
+    """Оператор назвал одного из двух — второй уходит, какой бы из них ни был раньше по id."""
+    m, x, z1, z2 = _cluster_with_two_aloe(db_session)
+    kept, removed = (z1, z2) if keep == "first" else (z2, z1)
+
+    assert ma.try_swap_alternative(db_session, m.id, "aloe", kept.id, dry_run=True).accepted
+    assert ma.swap_alternative(db_session, m.id, "aloe", kept.id) is True
+
+    assert _stored_clusters(db_session) == ({x.id: m.id, kept.id: m.id, removed.id: None}, {m.id})
+    assert _stored_rejections(db_session) == {_pair(kept, removed)}
+    assert db_session.scalar(select(Match.is_manual)) is True
+    # Теперь он на сайте один — повторная замена на него же отклоняется.
+    assert ma.try_swap_alternative(db_session, m.id, "aloe", kept.id) == ma.SwapOutcome(
+        False, "already_current"
+    )
+
+
+# --- замок сопоставления определён один раз -----------------------------------
+
+
+def test_the_matcher_lock_has_one_definition():
+    """Этап и ручные операции берут один и тот же замок, а не два с одним ключом.
+
+    Два помощника в разных модулях расходятся молча: замок с другим ключом
+    берётся без ошибки и ничего не сериализует. Ловит второе определение по
+    ключу-строке и по вызову `pg_advisory_*` рядом с именем константы. Не ловит
+    ключ, собранный из частей, и вызов `pg_advisory_*` с числом вместо
+    `hashtext(ключ)` — такой помощник под именем уже существующего ловит
+    сверка объектов в начале.
+    """
+    assert ma.acquire_match_mutation_xact_lock is match_lock.acquire_match_mutation_xact_lock
+    for name in (
+        "MATCH_MUTATION_ADVISORY_LOCK_KEY",
+        "acquire_match_mutation_xact_lock",
+        "acquire_match_mutation_lock",
+        "release_match_mutation_lock",
+    ):
+        assert getattr(matcher, name) is getattr(match_lock, name), name
+
+    root = Path(__file__).resolve().parent.parent
+    spell_the_key: list[str] = []
+    lock_by_the_constant: list[str] = []
+    for folder in ("src", "scripts", "migrations", "infra"):
+        for path in sorted((root / folder).rglob("*")):
+            if path.suffix not in {".py", ".sql", ".sh"}:
+                continue
+            text = path.read_text(encoding="utf-8")
+            relative = str(path.relative_to(root))
+            if match_lock.MATCH_MUTATION_ADVISORY_LOCK_KEY in text:
+                spell_the_key.append(relative)
+            if "MATCH_MUTATION_ADVISORY_LOCK_KEY" in text and "pg_advisory" in text:
+                lock_by_the_constant.append(relative)
+
+    assert spell_the_key == ["src/match_lock.py"]
+    assert lock_by_the_constant == ["src/match_lock.py"]
 
 
 def test_list_rejections_for_product(db_session):
