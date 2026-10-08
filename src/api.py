@@ -1001,7 +1001,9 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
             to=[email],
         )
     except Exception as e:
-        log.warning("login_link_email_failed", error=str(e), email=email)
+        from src.notifier import delivery_error_fields
+
+        log.warning("login_link_email_failed", user_id=user.id, **delivery_error_fields(e))
     return True
 
 
@@ -1889,7 +1891,6 @@ def dash_recipients_create(
     log.info(
         "recipient_created",
         id=new_user.id,
-        email=new_user.email,
         by_user_id=user.id,
         invite_sent=invite_sent,
     )

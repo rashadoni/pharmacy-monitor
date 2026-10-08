@@ -77,7 +77,9 @@ def send_daily_digest(
         notifier.send_email(subject=subject, html_body=html)
         log.info("digest_sent", subject=subject, events=len(events_sorted), total=total_in_window)
     except Exception as exc:
-        log.error("digest_email_failed", error=str(exc))
+        from src.notifier import delivery_error_fields
+
+        log.error("digest_email_failed", **delivery_error_fields(exc))
         return 0
 
     return len(events_sorted)

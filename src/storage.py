@@ -23,6 +23,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -327,13 +328,21 @@ class PharmonlinePublicAPIIdentityReconciliation(Base):
             "public_api_external_id",
             name="uq_pharmonline_public_api_reconciliation_public_id",
         ),
+        # Индексы трёх журналов личностей названы так, как их создают миграции
+        # 0019–0021 и как они стоят в боевой базе: без «identity_» в имени.
+        # `index=True` дал бы имя по таблице — второе, которого в базе нет.
+        Index("ix_pharmonline_public_api_reconciliations_tenant_id", "tenant_id"),
+        Index("ix_pharmonline_public_api_reconciliations_product_id", "product_id"),
+        Index(
+            "ix_pharmonline_public_api_reconciliations_public_id",
+            "public_api_external_id",
+        ),
+        Index("ix_pharmonline_public_api_reconciliations_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
-    product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="RESTRICT"), index=True
-    )
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"))
     legacy_external_id: Mapped[str] = mapped_column(String(200))
     public_api_external_id: Mapped[str] = mapped_column(String(200))
     legacy_canonical_url: Mapped[str] = mapped_column(String(500))
@@ -343,7 +352,7 @@ class PharmonlinePublicAPIIdentityReconciliation(Base):
     catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
     source_transport: Mapped[str] = mapped_column(String(40))
     preflight_run_ref: Mapped[str] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class PharmonlinePublicAPIIdentityAdmission(Base):
@@ -369,13 +378,15 @@ class PharmonlinePublicAPIIdentityAdmission(Base):
             "public_api_external_id",
             name="uq_pharmonline_public_api_admission_public_id",
         ),
+        Index("ix_pharmonline_public_api_admissions_tenant_id", "tenant_id"),
+        Index("ix_pharmonline_public_api_admissions_product_id", "product_id"),
+        Index("ix_pharmonline_public_api_admissions_public_id", "public_api_external_id"),
+        Index("ix_pharmonline_public_api_admissions_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
-    product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="RESTRICT"), index=True
-    )
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"))
     # ``existing_native_id`` means the exact native ID and URL were already
     # stored. ``new_public_product`` means no Product with that ID or URL was
     # present in any tenant before the guarded creation.
@@ -387,7 +398,7 @@ class PharmonlinePublicAPIIdentityAdmission(Base):
     catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
     source_transport: Mapped[str] = mapped_column(String(40))
     preflight_run_ref: Mapped[str] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class PharmonlinePublicAPIIdentityQuarantine(Base):
@@ -423,15 +434,21 @@ class PharmonlinePublicAPIIdentityQuarantine(Base):
             "public_api_external_id",
             name="uq_pharmonline_public_api_quarantine_public_id",
         ),
+        Index("ix_pharmonline_public_api_quarantines_tenant_id", "tenant_id"),
+        Index("ix_pharmonline_public_api_quarantines_legacy_product_id", "legacy_product_id"),
+        Index(
+            "ix_pharmonline_public_api_quarantines_replacement_product_id",
+            "replacement_product_id",
+        ),
+        Index("ix_pharmonline_public_api_quarantines_public_id", "public_api_external_id"),
+        Index("ix_pharmonline_public_api_quarantines_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
-    legacy_product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="RESTRICT"), index=True
-    )
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1)
+    legacy_product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"))
     replacement_product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="RESTRICT"), index=True
+        ForeignKey("products.id", ondelete="RESTRICT")
     )
     quarantine_kind: Mapped[str] = mapped_column(String(40))
     legacy_external_id: Mapped[str] = mapped_column(String(200))
@@ -444,7 +461,7 @@ class PharmonlinePublicAPIIdentityQuarantine(Base):
     catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
     source_transport: Mapped[str] = mapped_column(String(40))
     preflight_run_ref: Mapped[str] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class PharmonlinePublicAPICatalogBaseline(Base):
