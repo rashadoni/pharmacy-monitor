@@ -19,9 +19,11 @@
 - журналы перекодировок и нижней границы строку с `direct` не получают; нижнюю
   границу сверка напрямую не заводит и не двигает, а без неё отказывает
 - сам скрипт сверки на настоящем PostgreSQL: план и запись через `direct`
-  читают каталог по одному разу, запись отказывает, если её чтение разошлось с
-  одобренным планом; через Decodo — по-прежнему два чтения подряд и прежняя
-  версия
+  читают каталог по одному разу и одной попыткой, запись отказывает, если её
+  чтение разошлось с одобренным планом или её транспорт — не транспорт плана;
+  через Decodo — по-прежнему два чтения подряд, повторы и прежняя версия
+- версия доказательства, которую забыли внести в список «может менять
+  личности», пишет только простые допуски
 - код, который этой версии не знает, такие допуски не признаёт (так выглядит
   откат)
 
@@ -131,11 +133,11 @@ def test_direct_proof_version_is_a_data_contract():
     transports, kinds = main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF[MANUAL_DIRECT]
     assert transports == {"direct"}
     assert kinds == {"new_public_product", "existing_native_id"}
-    # Версии, с которыми запись не выполняет ничего, кроме простых допусков.
-    assert main_mod._PHARMONLINE_PUBLIC_API_PLAIN_ADMISSION_PROOF_VERSIONS == {
-        SCHEDULED,
-        MANUAL_DIRECT,
-    }
+    # Менять личности может одна версия — ручная сверка через свои транспорты.
+    assert main_mod._PHARMONLINE_PUBLIC_API_IDENTITY_TRANSITION_PROOF_VERSIONS == {MANUAL}
+    plain_only = main_mod._pharmonline_public_api_proof_version_is_plain_only
+    assert plain_only(MANUAL_DIRECT) and plain_only(SCHEDULED)
+    assert not plain_only(MANUAL)
 
 
 def test_manual_proof_version_still_has_no_direct_transport():
@@ -314,6 +316,32 @@ def test_plain_only_proof_version_refuses_a_split_even_through_decodo(db_session
 
     _assert_nothing_written(db_session, products=1)
     assert db_session.query(storage.Product).one().external_id == _meteor_id(1)
+
+
+def test_proof_version_nobody_listed_writes_plain_admissions_only(db_session, monkeypatch):
+    """Список версий, которым можно менять личности, — разрешающий. Будущая
+    версия, которой дали все транспорты и все классы, но в список не внесли,
+    перекодировку не выполнит."""
+    rules = dict(main_mod._PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF)
+    rules["future_v1"] = rules[MANUAL]
+    monkeypatch.setattr(main_mod, "_PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF", rules)
+    assert main_mod._pharmonline_public_api_proof_version_is_plain_only("future_v1")
+    db_session.add(
+        _stored(1, "legacy-product", external_id="legacy-product", availability_source=None)
+    )
+    db_session.commit()
+
+    with pytest.raises(ReconciliationError, match="is limited to plain admissions"):
+        _apply(
+            db_session,
+            _catalog(_api(1, "legacy-product")),
+            source_transport="decodo",
+            admission_proof_version="future_v1",
+        )
+    db_session.rollback()
+
+    _assert_nothing_written(db_session, products=1)
+    assert db_session.query(storage.Product).one().external_id == "legacy-product"
 
 
 def test_direct_reconciliation_refuses_an_unproven_address_change(db_session):
@@ -551,6 +579,71 @@ def test_baseline_ledger_never_gets_a_direct_row(db_session, existing_floor):
     assert _baseline_count(db_session) == (0 if existing_floor is None else 1)
 
 
+# ─── Чтение каталога скриптом: сколько раз ───────────────────────────────────
+
+
+def _discarded_read(reason: str):
+    """Чтение, которое скрейпер отбросил целиком: каталог менялся на ходу."""
+    return ScrapeResult(
+        site="pharmonline",
+        products=[],
+        route_statuses={PUBLIC_CATALOG_ROUTE: RouteStatus(complete=False, abort_reason=reason)},
+    )
+
+
+class _Reads:
+    def __init__(self, monkeypatch, *results) -> None:
+        self.results = list(results)
+        self.count = 0
+        self.pauses: list[float] = []
+        reads = self
+
+        class FakeScraper:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                return None
+
+            async def scrape(self, routes):
+                reads.count += 1
+                return reads.results.pop(0) if len(reads.results) > 1 else reads.results[0]
+
+        async def pause(seconds):
+            reads.pauses.append(seconds)
+
+        monkeypatch.setattr(reconciliation, "PharmonlinePublicAPIScraper", FakeScraper)
+        monkeypatch.setattr(reconciliation.asyncio, "sleep", pause)
+
+
+RETRYABLE = "products_metadata_changed_during_pagination"
+
+
+async def test_direct_read_is_one_attempt_and_is_not_retried(monkeypatch):
+    """Отброшенное чтение через прокси повторяют из новой сессии. Напрямую
+    повтор — ещё одно полное чтение с адреса прод-сервера, который сайт
+    ограничивает: скрипт падает, оператор запускает позже."""
+    assert reconciliation.is_retryable_full_catalog_abort_reason(RETRYABLE)
+    reads = _Reads(monkeypatch, _discarded_read(RETRYABLE), _catalog_result(_api(1, "known")))
+
+    with pytest.raises(SystemExit, match=f"abort_reason={RETRYABLE}, attempts=1"):
+        await reconciliation.read_verified_catalog(single_pass=True)
+
+    assert (reads.count, reads.pauses) == (1, [])
+
+
+async def test_proxied_read_still_retries_a_discarded_pass_and_reads_twice(monkeypatch):
+    catalog = _catalog_result(_api(1, "known"))
+    reads = _Reads(monkeypatch, _discarded_read(RETRYABLE), catalog)
+
+    result = await reconciliation.read_verified_catalog(single_pass=False)
+
+    # отброшенное, повтор, второй проход
+    assert reads.count == 3
+    assert reads.pauses == [1]
+    assert [product.external_id for product in result.products] == [_meteor_id(1)]
+
+
 # ─── Сам скрипт сверки, на настоящем PostgreSQL ──────────────────────────────
 #
 # Скрипт берёт замок сбора, читает план в транзакции READ ONLY и пишет под
@@ -646,6 +739,7 @@ def stand(monkeypatch, tmp_path) -> Iterator["Stand"]:
             "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_CATALOG_FINGERPRINT_SHA256",
             "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_MANIFEST_SHA256",
             "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_PRODUCT_COUNT",
+            "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT",
         ):
             monkeypatch.delenv(variable, raising=False)
         yield Stand(sessionmaker(engine, expire_on_commit=False), site, monkeypatch, tmp_path)
@@ -678,9 +772,10 @@ class Stand:
         await reconciliation.main(apply=False)
         return json.loads(self.evidence_path.read_text())
 
-    async def apply(self, transport: str, evidence: dict) -> None:
+    async def apply(self, transport: str, evidence: dict, **environment: str) -> None:
         """Запись с тем, что workflow берёт из одобренного плана."""
         for variable, value in {
+            "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT": evidence["transport"],
             "PHARMONLINE_PUBLIC_API_TRANSPORT": transport,
             "PHARMONLINE_PUBLIC_API_SOURCE_MANIFEST_SHA256": "c" * 64,
             "PHARMONLINE_PUBLIC_API_PREFLIGHT_RUN_REF": PLAN_RUN,
@@ -691,6 +786,7 @@ class Stand:
                 "candidate_manifest_sha256"
             ],
             "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_PRODUCT_COUNT": str(evidence["product_count"]),
+            **environment,
         }.items():
             self.monkeypatch.setenv(variable, value)
         await reconciliation.main(apply=True)
@@ -792,6 +888,48 @@ async def test_script_refuses_a_direct_apply_when_its_read_differs_from_the_plan
     with pytest.raises(SystemExit, match="fresh catalog differs from the approved read-only plan"):
         await stand.apply("direct", evidence)
 
+    assert stand.state() == before
+
+
+async def test_script_refuses_a_direct_apply_when_one_product_was_swapped_for_another(
+    stand: Stand,
+):
+    """Товаров столько же, сколько в плане, но один другой: по числу не отличить,
+    отпечаток каталога другой."""
+    stored, catalog = _burst()
+    stand.seed(*stored, _baseline(3))
+    stand.site.serve(catalog)
+    evidence = await stand.plan("direct")
+    before = stand.state()
+    stand.site.serve((*catalog[:-1], _api(6, "new-6")))
+
+    with pytest.raises(SystemExit, match="fresh catalog differs from the approved read-only plan"):
+        await stand.apply("direct", evidence)
+
+    assert stand.state() == before
+
+
+@pytest.mark.parametrize(
+    ("planned", "applied"), [("decodo", "direct"), ("direct", "decodo"), ("direct", "direct")]
+)
+async def test_script_applies_only_through_the_transport_of_its_plan(
+    stand: Stand, planned: str, applied: str
+):
+    """Workflow берёт транспорт записи из плана; скрипт сверяет и сам — до первого
+    чтения. Транспорт плана не назван вовсе — тоже отказ."""
+    stored, catalog = _burst()
+    stand.seed(*stored, _baseline(3))
+    stand.monkeypatch.setattr(main_mod, "_PHARMONLINE_PUBLIC_API_BOOTSTRAP_MIN_PRODUCTS", 2)
+    stand.site.serve(catalog)
+    evidence = await stand.plan(planned)
+    before = stand.state()
+    reads_after_plan = stand.site.reads
+    unnamed = {"PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT": ""} if planned == applied else {}
+
+    with pytest.raises(SystemExit, match="--apply must use the transport of the approved plan"):
+        await stand.apply(applied, evidence, **unnamed)
+
+    assert stand.site.reads == reads_after_plan
     assert stand.state() == before
 
 
@@ -919,22 +1057,3 @@ async def test_script_through_decodo_refuses_two_reads_that_differ(stand: Stand)
 
     assert stand.site.reads == 2
     assert not stand.evidence_path.exists()
-
-
-async def test_script_cannot_apply_a_decodo_plan_with_transitions_directly(stand: Stand):
-    """План одобрен через Decodo и содержит перекодировку; запись запущена с
-    `direct`. Совпавшие отпечатки не помогают: запись отказывает."""
-    stand.seed(
-        _stored(1, "known"),
-        _stored(2, "legacy", external_id="legacy", availability_source=None),
-        _baseline(1),
-    )
-    stand.site.serve((_api(1, "known"), _api(2, "legacy")))
-    evidence = await stand.plan("decodo")
-    before = stand.state()
-
-    with pytest.raises(ReconciliationError, match="direct reconciliation is limited to plain"):
-        await stand.apply("direct", evidence)
-
-    assert stand.state() == before
-    assert before["reconciliations"] == 0

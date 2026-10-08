@@ -185,9 +185,10 @@ jobs:
           set -euo pipefail
           work_dir=$1
           source_manifest_sha=$2
+          plan_transport=$3
           # Decodo settings are passed only with Decodo: a direct plan must not
           # depend on it.
-          case "$3" in
+          case "$plan_transport" in
             decodo)
               transport_env=(
                 PHARMONLINE_PUBLIC_API_TRANSPORT=decodo
@@ -241,6 +242,41 @@ jobs:
               f"script={script.relative_to(runtime)}"
           )
           PY
+
+          # The apply workflow makes the same check before it writes.  Here it
+          # saves a catalog read from this host and an approval that could not
+          # be used.
+          if [ "$plan_transport" = direct ]; then
+            # Admissions written by a direct reconciliation carry their own
+            # proof version.  The nightly timer runs the deployed code, not
+            # this checkout: code that does not know that version treats the
+            # admitted products as unknown and fails every night until it is
+            # deployed.  Ask the deployed code itself, before the catalog is
+            # read and before anything is written; anything but an explicit
+            # yes refuses.  (No command substitution around the here-document:
+            # bash 5.2 fails to parse one after a continued line.)  The answer
+            # goes to a file in this run's own fresh work directory.
+            deployed_code_answer="$work_dir/deployed-code-knows-direct"
+            (
+              cd /opt/pharmacy-monitor || exit 1
+              PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/pharmacy-monitor \
+                /opt/pharmacy-monitor/.venv/bin/python - > "$deployed_code_answer" <<'PY'
+          from pathlib import Path
+
+          from src import main
+
+          # The deployed copy, not the staged one and not an installed package.
+          assert Path(main.__file__).resolve() == Path("/opt/pharmacy-monitor/src/main.py").resolve()
+          rules = getattr(main, "_PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF", {})
+          print("yes" if "public_api_manual_direct_admission_v1" in rules else "no")
+          PY
+            ) || true
+            if [ "$(cat "$deployed_code_answer" 2>/dev/null || true)" != yes ]; then
+              echo "refusing direct reconciliation: the deployed code does not recognise direct admissions (public_api_manual_direct_admission_v1); deploy this commit with deploy.yml first, then dispatch again" >&2
+              exit 1
+            fi
+            echo "deployed code recognises direct admissions"
+          fi
 
           # EnvironmentFile values are literal systemd values, not shell code.
           while IFS= read -r line || [ -n "$line" ]; do

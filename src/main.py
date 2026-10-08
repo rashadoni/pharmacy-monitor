@@ -155,15 +155,13 @@ _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF = {
         _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_KINDS,
     ),
 }
-# Версии, с которыми запись выполняет только простые допуски: ни перекодировки,
-# ни смены адреса, ни разведения. Список явный, а не выведенный из классов выше:
-# версия, которой разрешили новый класс допуска, не должна заодно получить право
-# менять идентификаторы и адреса.
-_PHARMONLINE_PUBLIC_API_PLAIN_ADMISSION_PROOF_VERSIONS = frozenset(
-    {
-        _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION,
-        _PHARMONLINE_PUBLIC_API_MANUAL_DIRECT_ADMISSION_PROOF_VERSION,
-    }
+# Версии, с которыми запись может менять личности: перекодировка, смена адреса,
+# разведение. Список разрешающий: версия, которой здесь нет, — и любая будущая,
+# которую забудут сюда внести, — пишет только простые допуски. Он отдельный, а
+# не выведен из классов выше: версия, которой разрешили новый класс допуска, не
+# должна заодно получить право менять идентификаторы и адреса.
+_PHARMONLINE_PUBLIC_API_IDENTITY_TRANSITION_PROOF_VERSIONS = frozenset(
+    {_PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION}
 )
 # Потолок автодопуска за один прогон. Недельный приток новых товаров за
 # июнь–сентябрь 2026 — от 6 до ~60 (при сборе раз в неделю это и есть размер
@@ -1409,6 +1407,13 @@ def _pharmonline_public_api_manual_admission_proof_version(source_transport: str
     return _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION
 
 
+def _pharmonline_public_api_proof_version_is_plain_only(admission_proof_version: str) -> bool:
+    """С этой версией доказательства запись выполняет только простые допуски."""
+    return (
+        admission_proof_version not in _PHARMONLINE_PUBLIC_API_IDENTITY_TRANSITION_PROOF_VERSIONS
+    )
+
+
 def _pharmonline_public_api_plain_admission_refusal(
     admission_proof_version: str,
     actions: list[_PharmonlinePublicAPIReconciliationAction],
@@ -1421,7 +1426,7 @@ def _pharmonline_public_api_plain_admission_refusal(
     из них одних. Возвращает счётчики без идентификаторов и адресов: строка идёт
     в журнал шага Actions, а он открыт.
     """
-    if admission_proof_version not in _PHARMONLINE_PUBLIC_API_PLAIN_ADMISSION_PROOF_VERSIONS:
+    if not _pharmonline_public_api_proof_version_is_plain_only(admission_proof_version):
         return None
     _, allowed_kinds = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF[admission_proof_version]
     other_kinds = sum(1 for action in admissions if action.admission_kind not in allowed_kinds)

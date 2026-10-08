@@ -321,9 +321,16 @@ jobs:
                 DECODO_SITES=pharmonline
                 PHARMONLINE_DECODO_BACKCONNECT_STICKY=1
               )
+              # A failed publication is retried from a fresh Decodo session.
+              publish_attempts=3
               ;;
             direct)
               transport_env=(PHARMONLINE_PUBLIC_API_TRANSPORT=direct)
+              # Directly there is no fresh session: a retry is one more full
+              # read from this host's own address, which the source limits
+              # (429) and which the nightly collection needs.  One attempt; a
+              # failure is left to that collection or to a later dispatch.
+              publish_attempts=1
               ;;
             *)
               echo "invalid approved plan transport" >&2
@@ -388,11 +395,11 @@ jobs:
             # proof version.  The nightly timer runs the deployed code, not
             # this checkout: code that does not know that version treats the
             # admitted products as unknown and fails every night until it is
-            # deployed.  Ask the deployed code itself, before anything is
-            # written; anything but an explicit yes refuses.  (No command
-            # substitution around the here-document: bash 5.2 fails to parse
-            # one after a continued line.)
-            # The answer goes to a file in this run's own fresh work directory.
+            # deployed.  Ask the deployed code itself, before the catalog is
+            # read and before anything is written; anything but an explicit
+            # yes refuses.  (No command substitution around the here-document:
+            # bash 5.2 fails to parse one after a continued line.)  The answer
+            # goes to a file in this run's own fresh work directory.
             deployed_code_answer="$work_dir/deployed-code-knows-direct"
             (
               cd /opt/pharmacy-monitor || exit 1
@@ -409,7 +416,7 @@ jobs:
           PY
             ) || true
             if [ "$(cat "$deployed_code_answer" 2>/dev/null || true)" != yes ]; then
-              echo "refusing direct reconciliation: the deployed code does not recognise direct admissions (public_api_manual_direct_admission_v1); deploy this commit with deploy.yml first, then dispatch this workflow again with the same plan" >&2
+              echo "refusing direct reconciliation: the deployed code does not recognise direct admissions (public_api_manual_direct_admission_v1); deploy this commit with deploy.yml first, then dispatch again" >&2
               exit 1
             fi
             echo "deployed code recognises direct admissions"
@@ -542,6 +549,7 @@ jobs:
           PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_CATALOG_FINGERPRINT_SHA256="$expected_plan_fingerprint" \
           PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_MANIFEST_SHA256="$expected_plan_manifest" \
           PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_PRODUCT_COUNT="$expected_plan_product_count" \
+          PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT="$plan_transport" \
           PYTHONDONTWRITEBYTECODE=1 \
           PYTHONPATH="$runtime_dir" \
           /opt/pharmacy-monitor/.venv/bin/python \
@@ -584,8 +592,8 @@ jobs:
 
           publish_attempt=1
           publish_succeeded=0
-          while [ "$publish_attempt" -le 3 ]; do
-            echo "verified catalog publication attempt ${publish_attempt}/3"
+          while [ "$publish_attempt" -le "$publish_attempts" ]; do
+            echo "verified catalog publication attempt ${publish_attempt}/${publish_attempts}"
             if env "${transport_env[@]}" \
               PHARMONLINE_PUBLIC_API=required \
               PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \
@@ -603,7 +611,7 @@ jobs:
               publish_succeeded=1
               break
             fi
-            if [ "$publish_attempt" -lt 3 ]; then
+            if [ "$publish_attempt" -lt "$publish_attempts" ]; then
               echo "verified catalog publication attempt failed; waiting 60s before a fresh session" >&2
               sleep 60
             fi

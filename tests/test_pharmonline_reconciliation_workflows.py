@@ -17,8 +17,12 @@ tests/test_prod_db_revision_gate.py):
   через `direct` в свидетельстве не должно быть ни одного перехода личности
 - запись: транспорт берётся из свидетельства плана и доходит и до скрипта
   записи, и до сбора, публикующего каталог; своего параметра у workflow нет
-- запись через `direct` отказывает до базы и до бэкапа, пока выложенный код не
-  знает допусков сверки напрямую (иначе ночной таймер падал бы до выкладки)
+- и план, и запись через `direct` отказывают, пока выложенный код не знает
+  допусков сверки напрямую (иначе ночной таймер падал бы до выкладки): план —
+  до чтения каталога, запись — до базы и до бэкапа; сторож в обоих один и тот же
+- между записью и сбором, публикующим каталог, выдерживается пауза; через
+  Decodo сбор повторяется до трёх раз, напрямую — одна попытка (каждая — полное
+  чтение с адреса сервера)
 - цепочка целиком: свидетельство, которое оставил шаг плана, проходит проверку
   в workflow записи и приводит к записи тем же транспортом
 
@@ -92,7 +96,7 @@ if kind is not None:
         key: value
         for key, value in os.environ.items()
         if key.startswith(("DECODO_", "PHARMONLINE_DECODO_"))
-        or key == "PHARMONLINE_PUBLIC_API_TRANSPORT"
+        or key in ("PHARMONLINE_PUBLIC_API_TRANSPORT", "PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT")
     }
     with open(root / "calls.jsonl", "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"kind": kind, "env": passed}) + "\n")
@@ -140,6 +144,19 @@ if not source.startswith(prefix):
     sys.exit(f"stub scp: unexpected source {source}")
 shutil.copy(_sbx.to_sandbox(source[len(prefix) :]), destination)
 """,
+    # Паузы стенд не выдерживает, но записывает: между чем и сколько.
+    "sleep": r"""
+import json
+import os
+import pathlib
+import sys
+
+import _sbx
+
+_sbx.event("sleep")
+with open(pathlib.Path(os.environ["SBX_ROOT"]) / "calls.jsonl", "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"kind": "sleep", "seconds": sys.argv[1:]}) + "\n")
+""",
     # Артефакт плана: то, что оставил шаг плана в этом же стенде.
     "gh": r"""
 import os
@@ -161,7 +178,7 @@ shutil.copytree(artifact, args[args.index("--dir") + 1], dirs_exist_ok=True)
 class ReconciliationSandbox(Sandbox):
     """Стенд сверки: база на голове коммита, выбран транспорт, выложен какой-то код."""
 
-    def __init__(self, root: Path, *, transport: str = "decodo"):
+    def __init__(self, root: Path, *, transport: str = "decodo", deployed: str = "this commit"):
         super().__init__(root, db_state="at head")
         self.live = self.server / "opt" / "pharmacy-monitor"
         venv_python = self.live / ".venv" / "bin" / "python"
@@ -179,6 +196,7 @@ class ReconciliationSandbox(Sandbox):
             encoding="utf-8",
         )
         self.plan_metrics(PLAIN_METRICS)
+        self._deploy(deployed)
 
     def plan_metrics(self, metrics: dict, **evidence_override: object) -> None:
         (self.root / "plan-metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
@@ -228,7 +246,7 @@ class ReconciliationSandbox(Sandbox):
         path.write_text(json.dumps(evidence), encoding="utf-8")
         return path
 
-    def deploy(self, code: str) -> None:
+    def _deploy(self, code: str) -> None:
         """Код в живом каталоге сервера — тот, что исполняет ночной таймер."""
         deployed = self.live / "src"
         if code == "nothing":
@@ -262,6 +280,28 @@ class ReconciliationSandbox(Sandbox):
 def stand(tmp_path: Path) -> ReconciliationSandbox:
     assert shutil.which("rsync"), "стенду нужен rsync — без него шаги не исполнить"
     return ReconciliationSandbox(tmp_path)
+
+
+def _calls(stand: ReconciliationSandbox) -> list[tuple]:
+    """Что шаг сделал на сервере, по порядку: вызовы скрипта и сбора, паузы."""
+    return [(call["kind"], *call.get("seconds", ())) for call in stand.calls]
+
+
+def _guard(workflow: str) -> str:
+    """Текст сторожа выложенного кода в workflow."""
+    start = 'if [ "$plan_transport" = direct ]; then\n'
+    end = 'echo "deployed code recognises direct admissions"\n'
+    text = _workflow_text(workflow)
+    assert text.count(start) == text.count(end) == 1, workflow
+    return text[text.index(start) : text.index(end) + len(end)]
+
+
+OLD_DEPLOYMENTS = [
+    "nothing",
+    "nothing, but this commit is importable from elsewhere",
+    "before direct admissions",
+    "before any admission rules",
+]
 
 
 @pytest.fixture(scope="module")
@@ -337,10 +377,27 @@ def test_workflows_judge_a_direct_plan_by_counters_the_plan_really_reports(db_se
     )
     for key in (*TRANSITION_METRICS, "reconciliation_safe"):
         assert type(reported[key]) is int, key
+    # Новый класс плана («…_ready») заставит решить, переход ли он: пока этот
+    # список не поправят вместе с workflow, тест красный.
+    assert {key for key in reported if key.endswith("_ready")} == {
+        "legacy_rekeys_ready",
+        "native_id_url_rebind_ready",
+        "native_id_url_rebind_redirect_ready",
+        "identity_splits_ready",
+        "existing_native_admissions_ready",
+        "new_public_product_admissions_ready",
+    }
     listed = re.compile(r"for key in \(\n((?:\s+\"[a-z_]+\",\n)+)\s+\):\n\s+if type\(metrics")
     for workflow in (PLAN, RECOVER):
         (block,) = listed.findall(_workflow_text(workflow))
         assert tuple(re.findall(r'"([a-z_]+)"', block)) == TRANSITION_METRICS, workflow
+
+
+def test_plan_and_apply_ask_the_deployed_code_the_same_question():
+    """Сторож записан в двух файлах; разойдись они — план пропустил бы то, на
+    чём запись откажет (или наоборот)."""
+    assert _guard(PLAN) == _guard(RECOVER)
+    assert MANUAL_DIRECT in _guard(RECOVER)
 
 
 # ─── План ────────────────────────────────────────────────────────────────────
@@ -361,6 +418,34 @@ def test_plan_passes_the_chosen_transport_to_the_script(tmp_path: Path, transpor
     evidence = json.loads((stand.publish_plan_artifact() / "reconciliation-plan.json").read_text())
     assert evidence["transport"] == transport
     assert f"transport={transport}" in result.stdout
+
+
+@pytest.mark.parametrize("deployed", OLD_DEPLOYMENTS)
+def test_direct_plan_refuses_before_reading_until_the_deployed_code_knows_direct_admissions(
+    tmp_path: Path, deployed: str
+):
+    """Отказ до скрипта: ни чтения каталога с адреса сервера, ни плана, который
+    потом нельзя применить."""
+    stand = ReconciliationSandbox(tmp_path, transport="direct", deployed=deployed)
+
+    result = stand.run_step(PLAN, PLAN_STEP)
+
+    assert result.returncode != 0, _log(result)
+    assert (
+        "refusing direct reconciliation: the deployed code does not recognise direct admissions"
+        in result.stderr
+    ), _log(result)
+    assert stand.calls == []
+    assert stand.events == []
+
+
+def test_plan_through_decodo_does_not_ask_the_deployed_code(tmp_path: Path):
+    stand = ReconciliationSandbox(tmp_path, transport="decodo", deployed="nothing")
+
+    result = stand.run_step(PLAN, PLAN_STEP)
+
+    assert result.returncode == 0, _log(result)
+    assert "deployed code" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("transport", ["", "firecrawl", "Direct", "decodo' 'direct"])
@@ -513,8 +598,12 @@ def test_apply_step_refuses_an_unlisted_transport_before_any_production_command(
 def test_plan_and_apply_go_through_the_same_transport(tmp_path: Path, transport: str):
     """Цепочка целиком: шаг плана → его артефакт → проверка в workflow записи →
     запись и сбор тем же транспортом."""
-    stand = ReconciliationSandbox(tmp_path, transport=transport)
-    stand.deploy("this commit" if transport == "direct" else "nothing")
+    # Через Decodo выложенный код не спрашивают — на сервере его может и не быть.
+    stand = ReconciliationSandbox(
+        tmp_path,
+        transport=transport,
+        deployed="this commit" if transport == "direct" else "nothing",
+    )
     planned = stand.run_step(PLAN, PLAN_STEP)
     assert planned.returncode == 0, _log(planned)
     stand.publish_plan_artifact()
@@ -531,42 +620,46 @@ def test_plan_and_apply_go_through_the_same_transport(tmp_path: Path, transport:
     assert "sandbox: the scenario ends at the first catalog publication" in applied.stderr, _log(
         applied
     )
-    order = [kind for kind in stand.events if kind != "sleep"]
-    assert order == [
+    # До записи: сверка ревизии базы и бэкап (#44); миграция не зовётся.
+    assert [kind for kind in stand.events if kind not in ("sleep", "cli run")] == [
         "script",  # план
         "alembic current",
         "alembic heads",
         "backup",
         "script --apply",
-        "cli run",
-        "cli run",
-        "cli run",
     ], _log(applied)
-    assert [call["kind"] for call in stand.calls] == ["plan", "apply", "run", "run", "run"]
+    # После записи — пауза перед сбором, публикующим каталог: сайту дают остыть.
+    # Через Decodo упавший сбор повторяется из новой сессии до трёх раз; напрямую
+    # повтор — ещё одно полное чтение с адреса сервера, поэтому попытка одна.
+    publication = [("run",), ("sleep", "60"), ("run",), ("sleep", "60"), ("run",)]
+    assert _calls(stand) == [
+        ("plan",),
+        ("apply",),
+        ("sleep", "1860"),
+        *(publication if transport == "decodo" else publication[:1]),
+    ], _log(applied)
     for call in stand.calls:
+        if call["kind"] == "sleep":
+            continue
         assert call["env"].pop("PHARMONLINE_PUBLIC_API_TRANSPORT") == transport, call
+        # Скрипту записи транспорт плана назван ещё раз — он сверяет его со своим.
+        if call["kind"] == "apply":
+            assert call["env"].pop("PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT") == transport
         assert call["env"] == (DECODO_SETTINGS if transport == "decodo" else {}), call
-    # Сторож выложенного кода спрашивает только при записи напрямую.
-    assert ("deployed code recognises direct admissions" in applied.stdout) == (
-        transport == "direct"
-    )
+    # Сторож выложенного кода спрашивает только при сверке напрямую.
+    for step in (planned, applied):
+        assert ("deployed code recognises direct admissions" in step.stdout) == (
+            transport == "direct"
+        )
 
 
-@pytest.mark.parametrize(
-    "deployed",
-    [
-        "nothing",
-        "nothing, but this commit is importable from elsewhere",
-        "before direct admissions",
-        "before any admission rules",
-    ],
-)
+@pytest.mark.parametrize("deployed", OLD_DEPLOYMENTS)
 def test_direct_apply_refuses_until_the_deployed_code_knows_direct_admissions(
-    stand: ReconciliationSandbox, deployed: str
+    tmp_path: Path, deployed: str
 ):
     """Допуски сверки напрямую код до этой правки не признаёт: ночной таймер
     (он исполняет выложенный код, а не чекаут workflow) падал бы каждую ночь."""
-    stand.deploy(deployed)
+    stand = ReconciliationSandbox(tmp_path, deployed=deployed)
     stand.approve(PLAN_TRANSPORT="direct")
     before = stand.db_fingerprint()
 
@@ -584,10 +677,10 @@ def test_direct_apply_refuses_until_the_deployed_code_knows_direct_admissions(
     assert stand.db_fingerprint() == before
 
 
-def test_apply_through_decodo_does_not_ask_the_deployed_code(stand: ReconciliationSandbox):
+def test_apply_through_decodo_does_not_ask_the_deployed_code(tmp_path: Path):
     """Через Decodo пишется прежняя версия доказательства — её знает любой
     выложенный код, и сверка не должна зависеть от того, что лежит на сервере."""
-    stand.deploy("before direct admissions")
+    stand = ReconciliationSandbox(tmp_path, deployed="before direct admissions")
     stand.approve(PLAN_TRANSPORT="decodo")
 
     result = stand.run_step(RECOVER, APPLY_STEP)

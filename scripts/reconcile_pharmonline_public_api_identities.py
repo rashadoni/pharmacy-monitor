@@ -13,9 +13,13 @@ admits plain identities only (a new product, or a product already stored under
 the same ID and URL).  A plan that needs a legacy rekey, any URL move or a split
 is refused and must be rerun through Decodo.  It never creates or lowers the
 catalog floor.  Every read then leaves from the production host itself, so each
-invocation makes one catalog pass instead of two: the plan's pass and the
-apply's pass are the two fresh reads, and nothing is written unless the second
-equals the approved first.
+invocation makes one catalog pass, in one attempt, instead of two passes with
+retries: the plan's pass and the apply's pass are the two fresh reads, and
+nothing is written unless the second equals the approved first.  That is weaker
+than the proxied proof in one respect and is accepted knowingly: both reads
+come from the same address, so a catalog variant served consistently to this
+host would not be noticed, where two proxy exits would disagree.  The nightly
+collection reads from the same address and admits the same two classes.
 """
 
 from __future__ import annotations
@@ -31,7 +35,6 @@ from sqlalchemy import text
 
 from src import storage
 from src.main import (
-    _PHARMONLINE_PUBLIC_API_PLAIN_ADMISSION_PROOF_VERSIONS,
     PharmonlinePublicAPIReconciliationError,
     _PharmonlinePublicAPILegacySelfRedirectProof,
     _apply_pharmonline_public_api_reconciliation,
@@ -40,6 +43,7 @@ from src.main import (
     _pharmonline_public_api_catalog_fingerprint,
     _pharmonline_public_api_manual_admission_proof_version,
     _pharmonline_public_api_plain_admission_refusal,
+    _pharmonline_public_api_proof_version_is_plain_only,
     _pharmonline_public_api_reconciliation_plan,
     _pharmonline_public_api_reconciliation_plan_manifest_sha256,
     _pharmonline_public_api_reconciliation_is_safe,
@@ -64,9 +68,11 @@ def fail(message: str) -> NoReturn:
     raise SystemExit(f"Pharmonline public API reconciliation failed: {message}")
 
 
-async def read_catalog_pass(pass_name: str):
+async def read_catalog_pass(
+    pass_name: str, *, max_attempts: int = _MAX_FRESH_CATALOG_READ_ATTEMPTS
+):
     """Return one complete catalog or discard the entire inconsistent attempt."""
-    for attempt in range(1, _MAX_FRESH_CATALOG_READ_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         async with PharmonlinePublicAPIScraper() as scraper:
             result = await scraper.scrape([PUBLIC_CATALOG_ROUTE])
 
@@ -87,10 +93,7 @@ async def read_catalog_pass(pass_name: str):
             return result
 
         reason = route.abort_reason if route is not None else None
-        if (
-            is_retryable_full_catalog_abort_reason(reason)
-            and attempt < _MAX_FRESH_CATALOG_READ_ATTEMPTS
-        ):
+        if is_retryable_full_catalog_abort_reason(reason) and attempt < max_attempts:
             retry_delay = (
                 300
                 if reason
@@ -131,16 +134,17 @@ async def read_two_identical_catalogs():
 
 
 async def read_verified_catalog(*, single_pass: bool):
-    """Two identical back-to-back passes; one pass for a direct reconciliation.
+    """Two identical back-to-back passes; one attempt at one pass when direct.
 
     Direct reads all leave from the production host, and the source answers a
     host that reads the full catalog five times within an hour with 429 — the
-    same address the nightly collection depends on.  The second identical read
-    is not dropped, only moved: the apply's pass must equal the approved
-    plan's pass (fingerprint and product count) before anything is written.
+    same address the nightly collection depends on.  So a direct invocation
+    reads once and does not retry a discarded read: it fails, and the operator
+    dispatches again later.  The second read is the other invocation's: the
+    apply's pass must equal the approved plan's pass before anything is written.
     """
     if single_pass:
-        return await read_catalog_pass("direct pass")
+        return await read_catalog_pass("direct pass", max_attempts=1)
     return await read_two_identical_catalogs()
 
 
@@ -159,6 +163,21 @@ def _workflow_evidence() -> tuple[str, str]:
     if not source_manifest_sha256 or not preflight_run_ref:
         fail("--apply requires immutable exact-SHA workflow evidence")
     return source_manifest_sha256, preflight_run_ref
+
+
+def _require_plan_transport(transport: str) -> None:
+    """The apply goes through the transport its approved plan was made with.
+
+    The workflow passes the plan's transport twice: as the transport to use
+    and as the plan's.  A value overridden on the way (``src.main`` loads a
+    ``.env`` over the environment) or a crossed dispatch stops here, before
+    the first read.
+    """
+    plan_transport = (
+        os.environ.get("PHARMONLINE_PUBLIC_API_EXPECTED_PLAN_TRANSPORT", "").strip().lower()
+    )
+    if not plan_transport or plan_transport != transport:
+        fail("--apply must use the transport of the approved plan")
 
 
 def _expected_plan_evidence() -> tuple[str, str, int]:
@@ -270,8 +289,8 @@ async def main(*, apply: bool) -> None:
     # The transport names the proof version the admissions are written with:
     # direct has its own, limited to plain admissions.
     admission_proof_version = _pharmonline_public_api_manual_admission_proof_version(transport)
-    plain_admissions_only = (
-        admission_proof_version in _PHARMONLINE_PUBLIC_API_PLAIN_ADMISSION_PROOF_VERSIONS
+    plain_admissions_only = _pharmonline_public_api_proof_version_is_plain_only(
+        admission_proof_version
     )
     plan_refusal = None
     floor_refusal = None
@@ -282,6 +301,7 @@ async def main(*, apply: bool) -> None:
     expected_plan_manifest = ""
     expected_plan_product_count = 0
     if apply:
+        _require_plan_transport(transport)
         source_manifest_sha256, preflight_run_ref = _workflow_evidence()
         (
             expected_plan_fingerprint,
