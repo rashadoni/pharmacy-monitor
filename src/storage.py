@@ -364,6 +364,12 @@ class PharmonlinePublicAPIIdentityAdmission(Base):
     created from a fully verified public catalog.  Those two cases must remain
     explicit: a public-source admission is trusted only for the guarded public
     API path and never changes or impersonates DDP provenance.
+
+    Кто написал строку, видно по ``proof_version``: ручная сверка —
+    ``public_api_identity_admission_v1``; плановый сбор —
+    ``public_api_scheduled_admission_v1`` (тогда ``preflight_run_ref`` — номер
+    прогона из ``runs``, а ``source_manifest_sha256`` — хеш применённого плана).
+    Правила каждой версии — в ``main._pharmonline_public_api_admission_invalid_reason``.
     """
 
     __tablename__ = "pharmonline_public_api_identity_admissions"

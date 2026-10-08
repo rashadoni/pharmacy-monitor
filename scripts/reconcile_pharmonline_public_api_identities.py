@@ -22,6 +22,7 @@ from sqlalchemy import text
 
 from src import storage
 from src.main import (
+    _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION,
     _PharmonlinePublicAPILegacySelfRedirectProof,
     _apply_pharmonline_public_api_reconciliation,
     _diagnose_pharmonline_public_api_reconciliation,
@@ -367,6 +368,7 @@ async def main(*, apply: bool) -> None:
                         redirect_proofs=redirect_proofs,
                         legacy_self_redirect_proofs=legacy_self_redirect_proofs,
                         expected_plan_manifest_sha256=expected_plan_manifest,
+                        admission_proof_version=_PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION,
                     )
                     catalog_floor = _ensure_pharmonline_public_api_catalog_baseline(
                         session,
