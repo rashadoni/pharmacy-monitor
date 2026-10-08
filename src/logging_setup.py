@@ -72,6 +72,20 @@ def masking(renderer):
     return render
 
 
+class MaskingFormatter(logging.Formatter):
+    """Формат корневых обработчиков stdlib `logging`: адреса вырезаются из строки.
+
+    `masking` стоит на structlog, а в тот же вывод пишут ещё и сторонние
+    библиотеки — через корневые обработчики, мимо него. Источника адреса среди
+    них не найдено; формат стоит, чтобы появление такого источника ничего не
+    изменило. Вырезается всё, что обработчик выведет: сообщение, трассировка,
+    `stack_info`.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return mask_addresses(super().format(record))
+
+
 def configure_logging(service: str = "app") -> None:
     """Configure structlog → either JSON (production) or pretty (dev).
 
@@ -111,7 +125,7 @@ def configure_logging(service: str = "app") -> None:
 
     # Stdlib logging → forward to structlog so 3rd-party libs get same format
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setFormatter(MaskingFormatter("%(message)s"))
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
@@ -129,7 +143,7 @@ def configure_logging(service: str = "app") -> None:
             backupCount=backups,
             encoding="utf-8",
         )
-        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        file_handler.setFormatter(MaskingFormatter("%(message)s"))
         root.addHandler(file_handler)
 
 
