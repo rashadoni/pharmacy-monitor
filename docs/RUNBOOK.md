@@ -234,6 +234,15 @@ GitHub; хранится он 90 дней. Еженедельный сбор pha
   Пишутся класс ошибки и код ответа: `**notifier.delivery_error_fields(exc)`.
   Отказ SMTP выходит из `notifier.send_email` как `EmailDeliveryError` уже без
   адреса в тексте — на случай, если ошибку поймают выше и напечатают целиком.
+- Текст ошибки базы в журнал тоже не идёт там, где код работает с тем, что
+  прислал человек. SQLAlchemy кладёт в текст своей ошибки параметры запроса:
+  `/start <адрес>` боту ищет пользователя по адресу и записывает ему chat_id.
+  Адрес из строки вырезала бы маска, chat_id — число, его она не видит. Пишется
+  `**logging_setup.error_fields(exc)`: класс ошибки, код PostgreSQL (`sqlstate`)
+  и последняя строка нашего кода (`error_at`), без текста и трассировки. Так
+  пишут все три обработчика Telegram-бота (`src/telegram_bot.py`); из сообщения,
+  которое боту прислали, они не пишут ничего. Журнал бота — journald сервера,
+  не Actions. Как разбирать сбой команды — «Telegram бот молчит».
 - Вывод журнала CLI вырезает из готовой строки всё, что похоже на адрес
   (`logging_setup.masking` у structlog, `logging_setup.MaskingFormatter` у
   stdlib `logging`, которым пишут сторонние библиотеки), — последняя линия, а
@@ -243,7 +252,9 @@ GitHub; хранится он 90 дней. Еженедельный сбор pha
 
 Возврат ловит `tests/test_log_carries_no_address.py`: читает в `src/` вызовы
 журнала, `print` и `click.echo` и зовёт почтовые пути, у которых есть свой
-обработчик сбоя. Маска стоит только на журнале CLI. Мимо неё идут `click.echo`
+обработчик сбоя. Журнал бота держит `tests/test_telegram_bot.py`: бот
+запускается как на сервере, с настоящей ошибкой базы. Маска стоит только на
+журнале CLI. Мимо неё идут `click.echo`
 и `print`, а журнал API не замаскирован вовсе — он пишет в journald и наружу не
 выходит. Команды, которые печатают адрес по назначению, перечислены в том же
 тесте (`recipient …`, `tenant add-user`, `tenant issue-token` — последняя
@@ -252,8 +263,14 @@ GitHub; хранится он 90 дней. Еженедельный сбор pha
 отправки: `notify test` (оператору в терминал) и `health-check` (в journald
 сервера). Тест видит запуск команды CLI; код, который workflow зовёт
 встроенным Python, он не читает. Новая строка в этих списках — решение
-владельца, а не правка теста. `telegram poll` печатает имена и идентификаторы из Telegram — тоже
-только руками.
+владельца, а не правка теста. Третий список там же и под тем же запретом —
+команды, которые печатают входящие сообщения Telegram: `telegram poll`
+показывает оператору, кто написал боту (имя, идентификатор чата) и что написал,
+а в тексте бывает `/start <адрес>`.
+
+Чего это не закрывает: сам отправитель Telegram (`notifier.send_telegram_message`,
+`notifier.telegram_get_updates`) о своём сбое пишет текст ошибки и ответ
+Telegram как есть.
 
 Если адрес в журнал Actions всё же попал — журнал прогона удаляется целиком,
 необратимо и только по слову владельца:
@@ -483,6 +500,33 @@ grep TELEGRAM_BOT_TOKEN /opt/pharmacy-monitor/.env
 sudo -u pharmacy uv run --directory /opt/pharmacy-monitor pharmacy-monitor \
   telegram send-test CHAT_ID --text "manual test"
 ```
+
+**Бот ответил «❌ Ошибка: …».** В журнале бота (юнит из `infra/systemd/` —
+`pharmacy-monitor-telegram-bot`; на сервере, поднятом старым
+`provision_vps.sh`, — `pharmacy-monitor-telegram`) одна строка, без текста
+ошибки и без трассировки:
+
+```
+telegram_command_failed cmd=/start error_at='notifications.py:405 in bind_telegram' error_type=OperationalError
+```
+
+`error_at` — последняя строка `src/`, через которую прошла ошибка; у ошибки
+PostgreSQL рядом стоит её код, `sqlstate`. Почему текста нет — «Адреса в журнал
+не пишутся». Текст нужен — команду зовут руками, и он остаётся в терминале
+оператора:
+
+```bash
+# на сервере, под pm, с загруженным env
+set -a; source /etc/pharmacy-monitor/env; set +a
+.venv/bin/python - <<'PY'
+from src import storage, telegram_bot
+with storage.make_session()() as session:
+    print(telegram_bot.cmd_today(session, "0", ""))   # cmd_alerts, cmd_status
+PY
+```
+
+`/start` так не повторять: при удаче он запишет привязку чата. Что у него
+упало — поиск пользователя или запись — видно по строке в `error_at`.
 
 ### Замок сопоставления потерян посреди этапа
 

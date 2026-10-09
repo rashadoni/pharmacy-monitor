@@ -4578,7 +4578,13 @@ def telegram_poll(once: bool) -> None:
     """Poll Telegram bot — показать последние сообщения с chat_id'ами.
 
     Использование: попроси клиента написать боту любое сообщение, потом запусти
-    эту команду чтобы увидеть его chat_id и привязать через `recipient update`.
+    эту команду, чтобы увидеть его chat_id — для `telegram send-test` и
+    `notify test --chat-id`. К пользователю чат привязывает сам клиент:
+    `/start <email>` боту (`telegram run-bot`).
+
+    Печатает сообщения как есть — имя, chat_id, начало текста — в терминал
+    оператора. Из workflow не запускать: журнал шага Actions публичен
+    (`tests/test_log_carries_no_address.py`).
     """
     from src import notifier
 

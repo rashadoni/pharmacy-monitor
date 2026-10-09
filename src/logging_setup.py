@@ -97,6 +97,47 @@ class MaskingFormatter(logging.Formatter):
         return mask_addresses(text)
 
 
+_SRC_PREFIX = os.path.dirname(os.path.abspath(__file__)) + os.sep
+_SQLSTATE_RE = re.compile(r"[0-9A-Z]{5}")
+
+
+def error_fields(exc: BaseException) -> dict[str, object]:
+    """Что о сбое пишут в журнал вместо текста ошибки и трассировки.
+
+    Текст ошибки несёт данные, с которыми код работал: SQLAlchemy кладёт в него
+    параметры запроса, а запрос бывает «найти пользователя по адресу» или
+    «записать ему chat_id». Адрес из готовой строки вырезала бы маска, число —
+    нет. Остаётся то, что данных не несёт:
+
+    - `error_type` — класс ошибки;
+    - `sqlstate` — код ошибки PostgreSQL, если это ошибка базы: `OperationalError`
+      у SQLAlchemy — и остановка сервера (`57P01`), и сбой соединения (`08006`);
+    - `error_at` — последняя строка `src/`, через которую ошибка прошла:
+      `notifications.py:405 in bind_telegram`.
+
+    Зовут из `except`, поэтому сама не бросает: чего не удалось узнать, того в
+    ответе нет.
+    """
+    fields: dict[str, object] = {"error_type": type(exc).__name__}
+    try:
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if isinstance(sqlstate, str) and _SQLSTATE_RE.fullmatch(sqlstate):
+            fields["sqlstate"] = sqlstate
+        tb = exc.__traceback__
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            # Только полный путь внутри `src/`: у кода, собранного из строки
+            # (`<string>` — так SQLAlchemy строит свои методы), пути нет.
+            if code.co_filename.startswith(_SRC_PREFIX):
+                # Глубже по стеку — ближе к сбою: остаётся последняя строка.
+                where = code.co_filename[len(_SRC_PREFIX) :]
+                fields["error_at"] = f"{where}:{tb.tb_lineno} in {code.co_name}"
+            tb = tb.tb_next
+    except Exception:  # обработчик сбоя не должен упасть сам
+        pass
+    return fields
+
+
 def configure_logging(service: str = "app") -> None:
     """Configure structlog → either JSON (production) or pretty (dev).
 

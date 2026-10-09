@@ -17,9 +17,9 @@
 3. вывод журнала CLI вырезает адрес из готовой строки — и у structlog, и у
    stdlib `logging`, которым пишут сторонние библиотеки.
 
-`click.echo` и `print` идут мимо третьего слоя. Команды, которым печатать адрес
-или текст сбоя отправки разрешено, названы списками ниже, и ни один workflow их
-не запускает: журнал шага Actions публичен.
+`click.echo` и `print` идут мимо третьего слоя. Команды, которым печатать адрес,
+текст сбоя отправки или входящие сообщения Telegram разрешено, названы списками
+ниже, и ни один workflow их не запускает: журнал шага Actions публичен.
 
 `structlog.testing.capture_logs()` не видит событий внутри `CliRunner`, поэтому
 почтовые пути вызываются напрямую.
@@ -161,8 +161,24 @@ _PRINTS_AN_ADDRESS_BY_DESIGN = {
     "recipient_toggle": "recipient toggle",
     "recipient_update": "recipient update",
 }
+# Команды, которые печатают входящие сообщения Telegram: кто написал боту (имя,
+# идентификатор чата) и что написал. Это персональные данные, а написать боту
+# может кто угодно. Правило об адресе такую печать не видит: оно узнаёт адрес по
+# имени переменной, а здесь он лежит в тексте сообщения. Список держится на том,
+# что команда делает, а не на том, как она написана:
+# `test_telegram_poll_prints_the_incoming_message_and_is_listed_for_it`.
+_PRINTS_INCOMING_MESSAGES_BY_DESIGN = {
+    # Оператор смотрит, дошло ли сообщение клиента до бота и какой у клиента
+    # chat_id, — для `telegram send-test` и `notify test --chat-id`. Чей это
+    # чат, видно по имени и по тексту; в тексте бывает `/start <адрес>`.
+    "telegram_poll": "telegram poll",
+}
 # Функция команды → как её зовут в CLI. Имена сверяются с деревом click.
-_NOT_FROM_A_WORKFLOW = {**_PRINTS_AN_ADDRESS_BY_DESIGN, **_PRINTS_A_DELIVERY_ERROR_BY_DESIGN}
+_NOT_FROM_A_WORKFLOW = {
+    **_PRINTS_AN_ADDRESS_BY_DESIGN,
+    **_PRINTS_A_DELIVERY_ERROR_BY_DESIGN,
+    **_PRINTS_INCOMING_MESSAGES_BY_DESIGN,
+}
 # Все исключения из правила о тексте ошибки — в том виде, в каком правило их узнаёт.
 _EXCUSED = (
     {("event", function, event) for function, event in _LOGS_THE_ERROR_TEXT_BY_DESIGN}
@@ -208,11 +224,13 @@ _HOW_TO_FIX_EXCEPTION_TEXT = (
 )
 _HOW_TO_FIX_A_WORKFLOW = (
     "В workflow после имени CLI стоит команда, вывод которой идёт мимо маски "
-    "журнала: она печатает адрес или текст сбоя отправки через `click.echo`. "
+    "журнала: она печатает адрес, текст сбоя отправки или входящие сообщения "
+    "Telegram через `click.echo`. "
     "Журнал шага Actions публичен. Убери команду из workflow; если она нужна "
     "именно там — сначала пусть печатает `user_id` и "
     "`notifier.delivery_error_fields(exc)`, затем убери её из "
-    "`_PRINTS_AN_ADDRESS_BY_DESIGN` или `_PRINTS_A_DELIVERY_ERROR_BY_DESIGN`. "
+    "`_PRINTS_AN_ADDRESS_BY_DESIGN`, `_PRINTS_A_DELIVERY_ERROR_BY_DESIGN` или "
+    "`_PRINTS_INCOMING_MESSAGES_BY_DESIGN`. "
     "Проверка читает текст, а не исполняет его: если это строка `echo` с "
     "описанием, а не запуск, — перефразируй её (комментарии и `name:` шага "
     "проверка пропускает сама)."
@@ -222,7 +240,7 @@ _HOW_TO_FIX_A_COMMAND_NAME = (
     "за ней стоит другая функция: {problems}. Под мёртвым именем проверка "
     "workflow искала бы команду, которой нет, и пропустила бы настоящую. "
     "Поправь имя в `_PRINTS_AN_ADDRESS_BY_DESIGN` / "
-    "`_PRINTS_A_DELIVERY_ERROR_BY_DESIGN`."
+    "`_PRINTS_A_DELIVERY_ERROR_BY_DESIGN` / `_PRINTS_INCOMING_MESSAGES_BY_DESIGN`."
 )
 
 
@@ -608,6 +626,39 @@ def test_every_excused_command_is_a_cli_command_under_that_name():
     assert problems == [], _HOW_TO_FIX_A_COMMAND_NAME.format(problems="; ".join(problems))
 
 
+def test_telegram_poll_prints_the_incoming_message_and_is_listed_for_it(cli_logging, monkeypatch):
+    """Команда печатает сообщение как есть, мимо маски, — и ровно поэтому стоит
+    в списке. Убрать строку списка, пока команда печатает, нельзя; оставить её,
+    когда печатать перестала, — тоже."""
+    chat_id, sender = 700200, "aysel_from_client"
+    update = {
+        "update_id": 41,
+        "message": {
+            "chat": {"id": chat_id},
+            "from": {"username": sender, "first_name": "Айсель"},
+            "text": f"/start {ADDRESS}",
+        },
+    }
+    monkeypatch.setattr(notifier, "telegram_get_updates", lambda *args, **kwargs: [update])
+
+    result = CliRunner().invoke(main.cli, ["telegram", "poll", "--once"])
+
+    assert result.exit_code == 0, result.output
+    shown = [piece for piece in (str(chat_id), sender, ADDRESS) if piece in result.output]
+    listed = _PRINTS_INCOMING_MESSAGES_BY_DESIGN.get("telegram_poll") == "telegram poll"
+    assert bool(shown) == listed, (
+        f"`telegram poll` печатает из входящего сообщения: {shown or 'ничего'}; в "
+        f"`_PRINTS_INCOMING_MESSAGES_BY_DESIGN` команда {'есть' if listed else 'не стоит'}. "
+        "Пока команда печатает хоть что-то из этого — она в списке, и ни один "
+        "workflow её не запускает. Перестала печатать — убери строку списка."
+    )
+    # Сегодня — всё сообщение целиком: идентификатор чата, имя и текст с адресом.
+    assert f"chat_id={chat_id}  from={sender}  text='/start {ADDRESS}'" in result.output, (
+        "Вывод `telegram poll` изменился: поправь образец здесь и причину у "
+        "строки списка — там сказано, что именно команда печатает."
+    )
+
+
 # Точка входа CLI в тексте workflow: консольный скрипт или модуль — в кавычках,
 # в `${PM:-pharmacy-monitor}` или как есть.
 _CLI_ENTRY_POINT = re.compile(r"""(?:pharmacy-monitor|src\.main|src/main\.py)["'}]*[ \t]""")
@@ -712,6 +763,7 @@ def test_no_workflow_runs_a_command_whose_output_skips_the_mask():
             [(1, "notify test")],
         ),
         ("pharmacy-monitor health-check --alert-email || true", [(1, "health-check")]),
+        ("sudo -u pm .venv/bin/pharmacy-monitor telegram poll --once", [(1, "telegram poll")]),
         # Подкоманда в переменной: названа только группа.
         ('pharmacy-monitor recipient "$ACTION"', [(1, "recipient")]),
         # Точка входа в подстановке по умолчанию; вывод, перенаправленный в файл.
@@ -738,8 +790,13 @@ def test_the_workflow_check_finds_the_command_behind_options_and_line_breaks(tex
         ("tenant issue-token", True),
         ("notify test", True),
         ("health-check", True),
+        ("telegram poll", True),
         ("recipient", True),
         ("notify", True),
+        # Группа, в которой есть такая команда: подкоманда могла быть в переменной.
+        ("telegram", True),
+        ("telegram run-bot", False),
+        ("telegram send-test", False),
         ("run", False),
         ("notify digest", False),
         ("tenant list", False),

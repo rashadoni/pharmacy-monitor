@@ -8,8 +8,12 @@ service tag injection.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 
+import psycopg
 import pytest
+import sqlalchemy
 import structlog
 
 from src import logging_setup
@@ -121,3 +125,104 @@ def test_configure_logging_replaces_root_handlers(monkeypatch):
     handlers = logging.getLogger().handlers
     assert leftover not in handlers
     assert any(isinstance(h, logging.StreamHandler) for h in handlers)
+
+
+# ─── error_fields: что о сбое идёт в журнал вместо текста ошибки ─────────────
+
+ADDRESS = "viewer@client.example"
+CHAT_ID = "700200"
+
+
+def _database_error(orig: BaseException) -> sqlalchemy.exc.DBAPIError:
+    """Ошибка базы, какой её отдаёт SQLAlchemy: запрос и его параметры — в тексте."""
+    return sqlalchemy.exc.ProgrammingError(
+        "UPDATE tenant_users SET telegram_chat_id=%(chat)s WHERE email = %(email)s",
+        {"chat": CHAT_ID, "email": ADDRESS},
+        orig,
+    )
+
+
+def _caught(call) -> BaseException:
+    try:
+        call()
+    except Exception as exc:
+        return exc
+    raise AssertionError("ошибки не было")
+
+
+def test_error_fields_carry_the_class_and_the_database_code_not_the_text():
+    error = _database_error(psycopg.errors.UndefinedTable('relation "tenant_users" does not exist'))
+    # Посылка: в тексте ошибки лежат параметры запроса.
+    assert ADDRESS in str(error) and CHAT_ID in str(error)
+
+    fields = logging_setup.error_fields(error)
+
+    assert fields == {"error_type": "ProgrammingError", "sqlstate": "42P01"}
+
+
+def test_error_fields_take_only_a_code_for_the_database_code():
+    """`sqlstate` — пять знаков кода. Что угодно другое под этим именем — текст."""
+    orig = RuntimeError("нет связи")
+    orig.sqlstate = f"connection for {ADDRESS} refused"
+
+    assert logging_setup.error_fields(_database_error(orig)) == {"error_type": "ProgrammingError"}
+
+
+def test_error_fields_name_the_last_line_of_src_the_error_went_through():
+    # `mask_addresses(None)` падает внутри `src/logging_setup.py`.
+    error = _caught(lambda: logging_setup.mask_addresses(None))
+
+    fields = logging_setup.error_fields(error)
+
+    assert fields["error_type"] == "TypeError"
+    where, line, function = fields["error_at"].replace(" in ", ":").split(":")
+    assert (where, function) == ("logging_setup.py", "mask_addresses")
+    source = Path(logging_setup.__file__).read_text(encoding="utf-8").splitlines()
+    assert '"@" not in text' in source[int(line) - 1]
+
+
+def test_error_fields_leave_out_the_place_when_the_error_never_touched_src():
+    assert logging_setup.error_fields(_caught(lambda: int("x"))) == {"error_type": "ValueError"}
+    assert logging_setup.error_fields(ValueError("не брошена")) == {"error_type": "ValueError"}
+
+
+@pytest.mark.parametrize("filename", ["<string>", "telegram_bot.py", "./telegram_bot.py"])
+def test_error_fields_do_not_take_code_without_a_full_path_for_src(monkeypatch, filename):
+    """SQLAlchemy собирает свои методы из строки: файл у такого кода — `<string>`.
+    Из каталога `src/` относительный путь выглядел бы нашим."""
+    monkeypatch.chdir(Path(logging_setup.__file__).parent)
+    namespace: dict = {}
+    exec(compile("def generated():\n    raise ValueError('x')\n", filename, "exec"), namespace)
+
+    fields = logging_setup.error_fields(_caught(namespace["generated"]))
+
+    assert fields == {"error_type": "ValueError"}
+
+
+def test_error_fields_work_when_the_working_directory_is_gone(monkeypatch, tmp_path):
+    """Зовут из `except`: падение здесь остановило бы того, кто ловил сбой."""
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+    with pytest.raises(FileNotFoundError):
+        os.getcwd()
+    # На пути ошибки — код без файла, как у SQLAlchemy: его путь нельзя
+    # достраивать от рабочего каталога.
+    namespace: dict = {"fail": lambda: logging_setup.mask_addresses(None)}
+    exec(compile("def generated():\n    fail()\n", "<string>", "exec"), namespace)
+    error = _caught(namespace["generated"])
+
+    fields = logging_setup.error_fields(error)
+
+    assert fields["error_type"] == "TypeError"
+    assert fields["error_at"].startswith("logging_setup.py:")
+
+
+def test_error_fields_never_raise():
+    class Unreadable(Exception):
+        @property
+        def orig(self):
+            raise RuntimeError(f"нельзя прочитать {ADDRESS}")
+
+    assert logging_setup.error_fields(Unreadable()) == {"error_type": "Unreadable"}
