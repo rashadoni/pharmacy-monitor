@@ -217,8 +217,16 @@ def _shell(workflow: str | None) -> str:
     Аргументом — там, где скрипт передан ssh строкой в одинарных кавычках, а не
     here-документом: его исполняет оболочка входа через `-c`.
     """
-    if workflow is None or "<<'REMOTE'" in (WORKFLOWS / workflow).read_text():
+    if workflow is None:
         return "-s"
+    # Смотрим на шаг, в котором стоит разбор, а не на файл целиком: от функции
+    # вверх до `run: |` либо встретится начало here-документа, либо нет.
+    lines = (WORKFLOWS / workflow).read_text().split("\n")
+    at = next(i for i, line in enumerate(lines) if line.strip() == LOADER_OPENS)
+    while not lines[at].strip().startswith("run: |"):
+        if lines[at].rstrip().endswith("<<'REMOTE'"):
+            return "-s"
+        at -= 1
     return "-c"
 
 
@@ -677,6 +685,41 @@ def test_the_runbook_check_answers_with_a_refusal_line_or_one_word(
     )
 
     assert (done.returncode, done.stdout.decode(), done.stderr.decode()) == (code, stdout, stderr)
+
+
+def test_the_runbook_check_does_not_say_accepted_without_the_loader(tmp_path):
+    # Чекаут, где функции ещё нет (main до мержа, старая ветка, не тот каталог):
+    # проверка, зелёная при собственной поломке, хуже отсутствия проверки.
+    commands = [
+        line for line in RUNBOOK.read_text().split("\n") if line.endswith(RUNBOOK_CHECK_ENDS)
+    ]
+    assert len(commands) == 1
+    source = ".github/workflows/probe-pharmonline-decodo-json.yml"
+    assert source in commands[0] and (ROOT / source).exists()
+    env_file = tmp_path / "environment"
+    env_file.write_bytes(b"FIRST=1\n")
+    rewrite = shlex.quote(f"s|{ENV_FILE}|{env_file}|")
+    without_loader = tmp_path / "workflow.yml"
+    without_loader.write_text("          " + PREVIOUS_LOOP.replace("\n", "\n          "))
+
+    for workflow in (without_loader, tmp_path / "no such workflow.yml"):
+        local = (
+            commands[0]
+            .replace(source, shlex.quote(str(workflow)))
+            .replace(RUNBOOK_CHECK_ENDS, f"| sed {rewrite} | bash -s")
+        )
+        done = subprocess.run(
+            ["bash", "-c", local],
+            cwd=ROOT,
+            capture_output=True,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            timeout=60,
+            check=False,
+        )
+
+        assert done.returncode != 0
+        assert b"accepted" not in done.stdout
+        assert b"load_environment_file: command not found" in done.stderr
 
 
 def _plain_lines() -> list[tuple[str, str]]:

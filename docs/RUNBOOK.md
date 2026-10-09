@@ -411,14 +411,23 @@ CR не снимают — выкладка и бэкап получат зна�
 значение (пароль), а не его запись. То же с любым значением, где есть сразу и
 `\`, и одинарная кавычка: функция не примет его ни в каком написании.
 
-Проверить файл, не запуская сбор (с dev-бокса, из корня репозитория). Команда
+Проверить файл, не запуская сбор, — после каждой его правки: иначе отказ
+заметит только сбор в понедельник. С dev-бокса, из корня репозитория. Команда
 берёт функцию из workflow и исполняет её на сервере; файл читает пользователь
 `pm`, как и в workflow. Печатает либо ту же строку отказа, либо слово
 `accepted`:
 
 ```bash
-{ echo 'set -euo pipefail'; sed -n '/^ *load_environment_file() {$/,/^ *load_environment_file \//p' .github/workflows/probe-pharmonline-decodo-json.yml; echo 'echo accepted'; } | ssh root@13.140.186.143 'runuser -u pm -- bash -s'
+{ echo 'set -euo pipefail'; sed -n '/^ *load_environment_file() {$/,/^ *}$/p' .github/workflows/probe-pharmonline-decodo-json.yml; echo 'load_environment_file /etc/pharmacy-monitor/env && echo accepted'; } | ssh root@13.140.186.143 'runuser -u pm -- bash -s'
 ```
+
+Ответ `load_environment_file: command not found` значит, что функции в этом
+чекауте нет (старая ветка, не тот каталог), а не что файл плох: `accepted` без
+функции команда не скажет.
+
+То же самое настоящим workflow, тем же путём, что и сбор: ручной
+`probe-pharmonline-decodo-json` (ввести `PROBE`). В базу он не пишет и сборщик
+не зовёт; тратит немного трафика Decodo.
 
 Чего функция не ловит:
 - значение оборвано так, что его хвост сам выглядит как `ИМЯ=значение`. Такая
