@@ -34,9 +34,10 @@
 с адресом (`TenantUser`, `Recipient` — выводятся из `src/storage.py`, а не
 перечислены), атрибута `email` или `telegram_chat_id`, отправки (`send_email`,
 `send_telegram_message`), SQL к таблицам людей, переменных окружения с адресом.
-В самом запущенном коде нельзя ещё запускать процессы и импортировать по имени
-(`subprocess`, `os.system`, `importlib`, `exec`): так зовут CLI мимо обеих
-проверок. Списка разрешённых функций здесь нет намеренно: список закрепляет
+В самом запущенном коде нельзя ещё называть интерпретатор и CLI (строка
+`python`, `pharmacy-monitor`, `src.main`, `sys.executable`) и импортировать по
+имени (`importlib`, `exec`): так CLI запускают из кода мимо обеих проверок.
+Списка разрешённых функций здесь нет намеренно: список закрепляет
 имя, а не то, что за ним стоит, — функция, внесённая в него сегодня, завтра
 начнёт слать письма, и список это пропустит; путь по именам перечитывается на
 каждом прогоне CI.
@@ -53,15 +54,20 @@
 - читается `src/` чекаута, а блоки на сервере исполняют выложенный код: между
   мержем и выкладкой это разный код;
 - миграции (`python -m alembic`), `pip` и `pytest` не читаются вовсе;
-- Python, запущенный не словом `python`: интерпретатор в переменной
-  (`"$PY" - <<'EOF'`), консольный скрипт (`alembic`, `uv run`), файл со своим
-  `#!`, запуск внутри shell-скрипта, который workflow зовёт;
+- Python, запущенный не словом `python`: интерпретатор в переменной или в
+  подстановке (`"$PY" - <<'EOF'`, `"$(command -v python3)" job.py`), консольный
+  скрипт (`alembic`, `uv run`), файл со своим `#!`, запуск внутри shell-скрипта,
+  который workflow зовёт; процесс, который блок запускает сам, если путь к
+  интерпретатору в коде не назван строкой;
 - текст ошибки, в котором нет человека, но есть другое: имя хоста, обрывок
   запроса, логин прокси.
 
-Строки, в которых `python` — не запуск (`command -v python3`, `apt-get install
-python3`, `ls …/python`), тест узнаёт по команде перед словом; незнакомую форму
-он считает запуском и роняет CI — лучше так, чем пропустить.
+Не запуском считается только то, что названо явно: слово без программы после
+себя (`PY=…/python`), `--version` и аргумент команды, которая Python не
+запускает (`command -v python3`, `apt-get install python3`, `ls …/python`) —
+сверяется слово самой команды. Всё остальное — запуск: незнакомая форма роняет
+CI, а не пропускается. Под разбором стоит этаж: строка со словом `python`, о
+которой он ничего не решил, роняет CI тоже.
 """
 
 from __future__ import annotations
@@ -94,12 +100,12 @@ _PEOPLE_ENV = {"EMAIL_TO", "TELEGRAM_CHAT_ID"}
 _COLUMNS_THAT_NAME_NOBODY = {"id", "tenant_id", "role", "is_active"}
 # Слово запроса: строка с ним и с именем таблицы людей — SQL к этой таблице.
 _SQL_WORD = re.compile(r"\b(?:select|insert|update|delete|truncate|copy|from|join)\b", re.I)
-# В самом запущенном коде: импорт по имени тест не прочитает, а запуск процесса —
-# только если запускают Python (`pg_dump` из блока — не о людях).
+# В самом запущенном коде: импорт по имени тест не прочитает. А назвать строкой
+# интерпретатор или CLI — значит собираться их запустить; чем именно
+# (`subprocess`, `os.system`, `asyncio`), уже не важно.
 _MODULES_THAT_IMPORT_BY_NAME = {"runpy", "importlib"}
 _NAMES_THAT_IMPORT_BY_NAME = {"__import__", "exec", "eval"}
-_MODULES_THAT_RUN_A_PROCESS = {"subprocess", "multiprocessing", "pty"}
-_AN_INTERPRETER = re.compile(r"(?:^|[\s/])python[0-9.]*(?:\s|$)")
+_NAMES_A_PROGRAM_OF_OURS = re.compile(r"(?:^|[\s/])(python[0-9.]*|pharmacy-monitor)(?:\s|$)")
 _CLI_MODULE = "src.main"
 
 # ─── Запуски Python в тексте workflow ────────────────────────────────────────
@@ -108,21 +114,30 @@ _CLI_MODULE = "src.main"
 # `"$VENV/bin/python"`, `${PYTHON:-python3}`. `setup-python@v5`,
 # `python-version:` и `f"python={…}"` — не запуск.
 _INTERPRETER = re.compile(
-    r"""(?:(?<![\w.$/-])|(?<=:-))(?:[^\s"'`=;|&()<>]*/)?python[0-9.]*(?=["'}]*(?:[ \t<|;)&]|$))["'}]*""",
+    r"""(?:(?<![\w.$/-])|(?<=:-))(?:[^\s"'`=;|&()<>]*/)?python[0-9.]*(?=["'}]*(?:[ \t\r<>|;)&]|$))["'}]*""",
     re.M,
 )
+# Слово `python` в составе другого слова: пакет (`python3-venv`, `python-dotenv`),
+# действие (`setup-python@v5`), ключ (`python-version`).
+_PART_OF_ANOTHER_WORD = re.compile(r"[\w.-]*-python[0-9.]*(?:@[\w.]+)?|python[0-9.]*-[\w.-]+")
 _INTERPRETER_FLAGS = re.compile(r"-(?:[BbdEIiOPqsSuvx]+|OO|bb)$")
 _INTERPRETER_OPTIONS_WITH_A_VALUE = {"-X", "-W"}
 _NOT_A_RUN = {"-V", "-VV", "--version", "-h", "--help"}
 _HEREDOC = re.compile(r"""<<-?[ \t]*(['"]?)(\w+)\1""")
 _OPENING_QUOTE = re.compile(r"""[ \t]*(\\?["'])""")
-_REDIRECTION = re.compile(r"\d*[<>&]")
+# Перенаправления — не аргументы интерпретатора: `2>&1`; `> out.txt`, `<job.py`.
+_DUPLICATED_DESCRIPTOR = re.compile(r"\d*[<>]&[\d-]+$")
+_REDIRECTION = re.compile(r"(?:&>>?|\d*>>?|\d*<(?!<))(.*)$", re.S)
 _END_OF_SHELL_COMMAND = re.compile(r"&&|\|\||[;|\n]")
 # Где начинается команда, в которой стоит слово `python`.
 _START_OF_SHELL_COMMAND = re.compile(r"&&|\|\||\$\(|[;|\n(`]")
-# Команды, которым `python` — аргумент, а не программа.
+# Слова перед командой: ключевые слова shell, присваивания, `sudo` и `env`.
+_SHELL_KEYWORDS = {"if", "then", "else", "elif", "while", "until", "do", "!", "{", "time"}
+_ASSIGNMENT = re.compile(r"\w+=")
+_OPTIONS_WITH_A_VALUE_OF_SUDO = {"-u", "-g", "-C", "-h", "-p", "-U"}
+# Команды, которым `python` — аргумент, а не программа. Сверяется само слово
+# команды, а не любое слово перед `python`: `docker run test python …` — запуск.
 _COMMANDS_THAT_ONLY_NAME_PYTHON = {
-    "command",
     "which",
     "type",
     "test",
@@ -130,7 +145,6 @@ _COMMANDS_THAT_ONLY_NAME_PYTHON = {
     "[[",
     "ls",
     "ln",
-    "install",
     "apt-get",
     "apt",
     "dnf",
@@ -140,8 +154,10 @@ _COMMANDS_THAT_ONLY_NAME_PYTHON = {
     "echo",
     "printf",
 }
+# `command -v python3` спрашивает, где программа; `command python3 …` — запускает.
+_COMMAND_THAT_ASKS = ("command", {"-v", "-V"})
 # Шаг, тело которого — Python: `shell: python`. Тело такого шага тест не читает.
-_PYTHON_SHELL = re.compile(r"""^[ \t]*(?:-[ \t]+)?shell:[ \t]*["']?python""", re.M)
+_PYTHON_SHELL = re.compile(r"""(?<![\w-])shell:[ \t]*["']?python""")
 # Строки, которые ничего не запускают: комментарий и имя шага.
 _NOT_A_COMMAND_LINE = re.compile(r"^[ \t]*(?:#|-?[ \t]*name:).*$", re.M)
 # Модули, которые запускают как есть: своего кода о людях в них нет, а
@@ -206,18 +222,56 @@ def _repo_file(word: str) -> Path | None:
     return None
 
 
-def python_runs(text: str) -> list[PythonRun]:
-    """Запуски Python в тексте workflow: строка, вид и что запущено.
+def _only_names_python(command_before: str) -> bool:
+    """Стоит ли `python` аргументом команды, которая его не запускает.
 
-    Виды: `CODE` — код прочитан (блок `<<TAG`, `-c "…"`, файл из репозитория,
-    модуль `-m src.x`); `CLI` — `-m src.main` и `src/main.py`, их проверяет
-    `cli_commands_run`; `NOT_READ` — модуль из `_MODULES_NOT_READ`; `UNKNOWN` —
-    запуск есть, а что запущено, из текста не узнать (`python "$SCRIPT"`,
-    `… | python3`, шаг с `shell: python`), и это тест роняет.
-
-    Текст читается, а не исполняется. Тело уже найденного блока вторым запуском
-    не считается: слово `python` в строке Python — не команда.
+    Сверяется слово команды: первое после ключевых слов shell, присваиваний,
+    `sudo` и `env`. Всё остальное перед `python` — `timeout 85s`, `ssh host`,
+    `docker run test` — запуска не отменяет.
     """
+    words = command_before.split()
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in _SHELL_KEYWORDS or _ASSIGNMENT.match(word):
+            index += 1
+        elif word in {"sudo", "env"}:
+            index += 1
+            while index < len(words) and (
+                words[index].startswith("-") or _ASSIGNMENT.match(words[index])
+            ):
+                index += 2 if words[index] in _OPTIONS_WITH_A_VALUE_OF_SUDO else 1
+        else:
+            break
+    if index >= len(words):
+        return False
+    command, asks = _COMMAND_THAT_ASKS
+    if words[index] == command:
+        return index + 1 < len(words) and words[index + 1] in asks
+    return words[index] in _COMMANDS_THAT_ONLY_NAME_PYTHON
+
+
+def _without_redirections(words: list[str]) -> tuple[list[str], bool]:
+    """Слова команды без перенаправлений — и были ли они. Блок `<<TAG` остаётся."""
+    kept, redirected, index = [], False, 0
+    while index < len(words):
+        word = words[index]
+        if word.startswith("<<"):
+            kept.append(word)
+        elif _DUPLICATED_DESCRIPTOR.match(word):
+            redirected = True
+        elif found := _REDIRECTION.match(word):
+            redirected = True
+            index += 0 if found.group(1) else 1  # цель — следующим словом
+        else:
+            kept.append(word)
+        index += 1
+    return kept, redirected
+
+
+def _scan(text: str) -> tuple[list[PythonRun], set[int], list[tuple[int, int]], str]:
+    """Запуски; строки, о которых разбор что-то решил; прочитанные тела блоков;
+    текст без комментариев, имён шагов и переносов через «\\»."""
 
     def blank(found: re.Match) -> str:
         return " " * len(found.group())  # той же длины: позиции не съезжают
@@ -226,15 +280,19 @@ def python_runs(text: str) -> list[PythonRun]:
         return text.count("\n", 0, position) + 1
 
     shell = re.sub(r"\\\r?\n", blank, _NOT_A_COMMAND_LINE.sub(blank, text))
-    runs, already_read = [], []
+    runs: list[PythonRun] = []
+    seen: set[int] = set()
+    already_read: list[tuple[int, int]] = []
     for found in _PYTHON_SHELL.finditer(shell):
         runs.append(PythonRun(line_of(found.start()), UNKNOWN, "шаг с `shell: python`"))
+        seen.add(line_of(found.start()))
         end_of_line = shell.find("\n", found.end())
         already_read.append((found.start(), len(shell) if end_of_line < 0 else end_of_line))
     for interpreter in _INTERPRETER.finditer(shell):
         if any(start <= interpreter.start() < end for start, end in already_read):
             continue
         line = line_of(interpreter.start())
+        seen.add(line)
         end_of_line = shell.find("\n", interpreter.end())
         end_of_line = len(shell) if end_of_line < 0 else end_of_line
         rest = shell[interpreter.end() : end_of_line]
@@ -243,15 +301,16 @@ def python_runs(text: str) -> list[PythonRun]:
         before = shell[: interpreter.start()]
         separators = list(_START_OF_SHELL_COMMAND.finditer(before))
         separator = separators[-1].group() if separators else ""
-        command_before = before[separators[-1].end() :] if separators else before
-        if {_unquoted(word) for word in command_before.split()} & _COMMANDS_THAT_ONLY_NAME_PYTHON:
+        if _only_names_python(before[separators[-1].end() :] if separators else before):
             continue
 
-        words = [
-            word
-            for word in _END_OF_SHELL_COMMAND.split(rest, maxsplit=1)[0].split()
-            if _unquoted(word) or word.startswith("<<")
-        ]
+        words, redirected = _without_redirections(
+            [
+                word
+                for word in _END_OF_SHELL_COMMAND.split(rest, maxsplit=1)[0].split()
+                if _unquoted(word) or word.startswith("<<")
+            ]
+        )
         while words:
             if words[0] in _INTERPRETER_OPTIONS_WITH_A_VALUE:
                 words = words[2:]
@@ -261,9 +320,10 @@ def python_runs(text: str) -> list[PythonRun]:
                 break
         if words and words[0] in _NOT_A_RUN:
             continue
-        if not words or (_REDIRECTION.match(words[0]) and not words[0].startswith("<<")):
-            # Программы в команде нет. После `|` интерпретатор читает её со stdin.
-            if separator == "|":
+        if not words:
+            # Программы в команде нет: это упоминание (`PY=…/python`) — если только
+            # интерпретатору не дали её со stdin, через `|` или `<`.
+            if separator == "|" or redirected:
                 runs.append(PythonRun(line, UNKNOWN, "код со stdin, но не блоком `<<TAG`"))
             continue
         first = words[0]
@@ -271,7 +331,9 @@ def python_runs(text: str) -> list[PythonRun]:
             module = _unquoted(words[1]) if len(words) > 1 else ""
             if module == _CLI_MODULE:
                 # Строка, на которой стоит `-m`: по ней запуск узнаёт проверка CLI.
-                runs.append(PythonRun(line_of(shell.index("-m", interpreter.end())), CLI, module))
+                at = line_of(shell.index("-m", interpreter.end()))
+                seen.add(at)
+                runs.append(PythonRun(at, CLI, module))
             elif module.split(".")[0] in _MODULES_NOT_READ:
                 runs.append(PythonRun(line, NOT_READ, module))
             elif (path := _repo_file(module.replace(".", "/") + ".py")) is not None:
@@ -309,12 +371,51 @@ def python_runs(text: str) -> list[PythonRun]:
         elif (path := _repo_file(_unquoted(first))) is not None:
             origin = str(path.relative_to(ROOT))
             if origin == "src/main.py":
-                runs.append(PythonRun(line_of(shell.index(first, interpreter.end())), CLI, origin))
+                at = line_of(shell.index(first, interpreter.end()))
+                seen.add(at)
+                runs.append(PythonRun(at, CLI, origin))
             else:
                 runs.append(PythonRun(line, CODE, path.read_text(encoding="utf-8"), origin))
         else:
             runs.append(PythonRun(line, UNKNOWN, f"`{_unquoted(first)}`"))
-    return sorted(runs, key=lambda run: run.line)
+    return sorted(runs, key=lambda run: run.line), seen, already_read, shell
+
+
+def python_runs(text: str) -> list[PythonRun]:
+    """Запуски Python в тексте workflow: строка, вид и что запущено.
+
+    Виды: `CODE` — код прочитан (блок `<<TAG`, `-c "…"`, файл из репозитория,
+    модуль `-m src.x`); `CLI` — `-m src.main` и `src/main.py`, их проверяет
+    `cli_commands_run`; `NOT_READ` — модуль из `_MODULES_NOT_READ`; `UNKNOWN` —
+    запуск есть, а что запущено, из текста не узнать (`python "$SCRIPT"`,
+    `… | python3`, `python < файл`, шаг с `shell: python`), и это тест роняет.
+
+    Текст читается, а не исполняется. Тело уже найденного блока вторым запуском
+    не считается: слово `python` в строке Python — не команда. Не запуск —
+    только то, что названо явно: слово без программы после себя (`PY=…/python`),
+    `--version` и аргумент команды из `_COMMANDS_THAT_ONLY_NAME_PYTHON`.
+    """
+    return _scan(text)[0]
+
+
+def lines_naming_python_unexplained(text: str) -> list[int]:
+    """Строки, где стоит слово `python`, а разбор о них ничего не решил.
+
+    Разбор узнаёт интерпретатор по шаблону; строка, которую шаблон не узнал,
+    не попадает ни в запуски, ни в «не узнано» — её просто нет. Здесь слово
+    ищется без шаблона: всякая строка с ним вне прочитанных блоков обязана
+    быть либо разобрана, либо быть частью другого слова (`setup-python@v5`).
+    """
+    _, seen, already_read, shell = _scan(text)
+    unexplained, position = [], 0
+    for number, line in enumerate(text.split("\n"), start=1):
+        start, position = position, position + len(line) + 1
+        if "python" not in _PART_OF_ANOTHER_WORD.sub("", shell[start : start + len(line)]):
+            continue
+        if number in seen or any(first <= start < last for first, last in already_read):
+            continue
+        unexplained.append(number)
+    return unexplained
 
 
 # ─── Путь от кода до людей по именам ─────────────────────────────────────────
@@ -353,17 +454,9 @@ class _Module:
         self.modules: dict[str, str] = {}  # локальное имя → модуль репозитория
         self.names: dict[str, tuple[str, str]] = {}  # локальное имя → (модуль, имя)
         self.star_imports: list[str] = []
-        # Имя → функции, навешенные на него декоратором: `@cli.command()`,
-        # `@app.get(…)`. Вызов `cli([...])` доходит до них без единого имени.
-        self.registered: dict[str, list[str]] = {}
         for node in _top_level(tree.body):
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
                 self.defs[node.name] = node
-                for decorator in node.decorator_list:
-                    target = decorator.func if isinstance(decorator, ast.Call) else decorator
-                    parts = _dotted(target)
-                    if parts and len(parts) > 1:
-                        self.registered.setdefault(parts[0], []).append(node.name)
             elif isinstance(node, ast.Assign | ast.AnnAssign):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for target in targets:
@@ -403,6 +496,14 @@ class Sources:
         self.modules = set(trees)
         self._known = self.modules | {name.split(".")[0] for name in trees}
         self._modules = {name: _Module(name, tree, self._known) for name, tree in trees.items()}
+        # Имя → функции, навешенные на него декоратором: `@cli.command()`,
+        # `@app.get(…)`. Вызов `cli([...])` доходит до них без единого имени.
+        self._registered: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for module in self._modules.values():
+            for name, node in module.defs.items():
+                for decorator in getattr(node, "decorator_list", []):
+                    if (target := self._registers_on(decorator, module)) is not None:
+                        self._registered.setdefault(target, []).append((module.name, name))
         self.people_models: set[str] = set()
         self.people_tables: set[str] = set()
         storage = trees.get("src.storage")
@@ -471,9 +572,9 @@ class Sources:
 
     def _marks_of_the_run_itself(self, tree: ast.Module) -> list[str]:
         """Чего нельзя в самом запущенном коде, а в `src/` можно: импортировать
-        по имени, запускать из кода Python (так зовут CLI мимо обеих проверок)
-        и называть таблицу людей строкой."""
-        marks, runs_a_process, names_an_interpreter = [], [], False
+        по имени, называть интерпретатор или CLI (так их запускают из кода мимо
+        обеих проверок) и называть таблицу людей строкой."""
+        marks = []
         for sub in ast.walk(tree):
             if isinstance(sub, ast.Import | ast.ImportFrom):
                 modules = (
@@ -484,80 +585,91 @@ class Sources:
                 for module in modules:
                     if module.split(".")[0] in _MODULES_THAT_IMPORT_BY_NAME:
                         marks.append(f"`{module}` — импорт по имени не прочитать")
-                    elif module.split(".")[0] in _MODULES_THAT_RUN_A_PROCESS:
-                        runs_a_process.append(module)
+                if (
+                    isinstance(sub, ast.ImportFrom)
+                    and sub.module == "sys"
+                    and any(alias.name == "executable" for alias in sub.names)
+                ):
+                    marks.append("`sys.executable` — запуск Python из кода не прочитать")
             elif isinstance(sub, ast.Name) and sub.id in _NAMES_THAT_IMPORT_BY_NAME:
                 marks.append(f"`{sub.id}` — импорт по имени не прочитать")
-            elif isinstance(sub, ast.Attribute):
-                parts = _dotted(sub)
-                if parts == ["sys", "executable"]:
-                    names_an_interpreter = True
-                elif (
-                    parts
-                    and parts[0] == "os"
-                    and (sub.attr in {"system", "popen"} or sub.attr.startswith(("exec", "spawn")))
-                ):
-                    runs_a_process.append(f"os.{sub.attr}")
+            elif isinstance(sub, ast.Attribute) and sub.attr == "executable":
+                marks.append("`sys.executable` — запуск Python из кода не прочитать")
             elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
                 if sub.value == _CLI_MODULE:
                     marks.append(f"строка `{_CLI_MODULE}` — CLI зовут командой, а не из кода")
                 elif sub.value in self.people_tables:
                     marks.append(f"таблица `{sub.value}`")
-                elif _AN_INTERPRETER.search(sub.value):
-                    names_an_interpreter = True
-        if names_an_interpreter:
-            marks += [
-                f"`{how}` запускает Python — что именно, не прочитать" for how in runs_a_process
-            ]
+                elif program := _NAMES_A_PROGRAM_OF_OURS.search(sub.value):
+                    marks.append(
+                        f"строка называет `{program.group(1)}` — запуск из кода не прочитать"
+                    )
         return sorted(set(marks))
 
-    def _resolve(self, module: str, words: list[str]) -> tuple[str, str] | None:
-        """На какое имя указывает цепочка слов, начатая в модуле.
+    def _resolve_with_rest(
+        self, module: str, words: list[str]
+    ) -> tuple[tuple[str, str] | None, list[str]]:
+        """На какое имя указывает цепочка слов, начатая в модуле, и что осталось
+        после него.
 
         Идёт сквозь модули: подмодуль пакета (`src.scrapers.base`) и модуль,
         который этот модуль сам взял из репозитория (`main.notifier` — тот же
-        `src.notifier`). `None` — цепочка кончилась на модуле.
+        `src.notifier`). Имя `None` — цепочка кончилась на модуле.
         """
-        for word in words:
+        for index, word in enumerate(words):
             inside = self._modules.get(module)
             if f"{module}.{word}" in self._known:
                 module = f"{module}.{word}"
             elif inside is not None and word not in inside.defs and word in inside.modules:
                 module = inside.modules[word]
             else:
-                return (module, word)
-        return None
+                return (module, word), words[index + 1 :]
+        return None, []
+
+    def _resolve(self, module: str, words: list[str]) -> tuple[str, str] | None:
+        return self._resolve_with_rest(module, words)[0]
+
+    def _resolve_in(self, parts: list[str], module: _Module, *, own_defs: bool):
+        """Цепочка слов из кода модуля → имя репозитория и остаток цепочки."""
+        if own_defs and parts[0] in module.defs:
+            return (module.name, parts[0]), parts[1:]
+        if parts[0] in module.modules:
+            return self._resolve_with_rest(module.modules[parts[0]], parts[1:])
+        if parts[0] in module.names:
+            origin, name = module.names[parts[0]]
+            return self._resolve_with_rest(origin, [name, *parts[1:]])
+        return None, []
+
+    def _registers_on(self, decorator: ast.AST, module: _Module) -> tuple[str, str] | None:
+        """Имя, на которое декоратор навешивает функцию, — или `None`.
+
+        Регистрация — это вызов метода у объекта: `@cli.command()`,
+        `@app.get(…)`, `@main.cli.command()`. Обычный декоратор, даже взятый
+        через модуль (`@alerts.notify_on_failure`), — функция, которую зовут:
+        после её имени в цепочке ничего не остаётся.
+        """
+        parts = _dotted(decorator.func if isinstance(decorator, ast.Call) else decorator)
+        if not parts:
+            return None
+        target, rest = self._resolve_in(parts, module, own_defs=True)
+        return target if rest else None
 
     def _followed(self, node: ast.AST, module: _Module, *, own_defs: bool) -> list[tuple[str, str]]:
         """Имена из репозитория, которых касается этот кусок кода."""
-        # Декоратор-регистрация (`@cli.command()`) — не то, что функция зовёт:
-        # иначе любая команда CLI тянула бы за собой все остальные.
+        # Декоратор-регистрация — не то, что функция зовёт: иначе любая команда
+        # CLI тянула бы за собой все остальные.
         registration = {
             id(inner)
             for decorator in getattr(node, "decorator_list", [])
-            if len(_dotted(decorator.func if isinstance(decorator, ast.Call) else decorator) or [])
-            > 1
+            if self._registers_on(decorator, module) is not None
             for inner in ast.walk(decorator)
         }
         followed = []
         for sub in ast.walk(node):
-            target = None
-            if id(sub) in registration:
+            if id(sub) in registration or not isinstance(sub, ast.Name | ast.Attribute):
                 continue
-            if isinstance(sub, ast.Name):
-                if own_defs and sub.id in module.defs:
-                    target = (module.name, sub.id)
-                elif sub.id in module.names:
-                    origin, name = module.names[sub.id]
-                    target = self._resolve(origin, [name])
-            elif isinstance(sub, ast.Attribute):
-                parts = _dotted(sub)
-                if parts and parts[0] in module.modules:
-                    target = self._resolve(module.modules[parts[0]], parts[1:])
-                elif parts and parts[0] in module.names:
-                    origin, name = module.names[parts[0]]
-                    target = self._resolve(origin, [name, *parts[1:]])
-            if target is not None:
+            parts = [sub.id] if isinstance(sub, ast.Name) else _dotted(sub)
+            if parts and (target := self._resolve_in(parts, module, own_defs=own_defs)[0]):
                 followed.append(target)
         return followed
 
@@ -584,7 +696,7 @@ class Sources:
             if module is None:
                 continue
             # Функции, навешенные на это имя декоратором, достижимы из него.
-            queue += [((module.name, name), key) for name in module.registered.get(key[1], [])]
+            queue += [(registered, key) for registered in self._registered.get(key, [])]
             node = module.defs.get(key[1])
             if node is None:  # не определено здесь: имя, которое модуль сам взял из репозитория
                 if key[1] in module.names:
@@ -730,7 +842,7 @@ def test_the_check_is_not_blind():
     assert _src().people_reached(
         "from src import notifications\nnotifications.dispatch_events_batch"
     )
-    assert _src().people_reached("from src import main\nmain.notifier.send_email")
+    assert _src().people_reached("from src import main\nmain.notifications.dispatch_events_batch")
     assert _src().people_reached("from src.main import cli\ncli(['recipient', 'list'])")
 
 
@@ -799,6 +911,10 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         (".venv/bin/python -m py_compile src/api.py", [(1, NOT_READ)]),
         ("curl -s https://x.example | python -m json.tool", [(1, NOT_READ)]),
         ("python -m playwright install chromium", [(1, NOT_READ)]),
+        ("python -m venv .venv", [(1, NOT_READ)]),
+        ("python -m ensurepip --upgrade", [(1, NOT_READ)]),
+        ("python -m compileall -q src", [(1, NOT_READ)]),
+        ("python -m pytest -q", [(1, NOT_READ)]),
         ("python -m src.digest", [(1, CODE)]),
         ("python migrations/env.py", [(1, CODE)]),
         (
@@ -815,13 +931,31 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ("cat job.py | python -", [(1, UNKNOWN)]),
         ("python - < job.py", [(1, UNKNOWN)]),
         ("python -c $CODE", [(1, UNKNOWN)]),
+        # Перенаправление — не программа: блок за ним читается, файл со stdin — нет.
+        (f"python3 > out.txt <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        (f"python3 2>/dev/null <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        (f"python3>out.txt <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        (f"python - <<'PY' 2>&1 | tee run.log\n{_BLOCK}PY\n", [(1, CODE)]),
+        ("python3 < scripts/full_rematch.py", [(1, UNKNOWN)]),
+        ("python3 <(curl -s https://x.example/job.py)", [(1, UNKNOWN)]),
+        ("python3 >/dev/null", [(1, UNKNOWN)]),
+        # Опции интерпретатора со значением и без.
+        (f"python -X dev -W ignore -B - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        # Слово из списка «не запуск» стоит не командой: это запуск.
+        (f"command python3 - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        (f"docker compose run test python - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        (f"systemd-run --unit install python - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        ('ssh host echo go \\&\\& python3 "$SCRIPT"', [(1, UNKNOWN)]),
+        ('timeout 60 ls && echo python; python "$SCRIPT"', [(1, UNKNOWN)]),
         # Код пришёл по `|`: интерпретатор без единого слова после себя.
+        ("render | python3\r\n", [(1, UNKNOWN)]),
         ("cat <<'CODE' | python3\nprint(1)\nCODE\n", [(1, UNKNOWN)]),
         ("out=$(render | python3)\n", [(1, UNKNOWN)]),
         ("render | python3 >/dev/null\n", [(1, UNKNOWN)]),
         # Шаг, тело которого — Python.
         ("- run: |\n    print(1)\n  shell: python\n", [(3, UNKNOWN)]),
         ("defaults:\n  run:\n    shell: 'python3 {0}'\n", [(3, UNKNOWN)]),
+        ("steps:\n  - {run: 'print(1)', shell: python}\n", [(2, UNKNOWN)]),
         ("steps:\n  - shell: python\n    run: |\n      print(1)\n", [(2, UNKNOWN)]),
         # Не запуск: `python` — аргумент другой команды.
         ("- uses: actions/setup-python@v5\n  with:\n    python-version: '3.12'\n", []),
@@ -832,8 +966,24 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ("ln -sf /usr/bin/python3 /usr/local/bin/python\n", []),
         ("ls -l .venv/bin/python >&2\n", []),
         ("echo 'python is here'\n", []),
+        ("printf '%s\\n' python\n", []),
+        ("which python3\n", []),
+        ("type python3\n", []),
+        ("[ -x .venv/bin/python ] || exit 1\n", []),
+        ("if [[ -x .venv/bin/python ]]; then echo ok; fi\n", []),
+        ("sudo -u pm test -x /opt/app/.venv/bin/python\n", []),
+        ("sudo apt install -y python3\n", []),
+        ("dnf install -y python3\n", []),
+        ("yum install -y python3\n", []),
+        ("apk add python3\n", []),
+        ("brew install python\n", []),
+        ("PY=/opt/app/.venv/bin/python\n", []),
+        ("export PYTHON=python3\n", []),
         ("python --version", []),
         ("python -VV", []),
+        ("python -V", []),
+        ("python -h", []),
+        ("python --help", []),
         ('PYTHONPATH="$dir" pharmacy-monitor run', []),
         ("  # руками: python - <<'PY'\n", []),
         ("      - name: Run python - check\n", []),
@@ -844,6 +994,45 @@ def _kinds(text: str) -> list[tuple[int, str]]:
 )
 def test_the_check_finds_python_behind_every_form_of_run(text, kinds):
     assert _kinds(text) == kinds
+
+
+@pytest.mark.parametrize(
+    ("text", "lines"),
+    [
+        # Разобрано: запуск, блок, «не запуск», комментарий, часть другого слова.
+        (f"python - <<'PY'\n{_BLOCK}print('python here')\nPY\n", []),
+        ('python "$SCRIPT"\n', []),
+        ("test -x /opt/app/.venv/bin/python\n", []),
+        ("  # python - <<'PY'\n      - name: Run python\n", []),
+        ("- uses: actions/setup-python@v5\n  with:\n    python-version: '3.12'\n", []),
+        ("pip install python-dotenv && apt-get install -y python3-venv\n", []),
+        ("python -c \"\nimport sys\nprint('python')\n\"\n", []),
+        ('PYTHONPATH="$dir" "$PY" job.py\n', []),
+        # Шаблон интерпретатора слово не узнал — строки нет ни в одном списке.
+        ("echo ok\npythonw job.py\n", [2]),
+        ("/usr/bin/micropython job.py\n", [1]),
+        ("run: $python job.py\n", [1]),
+    ],
+)
+def test_a_line_that_names_python_is_never_just_dropped(text, lines):
+    assert lines_naming_python_unexplained(text) == lines
+
+
+def test_every_line_that_names_python_in_a_workflow_is_explained():
+    """Этаж под разбором: шаблон, переставший узнавать форму запуска, не делает
+    тест зелёным — строка со словом `python` обязана быть кем-то объяснена."""
+    found = [
+        f"{path.name}:{line}"
+        for path in sorted(WORKFLOWS.glob("*.y*ml"))
+        for line in lines_naming_python_unexplained(path.read_text(encoding="utf-8"))
+    ]
+    assert found == [], (
+        f"В workflow есть строки со словом `python`, о которых разбор ничего не "
+        f"решил: {', '.join(found)}. Это не запуск, не блок, не комментарий и не "
+        "часть другого слова — шаблон `_INTERPRETER` такую запись интерпретатора "
+        "не узнаёт, и код за ней никто не читает. Научи шаблон этой записи; если "
+        "слово — часть другого (`python3-venv`), допиши `_PART_OF_ANOTHER_WORD`."
+    )
 
 
 def test_the_block_is_read_as_it_was_written():
@@ -922,6 +1111,10 @@ _FAKE_SRC = {
         class Report:
             def send(self):
                 alert(None)
+
+        def wrapped(function):
+            alert(None)
+            return function
         """
     ),
     "src.tenants": textwrap.dedent(
@@ -971,6 +1164,27 @@ _FAKE_SRC = {
         @retry
         def mailer():
             notifier.send_email("x", "y")
+
+        @health.wrapped
+        def wrapped_job():
+            storage.make_session()
+        """
+    ),
+    "src.extra": textwrap.dedent(
+        """
+        from src import main, storage
+
+        @main.cli.command("extra")
+        def extra_cmd():
+            print(storage.TenantUser)
+        """
+    ),
+    "src.shadow": textwrap.dedent(
+        """
+        from src import health
+
+        def health(session):
+            return 1
         """
     ),
     "src.scrapers.base": "import os\n\ndef proxy():\n    return os.environ['PROXY']\n",
@@ -1012,37 +1226,52 @@ _FAKE_SRC = {
         ("text('TRUNCATE recipients')", ["SQL к таблице `recipients` ← код"]),
         ("Base.metadata.tables['recipients']", ["таблица `recipients` ← код"]),
         ("from src.notifier import *", ["`from src.notifier import *` — что взято, не прочитать"]),
-        # Импорт по имени и запуск Python из кода: так зовут CLI мимо обеих проверок.
+        # Импорт по имени; интерпретатор или CLI, названные в коде: так зовут CLI
+        # мимо обеих проверок, и чем именно их запускают, не важно.
         (
             "import subprocess, sys\nsubprocess.run([sys.executable, '-m', 'src.main', 'recipient'])",
             [
-                "`subprocess` запускает Python — что именно, не прочитать ← код",
+                "`sys.executable` — запуск Python из кода не прочитать ← код",
                 "строка `src.main` — CLI зовут командой, а не из кода ← код",
             ],
         ),
         (
-            "import subprocess\nsubprocess.run(['/opt/app/.venv/bin/python3', path])",
-            ["`subprocess` запускает Python — что именно, не прочитать ← код"],
+            "from sys import executable\nrun([executable, '-m', module])",
+            ["`sys.executable` — запуск Python из кода не прочитать ← код"],
         ),
         (
-            "import os\nos.system('python ' + path)\nos.execv('python', args)",
-            [
-                "`os.execv` запускает Python — что именно, не прочитать ← код",
-                "`os.system` запускает Python — что именно, не прочитать ← код",
-            ],
+            "import subprocess\nsubprocess.run(['/opt/app/.venv/bin/python3', path])",
+            ["строка называет `python3` — запуск из кода не прочитать ← код"],
         ),
-        # Не Python: бэкап перед восстановлением снимает `pg_dump`.
+        (
+            "from os import system\nsystem('cd /opt/app && .venv/bin/python job.py')",
+            ["строка называет `python` — запуск из кода не прочитать ← код"],
+        ),
+        (
+            "import asyncio\nasyncio.create_subprocess_exec('python3', 'job.py')",
+            ["строка называет `python3` — запуск из кода не прочитать ← код"],
+        ),
+        (
+            "import subprocess\nsubprocess.run(['pharmacy-monitor'] + ['recipient', 'list'])",
+            ["строка называет `pharmacy-monitor` — запуск из кода не прочитать ← код"],
+        ),
+        # Не интерпретатор и не CLI: бэкап снимает `pg_dump`, путь — каталог.
         ("import subprocess\nsubprocess.run(['pg_dump', '--file=x', name], check=True)", []),
         ("import os\nos.system(command)", []),
-        (
-            "import os\nos.system('cd /opt/app && .venv/bin/python job.py')",
-            ["`os.system` запускает Python — что именно, не прочитать ← код"],
-        ),
+        ("from pathlib import Path\nPath('/opt/pharmacy-monitor/src/main.py').resolve()", []),
+        ("print(f'python={version}, ok')", []),
         (
             "from importlib import import_module\nimport_module(name)",
             ["`importlib` — импорт по имени не прочитать ← код"],
         ),
+        ("import runpy\nrunpy.run_path(path)", ["`runpy` — импорт по имени не прочитать ← код"]),
         ("exec(code)", ["`exec` — импорт по имени не прочитать ← код"]),
+        ("eval(code)", ["`eval` — импорт по имени не прочитать ← код"]),
+        ("__import__(name)", ["`__import__` — импорт по имени не прочитать ← код"]),
+        # Второе имя каждого списка — не только первое.
+        ("notify.send_telegram_message(chat, text)", ["отправка `send_telegram_message` ← код"]),
+        ("print(batch.emails)", ["атрибут `.emails` ← код"]),
+        ("os.environ['TELEGRAM_CHAT_ID']", ["переменная окружения `TELEGRAM_CHAT_ID` ← код"]),
         # Вглубь `src`: функция, переменная со ссылкой на неё, класс, реэкспорт.
         (
             "from src.health import alert\nalert(s)",
@@ -1101,7 +1330,11 @@ _FAKE_SRC = {
         # CLI из кода: команды навешены на группу декоратором.
         (
             "from src.main import cli\ncli(['recipient', 'list'])",
-            ["модель `Recipient` ← main.recipient_list ← main.recipient_group ← main.cli ← код"],
+            [
+                "модель `Recipient` ← main.recipient_list ← main.recipient_group ← main.cli ← код",
+                # Команда, навешенная на ту же группу из другого файла.
+                "модель `TenantUser` ← extra.extra_cmd ← main.cli ← код",
+            ],
         ),
         (
             "from src import main\nCliRunner().invoke(main.recipient_group, ['list'])",
@@ -1112,6 +1345,13 @@ _FAKE_SRC = {
             "from src.main import mailer\nmailer()",
             ["отправка `send_email` ← main.mailer ← код"],
         ),
+        # …и остаётся функцией, которую зовут, даже взятый через модуль.
+        (
+            "from src.main import wrapped_job\nwrapped_job()",
+            ["отправка `send_email` ← health.alert ← health.wrapped ← main.wrapped_job ← код"],
+        ),
+        # Имя, объявленное в модуле, главнее одноимённого модуля, который он взял.
+        ("from src import shadow\nshadow.health.alert(s)", []),
         # Файл из `scripts/`, который берёт код из соседнего файла.
         (
             "from scripts.helpers import who\nwho(s)",

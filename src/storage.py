@@ -60,10 +60,10 @@ def _env_int(name: str, default: int, *, min_value: int) -> int:
     return max(min_value, value)
 
 
-# Вместо текста ошибки, который хранить нельзя. Правило и пометка — те же, что у
-# `logging_setup.without_addresses`; здесь они повторены, а не взяты импортом:
-# этот модуль ни от чего в `src` не зависит, и файл, выложенный отдельно от
-# остальных, обязан загрузиться. Что копии не разошлись, следит тест.
+# Вместо текста ошибки, который хранить нельзя. Признак («@») и пометка — те же,
+# что у `logging_setup.without_addresses`; здесь они повторены, а не взяты
+# импортом: этот модуль ни от чего в `src` не зависит, и файл, выложенный
+# отдельно от остальных, обязан загрузиться. Что копии не разошлись, следит тест.
 _ERROR_TEXT_WITHHELD = "<текст скрыт>"
 # Класс ошибки в начале текста: «IntegrityError: …», «RunQualityFailure: …».
 # Любое другое слово перед двоеточием началом не считается: им бывает и имя
@@ -71,11 +71,18 @@ _ERROR_TEXT_WITHHELD = "<текст скрыт>"
 _ERROR_CLASS = re.compile(
     r"(?:[A-Z][A-Za-z0-9_]*)?(?:Error|Exception|Failure|Warning|Status|Timeout)(?=: )"
 )
-# Так к тексту дописывают заметки: «… | reaped: …», «… | post-persist: …».
+# Так к записанному тексту дописывают заметки: «… | reaped: …».
 _ERROR_NOTE_SEPARATOR = " | "
 
 
-def stored_error_text(text: object) -> str | None:
+def _error_text_without_addresses(text: str) -> str:
+    if "@" not in text:
+        return text
+    named = _ERROR_CLASS.match(text)
+    return f"{named.group()}: {_ERROR_TEXT_WITHHELD}" if named else _ERROR_TEXT_WITHHELD
+
+
+def stored_error_text(text, *, appended_to: object = None):
     """Текст ошибки, как он ляжет в базу: адреса в нём не бывает.
 
     Текст читают не только операторы: страницу прогонов видит сотрудник клиента,
@@ -84,26 +91,27 @@ def stored_error_text(text: object) -> str | None:
     текст параметры запроса. Поэтому чистится он здесь, при записи, а не в
     каждом месте показа (решение владельца 2026-10-09): есть «@» — от текста
     остаётся класс ошибки, если текст с него начинается, и `<текст скрыт>`.
-    Заметки, дописанные через « | », чистятся по одной: заметка с «@» не
-    стирает записанную до неё причину. Где искать исходный текст —
-    docs/RUNBOOK.md «Текст ошибки прогона».
 
-    Видит правило только «@»: Telegram-идентификатор (число) в параметрах
-    запроса пройдёт. Запросы самого сбора таких параметров не содержат.
+    `appended_to` — что лежало в колонке до записи. Если новый текст — прежний
+    плюс заметка через « | », заметка чистится отдельно и причину не стирает.
+    Иначе текст чистится целиком: « | » внутри самой ошибки его не делит.
+
+    Не строка (`None`, выражение SQL) возвращается как есть. Видит правило
+    только «@»: Telegram-идентификатор (число) в параметрах запроса пройдёт.
+    Где искать исходный текст — docs/RUNBOOK.md «Текст ошибки прогона».
     """
-    if text is None:
-        return None
-    if not isinstance(text, str):
-        text = str(text)
-    if "@" not in text:
+    if not isinstance(text, str) or "@" not in text:
         return text
-    parts = []
-    for part in text.split(_ERROR_NOTE_SEPARATOR):
-        if "@" in part:
-            named = _ERROR_CLASS.match(part)
-            part = f"{named.group()}: {_ERROR_TEXT_WITHHELD}" if named else _ERROR_TEXT_WITHHELD
-        parts.append(part)
-    return _ERROR_NOTE_SEPARATOR.join(parts)
+    if isinstance(appended_to, str) and appended_to:
+        head = appended_to + _ERROR_NOTE_SEPARATOR
+        if text.startswith(head):
+            return _ERROR_NOTE_SEPARATOR.join(
+                [
+                    _error_text_without_addresses(appended_to),
+                    _error_text_without_addresses(text[len(head) :]),
+                ]
+            )
+    return _error_text_without_addresses(text)
 
 
 def stored_error_details(value):
@@ -111,9 +119,10 @@ def stored_error_details(value):
 
     Тексты ошибок лежат в `run_quality` не в одном месте — список по сайтам,
     ошибка каждой категории, причина незавершённого маршрута, заметка о
-    восстановлении, — и собирают их в разных функциях. Правится на месте и
-    возвращается тот же объект: код, записав словарь в колонку, продолжает его
-    читать (`run_quality_message`) и дописывать. Ключи не трогаются.
+    восстановлении, — и собирают их в разных функциях. Словари и списки
+    правятся на месте, и возвращается тот же объект: код, записав словарь в
+    колонку, продолжает его читать (`run_quality_message`) и дописывать.
+    Ключи не трогаются: это названия категорий и адреса страниц.
     """
     if isinstance(value, str):
         return stored_error_text(value)
@@ -170,8 +179,9 @@ class Run(Base):
     )
 
     @validates("error_message", "catalog_verification_reason")
-    def _error_text_carries_no_address(self, _key: str, text: object) -> str | None:
-        return stored_error_text(text)
+    def _error_text_carries_no_address(self, key: str, text):
+        # Прежнее значение — из `__dict__`: так его чтение ничего не подгружает.
+        return stored_error_text(text, appended_to=self.__dict__.get(key))
 
     @validates("run_quality")
     def _error_details_carry_no_address(self, _key: str, quality):
@@ -269,8 +279,8 @@ class ScrapeRequest(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     @validates("error_message")
-    def _error_text_carries_no_address(self, _key: str, text: object) -> str | None:
-        return stored_error_text(text)
+    def _error_text_carries_no_address(self, key: str, text):
+        return stored_error_text(text, appended_to=self.__dict__.get(key))
 
 
 class AuditLog(Base):

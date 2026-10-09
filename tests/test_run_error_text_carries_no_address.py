@@ -24,9 +24,11 @@ viewer — сотрудник клиента; текст стоит в стро�
 - запись мимо ORM — `update(Run).values(…)`, `bulk_*_mappings`, сырой SQL,
   правку руками в psql — валидатор не видит. В `src/` таких записей нет; тест
   ниже ловит прямые формы, а словарь, собранный вне вызова, не узнает;
-- текст, обрезанный до записи ровно по имени ящика, оставит его начало: «@» в
-  нём уже нет; ключи внутри `run_quality` (названия категорий, адреса страниц)
-  не чистятся;
+- текст, обрезанный до записи по имени ящика, оставит его начало: «@» в нём
+  уже нет. Три места, где `src/main.py` режет текст ошибки (ошибка категории,
+  список ошибок сайта, причина незавершённого маршрута — до 40 знаков), чистят
+  его до обрезки сами; срез в скрейпере (500 знаков) — нет;
+- ключи внутри `run_quality` (названия категорий, адреса страниц) не чистятся;
 - строки, записанные до правки. На проде 2026-10-09 «@» нет ни в одном из 276
   текстов ошибки; проверка — docs/RUNBOOK.md «Текст ошибки прогона».
 """
@@ -41,12 +43,12 @@ from pathlib import Path
 import pytest
 import structlog
 from click.testing import CliRunner
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from src import api, health, logging_setup, main, storage, telegram_bot
-from src.scrapers.base import ScrapeResult
+from src.scrapers.base import RouteStatus, ScrapeResult
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 ADDRESS = "viewer@client.example"
@@ -94,18 +96,12 @@ _DB_ERROR = IntegrityError(
         ("client.example: recipient viewer@client.example rejected", WITHHELD),
         ("Viewer: mailbox viewer@client.example is full", WITHHELD),
         ("viewerError@client.example: bounced", WITHHELD),
-        # Заметки через « | » чистятся по одной: заметка с «@» не стирает причину.
+        # « | » внутри одного текста его не делит: по обе стороны — та же ошибка.
+        ("KeyError: 'viewer | viewer@client.example'", f"KeyError: {WITHHELD}"),
+        (f"(email)=(viewer) | bounced {ADDRESS}", WITHHELD),
         (
-            "RunQualityFailure: run quality failed | reaped: unit pharmacy-monitor-scrape@aloe.service",
-            f"RunQualityFailure: run quality failed | {WITHHELD}",
-        ),
-        (
-            f"ValueError: {ADDRESS} | post-persist: exit 1",
-            f"ValueError: {WITHHELD} | post-persist: exit 1",
-        ),
-        (
-            f"KeyError: '{ADDRESS}' | TypeError: {ADDRESS}",
-            f"KeyError: {WITHHELD} | TypeError: {WITHHELD}",
+            "RunQualityFailure: run quality failed | reaped: pharmacy-monitor-scrape@aloe.service",
+            f"RunQualityFailure: {WITHHELD}",
         ),
     ],
 )
@@ -114,40 +110,102 @@ def test_error_text_is_stored_without_an_at_sign(written, stored):
     assert "@" not in (storage.stored_error_text(written) or "")
 
 
-def test_what_is_not_text_is_stored_as_its_text():
-    """Запись идёт из обработчика ошибки: упасть на типе значения — потерять прогон."""
-    assert storage.stored_error_text(ValueError(f"no such user {ADDRESS}")) == WITHHELD
-    assert storage.stored_error_text(404) == "404"
+@pytest.mark.parametrize(
+    ("before", "written", "stored"),
+    [
+        # Заметка, дописанная к записанному тексту, чистится отдельно от него.
+        (
+            "RunQualityFailure: run quality failed",
+            "RunQualityFailure: run quality failed | reaped: pharmacy-monitor-scrape@aloe.service",
+            f"RunQualityFailure: run quality failed | {WITHHELD}",
+        ),
+        (
+            "aloe failed",
+            f"aloe failed | post-persist: KeyError: '{ADDRESS}'",
+            f"aloe failed | {WITHHELD}",
+        ),
+        # Строка, записанная до правки: прежний текст чистится тоже.
+        (
+            f"ValueError: {ADDRESS}",
+            f"ValueError: {ADDRESS} | post-persist: exit 1",
+            f"ValueError: {WITHHELD} | post-persist: exit 1",
+        ),
+        # Не дописывание — текст целиком.
+        ("aloe failed", f"other | reaped by {ADDRESS}", WITHHELD),
+        ("aloe", f"aloe failed | reaped by {ADDRESS}", WITHHELD),
+        (None, f"KeyError: 'viewer | {ADDRESS}'", f"KeyError: {WITHHELD}"),
+        ("", f"a | {ADDRESS}", WITHHELD),
+    ],
+)
+def test_a_note_appended_to_the_stored_text_does_not_erase_it(before, written, stored):
+    assert storage.stored_error_text(written, appended_to=before) == stored
 
 
-def test_the_rule_is_the_one_the_commands_use():
-    """В `storage.py` правило повторено, а не взято импортом — копии не расходятся."""
+def test_what_is_not_text_passes_as_it_is():
+    """Атрибуту модели присваивают и выражение SQL — превращать его в текст нельзя."""
+    expression = func.coalesce(storage.Run.error_message, "") + " | reaped"
+    run = storage.Run(error_message=expression)
+    assert run.error_message is expression
+    assert storage.stored_error_text(404) == 404
+    assert storage.stored_error_details({"n": 3, "ok": True, "none": None}) == {
+        "n": 3,
+        "ok": True,
+        "none": None,
+    }
+
+
+def test_the_sign_and_the_mark_are_the_ones_the_commands_use():
+    """В `storage.py` признак («@») и пометка повторены, а не взяты импортом —
+    копии не расходятся. Само правило шире: от текста остаётся класс ошибки."""
     assert storage._ERROR_TEXT_WITHHELD == logging_setup.TEXT_WITHHELD
     for sample in ("", "plain text", f"to {ADDRESS}", "a@b", "@", '"viewer name"@client.example'):
         assert storage.stored_error_text(sample) == logging_setup.without_addresses(sample)
+    for sample in ("ValueError: plain", f"ValueError: {ADDRESS}", f"x | {ADDRESS}", "a | b"):
+        hidden = logging_setup.without_addresses(sample) == logging_setup.TEXT_WITHHELD
+        assert (storage.stored_error_text(sample) != sample) is hidden
+
+
+def _loaded_with_the_module(statements):
+    """Команды, которые исполняются при загрузке файла: всё, кроме тел функций."""
+    for node in statements:
+        yield node
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for field in ("body", "orelse", "finalbody"):
+            yield from _loaded_with_the_module(getattr(node, field, []))
+        for handler in getattr(node, "handlers", []):
+            yield from _loaded_with_the_module(handler.body)
+
+
+def taken_from_src_at_load(source: str) -> set[str]:
+    taken = set()
+    for node in _loaded_with_the_module(ast.parse(source).body):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "src":
+            taken.add(node.module)
+        elif isinstance(node, ast.Import):
+            taken |= {alias.name for alias in node.names if alias.name.split(".")[0] == "src"}
+    return taken
 
 
 def test_storage_loads_without_the_rest_of_src():
     """Модуль моделей грузят API, миграции и блоки в workflow; файл, выложенный
     отдельно от остальных, обязан загрузиться. Импорт внутри функции не в счёт."""
-    tree = ast.parse((SRC / "storage.py").read_text(encoding="utf-8"))
-    taken = {
-        node.module
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "src"
-    } | {
-        alias.name
-        for node in tree.body
-        if isinstance(node, ast.Import)
-        for alias in node.names
-        if alias.name.split(".")[0] == "src"
-    }
+    taken = taken_from_src_at_load((SRC / "storage.py").read_text(encoding="utf-8"))
     assert taken == {"src._time"}, (
         f"`src/storage.py` при загрузке берёт из `src`: {sorted(taken)}. Каждый такой "
         "модуль обязан лежать на сервере той же версии, иначе не запустится ничего: "
-        "ни API, ни миграции, ни сбор. Правило о тексте ошибки повторено в "
-        "`storage.py` именно поэтому — не заменяй копию импортом."
+        "ни API, ни миграции, ни сбор. Признак и пометка для текста ошибки повторены "
+        "в `storage.py` именно поэтому — не заменяй копию импортом."
     )
+    assert taken_from_src_at_load(
+        "from src._time import utcnow\n\ndef f():\n    from src import x\n"
+    ) == {"src._time"}
+    under_a_condition = "if True:\n    from src.logging_setup import TEXT_WITHHELD\n"
+    in_a_class = "class A:\n    import src.tenants\n"
+    under_try = "try:\n    import x\nexcept ImportError:\n    from src import notifier\n"
+    assert taken_from_src_at_load(under_a_condition) == {"src.logging_setup"}
+    assert taken_from_src_at_load(in_a_class) == {"src.tenants"}
+    assert taken_from_src_at_load(under_try) == {"src"}
 
 
 # ─── Колонки ─────────────────────────────────────────────────────────────────
@@ -178,6 +236,8 @@ def test_every_column_with_an_error_text_cleans_it_on_write():
         assert row.error_message == f"ValueError: {WITHHELD}", model.__name__
         row.error_message = f"gone to {ADDRESS}"
         assert row.error_message == WITHHELD, model.__name__
+        row.error_message = "KeyError: 'viewer | viewer@client.example'"
+        assert row.error_message == f"KeyError: {WITHHELD}", model.__name__
         # Дописывание к уже записанному тексту — такая же запись.
         row.error_message = "RunQualityFailure: run quality failed"
         row.error_message = f"{row.error_message} | reaped by {ADDRESS}"
@@ -210,9 +270,12 @@ def _quality_with_addresses() -> dict:
         },
     )
     _, quality = main.classify_run_quality([result], ["aloe"], mode="category")
-    quality["sites"]["aloe"]["routes_incomplete"] = {
-        "dermanlar": {"reason": f"KeyError: '{ADDRESS}'"}
-    }
+    site = quality["sites"]["aloe"]
+    # Три места `classify_run_quality` чистит сама, до обрезки; здесь проверяется
+    # колонка, поэтому текст возвращён таким, каким его записал бы другой код.
+    site["errors"][0] = f"site_fatal: KeyError: '{ADDRESS}'"
+    site["items"]["dermanlar"]["error"] = f"KeyError: '{ADDRESS}'"
+    site["routes_incomplete"] = {"dermanlar": {"reason": f"KeyError: '{ADDRESS}'"}}
     quality["catalog_verification_reason"] = f"incomplete_routes=aloe:1[KeyError: '{ADDRESS}'x1]"
     quality["recovery"] = {"reason": "unit pharmacy-monitor-scrape@aloe.service was killed"}
     quality["checked"] = (f"by {ADDRESS}", 3)
@@ -243,6 +306,47 @@ def test_the_details_of_a_run_are_stored_without_an_address():
     )
     quality["financially_eligible"] = False
     assert run.run_quality["financially_eligible"] is False
+
+
+def test_the_text_is_cleaned_before_it_is_cut():
+    """Срез по имени ящика оставил бы его начало без «@» — и правило бы его не узнало."""
+    cut_at_the_mailbox = "RuntimeError: cannot notify  viewer.name@client.example"
+    assert cut_at_the_mailbox[: main._ROUTE_CAUSE_MAX_LEN].endswith("viewer.name")
+    causes = main._route_incomplete_causes(
+        RouteStatus(complete=False, abort_reason=cut_at_the_mailbox)
+    )
+    assert causes == [f"RuntimeError: {WITHHELD}"]
+
+    long = "KeyError: " + "x" * 478 + " viewer.name@client.example"
+    assert long[:500].endswith("viewer.name")
+    result = ScrapeResult(
+        site="aloe",
+        errors=[long],
+        items_expected=1,
+        items_failed=1,
+        item_results={"dermanlar": {"status": "failed", "error": long}},
+    )
+    _, quality = main.classify_run_quality([result], ["aloe"], mode="category")
+    assert quality["sites"]["aloe"]["errors"] == [f"KeyError: {WITHHELD}"]
+    assert quality["sites"]["aloe"]["items"]["dermanlar"]["error"] == f"KeyError: {WITHHELD}"
+    assert "viewer" not in repr(quality)
+
+
+def test_a_row_written_before_the_rule_is_cleaned_when_a_note_is_added(db_session):
+    db_session.add(storage.Run(status="running"))
+    db_session.commit()
+    db_session.execute(text("UPDATE runs SET error_message = :m"), {"m": f"ValueError: {ADDRESS}"})
+    db_session.commit()
+    db_session.expire_all()
+    run = db_session.query(storage.Run).one()
+    assert "@" in run.error_message  # чтение из базы текст не меняет
+
+    run.error_message = f"{run.error_message} | reaped stale run"
+    db_session.commit()
+
+    assert db_session.execute(text("SELECT error_message FROM runs")).scalar_one() == (
+        f"ValueError: {WITHHELD} | reaped stale run"
+    )
 
 
 def test_the_keys_of_the_details_are_left_alone():

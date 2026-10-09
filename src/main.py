@@ -3441,7 +3441,12 @@ def classify_run_quality(
             persisted_items[key] = {
                 "status": str(value.get("status") or "unknown")[:30],
                 "products": max(0, int(value.get("products") or 0)),
-                **({"error": str(value.get("error"))[:500]} if value.get("error") else {}),
+                # Чистка — до обрезки: срез по имени ящика оставил бы его без «@».
+                **(
+                    {"error": storage.stored_error_text(str(value.get("error")))[:500]}
+                    if value.get("error")
+                    else {}
+                ),
                 **(
                     {"error_kind": str(value.get("error_kind"))[:50]}
                     if value.get("error_kind")
@@ -3489,7 +3494,9 @@ def classify_run_quality(
                 else None
             ),
             "reasons": reasons,
-            "errors": [str(error)[:500] for error in result.errors[:20]],
+            "errors": [
+                storage.stored_error_text(str(error))[:500] for error in result.errors[:20]
+            ],
             "errors_truncated": max(0, len(result.errors) - 20),
             "items": persisted_items,
             "items_truncated": max(0, len(ordered_items) - len(persisted_items)),
@@ -3663,7 +3670,10 @@ def _route_incomplete_causes(status) -> list[str]:
 
     causes: list[str] = []
     if status.abort_reason:
-        causes.append(str(status.abort_reason)[:_ROUTE_CAUSE_MAX_LEN])
+        # Чистка — до обрезки: срез по имени ящика оставил бы его без «@».
+        causes.append(
+            storage.stored_error_text(str(status.abort_reason))[:_ROUTE_CAUSE_MAX_LEN]
+        )
     if status.item_failures > 0:
         causes.append("item_parse_failures")
     if status.pages_skipped > 0:
