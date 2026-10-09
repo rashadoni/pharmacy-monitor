@@ -26,8 +26,9 @@ from sqlalchemy import create_engine
 from src import auth, storage, watchlist as wl
 from src.url_parser import parse_urls_block
 
-load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Только `.env` своего чекаута и только недостающие имена — как в src/main.py.
+load_dotenv(PROJECT_ROOT / ".env")
 
 st.set_page_config(
     page_title="Pharmacy Monitor",

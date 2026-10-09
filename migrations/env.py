@@ -10,11 +10,14 @@ from sqlalchemy import engine_from_config, pool
 
 from src.storage import Base  # noqa: E402
 
-# Load .env if present so local dev "just works"
+# Load the checkout's own .env if present so local dev "just works".  The path
+# is explicit: without one python-dotenv walks up the directory tree, and a
+# staged copy of the code on the server would pick up a file it never shipped
+# with.  The process environment wins, as in src/main.py.
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 except ImportError:
     pass
 
