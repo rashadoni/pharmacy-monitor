@@ -166,7 +166,9 @@ def break_match(
     - Снимает canonical_id с detach_product
     - Если в кластере остался <2 Product'ов — Match удаляется
 
-    Возвращает количество созданных rejection-записей.
+    Возвращает число пар «отвязанный — оставшийся», по которым отказ теперь в
+    силе: запись создана, включена снова или уже была (тогда она подтверждена).
+    Пара товаров из разных тенантов записи не получает и в счёт не входит.
     """
     _acquire_match_mutation_xact_lock(session)
     m = session.get(Match, match_id)
@@ -177,9 +179,18 @@ def break_match(
         log.warning("break_match_skip", reason="product_not_in_match", product=detach_product_id)
         return 0
 
-    others = [p for p in m.products if p.id != detach_product_id]
+    # Состав кластера читаем из базы, а не из сессии. Сессии проекта не
+    # сбрасывают объекты после commit, а запись в `canonical_id` список
+    # `m.products` не меняет: товар, отвязанный или заменённый в этой же сессии,
+    # в нём остаётся. По такому списку вторая отвязка пишет отказ с товаром,
+    # которого в кластере уже нет, и не удаляет кластер, в котором остался один.
+    # flush — чтобы чтение увидело и то, что сессия ещё не записала (autoflush
+    # выключен).
+    session.flush()
+    session.expire(m, ["products"])
+    remaining = [p for p in m.products if p.id != detach_product_id]
     rej_count = 0
-    for other in others:
+    for other in remaining:
         if add_rejection(session, detach_product_id, other.id, reason=reason or "manual break"):
             rej_count += 1
 
@@ -187,13 +198,15 @@ def break_match(
     session.flush()
 
     # Если осталось <2 продукта в кластере — Match теряет смысл
-    remaining = [p for p in m.products if p.id != detach_product_id]
     if len(remaining) < 2:
         for p in remaining:
             p.canonical_id = None
         session.delete(m)
         log.info("match_dissolved", match_id=match_id, reason="cluster_too_small")
     else:
+        # Список в сессии снова устарел на отвязанный товар: следующий читатель
+        # (вызывающий, другая операция над кластером) перечитает его из базы.
+        session.expire(m, ["products"])
         log.info(
             "match_partial_break",
             match_id=match_id,
