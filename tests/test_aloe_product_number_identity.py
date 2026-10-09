@@ -22,6 +22,7 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import pytest
 from click.testing import CliRunner
 from alembic.migration import MigrationContext
@@ -179,7 +180,7 @@ def _write(db_session, products: list[ScrapedProduct], *, whole: bool = True) ->
     run = storage.Run(status="running", catalog_scope="full" if whole else "partial")
     db_session.add(run)
     db_session.commit()
-    written = persist_results(db_session, run, [_result(products)])
+    written = persist_results(db_session, run, [_result(products)], aloe_whole_catalog=whole)
     # Счётчик — о собранном: товар, оставленный до полного сбора, тоже собран.
     assert written == len(products)
     db_session.commit()
@@ -999,20 +1000,65 @@ def test_full_scan_settles_what_a_partial_scan_left(db_session) -> None:
     assert _prices(db_session, rows["12058"]) == [0.84]
 
 
-def test_full_scan_with_an_unfinished_section_decides_like_a_partial_one(db_session) -> None:
-    """Раздел не пройден — часть претендентов не видна: сравнивать их между собой рано."""
-    row = _legacy_row(db_session, _SLUG, price=0.79, country="ru", brand="Reyoung")
-    run = storage.Run(status="running", catalog_scope="full")
-    db_session.add(run)
-    db_session.commit()
+def _run_aloe(monkeypatch, db_session, pages: dict[str, str | Exception], *, baseline: int = 1):
+    """Команда `run --site aloe` целиком; сайт заменён заранее собранными страницами."""
+    from tests.test_run_failure_semantics import _patch_verified_aloe_pipeline
 
-    persist_results(
-        db_session,
-        run,
-        [_result([_scraped(_SINTEZ, country="Rusiya", brand="Sintez")], complete=False)],
+    scrape_all, persist = main.scrape_all, main.persist_results
+    seen: dict[str, list] = {"persisted": [], "whole": [], "in_transaction": []}
+    sessions: list = []
+
+    def recording_persist(session, run, results, **kwargs):
+        seen["persisted"].append([p.external_id for r in results for p in r.products])
+        seen["whole"].append(kwargs.get("aloe_whole_catalog"))
+        return persist(session, run, results, **kwargs)
+
+    class RecordingSessions(sessionmaker):
+        def __call__(self, **kwargs):
+            sessions.append(super().__call__(**kwargs))
+            return sessions[-1]
+
+    def make_session():
+        return RecordingSessions(
+            bind=db_session.get_bind(), expire_on_commit=False, autoflush=False
+        )
+
+    async def fetch(self, url: str) -> str:
+        seen["in_transaction"].append(any(session.in_transaction() for session in sessions))
+        page = pages[url.split("?", 1)[1]]
+        if isinstance(page, Exception):
+            raise page
+        return page
+
+    async def no_browser(self):
+        return self
+
+    async def no_promos(self):
+        return []
+
+    _patch_verified_aloe_pipeline(db_session, monkeypatch)
+    monkeypatch.setattr(storage, "make_session", make_session)
+    monkeypatch.setattr(main, "scrape_all", scrape_all)
+    monkeypatch.setattr(main, "persist_results", recording_persist)
+    monkeypatch.setattr(main, "baselines_for_sites", lambda *args: {"aloe": baseline})
+    monkeypatch.setattr(
+        main.watchlist,
+        "categories_for_site",
+        lambda session, site, only_category_id=None: ["product_field=bestseller", "dermanlar"],
     )
+    monkeypatch.setattr(AloeScraper, "_open_browser", no_browser)
+    monkeypatch.setattr(AloeScraper, "scrape_promos", no_promos)
+    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fetch)
+    monkeypatch.setattr(AloeScraper, "max_retries", 1, raising=False)
+    result = CliRunner().invoke(
+        main.cli, ["run", "--site", "aloe", "--mode", "category", "--no-alerts", "--force"]
+    )
+    db_session.expire_all()
+    return result, seen
 
-    assert _rows(db_session) == {_SLUG: row.id}
+
+_HIT_SINTEZ = {**_SINTEZ, "brand": {"name": "Sintez"}}
+_TWIN_REYOUNG = {**_REYOUNG, "brand": {"name": "Reyoung"}}
 
 
 async def test_run_decides_heirs_over_the_whole_site_not_section_by_section(
@@ -1023,55 +1069,68 @@ async def test_run_decides_heirs_over_the_whole_site_not_section_by_section(
     Раздел «хиты» идёт первым и показывает один товар слага. Записанный сразу, он
     забрал бы строку, в которой записан другой товар той же страны.
     """
-    from tests.test_run_failure_semantics import _patch_verified_aloe_pipeline
-
     row = _legacy_row(db_session, _SLUG, price=0.79, brand="Reyoung")
     pages = {
-        "product_field=bestseller": _listing({**_SINTEZ, "brand": {"name": "Sintez"}}),
-        "category_slug=dermanlar": _listing(
-            {**_SINTEZ, "brand": {"name": "Sintez"}}, {**_REYOUNG, "brand": {"name": "Reyoung"}}
-        ),
+        "product_field=bestseller": _listing(_HIT_SINTEZ),
+        "category_slug=dermanlar": _listing(_HIT_SINTEZ, _TWIN_REYOUNG),
     }
-    scrape_all, persist = main.scrape_all, main.persist_results
-    persisted: list[list[str]] = []
 
-    def recording_persist(session, run, results):
-        persisted.append([p.external_id for r in results for p in r.products])
-        return persist(session, run, results)
-
-    async def fetch(self, url: str) -> str:
-        return pages[url.split("?", 1)[1]]
-
-    async def no_browser(self):
-        return self
-
-    async def no_promos(self):
-        return []
-
-    _patch_verified_aloe_pipeline(db_session, monkeypatch)
-    monkeypatch.setattr(main, "scrape_all", scrape_all)
-    monkeypatch.setattr(main, "persist_results", recording_persist)
-    monkeypatch.setattr(
-        main.watchlist,
-        "categories_for_site",
-        lambda session, site, only_category_id=None: ["product_field=bestseller", "dermanlar"],
-    )
-    monkeypatch.setattr(AloeScraper, "_open_browser", no_browser)
-    monkeypatch.setattr(AloeScraper, "scrape_promos", no_promos)
-    monkeypatch.setattr(AloeScraper, "_fetch_listing_html", fetch)
-    monkeypatch.setattr(AloeScraper, "rate_limit_sec", 0.001, raising=False)
-
-    result = await asyncio.to_thread(
-        CliRunner().invoke,
-        main.cli,
-        ["run", "--site", "aloe", "--mode", "category", "--no-alerts", "--force"],
-    )
+    result, seen = await asyncio.to_thread(_run_aloe, monkeypatch, db_session, pages)
 
     assert result.exit_code == 0, result.output
-    assert persisted == [["12058", "12058", "12224"]]
-    db_session.expire_all()
+    assert (seen["persisted"], seen["whole"]) == ([["12058", "12058", "12224"]], [True])
     rows = _rows(db_session)
     assert rows["12224"] == row.id and rows["12058"] != row.id
+    # Сбор идёт десятки минут: всё это время сессия не держит открытой транзакции.
+    assert seen["in_transaction"] == [False, False]
+
+
+@pytest.mark.parametrize(
+    ("pages", "baseline"),
+    [
+        pytest.param(
+            {
+                "product_field=bestseller": _listing(_HIT_SINTEZ),
+                "category_slug=dermanlar": httpx.ConnectError("no answer"),
+            },
+            1,
+            id="section_not_scraped",
+        ),
+        pytest.param(
+            {
+                "product_field=bestseller": _listing(_HIT_SINTEZ),
+                "category_slug=dermanlar": _listing(_HIT_SINTEZ),
+            },
+            1000,
+            id="sections_done_but_far_fewer_products_than_usual",
+        ),
+        pytest.param(
+            {
+                "product_field=bestseller": _listing(_HIT_SINTEZ),
+                "category_slug=dermanlar": _listing(_HIT_SINTEZ),
+            },
+            None,
+            id="run_quality_below_its_own_baseline",
+        ),
+    ],
+)
+async def test_scan_the_system_will_not_trust_does_not_decide_heirs(
+    monkeypatch, db_session, pages, baseline
+) -> None:
+    """Раздать строки по сбору, где сайт отдал не всё, потом уже не отменить."""
+    row = _legacy_row(db_session, _SLUG, price=0.79, brand="Reyoung")
+    if baseline is None:
+        # Проверка каталога пройдена, а прогон собрал много меньше своих прежних.
+        monkeypatch.setattr(main, "run_quality_baselines_for_sites", lambda *a, **k: {"aloe": 1000})
+        baseline = 1
+
+    result, seen = await asyncio.to_thread(
+        _run_aloe, monkeypatch, db_session, pages, baseline=baseline
+    )
+
+    assert seen["whole"] == [False], result.output
+    # Товар, который пришёл один и в строке не записан, ждёт полного сбора.
+    assert _rows(db_session) == {_SLUG: row.id}
 
 
 # ─── Включение правила: миграция 0024, а не выкладка кода ────────────────────
@@ -1223,6 +1282,16 @@ async def test_automatic_ai_fallback_skips_aloe(monkeypatch) -> None:
     assert started == ["ai"]
 
 
+def test_ai_crawl_refuses_to_write_aloe(monkeypatch) -> None:
+    """Он называет товар aloe по-своему: запись завела бы товару вторую строку."""
+    monkeypatch.setattr(storage, "init_db", lambda: pytest.fail("до записи дойти не должно"))
+
+    result = CliRunner().invoke(main.cli, ["ai-crawl", "--site", "aloe"])
+
+    assert result.exit_code != 0
+    assert "только с --dry-run" in result.output
+
+
 def test_migration_switches_the_rule_on_and_downgrade_switches_it_off(
     switched_off_session,
 ) -> None:
@@ -1236,6 +1305,17 @@ def test_migration_switches_the_rule_on_and_downgrade_switches_it_off(
     assert main._aloe_number_identity_active(session) is True
     _write(session, [_scraped(_SINTEZ)])
     assert _rows(session) == {"12058": row.id}
+
+    # Отключённый триггер ничего не охраняет — правило выключено.
+    session.execute(
+        text(f"ALTER TABLE products DISABLE TRIGGER {main.ALOE_NUMBER_IDENTITY_TRIGGER}")
+    )
+    assert main._aloe_number_identity_active(session) is False
+    session.execute(
+        text(f"ALTER TABLE products ENABLE TRIGGER {main.ALOE_NUMBER_IDENTITY_TRIGGER}")
+    )
+    assert main._aloe_number_identity_active(session) is True
+    session.commit()
 
     for _ in range(2):
         _downgrade(session)

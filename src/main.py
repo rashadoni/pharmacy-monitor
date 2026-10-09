@@ -1817,7 +1817,9 @@ def _aloe_number_identity_active(session: Session) -> bool:
         session.scalar(
             text(
                 "select exists (select 1 from pg_trigger where tgname = :name"
-                " and tgrelid = to_regclass('products') and not tgisinternal)"
+                " and tgrelid = to_regclass('products') and not tgisinternal"
+                # Отключённый триггер ничего не охраняет: правило выключено.
+                " and tgenabled <> 'D')"
             ),
             {"name": ALOE_NUMBER_IDENTITY_TRIGGER},
         )
@@ -3875,7 +3877,13 @@ def _snapshot_payload_changed(last: dict | None, sp: ScrapedProduct) -> bool:
     )
 
 
-def persist_results(session: Session, run: storage.Run, results: list[ScrapeResult]) -> int:
+def persist_results(
+    session: Session,
+    run: storage.Run,
+    results: list[ScrapeResult],
+    *,
+    aloe_whole_catalog: bool = False,
+) -> int:
     """Сохранить ScrapedProduct/Promo в БД, обновить last_seen_at, добавить snapshots.
 
     Diff-only persist (2026-05-09): для существующих товаров pre-fetch'им
@@ -3893,6 +3901,12 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
     Per-chunk: pre-fetch existing → pre-fetch latest snapshots → ORM
     `add_all + flush` для новых продуктов (нужен RETURNING id для FK) →
     Core `insert` для diff-snapshots → commit.
+
+    `aloe_whole_catalog` — результат aloe есть полный сбор сайта, которому
+    система верит (все разделы пройдены, качество в норме). Только такой сбор
+    решает, кому достаётся строка, записанная под общим слагом
+    (`_adopt_aloe_product_numbers`); решение необратимо, поэтому признак
+    считает вызывающий — `run`, до записи.
 
     Returns: общее число spарсенных продуктов (НЕ записанных snapshot'ов —
     после diff-only snapshots может быть существенно меньше, чем products).
@@ -3924,15 +3938,8 @@ def persist_results(session: Session, run: storage.Run, results: list[ScrapeResu
         products = result.products
         if result.site == "aloe" and any(sp.identity_verified for sp in products):
             if _aloe_number_identity_active(session):
-                # Строку общего слага делит только полный сбор сайта, прошедший
-                # все разделы: иначе часть претендентов не видна.
-                whole_catalog = (
-                    run.catalog_scope == "full"
-                    and bool(result.route_statuses)
-                    and all(status.complete for status in result.route_statuses.values())
-                )
                 waiting = _adopt_aloe_product_numbers(
-                    session, products, whole_catalog=whole_catalog
+                    session, products, whole_catalog=aloe_whole_catalog
                 )
                 if waiting:
                     products = [
@@ -5156,6 +5163,13 @@ def ai_crawl_cmd(
     """
     from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE
 
+    if site == "aloe" and not dry_run:
+        raise click.ClickException(
+            "ai-crawl по aloe пока только с --dry-run: он называет товар по-своему и пишет "
+            "адрес со слагом, а товар aloe узнаётся по номеру на сайте — запись завела бы "
+            "товару вторую строку или затёрла адрес (CLAUDE.md, «Товар aloe узнаётся по номеру»)"
+        )
+
     if budget_usd is not None:
         os.environ["AI_CRAWL_BUDGET_USD"] = str(budget_usd)
 
@@ -5643,13 +5657,18 @@ def run_cmd(
 
                     on_category = _persist_category
 
+                country_map = load_aloe_country_map(session)
+                # Сбор идёт десятки минут, а aloe пишется только в его конце:
+                # чтения выше не должны всё это время держать открытую
+                # транзакцию (за ней встала бы любая правка схемы).
+                session.commit()
                 results = asyncio.run(
                     scrape_all(
                         slugs_by_site,
                         limit,
                         ai_fallback_baselines=baselines,
                         on_category=on_category,
-                        aloe_country_map=load_aloe_country_map(session),
+                        aloe_country_map=country_map,
                     )
                 )
                 persist_aloe_country_mappings(session, results)
@@ -5737,11 +5756,10 @@ def run_cmd(
                         quality["catalog_verification_reason_full"] = full_reason
                         run.run_quality = quality
                         raise
-            count = persist_results(session, run, results)
-            run.products_scraped = count
-            run.products_per_site = {r.site: len(r.products) for r in results}
-            run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
-            run.sites_completed = ",".join(r.site for r in results)
+            # Оба вердикта о сборе считаются до записи, а не после: кому
+            # достаётся строка aloe под общим слагом, решает только сбор,
+            # которому система потом поверит, — раздать строки по сбору, где
+            # сайт отдал половину товаров, уже не отменить.
             if quality_status is None or quality is None:
                 quality_status, quality = classify_run_quality(
                     results,
@@ -5750,19 +5768,28 @@ def run_cmd(
                     baselines=quality_baselines,
                     enforce_baseline=enforce_quality_baseline,
                 )
+            catalog_verified = guarded_catalog_verified
+            catalog_verification_reason = guarded_catalog_reason
+            if is_full_catalog and not requires_pre_persist_catalog_guard:
+                catalog_verified, catalog_verification_reason = _verify_full_catalog_results(
+                    results,
+                    sites=sites,
+                    expected_slugs=slugs_by_site,
+                    baselines=baselines,
+                )
+            count = persist_results(
+                session,
+                run,
+                results,
+                aloe_whole_catalog=is_full_catalog and quality_status == "ok" and catalog_verified,
+            )
+            run.products_scraped = count
+            run.products_per_site = {r.site: len(r.products) for r in results}
+            run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
+            run.sites_completed = ",".join(r.site for r in results)
             if is_full_catalog:
-                if requires_pre_persist_catalog_guard:
-                    run.catalog_verified = guarded_catalog_verified
-                    run.catalog_verification_reason = guarded_catalog_reason
-                else:
-                    run.catalog_verified, run.catalog_verification_reason = (
-                        _verify_full_catalog_results(
-                            results,
-                            sites=sites,
-                            expected_slugs=slugs_by_site,
-                            baselines=baselines,
-                        )
-                    )
+                run.catalog_verified = catalog_verified
+                run.catalog_verification_reason = catalog_verification_reason
                 financial_ok = quality_status == "ok" and run.catalog_verified
                 quality["full_catalog_verified"] = financial_ok
                 quality["financially_eligible"] = financial_ok

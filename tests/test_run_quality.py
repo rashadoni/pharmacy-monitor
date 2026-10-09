@@ -873,12 +873,13 @@ def test_ai_crawl_fatal_creates_failed_run_with_sanitized_quality(db_session, mo
     Session = sessionmaker(db_session.get_bind(), expire_on_commit=False)
     monkeypatch.setattr(storage, "init_db", lambda *args, **kwargs: None)
     monkeypatch.setattr(storage, "make_session", lambda *args, **kwargs: Session)
-    monkeypatch.setitem(ai_crawler.AI_CRAWLER_BY_SITE, "aloe", _FatalAICrawler)
+    # Сайт здесь — пример; по aloe команда без --dry-run отказывает сама.
+    monkeypatch.setitem(ai_crawler.AI_CRAWLER_BY_SITE, "aptekonline", _FatalAICrawler)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     result = CliRunner().invoke(
         main_mod.cli,
-        ["ai-crawl", "--site", "aloe", "--max-urls", "3"],
+        ["ai-crawl", "--site", "aptekonline", "--max-urls", "3"],
     )
 
     run = db_session.query(storage.Run).one()
@@ -887,6 +888,6 @@ def test_ai_crawl_fatal_creates_failed_run_with_sanitized_quality(db_session, mo
     assert run.status == "failed"
     assert run.finished_at is not None
     assert run.run_quality["financially_eligible"] is False
-    assert run.run_quality["sites"]["aloe"]["site_fatal"] is True
+    assert run.run_quality["sites"]["aptekonline"]["site_fatal"] is True
     assert "top-secret" not in payload
     assert "az.decodo.com" not in payload

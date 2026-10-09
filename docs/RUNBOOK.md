@@ -973,7 +973,8 @@ drop-in).
 правило выключено.
 
 Кому достаётся строка общего слага, решает только **полный сбор aloe,
-прошедший все разделы**: он видит все товары слага. Тик и сбор раздела
+которому система верит** (все разделы пройдены, качество прогона в норме —
+прогон кончается `ok`): он видит все товары слага, а решение необратимо. Тик и сбор раздела
 переводят строку, только когда пришедший товар в ней и записан (совпали
 страна, бренд и последняя цена — всё, что в строке есть); остальные товары,
 пока строка свободна, до полного сбора не пишутся вовсе (`left_for_full_scan`,
@@ -982,7 +983,10 @@ drop-in).
 **Включение правила — по шагам:**
 
 1. До выкладки (только чтение). Слага из одних цифр в каталоге нет — он был бы
-   принят за номер; закреплённых ссылок aloe нет; PR #52 закрыт:
+   принят за номер; закреплённых ссылок aloe нет; PR #52 закрыт; PR #39 смержен
+   (он убирает workflow, которые кладут на сервер файлы по одному: прежний
+   `src/main.py` при новом сборщике до первого полного сбора завёл бы вторые
+   строки, и предохранитель этого не видит):
 
 ```sql
 select external_id from products where site = 'aloe' and external_id ~ '^[0-9]+$';  -- только '0'
@@ -995,7 +999,10 @@ select count(*) from tracked_product_links where site = 'aloe' and url is not nu
    время сбора (`select id, status from runs where finished_at is null`).
 3. Сразу — полный сбор одного aloe мимо ритма (около получаса, под замком
    сбора). Кнопка в дашборде не годится: она собирает все сайты, и aloe
-   запишется, только когда закончатся остальные.
+   запишется, только когда закончатся остальные. Этот сбор пришлёт клиенту
+   товары, которые раньше были скрыты, как «новые» (около 190) и исправленные
+   цены; запускать ли его с `--no-alerts` — решение владельца, спросить до
+   запуска.
 
 ```bash
 ssh root@13.140.186.143 'systemd-run --quiet --wait --pipe --collect \
@@ -1004,10 +1011,12 @@ ssh root@13.140.186.143 'systemd-run --quiet --wait --pipe --collect \
   /opt/pharmacy-monitor/.venv/bin/pharmacy-monitor run --site aloe --force'
 ```
 
-4. Проверить событие `aloe_product_numbers_adopted` в выводе этой команды:
-   `whole_catalog=True`, `left_for_full_scan=0`, и запрос 2 ниже пуст. Если
-   `whole_catalog=False` (не пройден раздел) — сбор повторить: наследников
-   общих слагов он не назначал. У плановых сборов и тиков событие — в журнале:
+4. Проверить: прогон кончился `ok` (`select id, status, catalog_verified from
+   runs order by id desc limit 1`), в событии `aloe_product_numbers_adopted` из
+   вывода команды `whole_catalog=True` и `left_for_full_scan=0`, запрос 2 ниже
+   сходится. Если прогон не `ok` или `whole_catalog=False` — наследников общих
+   слагов он не назначал; ближайшей ночью плановый сбор повторит попытку сам,
+   но лучше повторить сразу. У плановых сборов и тиков событие — в журнале:
 
 ```bash
 ssh root@13.140.186.143 "journalctl -u 'pharmacy-monitor-scrape@aloe' \
@@ -1031,12 +1040,19 @@ select count(*) filter (where external_id ~ '^[0-9]+$' and external_id <> '0') a
        count(*) filter (where external_id !~ '^[0-9]+$' or external_id = '0')  as under_slug
   from products where site = 'aloe';
 
--- 2. После первого ПОЛНОГО сбора должно быть пусто: строка под слагом, которую
---    сбор видел позже включения правила.
-select id, external_id, last_seen_at from products
- where site = 'aloe' and (external_id !~ '^[0-9]+$' or external_id = '0')
-   and last_seen_at > timestamp '<время включения, UTC>'
- order by last_seen_at desc limit 20;
+-- 2. После первого ПОЛНОГО сбора: строки под слагом, у слага которых уже есть
+--    строка под номером, виденная после включения правила. Их должно быть
+--    столько, сколько `left_for_other_country` в событии этого сбора (строка
+--    оставлена, потому что пришедшие товары другой страны). Больше — сбор
+--    наследников не назначал или не дошёл до этих товаров.
+select count(*) from products s
+ where s.site = 'aloe' and (s.external_id !~ '^[0-9]+$' or s.external_id = '0')
+   and exists (
+       select 1 from products n
+        where n.site = 'aloe' and n.external_id ~ '^[1-9][0-9]*$'
+          and n.url like '%/#' || split_part(rtrim(s.url, '/'), '/', 4)
+          and split_part(n.url, '#', 2) = split_part(rtrim(s.url, '/'), '/', 4)
+          and n.last_seen_at > timestamp '<время включения, UTC>');
 
 -- 3. Слаги, под которыми теперь несколько строк, — те самые разные товары.
 select split_part(url, '#', 2) as slug, count(*), array_agg(external_id order by id)
