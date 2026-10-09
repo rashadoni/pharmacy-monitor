@@ -764,7 +764,7 @@ def dispatch_event(session: Session, event: AlertEvent) -> dict:
     `notifications.dispatch_events_batch`), остался под тестами.
 
     Возвращает {channel: status} где status = 'sent' / 'sent to N/M' /
-    'skipped: …' / 'error: msg'. В `channels_sent` попадают только каналы, по
+    'skipped: …' / 'error: <класс ошибки>'. В `channels_sent` попадают только каналы, по
     которым отправитель подтвердил хотя бы одну отправку, — а не все каналы
     правила: 'skipped', 'error' и 'sent to 0/M' доставкой не считаются.
     """
@@ -822,8 +822,9 @@ def _send_email_alert(event: AlertEvent) -> tuple[str, bool]:
     except Exception as e:
         from src.notifier import delivery_error_fields
 
-        log.warning("alert_email_failed", **delivery_error_fields(e))
-        return f"error: {e}", False
+        log.warning("alert_email_failed", event_id=event.id, **delivery_error_fields(e))
+        # Класс ошибки, не её текст: в тексте ошибки отправки бывает адрес.
+        return f"error: {type(e).__name__}", False
 
 
 def _send_telegram_alert(session: Session, event: AlertEvent) -> tuple[str, bool]:
@@ -857,5 +858,5 @@ def _send_telegram_alert(session: Session, event: AlertEvent) -> tuple[str, bool
     except Exception as e:
         from src.notifier import delivery_error_fields
 
-        log.warning("alert_telegram_failed", **delivery_error_fields(e))
-        return f"error: {e}", False
+        log.warning("alert_telegram_failed", event_id=event.id, **delivery_error_fields(e))
+        return f"error: {type(e).__name__}", False

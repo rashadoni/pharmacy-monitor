@@ -1436,7 +1436,9 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   digestSendTest: (kind: "daily" | "weekly" = "daily") =>
-    request<{ ok: boolean; recipients_sent: number }>(
+    // `recipients_sent` — только письма, которые почта подтвердила. `ok: false`
+    // значит, что кому-то не ушло: ответ при этом 200, исход читать по числам.
+    request<{ ok: boolean; recipients_sent: number; recipients_failed?: number }>(
       `/api/v1/dash/digest/send-test?kind=${kind}`,
       { method: "POST", timeoutMs: 30_000 },
     ),

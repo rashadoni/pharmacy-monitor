@@ -180,43 +180,50 @@ sudo journalctl -u pharmacy-monitor-run -f
 |---|---|
 | `smtp_send recipients=N`, следом `smtp_sent_ok` | Почтовый сервер письмо принял. Дальше — не у нас: доставку смотреть в кабинете Resend |
 | `…_failed user_id=… error_type=…` | Не ушло; причина — в `error_type`, таблица ниже. События: `email_batch_failed` (письмо о прогоне и письмо админу с тика), `digest_email_failed`, `login_link_email_failed`, `email_dispatch_failed`, `alert_email_failed`, `error_email_failed`. Строки `smtp_send` перед ним может и не быть: до разговора с сервером дело не дошло |
-| `email_skipped_no_smtp` | В окружении нет `SMTP_HOST` — обычно ручной запуск без загруженного env. Письма не было. Тот, кто слал, следом пишет свою строку сбоя без `error_type`: `email_batch_failed user_id=…` (письмо о прогоне и письмо админу с тика), `digest_email_failed user_id=…` (дайджест), `email_dispatch_failed`, `alert_email_failed` |
+| `email_skipped_no_smtp` | В окружении нет `SMTP_HOST` — обычно ручной запуск без загруженного env. Письма не было. Рассылки следом пишут свою строку сбоя без `error_type`: `email_batch_failed user_id=…` (письмо о прогоне и письмо админу с тика), `digest_email_failed user_id=…` (дайджест получателям; у старой команды `digest` — без `user_id`, письмо одно на всех). Ссылка на вход, отчёт о сборе и письмо об ошибке своей строки не пишут — у них остаётся только эта |
 | Нет ни `smtp_send`, ни `…_failed` | Письмо и не собирались слать: нет событий, порог важности получателя, включённый `daily_digest`, запуск с `--no-alerts` |
 
 **Дайджест: чем кончилась рассылка.** «Отправлено» говорится только о письме,
 которое отправитель подтвердил. `notify digest daily|weekly` заканчивается одной
 из строк:
 
-| В журнале | Что значит | Код выхода команды |
+| В журнале | Что значит | Команда |
 |---|---|---|
-| `digest_sent kind=… recipients=N events=M` | Письмо ушло всем N получателям | 0, `OK: weekly digest sent to N recipients` |
-| `digest_sent … recipients=N failed=K` (warning) | Ушло N получателям, ещё K — нет; кому — строки `digest_email_failed user_id=…` выше | 1, `Error: weekly digest sent to N of N+K recipients, K not sent` |
-| `digest_not_sent kind=… failed=K` (warning) | Не ушло никому | 1 |
-| `digest_no_events` / `digest_no_recipients` | Слать нечего или некому: пустое окно, никто не включил дайджест | 0, `sent to 0 recipients` |
+| `digest_sent kind=… recipients=N events=M` | Письмо подтверждено всем N получателям | код 0, `OK: weekly digest sent to N recipients` |
+| `digest_delivery_incomplete kind=… sent=N failed=K` (warning) | K получателям не ушло, N — ушло (`sent=0` — не ушло никому). Кому — строки `digest_email_failed user_id=…` выше | код 1, `Error: weekly digest sent to N of N+K recipients, K not sent` |
+| `digest_no_events` / `digest_no_recipients` | Слать нечего или некому: пустое окно, никто не включил дайджест, `--only` никого не нашёл | код 0, `Nothing to send: …` |
 
 Код 1 делает юнит `pharmacy-monitor-digest-weekly` упавшим (`systemctl
---failed`). Повторно он сам не запускается — `Type=oneshot` без `Restart`, — так
-что второго письма тем, кому первое ушло, не будет; следующая попытка — по
-расписанию. Запускать руками после починки почты можно, но письмо получат все
-подписанные, включая тех, кому оно уже пришло: одному — `--only <адрес>`.
+--failed`); за ним никто не следит — health этот юнит не читает. Повторно он сам
+не запускается — `Type=oneshot` без `Restart`, — так что второго письма тем,
+кому первое ушло, не будет; следующая попытка — по расписанию. Запускать руками
+после починки почты можно, но письмо получат все подписанные, включая тех, кому
+оно уже пришло: одному — `--only <адрес>` (адрес по `user_id` — запрос из п. 3).
+Получатель, которому почта отказывает постоянно (`SMTPRecipientsRefused`), будет
+ронять юнит каждую неделю, пока ему не выключат дайджест или не поправят адрес.
 
-Кнопка «отправить дайджест» в Quick Actions зовёт тот же код. Не ушло ни одного
-письма — ответ 502, в журнале API `digest_send_failed failed=K`; на экране при
-этом общий текст дашборда для ошибок сервера («Сервер недоступен. Попробуйте
-через минуту») — своей фразы у кнопки нет, причину смотреть в журнале. Ушло
-части — в сообщении число тех, кому ушло, в журнале `digest_sent_manual count=N
-failed=K` (warning).
+Кнопка «отправить дайджест» в Quick Actions зовёт тот же код и читает исход из
+ответа (он всегда 200: `ok`, `recipients_sent`, `recipients_failed`). На экране —
+своя фраза на каждый исход: «отправлен N получателям», «отправлен не всем: ушло
+N, не ушло K», «не отправлен: не ушло ни одно письмо», «не отправлялся: за сутки
+нет событий или никто не подписан». В журнале API — `digest_sent_manual count=N
+failed=K` (warning, если K > 0), `digest_not_sent_manual failed=K` (error),
+`digest_manual_nothing_to_send`.
 
 Старая команда `pharmacy-monitor digest` (юнит `pharmacy-monitor-digest@daily`,
 на проде выключен) шлёт одно письмо на всех: не ушло — `digest_email_failed` и
 код 1 (`Error: digest not sent`). «Skipped: no events in window» теперь значит
 только то, что событий не было.
 
-До 2026-10-09 ответ отправителя здесь не читался: без `SMTP_HOST` журнал писал
-`digest_sent recipients=N`, команда — `OK: … sent to N recipients`, кнопка —
-«отправлен N получателям», а старая команда при упавшей почте печатала
-«Skipped: no events in window». `digest_sent` в журнале до этой даты письма не
-доказывает — доказывает `smtp_sent_ok` перед ним.
+`report --send` (письмо с отчётом по прогону, руками): без `SMTP_HOST` — код 1 и
+`Error: report saved, but the email was not sent`; «Email sent.» печатается
+только после подтверждения.
+
+До 2026-10-09 ответ отправителя во всех этих местах не читался: без `SMTP_HOST`
+журнал писал `digest_sent recipients=N`, команды — `OK: … sent to N recipients`
+и «Email sent.», кнопка — «отправлен N получателям», а старая команда при
+упавшей почте печатала «Skipped: no events in window». `digest_sent` в журнале
+до этой даты письма не доказывает — доказывает `smtp_sent_ok` перед ним.
 
 **2. Что значит `error_type`.** Рядом с ним — числа, по которым случаи
 различаются: `smtp_code` (ответ сервера, 550), `smtp_status` (уточнение из того
@@ -501,36 +508,48 @@ group by 1 order by 1;
 **Симптом:** событие на странице `/alerts` есть, а сообщения в Telegram (или
 письма) получатель после сбора не получил.
 
-Рассылка о прогоне, если было что слать, заканчивается строкой:
+Рассылка о прогоне заканчивается одной итоговой строкой. Её имя зависит от
+исхода — «разослано» говорится только о рассылке, в которой отправитель
+подтвердил всё, что слали:
 
 ```
-alerts_dispatched_batch events=12 emails=2 telegram=0 failed=1 undelivered=3
+alerts_dispatch_incomplete events=12 emails=2 telegram=0 failed=1 undelivered=3
 ```
+
+| Строка | Что значит |
+|---|---|
+| `alerts_dispatched_batch` | Всё, что слали, ушло (`failed=0`) |
+| `alerts_dispatch_incomplete` (warning) | Хоть одна отправка не состоялась. В полях — сколько всё-таки ушло: строка бывает и когда одно письмо из двух дошло, и когда не дошло ни одно |
+| `alerts_dispatch_no_recipient` | Сбоя нет, но и слать было некому: пороги важности, тихие часы, получатели на ежедневном дайджесте |
+
+Поля у всех трёх одни:
 
 | Поле | Что значит |
 |---|---|
+| `events` | Сколько событий было к рассылке |
 | `emails`, `telegram` | Сколько писем и сообщений отправитель подтвердил |
 | `failed` | Сколько отправок не состоялось — отказ отправителя или ошибка. Одно письмо или сообщение — одна отправка, сколько бы событий в нём ни было |
 | `undelivered` | Сколько событий кому-то слали, и они не дошли ни по одному каналу |
 
-Строки нет вовсе — слать было нечего либо рассылка оборвалась на ошибке
-(`alert_dispatch_failed` с `error_type`, см. ниже); тем, до кого очередь дошла
-раньше обрыва, сообщения уже ушли.
+`failed` бывает больше нуля при `undelivered=0`: письмо дошло, а сообщение в
+Telegram тому же человеку — нет. Получатель с привязанным Telegram при пустом
+`TELEGRAM_BOT_TOKEN` даёт такую строку в каждом сборе, где ему есть что слать.
 
-Сразу за ней — строка самого сбора, одна на рассылку. «Разослано» в ней
-говорится только о том, что отправитель подтвердил:
+Итоговой строки нет вовсе — событий не было либо рассылка оборвалась целиком.
+Тогда сбор пишет `alert_dispatch_failed run_id=… events=N error_type=…`
+(warning): упал не отправитель — его отказ рассылка ловит сама, — а, например,
+база на записи меток канала. Текст ошибки в журнал не идёт, только её класс;
+подробности — в журнале PostgreSQL за ту же минуту. Тем, до кого очередь дошла
+раньше обрыва, сообщения уже ушли; у событий получателя, на котором оборвалось,
+метки канала нет, хотя письмо могло уйти. Сбор после этого идёт дальше и
+остаётся `ok`: цены и события записаны раньше, а сессию сбор откатывает
+(`alert_dispatch_rollback_failed` — откатить не вышло, соединения нет; тогда
+сбор упадёт следующим же запросом, уже со своей причиной).
 
-| Строка сбора | Что значит |
-|---|---|
-| `alerts_dispatched run_id=… events=N email=… telegram=… failed=0 undelivered=0` | Всё, что слали, ушло. `events` — сколько событий создал сбор, `email` и `telegram` — сколько писем и сообщений подтверждено |
-| `alert_dispatch_failed run_id=… events=N email=… telegram=… failed=K undelivered=U` (warning) | K отправок не состоялось. `email` и `telegram` — сколько при этом всё-таки ушло, так что строка бывает и при частичной рассылке |
-| `alert_dispatch_failed run_id=… events=N error_type=…` (warning) | Рассылка оборвалась целиком — не на отправителе, а, например, на базе. Итога нет; текст ошибки в журнал не пишется, только её класс |
-| `alerts_dispatch_no_recipient run_id=… events=N` | Сбоя нет, но и слать было некому: пороги важности, тихие часы, получатели на ежедневном дайджесте |
-
-Сбор от сбоя рассылки не падает и остаётся `ok`: цены и события уже записаны.
-До 2026-10-09 здесь при любом исходе стояло `alerts_dispatched count=N` — и когда
-все отправки отказали, и когда рассылка оборвалась; `count` было числом
-созданных событий, а не разосланных.
+До 2026-10-09 итог назывался `alerts_dispatched_batch` при любом исходе, а сбор
+следом всегда писал `alerts_dispatched count=N` — и когда все отправки отказали,
+и когда рассылка оборвалась; `count` было числом созданных событий. Оборвавшаяся
+на базе рассылка к тому же роняла сбор и оставляла прогон в `running`.
 
 Кому не ушло — строкой выше: `telegram_batch_failed user_id=… events=N` или
 `email_batch_failed user_id=… events=N`. `events` — сколько событий было в
@@ -554,13 +573,13 @@ alerts_dispatched_batch events=12 emails=2 telegram=0 failed=1 undelivered=3
 
 ```bash
 ssh root@13.140.186.143 'journalctl -u "pharmacy-monitor-scrape@*" --since "8 days ago" -o cat \
-  | grep -E "alerts_dispatch|alert_dispatch_failed|_batch_failed|email_skipped_no_smtp|telegram_(no_token|api_error|send_failed)"'
+  | grep -E "alerts_dispatch|alert_dispatch_|_batch_failed|email_skipped_no_smtp|telegram_(no_token|api_error|send_failed)"'
 ```
 
 Сбор pharmonline из GitHub Actions пишет те же строки в журнал своего шага.
 
-**Ручной запуск.** `alert evaluate --dispatch` зовёт ту же рассылку и говорит об
-исходе сам:
+**Ручной запуск.** `alert evaluate --dispatch` зовёт ту же рассылку (итоговая
+строка в журнале — та же) и говорит об исходе сам:
 
 | Вывод | Что значит | Код выхода |
 |---|---|---|
@@ -590,8 +609,8 @@ ssh root@13.140.186.143 'journalctl -u "pharmacy-monitor-scrape@*" --since "8 da
 Telegram, получатель на ежедневном дайджесте, `alert evaluate` без
 `--dispatch`, сбор с `--dry-run`, события `site_drop_smoke`. На проде таких
 большинство. Число несостоявшихся в базе не хранится: оно в журнале
-(`undelivered`) и в ответе `dispatch_events_batch`, из которого его берут строка
-сбора и вывод `alert evaluate --dispatch`.
+(`undelivered`) и в ответе `dispatch_events_batch`, из которого его берёт вывод
+`alert evaluate --dispatch`.
 
 До 2026-10-09 отказ отправителя считался доставкой: счётчик рос, событие
 получало «telegram» (без SMTP — «email») в `channels_sent`. Старые метки не

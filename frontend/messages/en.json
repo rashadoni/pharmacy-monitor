@@ -57,6 +57,9 @@
     "all_subscribers": "All subscribers",
     "sending": "Sending…",
     "digest_sent": "Digest sent to {count} recipients",
+    "digest_partly_sent": "Digest not sent to everyone: {sent} sent, {failed} not sent",
+    "digest_not_sent": "Digest not sent: none of the emails went out ({failed})",
+    "digest_nothing_to_send": "No digest was sent: no events in the last day or nobody is subscribed",
     "error": "Error: {message}",
     "dismiss_feedback": "Close notification"
   },

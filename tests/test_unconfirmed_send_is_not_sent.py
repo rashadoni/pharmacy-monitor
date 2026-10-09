@@ -6,12 +6,13 @@
 Вызов, после которого что-то считается разосланным, обязан читать ответ.
 
 Здесь — места, где ответ не читался или сбой терялся по дороге к оператору:
-дайджест (`notifications._send_digest`, старый `digest.send_daily_digest` и их
-команды и кнопка), итог рассылки о прогоне в конце сбора
-(`main._dispatch_run_alerts`), `alert evaluate --dispatch`, письмо
-администраторам с тика (`notifications.mail_unstored_events_to_admins`) и
-старый `alerts.dispatch_event`. Каждое место вызывается напрямую с отправителем,
-который отвечает `False`, и с отправителем, который бросает исключение.
+дайджест (`notifications._send_digest`, старый `digest.send_daily_digest`, их
+команды и кнопка в дашборде), итог рассылки о прогоне
+(`notifications.dispatch_events_batch`, конец команды `run`), `alert evaluate
+--dispatch`, письмо администраторам с тика
+(`notifications.mail_unstored_events_to_admins`), старый `alerts.dispatch_event`
+и `report --send`. Каждое место вызывается напрямую с отправителем, который не
+отправил: ответил `False`, ответил `None` или бросил исключение.
 """
 
 from __future__ import annotations
@@ -26,6 +27,9 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
+from sqlalchemy import event as sa_event
+from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 from structlog.testing import capture_logs
 
@@ -40,17 +44,21 @@ CHAT_ID = "700100"
 TITLE = "Naproksen подешевел"
 SMTP_TEXT = f"550 5.1.1 <{ALICE}>: Recipient address rejected"
 
-# Два способа, которыми отправитель сообщает «не ушло».
-REFUSALS = ["answers_false", "raises"]
+# Три способа, которыми отправитель сообщает «не ушло». `None` настоящий
+# отправитель не отвечает, но так отвечает заглушка без `return` — и это тоже
+# не подтверждение.
+REFUSALS = ["answers_false", "answers_none", "raises"]
 
 
 def _raises(*args, **kwargs):
     raise ConnectionRefusedError(111, SMTP_TEXT)
 
 
-def _refusing(how: str):
-    """Отправитель, который не отправил: ответил False или бросил исключение."""
-    return {"return_value": False} if how == "answers_false" else {"side_effect": _raises}
+def _refusing(how: str) -> dict:
+    """Отправитель, который не отправил, — аргументы для `patch`."""
+    if how == "raises":
+        return {"side_effect": _raises}
+    return {"return_value": False if how == "answers_false" else None}
 
 
 def _refuses(how: str, *, only: str):
@@ -60,7 +68,7 @@ def _refuses(how: str, *, only: str):
         if to == [only]:
             if how == "raises":
                 _raises()
-            return False
+            return False if how == "answers_false" else None
         return True
 
     return send
@@ -68,7 +76,7 @@ def _refuses(how: str, *, only: str):
 
 def _error_fields(how: str) -> dict:
     """Что строка сбоя несёт о причине: при отказе — ничего, отправитель написал сам."""
-    return {} if how == "answers_false" else {"error_type": "ConnectionRefusedError", "errno": 111}
+    return {"error_type": "ConnectionRefusedError", "errno": 111} if how == "raises" else {}
 
 
 def _lines(logs: list[dict], *events: str) -> list[dict]:
@@ -83,8 +91,8 @@ def _assert_no_person_or_text(printed: object) -> None:
 
 
 class _Journal:
-    """Строки журнала одного модуля (`src.main`, `src.api`): вход в CLI заново
-    настраивает structlog, и `capture_logs` событий команды не видит."""
+    """Строки журнала одного модуля: вход в CLI заново настраивает structlog, и
+    `capture_logs` событий команды не видит."""
 
     def __init__(self):
         self.lines: list[dict] = []
@@ -95,8 +103,8 @@ class _Journal:
 
         return record
 
-    def about_alerts(self) -> list[dict]:
-        return [line for line in self.lines if "alert" in line["event"]]
+    def named(self, *fragments: str) -> list[dict]:
+        return [line for line in self.lines if any(part in line["event"] for part in fragments)]
 
 
 @pytest.fixture
@@ -160,6 +168,8 @@ def _events(s, user, n=1, *, severity="critical", rule_id=None) -> list[storage.
 
 # ─── 1. Дайджест получателям (`notifications._send_digest`) ──────────────────
 
+_DIGEST_SUMMARIES = ("digest_sent", "digest_delivery_incomplete")
+
 
 @pytest.mark.parametrize("how", REFUSALS)
 def test_digest_nobody_received_is_not_sent(stand, how):
@@ -172,8 +182,7 @@ def test_digest_nobody_received_is_not_sent(stand, how):
 
     assert send.call_count == 2  # отказ одному не отменяет письмо другому
     assert result == {"recipients": 2, "sent": 0, "failed": 2}
-    assert _lines(logs, "digest_sent") == []
-    assert _lines(logs, "digest_email_failed", "digest_not_sent") == [
+    assert _lines(logs, "digest_email_failed", *_DIGEST_SUMMARIES) == [
         {
             "event": "digest_email_failed",
             "log_level": "warning",
@@ -189,9 +198,10 @@ def test_digest_nobody_received_is_not_sent(stand, how):
             **_error_fields(how),
         },
         {
-            "event": "digest_not_sent",
+            "event": "digest_delivery_incomplete",
             "log_level": "warning",
             "kind": "weekly",
+            "sent": 0,
             "failed": 2,
             "events": 3,
         },
@@ -217,13 +227,13 @@ def test_digest_counts_only_the_recipient_the_sender_confirmed(stand, how, refus
     assert [entry["user_id"] for entry in _lines(logs, "digest_email_failed")] == [
         users[refused].id
     ]
-    # Ушло не всем: итог — предупреждение, и в нём сколько не ушло.
-    assert _lines(logs, "digest_sent", "digest_not_sent") == [
+    # Ушло не всем: «digest_sent» не пишется, итог — предупреждение с обоими числами.
+    assert _lines(logs, *_DIGEST_SUMMARIES) == [
         {
-            "event": "digest_sent",
+            "event": "digest_delivery_incomplete",
             "log_level": "warning",
             "kind": "weekly",
-            "recipients": 1,
+            "sent": 1,
             "failed": 1,
             "events": 2,
         }
@@ -240,7 +250,7 @@ def test_digest_confirmed_for_everyone_keeps_the_usual_line(stand):
         result = notifications.send_weekly_digest(stand, tenant_id=alice.tenant_id)
 
     assert result == {"recipients": 2, "sent": 2, "failed": 0}
-    assert _lines(logs, "digest_sent", "digest_not_sent", "digest_email_failed") == [
+    assert _lines(logs, "digest_email_failed", *_DIGEST_SUMMARIES) == [
         {
             "event": "digest_sent",
             "log_level": "info",
@@ -253,15 +263,9 @@ def test_digest_confirmed_for_everyone_keeps_the_usual_line(stand):
 
 def test_digest_without_smtp_is_not_sent_by_the_real_sender(stand):
     """Тот самый случай: `notify digest`, запущенная руками без загруженного env."""
-    alice = _user(stand)
+    alice = _user(stand, daily_digest=True)
     _events(stand, alice)
 
-    with capture_logs() as logs:
-        result = notifications.send_daily_digest(stand, tenant_id=alice.tenant_id)
-    assert result == {"recipients": 0, "sent": 0, "failed": 0}  # daily_digest выключен
-
-    alice.daily_digest = True
-    stand.commit()
     with capture_logs() as logs:
         result = notifications.send_daily_digest(stand, tenant_id=alice.tenant_id)
 
@@ -269,8 +273,21 @@ def test_digest_without_smtp_is_not_sent_by_the_real_sender(stand):
     assert [entry["event"] for entry in logs] == [
         "email_skipped_no_smtp",
         "digest_email_failed",
-        "digest_not_sent",
+        "digest_delivery_incomplete",
     ]
+    _assert_no_person_or_text(_lines(logs, "digest_email_failed", "digest_delivery_incomplete"))
+
+
+def test_digest_with_nobody_subscribed_composes_no_letter(stand):
+    alice = _user(stand)  # ежедневный дайджест выключен
+    _events(stand, alice)
+
+    with patch("src.notifier.send_email") as send, capture_logs() as logs:
+        result = notifications.send_daily_digest(stand, tenant_id=alice.tenant_id)
+
+    assert not send.called
+    assert result == {"recipients": 0, "sent": 0, "failed": 0}
+    assert [entry["event"] for entry in logs] == ["digest_no_recipients"]
 
 
 def test_digest_dry_run_counts_recipients_but_nothing_sent(stand):
@@ -282,7 +299,7 @@ def test_digest_dry_run_counts_recipients_but_nothing_sent(stand):
 
     assert not send.called
     assert result == {"recipients": 1, "sent": 0, "failed": 0}
-    assert _lines(logs, "digest_sent", "digest_not_sent") == []
+    assert _lines(logs, *_DIGEST_SUMMARIES) == []
     assert _lines(logs, "digest_dry_run_done") == [
         {
             "event": "digest_dry_run_done",
@@ -334,16 +351,21 @@ def test_notify_digest_command_reports_confirmed_recipients(stand):
     assert "OK: weekly digest sent to 2 recipients" in result.output
 
 
-def test_notify_digest_command_with_nothing_to_send_is_not_a_failure(stand):
-    """Пустая неделя: писем нет, но это не сбой — таймер не должен краснеть."""
-    _user(stand)
+@pytest.mark.parametrize("args", [[], ["--only", "nobody@client.example"]])
+def test_notify_digest_command_with_nothing_to_send_is_not_a_failure(stand, args):
+    """Пустая неделя или адрес, которого нет среди подписанных: писем нет, но это
+    не сбой — таймер не должен краснеть — и не «sent»."""
+    alice = _user(stand)
+    if args:
+        _events(stand, alice)
 
     with patch("src.notifier.send_email") as send:
-        result = CliRunner().invoke(main_mod.cli, ["notify", "digest", "weekly"])
+        result = CliRunner().invoke(main_mod.cli, ["notify", "digest", "weekly", *args])
 
     assert not send.called
     assert result.exit_code == 0, result.output
-    assert "OK: weekly digest sent to 0 recipients" in result.output
+    assert "Nothing to send" in result.output
+    assert "OK:" not in result.output and "sent to" not in result.output
 
 
 @pytest.fixture
@@ -366,39 +388,37 @@ def dashboard(stand, monkeypatch):
 
 def _press_digest_button(dashboard, **sender):
     dashboard.journal.lines.clear()
-    with patch("src.notifier.send_email", **sender):
+    with patch("src.notifier.send_email", **sender) as send:
         response = dashboard.client.post("/api/v1/dash/digest/send-test?kind=weekly")
-    about_digest = [line for line in dashboard.journal.lines if "digest" in line["event"]]
-    return response, about_digest
+    assert response.status_code == 200, response.text
+    return response.json(), dashboard.journal.named("digest"), send
 
 
 @pytest.mark.parametrize("how", REFUSALS)
 def test_digest_button_does_not_answer_sent_when_nothing_was(dashboard, how):
-    response, journal = _press_digest_button(dashboard, **_refusing(how))
+    answer, journal, _ = _press_digest_button(dashboard, **_refusing(how))
 
-    assert response.status_code == 502, response.text
-    assert "recipients_sent" not in response.json()
+    assert answer == {"ok": False, "recipients": 2, "recipients_sent": 0, "recipients_failed": 2}
     assert journal == [
         {
-            "event": "digest_send_failed",
+            "event": "digest_not_sent_manual",
             "log_level": "error",
-            "kind": "weekly",
             "failed": 2,
+            "kind": "weekly",
             "by_user_id": dashboard.admin.id,
         }
     ]
-    _assert_no_person_or_text([response.text, journal])
+    _assert_no_person_or_text([answer, journal])
 
 
 def test_digest_button_counts_only_confirmed_recipients(dashboard):
-    partial, partial_journal = _press_digest_button(
+    partial, partial_journal, _ = _press_digest_button(
         dashboard, side_effect=_refuses("raises", only=ALICE)
     )
-    clean, clean_journal = _press_digest_button(dashboard, return_value=True)
+    clean, clean_journal, _ = _press_digest_button(dashboard, return_value=True)
 
-    assert partial.status_code == 200, partial.text
-    assert partial.json() == {"ok": False, "recipients_sent": 1, "recipients_failed": 1}
-    assert clean.json() == {"ok": True, "recipients_sent": 2, "recipients_failed": 0}
+    assert partial == {"ok": False, "recipients": 2, "recipients_sent": 1, "recipients_failed": 1}
+    assert clean == {"ok": True, "recipients": 2, "recipients_sent": 2, "recipients_failed": 0}
     by = {"kind": "weekly", "by_user_id": dashboard.admin.id}
     # Ушло не всем — предупреждение, а не обычная строка.
     assert partial_journal == [
@@ -407,6 +427,49 @@ def test_digest_button_counts_only_confirmed_recipients(dashboard):
     assert clean_journal == [
         {"event": "digest_sent_manual", "log_level": "info", "count": 2, "failed": 0, **by}
     ]
+
+
+def test_digest_button_with_nothing_to_send_is_neither_sent_nor_failed(dashboard, stand):
+    """Событий за окно нет: это не сбой почты и не «отправлен 0 получателям»."""
+    stand.query(storage.AlertEvent).delete()
+    stand.commit()
+
+    answer, journal, send = _press_digest_button(dashboard)
+
+    assert not send.called
+    assert answer == {"ok": True, "recipients": 0, "recipients_sent": 0, "recipients_failed": 0}
+    assert journal == [
+        {
+            "event": "digest_manual_nothing_to_send",
+            "log_level": "info",
+            "kind": "weekly",
+            "by_user_id": dashboard.admin.id,
+        }
+    ]
+
+
+def test_digest_button_copy_exists_for_every_outcome_in_every_language():
+    """Кнопка читает исход и показывает свою фразу: все четыре — на трёх языках."""
+    import json
+
+    frontend = Path(main_mod.__file__).resolve().parent.parent / "frontend"
+    component = (frontend / "src" / "components" / "quick-actions.tsx").read_text(encoding="utf-8")
+    keys = {
+        "digest_sent": {"count"},
+        "digest_partly_sent": {"sent", "failed"},
+        "digest_not_sent": {"failed"},
+        "digest_nothing_to_send": set(),
+    }
+    assert "recipients_failed" in component
+    for locale in ("ru", "az", "en"):
+        copy = json.loads((frontend / "messages" / f"{locale}.json").read_text(encoding="utf-8"))
+        for key, placeholders in keys.items():
+            assert f't("{key}"' in component, key
+            text = copy["quick_actions"][key]
+            assert {name for name in placeholders if f"{{{name}}}" in text} == placeholders, (
+                locale,
+                key,
+            )
 
 
 # ─── 1б. Старый ежедневный дайджест (`digest.send_daily_digest`) ─────────────
@@ -425,11 +488,9 @@ def test_legacy_digest_not_sent_is_an_error_not_a_count(stand, how):
         digest.send_daily_digest(stand)
 
     assert send.call_count == 1
-    assert _lines(logs, "digest_sent") == []
-    (failure,) = _lines(logs, "digest_email_failed")
-    assert failure["log_level"] == "error"
-    assert ("error_type" in failure) == (how == "raises")
-    assert "error" not in failure
+    expected = {"event": "digest_email_failed", "log_level": "error"}
+    expected.update(_error_fields(how) if how == "raises" else {"events": 2})
+    assert _lines(logs, "digest_sent", "digest_email_failed") == [expected]
     # Исходная ошибка с адресом в тексте не уходит ни текстом, ни причиной.
     assert raised.value.__cause__ is None and raised.value.__context__ is None
     _assert_no_person_or_text([logs, str(raised.value)])
@@ -481,194 +542,335 @@ def test_legacy_digest_command_tells_sent_from_nothing_to_send_from_dry_run(stan
     assert "OK: digest sent, 1 events" in sent.output
 
 
-# ─── 2. Итог рассылки о прогоне в конце сбора (`main._dispatch_run_alerts`) ──
+# ─── 2. Итог рассылки о прогоне ──────────────────────────────────────────────
+#
+# Итог пишет сама `dispatch_events_batch`, одной строкой, и имя строки зависит
+# от исхода. Вызывающие (конец сбора, `alert evaluate --dispatch`) своей строки
+# «разослано» не пишут.
+
+_RUN_SUMMARIES = (
+    "alerts_dispatched_batch",
+    "alerts_dispatch_incomplete",
+    "alerts_dispatch_no_recipient",
+)
+
+
+def _summary(event: str, level: str, **numbers) -> dict:
+    return {"event": event, "log_level": level, **numbers}
+
+
+@pytest.mark.parametrize("how", REFUSALS)
+def test_run_letter_nobody_received_is_not_called_dispatched(stand, how):
+    user = _user(stand)
+    fired = _events(stand, user, 3)
+
+    with patch("src.notifier.send_email", **_refusing(how)), capture_logs() as logs:
+        result = notifications.dispatch_events_batch(stand, fired)
+
+    assert result == {"email": 0, "telegram": 0, "failed": 1, "undelivered": 3}
+    assert _lines(logs, *_RUN_SUMMARIES) == [
+        _summary(
+            "alerts_dispatch_incomplete",
+            "warning",
+            events=3,
+            emails=0,
+            telegram=0,
+            failed=1,
+            undelivered=3,
+        )
+    ]
+
+
+def test_run_letter_one_refused_recipient_is_incomplete_with_what_went(stand):
+    """Одному ушло, другому нет: не «разослано», а в строке — сколько всё-таки ушло."""
+    user = _user(stand)
+    _user(stand, BOB)
+    fired = _events(stand, user, 2)
+
+    with (
+        patch("src.notifier.send_email", side_effect=_refuses("answers_false", only=BOB)),
+        capture_logs() as logs,
+    ):
+        result = notifications.dispatch_events_batch(stand, fired)
+
+    assert result == {"email": 1, "telegram": 0, "failed": 1, "undelivered": 0}
+    assert _lines(logs, *_RUN_SUMMARIES) == [
+        _summary(
+            "alerts_dispatch_incomplete",
+            "warning",
+            events=2,
+            emails=1,
+            telegram=0,
+            failed=1,
+            undelivered=0,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("email", "telegram"), [("info", "info"), ("off", "info"), ("info", "off")]
+)
+def test_run_letter_confirmed_is_dispatched_with_what_went(stand, email, telegram):
+    """Подтверждено всё, что слали, — по обоим каналам или по одному из них."""
+    user = _user(
+        stand, email_severity_min=email, telegram_severity_min=telegram, telegram_chat_id=CHAT_ID
+    )
+    fired = _events(stand, user, 2)
+    went = {"emails": int(email != "off"), "telegram": int(telegram != "off")}
+
+    with (
+        patch("src.notifier.send_email", return_value=True),
+        patch("src.notifier.send_telegram_message", return_value=True),
+        capture_logs() as logs,
+    ):
+        result = notifications.dispatch_events_batch(stand, fired)
+
+    assert (result["failed"], result["undelivered"]) == (0, 0)
+    assert _lines(logs, *_RUN_SUMMARIES) == [
+        _summary("alerts_dispatched_batch", "info", events=2, **went, failed=0, undelivered=0)
+    ]
+
+
+def test_run_letter_with_nobody_to_send_to_is_not_called_dispatched(stand):
+    """Сбоя нет, но и получателя нет (порог важности): это не «разослано»."""
+    user = _user(stand, email_severity_min="critical")
+    fired = _events(stand, user, 2, severity="info")
+
+    with patch("src.notifier.send_email") as send, capture_logs() as logs:
+        result = notifications.dispatch_events_batch(stand, fired)
+
+    assert not send.called
+    assert result == {"email": 0, "telegram": 0, "failed": 0, "undelivered": 0}
+    assert _lines(logs, *_RUN_SUMMARIES) == [
+        _summary(
+            "alerts_dispatch_no_recipient",
+            "info",
+            events=2,
+            emails=0,
+            telegram=0,
+            failed=0,
+            undelivered=0,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("channel", "in_message", "undelivered"), [("email", 2, 1), ("telegram", 1, 0)]
+)
+def test_run_letter_failure_line_carries_the_event_count_when_the_sender_raised(
+    stand, channel, in_message, undelivered
+):
+    """RUNBOOK обещает `events=N` в строке сбоя — и когда отправитель упал.
+
+    N — сколько событий было в сообщении этого получателя, а не в прогоне:
+    из трёх событий письмо (порог `warning`) несёт два, Telegram (`critical`) — одно.
+    """
+    user = _user(
+        stand,
+        email_severity_min="warning",
+        telegram_severity_min="critical",
+        telegram_chat_id=CHAT_ID,
+    )
+    events = [
+        *_events(stand, user, severity="critical"),
+        *_events(stand, user, severity="warning"),
+        *_events(stand, user, severity="info"),
+    ]
+    senders = {"email": "send_email", "telegram": "send_telegram_message"}
+    other = senders["telegram" if channel == "email" else "email"]
+
+    with (
+        patch(f"src.notifier.{senders[channel]}", side_effect=_raises),
+        patch(f"src.notifier.{other}", return_value=True),
+        capture_logs() as logs,
+    ):
+        result = notifications.dispatch_events_batch(stand, events)
+
+    assert (result["failed"], result["undelivered"]) == (1, undelivered)
+    assert _lines(logs, "email_batch_failed", "telegram_batch_failed") == [
+        {
+            "event": f"{channel}_batch_failed",
+            "log_level": "warning",
+            "user_id": user.id,
+            "events": in_message,
+            **_error_fields("raises"),
+        }
+    ]
+
+
+# ── Конец сбора: `main._dispatch_run_alerts` ──
 
 
 @pytest.fixture
 def journal(monkeypatch):
+    """Журнал `src.main` и `src.notifications` — в том порядке, в каком писались."""
     recorder = _Journal()
     monkeypatch.setattr(main_mod, "log", recorder)
+    monkeypatch.setattr(notifications, "log", recorder)
     return recorder
 
 
 RUN_ID = 77
 
 
-@pytest.mark.parametrize("how", REFUSALS)
-def test_run_alerts_nobody_received_are_not_called_dispatched(stand, journal, how):
-    user = _user(stand)
-    fired = _events(stand, user, 3)
+@pytest.fixture
+def marks_cannot_be_written(stand):
+    """База отказывает в записи меток канала — уже после того, как письмо ушло."""
 
-    with patch("src.notifier.send_email", **_refusing(how)):
+    def refuse(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE ALERT_EVENTS"):
+            raise OperationalError(
+                statement, {}, Exception(f"server closed the connection {ALICE}")
+            )
+
+    engine = stand.get_bind()
+    sa_event.listen(engine, "before_cursor_execute", refuse)
+    yield
+    sa_event.remove(engine, "before_cursor_execute", refuse)
+
+
+@pytest.mark.parametrize("how", ["answers_false", "confirmed"])
+def test_run_alerts_caller_writes_no_line_of_its_own(stand, journal, how):
+    """«Разослано» от себя конец сбора не пишет ни при каком исходе: итог один,
+    и он у рассылки."""
+    fired = _events(stand, _user(stand), 2)
+    sender = _refusing(how) if how != "confirmed" else {"return_value": True}
+
+    with patch("src.notifier.send_email", **sender):
         main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
 
-    assert journal.lines == [
-        {
-            "event": "alert_dispatch_failed",
-            "log_level": "warning",
-            "run_id": RUN_ID,
-            "events": 3,
-            "email": 0,
-            "telegram": 0,
-            "failed": 1,
-            "undelivered": 3,
-        }
-    ]
+    expected = "alerts_dispatched_batch" if how == "confirmed" else "alerts_dispatch_incomplete"
+    assert [line["event"] for line in journal.named("alert")] == [expected]
 
 
-def test_run_alerts_one_refused_recipient_is_a_failure_with_the_counts(stand, journal):
-    """Одному ушло, другому нет: строка сбоя, а в ней — сколько всё-таки ушло."""
-    user = _user(stand)
-    _user(stand, BOB)
-    fired = _events(stand, user, 2)
-
-    with patch("src.notifier.send_email", side_effect=_refuses("answers_false", only=BOB)):
-        main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
-
-    assert journal.lines == [
-        {
-            "event": "alert_dispatch_failed",
-            "log_level": "warning",
-            "run_id": RUN_ID,
-            "events": 2,
-            "email": 1,
-            "telegram": 0,
-            "failed": 1,
-            "undelivered": 0,
-        }
-    ]
-
-
-def test_run_alerts_that_crashed_are_not_called_dispatched(stand, journal):
-    """Рассылка упала целиком (база): строка сбоя без текста ошибки, сбор не падает."""
+def test_run_alerts_that_crashed_leave_the_session_usable(stand, journal, marks_cannot_be_written):
+    """Рассылка упала на базе: строка сбоя без текста ошибки, а сессия сбора
+    после этого работает — иначе сбор упал бы следующим же запросом."""
     fired = _events(stand, _user(stand), 2)
 
-    def crash(session, events):
-        raise RuntimeError(f"UPDATE tenant_users … {ALICE}")
-
-    with patch.object(notifications, "dispatch_events_batch", crash):
+    with patch("src.notifier.send_email", return_value=True) as send:
         main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
 
-    assert journal.lines == [
+    assert send.call_count == 1
+    assert journal.named("alert") == [
         {
             "event": "alert_dispatch_failed",
             "log_level": "warning",
             "run_id": RUN_ID,
             "events": 2,
-            "error_type": "RuntimeError",
+            "error_type": "OperationalError",
         }
     ]
+    _assert_no_person_or_text(journal.lines)
+    # Сессия не в прерванной транзакции: читает и коммитит.
+    assert stand.scalar(select(func.count()).select_from(storage.AlertEvent)) == 2
+    stand.add(storage.Recipient(email="after@client.example", is_active=True))
+    stand.commit()
 
 
-def test_run_alerts_confirmed_are_dispatched_with_what_went(stand, journal):
-    user = _user(stand, telegram_severity_min="info", telegram_chat_id=CHAT_ID)
-    fired = _events(stand, user, 2)
+def test_run_alerts_crash_with_a_dead_connection_does_not_raise_from_the_handler(
+    stand, journal, marks_cannot_be_written, monkeypatch
+):
+    """Откат тоже не удался (соединения нет): причина — в журнале, из обработчика
+    ничего не летит; сбор упадёт дальше сам, на своём запросе."""
+    fired = _events(stand, _user(stand))
 
-    with (
-        patch("src.notifier.send_email", return_value=True),
-        patch("src.notifier.send_telegram_message", return_value=True),
-    ):
+    def dead(*args, **kwargs):
+        raise OperationalError("ROLLBACK", {}, Exception(f"connection is closed {ALICE}"))
+
+    with patch("src.notifier.send_email", return_value=True):
+        monkeypatch.setattr(stand, "rollback", dead)
         main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
 
-    assert journal.lines == [
-        {
-            "event": "alerts_dispatched",
-            "log_level": "info",
-            "run_id": RUN_ID,
-            "events": 2,
-            "email": 1,
-            "telegram": 1,
-            "failed": 0,
-            "undelivered": 0,
-        }
+    assert [(line["event"], line["error_type"]) for line in journal.named("alert")] == [
+        ("alert_dispatch_failed", "OperationalError"),
+        ("alert_dispatch_rollback_failed", "OperationalError"),
     ]
+    _assert_no_person_or_text(journal.lines)
 
 
-def test_run_alerts_confirmed_by_telegram_alone_are_dispatched(stand, journal):
-    user = _user(
-        stand, email_severity_min="off", telegram_severity_min="info", telegram_chat_id=CHAT_ID
-    )
-    fired = _events(stand, user)
-
-    with patch("src.notifier.send_telegram_message", return_value=True):
-        main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
-
-    (line,) = journal.lines
-    assert (line["event"], line["email"], line["telegram"]) == ("alerts_dispatched", 0, 1)
-
-
-def test_run_alerts_with_nobody_to_send_to_are_not_called_dispatched(stand, journal):
-    """Сбоя нет, но и получателя нет (порог важности): это не «разослано»."""
-    user = _user(stand, email_severity_min="critical")
-    fired = _events(stand, user, 2, severity="info")
-
-    with patch("src.notifier.send_email") as send:
-        main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
-
-    assert not send.called
-    assert journal.lines == [
-        {
-            "event": "alerts_dispatch_no_recipient",
-            "log_level": "info",
-            "run_id": RUN_ID,
-            "events": 2,
-        }
-    ]
-
-
-def _run_that_fires_an_alert(stand, monkeypatch):
+def _run_that_fires_alerts(stand, monkeypatch, *extra_args, events=3):
     """Команда `run` целиком; подменён поход на сайт и подсчёт правил."""
     user = _user(stand)
     _patch_verified_aloe_pipeline(stand, monkeypatch)
-    # У `run` своя сессия: событие должно жить в ней, иначе канал ему не записать.
+    # У `run` своя сессия: события должны жить в ней, иначе канал им не записать.
     fired: list[storage.AlertEvent] = []
 
     def evaluate(session, run_id):
-        event = storage.AlertEvent(
-            rule_type="site_silent",
-            dedup_key=f"run-{run_id}",
-            severity="critical",
-            title=TITLE,
-            tenant_id=user.tenant_id,
-            created_at=utcnow(),
-        )
-        session.add(event)
-        session.commit()
-        fired.append(event)
-        return [event]
+        fired.extend(_events(session, user, events))
+        return list(fired)
 
     monkeypatch.setattr(alerts, "evaluate_rules", evaluate)
     runner = CliRunner()
     with runner.isolated_filesystem():
         result = runner.invoke(
-            main_mod.cli, ["run", "--site", "aloe", "--mode", "category", "--force"]
+            main_mod.cli, ["run", "--site", "aloe", "--mode", "category", "--force", *extra_args]
         )
     return result, fired
 
 
 @pytest.mark.parametrize("how", REFUSALS)
 def test_run_does_not_log_dispatched_when_the_letter_did_not_go(stand, monkeypatch, journal, how):
-    """Конец настоящего сбора: сбой рассылки сбор не роняет и «разослано» не пишет."""
+    """Конец настоящего сбора: отказ отправителя сбор не роняет и «разослано» не пишет."""
     with patch("src.notifier.send_email", **_refusing(how)):
-        result, fired = _run_that_fires_an_alert(stand, monkeypatch)
+        result, fired = _run_that_fires_alerts(stand, monkeypatch)
 
     assert result.exit_code == 0, result.output
-    assert [line["event"] for line in journal.about_alerts()] == ["alert_dispatch_failed"]
-    (failure,) = journal.about_alerts()
-    assert (failure["events"], failure["failed"], failure["undelivered"]) == (1, 1, 1)
-    assert not fired[0].channels_sent
-    run = stand.query(storage.Run).one()
-    assert run.status == "ok" and failure["run_id"] == run.id
+    assert [line["event"] for line in journal.named("alerts_dispatch", "alert_dispatch")] == [
+        "alerts_dispatch_incomplete"
+    ]
+    (summary,) = journal.named("alerts_dispatch_incomplete")
+    assert (summary["events"], summary["failed"], summary["undelivered"]) == (3, 1, 3)
+    assert not any(event.channels_sent for event in fired)
+    assert stand.query(storage.Run).one().status == "ok"
 
 
 def test_run_logs_dispatched_when_the_sender_confirmed(stand, monkeypatch, journal):
     with patch("src.notifier.send_email", return_value=True):
-        result, fired = _run_that_fires_an_alert(stand, monkeypatch)
+        result, fired = _run_that_fires_alerts(stand, monkeypatch)
 
     assert result.exit_code == 0, result.output
-    (line,) = journal.about_alerts()
-    assert (line["event"], line["email"], line["failed"]) == ("alerts_dispatched", 1, 0)
-    assert fired[0].channels_sent == ["email"]
+    assert [line["event"] for line in journal.named("alerts_dispatch", "alert_dispatch")] == [
+        "alerts_dispatched_batch"
+    ]
+    assert [event.channels_sent for event in fired] == [["email"]] * 3
+
+
+def test_run_survives_a_database_failure_inside_the_dispatch(
+    stand, monkeypatch, journal, marks_cannot_be_written
+):
+    """Письмо ушло, запись меток сорвалась. Раньше следующий же запрос сбора падал
+    на прерванной транзакции, обработчик сбоя — на том же, и прогон оставался
+    `running`. Теперь сбор доходит до конца."""
+    with patch("src.notifier.send_email", return_value=True) as send:
+        result, _ = _run_that_fires_alerts(stand, monkeypatch)
+
+    assert send.call_count == 1
+    assert result.exit_code == 0, result.output
+    run = stand.query(storage.Run).one()
+    stand.refresh(run)
+    assert run.status == "ok"
+    (failure,) = journal.named("alert_dispatch")
+    assert failure == {
+        "event": "alert_dispatch_failed",
+        "log_level": "warning",
+        "run_id": run.id,
+        "events": 3,
+        "error_type": "OperationalError",
+    }
+    assert journal.named("alerts_dispatched") == []
+    assert "run_failed" not in [line["event"] for line in journal.lines]
+
+
+def test_run_dry_run_sends_nothing_and_says_so(stand, monkeypatch, journal):
+    with patch("src.notifier.send_email") as send:
+        result, _ = _run_that_fires_alerts(stand, monkeypatch, "--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert not send.called
+    assert [line["event"] for line in journal.named("alerts_dispatch", "alert_dispatch")] == [
+        "alerts_dispatch_skipped_dry_run"
+    ]
 
 
 # ─── 3. `alert evaluate --dispatch` ──────────────────────────────────────────
@@ -859,50 +1061,7 @@ def test_admin_letter_without_smtp_and_token_names_the_recipient(stand):
         ("telegram_no_token", None),
         ("telegram_batch_failed", admin.id),
     ]
-
-
-@pytest.mark.parametrize(
-    ("channel", "in_message", "undelivered"), [("email", 2, 1), ("telegram", 1, 0)]
-)
-def test_run_letter_failure_line_carries_the_event_count_when_the_sender_raised(
-    stand, channel, in_message, undelivered
-):
-    """RUNBOOK обещает `events=N` в строке сбоя — и когда отправитель упал.
-
-    N — сколько событий было в сообщении этого получателя, а не в прогоне:
-    из трёх событий письмо (порог `warning`) несёт два, Telegram (`critical`) — одно.
-    """
-    user = _user(
-        stand,
-        email_severity_min="warning",
-        telegram_severity_min="critical",
-        telegram_chat_id=CHAT_ID,
-    )
-    events = [
-        *_events(stand, user, severity="critical"),
-        *_events(stand, user, severity="warning"),
-        *_events(stand, user, severity="info"),
-    ]
-    senders = {"email": "send_email", "telegram": "send_telegram_message"}
-    other = senders["telegram" if channel == "email" else "email"]
-
-    with (
-        patch(f"src.notifier.{senders[channel]}", side_effect=_raises),
-        patch(f"src.notifier.{other}", return_value=True),
-        capture_logs() as logs,
-    ):
-        result = notifications.dispatch_events_batch(stand, events)
-
-    assert (result["failed"], result["undelivered"]) == (1, undelivered)
-    assert _lines(logs, "email_batch_failed", "telegram_batch_failed") == [
-        {
-            "event": f"{channel}_batch_failed",
-            "log_level": "warning",
-            "user_id": user.id,
-            "events": in_message,
-            **_error_fields("raises"),
-        }
-    ]
+    _assert_no_person_or_text(_lines(logs, "email_batch_failed", "telegram_batch_failed"))
 
 
 # ─── 5. Старый путь `alerts.dispatch_event` ──────────────────────────────────
@@ -923,10 +1082,8 @@ def _legacy_telegram_recipients(s, *chat_ids) -> None:
     s.commit()
 
 
-@pytest.mark.parametrize(
-    ("how", "status"), [("answers_false", "skipped: smtp not configured"), ("raises", "error: ")]
-)
-def test_legacy_dispatch_records_no_channel_the_sender_did_not_confirm(stand, how, status):
+@pytest.mark.parametrize("how", REFUSALS)
+def test_legacy_dispatch_records_no_channel_the_sender_did_not_confirm(stand, how):
     """Писались каналы правила, а не состоявшиеся отправки."""
     _legacy_telegram_recipients(stand, "700100", "700200")
     rule = _rule(stand, ["email", "telegram"])
@@ -939,19 +1096,31 @@ def test_legacy_dispatch_records_no_channel_the_sender_did_not_confirm(stand, ho
     ):
         result = alerts.dispatch_event(stand, event)
 
-    assert result["email"].startswith(status)
-    assert result["telegram"] == "sent to 0/2"
+    assert result == {
+        # Класс ошибки, а не её текст: в тексте ошибки отправки бывает адрес.
+        "email": "error: ConnectionRefusedError"
+        if how == "raises"
+        else "skipped: smtp not configured",
+        "telegram": "sent to 0/2",
+    }
     stand.refresh(event)
     assert event.channels_sent == []
-    assert [entry["event"] for entry in logs] == ["alert_email_failed", "alert_telegram_failed"]
-    assert logs[1] == {
-        "event": "alert_telegram_failed",
-        "log_level": "warning",
-        "event_id": event.id,
-        "failed": 2,
-        "of": 2,
-    }
-    _assert_no_person_or_text(logs)
+    assert logs == [
+        {
+            "event": "alert_email_failed",
+            "log_level": "warning",
+            "event_id": event.id,
+            **_error_fields(how),
+        },
+        {
+            "event": "alert_telegram_failed",
+            "log_level": "warning",
+            "event_id": event.id,
+            "failed": 2,
+            "of": 2,
+        },
+    ]
+    _assert_no_person_or_text([logs, result])
 
 
 def test_legacy_dispatch_records_the_channels_the_sender_confirmed(stand):
@@ -991,8 +1160,12 @@ def test_legacy_dispatch_skipped_or_crashed_telegram_is_not_a_channel(stand, tel
     ):
         result = alerts.dispatch_event(stand, event)
 
-    assert result["email"] == "sent"
-    assert result["telegram"].startswith("skipped: " if telegram == "no_chat" else "error: ")
+    assert result == {
+        "email": "sent",
+        "telegram": "skipped: no telegram chat_ids"
+        if telegram == "no_chat"
+        else "error: ConnectionRefusedError",
+    }
     stand.refresh(event)
     assert event.channels_sent == ["email"]
 
@@ -1010,6 +1183,71 @@ def test_single_event_dispatch_is_not_called_from_src():
         and getattr(node.func, "attr", getattr(node.func, "id", None)) == "dispatch_event"
     ]
     assert callers == []
+
+
+# ─── 6. `report --send` ──────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def report_ready(stand, monkeypatch):
+    """Проверенный полный прогон, по которому `report --send` готова слать письмо."""
+    from src import roi
+
+    now = utcnow()
+    run = storage.Run(
+        tenant_id=tenants.get_or_create_default(stand).id,
+        status="ok",
+        started_at=now,
+        finished_at=now,
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=True,
+        catalog_verification_reason="test",
+        run_quality={
+            "baseline_enforced": True,
+            "full_catalog_verified": True,
+            "financially_eligible": True,
+            "sites": {"aloe": {"status": "ok"}},
+        },
+    )
+    stand.add(run)
+    stand.commit()
+    monkeypatch.setattr(roi, "financial_inputs_are_fresh", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        main_mod.analyzer, "analyze", lambda *a: SimpleNamespace(run_started_at=now)
+    )
+    monkeypatch.setattr(main_mod.reporter, "render_html", lambda report: "ok")
+    monkeypatch.setattr(main_mod.reporter, "render_excel", lambda report: b"ok")
+    monkeypatch.setattr(main_mod.reporter, "email_subject", lambda report: "ok")
+    monkeypatch.setattr(main_mod.reporter, "excel_filename", lambda report: "ok.xlsx")
+    return run
+
+
+def _report_send(run):
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        return runner.invoke(main_mod.cli, ["report", "--run-id", str(run.id), "--send"])
+
+
+@pytest.mark.parametrize("how", REFUSALS)
+def test_report_send_does_not_print_sent_when_the_letter_did_not_go(report_ready, how):
+    with patch("src.notifier.send_email", **_refusing(how)) as send:
+        result = _report_send(report_ready)
+
+    assert send.call_count == 1
+    assert result.exit_code != 0, result.output
+    assert "Email sent." not in result.output
+    if how != "raises":
+        assert "the email was not sent" in result.output
+
+
+def test_report_send_prints_sent_when_the_sender_confirmed(report_ready):
+    with patch("src.notifier.send_email", return_value=True) as send:
+        result = _report_send(report_ready)
+
+    assert send.call_count == 1
+    assert result.exit_code == 0, result.output
+    assert "Email sent." in result.output
 
 
 def test_real_senders_answer_false_without_configuration(stand):

@@ -2540,7 +2540,7 @@ def _should_trigger_ai_fallback(primary_yield: int, baseline: int | None) -> boo
 #
 # HTML-отчёт + Excel-вложение (тема «Pharmacy Monitor DD.MM.YYYY — N undercuts»)
 # шлётся в конце каждого НЕ-hourly прогона на EMAIL_TO/recipients. Это отдельный
-# канал от мгновенных undercut-алертов (evaluate_rules → dispatch_event) и от
+# канал от мгновенных undercut-алертов (evaluate_rules → dispatch_events_batch) и от
 # daily/weekly дайджестов — управляется собственным флагом:
 #   SCRAPE_REPORT_EMAIL=0   отключает письмо (default ON — обратная совместимость)
 #
@@ -5098,8 +5098,15 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | No
                 f"{kind} digest sent to {result['sent']} of {result['recipients']} recipients, "
                 f"{result['failed']} not sent — see digest_email_failed (user_id) in the log above"
             )
-        else:
+        elif result["sent"]:
             click.echo(f"OK: {kind} digest sent to {result['sent']} recipients")
+        else:
+            # Пустое окно, никто не подписан или `--only` никого не нашёл: не
+            # сбой — таймер в пустую неделю не должен краснеть.
+            click.echo(
+                f"Nothing to send: no events in the window or no recipient has the {kind} "
+                "digest on — see digest_no_events / digest_no_recipients in the log above"
+            )
 
 
 @notify_group.command("test")
@@ -6375,34 +6382,40 @@ def intraday_tick_cmd(dry_run: bool) -> None:
 
 
 def _dispatch_run_alerts(session: Session, run_id: int, fired: list[storage.AlertEvent]) -> None:
-    """Рассылка о прогоне и одна строка журнала о том, чем она кончилась.
+    """Рассылка о прогоне; её сбой сбор не роняет.
 
-    «Разослано» пишется только о том, что отправитель подтвердил. Сбой рассылки
-    сбор не роняет: события и цены уже записаны. Повтора нет — событие, не
-    дошедшее ни по одному каналу, остаётся на `/alerts` и в дайджесте.
+    Итог рассылки — что ушло, что нет — пишет сама `dispatch_events_batch`,
+    одной строкой с именем по исходу. Здесь остаётся случай, когда она упала
+    целиком: отказ отправителя она ловит сама, так что наружу выходит сбой базы.
+    События и цены к этому моменту уже записаны (`evaluate_rules` коммитит сам),
+    поэтому сбор идёт дальше. Повтора нет — событие, не дошедшее ни по одному
+    каналу, остаётся на `/alerts` и в дайджесте.
     """
     from src import notifications as notif_mod
 
     try:
-        sent = notif_mod.dispatch_events_batch(session, fired)
+        notif_mod.dispatch_events_batch(session, fired)
     except Exception as e:  # noqa: BLE001
-        # Рассылка оборвалась посреди: кому-то могло уйти, итога нет.
+        # Рассылка оборвалась посреди: кому-то могло уйти, итоговой строки нет.
         log.warning(
             "alert_dispatch_failed",
             run_id=run_id,
             events=len(fired),
             **notifier.delivery_error_fields(e),
         )
-        return
-
-    if sent["failed"]:
-        log.warning("alert_dispatch_failed", run_id=run_id, events=len(fired), **sent)
-    elif sent["email"] or sent["telegram"]:
-        log.info("alerts_dispatched", run_id=run_id, events=len(fired), **sent)
-    else:
-        # Сбоя нет, но и слать было некому: пороги важности, тихие часы,
-        # получатели на ежедневном дайджесте.
-        log.info("alerts_dispatch_no_recipient", run_id=run_id, events=len(fired))
+        # Сорвавшийся commit оставляет сессию в прерванной транзакции. Без
+        # отката следующий же запрос сбора падает на PendingRollbackError, а
+        # обработчик сбоя сбора — на том же, и прогон остаётся `running`.
+        # Теряются только метки каналов получателя, на котором сорвалось.
+        try:
+            session.rollback()
+        except Exception as rollback_error:  # noqa: BLE001
+            # Соединения нет: сбор упадёт на следующем запросе сам, со своей причиной.
+            log.warning(
+                "alert_dispatch_rollback_failed",
+                run_id=run_id,
+                **notifier.delivery_error_fields(rollback_error),
+            )
 
 
 def _mail_tick_price_changes_to_admins(
@@ -6809,7 +6822,9 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
         click.echo(f"Saved report for run #{run_id} to reports/")
 
         if send:
-            notifier.send_email(
+            # False — SMTP не настроен, письма не было; отказ сервера и сеть
+            # приходят исключением и роняют команду сами.
+            if not notifier.send_email(
                 subject=reporter.email_subject(report),
                 html_body=html,
                 attachments=[
@@ -6819,7 +6834,11 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
                 ],
-            )
+            ):
+                raise click.ClickException(
+                    "report saved, but the email was not sent: SMTP is not configured "
+                    "(SMTP_HOST is empty) — load the service env and run again"
+                )
             click.echo("Email sent.")
 
 

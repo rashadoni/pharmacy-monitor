@@ -1716,14 +1716,26 @@ def dash_digest_send_test(
         raise HTTPException(500, f"Не удалось отправить: {e}")
 
     # `recipients_sent` — только те, кому отправитель письмо подтвердил. Сбой
-    # отправки `_send_digest` наружу не выпускает, а считает в `failed`.
+    # отправки `_send_digest` наружу не выпускает, а считает в `failed`. Ответ
+    # всегда 200: исход — в `ok` и числах, дашборд обязан их читать (кнопка
+    # показывает свою фразу на каждый исход).
     sent, failed = result["sent"], result["failed"]
+    who = {"kind": kind, "by_user_id": user.id}
     if failed and not sent:
-        log.error("digest_send_failed", kind=kind, failed=failed, by_user_id=user.id)
-        raise HTTPException(502, "Дайджест не отправлен: почта не приняла ни одного письма")
-    note = log.warning if failed else log.info
-    note("digest_sent_manual", kind=kind, count=sent, failed=failed, by_user_id=user.id)
-    return {"ok": not failed, "recipients_sent": sent, "recipients_failed": failed}
+        log.error("digest_not_sent_manual", failed=failed, **who)
+    elif failed:
+        log.warning("digest_sent_manual", count=sent, failed=failed, **who)
+    elif sent:
+        log.info("digest_sent_manual", count=sent, failed=failed, **who)
+    else:
+        # Нет событий за окно или никто не включил дайджест.
+        log.info("digest_manual_nothing_to_send", **who)
+    return {
+        "ok": not failed,
+        "recipients": result["recipients"],
+        "recipients_sent": sent,
+        "recipients_failed": failed,
+    }
 
 
 # ─── Recipients management (admin only) ──────────────────────────────────────

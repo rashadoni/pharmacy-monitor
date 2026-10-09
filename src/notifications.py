@@ -6,7 +6,10 @@ Replaces the scattered logic in src/alerts.py:_send_*_alert. New logic respects:
   - Daily / weekly digest opt-in (events queued, sent in batch)
 
 Public API:
-  - dispatch_event(session, event)        — for real-time alerts (called by alerts.evaluate_rules)
+  - dispatch_events_batch(session, events) — real-time alerts: one letter per run (called at
+                                             the end of `run` and by `alert evaluate --dispatch`)
+  - dispatch_event(session, event)        — one letter per event; superseded by the batch,
+                                             no longer called from src/
   - send_daily_digest(session, tenant_id) — call from systemd timer at 08:00
   - send_weekly_digest(session, tenant_id) — call from systemd timer Mondays
   - bind_telegram(session, chat_id, email) — link telegram to user
@@ -222,6 +225,12 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
     ни по одному каналу}. Первые два числа — только подтверждённое отправителем.
     Вызывающий, который пишет или печатает «разослано», обязан смотреть на
     `failed`: нули в `email` и `telegram` бывают и когда слать было некому.
+
+    Итог в журнал пишет сама функция, одной строкой, и имя строки зависит от
+    исхода: `alerts_dispatched_batch` — всё, что слали, подтверждено;
+    `alerts_dispatch_incomplete` — хоть одна отправка не состоялась (в полях —
+    сколько всё-таки ушло); `alerts_dispatch_no_recipient` — слать было некому.
+    Вызывающему свою строку «разослано» писать не нужно.
     """
     # Dedup: не трогаем уже отправленные (retry-safe, как dispatch_event).
     pending = [e for e in events if not (e.channels_sent and len(e.channels_sent) > 0)]
@@ -339,14 +348,22 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
     # поэтому число таких событий пишется сюда. Дайджест метку не читает:
     # подписанным на него они придут.
     undelivered = len(attempted - delivered)
-    log.info(
-        "alerts_dispatched_batch",
-        events=len(pending),
-        emails=emails_sent,
-        telegram=tg_sent,
-        failed=failed,
-        undelivered=undelivered,
-    )
+    summary = {
+        "events": len(pending),
+        "emails": emails_sent,
+        "telegram": tg_sent,
+        "failed": failed,
+        "undelivered": undelivered,
+    }
+    # «Разослано» — только когда отправитель подтвердил всё, что слали.
+    if failed:
+        log.warning("alerts_dispatch_incomplete", **summary)
+    elif emails_sent or tg_sent:
+        log.info("alerts_dispatched_batch", **summary)
+    else:
+        # Сбоя нет, но и слать было некому: пороги важности, тихие часы,
+        # получатели на ежедневном дайджесте.
+        log.info("alerts_dispatch_no_recipient", **summary)
     return {
         "email": emails_sent,
         "telegram": tg_sent,
@@ -527,7 +544,11 @@ def _send_digest(
     Возвращает {'recipients': скольким письмо предназначалось, 'sent': скольким
     отправитель его подтвердил, 'failed': скольким не ушло}. Получатель считается
     в `sent` только по ответу отправителя: `send_email` без SMTP ничего не шлёт и
-    отвечает False. При `dry_run` `sent` и `failed` — нули.
+    отвечает False. При `dry_run` `sent` и `failed` — нули. Все нули — письмо и
+    не собиралось: нет получателей или нет событий.
+
+    Итог в журнале: `digest_sent` — письмо подтверждено всем получателям;
+    `digest_delivery_incomplete` — хоть одному не ушло (в полях — скольким ушло).
 
     `only_email` — отправить одному получателю из включивших дайджест: так
     письмо смотрят на живых данных, не трогая остальных. `dry_run` — собрать
@@ -603,18 +624,16 @@ def _send_digest(
             "digest_dry_run_done", kind=kind, recipients=counts["recipients"], events=len(events)
         )
     elif not counts["failed"]:
+        # Сбоев нет: подтверждённых получателей столько же, сколько было.
         log.info("digest_sent", kind=kind, recipients=counts["sent"], events=len(events))
-    elif counts["sent"]:
-        # Ушло не всем: `recipients` — скольким отправитель письмо подтвердил.
+    else:
         log.warning(
-            "digest_sent",
+            "digest_delivery_incomplete",
             kind=kind,
-            recipients=counts["sent"],
+            sent=counts["sent"],
             failed=counts["failed"],
             events=len(events),
         )
-    else:
-        log.warning("digest_not_sent", kind=kind, failed=counts["failed"], events=len(events))
     return counts
 
 

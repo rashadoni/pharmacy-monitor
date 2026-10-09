@@ -531,8 +531,25 @@ def test_dispatch_event_unconfigured_smtp_is_not_a_delivery(setup, tenant_user):
 # ─── dispatch_events_batch: отправитель ответил отказом ──────────────────────
 
 
+# Итог рассылки — одна строка; её имя зависит от исхода.
+_BATCH_SUMMARIES = (
+    "alerts_dispatched_batch",  # всё, что слали, подтверждено
+    "alerts_dispatch_incomplete",  # хоть одна отправка не состоялась
+    "alerts_dispatch_no_recipient",  # слать было некому
+)
+
+
 def _batch_summary(logs: list[dict]) -> dict:
-    (summary,) = _failures(logs, "alerts_dispatched_batch")
+    (summary,) = [entry for entry in logs if entry["event"] in _BATCH_SUMMARIES]
+    # «Разослано» не говорится о рассылке, в которой что-то не ушло.
+    expected = (
+        "alerts_dispatch_incomplete"
+        if summary["failed"]
+        else "alerts_dispatched_batch"
+        if summary["emails"] or summary["telegram"]
+        else "alerts_dispatch_no_recipient"
+    )
+    assert summary["event"] == expected, summary
     return summary
 
 
@@ -1724,7 +1741,7 @@ def test_notify_digest_cli_dry_run_and_only(setup, tenant_user, monkeypatch):
 
         r = CliRunner().invoke(cli, ["notify", "digest", "weekly", "--only", "nobody@example.com"])
         assert r.exit_code == 0, r.output
-        assert "sent to 0 recipients" in r.output
+        assert "Nothing to send" in r.output and "sent to" not in r.output
         assert not mock_email.called
 
         r = CliRunner().invoke(cli, ["notify", "digest", "weekly", "--only", "alice@example.com"])
