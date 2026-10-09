@@ -256,7 +256,7 @@ uv run pharmacy-monitor telegram run-bot
 # 5. В правиле алерта указать channels=email,telegram
 ```
 
-Поддерживаемые команды: `/start`, `/help`, `/today`, `/alerts`, `/status`.
+Поддерживаемые команды: `/start`, `/help`, `/today`, `/alerts`, `/status`, `/stop`.
 
 ## Что ИЗ КОРОБКИ работает после установки
 

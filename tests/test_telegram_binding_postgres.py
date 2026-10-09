@@ -25,6 +25,7 @@ from collections.abc import Iterator
 import pytest
 from sqlalchemy import Engine, create_engine, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
+from structlog.testing import capture_logs
 
 from src import telegram_binding
 from src._time import utcnow
@@ -194,11 +195,23 @@ def test_a_database_failure_names_no_chat_and_leaves_the_session_usable(engine, 
         )
         with _session(engine) as session:
             session.execute(text("SET LOCAL lock_timeout = '300ms'"))
-            with pytest.raises(telegram_binding.BindingStorageError) as raised:
+            with (
+                capture_logs() as logs,
+                pytest.raises(telegram_binding.BindingStorageError) as raised,
+            ):
                 telegram_binding.bind_chat(session, chat, "A" * 22)
 
             assert chat not in "".join(traceback.format_exception(raised.value))
             assert str(raised.value) == "OperationalError in bind_chat, sqlstate 55P03"
+            assert logs == [
+                {
+                    "event": "telegram_binding_storage_failed",
+                    "log_level": "error",
+                    "where": "bind_chat",
+                    "error_type": "OperationalError",
+                    "sqlstate": "55P03",
+                }
+            ]
             assert session.execute(text("SELECT 1")).scalar_one() == 1
         holder.rollback()
 

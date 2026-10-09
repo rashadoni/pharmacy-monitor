@@ -75,7 +75,8 @@ class BindingStorageError(RuntimeError):
 
     SQLAlchemy кладёт в текст ошибки параметры запроса, а среди них номер чата;
     обработчик бота пишет текст ошибки в журнал. Здесь остаётся класс ошибки,
-    место и код PostgreSQL.
+    место и код PostgreSQL; то же пишет в журнал событие
+    `telegram_binding_storage_failed`.
     """
 
 
@@ -115,6 +116,14 @@ def _without_query_text(
             failure = BindingStorageError(
                 f"{type(exc).__name__} in {fn.__name__}"
                 + (f", sqlstate {sqlstate}" if sqlstate else "")
+            )
+            # Тот, кто поймает `failure`, увидит только её класс: что случилось
+            # с базой, записать можно лишь здесь.
+            log.error(
+                "telegram_binding_storage_failed",
+                where=fn.__name__,
+                error_type=type(exc).__name__,
+                sqlstate=sqlstate,
             )
         # Вне except: у новой ошибки нет ни причины, ни контекста, и трассировка
         # не покажет исходную — с параметрами запроса.
@@ -230,6 +239,11 @@ def user_for_chat(session: Session, chat_id: str) -> TenantUser | None:
 
 
 def _audit(tenant_id: int, user_id: int, action: str) -> AuditLog:
+    """Запись идёт в той же транзакции, что и привязка: без следа её не бывает.
+
+    `actor_user_id` — аккаунт, чей это чат. Кто из участников группы набрал
+    команду, запись не знает.
+    """
     return AuditLog(
         tenant_id=tenant_id,
         actor_user_id=user_id,

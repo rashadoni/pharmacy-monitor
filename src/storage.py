@@ -191,6 +191,10 @@ class ScrapeRequest(Base):
 class AuditLog(Base):
     """Immutable trail of successful dashboard mutations.
 
+    Plus two events that no dashboard request makes: a Telegram chat bound to
+    or unbound from an account by the chat itself (`action` BIND / UNBIND,
+    `resource` "telegram-chat", written by `src/telegram_binding.py`).
+
     Payload bodies are intentionally not stored: pricing uploads, passwords and
     integration secrets must never leak into an audit row.  The request path,
     actor, method, response status and request id are enough to establish who

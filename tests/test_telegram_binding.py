@@ -647,6 +647,24 @@ def test_a_message_to_the_bot_binds_through_the_code(db_session, account, clock,
     assert _chat_of(db_session, account) is None
 
 
+def test_a_command_for_another_bot_is_left_alone(db_session, clock, replies, monkeypatch):
+    """В группе с несколькими ботами `/stop@other_bot` — не нам, а привязку сняло бы."""
+    monkeypatch.setenv("TELEGRAM_BOT_USERNAME", "@pm_alerts_bot")
+    bound = _user(db_session, ADDRESS, chat=CHAT)
+
+    telegram_bot.handle_update(db_session, _incoming("/stop@GroupHelpBot"))
+    telegram_bot.handle_update(db_session, _incoming(f"/start@GroupHelpBot {UNKNOWN}"))
+
+    assert replies == []
+    assert _chat_of(db_session, bound) == CHAT
+    assert _failures(db_session) == {}
+
+    telegram_bot.handle_update(db_session, _incoming("/stop@PM_Alerts_Bot"))
+
+    assert replies == [(CHAT, telegram_bot.UNBOUND_REPLY)]
+    assert _chat_of(db_session, bound) is None
+
+
 def test_a_message_without_a_chat_is_not_answered(db_session, account, clock, replies):
     issued = telegram_binding.issue_code(db_session, account.id)
 
@@ -708,7 +726,7 @@ def test_a_database_failure_leaves_the_chat_out_of_the_error(
     db_session.rollback()
     assert CHAT in str(raw.value)
 
-    with pytest.raises(telegram_binding.BindingStorageError) as raised:
+    with capture_logs() as logs, pytest.raises(telegram_binding.BindingStorageError) as raised:
         function(db_session, *arguments)
 
     shown = "".join(traceback.format_exception(raised.value))
@@ -716,8 +734,44 @@ def test_a_database_failure_leaves_the_chat_out_of_the_error(
         assert secret not in shown, shown
     assert raised.value.__cause__ is None and raised.value.__context__ is None
     assert str(raised.value) == f"OperationalError in {function.__name__}"
+    # Что случилось, остаётся в журнале — без текста запроса.
+    assert logs == [
+        {
+            "event": "telegram_binding_storage_failed",
+            "log_level": "error",
+            "where": function.__name__,
+            "error_type": "OperationalError",
+            "sqlstate": None,
+        }
+    ]
     # Сессия после сбоя годна: бот отвечает человеку и берётся за следующее сообщение.
     assert db_session.execute(sqlalchemy.text("select 1")).scalar_one() == 1
+
+
+def test_a_refused_write_leaves_the_chat_out_of_the_error_too(db_session, clock):
+    """Не только «таблицы нет»: отказ в записи — другой класс ошибки базы."""
+    _user(db_session, ADDRESS, chat=CHAT)
+    db_session.execute(
+        sqlalchemy.text(
+            "create trigger refuse_writes before update on tenant_users "
+            "begin select raise(abort, 'read-only'); end"
+        )
+    )
+    db_session.commit()
+    with pytest.raises(sqlalchemy.exc.IntegrityError) as raw:
+        telegram_binding.unbind_chat.__wrapped__(db_session, CHAT)
+    db_session.rollback()
+    assert CHAT in str(raw.value)
+
+    with capture_logs() as logs, pytest.raises(telegram_binding.BindingStorageError) as raised:
+        telegram_binding.unbind_chat(db_session, CHAT)
+
+    assert CHAT not in "".join(traceback.format_exception(raised.value))
+    assert str(raised.value) == "IntegrityError in unbind_chat"
+    assert [(entry["event"], entry["error_type"]) for entry in logs] == [
+        ("telegram_binding_storage_failed", "IntegrityError")
+    ]
+    assert CHAT not in repr(logs)
 
 
 def test_the_bot_answers_a_database_failure_without_its_text(db_session, account, replies):
@@ -728,7 +782,10 @@ def test_the_bot_answers_a_database_failure_without_its_text(db_session, account
         telegram_bot.handle_update(db_session, _incoming("/alerts"))
 
     assert replies == [(CHAT, "❌ Ошибка: BindingStorageError")]
-    assert [entry["event"] for entry in logs] == ["telegram_command_failed"]
+    assert [entry["event"] for entry in logs] == [
+        "telegram_binding_storage_failed",
+        "telegram_command_failed",
+    ]
     assert CHAT not in repr(logs), logs
 
 

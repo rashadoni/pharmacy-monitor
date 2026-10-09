@@ -270,8 +270,11 @@ function NotificationsSection() {
   });
   const integrationsQ = useQuery({ queryKey: ["integrations"], queryFn: api.integrations });
   const statusQ = useQuery({ queryKey: ["system-status"], queryFn: api.systemStatus });
-  const botUsername =
-    integrationsQ.data?.telegram_bot_username ?? process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME;
+  const botUsername = (
+    integrationsQ.data?.telegram_bot_username ??
+    process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME ??
+    ""
+  ).replace(/^@/, "");
   const updateMutation = useMutation({
     mutationFn: (patch: Partial<NotifPrefs>) => api.notifPrefsUpdate(patch),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notif-prefs"] }),

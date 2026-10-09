@@ -230,6 +230,12 @@ COMMANDS: dict[str, Callable[[Session, str, str], str]] = {
 }
 
 
+def _is_this_bot(name: str) -> bool:
+    """Имя после «@» в команде — наше. Пока своё имя не задано, верим любому."""
+    own = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+    return not own or name.lower() == own.lower()
+
+
 def handle_update(session: Session, update: dict) -> None:
     """Обработать одно входящее сообщение."""
     msg = update.get("message") or update.get("edited_message")
@@ -243,7 +249,10 @@ def handle_update(session: Session, update: dict) -> None:
     if not text.startswith("/"):
         return  # игнорируем не-команды
     parts = text.split(maxsplit=1)
-    cmd = parts[0].split("@")[0].lower()  # /today@bot_name → /today
+    cmd, _, addressed_to = parts[0].partition("@")  # /today@bot_name → /today
+    cmd = cmd.lower()
+    if addressed_to and not _is_this_bot(addressed_to):
+        return  # в группе: команда другому боту, а `/stop` отвязывает чат
     args = parts[1] if len(parts) > 1 else ""
 
     handler = COMMANDS.get(cmd)
