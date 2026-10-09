@@ -31,8 +31,9 @@ GitHub Actions в этом репозитории читает любой пол
   и сбору лучше остановиться, чем уйти с половиной секрета;
 - имя, которому bash значение из файла не отдаст (только для чтения, вычисляемое,
   перенастраивающее саму оболочку) или которым пользуется сам разбор, — отказ.
-  Так же и имя, которое bash держит числом (`OPTIND`, `SECONDS`, `UID`):
-  значение под ним bash не сохранил бы, а вычислил, то есть исполнил;
+  Так же и имя, которое bash держит числом (`OPTIND`, `RANDOM`, `SECONDS`,
+  `UID`): текст под ним не хранится, а под `OPTIND`, `RANDOM`, `SRANDOM` и
+  `HISTCMD` значение bash ещё и вычислил бы, то есть исполнил;
 - у цикла разбора нет stderr: ни сам bash (предупреждение `setlocale`,
   «readonly variable»), ни трассировка (`set -x`) окружающего скрипта изнутри
   него ничего сказать не могут;
@@ -62,7 +63,10 @@ GitHub Actions в этом репозитории читает любой пол
   предупреждении позже — при следующей смене локали в том же скрипте или при
   старте дочернего bash;
 - строка с именем переменной самого скрипта (`work_dir=…`) её перезапишет, как
-  и при прежнем цикле: разбор знает только свои имена и имена bash;
+  и при прежнем цикле: разбор знает только свои имена и имена bash. По той же
+  причине он не узнает переменную, которую скрипт объявил числом
+  (`declare -i`), но ещё не присвоил: значение под ней bash вычислит. Сегодня
+  таких объявлений в workflow нет;
 - разбор защищает от испорченного файла, а не от написанного со злым умыслом:
   переменные окружения сами управляют следующими командами (`PATH`,
   `LD_PRELOAD`), а писать в файл может тот же, кто запускает скрипт;
@@ -573,17 +577,45 @@ def test_a_file_that_cannot_be_read_is_a_refusal_not_an_empty_environment(
     assert got.exported is None
 
 
-@pytest.mark.parametrize("name", ["OPTIND", "RANDOM", "SECONDS", "HISTCMD", "UID"])
+@pytest.mark.parametrize("name", ["OPTIND", "RANDOM", "SRANDOM", "HISTCMD"])
 def test_a_value_is_stored_or_refused_but_never_computed(name, tmp_path):
-    # Под именем, которое bash держит числом, значение — арифметическое
-    # выражение: индекс массива в нём bash подставляет, то есть исполняет команду.
+    # Под этими именами значение для bash — арифметическое выражение: индекс
+    # массива в нём bash подставляет, то есть исполняет команду. Прежний цикл
+    # так и делал — без этого проверка ниже ничего бы не доказывала.
     marker = tmp_path / "executed"
-    content = f"{name}=PATH[$(touch {shlex.quote(str(marker))})0]\n"
+    content = f"{name}=PATH[$(touch {shlex.quote(str(marker))})0]\n".encode()
 
-    got = _run(COPIES[WEEKLY_REFRESH], content.encode(), tmp_path)
+    _run(PREVIOUS_LOOP, content, tmp_path)
+    assert marker.exists(), f"bash больше не вычисляет значение под именем {name}"
+    marker.unlink()
+
+    got = _run(COPIES[WEEKLY_REFRESH], content, tmp_path)
 
     assert (got.code, got.stderr) == (1, f"EnvironmentFile line 1: {OWNED_NAME}\n")
     assert not marker.exists(), "значение из файла секретов было исполнено"
+
+
+def test_a_symlink_to_the_file_is_read_like_the_file(tmp_path):
+    # Проверка «это обычный файл» не должна отвергать ссылку на него.
+    real = tmp_path / "real"
+    real.write_bytes(b"V=abc\n")
+    script = (
+        "set -euo pipefail\n"
+        + COPIES[WEEKLY_REFRESH].replace(ENV_FILE, shlex.quote(str(tmp_path / "link")))
+        + 'printf "%s" "$V"\n'
+    )
+    (tmp_path / "link").symlink_to(real)
+
+    done = subprocess.run(
+        ["bash", "-s"],
+        input=script.encode(),
+        capture_output=True,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+        timeout=60,
+        check=False,
+    )
+
+    assert (done.returncode, done.stdout, done.stderr) == (0, b"abc", b"")
 
 
 def test_every_variable_of_the_loader_is_a_name_it_refuses(tmp_path):

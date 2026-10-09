@@ -141,9 +141,9 @@ jobs:
               esac
               # Some names cannot carry a value from the file.  env_* is the state
               # of this function; PS4 and BASH_* reconfigure the running shell
-              # (BASH_ARGV0 renames it in every later message).  Under a name bash
-              # holds as a number (OPTIND, SECONDS, UID) the value would be computed,
-              # that is executed, instead of stored.  A read-only name (SHELLOPTS)
+              # (BASH_ARGV0 renames it in every later message).  A name bash holds
+              # as a number does not store text: under OPTIND or RANDOM the value
+              # would be computed, that is executed.  A read-only name (SHELLOPTS)
               # ends bash on the spot, hence the subshell first.  And bash keeps its
               # own value for the names it computes (GROUPS), so what was exported
               # is read back.
