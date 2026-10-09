@@ -548,10 +548,11 @@ telegram_send_failed error_at='notifier.py:153 in send_telegram_message' error_t
 | `http_status=403` | Человек заблокировал бота, или бот пишет ему первым |
 | `http_status=409` | Тем же токеном опрашивает другой процесс (второй бот, `telegram poll` при живом боте) или включён webhook |
 | `http_status=429` | Слишком часто |
+| `http_status` от 500 | Сбой на стороне Telegram или прокси перед ним |
 | `InvalidURL` | В токене управляющий символ или пробел — CR на конце строки env (не под systemd, см. выше), лишний перевод строки в значении |
 | `UnicodeEncodeError` | В токене нелатинская буква. У `telegram_send_failed` — ещё и текст сообщения, который не кодируется |
 | `TypeError` у `telegram_poll_failed` | Telegram ответил `ok`, но не списком сообщений |
-| `JSONDecodeError`, `AttributeError` | Ответил не Telegram: страница прокси или заглушка вместо JSON |
+| `JSONDecodeError`, `UnicodeDecodeError`, `AttributeError` | Ответил не Telegram или не так, как он отвечает: страница прокси, заглушка, JSON без объекта |
 | `URLError` + `reason_type` | Сеть: `gaierror` — нет имени в DNS, `ConnectionRefusedError` (`errno=111`) — отказ в соединении, `SSLCertVerificationError` — сертификат |
 | `TimeoutError` — классом или в `reason_type` | Telegram не ответил за отведённое время |
 

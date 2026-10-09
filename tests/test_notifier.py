@@ -397,13 +397,15 @@ def test_telegram_message_that_cannot_be_encoded_is_a_failed_send(monkeypatch, c
     }
 
 
-# Где в том, что исполняется, назван адрес Telegram, и сколько раз. Счёт, а не
-# одно имя файла: второе упоминание в уже названном файле — тоже новое место.
+# Где в том, что исполняется, назван адрес Telegram: файл → сколько раз назван
+# сам адрес и сколько раз — константа с ним. Счёт, а не одно имя файла: второе
+# упоминание в уже названном файле — тоже новое место.
 _NAMES_THE_TELEGRAM_ADDRESS = {
-    # Один раз — в `TELEGRAM_API_BASE`; кто по ней собирает запрос, названо в тесте.
-    "src/notifier.py": 1,
+    # Адрес — один раз, в `TELEGRAM_API_BASE`; константа — её определение и две
+    # функции, которые собирают по ней запрос (названы в тесте).
+    "src/notifier.py": (1, 3),
     # Подсказка оператору, где взять chat_id: на месте токена заглушка, запроса нет.
-    "scripts/configure-integrations.sh": 1,
+    "scripts/configure-integrations.sh": (1, 0),
 }
 
 
@@ -416,12 +418,11 @@ def test_only_the_two_sender_functions_build_a_telegram_request():
         for path in (root / folder).rglob("*"):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
-            try:
-                content = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-            if "api.telegram.org" in content or "TELEGRAM_API_BASE" in content:
-                named_in[path.relative_to(root).as_posix()] = content.count("api.telegram.org")
+            # Байтами и без оглядки на регистр: файл в другой кодировке — тоже файл.
+            content = path.read_bytes().lower()
+            counts = (content.count(b"api.telegram.org"), content.count(b"telegram_api_base"))
+            if any(counts):
+                named_in[path.relative_to(root).as_posix()] = counts
     builders = {
         node.name
         for node in ast.parse((root / "src/notifier.py").read_text(encoding="utf-8")).body
@@ -432,8 +433,8 @@ def test_only_the_two_sender_functions_build_a_telegram_request():
         _NAMES_THE_TELEGRAM_ADDRESS,
         {"send_telegram_message", "telegram_get_updates"},
     ), (
-        f"Адрес Telegram назван в {named_in} (файл: сколько раз), запрос собирают "
-        f"{sorted(builders)}. "
+        f"Адрес Telegram назван в {named_in} (файл: сколько раз адрес, сколько раз "
+        f"`TELEGRAM_API_BASE`), запрос собирают {sorted(builders)}. "
         "Токен бота стоит в адресе запроса, и текст ошибки запроса его несёт. В новом "
         "месте о сбое пиши `**_telegram_error_fields(exc)`, а не текст ошибки и не ответ "
         "сервера; проверь прямым вызовом с токеном, у которого на конце `\\r`, — как "
