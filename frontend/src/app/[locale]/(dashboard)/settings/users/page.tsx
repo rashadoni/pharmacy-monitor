@@ -5,11 +5,46 @@ import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
 import { useState } from "react";
 import { ArrowLeft, Clock, Send, Trash2, UserPlus } from "lucide-react";
-import { api, type Recipient, type RecipientCreate, type RecipientUpdate } from "@/lib/api";
+import {
+  ApiError,
+  api,
+  type Recipient,
+  type RecipientCreate,
+  type RecipientUpdate,
+} from "@/lib/api";
 import { formatTime } from "@/lib/utils";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
 type Sev = (typeof SEVERITIES)[number];
+
+// Причины, по которым сервер не принимает адрес (src/email_address.py, PROBLEMS).
+// Перевод каждой — users.address_problem_<код>; список и переводы сверяет
+// tests/test_email_address.py.
+const ADDRESS_PROBLEMS = [
+  "empty",
+  "whitespace",
+  "not_ascii",
+  "several",
+  "no_at",
+  "several_at",
+  "too_long",
+  "mailbox",
+  "domain",
+] as const;
+type AddressProblem = (typeof ADDRESS_PROBLEMS)[number];
+
+/** Код причины из ответа 422, если сервер отказал именно в адресе. */
+function addressProblem(err: unknown): AddressProblem | null {
+  if (!(err instanceof ApiError) || err.status !== 422) return null;
+  try {
+    const first = JSON.parse(err.detail)?.detail?.[0];
+    if (first?.type !== "email_address") return null;
+    const problem = first.ctx?.problem;
+    return ADDRESS_PROBLEMS.find((known) => known === problem) ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export default function UsersPage() {
   const t = useTranslations("users");
@@ -40,6 +75,13 @@ export default function UsersPage() {
   });
 
   const isAdmin = meQ.data?.role === "admin";
+
+  // Отказ в адресе — словами; остальные ошибки показываются как раньше.
+  function addError(err: unknown): string {
+    const problem = addressProblem(err);
+    if (problem) return t(`address_problem_${problem}`);
+    return (err as Error)?.message ?? t("add_error");
+  }
 
   return (
     <div className="space-y-6 max-w-3xl">
@@ -74,9 +116,7 @@ export default function UsersPage() {
             weeklyEnabled={weeklyEnabled}
             onAdd={(p) => createMut.mutate(p)}
             pending={createMut.isPending}
-            error={
-              createMut.isError ? ((createMut.error as Error)?.message ?? t("add_error")) : null
-            }
+            error={createMut.isError ? addError(createMut.error) : null}
             doneEmail={createMut.isSuccess ? createMut.data?.email : null}
           />
           <div className="space-y-3">

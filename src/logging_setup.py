@@ -57,6 +57,26 @@ def mask_addresses(text: str) -> str:
     return _ADDRESS_RE.sub(ADDRESS_MASK, text)
 
 
+# Вместо текста, который показывать нельзя.
+TEXT_WITHHELD = "<текст скрыт>"
+
+
+def without_addresses(text: str) -> str:
+    """Текст, который печатают мимо маски журнала, — или ничего.
+
+    Строку журнала выбросить нельзя, поэтому на журнале маска, и она не полна:
+    от `o'brien@…` оставляет начало имени, от `Иван Петров <…>` — имя, адрес с
+    именем в кавычках не трогает вовсе. Там, где текст можно не показать —
+    `click.echo`, строка «Error: …», текст ошибки отправки, — он не показывается
+    целиком, если в нём есть «@».
+
+    Видит она только «@». Telegram-идентификатор человека — число: ошибка базы,
+    в параметрах запроса которой он лежит, пройдёт как есть. Где такое бывает,
+    текст ошибки не печатают вовсе.
+    """
+    return TEXT_WITHHELD if "@" in text else text
+
+
 def masking(renderer):
     """Обернуть последний процессор structlog: адреса вырезаются из готовой строки.
 
@@ -70,6 +90,31 @@ def masking(renderer):
         return mask_addresses(rendered) if isinstance(rendered, str) else rendered
 
     return render
+
+
+class MaskingFormatter(logging.Formatter):
+    """Формат корневых обработчиков stdlib `logging`: адреса вырезаются из строки.
+
+    `masking` стоит на structlog, а в тот же вывод пишут ещё и сторонние
+    библиотеки — через корневые обработчики, мимо него. Источника адреса среди
+    них не найдено; формат стоит, чтобы появление такого источника ничего не
+    изменило. Вырезается всё, что формат отдаёт обработчику: сообщение,
+    трассировка, `stack_info`. Мимо остаётся только то, что `logging` печатает
+    в stderr сам, когда строку не принял поток или запись не удалось даже
+    показать через `repr`.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            text = super().format(record)
+        except Exception:
+            # Сообщение не сошлось со своими аргументами. `logging` в ответ
+            # печатает запись в stderr сам — мимо формата и вместе с аргументами.
+            text = (
+                f"unformattable log record from {record.name} "
+                f"({record.pathname}:{record.lineno}): {record.msg!r} % {record.args!r}"
+            )
+        return mask_addresses(text)
 
 
 def configure_logging(service: str = "app") -> None:
@@ -111,7 +156,7 @@ def configure_logging(service: str = "app") -> None:
 
     # Stdlib logging → forward to structlog so 3rd-party libs get same format
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setFormatter(MaskingFormatter("%(message)s"))
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
@@ -129,7 +174,7 @@ def configure_logging(service: str = "app") -> None:
             backupCount=backups,
             encoding="utf-8",
         )
-        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        file_handler.setFormatter(MaskingFormatter("%(message)s"))
         root.addHandler(file_handler)
 
 
