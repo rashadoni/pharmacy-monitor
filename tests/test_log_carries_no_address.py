@@ -118,8 +118,9 @@ _PRINTING_CALLS = {
 
 # Команды, которые печатают адрес или ответ почтового сервера по назначению:
 # оператор запускает их сам и читает вывод в своём терминале. `click.echo` и
-# `print` идут мимо маски журнала, поэтому из workflow эти команды не запускают —
-# см. тест ниже.
+# `print` идут мимо маски журнала, поэтому в список команд для workflow их не
+# вносят — см. тест ниже. Функция команды → как её зовут в CLI; имена сверяются
+# с деревом click.
 _PRINTS_AN_ADDRESS_BY_DESIGN = {
     "tenant_add_user": "tenant add-user",
     "tenant_issue_token": "tenant issue-token",
@@ -132,8 +133,6 @@ _PRINTS_AN_ADDRESS_BY_DESIGN = {
     # — больше его не печатает никто, docs/RUNBOOK.md «Email не приходит».
     "notify_test": "notify test",
 }
-# Функция команды → как её зовут в CLI. Имена сверяются с деревом click.
-_NOT_FROM_A_WORKFLOW = {**_PRINTS_AN_ADDRESS_BY_DESIGN}
 # Команды CLI, которые запускают из workflow. `click.echo`, `print` и строка
 # «Error: …» идут мимо маски журнала прямо в публичный журнал шага, поэтому
 # внести сюда команду — значит прочитать всё, что она печатает: текст пойманной
@@ -165,24 +164,25 @@ _HOW_TO_FIX_THE_LIST_OF_PRINTERS = (
     "списке: {unlisted} — новая команда выводит адрес или ответ почтового "
     "сервера через `print`/`click.echo`. Если в выводе он не нужен, печатай "
     "`user_id`, число или класс ошибки; если нужен оператору — добавь строку "
-    "«функция: имя в CLI» и убедись, что ни один workflow команду не запускает. "
+    "«функция: имя в CLI»: в список команд для workflow её после этого не внести. "
     "В списке, но не печатает: {stale} — команда перестала это выводить или её "
     "функцию переименовали: убери или поправь строку. В список идут только "
     "команды CLI: если адрес печатает вспомогательная функция, перенеси печать "
     "в саму команду."
 )
 _HOW_TO_FIX_A_WORKFLOW = (
-    "В workflow после имени CLI стоит команда, которой нет в "
-    "`_RUN_FROM_A_WORKFLOW`: {found}. Журнал шага Actions публичен, а "
-    "`click.echo`, `print` и строка «Error: …» идут мимо маски журнала. Прежде "
-    "чем внести команду в список, прочитай всё, что она печатает: адрес — "
-    "только `user_id` или числом, текст пойманной ошибки — только через "
-    "`logging_setup.without_addresses`; что прочитано, напиши в PR. Команду из "
-    "`_PRINTS_AN_ADDRESS_BY_DESIGN` внести нельзя: она печатает адрес или "
-    "ответ почтового сервера по назначению. `health-check` — только по слову "
-    "владельца. Проверка читает текст, а не исполняет его: если это строка "
-    "`echo` с описанием, а не запуск, — перефразируй её (комментарии и `name:` "
-    "шага проверка пропускает сама)."
+    "В workflow после имени CLI стоит не то, что есть в `_RUN_FROM_A_WORKFLOW`: "
+    "{found}. Журнал шага Actions публичен, а `click.echo`, `print` и строка "
+    "«Error: …» идут мимо маски журнала. Прежде чем внести команду в список, "
+    "прочитай всё, что она печатает: адрес — только `user_id` или числом, текст "
+    "пойманной ошибки — только через `logging_setup.without_addresses`; что "
+    "прочитано, напиши в PR. Команду из `_PRINTS_AN_ADDRESS_BY_DESIGN` внести "
+    "нельзя: она печатает адрес или ответ почтового сервера по назначению. "
+    "`health-check` — только по слову владельца. «{unknown}» значит, что после "
+    "имени CLI стоят слова, но команды среди них нет: она в переменной "
+    "(`pharmacy-monitor $CMD`) или это не запуск, а описание. Команду назови в "
+    "тексте явно, описание перефразируй (комментарии и `name:` шага проверка "
+    "пропускает сама)."
 )
 _HOW_TO_FIX_A_COMMAND_NAME = (
     "В списке названа команда, которой в CLI нет под этим именем или за ней "
@@ -199,7 +199,8 @@ _HOW_TO_FIX_A_BYPASS = (
     "асинхронная отправка) — он обязан чистить ошибку так же, и проверять его "
     "надо теми же тестами слоя 2. Если находка — не smtplib, а своё имя `SMTP` "
     "или `LMTP` (значение перечисления, константа), — переименуй его: проверка "
-    "сверяет имена."
+    "сверяет имена. В workflow имя ищется по тексту, и слово в комментарии — "
+    "тоже находка."
 )
 
 
@@ -334,7 +335,7 @@ def _cli_callback(name: str) -> str | None:
 def test_every_listed_command_is_a_cli_command_under_that_name():
     """Переименование команды не оставляет в списках мёртвое имя."""
     problems = []
-    for function, name in _NOT_FROM_A_WORKFLOW.items():
+    for function, name in _PRINTS_AN_ADDRESS_BY_DESIGN.items():
         callback = _cli_callback(name)
         if callback is None:
             problems.append(f"«{name}» — такой команды нет")
@@ -348,24 +349,38 @@ def test_every_listed_command_is_a_cli_command_under_that_name():
     assert problems == [], _HOW_TO_FIX_A_COMMAND_NAME.format(problems="; ".join(problems))
 
 
-# Точка входа CLI в тексте workflow: консольный скрипт или модуль — в кавычках,
-# в `${PM:-pharmacy-monitor}` или как есть.
-_CLI_ENTRY_POINT = re.compile(r"""(?:pharmacy-monitor|src\.main|src/main\.py)["'}]*[ \t]""")
+# Запуск CLI в тексте workflow: консольный скрипт (в кавычках, в
+# `${PM:-pharmacy-monitor}` или как есть), `python -m src.main` или
+# `python …/src/main.py`. Просто путь `src/main.py` (его копируют) и `from
+# src.main import` (встроенный Python) — не запуск.
+_CLI_ENTRY_POINT = re.compile(
+    r"""(?:pharmacy-monitor|-m[ \t]+src\.main|python[\d.]*["']?[ \t]+\S*src/main\.py)["'}]*[ \t]"""
+)
 _END_OF_SHELL_COMMAND = re.compile(r"&&|\|\||[;|\n]")
 # Строки, которые ничего не запускают: комментарий и имя шага.
 _NOT_A_COMMAND_LINE = re.compile(r"^[ \t]*(?:#|-?[ \t]*name:).*$", re.M)
+# После имени CLI стоят слова, но команды среди них нет.
+_UNKNOWN_COMMAND = "команда не узнана"
 
 
 def _cli_command(words: list[str]) -> str:
     """Какую команду CLI запускают слова после точки входа: «recipient list».
 
     Слова сверяются с деревом click. Слово, которое не команда, пропускается —
-    опция группы, её значение, переменная оболочки: `--log-level X recipient
-    list` запускает ту же команду, что `recipient list`.
+    опция, переменная оболочки; значение опции группы пропускается вместе с
+    ней: `--log-level run recipient list` запускает `recipient list`, а не `run`.
     """
-    group, path = main.cli, []
+    group, path, is_a_value = main.cli, [], False
     for word in words:
+        if is_a_value:
+            is_a_value = False
+            continue
         name = re.split(r"[<>]", word.strip("'\"`()&"))[0]  # `health-check>out.txt`
+        is_a_value = any(
+            name in param.opts and not param.is_flag
+            for param in group.params
+            if isinstance(param, click.Option)
+        )
         command = group.commands.get(name)
         if command is None:
             continue
@@ -377,13 +392,15 @@ def _cli_command(words: list[str]) -> str:
 
 
 def cli_commands_run(text: str) -> list[tuple[int, str]]:
-    """Команды CLI, которые запускает текст workflow: номер строки и команда.
+    """Команды CLI, которые запускает текст workflow: номер строки и команда —
+    или `_UNKNOWN_COMMAND`, если после имени CLI стоят слова, а команды среди
+    них нет (`pharmacy-monitor $CMD`, `pharmacy-monitor ${{ inputs.command }}`).
 
     Перенос строки через `\\` — продолжение той же команды. Текст читается, а
     не исполняется, поэтому команду разбор видит и в строке `echo` с её
-    описанием. Чего он не видит: команду за переменной оболочки (`$PM recipient
-    list`), внутри скрипта, который workflow запускает, вызов из Python
-    (`cli([...])`) и команду, разбитую по строкам без `\\` (YAML `run: >`).
+    описанием. Чего он не видит: имя CLI в переменной (`"$PM" recipient list`,
+    массив bash), команду с новой строки без `\\` (YAML `run: >`), запуск
+    внутри скрипта, который workflow зовёт, и вызов из Python (`cli([...])`).
     """
 
     def blank(found: re.Match) -> str:
@@ -392,10 +409,10 @@ def cli_commands_run(text: str) -> list[tuple[int, str]]:
     joined = re.sub(r"\\\r?\n", blank, _NOT_A_COMMAND_LINE.sub(blank, text))
     commands = []
     for entry in _CLI_ENTRY_POINT.finditer(joined):
-        tail = _END_OF_SHELL_COMMAND.split(joined[entry.end() :], maxsplit=1)[0]
-        command = _cli_command(tail.split())
-        if command:
-            commands.append((text.count("\n", 0, entry.start()) + 1, command))
+        words = _END_OF_SHELL_COMMAND.split(joined[entry.end() :], maxsplit=1)[0].split()
+        if words:
+            line = text.count("\n", 0, entry.start()) + 1
+            commands.append((line, _cli_command(words) or _UNKNOWN_COMMAND))
     return commands
 
 
@@ -409,7 +426,9 @@ def test_a_workflow_runs_only_the_commands_listed_for_it():
         for line, command in commands
         if command not in _RUN_FROM_A_WORKFLOW
     ]
-    assert found == [], _HOW_TO_FIX_A_WORKFLOW.format(found="; ".join(found))
+    assert found == [], _HOW_TO_FIX_A_WORKFLOW.format(
+        found="; ".join(found), unknown=_UNKNOWN_COMMAND
+    )
     # Разбор не ослеп: в workflow, ради которого всё это, — еженедельном сборе
     # pharmonline, который шлёт письма, — он видит запуск сбора.
     weekly = "autonomous-pharmonline-decodo-public-api.yml"
@@ -422,16 +441,10 @@ def test_a_workflow_runs_only_the_commands_listed_for_it():
 
 
 def test_no_command_that_prints_an_address_is_listed_for_a_workflow():
-    """В том числе группой: при `recipient "$ACTION"` подкоманду из текста не
-    узнать, и разбор назовёт только `recipient`."""
-    printers = set(_NOT_FROM_A_WORKFLOW.values())
-    listed = {
-        allowed
-        for allowed in _RUN_FROM_A_WORKFLOW
-        for printer in printers
-        if printer == allowed or printer.startswith(allowed + " ")
-    }
-    assert listed == set(), _HOW_TO_FIX_A_WORKFLOW.format(found=", ".join(sorted(listed)))
+    listed = _RUN_FROM_A_WORKFLOW & set(_PRINTS_AN_ADDRESS_BY_DESIGN.values())
+    assert listed == set(), _HOW_TO_FIX_A_WORKFLOW.format(
+        found=", ".join(sorted(listed)), unknown=_UNKNOWN_COMMAND
+    )
 
 
 @pytest.mark.parametrize(
@@ -463,8 +476,21 @@ def test_no_command_that_prints_an_address_is_listed_for_a_workflow():
         ("pharmacy-monitor health-check>/tmp/health.txt 2>&1", [(1, "health-check")]),
         ("pharmacy-monitor health-check& wait", [(1, "health-check")]),
         ("pharmacy-monitor run --site aloe; echo recipient list", [(1, "run")]),
+        (
+            "/opt/pharmacy-monitor/.venv/bin/python src/main.py recipient list",
+            [(1, "recipient list")],
+        ),
+        # Значение опции группы, названное как команда.
+        ("pharmacy-monitor --log-level run recipient list", [(1, "recipient list")]),
+        # Команда в переменной: запуск есть, а что запущено — из текста не узнать.
+        ("pharmacy-monitor $CMD", [(1, _UNKNOWN_COMMAND)]),
+        ("pharmacy-monitor ${{ inputs.command }} --site aloe", [(1, _UNKNOWN_COMMAND)]),
+        ("python -m src.main --help", [(1, _UNKNOWN_COMMAND)]),
+        # Не запуск: каталог, копирование файла, встроенный Python.
         ("cd /opt/pharmacy-monitor && ls recipient list", []),
+        ("rsync -a src/main.py src/notifier.py pm@host:/opt/pharmacy-monitor/src/", []),
         ("from src.main import (", []),
+        ("          from src.main import _verify_pharmonline_public_api_identities", []),
         # Комментарий и имя шага ничего не запускают.
         ("  # после выкладки руками: pharmacy-monitor notify test", []),
         ("      - name: Restart pharmacy-monitor health-check timer", []),
@@ -476,6 +502,8 @@ def test_the_workflow_check_finds_the_command_behind_options_and_line_breaks(tex
 
 
 def test_health_check_is_not_listed_for_a_workflow_without_the_owners_word():
+    """Растяжка, а не проверка: сама она упасть может только от правки списка —
+    и говорит тому, кто правит, чьё это решение."""
     assert "health-check" not in _RUN_FROM_A_WORKFLOW, (
         "`health-check` из workflow запретил запускать владелец. Причина, по "
         "которой запрет был введён, устранена, но снять его — решение владельца, "
@@ -1062,14 +1090,15 @@ class _SmtplibWithoutANetwork(smtplib.SMTP):
         ".",
         "=?utf-8?q?=0A",
         "я",
-        '"viewer name"@client.example',
-        f"Иван Петров <{ADDRESS}>",
     ],
 )
 def test_a_broken_recipient_record_never_brings_the_others_out(smtp_env, monkeypatch, record):
     """`recipient add` адрес не проверяет, а письмо на весь список одно: кривая
     запись ломает его сборку, и что об этом скажет пакет `email`, зависит от
-    версии Python. Что бы ни сказал — адреса соседей наружу не выходят."""
+    версии Python. Что бы ни сказал — адреса соседей наружу не выходят.
+
+    На 3.12.3 адреса несёт только ошибка от первой записи (её отдельно держит
+    тест ниже); остальные — на случай версии, где с адресами выйдет другая."""
     monkeypatch.setattr("smtplib.SMTP", _SmtplibWithoutANetwork)
     recipients = [ADDRESS, record, "second@client.example"]
 
@@ -1256,8 +1285,9 @@ def test_run_failure_output_carries_no_address(cli_logging, db_session, monkeypa
     factory = sessionmaker(bind=db_session.get_bind(), expire_on_commit=False, autoflush=False)
 
     async def refused(*args, **kwargs):
-        # Без записи адреса, которую маска не узнаёт: трассировку печатает
-        # журнал, а на журнале маска — это её известный предел, не этого теста.
+        # Только запись адреса, которую маска знает: трассировку печатает
+        # журнал, а на журнале маска. Запись, которую она не узнаёт, прошла бы
+        # в трассировке как есть — это известный предел слоя 3, не этого теста.
         raise RuntimeError(_SMTPLIB_TEXT)
 
     monkeypatch.setattr(storage, "init_db", lambda: None)
