@@ -1706,16 +1706,24 @@ def dash_digest_send_test(
     from src import notifications
 
     try:
-        count = (
+        result = (
             notifications.send_daily_digest(db, tenant_id=user.tenant_id)
             if kind == "daily"
             else notifications.send_weekly_digest(db, tenant_id=user.tenant_id)
         )
-        log.info("digest_sent_manual", kind=kind, count=count, by_user_id=user.id)
-        return {"ok": True, "recipients_sent": count}
     except Exception as e:
         log.error("digest_send_failed", error=str(e))
         raise HTTPException(500, f"Не удалось отправить: {e}")
+
+    # `recipients_sent` — только те, кому отправитель письмо подтвердил. Сбой
+    # отправки `_send_digest` наружу не выпускает, а считает в `failed`.
+    sent, failed = result["sent"], result["failed"]
+    if failed and not sent:
+        log.error("digest_send_failed", kind=kind, failed=failed, by_user_id=user.id)
+        raise HTTPException(502, "Дайджест не отправлен: почта не приняла ни одного письма")
+    note = log.warning if failed else log.info
+    note("digest_sent_manual", kind=kind, count=sent, failed=failed, by_user_id=user.id)
+    return {"ok": not failed, "recipients_sent": sent, "recipients_failed": failed}
 
 
 # ─── Recipients management (admin only) ──────────────────────────────────────

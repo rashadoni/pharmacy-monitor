@@ -217,12 +217,16 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
     только у событий, реально вошедших в отправленную сводку) и коммитится
     per-получатель — чтобы сбой commit не дал повторную рассылку всей пачки.
 
-    Возвращает {'email': писем, 'telegram': сообщений}.
+    Возвращает {'email': писем, 'telegram': сообщений, 'failed': отправок не
+    состоялось, 'undelivered': событий, которые кому-то слали и которые не дошли
+    ни по одному каналу}. Первые два числа — только подтверждённое отправителем.
+    Вызывающий, который пишет или печатает «разослано», обязан смотреть на
+    `failed`: нули в `email` и `telegram` бывают и когда слать было некому.
     """
     # Dedup: не трогаем уже отправленные (retry-safe, как dispatch_event).
     pending = [e for e in events if not (e.channels_sent and len(e.channels_sent) > 0)]
     if not pending:
-        return {"email": 0, "telegram": 0}
+        return {"email": 0, "telegram": 0, "failed": 0, "undelivered": 0}
 
     # Группировка по tenant_id — forward-looking. СЕЙЧАС no-op: evaluate_rules
     # создаёт AlertEvent без tenant_id → все события дефолтятся в tenant 1 (как и
@@ -280,6 +284,7 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                         log.warning(
                             "email_batch_failed",
                             user_id=user.id,
+                            events=len(ev_email),
                             **notifier.delivery_error_fields(exc),
                         )
 
@@ -312,6 +317,7 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                         log.warning(
                             "telegram_batch_failed",
                             user_id=user.id,
+                            events=len(ev_tg),
                             **notifier.delivery_error_fields(exc),
                         )
 
@@ -341,7 +347,12 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
         failed=failed,
         undelivered=undelivered,
     )
-    return {"email": emails_sent, "telegram": tg_sent}
+    return {
+        "email": emails_sent,
+        "telegram": tg_sent,
+        "failed": failed,
+        "undelivered": undelivered,
+    }
 
 
 # ─── События, которых нет в журнале: только администраторам ──────────────────
@@ -372,7 +383,9 @@ def mail_unstored_events_to_admins(
     Пороги важности и тихие часы действуют как обычно. `note` — пояснение под
     заголовком письма.
 
-    Возвращает {'email': писем, 'telegram': сообщений, 'failed': сбоев}.
+    Возвращает {'email': писем, 'telegram': сообщений, 'failed': сбоев}. Кому не
+    ушло, остаётся в журнале: `email_batch_failed` / `telegram_batch_failed` с
+    `user_id` — и когда отправитель бросил исключение, и когда ответил «не ушло».
     """
     counts = {"email": 0, "telegram": 0, "failed": 0}
     by_tenant: dict[int, list[storage.AlertEvent]] = {}
@@ -405,8 +418,14 @@ def mail_unstored_events_to_admins(
                     log.warning(
                         "email_batch_failed",
                         user_id=user.id,
+                        events=len(ev_email),
                         **notifier.delivery_error_fields(exc),
                     )
+                else:
+                    # False — SMTP не настроен; причину отправитель написал сам
+                    # (`email_skipped_no_smtp`), здесь остаётся, кому не ушло.
+                    if not delivered:
+                        log.warning("email_batch_failed", user_id=user.id, events=len(ev_email))
                 counts["email" if delivered else "failed"] += 1
 
             if user.telegram_chat_id and not _in_quiet_hours(user.quiet_hours):
@@ -428,8 +447,14 @@ def mail_unstored_events_to_admins(
                         log.warning(
                             "telegram_batch_failed",
                             user_id=user.id,
+                            events=len(ev_tg),
                             **notifier.delivery_error_fields(exc),
                         )
+                    else:
+                        # False — нет токена, сеть или отказ Telegram; причину
+                        # отправитель написал сам.
+                        if not delivered:
+                            log.warning("telegram_batch_failed", user_id=user.id, events=len(ev_tg))
                     counts["telegram" if delivered else "failed"] += 1
 
     return counts
@@ -463,8 +488,8 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
 
 def send_daily_digest(
     session: Session, tenant_id: int = 1, *, only_email: str | None = None, dry_run: bool = False
-) -> int:
-    """Send daily digest to opted-in users. Returns count of emails sent."""
+) -> dict[str, int]:
+    """Send daily digest to opted-in users. Returns the counts of `_send_digest`."""
     return _send_digest(
         session,
         tenant_id,
@@ -477,7 +502,7 @@ def send_daily_digest(
 
 def send_weekly_digest(
     session: Session, tenant_id: int = 1, *, only_email: str | None = None, dry_run: bool = False
-) -> int:
+) -> dict[str, int]:
     return _send_digest(
         session,
         tenant_id,
@@ -496,13 +521,19 @@ def _send_digest(
     *,
     only_email: str | None = None,
     dry_run: bool = False,
-) -> int:
-    """Собрать и разослать дайджест. Возвращает число получателей.
+) -> dict[str, int]:
+    """Собрать и разослать дайджест.
+
+    Возвращает {'recipients': скольким письмо предназначалось, 'sent': скольким
+    отправитель его подтвердил, 'failed': скольким не ушло}. Получатель считается
+    в `sent` только по ответу отправителя: `send_email` без SMTP ничего не шлёт и
+    отвечает False. При `dry_run` `sent` и `failed` — нули.
 
     `only_email` — отправить одному получателю из включивших дайджест: так
     письмо смотрят на живых данных, не трогая остальных. `dry_run` — собрать
     письма и записать в лог тему, размер и число строк, ничего не отправляя.
     """
+    counts = {"recipients": 0, "sent": 0, "failed": 0}
     users = session.scalars(
         select(storage.TenantUser).where(
             storage.TenantUser.tenant_id == tenant_id,
@@ -516,7 +547,7 @@ def _send_digest(
         users = [u for u in users if u.email.lower() == only_email.strip().lower()]
     if not users:
         log.info("digest_no_recipients", kind=kind, tenant=tenant_id)
-        return 0
+        return counts
 
     events = session.scalars(
         select(storage.AlertEvent)
@@ -530,7 +561,7 @@ def _send_digest(
 
     if not events:
         log.info("digest_no_events", kind=kind, tenant=tenant_id)
-        return 0
+        return counts
 
     # Письмо одно на всех получателей. «Порог email-уведомлений» получателя
     # (`email_severity_min`) на дайджест не действует — решение владельца
@@ -538,7 +569,7 @@ def _send_digest(
     # пропали бы названия товаров из «Можно поднять цену».
     html = _render_digest_email(events, kind=kind, since=since)
     subject = _digest_subject(events, kind)
-    sent = 0
+    counts["recipients"] = len(users)
     for user in users:
         if dry_run:
             log.info(
@@ -549,25 +580,42 @@ def _send_digest(
                 kb=round(len(html.encode()) / 1024, 1),
                 rows=html.count(_EVENT_ROW_MARK),
             )
-            sent += 1
             continue
         try:
-            notifier.send_email(subject=subject, html_body=html, to=[user.email])
-            sent += 1
+            # False — SMTP не настроен, письма не было (отправитель пишет
+            # `email_skipped_no_smtp`); отказ сервера и сеть приходят исключением.
+            if notifier.send_email(subject=subject, html_body=html, to=[user.email]):
+                counts["sent"] += 1
+            else:
+                counts["failed"] += 1
+                log.warning("digest_email_failed", user_id=user.id, kind=kind)
         except Exception as e:
+            counts["failed"] += 1
             log.warning(
                 "digest_email_failed",
                 user_id=user.id,
                 kind=kind,
                 **notifier.delivery_error_fields(e),
             )
-    log.info(
-        "digest_dry_run_done" if dry_run else "digest_sent",
-        kind=kind,
-        recipients=sent,
-        events=len(events),
-    )
-    return sent
+
+    if dry_run:
+        log.info(
+            "digest_dry_run_done", kind=kind, recipients=counts["recipients"], events=len(events)
+        )
+    elif not counts["failed"]:
+        log.info("digest_sent", kind=kind, recipients=counts["sent"], events=len(events))
+    elif counts["sent"]:
+        # Ушло не всем: `recipients` — скольким отправитель письмо подтвердил.
+        log.warning(
+            "digest_sent",
+            kind=kind,
+            recipients=counts["sent"],
+            failed=counts["failed"],
+            events=len(events),
+        )
+    else:
+        log.warning("digest_not_sent", kind=kind, failed=counts["failed"], events=len(events))
+    return counts
 
 
 _FINANCIAL_EVENT_TYPES = {

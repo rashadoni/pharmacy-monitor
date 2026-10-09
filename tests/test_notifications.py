@@ -256,6 +256,9 @@ def test_dispatch_event_severity_below_threshold_skipped(setup, tenant_user):
 
 # ─── dispatch_events_batch (one email per run) ───────────────────────────────
 
+# Ничего не слали и ничего не сорвалось.
+_NOTHING_SENT = {"email": 0, "telegram": 0, "failed": 0, "undelivered": 0}
+
 
 def _mk_event(s, tenant_id, key, severity, title):
     e = storage.AlertEvent(
@@ -347,8 +350,8 @@ def test_dispatch_events_batch_skips_already_sent_and_empty(setup, tenant_user):
     already.channels_sent = ["email"]
     s.commit()
     with patch("src.notifier.send_email") as mock_email:
-        assert notifications.dispatch_events_batch(s, [already]) == {"email": 0, "telegram": 0}
-        assert notifications.dispatch_events_batch(s, []) == {"email": 0, "telegram": 0}
+        assert notifications.dispatch_events_batch(s, [already]) == _NOTHING_SENT
+        assert notifications.dispatch_events_batch(s, []) == _NOTHING_SENT
         assert not mock_email.called
 
 
@@ -551,7 +554,7 @@ def test_dispatch_events_batch_telegram_refusal_is_not_a_delivery(setup, tenant_
         result = notifications.dispatch_events_batch(s, evs)
 
     assert mock_tg.call_count == 1
-    assert result == {"email": 0, "telegram": 0}
+    assert result == {"email": 0, "telegram": 0, "failed": 1, "undelivered": 3}
     for e in evs:
         s.refresh(e)
         assert not e.channels_sent
@@ -581,8 +584,8 @@ def test_dispatch_events_batch_telegram_refusal_leaves_events_pending(setup, ten
         again = notifications.dispatch_events_batch(s, [e])
 
     assert mock_tg.call_count == 2
-    assert first == {"email": 0, "telegram": 0}
-    assert again == {"email": 0, "telegram": 1}
+    assert first == {"email": 0, "telegram": 0, "failed": 1, "undelivered": 1}
+    assert again == {"email": 0, "telegram": 1, "failed": 0, "undelivered": 0}
     s.refresh(e)
     assert e.channels_sent == ["telegram"]
 
@@ -602,7 +605,7 @@ def test_dispatch_events_batch_telegram_refusal_keeps_the_email_mark(setup, tena
     ):
         result = notifications.dispatch_events_batch(s, [e])
 
-    assert result == {"email": 1, "telegram": 0}
+    assert result == {"email": 1, "telegram": 0, "failed": 1, "undelivered": 0}
     s.refresh(e)
     assert e.channels_sent == ["email"]
     summary = _batch_summary(logs)
@@ -641,7 +644,7 @@ def test_dispatch_events_batch_marks_only_what_telegram_took(setup, tenant_user,
 
     # Слали обоим: отказ одному не отменяет отправку другому.
     assert sorted(c.args[0] for c in mock_tg.call_args_list) == sorted([_CHAT_ID, "222"])
-    assert result == {"email": 0, "telegram": 1}
+    assert result == {"email": 0, "telegram": 1, "failed": 1, "undelivered": 1}
     # В сбое — сколько событий было в сообщении этого получателя, а не в прогоне.
     assert [(f["user_id"], f["events"]) for f in _failures(logs, "telegram_batch_failed")] == [
         (refused.id, 2)
@@ -671,7 +674,7 @@ def test_dispatch_events_batch_without_a_token_delivers_nothing(setup, tenant_us
     with capture_logs() as logs:
         result = notifications.dispatch_events_batch(s, [e])
 
-    assert result == {"email": 0, "telegram": 0}
+    assert result == {"email": 0, "telegram": 0, "failed": 1, "undelivered": 1}
     s.refresh(e)
     assert not e.channels_sent
     # Причину называет отправитель, получателя — рассылка.
@@ -701,7 +704,7 @@ def test_dispatch_events_batch_unconfigured_smtp_is_not_a_delivery(setup, tenant
 
     # Письмо пробовали послать обоим: отказ первому не отменяет попытку второму.
     assert (mock_email.call_count, mock_tg.call_count) == (2, 1)
-    assert result == {"email": 0, "telegram": 1}
+    assert result == {"email": 0, "telegram": 1, "failed": 2, "undelivered": 1}
     s.refresh(crit)
     s.refresh(warn)
     assert crit.channels_sent == ["telegram"]
@@ -735,7 +738,7 @@ def test_dispatch_events_batch_counts_a_sender_that_raised(setup, tenant_user, c
     ):
         result = notifications.dispatch_events_batch(s, evs)
 
-    assert result == {"email": 0, "telegram": 0}
+    assert result == {"email": 0, "telegram": 0, "failed": 1, "undelivered": 3}
     (failure,) = _failures(logs, f"{channel}_batch_failed")
     assert failure["user_id"] == tenant_user.id
     summary = _batch_summary(logs)
@@ -777,7 +780,7 @@ def test_dispatch_events_batch_counts_across_tenants(setup, tenant_user, refused
         # Тенант первого события обходится первым.
         result = notifications.dispatch_events_batch(s, [*mine, theirs])
 
-    assert result == {"email": 0, "telegram": 1}
+    assert result == {"email": 0, "telegram": 1, "failed": 1, "undelivered": undelivered}
     summary = _batch_summary(logs)
     assert (summary["telegram"], summary["failed"], summary["undelivered"]) == (1, 1, undelivered)
     for e in (*mine, theirs):
@@ -806,7 +809,7 @@ def test_dispatch_events_batch_does_not_count_what_was_never_sent(setup, tenant_
         result = notifications.dispatch_events_batch(s, [e])
 
     assert not mock_email.called and not mock_tg.called
-    assert result == {"email": 0, "telegram": 0}
+    assert result == _NOTHING_SENT
     summary = _batch_summary(logs)
     assert (summary["failed"], summary["undelivered"]) == (0, 0)
 
@@ -826,7 +829,7 @@ def test_dispatch_events_batch_clean_run_reports_no_failures(setup, tenant_user)
     ):
         result = notifications.dispatch_events_batch(s, [crit, info])
 
-    assert result == {"email": 1, "telegram": 1}
+    assert result == {"email": 1, "telegram": 1, "failed": 0, "undelivered": 0}
     assert _failures(logs, "telegram_batch_failed") == []
     summary = _batch_summary(logs)
     # info ниже порогов получателя: его никому и не слали — это не «не ушло».
@@ -994,7 +997,7 @@ def test_dispatch_events_batch_all_below_threshold_redispatchable(setup, tenant_
     with patch("src.notifier.send_email") as mock_email:
         result = notifications.dispatch_events_batch(s, [warn, info])
         assert not mock_email.called
-        assert result == {"email": 0, "telegram": 0}
+        assert result == _NOTHING_SENT
 
     s.refresh(warn)
     s.refresh(info)
@@ -1004,13 +1007,16 @@ def test_dispatch_events_batch_all_below_threshold_redispatchable(setup, tenant_
 
 # ─── Digest ─────────────────────────────────────────────────────────────────
 
+# Письмо не собиралось: нет получателей или нет событий.
+_NO_DIGEST = {"recipients": 0, "sent": 0, "failed": 0}
+
 
 def test_send_daily_digest_no_recipients(setup, tenant_user):
     """User without daily_digest=True → no email."""
     s = setup
     with patch("src.notifier.send_email") as mock_email:
         sent = notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
-        assert sent == 0
+        assert sent == _NO_DIGEST
         assert not mock_email.called
 
 
@@ -1053,7 +1059,7 @@ def test_send_daily_digest_with_events(setup, tenant_user):
 
     with patch("src.notifier.send_email") as mock_email:
         sent = notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
-        assert sent == 1
+        assert sent == {"recipients": 1, "sent": 1, "failed": 0}
         assert mock_email.called
 
 
@@ -1073,7 +1079,7 @@ def test_send_digest_skips_legacy_financial_event_without_verified_run(setup, te
     s.commit()
 
     with patch("src.notifier.send_email") as mock_email:
-        assert notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id) == 0
+        assert notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id) == _NO_DIGEST
         assert not mock_email.called
 
 
@@ -1095,7 +1101,7 @@ def test_send_daily_digest_skips_old_events(setup, tenant_user):
 
     with patch("src.notifier.send_email") as mock_email:
         sent = notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
-        assert sent == 0
+        assert sent == _NO_DIGEST
         assert not mock_email.called
 
 
@@ -1626,7 +1632,7 @@ def test_digest_skips_financial_event_with_odd_payload(setup, tenant_user):
     s.commit()
 
     with patch("src.notifier.send_email") as mock_email:
-        assert notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id) == 0
+        assert notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id) == _NO_DIGEST
         assert not mock_email.called
 
 
@@ -1671,7 +1677,8 @@ def test_digest_only_sends_to_one_opted_in_recipient(setup, tenant_user):
             sent = notifications.send_weekly_digest(
                 s, tenant_id=tenant_user.tenant_id, only_email=only_email
             )
-        assert sent == mock_email.call_count
+        count = mock_email.call_count
+        assert sent == {"recipients": count, "sent": count, "failed": 0}
         return [c.kwargs["to"][0] for c in mock_email.call_args_list]
 
     assert send(" Alice@Example.com ") == ["alice@example.com"]
@@ -1691,9 +1698,9 @@ def test_digest_dry_run_sends_nothing(setup, tenant_user):
     s.commit()
 
     with patch("src.notifier.send_email") as mock_email:
-        assert (
-            notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id, dry_run=True) == 1
-        )
+        result = notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id, dry_run=True)
+        # Письмо предназначалось одному; ни отправленных, ни сорванных нет.
+        assert result == {"recipients": 1, "sent": 0, "failed": 0}
         assert not mock_email.called
 
 

@@ -434,7 +434,7 @@ def test_run_letter_failure_log_carries_no_address(session, user):
     event = _event(session, user)
     with capture_logs() as logs:
         counts = notifications.dispatch_events_batch(session, [event])
-    assert counts == {"email": 0, "telegram": 0}
+    assert counts == {"email": 0, "telegram": 0, "failed": 2, "undelivered": 1}
     _assert_clean(logs, events={"email_batch_failed", "telegram_batch_failed"}, user_id=user.id)
 
 
@@ -450,7 +450,7 @@ def test_per_user_digest_failure_log_carries_no_address(session, user):
     _event(session, user)
     with capture_logs() as logs:
         sent = notifications.send_weekly_digest(session, tenant_id=user.tenant_id)
-    assert sent == 0
+    assert sent == {"recipients": 1, "sent": 0, "failed": 1}
     _assert_clean(logs, events={"digest_email_failed"}, user_id=user.id)
 
 
@@ -472,8 +472,8 @@ def test_telegram_binding_log_carries_no_address(session, user):
 
 def test_legacy_daily_digest_failure_log_carries_no_address(session, user):
     _event(session, user)
-    with capture_logs() as logs:
-        assert digest.send_daily_digest(session) == 0
+    with capture_logs() as logs, pytest.raises(digest.DigestNotSent):
+        digest.send_daily_digest(session)
     _assert_clean(logs, events={"digest_email_failed"}, user_id=None)
 
 
