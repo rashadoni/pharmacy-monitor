@@ -361,13 +361,16 @@ def test_every_listed_command_is_a_cli_command_under_that_name():
     assert problems == [], _HOW_TO_FIX_A_COMMAND_NAME.format(problems="; ".join(problems))
 
 
-# Запуск CLI в тексте workflow: консольный скрипт (в кавычках, в
-# `${PM:-pharmacy-monitor}` или как есть), `python -m src.main` или
-# `python …/src/main.py`. Просто путь `src/main.py` (его копируют) и `from
-# src.main import` (встроенный Python) — не запуск.
+# Запуск CLI в тексте workflow. Консольный скрипт — отдельным словом (в
+# кавычках, в `${PM:-pharmacy-monitor}`, элементом списка) или из каталога
+# `bin/`; каталог `/opt/pharmacy-monitor` — не запуск. `python -m src.main` —
+# тоже запуск.
 _CLI_ENTRY_POINT = re.compile(
-    r"""(?:pharmacy-monitor|-m[ \t]+src\.main|python[\d.]*["']?[ \t]+\S*src/main\.py)["'}]*[ \t]"""
+    r"""(?:(?:(?<![\w/.])|(?<=bin/))pharmacy-monitor|-m[ \t]+src\.main)["'}]*,?[ \t]"""
 )
+# Путь `src/main.py` стоит и там, где файл запускают, и там, где его копируют:
+# запуском он считается, только если следом идёт команда CLI.
+_CLI_SCRIPT_PATH = re.compile(r"""src/main\.py["'}]*,?[ \t]""")
 _END_OF_SHELL_COMMAND = re.compile(r"&&|\|\||[;|\n]")
 # Строки, которые ничего не запускают: комментарий и имя шага.
 _NOT_A_COMMAND_LINE = re.compile(r"^[ \t]*(?:#|-?[ \t]*name:).*$", re.M)
@@ -378,24 +381,27 @@ _UNKNOWN_COMMAND = "команда не узнана"
 def _cli_command(words: list[str]) -> str:
     """Какую команду CLI запускают слова после точки входа: «recipient list».
 
-    Слова сверяются с деревом click. Слово, которое не команда, пропускается —
-    опция, переменная оболочки; значение опции группы пропускается вместе с
-    ней: `--log-level run recipient list` запускает `recipient list`, а не `run`.
+    Слова сверяются с деревом click. Опция пропускается, значение опции группы
+    — вместе с ней: `--log-level run recipient list` запускает `recipient
+    list`, а не `run`. На первом слове, которое не опция и не команда, разбор
+    останавливается: `"$CMD" run` — не `run`, а неизвестно что.
     """
     group, path, is_a_value = main.cli, [], False
     for word in words:
         if is_a_value:
             is_a_value = False
             continue
-        name = re.split(r"[<>]", word.strip("'\"`()&"))[0]  # `health-check>out.txt`
-        is_a_value = any(
-            name in param.opts and not param.is_flag
-            for param in group.params
-            if isinstance(param, click.Option)
-        )
+        name = re.split(r"[<>]", word.strip("'\"`()&[],"))[0]  # `health-check>out.txt`
+        if name.startswith("-"):
+            is_a_value = any(
+                name in param.opts and not param.is_flag
+                for param in group.params
+                if isinstance(param, click.Option)
+            )
+            continue
         command = group.commands.get(name)
         if command is None:
-            continue
+            break
         path.append(name)
         if not isinstance(command, click.Group):
             break
@@ -411,8 +417,10 @@ def cli_commands_run(text: str) -> list[tuple[int, str]]:
     Перенос строки через `\\` — продолжение той же команды. Текст читается, а
     не исполняется, поэтому команду разбор видит и в строке `echo` с её
     описанием. Чего он не видит: имя CLI в переменной (`"$PM" recipient list`,
-    массив bash), команду с новой строки без `\\` (YAML `run: >`), запуск
-    внутри скрипта, который workflow зовёт, и вызов из Python (`cli([...])`).
+    массив bash), скрипт не из каталога `bin/` (`./pharmacy-monitor …`),
+    `src/main.py` с командой в переменной, команду с новой строки без `\\`
+    (YAML `run: >`), запуск внутри скрипта, который workflow зовёт, и вызов из
+    Python (`cli([...])`).
     """
 
     def blank(found: re.Match) -> str:
@@ -420,12 +428,14 @@ def cli_commands_run(text: str) -> list[tuple[int, str]]:
 
     joined = re.sub(r"\\\r?\n", blank, _NOT_A_COMMAND_LINE.sub(blank, text))
     commands = []
-    for entry in _CLI_ENTRY_POINT.finditer(joined):
-        words = _END_OF_SHELL_COMMAND.split(joined[entry.end() :], maxsplit=1)[0].split()
-        if words:
-            line = text.count("\n", 0, entry.start()) + 1
-            commands.append((line, _cli_command(words) or _UNKNOWN_COMMAND))
-    return commands
+    for entry_point, certainly_a_run in ((_CLI_ENTRY_POINT, True), (_CLI_SCRIPT_PATH, False)):
+        for entry in entry_point.finditer(joined):
+            words = _END_OF_SHELL_COMMAND.split(joined[entry.end() :], maxsplit=1)[0].split()
+            command = _cli_command(words)
+            if command or (words and certainly_a_run):
+                line = text.count("\n", 0, entry.start()) + 1
+                commands.append((line, command or _UNKNOWN_COMMAND))
+    return sorted(commands)
 
 
 def test_a_workflow_runs_only_the_commands_listed_for_it():
@@ -496,10 +506,17 @@ def test_no_command_that_prints_an_address_is_listed_for_a_workflow():
         ("pharmacy-monitor --log-level run recipient list", [(1, "recipient list")]),
         # Команда в переменной: запуск есть, а что запущено — из текста не узнать.
         ("pharmacy-monitor $CMD", [(1, _UNKNOWN_COMMAND)]),
+        ('pharmacy-monitor "$CMD" run', [(1, _UNKNOWN_COMMAND)]),
+        # `src/main.py` за интерпретатором с опцией и за интерпретатором в переменной.
+        ("python -u src/main.py health-check", [(1, "health-check")]),
+        ('"$PY" src/main.py recipient list', [(1, "recipient list")]),
+        # Команда списком YAML.
+        ('command: ["pharmacy-monitor", "recipient", "list"]', [(1, "recipient list")]),
         ("pharmacy-monitor ${{ inputs.command }} --site aloe", [(1, _UNKNOWN_COMMAND)]),
         ("python -m src.main --help", [(1, _UNKNOWN_COMMAND)]),
         # Не запуск: каталог, копирование файла, встроенный Python.
         ("cd /opt/pharmacy-monitor && ls recipient list", []),
+        ("tar -C /opt/pharmacy-monitor src", []),
         ("rsync -a src/main.py src/notifier.py pm@host:/opt/pharmacy-monitor/src/", []),
         ("from src.main import (", []),
         ("          from src.main import _verify_pharmonline_public_api_identities", []),
@@ -1056,7 +1073,7 @@ def test_an_interrupt_while_the_failure_is_cleaned_carries_no_refusal(smtp_env, 
     monkeypatch.setattr("smtplib.SMTP", _smtp_that_fails_with(refusal))
 
     def interrupted(exc):
-        raise KeyboardInterrupt
+        raise KeyboardInterrupt from exc
 
     monkeypatch.setattr(notifier, "_send_failure", interrupted)
 
