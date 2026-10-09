@@ -92,8 +92,10 @@ def test_aloe_products_from_listing_html_parses_embedded_payload() -> None:
     assert len(products) == 1
     product = products[0]
     assert product.site == "aloe"
-    assert product.external_id == "reloba-30-ed"
-    assert product.url == "https://aloe.az/reloba-30-ed/"
+    # Товар называет его номер на сайте, а не слаг: слаг у товаров бывает общий.
+    assert product.external_id == "26069"
+    assert product.url == "https://aloe.az/26069/#reloba-30-ed"
+    assert product.identity_verified is True
     assert product.name == "Reloba 30 ed"
     assert product.brand == "AloeBrand"
     assert product.price == 38.1
@@ -170,7 +172,12 @@ async def test_aloe_rsc_scrape_category_uses_last_page(monkeypatch) -> None:
 
     products = [p async for p in scraper.scrape_category("dermanlar")]
 
-    assert [p.external_id for p in products] == ["one", "two", "three"]
+    assert [p.external_id for p in products] == ["1", "2", "3"]
+    assert [p.url for p in products] == [
+        "https://aloe.az/1/#one",
+        "https://aloe.az/2/#two",
+        "https://aloe.az/3/#three",
+    ]
     assert len(requested) == 3
     assert requested[0] == "https://aloe.az/catalog/filters/?category_slug=dermanlar"
     assert requested[1].endswith("&page=2")
@@ -422,7 +429,7 @@ async def test_aloe_listing_survives_one_transient_failure(monkeypatch, blip: st
 
     products = [p async for p in scraper.scrape_category("dermanlar")]
 
-    assert [p.external_id for p in products] == ["item-1", "item-2"]
+    assert [p.external_id for p in products] == ["1", "2"]
     assert requests == ["1", "2", "2"]
     status = scraper._route_statuses["dermanlar"]
     assert status.complete is True
@@ -483,7 +490,7 @@ async def test_aloe_detail_fetch_is_not_retried(monkeypatch) -> None:
 
     products = [p async for p in scraper.scrape_category("dermanlar")]
 
-    assert [p.external_id for p in products] == ["item-7"]
+    assert [p.external_id for p in products] == ["7"]
     assert detail_requests == 1
     assert scraper.fetch_retries == 0
     assert scraper._route_statuses["dermanlar"].complete is True
@@ -917,8 +924,9 @@ async def test_aloe_unresolvable_country_id_costs_one_detail_per_scrape(monkeypa
     products = [p async for p in scraper.scrape_category("dermanlar")]
     products += [p async for p in scraper.scrape_category("kosmetika")]
 
-    assert detail_requests == ["/item-1/"]
-    assert [p.external_id for p in products] == ["item-1", "item-2", "item-1", "item-2"]
+    # Карточку открывают по адресу с номером: он показывает именно этот товар.
+    assert detail_requests == ["/1/"]
+    assert [p.external_id for p in products] == ["1", "2", "1", "2"]
     assert all(p.manufacturer_country_raw == "7" for p in products)
     assert all(p.country_source == "aloe_api_country_id" for p in products)
     assert scraper.verified_country_mappings == {}

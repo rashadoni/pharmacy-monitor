@@ -1007,6 +1007,201 @@ drop-in).
 `/root/pharmacy-monitor-rematch-unit-<дата>/` нельзя — вместе с ним вернётся
 еженедельный полный сброс, а в коде до PR #33 отказа без второго флага нет.
 
+### Идентификаторы aloe: номер товара
+
+С миграции `0024_aloe_product_numbers` товар aloe в `products` узнаётся по
+номеру товара на сайте (`external_id = '12058'`), адрес —
+`https://aloe.az/12058/#ceftriaxone-1-q`. Раньше идентификатором был слаг, а
+слаг сайт сам даёт нескольким разным товарам: они писались одной строкой.
+Почему номер, а не слаг и не `code`, — в шапке `src/scrapers/aloe.py`.
+
+**Правило включает миграция, а не выкладка кода.** Миграция ставит на
+`products` триггер `products_aloe_number_identity`. Пока его нет, код пишет
+товары aloe под слагом, как раньше; когда он есть — под номером. Строки
+миграция не трогает: строку, записанную под слагом, переводит на номер сама
+запись сбора, когда сбор снова видит товар (`main._adopt_aloe_product_numbers`,
+событие `aloe_product_numbers_adopted`).
+
+Кому достаётся строка общего слага, решает только **полный сбор aloe,
+которому система верит** (все разделы пройдены, качество прогона в норме —
+прогон кончается `ok`): он видит все товары слага, а решение необратимо. Тик и сбор раздела
+переводят строку, только когда пришедший товар в ней и записан (совпали
+страна, бренд и последняя цена — всё, что в строке есть); остальные товары,
+пока строка свободна, до полного сбора не пишутся вовсе (`left_for_full_scan`,
+номера — в `waiting`).
+
+**Включение правила — по шагам:**
+
+1. До выкладки (только чтение). Слага из одних цифр в каталоге нет — он был бы
+   принят за номер; закреплённых ссылок aloe нет; PR #52 закрыт; PR #39 смержен
+   (он убирает workflow, которые кладут на сервер файлы по одному: прежний
+   `src/main.py` при новом сборщике до первого полного сбора завёл бы вторые
+   строки, и предохранитель этого не видит):
+
+```sql
+select external_id from products where site = 'aloe' and external_id ~ '^[0-9]+$';  -- только '0'
+select count(*) from tracked_product_links where site = 'aloe' and url is not null;  -- 0
+```
+
+2. Мерж PR с миграцией и выкладка `deploy.yml` с `apply_migrations=true` — за
+   один присест (еженедельный сбор pharmonline, понедельник 03:20 UTC, берёт
+   код из `main` и отказывает, если ревизия базы не последняя в чекауте); не во
+   время сбора (`select id, status from runs where finished_at is null`).
+3. Сразу — полный сбор одного aloe мимо ритма (около получаса, под замком
+   сбора). Кнопка в дашборде не годится: она собирает все сайты, и aloe
+   запишется, только когда закончатся остальные. Этот сбор пришлёт клиенту
+   товары, которые раньше были скрыты, как «новые» (около 190) и исправленные
+   цены; запускать ли его с `--no-alerts` — решение владельца, спросить до
+   запуска.
+
+```bash
+ssh root@13.140.186.143 'systemd-run --quiet --wait --pipe --collect \
+  -p User=pm -p Group=pm -p EnvironmentFile=/etc/pharmacy-monitor/env \
+  -p WorkingDirectory=/opt/pharmacy-monitor \
+  /opt/pharmacy-monitor/.venv/bin/pharmacy-monitor run --site aloe --force'
+```
+
+4. Проверить: прогон кончился `ok` (`select id, status, catalog_verified from
+   runs order by id desc limit 1`), в событии `aloe_product_numbers_adopted` из
+   вывода команды `whole_catalog=True` и `left_for_full_scan=0`, запрос 2 ниже
+   сходится. Если прогон не `ok` или `whole_catalog=False` — наследников общих
+   слагов он не назначал; ближайшей ночью плановый сбор повторит попытку сам,
+   но лучше повторить сразу. У плановых сборов и тиков событие — в журнале:
+
+```bash
+ssh root@13.140.186.143 "journalctl -u 'pharmacy-monitor-scrape@aloe' \
+  -u pharmacy-monitor-intraday --since today -g aloe_product_numbers_adopted -o cat"
+```
+
+В событии: `products` — сколько строк переведено; `whole_catalog` — решал ли
+полный сбор; `shared_slugs` — у скольких слагов со строкой сбор видел больше
+одного товара; `left_for_other_country` — сколько строк остались под слагом,
+потому что все пришедшие товары слага другой страны (каждый получил свою
+строку); `left_for_full_scan` и `waiting` — сколько и какие товары частичный
+сбор не записал и оставил полному.
+
+```sql
+-- 0. Правило включено? (true — предохранитель стоит и не отключён)
+select exists (select 1 from pg_trigger
+                where tgname = 'products_aloe_number_identity' and tgenabled <> 'D');
+
+-- 1. Сколько строк под номером и сколько осталось под слагом.
+select count(*) filter (where external_id ~ '^[0-9]+$' and external_id <> '0') as under_number,
+       count(*) filter (where external_id !~ '^[0-9]+$' or external_id = '0')  as under_slug
+  from products where site = 'aloe';
+
+-- 2. После первого ПОЛНОГО сбора: строки под слагом, у слага которых уже есть
+--    строка под номером, виденная после включения правила. Их должно быть
+--    столько, сколько `left_for_other_country` в событии этого сбора (строка
+--    оставлена, потому что пришедшие товары другой страны). Больше — сбор
+--    наследников не назначал или не дошёл до этих товаров.
+select count(*) from products s
+ where s.site = 'aloe' and (s.external_id !~ '^[0-9]+$' or s.external_id = '0')
+   and exists (
+       select 1 from products n
+        where n.site = 'aloe' and n.external_id ~ '^[1-9][0-9]*$'
+          and n.url like '%/#' || split_part(rtrim(s.url, '/'), '/', 4)
+          and split_part(n.url, '#', 2) = split_part(rtrim(s.url, '/'), '/', 4)
+          and n.last_seen_at > timestamp '<время включения, UTC>');
+
+-- 3. Слаги, под которыми теперь несколько строк, — те самые разные товары.
+select split_part(url, '#', 2) as slug, count(*), array_agg(external_id order by id)
+  from products where site = 'aloe' and url like '%#%'
+ group by 1 having count(*) > 1 order by 2 desc limit 20;
+
+-- 4. Должно быть пусто: номер в идентификаторе при адресе без номера
+--    (строку под номером завёл или затёр `ai-crawl`).
+select id, external_id, url from products
+ where site = 'aloe' and external_id ~ '^[1-9][0-9]*$'
+   and url not like 'https://aloe.az/' || external_id || '/%' limit 20;
+```
+
+Что увидит клиент в первом полном сборе после включения: товары, которые
+раньше были скрыты за чужой строкой (2026-10-08 таких в продаже около 190),
+придут как «новые», а у единичных строк, где лежала цена другого товара, цена
+«изменится» на правильную (на копии каталога — одна строка в парах:
+`lavanda-yagi-10-ml`, 7,3 → 2,8).
+
+**Сбор aloe падает с «already stored under its site number».** Сработал
+предохранитель: в базу пишет код, который о номере не знает (выложена старая
+ветка, обходной workflow положил прежний `src/main.py`, сбор запущен из
+старого чекаута). Он ищет товар по слагу, не находит переведённую строку и
+вставляет вторую — предохранитель вставку отвергает, строк не прибавляется.
+Чинить код на сервере (`deploy.yml --ref main`), а не базу: сверить
+`sha256sum /opt/pharmacy-monitor/src/main.py` с `git show origin/main:src/main.py`.
+Триггер руками не снимать и не отключать.
+
+**Сбор aloe падает с «уже записаны под номером, а правило выключено».**
+Предохранителя в базе нет (снят руками, потерян при пересоздании таблицы или
+при загрузке одних данных), а строки уже под номером. Запись под слагом завела
+бы каталог второй раз, поэтому код отказывает. Вернуть предохранитель — шаг
+`upgrade` (команда ниже, `m.upgrade()`).
+
+**Откат.** Код возвращать не нужно — правило выключается в базе.
+
+1. Остановить всё, что пишет сбор aloe: `systemctl stop` для
+   `pharmacy-monitor-scrape@aloe.timer`, `pharmacy-monitor-intraday.timer`,
+   `pharmacy-monitor-watchlist.timer`, `pharmacy-monitor-scrape-watcher.timer`.
+   Пока идёт сбор или отчёт в эту секунду читает цены, шаг отката откажет
+   сам («the scrape lock is held») — повторить.
+2. Бэкап (`bash infra/scripts/backup.sh` под `pm`), затем шаг `downgrade`
+   миграции **мимо цепочки Alembic** — он снимает предохранитель и возвращает
+   строкам слаги, ревизия базы остаётся `0024`:
+
+```bash
+ssh root@13.140.186.143 'systemd-run --quiet --wait --pipe --collect \
+  -p User=pm -p Group=pm -p EnvironmentFile=/etc/pharmacy-monitor/env \
+  -p WorkingDirectory=/opt/pharmacy-monitor \
+  /opt/pharmacy-monitor/.venv/bin/python -c "
+import importlib.util, logging
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from src import storage
+logging.basicConfig(level=logging.INFO)
+spec = importlib.util.spec_from_file_location(\"m\", \"migrations/versions/0024_aloe_product_numbers.py\")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+with storage.make_engine().begin() as c, Operations.context(MigrationContext.configure(c)):
+    m.downgrade()
+"'
+```
+
+   В выводе — сколько строк вернулось под слаг и сколько осталось под номером.
+   Так же шаг исполняют тесты (`tests/test_aloe_product_number_identity.py`,
+   `_migrate`).
+3. Включить таймеры. Тот же код пишет товары aloe под слагом, как до правки
+   (запрос 0 отвечает `false`).
+
+`alembic downgrade 0023_snapshot_confirmed_run` делает то же, но ещё и
+отматывает ревизию базы. Годится, только если тут же откатывается и `main`
+(revert PR с миграцией): иначе база отстанет от чекаута — еженедельный сбор
+pharmonline откажет, а следующая выкладка с `apply_migrations=true` применит
+миграцию заново и молча включит правило. И только пока 0024 — последняя
+миграция (`alembic heads`): иначе команда снимет и те, что лежат поверх.
+
+Чего откат не возвращает: товар, получивший свою строку потому, что делил слаг
+с другим, остаётся под номером. В режиме «под слагом» такую строку сбор не
+видит — она стареет вместе с собранной историей; под слагом снова живёт один
+товар из нескольких, как до правки. Не возвращается под слаг и строка, у
+которой в адресе слага нет.
+
+⚠️ **Включить правило обратно после отката — не то же самое, что не
+выключать.** Под слагом строку общего слага пишет один из товаров: в ней
+появляется его цена (записанная смена цены, возможен алерт), а после двух
+сборов — и его страна. При повторном включении цена вернётся, а прежний
+владелец строки другой страны получит новую строку без истории и пары (на
+копии каталога — у слагов, где первым в листинге стоит товар другой страны).
+Повторное включение — тем же
+способом, `m.upgrade()` вместо `m.downgrade()`, отдельным решением и с
+полным сбором сразу после.
+
+**Ручная привязка по адресу** (страница сравнения) понимает оба адреса aloe:
+с номером — всегда один товар; со слагом (его показывает сам сайт) — если
+слаг у одного товара в каталоге. На общий слаг дашборд отвечает отказом и
+просит адрес с номером: номер написан на странице товара, «Məhsul kodu».
+Закреплённые ссылки (watchlist) находят товар так же; ссылку на общий слаг
+привязка пропускает (`watchlist_aloe_address_names_several_products`) —
+закреплять адрес с номером.
+
 ---
 
 ## 📊 Регулярные проверки

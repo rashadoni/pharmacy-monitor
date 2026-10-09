@@ -5096,10 +5096,35 @@ def _external_id_from_url(url: str) -> str:
     """Последний сегмент пути URL (без query/fragment) = external_id товара.
 
     Совпадает с тем, как скрейперы формируют external_id (pharmonline:
-    `_external_id_from_href`; aptekonline/aloe: url_id = слаг после /product/).
+    `_external_id_from_href`; aptekonline: url_id после /product/; aloe: номер
+    товара в адресе `https://aloe.az/{номер}/`).
     """
     path = (url or "").split("?")[0].split("#")[0].rstrip("/")
     return path.split("/")[-1].strip()
+
+
+def _aloe_product_at_address(db: Session, tenant_id: int, url: str) -> storage.Product | None:
+    """Товар aloe по адресу его страницы; на адрес нескольких товаров — отказ.
+
+    Адрес со слагом (его показывает сам сайт) товар не называет: один слаг
+    сайт даёт нескольким товарам. Какой из них нужен, знает только оператор.
+    """
+    from src import match_actions
+
+    found = match_actions.aloe_products_at_address(db, url, tenant_id=tenant_id)
+    if len(found) > 1:
+        # Строка, которую сбор ещё не перевёл на номер, номера не имеет.
+        numbers = ", ".join(
+            sorted((p.external_id for p in found if p.external_id.isdigit()), key=int)
+        )
+        raise HTTPException(
+            409,
+            "По этому адресу на aloe несколько разных товаров"
+            + (f" (номера {numbers})" if numbers else "")
+            + ". Вставьте адрес с номером нужного: https://aloe.az/<номер>/ — номер написан "
+            "на странице товара («Məhsul kodu»)",
+        )
+    return found[0] if found else None
 
 
 @app.post("/api/v1/dash/matches/{match_id}/relink")
@@ -5135,14 +5160,20 @@ def dash_match_relink(
     if not ext:
         raise HTTPException(400, "Не удалось разобрать ссылку")
 
-    prod = db.scalar(
-        select(storage.Product).where(
-            storage.Product.tenant_id == user.tenant_id,
-            storage.Product.site == site,
-            storage.Product.external_id == ext,
+    if site == "aloe":
+        # По подстроке адреса здесь искать нельзя: номер «1205» нашёлся бы
+        # внутри адреса товара 12058.
+        prod = _aloe_product_at_address(db, user.tenant_id, body.url)
+    else:
+        prod = db.scalar(
+            select(storage.Product).where(
+                storage.Product.tenant_id == user.tenant_id,
+                storage.Product.site == site,
+                storage.Product.external_id == ext,
+            )
         )
-    )
-    if prod is None:  # fallback: по подстроке URL (на случай иной формы external_id)
+    if prod is None and site != "aloe":
+        # fallback: по подстроке URL (на случай иной формы external_id)
         prod = db.scalar(
             select(storage.Product).where(
                 storage.Product.tenant_id == user.tenant_id,
