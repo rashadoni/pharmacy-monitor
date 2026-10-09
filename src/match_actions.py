@@ -299,3 +299,45 @@ def list_rejections_for_product(session: Session, product_id: int) -> list[int]:
     for r in rows:
         out.append(r.product_b_id if r.product_a_id == product_id else r.product_a_id)
     return out
+
+
+def aloe_products_at_address(session: Session, url: str, *, tenant_id: int = 1) -> list[Product]:
+    """Товары aloe из каталога, на которые указывает адрес страницы товара.
+
+    Адрес с номером (`https://aloe.az/12058/`) называет один товар. Адрес со
+    слагом (`https://aloe.az/ceftriaxone-1-q/`, его показывает сам сайт) товар
+    не называет: сайт даёт один слаг нескольким товарам, а товар у нас записан
+    под номером. По такому адресу возвращаются все товары каталога с этим
+    слагом — решать, что делать с несколькими, должен вызывающий; выбирать из
+    них наугад нельзя. Список отсортирован по номеру строки.
+    """
+    # Только здесь: модуль действий над парами не должен тянуть сборщик при импорте.
+    from src.scrapers.aloe import (
+        aloe_legacy_external_ids,
+        aloe_product_number,
+        aloe_slug_from_url,
+    )
+
+    address = (url or "").split("#")[0].split("?")[0].rstrip("/")
+    number = aloe_product_number(address.rsplit("/", 1)[-1])
+    slug = aloe_slug_from_url(url or "")
+    if number is not None:
+        matches = Product.external_id == number
+    elif slug:
+        matches = or_(
+            # Это отбор для базы; что слаг совпал целиком, проверяется ниже.
+            Product.url.endswith(f"#{slug}", autoescape=True),
+            # Строка, которую сбор ещё не перевёл со слага на номер.
+            Product.external_id.in_(aloe_legacy_external_ids(slug)),
+        )
+    else:
+        return []
+    found = session.scalars(
+        select(Product)
+        .where(Product.tenant_id == tenant_id, Product.site == "aloe", matches)
+        .order_by(Product.id)
+    ).all()
+    if number is not None:
+        return list(found)
+    return [product for product in found if aloe_slug_from_url(product.url) == slug]
+

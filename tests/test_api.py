@@ -4136,6 +4136,119 @@ def test_match_relink_adds_missing_site(client, tenant_user, setup_db):
     assert new.canonical_id == m.id
 
 
+def _aloe_numbered(s, number: str, slug: str, name: str) -> storage.Product:
+    """Товар aloe, как его пишет сбор: идентификатор — номер товара на сайте."""
+    product = storage.Product(
+        tenant_id=1,
+        site="aloe",
+        external_id=number,
+        url=f"https://aloe.az/{number}/#{slug}",
+        name=name,
+        name_normalized=name.lower(),
+    )
+    s.add(product)
+    s.commit()
+    return product
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        "https://aloe.az/12224/",
+        "https://aloe.az/12224",
+        "https://aloe.az/12224/#ceftriaxone-1-q",
+        "https://aloe.az/ru/12224/?utm_source=x",
+    ],
+)
+def test_match_relink_finds_aloe_product_by_its_number(client, tenant_user, setup_db, pasted):
+    """Адрес с номером называет ровно один товар, даже когда слаг общий."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="Ceftriaxone", products_per_site=2)
+    _aloe_numbered(s, "12058", "ceftriaxone-1-q", "Ceftriaxone 1 q Sintez")
+    wanted = _aloe_numbered(s, "12224", "ceftriaxone-1-q", "Ceftriaxone 1 q Reyoung")
+    _login(client, tenant_user, s)
+
+    r = client.post(f"/api/v1/dash/matches/{m.id}/relink", json={"site": "aloe", "url": pasted})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["product_id"] == wanted.id
+
+
+def test_match_relink_finds_aloe_product_by_the_slug_address_the_site_shows(
+    client, tenant_user, setup_db
+):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="Krem", products_per_site=2)
+    wanted = _aloe_numbered(s, "501", "krem-gel-250-ml", "Krem-gel 250 ml")
+    # Слаг длиннее на хвост и слаг с тем же хвостом — другие товары.
+    _aloe_numbered(s, "502", "krem-gel-250-ml-2-ed", "Krem-gel 250 ml 2 əd")
+    _aloe_numbered(s, "503", "uz-ucun-krem-gel-250-ml", "Üz üçün krem-gel 250 ml")
+    _login(client, tenant_user, s)
+
+    r = client.post(
+        f"/api/v1/dash/matches/{m.id}/relink",
+        json={"site": "aloe", "url": "https://aloe.az/krem-gel-250-ml/"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["product_id"] == wanted.id
+
+
+def test_match_relink_refuses_an_aloe_slug_shared_by_several_products(
+    client, tenant_user, setup_db
+):
+    """Какой из товаров слага нужен, адрес со слагом не говорит: не выбираем наугад."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="Ceftriaxone", products_per_site=2)
+    first = _aloe_numbered(s, "12058", "ceftriaxone-1-q", "Ceftriaxone 1 q Sintez")
+    second = _aloe_numbered(s, "12224", "ceftriaxone-1-q", "Ceftriaxone 1 q Reyoung")
+    _login(client, tenant_user, s)
+
+    r = client.post(
+        f"/api/v1/dash/matches/{m.id}/relink",
+        json={"site": "aloe", "url": "https://aloe.az/ceftriaxone-1-q/"},
+    )
+
+    assert r.status_code == 409, r.text
+    assert "12058, 12224" in r.json()["detail"]
+    s.refresh(first)
+    s.refresh(second)
+    assert first.canonical_id is None and second.canonical_id is None
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        # Номера «1205» в каталоге нет; внутри адреса товара 12058 он есть.
+        "https://aloe.az/1205/",
+        # «%» и «_» в адресе — знаки, а не подстановка.
+        "https://aloe.az/ceftriaxone-_-q/",
+        "https://aloe.az/ceftriaxone-%/",
+    ],
+)
+def test_match_relink_does_not_guess_an_aloe_product_from_a_part_of_the_address(
+    client, tenant_user, setup_db, pasted
+):
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("python-jose not installed")
+    s = setup_db
+    m = _make_match_with_products(s, confidence=0.8, canonical="Ceftriaxone", products_per_site=2)
+    only = _aloe_numbered(s, "12058", "ceftriaxone-1-q", "Ceftriaxone 1 q")
+    _login(client, tenant_user, s)
+
+    r = client.post(f"/api/v1/dash/matches/{m.id}/relink", json={"site": "aloe", "url": pasted})
+
+    assert r.status_code == 404, r.text
+    s.refresh(only)
+    assert only.canonical_id is None
+
+
 def test_match_relink_404_unknown_url(client, tenant_user, setup_db):
     if not api_module._JWT_AVAILABLE:
         pytest.skip("python-jose not installed")

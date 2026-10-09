@@ -56,34 +56,31 @@ async def _parse_cards(
 
 
 # === ALOE ===
+# Товары aloe читаются из потока Next.js в странице листинга, а не из вёрстки
+# карточек: в вёрстке нет номера товара, а без номера товар не назвать
+# (tests/test_aloe_product_number_identity.py). Браузер для разбора не нужен.
 
 
-@pytest.mark.asyncio
-async def test_aloe_snapshot_yields_products():
-    from src.scrapers.aloe import AloeScraper
+def _aloe_snapshot_products() -> list:
+    from src.scrapers.aloe import aloe_products_from_listing_html
 
-    products, n_cards = await _parse_cards(
-        "aloe_bestseller.html",
-        AloeScraper,
-        '[class*="productCardWrapper"]',
-        category="bestseller",
-    )
-    # aloe в snapshot имел 12 cards (известный лимит)
-    assert n_cards >= 5, f"Слишком мало cards: {n_cards}"
+    html = (FIXTURES / "aloe_bestseller.html").read_text(encoding="utf-8")
+    return aloe_products_from_listing_html(html, category_slug="bestseller")
 
 
-@pytest.mark.asyncio
-async def test_aloe_snapshot_extracts_brand():
-    from src.scrapers.aloe import AloeScraper
+def test_aloe_snapshot_yields_products():
+    products = _aloe_snapshot_products()
 
-    products, _ = await _parse_cards(
-        "aloe_bestseller.html",
-        AloeScraper,
-        '[class*="productCardWrapper"]',
-        category="bestseller",
-    )
-    if not products:
-        pytest.skip("snapshot пустой")
+    # Страница листинга aloe — 12 товаров.
+    assert len(products) == 12
+    assert all(re.fullmatch(r"[1-9][0-9]*", product.external_id) for product in products)
+    assert all(product.identity_verified for product in products)
+    assert all(product.price is not None and product.price > 0 for product in products)
+
+
+def test_aloe_snapshot_extracts_brand():
+    products = _aloe_snapshot_products()
+
     with_brand = sum(1 for p in products if p.brand)
     coverage = with_brand / len(products)
     assert coverage >= 0.5, f"Brand-coverage {coverage * 100:.0f}% < 50% на aloe"
