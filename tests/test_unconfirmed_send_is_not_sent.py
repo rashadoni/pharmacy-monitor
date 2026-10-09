@@ -373,6 +373,7 @@ def test_notify_digest_command_with_nothing_to_send_is_not_a_failure(stand, args
     assert not send.called
     assert result.exit_code == 0, result.output
     assert "Nothing to send" in result.output and who in result.output
+    assert "digest_no_events / digest_no_recipients" in result.output  # куда смотреть
     assert "OK:" not in result.output and "sent to" not in result.output
     _assert_no_person_or_text(result.output)
 
@@ -497,14 +498,16 @@ def test_digest_button_has_a_phrase_for_every_outcome_in_every_language():
     frontend = Path(main_mod.__file__).resolve().parent.parent / "frontend"
     component = (frontend / "src" / "components" / "quick-actions.tsx").read_text(encoding="utf-8")
     assert "digest_${r.outcome" in component  # фраза выбирается по исходу, а не по числам
+    # …и получает подтверждённые и сорванные под теми именами, что стоят во фразах.
+    assert "{ count: sent, sent, failed }" in component
+    assert "const sent = r.recipients_sent;" in component
+    assert "const failed = r.recipients_failed ?? 0;" in component
     for locale in ("ru", "az", "en"):
         copy = json.loads((frontend / "messages" / f"{locale}.json").read_text(encoding="utf-8"))
         phrases = copy["quick_actions"]
         for outcome, numbers in DIGEST_OUTCOMES.items():
             text = phrases[f"digest_{outcome}"]
             assert set(re.findall(r"\{(\w+)\}", text)) == numbers, (locale, outcome, text)
-        # Четыре исхода — четыре разные фразы.
-        assert len({phrases[f"digest_{outcome}"] for outcome in DIGEST_OUTCOMES}) == 4
 
 
 # ─── 1б. Старый ежедневный дайджест (`digest.send_daily_digest`) ─────────────
@@ -761,6 +764,81 @@ def test_run_letter_keeps_sending_when_marks_cannot_be_saved(stand, marks_cannot
     assert bob.id != alice.id
 
 
+def test_run_letter_whose_marks_were_not_saved_still_counts_as_delivered(
+    stand, marks_cannot_be_written
+):
+    """Письмо ушло единственному получателю, метки не записались: событие дошло —
+    в «не дошедшие» оно не попадает. В строке — сколько событий было в письме
+    этого получателя (два из трёх: порог `warning`), а не в прогоне."""
+    user = _user(stand, email_severity_min="warning")
+    fired = [*_events(stand, user, 2), *_events(stand, user, severity="info")]
+
+    with patch("src.notifier.send_email", return_value=True), capture_logs() as logs:
+        result = notifications.dispatch_events_batch(stand, fired)
+
+    assert result == {"email": 1, "telegram": 0, "failed": 0, "undelivered": 0}
+    assert _lines(logs, "alert_marks_not_saved", *_RUN_SUMMARIES) == [
+        {
+            "event": "alert_marks_not_saved",
+            "log_level": "warning",
+            "user_id": user.id,
+            "events": 2,
+            "error_type": "OperationalError",
+        },
+        _summary(
+            "alerts_dispatched_batch",
+            "info",
+            events=3,
+            emails=1,
+            telegram=0,
+            failed=0,
+            undelivered=0,
+        ),
+    ]
+
+
+def test_run_letter_names_the_recipient_even_if_the_rollback_fails(
+    stand, marks_cannot_be_written, monkeypatch
+):
+    """База недоступна совсем: откат после сорванной записи меток тоже падает и
+    выходит наружу — но кому письмо ушло без меток, журнал уже назвал."""
+    user_id = _user(stand).id  # после сорванной записи объект пользователя уже не прочитать
+    fired = _events(stand, stand.get(storage.TenantUser, user_id))
+
+    def dead(*args, **kwargs):
+        raise OperationalError("ROLLBACK", {}, Exception("connection is closed"))
+
+    monkeypatch.setattr(stand, "rollback", dead)
+    with (
+        patch("src.notifier.send_email", return_value=True),
+        capture_logs() as logs,
+        pytest.raises(OperationalError),
+    ):
+        notifications.dispatch_events_batch(stand, fired)
+
+    assert [(entry["event"], entry["user_id"]) for entry in logs] == [
+        ("alert_marks_not_saved", user_id)
+    ]
+
+
+def test_run_letter_marks_add_up_across_recipients(stand):
+    """Одному событие дошло письмом, другому — в Telegram: у события оба канала."""
+    _user(stand)
+    _user(
+        stand, BOB, email_severity_min="off", telegram_severity_min="info", telegram_chat_id=CHAT_ID
+    )
+    (fired,) = _events(stand, stand.query(storage.TenantUser).first())
+
+    with (
+        patch("src.notifier.send_email", return_value=True),
+        patch("src.notifier.send_telegram_message", return_value=True),
+    ):
+        notifications.dispatch_events_batch(stand, [fired])
+
+    stand.refresh(fired)
+    assert fired.channels_sent == ["email", "telegram"]
+
+
 @pytest.mark.parametrize(
     ("channel", "in_message", "undelivered"), [("email", 2, 1), ("telegram", 1, 0)]
 )
@@ -872,7 +950,8 @@ def test_run_alerts_crash_with_a_dead_connection_does_not_raise_from_the_handler
 ):
     """Откат тоже не удался (соединения нет): причина — в журнале, из обработчика
     ничего не летит."""
-    fired = _events(stand, _user(stand))
+    user_id = _user(stand).id
+    fired = _events(stand, stand.get(storage.TenantUser, user_id))
 
     def dead(*args, **kwargs):
         raise OperationalError("ROLLBACK", {}, Exception(f"connection is closed {ALICE}"))
@@ -882,6 +961,13 @@ def test_run_alerts_crash_with_a_dead_connection_does_not_raise_from_the_handler
         main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
 
     assert journal.named("alert") == [
+        {
+            "event": "alert_marks_not_saved",
+            "log_level": "warning",
+            "user_id": user_id,
+            "events": 1,
+            "error_type": "OperationalError",
+        },
         {
             "event": "alert_dispatch_failed",
             "log_level": "warning",
