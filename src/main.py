@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import logging
 import os
@@ -2564,6 +2565,53 @@ def _report_email_enabled() -> bool:
     )
 
 
+def _rolls_back_unfinished_matching_work(step):
+    """Шаг сопоставления упал — то, что он успел изменить, в базу не попадает.
+
+    Для функции, которая под замком сопоставления правит пары и сама фиксирует
+    свою работу (первый аргумент — сессия). Упав на середине, она оставляла
+    сделанную половину в сессии — в том числе уже отправленную в базу её же
+    flush, — и эту половину фиксировал первый commit после неё. В `run` это
+    запись итога прогона: до 2026-10-09 полуразобранный кластер уходил в базу
+    вместе с `failed` — без записи в `match_policy_audits`, по которой разбор
+    можно отменить.
+
+    Откатывается вся незавершённая транзакция сессии; зафиксированное раньше
+    остаётся. На PostgreSQL чужого в ней нет: взятие замка фиксирует всё, что
+    сессия несла до него. Это верно для сессии, привязанной к движку, — так её
+    создают обе команды; у сессии на соединении вызывающего и на SQLite замок
+    ничего не фиксирует, и вместе с шагом уходит то, что вызывающий не
+    закоммитил.
+
+    Замок сопоставления откат переживает: он сессионный и лежит на том же
+    соединении. Если соединение потеряно, сессия после отката ходит через пул,
+    уже мимо замка, — поэтому после отката здесь только исключение дальше:
+    продолжать шаги под замком нельзя (`matcher.acquire_match_mutation_lock`).
+    """
+
+    @functools.wraps(step)
+    def guarded(session: Session, *args, **kwargs):
+        try:
+            return step(session, *args, **kwargs)
+        except Exception as failure:
+            fields = {"step": step.__name__, "error": type(failure).__name__}
+            try:
+                session.rollback()
+            except Exception as rollback_failure:
+                # Причина сбоя — исключение шага, отказ отката её не подменяет.
+                # Транзакцию сессии SQLAlchemy при этом всё равно закрыл.
+                log.warning(
+                    "matching_work_rollback_failed",
+                    rollback_error=f"{type(rollback_failure).__name__}: {rollback_failure}",
+                    **fields,
+                )
+            else:
+                log.warning("matching_work_rolled_back", **fields)
+            raise
+
+    return guarded
+
+
 _SCRAPE_ADVISORY_LOCK_KEY = SCRAPE_ADVISORY_LOCK_KEY
 def _acquire_matcher_lock(session: Session, *, wait: bool) -> bool:
     """Serialize matcher/rematch writes to products.canonical_id on Postgres."""
@@ -2577,6 +2625,7 @@ def _release_matcher_lock(session: Session) -> None:
         log.warning("matcher_lock_release_failed", error=str(exc))
 
 
+@_rolls_back_unfinished_matching_work
 def _run_matching_stage(
     session: Session, *, fuzzy_threshold: int | None = None
 ) -> dict[str, int | None]:
@@ -2594,6 +2643,13 @@ def _run_matching_stage(
     одного не отменяет ни второй, ни само сопоставление (в сводке — None).
     Сбой revalidate — ошибка этапа: после него в базе могут остаться пары,
     которые текущие правила запрещают.
+
+    Ошибка, с которой этап завершается, недоделанной работы за собой не
+    оставляет: незавершённую транзакцию откатывает декоратор, а не вызывающий
+    (Ctrl-C он не перехватывает: за ним commit не следует).
+    Вместе с упавшим `match_products` на PostgreSQL уходят и подготовительные
+    шаги — их фиксирует его commit. Флаги цен свою ошибку глотают, и на них
+    это правило не действует.
     """
     summary: dict[str, int | None] = {"refreshed": None, "relinked": None}
     for key, prepare in (
@@ -3198,6 +3254,7 @@ def collect_watchlist_urls(
     return out
 
 
+@_rolls_back_unfinished_matching_work
 def auto_match_watchlist(session, *, tenant_id: int = 1) -> int:
     """Привязать Product'ы к Match-кластеру для каждого TrackedProduct.
 
@@ -3205,7 +3262,8 @@ def auto_match_watchlist(session, *, tenant_id: int = 1) -> int:
     brand, etc.) → найти Product'ы по URL = TrackedProductLink.url и поставить им
     canonical_id. Это даёт мгновенный cross-site matching без эвристики.
 
-    Возвращает кол-во привязанных Product'ов.
+    Возвращает кол-во привязанных Product'ов. Упав на середине, откатывает
+    то, что успела привязать (декоратор): фиксирует она всё разом, в конце.
     """
     from sqlalchemy import select
 
