@@ -266,7 +266,7 @@ GitHub; хранится он 90 дней. Еженедельный сбор pha
 запускается как на сервере, с настоящей ошибкой базы. Журнал отправителя
 Telegram — `tests/test_notifier.py`: обе функции вызываются с настоящей
 `InvalidURL` (токен с `\r`) и с отказом сервера, и там же список мест, где
-назван адрес Telegram, — новое место роняет тест. Маска стоит только на
+назван адрес Telegram, со счётом упоминаний — новое роняет тест. Маска стоит только на
 журнале CLI. Мимо неё идут `click.echo`
 и `print`, а журнал API не замаскирован вовсе — он пишет в journald и наружу не
 выходит. Команды, которые печатают адрес по назначению, перечислены в том же
@@ -551,6 +551,7 @@ telegram_send_failed error_at='notifier.py:153 in send_telegram_message' error_t
 | `InvalidURL` | В токене управляющий символ или пробел — CR на конце строки env (не под systemd, см. выше), лишний перевод строки в значении |
 | `UnicodeEncodeError` | В токене нелатинская буква. У `telegram_send_failed` — ещё и текст сообщения, который не кодируется |
 | `TypeError` у `telegram_poll_failed` | Telegram ответил `ok`, но не списком сообщений |
+| `JSONDecodeError`, `AttributeError` | Ответил не Telegram: страница прокси или заглушка вместо JSON |
 | `URLError` + `reason_type` | Сеть: `gaierror` — нет имени в DNS, `ConnectionRefusedError` (`errno=111`) — отказ в соединении, `SSLCertVerificationError` — сертификат |
 | `TimeoutError` — классом или в `reason_type` | Telegram не ответил за отведённое время |
 

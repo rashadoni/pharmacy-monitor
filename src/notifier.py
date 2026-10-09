@@ -188,7 +188,7 @@ def telegram_get_updates(offset: int | None = None, timeout: int = 0) -> list[di
                     "telegram_api_error", method="getUpdates", **_telegram_refusal_fields(body)
                 )
                 return None
-            updates = body.get("result") or []
+            updates = body.get("result")
             if not (isinstance(updates, list) and all(isinstance(u, dict) for u in updates)):
                 # Не список сообщений — не «сообщений нет»: вызывающие разбирают
                 # ответ без проверок.
