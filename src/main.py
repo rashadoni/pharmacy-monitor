@@ -3489,7 +3489,10 @@ def classify_run_quality(
                 else None
             ),
             "reasons": reasons,
-            "errors": [str(error)[:500] for error in result.errors[:20]],
+            # Тем же правилом, что `Run.error_message`: список видит сотрудник клиента.
+            "errors": [
+                (storage.stored_error_text(str(error)) or "")[:500] for error in result.errors[:20]
+            ],
             "errors_truncated": max(0, len(result.errors) - 20),
             "items": persisted_items,
             "items_truncated": max(0, len(ordered_items) - len(persisted_items)),

@@ -11,9 +11,11 @@ Schema overview:
 from __future__ import annotations
 
 import os
+import re
 import threading
 from datetime import datetime
 from src._time import utcnow
+from src.logging_setup import without_addresses
 from pathlib import Path
 
 from sqlalchemy import (
@@ -36,6 +38,7 @@ from sqlalchemy.orm import (
     mapped_column,
     relationship,
     sessionmaker,
+    validates,
 )
 
 
@@ -58,6 +61,34 @@ def _env_int(name: str, default: int, *, min_value: int) -> int:
     return max(min_value, value)
 
 
+# Класс ошибки в начале текста: «IntegrityError: …», «site_fatal: …».
+_ERROR_TEXT_PREFIX = re.compile(r"[A-Za-z_][\w.]*(?=: )")
+
+
+def stored_error_text(text: str | None) -> str | None:
+    """Текст ошибки, как он ляжет в `error_message`: адреса в нём не бывает.
+
+    Поле читают не только операторы: страницу прогонов видит сотрудник клиента,
+    текст идёт в письмо о здоровье, в ответ бота и в журнал шага workflow, а
+    вместе с базой — в бэкап. Ошибка же несёт что угодно: ошибка базы кладёт в
+    текст параметры запроса. Поэтому чистится он здесь, при записи, а не в
+    каждом месте показа (решение владельца 2026-10-09): есть «@» — от текста
+    остаётся класс ошибки, если текст с него начинается, и `<текст скрыт>`.
+    Исходный текст такой ошибки искать в журнале сервера, событие `run_failed`.
+
+    Правило то же, что у вывода команд, — `logging_setup.without_addresses`, и
+    видит оно только «@»: Telegram-идентификатор (число) в параметрах запроса
+    пройдёт. Запросы самого сбора таких параметров не содержат.
+    """
+    if text is None:
+        return None
+    shown = without_addresses(text)
+    if shown == text:
+        return text
+    named = _ERROR_TEXT_PREFIX.match(text)
+    return f"{named.group()}: {shown}" if named else shown
+
+
 class Run(Base):
     __tablename__ = "runs"
 
@@ -68,6 +99,7 @@ class Run(Base):
     status: Mapped[str] = mapped_column(
         String(20), default="running"
     )  # running/ok/degraded/failed
+    # Пишется через `stored_error_text` — валидатор в конце класса.
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     products_scraped: Mapped[int] = mapped_column(Integer, default=0)
     sites_completed: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -96,6 +128,10 @@ class Run(Base):
     snapshots: Mapped[list["PriceSnapshot"]] = relationship(
         back_populates="run", foreign_keys="PriceSnapshot.run_id"
     )
+
+    @validates("error_message")
+    def _error_message_carries_no_address(self, _key: str, text: str | None) -> str | None:
+        return stored_error_text(text)
 
 
 def run_is_financially_eligible(run: Run | None) -> bool:
@@ -185,7 +221,12 @@ class ScrapeRequest(Base):
     run_id: Mapped[int | None] = mapped_column(
         ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
     )
+    # Копия текста ошибки прогона или текст от watcher'а — тем же правилом.
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    @validates("error_message")
+    def _error_message_carries_no_address(self, _key: str, text: str | None) -> str | None:
+        return stored_error_text(text)
 
 
 class AuditLog(Base):
