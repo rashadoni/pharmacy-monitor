@@ -142,6 +142,16 @@ def _database_error(orig: BaseException) -> sqlalchemy.exc.DBAPIError:
     )
 
 
+def _through_src(error: BaseException):
+    """Бросить ошибку так, чтобы она прошла через строку `src/`: `masking`
+    зовёт переданный ей отрисовщик из `src/logging_setup.py`."""
+
+    def renderer(logger, name, event):
+        raise error
+
+    logging_setup.masking(renderer)(None, "info", {})
+
+
 def _caught(call) -> BaseException:
     try:
         call()
@@ -160,12 +170,35 @@ def test_error_fields_carry_the_class_and_the_database_code_not_the_text():
     assert fields == {"error_type": "ProgrammingError", "sqlstate": "42P01"}
 
 
-def test_error_fields_take_only_a_code_for_the_database_code():
-    """`sqlstate` — пять знаков кода. Что угодно другое под этим именем — текст."""
+@pytest.mark.parametrize(
+    "not_a_code",
+    [
+        f"connection for {ADDRESS} refused",
+        # Код в начале и код внутри — всё равно текст.
+        f"08006 {ADDRESS}",
+        f"{ADDRESS} 08006",
+        "08006\n" + ADDRESS,
+        "0800",
+        8006,
+        None,
+    ],
+)
+def test_error_fields_take_only_a_code_for_the_database_code(not_a_code):
+    """`sqlstate` — ровно пять знаков кода. Что угодно другое под этим именем — текст."""
     orig = RuntimeError("нет связи")
-    orig.sqlstate = f"connection for {ADDRESS} refused"
+    orig.sqlstate = not_a_code
 
     assert logging_setup.error_fields(_database_error(orig)) == {"error_type": "ProgrammingError"}
+
+
+def test_error_fields_have_no_database_code_when_the_server_sent_none():
+    """Отказ в соединении: до сервера не дошло, кода у ошибки нет."""
+    refused = psycopg.OperationalError("connection refused")
+    assert refused.sqlstate is None
+
+    assert logging_setup.error_fields(_database_error(refused)) == {
+        "error_type": "ProgrammingError"
+    }
 
 
 def test_error_fields_name_the_last_line_of_src_the_error_went_through():
@@ -179,6 +212,30 @@ def test_error_fields_name_the_last_line_of_src_the_error_went_through():
     assert (where, function) == ("logging_setup.py", "mask_addresses")
     source = Path(logging_setup.__file__).read_text(encoding="utf-8").splitlines()
     assert '"@" not in text' in source[int(line) - 1]
+
+
+def test_error_fields_keep_the_place_when_reading_the_database_code_fails():
+    class Unreadable(Exception):
+        @property
+        def orig(self):
+            raise RuntimeError(f"нельзя прочитать {ADDRESS}")
+
+    fields = logging_setup.error_fields(_caught(lambda: _through_src(Unreadable())))
+
+    assert fields["error_type"] == "Unreadable"
+    assert fields["error_at"].startswith("logging_setup.py:"), fields
+
+
+def test_error_fields_know_src_by_a_path_that_was_not_normalized():
+    """`sys.path` с «..» в записи: путь файла тот же, а строка другая."""
+    src = Path(logging_setup.__file__).parent
+    filename = str(src / ".." / src.name / "generated.py")
+    namespace: dict = {}
+    exec(compile("def generated():\n    raise ValueError('x')\n", filename, "exec"), namespace)
+
+    fields = logging_setup.error_fields(_caught(namespace["generated"]))
+
+    assert fields == {"error_type": "ValueError", "error_at": "generated.py:2 in generated"}
 
 
 def test_error_fields_leave_out_the_place_when_the_error_never_touched_src():

@@ -110,29 +110,36 @@ def error_fields(exc: BaseException) -> dict[str, object]:
     нет. Остаётся то, что данных не несёт:
 
     - `error_type` — класс ошибки;
-    - `sqlstate` — код ошибки PostgreSQL, если это ошибка базы: `OperationalError`
-      у SQLAlchemy — и остановка сервера (`57P01`), и сбой соединения (`08006`);
     - `error_at` — последняя строка `src/`, через которую ошибка прошла:
-      `notifications.py:405 in bind_telegram`.
+      `notifications.py:405 in bind_telegram`;
+    - `sqlstate` — код ошибки PostgreSQL, если сервер его прислал:
+      `OperationalError` у SQLAlchemy — и остановка сервера (`57P01`), и
+      нехватка соединений (`53300`). Когда до сервера не дошло (отказ в
+      соединении), кода нет.
+
+    Об ошибке, завёрнутой в другую (`raise X(...) from exc`), говорит только
+    внешняя: исходный класс, код и место не пишутся.
 
     Зовут из `except`, поэтому сама не бросает: чего не удалось узнать, того в
     ответе нет.
     """
     fields: dict[str, object] = {"error_type": type(exc).__name__}
     try:
-        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
-        if isinstance(sqlstate, str) and _SQLSTATE_RE.fullmatch(sqlstate):
-            fields["sqlstate"] = sqlstate
         tb = exc.__traceback__
         while tb is not None:
             code = tb.tb_frame.f_code
-            # Только полный путь внутри `src/`: у кода, собранного из строки
-            # (`<string>` — так SQLAlchemy строит свои методы), пути нет.
-            if code.co_filename.startswith(_SRC_PREFIX):
+            # Только полный путь внутри `src/`. У кода, собранного из строки
+            # (`<string>` — так SQLAlchemy строит свои методы), пути нет, и
+            # достраивать его от рабочего каталога нельзя: `normpath` этого и
+            # не делает, он лишь убирает из пути «..».
+            path = os.path.normpath(code.co_filename)
+            if path.startswith(_SRC_PREFIX):
                 # Глубже по стеку — ближе к сбою: остаётся последняя строка.
-                where = code.co_filename[len(_SRC_PREFIX) :]
-                fields["error_at"] = f"{where}:{tb.tb_lineno} in {code.co_name}"
+                fields["error_at"] = f"{path[len(_SRC_PREFIX) :]}:{tb.tb_lineno} in {code.co_name}"
             tb = tb.tb_next
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if isinstance(sqlstate, str) and _SQLSTATE_RE.fullmatch(sqlstate):
+            fields["sqlstate"] = sqlstate
     except Exception:  # обработчик сбоя не должен упасть сам
         pass
     return fields

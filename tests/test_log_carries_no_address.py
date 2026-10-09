@@ -173,6 +173,12 @@ _PRINTS_INCOMING_MESSAGES_BY_DESIGN = {
     # чат, видно по имени и по тексту; в тексте бывает `/start <адрес>`.
     "telegram_poll": "telegram poll",
 }
+# Кто в `src/` сам читает входящие сообщения (`notifier.telegram_get_updates`) и
+# чем отвечает за то, что они никуда не утекут. Новый читатель — решение.
+_READS_INCOMING_MESSAGES = {
+    "telegram_poll": "печатает оператору: строка списка выше, запрет в workflow",
+    "run_polling": "бот: его журнал и печать проверяет tests/test_telegram_bot.py",
+}
 # Функция команды → как её зовут в CLI. Имена сверяются с деревом click.
 _NOT_FROM_A_WORKFLOW = {
     **_PRINTS_AN_ADDRESS_BY_DESIGN,
@@ -626,17 +632,37 @@ def test_every_excused_command_is_a_cli_command_under_that_name():
     assert problems == [], _HOW_TO_FIX_A_COMMAND_NAME.format(problems="; ".join(problems))
 
 
+def test_every_reader_of_incoming_messages_is_accounted_for():
+    """Вход у сообщений один — `notifier.telegram_get_updates`. Кто его зовёт,
+    тот держит в руках имя, идентификатор чата и текст человека."""
+    readers = {
+        str(owner)
+        for path, source in _src_sources().items()
+        for call, owner in _calls_with_owner(ast.parse(source))
+        if _called_name(call) == "telegram_get_updates"
+    }
+    assert readers == set(_READS_INCOMING_MESSAGES), (
+        f"Входящие сообщения Telegram читают {sorted(readers)}, а учтены "
+        f"{sorted(_READS_INCOMING_MESSAGES)}. Новая функция: если она печатает "
+        "сообщения оператору — это команда для `_PRINTS_INCOMING_MESSAGES_BY_DESIGN` "
+        "(и из workflow её не запускают); если пишет в журнал — проверь прямым "
+        "вызовом, что в него не идёт ничего из сообщения, как у бота в "
+        "tests/test_telegram_bot.py. Затем впиши её в `_READS_INCOMING_MESSAGES`. "
+        "Функцию убрали или переименовали — поправь строку."
+    )
+
+
 def test_telegram_poll_prints_the_incoming_message_and_is_listed_for_it(cli_logging, monkeypatch):
     """Команда печатает сообщение как есть, мимо маски, — и ровно поэтому стоит
     в списке. Убрать строку списка, пока команда печатает, нельзя; оставить её,
     когда печатать перестала, — тоже."""
-    chat_id, sender = 700200, "aysel_from_client"
+    chat_id, sender, name, said = 700200, "aysel_from_client", "Айсель", "kod-4417"
     update = {
         "update_id": 41,
         "message": {
             "chat": {"id": chat_id},
-            "from": {"username": sender, "first_name": "Айсель"},
-            "text": f"/start {ADDRESS}",
+            "from": {"username": sender, "first_name": name},
+            "text": f"/start {ADDRESS} {said}",
         },
     }
     monkeypatch.setattr(notifier, "telegram_get_updates", lambda *args, **kwargs: [update])
@@ -644,7 +670,8 @@ def test_telegram_poll_prints_the_incoming_message_and_is_listed_for_it(cli_logg
     result = CliRunner().invoke(main.cli, ["telegram", "poll", "--once"])
 
     assert result.exit_code == 0, result.output
-    shown = [piece for piece in (str(chat_id), sender, ADDRESS) if piece in result.output]
+    of_the_message = (str(chat_id), sender, name, ADDRESS, said)
+    shown = [piece for piece in of_the_message if piece in result.output]
     listed = _PRINTS_INCOMING_MESSAGES_BY_DESIGN.get("telegram_poll") == "telegram poll"
     assert bool(shown) == listed, (
         f"`telegram poll` печатает из входящего сообщения: {shown or 'ничего'}; в "
@@ -653,7 +680,8 @@ def test_telegram_poll_prints_the_incoming_message_and_is_listed_for_it(cli_logg
         "workflow её не запускает. Перестала печатать — убери строку списка."
     )
     # Сегодня — всё сообщение целиком: идентификатор чата, имя и текст с адресом.
-    assert f"chat_id={chat_id}  from={sender}  text='/start {ADDRESS}'" in result.output, (
+    line = f"chat_id={chat_id}  from={sender}  text='/start {ADDRESS} {said}'"
+    assert line in result.output, (
         "Вывод `telegram poll` изменился: поправь образец здесь и причину у "
         "строки списка — там сказано, что именно команда печатает."
     )
