@@ -150,14 +150,17 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
             user.email_severity_min, event.severity, DEFAULT_EMAIL_SEVERITY
         ):
             try:
-                # False — SMTP не настроен, письма не было; отказ сервера и сеть
-                # приходят исключением.
+                # False — SMTP не настроен, письма не было (отправитель пишет
+                # `email_skipped_no_smtp`); отказ сервера и сеть приходят
+                # исключением.
                 if notifier.send_email(
                     subject=f"[{event.severity.upper()}] {event.title[:80]}",
                     html_body=_render_single_event_email(event),
                     to=[user.email],
                 ):
                     results["email"].append(user.email)
+                else:
+                    log.warning("email_dispatch_failed", user_id=user.id)
             except Exception as e:
                 log.warning(
                     "email_dispatch_failed", user_id=user.id, **notifier.delivery_error_fields(e)
@@ -258,8 +261,9 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                 if ev_email:
                     attempted.update(id(e) for e in ev_email)
                     try:
-                        # False — SMTP не настроен, письма не было; отказ сервера
-                        # и сеть приходят исключением.
+                        # False — SMTP не настроен, письма не было (отправитель
+                        # пишет `email_skipped_no_smtp`); отказ сервера и сеть
+                        # приходят исключением.
                         if notifier.send_email(
                             subject=_batch_subject(ev_email),
                             html_body=_render_batch_email(ev_email),
@@ -270,6 +274,7 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                                 sent_now.setdefault(id(e), set()).add("email")
                         else:
                             failed += 1
+                            log.warning("email_batch_failed", user_id=user.id, events=len(ev_email))
                     except Exception as exc:
                         failed += 1
                         log.warning(
@@ -324,8 +329,9 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
 
     # Событие, которое кому-то слали и которое не дошло ни по одному каналу,
     # остаётся без метки. Повторной рассылки в проекте нет: эту функцию зовут
-    # один раз, на только что созданные события, — поэтому число таких событий
-    # пишется сюда. Дайджест метку не читает: подписанным на него они придут.
+    # только на события, которые `evaluate_rules` создал этим же вызовом, —
+    # поэтому число таких событий пишется сюда. Дайджест метку не читает:
+    # подписанным на него они придут.
     undelivered = len(attempted - delivered)
     log.info(
         "alerts_dispatched_batch",

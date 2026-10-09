@@ -500,18 +500,29 @@ def test_dispatch_event_counts_telegram_per_recipient(setup, tenant_user):
 
 
 def test_dispatch_event_unconfigured_smtp_is_not_a_delivery(setup, tenant_user):
-    """SMTP не настроен: `send_email` отвечает False — письма не было."""
+    """SMTP не настроен: `send_email` отвечает False — письма не было. Telegram
+    тому же получателю от этого не зависит."""
     s = setup
+    tenant_user.telegram_chat_id = _CHAT_ID
+    s.commit()
     event = _mk_event(s, tenant_user.tenant_id, "single-no-smtp", "critical", "x")
     s.commit()
 
-    with patch("src.notifier.send_email", return_value=False) as mock_email:
+    with (
+        patch("src.notifier.send_email", return_value=False) as mock_email,
+        patch("src.notifier.send_telegram_message", return_value=True) as mock_tg,
+        capture_logs() as logs,
+    ):
         result = notifications.dispatch_event(s, event)
 
-    assert mock_email.call_count == 1
-    assert result == {"email": "sent_0", "telegram": "sent_0"}
+    assert (mock_email.call_count, mock_tg.call_count) == (1, 1)
+    assert result == {"email": "sent_0", "telegram": "sent_1"}
     s.refresh(event)
-    assert not event.channels_sent
+    assert event.channels_sent == ["telegram"]
+    assert _failures(logs, "email_dispatch_failed") == [
+        {"event": "email_dispatch_failed", "log_level": "warning", "user_id": tenant_user.id}
+    ]
+    assert "@" not in repr(logs)
 
 
 # ─── dispatch_events_batch: отправитель ответил отказом ──────────────────────
@@ -599,17 +610,21 @@ def test_dispatch_events_batch_telegram_refusal_keeps_the_email_mark(setup, tena
     assert (summary["failed"], summary["undelivered"]) == (1, 0)
 
 
-def test_dispatch_events_batch_marks_only_what_telegram_took(setup, tenant_user):
+@pytest.mark.parametrize("refused_is", ["first", "last"])
+def test_dispatch_events_batch_marks_only_what_telegram_took(setup, tenant_user, refused_is):
     """Метка ставится по событию: что входило только в отказанное сообщение,
-    остаётся без канала, даже если другому получателю Telegram доставил."""
+    остаётся без канала, даже если другому получателю Telegram доставил. Отказ
+    одному получателю остальных не касается, в каком бы порядке они ни шли."""
     s = setup
     t = tenant_user.tenant_id
     tenant_user.email_severity_min = "off"
-    tenant_user.telegram_chat_id = _CHAT_ID  # порог critical, ему доставят
-    bob = _add_user(
-        s, t, "bob@example.com", "viewer", telegram_chat_id="222", telegram_severity_min="warning"
-    )
+    tenant_user.telegram_chat_id = _CHAT_ID
+    bob = _add_user(s, t, "bob@example.com", "viewer", telegram_chat_id="222")
     bob.email_severity_min = "off"
+    # В тестовой базе получатели идут в порядке создания: tenant_user, затем bob.
+    refused, served = (tenant_user, bob) if refused_is == "first" else (bob, tenant_user)
+    refused.telegram_severity_min = "warning"  # ждал оба события
+    served.telegram_severity_min = "critical"
     crit = _mk_event(s, t, "batch-only-crit", "critical", "CRITONLY")
     warn = _mk_event(s, t, "batch-only-warn", "warning", "WARNONLY")
     info = _mk_event(s, t, "batch-only-info", "info", "INFOONLY")  # ниже порогов обоих
@@ -617,22 +632,24 @@ def test_dispatch_events_batch_marks_only_what_telegram_took(setup, tenant_user)
 
     with (
         patch(
-            "src.notifier.send_telegram_message", side_effect=lambda chat, _text: chat == _CHAT_ID
+            "src.notifier.send_telegram_message",
+            side_effect=lambda chat, _text: chat == served.telegram_chat_id,
         ) as mock_tg,
         capture_logs() as logs,
     ):
         result = notifications.dispatch_events_batch(s, [crit, warn, info])
 
-    assert mock_tg.call_count == 2
+    # Слали обоим: отказ одному не отменяет отправку другому.
+    assert sorted(c.args[0] for c in mock_tg.call_args_list) == sorted([_CHAT_ID, "222"])
     assert result == {"email": 0, "telegram": 1}
     # В сбое — сколько событий было в сообщении этого получателя, а не в прогоне.
     assert [(f["user_id"], f["events"]) for f in _failures(logs, "telegram_batch_failed")] == [
-        (bob.id, 2)
+        (refused.id, 2)
     ]
     for e in (crit, warn, info):
         s.refresh(e)
     assert crit.channels_sent == ["telegram"]
-    assert not warn.channels_sent  # предупреждение ждал только bob
+    assert not warn.channels_sent  # предупреждение ждал только тот, кому отказано
     assert not info.channels_sent
     summary = _batch_summary(logs)
     assert (summary["telegram"], summary["failed"], summary["undelivered"]) == (1, 1, 1)
@@ -664,23 +681,127 @@ def test_dispatch_events_batch_without_a_token_delivers_nothing(setup, tenant_us
 
 
 def test_dispatch_events_batch_unconfigured_smtp_is_not_a_delivery(setup, tenant_user):
-    """SMTP не настроен: `send_email` отвечает False — письма не было."""
+    """SMTP не настроен: `send_email` отвечает False — письма не было. Telegram
+    тому же получателю от этого не зависит."""
     s = setup
-    e = _mk_event(s, tenant_user.tenant_id, "batch-no-smtp", "critical", "x")
+    tenant_user.telegram_chat_id = _CHAT_ID  # порог critical
+    s.commit()
+    crit = _mk_event(s, tenant_user.tenant_id, "batch-no-smtp", "critical", "x")
+    warn = _mk_event(s, tenant_user.tenant_id, "batch-no-smtp-warn", "warning", "y")
+    info = _mk_event(s, tenant_user.tenant_id, "batch-no-smtp-info", "info", "z")  # ниже порога
     s.commit()
 
     with (
         patch("src.notifier.send_email", return_value=False) as mock_email,
+        patch("src.notifier.send_telegram_message", return_value=True) as mock_tg,
+        capture_logs() as logs,
+    ):
+        result = notifications.dispatch_events_batch(s, [crit, warn, info])
+
+    assert (mock_email.call_count, mock_tg.call_count) == (1, 1)
+    assert result == {"email": 0, "telegram": 1}
+    s.refresh(crit)
+    s.refresh(warn)
+    assert crit.channels_sent == ["telegram"]
+    assert not warn.channels_sent
+    assert _failures(logs, "email_batch_failed") == [
+        {
+            "event": "email_batch_failed",
+            "log_level": "warning",
+            "user_id": tenant_user.id,
+            "events": 2,
+        }
+    ]
+    summary = _batch_summary(logs)
+    # Сбой — одно письмо, а не два события в нём; не дошло никому одно из двух.
+    assert (summary["emails"], summary["failed"], summary["undelivered"]) == (0, 1, 1)
+    assert "@" not in repr(logs)
+
+
+@pytest.mark.parametrize("channel", ["email", "telegram"])
+def test_dispatch_events_batch_counts_a_sender_that_raised(setup, tenant_user, channel):
+    """Сбой, пришедший исключением (так падает SMTP на проде), считается так же,
+    как отказ: в `failed` — отправка, в `undelivered` — её события."""
+    s = setup
+    if channel == "telegram":
+        _telegram_only(tenant_user, s)
+    evs = [
+        _mk_event(s, tenant_user.tenant_id, f"batch-raised-{i}", "critical", "x") for i in range(3)
+    ]
+    s.commit()
+
+    with (
+        patch("src.notifier.send_email", side_effect=ConnectionRefusedError("smtp down")),
+        patch("src.notifier.send_telegram_message", side_effect=RuntimeError("boom")),
+        capture_logs() as logs,
+    ):
+        result = notifications.dispatch_events_batch(s, evs)
+
+    assert result == {"email": 0, "telegram": 0}
+    (failure,) = _failures(logs, f"{channel}_batch_failed")
+    assert failure["user_id"] == tenant_user.id
+    summary = _batch_summary(logs)
+    assert (summary["failed"], summary["undelivered"]) == (1, 3)
+    for e in evs:
+        s.refresh(e)
+        assert not e.channels_sent
+
+
+def test_dispatch_events_batch_counts_across_tenants(setup, tenant_user):
+    """Счёт общий на весь вызов: отказ в одном тенанте не теряется за доставкой в другом."""
+    s = setup
+    _telegram_only(tenant_user, s)
+    other = storage.Tenant(slug="second", name="Second")
+    s.add(other)
+    s.commit()
+    carol = _add_user(
+        s,
+        other.id,
+        "carol@example.com",
+        "admin",
+        telegram_chat_id="333",
+        telegram_severity_min="info",
+    )
+    carol.email_severity_min = "off"
+    mine = [_mk_event(s, tenant_user.tenant_id, f"t1-{i}", "critical", "x") for i in range(2)]
+    theirs = _mk_event(s, other.id, "t2", "critical", "y")
+    s.commit()
+
+    with (
+        patch("src.notifier.send_telegram_message", side_effect=lambda chat, _text: chat == "333"),
+        capture_logs() as logs,
+    ):
+        result = notifications.dispatch_events_batch(s, [*mine, theirs])
+
+    assert result == {"email": 0, "telegram": 1}
+    summary = _batch_summary(logs)
+    assert (summary["telegram"], summary["failed"], summary["undelivered"]) == (1, 1, 2)
+    s.refresh(theirs)
+    assert theirs.channels_sent == ["telegram"]
+
+
+def test_dispatch_events_batch_does_not_count_what_was_never_sent(setup, tenant_user):
+    """Тихие часы и ежедневный дайджест — не сбой: получателю и не слали."""
+    s = setup
+    tenant_user.daily_digest = True  # письмо о прогоне не шлётся
+    tenant_user.telegram_chat_id = _CHAT_ID
+    tenant_user.telegram_severity_min = "info"
+    tenant_user.quiet_hours = "00-00"  # тихо круглые сутки
+    s.commit()
+    e = _mk_event(s, tenant_user.tenant_id, "batch-quiet", "critical", "x")
+    s.commit()
+
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
         capture_logs() as logs,
     ):
         result = notifications.dispatch_events_batch(s, [e])
 
-    assert mock_email.call_count == 1
+    assert not mock_email.called and not mock_tg.called
     assert result == {"email": 0, "telegram": 0}
-    s.refresh(e)
-    assert not e.channels_sent
     summary = _batch_summary(logs)
-    assert (summary["emails"], summary["failed"], summary["undelivered"]) == (0, 1, 1)
+    assert (summary["failed"], summary["undelivered"]) == (0, 0)
 
 
 def test_dispatch_events_batch_clean_run_reports_no_failures(setup, tenant_user):
