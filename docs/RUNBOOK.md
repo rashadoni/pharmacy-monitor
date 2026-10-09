@@ -90,6 +90,22 @@ DATABASE_URL=sqlite:///data/db.sqlite
 2. Окружение процесса главнее файла: файл даёт только имена, которых в
    окружении нет.
 
+Кто кого перекрывает у команды CLI — от слабого к сильному:
+
+1. `.env` в корне своего чекаута — только имена, которых ни один источник ниже
+   не дал;
+2. `Environment=` в юните или его drop-in (сейчас такая строка одна:
+   `SCRAPE_REPORT_EMAIL=0` у `pharmacy-monitor-scrape@`);
+3. `EnvironmentFile=/etc/pharmacy-monitor/env` — перекрывает `Environment=`
+   (проверено на systemd 255): строка с тем же именем в файле секретов сильнее
+   строки юнита;
+4. переменная, названная рядом с командой (`ИМЯ=значение команда` — в workflow
+   или в оболочке);
+5. то, что код выставляет сам уже после запуска: автономный сбор pharmonline
+   (`_enable_pharmonline_public_api_autonomous_mode` в `src/main.py`) ставит
+   `AI_FALLBACK_ENABLED=0`, `SCRAPE_REPORT_EMAIL=0`, `PHARMONLINE_USE_DDP=0` и
+   переменные источника, `ai-crawl --budget-usd` — `AI_CRAWL_BUDGET_USD`.
+
 На сервере из этого следует: копия кода, которую еженедельный сбор pharmonline
 кладёт в `/opt/pharmacy-monitor/.codex-pharmonline-auto.*/runtime/`, `.env` не
 читает никакой; выложенный код (`/opt/pharmacy-monitor/src`) прочёл бы
