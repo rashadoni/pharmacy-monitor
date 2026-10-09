@@ -78,6 +78,9 @@
 
 Что разбор читает неверно, хотя и не молчит: код после `-c`, склеенный из двух
 строк в разных кавычках с переносом строки между ними, — прочитается первая.
+Строку документации запущенного файла тест за код не считает (`os.system(__doc__)`
+не увидит), а действие, которое исполняет Python из своего входа (`uses: …`
+со `script:`), не читает вовсе.
 """
 
 from __future__ import annotations
@@ -139,9 +142,25 @@ _INTERPRETER = re.compile(
 _NOT_THE_INTERPRETER = re.compile(
     r"[\w.-]*-python[0-9.]*(?:@[\w.]+)?"
     r"|python[0-9.]*-(?=[\w$])[\w.-]*"
-    r"|python[0-9.]*(?=[/:])"
+    r"|python[0-9.]*(?=/)"
+    r"|python(?=:(?:\s|$))"
     r"|(?<=\w\.)python[0-9.]*"
 )
+# Образ `python:3.12` интерпретатором не назван, но запускает его: `docker run -i
+# python:3.12 <<'PY'`. Не запуск — только ключ YAML целой строкой.
+_AN_IMAGE_KEY = re.compile(
+    r"""^[ \t]*(?:-[ \t]+)?(?:container|image|uses):[ \t]*["']?(?:docker://)?python:[\w.-]+["']?[ \t]*$""",
+    re.M,
+)
+# `${PYTHON:-python3}`, `${PY-python3}`: интерпретатор — значением по умолчанию.
+_DEFAULT_OF_A_VARIABLE = re.compile(r"""(\$\{\w+:?[-=+])((?:[^\s}"']*/)?python[0-9.]*)\}""")
+# Перенос через «\» посреди слова: `pyth\` + `on3` — одно слово, а не два.
+_A_WORD_BROKEN_BY_A_LINE_BREAK = re.compile(r"\w\\\r?\n\w")
+# Подстановка команды: в блоке без кавычек у `<<TAG` и в `-c "…"` shell исполнит
+# её раньше, чем Python получит код.
+_COMMAND_SUBSTITUTION = re.compile(r"\$\(|`")
+# Откуда команда берёт stdin: блок, строка `<<<`, файл, другой дескриптор.
+_STDIN_SOURCE = re.compile(r"(\d*)(<<<|<<-?|<&|<)(?!\()")
 _INTERPRETER_FLAGS = re.compile(r"-(?:[BbdEIiOPqsSuvx]+|OO|bb)$")
 _INTERPRETER_OPTIONS_WITH_A_VALUE = {"-X", "-W"}
 _NOT_A_RUN = {"-V", "-VV", "--version", "-h", "--help"}
@@ -159,13 +178,13 @@ _END_OF_SHELL_COMMAND = re.compile(r"&&|\|\||[;|\n]")
 # Строка, не совпавшая с видом целиком, — запуск: её либо удаётся прочитать,
 # либо она роняет CI. Новый вид дописывают сюда — это видно в дифе теста.
 _A_PYTHON = r"""["']?[\w./${}-]*python[0-9.]*["']?"""  # одно слово: путь к интерпретатору
-_OUTPUT_ELSEWHERE = r"(?: (?:\d?>>?|&>) ?[\w/.&-]+)*"
+_OUTPUT_ELSEWHERE = r"""(?: (?:\d?>>?|&>) ?(?:&\d|"?\$\{?\w+\}?"?|[\w/.-]+))*"""
 _LINES_THAT_ONLY_NAME_PYTHON = [
     re.compile(shape)
     for shape in (
         # Проверка файла: `test -x …/python`, `[ ! -x …/python ] || exit 1`.
-        rf"(?:sudo(?: -u [\w-]+)? )?(?:test|\[\[?) (?:! )?-[a-zA-Z] {_A_PYTHON}(?: \]\]?)?"
-        r"(?: \|\| exit \d+)?",
+        rf"(?:if )?(?:sudo(?: -u [\w-]+)? )?(?:test|\[\[?) (?:! )?-[a-zA-Z] {_A_PYTHON}(?: \]\]?)?"
+        r"(?:; then| \|\| exit \d+)?",
         # Присваивание одного слова: `PY=…/python`, `export PYTHON=python3`.
         rf"(?:export |readonly |local )?\w+={_A_PYTHON}",
         # Вопрос «где программа»: `command -v python3 >/dev/null || exit 1`.
@@ -176,8 +195,10 @@ _LINES_THAT_ONLY_NAME_PYTHON = [
         r" (?:install|add)(?: [\w.+:=-]+)*",
         # Список и ссылка: `ls -l …/python`, `ln -sf /usr/bin/python3 /usr/local/bin/python`.
         rf"(?:ls|ln)(?: [\w./+:=-]+)+{_OUTPUT_ELSEWHERE}",
-        # Текст, который печатают: слова и строки без подстановки команд.
-        r"""(?:echo|printf)(?: (?:"(?:[^"$`\\]|\$\w+|\$\{\w+\})*"|'[^']*'|[\w./:=,%-]+))+"""
+        # Текст, который печатают: слова и строки без подстановки команд и без
+        # `;`, `|`, `&` — строка в кавычках бывает концом внешней строки, и то,
+        # что за ней, shell исполнит.
+        r"""(?:echo|printf)(?: (?:"(?:[^"$`\\;|&]|\$\w+|\$\{\w+\})*"|'[^';|&]*'|[\w./:=,%-]+))+"""
         + _OUTPUT_ELSEWHERE,
     )
 ]
@@ -187,8 +208,9 @@ _PYTHON_SHELL = re.compile(r"""(?<![\w-])["']?shell["']?[ \t]*:[ \t]*(?:&\w+[ \t
 # Строки, которые ничего не запускают: комментарий и имя шага. Такая строка
 # бывает и серединой строки в кавычках, за которой в той же строке стоит запуск
 # (`…" | python3 …`), поэтому со знаком `|`, `;`, `&` или подстановкой она
-# читается как обычная.
-_NOT_A_COMMAND_LINE = re.compile(r"^[ \t]*(?:#|-?[ \t]*name:)[^|;&`\n]*$", re.M)
+# читается как обычная. Как и строка, которой продолжается предыдущая (`\` в
+# конце): это уже не комментарий.
+_NOT_A_COMMAND_LINE = re.compile(r"[ \t]*(?:#|-?[ \t]*name:)[^|;&`$\n]*")
 # Модули, которые запускают как есть: своего кода о людях в них нет, а
 # миграции этот тест не читает (см. описание файла).
 _MODULES_NOT_READ = {
@@ -257,23 +279,31 @@ def _only_names_python(line: str) -> bool:
     return any(shape.fullmatch(whole) for shape in _LINES_THAT_ONLY_NAME_PYTHON)
 
 
-def _without_redirections(words: list[str]) -> tuple[list[str], bool]:
-    """Слова команды без перенаправлений — и взят ли stdin из файла. Блок `<<TAG`
-    остаётся словом."""
-    kept, stdin_from_a_file, index = [], False, 0
+def _without_redirections(words: list[str]) -> list[str]:
+    """Слова команды без перенаправлений. Блок `<<TAG` остаётся словом."""
+    kept, index = [], 0
     while index < len(words):
         word = words[index]
-        if word.startswith("<<"):
+        if word.startswith("<<") and not word.startswith("<<<"):
             kept.append(word)
         elif _DUPLICATED_DESCRIPTOR.match(word):
             pass
         elif found := _REDIRECTION.match(word):
-            stdin_from_a_file = stdin_from_a_file or "<" in word[: found.start(1)]
             index += 0 if found.group(1) else 1  # цель — следующим словом
         else:
             kept.append(word)
         index += 1
-    return kept, stdin_from_a_file
+    return kept
+
+
+def _without_lines_that_run_nothing(text: str) -> str:
+    """Текст, в котором строки комментариев и имён шагов заменены пробелами."""
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        continues = index > 0 and lines[index - 1].rstrip("\r").endswith("\\")
+        if not continues and _NOT_A_COMMAND_LINE.fullmatch(line.rstrip("\r")):
+            lines[index] = " " * len(line)
+    return "\n".join(lines)
 
 
 def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
@@ -287,10 +317,16 @@ def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
     def line_of(position: int) -> int:
         return text.count("\n", 0, position) + 1
 
-    shell = re.sub(r"\\\r?\n", blank, _NOT_A_COMMAND_LINE.sub(blank, text))
+    shell = re.sub(r"\\\r?\n", blank, _without_lines_that_run_nothing(text))
+    # `${PY:-python3}` → слово `python3` на том же месте.
+    shell = _DEFAULT_OF_A_VARIABLE.sub(
+        lambda found: " " * len(found.group(1)) + found.group(2) + " ", shell
+    )
     runs: list[PythonRun] = []
     decided: list[tuple[int, int]] = []
     already_read: list[tuple[int, int]] = []
+    for found in _A_WORD_BROKEN_BY_A_LINE_BREAK.finditer(text):
+        runs.append(PythonRun(line_of(found.start()), UNKNOWN, "слово разорвано переносом «\\»"))
     for found in _PYTHON_SHELL.finditer(shell):
         runs.append(PythonRun(line_of(found.start()), UNKNOWN, "шаг с `shell: python`"))
         end_of_line = shell.find("\n", found.end())
@@ -308,25 +344,28 @@ def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
         # Своя команда интерпретатора: до `&&`, `||`, `;`, `|`. Блок `<<TAG` за
         # этой границей — чужой.
         rest = _END_OF_SHELL_COMMAND.split(shell[interpreter.end() : end_of_line], maxsplit=1)[0]
-        words, stdin_from_a_file = _without_redirections(
+        words = _without_redirections(
             [word for word in rest.split() if _unquoted(word) or word.startswith("<<")]
         )
+        interactive = False
         while words:
             if words[0] in _INTERPRETER_OPTIONS_WITH_A_VALUE:
                 words = words[2:]
             elif _INTERPRETER_FLAGS.match(words[0]):
+                interactive = interactive or "i" in words[0]
                 words = words[1:]
             else:
                 break
         if words and _unquoted(words[0]) in _NOT_A_RUN:
             continue
-        if not words or stdin_from_a_file:
+        if not words:
             # Программы после слова нет, и строка не из тех, где оно ничего не
             # запускает: значит, код интерпретатору дали иначе — по `|`, через
             # `<`, следующей строкой свёрнутого YAML, блоком у внешней команды.
-            # Файл со stdin главнее блока `<<TAG` в той же команде.
-            why = "с файлом на stdin" if stdin_from_a_file else "без программы: код дали со stdin?"
-            runs.append(PythonRun(line, UNKNOWN, f"интерпретатор {why}"))
+            runs.append(PythonRun(line, UNKNOWN, "интерпретатор без программы: код со stdin?"))
+            continue
+        if interactive:
+            runs.append(PythonRun(line, UNKNOWN, "`-i`: после кода интерпретатор читает stdin"))
             continue
         first = words[0]
         if first == "-m":
@@ -363,6 +402,9 @@ def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
                 runs.append(PythonRun(line, UNKNOWN, "код после `-c` склеен из кусков"))
                 continue
             code = text[quoted.end() : closing]
+            if quoted.group(1) != "'" and _COMMAND_SUBSTITUTION.search(code):
+                runs.append(PythonRun(line, UNKNOWN, 'в коде `-c "…"` подстановка команды'))
+                continue
             if quoted.group(1) == '"':  # в двойных кавычках shell снимает `\` сам
                 code = re.sub(r'\\(["\\$`])', r"\1", code)
             runs.append(PythonRun(line, CODE, textwrap.dedent(code)))
@@ -378,7 +420,16 @@ def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
             if closing is None:
                 runs.append(PythonRun(line, UNKNOWN, "код со stdin, но не блоком `<<TAG`"))
                 continue
-            runs.append(PythonRun(line, CODE, textwrap.dedent(text[body_start : closing.start()])))
+            # Источник stdin у команды один, и это блок: второй блок, `<<<`,
+            # файл или другой дескриптор подменили бы прочитанный код.
+            if _STDIN_SOURCE.findall(rest) not in ([("", "<<")], [("", "<<-")]):
+                runs.append(PythonRun(line, UNKNOWN, "у команды не один источник stdin"))
+                continue
+            body = text[body_start : closing.start()]
+            if not heredoc.group(1) and _COMMAND_SUBSTITUTION.search(body):
+                runs.append(PythonRun(line, UNKNOWN, "в блоке `<<TAG` без кавычек подстановка"))
+                continue
+            runs.append(PythonRun(line, CODE, textwrap.dedent(body)))
             # Только тело: на строке с `<<TAG` может стоять и второй запуск.
             already_read.append((body_start, closing.end()))
         elif (path := _repo_file(_unquoted(first))) is not None:
@@ -421,7 +472,11 @@ def lines_naming_python_unexplained(text: str) -> list[int]:
     `lib/python3.12/…`).
     """
     _, decided, shell = _scan(text)
-    covered = decided + [found.span() for found in _NOT_THE_INTERPRETER.finditer(shell)]
+    covered = decided + [
+        found.span()
+        for shape in (_NOT_THE_INTERPRETER, _AN_IMAGE_KEY)
+        for found in shape.finditer(shell)
+    ]
     return sorted(
         {
             text.count("\n", 0, found.start()) + 1
@@ -700,8 +755,6 @@ class Sources:
         for sub in ast.walk(node):
             if id(sub) in chain or not isinstance(sub, ast.Name | ast.Attribute):
                 continue
-            if isinstance(sub, ast.Name) and not isinstance(sub.ctx, ast.Load):
-                continue  # имя, которому присваивают, — не ссылка на него
             parts = [sub.id] if isinstance(sub, ast.Name) else _dotted(sub)
             if parts and (target := self._resolve_in(parts, module, own_defs=own_defs)[0]):
                 followed.append((target, True))
@@ -752,6 +805,7 @@ class Sources:
                 queue += [
                     (next_key, key, to)
                     for next_key, to in self._followed(node, module, own_defs=True)
+                    if next_key != key  # `app.title = …` — не ссылка `app` на себя
                 ]
         return sorted(set(found))
 
@@ -1065,6 +1119,8 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ("PY=/opt/app/.venv/bin/python\n", []),
         ("export PYTHON=python3\n", []),
         ("if ! command -v python3 >/dev/null 2>&1; then\n", []),
+        ("if [ ! -x .venv/bin/python ]; then\n", []),
+        ('echo "PY=python3" >> "$GITHUB_ENV"\n', []),
         ('echo "found $n python files in ${dir}" >&2\n', []),
         # То же одной строкой шага: `run:` — не команда.
         ("- run: sudo apt-get install -y python3 python3-venv\n", []),
@@ -1122,6 +1178,42 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ("python3 -c 'import sys'\"; from src import notifications\"\n", [(1, UNKNOWN)]),
         ("ssh host \"python3 -c 'print(1)'\"\n", [(1, CODE)]),
         ('echo "Python: $(python3 --version)"\n', []),
+        # Пятый разбор. Подстановка в строке «комментария» внутри блока, который
+        # shell раскрывает; строка `echo`, чья кавычка закрывает внешнюю строку.
+        (
+            'cat >> "$GITHUB_STEP_SUMMARY" <<EOF\n# rows: $(python3 "$SCRIPT")\nEOF\n',
+            [(2, UNKNOWN)],
+        ),
+        ("BODY=\"id: 1\n- name: $(python3 -c 'import sys')\"\n", [(2, CODE)]),
+        (
+            'ssh host "\n  echo "ok && python3 scripts/preflight_pharmonline_public_api.py"\n"\n',
+            [(2, CODE)],
+        ),
+        ('  echo "; python3 "$SCRIPT"; echo "\n', [(1, UNKNOWN)]),
+        # `&` — не цель перенаправления: за ним следующая команда.
+        ("echo x >a&python3\n", [(1, UNKNOWN)]),
+        ("command -v python3 >/dev/null&python3\n", [(1, UNKNOWN), (1, UNKNOWN)]),
+        # Подстановка команды в теле, которое shell раскрывает до Python.
+        ("python - <<PY\nimport sys  # как $(date)\nPY\n", [(1, UNKNOWN)]),
+        (f"python - <<'PY'\n{_BLOCK}# `date` и $(date) в кавычках — текст\nPY\n", [(1, CODE)]),
+        ("python3 -c \"print('$(date)')\"\n", [(1, UNKNOWN)]),
+        ("python3 -c 'print(\"$(date)\")'\n", [(1, CODE)]),
+        # Интерпретатор — значением переменной по умолчанию.
+        ('${PYTHON-python3} "$SCRIPT"\n', [(1, UNKNOWN)]),
+        (f"\"${{PY-python3}}\" - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        (f"${{PY:=/usr/bin/python3}} - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        # Источник stdin у команды не один — или не блок.
+        ("python3 - <<'A' <<'B'\nx = 1\nA\ny = 2\nB\n", [(1, UNKNOWN)]),
+        ("python3 - <<'PY' <<< \"$CODE\"\nx = 1\nPY\n", [(1, UNKNOWN)]),
+        ("cat x.py | python3 - 3<<'CFG'\nx = 1\nCFG\n", [(1, UNKNOWN)]),
+        ("python3 - <<'PY' <&3\nx = 1\nPY\n", [(1, UNKNOWN)]),
+        ("python3 -i -c 'pass' <<'PY'\nx = 1\nPY\n", [(1, UNKNOWN)]),
+        # …а stdin, закрытый для программы, которая названа, — не помеха.
+        ('python -m alembic \\\n  -c "$d/alembic.ini" "$@" </dev/null\n', [(1, NOT_READ)]),
+        ("python -c 'import sys' < /dev/null\n", [(1, CODE)]),
+        # Перенос «\\» посреди слова и перед строкой, похожей на комментарий.
+        ("pyth\\\non3 scripts/x.py\n", [(1, UNKNOWN)]),
+        ('VAR=a\\\n# python3 "$SCRIPT"\n', [(2, UNKNOWN)]),
     ],
 )
 def test_the_check_finds_python_behind_every_form_of_run(text, kinds):
@@ -1144,7 +1236,11 @@ def test_the_check_finds_python_behind_every_form_of_run(text, kinds):
         ("ls .venv/lib/python3.12/site-packages\n", []),
         ('export PATH="/opt/python/bin:$PATH"\n', []),
         ("matrix:\n  python: ['3.11', '3.12']\nrun: echo ${{ matrix.python }}\n", []),
-        ("key: python-${{ hashFiles('uv.lock') }}\nuses: docker://python:3.12\n", []),
+        ("key: python-${{ hashFiles('uv.lock') }}\n", []),
+        # Образ `python:TAG` — ключом YAML целой строкой; в команде он запускает.
+        ("container: python:3.12-slim\n    uses: docker://python:3.12\n", []),
+        ("docker run --rm -i python:3.12 <<'PY'\nprint(1)\nPY\n", [1]),
+        ("cat x.py | docker run -i python:3.12-slim\n", [1]),
         # Шаблон интерпретатора слово не узнал — строки нет ни в одном списке.
         ("echo ok\npythonw job.py\n", [2]),
         # …даже если на той же строке стоит слово, о котором разбор решил.
@@ -1242,6 +1338,17 @@ _FAKE_SRC = {
 
         HANDLERS = {"alert": alert}
         HANDLERS["size"] = len
+
+        jobs = Registry()
+        jobs.title = "x"
+
+        @jobs.register("quiet")
+        def quiet_job():
+            return 1
+
+        @jobs.register("mail")
+        def mail_job():
+            alert(None)
 
         try:
             import fast
@@ -1444,6 +1551,15 @@ _FAKE_SRC = {
             "run(['.venv/bin/pharmacy-monitor', 'recipient', 'list'])",
             ["строка называет `pharmacy-monitor` — запуск из кода не прочитать ← код"],
         ),
+        # Строка документации — не код: в ней пишут, как файл запускать.
+        (
+            '"""Run: python scripts/x.py --apply (``src.main`` loads the env)."""\nimport os\n',
+            [],
+        ),
+        (
+            'def main():\n    """Same as pharmacy-monitor run."""\n    return 1\n',
+            [],
+        ),
         # Не интерпретатор и не CLI: бэкап снимает `pg_dump`, путь — каталог.
         ("import os\nos.chdir('/opt/pharmacy-monitor')", []),
         ("from pathlib import Path\nPath('/var/backups/pharmacy-monitor') / 'x.dump'", []),
@@ -1553,6 +1669,13 @@ _FAKE_SRC = {
         (
             "from src.extra import quiet_cmd\nquiet_cmd()",
             ["модель `Recipient` ← extra._who ← extra.quiet_cmd ← код"],
+        ),
+        # Одна функция, навешенная на объект, не тянет за собой соседние — даже
+        # когда объекту ещё что-то присваивают; сам объект — тянет.
+        ("from src.health import quiet_job\nquiet_job()", []),
+        (
+            "from src.health import jobs\njobs.run_all()",
+            ["отправка `send_email` ← health.alert ← health.mail_job ← health.jobs ← код"],
         ),
         # Имя объявлено дважды — читаются оба объявления.
         (
