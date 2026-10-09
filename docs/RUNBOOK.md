@@ -1007,7 +1007,9 @@ systemd-run --quiet --wait --pipe --collect -p User=pm -p Group=pm -p Environmen
 ответил, попробуйте ещё раз», а запрос на сервере дожидался бы этапа и записывал
 правку уже после этого — повтор записывал её второй раз.
 
-В журнале API отказ — событие `match_edit_refused` с `reason=matching_in_progress`:
+В журнале API отказ — событие `match_edit_refused` с `reason=matching_in_progress`;
+поле `action` называет правку (`relink`, `reject`, `confirm`, `add-product`,
+`create-with-products`), `request_id` — запрос:
 
 ```bash
 ssh root@13.140.186.143 "journalctl -u pharmacy-monitor-api --since '-1 day' -g match_edit_refused -o cat | tail"
