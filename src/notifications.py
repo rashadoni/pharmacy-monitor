@@ -126,7 +126,9 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
     """Route a single AlertEvent to all eligible channels.
 
     Returns dict {channel_name: status}, e.g. {'email': 'sent_3', 'telegram': 'queued_2'}.
-    Updates event.channels_sent so we don't re-dispatch on retry.
+    Updates event.channels_sent so we don't re-dispatch on retry. Telegram is
+    recorded only if the sender confirmed at least one delivery: it answers
+    False instead of raising (see the call below).
     """
     if event.channels_sent and len(event.channels_sent) > 0:
         log.debug("dispatch_skipped_already_sent", event_id=event.id)
@@ -168,8 +170,13 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
             and not _in_quiet_hours(user.quiet_hours)
         ):
             try:
-                notifier.send_telegram_message(user.telegram_chat_id, _format_event_text(event))
-                results["telegram"].append(user.telegram_chat_id)
+                # Отправитель свой сбой наружу не выпускает, а отвечает False
+                # (нет токена, сеть, отказ Telegram) и причину пишет в журнал
+                # сам. Здесь остаётся, кому не ушло.
+                if notifier.send_telegram_message(user.telegram_chat_id, _format_event_text(event)):
+                    results["telegram"].append(user.telegram_chat_id)
+                else:
+                    log.warning("telegram_dispatch_failed", user_id=user.id)
             except Exception as e:
                 log.warning(
                     "telegram_dispatch_failed",
@@ -222,6 +229,11 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
 
     emails_sent = 0
     tg_sent = 0
+    # Для итоговой строки журнала: сколько отправок не состоялось и какие
+    # события кому-то слали (`attempted`), а какие дошли (`delivered`).
+    failed = 0
+    attempted: set[int] = set()
+    delivered: set[int] = set()
 
     for tenant_id, tevents in by_tenant.items():
         users = session.scalars(
@@ -242,6 +254,7 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                     if _severity_passes(user.email_severity_min, e.severity, DEFAULT_EMAIL_SEVERITY)
                 ]
                 if ev_email:
+                    attempted.update(id(e) for e in ev_email)
                     try:
                         notifier.send_email(
                             subject=_batch_subject(ev_email),
@@ -252,6 +265,7 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                         for e in ev_email:
                             sent_now.setdefault(id(e), set()).add("email")
                     except Exception as exc:
+                        failed += 1
                         log.warning(
                             "email_batch_failed",
                             user_id=user.id,
@@ -268,14 +282,22 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                     )
                 ]
                 if ev_tg:
+                    attempted.update(id(e) for e in ev_tg)
                     try:
-                        notifier.send_telegram_message(
+                        # Отправитель свой сбой наружу не выпускает, а отвечает
+                        # False (нет токена, сеть, отказ Telegram) и причину
+                        # пишет в журнал сам. Здесь остаётся, кому не ушло.
+                        if notifier.send_telegram_message(
                             user.telegram_chat_id, _format_batch_text(ev_tg)
-                        )
-                        tg_sent += 1
-                        for e in ev_tg:
-                            sent_now.setdefault(id(e), set()).add("telegram")
+                        ):
+                            tg_sent += 1
+                            for e in ev_tg:
+                                sent_now.setdefault(id(e), set()).add("telegram")
+                        else:
+                            failed += 1
+                            log.warning("telegram_batch_failed", user_id=user.id, events=len(ev_tg))
                     except Exception as exc:
+                        failed += 1
                         log.warning(
                             "telegram_batch_failed",
                             user_id=user.id,
@@ -288,16 +310,24 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
             # получателем, а не
             # всей пачкой (единый end-of-batch commit мог бы продублировать всем).
             if sent_now:
+                delivered.update(sent_now)
                 for eid, chans in sent_now.items():
                     ev = by_obj[eid]
                     ev.channels_sent = sorted(set(ev.channels_sent or []) | chans)
                 session.commit()
 
+    # Событие, которое кому-то слали и которое не дошло ни по одному каналу,
+    # остаётся без метки. Повторной рассылки в проекте нет: эту функцию зовут
+    # один раз, на только что созданные события, — поэтому число таких событий
+    # пишется сюда. Дайджест метку не читает: подписанным на него они придут.
+    undelivered = len(attempted - delivered)
     log.info(
         "alerts_dispatched_batch",
         events=len(pending),
         emails=emails_sent,
         telegram=tg_sent,
+        failed=failed,
+        undelivered=undelivered,
     )
     return {"email": emails_sent, "telegram": tg_sent}
 
