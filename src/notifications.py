@@ -126,9 +126,9 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
     """Route a single AlertEvent to all eligible channels.
 
     Returns dict {channel_name: status}, e.g. {'email': 'sent_3', 'telegram': 'queued_2'}.
-    Updates event.channels_sent so we don't re-dispatch on retry. Telegram is
-    recorded only if the sender confirmed at least one delivery: it answers
-    False instead of raising (see the call below).
+    Updates event.channels_sent so we don't re-dispatch on retry. A channel is
+    recorded only if a sender confirmed at least one delivery on it: both senders
+    can answer False without raising (see the calls below).
     """
     if event.channels_sent and len(event.channels_sent) > 0:
         log.debug("dispatch_skipped_already_sent", event_id=event.id)
@@ -150,12 +150,14 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
             user.email_severity_min, event.severity, DEFAULT_EMAIL_SEVERITY
         ):
             try:
-                notifier.send_email(
+                # False — SMTP не настроен, письма не было; отказ сервера и сеть
+                # приходят исключением.
+                if notifier.send_email(
                     subject=f"[{event.severity.upper()}] {event.title[:80]}",
                     html_body=_render_single_event_email(event),
                     to=[user.email],
-                )
-                results["email"].append(user.email)
+                ):
+                    results["email"].append(user.email)
             except Exception as e:
                 log.warning(
                     "email_dispatch_failed", user_id=user.id, **notifier.delivery_error_fields(e)
@@ -256,14 +258,18 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                 if ev_email:
                     attempted.update(id(e) for e in ev_email)
                     try:
-                        notifier.send_email(
+                        # False — SMTP не настроен, письма не было; отказ сервера
+                        # и сеть приходят исключением.
+                        if notifier.send_email(
                             subject=_batch_subject(ev_email),
                             html_body=_render_batch_email(ev_email),
                             to=[user.email],
-                        )
-                        emails_sent += 1
-                        for e in ev_email:
-                            sent_now.setdefault(id(e), set()).add("email")
+                        ):
+                            emails_sent += 1
+                            for e in ev_email:
+                                sent_now.setdefault(id(e), set()).add("email")
+                        else:
+                            failed += 1
                     except Exception as exc:
                         failed += 1
                         log.warning(

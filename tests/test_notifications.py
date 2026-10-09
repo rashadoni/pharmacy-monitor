@@ -391,8 +391,8 @@ def test_dispatch_events_batch_two_users_different_thresholds(setup, tenant_user
 # ─── dispatch_event: отправитель ответил отказом ─────────────────────────────
 #
 # `send_telegram_message` свой сбой ловит сама и отвечает False (нет токена,
-# сеть, отказ Telegram). Исключения при этом нет — обработчик `except` не
-# срабатывает.
+# сеть, отказ Telegram); `send_email` отвечает False, когда SMTP не настроен.
+# Исключения при этом нет — обработчик `except` не срабатывает.
 
 _CHAT_ID = "700100"
 _ALERT_TITLE = "Naproksen подешевел"
@@ -497,6 +497,21 @@ def test_dispatch_event_counts_telegram_per_recipient(setup, tenant_user):
     assert [e["user_id"] for e in _failures(logs, "telegram_dispatch_failed")] == [tenant_user.id]
     s.refresh(event)
     assert event.channels_sent == ["telegram"]
+
+
+def test_dispatch_event_unconfigured_smtp_is_not_a_delivery(setup, tenant_user):
+    """SMTP не настроен: `send_email` отвечает False — письма не было."""
+    s = setup
+    event = _mk_event(s, tenant_user.tenant_id, "single-no-smtp", "critical", "x")
+    s.commit()
+
+    with patch("src.notifier.send_email", return_value=False) as mock_email:
+        result = notifications.dispatch_event(s, event)
+
+    assert mock_email.call_count == 1
+    assert result == {"email": "sent_0", "telegram": "sent_0"}
+    s.refresh(event)
+    assert not event.channels_sent
 
 
 # ─── dispatch_events_batch: отправитель ответил отказом ──────────────────────
@@ -646,6 +661,26 @@ def test_dispatch_events_batch_without_a_token_delivers_nothing(setup, tenant_us
     names = [entry["event"] for entry in logs]
     assert names.index("telegram_no_token") < names.index("telegram_batch_failed")
     assert _failures(logs, "telegram_batch_failed")[0]["user_id"] == tenant_user.id
+
+
+def test_dispatch_events_batch_unconfigured_smtp_is_not_a_delivery(setup, tenant_user):
+    """SMTP не настроен: `send_email` отвечает False — письма не было."""
+    s = setup
+    e = _mk_event(s, tenant_user.tenant_id, "batch-no-smtp", "critical", "x")
+    s.commit()
+
+    with (
+        patch("src.notifier.send_email", return_value=False) as mock_email,
+        capture_logs() as logs,
+    ):
+        result = notifications.dispatch_events_batch(s, [e])
+
+    assert mock_email.call_count == 1
+    assert result == {"email": 0, "telegram": 0}
+    s.refresh(e)
+    assert not e.channels_sent
+    summary = _batch_summary(logs)
+    assert (summary["emails"], summary["failed"], summary["undelivered"]) == (0, 1, 1)
 
 
 def test_dispatch_events_batch_clean_run_reports_no_failures(setup, tenant_user):
