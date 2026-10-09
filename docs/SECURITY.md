@@ -7,6 +7,7 @@ Run before go-live. Tick each box, paste output for evidence.
 - [ ] **JWT secret** is 32+ chars from `openssl rand -hex 32`, stored in `/etc/pharmacy-monitor/env` (mode 0600, owned by `pm`)
 - [ ] **API key** (`PHARMACY_API_KEY`) is also 32+ chars random, separate value from JWT_SECRET
 - [ ] Magic-link tokens expire in 30 minutes (verify in `src/tenants.py:issue_magic_token`)
+- [ ] Magic-link tokens are stored as SHA-256, never in the clear: `tenant_users.magic_token` holds the hash, the token itself exists only in the email (`tests/test_magic_link_token.py`; how to check the live table — `docs/RUNBOOK.md`, «Ссылка из письма не входит»)
 - [ ] JWT cookie is `httpOnly` + `secure` (in production) + `sameSite=lax`
 - [ ] Failed auth attempts are rate-limited per IP (10/min in `require_api_key`)
 - [ ] User auth attempts are rate-limited per chat_id (5/min in `auth/request`)

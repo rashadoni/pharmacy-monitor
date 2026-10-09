@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 from datetime import timedelta
 from src._time import utcnow
@@ -131,8 +132,18 @@ def list_users(session: Session, tenant_id: int | None = None) -> list[TenantUse
     return list(session.scalars(stmt).all())
 
 
+def _magic_token_hash(token: str) -> str:
+    # `surrogatepass`: в JSON-теле запроса бывает одиночный суррогат, строгая
+    # кодировка упала бы на нём — а это ответ 500 на входе вместо отказа.
+    return hashlib.sha256(token.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def issue_magic_token(session: Session, email: str, ttl_minutes: int = 30) -> str | None:
-    """Сгенерировать magic-token. Вернуть токен (для отправки в email).
+    """Выдать одноразовый токен входа и вернуть его — для ссылки в письме.
+
+    В базу идёт только SHA-256 токена. Сам токен отсюда уходит один раз, тому,
+    кто вызвал; прочитать его потом неоткуда — ни из строки пользователя, ни из
+    дампа. Прежний токен пользователя гаснет: у него один действующий.
 
     Если такого юзера нет — None. Не создаёт user'а автоматически (security).
     """
@@ -144,24 +155,34 @@ def issue_magic_token(session: Session, email: str, ttl_minutes: int = 30) -> st
     if not u:
         return None
     token = secrets.token_urlsafe(32)
-    u.magic_token = token
+    u.magic_token_hash = _magic_token_hash(token)
     u.magic_token_expires_at = utcnow() + timedelta(minutes=ttl_minutes)
     session.commit()
     return token
 
 
 def verify_magic_token(session: Session, token: str) -> TenantUser | None:
-    """Проверить токен. Если валиден — отметить last_login_at, обнулить токен, вернуть user."""
+    """Проверить токен из ссылки. Годен — погасить, отметить вход, вернуть user.
+
+    Пользователь ищется по хешу присланного: в запрос к базе (а значит, и в
+    текст её ошибки) токен не попадает. Содержимое колонки токеном не служит —
+    ни хеш, ни токен, записанный туда открытым текстом до 2026-10-10: от
+    присланного всегда берётся хеш. Токен без срока не годен.
+    """
     if not token:
         return None
     u = session.scalar(
-        select(TenantUser).where(TenantUser.magic_token == token, TenantUser.is_active.is_(True))
+        select(TenantUser).where(
+            TenantUser.magic_token_hash == _magic_token_hash(token),
+            TenantUser.is_active.is_(True),
+        )
     )
     if not u:
         return None
-    if u.magic_token_expires_at and u.magic_token_expires_at < utcnow():
+    expires_at = u.magic_token_expires_at
+    if expires_at is None or expires_at < utcnow():
         return None
-    u.magic_token = None
+    u.magic_token_hash = None
     u.magic_token_expires_at = None
     u.last_login_at = utcnow()
     session.commit()
