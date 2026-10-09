@@ -325,54 +325,6 @@ set -a; source /etc/pharmacy-monitor/env; set +a
 .venv/bin/pharmacy-monitor notify digest weekly --only admin@example.com
 ```
 
-### Firecrawl fallback для Pharmonline
-
-Decodo остаётся основным источником. Автоматический workflow переходит на
-Firecrawl **только** после трёх неуспешных свежих попыток Decodo и лишь при
-явном включении в `/etc/pharmacy-monitor/env`:
-
-```bash
-FIRECRAWL_API_KEY=fc-...  # секрет, не коммитить
-PHARMONLINE_PUBLIC_API_FIRECRAWL_FALLBACK=required
-PHARMONLINE_FIRECRAWL_MAX_REQUESTS=140
-```
-
-Fallback читает `rawHtml` API/ sitemap c `maxAge=0`, `storeInCache=false` и
-`proxy=basic`. Каждый ответ обязан быть HTTP 200, basic и ровно 1 credit;
-изменение тарифа, cache/advanced-proxy или неполный sitemap отклоняют весь
-прогон без обновления каталога. На текущем каталоге ожидается до 131 запроса
-за полный проход; лимит 140 — предохранитель, а не цель для расхода.
-
-```bash
-# Текущее состояние всех email-потоков
-ssh root@13.140.186.143 '
-  grep "^SCRAPE_REPORT_EMAIL=" /etc/pharmacy-monitor/env || echo "(report email: ON — флаг не задан)"
-  systemctl is-enabled pharmacy-monitor-digest@daily.timer pharmacy-monitor-digest-weekly.timer
-  systemctl list-timers --all | grep -i digest
-'
-# NB: есть templated-юнит pharmacy-monitor-digest@weekly.timer (слал бы 24ч-дайджест
-# на EMAIL_TO еженедельно) — он должен быть DISABLED, иначе лишний недельный блок.
-```
-
-### Дашборд не открывается
-
-**Симптом:** `https://monitor.pharmonline.az` → timeout / 502 / 503.
-
-**Действия:**
-```bash
-# Streamlit жив?
-systemctl status pharmacy-monitor-dashboard
-sudo journalctl -u pharmacy-monitor-dashboard -n 100
-
-# nginx жив?
-systemctl status nginx
-sudo nginx -t  # синтаксис конфига
-
-# Перезапустить
-sudo systemctl restart pharmacy-monitor-dashboard
-sudo systemctl reload nginx
-```
-
 ### Привязка Telegram-чата к аккаунту
 
 Чат к аккаунту привязывает тот, кто вошёл в аккаунт, а не тот, кто знает его
@@ -497,6 +449,54 @@ PostgreSQL. Привязка и отвязка из чата пишутся в `
 товара». И мержить PR с миграцией и выкладывать — за один присест:
 еженедельный сбор pharmonline (понедельник 03:20 UTC) берёт код из `main` и
 отказывает, пока ревизия базы — не последняя в чекауте.
+
+### Firecrawl fallback для Pharmonline
+
+Decodo остаётся основным источником. Автоматический workflow переходит на
+Firecrawl **только** после трёх неуспешных свежих попыток Decodo и лишь при
+явном включении в `/etc/pharmacy-monitor/env`:
+
+```bash
+FIRECRAWL_API_KEY=fc-...  # секрет, не коммитить
+PHARMONLINE_PUBLIC_API_FIRECRAWL_FALLBACK=required
+PHARMONLINE_FIRECRAWL_MAX_REQUESTS=140
+```
+
+Fallback читает `rawHtml` API/ sitemap c `maxAge=0`, `storeInCache=false` и
+`proxy=basic`. Каждый ответ обязан быть HTTP 200, basic и ровно 1 credit;
+изменение тарифа, cache/advanced-proxy или неполный sitemap отклоняют весь
+прогон без обновления каталога. На текущем каталоге ожидается до 131 запроса
+за полный проход; лимит 140 — предохранитель, а не цель для расхода.
+
+```bash
+# Текущее состояние всех email-потоков
+ssh root@13.140.186.143 '
+  grep "^SCRAPE_REPORT_EMAIL=" /etc/pharmacy-monitor/env || echo "(report email: ON — флаг не задан)"
+  systemctl is-enabled pharmacy-monitor-digest@daily.timer pharmacy-monitor-digest-weekly.timer
+  systemctl list-timers --all | grep -i digest
+'
+# NB: есть templated-юнит pharmacy-monitor-digest@weekly.timer (слал бы 24ч-дайджест
+# на EMAIL_TO еженедельно) — он должен быть DISABLED, иначе лишний недельный блок.
+```
+
+### Дашборд не открывается
+
+**Симптом:** `https://monitor.pharmonline.az` → timeout / 502 / 503.
+
+**Действия:**
+```bash
+# Streamlit жив?
+systemctl status pharmacy-monitor-dashboard
+sudo journalctl -u pharmacy-monitor-dashboard -n 100
+
+# nginx жив?
+systemctl status nginx
+sudo nginx -t  # синтаксис конфига
+
+# Перезапустить
+sudo systemctl restart pharmacy-monitor-dashboard
+sudo systemctl reload nginx
+```
 
 ### Поиск на странице сравнения не находит товар / находит не сразу
 
