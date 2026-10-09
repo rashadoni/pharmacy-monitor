@@ -19,12 +19,17 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from src.email_address import normalize_address
 from src.storage import Tenant, TenantUser
 
 log = structlog.get_logger()
 
 DEFAULT_TENANT_SLUG = "default"
 DEFAULT_TENANT_ID = 1
+# Под этой записью живёт первый администратор, пока ему не задали настоящий
+# адрес: по ней входят паролем (`ADMIN_LOGIN`), писем на неё нет — адресом она
+# не является, и при отправке её пропускают, как любую запись не по правилу.
+BOOTSTRAP_ADMIN_EMAIL = "admin@local"
 
 
 def current_tenant_id() -> int:
@@ -108,7 +113,11 @@ def add_user(
     name: str | None = None,
     role: str = "admin",
 ) -> TenantUser:
+    """Запись, которая не адрес, — `InvalidEmailAddress`; кроме заглушки первого
+    администратора (`BOOTSTRAP_ADMIN_EMAIL`)."""
     email = email.strip().lower()
+    if email != BOOTSTRAP_ADMIN_EMAIL:
+        email = normalize_address(email)
     existing = session.scalar(
         select(TenantUser).where(TenantUser.tenant_id == tenant_id, TenantUser.email == email)
     )

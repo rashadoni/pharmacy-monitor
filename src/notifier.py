@@ -4,6 +4,10 @@
 1. Аргумент `to=...` (если передан)
 2. Активные записи из БД (таблица recipients)
 3. EMAIL_TO в .env (fallback)
+
+Запись, которая не адрес (`src/email_address.py`), в письмо не попадает: письмо
+на список одно, и такая запись срывала его всем. О пропуске — событие
+`email_recipients_skipped` с номером записи и кодом причины.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from email.message import EmailMessage
 import structlog
 
 from src import storage, watchlist
+from src.email_address import InvalidEmailAddress, normalize_address
 from src.logging_setup import TEXT_WITHHELD, mask_addresses, without_addresses
 
 log = structlog.get_logger()
@@ -229,19 +234,56 @@ def telegram_get_updates(offset: int | None = None, timeout: int = 0) -> list[di
         return []
 
 
-def resolve_recipients(explicit: list[str] | None = None) -> list[str]:
-    """Собрать список получателей по приоритету."""
+class NoValidRecipients(ValueError):
+    """Слать некому: ни одна запись получателя не адрес."""
+
+
+def _recipient_records(explicit: list[str] | None = None) -> tuple[str, list[tuple[int, str]]]:
+    """Список получателей по приоритету: откуда он взят и его записи как есть,
+    без проверки, — (номер, запись).
+
+    Номер — то, чем запись называют в журнале вместо адреса: `id` строки
+    `recipients`, а у `EMAIL_TO` и у аргумента `to` — место в списке, с единицы.
+    """
     if explicit:
-        return explicit
+        return "to", list(enumerate(explicit, 1))
     try:
         Session = storage.make_session()
         with Session() as s:
-            from_db = watchlist.active_recipient_emails(s)
+            from_db = watchlist.active_recipients(s)
             if from_db:
-                return from_db
+                return "recipients", from_db
     except Exception as e:
         log.warning("recipients_db_lookup_failed", error=str(e))
-    return [s.strip() for s in os.environ.get("EMAIL_TO", "").split(",") if s.strip()]
+    from_env = [s.strip() for s in os.environ.get("EMAIL_TO", "").split(",") if s.strip()]
+    return "EMAIL_TO", list(enumerate(from_env, 1))
+
+
+def _addresses_only(source: str, records: list[tuple[int, str]]) -> list[str]:
+    """Адреса из записей списка; запись, которая не адрес, пропускается.
+
+    Письмо на список одно, заголовок `To:` общий: запись, которая не адрес,
+    ломает его сборку, и письмо не уходит никому. Поэтому она остаётся без
+    письма одна, а в журнале о ней — номер и код причины (`email_address.PROBLEMS`),
+    не сама запись: в ней бывает адрес с опечаткой.
+    """
+    addresses, skipped = [], {}
+    for number, record in records:
+        try:
+            addresses.append(normalize_address(record))
+        except InvalidEmailAddress as refusal:
+            skipped[number] = refusal.problem
+    if skipped:
+        numbers = "recipient_ids" if source == "recipients" else "positions"
+        log.warning(
+            "email_recipients_skipped",
+            source=source,
+            skipped=len(skipped),
+            sending_to=len(addresses),
+            problems=sorted(set(skipped.values())),
+            **{numbers: sorted(skipped)},
+        )
+    return addresses
 
 
 # Без таймаута smtplib ждёт зависший сервер бесконечно, а письмо шлют и
@@ -304,11 +346,16 @@ def _send_email(
     smtp_pass = os.environ["SMTP_PASSWORD"]
     smtp_from = os.environ.get("SMTP_FROM", smtp_user)
 
-    recipients = resolve_recipients(to)
-    if not recipients:
+    source, records = _recipient_records(to)
+    if not records:
         raise ValueError(
             "No recipients configured. Add via "
             "`pharmacy-monitor recipient add EMAIL` or set EMAIL_TO in .env."
+        )
+    recipients = _addresses_only(source, records)
+    if not recipients:
+        raise NoValidRecipients(
+            f"none of the {len(records)} recipient record(s) from {source} is an email address"
         )
 
     msg = EmailMessage()

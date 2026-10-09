@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 load_dotenv(override=True)
 
 from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
+from src.email_address import InvalidEmailAddress  # noqa: E402
 from src.run_lock import SCRAPE_ADVISORY_LOCK_KEY  # noqa: E402
 from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
@@ -4748,7 +4749,10 @@ def tenant_add_user(tenant_slug: str, email: str, name: str | None, role: str) -
         t = t_mod.get_tenant(s, tenant_slug)
         if not t:
             raise click.ClickException(f"Tenant not found: {tenant_slug}")
-        u = t_mod.add_user(s, t.id, email, name=name, role=role)
+        try:
+            u = t_mod.add_user(s, t.id, email, name=name, role=role)
+        except InvalidEmailAddress as refusal:
+            raise click.ClickException(str(refusal)) from None
         click.echo(f"OK: user #{u.id} {u.email} role={u.role}")
 
 
@@ -6968,7 +6972,10 @@ def recipient_add(email: str, name: str | None) -> None:
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        r = watchlist.add_recipient(s, email, name)
+        try:
+            r = watchlist.add_recipient(s, email, name)
+        except InvalidEmailAddress as refusal:
+            raise click.ClickException(str(refusal)) from None
         click.echo(f"OK: {r.email} ({r.name or '—'}) is_active={r.is_active}")
 
 
@@ -7022,7 +7029,10 @@ def recipient_update(email: str, new_email: str | None, name: str | None) -> Non
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        r = watchlist.update_recipient(s, email, new_email=new_email, name=name)
+        try:
+            r = watchlist.update_recipient(s, email, new_email=new_email, name=name)
+        except InvalidEmailAddress as refusal:
+            raise click.ClickException(str(refusal)) from None
         if not r:
             click.echo(f"Not found: {email}")
             return

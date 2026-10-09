@@ -1080,6 +1080,21 @@ class _SmtplibWithoutANetwork(smtplib.SMTP):
         return {}
 
 
+@pytest.fixture
+def no_address_check(monkeypatch):
+    """Отбор записей перед сборкой письма выключен.
+
+    Запись, которая не адрес, до пакета `email` больше не доходит: её отсеивает
+    `notifier._addresses_only` (`tests/test_email_address.py`). Тесты ниже держат
+    слой под ним — если правило когда-нибудь пропустит запись, на которой
+    сборка падает, адреса соседей наружу всё равно не выйдут. С включённым
+    отбором они проходили бы, ничего не проверив.
+    """
+    monkeypatch.setattr(
+        notifier, "_addresses_only", lambda source, records: [record for _, record in records]
+    )
+
+
 @pytest.mark.parametrize(
     "record",
     [
@@ -1092,10 +1107,12 @@ class _SmtplibWithoutANetwork(smtplib.SMTP):
         "я",
     ],
 )
-def test_a_broken_recipient_record_never_brings_the_others_out(smtp_env, monkeypatch, record):
-    """`recipient add` адрес не проверяет, а письмо на весь список одно: кривая
-    запись ломает его сборку, и что об этом скажет пакет `email`, зависит от
-    версии Python. Что бы ни сказал — адреса соседей наружу не выходят.
+def test_a_broken_recipient_record_never_brings_the_others_out(
+    smtp_env, monkeypatch, no_address_check, record
+):
+    """Письмо на весь список одно: кривая запись ломает его сборку, и что об
+    этом скажет пакет `email`, зависит от версии Python. Что бы ни сказал —
+    адреса соседей наружу не выходят.
 
     На 3.12.3 адреса несёт только ошибка от первой записи (её отдельно держит
     тест ниже); остальные — на случай версии, где с адресами выйдет другая."""
@@ -1109,7 +1126,9 @@ def test_a_broken_recipient_record_never_brings_the_others_out(smtp_env, monkeyp
         assert failure.__cause__ is None and failure.__context__ is None
 
 
-def test_a_real_assembly_error_keeps_the_neighbours_addresses_inside(smtp_env, monkeypatch):
+def test_a_real_assembly_error_keeps_the_neighbours_addresses_inside(
+    smtp_env, monkeypatch, no_address_check
+):
     """Не выдуманная ошибка: на Python 3.12.3 (он стоит на проде) запись
     `[\\,группа:` даёт `HeaderWriteError` с заголовком `To:` целиком. Тест выше
     на остальных записях проходит и без очистки — различает случаи этот."""
@@ -1345,7 +1364,9 @@ def test_health_check_output_carries_no_address(
     monkeypatch.setattr(storage, "init_db", lambda: None)
     monkeypatch.setattr(storage, "make_session", lambda: lambda: nullcontext(object()))
     monkeypatch.setattr(health, "check_health", lambda *args, **kwargs: report)
-    monkeypatch.setattr(notifier, "resolve_recipients", lambda explicit=None: [ADDRESS])
+    monkeypatch.setattr(
+        notifier, "_recipient_records", lambda explicit=None: ("recipients", [(1, ADDRESS)])
+    )
     fake = (
         _smtp_that_fails_with(smtp_error())
         if smtp_error

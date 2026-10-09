@@ -1120,16 +1120,18 @@ if _onb_status.state != "ready" and not st.session_state.get("onboarding_dismiss
                 email = st.text_input("Email", placeholder="you@pharmonline.az")
                 name = st.text_input("Имя (опц.)", placeholder="Rashad")
                 if st.form_submit_button("Добавить", type="primary"):
-                    if "@" in email:
-                        from src import watchlist as wl_
+                    from src import watchlist as wl_
+                    from src.email_address import InvalidEmailAddress
 
+                    try:
                         with get_session() as s_:
                             wl_.add_recipient(s_, email, name=name or None)
+                    except InvalidEmailAddress as refusal:
+                        st.error(str(refusal))
+                    else:
                         reset_caches()
                         st.success("✓ Готово!")
                         st.rerun()
-                    else:
-                        st.error("Введи валидный email")
     st.divider()
 
 (
@@ -2663,12 +2665,13 @@ with tab_recipients:
                 new_email = st.text_input("Email")
                 new_name = st.text_input("Имя (опц.)")
                 if st.form_submit_button("Добавить", type="primary"):
-                    if not new_email.strip():
-                        st.error("Email обязателен")
-                    elif "@" not in new_email:
-                        st.error("Похоже это не email")
-                    else:
+                    from src.email_address import InvalidEmailAddress
+
+                    try:
                         r = wl.add_recipient(s, new_email, new_name or None)
+                    except InvalidEmailAddress as refusal:
+                        st.error(str(refusal))
+                    else:
                         reset_caches()
                         st.success(f"Добавлено: {r.email}")
                         st.rerun()

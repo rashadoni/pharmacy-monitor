@@ -80,6 +80,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
+from pydantic_core import PydanticCustomError
 from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.orm import Session, aliased, selectinload
 
@@ -88,6 +89,7 @@ from src import inventory as inv_mod
 from src import storage, tenants
 from src._time import utcnow
 from src.category_taxonomy import classify_source_category, source_category_labels
+from src.email_address import InvalidEmailAddress, normalize_address
 from src.normalize import pack_unit_count
 from src.product_policy import POLICY_PRODUCT_FIELDS
 
@@ -390,7 +392,9 @@ def require_user(
             from src import tenants as _tenants
 
             t = _tenants.get_or_create_default(db)
-            user = _tenants.add_user(db, t.id, "admin@local", name="Admin", role="admin")
+            user = _tenants.add_user(
+                db, t.id, _tenants.BOOTSTRAP_ADMIN_EMAIL, name="Admin", role="admin"
+            )
             db.commit()
         request.state.tenant_id = user.tenant_id
         request.state.user_id = user.id
@@ -467,16 +471,28 @@ class RoiRecommendationsOut(BaseModel):
     provenance: RoiStatusOut
 
 
+def _address_field(value: str) -> str:
+    """Поле с почтовым адресом: то же правило, что у CLI (`src/email_address.py`).
+
+    Отказ уходит в ответ 422 как `type: "email_address"`, причина словами — в
+    `msg`, её код — в `ctx.problem`: по коду страница «Пользователи» берёт
+    перевод.
+    """
+    try:
+        return normalize_address(value)
+    except InvalidEmailAddress as refusal:
+        raise PydanticCustomError(
+            "email_address", "{reason}", {"reason": str(refusal), "problem": refusal.problem}
+        ) from None
+
+
 class AuthRequestIn(BaseModel):
     email: str
 
     @field_validator("email")
     @classmethod
     def _validate_email(cls, v: str) -> str:
-        v = v.strip().lower()
-        if "@" not in v or "." not in v.split("@")[-1] or len(v) > 255:
-            raise ValueError("invalid email")
-        return v
+        return _address_field(v)
 
 
 class PasswordLoginIn(BaseModel):
@@ -1125,7 +1141,9 @@ def auth_login(
             from src import tenants as _tenants
 
             t = _tenants.get_or_create_default(db)
-            user = _tenants.add_user(db, t.id, "admin@local", name="Admin", role="admin")
+            user = _tenants.add_user(
+                db, t.id, _tenants.BOOTSTRAP_ADMIN_EMAIL, name="Admin", role="admin"
+            )
             db.commit()
         pw_to_check = user.password_hash or env_pw_hash
     else:
@@ -1750,10 +1768,7 @@ class RecipientCreate(BaseModel):
     @field_validator("email")
     @classmethod
     def _email(cls, v: str) -> str:
-        v = v.strip().lower()
-        if "@" not in v or len(v) < 5:
-            raise ValueError("invalid email")
-        return v
+        return _address_field(v)
 
     @field_validator("role")
     @classmethod
