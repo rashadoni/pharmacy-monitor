@@ -56,7 +56,7 @@ git-истории до её переписывания. Всё, что здес
 перевести и их на общую функцию. Другие чтения файла из workflow
 (`deploy.yml`, `category-hotfix-deploy.yml`, `infra/scripts/backup.sh`) берут по
 одной переменной и кавычек не снимают — правило записи для них в
-`.env.example`.
+`.env.example`; `health-pharmonline-hotfix-deploy.yml` читает файл из Python.
 
 **Журнал шага GitHub Actions тоже публичный** — его читает любой пользователь
 GitHub, хранится он 90 дней. Всё, что печатает команда, запущенная из workflow,

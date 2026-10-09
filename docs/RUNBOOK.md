@@ -418,7 +418,7 @@ CR не снимают — выкладка и бэкап получат зна�
 `accepted`:
 
 ```bash
-{ echo 'set -euo pipefail'; sed -n '/^ *load_environment_file() {$/,/^ *}$/p' .github/workflows/probe-pharmonline-decodo-json.yml; echo 'load_environment_file /etc/pharmacy-monitor/env && echo accepted'; } | ssh root@13.140.186.143 'runuser -u pm -- bash -s'
+{ echo 'set -euo pipefail'; sed -n '/^ *load_environment_file() {$/,/^ *}$/p' .github/workflows/probe-pharmonline-decodo-json.yml; echo 'load_environment_file /etc/pharmacy-monitor/env'; echo 'echo accepted'; } | ssh root@13.140.186.143 'runuser -u pm -- bash -s'
 ```
 
 Ответ `load_environment_file: command not found` значит, что функции в этом
