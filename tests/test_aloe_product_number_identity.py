@@ -47,8 +47,8 @@ from src.scrapers.aloe import (
 from src.scrapers.base import RouteStatus, ScrapedProduct, ScrapeResult
 
 _FIXTURES = Path(__file__).parent / "fixtures"
-# Миграция включает правило на проде. Пока владелец не сказал «давай», она
-# лежит в `migrations/pending/`, и Alembic её не видит.
+# Миграция включает правило на проде. До слова владельца она лежала в
+# `migrations/pending/`, мимо цепочки Alembic.
 _MIGRATION = next(
     path
     for folder in ("versions", "pending")
