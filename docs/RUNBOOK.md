@@ -180,7 +180,7 @@ sudo journalctl -u pharmacy-monitor-run -f
 |---|---|
 | `smtp_send recipients=N`, следом `smtp_sent_ok` | Почтовый сервер письмо принял. Дальше — не у нас: доставку смотреть в кабинете Resend |
 | `…_failed user_id=… error_type=…` | Не ушло; причина — в `error_type`, таблица ниже. События: `email_batch_failed` (письмо о прогоне и письмо админу с тика), `digest_email_failed`, `login_link_email_failed`, `email_dispatch_failed`, `alert_email_failed`, `error_email_failed`. Строки `smtp_send` перед ним может и не быть: до разговора с сервером дело не дошло |
-| `email_skipped_no_smtp` | В окружении нет `SMTP_HOST` — обычно ручной запуск без загруженного env |
+| `email_skipped_no_smtp` | В окружении нет `SMTP_HOST` — обычно ручной запуск без загруженного env. Рассылка о прогоне следом называет получателя: `email_batch_failed user_id=…` без `error_type` |
 | Нет ни `smtp_send`, ни `…_failed` | Письмо и не собирались слать: нет событий, порог важности получателя, включённый `daily_digest`, запуск с `--no-alerts` |
 
 **2. Что значит `error_type`.** Рядом с ним — числа, по которым случаи
@@ -478,8 +478,9 @@ alerts_dispatched_batch events=12 emails=2 telegram=0 failed=1 undelivered=3
 | `failed` | Сколько отправок не состоялось — отказ отправителя или ошибка. Одно письмо или сообщение — одна отправка, сколько бы событий в нём ни было |
 | `undelivered` | Сколько событий кому-то слали, и они не дошли ни по одному каналу |
 
-Строки нет вовсе — рассылка упала целиком (`alert_dispatch_failed`) или слать
-было нечего.
+Строки нет вовсе — слать было нечего либо рассылка оборвалась на ошибке
+(`alert_dispatch_failed`); тем, до кого очередь дошла раньше обрыва, сообщения
+уже ушли.
 
 Кому не ушло — строкой выше: `telegram_batch_failed user_id=… events=N` или
 `email_batch_failed user_id=… events=N`. `events` — сколько событий было в
