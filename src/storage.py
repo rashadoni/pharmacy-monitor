@@ -15,7 +15,6 @@ import re
 import threading
 from datetime import datetime
 from src._time import utcnow
-from src.logging_setup import without_addresses
 from pathlib import Path
 
 from sqlalchemy import (
@@ -61,32 +60,72 @@ def _env_int(name: str, default: int, *, min_value: int) -> int:
     return max(min_value, value)
 
 
-# Класс ошибки в начале текста: «IntegrityError: …», «site_fatal: …».
-_ERROR_TEXT_PREFIX = re.compile(r"[A-Za-z_][\w.]*(?=: )")
+# Вместо текста ошибки, который хранить нельзя. Правило и пометка — те же, что у
+# `logging_setup.without_addresses`; здесь они повторены, а не взяты импортом:
+# этот модуль ни от чего в `src` не зависит, и файл, выложенный отдельно от
+# остальных, обязан загрузиться. Что копии не разошлись, следит тест.
+_ERROR_TEXT_WITHHELD = "<текст скрыт>"
+# Класс ошибки в начале текста: «IntegrityError: …», «RunQualityFailure: …».
+# Любое другое слово перед двоеточием началом не считается: им бывает и имя
+# ящика («ivan.petrov: mailbox … is full»).
+_ERROR_CLASS = re.compile(
+    r"(?:[A-Z][A-Za-z0-9_]*)?(?:Error|Exception|Failure|Warning|Status|Timeout)(?=: )"
+)
+# Так к тексту дописывают заметки: «… | reaped: …», «… | post-persist: …».
+_ERROR_NOTE_SEPARATOR = " | "
 
 
-def stored_error_text(text: str | None) -> str | None:
-    """Текст ошибки, как он ляжет в `error_message`: адреса в нём не бывает.
+def stored_error_text(text: object) -> str | None:
+    """Текст ошибки, как он ляжет в базу: адреса в нём не бывает.
 
-    Поле читают не только операторы: страницу прогонов видит сотрудник клиента,
-    текст идёт в письмо о здоровье, в ответ бота и в журнал шага workflow, а
+    Текст читают не только операторы: страницу прогонов видит сотрудник клиента,
+    он же идёт в письмо о здоровье, в ответ бота и в журнал шага workflow, а
     вместе с базой — в бэкап. Ошибка же несёт что угодно: ошибка базы кладёт в
     текст параметры запроса. Поэтому чистится он здесь, при записи, а не в
     каждом месте показа (решение владельца 2026-10-09): есть «@» — от текста
     остаётся класс ошибки, если текст с него начинается, и `<текст скрыт>`.
-    Исходный текст такой ошибки искать в журнале сервера, событие `run_failed`.
+    Заметки, дописанные через « | », чистятся по одной: заметка с «@» не
+    стирает записанную до неё причину. Где искать исходный текст —
+    docs/RUNBOOK.md «Текст ошибки прогона».
 
-    Правило то же, что у вывода команд, — `logging_setup.without_addresses`, и
-    видит оно только «@»: Telegram-идентификатор (число) в параметрах запроса
-    пройдёт. Запросы самого сбора таких параметров не содержат.
+    Видит правило только «@»: Telegram-идентификатор (число) в параметрах
+    запроса пройдёт. Запросы самого сбора таких параметров не содержат.
     """
     if text is None:
         return None
-    shown = without_addresses(text)
-    if shown == text:
+    if not isinstance(text, str):
+        text = str(text)
+    if "@" not in text:
         return text
-    named = _ERROR_TEXT_PREFIX.match(text)
-    return f"{named.group()}: {shown}" if named else shown
+    parts = []
+    for part in text.split(_ERROR_NOTE_SEPARATOR):
+        if "@" in part:
+            named = _ERROR_CLASS.match(part)
+            part = f"{named.group()}: {_ERROR_TEXT_WITHHELD}" if named else _ERROR_TEXT_WITHHELD
+        parts.append(part)
+    return _ERROR_NOTE_SEPARATOR.join(parts)
+
+
+def stored_error_details(value):
+    """То же правило для JSON с подробностями прогона: каждая строка внутри.
+
+    Тексты ошибок лежат в `run_quality` не в одном месте — список по сайтам,
+    ошибка каждой категории, причина незавершённого маршрута, заметка о
+    восстановлении, — и собирают их в разных функциях. Правится на месте и
+    возвращается тот же объект: код, записав словарь в колонку, продолжает его
+    читать (`run_quality_message`) и дописывать. Ключи не трогаются.
+    """
+    if isinstance(value, str):
+        return stored_error_text(value)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = stored_error_details(item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = stored_error_details(item)
+    elif isinstance(value, tuple):
+        return tuple(stored_error_details(item) for item in value)
+    return value
 
 
 class Run(Base):
@@ -99,7 +138,8 @@ class Run(Base):
     status: Mapped[str] = mapped_column(
         String(20), default="running"
     )  # running/ok/degraded/failed
-    # Пишется через `stored_error_text` — валидатор в конце класса.
+    # Этот текст, причина недоверия каталогу и `run_quality` пишутся без адресов —
+    # валидаторы в конце класса.
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     products_scraped: Mapped[int] = mapped_column(Integer, default=0)
     sites_completed: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -129,9 +169,13 @@ class Run(Base):
         back_populates="run", foreign_keys="PriceSnapshot.run_id"
     )
 
-    @validates("error_message")
-    def _error_message_carries_no_address(self, _key: str, text: str | None) -> str | None:
+    @validates("error_message", "catalog_verification_reason")
+    def _error_text_carries_no_address(self, _key: str, text: object) -> str | None:
         return stored_error_text(text)
+
+    @validates("run_quality")
+    def _error_details_carry_no_address(self, _key: str, quality):
+        return stored_error_details(quality)
 
 
 def run_is_financially_eligible(run: Run | None) -> bool:
@@ -225,7 +269,7 @@ class ScrapeRequest(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     @validates("error_message")
-    def _error_message_carries_no_address(self, _key: str, text: str | None) -> str | None:
+    def _error_text_carries_no_address(self, _key: str, text: object) -> str | None:
         return stored_error_text(text)
 
 
