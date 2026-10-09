@@ -4144,7 +4144,7 @@ def health_check_cmd(
 ) -> None:
     """Проверить здоровье системы: stale/failed/empty/site-drop. Exit-code 0=ok, 1=warning, 2=critical."""
     from src.health import check_health
-    from src.logging_setup import mask_addresses
+    from src.logging_setup import without_addresses
 
     storage.init_db()
     Session = storage.make_session()
@@ -4162,7 +4162,7 @@ def health_check_cmd(
         for i in report.issues:
             # click печатает мимо маски журнала, а в сообщении бывает текст ошибки
             # прогона как он записан в базу (`runs.error_message`).
-            click.echo(f"  [{i.severity}] {i.code}: {mask_addresses(i.message)}")
+            click.echo(f"  [{i.severity}] {i.code}: {without_addresses(i.message)}")
 
     # Do not return early on quiet+OK: an active incident still needs one
     # recovery email and an atomic transition to the healthy state.
@@ -4188,7 +4188,7 @@ def health_check_cmd(
         except Exception as e:
             # Тоже мимо маски. Сбой отправки приходит из `send_email` уже без
             # адреса; остальное в этом `try` не чистил никто.
-            reason = mask_addresses(str(e))
+            reason = without_addresses(str(e))
             click.echo(f"⚠️ Не удалось отправить health email: {reason}", err=True)
 
     if quiet_healthy:
@@ -5673,9 +5673,9 @@ def run_cmd(
             session.commit()
             log.exception("run_failed", run_id=run_id)
             # click печатает этот текст сам, мимо маски журнала.
-            from src.logging_setup import mask_addresses
+            from src.logging_setup import without_addresses
 
-            raise click.ClickException(mask_addresses(str(e)))
+            raise click.ClickException(without_addresses(str(e)))
 
 
 @cli.command("scrape")

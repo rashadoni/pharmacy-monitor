@@ -21,16 +21,12 @@ from email.message import EmailMessage
 import structlog
 
 from src import storage, watchlist
-from src.logging_setup import mask_addresses
+from src.logging_setup import TEXT_WITHHELD, mask_addresses, without_addresses
 
 log = structlog.get_logger()
 
 
 _SMTP_STATUS_RE = re.compile(r"[245]\.\d{1,3}\.\d{1,3}(?![\d.])")
-
-
-# Вместо текста ошибки, который показывать нельзя.
-_TEXT_WITHHELD = "<текст скрыт>"
 
 
 class EmailSendError(Exception):
@@ -40,9 +36,13 @@ class EmailSendError(Exception):
     Текст ошибки уходит дальше, чем её ловят: в трассировку `run_failed`, в
     строку «Error: …» от click, в `runs.error_message`, в вывод команды, которая
     сбой не ловит вовсе (`report --send`). Поэтому адреса в нём нет: класс
-    исходной ошибки, её текст без адресов и строка этого модуля, на которой она
-    возникла. Самой исходной ошибки при этой нет — ни причиной, ни контекстом,
-    — и её трассировки тоже: вместо неё эта строка.
+    исходной ошибки, её текст (если в нём не было «@») и строка этого модуля,
+    на которой она возникла; у отказа сервера — класс и коды ответа. Самой
+    исходной ошибки при этой нет — ни причиной, ни контекстом, — и её
+    трассировки тоже.
+
+    Чего это не закрывает: трассировку с локальными переменными кадров
+    (`capture_locals`, rich, Sentry) — в кадре `send_email` лежит `to`.
 
     `error_type` — класс исходной ошибки, `errno` — её код, если она сетевая.
     """
@@ -53,14 +53,15 @@ class EmailSendError(Exception):
         super().__init__(text or error_type)
 
 
-class EmailDeliveryError(EmailSendError, smtplib.SMTPException):
+class EmailDeliveryError(EmailSendError):
     """Почтовый сервер не принял письмо.
 
     Текст ошибки — класс исходной ошибки smtplib и коды ответа, без самого
     ответа сервера: smtplib кладёт в текст своих ошибок адрес получателя. Ответ
-    сервера с вырезанными адресами лежит в `server_reply` — его печатает только
-    `notify test`, которую оператор запускает сам: сервер может назвать ящик и
-    без «@», и такое маска не узнает.
+    сервера лежит в `server_reply`, и он только пропущен через маску: адрес
+    привычной записи из него вырезан, а имя рядом с адресом, адрес с именем в
+    кавычках и ящик, названный без «@», остаются. Поэтому его печатает одна
+    `notify test`, которую оператор запускает сам, а в журнал он не идёт.
 
     `smtp_status` — расширенный код из начала ответа («5.1.1»): 550 сервер
     ставит на десяток разных причин, а различает их этим кодом.
@@ -95,16 +96,14 @@ def _delivery_failure(exc: smtplib.SMTPException) -> EmailDeliveryError:
 def _text_without_addresses(exc: Exception) -> str:
     """Текст ошибки, каким его можно показать.
 
-    Маска вырезает адрес привычной записи. Чего она не узнала — имя в кавычках,
-    домен без имени, — выдаёт оставшийся «@»: такой текст не показывается вовсе.
-    Ошибки пакета `email` несут в тексте сам заголовок письма: `HeaderWriteError`
-    печатает `To:` целиком, со всеми получателями, а нелатинская часть записана
-    в нём base64 — мимо любой маски. Их текст не показывается никогда.
+    Текст с «@» не показывается вовсе (`without_addresses`). Ошибки пакета
+    `email` несут в тексте сам заголовок письма: `HeaderWriteError` печатает
+    `To:` целиком, со всеми получателями, а нелатинская часть записана в нём
+    base64, без единого «@». Их текст не показывается никогда.
     """
     if isinstance(exc, email.errors.MessageError):
-        return _TEXT_WITHHELD
-    text = mask_addresses(str(exc))
-    return _TEXT_WITHHELD if "@" in text else text
+        return TEXT_WITHHELD
+    return without_addresses(str(exc))
 
 
 def _raised_at(exc: BaseException) -> str:
@@ -260,9 +259,13 @@ def send_email(
             failure = _send_failure(exc)
         except Exception:  # у ошибки не удалось взять даже текст
             failure = EmailSendError(type(exc).__name__)
+    except BaseException as interrupt:
+        # Прерывание (KeyboardInterrupt, SystemExit) проходит как есть, но без
+        # ошибки, при обработке которой оно пришло: в её тексте адрес.
+        interrupt.__context__ = None
+        raise
     # Вне except: у новой ошибки нет ни причины, ни контекста, и трассировка не
-    # покажет исходную — с адресом. Прерывание (KeyboardInterrupt, SystemExit)
-    # проходит как есть.
+    # покажет исходную — с адресом.
     raise failure
 
 

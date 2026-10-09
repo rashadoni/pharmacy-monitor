@@ -8,14 +8,15 @@
 Слоёв три, и каждый проверяется отдельно:
 
 1. вызов журнала не передаёт адрес. Проверяется дважды: чтением кода всего
-   `src/` и прямым вызовом каждого почтового пути — в том числе со сбоем
-   отправки: о нём в журнал идут класс ошибки и коды, не её текст;
+   `src/` и прямым вызовом почтовых путей, у которых есть свой обработчик
+   сбоя: о сбое в журнал идут класс ошибки и коды, не её текст, и печатью он
+   тоже не выводится;
 2. что бы ни сломалось при отправке, ошибка выходит из `notifier.send_email`
-   уже без адреса — в тексте, в `repr`, в трассировке, в причине и контексте.
-   Куда её запишут дальше, уже не важно: в трассировку `run_failed`, в строку
-   «Error: …» от click, в вывод команды, которая сбой не ловит вовсе. Стоит это
-   на том, что к почтовому серверу ходит только `send_email`, — проверяется
-   тоже;
+   уже без адреса — в тексте, в `repr`, в атрибутах, в трассировке, в причине
+   и контексте. Куда её запишут дальше, уже не важно: в трассировку
+   `run_failed`, в строку «Error: …» от click, в вывод команды, которая сбой не
+   ловит вовсе. Стоит это на том, что к почтовому серверу ходит только
+   `send_email`, — проверяется тоже;
 3. вывод журнала CLI вырезает адрес из готовой строки — и у structlog, и у
    stdlib `logging`, которым пишут сторонние библиотеки.
 
@@ -27,8 +28,15 @@
 узнавало вывод по форме кода — журнал, печать, трассировка, новая ошибка с тем
 же текстом, обёртка над отправкой — и за три захода так и не сошлось, а до
 команды, которая сбой не ловит, не дотягивалось вовсе. Текст чистится там, где
-он появляется (слой 2); обработчики каждого почтового пути проверяет прямой
-вызов (слой 1).
+он появляется (слой 2); обработчики почтовых путей проверяет прямой вызов
+(слой 1).
+
+Чего после этого не ловит ничто: новый обработчик, в `try` которого рядом с
+отправкой стоит ещё что-то (запись в базу), а текст пойманной ошибки он
+печатает через `click.echo` как есть. Ошибка отправки туда придёт чистой, а
+ошибка базы — с параметрами запроса. Правило на это одно, и держит его
+человек: мимо журнала текст чужой ошибки печатают через
+`logging_setup.without_addresses`.
 
 `structlog.testing.capture_logs()` не видит событий внутри `CliRunner`, поэтому
 почтовые пути вызываются напрямую.
@@ -46,13 +54,13 @@ import smtplib
 import socket
 import time
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 
 import click
 import pytest
 import structlog
 from click.testing import CliRunner
-from contextlib import nullcontext
 from sqlalchemy.orm import sessionmaker
 from structlog.testing import capture_logs
 
@@ -516,14 +524,18 @@ def _refused(*args, **kwargs):
 
 
 @pytest.fixture
-def session(monkeypatch, db_session):
+def session(monkeypatch, db_session, capsys):
     engine = db_session.get_bind()
     Session = sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(storage, "make_session", lambda *a, **kw: Session)
     monkeypatch.setenv("PHARMACY_PUBLIC_URL", "https://example.com")
     monkeypatch.setattr(notifier, "send_email", _refused)
     monkeypatch.setattr(notifier, "send_telegram_message", _refused)
-    return db_session
+    yield db_session
+    # Журнал каждый тест смотрит сам; здесь — что обработчик сбоя не вывел текст
+    # ошибки печатью, мимо журнала.
+    printed = capsys.readouterr()
+    assert "@" not in printed.out + printed.err, printed
 
 
 @pytest.fixture
@@ -670,7 +682,7 @@ def cli_logging(monkeypatch, tmp_path):
 
 
 def _smtp_that_fails_with(
-    error: BaseException, at: str = "send_message", closing: Exception | None = None
+    error: BaseException, at: str = "send_message", closing: BaseException | None = None
 ):
     """Почтовый сервер, который падает с `error` на шаге `at`, а при закрытии
     соединения — ещё и с `closing`."""
@@ -704,9 +716,10 @@ def _smtp_that_fails_with(
 
 
 def _everything_printed(failure: BaseException) -> str:
-    """Всё, что из ошибки может попасть в вывод: текст, repr и трассировка —
-    вместе с причиной и контекстом, если они есть."""
-    return str(failure) + repr(failure) + "".join(traceback.format_exception(failure))
+    """Всё, что из ошибки может попасть в вывод: текст, repr, аргументы,
+    атрибуты и трассировка — вместе с причиной и контекстом, если они есть."""
+    shown = [str(failure), repr(failure), repr(failure.args), repr(vars(failure))]
+    return "".join(shown + traceback.format_exception(failure))
 
 
 # Строка `notifier.py`, на которой письмо остановилось, — в конце текста ошибки.
@@ -802,31 +815,44 @@ def test_smtp_refusal_leaves_send_email_without_an_address(
     ("error", "at", "shown", "fields"),
     [
         # Пакет `email` кладёт в текст ошибки сам заголовок письма — со всеми
-        # получателями разом. Такой текст не показывается вовсе.
+        # получателями разом (`HeaderWriteError`: «folded header contains
+        # newline: b'To: …'»). Текст таких ошибок не показывается никогда —
+        # и тогда, когда «@» в нём нет: нелатинская часть заголовка записана
+        # base64, а разбор называет ящик без домена.
         (
-            email.errors.HeaderWriteError(
-                f"folded header contains newline: b'To: {ADDRESS},\\r\\n second@client.example'"
-            ),
+            email.errors.HeaderParseError(f"cannot fold b'To: {ADDRESS},\\r\\n {ADDRESS}'"),
             "send_message",
-            "HeaderWriteError: <текст скрыт>",
-            {"error_type": "HeaderWriteError"},
+            "HeaderParseError: <текст скрыт>",
+            {"error_type": "HeaderParseError"},
         ),
-        # Адрес привычной записи вырезает маска; остальной текст остаётся оператору.
+        (
+            email.errors.HeaderParseError("expected atom but found '=?utf-8?b?0LjQstCw0L0=?='"),
+            "send_message",
+            "HeaderParseError: <текст скрыт>",
+            {"error_type": "HeaderParseError"},
+        ),
+        # Текст с «@» не показывается целиком: маска оставила бы от него начало
+        # имени, имя рядом с адресом, а адрес с именем в кавычках — как есть.
         (
             RuntimeError(f"relay refused {ADDRESS}: over quota"),
             "send_message",
-            "RuntimeError: relay refused <address>: over quota",
+            "RuntimeError: <текст скрыт>",
             {"error_type": "RuntimeError"},
         ),
-        # Чего маска не узнала, выдаёт оставшийся «@»: текст скрыт целиком.
         (
-            ValueError('cannot fold "viewer name"@client.example'),
+            RuntimeError("relay refused o'brien@client.example"),
+            "send_message",
+            "RuntimeError: <текст скрыт>",
+            {"error_type": "RuntimeError"},
+        ),
+        (
+            ValueError(f"cannot fold Ivan Petrov <{ADDRESS}>"),
             "send_message",
             "ValueError: <текст скрыт>",
             {"error_type": "ValueError"},
         ),
         (
-            ValueError("no mailbox before '@client.example'"),
+            ValueError('cannot fold "viewer name"@client.example'),
             "send_message",
             "ValueError: <текст скрыт>",
             {"error_type": "ValueError"},
@@ -932,39 +958,128 @@ def test_a_missing_setting_leaves_send_email_as_a_send_error(smtp_env, monkeypat
     assert notifier.delivery_error_fields(raised.value) == {"error_type": "KeyError"}
 
 
-def test_an_interrupt_passes_through_send_email(smtp_env, monkeypatch):
-    monkeypatch.setattr("smtplib.SMTP", _smtp_that_fails_with(KeyboardInterrupt()))
-    with pytest.raises(KeyboardInterrupt):
+def test_an_interrupt_passes_through_send_email_without_the_refusal(smtp_env, monkeypatch):
+    """Прерывание — не сбой отправки, оно проходит как есть. Но пришедшее при
+    закрытии соединения после отказа несёт отказ своим контекстом."""
+    refusal = smtplib.SMTPRecipientsRefused({ADDRESS: (550, SMTP_REPLY.encode())})
+    fake = _smtp_that_fails_with(refusal, closing=KeyboardInterrupt())
+    monkeypatch.setattr("smtplib.SMTP", fake)
+
+    # Тест не слеп: под `send_email` адрес в трассировке прерывания есть.
+    with pytest.raises(KeyboardInterrupt) as raw:
+        notifier._send_email("Тема", "<p>x</p>", None, [ADDRESS])
+    assert ADDRESS in "".join(traceback.format_exception(raw.value))
+
+    with pytest.raises(KeyboardInterrupt) as raised:
         notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS])
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert "@" not in _everything_printed(raised.value)
+
+
+class _SmtplibWithoutANetwork(smtplib.SMTP):
+    """Настоящий smtplib, у которого отнята только сеть: письмо собирает и
+    укладывает в байты пакет `email`, как при настоящей отправке."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()  # без адреса сервера smtplib не соединяется
+
+    def __exit__(self, *args):
+        return False
+
+    def starttls(self, *args, **kwargs):
+        pass
+
+    def login(self, *args, **kwargs):
+        pass
+
+    def ehlo_or_helo_if_needed(self):
+        pass
+
+    def has_extn(self, name):
+        return False
+
+    def sendmail(self, *args, **kwargs):
+        return {}
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        # На Python 3.12.3 (он стоит на проде) эта запись даёт `HeaderWriteError`
+        # с заголовком `To:` целиком — вместе с адресами двух соседей по списку.
+        "[\\,группа:",
+        ":",
+        ".",
+        "=?utf-8?q?=0A",
+        "я",
+        '"viewer name"@client.example',
+        f"Иван Петров <{ADDRESS}>",
+    ],
+)
+def test_a_broken_recipient_record_never_brings_the_others_out(smtp_env, monkeypatch, record):
+    """`recipient add` адрес не проверяет, а письмо на весь список одно: кривая
+    запись ломает его сборку, и что об этом скажет пакет `email`, зависит от
+    версии Python. Что бы ни сказал — адреса соседей наружу не выходят."""
+    monkeypatch.setattr("smtplib.SMTP", _SmtplibWithoutANetwork)
+    recipients = [ADDRESS, record, "second@client.example"]
+
+    try:
+        assert notifier.send_email("Тема", "<p>x</p>", to=recipients) is True
+    except notifier.EmailSendError as failure:
+        assert "@" not in _everything_printed(failure), _everything_printed(failure)
+        assert failure.__cause__ is None and failure.__context__ is None
+
+
+def test_the_broken_record_samples_do_break_the_letter(smtp_env, monkeypatch):
+    """Тест выше не слеп: хотя бы одна из записей письмо действительно ломает.
+    Нелатинский адрес без поддержки SMTPUTF8 smtplib отвергает на любой версии."""
+    monkeypatch.setattr("smtplib.SMTP", _SmtplibWithoutANetwork)
+    with pytest.raises(notifier.EmailDeliveryError) as raised:
+        notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS, "я", "second@client.example"])
+    assert raised.value.error_type == "SMTPNotSupportedError"
 
 
 _NOTIFIER = "src/notifier.py"
 
 
-def mail_server_bypasses(sources: dict[str, str]) -> list[str]:
-    """Кто ходит к почтовому серверу мимо `send_email`: модуль, кроме `notifier`,
-    который импортирует smtplib, и любое упоминание `_send_email` вне самой
-    `send_email`.
+# Чем smtplib открывает разговор с почтовым сервером.
+_MAIL_SERVER_CLASSES = {"SMTP", "SMTP_SSL", "LMTP"}
 
-    Чего проверка не видит: импорт по строке (`importlib.import_module`), имя,
-    собранное из частей (`getattr(notifier, "_send" + "_email")`), и другой
-    транспорт — HTTP API почтового сервиса, сторонний SMTP-клиент.
+
+def mail_server_bypasses(sources: dict[str, str]) -> list[str]:
+    """Кто ходит к почтовому серверу мимо `send_email`.
+
+    Сверка по именам: smtplib импортирует только `notifier`; класс сервера
+    (`SMTP`, `SMTP_SSL`, `LMTP`) назван только в `_send_email`; сама
+    `_send_email` названа только в `send_email`. Имя строкой (`getattr(notifier,
+    "_send_email")`, `import_module("smtplib")`) — тоже имя.
+
+    Чего проверка не видит: имя, собранное из частей (`"_send" + "_email"`),
+    класс сервера под другим именем (`Server = smtplib.SMTP` в `_send_email` и
+    вызов `Server` вне её) и другой транспорт — HTTP API почтового сервиса,
+    сторонний SMTP-клиент.
     """
     found = []
     for path, source in sources.items():
+        in_notifier = path == _NOTIFIER
         for node, owner in _nodes_with_owner(ast.parse(source)):
+            inside = owner.name if in_notifier and owner is not None else None
             if isinstance(node, ast.Import | ast.ImportFrom):
-                imported = {alias.name for alias in node.names}
-                modules = imported if isinstance(node, ast.Import) else {node.module or ""}
-                bypass = "_send_email" in imported or (
-                    path != _NOTIFIER and any(name.split(".")[0] == "smtplib" for name in modules)
+                named = {alias.name for alias in node.names}
+                if isinstance(node, ast.ImportFrom):
+                    named.add(node.module or "")
+                bypass = "_send_email" in named or (
+                    not in_notifier and any(name.split(".")[0] == "smtplib" for name in named)
                 )
             elif isinstance(node, ast.Name | ast.Attribute):
                 name = node.id if isinstance(node, ast.Name) else node.attr
-                inside_the_entry = (
-                    path == _NOTIFIER and owner is not None and owner.name == "send_email"
+                bypass = (name == "_send_email" and inside != "send_email") or (
+                    name in _MAIL_SERVER_CLASSES and inside != "_send_email"
                 )
-                bypass = name == "_send_email" and not inside_the_entry
+            elif isinstance(node, ast.Constant):
+                bypass = (node.value == "_send_email" and inside != "send_email") or (
+                    node.value == "smtplib"
+                )
             else:
                 continue
             if bypass:
@@ -991,8 +1106,15 @@ def test_only_send_email_talks_to_the_mail_server():
         ("src/digest.py", "notifier._send_email(subject, html, None, None)", 1),
         ("src/digest.py", "from src.notifier import _send_email", 1),
         ("src/digest.py", "send = notifier._send_email", 1),
-        # В самом `notifier` — тоже, если зовёт не `send_email`.
+        ("src/digest.py", "send = getattr(notifier, '_send_email')", 1),
+        # smtplib, взятый у `notifier`, и smtplib, импортированный по строке.
+        ("src/digest.py", "from src.notifier import smtplib", 1),
+        ("src/digest.py", "notifier.smtplib.SMTP(host, 587)", 1),
+        ("src/digest.py", "mail = importlib.import_module('smtplib')", 1),
+        # В самом `notifier` — тоже: второй отправитель рядом с первым.
         (_NOTIFIER, "def resend():\n    return _send_email('x', 'y', None, None)", 1),
+        (_NOTIFIER, "def send_invite():\n    with smtplib.SMTP_SSL(host) as smtp: ...", 1),
+        (_NOTIFIER, "def _send_email():\n    with smtplib.SMTP(host) as smtp: ...", 0),
         (
             _NOTIFIER,
             "import smtplib\n\ndef send_email():\n    return _send_email()\n\n"
@@ -1055,7 +1177,7 @@ def test_run_failure_output_carries_no_address(cli_logging, db_session, monkeypa
 
     assert result.exit_code != 0
     assert "run_failed" in result.output and "Traceback" in result.output
-    assert "Error: {'<address>': (550" in result.output
+    assert "Error: <текст скрыт>" in result.output
     assert "@" not in result.output, result.output
 
 
@@ -1064,7 +1186,7 @@ def _refusal() -> Exception:
 
 
 def _bad_header() -> Exception:
-    return email.errors.HeaderWriteError(f"folded header contains newline: b'To: {ADDRESS}'")
+    return email.errors.HeaderParseError(f"cannot fold b'To: {ADDRESS}'")
 
 
 def _fail_to_record(*args, **kwargs):
@@ -1076,10 +1198,10 @@ def _fail_to_record(*args, **kwargs):
     [
         # Отказ сервера и сбой сборки письма: чисты уже на выходе из `send_email`.
         (_refusal, None, "SMTPRecipientsRefused (SMTP 550 5.1.1)"),
-        (_bad_header, None, "HeaderWriteError: <текст скрыт> (notifier.py:"),
+        (_bad_header, None, "HeaderParseError: <текст скрыт> (notifier.py:"),
         # Письмо ушло, а упало то, что стоит в том же `try` после отправки: эту
         # ошибку `send_email` не видела, её чистит сама команда.
-        (None, _fail_to_record, "cannot record the alert sent to <address>"),
+        (None, _fail_to_record, "<текст скрыт>"),
     ],
 )
 def test_health_check_output_carries_no_address(
@@ -1111,8 +1233,7 @@ def test_health_check_output_carries_no_address(
     )
 
     assert result.exit_code == 2, result.output
-    assert "last_run_failed: Последний прогон #7" in result.output, result.output
-    assert "IntegrityError: <address>" in result.output, result.output
+    assert "[critical] last_run_failed: <текст скрыт>" in result.output, result.output
     assert f"Не удалось отправить health email: {reason}" in result.output, result.output
     assert "@" not in result.output, result.output
 
@@ -1125,7 +1246,7 @@ def test_health_check_output_carries_no_address(
             "email:    FAIL — SMTPRecipientsRefused (SMTP 550 5.1.1): "
             "5.1.1 <<address>>: Recipient address rejected",
         ),
-        (_bad_header, "email:    FAIL — HeaderWriteError: <текст скрыт> (notifier.py:"),
+        (_bad_header, "email:    FAIL — HeaderParseError: <текст скрыт> (notifier.py:"),
     ],
 )
 def test_notify_test_output_carries_no_address(
@@ -1205,6 +1326,25 @@ def test_mask_keeps_a_json_line_valid():
 def test_masking_passes_through_what_a_renderer_did_not_turn_into_text():
     event = {"event": "x", "user": ADDRESS}
     assert logging_setup.masking(lambda *_: event)(None, "info", event) is event
+
+
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [
+        ("timed out", "timed out"),
+        ("", ""),
+        (f"relay refused {ADDRESS}", "<текст скрыт>"),
+        # То, от чего маска оставила бы начало имени, имя рядом с адресом или всё.
+        ("relay refused o'brien@client.example", "<текст скрыт>"),
+        (f"Иван Петров <{ADDRESS}>", "<текст скрыт>"),
+        ('"viewer name"@client.example', "<текст скрыт>"),
+        ("proxy http://user:secret@gate.example.com:7000 refused", "<текст скрыт>"),
+    ],
+)
+def test_text_printed_past_the_log_mask_is_withheld_if_it_has_an_at_sign(text, shown):
+    """Строку журнала выбросить нельзя — на ней маска. Текст, который печатают
+    мимо журнала (`click.echo`, «Error: …», ошибка отправки), можно не показать."""
+    assert logging_setup.without_addresses(text) == shown
 
 
 def _configure_cli(monkeypatch, as_json: bool) -> None:
