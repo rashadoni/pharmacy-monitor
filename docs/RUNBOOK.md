@@ -348,6 +348,8 @@ set -a; source /etc/pharmacy-monitor/env; set +a
    именем. Имя вписывается руками: `scripts/configure-integrations.sh` его не
    спрашивает.
 3. `systemctl restart pharmacy-monitor-api` — настройки страница читает через API.
+   Имя читает и сам бот, при запуске: если env поменяли при работающем боте,
+   перезапустить и его.
 4. Под root: `systemctl enable --now pharmacy-monitor-telegram-bot`. Юнит на
    сервере уже лежит и совпадает с `infra/systemd/pharmacy-monitor-telegram-bot.service`
    (сверено 2026-10-09, состояние — `disabled`). `deploy.yml` юниты не ставит и
@@ -409,7 +411,10 @@ SQL
 Бот не отвечает вовсе — запущен ли он:
 `systemctl status pharmacy-monitor-telegram-bot` и
 `journalctl -u pharmacy-monitor-telegram-bot -n 50`. (Раздел «Telegram бот
-молчит» ниже называет юнит и путь к env времён пилота — они другие.)
+молчит» ниже называет юнит и путь к env времён пилота — они другие.) В группе
+бот молчит на команды из меню (`/today@имя_бота`), а на набранные руками
+отвечает — в `TELEGRAM_BOT_USERNAME` опечатка: команду с чужим именем бот
+пропускает молча, в журнале об этом ничего нет.
 
 **«Слишком много неудачных попыток».** Проходит само, не позже чем через 15
 минут. Снять раньше — стереть строку чата:

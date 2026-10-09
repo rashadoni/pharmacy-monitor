@@ -665,6 +665,16 @@ def test_a_command_for_another_bot_is_left_alone(db_session, clock, replies, mon
     assert _chat_of(db_session, bound) is None
 
 
+def test_a_bot_that_does_not_know_its_name_takes_any_suffix(db_session, replies, monkeypatch):
+    """Имя не задано — отличить чужую команду нечем; бот ведёт себя как раньше."""
+    monkeypatch.delenv("TELEGRAM_BOT_USERNAME", raising=False)
+
+    telegram_bot.handle_update(db_session, _incoming("/help@whatever_bot"))
+
+    assert [chat for chat, _ in replies] == [CHAT]
+    assert "/today" in replies[0][1]
+
+
 def test_a_message_without_a_chat_is_not_answered(db_session, account, clock, replies):
     issued = telegram_binding.issue_code(db_session, account.id)
 
