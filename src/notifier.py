@@ -58,22 +58,33 @@ class EmailDeliveryError(EmailSendError):
 
     Текст ошибки — класс исходной ошибки smtplib и коды ответа, без самого
     ответа сервера: smtplib кладёт в текст своих ошибок адрес получателя. Ответ
-    сервера лежит в `server_reply`, и он только пропущен через маску: адрес
-    привычной записи из него вырезан, а имя рядом с адресом, адрес с именем в
-    кавычках и ящик, названный без «@», остаются. Поэтому его печатает одна
-    `notify test`, которую оператор запускает сам, а в журнал он не идёт.
+    сервера лежит в `server_reply`: адрес привычной записи из него вырезан
+    маской, а если после неё остался «@», ответа нет вовсе. Знака «@» в нём не
+    бывает, но имя рядом с адресом и ящик, названный без «@» («user viewer
+    unknown»), остаются. Поэтому его печатает одна `notify test`, которую
+    оператор запускает сам, а в журнал он не идёт.
 
     `smtp_status` — расширенный код из начала ответа («5.1.1»): 550 сервер
     ставит на десяток разных причин, а различает их этим кодом.
     """
 
-    def __init__(self, error_type: str, smtp_code: int | None = None, server_reply: str = ""):
+    def __init__(
+        self,
+        error_type: str,
+        smtp_code: int | None = None,
+        server_reply: str = "",
+        smtp_status: str | None = None,
+    ):
         self.smtp_code = smtp_code
         self.server_reply = server_reply
-        status = _SMTP_STATUS_RE.match(server_reply)
-        self.smtp_status = status.group(0) if status else None
+        self.smtp_status = smtp_status or _smtp_status(server_reply)
         codes = " ".join(str(code) for code in (smtp_code, self.smtp_status) if code)
         super().__init__(error_type, f"{error_type} (SMTP {codes})" if codes else error_type)
+
+
+def _smtp_status(reply: str) -> str | None:
+    status = _SMTP_STATUS_RE.match(reply)
+    return status.group(0) if status else None
 
 
 def _delivery_failure(exc: smtplib.SMTPException) -> EmailDeliveryError:
@@ -86,10 +97,12 @@ def _delivery_failure(exc: smtplib.SMTPException) -> EmailDeliveryError:
         reply = str(exc)
     if isinstance(reply, bytes):
         reply = reply.decode("utf-8", "replace")
+    reply = str(reply)
     return EmailDeliveryError(
         type(exc).__name__,
         code if isinstance(code, int) else None,
-        mask_addresses(str(reply)),
+        without_addresses(mask_addresses(reply)),
+        _smtp_status(reply),  # до вырезания: скрытый ответ кода уже не несёт
     )
 
 
@@ -253,15 +266,17 @@ def send_email(
     on this function being the only way a send failure gets out.
     """
     try:
-        return _send_email(subject, html_body, attachments, to)
-    except Exception as exc:
         try:
-            failure = _send_failure(exc)
-        except Exception:  # у ошибки не удалось взять даже текст
-            failure = EmailSendError(type(exc).__name__)
+            return _send_email(subject, html_body, attachments, to)
+        except Exception as exc:
+            try:
+                failure = _send_failure(exc)
+            except Exception:  # у ошибки не удалось взять даже текст
+                failure = EmailSendError(type(exc).__name__)
     except BaseException as interrupt:
         # Прерывание (KeyboardInterrupt, SystemExit) проходит как есть, но без
-        # ошибки, при обработке которой оно пришло: в её тексте адрес.
+        # ошибки, при обработке которой оно пришло — будь то закрытие соединения
+        # после отказа или очистка строкой выше: в её тексте адрес.
         interrupt.__context__ = None
         raise
     # Вне except: у новой ошибки нет ни причины, ни контекста, и трассировка не

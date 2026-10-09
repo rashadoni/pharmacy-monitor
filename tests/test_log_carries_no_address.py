@@ -20,9 +20,10 @@
 3. вывод журнала CLI вырезает адрес из готовой строки — и у structlog, и у
    stdlib `logging`, которым пишут сторонние библиотеки.
 
-`click.echo` и `print` идут мимо третьего слоя. Команды, которым печатать адрес
-или ответ почтового сервера разрешено, названы списком ниже, и ни один workflow
-их не запускает: журнал шага Actions публичен.
+`click.echo` и `print` идут мимо третьего слоя, а журнал шага Actions публичен.
+Поэтому из workflow запускают только команды из короткого списка ниже
+(`_RUN_FROM_A_WORKFLOW`), а команды, которым печатать адрес или ответ почтового
+сервера разрешено, названы отдельно — и в тот список попасть не могут.
 
 Правила «обработчик сбоя отправки не выводит текст ошибки» здесь больше нет. Оно
 узнавало вывод по форме кода — журнал, печать, трассировка, новая ошибка с тем
@@ -131,15 +132,23 @@ _PRINTS_AN_ADDRESS_BY_DESIGN = {
     # — больше его не печатает никто, docs/RUNBOOK.md «Email не приходит».
     "notify_test": "notify test",
 }
-# Запрет владельца, а не вывод из кода: команда не печатает ни адрес, ни ответ
-# сервера. Запрещена она была за текст сбоя отправки, который печатала как есть.
-# Теперь он без адреса уже на выходе из `send_email`, а всё, что команда печатает
-# из чужих ошибок — и сбой после отправки, и текст ошибки прогона из базы, —
-# идёт через маску (`test_health_check_output_carries_no_address`). Снять запрет
-# — слово владельца: тогда убрать этот словарь и строки с ним в тестах ниже.
-_NOT_FROM_A_WORKFLOW_BY_THE_OWNERS_WORD = {"health_check_cmd": "health-check"}
 # Функция команды → как её зовут в CLI. Имена сверяются с деревом click.
-_NOT_FROM_A_WORKFLOW = {**_PRINTS_AN_ADDRESS_BY_DESIGN, **_NOT_FROM_A_WORKFLOW_BY_THE_OWNERS_WORD}
+_NOT_FROM_A_WORKFLOW = {**_PRINTS_AN_ADDRESS_BY_DESIGN}
+# Команды CLI, которые запускают из workflow. `click.echo`, `print` и строка
+# «Error: …» идут мимо маски журнала прямо в публичный журнал шага, поэтому
+# внести сюда команду — значит прочитать всё, что она печатает: текст пойманной
+# ошибки — только через `logging_setup.without_addresses`. Кто и что прочитал,
+# пишется в PR словами.
+#
+# `health-check` здесь нет словом владельца: он запретил запускать её из
+# workflow, когда она печатала текст сбоя отправки как есть. Теперь всё, что она
+# печатает из ошибок, идёт через `without_addresses`
+# (`test_health_check_output_carries_no_address`), но внести её — его решение.
+_RUN_FROM_A_WORKFLOW = {
+    # Сбор. Письма о прогоне, трассировку `run_failed` и строку «Error: …»
+    # проверяют тесты этого файла.
+    "run",
+}
 
 _HOW_TO_FIX_AN_ADDRESS = (
     "В журнал и в вывод команды уходит адрес, идентификатор человека или ответ "
@@ -163,22 +172,23 @@ _HOW_TO_FIX_THE_LIST_OF_PRINTERS = (
     "в саму команду."
 )
 _HOW_TO_FIX_A_WORKFLOW = (
-    "В workflow после имени CLI стоит команда, которую оттуда не запускают. "
-    "Журнал шага Actions публичен, а `click.echo` идёт мимо маски журнала: "
-    "команда из `_PRINTS_AN_ADDRESS_BY_DESIGN` печатает адрес или ответ "
-    "почтового сервера. Убери её из workflow; если она нужна именно там — "
-    "сначала пусть печатает `user_id` и `notifier.delivery_error_fields(exc)`, "
-    "затем убери её из списка. `health-check` запрещён отдельно, словом "
-    "владельца (`_NOT_FROM_A_WORKFLOW_BY_THE_OWNERS_WORD`): снять запрет — его "
-    "решение. Проверка читает текст, а не исполняет его: если это строка `echo` "
-    "с описанием, а не запуск, — перефразируй её (комментарии и `name:` шага "
-    "проверка пропускает сама)."
+    "В workflow после имени CLI стоит команда, которой нет в "
+    "`_RUN_FROM_A_WORKFLOW`: {found}. Журнал шага Actions публичен, а "
+    "`click.echo`, `print` и строка «Error: …» идут мимо маски журнала. Прежде "
+    "чем внести команду в список, прочитай всё, что она печатает: адрес — "
+    "только `user_id` или числом, текст пойманной ошибки — только через "
+    "`logging_setup.without_addresses`; что прочитано, напиши в PR. Команду из "
+    "`_PRINTS_AN_ADDRESS_BY_DESIGN` внести нельзя: она печатает адрес или "
+    "ответ почтового сервера по назначению. `health-check` — только по слову "
+    "владельца. Проверка читает текст, а не исполняет его: если это строка "
+    "`echo` с описанием, а не запуск, — перефразируй её (комментарии и `name:` "
+    "шага проверка пропускает сама)."
 )
 _HOW_TO_FIX_A_COMMAND_NAME = (
     "В списке названа команда, которой в CLI нет под этим именем или за ней "
-    "стоит другая функция: {problems}. Под мёртвым именем проверка workflow "
-    "искала бы команду, которой нет, и пропустила бы настоящую. Поправь имя в "
-    "`_PRINTS_AN_ADDRESS_BY_DESIGN` / `_NOT_FROM_A_WORKFLOW_BY_THE_OWNERS_WORD`."
+    "стоит другая функция: {problems}. Под мёртвым именем список описывает не "
+    "ту команду, что запускается на самом деле. Поправь имя в "
+    "`_PRINTS_AN_ADDRESS_BY_DESIGN` / `_RUN_FROM_A_WORKFLOW`."
 )
 _HOW_TO_FIX_A_BYPASS = (
     "К почтовому серверу ходят мимо `notifier.send_email`: {found}. Только она "
@@ -187,7 +197,9 @@ _HOW_TO_FIX_A_BYPASS = (
     "`run_failed`, click и команды, которые сбой не ловят. Шли письмо через "
     "`notifier.send_email`. Если нужен второй вход (другой транспорт, "
     "асинхронная отправка) — он обязан чистить ошибку так же, и проверять его "
-    "надо теми же тестами слоя 2."
+    "надо теми же тестами слоя 2. Если находка — не smtplib, а своё имя `SMTP` "
+    "или `LMTP` (значение перечисления, константа), — переименуй его: проверка "
+    "сверяет имена."
 )
 
 
@@ -309,17 +321,30 @@ def test_the_list_of_commands_that_print_an_address_is_exact():
     )
 
 
-def test_every_excused_command_is_a_cli_command_under_that_name():
-    """Переименование команды не оставляет в списке мёртвое имя."""
+def _cli_callback(name: str) -> str | None:
+    """Функция, которая стоит за командой CLI с таким именем, — или `None`."""
+    command = main.cli
+    for word in name.split():
+        command = command.commands.get(word) if isinstance(command, click.Group) else None
+    if command is None or isinstance(command, click.Group):
+        return None
+    return command.callback.__name__
+
+
+def test_every_listed_command_is_a_cli_command_under_that_name():
+    """Переименование команды не оставляет в списках мёртвое имя."""
     problems = []
     for function, name in _NOT_FROM_A_WORKFLOW.items():
-        command = main.cli
-        for word in name.split():
-            command = command.commands.get(word) if isinstance(command, click.Group) else None
-        if command is None or isinstance(command, click.Group):
+        callback = _cli_callback(name)
+        if callback is None:
             problems.append(f"«{name}» — такой команды нет")
-        elif command.callback.__name__ != function:
-            problems.append(f"«{name}» — это {command.callback.__name__}, а не {function}")
+        elif callback != function:
+            problems.append(f"«{name}» — это {callback}, а не {function}")
+    problems += [
+        f"«{name}» — такой команды нет"
+        for name in sorted(_RUN_FROM_A_WORKFLOW)
+        if _cli_callback(name) is None
+    ]
     assert problems == [], _HOW_TO_FIX_A_COMMAND_NAME.format(problems="; ".join(problems))
 
 
@@ -374,16 +399,7 @@ def cli_commands_run(text: str) -> list[tuple[int, str]]:
     return commands
 
 
-def _skips_the_mask(command: str) -> bool:
-    """Команда из списков исключений — или группа, в которой такая есть: при
-    `recipient "$ACTION"` подкоманду из текста не узнать."""
-    return any(
-        banned == command or banned.startswith(command + " ")
-        for banned in _NOT_FROM_A_WORKFLOW.values()
-    )
-
-
-def test_no_workflow_runs_a_command_whose_output_skips_the_mask():
+def test_a_workflow_runs_only_the_commands_listed_for_it():
     """Журнал шага Actions публичен, а `click.echo` маска не трогает."""
     workflows = sorted((SRC.parent / ".github" / "workflows").glob("*.y*ml"))
     run = {path.name: cli_commands_run(path.read_text(encoding="utf-8")) for path in workflows}
@@ -391,18 +407,31 @@ def test_no_workflow_runs_a_command_whose_output_skips_the_mask():
         f"{name}:{line}: {command}"
         for name, commands in run.items()
         for line, command in commands
-        if _skips_the_mask(command)
+        if command not in _RUN_FROM_A_WORKFLOW
     ]
-    assert found == [], _HOW_TO_FIX_A_WORKFLOW
+    assert found == [], _HOW_TO_FIX_A_WORKFLOW.format(found="; ".join(found))
     # Разбор не ослеп: в workflow, ради которого всё это, — еженедельном сборе
     # pharmonline, который шлёт письма, — он видит запуск сбора.
     weekly = "autonomous-pharmonline-decodo-public-api.yml"
     assert "run" in {command for _, command in run.get(weekly, [])}, (
         f"Проверка не видит запуск сбора в {weekly}. Если файл переименован — "
         "поправь имя здесь; если сбор теперь запускается иначе — научи "
-        "`cli_commands_run` читать новую форму, иначе запрет на команды из "
-        "списков исключений этот workflow не проверяет."
+        "`cli_commands_run` читать новую форму, иначе этот workflow никто не "
+        "проверяет."
     )
+
+
+def test_no_command_that_prints_an_address_is_listed_for_a_workflow():
+    """В том числе группой: при `recipient "$ACTION"` подкоманду из текста не
+    узнать, и разбор назовёт только `recipient`."""
+    printers = set(_NOT_FROM_A_WORKFLOW.values())
+    listed = {
+        allowed
+        for allowed in _RUN_FROM_A_WORKFLOW
+        for printer in printers
+        if printer == allowed or printer.startswith(allowed + " ")
+    }
+    assert listed == set(), _HOW_TO_FIX_A_WORKFLOW.format(found=", ".join(sorted(listed)))
 
 
 @pytest.mark.parametrize(
@@ -446,23 +475,13 @@ def test_the_workflow_check_finds_the_command_behind_options_and_line_breaks(tex
     assert cli_commands_run(text) == commands
 
 
-@pytest.mark.parametrize(
-    ("command", "skips"),
-    [
-        ("recipient list", True),
-        ("tenant issue-token", True),
-        ("notify test", True),
-        ("health-check", True),
-        ("recipient", True),
-        ("notify", True),
-        ("run", False),
-        ("notify digest", False),
-        ("tenant list", False),
-        ("watchlist", False),
-    ],
-)
-def test_the_workflow_check_knows_which_commands_skip_the_mask(command, skips):
-    assert _skips_the_mask(command) is skips
+def test_health_check_is_not_listed_for_a_workflow_without_the_owners_word():
+    assert "health-check" not in _RUN_FROM_A_WORKFLOW, (
+        "`health-check` из workflow запретил запускать владелец. Причина, по "
+        "которой запрет был введён, устранена, но снять его — решение владельца, "
+        "а не правка списка. Есть его слово — убери этот тест и напиши в PR, "
+        "что команда печатает."
+    )
 
 
 @pytest.mark.parametrize(
@@ -516,11 +535,17 @@ def run_cmd():
 # ─── Слой 1б: каждый почтовый путь, вызванный напрямую ───────────────────────
 
 
+# Отказ, как его пишет smtplib, и запись адреса, которую маска журнала не узнаёт.
+_SMTPLIB_TEXT = f"{{'{ADDRESS}': (550, b'{SMTP_REPLY}')}}"
+_PAST_THE_MASK = '"viewer name"@client.example'
+
+
 def _refused(*args, **kwargs):
-    """Сбой отправки с адресом в тексте — как его пишет smtplib. Настоящий
-    `send_email` такую ошибку наружу не выпускает (слой 2); обработчик
-    проверяется так, будто выпустил."""
-    raise RuntimeError(f"{{'{ADDRESS}': (550, b'{SMTP_REPLY}')}}")
+    """Сбой отправки с адресом в тексте. Настоящий `send_email` такую ошибку
+    наружу не выпускает (слой 2); обработчик проверяется так, будто выпустил.
+    Вторая запись адреса — чтобы печать через маску за чистую не сошла: мимо
+    журнала текст ошибки печатают только через `without_addresses`."""
+    raise RuntimeError(f"{_SMTPLIB_TEXT} {_PAST_THE_MASK}")
 
 
 @pytest.fixture
@@ -789,6 +814,15 @@ def test_smtp_send_logs_how_many_recipients_not_who(smtp_env, monkeypatch):
             {"error_type": "SMTPServerDisconnected"},
             "Connection unexpectedly closed",
         ),
+        (
+            # Запись адреса, которую маска не узнала: ответа нет вовсе, а код из
+            # его начала остаётся.
+            smtplib.SMTPDataError(550, f"5.1.1 {_PAST_THE_MASK}: no such user".encode()),
+            "send_message",
+            "SMTPDataError (SMTP 550 5.1.1)",
+            {"error_type": "SMTPDataError", "smtp_code": 550, "smtp_status": "5.1.1"},
+            "<текст скрыт>",
+        ),
     ],
 )
 def test_smtp_refusal_leaves_send_email_without_an_address(
@@ -976,6 +1010,22 @@ def test_an_interrupt_passes_through_send_email_without_the_refusal(smtp_env, mo
     assert "@" not in _everything_printed(raised.value)
 
 
+def test_an_interrupt_while_the_failure_is_cleaned_carries_no_refusal(smtp_env, monkeypatch):
+    """То же, если прерывание пришло, пока `send_email` готовила замену ошибке."""
+    refusal = smtplib.SMTPRecipientsRefused({ADDRESS: (550, SMTP_REPLY.encode())})
+    monkeypatch.setattr("smtplib.SMTP", _smtp_that_fails_with(refusal))
+
+    def interrupted(exc):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(notifier, "_send_failure", interrupted)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS])
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert "@" not in _everything_printed(raised.value)
+
+
 class _SmtplibWithoutANetwork(smtplib.SMTP):
     """Настоящий smtplib, у которого отнята только сеть: письмо собирает и
     укладывает в байты пакет `email`, как при настоящей отправке."""
@@ -1030,13 +1080,26 @@ def test_a_broken_recipient_record_never_brings_the_others_out(smtp_env, monkeyp
         assert failure.__cause__ is None and failure.__context__ is None
 
 
-def test_the_broken_record_samples_do_break_the_letter(smtp_env, monkeypatch):
-    """Тест выше не слеп: хотя бы одна из записей письмо действительно ломает.
-    Нелатинский адрес без поддержки SMTPUTF8 smtplib отвергает на любой версии."""
+def test_a_real_assembly_error_keeps_the_neighbours_addresses_inside(smtp_env, monkeypatch):
+    """Не выдуманная ошибка: на Python 3.12.3 (он стоит на проде) запись
+    `[\\,группа:` даёт `HeaderWriteError` с заголовком `To:` целиком. Тест выше
+    на остальных записях проходит и без очистки — различает случаи этот."""
     monkeypatch.setattr("smtplib.SMTP", _SmtplibWithoutANetwork)
-    with pytest.raises(notifier.EmailDeliveryError) as raised:
-        notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS, "я", "second@client.example"])
-    assert raised.value.error_type == "SMTPNotSupportedError"
+    recipients = [ADDRESS, "[\\,группа:", "second@client.example"]
+
+    try:
+        notifier._send_email("Тема", "<p>x</p>", None, recipients)
+        raw = ""
+    except Exception as error:
+        raw = str(error)
+    if "second@client.example" not in raw:
+        pytest.skip("этот Python на такую запись адресами соседей не отвечает: пример устарел")
+
+    with pytest.raises(notifier.EmailSendError) as raised:
+        notifier.send_email("Тема", "<p>x</p>", to=recipients)
+    assert "<текст скрыт>" in str(raised.value)
+    assert "@" not in _everything_printed(raised.value), _everything_printed(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
 
 
 _NOTIFIER = "src/notifier.py"
@@ -1050,26 +1113,33 @@ def mail_server_bypasses(sources: dict[str, str]) -> list[str]:
     """Кто ходит к почтовому серверу мимо `send_email`.
 
     Сверка по именам: smtplib импортирует только `notifier`; класс сервера
-    (`SMTP`, `SMTP_SSL`, `LMTP`) назван только в `_send_email`; сама
-    `_send_email` названа только в `send_email`. Имя строкой (`getattr(notifier,
-    "_send_email")`, `import_module("smtplib")`) — тоже имя.
+    (`SMTP`, `SMTP_SSL`, `LMTP`) назван только в его функции `_send_email`; сама
+    `_send_email` названа только в его функции `send_email`. Имя строкой
+    (`getattr(notifier, "_send_email")`, `import_module("smtplib")`) — тоже имя.
 
     Чего проверка не видит: имя, собранное из частей (`"_send" + "_email"`),
-    класс сервера под другим именем (`Server = smtplib.SMTP` в `_send_email` и
-    вызов `Server` вне её) и другой транспорт — HTTP API почтового сервиса,
-    сторонний SMTP-клиент.
+    класс сервера под другим именем (`from smtplib import SMTP_SSL as Server`
+    в `notifier`) и другой транспорт — HTTP API почтового сервиса, сторонний
+    SMTP-клиент. Своё имя `SMTP` (значение перечисления) она примет за класс
+    сервера.
     """
     found = []
     for path, source in sources.items():
-        in_notifier = path == _NOTIFIER
-        for node, owner in _nodes_with_owner(ast.parse(source)):
-            inside = owner.name if in_notifier and owner is not None else None
+        tree = ast.parse(source)
+        # Функции самого модуля `notifier`: метод с тем же именем — уже не они.
+        entry = (
+            {node: node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+            if path == _NOTIFIER
+            else {}
+        )
+        for node, owner in _nodes_with_owner(tree):
+            inside = entry.get(owner)
             if isinstance(node, ast.Import | ast.ImportFrom):
                 named = {alias.name for alias in node.names}
                 if isinstance(node, ast.ImportFrom):
                     named.add(node.module or "")
                 bypass = "_send_email" in named or (
-                    not in_notifier and any(name.split(".")[0] == "smtplib" for name in named)
+                    path != _NOTIFIER and any(name.split(".")[0] == "smtplib" for name in named)
                 )
             elif isinstance(node, ast.Name | ast.Attribute):
                 name = node.id if isinstance(node, ast.Name) else node.attr
@@ -1087,14 +1157,33 @@ def mail_server_bypasses(sources: dict[str, str]) -> list[str]:
     return found
 
 
+def _sources_that_could_send_mail() -> dict[str, str]:
+    """`src/` и `scripts/`: скрипты зовут из workflow наравне с командами CLI."""
+    scripts = SRC.parent / "scripts"
+    return _src_sources() | {
+        str(path.relative_to(SRC.parent)): path.read_text(encoding="utf-8")
+        for path in sorted(scripts.rglob("*.py"))
+    }
+
+
 def test_only_send_email_talks_to_the_mail_server():
     """На этом стоит весь слой 2: ошибка, взятая мимо `send_email`, не очищена."""
-    sources = _src_sources()
+    sources = _sources_that_could_send_mail()
     found = mail_server_bypasses(sources)
+    # Python, встроенный в workflow, как код не разобрать — те же имена ищутся
+    # в его тексте.
+    found += [
+        f".github/workflows/{path.name}: {name}"
+        for path in sorted((SRC.parent / ".github" / "workflows").glob("*.y*ml"))
+        for name in sorted(set(re.findall(r"\b(?:smtplib|_send_email)\b", path.read_text("utf-8"))))
+    ]
     assert found == [], _HOW_TO_FIX_A_BYPASS.format(found="; ".join(found))
-    # Проверка не слепа: тот же `notifier.py` под чужим именем — уже обход.
+    # Проверка не слепа: скрипты она читает, а тот же `notifier.py` под чужим
+    # именем — уже обход.
+    assert any(path.startswith("scripts/") for path in sources), sorted(sources)[:5]
     elsewhere = mail_server_bypasses({"src/elsewhere.py": sources[_NOTIFIER]})
     assert any("import smtplib" in line for line in elsewhere), elsewhere
+    assert any("smtplib.SMTP" in line for line in elsewhere), elsewhere
 
 
 @pytest.mark.parametrize(
@@ -1114,6 +1203,13 @@ def test_only_send_email_talks_to_the_mail_server():
         # В самом `notifier` — тоже: второй отправитель рядом с первым.
         (_NOTIFIER, "def resend():\n    return _send_email('x', 'y', None, None)", 1),
         (_NOTIFIER, "def send_invite():\n    with smtplib.SMTP_SSL(host) as smtp: ...", 1),
+        # Метод с именем входа — не сам вход.
+        (
+            _NOTIFIER,
+            "class Mailer:\n    def send_email(self):\n        return _send_email('x', 'y')",
+            1,
+        ),
+        ("scripts/mail_probe.py", "import smtplib", 1),
         (_NOTIFIER, "def _send_email():\n    with smtplib.SMTP(host) as smtp: ...", 0),
         (
             _NOTIFIER,
@@ -1160,7 +1256,9 @@ def test_run_failure_output_carries_no_address(cli_logging, db_session, monkeypa
     factory = sessionmaker(bind=db_session.get_bind(), expire_on_commit=False, autoflush=False)
 
     async def refused(*args, **kwargs):
-        _refused()
+        # Без записи адреса, которую маска не узнаёт: трассировку печатает
+        # журнал, а на журнале маска — это её известный предел, не этого теста.
+        raise RuntimeError(_SMTPLIB_TEXT)
 
     monkeypatch.setattr(storage, "init_db", lambda: None)
     monkeypatch.setattr(storage, "make_session", lambda: factory)
