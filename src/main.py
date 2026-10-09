@@ -4956,6 +4956,13 @@ def telegram_poll(once: bool) -> None:
     from src import notifier
 
     updates = notifier.telegram_get_updates()
+    if updates is None:
+        # Не «сообщений нет»: опрос не состоялся — нет токена, не подошёл токен,
+        # сеть. Причину отправитель уже написал в журнал, без текста ошибки.
+        raise click.ClickException(
+            "Опрос Telegram не состоялся — причина в строке журнала выше "
+            "(telegram_no_token, telegram_poll_failed или telegram_api_error)."
+        )
     if not updates:
         click.echo("Нет новых сообщений. Попроси клиента написать боту /start.")
         return

@@ -29,6 +29,11 @@ from src.logging_setup import error_fields
 
 log = structlog.get_logger()
 
+# Сколько ждать после несостоявшегося опроса. Без паузы цикл при недоступной
+# сети или неверном токене крутится вхолостую: запрос за запросом и строка в
+# журнал на каждом обороте.
+POLL_RETRY_SEC = 5
+
 
 def cmd_start(session: Session, chat_id: str, args: str) -> str:
     """Привязка chat_id к существующему TenantUser по email.
@@ -200,7 +205,11 @@ def run_polling(poll_timeout: int = 30) -> None:
             updates = notifier.telegram_get_updates(offset=last_update_id, timeout=poll_timeout)
         except Exception as e:
             log.warning("telegram_poll_error", **error_fields(e))
-            time.sleep(5)
+            updates = None
+        if updates is None:
+            # Опрос не состоялся. О причине `telegram_get_updates` уже написала
+            # в журнал сама (`telegram_poll_failed`, `telegram_api_error`).
+            time.sleep(POLL_RETRY_SEC)
             continue
 
         for update in updates:
