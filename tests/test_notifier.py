@@ -9,6 +9,7 @@ Coverage gap: 18% → больше. Покрываем:
 
 from __future__ import annotations
 
+import ast
 import errno
 import http.client
 import io
@@ -17,8 +18,10 @@ import logging
 import re
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from email.message import Message
+from pathlib import Path
 
 import pytest
 from structlog.testing import capture_logs
@@ -134,13 +137,30 @@ def test_telegram_get_updates_handles_error(monkeypatch):
     assert notifier.telegram_get_updates() is None
 
 
-@pytest.mark.parametrize("reply", [{"ok": True, "result": []}, {"ok": True}])
+@pytest.mark.parametrize(
+    "reply", [{"ok": True, "result": []}, {"ok": True, "result": None}, {"ok": True}]
+)
 def test_telegram_get_updates_tells_no_messages_from_a_failed_poll(monkeypatch, reply):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
     monkeypatch.setattr("urllib.request.urlopen", _answers_with(reply))
     with capture_logs() as logs:
         assert notifier.telegram_get_updates() == []
     assert logs == []
+
+
+@pytest.mark.parametrize("result", [True, 7, "text", {"update_id": 1}, [1, 2], [None]])
+def test_telegram_get_updates_answers_with_messages_or_with_none(monkeypatch, result):
+    """Оба вызывающих разбирают ответ без проверок: не список сообщений — это
+    опрос, который не состоялся, а не то, обо что бот упадёт."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setattr("urllib.request.urlopen", _answers_with({"ok": True, "result": result}))
+    with capture_logs() as logs:
+        assert notifier.telegram_get_updates() is None
+    assert _the_failure(logs, "telegram_get_updates") == {
+        "event": "telegram_poll_failed",
+        "log_level": "warning",
+        "error_type": "TypeError",
+    }
 
 
 # ─── Журнал отправителя Telegram: ни токена, ни ответа сервера ───────────────
@@ -319,8 +339,11 @@ def test_telegram_network_failure_log_says_what_is_behind_the_urlerror(
     ("error_code", "logged"),
     [
         (400, {"error_code": 400}),
-        # Пишется число. Чем бы ни оказался код в ответе, строкой он в журнал не идёт.
+        # Пишется код ответа, и только пока он на код похож: ни строка, ни
+        # число размером с идентификатор чата в журнал не идут.
         ("400 chat -1001234567890", {}),
+        (-1001234567890, {}),
+        (True, {}),
         (None, {}),
     ],
 )
@@ -345,6 +368,72 @@ def test_telegram_api_error_log_keeps_the_error_code_and_not_the_reply(
     assert logs == [
         {"event": "telegram_api_error", "log_level": "warning", "method": method, **logged}
     ]
+
+
+def test_telegram_message_that_cannot_be_encoded_is_a_failed_send(monkeypatch, capsys, caplog):
+    """Сбой до сети — тот же сбой отправки: наружу не выходит, в журнале — класс."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+    text = "цена \udc80 упала"
+    # Посылка: такой текст не кодируется, а сама ошибка держит его целиком.
+    with pytest.raises(UnicodeEncodeError) as raised:
+        urllib.parse.urlencode({"text": text})
+    assert "упала" in raised.value.object
+
+    result, logs, written = _called(
+        lambda: notifier.send_telegram_message(CHAT_ID, text), capsys, caplog
+    )
+
+    assert result is False
+    for piece in (TOKEN, CHAT_ID, "упала"):
+        assert piece not in written, written
+    assert _the_failure(logs, "send_telegram_message") == {
+        "event": "telegram_send_failed",
+        "log_level": "warning",
+        "error_type": "UnicodeEncodeError",
+    }
+
+
+# Где в том, что исполняется, назван адрес Telegram, и что файл с ним делает.
+_NAMES_THE_TELEGRAM_ADDRESS = {
+    "src/notifier.py": "собирает запрос — в функциях, названных в тесте ниже",
+    "scripts/configure-integrations.sh": (
+        "печатает оператору подсказку, где взять chat_id: на месте токена заглушка, запроса нет"
+    ),
+}
+
+
+def test_only_the_two_sender_functions_build_a_telegram_request():
+    """Токен закрыт там, где собирается адрес запроса, — в двух функциях, которые
+    тесты выше зовут с настоящей ошибкой. Третье место — решение, а не случайность."""
+    root = Path(__file__).resolve().parent.parent
+    named_in = set()
+    for folder in ("src", "scripts", "infra", ".github"):
+        for path in (root / folder).rglob("*"):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if "api.telegram.org" in content or "TELEGRAM_API_BASE" in content:
+                named_in.add(path.relative_to(root).as_posix())
+    builders = {
+        node.name
+        for node in ast.parse((root / "src/notifier.py").read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef)
+        and any(getattr(inner, "id", None) == "TELEGRAM_API_BASE" for inner in ast.walk(node))
+    }
+    assert (named_in, builders) == (
+        set(_NAMES_THE_TELEGRAM_ADDRESS),
+        {"send_telegram_message", "telegram_get_updates"},
+    ), (
+        f"Адрес Telegram назван в {sorted(named_in)}, запрос собирают {sorted(builders)}. "
+        "Токен бота стоит в адресе запроса, и текст ошибки запроса его несёт. В новом "
+        "месте о сбое пиши `**_telegram_error_fields(exc)`, а не текст ошибки и не ответ "
+        "сервера; проверь прямым вызовом с токеном, у которого на конце `\\r`, — как "
+        "`test_telegram_failure_log_carries_no_token`; затем впиши место сюда. Файл, "
+        "который запроса не шлёт, — строкой в `_NAMES_THE_TELEGRAM_ADDRESS`, с причиной."
+    )
 
 
 # ─── resolve_recipients ────────────────────────────────────────────────────

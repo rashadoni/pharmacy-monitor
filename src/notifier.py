@@ -103,9 +103,10 @@ def _telegram_error_fields(exc: BaseException) -> dict[str, object]:
     адреса. Пишутся класс ошибки и строка этого модуля (`error_fields`), а чем
     случаи различаются — числами и именами классов:
 
-    - `http_status` — код ответа: 401 — токен не подошёл, 400 — запрос не
-      принят (нет такого чата, не разобрана разметка), 403 — человек заблокировал
-      бота, 409 — тем же токеном опрашивает второй бот, 429 — слишком часто;
+    - `http_status` — код ответа: 401 — токен не подошёл, 404 — токен не той
+      формы, 400 — запрос не принят (нет такого чата, не разобрана разметка),
+      403 — человек заблокировал бота, 409 — тем же токеном опрашивает второй
+      бот, 429 — слишком часто;
     - `reason_type` и `errno` — что стоит за `URLError`: нет имени в DNS
       (`gaierror`), отказ в соединении (`ConnectionRefusedError`, 111), сертификат.
     """
@@ -124,10 +125,11 @@ def _telegram_refusal_fields(body: dict) -> dict[str, object]:
     """Отказ Telegram в ответе с `ok: false`: из ответа берётся только `error_code`.
 
     Сам ответ в журнал не идёт: в `parameters.migrate_to_chat_id` стоит
-    идентификатор чата, а `description` — текст, который пишет сервер.
+    идентификатор чата, а `description` — текст, который пишет сервер. И код
+    пишется, только пока он похож на код: число из диапазона кодов ответа HTTP.
     """
     code = body.get("error_code")
-    return {"error_code": code} if type(code) is int else {}
+    return {"error_code": code} if isinstance(code, int) and 100 <= code <= 599 else {}
 
 
 def send_telegram_message(chat_id: str | int, text: str, parse_mode: str = "Markdown") -> bool:
@@ -143,9 +145,11 @@ def send_telegram_message(chat_id: str | int, text: str, parse_mode: str = "Mark
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
-    data = urllib.parse.urlencode(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
     try:
+        # Сборка запроса тоже здесь: текст, который не кодируется (одиночный
+        # суррогат), — такой же сбой отправки, и наружу он не выходит.
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
         with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()) as resp:
             body = json.loads(resp.read().decode("utf-8"))
             if not body.get("ok"):
@@ -184,7 +188,12 @@ def telegram_get_updates(offset: int | None = None, timeout: int = 0) -> list[di
                     "telegram_api_error", method="getUpdates", **_telegram_refusal_fields(body)
                 )
                 return None
-            return body.get("result") or []
+            updates = body.get("result") or []
+            if not (isinstance(updates, list) and all(isinstance(u, dict) for u in updates)):
+                # Не список сообщений — не «сообщений нет»: вызывающие разбирают
+                # ответ без проверок.
+                raise TypeError("getUpdates: result is not a list of updates")
+            return updates
     except Exception as e:
         log.warning("telegram_poll_failed", **_telegram_error_fields(e))
         return None

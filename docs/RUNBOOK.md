@@ -265,7 +265,8 @@ GitHub; хранится он 90 дней. Еженедельный сбор pha
 обработчик сбоя. Журнал бота держит `tests/test_telegram_bot.py`: бот
 запускается как на сервере, с настоящей ошибкой базы. Журнал отправителя
 Telegram — `tests/test_notifier.py`: обе функции вызываются с настоящей
-`InvalidURL` (токен с `\r`) и с отказом сервера. Маска стоит только на
+`InvalidURL` (токен с `\r`) и с отказом сервера, и там же список мест, где
+назван адрес Telegram, — новое место роняет тест. Маска стоит только на
 журнале CLI. Мимо неё идут `click.echo`
 и `print`, а журнал API не замаскирован вовсе — он пишет в journald и наружу не
 выходит. Команды, которые печатают адрес по назначению, перечислены в том же
@@ -282,12 +283,14 @@ Telegram — `tests/test_notifier.py`: обе функции вызываютс�
 
 Чего это не закрывает. Без текста ошибки базы пишет только бот: остальной
 код — как раньше, а запросы по адресу есть ещё при входе и выдаче ссылки на вход
-(`src/api.py`). Токен Telegram закрыт в двух функциях отправителя, и тест
-смотрит на них: новый запрос к Telegram, собранный в другом месте, правилу сам
-не подчинится.
+(`src/api.py`). Токен Telegram закрыт в двух функциях отправителя. Новое
+место, где назван адрес Telegram, тест заметит по имени (`api.telegram.org`,
+`TELEGRAM_API_BASE` в `src/`, `scripts/`, `infra/`, `.github/`); адрес,
+собранный из частей или взятый из переменной, он не увидит.
 
 Если адрес в журнал Actions всё же попал — журнал прогона удаляется целиком,
-необратимо и только по слову владельца:
+необратимо и только по слову владельца. Токен Telegram в журнале — то же, и
+сначала отозвать сам токен у @BotFather: удаление журнала утечку не отменяет.
 
 ```bash
 # сначала убедиться, что это тот прогон: строки журнала команды с адресом
@@ -504,12 +507,14 @@ group by 1 order by 1;
 **Действия:**
 ```bash
 # Сервис жив?
-systemctl status pharmacy-monitor-telegram
-sudo journalctl -u pharmacy-monitor-telegram -n 50
+systemctl status pharmacy-monitor-telegram-bot
+sudo journalctl -u pharmacy-monitor-telegram-bot -n 50
 
 # Токен задан? Число строк, а не сам токен: печатать его незачем
 grep -c '^TELEGRAM_BOT_TOKEN=.' /etc/pharmacy-monitor/env
-# Строк с CR на конце (файл сохранён с CRLF) быть не должно: ответ 0
+# Строк с CR на конце (файл сохранён с CRLF) быть не должно: ответ 0.
+# systemd такой CR отбрасывает сам, а `source` ниже и разбор env-файла в
+# workflow еженедельного сбора — нет: у них токен выйдет с `\r` на конце
 grep -c $'\r$' /etc/pharmacy-monitor/env
 
 # Тест отправки вручную — под pm, с загруженным env
@@ -523,7 +528,7 @@ set -a; source /etc/pharmacy-monitor/env; set +a
 журнал не пишутся»):
 
 ```
-telegram_send_failed error_at='notifier.py:149 in send_telegram_message' error_type=HTTPError http_status=401
+telegram_send_failed error_at='notifier.py:153 in send_telegram_message' error_type=HTTPError http_status=401
 ```
 
 | Событие | Что значит |
@@ -531,16 +536,21 @@ telegram_send_failed error_at='notifier.py:149 in send_telegram_message' error_t
 | `telegram_no_token` | В окружении нет `TELEGRAM_BOT_TOKEN` — обычно ручной запуск без загруженного env |
 | `telegram_send_failed` | Сообщение не ушло — алерт, ответ бота, тест отправки |
 | `telegram_poll_failed` | Бот или `telegram poll` не получили сообщения |
+| `telegram_poll_error` | То же, но сбой отправитель не поймал сам; пишет бот. В исправном коде не встречается |
+| `telegram_bot_no_token` | Бот запущен без токена и сразу вышел |
 | `telegram_api_error` | Telegram ответил 200, но с отказом; рядом `method` и `error_code` (те же числа, что у `http_status`) |
 
 | В строке | Причина |
 |---|---|
 | `HTTPError`, `http_status=401` | Токен не подошёл: отозван или вписан не тот |
-| `http_status=400` | Запрос не принят: нет такого чата (проверить chat_id) или не разобрана разметка сообщения |
-| `http_status=403` | Человек заблокировал бота или ни разу ему не писал |
+| `http_status=404` | Токен не той формы — обрезан, без двоеточия |
+| `http_status=400` | Запрос не принят: нет такого чата (проверить chat_id; человек должен сначала сам написать боту) или не разобрана разметка сообщения |
+| `http_status=403` | Человек заблокировал бота, или бот пишет ему первым |
 | `http_status=409` | Тем же токеном опрашивает другой процесс (второй бот, `telegram poll` при живом боте) или включён webhook |
 | `http_status=429` | Слишком часто |
-| `InvalidURL`, `UnicodeEncodeError` | В токене управляющий символ, пробел или нелатинская буква — строка env с CRLF, лишний перевод строки в значении |
+| `InvalidURL` | В токене управляющий символ или пробел — CR на конце строки env (не под systemd, см. выше), лишний перевод строки в значении |
+| `UnicodeEncodeError` | В токене нелатинская буква. У `telegram_send_failed` — ещё и текст сообщения, который не кодируется |
+| `TypeError` у `telegram_poll_failed` | Telegram ответил `ok`, но не списком сообщений |
 | `URLError` + `reason_type` | Сеть: `gaierror` — нет имени в DNS, `ConnectionRefusedError` (`errno=111`) — отказ в соединении, `SSLCertVerificationError` — сертификат |
 | `TimeoutError` — классом или в `reason_type` | Telegram не ответил за отведённое время |
 

@@ -4960,8 +4960,8 @@ def telegram_poll(once: bool) -> None:
         # Не «сообщений нет»: опрос не состоялся — нет токена, не подошёл токен,
         # сеть. Причину отправитель уже написал в журнал, без текста ошибки.
         raise click.ClickException(
-            "Опрос Telegram не состоялся — причина в строке журнала выше "
-            "(telegram_no_token, telegram_poll_failed или telegram_api_error)."
+            "Опрос Telegram не состоялся. Причина — в журнале, уровень warning: "
+            "telegram_no_token, telegram_poll_failed или telegram_api_error."
         )
     if not updates:
         click.echo("Нет новых сообщений. Попроси клиента написать боту /start.")
