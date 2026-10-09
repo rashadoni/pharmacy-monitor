@@ -72,6 +72,79 @@ def masking(renderer):
     return render
 
 
+class MaskingFormatter(logging.Formatter):
+    """Формат корневых обработчиков stdlib `logging`: адреса вырезаются из строки.
+
+    `masking` стоит на structlog, а в тот же вывод пишут ещё и сторонние
+    библиотеки — через корневые обработчики, мимо него. Источника адреса среди
+    них не найдено; формат стоит, чтобы появление такого источника ничего не
+    изменило. Вырезается всё, что формат отдаёт обработчику: сообщение,
+    трассировка, `stack_info`. Мимо остаётся только то, что `logging` печатает
+    в stderr сам, когда строку не принял поток или запись не удалось даже
+    показать через `repr`.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            text = super().format(record)
+        except Exception:
+            # Сообщение не сошлось со своими аргументами. `logging` в ответ
+            # печатает запись в stderr сам — мимо формата и вместе с аргументами.
+            text = (
+                f"unformattable log record from {record.name} "
+                f"({record.pathname}:{record.lineno}): {record.msg!r} % {record.args!r}"
+            )
+        return mask_addresses(text)
+
+
+_SRC_PREFIX = os.path.dirname(os.path.abspath(__file__)) + os.sep
+_SQLSTATE_RE = re.compile(r"[0-9A-Z]{5}")
+
+
+def error_fields(exc: BaseException) -> dict[str, object]:
+    """Что о сбое пишут в журнал вместо текста ошибки и трассировки.
+
+    Текст ошибки несёт данные, с которыми код работал: SQLAlchemy кладёт в него
+    параметры запроса, а запрос бывает «найти пользователя по адресу» или
+    «записать ему chat_id». Адрес из готовой строки вырезала бы маска, число —
+    нет. Остаётся то, что данных не несёт:
+
+    - `error_type` — класс ошибки;
+    - `error_at` — последняя строка `src/`, через которую ошибка прошла:
+      `notifications.py:405 in bind_telegram`;
+    - `sqlstate` — код ошибки PostgreSQL, если он у ошибки есть:
+      `OperationalError` у SQLAlchemy — и остановка сервера (`57P01`), и
+      взаимная блокировка (`40P01`). У сбоя на установке соединения кода нет,
+      что бы ни ответил сервер.
+
+    Об ошибке, завёрнутой в другую (`raise X(...) from exc`), говорит только
+    внешняя: исходный класс, код и место не пишутся.
+
+    Зовут из `except`, поэтому сама не бросает: чего не удалось узнать, того в
+    ответе нет.
+    """
+    fields: dict[str, object] = {"error_type": type(exc).__name__}
+    try:
+        tb = exc.__traceback__
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            # Только полный путь внутри `src/`. У кода, собранного из строки
+            # (`<string>` — так SQLAlchemy строит свои методы), пути нет, и
+            # достраивать его от рабочего каталога нельзя: `normpath` этого и
+            # не делает, он лишь убирает из пути «..».
+            path = os.path.normpath(code.co_filename)
+            if path.startswith(_SRC_PREFIX):
+                # Глубже по стеку — ближе к сбою: остаётся последняя строка.
+                fields["error_at"] = f"{path[len(_SRC_PREFIX) :]}:{tb.tb_lineno} in {code.co_name}"
+            tb = tb.tb_next
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if isinstance(sqlstate, str) and _SQLSTATE_RE.fullmatch(sqlstate):
+            fields["sqlstate"] = sqlstate
+    except Exception:  # обработчик сбоя не должен упасть сам
+        pass
+    return fields
+
+
 def configure_logging(service: str = "app") -> None:
     """Configure structlog → either JSON (production) or pretty (dev).
 
@@ -111,7 +184,7 @@ def configure_logging(service: str = "app") -> None:
 
     # Stdlib logging → forward to structlog so 3rd-party libs get same format
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setFormatter(MaskingFormatter("%(message)s"))
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
@@ -129,7 +202,7 @@ def configure_logging(service: str = "app") -> None:
             backupCount=backups,
             encoding="utf-8",
         )
-        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        file_handler.setFormatter(MaskingFormatter("%(message)s"))
         root.addHandler(file_handler)
 
 

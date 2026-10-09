@@ -25,8 +25,14 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from src import notifier, storage
+from src.logging_setup import error_fields
 
 log = structlog.get_logger()
+
+# Сколько ждать после несостоявшегося опроса. Без паузы цикл при недоступной
+# сети или неверном токене крутится вхолостую: запрос за запросом и строка в
+# журнал на каждом обороте.
+POLL_RETRY_SEC = 5
 
 
 def cmd_start(session: Session, chat_id: str, args: str) -> str:
@@ -175,7 +181,7 @@ def handle_update(session: Session, update: dict) -> None:
     try:
         response = handler(session, chat_id, args)
     except Exception as e:
-        log.exception("telegram_command_failed", cmd=cmd, error=str(e))
+        log.error("telegram_command_failed", cmd=cmd, **error_fields(e))
         response = f"❌ Ошибка: {type(e).__name__}"
     notifier.send_telegram_message(chat_id, response)
 
@@ -198,8 +204,12 @@ def run_polling(poll_timeout: int = 30) -> None:
         try:
             updates = notifier.telegram_get_updates(offset=last_update_id, timeout=poll_timeout)
         except Exception as e:
-            log.warning("telegram_poll_error", error=str(e))
-            time.sleep(5)
+            log.warning("telegram_poll_error", **error_fields(e))
+            updates = None
+        if updates is None:
+            # Опрос не состоялся. О причине `telegram_get_updates` уже написала
+            # в журнал сама (`telegram_poll_failed`, `telegram_api_error`).
+            time.sleep(POLL_RETRY_SEC)
             continue
 
         for update in updates:
@@ -210,4 +220,4 @@ def run_polling(poll_timeout: int = 30) -> None:
                 try:
                     handle_update(s, update)
                 except Exception as e:
-                    log.exception("telegram_handle_update_failed", error=str(e))
+                    log.error("telegram_handle_update_failed", **error_fields(e))

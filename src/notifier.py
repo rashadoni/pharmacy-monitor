@@ -13,6 +13,7 @@ import os
 import re
 import smtplib
 import ssl
+import urllib.error
 import urllib.parse
 import urllib.request
 from email.message import EmailMessage
@@ -20,7 +21,7 @@ from email.message import EmailMessage
 import structlog
 
 from src import storage, watchlist
-from src.logging_setup import mask_addresses
+from src.logging_setup import error_fields, mask_addresses
 
 log = structlog.get_logger()
 
@@ -93,6 +94,44 @@ def delivery_error_fields(exc: BaseException) -> dict[str, object]:
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
+def _telegram_error_fields(exc: BaseException) -> dict[str, object]:
+    """Что о сбое запроса к Telegram пишут в журнал вместо текста ошибки.
+
+    Токен бота стоит в адресе запроса, а текст ошибки адрес несёт: токен с
+    управляющим символом (строка env с CRLF) даёт `http.client.InvalidURL`, и в
+    её тексте путь запроса лежит целиком. Маска журнала вырезает только почтовые
+    адреса. Пишутся класс ошибки и строка этого модуля (`error_fields`), а чем
+    случаи различаются — числами и именами классов:
+
+    - `http_status` — код ответа: 401 — токен не подошёл, 404 — токен не той
+      формы, 400 — запрос не принят (нет такого чата, не разобрана разметка),
+      403 — человек заблокировал бота, 409 — тем же токеном опрашивает второй
+      бот, 429 — слишком часто;
+    - `reason_type` и `errno` — что стоит за `URLError`: нет имени в DNS
+      (`gaierror`), отказ в соединении (`ConnectionRefusedError`, 111), сертификат.
+    """
+    fields = error_fields(exc)
+    if isinstance(exc, urllib.error.HTTPError):
+        fields["http_status"] = exc.code
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException):
+        fields["reason_type"] = type(reason).__name__
+        if isinstance(reason, OSError) and isinstance(reason.errno, int):
+            fields["errno"] = reason.errno
+    return fields
+
+
+def _telegram_refusal_fields(body: dict) -> dict[str, object]:
+    """Отказ Telegram в ответе с `ok: false`: из ответа берётся только `error_code`.
+
+    Сам ответ в журнал не идёт: в `parameters.migrate_to_chat_id` стоит
+    идентификатор чата, а `description` — текст, который пишет сервер. И код
+    пишется, только пока он похож на код: число из диапазона кодов ответа HTTP.
+    """
+    code = body.get("error_code")
+    return {"error_code": code} if isinstance(code, int) and 100 <= code <= 599 else {}
+
+
 def send_telegram_message(chat_id: str | int, text: str, parse_mode: str = "Markdown") -> bool:
     """Отправить Telegram-сообщение. Возвращает True если ok=true."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -106,29 +145,36 @@ def send_telegram_message(chat_id: str | int, text: str, parse_mode: str = "Mark
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
-    data = urllib.parse.urlencode(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
     try:
+        # Сборка запроса тоже здесь: текст, который не кодируется (одиночный
+        # суррогат), — такой же сбой отправки, и наружу он не выходит.
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
         with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()) as resp:
             body = json.loads(resp.read().decode("utf-8"))
             if not body.get("ok"):
-                log.warning("telegram_api_error", body=body)
+                log.warning(
+                    "telegram_api_error", method="sendMessage", **_telegram_refusal_fields(body)
+                )
                 return False
             return True
     except Exception as e:
-        log.warning("telegram_send_failed", error=str(e))
+        log.warning("telegram_send_failed", **_telegram_error_fields(e))
         return False
 
 
-def telegram_get_updates(offset: int | None = None, timeout: int = 0) -> list[dict]:
+def telegram_get_updates(offset: int | None = None, timeout: int = 0) -> list[dict] | None:
     """Получить новые сообщения боту через long-polling.
 
-    Используется командой `pharmacy-monitor telegram poll` чтобы получить chat_id
-    нового пользователя.
+    `None` — опрос не состоялся: нет токена, сеть, отказ Telegram; причина уже в
+    журнале. Пустой список — опрос состоялся, сообщений нет. Это разные ответы:
+    бот после несостоявшегося опроса ждёт, а `telegram poll` не говорит
+    оператору «сообщений нет», когда не подошёл токен.
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        return []
+        log.warning("telegram_no_token", hint="set TELEGRAM_BOT_TOKEN in .env")
+        return None
     url = TELEGRAM_API_BASE.format(token=token, method="getUpdates")
     params = {"timeout": timeout}
     if offset is not None:
@@ -138,11 +184,19 @@ def telegram_get_updates(offset: int | None = None, timeout: int = 0) -> list[di
         with urllib.request.urlopen(full_url, timeout=timeout + 5) as resp:
             body = json.loads(resp.read().decode("utf-8"))
             if not body.get("ok"):
-                return []
-            return body.get("result", [])
+                log.warning(
+                    "telegram_api_error", method="getUpdates", **_telegram_refusal_fields(body)
+                )
+                return None
+            updates = body.get("result")
+            if not (isinstance(updates, list) and all(isinstance(u, dict) for u in updates)):
+                # Не список сообщений — не «сообщений нет»: вызывающие разбирают
+                # ответ без проверок.
+                raise TypeError("getUpdates: result is not a list of updates")
+            return updates
     except Exception as e:
-        log.warning("telegram_poll_failed", error=str(e))
-        return []
+        log.warning("telegram_poll_failed", **_telegram_error_fields(e))
+        return None
 
 
 def resolve_recipients(explicit: list[str] | None = None) -> list[str]:

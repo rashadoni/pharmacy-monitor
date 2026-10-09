@@ -1,10 +1,26 @@
-"""Тесты Telegram-бота: маршрутизация команд + рендер сводок."""
+"""Тесты Telegram-бота: маршрутизация команд, рендер сводок и журнал бота.
 
+Журнал — в конце файла: обработчики бота не пишут в него ничего из того, что
+человек написал боту, и ничего из текста ошибки. Почему — docs/RUNBOOK.md
+«Адреса в журнал не пишутся». Следом — опрос, который не состоялся: бот ждёт,
+а `telegram poll` не выдаёт его за «сообщений нет».
+"""
+
+import logging
+import re
 from datetime import timedelta
+from types import SimpleNamespace
+
+import pytest
+import sqlalchemy
+import structlog
+from click.testing import CliRunner
+from sqlalchemy.orm import sessionmaker
+from structlog.testing import capture_logs
 
 from src._time import utcnow
 
-from src import roi, telegram_bot
+from src import logging_setup, main, notifications, notifier, roi, storage, telegram_bot, tenants
 from src.storage import AlertEvent, Match, PriceSnapshot, Product, Run
 
 
@@ -223,3 +239,342 @@ def test_handle_update_ignores_non_command(db_session):
         assert sent == []  # ничего не отправлено
     finally:
         notifier.send_telegram_message = original
+
+
+# ─── Журнал бота: ничего из сообщения и ничего из текста ошибки ──────────────
+#
+# Бот вызывается как на сервере — `run_polling` с настоящей сессией. Проверка
+# смотрит на то, что вышло наружу (журнал structlog, печать, stdlib `logging`),
+# а не на то, как написан обработчик. Отправитель (`notifier`) здесь подменён:
+# что о своём сбое пишет он сам, эти тесты не видят.
+
+ADDRESS = "viewer@client.example"
+CHAT_ID = "700200"
+SENDER = "aysel_from_client"
+SENDER_NAME = "Айсель"
+
+
+def _incoming(message_text: str) -> dict:
+    """Сообщение боту — как его отдаёт getUpdates."""
+    return {
+        "update_id": 41,
+        "message": {
+            "chat": {"id": int(CHAT_ID)},
+            "from": {"username": SENDER, "first_name": SENDER_NAME},
+            "text": message_text,
+        },
+    }
+
+
+@pytest.fixture
+def bot_user(db_session, monkeypatch):
+    """Бот на базе теста и пользователь, к которому `/start <адрес>` привязывает чат."""
+    Session = sessionmaker(db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr(storage, "make_session", lambda *args, **kwargs: Session)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "000:test")
+    tenant = tenants.get_or_create_default(db_session)
+    row = storage.TenantUser(
+        tenant_id=tenant.id, email=ADDRESS, role="admin", is_active=True, created_at=utcnow()
+    )
+    db_session.add(row)
+    db_session.commit()
+    return row
+
+
+@pytest.fixture
+def replies(monkeypatch):
+    """Ответы бота человеку: в сеть не уходят, складываются сюда."""
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        notifier,
+        "send_telegram_message",
+        lambda chat_id, text, **kwargs: sent.append((str(chat_id), text)) or True,
+    )
+    return sent
+
+
+def _poll(
+    monkeypatch, capsys, caplog, polls: list, pauses: list | None = None
+) -> tuple[list[dict], str]:
+    """`run_polling` до остановки: журнал structlog и всё остальное, что бот
+    вывел, — печать и stdlib `logging`.
+
+    `polls` — чем getUpdates отвечает на каждый опрос: пачка сообщений, `None`
+    (опрос не состоялся) или ошибка. Дальше — Ctrl-C: так бот и останавливают.
+    В `pauses` складывается, сколько секунд бот ждал.
+    """
+    pauses = [] if pauses is None else pauses
+    answers = iter(polls)
+
+    def get_updates(offset=None, timeout=0):
+        answer = next(answers, KeyboardInterrupt())
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    handled = []
+    handle_update = telegram_bot.handle_update
+
+    def handle(session, update):
+        handled.append(update)
+        return handle_update(session, update)
+
+    monkeypatch.setattr(notifier, "telegram_get_updates", get_updates)
+    monkeypatch.setattr(telegram_bot, "handle_update", handle)
+    monkeypatch.setattr(telegram_bot, "time", SimpleNamespace(sleep=pauses.append))
+    caplog.set_level(logging.DEBUG)
+    caplog.clear()
+    capsys.readouterr()
+    with capture_logs() as logs, pytest.raises(KeyboardInterrupt):
+        telegram_bot.run_polling(poll_timeout=0)
+    printed = capsys.readouterr()
+    # Каждое сообщение дошло до разбора: без этого «в журнале ничего нет» ни о
+    # чём не говорит.
+    assert handled == [update for batch in polls if isinstance(batch, list) for update in batch]
+    return logs, printed.out + printed.err + caplog.text
+
+
+def _assert_nothing_of_the_message(logs: list[dict], other_output: str) -> None:
+    """Нигде нет того, что написал человек, и нет трассировки: под
+    `capture_logs` она видна только ключом `exc_info`."""
+    written = repr(logs) + other_output
+    for piece in ("@", CHAT_ID, SENDER, SENDER_NAME):
+        assert piece not in written, written
+    assert not any("exc_info" in entry for entry in logs), logs
+
+
+def _the_failure(logs: list[dict], event: str, *, error_at: str) -> dict:
+    """Запись о сбое без `error_at`: место сверено с образцом, номер строки плавает."""
+    [failure] = [dict(entry) for entry in logs if entry["event"] == event]
+    assert re.fullmatch(error_at, failure.pop("error_at")), logs
+    return failure
+
+
+@pytest.mark.parametrize(
+    ("message_text", "reply"),
+    [
+        (f"/start {ADDRESS}", "Привязано"),
+        ("/start nobody@client.example", "не найден"),
+        # Неизвестная команда: слово после «/» человек тоже набрал сам.
+        (f"/{SENDER} {ADDRESS}", "Неизвестная команда"),
+        (f"мой адрес {ADDRESS}", None),
+        ("/help", "/today"),
+        (f"/today {ADDRESS}", "Сегодня"),
+        (f"/alerts {ADDRESS}", "Алертов"),
+        (f"/status {ADDRESS}", "Status"),
+    ],
+)
+def test_bot_writes_out_nothing_of_the_incoming_message(
+    bot_user, replies, monkeypatch, capsys, caplog, message_text, reply
+):
+    logs, other_output = _poll(monkeypatch, capsys, caplog, [[_incoming(message_text)]])
+
+    _assert_nothing_of_the_message(logs, other_output)
+    # Человеку ответили — в его же чат.
+    assert [reply in text for _, text in replies] == ([True] if reply else [])
+    assert {chat for chat, _ in replies} <= {CHAT_ID}
+
+
+@pytest.mark.parametrize(
+    ("break_the_database", "carried", "error_type"),
+    [
+        # Поиск пользователя по адресу: в параметрах запроса — адрес.
+        ("alter table tenant_users rename to tenant_users_gone", ADDRESS, "OperationalError"),
+        # Запись привязки: в параметрах — chat_id. Он число: маска журнала,
+        # последняя линия для адреса, его не вырезает.
+        (
+            "create trigger refuse_writes before update on tenant_users "
+            "begin select raise(abort, 'read-only'); end",
+            CHAT_ID,
+            "IntegrityError",
+        ),
+    ],
+    ids=["lookup", "write"],
+)
+def test_bot_command_failure_log_carries_no_error_text(
+    db_session,
+    bot_user,
+    replies,
+    monkeypatch,
+    capsys,
+    caplog,
+    break_the_database,
+    carried,
+    error_type,
+):
+    """`/start <адрес>` при сбое базы: SQLAlchemy кладёт в текст ошибки параметры запроса."""
+    db_session.execute(sqlalchemy.text(break_the_database))
+    db_session.commit()
+    # Посылка правила. Перестанет SQLAlchemy писать параметры в текст ошибки —
+    # тест скажет об этом, а не пройдёт вхолостую.
+    with pytest.raises(sqlalchemy.exc.SQLAlchemyError) as raised:
+        notifications.bind_telegram(db_session, CHAT_ID, ADDRESS)
+    db_session.rollback()
+    assert "[parameters: " in str(raised.value) and carried in str(raised.value)
+    assert logging_setup.mask_addresses(CHAT_ID) == CHAT_ID
+
+    logs, other_output = _poll(monkeypatch, capsys, caplog, [[_incoming(f"/start {ADDRESS}")]])
+
+    _assert_nothing_of_the_message(logs, other_output)
+    # Диагностика остаётся: какая команда, какая ошибка и где в нашем коде.
+    failure = _the_failure(
+        logs, "telegram_command_failed", error_at=r"notifications\.py:\d+ in bind_telegram"
+    )
+    assert failure == {
+        "event": "telegram_command_failed",
+        "log_level": "error",
+        "cmd": "/start",
+        "error_type": error_type,
+    }
+    assert replies == [(CHAT_ID, f"❌ Ошибка: {error_type}")]
+
+
+def test_bot_update_failure_log_carries_no_error_text(bot_user, monkeypatch, capsys, caplog):
+    """До этого обработчика доходит то, что не поймал обработчик команды. Здесь —
+    отказ отправителя с адресом в тексте, каким его пишет smtplib."""
+
+    def refused(chat_id, text, **kwargs):
+        raise RuntimeError(f"{{'{ADDRESS}': (550, b'5.1.1 <{ADDRESS}>: rejected')}}")
+
+    monkeypatch.setattr(notifier, "send_telegram_message", refused)
+
+    logs, other_output = _poll(monkeypatch, capsys, caplog, [[_incoming("/help")]])
+
+    _assert_nothing_of_the_message(logs, other_output)
+    failure = _the_failure(
+        logs, "telegram_handle_update_failed", error_at=r"telegram_bot\.py:\d+ in handle_update"
+    )
+    assert failure == {
+        "event": "telegram_handle_update_failed",
+        "log_level": "error",
+        "error_type": "RuntimeError",
+    }
+
+
+def test_bot_poll_failure_log_carries_no_error_text(bot_user, monkeypatch, capsys, caplog):
+    """`notifier.telegram_get_updates` ловит свой сбой сама и отвечает `None`
+    (ниже). Сюда доходит только то, чего она не поймала; обработчик пишет так
+    же, как два других, и ждёт столько же."""
+    refusal = RuntimeError(f"getUpdates: 5.1.1 <{ADDRESS}>: rejected")
+    pauses: list = []
+
+    logs, other_output = _poll(monkeypatch, capsys, caplog, [refusal], pauses)
+
+    assert pauses == [telegram_bot.POLL_RETRY_SEC]
+    _assert_nothing_of_the_message(logs, other_output)
+    failure = _the_failure(
+        logs, "telegram_poll_error", error_at=r"telegram_bot\.py:\d+ in run_polling"
+    )
+    assert failure == {
+        "event": "telegram_poll_error",
+        "log_level": "warning",
+        "error_type": "RuntimeError",
+    }
+
+
+# ─── Опрос, который не состоялся ─────────────────────────────────────────────
+#
+# `notifier.telegram_get_updates` отвечает `None`, когда опроса не было (нет
+# токена, сеть, отказ Telegram), и пустым списком, когда сообщений нет. Зовут её
+# двое, и обоим разница нужна: бот ждёт, а не крутит цикл; `telegram poll` не
+# отправляет оператора просить клиента написать ещё раз.
+
+TOKEN = "000111:FAKE-token-for-tests"
+
+
+def test_bot_waits_after_a_poll_that_did_not_happen(bot_user, replies, monkeypatch, capsys, caplog):
+    pauses: list = []
+    polls = [None, [], None, [_incoming("/help")]]
+
+    logs, _ = _poll(monkeypatch, capsys, caplog, polls, pauses)
+
+    # Две паузы — за два несостоявшихся опроса. После опроса без сообщений бот
+    # не ждёт: длинный опрос сам держит запрос, пока сообщений нет.
+    assert pauses == [telegram_bot.POLL_RETRY_SEC] * 2
+    # О причине пишет сама `telegram_get_updates`; бот второй строки не добавляет.
+    assert [entry["event"] for entry in logs] == ["telegram_bot_start"]
+    # После пауз бот работает дальше: сообщение из последнего опроса получило ответ.
+    assert [chat for chat, _ in replies] == [CHAT_ID]
+
+
+def test_bot_with_a_token_telegram_cannot_take_waits_and_logs_no_token(
+    bot_user, monkeypatch, capsys, caplog
+):
+    """Отправитель настоящий: токен с `\\r` на конце (строка env с CRLF), и
+    `urlopen` бросает `InvalidURL` с путём запроса в тексте. До правки бот
+    крутил такой опрос без паузы, а токен стоял в каждой строке журнала."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN + "\r")
+    # Запрос до сети не доходит; если дойдёт — то не дальше этой машины.
+    monkeypatch.setattr(notifier, "TELEGRAM_API_BASE", "https://127.0.0.1:9/bot{token}/{method}")
+    get_updates, polls, pauses = notifier.telegram_get_updates, [], []
+
+    def three_polls(**kwargs):
+        polls.append(kwargs)
+        if len(polls) > 3:
+            raise KeyboardInterrupt  # так бот и останавливают
+        return get_updates(**kwargs)
+
+    monkeypatch.setattr(notifier, "telegram_get_updates", three_polls)
+    monkeypatch.setattr(telegram_bot, "time", SimpleNamespace(sleep=pauses.append))
+    caplog.set_level(logging.DEBUG)
+    capsys.readouterr()
+
+    with capture_logs() as logs, pytest.raises(KeyboardInterrupt):
+        telegram_bot.run_polling(poll_timeout=0)
+
+    printed = capsys.readouterr()
+    assert pauses == [telegram_bot.POLL_RETRY_SEC] * 3
+    failures = [entry for entry in logs if entry["event"] != "telegram_bot_start"]
+    assert [(entry["event"], entry["error_type"]) for entry in failures] == [
+        ("telegram_poll_failed", "InvalidURL")
+    ] * 3
+    written = repr(logs) + printed.out + printed.err + caplog.text
+    assert TOKEN not in written, written
+
+
+@pytest.fixture
+def cli_logging(monkeypatch, tmp_path):
+    """`_setup_logging` пишет в `logs/` текущего каталога и меняет общий конфиг."""
+    monkeypatch.chdir(tmp_path)
+    root = logging.getLogger()
+    saved = (root.handlers[:], root.level)
+    yield
+    for handler in root.handlers:
+        handler.close()
+    root.handlers[:], root.level = saved[0], saved[1]
+    structlog.reset_defaults()
+
+
+def test_telegram_poll_does_not_pass_a_failed_poll_off_as_no_messages(cli_logging, monkeypatch):
+    """Отправитель настоящий, токен тот же, что у бота выше: оператор видит, что
+    опроса не было и почему, — и не видит токена."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN + "\r")
+    monkeypatch.setattr(notifier, "TELEGRAM_API_BASE", "https://127.0.0.1:9/bot{token}/{method}")
+
+    result = CliRunner().invoke(main.cli, ["telegram", "poll"])
+
+    assert result.exit_code == 1, result.output
+    assert "Нет новых сообщений" not in result.output
+    assert "Error: Опрос Telegram не состоялся" in result.output
+    # Причина — строкой журнала, которую команда вывела перед этим.
+    assert "telegram_poll_failed" in result.output and "InvalidURL" in result.output
+    assert TOKEN not in result.output
+
+
+def test_telegram_poll_without_a_token_says_so(cli_logging, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+    result = CliRunner().invoke(main.cli, ["telegram", "poll"])
+
+    assert result.exit_code == 1, result.output
+    assert "Нет новых сообщений" not in result.output
+    assert "telegram_no_token" in result.output
+
+
+def test_telegram_poll_with_no_messages_still_says_there_are_none(cli_logging, monkeypatch):
+    monkeypatch.setattr(notifier, "telegram_get_updates", lambda *args, **kwargs: [])
+
+    result = CliRunner().invoke(main.cli, ["telegram", "poll"])
+
+    assert result.exit_code == 0, result.output
+    assert "Нет новых сообщений" in result.output
