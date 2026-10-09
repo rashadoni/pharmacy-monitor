@@ -109,19 +109,33 @@ class _MaskingWriter(io.BufferedIOBase):
     def name(self) -> str:
         return getattr(self._stream, "name", "<masked>")
 
-    @contextmanager
     def _locked(self):
-        """Замок на время записи. Когда интерпретатор завершается — не дольше
-        секунды: фоновый поток, застрявший на записи в канал, который никто не
-        читает, замок уже не отпустит. Python без маски ждёт столько же и
-        обрывает процесс; ждать вечно значило бы повесить его. Других потоков
-        исполнения к этому времени нет."""
-        held = self._lock.acquire(timeout=1 if sys.is_finalizing() else -1)
+        """Замок на время записи."""
+        if not sys.is_finalizing():
+            # Сам замок, а не обёртка над ним: `with` берёт его так, что Ctrl-C
+            # между взятием и входом в блок не оставит его взятым навсегда.
+            return self._lock
+        return self._locked_while_exiting()
+
+    @contextmanager
+    def _locked_while_exiting(self):
+        """Интерпретатор завершается: замок ждут не дольше секунды.
+
+        Фоновый поток, застрявший на записи в канал, который никто не читает,
+        замок уже не отпустит. Python без маски ждёт столько же; ждать вечно
+        значило бы повесить процесс. Других потоков исполнения к этому времени
+        нет, поэтому дальше — с новым замком: ту же секунду на каждой
+        следующей записи ждать незачем.
+        """
+        lock = self._lock
+        held = lock.acquire(timeout=1)
+        if not held:
+            self._lock = threading.RLock()
         try:
             yield
         finally:
             if held:
-                self._lock.release()
+                lock.release()
 
     def write(self, data) -> int:
         data = bytes(data)

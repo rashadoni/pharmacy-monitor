@@ -342,6 +342,41 @@ def test_closing_the_mask_lets_every_tail_out_and_leaves_the_stream_open():
     assert _reached(under) == "хвост живого потока"
 
 
+def test_the_lock_is_taken_the_way_an_interrupt_cannot_leave_it_held():
+    """`with замок:` берёт его без зазора. Обёртка-генератор оставляла окно:
+    Ctrl-C между взятием и входом в блок — и замок взят навсегда."""
+    writer = output_mask._MaskingWriter(io.StringIO(), io.BytesIO())
+    assert writer._locked() is writer._lock
+
+
+def test_a_lock_nobody_will_release_is_waited_for_once(monkeypatch):
+    """При завершении интерпретатора хозяин замка остановлен вместе с ним.
+    Секунду ждут один раз, а не на каждой следующей записи."""
+    writer = output_mask._MaskingWriter(io.StringIO(), io.BytesIO())
+    taken, done = threading.Event(), threading.Event()
+
+    def stuck():
+        with writer._lock:
+            taken.set()
+            done.wait(10)
+
+    owner = threading.Thread(target=stuck, daemon=True)
+    owner.start()
+    assert taken.wait(5)
+    monkeypatch.setattr(sys, "is_finalizing", lambda: True)
+    try:
+        started = time.perf_counter()
+        writer.flush()
+        first = time.perf_counter() - started
+        writer.write(b"line\n")
+        writer.flush()
+        rest = time.perf_counter() - started - first
+    finally:
+        done.set()
+        owner.join(5)
+    assert 0.9 < first < 3 and rest < 0.5
+
+
 def test_a_close_that_fails_still_closes_the_mask():
     """Канал оборвался, и хвост выпустить не удалось. Маска всё равно закрыта:
     иначе сборщик мусора пришёл бы закрывать её ещё раз."""
@@ -905,11 +940,13 @@ def test_a_background_thread_stuck_on_a_write_does_not_hang_the_exit():
     маски; основной поток закончил. Python без маски ждёт секунду и обрывает
     процесс — под маской он не должен ждать вечно: зависший сбор держит замок
     сбора, и следующий не начнётся."""
+    # Канал без буфера Python: у буфера свой замок, и на нём интерпретатор
+    # обрывает процесс сам, с маской или без.
     script = """
-import os, sys, threading, time
+import io, os, sys, threading, time
 from src import output_mask
 read_end, write_end = os.pipe()
-sys.stdout = open(write_end, "w")
+sys.stdout = io.TextIOWrapper(open(write_end, "wb", buffering=0), write_through=True)
 output_mask.mask_output()
 threading.Thread(target=print, args=("x" * 1_000_000,), daemon=True).start()
 time.sleep(0.5)
@@ -921,10 +958,7 @@ time.sleep(0.5)
         capture_output=True,
         timeout=20,
     )
-    # Проверка — что процесс вообще закончился: иначе `subprocess.run` бросил бы
-    # `TimeoutExpired`. Чем он закончился, решает Python — тем же обрывом, что
-    # и без маски.
-    assert done.returncode is not None
+    assert done.returncode == 0, done.stderr
 
 
 def test_the_tail_without_a_newline_is_written_when_the_process_ends(tmp_path):
