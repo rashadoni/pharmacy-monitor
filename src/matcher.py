@@ -18,18 +18,26 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from functools import lru_cache
+from itertools import islice
 from typing import Sequence
 
 import structlog
 from rapidfuzz import fuzz
-from sqlalchemy import event, select, text
-from sqlalchemy.engine import Connection
-from sqlalchemy.exc import InvalidRequestError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.brand_catalog import is_brand_blacklisted
 from src.brand_resolver import brands_conflict, is_commodity_name
 from src.match_actions import is_rejected
+
+# Замок сопоставления определён один раз, в src.match_lock. Здесь — прежние
+# имена: сбор, rematch, эндпоинты и скрипты зовут их как matcher.<имя>.
+from src.match_lock import (  # noqa: F401
+    MATCH_MUTATION_ADVISORY_LOCK_KEY,
+    acquire_match_mutation_lock,
+    acquire_match_mutation_xact_lock,
+    release_match_mutation_lock,
+)
 from src.normalize import (
     ROUTE_CLASSES,
     extract_form,
@@ -52,168 +60,6 @@ from src.storage import (
 )
 
 log = structlog.get_logger()
-
-MATCH_MUTATION_ADVISORY_LOCK_KEY = "pharmacy_monitor_matcher"
-# Session.info: соединение, на котором сессия держит сессионный замок (_HeldLock).
-_LOCK_CONNECTION_INFO_KEY = "match_mutation_lock_connection"
-
-
-class _HeldLock:
-    __slots__ = ("connection", "raw", "previous_bind")
-
-    def __init__(self, connection: Connection, raw, previous_bind) -> None:
-        self.connection = connection
-        # Соединение драйвера под ним. После обрыва или Ctrl-C посреди запроса
-        # SQLAlchemy соединение вне пула не закрывает, а только отпускает, и при
-        # следующем запросе молча берёт вместо него другое — из пула.
-        self.raw = raw
-        self.previous_bind = previous_bind
-
-    def intact(self) -> bool:
-        """Сессия всё ещё ходит через то самое соединение, на котором лежит замок."""
-        try:
-            return self.connection.connection.dbapi_connection is self.raw
-        except InvalidRequestError:
-            # Соединение потеряно, а транзакция на нём ещё не откачена: SQLAlchemy
-            # отказывается его выдавать («can't reconnect until … rolled back»).
-            return False
-
-
-def _is_postgres(session: Session) -> bool:
-    return session.get_bind().dialect.name == "postgresql"
-
-
-def acquire_match_mutation_xact_lock(session: Session) -> None:
-    """Serialize one transaction with every canonical topology mutation."""
-    if _is_postgres(session):
-        held = session.info.get(_LOCK_CONNECTION_INFO_KEY)
-        if held is not None and not held.intact():
-            # После обрыва или Ctrl-C и rollback сессия идёт уже через пул: без
-            # сессионного замка либо в очередь за собственным брошенным соединением.
-            raise RuntimeError(
-                "the session is no longer on the connection that holds the match mutation lock"
-            )
-        session.scalar(
-            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-            {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY},
-        )
-
-
-def acquire_match_mutation_lock(session: Session, *, wait: bool = True) -> bool:
-    """Session-level lock for multi-transaction operations and rollback.
-
-    Сессионный замок принадлежит соединению с базой, а сессия, привязанная к
-    движку, после каждого commit возвращает соединение в пул и на следующий
-    запрос берёт его заново. Пул вправе отдать другое: соединение старше
-    `pool_recycle` он закрывает и открывает новое. Замок тогда пропадает посреди
-    операции, а снятие уходит в соединение, которое его не держит. На проде так
-    закончились 12 этапов сопоставления из 39 с 3 сентября по 7 октября 2026.
-
-    Поэтому замок берётся на отдельном соединении, которое в пул не
-    возвращается, и до снятия замка сессия работает только через него. Держать
-    замок на одном соединении, а писать через другое нельзя: шаги операции
-    берут транзакционный замок с тем же ключом
-    (`acquire_match_mutation_xact_lock`) и встали бы в очередь за собственным
-    процессом.
-
-    Перевести сессию на другое соединение можно только между транзакциями,
-    поэтому открытая транзакция завершается через `session.commit()` — как её
-    завершил бы первый же commit самой операции — ещё до попытки взять замок,
-    то есть и тогда, когда замок занят и функция вернёт False. Транзакцию,
-    оборванную ошибкой SQL, сервер при этом откатывает.
-
-    Пока замок держится, `session.get_bind()` — соединение, а не движок: код,
-    которому нужен движок (`run_lock.try_shared_scrape_read_lock`), под замком
-    не вызывать. Если соединение замка потеряно (обрыв, Ctrl-C посреди
-    запроса), запросы сессии падают, а после rollback SQLAlchemy переподключил
-    бы её через пул, уже мимо замка — поэтому `acquire_match_mutation_xact_lock`
-    тогда отказывает. Шаг, который транзакционный замок не берёт, этой проверки
-    не проходит: откатывать и продолжать под замком нельзя.
-
-    Сессию, которую вызывающий сам привязал к соединению, функция не трогает:
-    замок ложится на это соединение.
-    """
-    if not _is_postgres(session):
-        return True
-    fn = "pg_advisory_lock" if wait else "pg_try_advisory_lock"
-    statement = text(f"SELECT {fn}(hashtext(:key))")
-    params = {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY}
-    if _LOCK_CONNECTION_INFO_KEY in session.info:
-        raise RuntimeError("this session already holds the match mutation lock")
-    bind = session.get_bind()
-    if isinstance(bind, Connection):
-        value = session.scalar(statement, params)
-        return True if wait else bool(value)
-
-    if session.in_transaction():
-        session.commit()
-    connection = bind.connect()
-    raw = None
-    try:
-        # Вне пула: закрытие такого соединения — конец сеанса на сервере, и
-        # замок уходит вместе с ним, даже если явное снятие не удалось.
-        connection.detach()
-        raw = connection.connection.dbapi_connection
-        value = connection.scalar(statement, params)
-        # Сессионный замок переживает COMMIT; транзакцию самого запроса
-        # закрываем, чтобы сессия начала на этом соединении свою.
-        connection.commit()
-    except BaseException:
-        _close_lock_connection(connection, raw)
-        raise
-    if not wait and not value:
-        _close_lock_connection(connection, raw)
-        return False
-    session.info[_LOCK_CONNECTION_INFO_KEY] = _HeldLock(connection, raw, session.bind)
-    session.bind = connection
-    return True
-
-
-def release_match_mutation_lock(session: Session) -> None:
-    """Снять замок, взятый `acquire_match_mutation_lock`.
-
-    Незавершённую транзакцию сессии функция не фиксирует и не откатывает:
-    транзакция доживает на выделенном соединении, и оно закрывается вместе с
-    ней. Следующая транзакция сессии снова идёт через пул.
-    """
-    if not _is_postgres(session):
-        return
-    statement = text("SELECT pg_advisory_unlock(hashtext(:key))")
-    params = {"key": MATCH_MUTATION_ADVISORY_LOCK_KEY}
-    held = session.info.pop(_LOCK_CONNECTION_INFO_KEY, None)
-    if held is None:
-        if not session.scalar(statement, params):
-            log.warning("matcher_lock_not_held_at_release")
-        return
-    try:
-        if not held.connection.scalar(statement, params):
-            log.warning("matcher_lock_not_held_at_release")
-    finally:
-        session.bind = held.previous_bind
-        _close_after_session_transaction(session, held)
-
-
-def _close_after_session_transaction(session: Session, held: _HeldLock) -> None:
-    """Закрыть выделенное соединение, когда сессия закончит на нём транзакцию."""
-    if not session.in_transaction():
-        _close_lock_connection(held.connection, held.raw)
-        return
-
-    def close(_session: Session, transaction) -> None:
-        # Точки сохранения (вложенные транзакции) соединение не освобождают.
-        if transaction.parent is None and not held.connection.closed:
-            _close_lock_connection(held.connection, held.raw)
-
-    event.listen(session, "after_transaction_end", close)
-
-
-def _close_lock_connection(connection: Connection, raw) -> None:
-    try:
-        connection.close()
-    finally:
-        if raw is not None:
-            raw.close()
-
 
 FUZZY_THRESHOLD = 75  # 0..100, минимальный score для авто-матча.
 # Снижено с 78 → 75 (2026-05-26): bucket (brand, dosage, pack) уже строго
@@ -1860,20 +1706,30 @@ def relink_dead_members(
 
     Безопасность кандидата: (1) живой + unmatched (find_alternatives отдаёт только
     canonical_id IS NULL), (2) тот же pack_count и strength, что у мёртвого (один
-    сайт → единый формат), (3) НЕ конфликтует с живым cross-site anchor'ом по
-    _hard_conflict/_pairwise_spec_conflict, (4) fuzzy score >= min_score. Ручные
+    сайт → единый формат), (3) НЕ конфликтует ни с одним живым товаром других
+    сайтов по _hard_conflict/_pairwise_spec_conflict, (4) fuzzy score >= min_score. Ручные
     (is_manual) кластеры не трогаем. Возвращает план [{match_id,site,old,new,score,
-    action}]; при dry_run БД не меняется (swap_alternative не вызывается)."""
+    action}]. `swap` — замена записана (при dry_run — прошла бы, БД не меняется);
+    `swap-rejected` — кандидат нашёлся, но замену не пропустила проверка самой
+    замены, причина в поле `reason` (например, в кластере есть ещё один мёртвый
+    товар). Отклонённая замена в базе ничего не меняет. Пробный прогон отдаёт
+    тот же план, что отдал бы настоящий на тех же данных."""
     from src import match_actions
 
     results: list[dict] = []
     dead_members = session.scalars(
-        select(Product).where(
+        select(Product)
+        .where(
             Product.url_dead_at.is_not(None),
             Product.canonical_id.is_not(None),
         )
+        .order_by(Product.id)
     ).all()
     seen: set[tuple[int, str]] = set()
+    # Кандидаты, уже отданные кластеру в этом вызове. Настоящий прогон их и так
+    # не предложит второй раз (они больше не без пары); пробному это надо
+    # помнить самому, иначе один кандидат обещан двум кластерам.
+    taken: set[int] = set()
     for d in dead_members:
         key = (d.canonical_id, d.site)
         if key in seen:
@@ -1882,8 +1738,28 @@ def relink_dead_members(
         m = session.get(Match, d.canonical_id)
         if m is None or m.is_manual:
             continue
-        anchor = next((p for p in m.products if p.url_dead_at is None and p.site != d.site), None)
-        if anchor is None:
+        # Замена убирает из кластера «товар сайта», не выбирая какой. Если на
+        # сайте их несколько (быть не должно), убранным оказался бы и живой — с
+        # постоянным отказом, а мёртвый остался бы; в плане при этом значилась
+        # бы замена мёртвого. Такой кластер разбирают руками.
+        if [p.id for p in m.products if p.site == d.site] != [d.id]:
+            results.append(
+                {
+                    "match_id": m.id,
+                    "site": d.site,
+                    "old": d.id,
+                    "new": None,
+                    "score": None,
+                    "action": "skip-several-on-site",
+                }
+            )
+            continue
+        # Кандидат сверяется со всеми живыми товарами других сайтов, а не с
+        # первым попавшимся: иначе от порядка строк в таблице зависело, сведёт
+        # ли замена запрещённую пару (D3 с D3+K2) — и уже в ручном кластере,
+        # который revalidate_split не разбирает.
+        anchors = [p for p in m.products if p.url_dead_at is None and p.site != d.site]
+        if not anchors:
             results.append(
                 {
                     "match_id": d.canonical_id,
@@ -1898,16 +1774,25 @@ def relink_dead_members(
         d_pack = _pack_count(d.pack_size or "")
         d_str = _strength_numbers(d.name or "")
         chosen = None
-        for cand, score in match_actions.find_alternatives(session, m.id, d.site, limit=25):
+        # Окно — 25 самых похожих среди живых и ещё не отданных. Отсев идёт до
+        # окна: в настоящем прогоне отданный кандидат пропадает из списка сам, а
+        # отвязанный мёртвый в нём появляется — пробный обязан видеть то же окно.
+        available = (
+            (cand, score)
+            for cand, score in match_actions.find_alternatives(session, m.id, d.site, limit=None)
+            if cand.url_dead_at is None and cand.id not in taken
+        )
+        for cand, score in islice(available, 25):
             if score < min_score:
                 break  # отсортировано по убыванию
-            if cand.url_dead_at is not None:
-                continue
             if _pack_count(cand.pack_size or "") != d_pack:
                 continue
             if _strength_numbers(cand.name or "") != d_str:
                 continue
-            if _hard_conflict(anchor, cand) or _pairwise_spec_conflict(anchor, cand):
+            if any(
+                _hard_conflict(anchor, cand) or _pairwise_spec_conflict(anchor, cand)
+                for anchor in anchors
+            ):
                 continue
             chosen = (cand, score)
             break
@@ -1924,18 +1809,22 @@ def relink_dead_members(
             )
             continue
         cand, score = chosen
-        results.append(
-            {
-                "match_id": m.id,
-                "site": d.site,
-                "old": d.id,
-                "new": cand.id,
-                "score": score,
-                "action": "swap",
-            }
+        outcome = match_actions.try_swap_alternative(
+            session, m.id, d.site, cand.id, dry_run=dry_run
         )
-        if not dry_run:
-            match_actions.swap_alternative(session, m.id, d.site, cand.id)
+        entry = {
+            "match_id": m.id,
+            "site": d.site,
+            "old": d.id,
+            "new": cand.id,
+            "score": score,
+            "action": "swap" if outcome.accepted else "swap-rejected",
+        }
+        if outcome.accepted:
+            taken.add(cand.id)
+        else:
+            entry["reason"] = outcome.reason
+        results.append(entry)
     return results
 
 

@@ -171,10 +171,109 @@ function normalizeUiLocale(locale: string): UiLocale {
   return locale === "az" || locale === "en" ? locale : "ru";
 }
 
+/**
+ * Отказ правки состава сравнения (заменить, отклонить, подтвердить, добавить
+ * товар, создать сравнение). Бэкенд, кроме русского `detail`, шлёт `code` и
+ * `params` — см. `MatchEditRefused` в src/api.py. По-русски показываем сам
+ * `detail`; для az и en текст берётся отсюда по коду. Код, добавленный на
+ * бэкенде, добавлять и сюда: без записи оператор увидит общее «конфликт данных».
+ */
+type MatchEditParams = { site?: string; match_id?: number; reason?: string };
+
+const MATCH_EDIT_COPY: Record<
+  Exclude<UiLocale, "ru">,
+  Record<string, (p: MatchEditParams) => string>
+> = {
+  az: {
+    matching_in_progress: () =>
+      "Hazırda məhsulların uyğunlaşdırılması gedir — dəyişiklik yazılmadı. 2–3 dəqiqədən sonra yenidən cəhd edin.",
+    match_gone: () => "Bu müqayisə artıq yoxdur. Səhifəni yeniləyin.",
+    relink_bad_link: () =>
+      "Keçidi oxumaq alınmadı. Məhsul səhifəsinin ünvanını tam yapışdırın.",
+    relink_not_in_catalog: (p) =>
+      `Bu keçid üzrə məhsul ${p.site} kataloqunda yoxdur. Keçidin ${p.site} saytındakı məhsul səhifəsinə apardığını yoxlayın; yeni məhsul növbəti skandan sonra görünəcək.`,
+    product_in_other_match: (p) =>
+      `Bu məhsul artıq başqa müqayisədədir (№${p.match_id}). Əvvəlcə həmin müqayisəni rədd edin.`,
+    already_current: (p) =>
+      `Bu məhsul onsuz da bu müqayisədə ${p.site} üzrə durur — dəyişməyə ehtiyac yoxdur.`,
+    dead_link_new: (p) =>
+      `Bu məhsulun ${p.site} saytındakı səhifəsi artıq açılmır — onu müqayisəyə qoymaq olmaz.`,
+    dead_link_member: (p) =>
+      `Bu müqayisədəki ${p.site} məhsulunun səhifəsi artıq açılmır. Əvvəlcə onu dəyişin, sonra bunu.`,
+    out_of_stock_new: (p) =>
+      `Bu məhsul hazırda ${p.site} saytında stokda yoxdur — onu müqayisəyə qoymaq olmaz.`,
+    out_of_stock_member: (p) =>
+      `Bu müqayisədəki ${p.site} məhsulu hazırda stokda yoxdur. Əvvəlcə onu dəyişin və ya stoka qayıtmasını gözləyin.`,
+    country_conflict: () =>
+      "Müqayisədə istehsal ölkəsi fərqli olan məhsullar olardı — qaydaya görə bunlar fərqli məhsullardır.",
+    country_unverified: () =>
+      "Məhsullardan birinin istehsal ölkəsi təsdiqlənməyib — belə müqayisə yaratmaq olmaz.",
+    offer_not_fresh_new: (p) =>
+      `Bu məhsulun ${p.site} saytında stok vəziyyəti çoxdan yoxlanılmayıb. Növbəti skanı gözləyin.`,
+    offer_not_fresh_member: (p) =>
+      `Bu müqayisədəki ${p.site} məhsulunun stok vəziyyəti çoxdan yoxlanılmayıb. Növbəti skanı gözləyin.`,
+    swap_refused: (p) => `Məhsulu dəyişmək alınmadı (səbəb: ${p.reason}).`,
+  },
+  en: {
+    matching_in_progress: () =>
+      "Product matching is running right now — your change was not saved. Try again in 2–3 minutes.",
+    match_gone: () => "This comparison no longer exists. Refresh the page.",
+    relink_bad_link: () =>
+      "Could not read the link. Paste the full address of the product page.",
+    relink_not_in_catalog: (p) =>
+      `There is no product for this link in the ${p.site} catalogue. Check that the link opens a product page on ${p.site}; a new product appears after the next scan.`,
+    product_in_other_match: (p) =>
+      `This product is already in another comparison (#${p.match_id}). Reject that comparison first.`,
+    already_current: (p) =>
+      `This product is already the ${p.site} product of this comparison — nothing to change.`,
+    dead_link_new: (p) =>
+      `The page of this product on ${p.site} no longer opens — it cannot be put into a comparison.`,
+    dead_link_member: (p) =>
+      `The page of the ${p.site} product in this comparison no longer opens. Replace that one first, then this one.`,
+    out_of_stock_new: (p) =>
+      `This product is out of stock on ${p.site} — it cannot be put into a comparison.`,
+    out_of_stock_member: (p) =>
+      `The ${p.site} product of this comparison is out of stock. Replace it first or wait until it is back.`,
+    country_conflict: () =>
+      "The comparison would hold products made in different countries — by the rule these are different products.",
+    country_unverified: () =>
+      "The country of manufacture of one of the products is not verified — such a comparison cannot be made.",
+    offer_not_fresh_new: (p) =>
+      `The stock status of this product on ${p.site} has not been checked for a long time. Wait for the next scan.`,
+    offer_not_fresh_member: (p) =>
+      `The stock status of the ${p.site} product of this comparison has not been checked for a long time. Wait for the next scan.`,
+    swap_refused: (p) => `Could not replace the product (reason: ${p.reason}).`,
+  },
+};
+
+function matchEditRefusal(
+  err: ApiError,
+): { code: string; detail: string; params: MatchEditParams } | null {
+  try {
+    const body = JSON.parse(err.detail);
+    if (typeof body?.code === "string" && typeof body?.detail === "string") {
+      return { code: body.code, detail: body.detail, params: body.params ?? {} };
+    }
+  } catch {
+    /* тело не JSON — не наш отказ */
+  }
+  return null;
+}
+
 export function friendlyError(err: unknown, locale = "ru"): string {
   const normalizedLocale = normalizeUiLocale(locale);
   const copy = ERROR_COPY[normalizedLocale];
   if (err instanceof ApiError) {
+    const refusal = matchEditRefusal(err);
+    if (refusal) {
+      if (normalizedLocale === "ru") return refusal.detail;
+      const texts = MATCH_EDIT_COPY[normalizedLocale];
+      // Незнакомый код — ниже, общим текстом по статусу. Только свои ключи:
+      // код вроде "constructor" не должен достать метод объекта.
+      if (Object.prototype.hasOwnProperty.call(texts, refusal.code)) {
+        return texts[refusal.code](refusal.params);
+      }
+    }
     // Pydantic 422 detail обычно JSON: [{loc, msg, type}, ...]
     if (err.status === 422 && err.detail.startsWith("{")) {
       try {

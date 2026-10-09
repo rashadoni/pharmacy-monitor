@@ -2322,6 +2322,13 @@ def _run_matching_stage(
             log.info("price_mismatch_flags_updated", changed=summary["flagged"])
     except Exception as _fe:
         log.warning("flag_mismatches_failed", error=str(_fe))
+    # Шаги выше берут транзакционный замок сопоставления всегда, а коммитят,
+    # только когда что-то изменили. Без этого commit замок переживал бы этап: в
+    # обычном случае (перепроверка никого не разобрала) он держался до
+    # следующего commit вызывающего — уже после снятия сессионного замка, пока
+    # сбор подтверждает цены и считает алерты. Правки операторов всё это время
+    # получали бы отказ «идёт сопоставление».
+    session.commit()
     return summary
 
 
@@ -6096,13 +6103,26 @@ def rematch_cmd(
             if relink_dead:
                 plan = matcher.relink_dead_members(session, dry_run=dry_run)
                 swaps = [r for r in plan if r["action"] == "swap"]
-                skips = [r for r in plan if r["action"] != "swap"]
-                click.echo(f"relink-dead: {len(swaps)} swap, {len(skips)} skip")
+                rejected = [r for r in plan if r["action"] == "swap-rejected"]
+                skips = [r for r in plan if r["action"] not in ("swap", "swap-rejected")]
+                click.echo(
+                    f"relink-dead: {len(swaps)} swap, {len(rejected)} отклонено, "
+                    f"{len(skips)} skip"
+                )
                 for r in swaps:
                     click.echo(
                         f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} → live#{r['new']} (score {r['score']})"
                     )
-                for r in skips[:20]:
+                for r in rejected:
+                    click.echo(
+                        f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} → live#{r['new']} "
+                        f"— отклонено: {r['reason']}"
+                    )
+                # Пары, которые команда не трогает и которые надо разобрать руками,
+                # печатаются все; остальные пропуски — первые двадцать.
+                by_hand = [r for r in skips if r["action"] == "skip-several-on-site"]
+                routine = [r for r in skips if r["action"] != "skip-several-on-site"]
+                for r in by_hand + routine[:20]:
                     click.echo(f"  cl{r['match_id']} [{r['site']}] dead#{r['old']} — {r['action']}")
                 if dry_run:
                     click.echo("(dry-run — ничего не изменено)")

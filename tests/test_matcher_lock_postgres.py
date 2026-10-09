@@ -36,7 +36,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
 from src import main as main_mod
-from src import matcher
+from src import match_lock, matcher
 from src.storage import Base, Match, Product
 
 # Строки pg_locks с замком сопоставления: односложный ключ bigint лежит в
@@ -338,11 +338,11 @@ def test_edit_queued_behind_the_stage_runs_only_after_its_last_step(engines, mon
             summary = main_mod._run_matching_stage(session)
         finally:
             main_mod._release_matcher_lock(session)
-        # revalidate ничего не разбил и свой транзакционный замок ещё держит —
-        # его отпускает commit вызывающего, как в конце сбора.
-        session.commit()
+        # revalidate ничего не разбил, но и замка за собой не оставил: этап
+        # коммитит в конце сам, и правка проходит, не дожидаясь commit сбора.
         edit.join(10)
         assert not edit.is_alive(), "правка не прошла после снятия замка"
+        session.commit()
 
     assert order == ["revalidate_split", "flag_suspected_mismatches", "manual edit"]
     assert _lock_holders(outsider) == []
@@ -539,7 +539,7 @@ def test_lock_leaves_with_the_transaction_after_an_interrupt_mid_query(engines):
         assert main_mod._acquire_matcher_lock(session, wait=True)
         holders = _lock_holders(outsider)
         # Ссылка держит объект соединения живым: сборщик мусора тест не выручит.
-        raw = session.info[matcher._LOCK_CONNECTION_INFO_KEY].raw
+        raw = session.info[match_lock._LOCK_CONNECTION_INFO_KEY].raw
         with pytest.raises(KeyboardInterrupt):
             session.execute(text("SELECT 'interrupted'"))
         # Откатили и пошли дальше: сессия уже на соединении из пула, и шаг встал бы
@@ -547,6 +547,10 @@ def test_lock_leaves_with_the_transaction_after_an_interrupt_mid_query(engines):
         session.rollback()
         with pytest.raises(RuntimeError, match="no longer on the connection"):
             matcher.acquire_match_mutation_xact_lock(session)
+        # И вариант со сроком ожидания: та же сверка, раньше любого запроса.
+        with pytest.raises(RuntimeError, match="no longer on the connection"):
+            match_lock.acquire_match_mutation_xact_lock_within(session, 0.2)
+        assert not session.in_transaction()
         main_mod._release_matcher_lock(session)
 
         session.close()

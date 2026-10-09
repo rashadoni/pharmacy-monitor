@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import ast
+import datetime
 import shlex
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from sqlalchemy import select
 
 from src import main as main_mod
 from src import storage
@@ -323,6 +325,102 @@ def test_only_writing_modes_take_the_run_lock(db_session, monkeypatch, args, tak
 
     assert _rematch(db_session, monkeypatch, *args).exit_code == 0
     assert waits == ([False] if takes_lock else [])
+
+
+_DEAD_URL_AT = datetime.datetime(2026, 5, 30, 17, 0, 0)
+
+
+def _dead_member_cluster(
+    db_session, name: str, dead_sites: list[str]
+) -> tuple[int, dict[str, tuple[int, int]]]:
+    """Кластер: живой товар pharmonline и мёртвый на каждом из `dead_sites`.
+
+    У каждого мёртвого есть живой кандидат без пары на том же сайте. Возвращает
+    id кластера и {сайт: (id мёртвого, id кандидата)}.
+    """
+    match = storage.Match(tenant_id=1, canonical_name=name, confidence=1.0, is_manual=False)
+    db_session.add(match)
+    db_session.flush()
+    _product(db_session, "pharmonline", name, canonical_id=match.id)
+    pairs: dict[str, tuple[int, int]] = {}
+    for site in dead_sites:
+        dead = _product(
+            db_session, site, name, external_id=f"{site}-{name}-dead", canonical_id=match.id
+        )
+        dead.url_dead_at = _DEAD_URL_AT
+        live = _product(db_session, site, name, external_id=f"{site}-{name}-live")
+        pairs[site] = (dead.id, live.id)
+    db_session.commit()
+    return match.id, pairs
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_relink_dead_report_counts_only_applied_swaps(db_session, monkeypatch, dry_run):
+    """«applied N» — записанные замены; отклонённая идёт своей строкой с причиной.
+
+    Раньше в счёт шла любая замена, для которой нашёлся кандидат, — и та, что
+    не прошла проверку и в базе ничего не изменила. Второй кластер здесь такой:
+    мёртвые товары на двух сайтах не дают заменить ни один из них.
+    """
+    applied, applied_pairs = _dead_member_cluster(db_session, "Ferrovef N60", ["aptekonline"])
+    refused, refused_pairs = _dead_member_cluster(
+        db_session, "Kreon 10000 N20", ["aptekonline", "aloe"]
+    )
+    dead, live = applied_pairs["aptekonline"]
+    dead_apt, live_apt = refused_pairs["aptekonline"]
+    dead_aloe, live_aloe = refused_pairs["aloe"]
+
+    result = _rematch(db_session, monkeypatch, "--relink-dead", *(["--dry-run"] if dry_run else []))
+
+    assert result.exit_code == 0, result.output
+    # Строки журнала (начинаются с отметки времени) идут в тот же вывод.
+    lines = [line for line in result.output.splitlines() if not line[:1].isdigit()]
+    assert lines[0] == "relink-dead: 1 swap, 2 отклонено, 0 skip"
+    assert sorted(lines[1:-1]) == sorted(
+        [
+            f"  cl{applied} [aptekonline] dead#{dead} → live#{live} (score 100)",
+            f"  cl{refused} [aptekonline] dead#{dead_apt} → live#{live_apt} "
+            f"— отклонено: offer:dead_url product={dead_aloe} site=aloe",
+            f"  cl{refused} [aloe] dead#{dead_aloe} → live#{live_aloe} "
+            f"— отклонено: offer:dead_url product={dead_apt} site=aptekonline",
+        ]
+    )
+    assert lines[-1] == (
+        "(dry-run — ничего не изменено)"
+        if dry_run
+        else "applied 1 swap'ов (swap_alternative → кластер is_manual)"
+    )
+    pairing = dict(
+        db_session.execute(select(storage.Product.id, storage.Product.canonical_id)).all()
+    )
+    assert pairing[live] == (None if dry_run else applied)
+    assert pairing[dead] == (applied if dry_run else None)
+    assert [pairing[i] for i in (dead_apt, live_apt, dead_aloe, live_aloe)] == [
+        refused,
+        None,
+        refused,
+        None,
+    ]
+    manual = dict(db_session.execute(select(storage.Match.id, storage.Match.is_manual)).all())
+    assert manual == {applied: not dry_run, refused: False}
+
+
+def test_relink_dead_report_lists_every_pair_left_for_manual_work(db_session, monkeypatch):
+    """Пропусков печатается двадцать, а пары «разобрать руками» — все и первыми."""
+    plan = [
+        {"match_id": n, "site": "aloe", "old": n, "new": None, "score": None, "action": action}
+        for n, action in enumerate(["skip-no-live-alt"] * 25 + ["skip-several-on-site"] * 2)
+    ]
+    monkeypatch.setattr(main_mod.matcher, "relink_dead_members", lambda session, dry_run: plan)
+
+    result = _rematch(db_session, monkeypatch, "--relink-dead", "--dry-run")
+
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.output.splitlines() if line.startswith("  cl")]
+    assert [line.rsplit(" — ", 1)[1] for line in lines] == (
+        ["skip-several-on-site"] * 2 + ["skip-no-live-alt"] * 20
+    )
+    assert result.output.splitlines()[0] == "relink-dead: 0 swap, 0 отклонено, 27 skip"
 
 
 def test_rematch_steps_aside_while_another_matching_stage_runs(db_session, monkeypatch):

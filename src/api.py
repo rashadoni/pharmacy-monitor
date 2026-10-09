@@ -78,7 +78,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.orm import Session, aliased, selectinload
@@ -5033,6 +5033,95 @@ def _require_match_policy(products: list[storage.Product]) -> None:
             raise HTTPException(409, f"Product {product.id} has no fresh active offer")
 
 
+# Все коды отказов правки состава. Тот же перечень — ключи `MATCH_EDIT_COPY` во
+# фронте, для az и для en; сверяет `tests/test_api.py` (vitest в CI не идёт).
+MATCH_EDIT_REFUSAL_CODES = frozenset(
+    {
+        "matching_in_progress",
+        "match_gone",
+        "relink_bad_link",
+        "relink_not_in_catalog",
+        "product_in_other_match",
+        "already_current",
+        "dead_link_new",
+        "dead_link_member",
+        "out_of_stock_new",
+        "out_of_stock_member",
+        "country_conflict",
+        "country_unverified",
+        "offer_not_fresh_new",
+        "offer_not_fresh_member",
+        "swap_refused",
+    }
+)
+
+
+class MatchEditRefused(HTTPException):
+    """Отказ правки состава кластера с кодом причины.
+
+    В ответе, кроме русского `detail`, идут `code` и `params`: дашборд по коду
+    показывает текст на языке оператора (интерфейсом пользуются на
+    азербайджанском), а не общее «конфликт данных». Тексты для az и en лежат во
+    фронте (`MATCH_EDIT_COPY` в `frontend/src/lib/api.ts`) — код, добавленный
+    здесь, добавлять и туда.
+    """
+
+    def __init__(self, status_code: int, code: str, detail: str, **params: Any) -> None:
+        if code not in MATCH_EDIT_REFUSAL_CODES:
+            raise ValueError(f"unknown match edit refusal code: {code!r}")
+        super().__init__(status_code, detail)
+        self.code = code
+        self.params = params
+
+
+@app.exception_handler(MatchEditRefused)
+async def _match_edit_refused(request: Request, exc: MatchEditRefused) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "code": exc.code, "params": exc.params},
+    )
+
+
+# Сколько секунд правка оператора ждёт замок сопоставления. Этап держит его
+# минуты, а дашборд обрывает запрос через 30 секунд и предлагает повторить —
+# ждать этап целиком значило бы записать правку уже после этого «не удалось», и
+# повтор записал бы её второй раз. Нескольких секунд хватает, чтобы дождаться
+# правки другого оператора (она занимает миллисекунды).
+MATCH_EDIT_LOCK_WAIT_SECONDS = 5.0
+
+
+def _lock_match_edits(db: Session, action: str) -> None:
+    """Замок сопоставления — до первого чтения того, что запрос собирается менять.
+
+    Этап сопоставления (конец сбора, `rematch`) держит этот замок полторы — три
+    с половиной минуты и всё это время меняет `products.canonical_id`. Товары он
+    читает в память в начале и дальше работает с копией, поэтому запрос,
+    записавший в эти минуты без замка, этапу не виден: тот затирает правку
+    оператора своей. А запрос, вставший на замок с уже прочитанными кластером и
+    товарами, после ожидания пишет по тому, что было до него: сессии проекта не
+    сбрасывают объекты после commit.
+
+    Отсюда порядок в каждом эндпоинте, который правит состав кластера: проверки,
+    видные из самого запроса (им незачем ждать), затем замок, затем чтение.
+    Замок транзакционный: держится до commit правки или до закрытия сессии при
+    отказе. На SQLite замка нет.
+
+    Пока идёт этап, правка не ждёт его конца, а получает отказ
+    `matching_in_progress`: ничего не прочитано, ничего не записано, соединение
+    возвращено в пул.
+    """
+    from src import match_lock
+
+    if not match_lock.acquire_match_mutation_xact_lock_within(db, MATCH_EDIT_LOCK_WAIT_SECONDS):
+        log.info("match_edit_refused", reason="matching_in_progress", action=action)
+        raise MatchEditRefused(
+            409,
+            "matching_in_progress",
+            "Сейчас идёт сопоставление товаров — правка не записана. "
+            "Повторите через 2–3 минуты.",
+        )
+
+
 @app.post("/api/v1/dash/matches/{match_id}/confirm", status_code=204)
 def dash_match_confirm(
     match_id: int,
@@ -5042,6 +5131,7 @@ def dash_match_confirm(
     """Confirm a borderline match — sets is_manual=true so auto-matcher won't
     re-cluster on next nightly run. Inverse of /reject. Used by suggestion UI.
     """
+    _lock_match_edits(db, "confirm")
     match = db.scalar(
         select(storage.Match).where(
             storage.Match.id == match_id,
@@ -5069,6 +5159,10 @@ def dash_match_reject(
     """Manually reject a match: remove canonical_id from products + record rejection pair."""
     from src import match_actions
 
+    # Состав читается под замком: отказы ниже пишутся по каждой паре, а кластер
+    # удаляется целиком — по составу, прочитанному до ожидания, запрос выдёргивал
+    # товар из пары, в которую его за это время свёл этап.
+    _lock_match_edits(db, "reject")
     match = db.scalar(select(storage.Match).where(storage.Match.id == match_id))
     if not match:
         raise HTTPException(404, "Match not found")
@@ -5090,6 +5184,90 @@ def dash_match_reject(
 class MatchRelinkIn(BaseModel):
     site: str
     url: str
+
+
+_SWAP_OFFER_REFUSAL = re.compile(r"^offer:(?P<why>\w+) product=(?P<product>\d+) site=(?P<site>\w+)$")
+_SWAP_OTHER_MATCH = re.compile(r"^product_in_other_match match=(?P<match>\d+)$")
+
+
+def _relink_refusal(reason: str | None, *, site: str, product_id: int) -> MatchEditRefused:
+    """Отказ `try_swap_alternative` — словами для оператора.
+
+    Раньше на любой отказ замены шло «возможно, это уже текущий товар сайта»:
+    оператор, которому мешала мёртвая ссылка у другого товара пары, получал
+    неверную подсказку. Причину знает сама замена; здесь она только называется
+    по-человечески. «Этот товар» в текстах — тот, чью ссылку вставил оператор.
+    """
+    reason = reason or ""
+    if reason == "match_not_found":
+        return MatchEditRefused(404, "match_gone", "Этого сравнения уже нет. Обновите страницу.")
+    if reason == "already_current":
+        return MatchEditRefused(
+            409,
+            "already_current",
+            f"Этот товар уже стоит в этом сравнении на {site} — менять нечего.",
+            site=site,
+        )
+    if reason == "identity:country_conflict":
+        return MatchEditRefused(
+            409,
+            "country_conflict",
+            "В сравнении оказались бы товары с разной страной производства — "
+            "по правилу это разные товары.",
+        )
+    if reason == "identity:country_unknown":
+        return MatchEditRefused(
+            409,
+            "country_unverified",
+            "У одного из товаров не подтверждена страна производства — "
+            "такое сравнение собрать нельзя.",
+        )
+    other_match = _SWAP_OTHER_MATCH.match(reason)
+    if other_match:
+        match_id = int(other_match["match"])
+        return MatchEditRefused(
+            409,
+            "product_in_other_match",
+            f"Этот товар уже стоит в другом сравнении (№{match_id}). "
+            "Сначала отклоните то сравнение.",
+            match_id=match_id,
+        )
+    offer = _SWAP_OFFER_REFUSAL.match(reason)
+    if offer:
+        # Отказ из-за самого нового товара или из-за другого товара пары —
+        # оператору нужны разные действия.
+        about_new = int(offer["product"]) == product_id
+        where = offer["site"]
+        if offer["why"] == "dead_url":
+            code, text = (
+                ("dead_link_new", f"Страница этого товара на {where} больше не открывается — "
+                 "поставить его в сравнение нельзя.")
+                if about_new
+                else ("dead_link_member", f"У товара {where} в этом сравнении страница больше "
+                      "не открывается. Сначала замените его, потом этот.")
+            )
+        elif offer["why"] == "out_of_stock":
+            code, text = (
+                ("out_of_stock_new", f"Этого товара сейчас нет в наличии на {where} — "
+                 "поставить его в сравнение нельзя.")
+                if about_new
+                else ("out_of_stock_member", f"Товара {where} из этого сравнения сейчас нет в "
+                      "наличии. Сначала замените его или дождитесь, пока он появится.")
+            )
+        else:
+            code, text = (
+                ("offer_not_fresh_new", f"Наличие этого товара на {where} давно не "
+                 "проверялось. Дождитесь следующего сбора.")
+                if about_new
+                else ("offer_not_fresh_member", f"Наличие товара {where} из этого сравнения "
+                      "давно не проверялось. Дождитесь следующего сбора.")
+            )
+        return MatchEditRefused(409, code, text, site=where)
+    # Сюда эндпоинт не доходит (товар найден по сайту и тенанту под тем же
+    # замком); причина остаётся видна, если это когда-нибудь изменится.
+    return MatchEditRefused(
+        409, "swap_refused", f"Не удалось заменить товар (причина: {reason}).", reason=reason
+    )
 
 
 def _external_id_from_url(url: str) -> str:
@@ -5119,21 +5297,32 @@ def dash_match_relink(
     """
     from src import match_actions
 
-    match = db.scalar(
-        select(storage.Match).where(
-            storage.Match.id == match_id, storage.Match.tenant_id == user.tenant_id
-        )
-    )
-    if not match:
-        raise HTTPException(404, "Match not found")
-
+    # То, что видно из самого запроса, проверяем до замка: отказу из-за опечатки
+    # незачем ждать этап сопоставления.
     site = (body.site or "").strip().lower()
     if site not in ("pharmonline", "aptekonline", "aloe"):
         raise HTTPException(400, f"Неизвестный сайт: {site!r}")
 
     ext = _external_id_from_url(body.url)
     if not ext:
-        raise HTTPException(400, "Не удалось разобрать ссылку")
+        raise MatchEditRefused(
+            400,
+            "relink_bad_link",
+            "Не удалось разобрать ссылку. Вставьте адрес страницы товара целиком.",
+        )
+
+    # Замок — до первого чтения, а не внутри замены: кластер и товар ниже
+    # ищутся по тенанту, и этап за время ожидания мог изменить и то, и другое
+    # (свести кандидата в другую пару, распустить кластер).
+    _lock_match_edits(db, "relink")
+
+    match = db.scalar(
+        select(storage.Match).where(
+            storage.Match.id == match_id, storage.Match.tenant_id == user.tenant_id
+        )
+    )
+    if not match:
+        raise _relink_refusal("match_not_found", site=site, product_id=0)
 
     prod = db.scalar(
         select(storage.Product).where(
@@ -5151,20 +5340,21 @@ def dash_match_relink(
             )
         )
     if prod is None:
-        raise HTTPException(
-            404, f"Товар по этой ссылке не найден в каталоге {site} (возможно, не заскрейплен)"
-        )
-    if prod.canonical_id is not None and prod.canonical_id != match_id:
-        raise HTTPException(
-            409,
-            f"Этот товар уже в другом сравнении (#{prod.canonical_id}) — сначала отклоните его там",
+        raise MatchEditRefused(
+            404,
+            "relink_not_in_catalog",
+            f"Товара по этой ссылке нет в каталоге {site}. Проверьте, что ссылка ведёт на "
+            f"страницу товара на {site}; новый товар появится после ближайшего сбора.",
+            site=site,
         )
 
-    _require_match_policy([p for p in match.products if p.site != site] + [prod])
-
-    ok = match_actions.swap_alternative(db, match_id, site, prod.id)
-    if not ok:
-        raise HTTPException(400, "Не удалось переназначить (возможно, это уже текущий товар сайта)")
+    # Остальное проверяет сама замена — и товар из другого сравнения, и страну,
+    # и наличие (всё, что смотрел `_require_match_policy`, и мёртвую ссылку
+    # сверх того). Причина отказа у неё одна на все пути, включая старый дашборд
+    # и `rematch --relink-dead`.
+    outcome = match_actions.try_swap_alternative(db, match_id, site, prod.id)
+    if not outcome.accepted:
+        raise _relink_refusal(outcome.reason, site=site, product_id=prod.id)
 
     log.info("match_relinked", match_id=match_id, site=site, product_id=prod.id, user_id=user.id)
     return {"ok": True, "product_id": prod.id, "name": prod.name, "site": site}
@@ -5917,6 +6107,7 @@ def dash_match_add_product(
     - Если product был в другом match'е — переезжает (старый match теряет связь)
     Метит Match.is_manual=True (ручной выбор → защищён от auto-перематчивания).
     """
+    _lock_match_edits(db, "add-product")
     match = db.scalar(
         select(storage.Match).where(
             storage.Match.id == match_id,
@@ -5990,6 +6181,13 @@ def dash_match_create_with_products(
     кластера). Берёт canonical_name/brand/... из первого продукта. Метит
     is_manual=True. Возвращает созданный Match.
     """
+    # Повтор в списке виден из самого запроса и при любом состоянии базы кончается
+    # тем же отказом, что ниже: найдётся меньше товаров, чем названо. Замок ему
+    # ждать незачем.
+    if len(set(payload.product_ids)) != len(payload.product_ids):
+        raise HTTPException(404, "One or more products not found")
+
+    _lock_match_edits(db, "create-with-products")
     products = list(
         db.scalars(
             select(storage.Product).where(

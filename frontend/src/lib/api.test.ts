@@ -1,6 +1,47 @@
 import { describe, expect, it } from "vitest";
 import { ApiError, friendlyError, isVerifiedScanPendingError } from "./api";
 
+describe("match edit refusals", () => {
+  const refusal = (status: number, code: string, detail: string, params = {}) =>
+    new ApiError(status, JSON.stringify({ detail, code, params }));
+
+  it("shows the backend text in Russian and its own text in az and en", () => {
+    const busy = refusal(
+      409,
+      "matching_in_progress",
+      "Сейчас идёт сопоставление товаров — правка не записана. Повторите через 2–3 минуты.",
+    );
+    expect(friendlyError(busy, "ru")).toBe(
+      "Сейчас идёт сопоставление товаров — правка не записана. Повторите через 2–3 минуты.",
+    );
+    expect(friendlyError(busy, "az")).toContain("uyğunlaşdırılması gedir");
+    expect(friendlyError(busy, "en")).toContain("matching is running");
+  });
+
+  it("names the site and the other comparison from params", () => {
+    const dead = refusal(409, "dead_link_member", "…", { site: "pharmonline" });
+    expect(friendlyError(dead, "az")).toContain("pharmonline məhsulunun səhifəsi");
+    const taken = refusal(409, "product_in_other_match", "…", { match_id: 41 });
+    expect(friendlyError(taken, "en")).toContain("(#41)");
+  });
+
+  it("keeps the specific text for 404 instead of the generic not found", () => {
+    const gone = refusal(404, "match_gone", "Этого сравнения уже нет. Обновите страницу.");
+    expect(friendlyError(gone, "ru")).toBe("Этого сравнения уже нет. Обновите страницу.");
+    expect(friendlyError(gone, "az")).toBe("Bu müqayisə artıq yoxdur. Səhifəni yeniləyin.");
+  });
+
+  it("falls back to the status text for a code it does not know", () => {
+    const conflict =
+      "Məlumat ziddiyyəti var. Səhifəni yeniləyib dəyişiklikləri yoxlayın.";
+    const unknown = refusal(409, "brand_new_code", "Что-то новое");
+    expect(friendlyError(unknown, "ru")).toBe("Что-то новое");
+    expect(friendlyError(unknown, "az")).toBe(conflict);
+    // Имя метода объекта — не код отказа.
+    expect(friendlyError(refusal(409, "constructor", "…"), "az")).toBe(conflict);
+  });
+});
+
 describe("friendlyError locale handling", () => {
   it("localizes common HTTP errors", () => {
     expect(friendlyError(new ApiError(401, "unauthorized"), "az")).toBe(
