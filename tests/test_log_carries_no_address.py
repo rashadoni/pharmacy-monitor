@@ -173,8 +173,9 @@ _PRINTS_INCOMING_MESSAGES_BY_DESIGN = {
     # чат, видно по имени и по тексту; в тексте бывает `/start <адрес>`.
     "telegram_poll": "telegram poll",
 }
-# Кто в `src/` сам читает входящие сообщения (`notifier.telegram_get_updates`) и
-# чем отвечает за то, что они никуда не утекут. Новый читатель — решение.
+# Кто в `src/` называет `notifier.telegram_get_updates` — зовёт сам, кладёт в
+# переменную или передаёт дальше — и чем отвечает за то, что сообщения никуда не
+# утекут. Новый читатель — решение.
 _READS_INCOMING_MESSAGES = {
     "telegram_poll": "печатает оператору: строка списка выше, запрет в workflow",
     "run_polling": "бот: его журнал и печать проверяет tests/test_telegram_bot.py",
@@ -636,10 +637,11 @@ def test_every_reader_of_incoming_messages_is_accounted_for():
     """Вход у сообщений один — `notifier.telegram_get_updates`. Кто его зовёт,
     тот держит в руках имя, идентификатор чата и текст человека."""
     readers = {
-        str(owner)
-        for path, source in _src_sources().items()
-        for call, owner in _calls_with_owner(ast.parse(source))
-        if _called_name(call) == "telegram_get_updates"
+        owner.name if owner else "<модуль>"
+        for source in _src_sources().values()
+        for node, owner in _nodes_with_owner(ast.parse(source))
+        # Любое упоминание, не только вызов: псевдоним и передача аргументом.
+        if _reference(node) == "telegram_get_updates"
     }
     assert readers == set(_READS_INCOMING_MESSAGES), (
         f"Входящие сообщения Telegram читают {sorted(readers)}, а учтены "
@@ -679,7 +681,7 @@ def test_telegram_poll_prints_the_incoming_message_and_is_listed_for_it(cli_logg
         "Пока команда печатает хоть что-то из этого — она в списке, и ни один "
         "workflow её не запускает. Перестала печатать — убери строку списка."
     )
-    # Сегодня — всё сообщение целиком: идентификатор чата, имя и текст с адресом.
+    # Сегодня — идентификатор чата, ник (нет ника — имя) и первые 60 знаков текста.
     line = f"chat_id={chat_id}  from={sender}  text='/start {ADDRESS} {said}'"
     assert line in result.output, (
         "Вывод `telegram poll` изменился: поправь образец здесь и причину у "
