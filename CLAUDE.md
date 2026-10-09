@@ -906,6 +906,15 @@ SELECT COUNT(*) FROM products;
 - Tests live in `tests/`, named `test_<module>.py`
 - Avoid `print()` in src/ — use `structlog`
 - New endpoints under `/api/v1/dash/*` for frontend, `/api/v1/<x>` for ERP
+- Строка, которую писали не мы (название товара, текст проблемы health, слово, набранное
+  человеком), попадает в Telegram-сообщение только через `notifier.telegram_escape`; обрезать её —
+  до вызова. Сообщения идут в разметке Markdown (legacy): незакрытые `_`, `*`, `` ` ``, `[`
+  Telegram отвергает вместе со всем сообщением, закрытые — принимает, но знаки из текста пропадают.
+  На отказ 400 отправитель повторяет тот же текст без разметки (в журнале `telegram_markup_refused`).
+  Проверка — `tests/test_telegram_markup.py`: вместо сервера там перенос его разбора из исходника
+  tdlib. ⚠️ На живом Telegram не проверено (2026-10-10 бот выключен, токена нет): перед включением
+  бота — два ручных сообщения из [docs/RUNBOOK.md](docs/RUNBOOK.md) «Telegram: сообщение пришло со
+  знаками разметки».
 
 ## Important context I should not forget
 
