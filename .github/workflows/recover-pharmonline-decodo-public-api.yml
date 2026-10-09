@@ -2,9 +2,14 @@ name: Reconcile and recover Pharmonline catalog via verified Decodo public API
 
 # This is the only write-enabled Decodo route.  It never replaces the running
 # production source tree.  A successful exact-commit, read-only reconciliation
-# plan is required first; the job then stages its own verified source, retains a
-# production DB backup, creates the additive audit schema, performs the guarded
-# in-place legacy ID rekey, and only then publishes a verified full catalog.
+# plan is required first; the job then stages its own verified source, refuses
+# unless the production DB is at this commit's migration head, retains a
+# production DB backup, performs the guarded in-place legacy ID rekey, and only
+# then publishes a verified full catalog.
+#
+# It does not migrate.  deploy.yml is the only thing that moves the production
+# schema; a commit whose migrations are ahead of the DB is deployed first
+# (apply_migrations=true) and this workflow is dispatched afterwards.
 on:
   workflow_dispatch:
     inputs:
@@ -343,6 +348,34 @@ jobs:
             export "$key=$value"
           done < /etc/pharmacy-monitor/env
 
+          # This job runs the code of its own checkout against the production
+          # DB: every CLI command calls storage.init_db() -> create_all, so a
+          # commit with a table the DB lacks would create it past Alembic, and
+          # one with a new column fails on its first query.  Refuse unless the
+          # DB is exactly at this commit's single migration head.  This is the
+          # first thing that touches the DB, before the backup and before any
+          # write: a refusal changes nothing in the DB and takes no backup (the
+          # staged source stays on the host for audit).
+          cd "$runtime_dir"
+          if ! db_revision=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python -m alembic \
+              -c "$runtime_dir/alembic.ini" current | awk 'NF {print $1}'); then
+            echo "refusing reconciliation: the production DB revision cannot be read with this commit's migrations (the DB is ahead of this commit, or unreachable); dispatch from the deployed commit" >&2
+            exit 1
+          fi
+          source_head=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+            /opt/pharmacy-monitor/.venv/bin/python -m alembic \
+              -c "$runtime_dir/alembic.ini" heads | awk 'NF {print $1}')
+          if [ "$(printf '%s\n' "$source_head" | sed '/^$/d' | wc -l)" -ne 1 ]; then
+            echo "refusing reconciliation: this commit must have exactly one migration head, found: ${source_head:-none}" >&2
+            exit 1
+          fi
+          if [ "$db_revision" != "$source_head" ]; then
+            echo "refusing reconciliation: production DB is at migration ${db_revision:-none}, this commit's migrations end at $source_head; deploy this commit with deploy.yml (apply_migrations=true) first; this workflow does not migrate" >&2
+            exit 1
+          fi
+          echo "production DB is at this commit's migration head: $db_revision"
+
           backup_path="$work_dir/production-before-reconciliation.dump"
           BACKUP_PATH="$backup_path" PYTHONDONTWRITEBYTECODE=1 \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
@@ -409,13 +442,6 @@ jobs:
           )
           PY
 
-          cd "$runtime_dir"
-          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
-            /opt/pharmacy-monitor/.venv/bin/python -m alembic -c "$runtime_dir/alembic.ini" upgrade head
-          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
-            /opt/pharmacy-monitor/.venv/bin/python -m alembic -c "$runtime_dir/alembic.ini" current | \
-            grep -F '0021_public_api_quarantines'
-
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
           from src import storage
@@ -424,7 +450,7 @@ jobs:
           Session = storage.make_session()
           with Session() as session:
               if not _pharmonline_public_api_recovery_tables_available(session):
-                  raise SystemExit("reconciliation audit schema is not available after migration")
+                  raise SystemExit("reconciliation audit schema is not available")
           print("reconciliation audit schema verified")
           PY
 
@@ -630,7 +656,14 @@ jobs:
           fi
           test "$(sha256sum "$work_dir/incoming/source-manifest" | awk '{print $1}')" = \
             "$source_manifest_sha"
-          test -f "$work_dir/production-before-reconciliation.dump"
+          if [ ! -f "$work_dir/production-before-reconciliation.dump" ]; then
+            if [ -f "$work_dir/reconciliation-and-catalog-recovery-verified" ]; then
+              echo "recovery is marked verified but its production backup is missing" >&2
+              exit 1
+            fi
+            echo "recovery stopped before the production backup; staged source retained for audit" >&2
+            exit 0
+          fi
           if [ -f "$work_dir/reconciliation-and-catalog-recovery-verified" ]; then
             echo "verified recovery evidence and immutable backup retained"
           else
