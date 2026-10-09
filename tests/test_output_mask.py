@@ -69,14 +69,18 @@ _HOW_TO_FIX_THE_OPERATOR_COMMANDS = (
 _HOW_TO_FIX_A_WAY_PAST_THE_MASK = (
     "В `src/` появился или исчез путь мимо маски вывода. Лишнее: {extra}. "
     "Пропало: {missing}. Маску снимает только `OperatorCommand.invoke`, а поток "
-    "под маской берёт только настройка журнала (`_setup_logging`, `_log_stream`): "
-    "у журнала своя маска. Остальному коду `unmask_output`, `unmasked`, "
-    "`sys.__stdout__` / `sys.__stderr__`, `os.write` и присваивание `sys.stdout` / "
-    "`sys.stderr` не нужны: печатай через `click.echo` или `print`. Если строка "
+    "под маской берёт только журнал (`_setup_logging`, `_LogStream`): у него своя "
+    "маска. Остальному коду `unmask_output`, `unmasked`, `sys.__stdout__` / "
+    "`sys.__stderr__`, `os.write` и присваивание `sys.stdout` / `sys.stderr` не "
+    "нужны: печатай через `click.echo` или `print`. «При импорте» значит, что "
+    "`sys.stdout` / `sys.stderr` взят на уровне модуля, в теле класса или "
+    "значением по умолчанию: маску ставит запуск команды, позже, и такой поток "
+    "остаётся без неё. Бери поток в момент печати, внутри функции. Если строка "
     "переехала в другую функцию — поправь список в тесте."
 )
 _HOW_TO_FIX_A_CHILD_PROCESS = (
-    "В `src/` появился новый запуск дочернего процесса: {found}. Ребёнок пишет в "
+    "Список файлов `src/`, которые запускают дочерний процесс, разошёлся с кодом: "
+    "{found}. Ребёнок пишет в "
     "дескриптор, который унаследовал, — мимо `sys.stdout` и мимо маски вывода. "
     "Забери его вывод себе (`capture_output=True`) и напечатай сам — тогда он "
     "пройдёт через маску, — и внеси файл в `_STARTS_A_CHILD_PROCESS`."
@@ -205,6 +209,101 @@ def test_a_stream_that_flushes_each_line_does_not_flush_the_tail(monkeypatch):
     assert _reached(under) == "первая\n<address>\n"
 
 
+def test_a_stream_that_flushes_each_line_draws_a_progress_bar_without_flush():
+    """Такой поток сбрасывает буфер и на возврате каретки: полосу прогресса в
+    stderr рисуют без `flush`."""
+    under = _stream(line_buffering=True)
+    masked = MaskedStream(under)
+    masked.write("\r[#   ] 25%")
+    assert _reached(under) == "\r[#   ] 25%"
+
+    # Поток без такого сброса ждёт — как ждал бы и без маски.
+    plain = _stream()
+    held = MaskedStream(plain)
+    held.write("\r[#   ] 25%")
+    assert _reached(plain) == ""
+
+
+def test_flush_reaches_the_file_under_the_stream(tmp_path):
+    """У `BytesIO` сбрасывать нечего; у настоящего файла между потоком и
+    диском ещё один буфер, и `click.echo` ждёт, что `flush` опустошит и его."""
+    path = tmp_path / "out.txt"
+    with open(path, "w", encoding="utf-8") as real:
+        masked = MaskedStream(real)
+        masked.write("started\n")
+        assert path.read_text(encoding="utf-8") == ""
+        masked.flush()
+        assert path.read_text(encoding="utf-8") == "started\n"
+
+
+def test_lines_from_two_threads_are_not_glued_together():
+    """`print("a", b)` — несколько вызовов `write`, и между ними успевает
+    вклиниться другой поток исполнения. Хвост у каждого свой."""
+    under = _stream()
+    masked = MaskedStream(under)
+    half_written, go_on = threading.Event(), threading.Event()
+
+    def slow():
+        masked.write("медленный ")
+        half_written.set()
+        go_on.wait(5)
+        masked.write(f"{ADDRESS}\n")
+
+    writer = threading.Thread(target=slow, daemon=True)
+    writer.start()
+    assert half_written.wait(5)
+    print("быстрый", ADDRESS, file=masked)
+    # Чужой хвост `flush` не трогает: его хозяин ещё пишет.
+    masked.flush()
+    assert _reached(under) == "быстрый <address>\n"
+    go_on.set()
+    writer.join(5)
+    assert _reached(under) == "быстрый <address>\nмедленный <address>\n"
+
+
+def test_the_tail_of_a_finished_thread_is_not_lost():
+    """Дописать строку больше некому: её выпускает первый же `flush` — при
+    выходе из процесса его зовёт интерпретатор."""
+    under = _stream()
+    masked = MaskedStream(under)
+    writer = threading.Thread(target=masked.write, args=("хвост потока",))
+    writer.start()
+    writer.join()
+    assert _reached(under) == ""
+    masked.flush()
+    assert _reached(under) == "хвост потока"
+
+
+def test_a_flush_waits_for_a_write_in_progress():
+    """Запись в медленный канал держит замок: сброс из другого потока
+    исполнения не вклинивается в её середину."""
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    class Sink:
+        def write(self, data: bytes) -> None:
+            calls.append("запись началась")
+            entered.set()
+            release.wait(5)
+            calls.append("запись кончилась")
+
+        def flush(self) -> None:
+            calls.append("сброс")
+
+    writer = output_mask._MaskingWriter(io.StringIO(), Sink())
+    writing = threading.Thread(target=writer.write, args=(b"line\n",), daemon=True)
+    writing.start()
+    assert entered.wait(5)
+    flushing = threading.Thread(target=writer.flush, daemon=True)
+    flushing.start()
+    flushing.join(0.3)
+    assert flushing.is_alive(), "сброс не дождался записи"
+    release.set()
+    writing.join(5)
+    flushing.join(5)
+    assert calls == ["запись началась", "запись кончилась", "сброс"]
+
+
 def test_bytes_written_to_the_buffer_are_masked_too():
     """`sys.stdout.buffer` — обычный способ напечатать мимо текстового слоя."""
     under = _stream()
@@ -247,6 +346,12 @@ def test_the_masked_stream_answers_for_the_stream_it_hides():
     masked = MaskedStream(under)
     assert (masked.encoding, masked.errors) == ("latin-1", "backslashreplace")
     assert masked.isatty() is False and masked.writable() and not masked.closed
+
+    class Terminal(io.TextIOWrapper):
+        def isatty(self) -> bool:
+            return True
+
+    assert MaskedStream(Terminal(io.BytesIO(), encoding="utf-8")).isatty() is True
     assert masked.unmasked is under
     # Потока без дескриптора Playwright ждёт именно с этой ошибкой.
     with pytest.raises(io.UnsupportedOperation):
@@ -337,6 +442,15 @@ def test_the_mask_goes_on_both_streams_once(monkeypatch):
     assert (sys.stdout, sys.stderr) == first
     assert (sys.stdout.unmasked, sys.stderr.unmasked) == (out, err)
     assert output_mask.unmasked(sys.stdout) is out and output_mask.unmasked(out) is out
+
+
+def test_a_process_without_streams_is_left_alone(monkeypatch):
+    """У демона с закрытыми дескрипторами `sys.stdout` — `None`."""
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    output_mask.mask_output()
+    output_mask.unmask_output()
+    assert sys.stdout is None and sys.stderr is None
 
 
 def test_one_stream_under_both_names_gets_one_mask(monkeypatch):
@@ -687,49 +801,83 @@ def probe():
 
 
 # ─── 6. Кто вправе снять маску — чтение кода ─────────────────────────────────
+#
+# Растяжки, а не ограждение: сверяют имена и ловят случайное, не намеренное.
+# `import os as o; o.write(1, …)`, `open(1, "w", closefd=False)`,
+# `contextlib.redirect_stdout` они не видят.
 
 # Файл, функция, имя. Маску снимает одно место; поток под ней берёт журнал.
 _WAYS_PAST_THE_MASK = {
     ("src/main.py", "OperatorCommand.invoke", "unmask_output"),
     ("src/main.py", "_setup_logging", "unmasked"),
-    ("src/main.py", "_log_stream", "unmasked"),
+    ("src/main.py", "_LogStream.msg", "unmasked"),
 }
-_NAMES_PAST_THE_MASK = {"unmask_output", "unmasked", "__stdout__", "__stderr__"}
-_CALLS_PAST_THE_MASK = {"os.write", "os.fdopen"}
+_NAMES_PAST_THE_MASK = {"unmask_output", "__stdout__", "__stderr__"}
+# `unmasked` — слово обычное: считается только атрибутом и в импорте.
+_ATTRIBUTES_PAST_THE_MASK = _NAMES_PAST_THE_MASK | {"unmasked"}
+_CALLS_PAST_THE_MASK = {"os.write"}
 _STREAM_NAMES = {"sys.stdout", "sys.stderr"}
-# Кто в `src/` запускает дочерний процесс. Оба забирают его вывод себе:
-# `observability` читает ответ git, `dashboard` — журнал сбора для страницы.
+# Кто в `src/` запускает дочерний процесс через `subprocess`. Оба забирают его
+# вывод себе: `observability` читает ответ git, `dashboard` — журнал сбора для
+# страницы. Чего проверка не видит: Playwright запускает свой драйвер сам, из
+# своего кода, и stderr драйвера идёт в дескриптор мимо маски.
 _STARTS_A_CHILD_PROCESS = {"src/observability.py", "src/dashboard.py"}
 _CHILD_PROCESS_MODULES = {"subprocess", "multiprocessing", "pty"}
-_CHILD_PROCESS_CALLS = {"os.system", "os.popen", "os.fork", "os.posix_spawn", "os.startfile"}
+_OS_STARTS_A_CHILD = ("system", "popen", "fork", "exec", "spawn", "posix_spawn", "startfile")
+_STARTS_A_CHILD = ("create_subprocess", "subprocess_exec", "subprocess_shell")
 
 
-def _owners(node: ast.AST, owner: str = ""):
-    """Каждый узел дерева и имя того, внутри чего он стоит: «Класс.метод»."""
+def _scoped(node: ast.AST, owner: str = "", called: bool = False):
+    """Каждый узел дерева, имя того, внутри чего он стоит («Класс.метод»), и
+    исполняется ли он при вызове функции — а не при импорте модуля."""
     for child in ast.iter_child_nodes(node):
-        yield child, owner
-        named = isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
-        yield from _owners(child, f"{owner}.{child.name}".lstrip(".") if named else owner)
+        yield child, owner, called
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            inner = owner if isinstance(child, ast.Lambda) else f"{owner}.{child.name}".lstrip(".")
+            # Значения по умолчанию и декораторы вычисляются там, где функция
+            # объявлена, а не там, где её зовут.
+            declared = [*child.args.defaults, *filter(None, child.args.kw_defaults)]
+            declared += getattr(child, "decorator_list", [])
+            for part in declared:
+                yield part, owner, called
+                yield from _scoped(part, owner, called)
+            for part in child.body if isinstance(child.body, list) else [child.body]:
+                yield part, inner, True
+                yield from _scoped(part, inner, True)
+        elif isinstance(child, ast.ClassDef):
+            yield from _scoped(child, f"{owner}.{child.name}".lstrip("."), called)
+        else:
+            yield from _scoped(child, owner, called)
 
 
 def ways_past_the_mask(sources: dict[str, str]) -> set[tuple[str, str, str]]:
     """Где код обходит маску вывода: снимает её, берёт поток под ней, пишет в
-    дескриптор или ставит на место `sys.stdout` свой поток."""
+    дескриптор, ставит на место `sys.stdout` свой поток — или берёт `sys.stdout`
+    при импорте модуля, когда маски на нём ещё нет."""
     found = set()
     for path, source in sources.items():
-        for node, owner in _owners(ast.parse(source)):
+        for node, owner, called in _scoped(ast.parse(source)):
             if isinstance(node, ast.ImportFrom):
                 found |= {
                     (path, owner, alias.name)
                     for alias in node.names
-                    if alias.name in _NAMES_PAST_THE_MASK
+                    if alias.name in _ATTRIBUTES_PAST_THE_MASK
                 }
-            if isinstance(node, ast.Attribute | ast.Name):
-                name = node.attr if isinstance(node, ast.Attribute) else node.id
-                if name in _NAMES_PAST_THE_MASK:
-                    found.add((path, owner, name))
+                if node.module == "sys" and not called:
+                    found |= {
+                        (path, owner, f"sys.{alias.name} при импорте")
+                        for alias in node.names
+                        if f"sys.{alias.name}" in _STREAM_NAMES
+                    }
+            if isinstance(node, ast.Name) and node.id in _NAMES_PAST_THE_MASK:
+                found.add((path, owner, node.id))
+            if isinstance(node, ast.Attribute):
+                if node.attr in _ATTRIBUTES_PAST_THE_MASK:
+                    found.add((path, owner, node.attr))
                 elif ast.unparse(node) in _CALLS_PAST_THE_MASK:
                     found.add((path, owner, ast.unparse(node)))
+                elif ast.unparse(node) in _STREAM_NAMES and not called:
+                    found.add((path, owner, f"{ast.unparse(node)} при импорте"))
             targets = []
             if isinstance(node, ast.Assign):
                 targets = node.targets
@@ -750,20 +898,32 @@ def child_processes(sources: dict[str, str]) -> set[str]:
     found = set()
     for path, source in sources.items():
         for node in ast.walk(ast.parse(source)):
-            modules = []
+            names = []
             if isinstance(node, ast.Import):
-                modules = [alias.name for alias in node.names]
+                names = [alias.name.split(".")[0] for alias in node.names]
             elif isinstance(node, ast.ImportFrom):
-                modules = [node.module or ""]
-            if {module.split(".")[0] for module in modules} & _CHILD_PROCESS_MODULES:
-                found.add(path)
-            if isinstance(node, ast.Attribute) and (
-                ast.unparse(node) in _CHILD_PROCESS_CALLS
-                or (
-                    node.attr.startswith(("create_subprocess", "exec", "spawn"))
-                    and ast.unparse(node.value) in {"os", "asyncio"}
+                names = [(node.module or "").split(".")[0]]
+                if node.module == "os":
+                    names += [
+                        "subprocess"
+                        for alias in node.names
+                        if alias.name.startswith(_OS_STARTS_A_CHILD)
+                    ]
+                names += [
+                    "subprocess"
+                    for alias in node.names
+                    if alias.name.startswith(_STARTS_A_CHILD) or alias.name == "ProcessPoolExecutor"
+                ]
+            elif isinstance(node, ast.Name):
+                names = ["subprocess"] if node.id == "ProcessPoolExecutor" else []
+            elif isinstance(node, ast.Attribute):
+                from_os = ast.unparse(node.value) == "os" and node.attr.startswith(
+                    _OS_STARTS_A_CHILD
                 )
-            ):
+                starts = node.attr.startswith(_STARTS_A_CHILD)
+                if from_os or starts or node.attr == "ProcessPoolExecutor":
+                    names = ["subprocess"]
+            if set(names) & _CHILD_PROCESS_MODULES:
                 found.add(path)
     return found
 
@@ -793,6 +953,7 @@ def test_only_the_operator_command_and_the_log_reach_past_the_mask():
             "from src.output_mask import unmask_output as off\ndef run_cmd():\n    off()\n",
             {("", "unmask_output")},
         ),
+        ("from src.output_mask import unmasked\n", {("", "unmasked")}),
         ("def f():\n    output_mask.unmasked(sys.stderr).write(x)\n", {("f", "unmasked")}),
         ("def f():\n    sys.stdout.unmasked.write(x)\n", {("f", "unmasked")}),
         ("def f():\n    print(x, file=sys.__stdout__)\n", {("f", "__stdout__")}),
@@ -804,10 +965,27 @@ def test_only_the_operator_command_and_the_log_reach_past_the_mask():
             {("f", "sys.stdout ="), ("f", "sys.stderr =")},
         ),
         ("def f():\n    setattr(sys, name, stream)\n", {("f", "setattr(sys, …)")}),
-        # Обычная печать и чтение потока — не обход.
+        # Поток взят при импорте модуля: маску ставит запуск команды, позже.
+        ("OUT = sys.stderr\n", {("", "sys.stderr при импорте")}),
+        ("handler = logging.StreamHandler(sys.stdout)\n", {("", "sys.stdout при импорте")}),
+        ("class A:\n    out = sys.stdout\n", {("A", "sys.stdout при импорте")}),
+        (
+            "def report(text, out=sys.stdout):\n    out.write(text)\n",
+            {("", "sys.stdout при импорте")},
+        ),
+        (
+            "class A:\n    def f(self, *, out=sys.stderr):\n        pass\n",
+            {("A", "sys.stderr при импорте")},
+        ),
+        ("from sys import stderr\n", {("", "sys.stderr при импорте")}),
+        # Обычная печать и поток, взятый в момент вызова, — не обход.
         ("def f():\n    print(x, file=sys.stderr)\n    sys.stdout.flush()\n", set()),
         ("def f():\n    handler = logging.StreamHandler(sys.stdout)\n", set()),
-        ("def f():\n    os.fsync(temp_file.fileno())\n", set()),
+        ("def f():\n    from sys import stdout\n", set()),
+        ("factory = lambda: sys.stdout\n", set()),
+        # Обычное слово и запись во временный файл.
+        ("def f():\n    unmasked = [row for row in rows if row.shown]\n", set()),
+        ("def f():\n    os.fsync(temp_file.fileno())\n    os.fdopen(fd, 'w')\n", set()),
     ],
 )
 def test_the_code_check_sees_a_way_past_the_mask(source, found):
@@ -829,11 +1007,19 @@ def test_only_the_known_places_in_src_start_a_child_process():
         ("from subprocess import run\n", True),
         ("from multiprocessing.pool import Pool\n", True),
         ("os.system('git status')\n", True),
+        ("from os import system\n", True),
         ("await asyncio.create_subprocess_exec('git')\n", True),
+        ("from asyncio import create_subprocess_shell\n", True),
+        ("await loop.subprocess_exec(protocol, 'git')\n", True),
         ("os.execv(path, argv)\n", True),
         ("os.spawnlp(os.P_WAIT, 'git', 'git')\n", True),
+        ("os.posix_spawnp('git', argv, env)\n", True),
+        ("os.forkpty()\n", True),
+        ("from concurrent.futures import ProcessPoolExecutor\n", True),
+        ("pool = concurrent.futures.ProcessPoolExecutor()\n", True),
         ("import os\nos.environ.copy()\n", False),
         ("cursor.execute(statement)\n", False),
+        ("from concurrent.futures import ThreadPoolExecutor\n", False),
     ],
 )
 def test_the_code_check_sees_a_child_process(source, starts):

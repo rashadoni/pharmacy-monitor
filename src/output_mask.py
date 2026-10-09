@@ -7,12 +7,9 @@
 самого потока: всё, что пишут в `sys.stdout` и `sys.stderr`, выходит построчно
 и после маски, кто бы и чем ни писал.
 
-Последняя линия, а не разрешение печатать адреса. Что идёт мимо неё:
-
-- дочерний процесс и код на C пишут в дескриптор, а не в `sys.stdout`;
-- `sys.__stdout__`, `os.write(1, …)` и поток, взятый до установки маски;
-- строка, которую разрезал `flush()`: что уже сброшено, обратно не вернуть;
-- журнал: у него своя маска, и сюда он не заходит (см. `unmasked`).
+Последняя линия, а не разрешение печатать адреса: знает она только «@», а
+пишут и мимо неё. Что именно — одним списком в docs/RUNBOOK.md, «Маска вывода».
+Журнал сюда не заходит: у него своя маска (см. `unmasked`).
 """
 
 from __future__ import annotations
@@ -75,19 +72,22 @@ class _MaskingWriter(io.BufferedIOBase):
     Стоит ниже текста, поэтому мимо не проходит ни строка, ни байты: `buffer`
     замаскированного потока — это он и есть. Наружу отдаёт только целые строки:
     `print("a", b)` — это четыре вызова `write`, и адрес может прийти по частям.
-    Хвост без перевода строки ждёт его или `flush()`.
+    Хвост без перевода строки ждёт его или `flush()`. Закрытие маски поток под
+    ней не закрывает: он не её.
     """
 
     def __init__(self, stream, sink) -> None:
         self._stream = stream
         self._sink = sink
-        self._pending: list[bytes] = []
+        # Хвост у каждого потока исполнения свой: `print("a", b)` из двух
+        # потоков сразу иначе склеил бы их строки в одну.
+        self._pending: dict[threading.Thread, list[bytes]] = {}
         # Поток, который сбрасывает буфер на каждом переводе строки (stderr,
         # терминал), делает это и под маской — но сбрасываются целые строки, а
         # не хвост: `TextIOWrapper(line_buffering=True)` выпустил бы и его.
         self._flush_each_line = bool(getattr(stream, "line_buffering", False))
-        # Поток общий для всех потоков исполнения; RLock — запись может прийти
-        # и изнутри записи (обработчик сигнала, `__del__`).
+        # RLock — запись может прийти и изнутри записи (обработчик сигнала,
+        # `__del__`).
         self._lock = threading.RLock()
 
     def writable(self) -> bool:
@@ -107,40 +107,45 @@ class _MaskingWriter(io.BufferedIOBase):
 
     def write(self, data) -> int:
         data = bytes(data)
+        me = threading.current_thread()
         with self._lock:
             head, newline, tail = data.rpartition(b"\n")
             if not newline:
-                self._pending.append(data)
-                return len(data)
-            lines = b"".join([*self._pending, head, newline])
-            self._pending = [tail] if tail else []
-            self._emit(lines)
-            if self._flush_each_line:
-                self._sink.flush()
+                self._pending.setdefault(me, []).append(data)
+            else:
+                lines = b"".join([*self._pending.pop(me, ()), head, newline])
+                if tail:
+                    self._pending[me] = [tail]
+                self._emit(lines)
+                if self._flush_each_line:
+                    self._sink.flush()
+            if self._flush_each_line and b"\r" in data:
+                # Полоса прогресса: такой поток сбрасывает буфер и на возврате
+                # каретки — кадр полосы перевода строки не дождётся.
+                self._release(me)
         return len(data)
 
     def flush(self) -> None:
         with self._lock:
-            if self._pending:
-                # Кто зовёт `flush`, тому текст нужен на экране сейчас:
-                # приглашение ко вводу, точки прогресса. Адрес, который
-                # разрезан этим сбросом, маска уже не узнает.
-                tail = b"".join(self._pending)
-                self._pending = []
-                self._emit(tail)
-            self._sink.flush()
+            self._release(threading.current_thread())
+
+    def _release(self, me: threading.Thread) -> None:
+        """Выпустить хвост без перевода строки и сбросить поток под маской.
+
+        Кто зовёт `flush`, тому его текст нужен на экране сейчас: приглашение
+        ко вводу, точки прогресса. Адрес, разрезанный этим сбросом, маска уже
+        не узнает. Чужой хвост выпускается, только если его хозяин завершился:
+        дописать строку больше некому.
+        """
+        for thread in [t for t in self._pending if t is me or not t.is_alive()]:
+            self._emit(b"".join(self._pending.pop(thread)))
+        self._sink.flush()
 
     @property
     def closed(self) -> bool:
         # Закрыли поток под маской — закрыта и она: сборщик мусора не станет
         # сбрасывать в него хвост, а запись откажет, как отказала бы без маски.
         return super().closed or bool(getattr(self._sink, "closed", False))
-
-    def close(self) -> None:
-        # Сбросить хвост и больше не принимать. Поток под маской не наш:
-        # закрывает его тот, кто открыл.
-        if not self.closed:
-            super().close()
 
     def _emit(self, data: bytes) -> None:
         if b"@" in data:  # почти весь вывод: не декодируем и не трогаем
@@ -196,7 +201,9 @@ def mask_output() -> None:
 
     Обратно маска не снимается: строку «Error: …» click печатает уже после
     того, как команда закончилась, а трассировку непойманной ошибки —
-    интерпретатор, ещё позже. Обе читают `sys.stderr` в момент печати.
+    интерпретатор, ещё позже. Обе читают `sys.stderr` в момент печати. В самом
+    конце интерпретатор возвращает на место прежние потоки сам: что напечатает
+    `__del__` при разборке модулей, идёт уже мимо маски.
     """
     masked: dict[int, MaskedStream] = {}
     for name in ("stdout", "stderr"):

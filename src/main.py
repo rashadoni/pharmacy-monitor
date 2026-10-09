@@ -2821,17 +2821,29 @@ def _setup_logging(level: str = "INFO") -> None:
             ),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, level)),
-        logger_factory=_log_stream,
+        logger_factory=lambda *_args: _LOG_STREAM,
     )
 
 
-def _log_stream(*_args) -> structlog.WriteLogger:
+class _LogStream:
     """Куда structlog пишет строку журнала: stdout под маской вывода.
 
-    Не `PrintLogger`: он, получив настоящий stdout, печатает в `sys.stdout`
-    как тот есть на момент печати — то есть обратно через маску вывода.
+    Не `structlog.PrintLogger`: он, получив настоящий stdout, печатает в
+    `sys.stdout` как тот есть на момент печати — то есть обратно через маску
+    вывода. Поток берётся в момент записи, а не один раз: под `CliRunner` он
+    у каждого запуска свой.
     """
-    return structlog.WriteLogger(output_mask.unmasked(sys.stdout))
+
+    def msg(self, message: str) -> None:
+        stream = output_mask.unmasked(sys.stdout)
+        stream.write(message + "\n")
+        stream.flush()
+
+    log = debug = info = warn = warning = msg
+    fatal = failure = err = error = critical = exception = msg
+
+
+_LOG_STREAM = _LogStream()
 
 
 log = structlog.get_logger()
@@ -4178,9 +4190,9 @@ def persist_results(
 @click.option("--log-level", default="INFO")
 def cli(log_level: str) -> None:
     """Pharmacy Monitor CLI."""
-    # Раньше всего остального: всё, что команда напечатает мимо журнала —
-    # `click.echo`, `print`, строка «Error: …», трассировка непойманной ошибки, —
-    # выходит без адресов. Снимает маску только `OperatorCommand`.
+    # Всё, что команда напечатает мимо журнала — `click.echo`, `print`, строка
+    # «Error: …», трассировка непойманной ошибки, — выходит без адресов.
+    # Снимает маску только `OperatorCommand`.
     output_mask.mask_output()
     _setup_logging(log_level)
 
