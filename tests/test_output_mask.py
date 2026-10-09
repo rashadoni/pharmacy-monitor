@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import _thread
 import ast
 import gc
 import io
@@ -224,6 +225,36 @@ def test_a_stream_that_flushes_each_line_draws_a_progress_bar_without_flush():
     assert _reached(plain) == ""
 
 
+def test_a_carriage_return_before_a_newline_is_not_a_progress_bar():
+    """`\\r\\n` — конец строки, а не кадр полосы: хвост после него ждёт."""
+    under = _stream(line_buffering=True)
+    masked = MaskedStream(under)
+    masked.write("HTTP/1.1 200 OK\r\nX-To: viewer")
+    masked.write("@client.example\r\n")
+    assert _reached(under) == "HTTP/1.1 200 OK\r\nX-To: <address>\r\n"
+
+
+def test_a_progress_bar_does_not_release_another_threads_tail():
+    under = _stream(line_buffering=True)
+    masked = MaskedStream(under)
+    half_written, go_on = threading.Event(), threading.Event()
+
+    def slow():
+        masked.write("vie")
+        half_written.set()
+        go_on.wait(5)
+        masked.write("wer@client.example\n")
+
+    writer = threading.Thread(target=slow, daemon=True)
+    writer.start()
+    assert half_written.wait(5)
+    masked.write("\r[#   ] 25%")
+    assert _reached(under) == "\r[#   ] 25%"
+    go_on.set()
+    writer.join(5)
+    assert _reached(under) == "\r[#   ] 25%<address>\n"
+
+
 def test_flush_reaches_the_file_under_the_stream(tmp_path):
     """У `BytesIO` сбрасывать нечего; у настоящего файла между потоком и
     диском ещё один буфер, и `click.echo` ждёт, что `flush` опустошит и его."""
@@ -272,6 +303,82 @@ def test_the_tail_of_a_finished_thread_is_not_lost():
     assert _reached(under) == ""
     masked.flush()
     assert _reached(under) == "хвост потока"
+
+
+def test_a_thread_python_did_not_start_does_not_keep_its_tail_forever():
+    """Поток исполнения, заведённый из кода на C, о своём конце не сообщает:
+    ждать, что он допишет строку, нельзя — хвост выпускает первый же `flush`."""
+    under = _stream()
+    masked = MaskedStream(under)
+    written = threading.Event()
+
+    def foreign():
+        masked.write("хвост чужого потока")
+        written.set()
+
+    _thread.start_new_thread(foreign, ())
+    assert written.wait(5)
+    masked.flush()
+    assert _reached(under) == "хвост чужого потока"
+
+
+def test_closing_the_mask_lets_every_tail_out_and_leaves_the_stream_open():
+    under = _stream()
+    masked = MaskedStream(under)
+    half_written, go_on = threading.Event(), threading.Event()
+
+    def slow():
+        masked.write("хвост живого потока")
+        half_written.set()
+        go_on.wait(5)
+
+    writer = threading.Thread(target=slow, daemon=True)
+    writer.start()
+    assert half_written.wait(5)
+    masked.close()
+    go_on.set()
+    writer.join(5)
+    assert masked.closed and not under.closed
+    assert _reached(under) == "хвост живого потока"
+
+
+def test_a_flush_from_inside_a_flush_finds_the_tails_already_taken():
+    """Запись в поток под маской зовёт `flush` ещё раз — так делает обработчик
+    сигнала с `click.echo`. Хвосты к этому времени забрал вложенный вызов."""
+
+    class Sink:
+        def __init__(self) -> None:
+            self.written: list[bytes] = []
+            self.writer = None
+
+        def write(self, data: bytes) -> None:
+            self.written.append(data)
+            if len(self.written) == 1:
+                self.writer.flush()
+
+        def flush(self) -> None:
+            pass
+
+    sink = Sink()
+    sink.writer = output_mask._MaskingWriter(io.StringIO(), sink)
+    for tail in (b"first", b"second"):
+        finished = threading.Thread(target=sink.writer.write, args=(tail,))
+        finished.start()
+        finished.join()
+    failed = []
+
+    def flush():
+        try:
+            sink.writer.flush()
+        except Exception as error:
+            failed.append(error)
+
+    flushing = threading.Thread(target=flush, daemon=True)
+    flushing.start()
+    flushing.join(timeout=5)
+    assert not flushing.is_alive(), "сброс изнутри сброса повис на замке"
+    assert failed == []
+    assert sorted(sink.written) == [b"first", b"second"]
 
 
 def test_a_flush_waits_for_a_write_in_progress():
@@ -483,15 +590,43 @@ def test_taking_the_mask_off_lets_the_tail_out_first(monkeypatch):
     output_mask.mask_output()
     sys.stdout.write(f"под маской {ADDRESS}")
     # Маску кто-то держит (обработчик журнала сторонней библиотеки): сборщик
-    # мусора хвост за неё не сбросит.
+    # мусора хвост за неё не сбросит. И она остаётся рабочей.
     held = sys.stdout
 
     output_mask.unmask_output()
 
     assert (sys.stdout, sys.stderr) == (out, err) and held.unmasked is out
+    assert not held.closed
     print(f" и без неё {ADDRESS}")
     out.flush()
     assert _reached(out) == f"под маской <address> и без неё {ADDRESS}\n"
+
+
+def test_taking_the_mask_off_does_not_lose_the_tail_of_a_thread_still_writing(monkeypatch):
+    """Свою строку он допишет уже в поток без маски: начало лежит в ней."""
+    out = _stream()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", _stream())
+    output_mask.mask_output()
+    half_written, go_on = threading.Event(), threading.Event()
+
+    def slow():
+        sys.stdout.write("начало под маской, ")
+        half_written.set()
+        go_on.wait(5)
+        sys.stdout.write("конец без неё\n")
+
+    writer = threading.Thread(target=slow, daemon=True)
+    writer.start()
+    assert half_written.wait(5)
+    # Маску кто-то держит: сборщик мусора хвост за неё не выпустит.
+    held = sys.stdout
+    output_mask.unmask_output()
+    go_on.set()
+    writer.join(5)
+    out.flush()
+    assert _reached(out) == "начало под маской, конец без неё\n"
+    assert held.unmasked is out
 
 
 # ─── 4. Настоящая группа `cli` ───────────────────────────────────────────────
@@ -834,10 +969,10 @@ def _scoped(node: ast.AST, owner: str = "", called: bool = False):
         yield child, owner, called
         if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
             inner = owner if isinstance(child, ast.Lambda) else f"{owner}.{child.name}".lstrip(".")
-            # Значения по умолчанию и декораторы вычисляются там, где функция
-            # объявлена, а не там, где её зовут.
-            declared = [*child.args.defaults, *filter(None, child.args.kw_defaults)]
-            declared += getattr(child, "decorator_list", [])
+            # Значения по умолчанию, аннотации и декораторы вычисляются там,
+            # где функция объявлена, а не там, где её зовут.
+            declared = [child.args, *getattr(child, "decorator_list", [])]
+            declared += filter(None, [getattr(child, "returns", None)])
             for part in declared:
                 yield part, owner, called
                 yield from _scoped(part, owner, called)
@@ -978,6 +1113,12 @@ def test_only_the_operator_command_and_the_log_reach_past_the_mask():
             {("A", "sys.stderr при импорте")},
         ),
         ("from sys import stderr\n", {("", "sys.stderr при импорте")}),
+        (
+            "@click.option('--out', default=sys.stdout)\ndef f(out):\n    pass\n",
+            {("", "sys.stdout при импорте")},
+        ),
+        ("def f(out: type(sys.__stdout__)) -> None:\n    pass\n", {("", "__stdout__")}),
+        ("def f() -> type(sys.__stderr__):\n    pass\n", {("", "__stderr__")}),
         # Обычная печать и поток, взятый в момент вызова, — не обход.
         ("def f():\n    print(x, file=sys.stderr)\n    sys.stdout.flush()\n", set()),
         ("def f():\n    handler = logging.StreamHandler(sys.stdout)\n", set()),

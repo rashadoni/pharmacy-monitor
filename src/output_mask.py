@@ -28,6 +28,9 @@ WORD_WITHHELD = "<слово скрыто>"
 # его на слова, и без этого шаблона первое слово имени осталось бы в выводе.
 _QUOTED_NAME = re.compile(r'"[^"\n]{1,64}"@\S*')
 _SPACES = re.compile(r"(\s+)")
+# Поток исполнения, заведённый не через `threading` (из кода на C): о своём
+# конце он не сообщает, и ждать, что он допишет строку, нельзя.
+_FOREIGN_THREAD = getattr(threading, "_DummyThread", ())
 
 
 def mask_line(line: str) -> str:
@@ -119,9 +122,10 @@ class _MaskingWriter(io.BufferedIOBase):
                 self._emit(lines)
                 if self._flush_each_line:
                     self._sink.flush()
-            if self._flush_each_line and b"\r" in data:
+            if self._flush_each_line and b"\r" in tail:
                 # Полоса прогресса: такой поток сбрасывает буфер и на возврате
-                # каретки — кадр полосы перевода строки не дождётся.
+                # каретки — кадр полосы перевода строки не дождётся. Возврат
+                # каретки перед переводом строки (`\r\n`) — не кадр.
                 self._release(me)
         return len(data)
 
@@ -129,16 +133,32 @@ class _MaskingWriter(io.BufferedIOBase):
         with self._lock:
             self._release(threading.current_thread())
 
-    def _release(self, me: threading.Thread) -> None:
+    def release_all(self) -> None:
+        """Выпустить хвосты всех потоков исполнения: маску снимают, и дописывать
+        строки в неё больше некому."""
+        with self._lock:
+            self._release(None)
+
+    def close(self) -> None:
+        # Поток под маской остаётся открытым: он не её.
+        self.release_all()
+        super().close()
+
+    def _release(self, me: threading.Thread | None) -> None:
         """Выпустить хвост без перевода строки и сбросить поток под маской.
 
         Кто зовёт `flush`, тому его текст нужен на экране сейчас: приглашение
         ко вводу, точки прогресса. Адрес, разрезанный этим сбросом, маска уже
-        не узнает. Чужой хвост выпускается, только если его хозяин завершился:
-        дописать строку больше некому.
+        не узнает. Чужой хвост выпускается, только если его хозяин строку уже
+        не допишет: завершился или заведён не через `threading`.
         """
-        for thread in [t for t in self._pending if t is me or not t.is_alive()]:
-            self._emit(b"".join(self._pending.pop(thread)))
+        for thread in list(self._pending):
+            if me is None or thread is me or _abandoned(thread):
+                # Запись в поток под маской может позвать `flush` ещё раз
+                # (обработчик сигнала): хвост к этому времени уже забрали.
+                tail = self._pending.pop(thread, None)
+                if tail:
+                    self._emit(b"".join(tail))
         self._sink.flush()
 
     @property
@@ -155,6 +175,10 @@ class _MaskingWriter(io.BufferedIOBase):
             text = "\n".join(mask_line(line) for line in text.split("\n"))
             data = text.encode("utf-8", "surrogateescape")
         self._sink.write(data)
+
+
+def _abandoned(thread: threading.Thread) -> bool:
+    return isinstance(thread, _FOREIGN_THREAD) or not thread.is_alive()
 
 
 class MaskedStream(io.TextIOWrapper):
@@ -226,5 +250,5 @@ def unmask_output() -> None:
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name)
         if isinstance(stream, MaskedStream):
-            stream.flush()
+            stream.buffer.release_all()
             setattr(sys, name, stream.unmasked)
