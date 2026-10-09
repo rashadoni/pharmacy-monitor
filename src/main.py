@@ -30,7 +30,15 @@ from sqlalchemy.orm import Session
 
 load_dotenv(override=True)
 
-from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
+from src import (  # noqa: E402
+    analyzer,
+    matcher,
+    notifier,
+    output_mask,
+    reporter,
+    storage,
+    watchlist,
+)
 from src.run_lock import SCRAPE_ADVISORY_LOCK_KEY  # noqa: E402
 from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
@@ -2771,29 +2779,32 @@ def _setup_logging(level: str = "INFO") -> None:
     Файл-логи читаются ELK / Loki / простым `jq`. Ротация — logrotate
     (см. provision_vps.sh — еженедельно, 8 архивов, gzip).
     """
+    # Вывод команды бывает публичным: еженедельный сбор pharmonline идёт из
+    # GitHub Actions, и журнал его шага открыт. Почтовый адрес из готовой
+    # строки вырезается, что бы ни передал вызов журнала, — и у structlog, и у
+    # stdlib `logging`, которым в тот же вывод пишут сторонние библиотеки.
+    from src.logging_setup import MaskingFormatter, masking
+
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # File handler — JSONL
     file_handler = logging.FileHandler(log_dir / "app.jsonl", encoding="utf-8")
     file_handler.setLevel(level)
-    file_handler.setFormatter(logging.Formatter("%(message)s"))
+    file_handler.setFormatter(MaskingFormatter("%(message)s"))
 
-    # Stream handler — terminal
-    stream_handler = logging.StreamHandler(sys.stdout)
+    # Stream handler — terminal. Журнал пишет в поток под маской вывода
+    # (`output_mask`): своя маска у него уже есть, и строку она оставляет
+    # разборчивой — маска вывода вырезает слово с «@» целиком.
+    stream_handler = logging.StreamHandler(output_mask.unmasked(sys.stdout))
     stream_handler.setLevel(level)
-    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    stream_handler.setFormatter(MaskingFormatter("%(message)s"))
 
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
     root.setLevel(level)
-
-    # Вывод команды бывает публичным: еженедельный сбор pharmonline идёт из
-    # GitHub Actions, и журнал его шага открыт. Почтовый адрес из готовой
-    # строки вырезается, что бы ни передал вызов журнала.
-    from src.logging_setup import masking
 
     structlog.configure(
         processors=[
@@ -2810,7 +2821,29 @@ def _setup_logging(level: str = "INFO") -> None:
             ),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, level)),
+        logger_factory=lambda *_args: _LOG_STREAM,
     )
+
+
+class _LogStream:
+    """Куда structlog пишет строку журнала: stdout под маской вывода.
+
+    Не `structlog.PrintLogger`: он, получив настоящий stdout, печатает в
+    `sys.stdout` как тот есть на момент печати — то есть обратно через маску
+    вывода. Поток берётся в момент записи, а не один раз: под `CliRunner` он
+    у каждого запуска свой.
+    """
+
+    def msg(self, message: str) -> None:
+        stream = output_mask.unmasked(sys.stdout)
+        stream.write(message + "\n")
+        stream.flush()
+
+    log = debug = info = warn = warning = msg
+    fatal = failure = err = error = critical = exception = msg
+
+
+_LOG_STREAM = _LogStream()
 
 
 log = structlog.get_logger()
@@ -4157,7 +4190,27 @@ def persist_results(
 @click.option("--log-level", default="INFO")
 def cli(log_level: str) -> None:
     """Pharmacy Monitor CLI."""
+    # Всё, что команда напечатает мимо журнала — `click.echo`, `print`, строка
+    # «Error: …», трассировка непойманной ошибки, — выходит без адресов.
+    # Снимает маску только `OperatorCommand`.
+    output_mask.mask_output()
     _setup_logging(log_level)
+
+
+class OperatorCommand(click.Command):
+    """Команда, которая печатает адрес оператору по назначению.
+
+    Её вывод идёт мимо маски: `recipient list` с `<address>` вместо адресов
+    бесполезна. Класс — единственное место, где маска снимается, и ставят его
+    только командам из списка `_PRINTS_AN_ADDRESS_BY_DESIGN` в
+    `tests/test_log_carries_no_address.py`: тест сверяет список с деревом click
+    и не даёт запустить такую команду из workflow. Новая команда этого класса —
+    решение владельца.
+    """
+
+    def invoke(self, ctx: click.Context):
+        output_mask.unmask_output()
+        return super().invoke(ctx)
 
 
 @cli.command("init-db")
@@ -4510,6 +4563,7 @@ def health_check_cmd(
 ) -> None:
     """Проверить здоровье системы: stale/failed/empty/site-drop. Exit-code 0=ok, 1=warning, 2=critical."""
     from src.health import check_health
+    from src.logging_setup import without_addresses
 
     storage.init_db()
     Session = storage.make_session()
@@ -4525,7 +4579,9 @@ def health_check_cmd(
             f"at {report.last_run_at}"
         )
         for i in report.issues:
-            click.echo(f"  [{i.severity}] {i.code}: {i.message}")
+            # click печатает мимо маски журнала, а в сообщении бывает текст ошибки
+            # прогона как он записан в базу (`runs.error_message`).
+            click.echo(f"  [{i.severity}] {i.code}: {without_addresses(i.message)}")
 
     # Do not return early on quiet+OK: an active incident still needs one
     # recovery email and an atomic transition to the healthy state.
@@ -4549,7 +4605,10 @@ def health_check_cmd(
                         "инцидент не изменился)"
                     )
         except Exception as e:
-            click.echo(f"⚠️ Не удалось отправить health email: {e}", err=True)
+            # Тоже мимо маски. Сбой отправки приходит из `send_email` уже без
+            # адреса; остальное в этом `try` не чистил никто.
+            reason = without_addresses(str(e))
+            click.echo(f"⚠️ Не удалось отправить health email: {reason}", err=True)
 
     if quiet_healthy:
         return
@@ -4726,7 +4785,7 @@ def tenant_list() -> None:
             )
 
 
-@tenant_group.command("add-user")
+@tenant_group.command("add-user", cls=OperatorCommand)
 @click.argument("tenant_slug")
 @click.argument("email")
 @click.option("--name", default=None)
@@ -4745,7 +4804,7 @@ def tenant_add_user(tenant_slug: str, email: str, name: str | None, role: str) -
         click.echo(f"OK: user #{u.id} {u.email} role={u.role}")
 
 
-@tenant_group.command("issue-token")
+@tenant_group.command("issue-token", cls=OperatorCommand)
 @click.argument("email")
 @click.option("--ttl-min", type=int, default=30)
 def tenant_issue_token(email: str, ttl_min: int) -> None:
@@ -5009,7 +5068,7 @@ def telegram_run_bot(timeout: int) -> None:
 def digest_cmd(top_n: int, window_hours: int, dry_run: bool) -> None:
     """Отправить daily digest (топ-N алертов за последние window_hours часов).
 
-    Запускается systemd timer pharmacy-monitor-digest@daily.timer в 05:00 UTC
+    Запускается таймером systemd `pharmacy-monitor-digest`, экземпляр `daily`, в 05:00 UTC
     (09:00 Baku). При 0 событий — письмо не отправляется.
     """
     from src.digest import send_daily_digest
@@ -5053,7 +5112,7 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | No
     Daily includes events from last 24h, weekly from last 7d. Recipients are
     `tenant_users` with daily_digest=True / weekly_digest=True.
 
-    Schedule via systemd timer (see infra/systemd/pharmacy-monitor-digest@.timer).
+    Schedule via systemd timer (see infra/systemd/, unit pharmacy-monitor-digest-weekly).
     """
     from src import notifications
 
@@ -5070,7 +5129,7 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | No
             click.echo(f"OK: {kind} digest sent to {sent} recipients")
 
 
-@notify_group.command("test")
+@notify_group.command("test", cls=OperatorCommand)
 @click.option(
     "--email", "email_to", default=None, help="Override-получатель (default: DB/EMAIL_TO)"
 )
@@ -6058,9 +6117,9 @@ def run_cmd(
             session.commit()
             log.exception("run_failed", run_id=run_id)
             # click печатает этот текст сам, мимо маски журнала.
-            from src.logging_setup import mask_addresses
+            from src.logging_setup import without_addresses
 
-            raise click.ClickException(mask_addresses(str(e)))
+            raise click.ClickException(without_addresses(str(e)))
 
 
 @cli.command("scrape")
@@ -6953,7 +7012,7 @@ def recipient_group() -> None:
     """Управление получателями email-рассылки."""
 
 
-@recipient_group.command("add")
+@recipient_group.command("add", cls=OperatorCommand)
 @click.argument("email")
 @click.option("--name", default=None, help="Имя получателя (опционально)")
 def recipient_add(email: str, name: str | None) -> None:
@@ -6965,7 +7024,7 @@ def recipient_add(email: str, name: str | None) -> None:
         click.echo(f"OK: {r.email} ({r.name or '—'}) is_active={r.is_active}")
 
 
-@recipient_group.command("list")
+@recipient_group.command("list", cls=OperatorCommand)
 @click.option("--active-only", is_flag=True, help="Только активные")
 def recipient_list(active_only: bool) -> None:
     """Список получателей."""
@@ -6981,7 +7040,7 @@ def recipient_list(active_only: bool) -> None:
             click.echo(f"  [{mark}] {r.email}  {r.name or ''}")
 
 
-@recipient_group.command("remove")
+@recipient_group.command("remove", cls=OperatorCommand)
 @click.argument("email")
 def recipient_remove(email: str) -> None:
     """Удалить получателя."""
@@ -6992,7 +7051,7 @@ def recipient_remove(email: str) -> None:
         click.echo("OK: removed" if ok else f"Not found: {email}")
 
 
-@recipient_group.command("toggle")
+@recipient_group.command("toggle", cls=OperatorCommand)
 @click.argument("email")
 def recipient_toggle(email: str) -> None:
     """Активировать/деактивировать получателя без удаления."""
@@ -7006,7 +7065,7 @@ def recipient_toggle(email: str) -> None:
         click.echo(f"OK: {r.email} is_active={r.is_active}")
 
 
-@recipient_group.command("update")
+@recipient_group.command("update", cls=OperatorCommand)
 @click.argument("email")
 @click.option("--new-email", default=None, help="Новый email")
 @click.option("--name", default=None, help="Новое имя")
