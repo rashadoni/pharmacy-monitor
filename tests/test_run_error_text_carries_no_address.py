@@ -25,7 +25,8 @@ viewer — сотрудник клиента; текст стоит в стро�
   правку руками в psql — валидатор не видит. В `src/` таких записей нет; тест
   ниже ловит прямые формы, а словарь, собранный вне вызова, не узнает;
 - текст, обрезанный до записи ровно по имени ящика, оставит его начало: «@» в
-  нём уже нет;
+  нём уже нет; ключи внутри `run_quality` (названия категорий, адреса страниц)
+  не чистятся;
 - строки, записанные до правки. На проде 2026-10-09 «@» нет ни в одном из 276
   текстов ошибки; проверка — docs/RUNBOOK.md «Текст ошибки прогона».
 """
@@ -242,6 +243,14 @@ def test_the_details_of_a_run_are_stored_without_an_address():
     )
     quality["financially_eligible"] = False
     assert run.run_quality["financially_eligible"] is False
+
+
+def test_the_keys_of_the_details_are_left_alone():
+    """Ключи — названия категорий и адреса страниц, которые запросили мы сами, а
+    не текст ошибки; скрыть ключ значило бы склеить две записи в одну."""
+    page = "https://aloe.az/@brand/"
+    run = storage.Run(run_quality={"items": {page: {"error": f"KeyError: '{ADDRESS}'"}, "bad": {}}})
+    assert run.run_quality == {"items": {page: {"error": f"KeyError: {WITHHELD}"}, "bad": {}}}
 
 
 def test_what_reaches_the_database_is_what_the_model_holds(db_session):

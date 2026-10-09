@@ -141,7 +141,7 @@ _COMMANDS_THAT_ONLY_NAME_PYTHON = {
     "printf",
 }
 # Шаг, тело которого — Python: `shell: python`. Тело такого шага тест не читает.
-_PYTHON_SHELL = re.compile(r"""^[ \t]*shell:[ \t]*["']?python""", re.M)
+_PYTHON_SHELL = re.compile(r"""^[ \t]*(?:-[ \t]+)?shell:[ \t]*["']?python""", re.M)
 # Строки, которые ничего не запускают: комментарий и имя шага.
 _NOT_A_COMMAND_LINE = re.compile(r"^[ \t]*(?:#|-?[ \t]*name:).*$", re.M)
 # Модули, которые запускают как есть: своего кода о людях в них нет, а
@@ -400,7 +400,8 @@ class Sources:
 
     def __init__(self, sources: dict[str, str]):
         trees = {name: ast.parse(text) for name, text in sources.items()}
-        self._known = set(trees) | {name.split(".")[0] for name in trees}
+        self.modules = set(trees)
+        self._known = self.modules | {name.split(".")[0] for name in trees}
         self._modules = {name: _Module(name, tree, self._known) for name, tree in trees.items()}
         self.people_models: set[str] = set()
         self.people_tables: set[str] = set()
@@ -721,6 +722,8 @@ def test_the_check_is_not_blind():
         "переименовали — поправь `_PERSONAL_COLUMNS`."
     )
     assert {"tenant_users", "recipients"} <= _src().people_tables
+    # Читаются оба каталога, из которых workflow запускает код.
+    assert {"src.storage", "scripts.preflight_pharmonline_public_api"} <= _src().modules
     # На настоящем коде путь до людей находится там, где он есть: рассылка о
     # прогоне читает получателей и шлёт письма; CLI — вся — тоже: команды
     # навешены на `cli` декоратором, имени у этого пути нет.
@@ -807,6 +810,7 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ("python ${{ inputs.script }}", [(1, UNKNOWN)]),
         ("python scripts/no_such_file.py", [(1, UNKNOWN)]),
         ("python ../outside.py", [(1, UNKNOWN)]),
+        ("python tests/../migrations/env.py", [(1, UNKNOWN)]),
         ("python -m some.module", [(1, UNKNOWN)]),
         ("cat job.py | python -", [(1, UNKNOWN)]),
         ("python - < job.py", [(1, UNKNOWN)]),
@@ -818,6 +822,7 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         # Шаг, тело которого — Python.
         ("- run: |\n    print(1)\n  shell: python\n", [(3, UNKNOWN)]),
         ("defaults:\n  run:\n    shell: 'python3 {0}'\n", [(3, UNKNOWN)]),
+        ("steps:\n  - shell: python\n    run: |\n      print(1)\n", [(2, UNKNOWN)]),
         # Не запуск: `python` — аргумент другой команды.
         ("- uses: actions/setup-python@v5\n  with:\n    python-version: '3.12'\n", []),
         ("test -x /opt/app/.venv/bin/python\n", []),
