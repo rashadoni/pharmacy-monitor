@@ -1716,22 +1716,25 @@ def dash_digest_send_test(
         raise HTTPException(500, f"Не удалось отправить: {e}")
 
     # `recipients_sent` — только те, кому отправитель письмо подтвердил. Сбой
-    # отправки `_send_digest` наружу не выпускает, а считает в `failed`. Ответ
-    # всегда 200: исход — в `ok` и числах, дашборд обязан их читать (кнопка
-    # показывает свою фразу на каждый исход).
+    # отправки `_send_digest` наружу не выпускает, а считает в `failed`, поэтому
+    # ответ при нём — 200, а исход назван словом: у кнопки на каждый исход своя
+    # фраза (`quick_actions.digest_<outcome>` в `frontend/messages/*.json`).
     sent, failed = result["sent"], result["failed"]
     who = {"kind": kind, "by_user_id": user.id}
-    if failed and not sent:
-        log.error("digest_not_sent_manual", failed=failed, **who)
-    elif failed:
-        log.warning("digest_sent_manual", count=sent, failed=failed, **who)
+    if failed:
+        # «sent» в имени строки — только когда письмо подтверждено всем.
+        outcome = "partly_sent" if sent else "not_sent"
+        log.warning("digest_incomplete_manual", count=sent, failed=failed, **who)
     elif sent:
-        log.info("digest_sent_manual", count=sent, failed=failed, **who)
+        outcome = "sent"
+        log.info("digest_sent_manual", count=sent, **who)
     else:
         # Нет событий за окно или никто не включил дайджест.
+        outcome = "nothing_to_send"
         log.info("digest_manual_nothing_to_send", **who)
     return {
         "ok": not failed,
+        "outcome": outcome,
         "recipients": result["recipients"],
         "recipients_sent": sent,
         "recipients_failed": failed,

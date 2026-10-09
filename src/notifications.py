@@ -331,16 +331,30 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
                         )
 
             # Коммитим прогресс СРАЗУ после каждого получателя: успешно отправленное
-            # помечаем channels_sent и фиксируем. Если commit упадёт (например,
-            # transient DB/network fault), повторная рассылка ограничится ОДНИМ
-            # получателем, а не
-            # всей пачкой (единый end-of-batch commit мог бы продублировать всем).
+            # помечаем channels_sent и фиксируем — сбой записи тогда стоит меток
+            # ОДНОГО получателя, а не всей пачки.
             if sent_now:
                 delivered.update(sent_now)
                 for eid, chans in sent_now.items():
                     ev = by_obj[eid]
                     ev.channels_sent = sorted(set(ev.channels_sent or []) | chans)
-                session.commit()
+                recipient_id = user.id
+                try:
+                    session.commit()
+                except Exception as exc:
+                    # Сообщение этому получателю ушло, не записались только метки.
+                    # Откат обязателен: в прерванной транзакции следующий же
+                    # запрос упал бы, и остальные получатели остались бы без
+                    # письма из-за меток, которые никто не читает. Если база
+                    # недоступна совсем, упадёт сам откат или следующий запрос —
+                    # это уже забота вызывающего.
+                    session.rollback()
+                    log.warning(
+                        "alert_marks_not_saved",
+                        user_id=recipient_id,
+                        events=len(sent_now),
+                        **notifier.delivery_error_fields(exc),
+                    )
 
     # Событие, которое кому-то слали и которое не дошло ни по одному каналу,
     # остаётся без метки. Повторной рассылки в проекте нет: эту функцию зовут

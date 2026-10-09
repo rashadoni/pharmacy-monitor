@@ -5103,9 +5103,14 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | No
         else:
             # Пустое окно, никто не подписан или `--only` никого не нашёл: не
             # сбой — таймер в пустую неделю не должен краснеть.
+            nobody = (
+                f"--only matches no recipient with the {kind} digest on"
+                if only_email is not None
+                else f"no recipient has the {kind} digest on"
+            )
             click.echo(
-                f"Nothing to send: no events in the window or no recipient has the {kind} "
-                "digest on — see digest_no_events / digest_no_recipients in the log above"
+                f"Nothing to send: no events in the window or {nobody} — see "
+                "digest_no_events / digest_no_recipients in the log above"
             )
 
 
@@ -6410,7 +6415,10 @@ def _dispatch_run_alerts(session: Session, run_id: int, fired: list[storage.Aler
         try:
             session.rollback()
         except Exception as rollback_error:  # noqa: BLE001
-            # Соединения нет: сбор упадёт на следующем запросе сам, со своей причиной.
+            # Откат не удался — соединение потеряно. Сессия при этом транзакцию
+            # всё равно закрывает и следующий запрос идёт на новом соединении:
+            # сбор продолжится, если база вернулась, и упадёт со своей причиной,
+            # если нет.
             log.warning(
                 "alert_dispatch_rollback_failed",
                 run_id=run_id,

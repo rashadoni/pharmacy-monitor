@@ -1436,9 +1436,15 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   digestSendTest: (kind: "daily" | "weekly" = "daily") =>
-    // `recipients_sent` — только письма, которые почта подтвердила. `ok: false`
-    // значит, что кому-то не ушло: ответ при этом 200, исход читать по числам.
-    request<{ ok: boolean; recipients_sent: number; recipients_failed?: number }>(
+    // `recipients_sent` — только письма, которые почта подтвердила. Когда
+    // кому-то не ушло, ответ всё равно 200: исход назван в `outcome`, и у кнопки
+    // на каждый своя фраза (`quick_actions.digest_<outcome>`).
+    request<{
+      ok: boolean;
+      outcome?: "sent" | "partly_sent" | "not_sent" | "nothing_to_send";
+      recipients_sent: number;
+      recipients_failed?: number;
+    }>(
       `/api/v1/dash/digest/send-test?kind=${kind}`,
       { method: "POST", timeoutMs: 30_000 },
     ),

@@ -31,18 +31,12 @@ export function QuickActions() {
   const digestMut = useMutation({
     mutationFn: () => api.digestSendTest("daily"),
     onSuccess: (r) => {
-      // «Отправлен» — только о письмах, которые почта подтвердила.
+      // Исход считает сервер: «отправлен» — только о письмах, которые почта
+      // подтвердила. Фразы — digest_sent, digest_partly_sent, digest_not_sent,
+      // digest_nothing_to_send.
       const sent = r.recipients_sent;
       const failed = r.recipients_failed ?? 0;
-      if (failed > 0 && sent > 0) {
-        setFeedback(t("digest_partly_sent", { sent, failed }));
-      } else if (failed > 0) {
-        setFeedback(t("digest_not_sent", { failed }));
-      } else if (sent > 0) {
-        setFeedback(t("digest_sent", { count: sent }));
-      } else {
-        setFeedback(t("digest_nothing_to_send"));
-      }
+      setFeedback(t(`digest_${r.outcome ?? "sent"}`, { count: sent, sent, failed }));
       setOpen(false);
     },
     onError: (err) => setFeedback(t("error", { message: friendlyError(err, locale) })),

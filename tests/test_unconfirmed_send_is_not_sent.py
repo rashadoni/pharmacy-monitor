@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import ast
+import json
+import re
 import smtplib
 import urllib.request
 from pathlib import Path
@@ -351,8 +353,14 @@ def test_notify_digest_command_reports_confirmed_recipients(stand):
     assert "OK: weekly digest sent to 2 recipients" in result.output
 
 
-@pytest.mark.parametrize("args", [[], ["--only", "nobody@client.example"]])
-def test_notify_digest_command_with_nothing_to_send_is_not_a_failure(stand, args):
+@pytest.mark.parametrize(
+    ("args", "who"),
+    [
+        ([], "no recipient has the weekly digest on"),
+        (["--only", "nobody@client.example"], "--only matches no recipient"),
+    ],
+)
+def test_notify_digest_command_with_nothing_to_send_is_not_a_failure(stand, args, who):
     """Пустая неделя или адрес, которого нет среди подписанных: писем нет, но это
     не сбой — таймер не должен краснеть — и не «sent»."""
     alice = _user(stand)
@@ -364,8 +372,9 @@ def test_notify_digest_command_with_nothing_to_send_is_not_a_failure(stand, args
 
     assert not send.called
     assert result.exit_code == 0, result.output
-    assert "Nothing to send" in result.output
+    assert "Nothing to send" in result.output and who in result.output
     assert "OK:" not in result.output and "sent to" not in result.output
+    _assert_no_person_or_text(result.output)
 
 
 @pytest.fixture
@@ -386,23 +395,41 @@ def dashboard(stand, monkeypatch):
     api.app.dependency_overrides.clear()
 
 
+# Исходы, которые кнопка умеет назвать: на каждый — своя фраза в дашборде.
+DIGEST_OUTCOMES = {
+    "sent": {"count"},
+    "partly_sent": {"sent", "failed"},
+    "not_sent": {"failed"},
+    "nothing_to_send": set(),
+}
+
+
 def _press_digest_button(dashboard, **sender):
     dashboard.journal.lines.clear()
     with patch("src.notifier.send_email", **sender) as send:
         response = dashboard.client.post("/api/v1/dash/digest/send-test?kind=weekly")
     assert response.status_code == 200, response.text
-    return response.json(), dashboard.journal.named("digest"), send
+    answer = response.json()
+    assert answer["outcome"] in DIGEST_OUTCOMES
+    return answer, dashboard.journal.named("digest"), send
 
 
 @pytest.mark.parametrize("how", REFUSALS)
 def test_digest_button_does_not_answer_sent_when_nothing_was(dashboard, how):
     answer, journal, _ = _press_digest_button(dashboard, **_refusing(how))
 
-    assert answer == {"ok": False, "recipients": 2, "recipients_sent": 0, "recipients_failed": 2}
+    assert answer == {
+        "ok": False,
+        "outcome": "not_sent",
+        "recipients": 2,
+        "recipients_sent": 0,
+        "recipients_failed": 2,
+    }
     assert journal == [
         {
-            "event": "digest_not_sent_manual",
-            "log_level": "error",
+            "event": "digest_incomplete_manual",
+            "log_level": "warning",
+            "count": 0,
             "failed": 2,
             "kind": "weekly",
             "by_user_id": dashboard.admin.id,
@@ -417,16 +444,26 @@ def test_digest_button_counts_only_confirmed_recipients(dashboard):
     )
     clean, clean_journal, _ = _press_digest_button(dashboard, return_value=True)
 
-    assert partial == {"ok": False, "recipients": 2, "recipients_sent": 1, "recipients_failed": 1}
-    assert clean == {"ok": True, "recipients": 2, "recipients_sent": 2, "recipients_failed": 0}
+    assert partial == {
+        "ok": False,
+        "outcome": "partly_sent",
+        "recipients": 2,
+        "recipients_sent": 1,
+        "recipients_failed": 1,
+    }
+    assert clean == {
+        "ok": True,
+        "outcome": "sent",
+        "recipients": 2,
+        "recipients_sent": 2,
+        "recipients_failed": 0,
+    }
     by = {"kind": "weekly", "by_user_id": dashboard.admin.id}
-    # Ушло не всем — предупреждение, а не обычная строка.
+    # Ушло не всем — «sent» в имени строки нет.
     assert partial_journal == [
-        {"event": "digest_sent_manual", "log_level": "warning", "count": 1, "failed": 1, **by}
+        {"event": "digest_incomplete_manual", "log_level": "warning", "count": 1, "failed": 1, **by}
     ]
-    assert clean_journal == [
-        {"event": "digest_sent_manual", "log_level": "info", "count": 2, "failed": 0, **by}
-    ]
+    assert clean_journal == [{"event": "digest_sent_manual", "log_level": "info", "count": 2, **by}]
 
 
 def test_digest_button_with_nothing_to_send_is_neither_sent_nor_failed(dashboard, stand):
@@ -437,7 +474,13 @@ def test_digest_button_with_nothing_to_send_is_neither_sent_nor_failed(dashboard
     answer, journal, send = _press_digest_button(dashboard)
 
     assert not send.called
-    assert answer == {"ok": True, "recipients": 0, "recipients_sent": 0, "recipients_failed": 0}
+    assert answer == {
+        "ok": True,
+        "outcome": "nothing_to_send",
+        "recipients": 0,
+        "recipients_sent": 0,
+        "recipients_failed": 0,
+    }
     assert journal == [
         {
             "event": "digest_manual_nothing_to_send",
@@ -448,28 +491,20 @@ def test_digest_button_with_nothing_to_send_is_neither_sent_nor_failed(dashboard
     ]
 
 
-def test_digest_button_copy_exists_for_every_outcome_in_every_language():
-    """Кнопка читает исход и показывает свою фразу: все четыре — на трёх языках."""
-    import json
-
+def test_digest_button_has_a_phrase_for_every_outcome_in_every_language():
+    """Кнопка берёт фразу по имени исхода из ответа: на каждый исход она есть на
+    трёх языках и подставляет ровно те числа, которые кнопка даёт."""
     frontend = Path(main_mod.__file__).resolve().parent.parent / "frontend"
     component = (frontend / "src" / "components" / "quick-actions.tsx").read_text(encoding="utf-8")
-    keys = {
-        "digest_sent": {"count"},
-        "digest_partly_sent": {"sent", "failed"},
-        "digest_not_sent": {"failed"},
-        "digest_nothing_to_send": set(),
-    }
-    assert "recipients_failed" in component
+    assert "digest_${r.outcome" in component  # фраза выбирается по исходу, а не по числам
     for locale in ("ru", "az", "en"):
         copy = json.loads((frontend / "messages" / f"{locale}.json").read_text(encoding="utf-8"))
-        for key, placeholders in keys.items():
-            assert f't("{key}"' in component, key
-            text = copy["quick_actions"][key]
-            assert {name for name in placeholders if f"{{{name}}}" in text} == placeholders, (
-                locale,
-                key,
-            )
+        phrases = copy["quick_actions"]
+        for outcome, numbers in DIGEST_OUTCOMES.items():
+            text = phrases[f"digest_{outcome}"]
+            assert set(re.findall(r"\{(\w+)\}", text)) == numbers, (locale, outcome, text)
+        # Четыре исхода — четыре разные фразы.
+        assert len({phrases[f"digest_{outcome}"] for outcome in DIGEST_OUTCOMES}) == 4
 
 
 # ─── 1б. Старый ежедневный дайджест (`digest.send_daily_digest`) ─────────────
@@ -654,6 +689,78 @@ def test_run_letter_with_nobody_to_send_to_is_not_called_dispatched(stand):
     ]
 
 
+def test_run_letter_summary_counts_the_events_it_had_to_send(stand):
+    """`events` в итоге — сколько событий было к рассылке: уже разосланное не в счёт."""
+    user = _user(stand)
+    already, *fresh = _events(stand, user, 3)
+    already.channels_sent = ["email"]
+    stand.commit()
+
+    with patch("src.notifier.send_email", return_value=True), capture_logs() as logs:
+        notifications.dispatch_events_batch(stand, [already, *fresh])
+
+    (summary,) = _lines(logs, *_RUN_SUMMARIES)
+    assert (summary["event"], summary["events"]) == ("alerts_dispatched_batch", 2)
+
+
+@pytest.fixture
+def marks_cannot_be_written(stand):
+    """База отказывает в записи меток канала — уже после того, как письмо ушло."""
+    refused = []
+
+    def refuse(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE ALERT_EVENTS") and (
+            not refused or refuse.always
+        ):
+            refused.append(statement)
+            raise OperationalError(
+                statement, {}, Exception(f"server closed the connection {ALICE}")
+            )
+
+    refuse.always = True
+    engine = stand.get_bind()
+    sa_event.listen(engine, "before_cursor_execute", refuse)
+    yield refuse
+    sa_event.remove(engine, "before_cursor_execute", refuse)
+
+
+def test_run_letter_keeps_sending_when_marks_cannot_be_saved(stand, marks_cannot_be_written):
+    """Письмо первому получателю ушло, запись его меток сорвалась. Остальные
+    получатели из-за этого без письма не остаются, а итог не врёт: ушло обоим."""
+    marks_cannot_be_written.always = False  # сбой разовый
+    alice, bob = _user(stand), _user(stand, BOB)
+    fired = _events(stand, alice, 3)
+
+    with patch("src.notifier.send_email", return_value=True) as send, capture_logs() as logs:
+        result = notifications.dispatch_events_batch(stand, fired)
+
+    assert [call.kwargs["to"] for call in send.call_args_list] == [[ALICE], [BOB]]
+    assert result == {"email": 2, "telegram": 0, "failed": 0, "undelivered": 0}
+    assert _lines(logs, "alert_marks_not_saved", *_RUN_SUMMARIES) == [
+        {
+            "event": "alert_marks_not_saved",
+            "log_level": "warning",
+            "user_id": alice.id,
+            "events": 3,
+            "error_type": "OperationalError",
+        },
+        _summary(
+            "alerts_dispatched_batch",
+            "info",
+            events=3,
+            emails=2,
+            telegram=0,
+            failed=0,
+            undelivered=0,
+        ),
+    ]
+    _assert_no_person_or_text(logs)
+    # Метки второго получателя записаны: сессия после сбоя работает.
+    stand.expire_all()
+    assert [event.channels_sent for event in fired] == [["email"]] * 3
+    assert bob.id != alice.id
+
+
 @pytest.mark.parametrize(
     ("channel", "in_message", "undelivered"), [("email", 2, 1), ("telegram", 1, 0)]
 )
@@ -713,22 +820,6 @@ def journal(monkeypatch):
 RUN_ID = 77
 
 
-@pytest.fixture
-def marks_cannot_be_written(stand):
-    """База отказывает в записи меток канала — уже после того, как письмо ушло."""
-
-    def refuse(conn, cursor, statement, parameters, context, executemany):
-        if statement.lstrip().upper().startswith("UPDATE ALERT_EVENTS"):
-            raise OperationalError(
-                statement, {}, Exception(f"server closed the connection {ALICE}")
-            )
-
-    engine = stand.get_bind()
-    sa_event.listen(engine, "before_cursor_execute", refuse)
-    yield
-    sa_event.remove(engine, "before_cursor_execute", refuse)
-
-
 @pytest.mark.parametrize("how", ["answers_false", "confirmed"])
 def test_run_alerts_caller_writes_no_line_of_its_own(stand, journal, how):
     """«Разослано» от себя конец сбора не пишет ни при каком исходе: итог один,
@@ -743,15 +834,23 @@ def test_run_alerts_caller_writes_no_line_of_its_own(stand, journal, how):
     assert [line["event"] for line in journal.named("alert")] == [expected]
 
 
-def test_run_alerts_that_crashed_leave_the_session_usable(stand, journal, marks_cannot_be_written):
+def _dispatch_that_dies_on_the_database(session, events):
+    """Рассылка, которую база оборвала целиком: flush не удался, исключение вышло
+    наружу, сессия осталась в прерванной транзакции — как при обрыве соединения."""
+    events[0].channels_sent = ["email"]
+    session.commit()
+
+
+def test_run_alerts_that_crashed_leave_the_session_usable(
+    stand, journal, marks_cannot_be_written, monkeypatch
+):
     """Рассылка упала на базе: строка сбоя без текста ошибки, а сессия сбора
     после этого работает — иначе сбор упал бы следующим же запросом."""
     fired = _events(stand, _user(stand), 2)
+    monkeypatch.setattr(notifications, "dispatch_events_batch", _dispatch_that_dies_on_the_database)
 
-    with patch("src.notifier.send_email", return_value=True) as send:
-        main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
+    main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
 
-    assert send.call_count == 1
     assert journal.named("alert") == [
         {
             "event": "alert_dispatch_failed",
@@ -772,7 +871,7 @@ def test_run_alerts_crash_with_a_dead_connection_does_not_raise_from_the_handler
     stand, journal, marks_cannot_be_written, monkeypatch
 ):
     """Откат тоже не удался (соединения нет): причина — в журнале, из обработчика
-    ничего не летит; сбор упадёт дальше сам, на своём запросе."""
+    ничего не летит."""
     fired = _events(stand, _user(stand))
 
     def dead(*args, **kwargs):
@@ -782,9 +881,20 @@ def test_run_alerts_crash_with_a_dead_connection_does_not_raise_from_the_handler
         monkeypatch.setattr(stand, "rollback", dead)
         main_mod._dispatch_run_alerts(stand, RUN_ID, fired)
 
-    assert [(line["event"], line["error_type"]) for line in journal.named("alert")] == [
-        ("alert_dispatch_failed", "OperationalError"),
-        ("alert_dispatch_rollback_failed", "OperationalError"),
+    assert journal.named("alert") == [
+        {
+            "event": "alert_dispatch_failed",
+            "log_level": "warning",
+            "run_id": RUN_ID,
+            "events": 1,
+            "error_type": "OperationalError",
+        },
+        {
+            "event": "alert_dispatch_rollback_failed",
+            "log_level": "warning",
+            "run_id": RUN_ID,
+            "error_type": "OperationalError",
+        },
     ]
     _assert_no_person_or_text(journal.lines)
 
@@ -836,29 +946,55 @@ def test_run_logs_dispatched_when_the_sender_confirmed(stand, monkeypatch, journ
     assert [event.channels_sent for event in fired] == [["email"]] * 3
 
 
-def test_run_survives_a_database_failure_inside_the_dispatch(
+def test_run_survives_marks_that_cannot_be_saved(
     stand, monkeypatch, journal, marks_cannot_be_written
 ):
     """Письмо ушло, запись меток сорвалась. Раньше следующий же запрос сбора падал
     на прерванной транзакции, обработчик сбоя — на том же, и прогон оставался
-    `running`. Теперь сбор доходит до конца."""
+    `running`. Теперь сбор доходит до конца, а итог рассылки честный: письмо ушло."""
     with patch("src.notifier.send_email", return_value=True) as send:
-        result, _ = _run_that_fires_alerts(stand, monkeypatch)
+        result, fired = _run_that_fires_alerts(stand, monkeypatch)
 
     assert send.call_count == 1
     assert result.exit_code == 0, result.output
     run = stand.query(storage.Run).one()
     stand.refresh(run)
     assert run.status == "ok"
-    (failure,) = journal.named("alert_dispatch")
-    assert failure == {
-        "event": "alert_dispatch_failed",
-        "log_level": "warning",
-        "run_id": run.id,
-        "events": 3,
-        "error_type": "OperationalError",
-    }
-    assert journal.named("alerts_dispatched") == []
+    assert [line["event"] for line in journal.named("alert_marks", "alert_dispatch")] == [
+        "alert_marks_not_saved"
+    ]
+    assert [line["event"] for line in journal.named("alerts_dispatch")] == [
+        "alerts_dispatched_batch"
+    ]
+    assert "run_failed" not in [line["event"] for line in journal.lines]
+    stand.expire_all()
+    stored = stand.query(storage.AlertEvent).all()
+    assert len(stored) == len(fired) == 3
+    assert not any(event.channels_sent for event in stored)  # меток нет, хотя письмо ушло
+
+
+def test_run_survives_a_dispatch_that_died_on_the_database(
+    stand, monkeypatch, journal, marks_cannot_be_written
+):
+    """Рассылка оборвалась целиком и оставила сессию в прерванной транзакции:
+    сбор откатывает её и доходит до конца."""
+    monkeypatch.setattr(notifications, "dispatch_events_batch", _dispatch_that_dies_on_the_database)
+
+    result, _ = _run_that_fires_alerts(stand, monkeypatch)
+
+    assert result.exit_code == 0, result.output
+    run = stand.query(storage.Run).one()
+    stand.refresh(run)
+    assert run.status == "ok"
+    assert journal.named("alert_dispatch") == [
+        {
+            "event": "alert_dispatch_failed",
+            "log_level": "warning",
+            "run_id": run.id,
+            "events": 3,
+            "error_type": "OperationalError",
+        }
+    ]
     assert "run_failed" not in [line["event"] for line in journal.lines]
 
 
@@ -1157,6 +1293,7 @@ def test_legacy_dispatch_skipped_or_crashed_telegram_is_not_a_channel(stand, tel
     with (
         patch("src.notifier.send_email", return_value=True),
         patch("src.notifier.send_telegram_message", side_effect=_raises),
+        capture_logs() as logs,
     ):
         result = alerts.dispatch_event(stand, event)
 
@@ -1168,6 +1305,18 @@ def test_legacy_dispatch_skipped_or_crashed_telegram_is_not_a_channel(stand, tel
     }
     stand.refresh(event)
     assert event.channels_sent == ["email"]
+    assert logs == (
+        []
+        if telegram == "no_chat"
+        else [
+            {
+                "event": "alert_telegram_failed",
+                "log_level": "warning",
+                "event_id": event.id,
+                **_error_fields("raises"),
+            }
+        ]
+    )
 
 
 def test_single_event_dispatch_is_not_called_from_src():

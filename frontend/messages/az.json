@@ -58,8 +58,8 @@
     "sending": "Göndərilir…",
     "digest_sent": "İcmal {count} alıcıya göndərildi",
     "digest_partly_sent": "İcmal hamıya göndərilmədi: {sent} göndərildi, {failed} göndərilmədi",
-    "digest_not_sent": "İcmal göndərilmədi: heç bir məktub getmədi ({failed})",
-    "digest_nothing_to_send": "İcmal göndərilmədi: son sutkada hadisə yoxdur və ya heç kim abunə deyil",
+    "digest_not_sent": "İcmal göndərilmədi: heç bir məktub getmədi (alıcı sayı: {failed})",
+    "digest_nothing_to_send": "Göndəriləcək icmal yoxdur: son sutkada hadisə yoxdur və ya heç kim abunə deyil",
     "error": "Xəta: {message}",
     "dismiss_feedback": "Bildirişi bağla"
   },
