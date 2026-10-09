@@ -1213,7 +1213,7 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ("python -c 'import sys' < /dev/null\n", [(1, CODE)]),
         # Перенос «\\» посреди слова и перед строкой, похожей на комментарий.
         ("pyth\\\non3 scripts/x.py\n", [(1, UNKNOWN)]),
-        ('VAR=a\\\n# python3 "$SCRIPT"\n', [(2, UNKNOWN)]),
+        ("VAR=a\\\n# python3 scripts/no_such_file.py\n", [(2, UNKNOWN)]),
     ],
 )
 def test_the_check_finds_python_behind_every_form_of_run(text, kinds):
@@ -1450,10 +1450,10 @@ _FAKE_SRC = {
 
         if FAST:
             def pick():
-                return 1
+                notifier.send_email("x", "y")
         else:
             def pick():
-                notifier.send_email("x", "y")
+                return 1
         """
     ),
     "src.shadow": textwrap.dedent(
@@ -1655,6 +1655,8 @@ _FAKE_SRC = {
             "from src.main import mailer\nmailer()",
             ["отправка `send_email` ← main.mailer ← код"],
         ),
+        # …и сам не тянет за собой функции, которые им обёрнуты.
+        ("from src.main import retry\nretry(len)", []),
         # …и остаётся функцией, которую зовут, даже взятый через модуль.
         (
             "from src.main import wrapped_job\nwrapped_job()",
