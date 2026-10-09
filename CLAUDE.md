@@ -54,8 +54,13 @@ workflow Python — нет). Новая строка в этих списках 
 что она печатает. Текст ошибки базы несёт параметры запроса — адрес и chat_id
 (число, маска его не видит): где запрос ищет человека, в журнал идёт
 `**logging_setup.error_fields(exc)` — класс, строка кода, код базы. Пока так
-пишет только Telegram-бот (`tests/test_telegram_bot.py`). Как искать письмо без
-адреса в журнале и как удалить журнал прогона —
+пишет только Telegram-бот (`tests/test_telegram_bot.py`). Токен бота стоит в
+адресе запроса к Telegram, и текст ошибки `urlopen` его несёт (токен с `\r` на
+конце — `InvalidURL` с путём запроса целиком), а маска токен не видит: отправитель
+(`notifier.send_telegram_message`, `telegram_get_updates`) пишет о сбое класс и
+коды — `http_status`, `error_code`, — без текста ошибки и без ответа сервера
+(`tests/test_notifier.py`). Новый запрос к Telegram — через те же поля. Как
+искать письмо без адреса в журнале и как удалить журнал прогона —
 [docs/RUNBOOK.md](docs/RUNBOOK.md) «Email не приходит».
 
 This file is auto-loaded in every Claude Code session. Read it first.
