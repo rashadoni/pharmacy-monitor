@@ -1758,7 +1758,7 @@ class RecipientOut(BaseModel):
 
 
 class RecipientCreate(BaseModel):
-    email: str = Field(min_length=3, max_length=200)
+    email: str
     name: str | None = None
     role: str = "viewer"
     daily_digest: bool = True

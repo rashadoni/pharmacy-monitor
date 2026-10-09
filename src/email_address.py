@@ -19,11 +19,12 @@
   SMTPUTF8 не объявляет, smtplib останавливает ещё до отправки — всему списку;
 - имя ящика — буквы, цифры и знаки `. _ % + -`. Ровно такие адреса маска
   журнала (`logging_setup.mask_addresses`) вырезает целиком; от `o'brien@…` она
-  оставила бы начало имени, имя в кавычках не увидела бы вовсе. Принятый адрес
-  в журнале не остаётся ни в каком виде — `tests/test_email_address.py` сверяет
-  это с самой маской;
+  оставила бы начало имени, имя в кавычках не увидела бы вовсе.
+  `tests/test_email_address.py` сверяет правило с самой маской;
 - домен — имя с точкой, зона из латинских букв: `admin@local` и адрес сервера в
-  квадратных скобках письмо не получат.
+  квадратных скобках письмо не получат. Часть домена в записи `xn--…` — те же
+  нелатинские буквы, только закодированные: Chrome сам переводит в неё домен,
+  набранный не в той раскладке, раньше, чем страница его прочтёт.
 
 Чего правило не проверяет: что ящик существует. Опечатку в имени оно пропустит.
 """
@@ -35,7 +36,6 @@ import re
 # Ширина колонок `recipients.email` и `tenant_users.email`.
 MAX_LENGTH = 200
 _MAX_MAILBOX_LENGTH = 64
-_MAX_DOMAIN_LENGTH = 253
 
 _MAILBOX_RE = re.compile(r"[a-z0-9_%+\-]+(?:\.[a-z0-9_%+\-]+)*")
 _LABEL = r"[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?"
@@ -90,6 +90,10 @@ def address_problem(value: object) -> str | None:
     address = value.strip().lower()
     if not address:
         return "empty"
+    # Длина — первой: дальше запись читается по знаку, а запрос ссылки на вход
+    # принимает строку любой длины от кого угодно.
+    if len(address) > MAX_LENGTH:
+        return "too_long"
     if any(char.isspace() or not char.isprintable() for char in address):
         return "whitespace"
     if not address.isascii():
@@ -100,12 +104,12 @@ def address_problem(value: object) -> str | None:
         return "no_at"
     if address.count("@") > 1:
         return "several_at"
-    if len(address) > MAX_LENGTH:
-        return "too_long"
     mailbox, domain = address.split("@")
     if len(mailbox) > _MAX_MAILBOX_LENGTH or not _MAILBOX_RE.fullmatch(mailbox):
         return "mailbox"
-    if len(domain) > _MAX_DOMAIN_LENGTH or not _DOMAIN_RE.fullmatch(domain):
+    if any(label.startswith("xn--") for label in domain.split(".")):
+        return "not_ascii"
+    if not _DOMAIN_RE.fullmatch(domain):
         return "domain"
     return None
 

@@ -8,7 +8,6 @@ import { ArrowLeft, Clock, Send, Trash2, UserPlus } from "lucide-react";
 import {
   ApiError,
   api,
-  friendlyError,
   type Recipient,
   type RecipientCreate,
   type RecipientUpdate,
@@ -50,7 +49,6 @@ function addressProblem(err: unknown): AddressProblem | null {
 export default function UsersPage() {
   const t = useTranslations("users");
   const tCommon = useTranslations("common");
-  const locale = useLocale();
   const qc = useQueryClient();
   const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
   const listQ = useQuery({ queryKey: ["recipients"], queryFn: api.recipients });
@@ -78,10 +76,11 @@ export default function UsersPage() {
 
   const isAdmin = meQ.data?.role === "admin";
 
+  // Отказ в адресе — словами; остальные ошибки показываются как раньше.
   function addError(err: unknown): string {
     const problem = addressProblem(err);
     if (problem) return t(`address_problem_${problem}`);
-    return friendlyError(err, locale) || t("add_error");
+    return (err as Error)?.message ?? t("add_error");
   }
 
   return (

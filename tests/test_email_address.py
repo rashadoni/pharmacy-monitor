@@ -51,7 +51,9 @@ ACCEPTED = [
     "user.name+tag@sub.example.co.uk",
     "u_s%r-1@a-b.az",
     "0@1a.az",
+    # Границы: имя ящика 64 знака, часть домена 63, весь адрес ровно 200.
     "x" * 64 + "@example.com",
+    "x" * 64 + "@" + "a" * 63 + "." + "b" * 63 + ".example",
 ]
 
 # Запись → код причины. Первые пять — те, на которых сборка письма падала у
@@ -78,7 +80,9 @@ REFUSED = {
     '"viewer"@client.example': "several",
     "viewer(note)@client.example": "several",
     "viewer@client@example.com": "several_at",
-    "x" * (MAX_LENGTH - 11) + "@example.com": "too_long",
+    "x" * 64 + "@" + "a" * 63 + "." + "b" * 63 + ".examples": "too_long",  # 201 знак
+    # Длина проверяется первой: запись любого размера не читается по знаку.
+    "x " * 5_000 + "@example.com": "too_long",
     "@client.example": "mailbox",
     ".viewer@client.example": "mailbox",
     "viewer.@client.example": "mailbox",
@@ -93,8 +97,13 @@ REFUSED = {
     "viewer@client-.example": "domain",
     "viewer@client..example": "domain",
     "viewer@.example": "domain",
+    "viewer@" + "a" * 64 + ".example": "domain",
     "viewer@[192.0.2.1]": "domain",
-    "viewer@xn--e1afmkfd.xn--p1ai": "domain",
+    # Домен с нелатинской буквой, как его присылает Chrome: поле ввода адреса
+    # само переводит такой домен в запись `xn--…`.
+    "viewer@xn--lient-3ve.example": "not_ascii",
+    "viewer@mail.xn--lient-3ve.example": "not_ascii",
+    "viewer@xn--e1afmkfd.xn--p1ai": "not_ascii",
     tenants.BOOTSTRAP_ADMIN_EMAIL: "domain",
 }
 
@@ -125,6 +134,15 @@ def test_a_record_that_is_not_an_address_is_refused_with_its_reason(record, prob
 
 def test_what_is_not_a_string_is_not_an_address():
     assert address_problem(None) == "empty"
+
+
+def test_the_examples_stand_on_the_length_limits():
+    """Примеры выше названы граничными — пусть ими и остаются, если правило
+    или ширина колонки изменятся."""
+    longest = ACCEPTED[-1]
+    assert len(longest) == MAX_LENGTH
+    assert len(longest.split("@")[0]) == _MAX_MAILBOX_LENGTH
+    assert address_problem(longest + "s") == "too_long"
 
 
 def test_every_reason_is_reachable_and_has_a_text_that_can_be_shown_anywhere():
@@ -168,8 +186,20 @@ def _candidates(count: int) -> list[str]:
     return found
 
 
+def _every_printable_sign_in_every_place() -> list[str]:
+    """Каждый печатный знак ASCII — в начале, в середине и в конце имени ящика,
+    части домена и зоны. Случайный перебор выше знает только свои пятнадцать
+    знаков: разреши правило новый (`&`, `!`, `~`) — он бы этого не заметил."""
+    found = []
+    for code in range(0x20, 0x7F):
+        sign = chr(code)
+        for part in (f"{sign}ab", f"a{sign}b", f"ab{sign}"):
+            found += [f"{part}@client.example", f"viewer@{part}.example", f"viewer@client.{part}"]
+    return found
+
+
 def _accepted_candidates() -> list[str]:
-    candidates = _candidates(6000)
+    candidates = _candidates(6000) + _every_printable_sign_in_every_place()
     accepted = sorted({normalize_address(c) for c in candidates if is_address(c)})
     # Перебор не вхолостую: и принятых, и отвергнутых — сотни.
     assert len(accepted) > 300 and len(candidates) - len(accepted) > 300, len(accepted)
@@ -239,7 +269,7 @@ def _to_header(message: bytes) -> str:
 def test_an_accepted_address_goes_through_the_real_assembly(outbox):
     """Правило не просто строже прежнего: с адресом, который оно приняло,
     пакет `email` письмо собирает, а в конверте стоит ровно этот адрес."""
-    addresses = ACCEPTED + _accepted_candidates()[:300]
+    addresses = ACCEPTED + _accepted_candidates()
     for address in addresses:
         assert notifier.send_email("Тема", "<p>x</p>", to=[address]) is True
     assert [envelope for envelope, _ in outbox] == [[address] for address in addresses]
@@ -385,6 +415,9 @@ def admin_page(database, monkeypatch):
         ("rəşad@client.example", "not_ascii"),
         ("o'brien@client.example", "mailbox"),
         ("viewer@client.example, second@client.example", "whitespace"),
+        ("viewer@xn--lient-3ve.example", "not_ascii"),
+        ("x" * 190 + "@client.example", "too_long"),
+        ("", "empty"),
     ],
 )
 def test_the_users_page_gets_the_reason_as_a_code_and_in_words(
@@ -520,6 +553,20 @@ def test_a_bad_entry_of_email_to_is_named_by_its_place(outbox, database, monkeyp
     assert logs[0]["positions"] == [2, 3]
     assert logs[0]["problems"] == ["domain", "not_ascii"]
     assert "@" not in repr(logs), logs
+
+
+def test_a_list_of_bad_rows_does_not_switch_the_letter_to_email_to(outbox, database, monkeypatch):
+    """Кому слать, решает список, а не его поломка: `EMAIL_TO` — запасной
+    список на случай пустой таблицы, и у него могут быть другие получатели."""
+    database.add(storage.Recipient(email="viewer@local", is_active=True))
+    database.commit()
+    monkeypatch.setenv("EMAIL_TO", SECOND)
+
+    with pytest.raises(notifier.EmailSendError) as raised:
+        notifier.send_email("Тема", "<p>x</p>")
+
+    assert outbox == []
+    assert raised.value.error_type == "NoValidRecipients"
 
 
 def test_the_address_goes_out_as_it_is_stored(outbox):
