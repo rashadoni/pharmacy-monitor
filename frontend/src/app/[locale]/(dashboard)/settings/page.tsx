@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslations } from "next-intl";
 import { Link, useRouter } from "@/i18n/navigation";
 import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, MessageCircle, Send, User, Users, XCircle, Zap } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type NotifPrefs } from "@/lib/api";
 import { LocaleSwitcher } from "@/components/locale-switcher";
 
@@ -41,7 +41,7 @@ export default function SettingsPage() {
         )}
       </Section>
 
-      <NotificationsSection email={meQ.data?.email} />
+      <NotificationsSection />
 
       <ChangePasswordSection />
 
@@ -255,24 +255,58 @@ function IntegrationsStatusSection() {
 }
 
 
-function NotificationsSection({ email }: { email?: string }) {
+function NotificationsSection() {
   const queryClient = useQueryClient();
   const t = useTranslations("settings");
   const tCommon = useTranslations("common");
-  const prefsQ = useQuery({ queryKey: ["notif-prefs"], queryFn: api.notifPrefs });
+  // Код привязки чата: выдаётся вошедшему пользователю, живёт недолго и
+  // срабатывает один раз. Пока он на экране, настройки перечитываются — как
+  // только бот привяжет чат, блок сам покажет привязку.
+  const [bindCode, setBindCode] = useState<{ code: string; expiresAt: number } | null>(null);
+  const prefsQ = useQuery({
+    queryKey: ["notif-prefs"],
+    queryFn: api.notifPrefs,
+    refetchInterval: bindCode ? 3000 : false,
+  });
   const integrationsQ = useQuery({ queryKey: ["integrations"], queryFn: api.integrations });
   const statusQ = useQuery({ queryKey: ["system-status"], queryFn: api.systemStatus });
-  const bindEmail = email ?? "your-email@example.com";
+  const botUsername =
+    integrationsQ.data?.telegram_bot_username ?? process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME;
   const updateMutation = useMutation({
     mutationFn: (patch: Partial<NotifPrefs>) => api.notifPrefsUpdate(patch),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notif-prefs"] }),
   });
   const unbindMutation = useMutation({
     mutationFn: () => api.notifUnbindTelegram(),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notif-prefs"] }),
+    onSuccess: () => {
+      setBindCode(null);
+      queryClient.invalidateQueries({ queryKey: ["notif-prefs"] });
+    },
   });
+  const bindCodeMutation = useMutation({
+    mutationFn: () => api.notifTelegramBindCode(),
+    onSuccess: (issued) =>
+      setBindCode({ code: issued.code, expiresAt: Date.now() + issued.expires_in_sec * 1000 }),
+    // Отказ бывает и оттого, что чат уже привязан в другой вкладке.
+    onError: () => queryClient.invalidateQueries({ queryKey: ["notif-prefs"] }),
+  });
+  useEffect(() => {
+    if (!bindCode) return;
+    // Код истёк: убрать его с экрана и перечитать настройки — привязка могла
+    // пройти, пока вкладка была в фоне.
+    const timer = setTimeout(() => {
+      setBindCode(null);
+      queryClient.invalidateQueries({ queryKey: ["notif-prefs"] });
+    }, Math.max(0, bindCode.expiresAt - Date.now()));
+    return () => clearTimeout(timer);
+  }, [bindCode, queryClient]);
 
   const prefs = prefsQ.data;
+  const telegramBound = !!prefs?.telegram_chat_id;
+  useEffect(() => {
+    // Чат привязан — код погашен, перечитывать настройки больше незачем.
+    if (telegramBound) setBindCode(null);
+  }, [telegramBound]);
 
   return (
     <Section title={t("notifications")} icon={Bell}>
@@ -328,24 +362,56 @@ function NotificationsSection({ email }: { email?: string }) {
                   bash scripts/configure-integrations.sh
                 </code>
               </div>
-            ) : (
-              <div className="rounded-md bg-secondary/50 border border-border p-3 text-sm">
-                <div>
-                  {t("telegram_bind_hint")}{" "}
-                  <code className="font-mono">/start {bindEmail}</code>
+            ) : !botUsername ? (
+              // Без имени бота код не выдаём: человек искал бы бота сам и мог
+              // отправить код чужому боту с похожим именем.
+              <div className="rounded-md bg-warning/10 border border-warning/40 p-3 text-sm">
+                <div className="font-medium text-warning mb-1">{t("telegram_not_configured_title")}</div>
+                <div className="text-xs text-muted-foreground">
+                  {t("telegram_bot_username_missing")}{" "}
+                  <code className="font-mono">TELEGRAM_BOT_USERNAME</code>{" "}
+                  <code className="font-mono">/etc/pharmacy-monitor/env</code>
                 </div>
-                <a
-                  href={`https://t.me/${
-                    integrationsQ.data?.telegram_bot_username ??
-                    process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME ??
-                    "your_bot"
-                  }`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs text-primary hover:underline mt-1 inline-block"
-                >
-                  {t("telegram_open_bot")}
-                </a>
+              </div>
+            ) : (
+              <div className="rounded-md bg-secondary/50 border border-border p-3 text-sm space-y-2">
+                <div>{t("telegram_bind_hint")}</div>
+                {bindCode ? (
+                  <>
+                    <div>{t("telegram_bind_send", { bot: botUsername })}</div>
+                    <code className="block font-mono text-xs bg-background border border-border p-2 rounded break-all select-all">
+                      /start {bindCode.code}
+                    </code>
+                    <div className="text-xs text-muted-foreground">
+                      {t("telegram_bind_valid_until", {
+                        time: new Date(bindCode.expiresAt).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        }),
+                      })}{" "}
+                      {t("telegram_bind_waiting")}
+                    </div>
+                    <a
+                      href={`https://t.me/${botUsername}?start=${bindCode.code}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex min-h-11 items-center rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 md:min-h-9"
+                    >
+                      {t("telegram_open_bot")}
+                    </a>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => bindCodeMutation.mutate()}
+                    disabled={bindCodeMutation.isPending}
+                    className="min-h-11 rounded-md bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 disabled:opacity-50 md:min-h-9"
+                  >
+                    {t("telegram_bind_get_code")}
+                  </button>
+                )}
+                {bindCodeMutation.isError && !bindCode && (
+                  <div className="text-xs text-destructive">{t("telegram_bind_error")}</div>
+                )}
               </div>
             )}
           </div>

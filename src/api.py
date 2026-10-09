@@ -1688,6 +1688,42 @@ def dash_notifications_unbind_telegram(
     return Response(status_code=204)
 
 
+class TelegramBindCodeOut(BaseModel):
+    code: str
+    expires_in_sec: int
+
+
+@app.post("/api/v1/dash/me/notifications/telegram/code", response_model=TelegramBindCodeOut)
+def dash_notifications_telegram_code(
+    response: Response,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Выдать одноразовый код привязки Telegram-чата к своему аккаунту.
+
+    Код показывается один раз — в этом ответе; в базе остаётся его хеш.
+    Пользователь отправляет его боту `/start <код>`. Чат привязывает тот, кто
+    вошёл в аккаунт, поэтому без входа (`PHARMACY_AUTH_DISABLED`) код не
+    выдаётся: там «вошедший» — любой, кто открыл дашборд.
+    """
+    from src import telegram_binding
+
+    if _AUTH_DISABLED:
+        raise HTTPException(403, "Telegram binding requires a signed-in user")
+    _check_rate_limit(f"tg_bind_code:{user.id}", limit=5)
+    try:
+        issued = telegram_binding.issue_code(db, user.id)
+    except telegram_binding.AlreadyBound:
+        raise HTTPException(409, "Telegram is already bound — unbind it first")
+    except LookupError:
+        raise HTTPException(404, "User not found")
+    response.headers["Cache-Control"] = "no-store"
+    return TelegramBindCodeOut(
+        code=issued.code,
+        expires_in_sec=int(telegram_binding.CODE_TTL.total_seconds()),
+    )
+
+
 @app.post("/api/v1/dash/digest/send-test")
 def dash_digest_send_test(
     kind: str = "daily",

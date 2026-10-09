@@ -66,7 +66,7 @@ curl -fsS https://your-domain.com/health
 # - Enter your real email → magic-link arrives
 # - Click link → /overview loads with data
 # - Search "nestle" in /comparison → results appear
-# - /settings → Telegram bind via /start <email>
+# - /settings → Telegram: get a one-time code, send the bot /start <code>
 # - Receive a test alert in Telegram (force one if needed)
 
 # 7. Announce

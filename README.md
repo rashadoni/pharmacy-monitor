@@ -251,8 +251,8 @@ echo "TELEGRAM_BOT_TOKEN=12345:ABC..." >> .env
 # 2. Запустить bot polling
 uv run pharmacy-monitor telegram run-bot
 
-# 3. Клиент пишет боту /start → видит свой chat_id
-# 4. Привязать chat_id к recipient через дашборд (📧 Получатели)
+# 3. Пользователь в дашборде: Настройки → Уведомления → «Получить код привязки»
+# 4. Отправляет код боту: /start <код> (код действует 10 минут, один раз)
 # 5. В правиле алерта указать channels=email,telegram
 ```
 

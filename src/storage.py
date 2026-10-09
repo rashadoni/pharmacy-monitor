@@ -589,6 +589,43 @@ class TenantUser(Base):
     weekly_digest: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class TelegramBindCode(Base):
+    """Одноразовый код привязки Telegram-чата к аккаунту.
+
+    Код выдаёт дашборд вошедшему пользователю, пользователь отправляет его боту
+    `/start <код>` (`src/telegram_binding.py`). В базе лежит только SHA-256 кода:
+    сам код знают дашборд в момент выдачи и тот, кому его показали. У
+    пользователя не больше одного действующего кода — новый заменяет прежний.
+    """
+
+    __tablename__ = "telegram_bind_codes"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_telegram_bind_codes_user_id"),
+        UniqueConstraint("code_hash", name="uq_telegram_bind_codes_code_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("tenant_users.id", ondelete="CASCADE"))
+    code_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class TelegramBindAttempt(Base):
+    """Неудачные попытки привязки, по чату: сколько и с какого момента.
+
+    Строка живёт одно окно (`telegram_binding.ATTEMPT_WINDOW`) и стирается при
+    удачной привязке или вместе с прочими истёкшими — при следующей неудаче
+    любого чата. В базе, а не в памяти бота: перезапуск бота счёт не обнуляет.
+    """
+
+    __tablename__ = "telegram_bind_attempts"
+
+    chat_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    failures: Mapped[int] = mapped_column(Integer)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime)
+
+
 class MatchRejection(Base):
     """Анти-матч: пара Product'ов которые НЕ являются одним товаром.
 

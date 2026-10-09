@@ -46,12 +46,12 @@ def test_cmd_help_lists_commands(db_session):
         assert cmd in out
 
 
-def test_cmd_today_no_data(db_session):
+def test_cmd_today_no_data(db_session, bound_chat):
     out = telegram_bot.cmd_today(db_session, "12345", "")
     assert "временно недоступны" in out.lower()
 
 
-def test_cmd_today_with_data(db_session):
+def test_cmd_today_with_data(db_session, bound_chat):
     """Если есть Match с конкурентом дешевле клиента — должно быть в топ-3."""
     m = Match(canonical_name="Foo", confidence=1.0)
     db_session.add(m)
@@ -94,7 +94,7 @@ def test_cmd_today_with_data(db_session):
     assert "Foo" in out
 
 
-def test_cmd_today_does_not_compute_from_unfinished_run(db_session):
+def test_cmd_today_does_not_compute_from_unfinished_run(db_session, bound_chat):
     run = _add_run(db_session)
     run.finished_at = None
     db_session.commit()
@@ -104,7 +104,7 @@ def test_cmd_today_does_not_compute_from_unfinished_run(db_session):
     assert "временно недоступны" in out.lower()
 
 
-def test_cmd_today_hides_old_cache_after_degraded_full_attempt(db_session):
+def test_cmd_today_hides_old_cache_after_degraded_full_attempt(db_session, bound_chat):
     run = _add_run(db_session, started_at=utcnow() - timedelta(hours=1))
     roi.cache_actions(db_session, "pharmonline", [], run_id=run.id)
     degraded_at = utcnow()
@@ -135,12 +135,12 @@ def test_cmd_today_hides_old_cache_after_degraded_full_attempt(db_session):
     assert "временно недоступны" in out.lower()
 
 
-def test_cmd_alerts_empty(db_session):
+def test_cmd_alerts_empty(db_session, bound_chat):
     out = telegram_bot.cmd_alerts(db_session, "12345", "")
     assert "не было" in out
 
 
-def test_cmd_alerts_with_events(db_session):
+def test_cmd_alerts_with_events(db_session, bound_chat):
     db_session.add(
         AlertEvent(
             rule_type="undercut_threshold",
@@ -155,7 +155,7 @@ def test_cmd_alerts_with_events(db_session):
     assert "Test alert title" in out
 
 
-def test_cmd_status(db_session):
+def test_cmd_status(db_session, bound_chat):
     """Status работает даже на пустой БД (warning: no_runs)."""
     out = telegram_bot.cmd_status(db_session, "12345", "")
     assert "Status" in out
