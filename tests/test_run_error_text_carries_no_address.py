@@ -135,6 +135,7 @@ def test_error_text_is_stored_without_an_at_sign(written, stored):
         # Не дописывание — текст целиком.
         ("aloe failed", f"other | reaped by {ADDRESS}", WITHHELD),
         ("aloe", f"aloe failed | reaped by {ADDRESS}", WITHHELD),
+        ("b", f"a | b | reaped by {ADDRESS}", WITHHELD),
         (None, f"KeyError: 'viewer | {ADDRESS}'", f"KeyError: {WITHHELD}"),
         ("", f"a | {ADDRESS}", WITHHELD),
     ],

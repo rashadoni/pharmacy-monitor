@@ -62,16 +62,22 @@
 - текст ошибки, в котором нет человека, но есть другое: имя хоста, обрывок
   запроса, логин прокси.
 
-Не запуском считается только названное явно: `--version`, `-h` и слово, прямо
-перед которым стоит один из пяти видов (`_ONLY_NAMES_PYTHON`): проверка файла
-(`test -x …/python`), присваивание (`PY=…/python`), `command -v`, аргумент
-`which`/`ls`/`ln`/установки пакетов и слово в `echo`. Где начинается команда,
-тест из текста shell не выводит — каждый вид требует своего начала сам. Всё
-остальное — запуск: незнакомая форма и интерпретатор без программы после себя
-роняют CI, а не пропускаются. Под разбором стоит этаж: слово `python`, о
+Не запуском считается только названное явно: `--version`, `-h` — и строка,
+которая ЦЕЛИКОМ, от начала до конца, совпала с одним из шести видов
+(`_LINES_THAT_ONLY_NAME_PYTHON`): проверка файла (`test -x …/python`),
+присваивание одного слова (`PY=…/python`), `command -v`/`which`, установка
+пакетов, `ls`/`ln`, `echo` с простым текстом. Где в тексте shell начинается и
+кончается команда, тест не выводит: четыре разбора подряд находили форму, в
+которой такой вывод ошибался и запуск пропадал молча. Поэтому всё остальное —
+запуск: незнакомая форма, строка-упоминание с продолжением (`test -x … && …`)
+и интерпретатор без программы после себя роняют CI, а не пропускаются; новый
+вид строки дописывают в список. Под разбором стоит этаж: слово `python`, о
 котором он ничего не решил, роняет CI тоже — кроме заведомо не интерпретатора
 (слово с дефисом вроде `python3-venv`, каталог, образ, ключ; интерпретатор с
 дефисом в имени — `python3-dbg` — этаж за такое слово и примет).
+
+Что разбор читает неверно, хотя и не молчит: код после `-c`, склеенный из двух
+строк в разных кавычках с переносом строки между ними, — прочитается первая.
 """
 
 from __future__ import annotations
@@ -146,41 +152,43 @@ _DUPLICATED_DESCRIPTOR = re.compile(r"\d*[<>]&[\d-]+$")
 _REDIRECTION = re.compile(r"(?:&>>?|\d*>>?|\d*<(?!<))(.*)$", re.S)
 _END_OF_SHELL_COMMAND = re.compile(r"&&|\|\||[;|\n]")
 
-# Слово `python`, которое ничего не запускает, узнаётся только по тому, что
-# стоит прямо перед ним в строке, и только в пяти видах. Где начинается команда,
-# тест из текста shell не выводит: каждый вид требует своего начала явно, и всё,
-# что между началом и словом, — простые слова без подстановок и операторов.
-# Что не подошло ни под один вид — запуск.
-_PLAIN_WORD = r"""(?:[\w./+:=,@%-]+|'[^'$`]*'|"[^"$`]*")"""
-_START_OF_A_COMMAND = (
-    r"(?:^[ \t]*(?:-[ \t]+)?(?:run:[ \t]*)?|[;&|({`][ \t]*|\b(?:then|do|else)[ \t]+)"
-    r"(?:sudo[ \t]+(?:-\w+[ \t]+(?:[\w.-]+[ \t]+)?)*)?"
-)
-_ONLY_NAMES_PYTHON = [
-    # Проверка файла: `test -x …/python`, `[ ! -x …/python ]`.
-    re.compile(r"""(?:\btest|\[\[?)[ \t]+(?:![ \t]+)?-[a-zA-Z][ \t]+["']?$"""),
-    # Присваивание и значение опции: `PY=…/python`, `--python=python3`.
-    re.compile(r"""[\w}]=["']?$"""),
-    # Вопрос «где программа»: `command -v python3` — в любом месте команды.
-    re.compile(r"""\bcommand[ \t]+-[vV][ \t]+["']?$"""),
-    # Он же и аргумент команды, которая Python не запускает, — в её начале.
-    re.compile(
-        _START_OF_A_COMMAND
-        + r"(?:which|type|hash|ls|ln|(?:apt-get|apt|dnf|yum|brew)[ \t]+install|apk[ \t]+add)\b"
-        + rf"(?:[ \t]+{_PLAIN_WORD})*"
-        + r"""[ \t]+["']?$"""
-    ),
-    # Слово в тексте, который печатают.
-    re.compile(
-        _START_OF_A_COMMAND
-        + rf"(?:echo|printf)\b(?:[ \t]+{_PLAIN_WORD})*"
-        + r"""[ \t]+["']?[^"'$`;&|<>()]*$"""
-    ),
+# Строка, в которой слово `python` ничего не запускает, узнаётся только ЦЕЛИКОМ:
+# от начала до конца она должна быть одним из шести видов. Где в тексте shell
+# начинается и кончается команда, тест не выводит — четыре разбора подряд
+# находили форму, в которой вывод ошибался, и запуск за ним пропадал молча.
+# Строка, не совпавшая с видом целиком, — запуск: её либо удаётся прочитать,
+# либо она роняет CI. Новый вид дописывают сюда — это видно в дифе теста.
+_A_PYTHON = r"""["']?[\w./${}-]*python[0-9.]*["']?"""  # одно слово: путь к интерпретатору
+_OUTPUT_ELSEWHERE = r"(?: (?:\d?>>?|&>) ?[\w/.&-]+)*"
+_LINES_THAT_ONLY_NAME_PYTHON = [
+    re.compile(shape)
+    for shape in (
+        # Проверка файла: `test -x …/python`, `[ ! -x …/python ] || exit 1`.
+        rf"(?:sudo(?: -u [\w-]+)? )?(?:test|\[\[?) (?:! )?-[a-zA-Z] {_A_PYTHON}(?: \]\]?)?"
+        r"(?: \|\| exit \d+)?",
+        # Присваивание одного слова: `PY=…/python`, `export PYTHON=python3`.
+        rf"(?:export |readonly |local )?\w+={_A_PYTHON}",
+        # Вопрос «где программа»: `command -v python3 >/dev/null || exit 1`.
+        rf"(?:if )?(?:! )?(?:command -[vV]|which|type|hash) {_A_PYTHON}{_OUTPUT_ELSEWHERE}"
+        r"(?:; then| \|\| exit \d+)?",
+        # Установка пакетов: `sudo apt-get install -y python3 python3-venv`.
+        r"(?:sudo )?(?:[A-Z_]+=\w+ )*(?:apt-get|apt|dnf|yum|brew|apk)(?: -[\w-]+)*"
+        r" (?:install|add)(?: [\w.+:=-]+)*",
+        # Список и ссылка: `ls -l …/python`, `ln -sf /usr/bin/python3 /usr/local/bin/python`.
+        rf"(?:ls|ln)(?: [\w./+:=-]+)+{_OUTPUT_ELSEWHERE}",
+        # Текст, который печатают: слова и строки без подстановки команд.
+        r"""(?:echo|printf)(?: (?:"(?:[^"$`\\]|\$\w+|\$\{\w+\})*"|'[^']*'|[\w./:=,%-]+))+"""
+        + _OUTPUT_ELSEWHERE,
+    )
 ]
+_START_OF_A_STEP = re.compile(r"^(?:- )?(?:run: )?")
 # Шаг, тело которого — Python: `shell: python`. Тело такого шага тест не читает.
 _PYTHON_SHELL = re.compile(r"""(?<![\w-])["']?shell["']?[ \t]*:[ \t]*(?:&\w+[ \t]+)?["']?python""")
-# Строки, которые ничего не запускают: комментарий и имя шага.
-_NOT_A_COMMAND_LINE = re.compile(r"^[ \t]*(?:#|-?[ \t]*name:).*$", re.M)
+# Строки, которые ничего не запускают: комментарий и имя шага. Такая строка
+# бывает и серединой строки в кавычках, за которой в той же строке стоит запуск
+# (`…" | python3 …`), поэтому со знаком `|`, `;`, `&` или подстановкой она
+# читается как обычная.
+_NOT_A_COMMAND_LINE = re.compile(r"^[ \t]*(?:#|-?[ \t]*name:)[^|;&`\n]*$", re.M)
 # Модули, которые запускают как есть: своего кода о людях в них нет, а
 # миграции этот тест не читает (см. описание файла).
 _MODULES_NOT_READ = {
@@ -243,27 +251,29 @@ def _repo_file(word: str) -> Path | None:
     return None
 
 
-def _only_names_python(before_on_the_line: str) -> bool:
-    """Стоит ли перед словом `python` то, после чего оно ничего не запускает."""
-    return any(shape.search(before_on_the_line) for shape in _ONLY_NAMES_PYTHON)
+def _only_names_python(line: str) -> bool:
+    """Вся ли строка — один из видов, в которых слово `python` ничего не запускает."""
+    whole = _START_OF_A_STEP.sub("", " ".join(line.split()))
+    return any(shape.fullmatch(whole) for shape in _LINES_THAT_ONLY_NAME_PYTHON)
 
 
 def _without_redirections(words: list[str]) -> tuple[list[str], bool]:
-    """Слова команды без перенаправлений — и были ли они. Блок `<<TAG` остаётся."""
-    kept, redirected, index = [], False, 0
+    """Слова команды без перенаправлений — и взят ли stdin из файла. Блок `<<TAG`
+    остаётся словом."""
+    kept, stdin_from_a_file, index = [], False, 0
     while index < len(words):
         word = words[index]
         if word.startswith("<<"):
             kept.append(word)
         elif _DUPLICATED_DESCRIPTOR.match(word):
-            redirected = True
+            pass
         elif found := _REDIRECTION.match(word):
-            redirected = True
+            stdin_from_a_file = stdin_from_a_file or "<" in word[: found.start(1)]
             index += 0 if found.group(1) else 1  # цель — следующим словом
         else:
             kept.append(word)
         index += 1
-    return kept, redirected
+    return kept, stdin_from_a_file
 
 
 def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
@@ -292,17 +302,14 @@ def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
         line = line_of(interpreter.start())
         end_of_line = shell.find("\n", interpreter.end())
         end_of_line = len(shell) if end_of_line < 0 else end_of_line
-        rest = shell[interpreter.end() : end_of_line]
         start_of_line = shell.rfind("\n", 0, interpreter.start()) + 1
-        if _only_names_python(shell[start_of_line : interpreter.start()]):
+        if _only_names_python(shell[start_of_line:end_of_line]):
             continue
-
-        words, redirected = _without_redirections(
-            [
-                word
-                for word in _END_OF_SHELL_COMMAND.split(rest, maxsplit=1)[0].split()
-                if _unquoted(word) or word.startswith("<<")
-            ]
+        # Своя команда интерпретатора: до `&&`, `||`, `;`, `|`. Блок `<<TAG` за
+        # этой границей — чужой.
+        rest = _END_OF_SHELL_COMMAND.split(shell[interpreter.end() : end_of_line], maxsplit=1)[0]
+        words, stdin_from_a_file = _without_redirections(
+            [word for word in rest.split() if _unquoted(word) or word.startswith("<<")]
         )
         while words:
             if words[0] in _INTERPRETER_OPTIONS_WITH_A_VALUE:
@@ -311,13 +318,14 @@ def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
                 words = words[1:]
             else:
                 break
-        if words and words[0] in _NOT_A_RUN:
+        if words and _unquoted(words[0]) in _NOT_A_RUN:
             continue
-        if not words:
-            # Программы после слова нет, и упоминанием оно не признано: значит,
-            # код интерпретатору дали иначе — по `|`, через `<`, следующей
-            # строкой свёрнутого YAML, блоком у внешней команды.
-            why = "файл со stdin" if redirected else "без программы: код дали со stdin?"
+        if not words or stdin_from_a_file:
+            # Программы после слова нет, и строка не из тех, где оно ничего не
+            # запускает: значит, код интерпретатору дали иначе — по `|`, через
+            # `<`, следующей строкой свёрнутого YAML, блоком у внешней команды.
+            # Файл со stdin главнее блока `<<TAG` в той же команде.
+            why = "с файлом на stdin" if stdin_from_a_file else "без программы: код дали со stdin?"
             runs.append(PythonRun(line, UNKNOWN, f"интерпретатор {why}"))
             continue
         first = words[0]
@@ -341,6 +349,18 @@ def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
             closing = _closing_quote(shell, quoted.end(), quoted.group(1)) if quoted else -1
             if closing < 0:
                 runs.append(PythonRun(line, UNKNOWN, "код после `-c` не в кавычках"))
+                continue
+            # Сразу за закрытой кавычкой — ещё текст: shell склеит его с кодом
+            # (`-c 'import sys'"; from src import …"`). Одна кавычка следом и
+            # конец слова — это закрылась внешняя строка, в которой лежит вся
+            # команда (`ssh host 'python -c "…"'`).
+            tail = shell[closing + len(quoted.group(1)) :]
+            if tail[:1] in ("'", '"'):
+                glued = bool(tail[1:2].strip()) and tail[1:2] != ")"
+            else:
+                glued = bool(tail[:1].strip()) and tail[:1] not in ";|&)"
+            if glued:
+                runs.append(PythonRun(line, UNKNOWN, "код после `-c` склеен из кусков"))
                 continue
             code = text[quoted.end() : closing]
             if quoted.group(1) == '"':  # в двойных кавычках shell снимает `\` сам
@@ -384,9 +404,9 @@ def python_runs(text: str) -> list[PythonRun]:
 
     Текст читается, а не исполняется. Тело уже найденного блока вторым запуском
     не считается: слово `python` в строке Python — не команда. Не запуск —
-    только названное явно: `--version`, `-h` и слово, перед которым стоит один
-    из пяти видов `_ONLY_NAMES_PYTHON`. Слово без программы после себя, не
-    подошедшее ни под один вид, — `UNKNOWN`.
+    только названное явно: `--version`, `-h` и строка, целиком совпавшая с
+    одним из видов `_LINES_THAT_ONLY_NAME_PYTHON`. Слово без программы после
+    себя в любой другой строке — `UNKNOWN`.
     """
     return _scan(text)[0]
 
@@ -570,8 +590,18 @@ class Sources:
         """Чего нельзя в самом запущенном коде, а в `src/` можно: импортировать
         по имени, называть интерпретатор или CLI (так их запускают из кода мимо
         обеих проверок) и называть таблицу людей строкой."""
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+        }
         marks = []
         for sub in ast.walk(tree):
+            if id(sub) in docstrings:
+                continue
             if isinstance(sub, ast.Import | ast.ImportFrom):
                 modules = (
                     [alias.name for alias in sub.names]
@@ -670,6 +700,8 @@ class Sources:
         for sub in ast.walk(node):
             if id(sub) in chain or not isinstance(sub, ast.Name | ast.Attribute):
                 continue
+            if isinstance(sub, ast.Name) and not isinstance(sub.ctx, ast.Load):
+                continue  # имя, которому присваивают, — не ссылка на него
             parts = [sub.id] if isinstance(sub, ast.Name) else _dotted(sub)
             if parts and (target := self._resolve_in(parts, module, own_defs=own_defs)[0]):
                 followed.append((target, True))
@@ -756,13 +788,15 @@ _HOW_TO_FIX_A_RUN = (
     "перепиши блоком. Блок, который не разбирается как Python, — это либо "
     "подстановка shell, ломающая синтаксис (открой кавычками `<<'PY'` и передай "
     "значения через окружение), либо синтаксис новее Python 3.11, на котором "
-    "идёт CI. Если `python` здесь не запускают, тест узнаёт это только по "
-    "тому, что стоит прямо перед словом, и только в пяти видах "
-    "(`_ONLY_NAMES_PYTHON`): проверка файла, присваивание, `command -v`, "
-    "аргумент `which`/`ls`/`ln`/установки пакетов и слово в `echo` — причём "
-    "команда должна стоять в начале, а между ней и словом не должно быть "
-    "подстановок и операторов. Напиши строку так или перефразируй (комментарии "
-    "и `name:` шага тест пропускает сам); модуль, который ничего своего не "
+    "идёт CI. Если `python` здесь не запускают, тест узнаёт это, только когда "
+    "строка ЦЕЛИКОМ — один из видов `_LINES_THAT_ONLY_NAME_PYTHON`: проверка "
+    "файла (`test -x …/python`), присваивание одного слова, `command -v`/`which`, "
+    "установка пакетов, `ls`/`ln`, `echo` с простым текстом. Строка с "
+    "продолжением (`test -x … && …`) видом уже не считается: вынеси упоминание "
+    "на свою строку или перефразируй (строку комментария и `name:` шага без "
+    "знаков `|`, `;`, `&` тест пропускает сам). Нужен новый вид строки — допиши "
+    "его в список целиком, от начала до конца: так запуску в нём негде "
+    "спрятаться, и правка видна в дифе. Модуль, который ничего своего не "
     "исполняет, допиши в `_MODULES_NOT_READ`."
 )
 _HOW_TO_FIX_A_REACH = (
@@ -964,7 +998,7 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         (f"docker compose run test python - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
         (f"systemd-run --unit install python - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
         ('ssh host echo go \\&\\& python3 "$SCRIPT"', [(1, UNKNOWN)]),
-        ('timeout 60 ls && echo python; python "$SCRIPT"', [(1, UNKNOWN)]),
+        ('timeout 60 ls && echo python; python "$SCRIPT"', [(1, UNKNOWN), (1, UNKNOWN)]),
         # Перед запуском — подстановка, присваивание в кавычках, `&`, ветка `case`:
         # слова «не запуска» внутри них запуска не отменяют.
         (
@@ -1011,7 +1045,7 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         # Не запуск: `python` — аргумент другой команды.
         ("- uses: actions/setup-python@v5\n  with:\n    python-version: '3.12'\n", []),
         ("test -x /opt/app/.venv/bin/python\n", []),
-        ("test -x /opt/app/.venv/bin/python && echo ok\n", []),
+        ("[ ! -x /opt/app/.venv/bin/python ] || exit 1\n", []),
         ("command -v python3 >/dev/null || exit 1\n", []),
         ("sudo apt-get install -y python3 python3-venv\n", []),
         ("ln -sf /usr/bin/python3 /usr/local/bin/python\n", []),
@@ -1021,7 +1055,7 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ("which python3\n", []),
         ("type python3\n", []),
         ("[ -x .venv/bin/python ] || exit 1\n", []),
-        ("if [[ -x .venv/bin/python ]]; then echo ok; fi\n", []),
+        ("[[ -x .venv/bin/python ]]\n", []),
         ("sudo -u pm test -x /opt/app/.venv/bin/python\n", []),
         ("sudo apt install -y python3\n", []),
         ("dnf install -y python3\n", []),
@@ -1030,8 +1064,8 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ("brew install python\n", []),
         ("PY=/opt/app/.venv/bin/python\n", []),
         ("export PYTHON=python3\n", []),
-        ("PY=`which python3`\n", []),
-        ("uv venv --python=python3\n", []),
+        ("if ! command -v python3 >/dev/null 2>&1; then\n", []),
+        ('echo "found $n python files in ${dir}" >&2\n', []),
         # То же одной строкой шага: `run:` — не команда.
         ("- run: sudo apt-get install -y python3 python3-venv\n", []),
         ("run: command -v python3 >/dev/null\n", []),
@@ -1045,9 +1079,49 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ('PYTHONPATH="$dir" pharmacy-monitor run', []),
         ("  # руками: python - <<'PY'\n", []),
         ("      - name: Run python - check\n", []),
-        # …а после неё в той же строке — уже запуск.
-        (f"command -v python3 && python3 - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
-        ('if [ -x .venv/bin/python ]; then .venv/bin/python "$SCRIPT"; fi', [(1, UNKNOWN)]),
+        # Строка — «не запуск» только целиком: с продолжением она уже запуск, и
+        # слово без программы после себя роняет CI, а не пропускается.
+        ("test -x /opt/app/.venv/bin/python && echo ok\n", [(1, UNKNOWN)]),
+        ("if [[ -x .venv/bin/python ]]; then echo ok; fi\n", [(1, UNKNOWN)]),
+        ("PY=`which python3`\n", [(1, UNKNOWN)]),
+        ("uv venv --python=python3\n", [(1, UNKNOWN)]),
+        (f"command -v python3 && python3 - <<'PY'\n{_BLOCK}PY\n", [(1, UNKNOWN), (1, CODE)]),
+        (
+            'if [ -x .venv/bin/python ]; then .venv/bin/python "$SCRIPT"; fi',
+            [(1, UNKNOWN), (1, UNKNOWN)],
+        ),
+        # Четвёртый разбор: значение опции, которое исполняют; слово `test` как
+        # имя пользователя или хоста; команда целиком в переменной.
+        ('su pm --command="python3 scripts/preflight_pharmonline_public_api.py"\n', [(1, CODE)]),
+        ('gcloud compute ssh vm --command="python3 /opt/job.py"\n', [(1, UNKNOWN)]),
+        ("docker run --rm --entrypoint=python3 img scripts/job.py\n", [(1, UNKNOWN)]),
+        (
+            'CMD="/opt/app/.venv/bin/python scripts/preflight_pharmonline_public_api.py --x"\n',
+            [(1, CODE)],
+        ),
+        ("REMOTE='python3 -c \"from src import notifications\"'\n", [(1, CODE)]),
+        ('sudo -u test -H python3 "$SCRIPT"\n', [(1, UNKNOWN)]),
+        (f"ssh pm@test -T python3 - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        ('su test -c "python3 scripts/preflight_pharmonline_public_api.py"\n', [(1, CODE)]),
+        ('env -u test -i python3 "$S"\n', [(1, UNKNOWN)]),
+        (f"docker run --rm --network test -i python <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        ('args: [ -c "python3 job.py" ]\n', [(1, UNKNOWN)]),
+        ('timeout 5 some-command -v python3 "$S"\n', [(1, UNKNOWN)]),
+        ('sudo -u ls python3 "$S"\n', [(1, UNKNOWN)]),
+        (f"NOTE='x; echo ' .venv/bin/python - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
+        (
+            'MSG="step failed; echo " python3 scripts/preflight_pharmonline_public_api.py\n',
+            [(1, CODE)],
+        ),
+        # Строка «комментария» или `name:` внутри строки в кавычках, за которой запуск.
+        ("printf '%s' \"id: 1\nname: x\" | python3 -c 'import sys'\n", [(2, CODE)]),
+        ('printf \'%s\' "a\n# b" | python3 "$S"\n', [(2, UNKNOWN)]),
+        # Блок за `&&` — чужой; файл на stdin главнее блока; код, склеенный из кусков.
+        ("cat job.py | python3 - && cat <<'EOF' > note.txt\nharmless = 1\nEOF\n", [(1, UNKNOWN)]),
+        (f"python3 - <<'PY' < job.py\n{_BLOCK}PY\n", [(1, UNKNOWN)]),
+        ("python3 -c 'import sys'\"; from src import notifications\"\n", [(1, UNKNOWN)]),
+        ("ssh host \"python3 -c 'print(1)'\"\n", [(1, CODE)]),
+        ('echo "Python: $(python3 --version)"\n', []),
     ],
 )
 def test_the_check_finds_python_behind_every_form_of_run(text, kinds):
