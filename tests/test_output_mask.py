@@ -342,6 +342,23 @@ def test_closing_the_mask_lets_every_tail_out_and_leaves_the_stream_open():
     assert _reached(under) == "хвост живого потока"
 
 
+def test_a_close_that_fails_still_closes_the_mask():
+    """Канал оборвался, и хвост выпустить не удалось. Маска всё равно закрыта:
+    иначе сборщик мусора пришёл бы закрывать её ещё раз."""
+
+    class Sink:
+        def write(self, data: bytes) -> None:
+            pass
+
+        def flush(self) -> None:
+            raise BrokenPipeError
+
+    writer = output_mask._MaskingWriter(io.StringIO(), Sink())
+    with pytest.raises(BrokenPipeError):
+        writer.close()
+    assert writer.closed
+
+
 def test_a_flush_from_inside_a_flush_finds_the_tails_already_taken():
     """Запись в поток под маской зовёт `flush` ещё раз — так делает обработчик
     сигнала с `click.echo`. Хвосты к этому времени забрал вложенный вызов."""
@@ -881,6 +898,33 @@ def test_the_traceback_of_an_error_nobody_caught_is_masked(tmp_path, setup):
     assert "RuntimeError: (psycopg.errors.UniqueViolation)" in done.stderr
     assert "'email': '<address>'" in done.stderr and WORD_WITHHELD in done.stderr
     assert "@" not in done.stdout + done.stderr, done.stderr
+
+
+def test_a_background_thread_stuck_on_a_write_does_not_hang_the_exit():
+    """Фоновый поток пишет в канал, который никто не читает, и держит замок
+    маски; основной поток закончил. Python без маски ждёт секунду и обрывает
+    процесс — под маской он не должен ждать вечно: зависший сбор держит замок
+    сбора, и следующий не начнётся."""
+    script = """
+import os, sys, threading, time
+from src import output_mask
+read_end, write_end = os.pipe()
+sys.stdout = open(write_end, "w")
+output_mask.mask_output()
+threading.Thread(target=print, args=("x" * 1_000_000,), daemon=True).start()
+time.sleep(0.5)
+"""
+    done = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+        capture_output=True,
+        timeout=20,
+    )
+    # Проверка — что процесс вообще закончился: иначе `subprocess.run` бросил бы
+    # `TimeoutExpired`. Чем он закончился, решает Python — тем же обрывом, что
+    # и без маски.
+    assert done.returncode is not None
 
 
 def test_the_tail_without_a_newline_is_written_when_the_process_ends(tmp_path):

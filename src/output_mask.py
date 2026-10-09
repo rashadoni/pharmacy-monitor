@@ -18,6 +18,7 @@ import io
 import re
 import sys
 import threading
+from contextlib import contextmanager
 
 from src.logging_setup import mask_addresses
 
@@ -108,10 +109,24 @@ class _MaskingWriter(io.BufferedIOBase):
     def name(self) -> str:
         return getattr(self._stream, "name", "<masked>")
 
+    @contextmanager
+    def _locked(self):
+        """Замок на время записи. Когда интерпретатор завершается — не дольше
+        секунды: фоновый поток, застрявший на записи в канал, который никто не
+        читает, замок уже не отпустит. Python без маски ждёт столько же и
+        обрывает процесс; ждать вечно значило бы повесить его. Других потоков
+        исполнения к этому времени нет."""
+        held = self._lock.acquire(timeout=1 if sys.is_finalizing() else -1)
+        try:
+            yield
+        finally:
+            if held:
+                self._lock.release()
+
     def write(self, data) -> int:
         data = bytes(data)
         me = threading.current_thread()
-        with self._lock:
+        with self._locked():
             head, newline, tail = data.rpartition(b"\n")
             if not newline:
                 self._pending.setdefault(me, []).append(data)
@@ -130,19 +145,23 @@ class _MaskingWriter(io.BufferedIOBase):
         return len(data)
 
     def flush(self) -> None:
-        with self._lock:
+        with self._locked():
             self._release(threading.current_thread())
 
     def release_all(self) -> None:
         """Выпустить хвосты всех потоков исполнения: маску снимают, и дописывать
         строки в неё больше некому."""
-        with self._lock:
+        with self._locked():
             self._release(None)
 
     def close(self) -> None:
-        # Поток под маской остаётся открытым: он не её.
-        self.release_all()
-        super().close()
+        # Поток под маской остаётся открытым: он не её. Сама маска закрыта,
+        # даже если хвост выпустить не удалось: иначе сборщик мусора придёт
+        # закрывать её ещё раз.
+        try:
+            self.release_all()
+        finally:
+            super().close()
 
     def _release(self, me: threading.Thread | None) -> None:
         """Выпустить хвост без перевода строки и сбросить поток под маской.
