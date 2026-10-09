@@ -641,7 +641,7 @@ def test_every_reader_of_incoming_messages_is_accounted_for():
         for source in _src_sources().values()
         for node, owner in _nodes_with_owner(ast.parse(source))
         # Любое упоминание, не только вызов: псевдоним и передача аргументом.
-        if _reference(node) == "telegram_get_updates"
+        if getattr(node, "attr", getattr(node, "id", None)) == "telegram_get_updates"
     }
     assert readers == set(_READS_INCOMING_MESSAGES), (
         f"Входящие сообщения Telegram читают {sorted(readers)}, а учтены "
