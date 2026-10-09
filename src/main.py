@@ -2540,7 +2540,7 @@ def _should_trigger_ai_fallback(primary_yield: int, baseline: int | None) -> boo
 #
 # HTML-отчёт + Excel-вложение (тема «Pharmacy Monitor DD.MM.YYYY — N undercuts»)
 # шлётся в конце каждого НЕ-hourly прогона на EMAIL_TO/recipients. Это отдельный
-# канал от мгновенных undercut-алертов (evaluate_rules → dispatch_event) и от
+# канал от мгновенных undercut-алертов (evaluate_rules → dispatch_events_batch) и от
 # daily/weekly дайджестов — управляется собственным флагом:
 #   SCRAPE_REPORT_EMAIL=0   отключает письмо (default ON — обратная совместимость)
 #
@@ -4898,8 +4898,26 @@ def alert_evaluate(dispatch: bool, rule_id: tuple[int, ...]) -> None:
         if dispatch and fired:
             from src import notifications as notif_mod
 
-            results = notif_mod.dispatch_events_batch(s, fired)
-            click.echo(f"  → отправлено одним письмом: {results}")
+            sent = notif_mod.dispatch_events_batch(s, fired)
+            delivered = f"писем {sent['email']}, сообщений Telegram {sent['telegram']}"
+            anything_sent = bool(sent["email"] or sent["telegram"])
+            if sent["failed"]:
+                # События уже записаны, а повторно рассылку никто не шлёт: о том,
+                # что не ушло, команда говорит кодом выхода.
+                headline = "отправлено не всё" if anything_sent else "не отправлено ничего"
+                raise click.ClickException(
+                    f"{headline} — {delivered}; отправок не состоялось: "
+                    f"{sent['failed']}, событий, не дошедших ни по одному каналу: "
+                    f"{sent['undelivered']}. Кому не ушло — строки email_batch_failed / "
+                    "telegram_batch_failed (user_id) в журнале выше."
+                )
+            if anything_sent:
+                click.echo(f"  → отправлено: {delivered}")
+            else:
+                click.echo(
+                    "  → никому не отправлено: нет получателя, которому эти события "
+                    "положены (порог важности, тихие часы, ежедневный дайджест)"
+                )
 
 
 @alert_group.command("recent")
@@ -5012,16 +5030,23 @@ def digest_cmd(top_n: int, window_hours: int, dry_run: bool) -> None:
     Запускается systemd timer pharmacy-monitor-digest@daily.timer в 05:00 UTC
     (09:00 Baku). При 0 событий — письмо не отправляется.
     """
-    from src.digest import send_daily_digest
+    from src.digest import DigestNotSent, send_daily_digest
 
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        n = send_daily_digest(s, window_hours=window_hours, top_n=top_n, dry_run=dry_run)
-        if n:
+        try:
+            n = send_daily_digest(s, window_hours=window_hours, top_n=top_n, dry_run=dry_run)
+        except DigestNotSent:
+            raise click.ClickException(
+                "digest not sent — see digest_email_failed in the log above"
+            ) from None
+        if dry_run:
+            click.echo(f"[dry-run] {n} events, nothing sent")
+        elif n:
             click.echo(f"OK: digest sent, {n} events")
         else:
-            click.echo("Skipped: no events in window" if not dry_run else f"[dry-run] {n} events")
+            click.echo("Skipped: no events in window")
 
 
 # ─── Notifications: digest commands (W9) ─────────────────────────────────────
@@ -5063,11 +5088,30 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | No
         send = (
             notifications.send_daily_digest if kind == "daily" else notifications.send_weekly_digest
         )
-        sent = send(s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run)
+        result = send(s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run)
         if dry_run:
-            click.echo(f"[dry-run] {kind} digest: {sent} recipients, nothing sent")
+            click.echo(f"[dry-run] {kind} digest: {result['recipients']} recipients, nothing sent")
+        elif result["failed"]:
+            # Таймер дайджеста — oneshot без перезапуска: код выхода не даст
+            # второй рассылки тем, кому письмо уже ушло.
+            raise click.ClickException(
+                f"{kind} digest sent to {result['sent']} of {result['recipients']} recipients, "
+                f"{result['failed']} not sent — see digest_email_failed (user_id) in the log above"
+            )
+        elif result["sent"]:
+            click.echo(f"OK: {kind} digest sent to {result['sent']} recipients")
         else:
-            click.echo(f"OK: {kind} digest sent to {sent} recipients")
+            # Пустое окно, никто не подписан или `--only` никого не нашёл: не
+            # сбой — таймер в пустую неделю не должен краснеть.
+            nobody = (
+                f"--only matches no recipient with the {kind} digest on"
+                if only_email is not None
+                else f"no recipient has the {kind} digest on"
+            )
+            click.echo(
+                f"Nothing to send: no events in the window or {nobody} — see "
+                "digest_no_events / digest_no_recipients in the log above"
+            )
 
 
 @notify_group.command("test")
@@ -5903,17 +5947,13 @@ def run_cmd(
                 run
             ) or storage.run_is_watchlist_price_alert_eligible(run)
             if not no_alerts and alerts_allowed:
-                from src import alerts as alerts_mod, notifications as notif_mod
+                from src import alerts as alerts_mod
 
                 fired = alerts_mod.evaluate_rules(session, run.id)
                 if fired and not dry_run:
                     # Одно письмо-сводка на прогон (вместо письма на событие) —
                     # переоценка целой линейки больше не топит инбокс.
-                    try:
-                        notif_mod.dispatch_events_batch(session, fired)
-                    except Exception as e:
-                        log.warning("alert_dispatch_failed", error=str(e))
-                    log.info("alerts_dispatched", count=len(fired))
+                    _dispatch_run_alerts(session, run.id, fired)
                 elif fired:
                     log.info("alerts_dispatch_skipped_dry_run", count=len(fired))
             elif not no_alerts:
@@ -6346,6 +6386,46 @@ def intraday_tick_cmd(dry_run: bool) -> None:
         _mail_tick_price_changes_to_admins(Session, run_id, site=site, category_key=category_key)
 
 
+def _dispatch_run_alerts(session: Session, run_id: int, fired: list[storage.AlertEvent]) -> None:
+    """Рассылка о прогоне; её сбой сбор не роняет.
+
+    Итог рассылки — что ушло, что нет — пишет сама `dispatch_events_batch`,
+    одной строкой с именем по исходу. Здесь остаётся случай, когда она упала
+    целиком: отказ отправителя она ловит сама, так что наружу выходит сбой базы.
+    События и цены к этому моменту уже записаны (`evaluate_rules` коммитит сам),
+    поэтому сбор идёт дальше. Повтора нет — событие, не дошедшее ни по одному
+    каналу, остаётся на `/alerts` и в дайджесте.
+    """
+    from src import notifications as notif_mod
+
+    try:
+        notif_mod.dispatch_events_batch(session, fired)
+    except Exception as e:  # noqa: BLE001
+        # Рассылка оборвалась посреди: кому-то могло уйти, итоговой строки нет.
+        log.warning(
+            "alert_dispatch_failed",
+            run_id=run_id,
+            events=len(fired),
+            **notifier.delivery_error_fields(e),
+        )
+        # Сорвавшийся commit оставляет сессию в прерванной транзакции. Без
+        # отката следующий же запрос сбора падает на PendingRollbackError, а
+        # обработчик сбоя сбора — на том же, и прогон остаётся `running`.
+        # Теряются только метки каналов получателя, на котором сорвалось.
+        try:
+            session.rollback()
+        except Exception as rollback_error:  # noqa: BLE001
+            # Откат не удался — соединение потеряно. Сессия при этом транзакцию
+            # всё равно закрывает и следующий запрос идёт на новом соединении:
+            # сбор продолжится, если база вернулась, и упадёт со своей причиной,
+            # если нет.
+            log.warning(
+                "alert_dispatch_rollback_failed",
+                run_id=run_id,
+                **notifier.delivery_error_fields(rollback_error),
+            )
+
+
 def _mail_tick_price_changes_to_admins(
     Session, run_id: int, *, site: str, category_key: str
 ) -> None:
@@ -6750,7 +6830,9 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
         click.echo(f"Saved report for run #{run_id} to reports/")
 
         if send:
-            notifier.send_email(
+            # False — SMTP не настроен, письма не было; отказ сервера и сеть
+            # приходят исключением и роняют команду сами.
+            if not notifier.send_email(
                 subject=reporter.email_subject(report),
                 html_body=html,
                 attachments=[
@@ -6760,7 +6842,11 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
                 ],
-            )
+            ):
+                raise click.ClickException(
+                    "report saved, but the email was not sent: SMTP is not configured "
+                    "(SMTP_HOST is empty) — load the service env and run again"
+                )
             click.echo("Email sent.")
 
 

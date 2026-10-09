@@ -27,6 +27,7 @@ def stub_notifier(monkeypatch):
 
     def fake_send(subject, html_body):
         calls.append({"subject": subject, "html_body": html_body})
+        return True  # как настоящий отправитель после принятого письма
 
     monkeypatch.setattr(real_notifier, "send_email", fake_send)
     return calls
@@ -113,8 +114,8 @@ def test_digest_dry_run_no_email(db_session, stub_notifier, capsys):
     assert "Dry test" in captured.out
 
 
-def test_digest_email_failure_returns_zero(db_session, monkeypatch):
-    """SMTP exception → возвращаем 0 (не падаем)."""
+def test_digest_email_failure_is_not_a_quiet_zero(db_session, monkeypatch):
+    """Отправитель упал → `DigestNotSent`, а не 0: 0 значит «событий не было»."""
     import src.notifier as real_notifier
 
     def boom(*_a, **_kw):
@@ -124,8 +125,11 @@ def test_digest_email_failure_returns_zero(db_session, monkeypatch):
 
     _add_alert(db_session, severity="warning", title="Fail test")
     db_session.commit()
-    n = digest.send_daily_digest(db_session, window_hours=24)
-    assert n == 0
+    with pytest.raises(digest.DigestNotSent) as raised:
+        digest.send_daily_digest(db_session, window_hours=24)
+    # Текст ошибки отправителя дальше не идёт — ни в сообщении, ни в причине.
+    assert "SMTP down" not in str(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
 
 
 def test_make_subject_no_events_label():

@@ -143,7 +143,9 @@ curl -s http://localhost:8080/metrics | grep -c '^pharmacy_'    # > 0
 # Sentry получает события (test):
 curl -X POST http://localhost:8080/api/v1/products  # 401 — должно появиться в Sentry если включен
 
-# Алерт-цепочка работает (если SMTP / Telegram настроены):
+# Алерт-цепочка работает (если SMTP / Telegram настроены). Код выхода 1 и
+# «Error: не отправлено ничего…» или «Error: отправлено не всё…» — отправитель
+# подтвердил не всё; кому не ушло — в журнале выше.
 .venv/bin/pharmacy-monitor alert evaluate --dispatch
 ```
 
