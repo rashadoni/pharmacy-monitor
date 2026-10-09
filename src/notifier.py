@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import email.errors
 import json
 import os
 import re
@@ -28,27 +29,50 @@ log = structlog.get_logger()
 _SMTP_STATUS_RE = re.compile(r"[245]\.\d{1,3}\.\d{1,3}(?![\d.])")
 
 
-class EmailDeliveryError(smtplib.SMTPException):
+# Вместо текста ошибки, который показывать нельзя.
+_TEXT_WITHHELD = "<текст скрыт>"
+
+
+class EmailSendError(Exception):
+    """Письмо не ушло. Что бы ни сломалось при отправке, из `send_email` выходит
+    эта ошибка; отказ почтового сервера — её наследником `EmailDeliveryError`.
+
+    Текст ошибки уходит дальше, чем её ловят: в трассировку `run_failed`, в
+    строку «Error: …» от click, в `runs.error_message`, в вывод команды, которая
+    сбой не ловит вовсе (`report --send`). Поэтому адреса в нём нет: класс
+    исходной ошибки, её текст без адресов и строка этого модуля, на которой она
+    возникла. Самой исходной ошибки при этой нет — ни причиной, ни контекстом,
+    — и её трассировки тоже: вместо неё эта строка.
+
+    `error_type` — класс исходной ошибки, `errno` — её код, если она сетевая.
+    """
+
+    def __init__(self, error_type: str, text: str = "", errno: int | None = None):
+        self.error_type = error_type
+        self.errno = errno
+        super().__init__(text or error_type)
+
+
+class EmailDeliveryError(EmailSendError, smtplib.SMTPException):
     """Почтовый сервер не принял письмо.
 
     Текст ошибки — класс исходной ошибки smtplib и коды ответа, без самого
-    ответа сервера. smtplib кладёт в текст своих ошибок адрес получателя, а
-    текст ошибки уходит дальше, чем её ловят: в поле журнала, в трассировку
-    `run_failed`. Ответ сервера с вырезанными адресами лежит в `server_reply` —
-    его печатает только `notify test`, которую оператор запускает сам.
+    ответа сервера: smtplib кладёт в текст своих ошибок адрес получателя. Ответ
+    сервера с вырезанными адресами лежит в `server_reply` — его печатает только
+    `notify test`, которую оператор запускает сам: сервер может назвать ящик и
+    без «@», и такое маска не узнает.
 
     `smtp_status` — расширенный код из начала ответа («5.1.1»): 550 сервер
     ставит на десяток разных причин, а различает их этим кодом.
     """
 
     def __init__(self, error_type: str, smtp_code: int | None = None, server_reply: str = ""):
-        self.error_type = error_type
         self.smtp_code = smtp_code
         self.server_reply = server_reply
         status = _SMTP_STATUS_RE.match(server_reply)
         self.smtp_status = status.group(0) if status else None
         codes = " ".join(str(code) for code in (smtp_code, self.smtp_status) if code)
-        super().__init__(f"{error_type} (SMTP {codes})" if codes else error_type)
+        super().__init__(error_type, f"{error_type} (SMTP {codes})" if codes else error_type)
 
 
 def _delivery_failure(exc: smtplib.SMTPException) -> EmailDeliveryError:
@@ -68,21 +92,66 @@ def _delivery_failure(exc: smtplib.SMTPException) -> EmailDeliveryError:
     )
 
 
+def _text_without_addresses(exc: Exception) -> str:
+    """Текст ошибки, каким его можно показать.
+
+    Маска вырезает адрес привычной записи. Чего она не узнала — имя в кавычках,
+    домен без имени, — выдаёт оставшийся «@»: такой текст не показывается вовсе.
+    Ошибки пакета `email` несут в тексте сам заголовок письма: `HeaderWriteError`
+    печатает `To:` целиком, со всеми получателями, а нелатинская часть записана
+    в нём base64 — мимо любой маски. Их текст не показывается никогда.
+    """
+    if isinstance(exc, email.errors.MessageError):
+        return _TEXT_WITHHELD
+    text = mask_addresses(str(exc))
+    return _TEXT_WITHHELD if "@" in text else text
+
+
+def _raised_at(exc: BaseException) -> str:
+    """На какой строке этого модуля возникла ошибка: `notifier.py:250 in _send_email`.
+
+    По ней видно, на чём письмо остановилось — соединение, вход, отправка, —
+    когда трассировки исходной ошибки уже нет.
+    """
+    at = ""
+    tb = exc.__traceback__
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        if code.co_filename == __file__:
+            at = f"{os.path.basename(__file__)}:{tb.tb_lineno} in {code.co_name}"
+        tb = tb.tb_next
+    return at
+
+
+def _send_failure(exc: Exception) -> EmailSendError:
+    """Чем заменить пойманную при отправке ошибку, чтобы выпустить её наружу."""
+    if isinstance(exc, smtplib.SMTPException):
+        return _delivery_failure(exc)
+    error_type = type(exc).__name__
+    text, at = _text_without_addresses(exc), _raised_at(exc)
+    shown = f"{error_type}: {text}" if text else error_type
+    errno = exc.errno if isinstance(exc, OSError) and isinstance(exc.errno, int) else None
+    return EmailSendError(error_type, f"{shown} ({at})" if at else shown, errno)
+
+
 def delivery_error_fields(exc: BaseException) -> dict[str, object]:
     """Что о сбое доставки пишут в журнал: класс ошибки и её числовые коды.
 
-    Текст ошибки (`str(exc)`) в журнал не идёт: в нём бывает адрес получателя.
-    Кому не ушло, вызывающий пишет рядом как `user_id`.
+    Текст ошибки (`str(exc)`) в журнал не идёт. У ошибки из `send_email` он уже
+    без адреса, но в `try` обработчика стоит не только отправка, а ошибку базы
+    или вёрстки письма никто не чистил. Кому не ушло, вызывающий пишет рядом как
+    `user_id`.
     """
-    refused = isinstance(exc, EmailDeliveryError)
-    fields: dict[str, object] = {"error_type": exc.error_type if refused else type(exc).__name__}
+    cleaned = isinstance(exc, EmailSendError)
+    fields: dict[str, object] = {"error_type": exc.error_type if cleaned else type(exc).__name__}
     smtp_code = getattr(exc, "smtp_code", None)
     if isinstance(smtp_code, int):
         fields["smtp_code"] = smtp_code
-    if refused and exc.smtp_status:
+    if isinstance(exc, EmailDeliveryError) and exc.smtp_status:
         fields["smtp_status"] = exc.smtp_status
-    elif isinstance(exc, OSError) and isinstance(exc.errno, int):
-        fields["errno"] = exc.errno  # сеть: 101 — нет маршрута, 111 — отказ в соединении
+    errno = exc.errno if cleaned or isinstance(exc, OSError) else None
+    if isinstance(errno, int):
+        fields["errno"] = errno  # сеть: 101 — нет маршрута, 111 — отказ в соединении
     return fields
 
 
@@ -179,15 +248,21 @@ def send_email(
     ignore the return value; stateful callers must require ``True`` before they
     mark a notification as delivered.
 
-    An SMTP refusal is raised as ``EmailDeliveryError``, whose text never
-    carries an address; network errors propagate as they are.
+    Whatever fails on the way, the caller gets an ``EmailSendError`` whose text
+    never carries an address (``EmailDeliveryError`` when the server refused).
+    Nothing else may talk to the mail server: "no address reaches the log" rests
+    on this function being the only way a send failure gets out.
     """
     try:
         return _send_email(subject, html_body, attachments, to)
-    except smtplib.SMTPException as exc:
-        failure = _delivery_failure(exc)
+    except Exception as exc:
+        try:
+            failure = _send_failure(exc)
+        except Exception:  # у ошибки не удалось взять даже текст
+            failure = EmailSendError(type(exc).__name__)
     # Вне except: у новой ошибки нет ни причины, ни контекста, и трассировка не
-    # покажет исходную — с адресом.
+    # покажет исходную — с адресом. Прерывание (KeyboardInterrupt, SystemExit)
+    # проходит как есть.
     raise failure
 
 
@@ -197,8 +272,8 @@ def _send_email(
     attachments: list[tuple[str, bytes, str]] | None,
     to: list[str] | None,
 ) -> bool:
-    """Сам разговор с почтовым сервером. Ошибки smtplib выходят отсюда как есть,
-    с адресом в тексте, — звать только через `send_email`."""
+    """Сборка письма и разговор с почтовым сервером. Ошибки выходят отсюда как
+    есть, с адресом в тексте, — звать только через `send_email`."""
     smtp_host = os.environ.get("SMTP_HOST")
     if not smtp_host:
         log.info("email_skipped_no_smtp", subject=subject)

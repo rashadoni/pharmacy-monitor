@@ -4144,6 +4144,7 @@ def health_check_cmd(
 ) -> None:
     """Проверить здоровье системы: stale/failed/empty/site-drop. Exit-code 0=ok, 1=warning, 2=critical."""
     from src.health import check_health
+    from src.logging_setup import mask_addresses
 
     storage.init_db()
     Session = storage.make_session()
@@ -4159,7 +4160,9 @@ def health_check_cmd(
             f"at {report.last_run_at}"
         )
         for i in report.issues:
-            click.echo(f"  [{i.severity}] {i.code}: {i.message}")
+            # click печатает мимо маски журнала, а в сообщении бывает текст ошибки
+            # прогона как он записан в базу (`runs.error_message`).
+            click.echo(f"  [{i.severity}] {i.code}: {mask_addresses(i.message)}")
 
     # Do not return early on quiet+OK: an active incident still needs one
     # recovery email and an atomic transition to the healthy state.
@@ -4183,7 +4186,10 @@ def health_check_cmd(
                         "инцидент не изменился)"
                     )
         except Exception as e:
-            click.echo(f"⚠️ Не удалось отправить health email: {e}", err=True)
+            # Тоже мимо маски. Сбой отправки приходит из `send_email` уже без
+            # адреса; остальное в этом `try` не чистил никто.
+            reason = mask_addresses(str(e))
+            click.echo(f"⚠️ Не удалось отправить health email: {reason}", err=True)
 
     if quiet_healthy:
         return

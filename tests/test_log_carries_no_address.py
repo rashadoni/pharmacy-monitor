@@ -7,19 +7,28 @@
 
 Слоёв три, и каждый проверяется отдельно:
 
-1. вызов журнала не передаёт адрес, а обработчик сбоя отправки не выводит
-   текст ошибки — ни в журнал, ни печатью, ни новой ошибкой с этим текстом
-   (smtplib кладёт адрес и в него).
-   Проверяется дважды: чтением кода всего `src/` и прямым вызовом каждого
-   почтового пути;
-2. ошибка SMTP выходит из `notifier.send_email` уже без адреса в тексте — куда
-   бы её ни записали дальше (`log.exception("run_failed")` печатает трассировку);
+1. вызов журнала не передаёт адрес. Проверяется дважды: чтением кода всего
+   `src/` и прямым вызовом каждого почтового пути — в том числе со сбоем
+   отправки: о нём в журнал идут класс ошибки и коды, не её текст;
+2. что бы ни сломалось при отправке, ошибка выходит из `notifier.send_email`
+   уже без адреса — в тексте, в `repr`, в трассировке, в причине и контексте.
+   Куда её запишут дальше, уже не важно: в трассировку `run_failed`, в строку
+   «Error: …» от click, в вывод команды, которая сбой не ловит вовсе. Стоит это
+   на том, что к почтовому серверу ходит только `send_email`, — проверяется
+   тоже;
 3. вывод журнала CLI вырезает адрес из готовой строки — и у structlog, и у
    stdlib `logging`, которым пишут сторонние библиотеки.
 
 `click.echo` и `print` идут мимо третьего слоя. Команды, которым печатать адрес
-или текст сбоя отправки разрешено, названы списками ниже, и ни один workflow их
-не запускает: журнал шага Actions публичен.
+или ответ почтового сервера разрешено, названы списком ниже, и ни один workflow
+их не запускает: журнал шага Actions публичен.
+
+Правила «обработчик сбоя отправки не выводит текст ошибки» здесь больше нет. Оно
+узнавало вывод по форме кода — журнал, печать, трассировка, новая ошибка с тем
+же текстом, обёртка над отправкой — и за три захода так и не сошлось, а до
+команды, которая сбой не ловит, не дотягивалось вовсе. Текст чистится там, где
+он появляется (слой 2); обработчики каждого почтового пути проверяет прямой
+вызов (слой 1).
 
 `structlog.testing.capture_logs()` не видит событий внутри `CliRunner`, поэтому
 почтовые пути вызываются напрямую.
@@ -28,11 +37,13 @@
 from __future__ import annotations
 
 import ast
+import email.errors
 import json
 import logging
 import random
 import re
 import smtplib
+import socket
 import time
 import traceback
 from pathlib import Path
@@ -41,6 +52,7 @@ import click
 import pytest
 import structlog
 from click.testing import CliRunner
+from contextlib import nullcontext
 from sqlalchemy.orm import sessionmaker
 from structlog.testing import capture_logs
 
@@ -49,6 +61,7 @@ from src import (
     api,
     digest,
     error_reporting,
+    health,
     logging_setup,
     main,
     notifications,
@@ -69,7 +82,10 @@ _LOG_METHODS = {"debug", "info", "warning", "warn", "error", "exception", "criti
 # Имена и атрибуты, под которыми в проекте ходит адрес или идентификатор
 # человека. Проверка видит имя, а не значение: адрес в переменной с другим
 # именем, в `**fields` или в repr объекта она не поймает — на это третий слой.
-_PERSON_ATTRS = {"email", "emails", "telegram_chat_id"}
+# `server_reply` — ответ почтового сервера на отказ (`EmailDeliveryError`): адреса
+# из него вырезаны маской, но ящик сервер может назвать и без «@» («user viewer
+# unknown»), а такое маска не узнает.
+_PERSON_ATTRS = {"email", "emails", "telegram_chat_id", "server_reply"}
 _PERSON_NAMES = {
     "email",
     "emails",
@@ -82,28 +98,6 @@ _PERSON_NAMES = {
     "chat_id",
 }
 _COUNTING = {"len", "bool"}
-# `_send_email` — разговор с сервером под `send_email`: его ошибки ещё несут адрес.
-_SENDERS = {"send_email", "_send_email", "send_telegram_message"}
-# Отправители, чей сбой выходит наружу. `send_telegram_message` свой ловит сама и
-# возвращает False (`test_the_telegram_sender_keeps_its_own_failure`): функция,
-# которая зовёт Telegram, сбой отправки не выпускает, и обработчики тех, кто
-# зовёт её, под правило не попадают.
-_RAISING_SENDERS = _SENDERS - {"send_telegram_message"}
-_EXCEPTION_SUMMARIES = {"type", "delivery_error_fields"}
-# Чем достают текст пойманной ошибки, не называя её по имени: функции модуля
-# `traceback` (кроме тех, что про стек вызовов), `sys.exc_info()`,
-# `sys.exception()` — и вот эти, если их импортировали по имени.
-_ERROR_TEXT_GETTERS = {
-    "format_exc",
-    "format_exception",
-    "format_exception_only",
-    "print_exc",
-    "print_exception",
-    "exc_info",
-}
-# Методы, которыми текст докладывают в уже существующую переменную. `add` тут
-# нет намеренно: `session.add(row)` записал бы в носители текста саму сессию.
-_COLLECTING_METHODS = {"append", "extend", "insert", "update", "setdefault"}
 _PRINTING_CALLS = {
     "click.echo",
     "click.secho",
@@ -113,45 +107,10 @@ _PRINTING_CALLS = {
     "sys.stderr.write",
 }
 
-# ── Исключения из правила «обработчик сбоя отправки не выводит текст ошибки» ──
-# Каждое — с причиной. Строка, которая ничего не разрешает, роняет
-# `test_no_excuse_from_the_exception_text_rule_is_dead`.
-
-# События журнала, которым трассировка с текстом ошибки разрешена: `try` такого
-# обработчика держит целый шаг работы, отправка в нём — одна из стадий, и без
-# трассировки сбой шага не разобрать. Событие названо вместе с функцией: то же
-# имя события в другом месте исключением не считается.
-_LOGS_THE_ERROR_TEXT_BY_DESIGN = {
-    # Обработчик всего сбора: в его `try` лежит весь пайплайн. От адреса
-    # трассировку страхуют слой 2 (текст отказа SMTP чист уже на выходе из
-    # `send_email`) и слой 3 — его на этом обработчике проверяет
-    # `test_run_failure_output_carries_no_address`.
-    ("run_cmd", "run_failed"),
-}
-# Функции, которые бросают текст пойманной ошибки дальше новой ошибкой: click
-# печатает его строкой «Error: …» мимо маски журнала.
-_RAISES_THE_ERROR_TEXT_BY_DESIGN = {
-    # Сбой сбора: текст пропущен через `mask_addresses` прямо в `raise`. Что
-    # адреса в выводе нет, проверяет `test_run_failure_output_carries_no_address`.
-    "run_cmd",
-}
-# Команды, которые печатают текст сбоя отправки: причину читает человек, а не
-# журнал Actions. `click.echo` идёт мимо маски; текст отказа SMTP чист только
-# слоем 2, а текст остальных ошибок не чистит ничто — поэтому из workflow эти
-# команды не запускают, как и команды из списка ниже.
-_PRINTS_A_DELIVERY_ERROR_BY_DESIGN = {
-    # Проверка доставки, которую оператор запускает руками. Об отказе SMTP
-    # печатает класс ошибки с кодами и ответ сервера (`server_reply`, адреса в
-    # нём вырезаны) — больше полный ответ не печатает никто, docs/RUNBOOK.md
-    # «Email не приходит». Любую другую ошибку печатает как есть.
-    "notify_test": "notify test",
-    # Часовая проверка здоровья под systemd: причина, по которой письмо о
-    # тревоге не ушло, идёт в stderr юнита, то есть в journald сервера.
-    "health_check_cmd": "health-check",
-}
-# Команды, которые печатают адрес по назначению: оператор запускает их сам и
-# читает вывод в своём терминале. `click.echo` и `print` идут мимо маски журнала,
-# поэтому из workflow эти команды не запускают — см. тест ниже.
+# Команды, которые печатают адрес или ответ почтового сервера по назначению:
+# оператор запускает их сам и читает вывод в своём терминале. `click.echo` и
+# `print` идут мимо маски журнала, поэтому из workflow эти команды не запускают —
+# см. тест ниже.
 _PRINTS_AN_ADDRESS_BY_DESIGN = {
     "tenant_add_user": "tenant add-user",
     "tenant_issue_token": "tenant issue-token",
@@ -160,19 +119,25 @@ _PRINTS_AN_ADDRESS_BY_DESIGN = {
     "recipient_remove": "recipient remove",
     "recipient_toggle": "recipient toggle",
     "recipient_update": "recipient update",
+    # Проверка доставки. Об отказе SMTP печатает ответ сервера (`server_reply`)
+    # — больше его не печатает никто, docs/RUNBOOK.md «Email не приходит».
+    "notify_test": "notify test",
 }
+# Запрет владельца, а не вывод из кода: команда не печатает ни адрес, ни ответ
+# сервера. Запрещена она была за текст сбоя отправки, который печатала как есть.
+# Теперь он без адреса уже на выходе из `send_email`, а всё, что команда печатает
+# из чужих ошибок — и сбой после отправки, и текст ошибки прогона из базы, —
+# идёт через маску (`test_health_check_output_carries_no_address`). Снять запрет
+# — слово владельца: тогда убрать этот словарь и строки с ним в тестах ниже.
+_NOT_FROM_A_WORKFLOW_BY_THE_OWNERS_WORD = {"health_check_cmd": "health-check"}
 # Функция команды → как её зовут в CLI. Имена сверяются с деревом click.
-_NOT_FROM_A_WORKFLOW = {**_PRINTS_AN_ADDRESS_BY_DESIGN, **_PRINTS_A_DELIVERY_ERROR_BY_DESIGN}
-# Все исключения из правила о тексте ошибки — в том виде, в каком правило их узнаёт.
-_EXCUSED = (
-    {("event", function, event) for function, event in _LOGS_THE_ERROR_TEXT_BY_DESIGN}
-    | {("print", function) for function in _PRINTS_A_DELIVERY_ERROR_BY_DESIGN}
-    | {("raise", function) for function in _RAISES_THE_ERROR_TEXT_BY_DESIGN}
-)
+_NOT_FROM_A_WORKFLOW = {**_PRINTS_AN_ADDRESS_BY_DESIGN, **_NOT_FROM_A_WORKFLOW_BY_THE_OWNERS_WORD}
 
 _HOW_TO_FIX_AN_ADDRESS = (
-    "В журнал и в вывод команды уходит адрес или идентификатор человека. "
-    "Пиши `user_id=user.id` или число (`len(...)`). Если переменная названа "
+    "В журнал и в вывод команды уходит адрес, идентификатор человека или ответ "
+    "почтового сервера (`server_reply`: ящик в нём бывает назван и без «@»). "
+    "Пиши `user_id=user.id`, число (`len(...)`) или "
+    "`**notifier.delivery_error_fields(exc)`. Если переменная названа "
     "`to`/`email`, но адресом не является, — переименуй её. Если команда "
     "печатает адрес оператору по назначению (как `recipient list`) — это "
     "решение, а не правка теста: внеси её функцию в "
@@ -180,49 +145,41 @@ _HOW_TO_FIX_AN_ADDRESS = (
 )
 _HOW_TO_FIX_THE_LIST_OF_PRINTERS = (
     "Список `_PRINTS_AN_ADDRESS_BY_DESIGN` разошёлся с кодом. Печатает, но не в "
-    "списке: {unlisted} — новая команда выводит адрес через `print`/`click.echo`. "
-    "Если адрес в выводе не нужен, печатай `user_id` или число; если нужен "
-    "оператору — добавь строку «функция: имя в CLI» и убедись, что ни один "
-    "workflow команду не запускает. В списке, но не печатает: {stale} — команда "
-    "перестала выводить адрес или её функцию переименовали: убери или поправь "
-    "строку. В список идут только команды CLI: если адрес печатает "
-    "вспомогательная функция, перенеси печать в саму команду."
-)
-_HOW_TO_FIX_EXCEPTION_TEXT = (
-    "Обработчик сбоя отправки выводит текст ошибки — полем журнала, трассировкой "
-    "(`log.exception`, `exc_info=`, `traceback.*`), печатью или новой ошибкой с "
-    "этим текстом (`raise X(str(exc))`, `sys.exit`), — а smtplib кладёт в текст "
-    "адрес получателя. Пиши `**notifier.delivery_error_fields(exc)`: класс ошибки "
-    "и коды. Обработчик считается и тогда, когда письмо шлёт не он сам, а "
-    "функция из его `try`, которая сбой не ловит или бросает дальше (у каждой "
-    "находки после стрелки названо, через что она признана почтовой); такими "
-    "сейчас считаются {wrappers}. Если обработчик дальний и текст в нём нужен "
-    "для чужих сбоев — поймай сбой отправки там, где шлёшь: до дальнего он "
-    "тогда не дойдёт. Имена сверяются без разбора импортов: если "
-    "в этом списке функции, которые писем не шлют, — у какой-то обёртки над "
-    "отправкой слишком общее имя (вроде `send` или `report`), и за неё приняты "
-    "чужие одноимённые вызовы: дай обёртке имя поточнее. Если текст нужен "
-    "человеку в терминале (как у `notify test`) — внеси функцию команды в "
-    "`_PRINTS_A_DELIVERY_ERROR_BY_DESIGN` с причиной; из workflow её тогда не "
-    "запускают."
+    "списке: {unlisted} — новая команда выводит адрес или ответ почтового "
+    "сервера через `print`/`click.echo`. Если в выводе он не нужен, печатай "
+    "`user_id`, число или класс ошибки; если нужен оператору — добавь строку "
+    "«функция: имя в CLI» и убедись, что ни один workflow команду не запускает. "
+    "В списке, но не печатает: {stale} — команда перестала это выводить или её "
+    "функцию переименовали: убери или поправь строку. В список идут только "
+    "команды CLI: если адрес печатает вспомогательная функция, перенеси печать "
+    "в саму команду."
 )
 _HOW_TO_FIX_A_WORKFLOW = (
-    "В workflow после имени CLI стоит команда, вывод которой идёт мимо маски "
-    "журнала: она печатает адрес или текст сбоя отправки через `click.echo`. "
-    "Журнал шага Actions публичен. Убери команду из workflow; если она нужна "
-    "именно там — сначала пусть печатает `user_id` и "
-    "`notifier.delivery_error_fields(exc)`, затем убери её из "
-    "`_PRINTS_AN_ADDRESS_BY_DESIGN` или `_PRINTS_A_DELIVERY_ERROR_BY_DESIGN`. "
-    "Проверка читает текст, а не исполняет его: если это строка `echo` с "
-    "описанием, а не запуск, — перефразируй её (комментарии и `name:` шага "
+    "В workflow после имени CLI стоит команда, которую оттуда не запускают. "
+    "Журнал шага Actions публичен, а `click.echo` идёт мимо маски журнала: "
+    "команда из `_PRINTS_AN_ADDRESS_BY_DESIGN` печатает адрес или ответ "
+    "почтового сервера. Убери её из workflow; если она нужна именно там — "
+    "сначала пусть печатает `user_id` и `notifier.delivery_error_fields(exc)`, "
+    "затем убери её из списка. `health-check` запрещён отдельно, словом "
+    "владельца (`_NOT_FROM_A_WORKFLOW_BY_THE_OWNERS_WORD`): снять запрет — его "
+    "решение. Проверка читает текст, а не исполняет его: если это строка `echo` "
+    "с описанием, а не запуск, — перефразируй её (комментарии и `name:` шага "
     "проверка пропускает сама)."
 )
 _HOW_TO_FIX_A_COMMAND_NAME = (
-    "В списке исключений названа команда, которой в CLI нет под этим именем или "
-    "за ней стоит другая функция: {problems}. Под мёртвым именем проверка "
-    "workflow искала бы команду, которой нет, и пропустила бы настоящую. "
-    "Поправь имя в `_PRINTS_AN_ADDRESS_BY_DESIGN` / "
-    "`_PRINTS_A_DELIVERY_ERROR_BY_DESIGN`."
+    "В списке названа команда, которой в CLI нет под этим именем или за ней "
+    "стоит другая функция: {problems}. Под мёртвым именем проверка workflow "
+    "искала бы команду, которой нет, и пропустила бы настоящую. Поправь имя в "
+    "`_PRINTS_AN_ADDRESS_BY_DESIGN` / `_NOT_FROM_A_WORKFLOW_BY_THE_OWNERS_WORD`."
+)
+_HOW_TO_FIX_A_BYPASS = (
+    "К почтовому серверу ходят мимо `notifier.send_email`: {found}. Только она "
+    "выпускает ошибку отправки без адреса в тексте; ошибка smtplib и ошибка "
+    "`_send_email` несут адрес получателя, и дальше их печатают трассировка "
+    "`run_failed`, click и команды, которые сбой не ловят. Шли письмо через "
+    "`notifier.send_email`. Если нужен второй вход (другой транспорт, "
+    "асинхронная отправка) — он обязан чистить ошибку так же, и проверять его "
+    "надо теми же тестами слоя 2."
 )
 
 
@@ -314,231 +271,6 @@ def address_leaks(source: str, *, by_design: frozenset[str] | None = None) -> li
     return sorted(set(found))
 
 
-def _reference(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    return node.attr if isinstance(node, ast.Attribute) else None
-
-
-def _local_names(function: ast.AST | None) -> frozenset[str]:
-    """Параметры и переменные функции. Под таким именем в ней ходит значение, а
-    не функция модуля."""
-    if function is None:
-        return frozenset()
-    args = function.args
-    params = [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
-    return frozenset(param.arg for param in params if param) | {
-        node.id
-        for node in ast.walk(function)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
-    }
-
-
-def _functions_named(node: ast.AST, local: frozenset[str]):
-    """Функции, которые называет вызов: та, что вызвана, и те, что переданы ему
-    аргументом, — `ctx.invoke(report_cmd)` зовёт команду не по имени. Аргумент,
-    который в этой функции переменная или параметр, функцией не считается."""
-    if isinstance(node, ast.Call):
-        yield _reference(node.func)
-        for value in _values(node):
-            if not (isinstance(value, ast.Name) and value.id in local):
-                yield _reference(value)
-
-
-def _stops_the_failure(node: ast.Try) -> bool:
-    """`try` ловит всё и ни один его обработчик ничего не бросает. `except
-    OSError` отказ почтового сервера не ловит; «записал и бросил дальше» сбой не
-    останавливает — в каком бы из обработчиков ни стоял `raise`."""
-    catches_everything = any(
-        handler.type is None
-        or any(
-            isinstance(name, ast.Name) and name.id in {"Exception", "BaseException"}
-            for name in ast.walk(handler.type)
-        )
-        for handler in node.handlers
-    )
-    return catches_everything and not any(
-        isinstance(inner, ast.Raise) for handler in node.handlers for inner in ast.walk(handler)
-    )
-
-
-def _escaping_references(node: ast.AST, local: frozenset[str], stopped: bool = False):
-    """Имена функций, чей сбой выходит из этой функции: названы вне `try`,
-    который сбой останавливает. Вложенная функция — отдельная, её вызовы
-    считаются за ней."""
-    if not stopped:
-        yield from _functions_named(node, local)
-    for field, value in ast.iter_fields(node):
-        inside = stopped or (
-            field == "body" and isinstance(node, ast.Try) and _stops_the_failure(node)
-        )
-        for child in value if isinstance(value, list) else [value]:
-            if isinstance(child, ast.AST) and not isinstance(
-                child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
-            ):
-                yield from _escaping_references(child, local, inside)
-
-
-def senders_in(sources) -> frozenset[str]:
-    """Отправители и функции, из которых сбой отправки выходит наружу.
-
-    `_dispatch_health_alert_email` шлёт письмо и сбой не ловит — ловит его
-    `health_check_cmd`. Обработчик сбоя отправки — тот, в который сбой приходит,
-    а не только тот, в чьём `try` стоит сам `send_email`. Сверка по имени
-    функции: импорты не разбираются, одноимённые функции считаются одной —
-    обёртка с именем вроде `send` записала бы в отправители все `x.send(...)`.
-    """
-    escaping = [
-        (node.name, set(_escaping_references(node, _local_names(node))))
-        for source in sources
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    ]
-    raising = set(_RAISING_SENDERS)
-    while True:
-        wrappers = {name for name, named in escaping if named & raising} - raising
-        if not wrappers:
-            return frozenset(raising | _SENDERS)
-        raising |= wrappers
-
-
-def _reads_the_caught_error(node: ast.AST) -> bool:
-    """`traceback.format_exc()`, `sys.exc_info()`: текст ошибки без её имени."""
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-        if func.value.id == "traceback":
-            return "stack" not in func.attr  # `print_stack` — стек вызовов, не ошибка
-        return func.value.id == "sys" and func.attr in {"exc_info", "exception"}
-    return isinstance(func, ast.Name) and func.id in _ERROR_TEXT_GETTERS
-
-
-def _carries_error_text(value: ast.AST, names: set[str]) -> bool:
-    """Класс ошибки, её коды и число (`len(errors)`) — не текст."""
-    return any(
-        (isinstance(node, ast.Name) and node.id in names) or _reads_the_caught_error(node)
-        for node in _walk_outside(value, _EXCEPTION_SUMMARIES | _COUNTING)
-    )
-
-
-def _variable(target: ast.AST) -> str | None:
-    """Переменная, в которую кладут значение: `text = …` и `fields["error"] = …`.
-    Атрибут (`run.error_message = …`) — запись в объект, а не в переменную."""
-    if isinstance(target, ast.Subscript):
-        target = target.value
-    return target.id if isinstance(target, ast.Name) else None
-
-
-def _error_text_names(handler: ast.ExceptHandler) -> set[str]:
-    """Имя пойманной ошибки и переменные обработчика, в которые переложен её
-    текст: `text = traceback.format_exc()`, `fields["error"] = str(exc)`,
-    `errors.append(f"{exc}")`."""
-    names = {handler.name} if handler.name else set()
-    while True:
-        fresh = set()
-        for node in ast.walk(handler):
-            if isinstance(node, ast.Assign):
-                targets, values = node.targets, [node.value]
-            elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
-                targets, values = [node.target], [node.value] if node.value else []
-            elif _called_name(node) in _COLLECTING_METHODS and isinstance(node.func, ast.Attribute):
-                targets, values = [node.func.value], _values(node)
-            else:
-                continue
-            if any(_carries_error_text(value, names) for value in values):
-                fresh |= {
-                    _variable(part)
-                    for target in targets
-                    for part in (target.elts if isinstance(target, ast.Tuple) else [target])
-                } - {None}
-        if fresh <= names:
-            return names
-        names |= fresh
-
-
-def _asks_for_a_traceback(call: ast.Call) -> bool:
-    """`log.exception(...)` и `exc_info=` — трассировку с текстом ошибки журнал
-    печатает сам, имя ошибки в аргументах для этого не нужно."""
-    return call.func.attr == "exception" or any(
-        keyword.arg == "exc_info"
-        and not (isinstance(keyword.value, ast.Constant) and not keyword.value.value)
-        for keyword in call.keywords
-    )
-
-
-def _exception_text_findings(tree: ast.AST, senders: frozenset[str]):
-    """Каждый вывод текста ошибки из обработчика сбоя отправки: строка, код и
-    под каким именем его можно разрешить — `("event", функция, событие)` для
-    журнала, `("print", функция)` для печати, `("raise", функция)` для новой
-    ошибки с этим текстом, `None`, если разрешить нельзя."""
-    for node, function in _nodes_with_owner(tree):
-        if not isinstance(node, ast.Try):
-            continue
-        owner, local = function.name if function else None, _local_names(function)
-        sent_by = sorted(
-            {
-                name
-                for stmt in node.body
-                for inner in ast.walk(stmt)
-                for name in _functions_named(inner, local)
-                if name in senders
-            }
-        )
-        if not sent_by:
-            continue
-        via = f"  ← отправка в его try: {', '.join(sent_by)}"
-        for handler in node.handlers:
-            names = _error_text_names(handler)
-            for inner in ast.walk(handler):
-                call, excuse, leaks = inner, None, False
-                if _is_log_call(inner):
-                    event = inner.args[0] if inner.args else None
-                    event = event.value if isinstance(event, ast.Constant) else None
-                    excuse = ("event", owner, event)
-                    leaks = _asks_for_a_traceback(inner)
-                elif _is_print_call(inner):
-                    excuse = ("print", owner)
-                elif isinstance(inner, ast.Raise) and isinstance(inner.exc, ast.Call):
-                    # `raise click.ClickException(str(exc))`: click напечатает «Error: …».
-                    call, excuse = inner.exc, ("raise", owner)
-                elif isinstance(inner, ast.Raise) and isinstance(inner.exc, ast.Name):
-                    # `err = X(str(exc)); raise err` — но не сама пойманная ошибка.
-                    excuse = ("raise", owner)
-                    leaks = inner.exc.id in names - {handler.name}
-                elif _reads_the_caught_error(inner) and _called_name(inner).startswith("print_"):
-                    leaks = True  # `traceback.print_exc()` пишет в stderr сам
-                else:
-                    continue
-                if leaks or (
-                    isinstance(call, ast.Call)
-                    and any(_carries_error_text(value, names) for value in _values(call))
-                ):
-                    yield inner.lineno, ast.unparse(inner) + via, excuse
-
-
-def exception_text_leaks(
-    source: str, *, senders: frozenset[str] | None = None, excused: bool = True
-) -> list[str]:
-    """Обработчики сбоя отправки, которые выводят саму ошибку: в журнал, печатью
-    или новой ошибкой с её текстом.
-
-    Чего правило не видит: текст, который вывели уже после обработчика
-    (собрали в список — напечатали за циклом) или положили в атрибут объекта
-    (`user.errors.append(…)`); журнал не под именем `log` и модули под другим
-    именем (`import traceback as tb`). Ошибка, брошенная дальше как есть
-    (`raise`), — не вывод: её получит обработчик выше, и правило придёт к нему.
-    """
-    known = senders_in([source]) if senders is None else senders
-    return sorted(
-        {
-            f"{line}: {code}"
-            for line, code, excuse in _exception_text_findings(ast.parse(source), known)
-            if not (excused and excuse in _EXCUSED)
-        }
-    )
-
-
 def _src_sources() -> dict[str, str]:
     return {
         str(path.relative_to(SRC.parent)): path.read_text(encoding="utf-8")
@@ -552,31 +284,6 @@ def _across_src(check) -> list[str]:
 
 def test_no_log_or_print_call_in_src_is_given_an_address():
     assert _across_src(address_leaks) == [], _HOW_TO_FIX_AN_ADDRESS
-
-
-def test_no_send_failure_handler_in_src_writes_out_the_exception_text():
-    senders = senders_in(_src_sources().values())
-    found = _across_src(lambda source: exception_text_leaks(source, senders=senders))
-    assert found == [], _HOW_TO_FIX_EXCEPTION_TEXT.format(wrappers=sorted(senders - _SENDERS))
-
-
-def test_no_excuse_from_the_exception_text_rule_is_dead():
-    """Исключение, под которое в коде ничего не попадает, — не страховка, а дыра
-    на будущее. Обратное этот тест не ловит: второй вывод текста в той же
-    функции (а у события — под тем же именем) пройдёт по уже выданному
-    исключению."""
-    senders = senders_in(_src_sources().values())
-    used = {
-        excuse
-        for source in _src_sources().values()
-        for _, _, excuse in _exception_text_findings(ast.parse(source), senders)
-    }
-    assert _EXCUSED - used == set(), (
-        "В списках исключений из правила о тексте ошибки есть строки, которые "
-        "ничего не разрешают: обработчик исправили, убрали или переименовали "
-        "его функцию. Убери или поправь их в `_LOGS_THE_ERROR_TEXT_BY_DESIGN`, "
-        "`_RAISES_THE_ERROR_TEXT_BY_DESIGN`, `_PRINTS_A_DELIVERY_ERROR_BY_DESIGN`."
-    )
 
 
 def test_the_list_of_commands_that_print_an_address_is_exact():
@@ -761,6 +468,9 @@ def test_the_workflow_check_knows_which_commands_skip_the_mask(command, skips):
         'log.info("x", to=", ".join(recipients))',
         'print(f"digest sent to {user.email}")',
         'click.echo(f"OK: {r.email}")',
+        # Ответ почтового сервера: ящик в нём бывает назван и без «@».
+        'log.warning("email_batch_failed", reply=exc.server_reply)',
+        'click.echo(f"email: FAIL — {exc}: {exc.server_reply}")',
     ],
 )
 def test_the_code_check_sees_an_address_in_a_log_call(call):
@@ -795,248 +505,13 @@ def run_cmd():
     assert [line.split(":")[0] for line in address_leaks(source)] == ["4", "7"]
 
 
-_HANDLER = """
-try:
-    notifier.send_email(subject=subject, html_body=html, to=[user.email])
-except Exception as exc:
-    {body}
-"""
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        'log.warning("email_batch_failed", user_id=user.id, error=str(exc))',
-        'log.warning("email_batch_failed", error=f"{exc}")',
-        'log.exception("email_batch_failed", exc_info=exc)',
-        'log.exception("email_batch_failed", user_id=user.id)',
-        'log.warning("email_batch_failed", error=repr(exc)[:200])',
-        # Трассировка без имени ошибки в аргументах.
-        'log.warning("email_batch_failed", user_id=user.id, exc_info=True)',
-        'log.error("email_batch_failed", exc_info=sys.exc_info())',
-        'log.warning("email_batch_failed", error=traceback.format_exc())',
-        'log.warning("email_batch_failed", error=traceback.format_exception(*sys.exc_info()))',
-        'log.warning("email_batch_failed", error=format_exc()[-500:])',
-        "traceback.print_exc()",
-        # Печать идёт ещё и мимо маски журнала.
-        'click.echo(f"email: FAIL — {exc}")',
-        'click.echo(f"email: FAIL — {exc.server_reply}", err=True)',
-        'click.secho(str(exc), fg="red")',
-        'print("email failed:", exc)',
-        "print(traceback.format_exc())",
-        # Текст ошибки, переложенный в переменную.
-        'text = traceback.format_exc()\n    log.warning("email_batch_failed", error=text)',
-        'reason = str(exc)\n    short = reason[:200]\n    click.echo(f"email: FAIL — {short}")',
-        'fields = {"error": str(exc)}\n    log.warning("email_batch_failed", **fields)',
-        'fields["error"] = str(exc)\n    log.warning("email_batch_failed", **fields)',
-        'errors.append(f"{user.id}: {exc}")\n    click.echo("; ".join(errors))',
-        'log.warning("email_batch_failed", error=str(sys.exception()))',
-        # Новая ошибка с тем же текстом: click печатает её строкой «Error: …».
-        'raise click.ClickException(f"email: FAIL — {exc}")',
-        "raise RuntimeError(str(exc)) from None",
-        'failure = click.ClickException(f"email: FAIL — {exc}")\n    raise failure',
-        'sys.exit(f"email: FAIL — {exc}")',
-        "exit(str(exc))",
-        "ctx.fail(str(exc))",
-        "sys.stderr.write(str(exc))",
-    ],
-)
-def test_the_code_check_sees_exception_text_in_a_send_failure_handler(body):
-    assert len(exception_text_leaks(_HANDLER.format(body=body))) == 1
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        'log.warning("email_batch_failed", user_id=user.id, error_type=type(exc).__name__)',
-        'log.warning("email_batch_failed", **notifier.delivery_error_fields(exc))',
-        'log.warning("email_batch_failed", user_id=user.id)',
-        'log.warning("email_batch_failed", user_id=user.id, exc_info=False)',
-        'fields = notifier.delivery_error_fields(exc)\n    log.warning("email_batch_failed", **fields)',
-        'click.echo(f"email: FAIL — {type(exc).__name__}")',
-        'click.echo("email: FAIL", err=True)',
-        "print(notifier.delivery_error_fields(exc))",
-        # Запись в базу — не вывод: её это правило не касается.
-        'run.error_message = f"{type(exc).__name__}: {exc}"\n    log.warning("x", run_id=run.id)',
-        # Сколько не ушло — число, а не текст.
-        'errors.append(str(exc))\n    log.warning("email_batch_failed", failed=len(errors))',
-        'session.add(Failure(detail=str(exc)))\n    log.warning("x", dirty=bool(session.new))',
-        # Ошибка, брошенная дальше как есть или без текста пойманной.
-        "raise",
-        "raise exc",
-        'raise click.ClickException("письмо не ушло") from exc',
-        'raise click.ClickException("письмо не ушло")',
-        'raise click.ClickException(f"письмо не ушло: {type(exc).__name__}")',
-        "sys.exit(1)",
-        # Стек вызовов — не текст ошибки.
-        "traceback.print_stack()",
-    ],
-)
-def test_the_code_check_lets_the_error_class_through(body):
-    assert exception_text_leaks(_HANDLER.format(body=body)) == []
-
-
-def test_the_code_check_excuses_an_event_only_in_the_function_it_is_listed_for():
-    source = """
-def run_cmd():
-    try:
-        notifier.send_email(subject="x", html_body="y")
-    except Exception as e:
-        log.exception("run_failed", run_id=1)
-        log.exception("report_failed", run_id=1)
-        raise click.ClickException(mask_addresses(str(e)))
-
-def report_cmd():
-    try:
-        notifier.send_email(subject="x", html_body="y")
-    except Exception as e:
-        log.exception("run_failed", run_id=1)
-        raise click.ClickException(mask_addresses(str(e)))
-"""
-    assert [line.split(":")[0] for line in exception_text_leaks(source)] == ["14", "15", "7"]
-    # Без списков исключений правило видит и разрешённое.
-    assert len(exception_text_leaks(source, excused=False)) == 5
-
-
-def test_the_code_check_excuses_printing_the_error_only_inside_the_listed_commands():
-    source = """
-def notify_test():
-    try:
-        notifier.send_email(subject="x", html_body="y")
-    except notifier.EmailDeliveryError as e:
-        click.echo(f"email: FAIL — {e}: {e.server_reply}")
-        log.warning("notify_test_failed", error=str(e))
-
-def run_cmd():
-    try:
-        notifier.send_email(subject="x", html_body="y")
-    except Exception as e:
-        click.echo(f"email: FAIL — {e}")
-"""
-    assert [line.split(":")[0] for line in exception_text_leaks(source)] == ["13", "7"]
-    assert len(exception_text_leaks(source, excused=False)) == 3
-
-
-_WRAPPED_SENDER = """
-def deliver(report):
-    notifier.send_email(subject="x", html_body=render(report))
-
-def deliver_and_record(report):
-    deliver(report)
-    record(report)
-
-def deliver_quietly(report):
-    try:
-        notifier.send_email(subject="x", html_body=render(report))
-    except Exception as exc:
-        log.warning("report_email_failed", **notifier.delivery_error_fields(exc))
-
-def deliver_past_a_narrow_handler(report):
-    try:
-        notifier.send_email(subject="x", html_body=render(report))
-    except OSError:
-        pass
-
-def deliver_and_reraise(report):
-    try:
-        notifier.send_email(subject="x", html_body=render(report))
-    except Exception as exc:
-        log.warning("report_email_failed", **notifier.delivery_error_fields(exc))
-        raise
-
-def deliver_and_reraise_refusals(report):
-    try:
-        notifier.send_email(subject="x", html_body=render(report))
-    except notifier.EmailDeliveryError:
-        raise
-    except Exception as exc:
-        log.warning("report_email_failed", **notifier.delivery_error_fields(exc))
-
-def ping(report):
-    notifier.send_telegram_message(report.chat_id, "готово")
-
-def command(report):
-    try:
-        {call}
-    except Exception as exc:
-        click.echo(f"report: FAIL — {{exc}}")
-"""
-
-
-@pytest.mark.parametrize(
-    ("call", "leaks"),
-    [
-        ("deliver(report)", 1),
-        # Сбой выходит и через вторую обёртку.
-        ("deliver_and_record(report)", 1),
-        # `except OSError` отказ почтового сервера не ловит.
-        ("deliver_past_a_narrow_handler(report)", 1),
-        # Записала и бросила дальше — сбой не остановлен.
-        ("deliver_and_reraise(report)", 1),
-        # `raise` стоит в соседнем обработчике того же `try`.
-        ("deliver_and_reraise_refusals(report)", 1),
-        # Обёртку зовут не по имени, а передают аргументом.
-        ("ctx.invoke(deliver, report)", 1),
-        # Под `send_email`: ошибка отсюда ещё с адресом в тексте.
-        ("notifier._send_email(subject, html, None, None)", 1),
-        # Сам вызов Telegram в `try` — отправка; обёртка над ним сбой не выпускает:
-        # `send_telegram_message` ловит его сама.
-        ("notifier.send_telegram_message(report.chat_id, text)", 1),
-        ("ping(report)", 0),
-        # Эта свой сбой поймала сама: в `command` приходит уже не он.
-        ("deliver_quietly(report)", 0),
-        ("record(report)", 0),
-        # Имя обёртки упомянуто, но она не вызвана и никому не передана.
-        ("record(report, note=deliver.__name__)", 0),
-    ],
-)
-def test_the_code_check_follows_a_send_failure_to_the_handler_that_gets_it(call, leaks):
-    assert len(exception_text_leaks(_WRAPPED_SENDER.format(call=call))) == leaks
-
-
-def test_the_code_check_knows_which_functions_in_src_let_a_send_failure_out():
-    """Образцы из живого кода. Упал после переименования или переделки одной из
-    этих функций — поправь имя здесь; правило при этом проверяй мутацией."""
-    senders = senders_in(_src_sources().values())
-    # `health_check_cmd` ловит сбой не `send_email`, а этой обёртки над ним.
-    assert "_dispatch_health_alert_email" in senders, sorted(senders)
-    # Сбой сбора записан и брошен дальше: `run` сбой письма о прогоне выпускает.
-    assert "run_cmd" in senders, sorted(senders)
-    # Эти сбой отправки ловят сами, а `handle_update` шлёт только в Telegram.
-    quiet = {"dispatch_events_batch", "mail_unstored_events_to_admins", "handle_update"}
-    assert not quiet & senders, sorted(quiet & senders)
-
-
-def test_the_telegram_sender_keeps_its_own_failure():
-    """На этом стоит `_RAISING_SENDERS`: функция с вызовом Telegram не считается
-    выпускающей сбой отправки, пока сам отправитель ловит всё, что бросает сеть."""
-    sender = next(
-        node
-        for node in ast.walk(ast.parse(_src_sources()["src/notifier.py"]))
-        if isinstance(node, ast.FunctionDef) and node.name == "send_telegram_message"
-    )
-    assert "urlopen" not in set(_escaping_references(sender, _local_names(sender))), (
-        "`send_telegram_message` перестала ловить сбой сети сама. Теперь он "
-        "выходит к вызывающим: убери её из вычитания в `_RAISING_SENDERS`, и "
-        "правило пойдёт за этим сбоем так же, как за сбоем почты."
-    )
-
-
-def test_the_code_check_ignores_handlers_that_send_nothing():
-    source = """
-try:
-    rows = session.scalars(query).all()
-except Exception as exc:
-    log.warning("lookup_failed", error=str(exc))
-"""
-    assert exception_text_leaks(source) == []
-
-
 # ─── Слой 1б: каждый почтовый путь, вызванный напрямую ───────────────────────
 
 
 def _refused(*args, **kwargs):
-    """Отказ почтового сервера с адресом в тексте — как его пишет smtplib."""
+    """Сбой отправки с адресом в тексте — как его пишет smtplib. Настоящий
+    `send_email` такую ошибку наружу не выпускает (слой 2); обработчик
+    проверяется так, будто выпустил."""
     raise RuntimeError(f"{{'{ADDRESS}': (550, b'{SMTP_REPLY}')}}")
 
 
@@ -1096,7 +571,9 @@ def _assert_clean(logs: list[dict], *, events: set[str], user_id: int | None) ->
         if user_id is not None:
             assert entry["user_id"] == user_id
         assert entry["error_type"] == "RuntimeError"
+        # Ни текста ошибки, ни трассировки с ним.
         assert "error" not in entry and "user" not in entry
+        assert not entry.get("exc_info")
 
 
 def test_single_event_dispatch_failure_log_carries_no_address(session, user):
@@ -1189,18 +666,26 @@ def cli_logging(monkeypatch, tmp_path):
     structlog.reset_defaults()
 
 
-# ─── Слой 2: ошибка SMTP выходит из send_email без адреса ────────────────────
+# ─── Слой 2: что бы ни сломалось, ошибка выходит из send_email без адреса ────
 
 
-def _smtp_that_fails_with(error: Exception, at: str = "send_message"):
+def _smtp_that_fails_with(
+    error: BaseException, at: str = "send_message", closing: Exception | None = None
+):
+    """Почтовый сервер, который падает с `error` на шаге `at`, а при закрытии
+    соединения — ещё и с `closing`."""
+
     class FakeSMTP:
         def __init__(self, *args, **kwargs):
-            pass
+            if at == "connect":
+                raise error
 
         def __enter__(self):
             return self
 
         def __exit__(self, *args):
+            if closing is not None:
+                raise closing
             return False
 
         def starttls(self):
@@ -1216,6 +701,16 @@ def _smtp_that_fails_with(error: Exception, at: str = "send_message"):
                 raise error
 
     return FakeSMTP
+
+
+def _everything_printed(failure: BaseException) -> str:
+    """Всё, что из ошибки может попасть в вывод: текст, repr и трассировка —
+    вместе с причиной и контекстом, если они есть."""
+    return str(failure) + repr(failure) + "".join(traceback.format_exception(failure))
+
+
+# Строка `notifier.py`, на которой письмо остановилось, — в конце текста ошибки.
+_RAISED_AT = r" \(notifier\.py:\d+ in _send_email\)"
 
 
 @pytest.fixture
@@ -1292,9 +787,8 @@ def test_smtp_refusal_leaves_send_email_without_an_address(
         notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS])
 
     failure = raised.value
-    # Всё, что из ошибки может попасть в журнал: текст, repr, трассировка.
-    printed = str(failure) + repr(failure) + "".join(traceback.format_exception(failure))
-    assert "@" not in printed, printed
+    assert isinstance(failure, notifier.EmailSendError)
+    assert "@" not in _everything_printed(failure), _everything_printed(failure)
     assert failure.__cause__ is None and failure.__context__ is None
     assert "@" not in repr(logs), logs
 
@@ -1302,6 +796,217 @@ def test_smtp_refusal_leaves_send_email_without_an_address(
     assert str(failure) == text
     assert notifier.delivery_error_fields(failure) == fields
     assert failure.server_reply == reply
+
+
+@pytest.mark.parametrize(
+    ("error", "at", "shown", "fields"),
+    [
+        # Пакет `email` кладёт в текст ошибки сам заголовок письма — со всеми
+        # получателями разом. Такой текст не показывается вовсе.
+        (
+            email.errors.HeaderWriteError(
+                f"folded header contains newline: b'To: {ADDRESS},\\r\\n second@client.example'"
+            ),
+            "send_message",
+            "HeaderWriteError: <текст скрыт>",
+            {"error_type": "HeaderWriteError"},
+        ),
+        # Адрес привычной записи вырезает маска; остальной текст остаётся оператору.
+        (
+            RuntimeError(f"relay refused {ADDRESS}: over quota"),
+            "send_message",
+            "RuntimeError: relay refused <address>: over quota",
+            {"error_type": "RuntimeError"},
+        ),
+        # Чего маска не узнала, выдаёт оставшийся «@»: текст скрыт целиком.
+        (
+            ValueError('cannot fold "viewer name"@client.example'),
+            "send_message",
+            "ValueError: <текст скрыт>",
+            {"error_type": "ValueError"},
+        ),
+        (
+            ValueError("no mailbox before '@client.example'"),
+            "send_message",
+            "ValueError: <текст скрыт>",
+            {"error_type": "ValueError"},
+        ),
+        # Адрес не в тексте, а в аргументах ошибки — его печатает repr.
+        (
+            UnicodeEncodeError("ascii", "почта@пример.рф", 0, 5, "ordinal not in range(128)"),
+            "login",
+            "UnicodeEncodeError: 'ascii' codec can't encode characters in position 0-4: "
+            "ordinal not in range(128)",
+            {"error_type": "UnicodeEncodeError"},
+        ),
+        # Сеть: класс и errno — то, по чему случаи различает docs/RUNBOOK.md.
+        (
+            ConnectionRefusedError(111, "Connection refused"),
+            "connect",
+            "ConnectionRefusedError: [Errno 111] Connection refused",
+            {"error_type": "ConnectionRefusedError", "errno": 111},
+        ),
+        (
+            socket.gaierror(-2, "Name or service not known"),
+            "connect",
+            "gaierror: [Errno -2] Name or service not known",
+            {"error_type": "gaierror", "errno": -2},
+        ),
+        (
+            TimeoutError("timed out"),
+            "starttls",
+            "TimeoutError: timed out",
+            {"error_type": "TimeoutError"},
+        ),
+        # Ошибка без текста.
+        (RuntimeError(), "send_message", "RuntimeError", {"error_type": "RuntimeError"}),
+    ],
+)
+def test_any_other_failure_leaves_send_email_without_an_address(
+    smtp_env, monkeypatch, error, at, shown, fields
+):
+    """Не только отказ сервера: сборка письма, сеть, что угодно."""
+    monkeypatch.setattr("smtplib.SMTP", _smtp_that_fails_with(error, at=at))
+
+    with capture_logs() as logs, pytest.raises(notifier.EmailSendError) as raised:
+        notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS])
+
+    failure = raised.value
+    assert type(failure) is notifier.EmailSendError  # отказом сервера не притворяется
+    assert "@" not in _everything_printed(failure), _everything_printed(failure)
+    assert failure.__cause__ is None and failure.__context__ is None
+    assert "@" not in repr(logs), logs
+
+    # Диагностика: класс исходной ошибки, её текст и строка, где письмо остановилось.
+    assert re.fullmatch(re.escape(shown) + _RAISED_AT, str(failure)), str(failure)
+    assert notifier.delivery_error_fields(failure) == fields
+
+
+def test_a_failure_while_closing_does_not_drag_the_refusal_along(smtp_env, monkeypatch):
+    """Ошибка, возникшая при закрытии соединения после отказа, несёт отказ
+    своим контекстом — и трассировка печатает его вместе с адресом."""
+    refusal = smtplib.SMTPRecipientsRefused({ADDRESS: (550, SMTP_REPLY.encode())})
+    closing = OSError(32, "Broken pipe")
+    monkeypatch.setattr("smtplib.SMTP", _smtp_that_fails_with(refusal, closing=closing))
+
+    # Тест не слеп: под `send_email` у этой ошибки адрес в трассировке есть.
+    with pytest.raises(OSError) as raw:
+        notifier._send_email("Тема", "<p>x</p>", None, [ADDRESS])
+    assert ADDRESS in "".join(traceback.format_exception(raw.value))
+
+    with pytest.raises(notifier.EmailSendError) as raised:
+        notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS])
+
+    failure = raised.value
+    assert "@" not in _everything_printed(failure), _everything_printed(failure)
+    assert failure.__cause__ is None and failure.__context__ is None
+    assert notifier.delivery_error_fields(failure) == {"error_type": "BrokenPipeError", "errno": 32}
+
+
+def test_a_failure_that_cannot_be_printed_leaves_send_email_clean(smtp_env, monkeypatch):
+    """Ошибку не удалось даже превратить в текст — исходная наружу всё равно не идёт."""
+
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError(f"no text for {ADDRESS}")
+
+    monkeypatch.setattr("smtplib.SMTP", _smtp_that_fails_with(Unprintable()))
+
+    with pytest.raises(notifier.EmailSendError) as raised:
+        notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS])
+
+    failure = raised.value
+    assert str(failure) == "Unprintable"
+    assert "@" not in _everything_printed(failure), _everything_printed(failure)
+    assert failure.__cause__ is None and failure.__context__ is None
+
+
+def test_a_missing_setting_leaves_send_email_as_a_send_error(smtp_env, monkeypatch):
+    """Сбой до разговора с сервером — та же ошибка, с тем же классом в журнале."""
+    monkeypatch.delenv("SMTP_PASSWORD")
+
+    with pytest.raises(notifier.EmailSendError) as raised:
+        notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS])
+
+    assert re.fullmatch(r"KeyError: 'SMTP_PASSWORD'" + _RAISED_AT, str(raised.value))
+    assert notifier.delivery_error_fields(raised.value) == {"error_type": "KeyError"}
+
+
+def test_an_interrupt_passes_through_send_email(smtp_env, monkeypatch):
+    monkeypatch.setattr("smtplib.SMTP", _smtp_that_fails_with(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        notifier.send_email("Тема", "<p>x</p>", to=[ADDRESS])
+
+
+_NOTIFIER = "src/notifier.py"
+
+
+def mail_server_bypasses(sources: dict[str, str]) -> list[str]:
+    """Кто ходит к почтовому серверу мимо `send_email`: модуль, кроме `notifier`,
+    который импортирует smtplib, и любое упоминание `_send_email` вне самой
+    `send_email`.
+
+    Чего проверка не видит: импорт по строке (`importlib.import_module`), имя,
+    собранное из частей (`getattr(notifier, "_send" + "_email")`), и другой
+    транспорт — HTTP API почтового сервиса, сторонний SMTP-клиент.
+    """
+    found = []
+    for path, source in sources.items():
+        for node, owner in _nodes_with_owner(ast.parse(source)):
+            if isinstance(node, ast.Import | ast.ImportFrom):
+                imported = {alias.name for alias in node.names}
+                modules = imported if isinstance(node, ast.Import) else {node.module or ""}
+                bypass = "_send_email" in imported or (
+                    path != _NOTIFIER and any(name.split(".")[0] == "smtplib" for name in modules)
+                )
+            elif isinstance(node, ast.Name | ast.Attribute):
+                name = node.id if isinstance(node, ast.Name) else node.attr
+                inside_the_entry = (
+                    path == _NOTIFIER and owner is not None and owner.name == "send_email"
+                )
+                bypass = name == "_send_email" and not inside_the_entry
+            else:
+                continue
+            if bypass:
+                found.append(f"{path}:{node.lineno}: {ast.unparse(node)}")
+    return found
+
+
+def test_only_send_email_talks_to_the_mail_server():
+    """На этом стоит весь слой 2: ошибка, взятая мимо `send_email`, не очищена."""
+    sources = _src_sources()
+    found = mail_server_bypasses(sources)
+    assert found == [], _HOW_TO_FIX_A_BYPASS.format(found="; ".join(found))
+    # Проверка не слепа: тот же `notifier.py` под чужим именем — уже обход.
+    elsewhere = mail_server_bypasses({"src/elsewhere.py": sources[_NOTIFIER]})
+    assert any("import smtplib" in line for line in elsewhere), elsewhere
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "bypasses"),
+    [
+        ("src/digest.py", "import smtplib", 1),
+        ("src/digest.py", "import ssl, smtplib as mail", 1),
+        ("src/digest.py", "from smtplib import SMTP", 1),
+        ("src/digest.py", "notifier._send_email(subject, html, None, None)", 1),
+        ("src/digest.py", "from src.notifier import _send_email", 1),
+        ("src/digest.py", "send = notifier._send_email", 1),
+        # В самом `notifier` — тоже, если зовёт не `send_email`.
+        (_NOTIFIER, "def resend():\n    return _send_email('x', 'y', None, None)", 1),
+        (
+            _NOTIFIER,
+            "import smtplib\n\ndef send_email():\n    return _send_email()\n\n"
+            "def _send_email(): ...",
+            0,
+        ),
+        ("src/digest.py", "notifier.send_email(subject='x', html_body='y')", 0),
+        # Чужая функция с похожим именем.
+        ("src/alerts.py", "def _send_email_alert(event): ...\n\n_send_email_alert(event)", 0),
+        ("src/digest.py", "import smtplib_stub", 0),
+    ],
+)
+def test_the_code_check_sees_a_way_past_send_email(path, source, bypasses):
+    assert len(mail_server_bypasses({path: source})) == bypasses
 
 
 def test_delivery_error_fields_never_carry_the_error_text():
@@ -1351,6 +1056,89 @@ def test_run_failure_output_carries_no_address(cli_logging, db_session, monkeypa
     assert result.exit_code != 0
     assert "run_failed" in result.output and "Traceback" in result.output
     assert "Error: {'<address>': (550" in result.output
+    assert "@" not in result.output, result.output
+
+
+def _refusal() -> Exception:
+    return smtplib.SMTPRecipientsRefused({ADDRESS: (550, SMTP_REPLY.encode())})
+
+
+def _bad_header() -> Exception:
+    return email.errors.HeaderWriteError(f"folded header contains newline: b'To: {ADDRESS}'")
+
+
+def _fail_to_record(*args, **kwargs):
+    raise RuntimeError(f"cannot record the alert sent to {ADDRESS}")
+
+
+@pytest.mark.parametrize(
+    ("smtp_error", "write_state", "reason"),
+    [
+        # Отказ сервера и сбой сборки письма: чисты уже на выходе из `send_email`.
+        (_refusal, None, "SMTPRecipientsRefused (SMTP 550 5.1.1)"),
+        (_bad_header, None, "HeaderWriteError: <текст скрыт> (notifier.py:"),
+        # Письмо ушло, а упало то, что стоит в том же `try` после отправки: эту
+        # ошибку `send_email` не видела, её чистит сама команда.
+        (None, _fail_to_record, "cannot record the alert sent to <address>"),
+    ],
+)
+def test_health_check_output_carries_no_address(
+    cli_logging, smtp_env, monkeypatch, tmp_path, smtp_error, write_state, reason
+):
+    """Команда печатает через `click.echo`, мимо маски журнала, — и причину, по
+    которой письмо о тревоге не ушло, и текст ошибки прогона, как он записан в
+    базу (`runs.error_message`)."""
+    stored = f"Последний прогон #7 завершился со статусом failed: IntegrityError: {ADDRESS}"
+    report = health.HealthReport(
+        status="critical", issues=[health.HealthIssue("critical", "last_run_failed", stored)]
+    )
+    monkeypatch.setattr(storage, "init_db", lambda: None)
+    monkeypatch.setattr(storage, "make_session", lambda: lambda: nullcontext(object()))
+    monkeypatch.setattr(health, "check_health", lambda *args, **kwargs: report)
+    monkeypatch.setattr(notifier, "resolve_recipients", lambda explicit=None: [ADDRESS])
+    fake = (
+        _smtp_that_fails_with(smtp_error())
+        if smtp_error
+        else _smtp_that_fails_with(RuntimeError(), at="never")
+    )
+    monkeypatch.setattr("smtplib.SMTP", fake)
+    if write_state is not None:
+        monkeypatch.setattr(main, "_write_health_alert_state", write_state)
+
+    result = CliRunner().invoke(
+        main.cli,
+        ["health-check", "--alert-email", "--alert-state-file", str(tmp_path / "health.json")],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "last_run_failed: Последний прогон #7" in result.output, result.output
+    assert "IntegrityError: <address>" in result.output, result.output
+    assert f"Не удалось отправить health email: {reason}" in result.output, result.output
+    assert "@" not in result.output, result.output
+
+
+@pytest.mark.parametrize(
+    ("smtp_error", "line"),
+    [
+        (
+            _refusal,
+            "email:    FAIL — SMTPRecipientsRefused (SMTP 550 5.1.1): "
+            "5.1.1 <<address>>: Recipient address rejected",
+        ),
+        (_bad_header, "email:    FAIL — HeaderWriteError: <текст скрыт> (notifier.py:"),
+    ],
+)
+def test_notify_test_output_carries_no_address(
+    cli_logging, smtp_env, monkeypatch, smtp_error, line
+):
+    """То же у проверки доставки — с настоящим `send_email`, а не подменённым."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setattr("smtplib.SMTP", _smtp_that_fails_with(smtp_error()))
+
+    result = CliRunner().invoke(main.cli, ["notify", "test", "--email", ADDRESS])
+
+    assert result.exit_code == 0, result.output
+    assert line in result.output, result.output
     assert "@" not in result.output, result.output
 
 
