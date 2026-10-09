@@ -46,6 +46,7 @@ from src import (
     notifications,
     notifier,
     storage,
+    telegram_binding,
     tenants,
 )
 from src._time import utcnow
@@ -464,10 +465,19 @@ def test_per_user_digest_dry_run_names_the_recipient_by_id(session, user):
 
 
 def test_telegram_binding_log_carries_no_address(session, user):
+    """Привязка по коду из дашборда: в журнале ни адреса, ни чата, ни кода."""
+    user.telegram_chat_id = None
+    session.commit()
     with capture_logs() as logs:
-        assert notifications.bind_telegram(session, "700200", ADDRESS) is True
-    assert "@" not in repr(logs), logs
-    assert logs == [{"event": "telegram_bound", "log_level": "info", "user_id": user.id}]
+        issued = telegram_binding.issue_code(session, user.id)
+        outcome = telegram_binding.bind_chat(session, "700200", issued.code)
+    assert outcome is telegram_binding.BindOutcome.BOUND
+    for secret in ("@", "700200", issued.code):
+        assert secret not in repr(logs), logs
+    assert logs == [
+        {"event": "telegram_bind_code_issued", "log_level": "info", "user_id": user.id},
+        {"event": "telegram_bound", "log_level": "info", "user_id": user.id},
+    ]
 
 
 def test_legacy_daily_digest_failure_log_carries_no_address(session, user):

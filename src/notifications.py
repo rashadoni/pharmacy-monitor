@@ -9,7 +9,6 @@ Public API:
   - dispatch_event(session, event)        — for real-time alerts (called by alerts.evaluate_rules)
   - send_daily_digest(session, tenant_id) — call from systemd timer at 08:00
   - send_weekly_digest(session, tenant_id) — call from systemd timer Mondays
-  - bind_telegram(session, chat_id, email) — link telegram to user
 
 Severity ordering (low → high):  info < warning < critical
 """
@@ -394,26 +393,9 @@ def mail_unstored_events_to_admins(
 
 
 # ─── Telegram /start binding ─────────────────────────────────────────────────
-
-
-def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
-    """Link a Telegram chat_id to an existing TenantUser by email.
-
-    Called from telegram_bot.cmd_start when user does `/start <email>`.
-    Returns True if bound, False if user not found.
-    """
-    user = session.scalar(
-        select(storage.TenantUser).where(
-            storage.TenantUser.email == email.lower().strip(),
-            storage.TenantUser.is_active.is_(True),
-        )
-    )
-    if not user:
-        return False
-    user.telegram_chat_id = str(chat_id)
-    session.commit()
-    log.info("telegram_bound", user_id=user.id)
-    return True
+# Привязка чата живёт в `src/telegram_binding.py`: по одноразовому коду из
+# дашборда. `bind_telegram(session, chat_id, email)` здесь больше нет — она
+# записывала чат любому, кто знал адрес пользователя.
 
 
 # ─── Daily / weekly digest ───────────────────────────────────────────────────

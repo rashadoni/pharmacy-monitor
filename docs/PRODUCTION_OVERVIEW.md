@@ -87,13 +87,14 @@ infra/prometheus.yml                            W11
 src/api.py                  rewritten — 31 routes, JWT, CORS, /metrics, prefs   W2/W11
 src/storage.py              + tenant_id in 5 models + 6 notif_prefs columns      W3/W9
 src/tenancy.py              ContextVar + scoped() + assert_same_tenant            W3
-src/notifications.py        dispatch_event + bind_telegram + digests              W9
+src/notifications.py        dispatch_event + digests                              W9
 src/observability.py        Sentry + Prometheus + helpers                          W11
 src/logging_setup.py        structured JSON logs + file rotation                   W11
 src/scrapers/base.py        + proxy + stealth + captcha + smart retry              W10
 src/scrapers/anti_detection.py  9 UAs + viewport jitter + stealth_js               W10
 src/scrapers/captcha.py     captcha detection (DOM + text patterns)                W10
-src/telegram_bot.py         /start <email> binds chat_id                           W9
+src/telegram_bot.py         /start <code> binds the chat (code from the dashboard) W9
+src/telegram_binding.py     one-time bind codes, attempt limit                     2026-10
 src/main.py                 + notify digest CLI + smoke-test in run_cmd            W9
 src/matcher.py              + metrics injection                                    W11
 src/alerts.py               + metrics injection                                    W11
