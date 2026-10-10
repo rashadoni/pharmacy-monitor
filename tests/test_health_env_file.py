@@ -10,8 +10,10 @@
 `pharmacy-monitor health-check`. Тесты держат четыре вещи:
 
 * сервер отличается от машины разработчика тем, что на нём есть файл настроек
-  сервера; `.env` у разработчика — штатное место настроек и проблемой не считается;
-* в отчёт попадает только путь: ни один из двух файлов не открывается;
+  сервера; `.env` у разработчика — штатное место настроек и проблемой не считается.
+  Как запущен процесс (таймер, руками), роли не играет;
+* в отчёт попадает только путь: ни один из двух файлов не открывается, и ни
+  размера, ни времени, ни владельца файла в сообщении нет;
 * это предупреждение, а не авария, и пока файл лежит, письмо о нём уходит раз в
   сутки, а не каждый час;
 * смотрит проверка на тот самый файл, который читает CLI, и на тот самый файл
@@ -23,7 +25,10 @@ from __future__ import annotations
 import ast
 import builtins
 import io
+import json
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -47,6 +52,9 @@ ENV_FILE_VALUE = "pm-envtest-stray-value"
 SERVER_NAME = "PM_ENVTEST_SERVER_NAME"
 SERVER_VALUE = "pm-envtest-server-value"
 FILE_CONTENT = (ENV_FILE_NAME, ENV_FILE_VALUE, SERVER_NAME, SERVER_VALUE)
+
+# Что systemd кладёт в окружение процесса службы.
+SYSTEMD_MARKERS = ("INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "NOTIFY_SOCKET")
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,8 @@ def machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Machine:
         beside_code=root / ".env",
         settings_file=tmp_path / "etc" / "pharmacy-monitor" / "env",
     )
+    # Признак сервера для всех тестов уже снят в conftest (`_not_a_server`);
+    # здесь оба пути переезжают во временный каталог.
     monkeypatch.setattr(health, "_CHECKOUT_ENV_FILE", made.beside_code)
     monkeypatch.setattr(health, "_SERVER_ENV_FILE", made.settings_file)
     return made
@@ -147,6 +157,34 @@ def test_env_file_in_a_developer_checkout_is_not_a_problem(machine: Machine) -> 
     assert health._check_env_file_next_to_code() == []
 
 
+def test_settings_directory_without_the_file_is_not_a_server(machine: Machine) -> None:
+    # Признак — сам файл настроек, а не каталог, в котором он должен лежать.
+    machine.settings_file.parent.mkdir(parents=True)
+    machine.put_env_file()
+
+    assert health._check_env_file_next_to_code() == []
+
+
+@pytest.mark.parametrize("under_systemd", [False, True])
+def test_how_the_process_was_started_changes_nothing(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch, under_systemd: bool
+) -> None:
+    # Сервер узнаётся по диску, а не по окружению процесса: ручной запуск на
+    # сервере видит то же, что таймер, а служба пользователя на машине
+    # разработчика сервером её не делает.
+    for name in SYSTEMD_MARKERS:
+        if under_systemd:
+            monkeypatch.setenv(name, "8c1f0c0c5d3b4a6e9f1d2b3c4d5e6f70")
+        else:
+            monkeypatch.delenv(name, raising=False)
+    machine.put_env_file()
+
+    assert health._check_env_file_next_to_code() == []
+    machine.make_it_a_server()
+    found = health._check_env_file_next_to_code()
+    assert [(issue.severity, issue.code) for issue in found] == [("warning", CODE)]
+
+
 def test_the_file_coming_back_is_noticed_on_the_next_check(server: Machine) -> None:
     assert health._check_env_file_next_to_code() == []
     server.put_env_file()
@@ -155,10 +193,15 @@ def test_the_file_coming_back_is_noticed_on_the_next_check(server: Machine) -> N
     assert health._check_env_file_next_to_code() == []
 
 
-@pytest.mark.parametrize("kind", ["dangling symlink", "symlink to a file", "directory"])
+@pytest.mark.parametrize(
+    "kind", ["empty file", "dangling symlink", "symlink to a file", "directory"]
+)
 def test_anything_named_env_file_counts(server: Machine, tmp_path: Path, kind: str) -> None:
-    # Ссылка в никуда сегодня не читается, а завтра по ней появится файл.
-    if kind == "directory":
+    # Пустой файл завтра наполнят; ссылка в никуда сегодня не читается, а завтра
+    # по ней появится файл.
+    if kind == "empty file":
+        server.beside_code.write_text("")
+    elif kind == "directory":
         server.beside_code.mkdir()
     else:
         target = tmp_path / "elsewhere"
@@ -205,37 +248,66 @@ def test_server_whose_settings_directory_is_closed_is_still_a_server(
 
 
 @pytest.fixture
-def no_reading(server: Machine, monkeypatch: pytest.MonkeyPatch) -> Machine:
-    """Сервер с `.env` рядом с кодом; открыть любой из двух файлов — уронить тест."""
-    server.put_env_file()
-    guarded = {str(server.beside_code), str(server.settings_file)}
+def opened(server: Machine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Сервер с `.env` рядом с кодом; сюда пишется каждое открытие любого из двух файлов.
 
-    def refuse(original):
+    Открытие не запрещается, а записывается: запрет через исключение проглотил бы
+    `except Exception` вокруг чтения, и тест остался бы зелёным, а на сервере
+    чтение удалось бы.
+    """
+    server.put_env_file()
+    watched = {str(server.beside_code), str(server.settings_file)}
+    seen: list[str] = []
+
+    def recording(original):
         def opener(file, *args, **kwargs):
             if isinstance(file, (str, bytes, os.PathLike)):
-                assert os.path.abspath(os.fsdecode(file)) not in guarded, f"opened {file}"
+                path = os.path.abspath(os.fsdecode(file))
+                if path in watched:
+                    seen.append(path)
             return original(file, *args, **kwargs)
 
         return opener
 
-    monkeypatch.setattr(builtins, "open", refuse(builtins.open))
-    monkeypatch.setattr(io, "open", refuse(io.open))
-    monkeypatch.setattr(os, "open", refuse(os.open))
-    return server
+    monkeypatch.setattr(builtins, "open", recording(builtins.open))
+    monkeypatch.setattr(io, "open", recording(io.open))
+    monkeypatch.setattr(os, "open", recording(os.open))
+    return seen
 
 
-def test_the_guard_against_reading_would_catch_a_read(no_reading: Machine) -> None:
-    for read in (
-        lambda: no_reading.beside_code.read_text(),
-        lambda: open(no_reading.beside_code),
-        lambda: os.open(no_reading.beside_code, os.O_RDONLY),
-    ):
-        with pytest.raises(AssertionError, match="opened"):
-            read()
+def test_recorder_sees_every_way_of_opening(server: Machine, opened: list[str]) -> None:
+    server.beside_code.read_text()
+    with open(server.settings_file):
+        pass
+    os.close(os.open(server.beside_code, os.O_RDONLY))
+
+    assert opened == [
+        str(server.beside_code),
+        str(server.settings_file),
+        str(server.beside_code),
+    ]
+
+
+def test_message_says_where_the_file_is_and_nothing_else_about_it(server: Machine) -> None:
+    server.put_env_file()
+
+    told = health._check_env_file_next_to_code()[0]
+
+    for secret in FILE_CONTENT:
+        assert secret not in told.message
+    # Ни размера, ни времени, ни владельца: вне двух путей в сообщении нет цифр…
+    outside_the_paths = told.message.replace(str(server.beside_code), "").replace(
+        str(server.settings_file), ""
+    )
+    assert not any(character.isdigit() for character in outside_the_paths)
+    # …и о другом файле на том же месте сказано слово в слово то же.
+    server.beside_code.write_text("")
+    os.utime(server.beside_code, (0, 0))
+    assert health._check_env_file_next_to_code() == [told]
 
 
 def test_report_carries_the_path_and_nothing_from_either_file(
-    no_reading: Machine, db_session
+    server: Machine, opened: list[str], db_session
 ) -> None:
     report = check_health(db_session)
 
@@ -248,14 +320,15 @@ def test_report_carries_the_path_and_nothing_from_either_file(
             alert_signature(report),
         )
     )
-    assert str(no_reading.beside_code) in issue.message
-    assert str(no_reading.beside_code) in health.render_alert_html(report)
+    assert opened == []
+    assert str(server.beside_code) in issue.message
+    assert str(server.beside_code) in health.render_alert_html(report)
     for secret in FILE_CONTENT:
         assert secret not in told
 
 
 def test_health_check_command_prints_and_mails_the_path_only(
-    no_reading: Machine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: Machine, opened: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'health.sqlite'}")
     mailed: list[dict] = []
@@ -276,10 +349,11 @@ def test_health_check_command_prints_and_mails_the_path_only(
 
     # 1 — warning: юнит health считает такой выход штатным (SuccessExitStatus=1 2).
     assert result.exit_code == 1, result.output
+    assert opened == []
     assert f"[warning] {CODE}: " in result.output
-    assert str(no_reading.beside_code) in result.output
+    assert str(server.beside_code) in result.output
     assert [mail["subject"] for mail in mailed] == ["Pharmacy Monitor — WARNING"]
-    assert str(no_reading.beside_code) in mailed[0]["html_body"]
+    assert str(server.beside_code) in mailed[0]["html_body"]
     for secret in FILE_CONTENT:
         assert secret not in result.output
         assert secret not in mailed[0]["html_body"]
@@ -292,7 +366,7 @@ def test_health_check_command_prints_and_mails_the_path_only(
 def test_it_is_a_warning_whatever_the_state_of_the_data(server: Machine, db_session) -> None:
     server.put_env_file()
 
-    # Прогонов ещё нет: проверка от базы не зависит и раннему выходу не мешает.
+    # Прогонов ещё нет: проверке они не нужны, и ранний выход `no_runs` её не глушит.
     empty = check_health(db_session)
     assert empty.status == "warning"
     assert [issue.code for issue in empty.issues] == [CODE, "no_runs"]
@@ -354,8 +428,34 @@ def test_path_is_not_part_of_the_incident_identity(server: Machine) -> None:
 
 # ── Проверка смотрит на те же файлы, что код и юниты ───────────────────────────
 
+_PATHS_PROBE = """
+import json
+from src import health
+print(json.dumps({"checkout": str(health._CHECKOUT_ENV_FILE), "server": str(health._SERVER_ENV_FILE)}))
+"""
 
-def test_it_watches_the_file_the_cli_reads() -> None:
+
+@pytest.fixture(scope="module")
+def real_paths(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
+    """Оба пути, как их видит свежий процесс, запущенный из постороннего каталога.
+
+    В самом тестовом процессе их смотреть нельзя: признак сервера снят в conftest,
+    а cwd pytest — корень репозитория, и путь, собранный от cwd, совпал бы с
+    верным случайно. Ручной запуск на сервере идёт из любого каталога.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _PATHS_PROBE],
+        cwd=tmp_path_factory.mktemp("elsewhere"),
+        env={**os.environ, "PYTHONPATH": str(REPO)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_it_watches_the_file_the_cli_reads(real_paths: dict[str, str]) -> None:
     # Путь, который `src/main.py` отдаёт загрузчику `.env`, вычисляется из его
     # же текста — и должен совпасть с тем, за которым следит health.
     main_path = REPO / "src" / "main.py"
@@ -368,10 +468,10 @@ def test_it_watches_the_file_the_cli_reads() -> None:
     argument = compile(ast.Expression(loader_calls[0].args[0]), str(main_path), "eval")
     loaded = eval(argument, {"Path": Path, "__file__": str(main_path)})
 
-    assert health._CHECKOUT_ENV_FILE == loaded == REPO / ".env"
+    assert real_paths["checkout"] == str(loaded) == str(REPO / ".env")
 
 
-def test_server_is_recognised_by_the_file_the_units_are_fed() -> None:
+def test_server_is_recognised_by_the_file_the_units_are_fed(real_paths: dict[str, str]) -> None:
     named = {
         line.split("=", 1)[1].strip().lstrip("-")
         for unit in (REPO / "infra" / "systemd").rglob("*")
@@ -380,4 +480,12 @@ def test_server_is_recognised_by_the_file_the_units_are_fed() -> None:
         if line.startswith("EnvironmentFile=")
     }
 
-    assert named == {str(health._SERVER_ENV_FILE)} == {"/etc/pharmacy-monitor/env"}
+    assert named == {real_paths["server"]} == {"/etc/pharmacy-monitor/env"}
+
+
+def test_rest_of_the_suite_runs_as_on_a_developer_machine() -> None:
+    # Тесты проверяют правило, а не машину: в тестовом процессе признак сервера
+    # снят (conftest), иначе на машине с файлом настроек сервера и `.env` в корне
+    # чекаута краснел бы любой тест, ждущий чистый отчёт.
+    assert not health._is_there(health._SERVER_ENV_FILE)
+    assert health._check_env_file_next_to_code() == []
