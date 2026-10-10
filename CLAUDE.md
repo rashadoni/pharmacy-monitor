@@ -114,9 +114,9 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 
 ### Auth
 - Password login via `POST /auth/login {login, password}` → JWT cookie `pm_session` (httpOnly)
+- **Токен из ссылки на вход сервер в базе не хранит (2026-10-10):** в `tenant_users.magic_token` лежит его SHA-256, в запросы к базе идёт только хеш (`tenants.issue_magic_token` / `verify_magic_token`; в модели поле названо `magic_token_hash`, колонка осталась под старым именем — миграции нет). Содержимое колонки входом не служит, «найти ссылку в базе» нельзя — только выслать новую. Новый путь выдачи берёт токен у `issue_magic_token` и никуда его не пишет — ни в таблицу, ни в журнал; это ловит `tests/test_magic_link_token.py`. ⚠️ Не закрыто: в журнале Caddy токен есть — адрес `/set-password?token=…` пишется целиком и остаётся рабочей ссылкой, пока пароль не задан. Выложено ли — проверять сервер, а не эту строку, и смотреть процесс, а не файл: API читает код при старте. Команды и разбор колонки — [docs/RUNBOOK.md](docs/RUNBOOK.md) «Ссылка из письма не входит».
 - bcrypt hash stored in `/etc/pharmacy-monitor/env` as `ADMIN_PASSWORD_HASH`
 - Magic-link flow (`/auth/request` + `/auth/verify`) still works as alternative
-- Токен из ссылки на вход лежит в базе SHA-256-хешем, сам токен — только в письме (`tenants.issue_magic_token` / `verify_magic_token`, 2026-10-10). Колонка называется по-старому, `tenant_users.magic_token`; в модели — `magic_token_hash`. Содержимое колонки входом не служит, поэтому «найти ссылку в базе» нельзя — только выслать новую. Новый путь выдачи обязан брать токен у `issue_magic_token` и никуда его не записывать. Выложено ли — проверять сервер, а не эту строку: `grep -c _magic_token_hash /opt/pharmacy-monitor/src/tenants.py` (0 — не выложено, в колонке токены открытым текстом). Диагностика — [docs/RUNBOOK.md](docs/RUNBOOK.md) «Ссылка из письма не входит».
 
 ### Data
 - Pilot data migrated: 2087 products, 83 cross-site matches, 14469 price snapshots, 357 categories

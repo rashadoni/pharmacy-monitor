@@ -1,4 +1,4 @@
-"""Одноразовый токен входа лежит в базе хешем, а сам существует только в письме.
+"""Одноразовый токен входа лежит в базе хешем: сам токен сервер не хранит.
 
 Токен из ссылки — полноценный вход: `/auth/verify` ставит по нему сессию,
 `/auth/set-password` задаёт пароль. До 2026-10-10 он лежал в
@@ -7,25 +7,34 @@
 
 Что здесь проверяется:
 
-- в строке пользователя и в запросах к базе самого токена нет;
-- токен из письма входит один раз, после срока и без срока — не входит;
+- токена нет ни в строке пользователя, ни в одном запросе к базе (в любую
+  таблицу), ни в журнале приложения;
+- токен из письма входит один раз и полчаса; новая ссылка гасит прежнюю;
 - содержимое колонки токеном не служит — ни хеш, ни токен, записанный открытым
   текстом прежним кодом;
 - так на каждом пути выдачи: запрос ссылки, приглашение, повторная отправка
   админом, команда `tenant issue-token`.
+
+Чего здесь нет: журнала прокси. Caddy пишет адрес запроса вместе с `?token=…`,
+и это тест не видит — docs/RUNBOOK.md, «Ссылка из письма не входит».
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+from collections.abc import Callable, Iterator
 from datetime import timedelta
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import structlog
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session, sessionmaker
+from structlog.testing import capture_logs
 
 from src import api as api_module
 from src import main, notifier, rate_limit, storage, tenants
@@ -42,7 +51,7 @@ def _sha256(value: str) -> str:
 
 def _add_user(session: Session, address: str = ADDRESS, **fields) -> TenantUser:
     tenant = tenants.get_or_create_default(session)
-    user = TenantUser(tenant_id=tenant.id, email=address, is_active=True, **fields)
+    user = TenantUser(tenant_id=tenant.id, email=address, **{"is_active": True, **fields})
     session.add(user)
     session.commit()
     return user
@@ -63,6 +72,33 @@ def _assert_only_the_hash_is_stored(session: Session, user: TenantUser, token: s
     assert token not in repr(row)
 
 
+@pytest.fixture
+def written(db_session) -> Iterator[Callable[[], list[str]]]:
+    """Всё, что сервер записал за тест: запросы к базе с параметрами и журнал.
+
+    Параметры запроса — тоже запись: база кладёт их в текст своей ошибки.
+    """
+    queries: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        queries.append(f"{statement} {parameters!r}")
+
+    engine = db_session.get_bind()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        with capture_logs() as entries:
+            yield lambda: queries + [repr(entry) for entry in entries]
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+def _assert_written_nowhere(written: Callable[[], list[str]], token: str) -> None:
+    lines = written()
+    # Запись хеша на месте — иначе вторая проверка ничего бы не значила.
+    assert [line for line in lines if _sha256(token) in line], lines
+    assert not [line for line in lines if token in line]
+
+
 # ─── Выдача и проверка ───────────────────────────────────────────────────────
 
 
@@ -75,26 +111,38 @@ def test_the_row_holds_the_hash_of_the_token_not_the_token(db_session):
     _assert_only_the_hash_is_stored(db_session, user, token)
 
 
-def test_the_token_is_in_no_query_sent_to_the_database(db_session):
-    """Текст ошибки базы несёт параметры запроса — токена среди них быть не должно."""
+def test_the_token_is_in_no_query_and_no_log_line(db_session, written):
     _add_user(db_session)
-    sent: list[str] = []
 
-    def record(conn, cursor, statement, parameters, context, executemany):
-        sent.append(f"{statement} {parameters!r}")
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+    assert tenants.verify_magic_token(db_session, token) is not None
+    assert tenants.verify_magic_token(db_session, token) is None
 
-    engine = db_session.get_bind()
-    event.listen(engine, "before_cursor_execute", record)
-    try:
-        token = tenants.issue_magic_token(db_session, ADDRESS)
-        assert tenants.verify_magic_token(db_session, token) is not None
-        assert tenants.verify_magic_token(db_session, token) is None
-    finally:
-        event.remove(engine, "before_cursor_execute", record)
+    _assert_written_nowhere(written, token)
+    # Хеш ушёл в базу трижды: запись и два поиска.
+    assert sum(_sha256(token) in line for line in written()) >= 3
 
-    # Запись и оба поиска на месте — иначе проверка ниже ничего бы не значила.
-    assert sum(_sha256(token) in query for query in sent) >= 3, sent
-    assert not [query for query in sent if token in query]
+
+def test_every_link_carries_its_own_long_random_token(db_session):
+    _add_user(db_session)
+    _add_user(db_session, "second@example.com")
+
+    tokens = [
+        tenants.issue_magic_token(db_session, ADDRESS),
+        tenants.issue_magic_token(db_session, "second@example.com"),
+        tenants.issue_magic_token(db_session, ADDRESS),
+    ]
+
+    assert len(set(tokens)) == 3
+    assert all(len(token) >= 43 for token in tokens)  # 32 случайных байта
+
+
+def test_no_link_is_issued_to_a_switched_off_account(db_session):
+    user = _add_user(db_session, is_active=False)
+
+    assert tenants.issue_magic_token(db_session, ADDRESS) is None
+    assert tenants.issue_magic_token(db_session, ADDRESS, ttl_minutes=5) is None
+    assert _row(db_session, user)["magic_token"] is None
 
 
 def test_the_token_signs_in_once(db_session):
@@ -103,16 +151,29 @@ def test_the_token_signs_in_once(db_session):
 
     assert tenants.verify_magic_token(db_session, token).id == user.id
     assert tenants.verify_magic_token(db_session, token) is None
-    assert _row(db_session, user)["magic_token"] is None
+    row = _row(db_session, user)
+    assert row["magic_token"] is None and row["magic_token_expires_at"] is None
 
 
-def test_the_token_does_not_sign_in_after_its_term(db_session):
+def test_a_new_link_spends_the_previous_one(db_session):
     user = _add_user(db_session)
-    token = tenants.issue_magic_token(db_session, ADDRESS)
-    user.magic_token_expires_at = utcnow() - timedelta(seconds=1)
-    db_session.commit()
+    earlier = tenants.issue_magic_token(db_session, ADDRESS)
+    later = tenants.issue_magic_token(db_session, ADDRESS)
 
-    assert tenants.verify_magic_token(db_session, token) is None
+    assert tenants.verify_magic_token(db_session, earlier) is None
+    assert tenants.verify_magic_token(db_session, later).id == user.id
+
+
+@pytest.mark.parametrize(("minutes_later", "signs_in"), [(29, True), (31, False)])
+def test_the_token_lives_half_an_hour(db_session, monkeypatch, minutes_later, signs_in):
+    _add_user(db_session)
+    issued_at = utcnow()
+    monkeypatch.setattr(tenants, "utcnow", lambda: issued_at)
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+
+    monkeypatch.setattr(tenants, "utcnow", lambda: issued_at + timedelta(minutes=minutes_later))
+
+    assert (tenants.verify_magic_token(db_session, token) is not None) is signs_in
 
 
 def test_a_token_without_a_term_does_not_sign_in(db_session):
@@ -162,6 +223,8 @@ def client(monkeypatch, db_session) -> TestClient:
     factory = sessionmaker(db_session.get_bind(), expire_on_commit=False)
     monkeypatch.setattr(storage, "make_session", lambda database_url=None: factory)
     monkeypatch.setenv("JWT_SECRET", "test-secret-very-long-not-for-prod-only")
+    # Адрес в ссылке — свой, а не из окружения того, кто запустил тесты.
+    monkeypatch.setenv("PHARMACY_PUBLIC_URL", "https://dashboard.example")
     # Счёт запросов — в памяти процесса и с нуля: в CI рядом стоит Redis, и
     # счётчик в нём переживал бы тест.
     monkeypatch.setattr(rate_limit, "_redis_client", lambda: None)
@@ -181,9 +244,11 @@ def letters(monkeypatch) -> list[str]:
 
 def _link_in(letter: str) -> tuple[str, str]:
     """Куда ведёт ссылка из письма и какой токен она несёт."""
-    links = set(re.findall(r"(/[a-z/-]+)\?token=([A-Za-z0-9_-]+)", letter))
-    assert len(links) == 1, letter
-    return links.pop()
+    (address,) = set(re.findall(r"href='([^']+)'", letter))
+    link = urlsplit(address)
+    assert f"{link.scheme}://{link.netloc}" == "https://dashboard.example"
+    (token,) = parse_qs(link.query)["token"]
+    return link.path, token
 
 
 def _sign_in_as_admin(client: TestClient, session: Session) -> TenantUser:
@@ -194,7 +259,7 @@ def _sign_in_as_admin(client: TestClient, session: Session) -> TenantUser:
     return admin
 
 
-def test_a_requested_login_link_signs_in_once(client, letters, db_session):
+def test_a_requested_login_link_signs_in_once(client, letters, db_session, written):
     user = _add_user(db_session, password_hash=api_module._hash_bcrypt(PASSWORD))
 
     assert client.post("/auth/request", json={"email": ADDRESS}).status_code == 200
@@ -206,9 +271,10 @@ def test_a_requested_login_link_signs_in_once(client, letters, db_session):
     assert first.status_code == 200 and first.json()["user_id"] == user.id
     assert api_module.COOKIE_NAME in first.cookies
     assert client.get(path, params={"token": token}).status_code == 401
+    _assert_written_nowhere(written, token)
 
 
-def test_an_invitation_sets_a_password_once(client, letters, db_session):
+def test_an_invitation_sets_a_password_once(client, letters, db_session, written):
     _sign_in_as_admin(client, db_session)
 
     created = client.post("/api/v1/dash/recipients", json={"email": ADDRESS, "role": "viewer"})
@@ -225,9 +291,10 @@ def test_an_invitation_sets_a_password_once(client, letters, db_session):
     assert again.status_code == 401
     db_session.refresh(user)
     assert api_module._verify_bcrypt(PASSWORD, user.password_hash)
+    _assert_written_nowhere(written, token)
 
 
-def test_a_link_resent_by_an_admin_signs_in_once(client, letters, db_session):
+def test_a_link_resent_by_an_admin_signs_in_once(client, letters, db_session, written):
     _sign_in_as_admin(client, db_session)
     user = _add_user(db_session, password_hash=api_module._hash_bcrypt(PASSWORD))
 
@@ -239,6 +306,7 @@ def test_a_link_resent_by_an_admin_signs_in_once(client, letters, db_session):
     client.cookies.clear()
     assert client.get(path, params={"token": token}).status_code == 200
     assert client.get(path, params={"token": token}).status_code == 401
+    _assert_written_nowhere(written, token)
 
 
 def test_what_the_column_holds_opens_neither_door(client, db_session):
@@ -268,7 +336,22 @@ def test_a_token_that_is_not_text_is_refused_not_a_server_error(client, db_sessi
     assert refused.status_code == 401
 
 
-def test_the_token_printed_by_the_cli_signs_in_and_is_not_stored(db_session, monkeypatch):
+@pytest.fixture
+def cli_logging(monkeypatch, tmp_path) -> Iterator[None]:
+    """`_setup_logging` пишет в `logs/` текущего каталога и меняет общий конфиг."""
+    monkeypatch.chdir(tmp_path)
+    root = logging.getLogger()
+    saved = (root.handlers[:], root.level)
+    yield
+    for handler in root.handlers:
+        handler.close()
+    root.handlers[:], root.level = saved[0], saved[1]
+    structlog.reset_defaults()
+
+
+def test_the_token_printed_by_the_cli_signs_in_and_is_not_stored(
+    cli_logging, db_session, monkeypatch
+):
     user = _add_user(db_session)
     factory = sessionmaker(db_session.get_bind(), expire_on_commit=False)
     monkeypatch.setattr(storage, "init_db", lambda: None)
