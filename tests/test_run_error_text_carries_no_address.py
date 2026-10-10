@@ -567,14 +567,14 @@ def test_nothing_in_src_writes_the_error_text_past_the_model():
     )
 
 
-def test_no_workflow_block_writes_the_error_text_past_the_model():
-    """Блоки в workflow пишут эти колонки тоже (`recover-interrupted-empty-run.yml`),
-    и на сервере — выложенным кодом моделей: мимо ORM валидатор их не увидит."""
-    from tests.test_workflow_python_reaches_no_person import CODE, WORKFLOWS, python_runs
+def workflow_writes_past_the_model(workflows: dict[str, str]) -> tuple[list[str], int]:
+    """Где код, который запускает workflow, пишет колонку мимо модели, — и сколько
+    кусков кода прочитано."""
+    from tests.test_workflow_python_reaches_no_person import CODE, python_runs
 
     found, read = [], 0
-    for path in sorted(WORKFLOWS.glob("*.y*ml")):
-        for run in python_runs(path.read_text(encoding="utf-8")):
+    for name, workflow in workflows.items():
+        for run in python_runs(workflow):
             if run.kind != CODE:
                 continue
             try:
@@ -582,12 +582,40 @@ def test_no_workflow_block_writes_the_error_text_past_the_model():
             except SyntaxError:
                 continue  # об этом — тест о запусках Python в workflow
             read += 1
-            found += [f"{path.name}:{run.line} ({run.origin}), строка кода {n}" for n in lines]
+            found += [f"{name}:{run.line} ({run.origin}), строка кода {n}" for n in lines]
+    return found, read
+
+
+def test_no_workflow_block_writes_the_error_text_past_the_model():
+    """Блоки в workflow пишут эти колонки тоже (`recover-interrupted-empty-run.yml`),
+    и на сервере — выложенным кодом моделей: мимо ORM валидатор их не увидит."""
+    from tests.test_workflow_python_reaches_no_person import WORKFLOWS
+
+    found, read = workflow_writes_past_the_model(
+        {path.name: path.read_text(encoding="utf-8") for path in sorted(WORKFLOWS.glob("*.y*ml"))}
+    )
     assert read, "Ни одного блока Python в workflow не прочитано: разбор ослеп."
     assert found == [], (
         f"Код, который запускает workflow, пишет колонку с текстом ошибки мимо модели: "
         f"{'; '.join(found)}. Пиши через модель (`run.error_message = …`) — тогда "
         "текст почистит валидатор колонки."
+    )
+
+
+def test_the_check_reads_the_blocks_of_a_workflow():
+    through_the_model = "python - <<'PY'\nrun.error_message = str(error)\nPY\n"
+    past_the_model = (
+        "echo start\n"
+        "python - <<'PY'\n"
+        "import os\n"
+        "session.execute(update(Run).values(error_message=str(error)))\n"
+        "PY\n"
+        "python -m pip install x\n"
+    )
+    assert workflow_writes_past_the_model({"a.yml": through_the_model}) == ([], 1)
+    assert workflow_writes_past_the_model({"a.yml": past_the_model}) == (
+        ["a.yml:2 (блок), строка кода 2"],
+        1,
     )
 
 

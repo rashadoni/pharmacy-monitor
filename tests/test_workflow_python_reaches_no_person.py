@@ -1265,6 +1265,8 @@ def test_the_check_finds_python_behind_every_form_of_run(text, kinds):
         ("cat x.py | docker run -i python:3.12-slim\n", [1]),
         # Шаблон интерпретатора слово не узнал — строки нет ни в одном списке.
         ("echo ok\npythonw job.py\n", [2]),
+        # Дефис без слова перед ним интерпретатор частью другого слова не делает.
+        ('${CMD[*]}-python3 "$SCRIPT"\n', [1]),
         # …даже если на той же строке стоит слово, о котором разбор решил.
         ('test -x .venv/bin/python && pythonw "$SCRIPT"\n', [1]),
         ("/usr/bin/micropython job.py\n", [1]),
