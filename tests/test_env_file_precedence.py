@@ -434,27 +434,27 @@ SECRETS = (
     "omega-other-7",
     "weird-switch-8",
     "sigmaTau",
+    "http_proxy",
     "QUJDREVGRw",
     "MFRGGZDFMZTWQ2LKCANARYSECRET",
     "TOKEN",
     "hunter2",
     "upsilon-key-9",
-    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
     "KEY_BODY",
-    "O_AFTER",
 )
 
+# Простой файл: каждая строка — пустая, комментарий или `ИМЯ=значение`.
 ENV_FILE_TEXT = (
     "A_SAME=alpha-value-1\n"
     'B_DIFF="beta-file-2"\n'
     "export C_ONLY=gamma-only-3\n"
     "# комментарий\n"
+    "\n"
     'D_QUOTED="delta 4"\n'
     "E_BACKSLASH=eps\\ilon\n"
     "F_DOLLAR=zeta$eta\n"
     "G_HASH=theta#iota\n"
     "H_INNER_QUOTE=kappa'lambda\n"
-    "I_SYSTEMD_EXPORT=alpha-value-1\n"
     "J_SERVER_QUOTED=alpha-value-1\n"
     "K_CASE=alpha-value-1\n"
     "L_NBSP=alpha-value-1\n"
@@ -462,27 +462,18 @@ ENV_FILE_TEXT = (
     "PORT=8080\n"
     "Q_CR=alpha-value-1\n"
     "R_EDGE_SPACE=alpha-value-1\n"
-    "SCRAPE_REPORT_EMAIL=1\n"
-    # Дальше — то, что именем не считается: печататься не должно ничего.
-    "sigmaTau=alpha-value-1\n"  # строчные буквы в имени
+    "  SCRAPE_REPORT_EMAIL=1  \n"
+    # Дальше — имена, которые не печатаются: только считаются.
+    "sigmaTau=alpha-value-1\n"  # строчные буквы
+    "http_proxy=alpha-value-1\n"  # строчные, хоть и с подчёркиванием
     "QUJDREVGRw==\n"  # хвост значения, оборванного переводом строки
     "MFRGGZDFMZTWQ2LKCANARYSECRET====\n"  # такой же хвост, но целиком прописными
     "TOKEN=alpha-value-1\n"  # без подчёркивания, и в файле секретов такого имени нет
-    "postgresql://pm:hunter2@localhost/db?sslmode=require\n"
-    "'upsilon-key-9'=x\n"
-    "просто строка без знака равенства\n"
-    # Значение на несколько строк: с этой строки файл по строкам не читается.
-    'N_MULTILINE="-----BEGIN PRIVATE KEY-----\n'
-    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC=\n"
-    "KEY_BODY=alpha-value-1\n"  # выглядит как имя, но это середина значения
-    '-----END PRIVATE KEY-----"\n'
-    "O_AFTER=alpha-value-1\n"
 )
-MULTILINE_STARTS_AT = ENV_FILE_TEXT.count("\n", 0, ENV_FILE_TEXT.index("N_MULTILINE")) + 1
 
 SERVER_FILE_TEXT = (
     "# файл секретов\n"
-    "; комментарий по-systemd\n"
+    "\n"
     "A_SAME=alpha-value-1\n"
     "B_DIFF=beta-server-9\n"
     "D_QUOTED=delta 4\n"
@@ -490,7 +481,6 @@ SERVER_FILE_TEXT = (
     "F_DOLLAR=zeta-plain\n"
     "G_HASH=theta#iota\n"
     "H_INNER_QUOTE=kappa-plain\n"
-    "export I_SYSTEMD_EXPORT=alpha-value-1\n"  # systemd такую строку пропускает
     'J_SERVER_QUOTED="alpha-value-1"\n'  # службы кавычки снимут, цикл workflow — нет
     "K_CASE=Alpha-Value-1\n"
     f"L_NBSP=alpha-value-1{NBSP}\n"  # хвост, оставленный вставкой из чата
@@ -508,7 +498,7 @@ SERVER_FILE_TEXT = (
     "Z_OTHER=omega-other-7\n"
 )
 
-EXPECTED_NAMES = f"""\
+EXPECTED_NAMES = """\
   A_SAME               same
   B_DIFF               differs
   C_ONLY               absent
@@ -517,21 +507,21 @@ EXPECTED_NAMES = f"""\
   F_DOLLAR             unsure
   G_HASH               unsure
   H_INNER_QUOTE        unsure
-  I_SYSTEMD_EXPORT     absent
   J_SERVER_QUOTED      unsure
   K_CASE               differs
   L_NBSP               unsure
   M_EMPTY              same
-  N_MULTILINE          absent
   PORT                 same
   Q_CR                 unsure
   R_EDGE_SPACE         unsure
   SCRAPE_REPORT_EMAIL  absent
-  other lines, not shown: 7
-  not read from line {MULTILINE_STARTS_AT} on - an open quote or a line continuation \
-(4 more lines): read the rest by hand
+  names not shown: 5
 """
-SERVER_SUMMARY = "21 names, 1 other lines"
+SERVER_NAMES = 21
+NOT_PLAIN = (
+    "  NOT a plain NAME=value file from line {line} on (a quote without its pair, a line "
+    "continuation, a control or non-ASCII character, or a line that is not NAME=value)\n"
+)
 
 
 @dataclass(frozen=True)
@@ -605,6 +595,10 @@ def _names(server: Server, count: int, path: Path | None = None) -> str:
     return f"names in {path or server.stray} ({count}), against the server file:"
 
 
+def _server_line(server: Server, count: int) -> str:
+    return f"server file {server.env}: {count} names"
+
+
 def _found_line(path: Path, kind: str = "FOUND") -> str:
     import grp
     import pwd
@@ -624,8 +618,8 @@ def test_diag_names_every_variable_and_its_relation_to_the_server_file(server: S
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
-    assert _section(result.stdout, _names(server, 18)) == EXPECTED_NAMES
-    assert f"server file {server.env}: {SERVER_SUMMARY}\n" in result.stdout
+    assert _section(result.stdout, _names(server, 16)) == EXPECTED_NAMES
+    assert _section(result.stdout, _server_line(server, SERVER_NAMES)) == ""
 
 
 def test_diag_prints_exactly_this_and_nothing_else(server: Server) -> None:
@@ -643,14 +637,13 @@ def test_diag_prints_exactly_this_and_nothing_else(server: Server) -> None:
     assert result.stdout == (
         f"python-dotenv in {server.root}/.venv: not found\n"
         f"deployed {server.root}/src/main.py: new rule - own checkout root only, "
-        "the environment wins\n"
-        f"server file {server.env}: {SERVER_SUMMARY}\n"
+        "the environment wins\n" + _server_line(server, SERVER_NAMES) + "\n"
         "where a path-less load_dotenv() looked, from the deployed code:\n"
         f"  {server.root}/src/.env  -\n"
         + _found_line(server.stray)
         + "".join(f"  {path}  -\n" for path in above)
         + f"  {server.root}/migrations/.env  -\n"
-        + _names(server, 18)
+        + _names(server, 16)
         + "\n"
         + EXPECTED_NAMES
         + f"units under {server.units} whose EnvironmentFile is a .env next to the code:\n"
@@ -663,65 +656,110 @@ def test_diag_prints_exactly_this_and_nothing_else(server: Server) -> None:
     )
 
 
-def test_diag_stops_where_a_file_can_no_longer_be_read_line_by_line(server: Server) -> None:
-    """После открытой кавычки имя от продолжения значения не отличить — дальше не читаем."""
-    for opening in (
-        'NOTE_TEXT="first \\" still open\n',  # кавычка под обратной косой чертой не закрывает
-        "NOTE_TEXT='one\n",  # одинарная
-        'NOTE_TEXT="a" "b\n',  # закрыта и открыта снова
-        'NOTE_TEXT="closed" # а дальше комментарий\n',  # читается, но не нами
-    ):
-        server.stray.write_text(
-            "A_SAME=alpha-value-1\n" + opening + "KEY_BODY=alpha-value-1\nend of note\"'\n"
-        )
-        result = _diag(server)
+# Строки `.env`, после которых файлу нельзя верить построчно. В каждой — причина,
+# по которой настоящий python-dotenv прочёл бы файл иначе, чем «по строке на имя».
+NOT_PLAIN_ENV_LINES = [
+    "postgresql://pm:hunter2@localhost/db?sslmode=require",  # не имя
+    "просто строка без знака равенства",
+    "'upsilon-key-9'=x",  # имя в кавычках python-dotenv принимает
+    "'A_SAME'=beta-file-2",  # …и так переопределяет имя, названное выше
+    "'note",  # незакрытое имя в кавычках тянется на следующие строки
+    'N_MULTILINE="-----BEGIN PRIVATE KEY-----',  # значение на несколько строк
+    'NOTE_TEXT="first \\" still open',  # кавычка под обратной косой чертой не закрывает
+    "NOTE_TEXT='one",
+    'NOTE_TEXT="a" "b',  # закрыта и открыта снова
+    'NOTE_TEXT="closed" # а дальше комментарий',  # читается, но не нами
+    "W_A=1\rA_SAME=beta-file-2",  # CR посреди строки для python-dotenv — перевод строки
+    f"{NBSP}A_SAME=beta-file-2",  # пробелом он считает и это, и срезает перед именем
+    "\x0cA_SAME=beta-file-2",
+    " A_SAME=beta-file-2",
+    "export\x0bA_SAME=beta-file-2",
+    f"A_SAME{NBSP}=beta-file-2",
+    "A_SAME = beta-file-2",
+    f'W_A={NBSP}"abc',
+    "W_A=a\tb",
+    "W_A=é",
+]
 
-        assert result.returncode == 0, result.stderr
-        assert _section(result.stdout, _names(server, 2)) == (
-            "  A_SAME     same\n"
-            "  NOTE_TEXT  absent\n"
-            "  other lines, not shown: 0\n"
-            "  not read from line 2 on - an open quote or a line continuation "
-            "(2 more lines): read the rest by hand\n"
-        ), opening
-        assert "KEY_BODY" not in result.stdout
+
+@pytest.mark.parametrize("line", NOT_PLAIN_ENV_LINES)
+def test_diag_answers_unsure_for_an_env_file_that_is_not_plain(server: Server, line: str) -> None:
+    """Ниже странной строки может быть и продолжение значения, и второе определение имени."""
+    text = f"A_SAME=alpha-value-1\n# комментарий\n{line}\nKEY_BODY=alpha-value-1\n"
+    server.stray.write_text(text, encoding="utf-8", newline="")
+
+    result = _diag(server)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.isascii()
+    assert _section(result.stdout, _names(server, 1)) == (
+        "  A_SAME  unsure\n"
+        "  names not shown: 0\n"
+        + NOT_PLAIN.format(line=3)
+        + "  the file was not read past that line: every answer above is unsure\n"
+    )
+    for secret in SECRETS:
+        assert secret not in result.stdout
 
 
-def test_diag_does_not_call_a_name_absent_or_same_past_a_break_in_the_server_file(
-    server: Server,
+# То же для файла секретов: его читают systemd и цикл в workflow, и оба — по-своему.
+NOT_PLAIN_SERVER_LINES = [
+    "W_JOINED=abc\\",  # systemd приклеит следующую строку
+    "W_JOINED=it's",  # кавычку он открывает и посреди значения
+    'W_JOINED="a" "b',
+    "# комментарий с продолжением\\",
+    "W_A=1\rA_SAME=beta-file-2",
+    " A_SAME=beta-file-2",  # systemd пробел срежет и имя переопределит; цикл остановится
+    "A_SAME+=tail",  # цикл допишет к значению, systemd строку пропустит
+    "A_SAME",  # цикл выставит имя самому себе
+    "export A_SAME=beta-file-2",  # systemd пропустит, цикл остановится
+    "; комментарий по-systemd",  # для цикла это не комментарий
+    " # комментарий с отступом",
+    "   ",
+]
+
+
+@pytest.mark.parametrize("line", NOT_PLAIN_SERVER_LINES)
+def test_diag_compares_nothing_against_a_server_file_that_is_not_plain(
+    server: Server, line: str
 ) -> None:
-    """systemd приклеивает строку после `\\` и открывает кавычку посреди значения."""
     server.stray.write_text("A_SAME=alpha-value-1\nB_DIFF=beta-file-2\nC_ONLY=gamma-only-3\n")
-    for breaking in ("W_JOINED=abc\\\n", "W_JOINED=it's\n", 'W_JOINED="a" "b\n'):
-        server.env.write_text("A_SAME=alpha-value-1\n" + breaking + "B_DIFF=beta-file-2\n")
-        result = _diag(server)
+    text = f"A_SAME=alpha-value-1\n{line}\nB_DIFF=beta-file-2\n"
+    server.env.write_text(text, encoding="utf-8", newline="")
 
-        assert result.returncode == 0, result.stderr
-        assert _section(result.stdout, f"server file {server.env}: 2 names, 0 other lines") == (
-            "  not read from line 2 on - an open quote or a line continuation "
-            "(1 more lines): read the rest by hand\n"
-        ), breaking
-        assert _section(result.stdout, _names(server, 3)) == (
-            "  A_SAME  same\n  B_DIFF  unsure\n  C_ONLY  unsure\n  other lines, not shown: 0\n"
-        ), breaking
+    result = _diag(server)
+
+    assert result.returncode == 0, result.stderr
+    assert _section(result.stdout, _server_line(server, 1)) == (
+        NOT_PLAIN.format(line=2)
+        + "  nothing can be compared against it: every answer below is unsure\n"
+    )
+    # Ни `same`, ни `absent`: имя может стоять ниже строки, на которой чтение кончилось.
+    assert _section(result.stdout, _names(server, 3)) == (
+        "  A_SAME  unsure\n  B_DIFF  unsure\n  C_ONLY  unsure\n  names not shown: 0\n"
+    )
 
 
 @pytest.mark.parametrize(
     ("in_env", "in_server"),
     [
-        ("X_ONE=abc", f"X_ONE=abc{NBSP}"),  # python-dotenv срежет, systemd оставит
+        ("X_ONE=abc", f"X_ONE=abc{NBSP}"),  # python-dotenv срезал бы, systemd оставит
         ("X_ONE=abc", f"X_ONE={NBSP}abc"),
         ("X_ONE=abc", "X_ONE=abc "),
-        ("X_ONE=abc\x0b", "X_ONE=abc\x0b"),
         ("X_ONE=abc", "X_ONE=abc\x1f"),
-        ("X_ONE=abc\x0cone", "X_ONE=abc\x0ctwo"),
-        ("X_ONE=abc\x0cY_TWO=tail", "X_ONE=abc"),  # не две строки: Y_TWO — часть значения
-        ("X_ONE=abc Y_TWO=tail", "X_ONE=abc"),
-        ("X_ONE=abc\rY_TWO=tail", "X_ONE=abc"),
-        ("X_ONE=a`b", "X_ONE=a`b"),
-        ("X_ONE='abc'", "X_ONE='abc'"),  # кавычки в файле секретов цикл workflow не снимает
+        ("X_ONE=ab", "X_ONE=a\tb"),
+        ("X_ONE=abc", "X_ONE=é"),
+        ("X_ONE=abc", "X_ONE=abc "),  # края systemd срежет, цикл workflow оставит
+        ("X_ONE=abc", "X_ONE= abc"),
+        ("X_ONE=abc", "X_ONE=abc\r"),
+        ("X_ONE='abc'", "X_ONE='abc'"),  # кавычки тоже: systemd снимет, цикл нет
         ("X_ONE=abc", 'X_ONE="abc"'),
-        ("X_ONE=é", "X_ONE=é"),
+        ("X_ONE=a\\b", "X_ONE=a\\b"),
+        ("X_ONE=a$b", "X_ONE=a$b"),
+        ("X_ONE=a#b", "X_ONE=a#b"),
+        ("X_ONE=a`b", "X_ONE=a`b"),
+        ('X_ONE="a$b"', "X_ONE=a$b"),
+        ("X_ONE=a'b", "X_ONE=ab"),
     ],
 )
 def test_diag_is_unsure_about_values_readers_would_not_agree_on(
@@ -734,10 +772,39 @@ def test_diag_is_unsure_about_values_readers_would_not_agree_on(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.isascii()
+    assert _section(result.stdout, _server_line(server, 1)) == ""  # файл секретов простой
+    assert _section(result.stdout, _names(server, 1)) == "  X_ONE  unsure\n  names not shown: 0\n"
+
+
+@pytest.mark.parametrize(
+    ("in_env", "in_server", "answer"),
+    [
+        ("X_ONE=abc", "X_ONE=abc", "same"),
+        ('X_ONE="a b"', "X_ONE=a b", "same"),  # кавычки в `.env` python-dotenv снимает
+        ("X_ONE='a b'", "X_ONE=a b", "same"),
+        ("  export X_ONE= abc  ", "X_ONE=abc", "same"),
+        ("X_ONE=abc\r", "X_ONE=abc", "same"),  # CRLF в `.env`
+        ("X_ONE=abc\nX_ONE=xyz", "X_ONE=xyz", "same"),  # действует последнее определение
+        ("X_ONE=abc", "X_ONE=abc\nX_ONE=xyz", "differs"),
+        ("X_ONE=abc", "X_ONE=ABC", "differs"),
+        ("X_ONE=a b", "X_ONE=a  b", "differs"),
+        ("X_ONE=", "X_ONE=0", "differs"),
+        ("X_ONE=abc", "Y_TWO=abc", "absent"),
+        ("X_ONE=abc", "x_one=abc", "absent"),
+    ],
+)
+def test_diag_compares_plain_values_exactly(
+    server: Server, in_env: str, in_server: str, answer: str
+) -> None:
+    server.stray.write_text(in_env + "\n", encoding="utf-8", newline="")
+    server.env.write_text(in_server + "\n", encoding="utf-8", newline="")
+
+    result = _diag(server)
+
+    assert result.returncode == 0, result.stderr
     assert _section(result.stdout, _names(server, 1)) == (
-        "  X_ONE  unsure\n  other lines, not shown: 0\n"
+        f"  X_ONE  {answer}\n  names not shown: 0\n"
     )
-    assert "Y_TWO" not in result.stdout
 
 
 def test_diag_says_when_a_file_is_not_valid_utf8(server: Server) -> None:
@@ -747,12 +814,13 @@ def test_diag_says_when_a_file_is_not_valid_utf8(server: Server) -> None:
     result = _diag(server)
 
     assert result.returncode == 0, result.stderr
-    assert _section(result.stdout, f"server file {server.env}: 1 names, 0 other lines") == (
+    assert _section(result.stdout, _server_line(server, 1)) == (
         "  NOT valid UTF-8: systemd would refuse this file\n"
     )
-    assert _section(result.stdout, _names(server, 1)) == (
-        "  X_ONE  unsure\n"
-        "  other lines, not shown: 0\n"
+    assert _section(result.stdout, _names(server, 0)) == (
+        "  names not shown: 0\n"
+        + NOT_PLAIN.format(line=1)
+        + "  the file was not read past that line: every answer above is unsure\n"
         "  NOT valid UTF-8: python-dotenv would fail on this file\n"
     )
 
@@ -850,10 +918,10 @@ def test_diag_looks_above_the_code_and_under_migrations(server: Server) -> None:
 
     assert result.returncode == 0, result.stderr
     assert _section(result.stdout, _names(server, 2, above)) == (
-        "  A_SAME   same\n  L_ABOVE  absent\n  other lines, not shown: 0\n"
+        "  A_SAME   same\n  L_ABOVE  absent\n  names not shown: 0\n"
     )
     assert _section(result.stdout, _names(server, 1, under)) == (
-        "  B_DIFF  differs\n  other lines, not shown: 0\n"
+        "  B_DIFF  differs\n  names not shown: 0\n"
     )
 
 
@@ -937,9 +1005,7 @@ def test_diag_does_not_compare_what_is_not_a_readable_file(server: Server) -> No
     result = _diag(server)
     assert result.returncode == 0, result.stderr
     assert _found_line(stray, "FOUND (symlink)") in result.stdout
-    assert _section(result.stdout, _names(server, 1)) == (
-        "  A_SAME  same\n  other lines, not shown: 0\n"
-    )
+    assert _section(result.stdout, _names(server, 1)) == "  A_SAME  same\n  names not shown: 0\n"
 
     stray.unlink()
     stray.write_text(ENV_FILE_TEXT, encoding="utf-8")

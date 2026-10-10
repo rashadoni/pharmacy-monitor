@@ -12,13 +12,14 @@
     absent   в файле секретов такого имени нет
     unsure   сравнить нельзя: значение разные читатели поймут по-разному
 
-Ответ `same` и `differs` даётся, только когда оба значения — печатные знаки ASCII
-без обратной косой черты, `$`, `#` и кавычек внутри, а в файле секретов ещё и без
-кавычек вокруг, без пробелов и CR по краям строки: systemd их снимает, а цикл,
-которым файл читают workflow, — нет.
-Всё остальное — `unsure`. Строка с незакрытой кавычкой или с обратной косой чертой
-в конце останавливает чтение файла: дальше не понять, где имя, а где продолжение
-значения, — об этом сказано отдельной строкой, и остаток файла смотрят глазами.
+Ответ, отличный от `unsure`, даётся, только когда оба файла простые — каждая
+строка пустая, комментарий или `ИМЯ=значение`, — а оба значения состоят из
+печатных знаков ASCII без обратной косой черты, `$`, `#` и кавычек внутри; в файле
+секретов ещё и без кавычек вокруг, без пробелов и CR по краям строки: systemd их
+снимает, а цикл, которым файл читают workflow, — нет. Первая же строка иного вида
+останавливает чтение файла: ниже неё может быть и продолжение значения, и второе
+определение имени, названного выше. Об этом сказано отдельной строкой, все ответы
+по такому файлу — `unsure`, и смотрят его глазами.
 
 Ещё скрипт говорит: какому правилу следует выложенный `src/main.py`; называет ли
 `.env` какой-нибудь юнит своим `EnvironmentFile`; какие из имён задаёт строка
@@ -27,7 +28,7 @@
 
 Только чтение. Значений не печатает, в том числе при ошибке — о сбое сказано
 классом исключения. Имя печатается, если оно записано ПРОПИСНЫМИ и в нём есть
-подчёркивание либо такое же имя стоит в файле секретов; остальные строки только
+подчёркивание либо такое же имя стоит в файле секретов; остальные имена только
 считаются. Причина: хвост оборванного значения (`…==` на своей строке) для любого
 разбора тоже выглядит как `ИМЯ=значение`. Предел, который остаётся: обрывок из
 одних прописных букв, цифр и подчёркиваний от имени не отличить — незнакомое имя
@@ -84,6 +85,10 @@ def _ascii(text: object) -> str:
     )
 
 
+def _printable(text: str) -> bool:
+    return all(" " <= ch <= "~" for ch in text)
+
+
 def _clean_pair(value: str) -> bool:
     """Значение в одной паре кавычек, внутри которой нет ни кавычек, ни `\\`."""
     return (
@@ -94,47 +99,79 @@ def _clean_pair(value: str) -> bool:
     )
 
 
-def _stops_line_reading(value: str, *, dotenv: bool) -> bool:
-    """После такого значения строки файла уже нельзя читать по одной.
-
-    python-dotenv: значение, начатое кавычкой, может идти на несколько строк.
-    systemd: кавычка открывается и посреди значения, а обратная косая черта в
-    конце строки приклеивает следующую.
-    """
-    if dotenv:
-        return value.startswith(tuple(_QUOTES)) and not _clean_pair(value)
-    if value.endswith("\\"):
-        return True
-    return any(mark in value for mark in _QUOTES) and not _clean_pair(value)
-
-
-def _comparable(value: str, *, quotes_are_stripped: bool) -> str | None:
-    """Значение, которое все читатели файла получат одинаковым; иначе None."""
-    if _clean_pair(value):
-        if not quotes_are_stripped:
-            return None
-        value = value[1:-1]
-    if any(not " " <= ch <= "~" or ch in _READ_DIFFERENTLY + _QUOTES for ch in value):
+def _comparable(value: str) -> str | None:
+    """Значение без знаков, которые читатели файла понимают по-разному; иначе None."""
+    if not _printable(value) or any(mark in value for mark in _READ_DIFFERENTLY + _QUOTES):
         return None
     return value
+
+
+# Строка файла — одно из четырёх: пустая, комментарий, `ИМЯ=значение` в самом
+# простом виде или «другое». «Другое» — всё, что хоть один читатель файла может
+# понять не как одну строку с одним именем: кавычка без пары, значение на
+# несколько строк, `\` в конце, CR или знак вне печатных ASCII (python-dotenv
+# считает пробелом и неразрывный пробел, и перевод страницы — и молча срезает
+# их перед именем), имя в кавычках, строка без `=`. После первой такой строки
+# файлу нельзя верить построчно: ниже может быть и продолжение значения, и второе
+# определение имени, названного выше.
+BLANK, COMMENT, ASSIGNMENT, OTHER = "blank", "comment", "assignment", "other"
+
+
+def _dotenv_line(raw: str) -> tuple[str, str, str | None]:
+    """Строка `.env` так, как её поймёт python-dotenv."""
+    line = raw[:-1] if raw.endswith("\r") else raw
+    if "\r" in line:
+        return OTHER, "", None
+    line = line.strip(" \t")
+    if not line:
+        return BLANK, "", None
+    if line[0] == "#":
+        return COMMENT, "", None
+    if not _printable(line):
+        return OTHER, "", None
+    if line.startswith("export "):
+        line = line[len("export ") :].lstrip(" ")
+    name, separator, value = line.partition("=")
+    if not separator or not _NAME.fullmatch(name):
+        return OTHER, "", None
+    value = value.lstrip(" ")
+    if value[:1] in tuple(_QUOTES):
+        if not _clean_pair(value):
+            return OTHER, "", None
+        value = value[1:-1]
+    return ASSIGNMENT, name, _comparable(value)
+
+
+def _systemd_line(raw: str) -> tuple[str, str, str | None]:
+    """Строка файла секретов так, как её поймут и systemd, и цикл в workflow."""
+    if not raw:
+        return BLANK, "", None
+    if "\r" in raw[:-1]:
+        return OTHER, "", None
+    if raw[0] == "#":
+        # Комментарий с `\` в конце systemd продолжает на следующую строку.
+        return (OTHER if raw.rstrip("\r").endswith("\\") else COMMENT), "", None
+    line = raw[:-1] if raw.endswith("\r") else raw
+    name, separator, value = line.partition("=")
+    if not separator or not _NAME.fullmatch(name):
+        return OTHER, "", None
+    if value.endswith("\\") or (any(q in value for q in _QUOTES) and not _clean_pair(value)):
+        return OTHER, "", None
+    if line != raw or value != value.strip(" \t"):
+        # CR и пробелы по краям systemd отбросит, а цикл workflow оставит в значении.
+        return ASSIGNMENT, name, None
+    return ASSIGNMENT, name, _comparable(value)
 
 
 @dataclass
 class EnvFile:
     values: dict[str, str | None] = field(default_factory=dict)  # None — есть, но несравнимо
-    skipped: int = 0  # строки до остановки, которые именем не стали
-    stopped_at: int = 0  # номер строки, на которой чтение остановилось; 0 — дочитан
-    left_unread: int = 0  # непустые строки после остановки
+    not_plain_from: int = 0  # номер первой строки вида «другое»; 0 — файл простой
     valid_utf8: bool = True
 
 
 def read_assignments(path: Path, *, dotenv: bool) -> EnvFile:
-    """Имена файла. `dotenv` — правила python-dotenv, иначе правила systemd.
-
-    Различаются они тут в трёх местах: слово `export` перед именем (python-dotenv
-    его принимает, systemd строку пропускает), комментарий с `;` (только systemd)
-    и кавычки вокруг значения (см. `_comparable`).
-    """
+    """Имена файла до первой строки, которую нельзя прочесть как `ИМЯ=значение`."""
     result = EnvFile()
     data = path.read_bytes()
     try:
@@ -142,31 +179,14 @@ def read_assignments(path: Path, *, dotenv: bool) -> EnvFile:
     except UnicodeDecodeError:
         text = data.decode("utf-8", errors="replace")
         result.valid_utf8 = False
+    classify = _dotenv_line if dotenv else _systemd_line
     for number, raw in enumerate(text.split("\n"), start=1):
-        line = raw.strip(" \t\r")
-        if result.stopped_at:
-            result.left_unread += bool(line)
-            continue
-        if not line or line[0] in ("#" if dotenv else "#;"):
-            continue
-        name, separator, value = line.partition("=")
-        name, value = name.strip(" \t"), value.strip(" \t")
-        if dotenv and name[:6] == "export" and name[6:7] in (" ", "\t"):
-            name = name[6:].strip(" \t")
-        named = bool(separator) and bool(_NAME.fullmatch(name))
-        if separator and _stops_line_reading(value, dotenv=dotenv):
-            result.stopped_at = number
-            if named:
-                result.values[name] = None
-            continue
-        if not named:
-            result.skipped += 1
-            continue
-        if not dotenv and raw != f"{name}={value}":
-            # Пробел или CR по краям systemd отбросит, а цикл workflow оставит в значении.
-            result.values[name] = None
-            continue
-        result.values[name] = _comparable(value, quotes_are_stripped=dotenv)
+        kind, name, value = classify(raw)
+        if kind == OTHER:
+            result.not_plain_from = number
+            break
+        if kind == ASSIGNMENT:
+            result.values[name] = value
     return result
 
 
@@ -296,10 +316,11 @@ def scan_units(units: Path, env_files: set[str], names: set[str]) -> UnitScan:
     return scan
 
 
-def _unread_note(env: EnvFile) -> str:
+def _not_plain_note(env: EnvFile) -> str:
     return (
-        f"not read from line {env.stopped_at} on - an open quote or a line continuation "
-        f"({env.left_unread} more lines): read the rest by hand"
+        f"NOT a plain NAME=value file from line {env.not_plain_from} on "
+        "(a quote without its pair, a line continuation, a control or non-ASCII character, "
+        "or a line that is not NAME=value)"
     )
 
 
@@ -313,11 +334,10 @@ def report(root: Path, server_env: Path, units: Path, flags: list[str]) -> tuple
     except OSError as exc:
         lines.append(f"server file {server_env}: cannot read ({type(exc).__name__})")
         return lines, 2
-    lines.append(
-        f"server file {server_env}: {len(server.values)} names, {server.skipped} other lines"
-    )
-    if server.stopped_at:
-        lines.append(f"  {_unread_note(server)}")
+    lines.append(f"server file {server_env}: {len(server.values)} names")
+    if server.not_plain_from:
+        lines.append(f"  {_not_plain_note(server)}")
+        lines.append("  nothing can be compared against it: every answer below is unsure")
     if not server.valid_utf8:
         lines.append("  NOT valid UTF-8: systemd would refuse this file")
 
@@ -348,19 +368,22 @@ def report(root: Path, server_env: Path, units: Path, flags: list[str]) -> tuple
         )
         lines.append(f"names in {path} ({len(printable)}), against the server file:")
         width = max((len(name) for name in printable), default=0)
+        reliable = not (env.not_plain_from or server.not_plain_from)
         for name in printable:
             mine, theirs = env.values[name], server.values.get(name)
-            if name not in server.values:
-                # После остановки файл секретов не дочитан: имя может стоять ниже.
-                status = "unsure" if server.stopped_at else "absent"
+            if not reliable:
+                status = "unsure"
+            elif name not in server.values:
+                status = "absent"
             elif mine is None or theirs is None:
                 status = "unsure"
             else:
                 status = "same" if mine == theirs else "differs"
             lines.append(f"  {name.ljust(width)}  {status}")
-        lines.append(f"  other lines, not shown: {env.skipped + len(env.values) - len(printable)}")
-        if env.stopped_at:
-            lines.append(f"  {_unread_note(env)}")
+        lines.append(f"  names not shown: {len(env.values) - len(printable)}")
+        if env.not_plain_from:
+            lines.append(f"  {_not_plain_note(env)}")
+            lines.append("  the file was not read past that line: every answer above is unsure")
         if not env.valid_utf8:
             lines.append("  NOT valid UTF-8: python-dotenv would fail on this file")
         shown.update(printable)
