@@ -4891,7 +4891,7 @@ def test_recipient_create_issues_login_token(client, auth_cookie, setup_db):
     assert r.status_code == 200, r.text
     u = setup_db.scalar(select(storage.TenantUser).where(storage.TenantUser.email == "invite@x.az"))
     assert u is not None
-    assert u.magic_token is not None  # инвайт выпустил токен на вход
+    assert u.magic_token_hash is not None  # инвайт выпустил токен на вход
     assert u.magic_token_expires_at is not None
 
 
@@ -4926,7 +4926,7 @@ def test_send_login_link_ok(client, auth_cookie, setup_db):
     assert r.status_code == 200, r.text
     assert r.json()["email"] == "reuse@x.az"
     s.refresh(u)
-    assert u.magic_token is not None
+    assert u.magic_token_hash is not None
 
 
 def test_send_login_link_404(client, auth_cookie):
@@ -4976,7 +4976,7 @@ def test_set_password_valid_token_sets_hash_and_cookie(client, setup_db):
     s.refresh(u)
     assert u.password_hash
     assert api_module._verify_bcrypt("mypass123", u.password_hash)
-    assert u.magic_token is None  # одноразовый — погашен
+    assert u.magic_token_hash is None  # одноразовый — погашен
 
 
 def test_set_password_invalid_token_401(client, setup_db):
