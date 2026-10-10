@@ -137,7 +137,7 @@ cat /etc/ssh/sshd_config | grep -iE "(password|permitroot)"
 
 - [ ] Pydantic validation rejects malformed input (test with garbage payloads)
 - [ ] No PII in Sentry events (`send_default_pii=False`)
-- [ ] No PII in journald logs, and no login-link tokens either. **Known open item (2026-10-10):** the application log is clean, but the Caddy access log records the request URL with `?token=…`
+- [ ] No PII in journald logs, and no login-link tokens either. **Known open item (2026-10-10):** the application's own log calls carry no token, but both access logs record the request URL with `?token=…` — Caddy for every link, uvicorn for `/auth/verify` (after the token is spent)
 - [ ] File uploads (if any) — size-limited, MIME-checked
 - [ ] CLI commands that delete data (`db-check --fix`, `inventory truncate`) require explicit `--confirm` flag (manual review)
 
@@ -148,7 +148,8 @@ grep -rn "send_default_pii" src/observability.py
 
 # Verify login-link tokens are not logged — application log and both access logs:
 journalctl -u pharmacy-monitor-api -u caddy --since "30 days ago" | grep -c 'token='
-# Expect 0. On prod 2026-10-10: 49, all from the Caddy access log.
+# Expect 0 once both access logs drop the query string. On prod 2026-10-10: 49, all from the
+# Caddy access log — 41 `set-password?token=` and 8 probes of a path this app does not serve.
 ```
 
 ## Dependencies

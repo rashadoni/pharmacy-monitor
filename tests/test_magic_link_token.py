@@ -8,7 +8,7 @@
 Что здесь проверяется:
 
 - токена нет ни в строке пользователя, ни в одном запросе к базе (в любую
-  таблицу), ни в журнале приложения;
+  таблицу), ни в журнале приложения, ни в ответе того, кто ссылку выдал;
 - токен из письма входит один раз и полчаса; новая ссылка гасит прежнюю;
 - содержимое колонки токеном не служит — ни хеш, ни токен, записанный открытым
   текстом прежним кодом;
@@ -26,6 +26,7 @@ import logging
 import re
 from collections.abc import Callable, Iterator
 from datetime import timedelta
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -66,28 +67,43 @@ def _row(session: Session, user: TenantUser) -> dict:
     )
 
 
-def _assert_only_the_hash_is_stored(session: Session, user: TenantUser, token: str) -> None:
+def _assert_only_the_hash_is_stored(
+    session: Session, user: TenantUser, token: str, *, minutes: int = 30
+) -> None:
+    """В строке — хеш токена и срок, который назвали при выдаче."""
     row = _row(session, user)
     assert row["magic_token"] == _sha256(token)
     assert token not in repr(row)
+    session.refresh(user)
+    left = user.magic_token_expires_at - utcnow()
+    assert timedelta(minutes=minutes - 1) < left <= timedelta(minutes=minutes)
 
 
 @pytest.fixture
-def written(db_session) -> Iterator[Callable[[], list[str]]]:
-    """Всё, что сервер записал за тест: запросы к базе с параметрами и журнал.
+def written(db_session, caplog, capsys) -> Iterator[Callable[[], list[str]]]:
+    """Всё, что сервер записал за тест: запросы к базе с параметрами, журнал, печать.
 
     Параметры запроса — тоже запись: база кладёт их в текст своей ошибки.
     """
     queries: list[str] = []
+    printed: list[str] = []
 
     def record(conn, cursor, statement, parameters, context, executemany):
         queries.append(f"{statement} {parameters!r}")
 
+    def everything() -> list[str]:
+        printed.extend(capsys.readouterr())
+        return [*queries, *(repr(entry) for entry in entries), caplog.text, *printed]
+
+    # Адрес запроса пишет в журнал и сам тестовый клиент — это не сервер.
+    # Порядок важен: `set_level` каждый раз выставляет уровень и самому сборщику.
+    caplog.set_level(logging.WARNING, logger="httpx")
+    caplog.set_level(logging.DEBUG)
     engine = db_session.get_bind()
     event.listen(engine, "before_cursor_execute", record)
     try:
         with capture_logs() as entries:
-            yield lambda: queries + [repr(entry) for entry in entries]
+            yield everything
     finally:
         event.remove(engine, "before_cursor_execute", record)
 
@@ -262,10 +278,12 @@ def _sign_in_as_admin(client: TestClient, session: Session) -> TenantUser:
 def test_a_requested_login_link_signs_in_once(client, letters, db_session, written):
     user = _add_user(db_session, password_hash=api_module._hash_bcrypt(PASSWORD))
 
-    assert client.post("/auth/request", json={"email": ADDRESS}).status_code == 200
+    requested = client.post("/auth/request", json={"email": ADDRESS})
 
+    assert requested.status_code == 200
     path, token = _link_in(letters[0])
     assert path == "/auth/verify"
+    assert token not in requested.text
     _assert_only_the_hash_is_stored(db_session, user, token)
     first = client.get(path, params={"token": token})
     assert first.status_code == 200 and first.json()["user_id"] == user.id
@@ -283,6 +301,7 @@ def test_an_invitation_sets_a_password_once(client, letters, db_session, written
     user = db_session.get(TenantUser, created.json()["id"])
     path, token = _link_in(letters[0])
     assert path == "/set-password"
+    assert token not in created.text
     _assert_only_the_hash_is_stored(db_session, user, token)
     client.cookies.clear()
     first = client.post("/auth/set-password", json={"token": token, "new_password": PASSWORD})
@@ -302,6 +321,7 @@ def test_a_link_resent_by_an_admin_signs_in_once(client, letters, db_session, wr
 
     assert resent.status_code == 200, resent.text
     path, token = _link_in(letters[0])
+    assert token not in resent.text
     _assert_only_the_hash_is_stored(db_session, user, token)
     client.cookies.clear()
     assert client.get(path, params={"token": token}).status_code == 200
@@ -357,9 +377,13 @@ def test_the_token_printed_by_the_cli_signs_in_and_is_not_stored(
     monkeypatch.setattr(storage, "init_db", lambda: None)
     monkeypatch.setattr(storage, "make_session", lambda: factory)
 
-    result = CliRunner().invoke(main.cli, ["tenant", "issue-token", ADDRESS])
+    result = CliRunner().invoke(main.cli, ["tenant", "issue-token", ADDRESS, "--ttl-min", "5"])
 
     assert result.exit_code == 0, result.output
     token = re.search(r"^Token: (\S+)$", result.output, re.MULTILINE).group(1)
-    _assert_only_the_hash_is_stored(db_session, user, token)
+    _assert_only_the_hash_is_stored(db_session, user, token, minutes=5)
+    # Токен печатается оператору один раз; журнал команды его не повторяет.
+    assert result.output.count(token) == 1
+    log_file = Path("logs/app.jsonl")
+    assert not log_file.exists() or token not in log_file.read_text(encoding="utf-8")
     assert tenants.verify_magic_token(db_session, token).id == user.id
