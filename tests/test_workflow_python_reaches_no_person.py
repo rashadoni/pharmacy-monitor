@@ -63,11 +63,12 @@
   запроса, логин прокси.
 
 Не запуском считается только названное явно: `--version`, `-h` — и строка,
-которая ЦЕЛИКОМ, от начала до конца, совпала с одним из шести видов
-(`_LINES_THAT_ONLY_NAME_PYTHON`): проверка файла (`test -x …/python`),
-присваивание одного слова (`PY=…/python`), `command -v`/`which`, установка
-пакетов, `ls`/`ln`, `echo` с простым текстом, где слово `python` стоит
-последним. Где в тексте shell начинается и
+которая ЦЕЛИКОМ, от начала до конца, совпала с видом из
+`_LINES_THAT_ONLY_NAME_PYTHON`. Вид там один — тот, что нужен настоящим
+workflow: проверка файла (`test -x …/python`). Присваивание интерпретатора
+переменной, `command -v python3`, установка пакетов, `echo` со словом `python`
+роняют CI намеренно: каждый такой вид оказывался дырой, а присваивание — первая
+половина обхода через переменную. Где в тексте shell начинается и
 кончается команда, тест не выводит: четыре разбора подряд находили форму, в
 которой такой вывод ошибался и запуск пропадал молча. Поэтому всё остальное —
 запуск: незнакомая форма, строка-упоминание с продолжением (`test -x … && …`)
@@ -143,7 +144,7 @@ _INTERPRETER = re.compile(
 # (`lib/python3.12/site-packages`), образ или ключ (`python:3.12`), поле
 # (`matrix.python`).
 _NOT_THE_INTERPRETER = re.compile(
-    r"[\w.-]*-python[0-9.]*(?:@[\w.]+)?"
+    r"[\w.]+(?:-[\w.]+)*-python[0-9.]*(?:@[\w.]+)?"
     r"|python[0-9.]*-(?=[\w$])[\w.-]*"
     r"|python[0-9.]*(?=/)"
     r"|python(?=:(?:\s|$))"
@@ -156,9 +157,9 @@ _AN_IMAGE_KEY = re.compile(
     re.M,
 )
 # `${PYTHON:-python3}`, `${PY-python3}`: интерпретатор — значением по умолчанию.
-_DEFAULT_OF_A_VARIABLE = re.compile(r"""(\$\{[^}\s:=+-]+:?[-=+])((?:[^\s}"']*/)?python[0-9.]*)\}""")
+_DEFAULT_OF_A_VARIABLE = re.compile(r"""(\$\{[^}\s"']*?:?[-=+])((?:[^\s}"']*/)?python[0-9.]*)\}""")
 # Перенос через «\» посреди слова: `pyth\` + `on3` — одно слово, а не два.
-_A_WORD_BROKEN_BY_A_LINE_BREAK = re.compile(r"\w\\\r?\n[ \t]*\w")
+_A_WORD_BROKEN_BY_A_LINE_BREAK = re.compile(r"([\w./-]+)\\\r?\n[ \t]*([\w./-]+)")
 # Подстановка команды: в блоке без кавычек у `<<TAG` и в `-c "…"` shell исполнит
 # её раньше, чем Python получит код.
 _COMMAND_SUBSTITUTION = re.compile(r"\$\(|`")
@@ -177,40 +178,23 @@ _REDIRECTION = re.compile(r"(?:&>>?|\d*>>?|\d*<(?!<))(.*)$", re.S)
 _END_OF_SHELL_COMMAND = re.compile(r"&&|\|\||[;|\n]")
 
 # Строка, в которой слово `python` ничего не запускает, узнаётся только ЦЕЛИКОМ:
-# от начала до конца она должна быть одним из шести видов. Где в тексте shell
+# от начала до конца она должна быть одним из видов ниже. Где в тексте shell
 # начинается и кончается команда, тест не выводит — четыре разбора подряд
 # находили форму, в которой вывод ошибался, и запуск за ним пропадал молча.
-# Строка, не совпавшая с видом целиком, — запуск: её либо удаётся прочитать,
-# либо она роняет CI. Новый вид дописывают сюда — это видно в дифе теста.
-# Одно слово: путь к интерпретатору, в том числе значением по умолчанию.
-_A_PYTHON = r"""["']?(?:\$\{\w+:?[-=])?[\w./${}-]*python[0-9.]*\}?["']?"""
-_OUTPUT_ELSEWHERE = r"""(?: (?:\d?>>?|&>) ?(?:&\d|"?\$\{?\w+\}?"?|[\w/.-]+))*"""
+# Вид здесь один — тот, что нужен настоящим workflow: проверка файла. Остальные
+# (присваивание, `command -v`, установка пакетов, `ls`, `echo`) были написаны
+# впрок, и каждый оказался дырой; присваивание к тому же — первая половина
+# обхода `"$PY" - <<'PY'`, которого тест не видит. Такая строка роняет CI, пока
+# её вид не допишут сюда целиком — это видно в дифе теста.
+_A_PYTHON = r"""["']?[\w./${}-]*python[0-9.]*["']?"""  # одно слово: путь к интерпретатору
 _LINES_THAT_ONLY_NAME_PYTHON = [
-    re.compile(shape)
-    for shape in (
-        # Проверка файла: `test -x …/python`, `[ ! -x …/python ] || exit 1`.
+    # Проверка файла: `test -x …/python`, `[ ! -x …/python ] || exit 1`.
+    re.compile(
         rf"(?:if )?(?:sudo(?: -u [\w-]+)? )?(?:test|\[\[?) (?:! )?-[a-zA-Z] {_A_PYTHON}(?: \]\]?)?"
-        r"(?:; then| \|\| exit \d+)?",
-        # Присваивание одного слова: `PY=…/python`, `export PYTHON=python3`.
-        rf"(?:export |readonly |local )?\w+={_A_PYTHON}",
-        # Вопрос «где программа»: `command -v python3 >/dev/null || exit 1`.
-        rf"(?:if )?(?:! )?(?:command -[vV]|which|type|hash) {_A_PYTHON}{_OUTPUT_ELSEWHERE}"
-        r"(?:; then| \|\| exit \d+)?",
-        # Установка пакетов: `sudo apt-get install -y python3 python3-venv`.
-        r"(?:sudo )?(?:[A-Z_]+=\w+ )*(?:apt-get|apt|dnf|yum|brew|apk)(?: -[\w-]+)*"
-        r" (?:install|add)(?: [\w.+:=-]+)*",
-        # Список и ссылка: `ls -l …/python`, `ln -sf /usr/bin/python3 /usr/local/bin/python`.
-        rf"(?:ls|ln)(?: [\w./+:=-]+)+{_OUTPUT_ELSEWHERE}",
-        # Текст, который печатают: слова и строки без подстановки команд и без
-        # `;`, `|`, `&` — строка в кавычках бывает концом внешней строки, и то,
-        # что за ней, shell исполнит.
-        r"""(?:echo|printf)(?: (?:"(?:[^"$`\\;|&]|\$\w+|\$\{\w+\})*"|'[^';|&]*'|[\w./:=,%-]+))+"""
-        + _OUTPUT_ELSEWHERE,
-    )
+        r"(?:; then| \|\| exit \d+)?"
+    ),
 ]
 _START_OF_A_STEP = re.compile(r"^(?:- )?(?:run: )?")
-_PRINTS_A_TEXT = re.compile(r"(?:echo|printf) ")
-_ENDS_WITH_PYTHON = re.compile(r"""python[0-9.]*["']?""" + _OUTPUT_ELSEWHERE + "$")
 # Шаг, тело которого — Python: `shell: python`. Тело такого шага тест не читает.
 _PYTHON_SHELL = re.compile(r"""(?<![\w-])["']?shell["']?[ \t]*:[ \t]*(?:&\w+[ \t]+)?["']?python""")
 # Строки, которые ничего не запускают: комментарий и имя шага. Такая строка
@@ -218,6 +202,7 @@ _PYTHON_SHELL = re.compile(r"""(?<![\w-])["']?shell["']?[ \t]*:[ \t]*(?:&\w+[ \t
 # (`…" | python3 …`), поэтому со знаком `|`, `;`, `&` или подстановкой команды
 # (`$(…)`, обратные кавычки) она читается как обычная. Как и строка, которой продолжается предыдущая (`\` в
 # конце): это уже не комментарий.
+_A_QUOTE_BEFORE_PYTHON = re.compile(r"""[^\n]*["'][^\n]*python""")
 _NOT_A_COMMAND_LINE = re.compile(r"[ \t]*(?:#|-?[ \t]*name:)(?:(?!\$\()[^|;&`\n])*")
 # Модули, которые запускают как есть: своего кода о людях в них нет, а
 # миграции этот тест не читает (см. описание файла).
@@ -282,15 +267,9 @@ def _repo_file(word: str) -> Path | None:
 
 
 def _only_names_python(line: str) -> bool:
-    """Вся ли строка — один из видов, в которых слово `python` ничего не запускает."""
+    """Вся ли строка — вид, в котором слово `python` ничего не запускает."""
     whole = _START_OF_A_STEP.sub("", " ".join(line.split()))
-    if not any(shape.fullmatch(whole) for shape in _LINES_THAT_ONLY_NAME_PYTHON):
-        return False
-    # В тексте, который печатают, слово `python` стоит последним: кавычка строки
-    # `echo` бывает концом внешней строки, и то, что идёт за словом, исполнится.
-    if _PRINTS_A_TEXT.match(whole):
-        return len(_INTERPRETER.findall(whole)) == 1 and bool(_ENDS_WITH_PYTHON.search(whole))
-    return True
+    return any(shape.fullmatch(whole) for shape in _LINES_THAT_ONLY_NAME_PYTHON)
 
 
 def _without_redirections(words: list[str]) -> list[str]:
@@ -315,7 +294,14 @@ def _without_lines_that_run_nothing(text: str) -> str:
     lines = text.split("\n")
     for index, line in enumerate(lines):
         continues = index > 0 and lines[index - 1].rstrip("\r").endswith("\\")
-        if not continues and _NOT_A_COMMAND_LINE.fullmatch(line.rstrip("\r")):
+        # Кавычка перед словом `python`: строка — хвост многострочной строки в
+        # кавычках (`NOTE="…⏎# …" python3 - <<'PY'`), а не комментарий.
+        closes_a_string = _A_QUOTE_BEFORE_PYTHON.match(line)
+        if (
+            not continues
+            and not closes_a_string
+            and _NOT_A_COMMAND_LINE.fullmatch(line.rstrip("\r"))
+        ):
             lines[index] = " " * len(line)
     return "\n".join(lines)
 
@@ -340,7 +326,11 @@ def _scan(text: str) -> tuple[list[PythonRun], list[tuple[int, int]], str]:
     decided: list[tuple[int, int]] = []
     already_read: list[tuple[int, int]] = []
     for found in _A_WORD_BROKEN_BY_A_LINE_BREAK.finditer(text):
-        runs.append(PythonRun(line_of(found.start()), UNKNOWN, "слово разорвано переносом «\\»"))
+        before, after = found.groups()
+        if "python" in before + after and "python" not in before and "python" not in after:
+            runs.append(
+                PythonRun(line_of(found.start()), UNKNOWN, "`python` разорвано переносом «\\»")
+            )
     for found in _PYTHON_SHELL.finditer(shell):
         runs.append(PythonRun(line_of(found.start()), UNKNOWN, "шаг с `shell: python`"))
         end_of_line = shell.find("\n", found.end())
@@ -859,16 +849,15 @@ _HOW_TO_FIX_A_RUN = (
     "подстановка shell, ломающая синтаксис (открой кавычками `<<'PY'` и передай "
     "значения через окружение), либо синтаксис новее Python 3.11, на котором "
     "идёт CI. Если `python` здесь не запускают, тест узнаёт это, только когда "
-    "строка ЦЕЛИКОМ — один из видов `_LINES_THAT_ONLY_NAME_PYTHON`: проверка "
-    "файла (`test -x …/python`), присваивание одного слова, `command -v`/`which`, "
-    "установка пакетов, `ls`/`ln`, `echo` с простым текстом. Строка с "
-    "продолжением (`test -x … && …`) видом уже не считается: вынеси упоминание "
-    "на свою строку или перефразируй (строку комментария и `name:` шага без "
-    "знаков `|`, `;`, `&` и подстановки команды тест пропускает сам; в тексте "
-    "`echo` слово `python` должно стоять последним). Нужен новый вид строки — допиши "
-    "его в список целиком, от начала до конца: так запуску в нём негде "
-    "спрятаться, и правка видна в дифе. Модуль, который ничего своего не "
-    "исполняет, допиши в `_MODULES_NOT_READ`."
+    "строка ЦЕЛИКОМ — вид из `_LINES_THAT_ONLY_NAME_PYTHON`; сейчас он один — "
+    "проверка файла (`test -x …/python`). Строка с продолжением (`test -x … && …`) "
+    "видом уже не считается: вынеси проверку на свою строку. Интерпретатор, "
+    "присвоенный переменной (`PY=…/python`), роняет CI намеренно: запуск через "
+    "переменную тест не увидит — зови интерпретатор по имени. Строку комментария "
+    "и `name:` шага без знаков `|`, `;`, `&` и подстановки команды тест "
+    "пропускает сам. Нужен новый вид строки — допиши его в список целиком, от "
+    "начала до конца: так запуску в нём негде спрятаться, и правка видна в "
+    "дифе. Модуль, который ничего своего не исполняет, допиши в `_MODULES_NOT_READ`."
 )
 _HOW_TO_FIX_A_REACH = (
     "Python, который workflow запускает мимо CLI, дотягивается до людей: {found}. "
@@ -1113,38 +1102,16 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ("shell : python\n", [(1, UNKNOWN)]),
         ('{"shell": "python"}\n', [(1, UNKNOWN)]),
         ("steps:\n  - shell: python\n    run: |\n      print(1)\n", [(2, UNKNOWN)]),
-        # Не запуск: `python` — аргумент другой команды.
+        # Не запуск: слово в составе другого, проверка файла целой строкой, вопрос
+        # о версии, комментарий и имя шага.
         ("- uses: actions/setup-python@v5\n  with:\n    python-version: '3.12'\n", []),
         ("test -x /opt/app/.venv/bin/python\n", []),
         ("[ ! -x /opt/app/.venv/bin/python ] || exit 1\n", []),
-        ("command -v python3 >/dev/null || exit 1\n", []),
-        ("sudo apt-get install -y python3 python3-venv\n", []),
-        ("ln -sf /usr/bin/python3 /usr/local/bin/python\n", []),
-        ("ls -l .venv/bin/python >&2\n", []),
-        ("echo 'we use python'\n", []),
-        ("printf '%s\\n' python\n", []),
-        ("which python3\n", []),
-        ("type python3\n", []),
         ("[ -x .venv/bin/python ] || exit 1\n", []),
         ("[[ -x .venv/bin/python ]]\n", []),
         ("sudo -u pm test -x /opt/app/.venv/bin/python\n", []),
-        ("sudo apt install -y python3\n", []),
-        ("dnf install -y python3\n", []),
-        ("yum install -y python3\n", []),
-        ("apk add python3\n", []),
-        ("brew install python\n", []),
-        ("PY=/opt/app/.venv/bin/python\n", []),
-        ("export PYTHON=python3\n", []),
-        ("if ! command -v python3 >/dev/null 2>&1; then\n", []),
         ("if [ ! -x .venv/bin/python ]; then\n", []),
-        ('echo "PY=python3" >> "$GITHUB_ENV"\n', []),
-        ('echo "in ${dir} found $n files for python" >&2\n', []),
-        ('PYTHON="${PYTHON:-python3}"\n', []),
-        # То же одной строкой шага: `run:` — не команда.
-        ("- run: sudo apt-get install -y python3 python3-venv\n", []),
-        ("run: command -v python3 >/dev/null\n", []),
-        ("run: ls -l .venv/bin/python >&2\n", []),
-        ('run: echo "installed python"\n', []),
+        ("- run: test -x .venv/bin/python\n", []),
         ("python --version", []),
         ("python -VV", []),
         ("python -V", []),
@@ -1153,6 +1120,27 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         ('PYTHONPATH="$dir" pharmacy-monitor run', []),
         ("  # руками: python - <<'PY'\n", []),
         ("      - name: Run python - check\n", []),
+        # Других видов «не запуска» нет: настоящим workflow они не нужны, а каждый
+        # был дырой. Такая строка роняет CI, пока её вид не допишут в список.
+        ("command -v python3 >/dev/null || exit 1\n", [(1, UNKNOWN)]),
+        ("which python3\n", [(1, UNKNOWN)]),
+        ("sudo apt-get install -y python3 python3-venv\n", [(1, UNKNOWN)]),
+        ("ln -sf /usr/bin/python3 /usr/local/bin/python\n", [(1, UNKNOWN), (1, UNKNOWN)]),
+        ("ls -l .venv/bin/python >&2\n", [(1, UNKNOWN)]),
+        ("echo 'we use python'\n", [(1, UNKNOWN)]),
+        ('echo "PY=python3" >> "$GITHUB_ENV"\n', [(1, UNKNOWN)]),
+        # Интерпретатор, спрятанный в переменную, — первая половина обхода:
+        # запуск `"$PY" - <<'PY'` тест уже не увидит.
+        ("PY=/opt/app/.venv/bin/python\n", [(1, UNKNOWN)]),
+        ("export PYTHON=python3\n", [(1, UNKNOWN)]),
+        ('PYTHON="${PYTHON:-python3}"\n', [(1, UNKNOWN)]),
+        # Хвост многострочной строки в кавычках, похожий на комментарий или имя шага.
+        (f"NOTE=\"первая\n# вторая\" python3 - <<'PY'\n{_BLOCK}PY\n", [(2, CODE)]),
+        ('NOTE="первая\n# вторая" python3 "$SCRIPT"\n', [(2, UNKNOWN)]),
+        (f"NOTE='a\nname: b' .venv/bin/python - <<'PY'\n{_BLOCK}PY\n", [(2, CODE)]),
+        # Значение по умолчанию у параметра с дефисом в индексе.
+        ('${CMD[-1]-python3} "$SCRIPT"\n', [(1, UNKNOWN)]),
+        (f"${{CMD[i-1]-python3}} - <<'PY'\n{_BLOCK}PY\n", [(1, CODE)]),
         # Строка — «не запуск» только целиком: с продолжением она уже запуск, и
         # слово без программы после себя роняет CI, а не пропускается.
         ("test -x /opt/app/.venv/bin/python && echo ok\n", [(1, UNKNOWN)]),
@@ -1242,6 +1230,9 @@ def _kinds(text: str) -> list[tuple[int, str]]:
         # Перенос «\\» посреди слова и перед строкой, похожей на комментарий.
         ("pyth\\\non3 scripts/x.py\n", [(1, UNKNOWN)]),
         ("    pyth\\\n    on3 scripts/x.py\n", [(1, UNKNOWN)]),
+        # …а не любое слово: строка Python и адрес, продолженные «\».
+        (f"python - <<'PY'\nok = first or\\\nsecond\n{_BLOCK}PY\n", [(1, CODE)]),
+        ("curl -s https://x.example/api\\\n/v1 | .venv/bin/python -m json.tool\n", [(2, NOT_READ)]),
         # Имя шага и комментарий с переменной — по-прежнему не команда.
         ("      - name: Test with python ${{ matrix.version }}\n  # python in $HOME\n", []),
         ("VAR=a\\\n# python3 scripts/no_such_file.py\n", [(2, UNKNOWN)]),
