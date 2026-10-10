@@ -21,8 +21,9 @@
 покажет — `tests/test_magic_link_redeem_postgres.py`.
 
 Журнал прокси и журнал доступа API пишут адрес запроса — поэтому токен стоит в
-ссылке после «#», куда запрос не дотягивается. Это проверяет
-tests/test_login_token_not_in_address.py.
+ссылке после «#», куда запрос не дотягивается. Это проверяют
+tests/test_login_token_not_in_address.py и, настоящим браузером,
+tests/test_login_link_in_a_browser.py.
 """
 
 from __future__ import annotations
@@ -331,9 +332,12 @@ def client(monkeypatch, db_session) -> TestClient:
 def letters(monkeypatch) -> list[str]:
     """Тела писем, которые ушли бы получателям."""
     sent: list[str] = []
-    monkeypatch.setattr(
-        notifier, "send_email", lambda *, subject, html_body, to: sent.append(html_body)
-    )
+
+    def deliver(*, subject, html_body, to) -> bool:
+        sent.append(html_body)
+        return True  # письмо принято: отправитель так и отвечает
+
+    monkeypatch.setattr(notifier, "send_email", deliver)
     return sent
 
 
@@ -349,7 +353,7 @@ def _link_in(letter: str) -> tuple[str, str]:
 
 
 def _sign_in_as_the_page_does(client: TestClient, token: str):
-    """Страница входа читает токен из адреса и шлёт его телом запроса."""
+    """Страница `/auth/link` читает токен из адреса и шлёт его телом запроса."""
     return client.post("/auth/verify", json={"token": token})
 
 
@@ -368,7 +372,7 @@ def test_a_requested_login_link_signs_in_once(client, letters, db_session, writt
 
     assert requested.status_code == 200
     path, token = _link_in(letters[0])
-    assert path == "/az/auth/verify"
+    assert path == "/auth/link"
     assert token not in requested.text
     _assert_only_the_hash_is_stored(db_session, user, token)
     first = _sign_in_as_the_page_does(client, token)
@@ -386,7 +390,7 @@ def test_an_invitation_sets_a_password_once(client, letters, db_session, written
     assert created.status_code == 200, created.text
     user = db_session.get(TenantUser, created.json()["id"])
     path, token = _link_in(letters[0])
-    assert path == "/az/set-password"
+    assert path == "/auth/link/password"
     assert token not in created.text
     _assert_only_the_hash_is_stored(db_session, user, token)
     client.cookies.clear()
@@ -407,7 +411,7 @@ def test_a_link_resent_by_an_admin_signs_in_once(client, letters, db_session, wr
 
     assert resent.status_code == 200, resent.text
     path, token = _link_in(letters[0])
-    assert path == "/az/auth/verify"
+    assert path == "/auth/link"
     assert token not in resent.text
     _assert_only_the_hash_is_stored(db_session, user, token)
     client.cookies.clear()

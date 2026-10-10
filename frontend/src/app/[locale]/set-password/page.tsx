@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
-import { linkTokenFromHash } from "@/lib/link-token";
+import { forgetLinkToken, storedLinkToken } from "@/lib/link-token";
 import { Lock, KeyRound } from "lucide-react";
 import {
   passwordProblem,
@@ -19,13 +19,14 @@ const PROBLEM_TEXT = {
 } as const satisfies Record<PasswordProblem, string>;
 
 /**
- * /[locale]/set-password#token=...
+ * /[locale]/set-password
  *
  * Приглашённый пользователь задаёт свой пароль по одноразовому magic-token из
- * письма. Токен стоит в ссылке после «#» — серверу эта часть адреса не уходит;
- * страница читает её и шлёт токен телом POST /auth/set-password → backend
- * ставит password_hash + JWT cookie → redirect на /overview. Дальше юзер входит
- * по email+паролю на /login.
+ * письма. Ссылку открывает страница API `/auth/link/password`: она кладёт токен
+ * в sessionStorage вкладки и приводит сюда — в адресе этой страницы токена нет
+ * (почему — `@/lib/link-token`). Форма шлёт токен телом POST /auth/set-password
+ * → backend ставит password_hash + JWT cookie → redirect на /overview. Дальше
+ * юзер входит по email+паролю на /login.
  *
  * Пароль, который сервер не примет (короткий, длиннее 72 байт), сюда же и
  * возвращается с причиной — до отправки; ссылка при таком отказе остаётся годной.
@@ -33,11 +34,11 @@ const PROBLEM_TEXT = {
 export default function SetPasswordPage() {
   const router = useRouter();
   const t = useTranslations("set_password");
-  // undefined — адрес ещё не прочитан (первый кадр), null — токена в ссылке нет.
+  // undefined — хранилище ещё не прочитано (первый кадр), null — токена нет.
   const [token, setToken] = useState<string | null | undefined>(undefined);
 
   useEffect(() => {
-    setToken(linkTokenFromHash(window.location.hash));
+    setToken(storedLinkToken());
   }, []);
 
   const [password, setPassword] = useState("");
@@ -47,8 +48,8 @@ export default function SetPasswordPage() {
   // Ссылка больше не годится (сервер отказал по ней самой). Отказ по паролю и
   // сбой её не гасят — новую тогда предлагать незачем: она погасила бы эту.
   const [linkSpent, setLinkSpent] = useState(false);
-  // Ссылка без токена (письмо старого образца, обрезанный адрес) — сказать сразу,
-  // а не после того, как человек придумал пароль.
+  // Токена нет (письмо старого образца, адрес набран руками) — сказать сразу, а
+  // не после того, как человек придумал пароль.
   const shownError = errorMsg ?? (token === null ? t("token_missing") : null);
 
   async function onSubmit(e: React.FormEvent) {
@@ -94,6 +95,7 @@ export default function SetPasswordPage() {
         );
       }
       // Cookie set — logged in. Redirect to dashboard.
+      forgetLinkToken();
       router.replace("/overview");
       router.refresh();
     } catch (err) {

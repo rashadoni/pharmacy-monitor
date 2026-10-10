@@ -5091,7 +5091,7 @@ def test_login_admin_bootstrap_env_hash(client, tenant_user, monkeypatch):
 def test_send_login_link_targets_set_password_for_new_user(
     client, auth_cookie, setup_db, monkeypatch
 ):
-    """Юзер без пароля → письмо ведёт на страницу set-password (создание пароля)."""
+    """Юзер без пароля → письмо ведёт на создание пароля (/auth/link/password)."""
     captured = {}
 
     def fake_send_email(*, subject, html_body, to):
@@ -5104,14 +5104,14 @@ def test_send_login_link_targets_set_password_for_new_user(
     u = _make_user(s, "freshlink@x.az")  # без пароля
     r = client.post(f"/api/v1/dash/recipients/{u.id}/send-login-link")
     assert r.status_code == 200, r.text
-    assert "/az/set-password#token=" in captured["html"]
-    assert "/auth/verify" not in captured["html"]
+    assert "/auth/link/password#token=" in captured["html"]
+    assert "/auth/link#token=" not in captured["html"]
 
 
 def test_send_login_link_targets_auto_login_for_existing_password(
     client, auth_cookie, setup_db, monkeypatch
 ):
-    """Юзер со своим паролем → письмо — обычный login-link (страница auth/verify)."""
+    """Юзер со своим паролем → письмо — обычный login-link (/auth/link)."""
     captured = {}
 
     def fake_send_email(*, subject, html_body, to):
@@ -5124,8 +5124,8 @@ def test_send_login_link_targets_auto_login_for_existing_password(
     u = _make_user(s, "haspw@x.az", password="secret123")
     r = client.post(f"/api/v1/dash/recipients/{u.id}/send-login-link")
     assert r.status_code == 200, r.text
-    assert "/az/auth/verify#token=" in captured["html"]
-    assert "/set-password" not in captured["html"]
+    assert "/auth/link#token=" in captured["html"]
+    assert "/auth/link/password" not in captured["html"]
 
 
 def test_auth_verify_browser_accept_redirects(client, setup_db):

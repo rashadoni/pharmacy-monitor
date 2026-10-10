@@ -1,16 +1,33 @@
 /**
- * Токен из ссылки в письме стоит после «#» (`…/set-password#token=…`).
+ * Токен из ссылки-приглашения для формы создания пароля.
  *
- * Эту часть адреса браузер серверу не отправляет — ни в запросе страницы, ни в
- * заголовке Referer следующих запросов, — поэтому токена нет в журналах прокси
- * и API. Страница читает его здесь и передаёт телом POST.
+ * Ссылку из письма открывает страница API `/auth/link/password`: она читает
+ * токен из части адреса после «#», кладёт его в `sessionStorage` вкладки и
+ * приводит сюда уже по чистому адресу `/set-password`. Из адреса эта форма токен
+ * не берёт намеренно: адрес своей страницы Next.js отправляет серверу в
+ * заголовке `Next-Router-State-Tree` — вместе с частью после «#», — а заголовки
+ * запроса прокси пишет в журнал.
  *
- * Из строки запроса («?token=…») токен не читается намеренно: адрес запроса
- * журналы пишут целиком. Формат ссылки задаёт `_send_login_link` в
- * `src/api.py`; совпадение сверяет `tests/test_login_token_not_in_address.py`.
+ * Ключ общий с `LINK_TOKEN_STORAGE_KEY` в `src/login_link_pages.py`; совпадение
+ * сверяет `tests/test_login_token_not_in_address.py`.
  */
-export function linkTokenFromHash(hash: string): string | null {
-  const params = new URLSearchParams(hash.startsWith("#") ? hash.slice(1) : hash);
-  const token = params.get("token")?.trim();
-  return token ? token : null;
+export const LINK_TOKEN_STORAGE_KEY = "pm_link_token";
+
+export function storedLinkToken(): string | null {
+  try {
+    const token = window.sessionStorage.getItem(LINK_TOKEN_STORAGE_KEY)?.trim();
+    return token ? token : null;
+  } catch {
+    // Хранилище отключено: страница API об этом уже сказала и сюда не привела.
+    return null;
+  }
+}
+
+/** Пароль задан — токен погашен, во вкладке он больше не нужен. */
+export function forgetLinkToken(): void {
+  try {
+    window.sessionStorage.removeItem(LINK_TOKEN_STORAGE_KEY);
+  } catch {
+    // Нечего стирать.
+  }
 }

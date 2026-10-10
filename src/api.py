@@ -11,9 +11,9 @@ Auth моделей две:
        endpoints `/api/v1/products`, `/api/v1/comparisons`, `/api/v1/inventory/*`.
     2. **JWT cookie** — для frontend dashboard. Magic-link flow:
        `POST /auth/request` → email со ссылкой, токен в ней после «#» →
-       страница фронтенда шлёт его телом `POST /auth/verify` → httpOnly cookie
-       с JWT. Endpoints `/api/v1/dash/*` требуют этот cookie и фильтруют по
-       tenant_id.
+       страница `GET /auth/link` шлёт его телом `POST /auth/verify` → httpOnly
+       cookie с JWT. Endpoints `/api/v1/dash/*` требуют этот cookie и фильтруют
+       по tenant_id.
 
 Endpoints (v1):
     Public:
@@ -21,6 +21,8 @@ Endpoints (v1):
 
     Auth (no auth required, public):
         POST /auth/request                 — request magic-link by email
+        GET  /auth/link                    — страница входа по ссылке из письма
+        GET  /auth/link/password           — страница ссылки на создание пароля
         POST /auth/verify {token}          — verify token, set JWT cookie
         GET  /auth/verify?token=...        — то же, токен в адресе: письма так
                                              не ходят, остался для скриптов
@@ -955,13 +957,6 @@ def _wants_html(request: Request) -> bool:
     return "text/html" in request.headers.get("accept", "").lower()
 
 
-# Язык страниц, на которые ведут ссылки из писем. Адрес пишется сразу с ним:
-# без префикса `/auth/*` прокси отдаёт API, а не фронтенду, а `/set-password`
-# шёл бы через редирект. Тот же, что `defaultLocale` во фронтенде
-# (`frontend/src/i18n/config.ts`) — сверяет tests/test_login_token_not_in_address.py.
-LOGIN_LINK_LOCALE = "az"
-
-
 def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     """Выпустить magic-token для email и отправить ссылку на вход. Best-effort.
 
@@ -971,17 +966,16 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     должно падать из-за временной проблемы с почтой (fail-open).
 
     Цель ссылки выбирается по тому, есть ли у пользователя свой пароль:
-    - нет пароля (`password_hash` пуст) → страница `set-password` — юзер задаёт
-      пароль и сразу входит. Дальше логинится по email+паролю в любой момент.
-    - есть пароль → страница `auth/verify` — magic-link просто логинит.
+    - нет пароля (`password_hash` пуст) → `/auth/link/password` — оттуда на форму
+      `/set-password`: юзер задаёт пароль и сразу входит. Дальше логинится по
+      email+паролю в любой момент.
+    - есть пароль → `/auth/link` — magic-link просто логинит.
     `invite=True` — приветственная формулировка письма (новый пользователь).
 
-    Токен стоит в ссылке после «#». Эту часть адреса браузер серверу не
-    отправляет — ни в запросе страницы, ни в заголовке Referer следующих
-    запросов, — поэтому токена нет в журналах прокси и API. Страница читает его
-    сама и шлёт телом POST. В строку запроса («?token=…») токен не ставить:
-    2026-10-10 в журнале прокси лежала 41 такая строка, и ссылка на создание
-    пароля из журнала оставалась рабочей, пока пароль не задан.
+    Токен стоит в ссылке после «#»: эту часть адреса браузер серверу не
+    отправляет. Обе страницы отдаёт API, а не фронтенд, — почему, сказано в
+    `src/login_link_pages.py`. В строку запроса («?token=…») и в адрес страницы
+    фронтенда токен не ставить: адрес и заголовки запроса пишет журнал прокси.
     """
     email = email.strip().lower()
     user = db.scalar(
@@ -998,7 +992,7 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     needs_password = not user.password_hash
     public_url = os.environ.get("PHARMACY_PUBLIC_URL", "http://localhost:3000")
     if needs_password:
-        link = f"{public_url}/{LOGIN_LINK_LOCALE}/set-password#token={token}"
+        link = f"{public_url}/auth/link/password#token={token}"
         welcome = (
             "<p>Sizə Pharmacy Monitor monitorinq paneli üçün giriş açıldı.</p>"
             "<p>Вам открыт доступ к панели Pharmacy Monitor.</p>"
@@ -1012,7 +1006,7 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
             "<p>Задайте пароль для входа (ссылка действует 30 минут):</p>"
         )
     else:
-        link = f"{public_url}/{LOGIN_LINK_LOCALE}/auth/verify#token={token}"
+        link = f"{public_url}/auth/link#token={token}"
         subject = "Pharmacy Monitor — giriş keçidi / ссылка для входа"
         intro = (
             "<p>Daxil olmaq üçün keçid (30 dəqiqə qüvvədədir):</p>"
@@ -1049,6 +1043,29 @@ def auth_request(payload: AuthRequestIn, request: Request, db: Session = Depends
     return AuthRequestOut(sent=True, detail="If the email is registered, a magic-link was sent.")
 
 
+from fastapi.responses import HTMLResponse
+
+from src import login_link_pages
+
+
+def _login_link_page(html: str) -> HTMLResponse:
+    # Страница одна на всех и токена не содержит; не кэшировать — чтобы после
+    # выкладки браузер не исполнил прежний сценарий.
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/auth/link", include_in_schema=False)
+def auth_link_sign_in_page() -> HTMLResponse:
+    """Куда ведёт ссылка на вход: страница шлёт токен в `POST /auth/verify`."""
+    return _login_link_page(login_link_pages.SIGN_IN_PAGE)
+
+
+@app.get("/auth/link/password", include_in_schema=False)
+def auth_link_set_password_page() -> HTMLResponse:
+    """Куда ведёт ссылка на создание пароля: дальше — форма `/set-password`."""
+    return _login_link_page(login_link_pages.SET_PASSWORD_PAGE)
+
+
 class LinkTokenIn(BaseModel):
     """Токен из ссылки в письме — телом запроса, не адресом."""
 
@@ -1069,15 +1086,15 @@ def auth_verify_posted(
 ):
     """Вход по ссылке из письма: токен приходит телом запроса.
 
-    Так ходит страница `auth/verify` фронтенда: ссылка несёт токен после «#»,
-    страница читает его и шлёт сюда. Тело запроса журналы прокси и API не
-    пишут, адрес — пишут. Проверка, гашение и cookie — те же, что у GET ниже:
+    Так ходит страница `/auth/link`: ссылка несёт токен после «#», страница
+    читает его и шлёт сюда. Тело запроса журналы прокси и API не пишут, адрес
+    и заголовки — пишут. Проверка, гашение и cookie — те же, что у GET ниже:
     правило входа одно, меняется только способ доставки токена.
     """
     return auth_verify(payload.token, request, response, db)
 
 
-@app.get("/auth/verify")
+@app.get("/auth/verify", deprecated=True)
 def auth_verify(token: str, request: Request, response: Response, db: Session = Depends(get_db)):
     """Verify magic token, set JWT cookie.
 
