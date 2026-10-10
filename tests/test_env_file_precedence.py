@@ -11,7 +11,7 @@
   `EnvironmentFile` своей службы;
 * копия кода, которую еженедельный сбор pharmonline кладёт в
   `/opt/pharmacy-monitor/.codex-pharmonline-auto.XXXXXX/runtime/`, доходила до того
-  же файла — и он был сильнее даже переменных, названных рядом с командой;
+  же файла — и имя из него было бы сильнее переменной, названной рядом с командой;
 * `migrations/env.py` (без перекрытия) из такой копии взял бы оттуда
   `DATABASE_URL`, не окажись его в окружении, — миграции пошли бы в чужую базу;
 * на dev-боксе воркитри из `.claude/worktrees/…` читал `.env` корневого чекаута:
@@ -23,13 +23,15 @@
 
 Тесты исполняют настоящий импорт `src.main`, начало `src/dashboard.py` и настоящий
 `alembic current` на копии дерева, разложенной так же, как раскладывает его сервер.
-Страж ниже держит форму вызова во всех трёх файлах и не даёт завести четвёртый.
-Чего страж не видит: чтение `.env` своим кодом, без python-dotenv, и вызовы внутри
-вставок Python в workflow (`.github/` он не читает).
+Страж ниже держит форму вызова во всех трёх файлах и не даёт завести четвёртый —
+ни в коде, ни в тестах. Чего страж не видит: чтение `.env` своим кодом, без
+python-dotenv, и вызовы внутри вставок Python в workflow (`.github/` он не читает).
 
 Вторая половина файла — `scripts/diag_env_sources.py`: скрипт для сервера, который
-называет имена из `.env` и их отношение к файлу секретов. Значений он не печатает
-ни в каком случае — это и проверяется, в том числе на оборванных файлах.
+называет имена из `.env` и их отношение к файлу секретов. Значений он не печатает,
+в том числе на оборванных файлах, — с одним пределом, записанным в его шапке:
+обрывок значения из одних прописных букв, цифр и подчёркиваний от имени не
+отличить. `same` он говорит, только когда все читатели файла получат одно и то же.
 """
 
 from __future__ import annotations
@@ -37,7 +39,6 @@ from __future__ import annotations
 import ast
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -258,12 +259,14 @@ def test_alembic_reads_own_file_unless_the_environment_names_a_database(
 DOTENV_CALLERS = ("src/main.py", "src/dashboard.py", "migrations/env.py")
 PINNED_CALL = "load_dotenv(Path(__file__).resolve().parent.parent / '.env')"
 SEARCHERS = {"find_dotenv", "dotenv_values", "DotEnv"}
-SKIPPED_DIRS = {"tests", "node_modules", "__pycache__", "frontend"}
+SKIPPED_DIRS = {"node_modules", "__pycache__", "frontend", "venv", "site-packages", "build", "dist"}
+THIS_TEST = "tests/test_env_file_precedence.py"
 
 
 def _dotenv_problems(name: str, source: str) -> list[str]:
     """Чем файл нарушает правило; пусто — не нарушает."""
     problems: list[str] = []
+    mentions = 0
     calls: list[ast.Call] = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
@@ -290,14 +293,24 @@ def _dotenv_problems(name: str, source: str) -> list[str]:
             problems.append(f"line {node.lineno}: {node.id} is not the pinned call")
         if isinstance(node, ast.Attribute) and node.attr in SEARCHERS | {"load_dotenv"}:
             problems.append(f"line {node.lineno}: {node.attr} is not the pinned call")
+        if isinstance(node, ast.keyword) and node.arg == "env_file":
+            # `uvicorn.run(..., env_file=".env")` — тот же python-dotenv, только из uvicorn.
+            problems.append("env_file= hands a .env to another reader")
+        if isinstance(node, ast.Name) and node.id == "load_dotenv":
+            mentions += 1
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "load_dotenv":
                 calls.append(node)
-    if name in DOTENV_CALLERS and len(calls) != 1:
-        problems.append(f"{len(calls)} calls of load_dotenv, exactly one expected")
     for call in calls:
         if ast.unparse(call) != PINNED_CALL:
             problems.append(f"line {call.lineno}: {ast.unparse(call)} is not {PINNED_CALL}")
+    # Имя встречается один раз — в самом вызове: второе упоминание — это псевдоним
+    # (`again = load_dotenv`), через который вызов уйдёт из-под стража.
+    expected = 1 if name in DOTENV_CALLERS else 0
+    if (len(calls), mentions) != (expected, expected):
+        problems.append(
+            f"load_dotenv: {len(calls)} calls, {mentions} mentions; {expected} expected"
+        )
     return problems
 
 
@@ -313,6 +326,8 @@ def _python_sources() -> dict[str, str]:
             if file.endswith(".py"):
                 path = Path(directory) / file
                 sources[path.relative_to(REPO).as_posix()] = path.read_text(encoding="utf-8")
+    # Этот файл сам полон запрещённых примеров — они тут строками.
+    sources.pop(THIS_TEST)
     return sources
 
 
@@ -333,6 +348,8 @@ _IMPORT = "from pathlib import Path\nfrom dotenv import load_dotenv\n"
         _IMPORT + "load_dotenv('.env')",
         _IMPORT + "load_dotenv(None)",
         _IMPORT + PINNED_CALL + "\n" + PINNED_CALL,
+        _IMPORT + PINNED_CALL + "\nagain = load_dotenv\nagain(override=True)",
+        _IMPORT + PINNED_CALL + "\nimport uvicorn\nuvicorn.run('src.api:app', env_file='.env')",
         _IMPORT,
         "from dotenv import load_dotenv as _ld\n_ld(override=True)",
         "import dotenv\ndotenv.load_dotenv()",
@@ -350,23 +367,27 @@ def test_guard_accepts_the_pinned_call_only_in_the_three_callers() -> None:
     source = _IMPORT + PINNED_CALL
     for caller in DOTENV_CALLERS:
         assert _dotenv_problems(caller, source) == []
-    assert _dotenv_problems("src/api.py", source)
-    assert _dotenv_problems("scripts/audit_matches.py", source)
+    for other in ("src/api.py", "scripts/audit_matches.py", "tests/conftest.py"):
+        assert _dotenv_problems(other, source)
+    assert _dotenv_problems("src/api.py", "import uvicorn\nuvicorn.run('a:b', env_file='.env')")
 
 
 def test_env_file_is_read_the_same_way_in_all_three_places() -> None:
     sources = _python_sources()
-    assert set(DOTENV_CALLERS) <= sources.keys()  # страж видит файлы, которые держит
+    # Страж видит файлы, которые держит, и тесты — тоже: `load_dotenv()` в
+    # conftest вернул бы воркитри чужой `.env`.
+    assert {*DOTENV_CALLERS, "tests/conftest.py"} <= sources.keys()
     found = {name: _dotenv_problems(name, text) for name, text in sources.items()}
     assert {name: problems for name, problems in found.items() if problems} == {}
 
 
 # ── Проверка «выложено ли» из документации отличает прежний код от нового ──────
 
-DEPLOY_CHECK = "^load_dotenv(override=True)"
+DEPLOY_CHECK = "grep -c '^load_dotenv(override=True)' /opt/pharmacy-monitor/src/main.py"
 
 
-def _grep_count(pattern: str, path: Path) -> int:
+def _grep_count(path: Path) -> int:
+    pattern = DEPLOY_CHECK.split("'")[1]
     result = subprocess.run(["grep", "-c", pattern, str(path)], capture_output=True, text=True)
     return int(result.stdout.strip())
 
@@ -378,34 +399,49 @@ def test_documented_deploy_check_tells_old_code_from_new(tmp_path: Path) -> None
     previous = tmp_path / "previous_main.py"
     previous.write_text(current.replace(new_call, "load_dotenv(override=True)"), encoding="utf-8")
 
-    for document in (RUNBOOK, CLAUDE_MD):
-        assert f"grep -c '{DEPLOY_CHECK}'" in document.read_text(encoding="utf-8"), document.name
-    assert _grep_count(DEPLOY_CHECK, previous) == 1
-    assert _grep_count(DEPLOY_CHECK, REPO / "src/main.py") == 0
+    # Команда и то, что значит её ответ, записаны в обоих документах.
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    assert f'ssh root@13.140.186.143 "{DEPLOY_CHECK}"\n' in runbook
+    assert "`0` — выложено; `1` — выложенный код по-прежнему берёт `.env`" in runbook
+    assert f"`{DEPLOY_CHECK}`\n(0 — выложено)" in CLAUDE_MD.read_text(encoding="utf-8")
+
+    assert _grep_count(previous) == 1
+    assert _grep_count(REPO / "src/main.py") == 0
     # И неточный шаблон не соврёт: слов прежнего вызова в новом файле нет вовсе.
     assert "override=True" not in current
 
 
 # ── scripts/diag_env_sources.py: имена и same/differs/absent/unsure, без значений ──
 
+NBSP = " "
+
+# Значения и обрывки значений из файлов ниже: в выводе не должно быть ни одного.
 SECRETS = (
     "alpha-value-1",
+    "Alpha-Value-1",
     "beta-file-2",
     "beta-server-9",
     "gamma-only-3",
     "delta 4",
     "eps\\ilon",
     "zeta$eta",
+    "zeta-plain",
     "theta#iota",
     "kappa'lambda",
+    "kappa-plain",
+    "8080",
+    "4821",
     "omega-other-7",
     "weird-switch-8",
     "sigmaTau",
     "QUJDREVGRw",
+    "MFRGGZDFMZTWQ2LKCANARYSECRET",
+    "TOKEN",
     "hunter2",
     "upsilon-key-9",
     "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
-    "KEYBODY",
+    "KEY_BODY",
+    "O_AFTER",
 )
 
 ENV_FILE_TEXT = (
@@ -419,39 +455,60 @@ ENV_FILE_TEXT = (
     "G_HASH=theta#iota\n"
     "H_INNER_QUOTE=kappa'lambda\n"
     "I_SYSTEMD_EXPORT=alpha-value-1\n"
+    "J_SERVER_QUOTED=alpha-value-1\n"
+    "K_CASE=alpha-value-1\n"
+    "L_NBSP=alpha-value-1\n"
+    "M_EMPTY=\n"
+    "PORT=8080\n"
+    "Q_CR=alpha-value-1\n"
+    "R_EDGE_SPACE=alpha-value-1\n"
     "SCRAPE_REPORT_EMAIL=1\n"
-    # Дальше — то, что именем не является: печататься не должно ничего.
+    # Дальше — то, что именем не считается: печататься не должно ничего.
     "sigmaTau=alpha-value-1\n"  # строчные буквы в имени
     "QUJDREVGRw==\n"  # хвост значения, оборванного переводом строки
+    "MFRGGZDFMZTWQ2LKCANARYSECRET====\n"  # такой же хвост, но целиком прописными
+    "TOKEN=alpha-value-1\n"  # без подчёркивания, и в файле секретов такого имени нет
     "postgresql://pm:hunter2@localhost/db?sslmode=require\n"
     "'upsilon-key-9'=x\n"
     "просто строка без знака равенства\n"
-    'J_MULTILINE="-----BEGIN PRIVATE KEY-----\n'
+    # Значение на несколько строк: с этой строки файл по строкам не читается.
+    'N_MULTILINE="-----BEGIN PRIVATE KEY-----\n'
     "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC=\n"
-    "KEYBODY=alpha-value-1\n"  # выглядит как имя, но это середина значения
+    "KEY_BODY=alpha-value-1\n"  # выглядит как имя, но это середина значения
     '-----END PRIVATE KEY-----"\n'
-    "K_AFTER=alpha-value-1\n"
+    "O_AFTER=alpha-value-1\n"
 )
+MULTILINE_STARTS_AT = ENV_FILE_TEXT.count("\n", 0, ENV_FILE_TEXT.index("N_MULTILINE")) + 1
 
 SERVER_FILE_TEXT = (
     "# файл секретов\n"
-    "A_SAME=alpha-value-1\r\n"
+    "; комментарий по-systemd\n"
+    "A_SAME=alpha-value-1\n"
     "B_DIFF=beta-server-9\n"
-    "D_QUOTED='delta 4'\n"
+    "D_QUOTED=delta 4\n"
     "E_BACKSLASH=eps\\ilon\n"
-    "F_DOLLAR=zeta$eta\n"
+    "F_DOLLAR=zeta-plain\n"
     "G_HASH=theta#iota\n"
-    "H_INNER_QUOTE=kappa'lambda\n"
+    "H_INNER_QUOTE=kappa-plain\n"
     "export I_SYSTEMD_EXPORT=alpha-value-1\n"  # systemd такую строку пропускает
-    "K_AFTER=alpha-value-1\n"
+    'J_SERVER_QUOTED="alpha-value-1"\n'  # службы кавычки снимут, цикл workflow — нет
+    "K_CASE=Alpha-Value-1\n"
+    f"L_NBSP=alpha-value-1{NBSP}\n"  # хвост, оставленный вставкой из чата
+    "M_EMPTY=\n"
+    "PORT=8080\n"
+    # Края значения systemd обрежет, а цикл workflow оставит как есть.
+    "Q_CR=alpha-value-1\r\n"
+    "R_EDGE_SPACE=alpha-value-1 \n"
     "AI_FALLBACK_ENABLED=1\n"
     "EMPTY_SWITCH=\n"
     "LOUD_SWITCH=TRUE\n"
     "ODD_SWITCH=weird-switch-8\n"
+    "PIN_SWITCH=4821\n"
+    "lower_switch=on\n"
     "Z_OTHER=omega-other-7\n"
 )
 
-EXPECTED_NAMES = """\
+EXPECTED_NAMES = f"""\
   A_SAME               same
   B_DIFF               differs
   C_ONLY               absent
@@ -461,11 +518,20 @@ EXPECTED_NAMES = """\
   G_HASH               unsure
   H_INNER_QUOTE        unsure
   I_SYSTEMD_EXPORT     absent
-  J_MULTILINE          absent
-  K_AFTER              same
+  J_SERVER_QUOTED      unsure
+  K_CASE               differs
+  L_NBSP               unsure
+  M_EMPTY              same
+  N_MULTILINE          absent
+  PORT                 same
+  Q_CR                 unsure
+  R_EDGE_SPACE         unsure
   SCRAPE_REPORT_EMAIL  absent
-  other lines, not shown: 8
+  other lines, not shown: 7
+  not read from line {MULTILINE_STARTS_AT} on - an open quote or a line continuation \
+(4 more lines): read the rest by hand
 """
+SERVER_SUMMARY = "21 names, 1 other lines"
 
 
 @dataclass(frozen=True)
@@ -473,6 +539,10 @@ class Server:
     root: Path
     env: Path
     units: Path
+
+    @property
+    def stray(self) -> Path:
+        return self.root / ".env"
 
 
 @pytest.fixture
@@ -531,49 +601,160 @@ def _section(output: str, heading: str) -> str:
     return "".join(lines[start:end])
 
 
+def _names(server: Server, count: int, path: Path | None = None) -> str:
+    return f"names in {path or server.stray} ({count}), against the server file:"
+
+
+def _found_line(path: Path, kind: str = "FOUND") -> str:
+    import grp
+    import pwd
+    import time
+
+    st = path.stat()
+    owner = f"{pwd.getpwuid(st.st_uid).pw_name}:{grp.getgrgid(st.st_gid).gr_name}"
+    modified = time.strftime("%Y-%m-%d", time.gmtime(st.st_mtime))
+    return (
+        f"  {path}  {kind}  mode={st.st_mode & 0o7777:o} owner={owner} "
+        f"size={st.st_size} modified={modified}\n"
+    )
+
+
 def test_diag_names_every_variable_and_its_relation_to_the_server_file(server: Server) -> None:
     result = _diag(server)
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
-    assert _section(result.stdout, f"names in {server.root / '.env'} (12)") == EXPECTED_NAMES
-    assert f"server file {server.env}: 13 names\n" in result.stdout
+    assert _section(result.stdout, _names(server, 18)) == EXPECTED_NAMES
+    assert f"server file {server.env}: {SERVER_SUMMARY}\n" in result.stdout
 
 
-def test_diag_prints_nothing_but_the_known_shapes(server: Server) -> None:
-    """Весь вывод — строки известного вида: лишнему (обрывку, длине, хешу) в нём нет места."""
+def test_diag_prints_exactly_this_and_nothing_else(server: Server) -> None:
+    """Вывод сверяется целиком: обрывку значения, его длине или хешу в нём нет места."""
+    above = [parent / ".env" for parent in server.root.parents]
+    if any(path.exists() for path in above):
+        pytest.skip("a .env above the temporary directory would add lines of its own")
     result = _diag(server, "--flag", "AI_FALLBACK_ENABLED", "--flag", "ODD_SWITCH")
 
     assert result.returncode == 0, result.stderr
-    printed = result.stdout + result.stderr
-    assert printed.isascii()
+    assert result.stderr == ""
     for secret in SECRETS:
-        assert secret not in printed
-
-    stat_part = r"mode=[0-7]{3} owner=\S+:\S+ size=\d+ modified=\d{4}-\d\d-\d\d"
-    root, env, units = (re.escape(str(path)) for path in (server.root, server.env, server.units))
-    shape = (
-        rf"python-dotenv in {root}/\.venv: not found\n"
-        rf"deployed {root}/src/main\.py: new rule - own checkout root only, "
-        r"the environment wins\n"
-        rf"server file {env}: 13 names\n"
-        r"where a path-less load_dotenv\(\) looked, from the deployed code:\n"
-        rf"  {root}/src/\.env  -\n"
-        rf"  {root}/\.env  FOUND  {stat_part}\n"
-        r"(?:  /\S*\.env  -\n)+"
-        rf"  {root}/migrations/\.env  -\n"
-        rf"names in {root}/\.env \(12\), against the server file:\n"
-        + re.escape(EXPECTED_NAMES)
-        + rf"units under {units} that name such a file as EnvironmentFile:\n"
-        r"  none\n"
-        r"names above that a pharmacy-monitor unit sets with Environment=:\n"
-        rf"  SCRAPE_REPORT_EMAIL  {units}/pharmacy-monitor-scrape@\.service\.d/"
-        r"zz-realtime-alerts\.conf\n"
-        r"switches in the server file:\n"
-        r"  AI_FALLBACK_ENABLED  1\n"
-        r"  ODD_SWITCH  set \(value not shown\)\n"
+        assert secret not in result.stdout
+    scrape = server.units / "pharmacy-monitor-scrape@.service.d/zz-realtime-alerts.conf"
+    assert result.stdout == (
+        f"python-dotenv in {server.root}/.venv: not found\n"
+        f"deployed {server.root}/src/main.py: new rule - own checkout root only, "
+        "the environment wins\n"
+        f"server file {server.env}: {SERVER_SUMMARY}\n"
+        "where a path-less load_dotenv() looked, from the deployed code:\n"
+        f"  {server.root}/src/.env  -\n"
+        + _found_line(server.stray)
+        + "".join(f"  {path}  -\n" for path in above)
+        + f"  {server.root}/migrations/.env  -\n"
+        + _names(server, 18)
+        + "\n"
+        + EXPECTED_NAMES
+        + f"units under {server.units} whose EnvironmentFile is a .env next to the code:\n"
+        "  none\n"
+        "names above that a pharmacy-monitor unit sets with Environment=:\n"
+        f"  SCRAPE_REPORT_EMAIL  {scrape}\n"
+        "switches in the server file:\n"
+        "  AI_FALLBACK_ENABLED  1\n"
+        "  ODD_SWITCH  set (value not shown)\n"
     )
-    assert re.fullmatch(shape, result.stdout), result.stdout
+
+
+def test_diag_stops_where_a_file_can_no_longer_be_read_line_by_line(server: Server) -> None:
+    """После открытой кавычки имя от продолжения значения не отличить — дальше не читаем."""
+    for opening in (
+        'NOTE_TEXT="first \\" still open\n',  # кавычка под обратной косой чертой не закрывает
+        "NOTE_TEXT='one\n",  # одинарная
+        'NOTE_TEXT="a" "b\n',  # закрыта и открыта снова
+        'NOTE_TEXT="closed" # а дальше комментарий\n',  # читается, но не нами
+    ):
+        server.stray.write_text(
+            "A_SAME=alpha-value-1\n" + opening + "KEY_BODY=alpha-value-1\nend of note\"'\n"
+        )
+        result = _diag(server)
+
+        assert result.returncode == 0, result.stderr
+        assert _section(result.stdout, _names(server, 2)) == (
+            "  A_SAME     same\n"
+            "  NOTE_TEXT  absent\n"
+            "  other lines, not shown: 0\n"
+            "  not read from line 2 on - an open quote or a line continuation "
+            "(2 more lines): read the rest by hand\n"
+        ), opening
+        assert "KEY_BODY" not in result.stdout
+
+
+def test_diag_does_not_call_a_name_absent_or_same_past_a_break_in_the_server_file(
+    server: Server,
+) -> None:
+    """systemd приклеивает строку после `\\` и открывает кавычку посреди значения."""
+    server.stray.write_text("A_SAME=alpha-value-1\nB_DIFF=beta-file-2\nC_ONLY=gamma-only-3\n")
+    for breaking in ("W_JOINED=abc\\\n", "W_JOINED=it's\n", 'W_JOINED="a" "b\n'):
+        server.env.write_text("A_SAME=alpha-value-1\n" + breaking + "B_DIFF=beta-file-2\n")
+        result = _diag(server)
+
+        assert result.returncode == 0, result.stderr
+        assert _section(result.stdout, f"server file {server.env}: 2 names, 0 other lines") == (
+            "  not read from line 2 on - an open quote or a line continuation "
+            "(1 more lines): read the rest by hand\n"
+        ), breaking
+        assert _section(result.stdout, _names(server, 3)) == (
+            "  A_SAME  same\n  B_DIFF  unsure\n  C_ONLY  unsure\n  other lines, not shown: 0\n"
+        ), breaking
+
+
+@pytest.mark.parametrize(
+    ("in_env", "in_server"),
+    [
+        ("X_ONE=abc", f"X_ONE=abc{NBSP}"),  # python-dotenv срежет, systemd оставит
+        ("X_ONE=abc", f"X_ONE={NBSP}abc"),
+        ("X_ONE=abc", "X_ONE=abc "),
+        ("X_ONE=abc\x0b", "X_ONE=abc\x0b"),
+        ("X_ONE=abc", "X_ONE=abc\x1f"),
+        ("X_ONE=abc\x0cone", "X_ONE=abc\x0ctwo"),
+        ("X_ONE=abc\x0cY_TWO=tail", "X_ONE=abc"),  # не две строки: Y_TWO — часть значения
+        ("X_ONE=abc Y_TWO=tail", "X_ONE=abc"),
+        ("X_ONE=abc\rY_TWO=tail", "X_ONE=abc"),
+        ("X_ONE=a`b", "X_ONE=a`b"),
+        ("X_ONE='abc'", "X_ONE='abc'"),  # кавычки в файле секретов цикл workflow не снимает
+        ("X_ONE=abc", 'X_ONE="abc"'),
+        ("X_ONE=é", "X_ONE=é"),
+    ],
+)
+def test_diag_is_unsure_about_values_readers_would_not_agree_on(
+    server: Server, in_env: str, in_server: str
+) -> None:
+    server.stray.write_text(in_env + "\n", encoding="utf-8", newline="")
+    server.env.write_text(in_server + "\n", encoding="utf-8", newline="")
+
+    result = _diag(server)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.isascii()
+    assert _section(result.stdout, _names(server, 1)) == (
+        "  X_ONE  unsure\n  other lines, not shown: 0\n"
+    )
+    assert "Y_TWO" not in result.stdout
+
+
+def test_diag_says_when_a_file_is_not_valid_utf8(server: Server) -> None:
+    server.stray.write_bytes(b"X_ONE=ab\xffc\n")
+    server.env.write_bytes(b"X_ONE=ab\xfec\n")
+
+    result = _diag(server)
+
+    assert result.returncode == 0, result.stderr
+    assert _section(result.stdout, f"server file {server.env}: 1 names, 0 other lines") == (
+        "  NOT valid UTF-8: systemd would refuse this file\n"
+    )
+    assert _section(result.stdout, _names(server, 1)) == (
+        "  X_ONE  unsure\n"
+        "  other lines, not shown: 0\n"
+        "  NOT valid UTF-8: python-dotenv would fail on this file\n"
+    )
 
 
 def test_diag_says_only_a_switch_word_about_a_switch(server: Server) -> None:
@@ -582,9 +763,12 @@ def test_diag_says_only_a_switch_word_about_a_switch(server: Server) -> None:
         *("--flag", "AI_FALLBACK_ENABLED"),
         *("--flag", "EMPTY_SWITCH"),
         *("--flag", "LOUD_SWITCH"),
+        *("--flag", "lower_switch"),
         *("--flag", "NOT_THERE"),
         *("--flag", "ODD_SWITCH"),
+        *("--flag", "PIN_SWITCH"),
         *("--flag", "E_BACKSLASH"),
+        *("--flag", "J_SERVER_QUOTED"),
     )
 
     assert result.returncode == 0, result.stderr
@@ -592,56 +776,95 @@ def test_diag_says_only_a_switch_word_about_a_switch(server: Server) -> None:
         "  AI_FALLBACK_ENABLED  1\n"
         "  EMPTY_SWITCH  empty\n"  # пусто — не «выключено»: у части переключателей это «включено»
         "  LOUD_SWITCH  true\n"
+        "  lower_switch  on\n"
         "  NOT_THERE  unset\n"
         "  ODD_SWITCH  set (value not shown)\n"
+        "  PIN_SWITCH  set (value not shown)\n"  # короткое, но не служебное слово
         "  E_BACKSLASH  set (value not shown)\n"
+        "  J_SERVER_QUOTED  set (value not shown)\n"
     )
 
 
 def test_diag_names_units_that_use_the_file_as_their_environment(server: Server) -> None:
-    stray = server.root / ".env"
-    (server.units / "legacy.service").write_text(f"[Service]\nEnvironmentFile=-{stray}\n")
+    (server.units / "legacy.service").write_text(f"[Service]\nEnvironmentFile=-{server.stray}\n")
     dropin = server.units / "pharmacy-monitor-run.service.d"
     dropin.mkdir()
-    (dropin / "override.conf").write_text(f'[Service]\nEnvironmentFile="{stray}"\n')
+    (dropin / "override.conf").write_text(f'[Service]\nEnvironmentFile="{server.stray}"\n')
     (server.units / "multi-user.target.wants").mkdir()
     (server.units / "multi-user.target.wants/legacy.service").symlink_to(
         server.units / "legacy.service"
     )
+    heading = f"units under {server.units} whose EnvironmentFile is a .env next to the code:"
+    expected = f"  {server.units / 'legacy.service'}\n  {dropin / 'override.conf'}\n"
+
+    result = _diag(server)
+    assert result.returncode == 0, result.stderr
+    assert _section(result.stdout, heading) == expected
+
+    # Файл убрали, а юнит по-прежнему на него ссылается — это надо увидеть и тогда.
+    server.stray.unlink()
+    result = _diag(server)
+    assert result.returncode == 0, result.stderr
+    assert _section(result.stdout, heading) == expected
+    assert "names above that a pharmacy-monitor unit sets" not in result.stdout
+
+
+def test_diag_names_units_that_set_the_same_names_themselves(server: Server) -> None:
+    everyone = server.units / "service.d"
+    everyone.mkdir()
+    (everyone / "all.conf").write_text('[Service]\nEnvironment="A_SAME=omega-other-7"\n')
+    continued = server.units / "pharmacy-monitor-health.service"
+    continued.write_text("[Service]\nEnvironment=OTHER_NAME=1 \\\n  B_DIFF=beta-server-9\n")
+    hidden = server.units / "pharmacy-monitor-secret.service"
+    hidden.write_text("[Service]\nEnvironment=C_ONLY=gamma-only-3\n")
+    hidden.chmod(0)
 
     result = _diag(server)
 
     assert result.returncode == 0, result.stderr
-    heading = f"units under {server.units} that name such a file as EnvironmentFile:"
-    assert _section(result.stdout, heading) == (
-        f"  {server.units / 'legacy.service'}\n  {dropin / 'override.conf'}\n"
+    scrape = server.units / "pharmacy-monitor-scrape@.service.d/zz-realtime-alerts.conf"
+    expected = (
+        f"  A_SAME  {everyone / 'all.conf'}\n"
+        f"  B_DIFF  {continued}\n"
+        f"  SCRAPE_REPORT_EMAIL  {scrape}\n"
     )
+    if not os.access(hidden, os.R_OK):  # под root запрет на чтение не действует
+        expected += "  unit files this user could not read: 1\n"
+    else:
+        expected = expected.replace("  SCRAPE", f"  C_ONLY  {hidden}\n  SCRAPE")
+    heading = "names above that a pharmacy-monitor unit sets with Environment=:"
+    assert _section(result.stdout, heading) == expected
+    for secret in SECRETS:
+        assert secret not in result.stdout
 
 
 def test_diag_looks_above_the_code_and_under_migrations(server: Server) -> None:
-    (server.root / ".env").unlink()
-    (server.root.parent / ".env").write_text("A_SAME=alpha-value-1\nL_ABOVE=gamma-only-3\n")
+    server.stray.unlink()
+    above = server.root.parent / ".env"
+    above.write_text("A_SAME=alpha-value-1\nL_ABOVE=gamma-only-3\n")
     (server.root / "migrations").mkdir()
-    (server.root / "migrations/.env").write_text("B_DIFF=beta-file-2\n")
+    under = server.root / "migrations/.env"
+    under.write_text("B_DIFF=beta-file-2\n")
 
     result = _diag(server)
 
     assert result.returncode == 0, result.stderr
-    above = _section(result.stdout, f"names in {server.root.parent / '.env'} (2)")
-    assert above == "  A_SAME   same\n  L_ABOVE  absent\n  other lines, not shown: 0\n"
-    under = _section(result.stdout, f"names in {server.root / 'migrations/.env'} (1)")
-    assert under == "  B_DIFF  differs\n  other lines, not shown: 0\n"
+    assert _section(result.stdout, _names(server, 2, above)) == (
+        "  A_SAME   same\n  L_ABOVE  absent\n  other lines, not shown: 0\n"
+    )
+    assert _section(result.stdout, _names(server, 1, under)) == (
+        "  B_DIFF  differs\n  other lines, not shown: 0\n"
+    )
 
 
 def test_diag_without_env_file_says_so(server: Server) -> None:
-    (server.root / ".env").unlink()
+    server.stray.unlink()
 
     result = _diag(server, "--flag", "AI_FALLBACK_ENABLED")
 
     assert result.returncode == 0, result.stderr
     assert "no .env next to the code or above it: nothing to compare\n" in result.stdout
     assert "names in" not in result.stdout
-    assert "units under" not in result.stdout
     assert _section(result.stdout, "switches in the server file:") == "  AI_FALLBACK_ENABLED  1\n"
 
 
@@ -650,7 +873,7 @@ def test_diag_tells_which_rule_the_deployed_code_follows(server: Server) -> None
     line = f"deployed {deployed}: "
     assert line + "new rule" in _diag(server).stdout
 
-    deployed.write_text("import os\nload_dotenv(override=True)\n")
+    deployed.write_text("import os\nload_dotenv(override=True)\n" + deployed.read_text("utf-8"))
     assert line + "OLD rule" in _diag(server).stdout
 
     deployed.write_text("# load_dotenv(override=True) было здесь\n", encoding="utf-8")
@@ -660,16 +883,43 @@ def test_diag_tells_which_rule_the_deployed_code_follows(server: Server) -> None
     assert line + "cannot read (FileNotFoundError)" in _diag(server).stdout
 
 
+def test_diag_reads_the_dotenv_version_from_the_directory_name_only(server: Server) -> None:
+    packages = server.root / ".venv/lib/python3.12/site-packages"
+    packages.mkdir(parents=True)
+    line = f"python-dotenv in {server.root}/.venv: "
+    forged = "no .env next to the code or above it: nothing to compare"
+    (packages / f"python_dotenv-1.2.2\n{forged}\nX.dist-info").mkdir()
+    result = _diag(server)
+    assert line + "not found\n" in result.stdout
+    assert forged not in result.stdout
+
+    (packages / "python_dotenv-1.2.2.dist-info").mkdir()
+    assert line + "1.2.2\n" in _diag(server).stdout
+
+
+def test_diag_escapes_what_a_file_name_could_forge(server: Server) -> None:
+    forged = "  DATABASE_URL  same"
+    unit = server.units / f"zz\n{forged}\n.conf"
+    unit.write_text(f"[Service]\nEnvironmentFile={server.stray}\n")
+
+    result = _diag(server)
+
+    assert result.returncode == 0, result.stderr
+    assert forged not in result.stdout.splitlines()
+    assert f"  {server.units}/zz\\n{forged}\\n.conf\n" in result.stdout
+
+
 def test_diag_refuses_when_the_server_file_cannot_be_read(server: Server) -> None:
     result = _diag(server, env=server.root / "no-such-file")
 
     assert result.returncode == 2
-    assert "cannot read (FileNotFoundError)" in result.stdout
-    assert "names in" not in result.stdout
+    assert result.stdout.endswith(
+        f"server file {server.root / 'no-such-file'}: cannot read (FileNotFoundError)\n"
+    )
 
 
 def test_diag_does_not_compare_what_is_not_a_readable_file(server: Server) -> None:
-    stray = server.root / ".env"
+    stray = server.stray
     stray.unlink()
     stray.mkdir()
     result = _diag(server)
@@ -682,6 +932,14 @@ def test_diag_does_not_compare_what_is_not_a_readable_file(server: Server) -> No
     result = _diag(server)
     assert result.returncode == 0, result.stderr
     assert f"  {stray}  FOUND, but cannot follow it (FileNotFoundError)\n" in result.stdout
+
+    (server.root / "nowhere").write_text("A_SAME=alpha-value-1\n")
+    result = _diag(server)
+    assert result.returncode == 0, result.stderr
+    assert _found_line(stray, "FOUND (symlink)") in result.stdout
+    assert _section(result.stdout, _names(server, 1)) == (
+        "  A_SAME  same\n  other lines, not shown: 0\n"
+    )
 
     stray.unlink()
     stray.write_text(ENV_FILE_TEXT, encoding="utf-8")
@@ -696,6 +954,9 @@ def test_diag_does_not_compare_what_is_not_a_readable_file(server: Server) -> No
 
 
 def test_diag_only_reads(server: Server, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
     def snapshot() -> dict[str, tuple[int, int]]:
         return {
             str(path): (path.lstat().st_size, path.lstat().st_mtime_ns)
@@ -703,7 +964,16 @@ def test_diag_only_reads(server: Server, tmp_path: Path) -> None:
         }
 
     before = snapshot()
-    result = _diag(server, "--flag", "AI_FALLBACK_ENABLED")
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-", "--root", str(server.root), "--server-env"]
+        + [str(server.env), "--units", str(server.units), "--flag", "AI_FALLBACK_ENABLED"],
+        input=DIAG_SCRIPT.read_text(encoding="utf-8"),
+        cwd=home,
+        env=_clean_env(HOME=str(home), TMPDIR=str(home)),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
 
     assert result.returncode == 0, result.stderr
     assert snapshot() == before
@@ -712,6 +982,8 @@ def test_diag_only_reads(server: Server, tmp_path: Path) -> None:
 def test_runbook_command_feeds_this_script_to_a_plain_interpreter_as_pm() -> None:
     """Команда в RUNBOOK называет существующий файл и подаёт его через stdin."""
     assert DIAG_SCRIPT.is_file()
-    command = "'runuser -u pm -- python3 -' < scripts/diag_env_sources.py"
-    assert command in RUNBOOK.read_text(encoding="utf-8")
-    assert command in DIAG_SCRIPT.read_text(encoding="utf-8")
+    command = (
+        "ssh root@13.140.186.143 'runuser -u pm -- python3 -I -' < scripts/diag_env_sources.py"
+    )
+    assert command + "\n" in RUNBOOK.read_text(encoding="utf-8")
+    assert command + "\n" in DIAG_SCRIPT.read_text(encoding="utf-8")

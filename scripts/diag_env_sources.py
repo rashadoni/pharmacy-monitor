@@ -10,26 +10,34 @@
     same     значение то же
     differs  значение другое
     absent   в файле секретов такого имени нет
-    unsure   сравнить нельзя: в одном из значений есть знак, который python-dotenv
-             и systemd читают по-разному (обратная косая черта, `$`, `#`, кавычка
-             внутри значения, значение на несколько строк)
+    unsure   сравнить нельзя: значение разные читатели поймут по-разному
 
-Ещё он говорит: какому правилу следует выложенный `src/main.py`; называет ли
+Ответ `same` и `differs` даётся, только когда оба значения — печатные знаки ASCII
+без обратной косой черты, `$`, `#` и кавычек внутри, а в файле секретов ещё и без
+кавычек вокруг, без пробелов и CR по краям строки: systemd их снимает, а цикл,
+которым файл читают workflow, — нет.
+Всё остальное — `unsure`. Строка с незакрытой кавычкой или с обратной косой чертой
+в конце останавливает чтение файла: дальше не понять, где имя, а где продолжение
+значения, — об этом сказано отдельной строкой, и остаток файла смотрят глазами.
+
+Ещё скрипт говорит: какому правилу следует выложенный `src/main.py`; называет ли
 `.env` какой-нибудь юнит своим `EnvironmentFile`; какие из имён задаёт строка
 `Environment=` юнита (файл секретов её не знает, а после выкладки правила она
 сильнее `.env`).
 
-Только чтение. Значений не печатает нигде, в том числе при ошибке — о сбое сказано
-классом исключения. Печатаются только имена, записанные ПРОПИСНЫМИ: хвост
-оборванного значения (`…==` на своей строке) для любого разбора тоже выглядит как
-`ИМЯ=значение`, и строчные буквы его выдают; такие строки только считаются.
-Предел: обрывок из одних прописных букв и цифр от имени не отличить.
+Только чтение. Значений не печатает, в том числе при ошибке — о сбое сказано
+классом исключения. Имя печатается, если оно записано ПРОПИСНЫМИ и в нём есть
+подчёркивание либо такое же имя стоит в файле секретов; остальные строки только
+считаются. Причина: хвост оборванного значения (`…==` на своей строке) для любого
+разбора тоже выглядит как `ИМЯ=значение`. Предел, который остаётся: обрывок из
+одних прописных букв, цифр и подчёркиваний от имени не отличить — незнакомое имя
+в ответе может оказаться им.
 
 Сторонних пакетов не нужно, поэтому запускается системным python3 от имени pm —
 не от root и не интерпретатором из каталога, куда pm пишет. `scripts/` выкладка на
 сервер не возит: текст подаётся через stdin, из корня чекаута на dev-боксе:
 
-    ssh root@13.140.186.143 'runuser -u pm -- python3 -' < scripts/diag_env_sources.py
+    ssh root@13.140.186.143 'runuser -u pm -- python3 -I -' < scripts/diag_env_sources.py
 
 `--flag ИМЯ` после `-` говорит про переключатель из файла секретов: `unset`,
 `empty`, одно из служебных слов (`1`, `0`, `true`, `false`, `yes`, `no`, `on`,
@@ -48,16 +56,20 @@ import re
 import stat
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_ROOT = "/opt/pharmacy-monitor"
 DEFAULT_SERVER_ENV = "/etc/pharmacy-monitor/env"
 DEFAULT_UNITS = "/etc/systemd/system"
 
-_SHOWN_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_UPPER_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 _SWITCH_WORDS = frozenset({"1", "0", "true", "false", "yes", "no", "on", "off", "required"})
-_READ_DIFFERENTLY = "\\$#'\"`"
+_QUOTES = "'\""
+_READ_DIFFERENTLY = "\\$#`"
 _UNIT_SUFFIXES = {".service", ".conf"}
+_DOTENV_DIST = re.compile(r"python_dotenv-(\d+(?:\.\d+)*)\.dist-info")
 
 # Прежний вызов в `src/main.py` — отдельной строкой с начала строки. Тот же
 # шаблон стоит в RUNBOOK для ручной проверки `grep -c`.
@@ -66,53 +78,96 @@ NEW_CALL = "load_dotenv(Path(__file__).resolve().parent.parent"
 
 
 def _ascii(text: object) -> str:
-    return str(text).encode("ascii", "backslashreplace").decode("ascii")
+    """Строка отчёта: всё, кроме печатных знаков ASCII, — в виде \\xNN."""
+    return "".join(
+        ch if " " <= ch <= "~" else ch.encode("unicode_escape").decode("ascii") for ch in str(text)
+    )
 
 
-def _plain(raw: str) -> str | None:
-    """Значение, которое python-dotenv и systemd прочтут одинаково; иначе None."""
-    value = raw.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+def _clean_pair(value: str) -> bool:
+    """Значение в одной паре кавычек, внутри которой нет ни кавычек, ни `\\`."""
+    return (
+        len(value) >= 2
+        and value[0] in _QUOTES
+        and value[-1] == value[0]
+        and not any(mark in value[1:-1] for mark in _QUOTES + "\\")
+    )
+
+
+def _stops_line_reading(value: str, *, dotenv: bool) -> bool:
+    """После такого значения строки файла уже нельзя читать по одной.
+
+    python-dotenv: значение, начатое кавычкой, может идти на несколько строк.
+    systemd: кавычка открывается и посреди значения, а обратная косая черта в
+    конце строки приклеивает следующую.
+    """
+    if dotenv:
+        return value.startswith(tuple(_QUOTES)) and not _clean_pair(value)
+    if value.endswith("\\"):
+        return True
+    return any(mark in value for mark in _QUOTES) and not _clean_pair(value)
+
+
+def _comparable(value: str, *, quotes_are_stripped: bool) -> str | None:
+    """Значение, которое все читатели файла получат одинаковым; иначе None."""
+    if _clean_pair(value):
+        if not quotes_are_stripped:
+            return None
         value = value[1:-1]
-    if any(mark in value for mark in _READ_DIFFERENTLY):
+    if any(not " " <= ch <= "~" or ch in _READ_DIFFERENTLY + _QUOTES for ch in value):
         return None
     return value
 
 
-def read_assignments(path: Path, *, export_prefix: bool) -> tuple[dict[str, str | None], int]:
-    """Имена файла и число строк, которые именем не стали.
+@dataclass
+class EnvFile:
+    values: dict[str, str | None] = field(default_factory=dict)  # None — есть, но несравнимо
+    skipped: int = 0  # строки до остановки, которые именем не стали
+    stopped_at: int = 0  # номер строки, на которой чтение остановилось; 0 — дочитан
+    left_unread: int = 0  # непустые строки после остановки
+    valid_utf8: bool = True
 
-    Значение `None` — «есть, но сравнивать нельзя». `export_prefix` — python-dotenv
-    слово `export` перед именем принимает, systemd такую строку пропускает.
+
+def read_assignments(path: Path, *, dotenv: bool) -> EnvFile:
+    """Имена файла. `dotenv` — правила python-dotenv, иначе правила systemd.
+
+    Различаются они тут в трёх местах: слово `export` перед именем (python-dotenv
+    его принимает, systemd строку пропускает), комментарий с `;` (только systemd)
+    и кавычки вокруг значения (см. `_comparable`).
     """
-    values: dict[str, str | None] = {}
-    hidden = 0
-    open_quote = ""
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw.strip()
-        if open_quote:
-            # Продолжение значения в кавычках, открытых строкой выше.
-            hidden += 1
-            if open_quote in line:
-                open_quote = ""
+    result = EnvFile()
+    data = path.read_bytes()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("utf-8", errors="replace")
+        result.valid_utf8 = False
+    for number, raw in enumerate(text.split("\n"), start=1):
+        line = raw.strip(" \t\r")
+        if result.stopped_at:
+            result.left_unread += bool(line)
             continue
-        if not line or line[0] in "#;":
+        if not line or line[0] in ("#" if dotenv else "#;"):
             continue
         name, separator, value = line.partition("=")
-        name = name.strip()
-        if export_prefix and name.startswith("export "):
-            name = name[len("export ") :].strip()
-        if not separator or not _SHOWN_NAME.fullmatch(name):
-            hidden += 1
+        name, value = name.strip(" \t"), value.strip(" \t")
+        if dotenv and name[:6] == "export" and name[6:7] in (" ", "\t"):
+            name = name[6:].strip(" \t")
+        named = bool(separator) and bool(_NAME.fullmatch(name))
+        if separator and _stops_line_reading(value, dotenv=dotenv):
+            result.stopped_at = number
+            if named:
+                result.values[name] = None
             continue
-        value = value.strip()
-        if value[:1] in ("'", '"') and value.count(value[0]) == 1:
-            # Кавычка открыта и на этой строке не закрыта: значение идёт дальше.
-            open_quote = value[0]
-            values[name] = None
+        if not named:
+            result.skipped += 1
             continue
-        values[name] = _plain(value)
-    return values, hidden
+        if not dotenv and raw != f"{name}={value}":
+            # Пробел или CR по краям systemd отбросит, а цикл workflow оставит в значении.
+            result.values[name] = None
+            continue
+        result.values[name] = _comparable(value, quotes_are_stripped=dotenv)
+    return result
 
 
 def classify_switch(values: dict[str, str | None], name: str) -> str:
@@ -121,8 +176,8 @@ def classify_switch(values: dict[str, str | None], name: str) -> str:
     value = values[name]
     if value == "":
         return "empty"
-    if value is not None and value.strip().lower() in _SWITCH_WORDS:
-        return value.strip().lower()
+    if value is not None and value.lower() in _SWITCH_WORDS:
+        return value.lower()
     return "set (value not shown)"
 
 
@@ -189,48 +244,63 @@ def dotenv_version(root: Path) -> str:
         found = sorted(root.glob(".venv/lib/python*/site-packages/python_dotenv-*.dist-info"))
     except OSError as exc:
         return f"unknown ({type(exc).__name__})"
-    if not found:
-        return "not found"
-    return found[-1].name[len("python_dotenv-") : -len(".dist-info")]
+    versions = [match.group(1) for path in found if (match := _DOTENV_DIST.fullmatch(path.name))]
+    return versions[-1] if versions else "not found"
 
 
-def scan_units(
-    units: Path, env_files: list[Path], names: set[str]
-) -> tuple[list[str], dict[str, list[str]], str]:
+@dataclass
+class UnitScan:
+    references: list[str] = field(default_factory=list)  # юниты, чей EnvironmentFile — такой .env
+    setters: dict[str, list[str]] = field(default_factory=dict)  # имя -> юниты с Environment=
+    unreadable: int = 0
+    problem: str = ""
+
+
+def scan_units(units: Path, env_files: set[str], names: set[str]) -> UnitScan:
     """Юниты, которые называют `.env` своим файлом окружения или сами задают его имена."""
-    references: list[str] = []
-    setters: dict[str, list[str]] = {}
-    wanted = {str(path) for path in env_files}
-    seen: set[str] = set()
+    scan = UnitScan()
     if not units.is_dir():
-        return references, setters, "not a directory"
+        scan.problem = "not a directory"
+        return scan
     try:
         candidates = sorted(path for path in units.rglob("*") if path.suffix in _UNIT_SUFFIXES)
     except OSError as exc:
-        return references, setters, f"cannot list ({type(exc).__name__})"
+        scan.problem = f"cannot list ({type(exc).__name__})"
+        return scan
+    seen: set[str] = set()
     for path in candidates:
+        real = os.path.realpath(path)
+        if real in seen or not os.path.isfile(real):
+            continue
+        seen.add(real)
         try:
-            real = os.path.realpath(path)
-            if real in seen or not os.path.isfile(real):
-                continue
-            seen.add(real)
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            scan.unreadable += 1
             continue
-        for raw in text.splitlines():
+        relative = path.relative_to(units).as_posix()
+        ours = "pharmacy-monitor" in relative or relative.startswith("service.d/")
+        for raw in text.replace("\\\n", " ").splitlines():
             key, separator, value = raw.strip().partition("=")
             key = key.strip()
             if not separator:
                 continue
             if key == "EnvironmentFile":
-                if value.strip().lstrip("-").strip("'\"") in wanted:
-                    references.append(str(path))
-            elif key == "Environment" and "pharmacy-monitor" in path.relative_to(units).as_posix():
+                if value.strip().lstrip("-").strip(_QUOTES) in env_files:
+                    scan.references.append(str(path))
+            elif key == "Environment" and ours:
                 for token in value.split():
-                    name = token.lstrip("'\"").partition("=")[0]
+                    name = token.lstrip(_QUOTES).partition("=")[0]
                     if name in names:
-                        setters.setdefault(name, []).append(str(path))
-    return references, setters, ""
+                        scan.setters.setdefault(name, []).append(str(path))
+    return scan
+
+
+def _unread_note(env: EnvFile) -> str:
+    return (
+        f"not read from line {env.stopped_at} on - an open quote or a line continuation "
+        f"({env.left_unread} more lines): read the rest by hand"
+    )
 
 
 def report(root: Path, server_env: Path, units: Path, flags: list[str]) -> tuple[list[str], int]:
@@ -239,15 +309,22 @@ def report(root: Path, server_env: Path, units: Path, flags: list[str]) -> tuple
         f"deployed {root / 'src/main.py'}: {deployed_rule(root)}",
     ]
     try:
-        server_values, _ = read_assignments(server_env, export_prefix=False)
+        server = read_assignments(server_env, dotenv=False)
     except OSError as exc:
         lines.append(f"server file {server_env}: cannot read ({type(exc).__name__})")
         return lines, 2
-    lines.append(f"server file {server_env}: {len(server_values)} names")
+    lines.append(
+        f"server file {server_env}: {len(server.values)} names, {server.skipped} other lines"
+    )
+    if server.stopped_at:
+        lines.append(f"  {_unread_note(server)}")
+    if not server.valid_utf8:
+        lines.append("  NOT valid UTF-8: systemd would refuse this file")
 
     lines.append("where a path-less load_dotenv() looked, from the deployed code:")
+    candidates = search_path(root)
     found: list[Path] = []
-    for candidate in search_path(root):
+    for candidate in candidates:
         description, comparable = _candidate(candidate)
         lines.append(f"  {candidate}  {description}")
         if comparable:
@@ -259,43 +336,55 @@ def report(root: Path, server_env: Path, units: Path, flags: list[str]) -> tuple
     shown: set[str] = set()
     for path in found:
         try:
-            file_values, hidden = read_assignments(path, export_prefix=True)
+            env = read_assignments(path, dotenv=True)
         except OSError as exc:
             lines.append(f"{path}: cannot read ({type(exc).__name__})")
             code = 3
             continue
-        lines.append(f"names in {path} ({len(file_values)}), against the server file:")
-        width = max((len(name) for name in file_values), default=0)
-        for name in sorted(file_values):
-            if name not in server_values:
-                status = "absent"
-            elif file_values[name] is None or server_values[name] is None:
+        printable = sorted(
+            name
+            for name in env.values
+            if _UPPER_NAME.fullmatch(name) and ("_" in name or name in server.values)
+        )
+        lines.append(f"names in {path} ({len(printable)}), against the server file:")
+        width = max((len(name) for name in printable), default=0)
+        for name in printable:
+            mine, theirs = env.values[name], server.values.get(name)
+            if name not in server.values:
+                # После остановки файл секретов не дочитан: имя может стоять ниже.
+                status = "unsure" if server.stopped_at else "absent"
+            elif mine is None or theirs is None:
                 status = "unsure"
-            elif file_values[name] == server_values[name]:
-                status = "same"
             else:
-                status = "differs"
+                status = "same" if mine == theirs else "differs"
             lines.append(f"  {name.ljust(width)}  {status}")
-        lines.append(f"  other lines, not shown: {hidden}")
-        shown.update(file_values)
+        lines.append(f"  other lines, not shown: {env.skipped + len(env.values) - len(printable)}")
+        if env.stopped_at:
+            lines.append(f"  {_unread_note(env)}")
+        if not env.valid_utf8:
+            lines.append("  NOT valid UTF-8: python-dotenv would fail on this file")
+        shown.update(printable)
 
-    if found:
-        references, setters, problem = scan_units(units, found, shown)
-        if problem:
-            lines.append(f"units under {units}: {problem}")
-        else:
-            lines.append(f"units under {units} that name such a file as EnvironmentFile:")
-            lines.extend(f"  {path}" for path in references or ["none"])
+    in_tree = {str(path) for path in candidates if root in path.parents}
+    scan = scan_units(units, in_tree | {str(path) for path in found}, shown)
+    if scan.problem:
+        lines.append(f"units under {units}: {scan.problem}")
+    else:
+        lines.append(f"units under {units} whose EnvironmentFile is a .env next to the code:")
+        lines.extend(f"  {path}" for path in scan.references or ["none"])
+        if shown:
             lines.append("names above that a pharmacy-monitor unit sets with Environment=:")
-            if setters:
-                for name in sorted(setters):
-                    lines.extend(f"  {name}  {path}" for path in setters[name])
+            if scan.setters:
+                for name in sorted(scan.setters):
+                    lines.extend(f"  {name}  {path}" for path in scan.setters[name])
             else:
                 lines.append("  none")
+        if scan.unreadable:
+            lines.append(f"  unit files this user could not read: {scan.unreadable}")
 
     if flags:
         lines.append("switches in the server file:")
-        lines.extend(f"  {name}  {classify_switch(server_values, name)}" for name in flags)
+        lines.extend(f"  {name}  {classify_switch(server.values, name)}" for name in flags)
     return lines, code
 
 
