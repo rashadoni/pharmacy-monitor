@@ -181,6 +181,13 @@ def test_a_post_without_a_usable_token_is_a_bad_request(client, body):
     assert api_module.COOKIE_NAME not in refused.cookies
 
 
+def test_the_longest_allowed_token_is_checked_like_any_other(client):
+    """512 знаков — ещё токен (неверный), 513 — уже не запрос."""
+    refused = client.post("/auth/verify", json={"token": "x" * 512})
+
+    assert refused.status_code == 401
+
+
 def test_the_post_takes_the_token_from_the_body_only(client, db_session):
     """Токен, приписанный к адресу POST, входом не служит и остаётся годным."""
     _add_user(db_session, password_hash=api_module._hash_bcrypt(PASSWORD))
