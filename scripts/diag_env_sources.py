@@ -108,12 +108,15 @@ def _comparable(value: str) -> str | None:
 
 # Строка файла — одно из четырёх: пустая, комментарий, `ИМЯ=значение` в самом
 # простом виде или «другое». «Другое» — всё, что хоть один читатель файла может
-# понять не как одну строку с одним именем: кавычка без пары, значение на
-# несколько строк, `\` в конце, CR или знак вне печатных ASCII (python-dotenv
-# считает пробелом и неразрывный пробел, и перевод страницы — и молча срезает
-# их перед именем), имя в кавычках, строка без `=`. После первой такой строки
-# файлу нельзя верить построчно: ниже может быть и продолжение значения, и второе
-# определение имени, названного выше.
+# понять не как одну строку с одним именем. У python-dotenv это значение или имя
+# в кавычках (оно может идти на несколько строк), CR и любой знак вне печатных
+# ASCII: пробелом он считает и неразрывный пробел, и перевод страницы — и молча
+# срезает их перед именем. У файла секретов это `\` в конце строки (systemd 255
+# приклеивает следующую; кавычки у него на следующую строку не переходят —
+# проверено) и всё, на чём цикл в workflow останавливается или читает иначе:
+# комментарий не с первой колонки или с `;`, `export`, `ИМЯ+=`, строка без `=`.
+# После первой такой строки файлу нельзя верить построчно: ниже может быть и
+# продолжение значения, и второе определение имени, названного выше.
 BLANK, COMMENT, ASSIGNMENT, OTHER = "blank", "comment", "assignment", "other"
 
 
@@ -149,17 +152,18 @@ def _systemd_line(raw: str) -> tuple[str, str, str | None]:
     if "\r" in raw[:-1]:
         return OTHER, "", None
     if raw[0] == "#":
-        # Комментарий с `\` в конце systemd продолжает на следующую строку.
-        return (OTHER if raw.rstrip("\r").endswith("\\") else COMMENT), "", None
+        return COMMENT, "", None
     line = raw[:-1] if raw.endswith("\r") else raw
     name, separator, value = line.partition("=")
     if not separator or not _NAME.fullmatch(name):
         return OTHER, "", None
-    if value.endswith("\\") or (any(q in value for q in _QUOTES) and not _clean_pair(value)):
+    bare = value.strip(" \t")
+    if value.endswith("\\") or (bare[:1] in tuple(_QUOTES) and not _clean_pair(bare)):
         return OTHER, "", None
-    if line != raw or value != value.strip(" \t"):
+    if line != raw or value != bare:
         # CR и пробелы по краям systemd отбросит, а цикл workflow оставит в значении.
         return ASSIGNMENT, name, None
+    # Кавычки systemd снимет, цикл оставит: значение с ними `_comparable` не пропустит.
     return ASSIGNMENT, name, _comparable(value)
 
 
@@ -180,13 +184,20 @@ def read_assignments(path: Path, *, dotenv: bool) -> EnvFile:
         text = data.decode("utf-8", errors="replace")
         result.valid_utf8 = False
     classify = _dotenv_line if dotenv else _systemd_line
+    repeated: set[str] = set()
     for number, raw in enumerate(text.split("\n"), start=1):
         kind, name, value = classify(raw)
         if kind == OTHER:
             result.not_plain_from = number
             break
         if kind == ASSIGNMENT:
+            if not dotenv and name in result.values:
+                # Имя задано дважды: systemd и цикл возьмут последнее, а `grep -m1`
+                # в deploy.yml и backup.sh — первое.
+                repeated.add(name)
             result.values[name] = value
+    for name in repeated:
+        result.values[name] = None
     return result
 
 

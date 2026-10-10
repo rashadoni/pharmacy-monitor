@@ -25,7 +25,10 @@
 `alembic current` на копии дерева, разложенной так же, как раскладывает его сервер.
 Страж ниже держит форму вызова во всех трёх файлах и не даёт завести четвёртый —
 ни в коде, ни в тестах. Чего страж не видит: чтение `.env` своим кодом, без
-python-dotenv, и вызовы внутри вставок Python в workflow (`.github/` он не читает).
+python-dotenv; `env_file` не как аргумент вызова (атрибут класса настроек, ключ
+словаря); `--env-file` в команде и `EnvironmentFile=…/.env` в юните; вставки
+Python в workflow (`.github/` он не читает). Читает он рабочее дерево, а не
+список файлов git: черновой скрипт с `load_dotenv()` уронит его и до коммита.
 
 Вторая половина файла — `scripts/diag_env_sources.py`: скрипт для сервера, который
 называет имена из `.env` и их отношение к файлу секретов. Значений он не печатает,
@@ -399,16 +402,20 @@ def test_documented_deploy_check_tells_old_code_from_new(tmp_path: Path) -> None
     previous = tmp_path / "previous_main.py"
     previous.write_text(current.replace(new_call, "load_dotenv(override=True)"), encoding="utf-8")
 
-    # Команда и то, что значит её ответ, записаны в обоих документах.
-    runbook = RUNBOOK.read_text(encoding="utf-8")
-    assert f'ssh root@13.140.186.143 "{DEPLOY_CHECK}"\n' in runbook
+    # Команда и то, что значит её ответ, записаны в обоих документах. Переносы
+    # строк в тексте документа не важны: сверяются слова.
+    runbook = " ".join(RUNBOOK.read_text(encoding="utf-8").split())
+    claude_md = " ".join(CLAUDE_MD.read_text(encoding="utf-8").split())
+    assert f'ssh root@13.140.186.143 "{DEPLOY_CHECK}"' in runbook
     assert "`0` — выложено; `1` — выложенный код по-прежнему берёт `.env`" in runbook
-    assert f"`{DEPLOY_CHECK}`\n(0 — выложено)" in CLAUDE_MD.read_text(encoding="utf-8")
+    assert f"`{DEPLOY_CHECK}` (0 — выложено)" in claude_md
 
     assert _grep_count(previous) == 1
     assert _grep_count(REPO / "src/main.py") == 0
-    # И неточный шаблон не соврёт: слов прежнего вызова в новом файле нет вовсе.
-    assert "override=True" not in current
+    # И неточный шаблон не соврёт: рядом с `load_dotenv` слова прежнего вызова нет.
+    assert not [
+        line for line in current.splitlines() if "load_dotenv" in line and "override" in line
+    ]
 
 
 # ── scripts/diag_env_sources.py: имена и same/differs/absent/unsure, без значений ──
@@ -706,9 +713,8 @@ def test_diag_answers_unsure_for_an_env_file_that_is_not_plain(server: Server, l
 # То же для файла секретов: его читают systemd и цикл в workflow, и оба — по-своему.
 NOT_PLAIN_SERVER_LINES = [
     "W_JOINED=abc\\",  # systemd приклеит следующую строку
-    "W_JOINED=it's",  # кавычку он открывает и посреди значения
-    'W_JOINED="a" "b',
-    "# комментарий с продолжением\\",
+    'W_JOINED="a" "b',  # начато кавычкой и это не одна пара: такое не разбираем
+    "W_JOINED='open",
     "W_A=1\rA_SAME=beta-file-2",
     " A_SAME=beta-file-2",  # systemd пробел срежет и имя переопределит; цикл остановится
     "A_SAME+=tail",  # цикл допишет к значению, systemd строку пропустит
@@ -765,6 +771,9 @@ def test_diag_compares_nothing_against_a_server_file_that_is_not_plain(
         ("X_ONE=a`b", "X_ONE=a`b"),
         ('X_ONE="a$b"', "X_ONE=a$b"),
         ("X_ONE=a'b", "X_ONE=ab"),
+        ("X_ONE=its", "X_ONE=it's"),  # кавычка посреди значения в файле секретов
+        ("X_ONE=abc", "X_ONE=abc\nX_ONE=abc"),  # дважды: `grep -m1` возьмёт первое
+        ("X_ONE=xyz", "X_ONE=abc\nX_ONE=xyz"),
     ],
 )
 def test_diag_is_unsure_about_values_readers_would_not_agree_on(
@@ -777,7 +786,7 @@ def test_diag_is_unsure_about_values_readers_would_not_agree_on(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.isascii()
-    assert _section(result.stdout, _server_line(server, 1)) == ""  # файл секретов простой
+    assert f"{_server_line(server, 1)}\nwhere" in result.stdout  # файл секретов простой
     assert _section(result.stdout, _names(server, 1)) == "  X_ONE  unsure\n  names not shown: 0\n"
 
 
@@ -790,7 +799,7 @@ def test_diag_is_unsure_about_values_readers_would_not_agree_on(
         ("  export X_ONE= abc  ", "X_ONE=abc", "same"),
         ("X_ONE=abc\r", "X_ONE=abc", "same"),  # CRLF в `.env`
         ("X_ONE=abc\nX_ONE=xyz", "X_ONE=xyz", "same"),  # действует последнее определение
-        ("X_ONE=abc", "X_ONE=abc\nX_ONE=xyz", "differs"),
+        ("X_ONE=abc", "# заметка с чертой в конце\\\nX_ONE=abc", "same"),
         ("X_ONE=abc", "X_ONE=ABC", "differs"),
         ("X_ONE=a b", "X_ONE=a  b", "differs"),
         ("X_ONE=", "X_ONE=0", "differs"),
