@@ -64,7 +64,7 @@ def _in_quiet_hours(quiet_hours: str | None, now: datetime | None = None) -> boo
 
 
 def _format_event_text(event: storage.AlertEvent) -> str:
-    """Telegram MarkdownV2 message for one event."""
+    """Telegram message for one event (legacy Markdown, see `notifier.telegram_escape`)."""
     sev_emoji = {
         "critical": "🔴",
         "warning": "⚠️",
@@ -74,9 +74,9 @@ def _format_event_text(event: storage.AlertEvent) -> str:
     when = event.created_at.strftime("%d.%m %H:%M")
     title = (event.title or "")[:200]
     detail = (event.detail or "")[:300]
-    out = f"{sev_emoji} *{event.severity.upper()}* `{when}`\n*{title}*"
+    out = f"{sev_emoji} *{event.severity.upper()}* `{when}`\n{notifier.telegram_escape(title, '*')}"
     if detail:
-        out += f"\n_{detail}_"
+        out += f"\n{notifier.telegram_escape(detail, '_')}"
     return out
 
 
@@ -961,7 +961,8 @@ def _format_batch_text(events: list[storage.AlertEvent]) -> str:
     emoji = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️", "opportunity": "💡"}
     lines = [f"*Pharmacy Monitor — {len(events)} алертов*"]
     for e in ordered[:30]:
-        lines.append(f"{emoji.get(e.severity, '•')} {(e.title or '')[:120]}")
+        title = notifier.telegram_escape((e.title or "")[:120])
+        lines.append(f"{emoji.get(e.severity, '•')} {title}")
     if len(ordered) > 30:
         lines.append(f"…и ещё {len(ordered) - 30}")
     return "\n".join(lines)

@@ -43,14 +43,14 @@ def cmd_start(session: Session, chat_id: str, args: str) -> str:
         if bound:
             return (
                 "✅ *Привязано!*\n\n"
-                f"Email: `{email}`\n"
+                f"Email: {notifier.telegram_escape(email, '`')}\n"
                 f"Chat ID: `{chat_id}`\n\n"
                 "Теперь будешь получать алерты сюда (по умолчанию — critical).\n"
                 "Настройки уведомлений: дашборд → ⚙️ Настройки.\n\n"
                 "Команды: /today /alerts /status /help"
             )
         return (
-            f"❌ Email `{email}` не найден или неактивен.\n\n"
+            f"❌ Email {notifier.telegram_escape(email, '`')} не найден или неактивен.\n\n"
             "Сначала аккаунт должен быть создан (admin → Получатели в дашборде)."
         )
     return (
@@ -70,7 +70,7 @@ def cmd_start(session: Session, chat_id: str, args: str) -> str:
 def cmd_help(session: Session, chat_id: str, args: str) -> str:
     return (
         "*Pharmacy Monitor бот*\n\n"
-        "/start — приветствие + chat_id\n"
+        "/start — приветствие + `chat_id`\n"
         "/today — KPI + топ-3 действия\n"
         "/alerts — последние 5 событий\n"
         "/status — здоровье системы\n"
@@ -111,7 +111,8 @@ def cmd_today(session: Session, chat_id: str, args: str) -> str:
         gap = a.unit_gap_azn or 0
         spread = a.spread_pct or 0
         gap_str = f"+{gap:.2f}" if gap > 0 else f"{gap:.2f}"
-        lines.append(f"{i}. {sev} {a.title[:60]} (`{gap_str} ₼/ед`, спред {spread:.1f}%)")
+        title = notifier.telegram_escape(a.title[:60])
+        lines.append(f"{i}. {sev} {title} (`{gap_str} ₼/ед`, спред {spread:.1f}%)")
     return "\n".join(lines)
 
 
@@ -126,7 +127,7 @@ def cmd_alerts(session: Session, chat_id: str, args: str) -> str:
     for ev in events:
         sev = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️"}.get(ev.severity, "•")
         when = ev.created_at.strftime("%d.%m %H:%M")
-        lines.append(f"{sev} `{when}` {ev.title[:60]}")
+        lines.append(f"{sev} `{when}` {notifier.telegram_escape(ev.title[:60])}")
     return "\n".join(lines)
 
 
@@ -141,7 +142,9 @@ def cmd_status(session: Session, chat_id: str, args: str) -> str:
         f"Last run: #{rep.last_run_id} ({rep.last_run_status})",
     ]
     for i in rep.issues[:5]:
-        out.append(f"  • _{i.code}_: {i.message[:80]}")
+        # Код — моноширинным: в курсиве он рвался бы на каждом подчёркивании.
+        code = notifier.telegram_escape(i.code, "`")
+        out.append(f"  • {code}: {notifier.telegram_escape(i.message[:80])}")
     return "\n".join(out)
 
 
@@ -170,13 +173,17 @@ def handle_update(session: Session, update: dict) -> None:
 
     handler = COMMANDS.get(cmd)
     if not handler:
-        notifier.send_telegram_message(chat_id, f"Неизвестная команда: `{cmd}`. /help")
+        # Срез — чтобы ответ на длинную строку уложился в предел сообщения.
+        unknown = notifier.telegram_escape(cmd[:64], "`")
+        notifier.send_telegram_message(chat_id, f"Неизвестная команда: {unknown}. /help")
         return
     try:
         response = handler(session, chat_id, args)
     except Exception as e:
         log.exception("telegram_command_failed", cmd=cmd, error=str(e))
         response = f"❌ Ошибка: {type(e).__name__}"
+        # Своей разметки в этом ответе нет, а в имени класса бывает «_».
+        response = notifier.telegram_escape(response)
     notifier.send_telegram_message(chat_id, response)
 
 
