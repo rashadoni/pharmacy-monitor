@@ -1,32 +1,37 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Link, useRouter } from "@/i18n/navigation";
+import { linkTokenFromHash } from "@/lib/link-token";
 
 /**
- * /[locale]/auth/verify?token=...
+ * /[locale]/auth/verify#token=...
  *
- * Calls FastAPI endpoint, sets JWT cookie, redirects to /<locale>/overview.
- *
- * Phase 6.1 retry: Suspense boundary обязательна для useSearchParams при
- * SSG из [locale]/ dynamic segment. Иначе prerender падает.
+ * Сюда ведёт ссылка на вход из письма. Токен стоит после «#» — серверу эта
+ * часть адреса не уходит; страница читает её и шлёт токен телом POST
+ * /auth/verify. Тот ставит JWT cookie, дальше — /<locale>/overview.
  */
-function VerifyInner() {
+export default function VerifyPage() {
   const t = useTranslations("auth");
   const router = useRouter();
-  const params = useSearchParams();
   const [error, setError] = useState<string | null>(null);
+  // Токен одноразовый: второй запрос с ним получил бы отказ уже после входа.
+  const sent = useRef(false);
 
   useEffect(() => {
-    const token = params.get("token");
+    if (sent.current) return;
+    sent.current = true;
+    const token = linkTokenFromHash(window.location.hash);
     if (!token) {
       setError(t("verify_missing"));
       return;
     }
-    fetch(`/auth/verify?token=${encodeURIComponent(token)}`, {
+    fetch("/auth/verify", {
+      method: "POST",
       credentials: "include",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ token }),
     })
       .then((res) => {
         if (res.ok) {
@@ -37,7 +42,7 @@ function VerifyInner() {
         }
       })
       .catch(() => setError(t("verify_network")));
-  }, [params, router, t]);
+  }, [router, t]);
 
   return (
     <div className="min-h-screen flex items-center justify-center">
@@ -52,20 +57,5 @@ function VerifyInner() {
         <div className="text-muted-foreground text-sm">{t("verify_loading")}</div>
       )}
     </div>
-  );
-}
-
-export default function VerifyPage() {
-  const t = useTranslations("auth");
-  return (
-    <Suspense
-      fallback={
-        <div className="min-h-screen flex items-center justify-center">
-          <div className="text-muted-foreground text-sm">{t("verify_loading")}</div>
-        </div>
-      }
-    >
-      <VerifyInner />
-    </Suspense>
   );
 }

@@ -1,6 +1,6 @@
 """Одноразовый токен входа лежит в базе хешем: сам токен сервер не хранит.
 
-Токен из ссылки — полноценный вход: `/auth/verify` ставит по нему сессию,
+Токен из ссылки — полноценный вход: `POST /auth/verify` ставит по нему сессию,
 `/auth/set-password` задаёт пароль. До 2026-10-10 он лежал в
 `tenant_users.magic_token` открытым текстом, и вошёл бы любой, кто прочитал базу
 или дамп, снятый, пока токен жив.
@@ -20,8 +20,9 @@
 Что из двух одновременных запросов с одним токеном проходит один, SQLite не
 покажет — `tests/test_magic_link_redeem_postgres.py`.
 
-Чего здесь нет: журнала прокси. Caddy пишет адрес запроса вместе с `?token=…`,
-и это тест не видит — docs/RUNBOOK.md, «Ссылка из письма не входит».
+Журнал прокси и журнал доступа API пишут адрес запроса — поэтому токен стоит в
+ссылке после «#», куда запрос не дотягивается. Это проверяет
+tests/test_login_token_not_in_address.py.
 """
 
 from __future__ import annotations
@@ -341,8 +342,15 @@ def _link_in(letter: str) -> tuple[str, str]:
     (address,) = set(re.findall(r"href='([^']+)'", letter))
     link = urlsplit(address)
     assert f"{link.scheme}://{link.netloc}" == "https://dashboard.example"
-    (token,) = parse_qs(link.query)["token"]
+    # Токен — после «#»: в запросе страницы его нет.
+    assert link.query == ""
+    (token,) = parse_qs(link.fragment)["token"]
     return link.path, token
+
+
+def _sign_in_as_the_page_does(client: TestClient, token: str):
+    """Страница входа читает токен из адреса и шлёт его телом запроса."""
+    return client.post("/auth/verify", json={"token": token})
 
 
 def _sign_in_as_admin(client: TestClient, session: Session) -> TenantUser:
@@ -360,13 +368,13 @@ def test_a_requested_login_link_signs_in_once(client, letters, db_session, writt
 
     assert requested.status_code == 200
     path, token = _link_in(letters[0])
-    assert path == "/auth/verify"
+    assert path == "/az/auth/verify"
     assert token not in requested.text
     _assert_only_the_hash_is_stored(db_session, user, token)
-    first = client.get(path, params={"token": token})
+    first = _sign_in_as_the_page_does(client, token)
     assert first.status_code == 200 and first.json()["user_id"] == user.id
     assert api_module.COOKIE_NAME in first.cookies
-    assert client.get(path, params={"token": token}).status_code == 401
+    assert _sign_in_as_the_page_does(client, token).status_code == 401
     _assert_written_nowhere(written, token)
 
 
@@ -378,7 +386,7 @@ def test_an_invitation_sets_a_password_once(client, letters, db_session, written
     assert created.status_code == 200, created.text
     user = db_session.get(TenantUser, created.json()["id"])
     path, token = _link_in(letters[0])
-    assert path == "/set-password"
+    assert path == "/az/set-password"
     assert token not in created.text
     _assert_only_the_hash_is_stored(db_session, user, token)
     client.cookies.clear()
@@ -399,11 +407,12 @@ def test_a_link_resent_by_an_admin_signs_in_once(client, letters, db_session, wr
 
     assert resent.status_code == 200, resent.text
     path, token = _link_in(letters[0])
+    assert path == "/az/auth/verify"
     assert token not in resent.text
     _assert_only_the_hash_is_stored(db_session, user, token)
     client.cookies.clear()
-    assert client.get(path, params={"token": token}).status_code == 200
-    assert client.get(path, params={"token": token}).status_code == 401
+    assert _sign_in_as_the_page_does(client, token).status_code == 200
+    assert _sign_in_as_the_page_does(client, token).status_code == 401
     _assert_written_nowhere(written, token)
 
 
