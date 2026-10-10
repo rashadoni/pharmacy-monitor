@@ -41,7 +41,7 @@
     ssh root@13.140.186.143 'runuser -u pm -- python3 -I -' < scripts/diag_env_sources.py
 
 `--flag ИМЯ` после `-` говорит про переключатель из файла секретов: `unset`,
-`empty`, одно из служебных слов (`1`, `0`, `true`, `false`, `yes`, `no`, `on`,
+`empty`, `unsure` (файл секретов не простой), одно из служебных слов (`1`, `0`, `true`, `false`, `yes`, `no`, `on`,
 `off`, `required`) либо `set (value not shown)`. Что из этого значит «включено»,
 решает код, который переключатель читает, — у разных переключателей по-разному.
 
@@ -334,10 +334,15 @@ def report(root: Path, server_env: Path, units: Path, flags: list[str]) -> tuple
     except OSError as exc:
         lines.append(f"server file {server_env}: cannot read ({type(exc).__name__})")
         return lines, 2
-    lines.append(f"server file {server_env}: {len(server.values)} names")
     if server.not_plain_from:
+        lines.append(
+            f"server file {server_env}: {len(server.values)} names "
+            f"above line {server.not_plain_from}, the rest not read"
+        )
         lines.append(f"  {_not_plain_note(server)}")
         lines.append("  nothing can be compared against it: every answer below is unsure")
+    else:
+        lines.append(f"server file {server_env}: {len(server.values)} names")
     if not server.valid_utf8:
         lines.append("  NOT valid UTF-8: systemd would refuse this file")
 
@@ -407,7 +412,10 @@ def report(root: Path, server_env: Path, units: Path, flags: list[str]) -> tuple
 
     if flags:
         lines.append("switches in the server file:")
-        lines.extend(f"  {name}  {classify_switch(server.values, name)}" for name in flags)
+        for name in flags:
+            # Файл секретов не дочитан: переключатель может стоять или меняться ниже.
+            answer = "unsure" if server.not_plain_from else classify_switch(server.values, name)
+            lines.append(f"  {name}  {answer}")
     return lines, code
 
 

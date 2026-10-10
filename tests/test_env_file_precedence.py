@@ -595,8 +595,9 @@ def _names(server: Server, count: int, path: Path | None = None) -> str:
     return f"names in {path or server.stray} ({count}), against the server file:"
 
 
-def _server_line(server: Server, count: int) -> str:
-    return f"server file {server.env}: {count} names"
+def _server_line(server: Server, count: int, *, stopped_at: int = 0) -> str:
+    tail = f" above line {stopped_at}, the rest not read" if stopped_at else ""
+    return f"server file {server.env}: {count} names{tail}"
 
 
 def _found_line(path: Path, kind: str = "FOUND") -> str:
@@ -727,12 +728,16 @@ def test_diag_compares_nothing_against_a_server_file_that_is_not_plain(
     text = f"A_SAME=alpha-value-1\n{line}\nB_DIFF=beta-file-2\n"
     server.env.write_text(text, encoding="utf-8", newline="")
 
-    result = _diag(server)
+    result = _diag(server, "--flag", "A_SAME", "--flag", "B_DIFF", "--flag", "NOT_THERE")
 
     assert result.returncode == 0, result.stderr
-    assert _section(result.stdout, _server_line(server, 1)) == (
+    assert _section(result.stdout, _server_line(server, 1, stopped_at=2)) == (
         NOT_PLAIN.format(line=2)
         + "  nothing can be compared against it: every answer below is unsure\n"
+    )
+    # И про переключатель тоже: он может стоять или меняться ниже этой строки.
+    assert _section(result.stdout, "switches in the server file:") == (
+        "  A_SAME  unsure\n  B_DIFF  unsure\n  NOT_THERE  unsure\n"
     )
     # Ни `same`, ни `absent`: имя может стоять ниже строки, на которой чтение кончилось.
     assert _section(result.stdout, _names(server, 3)) == (
