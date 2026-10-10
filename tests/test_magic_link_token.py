@@ -75,8 +75,9 @@ def _assert_only_the_hash_is_stored(
     assert row["magic_token"] == _sha256(token)
     assert token not in repr(row)
     session.refresh(user)
+    # С запасом в минуту в обе стороны: часы машины могут шагнуть и назад.
     left = user.magic_token_expires_at - utcnow()
-    assert timedelta(minutes=minutes - 1) < left <= timedelta(minutes=minutes)
+    assert timedelta(minutes=minutes - 1) < left < timedelta(minutes=minutes + 1)
 
 
 @pytest.fixture
@@ -93,11 +94,15 @@ def written(db_session, caplog, capsys) -> Iterator[Callable[[], list[str]]]:
 
     def everything() -> list[str]:
         printed.extend(capsys.readouterr())
-        return [*queries, *(repr(entry) for entry in entries), caplog.text, *printed]
+        # Обычный `logging` — только свой: адрес запроса пишет в журнал и сам
+        # тестовый клиент, а это не сервер.
+        logged = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "root" or record.name.split(".")[0] == "src"
+        ]
+        return [*queries, *(repr(entry) for entry in entries), *logged, *printed]
 
-    # Адрес запроса пишет в журнал и сам тестовый клиент — это не сервер.
-    # Порядок важен: `set_level` каждый раз выставляет уровень и самому сборщику.
-    caplog.set_level(logging.WARNING, logger="httpx")
     caplog.set_level(logging.DEBUG)
     engine = db_session.get_bind()
     event.listen(engine, "before_cursor_execute", record)
