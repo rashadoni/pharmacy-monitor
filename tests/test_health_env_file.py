@@ -293,16 +293,19 @@ def test_message_says_where_the_file_is_and_nothing_else_about_it(server: Machin
 
     told = health._check_env_file_next_to_code()[0]
 
-    for secret in FILE_CONTENT:
-        assert secret not in told.message
-    # Ни размера, ни времени, ни владельца: вне двух путей в сообщении нет цифр…
-    outside_the_paths = told.message.replace(str(server.beside_code), "").replace(
-        str(server.settings_file), ""
+    # Текст целиком: два пути и постоянные слова. Ни содержимого, ни размера, ни
+    # времени, ни владельца, ни прав — ничему из этого в нём нет места.
+    assert told.message == (
+        f"Рядом с кодом лежит {server.beside_code} — на сервере его быть не должно: "
+        f"настройки сервера живут в {server.settings_file}, а из .env команды CLI "
+        "добирают имена, которых нет в окружении службы (API его не читает). "
+        "Как проверить и убрать — docs/RUNBOOK.md «Откуда процесс берёт настройки»."
     )
-    assert not any(character.isdigit() for character in outside_the_paths)
-    # …и о другом файле на том же месте сказано слово в слово то же.
+    assert told.context == {"path": str(server.beside_code)}
+    # И о других файлах на тех же местах сказано слово в слово то же.
     server.beside_code.write_text("")
     os.utime(server.beside_code, (0, 0))
+    server.settings_file.write_text("OTHER_NAME=other-value\n" * 50)
     assert health._check_env_file_next_to_code() == [told]
 
 
@@ -483,9 +486,11 @@ def test_server_is_recognised_by_the_file_the_units_are_fed(real_paths: dict[str
     assert named == {real_paths["server"]} == {"/etc/pharmacy-monitor/env"}
 
 
-def test_rest_of_the_suite_runs_as_on_a_developer_machine() -> None:
+def test_rest_of_the_suite_runs_as_on_a_developer_machine(real_paths: dict[str, str]) -> None:
     # Тесты проверяют правило, а не машину: в тестовом процессе признак сервера
     # снят (conftest), иначе на машине с файлом настроек сервера и `.env` в корне
-    # чекаута краснел бы любой тест, ждущий чистый отчёт.
+    # чекаута краснел бы любой тест, ждущий чистый отчёт. Сверка с настоящим
+    # путём нужна, чтобы пропажа фикстуры была видна и там, где файла нет.
+    assert str(health._SERVER_ENV_FILE) != real_paths["server"]
     assert not health._is_there(health._SERVER_ENV_FILE)
     assert health._check_env_file_next_to_code() == []
