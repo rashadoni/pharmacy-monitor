@@ -7,6 +7,7 @@ import { useState } from "react";
 import { ArrowLeft, Clock, Send, Trash2, UserPlus } from "lucide-react";
 import { api, type Recipient, type RecipientCreate, type RecipientUpdate } from "@/lib/api";
 import { formatTime } from "@/lib/utils";
+import { isLoginLinkNotSentError } from "@/lib/api";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
 type Sev = (typeof SEVERITIES)[number];
@@ -78,6 +79,7 @@ export default function UsersPage() {
               createMut.isError ? ((createMut.error as Error)?.message ?? t("add_error")) : null
             }
             doneEmail={createMut.isSuccess ? createMut.data?.email : null}
+            inviteSent={createMut.data?.invite_sent}
           />
           <div className="space-y-3">
             {listQ.isLoading && (
@@ -140,6 +142,7 @@ function AddUserForm({
   pending,
   error,
   doneEmail,
+  inviteSent,
 }: {
   dailyEnabled: boolean;
   weeklyEnabled: boolean;
@@ -147,6 +150,8 @@ function AddUserForm({
   pending: boolean;
   error: string | null;
   doneEmail?: string | null;
+  // Подтвердил ли отправитель письмо со ссылкой: «отправлена» — только по true.
+  inviteSent?: boolean;
 }) {
   const t = useTranslations("users");
   const [email, setEmail] = useState("");
@@ -216,7 +221,19 @@ function AddUserForm({
         >
           {pending ? t("adding") : t("add_btn")}
         </button>
-        {doneEmail && <span className="text-xs text-success">{t("added", { email: doneEmail })}</span>}
+        {doneEmail && inviteSent === true && (
+          <span className="text-xs text-success">{t("added", { email: doneEmail })}</span>
+        )}
+        {doneEmail && inviteSent === false && (
+          <span className="text-xs text-destructive">
+            {t("added_invite_not_sent", { email: doneEmail })}
+          </span>
+        )}
+        {doneEmail && inviteSent === undefined && (
+          <span className="text-xs text-success">
+            {t("added_invite_unknown", { email: doneEmail })}
+          </span>
+        )}
         {error && <span className="text-xs text-destructive">{error}</span>}
       </div>
       <p className="text-xs text-muted-foreground mt-2">{t("add_hint")}</p>
@@ -337,7 +354,11 @@ function UserCard({
             <span className="text-[11px] text-success">{t("login_link_sent")}</span>
           )}
           {sendLinkMut.isError && (
-            <span className="text-[11px] text-destructive">{t("login_link_error")}</span>
+            <span className="text-[11px] text-destructive">
+              {isLoginLinkNotSentError(sendLinkMut.error)
+                ? t("login_link_not_sent")
+                : t("login_link_error")}
+            </span>
           )}
           <button
             onClick={() => sendLinkMut.mutate()}

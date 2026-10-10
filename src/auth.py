@@ -127,7 +127,7 @@ def render_login_gate() -> bool:
                                     "PHARMACY_PUBLIC_URL", "http://localhost:8501"
                                 )
                                 link = f"{domain}/?magic_token={token}"
-                                notifier.send_email(
+                                confirmed = notifier.send_email(
                                     subject="Pharmacy Monitor — вход",
                                     html_body=(
                                         f"<p>Кликни на ссылку чтобы войти "
@@ -136,7 +136,12 @@ def render_login_gate() -> bool:
                                     ),
                                     to=[email],
                                 )
-                                st.success("Ссылка отправлена на email!")
+                                # «Отправлена» — только о письме, которое
+                                # отправитель подтвердил: без SMTP он отвечает False.
+                                if confirmed:
+                                    st.success("Ссылка отправлена на email!")
+                                else:
+                                    st.error("Письмо со ссылкой не ушло: отправка не подтверждена.")
                             except Exception as e:
                                 st.error(f"Не удалось отправить email: {e}")
 

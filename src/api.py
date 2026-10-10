@@ -938,13 +938,25 @@ def _wants_html(request: Request) -> bool:
     return "text/html" in request.headers.get("accept", "").lower()
 
 
-def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
-    """Выпустить magic-token для email и отправить ссылку на вход. Best-effort.
+# Чем кончилась отправка ссылки на вход. «Пользователь найден» и «отправитель
+# письмо подтвердил» — разные вещи: первое нельзя выдавать на `/auth/request`,
+# второе обязан знать администратор, который нажал «отправить ссылку».
+LOGIN_LINK_SENT = "sent"
+LOGIN_LINK_NOT_SENT = "not_sent"
+LOGIN_LINK_NO_USER = "no_user"
+# Код отказа в ответе администратору; по нему страница «Пользователи» берёт фразу.
+LOGIN_LINK_NOT_SENT_CODE = "login_link_not_sent"
 
-    Возвращает True, если активный пользователь с таким email найден (токен
-    выпущен, попытка отправки сделана), False — если такого активного юзера нет.
-    Сбой SMTP логируется, но НЕ пробрасывается: создание/инвайт пользователя не
-    должно падать из-за временной проблемы с почтой (fail-open).
+
+def _deliver_login_link(db: Session, email: str, *, invite: bool = False) -> str:
+    """Выпустить magic-token для email, отправить ссылку на вход и назвать исход.
+
+    `LOGIN_LINK_SENT` — отправитель письмо подтвердил. `LOGIN_LINK_NOT_SENT` —
+    пользователь есть, токен выпущен, но письмо не ушло: отправитель отказал
+    (`send_email` без SMTP отвечает False), ничего не ответил или бросил
+    исключение. `LOGIN_LINK_NO_USER` — активного пользователя с таким email нет,
+    письмо и не собиралось. Сбой почты не пробрасывается: создание пользователя
+    из-за него не падает. Кому не ушло — `login_link_email_failed user_id=…`.
 
     Цель ссылки выбирается по тому, есть ли у пользователя свой пароль:
     - нет пароля (`password_hash` пуст) → `/set-password` — юзер задаёт пароль и
@@ -960,10 +972,10 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
         )
     )
     if not user:
-        return False
+        return LOGIN_LINK_NO_USER
     token = tenants.issue_magic_token(db, email)
     if not token:
-        return False
+        return LOGIN_LINK_NO_USER
     needs_password = not user.password_hash
     public_url = os.environ.get("PHARMACY_PUBLIC_URL", "http://localhost:3000")
     if needs_password:
@@ -990,7 +1002,7 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     try:
         from src import notifier
 
-        notifier.send_email(
+        confirmed = notifier.send_email(
             subject=subject,
             html_body=(
                 f"{intro}"
@@ -1004,7 +1016,25 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
         from src.notifier import delivery_error_fields
 
         log.warning("login_link_email_failed", user_id=user.id, **delivery_error_fields(e))
-    return True
+        return LOGIN_LINK_NOT_SENT
+    if not confirmed:
+        # Отправитель не упал, но и не подтвердил — причину он написал сам
+        # (`email_skipped_no_smtp`); здесь — кому не ушло.
+        log.warning("login_link_email_failed", user_id=user.id)
+        return LOGIN_LINK_NOT_SENT
+    return LOGIN_LINK_SENT
+
+
+def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
+    """Ссылка на вход для публичного `/auth/request`. Best-effort.
+
+    Возвращает True, если активный пользователь с таким email найден (токен
+    выпущен, попытка отправки сделана), False — если такого активного юзера нет.
+    Ушло ли письмо, ответ намеренно НЕ говорит: по `/auth/request` нельзя узнать
+    ни есть ли такой адрес, ни работает ли почта. Вызывающему, который после
+    вызова скажет «отправлено», нужна `_deliver_login_link`.
+    """
+    return _deliver_login_link(db, email, invite=invite) != LOGIN_LINK_NO_USER
 
 
 @app.post("/auth/request", response_model=AuthRequestOut)
@@ -1877,7 +1907,14 @@ def dash_recipients_list(
     return [_to_recipient_out(u) for u in users]
 
 
-@app.post("/api/v1/dash/recipients", response_model=RecipientOut)
+class RecipientCreatedOut(RecipientOut):
+    # Подтвердил ли отправитель письмо со ссылкой на вход. Пользователь создан в
+    # обоих случаях; False — письмо не ушло, и без кнопки «отправить ссылку»
+    # войти ему нечем.
+    invite_sent: bool
+
+
+@app.post("/api/v1/dash/recipients", response_model=RecipientCreatedOut)
 def dash_recipients_create(
     payload: RecipientCreate,
     user: storage.TenantUser = Depends(require_user),
@@ -1909,15 +1946,18 @@ def dash_recipients_create(
     db.refresh(new_user)
     # Авто-инвайт: новый юзер получает magic-link на вход сразу (без него у
     # него нет способа залогиниться — общий пароль логинит как админа, а формы
-    # запроса ссылки в UI нет). Best-effort: сбой почты не валит создание.
-    invite_sent = _send_login_link(db, new_user.email, invite=True)
+    # запроса ссылки в UI нет). Best-effort: сбой почты не валит создание, но
+    # `invite_sent` — только о письме, которое отправитель подтвердил.
+    invite_sent = _deliver_login_link(db, new_user.email, invite=True) == LOGIN_LINK_SENT
     log.info(
         "recipient_created",
         id=new_user.id,
         by_user_id=user.id,
         invite_sent=invite_sent,
     )
-    return _to_recipient_out(new_user)
+    return RecipientCreatedOut(
+        **_to_recipient_out(new_user).model_dump(), invite_sent=invite_sent
+    )
 
 
 @app.patch("/api/v1/dash/recipients/{recipient_id}", response_model=RecipientOut)
@@ -2030,6 +2070,11 @@ def dash_recipients_send_login_link(
     В отличие от публичного /auth/request (анти-enumeration → всегда 200), этот
     эндпоинт admin-only, поэтому может честно вернуть 404/400 — утечки наличия
     email тут нет.
+
+    Ответ 200 — только о письме, которое отправитель подтвердил. Не подтвердил
+    (отказ почты, сеть, SMTP не настроен) — 502 с кодом `login_link_not_sent`:
+    ошибкой это видит и вкладка, открытая до выкладки, и любой клиент, который
+    читает один статус.
     """
     _require_admin(user)
     r = db.scalar(
@@ -2042,7 +2087,15 @@ def dash_recipients_send_login_link(
         raise HTTPException(404, "Recipient not found")
     if not r.is_active:
         raise HTTPException(400, "Пользователь деактивирован — сначала активируйте его")
-    _send_login_link(db, r.email, invite=False)
+    if _deliver_login_link(db, r.email, invite=False) != LOGIN_LINK_SENT:
+        log.warning("recipient_login_link_not_sent", id=r.id, by_user_id=user.id)
+        raise HTTPException(
+            502,
+            detail={
+                "code": LOGIN_LINK_NOT_SENT_CODE,
+                "message": "The login-link email was not sent: the mail sender did not confirm it.",
+            },
+        )
     log.info("recipient_login_link_sent", id=r.id, by_user_id=user.id)
     return {"ok": True, "email": r.email}
 
