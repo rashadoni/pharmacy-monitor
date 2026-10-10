@@ -1,5 +1,7 @@
 """Общие фикстуры для тестов: shared in-memory SQLite через StaticPool."""
 
+from pathlib import Path
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -35,3 +37,19 @@ def _reset_catalog_search_index():
     catalog_search.reset_cache()
     yield
     catalog_search.reset_cache()
+
+
+@pytest.fixture(autouse=True)
+def _not_a_server(monkeypatch):
+    """Для health любая машина, где идут тесты, — машина разработчика.
+
+    `health._check_env_file_next_to_code` смотрит на настоящий диск: есть ли файл
+    настроек сервера и лежит ли `.env` в корне чекаута. Там, где есть оба, краснел
+    бы каждый тест, ждущий чистый отчёт. Тесты самой проверки
+    (`tests/test_health_env_file.py`) ставят оба пути сами.
+    """
+    from src import health
+
+    monkeypatch.setattr(
+        health, "_SERVER_ENV_FILE", Path(__file__).resolve().parent / "no-server-settings-here"
+    )

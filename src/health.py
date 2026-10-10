@@ -3,6 +3,9 @@
 Используется через CLI `pharmacy-monitor health-check` (на cron каждый час)
 или встраивается в основной прогон.
 
+Отдельно от прогонов проверяется установка: на сервере рядом с кодом не должен
+лежать `.env` (`_check_env_file_next_to_code`).
+
 Что детектируется:
 1. **Stale**: последнего прогона нет дольше ритма самого частого сайта
 2. **Failed**: последний run завершился со status='failed'
@@ -15,6 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Literal
 
 import structlog
@@ -74,6 +78,11 @@ def check_health(
 ) -> HealthReport:
     """Запустить все проверки и вернуть совокупный отчёт."""
     report = HealthReport(status="ok")
+
+    # 0. Установка, а не данные: прогоны проверке не нужны, поэтому она стоит до
+    # раннего выхода `no_runs`. База ей тоже не нужна, но отчёт без базы не
+    # собирается вовсе: упадёт запрос ниже — не будет и этого предупреждения.
+    report.issues.extend(_check_env_file_next_to_code())
 
     from src import storage
 
@@ -604,6 +613,70 @@ def alert_due(
     except (TypeError, ValueError):
         return True
     return elapsed < timedelta(0) or elapsed >= timedelta(hours=cooldown_hours)
+
+
+# Файл настроек сервера: его подаёт службам systemd (`EnvironmentFile=` в каждом
+# юните из infra/systemd). Он же признак «это сервер»: на машине разработчика
+# его нет, и там `.env` в корне чекаута — штатное место настроек. Признак берётся
+# с диска, а не из окружения процесса: `INVOCATION_ID` и подобное говорят лишь
+# «запущено из-под systemd», а это бывает и на машине разработчика (служба
+# пользователя), и там, где `.env` сам назван `EnvironmentFile` юнита и вторым
+# источником не является. Файл не открывается — нужен только факт, что он есть.
+_SERVER_ENV_FILE = Path("/etc/pharmacy-monitor/env")
+
+# `.env`, который прочёл бы этот код: то же выражение, что у `load_dotenv` в
+# `src/main.py`, — корень чекаута, из которого код исполняется.
+_CHECKOUT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _is_there(path: Path) -> bool:
+    """Лежит ли что-нибудь по этому пути. Сам файл не открывается.
+
+    «Нет» — только когда система прямо ответила, что пути нет. Любой другой
+    отказ (каталог закрыт правами, сбой диска) считается «есть»: проверка,
+    которая на собственном сбое отвечает «всё чисто», ничего не сторожит.
+    """
+    try:
+        path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _check_env_file_next_to_code() -> list[HealthIssue]:
+    """На сервере рядом с кодом лежит `.env` — второй источник настроек.
+
+    Настройки сервера живут в `_SERVER_ENV_FILE`. `.env` в корне выложенного
+    кода команды CLI всё равно читают — для имён, которых нет в окружении
+    службы, — а API не читает вовсе: одно имя может значить разное у двух
+    процессов. Выкладка такой файл не возит, но один уже нашёлся: лежал с мая
+    2026, заметили в октябре.
+
+    Смотрим только, лежит ли файл: проверка его не открывает и от себя ни имён,
+    ни значений в отчёт не добавляет — там путь и ничего больше. Что в файле и
+    чем он расходится с файлом настроек, говорит `scripts/diag_env_sources.py`.
+
+    warning, а не critical: данные клиента не устарели и не пропали, сборы идут.
+    Письмо уходит один раз, дальше — напоминание раз в сутки, пока файл не
+    убран: подпись инцидента (`alert_signature`) — код и важность, от проверки
+    к проверке она та же. Кому уходит письмо, важность не решает: его получают
+    все активные получатели (`notifier.resolve_recipients`).
+    """
+    if not _is_there(_SERVER_ENV_FILE) or not _is_there(_CHECKOUT_ENV_FILE):
+        return []
+    return [
+        HealthIssue(
+            "warning",
+            "env_file_next_to_code",
+            f"Рядом с кодом лежит {_CHECKOUT_ENV_FILE} — на сервере его быть не должно: "
+            f"настройки сервера живут в {_SERVER_ENV_FILE}, а из .env команды CLI "
+            "добирают имена, которых нет в окружении службы (API его не читает). "
+            "Как проверить и убрать — docs/RUNBOOK.md «Откуда процесс берёт настройки».",
+            context={"path": str(_CHECKOUT_ENV_FILE)},
+        )
+    ]
 
 
 # Окно СВЕЖЕСТИ для знаменателя site_drop: живым считается каталог, виденный за
