@@ -2,6 +2,14 @@
 
 12-week roadmap delivered. This is the master index of what's where.
 
+> ⚠️ Marked 2026-10-11. This overview is a snapshot taken when the 12-week
+> roadmap was delivered (May 2026). Its test counts, route counts, file lists
+> and the "frozen for v1.0" stack table describe that moment and were not
+> re-checked. Two lines were brought up to date on 2026-10-11: the "Hosting" row
+> of the stack table and item 4 of "Where to start". Current test numbers are in
+> the CI log (`docs/ARCHITECTURE.md`, section 6); the current server and what
+> runs on it — `CLAUDE.md`, "Current production state".
+
 ## Architecture (final)
 
 ```
@@ -169,7 +177,7 @@ load-test/api.k6.js + README   k6 scenarios + thresholds            W12
 | Errors | Sentry SDK | 2+ |
 | Metrics | prometheus-client | 0.21+ |
 | CI/CD | GitHub Actions → SSH deploy | — |
-| Hosting | Hetzner CX22 (4 vCPU, 8GB, ~6€/mo) | — |
+| Hosting | Contabo VPS — 4 vCPU, 8 GB RAM, 96 GB disk, Ubuntu 24.04 (since 2026-09-03; read from the server 2026-10-11). v1.0 ran on a Hetzner Cloud VM (this row said "Hetzner CX22 (4 vCPU, 8GB, ~6€/mo)"); that server was deleted in September 2026. The Contabo price is not recorded in the repository | — |
 | TLS / Proxy | Caddy | 2 |
 | Process | systemd | — |
 

@@ -113,6 +113,14 @@ from src.observability import (
 
 init_observability(service="api")
 
+# Журнал доступа uvicorn пишет адрес запроса целиком, а в нём — токен входа из
+# письма (`/auth/verify?token=…`). Строка запроса из журнала убирается здесь,
+# при импорте приложения: так фильтр стоит в каждом рабочем процессе раньше
+# первого запроса. Почему не флагом в юните — src/access_log.py.
+from src.access_log import hide_query_strings
+
+hide_query_strings()
+
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
