@@ -78,7 +78,7 @@ infra/systemd/pharmacy-monitor-digest@weekly.timer W9
 infra/systemd/pharmacy-monitor-telegram-bot.service W9
 infra/grafana/dashboard.json                    W11
 infra/prometheus.yml                            W11
-.github/workflows/ci.yml                        W1
+.github/workflows/ci-pipeline.yml               W1
 .github/workflows/deploy.yml                    W1
 ```
 
