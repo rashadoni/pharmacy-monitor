@@ -81,12 +81,21 @@ curl -i -H "Origin: https://evil.com" \
 - [ ] No secrets in git history (`git secrets --scan` or `gitleaks`)
 - [ ] `.env`, `.env.local` in `.gitignore`
 - [ ] Secrets only in `/etc/pharmacy-monitor/env` (mode 0600, owned by `pm:pm`)
-- [ ] GitHub Actions secrets (HETZNER_SSH_KEY) only used in `deploy.yml`, never echoed
+- [ ] GitHub Actions secret `SSH_PRIVATE_KEY` — the key workflows use to log in to the server as `pm`, the only secret the repository has (`gh secret list`) — is passed to a step only through `env:` and written only to the key file, never printed to the log. Every workflow that connects to the server reads it, not `deploy.yml` alone: 20 of the 22 files in `.github/workflows/` on 2026-10-11
 
 ```bash
 # On server:
 ls -la /etc/pharmacy-monitor/env
 # Expect: -rw------- 1 pm pm
+
+# In workflows: which ones read the secret
+grep -l 'secrets\.SSH_PRIVATE_KEY' .github/workflows/*.yml
+# ...any that read it other than as an `env:` entry of that name
+grep -n 'secrets\.SSH_PRIVATE_KEY' .github/workflows/*.yml | grep -v '^[^:]*:[0-9]*: *SSH_PRIVATE_KEY: \${{ secrets\.SSH_PRIVATE_KEY }} *$'
+# Expect: empty
+# ...and what the steps do with `$SSH_PRIVATE_KEY`
+grep -nE '\$\{?SSH_PRIVATE_KEY' .github/workflows/*.yml
+# Expect: only emptiness tests and redirects into ~/.ssh/id_ed25519
 
 # In git:
 git log -p -- .env 2>&1 | head  # should be empty

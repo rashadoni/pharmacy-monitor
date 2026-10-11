@@ -178,7 +178,7 @@ load-test/api.k6.js + README   k6 scenarios + thresholds            W12
 1. **Check pre-flight**: `docs/SECURITY.md` and `docs/GO_LIVE.md`
 2. **Run tests**: `.venv/bin/pytest -q && cd frontend && pnpm test`
 3. **Local dev**: `docker compose up -d && uvicorn src.api:app --reload &  cd frontend && pnpm dev`
-4. **Production deploy**: `bash infra/scripts/initial_server_setup.sh` on Hetzner, then `bash infra/deploy.sh`
+4. **Production deploy**: once CI is green on the commit, start the `deploy.yml` workflow by hand — `gh workflow run deploy.yml --ref main -f apply_migrations=false`; details in `docs/RUNBOOK.md`, in the note that opens the section «Обновления / деплой нового кода». (This line used to say `bash infra/deploy.sh` on Hetzner: that server was deleted in September 2026, and the script was removed from the repository on 2026-10-11.)
 
 ## What's NOT done (out of scope for v1.0)
 
