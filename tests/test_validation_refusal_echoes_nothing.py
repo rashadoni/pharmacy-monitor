@@ -13,20 +13,27 @@ FastAPI по умолчанию кладёт в `detail[].input` значени�
 
 Что здесь проверяется:
 
-- ни на одном адресе входа и ни при каком виде отказа присланного в ответе нет;
-- остаётся то, чем запрос можно поправить, — `type`, `loc`, `msg` и `ctx`:
-  интерфейс читает `msg` и `loc` (`friendlyError`), по `ctx` берёт перевод;
+- ни на одном адресе входа и ни при каком виде отказа присланного в ответе нет —
+  ни в теле, ни в заголовках;
+- остаётся то, чем запрос можно поправить: `type`, `loc`, `msg` — их читает
+  интерфейс (`friendlyError`) — и `ctx` с параметрами правила; исключение
+  валидатора в `ctx` не идёт;
 - ответ собирается, когда суррогат стоит в значении, в имени поля, в теле;
-- правило одно на все маршруты, и ни одна модель запроса не цитирует значение
-  в тексте причины.
+- правило одно на все маршруты.
 
-Отказ, который обработчик бросает сам (`HTTPException(422)`), сюда не относится:
-его текст пишет наш код.
+Чего обработчик не может: текст причины (`msg`) пишет валидатор, и вырезать из
+него нечего. Валидатор, который цитирует значение, вернул бы его — а на суррогате
+упал бы ещё до ответа. Поэтому последний тест прогоняет через отказ все модели
+`src/api.py`.
+
+Отказ, который обработчик маршрута бросает сам (`HTTPException(422)`), сюда не
+относится: его текст пишет наш код.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -91,7 +98,7 @@ WITH_A_SURROGATE = [
 
 
 @pytest.fixture
-def sessions(monkeypatch, db_session) -> sessionmaker:
+def sessions(monkeypatch, db_session) -> Iterator[sessionmaker]:
     if not api_module._JWT_AVAILABLE:
         pytest.skip("python-jose not installed — JWT tests skipped")
     factory = sessionmaker(db_session.get_bind(), expire_on_commit=False, autoflush=False)
@@ -101,7 +108,8 @@ def sessions(monkeypatch, db_session) -> sessionmaker:
     # счётчик в нём переживал бы тест.
     monkeypatch.setattr(rate_limit, "_redis_client", lambda: None)
     rate_limit._reset_memory_for_tests()
-    return factory
+    yield factory
+    rate_limit._reset_memory_for_tests()
 
 
 @pytest.fixture
@@ -130,6 +138,7 @@ def _post(client: TestClient, path: str, body: Any) -> Response:
 def _assert_refusal_echoes_nothing(response: Response) -> list[dict]:
     assert response.status_code == 422, response.text
     assert SECRET not in response.text
+    assert SECRET not in str(response.headers)
     problems = response.json()["detail"]
     assert problems, "отказ без единой причины"
     for problem in problems:
@@ -162,6 +171,30 @@ def test_a_query_value_is_not_returned(signed_in):
 
     (problem,) = _assert_refusal_echoes_nothing(refused)
     assert problem["loc"] == ["query", "limit"]
+
+
+def test_a_value_in_the_address_is_not_returned(signed_in):
+    refused = signed_in.get(f"/api/v1/dash/matches/{SECRET}/alternatives")
+
+    problems = _assert_refusal_echoes_nothing(refused)
+    assert ["path", "match_id"] in [problem["loc"] for problem in problems]
+
+
+def test_every_problem_is_named_not_only_the_first(client):
+    problems = _assert_refusal_echoes_nothing(_post(client, "/auth/login", {"note": SECRET}))
+
+    assert [problem["loc"] for problem in problems] == [["body", "login"], ["body", "password"]]
+
+
+def test_the_exception_of_a_validator_is_not_returned(client):
+    refused = _post(client, "/auth/login", {"login": "admin", "password": SECRET * 12})
+
+    # pydantic кладёт в `ctx` само исключение валидатора — в ответе его нет.
+    assert refused.json() == {
+        "detail": [
+            {"type": "value_error", "loc": ["body", "password"], "msg": "Value error, too long"}
+        ]
+    }
 
 
 def test_the_refusal_still_names_the_field_and_the_reason(client):
@@ -199,6 +232,14 @@ class _Strict(BaseModel):
     code: str = Field(default="abc", min_length=3)
     address: str = "a@example.com"
     prices: dict[str, int] = Field(default_factory=dict)
+    settings: str = "{}"
+
+    @field_validator("settings")
+    @classmethod
+    def _settings(cls, value: str) -> str:
+        # JSONDecodeError — тоже ValueError, а разбираемый текст лежит в её `doc`.
+        json.loads(value)
+        return value
 
     @field_validator("address")
     @classmethod
@@ -233,13 +274,21 @@ def strict() -> TestClient:
 def test_a_surrogate_in_a_name_pydantic_reports_is_refused_too(strict, raw):
     """Имя из запроса pydantic кладёт в `loc` — но суррогат в нём заменяет сам.
 
-    На это опирается обработчик: без `input` суррогату в ответ попасть неоткуда,
-    и собирать ответ особым способом не нужно.
+    На это опирается обработчик: в том, что пишет pydantic, суррогата нет, и
+    собирать ответ особым способом не нужно.
     """
     refused = _post(strict, "/strict", raw)
 
     assert refused.status_code == 422, refused.text
     assert refused.json()["detail"]
+
+
+def test_an_exception_that_carries_the_value_is_not_unfolded(strict):
+    refused = _post(strict, "/strict", {"settings": "{" + SECRET})
+
+    (problem,) = _assert_refusal_echoes_nothing(refused)
+    assert problem["type"] == "value_error"
+    assert "ctx" not in problem
 
 
 def test_the_parameters_of_the_rule_stay_in_the_refusal(strict):
@@ -273,13 +322,31 @@ def _models_of_the_api() -> list[type[BaseModel]]:
     )
 
 
-# Значение на месте каждого поля: слишком длинное, пустое по смыслу, не того типа.
-PROBES = [SECRET, SECRET * 40, f" {SECRET} ", f"{SECRET}\ud800", [SECRET], {"is": SECRET}]
+# Значение на месте каждого поля: слишком длинное, в пробелах, похожее на адрес,
+# с суррогатом, не того типа.
+PROBES = [
+    SECRET,
+    SECRET * 40,
+    f" {SECRET} ",
+    f"{SECRET}@{SECRET}.example",
+    f"{SECRET}\ud800",
+    [SECRET],
+    {"is": SECRET},
+]
 
 
 @pytest.mark.parametrize("model", _models_of_the_api(), ids=lambda model: model.__name__)
 async def test_no_model_quotes_the_value_in_its_reason(model):
-    """`msg` пишет валидатор: `raise ValueError(f"плохой пароль {v}")` вернул бы пароль."""
+    """Валидатор с текстом вроде `f"плохой пароль {v}"` вернул бы пароль в `msg`.
+
+    Упал этот тест — замените текст на постоянный; код причины для интерфейса
+    кладётся в `ctx` (`PydanticCustomError`). Исключение `UnicodeEncodeError`
+    здесь значит то же: значение с суррогатом попало в текст причины.
+
+    Сверка грубая: пробует несколько значений на месте всех полей сразу и видит
+    только модели из `src/api.py`. Валидатор, который цитирует значение лишь при
+    особом его виде, она пропустит.
+    """
     for probe in PROBES:
         try:
             model.model_validate({name: probe for name in model.model_fields})

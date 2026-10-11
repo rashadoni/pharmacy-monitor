@@ -174,19 +174,31 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-# `ctx` — параметры правила (границы длины, код причины): по ним интерфейс
-# подбирает перевод. Чего в списке нет, в ответ не идёт — и поле, которое
-# FastAPI добавит позже, тоже.
+# Чего в списке нет, в ответ не идёт — и поле, которое FastAPI добавит позже,
+# тоже. `ctx` — параметры правила: граница длины, код причины для интерфейса.
+#
+# Остаётся текст причины (`msg`): его пишет pydantic или наш валидатор, и вырезать
+# из него нечего. Поэтому текст валидатора значение не цитирует — постоянная
+# строка, а не f-строка. Сверяет `tests/test_validation_refusal_echoes_nothing.py`.
 _REFUSAL_FIELDS = ("type", "loc", "msg", "ctx")
 
 
 @app.exception_handler(RequestValidationError)
 async def _validation_refusal(request: Request, exc: RequestValidationError) -> JSONResponse:
-    problems = [
-        {field: error[field] for field in _REFUSAL_FIELDS if field in error}
-        for error in exc.errors()
-        if isinstance(error, dict)
-    ]
+    problems = []
+    for error in exc.errors():
+        problem = {field: error[field] for field in _REFUSAL_FIELDS if field in error}
+        # Исключение валидатора pydantic кладёт в `ctx` объектом, а кодировщик
+        # разворачивает его атрибуты: у JSONDecodeError среди них разбираемый
+        # текст — то самое значение.
+        rule = {
+            name: value
+            for name, value in problem.pop("ctx", {}).items()
+            if not isinstance(value, BaseException)
+        }
+        if rule:
+            problem["ctx"] = rule
+        problems.append(problem)
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(problems)})
 
 
@@ -1129,10 +1141,11 @@ def _login_bytes(login: str) -> bytes:
 
 
 def _fits_text_column(value: str) -> bool:
-    """Может ли строка лежать в текстовой колонке базы.
+    """Может ли строка лежать в текстовой колонке PostgreSQL.
 
     Одиночный суррогат не кодируется в UTF-8, нулевой байт PostgreSQL в тексте не
-    хранит: на обоих драйвер бросает исключение, не дойдя до запроса.
+    хранит: драйвер бросает исключение, не дойдя до запроса. SQLite нулевой байт
+    принимает — в тестах на ней эту половину правила не видно.
     """
     try:
         value.encode("utf-8")
@@ -1184,8 +1197,8 @@ def auth_login(
             db.commit()
         pw_to_check = user.password_hash or env_pw_hash
     elif not _fits_text_column(login_raw):
-        # Адреса с таким знаком в базе быть не может, а запрос с ним упал бы.
-        # Отказ ниже — тот же, что на любой незнакомый логин.
+        # В базе PostgreSQL адреса с таким знаком быть не может, а запрос с ним
+        # упал бы. Отказ ниже — тот же, что на любой незнакомый логин.
         user, pw_to_check = None, ""
     else:
         # Email-based login для конкретного пользователя — без env-fallback

@@ -4,8 +4,8 @@
 
 - на логин не латиницей («админ», `ə@example.com`): логин сверялся с ADMIN_LOGIN
   через `hmac.compare_digest` на строках, а тот берёт строки только из ASCII и
-  бросает TypeError. Человек, набравший логин в другой раскладке, видел «сервер
-  недоступен», а запрос с его настоящим паролем уходил с ошибкой в Sentry;
+  бросает TypeError. Человек, набравший логин в другой раскладке, видел «Ошибка
+  входа», а запрос с его настоящим паролем уходил с ошибкой в Sentry;
 - на логин с одиночным суррогатом или нулевым байтом: в JSON обе строки
   допустимы, но суррогат не кодируется в UTF-8, а нулевой байт PostgreSQL в
   тексте не хранит — исключение бросал драйвер базы, не дойдя до запроса.
@@ -14,15 +14,18 @@
 
 - отказ на такой логин — тот же ответ, что на незнакомый латинский, и считается
   той же неудачной попыткой;
-- логин, который на ADMIN_LOGIN только похож, администратором не становится;
+- логин, который на ADMIN_LOGIN или на чужой адрес только похож, не подходит:
+  при сверке ничего не отбрасывается и не заменяется;
 - сверка осталась без регистра и работает при ADMIN_LOGIN не латиницей;
-- пользователь с адресом не латиницей входит.
+- пользователь с адресом не латиницей входит (такие адреса могли завести раньше).
 
 Нулевой байт SQLite в запросе принимает, отвергает его только PostgreSQL —
 поэтому случаи с базой идут на обеих.
 
-Пароль, который не берёт bcrypt (суррогат, длиннее 72 байт), — отдельная правка,
-`tests/test_password_fits_bcrypt.py`.
+Чего здесь нет. Пароль, который не берёт bcrypt (суррогат, длиннее 72 байт), на
+входе по-прежнему даёт 500 — это отдельная правка. И регистр приводит
+`str.lower()`: «İ» с азербайджанской раскладки он в «i» не превращает, так что
+«ADMİN» остаётся другим логином — как считать такие буквы, здесь не решается.
 """
 
 from __future__ import annotations
@@ -66,13 +69,22 @@ ODD_LOGINS = [
     pytest.param("a\x00@example.com", id="nul-inside"),
     pytest.param("\x00", id="nul-alone"),
 ]
-# Похож на «admin», но не он: сверка по байтам не должна ничего отбрасывать.
+# Похож на «admin», но не он: сверка по байтам ничего не отбрасывает и не сводит
+# похожие знаки к одному.
 ALMOST_ADMIN = [
     pytest.param("admin\ud800", id="admin-and-surrogate"),
     pytest.param("admin\x00", id="admin-and-nul"),
+    pytest.param("admin\u200b", id="admin-and-zero-width-space"),
     pytest.param("аdmin", id="cyrillic-a"),
-    pytest.param("admın", id="dotless-i"),
-    pytest.param("ADMİN", id="dotted-capital-i"),
+    pytest.param("ａｄｍｉｎ", id="fullwidth"),
+]
+OWNER = "owner@example.com"
+# То же с адресом: знак, с которым строку нельзя искать в базе, из неё не вырезается.
+ALMOST_THE_OWNER = [
+    pytest.param("owner\x00@example.com", id="nul-inside"),
+    pytest.param("owner@example.com\x00", id="nul-after"),
+    pytest.param("owner@example.com\ud800", id="surrogate-after"),
+    pytest.param("\udc00owner@example.com", id="surrogate-before"),
 ]
 
 
@@ -120,7 +132,7 @@ def engine(request) -> Iterator[Engine]:
 
 
 @pytest.fixture
-def sessions(monkeypatch, engine) -> sessionmaker:
+def sessions(monkeypatch, engine) -> Iterator[sessionmaker]:
     if not api_module._JWT_AVAILABLE:
         pytest.skip("python-jose not installed — JWT tests skipped")
     # Сессия запроса — как в `storage.make_session`: без autoflush.
@@ -135,7 +147,10 @@ def sessions(monkeypatch, engine) -> sessionmaker:
     # счётчик в нём переживал бы тест.
     monkeypatch.setattr(rate_limit, "_redis_client", lambda: None)
     rate_limit._reset_memory_for_tests()
-    return factory
+    yield factory
+    # Без Redis счётчик общий на процесс: исчерпанный здесь предел достался бы
+    # следующему файлу.
+    rate_limit._reset_memory_for_tests()
 
 
 @pytest.fixture
@@ -179,7 +194,7 @@ def _refusals_before_the_limit(client: TestClient, login: str) -> int:
 @pytest.mark.parametrize("login", ODD_LOGINS)
 def test_an_odd_login_is_refused_like_an_unknown_one(client, sessions, login):
     # Пароль у администратора задан: отказ — про логин, а не про пустую базу.
-    _add_user(sessions, "owner@example.com", role="admin")
+    _add_user(sessions, OWNER, role="admin")
     unknown = _login(client, UNKNOWN)
     assert unknown.status_code == 401, unknown.text
 
@@ -196,18 +211,29 @@ def test_an_odd_login_counts_as_a_failed_attempt(client, login):
 
 @pytest.mark.parametrize("login", ["admin", "Admin", "ADMIN", "  admin  "])
 def test_the_admin_login_is_matched_whatever_its_case(client, sessions, login):
-    _add_user(sessions, "owner@example.com", role="admin")
+    _add_user(sessions, OWNER, role="admin")
 
     signed_in = _login(client, login)
 
     assert signed_in.status_code == 200, signed_in.text
-    assert signed_in.json()["email"] == "owner@example.com"
+    assert signed_in.json()["email"] == OWNER
     assert api_module.COOKIE_NAME in signed_in.cookies
 
 
 @pytest.mark.parametrize("login", ALMOST_ADMIN)
 def test_a_login_that_only_resembles_the_admin_login_is_not_the_admin(client, sessions, login):
-    _add_user(sessions, "owner@example.com", role="admin")
+    _add_user(sessions, OWNER, role="admin")
+
+    refused = _login(client, login)
+
+    assert refused.status_code == 401, refused.text
+    assert api_module.COOKIE_NAME not in refused.cookies
+
+
+@pytest.mark.parametrize("login", ALMOST_THE_OWNER)
+def test_a_login_that_only_resembles_an_address_is_not_that_user(client, sessions, login):
+    _add_user(sessions, OWNER)
+    assert _login(client, OWNER).status_code == 200
 
     refused = _login(client, login)
 
@@ -218,14 +244,30 @@ def test_a_login_that_only_resembles_the_admin_login_is_not_the_admin(client, se
 @pytest.mark.parametrize("login", ["админ", "Админ", "АДМИН"])
 def test_an_admin_login_in_another_script_is_matched(client, sessions, monkeypatch, login):
     monkeypatch.setenv("ADMIN_LOGIN", "Админ")
-    _add_user(sessions, "owner@example.com", role="admin")
+    _add_user(sessions, OWNER, role="admin")
 
     signed_in = _login(client, login)
 
     assert signed_in.status_code == 200, signed_in.text
-    assert signed_in.json()["email"] == "owner@example.com"
-    # Прежний логин при этом — обычный адрес, которого в базе нет.
-    assert _login(client, "admin").status_code == 401
+    assert signed_in.json()["email"] == OWNER
+
+
+@pytest.mark.parametrize(
+    "login",
+    [
+        pytest.param("почта", id="another-word-of-the-same-length"),
+        pytest.param("admin", id="the-default-login"),
+        pytest.param("Aдмин", id="latin-a"),
+    ],
+)
+def test_another_word_is_not_an_admin_login_in_another_script(client, sessions, monkeypatch, login):
+    monkeypatch.setenv("ADMIN_LOGIN", "Админ")
+    _add_user(sessions, OWNER, role="admin")
+
+    refused = _login(client, login)
+
+    assert refused.status_code == 401, refused.text
+    assert api_module.COOKIE_NAME not in refused.cookies
 
 
 @pytest.mark.parametrize(
