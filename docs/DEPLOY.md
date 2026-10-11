@@ -1,5 +1,13 @@
 # Deployment Runbook — Hetzner CX22
 
+> ⚠️ Marked 2026-10-11. This runbook was written for the first production
+> server, a Hetzner Cloud VM. That server is gone: production moved to a Contabo
+> VPS on 2026-09-03 (address, access and what runs there — `CLAUDE.md`, "Current
+> production state"). On 2026-10-11 two places here were compared with the
+> repository and with the server: Phase 8 was rewritten, and the code steps of
+> "Rollback" were marked outdated. Nothing else was re-checked that day; it may
+> still describe the Hetzner setup.
+
 **Target**: Hetzner Cloud CX22 (4 vCPU, 8GB RAM, 80GB SSD), Ubuntu 24.04, single-tenant production.
 
 ## Prerequisites (one-time)
@@ -136,25 +144,58 @@ systemctl reload caddy
 
 ## Phase 8 — GitHub Actions deploy
 
-In GitHub repo settings → Secrets:
+A push or a merge into `main` does not start a deploy. It runs
+`ci-pipeline.yml` (lint, tests, frontend) and nothing after it. The release
+workflow, `.github/workflows/deploy.yml`, has one trigger, `workflow_dispatch`,
+so it runs only when someone starts it:
+
+```bash
+gh workflow run deploy.yml --ref main -f apply_migrations=false
+```
+
+The workflow does not look at CI — start it once CI is green on the commit
+being deployed. It copies code from its own checkout with `rsync` and runs no
+`git` command on the server: `/opt/pharmacy-monitor` there is a copy without
+`.git` (checked 2026-10-11). `infra/deploy.sh`, which updated the server with
+`git reset --hard origin/main`, was not called by any workflow and was removed
+from the repository on 2026-10-11. The preflight checks, the `apply_migrations`
+switch and the cautions about when to start are in the workflow itself and in
+`docs/RUNBOOK.md`, «Обновления / деплой нового кода» — read them there, not in
+a copy here.
+
+Two things are outside this path (as of 2026-10-11):
+
+- The weekly `autonomous-pharmonline-decodo-public-api.yml` checks out `main`
+  and runs the pipeline from its own copy of `src/`, so for that scrape a merge
+  into `main` already is the release (`docs/RUNBOOK.md`, «Выкладка правок
+  сопоставления»).
+- Three other hand-started workflows also write into the live directory:
+  `category-hotfix-deploy.yml`, `health-pharmonline-hotfix-deploy.yml` and
+  `activate-pharmonline-public-api-autonomy.yml`.
+
+One secret is involved (GitHub repo settings → Secrets and variables →
+Actions):
 
 | Secret | Value |
 |---|---|
-| `HETZNER_HOST` | server IP or domain |
-| `HETZNER_SSH_USER` | `pm` |
-| `HETZNER_SSH_KEY` | private key contents (`cat ~/.ssh/id_ed25519`) |
-| `HETZNER_SSH_KNOWN_HOSTS` | output of `ssh-keyscan <host>` |
+| `SSH_PRIVATE_KEY` | private key the workflows use to log in to the server as `pm` |
 
-Allow `pm` to run select sudo commands:
-```
-# /etc/sudoers.d/pm
-pm ALL=(ALL) NOPASSWD: /bin/systemctl restart pharmacy-monitor-api.service
-pm ALL=(ALL) NOPASSWD: /bin/systemctl restart pharmacy-monitor-frontend.service
-pm ALL=(ALL) NOPASSWD: /bin/systemctl reload caddy
-pm ALL=(ALL) NOPASSWD: /bin/systemctl reload nginx
-```
+It is the only secret the repository has (`gh secret list`, 2026-10-11). The
+server address and its SSH host key are not secrets: they are written into
+each workflow that connects to the server, and the key is kept in
+`infra/prod_known_hosts`. Never take the host key from the network
+(`ssh-keyscan`, `StrictHostKeyChecking=accept-new`):
+`tests/test_prod_host_pinning.py` fails on either in `.github/`, `infra/` and
+`scripts/`.
 
-Push to `main` → CI runs lint + tests → on success, deploy.yml SSH'es to Hetzner and runs `infra/deploy.sh`.
+`deploy.yml` restarts the two services as `pm` through `sudo -n` and checks
+first that this is allowed (step "Preflight least-privilege service restart").
+The one-time rule it expects on the server, from the workflow header:
+
+```
+# /etc/sudoers.d/pm-deploy
+pm ALL=(root) NOPASSWD: /usr/bin/systemctl restart pharmacy-monitor-api.service, /usr/bin/systemctl restart pharmacy-monitor-frontend.service
+```
 
 ## Health checks
 
@@ -178,6 +219,12 @@ ls -lth /var/backups/pharmacy-monitor/ | head
 ```
 
 ## Rollback
+
+> ⚠️ Outdated (marked 2026-10-11). The code steps below cannot work on the
+> current server: `/opt/pharmacy-monitor` is a copy without `.git` (checked
+> 2026-10-11), so `git log` and `git reset --hard` fail there. How code gets to
+> the server now — Phase 8 above. The other steps of this section were not
+> re-checked.
 
 ```bash
 # Last good revision

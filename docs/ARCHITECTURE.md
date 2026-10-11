@@ -416,7 +416,7 @@ Pre-existing failures (not blocking):
 - test_scrapers_snapshot.py (4) — нужны network fixtures для pharmonline/aloe HTTP-snapshots
 ```
 
-E2E coverage: **0 tests** — Phase 6.3 pending. С новым Playwright MCP можно драйвить через AI agent interactively сначала, потом codify как Playwright tests.
+E2E: в `frontend/e2e/` лежит восемь файлов сценариев Playwright (`*.spec.ts`, сверено 2026-10-11). CI их не исполняет: ни один workflow не зовёт `pnpm test:e2e`, сценариям нужен поднятый стенд с базой. Зелёный CI о них ничего не говорит. Как запускать — `frontend/e2e/README.md`.
 
 ---
 
@@ -432,6 +432,7 @@ E2E coverage: **0 tests** — Phase 6.3 pending. С новым Playwright MCP м
 - Phase 5.5: frontend X-Request-ID propagation
 - Phase 5.6: per-site staleness panel
 - Phase 6.1: URL-based i18n (layout-based, no middleware)
+- Phase 6.4: CI integration test — джоба `Test (pytest)` в `ci-pipeline.yml` поднимает Postgres 16 и Redis 7 service-контейнерами, накатывает миграции и гонит pytest на них
 - Phase 6.5: RUNBOOK updates
 
 ### Blocked
@@ -440,8 +441,7 @@ E2E coverage: **0 tests** — Phase 6.3 pending. С новым Playwright MCP м
 - Phase 3: HA replica — needs 2nd Hetzner cx22 ($8/мес user decision)
 
 ### Pending
-- Phase 6.3: Playwright E2E (5 scenarios)
-- Phase 6.4: CI integration test (Postgres + Redis в docker)
+- Phase 6.3: Playwright E2E — сценарии написаны (восемь файлов в `frontend/e2e/`), но CI их не исполняет: им нужен поднятый стенд с базой (сверено 2026-10-11)
 - Task #33: Fix aloe scraper URL bug (production user-facing)
 - Long-term: ERP integration (out of scope per client)
 

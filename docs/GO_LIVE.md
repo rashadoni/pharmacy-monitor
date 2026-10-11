@@ -100,6 +100,11 @@ curl -fsS https://your-domain.com/health
 
 If something is broken in production and we need to go back:
 
+> ⚠️ Outdated (marked 2026-10-11). Step 1 cannot work on the current server:
+> `/opt/pharmacy-monitor` is a copy without `.git` (checked 2026-10-11), so
+> `git log` and `git reset --hard` fail there. How code gets to the server now —
+> `docs/DEPLOY.md`, Phase 8. The other steps were not re-checked.
+
 ```bash
 # 1. Revert to last good code revision
 ssh pm@server
