@@ -416,7 +416,7 @@ Pre-existing failures (not blocking):
 - test_scrapers_snapshot.py (4) — нужны network fixtures для pharmonline/aloe HTTP-snapshots
 ```
 
-E2E: в `frontend/e2e/` лежит восемь файлов сценариев Playwright (`*.spec.ts`, сверено 2026-10-11). CI их не исполняет: ни один workflow не зовёт `pnpm test:e2e`, сценариям нужен поднятый стенд с базой. Зелёный CI о них ничего не говорит. Как запускать — `frontend/e2e/README.md`.
+E2E: в `frontend/e2e/` лежит восемь файлов сценариев Playwright (`*.spec.ts`, сверено 2026-10-11). CI их не исполняет: ни один workflow не зовёт `pnpm test:e2e`, сценариям нужен поднятый стенд с базой. Зелёный CI не говорит, проходят ли они: `tsc` в CI эти файлы только типизирует. Как запускать — `frontend/e2e/README.md`.
 
 ---
 
@@ -432,7 +432,7 @@ E2E: в `frontend/e2e/` лежит восемь файлов сценариев 
 - Phase 5.5: frontend X-Request-ID propagation
 - Phase 5.6: per-site staleness panel
 - Phase 6.1: URL-based i18n (layout-based, no middleware)
-- Phase 6.4: CI integration test — джоба `Test (pytest)` в `ci-pipeline.yml` поднимает Postgres 16 и Redis 7 service-контейнерами, накатывает миграции и гонит pytest на них
+- Phase 6.4: CI integration test — джоба `Test (pytest)` в `ci-pipeline.yml` поднимает Postgres 16 и Redis 7 service-контейнерами, накатывает на Postgres миграции и запускает pytest с `DATABASE_URL` и `REDIS_URL` на них. Общая фикстура `db_session` при этом — SQLite в памяти; на PostgreSQL идут те тесты, что сами читают `DATABASE_URL`
 - Phase 6.5: RUNBOOK updates
 
 ### Blocked

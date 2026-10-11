@@ -157,21 +157,32 @@ The workflow does not look at CI — start it once CI is green on the commit
 being deployed. It copies code from its own checkout with `rsync` and runs no
 `git` command on the server: `/opt/pharmacy-monitor` there is a copy without
 `.git` (checked 2026-10-11). `infra/deploy.sh`, which updated the server with
-`git reset --hard origin/main`, was not called by any workflow and was removed
-from the repository on 2026-10-11. The preflight checks, the `apply_migrations`
-switch and the cautions about when to start are in the workflow itself and in
-`docs/RUNBOOK.md`, «Обновления / деплой нового кода» — read them there, not in
-a copy here.
+`git reset --hard origin/main`, has not been called by any workflow since
+`deploy.yml` was rewritten on 2026-05-30, and was removed from the repository
+on 2026-10-11. A copy dated 2026-05-15 is still on the server — do not run it.
+The preflight checks, the `apply_migrations` switch and the cautions about when
+to start are in the workflow itself and in the note at the top of
+`docs/RUNBOOK.md`, «Обновления / деплой нового кода» (the code block under that
+note is the old procedure) — read them there, not in a copy here.
 
-Two things are outside this path (as of 2026-10-11):
+`deploy.yml` is the release path, but it is not the only workflow that runs a
+checkout's code on the server. As of 2026-10-11, at least:
 
-- The weekly `autonomous-pharmonline-decodo-public-api.yml` checks out `main`
-  and runs the pipeline from its own copy of `src/`, so for that scrape a merge
-  into `main` already is the release (`docs/RUNBOOK.md`, «Выкладка правок
-  сопоставления»).
-- Three other hand-started workflows also write into the live directory:
-  `category-hotfix-deploy.yml`, `health-pharmonline-hotfix-deploy.yml` and
-  `activate-pharmonline-public-api-autonomy.yml`.
+- Three hand-started workflows overwrite live code under
+  `/opt/pharmacy-monitor/src`: `category-hotfix-deploy.yml`,
+  `health-pharmonline-hotfix-deploy.yml` and
+  `activate-pharmonline-public-api-autonomy.yml` (the last one also
+  `migrations/`, `templates/` and `alembic.ini`).
+- Six workflows copy their checkout's `src/` into a temporary directory under
+  `/opt/pharmacy-monitor` and run it from there, leaving the live code as it
+  was. One of them, `autonomous-pharmonline-decodo-public-api.yml`, runs on a
+  weekly schedule from `main`, after checking that CI passed on that commit —
+  so for that scrape a merge into `main` already is the release
+  (`docs/RUNBOOK.md`, «Выкладка правок сопоставления»). Another,
+  `recover-pharmonline-decodo-public-api.yml`, also runs `alembic upgrade head`
+  on the production database.
+
+This is not an account of all 22 workflows; read a workflow before starting it.
 
 One secret is involved (GitHub repo settings → Secrets and variables →
 Actions):
@@ -222,8 +233,12 @@ ls -lth /var/backups/pharmacy-monitor/ | head
 
 > ⚠️ Outdated (marked 2026-10-11). The code steps below cannot work on the
 > current server: `/opt/pharmacy-monitor` is a copy without `.git` (checked
-> 2026-10-11), so `git log` and `git reset --hard` fail there. How code gets to
-> the server now — Phase 8 above. The other steps of this section were not
+> 2026-10-11), so `git log` and `git reset --hard` fail there. Where
+> `docs/RUNBOOK.md` describes taking code back, it goes through `main`: revert
+> the merge, wait for green CI, run `deploy.yml` («Выкладка правок
+> сопоставления», the rollback steps; the note under «Restore drill»).
+> `deploy.yml` refuses a commit that does not contain the production
+> database's migration revision. The other steps of this section were not
 > re-checked.
 
 ```bash
