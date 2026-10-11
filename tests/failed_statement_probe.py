@@ -15,17 +15,29 @@ Starlette и SQLAlchemy на весь процесс, а stdout и stderr это
 Наружу ничего не уходит: DSN указывает на `.invalid`, транспорт подменён и
 складывает части конвертов в список.
 
-Проверяется один путь — текст ошибки. Два соседних пути закрыты аргументами
-`sentry_sdk.init` прямо здесь, что бы ни передал `init_sentry`: переменные
-кадров (в кадрах SQLAlchemy лежит переменная `parameters`) и тело запроса (в
-нём пароль и токен). Иначе проба не отличила бы параметры в тексте ошибки от
-тех же значений, пришедших соседним путём.
+Проверяется один слой — движок: что стоит в тексте ошибки, когда он доходит
+до Sentry. Остальное закрыто или снято аргументами `sentry_sdk.init` прямо
+здесь, что бы ни передал `init_sentry`:
+
+- переменные кадров (в кадрах SQLAlchemy лежит переменная `parameters`) и тело
+  запроса (в нём пароль и токен) не собираются — иначе проба не отличила бы
+  данные в тексте ошибки от тех же значений, пришедших соседним путём;
+- хуки `before_send` сняты. С PR #84 они сами вырезают из события
+  `[parameters: …]` и строки DETAIL / CONTEXT; с ними контрольный режим не
+  увидел бы утечки, а чистый конверт ничего не говорил бы о движке. Хуки
+  проверяет свой тест — `tests/test_sentry_events_carry_no_credentials.py`;
+  журнал, `runs.error_message` и трассировку CLI они не закрывают, это делает
+  только движок.
 
 Режимы:
-    guarded    движок создаёт `storage.create_engine_hiding_statement_data`;
-    unguarded  движок создаёт голый `create_engine`, как до правки. Контроль: в
-               этом режиме проба обязана увидеть данные запроса и в конверте, и
-               в журнале — иначе её «чисто» ничего не значит.
+    guarded     движок создаёт `storage.create_engine_hiding_statement_data`,
+                хуки Sentry сняты: чисто — значит, чист текст самой ошибки;
+    unguarded   движок создаёт голый `create_engine`, как до правки, хуки сняты.
+                Контроль: в этом режиме проба обязана увидеть данные запроса и в
+                конверте, и в журнале — иначе её «чисто» ничего не значит;
+    as_shipped  как на сервере: защищённый движок и хуки, какими их передал
+                `init_sentry`. Два слоя вместе: хуки не должны ни вернуть данные,
+                ни выбросить событие об ошибке.
 """
 
 from __future__ import annotations
@@ -41,7 +53,7 @@ import time
 import uuid
 
 MODE, REPORT_PATH = sys.argv[1], sys.argv[2]
-assert MODE in ("guarded", "unguarded"), MODE
+assert MODE in ("guarded", "unguarded", "as_shipped"), MODE
 
 BASE_URL = os.environ["DATABASE_URL"]
 SCHEMA = f"failed_statement_{uuid.uuid4().hex[:12]}"
@@ -85,11 +97,12 @@ _real_init = sentry_sdk.init
 
 def _init_with_recording_transport(**options):
     options.update(include_local_variables=False, max_request_body_size="never")
-    # Хуки Sentry из `src/observability.py` сами вырезают из текста ошибки
-    # `[parameters: …]` и DETAIL. Здесь проверяется движок, поэтому они сняты:
-    # с ними контрольный режим не видел бы данных и при незащищённом движке, а
-    # защищённый был бы «чистым» и при сломанной защите.
-    options.update(before_send=None, before_send_transaction=None)
+    if MODE != "as_shipped":
+        # Хуки Sentry из `src/observability.py` сами вырезают из текста ошибки
+        # `[parameters: …]` и DETAIL. Здесь проверяется движок, поэтому они сняты:
+        # с ними контрольный режим не видел бы данных и при незащищённом движке, а
+        # защищённый был бы «чистым» и при сломанной защите.
+        options.update(before_send=None, before_send_transaction=None)
     return _real_init(transport=RecordingTransport, **options)
 
 
@@ -257,4 +270,8 @@ finally:
 
 sentry_sdk.flush()
 with open(REPORT_PATH, "w", encoding="utf-8") as report:
-    json.dump({"mode": MODE, "cases": CASES, "sent": ITEMS}, report, ensure_ascii=False)
+    # Стояли ли хуки на самом деле — спрашиваем у клиента SDK, а не у режима.
+    hooks = sentry_sdk.get_client().options.get("before_send") is not None
+    json.dump(
+        {"mode": MODE, "hooks": hooks, "cases": CASES, "sent": ITEMS}, report, ensure_ascii=False
+    )
