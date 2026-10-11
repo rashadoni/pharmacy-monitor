@@ -2364,6 +2364,27 @@ def test_legacy_products_with_key_200(client):
     assert isinstance(r.json(), list)
 
 
+def test_api_key_rate_limit_counter_is_not_named_after_the_key(client, monkeypatch):
+    """Имя счётчика уходит в Redis, а Sentry пишет команды Redis в трассу запроса.
+
+    Было `ok:<первые восемь знаков ключа>` — начало действующего ключа лежало в
+    каждой записанной трассе запроса с ключом.
+    """
+    counters = []
+    monkeypatch.setattr(
+        api_module, "_check_rate_limit", lambda key, limit=None: counters.append(key)
+    )
+    key = "test-key-1234"
+
+    assert client.get("/api/v1/products", headers={"X-API-Key": key}).status_code == 200
+
+    [counter] = counters
+    assert counter.startswith("ok:")
+    assert not any(key[i : i + 4] in counter for i in range(len(key) - 3))
+    # Другой ключ — другой счётчик: лимит по-прежнему считается на ключ.
+    assert counter != f"ok:{api_module._api_key_bucket('another-key-5678')}"
+
+
 def test_legacy_alerts_recent_with_key(client):
     r = client.get(
         "/api/v1/alerts/recent",

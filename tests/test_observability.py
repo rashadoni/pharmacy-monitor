@@ -53,6 +53,17 @@ def test_init_sentry_idempotent(monkeypatch):
     assert call_count == 1
 
 
+def test_init_sentry_failure_does_not_stop_the_process(monkeypatch):
+    """`src.api` calls this at import: an SDK that rejects an option must not take the API down."""
+    monkeypatch.setenv("SENTRY_DSN", "https://test@test.ingest.sentry.io/123")
+    monkeypatch.setattr(observability, "_SENTRY_INITIALIZED", False)
+
+    with patch("sentry_sdk.init", side_effect=TypeError("Unknown option 'max_request_body_size'")):
+        observability.init_sentry(service="api")
+
+    assert observability._SENTRY_INITIALIZED is False
+
+
 def test_sentry_capture_no_op_when_uninitialized():
     """sentry_capture() must not raise if Sentry isn't init'd."""
     observability._SENTRY_INITIALIZED = False
@@ -151,7 +162,14 @@ _HOSTILE_SCAN = """
 import time
 from src import observability
 
-hostile = ["/" + "eyJ" * 20_000, "eyJ" * 20_000 + " x.eyJ", "?" + "token?" * 10_000]
+hostile = [
+    "/" + "eyJ" * 20_000,
+    "eyJ" * 20_000 + " x.eyJ",
+    "?" + "token?" * 10_000,
+    "?" + "token" * 12_000,
+    "?" + "%74" * 20_000,
+    "1" * 60_000 + ":" + "a" * 20,
+]
 started = time.perf_counter()
 for text in hostile:
     assert observability._sentry_before_send({"message": text}, {}) == {"message": text}
@@ -188,21 +206,35 @@ def test_sentry_token_scan_stays_linear_on_a_hostile_request_line():
     [
         (
             '127.0.0.1:5 - "GET /auth/verify?token=abc123 HTTP/1.1" 500',
-            '127.0.0.1:5 - "GET /auth/verify?token=[Filtered] HTTP/1.1" 500',
+            '127.0.0.1:5 - "GET /auth/verify?[Filtered] HTTP/1.1" 500',
         ),
+        # The name as the client sent it, the value with a quote in it, a link in a link.
+        (
+            '"GET /auth/verify?%74oken=abc HTTP/1.1" 500',
+            '"GET /auth/verify?[Filtered] HTTP/1.1" 500',
+        ),
+        (
+            '"GET /auth/verify?token=ab\'cd HTTP/1.1" 500',
+            '"GET /auth/verify?[Filtered] HTTP/1.1" 500',
+        ),
+        ('"GET /go?next=/auth/verify?token=abc HTTP/1.1" 302', '"GET /go?[Filtered] HTTP/1.1" 302'),
         (
             "GET https://h/p?a=1&X-Amz-Signature=zz&b=2#frag failed",
-            "GET https://h/p?a=1&X-Amz-Signature=[Filtered]&b=2#frag failed",
+            "GET https://h/p?[Filtered]#frag failed",
         ),
-        ("/x?search=kreon&api_key=abc&limit=5", "/x?search=kreon&api_key=[Filtered]&limit=5"),
+        # Nothing named like a credential: the text is left alone.
         (
-            "/x?search=kreon&category_key=pharma&limit=5",
-            "/x?search=kreon&category_key=pharma&limit=5",
+            '"GET /x?search=kreon&category_key=pharma&limit=5 HTTP/1.1" 200',
+            '"GET /x?search=kreon&category_key=pharma&limit=5 HTTP/1.1" 200',
         ),
         ("why? token=5 & more", "why? token=5 & more"),  # prose, not a URL
+        (
+            "SELECT a FROM t WHERE x = ? AND token=? LIMIT ?",
+            "SELECT a FROM t WHERE x = ? AND token=? LIMIT ?",
+        ),
     ],
 )
-def test_sentry_masks_a_credential_parameter_in_a_quoted_url(text, expected):
+def test_sentry_replaces_a_credential_query_inside_a_quoted_url(text, expected):
     """uvicorn's access-log line reaches the event as a breadcrumb message."""
     event = {"breadcrumbs": {"values": [{"category": "uvicorn.access", "message": text}]}}
 
@@ -217,10 +249,14 @@ def test_sentry_masks_a_credential_parameter_in_a_quoted_url(text, expected):
         ("search=kreon&limit=50", True),
         ("category_key=pharma_kreon", True),  # "key" alone does not make a credential
         ("search=token", True),  # the word is in the value, not in the name
+        ("token", True),  # a name with no value has nothing to leak
         ("token=abc", False),
         ("search=kreon&api_key=abc", False),
         ("X-Amz-Signature=abc&limit=5", False),
         ("new_password=abc", False),
+        ("%74oken=abc", False),  # the application decodes the name before reading it
+        ("next=/auth/verify?token=abc", False),  # a URL nested in a value
+        ("next=%2Fauth%2Fverify%3Ftoken%3Dabc", False),
     ],
 )
 def test_sentry_replaces_a_query_string_that_names_a_credential(query, kept):
@@ -238,6 +274,57 @@ def test_sentry_replaces_a_query_string_that_names_a_credential(query, kept):
         "http.query": expected,
         "url": "http://x/y",
     }
+
+
+_SQL_ERROR = (
+    "(psycopg.errors.QueryCanceled) canceling statement due to statement timeout\n"
+    "[SQL: SELECT tenant_users.id FROM tenant_users WHERE tenant_users.magic_token = %(t)s]\n"
+)
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "[parameters: {'t': 'login-token-abc'}]\n(Background on this error at: https://sqlalche.me/e/20/e3q8)",
+        "[parameters: [{'t': 'a]b'}, {'t': 'login-token-abc'}]]",  # brackets inside the values
+        "[parameters: {'t': 'login-token-ab",  # cut off before the closing bracket
+    ],
+)
+def test_sentry_drops_bound_parameters_from_a_database_error(tail):
+    """SQLAlchemy appends the failed statement's parameters to the error text."""
+    event = {"exception": {"values": [{"type": "OperationalError", "value": _SQL_ERROR + tail}]}}
+
+    clean = observability._sentry_before_send(event, {})
+
+    assert clean["exception"]["values"][0]["value"] == _SQL_ERROR + "[parameters: [Filtered]]"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "POST https://api.telegram.org/bot8123456789:AAH-abcdefghijklmnopqrstuvwxyz012345/sendMessage",
+            "POST https://api.telegram.org/bot[Filtered]/sendMessage",
+        ),
+        ("token 8123456789:AAH-abcdefghijklmnopqrstuvwxyz012345 leaked", "token [Filtered] leaked"),
+        # Digits, a colon and a long word, but not a bot token.
+        (
+            "at 2026-10-11T18:01:34 from 127.0.0.1:35992",
+            "at 2026-10-11T18:01:34 from 127.0.0.1:35992",
+        ),
+        (
+            "image sha256:0123456789abcdef0123456789abcdef0123456789abcdef",
+            "image sha256:0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+    ],
+)
+def test_sentry_masks_a_telegram_bot_token_in_an_outgoing_url(text, expected):
+    """The token is part of the URL path, and the SDK records the URL of an outgoing request."""
+    event = {"spans": [{"description": text, "data": {"url": text}}]}
+
+    clean = observability._sentry_before_send_transaction(event, {})
+
+    assert clean == {"spans": [{"description": expected, "data": {"url": expected}}]}
 
 
 def test_sentry_filters_credential_headers_by_name_and_drops_body_and_cookies():

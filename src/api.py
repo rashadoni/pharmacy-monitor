@@ -328,7 +328,18 @@ def require_api_key(
         client_ip = request.client.host if request.client else "unknown"
         _check_rate_limit(f"failed:{client_ip}", limit=10)
         raise HTTPException(status_code=401, detail="Invalid X-API-Key")
-    _check_rate_limit(f"ok:{x_api_key[:8]}")
+    _check_rate_limit(f"ok:{_api_key_bucket(x_api_key)}")
+
+
+def _api_key_bucket(api_key: str) -> str:
+    """Имя счётчика запросов для ключа — без самого ключа.
+
+    Имя уходит в Redis, а Sentry записывает команды Redis в трассу запроса
+    вместе с ключом: первые восемь знаков API-ключа лежали там открытым текстом.
+    """
+    import hashlib
+
+    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
 
 # ─── Auth: JWT cookie (frontend dashboard) ───────────────────────────────────
