@@ -479,18 +479,27 @@ Persistent state:
 
 ## 6. Test coverage
 
-Числа — из журнала CI на `main`, а не из локального запуска: прогон
-`ci-pipeline.yml` на коммите `f33cafd5`, 2026-10-11
-(https://github.com/rashadoni/pharmacy-monitor/actions/runs/38170815118).
-Они устаревают с каждым мержем; свежие — в журнале последнего прогона:
+Числа — из журнала CI на `main`, а не из локального запуска. Они устаревают с
+каждым мержем: за полчаса 2026-10-11 — 2400 passed на `f33cafd5`, 2663 на
+`3c09c5df`, 2815 на `4cf0bfb7`. Свежие — в журнале последнего прогона:
 `gh run list --workflow=ci-pipeline.yml --branch main`.
 
-- **Backend, джоба `Test (pytest)`:** `2400 passed, 4 skipped, 1 xfailed`.
-  Упавших нет. Упавшие тесты, которые «not blocking», с порядком доставки
-  несовместимы: `Test (pytest)` — обязательная проверка, PR с красной не
-  мержится (`DELIVERY-ARCHITECTURE.md`, слой 1).
+Снимок 2026-10-11 — последний зелёный на тот час прогон `ci-pipeline.yml` на
+`main`, коммит `3c09c5df`
+(https://github.com/rashadoni/pharmacy-monitor/actions/runs/38172255721):
+
+- **Backend, джоба `Test (pytest)`:** `2663 passed, 4 skipped, 1 xfailed`,
+  упавших нет.
+- **Упавших тестов, которые «not blocking», не бывает.** `Test (pytest)` —
+  обязательная проверка, PR с красной не мержится
+  (`DELIVERY-ARCHITECTURE.md`, слой 1). Сам `main` покраснеть при этом может:
+  защита ветки не требует свежей базы, и два PR, зелёных порознь, вместе роняют
+  тест. Так было в тот же день: на следующем коммите, `4cf0bfb7` (мерж #84),
+  упал один тест, пришедший с #86, — `1 failed, 2815 passed`. С этой минуты
+  `Test (pytest)` красная у каждого PR, собранного поверх такого `main`, в том
+  числе у PR с одной документацией (#89).
 - **Сколько тестов в каком файле, журнал не говорит**: pytest идёт с `-q`, имён
-  файлов и тестов в его выводе нет. В `tests/` на этом коммите 86 файлов
+  файлов и тестов в его выводе нет. В `tests/` на этом коммите 88 файлов
   `test_*.py`.
 - **`1 xfailed`.** Пометка `xfail` в `tests/` одна —
   `test_pharmonline_snapshot_prices_parseable` в `test_scrapers_snapshot.py`:
