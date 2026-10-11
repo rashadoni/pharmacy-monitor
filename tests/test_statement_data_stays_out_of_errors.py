@@ -717,6 +717,9 @@ def test_no_new_workflow_builds_its_own_engine():
     statements = _STATEMENT_CALL.findall(deploy)
     assert len(statements) == 1, f"в deploy.yml больше одного запроса к базе: {statements}"
     assert f'connection.execute(text("{_DEPLOY_REVISION_QUERY}"))' in deploy
+    assert 'create_engine(os.environ["DATABASE_URL"], hide_parameters=True)' in deploy
+    # Как и весь страж, это растяжка на именах: запрос через переменную
+    # (`run = connection.execute`) или `getattr` она не увидит.
 
 
 # ─── Приложение под uvicorn: конверт Sentry и журнал ────────────────────────

@@ -984,6 +984,9 @@ def test_previous_workflow_cannot_roll_back_past_the_engine_factory(tmp_path: Pa
     still_stuck = run_workflow(sandbox, apply_migrations=False, workflow_file=PREVIOUS_WORKFLOW)
 
     assert still_stuck.failed_step.name == PREFLIGHT_REVISION, still_stuck.describe()
+    assert (
+        "cannot import name 'create_engine_hiding_statement_data'" in still_stuck.failed_step.stderr
+    )
     assert len(sandbox.events("rsync")) == copied_before, "до копирования дело не дошло"
 
     # Выводит выкладка коммитом с этим порядком: живой env.py он не исполняет.
