@@ -13,6 +13,10 @@ Workflow нельзя запустить локально, поэтому тес
   и `/etc/pharmacy-monitor` на каталоги песочницы;
 - `rsync` копирует туда же настоящим rsync;
 - Alembic настоящий, база — SQLite; миграции пробные;
+- прошлый релиз в живом каталоге — такой, каким сервер был до первой выкладки
+  этим workflow: `migrations/env.py` от 2026-08-23 и `src/storage.py` без
+  фабрики движка, которую зовёт `env.py` чекаута. Миграция, исполненная не на
+  `src` и `env.py` своего релиза, здесь падает на импорте;
 - `sudo`, `pnpm`, `curl`, `sleep`, `systemctl` — заглушки, которые пишут журнал.
 
 Каждая заглушка записывает, какая ревизия была в базе и какой релиз лежал в
@@ -57,6 +61,26 @@ RESTART = "Build frontend + restart services"
 CLEANUP = "Remove staged release runtime"
 
 REAL_RSYNC = shutil.which("rsync")
+
+# `migrations/env.py`, лежавший на сервере до первой выкладки этим workflow:
+# прежний deploy.yml возил только `migrations/versions/`. Файл прочитан с сервера
+# 2026-10-11, байт в байт тот же, что в истории git до PR #86 (контрольная сумма
+# ниже). Движок он строит через `engine_from_config`, из `src` берёт один `Base`.
+PREVIOUS_ENV_PY = ROOT / "tests" / "fixtures" / "migrations_env_on_server_2026-08-23.py.txt"
+PREVIOUS_ENV_PY_SHA256 = "10fbd002a801b6183d9097c20956b790749de1561aa6de3bd4799272d054021f"
+
+STORAGE_BEFORE_THE_FACTORY = (
+    "from sqlalchemy.orm import DeclarativeBase\n\n\nclass Base(DeclarativeBase):\n    pass\n"
+)
+# `env.py` чекаута берёт движок у `storage.create_engine_hiding_statement_data`
+# (PR #86). Здесь — её имя и подпись, а не защита: что она прячет, проверяет
+# tests/test_statement_data_stays_out_of_errors.py на настоящем `src`.
+STORAGE_WITH_THE_FACTORY = (
+    "from sqlalchemy import create_engine\n"
+    + STORAGE_BEFORE_THE_FACTORY
+    + "\n\ndef create_engine_hiding_statement_data(url, **options):\n"
+    "    return create_engine(url, hide_parameters=True, **options)\n"
+)
 
 BASE = "0001_base"
 HEAD = "0002_needs_new_src"
@@ -393,32 +417,46 @@ def _write_executable(path: Path, body: str, *, python: bool = True) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def _write_release(target: Path, *, release: str, revisions: list[str]) -> None:
-    """Дерево релиза в том виде, в каком его видит workflow: чекаут или сервер."""
+def _write_release(target: Path, *, release: str, revisions: list[str], staged: bool) -> None:
+    """Дерево релиза в том виде, в каком его видит workflow: чекаут или сервер.
+
+    ``release`` — чей это код: ``new`` — чекаут этого репозитория (``env.py``
+    зовёт фабрику движка из ``src``), ``old`` — то, что лежало на сервере до
+    первой выкладки этим workflow (фабрики в ``src`` нет, ``env.py`` её не
+    зовёт). ``staged`` — выкладывают ли это дерево или оно лежит в живом каталоге.
+    """
     (target / "src").mkdir(parents=True)
     (target / "src" / "__init__.py").write_text("", encoding="utf-8")
     (target / "src" / "storage.py").write_text(
-        "from sqlalchemy.orm import DeclarativeBase\n\n\nclass Base(DeclarativeBase):\n    pass\n",
+        STORAGE_WITH_THE_FACTORY if release == "new" else STORAGE_BEFORE_THE_FACTORY,
         encoding="utf-8",
     )
     (target / "src" / "RELEASE").write_text(release + "\n", encoding="utf-8")
     # Модуль есть в обоих релизах и на sys.path оба каталога: по значению видно,
     # чей src взяла миграция.
-    source = "the staged release" if release == "new" else "the live directory"
+    source = "the staged release" if staged else "the live directory"
     (target / "src" / "release_probe.py").write_text(f'VALUE = "from {source}"\n', encoding="utf-8")
 
     versions = target / "migrations" / "versions"
     versions.mkdir(parents=True)
     shutil.copy(ROOT / "alembic.ini", target / "alembic.ini")
-    for name in ("env.py", "script.py.mako", "README"):
+    for name in ("script.py.mako", "README"):
         shutil.copy(ROOT / "migrations" / name, target / "migrations" / name)
-    if release == "old":
-        # На сервере env.py и alembic.ini прошлого релиза: правка обязана
-        # доехать выкладкой. И файл, которого в релизе уже нет.
-        for stale in (target / "migrations" / "env.py", target / "alembic.ini"):
-            stale.write_text(
-                stale.read_text(encoding="utf-8") + "\n# previous release\n", encoding="utf-8"
-            )
+    if release == "new":
+        shutil.copy(ROOT / "migrations" / "env.py", target / "migrations" / "env.py")
+    else:
+        previous = PREVIOUS_ENV_PY.read_bytes()
+        assert hashlib.sha256(previous).hexdigest() == PREVIOUS_ENV_PY_SHA256, (
+            f"{PREVIOUS_ENV_PY.name} — снимок файла с сервера, его не правят"
+        )
+        (target / "migrations" / "env.py").write_bytes(previous)
+    if not staged:
+        # На сервере alembic.ini прошлой выкладки: правка обязана доехать
+        # выкладкой. И файл, которого в релизе уже нет.
+        stale = target / "alembic.ini"
+        stale.write_text(
+            stale.read_text(encoding="utf-8") + "\n# previous release\n", encoding="utf-8"
+        )
         (versions / "removed_from_the_release.txt").write_text("stale\n", encoding="utf-8")
     for revision in revisions:
         (versions / f"{revision}.py").write_text(MIGRATIONS[revision], encoding="utf-8")
@@ -462,7 +500,15 @@ class WorkflowResult:
 
 
 class Sandbox:
-    def __init__(self, root: Path, *, release_revisions: list[str], live_revisions: list[str]):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        release_revisions: list[str],
+        live_revisions: list[str],
+        rollback: bool = False,
+    ):
+        """``rollback`` — выкладывают прошлый релиз поверх нового, а не наоборот."""
         self.root = root
         self.checkout = root / "checkout"
         self.server = root / "server"
@@ -470,8 +516,11 @@ class Sandbox:
         self.bin = root / "bin"
         self.database = self.server / "data" / "db.sqlite"
 
-        _write_release(self.checkout, release="new", revisions=release_revisions)
-        _write_release(self.live, release="old", revisions=live_revisions)
+        self.staged_release, self.live_release = ("old", "new") if rollback else ("new", "old")
+        _write_release(
+            self.checkout, release=self.staged_release, revisions=release_revisions, staged=True
+        )
+        _write_release(self.live, release=self.live_release, revisions=live_revisions, staged=False)
         # Прошлый релиз выложен давно. Без этого rsync, который сверяет размер и
         # время, счёл бы файл одного размера, записанный в ту же секунду, прежним.
         yesterday = time.time() - 24 * 3600
@@ -528,6 +577,20 @@ class Sandbox:
             cwd=self.live,
             env={**self.env, "DATABASE_URL": f"sqlite:///{self.database}"},
             check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def alembic_by_hand(self, *arguments: str) -> subprocess.CompletedProcess:
+        """`alembic …` руками из живого каталога, как его запустил бы человек на сервере."""
+        return subprocess.run(
+            [sys.executable, "-m", "alembic", *arguments],
+            cwd=self.live,
+            env={
+                **self.env,
+                "DATABASE_URL": f"sqlite:///{self.database}",
+                "PYTHONPATH": str(self.live),
+            },
             capture_output=True,
             text=True,
         )
@@ -789,6 +852,64 @@ def test_migration_runs_while_the_previous_release_is_still_live(
     ]
     assert restarts[0]["at"] > max(event["at"] for event in live_copies)
     assert sandbox.staging_dirs() == []
+
+
+def test_stand_live_release_cannot_serve_the_env_py_being_deployed(
+    pending_migration: Sandbox,
+) -> None:
+    """Контроль стенда: `env.py` чекаута на `src` прошлого релиза не импортируется.
+
+    На этом держится проверка «миграция идёт на `src` своего релиза»: возьми
+    workflow `src` из живого каталога, `alembic` упал бы так же.
+    """
+    sandbox = pending_migration
+    shutil.copy(ROOT / "migrations" / "env.py", sandbox.live / "migrations" / "env.py")
+
+    mixed = sandbox.alembic_by_hand("current")
+
+    assert mixed.returncode != 0
+    assert "cannot import name 'create_engine_hiding_statement_data'" in mixed.stderr
+
+
+@pytest.mark.parametrize("rollback", [False, True], ids=["new over old", "old over new"])
+def test_every_alembic_call_runs_on_the_release_being_deployed(
+    tmp_path: Path, rollback: bool
+) -> None:
+    """`env.py` и `src` всегда одного релиза — и при выкладке вперёд, и при возврате.
+
+    `env.py` чекаута зовёт фабрику движка из `src/storage.py`; в `src` прошлого
+    релиза её нет. Workflow не исполняет Alembic из живого каталога ни разу:
+    каждый вызов идёт из `.deploy-stage.*`, где лежат `env.py` и `src` одного
+    коммита. После выкладки в живом каталоге тоже одна пара.
+
+    Чего это не покрывает: возврат ПРЕЖНИМ deploy.yml (коммит старше этого
+    workflow). Тот кладёт `src/` и `migrations/versions/`, `env.py` не трогает и
+    Alembic зовёт из живого каталога — docs/RUNBOOK.md, «Откат».
+    """
+    revisions = [BASE] if rollback else [BASE, HEAD]
+    sandbox = Sandbox(
+        tmp_path, release_revisions=revisions, live_revisions=[BASE], rollback=rollback
+    )
+    sandbox.migrate_production_to(BASE)
+
+    result = run_workflow(sandbox, apply_migrations=not rollback)
+
+    assert result.failed_step is None, result.describe()
+    calls = sandbox.events("alembic")
+    assert {call["command"] for call in calls} >= {"heads", "current"}
+    assert ("upgrade" in {call["command"] for call in calls}) is (not rollback)
+    for call in calls:
+        assert re.fullmatch(r"/opt/pharmacy-monitor/\.deploy-stage\.\w{6}/runtime", call["cwd"]), (
+            call
+        )
+        assert call["pythonpath"] == call["cwd"], call
+
+    assert (sandbox.live / "src" / "RELEASE").read_text().strip() == sandbox.staged_release
+    deployed_env_py = PREVIOUS_ENV_PY if rollback else ROOT / "migrations" / "env.py"
+    assert (sandbox.live / "migrations" / "env.py").read_bytes() == deployed_env_py.read_bytes()
+    by_hand = sandbox.alembic_by_hand("current")
+    assert by_hand.returncode == 0, by_hand.stderr
+    assert by_hand.stdout.split()[0] == revisions[-1]
 
 
 def test_release_without_a_migration_takes_no_backup_and_runs_no_upgrade(tmp_path: Path) -> None:

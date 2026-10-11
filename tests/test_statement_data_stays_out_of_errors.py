@@ -667,7 +667,14 @@ def test_guard_sees_an_engine_created_elsewhere(tmp_path, monkeypatch):
 # Python внутри шага workflow печатает в публичный журнал и ходит в боевую базу.
 # Три шага строят движок сами; их запросы читают прогоны, размер базы и каталог,
 # людей в них нет (прочитано 2026-10-11). Новому такому шагу — фабрика.
+#
+# deploy.yml — четвёртый, и фабрику взять не может: ревизию базы он читает до
+# того, как релиз попал на сервер, а `src` в живом каталоге — прошлого релиза и
+# фабрики может не знать. Запрос один, без параметров: `SELECT version_num FROM
+# alembic_version`. Миграции тот же workflow исполняет уже через `migrations/env.py`
+# своего релиза, то есть через фабрику.
 _WORKFLOWS_WITH_THEIR_OWN_ENGINE = {
+    ".github/workflows/deploy.yml",
     ".github/workflows/preflight-pharmonline-public-api-full.yml",
     ".github/workflows/recover-pharmonline-decodo-public-api.yml",
     ".github/workflows/recover-pharmonline-public-api.yml",

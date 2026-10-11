@@ -35,6 +35,14 @@ name: Deploy to production
 #   запустить заново: ревизия базы читается из самой базы, а не через файлы
 #   миграций живого каталога. Вернуть прошлый коммит после миграции нельзя —
 #   в нём нет ревизии базы; чинить новым коммитом.
+#   ОТКАТ ВЫКЛАДКОЙ ПРОШЛОГО КОММИТА исполняет deploy.yml ТОГО коммита, а не
+#   этот. Коммит с этим порядком берёт env.py и src из своей копии — пары
+#   «env.py одного релиза, src другого» Alembic не видит. Коммит старше зовёт
+#   Alembic из живого каталога, где env.py остаётся от последней выкладки, а
+#   тот импортирует storage.create_engine_hiding_statement_data: с коммитом до
+#   PR #86 (3c09c5df, 2026-10-11) `alembic current` падает на импорте после
+#   копирования src и до рестарта. Такой код возвращать revert-коммитом —
+#   docs/RUNBOOK.md, «Откат выкладкой прошлого коммита».
 #   Миграция ждёт блокировку таблицы не дольше MIGRATION_LOCK_TIMEOUT_MS и
 #   повторяется MIGRATION_LOCK_ATTEMPTS раз: пока она ждёт, за ней стоят все
 #   запросы к этой таблице, в том числе чтения API. Предел — на ожидание, не на
@@ -93,6 +101,12 @@ jobs:
           # exactly the state a deploy leaves when it dies after its migration
           # and before the files are copied — and that deploy must be
           # re-runnable.
+          # Its own engine, not storage.create_engine_hiding_statement_data:
+          # nothing of this release is on the server yet, and the src that is
+          # there may predate the factory. One statement, no parameters, one
+          # table without people in it — a failure has no data to print. Do
+          # not add queries here; tests/test_statement_data_stays_out_of_errors.py
+          # lists this file as an exception for this statement only.
           current_output=$(ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd /opt/pharmacy-monitor

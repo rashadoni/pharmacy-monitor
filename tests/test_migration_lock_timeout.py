@@ -17,6 +17,11 @@
 - текст ошибки содержит `LockNotAvailable`: по нему `deploy.yml` отличает
   «таблица занята» от настоящей ошибки миграции
 - предел по умолчанию, свой предел и опции из самой строки подключения
+- текст ошибки упавшей миграции данных не несёт данных запроса: `alembic
+  upgrade` идёт из `deploy.yml`, журнал шага публичный. Движок в `env.py` —
+  `storage.create_engine_hiding_statement_data` с `connect_args` предела; два
+  настоящих сбоя (ожидание замка строки, нарушение ограничения) и контроль на
+  `env.py`, лежавшем на сервере до этой правки: с ним те же данные в тексте есть
 
 Тест исполняет настоящий `migrations/env.py` репозитория на одноразовой базе с
 одной пробной миграцией, чтобы не зависеть от содержимого боевых.
@@ -95,13 +100,13 @@ def scratch_db_url():
         admin.dispose()
 
 
-def _project(tmp_path: Path, *bodies: str) -> Path:
+def _project(tmp_path: Path, *bodies: str, env_py: Path = ROOT / "migrations" / "env.py") -> Path:
     """Alembic-проект с настоящими alembic.ini и env.py и цепочкой пробных миграций."""
     project = tmp_path / "project"
     versions = project / "migrations" / "versions"
     versions.mkdir(parents=True)
     shutil.copy(ROOT / "alembic.ini", project / "alembic.ini")
-    shutil.copy(ROOT / "migrations" / "env.py", project / "migrations" / "env.py")
+    shutil.copy(env_py, project / "migrations" / "env.py")
     shutil.copy(ROOT / "migrations" / "script.py.mako", project / "migrations" / "script.py.mako")
     previous = None
     for number, body in enumerate(bodies, start=1):
@@ -228,3 +233,99 @@ def test_a_malformed_timeout_stops_the_migration_before_it_connects(tmp_path: Pa
 
     assert result.returncode != 0
     assert "MIGRATION_LOCK_TIMEOUT_MS must be a whole number" in result.stderr
+
+
+# ─── Упавшая миграция данных: в тексте ошибки нет данных запроса ─────────────
+
+# `env.py`, лежавший на сервере до первой выкладки новым deploy.yml (прочитан
+# 2026-10-11): движок через `engine_from_config`, без предела ожидания.
+ENV_PY_ON_SERVER_BEFORE = ROOT / "tests" / "fixtures" / "migrations_env_on_server_2026-08-23.py.txt"
+
+ROW_EMAIL = "row-marker@example.test"
+ROW_HASH = "ROW-HASH-MARKER-51c7"
+PARAMETER_HASH = "PARAMETER-HASH-MARKER-9f3c"
+MARKERS = (ROW_EMAIL, ROW_HASH, PARAMETER_HASH)
+
+# Ждёт замок строки, которую держит другая транзакция.
+UPDATE_A_LOCKED_ROW = f"""    op.execute(
+        sa.text("UPDATE people SET password_hash = :hash WHERE email = :email").bindparams(
+            hash="{PARAMETER_HASH}", email="{ROW_EMAIL}"
+        )
+    )"""
+# Нарушает уникальность: сервер приводит значение ключа в DETAIL.
+INSERT_A_DUPLICATE = f"""    op.execute(
+        sa.text(
+            "INSERT INTO people (id, email, password_hash) VALUES (:id, :email, :hash)"
+        ).bindparams(id=2, email="{ROW_EMAIL}", hash="{PARAMETER_HASH}")
+    )"""
+
+
+def _fail_a_data_migration(
+    tmp_path: Path, scratch_db_url: str, failure: str, *, env_py: Path, db_url: str | None = None
+) -> str:
+    """Уронить пробную миграцию данных настоящим сбоем и вернуть всё, что напечатал Alembic."""
+    body = UPDATE_A_LOCKED_ROW if failure == "lock wait" else INSERT_A_DUPLICATE
+    project = _project(tmp_path, body, env_py=env_py)
+    engine = create_engine(scratch_db_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE people "
+                "(id integer PRIMARY KEY, email text NOT NULL UNIQUE, password_hash text)"
+            )
+        )
+        connection.execute(
+            text("INSERT INTO people VALUES (1, :email, :hash)"),
+            {"email": ROW_EMAIL, "hash": ROW_HASH},
+        )
+    holder = engine.connect()
+    try:
+        if failure == "lock wait":
+            holder.execute(text("SELECT id FROM people WHERE id = 1 FOR UPDATE")).one()
+        failed = _alembic(
+            project, db_url or scratch_db_url, "upgrade", "head", lock_timeout_ms="400"
+        )
+    finally:
+        holder.rollback()
+        holder.close()
+        engine.dispose()
+    assert failed.returncode != 0, "пробная миграция должна была упасть"
+    return failed.stdout + failed.stderr
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_class"),
+    [("lock wait", "LockNotAvailable"), ("constraint", "UniqueViolation")],
+)
+def test_a_failed_data_migration_prints_no_statement_data(
+    tmp_path: Path, scratch_db_url: str, failure: str, error_class: str
+) -> None:
+    printed = _fail_a_data_migration(
+        tmp_path, scratch_db_url, failure, env_py=ROOT / "migrations" / "env.py"
+    )
+
+    # Класс ошибки остаётся: по нему deploy.yml отличает «таблица занята» от поломки.
+    assert f"psycopg.errors.{error_class}" in printed
+    # Остаётся и сам запрос — с именами параметров, без значений.
+    assert "%(email)s" in printed
+    leaked = [marker for marker in MARKERS if marker in printed]
+    assert not leaked, f"в тексте ошибки миграции данные запроса: {leaked}\n{printed}"
+    assert "[parameters:" not in printed
+    assert "DETAIL" not in printed
+
+
+@pytest.mark.parametrize("failure", ["lock wait", "constraint"])
+def test_control_the_env_py_the_server_had_printed_that_data(
+    tmp_path: Path, scratch_db_url: str, failure: str
+) -> None:
+    """Контроль пробы: на прежнем `env.py` те же сбои печатают данные — проба их видит."""
+    # У прежнего env.py предела нет: без него ожидание замка не кончилось бы.
+    with_limit = f"{scratch_db_url}?options=-c lock_timeout=400"
+
+    printed = _fail_a_data_migration(
+        tmp_path, scratch_db_url, failure, env_py=ENV_PY_ON_SERVER_BEFORE, db_url=with_limit
+    )
+
+    assert "[parameters:" in printed
+    for marker in (PARAMETER_HASH, ROW_EMAIL):
+        assert marker in printed, f"контроль не увидел {marker}:\n{printed}"
