@@ -115,6 +115,40 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 50
 ls -lah /opt/pharmacy-monitor/logs/
 ```
 
+### Журнал API: строка запроса скрыта
+
+uvicorn пишет в журнал `pharmacy-monitor-api` строку на каждый запрос. Всё после
+`?` в адресе заменено меткой — в строке запроса ездит токен входа из письма:
+
+```
+INFO:     203.0.113.7:51324 - "GET /auth/verify?<hidden> HTTP/1.1" 303 See Other
+```
+
+Метод, путь и статус на месте; строка без `?` (`GET /health`) не меняется.
+Делает это `src/access_log.py`, фильтр ставится при импорте `src.api` — от
+флагов запуска uvicorn и от юнита не зависит.
+
+**Нужны параметры запроса** (что клиент искал, с каким фильтром пришёл) — они в
+журнале Caddy, он пишет адрес целиком: `journalctl -u caddy -o cat | grep
+/api/v1/dash/`. ⚠️ По той же причине токен входа в журнале Caddy остаётся.
+
+**Проверить после выкладки** (root):
+
+```bash
+grep -c hide_query_strings /opt/pharmacy-monitor/src/api.py   # 0 — код не выложен
+SINCE=$(systemctl show -p ActiveEnterTimestamp --value pharmacy-monitor-api)
+journalctl -u pharmacy-monitor-api --since "$SINCE" | grep -c 'token='      # ждём 0
+journalctl -u pharmacy-monitor-api --since "$SINCE" | grep -c '?<hidden>'   # растёт с запросами
+```
+
+Строки, записанные до рестарта, остаются в journald до ротации.
+
+**В журнале `request_log_line_dropped`** — uvicorn сменил вид записи о запросе,
+и фильтр перестал её узнавать. Такие записи не печатаются вовсе (строк о
+запросах в журнале API нет), событие пишется один раз на процесс. Запросы видны
+в журнале Caddy; чинить — `src/access_log.py` и
+`tests/test_access_log_carries_no_query.py` под новую версию uvicorn.
+
 ---
 
 ## 🔧 Типовые проблемы и решения
