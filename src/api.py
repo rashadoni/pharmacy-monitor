@@ -949,6 +949,9 @@ LOGIN_LINK_NO_USER = "no_user"
 # сервера Sentry забирает вместе с кадрами запроса, в которых лежит кука сессии.
 LOGIN_LINK_NOT_SENT_STATUS = 424
 LOGIN_LINK_NOT_SENT_CODE = "login_link_not_sent"
+# Письмо и не собиралось: пользователь не нашёлся по адресу. Свой код, чтобы
+# страница не советовала проверять почту, — она покажет общую ошибку.
+LOGIN_LINK_NO_USER_CODE = "login_link_no_user"
 
 
 def _deliver_login_link(db: Session, email: str, *, invite: bool = False) -> str:
@@ -2077,7 +2080,8 @@ def dash_recipients_send_login_link(
     Ответ 200 — только о письме, которое отправитель подтвердил. Не подтвердил
     (отказ почты, сеть, SMTP не настроен) — 424 с кодом `login_link_not_sent`:
     ошибкой это видит и вкладка, открытая до выкладки, и любой клиент, который
-    читает один статус.
+    читает один статус. Письмо и не собиралось (пользователь не нашёлся по
+    адресу) — 409 с кодом `login_link_no_user`.
     """
     _require_admin(user)
     r = db.scalar(
@@ -2092,11 +2096,20 @@ def dash_recipients_send_login_link(
         raise HTTPException(400, "Пользователь деактивирован — сначала активируйте его")
     outcome = _deliver_login_link(db, r.email, invite=False)
     if outcome != LOGIN_LINK_SENT:
-        # `outcome=no_user` — письмо и не собиралось: пользователь не нашёлся по
-        # адресу в нижнем регистре или его отключили, пока шёл запрос.
         log.warning(
             "recipient_login_link_not_sent", id=r.id, by_user_id=user.id, outcome=outcome
         )
+    if outcome == LOGIN_LINK_NO_USER:
+        # Пользователь не нашёлся по адресу в нижнем регистре (строку завели
+        # мимо приложения) или его отключили, пока шёл запрос. Почта ни при чём.
+        raise HTTPException(
+            409,
+            detail={
+                "code": LOGIN_LINK_NO_USER_CODE,
+                "message": "No active user is found by this address: no link was issued.",
+            },
+        )
+    if outcome != LOGIN_LINK_SENT:
         raise HTTPException(
             LOGIN_LINK_NOT_SENT_STATUS,
             detail={

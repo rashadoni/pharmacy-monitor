@@ -377,7 +377,14 @@ def test_send_link_button_for_a_user_the_lookup_does_not_find(desk):
 
     response, send = _press_send_link(desk, carol.id, return_value=True)
 
-    _assert_the_button_refused(response)
+    # Не отказ почты: страница покажет общую ошибку, а не «проверьте адрес и почту».
+    assert response.status_code == 409 != api.LOGIN_LINK_NOT_SENT_STATUS, response.text
+    answer = response.json()
+    assert set(answer) == {"detail"} and set(answer["detail"]) == {"code", "message"}
+    assert answer["detail"]["code"] == api.LOGIN_LINK_NO_USER_CODE == "login_link_no_user"
+    assert api.LOGIN_LINK_NO_USER_CODE != api.LOGIN_LINK_NOT_SENT_CODE
+    assert "mail" not in answer["detail"]["message"]
+    _assert_no_person_or_text(answer)
     assert not send.called
     assert desk.journal.lines == [_button_refusal_line(desk, carol.id, "no_user")]
 
@@ -462,7 +469,13 @@ def test_new_user_invite_is_called_sent_when_the_sender_confirmed(desk):
 
 def _squeezed(path: Path) -> str:
     code = re.sub(r"(?m)^\s*//.*$", "", path.read_text(encoding="utf-8"))
+    code = re.sub(r"\{/\*.*?\*/\}", "", code, flags=re.DOTALL)  # закомментированный JSX
     return re.sub(r"\s+", " ", code)
+
+
+def _says(page: str, phrase: str) -> int:
+    """Сколько раз страница берёт фразу — в любых кавычках."""
+    return len(re.findall(rf"""\bt\(\s*["'`]{phrase}["'`]""", page))
 
 
 def test_dashboard_client_recognises_the_refusal_the_server_sends():
@@ -505,7 +518,9 @@ def test_users_page_reads_the_outcome_before_saying_sent():
 
     # «Отправить ссылку»: «отправлена» сказано в одном месте и только на ответ 200.
     assert "mutationFn: () => api.recipientSendLoginLink(u.id), });" in page
-    assert page.count('t("login_link_sent")') == 1
+    assert _says(page, "login_link_sent") == 1
+    # Пока запрос идёт, кнопка не нажимается: второе нажатие погасило бы первую ссылку.
+    assert "disabled={!u.is_active || sendLinkMut.isPending}" in page
     assert (
         "{sendLinkMut.isSuccess && ( "
         '<span className="text-[11px] text-success">{t("login_link_sent")}</span> )}'
@@ -533,7 +548,7 @@ def test_users_page_reads_the_outcome_before_saying_sent():
             page,
         )
         assert said == [(shown_when, colour)], (phrase, said)
-        assert page.count(f't("{phrase}"') == 1, phrase
+        assert _says(page, phrase) == 1, phrase
 
 
 def test_users_page_has_every_phrase_in_every_language():
@@ -543,8 +558,8 @@ def test_users_page_has_every_phrase_in_every_language():
         )["users"]
         for phrase in ("added", "added_invite_not_sent", "added_invite_unknown"):
             assert re.findall(r"\{(\w+)\}", copy[phrase]) == ["email"], (locale, phrase)
-            # Апостроф рядом со скобкой превращает подстановку в буквальный текст.
-            assert "'{" not in copy[phrase] and "}'" not in copy[phrase], (locale, phrase)
+            # Апостроф превращает подстановку в буквальный текст, тег роняет форматтер.
+            assert "'" not in copy[phrase] and "<" not in copy[phrase], (locale, phrase)
         assert "{" not in copy["login_link_not_sent"], locale
         # Оператору сказано, какой кнопкой отправить ссылку заново, — её же словами.
         assert f"«{copy['send_login_link']}»" in copy["added_invite_not_sent"].replace(

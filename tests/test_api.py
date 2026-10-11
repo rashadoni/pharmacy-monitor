@@ -4916,7 +4916,7 @@ def test_send_login_link_ok(client, auth_cookie, setup_db, monkeypatch):
     """admin шлёт login-link активному юзеру → 200 + выпущен свежий токен."""
     from src import notifier
 
-    # 200 — только о письме, которое отправитель подтвердил; без SMTP ответ 502.
+    # 200 — только о письме, которое отправитель подтвердил; без SMTP ответ 424.
     monkeypatch.setattr(notifier, "send_email", lambda **kwargs: True)
     s = setup_db
     t = tenants.get_or_create_default(s)
