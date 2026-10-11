@@ -91,10 +91,10 @@ ls -la /etc/pharmacy-monitor/env
 # In workflows: which ones read the secret
 grep -l 'secrets\.SSH_PRIVATE_KEY' .github/workflows/*.yml
 # ...any that read it other than as an `env:` entry of that name
-grep -n 'secrets\.SSH_PRIVATE_KEY' .github/workflows/*.yml | grep -v 'SSH_PRIVATE_KEY: \${{ secrets.SSH_PRIVATE_KEY }}'
+grep -n 'secrets\.SSH_PRIVATE_KEY' .github/workflows/*.yml | grep -v '^[^:]*:[0-9]*: *SSH_PRIVATE_KEY: \${{ secrets\.SSH_PRIVATE_KEY }} *$'
 # Expect: empty
 # ...and what the steps do with `$SSH_PRIVATE_KEY`
-grep -n '\$SSH_PRIVATE_KEY' .github/workflows/*.yml
+grep -nE '\$\{?SSH_PRIVATE_KEY' .github/workflows/*.yml
 # Expect: only emptiness tests and redirects into ~/.ssh/id_ed25519
 
 # In git:

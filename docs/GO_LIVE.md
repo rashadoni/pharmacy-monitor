@@ -7,8 +7,9 @@ Final pre-flight checklist + DNS cutover + 72h on-call.
 > VPS (`CLAUDE.md`, "Current production state"). On 2026-10-11 only the steps
 > that run `git` on the server were compared with it — step 1 of "T-0: Cutover"
 > and step 1 of "Rollback procedure". They cannot work there:
-> `/opt/pharmacy-monitor` is a copy without `.git`. Nothing else here was
-> re-checked that day.
+> `/opt/pharmacy-monitor` is a copy without `.git`. Apart from that and the two
+> CI lines under "T-3 days", corrected the same day in PR #83, nothing here was
+> re-checked.
 
 ## T-7 days (one week before)
 

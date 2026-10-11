@@ -161,8 +161,8 @@ being deployed. It copies code from its own checkout with `rsync` and runs no
 `deploy.yml` was rewritten on 2026-05-30, and was removed from the repository
 on 2026-10-11. A copy dated 2026-05-15 is still on the server — do not run it.
 The preflight checks, the `apply_migrations` switch and the cautions about when
-to start are in the workflow itself and in the note at the top of
-`docs/RUNBOOK.md`, «Обновления / деплой нового кода» (the code block under that
+to start are in the workflow itself and in `docs/RUNBOOK.md`, in the note that
+opens the section «Обновления / деплой нового кода» (the code block under that
 note is the old procedure) — read them there, not in a copy here.
 
 `deploy.yml` is the release path, but it is not the only workflow that runs a
@@ -234,12 +234,13 @@ ls -lth /var/backups/pharmacy-monitor/ | head
 > ⚠️ Outdated (marked 2026-10-11). The code steps below cannot work on the
 > current server: `/opt/pharmacy-monitor` is a copy without `.git` (checked
 > 2026-10-11), so `git log` and `git reset --hard` fail there. Where
-> `docs/RUNBOOK.md` describes taking code back, it goes through `main`: revert
-> the merge, wait for green CI, run `deploy.yml` («Выкладка правок
-> сопоставления», the rollback steps; the note under «Restore drill»).
-> `deploy.yml` refuses a commit that does not contain the production
-> database's migration revision. The other steps of this section were not
-> re-checked.
+> `docs/RUNBOOK.md` describes taking code back, it goes through `main` and
+> `deploy.yml`: revert the merge, wait for green CI, deploy («Выкладка правок
+> сопоставления», the rollback steps), or a new commit through a PR (the note
+> under «Restore drill»). `deploy.yml` refuses a commit that does not contain
+> the production database's migration revision, and it leaves on the server
+> any file a release added under `src/` (that `rsync` runs without `--delete`).
+> The other steps of this section were not re-checked.
 
 ```bash
 # Last good revision
