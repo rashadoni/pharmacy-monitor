@@ -2,6 +2,15 @@
 
 Final pre-flight checklist + DNS cutover + 72h on-call.
 
+> ⚠️ Marked 2026-10-11. This checklist was written for the go-live on the first
+> server, a Hetzner Cloud VM, which no longer exists; production is on a Contabo
+> VPS (`CLAUDE.md`, "Current production state"). On 2026-10-11 only the steps
+> that run `git` on the server were compared with it — step 1 of "T-0: Cutover"
+> and step 1 of "Rollback procedure". They cannot work there:
+> `/opt/pharmacy-monitor` is a copy without `.git`. Apart from that and the two
+> CI lines under "T-3 days", corrected the same day in PR #83, nothing here was
+> re-checked.
+
 ## T-7 days (one week before)
 
 - [ ] Hetzner CX22 provisioned, OS hardened (`infra/scripts/initial_server_setup.sh` ran clean)
@@ -99,6 +108,11 @@ curl -fsS https://your-domain.com/health
 ## Rollback procedure
 
 If something is broken in production and we need to go back:
+
+> ⚠️ Outdated (marked 2026-10-11). Step 1 cannot work on the current server —
+> see the note at the top of this file. How code gets to the server and how the
+> runbook takes it back — `docs/DEPLOY.md`, Phase 8 and "Rollback". The other
+> steps were not re-checked.
 
 ```bash
 # 1. Revert to last good code revision
