@@ -28,6 +28,7 @@ Metrics (Prometheus naming convention):
 from __future__ import annotations
 
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Iterator
@@ -66,8 +67,19 @@ def init_sentry(service: str) -> None:
             profiles_sample_rate=float(os.environ.get("SENTRY_PROFILES_SAMPLE_RATE", "0.1")),
             integrations=[FastApiIntegration(), SqlalchemyIntegration()],
             send_default_pii=False,  # don't send IP/cookies by default
+            # Frame locals are where the request's credentials sit verbatim: the
+            # ASGI `scope` and the `Request` object carry the session cookie and
+            # the API key, a pydantic payload carries the password. The SDK
+            # scrubs locals by variable name, and none of those names gives the
+            # contents away. The traceback itself stays.
+            include_local_variables=False,
+            # A request body holds passwords under names the SDK's scrubber does
+            # not know (`new_password`, `current_password`), and it is attached
+            # to performance traces of successful requests too, not just errors.
+            max_request_body_size="never",
             attach_stacktrace=True,
             before_send=_sentry_before_send,
+            before_send_transaction=_sentry_before_send_transaction,
         )
         sentry_sdk.set_tag("service", service)
         log.info("sentry_initialized", service=service, env=env, release=release[:8])
@@ -77,7 +89,7 @@ def init_sentry(service: str) -> None:
 
 
 def _sentry_before_send(event: dict, hint: dict) -> dict | None:
-    """Filter sensitive data + low-noise errors before sending to Sentry.
+    """Drop low-noise errors and strip request credentials before sending.
 
     Drop if: keyboard interrupt, client-disconnected, expected captcha.
     """
@@ -90,7 +102,138 @@ def _sentry_before_send(event: dict, hint: dict) -> dict | None:
         # Captcha is expected, log only
         if "CaptchaDetected" in exc_type:
             return None
-    return event
+    return _without_credentials(event)
+
+
+def _sentry_before_send_transaction(event: dict, hint: dict) -> dict | None:
+    """Performance traces carry the same request block as error events."""
+    return _without_credentials(event)
+
+
+# ─── Sentry: no request credentials in an outgoing event ────────────────────
+#
+# Two layers, each holding on its own (tests/test_sentry_events_carry_no_credentials.py
+# switches them off one at a time):
+#
+#   1. The SDK does not collect: no frame locals, no request body, no PII
+#      (`sentry_sdk.init` arguments above).
+#   2. The hooks below remove the same things from the finished event, so the
+#      guarantee does not rest on one keyword argument of a third-party SDK:
+#      the deploy does not install dependencies, and the SDK on the server
+#      need not be the version CI tests. They also cover what the SDK has no
+#      switch for: a query string (`/auth/verify?token=…`), which uvicorn's
+#      access log also quotes into a breadcrumb, and a session token in free
+#      text.
+#
+# The SDK's `EventScrubber` is not part of this: it matches dictionary keys
+# against a denylist, and the cookie leaked under the keys `scope`, `request`
+# and `conn`.
+
+_FILTERED = "[Filtered]"
+
+# A header or query parameter whose name says its value is a credential.
+_CREDENTIAL_NAME_RE = re.compile(
+    r"auth|cookie|token|secret|session|passw|pwd|signature|api[-_]?key", re.IGNORECASE
+)
+
+# Where the SDK puts a query string: the incoming request, and the breadcrumb
+# and span of an outgoing one.
+_QUERY_KEYS = frozenset({"query_string", "http.query"})
+
+# A parameter inside a URL that some string quotes whole: the access-log line
+# `"GET /auth/verify?token=… HTTP/1.1" 500` arrives as a breadcrumb message.
+# Both classes are bounded by the delimiters, so matching stays linear on a
+# request line the caller controls.
+_URL_PARAM_RE = re.compile(r"([?&])([^=&#?\s\"']{1,64})=([^&#\s\"']+)")
+
+# The session cookie is a JWT. Matched by shape wherever a string quotes it —
+# exception text, breadcrumb, tag: `<header>.<payload>`, the signature optional,
+# so a token cut short by truncation is still caught. Group 1 is whatever is
+# glued in front of the header (`sess_eyJ…`) and is kept.
+#
+# The first line of the pattern is there for speed, not meaning: a match may
+# begin only where a run of token characters begins, and only if that run is
+# followed by `.eyJ`. Without it a long `eyJeyJeyJ…` in a request line is
+# rescanned from every `eyJ` — a second of CPU per 60 KB.
+_JWT_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]+\.eyJ)"
+    r"([A-Za-z0-9_-]*?)eyJ[A-Za-z0-9_-]{8,}"
+    r"\.eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*)?"
+)
+
+
+def _without_credentials(event: dict) -> dict | None:
+    """Return the event without request credentials, or None to drop it."""
+    try:
+        _clean_request(event)
+        return _scrubbed(event)
+    except Exception as exc:
+        # An event the scrubber could not process is not sent: letting it
+        # through would make the scrubber pass on its own failure.
+        log.warning("sentry_event_dropped", reason="scrubber_failed", error_type=type(exc).__name__)
+        return None
+
+
+def _clean_request(event: dict) -> None:
+    """Keep method, URL and harmless headers; drop body, cookies and credential headers."""
+    request = event.get("request")
+    if not isinstance(request, dict):
+        return
+    request.pop("data", None)
+    request.pop("cookies", None)
+    headers = request.get("headers")
+    if isinstance(headers, dict):
+        for name in headers:
+            if _CREDENTIAL_NAME_RE.search(str(name)):
+                headers[name] = _FILTERED
+    elif headers is not None:
+        del request["headers"]
+
+
+def _scrubbed(node):
+    """Copy of an event tree without frame locals, credential queries and session tokens."""
+    if isinstance(node, str):
+        return _URL_PARAM_RE.sub(_masked_url_param, _JWT_RE.sub(rf"\1{_FILTERED}", node))
+    if isinstance(node, dict):
+        clean = {}
+        for key, value in node.items():
+            if key == "frames" and isinstance(value, list):
+                # Exception, thread and bare stacktraces all keep frames under this key.
+                value = [_without_locals(frame) for frame in value]
+            elif key in _QUERY_KEYS and not _query_is_harmless(value):
+                value = _FILTERED
+            clean[_scrubbed(key)] = _scrubbed(value)
+        return clean
+    if isinstance(node, (list, tuple)):
+        return [_scrubbed(item) for item in node]
+    return node
+
+
+def _masked_url_param(match: re.Match) -> str:
+    separator, name, _value = match.groups()
+    if _CREDENTIAL_NAME_RE.search(name):
+        return f"{separator}{name}={_FILTERED}"
+    return match[0]
+
+
+def _without_locals(frame):
+    if isinstance(frame, dict):
+        return {key: value for key, value in frame.items() if key != "vars"}
+    return frame
+
+
+def _query_is_harmless(query) -> bool:
+    """False if any parameter is named like a credential.
+
+    The SDK hands the query string over already unquoted, so the end of a value
+    cannot be told apart from the start of the next parameter: the caller
+    replaces the whole string rather than one value.
+    """
+    if not query:
+        return True
+    if not isinstance(query, str):
+        return False
+    return not any(_CREDENTIAL_NAME_RE.search(pair.partition("=")[0]) for pair in query.split("&"))
 
 
 def _git_short_sha() -> str:
