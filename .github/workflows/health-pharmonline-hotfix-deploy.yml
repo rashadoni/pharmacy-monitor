@@ -1085,6 +1085,42 @@ jobs:
             src/health.py src/main.py src/notifier.py src/storage.py \
             src/scrapers/pharmonline_ddp.py
 
+          # py_compile checks syntax only.  This workflow ships five files, not
+          # the tree: a file that imports a module or a name the live tree does
+          # not have compiles fine, the health check below (src.storage,
+          # src.health) passes, and after a green run no CLI command starts on
+          # the server - scrapes, digests and health-check itself.  Import the
+          # real entry point; a failure here triggers the rollback.
+          printf '== deployed CLI entry point import ==\n'
+          timeout 60s .venv/bin/python - <<'PY'
+          from contextlib import redirect_stderr, redirect_stdout
+          import io
+          from pathlib import Path
+          import re
+
+          captured = io.StringIO()
+          try:
+              with redirect_stdout(captured), redirect_stderr(captured):
+                  from dotenv import load_dotenv
+
+                  load_dotenv("/etc/pharmacy-monitor/env", override=True)
+
+                  from src import main
+          except Exception as exc:
+              print("cli_entry_point_import=failed")
+              print(f"cli_entry_point_import_error_type={type(exc).__name__}")
+              missing = getattr(exc, "name", None)
+              if isinstance(missing, str) and re.fullmatch(r"[A-Za-z0-9_.]{1,80}", missing):
+                  print(f"cli_entry_point_import_module={missing}")
+              raise SystemExit(1) from None
+
+          expected = Path("/opt/pharmacy-monitor/src/main.py").resolve()
+          if Path(main.__file__).resolve() != expected:
+              print("cli_entry_point_import=not_the_deployed_file")
+              raise SystemExit(1)
+          print("cli_entry_point_import=ok")
+          PY
+
           printf '== structured read-only health verification ==\n'
           timeout 60s .venv/bin/python - <<'PY'
           from contextlib import redirect_stderr, redirect_stdout

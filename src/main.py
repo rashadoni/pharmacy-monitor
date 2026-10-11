@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 load_dotenv(override=True)
 
 from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
+from src.email_address import InvalidEmailAddress  # noqa: E402
 from src.run_lock import SCRAPE_ADVISORY_LOCK_KEY  # noqa: E402
 from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
@@ -2771,29 +2772,30 @@ def _setup_logging(level: str = "INFO") -> None:
     Файл-логи читаются ELK / Loki / простым `jq`. Ротация — logrotate
     (см. provision_vps.sh — еженедельно, 8 архивов, gzip).
     """
+    # Вывод команды бывает публичным: еженедельный сбор pharmonline идёт из
+    # GitHub Actions, и журнал его шага открыт. Почтовый адрес из готовой
+    # строки вырезается, что бы ни передал вызов журнала, — и у structlog, и у
+    # stdlib `logging`, которым в тот же вывод пишут сторонние библиотеки.
+    from src.logging_setup import MaskingFormatter, masking
+
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # File handler — JSONL
     file_handler = logging.FileHandler(log_dir / "app.jsonl", encoding="utf-8")
     file_handler.setLevel(level)
-    file_handler.setFormatter(logging.Formatter("%(message)s"))
+    file_handler.setFormatter(MaskingFormatter("%(message)s"))
 
     # Stream handler — terminal
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(level)
-    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    stream_handler.setFormatter(MaskingFormatter("%(message)s"))
 
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
     root.setLevel(level)
-
-    # Вывод команды бывает публичным: еженедельный сбор pharmonline идёт из
-    # GitHub Actions, и журнал его шага открыт. Почтовый адрес из готовой
-    # строки вырезается, что бы ни передал вызов журнала.
-    from src.logging_setup import masking
 
     structlog.configure(
         processors=[
@@ -4510,6 +4512,7 @@ def health_check_cmd(
 ) -> None:
     """Проверить здоровье системы: stale/failed/empty/site-drop. Exit-code 0=ok, 1=warning, 2=critical."""
     from src.health import check_health
+    from src.logging_setup import without_addresses
 
     storage.init_db()
     Session = storage.make_session()
@@ -4525,7 +4528,9 @@ def health_check_cmd(
             f"at {report.last_run_at}"
         )
         for i in report.issues:
-            click.echo(f"  [{i.severity}] {i.code}: {i.message}")
+            # click печатает мимо маски журнала, а в сообщении бывает текст ошибки
+            # прогона как он записан в базу (`runs.error_message`).
+            click.echo(f"  [{i.severity}] {i.code}: {without_addresses(i.message)}")
 
     # Do not return early on quiet+OK: an active incident still needs one
     # recovery email and an atomic transition to the healthy state.
@@ -4549,7 +4554,10 @@ def health_check_cmd(
                         "инцидент не изменился)"
                     )
         except Exception as e:
-            click.echo(f"⚠️ Не удалось отправить health email: {e}", err=True)
+            # Тоже мимо маски. Сбой отправки приходит из `send_email` уже без
+            # адреса; остальное в этом `try` не чистил никто.
+            reason = without_addresses(str(e))
+            click.echo(f"⚠️ Не удалось отправить health email: {reason}", err=True)
 
     if quiet_healthy:
         return
@@ -4741,7 +4749,10 @@ def tenant_add_user(tenant_slug: str, email: str, name: str | None, role: str) -
         t = t_mod.get_tenant(s, tenant_slug)
         if not t:
             raise click.ClickException(f"Tenant not found: {tenant_slug}")
-        u = t_mod.add_user(s, t.id, email, name=name, role=role)
+        try:
+            u = t_mod.add_user(s, t.id, email, name=name, role=role)
+        except InvalidEmailAddress as refusal:
+            raise click.ClickException(str(refusal)) from None
         click.echo(f"OK: user #{u.id} {u.email} role={u.role}")
 
 
@@ -6058,9 +6069,9 @@ def run_cmd(
             session.commit()
             log.exception("run_failed", run_id=run_id)
             # click печатает этот текст сам, мимо маски журнала.
-            from src.logging_setup import mask_addresses
+            from src.logging_setup import without_addresses
 
-            raise click.ClickException(mask_addresses(str(e)))
+            raise click.ClickException(without_addresses(str(e)))
 
 
 @cli.command("scrape")
@@ -6961,7 +6972,10 @@ def recipient_add(email: str, name: str | None) -> None:
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        r = watchlist.add_recipient(s, email, name)
+        try:
+            r = watchlist.add_recipient(s, email, name)
+        except InvalidEmailAddress as refusal:
+            raise click.ClickException(str(refusal)) from None
         click.echo(f"OK: {r.email} ({r.name or '—'}) is_active={r.is_active}")
 
 
@@ -7015,7 +7029,10 @@ def recipient_update(email: str, new_email: str | None, name: str | None) -> Non
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        r = watchlist.update_recipient(s, email, new_email=new_email, name=name)
+        try:
+            r = watchlist.update_recipient(s, email, new_email=new_email, name=name)
+        except InvalidEmailAddress as refusal:
+            raise click.ClickException(str(refusal)) from None
         if not r:
             click.echo(f"Not found: {email}")
             return

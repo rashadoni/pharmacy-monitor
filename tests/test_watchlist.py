@@ -31,8 +31,8 @@ def test_add_recipient_normalizes_email(db_session):
 
 
 def test_remove_recipient(db_session):
-    wl.add_recipient(db_session, "a@b.c")
-    assert wl.remove_recipient(db_session, "a@b.c") is True
+    wl.add_recipient(db_session, "a@b.co")
+    assert wl.remove_recipient(db_session, "a@b.co") is True
     assert wl.list_recipients(db_session) == []
 
 
@@ -52,7 +52,7 @@ def test_active_recipients_only(db_session):
     wl.add_recipient(db_session, "active@x.com")
     wl.add_recipient(db_session, "inactive@x.com")
     wl.toggle_recipient(db_session, "inactive@x.com")
-    assert wl.active_recipient_emails(db_session) == ["active@x.com"]
+    assert [email for _, email in wl.active_recipients(db_session)] == ["active@x.com"]
 
 
 def test_update_recipient_changes_name(db_session):

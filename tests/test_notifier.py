@@ -3,7 +3,7 @@
 Coverage gap: 18% → больше. Покрываем:
 - Telegram send_message: missing token, success, API error, network error
 - telegram_get_updates: missing token, success, error
-- resolve_recipients: explicit, from DB, from env, all-empty
+- _recipient_records: explicit, from DB, from env, all-empty
 - send_email: no SMTP env → skip, with SMTP → SMTP smtplib mocked
 """
 
@@ -121,53 +121,51 @@ def test_telegram_get_updates_handles_error(monkeypatch):
     assert notifier.telegram_get_updates() == []
 
 
-# ─── resolve_recipients ────────────────────────────────────────────────────
+# ─── _recipient_records ────────────────────────────────────────────────────
 
 
-def test_resolve_recipients_explicit_wins():
+def test_recipient_records_explicit_wins():
     """Explicit аргумент имеет приоритет — без обращения к DB / env."""
-    assert notifier.resolve_recipients(["alice@x"]) == ["alice@x"]
+    assert notifier._recipient_records(["alice@x"]) == ("to", [(1, "alice@x")])
 
 
-def test_resolve_recipients_falls_back_to_env(monkeypatch):
-    """Если DB пуста (или не найдена) — берём EMAIL_TO."""
-    # Make DB lookup return empty
+def test_recipient_records_fall_back_to_env(monkeypatch):
+    """Если DB пуста (или не найдена) — берём EMAIL_TO; номер — место в списке."""
     import src.watchlist as wl
 
-    monkeypatch.setattr(wl, "active_recipient_emails", lambda _s: [])
+    monkeypatch.setattr(wl, "active_recipients", lambda _s: [])
     monkeypatch.setenv("EMAIL_TO", "  env1@x.com,  env2@y.com  ")
-    out = notifier.resolve_recipients()
-    assert out == ["env1@x.com", "env2@y.com"]
+    assert notifier._recipient_records() == ("EMAIL_TO", [(1, "env1@x.com"), (2, "env2@y.com")])
 
 
-def test_resolve_recipients_from_db_when_available(monkeypatch):
-    """Если БД даёт recipients — используем их (env игнорируется)."""
+def test_recipient_records_from_db_when_available(monkeypatch):
+    """Если БД даёт recipients — используем их (env игнорируется); номер — id строки."""
     import src.watchlist as wl
 
-    monkeypatch.setattr(wl, "active_recipient_emails", lambda _s: ["db@x"])
+    monkeypatch.setattr(wl, "active_recipients", lambda _s: [(7, "db@x")])
     monkeypatch.setenv("EMAIL_TO", "env-only@x")
-    assert notifier.resolve_recipients() == ["db@x"]
+    assert notifier._recipient_records() == ("recipients", [(7, "db@x")])
 
 
-def test_resolve_recipients_db_failure_falls_back_to_env(monkeypatch):
+def test_recipient_records_db_failure_falls_back_to_env(monkeypatch):
     """Если DB lookup кидает exception — fallback на EMAIL_TO."""
     import src.watchlist as wl
 
     def boom(_s):
         raise RuntimeError("DB connection refused")
 
-    monkeypatch.setattr(wl, "active_recipient_emails", boom)
+    monkeypatch.setattr(wl, "active_recipients", boom)
     monkeypatch.setenv("EMAIL_TO", "fallback@x")
-    assert notifier.resolve_recipients() == ["fallback@x"]
+    assert notifier._recipient_records() == ("EMAIL_TO", [(1, "fallback@x")])
 
 
-def test_resolve_recipients_all_empty(monkeypatch):
+def test_recipient_records_all_empty(monkeypatch):
     """Нет explicit / DB / env → пустой список."""
     import src.watchlist as wl
 
-    monkeypatch.setattr(wl, "active_recipient_emails", lambda _s: [])
+    monkeypatch.setattr(wl, "active_recipients", lambda _s: [])
     monkeypatch.delenv("EMAIL_TO", raising=False)
-    assert notifier.resolve_recipients() == []
+    assert notifier._recipient_records() == ("EMAIL_TO", [])
 
 
 # ─── send_email ────────────────────────────────────────────────────────────
@@ -181,16 +179,17 @@ def test_send_email_skip_without_smtp_host(monkeypatch, caplog):
 
 
 def test_send_email_no_recipients_raises(monkeypatch):
-    """SMTP задан но нет получателей → ValueError."""
+    """SMTP задан, но нет получателей → ошибка отправки с классом ValueError."""
     monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
     monkeypatch.setenv("SMTP_USER", "u@x")
     monkeypatch.setenv("SMTP_PASSWORD", "p")
     monkeypatch.delenv("EMAIL_TO", raising=False)
     import src.watchlist as wl
 
-    monkeypatch.setattr(wl, "active_recipient_emails", lambda _s: [])
-    with pytest.raises(ValueError, match="No recipients"):
+    monkeypatch.setattr(wl, "active_recipients", lambda _s: [])
+    with pytest.raises(notifier.EmailSendError, match="ValueError: No recipients") as raised:
         notifier.send_email("S", "<p></p>")
+    assert raised.value.error_type == "ValueError"
 
 
 def test_send_email_sends_via_smtplib(monkeypatch):
@@ -199,10 +198,10 @@ def test_send_email_sends_via_smtplib(monkeypatch):
     monkeypatch.setenv("SMTP_PORT", "587")
     monkeypatch.setenv("SMTP_USER", "u@x")
     monkeypatch.setenv("SMTP_PASSWORD", "secret")
-    monkeypatch.setenv("EMAIL_TO", "recipient@x")
+    monkeypatch.setenv("EMAIL_TO", "recipient@x.example")
     import src.watchlist as wl
 
-    monkeypatch.setattr(wl, "active_recipient_emails", lambda _s: [])
+    monkeypatch.setattr(wl, "active_recipients", lambda _s: [])
 
     sent: dict = {}
 
@@ -231,7 +230,7 @@ def test_send_email_sends_via_smtplib(monkeypatch):
             sent["subject"] = msg["Subject"]
 
     monkeypatch.setattr("smtplib.SMTP", FakeSMTP)
-    assert notifier.send_email("Test subject", "<p>Body</p>", to=["explicit@x"]) is True
+    assert notifier.send_email("Test subject", "<p>Body</p>", to=["explicit@x.example"]) is True
     assert sent["host"] == "smtp.example.com"
     assert sent["port"] == 587
     # Без таймаута зависший SMTP держал бы таймерную задачу до лимита systemd.
@@ -239,7 +238,7 @@ def test_send_email_sends_via_smtplib(monkeypatch):
     assert sent["user"] == "u@x"
     assert sent["password"] == "secret"
     assert sent["starttls"] is True
-    assert sent["to"] == "explicit@x"
+    assert sent["to"] == "explicit@x.example"
     assert sent["subject"] == "Test subject"
 
 
@@ -250,7 +249,7 @@ def test_send_email_with_attachment(monkeypatch):
     monkeypatch.setenv("SMTP_PASSWORD", "p")
     import src.watchlist as wl
 
-    monkeypatch.setattr(wl, "active_recipient_emails", lambda _s: [])
+    monkeypatch.setattr(wl, "active_recipients", lambda _s: [])
 
     captured_messages = []
 
@@ -279,7 +278,7 @@ def test_send_email_with_attachment(monkeypatch):
             "S",
             "<p>x</p>",
             attachments=[("report.xlsx", b"fake-xlsx", "application/vnd.ms-excel")],
-            to=["r@x"],
+            to=["r@x.example"],
         )
         is True
     )
@@ -294,18 +293,20 @@ def test_send_email_with_attachment(monkeypatch):
 
 
 def test_send_email_smtp_failure_propagates(monkeypatch):
-    """SMTP exception НЕ ловится внутри send_email — propagate up.
+    """Сбой отправки НЕ глотается внутри send_email — выходит к вызывающему.
 
     Это намеренно: caller (alerts dispatcher) сам решает что делать
-    с failed delivery (retry / drop).
+    с failed delivery (retry / drop). Выходит он как `EmailSendError` — с
+    классом исходной ошибки, но без её текста как есть: в нём бывает адрес
+    (tests/test_log_carries_no_address.py, слой 2).
     """
     monkeypatch.setenv("SMTP_HOST", "x")
     monkeypatch.setenv("SMTP_USER", "u")
     monkeypatch.setenv("SMTP_PASSWORD", "p")
-    monkeypatch.setenv("EMAIL_TO", "r@x")
+    monkeypatch.setenv("EMAIL_TO", "r@x.example")
     import src.watchlist as wl
 
-    monkeypatch.setattr(wl, "active_recipient_emails", lambda _s: [])
+    monkeypatch.setattr(wl, "active_recipients", lambda _s: [])
 
     class BoomSMTP:
         def __init__(self, *a, **kw):
@@ -318,5 +319,6 @@ def test_send_email_smtp_failure_propagates(monkeypatch):
             pass
 
     monkeypatch.setattr("smtplib.SMTP", BoomSMTP)
-    with pytest.raises(ConnectionRefusedError):
+    with pytest.raises(notifier.EmailSendError, match="ConnectionRefusedError: nope") as raised:
         notifier.send_email("S", "<p></p>")
+    assert raised.value.error_type == "ConnectionRefusedError"

@@ -11,6 +11,7 @@ from pathlib import Path
 from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
+from src.email_address import normalize_address
 from src.storage import (
     Category,
     Recipient,
@@ -229,7 +230,9 @@ def seed_categories_from_yaml(session: Session, yaml_path) -> int:
 
 
 def add_recipient(session: Session, email: str, name: str | None = None) -> Recipient:
-    email = email.strip().lower()
+    """Запись, которая не адрес, — `InvalidEmailAddress`: письмо по этому списку
+    одно на всех, и такая запись срывала бы его всему списку."""
+    email = normalize_address(email)
     existing = session.scalar(select(Recipient).where(Recipient.email == email))
     if existing:
         existing.name = name or existing.name
@@ -277,12 +280,17 @@ def update_recipient(
     name: str | None = None,
     telegram_chat_id: str | None = None,
 ) -> Recipient | None:
-    """Изменить имя, email или telegram_chat_id существующей записи."""
+    """Изменить имя, email или telegram_chat_id существующей записи.
+
+    Запись ищется по своему тексту, без проверки, — так находят и старую
+    запись, которая не адрес. Новый адрес проверяется: не адрес —
+    `InvalidEmailAddress`.
+    """
     r = session.scalar(select(Recipient).where(Recipient.email == email.strip().lower()))
     if not r:
         return None
     if new_email:
-        r.email = new_email.strip().lower()
+        r.email = normalize_address(new_email)
     if name is not None:
         r.name = name or None
     if telegram_chat_id is not None:
@@ -291,8 +299,9 @@ def update_recipient(
     return r
 
 
-def active_recipient_emails(session: Session) -> list[str]:
-    return [r.email for r in list_recipients(session, active_only=True)]
+def active_recipients(session: Session) -> list[tuple[int, str]]:
+    """Активные записи списка: (id, запись). По id запись называют в журнале."""
+    return [(r.id, r.email) for r in list_recipients(session, active_only=True)]
 
 
 # === TRACKED PRODUCTS (WATCHLIST) ===
