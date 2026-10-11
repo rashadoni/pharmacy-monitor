@@ -201,14 +201,89 @@ jobs:
           PY
 
           # EnvironmentFile values are literal systemd values, not shell code.
-          while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-              ''|\#*) continue ;;
-            esac
-            key=${line%%=*}
-            value=${line#*=}
-            export "$key=$value"
-          done < /etc/pharmacy-monitor/env
+          load_environment_file() {
+            # systemd reads EnvironmentFile as literal NAME=VALUE lines, never as
+            # shell, and this step log is public.  Nothing read from the file is
+            # ever printed: the loop below has no stderr, so neither bash nor a
+            # trace can speak from inside it, and a refusal names the line number
+            # and nothing else.  The price: a fatal bash error inside the loop ends
+            # the script without a word, so keep every branch of it under test.
+            # A line is exported only if it means here what it means to systemd,
+            # which drops spaces, tabs and CR around the line, the name and the
+            # value and takes one pair of quotes off the value.  A line systemd
+            # would skip (no "=", a bad name) or read differently (other quoting,
+            # a backslash) stops the run: that is what a torn value looks like.
+            # tests/test_workflow_env_file_loader.py runs this text; every workflow
+            # carries the same copy, so change them together.
+            local env_file=$1 env_number=0 env_refusal="" env_line="" env_name="" env_value=""
+            local env_cr env_ws env_sq
+            env_cr=$(printf "\r")
+            env_ws=$(printf " \t")$env_cr
+            env_sq=$(printf "\047")
+            while IFS= read -r env_line || [ -n "$env_line" ]; do
+              env_number=$((env_number + 1))
+              env_line=${env_line#"${env_line%%[!"$env_ws"]*}"}
+              env_line=${env_line%"${env_line##*[!"$env_ws"]}"}
+              case "$env_line" in
+                "") continue ;;
+                *"$env_cr"*) env_refusal="a carriage return inside the line"; break ;;
+                \#*|\;*) continue ;;
+                *=*) ;;
+                *) env_refusal="not NAME=VALUE"; break ;;
+              esac
+              env_name=${env_line%%=*}
+              env_name=${env_name%"${env_name##*[!"$env_ws"]}"}
+              env_value=${env_line#*=}
+              env_value=${env_value#"${env_value%%[!"$env_ws"]*}"}
+              if ! [[ $env_name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                env_refusal="the name is not a variable name"; break
+              fi
+              case "$env_value" in
+                \"*\")
+                  env_value=${env_value#\"}
+                  env_value=${env_value%\"}
+                  case "$env_value" in
+                    *[\"\\]*) env_refusal="quoting systemd reads differently"; break ;;
+                  esac ;;
+                "$env_sq"*"$env_sq")
+                  env_value=${env_value#"$env_sq"}
+                  env_value=${env_value%"$env_sq"}
+                  case "$env_value" in
+                    *"$env_sq"*) env_refusal="quoting systemd reads differently"; break ;;
+                  esac ;;
+                \"*|"$env_sq"*)
+                  env_refusal="quoting systemd reads differently"; break ;;
+                *\\*)
+                  env_refusal="a backslash systemd reads differently"; break ;;
+              esac
+              # Some names cannot carry a value from the file.  env_* is the state
+              # of this function; PS4 and BASH_* reconfigure the running shell
+              # (BASH_ARGV0 renames it in every later message).  A name bash holds
+              # as a number does not store text: under OPTIND or RANDOM the value
+              # would be computed, that is executed.  A read-only name (SHELLOPTS)
+              # ends bash on the spot, hence the subshell first.  And bash keeps its
+              # own value for the names it computes (GROUPS), so what was exported
+              # is read back.
+              env_refusal="the name belongs to bash or to this loader"
+              case "$env_name" in
+                env_*|BASH_*|PS4) break ;;
+              esac
+              if [[ -v $env_name && ${!env_name@a} == *i* ]]; then
+                break
+              fi
+              (export "$env_name=$env_value") || break
+              export "$env_name=$env_value" || break
+              [[ ${!env_name-} == "$env_value" ]] || break
+              env_refusal=""
+            # A directory opens like a file and then reads as an empty one.
+            done 2> /dev/null < "$env_file" && [ -f "$env_file" ] ||
+              env_refusal="the file cannot be read"
+            if [ -n "$env_refusal" ]; then
+              echo "EnvironmentFile line $env_number: $env_refusal" >&2
+              exit 1
+            fi
+          }
+          load_environment_file /etc/pharmacy-monitor/env
 
           PHARMONLINE_PUBLIC_API=required \
           PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
