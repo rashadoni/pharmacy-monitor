@@ -25,6 +25,11 @@
                       режиме проба обязана увидеть утечку, иначе её «чисто» ничего
                       не значит.
 
+Журнал uvicorn чистит ещё и `src/access_log.py` — раньше, чем строку журнала
+доступа увидит SDK. Его фильтры оставлены только в `as_shipped`: в остальных
+режимах проверяется слой Sentry сам по себе, а с фильтрами хукам нечего было бы
+вырезать и контроль `before_fix` не увидел бы токен в «хлебной крошке».
+
 Чего проба не видит: Redis выключен (счётчики запросов идут в память), поэтому
 команд Redis в трассах нет — что имя счётчика не несёт ключа, проверяет
 tests/test_api.py.
@@ -134,12 +139,20 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from src import api, notifications, notifier, product_policy, storage
+from src import access_log, api, notifications, notifier, product_policy, storage
 from src import tenants  # импорт src.api выше и зовёт init_sentry
 from src._time import utcnow
 
 assert SHIPPED_OPTIONS, "init_sentry не дошёл до sentry_sdk.init"
 assert isinstance(sentry_sdk.get_client().transport, RecordingTransport), "транспорт не подменён"
+
+if MODE != "as_shipped":
+    for _name in (access_log.ACCESS_LOGGER, access_log.ERROR_LOGGER):
+        _logger = logging.getLogger(_name)
+        _shipped = [f for f in _logger.filters if isinstance(f, access_log.QueryHidden)]
+        # Снимать нечего — журнал чистят уже не так, и режимы пробы устарели.
+        assert len(_shipped) == 1, f"{_name}: ожидался один фильтр src.access_log: {_shipped}"
+        _logger.removeFilter(_shipped[0])
 
 engine = create_engine(
     "sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool

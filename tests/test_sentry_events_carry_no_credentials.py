@@ -28,6 +28,9 @@ uvicorn. При сбое базы SQLAlchemy дописывает в текст 
     возвращён к худшему случаю: держат всё;
   - `before_fix` — ни того ни другого. Это контроль: проба обязана увидеть
     утечку, иначе её «чисто» в остальных режимах ничего не значит.
+
+Строку журнала доступа раньше SDK чистит `src/access_log.py`; его фильтры
+оставлены только в `as_shipped`, чтобы остальные режимы проверяли слой Sentry.
 """
 
 from __future__ import annotations
@@ -270,9 +273,12 @@ def test_access_log_breadcrumb_keeps_the_request_line_without_the_token(probe):
     [leaked] = access_log_lines("before_fix")
     assert f'"GET /auth/verify?token={token} HTTP/1.1" 500' in leaked
 
-    for mode in ("as_shipped", "hooks_only"):
-        [line] = access_log_lines(mode)
-        assert '"GET /auth/verify?[Filtered] HTTP/1.1" 500' in line
+    # Хуки справляются сами: в этом режиме фильтры журнала с uvicorn сняты.
+    [line] = access_log_lines("hooks_only")
+    assert '"GET /auth/verify?[Filtered] HTTP/1.1" 500' in line
+    # На сервере строка приходит в SDK уже без запроса — её чистит src/access_log.py.
+    [line] = access_log_lines("as_shipped")
+    assert '"GET /auth/verify?<hidden> HTTP/1.1" 500' in line
 
 
 def test_database_error_keeps_the_statement_without_its_parameters(probe):

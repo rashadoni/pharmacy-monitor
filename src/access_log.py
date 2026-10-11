@@ -4,8 +4,10 @@
 
     127.0.0.1:46808 - "GET /auth/verify?token=<токен входа> HTTP/1.1" 303 See Other
 
-В строке запроса ездит токен входа из письма. Он одноразовый и живёт 30 минут,
-но при ответе 5xx остаётся непогашенным, а журнал лежит на сервере неделями.
+В строке запроса ездит токен входа из письма. В журнал он попадает раньше, чем
+погашен, а гасит его только успешный вход: после ответа 5xx и после запроса,
+который до проверки не дошёл (`HEAD` — 405), токен из журнала ещё действует,
+пока не выйдут его 30 минут.
 
 Здесь всё после `?` заменяется меткой — целиком, без списка «опасных»
 параметров: список, в котором нет завтрашнего параметра, пропускает его молча.
@@ -13,23 +15,30 @@
 ошибки, которую uvicorn печатает рядом, — адреса запроса в трассировке нет.
 
 Почему фильтр в коде, а не `--no-access-log` в systemd-юните. Юнит на сервере
-ставит root руками, отдельно от выкладки, и с файлом в репозитории он уже
-расходился; фильтр приезжает с кодом и не зависит от того, какими флагами
-запущен uvicorn. Ставит его `src.api` при импорте: uvicorn настраивает журнал
-до загрузки приложения, первый запрос приходит после.
+ставит root руками, отдельно от выкладки; фильтр приезжает с кодом. Ставит его
+`src.api` при импорте — в каждом рабочем процессе, до первого запроса.
 
-Адрес запроса uvicorn пишет в двух местах, и закрыты оба:
-  - журнал доступа, логгер `uvicorn.access` — строка на каждый ответ;
+При обычном уровне журнала uvicorn пишет адрес запроса в двух местах:
+  - журнал доступа, логгер `uvicorn.access` — строка на каждый ответ. Запись
+    незнакомого вида здесь не печатается вовсе;
   - запрос на WebSocket, логгер `uvicorn.error`: `"WebSocket /путь?запрос" 403`.
     Маршрутов WebSocket у приложения нет, но строку uvicorn пишет и на отказ.
+    Этот логгер пишет не только о запросах, поэтому запись узнаётся по куску
+    шаблона — и если uvicorn шаблон переименует, пройдёт как есть. Входа по
+    ссылке через WebSocket нет, чужому токену взяться в такой строке неоткуда.
 
 Чего фильтр НЕ делает:
   - путь остаётся как есть — секрету в пути маршрута он не поможет (таких
     маршрутов нет, за этим следит tests/test_access_log_carries_no_query.py);
-  - журнал Caddy перед API пишет тот же адрес с тем же токеном — это настройка
-    Caddyfile, не этого процесса;
-  - с `--log-level trace` uvicorn печатает сообщения ASGI целиком, со строкой
-    запроса внутри; на сервере уровень обычный.
+  - уровень журнала `debug` или `trace` (флаг `--log-level`, переменная
+    `UVICORN_LOG_LEVEL`): библиотека websockets и сам uvicorn печатают запрос
+    целиком, мимо обеих записей выше;
+  - журнал Caddy перед API пишет адрес сам — это настройка Caddyfile, не этого
+    процесса;
+  - событие Sentry: адрес запроса SDK берёт не из журнала, его чистит
+    `src/observability.py`. Из журнала SDK берёт только «хлебную крошку» —
+    строку журнала доступа, и она уходит уже с меткой;
+  - текст исключения в трассировке не трогается.
 """
 
 from __future__ import annotations
@@ -73,7 +82,7 @@ class QueryHidden(logging.Filter):
     Запись о запросе другого вида не пропускается вовсе: готовый текст в `msg`,
     шаблон с `?`, аргументы словарём — по ним нельзя сказать, где кончается
     запрос. Потерянная строка журнала лучше строки с токеном; о первой такой
-    записи процесс говорит один раз, без её содержимого.
+    записи фильтр говорит один раз, без её содержимого.
 
     `only_records_with` — для логгера, который пишет не только о запросах:
     запись без этого куска в шаблоне фильтр не трогает и не теряет.
@@ -85,33 +94,36 @@ class QueryHidden(logging.Filter):
         self._drop_reported = False
 
     def filter(self, record: logging.LogRecord) -> bool:
-        template = record.msg if isinstance(record.msg, str) else None
-        marker = self._only_records_with
-        if marker is not None and (template is None or marker not in template):
-            return True
+        # Фильтр зовётся на каждом ответе, внутри uvicorn: исключение отсюда
+        # оборвало бы запрос. Запись, которую не удалось разобрать, теряется.
         try:
+            template = record.msg if isinstance(record.msg, str) else None
+            marker = self._only_records_with
+            if marker is not None and (template is None or marker not in template):
+                return True
             args = record.args
             if template is not None and "?" not in template and isinstance(args, tuple):
                 if args:
                     record.args = tuple(_without_query(arg) for arg in args)
                 return True
-            self._report_drop(record)
         except Exception:
-            # Фильтр зовётся на каждом ответе, внутри uvicorn: исключение отсюда
-            # оборвало бы запрос. Запись, которую не удалось разобрать, теряется.
             pass
+        self._report_drop(record)
         return False
 
     def _report_drop(self, record: logging.LogRecord) -> None:
         if self._drop_reported:
             return
         self._drop_reported = True
-        log.warning(
-            "request_log_line_dropped",
-            logger=record.name,
-            reason="unrecognized record shape: cannot tell where the query string ends",
-            args_type=type(record.args).__name__,
-        )
+        try:
+            log.warning(
+                "request_log_line_dropped",
+                logger=record.name,
+                reason="unrecognized record shape: cannot tell where the query string ends",
+                args_type=type(record.args).__name__,
+            )
+        except Exception:
+            pass
 
 
 def _installed(logger: logging.Logger) -> bool:

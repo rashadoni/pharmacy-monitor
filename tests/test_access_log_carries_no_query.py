@@ -7,18 +7,25 @@
 
 Как проверяется. Настоящее приложение поднимается под настоящим uvicorn,
 отдельным процессом, с флагами из самого файла юнита
-(`infra/systemd/pharmacy-monitor-api.service`) — меняется только порт. По
-настоящей ссылке на вход приходит запрос, и токен ищется во всём, что процесс
-напечатал: stdout и stderr вместе, обоих рабочих процессов.
+(`infra/systemd/pharmacy-monitor-api.service`). От запуска на сервере отличаются
+порт, обёртка приложения (tests/access_log_probe.py — она нужна ради ответа 500
+и контроля), `python -m uvicorn` вместо скрипта из venv и окружение: оно
+собрано заново, из переменных сервера в нём нет ни одной. По настоящей ссылке
+на вход приходит запрос, и токен ищется во всём, что процесс напечатал: stdout
+и stderr вместе, родительского процесса и обоих рабочих.
 
-Два запуска (tests/access_log_probe.py):
+Два запуска:
   - `shipped` — как на сервере;
   - `unfiltered` — фильтры `src.access_log` сняты. Это контроль: проба обязана
     увидеть токен, иначе её «чисто» в первом запуске ничего не значит.
 
-Чего эти тесты НЕ проверяют: журнал Caddy (он пишет тот же адрес, и это не этот
-процесс), параметры SQL в тексте ошибки базы (при сбое запроса токен стоит и
-там — это настройка движка, отдельная правка), события Sentry.
+Чего эти тесты НЕ проверяют: журнал Caddy (он пишет адрес сам, и это не этот
+процесс); события Sentry и параметры SQL в тексте ошибки базы — у них свои
+тесты (test_sentry_events_carry_no_credentials.py,
+test_statement_data_stays_out_of_errors.py); уровень журнала `debug` и `trace`;
+запуск с настроенным Sentry (здесь `SENTRY_DSN` не задан); версии uvicorn,
+кроме той, что стоит у запускающего. Какой из двух рабочих процессов ответил на
+запрос, проба не выбирает.
 """
 
 from __future__ import annotations
@@ -50,12 +57,16 @@ MODES = ("shipped", "unfiltered")
 
 FAULT_EMAIL = "fault@access-log-probe.example"
 # Этим пользователям выпускается по настоящей ссылке на вход.
-LINK_OWNERS = ("browser", "json", "fault")
+LINK_OWNERS = ("browser", "json", "fault", "head")
 
 BOGUS_TOKEN = "bogus-CANARY-token-e2f0a6b1"
 WEBSOCKET_TOKEN = "websocket-CANARY-token-7d1e03b9"
 SECOND_PLACE_TOKEN = "second-CANARY-token-44cd58d0"
 SEARCH_TERM = "kreon-CANARY-search"
+POSTED_TOKEN = "posted-CANARY-token-91ab3c7e"
+ODD_NAME_VALUE = "oddname-CANARY-value-5f1c9a77"
+BARE_VALUE = "bare-CANARY-value-d2e04b68"
+LONG_QUERY_VALUE = "long-CANARY-value-0a1b2c3d"
 
 
 # ─── Фильтр: что он делает с записью ─────────────────────────────────────────
@@ -190,17 +201,40 @@ def test_a_record_of_unknown_shape_is_dropped_not_passed_on(msg, args, monkeypat
     assert hidden.filter(record) is False
     assert hidden.filter(_record(msg, args)) is False
 
-    # Сказано один раз и без содержимого записи.
-    assert [event for event, _ in recorder.events] == ["request_log_line_dropped"]
-    assert _CANARY not in repr(recorder.events)
+    # Сказано один раз, и в сказанном нет ничего из записи — только её вид.
+    assert recorder.events == [
+        (
+            "request_log_line_dropped",
+            {
+                "logger": access_log.ACCESS_LOGGER,
+                "reason": "unrecognized record shape: cannot tell where the query string ends",
+                "args_type": type(record.args).__name__,
+            },
+        )
+    ]
 
 
-def test_a_record_that_cannot_be_read_is_dropped_and_nothing_is_raised(monkeypatch):
+def test_a_record_that_cannot_be_read_is_dropped_reported_and_nothing_is_raised(monkeypatch):
     """Фильтр зовётся внутри uvicorn на каждом ответе: исключение оборвало бы запрос."""
 
     class Unprintable:
         def __str__(self) -> str:
             raise ValueError(f"/auth/verify?token={_CANARY}")
+
+    class UnreadableTemplate(str):
+        def __contains__(self, item) -> bool:
+            raise RuntimeError(f"/auth/verify?token={_CANARY}")
+
+    recorder = _Recorder()
+    monkeypatch.setattr(access_log, "log", recorder)
+    unprintable = _record(_ACCESS_TEMPLATE, ("c", "GET", Unprintable(), "1.1", 200))
+
+    assert _shipped_filter(access_log.ACCESS_LOGGER).filter(unprintable) is False
+    assert [event for event, _ in recorder.events] == ["request_log_line_dropped"]
+    assert _CANARY not in repr(recorder.events)
+    for name in (access_log.ACCESS_LOGGER, access_log.ERROR_LOGGER):
+        unreadable = _record(UnreadableTemplate(_ACCESS_TEMPLATE), ("c",), name=name)
+        assert _shipped_filter(name).filter(unreadable) is False
 
     class BrokenLog:
         def warning(self, *args, **kwargs) -> None:
@@ -208,11 +242,8 @@ def test_a_record_that_cannot_be_read_is_dropped_and_nothing_is_raised(monkeypat
 
     monkeypatch.setattr(access_log, "log", BrokenLog())
     hidden = _shipped_filter(access_log.ACCESS_LOGGER)
-
-    assert (
-        hidden.filter(_record(_ACCESS_TEMPLATE, ("c", "GET", Unprintable(), "1.1", 200))) is False
-    )
     assert hidden.filter(_record(f"/a?token={_CANARY}", ())) is False
+    assert hidden.filter(unprintable) is False
 
 
 @pytest.mark.parametrize("template", _WEBSOCKET_TEMPLATES)
@@ -277,7 +308,11 @@ def test_filters_are_installed_once_and_outlive_uvicorns_own_logging_setup(monke
     assert _query_filters(access_log.ACCESS_LOGGER)[0].filter(stray) is False
 
 
-_SECRET_LIKE_NAME = re.compile(r"token|secret|passw|key|hash|code|otp|jwt|sign|session|magic", re.I)
+# Имена, по которым src/observability.py узнаёт учётные данные, и три здешних.
+# Просто `key` или `code` секретом не считаются: `{barcode}`, `{category_key}`.
+_SECRET_LIKE_NAME = re.compile(
+    r"auth|cookie|token|secret|session|passw|pwd|signature|api[-_]?key|otp|jwt|magic", re.I
+)
 
 
 def test_no_route_carries_a_secret_in_its_path():
@@ -302,15 +337,16 @@ def test_no_route_carries_a_secret_in_its_path():
 def _unit_uvicorn_flags() -> list[str]:
     """Флаги, с которыми юнит запускает uvicorn, — из самого файла юнита."""
     text = API_UNIT.read_text(encoding="utf-8").replace("\\\n", " ")
-    commands = [
-        line.removeprefix("ExecStart=").strip()
-        for line in text.splitlines()
-        if line.startswith("ExecStart=")
-    ]
+    lines = [line.strip() for line in text.splitlines()]
+    commands = [line.removeprefix("ExecStart=").strip() for line in lines if "ExecStart=" in line]
     assert len(commands) == 1, f"ожидался один ExecStart, найдено {commands}"
     argv = shlex.split(commands[0])
     assert argv[0].endswith("/uvicorn"), argv[0]
     assert argv[1] == "src.api:app", f"юнит запускает {argv[1]}, а проба оборачивает src.api:app"
+    # uvicorn читает свои флаги и из окружения (`UVICORN_LOG_LEVEL=debug` печатает
+    # запрос целиком). Проба окружение юнита не повторяет — пусть его там и не будет.
+    in_unit = [line for line in lines if line.startswith("Environment=") and "UVICORN_" in line]
+    assert not in_unit, f"юнит задаёт флаги uvicorn окружением, проба их не видит: {in_unit}"
     return argv[2:]
 
 
@@ -319,6 +355,26 @@ def _launch_command(port: int) -> list[str]:
     assert flags[flags.index("--host") + 1] == "127.0.0.1", "проба слушает только 127.0.0.1"
     flags[flags.index("--port") + 1] = str(port)
     return [sys.executable, "-m", "uvicorn", PROBE_APP, *flags]
+
+
+def _worker_count() -> int:
+    flags = _unit_uvicorn_flags()
+    return int(flags[flags.index("--workers") + 1]) if "--workers" in flags else 1
+
+
+def _server_environment(mode: str, database_url: str) -> dict[str, str]:
+    """Окружение сервера — собранное заново: переменные запускающего (`UVICORN_*`,
+    `LOG_FORMAT`, `SENTRY_DSN`, прокси) в пробу не попадают."""
+    env = {name: os.environ[name] for name in ("PATH", "HOME", "TMPDIR") if name in os.environ}
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPO), os.environ.get("PYTHONPATH")]))
+    env.update(
+        ACCESS_LOG_PROBE=mode,
+        ACCESS_LOG_PROBE_FAULT_EMAIL=FAULT_EMAIL,
+        DATABASE_URL=database_url,
+        JWT_SECRET="probe-only-secret-0123456789abcdef",
+        PYTHONUTF8="1",
+    )
+    return env
 
 
 def _free_ports(count: int) -> list[int]:
@@ -366,30 +422,45 @@ class Call:
     target: str  # адрес, как его шлёт клиент
     status: int
     logged: str  # каким адрес обязан лечь в журнал
+    method: str = "GET"  # "WebSocket" — запрос на WebSocket
     accept: str | None = None
-    websocket: bool = False
 
 
 def _calls(tokens: dict[str, str]) -> list[Call]:
-    hidden = "/auth/verify?<hidden>"
+    link = "/auth/verify?<hidden>"
+    comparison = "/api/v1/dash/comparison"
     return [
         # Ссылку открыл браузер: вход и переход на дашборд.
-        Call("link_browser", f"/auth/verify?token={tokens['browser']}", 303, hidden, "text/html"),
-        Call("link_json", f"/auth/verify?token={tokens['json']}", 200, hidden),
-        # Ответ 5xx: uvicorn печатает ещё и трассировку.
-        Call("link_500", f"/auth/verify?token={tokens['fault']}", 500, hidden),
-        Call("link_refused", f"/auth/verify?token={BOGUS_TOKEN}", 401, hidden),
-        Call("token_second", f"/auth/verify?utm=mail&token={SECOND_PLACE_TOKEN}", 401, hidden),
+        Call(
+            "link_browser", f"/auth/verify?token={tokens['browser']}", 303, link, accept="text/html"
+        ),
+        Call("link_json", f"/auth/verify?token={tokens['json']}", 200, link),
+        # Ответ 5xx: uvicorn печатает ещё и трассировку, а ссылка остаётся действующей.
+        Call("link_500", f"/auth/verify?token={tokens['fault']}", 500, link),
+        # До проверки токена запрос не дошёл — ссылка действует и после него.
+        Call("link_head", f"/auth/verify?token={tokens['head']}", 405, link, method="HEAD"),
+        Call("link_post", f"/auth/verify?token={POSTED_TOKEN}", 405, link, method="POST"),
+        Call("link_refused", f"/auth/verify?token={BOGUS_TOKEN}", 401, link),
+        Call("token_second", f"/auth/verify?utm=mail&token={SECOND_PLACE_TOKEN}", 401, link),
         Call("no_query", "/auth/verify", 422, "/auth/verify"),
-        # Не токен: строка запроса скрыта целиком, а не по списку имён.
+        # Не токен: строка запроса скрыта целиком, а не по списку имён, —
+        # и с именем, которого ни в каком списке нет, и вовсе без имени, и длинная.
         Call(
             "search",
-            f"/api/v1/dash/comparison?search={SEARCH_TERM}&min_spread=5",
+            f"{comparison}?search={SEARCH_TERM}&min_spread=5",
             401,
-            "/api/v1/dash/comparison?<hidden>",
+            f"{comparison}?<hidden>",
+        ),
+        Call("odd_name", f"/health?zq={ODD_NAME_VALUE}", 200, "/health?<hidden>"),
+        Call("bare_value", f"/auth/verify?{BARE_VALUE}", 422, link),
+        Call(
+            "long",
+            f"{comparison}?pad={'x' * 3000}&q={LONG_QUERY_VALUE}",
+            401,
+            f"{comparison}?<hidden>",
         ),
         # Запрос на WebSocket uvicorn пишет другим логгером и другой строкой.
-        Call("websocket", f"/auth/verify?token={WEBSOCKET_TOKEN}", 403, hidden, websocket=True),
+        Call("websocket", f"/auth/verify?token={WEBSOCKET_TOKEN}", 403, link, method="WebSocket"),
     ]
 
 
@@ -397,10 +468,14 @@ def _canaries(tokens: dict[str, str]) -> dict[str, str]:
     """Значения, которых в журнале быть не должно, — и их половины: обрезок тоже утечка."""
     whole = {
         **{f"{owner}_link_token": token for owner, token in tokens.items()},
+        "posted_token": POSTED_TOKEN,
         "bogus_token": BOGUS_TOKEN,
         "second_place_token": SECOND_PLACE_TOKEN,
         "websocket_token": WEBSOCKET_TOKEN,
         "search_term": SEARCH_TERM,
+        "odd_name_value": ODD_NAME_VALUE,
+        "bare_value": BARE_VALUE,
+        "long_query_value": LONG_QUERY_VALUE,
     }
     halves = {}
     for name, value in whole.items():
@@ -410,11 +485,19 @@ def _canaries(tokens: dict[str, str]) -> dict[str, str]:
 
 
 def _send(port: int, call: Call) -> int:
-    if call.websocket:
-        return _websocket_handshake(port, call.target)
+    if call.method == "WebSocket":
+        handshake = (
+            f"GET {call.target} HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        return _raw_status(port, handshake.encode("ascii"))
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
     try:
-        connection.request("GET", call.target, headers={"Accept": call.accept or "*/*"})
+        connection.request(call.method, call.target, headers={"Accept": call.accept or "*/*"})
         response = connection.getresponse()
         response.read()
         return response.status
@@ -422,18 +505,10 @@ def _send(port: int, call: Call) -> int:
         connection.close()
 
 
-def _websocket_handshake(port: int, target: str) -> int:
-    """Запрос на WebSocket: статус первой строки ответа."""
-    request = (
-        f"GET {target} HTTP/1.1\r\n"
-        "Host: 127.0.0.1\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-        "Sec-WebSocket-Version: 13\r\n\r\n"
-    )
+def _raw_status(port: int, request: bytes) -> int:
+    """Байты как есть — статус первой строки ответа."""
     with socket.create_connection(("127.0.0.1", port), timeout=60) as connection:
-        connection.sendall(request.encode("ascii"))
+        connection.sendall(request)
         received = b""
         while b"\r\n" not in received:
             chunk = connection.recv(4096)
@@ -491,17 +566,6 @@ def probe(tmp_path_factory) -> dict[str, dict]:
     try:
         for mode in MODES:
             url, tokens = _database_with_login_links(out / f"{mode}.sqlite")
-            env = dict(os.environ)
-            env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPO), env.get("PYTHONPATH")]))
-            env.update(
-                ACCESS_LOG_PROBE=mode,
-                ACCESS_LOG_PROBE_FAULT_EMAIL=FAULT_EMAIL,
-                DATABASE_URL=url,
-                JWT_SECRET="probe-only-secret-0123456789abcdef",
-                PYTHONUTF8="1",
-            )
-            for name in ("SENTRY_DSN", "REDIS_URL", "PHARMACY_AUTH_DISABLED", "LOG_FILE"):
-                env.pop(name, None)
             log_path = out / f"{mode}.log"
             # Журнал — в файл, как у journald: stdout и stderr вместе. Дописыванием:
             # в один файл пишут родительский процесс и оба рабочих.
@@ -509,7 +573,7 @@ def probe(tmp_path_factory) -> dict[str, dict]:
                 processes[mode] = subprocess.Popen(
                     _launch_command(ports[mode]),
                     cwd=REPO,
-                    env=env,
+                    env=_server_environment(mode, url),
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
@@ -518,9 +582,10 @@ def probe(tmp_path_factory) -> dict[str, dict]:
         for mode in MODES:
             _wait_until_serving(ports[mode], processes[mode], runs[mode]["log_path"])
         for mode in MODES:
-            runs[mode]["statuses"] = {
-                call.name: _send(ports[mode], call) for call in runs[mode]["calls"]
-            }
+            statuses = {call.name: _send(ports[mode], call) for call in runs[mode]["calls"]}
+            # Не HTTP вовсе: об этом uvicorn пишет предупреждение, без строки запроса.
+            statuses["not_http"] = _raw_status(ports[mode], b"NOT-HTTP\r\n\r\n")
+            runs[mode]["statuses"] = statuses
     finally:
         for process in processes.values():
             _stop(process)
@@ -534,33 +599,41 @@ _WEBSOCKET_LINE = re.compile(r'- "WebSocket (?P<target>\S+)" (?P<status>\d{3})')
 
 
 def _logged_requests(output: str) -> Counter:
-    """Запросы, как их записал uvicorn: (вид, адрес, статус). Опрос готовности не в счёт."""
+    """Запросы, как их записал uvicorn: (метод, адрес, статус). Опрос готовности не в счёт."""
     logged: Counter = Counter()
     for line in output.splitlines():
         if found := _HTTP_LINE.search(line):
             if found["target"] != "/health":
-                logged[("http", found["target"], int(found["status"]))] += 1
+                logged[(found["method"], found["target"], int(found["status"]))] += 1
         elif found := _WEBSOCKET_LINE.search(line):
-            logged[("websocket", found["target"], int(found["status"]))] += 1
+            logged[("WebSocket", found["target"], int(found["status"]))] += 1
     return logged
 
 
 def _expected(calls: list[Call], *, with_query: bool) -> Counter:
     return Counter(
-        (
-            "websocket" if call.websocket else "http",
-            call.target if with_query else call.logged,
-            call.status,
-        )
-        for call in calls
+        (call.method, call.target if with_query else call.logged, call.status) for call in calls
     )
+
+
+def _other_lines(output: str) -> dict[str, int]:
+    """Записи uvicorn не о запросах — сколько раз каждая встретилась."""
+    return {
+        phrase: output.count(phrase)
+        for phrase in (
+            "Started server process",
+            "Application startup complete.",
+            "Exception in ASGI application",
+            "Invalid HTTP request received.",
+        )
+    }
 
 
 @pytest.mark.parametrize("mode", MODES)
 def test_probe_requests_got_the_answers_they_were_sent_for(probe, mode):
     """Ссылки настоящие: вход состоялся (303, 200), сбой дал 500, чужой токен — отказ."""
     run = probe[mode]
-    assert run["statuses"] == {call.name: call.status for call in run["calls"]}
+    assert run["statuses"] == {**{call.name: call.status for call in run["calls"]}, "not_http": 400}
 
 
 def test_without_the_filters_every_value_is_in_the_journal(probe):
@@ -587,13 +660,28 @@ def test_every_request_is_logged_and_none_with_its_query(probe):
     assert "--- Logging error ---" not in run["output"]
 
 
-def test_no_token_anywhere_in_what_the_process_printed(probe):
+def test_no_value_from_a_query_anywhere_in_what_the_process_printed(probe):
     run = probe["shipped"]
     output = run["output"]
 
     # Трассировка ответа 500 в журнале есть — значит, искали и в ней.
-    assert output.count("Exception in ASGI application") == 1
     assert "RuntimeError: probe: session issue failed" in output
     leaked = [name for name, value in _canaries(run["tokens"]).items() if value in output]
     assert not leaked, f"в журнале процесса: {leaked}"
-    assert "token=" not in output and "search=" not in output
+
+
+def test_records_that_are_not_about_requests_are_all_still_there(probe):
+    """Фильтр на `uvicorn.error` стоит рядом с записями о старте, остановке и ошибках."""
+    workers = _worker_count()
+    shipped = _other_lines(probe["shipped"]["output"])
+
+    assert shipped == {
+        "Started server process": workers,
+        "Application startup complete.": workers,
+        "Exception in ASGI application": 1,
+        "Invalid HTTP request received.": 1,
+    }
+    assert shipped == _other_lines(probe["unfiltered"]["output"])
+    # Остановка: рабочие процессы гасятся одним сигналом, порядок строк не важен.
+    for phrase in ("Shutting down", "Finished server process"):
+        assert phrase in probe["shipped"]["output"], phrase
