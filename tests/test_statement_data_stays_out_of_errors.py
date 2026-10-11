@@ -717,7 +717,9 @@ def probes(tmp_path_factory) -> dict[str, SimpleNamespace]:
         journal = done.stdout + done.stderr
         assert done.returncode == 0, f"проба ({mode}) упала:\n{journal[-4000:]}"
         found = json.loads(report.read_text(encoding="utf-8"))
-        results[mode] = SimpleNamespace(cases=found["cases"], sent=found["sent"], journal=journal)
+        results[mode] = SimpleNamespace(
+            cases=found["cases"], sent=found["sent"], hooks=found["hooks"], journal=journal
+        )
     return results
 
 
@@ -800,6 +802,10 @@ def test_engine_and_sentry_hooks_together_send_the_error_without_its_data(probes
     """
     shipped = probes["as_shipped"]
     sent = "\n".join(item["raw"] for item in shipped.sent)
+
+    # Контроль: хуки здесь стояли, а в двух других режимах — нет.
+    assert shipped.hooks
+    assert not probes["guarded"].hooks and not probes["unguarded"].hooks
 
     assert [case["status"] for case in shipped.cases.values()] == [500, 500, 500]
     assert [item["type"] for item in shipped.sent].count("event") >= 3

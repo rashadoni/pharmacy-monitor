@@ -266,4 +266,8 @@ finally:
 
 sentry_sdk.flush()
 with open(REPORT_PATH, "w", encoding="utf-8") as report:
-    json.dump({"mode": MODE, "cases": CASES, "sent": ITEMS}, report, ensure_ascii=False)
+    # Стояли ли хуки на самом деле — спрашиваем у клиента SDK, а не у режима.
+    hooks = sentry_sdk.get_client().options.get("before_send") is not None
+    json.dump(
+        {"mode": MODE, "hooks": hooks, "cases": CASES, "sent": ITEMS}, report, ensure_ascii=False
+    )
