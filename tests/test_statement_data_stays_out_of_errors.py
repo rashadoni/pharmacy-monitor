@@ -665,20 +665,25 @@ def test_guard_sees_an_engine_created_elsewhere(tmp_path, monkeypatch):
 
 
 # Python внутри шага workflow печатает в публичный журнал и ходит в боевую базу.
-# Три шага строят движок сами; их запросы читают прогоны, размер базы и каталог,
-# людей в них нет (прочитано 2026-10-11). Новому такому шагу — фабрика.
+# Два workflow строят движок сами. Новому такому шагу — фабрика.
 #
-# deploy.yml — четвёртый, и фабрику взять не может: ревизию базы он читает до
-# того, как релиз попал на сервер, а `src` в живом каталоге — прошлого релиза и
-# фабрики может не знать. Запрос один, без параметров: `SELECT version_num FROM
-# alembic_version`. Миграции тот же workflow исполняет уже через `migrations/env.py`
-# своего релиза, то есть через фабрику.
+# recover-pharmonline-decodo-public-api.yml читает прогоны, размер базы и
+# каталог, людей в его запросах нет (прочитано 2026-10-11).
+#
+# deploy.yml фабрику взять не может: ревизию базы он читает до того, как релиз
+# попал на сервер, а `src` в живом каталоге — прошлого релиза и фабрики может не
+# знать. Исключение выдано одному запросу, а не файлу — он записан ниже.
+# Миграции тот же workflow исполняет уже через `migrations/env.py` своего
+# релиза, то есть через фабрику.
 _WORKFLOWS_WITH_THEIR_OWN_ENGINE = {
     ".github/workflows/deploy.yml",
-    ".github/workflows/preflight-pharmonline-public-api-full.yml",
     ".github/workflows/recover-pharmonline-decodo-public-api.yml",
-    ".github/workflows/recover-pharmonline-public-api.yml",
 }
+_DEPLOY_REVISION_QUERY = "SELECT version_num FROM alembic_version"
+# Чем шаг workflow может отправить запрос в базу через движок или соединение.
+_STATEMENT_CALL = re.compile(
+    r"\b(?:execute|exec_driver_sql|executemany|scalar|scalars|read_sql\w*)\s*\("
+)
 
 
 def test_no_new_workflow_builds_its_own_engine():
@@ -699,6 +704,19 @@ def test_no_new_workflow_builds_its_own_engine():
         "workflow строит движок мимо storage.create_engine_hiding_statement_data: "
         + ", ".join(sorted(found - _WORKFLOWS_WITH_THEIR_OWN_ENGINE))
     )
+    # Список не длиннее дела: файл, которого уже нет, вернулся бы с готовым исключением.
+    assert found == _WORKFLOWS_WITH_THEIR_OWN_ENGINE, (
+        "в списке исключений workflow, который движок не строит или удалён: "
+        + ", ".join(sorted(_WORKFLOWS_WITH_THEIR_OWN_ENGINE - found))
+    )
+
+    # deploy.yml: один движок и один запрос — тот, у которого нет параметров и
+    # нет людей. Второй запрос этим движком (или второй движок) — уже не исключение.
+    deploy = (REPO / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+    assert len(call.findall(deploy)) == 1, "в deploy.yml больше одного своего движка"
+    statements = _STATEMENT_CALL.findall(deploy)
+    assert len(statements) == 1, f"в deploy.yml больше одного запроса к базе: {statements}"
+    assert f'connection.execute(text("{_DEPLOY_REVISION_QUERY}"))' in deploy
 
 
 # ─── Приложение под uvicorn: конверт Sentry и журнал ────────────────────────

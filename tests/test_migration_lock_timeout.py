@@ -19,9 +19,10 @@
 - предел по умолчанию, свой предел и опции из самой строки подключения
 - текст ошибки упавшей миграции данных не несёт данных запроса: `alembic
   upgrade` идёт из `deploy.yml`, журнал шага публичный. Движок в `env.py` —
-  `storage.create_engine_hiding_statement_data` с `connect_args` предела; два
-  настоящих сбоя (ожидание замка строки, нарушение ограничения) и контроль на
-  `env.py`, лежавшем на сервере до этой правки: с ним те же данные в тексте есть
+  `storage.create_engine_hiding_statement_data` с `connect_args` предела; три
+  настоящих сбоя (ожидание замка строки, нарушение уникальности, NULL в
+  обязательной колонке) и контроль на `env.py`, лежавшем на сервере до этой
+  правки: с ним те же данные в тексте есть
 
 Тест исполняет настоящий `migrations/env.py` репозитория на одноразовой базе с
 одной пробной миграцией, чтобы не зависеть от содержимого боевых.
@@ -258,14 +259,31 @@ INSERT_A_DUPLICATE = f"""    op.execute(
             "INSERT INTO people (id, email, password_hash) VALUES (:id, :email, :hash)"
         ).bindparams(id=2, email="{ROW_EMAIL}", hash="{PARAMETER_HASH}")
     )"""
+# NULL в обязательной колонке: сервер приводит в DETAIL всю строку таблицы —
+# то, чего в параметрах запроса нет.
+ERASE_A_REQUIRED_VALUE = """    op.execute(
+        sa.text("UPDATE people SET email = NULL WHERE id = :id").bindparams(id=1)
+    )"""
+
+# Сбой → миграция, класс ошибки и что о данных печатал прежний env.py:
+# метка сервера и значения, которые он за ней приводил.
+FAILURES = {
+    "lock wait": (
+        UPDATE_A_LOCKED_ROW,
+        "LockNotAvailable",
+        "CONTEXT",
+        (PARAMETER_HASH, ROW_EMAIL),
+    ),
+    "unique": (INSERT_A_DUPLICATE, "UniqueViolation", "DETAIL", (PARAMETER_HASH, ROW_EMAIL)),
+    "not null": (ERASE_A_REQUIRED_VALUE, "NotNullViolation", "DETAIL", (ROW_HASH,)),
+}
 
 
 def _fail_a_data_migration(
     tmp_path: Path, scratch_db_url: str, failure: str, *, env_py: Path, db_url: str | None = None
 ) -> str:
     """Уронить пробную миграцию данных настоящим сбоем и вернуть всё, что напечатал Alembic."""
-    body = UPDATE_A_LOCKED_ROW if failure == "lock wait" else INSERT_A_DUPLICATE
-    project = _project(tmp_path, body, env_py=env_py)
+    project = _project(tmp_path, FAILURES[failure][0], env_py=env_py)
     engine = create_engine(scratch_db_url)
     with engine.begin() as connection:
         connection.execute(
@@ -293,13 +311,12 @@ def _fail_a_data_migration(
     return failed.stdout + failed.stderr
 
 
-@pytest.mark.parametrize(
-    ("failure", "error_class"),
-    [("lock wait", "LockNotAvailable"), ("constraint", "UniqueViolation")],
-)
+@pytest.mark.parametrize("failure", sorted(FAILURES))
 def test_a_failed_data_migration_prints_no_statement_data(
-    tmp_path: Path, scratch_db_url: str, failure: str, error_class: str
+    tmp_path: Path, scratch_db_url: str, failure: str
 ) -> None:
+    error_class = FAILURES[failure][1]
+
     printed = _fail_a_data_migration(
         tmp_path, scratch_db_url, failure, env_py=ROOT / "migrations" / "env.py"
     )
@@ -307,18 +324,24 @@ def test_a_failed_data_migration_prints_no_statement_data(
     # Класс ошибки остаётся: по нему deploy.yml отличает «таблица занята» от поломки.
     assert f"psycopg.errors.{error_class}" in printed
     # Остаётся и сам запрос — с именами параметров, без значений.
-    assert "%(email)s" in printed
+    assert "[SQL: " in printed and "%(" in printed
     leaked = [marker for marker in MARKERS if marker in printed]
     assert not leaked, f"в тексте ошибки миграции данные запроса: {leaked}\n{printed}"
     assert "[parameters:" not in printed
+    # Обе половины защиты на месте: параметры прячет движок, хвост ошибки
+    # сервера (DETAIL, CONTEXT) отбрасывает обработчик фабрики.
+    assert "hide_parameters=True" in printed
+    assert "details hidden" in printed
     assert "DETAIL" not in printed
+    assert "CONTEXT" not in printed
 
 
-@pytest.mark.parametrize("failure", ["lock wait", "constraint"])
+@pytest.mark.parametrize("failure", sorted(FAILURES))
 def test_control_the_env_py_the_server_had_printed_that_data(
     tmp_path: Path, scratch_db_url: str, failure: str
 ) -> None:
     """Контроль пробы: на прежнем `env.py` те же сбои печатают данные — проба их видит."""
+    _, error_class, server_label, values = FAILURES[failure]
     # У прежнего env.py предела нет: без него ожидание замка не кончилось бы.
     with_limit = f"{scratch_db_url}?options=-c lock_timeout=400"
 
@@ -326,6 +349,8 @@ def test_control_the_env_py_the_server_had_printed_that_data(
         tmp_path, scratch_db_url, failure, env_py=ENV_PY_ON_SERVER_BEFORE, db_url=with_limit
     )
 
+    assert f"psycopg.errors.{error_class}" in printed
     assert "[parameters:" in printed
-    for marker in (PARAMETER_HASH, ROW_EMAIL):
+    assert server_label in printed, f"контроль не увидел {server_label}:\n{printed}"
+    for marker in values:
         assert marker in printed, f"контроль не увидел {marker}:\n{printed}"

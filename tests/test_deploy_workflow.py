@@ -13,10 +13,12 @@ Workflow нельзя запустить локально, поэтому тес
   и `/etc/pharmacy-monitor` на каталоги песочницы;
 - `rsync` копирует туда же настоящим rsync;
 - Alembic настоящий, база — SQLite; миграции пробные;
-- прошлый релиз в живом каталоге — такой, каким сервер был до первой выкладки
-  этим workflow: `migrations/env.py` от 2026-08-23 и `src/storage.py` без
-  фабрики движка, которую зовёт `env.py` чекаута. Миграция, исполненная не на
-  `src` и `env.py` своего релиза, здесь падает на импорте;
+- прошлый релиз в живом каталоге — `migrations/env.py`, лежавший на сервере до
+  первой выкладки этим workflow (от 2026-08-23), и `src/storage.py` без фабрики
+  движка, которую зовёт `env.py` чекаута. Это жёстче, чем сервер на 2026-10-11:
+  там `src` фабрику уже знает (PR #86 выложен), без неё — релизы старше.
+  Зато миграция, исполненная не на `src` и `env.py` своего релиза, здесь падает
+  на импорте;
 - `sudo`, `pnpm`, `curl`, `sleep`, `systemctl` — заглушки, которые пишут журнал.
 
 Каждая заглушка записывает, какая ревизия была в базе и какой релиз лежал в
@@ -68,6 +70,12 @@ REAL_RSYNC = shutil.which("rsync")
 # ниже). Движок он строит через `engine_from_config`, из `src` берёт один `Base`.
 PREVIOUS_ENV_PY = ROOT / "tests" / "fixtures" / "migrations_env_on_server_2026-08-23.py.txt"
 PREVIOUS_ENV_PY_SHA256 = "10fbd002a801b6183d9097c20956b790749de1561aa6de3bd4799272d054021f"
+
+# deploy.yml до этой правки — им выкладывается любой коммит старше неё, то есть
+# им идёт откат на такой коммит. Снимок `main` от 2026-10-11 (9f072e9a).
+PREVIOUS_WORKFLOW = ROOT / "tests" / "fixtures" / "deploy_yml_before_schema_first.yml"
+PREVIOUS_WORKFLOW_SHA256 = "705fd361e9916a0a4fd4ced0f79c3d3c02532d58b4d52077802434f88b183327"
+PREVIOUS_VERIFY_GRAPH = "Verify migration graph has one head"
 
 STORAGE_BEFORE_THE_FACTORY = (
     "from sqlalchemy.orm import DeclarativeBase\n\n\nclass Base(DeclarativeBase):\n    pass\n"
@@ -421,9 +429,9 @@ def _write_release(target: Path, *, release: str, revisions: list[str], staged: 
     """Дерево релиза в том виде, в каком его видит workflow: чекаут или сервер.
 
     ``release`` — чей это код: ``new`` — чекаут этого репозитория (``env.py``
-    зовёт фабрику движка из ``src``), ``old`` — то, что лежало на сервере до
-    первой выкладки этим workflow (фабрики в ``src`` нет, ``env.py`` её не
-    зовёт). ``staged`` — выкладывают ли это дерево или оно лежит в живом каталоге.
+    зовёт фабрику движка из ``src``), ``old`` — релиз старше PR #86 (фабрики в
+    ``src`` нет, ``env.py`` её не зовёт). ``staged`` — выкладывают ли это дерево
+    или оно лежит в живом каталоге.
     """
     (target / "src").mkdir(parents=True)
     (target / "src" / "__init__.py").write_text("", encoding="utf-8")
@@ -669,13 +677,16 @@ def run_workflow(
     apply_migrations: bool,
     without: tuple[str, ...] = (),
     before: dict | None = None,
+    workflow_file: Path | None = None,
 ) -> WorkflowResult:
     """Исполнить шаги deploy.yml так, как их исполняет раннер GitHub.
 
     ``without`` — шаги, которых как будто нет в workflow: так проверяется, что
     следующая проверка держит и одна. ``before`` — что сделать перед шагом.
+    ``workflow_file`` — чей deploy.yml исполнять: выкладку коммита исполняет
+    workflow этого же коммита.
     """
-    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    workflow = yaml.safe_load((workflow_file or WORKFLOW).read_text(encoding="utf-8"))
     # Стенд исполняет только то, что понимает. `continue-on-error`, `shell`,
     # `working-directory`, `env` и `defaults` на любом уровне меняют поведение
     # раннера — молча пропустить их значило бы проверять не тот workflow.
@@ -882,9 +893,9 @@ def test_every_alembic_call_runs_on_the_release_being_deployed(
     каждый вызов идёт из `.deploy-stage.*`, где лежат `env.py` и `src` одного
     коммита. После выкладки в живом каталоге тоже одна пара.
 
-    Чего это не покрывает: возврат ПРЕЖНИМ deploy.yml (коммит старше этого
-    workflow). Тот кладёт `src/` и `migrations/versions/`, `env.py` не трогает и
-    Alembic зовёт из живого каталога — docs/RUNBOOK.md, «Откат».
+    «old over new» — свойство workflow, а не настоящий откат: коммита, в котором
+    этот deploy.yml лежит рядом с прежним `env.py`, не бывает. Настоящий откат
+    на коммит старше этой правки исполняет ПРЕЖНИЙ deploy.yml — тесты ниже.
     """
     revisions = [BASE] if rollback else [BASE, HEAD]
     sandbox = Sandbox(
@@ -910,6 +921,82 @@ def test_every_alembic_call_runs_on_the_release_being_deployed(
     by_hand = sandbox.alembic_by_hand("current")
     assert by_hand.returncode == 0, by_hand.stderr
     assert by_hand.stdout.split()[0] == revisions[-1]
+
+
+def _rollback_with_the_previous_workflow(tmp_path: Path, *, knows_the_factory: bool) -> Sandbox:
+    """Сервер после выкладки этим порядком; назад выкладывают коммит старше него.
+
+    В живом каталоге `env.py` и `src` чекаута. Выкладываемый коммит несёт
+    прежний deploy.yml; его `src` знает фабрику движка (коммит от PR #86) или
+    нет (старше).
+    """
+    assert hashlib.sha256(PREVIOUS_WORKFLOW.read_bytes()).hexdigest() == (
+        PREVIOUS_WORKFLOW_SHA256
+    ), f"{PREVIOUS_WORKFLOW.name} — снимок прежнего deploy.yml, его не правят"
+    sandbox = Sandbox(tmp_path, release_revisions=[BASE], live_revisions=[BASE], rollback=True)
+    sandbox.migrate_production_to(BASE)
+    if knows_the_factory:
+        (sandbox.checkout / "src" / "storage.py").write_text(
+            STORAGE_WITH_THE_FACTORY, encoding="utf-8"
+        )
+    return sandbox
+
+
+def test_previous_workflow_rolls_back_to_a_commit_that_knows_the_engine_factory(
+    tmp_path: Path,
+) -> None:
+    """Откат на коммит от PR #86 и новее проходит: новому `env.py` хватает его `src`."""
+    sandbox = _rollback_with_the_previous_workflow(tmp_path, knows_the_factory=True)
+
+    result = run_workflow(sandbox, apply_migrations=False, workflow_file=PREVIOUS_WORKFLOW)
+
+    assert result.failed_step is None, result.describe()
+    assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "old"
+    # Прежний workflow env.py не возит: в живом каталоге остался файл чекаута.
+    assert (sandbox.live / "migrations" / "env.py").read_bytes() == (
+        ROOT / "migrations" / "env.py"
+    ).read_bytes()
+    assert len(_restarts(sandbox)) == 2
+
+
+def test_previous_workflow_cannot_roll_back_past_the_engine_factory(tmp_path: Path) -> None:
+    """Откат на коммит старше PR #86 срывается на середине, и выйти можно только вперёд.
+
+    Известное ограничение, а не желаемое поведение: тест держит в согласии с
+    кодом то, что обещает docs/RUNBOOK.md, «Откат выкладкой прошлого коммита».
+    """
+    sandbox = _rollback_with_the_previous_workflow(tmp_path, knows_the_factory=False)
+
+    stuck = run_workflow(sandbox, apply_migrations=False, workflow_file=PREVIOUS_WORKFLOW)
+
+    # Прошлый src уже скопирован, env.py остался новый — пара не импортируется.
+    assert stuck.failed_step.name == PREVIOUS_VERIFY_GRAPH, stuck.describe()
+    assert "cannot import name 'create_engine_hiding_statement_data'" in stuck.failed_step.stderr
+    assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "old"
+    assert _restarts(sandbox) == [], "сервисы остались на прежнем коде в памяти"
+    assert sandbox.alembic_by_hand("current").returncode != 0
+
+    # Прежним workflow отсюда не выйти даже с коммитом, который фабрику знает:
+    # первым шагом он зовёт `alembic current` из живого каталога.
+    (sandbox.checkout / "src" / "storage.py").write_text(STORAGE_WITH_THE_FACTORY, encoding="utf-8")
+    (sandbox.checkout / "src" / "RELEASE").write_text("knows the factory\n", encoding="utf-8")
+    copied_before = len(sandbox.events("rsync"))
+    still_stuck = run_workflow(sandbox, apply_migrations=False, workflow_file=PREVIOUS_WORKFLOW)
+
+    assert still_stuck.failed_step.name == PREFLIGHT_REVISION, still_stuck.describe()
+    assert len(sandbox.events("rsync")) == copied_before, "до копирования дело не дошло"
+
+    # Выводит выкладка коммитом с этим порядком: живой env.py он не исполняет.
+    shutil.copy(ROOT / "migrations" / "env.py", sandbox.checkout / "migrations" / "env.py")
+    (sandbox.checkout / "src" / "RELEASE").write_text("new\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=sandbox.checkout, check=True)
+    recovered = run_workflow(sandbox, apply_migrations=False)
+
+    assert recovered.failed_step is None, recovered.describe()
+    assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "new"
+    assert len(_restarts(sandbox)) == 2
+    by_hand = sandbox.alembic_by_hand("current")
+    assert by_hand.returncode == 0, by_hand.stderr
 
 
 def test_release_without_a_migration_takes_no_backup_and_runs_no_upgrade(tmp_path: Path) -> None:
