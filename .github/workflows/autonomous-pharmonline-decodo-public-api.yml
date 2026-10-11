@@ -238,14 +238,32 @@ jobs:
             esac
           done < /etc/pharmacy-monitor/env
 
-          current=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+          # This job runs the code of its own checkout against the production
+          # DB, so it refuses unless the DB is exactly at this commit's single
+          # migration head.  A migration merged into main but not yet deployed
+          # stops the weekly refresh right here; say where the DB is, where the
+          # commit is and what to do, as the reconciliation workflow does.  A
+          # bare failed `test` left a red step with no reason in its log, and
+          # let a commit with two migration heads through whenever `current`
+          # and `heads` happened to list them in the same order.
+          if ! current=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python -m alembic \
-              -c "$runtime_dir/alembic.ini" current | awk 'NF {print $1}')
+              -c "$runtime_dir/alembic.ini" current | awk 'NF {print $1}'); then
+            echo "refusing weekly refresh: the production DB revision cannot be read with this commit's migrations (the DB is ahead of this commit, or unreachable: see the alembic error above); if the DB is ahead, merge the deployed migration into main or dispatch this workflow from the deployed commit" >&2
+            exit 1
+          fi
           head=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python -m alembic \
               -c "$runtime_dir/alembic.ini" heads | awk 'NF {print $1}')
-          test -n "$current"
-          test "$current" = "$head"
+          if [ "$(printf '%s\n' "$head" | sed '/^$/d' | wc -l)" -ne 1 ]; then
+            echo "refusing weekly refresh: this commit must have exactly one migration head, found: ${head:-none}" >&2
+            exit 1
+          fi
+          if [ "$current" != "$head" ]; then
+            echo "refusing weekly refresh: production DB is at migration ${current:-none}, this commit's migrations end at $head; deploy this commit with deploy.yml (apply_migrations=true), then dispatch this workflow again; it does not migrate" >&2
+            exit 1
+          fi
+          echo "production DB is at this commit's migration head: $current"
 
           before_run_id=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
