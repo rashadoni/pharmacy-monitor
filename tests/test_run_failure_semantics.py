@@ -788,7 +788,7 @@ def test_multi_site_startup_failure_is_degraded_and_keeps_healthy_result(db_sess
             ),
         ]
 
-    def fake_persist(session, run, results):
+    def fake_persist(session, run, results, **kwargs):
         persisted_sites.extend(result.site for result in results)
         return sum(len(result.products) for result in results)
 

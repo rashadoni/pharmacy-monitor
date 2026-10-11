@@ -6,10 +6,10 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import pool
 from sqlalchemy.engine import make_url
 
-from src.storage import Base  # noqa: E402
+from src.storage import Base, create_engine_hiding_statement_data  # noqa: E402
 
 # Load .env if present so local dev "just works"
 try:
@@ -76,11 +76,11 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-        connect_args=_connect_args(),
+    # Not `engine_from_config`: `alembic upgrade` runs from the deploy workflow,
+    # whose step log is public, and a failed data migration must not print the
+    # row it failed on. alembic.ini sets no engine option besides the URL.
+    connectable = create_engine_hiding_statement_data(
+        db_url, poolclass=pool.NullPool, connect_args=_connect_args()
     )
     with connectable.connect() as connection:
         context.configure(

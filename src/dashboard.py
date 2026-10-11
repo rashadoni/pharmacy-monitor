@@ -21,7 +21,6 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
 
 from src import auth, storage, watchlist as wl
 from src.url_parser import parse_urls_block
@@ -306,7 +305,7 @@ auth.render_user_badge()
 
 @st.cache_resource
 def get_engine():
-    return create_engine(DATABASE_URL)
+    return storage.create_engine_hiding_statement_data(DATABASE_URL)
 
 
 def get_session():

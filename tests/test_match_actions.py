@@ -1,14 +1,23 @@
 """Тесты helper-операций для ручной коррекции матчей."""
 
+import ast
 import datetime
+import re
+from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+from sqlalchemy import func, select
+from structlog.testing import capture_logs
+
+from src import analytics, matcher
 from src import match_actions as ma
-from src import matcher
-from src.storage import Match, Product
+from src.storage import Match, MatchPolicyAudit, MatchRejection, Product
 
 
 def _make_product(s, **kw) -> Product:
     p = Product(
+        tenant_id=kw.get("tenant_id", 1),
         site=kw.get("site", "pharmonline"),
         external_id=kw.get("external_id", "id-1"),
         url=kw.get("url", "http://example.com/p"),
@@ -21,14 +30,17 @@ def _make_product(s, **kw) -> Product:
     return p
 
 
-def _make_match_cluster(s, name: str, sites: list[str]) -> tuple[Match, list[Product]]:
-    m = Match(canonical_name=name, confidence=1.0, is_manual=False)
+def _make_match_cluster(
+    s, name: str, sites: list[str], *, tenant_id: int = 1
+) -> tuple[Match, list[Product]]:
+    m = Match(tenant_id=tenant_id, canonical_name=name, confidence=1.0, is_manual=False)
     s.add(m)
     s.flush()
     products = []
     for i, site in enumerate(sites):
         p = _make_product(
             s,
+            tenant_id=tenant_id,
             site=site,
             external_id=f"{site}-{i}",
             name=name,
@@ -210,6 +222,323 @@ def test_list_rejections_for_product(db_session):
     assert sorted(rej_for_p1) == sorted([p2.id, p3.id])
     rej_for_p2 = ma.list_rejections_for_product(db_session, p2.id)
     assert rej_for_p2 == [p1.id]
+
+
+# ── Тенант отказа — тенант товаров пары ──────────────────────────────────────
+# Колонка match_rejections.tenant_id по умолчанию равна 1. Пока add_rejection её
+# не задавал, отказ любого тенанта доставался первому: читатель с фильтром по
+# тенанту (analytics.match_quality) показывал его не тому.
+
+
+def _tenant_pair(s, tenant_id: int, tag: str) -> tuple[Product, Product]:
+    left = _make_product(
+        s, tenant_id=tenant_id, site="pharmonline", external_id=f"{tag}-ph", name=f"{tag} left"
+    )
+    right = _make_product(
+        s, tenant_id=tenant_id, site="aloe", external_id=f"{tag}-aloe", name=f"{tag} right"
+    )
+    s.commit()
+    return left, right
+
+
+def _rejection_tenants(s) -> list[int]:
+    """Тенанты всех отказов — как они лежат в базе, а не в объектах сессии."""
+    s.flush()
+    return sorted(s.scalars(select(MatchRejection.tenant_id)))
+
+
+def test_add_rejection_takes_tenant_from_the_pair(db_session):
+    own_left, own_right = _tenant_pair(db_session, 1, "own")
+    foreign_left, foreign_right = _tenant_pair(db_session, 2, "foreign")
+
+    own = ma.add_rejection(db_session, own_left.id, own_right.id)
+    foreign = ma.add_rejection(db_session, foreign_right.id, foreign_left.id)
+    db_session.commit()
+
+    by_id = dict(db_session.execute(select(MatchRejection.id, MatchRejection.tenant_id)).all())
+    assert by_id == {own.id: 1, foreign.id: 2}
+    # Читатель с фильтром по тенанту видит отказ у хозяина пары и только у него.
+    assert analytics.match_quality(db_session, tenant_id=1).rejected_pairs == 1
+    assert analytics.match_quality(db_session, tenant_id=2).rejected_pairs == 1
+
+
+def _stored(s, rejection_id: int) -> tuple:
+    """Строка отказа из базы: (тенант, причина, тип, активна, когда снята)."""
+    s.commit()
+    return tuple(
+        s.execute(
+            select(
+                MatchRejection.tenant_id,
+                MatchRejection.reason,
+                MatchRejection.reason_type,
+                MatchRejection.is_active,
+                MatchRejection.resolved_at,
+            ).where(MatchRejection.id == rejection_id)
+        ).one()
+    )
+
+
+def test_add_rejection_repeat_and_reactivation_keep_the_pair_tenant(db_session):
+    left, right = _tenant_pair(db_session, 2, "foreign")
+    first = ma.add_rejection(db_session, left.id, right.id, reason="first")
+    db_session.commit()
+
+    again = ma.add_rejection(db_session, right.id, left.id, reason="second")
+
+    assert again.id == first.id
+    assert _stored(db_session, first.id) == (2, "first", "manual", True, None)
+
+    # Откат системного отказа гасит строку, новое нарушение её возвращает.
+    first.is_active = False
+    first.resolved_at = datetime.datetime(2026, 10, 7)
+    db_session.commit()
+
+    revived = ma.add_rejection(
+        db_session, left.id, right.id, reason="third", reason_type="system_spec"
+    )
+
+    assert revived.id == first.id
+    assert _stored(db_session, first.id) == (2, "third", "system_spec", True, None)
+    assert _rejection_tenants(db_session) == [2]
+
+
+def test_add_rejection_corrects_a_row_written_with_the_default_tenant(db_session):
+    """Строка прежнего кода (тенант по умолчанию) при повторном отказе получает тенант пары."""
+    left, right = _tenant_pair(db_session, 2, "foreign")
+    a_id, b_id = sorted((left.id, right.id))
+    db_session.add(MatchRejection(product_a_id=a_id, product_b_id=b_id, reason="old"))
+    db_session.commit()
+    assert _rejection_tenants(db_session) == [1]
+
+    rejection = ma.add_rejection(db_session, left.id, right.id, reason="new")
+
+    assert rejection.reason == "old"  # активная запись: причина остаётся прежней
+    assert _rejection_tenants(db_session) == [2]
+
+
+def test_add_rejection_skips_a_pair_across_tenants(db_session):
+    """Матчер сводит товары только внутри тенанта: такой отказ ничего не запрещает
+    и не принадлежал бы ни одному из двух тенантов."""
+    own = _make_product(db_session, name="Own", external_id="own")
+    foreign = _make_product(
+        db_session, tenant_id=2, site="aloe", name="Foreign", external_id="foreign"
+    )
+    db_session.commit()
+
+    with capture_logs() as seen:
+        assert ma.add_rejection(db_session, own.id, foreign.id) is None
+
+    assert _rejection_tenants(db_session) == []
+    assert ma.is_rejected(db_session, own.id, foreign.id) is False
+    # Журнал — единственный след того, что в кластере оказался чужой товар.
+    assert seen == [
+        {
+            "event": "rejection_cross_tenant_skipped",
+            "log_level": "error",
+            "product_ids": [own.id, foreign.id],
+            "tenant_ids": [1, 2],
+        }
+    ]
+
+
+def test_add_rejection_refuses_an_unknown_product(db_session):
+    known = _make_product(db_session, name="Known", external_id="known")
+    db_session.commit()
+
+    with pytest.raises(ValueError, match="not found"):
+        ma.add_rejection(db_session, known.id, known.id + 1000)
+
+    assert _rejection_tenants(db_session) == []
+
+
+def test_break_match_writes_rejections_for_the_cluster_tenant(db_session):
+    m, [_p1, p2, _p3] = _make_match_cluster(
+        db_session, "Aspirin", ["pharmonline", "aptekonline", "aloe"], tenant_id=2
+    )
+
+    assert ma.break_match(db_session, m.id, p2.id) == 2
+
+    assert _rejection_tenants(db_session) == [2, 2]
+
+
+def test_swap_alternative_writes_rejection_for_the_cluster_tenant(db_session):
+    m, [_p1, p2] = _make_match_cluster(
+        db_session, "Paracetamol", ["pharmonline", "aloe"], tenant_id=2
+    )
+    new_p = _make_product(
+        db_session, tenant_id=2, site="aloe", external_id="aloe-new", name="Paracetamol Generic"
+    )
+    db_session.commit()
+
+    assert ma.swap_alternative(db_session, m.id, "aloe", new_p.id) is True
+
+    assert ma.is_rejected(db_session, p2.id, new_p.id) is True
+    assert _rejection_tenants(db_session) == [2]
+
+
+def test_revalidate_split_writes_rejection_for_the_cluster_tenant(db_session):
+    m = Match(tenant_id=2, canonical_name="combo", confidence=0.9, is_manual=False)
+    db_session.add(m)
+    db_session.flush()
+    d3 = _make_product(
+        db_session,
+        tenant_id=2,
+        site="pharmonline",
+        external_id="c1",
+        name="Venatura Vitamin D3 20 ml",
+        name_normalized="venatura vitamin d3",
+        canonical_id=m.id,
+    )
+    d3k2 = _make_product(
+        db_session,
+        tenant_id=2,
+        site="aptekonline",
+        external_id="c2",
+        name="Venatura Vitamin D3 K2 20 ml",
+        name_normalized="venatura vitamin d3 k2",
+        canonical_id=m.id,
+    )
+    db_session.commit()
+
+    actions = matcher.revalidate_split(db_session, tenant_id=2)
+
+    assert [action["action"] for action in actions] == ["dissolve"]
+    assert ma.is_rejected(db_session, d3.id, d3k2.id) is True
+    assert _rejection_tenants(db_session) == [2]
+
+
+def test_reject_endpoint_writes_rejections_for_the_match_tenant(db_session):
+    from src import api as api_module
+
+    m, _products = _make_match_cluster(
+        db_session, "Ibuprofen", ["pharmonline", "aptekonline", "aloe"], tenant_id=2
+    )
+    match_id = m.id
+
+    response = api_module.dash_match_reject(
+        match_id, user=SimpleNamespace(id=7, tenant_id=2), db=db_session
+    )
+
+    assert response.status_code == 204
+    assert db_session.get(Match, match_id) is None
+    assert _rejection_tenants(db_session) == [2, 2, 2]
+    assert analytics.match_quality(db_session, tenant_id=2).rejected_pairs == 3
+    assert analytics.match_quality(db_session, tenant_id=1).rejected_pairs == 0
+
+
+# Кластера с товаром чужого тенанта быть не должно (matcher._persist_match такой
+# не создаст). Если он всё же есть, отклонение, отвязка и перепроверка в конце
+# сбора работают с ним как до появления тенанта у отказов: не падают, отказы
+# пишут только парам одного тенанта. Чужой товар, который по характеристикам ни
+# с кем не конфликтует, перепроверка из кластера не убирает — как и раньше.
+
+
+def _cluster_with_foreign_member(s, names: list[str]) -> tuple[Match, list[Product]]:
+    """Пара тенанта 1 (pharmonline, aptekonline, …), последний товар — тенанта 2."""
+    sites = ["pharmonline", "aptekonline", "aloe"][: len(names)]
+    m = Match(tenant_id=1, canonical_name=names[0], confidence=0.9, is_manual=False)
+    s.add(m)
+    s.flush()
+    products = [
+        _make_product(
+            s,
+            tenant_id=2 if index == len(names) - 1 else 1,
+            site=site,
+            external_id=f"mixed-{site}",
+            name=name,
+            canonical_id=m.id,
+        )
+        for index, (site, name) in enumerate(zip(sites, names, strict=True))
+    ]
+    s.commit()
+    return m, products
+
+
+def test_reject_endpoint_dismantles_a_cluster_with_a_foreign_member(db_session):
+    from src import api as api_module
+
+    m, [own_a, own_b, foreign] = _cluster_with_foreign_member(db_session, ["Ibuprofen"] * 3)
+    match_id = m.id
+
+    response = api_module.dash_match_reject(
+        match_id, user=SimpleNamespace(id=7, tenant_id=1), db=db_session
+    )
+
+    assert response.status_code == 204
+    assert db_session.get(Match, match_id) is None
+    linked = db_session.scalar(
+        select(func.count(Product.id)).where(Product.canonical_id.is_not(None))
+    )
+    assert linked == 0
+    assert ma.is_rejected(db_session, own_a.id, own_b.id) is True
+    assert _rejection_tenants(db_session) == [1]
+
+
+def test_break_match_detaches_a_foreign_member(db_session):
+    m, [own_a, own_b, foreign] = _cluster_with_foreign_member(db_session, ["Ibuprofen"] * 3)
+
+    assert ma.break_match(db_session, m.id, foreign.id) == 0
+
+    pairing = dict(db_session.execute(select(Product.id, Product.canonical_id)).all())
+    assert pairing == {own_a.id: m.id, own_b.id: m.id, foreign.id: None}
+    assert _rejection_tenants(db_session) == []
+
+
+def test_revalidate_split_dismantles_a_cluster_with_a_foreign_member(db_session):
+    m, [own, foreign] = _cluster_with_foreign_member(
+        db_session, ["Venatura Vitamin D3 20 ml", "Venatura Vitamin D3 K2 20 ml"]
+    )
+    match_id = m.id
+
+    actions = matcher.revalidate_split(db_session)
+
+    assert [action["action"] for action in actions] == ["dissolve"]
+    assert db_session.get(Match, match_id) is None
+    pairing = dict(db_session.execute(select(Product.id, Product.canonical_id)).all())
+    assert pairing == {own.id: None, foreign.id: None}
+    assert _rejection_tenants(db_session) == []
+    audit = db_session.scalar(select(MatchPolicyAudit).where(MatchPolicyAudit.match_id == match_id))
+    assert (audit.action, audit.payload["rejections"]) == ("spec_dissolve", [])
+
+
+def test_rejections_are_written_only_by_add_rejection():
+    """Тенант отказа задаётся в одном месте — второй писатель обошёл бы его.
+
+    Ловит вызов конструктора `MatchRejection(...)` где угодно, кроме
+    `add_rejection`, и сырой `INSERT INTO match_rejections`. Не ловит запись через
+    Core (`insert(MatchRejection)`), конструктор под другим именем и скрипт,
+    который копирует таблицы, не называя их.
+    """
+    root = Path(__file__).resolve().parent.parent
+    raw_insert = re.compile(r"insert\s+into\s+(\w+\.)?\"?match_rejections", re.I)
+    constructors: list[str] = []
+    raw_inserts: list[str] = []
+    for folder in ("src", "scripts", "migrations"):
+        for path in sorted((root / folder).rglob("*")):
+            if path.suffix not in {".py", ".sql", ".sh"}:
+                continue
+            text = path.read_text(encoding="utf-8")
+            relative = str(path.relative_to(root))
+            if raw_insert.search(text):
+                raw_inserts.append(relative)
+            if path.suffix != ".py":
+                continue
+
+            def visit(node: ast.AST, function: str | None, relative: str = relative) -> None:
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    function = node.name
+                if isinstance(node, ast.Call) and (
+                    (isinstance(node.func, ast.Name) and node.func.id == "MatchRejection")
+                    or (isinstance(node.func, ast.Attribute) and node.func.attr == "MatchRejection")
+                ):
+                    constructors.append(f"{relative} ({function})")
+                for child in ast.iter_child_nodes(node):
+                    visit(child, function)
+
+            visit(ast.parse(text), None)
+
+    assert constructors == ["src/match_actions.py (add_rejection)"]
+    assert raw_inserts == []
 
 
 # ── relink_dead_members (swap мёртвого члена кластера на живую альтернативу) ──

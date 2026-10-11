@@ -16,10 +16,60 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import re
 import sys
 from pathlib import Path
 
 import structlog
+
+# Почтовый адрес в готовой строке журнала. Строка бывает двух видов: как есть
+# (ConsoleRenderer) и JSON, где всё не-ASCII записано `\uXXXX`, а перевод строки
+# — `\n`. Отсюда оговорки в шаблоне:
+#   - буква считается буквой в обеих записях, иначе адрес с нелатинскими
+#     буквами прошёл бы мимо. `\uXXXX` — запись буквы, только когда `\` перед
+#     `u` сам не экранирован: чётное число `\` — это текст «A» как он есть;
+#   - буква сразу после `\` в адрес не входит: это хвост `\n` или `\t`, и вырезать
+#     его значило бы оставить в JSON одинокую `\`.
+# Точка в домене обязательна (иначе под шаблон попал бы `admin@local`), длина
+# имени ограничена, чтобы длинная строка без пробелов не разбиралась квадратично.
+#
+# Шаблон не полон и не должен считаться защитой секретов: имя в кавычках
+# (`"имя фамилия"@…`) он не видит, у имени с апострофом или длиннее 64 знаков
+# остаётся начало. Домен при этом скрыт всегда, кроме первого случая.
+_ESCAPED = r"(?<!\\)(?:\\\\)*\\u[0-9a-fA-F]{4}"
+_CHAR = rf"(?:(?<!\\)\w|{_ESCAPED})"
+_LETTER = rf"(?:(?<!\\)[^\W\d_]|{_ESCAPED})"
+_ADDRESS_RE = re.compile(
+    rf"(?:{_CHAR}|[.%+\-]){{1,64}}@(?:{_CHAR}|-)+(?:\.(?:{_CHAR}|-)+)*\.{_LETTER}{{2,}}"
+)
+ADDRESS_MASK = "<address>"
+
+
+def mask_addresses(text: str) -> str:
+    """Заменить в тексте всё, что похоже на почтовый адрес.
+
+    Журнал команды, которую запускает GitHub Actions, — журнал шага публичного
+    репозитория. Адрес получателя в нём — персональные данные клиента в
+    открытом доступе.
+    """
+    if "@" not in text:  # почти каждая строка журнала: регулярку не запускаем
+        return text
+    return _ADDRESS_RE.sub(ADDRESS_MASK, text)
+
+
+def masking(renderer):
+    """Обернуть последний процессор structlog: адреса вырезаются из готовой строки.
+
+    Последняя линия, а не замена аккуратности в вызовах: поле с адресом, repr
+    объекта, трассировка `log.exception` — что бы ни дошло до строки, адрес из
+    неё уходит. Вызовы журнала проверяет `tests/test_log_carries_no_address.py`.
+    """
+
+    def render(logger, name, event_dict):
+        rendered = renderer(logger, name, event_dict)
+        return mask_addresses(rendered) if isinstance(rendered, str) else rendered
+
+    return render
 
 
 def configure_logging(service: str = "app") -> None:
@@ -52,7 +102,7 @@ def configure_logging(service: str = "app") -> None:
         renderer = structlog.processors.JSONRenderer()
 
     structlog.configure(
-        processors=shared_processors + [renderer],
+        processors=shared_processors + [masking(renderer)],
         wrapper_class=structlog.make_filtering_bound_logger(level),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
