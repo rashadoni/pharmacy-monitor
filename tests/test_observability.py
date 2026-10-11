@@ -482,11 +482,16 @@ def test_sentry_bounds_the_request_headers_it_reads():
     """Headers are the caller's to fill, megabytes of them; the rest of the event is not."""
     headers = {f"x-flood-{i}": "?a=%41" + "a\xe9" * 8000 for i in range(256)}
     headers["user-agent"] = "curl/8"
-    event = {"request": {"headers": {"x-request-id": "rid-1", "referer": "r" * 5000, **headers}}}
+    first = {"x" * 257: "a megabyte-long name costs as much as a value", "x" * 256: "kept"}
+    event = {
+        "request": {"headers": {**first, "x-request-id": "rid-1", "referer": "r" * 5000, **headers}}
+    }
 
     clean = observability._sentry_before_send_transaction(event, {})["request"]["headers"]
 
     assert len(clean) == 100
+    assert clean["x" * 256] == "kept"
+    assert "x" * 257 not in clean
     assert clean["x-request-id"] == "rid-1"
     assert clean["referer"] == "r" * 2048 + "…"
     assert max(len(value) for value in clean.values()) == 2049
@@ -494,7 +499,8 @@ def test_sentry_bounds_the_request_headers_it_reads():
 
 
 def test_sentry_cuts_a_long_header_before_reading_it():
-    """A credential past the cut is gone with the tail; one across the cut is still masked."""
+    """A credential past the cut is gone with the tail; a query or a session token across it
+    is still masked (the bot token has a test of its own below)."""
     token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
     event = {
         "request": {
@@ -517,6 +523,21 @@ def test_sentry_cuts_a_long_header_before_reading_it():
         "x-debug": "p" * 1990 + " session [Filtered]…",
         "x-tail": "p" * 2048 + "…",
     }
+
+
+@pytest.mark.parametrize("separator", [":", "%3A"])
+@pytest.mark.parametrize("kept", [0, 1, 17, 32, 33, 34])
+def test_sentry_masks_a_bot_token_the_header_cut_shortened(separator, kept):
+    """The token shape has a fixed length, so a token the cut shortened needs a rule of its own."""
+    secret = "AAH-abcdefghijklmnopqrstuvwxyz01234"
+    lead = "u" * (2048 - len(f" /bot8123456789{separator}") - kept)
+    value = f"{lead} /bot8123456789{separator}{secret}/sendMessage"
+    event = {"request": {"headers": {"x-forwarded-uri": value}}}
+
+    clean = observability._sentry_before_send_transaction(event, {})["request"]["headers"]
+
+    expected = f"{lead} /bot8123456789{separator}…" if kept == 0 else f"{lead} /bot[Filtered]…"
+    assert clean["x-forwarded-uri"] == expected
 
 
 def test_sentry_drops_headers_it_cannot_read_by_name():

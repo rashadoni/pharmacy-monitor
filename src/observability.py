@@ -180,12 +180,15 @@ _PARAMETER_BREAK_RE = re.compile(r"[?&;#\s]")
 # decoded.
 _MAX_ESCAPES = 4096
 
-# Request headers are the one part of an event whose size the caller sets:
-# uvicorn takes megabytes of them, and every string of the event is read here,
+# Request headers are the part of an event whose size only the caller sets:
+# uvicorn takes megabytes of them — names as well as values — while its parser
+# stops a request line at about 64 KB. Every string of the event is read here,
 # on the thread that serves requests. What a real client sends fits these
 # bounds many times over; past them the work stops growing with the input.
 _MAX_HEADERS = 100
+_MAX_HEADER_NAME_LENGTH = 256
 _MAX_HEADER_LENGTH = 2048
+_CUT = "…"
 
 # The session cookie is a JWT. Matched by shape wherever a string quotes it —
 # exception text, breadcrumb, tag: `<header>.<payload>`, the signature optional,
@@ -204,11 +207,13 @@ _JWT_RE = re.compile(
 
 # A Telegram bot token, `<bot id>:<secret starting with A>`: 35 characters in
 # the shape secret scanners use, 34 in Telegram's own documentation examples.
-# The bounded length keeps `<number>:<md5 | sha1 | uuid>` out. The token is part
-# of the PATH of every Bot API URL (`/bot<token>/sendMessage`), and the SDK
+# The bounded length keeps `<number>:<md5 | sha1 | uuid>` out — and would keep
+# out a token that `_CUT` shortened, hence the second alternative. The token is
+# part of the PATH of every Bot API URL (`/bot<token>/sendMessage`), and the SDK
 # records the URL of an outgoing request in a breadcrumb and a span.
 _TELEGRAM_TOKEN_RE = re.compile(
-    r"(?<!\d)\d{5,16}(?::|%3[Aa])A[A-Za-z0-9_-]{33,34}(?![A-Za-z0-9_-])"
+    r"(?<!\d)\d{5,16}(?::|%3[Aa])A"
+    r"(?:[A-Za-z0-9_-]{33,34}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{0,34}(?=…))"
 )
 
 # A database error text quotes values in two places. SQLAlchemy ends it with the
@@ -243,13 +248,18 @@ def _clean_request(event: dict) -> None:
     request.pop("cookies", None)
     headers = request.get("headers")
     if isinstance(headers, dict):
-        for name in list(headers)[_MAX_HEADERS:]:
-            del headers[name]
+        request["headers"] = bounded = {}
         for name, value in headers.items():
+            if len(bounded) == _MAX_HEADERS:
+                break
+            if len(str(name)) > _MAX_HEADER_NAME_LENGTH:
+                continue
             if _CREDENTIAL_NAME_RE.search(str(name)):
-                headers[name] = _FILTERED
+                value = _FILTERED
             elif isinstance(value, str) and len(value) > _MAX_HEADER_LENGTH:
-                headers[name] = value[:_MAX_HEADER_LENGTH] + "…"
+                # Cut before the value is read for credentials, not after.
+                value = value[:_MAX_HEADER_LENGTH] + _CUT
+            bounded[name] = value
     elif headers is not None:
         del request["headers"]
 
