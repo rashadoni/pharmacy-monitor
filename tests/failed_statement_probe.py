@@ -30,10 +30,14 @@ Starlette и SQLAlchemy на весь процесс, а stdout и stderr это
   только движок.
 
 Режимы:
-    guarded    движок создаёт `storage.create_engine_hiding_statement_data`;
-    unguarded  движок создаёт голый `create_engine`, как до правки. Контроль: в
-               этом режиме проба обязана увидеть данные запроса и в конверте, и
-               в журнале — иначе её «чисто» ничего не значит.
+    guarded     движок создаёт `storage.create_engine_hiding_statement_data`,
+                хуки Sentry сняты: чисто — значит, чист текст самой ошибки;
+    unguarded   движок создаёт голый `create_engine`, как до правки, хуки сняты.
+                Контроль: в этом режиме проба обязана увидеть данные запроса и в
+                конверте, и в журнале — иначе её «чисто» ничего не значит;
+    as_shipped  как на сервере: защищённый движок и хуки, какими их передал
+                `init_sentry`. Два слоя вместе: хуки не должны ни вернуть данные,
+                ни выбросить событие об ошибке.
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ import time
 import uuid
 
 MODE, REPORT_PATH = sys.argv[1], sys.argv[2]
-assert MODE in ("guarded", "unguarded"), MODE
+assert MODE in ("guarded", "unguarded", "as_shipped"), MODE
 
 BASE_URL = os.environ["DATABASE_URL"]
 SCHEMA = f"failed_statement_{uuid.uuid4().hex[:12]}"
@@ -92,12 +96,9 @@ _real_init = sentry_sdk.init
 
 
 def _init_with_recording_transport(**options):
-    options.update(
-        include_local_variables=False,
-        max_request_body_size="never",
-        before_send=None,
-        before_send_transaction=None,
-    )
+    options.update(include_local_variables=False, max_request_body_size="never")
+    if MODE != "as_shipped":
+        options.update(before_send=None, before_send_transaction=None)
     return _real_init(transport=RecordingTransport, **options)
 
 

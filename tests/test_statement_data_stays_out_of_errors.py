@@ -699,10 +699,10 @@ def test_no_new_workflow_builds_its_own_engine():
 
 @pytest.fixture(scope="module")
 def probes(tmp_path_factory) -> dict[str, SimpleNamespace]:
-    """Проба в обоих режимах: с защитой движка и без неё (контроль)."""
+    """Проба в трёх режимах: движок с защитой, без неё (контроль) и пара «движок + хуки Sentry»."""
     url = _database_url()
     results = {}
-    for mode in ("guarded", "unguarded"):
+    for mode in ("guarded", "unguarded", "as_shipped"):
         report = tmp_path_factory.mktemp(f"probe_{mode}") / "report.json"
         done = subprocess.run(
             [sys.executable, str(REPO / "tests" / "failed_statement_probe.py"), mode, str(report)],
@@ -790,6 +790,24 @@ def test_sentry_envelopes_carry_no_statement_data(probes):
     assert not _BCRYPT_SHAPED.search(sent), "хеш пароля ушёл в Sentry"
     assert "[parameters: " not in sent
     assert "Failing row contains" not in sent
+
+
+def test_engine_and_sentry_hooks_together_send_the_error_without_its_data(probes):
+    """Как на сервере: защищённый движок и хуки `before_send` из `src/observability.py`.
+
+    Остальные режимы проверяют слои порознь; здесь — что вместе они не мешают
+    друг другу: событие об ошибке дошло, данных запроса в нём нет.
+    """
+    shipped = probes["as_shipped"]
+    sent = "\n".join(item["raw"] for item in shipped.sent)
+
+    assert [case["status"] for case in shipped.cases.values()] == [500, 500, 500]
+    assert [item["type"] for item in shipped.sent].count("event") >= 3
+    assert sent.count(_HIDDEN_BY_SQLALCHEMY) >= 3
+    for name, case in shipped.cases.items():
+        for label, secret in case["secrets"].items():
+            assert secret not in sent, f"{name}: {label} ушёл в Sentry"
+    assert not _BCRYPT_SHAPED.search(sent), "хеш пароля ушёл в Sentry"
 
 
 def test_journal_carries_no_statement_data(probes):
