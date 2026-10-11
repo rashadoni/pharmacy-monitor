@@ -80,15 +80,6 @@ ALMOST_ADMIN = [
     pytest.param("ａｄｍｉｎ", id="fullwidth"),
 ]
 OWNER = "owner@example.com"
-# То же с адресом: знак, с которым строку нельзя искать в базе, из неё не вырезается.
-ALMOST_THE_OWNER = [
-    pytest.param("\x00owner@example.com", id="nul-before"),
-    pytest.param("owner\x00@example.com", id="nul-inside"),
-    pytest.param("owner@example.com\x00", id="nul-after"),
-    pytest.param("\udc00owner@example.com", id="surrogate-before"),
-    pytest.param("ow\ud800ner@example.com", id="surrogate-inside"),
-    pytest.param("owner@example.com\ud800", id="surrogate-after"),
-]
 
 
 def _postgres_url() -> str:
@@ -246,15 +237,21 @@ def test_letters_of_the_azerbaijani_layout_are_other_letters_for_now(client, ses
     assert _login(client, login).status_code == 401
 
 
-@pytest.mark.parametrize("login", ALMOST_THE_OWNER)
-def test_a_login_that_only_resembles_an_address_is_not_that_user(client, sessions, login):
+@pytest.mark.parametrize("odd", ["\x00", "\ud800"], ids=["nul", "surrogate"])
+def test_a_login_that_only_resembles_an_address_is_not_that_user(client, sessions, odd):
+    """Знак, с которым строку нельзя искать в базе, из логина не вырезается.
+
+    Стоит он в любом месте адреса: вырезать его только в начале или только в
+    домене — такая же подмена.
+    """
     _add_user(sessions, OWNER)
     assert _login(client, OWNER).status_code == 200
 
-    refused = _login(client, login)
-
-    assert refused.status_code == 401, refused.text
-    assert api_module.COOKIE_NAME not in refused.cookies
+    for place in range(len(OWNER) + 1):
+        rate_limit._reset_memory_for_tests()
+        refused = _login(client, OWNER[:place] + odd + OWNER[place:])
+        assert refused.status_code == 401, (place, refused.text)
+        assert api_module.COOKIE_NAME not in refused.cookies
 
 
 @pytest.mark.parametrize("login", ["админ", "Админ", "АДМИН"])

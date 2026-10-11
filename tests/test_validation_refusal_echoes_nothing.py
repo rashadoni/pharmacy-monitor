@@ -244,11 +244,16 @@ class _Strict(BaseModel):
     def _address(cls, value: str) -> str:
         if "@" not in value:
             # Код причины — в `ctx`: по нему интерфейс берёт перевод. Рядом — то,
-            # чего там быть не должно: значение внутри списка.
+            # чего там быть не должно: значение внутри списка и внутри словаря.
             raise PydanticCustomError(
                 "email_address",
                 "{reason}",
-                {"reason": "Адрес не принят.", "problem": "domain", "seen": [value]},
+                {
+                    "reason": "Адрес не принят.",
+                    "problem": "domain",
+                    "seen": [value],
+                    "where": {"value": value},
+                },
             )
         return value
 
