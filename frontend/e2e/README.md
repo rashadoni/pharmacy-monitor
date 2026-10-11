@@ -48,7 +48,7 @@ PLAYWRIGHT_AUTH_TOKEN=$TOKEN pnpm test:e2e
 
 ## In CI (GitHub Actions)
 
-The `frontend` job in `.github/workflows/ci.yml` runs `pnpm test` (vitest unit tests).
+The `frontend` job in `.github/workflows/ci-pipeline.yml` runs `pnpm test` (vitest unit tests).
 E2E is run separately when you want it via:
 
 ```bash
