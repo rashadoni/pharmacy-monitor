@@ -158,6 +158,38 @@ app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 install_metrics_endpoint(app)
 
 
+# ─── Отказ проверки полей (422) ──────────────────────────────────────────────
+#
+# FastAPI по умолчанию кладёт в `detail[].input` присланное значение: на слишком
+# длинный пароль — сам пароль, на тело без обязательного поля — тело целиком. А
+# на одиночном суррогате (`"\ud800"`: в JSON он допустим, в UTF-8 его нет) такой
+# ответ не собирается вовсе — выходил 500, и текст исключения с теми же `input`
+# уходил в Sentry.
+#
+# Здесь в ответе остаётся то, чем запрос можно поправить: какое поле и что с ним
+# не так. Действует на все маршруты, а не на список адресов входа — список
+# отстал бы от кода.
+
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+# `ctx` — параметры правила (границы длины, код причины): по ним интерфейс
+# подбирает перевод. Чего в списке нет, в ответ не идёт — и поле, которое
+# FastAPI добавит позже, тоже.
+_REFUSAL_FIELDS = ("type", "loc", "msg", "ctx")
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_refusal(request: Request, exc: RequestValidationError) -> JSONResponse:
+    problems = [
+        {field: error[field] for field in _REFUSAL_FIELDS if field in error}
+        for error in exc.errors()
+        if isinstance(error, dict)
+    ]
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(problems)})
+
+
 # ─── Request ID middleware (Phase 0.5, 2026-05-26) ───────────────────────────
 #
 # Каждый запрос получает UUID4 (или принимается клиентский `X-Request-ID`,
@@ -1086,6 +1118,29 @@ def _hash_bcrypt(password: str) -> str:
 _DUMMY_BCRYPT_HASH = _hash_bcrypt("not-a-real-password-timing-equalizer")
 
 
+def _login_bytes(login: str) -> bytes:
+    """Логин для сверки с ADMIN_LOGIN: без регистра, байтами.
+
+    Строки `hmac.compare_digest` берёт только из ASCII и на «админ» бросает
+    TypeError — вход отвечал 500. Байты он сверяет любые. `surrogatepass` — чтобы
+    и одиночный суррогат (в JSON он допустим) кончался отказом, а не исключением.
+    """
+    return login.lower().encode("utf-8", "surrogatepass")
+
+
+def _fits_text_column(value: str) -> bool:
+    """Может ли строка лежать в текстовой колонке базы.
+
+    Одиночный суррогат не кодируется в UTF-8, нулевой байт PostgreSQL в тексте не
+    хранит: на обоих драйвер бросает исключение, не дойдя до запроса.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return "\x00" not in value
+
+
 @app.post("/auth/login")
 def auth_login(
     payload: PasswordLoginIn, response: Response, request: Request, db: Session = Depends(get_db)
@@ -1110,7 +1165,7 @@ def auth_login(
     env_pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
     login_raw = payload.login.strip()
 
-    if hmac.compare_digest(login_raw.lower(), expected_login.lower()):
+    if hmac.compare_digest(_login_bytes(login_raw), _login_bytes(expected_login)):
         # Bootstrap-админ: первый активный АДМИН + допускается env-хеш
         user = db.scalar(
             select(storage.TenantUser)
@@ -1128,6 +1183,10 @@ def auth_login(
             user = _tenants.add_user(db, t.id, "admin@local", name="Admin", role="admin")
             db.commit()
         pw_to_check = user.password_hash or env_pw_hash
+    elif not _fits_text_column(login_raw):
+        # Адреса с таким знаком в базе быть не может, а запрос с ним упал бы.
+        # Отказ ниже — тот же, что на любой незнакомый логин.
+        user, pw_to_check = None, ""
     else:
         # Email-based login для конкретного пользователя — без env-fallback
         user = db.scalar(
