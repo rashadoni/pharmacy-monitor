@@ -48,14 +48,18 @@ PLAYWRIGHT_AUTH_TOKEN=$TOKEN pnpm test:e2e
 
 ## In CI (GitHub Actions)
 
-The `frontend` job in `.github/workflows/ci-pipeline.yml` runs `pnpm test` (vitest unit tests).
-E2E is run separately when you want it via:
+CI does not run these scenarios. There is no e2e workflow in
+`.github/workflows/`, and no job of `ci-pipeline.yml` runs `pnpm test:e2e`. Its
+`Frontend (Next.js)` job runs `pnpm typecheck`, `pnpm test` (vitest, files
+matching `src/**/*.test.{ts,tsx}`) and `pnpm build`. The typecheck step
+type-checks the files in this directory too (`tsconfig.json` includes
+`**/*.ts`), but no spec is executed there. The `Test (pytest)` job does install
+Playwright's Chromium — for the Python scraper snapshot tests, not for these
+specs.
 
-```bash
-gh workflow run e2e
-```
-
-(Workflow file `.github/workflows/e2e.yml` to be added when prod is up.)
+A green CI therefore says nothing about what these scenarios check. Run them by
+hand, as described under "Run locally", against a backend and a frontend you
+started yourself.
 
 ## Coverage
 
