@@ -760,25 +760,36 @@ def _prices_for_match(
 def dispatch_event(session: Session, event: AlertEvent) -> dict:
     """Отправить event по каналам которые настроены в его правиле.
 
-    Возвращает {channel: status} где status = 'sent' / 'skipped' / 'error: msg'.
+    Старый путь: из `src/` не зовётся (рассылку о прогоне ведёт
+    `notifications.dispatch_events_batch`), остался под тестами.
+
+    Возвращает {channel: status} где status = 'sent' / 'sent to N/M' /
+    'skipped: …' / 'error: <класс ошибки>'. В `channels_sent` попадают только каналы, по
+    которым отправитель подтвердил хотя бы одну отправку, — а не все каналы
+    правила: 'skipped', 'error' и 'sent to 0/M' доставкой не считаются.
     """
     rule = session.get(AlertRule, event.rule_id) if event.rule_id else None
     channels = (rule.channels if rule else None) or ["email"]
     results: dict[str, Any] = {}
+    confirmed: list[str] = []
 
     if "email" in channels:
-        results["email"] = _send_email_alert(event)
+        results["email"], delivered = _send_email_alert(event)
+        if delivered:
+            confirmed.append("email")
 
     if "telegram" in channels:
-        results["telegram"] = _send_telegram_alert(session, event)
+        results["telegram"], delivered = _send_telegram_alert(session, event)
+        if delivered:
+            confirmed.append("telegram")
 
-    event.channels_sent = list(results.keys())
+    event.channels_sent = confirmed
     session.commit()
     return results
 
 
-def _send_email_alert(event: AlertEvent) -> str:
-    """Отправить email-алерт. Использует существующий notifier."""
+def _send_email_alert(event: AlertEvent) -> tuple[str, bool]:
+    """Отправить email-алерт. Возвращает (статус, подтвердил ли отправитель)."""
     try:
         from src import notifier
 
@@ -799,27 +810,35 @@ def _send_email_alert(event: AlertEvent) -> str:
           </div>
         </div>
         """
-        notifier.send_email(
+        # False — SMTP не настроен, письма не было (отправитель пишет
+        # `email_skipped_no_smtp`); отказ сервера и сеть приходят исключением.
+        if notifier.send_email(
             subject=f"[{event.severity.upper()}] {event.title[:80]}",
             html_body=html,
-        )
-        return "sent"
+        ):
+            return "sent", True
+        log.warning("alert_email_failed", event_id=event.id)
+        return "skipped: smtp not configured", False
     except Exception as e:
         from src.notifier import delivery_error_fields
 
-        log.warning("alert_email_failed", **delivery_error_fields(e))
-        return f"error: {e}"
+        log.warning("alert_email_failed", event_id=event.id, **delivery_error_fields(e))
+        # Класс ошибки, не её текст: в тексте ошибки отправки бывает адрес.
+        return f"error: {type(e).__name__}", False
 
 
-def _send_telegram_alert(session: Session, event: AlertEvent) -> str:
-    """Отправить Telegram-алерт всем активным получателям с привязанным chat_id."""
+def _send_telegram_alert(session: Session, event: AlertEvent) -> tuple[str, bool]:
+    """Отправить Telegram-алерт всем активным получателям с привязанным chat_id.
+
+    Возвращает (статус, подтвердил ли отправитель хотя бы одну отправку).
+    """
     try:
         from src import notifier, watchlist as wl
 
         recipients = wl.list_recipients(session, active_only=True)
         chat_ids = [r.telegram_chat_id for r in recipients if r.telegram_chat_id]
         if not chat_ids:
-            return "skipped: no telegram chat_ids"
+            return "skipped: no telegram chat_ids", False
         sev_emoji = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️"}.get(event.severity, "•")
         text = f"{sev_emoji} *{event.title}*\n\n{event.detail or ''}"
         sent = 0
@@ -827,9 +846,17 @@ def _send_telegram_alert(session: Session, event: AlertEvent) -> str:
             ok = notifier.send_telegram_message(chat_id, text)
             if ok:
                 sent += 1
-        return f"sent to {sent}/{len(chat_ids)}"
+        if sent < len(chat_ids):
+            # Причину каждого отказа отправитель написал сам, строкой раньше.
+            log.warning(
+                "alert_telegram_failed",
+                event_id=event.id,
+                failed=len(chat_ids) - sent,
+                of=len(chat_ids),
+            )
+        return f"sent to {sent}/{len(chat_ids)}", sent > 0
     except Exception as e:
         from src.notifier import delivery_error_fields
 
-        log.warning("alert_telegram_failed", **delivery_error_fields(e))
-        return f"error: {e}"
+        log.warning("alert_telegram_failed", event_id=event.id, **delivery_error_fields(e))
+        return f"error: {type(e).__name__}", False
