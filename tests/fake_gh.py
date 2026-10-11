@@ -4,29 +4,46 @@
 
     gh api [-X PUT] <путь> [-H <заголовок>] [--input -] [--jq <фильтр>]
 
-Всё остальное — отказ с ненулевым кодом: если скрипт начнёт звать `gh` иначе,
-тест упадёт, а не пройдёт мимо.
+Всё остальное — отказ с ненулевым кодом. Скрипт может такой отказ проглотить
+(`|| true`), поэтому в журнал пишется каждый запуск, ещё до разбора аргументов.
 
 Состояние лежит в каталоге из `FAKE_GH_DIR`:
 
 - `state.json` — что сейчас «стоит на GitHub» (ответ на чтение защиты). Файла
   нет — ветка не защищена, чтение отвечает 404, как у GitHub.
-- `calls.jsonl` — журнал: по строке на каждый вызов, до его исполнения.
+- `argv.jsonl` — аргументы каждого запуска, как пришли.
+- `calls.jsonl` — запуски, которые удалось разобрать: метод, путь, фильтр, тело.
 
-`FAKE_GH_PUT` задаёт, что делает запись:
+`FAKE_GH_GET` — как отвечает чтение:
 
-- `apply` (по умолчанию) — принять и ответить на следующее чтение так, как
-  ответил бы GitHub (`as_github_returns`);
+- `ok` (по умолчанию);
+- `fail` — всегда 502; `fail_first` — только первое; `fail_after_put` — те, что
+  идут после записи.
+
+`FAKE_GH_PUT` — что делает запись:
+
+- `apply` (по умолчанию) — принять и отвечать на чтение так, как ответил бы
+  GitHub (`as_github_returns`);
 - `drop_pull_request_rule` — принять, но остаться без требования pull request;
-- `reject` — отказать с 422, ничего не меняя.
+- `keep_admins_exempt` — принять, но правила на администратора не действуют;
+- `reject` — отказать с 422, ничего не меняя;
+- `error_after_apply` — применить и после этого ответить ошибкой (обрыв связи
+  на ответе).
 
 `--jq` исполняет настоящий `jq`: `gh` печатает строки без кавычек, поэтому `-r`.
-У `gh` внутри другая реализация (gojq) — совпадение на фильтре скрипта
-проверено отдельно, чтением живой защиты (см. описание PR).
+У `gh` внутри другая реализация (gojq). На фильтре скрипта они сверены вручную
+2026-10-11, gh 2.45.0, чтением живой защиты: и совпадение, и расхождение дают тот
+же вердикт и те же ключи в строках DIFFERS; отличается только порядок ключей
+внутри значения в этих строках. Тест этого не повторяет — повторяет каждый
+настоящий `--check`.
 
-`as_github_returns` — модель, а не GitHub. К действительности она привязана
-одним: для полезной нагрузки скрипта она даёт ровно тот ответ, который GitHub
-вернул на чтение 2026-10-11 (`tests/fixtures/main_protection_live_2026-10-11.json`).
+Как ведёт себя настоящий `gh` на ошибке, сверено там же: тело ответа уходит в
+stdout без фильтра, `gh: … (HTTP 404)` — в stderr, код 1.
+
+`as_github_returns` — модель, а не GitHub: принимает любую запись и не знает,
+примет ли GitHub эту. К действительности она привязана одним: для полезной
+нагрузки скрипта даёт ровно тот ответ, который GitHub вернул на чтение
+2026-10-11 (`tests/fixtures/main_protection_live_2026-10-11.json`).
 """
 
 from __future__ import annotations
@@ -73,7 +90,8 @@ def as_github_returns(payload: dict, endpoint: str) -> dict:
         }
     if payload["restrictions"] is not None:
         state["restrictions"] = {"url": f"{url}/restrictions", **payload["restrictions"]}
-    # Подпись коммитов задаётся отдельным запросом, запись защиты её не несёт.
+    # Подпись коммитов задаётся отдельным запросом. Здесь она всегда выключена:
+    # так на GitHub сейчас, и скрипт её не читает.
     state["required_signatures"] = {"url": f"{url}/required_signatures", "enabled": False}
     state["enforce_admins"] = {
         "url": f"{url}/enforce_admins",
@@ -89,9 +107,17 @@ def _refuse(message: str, code: int) -> int:
     return code
 
 
+def _server_error() -> int:
+    print("gh: HTTP 502", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str]) -> int:
     home = Path(os.environ["FAKE_GH_DIR"])
     state_file = home / "state.json"
+    journal = home / "calls.jsonl"
+    with (home / "argv.jsonl").open("a") as raw:
+        raw.write(json.dumps(argv) + "\n")
 
     if not argv or argv[0] != "api":
         return _refuse(f"only `gh api` is supported, got {argv!r}", 97)
@@ -118,12 +144,26 @@ def main(argv: list[str]) -> int:
     if endpoint is None:
         return _refuse("no endpoint", 97)
 
+    earlier = (
+        [json.loads(line)["method"] for line in journal.read_text().splitlines()]
+        if journal.exists()
+        else []
+    )
     body = sys.stdin.read() if reads_stdin else None
-    with (home / "calls.jsonl").open("a") as log:
+    with journal.open("a") as log:
         call = {"method": method, "endpoint": endpoint, "jq": jq_filter, "body": body}
         log.write(json.dumps(call) + "\n")
 
     if method == "GET":
+        reading = os.environ.get("FAKE_GH_GET", "ok")
+        if reading not in ("ok", "fail", "fail_first", "fail_after_put"):
+            return _refuse(f"unknown FAKE_GH_GET={reading}", 97)
+        if (
+            reading == "fail"
+            or (reading == "fail_first" and "GET" not in earlier)
+            or (reading == "fail_after_put" and "PUT" in earlier)
+        ):
+            return _server_error()
         if not state_file.exists():
             print(json.dumps({"message": "Branch not protected", "status": "404"}))
             print("gh: Branch not protected (HTTP 404)", file=sys.stderr)
@@ -143,9 +183,13 @@ def main(argv: list[str]) -> int:
         state = as_github_returns(json.loads(body or ""), endpoint)
         if effect == "drop_pull_request_rule":
             state.pop("required_pull_request_reviews", None)
-        elif effect != "apply":
+        elif effect == "keep_admins_exempt":
+            state["enforce_admins"]["enabled"] = False
+        elif effect not in ("apply", "error_after_apply"):
             return _refuse(f"unknown FAKE_GH_PUT={effect}", 97)
         state_file.write_text(json.dumps(state))
+        if effect == "error_after_apply":
+            return _server_error()
         print(json.dumps(state))
         return 0
 

@@ -6,16 +6,31 @@
 # described is not a control. So the enforcement lives here, is version
 # controlled, is re-runnable, and is what every other repository copies.
 #
-# What it configures on `main`:
+# What it describes for `main`:
 #   - changes arrive only through a pull request: `required_pull_request_reviews`
 #     is set, with zero required approvals — the owner works alone, and a rule
 #     nobody can satisfy is how production became undeployable in the first
 #     place
-#   - the three CI jobs must be green before merge, and only GitHub Actions
-#     (app 15368) can report them
+#   - the three CI jobs must be green before merge, reported by GitHub Actions
+#     (app 15368)
 #   - the rules apply to administrators too (`enforce_admins`): nobody merges a
 #     red pull request. Owner's decision, confirmed 2026-10-11
 #   - no force push, no branch deletion
+# That these settings behave as named — a direct push is refused, a status of
+# the same name from another source does not count — is GitHub's description
+# of them. Nobody here tried.
+#
+# Usage:
+#   bash scripts/ci/configure-main-protection.sh --check [owner/repo]
+#       read-only: compares the live protection with the payload below and
+#       sends nothing. Exit 0 = the same, 1 = different, 3 = could not tell.
+#   bash scripts/ci/configure-main-protection.sh --apply [owner/repo]
+#       writes the payload — only when the comparison found a difference, or
+#       found the branch unprotected. Reads the result back and fails unless
+#       it equals the payload.
+# Without a flag it is `--check`. Always type `--check` anyway: the copies of
+# this file from before this change (see below) do not know flags and WRITE
+# when run with none.
 #
 # Changed 2026-10-04. This script used to pin `agent-review` as the single
 # required context. That check reports green on every pull request when its
@@ -27,78 +42,87 @@
 # Changed 2026-10-11. Until then the payload said
 # `"required_pull_request_reviews": null`, while this header promised "only
 # through a pull request". GitHub's API description reads null as "disable",
-# and the PUT below replaces the whole protection object: a re-run would have
-# removed the pull-request requirement that is set on GitHub, and a commit with
-# green checks could then have been pushed straight to `main`. (Read from the
-# API description. Never tried.) The closing report would not have shown it: it
-# printed `pull_request_only` from the status-check field, so it said `true`
-# whatever the pull-request field held. Now the payload carries the
-# requirement, and the report is a comparison of what GitHub returns with the
-# payload — the script exits non-zero when they differ.
+# and the PUT replaces the whole protection object: a run would have removed
+# the pull-request requirement that is set on GitHub, and a commit with green
+# checks could then have been pushed straight to `main`. (Read from the API
+# description. Never tried. Every earlier version of this file sent null, so
+# the requirement that is on GitHub was not put there by this script.) The
+# closing report would not have shown it: it printed `pull_request_only` from
+# the status-check field, so it said `true` whatever the pull-request field
+# held. Now the payload carries the requirement, the report is a comparison of
+# what GitHub returns with the payload, and writing takes an explicit flag.
 #
-# NOT VERIFIED BY A RUN, as of 2026-10-11: the write below has not been sent to
-# GitHub in this form — branch protection is not changed for the sake of a
-# test. What was checked instead: the payload against the live protection, by
-# reading it, and the script against a stand-in `gh` that never reaches the
-# network (tests/test_main_protection_script.py).
+# NOT VERIFIED BY A RUN, as of 2026-10-11: `--apply` has never sent its write
+# to GitHub — branch protection is not changed for the sake of a test. What was
+# checked instead: the payload against the live protection, by reading it; the
+# comparison filter in gh's own jq, on that same read; and the script against a
+# stand-in `gh` that never reaches the network
+# (tests/test_main_protection_script.py). Rewrite this paragraph after the
+# first real write.
 #
-# Before a real run:
+# Before `--apply`:
 #   - it is the owner's call, not an agent's (docs/DELIVERY-ARCHITECTURE.md)
-#   - run it from an up-to-date `main` only: branches and worktrees cut before
-#     2026-10-11 still carry the copy that sends null
+#   - use the file from `origin/main` after a `git fetch`, not a local `main`
+#     and not another branch. Every branch and worktree cut before this change
+#     was merged carries the old file, whatever its date. The old file is the
+#     one without `--apply` in it:
+#       grep -c -- '--apply' scripts/ci/configure-main-protection.sh   # 0 = old
 #   - run `--check` first and read what differs: the write replaces every
-#     setting, including one somebody changed on purpose
-#
-# Usage:
-#   bash scripts/ci/configure-main-protection.sh --check [owner/repo]
-#       read-only: compares the live protection with the payload, sends nothing
-#   bash scripts/ci/configure-main-protection.sh [owner/repo]
-#       writes the payload, unless the live protection already equals it
+#     setting below, including one somebody changed on purpose — a fourth
+#     required check added by hand is removed by it
 set -euo pipefail
 
 usage() {
-  echo "Usage: bash scripts/ci/configure-main-protection.sh [--check] [owner/repo]" >&2
+  echo "Usage: bash scripts/ci/configure-main-protection.sh --check|--apply [owner/repo]" >&2
   exit 2
 }
 
-# Anything this script does not recognise stops it before the first request: a
-# mistyped or misplaced `--check` must not turn into a write.
-MODE=apply
-if [[ "${1:-}" == "--check" ]]; then
-  MODE=check
-  shift
-fi
+# Writing is never the default, and an argument that is not exactly a flag or
+# an owner/repo pair stops the script before the first request.
+MODE=check
+case "${1:-}" in
+  --check) shift ;;
+  --apply) MODE=apply; shift ;;
+esac
 [[ $# -le 1 ]] || usage
-[[ "${1:-}" != -* ]] || usage
 
 # The repository moved to the rashadoni account; the old default would have
 # configured protection on a repository nobody uses any more.
-REPO="${1:-rashadoni/pharmacy-monitor}"
-BRANCH="${BRANCH:-main}"
+REPO="rashadoni/pharmacy-monitor"
+[[ $# -eq 0 ]] || REPO="$1"
+REPO_SHAPE='^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$'
+[[ "${REPO}" =~ ${REPO_SHAPE} ]] || usage
+
+# Not taken from the environment: a BRANCH exported for something else must not
+# point a protection write at another branch.
+BRANCH="main"
 ENDPOINT="repos/${REPO}/branches/${BRANCH}/protection"
 
-command -v gh >/dev/null || { echo "gh is required" >&2; exit 1; }
+command -v gh >/dev/null || { echo "gh is required" >&2; exit 3; }
 
-# The whole protection object. PUT replaces it: a setting left out here is
-# reset to GitHub's default, not kept — which is why every setting the endpoint
-# takes is spelled out, and why `required_pull_request_reviews` must never be
-# null again.
+# The whole protection object. PUT replaces it: by the API description, a
+# top-level setting left out is reset to GitHub's default, not kept — which is
+# why every top-level setting the endpoint takes is spelled out, and why
+# `required_pull_request_reviews` must never be null again. Inside it,
+# `dismissal_restrictions` and `bypass_pull_request_allowances` are left out on
+# purpose: nobody is allowed to bypass the pull-request requirement.
 #
-# The three checks are the jobs of ci-pipeline.yml. That workflow has NO path
+# The three checks are jobs of ci-pipeline.yml. That workflow has NO path
 # filters: it runs on every pull request to main, documentation-only ones
 # included, so none of them can hang waiting for a check that never starts.
 # Keep that property — a path-filtered required check is unmergeable for ever.
 # Context strings must match the job `name:` values exactly. 15368 is GitHub
-# Actions: a status of the same name posted by anything else does not count.
+# Actions.
 #
 # `checks` replaces the `contexts` list this script sent before. `contexts` is
 # deprecated and leaves the choice of app to GitHub ("recently set by…");
 # `checks` names it, which is what GitHub reports for this branch today. Like
-# the rest of this write, the `checks`-only form has not been sent from here,
-# and GitHub's published API schema still marks `contexts` as required. If
-# GitHub refuses the write for that reason, the refusal is of the whole write
-# and nothing changes: say so, do not patch around it silently.
-DESIRED="$(cat <<'JSON'
+# the rest of the write, the `checks`-only form has not been sent from here,
+# and GitHub's published API schema still marks `contexts` as required. A
+# refusal for that reason is expected to be a refusal of the whole write: the
+# script then reads the protection back and says what is set. Do not patch
+# around it silently.
+IFS= read -r -d '' DESIRED <<'JSON' || true
 {
   "required_status_checks": {
     "strict": false,
@@ -125,14 +149,18 @@ DESIRED="$(cat <<'JSON'
   "allow_fork_syncing": false
 }
 JSON
-)"
 
 # Turns GitHub's answer into the shape of the payload and compares the two,
 # setting by setting. It runs inside `gh api --jq`, with the payload bound to
 # $want (JSON is valid jq). The last line it prints is the verdict; everything
-# before it is for the reader. A setting GitHub does not return counts as a
-# difference, not as "off".
-COMPARE="$(cat <<'JQ'
+# before it is for the reader, and is taken from GitHub's answer, not from the
+# payload.
+#
+# What "match" means: every setting this script writes has, on GitHub, the
+# value written here. A setting GitHub does not return counts as a difference,
+# not as "off". What it does not look at: anything this endpoint does not
+# write — commit signatures, repository rulesets.
+IFS= read -r -d '' COMPARE <<'JQ' || true
 | ($want | .required_status_checks.checks |= sort_by(.context)) as $want
 | {
     required_status_checks: (
@@ -164,7 +192,6 @@ COMPARE="$(cat <<'JQ'
   ($differs[] | "DIFFERS \(.): this script sets \($want[.] | tojson), GitHub has \($live[.] | tojson)"),
   (if ($differs | length) == 0 then "RESULT: match" else "RESULT: MISMATCH" end)
 JQ
-)"
 
 read_state() {
   gh api "${ENDPOINT}" -H "Accept: application/vnd.github+json" \
@@ -172,46 +199,47 @@ read_state() {
 }
 
 in_sync() {
-  [[ "${1##*$'\n'}" == "RESULT: match" ]]
+  [[ "$(printf '%s\n' "$1" | tail -n 1)" == "RESULT: match" ]]
 }
 
-if [[ "${MODE}" == check ]]; then
-  echo "Comparing ${REPO}@${BRANCH} with this script. Nothing is sent."
-  state="$(read_state)" || {
-    echo "Could not read the protection of ${REPO}@${BRANCH}: see the error above." >&2
-    exit 1
-  }
-  printf '%s\n' "${state}"
-  in_sync "${state}" || exit 1
-  exit 0
-fi
-
+echo "Comparing ${REPO}@${BRANCH} with this script."
 if state="$(read_state)"; then
+  printf '%s\n' "${state}"
   if in_sync "${state}"; then
-    printf '%s\n' "${state}"
-    echo "${REPO}@${BRANCH} is already protected the way this script describes. Nothing sent."
+    echo "Nothing to change, nothing sent."
     exit 0
   fi
-  echo "Protection of ${REPO}@${BRANCH} before the change:"
-  printf '%s\n' "${state}"
+elif [[ "${state}" == *"Branch not protected"* ]]; then
+  echo "${REPO}@${BRANCH} has no branch protection at all."
 else
-  echo "No readable protection on ${REPO}@${BRANCH} (see the error above)."
+  # Not "unprotected": an error, a refusal, an answer this script cannot read.
+  # Writing over a state nobody has seen is exactly what this script is for
+  # preventing.
+  echo "Could not read the protection of ${REPO}@${BRANCH}: see the error above." >&2
+  echo "Nothing was sent." >&2
+  exit 3
+fi
+
+if [[ "${MODE}" != apply ]]; then
+  echo "Nothing was sent. Writing is --apply, and it is the owner's call."
+  exit 1
 fi
 
 echo
-echo "Configuring branch protection on ${REPO}@${BRANCH}"
-response="$(gh api -X PUT "${ENDPOINT}" -H "Accept: application/vnd.github+json" \
-  --input - <<<"${DESIRED}")" || {
+echo "Writing branch protection to ${REPO}@${BRANCH}"
+if ! response="$(gh api -X PUT "${ENDPOINT}" -H "Accept: application/vnd.github+json" \
+  --input - <<<"${DESIRED}")"; then
   printf '%s\n' "${response}" >&2
-  echo "GitHub refused the write. Nothing in this script was applied." >&2
-  exit 1
-}
+  echo "The write did not complete: see the error above. What GitHub has now:" >&2
+  read_state >&2 || echo "…could not be read either. Run --check before relying on it." >&2
+  exit 3
+fi
 
 echo "Sent. Read back from GitHub:"
 state="$(read_state)" || {
   echo "The write was accepted, but the protection could not be read back." >&2
   echo "Treat ${REPO}@${BRANCH} as unverified until --check passes." >&2
-  exit 1
+  exit 3
 }
 printf '%s\n' "${state}"
 if ! in_sync "${state}"; then
