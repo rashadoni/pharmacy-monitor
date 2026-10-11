@@ -2364,6 +2364,39 @@ def test_legacy_products_with_key_200(client):
     assert isinstance(r.json(), list)
 
 
+def test_api_key_rate_limit_counter_is_not_named_after_the_key(client, monkeypatch):
+    """Имя счётчика уходит в Redis, а Sentry пишет команды Redis в трассу запроса.
+
+    Было `ok:<первые восемь знаков ключа>` — начало действующего ключа лежало в
+    каждой записанной трассе запроса с ключом. Хеш ключа тоже не годится: по
+    нему проверяют догадки о ключе.
+    """
+    counters = []
+    monkeypatch.setattr(
+        api_module, "_check_rate_limit", lambda key, limit=None: counters.append(key)
+    )
+
+    for key in ("test-key-1234", "another-key-5678"):
+        monkeypatch.setenv("PHARMACY_API_KEY", key)
+        assert client.get("/api/v1/products", headers={"X-API-Key": key}).status_code == 200
+
+    assert counters == ["ok:api-key", "ok:api-key"]
+
+
+def test_integrations_status_does_not_call_sentry_configured_when_it_failed_to_start(
+    client, auth_cookie, monkeypatch
+):
+    """DSN задан, а SDK инициализацию отверг: страница настроек не должна рисовать «включено»."""
+    monkeypatch.setenv("SENTRY_DSN", "https://test@test.ingest.sentry.io/123")
+    client.cookies.set(api_module.COOKIE_NAME, auth_cookie)
+
+    monkeypatch.setattr(api_module, "sentry_is_running", lambda: False)
+    assert client.get("/api/v1/dash/integrations").json()["sentry"] is False
+
+    monkeypatch.setattr(api_module, "sentry_is_running", lambda: True)
+    assert client.get("/api/v1/dash/integrations").json()["sentry"] is True
+
+
 def test_legacy_alerts_recent_with_key(client):
     r = client.get(
         "/api/v1/alerts/recent",
