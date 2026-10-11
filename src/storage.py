@@ -11,6 +11,7 @@ Schema overview:
 from __future__ import annotations
 
 import os
+import re
 import threading
 from datetime import datetime
 from src._time import utcnow
@@ -36,6 +37,7 @@ from sqlalchemy.orm import (
     mapped_column,
     relationship,
     sessionmaker,
+    validates,
 )
 
 
@@ -58,6 +60,83 @@ def _env_int(name: str, default: int, *, min_value: int) -> int:
     return max(min_value, value)
 
 
+# Вместо текста ошибки, который хранить нельзя. Признак («@») и пометка — те же,
+# что у `logging_setup.without_addresses`; здесь они повторены, а не взяты
+# импортом: этот модуль ни от чего в `src` не зависит, и файл, выложенный
+# отдельно от остальных, обязан загрузиться. Что копии не разошлись, следит тест.
+_ERROR_TEXT_WITHHELD = "<текст скрыт>"
+# Класс ошибки в начале текста: «IntegrityError: …», «RunQualityFailure: …».
+# Любое другое слово перед двоеточием началом не считается: им бывает и имя
+# ящика («ivan.petrov: mailbox … is full»).
+_ERROR_CLASS = re.compile(
+    r"(?:[A-Z][A-Za-z0-9_]*)?(?:Error|Exception|Failure|Warning|Status|Timeout)(?=: )"
+)
+# Так к записанному тексту дописывают заметки: «… | reaped: …».
+_ERROR_NOTE_SEPARATOR = " | "
+
+
+def _error_text_without_addresses(text: str) -> str:
+    if "@" not in text:
+        return text
+    named = _ERROR_CLASS.match(text)
+    return f"{named.group()}: {_ERROR_TEXT_WITHHELD}" if named else _ERROR_TEXT_WITHHELD
+
+
+def stored_error_text(text, *, appended_to: object = None):
+    """Текст ошибки, как он ляжет в базу: адреса в нём не бывает.
+
+    Текст читают не только операторы: страницу прогонов видит сотрудник клиента,
+    он же идёт в письмо о здоровье, в ответ бота и в журнал шага workflow, а
+    вместе с базой — в бэкап. Ошибка же несёт что угодно: ошибка базы кладёт в
+    текст параметры запроса. Поэтому чистится он здесь, при записи, а не в
+    каждом месте показа (решение владельца 2026-10-09): есть «@» — от текста
+    остаётся класс ошибки, если текст с него начинается, и `<текст скрыт>`.
+
+    `appended_to` — что лежало в колонке до записи. Если новый текст — прежний
+    плюс заметка через « | », заметка чистится отдельно и причину не стирает.
+    Иначе текст чистится целиком: « | » внутри самой ошибки его не делит.
+
+    Не строка (`None`, выражение SQL) возвращается как есть. Видит правило
+    только «@»: Telegram-идентификатор (число) в параметрах запроса пройдёт.
+    Где искать исходный текст — docs/RUNBOOK.md «Текст ошибки прогона».
+    """
+    if not isinstance(text, str) or "@" not in text:
+        return text
+    if isinstance(appended_to, str) and appended_to:
+        head = appended_to + _ERROR_NOTE_SEPARATOR
+        if text.startswith(head):
+            return _ERROR_NOTE_SEPARATOR.join(
+                [
+                    _error_text_without_addresses(appended_to),
+                    _error_text_without_addresses(text[len(head) :]),
+                ]
+            )
+    return _error_text_without_addresses(text)
+
+
+def stored_error_details(value):
+    """То же правило для JSON с подробностями прогона: каждая строка внутри.
+
+    Тексты ошибок лежат в `run_quality` не в одном месте — список по сайтам,
+    ошибка каждой категории, причина незавершённого маршрута, заметка о
+    восстановлении, — и собирают их в разных функциях. Словари и списки
+    правятся на месте, и возвращается тот же объект: код, записав словарь в
+    колонку, продолжает его читать (`run_quality_message`) и дописывать.
+    Ключи не трогаются: это названия категорий и адреса страниц.
+    """
+    if isinstance(value, str):
+        return stored_error_text(value)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = stored_error_details(item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = stored_error_details(item)
+    elif isinstance(value, tuple):
+        return tuple(stored_error_details(item) for item in value)
+    return value
+
+
 class Run(Base):
     __tablename__ = "runs"
 
@@ -68,6 +147,8 @@ class Run(Base):
     status: Mapped[str] = mapped_column(
         String(20), default="running"
     )  # running/ok/degraded/failed
+    # Этот текст, причина недоверия каталогу и `run_quality` пишутся без адресов —
+    # валидаторы в конце класса.
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     products_scraped: Mapped[int] = mapped_column(Integer, default=0)
     sites_completed: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -96,6 +177,15 @@ class Run(Base):
     snapshots: Mapped[list["PriceSnapshot"]] = relationship(
         back_populates="run", foreign_keys="PriceSnapshot.run_id"
     )
+
+    @validates("error_message", "catalog_verification_reason")
+    def _error_text_carries_no_address(self, key: str, text):
+        # Прежнее значение — из `__dict__`: так его чтение ничего не подгружает.
+        return stored_error_text(text, appended_to=self.__dict__.get(key))
+
+    @validates("run_quality")
+    def _error_details_carry_no_address(self, _key: str, quality):
+        return stored_error_details(quality)
 
 
 def run_is_financially_eligible(run: Run | None) -> bool:
@@ -185,7 +275,12 @@ class ScrapeRequest(Base):
     run_id: Mapped[int | None] = mapped_column(
         ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
     )
+    # Копия текста ошибки прогона или текст от watcher'а — тем же правилом.
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    @validates("error_message")
+    def _error_text_carries_no_address(self, key: str, text):
+        return stored_error_text(text, appended_to=self.__dict__.get(key))
 
 
 class AuditLog(Base):
