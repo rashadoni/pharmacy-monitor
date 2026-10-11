@@ -182,9 +182,11 @@ systemctl enable --now pharmacy-monitor-backup.timer
 >   `/etc/systemd/system/`: installing a changed unit is still a separate step
 >   for root, and on 2026-10-11 it had not been taken. The server's
 >   `pharmacy-monitor-rematch` units were the old ones (`rematch --reset`,
->   Monday 05:00) — the deployed code refuses that command, so no pairs are
->   reset, but no scheduled `rematch` runs either; `docs/RUNBOOK.md`,
->   «Выкладка правок сопоставления», has the command that replaces the unit.
+>   Monday 05:00). The unit last started on 2026-10-05, before the refusal
+>   was deployed; the code on the server now refuses that command, so from the
+>   next start on it should neither reset pairs nor run a scheduled `rematch`
+>   — read from the deployed code, not yet observed. `docs/RUNBOOK.md`, «Выкладка правок
+>   сопоставления», has the command that replaces the unit.
 >   The scrape service drop-in from Git (`zz-realtime-alerts.conf`) was not
 >   installed either; the aptekonline timer drop-in was.
 
@@ -265,16 +267,21 @@ checkout's code on the server. As of 2026-10-11, at least:
   `health-pharmonline-hotfix-deploy.yml` and
   `activate-pharmonline-public-api-autonomy.yml` (the last one also
   `migrations/`, `templates/` and `alembic.ini`).
-- Six workflows copy their checkout's `src/` into a temporary directory under
+- Four workflows copy their checkout's `src/` into a temporary directory under
   `/opt/pharmacy-monitor` and run it from there, leaving the live code as it
   was. One of them, `autonomous-pharmonline-decodo-public-api.yml`, runs on a
   weekly schedule from `main`, after checking that CI passed on that commit —
   so for that scrape a merge into `main` already is the release
-  (`docs/RUNBOOK.md`, «Выкладка правок сопоставления»). Another,
-  `recover-pharmonline-decodo-public-api.yml`, also runs `alembic upgrade head`
-  on the production database.
+  (`docs/RUNBOOK.md`, «Выкладка правок сопоставления»). None of the four
+  upgrades the production schema: `recover-pharmonline-decodo-public-api.yml`
+  reads the database revision (`alembic current`, `alembic heads`) and no
+  longer runs `alembic upgrade head`. `deploy.yml` is the only workflow that
+  runs it against the production database.
 
-This is not an account of all 22 workflows; read a workflow before starting it.
+The second item was re-counted later on 2026-10-11, after PR #49 removed nine
+workflows that day: it had said six workflows, and that the recover workflow
+upgraded the production database. This is not an account of all 13 workflows
+that remain; read a workflow before starting it.
 
 One secret is involved (GitHub repo settings → Secrets and variables →
 Actions):

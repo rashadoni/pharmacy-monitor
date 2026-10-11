@@ -368,7 +368,7 @@ Services (all systemd):
 - pharmacy-monitor-intraday.service     → intraday-tick
 - pharmacy-monitor-health.timer         → hourly
 - pharmacy-monitor-backup.timer         → daily 04:00 по времени хоста
-- pharmacy-monitor-rematch.timer        → Tuesday and Friday 04:30 по времени хоста; `rematch` без `--reset` (тот же этап, что конец сбора). Так в Git; на сервере — после замены юнита, см. RUNBOOK «Выкладка правок сопоставления». 2026-10-11 юнит на сервере ещё прежний (понедельник 05:00, `rematch --reset`). Сброса он не сделает: выложенный код на `--reset` без второго флага отвечает отказом (RUNBOOK, там же) — а значит, и планового `rematch` с сервера нет, пока юнит не заменён
+- pharmacy-monitor-rematch.timer        → Tuesday and Friday 04:30 по времени хоста; `rematch` без `--reset` (тот же этап, что конец сбора). Так в Git; на сервере — после замены юнита, см. RUNBOOK «Выкладка правок сопоставления». 2026-10-11 юнит на сервере ещё прежний (понедельник 05:00, `rematch --reset`). Последний его запуск был 2026-10-05, до выкладки отказа; код на сервере теперь на `--reset` без второго флага отвечает отказом (RUNBOOK, там же), так что со следующего запуска не должно быть ни сброса, ни планового `rematch`, пока юнит не заменён, — прочитано в коде, в журнале ещё не наблюдалось
 - pharmacy-monitor-digest@daily.timer   → daily 05:00 UTC; на сервере выключен
 - pharmacy-monitor-digest-weekly.timer  → понедельник 06:00 UTC; на сервере включён
 - prometheus, grafana-server            → активны (Grafana за Caddy, /grafana); Alertmanager не установлен
@@ -484,14 +484,15 @@ Persistent state:
 ## 6. Test coverage
 
 Числа — из журнала CI на `main`, а не из локального запуска. Они устаревают с
-каждым мержем: за час 2026-10-11 — 2400 passed на `f33cafd5`, 2663 на
-`3c09c5df`, 2816 на `6ee3878d`. Свежие — в журнале последнего прогона:
+каждым мержем: за час с небольшим 2026-10-11 — 2400 passed на `f33cafd5`, 2663
+на `3c09c5df`, 2816 на `6ee3878d`, 2886 на `9f072e9a`. Свежие — в журнале
+последнего прогона:
 `gh run list --workflow=ci-pipeline.yml --branch main`.
 
-Снимок 2026-10-11 — прогон `ci-pipeline.yml` на `main`, коммит `6ee3878d`
-(https://github.com/rashadoni/pharmacy-monitor/actions/runs/38174009247):
+Снимок 2026-10-11 — прогон `ci-pipeline.yml` на `main`, коммит `9f072e9a`
+(https://github.com/rashadoni/pharmacy-monitor/actions/runs/38174750694):
 
-- **Backend, джоба `Test (pytest)`:** `2816 passed, 4 skipped, 1 xfailed`,
+- **Backend, джоба `Test (pytest)`:** `2886 passed, 4 skipped, 1 xfailed`,
   упавших нет.
 - **Упавших тестов, которые «not blocking», не бывает.** `Test (pytest)` —
   обязательная проверка, PR с красной не мержится
@@ -503,7 +504,7 @@ Persistent state:
   том PR правились только тексты и комментарии); починено в тот же час, на
   `6ee3878d`.
 - **Сколько тестов в каком файле, журнал не говорит**: pytest идёт с `-q`, имён
-  файлов и тестов в его выводе нет. В `tests/` на этом коммите 89 файлов
+  файлов и тестов в его выводе нет. В `tests/` на этом коммите 90 файлов
   `test_*.py`.
 - **`1 xfailed`.** Пометка `xfail` в `tests/` одна —
   `test_pharmonline_snapshot_prices_parseable` в `test_scrapers_snapshot.py`:
