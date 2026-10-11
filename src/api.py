@@ -944,7 +944,10 @@ def _wants_html(request: Request) -> bool:
 LOGIN_LINK_SENT = "sent"
 LOGIN_LINK_NOT_SENT = "not_sent"
 LOGIN_LINK_NO_USER = "no_user"
-# Код отказа в ответе администратору; по нему страница «Пользователи» берёт фразу.
+# Отказ в ответе администратору: статус и код, по которым страница
+# «Пользователи» берёт фразу. Статус не 5xx: отказ почты — не сбой API, а ошибку
+# сервера Sentry забирает вместе с кадрами запроса, в которых лежит кука сессии.
+LOGIN_LINK_NOT_SENT_STATUS = 424
 LOGIN_LINK_NOT_SENT_CODE = "login_link_not_sent"
 
 
@@ -2072,7 +2075,7 @@ def dash_recipients_send_login_link(
     email тут нет.
 
     Ответ 200 — только о письме, которое отправитель подтвердил. Не подтвердил
-    (отказ почты, сеть, SMTP не настроен) — 502 с кодом `login_link_not_sent`:
+    (отказ почты, сеть, SMTP не настроен) — 424 с кодом `login_link_not_sent`:
     ошибкой это видит и вкладка, открытая до выкладки, и любой клиент, который
     читает один статус.
     """
@@ -2087,10 +2090,15 @@ def dash_recipients_send_login_link(
         raise HTTPException(404, "Recipient not found")
     if not r.is_active:
         raise HTTPException(400, "Пользователь деактивирован — сначала активируйте его")
-    if _deliver_login_link(db, r.email, invite=False) != LOGIN_LINK_SENT:
-        log.warning("recipient_login_link_not_sent", id=r.id, by_user_id=user.id)
+    outcome = _deliver_login_link(db, r.email, invite=False)
+    if outcome != LOGIN_LINK_SENT:
+        # `outcome=no_user` — письмо и не собиралось: пользователь не нашёлся по
+        # адресу в нижнем регистре или его отключили, пока шёл запрос.
+        log.warning(
+            "recipient_login_link_not_sent", id=r.id, by_user_id=user.id, outcome=outcome
+        )
         raise HTTPException(
-            502,
+            LOGIN_LINK_NOT_SENT_STATUS,
             detail={
                 "code": LOGIN_LINK_NOT_SENT_CODE,
                 "message": "The login-link email was not sent: the mail sender did not confirm it.",

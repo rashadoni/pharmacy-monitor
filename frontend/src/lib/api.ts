@@ -750,12 +750,13 @@ export interface Recipient {
 
 /**
  * «Отправить ссылку»: сервер дошёл до отправки, но отправитель письмо не
- * подтвердил — ответ 502 с этим кодом (`LOGIN_LINK_NOT_SENT_CODE` в src/api.py).
+ * подтвердил — ответ 424 с этим кодом (`LOGIN_LINK_NOT_SENT_STATUS` и
+ * `LOGIN_LINK_NOT_SENT_CODE` в src/api.py).
  */
 const LOGIN_LINK_NOT_SENT_CODE = "login_link_not_sent";
 
 export function isLoginLinkNotSentError(err: unknown): boolean {
-  if (!(err instanceof ApiError) || err.status !== 502) return false;
+  if (!(err instanceof ApiError) || err.status !== 424) return false;
   try {
     return JSON.parse(err.detail)?.detail?.code === LOGIN_LINK_NOT_SENT_CODE;
   } catch {
@@ -1265,7 +1266,7 @@ export const api = {
       method: "DELETE",
     }),
   recipientSendLoginLink: (id: number) =>
-    // 200 — только когда отправитель письмо подтвердил. Не подтвердил — 502,
+    // 200 — только когда отправитель письмо подтвердил. Не подтвердил — 424,
     // см. isLoginLinkNotSentError.
     request<{ ok: boolean; email: string }>(
       `/api/v1/dash/recipients/${id}/send-login-link`,

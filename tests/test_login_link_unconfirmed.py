@@ -6,13 +6,16 @@
 «Отправить ссылку» и приглашение при создании пользователя говорят оператору
 «отправлено». Им исход называет `api._deliver_login_link`.
 
-Каждое место вызывается напрямую с отправителем, который не отправил: ответил
-`False`, ответил `None` или бросил исключение, — и с настоящим `send_email` без
-SMTP и с отказом сервера. Помощники — из `test_unconfirmed_send_is_not_sent`.
+Каждое место — сама функция, кнопка, создание пользователя, `/auth/request` —
+вызывается с отправителем, который не отправил: подменённым (ответил `False`,
+ответил `None`, бросил исключение) и настоящим `send_email` (нет SMTP, сервер
+отверг адрес, SMTP настроен наполовину). Помощники — из
+`test_unconfirmed_send_is_not_sent`.
 """
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import re
@@ -42,6 +45,7 @@ ADMIN = "owner@client.example"
 NOBODY = "nobody@client.example"
 REPO = Path(api.__file__).resolve().parent.parent
 SAME_ANSWER = (200, {"sent": True, "detail": "If the email is registered, a magic-link was sent."})
+WELCOME = "Вам открыт доступ"  # есть только в письме-приглашении
 
 
 @pytest.fixture
@@ -90,13 +94,32 @@ def _failure_line(user_id: int, **error) -> dict:
     }
 
 
-def _server_that_refuses_the_recipient(monkeypatch):
-    """Настоящий `send_email` доходит до сервера, сервер отвергает адрес."""
+# Настоящий `send_email`, который письмо не отправил, и что строка сбоя несёт о
+# причине. Третий случай — не сетевая ошибка и не отказ сервера.
+REAL_SENDER = {
+    "no_smtp": {},
+    "server_refuses": {
+        "error_type": "SMTPRecipientsRefused",
+        "smtp_code": 550,
+        "smtp_status": "5.1.1",
+    },
+    "half_configured": {"error_type": "KeyError"},
+}
+
+
+def _real_sender_does_not_send(monkeypatch, mail: str) -> None:
+    if mail == "no_smtp":
+        return  # так стоит `desk`: отправитель ответит False
     monkeypatch.setenv("SMTP_HOST", "smtp.example.test")
-    monkeypatch.setenv("SMTP_USER", "resend")
     monkeypatch.setenv("SMTP_PASSWORD", "secret")
+    if mail == "half_configured":
+        monkeypatch.delenv("SMTP_USER", raising=False)
+        return
+    monkeypatch.setenv("SMTP_USER", "resend")
 
     class RefusingSMTP:
+        """Сервер на связи, но адрес получателя отвергает."""
+
         def __init__(self, *args, **kwargs):
             pass
 
@@ -117,13 +140,6 @@ def _server_that_refuses_the_recipient(monkeypatch):
             raise smtplib.SMTPRecipientsRefused({msg["To"]: (550, reply)})
 
     monkeypatch.setattr(smtplib, "SMTP", RefusingSMTP)
-
-
-REFUSED_BY_SERVER = {
-    "error_type": "SMTPRecipientsRefused",
-    "smtp_code": 550,
-    "smtp_status": "5.1.1",
-}
 
 
 # ─── 1. Исход отправки — `_deliver_login_link` ───────────────────────────────
@@ -167,24 +183,26 @@ def test_login_link_without_an_active_user_composes_no_letter(desk, monkeypatch,
     assert desk.journal.lines == []
 
 
-def test_login_link_by_the_real_sender_without_smtp_is_not_sent(desk):
-    """Запуск без `SMTP_HOST`: настоящий отправитель отвечает False и не падает."""
+@pytest.mark.parametrize("mail", REAL_SENDER)
+def test_login_link_the_real_sender_did_not_send_is_not_sent(desk, monkeypatch, mail):
+    """Без SMTP настоящий отправитель отвечает False, при отказе сервера и
+    недонастроенной почте — бросает; исход один."""
+    _real_sender_does_not_send(monkeypatch, mail)
+
     outcome = api._deliver_login_link(desk.db, ALICE)
 
     assert outcome == api.LOGIN_LINK_NOT_SENT
-    assert [line["event"] for line in desk.mail_journal.lines] == ["email_skipped_no_smtp"]
     # Кому не ушло, отправитель не знает — это пишет вызывающий.
-    assert desk.journal.lines == [_failure_line(desk.alice.id)]
-
-
-def test_login_link_refused_by_the_mail_server_is_not_sent(desk, monkeypatch):
-    """Рабочий сервер, опечатка в адресе: почта отвергает получателя."""
-    _server_that_refuses_the_recipient(monkeypatch)
-
-    outcome = api._deliver_login_link(desk.db, ALICE)
-
-    assert outcome == api.LOGIN_LINK_NOT_SENT
-    assert desk.journal.lines == [_failure_line(desk.alice.id, **REFUSED_BY_SERVER)]
+    assert desk.journal.lines == [_failure_line(desk.alice.id, **REAL_SENDER[mail])]
+    said_by_sender = [line["event"] for line in desk.mail_journal.lines]
+    assert (
+        said_by_sender
+        == {
+            "no_smtp": ["email_skipped_no_smtp"],
+            "server_refuses": ["smtp_send"],
+            "half_configured": [],
+        }[mail]
+    )
     _assert_no_person_or_text([desk.journal.lines, desk.mail_journal.lines])
 
 
@@ -208,7 +226,7 @@ def test_public_function_still_passes_the_invite_wording_through(desk):
         api._send_login_link(desk.db, ALICE, invite=True)
 
     plain, invite = (call.kwargs["html_body"] for call in send.call_args_list)
-    assert "Вам открыт доступ" in invite and "Вам открыт доступ" not in plain
+    assert WELCOME in invite and WELCOME not in plain
 
 
 def test_auth_request_answers_the_same_whatever_happened_to_the_letter(desk):
@@ -235,10 +253,50 @@ def test_auth_request_answers_the_same_whatever_happened_to_the_letter(desk):
     ]
 
 
+@pytest.mark.parametrize("mail", REAL_SENDER)
+def test_auth_request_answers_the_same_when_the_real_sender_did_not_send(desk, monkeypatch, mail):
+    _real_sender_does_not_send(monkeypatch, mail)
+
+    response = desk.client.post("/auth/request", json={"email": ALICE})
+
+    assert (response.status_code, response.json()) == SAME_ANSWER
+    assert desk.journal.lines == [_failure_line(desk.alice.id, **REAL_SENDER[mail])]
+
+
+def test_only_the_public_endpoint_calls_the_function_that_hides_delivery():
+    """`_send_login_link` отвечает «пользователь найден» — после неё нельзя
+    говорить «отправлено», и зовёт её один `/auth/request`.
+
+    `_deliver_login_link` отвечает строкой, а любая непустая строка истинна:
+    `if _deliver_login_link(...)` значило бы «отправлено всегда». Новый вызов
+    сравнивает исход с `LOGIN_LINK_SENT` явно — и вписывается сюда.
+    """
+    callers: dict[str, set[str]] = {"_send_login_link": set(), "_deliver_login_link": set()}
+    for path in sorted((REPO / "src").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for node in ast.walk(function):
+                name = getattr(node, "id", None) or getattr(node, "attr", None)
+                if name in callers:
+                    callers[name].add(f"{path.name}:{function.name}")
+
+    assert callers == {
+        "_send_login_link": {"api.py:auth_request"},
+        "_deliver_login_link": {
+            "api.py:_send_login_link",
+            "api.py:dash_recipients_create",
+            "api.py:dash_recipients_send_login_link",
+        },
+    }
+
+
 # ─── 3. Кнопка «Отправить ссылку» ────────────────────────────────────────────
 
 
 def _press_send_link(desk, user_id: int, **sender):
+    """Без `sender` работает настоящий `send_email`."""
     desk.journal.lines.clear()
     with contextlib.ExitStack() as stack:
         send = stack.enter_context(patch("src.notifier.send_email", **sender)) if sender else None
@@ -246,26 +304,38 @@ def _press_send_link(desk, user_id: int, **sender):
     return response, send
 
 
+def _button_refusal_line(desk, user_id: int, outcome: str) -> dict:
+    return {
+        "event": "recipient_login_link_not_sent",
+        "log_level": "warning",
+        "id": user_id,
+        "by_user_id": desk.admin.id,
+        "outcome": outcome,
+    }
+
+
+def _assert_the_button_refused(response) -> None:
+    # Ошибка запроса: «не отправлено» видит и клиент, который читает один статус.
+    # Не 5xx: отказ почты — не сбой API, Sentry его не забирает.
+    assert response.status_code == api.LOGIN_LINK_NOT_SENT_STATUS == 424, response.text
+    answer = response.json()
+    assert set(answer) == {"detail"}
+    assert set(answer["detail"]) == {"code", "message"}
+    assert answer["detail"]["code"] == api.LOGIN_LINK_NOT_SENT_CODE == "login_link_not_sent"
+    _assert_no_person_or_text(answer)
+
+
 @pytest.mark.parametrize("how", REFUSALS)
 def test_send_link_button_does_not_answer_sent_when_the_letter_did_not_go(desk, how):
     response, send = _press_send_link(desk, desk.alice.id, **_refusing(how))
 
-    # Ошибка запроса: «не отправлено» видит и клиент, который читает один статус.
-    assert response.status_code == 502, response.text
-    answer = response.json()
-    assert answer["detail"]["code"] == api.LOGIN_LINK_NOT_SENT_CODE == "login_link_not_sent"
-    assert set(answer) == {"detail"} and "ok" not in answer["detail"]
+    _assert_the_button_refused(response)
     assert send.call_count == 1
     assert desk.journal.lines == [
         _failure_line(desk.alice.id, **_error_fields(how)),
-        {
-            "event": "recipient_login_link_not_sent",
-            "log_level": "warning",
-            "id": desk.alice.id,
-            "by_user_id": desk.admin.id,
-        },
+        _button_refusal_line(desk, desk.alice.id, "not_sent"),
     ]
-    _assert_no_person_or_text([answer, desk.journal.lines])
+    _assert_no_person_or_text(desk.journal.lines)
 
 
 def test_send_link_button_answers_ok_when_the_sender_confirmed(desk):
@@ -275,6 +345,7 @@ def test_send_link_button_answers_ok_when_the_sender_confirmed(desk):
     assert response.json() == {"ok": True, "email": ALICE}
     assert send.call_count == 1
     assert send.call_args.kwargs["to"] == [ALICE]
+    assert WELCOME not in send.call_args.kwargs["html_body"]  # ссылка, а не приглашение
     assert desk.journal.lines == [
         {
             "event": "recipient_login_link_sent",
@@ -285,30 +356,40 @@ def test_send_link_button_answers_ok_when_the_sender_confirmed(desk):
     ]
 
 
-@pytest.mark.parametrize("mail", ["no_smtp", "server_refuses"])
-def test_send_link_button_with_the_real_sender_that_did_not_send(desk, monkeypatch, mail):
-    if mail == "server_refuses":
-        _server_that_refuses_the_recipient(monkeypatch)
-    error = REFUSED_BY_SERVER if mail == "server_refuses" else {}
+@pytest.mark.parametrize("mail", REAL_SENDER)
+def test_send_link_button_when_the_real_sender_did_not_send(desk, monkeypatch, mail):
+    _real_sender_does_not_send(monkeypatch, mail)
 
     response, _ = _press_send_link(desk, desk.alice.id)
 
-    assert response.status_code == 502, response.text
-    assert response.json()["detail"]["code"] == "login_link_not_sent"
-    assert [line["event"] for line in desk.journal.lines] == [
-        "login_link_email_failed",
-        "recipient_login_link_not_sent",
+    _assert_the_button_refused(response)
+    assert desk.journal.lines == [
+        _failure_line(desk.alice.id, **REAL_SENDER[mail]),
+        _button_refusal_line(desk, desk.alice.id, "not_sent"),
     ]
-    assert desk.journal.lines[0] == _failure_line(desk.alice.id, **error)
-    _assert_no_person_or_text([response.json(), desk.journal.lines])
+    _assert_no_person_or_text(desk.journal.lines)
+
+
+def test_send_link_button_for_a_user_the_lookup_does_not_find(desk):
+    """Адрес записан в базе не в нижнем регистре (заведён мимо приложения):
+    письмо и не собиралось — это не «отправлено», и в журнале видно почему."""
+    carol = _user(desk.db, "Carol@Client.example", role="viewer")
+
+    response, send = _press_send_link(desk, carol.id, return_value=True)
+
+    _assert_the_button_refused(response)
+    assert not send.called
+    assert desk.journal.lines == [_button_refusal_line(desk, carol.id, "no_user")]
 
 
 # ─── 4. Приглашение при создании пользователя ────────────────────────────────
 
 
 def _add_user(desk, **sender):
+    """Без `sender` работает настоящий `send_email`."""
     desk.journal.lines.clear()
-    with patch("src.notifier.send_email", **sender) as send:
+    with contextlib.ExitStack() as stack:
+        send = stack.enter_context(patch("src.notifier.send_email", **sender)) if sender else None
         response = desk.client.post(
             "/api/v1/dash/recipients", json={"email": BOB, "name": "Bob", "role": "viewer"}
         )
@@ -319,6 +400,16 @@ def _add_user(desk, **sender):
     return response.json(), created, send
 
 
+def _created_line(desk, user_id: int, *, invite_sent: bool) -> dict:
+    return {
+        "event": "recipient_created",
+        "log_level": "info",
+        "id": user_id,
+        "by_user_id": desk.admin.id,
+        "invite_sent": invite_sent,
+    }
+
+
 @pytest.mark.parametrize("how", REFUSALS)
 def test_new_user_is_created_but_the_invite_is_not_called_sent(desk, how):
     answer, created, send = _add_user(desk, **_refusing(how))
@@ -327,13 +418,23 @@ def test_new_user_is_created_but_the_invite_is_not_called_sent(desk, how):
     assert send.call_count == 1
     assert desk.journal.lines == [
         _failure_line(created.id, **_error_fields(how)),
-        {
-            "event": "recipient_created",
-            "log_level": "info",
-            "id": created.id,
-            "by_user_id": desk.admin.id,
-            "invite_sent": False,
-        },
+        _created_line(desk, created.id, invite_sent=False),
+    ]
+    _assert_no_person_or_text(desk.journal.lines)
+
+
+@pytest.mark.parametrize("mail", REAL_SENDER)
+def test_new_user_invite_is_not_called_sent_when_the_real_sender_did_not_send(
+    desk, monkeypatch, mail
+):
+    _real_sender_does_not_send(monkeypatch, mail)
+
+    answer, created, _ = _add_user(desk)
+
+    assert answer["invite_sent"] is False
+    assert desk.journal.lines == [
+        _failure_line(created.id, **REAL_SENDER[mail]),
+        _created_line(desk, created.id, invite_sent=False),
     ]
     _assert_no_person_or_text(desk.journal.lines)
 
@@ -344,16 +445,8 @@ def test_new_user_invite_is_called_sent_when_the_sender_confirmed(desk):
     assert answer["invite_sent"] is True
     assert send.call_count == 1
     assert send.call_args.kwargs["to"] == [BOB]
-    assert "Вам открыт доступ" in send.call_args.kwargs["html_body"]  # письмо-приглашение
-    assert desk.journal.lines == [
-        {
-            "event": "recipient_created",
-            "log_level": "info",
-            "id": created.id,
-            "by_user_id": desk.admin.id,
-            "invite_sent": True,
-        }
-    ]
+    assert WELCOME in send.call_args.kwargs["html_body"]  # письмо-приглашение
+    assert desk.journal.lines == [_created_line(desk, created.id, invite_sent=True)]
     # Исход приглашения — свойство ответа на создание, а не пользователя.
     listed = desk.client.get("/api/v1/dash/recipients").json()
     assert {row["email"] for row in listed} == {ADMIN, ALICE, BOB}
@@ -361,33 +454,74 @@ def test_new_user_invite_is_called_sent_when_the_sender_confirmed(desk):
 
 
 # ─── 5. Что видит оператор ───────────────────────────────────────────────────
+#
+# Тестов фронта в CI нет: страница сверяется по тексту исходника — без строк
+# комментариев, переносов и отступов. Это ловит правку, после которой
+# «отправлена» покажется без подтверждения, но не заменяет взгляд на экран.
 
 
 def _squeezed(path: Path) -> str:
-    """Исходник одной строкой: проверка не зависит от переносов и отступов."""
-    return re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+    code = re.sub(r"(?m)^\s*//.*$", "", path.read_text(encoding="utf-8"))
+    return re.sub(r"\s+", " ", code)
+
+
+def test_dashboard_client_recognises_the_refusal_the_server_sends():
+    client = _squeezed(REPO / "frontend" / "src" / "lib" / "api.ts")
+
+    assert f'const LOGIN_LINK_NOT_SENT_CODE = "{api.LOGIN_LINK_NOT_SENT_CODE}";' in client
+    # Отказ почты — только этот статус с этим кодом; ответ без кода им не считается.
+    assert (
+        "export function isLoginLinkNotSentError(err: unknown): boolean { "
+        f"if (!(err instanceof ApiError) || err.status !== {api.LOGIN_LINK_NOT_SENT_STATUS}) "
+        "return false; "
+        "try { return JSON.parse(err.detail)?.detail?.code === LOGIN_LINK_NOT_SENT_CODE; } "
+        "catch { return false; } }"
+    ) in client
+    # Ошибка запроса доходит до страницы как ошибка, а не как ответ.
+    assert (
+        "recipientSendLoginLink: (id: number) => "
+        "request<{ ok: boolean; email: string }>( "
+        "`/api/v1/dash/recipients/${id}/send-login-link`, "
+        '{ method: "POST" }, ),'
+    ) in client
+    assert 'request<RecipientCreated>("/api/v1/dash/recipients", {' in client
+    assert (
+        "export interface RecipientCreated extends Recipient { invite_sent?: boolean; }" in client
+    )
 
 
 def test_users_page_reads_the_outcome_before_saying_sent():
-    frontend = REPO / "frontend"
     page = _squeezed(
-        frontend / "src" / "app" / "[locale]" / "(dashboard)" / "settings" / "users" / "page.tsx"
+        REPO
+        / "frontend"
+        / "src"
+        / "app"
+        / "[locale]"
+        / "(dashboard)"
+        / "settings"
+        / "users"
+        / "page.tsx"
     )
-    client = _squeezed(frontend / "src" / "lib" / "api.ts")
 
-    # Клиент узнаёт отказ почты по статусу и коду, которые ставит сервер.
-    assert f'const LOGIN_LINK_NOT_SENT_CODE = "{api.LOGIN_LINK_NOT_SENT_CODE}";' in client
-    assert "if (!(err instanceof ApiError) || err.status !== 502) return false;" in client
-    assert "JSON.parse(err.detail)?.detail?.code === LOGIN_LINK_NOT_SENT_CODE" in client
-    assert "invite_sent?: boolean;" in client
-    # «Отправить ссылку»: успех — только ответ 200; отказ почты — своя фраза.
-    assert 'sendLinkMut.isSuccess && ( <span className="text-[11px] text-success">' in page
+    # «Отправить ссылку»: «отправлена» сказано в одном месте и только на ответ 200.
+    assert "mutationFn: () => api.recipientSendLoginLink(u.id), });" in page
+    assert page.count('t("login_link_sent")') == 1
     assert (
+        "{sendLinkMut.isSuccess && ( "
+        '<span className="text-[11px] text-success">{t("login_link_sent")}</span> )}'
+    ) in page
+    # Ошибка — красным; отказ почты — своей фразой.
+    assert (
+        "{sendLinkMut.isError && ( "
+        '<span className="text-[11px] text-destructive"> '
         "{isLoginLinkNotSentError(sendLinkMut.error) "
-        '? t("login_link_not_sent") : t("login_link_error")}'
+        '? t("login_link_not_sent") : t("login_link_error")} </span> )}'
     ) in page
     # Создание: «ссылка отправлена» — только когда сервер ответил invite_sent: true.
-    assert "inviteSent={createMut.data?.invite_sent}" in page
+    assert (
+        "doneEmail={createMut.isSuccess ? createMut.data?.email : null} "
+        "inviteSent={createMut.data?.invite_sent} />"
+    ) in page
     for shown_when, (phrase, colour) in {
         "inviteSent === true": ("added", "text-success"),
         "inviteSent === false": ("added_invite_not_sent", "text-destructive"),
@@ -399,7 +533,7 @@ def test_users_page_reads_the_outcome_before_saying_sent():
             page,
         )
         assert said == [(shown_when, colour)], (phrase, said)
-    assert page.count('t("added"') == 1
+        assert page.count(f't("{phrase}"') == 1, phrase
 
 
 def test_users_page_has_every_phrase_in_every_language():
@@ -409,12 +543,14 @@ def test_users_page_has_every_phrase_in_every_language():
         )["users"]
         for phrase in ("added", "added_invite_not_sent", "added_invite_unknown"):
             assert re.findall(r"\{(\w+)\}", copy[phrase]) == ["email"], (locale, phrase)
+            # Апостроф рядом со скобкой превращает подстановку в буквальный текст.
+            assert "'{" not in copy[phrase] and "}'" not in copy[phrase], (locale, phrase)
         assert "{" not in copy["login_link_not_sent"], locale
         # Оператору сказано, какой кнопкой отправить ссылку заново, — её же словами.
         assert f"«{copy['send_login_link']}»" in copy["added_invite_not_sent"].replace(
             "“", "«"
         ).replace("”", "»"), locale
-        # Четыре исхода — четыре разные фразы; успех от неудачи отличается не галочкой.
+        # У каждого исхода своя фраза; успех от неудачи отличается не одной галочкой.
         said = [
             copy[key]
             for key in ("login_link_sent", "login_link_not_sent", "login_link_error", "added")
