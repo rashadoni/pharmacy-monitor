@@ -27,7 +27,8 @@ Final pre-flight checklist + DNS cutover + 72h on-call.
   - p95 < 500ms ✓
   - error rate < 1% ✓
   - 100 concurrent VUs sustained ✓
-- [ ] Run full E2E test suite from CI (`gh run list --workflow=ci.yml`)
+- [ ] CI green on `main` (`gh run list --workflow=ci-pipeline.yml --branch main`)
+- [ ] Run the Playwright E2E suite by hand — CI does not run it (`frontend/e2e/README.md`)
 - [ ] All cron / systemd timers ran successfully:
   ```bash
   journalctl -u pharmacy-monitor-scrape@pharmonline --since "24 hours ago" | grep run_ok
