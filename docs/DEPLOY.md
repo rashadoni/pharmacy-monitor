@@ -11,8 +11,10 @@
 > - **Marked outdated, old text left in place under the mark:** Prerequisites
 >   and Phase 1, Phase 3, Phase 7, "Rollback", "Monitoring URLs", "Cost
 >   breakdown". Each mark says what was found.
-> - **Corrected in place:** the list of what `initial_server_setup.sh` installs
+> - **Corrected in place:** the list of what `initial_server_setup.sh` does
 >   (Phase 2) and the comment on `install_systemd_schedule.sh` (Phase 6).
+> - **Noted, not rewritten:** Phase 6 — a note under its command block names
+>   what the commands leave out; the block itself was not otherwise re-checked.
 > - **Not re-checked:** Phase 4 (beyond the owner and mode of the env file on
 >   the server, which match), Phase 5, "Health checks", and in Phase 6 the
 >   sentence about the watchlist and the paragraph about Firecrawl.
@@ -64,11 +66,17 @@ What this does (compared with the script 2026-10-11):
   3.11, as this line used to say — on Ubuntu 24.04 that is 3.12; the venv on
   the server runs Python 3.12.3), Node.js and pnpm
 - Creates `pm` system user + directory layout (`/opt/pharmacy-monitor`)
+- Creates the Postgres role `pm` and the database `pharmacy_monitor`. The
+  role's password is generated inside the script and never printed, so the
+  `STRONG_PASS_FROM_SETUP` that Phase 4 asks for has to be set by hand
+  afterwards
 - Configures ufw firewall (22, 80, 443 only)
 - Enables fail2ban, unattended-upgrades
 
 The steps the script prints at the end repeat Phase 3 (`git clone`,
-`python3.11 -m venv`, `uv sync`) and are outdated in the same way.
+`python3.11 -m venv`, `uv sync`) and are outdated in the same way; its step 1
+names `/home/pm/.ssh/authorized_keys`, while the script itself gives `pm` the
+home `/opt/pharmacy-monitor`.
 
 ## Phase 3 — Deploy code
 
@@ -147,8 +155,9 @@ systemctl daemon-reload
 # This is required after a release that changes infra/systemd: the final
 # ``zz-*`` overrides reset the schedule and ExecStart of older drop-ins instead
 # of relying on undocumented files in /etc. (Until 2026-10-11 this comment
-# said "daily cadence" and "neutralizes old weekly drop-ins"; the full scan is
-# weekly now, and the aptekonline drop-in is itself weekly.)
+# said "the versioned daily cadence" and "it neutralizes old weekly /
+# --no-alerts drop-ins"; the full scan is weekly now, and the aptekonline
+# drop-in is itself weekly.)
 /opt/pharmacy-monitor/infra/scripts/install_systemd_schedule.sh
 
 # Enable remaining services.
@@ -164,11 +173,20 @@ systemctl enable --now pharmacy-monitor-backup.timer
 >   `/etc/systemd/system/`. On a machine built by this phase nothing serves the
 >   dashboard, and `deploy.yml` checks that unit in its preflight, so it would
 >   stop there (read from the workflow, not tried).
+> - Three timers that are enabled on the server are enabled neither by the
+>   commands above nor by `install_systemd_schedule.sh`:
+>   `pharmacy-monitor-intraday.timer`, `pharmacy-monitor-digest-weekly.timer`
+>   and `pharmacy-monitor-scrape-watcher.timer`. Beyond this and the frontend,
+>   the command block above was not re-checked.
 > - `deploy.yml` copies `infra/systemd/` to `/opt/pharmacy-monitor`, not to
 >   `/etc/systemd/system/`: installing a changed unit is still a separate step
->   for root. On 2026-10-11 the server's `pharmacy-monitor-rematch` units were
->   still the old ones (`rematch --reset`, Monday 05:00), not the ones in Git —
->   `docs/RUNBOOK.md`, «Выкладка правок сопоставления», has the command.
+>   for root, and on 2026-10-11 it had not been taken. The server's
+>   `pharmacy-monitor-rematch` units were the old ones (`rematch --reset`,
+>   Monday 05:00) — the deployed code refuses that command, so no pairs are
+>   reset, but no scheduled `rematch` runs either; `docs/RUNBOOK.md`,
+>   «Выкладка правок сопоставления», has the command that replaces the unit.
+>   The scrape service drop-in from Git (`zz-realtime-alerts.conf`) was not
+>   installed either; the aptekonline timer drop-in was.
 
 Rewritten 2026-10-11 from `src/cadence.py`, the units in `infra/systemd/` and
 the timers on the server; this paragraph used to say "daily full scans run at
@@ -180,7 +198,7 @@ not UTC. On a night when the site has already been collected this week, `run`
 exits without scraping; a failed scan is therefore retried the next night for
 Aloe and Pharmonline, and a week later for Aptekonline. Pharmonline has a second
 path, a GitHub Actions workflow on Mondays. `src/cadence.py` is the single
-source for the rhythm; `CLAUDE.md`, «Расписание сбора», explains it.
+source for the rhythm; the block «РАСПИСАНИЕ СБОРА» in `CLAUDE.md` explains it.
 
 The scheduled scans evaluate real-time alert rules but deliberately do not
 send the bulky HTML/Excel scrape report. The priority watchlist is a separate
@@ -363,10 +381,11 @@ gunzip -c /var/backups/pharmacy-monitor/pharmacy-monitor-<timestamp>.sql.gz | \
 > «Копия бэкапа вне сервера»). The repository records no price for the Contabo
 > VPS. "Add ~€50/mo if proxy plan needed" is no longer an "if": by the comment
 > in `src/cadence.py` (2026-10-04) Aptekonline can only be collected through a
-> paid exit, about $49 a month for a weekly scan against $149 for a daily one —
-> the only current cost figure in the repository. The Telegram bot is not set
-> up (`TELEGRAM_BOT_TOKEN` is empty on the server). The Resend, Sentry and
-> domain rows were not re-checked.
+> paid exit, about $49 a month for a weekly scan against $149 for a daily one.
+> Other proxy prices are scattered through the repository (`.env.example`,
+> `CLAUDE.md`); which of them are still paid was not established. The Telegram
+> bot is not set up (`TELEGRAM_BOT_TOKEN` is empty on the server). The Resend,
+> Sentry and domain rows were not re-checked.
 
 | Service | Cost |
 |---|---|

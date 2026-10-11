@@ -94,15 +94,17 @@ Comprehensive overview за после Phase 6.1 (URL-based i18n) и устан�
        └──────────────────────┘
 ```
 
-> ⚠️ Схема — состояние на май 2026 (помечено 2026-10-11). В этот день в ней
-> поправлены две подписи. Сервер: было «Hetzner cx33 prod (DE)» — тот сервер
-> удалён, прод с 2026-09-03 на Contabo. Почта: было «SMTP (Resend) ✗ not
-> configured» — SMTP настроен, выключено только письмо с отчётом о сборе
-> (`SCRAPE_REPORT_EMAIL=0` в env сервера и в drop-in юнита сбора). Пути и часы
-> сбора на схеме не перепроверялись и с действующими расходятся: полный сбор у
-> всех трёх сайтов недельный, intraday обслуживает только aloe
-> (`intraday.INTRADAY_SITES`), таймер aloe стоит на 01:00, а не на 03:00.
-> Действующее расписание — `CLAUDE.md`, «Расписание сбора», и `src/cadence.py`.
+> ⚠️ Схема нарисована в мае 2026 и правилась 2026-07-03 (помечено 2026-10-11).
+> В этот день в ней поправлены две подписи. Сервер: было «Hetzner cx33 prod
+> (DE)» — тот сервер удалён, прод с 2026-09-03 на Contabo. Почта: было «SMTP
+> (Resend) ✗ not configured» — SMTP настроен, а письмо с отчётом о сборе, о
+> котором этот блок схемы, выключено: `SCRAPE_REPORT_EMAIL=0` в env сервера
+> (drop-in юнита сбора с тем же значением лежит в Git, на сервер он не
+> установлен). Пути и часы сбора на схеме не перепроверялись и с действующими
+> расходятся: полный сбор у всех трёх сайтов недельный, intraday обслуживает
+> только aloe (`intraday.INTRADAY_SITES`), таймер aloe стоит на 01:00, а не на
+> 03:00. Действующее расписание — `src/cadence.py` и блок «РАСПИСАНИЕ СБОРА» в
+> `CLAUDE.md`.
 
 ---
 
@@ -251,8 +253,9 @@ State management: React Query (TanStack). Cache invalidation после mutation
 
 ### Nightly scrape pipeline (01:00-04:00 UTC)
 
-> ⚠️ Блок ниже — состояние на май 2026 (помечено 2026-10-11). Сверено с
-> `src/cadence.py`, юнитами в `infra/systemd/` и таймерами на сервере:
+> ⚠️ Блок ниже написан в мае 2026 и правился 2026-07-03 (помечено
+> 2026-10-11). Сверено с `src/cadence.py`, юнитами в `infra/systemd/` и
+> таймерами на сервере; что в нём не так:
 >
 > - Полный сбор не суточный. Каталог каждого сайта собирается раз в неделю, в
 >   ночь на понедельник. Таймеры aloe и pharmonline срабатывают каждую ночь в
@@ -264,11 +267,12 @@ State management: React Query (TanStack). Cache invalidation после mutation
 > - Юнит зовёт `pharmacy-monitor run --site %i`, без `--mode category`.
 > - Сбор pharmonline по таймеру идёт через публичный API, а не через DDP и
 >   IPRoyal; второй его путь — workflow в GitHub Actions по понедельникам
->   (`CLAUDE.md`, «Расписание сбора»).
+>   (блок «РАСПИСАНИЕ СБОРА» в `CLAUDE.md`).
 > - Письмо с отчётом, последняя строка блока pharmonline, выключено:
 >   `SCRAPE_REPORT_EMAIL=0`.
-> - Числа в блоке (25k товаров, 272k обращений, 5–15k записей о цене) не
->   перепроверялись.
+> - Не перепроверялись: числа в блоке (25k товаров, 272k обращений, 5–15k
+>   записей о цене) и то, каким выходом aptekonline собирается сейчас («via
+>   Decodo AZ residential proxy»).
 
 ```
 01:00 UTC ─ pharmacy-monitor-scrape@pharmonline.timer fires
@@ -364,10 +368,10 @@ Services (all systemd):
 - pharmacy-monitor-intraday.service     → intraday-tick
 - pharmacy-monitor-health.timer         → hourly
 - pharmacy-monitor-backup.timer         → daily 04:00 по времени хоста
-- pharmacy-monitor-rematch.timer        → Tuesday and Friday 04:30 по времени хоста; `rematch` без `--reset` (тот же этап, что конец сбора). Так в Git; на сервере — после замены юнита, см. RUNBOOK «Выкладка правок сопоставления». 2026-10-11 юнит на сервере ещё прежний: понедельник 05:00, `rematch --reset`
+- pharmacy-monitor-rematch.timer        → Tuesday and Friday 04:30 по времени хоста; `rematch` без `--reset` (тот же этап, что конец сбора). Так в Git; на сервере — после замены юнита, см. RUNBOOK «Выкладка правок сопоставления». 2026-10-11 юнит на сервере ещё прежний (понедельник 05:00, `rematch --reset`). Сброса он не сделает: выложенный код на `--reset` без второго флага отвечает отказом (RUNBOOK, там же) — а значит, и планового `rematch` с сервера нет, пока юнит не заменён
 - pharmacy-monitor-digest@daily.timer   → daily 05:00 UTC; на сервере выключен
 - pharmacy-monitor-digest-weekly.timer  → понедельник 06:00 UTC; на сервере включён
-- prometheus, grafana-server            → активны (Grafana за Caddy, /grafana); Alertmanager не запущен
+- prometheus, grafana-server            → активны (Grafana за Caddy, /grafana); Alertmanager не установлен
 
 Network:
 - Caddy :80/:443 (auto-HTTPS via Let's Encrypt, HSTS preload)
@@ -468,38 +472,38 @@ Persistent state:
   пуст, `pharmacy-monitor-telegram-bot.service` выключен. Раньше здесь стояло
   «Sentry / Telegram / SMTP не configured — alerts только в DB»: по записи в
   `CLAUDE.md`, SMTP и Sentry работают с 2026-05-29.
-- **Prometheus и Grafana работают, Alertmanager — нет.** `prometheus` и
-  `grafana-server` активны, в `/etc/prometheus/alerts.yml` семь правил, блок
-  `alertmanagers` в конфиге закомментирован: правила видны в Prometheus, но
-  уведомлений по ним не уходит. Каталога `/var/lib/grafana/dashboards/`, куда
-  RUNBOOK («Observability») кладёт дашборд, на сервере нет; есть ли дашборд в
-  самой Grafana, не проверялось.
+- **Prometheus и Grafana работают, Alertmanager не установлен.** `prometheus`
+  и `grafana-server` активны, в `/etc/prometheus/alerts.yml` семь правил.
+  Юнита и файлов Alertmanager на сервере нет, блок `alertmanagers` в конфиге
+  Prometheus закомментирован: уведомлений по правилам не уходит. Каталога
+  `/var/lib/grafana/dashboards/`, куда RUNBOOK («Observability») кладёт
+  дашборд, на сервере нет; есть ли дашборд в самой Grafana, не проверялось.
 
 ---
 
 ## 6. Test coverage
 
 Числа — из журнала CI на `main`, а не из локального запуска. Они устаревают с
-каждым мержем: за полчаса 2026-10-11 — 2400 passed на `f33cafd5`, 2663 на
-`3c09c5df`, 2815 на `4cf0bfb7`. Свежие — в журнале последнего прогона:
+каждым мержем: за час 2026-10-11 — 2400 passed на `f33cafd5`, 2663 на
+`3c09c5df`, 2816 на `6ee3878d`. Свежие — в журнале последнего прогона:
 `gh run list --workflow=ci-pipeline.yml --branch main`.
 
-Снимок 2026-10-11 — последний зелёный на тот час прогон `ci-pipeline.yml` на
-`main`, коммит `3c09c5df`
-(https://github.com/rashadoni/pharmacy-monitor/actions/runs/38172255721):
+Снимок 2026-10-11 — прогон `ci-pipeline.yml` на `main`, коммит `6ee3878d`
+(https://github.com/rashadoni/pharmacy-monitor/actions/runs/38174009247):
 
-- **Backend, джоба `Test (pytest)`:** `2663 passed, 4 skipped, 1 xfailed`,
+- **Backend, джоба `Test (pytest)`:** `2816 passed, 4 skipped, 1 xfailed`,
   упавших нет.
 - **Упавших тестов, которые «not blocking», не бывает.** `Test (pytest)` —
   обязательная проверка, PR с красной не мержится
   (`DELIVERY-ARCHITECTURE.md`, слой 1). Сам `main` покраснеть при этом может:
   защита ветки не требует свежей базы, и два PR, зелёных порознь, вместе роняют
-  тест. Так было в тот же день: на следующем коммите, `4cf0bfb7` (мерж #84),
-  упал один тест, пришедший с #86, — `1 failed, 2815 passed`. С этой минуты
-  `Test (pytest)` красная у каждого PR, собранного поверх такого `main`, в том
-  числе у PR с одной документацией (#89).
+  тест. Так было в тот же день: на `4cf0bfb7` (мерж #84) упал один тест,
+  пришедший с #86, — `1 failed, 2815 passed`. Пока `main` был красным, красной
+  была и `Test (pytest)` у PR, собранного поверх него (прогон 38172561038: в
+  том PR правились только тексты и комментарии); починено в тот же час, на
+  `6ee3878d`.
 - **Сколько тестов в каком файле, журнал не говорит**: pytest идёт с `-q`, имён
-  файлов и тестов в его выводе нет. В `tests/` на этом коммите 88 файлов
+  файлов и тестов в его выводе нет. В `tests/` на этом коммите 89 файлов
   `test_*.py`.
 - **`1 xfailed`.** Пометка `xfail` в `tests/` одна —
   `test_pharmonline_snapshot_prices_parseable` в `test_scrapers_snapshot.py`:
@@ -545,9 +549,9 @@ E2E: в `frontend/e2e/` лежит восемь файлов сценариев 
 
 - Phase 5.4: Prometheus alerting — Prometheus стоит и работает (по `CLAUDE.md`,
   впервые поставлен 2026-05-29, ещё на прежнем сервере), семь правил лежат в
-  `infra/prometheus-alerts.yml` и на сервере. Не сделано одно: Alertmanager не
-  запущен, уведомлений по правилам нет. Раньше: «needs Prometheus install +
-  alert channel (Telegram/SMTP)» — SMTP с тех пор настроен, Telegram нет.
+  `infra/prometheus-alerts.yml` и на сервере. Не сделана доставка: Alertmanager
+  не установлен, уведомлений по правилам нет. Раньше: «needs Prometheus install
+  + alert channel (Telegram/SMTP)» — SMTP с тех пор настроен, Telegram нет.
 - Phase 5.3: Grafana dashboards — установка больше не мешает: `grafana-server`
   на сервере активен (впервые поставлен тогда же, 2026-05-29). Загружен ли
   дашборд (`infra/grafana/dashboard.json`) на нынешнем сервере, не проверялось

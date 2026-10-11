@@ -177,7 +177,7 @@ load-test/api.k6.js + README   k6 scenarios + thresholds            W12
 | Errors | Sentry SDK | 2+ |
 | Metrics | prometheus-client | 0.21+ |
 | CI/CD | GitHub Actions → SSH deploy | — |
-| Hosting | Contabo VPS — 4 vCPU, 8 GB RAM, 96 GB disk, Ubuntu 24.04 (since 2026-09-03; read from the server 2026-10-11). v1.0 ran on a Hetzner Cloud VM (this row said "Hetzner CX22, ~6€/mo"); that server was deleted in September 2026. The Contabo price is not recorded in the repository | — |
+| Hosting | Contabo VPS — 4 vCPU, 8 GB RAM, 96 GB disk, Ubuntu 24.04 (since 2026-09-03; read from the server 2026-10-11). v1.0 ran on a Hetzner Cloud VM (this row said "Hetzner CX22 (4 vCPU, 8GB, ~6€/mo)"); that server was deleted in September 2026. The Contabo price is not recorded in the repository | — |
 | TLS / Proxy | Caddy | 2 |
 | Process | systemd | — |
 

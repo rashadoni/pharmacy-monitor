@@ -149,7 +149,7 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 ⚠️ Источник истины по паролю — `tenant_users.password_hash` (bcrypt), а НЕ env: `auth_login` берёт `user.password_hash or env ADMIN_PASSWORD_HASH`, поэтому `ADMIN_PASSWORD_HASH` — только bootstrap-фолбэк и с момента первой смены пароля не действует (и фолбэк этот есть только на ветке входа по логину `admin`, не по email). При жалобе «не пускает в панель» смотреть БД, а не env и не эту документацию. Прежний пароль мёртв с 2026-08-23.
 **Server**: Contabo VPS `13.140.186.143` (`vmi3552946.contaboserver.net`), 4 vCPU / 8GB / 96GB, Ubuntu 24.04 — с переезда 2026-09-03.
 ⚠️ Прежний Hetzner cx33 `46.225.149.52` **удалён** (владелец ушёл с Hetzner в сентябре 2026). По SSH туда не ходить и запасным продом не считать: освобождённый облачный адрес могут выдать чужой машине. Всё ниже по файлу, где упомянуты Hetzner или этот адрес, — история, а не инструкция.
-**SSH**: `ssh root@13.140.186.143` — с dev-бокса, ключом по умолчанию; CI ходит как `pm@` ключом из секрета репозитория `SSH_PRIVATE_KEY`. Host key сервера прошит в `infra/prod_known_hosts` и в каждом workflow; брать ключ у сети (`ssh-keyscan`, `StrictHostKeyChecking=accept-new`) нельзя — `tests/test_prod_host_pinning.py` ловит возврат этих приёмов и старого адреса в `.github/`, `infra/`, `scripts/`. С машины, которая сервер ещё не знает, сначала добавить прошитый ключ: `grep -v '^#' infra/prod_known_hosts >> ~/.ssh/known_hosts`. (root + pm users active; pm home is `/opt/pharmacy-monitor`, NOT `/home/pm`; `pm` does not have passwordless sudo — use root for systemctl/sudo ops)
+**SSH**: `ssh root@13.140.186.143` — с dev-бокса, ключом по умолчанию; CI ходит как `pm@` ключом из секрета репозитория `SSH_PRIVATE_KEY`. Host key сервера прошит в `infra/prod_known_hosts` и в каждом workflow; брать ключ у сети (`ssh-keyscan`, `StrictHostKeyChecking=accept-new`) нельзя — `tests/test_prod_host_pinning.py` ловит возврат этих приёмов и старого адреса в `.github/`, `infra/`, `scripts/`. С машины, которая сервер ещё не знает, сначала добавить прошитый ключ: `grep -v '^#' infra/prod_known_hosts >> ~/.ssh/known_hosts`. (root + pm users active; pm home is `/opt/pharmacy-monitor`, NOT `/home/pm`; `pm` does not have passwordless sudo — use root for systemctl/sudo ops; ⚠️ уточнение 2026-10-11, чтением сервера: sudo без пароля у `pm` есть ровно на две команды — `systemctl restart pharmacy-monitor-api.service` и `systemctl restart pharmacy-monitor-frontend.service` (`/etc/sudoers.d/pm-deploy` от 2026-09-03, без них не работает `deploy.yml`); для всего остального — root)
 **DNS**: leaddrive.cloud at Namecheap; A `@` and `www` → 13.140.186.143
 
 ### What's running
@@ -160,7 +160,7 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 | Next.js :3000 | active | standalone build at `/opt/pharmacy-monitor/frontend/.next/standalone` |
 | Postgres 16 | active | DB `pharmacy_monitor`, user `pm` |
 | Redis 7 | active | cache + future rate-limit |
-| systemd timers | enabled | scrape@pharmonline 01:00, @aptekonline 02:00, @aloe 03:00, health hourly, backup 04:00 |
+| systemd timers | enabled | scrape@pharmonline 01:00, @aptekonline 02:00, @aloe 03:00, health hourly, backup 04:00 (строка от мая 2026; ⚠️ на 2026-10-11 таймер aloe стоит на 01:00, aptekonline — по понедельникам в 02:00, часы — по времени сервера, полный сбор недельный: блок «РАСПИСАНИЕ СБОРА» ниже) |
 
 ### Auth
 - Password login via `POST /auth/login {login, password}` → JWT cookie `pm_session` (httpOnly)
@@ -940,7 +940,7 @@ ssh root@13.140.186.143 \
   'cd /opt/pharmacy-monitor && .venv/bin/python -m ensurepip --upgrade && \
    .venv/bin/python -m pip install -q -e .'
 
-# Server ops (root user — pm has no passwordless sudo)
+# Server ops (root user — pm's passwordless sudo covers only the two restarts deploy.yml makes)
 ssh root@13.140.186.143
 systemctl restart pharmacy-monitor-api       # restart backend
 systemctl restart pharmacy-monitor-frontend  # restart frontend
