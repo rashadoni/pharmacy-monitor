@@ -25,7 +25,8 @@
 Чего здесь нет. Пароль, который не берёт bcrypt (суррогат, длиннее 72 байт), на
 входе по-прежнему даёт 500 — это отдельная правка. И регистр приводит
 `str.lower()`: «İ» с азербайджанской раскладки он в «i» не превращает, так что
-«ADMİN» остаётся другим логином — как считать такие буквы, здесь не решается.
+«ADMİN» остаётся другим логином. Как считать такие буквы, здесь не решается;
+сегодняшнее поведение закреплено отдельным тестом, чтобы не поменялось случайно.
 """
 
 from __future__ import annotations
@@ -81,10 +82,12 @@ ALMOST_ADMIN = [
 OWNER = "owner@example.com"
 # То же с адресом: знак, с которым строку нельзя искать в базе, из неё не вырезается.
 ALMOST_THE_OWNER = [
+    pytest.param("\x00owner@example.com", id="nul-before"),
     pytest.param("owner\x00@example.com", id="nul-inside"),
     pytest.param("owner@example.com\x00", id="nul-after"),
-    pytest.param("owner@example.com\ud800", id="surrogate-after"),
     pytest.param("\udc00owner@example.com", id="surrogate-before"),
+    pytest.param("ow\ud800ner@example.com", id="surrogate-inside"),
+    pytest.param("owner@example.com\ud800", id="surrogate-after"),
 ]
 
 
@@ -228,6 +231,19 @@ def test_a_login_that_only_resembles_the_admin_login_is_not_the_admin(client, se
 
     assert refused.status_code == 401, refused.text
     assert api_module.COOKIE_NAME not in refused.cookies
+
+
+@pytest.mark.parametrize("login", ["ADMİN", "admın"])
+def test_letters_of_the_azerbaijani_layout_are_other_letters_for_now(client, sessions, login):
+    """Так вход ведёт себя сегодня; это не требование безопасности.
+
+    «İ» — то, что азербайджанская раскладка даёт на Caps Lock вместо «I», «ı» —
+    вместо «i». `str.lower()` их к «i» не сводит. Решат считать их одной буквой —
+    вместе с правилом меняется и этот тест; случайно оно измениться не должно.
+    """
+    _add_user(sessions, OWNER, role="admin")
+
+    assert _login(client, login).status_code == 401
 
 
 @pytest.mark.parametrize("login", ALMOST_THE_OWNER)

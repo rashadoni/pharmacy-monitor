@@ -170,17 +170,20 @@ install_metrics_endpoint(app)
 # не так. Действует на все маршруты, а не на список адресов входа — список
 # отстал бы от кода.
 
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 # Чего в списке нет, в ответ не идёт — и поле, которое FastAPI добавит позже,
-# тоже. `ctx` — параметры правила: граница длины, код причины для интерфейса.
+# тоже.
 #
 # Остаётся текст причины (`msg`): его пишет pydantic или наш валидатор, и вырезать
 # из него нечего. Поэтому текст валидатора значение не цитирует — постоянная
 # строка, а не f-строка. Сверяет `tests/test_validation_refusal_echoes_nothing.py`.
 _REFUSAL_FIELDS = ("type", "loc", "msg", "ctx")
+# Из `ctx` — только простые значения: граница длины, код причины для интерфейса.
+# Исключение валидатора pydantic кладёт туда объектом, а в объекте бывает само
+# значение: у JSONDecodeError — разбираемый текст.
+_PLAIN = (str, int, float, bool, type(None))
 
 
 @app.exception_handler(RequestValidationError)
@@ -188,18 +191,15 @@ async def _validation_refusal(request: Request, exc: RequestValidationError) -> 
     problems = []
     for error in exc.errors():
         problem = {field: error[field] for field in _REFUSAL_FIELDS if field in error}
-        # Исключение валидатора pydantic кладёт в `ctx` объектом, а кодировщик
-        # разворачивает его атрибуты: у JSONDecodeError среди них разбираемый
-        # текст — то самое значение.
         rule = {
             name: value
-            for name, value in problem.pop("ctx", {}).items()
-            if not isinstance(value, BaseException)
+            for name, value in (problem.pop("ctx", None) or {}).items()
+            if isinstance(value, _PLAIN)
         }
         if rule:
             problem["ctx"] = rule
         problems.append(problem)
-    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(problems)})
+    return JSONResponse(status_code=422, content={"detail": problems})
 
 
 # ─── Request ID middleware (Phase 0.5, 2026-05-26) ───────────────────────────

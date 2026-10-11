@@ -16,8 +16,8 @@ FastAPI по умолчанию кладёт в `detail[].input` значени�
 - ни на одном адресе входа и ни при каком виде отказа присланного в ответе нет —
   ни в теле, ни в заголовках;
 - остаётся то, чем запрос можно поправить: `type`, `loc`, `msg` — их читает
-  интерфейс (`friendlyError`) — и `ctx` с параметрами правила; исключение
-  валидатора в `ctx` не идёт;
+  интерфейс (`friendlyError`) — и простые значения из `ctx`: граница длины, код
+  причины. Исключение валидатора и всё составное из `ctx` в ответ не идёт;
 - ответ собирается, когда суррогат стоит в значении, в имени поля, в теле;
 - правило одно на все маршруты.
 
@@ -190,11 +190,9 @@ def test_the_exception_of_a_validator_is_not_returned(client):
     refused = _post(client, "/auth/login", {"login": "admin", "password": SECRET * 12})
 
     # pydantic кладёт в `ctx` само исключение валидатора — в ответе его нет.
-    assert refused.json() == {
-        "detail": [
-            {"type": "value_error", "loc": ["body", "password"], "msg": "Value error, too long"}
-        ]
-    }
+    (problem,) = _assert_refusal_echoes_nothing(refused)
+    assert problem["type"] == "value_error"
+    assert "ctx" not in problem
 
 
 def test_the_refusal_still_names_the_field_and_the_reason(client):
@@ -245,9 +243,12 @@ class _Strict(BaseModel):
     @classmethod
     def _address(cls, value: str) -> str:
         if "@" not in value:
-            # Так отказывает PR с единым правилом адреса: код причины — в `ctx`.
+            # Код причины — в `ctx`: по нему интерфейс берёт перевод. Рядом — то,
+            # чего там быть не должно: значение внутри списка.
             raise PydanticCustomError(
-                "email_address", "{reason}", {"reason": "Адрес не принят.", "problem": "domain"}
+                "email_address",
+                "{reason}",
+                {"reason": "Адрес не принят.", "problem": "domain", "seen": [value]},
             )
         return value
 
@@ -298,7 +299,7 @@ def test_the_parameters_of_the_rule_stay_in_the_refusal(strict):
     assert problem["ctx"] == {"min_length": 3}
 
 
-def test_the_reason_code_stays_in_the_refusal(strict):
+def test_only_plain_values_of_the_rule_stay_in_the_refusal(strict):
     (problem,) = _assert_refusal_echoes_nothing(_post(strict, "/strict", {"address": SECRET}))
 
     assert problem == {
