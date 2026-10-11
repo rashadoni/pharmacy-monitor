@@ -115,6 +115,70 @@ sudo journalctl -u pharmacy-monitor-dashboard -n 50
 ls -lah /opt/pharmacy-monitor/logs/
 ```
 
+### Журнал API: строка запроса скрыта
+
+uvicorn пишет в журнал `pharmacy-monitor-api` строку на каждый запрос. Всё после
+`?` в адресе заменено меткой — в строке запроса ездит токен входа из письма:
+
+```
+INFO:     203.0.113.7:51324 - "GET /auth/verify?<hidden> HTTP/1.1" 303 See Other
+```
+
+Метод, путь и статус на месте; строка без `?` (`GET /health`) не меняется.
+Делает это `src/access_log.py`, фильтр ставится при импорте `src.api` — юнит
+для этого менять не нужно. Действует при обычном уровне журнала: с
+`--log-level debug|trace` или `UVICORN_LOG_LEVEL` в окружении uvicorn печатает
+запрос целиком, мимо фильтра.
+
+**Нужны параметры запроса** (что клиент искал, с каким фильтром пришёл) — их
+пишет Caddy, если на сервере у него включён журнал, как в `infra/Caddyfile`:
+`journalctl -u caddy -o cat | grep /api/v1/dash/`. ⚠️ По той же причине токен
+входа в журнале Caddy остаётся.
+
+**Проверить после выкладки** (root). Запрос с параметром и его строка в журнале:
+
+```bash
+grep -c hide_query_strings /opt/pharmacy-monitor/src/api.py    # 0 — код не выложен
+curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8080/health?probe=1'   # ждём 200
+journalctl -u pharmacy-monitor-api -n 20 --no-pager | grep 'GET /health'
+journalctl -u pharmacy-monitor-api -n 60 --no-pager | grep -c 'probe=1'             # ждём 0
+```
+
+- `"GET /health?<hidden> HTTP/1.1" 200` и счётчик 0 — фильтр работает в
+  запущенном процессе;
+- строка с меткой есть, а счётчик не 0 — уровень журнала `trace`: uvicorn
+  печатает запрос ещё раз, мимо фильтра. Уровень `debug` эта проверка не
+  покажет — на нём целиком печатается только запрос на WebSocket; уровень
+  смотреть прямо: `systemctl show -p Environment pharmacy-monitor-api` и
+  `grep -c UVICORN_ /etc/pharmacy-monitor/env`;
+- `"GET /health?probe=1 HTTP/1.1" 200` — процесс идёт без фильтра: API не
+  рестартован после выкладки или выложена ветка, в которой правки нет;
+- строки нет вовсе. Если curl ответил не 200 — строку вытеснила трассировка
+  ошибки, смотреть окно шире (`-n 200`). Если 200 — uvicorn строк о запросах
+  не пишет: журнал доступа выключен или уровень журнала `warning` и выше;
+  скрывать тогда нечего, а юнит или окружение отличаются от репозитория:
+  `systemctl cat pharmacy-monitor-api | grep -A7 ExecStart`.
+
+Заодно — версия uvicorn (CI проверяет 0.46.0, руками проверена ещё 0.52.1) и не
+терял ли фильтр записи:
+
+```bash
+/opt/pharmacy-monitor/.venv/bin/python -c 'import uvicorn; print(uvicorn.__version__)'
+SINCE=$(systemctl show -p ActiveEnterTimestamp --value pharmacy-monitor-api)
+journalctl -u pharmacy-monitor-api --since "$SINCE" | grep -c request_log_line_dropped   # ждём 0
+```
+
+Строки, записанные до рестарта, остаются в journald до ротации. Были ли они на
+этом сервере вообще, покажет `journalctl -u pharmacy-monitor-api --since "30 days
+ago" | grep -c 'HTTP/1\.[01]"'` (0 — журнал доступа не писался).
+
+**В журнале `request_log_line_dropped`** — uvicorn сменил вид записи о запросе,
+и фильтр перестал её узнавать. Запись, в которой он не может найти строку
+запроса, не печатается; событие пишется один раз на логгер. Строк о запросах
+в журнале API тогда нет — всех или только тех, что с параметрами. Запросы
+видны в журнале Caddy; чинить — `src/access_log.py` и
+`tests/test_access_log_carries_no_query.py` под новую версию uvicorn.
+
 ---
 
 ## 🔧 Типовые проблемы и решения
@@ -363,10 +427,11 @@ update tenant_users set password_hash = null where id = <id>;
 `?token=…`: 2026-10-10 на проде в `journalctl -u caddy` за 30 дней 41 строка
 `set-password?token=`, все за 6 октября. Страницу создания пароля отдаёт фронтенд, токен при этом
 не гаснет — такая строка остаётся рабочей ссылкой, пока пароль не задан и не
-вышли 30 минут. `/auth/verify?token=…` попадает в журнал Caddy и в журнал
-доступа API уже после гашения. Журнал читают root и группа `adm`; `pm`, под
+вышли 30 минут. `/auth/verify?token=…` попадает в журнал Caddy; журнал API
+пишет запрос без строки запроса (с 2026-10-11, после выкладки — «Журнал API:
+строка запроса скрыта» выше). Журнал читают root и группа `adm`; `pm`, под
 которым ходит CI, его не читает (проверено 2026-10-10). Не закрыто: журнал
-настраивают Caddyfile и юнит API, а их ставит root руками.
+Caddy — его настраивает Caddyfile, а тот ставит root руками.
 
 Что лежит у пользователя (значение токена не выводится; время в базе — UTC):
 
