@@ -7,6 +7,7 @@ Run before go-live. Tick each box, paste output for evidence.
 - [ ] **JWT secret** is 32+ chars from `openssl rand -hex 32`, stored in `/etc/pharmacy-monitor/env` (mode 0600, owned by `pm`)
 - [ ] **API key** (`PHARMACY_API_KEY`) is also 32+ chars random, separate value from JWT_SECRET
 - [ ] Magic-link tokens expire in 30 minutes (verify in `src/tenants.py:issue_magic_token`)
+- [ ] Magic-link tokens are not kept in the database: `tenant_users.magic_token` holds the SHA-256 of the token, and no query carries the token (`tests/test_magic_link_token.py`). A 43-character value there is a dead token left by the code before 2026-10-10. How to check the live table — `docs/RUNBOOK.md`, «Ссылка из письма не входит»
 - [ ] JWT cookie is `httpOnly` + `secure` (in production) + `sameSite=lax`
 - [ ] Failed auth attempts are rate-limited per IP (10/min in `require_api_key`)
 - [ ] User auth attempts are rate-limited per chat_id (5/min in `auth/request`)
@@ -81,12 +82,21 @@ curl -i -H "Origin: https://evil.com" \
 - [ ] No secrets in git history (`git secrets --scan` or `gitleaks`)
 - [ ] `.env`, `.env.local` in `.gitignore`
 - [ ] Secrets only in `/etc/pharmacy-monitor/env` (mode 0600, owned by `pm:pm`)
-- [ ] GitHub Actions secrets (HETZNER_SSH_KEY) only used in `deploy.yml`, never echoed
+- [ ] GitHub Actions secret `SSH_PRIVATE_KEY` — the key workflows use to log in to the server as `pm`, the only secret the repository has (`gh secret list`) — is passed to a step only through `env:` and written only to the key file, never printed to the log. Every workflow that connects to the server reads it, not `deploy.yml` alone: 20 of the 22 files in `.github/workflows/` on 2026-10-11
 
 ```bash
 # On server:
 ls -la /etc/pharmacy-monitor/env
 # Expect: -rw------- 1 pm pm
+
+# In workflows: which ones read the secret
+grep -l 'secrets\.SSH_PRIVATE_KEY' .github/workflows/*.yml
+# ...any that read it other than as an `env:` entry of that name
+grep -n 'secrets\.SSH_PRIVATE_KEY' .github/workflows/*.yml | grep -v '^[^:]*:[0-9]*: *SSH_PRIVATE_KEY: \${{ secrets\.SSH_PRIVATE_KEY }} *$'
+# Expect: empty
+# ...and what the steps do with `$SSH_PRIVATE_KEY`
+grep -nE '\$\{?SSH_PRIVATE_KEY' .github/workflows/*.yml
+# Expect: only emptiness tests and redirects into ~/.ssh/id_ed25519
 
 # In git:
 git log -p -- .env 2>&1 | head  # should be empty
@@ -136,7 +146,7 @@ cat /etc/ssh/sshd_config | grep -iE "(password|permitroot)"
 
 - [ ] Pydantic validation rejects malformed input (test with garbage payloads)
 - [ ] No PII in Sentry events (`send_default_pii=False`)
-- [ ] No PII in journald logs (verify magic_token never logged in plaintext)
+- [ ] No PII in journald logs, and no login-link tokens either. **Known open item (2026-10-10):** the application's own log calls carry no token, but both access logs record the request URL with `?token=…` — Caddy for every link, uvicorn for `/auth/verify` (after the token is spent)
 - [ ] File uploads (if any) — size-limited, MIME-checked
 - [ ] CLI commands that delete data (`db-check --fix`, `inventory truncate`) require explicit `--confirm` flag (manual review)
 
@@ -145,9 +155,10 @@ cat /etc/ssh/sshd_config | grep -iE "(password|permitroot)"
 grep -rn "send_default_pii" src/observability.py
 # Expect: send_default_pii=False
 
-# Verify magic_token not logged:
-journalctl -u pharmacy-monitor-api --since "1 hour ago" | grep -i magic
-# Should not show actual token values (only "magic_token_issued user=...")
+# Verify login-link tokens are not logged — application log and both access logs:
+journalctl -u pharmacy-monitor-api -u caddy --since "30 days ago" | grep -c 'token='
+# Expect 0 once both access logs drop the query string. On prod 2026-10-10: 49, all from the
+# Caddy access log — 41 `set-password?token=` and 8 probes of a path this app does not serve.
 ```
 
 ## Dependencies

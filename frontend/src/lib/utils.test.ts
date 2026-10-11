@@ -19,6 +19,6 @@ describe("localized date formatting", () => {
   it("formats AZN with the active route locale", () => {
     expect(formatPrice(1234.5, "az")).toContain("₼");
     expect(formatPrice(1234.5, "en")).toContain("1,234.50");
-    expect(formatPrice(1234.5, "ru")).toContain("1 234,50");
+    expect(formatPrice(1234.5, "ru")).toContain("1\u00a0234,50");
   });
 });

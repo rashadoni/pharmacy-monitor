@@ -805,7 +805,9 @@ def _send_email_alert(event: AlertEvent) -> str:
         )
         return "sent"
     except Exception as e:
-        log.warning("alert_email_failed", error=str(e))
+        from src.notifier import delivery_error_fields
+
+        log.warning("alert_email_failed", **delivery_error_fields(e))
         return f"error: {e}"
 
 
@@ -827,5 +829,7 @@ def _send_telegram_alert(session: Session, event: AlertEvent) -> str:
                 sent += 1
         return f"sent to {sent}/{len(chat_ids)}"
     except Exception as e:
-        log.warning("alert_telegram_failed", error=str(e))
+        from src.notifier import delivery_error_fields
+
+        log.warning("alert_telegram_failed", **delivery_error_fields(e))
         return f"error: {e}"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import smtplib
 import ssl
 import urllib.parse
@@ -19,8 +20,70 @@ from email.message import EmailMessage
 import structlog
 
 from src import storage, watchlist
+from src.logging_setup import mask_addresses
 
 log = structlog.get_logger()
+
+
+_SMTP_STATUS_RE = re.compile(r"[245]\.\d{1,3}\.\d{1,3}(?![\d.])")
+
+
+class EmailDeliveryError(smtplib.SMTPException):
+    """Почтовый сервер не принял письмо.
+
+    Текст ошибки — класс исходной ошибки smtplib и коды ответа, без самого
+    ответа сервера. smtplib кладёт в текст своих ошибок адрес получателя, а
+    текст ошибки уходит дальше, чем её ловят: в поле журнала, в трассировку
+    `run_failed`. Ответ сервера с вырезанными адресами лежит в `server_reply` —
+    его печатает только `notify test`, которую оператор запускает сам.
+
+    `smtp_status` — расширенный код из начала ответа («5.1.1»): 550 сервер
+    ставит на десяток разных причин, а различает их этим кодом.
+    """
+
+    def __init__(self, error_type: str, smtp_code: int | None = None, server_reply: str = ""):
+        self.error_type = error_type
+        self.smtp_code = smtp_code
+        self.server_reply = server_reply
+        status = _SMTP_STATUS_RE.match(server_reply)
+        self.smtp_status = status.group(0) if status else None
+        codes = " ".join(str(code) for code in (smtp_code, self.smtp_status) if code)
+        super().__init__(f"{error_type} (SMTP {codes})" if codes else error_type)
+
+
+def _delivery_failure(exc: smtplib.SMTPException) -> EmailDeliveryError:
+    code: object = getattr(exc, "smtp_code", None)
+    reply: object = getattr(exc, "smtp_error", None)
+    if isinstance(exc, smtplib.SMTPRecipientsRefused) and exc.recipients:
+        # {адрес: (код, ответ сервера)} — нужен ответ, адрес-ключ не нужен.
+        code, reply = next(iter(exc.recipients.values()))
+    if reply is None:
+        reply = str(exc)
+    if isinstance(reply, bytes):
+        reply = reply.decode("utf-8", "replace")
+    return EmailDeliveryError(
+        type(exc).__name__,
+        code if isinstance(code, int) else None,
+        mask_addresses(str(reply)),
+    )
+
+
+def delivery_error_fields(exc: BaseException) -> dict[str, object]:
+    """Что о сбое доставки пишут в журнал: класс ошибки и её числовые коды.
+
+    Текст ошибки (`str(exc)`) в журнал не идёт: в нём бывает адрес получателя.
+    Кому не ушло, вызывающий пишет рядом как `user_id`.
+    """
+    refused = isinstance(exc, EmailDeliveryError)
+    fields: dict[str, object] = {"error_type": exc.error_type if refused else type(exc).__name__}
+    smtp_code = getattr(exc, "smtp_code", None)
+    if isinstance(smtp_code, int):
+        fields["smtp_code"] = smtp_code
+    if refused and exc.smtp_status:
+        fields["smtp_status"] = exc.smtp_status
+    elif isinstance(exc, OSError) and isinstance(exc.errno, int):
+        fields["errno"] = exc.errno  # сеть: 101 — нет маршрута, 111 — отказ в соединении
+    return fields
 
 
 # === TELEGRAM ===
@@ -115,7 +178,27 @@ def send_email(
     ``False`` means SMTP is not configured. Existing fire-and-forget callers may
     ignore the return value; stateful callers must require ``True`` before they
     mark a notification as delivered.
+
+    An SMTP refusal is raised as ``EmailDeliveryError``, whose text never
+    carries an address; network errors propagate as they are.
     """
+    try:
+        return _send_email(subject, html_body, attachments, to)
+    except smtplib.SMTPException as exc:
+        failure = _delivery_failure(exc)
+    # Вне except: у новой ошибки нет ни причины, ни контекста, и трассировка не
+    # покажет исходную — с адресом.
+    raise failure
+
+
+def _send_email(
+    subject: str,
+    html_body: str,
+    attachments: list[tuple[str, bytes, str]] | None,
+    to: list[str] | None,
+) -> bool:
+    """Сам разговор с почтовым сервером. Ошибки smtplib выходят отсюда как есть,
+    с адресом в тексте, — звать только через `send_email`."""
     smtp_host = os.environ.get("SMTP_HOST")
     if not smtp_host:
         log.info("email_skipped_no_smtp", subject=subject)
@@ -143,7 +226,9 @@ def send_email(
         maintype, subtype = mime.split("/", 1)
         msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=fname)
 
-    log.info("smtp_send", host=smtp_host, port=smtp_port, recipients=recipients)
+    # Число, а не адреса: журнал еженедельного сбора pharmonline — это журнал
+    # шага GitHub Actions публичного репозитория.
+    log.info("smtp_send", host=smtp_host, port=smtp_port, recipients=len(recipients))
     with smtplib.SMTP(smtp_host, smtp_port, timeout=SMTP_TIMEOUT_SEC) as smtp:
         smtp.starttls()
         smtp.login(smtp_user, smtp_pass)
