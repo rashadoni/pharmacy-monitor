@@ -2771,29 +2771,30 @@ def _setup_logging(level: str = "INFO") -> None:
     Файл-логи читаются ELK / Loki / простым `jq`. Ротация — logrotate
     (см. provision_vps.sh — еженедельно, 8 архивов, gzip).
     """
+    # Вывод команды бывает публичным: еженедельный сбор pharmonline идёт из
+    # GitHub Actions, и журнал его шага открыт. Почтовый адрес из готовой
+    # строки вырезается, что бы ни передал вызов журнала, — и у structlog, и у
+    # stdlib `logging`, которым в тот же вывод пишут сторонние библиотеки.
+    from src.logging_setup import MaskingFormatter, masking
+
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # File handler — JSONL
     file_handler = logging.FileHandler(log_dir / "app.jsonl", encoding="utf-8")
     file_handler.setLevel(level)
-    file_handler.setFormatter(logging.Formatter("%(message)s"))
+    file_handler.setFormatter(MaskingFormatter("%(message)s"))
 
     # Stream handler — terminal
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(level)
-    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    stream_handler.setFormatter(MaskingFormatter("%(message)s"))
 
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
     root.setLevel(level)
-
-    # Вывод команды бывает публичным: еженедельный сбор pharmonline идёт из
-    # GitHub Actions, и журнал его шага открыт. Почтовый адрес из готовой
-    # строки вырезается, что бы ни передал вызов журнала.
-    from src.logging_setup import masking
 
     structlog.configure(
         processors=[
@@ -4944,11 +4945,24 @@ def telegram_poll(once: bool) -> None:
     """Poll Telegram bot — показать последние сообщения с chat_id'ами.
 
     Использование: попроси клиента написать боту любое сообщение, потом запусти
-    эту команду чтобы увидеть его chat_id и привязать через `recipient update`.
+    эту команду, чтобы увидеть его chat_id — для `telegram send-test` и
+    `notify test --chat-id`. К пользователю чат привязывает сам клиент:
+    `/start <email>` боту (`telegram run-bot`).
+
+    Печатает сообщения как есть — имя, chat_id, начало текста — в терминал
+    оператора. Из workflow не запускать: журнал шага Actions публичен
+    (`tests/test_log_carries_no_address.py`).
     """
     from src import notifier
 
     updates = notifier.telegram_get_updates()
+    if updates is None:
+        # Не «сообщений нет»: опрос не состоялся — нет токена, не подошёл токен,
+        # сеть. Причину отправитель уже написал в журнал, без текста ошибки.
+        raise click.ClickException(
+            "Опрос Telegram не состоялся. Причина — в журнале, уровень warning: "
+            "telegram_no_token, telegram_poll_failed или telegram_api_error."
+        )
     if not updates:
         click.echo("Нет новых сообщений. Попроси клиента написать боту /start.")
         return
