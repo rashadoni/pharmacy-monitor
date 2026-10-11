@@ -295,6 +295,8 @@ def test_the_password_form_takes_the_token_from_tab_storage_and_posts_it():
     assert re.findall(r"fetch\(([^,)]+)", code) == ['"/auth/set-password"']
     assert 'method: "POST"' in code
     assert re.search(r"body: JSON\.stringify\(\{ token\b", code)
+    # Погашенный токен во вкладке не остаётся.
+    assert "forgetLinkToken();" in code
 
 
 def test_the_form_and_the_link_page_agree_on_where_the_token_waits():

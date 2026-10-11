@@ -201,6 +201,8 @@ async def browser() -> AsyncIterator[Browser]:
 @pytest.fixture
 async def tab(browser) -> AsyncIterator[Page]:
     context = await browser.new_context()
+    # Сервер рядом: чего нет через 15 секунд, того не будет.
+    context.set_default_timeout(15_000)
     yield await context.new_page()
     await context.close()
 
