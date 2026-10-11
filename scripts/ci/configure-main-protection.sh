@@ -31,7 +31,9 @@
 # Exit codes, both modes: 0 = GitHub has what is written here (and nothing was
 # sent, or the write was read back and equals the payload); 1 = it has
 # something else; 2 = arguments not understood, nothing requested; 3 = could
-# not tell — a read or the write failed.
+# not tell — a read or the write failed. A status of 1 with neither a
+# "RESULT: MISMATCH" line nor the "no branch protection" line above it is the
+# script itself failing, not a finding.
 # Without a flag it is `--check`. Always type `--check` anyway: the copies of
 # this file from before this change (see below) do not know flags and WRITE
 # when run with none.

@@ -31,7 +31,8 @@ GitHub требование снимает — запуск открыл бы п
 Если защиту меняют намеренно (по слову владельца): в PR правятся скрипт и
 `EXPECTED`, а три теста со снимком (раздел «Снимок живой защиты») снимаются — он
 перестаёт быть записью живого состояния. Остальные тесты снимка не читают: их
-исходное состояние строится из `EXPECTED`. Новый снимок записывают чтением после
+исходное состояние строится из `EXPECTED`; поправить придётся только случай
+расхождения для самой изменённой настройки. Новый снимок записывают чтением после
 `--apply` и возвращают те три теста следующим PR. Править снимок руками нельзя:
 это единственное здесь, что пришло от GitHub.
 """
@@ -571,6 +572,15 @@ def test_apply_fails_when_github_ends_up_in_another_state(run, put, setting, lin
     assert result.differs == [setting]
     if line is not None:
         assert line in result.out.splitlines()
+    assert "NOT in the state" in result.err
+
+
+def test_apply_fails_when_the_branch_is_unprotected_after_an_accepted_write(run):
+    result = run("--apply", TEST_REPO, state=None, put="accept_and_drop")
+
+    assert result.requests == _on(TEST_ENDPOINT, GET_PUT_GET)
+    assert result.code == 1
+    assert result.out.count("no branch protection at all") == 2  # до записи и после
     assert "NOT in the state" in result.err
 
 

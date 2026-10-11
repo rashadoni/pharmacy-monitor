@@ -28,7 +28,8 @@
 - `unpin_checks` — принять, но проверки засчитываются из любого источника;
 - `reject` — отказать с 422, ничего не меняя;
 - `error_after_apply` — применить и после этого ответить ошибкой (обрыв связи
-  на ответе).
+  на ответе);
+- `accept_and_drop` — ответить успехом и оставить ветку без защиты.
 
 `--jq` исполняет настоящий `jq`: `gh` печатает строки без кавычек, поэтому `-r`.
 У `gh` внутри другая реализация (gojq). На фильтре скрипта они сверены вручную
@@ -84,7 +85,32 @@ GET_ERRORS = {
     # Код 0, а сверки нет.
     "empty": (0, "", ""),
     "partial": (0, "pull request required  : true\nrequired approvals     : 0", ""),
+    # Строка, похожая на вердикт, но не он.
     "lookalike": (0, "RESULT: match?", ""),
+    "lookalike_prefix": (0, "xRESULT: match", ""),
+    "lookalike_space": (0, "RESULT: match ", ""),
+    "lookalike_cr": (0, "RESULT: match\r", ""),
+    "lookalike_case": (0, "RESULT: MATCH", ""),
+    # Вердикт напечатан, а `gh` вышел с ошибкой.
+    "failed_with_verdict": (1, "pull request required  : true\nRESULT: match", "gh: HTTP 500"),
+    # Отказ «не защищена» напечатан, а `gh` вышел с нулём.
+    "404_as_success": (
+        0,
+        json.dumps({"message": "Branch not protected", "status": "404"}),
+        "",
+    ),
+    # Те же слова — начало другого сообщения.
+    "404_other_wording": (
+        1,
+        json.dumps({"message": "Branch not protected by this token", "status": "404"}),
+        "gh: Branch not protected by this token (HTTP 404)",
+    ),
+    # …и конец другого.
+    "404_same_ending": (
+        1,
+        json.dumps({"message": "Tag not protected", "status": "404"}),
+        "gh: Tag not protected (HTTP 404)",
+    ),
 }
 
 SWITCHES = (
@@ -224,8 +250,12 @@ def main(argv: list[str]) -> int:
         elif effect == "unpin_checks":
             for check in state["required_status_checks"]["checks"]:
                 check["app_id"] = None
-        elif effect not in ("apply", "error_after_apply"):
+        elif effect not in ("apply", "error_after_apply", "accept_and_drop"):
             return _refuse(f"unknown FAKE_GH_PUT={effect}", 97)
+        if effect == "accept_and_drop":
+            state_file.unlink(missing_ok=True)
+            print(json.dumps(state))
+            return 0
         state_file.write_text(json.dumps(state))
         if effect == "error_after_apply":
             return _fail("502")
