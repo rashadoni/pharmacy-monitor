@@ -158,8 +158,9 @@ being deployed. It copies code from its own checkout with `rsync` and runs no
 `git` command on the server: `/opt/pharmacy-monitor` there is a copy without
 `.git` (checked 2026-10-11). `infra/deploy.sh`, which updated the server with
 `git reset --hard origin/main`, has not been called by any workflow since
-`deploy.yml` was rewritten on 2026-05-30, and was removed from the repository
-on 2026-10-11. A copy dated 2026-05-15 is still on the server — do not run it.
+`deploy.yml` was rewritten on 2026-05-30, and was removed on 2026-10-11 — from
+the repository and, the same day, from the server, where a copy dated
+2026-05-15 had remained.
 The preflight checks, the `apply_migrations` switch and the cautions about when
 to start are in the workflow itself and in `docs/RUNBOOK.md`, in the note that
 opens the section «Обновления / деплой нового кода» (the code block under that
