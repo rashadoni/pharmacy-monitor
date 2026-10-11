@@ -821,7 +821,8 @@ def _send_telegram_alert(session: Session, event: AlertEvent) -> str:
         if not chat_ids:
             return "skipped: no telegram chat_ids"
         sev_emoji = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️"}.get(event.severity, "•")
-        text = f"{sev_emoji} *{event.title}*\n\n{event.detail or ''}"
+        title = notifier.telegram_escape(event.title, "*")
+        text = f"{sev_emoji} {title}\n\n{notifier.telegram_escape(event.detail)}"
         sent = 0
         for chat_id in chat_ids:
             ok = notifier.send_telegram_message(chat_id, text)
