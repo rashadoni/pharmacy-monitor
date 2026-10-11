@@ -26,7 +26,8 @@ from sqlalchemy import create_engine
 from src import auth, storage, watchlist as wl
 from src.url_parser import parse_urls_block
 
-load_dotenv()
+# Только `.env` своего чекаута и только недостающие имена — как в src/main.py.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 st.set_page_config(
