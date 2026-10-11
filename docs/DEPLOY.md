@@ -1,16 +1,36 @@
-# Deployment Runbook — Hetzner CX22
+# Deployment Runbook — written for the first server (Hetzner CX22)
 
 > ⚠️ Marked 2026-10-11. This runbook was written for the first production
 > server, a Hetzner Cloud VM. That server is gone: production moved to a Contabo
 > VPS on 2026-09-03 (address, access and what runs there — `CLAUDE.md`, "Current
-> production state"). On 2026-10-11 two places here were compared with the
-> repository and with the server: Phase 8 was rewritten, and the code steps of
-> "Rollback" were marked outdated. Nothing else was re-checked that day; it may
-> still describe the Hetzner setup.
+> production state"). On 2026-10-11 the runbook was compared with the repository
+> and, by reading only, with the server:
+>
+> - **Rewritten to match:** Phase 8, and the paragraph about scan times at the
+>   end of Phase 6.
+> - **Marked outdated, old text left in place under the mark:** Prerequisites
+>   and Phase 1, Phase 3, Phase 7, "Rollback", "Monitoring URLs", "Cost
+>   breakdown". Each mark says what was found.
+> - **Corrected in place:** the list of what `initial_server_setup.sh` installs
+>   (Phase 2) and the comment on `install_systemd_schedule.sh` (Phase 6).
+> - **Not re-checked:** Phase 4 (beyond the owner and mode of the env file on
+>   the server, which match), Phase 5, "Health checks", and in Phase 6 the
+>   sentence about the watchlist and the paragraph about Firecrawl.
+>
+> Nobody has run Phases 1–7 against a fresh machine to see whether they still
+> produce a working server, and the repository has no record of how the Contabo
+> VPS was set up. Treat them as history of the first install, not as a tested
+> procedure.
 
-**Target**: Hetzner Cloud CX22 (4 vCPU, 8GB RAM, 80GB SSD), Ubuntu 24.04, single-tenant production.
+**Target when written**: Hetzner Cloud CX22 (4 vCPU, 8GB RAM, 80GB SSD), Ubuntu 24.04, single-tenant production.
+
+**Production today** (read from the server 2026-10-11): Contabo VPS, 4 vCPU, 8 GB RAM, 96 GB disk, Ubuntu 24.04, time zone Europe/Berlin.
 
 ## Prerequisites (one-time)
+
+> ⚠️ Outdated (marked 2026-10-11). The Hetzner items here and all of Phase 1
+> apply to a provider the owner left in September 2026. What the equivalent
+> steps were for Contabo is not recorded in the repository.
 
 - [ ] Hetzner Cloud account with project created
 - [ ] Domain name (or subdomain) with A record pointing to server IP
@@ -39,13 +59,29 @@ ssh root@<server-ip>
 bash <(curl -fsSL https://raw.githubusercontent.com/<your-org>/<repo>/main/infra/scripts/initial_server_setup.sh)
 ```
 
-What this does:
-- Installs Postgres 16, Redis, Caddy, Python 3.11, Node.js
+What this does (compared with the script 2026-10-11):
+- Installs Postgres 16, Redis, Caddy, the distribution's `python3` (not Python
+  3.11, as this line used to say — on Ubuntu 24.04 that is 3.12; the venv on
+  the server runs Python 3.12.3), Node.js and pnpm
 - Creates `pm` system user + directory layout (`/opt/pharmacy-monitor`)
 - Configures ufw firewall (22, 80, 443 only)
 - Enables fail2ban, unattended-upgrades
 
+The steps the script prints at the end repeat Phase 3 (`git clone`,
+`python3.11 -m venv`, `uv sync`) and are outdated in the same way.
+
 ## Phase 3 — Deploy code
+
+> ⚠️ Outdated (marked 2026-10-11). This builds a git checkout on the server
+> with `uv` inside its venv. The current server is not that:
+> `/opt/pharmacy-monitor` has no `.git`, and `.venv/bin` has neither `uv` nor
+> `pip` (read from the server 2026-10-11; a `uv` binary does exist for `pm`, in
+> `/opt/pharmacy-monitor/.local/bin`). The release path there is `deploy.yml`
+> (Phase 8), which copies `src/`, `frontend/`, `migrations/versions/`,
+> `infra/systemd/` and `infra/scripts/` and builds the frontend. It does not
+> install Python dependencies: after a change to `pyproject.toml` they are
+> installed by hand (`CLAUDE.md`, "Useful commands"). How the venv on the
+> current server was first built is not recorded.
 
 ```bash
 # As pm user:
@@ -106,10 +142,13 @@ sudo -u pm bash -c 'cd /opt/pharmacy-monitor && .venv/bin/python scripts/sqlite_
 cp /opt/pharmacy-monitor/infra/systemd/*.{service,timer} /etc/systemd/system/
 systemctl daemon-reload
 
-# Install the versioned daily cadence and the 3-hour priority-watchlist timer.
-# This is required after a release that changes infra/systemd: it neutralizes
-# old weekly / --no-alerts drop-ins with final ``zz-*`` overrides instead of
-# relying on undocumented files in /etc.
+# Install the versioned schedule: the scrape, watchlist and rematch units plus
+# every drop-in under infra/systemd/overrides/, then enable their timers.
+# This is required after a release that changes infra/systemd: the final
+# ``zz-*`` overrides reset the schedule and ExecStart of older drop-ins instead
+# of relying on undocumented files in /etc. (Until 2026-10-11 this comment
+# said "daily cadence" and "neutralizes old weekly drop-ins"; the full scan is
+# weekly now, and the aptekonline drop-in is itself weekly.)
 /opt/pharmacy-monitor/infra/scripts/install_systemd_schedule.sh
 
 # Enable remaining services.
@@ -118,8 +157,32 @@ systemctl enable --now pharmacy-monitor-health.timer
 systemctl enable --now pharmacy-monitor-backup.timer
 ```
 
-The daily full scans run at 01:00 (Pharmonline), 02:00 (Aptekonline), and
-03:00 UTC (Aloe). They evaluate real-time alert rules but deliberately do not
+> ⚠️ Found 2026-10-11, reading the repository and the server:
+>
+> - Nothing above starts the frontend. `infra/systemd/` has no
+>   `pharmacy-monitor-frontend.service`; on the server that unit exists only in
+>   `/etc/systemd/system/`. On a machine built by this phase nothing serves the
+>   dashboard, and `deploy.yml` checks that unit in its preflight, so it would
+>   stop there (read from the workflow, not tried).
+> - `deploy.yml` copies `infra/systemd/` to `/opt/pharmacy-monitor`, not to
+>   `/etc/systemd/system/`: installing a changed unit is still a separate step
+>   for root. On 2026-10-11 the server's `pharmacy-monitor-rematch` units were
+>   still the old ones (`rematch --reset`, Monday 05:00), not the ones in Git —
+>   `docs/RUNBOOK.md`, «Выкладка правок сопоставления», has the command.
+
+Rewritten 2026-10-11 from `src/cadence.py`, the units in `infra/systemd/` and
+the timers on the server; this paragraph used to say "daily full scans run at
+01:00 (Pharmonline), 02:00 (Aptekonline), and 03:00 UTC (Aloe)". The full
+catalog of each site is collected once a week, in the night to Monday. The
+timers are not all weekly: the Aloe and Pharmonline timers fire every night at
+01:00, the Aptekonline timer on Mondays at 02:00 — server time (Europe/Berlin),
+not UTC. On a night when the site has already been collected this week, `run`
+exits without scraping; a failed scan is therefore retried the next night for
+Aloe and Pharmonline, and a week later for Aptekonline. Pharmonline has a second
+path, a GitHub Actions workflow on Mondays. `src/cadence.py` is the single
+source for the rhythm; `CLAUDE.md`, «Расписание сбора», explains it.
+
+The scheduled scans evaluate real-time alert rules but deliberately do not
 send the bulky HTML/Excel scrape report. The priority watchlist is a separate
 curated list of confirmed URLs and runs every three hours; it can notify only
 about a local price change, never publish a partial cross-site recommendation.
@@ -133,6 +196,16 @@ production configuration change. Do not replace Decodo or enable keyless mode
 in the production EnvironmentFile.
 
 ## Phase 7 — Caddy reverse proxy
+
+> ⚠️ Outdated (marked 2026-10-11). `infra/Caddyfile` has no domain to fill in
+> any more: the production block names `leaddrive.cloud` and
+> `www.leaddrive.cloud` directly, and `DOMAIN.example.com` survives only in a
+> commented-out pilot block. And `systemctl reload
+> caddy` is the wrong command for this file: it sets `admin off`, and by
+> `CLAUDE.md` and `docs/RUNBOOK.md` reload fails under that setting — use
+> `systemctl restart caddy` (`admin off` is in the server's Caddyfile too; the
+> reload itself was not tried on 2026-10-11). The server's `/etc/caddy/Caddyfile`
+> is not a copy of the file in Git and `deploy.yml` does not touch it.
 
 ```bash
 # As root:
@@ -241,7 +314,16 @@ ls -lth /var/backups/pharmacy-monitor/ | head
 > under «Restore drill»). `deploy.yml` refuses a commit that does not contain
 > the production database's migration revision, and it leaves on the server
 > any file a release added under `src/` (that `rsync` runs without `--delete`).
-> The other steps of this section were not re-checked.
+>
+> The database step at the end does not match the server either (read
+> 2026-10-11): every dump in `/var/backups/pharmacy-monitor/` is GPG-encrypted
+> and named `pharmacy-monitor-<timestamp>.sql.gz.gpg`, so there is no `.sql.gz`
+> file for `gunzip -c` to read. Do not adapt that line by adding a decrypt
+> step: `backup.sh` dumps with `--clean`, so the stream begins by dropping
+> every table of the database it is piped into. `docs/RUNBOOK.md`, «Копия
+> бэкапа вне сервера», restores into a separate empty database and says the
+> restore has never been tried on this server. The `alembic downgrade -1` line
+> was not re-checked.
 
 ```bash
 # Last good revision
@@ -261,11 +343,30 @@ gunzip -c /var/backups/pharmacy-monitor/pharmacy-monitor-<timestamp>.sql.gz | \
 
 ## Monitoring URLs (after Phase 11 in main plan)
 
+> ⚠️ Outdated (marked 2026-10-11). Grafana is not Grafana Cloud: it runs on the
+> server itself behind Caddy, at `/grafana` (`docs/RUNBOOK.md`,
+> «Observability»; `grafana-server` and `prometheus` were active on
+> 2026-10-11). No Uptime-Kuma unit or container was found on the server that
+> day; whether one runs elsewhere is not recorded. The Sentry line was not
+> re-checked beyond the fact that `SENTRY_DSN` is set on the server.
+
 - **Sentry** — `https://sentry.io/organizations/<your-org>/issues/`
 - **Grafana Cloud** — `https://<your-org>.grafana.net/`
 - **Uptime-Kuma** — typically `https://uptime.<your-domain>/`
 
 ## Cost breakdown (monthly)
+
+> ⚠️ Outdated (marked 2026-10-11). The table is the estimate made for the
+> Hetzner install and was not re-priced. Its first two rows no longer exist:
+> the server is a Contabo VPS, and there is no object storage — the nightly
+> dump stays on the server's own disk, B2 is not configured (`docs/RUNBOOK.md`,
+> «Копия бэкапа вне сервера»). The repository records no price for the Contabo
+> VPS. "Add ~€50/mo if proxy plan needed" is no longer an "if": by the comment
+> in `src/cadence.py` (2026-10-04) Aptekonline can only be collected through a
+> paid exit, about $49 a month for a weekly scan against $149 for a daily one —
+> the only current cost figure in the repository. The Telegram bot is not set
+> up (`TELEGRAM_BOT_TOKEN` is empty on the server). The Resend, Sentry and
+> domain rows were not re-checked.
 
 | Service | Cost |
 |---|---|
