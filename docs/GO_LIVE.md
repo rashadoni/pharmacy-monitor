@@ -4,12 +4,41 @@ Final pre-flight checklist + DNS cutover + 72h on-call.
 
 > ⚠️ Marked 2026-10-11. This checklist was written for the go-live on the first
 > server, a Hetzner Cloud VM, which no longer exists; production is on a Contabo
-> VPS (`CLAUDE.md`, "Current production state"). On 2026-10-11 only the steps
-> that run `git` on the server were compared with it — step 1 of "T-0: Cutover"
-> and step 1 of "Rollback procedure". They cannot work there:
-> `/opt/pharmacy-monitor` is a copy without `.git`. Apart from that and the two
-> CI lines under "T-3 days", corrected the same day in PR #83, nothing here was
-> re-checked.
+> VPS (`CLAUDE.md`, "Current production state"). The checklist is kept as the
+> record of that launch. On 2026-10-11 it was compared, by reading only, with
+> the server and the repository. Among the lines that do not hold there (the
+> list is what was found, not a line-by-line audit):
+>
+> - Every step that runs `git` on the server — step 1 of "T-0: Cutover", step 1
+>   of "Rollback procedure": `/opt/pharmacy-monitor` is a copy without `.git`.
+> - Every `.sql.gz` path — "T-7 days", step 3 of "Rollback procedure": the
+>   dumps are GPG-encrypted and named `pharmacy-monitor-<timestamp>.sql.gz.gpg`.
+>   Read the note in `docs/DEPLOY.md`, "Rollback", before restoring anything.
+> - Every `sudo` typed as `pm` other than a restart of the API or the frontend
+>   — `sudo -u pm …` in step 2 of "T-0: Cutover", `sudo systemctl stop/start`
+>   in step 3 of "Rollback procedure": `pm` may use `sudo` for two
+>   `systemctl restart` commands and nothing else (read from `sudo -l`; the
+>   steps themselves were not tried). `deploy.yml` runs
+>   `infra/scripts/backup.sh` as `pm` directly.
+> - Everything about Telegram — the bot unit under "T-7 days", the bind and the
+>   test alert in step 6, paging: the bot is not set up (`TELEGRAM_BOT_TOKEN`
+>   is empty, `pharmacy-monitor-telegram-bot` is disabled).
+> - "Daily digest email arrived at 08:00" under "T+24h":
+>   `pharmacy-monitor-digest@daily.timer` is disabled; the timer that is enabled
+>   is the weekly digest.
+> - Checks that expect a scrape every day — the `run_ok` grep under "T-3 days",
+>   "First scheduled scrape ran (or upcoming within 24h)" under "T+1h",
+>   "succeeded for all 3 sites" under "T+24h": the full scan is weekly
+>   (`src/cadence.py`), and on the other nights `run` exits without scraping.
+> - "offsite-uploaded" under "T-24h": the nightly dump stays on the server, no
+>   B2 keys are set (whether `rclone` is configured anywhere was not checked).
+> - "Uptime-Kuma → Telegram alert" under "On-call rotation": no Uptime-Kuma
+>   unit or container was found on the server, and Telegram is not set up.
+> - "Hetzner" wherever it appears, "Hetzner Cloud Console" under "Contact"
+>   included.
+>
+> The two CI lines under "T-3 days" were corrected the same day in PR #83.
+> Nothing else here was re-checked.
 
 ## T-7 days (one week before)
 
@@ -109,10 +138,11 @@ curl -fsS https://your-domain.com/health
 
 If something is broken in production and we need to go back:
 
-> ⚠️ Outdated (marked 2026-10-11). Step 1 cannot work on the current server —
-> see the note at the top of this file. How code gets to the server and how the
-> runbook takes it back — `docs/DEPLOY.md`, Phase 8 and "Rollback". The other
-> steps were not re-checked.
+> ⚠️ Outdated (marked 2026-10-11). Steps 1 and 3 cannot work as written on the
+> current server (`git`, `sudo` as `pm`, the dump's file name) — see the note
+> at the top of this file. How code gets to the
+> server and how the runbook takes it back — `docs/DEPLOY.md`, Phase 8 and
+> "Rollback". The other steps were not re-checked.
 
 ```bash
 # 1. Revert to last good code revision
