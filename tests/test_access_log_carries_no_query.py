@@ -670,8 +670,12 @@ def test_no_value_from_a_query_anywhere_in_what_the_process_printed(probe):
     assert not leaked, f"в журнале процесса: {leaked}"
 
 
-def test_records_that_are_not_about_requests_are_all_still_there(probe):
-    """Фильтр на `uvicorn.error` стоит рядом с записями о старте, остановке и ошибках."""
+def test_startup_error_and_shutdown_records_are_still_there(probe):
+    """Фильтр на `uvicorn.error` стоит рядом с записями о старте, остановке и ошибках.
+
+    Сверяются четыре записи и две об остановке, а не все: строки остановки у
+    родительского процесса идут в разном порядке и числе от запуска к запуску.
+    """
     workers = _worker_count()
     shipped = _other_lines(probe["shipped"]["output"])
 

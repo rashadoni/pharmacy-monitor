@@ -31,6 +31,8 @@ uvicorn. При сбое базы SQLAlchemy дописывает в текст 
 
 Строку журнала доступа раньше SDK чистит `src/access_log.py`; его фильтры
 оставлены только в `as_shipped`, чтобы остальные режимы проверяли слой Sentry.
+Поэтому на этой строке `as_shipped` хуки уже не проверяет — их проверяет
+`hooks_only`.
 """
 
 from __future__ import annotations

@@ -139,16 +139,22 @@ INFO:     203.0.113.7:51324 - "GET /auth/verify?<hidden> HTTP/1.1" 303 See Other
 
 ```bash
 grep -c hide_query_strings /opt/pharmacy-monitor/src/api.py    # 0 — код не выложен
-curl -s -o /dev/null 'http://127.0.0.1:8080/health?probe=1'
+curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8080/health?probe=1'   # ждём 200
 journalctl -u pharmacy-monitor-api -n 20 --no-pager | grep 'GET /health'
+journalctl -u pharmacy-monitor-api -n 60 --no-pager | grep -c 'probe=1'             # ждём 0
 ```
 
-- `"GET /health?<hidden> HTTP/1.1" 200` — фильтр работает в запущенном процессе;
+- `"GET /health?<hidden> HTTP/1.1" 200` и счётчик 0 — фильтр работает в
+  запущенном процессе;
+- строка с меткой есть, а счётчик не 0 — уровень журнала `debug` или `trace`:
+  uvicorn печатает запрос ещё раз, мимо фильтра;
 - `"GET /health?probe=1 HTTP/1.1" 200` — процесс идёт без фильтра: API не
   рестартован после выкладки или выложена ветка, в которой правки нет;
-- строки нет вовсе — журнал доступа на этом сервере выключен, скрывать нечего.
-  Юнит тогда отличается от файла в репозитории: `systemctl cat
-  pharmacy-monitor-api | grep -A7 ExecStart`.
+- строки нет вовсе. Если curl ответил не 200 — строку вытеснила трассировка
+  ошибки, смотреть окно шире (`-n 200`). Если 200 — uvicorn строк о запросах
+  не пишет: журнал доступа выключен или уровень журнала `warning` и выше;
+  скрывать тогда нечего, а юнит или окружение отличаются от репозитория:
+  `systemctl cat pharmacy-monitor-api | grep -A7 ExecStart`.
 
 Заодно — версия uvicorn (CI проверяет 0.46.0, руками проверена ещё 0.52.1) и не
 терял ли фильтр записи:
