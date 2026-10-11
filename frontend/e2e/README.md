@@ -57,8 +57,8 @@ type-checks the files in this directory too (`tsconfig.json` includes
 Playwright's Chromium — for the Python scraper snapshot tests, not for these
 specs.
 
-A green CI therefore says nothing about what these scenarios check. Run them by
-hand, as described under "Run locally", against a backend and a frontend you
+A green CI therefore does not tell you whether these scenarios pass. Run them
+by hand, as described under "Run locally", against a backend and a frontend you
 started yourself.
 
 ## Coverage
