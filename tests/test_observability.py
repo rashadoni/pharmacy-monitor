@@ -53,15 +53,27 @@ def test_init_sentry_idempotent(monkeypatch):
     assert call_count == 1
 
 
-def test_init_sentry_failure_does_not_stop_the_process(monkeypatch):
-    """`src.api` calls this at import: an SDK that rejects an option must not take the API down."""
+def test_init_sentry_survives_an_sdk_that_rejects_an_option(monkeypatch):
+    """`src.api` calls this at import: an SDK older than our options must not take the API down."""
     monkeypatch.setenv("SENTRY_DSN", "https://test@test.ingest.sentry.io/123")
     monkeypatch.setattr(observability, "_SENTRY_INITIALIZED", False)
 
     with patch("sentry_sdk.init", side_effect=TypeError("Unknown option 'max_request_body_size'")):
         observability.init_sentry(service="api")
 
-    assert observability._SENTRY_INITIALIZED is False
+    assert observability.sentry_is_running() is False
+
+
+def test_init_sentry_still_fails_loudly_on_a_bad_setting(monkeypatch):
+    """Only the SDK's "unknown option" is survived; a mistyped setting stops the start as before."""
+    monkeypatch.setenv("SENTRY_DSN", "https://test@test.ingest.sentry.io/123")
+    monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "ten percent")
+    monkeypatch.setattr(observability, "_SENTRY_INITIALIZED", False)
+
+    with patch("sentry_sdk.init") as sdk_init, pytest.raises(ValueError):
+        observability.init_sentry(service="api")
+
+    assert not sdk_init.called
 
 
 def test_sentry_capture_no_op_when_uninitialized():
@@ -168,7 +180,8 @@ hostile = [
     "?" + "token?" * 10_000,
     "?" + "token" * 12_000,
     "?" + "%74" * 20_000,
-    "1" * 60_000 + ":" + "a" * 20,
+    "?x " * 20_000,
+    "1" * 60_000 + ":" + "A" * 20,
 ]
 started = time.perf_counter()
 for text in hostile:
@@ -218,9 +231,14 @@ def test_sentry_token_scan_stays_linear_on_a_hostile_request_line():
             '"GET /auth/verify?[Filtered] HTTP/1.1" 500',
         ),
         ('"GET /go?next=/auth/verify?token=abc HTTP/1.1" 302', '"GET /go?[Filtered] HTTP/1.1" 302'),
+        # h11 hands the application a raw `#` as part of the value: the fragment goes too.
+        (
+            '"GET /auth/verify?token=ab#cd HTTP/1.1" 500',
+            '"GET /auth/verify?[Filtered] HTTP/1.1" 500',
+        ),
         (
             "GET https://h/p?a=1&X-Amz-Signature=zz&b=2#frag failed",
-            "GET https://h/p?[Filtered]#frag failed",
+            "GET https://h/p?[Filtered] failed",
         ),
         # Nothing named like a credential: the text is left alone.
         (
@@ -257,6 +275,7 @@ def test_sentry_replaces_a_credential_query_inside_a_quoted_url(text, expected):
         ("%74oken=abc", False),  # the application decodes the name before reading it
         ("next=/auth/verify?token=abc", False),  # a URL nested in a value
         ("next=%2Fauth%2Fverify%3Ftoken%3Dabc", False),
+        ("page=2#access_token=abc", False),  # a fragment is read as parameters too
     ],
 )
 def test_sentry_replaces_a_query_string_that_names_a_credential(query, kept):
@@ -299,14 +318,37 @@ def test_sentry_drops_bound_parameters_from_a_database_error(tail):
     assert clean["exception"]["values"][0]["value"] == _SQL_ERROR + "[parameters: [Filtered]]"
 
 
+def test_sentry_drops_the_row_values_postgres_quotes_in_a_database_error():
+    """Before SQLAlchemy's parameters comes PostgreSQL's own DETAIL line with the row itself."""
+    text = (
+        '(psycopg.errors.NotNullViolation) null value in column "name" violates not-null constraint\n'
+        "DETAIL:  Failing row contains (7, 1, a@b.c, null, viewer, $2b$12$hash, login-token-abc).\n"
+        "[SQL: UPDATE tenant_users SET name=%(name)s WHERE tenant_users.id = %(id)s]\n"
+        "[parameters: {'name': None, 'id': 7}]"
+    )
+
+    clean = observability._sentry_before_send({"message": text}, {})
+
+    assert clean["message"] == (
+        '(psycopg.errors.NotNullViolation) null value in column "name" violates not-null constraint\n'
+        "DETAIL: [Filtered]\n"
+        "[SQL: UPDATE tenant_users SET name=%(name)s WHERE tenant_users.id = %(id)s]\n"
+        "[parameters: [Filtered]]"
+    )
+
+
+_BOT_SECRET = "AAH-abcdefghijklmnopqrstuvwxyz01234"  # 35 characters, as issued
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
         (
-            "POST https://api.telegram.org/bot8123456789:AAH-abcdefghijklmnopqrstuvwxyz012345/sendMessage",
+            f"POST https://api.telegram.org/bot8123456789:{_BOT_SECRET}/sendMessage",
             "POST https://api.telegram.org/bot[Filtered]/sendMessage",
         ),
-        ("token 8123456789:AAH-abcdefghijklmnopqrstuvwxyz012345 leaked", "token [Filtered] leaked"),
+        (f"token 1234567890123:{_BOT_SECRET} leaked", "token [Filtered] leaked"),  # a longer bot id
+        (f"/bot8123456789%3A{_BOT_SECRET}/getMe", "/bot[Filtered]/getMe"),  # the colon encoded
         # Digits, a colon and a long word, but not a bot token.
         (
             "at 2026-10-11T18:01:34 from 127.0.0.1:35992",
@@ -315,6 +357,19 @@ def test_sentry_drops_bound_parameters_from_a_database_error(tail):
         (
             "image sha256:0123456789abcdef0123456789abcdef0123456789abcdef",
             "image sha256:0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+        (
+            "run 104532:0f8fad5b-d9cb-469f-a165-70867728950e done",
+            "run 104532:0f8fad5b-d9cb-469f-a165-70867728950e done",
+        ),
+        (
+            "products:12345:da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "products:12345:da39a3ee5e6b4b0d3255bfef95601890afd80709",
+        ),
+        # Starts like the secret but is longer than one: the length is part of the shape.
+        (
+            "artifact 20261011:Abuild0123456789abcdef0123456789abcdef01",
+            "artifact 20261011:Abuild0123456789abcdef0123456789abcdef01",
         ),
     ],
 )

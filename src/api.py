@@ -106,6 +106,7 @@ except ImportError:
 from src.observability import (
     init_observability,
     install_metrics_endpoint,
+    sentry_is_running,
     sentry_set_request_id,
     sentry_set_tenant,
 )
@@ -328,18 +329,12 @@ def require_api_key(
         client_ip = request.client.host if request.client else "unknown"
         _check_rate_limit(f"failed:{client_ip}", limit=10)
         raise HTTPException(status_code=401, detail="Invalid X-API-Key")
-    _check_rate_limit(f"ok:{_api_key_bucket(x_api_key)}")
-
-
-def _api_key_bucket(api_key: str) -> str:
-    """Имя счётчика запросов для ключа — без самого ключа.
-
-    Имя уходит в Redis, а Sentry записывает команды Redis в трассу запроса
-    вместе с ключом: первые восемь знаков API-ключа лежали там открытым текстом.
-    """
-    import hashlib
-
-    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    # Имя счётчика — без ключа и без его следа. Имя становится ключом Redis, а
+    # Sentry записывает команды Redis в трассу запроса: раньше здесь стояли
+    # первые восемь знаков ключа. Сюда доходит только один, настроенный ключ,
+    # поэтому счётчик один — хеш ключа дал бы тому, кто читает Sentry или Redis,
+    # способ проверять догадки о ключе.
+    _check_rate_limit("ok:api-key")
 
 
 # ─── Auth: JWT cookie (frontend dashboard) ───────────────────────────────────
@@ -1596,7 +1591,9 @@ def dash_integrations(user: storage.TenantUser = Depends(require_user)):
         "smtp_from": os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER") or None,
         "telegram": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
         "telegram_bot_username": os.environ.get("TELEGRAM_BOT_USERNAME") or None,
-        "sentry": bool(os.environ.get("SENTRY_DSN")),
+        # DSN в окружении ещё не значит, что Sentry работает: инициализация,
+        # которой SDK отказал, API не роняет.
+        "sentry": bool(os.environ.get("SENTRY_DSN")) and sentry_is_running(),
         "scraperapi": bool(os.environ.get("SCRAPER_API_KEY")),
         "scraperapi_sites": (os.environ.get("SCRAPER_API_SITES") or "").split(",")
         if os.environ.get("SCRAPER_API_SITES")

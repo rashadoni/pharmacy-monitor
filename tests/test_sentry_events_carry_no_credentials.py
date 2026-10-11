@@ -104,6 +104,10 @@ def probe(tmp_path_factory):
     out = tmp_path_factory.mktemp("sentry_probe")
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPO), env.get("PYTHONPATH")]))
+    # Проба обязана сама убрать прокси из окружения: urllib повёл бы запрос к
+    # заглушке Telegram через него, с токеном в адресе. Этот адрес никто не слушает.
+    for name in ("http_proxy", "https_proxy", "all_proxy"):
+        env[name] = env[name.upper()] = "http://127.0.0.1:1"
     running = {}
     reports = {}
     try:

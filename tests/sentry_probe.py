@@ -13,7 +13,8 @@
 
 Наружу ничего не уходит: DSN указывает на `.invalid`, транспорт подменён и
 складывает конверты в список, сервер и заглушка Telegram слушают случайные
-порты на 127.0.0.1.
+порты на 127.0.0.1, а переменные прокси из окружения убраны — иначе urllib
+повёл бы запрос к заглушке через прокси, вместе с адресом.
 
 Режимы — какой слой защиты оставлен:
     as_shipped        как на сервере;
@@ -51,7 +52,8 @@ MODE, REPORT_PATH = sys.argv[1], sys.argv[2]
 
 # Ключ начинается с приметных восьми знаков: начало ключа — тоже утечка.
 API_KEY = "Kq7CANRY-erp-key-5f1c9a77d2e04b68"
-TELEGRAM_BOT_TOKEN = "8123456789:AAH-CANARY-bot-token-0a1b2c3d4e5f6"
+TELEGRAM_BOT_TOKEN = "8123456789:AAH-CANARY-bot-token-0a1b2c3d4e5f6g"
+assert len(TELEGRAM_BOT_TOKEN.split(":")[1]) == 35, "у настоящего токена после двоеточия 35 знаков"
 
 os.environ["SENTRY_DSN"] = "https://0123456789abcdef0123456789abcdef@sentry.invalid/1"
 # Всё, что SDK умеет собирать, собирается на каждом запросе: трассы идут в
@@ -64,6 +66,10 @@ os.environ["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
 os.environ["JWT_SECRET"] = "probe-only-secret-0123456789abcdef"
 for name in ("PHARMACY_AUTH_DISABLED", "REDIS_URL", "ADMIN_PASSWORD_HASH"):
     os.environ.pop(name, None)
+for name in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+    os.environ.pop(name, None)
+    os.environ.pop(name.upper(), None)
+os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
 
 import sentry_sdk
 from sentry_sdk.scrubber import EventScrubber

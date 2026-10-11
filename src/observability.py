@@ -83,14 +83,15 @@ def init_sentry(service: str) -> None:
                 before_send=_sentry_before_send,
                 before_send_transaction=_sentry_before_send_transaction,
             )
-        except Exception as exc:
+        except TypeError as exc:
             # The SDK rejects an option it does not know with TypeError, and
             # this runs while `src.api` is imported: the deploy does not install
             # dependencies, so an SDK older than the options above would stop
-            # the API from starting. Error reporting is not worth an outage.
+            # the API from starting. Error reporting is not worth an outage;
+            # `sentry_is_running()` tells the settings page it is off.
             log.error(
                 "sentry_init_failed",
-                error_type=type(exc).__name__,
+                error=str(exc),  # "Unknown option '…'" — names the option, nothing else
                 sdk_version=getattr(sentry_sdk, "VERSION", "unknown"),
             )
             return
@@ -99,6 +100,11 @@ def init_sentry(service: str) -> None:
         _SENTRY_INITIALIZED = True
     except ImportError:
         log.warning("sentry_sdk_not_installed")
+
+
+def sentry_is_running() -> bool:
+    """True once `init_sentry` has succeeded — a DSN in the environment alone does not say so."""
+    return _SENTRY_INITIALIZED
 
 
 def _sentry_before_send(event: dict, hint: dict) -> dict | None:
@@ -135,8 +141,8 @@ def _sentry_before_send_transaction(event: dict, hint: dict) -> dict | None:
 #      an edit of the init arguments or a new SDK default does not reopen the
 #      leak — and they are the only guard for what the SDK has no switch for:
 #      a query string (`/auth/verify?token=…`, which uvicorn's access log also
-#      quotes into a breadcrumb), the bound parameters SQLAlchemy appends to an
-#      error text, and a token quoted in free text.
+#      quotes into a breadcrumb), the values a database error text quotes, and
+#      a token quoted in free text.
 #
 # tests/test_sentry_events_carry_no_credentials.py switches the layers off one
 # at a time. The SDK's `EventScrubber` is not part of this: it matches
@@ -160,8 +166,10 @@ _CREDENTIAL_NAME_RE = re.compile(
 _QUERY_KEYS = frozenset({"query_string", "http.query"})
 
 # A query string inside a URL that some string quotes whole: the access-log
-# line `"GET /auth/verify?token=… HTTP/1.1" 500` arrives as a breadcrumb.
-_URL_QUERY_RE = re.compile(r"\?[^\s#]+")
+# line `"GET /auth/verify?token=… HTTP/1.1" 500` arrives as a breadcrumb. The
+# run goes on to the next whitespace, fragment included: under the h11 parser
+# a raw `#` is part of the value the application reads.
+_URL_QUERY_RE = re.compile(r"\?\S+")
 
 # The session cookie is a JWT. Matched by shape wherever a string quotes it —
 # exception text, breadcrumb, tag: `<header>.<payload>`, the signature optional,
@@ -178,15 +186,19 @@ _JWT_RE = re.compile(
     r"\.eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*)?"
 )
 
-# A Telegram bot token, `<bot id>:<secret>`. It is part of the PATH of every
-# Bot API URL (`/bot<token>/sendMessage`), and the SDK records the URL of an
-# outgoing request in a breadcrumb and in a span.
-_TELEGRAM_TOKEN_RE = re.compile(r"(?<!\d)\d{5,12}:[A-Za-z0-9_-]{30,}")
+# A Telegram bot token, `<bot id>:<35 characters starting with A>` — the shape
+# secret scanners use; an exact length keeps `<number>:<md5 | sha1 | uuid>` out.
+# The token is part of the PATH of every Bot API URL (`/bot<token>/sendMessage`),
+# and the SDK records the URL of an outgoing request in a breadcrumb and a span.
+_TELEGRAM_TOKEN_RE = re.compile(r"(?<!\d)\d{5,16}(?::|%3[Aa])A[A-Za-z0-9_-]{34}(?![A-Za-z0-9_-])")
 
-# SQLAlchemy ends the text of a failed statement's error with its bound
-# parameters: the login token from `WHERE magic_token = ?`, a password hash, an
-# address. Everything from the marker on goes; the statement before it stays.
+# A database error text quotes values in two places. SQLAlchemy ends it with the
+# bound parameters of the failed statement — the login token from
+# `WHERE magic_token = ?`, a password hash, an address: everything from the
+# marker on goes, the statement before it stays. PostgreSQL itself adds a
+# DETAIL line (`Failing row contains (…)`, `Key (email)=(…) already exists`).
 _SQL_PARAMETERS_RE = re.compile(r"\[parameters: .*", re.DOTALL)
+_SQL_DETAIL_RE = re.compile(r"DETAIL:[^\n]*")
 
 
 def _without_credentials(event: dict) -> dict | None:
@@ -241,17 +253,20 @@ def _scrubbed_text(text: str) -> str:
     # case — a string with nothing to mask — off the regex engine altogether.
     if ".eyJ" in text:
         text = _JWT_RE.sub(rf"\1{_FILTERED}", text)
-    if ":" in text:
+    if ":" in text or "%3" in text:
         text = _TELEGRAM_TOKEN_RE.sub(_FILTERED, text)
     if "[parameters: " in text:
         text = _SQL_PARAMETERS_RE.sub(f"[parameters: {_FILTERED}]", text)
+    if "DETAIL:" in text:
+        text = _SQL_DETAIL_RE.sub(f"DETAIL: {_FILTERED}", text)
     if "?" in text:
         text = _URL_QUERY_RE.sub(_masked_url_query, text)
     return text
 
 
 def _masked_url_query(match: re.Match) -> str:
-    if _query_is_harmless(match[0][1:]):
+    # No `=`, no value: the common `?` of prose and SQL placeholders ends here.
+    if "=" not in match[0] or _query_is_harmless(match[0][1:]):
         return match[0]
     return f"?{_FILTERED}"
 
@@ -275,7 +290,7 @@ def _query_is_harmless(query) -> bool:
         return True
     if not isinstance(query, str):
         return False
-    for parameter in re.split("[?&;]", unquote(query)):
+    for parameter in re.split("[?&;#]", unquote(query)):
         name, has_value, _ = parameter.partition("=")
         if has_value and _CREDENTIAL_NAME_RE.search(name):
             return False
