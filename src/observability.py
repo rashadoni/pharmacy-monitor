@@ -88,7 +88,10 @@ def init_sentry(service: str) -> None:
             # this runs while `src.api` is imported: the deploy does not install
             # dependencies, so an SDK older than the options above would stop
             # the API from starting. Error reporting is not worth an outage;
-            # `sentry_is_running()` tells the settings page it is off.
+            # `sentry_is_running()` tells the settings page it is off. Any other
+            # failure stops the start, as it always did.
+            if not str(exc).startswith("Unknown option"):
+                raise
             log.error(
                 "sentry_init_failed",
                 error=str(exc),  # "Unknown option '…'" — names the option, nothing else
@@ -170,6 +173,12 @@ _QUERY_KEYS = frozenset({"query_string", "http.query"})
 # run goes on to the next whitespace, fragment included: under the h11 parser
 # a raw `#` is part of the value the application reads.
 _URL_QUERY_RE = re.compile(r"\?\S+")
+_PARAMETER_BREAK_RE = re.compile(r"[?&;#\s]")
+
+# Decoding `%XX` is the one step whose cost grows with the caller's input
+# faster than a scan does. Nothing ordinary carries this many escapes; a string
+# that does is treated as naming a credential without being decoded.
+_MAX_ESCAPES = 4096
 
 # The session cookie is a JWT. Matched by shape wherever a string quotes it —
 # exception text, breadcrumb, tag: `<header>.<payload>`, the signature optional,
@@ -186,19 +195,24 @@ _JWT_RE = re.compile(
     r"\.eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*)?"
 )
 
-# A Telegram bot token, `<bot id>:<35 characters starting with A>` — the shape
-# secret scanners use; an exact length keeps `<number>:<md5 | sha1 | uuid>` out.
-# The token is part of the PATH of every Bot API URL (`/bot<token>/sendMessage`),
-# and the SDK records the URL of an outgoing request in a breadcrumb and a span.
-_TELEGRAM_TOKEN_RE = re.compile(r"(?<!\d)\d{5,16}(?::|%3[Aa])A[A-Za-z0-9_-]{34}(?![A-Za-z0-9_-])")
+# A Telegram bot token, `<bot id>:<secret starting with A>`: 35 characters in
+# the shape secret scanners use, 34 in Telegram's own documentation examples.
+# The bounded length keeps `<number>:<md5 | sha1 | uuid>` out. The token is part
+# of the PATH of every Bot API URL (`/bot<token>/sendMessage`), and the SDK
+# records the URL of an outgoing request in a breadcrumb and a span.
+_TELEGRAM_TOKEN_RE = re.compile(
+    r"(?<!\d)\d{5,16}(?::|%3[Aa])A[A-Za-z0-9_-]{33,34}(?![A-Za-z0-9_-])"
+)
 
 # A database error text quotes values in two places. SQLAlchemy ends it with the
 # bound parameters of the failed statement — the login token from
 # `WHERE magic_token = ?`, a password hash, an address: everything from the
-# marker on goes, the statement before it stays. PostgreSQL itself adds a
-# DETAIL line (`Failing row contains (…)`, `Key (email)=(…) already exists`).
+# marker on goes, the statement before it stays. PostgreSQL itself adds DETAIL
+# (`Failing row contains (…)`, `Key (email)=(…) already exists`) and CONTEXT
+# lines: they go up to the statement, because a value in the row may hold a
+# line break. Only the English labels are known.
 _SQL_PARAMETERS_RE = re.compile(r"\[parameters: .*", re.DOTALL)
-_SQL_DETAIL_RE = re.compile(r"DETAIL:[^\n]*")
+_SQL_DETAIL_RE = re.compile(r"^(DETAIL|CONTEXT):.*?(?=\n\[SQL: |\Z)", re.DOTALL | re.MULTILINE)
 
 
 def _without_credentials(event: dict) -> dict | None:
@@ -257,18 +271,16 @@ def _scrubbed_text(text: str) -> str:
         text = _TELEGRAM_TOKEN_RE.sub(_FILTERED, text)
     if "[parameters: " in text:
         text = _SQL_PARAMETERS_RE.sub(f"[parameters: {_FILTERED}]", text)
-    if "DETAIL:" in text:
-        text = _SQL_DETAIL_RE.sub(f"DETAIL: {_FILTERED}", text)
-    if "?" in text:
-        text = _URL_QUERY_RE.sub(_masked_url_query, text)
+    if "DETAIL:" in text or "CONTEXT:" in text:
+        text = _SQL_DETAIL_RE.sub(rf"\1: {_FILTERED}", text)
+    if "?" in text and ("=" in text or "%3D" in text or "%3d" in text):
+        # One verdict for the string: if any of its query strings names a
+        # credential, all of them go. Deciding run by run would cost a Python
+        # call per run, and a request header is the caller's to fill with them.
+        queries = _URL_QUERY_RE.findall(text)
+        if queries and not _query_is_harmless(" ".join(queries)):
+            text = _URL_QUERY_RE.sub(f"?{_FILTERED}", text)
     return text
-
-
-def _masked_url_query(match: re.Match) -> str:
-    # No `=`, no value: the common `?` of prose and SQL placeholders ends here.
-    if "=" not in match[0] or _query_is_harmless(match[0][1:]):
-        return match[0]
-    return f"?{_FILTERED}"
 
 
 def _without_locals(frame):
@@ -283,14 +295,15 @@ def _query_is_harmless(query) -> bool:
     The caller then replaces the whole query string, not one value: in an
     unquoted string the end of a value cannot be told apart from the start of
     the next parameter. The name is checked after unquoting — the application
-    decodes `%74oken` to `token` — and a URL nested in a value (`next=/x?token=…`)
+    decodes `%74oken` to `token`, and `token%3D…` may reach it decoded — and a
+    URL nested in a value or a fragment (`next=/x?token=…`, `#access_token=…`)
     is read as parameters of its own.
     """
     if not query:
         return True
-    if not isinstance(query, str):
+    if not isinstance(query, str) or query.count("%") > _MAX_ESCAPES:
         return False
-    for parameter in re.split("[?&;#]", unquote(query)):
+    for parameter in _PARAMETER_BREAK_RE.split(unquote(query)):
         name, has_value, _ = parameter.partition("=")
         if has_value and _CREDENTIAL_NAME_RE.search(name):
             return False

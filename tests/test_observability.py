@@ -64,6 +64,18 @@ def test_init_sentry_survives_an_sdk_that_rejects_an_option(monkeypatch):
     assert observability.sentry_is_running() is False
 
 
+def test_init_sentry_does_not_swallow_other_type_errors(monkeypatch):
+    """The guard is for one message; a TypeError from anywhere else in init is a real fault."""
+    monkeypatch.setenv("SENTRY_DSN", "https://test@test.ingest.sentry.io/123")
+    monkeypatch.setattr(observability, "_SENTRY_INITIALIZED", False)
+
+    with (
+        patch("sentry_sdk.init", side_effect=TypeError("setup_once() takes no arguments")),
+        pytest.raises(TypeError),
+    ):
+        observability.init_sentry(service="api")
+
+
 def test_init_sentry_still_fails_loudly_on_a_bad_setting(monkeypatch):
     """Only the SDK's "unknown option" is survived; a mistyped setting stops the start as before."""
     monkeypatch.setenv("SENTRY_DSN", "https://test@test.ingest.sentry.io/123")
@@ -179,23 +191,26 @@ hostile = [
     "eyJ" * 20_000 + " x.eyJ",
     "?" + "token?" * 10_000,
     "?" + "token" * 12_000,
-    "?" + "%74" * 20_000,
     "?x " * 20_000,
+    "?a=1 " * 12_000,
     "1" * 60_000 + ":" + "A" * 20,
+    "?a=1" + "%" * 3_000_000,
 ]
 started = time.perf_counter()
 for text in hostile:
-    assert observability._sentry_before_send({"message": text}, {}) == {"message": text}
+    assert observability._sentry_before_send({"message": text}, {}) is not None
 print(time.perf_counter() - started)
 """
 
 
 def test_sentry_token_scan_stays_linear_on_a_hostile_request_line():
-    """The request line is the caller's, and the scrubber reads every string of the event.
+    """The request line and headers are the caller's, and the scrubber reads every string.
 
     A pattern that rescans from each `eyJ` takes a second on 60 KB when it is
     quadratic and does not finish when it is cubic — hence a child process with
-    a timeout: losing linearity must fail this test, not hang the suite.
+    a timeout: losing linearity must fail this test, not hang the suite. The
+    megabytes of `%` are for `unquote`, which without a cap costs a quarter of a
+    second per megabyte.
     """
     repo = Path(__file__).resolve().parents[1]
     env = dict(os.environ)
@@ -236,6 +251,15 @@ def test_sentry_token_scan_stays_linear_on_a_hostile_request_line():
             '"GET /auth/verify?token=ab#cd HTTP/1.1" 500',
             '"GET /auth/verify?[Filtered] HTTP/1.1" 500',
         ),
+        # A mangled link: the `=` is encoded, the secret after it is still valid.
+        (
+            "referer https://x/set-password?token%3Dabc seen",
+            "referer https://x/set-password?[Filtered] seen",
+        ),
+        # One verdict per string: a credential in one query takes the other queries with it.
+        ("from /a?page=2 to /b?token=abc", "from /a?[Filtered] to /b?[Filtered]"),
+        # More escapes than anything ordinary has: not decoded, treated as a credential.
+        ("GET /x?" + "%41" * 5000 + "=1 HTTP/1.1", "GET /x?[Filtered] HTTP/1.1"),
         (
             "GET https://h/p?a=1&X-Amz-Signature=zz&b=2#frag failed",
             "GET https://h/p?[Filtered] failed",
@@ -245,6 +269,7 @@ def test_sentry_token_scan_stays_linear_on_a_hostile_request_line():
             '"GET /x?search=kreon&category_key=pharma&limit=5 HTTP/1.1" 200',
             '"GET /x?search=kreon&category_key=pharma&limit=5 HTTP/1.1" 200',
         ),
+        ("page /x?page%3D2 opened", "page /x?page%3D2 opened"),
         ("why? token=5 & more", "why? token=5 & more"),  # prose, not a URL
         (
             "SELECT a FROM t WHERE x = ? AND token=? LIMIT ?",
@@ -319,10 +344,15 @@ def test_sentry_drops_bound_parameters_from_a_database_error(tail):
 
 
 def test_sentry_drops_the_row_values_postgres_quotes_in_a_database_error():
-    """Before SQLAlchemy's parameters comes PostgreSQL's own DETAIL line with the row itself."""
+    """Before SQLAlchemy's parameters come PostgreSQL's own DETAIL and CONTEXT lines.
+
+    The row is quoted whole, and a value in it may hold a line break: everything
+    up to the statement goes, not one line.
+    """
     text = (
         '(psycopg.errors.NotNullViolation) null value in column "name" violates not-null constraint\n'
-        "DETAIL:  Failing row contains (7, 1, a@b.c, null, viewer, $2b$12$hash, login-token-abc).\n"
+        "DETAIL:  Failing row contains (7, a@b.c, Имя\nФамилия, viewer, $2b$12$hash, login-token-abc).\n"
+        'CONTEXT:  SQL statement "UPDATE …" with "login-token-abc"\n'
         "[SQL: UPDATE tenant_users SET name=%(name)s WHERE tenant_users.id = %(id)s]\n"
         "[parameters: {'name': None, 'id': 7}]"
     )
@@ -337,6 +367,26 @@ def test_sentry_drops_the_row_values_postgres_quotes_in_a_database_error():
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # The driver's text on its own, with no statement after it.
+        (
+            "duplicate key value violates unique constraint\nDETAIL:  Key (email)=(a@b.c) already exists.",
+            "duplicate key value violates unique constraint\nDETAIL: [Filtered]",
+        ),
+        (
+            'COPY failed\nCONTEXT:  COPY t, line 1: "secret"\n[SQL: COPY t]',
+            "COPY failed\nCONTEXT: [Filtered]\n[SQL: COPY t]",
+        ),
+        # The label only counts at the start of a line.
+        ("PROBLEM DETAIL: disk is full\nretry later", "PROBLEM DETAIL: disk is full\nretry later"),
+    ],
+)
+def test_sentry_database_detail_is_cut_by_label_at_line_start(text, expected):
+    assert observability._sentry_before_send({"message": text}, {}) == {"message": expected}
+
+
 _BOT_SECRET = "AAH-abcdefghijklmnopqrstuvwxyz01234"  # 35 characters, as issued
 
 
@@ -348,6 +398,8 @@ _BOT_SECRET = "AAH-abcdefghijklmnopqrstuvwxyz01234"  # 35 characters, as issued
             "POST https://api.telegram.org/bot[Filtered]/sendMessage",
         ),
         (f"token 1234567890123:{_BOT_SECRET} leaked", "token [Filtered] leaked"),  # a longer bot id
+        # 34 characters, as in the examples of Telegram's own documentation.
+        ("/bot123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11/getMe", "/bot[Filtered]/getMe"),
         (f"/bot8123456789%3A{_BOT_SECRET}/getMe", "/bot[Filtered]/getMe"),  # the colon encoded
         # Digits, a colon and a long word, but not a bot token.
         (
