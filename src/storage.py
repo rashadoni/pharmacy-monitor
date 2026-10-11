@@ -571,7 +571,12 @@ class TenantUser(Base):
     # Когда пользователь меняет пароль через UI — пишется сюда, и далее auth
     # сначала проверяет DB-hash, фолбэк на env только если DB-hash NULL.
     password_hash: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    magic_token: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # SHA-256 одноразового токена входа, а не сам токен: токен знает только
+    # письмо (`tenants.issue_magic_token` / `verify_magic_token`). Колонка в базе
+    # называется по-старому, `magic_token`: до 2026-10-10 в ней лежал сам токен.
+    # Переименования нет намеренно — новый код на старой схеме уронил бы каждый
+    # запрос к пользователям, включая вход.
+    magic_token_hash: Mapped[str | None] = mapped_column("magic_token", String(100), nullable=True)
     magic_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
