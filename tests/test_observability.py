@@ -196,9 +196,13 @@ hostile = [
     "1" * 60_000 + ":" + "A" * 20,
     "?a=1" + "%" * 3_000_000,
 ]
+# 256 headers of 16 KB each — uvicorn accepts them — shaped for the slowest path
+# of `unquote`: non-ASCII characters between ASCII ones, and a single escape.
+flood = {f"x-flood-{i}": "?a=%41" + "a\xe9" * 8000 for i in range(256)}
 started = time.perf_counter()
 for text in hostile:
     assert observability._sentry_before_send({"message": text}, {}) is not None
+assert observability._sentry_before_send_transaction({"request": {"headers": flood}}, {})
 print(time.perf_counter() - started)
 """
 
@@ -254,6 +258,10 @@ def test_sentry_token_scan_stays_linear_on_a_hostile_request_line():
         # A mangled link: the `=` is encoded, the secret after it is still valid.
         (
             "referer https://x/set-password?token%3Dabc seen",
+            "referer https://x/set-password?[Filtered] seen",
+        ),
+        (
+            "referer https://x/set-password?token%3dabc seen",
             "referer https://x/set-password?[Filtered] seen",
         ),
         # One verdict per string: a credential in one query takes the other queries with it.
@@ -467,6 +475,47 @@ def test_sentry_filters_credential_headers_by_name_and_drops_body_and_cookies():
             "user-agent": "curl/8",
             "x-request-id": "rid-1",
         },
+    }
+
+
+def test_sentry_bounds_the_request_headers_it_reads():
+    """Headers are the caller's to fill, megabytes of them; the rest of the event is not."""
+    headers = {f"x-flood-{i}": "?a=%41" + "a\xe9" * 8000 for i in range(256)}
+    headers["user-agent"] = "curl/8"
+    event = {"request": {"headers": {"x-request-id": "rid-1", "referer": "r" * 5000, **headers}}}
+
+    clean = observability._sentry_before_send_transaction(event, {})["request"]["headers"]
+
+    assert len(clean) == 100
+    assert clean["x-request-id"] == "rid-1"
+    assert clean["referer"] == "r" * 2048 + "…"
+    assert max(len(value) for value in clean.values()) == 2049
+    assert "user-agent" not in clean  # sent after the first hundred
+
+
+def test_sentry_cuts_a_long_header_before_reading_it():
+    """A credential past the cut is gone with the tail; one across the cut is still masked."""
+    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
+    event = {
+        "request": {
+            "headers": {
+                # The cut falls inside the value of `token=`…
+                "x-forwarded-uri": "p" * 2020
+                + " https://x/verify?token=abcdefghijklmnopqrstuvwxyz",
+                # …inside the payload of a session token…
+                "x-debug": "p" * 1990 + f" session {token}",
+                # …and before the token begins.
+                "x-tail": "p" * 3000 + f" {token}",
+            }
+        }
+    }
+
+    clean = observability._sentry_before_send_transaction(event, {})["request"]["headers"]
+
+    assert clean == {
+        "x-forwarded-uri": "p" * 2020 + " https://x/verify?[Filtered]",
+        "x-debug": "p" * 1990 + " session [Filtered]…",
+        "x-tail": "p" * 2048 + "…",
     }
 
 

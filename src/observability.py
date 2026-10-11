@@ -175,10 +175,17 @@ _QUERY_KEYS = frozenset({"query_string", "http.query"})
 _URL_QUERY_RE = re.compile(r"\?\S+")
 _PARAMETER_BREAK_RE = re.compile(r"[?&;#\s]")
 
-# Decoding `%XX` is the one step whose cost grows with the caller's input
-# faster than a scan does. Nothing ordinary carries this many escapes; a string
-# that does is treated as naming a credential without being decoded.
+# Decoding `%XX` costs a Python step per escape. Nothing ordinary carries this
+# many; a string that does is treated as naming a credential without being
+# decoded.
 _MAX_ESCAPES = 4096
+
+# Request headers are the one part of an event whose size the caller sets:
+# uvicorn takes megabytes of them, and every string of the event is read here,
+# on the thread that serves requests. What a real client sends fits these
+# bounds many times over; past them the work stops growing with the input.
+_MAX_HEADERS = 100
+_MAX_HEADER_LENGTH = 2048
 
 # The session cookie is a JWT. Matched by shape wherever a string quotes it —
 # exception text, breadcrumb, tag: `<header>.<payload>`, the signature optional,
@@ -228,7 +235,7 @@ def _without_credentials(event: dict) -> dict | None:
 
 
 def _clean_request(event: dict) -> None:
-    """Keep method, URL and harmless headers; drop body, cookies and credential headers."""
+    """Keep method, URL and harmless headers, bounded; drop body, cookies and credential headers."""
     request = event.get("request")
     if not isinstance(request, dict):
         return
@@ -236,9 +243,13 @@ def _clean_request(event: dict) -> None:
     request.pop("cookies", None)
     headers = request.get("headers")
     if isinstance(headers, dict):
-        for name in headers:
+        for name in list(headers)[_MAX_HEADERS:]:
+            del headers[name]
+        for name, value in headers.items():
             if _CREDENTIAL_NAME_RE.search(str(name)):
                 headers[name] = _FILTERED
+            elif isinstance(value, str) and len(value) > _MAX_HEADER_LENGTH:
+                headers[name] = value[:_MAX_HEADER_LENGTH] + "…"
     elif headers is not None:
         del request["headers"]
 
@@ -303,6 +314,9 @@ def _query_is_harmless(query) -> bool:
         return True
     if not isinstance(query, str) or query.count("%") > _MAX_ESCAPES:
         return False
+    # Names are ASCII; `unquote` takes a far slower path through a string that
+    # mixes non-ASCII characters with a single escape.
+    query = query.encode("ascii", "backslashreplace").decode("ascii")
     for parameter in _PARAMETER_BREAK_RE.split(unquote(query)):
         name, has_value, _ = parameter.partition("=")
         if has_value and _CREDENTIAL_NAME_RE.search(name):
