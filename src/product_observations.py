@@ -17,6 +17,15 @@ from src.product_policy import (
 _PROMOTE_COUNTRY_AFTER_DISTINCT_RUNS = 2
 
 
+def _country_text(raw: Any) -> str | None:
+    """Fit the site's free-text country label to its String(160) columns.
+
+    The product card and the observation row store the same text. Left
+    unclipped, a longer label makes PostgreSQL refuse the whole persist batch.
+    """
+    return None if raw is None else str(raw)[:160]
+
+
 def apply_country_observation(
     product: storage.Product,
     scraped: Any,
@@ -30,7 +39,7 @@ def apply_country_observation(
     source = getattr(scraped, "country_source", None)
 
     if raw is not None:
-        product.manufacturer_country_raw = str(raw)[:160]
+        product.manufacturer_country_raw = _country_text(raw)
 
     current = product.manufacturer_country_code
     if status != COUNTRY_RESOLVED or code is None:
@@ -99,13 +108,14 @@ def observation_row(
     observed_at: datetime,
 ) -> storage.OfferObservation:
     """Build immutable history row from the raw signal, not inferred state."""
-    code, country_status = country_resolution(getattr(scraped, "manufacturer_country_raw", None))
+    raw = getattr(scraped, "manufacturer_country_raw", None)
+    code, country_status = country_resolution(raw)
     return storage.OfferObservation(
         tenant_id=product.tenant_id,
         run_id=run_id,
         product_id=product.id,
         country_code=code,
-        country_raw=getattr(scraped, "manufacturer_country_raw", None),
+        country_raw=_country_text(raw),
         country_resolution_status=country_status,
         country_source=getattr(scraped, "country_source", None),
         availability_status=getattr(scraped, "offer_availability_status", "unknown") or "unknown",
