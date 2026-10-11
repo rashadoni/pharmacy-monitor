@@ -11,12 +11,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 from datetime import timedelta
 from src._time import utcnow
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from src.storage import Tenant, TenantUser
@@ -131,8 +132,18 @@ def list_users(session: Session, tenant_id: int | None = None) -> list[TenantUse
     return list(session.scalars(stmt).all())
 
 
+def _magic_token_hash(token: str) -> str:
+    # `surrogatepass`: в JSON-теле запроса бывает одиночный суррогат, строгая
+    # кодировка упала бы на нём — а это ответ 500 на входе вместо отказа.
+    return hashlib.sha256(token.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def issue_magic_token(session: Session, email: str, ttl_minutes: int = 30) -> str | None:
-    """Сгенерировать magic-token. Вернуть токен (для отправки в email).
+    """Выдать одноразовый токен входа и вернуть его — для ссылки в письме.
+
+    В базу идёт только SHA-256 токена. Сам токен отсюда уходит один раз, тому,
+    кто вызвал; прочитать его потом неоткуда — ни из строки пользователя, ни из
+    дампа. Прежний токен пользователя гаснет: у него один действующий.
 
     Если такого юзера нет — None. Не создаёт user'а автоматически (security).
     """
@@ -144,25 +155,62 @@ def issue_magic_token(session: Session, email: str, ttl_minutes: int = 30) -> st
     if not u:
         return None
     token = secrets.token_urlsafe(32)
-    u.magic_token = token
+    u.magic_token_hash = _magic_token_hash(token)
     u.magic_token_expires_at = utcnow() + timedelta(minutes=ttl_minutes)
     session.commit()
     return token
 
 
-def verify_magic_token(session: Session, token: str) -> TenantUser | None:
-    """Проверить токен. Если валиден — отметить last_login_at, обнулить токен, вернуть user."""
+def redeem_magic_token(session: Session, token: str) -> TenantUser | None:
+    """Погасить токен из ссылки и вернуть его пользователя. Транзакцию не завершает.
+
+    Гашение — один UPDATE с условием «токен тот, срок не вышел, аккаунт
+    включён». Из двух одновременных запросов с одним токеном строку получает
+    один: второй ждёт его транзакцию и после её commit условия уже не находит.
+    Прочитать строку, а потом записать по первичному ключу нельзя — так проходили
+    оба.
+
+    Commit — за вызывающим, вместе с тем, ради чего токен предъявлен (сессия,
+    пароль). До него откат возвращает ссылку: сбой после проверки её не сжигает.
+
+    Пользователь возвращается перечитанным из базы. Если он уже был в этой
+    сессии с несохранёнными правками, они пропадут: звать на свежей сессии —
+    так зовут оба обработчика API — либо после своего flush.
+
+    Пользователь ищется по хешу присланного: в запрос к базе (а значит, и в
+    текст её ошибки) токен не попадает. Содержимое колонки токеном не служит —
+    ни хеш, ни токен, записанный туда открытым текстом до 2026-10-10: от
+    присланного всегда берётся хеш. Токен без срока не годен.
+    """
     if not token:
         return None
-    u = session.scalar(
-        select(TenantUser).where(TenantUser.magic_token == token, TenantUser.is_active.is_(True))
+    now = utcnow()
+    user_id = session.scalar(
+        update(TenantUser)
+        .where(
+            TenantUser.magic_token_hash == _magic_token_hash(token),
+            TenantUser.is_active.is_(True),
+            TenantUser.magic_token_expires_at >= now,
+        )
+        .values(magic_token_hash=None, magic_token_expires_at=None, last_login_at=now)
+        .returning(TenantUser.id)
+        .execution_options(synchronize_session=False)
     )
-    if not u:
+    if user_id is None:
         return None
-    if u.magic_token_expires_at and u.magic_token_expires_at < utcnow():
-        return None
-    u.magic_token = None
-    u.magic_token_expires_at = None
-    u.last_login_at = utcnow()
-    session.commit()
-    return u
+    # UPDATE прошёл мимо объектов сессии, а сессии проекта без autoflush и не
+    # сбрасывают объекты на commit: без перечитывания вызывающий получил бы
+    # пользователя с прежним токеном и прежним паролем.
+    return session.get(TenantUser, user_id, populate_existing=True)
+
+
+def verify_magic_token(session: Session, token: str) -> TenantUser | None:
+    """Проверить токен из ссылки. Годен — погасить, отметить вход, вернуть user.
+
+    Гашение записывается сразу. Кому после проверки нужно сделать что-то ещё,
+    что может не получиться, — `redeem_magic_token` и свой commit.
+    """
+    user = redeem_magic_token(session, token)
+    if user is not None:
+        session.commit()
+    return user
