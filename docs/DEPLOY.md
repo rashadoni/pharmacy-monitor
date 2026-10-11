@@ -272,11 +272,14 @@ checkout's code on the server. As of 2026-10-11, at least:
   was. One of them, `autonomous-pharmonline-decodo-public-api.yml`, runs on a
   weekly schedule from `main`, after checking that CI passed on that commit —
   so for that scrape a merge into `main` already is the release
-  (`docs/RUNBOOK.md`, «Выкладка правок сопоставления»). None of the four
-  upgrades the production schema: `recover-pharmonline-decodo-public-api.yml`
-  reads the database revision (`alembic current`, `alembic heads`) and no
-  longer runs `alembic upgrade head`. `deploy.yml` is the only workflow that
-  runs it against the production database.
+  (`docs/RUNBOOK.md`, «Выкладка правок сопоставления»). None of the four runs
+  `alembic upgrade`: `recover-pharmonline-decodo-public-api.yml` reads the
+  database revision (`alembic current`, `alembic heads`) and no longer
+  upgrades it. `deploy.yml` is the only workflow that runs `alembic upgrade`
+  against the production database. That is a statement about Alembic, not
+  about the schema: two of the four start the CLI's `run`, and the CLI's
+  `init_db()` calls `create_all` on PostgreSQL (`CLAUDE.md`, «Модели и
+  миграции сверяет CI»).
 
 The second item was re-counted later on 2026-10-11, after PR #49 removed nine
 workflows that day: it had said six workflows, and that the recover workflow
