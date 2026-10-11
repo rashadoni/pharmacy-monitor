@@ -111,6 +111,7 @@ jobs:
       - name: Typecheck (tsc --noEmit)
         run: pnpm typecheck
       - name: Unit tests (vitest)
+        timeout-minutes: 5
         run: pnpm test
       - name: Build
         run: NODE_OPTIONS=--max-old-space-size=4096 pnpm build
