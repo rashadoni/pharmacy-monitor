@@ -8,9 +8,10 @@
 `Authorization`, `X-API-Key` и пароль из тела `/auth/login`. Тело запроса
 уходило и без ошибки, в трассе успешного запроса: `new_password` и
 `current_password` штатный скраббер SDK не знает. Токен из
-`/auth/verify?token=…` уходил в строке запроса, в строке журнала доступа
-uvicorn и — при сбое базы — в параметрах запроса, которые SQLAlchemy дописывает
-в текст ошибки. Токен бота Telegram стоит в пути адреса исходящего запроса, а
+`/auth/verify?token=…` уходил в строке запроса и в строке журнала доступа
+uvicorn. При сбое базы SQLAlchemy дописывает в текст ошибки параметры запроса:
+хеш токена входа (до того как токен стали хранить хешем — сам токен), хеш
+пароля, адрес. Токен бота Telegram стоит в пути адреса исходящего запроса, а
 адрес SDK пишет в событие и в трассу.
 
 Как проверяется. `tests/sentry_probe.py` поднимает в отдельном процессе
@@ -31,6 +32,7 @@ uvicorn и — при сбое базы — в параметрах запрос
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -274,18 +276,28 @@ def test_access_log_breadcrumb_keeps_the_request_line_without_the_token(probe):
 
 
 def test_database_error_keeps_the_statement_without_its_parameters(probe):
-    """Сбой базы на входе по ссылке: токен — параметр запроса, и он в тексте ошибки."""
+    """Сбой базы на входе по ссылке: SQLAlchemy дописывает параметры запроса в текст ошибки.
+
+    Параметр здесь — SHA-256 токена из ссылки: столбец хранит хеш, сам токен в
+    запрос не идёт. Вырезаются параметры любые — в других запросах это адрес и
+    хеш пароля.
+    """
 
     def error_texts(mode):
         [event] = _payloads(probe[mode], "verify_500", "event")
         return [value["value"] for value in event["exception"]["values"]]
 
     token = probe["before_fix"]["canaries"]["magic_token"]
-    assert any(f"[parameters: ('{token}'" in text for text in error_texts("sdk_options_only"))
+    looked_up = hashlib.sha256(token.encode()).hexdigest()
+    assert any(
+        "[parameters: (" in text and f"'{looked_up}'" in text.split("[parameters: (")[1]
+        for text in error_texts("sdk_options_only")
+    )
 
     for mode in ("as_shipped", "hooks_only"):
         [text] = [t for t in error_texts(mode) if "[parameters: " in t]
         assert text.endswith("[parameters: [Filtered]]")
+        assert looked_up not in text
         assert "no such table: tenant_users" in text
         assert "WHERE tenant_users.magic_token = ?" in text
 

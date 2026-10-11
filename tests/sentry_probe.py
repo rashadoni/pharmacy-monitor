@@ -230,8 +230,8 @@ _replace(
 def _users_table_gone():
     """Запрос к пользователям падает в самой базе — как при её сбое.
 
-    Токен входа в это время уже подставлен в запрос параметром, и SQLAlchemy
-    дописывает параметры в текст ошибки.
+    Параметр запроса в это время уже подставлен — хеш токена входа, — и
+    SQLAlchemy дописывает параметры в текст ошибки.
     """
     with engine.begin() as connection:
         connection.exec_driver_sql("ALTER TABLE tenant_users RENAME TO tenant_users_gone")
