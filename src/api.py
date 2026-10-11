@@ -1028,12 +1028,14 @@ def auth_verify(token: str, request: Request, response: Response, db: Session = 
     получают прежний JSON-контракт.
     """
     wants_html = _wants_html(request)
-    user = tenants.verify_magic_token(db, token)
+    user = tenants.redeem_magic_token(db, token)
     if not user:
         if wants_html:
             return RedirectResponse(url="/login?error=link", status_code=303)
         raise HTTPException(401, "Invalid or expired token")
     jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
+    # Ссылка гаснет, когда сессия уже готова: сбой до этой строки её не сжигает.
+    db.commit()
     secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")
     if wants_html:
         redirect = RedirectResponse(url="/overview", status_code=303)
@@ -1057,8 +1059,81 @@ def auth_verify(token: str, request: Request, response: Response, db: Session = 
     return {"ok": True, "user_id": user.id}
 
 
+# bcrypt берёт от пароля 72 байта. bcrypt 5 на более длинном бросает ValueError —
+# и на записи, и на сверке; версии до неё молча отбрасывали хвост.
+PASSWORD_MAX_BYTES = 72
+PASSWORD_MIN_CHARS = 6
+
+_PASSWORD_PROBLEMS = {
+    "password_not_text": "В пароле есть знак, который нельзя сохранить — наберите пароль заново",
+    "password_too_short": f"Пароль должен быть минимум {PASSWORD_MIN_CHARS} символов",
+    "password_too_long": (
+        f"Пароль слишком длинный: помещается {PASSWORD_MAX_BYTES} латинских знака, "
+        "кириллические и буквы вроде ə, ö, ş занимают по два"
+    ),
+}
+
+
+def _password_problem(password: str) -> str | None:
+    """Почему строку нельзя задать паролем — код причины; можно — None.
+
+    Длина сверху считается в байтах UTF-8, как её считает bcrypt: 73 латинских
+    знака и 37 кириллических не помещаются одинаково. Снизу — в знаках.
+    """
+    try:
+        size = len(password.encode("utf-8"))
+    except UnicodeEncodeError:
+        # Одиночный суррогат: в JSON такая строка допустима, в UTF-8 — нет.
+        return "password_not_text"
+    if "\x00" in password:
+        # Нулевой байт bcrypt берёт за конец пароля и дальше идёт по кругу:
+        # «abc\0abc» сверился бы с «abc» — в обход нижней границы.
+        return "password_not_text"
+    if len(password) < PASSWORD_MIN_CHARS:
+        return "password_too_short"
+    if size > PASSWORD_MAX_BYTES:
+        return "password_too_long"
+    return None
+
+
+def _usable_new_password(raw: str, *, field: str = "new_password") -> str:
+    """Новый пароль в том виде, в каком его потом сверит вход, — или отказ 422.
+
+    Зовётся до любой записи. Пробелы по краям отбрасываются: вход отбрасывает их
+    тоже (`PasswordLoginIn`), и пароль, сохранённый с ними, не вошёл бы никогда.
+
+    Ответ — как у проверки полей FastAPI (`type`, `loc`, `msg`), по `type`
+    интерфейс подбирает текст на своём языке. Правило не стоит валидатором
+    модели намеренно: тот возвращает в ответе присланное значение — пароль, — а
+    на одиночном суррогате ответ не собирается вовсе, выходит 500.
+    """
+    password = raw.strip()
+    problem = _password_problem(password)
+    if problem:
+        raise HTTPException(
+            422,
+            detail=[{"type": problem, "loc": ["body", field], "msg": _PASSWORD_PROBLEMS[problem]}],
+        )
+    return password
+
+
+def _bcrypt_takes(password: str) -> bool:
+    """Возьмёт ли bcrypt строку вообще: она кодируется и не длиннее 72 байт."""
+    try:
+        return len(password.encode("utf-8")) <= PASSWORD_MAX_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
 def _verify_bcrypt(password: str, hash_str: str) -> bool:
-    """Verify bcrypt password. Used by auth.login и change-password."""
+    """Verify bcrypt password. Used by auth.login и change-password.
+
+    Строка, которую bcrypt не берёт, не совпадает ни с одним хешем: это отказ,
+    а не ошибка сервера. Остальное правило нового пароля сверка не знает — хеш
+    мог прийти из `ADMIN_PASSWORD_HASH`, где его никто не проверял.
+    """
+    if not _bcrypt_takes(password):
+        return False
     try:
         import bcrypt
 
@@ -1067,6 +1142,20 @@ def _verify_bcrypt(password: str, hash_str: str) -> bool:
         from passlib.hash import bcrypt as bcrypt_pl
 
         return bcrypt_pl.verify(password, hash_str)
+
+
+def _is_current_password(typed: str, hash_str: str) -> bool:
+    """Тот ли это пароль, которым пользователь входит.
+
+    Сверяется как набран, а если не сошлось — без пробелов по краям: вход их
+    отбрасывает, и новый пароль с ними не сохраняется. Набранное как есть идёт
+    первым ради пароля, сохранённого с пробелами прежним кодом: войти таким
+    нельзя, сменить можно только так.
+    """
+    if _verify_bcrypt(typed, hash_str):
+        return True
+    stripped = typed.strip()
+    return stripped != typed and _verify_bcrypt(stripped, hash_str)
 
 
 def _hash_bcrypt(password: str) -> str:
@@ -1166,6 +1255,7 @@ class SetPasswordIn(BaseModel):
     """Задать пароль по magic-token из письма-приглашения."""
 
     token: str
+    # Правило пароля проверяет обработчик (`_usable_new_password`), не модель.
     new_password: str
 
     @field_validator("token")
@@ -1174,15 +1264,6 @@ class SetPasswordIn(BaseModel):
         v = v.strip()
         if not v or len(v) > 512:
             raise ValueError("invalid token")
-        return v
-
-    @field_validator("new_password")
-    @classmethod
-    def _check_password(cls, v: str) -> str:
-        if len(v) < 6:
-            raise ValueError("Пароль должен быть минимум 6 символов")
-        if len(v) > 200:
-            raise ValueError("too long")
         return v
 
 
@@ -1195,11 +1276,18 @@ def auth_set_password(
     Проверяет token (одноразовый, TTL 30 мин), сохраняет bcrypt(new_password) в
     user.password_hash и сразу логинит (ставит JWT cookie). Дальше пользователь
     входит по email+паролю через /auth/login. Невалидный/просроченный token → 401.
+    Пароль, который задать нельзя, → 422, и ссылка остаётся годной.
     """
+    # До токена: отказ по паролю ссылку не трогает.
+    new_password = _usable_new_password(payload.new_password)
+
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(f"setpw:{client_ip}", limit=10)
 
-    user = tenants.verify_magic_token(db, payload.token)
+    # Гашение ссылки и запись пароля — одна транзакция. До commit ниже любой
+    # сбой (bcrypt, сессия, база) откатывает и то, и другое: ссылка остаётся
+    # годной, а не сгорает без пароля.
+    user = tenants.redeem_magic_token(db, payload.token)
     if not user:
         _check_rate_limit(f"setpw_fail:{client_ip}", limit=5)
         raise HTTPException(401, "Ссылка недействительна или истекла")
@@ -1208,12 +1296,14 @@ def auth_set_password(
     # У юзера с паролем magic-link ведёт на /auth/verify (вход), а не сюда; иначе
     # перезапись пароля по перехваченной login-ссылке = persistent takeover.
     if user.password_hash:
+        # Это отказ, а не сбой: ссылка предъявлена и гаснет, как и раньше.
+        db.commit()
         raise HTTPException(400, "Пароль уже задан — войдите по email и паролю")
 
-    user.password_hash = _hash_bcrypt(payload.new_password)
+    user.password_hash = _hash_bcrypt(new_password)
+    jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
     db.commit()
 
-    jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
     secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")
     response.set_cookie(
         key=COOKIE_NAME,
@@ -1260,17 +1350,19 @@ def dash_change_password(
     На success — сохраняет bcrypt(new_password) в user.password_hash. С этого
     момента env ADMIN_PASSWORD_HASH перестаёт использоваться для этого user'а.
     """
-    if len(payload.new_password) < 6:
-        raise HTTPException(400, "Пароль должен быть минимум 6 символов")
-    if payload.current_password == payload.new_password:
-        raise HTTPException(400, "Новый пароль не должен совпадать с текущим")
+    new_password = _usable_new_password(payload.new_password)
 
     env_pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
     pw_to_check = user.password_hash or env_pw_hash
-    if not pw_to_check or not _verify_bcrypt(payload.current_password, pw_to_check):
+    if not pw_to_check or not _is_current_password(payload.current_password, pw_to_check):
         raise HTTPException(401, "Текущий пароль неверный")
+    # С тем, что хранится, а не с тем, что набрано в поле «текущий»: его могли
+    # набрать с пробелами по краям, а пароль, сохранённый с ними прежним кодом,
+    # меняют на тот же без них — и это уже другой пароль.
+    if _verify_bcrypt(new_password, pw_to_check):
+        raise HTTPException(400, "Новый пароль не должен совпадать с текущим")
 
-    user.password_hash = _hash_bcrypt(payload.new_password)
+    user.password_hash = _hash_bcrypt(new_password)
     db.commit()
     return {"ok": True}
 

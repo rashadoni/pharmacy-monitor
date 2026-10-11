@@ -13,7 +13,12 @@
 - содержимое колонки токеном не служит — ни хеш, ни токен, записанный открытым
   текстом прежним кодом;
 - так на каждом пути выдачи: запрос ссылки, приглашение, повторная отправка
-  админом, команда `tenant issue-token`.
+  админом, команда `tenant issue-token`;
+- токен гаснет вместе с тем, ради чего предъявлен: сбой после проверки (bcrypt,
+  сессия) ссылку не сжигает — до 2026-10-10 она сгорала, а пароля не было.
+
+Что из двух одновременных запросов с одним токеном проходит один, SQLite не
+покажет — `tests/test_magic_link_redeem_postgres.py`.
 
 Чего здесь нет: журнала прокси. Caddy пишет адрес запроса вместе с `?token=…`,
 и это тест не видит — docs/RUNBOOK.md, «Ссылка из письма не входит».
@@ -140,7 +145,7 @@ def test_the_token_is_in_no_query_and_no_log_line(db_session, written):
     assert tenants.verify_magic_token(db_session, token) is None
 
     _assert_written_nowhere(written, token)
-    # Хеш ушёл в базу трижды: запись и два поиска.
+    # Хеш ушёл в базу трижды: запись и две попытки гашения.
     assert sum(_sha256(token) in line for line in written()) >= 3
 
 
@@ -197,6 +202,20 @@ def test_the_token_lives_half_an_hour(db_session, monkeypatch, minutes_later, si
     assert (tenants.verify_magic_token(db_session, token) is not None) is signs_in
 
 
+@pytest.mark.parametrize(("seconds_past_the_term", "signs_in"), [(0, True), (1, False)])
+def test_the_term_ends_to_the_second(db_session, monkeypatch, seconds_past_the_term, signs_in):
+    """Срок сверяет сама база, в условии гашения: ни минуты сверх названного."""
+    _add_user(db_session)
+    issued_at = utcnow()
+    monkeypatch.setattr(tenants, "utcnow", lambda: issued_at)
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+
+    now = issued_at + timedelta(minutes=30, seconds=seconds_past_the_term)
+    monkeypatch.setattr(tenants, "utcnow", lambda: now)
+
+    assert (tenants.verify_magic_token(db_session, token) is not None) is signs_in
+
+
 def test_a_token_without_a_term_does_not_sign_in(db_session):
     """Срок ставит выдача; строка без срока — ручная правка базы, а не вечный вход."""
     user = _add_user(db_session)
@@ -232,6 +251,60 @@ def test_a_token_stored_in_the_clear_by_the_old_code_does_not_sign_in(db_session
     db_session.commit()
 
     assert tenants.verify_magic_token(db_session, in_the_clear) is None
+
+
+# ─── Гашение: условие в самом запросе, запись — за вызывающим ────────────────
+
+
+def test_a_live_token_of_a_switched_off_account_does_not_sign_in(db_session):
+    user = _add_user(db_session)
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+    user.is_active = False
+    db_session.commit()
+    before = _row(db_session, user)
+
+    assert tenants.verify_magic_token(db_session, token) is None
+    assert _row(db_session, user) == before
+
+
+def test_the_user_handed_back_is_the_row_as_it_is_now(db_session):
+    """Сессии проекта не сбрасывают объекты ни перед запросом, ни на commit.
+
+    Пользователь уже загружен в сессию, а его строку меняет другая: вернуться
+    должен он же — с нынешним паролем и без токена. По устаревшему паролю
+    `/auth/set-password` решил бы, что пароля ещё нет.
+    """
+    user = _add_user(db_session)
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+    with sessionmaker(db_session.get_bind(), autoflush=False)() as elsewhere:
+        elsewhere.get(TenantUser, user.id).password_hash = "set-by-another-session"
+        elsewhere.commit()
+    assert user.password_hash is None and user.magic_token_hash == _sha256(token)
+
+    handed_back = tenants.verify_magic_token(db_session, token)
+
+    assert handed_back is user
+    assert user.password_hash == "set-by-another-session"
+    assert user.magic_token_hash is None and user.magic_token_expires_at is None
+    assert user.last_login_at is not None
+
+
+def test_redeeming_is_not_final_until_the_caller_commits(db_session):
+    user = _add_user(db_session)
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+    before = _row(db_session, user)
+
+    assert tenants.redeem_magic_token(db_session, token).id == user.id
+    assert _row(db_session, user)["magic_token"] is None
+    db_session.rollback()
+
+    assert _row(db_session, user) == before
+    # Вторым заходом — уже с commit: ссылка та же, и теперь она погашена.
+    assert tenants.redeem_magic_token(db_session, token).id == user.id
+    db_session.commit()
+    db_session.rollback()
+    assert _row(db_session, user)["magic_token"] is None
+    assert tenants.redeem_magic_token(db_session, token) is None
 
 
 # ─── Пути выдачи: токен уходит письмом, в базе — хеш ─────────────────────────
@@ -359,6 +432,91 @@ def test_a_token_that_is_not_text_is_refused_not_a_server_error(client, db_sessi
     )
 
     assert refused.status_code == 401
+
+
+# ─── Сбой после проверки токена ссылку не сжигает ────────────────────────────
+
+
+def _broken(*args, **kwargs):
+    raise RuntimeError("сломано нарочно")
+
+
+@pytest.mark.parametrize("broken", ["_hash_bcrypt", "_make_jwt"])
+def test_a_failure_while_setting_the_password_does_not_spend_the_invitation(
+    client, db_session, monkeypatch, broken
+):
+    """Раньше токен гас отдельным commit до хеширования: ссылка сгорала без пароля."""
+    user = _add_user(db_session)
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+    before = _row(db_session, user)
+    body = {"token": token, "new_password": PASSWORD}
+
+    with monkeypatch.context() as patch:
+        patch.setattr(api_module, broken, _broken)
+        failed = TestClient(api_module.app, raise_server_exceptions=False).post(
+            "/auth/set-password", json=body
+        )
+
+    assert failed.status_code == 500
+    # Ни токен, ни срок, ни отметка входа, ни пароль не записаны.
+    assert _row(db_session, user) == before
+    created = client.post("/auth/set-password", json=body)
+    assert created.status_code == 200, created.text
+    db_session.refresh(user)
+    assert api_module._verify_bcrypt(PASSWORD, user.password_hash)
+
+
+def test_a_failure_while_signing_in_does_not_spend_the_link(client, db_session, monkeypatch):
+    user = _add_user(db_session, password_hash=api_module._hash_bcrypt(PASSWORD))
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+    before = _row(db_session, user)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(api_module, "_make_jwt", _broken)
+        failed = TestClient(api_module.app, raise_server_exceptions=False).get(
+            "/auth/verify", params={"token": token}
+        )
+
+    assert failed.status_code == 500
+    assert _row(db_session, user) == before
+    signed_in = client.get("/auth/verify", params={"token": token})
+    assert signed_in.status_code == 200 and signed_in.json()["user_id"] == user.id
+
+
+def test_a_link_clicked_in_a_browser_signs_in_once(client, db_session):
+    """Клик из письма — навигация браузера: ответ другой, гашение то же."""
+    user = _add_user(db_session, password_hash=api_module._hash_bcrypt(PASSWORD))
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+    click = {"params": {"token": token}, "headers": {"accept": "text/html"}}
+
+    first = client.get("/auth/verify", follow_redirects=False, **click)
+
+    assert first.status_code == 303 and first.headers["location"] == "/overview"
+    assert api_module.COOKIE_NAME in first.cookies
+    row = _row(db_session, user)
+    assert row["magic_token"] is None and row["last_login_at"] is not None
+    client.cookies.clear()
+    again = client.get("/auth/verify", follow_redirects=False, **click)
+    assert again.status_code == 303 and again.headers["location"] == "/login?error=link"
+    assert api_module.COOKIE_NAME not in again.cookies
+
+
+def test_a_login_link_sets_no_password_and_is_spent_by_the_attempt(client, db_session):
+    """У кого пароль есть, тому ссылка — вход, а не новый пароль: это отказ, не сбой.
+
+    Ссылка при этом гаснет, как и раньше: предъявленная не туда, она не остаётся
+    входом для того, кто её перехватил.
+    """
+    user = _add_user(db_session, password_hash=api_module._hash_bcrypt(PASSWORD))
+    token = tenants.issue_magic_token(db_session, ADDRESS)
+
+    refused = client.post("/auth/set-password", json={"token": token, "new_password": "another-1"})
+
+    assert refused.status_code == 400
+    row = _row(db_session, user)
+    assert api_module._verify_bcrypt(PASSWORD, row["password_hash"])
+    assert row["magic_token"] is None and row["magic_token_expires_at"] is None
+    assert client.get("/auth/verify", params={"token": token}).status_code == 401
 
 
 @pytest.fixture

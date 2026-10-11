@@ -5,6 +5,18 @@ import { useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
 import { Lock, KeyRound } from "lucide-react";
+import {
+  passwordProblem,
+  passwordProblemInResponse,
+  type PasswordProblem,
+} from "@/lib/password-rule";
+
+// Причина, по которой пароль задать нельзя, → ключ текста в `set_password`.
+const PROBLEM_TEXT = {
+  password_not_text: "error_unusable",
+  password_too_short: "error_short",
+  password_too_long: "error_long",
+} as const satisfies Record<PasswordProblem, string>;
 
 /**
  * /[locale]/set-password?token=...
@@ -12,6 +24,9 @@ import { Lock, KeyRound } from "lucide-react";
  * Приглашённый пользователь задаёт свой пароль по одноразовому magic-token из
  * письма. POST /auth/set-password → backend ставит password_hash + JWT cookie →
  * redirect на /overview. Дальше юзер входит по email+паролю на /login.
+ *
+ * Пароль, который сервер не примет (короткий, длиннее 72 байт), сюда же и
+ * возвращается с причиной — до отправки; ссылка при таком отказе остаётся годной.
  *
  * Suspense обязателен для useSearchParams при SSG из [locale]/ сегмента.
  */
@@ -25,6 +40,9 @@ function SetPasswordInner() {
   const [confirm, setConfirm] = useState("");
   const [status, setStatus] = useState<"idle" | "loading" | "error">("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Ссылка больше не годится (сервер отказал по ней самой). Отказ по паролю и
+  // сбой её не гасят — новую тогда предлагать незачем: она погасила бы эту.
+  const [linkSpent, setLinkSpent] = useState(false);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -33,9 +51,10 @@ function SetPasswordInner() {
       setErrorMsg(t("token_missing"));
       return;
     }
-    if (password.length < 6) {
+    const problem = passwordProblem(password);
+    if (problem) {
       setStatus("error");
-      setErrorMsg(t("error_short"));
+      setErrorMsg(t(PROBLEM_TEXT[problem]));
       return;
     }
     if (password !== confirm) {
@@ -53,9 +72,19 @@ function SetPasswordInner() {
         body: JSON.stringify({ token, new_password: password }),
       });
       if (!res.ok) {
-        if (res.status === 401) throw new Error(t("error_invalid"));
+        if (res.status === 401) {
+          setLinkSpent(true);
+          throw new Error(t("error_invalid"));
+        }
         const data = await res.json().catch(() => ({}));
-        throw new Error(data?.detail || t("error_generic"));
+        // 400 — пароль у пользователя уже есть; ссылка при этом погашена.
+        if (res.status === 400) setLinkSpent(true);
+        const refused = passwordProblemInResponse(data);
+        if (refused) throw new Error(t(PROBLEM_TEXT[refused]));
+        // `detail` бывает и списком — тогда это не текст для человека.
+        throw new Error(
+          typeof data?.detail === "string" ? data.detail : t("error_generic"),
+        );
       }
       // Cookie set — logged in. Redirect to dashboard.
       router.replace("/overview");
@@ -143,7 +172,7 @@ function SetPasswordInner() {
             </button>
           </form>
 
-          {(status === "error" || !token) && (
+          {(linkSpent || !token) && (
             <p className="text-center text-xs text-muted-foreground mt-6">
               <a href="/login" className="underline text-primary">
                 {t("request_new")}
