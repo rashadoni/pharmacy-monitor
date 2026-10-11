@@ -479,6 +479,92 @@ sudo -u pharmacy uv run --directory /opt/pharmacy-monitor pharmacy-monitor \
   telegram send-test CHAT_ID --text "manual test"
 ```
 
+### Параметры упавшего запроса
+
+**Симптом.** В ошибке запроса к базе — в журнале, в Sentry, в `runs.error_message` —
+вместо параметров стоит `[SQL parameters hidden due to hide_parameters=True]`, а
+после первой строки ошибки PostgreSQL —
+`[details hidden: the full text is in the PostgreSQL log]`. У ошибок данных
+(значение не подошло типу или не влезло в колонку) нет и первой строки:
+`data exception, SQLSTATE 22001 [details hidden: ...]`.
+
+Так задумано (правка 2026-10-11). Текст ошибки запроса расходится далеко: Sentry —
+сторонний сервис, журнал шага GitHub Actions публичный, `runs.error_message`
+показывает дашборд. Раньше в нём стояли данные запроса: параметры (токен входа,
+адрес, хеш пароля), а при нарушении ограничения — вся строка таблицы, её приводит
+сам PostgreSQL. Теперь от ошибки остаются класс (`UniqueViolation`,
+`StringDataRightTruncation`), первая строка сервера и запрос с именами параметров
+(`[SQL: ...]`). Устроено это в `src/storage.py`, рядом с
+`create_engine_hiding_statement_data`.
+
+**Полный текст ошибки сервера** — DETAIL, HINT, CONTEXT — лежит в журнале
+PostgreSQL на сервере базы. Читают его `postgres`, root и группа `adm`; у `pm`,
+под которым работает приложение и ходит CI, доступа нет — смотрит владелец под
+root. Ротация раз в неделю, хранится десять архивов
+(`/etc/logrotate.d/postgresql-common`):
+
+```bash
+# время взять из журнала приложения; у каждой ошибки рядом STATEMENT — сам запрос
+zgrep -h -A4 "ERROR:" /var/log/postgresql/postgresql-16-main.log* | less
+```
+
+Подсказка сервера тоже только там. Сбор aloe, упавший на предохранителе, в своей
+ошибке несёт «already stored under its site number», а строку
+`HINT: Code older than migration ...` — уже нет.
+
+**Параметры запроса** сервер по умолчанию не пишет
+(`log_parameter_max_length_on_error = 0`; на проде так, проверено 2026-10-11).
+Нужны для разбора — включить на время и повторить сбой:
+
+```bash
+sudo -u postgres psql -X -c "ALTER SYSTEM SET log_parameter_max_length_on_error = 200" \
+                         -c "SELECT pg_reload_conf()"
+# ... повторить сбой, прочитать журнал: строка CONTEXT ... with parameters: $1 = '...'
+# (у ошибки типа — CONTEXT ... parameter $1 = '...': только тот параметр, что не подошёл)
+sudo -u postgres psql -X -c "ALTER SYSTEM RESET log_parameter_max_length_on_error" \
+                         -c "SELECT pg_reload_conf()"
+```
+
+⚠️ Пока настройка включена, в журнал PostgreSQL ложатся параметры упавших
+запросов, в том числе токен входа и хеш пароля, — выключить сразу после разбора.
+Замерено на PostgreSQL 16: параметры есть у нарушения ограничения, ошибки типа и
+`statement_timeout`; у ожидания замка на таблице строки CONTEXT не было вовсе.
+Те же параметры сервер в это время приписывает и к ошибке, которую отдаёт
+приложению. В текст ошибки приложения они не попадают: всё после первой строки
+отбрасывается, это проверяет `test_parameters_logged_by_the_server_are_not_printed`.
+Запись в настройки сервера — действие на проде, его делает владелец.
+
+Не трогая прод: повторить сбой на копии базы (рецепт одноразового PostgreSQL —
+«Модели и миграции» ниже), там параметры можно писать без оглядки. Так же — с
+тестом, упавшим в CI: журнал PostgreSQL там не печатается.
+
+**Выложена ли защита.** Два файла, и возят их по-разному:
+
+```bash
+grep -c create_engine_hiding_statement_data /opt/pharmacy-monitor/src/storage.py
+grep -c create_engine_hiding_statement_data /opt/pharmacy-monitor/migrations/env.py
+```
+
+Первый ноль значит, что на сервере прежний код и ошибки запросов печатаются с
+параметрами. Второй ноль — что с параметрами печатает `alembic upgrade`:
+`migrations/env.py` выкладка не возит (`deploy.yml` кладёт `src/` и
+`migrations/versions/`), на 2026-10-11 там файл от 2026-08-23. Журнал шага
+`deploy.yml` публичный: упавшая миграция, которая пишет в таблицу пользователей,
+напечатала бы в него строку. Положить файл руками мало — выкладка старого
+коммита (откат) оставит его рядом со старым `src/`, и `alembic current` упадёт на
+импорте. Возить каталог `migrations/` целиком и исполнять миграцию из копии
+своего релиза учит выкладку PR #35 («сначала база, потом код»); после его мержа и
+выкладки проверить второй командой ещё раз.
+
+**Если в журнале или в Sentry снова появилось `[parameters:` или `DETAIL:`** —
+где-то создан движок мимо фабрики (`tests/test_statement_data_stays_out_of_errors.py`
+ловит это в `src/`, `migrations/` и в новых workflow, но не в `scripts/`) либо
+ошибку печатает код, который сам достаёт данные из исключения (`exc.params`,
+`exc.orig.diag`). Значение в первой строке ошибки (`no operand in tsquery: "..."`,
+текст `RAISE EXCEPTION`) — не поломка защиты: первую строку вне ошибок данных она
+оставляет как есть. Как убрать из публичного журнала уже попавшее — «Email не
+приходит» выше, про удаление журнала прогона.
+
 ### Замок сопоставления потерян посреди этапа
 
 **Симптом** — в журнале PostgreSQL, а не приложения:
