@@ -15,11 +15,19 @@ Starlette и SQLAlchemy на весь процесс, а stdout и stderr это
 Наружу ничего не уходит: DSN указывает на `.invalid`, транспорт подменён и
 складывает части конвертов в список.
 
-Проверяется один путь — текст ошибки. Два соседних пути закрыты аргументами
-`sentry_sdk.init` прямо здесь, что бы ни передал `init_sentry`: переменные
-кадров (в кадрах SQLAlchemy лежит переменная `parameters`) и тело запроса (в
-нём пароль и токен). Иначе проба не отличила бы параметры в тексте ошибки от
-тех же значений, пришедших соседним путём.
+Проверяется один слой — движок: что стоит в тексте ошибки, когда он доходит
+до Sentry. Остальное закрыто или снято аргументами `sentry_sdk.init` прямо
+здесь, что бы ни передал `init_sentry`:
+
+- переменные кадров (в кадрах SQLAlchemy лежит переменная `parameters`) и тело
+  запроса (в нём пароль и токен) не собираются — иначе проба не отличила бы
+  данные в тексте ошибки от тех же значений, пришедших соседним путём;
+- хуки `before_send` сняты. С PR #84 они сами вырезают из события
+  `[parameters: …]` и строки DETAIL / CONTEXT; с ними контрольный режим не
+  увидел бы утечки, а чистый конверт ничего не говорил бы о движке. Хуки
+  проверяет свой тест — `tests/test_sentry_events_carry_no_credentials.py`;
+  журнал, `runs.error_message` и трассировку CLI они не закрывают, это делает
+  только движок.
 
 Режимы:
     guarded    движок создаёт `storage.create_engine_hiding_statement_data`;
@@ -84,7 +92,12 @@ _real_init = sentry_sdk.init
 
 
 def _init_with_recording_transport(**options):
-    options.update(include_local_variables=False, max_request_body_size="never")
+    options.update(
+        include_local_variables=False,
+        max_request_body_size="never",
+        before_send=None,
+        before_send_transaction=None,
+    )
     return _real_init(transport=RecordingTransport, **options)
 
 
