@@ -541,6 +541,19 @@ def _wait_until_serving(port: int, process: subprocess.Popen, log_path: Path) ->
             time.sleep(0.1)
 
 
+def _wait_until_every_worker_started(process: subprocess.Popen, log_path: Path) -> None:
+    """Первый ответ даёт тот рабочий процесс, что поднялся раньше; ждём и остальных —
+    иначе на медленной машине остановка застала бы второй на старте."""
+    deadline = time.monotonic() + 120
+    while True:
+        output = log_path.read_text(encoding="utf-8", errors="replace")
+        if output.count("Application startup complete.") >= _worker_count():
+            return
+        assert process.poll() is None, f"uvicorn остановился:\n{output[-4000:]}"
+        assert time.monotonic() < deadline, f"не все рабочие процессы поднялись:\n{output[-4000:]}"
+        time.sleep(0.1)
+
+
 def _stop(process: subprocess.Popen) -> None:
     """Остановить uvicorn вместе с рабочими процессами — у них своя группа."""
     if process.poll() is None:
@@ -581,6 +594,7 @@ def probe(tmp_path_factory) -> dict[str, dict]:
             runs[mode] = {"tokens": tokens, "log_path": log_path, "calls": _calls(tokens)}
         for mode in MODES:
             _wait_until_serving(ports[mode], processes[mode], runs[mode]["log_path"])
+            _wait_until_every_worker_started(processes[mode], runs[mode]["log_path"])
         for mode in MODES:
             statuses = {call.name: _send(ports[mode], call) for call in runs[mode]["calls"]}
             # Не HTTP вовсе: об этом uvicorn пишет предупреждение, без строки запроса.
