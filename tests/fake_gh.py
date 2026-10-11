@@ -14,11 +14,10 @@
 - `argv.jsonl` — аргументы каждого запуска, как пришли.
 - `calls.jsonl` — запуски, которые удалось разобрать: метод, путь, фильтр, тело.
 
-`FAKE_GH_GET` — как отвечает чтение:
-
-- `ok` (по умолчанию);
-- `fail` — всегда 502; `fail_first` — только первое; `fail_after_put` — те, что
-  идут после записи.
+`FAKE_GH_GET` — когда чтение не удаётся: `ok` (никогда, по умолчанию), `fail`
+(всегда), `fail_first` (только первое), `fail_after_put` (те, что идут после
+записи). `FAKE_GH_GET_ERROR` — чем именно оно не удаётся (`GET_ERRORS`): отказом
+с телом ответа, как у настоящего `gh`, или «успехом» без вердикта.
 
 `FAKE_GH_PUT` — что делает запись:
 
@@ -26,6 +25,7 @@
   GitHub (`as_github_returns`);
 - `drop_pull_request_rule` — принять, но остаться без требования pull request;
 - `keep_admins_exempt` — принять, но правила на администратора не действуют;
+- `unpin_checks` — принять, но проверки засчитываются из любого источника;
 - `reject` — отказать с 422, ничего не меняя;
 - `error_after_apply` — применить и после этого ответить ошибкой (обрыв связи
   на ответе).
@@ -55,6 +55,38 @@ import sys
 from pathlib import Path
 
 API = "https://api.github.com/"
+# Чем кончается неудавшееся чтение: (код выхода, stdout, stderr). Настоящий `gh`
+# на отказе печатает тело ответа в stdout — скрипт по нему отличает незащищённую
+# ветку от всего остального, поэтому тела здесь разные и похожие на правду.
+GET_ERRORS = {
+    "502": (1, "<html><body><h1>502 Bad Gateway</h1></body></html>", "gh: HTTP 502"),
+    "403": (
+        1,
+        json.dumps({"message": "API rate limit exceeded for user ID 1.", "status": "403"}),
+        "gh: API rate limit exceeded for user ID 1. (HTTP 403)",
+    ),
+    "404_not_found": (
+        1,
+        json.dumps({"message": "Not Found", "status": "404"}),
+        "gh: Not Found (HTTP 404)",
+    ),
+    "404_branch_not_found": (
+        1,
+        json.dumps({"message": "Branch not found", "status": "404"}),
+        "gh: Branch not found (HTTP 404)",
+    ),
+    # Страница ошибки, которая цитирует те самые слова, но ответом GitHub не является.
+    "503_quoting": (
+        1,
+        '<html><body>upstream said: {"message": "Branch not protected"}</body></html>',
+        "gh: HTTP 503",
+    ),
+    # Код 0, а сверки нет.
+    "empty": (0, "", ""),
+    "partial": (0, "pull request required  : true\nrequired approvals     : 0", ""),
+    "lookalike": (0, "RESULT: match?", ""),
+}
+
 SWITCHES = (
     "required_linear_history",
     "allow_force_pushes",
@@ -107,9 +139,13 @@ def _refuse(message: str, code: int) -> int:
     return code
 
 
-def _server_error() -> int:
-    print("gh: HTTP 502", file=sys.stderr)
-    return 1
+def _fail(kind: str) -> int:
+    code, out, err = GET_ERRORS[kind]
+    if out:
+        print(out)
+    if err:
+        print(err, file=sys.stderr)
+    return code
 
 
 def main(argv: list[str]) -> int:
@@ -163,7 +199,7 @@ def main(argv: list[str]) -> int:
             or (reading == "fail_first" and "GET" not in earlier)
             or (reading == "fail_after_put" and "PUT" in earlier)
         ):
-            return _server_error()
+            return _fail(os.environ.get("FAKE_GH_GET_ERROR", "502"))
         if not state_file.exists():
             print(json.dumps({"message": "Branch not protected", "status": "404"}))
             print("gh: Branch not protected (HTTP 404)", file=sys.stderr)
@@ -185,11 +221,14 @@ def main(argv: list[str]) -> int:
             state.pop("required_pull_request_reviews", None)
         elif effect == "keep_admins_exempt":
             state["enforce_admins"]["enabled"] = False
+        elif effect == "unpin_checks":
+            for check in state["required_status_checks"]["checks"]:
+                check["app_id"] = None
         elif effect not in ("apply", "error_after_apply"):
             return _refuse(f"unknown FAKE_GH_PUT={effect}", 97)
         state_file.write_text(json.dumps(state))
         if effect == "error_after_apply":
-            return _server_error()
+            return _fail("502")
         print(json.dumps(state))
         return 0
 

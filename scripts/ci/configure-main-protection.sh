@@ -23,11 +23,15 @@
 # Usage:
 #   bash scripts/ci/configure-main-protection.sh --check [owner/repo]
 #       read-only: compares the live protection with the payload below and
-#       sends nothing. Exit 0 = the same, 1 = different, 3 = could not tell.
+#       sends nothing.
 #   bash scripts/ci/configure-main-protection.sh --apply [owner/repo]
-#       writes the payload — only when the comparison found a difference, or
-#       found the branch unprotected. Reads the result back and fails unless
-#       it equals the payload.
+#       writes the payload — only after a comparison that ended in "MISMATCH",
+#       or on a branch GitHub reports as unprotected. Then reads the result
+#       back.
+# Exit codes, both modes: 0 = GitHub has what is written here (and nothing was
+# sent, or the write was read back and equals the payload); 1 = it has
+# something else; 2 = arguments not understood, nothing requested; 3 = could
+# not tell — a read or the write failed.
 # Without a flag it is `--check`. Always type `--check` anyway: the copies of
 # this file from before this change (see below) do not know flags and WRITE
 # when run with none.
@@ -39,26 +43,28 @@
 # all. The workflow is deleted and must not come back — see Layer 2 of
 # docs/DELIVERY-ARCHITECTURE.md.
 #
-# Changed 2026-10-11. Until then the payload said
+# Changed 2026-10-11. Before this change the payload said
 # `"required_pull_request_reviews": null`, while this header promised "only
 # through a pull request". GitHub's API description reads null as "disable",
 # and the PUT replaces the whole protection object: a run would have removed
 # the pull-request requirement that is set on GitHub, and a commit with green
 # checks could then have been pushed straight to `main`. (Read from the API
-# description. Never tried. Every earlier version of this file sent null, so
-# the requirement that is on GitHub was not put there by this script.) The
-# closing report would not have shown it: it printed `pull_request_only` from
-# the status-check field, so it said `true` whatever the pull-request field
-# held. Now the payload carries the requirement, the report is a comparison of
-# what GitHub returns with the payload, and writing takes an explicit flag.
+# description. Never tried. Every version that was on `main` before this
+# change sent null, so the requirement that is on GitHub was not put there by
+# this script.) The closing report would not have shown it: it printed
+# `pull_request_only` from the status-check field, so it said `true` whatever
+# the pull-request field held. Now the payload carries the requirement, the
+# report is a comparison of what GitHub returns with the payload, and writing
+# takes an explicit flag.
 #
 # NOT VERIFIED BY A RUN, as of 2026-10-11: `--apply` has never sent its write
 # to GitHub — branch protection is not changed for the sake of a test. What was
 # checked instead: the payload against the live protection, by reading it; the
 # comparison filter in gh's own jq, on that same read; and the script against a
 # stand-in `gh` that never reaches the network
-# (tests/test_main_protection_script.py). Rewrite this paragraph after the
-# first real write.
+# (tests/test_main_protection_script.py). After the first real write, rewrite
+# this paragraph and the two that say the same: Layer 1 of
+# docs/DELIVERY-ARCHITECTURE.md and the delivery section of CLAUDE.md.
 #
 # Before `--apply`:
 #   - it is the owner's call, not an agent's (docs/DELIVERY-ARCHITECTURE.md)
@@ -71,6 +77,8 @@
 #     setting below, including one somebody changed on purpose — a fourth
 #     required check added by hand is removed by it
 set -euo pipefail
+# Character ranges in the patterns below mean ASCII, whatever the caller's locale.
+export LC_ALL=C
 
 usage() {
   echo "Usage: bash scripts/ci/configure-main-protection.sh --check|--apply [owner/repo]" >&2
@@ -92,6 +100,7 @@ REPO="rashadoni/pharmacy-monitor"
 [[ $# -eq 0 ]] || REPO="$1"
 REPO_SHAPE='^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$'
 [[ "${REPO}" =~ ${REPO_SHAPE} ]] || usage
+[[ "${REPO##*/}" != "." && "${REPO##*/}" != ".." ]] || usage
 
 # Not taken from the environment: a BRANCH exported for something else must not
 # point a protection write at another branch.
@@ -100,12 +109,15 @@ ENDPOINT="repos/${REPO}/branches/${BRANCH}/protection"
 
 command -v gh >/dev/null || { echo "gh is required" >&2; exit 3; }
 
-# The whole protection object. PUT replaces it: by the API description, a
-# top-level setting left out is reset to GitHub's default, not kept — which is
-# why every top-level setting the endpoint takes is spelled out, and why
-# `required_pull_request_reviews` must never be null again. Inside it,
-# `dismissal_restrictions` and `bypass_pull_request_allowances` are left out on
-# purpose: nobody is allowed to bypass the pull-request requirement.
+# The whole protection object. PUT replaces it. The API description gives every
+# optional setting a default, so one left out is expected to fall back to that
+# default rather than keep its value (inferred from the description, not stated
+# there, not tried) — which is why every top-level setting the endpoint takes
+# is spelled out, and why `required_pull_request_reviews` must never be null
+# again. Inside it, `dismissal_restrictions` and
+# `bypass_pull_request_allowances` are left out on purpose: nobody is to bypass
+# the pull-request requirement. That leaving them out clears an allowance
+# already set is assumed too; the comparison shows one that survived.
 #
 # The three checks are jobs of ci-pipeline.yml. That workflow has NO path
 # filters: it runs on every pull request to main, documentation-only ones
@@ -154,7 +166,8 @@ JSON
 # setting by setting. It runs inside `gh api --jq`, with the payload bound to
 # $want (JSON is valid jq). The last line it prints is the verdict; everything
 # before it is for the reader, and is taken from GitHub's answer, not from the
-# payload.
+# payload. Only the two exact verdict lines count: output that ends in anything
+# else is "could not tell", never "different".
 #
 # What "match" means: every setting this script writes has, on GitHub, the
 # value written here. A setting GitHub does not return counts as a difference,
@@ -193,32 +206,55 @@ IFS= read -r -d '' COMPARE <<'JQ' || true
   (if ($differs | length) == 0 then "RESULT: match" else "RESULT: MISMATCH" end)
 JQ
 
-read_state() {
-  gh api "${ENDPOINT}" -H "Accept: application/vnd.github+json" \
-    --jq "(${DESIRED}) as \$want ${COMPARE}"
+NL=$'\n'
+
+# Reads the protection and sets STATE (what to show) and VERDICT:
+#   match | mismatch   the comparison ran and said so
+#   unprotected        GitHub answered that the branch has no protection
+#   unknown            anything else: an error, a refusal, an answer this
+#                      script cannot read. Never a reason to write.
+# "Unprotected" is GitHub's 404 body, which gh prints on stdout: a JSON object
+# carrying that message. The comparison's own output never starts with a brace.
+compare() {
+  VERDICT=unknown
+  if STATE="$(gh api "${ENDPOINT}" -H "Accept: application/vnd.github+json" \
+    --jq "(${DESIRED}) as \$want ${COMPARE}")"; then
+    case "${STATE##*"${NL}"}" in
+      "RESULT: match") VERDICT=match ;;
+      "RESULT: MISMATCH") VERDICT=mismatch ;;
+    esac
+  elif [[ "${STATE}" == "{"* && "${STATE}" == *'"Branch not protected"'* ]]; then
+    VERDICT=unprotected
+  fi
 }
 
-in_sync() {
-  [[ "$(printf '%s\n' "$1" | tail -n 1)" == "RESULT: match" ]]
+show() {
+  case "${VERDICT}" in
+    match | mismatch) printf '%s\n' "${STATE}" ;;
+    unprotected) echo "${REPO}@${BRANCH} has no branch protection at all." ;;
+    *)
+      [[ -z "${STATE}" ]] || printf '%s\n' "${STATE}" >&2
+      echo "Could not read the protection of ${REPO}@${BRANCH}: see above." >&2
+      ;;
+  esac
 }
 
 echo "Comparing ${REPO}@${BRANCH} with this script."
-if state="$(read_state)"; then
-  printf '%s\n' "${state}"
-  if in_sync "${state}"; then
+compare
+show
+case "${VERDICT}" in
+  match)
     echo "Nothing to change, nothing sent."
     exit 0
-  fi
-elif [[ "${state}" == *"Branch not protected"* ]]; then
-  echo "${REPO}@${BRANCH} has no branch protection at all."
-else
-  # Not "unprotected": an error, a refusal, an answer this script cannot read.
-  # Writing over a state nobody has seen is exactly what this script is for
-  # preventing.
-  echo "Could not read the protection of ${REPO}@${BRANCH}: see the error above." >&2
-  echo "Nothing was sent." >&2
-  exit 3
-fi
+    ;;
+  mismatch | unprotected) ;;
+  *)
+    # Writing over a state nobody has seen is exactly what this script is for
+    # preventing.
+    echo "Nothing was sent." >&2
+    exit 3
+    ;;
+esac
 
 if [[ "${MODE}" != apply ]]; then
   echo "Nothing was sent. Writing is --apply, and it is the owner's call."
@@ -230,24 +266,29 @@ echo "Writing branch protection to ${REPO}@${BRANCH}"
 if ! response="$(gh api -X PUT "${ENDPOINT}" -H "Accept: application/vnd.github+json" \
   --input - <<<"${DESIRED}")"; then
   printf '%s\n' "${response}" >&2
-  echo "The write did not complete: see the error above. What GitHub has now:" >&2
-  read_state >&2 || echo "…could not be read either. Run --check before relying on it." >&2
+  echo "The write request ended in an error: see above. What GitHub has now:" >&2
+  compare
+  show >&2
   exit 3
 fi
 
 echo "Sent. Read back from GitHub:"
-state="$(read_state)" || {
-  echo "The write was accepted, but the protection could not be read back." >&2
-  echo "Treat ${REPO}@${BRANCH} as unverified until --check passes." >&2
-  exit 3
-}
-printf '%s\n' "${state}"
-if ! in_sync "${state}"; then
-  echo >&2
-  echo "GitHub accepted the write, but ${REPO}@${BRANCH} is NOT in the state this" >&2
-  echo "script describes: see the DIFFERS lines above. Do not report it as protected." >&2
-  exit 1
-fi
+compare
+show
+case "${VERDICT}" in
+  match) ;;
+  mismatch | unprotected)
+    echo >&2
+    echo "GitHub accepted the write, but ${REPO}@${BRANCH} is NOT in the state this" >&2
+    echo "script describes: see above. Do not report it as protected." >&2
+    exit 1
+    ;;
+  *)
+    echo "The write was accepted, but the protection could not be read back." >&2
+    echo "Treat ${REPO}@${BRANCH} as unverified until --check passes." >&2
+    exit 3
+    ;;
+esac
 
 echo
 echo "Note: the rules apply to administrators too, so a red pull request cannot"
