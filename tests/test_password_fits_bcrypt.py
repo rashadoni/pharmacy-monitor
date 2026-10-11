@@ -42,6 +42,7 @@ from src.storage import TenantUser
 
 ADDRESS = "pharmacist@example.com"
 PASSWORD = "a-long-enough-password"
+SHARED_PASSWORD = "the-shared-admin-password"
 
 # Ровно 72 байта — и ровно 6 знаков: границы правила, обе внутри.
 FITS = [
@@ -330,6 +331,80 @@ def test_a_password_stored_in_spaces_by_the_old_code_can_be_changed_to_the_same_
     assert changed.status_code == 200, changed.text
     client.cookies.clear()
     assert _post(client, "/auth/login", login=ADDRESS, password=stored).status_code == 200
+
+
+def test_a_wrong_current_password_in_spaces_is_still_wrong(client, db_session):
+    """Без пробелов по краям сверяется набранное, а не что угодно."""
+    user = _sign_in(client, db_session)
+    before = _row(db_session, user)
+
+    refused = _post(
+        client,
+        "/api/v1/dash/me/password",
+        current_password=" wrong-pass-9 ",
+        new_password="new-password-1",
+    )
+
+    assert refused.status_code == 401, refused.text
+    assert _row(db_session, user) == before
+
+
+def test_a_wrong_current_password_is_refused_before_the_new_one_is_compared(client, db_session):
+    """Иначе ответ «новый совпадает с текущим» подтверждал бы пароль тому, у
+    кого есть только открытая сессия."""
+    _sign_in(client, db_session)
+
+    refused = _post(
+        client, "/api/v1/dash/me/password", current_password="wrong-pass-9", new_password=PASSWORD
+    )
+
+    assert refused.status_code == 401, refused.text
+
+
+@pytest.fixture
+def first_admin(client, db_session, monkeypatch) -> TenantUser:
+    """Администратор без своего пароля: входит общим, из `ADMIN_PASSWORD_HASH`."""
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", api_module._hash_bcrypt(SHARED_PASSWORD))
+    user = _add_user(db_session, role="admin")
+    client.cookies.set(
+        api_module.COOKIE_NAME, api_module._make_jwt(user.id, user.tenant_id, user.email)
+    )
+    return user
+
+
+def test_the_shared_password_is_the_current_one_until_an_own_password_is_set(
+    client, db_session, first_admin
+):
+    changed = _post(
+        client,
+        "/api/v1/dash/me/password",
+        current_password=f" {SHARED_PASSWORD} ",
+        new_password="own-password-1",
+    )
+
+    assert changed.status_code == 200, changed.text
+    db_session.refresh(first_admin)
+    assert api_module._verify_bcrypt("own-password-1", first_admin.password_hash)
+    # Свой пароль задан — общий текущим больше не служит.
+    again = _post(
+        client,
+        "/api/v1/dash/me/password",
+        current_password=SHARED_PASSWORD,
+        new_password="own-password-2",
+    )
+    assert again.status_code == 401, again.text
+
+
+def test_the_shared_password_cannot_be_kept_as_the_own_one(client, db_session, first_admin):
+    refused = _post(
+        client,
+        "/api/v1/dash/me/password",
+        current_password=SHARED_PASSWORD,
+        new_password=f" {SHARED_PASSWORD} ",
+    )
+
+    assert refused.status_code == 400, refused.text
+    assert _row(db_session, first_admin)["password_hash"] is None
 
 
 @pytest.mark.parametrize("current", ["a" * 73, "я" * 37, "abcdef\ud800"])
