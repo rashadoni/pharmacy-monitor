@@ -370,10 +370,16 @@ def test_send_link_button_when_the_real_sender_did_not_send(desk, monkeypatch, m
     _assert_no_person_or_text(desk.journal.lines)
 
 
-def test_send_link_button_for_a_user_the_lookup_does_not_find(desk):
-    """Адрес записан в базе не в нижнем регистре (заведён мимо приложения):
-    письмо и не собиралось — это не «отправлено», и в журнале видно почему."""
-    carol = _user(desk.db, "Carol@Client.example", role="viewer")
+@pytest.mark.parametrize("why", ["address_not_lowercase", "deactivated_meanwhile"])
+def test_send_link_button_for_a_user_the_lookup_does_not_find(desk, monkeypatch, why):
+    """Адрес записан в базе не в нижнем регистре (заведён мимо приложения) или
+    пользователя отключили, пока шёл запрос: письмо и не собиралось — это не
+    «отправлено» и не отказ почты, и в журнале видно почему."""
+    if why == "address_not_lowercase":
+        carol = _user(desk.db, "Carol@Client.example", role="viewer")
+    else:
+        carol = desk.alice
+        monkeypatch.setattr(tenants, "issue_magic_token", lambda *a, **kw: None)
 
     response, send = _press_send_link(desk, carol.id, return_value=True)
 
@@ -383,7 +389,9 @@ def test_send_link_button_for_a_user_the_lookup_does_not_find(desk):
     assert set(answer) == {"detail"} and set(answer["detail"]) == {"code", "message"}
     assert answer["detail"]["code"] == api.LOGIN_LINK_NO_USER_CODE == "login_link_no_user"
     assert api.LOGIN_LINK_NO_USER_CODE != api.LOGIN_LINK_NOT_SENT_CODE
-    assert "mail" not in answer["detail"]["message"]
+    assert answer["detail"]["message"] == (
+        "No active user is found by this address: no link was issued."
+    )
     _assert_no_person_or_text(answer)
     assert not send.called
     assert desk.journal.lines == [_button_refusal_line(desk, carol.id, "no_user")]
@@ -469,7 +477,8 @@ def test_new_user_invite_is_called_sent_when_the_sender_confirmed(desk):
 
 def _squeezed(path: Path) -> str:
     code = re.sub(r"(?m)^\s*//.*$", "", path.read_text(encoding="utf-8"))
-    code = re.sub(r"\{/\*.*?\*/\}", "", code, flags=re.DOTALL)  # закомментированный JSX
+    # Закомментированный JSX — только скобки, в которых нет ничего, кроме комментария.
+    code = re.sub(r"\{\s*/\*(?:(?!\*/).)*\*/\s*\}", "", code, flags=re.DOTALL)
     return re.sub(r"\s+", " ", code)
 
 
@@ -558,9 +567,12 @@ def test_users_page_has_every_phrase_in_every_language():
         )["users"]
         for phrase in ("added", "added_invite_not_sent", "added_invite_unknown"):
             assert re.findall(r"\{(\w+)\}", copy[phrase]) == ["email"], (locale, phrase)
-            # Апостроф превращает подстановку в буквальный текст, тег роняет форматтер.
-            assert "'" not in copy[phrase] and "<" not in copy[phrase], (locale, phrase)
         assert "{" not in copy["login_link_not_sent"], locale
+        for phrase in ("added_invite_not_sent", "added_invite_unknown", "login_link_not_sent"):
+            # Апостроф вплотную к скобке превращает подстановку в буквальный
+            # текст, тег роняет форматтер.
+            assert not re.search(r"'[{}<>]|[{}<>]'", copy[phrase]), (locale, phrase)
+            assert "<" not in copy[phrase], (locale, phrase)
         # Оператору сказано, какой кнопкой отправить ссылку заново, — её же словами.
         assert f"«{copy['send_login_link']}»" in copy["added_invite_not_sent"].replace(
             "“", "«"
