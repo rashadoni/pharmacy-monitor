@@ -98,6 +98,10 @@ _real_init = sentry_sdk.init
 def _init_with_recording_transport(**options):
     options.update(include_local_variables=False, max_request_body_size="never")
     if MODE != "as_shipped":
+        # Хуки Sentry из `src/observability.py` сами вырезают из текста ошибки
+        # `[parameters: …]` и DETAIL. Здесь проверяется движок, поэтому они сняты:
+        # с ними контрольный режим не видел бы данных и при незащищённом движке, а
+        # защищённый был бы «чистым» и при сломанной защите.
         options.update(before_send=None, before_send_transaction=None)
     return _real_init(transport=RecordingTransport, **options)
 

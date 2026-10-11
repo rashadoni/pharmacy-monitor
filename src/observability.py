@@ -217,7 +217,7 @@ _TELEGRAM_TOKEN_RE = re.compile(
 )
 
 # A database error text quotes values in two places. SQLAlchemy ends it with the
-# bound parameters of the failed statement — the login token from
+# bound parameters of the failed statement — the hash of a login token from
 # `WHERE magic_token = ?`, a password hash, an address: everything from the
 # marker on goes, the statement before it stays. PostgreSQL itself adds DETAIL
 # (`Failing row contains (…)`, `Key (email)=(…) already exists`) and CONTEXT
