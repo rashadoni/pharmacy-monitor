@@ -85,8 +85,11 @@ home `/opt/pharmacy-monitor`.
 > `/opt/pharmacy-monitor` has no `.git`, and `.venv/bin` has neither `uv` nor
 > `pip` (read from the server 2026-10-11; a `uv` binary does exist for `pm`, in
 > `/opt/pharmacy-monitor/.local/bin`). The release path there is `deploy.yml`
-> (Phase 8), which copies `src/`, `frontend/`, `migrations/versions/`,
-> `infra/systemd/` and `infra/scripts/` and builds the frontend. It does not
+> (Phase 8), which copies `src/`, `frontend/`, `migrations/` (the whole
+> directory, `env.py` included), `alembic.ini`, `infra/systemd/` and
+> `infra/scripts/` and builds the frontend — from the first deploy of a commit
+> that carries PR #35; the `deploy.yml` of older commits copies
+> `migrations/versions/` only. It does not
 > install Python dependencies: after a change to `pyproject.toml` they are
 > installed by hand (`CLAUDE.md`, "Useful commands"). How the venv on the
 > current server was first built is not recorded.
@@ -342,6 +345,9 @@ ls -lth /var/backups/pharmacy-monitor/ | head
 > under «Restore drill»). `deploy.yml` refuses a commit that does not contain
 > the production database's migration revision, and it leaves on the server
 > any file a release added under `src/` (that `rsync` runs without `--delete`).
+> Deploying an old ref runs that ref's own `deploy.yml`, and a ref older than
+> PR #86 cannot be deployed that way once the server holds the new
+> `migrations/env.py`: `docs/RUNBOOK.md`, «Откат выкладкой прошлого коммита».
 >
 > The database step at the end does not match the server either (read
 > 2026-10-11): every dump in `/var/backups/pharmacy-monitor/` is GPG-encrypted
