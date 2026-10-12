@@ -342,6 +342,10 @@ ls -lth /var/backups/pharmacy-monitor/ | head
 > under «Restore drill»). `deploy.yml` refuses a commit that does not contain
 > the production database's migration revision, and it leaves on the server
 > any file a release added under `src/` (that `rsync` runs without `--delete`).
+> Deploying an old ref runs that ref's own `deploy.yml`, which calls Alembic
+> from the live directory; that is why `deploy.yml` never replaces
+> `migrations/env.py` there (`docs/RUNBOOK.md`, «Откат выкладкой прошлого
+> коммита»).
 >
 > The database step at the end does not match the server either (read
 > 2026-10-11): every dump in `/var/backups/pharmacy-monitor/` is GPG-encrypted
