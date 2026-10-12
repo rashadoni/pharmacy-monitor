@@ -8,6 +8,7 @@ Run before go-live. Tick each box, paste output for evidence.
 - [ ] **API key** (`PHARMACY_API_KEY`) is also 32+ chars random, separate value from JWT_SECRET
 - [ ] Magic-link tokens expire in 30 minutes (verify in `src/tenants.py:issue_magic_token`)
 - [ ] Magic-link tokens are not kept in the database: `tenant_users.magic_token` holds the SHA-256 of the token, and no query carries the token (`tests/test_magic_link_token.py`). A 43-character value there is a dead token left by the code before 2026-10-10. How to check the live table — `docs/RUNBOOK.md`, «Ссылка из письма не входит»
+- [ ] Emailed magic links keep the token out of every request address and header: the link carries it after `#`, a page served by the API (not by Next.js, which copies its own address into a request header) posts it in a request body, and only when its button is pressed — a link scanner that executes the page does not spend the link. `tests/test_login_link_in_a_browser.py` opens the links in a real browser and inspects everything the server received. `GET /auth/verify?token=…` is still accepted for tests and scripts; no letter uses it
 - [ ] JWT cookie is `httpOnly` + `secure` (in production) + `sameSite=lax`
 - [ ] Failed auth attempts are rate-limited per IP (10/min in `require_api_key`)
 - [ ] User auth attempts are rate-limited per chat_id (5/min in `auth/request`)
@@ -146,7 +147,7 @@ cat /etc/ssh/sshd_config | grep -iE "(password|permitroot)"
 
 - [ ] Pydantic validation rejects malformed input (test with garbage payloads)
 - [ ] No PII in Sentry events (`send_default_pii=False`)
-- [ ] No PII in journald logs, and no login-link tokens either. **Known open item (2026-10-10):** the application's own log calls carry no token, but Caddy's access log records the request URL with `?token=…` for every link. uvicorn's request lines no longer do: since 2026-10-11 `src/access_log.py` replaces the query string with `?<hidden>` (in effect on the server once deployed — docs/RUNBOOK.md «Журнал API: строка запроса скрыта»)
+- [ ] No PII in journald logs, and no login-link tokens either: the application's own log calls carry none, and an emailed link no longer puts its token into a request address or header, which is what Caddy's access log records (2026-10-12, in effect once deployed — `curl -s -o /dev/null -w '%{http_code}' https://leaddrive.cloud/auth/link` answers 200). A second layer is a filter in both of Caddy's logs — the site's `log` block and the global `log default`, where Caddy writes a second record for a request it could not serve (sample in `infra/Caddyfile`, checked against real Caddy by `tests/test_caddy_log_filter.py`): it blanks the value of credential-like query parameters and drops the `X-Api-Key` and `Next-Router-State-Tree` headers. It is a list of names and does not recognise a percent-encoded name. It is installed by root by hand — `grep -c 'format filter' /etc/caddy/Caddyfile` on the server (2 = both blocks, 0 = not installed, and a request that does carry `?token=…` is then recorded whole); steps in docs/RUNBOOK.md «Фильтр в журнале Caddy». uvicorn's request lines drop the query string since 2026-10-11 (`src/access_log.py`, docs/RUNBOOK.md «Журнал API: строка запроса скрыта»). Entries written before the deploy stay until rotation; the tokens in them expired after 30 minutes
 - [ ] File uploads (if any) — size-limited, MIME-checked
 - [ ] CLI commands that delete data (`db-check --fix`, `inventory truncate`) require explicit `--confirm` flag (manual review)
 
@@ -155,11 +156,18 @@ cat /etc/ssh/sshd_config | grep -iE "(password|permitroot)"
 grep -rn "send_default_pii" src/observability.py
 # Expect: send_default_pii=False
 
-# Verify login-link tokens are not logged — application log and both access logs:
-journalctl -u pharmacy-monitor-api -u caddy --since "30 days ago" | grep -c 'token='
-# Expect 0 once Caddy's access log drops the query string too. On prod 2026-10-10: 49, all from
-# the Caddy access log — 41 `set-password?token=` and 8 probes of a path this app does not serve.
-# None came from the API journal — before its request lines were filtered; why, was not established.
+# Verify a login-link token is not logged — application log and both access logs.
+# Send yourself a link, open it, then search for the token itself (the part of the
+# link after `#token=`): Next.js percent-encodes the address it puts into a header,
+# so a search for `token=` misses it, and scanners bring a `token=` of their own.
+read -rs -p 'token: ' T; echo
+journalctl -u pharmacy-monitor-api -u caddy --since '-1 hour' -o cat | grep -c -F -- "$T"
+unset T
+# Expect 0. On prod 2026-10-10, before the fix, a count by the word `token=` over 30 days
+# gave 49, all from the Caddy access log: 41 entries held the token of the one link opened
+# since September — in the Referer, the request URI, a redirect Location and the
+# Next-Router-State-Tree header — and 8 were probes of a path this app does not serve.
+# None came from the API journal; why, was not established.
 ```
 
 ## Dependencies
