@@ -1993,6 +1993,40 @@ _STALE_MEMBER_CYCLES = 2
 _STALE_RELINK_MIN_FRESH_SHARE = 0.5
 
 
+def _gone_row_rules(products, now=None):
+    """Мерка «строка пропала с сайта» — одна для подготовки и для проходов.
+
+    Возвращает `(is_stale, fully_scraped)`. Строку не видели дольше двух циклов
+    сбора её сайта — `is_stale`; но судить по этому можно только на сайте из
+    `fully_scraped`, где за то же время видели хотя бы половину каталога: иначе
+    «давно не видели» значит «полный сбор не проходил».
+    """
+    from datetime import timedelta
+
+    from src._time import utcnow
+    from src.cadence import CADENCE_GRACE_HOURS, site_cadence_hours
+
+    current = now or utcnow()
+
+    def is_stale(product) -> bool:
+        hours = _STALE_MEMBER_CYCLES * site_cadence_hours(product.site) + CADENCE_GRACE_HOURS
+        return product.last_seen_at is None or product.last_seen_at < current - timedelta(
+            hours=hours
+        )
+
+    seen_recently: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # сайт → [свежих, всего]
+    for product in products:
+        if product.url_dead_at is None:
+            seen_recently[product.site][0] += not is_stale(product)
+            seen_recently[product.site][1] += 1
+    fully_scraped = {
+        site
+        for site, (fresh, total) in seen_recently.items()
+        if fresh >= total * _STALE_RELINK_MIN_FRESH_SHARE
+    }
+    return is_stale, fully_scraped
+
+
 def relink_stale_members(
     session: Session, *, tenant_id: int = 1, now=None, dry_run: bool = False
 ) -> list[dict]:
@@ -2013,51 +2047,50 @@ def relink_stale_members(
     Сайт пропускается, если недавно видели меньше половины его каталога:
     «строку давно не видели» тогда значит «полный сбор не проходил» (идут только
     частичные тики), а не «товар ушёл с сайта».
-    Ручные кластеры не трогаем. Возвращает список передач; при `dry_run` БД не
-    меняется.
-    """
-    from datetime import timedelta
 
-    from src._time import utcnow
-    from src.cadence import CADENCE_GRACE_HOURS, site_cadence_hours
+    Двойник бывает и с парой: пока пропавшая строка держала место, живая сошлась
+    с товаром третьего сайта отдельным кластером. Тогда один товар лежит двумя
+    кусками — в одном товар клиента с пропавшей строкой конкурента, в другом
+    живая строка конкурента без товара клиента, — и ни один проход их не сводит:
+    товар с парой в чужой кластер не переходит. Такие два кластера сливаются
+    (`merge_with_twin_cluster` ниже), если после слияния у каждого сайта
+    остаётся одна строка и никто из членов одного не конфликтует с членами
+    другого. Жалоба клиента 2026-10-09: «Kreon 25000» показывал цены aloe и
+    aptekonline без цены pharmonline.
+
+    Ручные кластеры не трогаем. Возвращает список передач и слияний (у слияния
+    есть ключ `merged`); при `dry_run` БД не меняется.
+    """
+    from sqlalchemy import update
+
     from src.product_policy import country_code_of
+    from src.storage import StockLevel, SupplierPrice
 
     acquire_match_mutation_xact_lock(session)
-    current = now or utcnow()
     products = session.scalars(select(Product).where(Product.tenant_id == tenant_id)).all()
-
-    def stale_before(site: str):
-        hours = _STALE_MEMBER_CYCLES * site_cadence_hours(site) + CADENCE_GRACE_HOURS
-        return current - timedelta(hours=hours)
-
-    def is_stale(product: Product) -> bool:
-        return product.last_seen_at is None or product.last_seen_at < stale_before(product.site)
-
-    seen_recently: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # сайт → [свежих, всего]
-    for product in products:
-        if product.url_dead_at is None:
-            seen_recently[product.site][0] += not is_stale(product)
-            seen_recently[product.site][1] += 1
-    fully_scraped = {
-        site
-        for site, (fresh, total) in seen_recently.items()
-        if fresh >= total * _STALE_RELINK_MIN_FRESH_SHARE
-    }
+    is_stale, fully_scraped = _gone_row_rules(products, now)
 
     def identity(product: Product) -> tuple:
         return (product.site, product.name_normalized, product.dosage, product.pack_size)
 
-    by_name: dict[tuple, list[Product]] = defaultdict(list)
-    members: dict[int, list[Product]] = defaultdict(list)
-    for product in products:
-        if product.canonical_id is not None:
-            members[product.canonical_id].append(product)
-        elif (
+    def is_live(product: Product) -> bool:
+        """Строка, которой можно отдать место: сайт собран, товар виден и сводим."""
+        return (
             product.site in fully_scraped
             and not is_stale(product)
             and product.url_dead_at is None
             and _unmatchable_reason(product) is None
-        ):
+        )
+
+    by_name: dict[tuple, list[Product]] = defaultdict(list)  # живые строки без пары
+    paired_by_name: dict[tuple, list[Product]] = defaultdict(list)  # живые строки с парой
+    members: dict[int, list[Product]] = defaultdict(list)
+    for product in products:
+        if product.canonical_id is not None:
+            members[product.canonical_id].append(product)
+            if is_live(product):
+                paired_by_name[identity(product)].append(product)
+        elif is_live(product):
             by_name[identity(product)].append(product)
 
     manual_ids = set(
@@ -2065,60 +2098,239 @@ def relink_stale_members(
             select(Match.id).where(Match.tenant_id == tenant_id, Match.is_manual.is_(True))
         )
     )
+    # Состав кластеров с учётом уже сделанных передач и слияний. При `dry_run`
+    # строки не меняются, поэтому решения читают состав отсюда, а не из
+    # `canonical_id`.
+    lineups: dict[int, list[Product]] = {
+        match_id: list(cluster) for match_id, cluster in members.items()
+    }
+    # Кластер живой строки с парой: слияние переносит такие строки, а читать
+    # `canonical_id` при `dry_run` нельзя.
+    cluster_of: dict[int, int] = {
+        product.id: product.canonical_id
+        for twins in paired_by_name.values()
+        for product in twins
+    }
+
+    def same_product(gone: Product, kept: Product) -> bool:
+        """`kept` — тот же товар, что и пропавшая строка `gone` того же сайта."""
+        if identity(gone) != identity(kept):
+            return False
+        # Страна — часть идентичности: двойник не должен знать о ней меньше.
+        gone_country = country_code_of(gone)
+        if gone_country and country_code_of(kept) != gone_country:
+            return False
+        # Из нормализованного имени вырезаны форма и путь введения, поэтому
+        # «(göz damcısı)» и «(qulaq damcısı)» совпадают по имени и различаются
+        # только этими проверками.
+        return not (_hard_conflict(gone, kept) or _pairwise_spec_conflict(gone, kept))
+
+    def strangers(a: Product, b: Product) -> bool:
+        """Товары разных сайтов, которым нельзя оказаться в одном кластере."""
+        return (
+            is_rejected(session, a.id, b.id)
+            or _hard_conflict(a, b)
+            or _pairwise_spec_conflict(a, b)
+        )
+
+    def one_twin(candidates: list[Product], stale: Product) -> Product | None:
+        if len(candidates) > 1 and stale.url:
+            candidates = [twin for twin in candidates if twin.url == stale.url]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def merge_with_twin_cluster(
+        match_id: int, stale: Product, unpaired: list[Product]
+    ) -> dict | None:
+        """Слить кластер пропавшей строки с кластером её живого двойника.
+
+        Возвращает запись о слиянии или None, если сливать нельзя. Решение
+        принимается целиком до первой записи: либо оба кластера становятся
+        одним, либо оба остаются как были. `unpaired` — живые строки сайта с
+        тем же названием без пары, которым место не досталось.
+        """
+        candidates = [
+            candidate
+            for candidate in paired_by_name.get(identity(stale), [])
+            if cluster_of[candidate.id] != match_id
+        ]
+        if not candidates:
+            return None  # живого двойника с парой нет — обычная пропавшая строка
+
+        def refused(reason: str, **context) -> None:
+            log.debug(
+                "matcher_split_merge_refused",
+                reason=reason,
+                match_id=match_id,
+                stale_id=stale.id,
+                **context,
+            )
+
+        if unpaired:
+            # У сайта ещё одна живая строка с этим названием. Какая из двух —
+            # продолжение пропавшей, по названию не решить.
+            return refused(
+                "live_row_without_pair_too", rows=[candidate.id for candidate in unpaired]
+            )
+        twin = one_twin(candidates, stale)
+        if twin is None:
+            return refused("several_twins", twins=[candidate.id for candidate in candidates])
+        if not same_product(stale, twin):
+            return refused("twin_is_another_product", twin_id=twin.id)
+        other_id = cluster_of[twin.id]
+        if other_id in manual_ids:
+            return refused("manual_cluster", other_id=other_id)
+        here = [member for member in lineups[match_id] if member is not stale]
+        there = list(lineups[other_id])
+        if not here:
+            # В кластере только пропавшая строка: сводить не с кем, а двойник
+            # уже на месте.
+            return refused("nothing_to_bring", other_id=other_id)
+        for side in (here, there):
+            if len({member.site for member in side}) != len(side):
+                # две строки одного сайта — не наш случай, не трогаем
+                return refused("site_twice_in_a_cluster", other_id=other_id)
+        # Один сайт с обеих сторон. Остаться может только живая строка, и
+        # только если вторая — её же пропавший двойник (кластеры держат
+        # пропавшие строки друг друга). Две живые строки сайта — два разных
+        # предложения, такое слияние дало бы кластер с дублем сайта.
+        dropped: list[Product] = []
+        for mine in list(here):
+            theirs = next((member for member in there if member.site == mine.site), None)
+            if theirs is None:
+                continue
+            if is_live(mine) and is_stale(theirs) and same_product(theirs, mine):
+                there.remove(theirs)
+                dropped.append(theirs)
+            elif is_live(theirs) and is_stale(mine) and same_product(mine, theirs):
+                here.remove(mine)
+                dropped.append(mine)
+            else:
+                both_lost = is_stale(mine) and is_stale(theirs)
+                return refused(
+                    "two_lost_rows_of_one_site" if both_lost else "two_rows_of_one_site",
+                    other_id=other_id,
+                    rows=[mine.id, theirs.id],
+                )
+        if not here:
+            return refused("nothing_to_bring", other_id=other_id)
+        unmatchable = [
+            member.id for member in here + there if _unmatchable_reason(member) is not None
+        ]
+        if unmatchable:
+            return refused("member_not_matchable", other_id=other_id, members=unmatchable)
+        clash = next(
+            ((mine.id, theirs.id) for mine in here for theirs in there if strangers(mine, theirs)),
+            None,
+        )
+        if clash:
+            return refused("members_must_not_meet", other_id=other_id, pair=list(clash))
+        # Та же проверка, что у проходов: цена за штуку против цены за упаковку.
+        kept = here + there
+        if _has_perunit_mismatch(
+            kept, latest_snapshots_per_product(session, [member.id for member in kept])
+        ):
+            return refused("price_per_unit_mismatch", other_id=other_id)
+        # Остаётся кластер, где членов больше: меняется меньше назначений.
+        # При равенстве — старший (меньший номер).
+        if (len(here), -match_id) > (len(there), -other_id):
+            keep_id, drop_id, movers = match_id, other_id, there
+        else:
+            keep_id, drop_id, movers = other_id, match_id, here
+        for mover in movers:
+            if mover.id in cluster_of:
+                cluster_of[mover.id] = keep_id
+        if not dry_run:
+            for gone in (stale, *dropped):
+                gone.canonical_id = None
+            for mover in movers:
+                mover.canonical_id = keep_id
+        lineups[keep_id] = here + there
+        lineups[drop_id] = []
+        return {
+            "match_id": keep_id,
+            "site": stale.site,
+            "old": stale.id,
+            "new": twin.id,
+            "merged": drop_id,
+            "moved": [mover.id for mover in movers],
+            "dropped": [gone.id for gone in dropped],
+        }
+
     relinked: list[dict] = []
     taken: set[int] = set()
     for match_id, cluster in members.items():
         if match_id in manual_ids:
             continue
-        lineup = list(cluster)  # состав кластера с учётом уже сделанных передач
         for stale in [member for member in cluster if is_stale(member)]:
-            twins = [twin for twin in by_name.get(identity(stale), []) if twin.id not in taken]
-            if len(twins) > 1 and stale.url:
-                twins = [twin for twin in twins if twin.url == stale.url]
-            if len(twins) != 1:
-                continue
-            twin = twins[0]
-            # Страна — часть идентичности: двойник не должен знать о ней меньше.
-            stale_country = country_code_of(stale)
-            if stale_country and country_code_of(twin) != stale_country:
-                continue
-            # Двойник — тот же товар, что и строка, которую он сменяет: из
-            # нормализованного имени вырезаны форма и путь введения, поэтому
-            # «(göz damcısı)» и «(qulaq damcısı)» совпадают по имени и
-            # различаются только этими проверками.
-            if _hard_conflict(stale, twin) or _pairwise_spec_conflict(stale, twin):
-                continue
-            if any(
-                is_rejected(session, other.id, twin.id)
-                or _hard_conflict(other, twin)
-                or _pairwise_spec_conflict(other, twin)
-                for other in lineup
-                if other.site != stale.site
+            lineup = lineups[match_id]
+            if stale not in lineup:
+                continue  # кластер уже слит с другим, или строка уже отвязана
+            unpaired = [twin for twin in by_name.get(identity(stale), []) if twin.id not in taken]
+            twin = one_twin(unpaired, stale)
+            if (
+                twin is None
+                or not same_product(stale, twin)
+                or any(strangers(other, twin) for other in lineup if other.site != stale.site)
             ):
+                # Место передать некому. Остаётся двойник с парой — слияние; при
+                # сопернике без пары оно откажет и назовёт причину.
+                merged = merge_with_twin_cluster(match_id, stale, unpaired)
+                if merged is not None:
+                    relinked.append(merged)
                 continue
             taken.add(twin.id)
-            lineup = [twin if member is stale else member for member in lineup]
+            lineups[match_id] = [twin if member is stale else member for member in lineup]
             relinked.append(
                 {"match_id": match_id, "site": stale.site, "old": stale.id, "new": twin.id}
             )
             if not dry_run:
                 stale.canonical_id = None
                 twin.canonical_id = match_id
+    merges = [item for item in relinked if "merged" in item]
     if relinked and not dry_run:
         # Сессии проекта — без autoflush: следующий шаг (match_products) читает
         # состав кластера из БД и без flush увидел бы прежних членов — старая
         # строка «занимает» сайт, двойника в кластере «нет».
         session.flush()
-        for match_id in {item["match_id"] for item in relinked}:
+        touched = {item["match_id"] for item in relinked} | {item["merged"] for item in merges}
+        for match_id in touched:
             match = session.get(Match, match_id)
             if match is not None:
                 session.expire(match, ["products"])
+        for item in merges:
+            # Закупочные цены и остатки, привязанные к кластеру, а не к товару,
+            # уходят вместе с ним: это тот же товар. Иначе удаление записи
+            # кластера унесло бы их каскадом.
+            for bound in (StockLevel, SupplierPrice):
+                session.execute(
+                    update(bound)
+                    .where(bound.canonical_id == item["merged"])
+                    .values(canonical_id=item["match_id"])
+                )
+        for drop_id in {item["merged"] for item in merges}:
+            match = session.get(Match, drop_id)
+            # Запись кластера удаляется, только когда в нём никого не осталось:
+            # состав читается из базы, а не из того, что решила эта функция.
+            if match is not None and not match.products:
+                session.delete(match)
+        session.flush()
     if relinked:
         log.info(
             "matcher_stale_members_relinked",
             count=len(relinked),
+            merged=len(merges),
             dry_run=dry_run,
             pairs=[(item["match_id"], item["old"], item["new"]) for item in relinked],
+        )
+    if merges:
+        log.info(
+            "matcher_split_clusters_merged",
+            count=len(merges),
+            dry_run=dry_run,
+            merges=[
+                {key: item[key] for key in ("match_id", "merged", "old", "moved", "dropped")}
+                for item in merges
+            ],
         )
     return relinked
 
@@ -2441,6 +2653,19 @@ def match_products(
     sites = sorted(by_site.keys())
     log.info("matcher_start", total_products=len(products), sites=sites)
 
+    # Строка без пары, пропавшая с сайта (мерка та же, что у
+    # relink_stale_members), новую пару не начинает и ни к кому не
+    # присоединяется. Иначе строки, только что освобождённые подготовкой —
+    # старая строка клиента и старая строка конкурента одного товара, —
+    # сходятся между собой: второй кластер того же товара из одних давно не
+    # виденных строк, вторая строка сравнения с устаревшими ценами.
+    is_stale, fully_scraped = _gone_row_rules(products)
+    gone_ids = {
+        p.id for p in products if p.canonical_id is None and p.site in fully_scraped and is_stale(p)
+    }
+    if gone_ids:
+        log.info("matcher_gone_rows_skipped", count=len(gone_ids))
+
     # Pre-fetch последние цены для всех продуктов — нужны для проверки
     # per-unit vs per-pack (цена-за-штуку vs цена-за-упаковку).
     # Один SELECT на все product_ids, не N+1.
@@ -2598,6 +2823,8 @@ def match_products(
         bc = (p.barcode or "").strip()
         if not bc or bc in ("0", "null", "none") or not bc.isdigit() or len(bc) < 8:
             continue
+        if p.id in gone_ids:
+            continue
         by_barcode[bc].append(p)
 
     barcode_matches_created = 0
@@ -2656,6 +2883,7 @@ def match_products(
     visited |= {
         p.id for p in products if p.url_dead_at is not None or _unmatchable_reason(p) is not None
     }
+    visited |= gone_ids
 
     # Первое слово названия у категорий («Şpris», «Uşaq …», «Tibbi …») и крупных
     # брендов (Solgar, Doğadan) стоит у десятков товаров — см. _CROWDED_FIRST_TOKEN.
