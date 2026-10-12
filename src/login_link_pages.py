@@ -11,7 +11,12 @@
 Referer, Location редиректа и этот заголовок. Поэтому адрес с токеном не
 открывает ни одна страница Next:
 
-- вход — страница шлёт токен в `POST /auth/verify` и уходит в дашборд;
+- вход — страница показывает кнопку «Войти» и по нажатию шлёт токен в
+  `POST /auth/verify`, затем уходит в дашборд. Сама, без нажатия, она токен не
+  шлёт: ссылку открывает не только человек — её открывают и проверки ссылок в
+  почте, исполняющие сценарии страниц, и такая проверка погасила бы ссылку
+  раньше получателя. По той же причине чужой сайт, приведший посетителя сюда
+  со своим токеном, без его нажатия никого не входит;
 - создание пароля — страница кладёт токен в `sessionStorage` вкладки и уходит
   на форму `/set-password` уже с чистым адресом; форма берёт токен оттуда
   (`frontend/src/lib/link-token.ts`, ключ общий — `LINK_TOKEN_STORAGE_KEY`).
@@ -42,21 +47,38 @@ _PAGE = """<!doctype html>
   body { margin: 0; min-height: 100vh; display: flex; align-items: center;
          justify-content: center; font-family: system-ui, sans-serif;
          background: #f8fafc; color: #475569; }
-  p { margin: 0 24px; font-size: 14px; line-height: 1.7; text-align: center; }
+  main { margin: 0 24px; text-align: center; }
+  p { margin: 0; font-size: 14px; line-height: 1.7; }
+  button { margin-top: 20px; padding: 11px 28px; border: 0; border-radius: 8px;
+           background: #2563eb; color: #fff; font: inherit; font-size: 15px;
+           font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: 0.6; cursor: default; }
 </style>
 </head>
 <body>
+<main>
 <p id="state">Keçid yoxlanılır…<br>Проверяем ссылку…</p>
+<button id="act" type="button" hidden></button>
 <noscript><p>Bu səhifə üçün JavaScript lazımdır.<br>Этой странице нужен JavaScript.</p></noscript>
+</main>
 <script>
 (function () {
   var state = document.getElementById("state");
   var token = new URLSearchParams(window.location.hash.slice(1)).get("token");
+  var act = document.getElementById("act");
   function say(az, ru) {
     state.textContent = "";
     state.appendChild(document.createTextNode(az));
     state.appendChild(document.createElement("br"));
     state.appendChild(document.createTextNode(ru));
+  }
+  // Кнопка со словами на обоих языках; что она делает, решает страница.
+  function offer(az, ru, pressed) {
+    act.textContent = az + " / " + ru;
+    act.onclick = pressed;
+    act.disabled = false;
+    act.hidden = false;
+    act.focus();
   }
 __SCRIPT__
 })();
@@ -65,26 +87,50 @@ __SCRIPT__
 </html>
 """
 
-# Ответ 401 и 422 — ссылка не годится (нет токена, истекла, уже использована):
-# дальше страница входа. Любой другой сбой (сеть, 5xx, перезапуск API) токен не
-# трогает: адрес остаётся прежним, и обновление страницы повторяет попытку.
+# Токен уходит только по нажатию кнопки — см. описание модуля.
+#
+# Ответ 401 и 422 — ссылка не годится (истекла, уже использована, испорчена):
+# страница говорит об этом сама и предлагает идти дальше — в дашборд, если вход
+# уже состоялся в соседней вкладке, иначе тот уведёт на страницу входа. Любой
+# другой сбой (сеть, 5xx, перезапуск API) токен не трогает: адрес остаётся
+# прежним, кнопка — тоже, повторное нажатие или обновление страницы повторяют
+# попытку.
 _SIGN_IN = """
-  function refused() { window.location.replace("/login?error=link"); }
-  function failed() {
-    say("Keçidi yoxlamaq alınmadı. Səhifəni yeniləyin.",
-        "Не удалось проверить ссылку. Обновите страницу.");
+  function onward() { window.location.replace("/overview"); }
+  function refused(az, ru) {
+    say(az, ru);
+    offer("Davam edin", "Продолжить", onward);
   }
-  if (!token) { refused(); return; }
-  fetch("/auth/verify", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", "Accept": "application/json" },
-    body: JSON.stringify({ token: token })
-  }).then(function (response) {
-    if (response.ok) { window.location.replace("/overview"); }
-    else if (response.status === 401 || response.status === 422) { refused(); }
-    else { failed(); }
-  }, failed);
+  function failed() {
+    say("Keçidi yoxlamaq alınmadı. Yenidən cəhd edin.",
+        "Не удалось проверить ссылку. Попробуйте ещё раз.");
+    act.disabled = false;
+  }
+  function signIn() {
+    act.disabled = true;
+    say("Keçid yoxlanılır…", "Проверяем ссылку…");
+    fetch("/auth/verify", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ token: token })
+    }).then(function (response) {
+      if (response.ok) { onward(); }
+      else if (response.status === 401 || response.status === 422) {
+        refused("Keçid etibarsızdır və ya artıq istifadə olunub.",
+                "Ссылка недействительна или уже использована.");
+      }
+      else { failed(); }
+    }, failed);
+  }
+  if (!token) {
+    refused("Keçid natamamdır. Onu məktubdan yenidən açın.",
+            "Ссылка неполная. Откройте её из письма ещё раз.");
+    return;
+  }
+  say("Pharmacy Monitor-a daxil olmaq üçün düyməni basın.",
+      "Нажмите кнопку, чтобы войти в Pharmacy Monitor.");
+  offer("Daxil ol", "Войти", signIn);
 """
 
 # Ссылка без токена стирает и прежний: форма не должна молча взять токен от
