@@ -3,21 +3,23 @@
 До этой правки у `/auth/verify` счётчика не было — ни у GET, ни у POST, которым
 входит страница из письма. Шестьдесят неверных токенов подряд получали
 шестьдесят ответов 401, и каждый исполнял UPDATE в `tenants.redeem_magic_token`.
-Подобрать токен в 256 бит так нельзя; это записи в базу без входа и без предела.
+Подобрать токен в 256 бит так нельзя; это запросы к базе без входа и без предела.
 
-Теперь, как у `/auth/set-password`: десять попыток в минуту с адреса до
-проверки токена (одиннадцатая до базы не доходит) и пять отказов в минуту
-(шестой отказ отвечает 429, а не 401). Предел записям в базу ставит первый
-счётчик; второй меняет только ответ.
+Теперь с одного адреса до проверки токена доходит десять попыток в минуту —
+тот же счётчик, что первым стоит у `/auth/set-password`. Одиннадцатая получает
+429 раньше, чем запрос к базе. Счётчика отказов, как у создания пароля и входа
+по паролю, здесь нет: он срабатывает после запроса к базе и ничего не
+ограничивает, а странице входа пришлось бы просить подождать по ссылке, которая
+просто не годится.
 
 Что проверяется здесь:
 
 - неверные токены перестают доходить до базы — считаются настоящие UPDATE;
 - счётчик один на GET и POST;
 - отказ 429 ссылку не гасит: через минуту она входит;
-- счётчик свой у каждого адреса — и адрес этот приходит из `X-Forwarded-For`,
-  когда uvicorn запущен с флагами из файла юнита (отдельный процесс, с
-  контрольным запуском без этих флагов);
+- счётчик свой у каждого адреса, и за прокси этот адрес uvicorn берёт из
+  `X-Forwarded-For` — отдельный процесс с флагами из файла юнита и контрольный
+  запуск с `--no-proxy-headers`;
 - в имени счётчика нет ни токена, ни его хеша;
 - то же на настоящем Redis, где счётчики лежат на сервере (в CI он стоит рядом
   и пропуск там — ошибка; без `REDIS_URL` тест пропускается).
@@ -59,7 +61,6 @@ from tests.test_magic_link_token import ADDRESS, _add_user, _row
 _redis_client_as_shipped = rate_limit._redis_client
 
 ATTEMPTS_A_MINUTE = 10
-REFUSALS_A_MINUTE = 5
 BROWSER = {"Accept": "text/html,application/xhtml+xml"}
 
 
@@ -79,8 +80,9 @@ def client(app_on_the_test_database) -> TestClient:
 
 
 @pytest.fixture
-def writes(db_session) -> list[str]:
-    """Каждый UPDATE, дошедший до базы, — текстом запроса."""
+def updates(db_session) -> list[str]:
+    """Каждый UPDATE, дошедший до базы, — текстом запроса. Тот, что не нашёл
+    строку, ничего не записал, но базой исполнен."""
     seen: list[str] = []
     engine = db_session.get_bind()
 
@@ -132,33 +134,33 @@ def _link(db_session, address: str = ADDRESS) -> str:
 
 
 @pytest.mark.parametrize("way", WAYS)
-def test_sixty_wrong_tokens_reach_the_database_ten_times(client, writes, way):
+def test_sixty_wrong_tokens_reach_the_database_ten_times(client, updates, way):
     statuses = [WAYS[way](client, f"wrong-{n}").status_code for n in range(60)]
 
-    assert statuses == [REFUSED[way]] * REFUSALS_A_MINUTE + [429] * (60 - REFUSALS_A_MINUTE)
-    assert len(writes) == ATTEMPTS_A_MINUTE
-    assert all("tenant_users" in statement for statement in writes)
+    assert statuses == [REFUSED[way]] * ATTEMPTS_A_MINUTE + [429] * (60 - ATTEMPTS_A_MINUTE)
+    assert len(updates) == ATTEMPTS_A_MINUTE
+    assert all("tenant_users" in statement for statement in updates)
 
 
-def test_without_the_counters_every_wrong_token_is_a_write(client, writes, monkeypatch):
-    """Контроль: так было. Без него «десять записей» выше могло бы значить, что
-    тест записей не видит."""
+def test_without_the_counter_every_wrong_token_is_a_query(client, updates, monkeypatch):
+    """Контроль: так было. Без него «десять запросов» выше могло бы значить, что
+    тест запросов не видит."""
     monkeypatch.setattr(api_module, "_check_rate_limit", lambda key, limit=None: None)
 
     statuses = [_post(client, f"wrong-{n}").status_code for n in range(60)]
 
     assert statuses == [401] * 60
-    assert len(writes) == 60
+    assert len(updates) == 60
 
 
-def test_both_ways_in_share_one_counter(client, writes):
+def test_both_ways_in_share_one_counter(client, updates):
     """Иначе тот, кто шлёт запросы, получил бы двадцать попыток вместо десяти."""
     ways = [_post, _get]
 
     statuses = [ways[n % 2](client, f"wrong-{n}").status_code for n in range(30)]
 
-    assert statuses == [401] * REFUSALS_A_MINUTE + [429] * (30 - REFUSALS_A_MINUTE)
-    assert len(writes) == ATTEMPTS_A_MINUTE
+    assert statuses == [401] * ATTEMPTS_A_MINUTE + [429] * (30 - ATTEMPTS_A_MINUTE)
+    assert len(updates) == ATTEMPTS_A_MINUTE
 
 
 def test_the_refusal_tells_when_to_come_back_and_repeats_nothing_sent(client):
@@ -177,19 +179,19 @@ def test_the_refusal_tells_when_to_come_back_and_repeats_nothing_sent(client):
 
 @pytest.mark.parametrize("way", WAYS)
 def test_a_link_refused_by_the_counter_signs_in_a_minute_later(
-    client, db_session, writes, clock, way
+    client, db_session, updates, clock, way
 ):
     user = _add_user(db_session)
     token = tenants.issue_magic_token(db_session, ADDRESS)
     stored = _row(db_session, user)["magic_token"]
     for n in range(ATTEMPTS_A_MINUTE):
         _post(client, f"wrong-{n}")
-    writes.clear()
+    updates.clear()
 
     refused = WAYS[way](client, token)
 
     assert refused.status_code == 429
-    assert writes == []
+    assert updates == []
     assert api_module.COOKIE_NAME not in client.cookies
     assert _row(db_session, user)["magic_token"] == stored
 
@@ -207,7 +209,9 @@ def test_a_refused_attempt_does_not_push_the_minute_further(client, db_session, 
     for n in range(ATTEMPTS_A_MINUTE):
         _post(client, f"wrong-{n}")
 
-    for seconds in (10, 20, 30, 40, 50):
+    # Отказов за эту минуту больше, чем сам предел: останься они в счёте,
+    # через минуту он был бы по-прежнему полон.
+    for seconds in range(5, 60, 4):
         clock.ahead = seconds
         assert _post(client, token).status_code == 429
 
@@ -215,14 +219,17 @@ def test_a_refused_attempt_does_not_push_the_minute_further(client, db_session, 
     assert _post(client, token).status_code == 200
 
 
-def test_five_refusals_do_not_close_the_way_for_a_good_link(client, db_session):
-    """Счётчик отказов меняет ответ на отказ, а не закрывает вход с адреса."""
+def test_a_dead_link_is_called_dead_until_the_attempts_run_out(client, db_session):
+    """Отказ по токену остаётся отказом по токену — 401, сколько бы их ни было
+    подряд: страница входа по нему уводит на страницу входа. 429 значит только
+    «сервер ссылку не проверял»."""
     token = _link(db_session)
 
-    refusals = [_post(client, f"wrong-{n}").status_code for n in range(REFUSALS_A_MINUTE + 1)]
+    refusals = [_post(client, f"wrong-{n}").status_code for n in range(ATTEMPTS_A_MINUTE - 1)]
 
-    assert refusals == [401] * REFUSALS_A_MINUTE + [429]
+    assert refusals == [401] * (ATTEMPTS_A_MINUTE - 1)
     assert _post(client, token).status_code == 200
+    assert _post(client, token).status_code == 429
 
 
 def test_ten_people_behind_one_address_sign_in_within_a_minute(client, db_session):
@@ -255,7 +262,7 @@ def test_one_address_does_not_spend_the_attempts_of_another(app_on_the_test_data
 
 
 @pytest.mark.parametrize("way", WAYS)
-def test_the_counters_are_named_after_the_address_and_nothing_sent(
+def test_the_counter_is_named_after_the_address_and_nothing_sent(
     client, db_session, monkeypatch, way
 ):
     """Имя уходит ключом в Redis, а Sentry пишет команды Redis в трассу запроса."""
@@ -269,11 +276,7 @@ def test_the_counters_are_named_after_the_address_and_nothing_sent(
     WAYS[way](client, wrong)
     WAYS[way](client, token)
 
-    assert named == [
-        ("verify:testclient", ATTEMPTS_A_MINUTE),
-        ("verify_fail:testclient", REFUSALS_A_MINUTE),
-        ("verify:testclient", ATTEMPTS_A_MINUTE),
-    ]
+    assert named == [("verify:testclient", ATTEMPTS_A_MINUTE)] * 2
     names = " ".join(name for name, _limit in named)
     for sent in (token, wrong):
         digest = hashlib.sha256(sent.encode()).hexdigest()
@@ -310,44 +313,53 @@ def counters_in_redis(monkeypatch) -> SimpleNamespace:
             pytest.fail("в CI рядом стоит Redis: счётчик входа обязан быть проверен на нём")
         pytest.skip("нужен Redis в REDIS_URL")
     address = f"2001:db8::{secrets.token_hex(2)}:{secrets.token_hex(2)}"
-    keys = [f"ratelimit:verify:{address}", f"ratelimit:verify_fail:{address}"]
+    key = f"ratelimit:verify:{address}"
     try:
-        yield SimpleNamespace(redis=redis, address=address, keys=keys)
+        yield SimpleNamespace(redis=redis, address=address, key=key)
     finally:
-        redis.delete(*keys)
+        redis.delete(key)
         rate_limit._reset_redis_probe_for_tests()
 
 
-def test_in_redis_the_counters_stop_the_writes_and_hold_only_the_address(
-    app_on_the_test_database, writes, counters_in_redis
+def test_in_redis_the_counter_stops_the_queries_and_holds_only_the_address(
+    app_on_the_test_database, updates, counters_in_redis
 ):
-    redis, address = counters_in_redis.redis, counters_in_redis.address
+    redis, address, key = (
+        counters_in_redis.redis,
+        counters_in_redis.address,
+        counters_in_redis.key,
+    )
     client = TestClient(app_on_the_test_database, client=(address, 50000))
 
     statuses = [_post(client, f"wrong-{n}").status_code for n in range(60)]
 
-    assert statuses == [401] * REFUSALS_A_MINUTE + [429] * (60 - REFUSALS_A_MINUTE)
-    assert len(writes) == ATTEMPTS_A_MINUTE
-    # Два ключа на адрес, и больше под этим адресом ничего нет.
-    attempts, refusals = counters_in_redis.keys
-    found = sorted(key.decode() for key in redis.scan_iter(match=f"*{address}*"))
-    assert found == sorted([attempts, refusals])
+    assert statuses == [401] * ATTEMPTS_A_MINUTE + [429] * (60 - ATTEMPTS_A_MINUTE)
+    assert len(updates) == ATTEMPTS_A_MINUTE
+    # Один ключ на адрес, и больше под этим адресом ничего нет.
+    assert [found.decode() for found in redis.scan_iter(match=f"*{address}*")] == [key]
     # Отклонённая попытка в счётчике не остаётся: срок она не продлевает.
-    assert redis.zcard(attempts) == ATTEMPTS_A_MINUTE
-    assert redis.zcard(refusals) == REFUSALS_A_MINUTE
-    assert 0 < redis.ttl(attempts) <= 120 and 0 < redis.ttl(refusals) <= 120
+    assert redis.zcard(key) == ATTEMPTS_A_MINUTE
+    assert 0 < redis.ttl(key) <= 120
     # В записях счётчика — время и случайный хвост, ничего из присланного.
-    stored = [m.decode() for key in (attempts, refusals) for m in redis.zrange(key, 0, -1)]
+    stored = [member.decode() for member in redis.zrange(key, 0, -1)]
     assert all(re.fullmatch(r"\d{13}-[0-9a-f]{8}", member) for member in stored), stored
 
 
 # ─── Чей адрес считается за прокси: uvicorn с флагами из юнита ───────────────
 #
 # На сервере uvicorn слушает 127.0.0.1, запросы ему передаёт Caddy с той же
-# машины. Без `--proxy-headers` адресом клиента был бы 127.0.0.1 у всех — один
-# счётчик на весь интернет: десять запросов в минуту от кого угодно закрывали бы
-# вход по ссылке каждому. С флагами адрес берётся из `X-Forwarded-For`, который
-# ставит Caddy.
+# машины. Адрес клиента uvicorn берёт из `X-Forwarded-For` — последний в списке,
+# которого нет среди доверенных, — и только когда запрос пришёл с доверенного
+# адреса. Так он ведёт себя и без флагов: чтение заголовка включено по
+# умолчанию, доверенный по умолчанию — 127.0.0.1. Флаги в юните закрепляют это
+# поверх окружения (`FORWARDED_ALLOW_IPS`).
+#
+# Счётчик стал бы одним на всех — десять запросов в минуту от кого угодно
+# закрывали бы вход по ссылке каждому, — если чтение заголовка выключить
+# (`--no-proxy-headers`, контрольный запуск ниже), если Caddy перестанет
+# приходить с доверенного адреса (другая машина, контейнер) или если API
+# перевести на unix-сокет. А с `--forwarded-allow-ips '*'` адрес назвал бы сам
+# клиент — и получал бы новый счётчик на каждый запрос.
 
 NOISY = "203.0.113.5"
 QUIET = "203.0.113.6"
@@ -360,7 +372,10 @@ def _launch_command(port: int, *, as_in_the_unit: bool) -> list[str]:
     # Один рабочий процесс: без Redis каждый считает сам, и ответ зависел бы от
     # того, которому достался запрос. На сервере счётчик общий — он в Redis.
     flags[flags.index("--workers") + 1] = "1"
-    assert "--proxy-headers" in flags, "юнит больше не читает адрес клиента у прокси"
+    assert "--proxy-headers" in flags, (
+        "юнит больше не называет --proxy-headers: чтение заголовка прокси теперь "
+        "зависит от умолчания uvicorn и от окружения"
+    )
     assert flags[flags.index("--forwarded-allow-ips") + 1] == "127.0.0.1", (
         "юнит верит заголовку прокси не только от своей машины: адрес клиента "
         "смог бы назвать сам клиент"
@@ -388,7 +403,7 @@ def _attempt(port: int, forwarded_for: str | None, token: str = "wrong") -> int:
 
 @pytest.fixture(scope="module")
 def behind_a_proxy(tmp_path_factory) -> dict[str, dict[str, object]]:
-    """Те же запросы серверу с флагами юнита и серверу без `--proxy-headers`."""
+    """Те же запросы серверу с флагами юнита и серверу с `--no-proxy-headers`."""
     folder: Path = tmp_path_factory.mktemp("login-link-rate-limit")
     answers: dict[str, dict[str, object]] = {}
     processes: list[subprocess.Popen] = []
@@ -431,7 +446,7 @@ def behind_a_proxy(tmp_path_factory) -> dict[str, dict[str, object]]:
 def test_behind_the_proxy_each_address_has_its_own_counter(behind_a_proxy):
     answers = behind_a_proxy["as in the unit"]
 
-    assert answers["noisy"] == [401] * REFUSALS_A_MINUTE + [429] * 6
+    assert answers["noisy"] == [401] * ATTEMPTS_A_MINUTE + [429]
     assert answers["quiet"] == 401
     # Счётчик не сменить, назвав в заголовке чужой адрес: считается тот, что
     # дописал прокси.
@@ -443,6 +458,6 @@ def test_without_proxy_headers_one_counter_would_serve_everyone(behind_a_proxy):
     """Контроль: на этом запуске видно, что проба различает адреса не случайно."""
     answers = behind_a_proxy["no proxy headers"]
 
-    assert answers["noisy"] == [401] * REFUSALS_A_MINUTE + [429] * 6
+    assert answers["noisy"] == [401] * ATTEMPTS_A_MINUTE + [429]
     assert answers["quiet"] == 429
     assert answers["no proxy header"] == 429

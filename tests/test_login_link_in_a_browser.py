@@ -349,7 +349,7 @@ async def test_too_many_attempts_keep_the_link_alive_and_the_page_says_to_wait(
         refused = await tab.context.request.post(
             f"{site.address}/auth/verify", data={"token": f"wrong-{attempt}"}
         )
-        assert refused.status in (401, 429)
+        assert refused.status == 401
     site.server_side.received.clear()
 
     await tab.goto(link)
