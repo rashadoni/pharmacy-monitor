@@ -1222,6 +1222,12 @@ _VARIANT_WORDS = {
     "hipertonic",
     "hypertonik",
     "hypertonic",
+    # Раствор Рингера и Рингер-лактат (раствор Хартмана) — разный состав. Жалоба
+    # клиента 2026-10-12: «Ringer laktat (Hartman) 500 ml» стоял в паре с
+    # «Ringer 500 ml». В каталоге слово есть только у этой линейки (замер на
+    # копии 2026-10-13: 15 товаров, пара со словом у одной стороны — одна).
+    "laktat",
+    "lactate",
 }
 
 
@@ -2335,6 +2341,251 @@ def relink_stale_members(
     return relinked
 
 
+def replace_price_strangers(
+    session: Session,
+    *,
+    tenant_id: int = 1,
+    now=None,
+    dry_run: bool = False,
+    products: Sequence[Product] | None = None,
+    prices: dict | None = None,
+) -> list[dict]:
+    """Заменить в кластере товар, чья цена расходится с остальными, его соседом
+    по сайту с их ценой.
+
+    У сайта бывает несколько товаров с одним названием или с названием, которое
+    проход считает не дальше: таблетки и свечи («Polioksidonium 12 mq № 10»
+    дважды), крем и мазь, обычный и с лимоном. Проход брал первого подходящего и
+    на цену не смотрел, а правила проходов к уже собранным кластерам не
+    применяются — неверный сосед оставался в кластере, и клиент получал «у
+    конкурента дешевле на 30%» про другой товар (жалоба 2026-10-12, четыре
+    алерта из рассылки).
+
+    Замена делается, когда выполнено всё:
+      * цена члена заметно расходится с каждым другим живым членом кластера;
+      * на его сайте есть ровно один живой товар, чья цена совпадает с ценой
+        каждого из остальных (значит, у остальных она одна), из того же бакета,
+        что кто-то из них, не дальше по названию от каждого из них, чем сам
+        заменяемый, и со всеми ними совместимый (отказы оператора,
+        `_hard_conflict`, `_pairwise_spec_conflict`, цена за единицу);
+      * замена знает о стране не меньше заменяемого: страна — часть
+        идентичности, и подтверждённую страну цена не перевешивает («Ringer
+        400 ml» украинский у обоих сайтов при разной цене остаётся парой);
+      * этот товар без пары — тогда он занимает место; либо состоит в другом
+        кластере — тогда два товара меняются местами, если заменяемый так же
+        подходит тому кластеру; если обмен не подходит, но и там этот товар
+        чужой по цене, он переходит, а заменяемый остаётся без пары; если в том
+        кластере больше нет живых членов, товар просто переходит;
+      * а если этот товар со своим кластером в цене согласен, то не на месте
+        остальные: они переходят в его кластер (`joined` в ответе), когда у двух
+        кластеров нет общих сайтов и каждый член того кластера подходит им на
+        тех же условиях; заменяемый остаётся без пары.
+
+    Кластер, в котором после этого остался один член, — уже не пара: он
+    распускается, как в `revalidate_split` (`left_alone` в ответе). Когда сосед с
+    ценой остальных есть, а пара оставлена как была, причина — в событии
+    `matcher_price_stranger_kept` (уровень debug).
+
+    Ручные кластеры не трогаются. Освобождённый товар остаётся без пары до
+    проходов, которые идут следом. Возвращает список замен; при `dry_run` ни
+    база, ни объекты сессии не меняются.
+    """
+    from src.product_policy import country_code_of
+
+    acquire_match_mutation_xact_lock(session)
+    if products is None:
+        products = session.scalars(
+            select(Product).where(Product.tenant_id == tenant_id).order_by(Product.id)
+        ).all()
+    if prices is None:
+        prices = latest_snapshots_per_product(session, [product.id for product in products])
+    is_stale, fully_scraped = _gone_row_rules(products, now)
+
+    def price(product: Product) -> float | None:
+        return _effective_price(prices, product)
+
+    def is_live(product: Product) -> bool:
+        return (
+            product.site in fully_scraped
+            and not is_stale(product)
+            and product.url_dead_at is None
+            and _unmatchable_reason(product) is None
+            and price(product) is not None
+        )
+
+    buckets: dict[tuple, list[Product]] = defaultdict(list)
+    lineups: dict[int, list[Product]] = defaultdict(list)
+    for product in products:
+        if product.canonical_id is not None:
+            lineups[product.canonical_id].append(product)
+        if is_live(product):
+            buckets[_bucket_key(product)].append(product)
+    manual_ids = set(
+        session.scalars(
+            select(Match.id).where(Match.tenant_id == tenant_id, Match.is_manual.is_(True))
+        )
+    )
+    cluster_of: dict[int, int | None] = {product.id: product.canonical_id for product in products}
+
+    def fits(newcomer: Product, others: list[Product], instead_of: Product) -> bool:
+        """`newcomer` подходит остальным не хуже, чем товар, чьё место он займёт."""
+        known_country = country_code_of(instead_of)
+        if known_country and country_code_of(newcomer) != known_country:
+            return False
+        return (
+            all(_same_price(price(newcomer), price(other)) for other in others if is_live(other))
+            and all(_name_gap(other, newcomer) <= _name_gap(other, instead_of) for other in others)
+            and not any(
+                is_rejected(session, other.id, newcomer.id)
+                or _hard_conflict(other, newcomer)
+                or _pairwise_spec_conflict(other, newcomer)
+                for other in others
+            )
+            and not _has_perunit_mismatch([newcomer, *others], prices)
+        )
+
+    def touchable(cluster_id: int) -> bool:
+        """Не ручной и без двух строк одного сайта: такой кластер чинят не здесь."""
+        sites = [member.site for member in lineups[cluster_id]]
+        return cluster_id not in manual_ids and len(set(sites)) == len(sites)
+
+    replaced: list[dict] = []
+    emptied: set[int] = set()
+    for match_id in sorted(lineups):
+        live = [member for member in lineups[match_id] if is_live(member)]
+        if len(live) < 2 or not touchable(match_id):
+            continue
+        # Чужой — тот, кто расходится в цене с КАЖДЫМ из остальных: в кластере
+        # с ценами 7,78 / 7,00 / 7,00 это первый. Замена обязана совпасть в цене
+        # со всеми остальными (`fits`), поэтому при трёх разных ценах её нет.
+        for odd in sorted(live, key=lambda member: (member.site, member.id)):
+            lineup = lineups[match_id]
+            if odd not in lineup:
+                continue
+            rest = [member for member in lineup if member is not odd]
+            live_rest = [member for member in rest if is_live(member)]
+            if not live_rest or not all(_price_apart(price(odd), price(other)) for other in live_rest):
+                continue
+            candidates = {
+                candidate.id: candidate
+                for other in live_rest
+                for candidate in buckets.get(_bucket_key(other), ())
+                if candidate.site == odd.site and candidate is not odd
+            }
+            twins = [candidate for candidate in candidates.values() if fits(candidate, rest, odd)]
+            if not twins:
+                continue
+
+            def kept(reason: str, *, _where=match_id, _odd=odd, _twins=twins, **context) -> None:
+                # Сосед с ценой остальных есть, а пара остаётся как была.
+                log.debug(
+                    "matcher_price_stranger_kept",
+                    reason=reason,
+                    match_id=_where,
+                    product=_odd.id,
+                    siblings=[candidate.id for candidate in _twins],
+                    **context,
+                )
+
+            if len(twins) > 1:
+                kept("several_siblings")
+                continue
+            twin = twins[0]
+            other_id = cluster_of.get(twin.id)
+            swapped = False
+            joined: list[Product] = []
+            left_alone: list[Product] = []
+            if other_id is not None:
+                if not touchable(other_id):
+                    kept("sibling_cluster_not_to_be_touched", sibling_match=other_id)
+                    continue
+                there = [member for member in lineups[other_id] if member is not twin]
+                live_there = [member for member in there if is_live(member)]
+                if not live_there:
+                    pass  # в кластере соседа живых строк больше нет — он переходит
+                elif fits(odd, there, twin):
+                    swapped = True  # два товара стоят крест-накрест
+                elif all(_price_apart(price(twin), price(other)) for other in live_there):
+                    pass  # обмен не подходит, но сосед и у себя чужой — переходит
+                elif not {member.site for member in rest} & {
+                    member.site for member in there
+                } and all(fits(member, rest, odd) for member in there):
+                    # Сосед у себя на месте. Значит, не на месте остальные
+                    # здесь: каждый в его кластере подходит им не хуже
+                    # заменяемого — они переходят туда.
+                    joined = rest
+                else:
+                    kept("sibling_agrees_with_its_cluster", sibling_match=other_id)
+                    continue
+            if joined:
+                lineups[other_id] = [*lineups[other_id], *joined]
+                lineups[match_id], left_alone = [], [odd]
+                emptied.add(match_id)
+            else:
+                lineups[match_id] = [twin if member is odd else member for member in lineup]
+                if swapped:
+                    lineups[other_id] = [
+                        odd if member is twin else member for member in lineups[other_id]
+                    ]
+                elif other_id is not None:
+                    lineups[other_id] = [
+                        member for member in lineups[other_id] if member is not twin
+                    ]
+                    if len(lineups[other_id]) < 2:
+                        left_alone, lineups[other_id] = lineups[other_id], []
+                        emptied.add(other_id)
+            # Кто где теперь стоит. Запись в `cluster_of` нужна и при `dry_run`:
+            # по ней следующие кластеры этого же вызова видят перемещённых.
+            moves = [(member, other_id) for member in joined] or [(twin, match_id)]
+            moves.append((odd, other_id if swapped else None))
+            moves.extend((member, None) for member in left_alone)
+            for member, cluster_id in moves:
+                cluster_of[member.id] = cluster_id
+                if not dry_run:
+                    member.canonical_id = cluster_id
+            replaced.append(
+                {
+                    # Кластер, где товары теперь стоят вместе с соседом.
+                    "match_id": other_id if joined else match_id,
+                    "site": odd.site,
+                    "old": odd.id,
+                    "new": twin.id,
+                    "price": price(twin),
+                    "old_price": price(odd),
+                    # Кластер, который покинул сосед, а при `joined` — остальные.
+                    "from_match": match_id if joined else other_id,
+                    "swapped": swapped,
+                    "joined": [member.id for member in joined],
+                    "left_alone": [member.id for member in left_alone],
+                }
+            )
+    if replaced and not dry_run:
+        # Как в relink_stale_members: сессии проекта без autoflush, а проходы
+        # читают состав кластера из базы.
+        session.flush()
+        touched = {item["match_id"] for item in replaced} | {
+            item["from_match"] for item in replaced if item["from_match"] is not None
+        }
+        for touched_id in touched:
+            match = session.get(Match, touched_id)
+            if match is not None:
+                session.expire(match, ["products"])
+        for empty_id in emptied:
+            match = session.get(Match, empty_id)
+            if match is not None and not match.products:
+                session.delete(match)
+        session.flush()
+    if replaced:
+        log.info(
+            "matcher_price_strangers_replaced",
+            count=len(replaced),
+            swapped=sum(1 for item in replaced if item["swapped"]),
+            dry_run=dry_run,
+            replaced=replaced,
+        )
+    return replaced
+
+
 def _build_word_freq(products: list) -> dict[str, int]:
     """Частота слов по всем name_normalized.
 
@@ -2548,7 +2799,36 @@ def _name_gap(a, b) -> int:
     return len(_name_tokens(a.name_normalized or "") ^ _name_tokens(b.name_normalized or ""))
 
 
-def _closest_first(p, candidates: list) -> list:
+# У одного товара на разных сайтах цена обычно одна (замер на копии каталога
+# 2026-10-12: до процента совпадает у 74% пар «товар клиента — товар
+# конкурента»). Поэтому из двух одинаково похожих по названию товаров сайта
+# тот же товар — тот, у которого цена та же.
+_SAME_PRICE_TOLERANCE = 0.005
+# Чужим по цене член кластера считается, когда расходится с остальными заметно:
+# между двумя листингами одного товара на сайте бывает разница в копейки, и
+# менять один на другой из-за неё — пустая перестановка.
+_PRICE_STRANGER_MIN_GAP = 0.01
+
+
+def _effective_price(prices: dict, product) -> float | None:
+    """Действующая цена товара из последней записи: со скидкой, если она есть."""
+    snap = prices.get(product.id)
+    if snap is None:
+        return None
+    value = snap.discount_price or snap.price
+    return float(value) if value and value > 0 else None
+
+
+def _same_price(a: float | None, b: float | None) -> bool:
+    return a is not None and b is not None and abs(a - b) <= _SAME_PRICE_TOLERANCE * max(a, b)
+
+
+def _price_apart(a: float | None, b: float | None) -> bool:
+    """Цены известны и расходятся заметно (см. `_PRICE_STRANGER_MIN_GAP`)."""
+    return a is not None and b is not None and abs(a - b) > _PRICE_STRANGER_MIN_GAP * max(a, b)
+
+
+def _closest_first(p, candidates: list, prices: dict | None = None) -> list:
     """Кандидаты в порядке близости к якорю `p`.
 
     Проход берёт первого подходящего кандидата с каждого сайта, а «подходит»
@@ -2557,17 +2837,20 @@ def _closest_first(p, candidates: list) -> list:
     в базе. Сначала идут уже состоящие в одном кластере с якорем (их не
     вытесняем), затем — по числу несовпадающих слов; среди одинаково близких
     первым идёт тот, чьё предложение подтверждено свежим сбором (у сайта бывают
-    две строки одного товара: актуальная и давно не виденная). Дальше порядок
-    прежний.
+    две строки одного товара: актуальная и давно не виденная), затем тот, чья
+    цена совпадает с ценой якоря: у сайта бывают два товара с одним названием —
+    таблетки и свечи, обычный и с лимоном. Дальше порядок прежний.
     """
     from src.product_policy import current_offer_eligibility
 
+    anchor_price = _effective_price(prices, p) if prices else None
     return sorted(
         candidates,
         key=lambda q: (
             not (p.canonical_id is not None and q.canonical_id == p.canonical_id),
             _name_gap(p, q),
             not current_offer_eligibility(q).eligible,
+            not (prices is not None and _same_price(anchor_price, _effective_price(prices, q))),
         ),
     )
 
@@ -2671,6 +2954,11 @@ def match_products(
     # Один SELECT на все product_ids, не N+1.
     all_ids = [p.id for p in products]
     latest_prices: dict[int, PriceSnapshot] = latest_snapshots_per_product(session, all_ids)
+
+    # Правила проходов к уже собранным кластерам не применяются. Соседа,
+    # выбранного когда-то без оглядки на цену, меняет этот шаг — до проходов,
+    # чтобы освобождённый товар тут же нашёл свою пару.
+    replace_price_strangers(session, tenant_id=tenant_id, products=products, prices=latest_prices)
 
     # Группируем по эвристическому ключу для O(N*K) вместо O(N^2) — см. _bucket_key.
     bucket_key = _bucket_key
@@ -2880,10 +3168,13 @@ def match_products(
     visited |= ambiguous_ids
     # Товары, которым запись в кластер всё равно откажет (нет в наличии и т.п.),
     # и товары с мёртвой ссылкой не участвуют в проходах ни якорем, ни кандидатом.
-    visited |= {
+    # `out_of_play` — те, кто не участвует вовсе, в отличие от уже разобранных
+    # проходом: пару они не получат, а значит, и чужую не оспаривают.
+    out_of_play = ambiguous_ids | gone_ids
+    out_of_play |= {
         p.id for p in products if p.url_dead_at is not None or _unmatchable_reason(p) is not None
     }
-    visited |= gone_ids
+    visited |= out_of_play
 
     # Первое слово названия у категорий («Şpris», «Uşaq …», «Tibbi …») и крупных
     # брендов (Solgar, Doğadan) стоит у десятков товаров — см. _CROWDED_FIRST_TOKEN.
@@ -2970,7 +3261,7 @@ def match_products(
                     continue
                 cluster = [p]
                 min_score = 100.0  # минимальный fuzzy score в кластере → confidence
-                for q in _closest_first(p, group[i + 1 :]):
+                for q in _closest_first(p, group[i + 1 :], latest_prices):
                     if allowed is not None and not allowed(p, q):
                         continue
                     if blocked(p, q, cluster):
@@ -2989,6 +3280,25 @@ def match_products(
                         rival.site == p.site
                         and rival.id != p.id
                         and _name_gap(rival, q) < gap
+                        and (allowed is None or allowed(rival, q))
+                        and not blocked(rival, q, [rival])
+                        and _name_similarity(rival, q) >= threshold
+                        for rival in group
+                    ):
+                        continue
+                    # То же, когда соперник не ближе, а так же близок по
+                    # названию, но у него с q одна цена, а у якоря — другая:
+                    # «Septolete total» с лимоном другого сайта — пара для
+                    # «Septolete total» с лимоном, а не для обычного. Занятый
+                    # соперник в счёт, как и выше; пропавший с сайта — нет: его
+                    # старая цена не должна оставлять без пары живой товар.
+                    q_price = _effective_price(latest_prices, q)
+                    if not _same_price(_effective_price(latest_prices, p), q_price) and any(
+                        rival.site == p.site
+                        and rival.id != p.id
+                        and rival.id not in out_of_play
+                        and _same_price(_effective_price(latest_prices, rival), q_price)
+                        and _name_gap(rival, q) <= gap
                         and (allowed is None or allowed(rival, q))
                         and not blocked(rival, q, [rival])
                         and _name_similarity(rival, q) >= threshold
