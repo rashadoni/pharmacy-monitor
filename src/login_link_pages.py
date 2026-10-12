@@ -96,6 +96,11 @@ __SCRIPT__
 # другой сбой (сеть, 5xx, перезапуск API) токен не трогает: адрес остаётся
 # прежним, кнопка — тоже, повторное нажатие или обновление страницы повторяют
 # попытку.
+#
+# Ответ 429 — счётчик попыток с этого адреса (`auth_verify`, окно — минута). Он
+# стоит до проверки токена, так что о ссылке сервер ничего не сказал: адрес и
+# кнопка тоже остаются, но нажатие сразу получит тот же отказ, поэтому страница
+# просит подождать.
 _SIGN_IN = """
   var stop = null;
   function onward() { window.location.replace("/overview"); }
@@ -109,6 +114,12 @@ _SIGN_IN = """
   function failed() {
     say("Keçidi yoxlamaq alınmadı. Yenidən cəhd edin.",
         "Не удалось проверить ссылку. Попробуйте ещё раз.");
+    act.disabled = false;
+    act.focus();
+  }
+  function throttled() {
+    say("Həddindən çox cəhd edildi. Bir dəqiqə gözləyin və yenidən cəhd edin.",
+        "Слишком много попыток. Подождите минуту и попробуйте ещё раз.");
     act.disabled = false;
     act.focus();
   }
@@ -132,6 +143,7 @@ _SIGN_IN = """
         refused("Keçid etibarsızdır və ya artıq istifadə olunub.",
                 "Ссылка недействительна или уже использована.");
       }
+      else if (response.status === 429) { throttled(); }
       else { failed(); }
     }, function () {
       window.clearTimeout(waiting);

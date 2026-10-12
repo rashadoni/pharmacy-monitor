@@ -1107,6 +1107,19 @@ def auth_verify(token: str, request: Request, response: Response, db: Session = 
     (Accept */*) получают JSON-контракт.
     """
     wants_html = _wants_html(request)
+    # Счётчик попыток с адреса — такой же, какой первым стоит у
+    # `/auth/set-password`, — и один на оба способа прислать токен (POST выше
+    # зовёт этот же обработчик). Стоит до проверки: отказ 429 до базы не доходит
+    # и ссылку не трогает. В имени — адрес клиента; токену и его хешу там не
+    # место: имя становится ключом Redis, а команды Redis Sentry пишет в трассу
+    # запроса.
+    #
+    # Второго счётчика — по отказам, как `setpw_fail` и `login_fail`, — здесь нет
+    # намеренно. Он срабатывает уже после запроса к базе и ничего не ограничивает,
+    # а ответ меняет: по ссылке, которая просто не годится, страница входа
+    # просила бы подождать минуту вместо того, чтобы назвать ссылку негодной.
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(f"verify:{client_ip}", limit=10)
     user = tenants.redeem_magic_token(db, token)
     if not user:
         if wants_html:
