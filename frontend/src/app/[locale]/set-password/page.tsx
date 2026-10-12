@@ -80,13 +80,15 @@ export default function SetPasswordPage() {
         body: JSON.stringify({ token, new_password: password }),
       });
       if (!res.ok) {
-        if (res.status === 401) {
+        // 401 — ссылка не годится; 400 — пароль у пользователя уже есть, и ссылка
+        // при этом погашена. Мёртвый токен во вкладке не остаётся: обновлённая
+        // страница скажет о нём сразу, а не после нового пароля.
+        if (res.status === 401 || res.status === 400) {
           setLinkSpent(true);
-          throw new Error(t("error_invalid"));
+          forgetLinkToken();
         }
+        if (res.status === 401) throw new Error(t("error_invalid"));
         const data = await res.json().catch(() => ({}));
-        // 400 — пароль у пользователя уже есть; ссылка при этом погашена.
-        if (res.status === 400) setLinkSpent(true);
         const refused = passwordProblemInResponse(data);
         if (refused) throw new Error(t(PROBLEM_TEXT[refused]));
         // `detail` бывает и списком — тогда это не текст для человека.

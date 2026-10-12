@@ -23,7 +23,10 @@ export function storedLinkToken(): string | null {
   }
 }
 
-/** Пароль задан — токен погашен, во вкладке он больше не нужен. */
+/**
+ * Токен погашен — пароль задан или сервер отказал по самой ссылке: во вкладке
+ * он больше не нужен.
+ */
 export function forgetLinkToken(): void {
   try {
     window.sessionStorage.removeItem(LINK_TOKEN_STORAGE_KEY);
