@@ -90,7 +90,7 @@
     "error_unusable": "The password contains a character that cannot be saved. Type it again",
     "error_invalid": "Link is invalid or expired",
     "error_generic": "Couldn't save password",
-    "token_missing": "Token missing in link",
+    "token_missing": "Open the link from the email again. If that does not help, ask your administrator for a new one",
     "request_new": "Request a new link"
   },
   "comparison": {

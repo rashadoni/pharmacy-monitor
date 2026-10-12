@@ -90,7 +90,7 @@
     "error_unusable": "Parolda yadda saxlanıla bilməyən simvol var. Parolu yenidən yığın",
     "error_invalid": "Link yararsız və ya müddəti bitib",
     "error_generic": "Parolu saxlamaq alınmadı",
-    "token_missing": "Linkdə token yoxdur",
+    "token_missing": "Məktubdakı linki yenidən açın. Alınmasa, administratordan yeni link istəyin",
     "request_new": "Yeni link tələb edin"
   },
   "comparison": {

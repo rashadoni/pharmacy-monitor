@@ -1,7 +1,8 @@
 """Ссылку из письма открывает настоящий браузер: до сервера токен доходит только телом запроса.
 
 Всё, что браузер отправил, записывается на стороне сервера — строка запроса,
-заголовки, тело — и токен ищется во всём этом как есть: он состоит из знаков,
+заголовки, тело — и рядом заголовки ответа: `Location` редиректа прокси пишет в
+журнал тоже. Токен ищется во всём этом как есть: он состоит из знаков,
 которые не меняет ни одно кодирование адреса, поэтому находится и внутри
 закодированного заголовка. Рядом собираются строки журнала доступа uvicorn —
 какими он писал бы их без фильтра `src.access_log`, то есть с адресом целиком:
@@ -56,12 +57,14 @@ class Received:
     address: str
     headers: list[tuple[str, str]]
     body: bytearray = field(default_factory=bytearray)
+    answer_headers: list[tuple[str, str]] = field(default_factory=list)
 
     def places_holding(self, value: str) -> list[str]:
         places = []
         if value in self.address:
             places.append("address")
         places += [f"header {name}" for name, held in self.headers if value in held]
+        places += [f"answer header {name}" for name, held in self.answer_headers if value in held]
         if value.encode() in bytes(self.body):
             places.append("body")
         return [f"{self.method} {self.path}: {place}" for place in places]
@@ -97,17 +100,26 @@ class ServerSide:
                 seen.body.extend(message.get("body", b""))
             return message
 
+        async def answering(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                seen.answer_headers.extend(
+                    (k.decode("latin-1"), v.decode("latin-1")) for k, v in message["headers"]
+                )
+            await send(message)
+
         if path.startswith(("/auth/", "/api/")):
-            await self.app(scope, recording, send)
+            await self.app(scope, recording, answering)
         elif path in FRONTEND_ROUTES_WITHOUT_LOCALE:
             # next.config.mjs, LEGACY_ROUTES: адрес без языка → `/az/…`, запрос сохраняется.
-            await _answer(send, 307, {"location": f"/az{path}" + (f"?{query}" if query else "")})
+            await _answer(
+                answering, 307, {"location": f"/az{path}" + (f"?{query}" if query else "")}
+            )
         elif path.startswith("/az/"):
             await _answer(
-                send, 200, {"content-type": "text/html"}, b"<html><body>frontend</body></html>"
+                answering, 200, {"content-type": "text/html"}, b"<html><body>frontend</body></html>"
             )
         else:
-            await _answer(send, 404, {})
+            await _answer(answering, 404, {})
 
 
 async def _answer(send, status: int, headers: dict[str, str], body: bytes = b"") -> None:
@@ -152,30 +164,37 @@ def site(monkeypatch, db_session) -> Iterator[Site]:
     hiding = [f for f in access.filters if isinstance(f, QueryHidden)]
     # Снимать нечего — значит, журнал прячет запрос уже иначе, и тест устарел.
     assert len(hiding) == 1, f"ожидался один фильтр src.access_log, найдено {hiding}"
-    access.removeFilter(hiding[0])
     saved = (access.level, access.propagate)
-    access.addHandler(collect)
-    access.setLevel(logging.INFO)
-    access.propagate = False
-
-    server_side = ServerSide(api_module.app)
-    server = uvicorn.Server(
-        uvicorn.Config(server_side, log_config=None, lifespan="off", access_log=True)
-    )
-    thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
-    thread.start()
+    server = None
+    thread = None
     try:
+        access.removeFilter(hiding[0])
+        access.addHandler(collect)
+        access.setLevel(logging.INFO)
+        access.propagate = False
+
+        server_side = ServerSide(api_module.app)
+        server = uvicorn.Server(
+            uvicorn.Config(server_side, log_config=None, lifespan="off", access_log=True)
+        )
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
+        thread.start()
         deadline = time.monotonic() + 10
         while not server.started:
             assert time.monotonic() < deadline and thread.is_alive(), "сервер не поднялся"
             time.sleep(0.01)
         yield Site(address, server_side, access_log)
     finally:
-        server.should_exit = True
-        thread.join(timeout=10)
+        if server is not None:
+            server.should_exit = True
+        if thread is not None:
+            thread.join(timeout=10)
         listener.close()
         access.removeHandler(collect)
-        access.level, access.propagate = saved
+        # Через setLevel, не присваиванием: он сбрасывает кэш `isEnabledFor`,
+        # иначе логгер остался бы включён для следующих тестов процесса.
+        access.setLevel(saved[0])
+        access.propagate = saved[1]
         access.addFilter(hiding[0])
 
 
@@ -414,8 +433,14 @@ async def test_the_recording_does_find_a_token_sent_in_an_address_or_a_header(
         token,
     )
 
+    # Письмо прежнего образца на создание пароля: фронтенд уводит на `/az/…`.
+    await tab.goto(f"{site.address}/set-password?token={token}")
+
     assert site.server_side.places_holding(token) == [
         "GET /auth/verify: address",
         "GET /az/overview: header next-router-state-tree",
+        "GET /set-password: address",
+        "GET /set-password: answer header location",
+        "GET /az/set-password: address",
     ]
     assert [line for line in site.access_log if token in line]
