@@ -10,9 +10,10 @@ Auth моделей две:
        Один shared key через PHARMACY_API_KEY в .env. Используется в legacy
        endpoints `/api/v1/products`, `/api/v1/comparisons`, `/api/v1/inventory/*`.
     2. **JWT cookie** — для frontend dashboard. Magic-link flow:
-       `POST /auth/request` → email с magic_token → `GET /auth/verify?token=...`
-       устанавливает httpOnly cookie с JWT. Endpoints `/api/v1/dash/*` требуют
-       этот cookie и фильтруют по tenant_id.
+       `POST /auth/request` → email со ссылкой, токен в ней после «#» →
+       страница `GET /auth/link` шлёт его телом `POST /auth/verify` → httpOnly
+       cookie с JWT. Endpoints `/api/v1/dash/*` требуют этот cookie и фильтруют
+       по tenant_id.
 
 Endpoints (v1):
     Public:
@@ -20,7 +21,11 @@ Endpoints (v1):
 
     Auth (no auth required, public):
         POST /auth/request                 — request magic-link by email
-        GET  /auth/verify?token=...        — verify token, set JWT cookie
+        GET  /auth/link                    — страница входа по ссылке из письма
+        GET  /auth/link/password           — страница ссылки на создание пароля
+        POST /auth/verify {token}          — verify token, set JWT cookie
+        GET  /auth/verify?token=...        — то же, токен в адресе: письма так
+                                             не ходят, остался для скриптов
         POST /auth/logout                  — clear cookie
 
     Frontend (JWT cookie required):
@@ -961,10 +966,16 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     должно падать из-за временной проблемы с почтой (fail-open).
 
     Цель ссылки выбирается по тому, есть ли у пользователя свой пароль:
-    - нет пароля (`password_hash` пуст) → `/set-password` — юзер задаёт пароль и
-      сразу входит. Дальше логинится по email+паролю в любой момент.
-    - есть пароль → `/auth/verify` — magic-link просто логинит (passwordless вход).
+    - нет пароля (`password_hash` пуст) → `/auth/link/password` — оттуда на форму
+      `/set-password`: юзер задаёт пароль и сразу входит. Дальше логинится по
+      email+паролю в любой момент.
+    - есть пароль → `/auth/link` — magic-link просто логинит.
     `invite=True` — приветственная формулировка письма (новый пользователь).
+
+    Токен стоит в ссылке после «#»: эту часть адреса браузер серверу не
+    отправляет. Обе страницы отдаёт API, а не фронтенд, — почему, сказано в
+    `src/login_link_pages.py`. В строку запроса («?token=…») и в адрес страницы
+    фронтенда токен не ставить: адрес и заголовки запроса пишет журнал прокси.
     """
     email = email.strip().lower()
     user = db.scalar(
@@ -981,7 +992,7 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     needs_password = not user.password_hash
     public_url = os.environ.get("PHARMACY_PUBLIC_URL", "http://localhost:3000")
     if needs_password:
-        link = f"{public_url}/set-password?token={token}"
+        link = f"{public_url}/auth/link/password#token={token}"
         welcome = (
             "<p>Sizə Pharmacy Monitor monitorinq paneli üçün giriş açıldı.</p>"
             "<p>Вам открыт доступ к панели Pharmacy Monitor.</p>"
@@ -995,7 +1006,7 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
             "<p>Задайте пароль для входа (ссылка действует 30 минут):</p>"
         )
     else:
-        link = f"{public_url}/auth/verify?token={token}"
+        link = f"{public_url}/auth/link#token={token}"
         subject = "Pharmacy Monitor — giriş keçidi / ссылка для входа"
         intro = (
             "<p>Daxil olmaq üçün keçid (30 dəqiqə qüvvədədir):</p>"
@@ -1032,16 +1043,83 @@ def auth_request(payload: AuthRequestIn, request: Request, db: Session = Depends
     return AuthRequestOut(sent=True, detail="If the email is registered, a magic-link was sent.")
 
 
-@app.get("/auth/verify")
+from fastapi.responses import HTMLResponse
+
+from src import login_link_pages
+
+
+def _login_link_page(html: str) -> HTMLResponse:
+    # Страница одна на всех и токена не содержит; не кэшировать — чтобы после
+    # выкладки браузер не исполнил прежний сценарий.
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/auth/link", include_in_schema=False)
+def auth_link_sign_in_page() -> HTMLResponse:
+    """Куда ведёт ссылка на вход: страница шлёт токен в `POST /auth/verify`."""
+    return _login_link_page(login_link_pages.SIGN_IN_PAGE)
+
+
+@app.get("/auth/link/password", include_in_schema=False)
+def auth_link_set_password_page() -> HTMLResponse:
+    """Куда ведёт ссылка на создание пароля: дальше — форма `/set-password`."""
+    return _login_link_page(login_link_pages.SET_PASSWORD_PAGE)
+
+
+class LinkTokenIn(BaseModel):
+    """Токен из ссылки в письме — телом запроса, не адресом."""
+
+    token: str
+
+    @field_validator("token")
+    @classmethod
+    def _strip_token(cls, v: str) -> str:
+        v = v.strip()
+        if not v or len(v) > 512:
+            raise ValueError("invalid token")
+        return v
+
+
+@app.post("/auth/verify")
+def auth_verify_posted(
+    payload: LinkTokenIn, request: Request, response: Response, db: Session = Depends(get_db)
+):
+    """Вход по ссылке из письма: токен приходит телом запроса.
+
+    Так ходит страница `/auth/link`: ссылка несёт токен после «#», страница
+    читает его и шлёт сюда. Тело запроса журналы прокси и API не пишут, адрес
+    и заголовки — пишут. Проверка, гашение и cookie — те же, что у GET ниже:
+    правило входа одно, меняется только способ доставки токена.
+    """
+    return auth_verify(payload.token, request, response, db)
+
+
+@app.get("/auth/verify", deprecated=True)
 def auth_verify(token: str, request: Request, response: Response, db: Session = Depends(get_db)):
     """Verify magic token, set JWT cookie.
 
-    Этот эндпоинт кликают прямо из письма, поэтому для браузера (Accept:
-    text/html) после установки cookie делаем 303-redirect на дашборд — иначе
-    пользователь видел бы сырой JSON. Программные/XHR-вызовы (Accept */*)
-    получают прежний JSON-контракт.
+    Токен здесь стоит в адресе запроса, а адрес пишут журналы прокси и API.
+    Письма сюда больше не ведут (см. `_send_login_link` и POST выше); адресом
+    входят тесты, e2e и нагрузочный скрипт. Новой ссылке сюда не место.
+
+    Для браузера (Accept: text/html) после установки cookie делаем 303-redirect
+    на дашборд — иначе пользователь видел бы сырой JSON. Программные/XHR-вызовы
+    (Accept */*) получают JSON-контракт.
     """
     wants_html = _wants_html(request)
+    # Счётчик попыток с адреса — такой же, какой первым стоит у
+    # `/auth/set-password`, — и один на оба способа прислать токен (POST выше
+    # зовёт этот же обработчик). Стоит до проверки: отказ 429 до базы не доходит
+    # и ссылку не трогает. В имени — адрес клиента; токену и его хешу там не
+    # место: имя становится ключом Redis, а команды Redis Sentry пишет в трассу
+    # запроса.
+    #
+    # Второго счётчика — по отказам, как `setpw_fail` и `login_fail`, — здесь нет
+    # намеренно. Он срабатывает уже после запроса к базе и ничего не ограничивает,
+    # а ответ меняет: по ссылке, которая просто не годится, страница входа
+    # просила бы подождать минуту вместо того, чтобы назвать ссылку негодной.
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(f"verify:{client_ip}", limit=10)
     user = tenants.redeem_magic_token(db, token)
     if not user:
         if wants_html:

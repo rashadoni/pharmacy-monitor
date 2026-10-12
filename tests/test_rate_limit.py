@@ -22,6 +22,13 @@ from src import rate_limit as rl
 
 
 @pytest.fixture(autouse=True)
+def _request_counters_end_with_the_test():
+    """Здесь проверяется сам выбор между Redis и памятью: общая фикстура из
+    conftest.py подменила бы `_redis_client`, который эти тесты и зовут. Состояние
+    между тестами сбрасывает `_reset_state` ниже."""
+
+
+@pytest.fixture(autouse=True)
 def _reset_state():
     """Свежее состояние between тестами — clear memory buckets + redis cache."""
     rl._reset_memory_for_tests()

@@ -68,11 +68,6 @@
     "submitting": "Sending…",
     "sent_title": "Email sent",
     "sent_body": "If this email is registered, click the link in the message (expires in 30 min).",
-    "verify_loading": "Verifying…",
-    "verify_invalid": "Invalid or expired token",
-    "verify_missing": "The URL does not contain a token",
-    "verify_network": "The link could not be verified: network unavailable",
-    "verify_request_new": "Request a new link",
     "logout_confirm": "Sign out?",
     "logout": "Sign out",
     "password_subtitle": "Enter your login and password",
@@ -95,7 +90,7 @@
     "error_unusable": "The password contains a character that cannot be saved. Type it again",
     "error_invalid": "Link is invalid or expired",
     "error_generic": "Couldn't save password",
-    "token_missing": "Token missing in link",
+    "token_missing": "Open the link from the email again. If that does not help, ask your administrator for a new one",
     "request_new": "Request a new link"
   },
   "comparison": {
