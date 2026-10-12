@@ -4333,6 +4333,16 @@ def _read_health_alert_state(path: str) -> dict | None:
             return False
         return True
 
+    # Дорожка долгих предупреждений: время отправки по ключу. Битая запись в ней
+    # не повод выбрасывать состояние инцидента — её просто нет, и о долгом
+    # предупреждении напишут ещё раз.
+    standing = state.get("standing")
+    standing = (
+        {key: value for key, value in standing.items() if valid_timestamp(value)}
+        if isinstance(standing, dict)
+        else {}
+    )
+
     version = state.get("version")
     if type(version) is int and version == 2:
         status = state.get("status")
@@ -4349,6 +4359,8 @@ def _read_health_alert_state(path: str) -> dict | None:
                 "signature": signature,
                 "last_sent_at": last_sent_at,
             }
+            if standing:
+                normalized["standing"] = standing
             incident_started_at = state.get("incident_started_at")
             if "incident_started_at" in state and not valid_timestamp(incident_started_at):
                 return None
@@ -4364,6 +4376,8 @@ def _read_health_alert_state(path: str) -> dict | None:
                 "signature": None,
                 "last_sent_at": last_sent_at,
             }
+            if standing:
+                normalized["standing"] = standing
             if "recovered_signature" in state:
                 recovered_signature = state.get("recovered_signature")
                 if recovered_signature is not None and not isinstance(recovered_signature, str):
@@ -4450,12 +4464,15 @@ def _dispatch_health_alert_email(
     if decision.action is None:
         return None
 
-    subject = (
-        "Pharmacy Monitor — RECOVERED"
-        if decision.action == "recovery"
-        else f"Pharmacy Monitor — {report.status.upper()}"
+    # У долгого предупреждения своя тема: «WARNING» — это тема нового инцидента.
+    subject = {
+        "recovery": "Pharmacy Monitor — RECOVERED",
+        "notice": "Pharmacy Monitor — NOTICE",
+    }.get(decision.action, f"Pharmacy Monitor — {report.status.upper()}")
+    delivered = notifier.send_email(
+        subject=subject,
+        html_body=render_alert_html(report, recovered=decision.action == "recovery"),
     )
-    delivered = notifier.send_email(subject=subject, html_body=render_alert_html(report))
     if delivered is not True:
         raise RuntimeError("health email was not delivered: SMTP is not configured")
     next_state = health_alert_state_after(decision, last_state, now=transition_at)
@@ -4509,7 +4526,7 @@ def health_check_cmd(
     alert_state_file: str,
 ) -> None:
     """Проверить здоровье системы: stale/failed/empty/site-drop. Exit-code 0=ok, 1=warning, 2=critical."""
-    from src.health import check_health
+    from src.health import STANDING_REMINDER_HOURS, check_health
 
     storage.init_db()
     Session = storage.make_session()
@@ -4543,10 +4560,17 @@ def health_check_cmd(
                     click.echo("→ Email-напоминание отправлено")
                 elif action == "recovery":
                     click.echo("→ Email о восстановлении отправлен")
-                elif report.status != "ok":
+                elif action == "notice":
+                    click.echo("→ Email с долгим предупреждением отправлен")
+                elif report.has_incident:
                     click.echo(
                         f"→ Email подавлен (напоминание раз в {alert_cooldown_hours}ч — "
                         "инцидент не изменился)"
+                    )
+                elif report.status != "ok":
+                    click.echo(
+                        "→ Email подавлен (долгое предупреждение: напоминание раз в "
+                        f"{STANDING_REMINDER_HOURS // 24} дней)"
                     )
         except Exception as e:
             click.echo(f"⚠️ Не удалось отправить health email: {e}", err=True)
