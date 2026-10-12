@@ -13,12 +13,12 @@ Workflow нельзя запустить локально, поэтому тес
   и `/etc/pharmacy-monitor` на каталоги песочницы;
 - `rsync` копирует туда же настоящим rsync;
 - Alembic настоящий, база — SQLite; миграции пробные;
-- прошлый релиз в живом каталоге — `migrations/env.py`, лежавший на сервере до
-  первой выкладки этим workflow (от 2026-08-23), и `src/storage.py` без фабрики
-  движка, которую зовёт `env.py` чекаута. Это жёстче, чем сервер на 2026-10-11:
-  там `src` фабрику уже знает (PR #86 выложен), без неё — релизы старше.
-  Зато миграция, исполненная не на `src` и `env.py` своего релиза, здесь падает
-  на импорте;
+- в живом каталоге всегда лежит `migrations/env.py` сервера (от 2026-08-23):
+  выкладка его не трогает, туда идёт только `migrations/versions/`. `env.py`
+  чекаута зовёт фабрику движка из `src/storage.py`, а прошлый релиз в
+  песочнице — без фабрики. Это жёстче, чем сервер на 2026-10-11 (там `src`
+  фабрику уже знает, без неё — релизы старше PR #86), зато миграция,
+  исполненная не на `src` и `env.py` своего релиза, здесь падает на импорте;
 - `sudo`, `pnpm`, `curl`, `sleep`, `systemctl` — заглушки, которые пишут журнал.
 
 Каждая заглушка записывает, какая ревизия была в базе и какой релиз лежал в
@@ -64,10 +64,11 @@ CLEANUP = "Remove staged release runtime"
 
 REAL_RSYNC = shutil.which("rsync")
 
-# `migrations/env.py`, лежавший на сервере до первой выкладки этим workflow:
-# прежний deploy.yml возил только `migrations/versions/`. Файл прочитан с сервера
-# 2026-10-11, байт в байт тот же, что в истории git до PR #86 (контрольная сумма
-# ниже). Движок он строит через `engine_from_config`, из `src` берёт один `Base`.
+# `migrations/env.py` живого каталога сервера. Ни прежний deploy.yml, ни этот его
+# не возят — только `migrations/versions/`. Файл прочитан с сервера 2026-10-11,
+# байт в байт тот же, что в истории git до PR #86 (контрольная сумма ниже).
+# Движок он строит через `engine_from_config`, из `src` берёт один `Base` —
+# поэтому импортируется рядом с любым релизом.
 PREVIOUS_ENV_PY = ROOT / "tests" / "fixtures" / "migrations_env_on_server_2026-08-23.py.txt"
 PREVIOUS_ENV_PY_SHA256 = "10fbd002a801b6183d9097c20956b790749de1561aa6de3bd4799272d054021f"
 
@@ -75,7 +76,6 @@ PREVIOUS_ENV_PY_SHA256 = "10fbd002a801b6183d9097c20956b790749de1561aa6de3bd47992
 # им идёт откат на такой коммит. Снимок `main` от 2026-10-11 (9f072e9a).
 PREVIOUS_WORKFLOW = ROOT / "tests" / "fixtures" / "deploy_yml_before_schema_first.yml"
 PREVIOUS_WORKFLOW_SHA256 = "705fd361e9916a0a4fd4ced0f79c3d3c02532d58b4d52077802434f88b183327"
-PREVIOUS_VERIFY_GRAPH = "Verify migration graph has one head"
 
 STORAGE_BEFORE_THE_FACTORY = (
     "from sqlalchemy.orm import DeclarativeBase\n\n\nclass Base(DeclarativeBase):\n    pass\n"
@@ -431,7 +431,8 @@ def _write_release(target: Path, *, release: str, revisions: list[str], staged: 
     ``release`` — чей это код: ``new`` — чекаут этого репозитория (``env.py``
     зовёт фабрику движка из ``src``), ``old`` — релиз старше PR #86 (фабрики в
     ``src`` нет, ``env.py`` её не зовёт). ``staged`` — выкладывают ли это дерево
-    или оно лежит в живом каталоге.
+    или оно лежит в живом каталоге. В живом каталоге ``env.py`` и
+    ``alembic.ini`` — сервера, каким бы ни был релиз: выкладка их не возит.
     """
     (target / "src").mkdir(parents=True)
     (target / "src" / "__init__.py").write_text("", encoding="utf-8")
@@ -450,7 +451,7 @@ def _write_release(target: Path, *, release: str, revisions: list[str], staged: 
     shutil.copy(ROOT / "alembic.ini", target / "alembic.ini")
     for name in ("script.py.mako", "README"):
         shutil.copy(ROOT / "migrations" / name, target / "migrations" / name)
-    if release == "new":
+    if release == "new" and staged:
         shutil.copy(ROOT / "migrations" / "env.py", target / "migrations" / "env.py")
     else:
         previous = PREVIOUS_ENV_PY.read_bytes()
@@ -459,8 +460,8 @@ def _write_release(target: Path, *, release: str, revisions: list[str], staged: 
         )
         (target / "migrations" / "env.py").write_bytes(previous)
     if not staged:
-        # На сервере alembic.ini прошлой выкладки: правка обязана доехать
-        # выкладкой. И файл, которого в релизе уже нет.
+        # alembic.ini сервера отличим от файла чекаута: видно, что выкладка
+        # его не заменила. И файл миграции, которого в релизе уже нет.
         stale = target / "alembic.ini"
         stale.write_text(
             stale.read_text(encoding="utf-8") + "\n# previous release\n", encoding="utf-8"
@@ -846,15 +847,12 @@ def test_migration_runs_while_the_previous_release_is_still_live(
     assert max(event["at"] for event in staged_copies) < upgrade["at"]
 
     # Файлы миграций — первыми: база уже впереди живого каталога.
-    assert live_copies[0]["destination"] == "/opt/pharmacy-monitor/migrations/"
+    assert live_copies[0]["destination"] == "/opt/pharmacy-monitor/migrations/versions/"
 
     assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "new"
     versions = sandbox.live / "migrations" / "versions"
     assert (versions / f"{HEAD}.py").exists()
     assert not (versions / "removed_from_the_release.txt").exists()
-    # env.py несёт lock_timeout: ручной `alembic upgrade` на сервере его тоже получит.
-    for relative in ("migrations/env.py", "alembic.ini"):
-        assert (sandbox.live / relative).read_bytes() == (ROOT / relative).read_bytes(), relative
 
     restarts = _restarts(sandbox)
     assert [event["argv"][-1] for event in restarts] == [
@@ -865,13 +863,16 @@ def test_migration_runs_while_the_previous_release_is_still_live(
     assert sandbox.staging_dirs() == []
 
 
-def test_stand_live_release_cannot_serve_the_env_py_being_deployed(
+def test_env_py_of_the_release_does_not_import_next_to_an_older_src(
     pending_migration: Sandbox,
 ) -> None:
-    """Контроль стенда: `env.py` чекаута на `src` прошлого релиза не импортируется.
+    """Почему `env.py` релиза в живой каталог не кладут — и контроль стенда.
 
-    На этом держится проверка «миграция идёт на `src` своего релиза»: возьми
-    workflow `src` из живого каталога, `alembic` упал бы так же.
+    `env.py` чекаута рядом с `src` без фабрики движка не импортируется. Такая
+    пара возникла бы при откате: коммит старше этого порядка выкладывает его
+    собственный deploy.yml, который кладёт свой `src/` и зовёт Alembic из живого
+    каталога. На том же держится проверка «миграция идёт на `src` своего
+    релиза»: возьми workflow `src` из живого каталога, `alembic` упал бы так же.
     """
     sandbox = pending_migration
     shutil.copy(ROOT / "migrations" / "env.py", sandbox.live / "migrations" / "env.py")
@@ -882,26 +883,36 @@ def test_stand_live_release_cannot_serve_the_env_py_being_deployed(
     assert "cannot import name 'create_engine_hiding_statement_data'" in mixed.stderr
 
 
+def _alembic_files_of_the_live_directory(sandbox: Sandbox) -> dict[str, bytes]:
+    return {
+        relative: (sandbox.live / relative).read_bytes()
+        for relative in ("migrations/env.py", "alembic.ini")
+    }
+
+
 @pytest.mark.parametrize("rollback", [False, True], ids=["new over old", "old over new"])
-def test_every_alembic_call_runs_on_the_release_being_deployed(
+def test_deploy_runs_alembic_on_its_own_release_and_leaves_the_live_env_py_alone(
     tmp_path: Path, rollback: bool
 ) -> None:
-    """`env.py` и `src` всегда одного релиза — и при выкладке вперёд, и при возврате.
+    """Свои `env.py` и `src` у миграции, прежние `env.py` и `alembic.ini` — в живом каталоге.
 
     `env.py` чекаута зовёт фабрику движка из `src/storage.py`; в `src` прошлого
     релиза её нет. Workflow не исполняет Alembic из живого каталога ни разу:
     каждый вызов идёт из `.deploy-stage.*`, где лежат `env.py` и `src` одного
-    коммита. После выкладки в живом каталоге тоже одна пара.
+    коммита. В живой каталог из `migrations/` он кладёт только `versions/`:
+    `env.py` сервера берёт из `src` один `Base` и работает рядом с любым релизом.
 
-    «old over new» — свойство workflow, а не настоящий откат: коммита, в котором
-    этот deploy.yml лежит рядом с прежним `env.py`, не бывает. Настоящий откат
-    на коммит старше этой правки исполняет ПРЕЖНИЙ deploy.yml — тесты ниже.
+    «old over new» — свойство workflow, а не настоящий откат: настоящий откат на
+    коммит старше этой правки исполняет ПРЕЖНИЙ deploy.yml — тест ниже.
     """
     revisions = [BASE] if rollback else [BASE, HEAD]
     sandbox = Sandbox(
         tmp_path, release_revisions=revisions, live_revisions=[BASE], rollback=rollback
     )
     sandbox.migrate_production_to(BASE)
+    alembic_files = _alembic_files_of_the_live_directory(sandbox)
+    assert alembic_files["migrations/env.py"] == PREVIOUS_ENV_PY.read_bytes()
+    assert alembic_files["alembic.ini"] != (ROOT / "alembic.ini").read_bytes()
 
     result = run_workflow(sandbox, apply_migrations=not rollback)
 
@@ -916,90 +927,68 @@ def test_every_alembic_call_runs_on_the_release_being_deployed(
         assert call["pythonpath"] == call["cwd"], call
 
     assert (sandbox.live / "src" / "RELEASE").read_text().strip() == sandbox.staged_release
-    deployed_env_py = PREVIOUS_ENV_PY if rollback else ROOT / "migrations" / "env.py"
-    assert (sandbox.live / "migrations" / "env.py").read_bytes() == deployed_env_py.read_bytes()
+    assert _alembic_files_of_the_live_directory(sandbox) == alembic_files
+    under_migrations = {
+        event["destination"]
+        for event in sandbox.events("rsync", live=True)
+        if "/migrations" in event["destination"] or "alembic.ini" in event["destination"]
+    }
+    assert under_migrations == {"/opt/pharmacy-monitor/migrations/versions/"}
     by_hand = sandbox.alembic_by_hand("current")
     assert by_hand.returncode == 0, by_hand.stderr
     assert by_hand.stdout.split()[0] == revisions[-1]
 
 
-def _rollback_with_the_previous_workflow(tmp_path: Path, *, knows_the_factory: bool) -> Sandbox:
-    """Сервер после выкладки этим порядком; назад выкладывают коммит старше него.
+@pytest.mark.parametrize(
+    "knows_the_factory", [True, False], ids=["commit since PR #86", "commit before PR #86"]
+)
+def test_previous_workflow_rolls_back_to_an_older_commit(
+    tmp_path: Path, knows_the_factory: bool
+) -> None:
+    """Откат на коммит старше этого порядка проходит — и на тот, что не знает фабрику.
 
-    В живом каталоге `env.py` и `src` чекаута. Выкладываемый коммит несёт
-    прежний deploy.yml; его `src` знает фабрику движка (коммит от PR #86) или
-    нет (старше).
+    Сервер после выкладки этим порядком: `src` чекаута, `env.py` — прежний.
+    Назад выкладывают коммит с ПРЕЖНИМ deploy.yml: он кладёт свой `src/` и
+    `migrations/versions/` и зовёт Alembic из живого каталога. Лежи там `env.py`
+    чекаута, коммит без фабрики сорвал бы выкладку на импорте после копирования
+    кода (тест выше показывает эту пару).
     """
     assert hashlib.sha256(PREVIOUS_WORKFLOW.read_bytes()).hexdigest() == (
         PREVIOUS_WORKFLOW_SHA256
     ), f"{PREVIOUS_WORKFLOW.name} — снимок прежнего deploy.yml, его не правят"
-    sandbox = Sandbox(tmp_path, release_revisions=[BASE], live_revisions=[BASE], rollback=True)
-    sandbox.migrate_production_to(BASE)
-    if knows_the_factory:
-        (sandbox.checkout / "src" / "storage.py").write_text(
-            STORAGE_WITH_THE_FACTORY, encoding="utf-8"
-        )
-    return sandbox
-
-
-def test_previous_workflow_rolls_back_to_a_commit_that_knows_the_engine_factory(
-    tmp_path: Path,
-) -> None:
-    """Откат на коммит от PR #86 и новее проходит: новому `env.py` хватает его `src`."""
-    sandbox = _rollback_with_the_previous_workflow(tmp_path, knows_the_factory=True)
-
-    result = run_workflow(sandbox, apply_migrations=False, workflow_file=PREVIOUS_WORKFLOW)
-
-    assert result.failed_step is None, result.describe()
-    assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "old"
-    # Прежний workflow env.py не возит: в живом каталоге остался файл чекаута.
-    assert (sandbox.live / "migrations" / "env.py").read_bytes() == (
-        ROOT / "migrations" / "env.py"
-    ).read_bytes()
-    assert len(_restarts(sandbox)) == 2
-
-
-def test_previous_workflow_cannot_roll_back_past_the_engine_factory(tmp_path: Path) -> None:
-    """Откат на коммит старше PR #86 срывается на середине, и выйти можно только вперёд.
-
-    Известное ограничение, а не желаемое поведение: тест держит в согласии с
-    кодом то, что обещает docs/RUNBOOK.md, «Откат выкладкой прошлого коммита».
-    """
-    sandbox = _rollback_with_the_previous_workflow(tmp_path, knows_the_factory=False)
-
-    stuck = run_workflow(sandbox, apply_migrations=False, workflow_file=PREVIOUS_WORKFLOW)
-
-    # Прошлый src уже скопирован, env.py остался новый — пара не импортируется.
-    assert stuck.failed_step.name == PREVIOUS_VERIFY_GRAPH, stuck.describe()
-    assert "cannot import name 'create_engine_hiding_statement_data'" in stuck.failed_step.stderr
-    assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "old"
-    assert _restarts(sandbox) == [], "сервисы остались на прежнем коде в памяти"
-    assert sandbox.alembic_by_hand("current").returncode != 0
-
-    # Прежним workflow отсюда не выйти даже с коммитом, который фабрику знает:
-    # первым шагом он зовёт `alembic current` из живого каталога.
-    (sandbox.checkout / "src" / "storage.py").write_text(STORAGE_WITH_THE_FACTORY, encoding="utf-8")
-    (sandbox.checkout / "src" / "RELEASE").write_text("knows the factory\n", encoding="utf-8")
-    copied_before = len(sandbox.events("rsync"))
-    still_stuck = run_workflow(sandbox, apply_migrations=False, workflow_file=PREVIOUS_WORKFLOW)
-
-    assert still_stuck.failed_step.name == PREFLIGHT_REVISION, still_stuck.describe()
-    assert (
-        "cannot import name 'create_engine_hiding_statement_data'" in still_stuck.failed_step.stderr
+    # Живой каталог — тот, что оставляет выкладка этим порядком.
+    after_deploy = Sandbox(
+        tmp_path / "deploy", release_revisions=[BASE], live_revisions=[BASE], rollback=False
     )
-    assert len(sandbox.events("rsync")) == copied_before, "до копирования дело не дошло"
+    after_deploy.migrate_production_to(BASE)
+    deployed = run_workflow(after_deploy, apply_migrations=False)
+    assert deployed.failed_step is None, deployed.describe()
+    assert (after_deploy.live / "src" / "storage.py").read_text() == STORAGE_WITH_THE_FACTORY
+    restarts_before = len(_restarts(after_deploy))
 
-    # Выводит выкладка коммитом с этим порядком: живой env.py он не исполняет.
-    shutil.copy(ROOT / "migrations" / "env.py", sandbox.checkout / "migrations" / "env.py")
-    (sandbox.checkout / "src" / "RELEASE").write_text("new\n", encoding="utf-8")
-    subprocess.run(["git", "add", "-A"], cwd=sandbox.checkout, check=True)
-    recovered = run_workflow(sandbox, apply_migrations=False)
+    # Теперь чекаут — прошлый коммит со своим, прежним deploy.yml.
+    (after_deploy.checkout / "src" / "storage.py").write_text(
+        STORAGE_WITH_THE_FACTORY if knows_the_factory else STORAGE_BEFORE_THE_FACTORY,
+        encoding="utf-8",
+    )
+    (after_deploy.checkout / "src" / "RELEASE").write_text("older\n", encoding="utf-8")
+    shutil.copy(PREVIOUS_ENV_PY, after_deploy.checkout / "migrations" / "env.py")
 
-    assert recovered.failed_step is None, recovered.describe()
-    assert (sandbox.live / "src" / "RELEASE").read_text().strip() == "new"
-    assert len(_restarts(sandbox)) == 2
-    by_hand = sandbox.alembic_by_hand("current")
-    assert by_hand.returncode == 0, by_hand.stderr
+    rolled_back = run_workflow(
+        after_deploy, apply_migrations=False, workflow_file=PREVIOUS_WORKFLOW
+    )
+
+    assert rolled_back.failed_step is None, rolled_back.describe()
+    assert (after_deploy.live / "src" / "RELEASE").read_text().strip() == "older"
+    assert (after_deploy.live / "migrations" / "env.py").read_bytes() == (
+        PREVIOUS_ENV_PY.read_bytes()
+    )
+    assert len(_restarts(after_deploy)) == restarts_before + 2
+    # Прежний workflow зовёт Alembic из живого каталога — и тот отвечает.
+    live_calls = [
+        call for call in after_deploy.events("alembic") if call["cwd"] == "/opt/pharmacy-monitor"
+    ]
+    assert {call["command"] for call in live_calls} >= {"heads", "current"}
 
 
 def test_release_without_a_migration_takes_no_backup_and_runs_no_upgrade(tmp_path: Path) -> None:

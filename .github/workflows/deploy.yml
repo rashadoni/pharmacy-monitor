@@ -14,8 +14,9 @@ name: Deploy to production
 #       echo 'pm ALL=(root) NOPASSWD: /usr/bin/systemctl restart pharmacy-monitor-api.service, /usr/bin/systemctl restart pharmacy-monitor-frontend.service' \
 #         | sudo tee /etc/sudoers.d/pm-deploy && sudo chmod 440 /etc/sudoers.d/pm-deploy
 #   * АЛЕМБИК ПО УМОЛЧАНИЮ НЕ ЗАПУСКАЕТСЯ: миграции включаются явным флагом
-#     apply_migrations и только после проверенного backup. Канонический каталог
-#     migrations синхронизируется с --delete; несколько heads останавливают deploy.
+#     apply_migrations и только после проверенного backup. Каталог
+#     migrations/versions синхронизируется с --delete; несколько heads
+#     останавливают deploy.
 #
 # ПОРЯДОК (2026-10-07): СНАЧАЛА БАЗА, ПОТОМ КОД.
 #   Таймеры запускают CLI из /opt/pharmacy-monitor весь день (вотчер очереди —
@@ -35,15 +36,19 @@ name: Deploy to production
 #   запустить заново: ревизия базы читается из самой базы, а не через файлы
 #   миграций живого каталога. Вернуть прошлый коммит после миграции нельзя —
 #   в нём нет ревизии базы; чинить новым коммитом.
-#   ОТКАТ ВЫКЛАДКОЙ ПРОШЛОГО КОММИТА исполняет deploy.yml ТОГО коммита, а не
-#   этот. Коммит с этим порядком берёт env.py и src из своей копии — пары
-#   «env.py одного релиза, src другого» Alembic не видит. Коммит старше зовёт
-#   Alembic из живого каталога, где env.py остаётся от последней выкладки, а
-#   тот импортирует storage.create_engine_hiding_statement_data: с коммитом до
-#   PR #86 (3c09c5df, 2026-10-11) `alembic current` падает на импорте после
-#   копирования src и до рестарта, и выйти из этого можно только выкладкой
-#   коммита с этим порядком. Такой код возвращать revert-коммитом —
-#   docs/RUNBOOK.md, «Откат выкладкой прошлого коммита».
+#   В ЖИВОЙ КАТАЛОГ ИЗ migrations КЛАДЁТСЯ ТОЛЬКО versions/ — env.py и
+#   alembic.ini этот workflow там НЕ трогает (решение владельца 2026-10-12).
+#   env.py релиза берёт движок у storage.create_engine_hiding_statement_data и
+#   рядом с src, который фабрику не знает, не импортируется. А откат выкладкой
+#   прошлого коммита исполняет deploy.yml ТОГО коммита: коммит старше этого
+#   порядка кладёт свой src/ и зовёт Alembic из живого каталога — с новым
+#   env.py там выкладка коммита старше PR #86 падала бы на импорте после
+#   копирования кода. Поэтому в живом каталоге остаётся env.py от 2026-08-23:
+#   из src ему нужен один Base, он есть в любом релизе. Свои миграции workflow
+#   исполняет из .deploy-stage.*, на env.py и src одного коммита. Цена — у
+#   `alembic`, запущенного на сервере руками, нет ни предела ожидания
+#   блокировки, ни защиты текста ошибки: docs/RUNBOOK.md, «Ручной alembic на
+#   сервере».
 #   Миграция ждёт блокировку таблицы не дольше MIGRATION_LOCK_TIMEOUT_MS и
 #   повторяется MIGRATION_LOCK_ATTEMPTS раз: пока она ждёт, за ней стоят все
 #   запросы к этой таблице, в том числе чтения API. Предел — на ожидание, не на
@@ -169,8 +174,7 @@ jobs:
           ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             source_bad=$(find \
               /opt/pharmacy-monitor/src \
-              /opt/pharmacy-monitor/migrations \
-              /opt/pharmacy-monitor/alembic.ini \
+              /opt/pharmacy-monitor/migrations/versions \
               -xdev \
               \( -name __pycache__ -o -name "*.pyc" \) -prune -o \
               ! -writable -print -quit)
@@ -412,14 +416,14 @@ jobs:
           # Migrations first: the database may already be ahead of the files
           # in the live directory, and until they catch up `alembic` run by
           # hand from /opt/pharmacy-monitor cannot name the current revision.
-          # The whole directory, not only versions/: env.py carries the lock
-          # timeout, and that manual run must get the same protection the
-          # staged run above had.
+          # Only versions/. env.py and alembic.ini of the live directory are
+          # left as they are, on purpose: this release's env.py needs this
+          # release's src, and a rollback to an older commit — run by that
+          # commit's deploy.yml, which calls Alembic from the live directory —
+          # would put an older src next to it. See the header.
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
-            migrations/ pm@13.140.186.143:/opt/pharmacy-monitor/migrations/
-          rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
-            alembic.ini pm@13.140.186.143:/opt/pharmacy-monitor/alembic.ini
+            migrations/versions/ pm@13.140.186.143:/opt/pharmacy-monitor/migrations/versions/
           rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
             src/ pm@13.140.186.143:/opt/pharmacy-monitor/src/

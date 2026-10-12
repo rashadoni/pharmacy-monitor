@@ -9,6 +9,10 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import make_url
 
+# This file needs the src of its own commit: the engine factory below came with
+# PR #86. deploy.yml therefore runs it from the staged copy of the release and
+# never copies it into the live directory on the server, where a rollback could
+# leave an older src next to it (tests/test_deploy_workflow.py).
 from src.storage import Base, create_engine_hiding_statement_data  # noqa: E402
 
 # Load .env if present so local dev "just works"
