@@ -31,6 +31,7 @@ test_statement_data_stays_out_of_errors.py); уровень журнала `debu
 from __future__ import annotations
 
 import http.client
+import json
 import logging
 import logging.config
 import os
@@ -57,7 +58,11 @@ MODES = ("shipped", "unfiltered")
 
 FAULT_EMAIL = "fault@access-log-probe.example"
 # Этим пользователям выпускается по настоящей ссылке на вход.
-LINK_OWNERS = ("browser", "json", "fault", "head")
+LINK_OWNERS = ("browser", "json", "fault", "head", "page")
+# Чей токен приходит телом запроса — так шлёт его страница из письма
+# (`/auth/link`, src/login_link_pages.py). Тело uvicorn не пишет вовсе: этого
+# токена в журнале нет и без фильтров.
+SENT_IN_A_BODY = ("page",)
 
 BOGUS_TOKEN = "bogus-CANARY-token-e2f0a6b1"
 WEBSOCKET_TOKEN = "websocket-CANARY-token-7d1e03b9"
@@ -424,6 +429,7 @@ class Call:
     logged: str  # каким адрес обязан лечь в журнал
     method: str = "GET"  # "WebSocket" — запрос на WebSocket
     accept: str | None = None
+    body: str | None = None  # JSON, как его шлёт страница из письма
 
 
 def _calls(tokens: dict[str, str]) -> list[Call]:
@@ -439,7 +445,18 @@ def _calls(tokens: dict[str, str]) -> list[Call]:
         Call("link_500", f"/auth/verify?token={tokens['fault']}", 500, link),
         # До проверки токена запрос не дошёл — ссылка действует и после него.
         Call("link_head", f"/auth/verify?token={tokens['head']}", 405, link, method="HEAD"),
-        Call("link_post", f"/auth/verify?token={POSTED_TOKEN}", 405, link, method="POST"),
+        # POST вход принимает, но токен читает из тела, а не из адреса: отказ 422.
+        Call("link_post", f"/auth/verify?token={POSTED_TOKEN}", 422, link, method="POST"),
+        # Так входит письмо: страница без токена в адресе, токен — телом запроса.
+        Call("link_page", "/auth/link", 200, "/auth/link"),
+        Call(
+            "link_body",
+            "/auth/verify",
+            200,
+            "/auth/verify",
+            method="POST",
+            body=json.dumps({"token": tokens["page"]}),
+        ),
         Call("link_refused", f"/auth/verify?token={BOGUS_TOKEN}", 401, link),
         Call("token_second", f"/auth/verify?utm=mail&token={SECOND_PLACE_TOKEN}", 401, link),
         Call("no_query", "/auth/verify", 422, "/auth/verify"),
@@ -464,10 +481,18 @@ def _calls(tokens: dict[str, str]) -> list[Call]:
     ]
 
 
-def _canaries(tokens: dict[str, str]) -> dict[str, str]:
-    """Значения, которых в журнале быть не должно, — и их половины: обрезок тоже утечка."""
+def _canaries(tokens: dict[str, str], *, sent_in_a_body: bool = True) -> dict[str, str]:
+    """Значения, которых в журнале быть не должно, — и их половины: обрезок тоже утечка.
+
+    `sent_in_a_body=False` — без токенов, ушедших телом запроса: их контрольный
+    запуск в журнале не найдёт, фильтры тут ни при чём.
+    """
     whole = {
-        **{f"{owner}_link_token": token for owner, token in tokens.items()},
+        **{
+            f"{owner}_link_token": token
+            for owner, token in tokens.items()
+            if sent_in_a_body or owner not in SENT_IN_A_BODY
+        },
         "posted_token": POSTED_TOKEN,
         "bogus_token": BOGUS_TOKEN,
         "second_place_token": SECOND_PLACE_TOKEN,
@@ -497,7 +522,10 @@ def _send(port: int, call: Call) -> int:
         return _raw_status(port, handshake.encode("ascii"))
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
     try:
-        connection.request(call.method, call.target, headers={"Accept": call.accept or "*/*"})
+        headers = {"Accept": call.accept or "*/*"}
+        if call.body is not None:
+            headers["Content-Type"] = "application/json"
+        connection.request(call.method, call.target, body=call.body, headers=headers)
         response = connection.getresponse()
         response.read()
         return response.status
@@ -655,10 +683,21 @@ def test_without_the_filters_every_value_is_in_the_journal(probe):
     run = probe["unfiltered"]
 
     assert _logged_requests(run["output"]) == _expected(run["calls"], with_query=True)
-    missing = [
-        name for name, value in _canaries(run["tokens"]).items() if value not in run["output"]
-    ]
+    sent_in_an_address = _canaries(run["tokens"], sent_in_a_body=False)
+    missing = [name for name, value in sent_in_an_address.items() if value not in run["output"]]
     assert not missing, f"проба не видит в журнале без фильтров: {missing}"
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_token_sent_in_a_body_is_not_in_the_journal_with_or_without_the_filters(probe, mode):
+    """Вход из письма шлёт токен телом запроса — на фильтр журнала он не опирается."""
+    run = probe[mode]
+
+    assert run["statuses"]["link_body"] == 200
+    for owner in SENT_IN_A_BODY:
+        token = run["tokens"][owner]
+        assert token[: len(token) // 2] not in run["output"], owner
+        assert token[len(token) // 2 :] not in run["output"], owner
 
 
 def test_every_request_is_logged_and_none_with_its_query(probe):

@@ -4,7 +4,8 @@
 заголовки, тело — и токен ищется во всём этом как есть: он состоит из знаков,
 которые не меняет ни одно кодирование адреса, поэтому находится и внутри
 закодированного заголовка. Рядом собираются строки журнала доступа uvicorn —
-того самого, что на сервере идёт в журнал API.
+какими он писал бы их без фильтра `src.access_log`, то есть с адресом целиком:
+так пишет адрес прокси перед API.
 
 Зачем браузер. Первая версия этой правки вела ссылку на страницу Next.js и
 считала, что часть адреса после «#» серверу не уходит. Next.js сам кладёт её в
@@ -39,6 +40,7 @@ from sqlalchemy.orm import sessionmaker
 
 from src import api as api_module
 from src import notifier, rate_limit, storage
+from src.access_log import ACCESS_LOGGER, QueryHidden
 from src.login_link_pages import LINK_TOKEN_STORAGE_KEY
 from tests.test_magic_link_token import ADDRESS, PASSWORD, _add_user, _row
 
@@ -139,11 +141,18 @@ def site(monkeypatch, db_session) -> Iterator[Site]:
     address = f"http://127.0.0.1:{listener.getsockname()[1]}"
     monkeypatch.setenv("PHARMACY_PUBLIC_URL", address)
 
-    # Журнал доступа — как на сервере, только строки собираются в список.
+    # Журнал доступа собирается в список — и без фильтра `src.access_log`,
+    # который прячет строку запроса: прокси перед API такого фильтра не имеет и
+    # адрес пишет целиком. Здесь проверяется, что токена в адресе нет вовсе, а
+    # не что его спрятали; сам фильтр проверяет test_access_log_carries_no_query.py.
     access_log: list[str] = []
     collect = logging.Handler()
     collect.emit = lambda record: access_log.append(record.getMessage())
-    access = logging.getLogger("uvicorn.access")
+    access = logging.getLogger(ACCESS_LOGGER)
+    hiding = [f for f in access.filters if isinstance(f, QueryHidden)]
+    # Снимать нечего — значит, журнал прячет запрос уже иначе, и тест устарел.
+    assert len(hiding) == 1, f"ожидался один фильтр src.access_log, найдено {hiding}"
+    access.removeFilter(hiding[0])
     saved = (access.level, access.propagate)
     access.addHandler(collect)
     access.setLevel(logging.INFO)
@@ -167,6 +176,7 @@ def site(monkeypatch, db_session) -> Iterator[Site]:
         listener.close()
         access.removeHandler(collect)
         access.level, access.propagate = saved
+        access.addFilter(hiding[0])
 
 
 @pytest.fixture
