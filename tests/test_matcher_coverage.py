@@ -646,3 +646,218 @@ def test_relink_waits_until_most_of_the_site_catalog_was_seen_recently(db_sessio
 
     assert matcher.relink_stale_members(db_session) == []
     assert (old.canonical_id, twin.canonical_id) == (match.id, None)
+
+
+# ── Двойник уже с парой: один товар лежит двумя кластерами ───────────────────
+#
+# Жалоба клиента 2026-10-09: «Kreon 25000» показывал цены aloe и aptekonline без
+# цены pharmonline. У aloe в июле сменился адрес товара; товар клиента остался в
+# паре со старой строкой aloe, а новая сошлась с aptekonline отдельным
+# кластером. Замер на проде 2026-10-12: 79 пропавших членов кластеров, у которых
+# живой двойник состоит в другом кластере.
+
+
+def _split_product(session, *, lost_site="aloe", lost_kw=None, live_kw=None, client_kw=None):
+    """Один товар двумя кластерами: в `left` пропавшая строка, в `right` живой двойник."""
+    left = storage.Match(tenant_id=1, canonical_name="Kreon 25000", confidence=1.0)
+    right = storage.Match(tenant_id=1, canonical_name="Kreon 25000", confidence=1.0)
+    session.add_all([left, right])
+    session.flush()
+    lost = _product(
+        session,
+        lost_site,
+        "Kreon 25000, 20 əd",
+        external_id="old-slug",
+        brand="Abbot",
+        canonical_id=left.id,
+        last_seen_at=utcnow() - timedelta(days=100),
+        **(lost_kw or {}),
+    )
+    client = _product(
+        session,
+        "pharmonline",
+        "Kreon 25000 №20 (Kapsula)",
+        canonical_id=left.id,
+        **(client_kw or {}),
+    )
+    live = _product(
+        session,
+        lost_site,
+        "Kreon 25000, 20 əd",
+        external_id="new-number",
+        brand="Abbot",
+        canonical_id=right.id,
+        **(live_kw or {}),
+    )
+    third = _product(session, "aptekonline", "Kreon  25000  N20", canonical_id=right.id)
+    session.commit()
+    return SimpleNamespace(left=left, right=right, lost=lost, client=client, live=live, third=third)
+
+
+def _clusters(session) -> dict[int, list[tuple[str, str]]]:
+    session.expire_all()
+    return {
+        match.id: sorted((product.site, product.external_id) for product in match.products)
+        for match in session.query(storage.Match).all()
+    }
+
+
+def test_relink_merges_the_cluster_of_a_lost_row_with_the_cluster_of_its_live_twin(db_session):
+    case = _split_product(db_session)
+    before = _clusters(db_session)
+
+    assert matcher.relink_stale_members(db_session, dry_run=True)
+    # dry_run не меняет ни базу, ни объекты сессии: изменённый объект ушёл бы в
+    # базу с ближайшим commit вызывающего.
+    assert not db_session.dirty and not db_session.deleted
+    assert _clusters(db_session) == before
+
+    merged = matcher.relink_stale_members(db_session)
+
+    # Остаётся кластер, где живых членов больше: меняется меньше назначений.
+    assert merged == [
+        {
+            "match_id": case.right.id,
+            "site": "aloe",
+            "old": case.lost.id,
+            "new": case.live.id,
+            "merged": case.left.id,
+            "moved": [case.client.id],
+            "dropped": [],
+        }
+    ]
+    assert _same_cluster(case.client, case.live, case.third)
+    assert case.lost.canonical_id is None
+    assert list(_clusters(db_session)) == [case.right.id]  # пустая запись кластера удалена
+    assert matcher.relink_stale_members(db_session) == []  # второй прогон ничего не находит
+
+
+def test_merge_keeps_the_older_cluster_when_both_are_the_same_size(db_session):
+    case = _split_product(db_session)
+    extra = _product(db_session, "extra-site", "Kreon 25000 N20", canonical_id=case.left.id)
+    db_session.commit()
+
+    merged = matcher.relink_stale_members(db_session)
+
+    assert (merged[0]["match_id"], merged[0]["merged"]) == (case.left.id, case.right.id)
+    assert merged[0]["moved"] == [case.live.id, case.third.id]
+    assert _same_cluster(case.client, case.live, case.third, extra)
+
+
+def test_merge_refuses_two_live_rows_of_one_site(db_session):
+    """Два живых товара одного сайта — два предложения, а не один товар."""
+    case = _split_product(db_session)
+    rival = _product(
+        db_session,
+        "aptekonline",
+        "Kreon  25000  N20",
+        external_id="another-listing",
+        canonical_id=case.left.id,
+    )
+    db_session.commit()
+    before = _clusters(db_session)
+
+    assert matcher.relink_stale_members(db_session) == []
+    assert _clusters(db_session) == before
+    assert rival.canonical_id == case.left.id
+
+
+def test_merge_drops_the_lost_twin_each_cluster_holds_for_the_other(db_session):
+    """Кластеры держат пропавшие строки друг друга: остаются только живые."""
+    case = _split_product(db_session)
+    lost_client = _product(
+        db_session,
+        "pharmonline",
+        "Kreon 25000 №20 (Kapsula)",
+        external_id="client-old-slug",
+        canonical_id=case.right.id,
+        last_seen_at=utcnow() - timedelta(days=100),
+    )
+    db_session.commit()
+
+    merged = matcher.relink_stale_members(db_session)
+
+    assert len(merged) == 1 and merged[0]["dropped"] == [lost_client.id]
+    assert _same_cluster(case.client, case.live, case.third)
+    assert (case.lost.canonical_id, lost_client.canonical_id) == (None, None)
+    assert sorted(product.site for product in case.live.canonical.products) == [
+        "aloe",
+        "aptekonline",
+        "pharmonline",
+    ]
+
+
+@pytest.mark.parametrize(
+    "obstacle", ["rejection", "country", "manual_left", "manual_right", "sold_out"]
+)
+def test_merge_leaves_both_clusters_alone_when_members_must_not_meet(db_session, obstacle):
+    from src import match_actions
+
+    client_kw = {}
+    if obstacle == "country":
+        # Страна — часть идентичности: товар клиента из Турции, у конкурента Германия.
+        client_kw = {"manufacturer_country_code": "tr", "country_resolution_status": "resolved"}
+    case = _split_product(db_session, client_kw=client_kw)
+    if obstacle == "country":
+        case.third.manufacturer_country_code = "de"
+        case.third.country_resolution_status = "resolved"
+    elif obstacle == "rejection":
+        match_actions.add_rejection(db_session, case.client.id, case.third.id, reason="operator")
+    elif obstacle == "manual_left":
+        case.left.is_manual = True
+    elif obstacle == "manual_right":
+        case.right.is_manual = True
+    elif obstacle == "sold_out":
+        case.third.offer_availability_status = "out_of_stock"
+    db_session.commit()
+    before = _clusters(db_session)
+
+    assert matcher.relink_stale_members(db_session) == []
+    assert _clusters(db_session) == before
+
+
+def test_merge_needs_the_twin_to_be_the_same_product_as_the_lost_row(db_session):
+    """Страна пропавшей строки известна, у «двойника» другая — это другой товар."""
+    case = _split_product(
+        db_session,
+        lost_kw={"manufacturer_country_code": "de", "country_resolution_status": "resolved"},
+        live_kw={"manufacturer_country_code": "tr", "country_resolution_status": "resolved"},
+    )
+    before = _clusters(db_session)
+
+    assert matcher.relink_stale_members(db_session) == []
+    assert _clusters(db_session) == before
+    assert case.lost.canonical_id == case.left.id
+
+
+def test_merge_then_match_in_one_unflushed_session_keeps_one_row_per_site(db_session):
+    """Как в пайплайне: подготовка, сопоставление и перепроверка без commit между ними."""
+    case = _split_product(db_session)
+
+    matcher.refresh_derived_fields(db_session)
+    matcher.relink_stale_members(db_session)
+    matcher.match_products(db_session)
+    matcher.revalidate_split(db_session)
+
+    assert _same_cluster(case.client, case.live, case.third)
+    assert case.lost.canonical_id is None
+    sites = [product.site for product in db_session.get(storage.Match, case.right.id).products]
+    assert sorted(sites) == ["aloe", "aptekonline", "pharmonline"]
+
+
+def test_merge_carries_costs_bound_to_the_dropped_cluster(db_session):
+    """Закупочная цена привязана к кластеру: удаление его записи унесло бы её каскадом."""
+    case = _split_product(db_session)
+    db_session.add_all(
+        [
+            storage.SupplierPrice(canonical_id=case.left.id, supplier_name="s", purchase_price=9.5),
+            storage.StockLevel(canonical_id=case.left.id, qty=3, is_in_stock=True),
+        ]
+    )
+    db_session.commit()
+
+    matcher.relink_stale_members(db_session)
+    db_session.commit()
+
+    assert db_session.query(storage.SupplierPrice).one().canonical_id == case.right.id
+    assert db_session.query(storage.StockLevel).one().canonical_id == case.right.id
