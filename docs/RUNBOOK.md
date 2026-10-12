@@ -1208,7 +1208,43 @@ with storage.make_session()() as s:
 
 **После выкладки правки** этап запускают руками — команда `rematch` в разделе
 «Выкладка правок сопоставления»; плановый юнит на сервере на 2026-10-12 прежний
-и не отрабатывает.
+и не отрабатывает. Вывод команды сохранять в файл (добавить в конец
+`2>&1 | tee /root/pm-rematch-$(date +%F-%H%M).log`): при ручном запуске строка
+`matcher_split_clusters_merged` идёт в терминал, а не в журнал сервера, и
+другого следа у слияния нет.
+
+**Откат слияний.** Слияние удаляет запись одной из двух пар, поэтому снимка из
+шага «Перед выкладкой» мало: он хранит назначения товаров, а возврат товара в
+удалённую пару упирается во внешний ключ (`products_canonical_id_fkey` —
+проверено на копии базы 2026-10-12). Перед запуском этапа снять ещё и сами
+пары, и сделать бэкап (`systemctl start pharmacy-monitor-backup.service`):
+
+```bash
+sudo -u postgres psql -X pharmacy_monitor -c "\copy (select * from matches) to '/tmp/pm-matches-before.csv' csv"
+```
+
+Тогда шаг 2 отката из «Выкладки правок сопоставления» выполняется так (`:m` —
+сохранённый `max(id)` из `matches`; отличие от него — две строки про
+`matches_before`):
+
+```sql
+create temp table before (id int primary key, canonical_id int, name_normalized text, dosage text, pack_size text);
+\copy before from '/tmp/pm-matching-before.csv' csv
+create temp table matches_before (like matches);
+\copy matches_before from '/tmp/pm-matches-before.csv' csv
+begin;
+insert into matches select * from matches_before b where not exists (select 1 from matches m where m.id = b.id);
+update products p set canonical_id = b.canonical_id, name_normalized = b.name_normalized,
+       dosage = b.dosage, pack_size = b.pack_size
+  from before b where p.id = b.id;
+update products set canonical_id = null where canonical_id > :m;
+delete from matches where id > :m;
+commit;
+```
+
+На копии базы после этапа с 16 слияниями это вернуло назначения всех товаров
+и число пар к исходным. Поля самих пар (название, флаги), которые этап успел
+поменять у уцелевших записей, откат не возвращает — как и прежний.
 
 ### Замок сопоставления потерян посреди этапа
 
