@@ -179,7 +179,7 @@ def test_the_proxy_gives_link_pages_and_their_posts_to_the_api():
 
 
 def test_the_pages_lead_only_to_routes_the_frontend_redirects_to_a_locale():
-    """`/overview`, `/login`, `/set-password` без языка: их уводит `next.config.mjs`."""
+    """`/overview` и `/set-password` без языка: их уводит `next.config.mjs`."""
     config = (ROOT / "frontend" / "next.config.mjs").read_text(encoding="utf-8")
     (legacy,) = re.findall(r"const LEGACY_ROUTES = \[(.*?)\];", config, re.DOTALL)
     redirected = set(re.findall(r'"([^"]+)"', legacy))
@@ -190,8 +190,20 @@ def test_the_pages_lead_only_to_routes_the_frontend_redirects_to_a_locale():
         )
     )
 
-    assert targets == {"overview", "login", "set-password"}
+    assert targets == {"overview", "set-password"}
     assert targets <= redirected
+
+
+def test_the_sign_in_page_posts_the_token_only_when_its_button_is_pressed():
+    """Растяжка по тексту страницы; что браузер делает на самом деле — в браузерном тесте."""
+    page = login_link_pages.SIGN_IN_PAGE
+
+    (posting,) = re.findall(r"function (\w+)\(\) \{[^}]*?fetch\(", page)
+    # Отправка названа в одном месте — в кнопке; сама страница её не зовёт.
+    assert re.findall(rf"\b{posting}\b(?!\(\) \{{)", page) == [posting]
+    assert f'offer("Daxil ol", "Войти", {posting}, true);' in page
+    # Странице создания пароля слать нечего: она только передаёт токен форме.
+    assert "fetch(" not in login_link_pages.SET_PASSWORD_PAGE
 
 
 # ─── Вход: токен приходит телом запроса ──────────────────────────────────────

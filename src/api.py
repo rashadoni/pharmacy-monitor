@@ -1117,7 +1117,7 @@ def auth_verify(token: str, request: Request, response: Response, db: Session = 
     # Второго счётчика — по отказам, как `setpw_fail` и `login_fail`, — здесь нет
     # намеренно. Он срабатывает уже после запроса к базе и ничего не ограничивает,
     # а ответ меняет: по ссылке, которая просто не годится, страница входа
-    # просила бы подождать минуту вместо того, чтобы увести на страницу входа.
+    # просила бы подождать минуту вместо того, чтобы назвать ссылку негодной.
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(f"verify:{client_ip}", limit=10)
     user = tenants.redeem_magic_token(db, token)

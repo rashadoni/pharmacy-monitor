@@ -256,6 +256,20 @@ async def _session_cookie(context: BrowserContext) -> dict | None:
 
 # ─── Вход ────────────────────────────────────────────────────────────────────
 
+SIGN_IN_BUTTON = "button:has-text('Войти')"
+# Что браузер запрашивает, открыв страницу и ничего не нажав.
+JUST_THE_PAGE = {("GET", "/auth/link"), ("GET", "/favicon.ico")}
+
+
+def _requests(site: Site) -> set[tuple[str, str]]:
+    return {(request.method, request.path) for request in site.server_side.received}
+
+
+async def _wait_for_text(tab: Page, text: str) -> None:
+    await tab.wait_for_function(
+        "text => document.getElementById('state').textContent.includes(text)", arg=text
+    )
+
 
 async def test_a_login_link_signs_in_and_the_token_reaches_the_server_only_in_a_body(
     site, tab, letters, db_session
@@ -265,6 +279,7 @@ async def test_a_login_link_signs_in_and_the_token_reaches_the_server_only_in_a_
     )
 
     await tab.goto(link)
+    await tab.click(SIGN_IN_BUTTON)
     await tab.wait_for_url(site.address + "/az/overview")
 
     cookie = await _session_cookie(tab.context)
@@ -277,37 +292,151 @@ async def test_a_login_link_signs_in_and_the_token_reaches_the_server_only_in_a_
     assert not [line for line in site.access_log if token in line]
 
 
-async def test_a_login_link_opens_once(site, tab, letters, db_session):
+async def test_an_opened_link_sends_nothing_until_the_button_is_pressed(
+    site, tab, letters, db_session
+):
+    """Проверка ссылок в почте открывает страницу и исполняет её — ссылку это не гасит."""
+    link, token = _link_for(
+        db_session, letters, site, password_hash=api_module._hash_bcrypt(PASSWORD)
+    )
+
+    await tab.goto(link)
+    await _wait_for_text(tab, "Нажмите кнопку")
+    await tab.wait_for_load_state("networkidle")
+
+    assert _requests(site) <= JUST_THE_PAGE
+    assert site.server_side.places_holding(token) == []
+    assert await _session_cookie(tab.context) is None
+    # Получатель после этого входит той же ссылкой.
+    await tab.click(SIGN_IN_BUTTON)
+    await tab.wait_for_url(site.address + "/az/overview")
+    assert await _session_cookie(tab.context)
+
+
+async def test_the_button_can_be_pressed_from_the_keyboard(site, tab, letters, db_session):
+    link, _token = _link_for(
+        db_session, letters, site, password_hash=api_module._hash_bcrypt(PASSWORD)
+    )
+
+    await tab.goto(link)
+    await _wait_for_text(tab, "Нажмите кнопку")
+    await tab.keyboard.press("Enter")
+
+    await tab.wait_for_url(site.address + "/az/overview")
+
+
+async def test_a_login_link_opens_once_and_the_second_time_says_why(site, tab, letters, db_session):
     link, token = _link_for(
         db_session, letters, site, password_hash=api_module._hash_bcrypt(PASSWORD)
     )
     await tab.goto(link)
+    await tab.click(SIGN_IN_BUTTON)
     await tab.wait_for_url(site.address + "/az/overview")
-    await tab.context.clear_cookies()
 
+    # Вторая вкладка с той же ссылкой — письмо открыли дважды.
     again = await tab.context.new_page()
     await again.goto(link)
-    await again.wait_for_url(site.address + "/az/login?error=link")
+    await again.click(SIGN_IN_BUTTON)
+    await _wait_for_text(again, "Ссылка недействительна или уже использована")
 
-    assert await _session_cookie(tab.context) is None
+    assert "Keçid etibarsızdır" in await again.inner_text("#state")
     assert set(site.server_side.places_holding(token)) == {"POST /auth/verify: body"}
+    # Вход из первой вкладки цел: «Продолжить» ведёт в дашборд.
+    await again.click("button:has-text('Продолжить')")
+    await again.wait_for_url(site.address + "/az/overview")
+    assert await _session_cookie(tab.context)
 
 
-@pytest.mark.parametrize(
-    "after_hash", ["", "token=", "other=1", "token=" + "x" * 600, "token=wrong"]
-)
-async def test_a_link_that_cannot_sign_in_leads_to_the_login_page(site, tab, after_hash):
+@pytest.mark.parametrize("after_hash", ["", "token=", "other=1"])
+async def test_a_link_without_a_token_says_so_and_sends_nothing(site, tab, after_hash):
     await tab.goto(f"{site.address}/auth/link#{after_hash}")
-    await tab.wait_for_url(site.address + "/az/login?error=link")
+    await _wait_for_text(tab, "Ссылка неполная")
 
+    assert await tab.locator(SIGN_IN_BUTTON).count() == 0
+    assert _requests(site) <= JUST_THE_PAGE
     assert await _session_cookie(tab.context) is None
+
+
+@pytest.mark.parametrize("after_hash", ["token=" + "x" * 600, "token=wrong"])
+async def test_a_link_that_cannot_sign_in_says_so_and_stays(site, tab, after_hash):
+    """Отказ виден на самой странице — раньше он молча приводил на страницу входа."""
+    link = f"{site.address}/auth/link#{after_hash}"
+    await tab.goto(link)
+    await tab.click(SIGN_IN_BUTTON)
+    await _wait_for_text(tab, "Ссылка недействительна или уже использована")
+
+    assert tab.url == link
+    # Кнопки входа больше нет: вместо неё, чуть погодя, «Продолжить».
+    await tab.wait_for_selector("button:has-text('Продолжить')")
+    assert await tab.locator(SIGN_IN_BUTTON).count() == 0
+    assert await _session_cookie(tab.context) is None
+
+
+async def test_a_second_press_does_not_skip_the_refusal(site, tab):
+    """Двойное нажатие «Войти»: второе не попадает на «Продолжить» и отказ не прячет."""
+    link = f"{site.address}/auth/link#token=wrong"
+    await tab.goto(link)
+    box = await tab.locator(SIGN_IN_BUTTON).bounding_box()
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+    await tab.mouse.click(x, y)
+    await _wait_for_text(tab, "Ссылка недействительна или уже использована")
+    # Ответ уже пришёл — нажимаем туда же ещё раз и ещё раз с клавиатуры.
+    await tab.mouse.click(x, y)
+    await tab.keyboard.press("Enter")
+    await tab.wait_for_selector("button:has-text('Продолжить')")
+
+    assert tab.url == link
+    assert "уже использована" in await tab.inner_text("#state")
+
+
+async def test_a_server_that_never_answers_does_not_hold_the_page_forever(
+    site, tab, letters, db_session
+):
+    link, token = _link_for(
+        db_session, letters, site, password_hash=api_module._hash_bcrypt(PASSWORD)
+    )
+    await tab.clock.install()
+    await tab.route("**/auth/verify", lambda route: None)  # запрос уходит и остаётся без ответа
+    await tab.goto(link)
+    await tab.click(SIGN_IN_BUTTON)
+    await _wait_for_text(tab, "Проверяем ссылку")
+
+    await tab.clock.fast_forward(29_000)
+    assert "Проверяем ссылку" in await tab.inner_text("#state")
+    await tab.clock.fast_forward(2_000)
+    await _wait_for_text(tab, "Попробуйте ещё раз")
+
+    assert tab.url == link
+    assert await tab.locator(SIGN_IN_BUTTON).is_enabled()
+    assert site.server_side.places_holding(token) == []
+
+
+async def test_without_javascript_the_page_says_only_that_it_needs_it(
+    site, browser, letters, db_session
+):
+    link, token = _link_for(
+        db_session, letters, site, password_hash=api_module._hash_bcrypt(PASSWORD)
+    )
+    context = await browser.new_context(java_script_enabled=False)
+    try:
+        page = await context.new_page()
+        await page.goto(link)
+        shown = await page.inner_text("body")
+    finally:
+        await context.close()
+
+    assert "Этой странице нужен JavaScript" in shown
+    assert "Проверяем" not in shown and "Войти" not in shown
+    assert site.server_side.places_holding(token) == []
 
 
 @pytest.mark.parametrize("failure", [500, 502, "no answer"])
-async def test_a_failed_check_keeps_the_link_alive_and_a_reload_retries(
-    site, tab, letters, db_session, failure
+@pytest.mark.parametrize("retry", ["button", "keyboard", "reload"])
+async def test_a_failed_check_keeps_the_link_alive_and_can_be_retried(
+    site, tab, letters, db_session, failure, retry
 ):
-    """Сбой — не отказ: токен не погашен, адрес прежний, обновление страницы входит."""
+    """Сбой — не отказ: токен не погашен, адрес прежний, кнопка на месте."""
     link, token = _link_for(
         db_session, letters, site, password_hash=api_module._hash_bcrypt(PASSWORD)
     )
@@ -320,23 +449,29 @@ async def test_a_failed_check_keeps_the_link_alive_and_a_reload_retries(
 
     await tab.route("**/auth/verify", fail)
     await tab.goto(link)
-    await tab.wait_for_function(
-        "document.getElementById('state').textContent.includes('Обновите страницу')"
-    )
+    await tab.click(SIGN_IN_BUTTON)
+    await _wait_for_text(tab, "Попробуйте ещё раз")
 
     assert tab.url == link
-    assert "Səhifəni yeniləyin" in await tab.inner_text("#state")
+    assert "Yenidən cəhd edin" in await tab.inner_text("#state")
     assert await _session_cookie(tab.context) is None
     assert site.server_side.places_holding(token) == []
 
     await tab.unroute("**/auth/verify")
-    await tab.reload()
+    if retry == "keyboard":
+        # После сбоя кнопка снова в фокусе: Enter повторяет попытку.
+        await tab.keyboard.press("Enter")
+    else:
+        if retry == "reload":
+            await tab.reload()
+        await tab.click(SIGN_IN_BUTTON)
     await tab.wait_for_url(site.address + "/az/overview")
     assert await _session_cookie(tab.context)
 
 
+@pytest.mark.parametrize("retry", ["button", "keyboard", "reload"])
 async def test_too_many_attempts_keep_the_link_alive_and_the_page_says_to_wait(
-    site, tab, letters, db_session
+    site, tab, letters, db_session, retry
 ):
     """Отказ 429 даёт сам сервер — счётчик попыток с адреса, а не подставной ответ."""
     link, token = _link_for(
@@ -353,28 +488,32 @@ async def test_too_many_attempts_keep_the_link_alive_and_the_page_says_to_wait(
     site.server_side.received.clear()
 
     await tab.goto(link)
-    await tab.wait_for_function(
-        "document.getElementById('state').textContent.includes('Подождите минуту')"
-    )
+    await tab.click(SIGN_IN_BUTTON)
+    await _wait_for_text(tab, "Подождите минуту")
 
     assert tab.url == link
     assert "Bir dəqiqə gözləyin" in await tab.inner_text("#state")
     assert await _session_cookie(tab.context) is None
     # Запрос ушёл и получил отказ; токен был только в его теле и не погашен.
     assert site.server_side.places_holding(token) == ["POST /auth/verify: body"]
-    assert [line for line in site.access_log if '"POST /auth/verify HTTP/1.1" 429' in line]
     assert _row(db_session, user)["magic_token"] == stored
 
-    # Обновление сразу — тот же отказ, адрес прежний.
-    await tab.reload()
-    await tab.wait_for_function(
-        "document.getElementById('state').textContent.includes('Подождите минуту')"
-    )
+    # Нажатие сразу — тот же отказ: кнопка на месте, адрес прежний.
+    await tab.click(SIGN_IN_BUTTON)
+    await _wait_for_text(tab, "Подождите минуту")
     assert tab.url == link
+    throttled = [line for line in site.access_log if '"POST /auth/verify HTTP/1.1" 429' in line]
+    assert len(throttled) == 2
 
     # Минута прошла.
     rate_limit._reset_memory_for_tests()
-    await tab.reload()
+    if retry == "keyboard":
+        # После отказа счётчика кнопка снова в фокусе: Enter повторяет попытку.
+        await tab.keyboard.press("Enter")
+    else:
+        if retry == "reload":
+            await tab.reload()
+        await tab.click(SIGN_IN_BUTTON)
     await tab.wait_for_url(site.address + "/az/overview")
     assert await _session_cookie(tab.context)
 

@@ -221,8 +221,8 @@ def test_a_refused_attempt_does_not_push_the_minute_further(client, db_session, 
 
 def test_a_dead_link_is_called_dead_until_the_attempts_run_out(client, db_session):
     """Отказ по токену остаётся отказом по токену — 401, сколько бы их ни было
-    подряд: страница входа по нему уводит на страницу входа. 429 значит только
-    «сервер ссылку не проверял»."""
+    подряд: по нему страница входа пишет, что ссылка не годится. 429 значит
+    только «сервер ссылку не проверял»."""
     token = _link(db_session)
 
     refusals = [_post(client, f"wrong-{n}").status_code for n in range(ATTEMPTS_A_MINUTE - 1)]
