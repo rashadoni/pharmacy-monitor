@@ -226,7 +226,7 @@ app/
     ├── layout.tsx       ← validate locale + setRequestLocale + NextIntlClientProvider
     ├── page.tsx         ← /<locale> → /<locale>/overview
     ├── login/
-    ├── auth/verify/
+    ├── set-password/
     └── (dashboard)/     ← route group, shared dashboard layout
         ├── layout.tsx
         ├── overview/

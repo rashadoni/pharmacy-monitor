@@ -1,12 +1,12 @@
 # Caddy reverse proxy for pharmacy-monitor.
 #
 # Auto-SSL via Let's Encrypt. DNS A record for leaddrive.cloud + www
-# points to the Hetzner host.
+# points to the production host.
 #
-# Install on Hetzner:
-#   apt install caddy
-#   cp infra/Caddyfile /etc/caddy/Caddyfile
-#   systemctl reload caddy
+# This is a sample, not the live file. /etc/caddy/Caddyfile is installed by
+# root by hand and differs (2026-10-10: it also pins `servers { protocols h1 h2 }`),
+# so do not copy this over it — diff first. `admin off` below means
+# `systemctl reload caddy` fails: apply with `systemctl restart caddy`.
 
 {
     # Global options
