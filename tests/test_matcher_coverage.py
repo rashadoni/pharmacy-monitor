@@ -694,6 +694,32 @@ def _split_product(session, *, lost_site="aloe", lost_kw=None, live_kw=None, cli
     return SimpleNamespace(left=left, right=right, lost=lost, client=client, live=live, third=third)
 
 
+class _MatcherLog:
+    """События журнала матчера вместе с полями.
+
+    `structlog.testing.capture_logs` здесь не годится: тест, вошедший в CLI
+    раньше, оставляет журнал на уровне INFO до конца прогона, и событие уровня
+    debug до перехватчика не доходит (в одиночку файл проходил, в общем прогоне
+    падал).
+    """
+
+    def __init__(self):
+        self.events: list[dict] = []
+
+    def __getattr__(self, level):
+        def record(event, **fields):
+            self.events.append({"event": event, **fields})
+
+        return record
+
+    def refusals(self) -> list[tuple[str, int]]:
+        return [
+            (entry["reason"], entry["stale_id"])
+            for entry in self.events
+            if entry["event"] == "matcher_split_merge_refused"
+        ]
+
+
 def _clusters(session) -> dict[int, list[tuple[str, str]]]:
     session.expire_all()
     return {
@@ -1165,7 +1191,7 @@ def test_merges_chain_through_a_row_moved_earlier_in_the_same_call(db_session):
     assert list(_clusters(db_session)) == [case.left.id]
 
 
-def test_merge_refuses_when_both_rows_of_a_site_are_lost(db_session):
+def test_merge_refuses_when_both_rows_of_a_site_are_lost(db_session, monkeypatch):
     """Обе строки сайта давно не видели — выбрать, какая останется, нечем."""
     case = _split_product(db_session)
     for cluster, external_id in ((case.left, "fourth-a"), (case.right, "fourth-b")):
@@ -1182,9 +1208,12 @@ def test_merge_refuses_when_both_rows_of_a_site_are_lost(db_session):
         _product(db_session, "fourth-site", f"Fresh product {i} № 10", external_id=f"fresh-{i}")
     db_session.commit()
     before = _clusters(db_session)
+    journal = _MatcherLog()
+    monkeypatch.setattr(matcher, "log", journal)
 
     assert matcher.relink_stale_members(db_session) == []
     assert _clusters(db_session) == before
+    assert ("two_lost_rows_of_one_site", case.lost.id) in journal.refusals()
 
 
 def test_a_lost_row_that_has_a_pair_still_brings_a_newcomer_into_its_cluster(db_session):
@@ -1268,10 +1297,8 @@ def test_second_merge_sees_the_rows_the_first_one_brought_in(db_session):
         ("rival_without_pair", "live_row_without_pair_too"),
     ],
 )
-def test_a_refused_merge_names_its_reason(db_session, obstacle, reason):
+def test_a_refused_merge_names_its_reason(db_session, monkeypatch, obstacle, reason):
     """Причина отказа — словарь RUNBOOK: по ней оператор понимает, что с товаром."""
-    from structlog.testing import capture_logs
-
     from src import match_actions
 
     lost_kw = live_kw = None
@@ -1298,8 +1325,8 @@ def test_a_refused_merge_names_its_reason(db_session, obstacle, reason):
         match_actions.add_rejection(db_session, case.client.id, rival.id, reason="operator")
     db_session.commit()
 
-    with capture_logs() as events:
-        assert matcher.relink_stale_members(db_session, dry_run=True) == []
+    journal = _MatcherLog()
+    monkeypatch.setattr(matcher, "log", journal)
 
-    refusals = [e for e in events if e["event"] == "matcher_split_merge_refused"]
-    assert [(e["reason"], e["stale_id"]) for e in refusals] == [(reason, case.lost.id)]
+    assert matcher.relink_stale_members(db_session, dry_run=True) == []
+    assert journal.refusals() == [(reason, case.lost.id)]
