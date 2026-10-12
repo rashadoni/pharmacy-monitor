@@ -11,6 +11,7 @@ Run before go-live. Tick each box, paste output for evidence.
 - [ ] Emailed magic links keep the token out of every request address and header: the link carries it after `#`, a page served by the API (not by Next.js, which copies its own address into a request header) posts it in a request body. `tests/test_login_link_in_a_browser.py` opens the links in a real browser and inspects everything the server received. `GET /auth/verify?token=…` is still accepted for tests and scripts; no letter uses it
 - [ ] JWT cookie is `httpOnly` + `secure` (in production) + `sameSite=lax`
 - [ ] Failed auth attempts are rate-limited per IP (10/min in `require_api_key`)
+- [ ] Magic-link sign-in is rate-limited per client address: 10 attempts/min before the token is checked (`verify:<address>`, shared by `GET` and `POST /auth/verify`) and 5 refusals/min (`verify_fail:<address>`), same as `/auth/set-password`. A 429 never reaches the database and leaves the link usable. The address comes from `X-Forwarded-For` only because the unit starts uvicorn with `--proxy-headers --forwarded-allow-ips '127.0.0.1'`; without them every client shares one counter. `tests/test_login_link_rate_limit.py` runs uvicorn with the unit's flags to show it
 - [ ] User auth attempts are rate-limited per chat_id (5/min in `auth/request`)
 
 ```bash

@@ -303,7 +303,7 @@ async def test_a_link_that_cannot_sign_in_leads_to_the_login_page(site, tab, aft
     assert await _session_cookie(tab.context) is None
 
 
-@pytest.mark.parametrize("failure", [500, 502, 429, "no answer"])
+@pytest.mark.parametrize("failure", [500, 502, "no answer"])
 async def test_a_failed_check_keeps_the_link_alive_and_a_reload_retries(
     site, tab, letters, db_session, failure
 ):
@@ -330,6 +330,50 @@ async def test_a_failed_check_keeps_the_link_alive_and_a_reload_retries(
     assert site.server_side.places_holding(token) == []
 
     await tab.unroute("**/auth/verify")
+    await tab.reload()
+    await tab.wait_for_url(site.address + "/az/overview")
+    assert await _session_cookie(tab.context)
+
+
+async def test_too_many_attempts_keep_the_link_alive_and_the_page_says_to_wait(
+    site, tab, letters, db_session
+):
+    """Отказ 429 даёт сам сервер — счётчик попыток с адреса, а не подставной ответ."""
+    link, token = _link_for(
+        db_session, letters, site, password_hash=api_module._hash_bcrypt(PASSWORD)
+    )
+    user = db_session.query(storage.TenantUser).filter_by(email=ADDRESS).one()
+    stored = _row(db_session, user)["magic_token"]
+    # С того же адреса, что и браузер: десять попыток за минуту — счётчик полон.
+    for attempt in range(10):
+        refused = await tab.context.request.post(
+            f"{site.address}/auth/verify", data={"token": f"wrong-{attempt}"}
+        )
+        assert refused.status in (401, 429)
+    site.server_side.received.clear()
+
+    await tab.goto(link)
+    await tab.wait_for_function(
+        "document.getElementById('state').textContent.includes('Подождите минуту')"
+    )
+
+    assert tab.url == link
+    assert "Bir dəqiqə gözləyin" in await tab.inner_text("#state")
+    assert await _session_cookie(tab.context) is None
+    # Запрос ушёл и получил отказ; токен был только в его теле и не погашен.
+    assert site.server_side.places_holding(token) == ["POST /auth/verify: body"]
+    assert [line for line in site.access_log if '"POST /auth/verify HTTP/1.1" 429' in line]
+    assert _row(db_session, user)["magic_token"] == stored
+
+    # Обновление сразу — тот же отказ, адрес прежний.
+    await tab.reload()
+    await tab.wait_for_function(
+        "document.getElementById('state').textContent.includes('Подождите минуту')"
+    )
+    assert tab.url == link
+
+    # Минута прошла.
+    rate_limit._reset_memory_for_tests()
     await tab.reload()
     await tab.wait_for_url(site.address + "/az/overview")
     assert await _session_cookie(tab.context)

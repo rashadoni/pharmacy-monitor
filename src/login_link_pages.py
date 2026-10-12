@@ -68,11 +68,18 @@ __SCRIPT__
 # Ответ 401 и 422 — ссылка не годится (нет токена, истекла, уже использована):
 # дальше страница входа. Любой другой сбой (сеть, 5xx, перезапуск API) токен не
 # трогает: адрес остаётся прежним, и обновление страницы повторяет попытку.
+# Ответ 429 — счётчик попыток с этого адреса (`auth_verify`, окно — минута):
+# адрес тоже остаётся прежним, но обновление сразу получит тот же отказ, поэтому
+# страница просит подождать.
 _SIGN_IN = """
   function refused() { window.location.replace("/login?error=link"); }
   function failed() {
     say("Keçidi yoxlamaq alınmadı. Səhifəni yeniləyin.",
         "Не удалось проверить ссылку. Обновите страницу.");
+  }
+  function throttled() {
+    say("Çox sayda cəhd oldu. Bir dəqiqə gözləyin və səhifəni yeniləyin.",
+        "Слишком много попыток. Подождите минуту и обновите страницу.");
   }
   if (!token) { refused(); return; }
   fetch("/auth/verify", {
@@ -83,6 +90,7 @@ _SIGN_IN = """
   }).then(function (response) {
     if (response.ok) { window.location.replace("/overview"); }
     else if (response.status === 401 || response.status === 422) { refused(); }
+    else if (response.status === 429) { throttled(); }
     else { failed(); }
   }, failed);
 """
