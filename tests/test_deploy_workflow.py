@@ -34,6 +34,7 @@ PostgreSQL (блокировки проверяет `test_migration_lock_timeout
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -881,6 +882,33 @@ def test_env_py_of_the_release_does_not_import_next_to_an_older_src(
 
     assert mixed.returncode != 0
     assert "cannot import name 'create_engine_hiding_statement_data'" in mixed.stderr
+
+
+def _configure_calls(env_py: Path) -> list[str]:
+    tree = ast.parse(env_py.read_text(encoding="utf-8"))
+    return [
+        ast.dump(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "configure"
+    ]
+
+
+def test_live_env_py_configures_alembic_the_way_the_release_env_py_does() -> None:
+    """`env.py` сервера заморожен: выкладка его не обновит, сколько бы ни менялся свой.
+
+    Сегодня они расходятся только движком и пределом ожидания. Правка
+    `context.configure(…)` в `env.py` репозитория (таблица ревизий, режим
+    транзакций) подействовала бы на миграции из deploy.yml, но не на ручной
+    `alembic` и не на откат прежним deploy.yml — и никто бы не заметил. Красный
+    тест значит: решить, как эта правка доедет до живого каталога, и только
+    потом обновлять снимок.
+    """
+    release = _configure_calls(ROOT / "migrations" / "env.py")
+
+    assert len(release) == 2, "ждём два вызова context.configure: offline и online"
+    assert _configure_calls(PREVIOUS_ENV_PY) == release
 
 
 def _alembic_files_of_the_live_directory(sandbox: Sandbox) -> dict[str, bytes]:

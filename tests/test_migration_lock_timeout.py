@@ -21,8 +21,8 @@
   upgrade` идёт из `deploy.yml`, журнал шага публичный. Движок в `env.py` —
   `storage.create_engine_hiding_statement_data` с `connect_args` предела; три
   настоящих сбоя (ожидание замка строки, нарушение уникальности, NULL в
-  обязательной колонке) и контроль на `env.py`, лежавшем на сервере до этой
-  правки: с ним те же данные в тексте есть
+  обязательной колонке) и контроль на `env.py` живого каталога сервера —
+  выкладка его не заменяет, и с ним те же данные в тексте есть
 
 Тест исполняет настоящий `migrations/env.py` репозитория на одноразовой базе с
 одной пробной миграцией, чтобы не зависеть от содержимого боевых.
@@ -238,9 +238,10 @@ def test_a_malformed_timeout_stops_the_migration_before_it_connects(tmp_path: Pa
 
 # ─── Упавшая миграция данных: в тексте ошибки нет данных запроса ─────────────
 
-# `env.py`, лежавший на сервере до первой выкладки новым deploy.yml (прочитан
-# 2026-10-11): движок через `engine_from_config`, без предела ожидания.
-ENV_PY_ON_SERVER_BEFORE = ROOT / "tests" / "fixtures" / "migrations_env_on_server_2026-08-23.py.txt"
+# `env.py` живого каталога сервера (прочитан 2026-10-11; deploy.yml его не
+# заменяет): движок через `engine_from_config`, без предела ожидания. На нём
+# идёт `alembic`, запущенный на сервере руками, и прежний deploy.yml.
+ENV_PY_ON_SERVER = ROOT / "tests" / "fixtures" / "migrations_env_on_server_2026-08-23.py.txt"
 
 ROW_EMAIL = "row-marker@example.test"
 ROW_HASH = "ROW-HASH-MARKER-51c7"
@@ -337,16 +338,16 @@ def test_a_failed_data_migration_prints_no_statement_data(
 
 
 @pytest.mark.parametrize("failure", sorted(FAILURES))
-def test_control_the_env_py_the_server_had_printed_that_data(
+def test_control_the_env_py_on_the_server_prints_that_data(
     tmp_path: Path, scratch_db_url: str, failure: str
 ) -> None:
-    """Контроль пробы: на прежнем `env.py` те же сбои печатают данные — проба их видит."""
+    """Контроль пробы: на `env.py` сервера те же сбои печатают данные — проба их видит."""
     _, error_class, server_label, values = FAILURES[failure]
-    # У прежнего env.py предела нет: без него ожидание замка не кончилось бы.
+    # У этого env.py предела нет: без него ожидание замка не кончилось бы.
     with_limit = f"{scratch_db_url}?options=-c lock_timeout=400"
 
     printed = _fail_a_data_migration(
-        tmp_path, scratch_db_url, failure, env_py=ENV_PY_ON_SERVER_BEFORE, db_url=with_limit
+        tmp_path, scratch_db_url, failure, env_py=ENV_PY_ON_SERVER, db_url=with_limit
     )
 
     assert f"psycopg.errors.{error_class}" in printed
