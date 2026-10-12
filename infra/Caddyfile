@@ -46,10 +46,31 @@ leaddrive.cloud, www.leaddrive.cloud {
         reverse_proxy 127.0.0.1:3000
     }
 
-    # Logs (rotate via systemd-journald)
+    # Logs (rotate via systemd-journald).
+    #
+    # The access log records the request URI, request headers and response
+    # headers. Login links no longer carry their token in any of them (the
+    # token sits after `#`), so this filter is a second layer: it blanks the
+    # value of any query parameter whose name looks like a credential — in the
+    # URI, in Referer and in a redirect's Location — and drops two headers:
+    # Next-Router-State-Tree (Next.js copies the page address into it) and
+    # X-Api-Key (Caddy redacts Cookie and Authorization by itself, not this).
+    # Other parameters stay readable: `?search=…` is what the log is read for.
+    # It is a list of names; a secret under a name not listed passes through.
+    # Checked against real Caddy 2.6.2 and 2.10.2 by
+    # tests/test_caddy_log_filter.py; installing it — docs/RUNBOOK.md.
     log {
         output stderr
-        format console
+        format filter {
+            wrap console
+            fields {
+                request>uri regexp `(?i)([?&][^=&]*(?:token|secret|passw|pwd|key|code|session|signature|auth)[^=&]*=)[^&]*` ${1}<hidden>
+                request>headers>Referer regexp `(?i)([?&][^=&]*(?:token|secret|passw|pwd|key|code|session|signature|auth)[^=&]*=)[^&]*` ${1}<hidden>
+                resp_headers>Location regexp `(?i)([?&][^=&]*(?:token|secret|passw|pwd|key|code|session|signature|auth)[^=&]*=)[^&]*` ${1}<hidden>
+                request>headers>Next-Router-State-Tree delete
+                request>headers>X-Api-Key delete
+            }
+        }
         level INFO
     }
 }
