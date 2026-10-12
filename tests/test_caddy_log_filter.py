@@ -5,6 +5,9 @@ Caddy стоит перед API и фронтендом и пишет в жур�
 (tests/test_login_link_in_a_browser.py) — это первый слой. Фильтр в блоке `log`
 образца `infra/Caddyfile` — второй: он закрывает запрос, который несёт
 `?token=…` сам (письмо прежнего образца, скрипт), и ключ API в заголовке.
+Таких блоков в образце два: `log` сайта (запись о каждом запросе) и общий
+`log default` — туда Caddy пишет вторую запись о запросе, который не смог
+обслужить (сервис за ним не ответил, 502), с тем же адресом и заголовками.
 
 Здесь два уровня проверки:
 
@@ -45,8 +48,16 @@ _DELETE_LINE = re.compile(r"^\s*(\S+) delete\s*$", re.MULTILINE)
 
 
 def _log_block() -> str:
+    """Блок `log` сайта: запись о каждом запросе."""
     sample = SAMPLE.read_text(encoding="utf-8")
     (block,) = re.findall(r"^    log \{\n.*?^    \}\n", sample, re.MULTILINE | re.DOTALL)
+    return block
+
+
+def _default_log_block() -> str:
+    """Общий `log default`: туда Caddy пишет о запросе, который не смог обслужить."""
+    sample = SAMPLE.read_text(encoding="utf-8")
+    (block,) = re.findall(r"^    log default \{\n.*?^    \}\n", sample, re.MULTILINE | re.DOTALL)
     return block
 
 
@@ -59,8 +70,9 @@ def _hide(address: str) -> str:
     return re.sub(pattern, r"\g<1><hidden>", address)
 
 
-def test_the_filter_covers_every_place_an_address_is_written():
-    block = _log_block()
+@pytest.mark.parametrize("block_of", [_log_block, _default_log_block])
+def test_the_filter_covers_every_place_an_address_is_written(block_of):
+    block = block_of()
     cleaned = {field: pattern for field, pattern, _ in _REGEXP_LINE.findall(block)}
 
     # Адрес запроса, адрес страницы, с которой он пришёл, и адрес редиректа.
@@ -70,8 +82,31 @@ def test_the_filter_covers_every_place_an_address_is_written():
         "request>headers>Next-Router-State-Tree",
         "request>headers>X-Api-Key",
     }
-    # Запись остаётся того же вида, что и была: фильтр оборачивает `console`.
-    assert "wrap console" in block and "output stderr" in block
+    assert "format filter {" in block
+
+
+def test_both_journals_are_filtered_alike():
+    """Запись о запросе и запись об ошибке запроса несут одни и те же поля."""
+    fields = [
+        sorted(
+            _REGEXP_LINE.findall(block) + [(f, "delete", "") for f in _DELETE_LINE.findall(block)]
+        )
+        for block in (_log_block(), _default_log_block())
+    ]
+
+    assert fields[0] == fields[1]
+    # Вид записей прежний: у сайта `console`, у общего журнала под systemd — `json`.
+    assert "wrap console" in _log_block() and "output stderr" in _log_block()
+    assert "wrap json" in _default_log_block()
+
+
+def test_the_names_are_those_the_sentry_layer_calls_credentials():
+    """Один список на оба слоя: имя, добавленное в `observability`, нужно и здесь."""
+    from src import observability
+
+    (pattern,) = {pattern for _, pattern, _ in _REGEXP_LINE.findall(_log_block())}
+    for name in observability._CREDENTIAL_NAME_RE.pattern.split("|"):
+        assert name in pattern, name
 
 
 @pytest.mark.parametrize(
@@ -83,6 +118,10 @@ def test_the_filter_covers_every_place_an_address_is_written():
         ("/x?access_token=SECRET", "/x?access_token=<hidden>"),
         ("/x?Token=SECRET", "/x?Token=<hidden>"),
         ("/x?api_key=SECRET&q=1", "/x?api_key=<hidden>&q=1"),
+        ("/x?apikey=SECRET", "/x?apikey=<hidden>"),
+        ("/x?key=SECRET&q=1", "/x?key=<hidden>&q=1"),
+        ("/x?q=1&code=SECRET", "/x?q=1&code=<hidden>"),
+        ("/x?session_id=SECRET", "/x?session_id=<hidden>"),
         ("/x?new_password=SECRET", "/x?new_password=<hidden>"),
         ("/x?token=", "/x?token=<hidden>"),
         ("/x?a=1&token=ONE&b=2&code=TWO", "/x?a=1&token=<hidden>&b=2&code=<hidden>"),
@@ -98,6 +137,8 @@ def test_a_secret_parameter_loses_its_value(address, written):
         "/health",
         "/api/v1/dash/comparison?search=kreon&min_spread=5",
         "/api/v1/dash/alerts?type=price_drop_pct&page=2",
+        # `key` и `code` — только имя целиком: это не они.
+        "/x?keyword=kreon&barcode=4600&category_code=7&postcode=1000",
         # Слово в пути или в значении — не имя параметра.
         "/auth/link",
         "/x?q=token",
@@ -117,6 +158,10 @@ CANARIES = {
     "router_state_token": "TOK4-canary-d4",
     "api_key": "APIKEY5-canary-e5",
     "second_place_token": "TOK6-canary-f6",
+    # Запрос, на который сервис за Caddy не ответил: об этом Caddy пишет ещё раз.
+    "unserved_token": "TOK7-canary-g7",
+    "unserved_referer_token": "TOK8-canary-h8",
+    "unserved_api_key": "APIKEY9-canary-i9",
 }
 KEPT = "kreon-KEPT"
 
@@ -161,16 +206,22 @@ def _sample_for_a_test(port: int, upstream: int, *, filtered: bool) -> str:
     assert switched == 1
     assert "leaddrive.cloud, www.leaddrive.cloud {" in sample
     sample = sample.replace("leaddrive.cloud, www.leaddrive.cloud {", f"http://127.0.0.1:{port} {{")
-    sample, proxies = re.subn(
-        r"reverse_proxy 127\.0\.0\.1:\d+", f"reverse_proxy 127.0.0.1:{upstream}", sample
+    # Grafana в образце — третий сервис за Caddy. Здесь он «лежит»: порт свободен,
+    # и запрос к нему Caddy обслужить не может (502).
+    dead = _free_port()
+    sample, grafana = re.subn(
+        r"reverse_proxy 127\.0\.0\.1:3001\b", f"reverse_proxy 127.0.0.1:{dead}", sample
     )
-    assert proxies >= 3
+    sample, proxies = re.subn(
+        r"reverse_proxy 127\.0\.0\.1:(?:8080|3000)\b", f"reverse_proxy 127.0.0.1:{upstream}", sample
+    )
+    assert (grafana, proxies) == (1, 2)
     if not filtered:
-        block = _log_block()
         plain = (
             "    log {\n        output stderr\n        format console\n        level INFO\n    }\n"
         )
-        sample = sample.replace(block, plain)
+        sample = sample.replace(_log_block(), plain).replace(_default_log_block(), "")
+        assert "format filter" not in sample
     return sample
 
 
@@ -234,6 +285,17 @@ def _journal_of(caddy: str, tmp_path: Path, upstream: int, *, filtered: bool) ->
             == 200
         )
         assert _get(port, f"/x?utm=mail&access_token={c['second_place_token']}&next=2") == 200
+        assert (
+            _get(
+                port,
+                f"/grafana/x?token={c['unserved_token']}",
+                **{
+                    "Referer": f"https://leaddrive.cloud/p?token={c['unserved_referer_token']}",
+                    "X-API-Key": c["unserved_api_key"],
+                },
+            )
+            == 502
+        )
         time.sleep(0.3)
     finally:
         process.terminate()
@@ -243,6 +305,13 @@ def _journal_of(caddy: str, tmp_path: Path, upstream: int, *, filtered: bool) ->
             process.kill()
             process.wait(timeout=10)
     return journal.read_text(encoding="utf-8", errors="replace")
+
+
+_LOCATION = re.compile(r'"Location":\s*\["([^"]*)"\]')
+
+
+def _records_holding(journal: str, value: str) -> list[str]:
+    return [line for line in journal.splitlines() if value in line]
 
 
 @pytest.fixture(scope="module")
@@ -267,7 +336,12 @@ def test_without_the_filter_caddy_writes_every_value(journals):
     missing = [name for name, value in CANARIES.items() if value not in journals["plain"]]
     assert not missing, f"проба не видит в журнале без фильтра: {missing}"
     # Токен ссылки на создание пароля лежит и в адресе редиректа.
-    assert f"/az/set-password?token={CANARIES['password_link_token']}" in journals["plain"]
+    assert _LOCATION.findall(journals["plain"]) == [
+        f"/az/set-password?token={CANARIES['password_link_token']}"
+    ]
+    # О запросе без ответа Caddy пишет дважды: запись о запросе и запись об ошибке.
+    assert len(_records_holding(journals["plain"], CANARIES["unserved_token"])) == 2
+    assert "http.log.error" in journals["plain"]
 
 
 def test_with_the_filter_caddy_writes_none_of_them(journals):
@@ -278,6 +352,9 @@ def test_with_the_filter_caddy_writes_none_of_them(journals):
     # Записи на месте и прежнего вида, параметры без секрета читаются.
     assert journal.count("handled request") == journals["plain"].count("handled request")
     assert '"uri": "/auth/verify?token=<hidden>"' in journal
-    assert "/az/set-password?token=<hidden>" in journal
+    assert _LOCATION.findall(journal) == ["/az/set-password?token=<hidden>"]
+    # Обе записи о запросе без ответа на месте — и обе без значения.
+    assert len(_records_holding(journal, "/grafana/x?token=<hidden>")) == 2
+    assert "http.log.error" in journal
     assert f"search={KEPT}&min_spread=5" in journal
     assert "/x?utm=mail&access_token=<hidden>&next=2" in journal

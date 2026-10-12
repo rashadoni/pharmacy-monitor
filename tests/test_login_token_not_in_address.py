@@ -201,7 +201,7 @@ def test_the_sign_in_page_posts_the_token_only_when_its_button_is_pressed():
     (posting,) = re.findall(r"function (\w+)\(\) \{[^}]*?fetch\(", page)
     # Отправка названа в одном месте — в кнопке; сама страница её не зовёт.
     assert re.findall(rf"\b{posting}\b(?!\(\) \{{)", page) == [posting]
-    assert f'offer("Daxil ol", "Войти", {posting});' in page
+    assert f'offer("Daxil ol", "Войти", {posting}, true);' in page
     # Странице создания пароля слать нечего: она только передаёт токен форме.
     assert "fetch(" not in login_link_pages.SET_PASSWORD_PAGE
 

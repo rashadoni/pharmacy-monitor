@@ -370,13 +370,16 @@ gh api -X DELETE repos/rashadoni/pharmacy-monitor/actions/runs/<id>/logs
 - После нажатия — «Keçid etibarsızdır və ya artıq istifadə olunub / Ссылка
   недействительна или уже использована»: отказ. Ссылка истекла, по ней уже
   вошли, её погасила более новая. Кнопка «Davam edin / Продолжить» ведёт в
-  дашборд, а если входа нет — на страницу входа.
+  дашборд, а если входа нет — на страницу входа; появляется она через
+  секунду после отказа, чтобы второе нажатие «Войти» на неё не попало.
 - Сразу, без кнопки входа, — «Keçid natamamdır… / Ссылка неполная. Откройте её
   из письма ещё раз»: в адресе нет части после «#» (ссылку набрали руками,
   скопировали не целиком, почтовый шлюз обрезал её).
 - «Keçidi yoxlamaq alınmadı. Yenidən cəhd edin / Не удалось проверить ссылку.
-  Попробуйте ещё раз» — не отказ: сеть, перезапуск API, ответ 5xx. Ссылка цела,
-  повторное нажатие или обновление страницы повторяют попытку.
+  Попробуйте ещё раз» — не отказ: сеть, перезапуск API, ответ 5xx, нет ответа
+  30 секунд. Повторное нажатие или обновление страницы повторяют попытку.
+  Ссылка цела, кроме одного случая: сервер вошёл, а ответ до страницы не
+  дошёл — тогда повтор скажет «уже использована», и нужна новая ссылка.
 - Форма создания пароля после отправки пишет «Link yararsız və ya müddəti bitib»
   («Ссылка недействительна или истекла») либо сразу показывает «Məktubdakı linki
   yenidən açın. Alınmasa, administratordan yeni link istəyin» («Откройте ссылку
@@ -606,26 +609,44 @@ API — пока идёт сборка фронтенда, новый код е�
 
 ### Фильтр в журнале Caddy (второй слой)
 
-Что он делает. В образце `infra/Caddyfile` блок `log` пишет запись через фильтр:
-у параметра запроса с именем, похожим на секрет (`token`, `secret`, `passw`,
-`pwd`, `key`, `code`, `session`, `signature`, `auth` — в любом месте имени, без
-учёта регистра), значение заменяется на `<hidden>` — в адресе запроса, в
-`Referer` и в `Location` редиректа; заголовки `Next-Router-State-Tree` и
-`X-Api-Key` в запись не идут вовсе. Остальные параметры читаются как раньше
-(`?search=kreon&min_spread=5`). Cookie и Authorization Caddy закрывает сам
-(проверено на 2.6.2 и 2.10.2), а ключ API в заголовке `X-Api-Key` без фильтра
-пишет целиком.
+Что он делает. Caddy пишет о запросе в двух местах, и в образце
+`infra/Caddyfile` фильтр стоит в обоих:
+
+- блок `log` сайта — запись о каждом запросе;
+- общий блок `log default` — туда Caddy пишет **вторую** запись о запросе,
+  который не смог обслужить сам (сервис за ним не ответил или перезапускается:
+  502), с тем же адресом и теми же заголовками. API перезапускается при каждой
+  выкладке, так что такие записи бывают.
+
+У параметра запроса с именем, похожим на секрет, значение заменяется на
+`<hidden>` — в адресе запроса, в `Referer` и в `Location` редиректа; заголовки
+`Next-Router-State-Tree` и `X-Api-Key` в запись не идут вовсе. Имена — те же,
+что у слоя Sentry (`_CREDENTIAL_NAME_RE` в `src/observability.py`: `auth`,
+`cookie`, `token`, `secret`, `session`, `passw`, `pwd`, `signature`, `api_key`
+— в любом месте имени, без учёта регистра), и ещё `key` и `code`, но только
+именем целиком. Остальные параметры читаются как раньше
+(`?search=kreon&min_spread=5`). Cookie и Authorization Caddy закрывает сам, а
+ключ API в заголовке `X-Api-Key` без фильтра пишет целиком.
 
 Чем проверено. `tests/test_caddy_log_filter.py` поднимает настоящий Caddy на
-образце целиком (подменены адрес сайта и порты) и ищет значения в том, что он
-записал; контрольный запуск без фильтра обязан их записать. Пройдено руками
-2026-10-12 на Caddy 2.6.2 и 2.10.2. ⚠️ В CI Caddy
-нет — там идут только проверки по тексту образца. Версия Caddy на сервере из
-репозитория не видна, и живой `/etc/caddy/Caddyfile` от образца отличается:
-первый шаг ниже — посмотреть обе вещи.
+образце целиком (подменены адрес сайта и порты, один сервис «лежит») и ищет
+значения в том, что он записал; контрольный запуск без фильтра обязан их
+записать — в том числе в записи об ошибке. Пройдено руками 2026-10-12 на Caddy
+2.6.2 и 2.10.2. ⚠️ В CI Caddy нет — там идут только проверки по тексту образца:
+блок, написанный с ошибкой в строении, CI пропустит, его ловит `caddy validate`
+в порядке ниже. Версия Caddy на сервере из репозитория не видна, и живой
+`/etc/caddy/Caddyfile` от образца отличается: первый шаг — посмотреть обе вещи.
 
-Чего фильтр не делает: это список имён — секрет в параметре с другим именем или
-в пути адреса пройдёт; записи, сделанные до установки, остаются до ротации.
+Чего фильтр не делает:
+
+- это список имён: секрет в параметре с другим именем (`otp`, `jwt`, `sig`) или
+  в пути адреса пройдёт;
+- имя, записанное кодами знаков (`%74oken=…`), он не узнаёт, а API такой
+  параметр принимает. Так пишет только тот, кто делает это нарочно;
+- параметр, в имени которого есть слово из списка, скрывается тоже: `author`
+  содержит `auth`. Сегодня у API таких параметров нет; новый параметр с таким
+  именем из журнала пропадёт молча;
+- записи, сделанные до установки, остаются до ротации.
 
 **Поставить (root, только по слову владельца; сайт недоступен на время
 перезапуска Caddy — секунды).** Правится копия, живой файл заменяется уже
@@ -633,48 +654,70 @@ API — пока идёт сборка фронтенда, новый код е�
 
 ```bash
 caddy version
-grep -n -A8 '^\s*log {' /etc/caddy/Caddyfile        # что стоит сейчас
-cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak.$(date +%Y%m%d-%H%M)
+systemctl show caddy -p User                          # от чьего имени идёт служба
+grep -n -B2 -A10 '^\s*log\b' /etc/caddy/Caddyfile     # какие блоки log стоят сейчас
+M=$(date +%Y%m%d-%H%M)
+cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak.$M
 cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.new
 nano /etc/caddy/Caddyfile.new
 ```
 
-В блоке `log` строку `format console` заменить блоком `format filter { … }` из
-`infra/Caddyfile` репозитория — десять строк, от `format filter {` до его
-закрывающей скобки. Остальной файл не трогать и образец поверх не копировать.
-Если у живого блока формат другой (`format json`) — в строке `wrap console`
-поставить его; если строки `format` нет — `wrap json`: так Caddy пишет под
-systemd, когда формат не задан.
+Две правки, обе — текстом из `infra/Caddyfile` репозитория; остальной файл не
+трогать и образец поверх не копировать:
+
+1. В блоке `log` сайта строку `format console` заменить блоком
+   `format filter { … }` — десять строк, от `format filter {` до его закрывающей
+   скобки. Если у живого блока формат другой (`format json`) — поставить его в
+   строке `wrap console`; если строки `format` нет — `wrap json`: так Caddy пишет
+   под systemd, когда формат не задан.
+2. В общий блок в начале файла (где `admin off`) добавить блок `log default { … }`
+   целиком. Если общий `log` там уже есть — не добавлять второй, а вписать в
+   него `format filter { … }` с тем форматом, что в нём стоит.
+
+Проверять от имени службы (строка `User=` из первой команды, обычно `caddy` —
+она и стоит в командах ниже), а не root: `validate` создаёт файлы, на которые
+ссылается конфигурация, и файл журнала, созданный root, служба потом не откроет
+(при записи в journald, как в образце, этого файла нет).
 
 ```bash
-caddy validate --config /etc/caddy/Caddyfile.new --adapter caddyfile   # ждём «Valid configuration»
+sudo -u caddy caddy validate --config /etc/caddy/Caddyfile.new --adapter caddyfile   # ждём «Valid configuration»
 cp -a /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile
-systemctl restart caddy && systemctl is-active caddy                    # reload при `admin off` не работает
+systemctl restart caddy && systemctl is-active caddy          # reload при `admin off` не работает
 ```
 
-`validate` отказал («unrecognized», «module not registered») — не ставить: живой
-файл не тронут, удалить `Caddyfile.new` и сообщить версию Caddy.
+`validate` отказал — не ставить: живой файл не тронут, удалить `Caddyfile.new`.
+«unrecognized», «module not registered» — версия Caddy фильтра не знает,
+сообщить её. Жалоба на пустое значение — в файле стоит `{$ИМЯ}` из окружения
+службы, которого у `sudo` нет: посмотреть `systemctl show caddy -p Environment
+-p EnvironmentFiles` и передать переменную в команду.
 
-Проверить на живом сайте — запрос с меткой и его запись:
+Проверить на живом сайте — запрос с меткой и его запись. Метка своя на каждую
+попытку, иначе в счёт попадёт прежняя:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' 'https://leaddrive.cloud/health?token=probe-CANARY-1&search=probe-KEPT-1'   # 200
+P=probe-$(date +%s)
+curl -s -o /dev/null -w '%{http_code}\n' "https://leaddrive.cloud/health?token=$P-CANARY&search=$P-KEPT"   # 200
 sleep 1
-journalctl -u caddy --since '-1 min' -o cat | grep -c 'probe-CANARY-1'    # ждём 0
-journalctl -u caddy --since '-1 min' -o cat | grep -c 'probe-KEPT-1'      # ждём 1
-journalctl -u caddy --since '-1 min' -o cat | grep -c 'token=<hidden>'    # не меньше 1
+journalctl -u caddy --since '-2 min' -o cat | grep -c -- "$P-CANARY"    # ждём 0
+journalctl -u caddy --since '-2 min' -o cat | grep -c -- "$P-KEPT"      # ждём 1
 ```
 
-Первая строка не 200 или записей нет вовсе — откат:
+Это проверяет запись о запросе. Запись об ошибке (второй блок) на живом сайте
+без остановки сервиса не вызвать — её проверяет тест; на сервере посмотреть,
+что блок встал: `grep -c 'format filter' /etc/caddy/Caddyfile` даёт 2.
+
+Откат — если сайт не отвечает 200, записи с меткой `KEPT` нет или счёт `CANARY`
+не ноль:
 
 ```bash
-cp -a /etc/caddy/Caddyfile.bak.<метка> /etc/caddy/Caddyfile
-caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl restart caddy
+cp -a /etc/caddy/Caddyfile.bak.$M /etc/caddy/Caddyfile
+sudo -u caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl restart caddy
 ```
 
 На сервере этот порядок не исполнялся ни разу (2026-10-12): сколько длится
 перезапуск и что напишет `caddy validate` тамошней версии, покажет первый раз.
-Стоит ли фильтр — `grep -c 'format filter' /etc/caddy/Caddyfile` (0 — нет).
+Стоит ли фильтр — `grep -c 'format filter' /etc/caddy/Caddyfile` (0 — нет, 2 —
+оба блока).
 
 ### Email — слишком много писем (volume controls)
 

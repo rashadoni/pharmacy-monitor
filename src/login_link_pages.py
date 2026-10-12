@@ -15,8 +15,9 @@ Referer, Location редиректа и этот заголовок. Поэто�
   `POST /auth/verify`, затем уходит в дашборд. Сама, без нажатия, она токен не
   шлёт: ссылку открывает не только человек — её открывают и проверки ссылок в
   почте, исполняющие сценарии страниц, и такая проверка погасила бы ссылку
-  раньше получателя. По той же причине чужой сайт, приведший посетителя сюда
-  со своим токеном, без его нажатия никого не входит;
+  раньше получателя. От чужого сайта, который хочет войти посетителем под
+  своей записью, кнопка не защищает: `GET /auth/verify?token=…` входит и без
+  нажатия, пока он принимает переход браузера;
 - создание пароля — страница кладёт токен в `sessionStorage` вкладки и уходит
   на форму `/set-password` уже с чистым адресом; форма берёт токен оттуда
   (`frontend/src/lib/link-token.ts`, ключ общий — `LINK_TOKEN_STORAGE_KEY`).
@@ -57,7 +58,7 @@ _PAGE = """<!doctype html>
 </head>
 <body>
 <main>
-<p id="state">Keçid yoxlanılır…<br>Проверяем ссылку…</p>
+<p id="state"></p>
 <button id="act" type="button" hidden></button>
 <noscript><p>Bu səhifə üçün JavaScript lazımdır.<br>Этой странице нужен JavaScript.</p></noscript>
 </main>
@@ -73,12 +74,12 @@ _PAGE = """<!doctype html>
     state.appendChild(document.createTextNode(ru));
   }
   // Кнопка со словами на обоих языках; что она делает, решает страница.
-  function offer(az, ru, pressed) {
+  function offer(az, ru, pressed, focused) {
     act.textContent = az + " / " + ru;
     act.onclick = pressed;
     act.disabled = false;
     act.hidden = false;
-    act.focus();
+    if (focused) { act.focus(); }
   }
 __SCRIPT__
 })();
@@ -96,32 +97,46 @@ __SCRIPT__
 # прежним, кнопка — тоже, повторное нажатие или обновление страницы повторяют
 # попытку.
 _SIGN_IN = """
+  var stop = null;
   function onward() { window.location.replace("/overview"); }
+  // Отказ должны прочитать: «Продолжить» появляется с задержкой и без фокуса,
+  // чтобы второе нажатие «Войти» (или второй Enter) не увело со страницы.
   function refused(az, ru) {
+    act.hidden = true;
     say(az, ru);
-    offer("Davam edin", "Продолжить", onward);
+    window.setTimeout(function () { offer("Davam edin", "Продолжить", onward, false); }, 800);
   }
   function failed() {
     say("Keçidi yoxlamaq alınmadı. Yenidən cəhd edin.",
         "Не удалось проверить ссылку. Попробуйте ещё раз.");
     act.disabled = false;
+    act.focus();
   }
+  // Сервер, который не отвечает, страницу вечно не держит.
+  function giveUp() { if (stop) { stop.abort(); } }
   function signIn() {
     act.disabled = true;
     say("Keçid yoxlanılır…", "Проверяем ссылку…");
+    stop = window.AbortController ? new AbortController() : null;
+    var waiting = window.setTimeout(giveUp, 30000);
     fetch("/auth/verify", {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ token: token })
+      body: JSON.stringify({ token: token }),
+      signal: stop ? stop.signal : undefined
     }).then(function (response) {
+      window.clearTimeout(waiting);
       if (response.ok) { onward(); }
       else if (response.status === 401 || response.status === 422) {
         refused("Keçid etibarsızdır və ya artıq istifadə olunub.",
                 "Ссылка недействительна или уже использована.");
       }
       else { failed(); }
-    }, failed);
+    }, function () {
+      window.clearTimeout(waiting);
+      failed();
+    });
   }
   if (!token) {
     refused("Keçid natamamdır. Onu məktubdan yenidən açın.",
@@ -130,12 +145,13 @@ _SIGN_IN = """
   }
   say("Pharmacy Monitor-a daxil olmaq üçün düyməni basın.",
       "Нажмите кнопку, чтобы войти в Pharmacy Monitor.");
-  offer("Daxil ol", "Войти", signIn);
+  offer("Daxil ol", "Войти", signIn, true);
 """
 
 # Ссылка без токена стирает и прежний: форма не должна молча взять токен от
 # письма, открытого в этой вкладке раньше.
 _SET_PASSWORD = """
+  say("Keçid açılır…", "Открываем ссылку…");
   try {
     if (token) { window.sessionStorage.setItem("__KEY__", token); }
     else { window.sessionStorage.removeItem("__KEY__"); }

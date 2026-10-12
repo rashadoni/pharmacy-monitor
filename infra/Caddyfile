@@ -12,6 +12,24 @@
     # Global options
     email rashadrahimov@gmail.com  # for Let's Encrypt
     admin off                      # disable Caddy admin API on public iface
+
+    # When Caddy cannot serve a request itself (upstream down or restarting:
+    # 502) it writes one more record, through the default logger, with the
+    # same address and headers as the access record. The site's `log` block
+    # below does not reach it, so the same filter stands here too. `wrap json`
+    # is what the default logger writes under systemd when no format is set.
+    log default {
+        format filter {
+            wrap json
+            fields {
+                request>uri regexp `(?i)([?&](?:[^=&]*(?:auth|cookie|token|secret|session|passw|pwd|signature|api[-_]?key)[^=&]*|key|code)=)[^&]*` ${1}<hidden>
+                request>headers>Referer regexp `(?i)([?&](?:[^=&]*(?:auth|cookie|token|secret|session|passw|pwd|signature|api[-_]?key)[^=&]*|key|code)=)[^&]*` ${1}<hidden>
+                resp_headers>Location regexp `(?i)([?&](?:[^=&]*(?:auth|cookie|token|secret|session|passw|pwd|signature|api[-_]?key)[^=&]*|key|code)=)[^&]*` ${1}<hidden>
+                request>headers>Next-Router-State-Tree delete
+                request>headers>X-Api-Key delete
+            }
+        }
+    }
 }
 
 # === Production frontend (Next.js on :3000) + API (FastAPI on :8080) ===
@@ -56,7 +74,11 @@ leaddrive.cloud, www.leaddrive.cloud {
     # Next-Router-State-Tree (Next.js copies the page address into it) and
     # X-Api-Key (Caddy redacts Cookie and Authorization by itself, not this).
     # Other parameters stay readable: `?search=…` is what the log is read for.
-    # It is a list of names; a secret under a name not listed passes through.
+    # The names are those of `_CREDENTIAL_NAME_RE` in src/observability.py,
+    # anywhere in a parameter's name, plus exactly `key` and `code`. It is a
+    # list: a secret under another name passes through, and so does a name
+    # written percent-encoded (`%74oken=`). The same five lines stand in the
+    # global `log default` block above — keep the two in step.
     # Checked against real Caddy 2.6.2 and 2.10.2 by
     # tests/test_caddy_log_filter.py; installing it — docs/RUNBOOK.md.
     log {
@@ -64,9 +86,9 @@ leaddrive.cloud, www.leaddrive.cloud {
         format filter {
             wrap console
             fields {
-                request>uri regexp `(?i)([?&][^=&]*(?:token|secret|passw|pwd|key|code|session|signature|auth)[^=&]*=)[^&]*` ${1}<hidden>
-                request>headers>Referer regexp `(?i)([?&][^=&]*(?:token|secret|passw|pwd|key|code|session|signature|auth)[^=&]*=)[^&]*` ${1}<hidden>
-                resp_headers>Location regexp `(?i)([?&][^=&]*(?:token|secret|passw|pwd|key|code|session|signature|auth)[^=&]*=)[^&]*` ${1}<hidden>
+                request>uri regexp `(?i)([?&](?:[^=&]*(?:auth|cookie|token|secret|session|passw|pwd|signature|api[-_]?key)[^=&]*|key|code)=)[^&]*` ${1}<hidden>
+                request>headers>Referer regexp `(?i)([?&](?:[^=&]*(?:auth|cookie|token|secret|session|passw|pwd|signature|api[-_]?key)[^=&]*|key|code)=)[^&]*` ${1}<hidden>
+                resp_headers>Location regexp `(?i)([?&](?:[^=&]*(?:auth|cookie|token|secret|session|passw|pwd|signature|api[-_]?key)[^=&]*|key|code)=)[^&]*` ${1}<hidden>
                 request>headers>Next-Router-State-Tree delete
                 request>headers>X-Api-Key delete
             }
