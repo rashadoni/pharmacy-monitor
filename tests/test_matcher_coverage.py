@@ -1025,9 +1025,9 @@ def test_merge_keeps_the_record_of_a_cluster_someone_else_still_belongs_to(db_se
 # ── Пропавшая строка без пары новую пару не начинает ─────────────────────────
 
 
-def _lost_everywhere(session, *, scraped: bool):
+def _lost_everywhere(session, *, scraped: bool, days: int = 100):
     """Старые строки одного товара на двух сайтах, обе без пары."""
-    long_ago = utcnow() - timedelta(days=100)
+    long_ago = utcnow() - timedelta(days=days)
     rows = [
         _product(session, "pharmonline", "Ferrovef № 60 (Kapsulalar)", last_seen_at=long_ago),
         _product(session, "aptekonline", "Ferrovef   N60", last_seen_at=long_ago),
@@ -1043,6 +1043,26 @@ def _lost_everywhere(session, *, scraped: bool):
 
 def test_rows_gone_from_their_sites_do_not_start_a_cluster(db_session):
     rows = _lost_everywhere(db_session, scraped=True)
+
+    matcher.match_products(db_session)
+
+    assert [row.canonical_id for row in rows] == [None, None]
+
+
+def test_a_row_missed_by_one_weekly_scrape_is_not_gone_yet(db_session):
+    """Пропавшей строка становится после двух пропущенных недельных сборов, не одного."""
+    rows = _lost_everywhere(db_session, scraped=True, days=10)
+
+    matcher.match_products(db_session)
+
+    assert _same_cluster(*rows)
+
+
+def test_rows_gone_from_their_sites_do_not_pair_by_barcode_either(db_session):
+    rows = _lost_everywhere(db_session, scraped=True)
+    for row in rows:
+        row.barcode = "4770001234567"
+    db_session.commit()
 
     matcher.match_products(db_session)
 
@@ -1196,3 +1216,90 @@ def test_a_lost_row_that_has_a_pair_still_brings_a_newcomer_into_its_cluster(db_
     matcher.match_products(db_session)
 
     assert _same_cluster(*old, newcomer)
+
+
+def test_second_merge_sees_the_rows_the_first_one_brought_in(db_session):
+    """Два кластера с живым товаром клиента в каждом и один общий двойник.
+
+    Первое слияние приводит товар клиента в кластер двойника; второе обязано
+    это видеть и отказать — иначе в кластере два товара одного сайта.
+    """
+    case = _split_product(db_session)
+    second = storage.Match(tenant_id=1, canonical_name="Kreon 25000", confidence=1.0)
+    db_session.add(second)
+    db_session.flush()
+    _product(
+        db_session,
+        "aloe",
+        "Kreon 25000, 20 əd",
+        external_id="older-slug",
+        brand="Abbot",
+        canonical_id=second.id,
+        last_seen_at=utcnow() - timedelta(days=100),
+    )
+    other_listing = _product(
+        db_session,
+        "pharmonline",
+        "Kreon 25000 №20 (Kapsula)",
+        external_id="second-listing",
+        canonical_id=second.id,
+    )
+    # У aloe две пропавшие строки: свежего каталога должно быть больше половины.
+    for i in range(2):
+        _product(db_session, "aloe", f"Fresh aloe product {i} № 10", external_id=f"fresh-{i}")
+    db_session.commit()
+
+    merged = matcher.relink_stale_members(db_session)
+    db_session.commit()
+
+    assert [item["merged"] for item in merged] == [case.left.id]
+    assert other_listing.canonical_id == second.id
+    sites = [product.site for product in db_session.get(storage.Match, case.right.id).products]
+    assert sorted(sites) == ["aloe", "aptekonline", "pharmonline"]
+
+
+@pytest.mark.parametrize(
+    ("obstacle", "reason"),
+    [
+        ("two_live_rows", "two_rows_of_one_site"),
+        ("other_country", "twin_is_another_product"),
+        ("rejection", "members_must_not_meet"),
+        ("manual_twin_cluster", "manual_cluster"),
+        ("rival_without_pair", "live_row_without_pair_too"),
+    ],
+)
+def test_a_refused_merge_names_its_reason(db_session, obstacle, reason):
+    """Причина отказа — словарь RUNBOOK: по ней оператор понимает, что с товаром."""
+    from structlog.testing import capture_logs
+
+    from src import match_actions
+
+    lost_kw = live_kw = None
+    if obstacle == "other_country":
+        lost_kw = {"manufacturer_country_code": "de", "country_resolution_status": "resolved"}
+        live_kw = {"manufacturer_country_code": "tr", "country_resolution_status": "resolved"}
+    case = _split_product(db_session, lost_kw=lost_kw, live_kw=live_kw)
+    if obstacle == "two_live_rows":
+        _product(
+            db_session,
+            "aptekonline",
+            "Kreon  25000  N20",
+            external_id="another-listing",
+            canonical_id=case.left.id,
+        )
+    elif obstacle == "rejection":
+        match_actions.add_rejection(db_session, case.client.id, case.third.id, reason="operator")
+    elif obstacle == "manual_twin_cluster":
+        case.right.is_manual = True
+    elif obstacle == "rival_without_pair":
+        _product(db_session, "aloe", "Kreon 25000, 20 əd", external_id="rival", brand="Abbot")
+        match_actions.add_rejection(db_session, case.client.id, case.live.id, reason="operator")
+        rival = db_session.query(storage.Product).filter_by(external_id="rival").one()
+        match_actions.add_rejection(db_session, case.client.id, rival.id, reason="operator")
+    db_session.commit()
+
+    with capture_logs() as events:
+        assert matcher.relink_stale_members(db_session, dry_run=True) == []
+
+    refusals = [e for e in events if e["event"] == "matcher_split_merge_refused"]
+    assert [(e["reason"], e["stale_id"]) for e in refusals] == [(reason, case.lost.id)]
