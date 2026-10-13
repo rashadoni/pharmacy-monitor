@@ -307,9 +307,12 @@ def test_autonomous_mode_accepts_padded_and_uppercased_transport(monkeypatch):
 
 
 def test_provenance_guards_still_reject_a_direct_ledger_row():
-    """Разрешив direct скрейпить, мы не разрешали ему писать в реестры.
+    """Разрешив direct скрейпить, мы не разрешали ему писать в реестры ручной сверки.
 
-    Эти гарды защищают необратимые записи и остаются decodo-only.
+    Перекодировка, смена адреса, разведение и нижняя граница каталога остаются
+    за ручной сверкой и её транспортами. С 2026-10-08 плановый сбор сам пишет
+    допуск двух простых классов — отдельной версией доказательства, не этой
+    (tests/test_pharmonline_scheduled_admission.py).
     """
     with pytest.raises(Exception):
         main_mod._require_pharmonline_public_api_reconciliation_proof(
