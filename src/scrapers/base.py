@@ -771,6 +771,8 @@ class BaseScraper(ABC):
         идёт только в конце прогона (`run_cmd`), и медленный/оборванный/зависший
         прогон (pharmonline DDP ~7ч) теряет ВСЁ собранное. Callback сохраняет каждую
         категорию сразу. Ошибка callback'а НЕ валит скрейп (логируется и идём дальше).
+        Следующую категорию получит тот же callback, поэтому после своего сбоя он
+        обязан остаться рабочим (`persist_results` недописанное откатывает сам).
         """
         requested_slugs = [slug for slug in category_slugs if slug is not None]
         result = ScrapeResult(site=self.site_name, items_expected=len(requested_slugs))

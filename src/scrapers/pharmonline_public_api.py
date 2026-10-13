@@ -171,6 +171,15 @@ def _env_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "required"}
 
 
+def configured_public_api_transport() -> str:
+    """Транспорт из окружения — то же значение, с которым стартует скрейпер.
+
+    Нужен и вне скрейпера: плановый сбор записывает в журнал допусков, каким
+    транспортом прочитан каталог.
+    """
+    return os.environ.get(_PUBLIC_API_TRANSPORT_ENV, _CRAWLBASE_TRANSPORT).strip().lower()
+
+
 def _decodo_backconnect_sticky_enabled() -> bool:
     """Read the opt-in recovery transport flag without silently falling back."""
     value = os.environ.get(_DECODO_BACKCONNECT_STICKY_ENV, "").strip().lower()
@@ -492,7 +501,7 @@ class PharmonlinePublicAPIScraper(BaseScraper):
     async def __aenter__(self) -> "PharmonlinePublicAPIScraper":  # type: ignore[override]
         if not _env_enabled("PHARMONLINE_PUBLIC_API"):
             raise SiteScrapeFatalError("Pharmonline public API mode is not explicitly enabled")
-        transport = os.environ.get(_PUBLIC_API_TRANSPORT_ENV, _CRAWLBASE_TRANSPORT).strip().lower()
+        transport = configured_public_api_transport()
         if transport not in {
             _CRAWLBASE_TRANSPORT,
             _DECODO_TRANSPORT,

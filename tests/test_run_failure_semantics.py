@@ -186,11 +186,31 @@ def test_revalidation_failure_marks_run_and_request_failed_before_outputs(db_ses
 def test_public_api_recovery_refuses_persistence_after_identity_proof_failure(
     db_session, monkeypatch
 ):
-    """A complete source still cannot write an untrusted ID→URL mapping."""
+    """A complete source still cannot write an untrusted ID→URL mapping.
+
+    С 2026-10-08 товар, которого в базе нет вовсе, плановый сбор допускает сам
+    (tests/test_pharmonline_scheduled_admission.py). Недоверенной остаётся
+    пара, которая противоречит базе: известный идентификатор по другому адресу.
+    Такой каталог по-прежнему не пишется целиком.
+    """
+    from src.normalize import normalize_name
     from src.scrapers.pharmonline_public_api import (
         PUBLIC_API_AVAILABILITY_SOURCE,
         PUBLIC_CATALOG_ROUTE,
     )
+
+    db_session.add(
+        storage.Product(
+            tenant_id=1,
+            site="pharmonline",
+            external_id="xwJspdCx3iFBDqDWF",
+            url="https://pharmonline.az/product/trusted-product",
+            name="Trusted DDP product",
+            name_normalized=normalize_name("Trusted DDP product"),
+            availability_source="pharmonline_ddp_total_count",
+        )
+    )
+    db_session.commit()
 
     async def untrusted_catalog(*args, **kwargs):
         return [
@@ -266,7 +286,10 @@ def test_public_api_recovery_refuses_persistence_after_identity_proof_failure(
             "public_api_identity_proof_failed:"
         )
         assert "PharmonlinePublicAPIIdentityError" in (run.error_message or "")
-        assert verify.scalars(select(storage.Product)).all() == []
+        assert "mismatched_urls=1" in (run.error_message or "")
+        (stored,) = verify.scalars(select(storage.Product)).all()
+        assert stored.url == "https://pharmonline.az/product/trusted-product"
+        assert verify.scalars(select(storage.PharmonlinePublicAPIIdentityAdmission)).all() == []
         assert verify.scalars(select(storage.OfferObservation)).all() == []
         assert verify.scalars(select(storage.PriceSnapshot)).all() == []
     finally:
