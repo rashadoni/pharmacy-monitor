@@ -3166,3 +3166,32 @@ def test_the_sibling_is_judged_with_every_member_as_the_anchor(db_session):
 
     assert matcher.replace_price_strangers(db_session) == []
     assert _clusters(db_session) == before
+
+
+def test_a_sibling_that_costs_as_a_member_of_its_cluster_now_off_sale_is_at_home(db_session):
+    """Журнал цен спрашивается со всеми членами кластера соседа, не только с
+    теми, кто в продаже: сосед стоит, как товар, которого сейчас нет в наличии."""
+    case = _crossed_pairs(db_session)
+    case.client_lemon.name = "Septolete total limon və ağcaqayın № 16"
+    case.competitor_lemon.name = "Septolete Total limon, kəndalaş N16"
+    for row in (case.client_lemon, case.competitor_lemon):
+        row.name_normalized = normalize_name(row.name)
+    # Страна лимонного товара клиента подтверждена: со своей стороны его кластер
+    # соседа без страны не примет, и решает только кластер обычного товара.
+    _country(case.client_lemon, "si")
+    _priced(
+        db_session,
+        _product(
+            db_session,
+            "aloe",
+            "Septolete total 16 əd",
+            canonical_id=case.second.id,
+            status="out_of_stock",
+        ),
+        6.61,
+    )
+    db_session.commit()
+    before = _clusters(db_session)
+
+    assert matcher.replace_price_strangers(db_session) == []
+    assert _clusters(db_session) == before
