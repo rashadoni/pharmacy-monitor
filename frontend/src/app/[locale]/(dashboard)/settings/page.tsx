@@ -7,8 +7,16 @@ import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, Messa
 import { useState } from "react";
 import { api, type NotifPrefs } from "@/lib/api";
 import { LocaleSwitcher } from "@/components/locale-switcher";
+import { passwordProblem, type PasswordProblem } from "@/lib/password-rule";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
+
+// Причина, по которой пароль задать нельзя, → ключ текста в `settings`.
+const PASSWORD_PROBLEM_TEXT = {
+  password_not_text: "password_unusable",
+  password_too_short: "password_too_short",
+  password_too_long: "password_too_long",
+} as const satisfies Record<PasswordProblem, string>;
 
 export default function SettingsPage() {
   const router = useRouter();
@@ -110,8 +118,9 @@ function ChangePasswordSection() {
   });
 
   const mismatch = next1 && next2 && next1 !== next2;
-  const tooShort = next1 && next1.length < 6;
-  const canSubmit = curr && next1 && next2 && next1 === next2 && next1.length >= 6;
+  // То же правило, что на сервере: кнопка не шлёт пароль, который он не примет.
+  const problem = next1 ? passwordProblem(next1) : null;
+  const canSubmit = curr && next1 && next2 && next1 === next2 && !problem;
 
   return (
     <Section title={t("change_password")} icon={Key}>
@@ -135,7 +144,9 @@ function ChangePasswordSection() {
             autoComplete="new-password"
             className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
           />
-          {tooShort && <span className="text-xs text-destructive">{t("password_too_short")}</span>}
+          {problem && (
+            <span className="text-xs text-destructive">{t(PASSWORD_PROBLEM_TEXT[problem])}</span>
+          )}
         </label>
         <label className="block">
           <span className="text-xs font-medium block mb-1">{t("new_password_repeat")}</span>

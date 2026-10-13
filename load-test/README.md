@@ -6,7 +6,7 @@ k6-based load tests for Pharmacy Monitor API.
 
 - Single binary, no Python deps
 - Native JS scripting (matches frontend's TS code style)
-- Built-in thresholds → CI fails on regression
+- Built-in thresholds → non-zero exit code on regression (usable as a CI gate)
 - HTML report + Grafana integration available out-of-box
 
 ## Install
@@ -46,7 +46,7 @@ PHARMACY_API_KEY=test-key \
 k6 run load-test/api.k6.js
 ```
 
-## Acceptance criteria (CI thresholds)
+## Acceptance criteria (k6 thresholds)
 
 | Metric | Threshold |
 |---|---|
@@ -55,7 +55,10 @@ k6 run load-test/api.k6.js
 | Error rate (4xx + 5xx, excluding 401) | < 1% |
 | Successful checks | > 99% |
 
-If thresholds violated → exit code 99 → CI step fails.
+If thresholds violated → exit code 99.
+
+CI does not run these tests: no workflow in `.github/workflows/` calls k6. They
+are run by hand, and a green CI says nothing about the thresholds above.
 
 ## Capacity model
 

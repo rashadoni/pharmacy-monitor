@@ -15,7 +15,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import click
+import pytest
 from click.testing import CliRunner
+from structlog.testing import capture_logs
 
 from src import main as main_mod
 from src import roi, storage, watchlist
@@ -973,6 +975,57 @@ def test_auto_match_watchlist_creates_match_and_links_products(db_session):
     match = db_session.get(storage.Match, p1.canonical_id)
     assert match.is_manual is True
     assert match.canonical_name == "Friso Gold 800g"
+
+
+def _aloe_numbered(db_session, number: str, slug: str) -> storage.Product:
+    """Товар aloe, как его пишет сбор: идентификатор — номер, адрес — с номером."""
+    product = storage.Product(
+        site="aloe",
+        external_id=number,
+        url=f"https://aloe.az/{number}/#{slug}",
+        name=f"Aloe {number}",
+        name_normalized=f"aloe {number}",
+    )
+    db_session.add(product)
+    db_session.commit()
+    return product
+
+
+@pytest.mark.parametrize(
+    "pinned",
+    ["https://aloe.az/friso-gold-800-q/", "https://aloe.az/20001/", "https://aloe.az/ru/20001"],
+)
+def test_auto_match_watchlist_finds_aloe_product_by_pinned_address(db_session, pinned):
+    """Закрепляют адрес со слагом, как его показывает сайт; в строке — адрес с номером."""
+    watchlist.add_tracked_product(db_session, canonical_name="Friso Gold 800g", aloe_url=pinned)
+    product = _aloe_numbered(db_session, "20001", "friso-gold-800-q")
+    _aloe_numbered(db_session, "20002", "friso-gold-400-q")
+
+    assert main_mod.auto_match_watchlist(db_session) == 1
+
+    db_session.refresh(product)
+    assert db_session.get(storage.Match, product.canonical_id).canonical_name == "Friso Gold 800g"
+
+
+def test_auto_match_watchlist_does_not_pick_one_of_several_aloe_products(db_session):
+    """Один слаг у двух товаров: какой из них закреплён, адрес со слагом не говорит."""
+    watchlist.add_tracked_product(
+        db_session, canonical_name="Ceftriaxone", aloe_url="https://aloe.az/ceftriaxone-1-q/"
+    )
+    first = _aloe_numbered(db_session, "12058", "ceftriaxone-1-q")
+    second = _aloe_numbered(db_session, "12224", "ceftriaxone-1-q")
+
+    with capture_logs() as logs:
+        assert main_mod.auto_match_watchlist(db_session) == 0
+
+    db_session.refresh(first)
+    db_session.refresh(second)
+    assert first.canonical_id is None and second.canonical_id is None
+    assert [
+        entry["products"]
+        for entry in logs
+        if entry["event"] == "watchlist_aloe_address_names_several_products"
+    ] == [["12058", "12224"]]
 
 
 def test_auto_match_watchlist_idempotent(db_session):

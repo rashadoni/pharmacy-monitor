@@ -10,9 +10,10 @@ Auth моделей две:
        Один shared key через PHARMACY_API_KEY в .env. Используется в legacy
        endpoints `/api/v1/products`, `/api/v1/comparisons`, `/api/v1/inventory/*`.
     2. **JWT cookie** — для frontend dashboard. Magic-link flow:
-       `POST /auth/request` → email с magic_token → `GET /auth/verify?token=...`
-       устанавливает httpOnly cookie с JWT. Endpoints `/api/v1/dash/*` требуют
-       этот cookie и фильтруют по tenant_id.
+       `POST /auth/request` → email со ссылкой, токен в ней после «#» →
+       страница `GET /auth/link` шлёт его телом `POST /auth/verify` → httpOnly
+       cookie с JWT. Endpoints `/api/v1/dash/*` требуют этот cookie и фильтруют
+       по tenant_id.
 
 Endpoints (v1):
     Public:
@@ -20,7 +21,11 @@ Endpoints (v1):
 
     Auth (no auth required, public):
         POST /auth/request                 — request magic-link by email
-        GET  /auth/verify?token=...        — verify token, set JWT cookie
+        GET  /auth/link                    — страница входа по ссылке из письма
+        GET  /auth/link/password           — страница ссылки на создание пароля
+        POST /auth/verify {token}          — verify token, set JWT cookie
+        GET  /auth/verify?token=...        — то же, токен в адресе: письма так
+                                             не ходят, остался для скриптов
         POST /auth/logout                  — clear cookie
 
     Frontend (JWT cookie required):
@@ -106,11 +111,20 @@ except ImportError:
 from src.observability import (
     init_observability,
     install_metrics_endpoint,
+    sentry_is_running,
     sentry_set_request_id,
     sentry_set_tenant,
 )
 
 init_observability(service="api")
+
+# Журнал доступа uvicorn пишет адрес запроса целиком, а в нём — токен входа из
+# письма (`/auth/verify?token=…`). Строка запроса из журнала убирается здесь,
+# при импорте приложения: так фильтр стоит в каждом рабочем процессе раньше
+# первого запроса. Почему не флагом в юните — src/access_log.py.
+from src.access_log import hide_query_strings
+
+hide_query_strings()
 
 
 # ─── App ─────────────────────────────────────────────────────────────────────
@@ -328,7 +342,12 @@ def require_api_key(
         client_ip = request.client.host if request.client else "unknown"
         _check_rate_limit(f"failed:{client_ip}", limit=10)
         raise HTTPException(status_code=401, detail="Invalid X-API-Key")
-    _check_rate_limit(f"ok:{x_api_key[:8]}")
+    # Имя счётчика — без ключа и без его следа. Имя становится ключом Redis, а
+    # Sentry записывает команды Redis в трассу запроса: раньше здесь стояли
+    # первые восемь знаков ключа. Сюда доходит только один, настроенный ключ,
+    # поэтому счётчик один — хеш ключа дал бы тому, кто читает Sentry или Redis,
+    # способ проверять догадки о ключе.
+    _check_rate_limit("ok:api-key")
 
 
 # ─── Auth: JWT cookie (frontend dashboard) ───────────────────────────────────
@@ -947,10 +966,16 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     должно падать из-за временной проблемы с почтой (fail-open).
 
     Цель ссылки выбирается по тому, есть ли у пользователя свой пароль:
-    - нет пароля (`password_hash` пуст) → `/set-password` — юзер задаёт пароль и
-      сразу входит. Дальше логинится по email+паролю в любой момент.
-    - есть пароль → `/auth/verify` — magic-link просто логинит (passwordless вход).
+    - нет пароля (`password_hash` пуст) → `/auth/link/password` — оттуда на форму
+      `/set-password`: юзер задаёт пароль и сразу входит. Дальше логинится по
+      email+паролю в любой момент.
+    - есть пароль → `/auth/link` — magic-link просто логинит.
     `invite=True` — приветственная формулировка письма (новый пользователь).
+
+    Токен стоит в ссылке после «#»: эту часть адреса браузер серверу не
+    отправляет. Обе страницы отдаёт API, а не фронтенд, — почему, сказано в
+    `src/login_link_pages.py`. В строку запроса («?token=…») и в адрес страницы
+    фронтенда токен не ставить: адрес и заголовки запроса пишет журнал прокси.
     """
     email = email.strip().lower()
     user = db.scalar(
@@ -967,7 +992,7 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     needs_password = not user.password_hash
     public_url = os.environ.get("PHARMACY_PUBLIC_URL", "http://localhost:3000")
     if needs_password:
-        link = f"{public_url}/set-password?token={token}"
+        link = f"{public_url}/auth/link/password#token={token}"
         welcome = (
             "<p>Sizə Pharmacy Monitor monitorinq paneli üçün giriş açıldı.</p>"
             "<p>Вам открыт доступ к панели Pharmacy Monitor.</p>"
@@ -981,7 +1006,7 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
             "<p>Задайте пароль для входа (ссылка действует 30 минут):</p>"
         )
     else:
-        link = f"{public_url}/auth/verify?token={token}"
+        link = f"{public_url}/auth/link#token={token}"
         subject = "Pharmacy Monitor — giriş keçidi / ссылка для входа"
         intro = (
             "<p>Daxil olmaq üçün keçid (30 dəqiqə qüvvədədir):</p>"
@@ -1001,7 +1026,9 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
             to=[email],
         )
     except Exception as e:
-        log.warning("login_link_email_failed", error=str(e), email=email)
+        from src.notifier import delivery_error_fields
+
+        log.warning("login_link_email_failed", user_id=user.id, **delivery_error_fields(e))
     return True
 
 
@@ -1016,22 +1043,91 @@ def auth_request(payload: AuthRequestIn, request: Request, db: Session = Depends
     return AuthRequestOut(sent=True, detail="If the email is registered, a magic-link was sent.")
 
 
-@app.get("/auth/verify")
+from fastapi.responses import HTMLResponse
+
+from src import login_link_pages
+
+
+def _login_link_page(html: str) -> HTMLResponse:
+    # Страница одна на всех и токена не содержит; не кэшировать — чтобы после
+    # выкладки браузер не исполнил прежний сценарий.
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/auth/link", include_in_schema=False)
+def auth_link_sign_in_page() -> HTMLResponse:
+    """Куда ведёт ссылка на вход: страница шлёт токен в `POST /auth/verify`."""
+    return _login_link_page(login_link_pages.SIGN_IN_PAGE)
+
+
+@app.get("/auth/link/password", include_in_schema=False)
+def auth_link_set_password_page() -> HTMLResponse:
+    """Куда ведёт ссылка на создание пароля: дальше — форма `/set-password`."""
+    return _login_link_page(login_link_pages.SET_PASSWORD_PAGE)
+
+
+class LinkTokenIn(BaseModel):
+    """Токен из ссылки в письме — телом запроса, не адресом."""
+
+    token: str
+
+    @field_validator("token")
+    @classmethod
+    def _strip_token(cls, v: str) -> str:
+        v = v.strip()
+        if not v or len(v) > 512:
+            raise ValueError("invalid token")
+        return v
+
+
+@app.post("/auth/verify")
+def auth_verify_posted(
+    payload: LinkTokenIn, request: Request, response: Response, db: Session = Depends(get_db)
+):
+    """Вход по ссылке из письма: токен приходит телом запроса.
+
+    Так ходит страница `/auth/link`: ссылка несёт токен после «#», страница
+    читает его и шлёт сюда. Тело запроса журналы прокси и API не пишут, адрес
+    и заголовки — пишут. Проверка, гашение и cookie — те же, что у GET ниже:
+    правило входа одно, меняется только способ доставки токена.
+    """
+    return auth_verify(payload.token, request, response, db)
+
+
+@app.get("/auth/verify", deprecated=True)
 def auth_verify(token: str, request: Request, response: Response, db: Session = Depends(get_db)):
     """Verify magic token, set JWT cookie.
 
-    Этот эндпоинт кликают прямо из письма, поэтому для браузера (Accept:
-    text/html) после установки cookie делаем 303-redirect на дашборд — иначе
-    пользователь видел бы сырой JSON. Программные/XHR-вызовы (Accept */*)
-    получают прежний JSON-контракт.
+    Токен здесь стоит в адресе запроса, а адрес пишут журналы прокси и API.
+    Письма сюда больше не ведут (см. `_send_login_link` и POST выше); адресом
+    входят тесты, e2e и нагрузочный скрипт. Новой ссылке сюда не место.
+
+    Для браузера (Accept: text/html) после установки cookie делаем 303-redirect
+    на дашборд — иначе пользователь видел бы сырой JSON. Программные/XHR-вызовы
+    (Accept */*) получают JSON-контракт.
     """
     wants_html = _wants_html(request)
-    user = tenants.verify_magic_token(db, token)
+    # Счётчик попыток с адреса — такой же, какой первым стоит у
+    # `/auth/set-password`, — и один на оба способа прислать токен (POST выше
+    # зовёт этот же обработчик). Стоит до проверки: отказ 429 до базы не доходит
+    # и ссылку не трогает. В имени — адрес клиента; токену и его хешу там не
+    # место: имя становится ключом Redis, а команды Redis Sentry пишет в трассу
+    # запроса.
+    #
+    # Второго счётчика — по отказам, как `setpw_fail` и `login_fail`, — здесь нет
+    # намеренно. Он срабатывает уже после запроса к базе и ничего не ограничивает,
+    # а ответ меняет: по ссылке, которая просто не годится, страница входа
+    # просила бы подождать минуту вместо того, чтобы назвать ссылку негодной.
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(f"verify:{client_ip}", limit=10)
+    user = tenants.redeem_magic_token(db, token)
     if not user:
         if wants_html:
             return RedirectResponse(url="/login?error=link", status_code=303)
         raise HTTPException(401, "Invalid or expired token")
     jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
+    # Ссылка гаснет, когда сессия уже готова: сбой до этой строки её не сжигает.
+    db.commit()
     secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")
     if wants_html:
         redirect = RedirectResponse(url="/overview", status_code=303)
@@ -1055,8 +1151,81 @@ def auth_verify(token: str, request: Request, response: Response, db: Session = 
     return {"ok": True, "user_id": user.id}
 
 
+# bcrypt берёт от пароля 72 байта. bcrypt 5 на более длинном бросает ValueError —
+# и на записи, и на сверке; версии до неё молча отбрасывали хвост.
+PASSWORD_MAX_BYTES = 72
+PASSWORD_MIN_CHARS = 6
+
+_PASSWORD_PROBLEMS = {
+    "password_not_text": "В пароле есть знак, который нельзя сохранить — наберите пароль заново",
+    "password_too_short": f"Пароль должен быть минимум {PASSWORD_MIN_CHARS} символов",
+    "password_too_long": (
+        f"Пароль слишком длинный: помещается {PASSWORD_MAX_BYTES} латинских знака, "
+        "кириллические и буквы вроде ə, ö, ş занимают по два"
+    ),
+}
+
+
+def _password_problem(password: str) -> str | None:
+    """Почему строку нельзя задать паролем — код причины; можно — None.
+
+    Длина сверху считается в байтах UTF-8, как её считает bcrypt: 73 латинских
+    знака и 37 кириллических не помещаются одинаково. Снизу — в знаках.
+    """
+    try:
+        size = len(password.encode("utf-8"))
+    except UnicodeEncodeError:
+        # Одиночный суррогат: в JSON такая строка допустима, в UTF-8 — нет.
+        return "password_not_text"
+    if "\x00" in password:
+        # Нулевой байт bcrypt берёт за конец пароля и дальше идёт по кругу:
+        # «abc\0abc» сверился бы с «abc» — в обход нижней границы.
+        return "password_not_text"
+    if len(password) < PASSWORD_MIN_CHARS:
+        return "password_too_short"
+    if size > PASSWORD_MAX_BYTES:
+        return "password_too_long"
+    return None
+
+
+def _usable_new_password(raw: str, *, field: str = "new_password") -> str:
+    """Новый пароль в том виде, в каком его потом сверит вход, — или отказ 422.
+
+    Зовётся до любой записи. Пробелы по краям отбрасываются: вход отбрасывает их
+    тоже (`PasswordLoginIn`), и пароль, сохранённый с ними, не вошёл бы никогда.
+
+    Ответ — как у проверки полей FastAPI (`type`, `loc`, `msg`), по `type`
+    интерфейс подбирает текст на своём языке. Правило не стоит валидатором
+    модели намеренно: тот возвращает в ответе присланное значение — пароль, — а
+    на одиночном суррогате ответ не собирается вовсе, выходит 500.
+    """
+    password = raw.strip()
+    problem = _password_problem(password)
+    if problem:
+        raise HTTPException(
+            422,
+            detail=[{"type": problem, "loc": ["body", field], "msg": _PASSWORD_PROBLEMS[problem]}],
+        )
+    return password
+
+
+def _bcrypt_takes(password: str) -> bool:
+    """Возьмёт ли bcrypt строку вообще: она кодируется и не длиннее 72 байт."""
+    try:
+        return len(password.encode("utf-8")) <= PASSWORD_MAX_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
 def _verify_bcrypt(password: str, hash_str: str) -> bool:
-    """Verify bcrypt password. Used by auth.login и change-password."""
+    """Verify bcrypt password. Used by auth.login и change-password.
+
+    Строка, которую bcrypt не берёт, не совпадает ни с одним хешем: это отказ,
+    а не ошибка сервера. Остальное правило нового пароля сверка не знает — хеш
+    мог прийти из `ADMIN_PASSWORD_HASH`, где его никто не проверял.
+    """
+    if not _bcrypt_takes(password):
+        return False
     try:
         import bcrypt
 
@@ -1065,6 +1234,20 @@ def _verify_bcrypt(password: str, hash_str: str) -> bool:
         from passlib.hash import bcrypt as bcrypt_pl
 
         return bcrypt_pl.verify(password, hash_str)
+
+
+def _is_current_password(typed: str, hash_str: str) -> bool:
+    """Тот ли это пароль, которым пользователь входит.
+
+    Сверяется как набран, а если не сошлось — без пробелов по краям: вход их
+    отбрасывает, и новый пароль с ними не сохраняется. Набранное как есть идёт
+    первым ради пароля, сохранённого с пробелами прежним кодом: войти таким
+    нельзя, сменить можно только так.
+    """
+    if _verify_bcrypt(typed, hash_str):
+        return True
+    stripped = typed.strip()
+    return stripped != typed and _verify_bcrypt(stripped, hash_str)
 
 
 def _hash_bcrypt(password: str) -> str:
@@ -1164,6 +1347,7 @@ class SetPasswordIn(BaseModel):
     """Задать пароль по magic-token из письма-приглашения."""
 
     token: str
+    # Правило пароля проверяет обработчик (`_usable_new_password`), не модель.
     new_password: str
 
     @field_validator("token")
@@ -1172,15 +1356,6 @@ class SetPasswordIn(BaseModel):
         v = v.strip()
         if not v or len(v) > 512:
             raise ValueError("invalid token")
-        return v
-
-    @field_validator("new_password")
-    @classmethod
-    def _check_password(cls, v: str) -> str:
-        if len(v) < 6:
-            raise ValueError("Пароль должен быть минимум 6 символов")
-        if len(v) > 200:
-            raise ValueError("too long")
         return v
 
 
@@ -1193,11 +1368,18 @@ def auth_set_password(
     Проверяет token (одноразовый, TTL 30 мин), сохраняет bcrypt(new_password) в
     user.password_hash и сразу логинит (ставит JWT cookie). Дальше пользователь
     входит по email+паролю через /auth/login. Невалидный/просроченный token → 401.
+    Пароль, который задать нельзя, → 422, и ссылка остаётся годной.
     """
+    # До токена: отказ по паролю ссылку не трогает.
+    new_password = _usable_new_password(payload.new_password)
+
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(f"setpw:{client_ip}", limit=10)
 
-    user = tenants.verify_magic_token(db, payload.token)
+    # Гашение ссылки и запись пароля — одна транзакция. До commit ниже любой
+    # сбой (bcrypt, сессия, база) откатывает и то, и другое: ссылка остаётся
+    # годной, а не сгорает без пароля.
+    user = tenants.redeem_magic_token(db, payload.token)
     if not user:
         _check_rate_limit(f"setpw_fail:{client_ip}", limit=5)
         raise HTTPException(401, "Ссылка недействительна или истекла")
@@ -1206,12 +1388,14 @@ def auth_set_password(
     # У юзера с паролем magic-link ведёт на /auth/verify (вход), а не сюда; иначе
     # перезапись пароля по перехваченной login-ссылке = persistent takeover.
     if user.password_hash:
+        # Это отказ, а не сбой: ссылка предъявлена и гаснет, как и раньше.
+        db.commit()
         raise HTTPException(400, "Пароль уже задан — войдите по email и паролю")
 
-    user.password_hash = _hash_bcrypt(payload.new_password)
+    user.password_hash = _hash_bcrypt(new_password)
+    jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
     db.commit()
 
-    jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
     secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")
     response.set_cookie(
         key=COOKIE_NAME,
@@ -1258,17 +1442,19 @@ def dash_change_password(
     На success — сохраняет bcrypt(new_password) в user.password_hash. С этого
     момента env ADMIN_PASSWORD_HASH перестаёт использоваться для этого user'а.
     """
-    if len(payload.new_password) < 6:
-        raise HTTPException(400, "Пароль должен быть минимум 6 символов")
-    if payload.current_password == payload.new_password:
-        raise HTTPException(400, "Новый пароль не должен совпадать с текущим")
+    new_password = _usable_new_password(payload.new_password)
 
     env_pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
     pw_to_check = user.password_hash or env_pw_hash
-    if not pw_to_check or not _verify_bcrypt(payload.current_password, pw_to_check):
+    if not pw_to_check or not _is_current_password(payload.current_password, pw_to_check):
         raise HTTPException(401, "Текущий пароль неверный")
+    # С тем, что хранится, а не с тем, что набрано в поле «текущий»: его могли
+    # набрать с пробелами по краям, а пароль, сохранённый с ними прежним кодом,
+    # меняют на тот же без них — и это уже другой пароль.
+    if _verify_bcrypt(new_password, pw_to_check):
+        raise HTTPException(400, "Новый пароль не должен совпадать с текущим")
 
-    user.password_hash = _hash_bcrypt(payload.new_password)
+    user.password_hash = _hash_bcrypt(new_password)
     db.commit()
     return {"ok": True}
 
@@ -1583,7 +1769,9 @@ def dash_integrations(user: storage.TenantUser = Depends(require_user)):
         "smtp_from": os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER") or None,
         "telegram": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
         "telegram_bot_username": os.environ.get("TELEGRAM_BOT_USERNAME") or None,
-        "sentry": bool(os.environ.get("SENTRY_DSN")),
+        # DSN в окружении ещё не значит, что Sentry работает: инициализация,
+        # которой SDK отказал, API не роняет.
+        "sentry": bool(os.environ.get("SENTRY_DSN")) and sentry_is_running(),
         "scraperapi": bool(os.environ.get("SCRAPER_API_KEY")),
         "scraperapi_sites": (os.environ.get("SCRAPER_API_SITES") or "").split(",")
         if os.environ.get("SCRAPER_API_SITES")
@@ -1889,7 +2077,6 @@ def dash_recipients_create(
     log.info(
         "recipient_created",
         id=new_user.id,
-        email=new_user.email,
         by_user_id=user.id,
         invite_sent=invite_sent,
     )
@@ -5095,10 +5282,35 @@ def _external_id_from_url(url: str) -> str:
     """Последний сегмент пути URL (без query/fragment) = external_id товара.
 
     Совпадает с тем, как скрейперы формируют external_id (pharmonline:
-    `_external_id_from_href`; aptekonline/aloe: url_id = слаг после /product/).
+    `_external_id_from_href`; aptekonline: url_id после /product/; aloe: номер
+    товара в адресе `https://aloe.az/{номер}/`).
     """
     path = (url or "").split("?")[0].split("#")[0].rstrip("/")
     return path.split("/")[-1].strip()
+
+
+def _aloe_product_at_address(db: Session, tenant_id: int, url: str) -> storage.Product | None:
+    """Товар aloe по адресу его страницы; на адрес нескольких товаров — отказ.
+
+    Адрес со слагом (его показывает сам сайт) товар не называет: один слаг
+    сайт даёт нескольким товарам. Какой из них нужен, знает только оператор.
+    """
+    from src import match_actions
+
+    found = match_actions.aloe_products_at_address(db, url, tenant_id=tenant_id)
+    if len(found) > 1:
+        # Строка, которую сбор ещё не перевёл на номер, номера не имеет.
+        numbers = ", ".join(
+            sorted((p.external_id for p in found if p.external_id.isdigit()), key=int)
+        )
+        raise HTTPException(
+            409,
+            "По этому адресу на aloe несколько разных товаров"
+            + (f" (номера {numbers})" if numbers else "")
+            + ". Вставьте адрес с номером нужного: https://aloe.az/<номер>/ — номер написан "
+            "на странице товара («Məhsul kodu»)",
+        )
+    return found[0] if found else None
 
 
 @app.post("/api/v1/dash/matches/{match_id}/relink")
@@ -5134,14 +5346,20 @@ def dash_match_relink(
     if not ext:
         raise HTTPException(400, "Не удалось разобрать ссылку")
 
-    prod = db.scalar(
-        select(storage.Product).where(
-            storage.Product.tenant_id == user.tenant_id,
-            storage.Product.site == site,
-            storage.Product.external_id == ext,
+    if site == "aloe":
+        # По подстроке адреса здесь искать нельзя: номер «1205» нашёлся бы
+        # внутри адреса товара 12058.
+        prod = _aloe_product_at_address(db, user.tenant_id, body.url)
+    else:
+        prod = db.scalar(
+            select(storage.Product).where(
+                storage.Product.tenant_id == user.tenant_id,
+                storage.Product.site == site,
+                storage.Product.external_id == ext,
+            )
         )
-    )
-    if prod is None:  # fallback: по подстроке URL (на случай иной формы external_id)
+    if prod is None and site != "aloe":
+        # fallback: по подстроке URL (на случай иной формы external_id)
         prod = db.scalar(
             select(storage.Product).where(
                 storage.Product.tenant_id == user.tenant_id,

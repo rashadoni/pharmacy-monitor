@@ -2,6 +2,14 @@
 
 12-week roadmap delivered. This is the master index of what's where.
 
+> ⚠️ Marked 2026-10-11. This overview is a snapshot taken when the 12-week
+> roadmap was delivered (May 2026). Its test counts, route counts, file lists
+> and the "frozen for v1.0" stack table describe that moment and were not
+> re-checked. Two lines were brought up to date on 2026-10-11: the "Hosting" row
+> of the stack table and item 4 of "Where to start". Current test numbers are in
+> the CI log (`docs/ARCHITECTURE.md`, section 6); the current server and what
+> runs on it — `CLAUDE.md`, "Current production state".
+
 ## Architecture (final)
 
 ```
@@ -78,7 +86,7 @@ infra/systemd/pharmacy-monitor-digest@weekly.timer W9
 infra/systemd/pharmacy-monitor-telegram-bot.service W9
 infra/grafana/dashboard.json                    W11
 infra/prometheus.yml                            W11
-.github/workflows/ci.yml                        W1
+.github/workflows/ci-pipeline.yml               W1
 .github/workflows/deploy.yml                    W1
 ```
 
@@ -169,7 +177,7 @@ load-test/api.k6.js + README   k6 scenarios + thresholds            W12
 | Errors | Sentry SDK | 2+ |
 | Metrics | prometheus-client | 0.21+ |
 | CI/CD | GitHub Actions → SSH deploy | — |
-| Hosting | Hetzner CX22 (4 vCPU, 8GB, ~6€/mo) | — |
+| Hosting | Contabo VPS — 4 vCPU, 8 GB RAM, 96 GB disk, Ubuntu 24.04 (since 2026-09-03; read from the server 2026-10-11). v1.0 ran on a Hetzner Cloud VM (this row said "Hetzner CX22 (4 vCPU, 8GB, ~6€/mo)"); that server was deleted in September 2026. The Contabo price is not recorded in the repository | — |
 | TLS / Proxy | Caddy | 2 |
 | Process | systemd | — |
 
@@ -178,7 +186,7 @@ load-test/api.k6.js + README   k6 scenarios + thresholds            W12
 1. **Check pre-flight**: `docs/SECURITY.md` and `docs/GO_LIVE.md`
 2. **Run tests**: `.venv/bin/pytest -q && cd frontend && pnpm test`
 3. **Local dev**: `docker compose up -d && uvicorn src.api:app --reload &  cd frontend && pnpm dev`
-4. **Production deploy**: `bash infra/scripts/initial_server_setup.sh` on Hetzner, then `bash infra/deploy.sh`
+4. **Production deploy**: once CI is green on the commit, start the `deploy.yml` workflow by hand — `gh workflow run deploy.yml --ref main -f apply_migrations=false`; details in `docs/RUNBOOK.md`, in the note that opens the section «Обновления / деплой нового кода». (This line used to say `bash infra/deploy.sh` on Hetzner: that server was deleted in September 2026, and the script was removed from the repository on 2026-10-11.)
 
 ## What's NOT done (out of scope for v1.0)
 
