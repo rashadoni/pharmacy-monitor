@@ -907,6 +907,51 @@ def test_site_data_is_old_only_past_what_its_rhythm_allows(setup, monkeypatch):
     assert ages["aloe"].collected_at is None and ages["aloe"].overdue is True
 
 
+def test_old_data_warning_follows_the_rhythm_map(setup, reader, monkeypatch):
+    """Ритм сбора меняют в одном месте — `cadence.SITE_SCRAPE_CADENCE_HOURS`. Те же
+    данные двухдневной давности при недельном ритме в порядке, при суточном — старые."""
+    s = setup
+    monkeypatch.setattr(notifications, "utcnow", lambda: MORNING)
+    run = _trusted_run(s, finished_at=MORNING - timedelta(days=2))
+    _pair(s, run, "Товар", {"pharmonline": 10.0, "aptekonline": 8.0})
+
+    def warned_sites() -> list[str]:
+        _sent, calls = _send_daily(s)
+        return re.findall(r"Данные (\w+) — от 11\.10\.2026", _text(calls[0].kwargs["html_body"]))
+
+    for site in SITES:
+        monkeypatch.setitem(cadence.SITE_SCRAPE_CADENCE_HOURS, site, 168)
+    assert warned_sites() == []
+
+    monkeypatch.setitem(cadence.SITE_SCRAPE_CADENCE_HOURS, "aloe", 24)
+    assert cadence.site_max_age_hours("aloe") == 24 + cadence.CADENCE_GRACE_HOURS
+    assert warned_sites() == ["Aloe"]
+
+    for site in SITES:
+        monkeypatch.setitem(cadence.SITE_SCRAPE_CADENCE_HOURS, site, 24)
+    assert warned_sites() == ["Pharmonline", "Aptekonline", "Aloe"]
+
+
+def test_one_missed_night_of_a_daily_rhythm_is_not_yet_old_data(setup, monkeypatch):
+    """При суточном ритме порог — 30 часов (сутки и запас). Письмо уходит в 05:00
+    UTC, ночной сбор кончается около 01:00: после одной пропущенной ночи данным
+    28 часов — строки-предупреждения ещё нет, дата в письме вчерашняя. После двух
+    ночей — есть."""
+    s = setup
+    tenants.get_or_create_default(s)
+    monkeypatch.setitem(cadence.SITE_SCRAPE_CADENCE_HOURS, "aloe", 24)
+    last_good_night = datetime(2026, 10, 12, 1, 0)
+    _trusted_run(s, sites=("aloe",), finished_at=last_good_night)
+    s.commit()
+
+    def aloe(letter_at: datetime):
+        return {age.site: age for age in notifications._site_data_ages(s, 1, letter_at)}["aloe"]
+
+    assert aloe(datetime(2026, 10, 12, 5, 0)).overdue is False  # сбор был этой ночью
+    assert aloe(datetime(2026, 10, 13, 5, 0)).overdue is False  # одну ночь пропустили: 28 ч
+    assert aloe(datetime(2026, 10, 14, 5, 0)).overdue is True  # две ночи: 52 ч
+
+
 def test_site_without_a_trusted_full_run_is_named_in_the_letter(setup, reader):
     s = setup
     run = _trusted_run(s, sites=("pharmonline", "aptekonline"))
