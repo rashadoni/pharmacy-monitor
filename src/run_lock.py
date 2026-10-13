@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import AsyncIterator, Iterator
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import Connection, text
 from sqlalchemy.orm import Session
 
 log = structlog.get_logger()
@@ -137,3 +137,45 @@ def try_shared_scrape_read_lock(session: Session) -> Iterator[bool]:
                 connection.rollback()
                 log.warning("scrape_read_lock_release_failed", error=str(exc))
         connection.close()
+
+
+# The pg_locks row of this very session for an exclusive advisory lock taken
+# with a single bigint key: the key's high half is `classid`, its low half is
+# `objid`, and `objsubid` is 1.
+_OWN_EXCLUSIVE_SESSION_LOCK = text(
+    """
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_locks AS held
+        WHERE held.locktype = 'advisory'
+          AND held.pid = pg_backend_pid()
+          AND held.granted
+          AND held.mode = 'ExclusiveLock'
+          AND held.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND held.objsubid = 1
+          AND held.classid::bigint = ((hashtext(:key)::bigint >> 32) & 4294967295)
+          AND held.objid::bigint = (hashtext(:key)::bigint & 4294967295)
+    )
+    """
+)
+
+
+def connection_holds_exclusive_scrape_lock(connection: Connection) -> bool:
+    """Ask the server whether this very connection still holds the producer lock.
+
+    A session-level advisory lock lives exactly as long as its server session.
+    When the server ends that session (a restart, crash recovery,
+    ``pg_terminate_backend``, ``idle_session_timeout``) the lock is free, and
+    nothing tells the holder: it does not touch the lock connection again until
+    it unlocks at exit.  SQLAlchemy would even reconnect such a ``Connection``
+    on its next statement, silently, to a session that holds nothing.  So the
+    question is not "does the connection answer" but "does ``pg_locks`` list
+    the lock for ``pg_backend_pid()``": a reconnected connection answers False.
+
+    A dead connection raises whatever the driver raises; the caller must read
+    that as "not held".  The implicit transaction is ended at once, so the lock
+    connection is never left ``idle in transaction``.
+    """
+    held = bool(connection.scalar(_OWN_EXCLUSIVE_SESSION_LOCK, {"key": SCRAPE_ADVISORY_LOCK_KEY}))
+    connection.commit()
+    return held

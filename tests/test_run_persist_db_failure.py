@@ -43,6 +43,7 @@ from uuid import uuid4
 import pytest
 from click.testing import CliRunner
 from sqlalchemy import create_engine, event, select, text
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -123,6 +124,18 @@ def db_session(request, monkeypatch):
         admin.dispose()
 
 
+@pytest.fixture(autouse=True)
+def outcome_write_never_waits(monkeypatch):
+    """Запись итога ждёт только сервер, который недоступен. Здесь база отказывает
+    в самой записи — ждать нечего, и пауза (до минуты) значила бы, что отказ
+    принят за недоступность. Проверяется после теста: исключение отсюда запись
+    итога проглотила бы сама."""
+    waited: list[float] = []
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", waited.append)
+    yield
+    assert waited == [], f"запись итога ждала сервер: {waited} с"
+
+
 def _is_postgresql(db_session) -> bool:
     return db_session.get_bind().dialect.name == "postgresql"
 
@@ -201,12 +214,14 @@ def _run_catalog(
     expected_status: str = "ok",
     command_line: tuple[str, ...] = ("run", "--mode", "category"),
     revalidate_split=lambda session: [],
+    smoke_test=lambda *args: None,
 ):
     """Команда сбора над сайтом из `catalog`; возвращает (прогон, итог команды).
 
     Подменены сам сайт и шаги после записи; запись сбора и обработчики сбоя —
     настоящие. `revalidate_split` — чем заменить перепроверку пар (шаг под
-    замком сопоставления).
+    замком сопоставления), `smoke_test` — проверку покрытия сайта (шаг сразу
+    после финального прохода).
     """
     scraper = type(
         "_Site",
@@ -229,7 +244,7 @@ def _run_catalog(
     )
     monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *args: {site: 1})
     monkeypatch.setattr(main_mod, "load_aloe_country_map", lambda *args: {})
-    monkeypatch.setattr(main_mod, "_smoke_test_per_site_coverage", lambda *args: None)
+    monkeypatch.setattr(main_mod, "_smoke_test_per_site_coverage", smoke_test)
     monkeypatch.setattr(main_mod.matcher, "refresh_derived_fields", lambda session: 0)
     monkeypatch.setattr(main_mod.matcher, "relink_stale_members", lambda session: 0)
     monkeypatch.setattr(main_mod.matcher, "replace_price_strangers", lambda session: 0)
@@ -461,7 +476,8 @@ def test_connection_lost_midway_costs_one_category_write_not_the_run(db_session,
     соединение, финальный проход дописывает `cat-b`.
 
     Перезапуск PostgreSQL рвёт все соединения разом, включая то, на котором
-    лежит замок сбора (здесь он подменён): этого тест не изображает.
+    лежит замок сбора (здесь он подменён): такой сбор останавливается, это
+    проверяет `tests/test_scrape_lock_lost.py` — на настоящем замке.
     """
     if not _is_postgresql(db_session):
         pytest.skip("обрыв соединения сервером — только PostgreSQL")
@@ -767,6 +783,48 @@ def test_only_fields_changed_since_the_last_write_are_carried(db_session):
     assert main_mod._unsaved_column_values(run) == {"catalog_verification_reason": "why"}
 
 
+@pytest.mark.parametrize(
+    "url", ["sqlite:///:memory:", "postgresql+psycopg://nobody@127.0.0.1:1/nowhere"]
+)
+def test_application_sessions_do_not_autoflush(url, monkeypatch):
+    """Перенос полей прогона через откат читает историю изменений атрибута, а
+    она живёт до первого flush. Поэтому сессии приложения — обе ветки
+    `storage.make_session` — обязаны быть без autoflush: с ним поле молча
+    пропадало бы (тест ниже), а тесты этого файла, которые строят свои фабрики
+    с тем же флагом, остались бы зелёными."""
+    monkeypatch.setattr(storage, "_SESSION_FACTORY_CACHE", {})
+
+    factory = storage.make_session(url)
+
+    try:
+        assert factory.kw["bind"].dialect.name == url.split(":")[0].split("+")[0]
+        assert factory.kw["autoflush"] is False
+        with factory() as session:
+            assert session.autoflush is False
+    finally:
+        factory.kw["bind"].dispose()
+
+
+def test_field_already_sent_by_autoflush_would_not_be_carried(db_session):
+    """Почему autoflush закреплён выключенным: с ним первый же запрос после
+    присвоения сам отправляет поле в базу. Истории у атрибута больше нет,
+    переносить помощнику нечего, а откат поле стирает."""
+    run = _new_run(db_session)
+    flushing = sessionmaker(db_session.get_bind(), expire_on_commit=False, autoflush=True)
+    with flushing() as session:
+        same_run = session.get(storage.Run, run.id)
+        same_run.catalog_verification_reason = "set right before the failure"
+        assert main_mod._unsaved_column_values(same_run) == {
+            "catalog_verification_reason": "set right before the failure"
+        }
+
+        session.scalar(select(storage.Run.id))  # любой запрос сессии
+
+        assert main_mod._unsaved_column_values(same_run) == {}
+        session.rollback()
+        assert same_run.catalog_verification_reason is None
+
+
 def _unwritable_field_then_broken_in_code(session, run):
     run.catalog_verification_reason = "set next to a field the database refuses"
     run.tenant_id = None  # NOT NULL
@@ -804,6 +862,50 @@ def test_carried_field_the_database_refuses_does_not_cost_the_outcome(
         ] == [["catalog_verification_reason", "tenant_id"]]
 
 
+def test_outcome_alone_is_still_written_when_waiting_did_not_help(db_session, monkeypatch):
+    """Отказ, который выглядит недоступностью сервера, а вызван полем,
+    выставленным на прогоне перед сбоем: сколько ни жди, запись с этим полем не
+    пройдёт. Когда паузы вышли, итог пишется один — как после любого отказа в
+    записи; без этого прогон оставался бы `running`."""
+    run = storage.Run(status="running", started_at=utcnow())
+    db_session.add(run)
+    db_session.commit()
+    run_id = run.id
+    run.catalog_verification_reason = "a value the server chokes on"
+    engine = db_session.get_bind()
+
+    def chokes_on_the_field(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE") and (
+            "catalog_verification_reason" in statement
+        ):
+            raise sa_exc.OperationalError(statement, {}, Exception("program limit exceeded"))
+
+    waited: list[float] = []
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", waited.append)
+    warned = _record_log(monkeypatch, main_mod, "warning")
+
+    def record_failure():
+        run.status = "failed"
+        run.error_message = "ValueError: boom"
+        run.finished_at = utcnow()
+
+    event.listen(engine, "before_cursor_execute", chokes_on_the_field)
+    try:
+        main_mod._write_failed_run_outcome(db_session, run, run_id, record_failure)
+    finally:
+        event.remove(engine, "before_cursor_execute", chokes_on_the_field)
+
+    db_session.rollback()
+    db_session.expire_all()
+    stored = db_session.get(storage.Run, run_id)
+    assert waited == list(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE), "сначала ждали сервер"
+    assert (stored.status, stored.error_message) == ("failed", "ValueError: boom")
+    assert stored.catalog_verification_reason is None
+    assert [
+        fields["dropped_fields"] for name, fields in warned if name == "run_failure_write_retried"
+    ] == [["catalog_verification_reason"]]
+
+
 def _half_done_then_broken_in_code(session, run):
     session.add(
         storage.Product(
@@ -821,10 +923,12 @@ def _half_done_then_broken_in_code(session, run):
 def test_unfinished_work_of_a_failed_step_is_not_saved_with_the_outcome(db_session, monkeypatch):
     """Шаг упал в коде, успев отправить в базу половину своей работы. Раньше
     commit итога сохранял эту половину вместе с `failed`; теперь итог пишется на
-    чистой транзакции."""
+    чистой транзакции. Итог записан — и строки о том, что он не записан, в
+    журнале нет."""
     monkeypatch.setattr(
         storage, "confirm_prices_of_latest_verified_runs", _half_done_then_broken_in_code
     )
+    logged = _record_log(monkeypatch, main_mod, "exception")
     catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
 
     run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
@@ -833,6 +937,39 @@ def test_unfinished_work_of_a_failed_step_is_not_saved_with_the_outcome(db_sessi
     assert run.error_message == "ValueError: step broke halfway"
     assert run.products_scraped == 1, "сохранённое до шага остаётся"
     assert _external_ids(db_session) == ["a"]
+    assert [name for name, _ in logged] == ["run_failed"]
+
+
+@pytest.mark.parametrize("log_stream", ["alive", "dead"])
+def test_outcome_does_not_depend_on_reading_the_unsaved_fields(db_session, monkeypatch, log_stream):
+    """Несохранённые поля прогона снять не удалось. Переносить тогда нечего — и
+    только: недоделанное шагом всё равно откатывается, а итог пишется. Раньше
+    сбой здесь обходил и откат, и запись итога, и прогон оставался `running`.
+    Строка журнала об этом может упасть сама (вывод оборван) — тоже не помеха."""
+
+    def unreadable(instance):
+        raise RuntimeError("attribute history is unavailable")
+
+    monkeypatch.setattr(main_mod, "_unsaved_column_values", unreadable)
+    monkeypatch.setattr(
+        storage, "confirm_prices_of_latest_verified_runs", _half_done_then_broken_in_code
+    )
+    warned: list[tuple[str, dict]] = []
+    if log_stream == "alive":
+        warned = _record_log(monkeypatch, main_mod, "warning")
+    else:
+        _dead_log_stream(monkeypatch, "warning")
+    catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
+
+    run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
+
+    assert run.finished_at is not None
+    assert run.error_message == "ValueError: step broke halfway"
+    assert _external_ids(db_session) == ["a"], "недоделанное шагом откачено"
+    if log_stream == "alive":
+        assert [
+            fields["error"] for name, fields in warned if name == "run_failure_fields_not_carried"
+        ] == ["RuntimeError: attribute history is unavailable"]
 
 
 def test_dead_log_stream_does_not_leave_the_run_running(db_session, monkeypatch):
@@ -966,14 +1103,19 @@ def test_unwritable_outcome_with_a_dead_log_stream_still_leaves_the_handler(
     db_session, monkeypatch
 ):
     """Итог не записать, и строка журнала об этом падает сама: помощник всё
-    равно возвращает управление — команда выйдет с причиной падения сбора."""
+    равно возвращает управление — команда выйдет с причиной падения сбора.
+    Попыток при отказе в записи две, не больше."""
     _dead_log_stream(monkeypatch, "warning", "exception")
     run = _new_run(db_session)
+    attempts: list[int] = []
 
     def record_that_the_database_refuses():
+        attempts.append(len(attempts) + 1)
         raise RuntimeError("outcome refused")
 
     main_mod._write_failed_run_outcome(db_session, run, run.id, record_that_the_database_refuses)
+
+    assert attempts == [1, 2]
 
 
 def test_failed_rollback_does_not_replace_the_cause_of_a_failed_write(db_session, monkeypatch):
