@@ -328,6 +328,50 @@ def test_attachment_name_and_date_are_bakus(setup, reader, monkeypatch):
     assert about["Файл сформирован"] == "14.10.2026 01:30 (Bakı)"
 
 
+def test_mail_server_receives_the_letter_with_the_workbook_attached(setup, reader, monkeypatch):
+    """Без подмены `send_email`: до почтового сервера доходит письмо с файлом, который открывается."""
+    s = setup
+    _mixed_catalog(s, _trusted_run(s))
+    delivered = []
+
+    class Server:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def starttls(self):
+            pass
+
+        def login(self, *args):
+            pass
+
+        def send_message(self, message):
+            delivered.append(message)
+
+    monkeypatch.setattr("smtplib.SMTP", Server)
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.test")
+    monkeypatch.setenv("SMTP_USER", "sender")
+    monkeypatch.setenv("SMTP_PASSWORD", "not-a-secret")
+    monkeypatch.setenv("SMTP_FROM", "Pharmacy Monitor")
+
+    assert notifications.send_daily_digest(s, tenant_id=1, locale="az") == 1
+
+    (message,) = delivered
+    assert message["To"] == "reader@example.test"
+    assert message["Subject"].startswith("Pharmacy Monitor — цены на ")
+    assert "Разница цен на" in message.get_body(preferencelist=("html",)).get_content()
+    (attached,) = message.iter_attachments()
+    assert attached.get_content_type() == comparison_export.XLSX_MEDIA_TYPE
+    assert re.fullmatch(r"qiymet-ferqleri-\d{4}-\d{2}-\d{2}\.xlsx", attached.get_filename())
+    book = load_workbook(io.BytesIO(attached.get_content()))
+    assert len(_body_rows(book.worksheets[0])) == 6
+
+
 def test_locale_changes_the_attachment_and_not_the_letter(setup, reader):
     s = setup
     _mixed_catalog(s, _trusted_run(s))
