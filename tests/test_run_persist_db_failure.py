@@ -127,12 +127,12 @@ def db_session(request, monkeypatch):
 def outcome_write_never_waits(monkeypatch):
     """Запись итога ждёт только сервер, который недоступен. Здесь база отказывает
     в самой записи — ждать нечего, и пауза (до минуты) значила бы, что отказ
-    принят за недоступность."""
-
-    def waited(seconds):
-        raise AssertionError(f"запись итога стала ждать сервер ({seconds} с)")
-
-    monkeypatch.setattr(main_mod, "_wait_for_the_database", waited)
+    принят за недоступность. Проверяется после теста: исключение отсюда запись
+    итога проглотила бы сама."""
+    waited: list[float] = []
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", waited.append)
+    yield
+    assert waited == [], f"запись итога ждала сервер: {waited} с"
 
 
 def _is_postgresql(db_session) -> bool:
@@ -1055,14 +1055,19 @@ def test_unwritable_outcome_with_a_dead_log_stream_still_leaves_the_handler(
     db_session, monkeypatch
 ):
     """Итог не записать, и строка журнала об этом падает сама: помощник всё
-    равно возвращает управление — команда выйдет с причиной падения сбора."""
+    равно возвращает управление — команда выйдет с причиной падения сбора.
+    Попыток при отказе в записи две, не больше."""
     _dead_log_stream(monkeypatch, "warning", "exception")
     run = _new_run(db_session)
+    attempts: list[int] = []
 
     def record_that_the_database_refuses():
+        attempts.append(len(attempts) + 1)
         raise RuntimeError("outcome refused")
 
     main_mod._write_failed_run_outcome(db_session, run, run.id, record_that_the_database_refuses)
+
+    assert attempts == [1, 2]
 
 
 def test_failed_rollback_does_not_replace_the_cause_of_a_failed_write(db_session, monkeypatch):

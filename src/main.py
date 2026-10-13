@@ -3793,13 +3793,16 @@ def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, r
         carried = unsaved
         outcome_alone = False
         waits = iter(_RUN_OUTCOME_WAITS_FOR_DATABASE)
-        while True:
+        # Попыток не больше, чем пауз, и ещё две — с перенесёнными полями и без
+        # них. Счёт стоит в самом цикле: ошибка в ветках ниже не должна
+        # превращать запись итога в бесконечную.
+        for _attempt in range(len(_RUN_OUTCOME_WAITS_FOR_DATABASE) + 2):
             try:
                 for key, value in carried.items():
                     setattr(run, key, value)
                 record()
                 session.commit()
-                break
+                return
             except Exception as write_error:
                 with suppress(Exception):
                     session.rollback()
@@ -3827,6 +3830,7 @@ def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, r
                     )
                 carried = {}
                 outcome_alone = True
+        raise RuntimeError("the run outcome was not written within the allowed attempts")
     except Exception:
         with suppress(Exception):
             log.exception("run_failure_not_recorded", run_id=run_id)

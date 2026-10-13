@@ -34,6 +34,7 @@ from uuid import uuid4
 import click
 import pytest
 from sqlalchemy import create_engine, event, make_url, text
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
@@ -140,16 +141,20 @@ class _Server:
         return self.lock_holders() == []
 
 
+# Настоящее ожидание: тесты ниже подменяют его, чтобы не спать.
+_REAL_WAIT_FOR_THE_DATABASE = main_mod._wait_for_the_database
+
+
 @pytest.fixture(autouse=True)
 def outcome_write_never_waits(monkeypatch):
     """Запись итога ждёт только сервер, который недоступен; где сервер отвечает,
     пауза (до минуты) значила бы, что его приняли за недоступный. Тесты простоя
-    ставят своё ожидание поверх."""
-
-    def waited(seconds):
-        raise AssertionError(f"запись итога стала ждать сервер ({seconds} с)")
-
-    monkeypatch.setattr(main_mod, "_wait_for_the_database", waited)
+    ставят своё ожидание поверх. Проверяется после теста: исключение отсюда
+    запись итога проглотила бы сама."""
+    waited: list[float] = []
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", waited.append)
+    yield
+    assert waited == [], f"запись итога ждала сервер: {waited} с"
 
 
 @pytest.fixture
@@ -600,10 +605,17 @@ def test_run_stays_running_when_the_server_does_not_come_back_in_time(lock_db, m
     assert isinstance(result.exception, SystemExit)
 
 
-def test_fields_set_before_the_failure_survive_the_wait_for_the_server(lock_db, monkeypatch):
+_LAST_WAIT = len(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE)
+
+
+@pytest.mark.parametrize("comes_back_on_wait", [2, _LAST_WAIT])
+def test_fields_set_before_the_failure_survive_the_wait_for_the_server(
+    lock_db, monkeypatch, comes_back_on_wait
+):
     """Недоступный сервер в записи не отказывал: пока запись итога его ждёт, поля,
     выставленные на прогоне перед сбоем, не отбрасываются — в отличие от записи,
-    которую база отклонила."""
+    которую база отклонила. Сервер, вернувшийся за последнюю паузу, тоже успел:
+    после неё есть ещё одна попытка."""
     session = lock_db.session
     run = storage.Run(status="running", started_at=utcnow())
     session.add(run)
@@ -613,12 +625,12 @@ def test_fields_set_before_the_failure_survive_the_wait_for_the_server(lock_db, 
     lock_db.server.stops_accepting_connections()
     waited: list[float] = []
 
-    def server_comes_back_on_the_second_wait(seconds):
+    def server_comes_back(seconds):
         waited.append(seconds)
-        if len(waited) == 2:
+        if len(waited) == comes_back_on_wait:
             lock_db.server.accepts_connections_again()
 
-    monkeypatch.setattr(main_mod, "_wait_for_the_database", server_comes_back_on_the_second_wait)
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", server_comes_back)
 
     def record_failure():
         run.status = "failed"
@@ -630,9 +642,86 @@ def test_fields_set_before_the_failure_survive_the_wait_for_the_server(lock_db, 
     session.rollback()
     session.expire_all()
     stored = session.get(storage.Run, run_id)
-    assert waited == list(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE[:2])
+    assert waited == list(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE[:comes_back_on_wait])
     assert (stored.status, stored.error_message) == ("failed", "ValueError: boom")
     assert stored.catalog_verification_reason == "set right before the failure"
+
+
+@pytest.mark.parametrize("comes_back_on_wait", [1, _LAST_WAIT])
+def test_outcome_alone_also_waits_for_the_server(lock_db, monkeypatch, comes_back_on_wait):
+    """База отклонила поле, выставленное на прогоне перед сбоем, — и тут же
+    пропала. Вторая попытка, уже без поля, ждёт сервер так же, как первая, — все
+    паузы, и после последней пишет итог."""
+    session = lock_db.session
+    run = storage.Run(status="running", started_at=utcnow())
+    session.add(run)
+    session.commit()
+    run_id = run.id
+    run.tenant_id = None  # NOT NULL: первую запись база не примет
+    waited: list[float] = []
+
+    def server_comes_back(seconds):
+        waited.append(seconds)
+        if len(waited) == comes_back_on_wait:
+            lock_db.server.accepts_connections_again()
+
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", server_comes_back)
+    real_log = main_mod.log
+
+    class _ServerGoesAwayAfterTheRefusal:
+        def __getattr__(self, name):
+            def line(event_name, **fields):
+                if event_name == "run_failure_write_retried":
+                    lock_db.server.stops_accepting_connections()
+                return getattr(real_log, name)(event_name, **fields)
+
+            return line
+
+    monkeypatch.setattr(main_mod, "log", _ServerGoesAwayAfterTheRefusal())
+
+    def record_failure():
+        run.status = "failed"
+        run.error_message = "ValueError: boom"
+        run.finished_at = utcnow()
+
+    main_mod._write_failed_run_outcome(session, run, run_id, record_failure)
+
+    session.rollback()
+    session.expire_all()
+    stored = session.get(storage.Run, run_id)
+    assert waited == list(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE[:comes_back_on_wait])
+    assert (stored.status, stored.tenant_id) == ("failed", 1)
+
+
+def test_waiting_for_the_server_is_a_real_pause(monkeypatch):
+    """Остальные тесты ожидание подменяют. Без настоящей паузы все попытки
+    записи итога уложились бы в миллисекунды — раньше, чем сервер вернётся."""
+    slept: list[float] = []
+    monkeypatch.setattr(main_mod.time, "sleep", slept.append)
+
+    _REAL_WAIT_FOR_THE_DATABASE(4)
+
+    assert slept == [4]
+    assert sum(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE) == 60, "всего ждёт минуту"
+
+
+@pytest.mark.parametrize(
+    ("error", "may_come_back"),
+    [
+        # Сервер недоступен, занят или оборвал соединение.
+        (sa_exc.OperationalError("SELECT 1", {}, Exception("server closed the connection")), True),
+        (sa_exc.InterfaceError("SELECT 1", {}, Exception("connection already closed")), True),
+        (sa_exc.TimeoutError("QueuePool limit reached"), True),
+        (sa_exc.DBAPIError("SELECT 1", {}, Exception("gone"), connection_invalidated=True), True),
+        # Сервер ответил отказом в самой записи — ждать нечего.
+        (sa_exc.IntegrityError("INSERT", {}, Exception("null value in column")), False),
+        (sa_exc.DataError("INSERT", {}, Exception("value too long")), False),
+        (sa_exc.PendingRollbackError("rollback first"), False),
+        (ValueError("broken in code"), False),
+    ],
+)
+def test_only_an_unreachable_server_is_waited_for(error, may_come_back):
+    assert main_mod._database_may_come_back(error) is may_come_back
 
 
 # ─── Соседние команды ────────────────────────────────────────────────────────
@@ -807,8 +896,9 @@ def test_lock_the_server_no_longer_lists_is_lost_even_on_a_live_connection(lock_
         with pytest.raises(main_mod.ScrapeLockLost) as lost:
             main_mod._fail_if_scrape_lock_lost(noticed="later")
 
-    assert str(lost.value).startswith(
+    assert str(lost.value) == (
         "scrape lock lost (noticed later): the server no longer lists it for its connection; "
+        "another scrape, tick or rematch may have run while it was free, so the run stops here"
     )
 
 
@@ -841,12 +931,15 @@ def test_lock_whose_check_failed_on_a_live_connection_is_not_left_in_the_pool(lo
         connection.execute(text("SELECT 1 / 0"))
 
     monkeypatch.setattr(main_mod, "connection_holds_exclusive_scrape_lock", refused_by_the_server)
+    warned = _record_log(monkeypatch, main_mod, "warning")
     with click.Context(click.Command("probe")):
         assert main_mod._hold_scrape_lock_until_command_exit(factory, wait=False) is True
         with pytest.raises(main_mod.ScrapeLockLost, match="the check on its connection failed"):
             main_mod._fail_if_scrape_lock_lost(noticed="in the middle")
         assert len(lock_db.server.lock_holders()) == 1, "сеанс жив, замок ещё за ним"
 
+    # Снять замок запросом команда и не пыталась: строки об отказе снятия нет.
+    assert [name for name, _ in warned] == ["scrape_lock_check_failed"]
     assert lock_db.server.has_no_lock_holders_soon()
     with click.Context(click.Command("next scrape")):
         assert main_mod._hold_scrape_lock_until_command_exit(factory, wait=False) is True

@@ -313,7 +313,8 @@ sudo -u postgres psql -X pharmacy_monitor -c \
   из `dropped_fields`, выставленные на прогоне перед сбоем (причина отказа
   проверки, `run_quality`), при этом не сохраняются; список бывает пуст — тогда
   первая попытка упала не из-за них.
-- `run_failure_not_recorded` — не прошла и вторая попытка. Прогон остаётся
+- `run_failure_not_recorded` — итог записать не удалось: база отклонила и
+  вторую попытку либо сервер не вернулся за минуту ожидания. Прогон остаётся
   `running`. Почему он упал — в выводе команды (строка `Error: …`), а у `run`
   ещё и в строке `run_failed` выше, с трассировкой. Дальше — как с любым
   зависшим прогоном, см. ниже.
@@ -349,21 +350,24 @@ connection failed (OperationalError); another scrape, tick or rematch may have
 run while it was free, so the run stops here
 ```
 
-- `noticed` — где заметили: `before a category write` и `after a failed
-  category write` (сбор остановлен посреди сайта; так бывает только в сборе по
-  категориям — у pharmonline в режиме `public_api` первая проверка стоит, когда
-  сбор уже кончился), `after the scrape`, `before the final write`, `after the
-  final write`
-  (товары и цены записаны, сопоставления не было), `before matching`, `before
-  alerts` (сопоставление прошло,
-  цены не подтверждены, письма не ушли), `before publication` (письма об алертах
-  этого прогона уже ушли и кэш рекомендаций пересчитан, но `ok` прогон не
-  получил: сайт числится не собранным, как после любого `failed`); у `scrape` —
-  `before the write` и причина без имени класса, у `ai-crawl` — `before the
-  write`.
-- дальше — что ответил сервер: `the check on its connection failed (…)` —
-  соединение замка оборвано; `the server no longer lists it for its connection`
-  — соединение отвечает, но замка за ним сервер не числит.
+- `noticed` — где заметили:
+  - `before a category write`, `after a failed category write` — сбор остановлен
+    посреди сайта. Так бывает только в сборе по категориям: у pharmonline в
+    режиме `public_api` первая проверка стоит, когда сбор уже кончился;
+  - `after the scrape`, `before the final write` — собранное не дописано;
+  - `after the final write` — товары и цены записаны, сопоставления не было;
+  - `before matching` — то же, после ожидания замка сопоставления;
+  - `before alerts` — сопоставление прошло, цены не подтверждены, письма не ушли;
+  - `before publication` — письма об алертах этого прогона к этой минуте уже
+    могли уйти, а кэш рекомендаций — пересчитаться, но `ok` прогон не получил:
+    сайт числится не собранным, как после любого `failed`;
+  - `before the write` — у `scrape` (причина там без имени класса) и `ai-crawl`.
+- дальше — чем кончилась проверка: `the check on its connection failed (…)` —
+  запрос проверки упал: обычно соединение замка оборвано, реже сервер отменил
+  сам запрос на живом соединении (в скобках в обоих случаях бывает
+  `OperationalError`; различает их только текст в строке
+  `scrape_lock_check_failed`). `the server no longer lists it for its
+  connection` — соединение отвечает, но замка за ним сервер не числит.
 - в журнале сбора — строка `scrape_lock_lost` с теми же двумя полями; если
   запрос проверки упал, перед ней `scrape_lock_check_failed` с первой строкой
   ошибки. Потерянный замок на выходе не снимают — его соединение закрывают
