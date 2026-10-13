@@ -5060,8 +5060,9 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | No
     `tenant_users` with daily_digest=True / weekly_digest=True.
 
     Weekly is scheduled by infra/systemd/pharmacy-monitor-digest-weekly.timer.
-    No unit runs `daily`: pharmacy-monitor-digest@.timer runs the legacy
-    `pharmacy-monitor digest` command, not this one.
+    No unit runs `daily`: the pharmacy-monitor-digest@.service template behind
+    the `@daily` and `@weekly` timers runs the legacy `pharmacy-monitor digest`
+    command, not this one.
     """
     from src import notifications
 

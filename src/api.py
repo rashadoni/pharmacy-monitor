@@ -813,9 +813,9 @@ def _digest_timer_on(kind: str) -> bool:
 
     ⚠️ `daily` must stay off until a unit runs `notify digest daily`. The only
     daily unit in `infra/systemd/` runs the legacy `pharmacy-monitor digest`,
-    which mails the `recipients` table and never reads
-    `tenant_users.daily_digest`: with the flag on, the dashboard would count a
-    per-user letter that no timer sends.
+    which mails the `recipients` table (`EMAIL_TO` when it is empty) and never
+    reads `tenant_users.daily_digest`: with the flag on, the dashboard would
+    count a per-user letter that no timer sends.
     """
     if kind == "daily":
         return _env_enabled("DAILY_DIGEST_ENABLED", False)

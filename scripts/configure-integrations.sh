@@ -136,6 +136,11 @@ configure_telegram() {
     echo "     https://api.telegram.org/botYOUR_TOKEN/getUpdates"
     echo "     найди 'chat.id' в JSON"
     echo
+    echo "  ⚠️  Пока привязка чата идёт по адресу (/start <адрес>), бот не проверяет,"
+    echo "     кто ему пишет: чат, назвавший адрес администратора, встанет на место"
+    echo "     его чата и будет получать его алерты. Привязку заменяет PR #72 —"
+    echo "     до его мержа токен лучше не включать (CLAUDE.md, «Known issues»)."
+    echo
     if ! ask_yes_no "Настроить Telegram сейчас?"; then
         echo "  Пропускаю Telegram."
         return
