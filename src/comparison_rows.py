@@ -413,6 +413,7 @@ def _comparison_rows(
     return out
 
 
-# Имена для тех, кто зовёт модуль снаружи. Это те же функции, не обёртки.
+# Имена для тех, кто зовёт модуль снаружи. Это те же объекты, не обёртки.
 comparison_rows = _comparison_rows
 has_ok_run = _has_ok_run
+STALE_AFTER_DAYS = _COMPARISON_STALE_DAYS

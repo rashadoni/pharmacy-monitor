@@ -7,7 +7,8 @@ Replaces the scattered logic in src/alerts.py:_send_*_alert. New logic respects:
 
 Public API:
   - dispatch_event(session, event)        — for real-time alerts (called by alerts.evaluate_rules)
-  - send_daily_digest(session, tenant_id) — call from systemd timer at 08:00
+  - send_daily_digest(session, tenant_id) — утреннее письмо: разница цен + события за сутки
+                                            (systemd timer, 09:00 Asia/Baku)
   - send_weekly_digest(session, tenant_id) — call from systemd timer Mondays
   - bind_telegram(session, chat_id, email) — link telegram to user
 
@@ -17,6 +18,7 @@ Severity ordering (low → high):  info < warning < critical
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from html import escape
 from typing import Iterable
@@ -26,7 +28,7 @@ import structlog
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from src import notifier, storage
+from src import cadence, comparison_export, comparison_rows, notifier, product_policy, storage
 from src._time import utcnow
 
 log = structlog.get_logger()
@@ -420,9 +422,23 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
 
 
 def send_daily_digest(
-    session: Session, tenant_id: int = 1, *, only_email: str | None = None, dry_run: bool = False
+    session: Session,
+    tenant_id: int = 1,
+    *,
+    only_email: str | None = None,
+    dry_run: bool = False,
+    locale: str = "ru",
 ) -> int:
-    """Send daily digest to opted-in users. Returns count of emails sent."""
+    """Утреннее письмо тем, у кого включён суточный дайджест. Возвращает число получателей.
+
+    Наверху — разница цен между сайтом клиента и конкурентами на сейчас
+    (`_price_report`), во вложении — тот же Excel, что отдаёт кнопка на странице
+    сравнения; ниже — события за сутки. `locale` — язык вложения: текст письма,
+    как у всех писем системы, русский.
+
+    `DailyLetterNotSent` — письмо не ушло никому, потому что отчёт о ценах
+    сломан, а событий за сутки нет: молча пропустить такое утро нельзя.
+    """
     return _send_digest(
         session,
         tenant_id,
@@ -430,6 +446,7 @@ def send_daily_digest(
         since=utcnow() - timedelta(hours=24),
         only_email=only_email,
         dry_run=dry_run,
+        locale=locale,
     )
 
 
@@ -454,12 +471,17 @@ def _send_digest(
     *,
     only_email: str | None = None,
     dry_run: bool = False,
+    locale: str = "ru",
 ) -> int:
     """Собрать и разослать дайджест. Возвращает число получателей.
 
     `only_email` — отправить одному получателю из включивших дайджест: так
     письмо смотрят на живых данных, не трогая остальных. `dry_run` — собрать
     письма и записать в лог тему, размер и число строк, ничего не отправляя.
+
+    Суточный дайджест (`kind="daily"`) несёт ещё отчёт о разнице цен и уходит и
+    без событий, если отчёт есть. Недельный отчёта не знает и письмо шлёт
+    прежнее.
     """
     users = session.scalars(
         select(storage.TenantUser).where(
@@ -476,6 +498,25 @@ def _send_digest(
         log.info("digest_no_recipients", kind=kind, tenant=tenant_id)
         return 0
 
+    report: _PriceReport | None = None
+    report_failure: Exception | None = None
+    if kind == "daily":
+        try:
+            # Точка сохранения: упавший запрос отчёта не должен оставить
+            # прерванной транзакцию, в которой ниже читаются события.
+            with session.begin_nested():
+                report = _price_report(session, tenant_id, locale=locale)
+        except Exception as exc:
+            # Письмо с событиями уйдёт и без отчёта. Адресов сборка отчёта не
+            # читает; текст ошибки запроса к базе приходит уже без его данных.
+            report_failure = exc
+            log.exception(
+                "digest_price_report_failed",
+                kind=kind,
+                tenant=tenant_id,
+                error_type=type(exc).__name__,
+            )
+
     events = session.scalars(
         select(storage.AlertEvent)
         .where(
@@ -486,16 +527,28 @@ def _send_digest(
     ).all()
     events = [event for event in events if _event_is_digest_eligible(session, event)]
 
-    if not events:
+    if not events and report is None:
         log.info("digest_no_events", kind=kind, tenant=tenant_id)
+        if report_failure is not None:
+            # Слать нечего, и причина — не тихое утро, а сломанный отчёт.
+            raise DailyLetterNotSent(type(report_failure).__name__) from report_failure
         return 0
 
     # Письмо одно на всех получателей. «Порог email-уведомлений» получателя
     # (`email_severity_min`) на дайджест не действует — решение владельца
     # 2026-10-07: размер держат потолки, а с порогом `warning` из почты совсем
     # пропали бы названия товаров из «Можно поднять цену».
-    html = _render_digest_email(events, kind=kind, since=since)
-    subject = _digest_subject(events, kind)
+    if report is None:
+        html = _render_digest_email(events, kind=kind, since=since)
+        subject = _digest_subject(events, kind)
+        # Без отчёта письмо шлётся и пишется в журнал теми же аргументами, что раньше.
+        with_file: dict = {}
+        file_size: dict = {}
+    else:
+        html = _render_digest_email(events, kind=kind, since=since, price_report=report)
+        subject = _price_letter_subject(report)
+        with_file = {"attachments": [report.attachment]}
+        file_size = {"attachment_kb": round(len(report.attachment[1]) / 1024, 1)}
     sent = 0
     for user in users:
         if dry_run:
@@ -506,11 +559,12 @@ def _send_digest(
                 subject=subject,
                 kb=round(len(html.encode()) / 1024, 1),
                 rows=html.count(_EVENT_ROW_MARK),
+                **file_size,
             )
             sent += 1
             continue
         try:
-            notifier.send_email(subject=subject, html_body=html, to=[user.email])
+            notifier.send_email(subject=subject, html_body=html, to=[user.email], **with_file)
             sent += 1
         except Exception as e:
             log.warning(
@@ -566,6 +620,265 @@ def _event_is_digest_eligible(session: Session, event: storage.AlertEvent) -> bo
             reason="run_not_financially_eligible",
         )
     return eligible
+
+
+# ─── Утреннее письмо: разница цен ────────────────────────────────────────────
+#
+# Клиент попросил присылать «различающиеся данные» на почту каждый день сам.
+# Суточный дайджест получил верх: сколько товаров в сравнении, у скольких цена
+# на сайтах разная и в чью пользу, от какого числа данные каждого сайта — и тот
+# же Excel, что отдаёт кнопка на странице сравнения. Списка «самых больших
+# разниц» в письме нет намеренно: наверху по разнице чаще всего стоят пары, где
+# сведены разные товары.
+
+
+class DailyLetterNotSent(RuntimeError):
+    """Утреннее письмо не ушло никому: отчёт о ценах сломан, событий за сутки нет.
+
+    В тексте — только класс исходной ошибки: его печатают и команда, и ответ
+    API администратору.
+    """
+
+    def __init__(self, error_type: str):
+        self.error_type = error_type
+        super().__init__(
+            f"отчёт о разнице цен не собрался ({error_type}), событий за сутки нет — "
+            "письмо не отправлено"
+        )
+
+
+@dataclass(frozen=True)
+class _SiteDataAge:
+    site: str
+    # Конец последнего полного сбора, которому система верит (UTC без пояса);
+    # None — такого сбора у сайта ещё не было.
+    collected_at: datetime | None
+    # Сбор старше, чем позволяет ритм сайта (`cadence.site_max_age_hours`).
+    overdue: bool
+
+
+@dataclass(frozen=True)
+class _PriceReport:
+    generated_at: datetime
+    client_site: str
+    # Числа — `comparison_export.difference_counts`, определения там же.
+    counts: dict[str, int]
+    sites: tuple[_SiteDataAge, ...]
+    # (имя файла, содержимое, тип) — как их ждёт `notifier.send_email`.
+    attachment: tuple[str, bytes, str]
+
+
+def _client_site(session: Session, tenant_id: int) -> str:
+    """Сайт клиента из записи арендатора; незнакомое значение — сайт по умолчанию."""
+    tenant = session.get(storage.Tenant, tenant_id)
+    site = tenant.client_site if tenant is not None else None
+    return site if site in comparison_export.SITES else comparison_export.CLIENT_SITE
+
+
+def _site_data_ages(session: Session, tenant_id: int, now: datetime) -> tuple[_SiteDataAge, ...]:
+    """Когда каждый сайт последний раз собран полностью сбором, которому система верит.
+
+    Источник — `storage.latest_financial_run_ids_by_site`, тот же, по которому
+    health поднимает `full_catalog_overdue`: последний полный сбор сайта,
+    прошедший проверку каталога, сколько бы ему ни было. Возраст — от конца
+    сбора. `product_policy._site_full_run_state` дешевле, но смотрит только на
+    последнюю попытку: если она проверку не прошла, он не называет никакого
+    сбора — а письму в этот день как раз и нужна дата последних годных данных.
+    """
+    run_ids = storage.latest_financial_run_ids_by_site(
+        session, comparison_export.SITES, tenant_id=tenant_id
+    )
+    runs = (
+        {
+            run.id: run
+            for run in session.scalars(
+                select(storage.Run).where(storage.Run.id.in_(set(run_ids.values())))
+            )
+        }
+        if run_ids
+        else {}
+    )
+    ages = []
+    for site in comparison_export.SITES:
+        run = runs.get(run_ids.get(site))
+        collected_at = (run.finished_at or run.started_at) if run is not None else None
+        overdue = collected_at is None or (
+            now - collected_at > timedelta(hours=cadence.site_max_age_hours(site))
+        )
+        ages.append(_SiteDataAge(site=site, collected_at=collected_at, overdue=overdue))
+    return tuple(ages)
+
+
+def _price_report(session: Session, tenant_id: int, *, locale: str) -> _PriceReport | None:
+    """Отчёт «разница цен на сейчас» для утреннего письма.
+
+    Строки — те же, что показывает страница сравнения с фильтрами по умолчанию
+    (минимум два сайта, достоверность пары от 0.70), файл — тот же, что отдаёт
+    её кнопка «Excel». Числа считаются из строк, ушедших в файл, по правилам
+    файла (`comparison_export.difference_counts`): «различаются» в письме — это
+    число строк первого листа.
+
+    Разбивка «в чью пользу» считается для сайта клиента из записи арендатора.
+    Колонка «Позиция» в файле написана про Pharmonline: у арендатора с другим
+    сайтом клиента разбивка письма с ней не совпадёт.
+
+    None — отчёта нет, причина в журнале (`digest_price_report_skipped`):
+    финансовые сравнения приостановлены политикой (страница в этом случае
+    отвечает 503), успешного сбора ещё не было или сравнивать нечего.
+    Исключение значит, что отчёт сломан; ловит его вызывающий.
+    """
+    eligibility = product_policy.policy_rollout_eligibility(session, tenant_id=tenant_id)
+    if not eligibility.eligible:
+        reason = eligibility.reason or "policy_not_ready"
+    elif not comparison_rows.has_ok_run(session, tenant_id=tenant_id):
+        reason = "no_successful_run"
+    else:
+        rows = comparison_rows.comparison_rows(session, tenant_id=tenant_id)
+        if rows:
+            now = utcnow()
+            client_site = _client_site(session, tenant_id)
+            report = _PriceReport(
+                generated_at=now,
+                client_site=client_site,
+                counts=comparison_export.difference_counts(rows, client_site),
+                sites=_site_data_ages(session, tenant_id, now),
+                attachment=(
+                    comparison_export.filename(locale, now),
+                    comparison_export.build_workbook(rows, locale=locale, generated_at=now),
+                    comparison_export.XLSX_MEDIA_TYPE,
+                ),
+            )
+            log.info(
+                "digest_price_report",
+                tenant=tenant_id,
+                locale=locale,
+                attachment_kb=round(len(report.attachment[1]) / 1024, 1),
+                overdue_sites=[age.site for age in report.sites if age.overdue],
+                **report.counts,
+            )
+            return report
+        reason = "no_comparison_rows"
+    log.info("digest_price_report_skipped", tenant=tenant_id, reason=reason)
+    return None
+
+
+def _price_letter_title(report: _PriceReport) -> str:
+    return f"Разница цен на {comparison_export.baku_time(report.generated_at):%d.%m.%Y}"
+
+
+def _price_letter_subject(report: _PriceReport) -> str:
+    day = comparison_export.baku_time(report.generated_at)
+    differing = report.counts["differing"]
+    found = (
+        f"различаются у {_num(differing)} {_plural(differing, 'товара', 'товаров', 'товаров')}"
+        if differing
+        else "различий нет"
+    )
+    return f"Pharmacy Monitor — цены на {day:%d.%m.%Y}: {found}"
+
+
+_NO_EVENTS_LINE = (
+    "За последние 24 часа событий не было — ни изменений цен, ни новых товаров, ни промо."
+)
+
+
+def _price_count_row(label: str, value: int, *, part: bool = False, strong: bool = False) -> str:
+    """Строка «подпись — число»; `part` — слагаемое строки над ней."""
+    label_style = (
+        "padding:3px 0 3px 16px;font-size:13px;color:#52525b;"
+        if part
+        else f"padding:6px 0;color:#18181b;{'font-weight:600;' if strong else ''}"
+    )
+    value_style = (
+        "font-size:13px;color:#52525b;"
+        if part
+        else f"font-size:{'18' if strong else '15'}px;font-weight:600;color:#18181b;"
+    )
+    return (
+        f'<tr><td style="{label_style}">{label}</td>'
+        f'<td style="text-align:right;white-space:nowrap;{value_style}">{_num(value)}</td></tr>'
+    )
+
+
+def _render_price_report(report: _PriceReport) -> str:
+    """Верх утреннего письма: числа о разнице цен, возраст данных сайтов, что в файле."""
+    titles = comparison_export.SITE_TITLES
+    client = titles[report.client_site]
+    rivals = " и ".join(titles[s] for s in comparison_export.SITES if s != report.client_site)
+    counts = report.counts
+
+    count_rows = [
+        _price_count_row("Товаров в сравнении", counts["compared"]),
+        _price_count_row("Цена на сайтах различается", counts["differing"], strong=True),
+        _price_count_row(
+            f"у конкурента дешевле, чем на {client}", counts["competitor_cheaper"], part=True
+        ),
+        _price_count_row(f"на {client} цена самая низкая", counts["client_cheapest"], part=True),
+        _price_count_row(
+            f"свежей цены {client} нет — различаются цены конкурентов",
+            counts["no_client_price"],
+            part=True,
+        ),
+        _price_count_row("Цена одинаковая", counts["same_price"]),
+    ]
+    if counts["not_comparable"]:
+        count_rows.append(
+            _price_count_row(
+                "Сравнить не с чем: свежая цена только на одном сайте", counts["not_comparable"]
+            )
+        )
+
+    age_rows = []
+    warnings = []
+    for age in report.sites:
+        site = titles[age.site]
+        if age.collected_at is None:
+            when = "—"
+            warnings.append(f"{site}: полного сбора, прошедшего проверку, ещё не было.")
+        else:
+            collected = comparison_export.baku_time(age.collected_at)
+            when = f"{collected:%d.%m.%Y %H:%M}"
+            if age.overdue:
+                warnings.append(
+                    f"Данные {site} — от {collected:%d.%m.%Y}: с тех пор полный сбор этого "
+                    "сайта не прошёл, его цены могут быть устаревшими."
+                )
+        age_rows.append(
+            f'<tr><td style="padding:2px 0;">{site}</td>'
+            f'<td style="text-align:right;white-space:nowrap;">{when}</td></tr>'
+        )
+    warning_rows = "".join(
+        f"""
+    <tr><td style="padding:10px 24px;background:#fffbeb;border-top:1px solid #e4e4e7;font-size:13px;color:#52525b;">
+      {escape(text, quote=False)}
+    </td></tr>"""
+        for text in warnings
+    )
+    public = os.environ.get("PHARMACY_PUBLIC_URL", "")
+    file_name = escape(report.attachment[0], quote=False)
+    return f"""<tr><td style="padding:24px 24px 8px;">
+      <div style="font-size:14px;color:#71717a;margin-bottom:4px;">Pharmacy Monitor</div>
+      <div style="font-size:22px;font-weight:600;color:#18181b;">{_price_letter_title(report)}</div>
+      <div style="font-size:13px;color:#71717a;margin-top:4px;">{client} в сравнении с {rivals}</div>
+    </td></tr>
+    <tr><td style="padding:8px 24px 4px;">
+      <table style="width:100%;border-collapse:collapse;">
+        {chr(10).join(count_rows)}
+      </table>
+      <div style="font-size:12px;color:#71717a;margin-top:8px;">
+        Сравниваются свежие цены: цена, которую сайт не показывал больше {comparison_rows.STALE_AFTER_DAYS} дней, в разницу не входит.
+      </div>
+    </td></tr>
+    <tr><td style="padding:12px 24px;border-top:1px solid #f4f4f5;font-size:13px;color:#52525b;">
+      <div style="font-weight:600;color:#18181b;margin-bottom:4px;">Когда сайты собраны полностью (время бакинское)</div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;color:#52525b;">
+        {chr(10).join(age_rows)}
+      </table>
+    </td></tr>{warning_rows}
+    <tr><td style="padding:12px 24px 16px;border-top:1px solid #f4f4f5;font-size:13px;color:#52525b;">
+      Все товары — в приложенном файле {file_name}: на первом листе товары с разной ценой, на втором — всё сравнение.
+      <a href="{escape(public)}/comparison?diff=1" style="color:#3b82f6;">Открыть в дашборде →</a>
+    </td></tr>"""
 
 
 # ─── Email templates ─────────────────────────────────────────────────────────
@@ -843,8 +1156,18 @@ def _digest_block(
 """.strip()
 
 
-def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since: datetime) -> str:
-    """Письмо-дайджест: сводка по типам, затем списки с потолком."""
+def _render_digest_email(
+    events: Iterable[storage.AlertEvent],
+    kind: str,
+    since: datetime,
+    *,
+    price_report: _PriceReport | None = None,
+) -> str:
+    """Письмо-дайджест: сводка по типам, затем списки с потолком.
+
+    С `price_report` письмо начинается отчётом о разнице цен, а события идут под
+    ним; если событий нет, вместо их сводки — одна строка об этом.
+    """
     events = list(events)
     total = len(events)
 
@@ -877,17 +1200,33 @@ def _render_digest_email(events: Iterable[storage.AlertEvent], kind: str, since:
         if scope_note
         else ""
     )
-    return f"""
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Дайджест за {period_name}</title></head>
-<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
-  <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
-    <tr><td style="padding:24px;">
+    title = f"Дайджест за {period_name}"
+    if price_report is None:
+        header = f"""<tr><td style="padding:24px;">
       <div style="font-size:14px;color:#71717a;margin-bottom:4px;">Pharmacy Monitor</div>
       <div style="font-size:22px;font-weight:600;color:#18181b;">Дайджест за {period_name}</div>
       <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
-    </td></tr>
+    </td></tr>"""
+    elif events:
+        title = _price_letter_title(price_report)
+        header = f"""{_render_price_report(price_report)}
+    <tr><td style="padding:20px 24px 12px;border-top:1px solid #e4e4e7;">
+      <div style="font-size:18px;font-weight:600;color:#18181b;">События за {period_name}</div>
+      <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
+    </td></tr>"""
+    else:
+        title = _price_letter_title(price_report)
+        header = f"""{_render_price_report(price_report)}
+    <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:13px;color:#52525b;">
+      {_NO_EVENTS_LINE}
+    </td></tr>"""
+    return f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>{title}</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f4f5;padding:20px;">
+  <table style="max-width:600px;margin:0 auto;background:white;border-radius:8px;overflow:hidden;width:100%;border-collapse:collapse;">
+    {header}
     {chr(10).join(summary_rows)}
     {scope_html}
     {chr(10).join(blocks)}

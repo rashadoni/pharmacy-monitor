@@ -5044,7 +5044,8 @@ def notify_group() -> None:
 @click.option(
     "--dry-run",
     is_flag=True,
-    help="Собрать письма и показать в логе тему, размер и число строк, ничего не отправляя",
+    help="Собрать письма и показать в логе тему, размер и число строк, ничего не отправляя; "
+    "у суточного письма — ещё числа о разнице цен и размер вложения",
 )
 @click.option(
     "--only",
@@ -5053,23 +5054,45 @@ def notify_group() -> None:
     help="Отправить только этому получателю (из включивших дайджест) — посмотреть письмо, "
     "не трогая остальных",
 )
-def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | None) -> None:
+@click.option(
+    "--locale",
+    type=click.Choice(["ru", "az", "en"]),
+    default="ru",
+    show_default=True,
+    help="Язык Excel-вложения суточного письма. Текст письма всегда русский, как у всех "
+    "писем системы; у недельного дайджеста вложения нет",
+)
+def notify_digest(
+    kind: str, tenant_id: int, dry_run: bool, only_email: str | None, locale: str
+) -> None:
     """Send digest email to opted-in users for the tenant.
 
-    Daily includes events from last 24h, weekly from last 7d. Recipients are
-    `tenant_users` with daily_digest=True / weekly_digest=True.
+    Daily — утреннее письмо: разница цен между сайтом клиента и конкурентами на
+    сейчас (числа и Excel со страницы сравнения во вложении) и события за 24
+    часа; уходит и без событий. Weekly — события за 7 дней. Получатели —
+    `tenant_users` с daily_digest=True / weekly_digest=True.
 
-    Schedule via systemd timer (see infra/systemd/pharmacy-monitor-digest@.timer).
+    Расписание — systemd-таймеры infra/systemd/pharmacy-monitor-digest-daily.timer
+    и pharmacy-monitor-digest-weekly.timer.
     """
     from src import notifications
 
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        send = (
-            notifications.send_daily_digest if kind == "daily" else notifications.send_weekly_digest
-        )
-        sent = send(s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run)
+        try:
+            if kind == "daily":
+                sent = notifications.send_daily_digest(
+                    s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run, locale=locale
+                )
+            else:
+                sent = notifications.send_weekly_digest(
+                    s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run
+                )
+        except notifications.DailyLetterNotSent as failure:
+            # Ненулевой код: юнит таймера должен показать сбой, а не тихое утро.
+            # Трассировка исходной ошибки уже в журнале (digest_price_report_failed).
+            raise click.ClickException(str(failure)) from None
         if dry_run:
             click.echo(f"[dry-run] {kind} digest: {sent} recipients, nothing sent")
         else:

@@ -69,3 +69,4 @@ def test_page_and_letter_share_one_row_builder():
         assert getattr(api_module, name) is getattr(comparison_rows, name), name
     assert comparison_rows.comparison_rows is comparison_rows._comparison_rows
     assert comparison_rows.has_ok_run is comparison_rows._has_ok_run
+    assert comparison_rows.STALE_AFTER_DAYS == comparison_rows._COMPARISON_STALE_DAYS
