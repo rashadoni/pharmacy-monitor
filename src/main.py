@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from src._time import utcnow
@@ -3584,45 +3585,60 @@ def mark_scrape_request_terminal(
     return request
 
 
-def _write_failed_run_outcome(session: Session, run_id: int, record) -> bool:
-    """Записать итог упавшего прогона — и тогда, когда упала сама база.
+def _unsaved_column_values(instance) -> dict[str, object]:
+    """Значения колонок, выставленные на объекте и ещё не отправленные в базу."""
+    state = inspect(instance)
+    values: dict[str, object] = {}
+    for prop in state.mapper.column_attrs:
+        attribute = state.attrs[prop.key]
+        if attribute.history.has_changes():
+            values[prop.key] = attribute.loaded_value
+    return values
 
-    `record()` выставляет поля итога и коммитит. Шаг, упавший на ошибке базы,
-    оставляет сессию с транзакцией, которую надо откатить, — иначе итог не
-    запишется, и прогон останется `running`, пока его часов через шесть не
-    закроет вотчер очереди: задним числом и без причины.
 
-    Откат — только когда писать иначе нельзя. В рабочей сессии вместе с итогом
-    сохраняются поля прогона, выставленные прямо перед исключением (причина
-    отказа, `run_quality`), а откат их стирает. После отката `record()`
-    выполняется заново, поэтому всё, что обработчик добавляет к итогу, ставится
-    внутри неё.
+def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, record) -> None:
+    """Записать итог упавшего прогона — на чистой транзакции.
 
-    False — итог записать не удалось вовсе (база недоступна). Отказ записи
-    остаётся в журнале отдельной строкой, а вызывающий выходит с причиной, по
-    которой упал сам прогон.
+    Сначала откат, всегда. Шаг, упавший на ошибке базы, оставляет сессию с
+    транзакцией, в которой итог не записать: обработчик сбоя падал на
+    собственном commit, и прогон оставался `running`, пока его часов через
+    шесть не закрывал вотчер очереди — задним числом и без причины. Шаг,
+    упавший в коде, оставляет в сессии недоделанное, и commit итога сохранял бы
+    эту половину вместе с `failed`.
+
+    Откат стирает и то, что выставлено на самом прогоне прямо перед исключением
+    (причина отказа, `run_quality`), поэтому несохранённые поля прогона
+    переносятся через него: снимаются до отката и ставятся обратно после.
+    `record()` выставляет сам итог — статус, причину, время, заявку; commit
+    делает эта функция. `run_id` берётся у вызывающего: после упавшего flush
+    объект прогона просрочен, и чтение `run.id` само упало бы.
+
+    Если база не приняла и запись итога, прогон остаётся `running`: отказ
+    ложится в журнал строкой `run_failure_not_recorded`, а вызывающий выходит с
+    причиной, по которой упал сам прогон.
     """
     try:
-        if not session.is_active:
-            # Упал flush: несохранённое SQLAlchemy уже отменил сам, а запись в
-            # такую транзакцию отбросил бы с предупреждением.
-            session.rollback()
+        unsaved = _unsaved_column_values(run)
         try:
-            record()
-        except Exception as write_error:
-            # Упал запрос мимо flush: сессия считает транзакцию рабочей, а
-            # PostgreSQL до отката не выполняет в ней ничего.
-            log.warning(
-                "run_failure_write_retried_after_rollback",
-                run_id=run_id,
-                error=f"{type(write_error).__name__}: {write_error}",
-            )
             session.rollback()
-            record()
+        except Exception as rollback_error:
+            # Соединение потеряно: до сервера откат не дошёл, но свою транзакцию
+            # сессия закрыла, и следующая начнётся на новом соединении.
+            with suppress(Exception):
+                log.warning(
+                    "run_failure_rollback_failed",
+                    run_id=run_id,
+                    error=f"{type(rollback_error).__name__}: {rollback_error}",
+                )
+        for key, value in unsaved.items():
+            setattr(run, key, value)
+        record()
+        session.commit()
     except Exception:
-        log.exception("run_failure_not_recorded", run_id=run_id)
-        return False
-    return True
+        # Журнал пишет в stdout: при оборванном выводе (ssh без терминала,
+        # отменённый workflow) строка сама падает — на исход это не влияет.
+        with suppress(Exception):
+            log.exception("run_failure_not_recorded", run_id=run_id)
 
 
 def run_tenant_id_for_request(session: Session, request_id: int | None) -> int:
@@ -3950,7 +3966,16 @@ def persist_results(
     try:
         return _persist_chunks(session, run, results, aloe_whole_catalog=aloe_whole_catalog)
     except Exception:
-        session.rollback()
+        try:
+            session.rollback()
+        except Exception as rollback_error:
+            # Соединение потеряно: до сервера откат не дошёл, но свою транзакцию
+            # сессия закрыла. Причина сбоя — исключение записи, а не это.
+            with suppress(Exception):
+                log.warning(
+                    "persist_rollback_failed",
+                    error=f"{type(rollback_error).__name__}: {rollback_error}",
+                )
         raise
 
 
@@ -5343,9 +5368,8 @@ def ai_crawl_cmd(
                 run.status = "failed"
                 run.error_message = failure_message
                 run.finished_at = utcnow()
-                session.commit()
 
-            _write_failed_run_outcome(session, run_id, record_failure)
+            _write_failed_run_outcome(session, run, run_id, record_failure)
             raise click.ClickException(str(e))
 
 
@@ -6134,8 +6158,8 @@ def run_cmd(
             failure_message = f"{type(e).__name__}: {e}"
 
             def record_failure() -> None:
-                """Всё, что обработчик добавляет к итогу, ставится здесь: после
-                отката функция выполняется заново."""
+                """Всё, что обработчик добавляет к итогу, ставится здесь:
+                функция вызывается после отката, на чистой транзакции."""
                 run.status = failure_status
                 run.error_message = failure_message
                 run.finished_at = utcnow()
@@ -6145,12 +6169,13 @@ def run_cmd(
                         req.run_id = run_id
                         req.status = failure_status
                         req.completed_at = utcnow()
-                session.commit()
 
-            # Причина — в журнал до записи итога: если база недоступна и итог
-            # записать не удастся, строка останется.
-            log.exception("run_failed", run_id=run_id)
-            _write_failed_run_outcome(session, run_id, record_failure)
+            # Причина — в журнал до записи итога: если база не примет и итог,
+            # строка останется. Сбой самой строки (оборванный вывод) запись
+            # итога не срывает.
+            with suppress(Exception):
+                log.exception("run_failed", run_id=run_id)
+            _write_failed_run_outcome(session, run, run_id, record_failure)
             # click печатает этот текст сам, мимо маски журнала.
             from src.logging_setup import mask_addresses
 
@@ -6267,9 +6292,8 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
                 run.status = "failed"
                 run.error_message = failure_message
                 run.finished_at = utcnow()
-                session.commit()
 
-            _write_failed_run_outcome(session, run_id, record_failure)
+            _write_failed_run_outcome(session, run, run_id, record_failure)
             raise click.ClickException(str(e))
 
 

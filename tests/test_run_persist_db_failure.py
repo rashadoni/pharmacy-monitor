@@ -13,13 +13,14 @@
   очереди, задним числом и без причины.
 
 Теперь недописанную пачку откатывает сама `persist_results`, а обработчики сбоя
-`run`, `scrape` и `ai-crawl` откатывают сессию, если иначе итог не записать.
+`run`, `scrape` и `ai-crawl` перед записью итога откатывают сессию; поля,
+выставленные на прогоне прямо перед исключением, переносятся через откат.
 
 Сбои здесь настоящие: отказывает сама база, посреди записи, а не код до
-обращения к ней. Каждый сценарий идёт на SQLite и на PostgreSQL. Прод —
-PostgreSQL, и после ошибки запроса он не выполняет в транзакции больше ничего,
-а SQLite продолжает как ни в чём не бывало; длину строки и отложенные
-ограничения проверяет тоже только PostgreSQL. Поэтому в CI вариант на
+обращения к ней. Сценарии идут на SQLite и на PostgreSQL; три — только на
+PostgreSQL (отложенное ограничение, обрыв соединения сервером, длина строки).
+Прод — PostgreSQL, и после ошибки запроса он не выполняет в транзакции больше
+ничего, а SQLite продолжает как ни в чём не бывало. Поэтому в CI вариант на
 PostgreSQL обязан исполняться: его пропуск — ошибка.
 
 Сбор идёт настоящим путём — `scrape_all` → `scrape_site` → `BaseScraper.scrape`
@@ -34,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -436,9 +438,13 @@ def test_one_refused_category_write_does_not_cost_the_rest_of_the_run(
 
 
 def test_connection_lost_midway_costs_one_category_write_not_the_run(db_session, monkeypatch):
-    """Сервер оборвал соединение посреди записи `cat-b` — так рвётся связь при
-    перезапуске PostgreSQL. Запись категории падает, следующая берёт новое
-    соединение, финальный проход дописывает `cat-b`."""
+    """Сервер оборвал одно соединение — то, которым шла запись `cat-b`
+    (`pg_terminate_backend`). Запись категории падает, следующая берёт новое
+    соединение, финальный проход дописывает `cat-b`.
+
+    Перезапуск PostgreSQL рвёт все соединения разом, включая то, на котором
+    лежит замок сбора (здесь он подменён): этого тест не изображает.
+    """
     if not _is_postgresql(db_session):
         pytest.skip("обрыв соединения сервером — только PostgreSQL")
     engine = db_session.get_bind()
@@ -497,7 +503,7 @@ def test_run_that_cannot_be_written_ends_failed_not_running(db_session, monkeypa
     writes = _record_writes(monkeypatch)
     catalog = {
         "cat-a": [_scraped("a", 5.0, "cat-a")],
-        "cat-b": [_without_url("bad", 6.5, "cat-b")],
+        "cat-b": [_without_url("bad", 7777.25, "cat-b")],
         "cat-c": [_scraped("c", 7.0, "cat-c")],
     }
 
@@ -512,8 +518,9 @@ def test_run_that_cannot_be_written_ends_failed_not_running(db_session, monkeypa
     assert run.finished_at is not None
     assert run.error_message.startswith("IntegrityError"), run.error_message
     assert "url" in run.error_message, "причина — отказ базы, а не сессия без отката"
+    # Цена — такая, какой не бывает в отметке времени строки журнала.
     for shown in (run.error_message, result.output):
-        assert "Product bad" not in shown and "6.5" not in shown, shown
+        assert "Product bad" not in shown and "7777.25" not in shown, shown
     assert isinstance(result.exception, SystemExit), "команда вышла сама, а не упала"
     assert _external_ids(db_session) == ["a", "c"]
     assert _observed(db_session, run) == ["a", "c"]
@@ -665,7 +672,6 @@ def test_database_failure_after_the_write_still_closes_the_run(
     db_session.add(request)
     db_session.commit()
     monkeypatch.setattr(storage, "confirm_prices_of_latest_verified_runs", failing_step)
-    retried = _record_log(monkeypatch, main_mod, "warning")
     catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
 
     run, _ = _run_catalog(
@@ -683,12 +689,90 @@ def test_database_failure_after_the_write_still_closes_the_run(
     db_session.refresh(request)
     assert (request.status, request.run_id) == ("failed", run.id)
     assert request.completed_at is not None
-    # Вторая попытка записи итога нужна только там, где сессия считает
-    # транзакцию рабочей, а база — прерванной.
-    second_attempt = _is_postgresql(db_session) and failing_step is _refused_statement
-    assert [name for name, _ in retried if name == "run_failure_write_retried_after_rollback"] == (
-        ["run_failure_write_retried_after_rollback"] if second_attempt else []
+
+
+def _verdict_then_refused_statement(session, run):
+    run.catalog_verification_reason = "reason set right before the failure"
+    run.run_quality = {**(run.run_quality or {}), "set_before_failure": True}
+    _refused_statement(session)
+
+
+def test_fields_set_on_the_run_before_the_failure_survive_the_rollback(db_session, monkeypatch):
+    """Шаг выставил на прогоне причину отказа и `run_quality`, а потом упал на
+    базе. Откат перед записью итога эти поля стирает — обработчик переносит их
+    через него, и в базе остаётся то, что о прогоне успели сказать."""
+    monkeypatch.setattr(
+        storage, "confirm_prices_of_latest_verified_runs", _verdict_then_refused_statement
     )
+    catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
+
+    run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
+
+    assert run.finished_at is not None
+    assert run.error_message.startswith("IntegrityError"), run.error_message
+    assert run.catalog_verification_reason == "reason set right before the failure"
+    assert run.run_quality["set_before_failure"] is True
+    assert run.run_quality["sites"], "прежнее содержимое на месте"
+
+
+def _half_done_then_broken_in_code(session, run):
+    session.add(
+        storage.Product(
+            site=SITE,
+            external_id="half-done",
+            url="https://half.invalid/p",
+            name="x",
+            name_normalized="x",
+        )
+    )
+    session.flush()
+    raise ValueError("step broke halfway")
+
+
+def test_unfinished_work_of_a_failed_step_is_not_saved_with_the_outcome(db_session, monkeypatch):
+    """Шаг упал в коде, успев отправить в базу половину своей работы. Раньше
+    commit итога сохранял эту половину вместе с `failed`; теперь итог пишется на
+    чистой транзакции."""
+    monkeypatch.setattr(
+        storage, "confirm_prices_of_latest_verified_runs", _half_done_then_broken_in_code
+    )
+    catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
+
+    run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
+
+    assert run.finished_at is not None
+    assert run.error_message == "ValueError: step broke halfway"
+    assert run.products_scraped == 1, "сохранённое до шага остаётся"
+    assert _external_ids(db_session) == ["a"]
+
+
+def test_dead_log_stream_does_not_leave_the_run_running(db_session, monkeypatch):
+    """Журнал команды пишет в stdout. При оборванном выводе (ssh без терминала,
+    отменённый workflow) строка о причине сбоя сама падает с `BrokenPipeError`.
+    Она пишется до итога — и запись итога сорвать не должна."""
+    real_log = main_mod.log
+
+    class _DeadStream:
+        def __getattr__(self, name):
+            if name != "exception":
+                return getattr(real_log, name)
+
+            def broken(event_name, **fields):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            return broken
+
+    def broken_step(session, run):
+        raise ValueError("step failed")
+
+    monkeypatch.setattr(storage, "confirm_prices_of_latest_verified_runs", broken_step)
+    monkeypatch.setattr(main_mod, "log", _DeadStream())
+    catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
+
+    run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
+
+    assert run.finished_at is not None
+    assert run.error_message == "ValueError: step failed"
 
 
 # Кто держит сессионный замок сопоставления в этой базе: односложный ключ bigint
@@ -711,7 +795,7 @@ _MATCHING_LOCK_HOLDERS = text(
 
 
 @pytest.mark.parametrize("failing_step", [_unwritable_row_at_flush, _refused_statement])
-def test_database_failure_under_the_matching_lock_closes_the_run_and_frees_the_lock(
+def test_database_failure_under_the_matching_lock_still_closes_the_run(
     db_session, monkeypatch, failing_step
 ):
     """На базе упал шаг под замком сопоставления (здесь — перепроверка пар).
@@ -719,8 +803,7 @@ def test_database_failure_under_the_matching_lock_closes_the_run_and_frees_the_l
     Замок лежит на отдельном соединении, и сессия до его снятия ходит только
     через него. Снятие замка на прерванной транзакции само падает, так что
     обработчик получает сессию с незавершённой транзакцией на этом соединении:
-    итог пишется после отката, а соединение замка закрывается вместе с
-    транзакцией — замок не остаётся висеть до конца процесса.
+    откат её завершает, соединение замка закрывается, итог пишется через пул.
     """
     catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
 
@@ -732,6 +815,9 @@ def test_database_failure_under_the_matching_lock_closes_the_run_and_frees_the_l
     assert "identity revalidation failed: IntegrityError" in run.error_message, run.error_message
     assert run.products_scraped == 1
     if _is_postgresql(db_session):
+        # Замка не держит никто. Прежний код этому не противоречил — замок
+        # уходил, когда команда закрывала сессию; проверка стережёт только то,
+        # что запись итога не оставила соединение замка открытым.
         holders = db_session.scalars(
             _MATCHING_LOCK_HOLDERS, {"key": main_mod.matcher.MATCH_MUTATION_ADVISORY_LOCK_KEY}
         ).all()
@@ -754,9 +840,144 @@ def test_reason_is_logged_even_when_the_outcome_cannot_be_written(db_session, mo
 
     assert [name for name, _ in logged] == ["run_failed", "run_failure_not_recorded"]
     assert "url" in logged[0][1]["handled"], logged
-    assert "url" in result.output, "команда называет причину падения сбора"
+    # Свою ошибку команда печатает строкой `Error: …` — в ней причина падения
+    # сбора (отказ по `products.url`), а не отказ записи итога (индекс `runs`).
+    error_lines = [line for line in result.output.splitlines() if line.startswith("Error: ")]
+    assert len(error_lines) == 1, result.output
+    assert "url" in error_lines[0] and "refuse_second_failed_run" not in error_lines[0]
     assert isinstance(result.exception, SystemExit)
     assert run.finished_at is None
+
+
+def test_outcome_is_written_even_when_the_rollback_itself_fails(db_session):
+    """Откат перед записью итога упал сам (так бывает на потерянном соединении:
+    до сервера он не дошёл). Свою транзакцию сессия при этом закрыла — итог
+    пишется на следующей."""
+    run = storage.Run(status="running", started_at=utcnow())
+    db_session.add(run)
+    db_session.commit()
+    run_id = run.id
+    real_rollback = db_session.rollback
+
+    def rollback_that_fails():
+        real_rollback()
+        raise RuntimeError("rollback did not reach the server")
+
+    db_session.rollback = rollback_that_fails
+
+    def record_failure():
+        run.status = "failed"
+        run.error_message = "ValueError: boom"
+        run.finished_at = utcnow()
+
+    try:
+        main_mod._write_failed_run_outcome(db_session, run, run_id, record_failure)
+    finally:
+        del db_session.rollback
+
+    db_session.rollback()
+    db_session.expire_all()
+    stored = db_session.get(storage.Run, run_id)
+    assert (stored.status, stored.error_message) == ("failed", "ValueError: boom")
+    assert stored.finished_at is not None
+
+
+def test_failed_rollback_does_not_replace_the_cause_of_a_failed_write(db_session, monkeypatch):
+    """Запись сбора упала в коде, а соединение к этому моменту молча потеряно:
+    откат недописанного сам падает. Наверх уходит причина сбоя записи, а не
+    отказ отката, и сессия остаётся рабочей."""
+    if not _is_postgresql(db_session):
+        pytest.skip("обрыв соединения сервером — только PostgreSQL")
+    run = _new_run(db_session)
+    admin = create_engine(db_session.get_bind().url, isolation_level="AUTOCOMMIT")
+
+    def write_that_breaks_on_a_dead_connection(session, run, results, **kwargs):
+        session.execute(select(storage.Run.id)).all()  # транзакция открыта
+        pid = session.connection().connection.dbapi_connection.info.backend_pid
+        with admin.connect() as connection:
+            connection.execute(text("SELECT pg_terminate_backend(:pid, 5000)"), {"pid": pid})
+        raise ValueError("the write broke in code")
+
+    monkeypatch.setattr(main_mod, "_persist_chunks", write_that_breaks_on_a_dead_connection)
+    try:
+        with pytest.raises(ValueError, match="the write broke in code"):
+            main_mod.persist_results(db_session, run, [])
+    finally:
+        admin.dispose()
+
+    assert db_session.scalar(select(storage.Run.id).where(storage.Run.id == run.id)) == run.id
+
+
+# ─── Чего стоил незакрытый прогон соседнему сайту ─────────────────────────────
+
+
+def test_one_sites_database_failure_does_not_fail_the_next_sites_run(db_session, monkeypatch):
+    """Сбор aloe упал на базе, следом по расписанию идёт сбор aptekonline.
+
+    Пока строка упавшего сбора висела `running`, проверенный сбор следующего
+    сайта сам кончался `failed` — на пересчёте рекомендаций («ROI refresh failed
+    for trusted epoch»), — а кэш рекомендаций удалялся: эпоха каталога смотрит на
+    последнюю попытку сайта по номеру, и незакрытая попытка её закрывает.
+    Прогон, закрытый как `failed`, соседу не мешает: пересчёт откладывается,
+    сбор кончается `ok`, кэш остаётся как был.
+    """
+    sites = ("pharmonline", "aptekonline", "aloe")
+    week_ago = utcnow() - timedelta(days=6, hours=23)
+    for site in sites:
+        db_session.add(
+            storage.Run(
+                status="ok",
+                started_at=week_ago,
+                finished_at=week_ago + timedelta(hours=1),
+                catalog_scope="full",
+                full_catalog_sites=site,
+                catalog_verified=True,
+                run_quality={
+                    "full_catalog_verified": True,
+                    "financially_eligible": True,
+                    "sites": {site: {"status": "ok"}},
+                },
+                products_scraped=10,
+            )
+        )
+    db_session.commit()
+    for site in sites:
+        db_session.add(
+            storage.RoiActionsCache(
+                tenant_id=1,
+                client_site=site,
+                payload=[{"type": "undercut"}],
+                computed_at=week_ago + timedelta(hours=1),
+                run_id=1,
+            )
+        )
+    db_session.commit()
+    monkeypatch.setattr(main_mod, "persist_aloe_country_mappings", lambda *args: 0)
+    # `--force`: гвард ритма решает по дню недели, тесту он не нужен.
+    scheduled = ("run", "--mode", "category", "--force")
+
+    broken, _ = _run_catalog(
+        db_session,
+        monkeypatch,
+        {"cat-a": [_without_url("bad", 6.0, "cat-a", "aloe")]},
+        site="aloe",
+        expected_status="failed",
+        command_line=scheduled,
+    )
+    following, _ = _run_catalog(
+        db_session,
+        monkeypatch,
+        {"cat-a": [_scraped("a", 5.0, "cat-a")]},
+        expected_status="ok",
+        command_line=scheduled,
+    )
+
+    assert broken.finished_at is not None
+    assert (following.full_catalog_sites, following.catalog_verified) == (SITE, True)
+    cached = db_session.execute(
+        select(storage.RoiActionsCache.client_site, storage.RoiActionsCache.payload)
+    ).all()
+    assert sorted(cached) == [(site, [{"type": "undercut"}]) for site in sorted(sites)]
 
 
 # ─── Соседние команды: scrape (тики) и ai-crawl ──────────────────────────────
@@ -803,30 +1024,57 @@ def test_scrape_command_closes_the_run_after_a_database_failure_outside_the_writ
     assert _external_ids(db_session) == [], "до записи сбора не дошло"
 
 
-def test_ai_crawl_command_that_cannot_be_written_ends_failed(db_session, monkeypatch):
-    """`ai-crawl` пишет той же `persist_results`."""
+class _Crawler:
+    """Запасной сборщик, нашедший одну запись."""
 
-    class _Crawler:
-        async def __aenter__(self):
-            return self
+    found: ScrapedProduct
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
+    async def __aenter__(self):
+        return self
 
-        async def crawl(self, max_urls: int, dry_run: bool = False):
-            return ScrapeResult(site="aptekonline", products=[_without_url("bad", 6.0, "cat-a")])
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
 
-    monkeypatch.setitem(ai_crawler.AI_CRAWLER_BY_SITE, "aptekonline", _Crawler)
+    async def crawl(self, max_urls: int, dry_run: bool = False):
+        return ScrapeResult(site=SITE, products=[type(self).found])
+
+
+def _ai_crawl(db_session, monkeypatch, found: ScrapedProduct):
+    crawler = type("_Found", (_Crawler,), {"found": found})
+    monkeypatch.setitem(ai_crawler.AI_CRAWLER_BY_SITE, SITE, crawler)
     monkeypatch.delenv("AI_CRAWL_PROVIDER", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "not-used")
     monkeypatch.setattr(storage, "init_db", lambda: None)
     monkeypatch.setattr(storage, "make_session", lambda: _session_factory(db_session))
+    db_session.commit()
 
-    result = CliRunner().invoke(main_mod.cli, ["ai-crawl", "--site", "aptekonline"])
+    result = CliRunner().invoke(main_mod.cli, ["ai-crawl", "--site", SITE])
 
     db_session.rollback()
+    db_session.expire_all()
     run = db_session.scalar(select(storage.Run).order_by(storage.Run.id.desc()))
     assert result.exit_code != 0
     assert run.status == "failed", (result.output, result.exception)
     assert run.finished_at is not None
+    return run
+
+
+def test_ai_crawl_command_that_cannot_be_written_ends_failed(db_session, monkeypatch):
+    """`ai-crawl` пишет той же `persist_results`."""
+    run = _ai_crawl(db_session, monkeypatch, _without_url("bad", 6.0, "cat-a"))
+
+    assert run.error_message.startswith("IntegrityError"), run.error_message
+
+
+@pytest.mark.parametrize("failing_step", [_unwritable_row_at_flush, _refused_statement])
+def test_ai_crawl_handler_does_not_rely_on_the_write_cleaning_up(
+    db_session, monkeypatch, failing_step
+):
+    """Другого обращения к базе, кроме записи сбора, у `ai-crawl` нет, а запись
+    откатывает за собой сама. Обработчик на это не полагается: здесь на месте
+    записи шаг, который падает на базе и транзакцию за собой не откатывает."""
+    monkeypatch.setattr(main_mod, "persist_results", failing_step)
+
+    run = _ai_crawl(db_session, monkeypatch, _scraped("a", 5.0, "cat-a"))
+
     assert run.error_message.startswith("IntegrityError"), run.error_message
