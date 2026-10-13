@@ -1357,6 +1357,7 @@ def _notification_settings(session, user):
     [
         {"email_severity_min": "critical"},
         {"email_severity_min": "info"},
+        {"email_severity_min": "off"},
         {"daily_digest": True},
         {"weekly_digest": False},
         {"telegram_severity_min": "info"},
@@ -1374,7 +1375,10 @@ def test_viewer_cannot_change_own_notifications(client, setup_db, change):
     assert _notification_settings(setup_db, viewer) == ("off", False, True, None, None)
 
 
-def test_viewer_sees_own_notifications_and_is_told_they_are_not_editable(client, setup_db):
+def test_viewer_sees_own_notifications_and_is_told_they_are_not_editable(
+    client, setup_db, monkeypatch
+):
+    monkeypatch.delenv("WEEKLY_DIGEST_ENABLED", raising=False)
     _login_client_staff(client, setup_db)
 
     response = client.get("/api/v1/dash/me/notifications")
@@ -1391,6 +1395,52 @@ def test_viewer_sees_own_notifications_and_is_told_they_are_not_editable(client,
         "can_edit": False,
         "has_delivery": True,
     }
+
+
+def test_viewer_whom_nothing_reaches_is_told_so_and_still_cannot_edit(client, setup_db):
+    viewer = _login_client_staff(client, setup_db)
+    viewer.weekly_digest = False
+    setup_db.commit()
+
+    body = client.get("/api/v1/dash/me/notifications").json()
+
+    assert (body["can_edit"], body["has_delivery"]) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("role", "may_edit"),
+    [("admin", True), ("owner", True), ("viewer", False), ("analyst", False), ("Admin", False)],
+)
+def test_only_administrator_roles_change_their_own_notifications(
+    client, setup_db, role, may_edit
+):
+    """Список разрешённых, а не запрещённых: незнакомая роль прав не получает."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    user = _make_user(setup_db, "someone@x.az", role=role)
+    assert _verify_login(client, setup_db, user.email).status_code == 200
+
+    response = client.patch(
+        "/api/v1/dash/me/notifications", json={"email_severity_min": "critical"}
+    )
+
+    assert response.status_code == (200 if may_edit else 403), response.text
+    assert _notification_settings(setup_db, user)[0] == ("critical" if may_edit else None)
+    assert client.get("/api/v1/dash/me/notifications").json()["can_edit"] is may_edit
+
+
+def test_viewer_can_still_unbind_own_telegram(client, setup_db):
+    """Отвязка только убавляет доставку, и другого выключателя у чата нет:
+    страница «Пользователи» привязкой Telegram не управляет."""
+    viewer = _login_client_staff(client, setup_db)
+    viewer.telegram_chat_id = "700400"
+    setup_db.commit()
+
+    response = client.delete("/api/v1/dash/me/notifications/telegram")
+
+    assert response.status_code == 204, response.text
+    setup_db.refresh(viewer)
+    assert viewer.telegram_chat_id is None
 
 
 def test_administrator_is_the_one_who_changes_a_viewers_notifications(

@@ -24,13 +24,16 @@ import { useTranslations } from "next-intl";
 import { api } from "@/lib/api";
 import { shouldShowNotifBanner } from "@/lib/notif-prefs";
 
-const DISMISS_KEY = "notif-banner-dismissed-v1";
+// v2: до 2026-10-13 баннер показывался и тем, кому письма шли, — скрытый тогда
+// не должен остаться скрытым теперь, когда он говорит правду.
+const DISMISS_KEY = "notif-banner-dismissed-v2";
 
 export function NotificationsBanner() {
   const t = useTranslations("banner");
   const [dismissed, setDismissed] = useState(true); // hide by default, set after hydration
   const { data } = useQuery({
-    queryKey: ["notif-prefs-banner"],
+    // Тот же ключ, что у страницы настроек: сохранил там — баннер перечитал.
+    queryKey: ["notif-prefs"],
     queryFn: () => api.notifPrefs(),
     staleTime: 60_000,
     retry: 0,

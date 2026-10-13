@@ -6,7 +6,7 @@ import { Link, useRouter } from "@/i18n/navigation";
 import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, MessageCircle, Send, User, Users, XCircle, Zap } from "lucide-react";
 import { useState } from "react";
 import { api, type NotifPrefsPatch } from "@/lib/api";
-import { canEditNotifPrefs } from "@/lib/notif-prefs";
+import { digestToggleLocked, notifPrefsReadOnly } from "@/lib/notif-prefs";
 import { LocaleSwitcher } from "@/components/locale-switcher";
 import { passwordProblem, type PasswordProblem } from "@/lib/password-rule";
 
@@ -287,14 +287,16 @@ function NotificationsSection({ email }: { email?: string }) {
   const prefs = prefsQ.data;
   // Viewer свои уведомления видит, но не меняет: их задаёт администратор на
   // странице «Пользователи». Сервер такую правку отклоняет и без этой страницы.
-  const canEdit = canEditNotifPrefs(prefs);
+  const readOnly = notifPrefsReadOnly(prefs);
+  const dailyTimerOn = statusQ.data?.digests.daily.enabled;
+  const weeklyTimerOn = statusQ.data?.digests.weekly.enabled;
 
   return (
     <Section title={t("notifications")} icon={Bell}>
       {prefsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
       {prefs && (
         <div className="space-y-4">
-          {!canEdit && (
+          {readOnly && (
             <div className="rounded-md border border-border bg-secondary/50 p-3 text-sm">
               {t("notifications_admin_managed")}
             </div>
@@ -308,7 +310,7 @@ function NotificationsSection({ email }: { email?: string }) {
             <SeveritySelect
               value={prefs.email_severity_min ?? "warning"}
               onChange={(v) => updateMutation.mutate({ email_severity_min: v })}
-              disabled={!canEdit}
+              disabled={readOnly}
             />
           </div>
 
@@ -326,7 +328,7 @@ function NotificationsSection({ email }: { email?: string }) {
                   <SeveritySelect
                     value={prefs.telegram_severity_min ?? "critical"}
                     onChange={(v) => updateMutation.mutate({ telegram_severity_min: v })}
-                    disabled={!canEdit}
+                    disabled={readOnly}
                   />
                   <button
                     onClick={() => {
@@ -338,7 +340,7 @@ function NotificationsSection({ email }: { email?: string }) {
                   </button>
                 </div>
               </div>
-            ) : !canEdit ? (
+            ) : readOnly ? (
               <div className="text-xs text-muted-foreground">{t("telegram_not_bound")}</div>
             ) : !integrationsQ.data?.telegram ? (
               <div className="rounded-md bg-warning/10 border border-warning/40 p-3 text-sm">
@@ -381,7 +383,7 @@ function NotificationsSection({ email }: { email?: string }) {
               type="text"
               defaultValue={prefs.quiet_hours ?? ""}
               placeholder="22-08"
-              disabled={!canEdit}
+              disabled={readOnly}
               onBlur={(e) => {
                 const v = e.target.value.trim();
                 if (v !== (prefs.quiet_hours ?? "")) {
@@ -400,10 +402,14 @@ function NotificationsSection({ email }: { email?: string }) {
               })}
               checked={prefs.daily_digest}
               onChange={(v) => updateMutation.mutate({ daily_digest: v })}
-              disabled={!canEdit || statusQ.data?.digests.daily.enabled === false}
+              disabled={readOnly || digestToggleLocked(dailyTimerOn, prefs.daily_digest)}
             />
-            {statusQ.data?.digests.daily.enabled === false && (
-              <p className="text-xs text-warning">{t("daily_digest_disabled")}</p>
+            {dailyTimerOn === false && (
+              <p className="text-xs text-warning">
+                {prefs.daily_digest && !readOnly
+                  ? t("daily_digest_blocks_instant")
+                  : t("daily_digest_disabled")}
+              </p>
             )}
             <Toggle
               label={t("weekly_digest_schedule", {
@@ -411,7 +417,7 @@ function NotificationsSection({ email }: { email?: string }) {
               })}
               checked={prefs.weekly_digest}
               onChange={(v) => updateMutation.mutate({ weekly_digest: v })}
-              disabled={!canEdit || statusQ.data?.digests.weekly.enabled === false}
+              disabled={readOnly || digestToggleLocked(weeklyTimerOn, prefs.weekly_digest)}
             />
           </div>
 

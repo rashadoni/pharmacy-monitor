@@ -1355,6 +1355,16 @@ def test_bind_telegram_refuses_a_viewer(setup, tenant_user):
         }
     ]
 
+    # Отказ не зависит от того, привязан ли уже чат (он мог остаться с тех
+    # пор, когда запись была администраторской): новый не подставляется.
+    viewer.telegram_chat_id = "111"
+    s.commit()
+    assert notifications.bind_telegram(s, "424242", "bob@example.com") is False
+    s.refresh(viewer)
+    assert viewer.telegram_chat_id == "111"
+    viewer.telegram_chat_id = None
+    s.commit()
+
     # И критичное событие прогона по-прежнему не уходит ему ни письмом, ни в Telegram.
     event = _mk_event(s, tenant_user.tenant_id, "after-refused-bind", "critical", "x")
     s.commit()
@@ -1367,21 +1377,26 @@ def test_bind_telegram_refuses_a_viewer(setup, tenant_user):
     assert not mock_tg.called
 
 
-# (порог писем, ежедневный, недельный, чат Telegram, порог Telegram)
+# (порог писем, ежедневный, недельный, чат Telegram, порог Telegram, тихие часы)
 _REACH_CASES = [
-    ("off", False, True, None, None),  # сотрудник клиента с 2026-10-13
-    ("off", False, False, None, None),  # не доходит ничего
-    (None, False, False, None, None),  # пустой порог — это warning, письма идут
-    ("info", False, False, None, None),
-    ("warning", False, False, None, None),
-    ("critical", False, False, None, None),
-    ("warning", True, False, None, None),  # ежедневный дайджест отменяет письма сразу
-    ("warning", True, True, None, None),
-    ("off", True, True, None, None),
-    ("off", False, False, "700300", None),  # чат привязан, порог по умолчанию
-    ("off", False, False, "700300", "info"),
-    ("off", False, False, "700300", "off"),
-    ("off", True, False, "700300", "off"),
+    ("off", False, True, None, None, None),  # сотрудник клиента с 2026-10-13
+    ("off", False, False, None, None, None),  # не доходит ничего
+    (None, False, False, None, None, None),  # пустой порог — это warning, письма идут
+    ("info", False, False, None, None, None),
+    ("warning", False, False, None, None, None),
+    ("critical", False, False, None, None, None),
+    ("warning", True, False, None, None, None),  # ежедневный дайджест отменяет письма сразу
+    ("warning", True, True, None, None, None),
+    ("off", True, True, None, None, None),
+    ("off", False, False, "700300", None, None),  # чат привязан, порог по умолчанию
+    ("off", False, False, "700300", "info", None),
+    ("off", False, False, "700300", "off", None),
+    ("off", True, False, "700300", "off", None),
+    # Равные часы — тихо круглые сутки: Telegram не уходит никогда. Окно на
+    # часть суток здесь не стоит: исход зависел бы от часа запуска теста.
+    ("off", False, False, "700300", None, "5-5"),
+    ("off", False, False, "700300", "info", "0-0"),
+    ("warning", False, False, "700300", None, "0-0"),  # письму тихие часы не мешают
 ]
 
 
@@ -1392,8 +1407,12 @@ _REACH_CASES = [
 def test_anything_reaches_agrees_with_what_is_actually_sent(
     setup, tenant_user, prefs, daily_on, weekly_on
 ):
-    """Ответ для баннера сверяется с настоящей рассылкой: критичное событие
-    прогона и те дайджесты, чей таймер на сервере идёт."""
+    """Ответ для баннера сверяется с тем, что шлют сами отправители: критичное
+    событие прогона и те дайджесты, чей таймер считается идущим.
+
+    Ежедневный дайджест здесь шлёт `send_daily_digest` — на сервере её зовёт
+    только кнопка: юнита, который слал бы её по таймеру, в `infra/systemd/` нет.
+    """
     s = setup
     (
         tenant_user.email_severity_min,
@@ -1401,6 +1420,7 @@ def test_anything_reaches_agrees_with_what_is_actually_sent(
         tenant_user.weekly_digest,
         tenant_user.telegram_chat_id,
         tenant_user.telegram_severity_min,
+        tenant_user.quiet_hours,
     ) = prefs
     run = _eligible_run(s, tenant_user.tenant_id)
     event = _digest_event(s, run, "undercut_threshold", "critical", "Reach")
@@ -1423,3 +1443,20 @@ def test_anything_reaches_agrees_with_what_is_actually_sent(
         )
         is delivered
     )
+
+
+
+def test_quiet_hours_for_part_of_the_day_still_count_as_telegram_delivery(setup, tenant_user):
+    """Тихие часы на часть суток Telegram не выключают — только круглосуточные."""
+    tenant_user.email_severity_min = "off"
+    tenant_user.telegram_chat_id = "700300"
+    tenant_user.telegram_severity_min = None
+
+    def reaches(quiet_hours):
+        tenant_user.quiet_hours = quiet_hours
+        return notifications.anything_reaches(
+            tenant_user, daily_digest_on=False, weekly_digest_on=False
+        )
+
+    assert [reaches(q) for q in (None, "22-08", "8-22", "23-0", "0-23", "not-hours")] == [True] * 6
+    assert [reaches(q) for q in ("0-0", "5-5", "23-23")] == [False] * 3

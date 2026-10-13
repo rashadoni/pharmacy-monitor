@@ -808,7 +808,14 @@ def _digest_timer_on(kind: str) -> bool:
     """Идёт ли на сервере таймер дайджеста.
 
     Systemd timer truth is mirrored through explicit deployment env, avoiding
-    privileged `systemctl` calls from the web process.
+    privileged `systemctl` calls from the web process. The value is read from
+    the API process environment: a change takes an API restart.
+
+    ⚠️ `daily` must stay off until a unit runs `notify digest daily`. The only
+    daily unit in `infra/systemd/` runs the legacy `pharmacy-monitor digest`,
+    which mails the `recipients` table and never reads
+    `tenant_users.daily_digest`: with the flag on, the dashboard would count a
+    per-user letter that no timer sends.
     """
     if kind == "daily":
         return _env_enabled("DAILY_DIGEST_ENABLED", False)

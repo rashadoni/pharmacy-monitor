@@ -399,29 +399,48 @@ def mail_unstored_events_to_admins(
 def may_edit_own_notifications(user: storage.TenantUser) -> bool:
     """Свои уведомления меняет только администратор.
 
-    Решение владельца 2026-10-13: сотруднику клиента (роль viewer) порог писем,
-    дайджесты и Telegram задаёт администратор на странице «Пользователи». До
-    этого получатель, которому мгновенные письма выключили, включал их себе сам.
+    Решение владельца 2026-10-13: сотруднику клиента (роль viewer) порог писем и
+    дайджесты задаёт администратор на странице «Пользователи». До этого
+    получатель, которому мгновенные письма выключили, включал их себе сам.
+    Порог Telegram и тихие часы viewer через интерфейс не задаёт никто: на
+    странице «Пользователи» этих полей нет.
     """
     return user.role in ADMIN_ROLES
+
+
+def _quiet_around_the_clock(quiet_hours: str | None) -> bool:
+    """Равные часы («0-0», «5-5») — тихо в любую минуту суток."""
+    return all(
+        _in_quiet_hours(quiet_hours, datetime(2000, 1, 1, hour)) for hour in range(24)
+    )
 
 
 def anything_reaches(
     user: storage.TenantUser, *, daily_digest_on: bool, weekly_digest_on: bool
 ) -> bool:
-    """Доходит ли до получателя хоть что-то: письмо сразу, Telegram или дайджест.
+    """Доходит ли до получателя хоть что-то из журнала алертов: письмо сразу,
+    Telegram или дайджест.
 
     Правила те же, что у `dispatch_events_batch` и `_send_digest`; вопрос — про
     событие наивысшей важности. `*_digest_on` — идёт ли на сервере таймер этого
     дайджеста: галочка получателя без таймера письма не даёт, а `daily_digest`
-    при этом ещё и отменяет письма сразу. Тихие часы не учитываются: они
-    откладывают Telegram, а не выключают его.
+    при этом ещё и отменяет письма сразу.
+
+    Чего правило не знает: настроены ли SMTP и токен бота; письма
+    администраторам о ценах с тиков (`mail_unstored_events_to_admins`) — их
+    событий в журнале нет, и `daily_digest` их не отменяет. Тихие часы Telegram
+    не откладывают, а пропускают: событие, пришедшее в них, в Telegram не уйдёт
+    совсем. Здесь они считаются, только когда закрывают все сутки.
     """
     instant_email = not user.daily_digest and _severity_passes(
         user.email_severity_min, "critical", DEFAULT_EMAIL_SEVERITY
     )
-    telegram = bool(user.telegram_chat_id) and _severity_passes(
-        user.telegram_severity_min, "critical", DEFAULT_TELEGRAM_SEVERITY
+    telegram = (
+        bool(user.telegram_chat_id)
+        and _severity_passes(
+            user.telegram_severity_min, "critical", DEFAULT_TELEGRAM_SEVERITY
+        )
+        and not _quiet_around_the_clock(user.quiet_hours)
     )
     digest = (bool(user.daily_digest) and daily_digest_on) or (
         bool(user.weekly_digest) and weekly_digest_on
@@ -439,6 +458,10 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
     Returns True if bound, False if user not found or may not change their own
     notifications: a bound chat receives alerts at once, which is exactly what
     the administrator decides for a viewer.
+
+    The check is on the account the address names, not on who is typing: a chat
+    that names an administrator's address is still bound to the administrator's
+    account. Binding by address cannot tell the two apart.
     """
     user = session.scalar(
         select(storage.TenantUser).where(
