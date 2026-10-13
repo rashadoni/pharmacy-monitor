@@ -83,6 +83,8 @@ infra/systemd/pharmacy-monitor-backup.timer     W1
 infra/systemd/pharmacy-monitor-digest@.service  W9
 infra/systemd/pharmacy-monitor-digest@daily.timer  W9
 infra/systemd/pharmacy-monitor-digest@weekly.timer W9
+infra/systemd/pharmacy-monitor-digest-daily.service  2026-10-13 (утреннее письмо с разницей цен)
+infra/systemd/pharmacy-monitor-digest-daily.timer    2026-10-13
 infra/systemd/pharmacy-monitor-telegram-bot.service W9
 infra/grafana/dashboard.json                    W11
 infra/prometheus.yml                            W11

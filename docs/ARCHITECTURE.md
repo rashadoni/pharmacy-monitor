@@ -369,7 +369,8 @@ Services (all systemd):
 - pharmacy-monitor-health.timer         → hourly
 - pharmacy-monitor-backup.timer         → daily 04:00 по времени хоста
 - pharmacy-monitor-rematch.timer        → Tuesday and Friday 04:30 по времени хоста; `rematch` без `--reset` (тот же этап, что конец сбора). Так в Git; на сервере — после замены юнита, см. RUNBOOK «Выкладка правок сопоставления». 2026-10-11 юнит на сервере ещё прежний (понедельник 05:00, `rematch --reset`). Последний его запуск был 2026-10-05, до выкладки отказа; код на сервере теперь на `--reset` без второго флага отвечает отказом (RUNBOOK, там же), так что со следующего запуска не должно быть ни сброса, ни планового `rematch`, пока юнит не заменён, — прочитано в коде, в журнале ещё не наблюдалось
-- pharmacy-monitor-digest@daily.timer   → daily 05:00 UTC; на сервере выключен
+- pharmacy-monitor-digest@daily.timer   → daily 05:00 UTC; на сервере выключен (прежняя команда `digest`)
+- pharmacy-monitor-digest-daily.timer   → daily 05:00 UTC; утреннее письмо с разницей цен (`notify digest daily`). В Git с 2026-10-13; на сервере — после того как root поставит юнит, RUNBOOK «Утреннее письмо с разницей цен»
 - pharmacy-monitor-digest-weekly.timer  → понедельник 06:00 UTC; на сервере включён
 - prometheus, grafana-server            → активны (Grafana за Caddy, /grafana); Alertmanager не установлен
 

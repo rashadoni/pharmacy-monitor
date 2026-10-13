@@ -277,6 +277,8 @@ sudo journalctl -u pharmacy-monitor-run -f
 - еженедельный сбор pharmonline — журнал шага GitHub Actions, `gh run view <id> --log`;
 - письмо админу с тика — `-u pharmacy-monitor-intraday`;
 - недельный дайджест — `-u pharmacy-monitor-digest-weekly`;
+- утреннее письмо с разницей цен — `-u pharmacy-monitor-digest-daily` (разбор его
+  событий — «Утреннее письмо с разницей цен»);
 - письмо о здоровье — `-u pharmacy-monitor-health`;
 - ссылка на вход — `-u pharmacy-monitor-api`.
 
@@ -806,10 +808,17 @@ per-user тумблеры daily/weekly (`tenant_users`, страница «По�
 | Полный отчёт скрейпа (HTML+Excel, тема «Pharmacy Monitor DD.MM.YYYY — N undercuts») | `run_cmd` в конце КАЖДОГО не-hourly прогона — nightly **и intraday-tick** (`hourly=False`, до ~13/день 05–17 UTC) | `SCRAPE_REPORT_EMAIL=0` в `/etc/pharmacy-monitor/env` (next scrape) | `SCRAPE_REPORT_EMAIL=1` или убрать строку |
 | Daily-дайджест (тема «Дайджест за сегодня», топ-N за 24ч) | `digest@daily.timer` → `pharmacy-monitor digest` → `src/digest.py` | `systemctl disable --now pharmacy-monitor-digest@daily.timer` | `systemctl enable --now …` |
 | Недельный per-user дайджест | `digest-weekly.timer` Пн 06:00 UTC → `notify digest weekly` → `src/notifications.py` (`tenant_users.weekly_digest`) | per-user тумблер в UI / `systemctl disable …` | UI / `systemctl enable …` |
+| Утреннее письмо с разницей цен (с 2026-10-13; на сервере — после установки таймера) | `digest-daily.timer` 05:00 UTC → `notify digest daily --locale az` → `src/notifications.py` (`tenant_users.daily_digest`) | per-user тумблер в UI / `systemctl disable --now pharmacy-monitor-digest-daily.timer` | раздел «Утреннее письмо с разницей цен» |
 
 **Важно — два разных тумблера, два разных отката:** отчёт-письмо гасится
 **env-флагом**, daily-дайджест — **состоянием systemd-юнита**. При откате нужно
 вернуть ОБА (легко забыть один).
+
+⚠️ Уточнение 2026-10-13: «Daily-дайджест» в таблице и в абзаце выше — прежняя
+команда `digest` под юнитом `pharmacy-monitor-digest@daily`. Утреннее письмо с
+разницей цен — другая команда (`notify digest daily`) под другим юнитом,
+`pharmacy-monitor-digest-daily`; оба таймера стоят на 05:00 UTC, и прежний
+включать обратно не нужно — получателю ушло бы два письма.
 
 `price_change_pct` сообщает и о росте, и о снижении цены; `price_drop_pct`
 нужен только когда снижение требует отдельной политики. Не включайте оба
@@ -855,6 +864,10 @@ ssh root@13.140.186.143 'sudo -u postgres psql -X pharmacy_monitor -c "select id
 `notify digest daily|weekly` (и кнопка «отправить дайджест» в Quick Actions)
 собирает `_render_digest_email` в `src/notifications.py`:
 
+⚠️ Уточнение 2026-10-13: у суточного письма над этой сводкой теперь стоит отчёт
+о разнице цен, а во вложении — Excel; уходит оно и без событий. Недельное не
+изменилось. Раздел «Утреннее письмо с разницей цен».
+
 - наверху — сводка: по строке на тип события с числом, разбивкой по важности и
   по сайтам;
 - ниже — события строками, не больше `_DIGEST_TYPE_CAP` (30) на тип и
@@ -892,6 +905,170 @@ set -a; source /etc/pharmacy-monitor/env; set +a
 .venv/bin/pharmacy-monitor notify digest weekly --only admin@example.com
 ```
 
+### Утреннее письмо с разницей цен
+
+Написано 2026-10-13. Клиент попросил присылать «различающиеся данные» на почту
+каждый день сам; владелец решил: каждое утро — письмо с разницей цен между
+сайтом клиента и двумя конкурентами и тот же Excel, что отдаёт кнопка на
+странице сравнения. Это суточный дайджест (`notify digest daily`,
+`src/notifications.py`), которому добавлен верх.
+
+⚠️ На сервере это работает после трёх шагов, и ни один из них выкладка не
+делает: код выложен, таймер поставил root, у получателя включён суточный
+дайджест. На 2026-10-13 не сделан ни один — смотреть сервер, а не эту строку
+(команды ниже).
+
+**Что в письме.**
+
+- Тема: «Pharmacy Monitor — цены на ДД.ММ.ГГГГ: различаются у N товаров» (дата
+  бакинская). Без отчёта о ценах тема прежняя: «…дайджест за сутки: N событий».
+- Числа на момент отправки: сколько товаров в сравнении; у скольких цена на
+  сайтах различается; из них — у конкурента дешевле, чем у клиента; у клиента
+  самая низкая (в том числе поровну с одним из конкурентов); свежей цены клиента
+  нет (различаются цены конкурентов между собой); у скольких цена одинаковая.
+  Определения — в `comparison_export.difference_counts`.
+- Когда каждый из трёх сайтов последний раз собран полностью сбором, прошедшим
+  проверку каталога (`storage.latest_financial_run_ids_by_site` — тот же
+  источник, что у тревоги `full_catalog_overdue`), время бакинское. Если сбор
+  старше, чем позволяет ритм сайта (`cadence.site_max_age_hours`), — строка
+  «Данные <сайт> — от <дата>: с тех пор полный сбор этого сайта не прошёл…».
+- Вложение — .xlsx страницы сравнения с фильтрами по умолчанию: первый лист —
+  товары с разной ценой, второй — всё сравнение. «Различаются у N» в письме —
+  это число строк первого листа; разбивка — колонка «Позиция Pharmonline» того
+  же листа. Язык файла задаёт `--locale ru|az|en` (юнит зовёт `--locale az`);
+  текст письма русский, как у всех писем системы.
+- Ниже — события за сутки тем же блоком, что в недельном дайджесте. Событий нет
+  — одна строка об этом.
+- Списка самых больших разниц в письме нет намеренно: наверху по разнице чаще
+  всего стоят пары, где сведены разные товары.
+
+**Когда уходит.** Есть отчёт — уходит, были события или нет. Отчёта нет, а
+события есть — уходит прежнее письмо о событиях, без чисел и без файла. Нет ни
+того ни другого — не уходит. Отчёта нет в трёх случаях (причина — в журнале):
+успешного сбора ещё не было; финансовые сравнения приостановлены политикой
+(страница сравнения в это время отвечает 503); сравнивать нечего. Четвёртый —
+сборка отчёта упала: тогда при пустых сутках команда кончается ошибкой (код 1),
+и юнит показывает сбой.
+
+**Кто получает.** Активные пользователи арендатора с включённым «Ежедневным
+дайджестом» (`tenant_users.daily_digest`). Письмо одно на всех; «Порог
+email-уведомлений» на него не действует. ⚠️ Включённый суточный дайджест
+отменяет получателю письма сразу после сбора (`dispatch_events_batch`): события
+он увидит в утреннем письме. Клиенту они и так не идут (порог `off`), а у
+администратора включение этой галочки их отложит до утра.
+
+По понедельникам у получателя, у которого включены оба дайджеста, писем два:
+утреннее в 09:00 и недельный дайджест в 10:00 по Баку.
+
+**Посмотреть, не отправляя клиенту.**
+
+```bash
+# на сервере, под pm, с загруженным env (systemd-EnvironmentFile вручную не грузится)
+set -a; source /etc/pharmacy-monitor/env; set +a
+# ничего не шлёт: числа и размер вложения — в событии digest_price_report,
+# получатель (user_id), тема и размер письма — в digest_dry_run
+.venv/bin/pharmacy-monitor notify digest daily --locale az --dry-run
+# шлёт одному адресу — из тех, у кого суточный дайджест включён
+.venv/bin/pharmacy-monitor notify digest daily --locale az --only <адрес>
+```
+
+`--dry-run` без получателей ответит `digest_no_recipients` и отчёт собирать не
+станет: чтобы посмотреть числа, суточный дайджест должен быть включён хотя бы у
+одной записи.
+
+Кнопка «отправить дайджест» в Quick Actions дашборда зовёт ту же функцию: она
+шлёт это же письмо всем, у кого суточный дайджест включён, с вложением на
+русском. Для просмотра она не годится.
+
+**Включить (root, на сервере).** `deploy.yml` кладёт юниты в
+`/opt/pharmacy-monitor/infra/systemd/`, в `/etc/systemd/system/` их ставят
+руками. В `install_systemd_schedule.sh` таймера нет намеренно: тот скрипт
+включает всё, что ставит.
+
+```bash
+# 1. Код письма выложен? 0 — нет: команда на сервере не знает --locale, юнит упадёт
+grep -c DailyLetterNotSent /opt/pharmacy-monitor/src/notifications.py
+ls /opt/pharmacy-monitor/infra/systemd/pharmacy-monitor-digest-daily.timer
+
+# 2. Поставить и включить таймер (только таймер: сервис запускает он)
+install -m 0644 \
+  /opt/pharmacy-monitor/infra/systemd/pharmacy-monitor-digest-daily.service \
+  /opt/pharmacy-monitor/infra/systemd/pharmacy-monitor-digest-daily.timer \
+  /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now pharmacy-monitor-digest-daily.timer
+
+# 3. Что получилось: следующий запуск — 05:00 UTC (09:00 Баку)
+systemctl list-timers pharmacy-monitor-digest-daily.timer
+systemctl cat pharmacy-monitor-digest-daily.service | grep ExecStart
+# прежний суточный таймер (команда `digest`, письмо на EMAIL_TO) должен остаться
+# выключенным, иначе в 05:00 UTC уйдут два письма
+systemctl is-enabled pharmacy-monitor-digest@daily.timer    # disabled
+```
+
+Дальше — получатели. Галочка «Ежедневный дайджест» в дашборде заперта, пока в
+`/etc/pharmacy-monitor/env` не стоит `DAILY_DIGEST_ENABLED=1` (дашборд не
+спрашивает systemd, а читает это окружение; время в подписи —
+`DAILY_DIGEST_SCHEDULE_BAKU`, по умолчанию 09:00). После правки env —
+`systemctl restart pharmacy-monitor-api`, затем Настройки → Пользователи →
+«Ежедневный дайджест» у нужной записи. Проверить, у кого включено (адрес в
+запрос не брать):
+
+```bash
+sudo -u postgres psql -X pharmacy_monitor -c "select id, role, is_active, daily_digest, weekly_digest from tenant_users order by id"
+```
+
+Выключить: `systemctl disable --now pharmacy-monitor-digest-daily.timer` — или
+снять галочку у получателя. ⚠️ У таймера `Persistent=true`: по документации
+systemd, включённый после перерыва, он сразу запустит пропущенное письмо. Если
+это не нужно — перед включением `systemctl clean --what=state
+pharmacy-monitor-digest-daily.timer`. На сервере не проверялось.
+
+**Ушло ли и почему нет.**
+
+```bash
+journalctl -u pharmacy-monitor-digest-daily --since today --no-pager
+systemctl status pharmacy-monitor-digest-daily.service --no-pager | head -5
+```
+
+| В журнале | Что значит |
+|---|---|
+| `digest_no_recipients kind=daily` | Суточный дайджест не включён ни у одной активной записи. Отчёт не собирался |
+| `digest_price_report compared=… differing=… attachment_kb=… overdue_sites=[…]` | Отчёт собран; эти числа — в письме |
+| `digest_price_report_skipped reason=…` | Отчёта нет: `no_successful_run`, `full_catalog_trust_not_ready` (политика), `no_comparison_rows` |
+| `digest_price_report_failed error_type=…` и трассировка | Сборка отчёта упала. Были события — письмо ушло без отчёта, код 0. Не было — `Error: отчёт о разнице цен не собрался (…)`, код 1, юнит в `failed` |
+| `digest_no_events kind=daily` | Ни отчёта, ни событий — письма нет |
+| `smtp_send recipients=1`, следом `smtp_sent_ok` | Почтовый сервер принял письмо этому получателю. Дошло ли — кабинет Resend |
+| `digest_email_failed user_id=… error_type=…` | Этому получателю не ушло; разбор — «Email не приходит» |
+| `digest_sent kind=daily recipients=N events=M` | Итог. `recipients` считает и письма, которые не ушли из-за пустого `SMTP_HOST` (`email_skipped_no_smtp`): верить `smtp_sent_ok` |
+
+Юнит в `failed`: сборка отчёта упала при пустых сутках (строка `Error:` выше),
+команда не уложилась в `TimeoutStartSec` (15 минут) или упала раньше письма —
+тогда в журнале трассировка (недоступна база, не читается env).
+
+**Чего письмо НЕ делает.**
+
+- Не говорит, что изменилось со вчера: числа — состояние на утро. Полный сбор
+  сайтов недельный (`src/cadence.py`), между сборами цены pharmonline и
+  aptekonline не обновляются, aloe — частями; в такие дни письмо почти
+  повторяет вчерашнее.
+- Не проверяет доставку: `smtp_sent_ok` значит только, что сервер письмо принял.
+- Не кончается ошибкой, когда не ушло ни одно письмо из-за отказа почтового
+  сервера: в журнале `digest_email_failed`, код 0 — как у недельного дайджеста.
+- Не кончается ошибкой, когда отчёт упал, а события были: письмо ушло без
+  отчёта, искать `digest_price_report_failed`.
+- Не повторяет отправку: что не ушло утром, само не уйдёт.
+- Разбивка «у кого дешевле» считается для сайта клиента из записи арендатора
+  (`tenants.client_site`), а колонка «Позиция» в файле написана про
+  Pharmonline: у арендатора с другим сайтом клиента они разойдутся. Арендатор
+  сейчас один.
+
+Не проверено на 2026-10-13: отправка настоящим почтовым сервером; размер
+вложения на боевом каталоге (на 1 200 строк сравнения файл — 135 КБ) и примет
+ли его сервер; юнит под systemd на сервере. Проверено: тесты на SQLite
+(`tests/test_daily_price_letter.py`, `tests/test_digest_daily_unit.py`); два
+теста на PostgreSQL написаны, но исполняются только в CI.
+
 ### Firecrawl fallback для Pharmonline
 
 Decodo остаётся основным источником. Автоматический workflow переходит на
@@ -915,6 +1092,7 @@ Fallback читает `rawHtml` API/ sitemap c `maxAge=0`, `storeInCache=false` 
 ssh root@13.140.186.143 '
   grep "^SCRAPE_REPORT_EMAIL=" /etc/pharmacy-monitor/env || echo "(report email: ON — флаг не задан)"
   systemctl is-enabled pharmacy-monitor-digest@daily.timer pharmacy-monitor-digest-weekly.timer
+  systemctl is-enabled pharmacy-monitor-digest-daily.timer   # утреннее письмо; "not-found" — таймер не ставили
   systemctl list-timers --all | grep -i digest
 '
 # NB: есть templated-юнит pharmacy-monitor-digest@weekly.timer (слал бы 24ч-дайджест

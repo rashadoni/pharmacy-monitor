@@ -178,6 +178,10 @@ systemctl enable --now pharmacy-monitor-backup.timer
 >   `pharmacy-monitor-intraday.timer`, `pharmacy-monitor-digest-weekly.timer`
 >   and `pharmacy-monitor-scrape-watcher.timer`. Beyond this and the frontend,
 >   the command block above was not re-checked.
+>   (2026-10-13: a fourth unit pair is installed the same way, by hand —
+>   `pharmacy-monitor-digest-daily.{service,timer}`, the morning price letter.
+>   It was added to Git on that date and was not on the server then; the
+>   commands are in `docs/RUNBOOK.md`, «Утреннее письмо с разницей цен».)
 > - `deploy.yml` copies `infra/systemd/` to `/opt/pharmacy-monitor`, not to
 >   `/etc/systemd/system/`: installing a changed unit is still a separate step
 >   for root, and on 2026-10-11 it had not been taken. The server's
