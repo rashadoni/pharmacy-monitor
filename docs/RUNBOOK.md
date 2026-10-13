@@ -1406,24 +1406,40 @@ with storage.make_session()() as s:
 `select count(*) from stock_levels where canonical_id is not null` и то же для
 `supplier_prices`).
 
+**Перед первым прогоном на сервере** — команда «что шаг сделал бы сейчас»:
+список должен совпасть с замером из PR (на копии от 2026-10-12 — 14 замен). И
+два счёта: `select count(*) from stock_levels where canonical_id is not null` и
+то же для `supplier_prices`. Если не ноль — остановиться и показать владельцу:
+роспуск кластера удалит привязанные к нему строки.
+
 **Откат.** Как у слияний из раздела выше, со снимком самих пар: распущенный
 кластер удаляется, и возврат товара в него упирается во внешний ключ. Шаг
 отката тот же («Откат слияний»), и в ту же транзакцию, перед `commit`, — ещё
-одна строка: отказ, записанный при роспуске пары «Ringer laktat» — «Ringer»,
-сам не уйдёт, а с ним пара не вернётся (`:r` — сохранённый `max(id)` из
-`match_rejections`):
+две команды. Первая снимает отказ, записанный при роспуске пары «Ringer
+laktat» — «Ringer»: сам он не уйдёт, а с ним пара не вернётся (`:r` —
+сохранённый `max(id)` из `match_rejections`). Вторая возвращает названия
+кластеров, которые шаг сменил:
 
 ```sql
 update match_rejections set is_active = false where id > :r and reason = 'revalidate-split';
+update matches m set canonical_name = b.canonical_name, canonical_brand = b.canonical_brand,
+       canonical_dosage = b.canonical_dosage, canonical_pack_size = b.canonical_pack_size
+  from matches_before b
+ where m.id = b.id and (m.canonical_name, m.canonical_brand, m.canonical_dosage, m.canonical_pack_size)
+       is distinct from (b.canonical_name, b.canonical_brand, b.canonical_dosage, b.canonical_pack_size);
 ```
 
-На копии базы 2026-10-13 после этапа с заменами и одним роспуском это
-вернуло назначения всех товаров, все 4 898 пар и число действующих отказов.
-Новые названия кластеров (на копии их четыре) откат не возвращает — как и
-прочие поля уцелевших пар.
-Строка снимает все отказы `revalidate-split`, записанные после выкладки, — не
-только этот. Если между выкладкой и откатом прошли сборы, сначала посмотреть
-список (`select * from match_rejections where id > :r`).
+На копии базы 2026-10-13 после этапа с 14 заменами и одним роспуском это
+вернуло назначения всех товаров, все 4 898 пар с их названиями (сменившихся
+было четыре) и число действующих отказов. Первая команда снимает все отказы
+`revalidate-split`, записанные после выкладки, — не только этот. Если между
+выкладкой и откатом прошли сборы, сначала посмотреть список
+(`select * from match_rejections where id > :r`).
+
+Недельный сбор pharmonline запускает cron GitHub (понедельник 03:20 UTC), а не
+таймер сервера: шаг 1 отката его не останавливает, и код он берёт из `main`.
+Откат данных и возврат `main` не разносить через это время — иначе сбор
+выполнит новый код на возвращённых данных.
 
 ### Замок сопоставления потерян посреди этапа
 
@@ -1903,6 +1919,13 @@ sudo -u postgres psql -X pharmacy_monitor -c "\copy (select id, canonical_id, na
 sudo -u postgres psql -X -At pharmacy_monitor -c "select 'matches', max(id) from matches union all select 'match_rejections', max(id) from match_rejections union all select 'match_policy_audits', max(id) from match_policy_audits"
 ```
 
+И сами пары — без них откат не выполнить (с 2026-10-12 этап удаляет записи
+кластеров: при слиянии двух кусков одного товара и при замене чужого по цене):
+
+```bash
+sudo -u postgres psql -X pharmacy_monitor -c "\copy (select * from matches) to '/tmp/pm-matches-before.csv' csv"
+```
+
 **После выкладки** — запустить этап сопоставления самим, под пользователем и с
 окружением сервиса, и сверить с замером из PR. Сначала убедиться, что сбор не
 идёт (`select id, status from runs where finished_at is null` — пусто), и не
@@ -2023,6 +2046,13 @@ drop-in).
    delete from matches where id > :m;
    commit;
    ```
+
+   Если этап после выкладки удалял записи кластеров (слияния, замены по
+   цене — в его выводе `Stale members relinked` или `Price strangers reseated`
+   не ноль), этот блок упрётся во внешний ключ. Тогда выполнять вариант со
+   снимком пар — «Откат слияний» в разделе «В строке сравнения цены конкурентов
+   есть, а цены клиента нет», с добавочными строками из «В сравнении цена не
+   та, что на сайте…» → «Откат».
 
 3. Вернуть `main` (revert merge-коммита), дождаться зелёного CI, выложить
    `deploy.yml`, включить таймеры.
