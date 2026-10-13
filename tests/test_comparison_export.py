@@ -169,3 +169,109 @@ def test_sheets_and_info(tmp_path):
     assert _open(rows, diff_only=True).sheetnames == ["Разные цены", "О файле"]
     # Пустая выборка — валидный файл с заголовками, а не ошибка.
     assert _body(_open([]).worksheets[0]) == []
+
+
+# ─── Числа утреннего письма: те же правила, что у файла ─────────────────────
+
+_MIXED_SELECTION = [
+    # Конкурент дешевле: клиент самый дорогой и клиент посередине.
+    _row("Дороже всех", {"pharmonline": _price(10.0), "aloe": _price(8.0)}),
+    _row(
+        "Посередине",
+        {"pharmonline": _price(9.0), "aptekonline": _price(8.0), "aloe": _price(10.0)},
+    ),
+    # У клиента самая низкая — и одному, и поровну с конкурентом.
+    _row("Дешевле всех", {"pharmonline": _price(8.0), "aptekonline": _price(10.0)}),
+    _row(
+        "Поровну с конкурентом",
+        {"pharmonline": _price(8.0), "aptekonline": _price(8.0), "aloe": _price(10.0)},
+    ),
+    # Свежей цены клиента нет: товара нет на его сайте либо цена устарела.
+    _row("Только конкуренты", {"aptekonline": _price(8.0), "aloe": _price(10.0)}),
+    _row(
+        "Цена клиента устарела",
+        {
+            "pharmonline": _price(1.0, stale=True, age_days=20),
+            "aptekonline": _price(8.0),
+            "aloe": _price(9.0),
+        },
+    ),
+    # Разницы нет.
+    _row("Одинаковая", {"pharmonline": _price(5.0), "aloe": _price(5.0)}),
+    # Разной была бы только устаревшая цена — это не разница.
+    _row(
+        "Разница только с устаревшей",
+        {
+            "pharmonline": _price(5.0),
+            "aptekonline": _price(5.0),
+            "aloe": _price(9.0, stale=True, age_days=30),
+        },
+    ),
+    # Свежая цена одна — сравнивать не с чем.
+    _row(
+        "Сравнить не с чем",
+        {"pharmonline": _price(5.0), "aloe": _price(9.0, stale=True, age_days=30)},
+    ),
+]
+
+
+def test_difference_counts_split_the_selection_without_overlap():
+    assert comparison_export.difference_counts(_MIXED_SELECTION) == {
+        "compared": 9,
+        "differing": 6,
+        "competitor_cheaper": 2,
+        "client_cheapest": 2,
+        "no_client_price": 2,
+        "same_price": 2,
+        "not_comparable": 1,
+    }
+    assert comparison_export.difference_counts([]) == {
+        "compared": 0,
+        "differing": 0,
+        "competitor_cheaper": 0,
+        "client_cheapest": 0,
+        "no_client_price": 0,
+        "same_price": 0,
+        "not_comparable": 0,
+    }
+
+
+def test_difference_counts_are_what_the_file_shows():
+    """Число из письма можно пересчитать по файлу: строки листов и колонка «Позиция»."""
+    counts = comparison_export.difference_counts(_MIXED_SELECTION)
+    wb = _open(_MIXED_SELECTION)
+    differing, everything = _body(wb["Разные цены"]), _body(wb["Всё сравнение"])
+    positions = [row[8] for row in differing]
+
+    assert counts["compared"] == len(everything)
+    assert counts["differing"] == len(differing)
+    assert counts["client_cheapest"] == positions.count("Самая низкая")
+    assert counts["competitor_cheaper"] == (
+        positions.count("Самая высокая") + positions.count("Посередине")
+    )
+    assert counts["no_client_price"] == positions.count(None)
+    assert counts["same_price"] == [row[8] for row in everything].count("Цена одинаковая")
+    info = {row[0]: row[1] for row in wb["О файле"].iter_rows(values_only=True) if row[0]}
+    assert info["Товаров с разной ценой"] == counts["differing"]
+    assert info["Всего товаров в выборке"] == counts["compared"]
+
+
+def test_difference_counts_compare_unit_prices_when_packs_differ():
+    """Пачка из 50 за 10.00 дешевле штуки за 0.25: у клиента самая низкая, как в файле."""
+    row = _row(
+        "Маска",
+        {
+            "pharmonline": _price(10.0, unit_price=0.2, pack_count=50),
+            "aloe": _price(0.25, unit_price=0.25, pack_count=1),
+        },
+        basis="unit",
+    )
+    assert comparison_export.client_position(row) == "cheapest"
+    assert comparison_export.difference_counts([row])["client_cheapest"] == 1
+
+
+def test_difference_counts_follow_the_tenants_client_site():
+    row = _row("Товар", {"pharmonline": _price(10.0), "aloe": _price(8.0)})
+    assert comparison_export.difference_counts([row])["competitor_cheaper"] == 1
+    assert comparison_export.difference_counts([row], "aloe")["client_cheapest"] == 1
+    assert comparison_export.difference_counts([row], "aptekonline")["no_client_price"] == 1

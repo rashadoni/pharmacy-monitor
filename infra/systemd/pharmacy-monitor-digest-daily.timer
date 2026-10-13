@@ -1,0 +1,15 @@
+[Unit]
+Description=Morning price letter — daily 05:00 UTC (09:00 Asia/Baku)
+
+[Timer]
+# В UTC, а не по времени хоста: 09:00 в Баку круглый год (перехода на летнее
+# время там нет). Ночные сборы стартуют в 23:00–01:00 UTC и к этому часу
+# закончены вместе с сопоставлением; tests/test_digest_daily_unit.py сверяет
+# зазор с таймерами сбора.
+OnCalendar=*-*-* 05:00:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+Unit=pharmacy-monitor-digest-daily.service
+
+[Install]
+WantedBy=timers.target

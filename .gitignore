@@ -34,6 +34,9 @@ data/snapshots/
 logs/*.log
 logs/*.jsonl
 data/category_labels_ru_backup_*.json
+# Сторож утреннего письма (src/daily_letter_state.py): состояние пишет сервер
+data/daily_letter_state.json
+data/.daily_letter_state.json.*.tmp
 reports/
 deck/
 
