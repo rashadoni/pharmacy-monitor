@@ -7,7 +7,11 @@
  *
  * Логика:
  * - На каждом dashboard-экране вверху
- * - Скрыт если: email_severity_min ∈ {info, warning, critical} OR telegram_chat_id
+ * - Показан только тому, кто свои уведомления меняет сам, и только когда до
+ *   него не доходит ничего — ни письмо сразу, ни Telegram, ни дайджест. Оба
+ *   ответа даёт сервер (`can_edit`, `has_delivery`), правило — в
+ *   `lib/notif-prefs.ts`. Viewer баннер не видит: его уведомления задаёт
+ *   администратор, и получатель с одним недельным дайджестом — не «без доставки».
  * - Скрыт если пользователь нажал × (запоминается в localStorage)
  * - CTA: Перейти в Настройки → /settings
  */
@@ -18,6 +22,7 @@ import { useEffect, useState } from "react";
 import { Bell, X } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { api } from "@/lib/api";
+import { shouldShowNotifBanner } from "@/lib/notif-prefs";
 
 const DISMISS_KEY = "notif-banner-dismissed-v1";
 
@@ -37,13 +42,7 @@ export function NotificationsBanner() {
   }, []);
 
   if (dismissed) return null;
-  if (!data) return null;
-
-  const emailOn =
-    data.email_severity_min &&
-    ["info", "warning", "critical"].includes(data.email_severity_min);
-  const telegramOn = !!data.telegram_chat_id;
-  if (emailOn || telegramOn) return null;
+  if (!shouldShowNotifBanner(data)) return null;
 
   function handleDismiss() {
     localStorage.setItem(DISMISS_KEY, "1");

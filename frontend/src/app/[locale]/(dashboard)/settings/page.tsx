@@ -5,7 +5,8 @@ import { useTranslations } from "next-intl";
 import { Link, useRouter } from "@/i18n/navigation";
 import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, MessageCircle, Send, User, Users, XCircle, Zap } from "lucide-react";
 import { useState } from "react";
-import { api, type NotifPrefs } from "@/lib/api";
+import { api, type NotifPrefsPatch } from "@/lib/api";
+import { canEditNotifPrefs } from "@/lib/notif-prefs";
 import { LocaleSwitcher } from "@/components/locale-switcher";
 import { passwordProblem, type PasswordProblem } from "@/lib/password-rule";
 
@@ -275,7 +276,7 @@ function NotificationsSection({ email }: { email?: string }) {
   const statusQ = useQuery({ queryKey: ["system-status"], queryFn: api.systemStatus });
   const bindEmail = email ?? "your-email@example.com";
   const updateMutation = useMutation({
-    mutationFn: (patch: Partial<NotifPrefs>) => api.notifPrefsUpdate(patch),
+    mutationFn: (patch: NotifPrefsPatch) => api.notifPrefsUpdate(patch),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notif-prefs"] }),
   });
   const unbindMutation = useMutation({
@@ -284,12 +285,20 @@ function NotificationsSection({ email }: { email?: string }) {
   });
 
   const prefs = prefsQ.data;
+  // Viewer свои уведомления видит, но не меняет: их задаёт администратор на
+  // странице «Пользователи». Сервер такую правку отклоняет и без этой страницы.
+  const canEdit = canEditNotifPrefs(prefs);
 
   return (
     <Section title={t("notifications")} icon={Bell}>
       {prefsQ.isLoading && <div className="text-muted-foreground">{tCommon("loading")}</div>}
       {prefs && (
         <div className="space-y-4">
+          {!canEdit && (
+            <div className="rounded-md border border-border bg-secondary/50 p-3 text-sm">
+              {t("notifications_admin_managed")}
+            </div>
+          )}
           <div>
             <div className="text-sm font-medium mb-1.5 flex items-center gap-1.5">
               <MessageCircle className="h-4 w-4" />
@@ -299,6 +308,7 @@ function NotificationsSection({ email }: { email?: string }) {
             <SeveritySelect
               value={prefs.email_severity_min ?? "warning"}
               onChange={(v) => updateMutation.mutate({ email_severity_min: v })}
+              disabled={!canEdit}
             />
           </div>
 
@@ -316,6 +326,7 @@ function NotificationsSection({ email }: { email?: string }) {
                   <SeveritySelect
                     value={prefs.telegram_severity_min ?? "critical"}
                     onChange={(v) => updateMutation.mutate({ telegram_severity_min: v })}
+                    disabled={!canEdit}
                   />
                   <button
                     onClick={() => {
@@ -327,6 +338,8 @@ function NotificationsSection({ email }: { email?: string }) {
                   </button>
                 </div>
               </div>
+            ) : !canEdit ? (
+              <div className="text-xs text-muted-foreground">{t("telegram_not_bound")}</div>
             ) : !integrationsQ.data?.telegram ? (
               <div className="rounded-md bg-warning/10 border border-warning/40 p-3 text-sm">
                 <div className="font-medium text-warning mb-1">{t("telegram_not_configured_title")}</div>
@@ -368,13 +381,14 @@ function NotificationsSection({ email }: { email?: string }) {
               type="text"
               defaultValue={prefs.quiet_hours ?? ""}
               placeholder="22-08"
+              disabled={!canEdit}
               onBlur={(e) => {
                 const v = e.target.value.trim();
                 if (v !== (prefs.quiet_hours ?? "")) {
                   updateMutation.mutate({ quiet_hours: v || null });
                 }
               }}
-              className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm w-32 font-mono md:min-h-9"
+              className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm w-32 font-mono disabled:cursor-not-allowed disabled:opacity-50 md:min-h-9"
             />
           </div>
 
@@ -386,7 +400,7 @@ function NotificationsSection({ email }: { email?: string }) {
               })}
               checked={prefs.daily_digest}
               onChange={(v) => updateMutation.mutate({ daily_digest: v })}
-              disabled={statusQ.data?.digests.daily.enabled === false}
+              disabled={!canEdit || statusQ.data?.digests.daily.enabled === false}
             />
             {statusQ.data?.digests.daily.enabled === false && (
               <p className="text-xs text-warning">{t("daily_digest_disabled")}</p>
@@ -397,7 +411,7 @@ function NotificationsSection({ email }: { email?: string }) {
               })}
               checked={prefs.weekly_digest}
               onChange={(v) => updateMutation.mutate({ weekly_digest: v })}
-              disabled={statusQ.data?.digests.weekly.enabled === false}
+              disabled={!canEdit || statusQ.data?.digests.weekly.enabled === false}
             />
           </div>
 
@@ -416,9 +430,11 @@ function NotificationsSection({ email }: { email?: string }) {
 function SeveritySelect({
   value,
   onChange,
+  disabled = false,
 }: {
   value: string;
   onChange: (v: string) => void;
+  disabled?: boolean;
 }) {
   const t = useTranslations("settings");
   const labels: Record<string, string> = {
@@ -430,8 +446,9 @@ function SeveritySelect({
   return (
     <select
       value={value}
+      disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
-      className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
+      className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50 md:min-h-9"
     >
       {SEVERITIES.map((s) => (
         <option key={s} value={s}>

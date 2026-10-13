@@ -393,6 +393,42 @@ def mail_unstored_events_to_admins(
     return counts
 
 
+# ─── Кто меняет свои уведомления и доходит ли до него хоть что-то ────────────
+
+
+def may_edit_own_notifications(user: storage.TenantUser) -> bool:
+    """Свои уведомления меняет только администратор.
+
+    Решение владельца 2026-10-13: сотруднику клиента (роль viewer) порог писем,
+    дайджесты и Telegram задаёт администратор на странице «Пользователи». До
+    этого получатель, которому мгновенные письма выключили, включал их себе сам.
+    """
+    return user.role in ADMIN_ROLES
+
+
+def anything_reaches(
+    user: storage.TenantUser, *, daily_digest_on: bool, weekly_digest_on: bool
+) -> bool:
+    """Доходит ли до получателя хоть что-то: письмо сразу, Telegram или дайджест.
+
+    Правила те же, что у `dispatch_events_batch` и `_send_digest`; вопрос — про
+    событие наивысшей важности. `*_digest_on` — идёт ли на сервере таймер этого
+    дайджеста: галочка получателя без таймера письма не даёт, а `daily_digest`
+    при этом ещё и отменяет письма сразу. Тихие часы не учитываются: они
+    откладывают Telegram, а не выключают его.
+    """
+    instant_email = not user.daily_digest and _severity_passes(
+        user.email_severity_min, "critical", DEFAULT_EMAIL_SEVERITY
+    )
+    telegram = bool(user.telegram_chat_id) and _severity_passes(
+        user.telegram_severity_min, "critical", DEFAULT_TELEGRAM_SEVERITY
+    )
+    digest = (bool(user.daily_digest) and daily_digest_on) or (
+        bool(user.weekly_digest) and weekly_digest_on
+    )
+    return instant_email or telegram or digest
+
+
 # ─── Telegram /start binding ─────────────────────────────────────────────────
 
 
@@ -400,7 +436,9 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
     """Link a Telegram chat_id to an existing TenantUser by email.
 
     Called from telegram_bot.cmd_start when user does `/start <email>`.
-    Returns True if bound, False if user not found.
+    Returns True if bound, False if user not found or may not change their own
+    notifications: a bound chat receives alerts at once, which is exactly what
+    the administrator decides for a viewer.
     """
     user = session.scalar(
         select(storage.TenantUser).where(
@@ -409,6 +447,9 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
         )
     )
     if not user:
+        return False
+    if not may_edit_own_notifications(user):
+        log.info("telegram_bind_refused", user_id=user.id, role=user.role)
         return False
     user.telegram_chat_id = str(chat_id)
     session.commit()
