@@ -748,6 +748,31 @@ export interface Recipient {
   created_at: string | null;
 }
 
+/**
+ * «Отправить ссылку»: сервер дошёл до отправки, но отправитель письмо не
+ * подтвердил — ответ 424 с этим кодом (`LOGIN_LINK_NOT_SENT_STATUS` и
+ * `LOGIN_LINK_NOT_SENT_CODE` в src/api.py).
+ */
+const LOGIN_LINK_NOT_SENT_CODE = "login_link_not_sent";
+
+export function isLoginLinkNotSentError(err: unknown): boolean {
+  if (!(err instanceof ApiError) || err.status !== 424) return false;
+  try {
+    return JSON.parse(err.detail)?.detail?.code === LOGIN_LINK_NOT_SENT_CODE;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ответ на создание пользователя. `invite_sent` — подтвердил ли отправитель
+ * письмо со ссылкой на вход: пользователь создан в обоих случаях. Сервер,
+ * который поля не знает, его не пришлёт — тогда об отправке ничего не известно.
+ */
+export interface RecipientCreated extends Recipient {
+  invite_sent?: boolean;
+}
+
 export interface RecipientCreate {
   email: string;
   name?: string | null;
@@ -1227,7 +1252,7 @@ export const api = {
   },
   recipients: () => request<Recipient[]>("/api/v1/dash/recipients"),
   recipientCreate: (payload: RecipientCreate) =>
-    request<Recipient>("/api/v1/dash/recipients", {
+    request<RecipientCreated>("/api/v1/dash/recipients", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -1241,6 +1266,8 @@ export const api = {
       method: "DELETE",
     }),
   recipientSendLoginLink: (id: number) =>
+    // 200 — только когда отправитель письмо подтвердил. Не подтвердил — 424,
+    // см. isLoginLinkNotSentError.
     request<{ ok: boolean; email: string }>(
       `/api/v1/dash/recipients/${id}/send-login-link`,
       { method: "POST" },
@@ -1436,7 +1463,15 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   digestSendTest: (kind: "daily" | "weekly" = "daily") =>
-    request<{ ok: boolean; recipients_sent: number }>(
+    // `recipients_sent` — только письма, которые почта подтвердила. Когда
+    // кому-то не ушло, ответ всё равно 200: исход назван в `outcome`, и у кнопки
+    // на каждый своя фраза (`quick_actions.digest_<outcome>`).
+    request<{
+      ok: boolean;
+      outcome?: "sent" | "partly_sent" | "not_sent" | "nothing_to_send";
+      recipients_sent: number;
+      recipients_failed?: number;
+    }>(
       `/api/v1/dash/digest/send-test?kind=${kind}`,
       { method: "POST", timeoutMs: 30_000 },
     ),

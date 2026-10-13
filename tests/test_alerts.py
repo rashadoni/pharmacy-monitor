@@ -902,6 +902,7 @@ def _stub_notifier(monkeypatch):
 
     def fake_email(subject, html_body):
         calls["email"].append({"subject": subject, "html_body": html_body})
+        return True  # как настоящий отправитель после принятого письма
 
     def fake_telegram(chat_id, text, parse_mode="Markdown"):
         calls["telegram"].append({"chat_id": chat_id, "text": text})

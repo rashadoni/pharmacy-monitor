@@ -29,6 +29,14 @@ SEV_EMOJI = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️"}
 MAX_EVENTS = 20
 
 
+class DigestNotSent(RuntimeError):
+    """События в окне были, а письмо не ушло: отправитель отказал или упал.
+
+    Причина уже в журнале (`digest_email_failed`); текста ошибки отправителя
+    здесь нет — в нём бывает адрес получателя.
+    """
+
+
 def send_daily_digest(
     session: Session,
     *,
@@ -36,7 +44,13 @@ def send_daily_digest(
     top_n: int = MAX_EVENTS,
     dry_run: bool = False,
 ) -> int:
-    """Отправить daily digest. Возвращает кол-во событий в письме (0 = не отправлено)."""
+    """Отправить daily digest. Возвращает кол-во событий в письме.
+
+    0 — событий в окне нет, письмо и не собиралось. Если письмо было, а
+    отправитель его не подтвердил (ответил False — SMTP не настроен — или
+    бросил исключение), функция бросает `DigestNotSent`: вызывающий не должен
+    путать «нечего слать» с «не ушло».
+    """
     cutoff = utcnow() - timedelta(hours=window_hours)
 
     events = session.scalars(
@@ -71,17 +85,24 @@ def send_daily_digest(
             print(f"  {SEV_EMOJI.get(e.severity, '•')} [{e.severity}] {e.title}")
         return len(events_sorted)
 
+    from src import notifier
+
     try:
-        from src import notifier
-
-        notifier.send_email(subject=subject, html_body=html)
-        log.info("digest_sent", subject=subject, events=len(events_sorted), total=total_in_window)
+        # False — SMTP не настроен, письма не было (отправитель пишет
+        # `email_skipped_no_smtp`); отказ сервера и сеть приходят исключением.
+        delivered = notifier.send_email(subject=subject, html_body=html)
     except Exception as exc:
-        from src.notifier import delivery_error_fields
+        delivered = False
+        log.error("digest_email_failed", **notifier.delivery_error_fields(exc))
+    else:
+        if not delivered:
+            log.error("digest_email_failed", events=len(events_sorted))
+    # Вне except: у новой ошибки нет ни причины, ни контекста — трассировка не
+    # покажет исходную, с адресом в тексте.
+    if not delivered:
+        raise DigestNotSent(f"digest with {len(events_sorted)} events was not sent")
 
-        log.error("digest_email_failed", **delivery_error_fields(exc))
-        return 0
-
+    log.info("digest_sent", subject=subject, events=len(events_sorted), total=total_in_window)
     return len(events_sorted)
 
 

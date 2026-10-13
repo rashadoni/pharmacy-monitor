@@ -4945,8 +4945,12 @@ def test_send_login_link_requires_admin(client, setup_db):
     assert client.post(f"/api/v1/dash/recipients/{target.id}/send-login-link").status_code == 403
 
 
-def test_send_login_link_ok(client, auth_cookie, setup_db):
+def test_send_login_link_ok(client, auth_cookie, setup_db, monkeypatch):
     """admin шлёт login-link активному юзеру → 200 + выпущен свежий токен."""
+    from src import notifier
+
+    # 200 — только о письме, которое отправитель подтвердил; без SMTP ответ 424.
+    monkeypatch.setattr(notifier, "send_email", lambda **kwargs: True)
     s = setup_db
     t = tenants.get_or_create_default(s)
     u = storage.TenantUser(
@@ -5096,6 +5100,7 @@ def test_send_login_link_targets_set_password_for_new_user(
 
     def fake_send_email(*, subject, html_body, to):
         captured["html"] = html_body
+        return True  # отправитель письмо подтвердил
 
     from src import notifier
 
@@ -5116,6 +5121,7 @@ def test_send_login_link_targets_auto_login_for_existing_password(
 
     def fake_send_email(*, subject, html_body, to):
         captured["html"] = html_body
+        return True  # отправитель письмо подтвердил
 
     from src import notifier
 
