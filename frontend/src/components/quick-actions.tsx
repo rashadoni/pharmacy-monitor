@@ -11,7 +11,8 @@ import { api, friendlyError } from "@/lib/api";
  * Quick Actions dropdown в углу sidebar / страниц. Admin-only действия которые
  * раньше требовали SSH на прод:
  *   - Запустить scan сейчас (через scrape-request очередь)
- *   - Отправить test digest всем получателям с daily_digest=true
+ *   - Отправить тестовое утреннее письмо — только нажавшему (ключ текста
+ *     `all_subscribers` назван по прежнему поведению: письмо шло всем подписанным)
  */
 export function QuickActions() {
   const t = useTranslations("quick_actions");

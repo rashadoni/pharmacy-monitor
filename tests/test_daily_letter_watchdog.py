@@ -231,6 +231,18 @@ def test_user_of_another_tenant_cannot_be_mailed_by_id(setup):
     assert not mock_email.called and outcome.no_recipients
 
 
+def test_deactivated_user_cannot_be_mailed_by_id(setup):
+    """Отбор по id — среди активных: отключённой записи письмо не уходит."""
+    s = setup
+    _mixed_catalog(s, _trusted_run(s))
+    gone = _reader(s, email="gone@example.test", is_active=False, daily_digest=False)
+
+    with _mail_server() as mock_email:
+        outcome = notifications.send_daily_letter(s, tenant_id=1, only_user_id=gone.id)
+
+    assert not mock_email.called and outcome.no_recipients
+
+
 def test_weekly_digest_leaves_no_record(setup):
     s = setup
     _reader(s, daily_digest=False, weekly_digest=True)

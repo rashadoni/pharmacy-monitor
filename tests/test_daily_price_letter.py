@@ -1357,6 +1357,17 @@ def test_dashboard_button_mails_only_the_admin_who_pressed_it(button, reader):
     assert _book(calls[0])[1].startswith("raznye-ceny-")
 
 
+def test_dashboard_button_is_for_admins_only(button, reader):
+    """Сотрудник клиента кнопкой письмо не отправит — ни себе, ни кому-то ещё."""
+    s = button
+    _mixed_catalog(s, _trusted_run(s))
+
+    response, calls = _press_the_button(s, reader)
+
+    assert response.status_code == 403
+    assert calls == []
+
+
 def test_dashboard_button_leaves_the_watchdog_record_alone(button, reader):
     """Тестовое письмо админу — не рассылка клиенту: ни новой записи, ни правки старой."""
     s = button
