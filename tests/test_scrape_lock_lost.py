@@ -16,7 +16,9 @@
 Замок здесь настоящий — в `tests/test_run_persist_db_failure.py` он подменён, — а
 он один на базу, не на схему: у каждого теста своя база, иначе два прогона этих
 тестов на одном сервере ждали бы друг друга. Соединения обрывает сам сервер
-(`pg_terminate_backend`). На SQLite замка нет, и проверять нечего; в CI эти
+(`pg_terminate_backend`); перезапуск, после которого сервер какое-то время не
+принимает новых, изображает запрет соединений с базой теста — сам сервер тесты
+не перезапускают, он общий. На SQLite замка нет, и проверять нечего; в CI эти
 тесты обязаны исполняться — их пропуск там ошибка.
 """
 
@@ -24,6 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -35,13 +39,16 @@ from sqlalchemy.orm import sessionmaker
 
 from src import main as main_mod
 from src import run_lock, storage
+from src._time import utcnow
 from src.scrapers.base import ScrapeMustStop
 from tests.test_run_persist_db_failure import (
     SITE,
     _ai_crawl,
     _CatalogScraper,
     _Crawler,
+    _dead_log_stream,
     _external_ids,
+    _record_log,
     _record_writes,
     _run_catalog,
     _scraped,
@@ -114,6 +121,36 @@ class _Server:
             )
         assert self.lock_holders() == []
 
+    def stops_accepting_connections(self) -> None:
+        """Перезапуск, как его видит процесс: соединения оборваны, а новых
+        сервер какое-то время не принимает."""
+        with self._admin.connect() as connection:
+            connection.execute(text(f'ALTER DATABASE "{self._database}" ALLOW_CONNECTIONS false'))
+        self.drops_every_connection()
+
+    def accepts_connections_again(self) -> None:
+        with self._admin.connect() as connection:
+            connection.execute(text(f'ALTER DATABASE "{self._database}" ALLOW_CONNECTIONS true'))
+
+    def has_no_lock_holders_soon(self) -> bool:
+        """Закрытый клиентом сеанс сервер убирает не мгновенно."""
+        deadline = time.monotonic() + 5
+        while self.lock_holders() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.lock_holders() == []
+
+
+@pytest.fixture(autouse=True)
+def outcome_write_never_waits(monkeypatch):
+    """Запись итога ждёт только сервер, который недоступен; где сервер отвечает,
+    пауза (до минуты) значила бы, что его приняли за недоступный. Тесты простоя
+    ставят своё ожидание поверх."""
+
+    def waited(seconds):
+        raise AssertionError(f"запись итога стала ждать сервер ({seconds} с)")
+
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", waited)
+
 
 @pytest.fixture
 def lock_db():
@@ -130,10 +167,11 @@ def lock_db():
         connect_args={"options": "-clock_timeout=5000"},
         pool_pre_ping=True,  # как на проде, `storage.make_engine`
     )
+    server = _Server(admin, database)
     try:
         storage.Base.metadata.create_all(engine)
         with sessionmaker(engine, expire_on_commit=False, autoflush=False)() as session:
-            yield SimpleNamespace(session=session, engine=engine, server=_Server(admin, database))
+            yield SimpleNamespace(session=session, engine=engine, server=server)
     finally:
         engine.dispose()
         with admin.connect() as connection:
@@ -168,33 +206,79 @@ def _three_categories(site: str = SITE, **kwargs) -> _Catalog:
 
 # Шаги `run` после сбора, в порядке исполнения. Между ними стоят проверки замка.
 _STEPS_AFTER_THE_SCRAPE = (
-    (main_mod, "persist_aloe_country_mappings"),
-    (main_mod, "_acquire_matcher_lock"),
-    (main_mod, "_run_matching_stage"),
-    (storage, "confirm_prices_of_latest_verified_runs"),
+    "persist_aloe_country_mappings",
+    "final write",
+    "_smoke_test_per_site_coverage",
+    "_acquire_matcher_lock",
+    "_run_matching_stage",
+    "confirm_prices_of_latest_verified_runs",
 )
 
 
-def _record_steps(monkeypatch, after: dict | None = None) -> list[str]:
-    """Какие шаги после сбора прогон исполнил. Шаги настоящие; `after[имя]`
-    вызывается, когда шаг `имя` закончил."""
-    done: list[str] = []
-    after = after or {}
+class _Steps:
+    """Какие шаги после сбора прогон исполнил. Шаги настоящие (кроме проверки
+    покрытия: её `_run_catalog` подменяет, сюда она приходит аргументом
+    `smoke_test`); `after[имя]` вызывается, когда шаг `имя` закончил."""
 
-    def recorded(owner, name):
-        real = getattr(owner, name)
+    def __init__(self, monkeypatch, after: dict | None = None) -> None:
+        self.done: list[str] = []
+        self._after = after or {}
+        for owner, name in (
+            (main_mod, "persist_aloe_country_mappings"),
+            (main_mod, "_acquire_matcher_lock"),
+            (main_mod, "_run_matching_stage"),
+            (storage, "confirm_prices_of_latest_verified_runs"),
+        ):
+            monkeypatch.setattr(owner, name, self._recorded(name, getattr(owner, name)))
+        # Финальный проход — тот вызов записи, которому `run` говорит, верит ли
+        # он собранному каталогу aloe; запись категории такого аргумента не несёт.
+        write = main_mod.persist_results
+        monkeypatch.setattr(
+            main_mod,
+            "persist_results",
+            self._recorded(
+                "final write",
+                write,
+                only_if=lambda kwargs: "aloe_whole_catalog" in kwargs,
+                otherwise=write,
+            ),
+        )
+        self.smoke_test = self._recorded("_smoke_test_per_site_coverage", lambda *args: None)
 
+    def _recorded(self, name, real, only_if=lambda kwargs: True, otherwise=None):
         def step(*args, **kwargs):
+            if not only_if(kwargs):
+                return otherwise(*args, **kwargs)
             result = real(*args, **kwargs)
-            done.append(name)
-            after.get(name, lambda: None)()
+            self.done.append(name)
+            self._after.get(name, lambda: None)()
             return result
 
         return step
 
-    for owner, name in _STEPS_AFTER_THE_SCRAPE:
-        monkeypatch.setattr(owner, name, recorded(owner, name))
-    return done
+
+@contextmanager
+def _in_the_middle_of_writing_cat_b(lock_db, monkeypatch, happens):
+    """Запись категорий, у которой `happens()` случается посреди записи `cat-b` —
+    после её первого запроса, когда транзакция уже открыта. Отдаёт список
+    записей (`_record_writes`)."""
+    about_to_write: list[str] = []
+
+    def in_the_middle(conn, cursor, statement, parameters, context, executemany):
+        if about_to_write == ["cat-b"]:
+            about_to_write.append("happened")
+            happens()
+
+    def second_write_begins(writes):
+        if writes == [("cat-a", "ok")]:
+            about_to_write.append("cat-b")
+
+    event.listen(lock_db.engine, "after_cursor_execute", in_the_middle)
+    try:
+        yield _record_writes(monkeypatch, before_write=second_write_begins)
+    finally:
+        event.remove(lock_db.engine, "after_cursor_execute", in_the_middle)
+    assert about_to_write == ["cat-b", "happened"]
 
 
 def _lost_lock_reason(noticed: str) -> str:
@@ -213,16 +297,14 @@ def test_run_holds_the_lock_to_the_end_and_is_published(lock_db, monkeypatch):
     def count_holders():
         holders_at_each_step.append(len(lock_db.server.lock_holders()))
 
-    steps = _record_steps(
-        monkeypatch, after={name: count_holders for _, name in _STEPS_AFTER_THE_SCRAPE}
-    )
+    steps = _Steps(monkeypatch, after=dict.fromkeys(_STEPS_AFTER_THE_SCRAPE, count_holders))
     writes = _record_writes(monkeypatch)
     catalog = _three_categories(when_asked={"cat-b": count_holders})
 
-    run, _ = _run_catalog(lock_db.session, monkeypatch, catalog)
+    run, _ = _run_catalog(lock_db.session, monkeypatch, catalog, smoke_test=steps.smoke_test)
 
-    assert steps == [name for _, name in _STEPS_AFTER_THE_SCRAPE]
-    assert holders_at_each_step == [1, 1, 1, 1, 1]
+    assert steps.done == list(_STEPS_AFTER_THE_SCRAPE)
+    assert holders_at_each_step == [1] * (1 + len(_STEPS_AFTER_THE_SCRAPE))
     assert [outcome for _, outcome in writes] == ["ok", "ok", "ok", "ok"]
     assert (run.catalog_scope, run.catalog_verified, run.error_message) == ("full", True, None)
     assert lock_db.server.lock_holders() == [], "замок снят на выходе из команды"
@@ -237,32 +319,23 @@ def test_run_stops_when_the_server_drops_every_connection_mid_write(lock_db, mon
     собирается, финального прохода и сопоставления нет, итог — `failed` с
     причиной. До проверки замка такой прогон кончался `ok`.
     """
-    about_to_write: list[str] = []
-
-    def server_restarts(conn, cursor, statement, parameters, context, executemany):
-        if about_to_write != ["cat-b"]:
-            return
-        about_to_write.append("every connection dropped")
-        lock_db.server.drops_every_connection()
-
-    def second_write_begins(writes):
-        if writes == [("cat-a", "ok")]:
-            about_to_write.append("cat-b")
-
-    # После первого запроса записи: транзакция уже открыта.
-    event.listen(lock_db.engine, "after_cursor_execute", server_restarts)
-    writes = _record_writes(monkeypatch, before_write=second_write_begins)
-    steps = _record_steps(monkeypatch)
+    steps = _Steps(monkeypatch)
     catalog = _three_categories()
-    try:
-        run, result = _run_catalog(lock_db.session, monkeypatch, catalog, expected_status="failed")
-    finally:
-        event.remove(lock_db.engine, "after_cursor_execute", server_restarts)
 
-    assert about_to_write == ["cat-b", "every connection dropped"]
+    with _in_the_middle_of_writing_cat_b(
+        lock_db, monkeypatch, lock_db.server.drops_every_connection
+    ) as writes:
+        run, result = _run_catalog(
+            lock_db.session,
+            monkeypatch,
+            catalog,
+            expected_status="failed",
+            smoke_test=steps.smoke_test,
+        )
+
     assert writes == [("cat-a", "ok"), ("cat-b", "OperationalError")]
     assert catalog.asked == ["cat-a", "cat-b"], "после потери замка сайт не дособирается"
-    assert steps == [], "ни словаря стран, ни сопоставления, ни подтверждения цен"
+    assert steps.done == [], "ни словаря стран, ни сопоставления, ни подтверждения цен"
     assert run.error_message.startswith(_lost_lock_reason("after a failed category write"))
     assert run.finished_at is not None
     assert _external_ids(lock_db.session) == ["a"]
@@ -282,19 +355,24 @@ def test_run_stops_at_the_next_category_when_only_the_lock_connection_is_dropped
     категории проверяется и у него: сбор без замка не идёт до конца сайта.
     """
     writes = _record_writes(monkeypatch)
-    steps = _record_steps(monkeypatch)
+    steps = _Steps(monkeypatch)
     catalog = _three_categories(
         site, when_asked={"cat-b": lock_db.server.drops_the_lock_connection}
     )
 
     run, _ = _run_catalog(
-        lock_db.session, monkeypatch, catalog, site=site, expected_status="failed"
+        lock_db.session,
+        monkeypatch,
+        catalog,
+        site=site,
+        expected_status="failed",
+        smoke_test=steps.smoke_test,
     )
 
     assert run.error_message.startswith(_lost_lock_reason("before a category write"))
     assert catalog.asked == ["cat-a", "cat-b"]
     assert writes == ([("cat-a", "ok")] if site == SITE else [])
-    assert steps == []
+    assert steps.done == []
     assert _external_ids(lock_db.session) == (["a"] if site == SITE else [])
 
 
@@ -309,14 +387,20 @@ def test_run_does_not_write_what_it_collected_after_the_lock_was_lost(lock_db, m
 
     monkeypatch.setattr(_CatalogScraper, "scrape_promos", promos_while_the_lock_goes)
     writes = _record_writes(monkeypatch)
-    steps = _record_steps(monkeypatch)
+    steps = _Steps(monkeypatch)
     catalog = _three_categories()
 
-    run, _ = _run_catalog(lock_db.session, monkeypatch, catalog, expected_status="failed")
+    run, _ = _run_catalog(
+        lock_db.session,
+        monkeypatch,
+        catalog,
+        expected_status="failed",
+        smoke_test=steps.smoke_test,
+    )
 
     assert run.error_message.startswith(_lost_lock_reason("after the scrape"))
     assert writes == [("cat-a", "ok"), ("cat-b", "ok"), ("cat-c", "ok")], "финального прохода нет"
-    assert steps == []
+    assert steps.done == []
 
 
 _ONLY_THE_LOCK = "drops_the_lock_connection"
@@ -336,6 +420,10 @@ _EVERY_CONNECTION = "drops_every_connection"
             _EVERY_CONNECTION,
             _lost_lock_reason("before the final write"),
         ),
+        # Следом за финальным проходом идёт проверка покрытия сайта — она пишет
+        # события в журнал алертов.
+        ("final write", _ONLY_THE_LOCK, _lost_lock_reason("after the final write")),
+        ("final write", _EVERY_CONNECTION, _lost_lock_reason("after the final write")),
         ("_acquire_matcher_lock", _ONLY_THE_LOCK, _lost_lock_reason("before matching")),
         ("_acquire_matcher_lock", _EVERY_CONNECTION, _lost_lock_reason("before matching")),
         ("_run_matching_stage", _ONLY_THE_LOCK, _lost_lock_reason("before alerts")),
@@ -354,30 +442,197 @@ def test_run_stops_at_the_first_stage_after_the_lock_was_lost(
     lock_db, monkeypatch, lost_after, dropped, reason
 ):
     """Замок потерян после записи сбора — на любом из этапов за ней. Следующий
-    этап не начинается: без замка прогон не пишет финальный проход, не
-    сопоставляет, не подтверждает цены и не публикуется как `ok`.
+    этап не начинается: без замка прогон не пишет финальный проход, не пишет
+    события проверки покрытия, не сопоставляет, не подтверждает цены и не
+    публикуется как `ok` — ни на миг: к обработчику сбоя он приходит `running`.
 
     Оборвано либо одно соединение с замком — тогда ни один запрос прогона не
     падает, и остановить его может только проверка, — либо все разом: вместе с
     ним уходит и замок сопоставления, а итог всё равно записан.
     """
-    all_steps = [name for _, name in _STEPS_AFTER_THE_SCRAPE]
-    steps = _record_steps(monkeypatch, after={lost_after: getattr(lock_db.server, dropped)})
+    all_steps = list(_STEPS_AFTER_THE_SCRAPE)
+    steps = _Steps(monkeypatch, after={lost_after: getattr(lock_db.server, dropped)})
     writes = _record_writes(monkeypatch)
+    stored_status_when_the_run_failed: list[str] = []
+    write_outcome = main_mod._write_failed_run_outcome
+
+    def outcome_of_a_run_stored_as(session, run, run_id, record):
+        with lock_db.engine.connect() as observer:
+            stored_status_when_the_run_failed.append(
+                observer.scalar(text("SELECT status FROM runs WHERE id = :id"), {"id": run_id})
+            )
+        write_outcome(session, run, run_id, record)
+
+    monkeypatch.setattr(main_mod, "_write_failed_run_outcome", outcome_of_a_run_stored_as)
     catalog = _Catalog({"cat-a": [_scraped("a", 5.0, "cat-a")]})
 
-    run, _ = _run_catalog(lock_db.session, monkeypatch, catalog, expected_status="failed")
+    run, _ = _run_catalog(
+        lock_db.session,
+        monkeypatch,
+        catalog,
+        expected_status="failed",
+        smoke_test=steps.smoke_test,
+    )
 
     assert run.error_message.startswith(reason), run.error_message
-    assert steps == all_steps[: all_steps.index(lost_after) + 1], "следующий этап не начат"
-    final_write = [("cat-a", "ok")] if lost_after != "persist_aloe_country_mappings" else []
+    # Замок сопоставления берётся сразу за проверкой покрытия, проверка замка
+    # сбора — уже под ним; остальные шаги отделены проверкой каждый.
+    assert steps.done == all_steps[: all_steps.index(lost_after) + 1], "следующий этап не начат"
+    final_write = [("cat-a", "ok")] if "final write" in steps.done else []
     assert writes == [("cat-a", "ok"), *final_write]
+    assert stored_status_when_the_run_failed == ["running"], "`ok` прогон не получал"
     assert run.finished_at is not None
     for key in (
         run_lock.SCRAPE_ADVISORY_LOCK_KEY,
         main_mod.matcher.MATCH_MUTATION_ADVISORY_LOCK_KEY,
     ):
         assert lock_db.server.lock_holders(key) == [], "команда не оставила за собой замков"
+
+
+def test_dead_log_stream_does_not_hide_the_lost_lock(lock_db, monkeypatch):
+    """Строки журнала о потере замка падают сами (вывод оборван — ssh без
+    терминала, отменённый workflow). Причина прогона — всё равно потеря замка,
+    а не `BrokenPipeError` строки, которая о ней сообщала."""
+    # Оборвано только соединение замка сбора: на прочих строках журнала этот
+    # путь не спотыкается.
+    steps = _Steps(
+        monkeypatch, after={"_acquire_matcher_lock": lock_db.server.drops_the_lock_connection}
+    )
+    _dead_log_stream(monkeypatch, "warning", "error")
+    catalog = _Catalog({"cat-a": [_scraped("a", 5.0, "cat-a")]})
+
+    run, _ = _run_catalog(
+        lock_db.session,
+        monkeypatch,
+        catalog,
+        expected_status="failed",
+        smoke_test=steps.smoke_test,
+    )
+
+    assert run.error_message.startswith(_lost_lock_reason("before matching")), run.error_message
+    assert "_run_matching_stage" not in steps.done
+
+
+# ─── Сервер не принимает соединения ──────────────────────────────────────────
+
+
+def test_run_is_closed_as_failed_once_the_restarted_server_accepts_connections(
+    lock_db, monkeypatch
+):
+    """Перезапуск PostgreSQL, как он выглядит на деле: соединения оборваны
+    посреди записи `cat-b`, и новых сервер какое-то время не принимает.
+
+    О потере замка прогон узнаёт за миллисекунды — раньше, чем сервер вернулся,
+    — и итог ему записать некуда. Запись итога ждёт сервер и пишет `failed` с
+    причиной, когда тот отвечает; без ожидания прогон оставался бы `running`.
+    """
+    waited: list[float] = []
+
+    def server_comes_back(seconds):
+        waited.append(seconds)
+        lock_db.server.accepts_connections_again()
+
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", server_comes_back)
+    logged = _record_log(monkeypatch, main_mod, "warning")
+    steps = _Steps(monkeypatch)
+    catalog = _three_categories()
+
+    with _in_the_middle_of_writing_cat_b(
+        lock_db, monkeypatch, lock_db.server.stops_accepting_connections
+    ) as writes:
+        run, _ = _run_catalog(
+            lock_db.session,
+            monkeypatch,
+            catalog,
+            expected_status="failed",
+            smoke_test=steps.smoke_test,
+        )
+
+    assert waited == [main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE[0]]
+    assert [
+        (fields["seconds"], fields["error"])
+        for name, fields in logged
+        if name == "run_failure_write_waits_for_database"
+    ] == [(waited[0], "OperationalError")]
+    assert writes == [("cat-a", "ok"), ("cat-b", "OperationalError")]
+    assert run.error_message.startswith(_lost_lock_reason("after a failed category write"))
+    assert run.finished_at is not None
+    assert steps.done == []
+
+
+def test_run_stays_running_when_the_server_does_not_come_back_in_time(lock_db, monkeypatch):
+    """Сервер не вернулся за всё время ожидания (восстановление после сбоя идёт
+    дольше минуты). Ждать дальше запись итога не будет: прогон остаётся
+    `running`, в журнале — причина его остановки и строка о том, что итог не
+    записан, команда выходит с причиной остановки. Закроет такую строку вотчер
+    очереди."""
+    waited: list[float] = []
+
+    def waits_in_vain(seconds):
+        waited.append(seconds)
+        assert len(waited) <= 2 * len(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE), "ждёт без предела"
+
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", waits_in_vain)
+    write_outcome = main_mod._write_failed_run_outcome
+
+    def write_outcome_then_the_server_returns(*args):
+        try:
+            write_outcome(*args)
+        finally:
+            lock_db.server.accepts_connections_again()
+
+    monkeypatch.setattr(
+        main_mod, "_write_failed_run_outcome", write_outcome_then_the_server_returns
+    )
+    logged = _record_log(monkeypatch, main_mod, "exception")
+    catalog = _three_categories()
+
+    with _in_the_middle_of_writing_cat_b(
+        lock_db, monkeypatch, lock_db.server.stops_accepting_connections
+    ):
+        run, result = _run_catalog(lock_db.session, monkeypatch, catalog, expected_status="running")
+
+    assert waited == list(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE)
+    assert [name for name, _ in logged] == ["run_failed", "run_failure_not_recorded"]
+    assert logged[0][1]["handled"].startswith("scrape lock lost (noticed after a failed category")
+    assert run.finished_at is None
+    assert "scrape lock lost" in result.output
+    assert isinstance(result.exception, SystemExit)
+
+
+def test_fields_set_before_the_failure_survive_the_wait_for_the_server(lock_db, monkeypatch):
+    """Недоступный сервер в записи не отказывал: пока запись итога его ждёт, поля,
+    выставленные на прогоне перед сбоем, не отбрасываются — в отличие от записи,
+    которую база отклонила."""
+    session = lock_db.session
+    run = storage.Run(status="running", started_at=utcnow())
+    session.add(run)
+    session.commit()
+    run_id = run.id
+    run.catalog_verification_reason = "set right before the failure"
+    lock_db.server.stops_accepting_connections()
+    waited: list[float] = []
+
+    def server_comes_back_on_the_second_wait(seconds):
+        waited.append(seconds)
+        if len(waited) == 2:
+            lock_db.server.accepts_connections_again()
+
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", server_comes_back_on_the_second_wait)
+
+    def record_failure():
+        run.status = "failed"
+        run.error_message = "ValueError: boom"
+        run.finished_at = utcnow()
+
+    main_mod._write_failed_run_outcome(session, run, run_id, record_failure)
+
+    session.rollback()
+    session.expire_all()
+    stored = session.get(storage.Run, run_id)
+    assert waited == list(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE[:2])
+    assert (stored.status, stored.error_message) == ("failed", "ValueError: boom")
+    assert stored.catalog_verification_reason == "set right before the failure"
 
 
 # ─── Соседние команды ────────────────────────────────────────────────────────
@@ -392,7 +647,7 @@ def test_scrape_command_does_not_write_without_the_lock(lock_db, monkeypatch):
         return []
 
     monkeypatch.setattr(_CatalogScraper, "scrape_promos", promos_while_the_lock_goes)
-    steps = _record_steps(monkeypatch)
+    steps = _Steps(monkeypatch)
     catalog = _three_categories()
 
     run, _ = _run_catalog(
@@ -405,7 +660,7 @@ def test_scrape_command_does_not_write_without_the_lock(lock_db, monkeypatch):
 
     # `scrape` пишет причину без имени класса ошибки.
     assert run.error_message.startswith("scrape lock lost (noticed before the write): ")
-    assert steps == []
+    assert steps.done == [], "словарь стран не записан"
     assert _external_ids(lock_db.session) == []
 
 
@@ -454,18 +709,34 @@ def test_lock_is_asked_of_the_server_not_of_the_connection_object(lock_db):
         assert run_lock.connection_holds_exclusive_scrape_lock(holder) is False
 
 
-def test_shared_reader_lock_is_not_taken_for_the_producer_lock(lock_db):
-    """Читатели каталога берут тот же ключ разделяемым замком
-    (`try_shared_scrape_read_lock`) — это не замок сбора."""
-    with lock_db.engine.connect() as reader:
-        reader.scalar(
-            text("SELECT pg_advisory_lock_shared(hashtext(:key))"),
-            {"key": run_lock.SCRAPE_ADVISORY_LOCK_KEY},
+@pytest.mark.parametrize(
+    "look_alike",
+    [
+        # Тот же ключ, но замок разделяемый: так его берут читатели каталога
+        # (`try_shared_scrape_read_lock`).
+        "pg_advisory_lock_shared(hashtext(:key))",
+        # Другой ключ — замок сопоставления.
+        "pg_advisory_lock(hashtext('pharmacy_monitor_matcher'))",
+        # Та же младшая половина ключа при другой старшей.
+        "pg_advisory_lock(hashtext(:key)::bigint & 4294967295)",
+        # Те же две половины, но ключ из двух чисел, а не из одного.
+        "pg_advisory_lock((hashtext(:key)::bigint >> 32)::integer, hashtext(:key))",
+    ],
+)
+def test_another_advisory_lock_of_the_session_is_not_taken_for_the_scrape_lock(lock_db, look_alike):
+    """Сеанс держит advisory-замок, похожий на замок сбора, — но не его."""
+    with lock_db.engine.connect() as connection:
+        connection.execute(text(f"SELECT {look_alike}"), {"key": run_lock.SCRAPE_ADVISORY_LOCK_KEY})
+        connection.commit()
+        held_by_the_session = connection.scalar(
+            text(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+            )
         )
-        reader.commit()
+        connection.commit()
 
-        assert lock_db.server.lock_holders() != []
-        assert run_lock.connection_holds_exclusive_scrape_lock(reader) is False
+        assert held_by_the_session == 1
+        assert run_lock.connection_holds_exclusive_scrape_lock(connection) is False
 
 
 def test_lost_lock_stays_lost(lock_db, monkeypatch):
@@ -556,6 +827,45 @@ def test_command_forgets_its_lock_on_exit(lock_db):
         assert main_mod._hold_scrape_lock_until_command_exit(factory, wait=False) is True
         main_mod._fail_if_scrape_lock_lost(noticed="in the second command")
     assert lock_db.server.lock_holders() == []
+
+
+def test_lock_whose_check_failed_on_a_live_connection_is_not_left_in_the_pool(lock_db, monkeypatch):
+    """Проверка упала, а сеанс замка жив (сервер отменил её запрос): замок
+    считается потерянным, хотя он ещё за сеансом, а транзакция проверки
+    прервана — снять замок запросом уже нельзя. На выходе команда закрывает
+    сеанс совсем: иначе замок остался бы на соединении в пуле до конца процесса,
+    и следующий сбор не стартовал бы."""
+    factory = sessionmaker(lock_db.engine, expire_on_commit=False, autoflush=False)
+
+    def refused_by_the_server(connection):
+        connection.execute(text("SELECT 1 / 0"))
+
+    monkeypatch.setattr(main_mod, "connection_holds_exclusive_scrape_lock", refused_by_the_server)
+    with click.Context(click.Command("probe")):
+        assert main_mod._hold_scrape_lock_until_command_exit(factory, wait=False) is True
+        with pytest.raises(main_mod.ScrapeLockLost, match="the check on its connection failed"):
+            main_mod._fail_if_scrape_lock_lost(noticed="in the middle")
+        assert len(lock_db.server.lock_holders()) == 1, "сеанс жив, замок ещё за ним"
+
+    assert lock_db.server.has_no_lock_holders_soon()
+    with click.Context(click.Command("next scrape")):
+        assert main_mod._hold_scrape_lock_until_command_exit(factory, wait=False) is True
+
+
+def test_lock_that_could_not_be_released_is_not_left_in_the_pool(lock_db, monkeypatch):
+    """Снять замок на выходе не удалось (транзакция на его соединении прервана).
+    Соединение в пул не возвращается: сеанс закрывается, замок уходит с ним, а
+    отказ ложится в журнал строкой `scrape_lock_release_failed`."""
+    factory = sessionmaker(lock_db.engine, expire_on_commit=False, autoflush=False)
+    warned = _record_log(monkeypatch, main_mod, "warning")
+    with click.Context(click.Command("probe")) as context:
+        assert main_mod._hold_scrape_lock_until_command_exit(factory, wait=False) is True
+        lock_connection = main_mod._SCRAPE_LOCKS_BY_COMMAND[context].connection
+        with pytest.raises(Exception, match="DivisionByZero"):
+            lock_connection.execute(text("SELECT 1 / 0"))
+
+    assert [name for name, _ in warned] == ["scrape_lock_release_failed"]
+    assert lock_db.server.has_no_lock_holders_soon()
 
 
 def test_nothing_is_checked_without_a_real_lock():

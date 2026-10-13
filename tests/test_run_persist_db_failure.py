@@ -123,6 +123,18 @@ def db_session(request, monkeypatch):
         admin.dispose()
 
 
+@pytest.fixture(autouse=True)
+def outcome_write_never_waits(monkeypatch):
+    """Запись итога ждёт только сервер, который недоступен. Здесь база отказывает
+    в самой записи — ждать нечего, и пауза (до минуты) значила бы, что отказ
+    принят за недоступность."""
+
+    def waited(seconds):
+        raise AssertionError(f"запись итога стала ждать сервер ({seconds} с)")
+
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", waited)
+
+
 def _is_postgresql(db_session) -> bool:
     return db_session.get_bind().dialect.name == "postgresql"
 
@@ -201,12 +213,14 @@ def _run_catalog(
     expected_status: str = "ok",
     command_line: tuple[str, ...] = ("run", "--mode", "category"),
     revalidate_split=lambda session: [],
+    smoke_test=lambda *args: None,
 ):
     """Команда сбора над сайтом из `catalog`; возвращает (прогон, итог команды).
 
     Подменены сам сайт и шаги после записи; запись сбора и обработчики сбоя —
     настоящие. `revalidate_split` — чем заменить перепроверку пар (шаг под
-    замком сопоставления).
+    замком сопоставления), `smoke_test` — проверку покрытия сайта (шаг сразу
+    после финального прохода).
     """
     scraper = type(
         "_Site",
@@ -229,7 +243,7 @@ def _run_catalog(
     )
     monkeypatch.setattr(main_mod, "baselines_for_sites", lambda *args: {site: 1})
     monkeypatch.setattr(main_mod, "load_aloe_country_map", lambda *args: {})
-    monkeypatch.setattr(main_mod, "_smoke_test_per_site_coverage", lambda *args: None)
+    monkeypatch.setattr(main_mod, "_smoke_test_per_site_coverage", smoke_test)
     monkeypatch.setattr(main_mod.matcher, "refresh_derived_fields", lambda session: 0)
     monkeypatch.setattr(main_mod.matcher, "relink_stale_members", lambda session: 0)
     monkeypatch.setattr(main_mod.matcher, "replace_price_strangers", lambda session: 0)

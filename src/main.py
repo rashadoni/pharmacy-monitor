@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+import time
 import weakref
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -28,6 +29,7 @@ import structlog
 import yaml
 from dotenv import load_dotenv
 from sqlalchemy import desc, func, inspect, select, text
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import NO_VALUE
 
@@ -2723,7 +2725,7 @@ def _fail_if_scrape_lock_lost(*, noticed: str) -> None:
     if held.lost is not None:
         raise ScrapeLockLost(
             f"scrape lock lost (noticed {noticed}): {held.lost}; another scrape, tick or "
-            "rematch may have run while it was free, so this run stops and publishes nothing"
+            "rematch may have run while it was free, so the run stops here"
         )
 
 
@@ -2771,12 +2773,23 @@ def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
     def release() -> None:
         _SCRAPE_LOCKS_BY_COMMAND.pop(context, None)
         try:
-            connection.scalar(
-                text("SELECT pg_advisory_unlock(hashtext(:key))"),
-                {"key": _SCRAPE_ADVISORY_LOCK_KEY},
-            )
-            connection.commit()
+            if held.lost is None:
+                connection.scalar(
+                    text("SELECT pg_advisory_unlock(hashtext(:key))"),
+                    {"key": _SCRAPE_ADVISORY_LOCK_KEY},
+                )
+                connection.commit()
+            else:
+                # Проверка сочла замок потерянным. Если она упала не на обрыве
+                # (отменённый запрос), сеанс жив и замок ещё за ним, а снять его
+                # запросом нельзя: транзакция проверки прервана. Сеанс
+                # закрывается совсем — замок уходит с ним, а не остаётся на
+                # соединении в пуле до конца процесса.
+                connection.invalidate()
         except Exception as exc:
+            # То же, если снять не удалось: в пул такое соединение не вернётся.
+            with suppress(Exception):
+                connection.invalidate()
             connection.rollback()
             log.warning("scrape_lock_release_failed", error=str(exc))
         finally:
@@ -3700,6 +3713,24 @@ def _unsaved_column_values(instance) -> dict[str, object]:
     return values
 
 
+# Сколько секунд между попытками записать итог ждать сервер, который не принимает
+# соединения. Перезапуск PostgreSQL занимает секунды, восстановление после сбоя
+# дольше; всего — минута, дальше прогон остаётся `running`.
+_RUN_OUTCOME_WAITS_FOR_DATABASE = (1, 2, 4, 8, 15, 30)
+
+
+def _database_may_come_back(error: BaseException) -> bool:
+    """Запись не прошла, потому что сервер недоступен, занят или оборвал
+    соединение, — а не потому, что он отказал в самой записи."""
+    return isinstance(
+        error, (sa_exc.OperationalError, sa_exc.InterfaceError, sa_exc.TimeoutError)
+    ) or bool(getattr(error, "connection_invalidated", False))
+
+
+def _wait_for_the_database(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, record) -> None:
     """Записать итог упавшего прогона — на чистой транзакции.
 
@@ -3723,6 +3754,13 @@ def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, r
     вторая пишет итог один. Если не прошла и она, прогон остаётся `running`:
     отказ ложится в журнал строкой `run_failure_not_recorded`, а вызывающий
     выходит с причиной, по которой упал сам прогон.
+
+    Отдельно — сервер, который недоступен (`_database_may_come_back`): в записи
+    он не отказывал, поэтому та же попытка повторяется после паузы, с теми же
+    полями, пока не выйдут паузы из `_RUN_OUTCOME_WAITS_FOR_DATABASE`. Без этого
+    прогон, остановленный потерей замка сбора, оставался бы `running` как раз
+    при перезапуске PostgreSQL: о потере он узнаёт за миллисекунды, и запись
+    итога приходилась бы на секунды, пока сервер ещё не принимает соединения.
 
     Снять несохранённые поля не удалось — переносить нечего, и только: откат и
     запись итога от этого зависеть не должны.
@@ -3752,23 +3790,43 @@ def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, r
                     run_id=run_id,
                     error=f"{type(rollback_error).__name__}: {rollback_error}",
                 )
-        try:
-            for key, value in unsaved.items():
-                setattr(run, key, value)
-            record()
-            session.commit()
-        except Exception as write_error:
-            with suppress(Exception):
-                log.warning(
-                    "run_failure_write_retried",
-                    run_id=run_id,
-                    dropped_fields=sorted(unsaved),
-                    error=f"{type(write_error).__name__}: {write_error}",
-                )
-            with suppress(Exception):
-                session.rollback()
-            record()
-            session.commit()
+        carried = unsaved
+        outcome_alone = False
+        waits = iter(_RUN_OUTCOME_WAITS_FOR_DATABASE)
+        while True:
+            try:
+                for key, value in carried.items():
+                    setattr(run, key, value)
+                record()
+                session.commit()
+                break
+            except Exception as write_error:
+                with suppress(Exception):
+                    session.rollback()
+                if _database_may_come_back(write_error):
+                    seconds = next(waits, None)
+                    if seconds is None:
+                        raise
+                    with suppress(Exception):
+                        log.warning(
+                            "run_failure_write_waits_for_database",
+                            run_id=run_id,
+                            seconds=seconds,
+                            error=type(write_error).__name__,
+                        )
+                    _wait_for_the_database(seconds)
+                    continue
+                if outcome_alone:
+                    raise
+                with suppress(Exception):
+                    log.warning(
+                        "run_failure_write_retried",
+                        run_id=run_id,
+                        dropped_fields=sorted(carried),
+                        error=f"{type(write_error).__name__}: {write_error}",
+                    )
+                carried = {}
+                outcome_alone = True
     except Exception:
         with suppress(Exception):
             log.exception("run_failure_not_recorded", run_id=run_id)
@@ -6103,6 +6161,10 @@ def run_cmd(
                     run_id=run.id,
                     quality=quality,
                 )
+
+            # Финальный проход мог идти минуты, а проверка покрытия ниже пишет
+            # события в журнал алертов.
+            _fail_if_scrape_lock_lost(noticed="after the final write")
 
             # === Smoke-test: per-site coverage drop ===
             # Если конкретный сайт собрал <50% от среднего за последние 5 ok-runs —

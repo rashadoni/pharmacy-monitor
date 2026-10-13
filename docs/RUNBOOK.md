@@ -320,6 +320,10 @@ sudo -u postgres psql -X pharmacy_monitor -c \
 
 - `run_failure_fields_not_carried` — поля, выставленные на прогоне перед сбоем,
   не удалось даже прочитать. Итог пишется без них.
+- `run_failure_write_waits_for_database` — сервер не принимает соединения или
+  оборвал запись итога; та же запись повторяется после паузы (`seconds`), поля
+  при этом не отбрасываются. Всего ждёт до минуты — подробнее в абзаце про
+  `ScrapeLockLost` ниже.
 
 То же относится к `scrape` (его зовут intraday-тики) и `ai-crawl`: после сбоя
 базы прогон закрывается как `failed` с причиной. `watchlist-tick` идёт через
@@ -342,12 +346,16 @@ sudo -u postgres psql -X pharmacy_monitor -c \
 ```
 ScrapeLockLost: scrape lock lost (noticed before matching): the check on its
 connection failed (OperationalError); another scrape, tick or rematch may have
-run while it was free, so this run stops and publishes nothing
+run while it was free, so the run stops here
 ```
 
 - `noticed` — где заметили: `before a category write` и `after a failed
-  category write` (сбор остановлен посреди сайта), `after the scrape`, `before
-  the final write`, `before matching`, `before alerts` (сопоставление прошло,
+  category write` (сбор остановлен посреди сайта; так бывает только в сборе по
+  категориям — у pharmonline в режиме `public_api` первая проверка стоит, когда
+  сбор уже кончился), `after the scrape`, `before the final write`, `after the
+  final write`
+  (товары и цены записаны, сопоставления не было), `before matching`, `before
+  alerts` (сопоставление прошло,
   цены не подтверждены, письма не ушли), `before publication` (письма об алертах
   этого прогона уже ушли и кэш рекомендаций пересчитан, но `ok` прогон не
   получил: сайт числится не собранным, как после любого `failed`); у `scrape` —
@@ -357,8 +365,20 @@ run while it was free, so this run stops and publishes nothing
   соединение замка оборвано; `the server no longer lists it for its connection`
   — соединение отвечает, но замка за ним сервер не числит.
 - в журнале сбора — строка `scrape_lock_lost` с теми же двумя полями; если
-  запрос проверки упал, перед ней `scrape_lock_check_failed` с текстом ошибки.
-  На выходе команды возможна `scrape_lock_release_failed`: снимать уже нечего.
+  запрос проверки упал, перед ней `scrape_lock_check_failed` с первой строкой
+  ошибки. Потерянный замок на выходе не снимают — его соединение закрывают
+  совсем; `scrape_lock_release_failed` значит другое: замок числился за
+  командой, но снять его не удалось (соединение тоже закрыто, замок ушёл с ним).
+
+**Итог записан не сразу или не записан.** Остановленный прогон пишет себе
+`failed`, а при перезапуске PostgreSQL сервер в эту секунду ещё не принимает
+соединения. Запись итога его ждёт — до минуты, паузами 1, 2, 4, 8, 15 и 30
+секунд, строка `run_failure_write_waits_for_database` на каждую. Не дождалась
+(восстановление после сбоя шло дольше) — `run_failure_not_recorded`, прогон
+остаётся `running`: причина остановки — в строке `run_failed` выше и в выводе
+команды, а что делать со строкой — ниже, «Прогон висит `running`…». То же
+ожидание действует при любом сбое прогона, не только при потере замка; отказ
+базы в самой записи (не принятое значение) ожидания не вызывает.
 
 Если все соединения оборваны посреди шага, который держит открытую транзакцию,
 первой придёт ошибка самого шага (`OperationalError: … terminating connection`),
@@ -389,9 +409,11 @@ run while it was free, so this run stops and publishes nothing
 сопоставления (минуты); `rematch` и `reap-stale-runs` замок берут, но не
 перепроверяют. Выложено ли — `grep -c _fail_if_scrape_lock_lost
 /opt/pharmacy-monitor/src/main.py` (0 — нет): до выкладки сбор, потерявший
-замок, доходит до конца как ни в чём не бывало и кончается `ok`. На сервере
-проверка не исполнялась — тесты идут на одноразовом PostgreSQL 16
-(`tests/test_scrape_lock_lost.py`).
+замок, доходит до конца как ни в чём не бывало и кончается `ok` (правка об
+откате записи сбора на сервере с 2026-10-13: `grep -c _persist_chunks` там не
+ноль). На сервере проверка не исполнялась — тесты идут на одноразовом
+PostgreSQL 16 (`tests/test_scrape_lock_lost.py`); чтением 2026-10-13 сверено,
+что роль приложения там не суперпользователь и читать `pg_locks` вправе.
 
 **Прогон висит `running`, а процесса сбора нет.** Так кончается сбор, который
 убили (перезагрузка, `TimeoutStartSec`, Ctrl-C), у которого база не приняла и
