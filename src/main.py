@@ -2583,8 +2583,9 @@ def _run_matching_stage(
     """Этап сопоставления — один и тот же в конце полного сбора и в `rematch`.
 
     Порядок: пересчёт выводимых полей по названию → замена давно не виденных
-    членов кластеров их живыми двойниками → `match_products` → `revalidate_split`
-    → флаги подозрительной разницы цен.
+    членов кластеров их живыми двойниками → замена чужих по цене членов их
+    соседями по сайту → `match_products` → `revalidate_split` → флаги
+    подозрительной разницы цен.
 
     Раньше `rematch` делал только часть этого (без замены устаревших строк и без
     revalidate), и «прогнать сопоставление руками после выкладки» давало не тот
@@ -2595,10 +2596,11 @@ def _run_matching_stage(
     Сбой revalidate — ошибка этапа: после него в базе могут остаться пары,
     которые текущие правила запрещают.
     """
-    summary: dict[str, int | None] = {"refreshed": None, "relinked": None}
+    summary: dict[str, int | None] = {"refreshed": None, "relinked": None, "reseated": None}
     for key, prepare in (
         ("refreshed", matcher.refresh_derived_fields),
         ("relinked", matcher.relink_stale_members),
+        ("reseated", matcher.replace_price_strangers),
     ):
         try:
             with session.begin_nested():
@@ -2606,6 +2608,10 @@ def _run_matching_stage(
             summary[key] = result if isinstance(result, int) else len(result)
         except Exception:
             log.exception("matcher_preparation_failed", step=prepare.__name__)
+            # Точка сохранения вернула базу, но не сессию: состав кластеров,
+            # прочитанный упавшим шагом после его записей, остался бы прежним,
+            # и проходы собрали бы кластер с двумя строками одного сайта.
+            session.expire_all()
     if fuzzy_threshold is None:
         summary["clusters"] = matcher.match_products(session)
     else:
@@ -6563,13 +6569,16 @@ def rematch_cmd(
 
             click.echo(f"Products re-normalized: {_shown(summary['refreshed'])}.")
             click.echo(f"Stale members relinked: {_shown(summary['relinked'])}.")
+            click.echo(f"Price strangers reseated: {_shown(summary['reseated'])}.")
             click.echo(f"Matcher done: {summary['clusters']} clusters created/updated.")
             click.echo(f"Revalidate: re-split {summary['revalidated']} clusters.")
             click.echo(f"Price-spread flags changed: {_shown(summary['flagged'])}.")
             # В сборе сбой подготовки не отменяет прогон; здесь команду запустили
             # ради самого этапа, и молчаливый «успех» планового юнита скрыл бы,
             # что пересчёт полей или замена строк не выполнились.
-            failed = [key for key in ("refreshed", "relinked") if summary[key] is None]
+            failed = [
+                key for key in ("refreshed", "relinked", "reseated") if summary[key] is None
+            ]
             if failed:
                 raise click.ClickException(
                     "matching stage finished, but a preparation step failed: "

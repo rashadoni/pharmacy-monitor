@@ -41,6 +41,7 @@ INSTALLER = REPO / "infra/scripts/install_systemd_schedule.sh"
 STAGE = [
     "refresh_derived_fields",
     "relink_stale_members",
+    "replace_price_strangers",
     "match_products",
     "revalidate_split",
     "flag_suspected_mismatches",
@@ -48,6 +49,7 @@ STAGE = [
 _EMPTY_RESULT = {
     "refresh_derived_fields": 0,
     "relink_stale_members": [],
+    "replace_price_strangers": [],
     "match_products": 0,
     "revalidate_split": [],
     "flag_suspected_mismatches": 0,
@@ -264,6 +266,7 @@ def test_rematch_gives_the_cluster_slot_to_the_live_twin(db_session, monkeypatch
 
     assert result.exit_code == 0, result.output
     assert "Stale members relinked: 1." in result.output
+    assert "Price strangers reseated: 0." in result.output
     for product in (old, partner, twin):
         db_session.refresh(product)
     assert (old.canonical_id, twin.canonical_id, partner.canonical_id) == (None, match.id, match.id)
@@ -350,7 +353,9 @@ def test_matcher_lock_is_released_when_the_stage_fails(db_session, monkeypatch):
     assert released == ["released"]
 
 
-@pytest.mark.parametrize("step", ["refresh_derived_fields", "relink_stale_members"])
+@pytest.mark.parametrize(
+    "step", ["refresh_derived_fields", "relink_stale_members", "replace_price_strangers"]
+)
 def test_failed_preparation_step_does_not_cancel_matching_but_fails_the_command(
     db_session, monkeypatch, step
 ):
