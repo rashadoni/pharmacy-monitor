@@ -461,7 +461,8 @@ def test_connection_lost_midway_costs_one_category_write_not_the_run(db_session,
     соединение, финальный проход дописывает `cat-b`.
 
     Перезапуск PostgreSQL рвёт все соединения разом, включая то, на котором
-    лежит замок сбора (здесь он подменён): этого тест не изображает.
+    лежит замок сбора (здесь он подменён): такой сбор останавливается, это
+    проверяет `tests/test_scrape_lock_lost.py` — на настоящем замке.
     """
     if not _is_postgresql(db_session):
         pytest.skip("обрыв соединения сервером — только PostgreSQL")
@@ -767,6 +768,48 @@ def test_only_fields_changed_since_the_last_write_are_carried(db_session):
     assert main_mod._unsaved_column_values(run) == {"catalog_verification_reason": "why"}
 
 
+@pytest.mark.parametrize(
+    "url", ["sqlite:///:memory:", "postgresql+psycopg://nobody@127.0.0.1:1/nowhere"]
+)
+def test_application_sessions_do_not_autoflush(url, monkeypatch):
+    """Перенос полей прогона через откат читает историю изменений атрибута, а
+    она живёт до первого flush. Поэтому сессии приложения — обе ветки
+    `storage.make_session` — обязаны быть без autoflush: с ним поле молча
+    пропадало бы (тест ниже), а тесты этого файла, которые строят свои фабрики
+    с тем же флагом, остались бы зелёными."""
+    monkeypatch.setattr(storage, "_SESSION_FACTORY_CACHE", {})
+
+    factory = storage.make_session(url)
+
+    try:
+        assert factory.kw["bind"].dialect.name == url.split(":")[0].split("+")[0]
+        assert factory.kw["autoflush"] is False
+        with factory() as session:
+            assert session.autoflush is False
+    finally:
+        factory.kw["bind"].dispose()
+
+
+def test_field_already_sent_by_autoflush_would_not_be_carried(db_session):
+    """Почему autoflush закреплён выключенным: с ним первый же запрос после
+    присвоения сам отправляет поле в базу. Истории у атрибута больше нет,
+    переносить помощнику нечего, а откат поле стирает."""
+    run = _new_run(db_session)
+    flushing = sessionmaker(db_session.get_bind(), expire_on_commit=False, autoflush=True)
+    with flushing() as session:
+        same_run = session.get(storage.Run, run.id)
+        same_run.catalog_verification_reason = "set right before the failure"
+        assert main_mod._unsaved_column_values(same_run) == {
+            "catalog_verification_reason": "set right before the failure"
+        }
+
+        session.scalar(select(storage.Run.id))  # любой запрос сессии
+
+        assert main_mod._unsaved_column_values(same_run) == {}
+        session.rollback()
+        assert same_run.catalog_verification_reason is None
+
+
 def _unwritable_field_then_broken_in_code(session, run):
     run.catalog_verification_reason = "set next to a field the database refuses"
     run.tenant_id = None  # NOT NULL
@@ -833,6 +876,38 @@ def test_unfinished_work_of_a_failed_step_is_not_saved_with_the_outcome(db_sessi
     assert run.error_message == "ValueError: step broke halfway"
     assert run.products_scraped == 1, "сохранённое до шага остаётся"
     assert _external_ids(db_session) == ["a"]
+
+
+@pytest.mark.parametrize("log_stream", ["alive", "dead"])
+def test_outcome_does_not_depend_on_reading_the_unsaved_fields(db_session, monkeypatch, log_stream):
+    """Несохранённые поля прогона снять не удалось. Переносить тогда нечего — и
+    только: недоделанное шагом всё равно откатывается, а итог пишется. Раньше
+    сбой здесь обходил и откат, и запись итога, и прогон оставался `running`.
+    Строка журнала об этом может упасть сама (вывод оборван) — тоже не помеха."""
+
+    def unreadable(instance):
+        raise RuntimeError("attribute history is unavailable")
+
+    monkeypatch.setattr(main_mod, "_unsaved_column_values", unreadable)
+    monkeypatch.setattr(
+        storage, "confirm_prices_of_latest_verified_runs", _half_done_then_broken_in_code
+    )
+    warned: list[tuple[str, dict]] = []
+    if log_stream == "alive":
+        warned = _record_log(monkeypatch, main_mod, "warning")
+    else:
+        _dead_log_stream(monkeypatch, "warning")
+    catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
+
+    run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
+
+    assert run.finished_at is not None
+    assert run.error_message == "ValueError: step broke halfway"
+    assert _external_ids(db_session) == ["a"], "недоделанное шагом откачено"
+    if log_stream == "alive":
+        assert [
+            fields["error"] for name, fields in warned if name == "run_failure_fields_not_carried"
+        ] == ["RuntimeError: attribute history is unavailable"]
 
 
 def test_dead_log_stream_does_not_leave_the_run_running(db_session, monkeypatch):

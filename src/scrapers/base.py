@@ -62,6 +62,16 @@ class SiteScrapeFatalError(RuntimeError):
     """
 
 
+class ScrapeMustStop(RuntimeError):
+    """Raised by an ``on_category`` callback to stop the whole scrape at once.
+
+    Any other error of the callback costs one category write and the scrape
+    goes on.  This one means the caller may not write anything further (it lost
+    the scrape lock), so collecting the rest of the site would only keep the
+    run open: it leaves ``scrape()`` as is, past the per-category handlers.
+    """
+
+
 def fatal_proxy_status(exc: BaseException) -> int | None:
     """Extract only account-level proxy statuses without leaking proxy URLs."""
     message = str(exc)
@@ -773,6 +783,8 @@ class BaseScraper(ABC):
         категорию сразу. Ошибка callback'а НЕ валит скрейп (логируется и идём дальше).
         Следующую категорию получит тот же callback, поэтому после своего сбоя он
         обязан остаться рабочим (`persist_results` недописанное откатывает сам).
+        Исключение одно — `ScrapeMustStop`: им callback останавливает сбор целиком,
+        и оно выходит из `scrape()` как есть.
         """
         requested_slugs = [slug for slug in category_slugs if slug is not None]
         result = ScrapeResult(site=self.site_name, items_expected=len(requested_slugs))
@@ -878,6 +890,8 @@ class BaseScraper(ABC):
                 if on_category is not None and cat_products:
                     try:
                         on_category(self.site_name, slug, cat_products)
+                    except ScrapeMustStop:
+                        raise
                     except Exception as e:
                         log.error(
                             "incremental_persist_failed",
@@ -885,6 +899,8 @@ class BaseScraper(ABC):
                             category=slug,
                             error=f"{type(e).__name__}: {e}",
                         )
+            except ScrapeMustStop:
+                raise
             except SiteScrapeFatalError as e:
                 abort_site(e, item_index, count)
                 break

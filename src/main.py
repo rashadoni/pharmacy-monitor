@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+import weakref
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -33,13 +34,17 @@ from sqlalchemy.orm.attributes import NO_VALUE
 load_dotenv(override=True)
 
 from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
-from src.run_lock import SCRAPE_ADVISORY_LOCK_KEY  # noqa: E402
+from src.run_lock import (  # noqa: E402
+    SCRAPE_ADVISORY_LOCK_KEY,
+    connection_holds_exclusive_scrape_lock,
+)
 from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
 from src.scrapers.aptekonline import AptekonlineScraper  # noqa: E402
 from src.scrapers.base import (  # noqa: E402
     BaseScraper,
     ScrapedProduct,
+    ScrapeMustStop,
     ScrapeResult,
     SiteScrapeFatalError,
     fatal_proxy_reason,
@@ -2640,6 +2645,88 @@ def _run_matching_stage(
     return summary
 
 
+class ScrapeLockLost(ScrapeMustStop):
+    """Замок сбора, взятый этой командой, больше не держится."""
+
+
+class _HeldScrapeLock:
+    """Соединение, на котором команда держит замок сбора, и что с замком стало."""
+
+    __slots__ = ("connection", "lost")
+
+    def __init__(self, connection) -> None:
+        self.connection = connection
+        # Почему замка больше нет; None — держится. Обратно в None не меняется.
+        self.lost: str | None = None
+
+
+# Замки сбора, которые команды этого процесса взяли и ещё не сняли, — по контексту
+# своей команды: вызванная через `ctx.invoke` берёт замок сама и чужой не
+# наследует. На SQLite замка нет, и сюда там ничего не попадает.
+_SCRAPE_LOCKS_BY_COMMAND: weakref.WeakKeyDictionary[click.Context, _HeldScrapeLock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _why_scrape_lock_is_gone(held: _HeldScrapeLock) -> str | None:
+    """Причина, по которой замок больше не держится; None — держится."""
+    try:
+        if connection_holds_exclusive_scrape_lock(held.connection):
+            return None
+    except Exception as error:
+        # В причину прогона идёт только класс ошибки, в журнал — ещё и первая
+        # строка: остальной текст — сам запрос проверки.
+        with suppress(Exception):
+            log.warning(
+                "scrape_lock_check_failed",
+                error=f"{type(error).__name__}: {(str(error).splitlines() or [''])[0]}",
+            )
+        return f"the check on its connection failed ({type(error).__name__})"
+    return "the server no longer lists it for its connection"
+
+
+def _fail_if_scrape_lock_lost(*, noticed: str) -> None:
+    """Остановить команду, если замок сбора, взятый ею, больше не держится.
+
+    Замок — сессионный advisory-замок на отдельном соединении, которое команда
+    до выхода не трогает. Если сервер оборвал это соединение (перезапуск
+    PostgreSQL мимо systemd, восстановление после сбоя, `pg_terminate_backend`),
+    замок свободен, а процесс этого не видит: рабочая сессия берёт из пула новое
+    соединение (`pool_pre_ping`) и пишет дальше — рядом с тиком, сбором другого
+    сайта или `rematch`, которые замок уже получили. Запись сбора рассчитывает
+    на то, что сборы идут по одному: `_adopt_aloe_product_numbers` раздаёт строки
+    товаров необратимо.
+
+    Спрашивается сервер: числится ли замок за сеансом этого соединения
+    (`run_lock.connection_holds_exclusive_scrape_lock`). Ответ «нет» и запрос,
+    упавший на мёртвом соединении, значат одно. Потерянный замок заново не
+    берётся, и каждая следующая проверка отказывает сразу, не спрашивая: пока
+    замок был свободен, рядом мог пройти другой сбор, и ручаться за то, что этот
+    прогон уже прочитал и записал, нельзя.
+
+    Проверка — не замок: соединение может оборваться сразу после неё. Поэтому
+    она стоит перед каждой записью сбора и перед каждым этапом после неё, а не
+    один раз; запись, начатую до обрыва, она не останавливает.
+
+    `noticed` — когда заметили («before matching»): попадает в причину прогона.
+    Без настоящего замка (SQLite, подмена в тестах) проверять нечего.
+    """
+    context = click.get_current_context(silent=True)
+    held = _SCRAPE_LOCKS_BY_COMMAND.get(context) if context is not None else None
+    if held is None:
+        return
+    if held.lost is None:
+        held.lost = _why_scrape_lock_is_gone(held)
+        if held.lost is not None:
+            with suppress(Exception):
+                log.error("scrape_lock_lost", noticed=noticed, reason=held.lost)
+    if held.lost is not None:
+        raise ScrapeLockLost(
+            f"scrape lock lost (noticed {noticed}): {held.lost}; another scrape, tick or "
+            "rematch may have run while it was free, so this run stops and publishes nothing"
+        )
+
+
 def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
     """Hold one checked-out connection's session lock without an idle transaction."""
     bind = SessionFactory.kw.get("bind")
@@ -2679,7 +2766,10 @@ def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
             connection.close()
         raise RuntimeError("scrape lock requires an active Click command context")
 
+    held = _HeldScrapeLock(connection)
+
     def release() -> None:
+        _SCRAPE_LOCKS_BY_COMMAND.pop(context, None)
         try:
             connection.scalar(
                 text("SELECT pg_advisory_unlock(hashtext(:key))"),
@@ -2693,6 +2783,7 @@ def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
             connection.close()
 
     context.call_on_close(release)
+    _SCRAPE_LOCKS_BY_COMMAND[context] = held
     return True
 
 
@@ -3592,6 +3683,13 @@ def _unsaved_column_values(instance) -> dict[str, object]:
     То же, что записал бы flush: колонка, чьё значение не отличается от
     прочитанного из базы, сюда не попадает. После упавшего flush возвращать
     нечего — SQLAlchemy сам сбрасывает объекты сессии.
+
+    Работает только у сессии без autoflush. С autoflush первый же запрос после
+    присвоения сам отправляет поле в базу: истории изменений у атрибута больше
+    нет, сюда оно не попадает, а откат его стирает — молча. Фабрики
+    `storage.make_session` отдают сессии без autoflush; это держит
+    `tests/test_run_persist_db_failure.py`, и включать autoflush там нельзя, пока
+    на этой функции стоит перенос полей прогона через откат.
     """
     state = inspect(instance)
     values: dict[str, object] = {}
@@ -3626,11 +3724,23 @@ def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, r
     отказ ложится в журнал строкой `run_failure_not_recorded`, а вызывающий
     выходит с причиной, по которой упал сам прогон.
 
+    Снять несохранённые поля не удалось — переносить нечего, и только: откат и
+    запись итога от этого зависеть не должны.
+
     Строки журнала здесь не должны срывать запись: журнал пишет в stdout, и при
     оборванном выводе (ssh без терминала, отменённый workflow) строка падает.
     """
     try:
-        unsaved = _unsaved_column_values(run)
+        try:
+            unsaved = _unsaved_column_values(run)
+        except Exception as inspection_error:
+            unsaved = {}
+            with suppress(Exception):
+                log.warning(
+                    "run_failure_fields_not_carried",
+                    run_id=run_id,
+                    error=f"{type(inspection_error).__name__}: {inspection_error}",
+                )
         try:
             session.rollback()
         except Exception as rollback_error:
@@ -5360,6 +5470,7 @@ def ai_crawl_cmd(
                         "error": "; ".join(result.errors[:5])[:500] or None,
                     }
                 }
+            _fail_if_scrape_lock_lost(noticed="before the write")
             count = persist_results(session, run, [result])
             run.products_scraped = count
             run.products_per_site = {site: len(result.products)}
@@ -5774,16 +5885,27 @@ def run_cmd(
                 on_category = None
                 if not use_legacy_identity_bridge:
                     def _persist_category(site_name, slug, cat_products):
+                        # На границе каждой категории, и у aloe тоже: сбор без
+                        # замка останавливается сразу, а не дособирает сайт.
+                        _fail_if_scrape_lock_lost(noticed="before a category write")
                         if site_name == "aloe":
                             # Пишется целиком в конце сбора: кому достаётся
                             # строка, записанная под общим слагом, решается по
                             # всем товарам сайта сразу (`_adopt_aloe_product_numbers`).
                             return
-                        persist_results(
-                            session,
-                            run,
-                            [ScrapeResult(site=site_name, products=list(cat_products))],
-                        )
+                        try:
+                            persist_results(
+                                session,
+                                run,
+                                [ScrapeResult(site=site_name, products=list(cat_products))],
+                            )
+                        except Exception:
+                            # Запись могла упасть оттого, что сервер оборвал все
+                            # соединения процесса разом, — тогда ушёл и замок, а
+                            # следующая запись прошла бы через новое соединение
+                            # как ни в чём не бывало.
+                            _fail_if_scrape_lock_lost(noticed="after a failed category write")
+                            raise
 
                     on_category = _persist_category
 
@@ -5801,6 +5923,7 @@ def run_cmd(
                         aloe_country_map=country_map,
                     )
                 )
+                _fail_if_scrape_lock_lost(noticed="after the scrape")
                 persist_aloe_country_mappings(session, results)
 
             quality_status: str | None = None
@@ -5907,6 +6030,7 @@ def run_cmd(
                     expected_slugs=slugs_by_site,
                     baselines=baselines,
                 )
+            _fail_if_scrape_lock_lost(noticed="before the final write")
             count = persist_results(
                 session,
                 run,
@@ -5993,6 +6117,8 @@ def run_cmd(
                 log.info("matcher_lock_wait", run_id=run.id)
                 _acquire_matcher_lock(session, wait=True)
                 lock_taken = True
+                # После ожидания замка сопоставления, а не до: ждать его можно долго.
+                _fail_if_scrape_lock_lost(noticed="before matching")
                 if effective_mode == "watchlist":
                     linked = auto_match_watchlist(session)
                     log.info("watchlist_auto_matched", linked=linked)
@@ -6014,6 +6140,10 @@ def run_cmd(
 
                 trust_context = finalizing_trusted_run(run.id)
                 trust_context.__enter__()
+
+            # Сопоставление шло минуты. Дальше — подтверждение цен и алерты:
+            # письмо уже не отзовёшь.
+            _fail_if_scrape_lock_lost(noticed="before alerts")
 
             # Diff-only не пишет snapshot, когда цена прежняя, поэтому за
             # проверенным сбором остаётся цена только изменившихся товаров.
@@ -6150,6 +6280,9 @@ def run_cmd(
                     status=run.status,
                 )
 
+            # `ok` получает только прогон, державший замок до конца.
+            _fail_if_scrape_lock_lost(noticed="before publication")
+
             if trust_context is not None:
                 trust_context.__exit__(None, None, None)
                 trust_context = None
@@ -6273,6 +6406,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
                     aloe_country_map=load_aloe_country_map(session),
                 )
             )
+            _fail_if_scrape_lock_lost(noticed="before the write")
             persist_aloe_country_mappings(session, results)
             if _pharmonline_legacy_id_bridge_enabled():
                 _bridge_pharmonline_legacy_ids(
