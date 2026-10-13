@@ -58,3 +58,14 @@ def _request_counters_end_with_the_test(monkeypatch):
     rate_limit._reset_memory_for_tests()
     yield
     rate_limit._reset_memory_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _daily_letter_state_stays_in_tmp(monkeypatch, tmp_path):
+    """Файл состояния утреннего письма (`src.daily_letter_state`) у каждого теста свой.
+
+    Настоящая рассылка суточного письма пишет исход в `data/` рабочего каталога,
+    а health его читает. Без фикстуры любой тест, отправивший суточный дайджест,
+    оставлял бы файл в чекауте, и следующий тест health читал бы чужую запись.
+    """
+    monkeypatch.setenv("DAILY_LETTER_STATE_FILE", str(tmp_path / "daily_letter_state.json"))

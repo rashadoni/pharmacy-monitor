@@ -8,6 +8,8 @@
 2. **Failed**: последний run завершился со status='failed'
 3. **Empty**: последний run ok но < min_products (полностью пустой)
 4. **Site-drop**: сайт покрыл <50% живого каталога за окно покрытия
+5. **Утреннее письмо**: суточное письмо клиенту не рассылалось, не принято
+   почтовым сервером или ушло без отчёта о ценах (`_check_daily_letter`)
 """
 
 from __future__ import annotations
@@ -21,13 +23,14 @@ import structlog
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
+from src import daily_letter_state
 from src._time import utcnow
 from src.cadence import (
     SITE_SCRAPE_CADENCE_HOURS,
     site_cadence_days,
     site_max_age_hours,
 )
-from src.storage import PriceSnapshot, Product, Run
+from src.storage import PriceSnapshot, Product, Run, TenantUser
 
 log = structlog.get_logger()
 
@@ -323,6 +326,10 @@ def check_health(
     # `empty_run` смотрит только на последний прогон в принципе (его маскировал
     # intraday-прогон другого сайта).
     report.issues.extend(_check_site_zero_scrape(session, fresh_verified_catalogs))
+
+    # 9. Утреннее письмо клиенту: рассылалось ли, принял ли его почтовый сервер
+    # и был ли в нём отчёт о ценах. Команда письма сама никого не оповещает.
+    report.issues.extend(_check_daily_letter(session))
 
     # Совокупный статус
     if any(i.severity == "critical" for i in report.issues):
@@ -982,6 +989,112 @@ def _check_site_zero_scrape(
         if seen == sites:
             break
     return issues
+
+
+_DAILY_LETTER_JOURNAL = "journalctl -u pharmacy-monitor-digest-daily --since yesterday"
+
+
+def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthIssue]:
+    """Сторож утреннего письма с разницей цен: ушло ли оно последний раз и каким.
+
+    Письмо клиент ждёт каждое утро, а его команда о своём сбое никого не
+    оповещает. Каждая настоящая рассылка оставляет запись
+    (`daily_letter_state`), и здесь она сверяется:
+
+    - последняя рассылка старше `daily_letter_state.MAX_AGE_HOURS` — письмо не
+      рассылалось: таймер не сработал или команда упала раньше рассылки;
+    - отчёт о ценах в последней рассылке не собрался — письмо ушло без чисел и
+      без файла либо не ушло вовсе (если и событий за сутки не было);
+    - письмо слали, но почтовый сервер не принял его ни у одного получателя.
+
+    Проверки нет, пока нет подписчиков на суточный дайджест или записи о
+    рассылке: сторож начинает работать с первой настоящей рассылки, и включение
+    подписки не поднимает тревогу до первого утра. Чего он не видит — письма,
+    которое сервер принял и не доставил.
+    """
+    subscribers = (
+        session.scalar(
+            select(func.count())
+            .select_from(TenantUser)
+            .where(
+                TenantUser.tenant_id == tenant_id,
+                TenantUser.is_active.is_(True),
+                TenantUser.daily_digest.is_(True),
+            )
+        )
+        or 0
+    )
+    if not subscribers:
+        return []
+    try:
+        mailing = daily_letter_state.last_mailing(tenant_id)
+    except daily_letter_state.StateUnreadable as failure:
+        return [
+            HealthIssue(
+                "warning",
+                "daily_letter_state_unreadable",
+                f"Файл состояния утреннего письма ({daily_letter_state.state_file()}) не "
+                f"читается ({failure}): сторож письма не работает. Удалить файл — сторож "
+                "начнёт заново со следующей рассылки.",
+            )
+        ]
+    if mailing is None:
+        return []
+
+    when = f"{mailing.at:%d.%m %H:%M} UTC"
+    age_hours = (utcnow() - mailing.at).total_seconds() / 3600
+    context = {
+        "hours_ago": round(age_hours, 1),
+        "recipients": mailing.recipients,
+        "accepted": mailing.accepted,
+        "report": mailing.report,
+    }
+    if age_hours > daily_letter_state.MAX_AGE_HOURS:
+        return [
+            HealthIssue(
+                "critical",
+                "daily_letter_overdue",
+                f"Утреннее письмо с разницей цен не рассылалось {age_hours:.0f}ч (порог "
+                f"{daily_letter_state.MAX_AGE_HOURS}ч; последняя рассылка — {when}), а "
+                f"подписчиков на него {subscribers}. Таймер не сработал, команда упала до "
+                "рассылки или не записала её исход: systemctl status "
+                f"pharmacy-monitor-digest-daily.timer; {_DAILY_LETTER_JOURNAL}.",
+                context=context,
+            )
+        ]
+    error_type = mailing.failed_report
+    if error_type is not None:
+        if mailing.accepted:
+            outcome = (
+                f"ушло без отчёта о разнице цен и без файла ({mailing.accepted} из "
+                f"{mailing.recipients} получателей)"
+            )
+        elif mailing.recipients:
+            outcome = "осталось без отчёта о разнице цен, и почтовый сервер его не принял"
+        else:
+            outcome = "не отправлено: отчёта о разнице цен нет, а событий за сутки не было"
+        return [
+            HealthIssue(
+                "warning" if mailing.accepted else "critical",
+                "daily_letter_report_failed",
+                f"Утреннее письмо {when} {outcome}. Сборка отчёта упала ({error_type}); "
+                f"трассировка — событие digest_price_report_failed: {_DAILY_LETTER_JOURNAL}.",
+                context=context,
+            )
+        ]
+    if mailing.recipients and not mailing.accepted:
+        return [
+            HealthIssue(
+                "critical",
+                "daily_letter_not_delivered",
+                f"Утреннее письмо с разницей цен {when} почтовый сервер не принял ни у одного "
+                f"из {mailing.recipients} получателей. Причина — digest_email_failed или "
+                f"email_skipped_no_smtp: {_DAILY_LETTER_JOURNAL} (рассылку кнопкой из "
+                "дашборда — в журнале pharmacy-monitor-api).",
+                context=context,
+            )
+        ]
+    return []
 
 
 def render_alert_html(report: HealthReport) -> str:

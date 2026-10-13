@@ -7,8 +7,9 @@ Replaces the scattered logic in src/alerts.py:_send_*_alert. New logic respects:
 
 Public API:
   - dispatch_event(session, event)        — for real-time alerts (called by alerts.evaluate_rules)
-  - send_daily_digest(session, tenant_id) — утреннее письмо: разница цен + события за сутки
-                                            (systemd timer, 09:00 Asia/Baku)
+  - send_daily_letter(session, tenant_id) — утреннее письмо: разница цен + события за сутки
+                                            (systemd timer, 09:00 Asia/Baku); возвращает исход
+  - send_daily_digest(session, tenant_id) — то же, числом получателей (кнопка в дашборде)
   - send_weekly_digest(session, tenant_id) — call from systemd timer Mondays
   - bind_telegram(session, chat_id, email) — link telegram to user
 
@@ -18,7 +19,7 @@ Severity ordering (low → high):  info < warning < critical
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from html import escape
 from typing import Iterable
@@ -28,7 +29,15 @@ import structlog
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from src import cadence, comparison_export, comparison_rows, notifier, product_policy, storage
+from src import (
+    cadence,
+    comparison_export,
+    comparison_rows,
+    daily_letter_state,
+    notifier,
+    product_policy,
+    storage,
+)
 from src._time import utcnow
 
 log = structlog.get_logger()
@@ -421,25 +430,67 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
 # ─── Daily / weekly digest ───────────────────────────────────────────────────
 
 
-def send_daily_digest(
+@dataclass(frozen=True)
+class DigestOutcome:
+    """Чем кончилась рассылка дайджеста."""
+
+    # Получатели, отправка которым не упала; при dry_run — кому письмо ушло бы.
+    sent: int = 0
+    # Скольким письмо слали (или слали бы): 0 — слать было нечего или некому.
+    recipients: int = 0
+    # У скольких почтовый сервер письмо принял. При dry_run — ноль.
+    accepted: int = 0
+    # Что с отчётом о ценах — в записи `daily_letter_state`: "ok",
+    # "skipped:<причина>", "failed:<класс ошибки>". У недельного дайджеста пусто.
+    report: str = ""
+    dry_run: bool = False
+    report_failure: Exception | None = field(default=None, compare=False, repr=False)
+
+    @property
+    def problems(self) -> list[str]:
+        """Почему рассылку нельзя считать состоявшейся; пусто — состоялась.
+
+        Тексты печатает команда (и по ним она кончается ошибкой), поэтому в них
+        класс ошибки и числа, без адресов и без текста ошибки.
+        """
+        found = []
+        if self.report_failure is not None:
+            error_type = type(self.report_failure).__name__
+            if self.recipients:
+                found.append(
+                    f"отчёт о разнице цен не собрался ({error_type}) — письмо без чисел и без файла"
+                )
+            else:
+                found.append(str(DailyLetterNotSent(error_type)))
+        if not self.dry_run and self.recipients and not self.accepted:
+            found.append(
+                f"почтовый сервер не принял письмо ни у одного из {self.recipients} получателей "
+                "(в журнале — digest_email_failed или email_skipped_no_smtp)"
+            )
+        return found
+
+
+def send_daily_letter(
     session: Session,
     tenant_id: int = 1,
     *,
     only_email: str | None = None,
     dry_run: bool = False,
     locale: str = "ru",
-) -> int:
-    """Утреннее письмо тем, у кого включён суточный дайджест. Возвращает число получателей.
+) -> DigestOutcome:
+    """Утреннее письмо тем, у кого включён суточный дайджест.
 
     Наверху — разница цен между сайтом клиента и конкурентами на сейчас
     (`_price_report`), во вложении — тот же Excel, что отдаёт кнопка на странице
     сравнения; ниже — события за сутки. `locale` — язык вложения: текст письма,
     как у всех писем системы, русский.
 
-    `DailyLetterNotSent` — письмо не ушло никому, потому что отчёт о ценах
-    сломан, а событий за сутки нет: молча пропустить такое утро нельзя.
+    Сломанный отчёт и отказ почтового сервера исключением не становятся: всё,
+    что можно, отправлено, а что не так — в `DigestOutcome.problems`. Исход
+    настоящей рассылки (не `dry_run` и не `only_email`) пишется в файл
+    `daily_letter_state`: по нему health замечает утро, когда письмо не ушло.
     """
-    return _send_digest(
+    outcome = _send_digest(
         session,
         tenant_id,
         kind="daily",
@@ -448,6 +499,37 @@ def send_daily_digest(
         dry_run=dry_run,
         locale=locale,
     )
+    if not dry_run and only_email is None:
+        daily_letter_state.record(
+            tenant_id,
+            at=utcnow(),
+            recipients=outcome.recipients,
+            accepted=outcome.accepted,
+            report=outcome.report,
+        )
+    return outcome
+
+
+def send_daily_digest(
+    session: Session,
+    tenant_id: int = 1,
+    *,
+    only_email: str | None = None,
+    dry_run: bool = False,
+    locale: str = "ru",
+) -> int:
+    """То же письмо, что `send_daily_letter`; возвращает число получателей.
+
+    `DailyLetterNotSent` — письмо не ушло никому, потому что отчёт о ценах
+    сломан, а событий за сутки нет: молча пропустить такое утро нельзя.
+    """
+    outcome = send_daily_letter(
+        session, tenant_id, only_email=only_email, dry_run=dry_run, locale=locale
+    )
+    if outcome.report_failure is not None and not outcome.recipients:
+        failure = outcome.report_failure
+        raise DailyLetterNotSent(type(failure).__name__) from failure
+    return outcome.sent
 
 
 def send_weekly_digest(
@@ -460,7 +542,7 @@ def send_weekly_digest(
         since=utcnow() - timedelta(days=7),
         only_email=only_email,
         dry_run=dry_run,
-    )
+    ).sent
 
 
 def _send_digest(
@@ -472,8 +554,8 @@ def _send_digest(
     only_email: str | None = None,
     dry_run: bool = False,
     locale: str = "ru",
-) -> int:
-    """Собрать и разослать дайджест. Возвращает число получателей.
+) -> DigestOutcome:
+    """Собрать и разослать дайджест. Возвращает исход рассылки.
 
     `only_email` — отправить одному получателю из включивших дайджест: так
     письмо смотрят на живых данных, не трогая остальных. `dry_run` — собрать
@@ -496,20 +578,25 @@ def _send_digest(
         users = [u for u in users if u.email.lower() == only_email.strip().lower()]
     if not users:
         log.info("digest_no_recipients", kind=kind, tenant=tenant_id)
-        return 0
+        return DigestOutcome(
+            report=daily_letter_state.report_skipped("no_recipients") if kind == "daily" else "",
+            dry_run=dry_run,
+        )
 
     report: _PriceReport | None = None
+    report_state = ""
     report_failure: Exception | None = None
     if kind == "daily":
         try:
             # Точка сохранения: упавший запрос отчёта не должен оставить
             # прерванной транзакцию, в которой ниже читаются события.
             with session.begin_nested():
-                report = _price_report(session, tenant_id, locale=locale)
+                report, report_state = _price_report(session, tenant_id, locale=locale)
         except Exception as exc:
             # Письмо с событиями уйдёт и без отчёта. Адресов сборка отчёта не
             # читает; текст ошибки запроса к базе приходит уже без его данных.
             report_failure = exc
+            report_state = daily_letter_state.report_failed(type(exc).__name__)
             log.exception(
                 "digest_price_report_failed",
                 kind=kind,
@@ -528,11 +615,9 @@ def _send_digest(
     events = [event for event in events if _event_is_digest_eligible(session, event)]
 
     if not events and report is None:
+        # Слать нечего. Тихое это утро или сломанный отчёт — видно по исходу.
         log.info("digest_no_events", kind=kind, tenant=tenant_id)
-        if report_failure is not None:
-            # Слать нечего, и причина — не тихое утро, а сломанный отчёт.
-            raise DailyLetterNotSent(type(report_failure).__name__) from report_failure
-        return 0
+        return DigestOutcome(report=report_state, dry_run=dry_run, report_failure=report_failure)
 
     # Письмо одно на всех получателей. «Порог email-уведомлений» получателя
     # (`email_severity_min`) на дайджест не действует — решение владельца
@@ -550,6 +635,7 @@ def _send_digest(
         with_file = {"attachments": [report.attachment]}
         file_size = {"attachment_kb": round(len(report.attachment[1]) / 1024, 1)}
     sent = 0
+    accepted = 0
     for user in users:
         if dry_run:
             log.info(
@@ -564,8 +650,12 @@ def _send_digest(
             sent += 1
             continue
         try:
-            notifier.send_email(subject=subject, html_body=html, to=[user.email], **with_file)
+            delivered = notifier.send_email(
+                subject=subject, html_body=html, to=[user.email], **with_file
+            )
             sent += 1
+            # False — почтовый сервер не настроен: письмо никуда не ушло.
+            accepted += delivered is True
         except Exception as e:
             log.warning(
                 "digest_email_failed",
@@ -579,7 +669,14 @@ def _send_digest(
         recipients=sent,
         events=len(events),
     )
-    return sent
+    return DigestOutcome(
+        sent=sent,
+        recipients=len(users),
+        accepted=accepted,
+        report=report_state,
+        dry_run=dry_run,
+        report_failure=report_failure,
+    )
 
 
 _FINANCIAL_EVENT_TYPES = {
@@ -709,8 +806,10 @@ def _site_data_ages(session: Session, tenant_id: int, now: datetime) -> tuple[_S
     return tuple(ages)
 
 
-def _price_report(session: Session, tenant_id: int, *, locale: str) -> _PriceReport | None:
-    """Отчёт «разница цен на сейчас» для утреннего письма.
+def _price_report(
+    session: Session, tenant_id: int, *, locale: str
+) -> tuple[_PriceReport | None, str]:
+    """Отчёт «разница цен на сейчас» для утреннего письма и что с ним.
 
     Строки — те же, что показывает страница сравнения с фильтрами по умолчанию
     (минимум два сайта, достоверность пары от 0.70), файл — тот же, что отдаёт
@@ -722,10 +821,11 @@ def _price_report(session: Session, tenant_id: int, *, locale: str) -> _PriceRep
     Колонка «Позиция» в файле написана про Pharmonline: у арендатора с другим
     сайтом клиента разбивка письма с ней не совпадёт.
 
-    None — отчёта нет, причина в журнале (`digest_price_report_skipped`):
-    финансовые сравнения приостановлены политикой (страница в этом случае
-    отвечает 503), успешного сбора ещё не было или сравнивать нечего.
-    Исключение значит, что отчёт сломан; ловит его вызывающий.
+    Отчёта нет (None) — рядом причина, она же в журнале
+    (`digest_price_report_skipped`): финансовые сравнения приостановлены
+    политикой (страница в этом случае отвечает 503), успешного сбора ещё не
+    было или сравнивать нечего. Исключение значит, что отчёт сломан; ловит его
+    вызывающий.
     """
     eligibility = product_policy.policy_rollout_eligibility(session, tenant_id=tenant_id)
     if not eligibility.eligible:
@@ -756,10 +856,10 @@ def _price_report(session: Session, tenant_id: int, *, locale: str) -> _PriceRep
                 overdue_sites=[age.site for age in report.sites if age.overdue],
                 **report.counts,
             )
-            return report
+            return report, daily_letter_state.REPORT_OK
         reason = "no_comparison_rows"
     log.info("digest_price_report_skipped", tenant=tenant_id, reason=reason)
-    return None
+    return None, daily_letter_state.report_skipped(reason)
 
 
 def _price_letter_title(report: _PriceReport) -> str:

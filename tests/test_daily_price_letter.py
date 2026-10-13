@@ -35,7 +35,15 @@ from sqlalchemy.orm import Session, sessionmaker
 from structlog.testing import capture_logs
 
 from src import api as api_module
-from src import cadence, comparison_export, comparison_rows, notifications, storage, tenants
+from src import (
+    cadence,
+    comparison_export,
+    comparison_rows,
+    daily_letter_state,
+    notifications,
+    storage,
+    tenants,
+)
 from src._time import utcnow
 from src.main import cli
 from src.storage import Base
@@ -62,12 +70,13 @@ def setup(monkeypatch, db_session):
 def _reader(s, **fields) -> storage.TenantUser:
     """Сотрудник клиента с включённым суточным дайджестом."""
     tenant = tenants.get_or_create_default(s)
-    user = storage.TenantUser(
-        tenant_id=tenant.id,
-        is_active=True,
-        created_at=utcnow(),
-        **{"email": "reader@example.test", "role": "viewer", "daily_digest": True, **fields},
-    )
+    defaults = {
+        "email": "reader@example.test",
+        "role": "viewer",
+        "is_active": True,
+        "daily_digest": True,
+    }
+    user = storage.TenantUser(tenant_id=tenant.id, created_at=utcnow(), **{**defaults, **fields})
     s.add(user)
     s.commit()
     return user
@@ -165,9 +174,14 @@ def _event(s, run, title: str = "Kreon 25000", severity: str = "critical") -> No
     s.commit()
 
 
+def _mail_server(accepts: bool = True):
+    """Подмена `notifier.send_email`: почтовый сервер письмо принимает (или не настроен)."""
+    return patch("src.notifier.send_email", return_value=accepts)
+
+
 def _send_daily(s, **kwargs):
     """Отправить суточное письмо: (число получателей, вызовы `send_email`)."""
-    with patch("src.notifier.send_email") as mock_email:
+    with _mail_server() as mock_email:
         sent = notifications.send_daily_digest(s, tenant_id=1, **kwargs)
     return sent, mock_email.call_args_list
 
@@ -581,7 +595,7 @@ def test_command_exits_non_zero_when_the_letter_could_not_be_built(
     _mixed_catalog(s, _trusted_run(s))
     monkeypatch.setattr(comparison_rows, "comparison_rows", _broken)
 
-    with patch("src.notifier.send_email") as mock_email:
+    with _mail_server() as mock_email:
         result = CliRunner().invoke(cli, ["notify", "digest", "daily", *extra])
 
     assert result.exit_code == 1, result.output
@@ -591,19 +605,133 @@ def test_command_exits_non_zero_when_the_letter_could_not_be_built(
     assert "@" not in result.output
 
 
-def test_command_succeeds_when_the_broken_report_left_an_events_letter(setup, reader, monkeypatch):
+def test_command_fails_after_sending_the_events_letter_without_the_report(
+    setup, reader, monkeypatch
+):
+    """Письмо о событиях ушло, но без отчёта — утро не состоялось: код не ноль.
+    Сначала отправка, потом ошибка."""
     s = setup
     run = _trusted_run(s)
     _mixed_catalog(s, run)
     _event(s, run)
     monkeypatch.setattr(comparison_rows, "comparison_rows", _broken)
 
-    with patch("src.notifier.send_email") as mock_email:
+    with _mail_server() as mock_email:
+        result = CliRunner().invoke(cli, ["notify", "digest", "daily"])
+
+    assert mock_email.call_count == 1
+    assert "attachments" not in mock_email.call_args.kwargs
+    assert result.exit_code == 1, result.output
+    assert "daily digest sent to 1 recipients" in result.output
+    assert "OK:" not in result.output
+    assert "Error: отчёт о разнице цен не собрался (KeyError) — письмо без чисел и без файла" in (
+        result.output
+    )
+    # Исход записан до ошибки: сторож в health видит то же, что код возврата.
+    assert daily_letter_state.last_mailing(1).report == "failed:KeyError"
+
+
+def test_dry_run_with_a_broken_report_fails_even_when_there_are_events(setup, reader, monkeypatch):
+    """Просмотр перед включением должен показать сломанный отчёт, а не «всё соберётся»."""
+    s = setup
+    run = _trusted_run(s)
+    _mixed_catalog(s, run)
+    _event(s, run)
+    monkeypatch.setattr(comparison_export, "build_workbook", _broken)
+
+    with _mail_server() as mock_email:
+        result = CliRunner().invoke(cli, ["notify", "digest", "daily", "--dry-run"])
+
+    assert result.exit_code == 1, result.output
+    assert "[dry-run] daily digest: 1 recipients, nothing sent" in result.output
+    assert "отчёт о разнице цен не собрался (KeyError)" in result.output
+    assert not mock_email.called
+    assert daily_letter_state.last_mailing(1) is None
+
+
+def _refusing(*args, **kwargs):
+    raise RuntimeError("{'reader@example.test': (550, b'5.1.1 mailbox unavailable')}")
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        pytest.param({"side_effect": _refusing}, id="server-refused"),
+        pytest.param({"return_value": False}, id="smtp-not-configured"),
+    ],
+)
+def test_command_fails_when_no_recipient_got_the_letter(setup, reader, server):
+    """Письмо собрано, но почтовый сервер не принял его ни у кого — это не «OK»."""
+    s = setup
+    _reader(s, email="second@example.test")
+    _mixed_catalog(s, _trusted_run(s))
+
+    with patch("src.notifier.send_email", **server) as mock_email:
+        result = CliRunner().invoke(cli, ["notify", "digest", "daily"])
+
+    assert mock_email.call_count == 2  # отказ одному не отменяет попытку другому
+    assert result.exit_code == 1, result.output
+    assert "почтовый сервер не принял письмо ни у одного из 2 получателей" in result.output
+    assert "@" not in result.output
+
+
+def test_command_succeeds_when_at_least_one_recipient_got_the_letter(setup, reader):
+    s = setup
+    _reader(s, email="second@example.test")
+    _mixed_catalog(s, _trusted_run(s))
+    answers = iter([RuntimeError("refused"), True])
+
+    def one_of_two(*args, **kwargs):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    with patch("src.notifier.send_email", side_effect=one_of_two):
         result = CliRunner().invoke(cli, ["notify", "digest", "daily"])
 
     assert result.exit_code == 0, result.output
-    assert "sent to 1 recipients" in result.output
+    assert "OK: daily digest sent to 1 recipients" in result.output
+    state = daily_letter_state.last_mailing(1)
+    assert (state.recipients, state.accepted, state.report) == (2, 1, "ok")
+
+
+def test_dry_run_is_not_an_undelivered_letter(setup, reader):
+    """При просмотре сервер ничего не принимал по определению — это не отказ."""
+    s = setup
+    _mixed_catalog(s, _trusted_run(s))
+
+    with _mail_server() as mock_email:
+        result = CliRunner().invoke(cli, ["notify", "digest", "daily", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert not mock_email.called
+
+
+def test_quiet_morning_without_report_or_events_is_not_an_error(setup, reader):
+    """Сборов ещё не было и событий нет: слать нечего, и это не сбой."""
+    with _mail_server() as mock_email:
+        result = CliRunner().invoke(cli, ["notify", "digest", "daily"])
+
+    assert result.exit_code == 0, result.output
+    assert "OK: daily digest sent to 0 recipients" in result.output
+    assert not mock_email.called
+
+
+def test_weekly_command_exit_code_does_not_follow_the_new_rules(setup):
+    """Недельный дайджест не менялся: отказ почтового сервера у него — по-прежнему код 0."""
+    s = setup
+    _reader(s, daily_digest=False, weekly_digest=True)
+    run = _trusted_run(s)
+    _event(s, run)
+
+    with patch("src.notifier.send_email", side_effect=_refusing) as mock_email:
+        result = CliRunner().invoke(cli, ["notify", "digest", "weekly"])
+
     assert mock_email.call_count == 1
+    assert result.exit_code == 0, result.output
+    assert "OK: weekly digest sent to 0 recipients" in result.output
+    assert daily_letter_state.last_mailing(1) is None
 
 
 def _database_error(session: Session, *, tenant_id: int):
@@ -845,7 +973,7 @@ def test_command_passes_the_locale_and_keeps_only_and_dry_run(setup, reader):
     _mixed_catalog(s, _trusted_run(s))
     runner = CliRunner()
 
-    with patch("src.notifier.send_email") as mock_email:
+    with _mail_server() as mock_email:
         result = runner.invoke(cli, ["notify", "digest", "daily", "--locale", "az"])
         assert result.exit_code == 0, result.output
         assert "OK: daily digest sent to 1 recipients" in result.output

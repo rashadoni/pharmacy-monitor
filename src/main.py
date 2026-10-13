@@ -5072,6 +5072,10 @@ def notify_digest(
     часа; уходит и без событий. Weekly — события за 7 дней. Получатели —
     `tenant_users` с daily_digest=True / weekly_digest=True.
 
+    Суточное письмо кончается кодом 1, если отчёт о ценах не собрался (даже
+    когда письмо с событиями ушло без него) или почтовый сервер не принял
+    письмо ни у одного получателя. Сначала отправляется всё, что можно.
+
     Расписание — systemd-таймеры infra/systemd/pharmacy-monitor-digest-daily.timer
     и pharmacy-monitor-digest-weekly.timer.
     """
@@ -5080,23 +5084,26 @@ def notify_digest(
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        try:
-            if kind == "daily":
-                sent = notifications.send_daily_digest(
-                    s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run, locale=locale
-                )
-            else:
-                sent = notifications.send_weekly_digest(
-                    s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run
-                )
-        except notifications.DailyLetterNotSent as failure:
-            # Ненулевой код: юнит таймера должен показать сбой, а не тихое утро.
-            # Трассировка исходной ошибки уже в журнале (digest_price_report_failed).
-            raise click.ClickException(str(failure)) from None
-        if dry_run:
-            click.echo(f"[dry-run] {kind} digest: {sent} recipients, nothing sent")
+        problems: list[str] = []
+        if kind == "daily":
+            outcome = notifications.send_daily_letter(
+                s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run, locale=locale
+            )
+            sent, problems = outcome.sent, outcome.problems
         else:
-            click.echo(f"OK: {kind} digest sent to {sent} recipients")
+            sent = notifications.send_weekly_digest(
+                s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run
+            )
+        if dry_run:
+            summary = f"[dry-run] {kind} digest: {sent} recipients, nothing sent"
+        else:
+            summary = f"{kind} digest sent to {sent} recipients"
+        if problems:
+            # Ненулевой код: юнит таймера должен показать сбой, а не тихое утро.
+            # Трассировка сбоя отчёта уже в журнале (digest_price_report_failed).
+            click.echo(summary)
+            raise click.ClickException("; ".join(problems))
+        click.echo(summary if dry_run else f"OK: {summary}")
 
 
 @notify_group.command("test")

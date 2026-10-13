@@ -73,7 +73,7 @@ def test_unit_command_runs_as_written(monkeypatch, db_session):
     _reader(db_session)
     _mixed_catalog(db_session, _trusted_run(db_session))
 
-    with patch("src.notifier.send_email") as mock_email:
+    with patch("src.notifier.send_email", return_value=True) as mock_email:
         result = CliRunner().invoke(cli, _exec_args())
 
     assert result.exit_code == 0, result.output
