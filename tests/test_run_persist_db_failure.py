@@ -14,7 +14,8 @@
 
 Теперь недописанную пачку откатывает сама `persist_results`, а обработчики сбоя
 `run`, `scrape` и `ai-crawl` перед записью итога откатывают сессию; поля,
-выставленные на прогоне прямо перед исключением, переносятся через откат.
+выставленные на прогоне прямо перед исключением, переносятся через откат (кроме
+случая, когда упал flush: тогда их уже сбросил сам SQLAlchemy).
 
 Сбои здесь настоящие: отказывает сама база, посреди записи, а не код до
 обращения к ней. Сценарии идут на SQLite и на PostgreSQL; три — только на
@@ -358,6 +359,23 @@ def _record_log(monkeypatch, module, *methods: str) -> list[tuple[str, dict]]:
     return events
 
 
+def _dead_log_stream(monkeypatch, *methods: str) -> None:
+    """Журнал `src.main`, у которого эти методы падают, как при оборванном выводе."""
+    real_log = main_mod.log
+
+    class _DeadStream:
+        def __getattr__(self, name):
+            if name not in methods:
+                return getattr(real_log, name)
+
+            def broken(event_name, **fields):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            return broken
+
+    monkeypatch.setattr(main_mod, "log", _DeadStream())
+
+
 # ─── Запись категории ────────────────────────────────────────────────────────
 
 
@@ -699,8 +717,10 @@ def _verdict_then_refused_statement(session, run):
 
 def test_fields_set_on_the_run_before_the_failure_survive_the_rollback(db_session, monkeypatch):
     """Шаг выставил на прогоне причину отказа и `run_quality`, а потом упал на
-    базе. Откат перед записью итога эти поля стирает — обработчик переносит их
-    через него, и в базе остаётся то, что о прогоне успели сказать."""
+    базе запросом мимо flush. Откат перед записью итога эти поля стирает —
+    обработчик переносит их через него, и в базе остаётся то, что о прогоне
+    успели сказать. (После упавшего flush переносить нечего: объекты сессии
+    SQLAlchemy сбрасывает сам, раньше обработчика.)"""
     monkeypatch.setattr(
         storage, "confirm_prices_of_latest_verified_runs", _verdict_then_refused_statement
     )
@@ -713,6 +733,75 @@ def test_fields_set_on_the_run_before_the_failure_survive_the_rollback(db_sessio
     assert run.catalog_verification_reason == "reason set right before the failure"
     assert run.run_quality["set_before_failure"] is True
     assert run.run_quality["sites"], "прежнее содержимое на месте"
+
+
+def _status_ok_then_broken_in_code(session, run):
+    run.status = "ok"
+    raise ValueError("failed after the status was set")
+
+
+def test_status_set_before_the_failure_gives_way_to_the_outcome(db_session, monkeypatch):
+    """Конец `run` ставит прогону `ok` и только потом коммитит. Сбой между ними
+    оставляет на прогоне несохранённый `ok` — он переносится через откат, как
+    любое поле, но итог ставится после него: упавший прогон не публикуется."""
+    monkeypatch.setattr(
+        storage, "confirm_prices_of_latest_verified_runs", _status_ok_then_broken_in_code
+    )
+    catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
+
+    run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
+
+    assert run.finished_at is not None
+    assert run.error_message == "ValueError: failed after the status was set"
+
+
+def test_only_fields_changed_since_the_last_write_are_carried(db_session):
+    """Через откат переносится то же, что записал бы flush, — не вся строка:
+    иначе запись итога затирала бы колонки значениями, прочитанными раньше."""
+    run = _new_run(db_session)
+    assert main_mod._unsaved_column_values(run) == {}
+
+    run.catalog_verification_reason = "why"
+    run.status = "ok"  # то же, что в базе
+
+    assert main_mod._unsaved_column_values(run) == {"catalog_verification_reason": "why"}
+
+
+def _unwritable_field_then_broken_in_code(session, run):
+    run.catalog_verification_reason = "set next to a field the database refuses"
+    run.tenant_id = None  # NOT NULL
+    raise ValueError("step failed")
+
+
+@pytest.mark.parametrize("log_stream", ["alive", "dead"])
+def test_carried_field_the_database_refuses_does_not_cost_the_outcome(
+    db_session, monkeypatch, log_stream
+):
+    """Поле, выставленное на прогоне перед сбоем, база не принимает. Итог важнее
+    поля: вторая попытка пишет его один — и тогда, когда строка журнала о ней
+    сама падает на оборванном выводе."""
+    monkeypatch.setattr(
+        storage, "confirm_prices_of_latest_verified_runs", _unwritable_field_then_broken_in_code
+    )
+    retried: list[tuple[str, dict]] = []
+    if log_stream == "alive":
+        retried = _record_log(monkeypatch, main_mod, "warning")
+    else:
+        _dead_log_stream(monkeypatch, "warning")
+    catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
+
+    run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
+
+    assert run.finished_at is not None
+    assert run.error_message == "ValueError: step failed"
+    assert run.tenant_id == 1
+    assert run.catalog_verification_reason != "set next to a field the database refuses"
+    if log_stream == "alive":
+        assert [
+            fields["dropped_fields"]
+            for name, fields in retried
+            if name == "run_failure_write_retried"
+        ] == [["catalog_verification_reason", "tenant_id"]]
 
 
 def _half_done_then_broken_in_code(session, run):
@@ -750,23 +839,12 @@ def test_dead_log_stream_does_not_leave_the_run_running(db_session, monkeypatch)
     """Журнал команды пишет в stdout. При оборванном выводе (ssh без терминала,
     отменённый workflow) строка о причине сбоя сама падает с `BrokenPipeError`.
     Она пишется до итога — и запись итога сорвать не должна."""
-    real_log = main_mod.log
-
-    class _DeadStream:
-        def __getattr__(self, name):
-            if name != "exception":
-                return getattr(real_log, name)
-
-            def broken(event_name, **fields):
-                raise BrokenPipeError(32, "Broken pipe")
-
-            return broken
 
     def broken_step(session, run):
         raise ValueError("step failed")
 
     monkeypatch.setattr(storage, "confirm_prices_of_latest_verified_runs", broken_step)
-    monkeypatch.setattr(main_mod, "log", _DeadStream())
+    _dead_log_stream(monkeypatch, "exception")
     catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
 
     run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
@@ -849,10 +927,12 @@ def test_reason_is_logged_even_when_the_outcome_cannot_be_written(db_session, mo
     assert run.finished_at is None
 
 
-def test_outcome_is_written_even_when_the_rollback_itself_fails(db_session):
+def test_outcome_is_written_even_when_the_rollback_itself_fails(db_session, monkeypatch):
     """Откат перед записью итога упал сам (так бывает на потерянном соединении:
     до сервера он не дошёл). Свою транзакцию сессия при этом закрыла — итог
-    пишется на следующей."""
+    пишется на следующей. Строка журнала об этом падает тоже (вывод оборван) —
+    и тоже ничего не срывает."""
+    _dead_log_stream(monkeypatch, "warning")
     run = storage.Run(status="running", started_at=utcnow())
     db_session.add(run)
     db_session.commit()
@@ -882,12 +962,28 @@ def test_outcome_is_written_even_when_the_rollback_itself_fails(db_session):
     assert stored.finished_at is not None
 
 
+def test_unwritable_outcome_with_a_dead_log_stream_still_leaves_the_handler(
+    db_session, monkeypatch
+):
+    """Итог не записать, и строка журнала об этом падает сама: помощник всё
+    равно возвращает управление — команда выйдет с причиной падения сбора."""
+    _dead_log_stream(monkeypatch, "warning", "exception")
+    run = _new_run(db_session)
+
+    def record_that_the_database_refuses():
+        raise RuntimeError("outcome refused")
+
+    main_mod._write_failed_run_outcome(db_session, run, run.id, record_that_the_database_refuses)
+
+
 def test_failed_rollback_does_not_replace_the_cause_of_a_failed_write(db_session, monkeypatch):
     """Запись сбора упала в коде, а соединение к этому моменту молча потеряно:
     откат недописанного сам падает. Наверх уходит причина сбоя записи, а не
-    отказ отката, и сессия остаётся рабочей."""
+    отказ отката, и сессия остаётся рабочей. Строка журнала об отказе отката
+    падает тоже (вывод оборван) — причину она не подменяет."""
     if not _is_postgresql(db_session):
         pytest.skip("обрыв соединения сервером — только PostgreSQL")
+    _dead_log_stream(monkeypatch, "warning")
     run = _new_run(db_session)
     admin = create_engine(db_session.get_bind().url, isolation_level="AUTOCOMMIT")
 
@@ -1007,7 +1103,7 @@ def test_scrape_command_closes_the_run_after_a_database_failure_outside_the_writ
 ):
     """Сбой базы в шаге `scrape` вне записи сбора (здесь — словарь стран, он
     пишется прямо перед ней): недописанное за собой шаг не откатывает, и итог
-    записывает обработчик — откатив сессию, если иначе нельзя."""
+    записывает обработчик — откатив сессию."""
     monkeypatch.setattr(main_mod, "persist_aloe_country_mappings", failing_step)
     catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
 

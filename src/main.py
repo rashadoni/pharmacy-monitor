@@ -28,6 +28,7 @@ import yaml
 from dotenv import load_dotenv
 from sqlalchemy import desc, func, inspect, select, text
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import NO_VALUE
 
 load_dotenv(override=True)
 
@@ -3586,12 +3587,17 @@ def mark_scrape_request_terminal(
 
 
 def _unsaved_column_values(instance) -> dict[str, object]:
-    """Значения колонок, выставленные на объекте и ещё не отправленные в базу."""
+    """Значения колонок, изменённые на объекте и ещё не отправленные в базу.
+
+    То же, что записал бы flush: колонка, чьё значение не отличается от
+    прочитанного из базы, сюда не попадает. После упавшего flush возвращать
+    нечего — SQLAlchemy сам сбрасывает объекты сессии.
+    """
     state = inspect(instance)
     values: dict[str, object] = {}
     for prop in state.mapper.column_attrs:
         attribute = state.attrs[prop.key]
-        if attribute.history.has_changes():
+        if attribute.history.has_changes() and attribute.loaded_value is not NO_VALUE:
             values[prop.key] = attribute.loaded_value
     return values
 
@@ -3608,35 +3614,52 @@ def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, r
 
     Откат стирает и то, что выставлено на самом прогоне прямо перед исключением
     (причина отказа, `run_quality`), поэтому несохранённые поля прогона
-    переносятся через него: снимаются до отката и ставятся обратно после.
-    `record()` выставляет сам итог — статус, причину, время, заявку; commit
-    делает эта функция. `run_id` берётся у вызывающего: после упавшего flush
-    объект прогона просрочен, и чтение `run.id` само упало бы.
+    переносятся через него: снимаются до отката и ставятся обратно после — до
+    `record()`, чтобы статус, выставленный перед сбоем, уступил итогу. Если
+    упал flush, переносить уже нечего: объекты сессии SQLAlchemy сбросил сам.
+    `record()` выставляет итог — статус, причину, время, заявку; commit делает
+    эта функция. `run_id` берётся у вызывающего: после упавшего flush объект
+    прогона просрочен, и чтение `run.id` само упало бы.
 
-    Если база не приняла и запись итога, прогон остаётся `running`: отказ
-    ложится в журнал строкой `run_failure_not_recorded`, а вызывающий выходит с
-    причиной, по которой упал сам прогон.
+    Попыток две: если база не приняла запись (в том числе перенесённое поле),
+    вторая пишет итог один. Если не прошла и она, прогон остаётся `running`:
+    отказ ложится в журнал строкой `run_failure_not_recorded`, а вызывающий
+    выходит с причиной, по которой упал сам прогон.
+
+    Строки журнала здесь не должны срывать запись: журнал пишет в stdout, и при
+    оборванном выводе (ssh без терминала, отменённый workflow) строка падает.
     """
     try:
         unsaved = _unsaved_column_values(run)
         try:
             session.rollback()
         except Exception as rollback_error:
-            # Соединение потеряно: до сервера откат не дошёл, но свою транзакцию
-            # сессия закрыла, и следующая начнётся на новом соединении.
+            # Обычно это потерянное соединение: до сервера откат не дошёл, но
+            # свою транзакцию сессия закрыла, и следующая начнётся на новом.
             with suppress(Exception):
                 log.warning(
                     "run_failure_rollback_failed",
                     run_id=run_id,
                     error=f"{type(rollback_error).__name__}: {rollback_error}",
                 )
-        for key, value in unsaved.items():
-            setattr(run, key, value)
-        record()
-        session.commit()
+        try:
+            for key, value in unsaved.items():
+                setattr(run, key, value)
+            record()
+            session.commit()
+        except Exception as write_error:
+            with suppress(Exception):
+                log.warning(
+                    "run_failure_write_retried",
+                    run_id=run_id,
+                    dropped_fields=sorted(unsaved),
+                    error=f"{type(write_error).__name__}: {write_error}",
+                )
+            with suppress(Exception):
+                session.rollback()
+            record()
+            session.commit()
     except Exception:
-        # Журнал пишет в stdout: при оборванном выводе (ssh без терминала,
-        # отменённый workflow) строка сама падает — на исход это не влияет.
         with suppress(Exception):
             log.exception("run_failure_not_recorded", run_id=run_id)
 
@@ -3969,8 +3992,8 @@ def persist_results(
         try:
             session.rollback()
         except Exception as rollback_error:
-            # Соединение потеряно: до сервера откат не дошёл, но свою транзакцию
-            # сессия закрыла. Причина сбоя — исключение записи, а не это.
+            # Обычно это потерянное соединение: до сервера откат не дошёл, но
+            # свою транзакцию сессия закрыла. Причина сбоя — исключение записи.
             with suppress(Exception):
                 log.warning(
                     "persist_rollback_failed",
