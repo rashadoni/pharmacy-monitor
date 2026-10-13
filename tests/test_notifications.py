@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -885,6 +886,64 @@ def test_weekly_digest_ignores_recipient_threshold(setup, tenant_user):
     assert len(set(bodies.values())) == 1
     assert "CRITTITLE" in bodies["bob@example.com"]
     assert "INFOTITLE" in bodies["bob@example.com"]
+
+
+# Недельное письмо, каким его слал код до утреннего письма о ценах (2026-10-13).
+# Файл снят с того кода и руками не правится; расхождение с ним — это изменение
+# недельного дайджеста, а не «устаревший образец».
+WEEKLY_LETTER_AS_IT_WAS = (
+    Path(__file__).parent / "fixtures" / "weekly_digest_before_daily_price_letter.html"
+)
+_FIXED_NOW = datetime(2026, 10, 12, 6, 0)
+
+
+def _fixed_week(s, tenant_id, monkeypatch) -> None:
+    """Неделя событий с прибитыми датами: письмо из неё воспроизводимо байт в байт."""
+    monkeypatch.setattr(notifications, "utcnow", lambda: _FIXED_NOW)
+    run = _eligible_run(s, tenant_id)
+    for hours_ago, rule_type, severity, title, payload in (
+        (2, "undercut_threshold", "critical", "Kreon 25000 № 20", {"site": "aloe", "diff_pct": 18}),
+        (3, "undercut_threshold", "warning", "Nurofen & Co 200 mq", {"site": "aptekonline"}),
+        (30, "price_drop_pct", "critical", "Ozempik 1 mq", {"site": "aloe", "drop_pct": 12.5}),
+        (50, "price_raise_opportunity", "info", "Veqovi 2,4 mq", {"gap_pct": 7}),
+        (70, "new_product", "info", "Yeni məhsul <A>", {"site": "pharmonline"}),
+        (90, "site_drop_smoke", "warning", "aloe: собрано меньше обычного", {"site": "aloe"}),
+    ):
+        s.add(
+            storage.AlertEvent(
+                rule_type=rule_type,
+                dedup_key=f"fixed-week|{title}",
+                severity=severity,
+                title=title,
+                detail=f"Подробности: {title}",
+                tenant_id=tenant_id,
+                created_at=_FIXED_NOW - timedelta(hours=hours_ago),
+                payload={**payload, "source_run_id": run.id},
+            )
+        )
+    s.commit()
+
+
+def test_weekly_digest_is_byte_for_byte_what_it_was(setup, tenant_user, monkeypatch):
+    """Утреннее письмо о ценах — правка суточного дайджеста. Недельный она не
+    трогает: тот же получатель, та же тема, то же тело, вложения нет."""
+    s = setup
+    tenant_user.weekly_digest = True
+    _fixed_week(s, tenant_user.tenant_id, monkeypatch)
+
+    with patch("src.notifier.send_email") as mock_email:
+        assert notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id) == 1
+
+    assert mock_email.call_count == 1
+    assert mock_email.call_args.args == ()
+    sent = mock_email.call_args.kwargs
+    # Ровно эти три аргумента: о вложении недельное письмо не знает вовсе.
+    assert set(sent) == {"subject", "html_body", "to"}
+    assert sent["to"] == [tenant_user.email]
+    assert sent["subject"] == (
+        "Pharmacy Monitor — дайджест за неделю: 6 событий, из них 2 критичных"
+    )
+    assert sent["html_body"] + "\n" == WEEKLY_LETTER_AS_IT_WAS.read_text(encoding="utf-8")
 
 
 def test_digest_rows_go_to_critical_of_every_type_first():
