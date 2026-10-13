@@ -1322,6 +1322,186 @@ def test_failed_dashboard_mutation_is_not_audited(client, auth_cookie):
     assert audit["total"] == 0
 
 
+# ─── Свои уведомления: viewer видит, меняет администратор ────────────────────
+# Решение владельца 2026-10-13: сотруднику клиента мгновенные письма выключены,
+# остаётся недельный дайджест. Пока viewer мог менять порог сам, он это решение
+# отменял — и баннер на каждой странице его к этому подталкивал.
+
+
+def _login_client_staff(client, session):
+    """Viewer с настройками, какие владелец задал сотруднику клиента."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    viewer = _make_user(session, "client-staff@x.az", role="viewer")
+    viewer.email_severity_min = "off"
+    viewer.weekly_digest = True
+    viewer.daily_digest = False
+    session.commit()
+    assert _verify_login(client, session, viewer.email).status_code == 200
+    return viewer
+
+
+def _notification_settings(session, user):
+    session.refresh(user)
+    return (
+        user.email_severity_min,
+        user.daily_digest,
+        user.weekly_digest,
+        user.telegram_severity_min,
+        user.quiet_hours,
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"email_severity_min": "critical"},
+        {"email_severity_min": "info"},
+        {"email_severity_min": "off"},
+        {"daily_digest": True},
+        {"weekly_digest": False},
+        {"telegram_severity_min": "info"},
+        {"quiet_hours": "22-08"},
+        {"email_severity_min": "warning", "daily_digest": True, "weekly_digest": False},
+        {},
+    ],
+)
+def test_viewer_cannot_change_own_notifications(client, setup_db, change):
+    viewer = _login_client_staff(client, setup_db)
+
+    response = client.patch("/api/v1/dash/me/notifications", json=change)
+
+    assert response.status_code == 403, response.text
+    assert _notification_settings(setup_db, viewer) == ("off", False, True, None, None)
+
+
+def test_viewer_sees_own_notifications_and_is_told_they_are_not_editable(
+    client, setup_db, monkeypatch
+):
+    monkeypatch.delenv("WEEKLY_DIGEST_ENABLED", raising=False)
+    _login_client_staff(client, setup_db)
+
+    response = client.get("/api/v1/dash/me/notifications")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "telegram_chat_id": None,
+        "email_severity_min": "off",
+        "telegram_severity_min": None,
+        "quiet_hours": None,
+        "daily_digest": False,
+        "weekly_digest": True,
+        # Не «без доставки»: недельный дайджест до него доходит.
+        "can_edit": False,
+        "has_delivery": True,
+    }
+
+
+def test_viewer_whom_nothing_reaches_is_told_so_and_still_cannot_edit(client, setup_db):
+    viewer = _login_client_staff(client, setup_db)
+    viewer.weekly_digest = False
+    setup_db.commit()
+
+    body = client.get("/api/v1/dash/me/notifications").json()
+
+    assert (body["can_edit"], body["has_delivery"]) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("role", "may_edit"),
+    [("admin", True), ("owner", True), ("viewer", False), ("analyst", False), ("Admin", False)],
+)
+def test_only_administrator_roles_change_their_own_notifications(
+    client, setup_db, role, may_edit
+):
+    """Список разрешённых, а не запрещённых: незнакомая роль прав не получает."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    user = _make_user(setup_db, "someone@x.az", role=role)
+    assert _verify_login(client, setup_db, user.email).status_code == 200
+
+    response = client.patch(
+        "/api/v1/dash/me/notifications", json={"email_severity_min": "critical"}
+    )
+
+    assert response.status_code == (200 if may_edit else 403), response.text
+    assert _notification_settings(setup_db, user)[0] == ("critical" if may_edit else None)
+    assert client.get("/api/v1/dash/me/notifications").json()["can_edit"] is may_edit
+
+
+@pytest.mark.parametrize("role", ["viewer", "admin"])
+def test_anyone_can_unbind_own_telegram(client, setup_db, role):
+    """И viewer тоже: отвязка только убавляет доставку, и другого выключателя у
+    чата нет — страница «Пользователи» привязкой Telegram не управляет."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    user = _make_user(setup_db, "someone@x.az", role=role)
+    user.telegram_chat_id = "700400"
+    setup_db.commit()
+    assert _verify_login(client, setup_db, user.email).status_code == 200
+
+    response = client.delete("/api/v1/dash/me/notifications/telegram")
+
+    assert response.status_code == 204, response.text
+    setup_db.refresh(user)
+    assert user.telegram_chat_id is None
+
+
+def test_administrator_is_the_one_who_changes_a_viewers_notifications(
+    client, auth_cookie, setup_db
+):
+    viewer = _make_user(setup_db, "client-staff@x.az", role="viewer")
+    viewer.email_severity_min = "off"
+    viewer.weekly_digest = True
+    setup_db.commit()
+
+    response = client.patch(
+        f"/api/v1/dash/recipients/{viewer.id}", json={"email_severity_min": "critical"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert _notification_settings(setup_db, viewer)[0] == "critical"
+
+
+def test_administrator_changes_own_notifications_and_learns_when_nothing_arrives(
+    client, auth_cookie, tenant_user, setup_db, monkeypatch
+):
+    monkeypatch.delenv("DAILY_DIGEST_ENABLED", raising=False)
+    monkeypatch.delenv("WEEKLY_DIGEST_ENABLED", raising=False)
+
+    def flags_after(change):
+        response = client.patch("/api/v1/dash/me/notifications", json=change)
+        assert response.status_code == 200, response.text
+        body = client.get("/api/v1/dash/me/notifications").json()
+        return body["can_edit"], body["has_delivery"]
+
+    # Порог не задан — рассылка считает его «warning», письма идут.
+    assert _notification_settings(setup_db, tenant_user)[0] is None
+    assert flags_after({}) == (True, True)
+    # Письма выключены, дайджестов нет, Telegram не привязан: не доходит ничего.
+    assert flags_after({"email_severity_min": "off"}) == (True, False)
+    assert _notification_settings(setup_db, tenant_user)[0] == "off"
+    # Недельный дайджест — доставка, пока его таймер на сервере идёт.
+    assert flags_after({"weekly_digest": True}) == (True, True)
+    monkeypatch.setenv("WEEKLY_DIGEST_ENABLED", "0")
+    assert flags_after({}) == (True, False)
+    # Ежедневный таймер по умолчанию выключен: галочка письма не даёт, а
+    # письма сразу отменяет.
+    assert flags_after({"email_severity_min": "warning", "weekly_digest": False}) == (True, True)
+    assert flags_after({"daily_digest": True}) == (True, False)
+    monkeypatch.setenv("DAILY_DIGEST_ENABLED", "1")
+    assert flags_after({}) == (True, True)
+    # Остальные поля администратор тоже меняет сам — они не теряются по дороге.
+    flags_after({"quiet_hours": "22-08", "telegram_severity_min": "info"})
+    assert _notification_settings(setup_db, tenant_user) == (
+        "warning",
+        True,
+        False,
+        "info",
+        "22-08",
+    )
+
+
 @pytest.mark.asyncio
 async def test_audit_middleware_uses_isolated_session(monkeypatch):
     from fastapi import Request, Response

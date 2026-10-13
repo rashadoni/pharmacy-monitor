@@ -888,7 +888,22 @@ export interface NotifPrefs {
   quiet_hours: string | null;
   daily_digest: boolean;
   weekly_digest: boolean;
+  // Считает сервер. Необязательные: пока идёт выкладка, страницу может
+  // обслуживать API, который этих полей ещё не отдаёт.
+  can_edit?: boolean;
+  has_delivery?: boolean;
 }
+
+export type NotifPrefsPatch = Partial<
+  Pick<
+    NotifPrefs,
+    | "email_severity_min"
+    | "telegram_severity_min"
+    | "quiet_hours"
+    | "daily_digest"
+    | "weekly_digest"
+  >
+>;
 
 // ─── API calls ─────────────────────────────────────────────────────────────
 
@@ -1412,7 +1427,7 @@ export const api = {
 
   // Notification preferences
   notifPrefs: () => request<NotifPrefs>("/api/v1/dash/me/notifications"),
-  notifPrefsUpdate: (patch: Partial<NotifPrefs>) =>
+  notifPrefsUpdate: (patch: NotifPrefsPatch) =>
     request<{ ok: true }>("/api/v1/dash/me/notifications", {
       method: "PATCH",
       body: JSON.stringify(patch),

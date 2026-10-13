@@ -5059,7 +5059,10 @@ def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | No
     Daily includes events from last 24h, weekly from last 7d. Recipients are
     `tenant_users` with daily_digest=True / weekly_digest=True.
 
-    Schedule via systemd timer (see infra/systemd/pharmacy-monitor-digest@.timer).
+    Weekly is scheduled by infra/systemd/pharmacy-monitor-digest-weekly.timer.
+    No unit runs `daily`: the pharmacy-monitor-digest@.service template behind
+    the `@daily` and `@weekly` timers runs the legacy `pharmacy-monitor digest`
+    command, not this one.
     """
     from src import notifications
 

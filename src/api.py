@@ -804,6 +804,24 @@ def _env_enabled(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _digest_timer_on(kind: str) -> bool:
+    """Идёт ли на сервере таймер дайджеста.
+
+    Systemd timer truth is mirrored through explicit deployment env, avoiding
+    privileged `systemctl` calls from the web process. The value is read from
+    the API process environment: a change takes an API restart.
+
+    ⚠️ `daily` must stay off until a unit runs `notify digest daily`. The only
+    daily unit in `infra/systemd/` runs the legacy `pharmacy-monitor digest`,
+    which mails the `recipients` table (`EMAIL_TO` when it is empty) and never
+    reads `tenant_users.daily_digest`: with the flag on, the dashboard would
+    count a per-user letter that no timer sends.
+    """
+    if kind == "daily":
+        return _env_enabled("DAILY_DIGEST_ENABLED", False)
+    return _env_enabled("WEEKLY_DIGEST_ENABLED", True)
+
+
 def _decodo_port_pool() -> list[int]:
     """Parse the effective sticky-port pool without exposing proxy secrets."""
     raw = os.environ.get("DECODO_PORTS", "30001-30010").strip()
@@ -885,16 +903,14 @@ def dash_system_status(
             "pool_size": len(decodo_ports),
         },
         "digests": {
-            # Systemd timer truth is mirrored through explicit deployment env,
-            # avoiding privileged `systemctl` calls from the web process.
             "daily": {
-                "enabled": _env_enabled("DAILY_DIGEST_ENABLED", False),
+                "enabled": _digest_timer_on("daily"),
                 "schedule_baku": os.environ.get(
                     "DAILY_DIGEST_SCHEDULE_BAKU", "09:00"
                 ),
             },
             "weekly": {
-                "enabled": _env_enabled("WEEKLY_DIGEST_ENABLED", True),
+                "enabled": _digest_timer_on("weekly"),
                 "schedule_baku": os.environ.get(
                     "WEEKLY_DIGEST_SCHEDULE_BAKU", "Monday 10:00"
                 ),
@@ -1796,6 +1812,11 @@ class NotifPrefsOut(BaseModel):
     quiet_hours: str | None
     daily_digest: bool
     weekly_digest: bool
+    # Считает сервер, а не страница: правила рассылки живут в `notifications`.
+    # can_edit — меняет ли пользователь эти настройки сам (viewer — нет, ему их
+    # задаёт администратор); has_delivery — доходит ли до него хоть что-то.
+    can_edit: bool
+    has_delivery: bool
 
 
 class NotifPrefsIn(BaseModel):
@@ -1834,6 +1855,8 @@ class NotifPrefsIn(BaseModel):
 
 @app.get("/api/v1/dash/me/notifications", response_model=NotifPrefsOut)
 def dash_notifications_get(user: storage.TenantUser = Depends(require_user)):
+    from src import notifications
+
     return NotifPrefsOut(
         telegram_chat_id=user.telegram_chat_id,
         email_severity_min=user.email_severity_min,
@@ -1841,6 +1864,12 @@ def dash_notifications_get(user: storage.TenantUser = Depends(require_user)):
         quiet_hours=user.quiet_hours,
         daily_digest=user.daily_digest or False,
         weekly_digest=user.weekly_digest or False,
+        can_edit=notifications.may_edit_own_notifications(user),
+        has_delivery=notifications.anything_reaches(
+            user,
+            daily_digest_on=_digest_timer_on("daily"),
+            weekly_digest_on=_digest_timer_on("weekly"),
+        ),
     )
 
 
@@ -1850,6 +1879,13 @@ def dash_notifications_update(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
+    from src import notifications
+
+    # Viewer свои уведомления не меняет — их задаёт администратор через
+    # `/api/v1/dash/recipients/{id}` (решение владельца 2026-10-13).
+    if not notifications.may_edit_own_notifications(user):
+        log.info("notif_prefs_change_refused", user_id=user.id, role=user.role)
+        raise HTTPException(403, "Notification settings are managed by an administrator")
     # Re-fetch in this session (require_user yields a different session)
     u = db.scalar(select(storage.TenantUser).where(storage.TenantUser.id == user.id))
     if not u:
@@ -1907,8 +1943,10 @@ def dash_digest_send_test(
 # ─── Recipients management (admin only) ──────────────────────────────────────
 # Управление получателями email-digest. Admin может добавить любого получателя
 # (клиента, бухгалтера, партнёра) с настройкой severity_min и opt-in для
-# daily/weekly. Каждый recipient это TenantUser с is_active=true. Digest-cron
-# собирает их через `daily_digest=true` и шлёт каждому отдельное письмо.
+# daily/weekly. Каждый recipient это TenantUser с is_active=true. Недельный
+# дайджест по таймеру получают те, у кого `weekly_digest=true`; ежедневный
+# per-user дайджест по таймеру не шлёт никто (см. `_digest_timer_on`), а
+# `daily_digest=true` при этом отменяет получателю письма сразу.
 
 
 class RecipientOut(BaseModel):

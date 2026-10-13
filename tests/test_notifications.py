@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 from sqlalchemy.orm import sessionmaker
+from structlog.testing import capture_logs
 
 from src import notifications, storage, tenants
 from src._time import utcnow
@@ -1294,3 +1295,170 @@ def test_notify_digest_cli_dry_run_and_only(setup, tenant_user, monkeypatch):
 )
 def test_plural(n, expected):
     assert notifications._plural(n, "событие", "события", "событий") == expected
+
+
+# ─── Кто меняет свои уведомления и доходит ли до него хоть что-то ───────────
+
+
+def _plain_user(s, tenant_id, email, role, **fields):
+    user = storage.TenantUser(
+        tenant_id=tenant_id,
+        email=email,
+        role=role,
+        is_active=True,
+        created_at=utcnow(),
+        **fields,
+    )
+    s.add(user)
+    s.commit()
+    s.refresh(user)
+    return user
+
+
+def test_only_admin_roles_edit_their_own_notifications(setup, tenant_user):
+    """Решение владельца 2026-10-13: сотруднику клиента уведомления задаёт администратор."""
+    s = setup
+    viewer = _plain_user(s, tenant_user.tenant_id, "bob@example.com", "viewer")
+    owner = _plain_user(s, tenant_user.tenant_id, "olga@example.com", "owner")
+    unknown = _plain_user(s, tenant_user.tenant_id, "nina@example.com", "analyst")
+
+    assert notifications.may_edit_own_notifications(tenant_user) is True  # admin
+    assert notifications.may_edit_own_notifications(owner) is True
+    assert notifications.may_edit_own_notifications(viewer) is False
+    # Роль, которой в списке администраторских нет, прав не получает.
+    assert notifications.may_edit_own_notifications(unknown) is False
+
+
+def test_bind_telegram_refuses_a_viewer(setup, tenant_user):
+    """Привязанный чат получает алерты сразу — viewer себе его не привязывает."""
+    s = setup
+    viewer = _plain_user(
+        s,
+        tenant_user.tenant_id,
+        "bob@example.com",
+        "viewer",
+        email_severity_min="off",
+        weekly_digest=True,
+    )
+
+    with capture_logs() as logs:
+        assert notifications.bind_telegram(s, "424242", "bob@example.com") is False
+
+    s.refresh(viewer)
+    assert viewer.telegram_chat_id is None
+    assert logs == [
+        {
+            "event": "telegram_bind_refused",
+            "log_level": "info",
+            "user_id": viewer.id,
+            "role": "viewer",
+        }
+    ]
+
+    # Отказ не зависит от того, привязан ли уже чат (он мог остаться с тех
+    # пор, когда запись была администраторской): новый не подставляется.
+    viewer.telegram_chat_id = "111"
+    s.commit()
+    assert notifications.bind_telegram(s, "424242", "bob@example.com") is False
+    s.refresh(viewer)
+    assert viewer.telegram_chat_id == "111"
+    viewer.telegram_chat_id = None
+    s.commit()
+
+    # И критичное событие прогона по-прежнему не уходит ему ни письмом, ни в Telegram.
+    event = _mk_event(s, tenant_user.tenant_id, "after-refused-bind", "critical", "x")
+    s.commit()
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
+    ):
+        notifications.dispatch_events_batch(s, [event])
+    assert [c.kwargs["to"] for c in mock_email.call_args_list] == [["alice@example.com"]]
+    assert not mock_tg.called
+
+
+# (порог писем, ежедневный, недельный, чат Telegram, порог Telegram, тихие часы)
+_REACH_CASES = [
+    ("off", False, True, None, None, None),  # сотрудник клиента с 2026-10-13
+    ("off", False, False, None, None, None),  # не доходит ничего
+    (None, False, False, None, None, None),  # пустой порог — это warning, письма идут
+    ("info", False, False, None, None, None),
+    ("warning", False, False, None, None, None),
+    ("critical", False, False, None, None, None),
+    ("warning", True, False, None, None, None),  # ежедневный дайджест отменяет письма сразу
+    ("warning", True, True, None, None, None),
+    ("off", True, True, None, None, None),
+    ("off", False, False, "700300", None, None),  # чат привязан, порог по умолчанию
+    ("off", False, False, "700300", "info", None),
+    ("off", False, False, "700300", "off", None),
+    ("off", True, False, "700300", "off", None),
+    ("off", True, False, "700300", None, None),  # ежедневный дайджест Telegram не отменяет
+    # Равные часы — тихо круглые сутки: Telegram не уходит никогда. Окно на
+    # часть суток здесь не стоит: исход зависел бы от часа запуска теста.
+    ("off", False, False, "700300", None, "5-5"),
+    ("off", False, False, "700300", "info", "0-0"),
+    ("warning", False, False, "700300", None, "0-0"),  # письму тихие часы не мешают
+]
+
+
+@pytest.mark.parametrize(
+    ("daily_on", "weekly_on"), [(False, True), (True, True), (False, False), (True, False)]
+)
+@pytest.mark.parametrize("prefs", _REACH_CASES)
+def test_anything_reaches_agrees_with_what_is_actually_sent(
+    setup, tenant_user, prefs, daily_on, weekly_on
+):
+    """Ответ для баннера сверяется с тем, что шлют сами отправители: критичное
+    событие прогона и те дайджесты, чей таймер считается идущим.
+
+    Ежедневный дайджест здесь шлёт `send_daily_digest` — на сервере её зовёт
+    только кнопка: юнита, который слал бы её по таймеру, в `infra/systemd/` нет.
+    """
+    s = setup
+    (
+        tenant_user.email_severity_min,
+        tenant_user.daily_digest,
+        tenant_user.weekly_digest,
+        tenant_user.telegram_chat_id,
+        tenant_user.telegram_severity_min,
+        tenant_user.quiet_hours,
+    ) = prefs
+    run = _eligible_run(s, tenant_user.tenant_id)
+    event = _digest_event(s, run, "undercut_threshold", "critical", "Reach")
+    s.commit()
+
+    with (
+        patch("src.notifier.send_email") as mock_email,
+        patch("src.notifier.send_telegram_message") as mock_tg,
+    ):
+        notifications.dispatch_events_batch(s, [event])
+        if daily_on:
+            notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
+        if weekly_on:
+            notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id)
+        delivered = mock_email.called or mock_tg.called
+
+    assert (
+        notifications.anything_reaches(
+            tenant_user, daily_digest_on=daily_on, weekly_digest_on=weekly_on
+        )
+        is delivered
+    )
+
+
+
+def test_quiet_hours_for_part_of_the_day_still_count_as_telegram_delivery(setup, tenant_user):
+    """Тихие часы на часть суток Telegram не выключают — только круглосуточные."""
+    tenant_user.email_severity_min = "off"
+    tenant_user.telegram_chat_id = "700300"
+    tenant_user.telegram_severity_min = None
+
+    def reaches(quiet_hours):
+        tenant_user.quiet_hours = quiet_hours
+        return notifications.anything_reaches(
+            tenant_user, daily_digest_on=False, weekly_digest_on=False
+        )
+
+    partial = (None, "22-08", "8-22", "23-0", "0-23", "1-0", "not-hours")
+    assert [reaches(q) for q in partial] == [True] * len(partial)
+    assert [reaches(q) for q in ("0-0", "5-5", "23-23")] == [False] * 3

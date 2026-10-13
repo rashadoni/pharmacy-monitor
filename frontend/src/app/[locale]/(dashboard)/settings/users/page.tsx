@@ -6,6 +6,7 @@ import { Link } from "@/i18n/navigation";
 import { useState } from "react";
 import { ArrowLeft, Clock, Send, Trash2, UserPlus } from "lucide-react";
 import { api, type Recipient, type RecipientCreate, type RecipientUpdate } from "@/lib/api";
+import { digestToggleLocked } from "@/lib/notif-prefs";
 import { formatTime } from "@/lib/utils";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
@@ -32,6 +33,7 @@ export default function UsersPage() {
     onSuccess: () => {
       invalidate();
       qc.invalidateQueries({ queryKey: ["me"] }); // self-edit → освежить роль/имя
+      qc.invalidateQueries({ queryKey: ["notif-prefs"] }); // и баннер о доставке
     },
   });
   const deleteMut = useMutation({
@@ -307,13 +309,13 @@ function UserCard({
         <Toggle
           label={t("daily_digest")}
           checked={u.daily_digest}
-          disabled={!dailyEnabled}
+          disabled={digestToggleLocked(dailyEnabled, u.daily_digest)}
           onChange={(daily_digest) => onUpdate({ daily_digest })}
         />
         <Toggle
           label={t("weekly_digest")}
           checked={u.weekly_digest}
-          disabled={!weeklyEnabled}
+          disabled={digestToggleLocked(weeklyEnabled, u.weekly_digest)}
           onChange={(weekly_digest) => onUpdate({ weekly_digest })}
         />
         <Toggle
