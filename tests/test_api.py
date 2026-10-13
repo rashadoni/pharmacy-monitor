@@ -447,7 +447,7 @@ def test_health_endpoint_aloe_full_does_not_mask_other_degraded_sites(client, se
 
 
 def test_health_endpoint_flags_staleness(client, setup_db):
-    """Пропущенный недельный сбор (>174ч) → staleness_warning=true, status=degraded."""
+    """Пропущенные ночные сборы (>30ч) → staleness_warning=true, status=degraded."""
 
     db = setup_db
     old = datetime.now(timezone.utc) - timedelta(hours=200)
@@ -472,8 +472,8 @@ def test_health_endpoint_flags_staleness(client, setup_db):
     sites = {s["site"]: s for s in body["sites"]}
     assert "aloe" in sites
     assert sites["aloe"]["hours_since"] >= 200
-    assert sites["aloe"]["cadence_hours"] == 168
-    assert sites["aloe"]["max_age_hours"] == 174
+    assert sites["aloe"]["cadence_hours"] == 24
+    assert sites["aloe"]["max_age_hours"] == 30
 
 
 def _add_aptekonline_product(db, *, hours_ago: int, external_id: str) -> None:
@@ -493,11 +493,11 @@ def _add_aptekonline_product(db, *, hours_ago: int, external_id: str) -> None:
     db.commit()
 
 
-def test_health_endpoint_stays_calm_mid_weekly_cycle(client, setup_db):
-    """Данные на 100ч — середина недельного цикла, тревоги быть не должно."""
+def test_health_endpoint_stays_calm_mid_daily_cycle(client, setup_db):
+    """Данные на 20ч — середина суточного цикла, тревоги быть не должно."""
 
     db = setup_db
-    seen = datetime.now(timezone.utc) - timedelta(hours=100)
+    seen = datetime.now(timezone.utc) - timedelta(hours=20)
     for i, site in enumerate(("pharmonline", "aptekonline", "aloe")):
         db.add(
             storage.Product(
@@ -515,27 +515,27 @@ def test_health_endpoint_stays_calm_mid_weekly_cycle(client, setup_db):
 
     body = client.get("/health").json()
     assert body["staleness_warning"] is False
-    assert all(s["cadence_hours"] == 168 for s in body["sites"])
+    assert all(s["cadence_hours"] == 24 for s in body["sites"])
 
 
-def test_health_endpoint_uses_weekly_aptekonline_threshold(client, setup_db):
-    """Регрессия: недельный aptekonline на 100ч НЕ поднимает тревогу.
+def test_health_endpoint_takes_the_aptekonline_threshold_from_the_rhythm_map(client, setup_db):
+    """Порог карточки сайта — ритм сайта с запасом, а не число, прибитое в API.
 
-    Сайт собирается раз в неделю, поэтому четырёхсуточные данные — штатная
-    середина цикла. До правки порог был суточный (30ч), и клиент видел красную
-    карточку плюс баннер «система требует внимания» почти всю неделю подряд.
+    Пока aptekonline собирался раз в неделю, а порог оставался суточным,
+    клиент видел красную карточку и баннер «система требует внимания» почти
+    всю неделю подряд. Теперь сайт суточный: 29 часов — ещё в запасе на повтор.
     """
 
-    _add_aptekonline_product(setup_db, hours_ago=100, external_id="weekly-fresh-1")
+    _add_aptekonline_product(setup_db, hours_ago=29, external_id="daily-fresh-1")
 
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
     assert body["staleness_warning"] is False
     sites = {s["site"]: s for s in body["sites"]}
-    assert sites["aptekonline"]["hours_since"] >= 100
-    assert sites["aptekonline"]["cadence_hours"] == 168
-    assert sites["aptekonline"]["max_age_hours"] == 174
+    assert sites["aptekonline"]["hours_since"] >= 29
+    assert sites["aptekonline"]["cadence_hours"] == 24
+    assert sites["aptekonline"]["max_age_hours"] == 30
 
 
 def test_health_endpoint_flags_missed_weekly_aptekonline_scan(client, setup_db):

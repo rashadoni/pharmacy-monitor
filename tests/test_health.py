@@ -291,22 +291,34 @@ def test_site_silence_critical_when_one_site_stale(db_session):
     assert "aloe" not in silent_sites  # aloe свежий — не должен попасть
 
 
-def test_site_silence_respects_weekly_cadence(db_session):
-    """Регрессия: на 100ч данные идут по графику, а не «молчат».
+def test_site_silence_respects_daily_cadence(db_session):
+    """Порог «сайт молчит» — ритм сайта с запасом: при ежедневном сборе это 30 часов.
 
-    С 2026-10-06 все три сайта собираются полным каталогом раз в неделю, поэтому
-    четырёхсуточный возраст данных — штатная середина цикла. Пока пороги были
-    суточными (30ч), дашборд красил сайт красным 6 дней из 7 и слал CRITICAL.
+    Данные двадцатичасовой давности — штатная середина суток, не тревога;
+    сорокачасовой — значит, ночной сбор пропущен. Пороги выводятся из карты
+    ритма: пока сайты собирались раз в неделю (2026-10-06…13), порог был 174 ч,
+    а до того суточный порог при недельном сборе красил сайт красным 6 дней из 7.
     """
     now = utcnow()
+    runs = {}
     for site in ("pharmonline", "aptekonline", "aloe"):
-        run = _add_run(db_session, now - timedelta(hours=100))
-        _add_snap(db_session, run, site, 30, last_seen_at=now - timedelta(hours=100))
+        runs[site] = _add_run(db_session, now - timedelta(hours=20))
+        _add_snap(db_session, runs[site], site, 30, last_seen_at=now - timedelta(hours=20))
     db_session.commit()
 
     rep = check_health(db_session, max_age_hours=26)
-    silent_sites = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
-    assert silent_sites == set()
+    assert {i.context.get("site") for i in rep.issues if i.code == "site_silent"} == set()
+
+    for product in db_session.query(Product).all():
+        product.last_seen_at = now - timedelta(hours=40)
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+    assert {i.context.get("site") for i in rep.issues if i.code == "site_silent"} == {
+        "pharmonline",
+        "aptekonline",
+        "aloe",
+    }
 
 
 def test_site_thresholds_follow_declared_cadence():
@@ -314,15 +326,14 @@ def test_site_thresholds_follow_declared_cadence():
     from src import health as h
     from src.cadence import site_cadence_hours
 
-    # Недельный ритм у всех трёх сайтов (решение владельца 2026-10-06).
+    # Суточный ритм у всех трёх сайтов (решение владельца 2026-10-13).
     for site in ("pharmonline", "aptekonline", "aloe"):
-        assert site_cadence_hours(site) == 168
-        assert h._SITE_MAX_AGE_HOURS[site] == 174
-        assert h._SITE_FRESHNESS_DAYS[site] == 9
-        assert h._SITE_COVERAGE_DAYS[site] == 8
+        assert site_cadence_hours(site) == 24
+        assert h._SITE_MAX_AGE_HOURS[site] == 30
+        assert h._SITE_FRESHNESS_DAYS[site] == 3
+        assert h._SITE_COVERAGE_DAYS[site] == 2
 
-    # Формула не ломает суточный случай: сайт без объявленного ритма получает
-    # ровно исторические 30ч, чтобы новый сайт не стартовал с недельным окном.
+    # Сайт без объявленного ритма получает те же суточные 30ч.
     from src.cadence import site_max_age_hours
 
     assert site_max_age_hours("site-without-declared-cadence") == 30
@@ -354,14 +365,20 @@ def test_stale_run_critical(db_session):
     assert any(i.code == "stale_run" for i in rep.issues)
 
 
-def test_weekly_cadence_does_not_raise_stale_run_between_collections(db_session):
+def test_weekly_cadence_does_not_raise_stale_run_between_collections(db_session, monkeypatch):
     """Двое суток без прогонов при недельном сборе — штатно, не тревога.
 
     Плановый запуск в ночи, когда сайт уже собран, выходит без прогона, а
     частичные тики прогон дают не каждый день: на проде 2026-10-06 он был один,
     2026-10-07 до полудня — ни одного. Порог 26ч поднимал бы «Проверьте cron»
-    на исправном недельном графике.
+    на исправном недельном графике. Сегодня ритм суточный — недельный здесь
+    подставлен: порог обязан следовать карте, если сайты вернут на неделю.
     """
+    from src import health
+
+    monkeypatch.setattr(
+        health, "_SITE_MAX_AGE_HOURS", {site: 174 for site in health._SITE_MAX_AGE_HOURS}
+    )
     _add_run(db_session, utcnow() - timedelta(hours=48))
     db_session.commit()
 
@@ -370,12 +387,25 @@ def test_weekly_cadence_does_not_raise_stale_run_between_collections(db_session)
     assert not any(i.code == "stale_run" for i in rep.issues)
 
 
+def test_daily_cadence_raises_stale_run_after_a_missed_night(db_session):
+    """При ежедневном сборе сутки с запасом без единого прогона — тревога."""
+    run = _add_run(db_session, utcnow() - timedelta(hours=29))
+    db_session.commit()
+    assert not any(i.code == "stale_run" for i in check_health(db_session, max_age_hours=26).issues)
+
+    run.started_at = utcnow() - timedelta(hours=31)
+    db_session.commit()
+    assert any(i.code == "stale_run" for i in check_health(db_session, max_age_hours=26).issues)
+
+
 def test_stale_run_follows_the_most_frequent_site(db_session, monkeypatch):
     """Вернётся суточный сайт — вернётся и суточный порог «давно не было прогонов»."""
     from src import health
 
     monkeypatch.setattr(
-        health, "_SITE_MAX_AGE_HOURS", {**health._SITE_MAX_AGE_HOURS, "aloe": 30}
+        health,
+        "_SITE_MAX_AGE_HOURS",
+        {"pharmonline": 174, "aptekonline": 174, "aloe": 30},
     )
     _add_run(db_session, utcnow() - timedelta(hours=48))
     db_session.commit()
@@ -432,19 +462,21 @@ def test_overdue_full_collection_is_reported_even_when_partial_ticks_keep_the_si
 
 
 def test_full_collection_is_overdue_only_past_cadence_plus_grace(db_session):
-    """Порог сторожа — ритм сайта с запасом (174ч), а не сам ритм (168ч).
+    """Порог сторожа — ритм сайта с запасом (30ч), а не сам ритм (24ч).
 
-    Между недельными сборами проходит до 169ч (перевод часов), и новый сбор
-    ещё должен успеть закончиться. Сторож на 168ч кричал бы каждую осень.
+    Между ночными сборами проходит до 25ч (перевод часов), сайт может оказаться
+    последним в очереди из трёх, и новый сбор ещё должен успеть закончиться.
+    Сторож на 24ч кричал бы каждое утро после сбора, начатого чуть позже
+    вчерашнего.
     """
     from src.cadence import site_max_age_hours
 
-    assert site_max_age_hours("aloe") == 174
-    run = _verified_full_run(db_session, hours_ago=173)
+    assert site_max_age_hours("aloe") == 30
+    run = _verified_full_run(db_session, hours_ago=29)
     db_session.commit()
     assert not any(i.code == "full_catalog_overdue" for i in check_health(db_session).issues)
 
-    run.started_at = utcnow() - timedelta(hours=175)
+    run.started_at = utcnow() - timedelta(hours=31)
     run.finished_at = run.started_at + timedelta(minutes=1)
     db_session.commit()
     overdue = {
@@ -601,11 +633,11 @@ def test_site_drop_warning(db_session):
     """Если за окно покрытия видели <50% живого каталога — alert."""
     base = utcnow()
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=30)
-    # Живой каталог: 100 товаров, виденных 8.5 дней назад (в окне свежести 9д,
-    # но ВНЕ окна покрытия 8д) — недавние скрейпы их НЕ переснимали. Возраст
-    # привязан к недельному ритму: окна выводятся из него (src/cadence.py).
-    old = _add_run(db_session, base - timedelta(days=8, hours=12), products_scraped=100)
-    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=8, hours=12))
+    # Живой каталог: 100 товаров, виденных 2.5 дня назад (в окне свежести 3д,
+    # но ВНЕ окна покрытия 2д) — недавние скрейпы их НЕ переснимали. Возраст
+    # привязан к суточному ритму: окна выводятся из него (src/cadence.py).
+    old = _add_run(db_session, base - timedelta(days=2, hours=12), products_scraped=100)
+    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=2, hours=12))
     # Недавнее покрытие: только 30 товаров за окно покрытия.
     _add_snap(db_session, cur, "pharmonline", 30, last_seen_at=base - timedelta(hours=1))
     db_session.commit()
@@ -818,15 +850,15 @@ def test_brand_coverage_partial_intraday_tick_skipped(db_session):
 def test_site_drop_below_20_percent_critical(db_session):
     base = utcnow()
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=10)
-    # Каталог 100 виден 8.5 дней назад (вне окна покрытия), недавно — лишь 10.
-    old = _add_run(db_session, base - timedelta(days=8, hours=12), products_scraped=100)
-    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=8, hours=12))
+    # Каталог 100 виден 2.5 дня назад (вне окна покрытия), недавно — лишь 10.
+    old = _add_run(db_session, base - timedelta(days=2, hours=12), products_scraped=100)
+    _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=2, hours=12))
     _add_snap(db_session, cur, "pharmonline", 10, last_seen_at=base - timedelta(hours=1))
     db_session.commit()
 
     rep = check_health(db_session, site_drop_threshold=0.5)
     drop_issues = [i for i in rep.issues if i.code == "site_drop"]
-    # seen(8д)=10, total(9д)=110 → 9% → critical
+    # seen(2д)=10, total(3д)=110 → 9% → critical
     assert any(i.severity == "critical" for i in drop_issues)
 
 

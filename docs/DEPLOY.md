@@ -206,6 +206,15 @@ Aloe and Pharmonline, and a week later for Aptekonline. Pharmonline has a second
 path, a GitHub Actions workflow on Mondays. `src/cadence.py` is the single
 source for the rhythm; the block «РАСПИСАНИЕ СБОРА» in `CLAUDE.md` explains it.
 
+⚠️ Note of 2026-10-13: the paragraph above describes the weekly rhythm. With the
+change of 2026-10-13 the full catalog of every site is collected every night
+(two alarms, 01:00 and a retry at 03:15 server time), the Aptekonline weekly
+drop-in is gone from the repository and the Monday GitHub Actions schedule for
+Pharmonline is removed. On the server this holds only after the change is
+deployed and root has removed the drop-in from `/etc` and installed the timer —
+`docs/RUNBOOK.md`, «Ежедневный сбор: что стоит на сервере». Note that
+`install_systemd_schedule.sh` below does not remove drop-ins from `/etc`.
+
 The scheduled scans evaluate real-time alert rules but deliberately do not
 send the bulky HTML/Excel scrape report. The priority watchlist is a separate
 curated list of confirmed URLs and runs every three hours; it can notify only
@@ -276,7 +285,9 @@ checkout's code on the server. As of 2026-10-11, at least:
   was. One of them, `autonomous-pharmonline-decodo-public-api.yml`, runs on a
   weekly schedule from `main`, after checking that CI passed on that commit —
   so for that scrape a merge into `main` already is the release
-  (`docs/RUNBOOK.md`, «Выкладка правок сопоставления»). None of the four runs
+  (`docs/RUNBOOK.md`, «Выкладка правок сопоставления»). (With the change of
+  2026-10-13 its schedule is removed; it runs only when started by hand, and
+  the sentence still holds for such a run.) None of the four runs
   `alembic upgrade`: `recover-pharmonline-decodo-public-api.yml` reads the
   database revision (`alembic current`, `alembic heads`) and no longer
   upgrades it. `deploy.yml` is the only workflow that runs `alembic upgrade`

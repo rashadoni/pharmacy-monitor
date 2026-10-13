@@ -500,9 +500,9 @@ def mail_pharmonline_admission_to_admins(
             delivered = notifier.send_email(subject=subject, html_body=html_body, to=[user.email])
         except Exception as exc:
             delivered = False
-            # Без адреса и без текста ошибки (SMTP кладёт адрес и в него):
-            # еженедельный сбор идёт из GitHub Actions, а журнал его шагов у
-            # публичного репозитория открыт.
+            # Без адреса и без текста ошибки (SMTP кладёт адрес и в него): сбор
+            # запускают и из GitHub Actions (с 2026-10-13 — только руками), а
+            # журнал его шагов у публичного репозитория открыт.
             log.warning(
                 "pharmonline_admission_mail_failed",
                 user_id=user.id,

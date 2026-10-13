@@ -33,6 +33,9 @@ Final pre-flight checklist + DNS cutover + 72h on-call.
 >   "First scheduled scrape ran (or upcoming within 24h)" under "T+1h",
 >   "succeeded for all 3 sites" under "T+24h": the full scan is weekly
 >   (`src/cadence.py`), and on the other nights `run` exits without scraping.
+>   (Note of 2026-10-13: with the change of that date the full scan is nightly
+>   again — once it is deployed and the timers are installed, see
+>   `docs/RUNBOOK.md`, «Ежедневный сбор: что стоит на сервере».)
 > - "offsite-uploaded" under "T-24h": the nightly dump stays on the server, no
 >   B2 keys are set (whether `rclone` is configured anywhere was not checked).
 > - "Uptime-Kuma → Telegram alert" under "On-call rotation": no Uptime-Kuma

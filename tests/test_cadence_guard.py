@@ -25,6 +25,7 @@ from src import storage
 from src._time import utcnow
 from src.cadence import (
     CADENCE_GRACE_HOURS,
+    SITE_SCRAPE_CADENCE_HOURS,
     cadence_window_start,
     site_cadence_hours,
     site_max_age_hours,
@@ -40,6 +41,9 @@ SCRAPE_TIMER_DROPINS = sorted(
     (REPO / "infra/systemd/overrides").glob("pharmacy-monitor-scrape@*.timer.d/*.conf")
 )
 PROVISION_SCRIPT = REPO / "scripts/provision_vps.sh"
+AUTONOMOUS_PHARMONLINE_WORKFLOW = (
+    REPO / ".github/workflows/autonomous-pharmonline-decodo-public-api.yml"
+)
 BERLIN = ZoneInfo("Europe/Berlin")  # часовой пояс прод-хоста: в нём заданы OnCalendar
 
 
@@ -57,23 +61,23 @@ def _unit_run_args(unit_file: Path, site: str) -> list[str]:
     return argv[1:]
 
 
-def _timer_schedule(timer_file: Path) -> tuple[int, int]:
-    """(час срабатывания по времени хоста, RandomizedDelaySec) из файла таймера."""
-    hours: list[int] = []
+def _timer_alarms(timer_file: Path) -> tuple[list[tuple[int, int]], int]:
+    """([(час, минута) каждого будильника по времени хоста], RandomizedDelaySec)."""
+    alarms: list[tuple[int, int]] = []
     delay: int | None = None
     for line in timer_file.read_text(encoding="utf-8").splitlines():
         if line.startswith("OnCalendar="):
             value = line.removeprefix("OnCalendar=").strip()
-            if not value:  # пустое значение в drop-in сбрасывает расписание
-                hours = []
+            if not value:  # пустое значение сбрасывает расписание, как в systemd
+                alarms = []
                 continue
-            clock = re.search(r"(\d{2}):00:00$", value)
-            assert clock, f"{timer_file.name}: тест умеет только расписание на ровный час"
-            hours.append(int(clock[1]))
+            clock = re.fullmatch(r"\*-\*-\* (\d{2}):(\d{2}):00", value)
+            assert clock, f"{timer_file.name}: тест умеет только ежедневное расписание ЧЧ:ММ:00"
+            alarms.append((int(clock[1]), int(clock[2])))
         elif line.startswith("RandomizedDelaySec="):
             delay = int(line.removeprefix("RandomizedDelaySec="))
-    assert len(hours) == 1 and delay is not None, timer_file
-    return hours[0], delay
+    assert alarms and delay is not None, timer_file
+    return alarms, delay
 
 
 def _full_run(
@@ -98,10 +102,21 @@ def _full_run(
     return run
 
 
-def _timer_fire_utc(day: date, hour: int) -> datetime:
-    """Момент `OnCalendar=*-*-* HH:00:00` по времени прод-хоста, в naive UTC."""
-    local = datetime(day.year, day.month, day.day, hour, tzinfo=BERLIN)
+def _timer_fire_utc(day: date, hour: int, minute: int = 0) -> datetime:
+    """Момент `OnCalendar=*-*-* HH:MM:00` по времени прод-хоста, в naive UTC."""
+    local = datetime(day.year, day.month, day.day, hour, minute, tzinfo=BERLIN)
     return local.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+@pytest.fixture
+def weekly_aloe(monkeypatch):
+    """aloe на недельном ритме — как все три сайта жили 2026-10-06…13.
+
+    Карта ритма сегодня суточная, но окно обязано работать с любым шагом: сайт
+    могут вернуть на неделю, и тогда гвард должен снова пропускать лишние ночи.
+    """
+    monkeypatch.setitem(SITE_SCRAPE_CADENCE_HOURS, "aloe", 168)
+    monkeypatch.setitem(SITE_SCRAPE_CADENCE_HOURS, "aptekonline", 168)
 
 
 def _berlin_weekday(moment_utc: datetime) -> int:
@@ -111,14 +126,13 @@ def _berlin_weekday(moment_utc: datetime) -> int:
 # ─── Окно ритма ──────────────────────────────────────────────────────────────
 
 
-def test_weekly_window_opens_in_the_night_to_monday():
-    """Неделя сбора открывается в воскресенье 22:00 UTC."""
-    wednesday = datetime(2026, 10, 7, 12, 0)
-
-    start = cadence_window_start("aloe", wednesday)
-
-    assert start == datetime(2026, 10, 4, 22, 0)
-    assert start.weekday() == 6
+def test_daily_window_opens_every_evening():
+    """Сутки сбора открываются в 22:00 UTC — так живут все три сайта."""
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        assert site_cadence_hours(site) == 24
+        assert cadence_window_start(site, datetime(2026, 10, 7, 12, 0)) == datetime(
+            2026, 10, 6, 22, 0
+        )
 
 
 def test_window_boundary_belongs_to_the_new_window():
@@ -126,8 +140,19 @@ def test_window_boundary_belongs_to_the_new_window():
 
     assert cadence_window_start("aloe", boundary) == boundary
     assert cadence_window_start("aloe", boundary - timedelta(seconds=1)) == datetime(
-        2026, 10, 4, 22, 0
+        2026, 10, 10, 22, 0
     )
+
+
+def test_weekly_window_opens_in_the_night_to_monday(weekly_aloe):
+    """Неделя сбора открывается в воскресенье 22:00 UTC."""
+    wednesday = datetime(2026, 10, 7, 12, 0)
+
+    start = cadence_window_start("aloe", wednesday)
+
+    assert start == datetime(2026, 10, 4, 22, 0)
+    assert start.weekday() == 6
+    assert cadence_window_start("aloe", datetime(2026, 10, 11, 21, 59, 59)) == start
 
 
 def test_site_without_declared_cadence_gets_daily_windows():
@@ -140,53 +165,87 @@ def test_site_without_declared_cadence_gets_daily_windows():
 
 
 def test_scrape_timers_in_repo_are_the_ones_the_boundary_was_chosen_for():
-    assert _timer_schedule(SCRAPE_TIMER) == (1, 300)
-    assert {path.parent.name: _timer_schedule(path) for path in SCRAPE_TIMER_DROPINS} == {
-        "pharmacy-monitor-scrape@aptekonline.timer.d": (2, 300)
-    }
+    """Два ночных будильника — сбор и повтор; drop-in'ов у таймера сбора нет.
 
-
-@pytest.mark.parametrize(
-    "timer_file",
-    [SCRAPE_TIMER, *SCRAPE_TIMER_DROPINS],
-    ids=lambda path: path.parent.name if path.suffix == ".conf" else path.name,
-)
-def test_window_boundary_fits_the_monday_night_timers(timer_file):
-    """Граница окна стоит раньше ночных таймеров понедельника и рядом с ними.
-
-    Часы и случайная задержка берутся из самих файлов таймеров: перенесёшь
-    таймер, не пересчитав `CADENCE_ANCHOR_UTC`, — упадёт этот тест. Перебираем
-    каждый понедельник трёх лет, то есть оба перевода часов.
+    Недельный drop-in aptekonline снят 2026-10-13. Вернётся в репозиторий — сайт
+    с суточной картой ритма будет «просрочен» шесть дней из семи.
     """
-    hour, delay_sec = _timer_schedule(timer_file)
+    assert _timer_alarms(SCRAPE_TIMER) == ([(1, 0), (3, 15)], 300)
+    assert SCRAPE_TIMER_DROPINS == []
+
+
+def test_window_boundary_fits_the_nightly_alarms():
+    """Граница окна стоит раньше ночных будильников и рядом с ними.
+
+    Часы и случайная задержка берутся из самого файла таймера: перенесёшь
+    будильник, не пересчитав `CADENCE_ANCHOR_UTC`, — упадёт этот тест. Перебираем
+    каждую ночь трёх лет, то есть оба перевода часов (они приходятся на
+    воскресенье — перебор одних понедельников их не видел).
+    """
+    alarms, delay_sec = _timer_alarms(SCRAPE_TIMER)
     jitter = timedelta(seconds=delay_sec)
-    monday = date(2026, 1, 5)
-    while monday < date(2029, 1, 1):
-        fire = _timer_fire_utc(monday, hour)
-        since_boundary = fire - cadence_window_start("aloe", fire)
-        # Понедельничный запуск открывает новую неделю, а не дособирает старую.
-        assert timedelta(hours=1) <= since_boundary < timedelta(hours=24), monday
-        # Сбор вручную сразу после границы сдвигает следующий плановый на этот
-        # зазор; с задержкой таймера и часом на разницу в длительности прогонов
-        # он обязан уложиться в запас ритма.
-        assert since_boundary + jitter <= timedelta(hours=CADENCE_GRACE_HOURS - 1), monday
-        monday += timedelta(days=7)
+    day = date(2026, 1, 1)
+    while day < date(2029, 1, 1):
+        windows = set()
+        for hour, minute in alarms:
+            # Будильник не стоит в часе перевода часов: такого местного времени
+            # в одну из ночей года нет вовсе, в другую оно наступает дважды.
+            local = datetime(day.year, day.month, day.day, hour, minute, tzinfo=BERLIN)
+            assert local.utcoffset() == local.replace(fold=1).utcoffset(), (day, hour, minute)
+            assert local.astimezone(timezone.utc).astimezone(BERLIN).replace(
+                tzinfo=None
+            ) == local.replace(tzinfo=None), (day, hour, minute)
+            fire = _timer_fire_utc(day, hour, minute)
+            opened = cadence_window_start("aloe", fire)
+            since_boundary = fire - opened
+            # Ночной запуск открывает новое окно, а не дособирает вчерашнее.
+            assert timedelta(hours=1) <= since_boundary, (day, hour, minute)
+            # Сбор вручную сразу после границы сдвигает следующий плановый на
+            # этот зазор; с задержкой таймера и часом на разницу в длительности
+            # прогонов он обязан уложиться в запас ритма.
+            assert since_boundary + jitter <= timedelta(hours=CADENCE_GRACE_HOURS - 1), (
+                day,
+                hour,
+                minute,
+            )
+            windows.add(opened)
+        # Повтор принадлежит той же ночи, что и первый будильник: иначе он был
+        # бы не повтором упавшего сбора, а вторым сбором.
+        assert len(windows) == 1, day
+        day += timedelta(days=1)
+
+
+def test_pharmonline_workflow_in_github_actions_has_no_schedule():
+    """Сбор pharmonline из GitHub Actions — только ручной запуск.
+
+    Понедельничный cron снят 2026-10-13: дубль идёт мимо гварда ритма
+    (`--mode public_api`) и исполняет `main`, а его упавшая попытка после
+    удачного ночного сбора отнимает у каталога pharmonline доверие до следующей
+    ночи. Вернётся расписание — вернётся и этот риск, теперь еженедельно.
+    """
+    import yaml
+
+    workflow = yaml.safe_load(AUTONOMOUS_PHARMONLINE_WORKFLOW.read_text(encoding="utf-8"))
+    # PyYAML читает ключ `on` как булево True.
+    triggers = workflow.get("on", workflow.get(True))
+
+    assert set(triggers) == {"workflow_dispatch"}
 
 
 # ─── Какие сайты пора собирать ───────────────────────────────────────────────
 
 
-def test_same_weekday_and_hour_a_week_later_is_due(db_session):
-    """7-й день в то же время суток — собираем.
+def test_next_night_at_the_same_hour_is_due(db_session):
+    """Следующей ночью в то же время суток — собираем.
 
-    Прежнее правило «с конца прошлого сбора прошло ≥168ч» здесь отвечало «рано»:
-    таймер срабатывает в то же время суток, сбор длится полчаса, значит на 7-й
-    день возраст 167,4ч. Сбор уезжал на 8-й день, а порог «данные устарели»
-    (174ч) успевал сработать раньше.
+    Правило «с конца прошлого сбора прошло не меньше ритма» здесь отвечало бы
+    «рано»: будильник срабатывает в то же время суток, сбор длится полчаса,
+    значит следующей ночью возраст — 23,4 часа. При недельном ритме то же
+    правило уводило сбор на восьмой день.
     """
     last = _full_run(db_session, "aloe", started_at=datetime(2026, 10, 11, 23, 3, 13))
-    # Неделю спустя таймеру выпала меньшая случайная задержка, чем в прошлый раз.
-    now = datetime(2026, 10, 18, 23, 0, 20)
+    # Назавтра таймеру выпала меньшая случайная задержка, чем в прошлый раз.
+    now = datetime(2026, 10, 12, 23, 0, 20)
     assert (now - last.finished_at).total_seconds() / 3600 < site_cadence_hours("aloe")
 
     due, covered = main_mod._sites_due_for_full_scan(db_session, ["aloe"], now=now)
@@ -195,9 +254,82 @@ def test_same_weekday_and_hour_a_week_later_is_due(db_session):
     assert covered == {}
 
 
+def test_second_alarm_of_the_night_skips_a_collected_site(db_session):
+    """Повтор в 03:15 после удачного сбора в 01:00 не делает ничего."""
+    alarms, _ = _timer_alarms(SCRAPE_TIMER)
+    (first_hour, first_minute), (retry_hour, retry_minute) = alarms
+    night = date(2026, 10, 14)
+    last = _full_run(
+        db_session, "aptekonline", started_at=_timer_fire_utc(night, first_hour, first_minute)
+    )
+    retry = _timer_fire_utc(night, retry_hour, retry_minute) + timedelta(seconds=40)
+
+    due, covered = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=retry)
+
+    assert due == []
+    assert covered["aptekonline"] == pytest.approx(
+        (retry - last.finished_at).total_seconds() / 3600
+    )
+
+
+@pytest.mark.parametrize("status", ["failed", "degraded"])
+def test_second_alarm_of_the_night_retries_a_site_whose_run_did_not_succeed(db_session, status):
+    """Ради этого второй будильник и стоит: неудачный сбор повторяется до утра."""
+    alarms, _ = _timer_alarms(SCRAPE_TIMER)
+    (first_hour, first_minute), (retry_hour, retry_minute) = alarms
+    night = date(2026, 10, 14)
+    _full_run(
+        db_session,
+        "aptekonline",
+        started_at=_timer_fire_utc(night, first_hour, first_minute),
+        status=status,
+    )
+    retry = _timer_fire_utc(night, retry_hour, retry_minute)
+
+    due, _ = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=retry)
+
+    assert due == ["aptekonline"]
+
+
+def test_nightly_alarms_collect_exactly_once_a_night(db_session):
+    """Шесть недель ночных будильников, как на проде: один сбор за ночь.
+
+    Каждую ночь — оба будильника из файла таймера, по времени хоста, со
+    случайной задержкой. Внутри отрезка — переход на зимнее время 25 октября:
+    будильники сдвигаются на час по UTC, ритм не должен ни удвоиться, ни
+    пропустить ночь, а данные — ни разу стать «просроченными» между сборами.
+    """
+    alarms, _ = _timer_alarms(SCRAPE_TIMER)
+    _full_run(db_session, "aloe", started_at=datetime(2026, 10, 6, 23, 3, 13))
+    collected: list[storage.Run] = []
+
+    for offset in range(42):
+        day = date(2026, 10, 8) + timedelta(days=offset)
+        for number, (hour, minute) in enumerate(alarms):
+            jitter = timedelta(seconds=(offset * 97 + number * 131) % 300)
+            now = _timer_fire_utc(day, hour, minute) + jitter
+            due, _ = main_mod._sites_due_for_full_scan(db_session, ["aloe"], now=now)
+            if due:
+                collected.append(
+                    _full_run(db_session, "aloe", started_at=now, minutes=30 + offset % 6)
+                )
+
+    nights = [
+        run.started_at.replace(tzinfo=timezone.utc).astimezone(BERLIN).date() for run in collected
+    ]
+    assert nights == [date(2026, 10, 8) + timedelta(days=offset) for offset in range(42)]
+    # Собирает всегда первый будильник ночи — повтору достаётся только сбой.
+    assert {
+        run.started_at.replace(tzinfo=timezone.utc).astimezone(BERLIN).hour for run in collected
+    } == {alarms[0][0]}
+    for previous, current in zip(collected, collected[1:]):
+        gap_hours = (current.finished_at - previous.finished_at).total_seconds() / 3600
+        assert gap_hours <= site_max_age_hours("aloe")
+
+
 @pytest.mark.parametrize("days_later", [1, 2, 3, 4, 5, 6])
-def test_nightly_wakeups_inside_the_week_are_skipped(db_session, days_later):
-    """Со второго по седьмой будильник той же недели — сайт уже собран."""
+def test_weekly_site_skips_nightly_wakeups_inside_the_week(db_session, weekly_aloe, days_later):
+    """Недельный сайт: со второго по седьмой будильник той же недели — уже собран."""
     last = _full_run(db_session, "aloe", started_at=datetime(2026, 10, 11, 23, 3, 13))
     now = datetime(2026, 10, 11, 23, 0, 20) + timedelta(days=days_later)
 
@@ -207,13 +339,14 @@ def test_nightly_wakeups_inside_the_week_are_skipped(db_session, days_later):
     assert covered["aloe"] == pytest.approx((now - last.finished_at).total_seconds() / 3600)
 
 
-def test_nightly_timer_collects_exactly_once_a_week(db_session):
-    """Шесть недель ночных срабатываний таймера, как на проде.
+def test_weekly_site_is_collected_exactly_once_a_week(db_session, weekly_aloe):
+    """Недельный сайт под суточным будильником — шесть недель, шесть сборов.
 
-    Таймер aloe: каждую ночь в 01:00 по времени хоста + до 5 минут случайной
-    задержки. Отправная точка — реальный последний сбор с прода (прогон 987).
-    Внутри отрезка — переход на зимнее время 25 октября: таймер сдвигается на
-    час по UTC, ритм не должен ни удвоиться, ни пропустить неделю.
+    Отправная точка — реальный последний сбор с прода (прогон 987). Внутри
+    отрезка — переход на зимнее время: ритм не должен ни удвоиться, ни
+    пропустить неделю. Седьмой день в то же время суток — собираем: по правилу
+    «прошло ≥168 ч» сбор уезжал на восьмой день, а порог «данные устарели»
+    (174 ч) срабатывал раньше.
     """
     _full_run(db_session, "aloe", started_at=datetime(2026, 10, 6, 23, 3, 13))
     collected: list[storage.Run] = []
@@ -235,50 +368,76 @@ def test_nightly_timer_collects_exactly_once_a_week(db_session):
         date(2026, 11, 16),
     ]
     assert {_berlin_weekday(run.started_at) for run in collected} == {0}
-    # Данные ни разу не успевают стать «просроченными» между двумя сборами.
     for previous, current in zip(collected, collected[1:]):
         gap_hours = (current.finished_at - previous.finished_at).total_seconds() / 3600
         assert gap_hours <= site_max_age_hours("aloe")
 
 
-def test_weekly_timer_is_not_skipped_after_midweek_recovery(db_session):
-    """Недельный таймер (aptekonline) после сбора посреди недели.
+def test_weekly_site_is_not_skipped_after_midweek_recovery(db_session, weekly_aloe):
+    """Недельный сайт после сбора посреди недели.
 
     Понедельничный сбор упал, в среду его повторили вручную. Правило «168ч с
     прошлого сбора» пропустило бы следующий понедельник (прошло 4,5 дня), и
-    таймер вернулся бы только через неделю — 11 дней без данных. Окно ритма
+    сбор вернулся бы только через неделю — 11 дней без данных. Окно ритма
     считает понедельник новой неделей.
     """
     _full_run(db_session, "aptekonline", started_at=datetime(2026, 10, 12, 0, 4), status="failed")
     _full_run(db_session, "aptekonline", started_at=datetime(2026, 10, 14, 9, 0))
 
-    next_monday = _timer_fire_utc(date(2026, 10, 19), hour=2) + timedelta(seconds=240)
-    due, _ = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=next_monday)
-
-    assert due == ["aptekonline"]
-
-
-def test_manual_collection_right_after_window_opens_keeps_next_week_fresh(db_session):
-    """Худший случай для порога «данные устарели».
-
-    Сбор вручную через секунды после открытия окна закрывает неделю, и
-    следующий плановый приходит позже обычного на зазор между границей и
-    таймером. Берём самый поздний таймер прода (aptekonline, 02:00 зимой),
-    полную случайную задержку и прогон вдвое длиннее обычного.
-    """
-    this_monday = _timer_fire_utc(date(2026, 11, 9), hour=2)
-    opened = cadence_window_start("aptekonline", this_monday)
-    early = _full_run(db_session, "aptekonline", started_at=opened + timedelta(seconds=5))
-
-    due, _ = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=this_monday)
+    sunday_night = _timer_fire_utc(date(2026, 10, 18), hour=1)
+    due, _ = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=sunday_night)
     assert due == []
 
-    next_monday = _timer_fire_utc(date(2026, 11, 16), hour=2) + timedelta(seconds=300)
+    next_monday = _timer_fire_utc(date(2026, 10, 19), hour=1) + timedelta(seconds=240)
     due, _ = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=next_monday)
+
     assert due == ["aptekonline"]
-    refreshed_by = next_monday + timedelta(minutes=65)
+
+
+def test_manual_collection_right_after_window_opens_keeps_the_next_night_fresh(db_session):
+    """Худший случай для порога «данные устарели».
+
+    Сбор вручную через секунды после открытия окна закрывает ночь: оба её
+    будильника сайт пропускают, и следующий плановый сбор приходит через сутки
+    с лишним. Берём зимнее время (будильник на час позже по UTC), полную
+    случайную задержку, сайт — последний в очереди из трёх (общий замок, вся
+    очередь около 70 минут) и прогон длиннее обычного.
+    """
+    alarms, delay_sec = _timer_alarms(SCRAPE_TIMER)
+    first_hour, first_minute = alarms[0]
+    night = date(2026, 11, 9)
+    opened = cadence_window_start("aptekonline", _timer_fire_utc(night, first_hour, first_minute))
+    early = _full_run(db_session, "aptekonline", started_at=opened + timedelta(seconds=5))
+
+    for hour, minute in alarms:
+        now = _timer_fire_utc(night, hour, minute)
+        due, _ = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=now)
+        assert due == [], (hour, minute)
+
+    next_night = _timer_fire_utc(night + timedelta(days=1), first_hour, first_minute) + timedelta(
+        seconds=delay_sec
+    )
+    due, _ = main_mod._sites_due_for_full_scan(db_session, ["aptekonline"], now=next_night)
+    assert due == ["aptekonline"]
+    refreshed_by = next_night + timedelta(minutes=70 + 45)
     gap_hours = (refreshed_by - early.started_at).total_seconds() / 3600
     assert gap_hours <= site_max_age_hours("aptekonline")
+
+
+def test_manual_collection_in_the_daytime_does_not_cancel_the_night(db_session):
+    """Кнопка «Запустить scrape» днём по Баку ночной сбор не отменяет.
+
+    Окно открывается в 22:00 UTC (02:00 Баку): всё, что собрано раньше,
+    принадлежит вчерашнему окну.
+    """
+    alarms, _ = _timer_alarms(SCRAPE_TIMER)
+    night = date(2026, 10, 15)
+    first = _timer_fire_utc(night, *alarms[0])
+    _full_run(db_session, "aloe", started_at=first - timedelta(hours=9))  # 14:00 UTC, 18:00 Баку
+
+    due, _ = main_mod._sites_due_for_full_scan(db_session, ["aloe"], now=first)
+
+    assert due == ["aloe"]
 
 
 def test_run_started_before_the_window_does_not_cover_it(db_session):
@@ -320,10 +479,10 @@ def test_site_without_any_full_run_is_due(db_session):
 
 
 def test_due_and_covered_sites_are_separated(db_session):
-    """Один прогон на три сайта собирает только те, у которых началась новая неделя."""
-    now = datetime(2026, 10, 13, 23, 1)
-    _full_run(db_session, "aloe", started_at=now - timedelta(hours=24))
-    _full_run(db_session, "aptekonline", started_at=now - timedelta(days=8))
+    """Один прогон на три сайта собирает только те, у которых началось новое окно."""
+    now = datetime(2026, 10, 13, 23, 31)
+    _full_run(db_session, "aloe", started_at=now - timedelta(minutes=30))
+    _full_run(db_session, "aptekonline", started_at=now - timedelta(hours=24))
 
     due, covered = main_mod._sites_due_for_full_scan(
         db_session, ["aloe", "aptekonline", "pharmonline"], now=now
