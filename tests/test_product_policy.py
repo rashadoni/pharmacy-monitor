@@ -245,37 +245,41 @@ def test_unknown_country_does_not_mask_two_resolved_country_conflicts() -> None:
 
 
 def test_offer_freshness_window_follows_site_cadence():
-    """Окно свежести оффера выводится из ритма сбора, а не из общих 30ч.
+    """Окно свежести оффера выводится из ритма сбора, а не из числа, прибитого рядом.
 
-    aptekonline собирается раз в неделю (решение владельца 2026-10-04), поэтому
-    самое свежее наблюдение по нему физически бывает недельной давности. Прежние
-    жёсткие 30ч объявляли его собственный успешный сбор несвежим уже через
-    полтора дня — полный каталог не подтверждался 6 дней из 7.
+    Пока aptekonline собирался раз в неделю (2026-10-04…13), самое свежее
+    наблюдение по нему физически бывало недельной давности, а жёсткие 30ч
+    объявляли его собственный успешный сбор несвежим уже через полтора дня —
+    полный каталог не подтверждался 6 дней из 7. Число здесь — следствие карты
+    ритма, и менять его нужно там.
     """
-    from src.cadence import site_max_age_hours
+    from src.cadence import SITE_SCRAPE_CADENCE_HOURS, site_max_age_hours
     from src.product_policy import OFFER_MAX_AGE_HOURS
 
-    # Все три сайта на недельном ритме (решение владельца 2026-10-06).
+    # Все три сайта на суточном ритме (решение владельца 2026-10-13).
     for site in ("pharmonline", "aptekonline", "aloe"):
-        assert OFFER_MAX_AGE_HOURS[site] == 174
+        assert OFFER_MAX_AGE_HOURS[site] == site_max_age_hours(site) == 30
+    assert set(OFFER_MAX_AGE_HOURS) == set(SITE_SCRAPE_CADENCE_HOURS)
 
-    # Формула не ломает суточный случай: сайт без объявленного ритма — 30ч.
+    # Сайт без объявленного ритма — те же суточные 30ч.
     assert site_max_age_hours("site-without-declared-cadence") == 30
 
 
-def test_weekly_site_offer_stays_fresh_mid_cycle():
-    """Наблюдение на 100ч — середина штатного недельного цикла у любого сайта."""
+def test_site_offer_stays_fresh_until_the_next_nightly_scan_is_overdue():
+    """Наблюдение на 29ч — ещё в запасе суточного ритма у любого сайта."""
     from src.product_policy import offer_is_fresh
 
     now = utcnow()
     for site in ("pharmonline", "aptekonline", "aloe"):
         product = _product(site)
-        product.availability_observed_at = now - timedelta(hours=100)
+        product.availability_observed_at = now - timedelta(hours=29)
         assert offer_is_fresh(product, now=now) is True, site
+        product.availability_observed_at = now - timedelta(hours=31)
+        assert offer_is_fresh(product, now=now) is False, site
 
 
-def test_weekly_site_offer_goes_stale_after_missed_scan():
-    """Пропущенный недельный сбор (>174ч) по-прежнему делает оффер несвежим."""
+def test_site_offer_goes_stale_after_missed_scans():
+    """Давно пропущенные сборы (200ч) делают оффер несвежим."""
     from src.product_policy import offer_is_fresh
 
     now = utcnow()

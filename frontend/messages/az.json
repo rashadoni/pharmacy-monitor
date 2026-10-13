@@ -182,7 +182,7 @@
     "recommendations_waiting_verified": "Növbəti təsdiqlənmiş tam skana qədər tövsiyələr müvəqqəti gizlədilib.",
     "recommendations_provenance": "Təsdiqlənmiş #{run} tam icraya əsaslanır, {completed} tamamlanıb.",
     "latest_by_site": "Hər sayt üzrə son icra",
-    "latest_by_site_desc": "Həftəlik saytlar son 5 ümumi icraya düşməsə də burada həmişə görünür.",
+    "latest_by_site_desc": "Hər sayt son 5 ümumi icraya düşməsə də burada həmişə görünür.",
     "newer_attempt_warning": "yeni #{id} cəhdi problemlə bitib",
     "system_status_title": "Sistemin vəziyyəti",
     "system_status_desc": "API, yaddaş xidmətləri, etibarlı kataloq və skan növbəsi.",

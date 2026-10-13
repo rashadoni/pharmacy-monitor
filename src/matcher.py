@@ -1994,6 +1994,14 @@ def refresh_derived_fields(session: Session, *, tenant_id: int = 1) -> int:
 
 # Строка считается пропавшей с сайта, если её не видели дольше двух циклов сбора…
 _STALE_MEMBER_CYCLES = 2
+# …но не раньше чем через две недели с запасом. Нижняя граница не привязана к
+# ритму намеренно: при суточном сборе «два цикла» — это 54 часа, а сайт убирает
+# из листинга товар, которого временно нет в продаже, и через неделю возвращает
+# его; место в паре за это время ушло бы живому двойнику с тем же названием —
+# у aloe под одним названием бывают разные товары. 342 часа — ровно то, что
+# давала формула при недельном ритме (2 × 168 + 6): смена ритма 2026-10-13 не
+# меняет, какие строки матчер считает пропавшими, и откат ритма — тоже.
+_STALE_MEMBER_MIN_HOURS = 14 * 24 + 6
 # …и при этом за то же время видели хотя бы половину каталога сайта.
 _STALE_RELINK_MIN_FRESH_SHARE = 0.5
 
@@ -2002,9 +2010,10 @@ def _gone_row_rules(products, now=None):
     """Мерка «строка пропала с сайта» — одна для подготовки и для проходов.
 
     Возвращает `(is_stale, fully_scraped)`. Строку не видели дольше двух циклов
-    сбора её сайта — `is_stale`; но судить по этому можно только на сайте из
-    `fully_scraped`, где за то же время видели хотя бы половину каталога: иначе
-    «давно не видели» значит «полный сбор не проходил».
+    сбора её сайта и не меньше `_STALE_MEMBER_MIN_HOURS` — `is_stale`; но судить
+    по этому можно только на сайте из `fully_scraped`, где за то же время видели
+    хотя бы половину каталога: иначе «давно не видели» значит «полный сбор не
+    проходил».
     """
     from datetime import timedelta
 
@@ -2014,7 +2023,10 @@ def _gone_row_rules(products, now=None):
     current = now or utcnow()
 
     def is_stale(product) -> bool:
-        hours = _STALE_MEMBER_CYCLES * site_cadence_hours(product.site) + CADENCE_GRACE_HOURS
+        hours = max(
+            _STALE_MEMBER_CYCLES * site_cadence_hours(product.site) + CADENCE_GRACE_HOURS,
+            _STALE_MEMBER_MIN_HOURS,
+        )
         return product.last_seen_at is None or product.last_seen_at < current - timedelta(
             hours=hours
         )

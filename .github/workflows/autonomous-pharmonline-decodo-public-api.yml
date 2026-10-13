@@ -5,18 +5,16 @@ name: Autonomous Pharmonline Decodo catalog refresh
 # production host: a scheduled job must never depend on a manually staged
 # recovery directory, nor silently fall back to the legacy DDP scraper.
 
+# Расписания у workflow нет с 2026-10-13 — только ручной запуск. Понедельничный
+# cron (`20 03 * * 1`) появился, когда каталог собирался раз в неделю и этот
+# путь был для pharmonline единственным живым. С 2026-10-04 pharmonline собирает
+# ночной systemd-таймер (транспорт `direct`), а с переходом на ежедневный сбор
+# дубль перестал быть страховкой и остался риском: он идёт мимо гварда ритма
+# (`--mode public_api`), исполняет голову `main`, а не выложенный код, и его
+# упавшая попытка после удачного ночного сбора отнимала бы у каталога
+# pharmonline доверие до следующей ночи. Страховка теперь — второй ночной
+# будильник и следующая ночь (infra/systemd/pharmacy-monitor-scrape@.timer).
 on:
-  schedule:
-    # Недельный ритм, решение владельца 2026-10-06: полный каталог собирается раз
-    # в неделю, по понедельникам. Это ЖИВОЙ путь pharmonline — systemd-таймер
-    # pharmacy-monitor-scrape@pharmonline остался легаси, и прод обновляется
-    # именно отсюда (сверено по Product.last_seen_at против времени прогонов).
-    # Час разнесён с systemd-таймерами. GitHub Actions считает в UTC; его
-    # планировщик регулярно опаздывает на часы, но день не сдвигает.
-    #
-    # Ритм продублирован в src/cadence.py — пороги «данные устарели» выводятся
-    # оттуда. Меняешь расписание здесь — меняй и там.
-    - cron: "20 03 * * 1"
   workflow_dispatch:
 
 permissions:

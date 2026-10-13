@@ -59,8 +59,8 @@ jobs:
               value=${line#*=}
               export "$key=$value"
             done < /etc/pharmacy-monitor/env
-            # --force: ручной запуск — явная просьба. Без него гвард недельного
-            # ритма пропустил бы сбор, если aptekonline на этой неделе уже
+            # --force: ручной запуск — явная просьба. Без него гвард ритма
+            # пропустил бы сбор, если aptekonline в этом окне ритма уже
             # собран, а шаг проверки ниже прошёл бы по старому прогону.
             .venv/bin/pharmacy-monitor run \
               --site aptekonline \

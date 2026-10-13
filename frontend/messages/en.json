@@ -182,7 +182,7 @@
     "recommendations_waiting_verified": "Recommendations are temporarily hidden until the next verified full scan.",
     "recommendations_provenance": "Based on verified full run #{run}, completed {completed}.",
     "latest_by_site": "Latest run by site",
-    "latest_by_site_desc": "Weekly sites stay visible here even when they are pushed out of the last 5 global runs.",
+    "latest_by_site_desc": "Every site stays visible here even when it is pushed out of the last 5 global runs.",
     "newer_attempt_warning": "new attempt #{id} finished with a problem",
     "system_status_title": "System status",
     "system_status_desc": "API, storage, trusted catalog and scan queue.",
