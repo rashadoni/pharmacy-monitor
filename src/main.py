@@ -2608,6 +2608,10 @@ def _run_matching_stage(
             summary[key] = result if isinstance(result, int) else len(result)
         except Exception:
             log.exception("matcher_preparation_failed", step=prepare.__name__)
+            # Точка сохранения вернула базу, но не сессию: состав кластеров,
+            # прочитанный упавшим шагом после его записей, остался бы прежним,
+            # и проходы собрали бы кластер с двумя строками одного сайта.
+            session.expire_all()
     if fuzzy_threshold is None:
         summary["clusters"] = matcher.match_products(session)
     else:

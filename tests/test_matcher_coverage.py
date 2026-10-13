@@ -1674,6 +1674,8 @@ def test_a_sibling_paired_with_a_gone_row_moves_and_the_gone_row_loses_its_clust
         "twin_has_the_other_dose_order",
         "prices_agreed_before",
         "prices_agreed_before_at_a_discount",
+        "prices_agreed_before_within_half_a_percent",
+        "prices_agreed_before_with_a_member_now_out_of_stock",
         "client_site_not_scraped",
     ],
 )
@@ -1743,6 +1745,19 @@ def test_a_price_stranger_stays_when_the_evidence_is_not_enough(db_session, monk
         _priced(db_session, case.suppositories, 19.2, days_ago=30)
     elif obstacle == "prices_agreed_before_at_a_discount":
         _priced(db_session, case.suppositories, 30.0, discount=19.2, days_ago=30)
+    elif obstacle == "prices_agreed_before_within_half_a_percent":
+        _priced(db_session, case.suppositories, 19.25, days_ago=30)
+    elif obstacle == "prices_agreed_before_with_a_member_now_out_of_stock":
+        # Третий член кластера сейчас не в наличии, но свечи стоили, как он:
+        # это такое же свидетельство, что свечи в кластере на месте.
+        gone_from_stock = _product(
+            db_session,
+            "aloe",
+            "Polioksidonium 12 mq 10 əd",
+            canonical_id=case.match.id,
+            status="out_of_stock",
+        )
+        _priced(db_session, gone_from_stock, 27.6)
     elif obstacle == "client_site_not_scraped":
         # Сайт клиента не собирался: его строки не «пропали», о них просто
         # ничего не известно. Пары с такими строками не трогаем.
@@ -1756,14 +1771,14 @@ def test_a_price_stranger_stays_when_the_evidence_is_not_enough(db_session, monk
     assert matcher.replace_price_strangers(db_session) == []
     assert _clusters(db_session) == before
     # Причина пишется, только когда сосед с ценой остальных нашёлся.
-    reasons = {
-        "two_twins": "several_siblings",
-        "prices_agreed_before": "prices_agreed_before",
-        "prices_agreed_before_at_a_discount": "prices_agreed_before",
-    }
-    assert journal.kept_strangers() == (
-        [(reasons[obstacle], case.suppositories.id)] if obstacle in reasons else []
+    reason = (
+        "several_siblings"
+        if obstacle == "two_twins"
+        else "prices_agreed_before"
+        if obstacle.startswith("prices_agreed")
+        else None
     )
+    assert journal.kept_strangers() == ([(reason, case.suppositories.id)] if reason else [])
 
 
 def test_a_cluster_whose_other_members_disagree_on_price_is_left_alone(db_session):
@@ -2612,14 +2627,69 @@ def test_the_cluster_is_renamed_when_its_name_was_the_name_of_the_one_who_left(d
     assert match.canonical_dosage != "50mq"
 
 
-def test_the_cluster_keeps_a_name_that_is_not_the_name_of_the_one_who_left(db_session):
+def test_the_cluster_keeps_a_name_that_one_of_its_members_carries(db_session):
+    """Название носит товар, который в кластере есть (здесь — вошедший сосед, и
+    он не первый по номеру): менять нечего."""
     case = _tablets_paired_with_suppositories(db_session)
-    assert case.match.canonical_name == "Polioksidonium"
+    case.match.canonical_name = case.tablets.name
+    db_session.commit()
+    assert case.competitor.id < case.tablets.id
 
     assert matcher.replace_price_strangers(db_session)
     db_session.commit()
 
-    assert case.match.canonical_name == "Polioksidonium"
+    assert case.match.canonical_name == case.tablets.name
+
+
+def test_a_name_the_one_who_left_carried_in_an_older_spelling_is_replaced_too(db_session):
+    """Название кластера не обновляется вслед за товаром: сверяем с оставшимися."""
+    case = _tablets_paired_with_suppositories(db_session)
+    case.match.canonical_name = "Polioksidonium 12 mq № 10 (prejnee napisanie)"
+    db_session.commit()
+
+    assert matcher.replace_price_strangers(db_session)
+    db_session.commit()
+
+    assert case.match.canonical_name == min(case.tablets, case.competitor, key=lambda p: p.id).name
+
+
+def test_both_clusters_of_a_swap_are_named_after_their_own_members(db_session):
+    case = _crossed_pairs(db_session)
+    case.first.canonical_name = case.competitor_lemon.name  # уйдёт во второй
+    case.second.canonical_name = case.competitor_plain.name  # уйдёт в первый
+    db_session.commit()
+
+    assert [item["swapped"] for item in matcher.replace_price_strangers(db_session)] == [True]
+    db_session.commit()
+
+    for match in (case.first, case.second):
+        assert match.canonical_name in {product.name for product in match.products}
+
+
+def test_the_cluster_a_sibling_moved_out_of_is_named_after_its_own_member(db_session):
+    """Обычный товар конкурента стоял третьим в кластере двух лимонных и дал ему название."""
+    case = _crossed_pairs(db_session)
+    case.client_lemon.name = "Septolete total limon və ağcaqayın № 16"
+    case.competitor_lemon.name = "Septolete Total limon, kəndalaş N16"
+    for row in (case.client_lemon, case.competitor_lemon):
+        row.name_normalized = normalize_name(row.name)
+    _priced(
+        db_session,
+        _product(
+            db_session,
+            "aloe",
+            "Septolete total limon və ağcaqayın 16 əd",
+            canonical_id=case.second.id,
+        ),
+        5.27,
+    )
+    case.second.canonical_name = case.competitor_plain.name
+    db_session.commit()
+
+    assert matcher.replace_price_strangers(db_session)
+    db_session.commit()
+
+    assert case.second.canonical_name in {product.name for product in case.second.products}
 
 
 def test_costs_bound_to_the_cluster_follow_the_rows_that_join_another(db_session):
@@ -2641,6 +2711,24 @@ def test_costs_bound_to_the_cluster_follow_the_rows_that_join_another(db_session
 
     assert [row.canonical_id for row in db_session.query(storage.SupplierPrice)] == [right_id]
     assert [row.canonical_id for row in db_session.query(storage.StockLevel)] == [right_id]
+
+
+def test_costs_stay_with_their_cluster_when_two_rows_only_swap(db_session):
+    case = _crossed_pairs(db_session)
+    for match in (case.first, case.second):
+        db_session.add(
+            storage.SupplierPrice(
+                canonical_id=match.id, supplier_name=match.canonical_name, purchase_price=5.0
+            )
+        )
+    db_session.commit()
+
+    assert [item["swapped"] for item in matcher.replace_price_strangers(db_session)] == [True]
+    db_session.commit()
+
+    assert {
+        row.supplier_name: row.canonical_id for row in db_session.query(storage.SupplierPrice)
+    } == {"A": case.first.id, "B": case.second.id}
 
 
 @pytest.mark.parametrize("where", ["in_the_cluster", "next_to_the_sibling"])
@@ -2900,3 +2988,181 @@ def test_a_sibling_whose_price_once_agreed_with_its_cluster_is_not_taken_from_it
         ("sibling_agrees_with_its_cluster", case.competitor_lemon.id),
         ("prices_agreed_before", case.client_lemon.id),
     ]
+
+
+def test_a_fresh_row_of_a_site_that_was_not_scraped_is_judged_like_any_other(db_session):
+    """«Не собран» — про строки, которых давно не видели. Свежую строку того же
+    сайта (частичный сбор её видел) шаг считает живой, и кластер она не
+    замораживает."""
+    match = _cluster(db_session, "Polioksidonium")
+    suppositories = _priced(
+        db_session,
+        _product(
+            db_session,
+            "pharmonline",
+            "Polioksidonium 12 mq № 10",
+            external_id="supp",
+            canonical_id=match.id,
+        ),
+        27.6,
+    )
+    fresh_aloe = _priced(
+        db_session,
+        _product(db_session, "aloe", "Polioksidonium 12 mq 10 əd", canonical_id=match.id),
+        19.2,
+    )
+    tablets = _priced(
+        db_session,
+        _product(db_session, "pharmonline", "Polioksidonium 12 mq  № 10", external_id="tabs"),
+        19.2,
+    )
+    for i in range(3):  # у aloe видели одну строку из четырёх: сайт не собран
+        _product(
+            db_session,
+            "aloe",
+            f"Unseen product {i} 10 əd",
+            external_id=f"unseen-{i}",
+            last_seen_at=utcnow() - timedelta(days=100),
+        )
+    db_session.commit()
+
+    assert matcher.replace_price_strangers(db_session)
+    assert _same_cluster(tablets, fresh_aloe) and suppositories.canonical_id is None
+
+
+@pytest.mark.parametrize("where", ["before_the_first_write", "after_the_writes"])
+def test_a_failed_reseat_leaves_neither_the_database_nor_the_session_half_changed(
+    db_session, monkeypatch, where
+):
+    """Шаг упал — этап идёт дальше с прежними парами. Точка сохранения
+    возвращает базу, но не сессию: состав кластера, прочитанный шагом после его
+    записей, остался бы «без ушедшего соседа». Проходы должны получить сессию,
+    которая с базой согласна."""
+    from sqlalchemy import select
+
+    from src import main as main_mod
+
+    case = _crossed_pairs(db_session)
+    case.client_lemon.name = "Septolete total limon və ağcaqayın № 16"
+    case.competitor_lemon.name = "Septolete Total limon, kəndalaş N16"
+    for row in (case.client_lemon, case.competitor_lemon):
+        row.name_normalized = normalize_name(row.name)
+    _priced(
+        db_session,
+        _product(
+            db_session,
+            "aloe",
+            "Septolete total limon və ağcaqayın 16 əd",
+            canonical_id=case.second.id,
+        ),
+        5.27,
+    )
+    # Названия носят остающиеся члены: шаг записи кластеров не меняет, и откат
+    # точки сохранения сам их состав в сессии не сбросит.
+    case.first.canonical_name = case.client_plain.name
+    case.second.canonical_name = case.client_lemon.name
+    db_session.commit()
+    before = _clusters(db_session)
+    real = matcher.replace_price_strangers
+    seen_by_the_passes: dict[int, set[int]] = {}
+
+    def failing(session, **kwargs):
+        if where == "after_the_writes":
+            assert [item["new"] for item in real(session, **kwargs)] == [case.competitor_plain.id]
+        raise ValueError("boom")
+
+    def passes(session, **kwargs):
+        in_the_database: dict[int, set[int]] = {case.first.id: set(), case.second.id: set()}
+        for product_id, cluster_id in session.execute(
+            select(storage.Product.id, storage.Product.canonical_id).where(
+                storage.Product.canonical_id.is_not(None)
+            )
+        ):
+            in_the_database[cluster_id].add(product_id)
+        for match in (case.first, case.second):
+            seen_by_the_passes[match.id] = {product.id for product in match.products}
+        assert seen_by_the_passes == in_the_database
+        return 0
+
+    monkeypatch.setattr(matcher, "replace_price_strangers", failing)
+    monkeypatch.setattr(matcher, "match_products", passes)
+
+    summary = main_mod._run_matching_stage(db_session)
+    db_session.commit()
+
+    assert summary["reseated"] is None and seen_by_the_passes
+    assert _clusters(db_session) == before
+
+
+# ── Правила о самих товарах (`_PassRules.incompatible`) ──────────────────────
+#
+# Тело `blocked` перенесено в общий набор 2026-10-13. Эти три правила до
+# переноса не закреплял ни один тест: без любого из них все тесты проходили.
+
+
+@pytest.mark.parametrize(
+    "client, competitor",
+    [
+        ("Kodelak Neo 100 ml", "Kodelak   100 ml"),  # модификатор — другая формула
+        ("Ametazon 30 qr (Krem)", "Ametazon məlhəm   30 q"),  # крем и мазь
+    ],
+)
+def test_passes_refuse_a_pair_the_shared_rules_forbid(db_session, client, competitor):
+    ours = _product(db_session, "pharmonline", client)
+    theirs = _product(db_session, "aptekonline", competitor)
+    db_session.commit()
+    rules = matcher._PassRules(db_session, [ours, theirs])
+
+    assert rules.incompatible(ours, theirs, [ours])
+    matcher.match_products(db_session)
+    assert ours.canonical_id is None and theirs.canonical_id is None
+
+
+def test_a_row_without_a_form_is_not_the_form_its_site_names_on_a_sibling(db_session):
+    """У сайта два товара с одним названием: у одного форма названа, у другого
+    нет. Значит, второй — не эта форма, и товару клиента с этой формой он не
+    пара, хотя идёт в списке раньше."""
+    unnamed = _product(
+        db_session, "aptekonline", "Polioksidonium   12 mq  N10", external_id="no-form"
+    )
+    named = _product(
+        db_session, "aptekonline", "Polioksidonium  12 mq  N10 (tabletlər)", external_id="tabs"
+    )
+    client = _product(db_session, "pharmonline", "Polioksidonium 12 mq № 10 (Tabletlər)")
+    db_session.commit()
+
+    matcher.match_products(db_session)
+
+    assert _same_cluster(client, named) and unnamed.canonical_id is None
+
+
+def test_the_sibling_is_judged_with_every_member_as_the_anchor(db_session):
+    """Форму проходы сверяют с якорем. У первого члена кластера форма не
+    названа, у второго — мазь: крем ему не пара, кто бы ни шёл первым."""
+    match = _cluster(db_session, "Ametazon")
+    unnamed = _priced(
+        db_session, _product(db_session, "aloe", "Ametazon 30 q", canonical_id=match.id), 7.0
+    )
+    ointment = _priced(
+        db_session,
+        _product(db_session, "aptekonline", "Ametazon məlhəm   30 q", canonical_id=match.id),
+        7.0,
+    )
+    _priced(
+        db_session,
+        _product(db_session, "pharmonline", "Ametazon 30 qr (Məlhəm)", canonical_id=match.id),
+        9.0,
+    )
+    cream = _priced(
+        db_session,
+        _product(db_session, "pharmonline", "Ametazon 30 qr (Krem)", external_id="cream"),
+        7.0,
+    )
+    db_session.commit()
+    rules = matcher._PassRules(db_session, [unnamed, ointment, cream])
+    assert not rules.incompatible(unnamed, cream, [unnamed, ointment])
+    assert rules.incompatible(ointment, cream, [unnamed, ointment])
+    before = _clusters(db_session)
+
+    assert matcher.replace_price_strangers(db_session) == []
+    assert _clusters(db_session) == before

@@ -2360,8 +2360,9 @@ def replace_price_strangers(
 
     Замена делается, когда выполнено всё:
       * цена члена заметно расходится с каждым другим живым членом кластера и
-        по журналу цен ни с кем из них не сходилась раньше: разошедшиеся цены
-        товара, который стоял в паре верно, — это изменение цены, а не ошибка;
+        по журналу цен ни с кем из членов не сходилась раньше: разошедшиеся
+        цены товара, который стоял в паре верно, — это изменение цены, а не
+        ошибка;
       * на его сайте есть ровно один живой товар, чья цена совпадает с ценой
         каждого из остальных (значит, у остальных она одна), из того же бакета,
         что кто-то из них, не дальше по названию от каждого из них, чем сам
@@ -2438,7 +2439,13 @@ def replace_price_strangers(
     past_prices: dict[int, set[float]] = {}
 
     def agreed_before(a: Product, b: Product) -> bool:
-        """Цены двух товаров когда-нибудь совпадали — по всему журналу цен."""
+        """Цены двух товаров когда-нибудь совпадали — по всему журналу цен.
+
+        Время записи не сверяется, намеренно: журнал может только запретить
+        замену, и цена, которую один товар носил раньше, а другой носит сейчас,
+        — тоже довод в пользу того, что товар один. Обратная ошибка (отказ там,
+        где пара неверна) оставляет всё как было.
+        """
         for product in (a, b):
             if product.id not in past_prices:
                 past_prices[product.id] = {
@@ -2453,7 +2460,11 @@ def replace_price_strangers(
         return any(_same_price(x, y) for x in past_prices[a.id] for y in past_prices[b.id])
 
     def never_agreed(member: Product, others: list[Product]) -> bool:
-        """По журналу цен товар не стоил, как кто-то из `others`, ни разу — и сейчас."""
+        """По журналу цен товар не стоил, как кто-то из `others`, ни разу — и сейчас.
+
+        Спрашивается со всеми членами кластера, не только с живыми: цена
+        товара, которого сейчас нет в наличии, — такое же свидетельство.
+        """
         return not any(agreed_before(member, other) for other in others)
 
     def fits(newcomer: Product, others: list[Product], instead_of: Product) -> bool:
@@ -2477,7 +2488,7 @@ def replace_price_strangers(
 
     replaced: list[dict] = []
     emptied: set[int] = set()
-    departed: dict[int, list[Product]] = defaultdict(list)  # кластер → кто из него вышел
+    left_by_someone: set[int] = set()  # кластеры, из которых кто-то вышел
     for match_id in sorted(lineups):
         live = [member for member in lineups[match_id] if is_live(member)]
         if len(live) < 2 or not touchable(match_id):
@@ -2517,7 +2528,7 @@ def replace_price_strangers(
                 continue
             # Журнал цен читается только здесь — для немногих кластеров, где
             # сосед нашёлся, а не для каждой пары с разными ценами.
-            if not never_agreed(odd, live_rest):
+            if not never_agreed(odd, rest):
                 kept("prices_agreed_before")
                 continue
             twin = twins[0]
@@ -2537,7 +2548,7 @@ def replace_price_strangers(
                     swapped = True  # два товара стоят крест-накрест
                 elif all(
                     _price_apart(price(twin), price(other)) for other in live_there
-                ) and never_agreed(twin, live_there):
+                ) and never_agreed(twin, there):
                     pass  # обмен не подходит, но сосед и у себя чужой — переходит
                 elif not {member.site for member in rest} & {
                     member.site for member in there
@@ -2555,17 +2566,17 @@ def replace_price_strangers(
                 emptied.add(match_id)
             else:
                 lineups[match_id] = [twin if member is odd else member for member in lineup]
-                departed[match_id].append(odd)
+                left_by_someone.add(match_id)
                 if swapped:
                     lineups[other_id] = [
                         odd if member is twin else member for member in lineups[other_id]
                     ]
-                    departed[other_id].append(twin)
+                    left_by_someone.add(other_id)
                 elif other_id is not None:
                     lineups[other_id] = [
                         member for member in lineups[other_id] if member is not twin
                     ]
-                    departed[other_id].append(twin)
+                    left_by_someone.add(other_id)
                     if len(lineups[other_id]) < 2:
                         left_alone, lineups[other_id] = lineups[other_id], []
                         emptied.add(other_id)
@@ -2623,17 +2634,16 @@ def replace_price_strangers(
             match = session.get(Match, empty_id)
             if match is not None and not match.products:
                 session.delete(match)
-        for cluster_id, leavers in departed.items():
-            # Название кластера взято у одного из членов. Если это был тот, кто
-            # вышел, оно теперь чужое: на странице сравнения и в заголовке
-            # алерта стояло бы «Qlipsidan 50» над двумя «Qlipsidan M».
-            match = None if cluster_id in emptied else session.get(Match, cluster_id)
+        for cluster_id in left_by_someone - emptied:
+            # Название кластера берётся у одного из членов. Если после ухода
+            # товара его не носит никто из оставшихся, оно чужое: на странице
+            # сравнения и в заголовке алерта стояло бы «Qlipsidan 50» над двумя
+            # «Qlipsidan M». Сверяется с оставшимися, а не с ушедшим: название
+            # могло быть взято у него ещё в прежнем написании.
+            match = session.get(Match, cluster_id)
             if match is None or not match.products:
                 continue
-            names = {member.name for member in match.products}
-            if match.canonical_name in names or match.canonical_name not in {
-                leaver.name for leaver in leavers
-            }:
+            if match.canonical_name in {member.name for member in match.products}:
                 continue
             first = min(match.products, key=lambda member: member.id)
             match.canonical_name = first.name
