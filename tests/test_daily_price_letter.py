@@ -30,7 +30,7 @@ import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 from structlog.testing import capture_logs
 
@@ -412,20 +412,31 @@ def test_nothing_is_sent_with_neither_a_report_nor_events(setup, reader):
     assert [entry["event"] for entry in logs][-1] == "digest_no_events"
 
 
+def _count_report_builds(monkeypatch) -> list[int]:
+    """Сколько раз звали сборку строк сравнения. Считаем, а не роняем: исключение
+    из сборки отчёта дайджест ловит сам, и письмо ушло бы как ни в чём не бывало."""
+    built: list[int] = []
+    real = comparison_rows.comparison_rows
+
+    def counted(*args, **kwargs):
+        built.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(comparison_rows, "comparison_rows", counted)
+    return built
+
+
 def test_no_recipients_means_no_report_is_built(setup, monkeypatch):
     """Отчёт — тысячи строк и книга Excel: без получателей его не собирают."""
     s = setup
     _reader(s, daily_digest=False)
     _mixed_catalog(s, _trusted_run(s))
-    monkeypatch.setattr(comparison_rows, "comparison_rows", _never_called)
+    built = _count_report_builds(monkeypatch)
 
     sent, calls = _send_daily(s)
 
     assert sent == 0 and calls == []
-
-
-def _never_called(*args, **kwargs):
-    raise AssertionError("сборку строк сравнения здесь звать не должны")
+    assert built == []
 
 
 def test_without_a_report_the_daily_letter_is_the_old_digest(setup, reader):
@@ -556,17 +567,33 @@ def _database_error(session: Session, *, tenant_id: int):
     session.execute(text("select * from no_such_table_for_the_letter"))
 
 
-def test_events_are_still_read_after_a_failed_report_query(setup, reader, monkeypatch):
-    """Упавший запрос отчёта и события читаются одной сессией."""
+def test_failed_report_query_is_rolled_back_to_a_savepoint(setup, reader, monkeypatch):
+    """Отчёт и события читает одна сессия, и упавший запрос отчёта откатывается к
+    точке сохранения. Зачем она нужна, SQLite не покажет (упавший запрос транзакцию
+    тут не прерывает) — это тест на PostgreSQL ниже; здесь видно, что она есть."""
     s = setup
     run = _trusted_run(s)
     _mixed_catalog(s, run)
     _event(s, run, "Kreon 25000")
     monkeypatch.setattr(comparison_rows, "comparison_rows", _database_error)
+    statements: list[str] = []
+    engine = s.get_bind()
 
-    sent, calls = _send_daily(s)
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        sent, calls = _send_daily(s)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
 
     assert sent == 1 and "Kreon 25000" in calls[0].kwargs["html_body"]
+    failed_at = next(i for i, sql in enumerate(statements) if "no_such_table_for_the_letter" in sql)
+    assert any(sql.startswith("SAVEPOINT ") for sql in statements[:failed_at])
+    assert statements[failed_at + 1].startswith("ROLLBACK TO SAVEPOINT ")
+    # События читаются уже после отката.
+    assert any("alert_events" in sql for sql in statements[failed_at + 2 :])
 
 
 # ─── То же на PostgreSQL: упавший запрос прерывает транзакцию ────────────────
@@ -804,14 +831,14 @@ def test_weekly_digest_never_builds_the_price_report(setup, monkeypatch):
     run = _trusted_run(s)
     _mixed_catalog(s, run)
     _event(s, run, "Kreon 25000")
-    monkeypatch.setattr(comparison_rows, "comparison_rows", _never_called)
-    monkeypatch.setattr(comparison_export, "build_workbook", _never_called)
+    built = _count_report_builds(monkeypatch)
 
     with patch("src.notifier.send_email") as mock_email:
         assert notifications.send_weekly_digest(s, tenant_id=1) == 1
         result = CliRunner().invoke(cli, ["notify", "digest", "weekly", "--locale", "az"])
 
     assert result.exit_code == 0, result.output
+    assert built == []
     assert mock_email.call_count == 2
     for call in mock_email.call_args_list:
         assert set(call.kwargs) == {"subject", "html_body", "to"}

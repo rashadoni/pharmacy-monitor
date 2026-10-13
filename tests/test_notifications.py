@@ -19,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 
 from src import notifications, storage, tenants
 from src._time import utcnow
+from tests.test_daily_price_letter import _pair
 
 
 @pytest.fixture
@@ -897,7 +898,7 @@ WEEKLY_LETTER_AS_IT_WAS = (
 _FIXED_NOW = datetime(2026, 10, 12, 6, 0)
 
 
-def _fixed_week(s, tenant_id, monkeypatch) -> None:
+def _fixed_week(s, tenant_id, monkeypatch) -> storage.Run:
     """Неделя событий с прибитыми датами: письмо из неё воспроизводимо байт в байт."""
     monkeypatch.setattr(notifications, "utcnow", lambda: _FIXED_NOW)
     run = _eligible_run(s, tenant_id)
@@ -922,6 +923,7 @@ def _fixed_week(s, tenant_id, monkeypatch) -> None:
             )
         )
     s.commit()
+    return run
 
 
 def test_weekly_digest_is_byte_for_byte_what_it_was(setup, tenant_user, monkeypatch):
@@ -929,7 +931,10 @@ def test_weekly_digest_is_byte_for_byte_what_it_was(setup, tenant_user, monkeypa
     трогает: тот же получатель, та же тема, то же тело, вложения нет."""
     s = setup
     tenant_user.weekly_digest = True
-    _fixed_week(s, tenant_user.tenant_id, monkeypatch)
+    run = _fixed_week(s, tenant_user.tenant_id, monkeypatch)
+    # В базе есть что сравнивать: суточное письмо из этих же данных вышло бы с
+    # отчётом о ценах и вложением. Прежнему коду сравнение было безразлично.
+    _pair(s, run, "Kreon 25000", {"pharmonline": 10.0, "aloe": 8.0})
 
     with patch("src.notifier.send_email") as mock_email:
         assert notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id) == 1

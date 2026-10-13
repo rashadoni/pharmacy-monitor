@@ -9,6 +9,7 @@ test_cadence_guard.py и test_rematch_unit.py: опечатка во флаге 
 
 from __future__ import annotations
 
+import re
 import shlex
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -32,9 +33,12 @@ REPO = Path(__file__).resolve().parents[1]
 SYSTEMD = REPO / "infra/systemd"
 UNIT = SYSTEMD / "pharmacy-monitor-digest-daily.service"
 TIMER = SYSTEMD / "pharmacy-monitor-digest-daily.timer"
-# Сбор сайта с сопоставлением укладывается в час с запасом (самый долгий — около
-# 35 минут и сопоставление); письмо должно уйти после него.
-MIN_GAP_AFTER_SCRAPE_START = timedelta(hours=2)
+# Письмо — утро после ночного сбора. Сбор сайта с сопоставлением укладывается в
+# час с запасом (самый долгий — около 35 минут и сопоставление): раньше чем
+# через два часа после его старта письмо застало бы сбор на середине. Позже чем
+# через двенадцать — это уже письмо перед следующей ночью, со вчерашними данными.
+MIN_AFTER_SCRAPE_START = timedelta(hours=2)
+MAX_AFTER_SCRAPE_START = timedelta(hours=12)
 
 
 def _settings(unit_file: Path) -> dict[str, list[str]]:
@@ -95,6 +99,13 @@ def test_unit_reads_the_production_env_and_cannot_hang_forever():
     assert not {"Restart", "ExecStartPre", "ExecStartPost"} & set(unit)
 
 
+def _letter_hour_utc() -> int:
+    (schedule,) = _settings(TIMER)["OnCalendar"]
+    clock = re.fullmatch(r"\*-\*-\* (\d{2}):00:00 UTC", schedule)
+    assert clock, f"тест умеет только ежедневное расписание на ровный час в UTC: {schedule}"
+    return int(clock[1])
+
+
 def test_timer_fires_at_nine_in_baku_every_day():
     timer = _settings(TIMER)
     assert timer["OnCalendar"] == ["*-*-* 05:00:00 UTC"]
@@ -107,12 +118,13 @@ def test_timer_fires_at_nine_in_baku_every_day():
 @pytest.mark.parametrize("day", [date(2026, 1, 12), date(2026, 7, 13)], ids=["winter", "summer"])
 def test_letter_goes_out_after_the_nightly_scrapes(day):
     """Таймеры сбора заданы по времени хоста, письмо — в UTC: зазор сверяется
-    в обе половины года. Переносишь таймеры сбора — письмо не должно уйти раньше
-    данных."""
-    letter_at = datetime(day.year, day.month, day.day, 5, 0)
+    в обе половины года. Переносишь таймер письма или таймеры сбора — письмо
+    должно остаться утром после сбора."""
+    letter_at = datetime(day.year, day.month, day.day, _letter_hour_utc(), 0)
     for timer_file in (SCRAPE_TIMER, *SCRAPE_TIMER_DROPINS):
         hour, delay = _timer_schedule(timer_file)
         scrape_at = _timer_fire_utc(day, hour) + timedelta(seconds=delay)
-        if scrape_at > letter_at:  # таймер этой ночи сработал накануне вечером по UTC
+        if scrape_at > letter_at:  # последний сбор перед письмом был сутками раньше
             scrape_at -= timedelta(days=1)
-        assert letter_at - scrape_at >= MIN_GAP_AFTER_SCRAPE_START, timer_file.name
+        waited = letter_at - scrape_at
+        assert MIN_AFTER_SCRAPE_START <= waited <= MAX_AFTER_SCRAPE_START, (timer_file.name, waited)
