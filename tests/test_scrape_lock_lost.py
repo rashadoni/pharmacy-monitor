@@ -598,22 +598,27 @@ def test_run_stops_at_the_first_stage_after_the_lock_was_lost(
 
 
 def test_dashboard_request_is_not_told_ok_by_a_run_that_lost_the_lock(lock_db, monkeypatch):
-    """Сбор по кнопке из дашборда (с пределом товаров) отдаёт заявке итог сразу
-    после записи, не дожидаясь сопоставления. Замок потерян за время записи —
-    заявка `ok` не получает ни на миг: к обработчику сбоя она приходит
-    `running`, а кончается `failed` вместе с прогоном."""
+    """Сбор по кнопке из дашборда (с пределом товаров) получает итог сбора сразу
+    после записи, не дожидаясь сопоставления, и отдаёт его заявке. Замок потерян
+    за время записи — ни прогон, ни заявка `ok` не получают ни на миг: к
+    обработчику сбоя оба приходят `running`, а кончаются `failed`. Сколько
+    собрано, прогон при этом помнит."""
     request = storage.ScrapeRequest(tenant_id=1, mode="all", status="running")
     lock_db.session.add(request)
     lock_db.session.commit()
     steps = _Steps(monkeypatch, after={"final write": lock_db.server.drops_the_lock_connection})
-    stored_request_when_the_run_failed: list[str] = []
+    stored_when_the_run_failed: list[tuple[str, str]] = []
     write_outcome = main_mod._write_failed_run_outcome
 
     def outcome_of_a_request_stored_as(session, run, run_id, record):
         with lock_db.engine.connect() as observer:
-            stored_request_when_the_run_failed.append(
-                observer.scalar(
-                    text("SELECT status FROM scrape_requests WHERE id = :id"), {"id": request.id}
+            stored_when_the_run_failed.append(
+                (
+                    observer.scalar(text("SELECT status FROM runs WHERE id = :id"), {"id": run_id}),
+                    observer.scalar(
+                        text("SELECT status FROM scrape_requests WHERE id = :id"),
+                        {"id": request.id},
+                    ),
                 )
             )
         write_outcome(session, run, run_id, record)
@@ -631,7 +636,8 @@ def test_dashboard_request_is_not_told_ok_by_a_run_that_lost_the_lock(lock_db, m
     )
 
     assert run.error_message.startswith(_lost_lock_reason("after the final write"))
-    assert stored_request_when_the_run_failed == ["running"]
+    assert stored_when_the_run_failed == [("running", "running")]
+    assert run.products_scraped == 1
     lock_db.session.refresh(request)
     assert (request.status, request.run_id) == ("failed", run.id)
 

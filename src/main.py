@@ -6127,11 +6127,12 @@ def run_cmd(
                 run.status = "running"
             else:
                 run.status = quality_status
-            session.commit()
-
-            # Финальный проход мог идти минуты. Дальше заявка из очереди получает
-            # итог сбора, а проверка покрытия пишет события в журнал алертов.
+            # Финальный проход мог идти минуты. Дальше прогон не на весь каталог
+            # получает итог сбора (`ok`), с ним — его заявка из очереди, а
+            # проверка покрытия пишет события в журнал алертов. Проверка стоит до
+            # commit: счётчики выше обработчик сбоя перенесёт через откат сам.
             _fail_if_scrape_lock_lost(noticed="after the final write")
+            session.commit()
 
             # === Early-complete для UI-triggered bounded scrape (job queue) ===
             # Full-catalog runs stay running until matcher/alerts/analyzer/ROI
