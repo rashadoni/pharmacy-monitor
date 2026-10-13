@@ -495,7 +495,7 @@ def mail_pharmonline_admission_to_admins(
             log.warning(
                 "pharmonline_admission_mail_failed",
                 user_id=user.id,
-                error_type=type(exc).__name__,
+                **notifier.delivery_error_fields(exc),
             )
         counts["email" if delivered else "failed"] += 1
     return counts

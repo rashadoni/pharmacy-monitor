@@ -1187,6 +1187,38 @@ def test_mail_failure_log_carries_no_address(db_session, monkeypatch):
     assert [entry["event"] for entry in logs] == ["pharmonline_admission_mail_failed"]
 
 
+def test_mail_failure_log_names_the_reason_the_server_gave(db_session, monkeypatch):
+    """Отказ почтового сервера `send_email` отдаёт как EmailDeliveryError: настоящий
+    класс ошибки и коды лежат в его полях. В журнале должны быть они, а не имя
+    обёртки — иначе по таблице RUNBOOK «что значит error_type» причину не найти."""
+
+    def refused_by_smtp(**kwargs):
+        raise notifications.notifier.EmailDeliveryError(
+            "SMTPRecipientsRefused", 550, "5.1.1 mailbox unavailable"
+        )
+
+    monkeypatch.setattr(notifications.notifier, "send_email", refused_by_smtp)
+    db_session.add(storage.TenantUser(tenant_id=1, email="owner@example.test", role="admin"))
+    db_session.commit()
+
+    with capture_logs() as logs:
+        counts = notifications.mail_pharmonline_admission_to_admins(
+            db_session,
+            tenant_id=1,
+            run_id=77,
+            items=[("new_public_product", "Товар", _url("p"))],
+        )
+
+    assert counts == {"email": 0, "failed": 1}
+    (entry,) = logs
+    assert entry["event"] == "pharmonline_admission_mail_failed"
+    assert entry["error_type"] == "SMTPRecipientsRefused"
+    assert entry["smtp_code"] == 550
+    assert entry["smtp_status"] == "5.1.1"
+    assert isinstance(entry["user_id"], int)
+    assert "owner@example.test" not in repr(logs)
+
+
 def test_admission_mail_links_only_pharmonline_product_addresses():
     body = notifications._render_pharmonline_admission_email(
         77,
@@ -1235,6 +1267,11 @@ def postgres_session():
 
     database_url = os.environ.get("DATABASE_URL", "")
     if not database_url.startswith("postgresql"):
+        if os.environ.get("CI"):
+            pytest.fail(
+                "в CI тесты допуска на PostgreSQL обязаны исполняться, а DATABASE_URL — "
+                "не PostgreSQL: SERIALIZABLE и откат пачки на SQLite проверить нечем."
+            )
         pytest.skip("PostgreSQL DATABASE_URL is required")
     tenant_id = 900_000 + secrets.randbelow(90_000)
     tag = secrets.token_hex(3)

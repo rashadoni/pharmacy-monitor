@@ -283,7 +283,7 @@ sudo journalctl -u pharmacy-monitor-run -f
 | В журнале | Что значит |
 |---|---|
 | `smtp_send recipients=N`, следом `smtp_sent_ok` | Почтовый сервер письмо принял. Дальше — не у нас: доставку смотреть в кабинете Resend |
-| `…_failed user_id=… error_type=…` | Не ушло; причина — в `error_type`, таблица ниже. События: `email_batch_failed` (письмо о прогоне и письмо админу с тика), `digest_email_failed`, `login_link_email_failed`, `email_dispatch_failed`, `alert_email_failed`, `error_email_failed`. Строки `smtp_send` перед ним может и не быть: до разговора с сервером дело не дошло |
+| `…_failed user_id=… error_type=…` | Не ушло; причина — в `error_type`, таблица ниже. События: `email_batch_failed` (письмо о прогоне и письмо админу с тика), `digest_email_failed`, `login_link_email_failed`, `email_dispatch_failed`, `alert_email_failed`, `error_email_failed`, `pharmonline_admission_mail_failed` (письмо админу о товарах, которые сбор pharmonline допустил сам). Строки `smtp_send` перед ним может и не быть: до разговора с сервером дело не дошло |
 | `email_skipped_no_smtp` | В окружении нет `SMTP_HOST` — обычно ручной запуск без загруженного env |
 | Нет ни `smtp_send`, ни `…_failed` | Письмо и не собирались слать: нет событий, порог важности получателя, включённый `daily_digest`, запуск с `--no-alerts` |
 
@@ -948,7 +948,8 @@ ssh root@13.140.186.143 '
 сбора в workflow ручной сверки. `--dry-run` тоже допускает (он и сбор пишет
 по-настоящему) и письмо админу тоже шлёт: флаг придерживает только то, что
 читает клиент, — алерты и отчёт. Транспорт — `direct`, `decodo` или `firecrawl`;
-с `crawlbase` и `scraperapi` (старые ручные workflow) сбор сам не допускает.
+с `crawlbase` и `scraperapi` сбор сам не допускает (транспорты в коде остались, а ручные
+workflow, которые ими ходили, удалены 7–8 октября 2026).
 
 **Что по-прежнему требует ручной сверки** (два workflow через Decodo): тот же
 идентификатор по новому адресу, легаси-строка со slug вместо идентификатора,
@@ -1067,8 +1068,9 @@ null`). Еженедельный сбор из GitHub Actions и workflow руч
    `_PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF`: без неё уже записанные
    допуски перестанут признаваться.
 
-**Проверки без записи** (`preflight-pharmonline-*-public-api-full.yml`)
-автодопуск не делают и на новом товаре по-прежнему пишут отказ — это больше не
+**Проверка без записи** (`preflight-pharmonline-decodo-public-api-full.yml` — из
+трёх таких файлов после 8 октября 2026 остался он один)
+автодопуск не делает и на новом товаре по-прежнему пишет отказ — это больше не
 значит, что сбор не пройдёт.
 
 **Нижняя граница каталога — следующая причина отказа.** Граница — 9000 товаров
@@ -2608,6 +2610,16 @@ Priority order in `src/scrapers/base.py`:
 **Когда.** Полный сбор pharmonline отказывает на проверке личностей: в `runs`
 статус `failed`, причина начинается с `public_api_identity_proof_failed`
 (`PharmonlinePublicAPIIdentityError: … refused persistence`).
+
+Сначала прочитать в той же причине `scheduled_admission=…`: с автодопуска
+(раздел «Сбор pharmonline: новые товары допускаются сами, остальное — ручная
+сверка») новые товары сбор допускает сам, и до ручной сверки дело доходит,
+только когда там стоит `refused(…)` — что именно сбор допускать отказался,
+названо в скобках и разобрано в том разделе. Если `scheduled_admission` в
+причине нет, допускать сбор не отказывался: либо на сервере код без автодопуска
+(`grep -c _admit_pharmonline_public_api_scheduled_identities
+/opt/pharmacy-monitor/src/main.py` даёт 0), либо проверка личностей отказала по
+другой причине — в обоих случаях ручная сверка.
 
 **Чем.** Два ручных workflow, оба исполняют код своего чекаута из чернового
 каталога на сервере, живой каталог не трогают:
