@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from src._time import utcnow
@@ -27,6 +28,7 @@ import yaml
 from dotenv import load_dotenv
 from sqlalchemy import desc, func, inspect, select, text
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import NO_VALUE
 
 load_dotenv(override=True)
 
@@ -91,6 +93,53 @@ _PHARMONLINE_PUBLIC_API_QUARANTINE_KIND = "legacy_self_redirect"
 _PHARMONLINE_PUBLIC_API_QUARANTINE_AVAILABILITY_SOURCE = "pharmonline_identity_quarantine"
 _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS = frozenset(
     {"existing_native_id", "new_public_product", "quarantined_public_product"}
+)
+# Транспорты, которыми ходит ручная сверка (workflow с двумя чтениями каталога).
+_PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS = frozenset(
+    {"crawlbase", "decodo", "scraperapi", "firecrawl"}
+)
+# Допуск, который плановый сбор записал сам, без ручной сверки. У него своя
+# версия доказательства, чтобы такие строки журнала нельзя было спутать с
+# ручными, и свои правила:
+#   * только два класса — оба не требуют свидетельства со стороны сайта;
+#     разведение (quarantined_public_product) остаётся за ручной сверкой;
+#   * транспорт — те, которыми сбор ходит без присмотра: decodo и direct у
+#     ночного таймера, direct и запасной firecrawl у еженедельного сбора из
+#     Actions (список ручной сверки старше прямого транспорта и его не знает);
+#   * preflight_run_ref — номер прогона (runs.id), а не прогона Actions;
+#   * source_manifest_sha256 — хеш плана, который этот прогон применил
+#     (манифеста исходников у планового сбора нет).
+# Код, не знающий этой версии, считает такие допуски недействительными и
+# отказывает — см. docs/RUNBOOK.md «Сбор pharmonline: новые товары допускаются
+# сами…», абзац «Откат».
+_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION = "public_api_scheduled_admission_v1"
+_PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS = frozenset({"decodo", "direct", "firecrawl"})
+_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS = frozenset(
+    {"existing_native_id", "new_public_product"}
+)
+# Версия доказательства → (допустимые транспорты, допустимые классы допуска).
+# Единственное место, где записано, что какой версии можно: по нему проверяется
+# и запись допуска, и каждая строка журнала при чтении.
+_PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF = {
+    _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION: (
+        _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS,
+        _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS,
+    ),
+    _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION: (
+        _PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS,
+        _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS,
+    ),
+}
+# Потолок автодопуска за один прогон. Недельный приток новых товаров за
+# июнь–сентябрь 2026 — от 6 до ~60 (при сборе раз в неделю это и есть размер
+# одного допуска); 150 покрывает две пропущенные недели. Больше — уже не «появились
+# новые товары», а всплеск: массовый импорт, смена идентификаторов на сайте или
+# долгий простой сбора. Его разбирает человек ручной сверкой.
+_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT = 150
+# Может только снизить потолок; 0 выключает автодопуск целиком (сбор снова
+# отказывает на первом же новом товаре, как до 2026-10-08).
+_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV = (
+    "PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT"
 )
 _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 # One-time bootstrap floor for a catalog that has never been baselined.  It
@@ -538,7 +587,7 @@ def _pharmonline_public_api_reconciliation_invalid_reason(
         return "source_manifest"
     if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256) is None:
         return "catalog_fingerprint"
-    if record.source_transport not in {"crawlbase", "decodo", "scraperapi", "firecrawl"}:
+    if record.source_transport not in _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS:
         return "transport"
     if re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None:
         return "preflight_run"
@@ -599,8 +648,14 @@ def _pharmonline_public_api_admission_invalid_reason(
     canonical_url = _canonical_pharmonline_product_url(record.public_api_canonical_url)
     if record.admission_kind not in _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS:
         return "admission_kind"
-    if record.proof_version != _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION:
+    rules = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF.get(record.proof_version)
+    if rules is None:
         return "proof_version"
+    allowed_transports, allowed_kinds = rules
+    if record.admission_kind not in allowed_kinds:
+        # Плановый сбор не разводит личности: строка «разведение + допуск
+        # планового сбора» может появиться только мимо кода.
+        return "admission_kind"
     if _PHARMONLINE_METEOR_ID_RE.fullmatch(public_external_id) is None:
         return "public_id"
     if canonical_url is None:
@@ -609,7 +664,7 @@ def _pharmonline_public_api_admission_invalid_reason(
         return "source_manifest"
     if _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(record.catalog_fingerprint_sha256) is None:
         return "catalog_fingerprint"
-    if record.source_transport not in {"crawlbase", "decodo", "scraperapi", "firecrawl"}:
+    if record.source_transport not in allowed_transports:
         return "transport"
     if re.fullmatch(r"[0-9]{1,20}", str(record.preflight_run_ref)) is None:
         return "preflight_run"
@@ -922,7 +977,12 @@ def _pharmonline_public_api_reconciliation_plan(
     api_records = _public_api_identity_records(results)
     product_statement = select(storage.Product).where(storage.Product.site == "pharmonline")
     if lock_products:
-        product_statement = product_statement.with_for_update()
+        # Блокировка строк ничего не стоит, если сами строки взяты из памяти
+        # сессии: объект, оставшийся от чтения без блокировки, отдал бы прежние
+        # идентификатор и адрес. Перечитываем из базы.
+        product_statement = product_statement.with_for_update().execution_options(
+            populate_existing=True
+        )
     all_site_products = session.scalars(product_statement).all()
     tenant_products = [product for product in all_site_products if product.tenant_id == tenant_id]
 
@@ -1276,30 +1336,30 @@ def _pharmonline_public_api_reconciliation_plan_manifest_sha256(
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
+_PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS = (
+    "target_id_cross_tenant",
+    "target_id_duplicate",
+    "legacy_url_ambiguous",
+    "legacy_url_cross_tenant",
+    "legacy_row_has_ddp_lineage",
+    "legacy_row_has_native_id",
+    "admission_url_cross_tenant",
+    "admission_url_conflict",
+    "native_id_url_rebind_unproven",
+    "reconciliation_record_conflict",
+    "admission_record_conflict",
+    "quarantine_record_conflict",
+    "trusted_identity_conflict",
+    "identity_split_prior_audit",
+    "unclassified_api_identities",
+)
+
+
 def _pharmonline_public_api_reconciliation_is_safe(metrics: dict[str, int]) -> bool:
     """Whether an exhaustive plan has no unproven or cross-tenant case."""
     if metrics.get("classified_identities") != metrics.get("api_identities"):
         return False
-    return not any(
-        metrics[key]
-        for key in (
-            "target_id_cross_tenant",
-            "target_id_duplicate",
-            "legacy_url_ambiguous",
-            "legacy_url_cross_tenant",
-            "legacy_row_has_ddp_lineage",
-            "legacy_row_has_native_id",
-            "admission_url_cross_tenant",
-            "admission_url_conflict",
-            "native_id_url_rebind_unproven",
-            "reconciliation_record_conflict",
-            "admission_record_conflict",
-            "quarantine_record_conflict",
-            "trusted_identity_conflict",
-            "identity_split_prior_audit",
-            "unclassified_api_identities",
-        )
-    )
+    return not any(metrics[key] for key in _PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS)
 
 
 def _require_pharmonline_public_api_reconciliation_proof(
@@ -1308,12 +1368,13 @@ def _require_pharmonline_public_api_reconciliation_proof(
     catalog_fingerprint_sha256: str,
     source_transport: str,
     preflight_run_ref: str,
+    allowed_transports: frozenset[str] = _PHARMONLINE_PUBLIC_API_WORKFLOW_PROOF_TRANSPORTS,
 ) -> None:
     """Validate non-secret, immutable evidence supplied by the gated workflow."""
     if (
         _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(source_manifest_sha256) is None
         or _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE.fullmatch(catalog_fingerprint_sha256) is None
-        or source_transport not in {"crawlbase", "decodo", "scraperapi", "firecrawl"}
+        or source_transport not in allowed_transports
         or re.fullmatch(r"[0-9]{1,20}", preflight_run_ref) is None
     ):
         raise PharmonlinePublicAPIReconciliationError(
@@ -1333,6 +1394,7 @@ def _apply_pharmonline_public_api_reconciliation(
     redirect_proofs: tuple[_PharmonlinePublicAPIRedirectProof, ...] = (),
     legacy_self_redirect_proofs: tuple[_PharmonlinePublicAPILegacySelfRedirectProof, ...] = (),
     expected_plan_manifest_sha256: str | None = None,
+    admission_proof_version: str,
 ) -> dict[str, int]:
     """Apply only a completely prevalidated identity recovery batch.
 
@@ -1340,12 +1402,29 @@ def _apply_pharmonline_public_api_reconciliation(
     script.  It never deletes Products; legacy rekeys preserve every linked
     record on the same primary key, and public genesis is allowed only where
     no Product identity exists in any tenant.
+
+    ``admission_proof_version`` — версия доказательства, с которой пишутся
+    допуски; умолчания нет намеренно: вызывающий обязан назвать, от чьего имени
+    пишет. Плановый сбор передаёт свою
+    (`_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION`), и тогда
+    функция применяет только допуски двух простых классов: перекодировку,
+    смену адреса и разведение она с этой версией не выполняет.
     """
+    scheduled = (
+        admission_proof_version == _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION
+    )
+    rules = _PHARMONLINE_PUBLIC_API_ADMISSION_RULES_BY_PROOF.get(admission_proof_version)
+    if rules is None:
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline reconciliation admission proof version is invalid"
+        )
+    allowed_transports, allowed_kinds = rules
     _require_pharmonline_public_api_reconciliation_proof(
         source_manifest_sha256=source_manifest_sha256,
         catalog_fingerprint_sha256=catalog_fingerprint_sha256,
         source_transport=source_transport,
         preflight_run_ref=preflight_run_ref,
+        allowed_transports=allowed_transports,
     )
     if not _pharmonline_public_api_recovery_tables_available(session):
         raise PharmonlinePublicAPIReconciliationError(
@@ -1382,6 +1461,17 @@ def _apply_pharmonline_public_api_reconciliation(
     if quarantines and source_transport != "decodo":
         raise PharmonlinePublicAPIReconciliationError(
             "public Pharmonline quarantine split requires the Decodo transport"
+        )
+    if scheduled and (
+        actions
+        or quarantines
+        or any(action.admission_kind not in allowed_kinds for action in admissions)
+    ):
+        # Вторая линия: вызывающий уже отказал бы такому плану. Здесь проверка
+        # стоит у самой записи, чтобы версия планового сбора не могла попасть
+        # на перекодировку, смену адреса или разведение ни при каком вызове.
+        raise PharmonlinePublicAPIReconciliationError(
+            "public Pharmonline scheduled admission is limited to plain admissions"
         )
 
     reconciliation_rows: list[dict[str, object]] = []
@@ -1539,20 +1629,34 @@ def _apply_pharmonline_public_api_reconciliation(
             }
         )
 
+    # Занятые идентификаторы и адреса читаем один раз на пачку и дополняем
+    # своими же вставками. Раньше каталог перечитывался на каждый новый товар —
+    # десятки секунд под блокировкой строк на пачке в сотню. Писатель в этой
+    # транзакции один (замок сбора, блокировка строк), а от чужой вставки с тем
+    # же идентификатором защищает уникальный ключ (site, external_id).
+    taken_ids: set[str] | None = None
+    taken_urls: set[str] = set()
     for action in admissions:
         if action.admission_kind not in _PHARMONLINE_PUBLIC_API_ADMISSION_KINDS:
             raise PharmonlinePublicAPIReconciliationError(
                 "public Pharmonline reconciliation admission kind is invalid"
             )
         if action.product_id is None:
-            existing_site_products = session.scalars(
-                select(storage.Product).where(storage.Product.site == "pharmonline")
-            ).all()
-            if any(
-                str(product.external_id) == action.public_api_external_id
-                or _canonical_pharmonline_product_url(product.url)
-                == action.public_api_canonical_url
-                for product in existing_site_products
+            if taken_ids is None:
+                site_rows = session.execute(
+                    select(storage.Product.external_id, storage.Product.url).where(
+                        storage.Product.site == "pharmonline"
+                    )
+                ).all()
+                taken_ids = {str(external_id) for external_id, _ in site_rows}
+                taken_urls = {
+                    canonical_url
+                    for _, url in site_rows
+                    if (canonical_url := _canonical_pharmonline_product_url(url)) is not None
+                }
+            if (
+                action.public_api_external_id in taken_ids
+                or action.public_api_canonical_url in taken_urls
             ):
                 raise PharmonlinePublicAPIReconciliationError(
                     "public Pharmonline genesis identity exists before apply"
@@ -1564,6 +1668,8 @@ def _apply_pharmonline_public_api_reconciliation(
             )
             session.add(product)
             session.flush()
+            taken_ids.add(action.public_api_external_id)
+            taken_urls.add(action.public_api_canonical_url)
         else:
             product = session.get(storage.Product, action.product_id)
             if (
@@ -1584,7 +1690,7 @@ def _apply_pharmonline_public_api_reconciliation(
                 "admission_kind": action.admission_kind,
                 "public_api_external_id": action.public_api_external_id,
                 "public_api_canonical_url": action.public_api_canonical_url,
-                "proof_version": _PHARMONLINE_PUBLIC_API_ADMISSION_PROOF_VERSION,
+                "proof_version": admission_proof_version,
                 "source_manifest_sha256": source_manifest_sha256,
                 "catalog_fingerprint_sha256": catalog_fingerprint_sha256,
                 "source_transport": source_transport,
@@ -2264,6 +2370,273 @@ def _verify_pharmonline_public_api_identities(
         tenant_id=tenant_id,
     )
     return len(api_by_id)
+
+
+def _pharmonline_public_api_scheduled_admission_limit() -> int:
+    """Сколько товаров плановый сбор может допустить сам; 0 — автодопуск выключен.
+
+    Переменная окружения может только снизить потолок. Нечитаемое значение
+    выключает автодопуск: опечатка в настройке не должна ничего допускать.
+    """
+    raw = os.environ.get(_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV, "").strip()
+    if not raw:
+        return _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT
+    if not (raw.isascii() and raw.isdigit()):
+        return 0
+    return min(int(raw), _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT)
+
+
+def _admit_pharmonline_public_api_scheduled_identities(
+    session: Session,
+    results: list[ScrapeResult],
+    *,
+    tenant_id: int,
+    run_id: int,
+    source_transport: str,
+) -> tuple[dict[str, object], list[_PharmonlinePublicAPIIdentityAdmissionAction]]:
+    """Допустить новые товары планового сбора, если весь план — простые допуски.
+
+    Ручная сверка допускает товар после двух одинаковых чтений каталога и
+    одобренного человеком плана. Плановый сбор делает это сам, но только там,
+    где свидетельство со стороны сайта не нужно вовсе:
+
+    * ``new_public_product`` — ни идентификатора, ни адреса нет ни у одного
+      тенанта: новой строке не с чем совпасть и нечью историю унаследовать;
+    * ``existing_native_id`` — строка с этим идентификатором И этим адресом уже
+      лежит у тенанта, и сайт сейчас называет ту же пару. Это строже, чем у
+      нового товара: совпали обе половины личности.
+
+    Вместо второго чтения:
+
+    * допуск и запись сбора идут из ОДНОГО чтения — того, что уже прошло
+      проверку полноты и сверку с sitemap; плану не с чем разойтись (ручная
+      сверка читает каталог сама, а сбор через полчаса читает его заново);
+    * план должен быть безопасен целиком и состоять только из этих допусков:
+      одна перекодировка, смена адреса, конфликт записей или чужой тенант — и
+      не допускается ничего;
+    * не больше потолка за прогон (всплеск — отказ, а не допуск);
+    * после допуска в той же транзакции идёт полная проверка личностей; не
+      прошла — допуски откатываются.
+
+    Транзакция та же, что у ручной сверки: SERIALIZABLE, строки товаров под
+    блокировкой, план перед записью сверяется по хешу с тем, по которому
+    принято решение.
+
+    Допуск фиксируется до записи сбора. Если сбор после этого упадёт, останутся
+    товар без цены и его допуск — то же состояние, что между ручной сверкой и
+    следующим сбором: допуск утверждает только «сайт назвал эту личность, и в
+    базе ей ничто не противоречило», а это верно и без цен. Следующий сбор
+    увидит товар доверенным и запишет цену.
+
+    Возвращает (сводка для run_quality, применённые допуски). Отказ — не
+    исключение: прогон остановит проверка личностей, с точными счётчиками.
+    """
+    from collections import Counter
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    limit = _pharmonline_public_api_scheduled_admission_limit()
+    summary: dict[str, object] = {
+        "status": "nothing_to_admit",
+        "reason": None,
+        "new_public_product": 0,
+        "existing_native_id": 0,
+        "limit": limit,
+    }
+    actions, admissions, quarantines, metrics = _pharmonline_public_api_reconciliation_plan(
+        session,
+        results,
+        tenant_id=tenant_id,
+    )
+    by_kind = Counter(action.admission_kind for action in admissions)
+    summary["new_public_product"] = by_kind.get("new_public_product", 0)
+    summary["existing_native_id"] = by_kind.get("existing_native_id", 0)
+    unsafe = {
+        key: metrics[key]
+        for key in _PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS
+        if metrics.get(key)
+    }
+    if not (actions or admissions or quarantines or unsafe):
+        return summary, []
+
+    def refused(reason: str) -> tuple[dict[str, object], list]:
+        summary.update(status="refused", reason=reason)
+        log.warning(
+            "pharmonline_public_api_scheduled_admission_refused",
+            run_id=run_id,
+            tenant_id=tenant_id,
+            reason=reason,
+            candidates=len(admissions),
+            limit=limit,
+        )
+        return summary, []
+
+    if limit < 1:
+        return refused(f"disabled:candidates={len(admissions)}")
+    if unsafe:
+        # unclassified_api_identities — сумма остальных счётчиков: каждый
+        # небезопасный случай остаётся неразобранным. Называем сам случай, а
+        # сумму — только если кроме неё сказать нечего.
+        named = {
+            key: value for key, value in unsafe.items() if key != "unclassified_api_identities"
+        } or unsafe
+        return refused(
+            "plan_unsafe:" + ",".join(f"{key}={value}" for key, value in sorted(named.items()))
+        )
+    if actions or quarantines:
+        return refused(
+            "identity_transition_required:"
+            f"legacy_rekeys={metrics['legacy_rekeys_ready']},"
+            "url_rebinds="
+            f"{metrics['native_id_url_rebind_ready'] + metrics['native_id_url_rebind_redirect_ready']},"
+            f"splits={metrics['identity_splits_ready']}"
+        )
+    if any(
+        action.admission_kind not in _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_KINDS
+        for action in admissions
+    ):
+        return refused("admission_kind")
+    if len(admissions) > limit:
+        return refused(f"limit_exceeded:candidates={len(admissions)},limit={limit}")
+    if source_transport not in _PHARMONLINE_PUBLIC_API_SCHEDULED_PROOF_TRANSPORTS:
+        return refused("transport")
+    if not _pharmonline_public_api_recovery_tables_available(session):
+        return refused("audit_schema_missing")
+    # Строка с любой записью в журналах, которую проверка при этом не считает
+    # доверенной, — это испорченное или незнакомое доказательство. Второй допуск
+    # поверх него не пишем: такое разбирает человек.
+    prior_audit_product_ids = _pharmonline_public_api_prior_audit_product_ids(
+        session,
+        tenant_id=tenant_id,
+    )
+    chained = sum(
+        1
+        for action in admissions
+        if action.product_id is not None and action.product_id in prior_audit_product_ids
+    )
+    if chained:
+        return refused(f"existing_identity_has_prior_audit={chained}")
+
+    plan_manifest_sha256 = _pharmonline_public_api_reconciliation_plan_manifest_sha256(
+        actions,
+        admissions,
+        quarantines,
+        metrics,
+    )
+    catalog_fingerprint_sha256 = _pharmonline_public_api_catalog_fingerprint(results)
+    # Решение принято на чтении без блокировок. Закрываем эту транзакцию и
+    # применяем в новой: она перечитывает план под блокировкой строк и
+    # откажет, если он успел измениться.
+    session.commit()
+    try:
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+        _apply_pharmonline_public_api_reconciliation(
+            session,
+            results,
+            tenant_id=tenant_id,
+            source_manifest_sha256=plan_manifest_sha256,
+            catalog_fingerprint_sha256=catalog_fingerprint_sha256,
+            source_transport=source_transport,
+            preflight_run_ref=str(run_id),
+            expected_plan_manifest_sha256=plan_manifest_sha256,
+            admission_proof_version=_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION,
+        )
+        _verify_pharmonline_public_api_identities(session, results, tenant_id=tenant_id)
+        session.commit()
+    except PharmonlinePublicAPIIdentityError:
+        # Дело не в новых товарах (нижняя граница каталога, конфликт записей…):
+        # допуск ничего бы не исправил. Откатываем его; причину со счётчиками
+        # назовёт проверка личностей у вызывающего.
+        session.rollback()
+        return refused("identity_proof_failed_after_admission")
+    except PharmonlinePublicAPIReconciliationError as exc:
+        session.rollback()
+        return refused(f"apply_refused:{str(exc)[:120]}")
+    except SQLAlchemyError as exc:
+        # Текст ошибки базы в причину не кладём: в нём бывают значения строк.
+        session.rollback()
+        return refused(f"apply_failed:{type(exc).__name__}")
+    except BaseException:
+        # Что бы ни случилось между первой записью и фиксацией — откат здесь.
+        # Иначе обработчик сбоя прогона, сохраняя статус, зафиксировал бы и
+        # недописанный, непроверенный допуск.
+        session.rollback()
+        raise
+
+    summary.update(
+        status="admitted",
+        proof_version=_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION,
+        source_transport=source_transport,
+        note=(
+            f"Плановый сбор сам допустил {len(admissions)} тов. pharmonline без ручной "
+            f"сверки: новых — {summary['new_public_product']}, вернувшихся под прежним "
+            f"идентификатором и адресом — {summary['existing_native_id']}."
+        ),
+    )
+    log.warning(
+        "pharmonline_public_api_scheduled_admission",
+        run_id=run_id,
+        tenant_id=tenant_id,
+        admitted=len(admissions),
+        new_public_product=summary["new_public_product"],
+        existing_native_id=summary["existing_native_id"],
+        limit=limit,
+        source_transport=source_transport,
+        proof_version=_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION,
+        catalog_fingerprint=catalog_fingerprint_sha256[:16],
+        plan_manifest=plan_manifest_sha256[:16],
+    )
+    return summary, list(admissions)
+
+
+def _mail_pharmonline_scheduled_admission_to_admins(
+    session: Session,
+    run: storage.Run,
+    admitted: list[_PharmonlinePublicAPIIdentityAdmissionAction],
+) -> dict[str, int]:
+    """Автодопуск не бывает тихим: список допущенного — письмом администраторам.
+
+    Допуски к этому моменту уже зафиксированы. Сбой почты сбор не роняет: то же
+    самое записано в журнале (`pharmonline_public_api_scheduled_admission`), в
+    run_quality прогона и в журнале допусков. Повторной отправки нет, поэтому
+    итог возвращается и кладётся в run_quality: `{"email": писем, "failed":
+    сбоев}`; оба нуля — писать было некому.
+    """
+    from src import notifications as notif_mod
+
+    try:
+        sent = notif_mod.mail_pharmonline_admission_to_admins(
+            session,
+            tenant_id=run.tenant_id,
+            run_id=run.id,
+            items=[
+                (
+                    action.admission_kind,
+                    action.public_product.name,
+                    action.public_api_canonical_url,
+                )
+                for action in admitted
+            ],
+        )
+    except Exception as e:  # noqa: BLE001
+        # Несохранённого в сессии здесь нет (допуски зафиксированы, проверка
+        # только читала), а сбой чтения получателей оставил бы транзакцию
+        # Postgres в состоянии «aborted» — и на ней упала бы запись сбора.
+        session.rollback()
+        log.warning(
+            "pharmonline_scheduled_admission_mail_failed",
+            run_id=run.id,
+            error_type=type(e).__name__,
+        )
+        return {"email": 0, "failed": 1}
+    if sent["failed"]:
+        log.warning("pharmonline_scheduled_admission_mail_failed", run_id=run.id, **sent)
+    elif sent["email"]:
+        log.info("pharmonline_scheduled_admission_mailed", run_id=run.id, **sent)
+    else:
+        log.warning("pharmonline_scheduled_admission_mail_no_recipient", run_id=run.id)
+    return sent
 
 
 def _diagnose_pharmonline_public_api_identities(
@@ -3063,7 +3436,11 @@ def persist_aloe_country_mappings(
     *,
     tenant_id: int = 1,
 ) -> int:
-    """Upsert detail-verified Aloe country dictionary discoveries."""
+    """Upsert detail-verified Aloe country dictionary discoveries.
+
+    Коммитит сам: словарь проверен по карточкам и от судьбы записи сбора не
+    зависит, а `persist_results`, упав, откатывает всё незакоммиченное.
+    """
     changed = 0
     for result in results:
         if result.site != "aloe":
@@ -3102,7 +3479,7 @@ def persist_aloe_country_mappings(
                 row.verified_at = utcnow()
                 changed += 1
     if changed:
-        session.flush()
+        session.commit()
     return changed
 
 
@@ -3580,6 +3957,84 @@ def mark_scrape_request_terminal(
     return request
 
 
+def _unsaved_column_values(instance) -> dict[str, object]:
+    """Значения колонок, изменённые на объекте и ещё не отправленные в базу.
+
+    То же, что записал бы flush: колонка, чьё значение не отличается от
+    прочитанного из базы, сюда не попадает. После упавшего flush возвращать
+    нечего — SQLAlchemy сам сбрасывает объекты сессии.
+    """
+    state = inspect(instance)
+    values: dict[str, object] = {}
+    for prop in state.mapper.column_attrs:
+        attribute = state.attrs[prop.key]
+        if attribute.history.has_changes() and attribute.loaded_value is not NO_VALUE:
+            values[prop.key] = attribute.loaded_value
+    return values
+
+
+def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, record) -> None:
+    """Записать итог упавшего прогона — на чистой транзакции.
+
+    Сначала откат, всегда. Шаг, упавший на ошибке базы, оставляет сессию с
+    транзакцией, в которой итог не записать: обработчик сбоя падал на
+    собственном commit, и прогон оставался `running`, пока его часов через
+    шесть не закрывал вотчер очереди — задним числом и без причины. Шаг,
+    упавший в коде, оставляет в сессии недоделанное, и commit итога сохранял бы
+    эту половину вместе с `failed`.
+
+    Откат стирает и то, что выставлено на самом прогоне прямо перед исключением
+    (причина отказа, `run_quality`), поэтому несохранённые поля прогона
+    переносятся через него: снимаются до отката и ставятся обратно после — до
+    `record()`, чтобы статус, выставленный перед сбоем, уступил итогу. Если
+    упал flush, переносить уже нечего: объекты сессии SQLAlchemy сбросил сам.
+    `record()` выставляет итог — статус, причину, время, заявку; commit делает
+    эта функция. `run_id` берётся у вызывающего: после упавшего flush объект
+    прогона просрочен, и чтение `run.id` само упало бы.
+
+    Попыток две: если база не приняла запись (в том числе перенесённое поле),
+    вторая пишет итог один. Если не прошла и она, прогон остаётся `running`:
+    отказ ложится в журнал строкой `run_failure_not_recorded`, а вызывающий
+    выходит с причиной, по которой упал сам прогон.
+
+    Строки журнала здесь не должны срывать запись: журнал пишет в stdout, и при
+    оборванном выводе (ssh без терминала, отменённый workflow) строка падает.
+    """
+    try:
+        unsaved = _unsaved_column_values(run)
+        try:
+            session.rollback()
+        except Exception as rollback_error:
+            # Обычно это потерянное соединение: до сервера откат не дошёл, но
+            # свою транзакцию сессия закрыла, и следующая начнётся на новом.
+            with suppress(Exception):
+                log.warning(
+                    "run_failure_rollback_failed",
+                    run_id=run_id,
+                    error=f"{type(rollback_error).__name__}: {rollback_error}",
+                )
+        try:
+            for key, value in unsaved.items():
+                setattr(run, key, value)
+            record()
+            session.commit()
+        except Exception as write_error:
+            with suppress(Exception):
+                log.warning(
+                    "run_failure_write_retried",
+                    run_id=run_id,
+                    dropped_fields=sorted(unsaved),
+                    error=f"{type(write_error).__name__}: {write_error}",
+                )
+            with suppress(Exception):
+                session.rollback()
+            record()
+            session.commit()
+    except Exception:
+        with suppress(Exception):
+            log.exception("run_failure_not_recorded", run_id=run_id)
+
+
 def run_tenant_id_for_request(session: Session, request_id: int | None) -> int:
     """Resolve CLI run ownership from an active queue request."""
     if request_id is None:
@@ -3884,6 +4339,41 @@ def _snapshot_payload_changed(last: dict | None, sp: ScrapedProduct) -> bool:
 
 
 def persist_results(
+    session: Session,
+    run: storage.Run,
+    results: list[ScrapeResult],
+    *,
+    aloe_whole_catalog: bool = False,
+) -> int:
+    """Записать сбор пачками; что и как пишется — в `_persist_chunks`.
+
+    Пачки коммитит сама функция, поэтому недописанную она сама и откатывает:
+    после любого исключения сессия остаётся рабочей, закоммиченные пачки — в
+    базе, от недописанной не остаётся ничего. Вместе с ней откатывается и то,
+    что вызывающий не закоммитил до вызова.
+
+    Раньше отката не было. Колбэк `run` зовёт запись на каждую категорию, а
+    сборщик его исключение ловит и идёт дальше: после одного сбоя базы следующие
+    категории и финальный проход падали на той же сессии, обработчик сбоя не мог
+    записать итог, и прогон оставался `running`.
+    """
+    try:
+        return _persist_chunks(session, run, results, aloe_whole_catalog=aloe_whole_catalog)
+    except Exception:
+        try:
+            session.rollback()
+        except Exception as rollback_error:
+            # Обычно это потерянное соединение: до сервера откат не дошёл, но
+            # свою транзакцию сессия закрыла. Причина сбоя — исключение записи.
+            with suppress(Exception):
+                log.warning(
+                    "persist_rollback_failed",
+                    error=f"{type(rollback_error).__name__}: {rollback_error}",
+                )
+        raise
+
+
+def _persist_chunks(
     session: Session,
     run: storage.Run,
     results: list[ScrapeResult],
@@ -5044,7 +5534,8 @@ def notify_group() -> None:
 @click.option(
     "--dry-run",
     is_flag=True,
-    help="Собрать письма и показать в логе тему, размер и число строк, ничего не отправляя",
+    help="Собрать письма и показать в логе тему, размер и число строк, ничего не отправляя; "
+    "у суточного письма — ещё числа о разнице цен и размер вложения",
 )
 @click.option(
     "--only",
@@ -5053,27 +5544,76 @@ def notify_group() -> None:
     help="Отправить только этому получателю (из включивших дайджест) — посмотреть письмо, "
     "не трогая остальных",
 )
-def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | None) -> None:
+@click.option(
+    "--locale",
+    type=click.Choice(["ru", "az", "en"]),
+    default="ru",
+    show_default=True,
+    help="Язык Excel-вложения суточного письма. Текст письма всегда русский, как у всех "
+    "писем системы; у недельного дайджеста вложения нет",
+)
+def notify_digest(
+    kind: str, tenant_id: int, dry_run: bool, only_email: str | None, locale: str
+) -> None:
     """Send digest email to opted-in users for the tenant.
 
-    Daily includes events from last 24h, weekly from last 7d. Recipients are
-    `tenant_users` with daily_digest=True / weekly_digest=True.
+    Daily — утреннее письмо: разница цен между сайтом клиента и конкурентами на
+    сейчас (числа и Excel со страницы сравнения во вложении) и события за 24
+    часа; уходит и без событий. Weekly — события за 7 дней. Получатели —
+    `tenant_users` с daily_digest=True / weekly_digest=True.
 
-    Schedule via systemd timer (see infra/systemd/pharmacy-monitor-digest@.timer).
+    Суточное письмо кончается кодом 1, если отчёт о ценах не собрался (даже
+    когда письмо с событиями ушло без него), почтовый сервер не принял письмо
+    ни у одного получателя или `--only` не нашёл такого адреса среди включивших
+    дайджест. Сначала отправляется всё, что можно.
+
+    Расписание — systemd-таймеры infra/systemd/pharmacy-monitor-digest-daily.timer
+    и pharmacy-monitor-digest-weekly.timer.
     """
     from src import notifications
 
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        send = (
-            notifications.send_daily_digest if kind == "daily" else notifications.send_weekly_digest
+        if kind == "weekly":
+            sent = notifications.send_weekly_digest(
+                s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run
+            )
+            if dry_run:
+                click.echo(f"[dry-run] {kind} digest: {sent} recipients, nothing sent")
+            else:
+                click.echo(f"OK: {kind} digest sent to {sent} recipients")
+            return
+
+        outcome = notifications.send_daily_letter(
+            s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run, locale=locale
         )
-        sent = send(s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run)
+        if only_email is not None and outcome.no_recipients:
+            # Опечатка в адресе не должна выглядеть как «письмо ушло». Сам адрес
+            # не печатаем: вывод команды маска журнала не трогает.
+            raise click.ClickException(
+                "получателя с таким адресом среди включивших суточный дайджест нет — "
+                "письмо не отправлено"
+            )
+        problems = outcome.problems
+        got = f"принято у {outcome.accepted} из {outcome.recipients} получателей"
         if dry_run:
-            click.echo(f"[dry-run] {kind} digest: {sent} recipients, nothing sent")
+            summary = f"[dry-run] daily digest: {outcome.sent} recipients, nothing sent"
+        elif not outcome.recipients:
+            summary = "OK: daily digest sent to 0 recipients"
+        elif outcome.accepted == outcome.recipients:
+            summary = f"OK: daily digest: {got}"
+        elif outcome.accepted:
+            # Без «OK»: письмо ушло не всем. Код при этом 0 — письмо ушло; о
+            # непринятых health скажет админу сам (daily_letter_partly_delivered).
+            summary = f"daily digest: {got} — кому не ушло, см. digest_email_failed в журнале"
         else:
-            click.echo(f"OK: {kind} digest sent to {sent} recipients")
+            summary = f"daily digest: {got}"
+        click.echo(summary.removeprefix("OK: ") if problems else summary)
+        if problems:
+            # Ненулевой код: юнит таймера должен показать сбой, а не тихое утро.
+            # Трассировка сбоя отчёта уже в журнале (digest_price_report_failed).
+            raise click.ClickException("; ".join(problems))
 
 
 @notify_group.command("test")
@@ -5218,6 +5758,7 @@ def ai_crawl_cmd(
         )
         session.add(run)
         session.commit()
+        run_id = run.id
         try:
             try:
                 result = asyncio.run(_run())
@@ -5265,10 +5806,14 @@ def ai_crawl_cmd(
         except RunQualityFailure as e:
             raise click.ClickException(str(e))
         except Exception as e:
-            run.status = "failed"
-            run.error_message = f"{type(e).__name__}: {e}"
-            run.finished_at = utcnow()
-            session.commit()
+            failure_message = f"{type(e).__name__}: {e}"
+
+            def record_failure() -> None:
+                run.status = "failed"
+                run.error_message = failure_message
+                run.finished_at = utcnow()
+
+            _write_failed_run_outcome(session, run, run_id, record_failure)
             raise click.ClickException(str(e))
 
 
@@ -5731,7 +6276,24 @@ def run_cmd(
                             f"{guarded_catalog_reason or 'full catalog verification failed'}"
                         )
                 if use_public_api:
+                    from src.scrapers.pharmonline_public_api import (
+                        configured_public_api_transport,
+                    )
+
+                    admission: dict[str, object] | None = None
+                    admitted: list[_PharmonlinePublicAPIIdentityAdmissionAction] = []
                     try:
+                        # Новые товары на сайте — обычное дело, а не расхождение
+                        # личностей: простые случаи сбор допускает сам, остальное
+                        # отказывает ниже, как и раньше.
+                        admission, admitted = _admit_pharmonline_public_api_scheduled_identities(
+                            session,
+                            results,
+                            tenant_id=run.tenant_id,
+                            run_id=run.id,
+                            source_transport=configured_public_api_transport(),
+                        )
+                        quality["pharmonline_identity_admission"] = admission
                         _verify_pharmonline_public_api_identities(
                             session,
                             results,
@@ -5745,6 +6307,15 @@ def run_cmd(
                         full_reason = (
                             f"public_api_identity_proof_failed:{str(exc).split(': ', 1)[-1]}"
                         )
+                        # Почему сбор не допустил сам — рядом со счётчиками: по
+                        # этой строке видно, что нужна ручная сверка и какой
+                        # именно случай её требует.
+                        admission_verdict = (
+                            f"; scheduled_admission=refused({admission['reason']})"
+                            if admission is not None and admission["status"] == "refused"
+                            else ""
+                        )
+                        full_reason += admission_verdict
                         # Колонка catalog_verification_reason — varchar(300), и
                         # обрезка приходится ровно на хвост: mismatched_urls,
                         # id_collisions, url_collisions. Именно эти счётчики и
@@ -5761,7 +6332,37 @@ def run_cmd(
                         quality["catalog_verification_reason"] = guarded_catalog_reason
                         quality["catalog_verification_reason_full"] = full_reason
                         run.run_quality = quality
+                        if admission_verdict:
+                            # Run.error_message (его показывают health и список
+                            # прогонов) берётся из текста исключения.
+                            raise PharmonlinePublicAPIIdentityError(
+                                f"{exc}{admission_verdict}"
+                            ) from exc
                         raise
+                    if admitted:
+                        # Письмо уходит и при --dry-run: флаг придерживает то,
+                        # что читает клиент (алерты, отчёт), а это служебное
+                        # сообщение о настоящей записи. С --dry-run зовут `run`
+                        # и workflow ручной сверки — допуск, сделанный там, тоже
+                        # не должен быть тихим.
+                        admission["mail"] = _mail_pharmonline_scheduled_admission_to_admins(
+                            session,
+                            run,
+                            admitted,
+                        )
+                        # Допуск зафиксирован, а запись сбора ещё впереди и может
+                        # упасть. Прогон должен показывать допуск и тогда, поэтому
+                        # отметка ставится сейчас; итог качества её заменит.
+                        # Копия — полная (те же ключи, что у любого прогона) и
+                        # отдельная: правка `quality` ниже не должна выглядеть
+                        # для ORM как «значение не изменилось».
+                        import copy
+
+                        early_quality = copy.deepcopy(quality)
+                        early_quality["full_catalog_verified"] = False
+                        early_quality["financially_eligible"] = False
+                        run.run_quality = early_quality
+                        session.commit()
             # Оба вердикта о сборе считаются до записи, а не после: кому
             # достаётся строка aloe под общим слагом, решает только сбор,
             # которому система потом поверит, — раздать строки по сбору, где
@@ -6050,19 +6651,31 @@ def run_cmd(
             if trust_context is not None:
                 trust_context.__exit__(*sys.exc_info())
                 trust_context = None
-            run.status = (
+
+            failure_status = (
                 "degraded" if isinstance(e, FullCatalogVerificationError) else "failed"
             )
-            run.error_message = f"{type(e).__name__}: {e}"
-            run.finished_at = utcnow()
-            if request_id is not None:
-                req = session.get(storage.ScrapeRequest, request_id)
-                if req is not None:
-                    req.run_id = run.id
-                    req.status = run.status
-                    req.completed_at = utcnow()
-            session.commit()
-            log.exception("run_failed", run_id=run_id)
+            failure_message = f"{type(e).__name__}: {e}"
+
+            def record_failure() -> None:
+                """Всё, что обработчик добавляет к итогу, ставится здесь:
+                функция вызывается после отката, на чистой транзакции."""
+                run.status = failure_status
+                run.error_message = failure_message
+                run.finished_at = utcnow()
+                if request_id is not None:
+                    req = session.get(storage.ScrapeRequest, request_id)
+                    if req is not None:
+                        req.run_id = run_id
+                        req.status = failure_status
+                        req.completed_at = utcnow()
+
+            # Причина — в журнал до записи итога: если база не примет и итог,
+            # строка останется. Сбой самой строки (оборванный вывод) запись
+            # итога не срывает.
+            with suppress(Exception):
+                log.exception("run_failed", run_id=run_id)
+            _write_failed_run_outcome(session, run, run_id, record_failure)
             # click печатает этот текст сам, мимо маски журнала.
             from src.logging_setup import mask_addresses
 
@@ -6112,6 +6725,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
         )
         session.add(run)
         session.commit()
+        run_id = run.id
         try:
             slugs_by_site = {
                 s: watchlist.categories_for_site(session, s, only_category_id=category_id)
@@ -6172,10 +6786,14 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
         except RunQualityFailure as e:
             raise click.ClickException(str(e))
         except Exception as e:
-            run.status = "failed"
-            run.error_message = str(e)
-            run.finished_at = utcnow()
-            session.commit()
+            failure_message = str(e)
+
+            def record_failure() -> None:
+                run.status = "failed"
+                run.error_message = failure_message
+                run.finished_at = utcnow()
+
+            _write_failed_run_outcome(session, run, run_id, record_failure)
             raise click.ClickException(str(e))
 
 

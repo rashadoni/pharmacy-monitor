@@ -25,7 +25,10 @@ Final pre-flight checklist + DNS cutover + 72h on-call.
 >   is empty, `pharmacy-monitor-telegram-bot` is disabled).
 > - "Daily digest email arrived at 08:00" under "T+24h":
 >   `pharmacy-monitor-digest@daily.timer` is disabled; the timer that is enabled
->   is the weekly digest.
+>   is the weekly digest. (2026-10-13: a daily letter exists again under a
+>   different unit, `pharmacy-monitor-digest-daily.timer`, 05:00 UTC = 09:00
+>   Baku; it is in Git, and on the server only once root installs it —
+>   `docs/RUNBOOK.md`, «Утреннее письмо с разницей цен».)
 > - Checks that expect a scrape every day — the `run_ok` grep under "T-3 days",
 >   "First scheduled scrape ran (or upcoming within 24h)" under "T+1h",
 >   "succeeded for all 3 sites" under "T+24h": the full scan is weekly

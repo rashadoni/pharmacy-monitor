@@ -49,6 +49,7 @@ from src import (
     tenants,
 )
 from src._time import utcnow
+from tests.test_daily_price_letter import _pair, _trusted_run
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 ADDRESS = "viewer@client.example"
@@ -451,6 +452,18 @@ def test_per_user_digest_failure_log_carries_no_address(session, user):
     with capture_logs() as logs:
         sent = notifications.send_weekly_digest(session, tenant_id=user.tenant_id)
     assert sent == 0
+    _assert_clean(logs, events={"digest_email_failed"}, user_id=user.id)
+
+
+def test_morning_letter_failure_log_carries_no_address(session, user):
+    """Суточное письмо несёт отчёт о ценах и вложение; сбой отправки пишет тот же обработчик."""
+    user.daily_digest = True
+    _pair(session, _trusted_run(session), "Kreon 25000", {"pharmonline": 10.0, "aloe": 8.0})
+    with capture_logs() as logs:
+        sent = notifications.send_daily_digest(session, tenant_id=user.tenant_id)
+    assert sent == 0
+    # Письмо было с отчётом: отказ пришёл на отправке с вложением.
+    assert [entry["differing"] for entry in logs if entry["event"] == "digest_price_report"] == [1]
     _assert_clean(logs, events={"digest_email_failed"}, user_id=user.id)
 
 
