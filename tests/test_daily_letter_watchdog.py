@@ -17,18 +17,18 @@ from __future__ import annotations
 
 import builtins
 import json
+import os
 import re
+import stat
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
-from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 from structlog.testing import capture_logs
 
-from src import api as api_module
 from src import (
     comparison_rows,
     daily_letter_state,
@@ -197,23 +197,38 @@ def test_run_without_subscribers_is_recorded_too(setup, at_eight):
     )
 
 
-def test_dashboard_button_mailing_is_recorded(setup, at_eight, monkeypatch):
-    """Кнопка «отправить дайджест» — тоже настоящая рассылка."""
-    if not api_module._JWT_AVAILABLE:
-        pytest.skip("python-jose not installed")
-    monkeypatch.setenv("JWT_SECRET", "test-secret-very-long-not-for-prod-only")
+def test_letter_to_one_user_by_id_is_not_a_mailing(setup, at_eight):
+    """Письмо одному пользователю мимо подписки (кнопка «тестовый дайджест» в
+    дашборде) клиенту не уходит — и записи для сторожа не оставляет, даже когда
+    почтовый сервер его не принял. Саму кнопку проверяет tests/test_daily_price_letter.py."""
+    s = setup
+    _reader(s)
+    admin = _reader(s, email="admin@example.test", role="admin", daily_digest=False)
+    _mixed_catalog(s, _trusted_run(s))
+    _mailed(ago=timedelta(hours=3))
+    before = daily_letter_state.state_file().read_text(encoding="utf-8")
+
+    with _mail_server(accepts=False) as mock_email:
+        outcome = notifications.send_daily_letter(s, tenant_id=1, only_user_id=admin.id)
+
+    assert [call.kwargs["to"] for call in mock_email.call_args_list] == [["admin@example.test"]]
+    assert (outcome.recipients, outcome.accepted) == (1, 0)
+    assert daily_letter_state.state_file().read_text(encoding="utf-8") == before
+
+
+def test_user_of_another_tenant_cannot_be_mailed_by_id(setup):
+    """Отбор по id не выходит за арендатора, для которого собирается письмо."""
     s = setup
     _reader(s)
     _mixed_catalog(s, _trusted_run(s))
-    admin = _reader(s, email="admin@example.test", role="admin", daily_digest=False)
-    client = TestClient(api_module.app)
-    client.get(f"/auth/verify?token={tenants.issue_magic_token(s, admin.email)}")
+    s.add(storage.Tenant(id=2, slug="second", name="Second", client_site="aloe"))
+    s.flush()
+    outsider = _reader(s, tenant_id=2, email="outsider@example.test", daily_digest=False)
 
-    with _mail_server():
-        response = client.post("/api/v1/dash/digest/send-test?kind=daily")
+    with _mail_server() as mock_email:
+        outcome = notifications.send_daily_letter(s, tenant_id=1, only_user_id=outsider.id)
 
-    assert response.status_code == 200, response.text
-    assert daily_letter_state.last_mailing(1).accepted == 1
+    assert not mock_email.called and outcome.no_recipients
 
 
 def test_weekly_digest_leaves_no_record(setup):
@@ -283,6 +298,21 @@ def test_record_starts_over_from_a_damaged_file():
     _mailed(ago=timedelta(hours=1))
 
     assert daily_letter_state.last_mailing(1).report == "ok"
+
+
+def test_state_file_is_readable_by_whoever_runs_health():
+    """Временный файл создаётся 0600. Запись, сделанную из-под root, health под pm
+    не прочёл бы — а закрытого в файле нет: время и числа. Права ставятся явно и
+    от umask запускающего не зависят."""
+    previous = os.umask(0o077)
+    try:
+        _mailed(ago=timedelta(hours=1))
+        _mailed(ago=timedelta(minutes=5))  # и при замене существующего файла
+    finally:
+        os.umask(previous)
+
+    mode = stat.S_IMODE(daily_letter_state.state_file().stat().st_mode)
+    assert mode == 0o644, oct(mode)
 
 
 def test_state_file_can_be_moved_with_the_environment(monkeypatch, tmp_path):
@@ -395,9 +425,24 @@ def test_letter_nobody_received_is_critical(setup, at_eight):
     assert "digest_email_failed" in issue.message and "email_skipped_no_smtp" in issue.message
 
 
-def test_letter_one_of_two_received_is_not_an_incident(setup, at_eight):
+def test_letter_refused_for_some_recipients_is_a_warning(setup, at_eight):
+    """Подписаны админ и клиент; клиенту сервер отказал, админ свою копию получил и
+    уверен, что всё в порядке. Ради этого случая сторож и заведён."""
     _reader(setup)
-    _mailed(ago=timedelta(hours=3), recipients=2, accepted=1)
+    _mailed(ago=timedelta(hours=3), recipients=3, accepted=1)
+
+    (issue,) = _letter_issues(setup)
+    assert (issue.severity, issue.code) == ("warning", "daily_letter_partly_delivered")
+    assert "14.10 05:00 UTC почтовый сервер не принял у 2 из 3 получателей" in issue.message
+    # Кому именно — в журнале, по номеру пользователя; адресов в тревоге нет.
+    assert "user_id в событиях digest_email_failed" in issue.message
+    assert "journalctl -u pharmacy-monitor-digest-daily" in issue.message
+    assert "@" not in issue.message
+
+
+def test_letter_everyone_received_is_healthy(setup, at_eight):
+    _reader(setup)
+    _mailed(ago=timedelta(hours=3), recipients=3, accepted=3)
 
     assert _letter_issues(setup) == []
 
@@ -428,14 +473,96 @@ def test_broken_report_in_the_last_mailing(setup, at_eight, recipients, accepted
     assert "digest_price_report_failed" in issue.message
 
 
-@pytest.mark.parametrize(
-    "report", ["skipped:no_successful_run", "skipped:no_comparison_rows", "skipped:no_recipients"]
-)
-def test_morning_with_nothing_to_send_is_not_an_incident(setup, at_eight, report):
+def test_run_that_had_nobody_to_mail_is_not_an_incident(setup, at_eight):
+    """Подписку включили после утреннего запуска: тому запуску слать было некому."""
     _reader(setup)
-    _mailed(ago=timedelta(hours=3), recipients=0, accepted=0, report=report)
+    _mailed(ago=timedelta(hours=3), recipients=0, accepted=0, report="skipped:no_recipients")
 
     assert _letter_issues(setup) == []
+
+
+@pytest.mark.parametrize(
+    ("reason", "says"),
+    [
+        ("full_catalog_trust_not_ready", "финансовые сравнения приостановлены политикой"),
+        ("no_successful_run", "успешного сбора ещё не было"),
+        ("no_comparison_rows", "в сравнении нет ни одной строки"),
+        ("some_future_reason", "some_future_reason"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("recipients", "outcome"),
+    [
+        (2, "письмо ушло без чисел и без файла"),
+        (0, "письма не было вовсе — событий за сутки тоже нет"),
+    ],
+    ids=["events-letter-went", "no-letter-at-all"],
+)
+def test_report_skipped_for_a_known_reason_is_a_warning(
+    setup, at_eight, reason, says, recipients, outcome
+):
+    """Отчёта нет не из-за сбоя, а по известной причине — но клиент ждёт именно
+    его, а такое утро повторяется, пока причина не снята. Молчать об этом днями
+    нельзя: команда кончается кодом 0."""
+    _reader(setup)
+    _mailed(
+        ago=timedelta(hours=3),
+        recipients=recipients,
+        accepted=recipients,
+        report=f"skipped:{reason}",
+    )
+
+    (issue,) = _letter_issues(setup)
+    assert (issue.severity, issue.code) == ("warning", "daily_letter_report_skipped")
+    assert f"В утреннем письме 14.10 05:00 UTC нет отчёта о разнице цен: {says}" in issue.message
+    assert outcome in issue.message
+    assert "digest_price_report_skipped" in issue.message
+
+
+def test_report_and_delivery_are_reported_side_by_side(setup, at_eight):
+    """Что с отчётом и что с доставкой — два разных вопроса, и ответа бывает два."""
+    _reader(setup)
+
+    _mailed(ago=timedelta(hours=3), recipients=2, accepted=0, report="skipped:no_comparison_rows")
+    assert _codes(_letter_issues(setup)) == [
+        ("warning", "daily_letter_report_skipped"),
+        ("critical", "daily_letter_not_delivered"),
+    ]
+
+    _mailed(ago=timedelta(hours=3), recipients=2, accepted=1, report="skipped:no_comparison_rows")
+    assert _codes(_letter_issues(setup)) == [
+        ("warning", "daily_letter_report_skipped"),
+        ("warning", "daily_letter_partly_delivered"),
+    ]
+
+    _mailed(ago=timedelta(hours=3), recipients=2, accepted=1, report="failed:KeyError")
+    assert _codes(_letter_issues(setup)) == [
+        ("warning", "daily_letter_report_failed"),
+        ("warning", "daily_letter_partly_delivered"),
+    ]
+
+    # У сломанного отчёта «никто не получил» сказано в его же строке — второй нет.
+    _mailed(ago=timedelta(hours=3), recipients=2, accepted=0, report="failed:KeyError")
+    assert _codes(_letter_issues(setup)) == [("critical", "daily_letter_report_failed")]
+
+
+def test_paused_comparison_without_events_is_noticed_the_same_morning(setup, at_eight, monkeypatch):
+    """Политика в enforce без подтверждённого каталога, событий нет: письма не будет
+    вовсе, команда кончится кодом 0 — и так каждое утро. Сторож это говорит."""
+    s = setup
+    _reader(s)
+    _mixed_catalog(s, _trusted_run(s))
+    monkeypatch.setenv("COUNTRY_IDENTITY_POLICY", "enforce")
+
+    with _mail_server() as mock_email:
+        result = CliRunner().invoke(cli, ["notify", "digest", "daily"])
+
+    assert result.exit_code == 0 and not mock_email.called
+    assert daily_letter_state.last_mailing(1).report == "skipped:full_catalog_trust_not_ready"
+    (issue,) = _letter_issues(s)
+    assert (issue.severity, issue.code) == ("warning", "daily_letter_report_skipped")
+    assert "страница сравнения в это время отвечает 503" in issue.message
+    assert "письма не было вовсе" in issue.message
 
 
 def test_overdue_outranks_what_the_old_mailing_looked_like(setup, at_eight):
@@ -451,6 +578,24 @@ def test_record_of_another_tenant_is_not_ours(setup, at_eight):
     daily_letter_state.record(2, at=NOW - timedelta(days=9), recipients=1, accepted=0, report="ok")
 
     assert _letter_issues(setup) == []
+
+
+def test_subscribers_of_another_tenant_do_not_arm_the_watchdog(setup, at_eight):
+    """У первого арендатора подписчиков нет — его давняя запись не тревога, сколько
+    бы подписчиков ни было у второго."""
+    s = setup
+    tenants.get_or_create_default(s)
+    s.add(storage.Tenant(id=2, slug="second", name="Second", client_site="aloe"))
+    s.flush()
+    _reader(s, tenant_id=2, email="second-reader@example.test")
+    _mailed(ago=timedelta(days=5), recipients=1, accepted=0, report="failed:KeyError")
+
+    assert _letter_issues(s) == []
+    # А для второго те же подписчики проверку включают: смотрится его запись.
+    daily_letter_state.record(2, at=NOW - timedelta(days=5), recipients=1, accepted=1, report="ok")
+    assert _codes(health._check_daily_letter(s, tenant_id=2)) == [
+        ("critical", "daily_letter_overdue")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -552,6 +697,45 @@ def test_health_check_command_mails_the_admin_once_and_reports_recovery(setup, t
     assert [letter["subject"] for letter in mailed][1:] == ["Pharmacy Monitor — RECOVERED"]
 
 
+def test_admin_learns_that_the_client_did_not_get_the_letter(setup, tmp_path):
+    """Клиенту отказали, админу письмо принято: команда кончилась кодом 0, а health
+    всё равно пишет админу — warning с числом непринятых."""
+    s = setup
+    _healthy_catalog(s)
+    client_user = _reader(s)
+    _reader(s, email="admin@example.test", role="admin")
+
+    def refuse_the_client(*, to, **kwargs):
+        if to == [client_user.email]:
+            raise RuntimeError("{'reader@example.test': (550, b'5.1.1 mailbox unavailable')}")
+        return True
+
+    with patch("src.notifier.send_email", side_effect=refuse_the_client):
+        result = CliRunner().invoke(cli, ["notify", "digest", "daily"])
+    assert result.exit_code == 0, result.output
+    assert "daily digest: принято у 1 из 2 получателей" in result.output
+
+    mailed = []
+    with patch.object(notifier, "send_email", lambda **kwargs: mailed.append(kwargs) or True):
+        checked = CliRunner().invoke(
+            cli,
+            [
+                "health-check",
+                "--alert-email",
+                "--quiet-on-ok",
+                "--alert-state-file",
+                str(tmp_path / "health_alert_state.json"),
+            ],
+        )
+
+    assert checked.exit_code == 1, checked.output
+    assert "[warning] daily_letter_partly_delivered" in checked.output
+    (alert,) = mailed
+    assert alert["subject"] == "Pharmacy Monitor — WARNING"
+    assert "почтовый сервер не принял у 1 из 2 получателей" in alert["html_body"]
+    assert "@" not in alert["html_body"] and "@" not in checked.output
+
+
 def test_same_letter_incident_is_one_incident_and_a_different_one_is_new(setup, at_eight):
     """Письмо админу — раз на инцидент: час спустя подпись та же, другая беда — новая."""
     _reader(setup)
@@ -570,7 +754,15 @@ def test_same_letter_incident_is_one_incident_and_a_different_one_is_new(setup, 
     _mailed(ago=timedelta(hours=3), recipients=1, accepted=1, report="failed:KeyError")
     report_failed = signature()
     _mailed(ago=timedelta(hours=3), recipients=1, accepted=0, report="failed:KeyError")
-    assert len({overdue, not_delivered, report_failed, signature()}) == 4
+    never_sent = signature()
+    _mailed(ago=timedelta(hours=3), recipients=2, accepted=1)
+    partly = signature()
+    _mailed(ago=timedelta(hours=3), recipients=0, accepted=0, report="skipped:no_comparison_rows")
+    no_rows = signature()
+    # Причина пропуска отчёта сменилась — это уже другой инцидент.
+    _mailed(ago=timedelta(hours=3), recipients=0, accepted=0, report="skipped:no_successful_run")
+    kinds = {overdue, not_delivered, report_failed, never_sent, partly, no_rows, signature()}
+    assert len(kinds) == 7
 
 
 # ─── Растяжки на юниты в infra/systemd ───────────────────────────────────────
@@ -611,7 +803,6 @@ def test_threshold_fits_a_letter_that_goes_out_once_a_day():
     "unit_name",
     [
         "pharmacy-monitor-digest-daily.service",  # пишет запись
-        "pharmacy-monitor-api.service",  # пишет запись: кнопка в дашборде
         "pharmacy-monitor-health.service",  # читает запись
     ],
 )

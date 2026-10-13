@@ -7,11 +7,12 @@
 (`health._check_daily_letter`) и поднимает тревогу тем же письмом админу, что и
 об остальном.
 
-Файл, а не таблица: схему базы ради сторожа не меняем. Пишут его команда письма
-и API (кнопка «отправить дайджест»), читает health — все под одним пользователем
-и из одного рабочего каталога, с записью в `data/` (юниты в infra/systemd; на это
-стоит растяжка в tests/test_daily_letter_watchdog.py). Адресов в файле нет:
-только время, числа и класс ошибки.
+Файл, а не таблица: схему базы ради сторожа не меняем. Пишет его команда письма
+(таймер или ручной запуск), читает health — под одним пользователем и из одного
+рабочего каталога, с записью в `data/` (юниты в infra/systemd; на это стоит
+растяжка в tests/test_daily_letter_watchdog.py). Письмо одному получателю —
+`--only` и кнопка «тестовый дайджест» в дашборде — записи не оставляет. Адресов
+в файле нет: только время, числа и класс ошибки.
 """
 
 from __future__ import annotations
@@ -41,7 +42,14 @@ DEFAULT_STATE_FILE = "data/daily_letter_state.json"
 MAX_AGE_HOURS = 26
 
 REPORT_OK = "ok"
+# Отчёт не строился, потому что письмо некому слать: подписчиков нет (или
+# `--only` никого не нашёл). Единственный «пропуск», который не проблема.
+REPORT_NO_RECIPIENTS = "skipped:no_recipients"
 _REPORT_RE = re.compile(r"ok|skipped:[a-z0-9_]+|failed:[A-Za-z_][A-Za-z0-9_]*")
+# В файле нет ничего закрытого — время и числа. Читать его должен health под
+# своим пользователем, кто бы ни запустил рассылку: временный файл создаётся
+# 0600, и запись, сделанную из-под root, health под pm иначе не прочёл бы.
+_STATE_FILE_MODE = 0o644
 
 
 def report_skipped(reason: str) -> str:
@@ -72,6 +80,12 @@ class Mailing:
         """Класс ошибки, на которой упала сборка отчёта; None — не падала."""
         kind, _, error_type = self.report.partition(":")
         return error_type if kind == "failed" else None
+
+    @property
+    def skipped_report(self) -> str | None:
+        """Причина, по которой отчёта в письме не было; None — был или упал."""
+        kind, _, reason = self.report.partition(":")
+        return reason if kind == "skipped" else None
 
 
 def state_file() -> Path:
@@ -113,6 +127,7 @@ def record(tenant_id: int, *, at: datetime, recipients: int, accepted: int, repo
             json.dump({"version": 1, "tenants": tenants}, temp_file, sort_keys=True, indent=1)
             temp_file.flush()
             os.fsync(temp_file.fileno())
+        os.chmod(temp_path, _STATE_FILE_MODE)
         os.replace(temp_path, path)
         temp_path = None
         return True

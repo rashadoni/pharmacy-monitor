@@ -76,7 +76,7 @@ def test_unit_command_runs_as_written(monkeypatch, db_session):
         result = CliRunner().invoke(cli, _exec_args())
 
     assert result.exit_code == 0, result.output
-    assert "OK: daily digest sent to 1 recipients" in result.output
+    assert "OK: daily digest: принято у 1 из 1 получателей" in result.output
     book, file_name = _book(mock_email.call_args)
     assert file_name.startswith("qiymet-ferqleri-") and file_name.endswith(".xlsx")
     assert book.sheetnames[0] == comparison_export.strings("az")["sheet_diff"]

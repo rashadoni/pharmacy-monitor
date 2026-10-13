@@ -1865,10 +1865,13 @@ def dash_digest_send_test(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """Отправить test digest всем получателям с `daily_digest=true`.
+    """Тестовый дайджест из меню Quick Actions. Только admin.
 
-    Используется из Quick Actions меню. Тот же код что и cron-таймер,
-    просто on-demand. Только admin.
+    Суточный — утреннее письмо с разницей цен и Excel — уходит ТОЛЬКО тому, кто
+    нажал кнопку, подписан он на суточный дайджест или нет: подписчики
+    (клиент) его не получают, запись сторожа утреннего письма не меняется.
+    Письмо собирает тот же код, что и таймер. Недельный идёт по-прежнему всем
+    подписанным на недельный.
     """
     if user.role != "admin":
         raise HTTPException(403, "Admin role required")
@@ -1878,7 +1881,7 @@ def dash_digest_send_test(
 
     try:
         count = (
-            notifications.send_daily_digest(db, tenant_id=user.tenant_id)
+            notifications.send_daily_digest(db, tenant_id=user.tenant_id, only_user_id=user.id)
             if kind == "daily"
             else notifications.send_weekly_digest(db, tenant_id=user.tenant_id)
         )

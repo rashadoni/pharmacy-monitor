@@ -67,16 +67,17 @@ def setup(monkeypatch, db_session):
     return db_session
 
 
-def _reader(s, **fields) -> storage.TenantUser:
+def _reader(s, *, tenant_id: int | None = None, **fields) -> storage.TenantUser:
     """Сотрудник клиента с включённым суточным дайджестом."""
-    tenant = tenants.get_or_create_default(s)
+    if tenant_id is None:
+        tenant_id = tenants.get_or_create_default(s).id
     defaults = {
         "email": "reader@example.test",
         "role": "viewer",
         "is_active": True,
         "daily_digest": True,
     }
-    user = storage.TenantUser(tenant_id=tenant.id, created_at=utcnow(), **{**defaults, **fields})
+    user = storage.TenantUser(tenant_id=tenant_id, created_at=utcnow(), **{**defaults, **fields})
     s.add(user)
     s.commit()
     return user
@@ -112,9 +113,18 @@ def _trusted_run(
     return run
 
 
-def _pair(s, run, name: str, prices: dict[str, float], *, stale=(), tenant_id: int = 1) -> None:
+def _pair(
+    s,
+    run,
+    name: str,
+    prices: dict[str, float],
+    *,
+    stale=(),
+    tenant_id: int = 1,
+    confidence: float = 1.0,
+) -> None:
     """Пара товаров на сайтах с ценами; `stale` — сайты, где товар давно не видели."""
-    match = storage.Match(tenant_id=tenant_id, canonical_name=name, confidence=1.0)
+    match = storage.Match(tenant_id=tenant_id, canonical_name=name, confidence=confidence)
     s.add(match)
     s.flush()
     for site, price in prices.items():
@@ -158,7 +168,14 @@ def _mixed_catalog(s, run) -> None:
     _pair(s, run, "Один сайт", {"pharmonline": 3.0})
 
 
-def _event(s, run, title: str = "Kreon 25000", severity: str = "critical") -> None:
+def _event(
+    s,
+    run,
+    title: str = "Kreon 25000",
+    severity: str = "critical",
+    *,
+    ago: timedelta = timedelta(0),
+) -> None:
     s.add(
         storage.AlertEvent(
             rule_type="undercut_threshold",
@@ -167,7 +184,7 @@ def _event(s, run, title: str = "Kreon 25000", severity: str = "critical") -> No
             title=title,
             detail=f"detail of {title}",
             tenant_id=run.tenant_id,
-            created_at=utcnow(),
+            created_at=utcnow() - ago,
             payload={"site": "aloe", "source_run_id": run.id},
         )
     )
@@ -235,13 +252,13 @@ def test_letter_numbers_can_be_recounted_from_the_attached_file(setup, reader):
         positions.count("Самая высокая") + positions.count("Посередине")
     )
     assert _number(letter, "на Pharmonline цена самая низкая") == positions.count("Самая низкая")
-    assert _number(letter, "свежей цены Pharmonline нет — различаются цены конкурентов") == (
-        positions.count(None)
-    )
+    assert _number(
+        letter, "цена Pharmonline в сравнение не вошла — различаются цены конкурентов"
+    ) == positions.count(None)
     assert _number(letter, "Цена одинаковая") == (
         [row[8] for row in everything].count("Цена одинаковая")
     )
-    assert _number(letter, "Сравнить не с чем: свежая цена только на одном сайте") == 1
+    assert _number(letter, "Сравнить не с чем: свежая цена меньше чем на двух сайтах") == 1
     # И сами значения — чтобы совпадение не было совпадением двух нулей.
     assert (positions.count("Самая низкая"), positions.count(None)) == (2, 2)
     assert positions.count("Самая высокая") + positions.count("Посередине") == 2
@@ -275,6 +292,67 @@ def test_a_stale_price_is_not_a_difference(setup, reader):
     assert _number(letter, "Цена одинаковая") == 1
     assert _body_rows(book.worksheets[0]) == []
     assert calls[0].kwargs["subject"].endswith(": различий нет")
+
+
+def test_client_price_thrown_out_as_an_outlier_is_not_called_a_missing_price(setup, reader):
+    """Цена клиента есть и свежая, но в разы ниже остальных: сборка строк убирает её
+    как явную ошибку. В письме это «в сравнение не вошла», а не «свежей цены нет»,
+    и не «у клиента дешевле всех»."""
+    s = setup
+    run = _trusted_run(s)
+    _pair(s, run, "Явная ошибка в цене", {"pharmonline": 0.5, "aptekonline": 10.0, "aloe": 11.0})
+
+    _sent, calls = _send_daily(s)
+
+    letter = _text(calls[0].kwargs["html_body"])
+    assert _number(letter, "Цена на сайтах различается") == 1
+    assert (
+        _number(letter, "цена Pharmonline в сравнение не вошла — различаются цены конкурентов") == 1
+    )
+    assert _number(letter, "на Pharmonline цена самая низкая") == 0
+    assert "свежей цены Pharmonline нет" not in letter
+    # Мелкая строка под числами называет все три случая.
+    assert (
+        "Цена сайта в сравнение не входит, если его товара в паре нет, если сайт не показывал "
+        "товар больше 14 дней или если цена отброшена как явная ошибка"
+    ) in letter
+    # В файле у этой строки цены клиента тоже нет, и позиция пуста.
+    book, _name = _book(calls[0])
+    (row,) = _body_rows(book.worksheets[0])
+    assert (row[2], row[3], row[4], row[8]) == (None, 10.0, 11.0, None)
+
+
+def test_nothing_to_compare_covers_no_fresh_price_at_all(setup, reader):
+    """«Меньше чем на двух сайтах» — это и одна свежая цена, и ни одной."""
+    s = setup
+    run = _trusted_run(s)
+    _pair(s, run, "Свежая одна", {"pharmonline": 5.0, "aloe": 9.0}, stale=("aloe",))
+    _pair(s, run, "Свежих нет", {"pharmonline": 5.0, "aloe": 9.0}, stale=("pharmonline", "aloe"))
+    _pair(s, run, "Обычная", {"pharmonline": 5.0, "aloe": 9.0})
+
+    _sent, calls = _send_daily(s)
+
+    letter = _text(calls[0].kwargs["html_body"])
+    assert _number(letter, "Сравнить не с чем: свежая цена меньше чем на двух сайтах") == 2
+    assert "только на одном сайте" not in letter
+    assert _number(letter, "Товаров в сравнении") == 3
+
+
+def test_pairs_below_the_page_confidence_floor_are_not_in_the_letter(setup, reader):
+    """Письмо берёт пары с той же достоверностью, что страница сравнения: от 0.70."""
+    s = setup
+    run = _trusted_run(s)
+    _pair(s, run, "Надёжная пара", {"pharmonline": 10.0, "aloe": 8.0}, confidence=0.70)
+    # Цены обычные: строку отсекает именно достоверность, а не фильтр выбросов.
+    _pair(s, run, "Сомнительная пара", {"pharmonline": 10.0, "aloe": 5.0}, confidence=0.69)
+
+    _sent, calls = _send_daily(s)
+
+    book, _name = _book(calls[0])
+    assert [row[0] for row in _body_rows(book.worksheets[1])] == ["Надёжная пара"]
+    letter = _text(calls[0].kwargs["html_body"])
+    assert _number(letter, "Товаров в сравнении") == 1
+    assert _number(letter, "Цена на сайтах различается") == 1
 
 
 def test_letter_has_no_list_of_the_biggest_gaps(setup, reader):
@@ -402,6 +480,80 @@ def test_locale_changes_the_attachment_and_not_the_letter(setup, reader):
     assert calls[0].kwargs["subject"].startswith("Pharmacy Monitor — цены на ")
 
 
+def _second_tenant(s) -> storage.TenantUser:
+    """Второй арендатор со своим сайтом клиента (aloe), подписчиком, сбором и парами."""
+    s.add(storage.Tenant(id=2, slug="second", name="Second", client_site="aloe"))
+    s.flush()
+    subscriber = _reader(s, tenant_id=2, email="second-reader@example.test")
+    run = _trusted_run(s, tenant_id=2, finished_at=MORNING - timedelta(hours=3))
+    # По одному товару на каждую часть разбивки — если считать её для aloe.
+    # Для pharmonline те же строки дали бы «дешевле всех» 2, «конкурент дешевле» 1, «не вошла» 0.
+    _pair(s, run, "Второй: aloe дешевле", {"pharmonline": 10.0, "aloe": 8.0}, tenant_id=2)
+    _pair(s, run, "Второй: aloe дороже", {"pharmonline": 8.0, "aloe": 10.0}, tenant_id=2)
+    _pair(s, run, "Второй: без aloe", {"pharmonline": 5.0, "aptekonline": 6.0}, tenant_id=2)
+    return subscriber
+
+
+def test_each_tenant_gets_a_letter_built_from_its_own_data(setup, reader, monkeypatch):
+    """Строки сравнения, сайт клиента, возраст данных и получатели — всё своё у
+    каждого арендатора."""
+    s = setup
+    monkeypatch.setattr(notifications, "utcnow", lambda: MORNING)
+    first_run = _trusted_run(s, finished_at=MORNING - timedelta(hours=5))
+    _mixed_catalog(s, first_run)
+    _second_tenant(s)
+    # Событие первого арендатора, в пределах суток от «сейчас» письма.
+    s.add(
+        storage.AlertEvent(
+            rule_type="undercut_threshold",
+            dedup_key="first-tenant-event",
+            severity="critical",
+            title="Событие первого арендатора",
+            tenant_id=1,
+            created_at=MORNING - timedelta(hours=2),
+            payload={"source_run_id": first_run.id},
+        )
+    )
+    s.commit()
+
+    with _mail_server() as mock_email:
+        assert notifications.send_daily_digest(s, tenant_id=2) == 1
+
+    (call,) = mock_email.call_args_list
+    assert call.kwargs["to"] == ["second-reader@example.test"]
+    letter = _text(call.kwargs["html_body"])
+    book, _name = _book(call)
+    # Строки — второго арендатора, и только его.
+    assert {row[0] for row in _body_rows(book.worksheets[1])} == {
+        "Второй: aloe дешевле",
+        "Второй: aloe дороже",
+        "Второй: без aloe",
+    }
+    assert _number(letter, "Товаров в сравнении") == 3
+    # Разбивка — для его сайта клиента.
+    assert "Aloe в сравнении с Pharmonline и Aptekonline" in letter
+    assert _number(letter, "на Aloe цена самая низкая") == 1
+    assert _number(letter, "у конкурента дешевле, чем на Aloe") == 1
+    assert _number(letter, "цена Aloe в сравнение не вошла — различаются цены конкурентов") == 1
+    assert "чем на Pharmonline" not in letter
+    # Возраст данных — по его сборам: 02:00 UTC = 06:00 Баку; сбор первого был в 04:00.
+    assert letter.count("13.10.2026 06:00") == 3 and "13.10.2026 04:00" not in letter
+    # События — тоже только свои: у второго их нет.
+    assert "Событие первого арендатора" not in letter
+    assert notifications._NO_EVENTS_LINE in letter
+
+    # А письмо первого — прежнее: его строки, его сайт клиента, его сборы.
+    with _mail_server() as mock_email:
+        assert notifications.send_daily_digest(s, tenant_id=1) == 1
+    (call,) = mock_email.call_args_list
+    assert call.kwargs["to"] == ["reader@example.test"]
+    first = _text(call.kwargs["html_body"])
+    assert "Pharmonline в сравнении с Aptekonline и Aloe" in first
+    assert _number(first, "Товаров в сравнении") == 8
+    assert first.count("13.10.2026 04:00") == 3 and "13.10.2026 06:00" not in first
+    assert "Событие первого арендатора" in first
+
+
 def test_another_tenants_pairs_are_not_counted(setup, reader):
     s = setup
     _pair(s, _trusted_run(s), "Свой товар", {"pharmonline": 10.0, "aloe": 8.0})
@@ -437,6 +589,50 @@ def test_letter_goes_out_on_a_morning_without_events(setup, reader):
     # Сводки событий нет вовсе — ни заголовка, ни «0 событий».
     assert "События за сутки" not in letter and "Дайджест за сутки" not in letter
     assert "0 событий" not in letter
+
+
+def test_no_events_line_is_worded_for_verified_runs_only(setup, reader):
+    """События сбора, не прошедшего проверку, дайджест отбрасывает. «Событий не
+    было» в такое утро было бы неправдой — письмо говорит про проверенные сборы."""
+    s = setup
+    _mixed_catalog(s, _trusted_run(s))
+    unverified = storage.Run(
+        tenant_id=1,
+        status="degraded",
+        started_at=utcnow() - timedelta(hours=2),
+        finished_at=utcnow() - timedelta(hours=1),
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=False,
+        run_quality={"financially_eligible": False, "sites": {"aloe": {"status": "failed"}}},
+    )
+    s.add(unverified)
+    s.flush()
+    _event(s, unverified, "Цена из непроверенного сбора")
+
+    with capture_logs() as logs:
+        _sent, calls = _send_daily(s)
+
+    assert "digest_event_skipped_unverified" in [entry["event"] for entry in logs]
+    letter = _text(calls[0].kwargs["html_body"])
+    assert "Цена из непроверенного сбора" not in letter
+    assert "За последние 24 часа событий по проверенным сборам нет." in letter
+    assert "событий не было" not in letter
+
+
+def test_daily_letter_carries_events_of_the_last_24_hours_only(setup, reader):
+    s = setup
+    run = _trusted_run(s)
+    _mixed_catalog(s, run)
+    _event(s, run, "Вчерашнее событие", ago=timedelta(hours=30))
+    _event(s, run, "Сегодняшнее событие", ago=timedelta(hours=23))
+
+    _sent, calls = _send_daily(s)
+
+    html = calls[0].kwargs["html_body"]
+    assert "Сегодняшнее событие" in html and "Вчерашнее событие" not in html
+    assert html.count(notifications._EVENT_ROW_MARK) == 1
+    assert "1 событие" in _text(html)
 
 
 def test_letter_with_events_puts_the_price_report_above_them(setup, reader):
@@ -622,7 +818,7 @@ def test_command_fails_after_sending_the_events_letter_without_the_report(
     assert mock_email.call_count == 1
     assert "attachments" not in mock_email.call_args.kwargs
     assert result.exit_code == 1, result.output
-    assert "daily digest sent to 1 recipients" in result.output
+    assert "daily digest: принято у 1 из 1 получателей" in result.output
     assert "OK:" not in result.output
     assert "Error: отчёт о разнице цен не собрался (KeyError) — письмо без чисел и без файла" in (
         result.output
@@ -675,7 +871,9 @@ def test_command_fails_when_no_recipient_got_the_letter(setup, reader, server):
     assert "@" not in result.output
 
 
-def test_command_succeeds_when_at_least_one_recipient_got_the_letter(setup, reader):
+def test_letter_refused_for_one_of_two_is_reported_as_it_is_and_is_not_an_error(setup, reader):
+    """Письмо ушло — код 0. Но «OK» команда не говорит: принято у одного из двух,
+    и об этом же health скажет админу (сторож)."""
     s = setup
     _reader(s, email="second@example.test")
     _mixed_catalog(s, _trusted_run(s))
@@ -691,9 +889,47 @@ def test_command_succeeds_when_at_least_one_recipient_got_the_letter(setup, read
         result = CliRunner().invoke(cli, ["notify", "digest", "daily"])
 
     assert result.exit_code == 0, result.output
-    assert "OK: daily digest sent to 1 recipients" in result.output
+    assert "daily digest: принято у 1 из 2 получателей — кому не ушло" in result.output
+    assert "digest_email_failed" in result.output
+    assert "OK:" not in result.output and "Error: " not in result.output
     state = daily_letter_state.last_mailing(1)
     assert (state.recipients, state.accepted, state.report) == (2, 1, "ok")
+
+
+@pytest.mark.parametrize("extra", [(), ("--dry-run",)], ids=["send", "dry-run"])
+def test_only_with_an_address_nobody_subscribed_under_is_an_error(setup, reader, extra):
+    """Опечатка в адресе не должна выглядеть как «письмо ушло». Сам адрес в вывод не идёт."""
+    s = setup
+    _mixed_catalog(s, _trusted_run(s))
+
+    with _mail_server() as mock_email:
+        result = CliRunner().invoke(
+            cli, ["notify", "digest", "daily", "--only", "raeder@example.test", *extra]
+        )
+
+    assert result.exit_code == 1, result.output
+    assert "Error: получателя с таким адресом среди включивших суточный дайджест нет" in (
+        result.output
+    )
+    assert "письмо не отправлено" in result.output and "OK" not in result.output
+    assert "@" not in result.output and "raeder" not in result.output
+    assert not mock_email.called
+    assert daily_letter_state.last_mailing(1) is None
+
+
+def test_only_with_a_subscribed_address_sends_to_that_recipient(setup, reader):
+    s = setup
+    _reader(s, email="second@example.test")
+    _mixed_catalog(s, _trusted_run(s))
+
+    with _mail_server() as mock_email:
+        result = CliRunner().invoke(
+            cli, ["notify", "digest", "daily", "--only", " Reader@Example.test "]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "OK: daily digest: принято у 1 из 1 получателей" in result.output
+    assert [call.kwargs["to"] for call in mock_email.call_args_list] == [["reader@example.test"]]
 
 
 def test_dry_run_is_not_an_undelivered_letter(setup, reader):
@@ -1044,7 +1280,7 @@ def test_command_passes_the_locale_and_keeps_only_and_dry_run(setup, reader):
     with _mail_server() as mock_email:
         result = runner.invoke(cli, ["notify", "digest", "daily", "--locale", "az"])
         assert result.exit_code == 0, result.output
-        assert "OK: daily digest sent to 1 recipients" in result.output
+        assert "OK: daily digest: принято у 1 из 1 получателей" in result.output
         assert _book(mock_email.call_args)[1].startswith("qiymet-ferqleri-")
 
         # Без флага — русский файл.
@@ -1056,9 +1292,9 @@ def test_command_passes_the_locale_and_keeps_only_and_dry_run(setup, reader):
         assert result.exit_code == 0, result.output
         assert "1 recipients, nothing sent" in result.output
 
-        result = runner.invoke(cli, ["notify", "digest", "daily", "--only", "nobody@example.test"])
-        assert result.exit_code == 0 and "sent to 0 recipients" in result.output
-        assert mock_email.call_count == 2
+        result = runner.invoke(cli, ["notify", "digest", "daily", "--only", "reader@example.test"])
+        assert result.exit_code == 0, result.output
+        assert mock_email.call_count == 3
 
     result = runner.invoke(cli, ["notify", "digest", "daily", "--locale", "de"])
     assert result.exit_code == 2 and "'de' is not one of" in result.output
@@ -1086,21 +1322,104 @@ def test_weekly_digest_never_builds_the_price_report(setup, monkeypatch):
         assert "Разница цен" not in call.kwargs["html_body"]
 
 
-def test_dashboard_button_sends_the_same_letter(setup, reader, monkeypatch):
-    """«Отправить дайджест» в Quick Actions зовёт ту же функцию: письмо то же, файл русский."""
+def _press_the_button(s, user, *, kind: str = "daily", server=None):
+    """Нажать «Отправить тестовый дайджест» от имени `user`: (ответ, вызовы send_email)."""
+    client = TestClient(api_module.app)
+    client.get(f"/auth/verify?token={tenants.issue_magic_token(s, user.email)}")
+    with server or _mail_server() as mock_email:
+        response = client.post(f"/api/v1/dash/digest/send-test?kind={kind}")
+    return response, mock_email.call_args_list
+
+
+@pytest.fixture
+def button(setup, monkeypatch):
     if not api_module._JWT_AVAILABLE:
         pytest.skip("python-jose not installed")
     monkeypatch.setenv("JWT_SECRET", "test-secret-very-long-not-for-prod-only")
-    s = setup
+    return setup
+
+
+def test_dashboard_button_mails_only_the_admin_who_pressed_it(button, reader):
+    """«Тестовый» значит тестовый: подписанный клиент письма не получает, а
+    нажавший админ получает, хотя на суточный дайджест не подписан."""
+    s = button
     _mixed_catalog(s, _trusted_run(s))
     admin = _reader(s, email="admin@example.test", role="admin", daily_digest=False)
-    client = TestClient(api_module.app)
-    client.get(f"/auth/verify?token={tenants.issue_magic_token(s, admin.email)}")
+    _reader(s, email="other-admin@example.test", role="admin", daily_digest=True)
 
-    with patch("src.notifier.send_email") as mock_email:
-        response = client.post("/api/v1/dash/digest/send-test?kind=daily")
+    response, calls = _press_the_button(s, admin)
 
     assert response.status_code == 200, response.text
     assert response.json() == {"ok": True, "recipients_sent": 1}
-    assert mock_email.call_args.kwargs["to"] == ["reader@example.test"]
-    assert _book(mock_email.call_args)[1].startswith("raznye-ceny-")
+    assert [call.kwargs["to"] for call in calls] == [["admin@example.test"]]
+    # Письмо то же, что утром: отчёт о ценах и файл; язык файла у кнопки русский.
+    assert "Разница цен на" in calls[0].kwargs["html_body"]
+    assert _book(calls[0])[1].startswith("raznye-ceny-")
+
+
+def test_dashboard_button_leaves_the_watchdog_record_alone(button, reader):
+    """Тестовое письмо админу — не рассылка клиенту: ни новой записи, ни правки старой."""
+    s = button
+    _mixed_catalog(s, _trusted_run(s))
+    admin = _reader(s, email="admin@example.test", role="admin", daily_digest=False)
+
+    _press_the_button(s, admin)
+    assert not daily_letter_state.state_file().exists()
+
+    daily_letter_state.record(
+        1, at=datetime(2026, 10, 13, 5, 1), recipients=1, accepted=1, report="ok"
+    )
+    before = daily_letter_state.state_file().read_text(encoding="utf-8")
+    _press_the_button(s, admin, server=patch("src.notifier.send_email", side_effect=_refusing))
+    assert daily_letter_state.state_file().read_text(encoding="utf-8") == before
+
+
+def test_dashboard_button_of_another_tenant_stays_within_that_tenant(button, reader, monkeypatch):
+    s = button
+    monkeypatch.setattr(notifications, "utcnow", lambda: MORNING)
+    _mixed_catalog(s, _trusted_run(s, finished_at=MORNING - timedelta(hours=5)))
+    _second_tenant(s)
+    their_admin = _reader(
+        s, tenant_id=2, email="second-admin@example.test", role="admin", daily_digest=False
+    )
+
+    response, calls = _press_the_button(s, their_admin)
+
+    assert response.json() == {"ok": True, "recipients_sent": 1}
+    assert [call.kwargs["to"] for call in calls] == [["second-admin@example.test"]]
+    book, _name = _book(calls[0])
+    assert len(_body_rows(book.worksheets[1])) == 3  # строки второго арендатора, не первого
+    assert "Aloe в сравнении с Pharmonline и Aptekonline" in _text(calls[0].kwargs["html_body"])
+
+
+def test_dashboard_button_reports_a_broken_report_without_an_address(button, reader, monkeypatch):
+    """Отчёт сломан, событий нет — слать нечего: 500 с классом ошибки, как и раньше."""
+    s = button
+    _mixed_catalog(s, _trusted_run(s))
+    admin = _reader(s, email="admin@example.test", role="admin", daily_digest=False)
+    monkeypatch.setattr(comparison_rows, "comparison_rows", _broken)
+
+    response, calls = _press_the_button(s, admin)
+
+    assert response.status_code == 500 and calls == []
+    assert response.json()["detail"] == (
+        "Не удалось отправить: отчёт о разнице цен не собрался (KeyError), событий за сутки "
+        "нет — письмо не отправлено"
+    )
+    assert "@" not in response.text
+
+
+def test_dashboard_button_for_the_weekly_digest_is_what_it_was(button):
+    """Недельный путь не менялся: кнопка шлёт недельный дайджест всем подписанным на него."""
+    s = button
+    _reader(s, daily_digest=False, weekly_digest=True)
+    admin = _reader(s, email="admin@example.test", role="admin", daily_digest=False)
+    _event(s, _trusted_run(s))
+
+    response, calls = _press_the_button(
+        s, admin, kind="weekly", server=patch("src.notifier.send_email")
+    )
+
+    assert response.json() == {"ok": True, "recipients_sent": 1}
+    assert [call.kwargs["to"] for call in calls] == [["reader@example.test"]]
+    assert set(calls[0].kwargs) == {"subject", "html_body", "to"}

@@ -447,6 +447,11 @@ class DigestOutcome:
     report_failure: Exception | None = field(default=None, compare=False, repr=False)
 
     @property
+    def no_recipients(self) -> bool:
+        """Письмо некому слать: подписчиков нет или отбор (`only_…`) никого не нашёл."""
+        return self.report == daily_letter_state.REPORT_NO_RECIPIENTS
+
+    @property
     def problems(self) -> list[str]:
         """Почему рассылку нельзя считать состоявшейся; пусто — состоялась.
 
@@ -475,6 +480,7 @@ def send_daily_letter(
     tenant_id: int = 1,
     *,
     only_email: str | None = None,
+    only_user_id: int | None = None,
     dry_run: bool = False,
     locale: str = "ru",
 ) -> DigestOutcome:
@@ -487,8 +493,11 @@ def send_daily_letter(
 
     Сломанный отчёт и отказ почтового сервера исключением не становятся: всё,
     что можно, отправлено, а что не так — в `DigestOutcome.problems`. Исход
-    настоящей рассылки (не `dry_run` и не `only_email`) пишется в файл
-    `daily_letter_state`: по нему health замечает утро, когда письмо не ушло.
+    настоящей рассылки пишется в файл `daily_letter_state`: по нему health
+    замечает утро, когда письмо не ушло. Не рассылка, и записи не оставляют:
+    `dry_run` и письмо одному — `only_email` (из включивших дайджест) или
+    `only_user_id` (пользователю арендатора по id, подписан он или нет; так
+    шлёт кнопка «отправить тестовый дайджест» в дашборде).
     """
     outcome = _send_digest(
         session,
@@ -496,10 +505,11 @@ def send_daily_letter(
         kind="daily",
         since=utcnow() - timedelta(hours=24),
         only_email=only_email,
+        only_user_id=only_user_id,
         dry_run=dry_run,
         locale=locale,
     )
-    if not dry_run and only_email is None:
+    if not dry_run and only_email is None and only_user_id is None:
         daily_letter_state.record(
             tenant_id,
             at=utcnow(),
@@ -515,6 +525,7 @@ def send_daily_digest(
     tenant_id: int = 1,
     *,
     only_email: str | None = None,
+    only_user_id: int | None = None,
     dry_run: bool = False,
     locale: str = "ru",
 ) -> int:
@@ -524,7 +535,12 @@ def send_daily_digest(
     сломан, а событий за сутки нет: молча пропустить такое утро нельзя.
     """
     outcome = send_daily_letter(
-        session, tenant_id, only_email=only_email, dry_run=dry_run, locale=locale
+        session,
+        tenant_id,
+        only_email=only_email,
+        only_user_id=only_user_id,
+        dry_run=dry_run,
+        locale=locale,
     )
     if outcome.report_failure is not None and not outcome.recipients:
         failure = outcome.report_failure
@@ -552,26 +568,33 @@ def _send_digest(
     since: datetime,
     *,
     only_email: str | None = None,
+    only_user_id: int | None = None,
     dry_run: bool = False,
     locale: str = "ru",
 ) -> DigestOutcome:
     """Собрать и разослать дайджест. Возвращает исход рассылки.
 
     `only_email` — отправить одному получателю из включивших дайджест: так
-    письмо смотрят на живых данных, не трогая остальных. `dry_run` — собрать
-    письма и записать в лог тему, размер и число строк, ничего не отправляя.
+    письмо смотрят на живых данных, не трогая остальных. `only_user_id` —
+    одному активному пользователю арендатора по id, мимо галочки дайджеста.
+    `dry_run` — собрать письма и записать в лог тему, размер и число строк,
+    ничего не отправляя.
 
     Суточный дайджест (`kind="daily"`) несёт ещё отчёт о разнице цен и уходит и
     без событий, если отчёт есть. Недельный отчёта не знает и письмо шлёт
     прежнее.
     """
+    if only_user_id is not None:
+        subscribed = storage.TenantUser.id == only_user_id
+    elif kind == "daily":
+        subscribed = storage.TenantUser.daily_digest.is_(True)
+    else:
+        subscribed = storage.TenantUser.weekly_digest.is_(True)
     users = session.scalars(
         select(storage.TenantUser).where(
             storage.TenantUser.tenant_id == tenant_id,
             storage.TenantUser.is_active.is_(True),
-            storage.TenantUser.daily_digest.is_(True)
-            if kind == "daily"
-            else storage.TenantUser.weekly_digest.is_(True),
+            subscribed,
         )
     ).all()
     if only_email is not None:
@@ -579,7 +602,7 @@ def _send_digest(
     if not users:
         log.info("digest_no_recipients", kind=kind, tenant=tenant_id)
         return DigestOutcome(
-            report=daily_letter_state.report_skipped("no_recipients") if kind == "daily" else "",
+            report=daily_letter_state.REPORT_NO_RECIPIENTS if kind == "daily" else "",
             dry_run=dry_run,
         )
 
@@ -890,9 +913,10 @@ def _price_letter_subject(report: _PriceReport) -> str:
     return f"Pharmacy Monitor — цены на {day:%d.%m.%Y}: {found}"
 
 
-_NO_EVENTS_LINE = (
-    "За последние 24 часа событий не было — ни изменений цен, ни новых товаров, ни промо."
-)
+# «По проверенным сборам», а не «событий не было»: события сбора, не прошедшего
+# проверку, дайджест отбрасывает (`digest_event_skipped_unverified`), и письмо
+# без них не должно утверждать, что ничего не происходило.
+_NO_EVENTS_LINE = "За последние 24 часа событий по проверенным сборам нет."
 
 
 def _price_count_row(label: str, value: int, *, part: bool = False, strong: bool = False) -> str:
@@ -928,7 +952,7 @@ def _render_price_report(report: _PriceReport) -> str:
         ),
         _price_count_row(f"на {client} цена самая низкая", counts["client_cheapest"], part=True),
         _price_count_row(
-            f"свежей цены {client} нет — различаются цены конкурентов",
+            f"цена {client} в сравнение не вошла — различаются цены конкурентов",
             counts["no_client_price"],
             part=True,
         ),
@@ -937,7 +961,8 @@ def _render_price_report(report: _PriceReport) -> str:
     if counts["not_comparable"]:
         count_rows.append(
             _price_count_row(
-                "Сравнить не с чем: свежая цена только на одном сайте", counts["not_comparable"]
+                "Сравнить не с чем: свежая цена меньше чем на двух сайтах",
+                counts["not_comparable"],
             )
         )
 
@@ -979,7 +1004,7 @@ def _render_price_report(report: _PriceReport) -> str:
         {chr(10).join(count_rows)}
       </table>
       <div style="font-size:12px;color:#71717a;margin-top:8px;">
-        Сравниваются свежие цены: цена, которую сайт не показывал больше {comparison_rows.STALE_AFTER_DAYS} дней, в разницу не входит.
+        Сравниваются свежие цены. Цена сайта в сравнение не входит, если его товара в паре нет, если сайт не показывал товар больше {comparison_rows.STALE_AFTER_DAYS} дней или если цена отброшена как явная ошибка — в разы ниже или выше остальных.
       </div>
     </td></tr>
     <tr><td style="padding:12px 24px;border-top:1px solid #f4f4f5;font-size:13px;color:#52525b;">

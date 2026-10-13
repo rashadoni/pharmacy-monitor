@@ -5073,8 +5073,9 @@ def notify_digest(
     `tenant_users` с daily_digest=True / weekly_digest=True.
 
     Суточное письмо кончается кодом 1, если отчёт о ценах не собрался (даже
-    когда письмо с событиями ушло без него) или почтовый сервер не принял
-    письмо ни у одного получателя. Сначала отправляется всё, что можно.
+    когда письмо с событиями ушло без него), почтовый сервер не принял письмо
+    ни у одного получателя или `--only` не нашёл такого адреса среди включивших
+    дайджест. Сначала отправляется всё, что можно.
 
     Расписание — systemd-таймеры infra/systemd/pharmacy-monitor-digest-daily.timer
     и pharmacy-monitor-digest-weekly.timer.
@@ -5084,26 +5085,45 @@ def notify_digest(
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        problems: list[str] = []
-        if kind == "daily":
-            outcome = notifications.send_daily_letter(
-                s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run, locale=locale
-            )
-            sent, problems = outcome.sent, outcome.problems
-        else:
+        if kind == "weekly":
             sent = notifications.send_weekly_digest(
                 s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run
             )
+            if dry_run:
+                click.echo(f"[dry-run] {kind} digest: {sent} recipients, nothing sent")
+            else:
+                click.echo(f"OK: {kind} digest sent to {sent} recipients")
+            return
+
+        outcome = notifications.send_daily_letter(
+            s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run, locale=locale
+        )
+        if only_email is not None and outcome.no_recipients:
+            # Опечатка в адресе не должна выглядеть как «письмо ушло». Сам адрес
+            # не печатаем: вывод команды маска журнала не трогает.
+            raise click.ClickException(
+                "получателя с таким адресом среди включивших суточный дайджест нет — "
+                "письмо не отправлено"
+            )
+        problems = outcome.problems
+        got = f"принято у {outcome.accepted} из {outcome.recipients} получателей"
         if dry_run:
-            summary = f"[dry-run] {kind} digest: {sent} recipients, nothing sent"
+            summary = f"[dry-run] daily digest: {outcome.sent} recipients, nothing sent"
+        elif not outcome.recipients:
+            summary = "OK: daily digest sent to 0 recipients"
+        elif outcome.accepted == outcome.recipients:
+            summary = f"OK: daily digest: {got}"
+        elif outcome.accepted:
+            # Без «OK»: письмо ушло не всем. Код при этом 0 — письмо ушло; о
+            # непринятых health скажет админу сам (daily_letter_partly_delivered).
+            summary = f"daily digest: {got} — кому не ушло, см. digest_email_failed в журнале"
         else:
-            summary = f"{kind} digest sent to {sent} recipients"
+            summary = f"daily digest: {got}"
+        click.echo(summary.removeprefix("OK: ") if problems else summary)
         if problems:
             # Ненулевой код: юнит таймера должен показать сбой, а не тихое утро.
             # Трассировка сбоя отчёта уже в журнале (digest_price_report_failed).
-            click.echo(summary)
             raise click.ClickException("; ".join(problems))
-        click.echo(summary if dry_run else f"OK: {summary}")
 
 
 @notify_group.command("test")

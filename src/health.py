@@ -992,6 +992,15 @@ def _check_site_zero_scrape(
 
 
 _DAILY_LETTER_JOURNAL = "journalctl -u pharmacy-monitor-digest-daily --since yesterday"
+# Почему отчёта о ценах в письме не было — словами (причины из `_price_report`).
+_DAILY_LETTER_NO_REPORT = {
+    "full_catalog_trust_not_ready": (
+        "финансовые сравнения приостановлены политикой — полный каталог не подтверждён "
+        "(страница сравнения в это время отвечает 503)"
+    ),
+    "no_successful_run": "успешного сбора ещё не было",
+    "no_comparison_rows": "в сравнении нет ни одной строки",
+}
 
 
 def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthIssue]:
@@ -1005,7 +1014,14 @@ def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthI
       рассылалось: таймер не сработал или команда упала раньше рассылки;
     - отчёт о ценах в последней рассылке не собрался — письмо ушло без чисел и
       без файла либо не ушло вовсе (если и событий за сутки не было);
-    - письмо слали, но почтовый сервер не принял его ни у одного получателя.
+    - отчёта не было по известной причине (сравнения приостановлены политикой,
+      сравнивать нечего): само по себе не сбой, но клиент ждёт именно отчёт, а
+      такое утро может повторяться днями;
+    - письмо слали, но почтовый сервер не принял его ни у одного получателя —
+      или принял не у всех: админ свою копию получил, а клиент нет.
+
+    Давно не рассылалось — одна проблема, прошлый исход уже не новость. Иначе
+    их бывает две: что с отчётом и что с доставкой.
 
     Проверки нет, пока нет подписчиков на суточный дайджест или записи о
     рассылке: сторож начинает работать с первой настоящей рассылки, и включение
@@ -1062,7 +1078,9 @@ def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthI
                 context=context,
             )
         ]
+    issues: list[HealthIssue] = []
     error_type = mailing.failed_report
+    skipped = mailing.skipped_report
     if error_type is not None:
         if mailing.accepted:
             outcome = (
@@ -1073,7 +1091,7 @@ def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthI
             outcome = "осталось без отчёта о разнице цен, и почтовый сервер его не принял"
         else:
             outcome = "не отправлено: отчёта о разнице цен нет, а событий за сутки не было"
-        return [
+        issues.append(
             HealthIssue(
                 "warning" if mailing.accepted else "critical",
                 "daily_letter_report_failed",
@@ -1081,20 +1099,52 @@ def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthI
                 f"трассировка — событие digest_price_report_failed: {_DAILY_LETTER_JOURNAL}.",
                 context=context,
             )
-        ]
-    if mailing.recipients and not mailing.accepted:
-        return [
+        )
+    elif skipped is not None and mailing.report != daily_letter_state.REPORT_NO_RECIPIENTS:
+        outcome = (
+            "письмо ушло без чисел и без файла"
+            if mailing.recipients
+            else "письма не было вовсе — событий за сутки тоже нет"
+        )
+        issues.append(
             HealthIssue(
-                "critical",
-                "daily_letter_not_delivered",
-                f"Утреннее письмо с разницей цен {when} почтовый сервер не принял ни у одного "
-                f"из {mailing.recipients} получателей. Причина — digest_email_failed или "
-                f"email_skipped_no_smtp: {_DAILY_LETTER_JOURNAL} (рассылку кнопкой из "
-                "дашборда — в журнале pharmacy-monitor-api).",
+                "warning",
+                "daily_letter_report_skipped",
+                f"В утреннем письме {when} нет отчёта о разнице цен: "
+                f"{_DAILY_LETTER_NO_REPORT.get(skipped, skipped)}; {outcome}. Пока причина "
+                "не снята, так будет каждое утро. В журнале — событие "
+                f"digest_price_report_skipped: {_DAILY_LETTER_JOURNAL}.",
+                # Причина — в подписи инцидента: сменилась — это новый инцидент.
+                context={**context, "status": skipped},
+            )
+        )
+    if mailing.recipients and not mailing.accepted:
+        # У сломанного отчёта об этом уже сказано в его же строке.
+        if error_type is None:
+            issues.append(
+                HealthIssue(
+                    "critical",
+                    "daily_letter_not_delivered",
+                    f"Утреннее письмо с разницей цен {when} почтовый сервер не принял ни у "
+                    f"одного из {mailing.recipients} получателей. Причина — "
+                    f"digest_email_failed или email_skipped_no_smtp: {_DAILY_LETTER_JOURNAL}.",
+                    context=context,
+                )
+            )
+    elif mailing.accepted < mailing.recipients:
+        issues.append(
+            HealthIssue(
+                "warning",
+                "daily_letter_partly_delivered",
+                f"Утреннее письмо с разницей цен {when} почтовый сервер не принял у "
+                f"{mailing.recipients - mailing.accepted} из {mailing.recipients} получателей. "
+                "Кому не ушло — user_id в событиях digest_email_failed: "
+                f"{_DAILY_LETTER_JOURNAL}; кто это — запрос по tenant_users в RUNBOOK "
+                "«Email не приходит».",
                 context=context,
             )
-        ]
-    return []
+        )
+    return issues
 
 
 def render_alert_html(report: HealthReport) -> str:
