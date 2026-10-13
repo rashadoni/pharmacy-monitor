@@ -1255,7 +1255,7 @@ def test_admission_mail_is_not_sent_for_an_empty_list(db_session, monkeypatch):
 
 @pytest.fixture
 def postgres_session():
-    """Сессия на PostgreSQL из DATABASE_URL (в CI он есть); без него — пропуск.
+    """Сессия на PostgreSQL из DATABASE_URL; без него — пропуск, а в CI — ошибка.
 
     База общая для всех тестов, поэтому у теста свой тенант и свои
     идентификаторы, а строки за собой он удаляет.
