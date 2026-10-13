@@ -494,11 +494,13 @@ def test_session_bound_to_a_connection_keeps_the_lock_on_it(engines):
 
 @pytest.mark.parametrize("ending", ["rollback", "close"])
 def test_lock_leaves_with_the_transaction_when_the_query_could_not_release_it(engines, ending):
-    """Транзакция этапа оборвана ошибкой SQL: снять замок запросом нельзя, но он не остаётся.
+    """Транзакция под замком оборвана ошибкой SQL: снять замок запросом нельзя, но он не остаётся.
 
-    Соединение замка закрывается, как только сессия закончит на нём транзакцию:
-    в `rematch` и в `run` это выход из `with Session()` (обработчик сбоя `run`
-    на оборванной транзакции падает сам и до rollback не доходит).
+    Соединение замка закрывается, как только сессия закончит на нём транзакцию —
+    на выходе из `with Session()`. Так кончаются `rematch --revalidate` и
+    `--relink-dead`: их шаг идёт мимо этапа, и до снятия замка транзакцию никто
+    не откатывает. Сам этап с 2026-10-09 откатывает её до снятия, и запрос
+    проходит (`tests/test_matching_stage_failure.py`).
     """
     make_stage_engine, outsider = engines
     engine = make_stage_engine()
