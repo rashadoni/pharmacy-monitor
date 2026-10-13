@@ -161,6 +161,11 @@ def strings(locale: str) -> dict[str, str]:
     return _STRINGS.get(locale, _STRINGS["az"])
 
 
+def baku_time(moment: datetime) -> datetime:
+    """Момент в UTC без пояса (как в столбцах базы) — в бакинское время."""
+    return moment + _BAKU_OFFSET
+
+
 def has_price_difference(row: dict[str, Any]) -> bool:
     """Цены на сайтах сравнимы и НЕ равны.
 
@@ -175,7 +180,7 @@ def has_price_difference(row: dict[str, Any]) -> bool:
 
 
 def filename(locale: str, generated_at: datetime) -> str:
-    local = generated_at + _BAKU_OFFSET
+    local = baku_time(generated_at)
     return f"{strings(locale)['filename']}-{local:%Y-%m-%d}.xlsx"
 
 
@@ -200,18 +205,85 @@ def _compared_value(row: dict[str, Any], entry: dict[str, Any]) -> float:
     return entry["price"]
 
 
-def _position(row: dict[str, Any], t: dict[str, str]) -> str:
-    entry = row["prices"].get(CLIENT_SITE)
+def client_position(row: dict[str, Any], client_site: str = CLIENT_SITE) -> str | None:
+    """Где свежая цена клиента среди сравнимых цен строки.
+
+    `equal` — цены на сайтах равны; `cheapest` — у клиента самая низкая, в том
+    числе поровну с кем-то из конкурентов; `priciest` — самая высокая; `middle`
+    — между ними. None — свежей цены клиента в строке нет или сравнивать не с
+    чем. По этому правилу пишется колонка «Позиция» и считаются числа утреннего
+    письма (`difference_counts`).
+    """
+    entry = row["prices"].get(client_site)
     if entry is None or entry.get("stale") or row.get("min_price") is None:
-        return ""
+        return None
     if row["min_price"] == row["max_price"]:
-        return t["pos_equal"]
+        return "equal"
     value = _compared_value(row, entry)
     if value == row["min_price"]:
-        return t["pos_cheapest"]
+        return "cheapest"
     if value == row["max_price"]:
-        return t["pos_priciest"]
-    return t["pos_middle"]
+        return "priciest"
+    return "middle"
+
+
+def difference_counts(rows: list[dict[str, Any]], client_site: str = CLIENT_SITE) -> dict[str, int]:
+    """Числа утреннего письма о разнице цен — те же, что видны в файле.
+
+    Сравнимая цена — свежая: сайт показывал товар не раньше, чем
+    `comparison_rows._COMPARISON_STALE_DAYS` дней назад. Устаревшая цена в строке
+    остаётся (в файле зачёркнута), но в минимум и максимум не входит и разницей
+    не считается. При разной фасовке сравнивается цена за штуку — как в файле.
+
+    - `compared` — строк в сравнении, лист «Всё сравнение»;
+    - `differing` — из них с разной ценой, лист «Разные цены»: сравнимых цен не
+      меньше двух и минимальная не равна максимальной (`has_price_difference`);
+    - `competitor_cheaper` — из `differing`: у клиента есть свежая цена, и она
+      выше минимальной, то есть хотя бы один конкурент дешевле (в колонке
+      «Позиция» — «Самая высокая» или «Посередине»);
+    - `client_cheapest` — из `differing`: свежая цена клиента минимальная, в том
+      числе поровну с одним из конкурентов («Самая низкая»);
+    - `no_client_price` — из `differing`: свежей цены клиента нет — различаются
+      цены конкурентов между собой («Позиция» пуста);
+    - `same_price` — сравнимые цены равны;
+    - `not_comparable` — свежая цена осталась меньше чем у двух сайтов.
+
+    `compared` = `differing` + `same_price` + `not_comparable`, а `differing` —
+    сумма трёх своих частей.
+    """
+    counts = dict.fromkeys(
+        (
+            "compared",
+            "differing",
+            "competitor_cheaper",
+            "client_cheapest",
+            "no_client_price",
+            "same_price",
+            "not_comparable",
+        ),
+        0,
+    )
+    for row in rows:
+        counts["compared"] += 1
+        if has_price_difference(row):
+            counts["differing"] += 1
+            position = client_position(row, client_site)
+            if position is None:
+                counts["no_client_price"] += 1
+            elif position == "cheapest":
+                counts["client_cheapest"] += 1
+            else:
+                counts["competitor_cheaper"] += 1
+        elif row.get("min_price") is None:
+            counts["not_comparable"] += 1
+        else:
+            counts["same_price"] += 1
+    return counts
+
+
+def _position(row: dict[str, Any], t: dict[str, str]) -> str:
+    position = client_position(row)
+    return t[f"pos_{position}"] if position else ""
 
 
 def _cheapest_sites(row: dict[str, Any]) -> str:
@@ -336,7 +408,7 @@ def build_workbook(
         _write_sheet(wb.create_sheet(t["sheet_all"]), rows, t)
 
     info = wb.create_sheet(t["sheet_info"])
-    local = generated_at + _BAKU_OFFSET
+    local = baku_time(generated_at)
     lines: list[tuple[str, Any]] = [
         (t["info_title"], ""),
         (t["info_generated"], f"{local:%d.%m.%Y %H:%M} (Bakı)"),
