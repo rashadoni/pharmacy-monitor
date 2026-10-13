@@ -788,12 +788,25 @@ def country_conflicts(a: Any, b: Any) -> bool:
     return bool(ca and cb and ca != cb)
 
 
-def offer_is_fresh(product: Any, *, now: datetime | None = None) -> bool:
+def offer_is_fresh(
+    product: Any, *, now: datetime | None = None, max_age_hours: int | None = None
+) -> bool:
+    """Наблюдение о наличии не старше срока сайта (`OFFER_MAX_AGE_HOURS`).
+
+    `max_age_hours` — свой срок вызывающего. Он нужен матчеру: тот выбирает
+    между одноимёнными строками сайта «ту, что сейчас в продаже», и его
+    терпение не должно сжиматься вместе с ритмом сбора (см.
+    `matcher._current_offer`).
+    """
     observed_at = getattr(product, "availability_observed_at", None)
     if observed_at is None:
         return False
     current = now or utcnow()
-    max_age = OFFER_MAX_AGE_HOURS.get(getattr(product, "site", ""), 30)
+    max_age = (
+        max_age_hours
+        if max_age_hours is not None
+        else OFFER_MAX_AGE_HOURS.get(getattr(product, "site", ""), 30)
+    )
     return observed_at >= current - timedelta(hours=max_age)
 
 
@@ -803,7 +816,9 @@ class Eligibility:
     reason: str | None = None
 
 
-def current_offer_eligibility(product: Any, *, now: datetime | None = None) -> Eligibility:
+def current_offer_eligibility(
+    product: Any, *, now: datetime | None = None, max_age_hours: int | None = None
+) -> Eligibility:
     if getattr(product, "url_dead_at", None) is not None:
         return Eligibility(False, "dead_url")
     status = getattr(product, "offer_availability_status", OFFER_UNKNOWN) or OFFER_UNKNOWN
@@ -811,7 +826,7 @@ def current_offer_eligibility(product: Any, *, now: datetime | None = None) -> E
         return Eligibility(False, "out_of_stock")
     if status != OFFER_IN_STOCK:
         return Eligibility(False, "availability_unknown")
-    if not offer_is_fresh(product, now=now):
+    if not offer_is_fresh(product, now=now, max_age_hours=max_age_hours):
         return Eligibility(False, "availability_stale")
     return Eligibility(True)
 

@@ -2006,6 +2006,27 @@ _STALE_MEMBER_MIN_HOURS = 14 * 24 + 6
 _STALE_RELINK_MIN_FRESH_SHARE = 0.5
 
 
+# Сколько матчер считает предложение «сейчас в продаже», выбирая между
+# одноимёнными строками сайта. Срок политики (`product_policy.OFFER_MAX_AGE_HOURS`)
+# следует ритму сбора и при суточном ритме равен 30 часам; с ним строка,
+# которой две ночи нет в листинге, проигрывала бы соседней с тем же названием,
+# хотя цена совпадает именно у неё, — и в паре оказывался бы другой товар (тот
+# же класс ошибки, что чинила правка от 2026-10-13). 174 часа — срок политики
+# при недельном ритме: смена ритма выбор пары не меняет.
+_OFFER_FRESH_MIN_HOURS = 7 * 24 + 6
+
+
+def _current_offer(product):
+    """`current_offer_eligibility` с терпением матчера, а не суточного ритма."""
+    from src.cadence import site_max_age_hours
+    from src.product_policy import current_offer_eligibility
+
+    return current_offer_eligibility(
+        product,
+        max_age_hours=max(site_max_age_hours(product.site), _OFFER_FRESH_MIN_HOURS),
+    )
+
+
 def _gone_row_rules(products, now=None):
     """Мерка «строка пропала с сайта» — одна для подготовки и для проходов.
 
@@ -2870,12 +2891,11 @@ def _unmatchable_reason(product) -> str | None:
         availability_policy_enforced,
         country_code_of,
         country_policy_enforced,
-        current_offer_eligibility,
     )
 
     if getattr(product, "offer_availability_status", None) == OFFER_OUT_OF_STOCK:
         return "out_of_stock"
-    if availability_policy_enforced() and not current_offer_eligibility(product).eligible:
+    if availability_policy_enforced() and not _current_offer(product).eligible:
         return "offer_not_eligible"
     if country_policy_enforced() and country_code_of(product) is None:
         return "country_unknown"
@@ -2943,15 +2963,13 @@ def _closest_first(p, candidates: list, prices: dict | None = None) -> list:
     страна якоря подтверждена, предпочтение по цене получает только кандидат с
     той же подтверждённой страной. Дальше порядок прежний.
     """
-    from src.product_policy import current_offer_eligibility
-
     anchor_price = _effective_price(prices, p) if prices else None
     return sorted(
         candidates,
         key=lambda q: (
             not (p.canonical_id is not None and q.canonical_id == p.canonical_id),
             _name_gap(p, q),
-            not current_offer_eligibility(q).eligible,
+            not _current_offer(q).eligible,
             not (
                 prices is not None
                 and _same_price(anchor_price, _effective_price(prices, q))

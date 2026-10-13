@@ -41,6 +41,9 @@ SCRAPE_TIMER_DROPINS = sorted(
     (REPO / "infra/systemd/overrides").glob("pharmacy-monitor-scrape@*.timer.d/*.conf")
 )
 PROVISION_SCRIPT = REPO / "scripts/provision_vps.sh"
+AUTONOMOUS_PHARMONLINE_WORKFLOW = (
+    REPO / ".github/workflows/autonomous-pharmonline-decodo-public-api.yml"
+)
 BERLIN = ZoneInfo("Europe/Berlin")  # часовой пояс прод-хоста: в нём заданы OnCalendar
 
 
@@ -185,6 +188,13 @@ def test_window_boundary_fits_the_nightly_alarms():
     while day < date(2029, 1, 1):
         windows = set()
         for hour, minute in alarms:
+            # Будильник не стоит в часе перевода часов: такого местного времени
+            # в одну из ночей года нет вовсе, в другую оно наступает дважды.
+            local = datetime(day.year, day.month, day.day, hour, minute, tzinfo=BERLIN)
+            assert local.utcoffset() == local.replace(fold=1).utcoffset(), (day, hour, minute)
+            assert local.astimezone(timezone.utc).astimezone(BERLIN).replace(
+                tzinfo=None
+            ) == local.replace(tzinfo=None), (day, hour, minute)
             fire = _timer_fire_utc(day, hour, minute)
             opened = cadence_window_start("aloe", fire)
             since_boundary = fire - opened
@@ -203,6 +213,23 @@ def test_window_boundary_fits_the_nightly_alarms():
         # бы не повтором упавшего сбора, а вторым сбором.
         assert len(windows) == 1, day
         day += timedelta(days=1)
+
+
+def test_pharmonline_workflow_in_github_actions_has_no_schedule():
+    """Сбор pharmonline из GitHub Actions — только ручной запуск.
+
+    Понедельничный cron снят 2026-10-13: дубль идёт мимо гварда ритма
+    (`--mode public_api`) и исполняет `main`, а его упавшая попытка после
+    удачного ночного сбора отнимает у каталога pharmonline доверие до следующей
+    ночи. Вернётся расписание — вернётся и этот риск, теперь еженедельно.
+    """
+    import yaml
+
+    workflow = yaml.safe_load(AUTONOMOUS_PHARMONLINE_WORKFLOW.read_text(encoding="utf-8"))
+    # PyYAML читает ключ `on` как булево True.
+    triggers = workflow.get("on", workflow.get(True))
+
+    assert set(triggers) == {"workflow_dispatch"}
 
 
 # ─── Какие сайты пора собирать ───────────────────────────────────────────────

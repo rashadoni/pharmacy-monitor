@@ -899,11 +899,12 @@ def test_roi_cache_waits_until_every_site_has_verified_full_scan(db_session):
 
 
 def test_roi_cache_rejects_stale_verified_site_inputs(db_session):
-    # 175ч — далеко за суточным порогом (ритм 24ч + запас 6ч, см. src/cadence.py).
+    # 31ч — сразу за суточным порогом (ритм 24ч + запас 6ч, см. src/cadence.py);
+    # 29ч — ещё в нём: порог входов рекомендаций следует карте ритма.
     run = Run(
-        started_at=utcnow() - timedelta(hours=175),
+        started_at=utcnow() - timedelta(hours=31),
         status="ok",
-        finished_at=utcnow() - timedelta(hours=175),
+        finished_at=utcnow() - timedelta(hours=31),
         catalog_scope="full",
         full_catalog_sites="pharmonline,aptekonline,aloe",
         catalog_verified=True,
@@ -916,6 +917,12 @@ def test_roi_cache_rejects_stale_verified_site_inputs(db_session):
 
     with pytest.raises(ValueError, match="fresh verified"):
         roi.cache_actions(db_session, "pharmonline", [], run_id=run.id)
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is False
+
+    run.started_at = utcnow() - timedelta(hours=29)
+    run.finished_at = run.started_at
+    db_session.commit()
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is True
 
 
 def test_latest_financial_snapshot_ignores_newer_partial_run(db_session):
