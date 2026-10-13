@@ -740,7 +740,6 @@ export interface Recipient {
   name: string | null;
   role: "admin" | "viewer";
   is_active: boolean;
-  daily_digest: boolean;
   weekly_digest: boolean;
   email_severity_min: "off" | "info" | "warning" | "critical" | null;
   telegram_chat_id: string | null;
@@ -752,7 +751,6 @@ export interface RecipientCreate {
   email: string;
   name?: string | null;
   role?: "admin" | "viewer";
-  daily_digest?: boolean;
   weekly_digest?: boolean;
   email_severity_min?: "off" | "info" | "warning" | "critical" | null;
 }
@@ -761,7 +759,6 @@ export interface RecipientUpdate {
   name?: string | null;
   role?: "admin" | "viewer";
   is_active?: boolean;
-  daily_digest?: boolean;
   weekly_digest?: boolean;
   email_severity_min?: "off" | "info" | "warning" | "critical" | null;
 }
@@ -886,7 +883,6 @@ export interface NotifPrefs {
   email_severity_min: string | null;
   telegram_severity_min: string | null;
   quiet_hours: string | null;
-  daily_digest: boolean;
   weekly_digest: boolean;
   // Считает сервер. Необязательные: пока идёт выкладка, страницу может
   // обслуживать API, который этих полей ещё не отдаёт.
@@ -900,7 +896,6 @@ export type NotifPrefsPatch = Partial<
     | "email_severity_min"
     | "telegram_severity_min"
     | "quiet_hours"
-    | "daily_digest"
     | "weekly_digest"
   >
 >;
@@ -951,8 +946,9 @@ export interface SystemStatus extends Health {
     sites: string[];
     pool_size: number;
   };
+  // Дайджест получателя один — недельный. Ключ `daily` сервер ещё отдаёт (для
+  // вкладок, открытых до выкладки), но читать его здесь нечему.
   digests: {
-    daily: { enabled: boolean; schedule_baku: string };
     weekly: { enabled: boolean; schedule_baku: string };
   };
 }
@@ -1450,9 +1446,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-  digestSendTest: (kind: "daily" | "weekly" = "daily") =>
+  // Недельный дайджест — только тому, кто нажал кнопку (`recipients_sent` 1 или 0).
+  digestSendTest: () =>
     request<{ ok: boolean; recipients_sent: number }>(
-      `/api/v1/dash/digest/send-test?kind=${kind}`,
+      "/api/v1/dash/digest/send-test?kind=weekly",
       { method: "POST", timeoutMs: 30_000 },
     ),
   watchlistList: () => request<WatchlistItem[]>("/api/v1/dash/watchlist"),

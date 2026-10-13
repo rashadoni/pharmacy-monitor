@@ -804,21 +804,18 @@ def _env_enabled(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _digest_timer_on(kind: str) -> bool:
-    """Идёт ли на сервере таймер дайджеста.
+def _weekly_digest_timer_on() -> bool:
+    """Идёт ли на сервере таймер недельного дайджеста.
 
     Systemd timer truth is mirrored through explicit deployment env, avoiding
     privileged `systemctl` calls from the web process. The value is read from
     the API process environment: a change takes an API restart.
 
-    ⚠️ `daily` must stay off until a unit runs `notify digest daily`. The only
-    daily unit in `infra/systemd/` runs the legacy `pharmacy-monitor digest`,
-    which mails the `recipients` table (`EMAIL_TO` when it is empty) and never
-    reads `tenant_users.daily_digest`: with the flag on, the dashboard would
-    count a per-user letter that no timer sends.
+    There is no daily counterpart: the per-user daily digest was removed on
+    2026-10-13 and `DAILY_DIGEST_ENABLED` has no reader. The
+    `pharmacy-monitor-digest@daily` unit runs the legacy `pharmacy-monitor
+    digest` (the `recipients` table) and is not mirrored here.
     """
-    if kind == "daily":
-        return _env_enabled("DAILY_DIGEST_ENABLED", False)
     return _env_enabled("WEEKLY_DIGEST_ENABLED", True)
 
 
@@ -903,14 +900,14 @@ def dash_system_status(
             "pool_size": len(decodo_ports),
         },
         "digests": {
-            "daily": {
-                "enabled": _digest_timer_on("daily"),
-                "schedule_baku": os.environ.get(
-                    "DAILY_DIGEST_SCHEDULE_BAKU", "09:00"
-                ),
-            },
+            # Ежедневного дайджеста получателя нет (2026-10-13). Ключ отдаётся
+            # постоянным «выключен» ради вкладок, открытых до выкладки: их
+            # страница настроек читает `digests.daily.enabled` без проверки и
+            # без ключа падает. Убрать можно, когда таких вкладок не останется, —
+            # сессия живёт 7 дней.
+            "daily": {"enabled": False, "schedule_baku": "09:00"},
             "weekly": {
-                "enabled": _digest_timer_on("weekly"),
+                "enabled": _weekly_digest_timer_on(),
                 "schedule_baku": os.environ.get(
                     "WEEKLY_DIGEST_SCHEDULE_BAKU", "Monday 10:00"
                 ),
@@ -1810,7 +1807,6 @@ class NotifPrefsOut(BaseModel):
     email_severity_min: str | None
     telegram_severity_min: str | None
     quiet_hours: str | None
-    daily_digest: bool
     weekly_digest: bool
     # Считает сервер, а не страница: правила рассылки живут в `notifications`.
     # can_edit — меняет ли пользователь эти настройки сам (viewer — нет, ему их
@@ -1823,7 +1819,6 @@ class NotifPrefsIn(BaseModel):
     email_severity_min: str | None = None
     telegram_severity_min: str | None = None
     quiet_hours: str | None = None
-    daily_digest: bool | None = None
     weekly_digest: bool | None = None
 
     @field_validator("email_severity_min", "telegram_severity_min")
@@ -1862,13 +1857,10 @@ def dash_notifications_get(user: storage.TenantUser = Depends(require_user)):
         email_severity_min=user.email_severity_min,
         telegram_severity_min=user.telegram_severity_min,
         quiet_hours=user.quiet_hours,
-        daily_digest=user.daily_digest or False,
         weekly_digest=user.weekly_digest or False,
         can_edit=notifications.may_edit_own_notifications(user),
         has_delivery=notifications.anything_reaches(
-            user,
-            daily_digest_on=_digest_timer_on("daily"),
-            weekly_digest_on=_digest_timer_on("weekly"),
+            user, weekly_digest_on=_weekly_digest_timer_on()
         ),
     )
 
@@ -1912,26 +1904,29 @@ def dash_notifications_unbind_telegram(
 
 @app.post("/api/v1/dash/digest/send-test")
 def dash_digest_send_test(
-    kind: str = "daily",
+    kind: str = "weekly",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """Отправить test digest всем получателям с `daily_digest=true`.
+    """Прислать недельный дайджест тому, кто нажал кнопку в Quick Actions.
 
-    Используется из Quick Actions меню. Тот же код что и cron-таймер,
-    просто on-demand. Только admin.
+    Письмо то же, что по таймеру в понедельник, но одному получателю — самому
+    администратору, и только если недельный дайджест у него включён (как
+    `notify digest weekly --only`). Остальным подписанным кнопка не пишет:
+    сотруднику клиента дайджест приходит раз в неделю по расписанию (решение
+    владельца 2026-10-13). До этой правки кнопка слала вид `daily` всем, у кого
+    стояла галочка ежедневного дайджеста, — на сервере таких не было. Только admin.
     """
     if user.role != "admin":
         raise HTTPException(403, "Admin role required")
-    if kind not in ("daily", "weekly"):
-        raise HTTPException(400, "kind must be 'daily' or 'weekly'")
+    if kind != "weekly":
+        # `daily` присылает вкладка, открытая до выкладки.
+        raise HTTPException(400, "Ежедневного дайджеста больше нет. Обновите страницу.")
     from src import notifications
 
     try:
-        count = (
-            notifications.send_daily_digest(db, tenant_id=user.tenant_id)
-            if kind == "daily"
-            else notifications.send_weekly_digest(db, tenant_id=user.tenant_id)
+        count = notifications.send_weekly_digest(
+            db, tenant_id=user.tenant_id, only_email=user.email
         )
         log.info("digest_sent_manual", kind=kind, count=count, by_user_id=user.id)
         return {"ok": True, "recipients_sent": count}
@@ -1943,10 +1938,11 @@ def dash_digest_send_test(
 # ─── Recipients management (admin only) ──────────────────────────────────────
 # Управление получателями email-digest. Admin может добавить любого получателя
 # (клиента, бухгалтера, партнёра) с настройкой severity_min и opt-in для
-# daily/weekly. Каждый recipient это TenantUser с is_active=true. Недельный
-# дайджест по таймеру получают те, у кого `weekly_digest=true`; ежедневный
-# per-user дайджест по таймеру не шлёт никто (см. `_digest_timer_on`), а
-# `daily_digest=true` при этом отменяет получателю письма сразу.
+# недельного дайджеста. Каждый recipient это TenantUser с is_active=true.
+# Недельный дайджест по таймеру получают те, у кого `weekly_digest=true`.
+# Поля ежедневного дайджеста в запросах и ответах нет (2026-10-13): запрос,
+# который его прислал (вкладка, открытая до выкладки), принимается, а значение
+# отбрасывается — модели ниже лишних полей не читают.
 
 
 class RecipientOut(BaseModel):
@@ -1955,7 +1951,6 @@ class RecipientOut(BaseModel):
     name: str | None
     role: str
     is_active: bool
-    daily_digest: bool
     weekly_digest: bool
     email_severity_min: str | None
     telegram_chat_id: str | None
@@ -1967,7 +1962,6 @@ class RecipientCreate(BaseModel):
     email: str = Field(min_length=3, max_length=200)
     name: str | None = None
     role: str = "viewer"
-    daily_digest: bool = True
     weekly_digest: bool = False
     email_severity_min: str | None = "warning"
 
@@ -2000,7 +1994,6 @@ class RecipientUpdate(BaseModel):
     name: str | None = None
     role: str | None = None
     is_active: bool | None = None
-    daily_digest: bool | None = None
     weekly_digest: bool | None = None
     email_severity_min: str | None = None
 
@@ -2055,7 +2048,6 @@ def _to_recipient_out(u: storage.TenantUser) -> RecipientOut:
         name=u.name,
         role=u.role,
         is_active=bool(u.is_active),
-        daily_digest=bool(u.daily_digest),
         weekly_digest=bool(u.weekly_digest),
         email_severity_min=u.email_severity_min,
         telegram_chat_id=u.telegram_chat_id,
@@ -2100,7 +2092,6 @@ def dash_recipients_create(
         name=payload.name,
         role=payload.role,
         is_active=True,
-        daily_digest=payload.daily_digest,
         weekly_digest=payload.weekly_digest,
         email_severity_min=payload.email_severity_min,
         created_at=utcnow(),
@@ -2213,7 +2204,6 @@ def dash_recipients_delete(
         return Response(status_code=204)
 
     r.is_active = False
-    r.daily_digest = False
     r.weekly_digest = False
     db.commit()
     log.info("recipient_deleted", id=r.id, by_user_id=user.id)

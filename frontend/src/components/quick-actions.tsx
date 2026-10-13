@@ -6,12 +6,13 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Mail, Play, X, Zap } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { api, friendlyError } from "@/lib/api";
+import { digestButtonFeedback } from "@/lib/notif-prefs";
 
 /**
  * Quick Actions dropdown в углу sidebar / страниц. Admin-only действия которые
  * раньше требовали SSH на прод:
  *   - Запустить scan сейчас (через scrape-request очередь)
- *   - Отправить test digest всем получателям с daily_digest=true
+ *   - Прислать себе недельный дайджест (то же письмо, что уйдёт по таймеру)
  */
 export function QuickActions() {
   const t = useTranslations("quick_actions");
@@ -29,9 +30,9 @@ export function QuickActions() {
   });
 
   const digestMut = useMutation({
-    mutationFn: () => api.digestSendTest("daily"),
+    mutationFn: () => api.digestSendTest(),
     onSuccess: (r) => {
-      setFeedback(t("digest_sent", { count: r.recipients_sent }));
+      setFeedback(t(digestButtonFeedback(r.recipients_sent)));
       setOpen(false);
     },
     onError: (err) => setFeedback(t("error", { message: friendlyError(err, locale) })),
@@ -95,7 +96,7 @@ export function QuickActions() {
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium">{t("digest_title")}</div>
                 <div className="text-xs text-muted-foreground">
-                  {t("all_subscribers")} · {digestMut.isPending ? t("sending") : t("now")}
+                  {t("digest_to_self")} · {digestMut.isPending ? t("sending") : t("now")}
                 </div>
               </div>
             </DropdownMenu.Item>

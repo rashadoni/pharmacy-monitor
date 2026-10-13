@@ -19,7 +19,6 @@ export default function UsersPage() {
   const meQ = useQuery({ queryKey: ["me"], queryFn: api.me });
   const listQ = useQuery({ queryKey: ["recipients"], queryFn: api.recipients });
   const statusQ = useQuery({ queryKey: ["system-status"], queryFn: api.systemStatus });
-  const dailyEnabled = statusQ.data?.digests.daily.enabled ?? false;
   const weeklyEnabled = statusQ.data?.digests.weekly.enabled ?? true;
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["recipients"] });
@@ -72,7 +71,6 @@ export default function UsersPage() {
         <>
           <DigestScheduleNote status={statusQ.data?.digests} />
           <AddUserForm
-            dailyEnabled={dailyEnabled}
             weeklyEnabled={weeklyEnabled}
             onAdd={(p) => createMut.mutate(p)}
             pending={createMut.isPending}
@@ -94,7 +92,6 @@ export default function UsersPage() {
                 key={u.id}
                 u={u}
                 isSelf={u.id === meQ.data?.id}
-                dailyEnabled={dailyEnabled}
                 weeklyEnabled={weeklyEnabled}
                 onUpdate={(patch) => updateMut.mutate({ id: u.id, patch })}
                 onDelete={() => {
@@ -126,24 +123,21 @@ function DigestScheduleNote({ status }: { status?: import("@/lib/api").SystemSta
       <Clock className="h-4 w-4 mt-0.5 shrink-0" />
       <div>
         {t("digest_schedule_note")}
-        <ul className="mt-1 list-disc pl-4 space-y-0.5">
-          <li>{t("digest_schedule_daily_state", { state: status?.daily.enabled ? t("digest_schedule_enabled", { schedule: status.daily.schedule_baku }) : t("digest_schedule_disabled") })}</li>
-          <li>{t("digest_schedule_weekly_state", { state: status?.weekly.enabled === false ? t("digest_schedule_disabled") : t("digest_schedule_enabled", { schedule: status?.weekly.schedule_baku ?? "Monday 10:00" }) })}</li>
-        </ul>
+        <div className="mt-1">
+          {t("digest_schedule_weekly_state", { state: status?.weekly.enabled === false ? t("digest_schedule_disabled") : t("digest_schedule_enabled", { schedule: status?.weekly.schedule_baku ?? "Monday 10:00" }) })}
+        </div>
       </div>
     </div>
   );
 }
 
 function AddUserForm({
-  dailyEnabled,
   weeklyEnabled,
   onAdd,
   pending,
   error,
   doneEmail,
 }: {
-  dailyEnabled: boolean;
   weeklyEnabled: boolean;
   onAdd: (p: RecipientCreate) => void;
   pending: boolean;
@@ -154,7 +148,6 @@ function AddUserForm({
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [role, setRole] = useState<"admin" | "viewer">("viewer");
-  const [daily, setDaily] = useState(false);
   const [weekly, setWeekly] = useState(false);
 
   const validEmail = /.+@.+\..+/.test(email.trim());
@@ -165,13 +158,11 @@ function AddUserForm({
       email: email.trim().toLowerCase(),
       name: name.trim() || null,
       role,
-      daily_digest: daily,
       weekly_digest: weekly,
     });
     setEmail("");
     setName("");
     setRole("viewer");
-    setDaily(false);
     setWeekly(false);
   }
 
@@ -206,7 +197,6 @@ function AddUserForm({
           <RoleSelect value={role} onChange={setRole} />
         </label>
         <div className="flex items-end gap-4 pb-1">
-          <Toggle label={t("daily_digest")} checked={daily} disabled={!dailyEnabled} onChange={setDaily} />
           <Toggle label={t("weekly_digest")} checked={weekly} disabled={!weeklyEnabled} onChange={setWeekly} />
         </div>
       </div>
@@ -229,7 +219,6 @@ function AddUserForm({
 function UserCard({
   u,
   isSelf,
-  dailyEnabled,
   weeklyEnabled,
   onUpdate,
   onDelete,
@@ -237,7 +226,6 @@ function UserCard({
 }: {
   u: Recipient;
   isSelf: boolean;
-  dailyEnabled: boolean;
   weeklyEnabled: boolean;
   onUpdate: (patch: RecipientUpdate) => void;
   onDelete: () => void;
@@ -306,12 +294,6 @@ function UserCard({
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 pt-3 border-t border-border">
-        <Toggle
-          label={t("daily_digest")}
-          checked={u.daily_digest}
-          disabled={digestToggleLocked(dailyEnabled, u.daily_digest)}
-          onChange={(daily_digest) => onUpdate({ daily_digest })}
-        />
         <Toggle
           label={t("weekly_digest")}
           checked={u.weekly_digest}

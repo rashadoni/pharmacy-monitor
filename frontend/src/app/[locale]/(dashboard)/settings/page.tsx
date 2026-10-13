@@ -288,7 +288,6 @@ function NotificationsSection({ email }: { email?: string }) {
   // Viewer свои уведомления видит, но не меняет: их задаёт администратор на
   // странице «Пользователи». Сервер такую правку отклоняет и без этой страницы.
   const readOnly = notifPrefsReadOnly(prefs);
-  const dailyTimerOn = statusQ.data?.digests.daily.enabled;
   const weeklyTimerOn = statusQ.data?.digests.weekly.enabled;
 
   return (
@@ -399,21 +398,6 @@ function NotificationsSection({ email }: { email?: string }) {
 
           <div className="pt-3 border-t border-border space-y-2">
             <div className="text-sm font-medium mb-1.5">{t("digest")}</div>
-            <Toggle
-              label={t("daily_digest_schedule", {
-                time: statusQ.data?.digests.daily.schedule_baku ?? "09:00",
-              })}
-              checked={prefs.daily_digest}
-              onChange={(v) => updateMutation.mutate({ daily_digest: v })}
-              disabled={readOnly || digestToggleLocked(dailyTimerOn, prefs.daily_digest)}
-            />
-            {dailyTimerOn === false && (
-              <p className="text-xs text-warning">
-                {prefs.daily_digest && !readOnly
-                  ? t("daily_digest_blocks_instant")
-                  : t("daily_digest_disabled")}
-              </p>
-            )}
             <Toggle
               label={t("weekly_digest_schedule", {
                 schedule: statusQ.data?.digests.weekly.schedule_baku ?? "Monday 10:00",

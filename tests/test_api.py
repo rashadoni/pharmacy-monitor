@@ -158,7 +158,9 @@ def test_system_status_exposes_queue_proxy_and_real_digest_schedule(
     monkeypatch.setenv("DECODO_PASSWORD", "configured-secret")
     monkeypatch.setenv("DECODO_SITES", "aloe,pharmonline")
     monkeypatch.setenv("DECODO_PORTS", "30001,30002")
-    monkeypatch.setenv("DAILY_DIGEST_ENABLED", "0")
+    # Ежедневного дайджеста нет: флаг, оставшийся в env сервера, никто не читает.
+    monkeypatch.setenv("DAILY_DIGEST_ENABLED", "1")
+    monkeypatch.setenv("DAILY_DIGEST_SCHEDULE_BAKU", "07:30")
     monkeypatch.setenv("WEEKLY_DIGEST_ENABLED", "1")
     monkeypatch.setenv("WEEKLY_DIGEST_SCHEDULE_BAKU", "Monday 10:00")
     older = storage.ScrapeRequest(
@@ -189,7 +191,8 @@ def test_system_status_exposes_queue_proxy_and_real_digest_schedule(
         "sites": ["aloe", "pharmonline"],
         "pool_size": 2,
     }
-    assert body["digests"]["daily"]["enabled"] is False
+    # Ключ остался ради вкладок, открытых до выкладки, и всегда «выключен».
+    assert body["digests"]["daily"] == {"enabled": False, "schedule_baku": "09:00"}
     assert body["digests"]["weekly"] == {
         "enabled": True,
         "schedule_baku": "Monday 10:00",
@@ -1335,7 +1338,6 @@ def _login_client_staff(client, session):
     viewer = _make_user(session, "client-staff@x.az", role="viewer")
     viewer.email_severity_min = "off"
     viewer.weekly_digest = True
-    viewer.daily_digest = False
     session.commit()
     assert _verify_login(client, session, viewer.email).status_code == 200
     return viewer
@@ -1345,7 +1347,6 @@ def _notification_settings(session, user):
     session.refresh(user)
     return (
         user.email_severity_min,
-        user.daily_digest,
         user.weekly_digest,
         user.telegram_severity_min,
         user.quiet_hours,
@@ -1358,11 +1359,10 @@ def _notification_settings(session, user):
         {"email_severity_min": "critical"},
         {"email_severity_min": "info"},
         {"email_severity_min": "off"},
-        {"daily_digest": True},
         {"weekly_digest": False},
         {"telegram_severity_min": "info"},
         {"quiet_hours": "22-08"},
-        {"email_severity_min": "warning", "daily_digest": True, "weekly_digest": False},
+        {"email_severity_min": "warning", "weekly_digest": False},
         {},
     ],
 )
@@ -1372,7 +1372,7 @@ def test_viewer_cannot_change_own_notifications(client, setup_db, change):
     response = client.patch("/api/v1/dash/me/notifications", json=change)
 
     assert response.status_code == 403, response.text
-    assert _notification_settings(setup_db, viewer) == ("off", False, True, None, None)
+    assert _notification_settings(setup_db, viewer) == ("off", True, None, None)
 
 
 def test_viewer_sees_own_notifications_and_is_told_they_are_not_editable(
@@ -1389,7 +1389,6 @@ def test_viewer_sees_own_notifications_and_is_told_they_are_not_editable(
         "email_severity_min": "off",
         "telegram_severity_min": None,
         "quiet_hours": None,
-        "daily_digest": False,
         "weekly_digest": True,
         # Не «без доставки»: недельный дайджест до него доходит.
         "can_edit": False,
@@ -1466,7 +1465,6 @@ def test_administrator_is_the_one_who_changes_a_viewers_notifications(
 def test_administrator_changes_own_notifications_and_learns_when_nothing_arrives(
     client, auth_cookie, tenant_user, setup_db, monkeypatch
 ):
-    monkeypatch.delenv("DAILY_DIGEST_ENABLED", raising=False)
     monkeypatch.delenv("WEEKLY_DIGEST_ENABLED", raising=False)
 
     def flags_after(change):
@@ -1485,21 +1483,200 @@ def test_administrator_changes_own_notifications_and_learns_when_nothing_arrives
     assert flags_after({"weekly_digest": True}) == (True, True)
     monkeypatch.setenv("WEEKLY_DIGEST_ENABLED", "0")
     assert flags_after({}) == (True, False)
-    # Ежедневный таймер по умолчанию выключен: галочка письма не даёт, а
-    # письма сразу отменяет.
     assert flags_after({"email_severity_min": "warning", "weekly_digest": False}) == (True, True)
-    assert flags_after({"daily_digest": True}) == (True, False)
-    monkeypatch.setenv("DAILY_DIGEST_ENABLED", "1")
-    assert flags_after({}) == (True, True)
     # Остальные поля администратор тоже меняет сам — они не теряются по дороге.
     flags_after({"quiet_hours": "22-08", "telegram_severity_min": "info"})
     assert _notification_settings(setup_db, tenant_user) == (
         "warning",
-        True,
         False,
         "info",
         "22-08",
     )
+
+
+# ─── Ежедневного дайджеста получателя нет (2026-10-13) ───────────────────────
+# По таймеру его не слал никто, а стоящая галочка отменяла получателю письма
+# сразу после сбора. Убраны галочка, её действие, флаг `DAILY_DIGEST_ENABLED` и
+# вид `daily` у кнопки; колонка `tenant_users.daily_digest` осталась без
+# читателей. Вкладка, открытая до выкладки, ещё шлёт поле в запросах и читает
+# ключ `digests.daily` — её запросы принимаются и ничего не пишут.
+
+
+def _daily_flags(session):
+    session.expire_all()
+    return {
+        u.email: (u.daily_digest, u.weekly_digest) for u in session.query(storage.TenantUser)
+    }
+
+
+def test_stale_tab_cannot_set_the_retired_daily_digest_flag(
+    client, auth_cookie, tenant_user, setup_db
+):
+    viewer = _make_user(setup_db, "client-staff@x.az", role="viewer")
+
+    own = client.patch("/api/v1/dash/me/notifications", json={"daily_digest": True})
+    other = client.patch(
+        f"/api/v1/dash/recipients/{viewer.id}",
+        json={"daily_digest": True, "weekly_digest": True},
+    )
+    created = client.post(
+        "/api/v1/dash/recipients", json={"email": "new@x.az", "daily_digest": True}
+    )
+
+    assert (own.status_code, other.status_code, created.status_code) == (200, 200, 200)
+    # Соседнее поле того же запроса записано, отброшено только снятое.
+    assert _daily_flags(setup_db) == {
+        tenant_user.email: (False, False),
+        "client-staff@x.az": (False, True),
+        "new@x.az": (False, False),
+    }
+    answers = [
+        other.json(),
+        created.json(),
+        client.get("/api/v1/dash/me/notifications").json(),
+        *client.get("/api/v1/dash/recipients").json(),
+    ]
+    assert len(answers) == 6
+    assert not [a for a in answers if "daily_digest" in a]
+
+
+def test_recipient_created_without_digest_fields_is_not_put_on_a_daily_digest(
+    client, auth_cookie, setup_db
+):
+    """До правки запрос без поля ставил галочку ежедневного дайджеста сам
+    (умолчание модели — `True`): новый получатель оставался без писем сразу и
+    без дайджеста. Форма поле слала всегда; так создавал только прямой запрос."""
+    from src import notifications
+
+    response = client.post("/api/v1/dash/recipients", json={"email": "new@x.az"})
+
+    assert response.status_code == 200, response.text
+    assert _daily_flags(setup_db)["new@x.az"] == (False, False)
+    created = setup_db.query(storage.TenantUser).filter_by(email="new@x.az").one()
+    assert created.email_severity_min == "warning"
+    assert notifications.anything_reaches(created, weekly_digest_on=False) is True
+
+
+def test_leftover_daily_digest_flag_and_env_switch_decide_nothing(
+    client, auth_cookie, tenant_user, setup_db, monkeypatch
+):
+    """Галочка, оставшаяся в базе, и флаг, оставшийся в env сервера: ни вместе,
+    ни порознь они не отменяют письма сразу и не считаются доставкой."""
+    monkeypatch.setenv("WEEKLY_DIGEST_ENABLED", "0")
+
+    def has_delivery():
+        return client.get("/api/v1/dash/me/notifications").json()["has_delivery"]
+
+    for flag in ("0", "1"):
+        monkeypatch.setenv("DAILY_DIGEST_ENABLED", flag)
+        tenant_user.daily_digest = True
+        tenant_user.email_severity_min = None  # пустой порог — warning, письма идут
+        setup_db.commit()
+        assert has_delivery() is True
+        tenant_user.email_severity_min = "off"
+        setup_db.commit()
+        assert has_delivery() is False
+
+
+def _week_event(session, tenant_id):
+    session.add(
+        storage.AlertEvent(
+            rule_type="site_drop_smoke",
+            dedup_key="digest-button",
+            severity="warning",
+            title="Сайт собран не полностью",
+            tenant_id=tenant_id,
+            created_at=utcnow() - timedelta(days=2),
+        )
+    )
+    session.commit()
+
+
+def test_digest_button_sends_the_weekly_digest_only_to_whoever_pressed_it(
+    client, auth_cookie, tenant_user, setup_db, monkeypatch
+):
+    """Сотруднику клиента с включённым недельным дайджестом кнопка не пишет: ему
+    дайджест приходит по расписанию. Событию два дня — в суточное окно, которым
+    кнопка ходила раньше, оно бы не попало."""
+    from src import notifier
+
+    viewer = _make_user(setup_db, "client-staff@x.az", role="viewer")
+    viewer.weekly_digest = True
+    tenant_user.weekly_digest = True
+    _week_event(setup_db, tenant_user.tenant_id)
+    sent = []
+    monkeypatch.setattr(
+        notifier, "send_email", lambda *, subject, html_body, to: sent.append((to, subject))
+    )
+
+    by_default = client.post("/api/v1/dash/digest/send-test")
+    named = client.post("/api/v1/dash/digest/send-test?kind=weekly")
+
+    for response in (by_default, named):
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "recipients_sent": 1}
+    assert [to for to, _ in sent] == [[tenant_user.email]] * 2
+    assert {subject for _, subject in sent} == {
+        "Pharmacy Monitor — дайджест за неделю: 1 событие"
+    }
+
+
+def test_digest_button_sends_nothing_when_the_presser_has_no_weekly_digest(
+    client, auth_cookie, tenant_user, setup_db, monkeypatch
+):
+    from src import notifier
+
+    viewer = _make_user(setup_db, "client-staff@x.az", role="viewer")
+    viewer.weekly_digest = True
+    tenant_user.weekly_digest = False
+    tenant_user.daily_digest = True  # прежняя галочка получателем не делает
+    _week_event(setup_db, tenant_user.tenant_id)
+    sent = []
+    monkeypatch.setattr(
+        notifier, "send_email", lambda *, subject, html_body, to: sent.append(to)
+    )
+
+    response = client.post("/api/v1/dash/digest/send-test")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True, "recipients_sent": 0}
+    assert sent == []
+
+
+@pytest.mark.parametrize("kind", ["daily", "monthly", ""])
+def test_digest_button_refuses_a_kind_that_does_not_exist(
+    client, auth_cookie, tenant_user, setup_db, monkeypatch, kind
+):
+    """`kind=daily` присылает вкладка, открытая до выкладки. Отказ, а не
+    недельное письмо под видом «тестового ежедневного»."""
+    from src import notifier
+
+    tenant_user.weekly_digest = True
+    tenant_user.daily_digest = True
+    _week_event(setup_db, tenant_user.tenant_id)
+    sent = []
+    monkeypatch.setattr(
+        notifier, "send_email", lambda *, subject, html_body, to: sent.append(to)
+    )
+
+    response = client.post(f"/api/v1/dash/digest/send-test?kind={kind}")
+
+    assert response.status_code == 400, response.text
+    assert sent == []
+
+
+def test_digest_button_is_for_administrators(client, setup_db, monkeypatch):
+    from src import notifier
+
+    viewer = _login_client_staff(client, setup_db)
+    _week_event(setup_db, viewer.tenant_id)
+    sent = []
+    monkeypatch.setattr(
+        notifier, "send_email", lambda *, subject, html_body, to: sent.append(to)
+    )
+
+    assert client.post("/api/v1/dash/digest/send-test").status_code == 403
+    assert sent == []
 
 
 @pytest.mark.asyncio
@@ -5058,7 +5235,7 @@ def test_recipient_create_and_list(client, auth_cookie, setup_db):
     """admin добавляет получателя — появляется в списке с нужной ролью."""
     r = client.post(
         "/api/v1/dash/recipients",
-        json={"email": "New@X.az", "name": "New", "role": "viewer", "daily_digest": True},
+        json={"email": "New@X.az", "name": "New", "role": "viewer"},
     )
     assert r.status_code == 200, r.text
     assert r.json()["email"] == "new@x.az"  # нормализован в lowercase

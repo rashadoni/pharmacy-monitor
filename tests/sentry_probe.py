@@ -235,7 +235,7 @@ def _failing_when(name, real):
 _replace(product_policy, "policy_rollout_eligibility", _policy_rollout_eligibility)
 _replace(api, "_verify_bcrypt", _failing_when("bcrypt", api._verify_bcrypt))
 _replace(
-    notifications, "send_daily_digest", _failing_when("digest", notifications.send_daily_digest)
+    notifications, "send_weekly_digest", _failing_when("digest", notifications.send_weekly_digest)
 )
 
 

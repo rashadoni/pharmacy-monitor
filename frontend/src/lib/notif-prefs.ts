@@ -22,9 +22,19 @@ export function shouldShowNotifBanner(prefs: Flags | null | undefined): boolean 
 
 /**
  * Галочку дайджеста, чей таймер на сервере не идёт, поставить нельзя, а снять
- * можно всегда: стоящая галочка ежедневного дайджеста отменяет письма сразу, и
- * запертой она оставляла получателя без писем вовсе.
+ * можно всегда: запертая стоящая галочка — настройка, которую не убрать.
+ * Дайджест получателя один, недельный; ежедневного нет с 2026-10-13.
  */
 export function digestToggleLocked(timerOn: boolean | undefined, checked: boolean): boolean {
   return timerOn === false && !checked;
+}
+
+/**
+ * Что сказать после кнопки «Прислать себе недельный дайджест» (Quick Actions).
+ * Письмо уходит только нажавшему, поэтому исходов два: сервер его отправил или
+ * слать было нечего — за неделю нет событий либо недельный дайджест у
+ * нажавшего выключен. Ключи — из `quick_actions` в `messages/*.json`.
+ */
+export function digestButtonFeedback(recipientsSent: number): "digest_sent" | "digest_none" {
+  return recipientsSent > 0 ? "digest_sent" : "digest_none";
 }

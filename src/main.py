@@ -5035,11 +5035,11 @@ def digest_cmd(top_n: int, window_hours: int, dry_run: bool) -> None:
 
 @cli.group("notify")
 def notify_group() -> None:
-    """Notification dispatch — daily/weekly digest, manual sends."""
+    """Notification dispatch — weekly digest, manual sends."""
 
 
 @notify_group.command("digest")
-@click.argument("kind", type=click.Choice(["daily", "weekly"]))
+@click.argument("kind", type=click.Choice(["weekly"]))
 @click.option("--tenant-id", type=int, default=1, help="Send digest for this tenant only")
 @click.option(
     "--dry-run",
@@ -5054,25 +5054,25 @@ def notify_group() -> None:
     "не трогая остальных",
 )
 def notify_digest(kind: str, tenant_id: int, dry_run: bool, only_email: str | None) -> None:
-    """Send digest email to opted-in users for the tenant.
+    """Send the weekly digest to opted-in users for the tenant.
 
-    Daily includes events from last 24h, weekly from last 7d. Recipients are
-    `tenant_users` with daily_digest=True / weekly_digest=True.
+    Events of the last 7 days; recipients are `tenant_users` with
+    weekly_digest=True. Scheduled by
+    infra/systemd/pharmacy-monitor-digest-weekly.timer.
 
-    Weekly is scheduled by infra/systemd/pharmacy-monitor-digest-weekly.timer.
-    No unit runs `daily`: the pharmacy-monitor-digest@.service template behind
-    the `@daily` and `@weekly` timers runs the legacy `pharmacy-monitor digest`
-    command, not this one.
+    `weekly` is the only kind: the per-user daily digest was removed on
+    2026-10-13. The pharmacy-monitor-digest@.service template behind the
+    `@daily` and `@weekly` timers runs the legacy `pharmacy-monitor digest`
+    command (the `recipients` table), not this one.
     """
     from src import notifications
 
     storage.init_db()
     Session = storage.make_session()
     with Session() as s:
-        send = (
-            notifications.send_daily_digest if kind == "daily" else notifications.send_weekly_digest
+        sent = notifications.send_weekly_digest(
+            s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run
         )
-        sent = send(s, tenant_id=tenant_id, only_email=only_email, dry_run=dry_run)
         if dry_run:
             click.echo(f"[dry-run] {kind} digest: {sent} recipients, nothing sent")
         else:

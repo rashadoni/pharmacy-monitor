@@ -3,12 +3,10 @@
 Replaces the scattered logic in src/alerts.py:_send_*_alert. New logic respects:
   - Per-tenant_user severity_min thresholds (info/warning/critical/off)
   - Quiet hours (don't ping telegram at 3 AM)
-  - Daily / weekly digest opt-in (events queued, sent in batch)
+  - Weekly digest opt-in (one summary letter on Mondays)
 
 Public API:
   - dispatch_event(session, event)        — for real-time alerts (called by alerts.evaluate_rules)
-  - send_daily_digest(session, tenant_id) — per-user daily digest; no timer
-    calls it (only the dashboard button), see `api._digest_timer_on`
   - send_weekly_digest(session, tenant_id) — call from systemd timer Mondays
   - bind_telegram(session, chat_id, email) — link telegram to user
 
@@ -144,10 +142,7 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
     results: dict[str, list[str]] = {"email": [], "telegram": []}
     sent_at = utcnow()
     for user in users:
-        # Email — skip real-time if user opted into daily digest (digest will include it)
-        if not user.daily_digest and _severity_passes(
-            user.email_severity_min, event.severity, DEFAULT_EMAIL_SEVERITY
-        ):
+        if _severity_passes(user.email_severity_min, event.severity, DEFAULT_EMAIL_SEVERITY):
             try:
                 notifier.send_email(
                     subject=f"[{event.severity.upper()}] {event.title[:80]}",
@@ -199,7 +194,6 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
     переоценка линейки из 15 товаров = 15 писем). Теперь одно письмо со списком
     всех алертов прогона, шлётся сразу после прогона — немедленность сохранена,
     поток убран. Уважает те же per-user правила, что и `dispatch_event`:
-    `daily_digest`-opt-out (real-time пропускается, событие попадёт в дайджест),
     email/telegram `severity_min`, quiet hours. Telegram — одним сообщением.
 
     `channels_sent` проставляется per-event (точная dedup-метка: канал отмечается
@@ -235,29 +229,27 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
         for user in users:
             sent_now: dict[int, set[str]] = {}
 
-            # Email — пропускаем real-time если юзер на daily_digest (попадёт в дайджест)
-            if not user.daily_digest:
-                ev_email = [
-                    e
-                    for e in tevents
-                    if _severity_passes(user.email_severity_min, e.severity, DEFAULT_EMAIL_SEVERITY)
-                ]
-                if ev_email:
-                    try:
-                        notifier.send_email(
-                            subject=_batch_subject(ev_email),
-                            html_body=_render_batch_email(ev_email),
-                            to=[user.email],
-                        )
-                        emails_sent += 1
-                        for e in ev_email:
-                            sent_now.setdefault(id(e), set()).add("email")
-                    except Exception as exc:
-                        log.warning(
-                            "email_batch_failed",
-                            user_id=user.id,
-                            **notifier.delivery_error_fields(exc),
-                        )
+            ev_email = [
+                e
+                for e in tevents
+                if _severity_passes(user.email_severity_min, e.severity, DEFAULT_EMAIL_SEVERITY)
+            ]
+            if ev_email:
+                try:
+                    notifier.send_email(
+                        subject=_batch_subject(ev_email),
+                        html_body=_render_batch_email(ev_email),
+                        to=[user.email],
+                    )
+                    emails_sent += 1
+                    for e in ev_email:
+                        sent_now.setdefault(id(e), set()).add("email")
+                except Exception as exc:
+                    log.warning(
+                        "email_batch_failed",
+                        user_id=user.id,
+                        **notifier.delivery_error_fields(exc),
+                    )
 
             # Telegram — одним сообщением, уважает quiet hours
             if user.telegram_chat_id and not _in_quiet_hours(user.quiet_hours):
@@ -323,8 +315,6 @@ def mail_unstored_events_to_admins(
     `dispatch_events_batch`:
 
     - получатели — только активные пользователи с ролью из `ADMIN_ROLES`;
-    - `daily_digest` письмо не отменяет: в дайджест такое событие не попадёт,
-      его нет в базе;
     - `channels_sent` не ведётся и ничего не коммитится. Повторной отправки
       нет: что не ушло, то потеряно, и вызывающий узнаёт об этом из `failed`.
 
@@ -416,26 +406,21 @@ def _quiet_around_the_clock(quiet_hours: str | None) -> bool:
     )
 
 
-def anything_reaches(
-    user: storage.TenantUser, *, daily_digest_on: bool, weekly_digest_on: bool
-) -> bool:
+def anything_reaches(user: storage.TenantUser, *, weekly_digest_on: bool) -> bool:
     """Доходит ли до получателя хоть что-то из журнала алертов: письмо сразу,
-    Telegram или дайджест.
+    Telegram или недельный дайджест.
 
     Правила те же, что у `dispatch_events_batch` и `_send_digest`; вопрос — про
-    событие наивысшей важности. `*_digest_on` — идёт ли на сервере таймер этого
-    дайджеста: галочка получателя без таймера письма не даёт, а `daily_digest`
-    при этом ещё и отменяет письма сразу.
+    событие наивысшей важности. `weekly_digest_on` — идёт ли на сервере таймер
+    недельного дайджеста: галочка получателя без таймера письма не даёт.
 
     Чего правило не знает: настроены ли SMTP и токен бота; письма
     администраторам о ценах с тиков (`mail_unstored_events_to_admins`) — их
-    событий в журнале нет, и `daily_digest` их не отменяет. Тихие часы Telegram
-    не откладывают, а пропускают: событие, пришедшее в них, в Telegram не уйдёт
-    совсем. Здесь они считаются, только когда закрывают все сутки.
+    событий в журнале нет. Тихие часы Telegram не откладывают, а пропускают:
+    событие, пришедшее в них, в Telegram не уйдёт совсем. Здесь они считаются,
+    только когда закрывают все сутки.
     """
-    instant_email = not user.daily_digest and _severity_passes(
-        user.email_severity_min, "critical", DEFAULT_EMAIL_SEVERITY
-    )
+    instant_email = _severity_passes(user.email_severity_min, "critical", DEFAULT_EMAIL_SEVERITY)
     telegram = (
         bool(user.telegram_chat_id)
         and _severity_passes(
@@ -443,9 +428,7 @@ def anything_reaches(
         )
         and not _quiet_around_the_clock(user.quiet_hours)
     )
-    digest = (bool(user.daily_digest) and daily_digest_on) or (
-        bool(user.weekly_digest) and weekly_digest_on
-    )
+    digest = bool(user.weekly_digest) and weekly_digest_on
     return instant_email or telegram or digest
 
 
@@ -481,26 +464,23 @@ def bind_telegram(session: Session, chat_id: str, email: str) -> bool:
     return True
 
 
-# ─── Daily / weekly digest ───────────────────────────────────────────────────
+# ─── Weekly digest ───────────────────────────────────────────────────────────
+#
+# Дайджест получателя один — недельный. Ежедневного (галочка «Ежедневный
+# дайджест», `tenant_users.daily_digest`, `notify digest daily`) нет с
+# 2026-10-13: по таймеру его не слал никто, а стоящая галочка отменяла
+# получателю письма сразу после сбора — человек оставался без писем вовсе.
+# Письмо «дайджест за сутки» по таблице `recipients` (`src/digest.py`, команда
+# `pharmacy-monitor digest`) — другой механизм, эта правка его не касалась.
 
-
-def send_daily_digest(
-    session: Session, tenant_id: int = 1, *, only_email: str | None = None, dry_run: bool = False
-) -> int:
-    """Send daily digest to opted-in users. Returns count of emails sent."""
-    return _send_digest(
-        session,
-        tenant_id,
-        kind="daily",
-        since=utcnow() - timedelta(hours=24),
-        only_email=only_email,
-        dry_run=dry_run,
-    )
+# Окна дайджеста: слово для темы письма и часы для ссылки на `/alerts`.
+_DIGEST_WINDOWS = {"weekly": ("неделю", 168)}
 
 
 def send_weekly_digest(
     session: Session, tenant_id: int = 1, *, only_email: str | None = None, dry_run: bool = False
 ) -> int:
+    """Недельный дайджест тем, у кого он включён. Возвращает число получателей."""
     return _send_digest(
         session,
         tenant_id,
@@ -530,9 +510,7 @@ def _send_digest(
         select(storage.TenantUser).where(
             storage.TenantUser.tenant_id == tenant_id,
             storage.TenantUser.is_active.is_(True),
-            storage.TenantUser.daily_digest.is_(True)
-            if kind == "daily"
-            else storage.TenantUser.weekly_digest.is_(True),
+            storage.TenantUser.weekly_digest.is_(True),
         )
     ).all()
     if only_email is not None:
@@ -832,12 +810,12 @@ def _digest_selection(
 def _alerts_url(kind: str, **filters: str) -> str:
     """Ссылка на страницу алертов с тем же окном, что у дайджеста."""
     public = os.environ.get("PHARMACY_PUBLIC_URL", "")
-    params = {"hours": "24" if kind == "daily" else "168", **filters}
+    params = {"hours": str(_DIGEST_WINDOWS[kind][1]), **filters}
     return escape(f"{public}/alerts?{urlencode(params)}")
 
 
 def _digest_period_name(kind: str) -> str:
-    return "сутки" if kind == "daily" else "неделю"
+    return _DIGEST_WINDOWS[kind][0]
 
 
 def _digest_subject(events: list[storage.AlertEvent], kind: str) -> str:

@@ -310,8 +310,10 @@ def test_dispatch_events_batch_single_event_keeps_old_subject(setup, tenant_user
         assert "Solo alert" in subj
 
 
-def test_dispatch_events_batch_daily_digest_user_skipped(setup, tenant_user):
-    """Юзер на daily_digest не получает real-time — событие уйдёт в дайджест."""
+def test_dispatch_events_batch_ignores_the_retired_daily_digest_flag(setup, tenant_user):
+    """Ежедневного дайджеста нет (2026-10-13). Запись, у которой в базе осталась
+    его галочка, письмо сразу получает: раньше галочка письмо отменяла, а
+    дайджеста, в который событие должно было попасть, никто не слал."""
     s = setup
     tenant_user.daily_digest = True
     s.commit()
@@ -319,8 +321,23 @@ def test_dispatch_events_batch_daily_digest_user_skipped(setup, tenant_user):
     s.commit()
     with patch("src.notifier.send_email") as mock_email:
         result = notifications.dispatch_events_batch(s, [e])
-        assert not mock_email.called
-        assert result["email"] == 0
+        assert [c.kwargs["to"] for c in mock_email.call_args_list] == [["alice@example.com"]]
+        assert result["email"] == 1
+    s.refresh(e)
+    assert e.channels_sent == ["email"]
+
+
+def test_dispatch_event_ignores_the_retired_daily_digest_flag(setup, tenant_user):
+    """То же у отправки одного события (`alert evaluate --dispatch` без пачки)."""
+    s = setup
+    tenant_user.daily_digest = True
+    s.commit()
+    e = _mk_event(s, tenant_user.tenant_id, "single-dd", "critical", "x")
+    s.commit()
+    with patch("src.notifier.send_email") as mock_email:
+        result = notifications.dispatch_event(s, e)
+        assert [c.kwargs["to"] for c in mock_email.call_args_list] == [["alice@example.com"]]
+        assert result["email"] == "sent_1"
 
 
 def test_dispatch_events_batch_severity_filter_per_event(setup, tenant_user):
@@ -444,23 +461,6 @@ def test_unstored_events_reach_admins_and_never_viewers(setup, tenant_user):
     assert event.channels_sent is None
 
 
-def test_unstored_events_ignore_the_daily_digest_opt_out(setup, tenant_user):
-    """Админ «на дайджесте» письмо всё равно получает: в дайджест такое событие
-    не попадёт — его нет в базе, а обычная рассылка его бы молча пропустила."""
-    s = setup
-    tenant_user.daily_digest = True
-    s.commit()
-    event = _loose_event("price_drop_pct", "critical", "Цена упала")
-
-    with patch("src.notifier.send_email") as mock_email:
-        assert notifications.dispatch_events_batch(s, [event])["email"] == 0
-        event.channels_sent = None
-        result = notifications.mail_unstored_events_to_admins(s, [event], note="n")
-
-    assert mock_email.call_count == 1
-    assert result["email"] == 1
-
-
 def test_unstored_events_respect_the_admin_severity_threshold(setup, tenant_user):
     s = setup
     tenant_user.email_severity_min = "critical"
@@ -560,18 +560,23 @@ def test_dispatch_events_batch_all_below_threshold_redispatchable(setup, tenant_
 # ─── Digest ─────────────────────────────────────────────────────────────────
 
 
-def test_send_daily_digest_no_recipients(setup, tenant_user):
-    """User without daily_digest=True → no email."""
+def test_send_weekly_digest_no_recipients(setup, tenant_user):
+    """User without weekly_digest=True → no email. Галочка ежедневного
+    дайджеста, оставшаяся в базе, получателем недельного не делает."""
     s = setup
+    tenant_user.daily_digest = True
+    run = _eligible_run(s, tenant_user.tenant_id)
+    _digest_event(s, run, "undercut_threshold", "critical", "X", site="aloe")
+    s.commit()
     with patch("src.notifier.send_email") as mock_email:
-        sent = notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
+        sent = notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id)
         assert sent == 0
         assert not mock_email.called
 
 
-def test_send_daily_digest_with_events(setup, tenant_user):
+def test_send_weekly_digest_with_events(setup, tenant_user):
     s = setup
-    tenant_user.daily_digest = True
+    tenant_user.weekly_digest = True
     run = storage.Run(
         tenant_id=tenant_user.tenant_id,
         status="ok",
@@ -607,14 +612,14 @@ def test_send_daily_digest_with_events(setup, tenant_user):
     s.commit()
 
     with patch("src.notifier.send_email") as mock_email:
-        sent = notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
+        sent = notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id)
         assert sent == 1
         assert mock_email.called
 
 
 def test_send_digest_skips_legacy_financial_event_without_verified_run(setup, tenant_user):
     s = setup
-    tenant_user.daily_digest = True
+    tenant_user.weekly_digest = True
     s.add(
         storage.AlertEvent(
             rule_type="undercut_threshold",
@@ -628,14 +633,14 @@ def test_send_digest_skips_legacy_financial_event_without_verified_run(setup, te
     s.commit()
 
     with patch("src.notifier.send_email") as mock_email:
-        assert notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id) == 0
+        assert notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id) == 0
         assert not mock_email.called
 
 
-def test_send_daily_digest_skips_old_events(setup, tenant_user):
-    """Events older than 24h not included — if all old, no email."""
+def test_send_weekly_digest_skips_old_events(setup, tenant_user):
+    """Events older than 7 days not included — if all old, no email."""
     s = setup
-    tenant_user.daily_digest = True
+    tenant_user.weekly_digest = True
     s.add(
         storage.AlertEvent(
             rule_type="undercut_threshold",
@@ -643,13 +648,13 @@ def test_send_daily_digest_skips_old_events(setup, tenant_user):
             severity="warning",
             title="Old event",
             tenant_id=tenant_user.tenant_id,
-            created_at=utcnow() - timedelta(days=3),
+            created_at=utcnow() - timedelta(days=8),
         )
     )
     s.commit()
 
     with patch("src.notifier.send_email") as mock_email:
-        sent = notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
+        sent = notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id)
         assert sent == 0
         assert not mock_email.called
 
@@ -1185,22 +1190,15 @@ def test_digest_skips_financial_event_with_odd_payload(setup, tenant_user):
         assert not mock_email.called
 
 
-def test_daily_digest_links_to_day_window(setup, tenant_user):
-    s = setup
-    tenant_user.daily_digest = True
-    run = _eligible_run(s, tenant_user.tenant_id)
-    _digest_event(s, run, "undercut_threshold", "critical", "Today event", site="aloe")
-    s.commit()
-
-    with patch("src.notifier.send_email") as mock_email:
-        notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
-    assert mock_email.call_args.kwargs["subject"] == (
-        "Pharmacy Monitor — дайджест за сутки: 1 событие, из них 1 критичное"
-    )
-    body = mock_email.call_args.kwargs["html_body"]
-    assert 'href="https://example.com/alerts?hours=24"' in body
-    assert 'href="https://example.com/alerts?hours=24&amp;type=undercut_threshold"' in body
-    assert "hours=168" not in body
+def test_weekly_is_the_only_digest_window():
+    """Суточного окна у дайджеста нет: вид `daily` не собирается ни в письмо, ни
+    в ссылку — он падает, а не подставляет неделю молча."""
+    assert set(notifications._DIGEST_WINDOWS) == {"weekly"}
+    assert not hasattr(notifications, "send_daily_digest")
+    with pytest.raises(KeyError):
+        notifications._digest_subject([], "daily")
+    with pytest.raises(KeyError):
+        notifications._alerts_url("daily")
 
 
 def test_digest_only_sends_to_one_opted_in_recipient(setup, tenant_user):
@@ -1377,7 +1375,10 @@ def test_bind_telegram_refuses_a_viewer(setup, tenant_user):
     assert not mock_tg.called
 
 
-# (порог писем, ежедневный, недельный, чат Telegram, порог Telegram, тихие часы)
+# (порог писем, галочка ежедневного, недельный, чат Telegram, порог Telegram, тихие часы)
+# Вторая колонка — значение, оставшееся в базе от ежедневного дайджеста. Его нет
+# с 2026-10-13, и ни на отправку, ни на ответ баннеру оно не влияет: строки с
+# `True` стоят здесь затем, чтобы это проверялось.
 _REACH_CASES = [
     ("off", False, True, None, None, None),  # сотрудник клиента с 2026-10-13
     ("off", False, False, None, None, None),  # не доходит ничего
@@ -1385,14 +1386,15 @@ _REACH_CASES = [
     ("info", False, False, None, None, None),
     ("warning", False, False, None, None, None),
     ("critical", False, False, None, None, None),
-    ("warning", True, False, None, None, None),  # ежедневный дайджест отменяет письма сразу
+    ("warning", True, False, None, None, None),  # старая галочка письма сразу не отменяет
     ("warning", True, True, None, None, None),
     ("off", True, True, None, None, None),
+    ("off", True, False, None, None, None),  # и сама доставкой не считается
     ("off", False, False, "700300", None, None),  # чат привязан, порог по умолчанию
     ("off", False, False, "700300", "info", None),
     ("off", False, False, "700300", "off", None),
     ("off", True, False, "700300", "off", None),
-    ("off", True, False, "700300", None, None),  # ежедневный дайджест Telegram не отменяет
+    ("off", True, False, "700300", None, None),
     # Равные часы — тихо круглые сутки: Telegram не уходит никогда. Окно на
     # часть суток здесь не стоит: исход зависел бы от часа запуска теста.
     ("off", False, False, "700300", None, "5-5"),
@@ -1401,19 +1403,13 @@ _REACH_CASES = [
 ]
 
 
-@pytest.mark.parametrize(
-    ("daily_on", "weekly_on"), [(False, True), (True, True), (False, False), (True, False)]
-)
+@pytest.mark.parametrize("weekly_on", [True, False])
 @pytest.mark.parametrize("prefs", _REACH_CASES)
 def test_anything_reaches_agrees_with_what_is_actually_sent(
-    setup, tenant_user, prefs, daily_on, weekly_on
+    setup, tenant_user, prefs, weekly_on
 ):
     """Ответ для баннера сверяется с тем, что шлют сами отправители: критичное
-    событие прогона и те дайджесты, чей таймер считается идущим.
-
-    Ежедневный дайджест здесь шлёт `send_daily_digest` — на сервере её зовёт
-    только кнопка: юнита, который слал бы её по таймеру, в `infra/systemd/` нет.
-    """
+    событие прогона и недельный дайджест, когда его таймер считается идущим."""
     s = setup
     (
         tenant_user.email_severity_min,
@@ -1432,19 +1428,11 @@ def test_anything_reaches_agrees_with_what_is_actually_sent(
         patch("src.notifier.send_telegram_message") as mock_tg,
     ):
         notifications.dispatch_events_batch(s, [event])
-        if daily_on:
-            notifications.send_daily_digest(s, tenant_id=tenant_user.tenant_id)
         if weekly_on:
             notifications.send_weekly_digest(s, tenant_id=tenant_user.tenant_id)
         delivered = mock_email.called or mock_tg.called
 
-    assert (
-        notifications.anything_reaches(
-            tenant_user, daily_digest_on=daily_on, weekly_digest_on=weekly_on
-        )
-        is delivered
-    )
-
+    assert notifications.anything_reaches(tenant_user, weekly_digest_on=weekly_on) is delivered
 
 
 def test_quiet_hours_for_part_of_the_day_still_count_as_telegram_delivery(setup, tenant_user):
@@ -1455,9 +1443,7 @@ def test_quiet_hours_for_part_of_the_day_still_count_as_telegram_delivery(setup,
 
     def reaches(quiet_hours):
         tenant_user.quiet_hours = quiet_hours
-        return notifications.anything_reaches(
-            tenant_user, daily_digest_on=False, weekly_digest_on=False
-        )
+        return notifications.anything_reaches(tenant_user, weekly_digest_on=False)
 
     partial = (None, "22-08", "8-22", "23-0", "0-23", "1-0", "not-hours")
     assert [reaches(q) for q in partial] == [True] * len(partial)

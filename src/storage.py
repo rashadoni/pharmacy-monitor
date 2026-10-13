@@ -591,8 +591,13 @@ class TenantUser(Base):
     telegram_severity_min: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # Quiet hours: "22-08" means no telegram between 22:00 and 08:00 local time. None = always on.
     quiet_hours: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    # Daily / weekly digest opt-in.
+    # Колонка без читателей (2026-10-13): ежедневного дайджеста получателя нет,
+    # значение никто не читает и не меняет. Осталась, потому что в базе она NOT
+    # NULL: модель без неё разошлась бы с миграциями. Удалять — миграцией,
+    # отдельным релизом. Новый код по ней ничего не решает:
+    # `tests/test_daily_digest_is_gone.py`.
     daily_digest: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Weekly digest opt-in.
     weekly_digest: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
