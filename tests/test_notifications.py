@@ -4,7 +4,6 @@ Covers:
   - severity threshold filtering (info < warning < critical < off)
   - quiet hours window
   - dispatch_event marks channels_sent
-  - bind_telegram links chat_id by email
   - digest sends to opted-in users only
 """
 
@@ -109,29 +108,6 @@ def test_quiet_hours_invalid_format():
     """Bad input shouldn't crash — return False."""
     assert notifications._in_quiet_hours("garbage") is False
     assert notifications._in_quiet_hours("25-30") is False  # parsing succeeds but logic still works
-
-
-# ─── bind_telegram ──────────────────────────────────────────────────────────
-
-
-def test_bind_telegram_existing_user(setup, tenant_user):
-    s = setup
-    bound = notifications.bind_telegram(s, "12345", "alice@example.com")
-    assert bound is True
-    s.refresh(tenant_user)
-    assert tenant_user.telegram_chat_id == "12345"
-
-
-def test_bind_telegram_unknown_email(setup, tenant_user):
-    s = setup
-    bound = notifications.bind_telegram(s, "99999", "nobody@example.com")
-    assert bound is False
-
-
-def test_bind_telegram_normalizes_email(setup, tenant_user):
-    s = setup
-    bound = notifications.bind_telegram(s, "555", "  ALICE@EXAMPLE.COM  ")
-    assert bound is True
 
 
 # ─── dispatch_event ─────────────────────────────────────────────────────────

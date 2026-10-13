@@ -4,19 +4,28 @@
     pharmacy-monitor telegram run-bot
 
 Поддерживаемые команды:
-    /start  — приветствие + пояснение как привязать chat_id
+    /start  — приветствие; `/start <код>` привязывает чат к аккаунту
     /help   — список команд
     /today  — краткая сводка за сегодня (KPI + топ-3 действия)
     /alerts — последние 5 алертов
     /status — здоровье системы
+    /stop   — отвязать этот чат от аккаунта
+
+`/today`, `/alerts` и `/status` отвечают только чату, привязанному к
+действующему аккаунту (`requires_binding`): бота в Telegram находит кто угодно.
+`/today` и `/alerts` показывают данные тенанта этого пользователя, `/status` —
+состояние системы целиком. Код привязки выдаёт дашборд —
+`src/telegram_binding.py`.
 
 Использует raw HTTP через urllib (без python-telegram-bot — лишняя зависимость).
 """
 
 from __future__ import annotations
 
+import functools
 import os
 import time
+from datetime import timedelta
 from src._time import utcnow
 from typing import Callable
 
@@ -30,39 +39,36 @@ log = structlog.get_logger()
 
 
 def cmd_start(session: Session, chat_id: str, args: str) -> str:
-    """Привязка chat_id к существующему TenantUser по email.
+    """Привязка чата к аккаунту по одноразовому коду из дашборда.
 
-    Usage: /start <email>     — пытается привязать к пользователю с этим email
-           /start             — без аргумента просто показывает chat_id и инструкцию
+    Usage: /start <код>       — привязать чат к аккаунту, которому выдан код
+           /start             — без аргумента показывает chat_id и инструкцию
+
+    Аргумент — всегда код. Адрес бот не принимает и не ищет: на `/start
+    <адрес>` ответ тот же, что на любой неверный код, есть такой пользователь
+    или нет.
     """
-    from src import notifications
+    from src import telegram_binding
 
-    email = args.strip().lower() if args else ""
-    if email and "@" in email:
-        bound = notifications.bind_telegram(session, chat_id, email)
-        if bound:
-            return (
-                "✅ *Привязано!*\n\n"
-                f"Email: `{email}`\n"
-                f"Chat ID: `{chat_id}`\n\n"
-                "Теперь будешь получать алерты сюда (по умолчанию — critical).\n"
-                "Настройки уведомлений: дашборд → ⚙️ Настройки.\n\n"
-                "Команды: /today /alerts /status /help"
-            )
-        return (
-            f"❌ Email `{email}` не найден или неактивен.\n\n"
-            "Сначала аккаунт должен быть создан (admin → Получатели в дашборде)."
-        )
+    if args.strip():
+        outcome = telegram_binding.bind_chat(session, chat_id, args)
+        if outcome is telegram_binding.BindOutcome.BOUND:
+            return BIND_OK_REPLY
+        if outcome is telegram_binding.BindOutcome.LOCKED:
+            return BIND_LOCKED_REPLY.format(minutes=_minutes(telegram_binding.ATTEMPT_WINDOW))
+        return BIND_REFUSED_REPLY
     return (
         "👋 *Привет!* Это Pharmacy Monitor.\n\n"
         f"Твой `chat_id`: `{chat_id}`\n\n"
-        "Чтобы привязать chat к аккаунту:\n"
-        "  `/start your-email@example.com`\n\n"
-        "После этого будешь получать сюда алерты автоматически.\n\n"
+        "Чтобы привязать чат к аккаунту:\n"
+        "1. дашборд → ⚙️ Настройки → Уведомления → «Получить код привязки»;\n"
+        "2. отправь код сюда: `/start <код>`.\n\n"
+        f"Код действует {_minutes(telegram_binding.CODE_TTL)} минут и срабатывает один раз.\n\n"
         "Команды:\n"
         "/today — что нового за сегодня\n"
         "/alerts — последние алерты\n"
         "/status — здоровье системы\n"
+        "/stop — отвязать этот чат\n"
         "/help — справка"
     )
 
@@ -70,19 +76,83 @@ def cmd_start(session: Session, chat_id: str, args: str) -> str:
 def cmd_help(session: Session, chat_id: str, args: str) -> str:
     return (
         "*Pharmacy Monitor бот*\n\n"
-        "/start — приветствие + chat_id\n"
+        "/start — приветствие; `/start <код>` привязывает чат\n"
         "/today — KPI + топ-3 действия\n"
         "/alerts — последние 5 событий\n"
         "/status — здоровье системы\n"
+        "/stop — отвязать этот чат\n"
         "/help — это сообщение"
     )
 
 
-def cmd_today(session: Session, chat_id: str, args: str) -> str:
+def cmd_stop(session: Session, chat_id: str, args: str) -> str:
+    """Отвязать этот чат. Чужой чат отсюда не отвязать: команда видит только свой."""
+    from src import telegram_binding
+
+    if telegram_binding.unbind_chat(session, chat_id):
+        return UNBOUND_REPLY
+    return NOT_BOUND_REPLY
+
+
+BIND_OK_REPLY = (
+    "✅ *Привязано.*\n\n"
+    "Алерты будут приходить сюда (по умолчанию — critical).\n"
+    "Настройки уведомлений: дашборд → ⚙️ Настройки.\n\n"
+    "Команды: /today /alerts /status /help\n"
+    "Отвязать этот чат: /stop"
+)
+# Один текст на любой отказ: по ответу не узнать ни того, есть ли такой код,
+# ни того, есть ли такой пользователь.
+BIND_REFUSED_REPLY = (
+    "❌ Код не подошёл.\n\n"
+    "Он неверный, уже использован или истёк, либо этот чат или аккаунт уже "
+    "привязаны.\n\n"
+    "Новый код: дашборд → ⚙️ Настройки → Уведомления → «Получить код привязки»."
+)
+BIND_LOCKED_REPLY = (
+    "⏳ Слишком много неудачных попыток. Попробуй позже: блокировка длится до {minutes} минут."
+)
+UNBOUND_REPLY = (
+    "🔕 Чат отвязан: алерты сюда больше не приходят.\n\n"
+    "Привязать снова: дашборд → ⚙️ Настройки → Уведомления → «Получить код привязки»."
+)
+NOT_BOUND_REPLY = (
+    "🔒 Этот чат не привязан к аккаунту Pharmacy Monitor.\n\n"
+    "Привязать: дашборд → ⚙️ Настройки → Уведомления → «Получить код привязки», "
+    "затем отправь сюда `/start <код>`."
+)
+
+BoundHandler = Callable[[Session, storage.TenantUser, str], str]
+
+
+def _minutes(span: timedelta) -> int:
+    return int(span.total_seconds() // 60)
+
+
+def requires_binding(handler: BoundHandler) -> Callable[[Session, str, str], str]:
+    """Команда отвечает только чату, привязанному к действующему аккаунту.
+
+    Обёрнутая функция получает пользователя вместо chat_id.
+    """
+
+    @functools.wraps(handler)
+    def guarded(session: Session, chat_id: str, args: str) -> str:
+        from src import telegram_binding
+
+        user = telegram_binding.user_for_chat(session, chat_id)
+        if user is None:
+            return NOT_BOUND_REPLY
+        return handler(session, user, args)
+
+    return guarded
+
+
+@requires_binding
+def cmd_today(session: Session, user: storage.TenantUser, args: str) -> str:
     """Краткая сводка: топ-3 действия из ROI."""
     from src import roi
 
-    actions = roi.get_cached_action_items(session, roi.CLIENT_SITE, tenant_id=1)
+    actions = roi.get_cached_action_items(session, roi.CLIENT_SITE, tenant_id=user.tenant_id)
     if actions is None:
         return (
             "📊 *Сегодня:* рекомендации временно недоступны — "
@@ -115,10 +185,14 @@ def cmd_today(session: Session, chat_id: str, args: str) -> str:
     return "\n".join(lines)
 
 
-def cmd_alerts(session: Session, chat_id: str, args: str) -> str:
+@requires_binding
+def cmd_alerts(session: Session, user: storage.TenantUser, args: str) -> str:
     """Последние 5 алертов."""
     events = session.scalars(
-        select(storage.AlertEvent).order_by(desc(storage.AlertEvent.created_at)).limit(5)
+        select(storage.AlertEvent)
+        .where(storage.AlertEvent.tenant_id == user.tenant_id)
+        .order_by(desc(storage.AlertEvent.created_at))
+        .limit(5)
     ).all()
     if not events:
         return "🔔 Алертов ещё не было."
@@ -130,7 +204,8 @@ def cmd_alerts(session: Session, chat_id: str, args: str) -> str:
     return "\n".join(lines)
 
 
-def cmd_status(session: Session, chat_id: str, args: str) -> str:
+@requires_binding
+def cmd_status(session: Session, user: storage.TenantUser, args: str) -> str:
     """Health-check кратко."""
     from src import health
 
@@ -151,7 +226,14 @@ COMMANDS: dict[str, Callable[[Session, str, str], str]] = {
     "/today": cmd_today,
     "/alerts": cmd_alerts,
     "/status": cmd_status,
+    "/stop": cmd_stop,
 }
+
+
+def _is_this_bot(name: str) -> bool:
+    """Имя после «@» в команде — наше. Пока своё имя не задано, верим любому."""
+    own = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+    return not own or name.lower() == own.lower()
 
 
 def handle_update(session: Session, update: dict) -> None:
@@ -160,12 +242,17 @@ def handle_update(session: Session, update: dict) -> None:
     if not msg:
         return
     chat = msg.get("chat") or {}
-    chat_id = str(chat.get("id"))
+    if chat.get("id") is None:
+        return
+    chat_id = str(chat["id"])
     text = (msg.get("text") or "").strip()
     if not text.startswith("/"):
         return  # игнорируем не-команды
     parts = text.split(maxsplit=1)
-    cmd = parts[0].split("@")[0].lower()  # /today@bot_name → /today
+    cmd, _, addressed_to = parts[0].partition("@")  # /today@bot_name → /today
+    cmd = cmd.lower()
+    if addressed_to and not _is_this_bot(addressed_to):
+        return  # в группе: команда другому боту, а `/stop` отвязывает чат
     args = parts[1] if len(parts) > 1 else ""
 
     handler = COMMANDS.get(cmd)

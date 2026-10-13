@@ -1421,6 +1421,12 @@ export const api = {
     request<void>("/api/v1/dash/me/notifications/telegram", {
       method: "DELETE",
     }),
+  // Одноразовый код привязки чата: показывается один раз, боту — `/start <код>`.
+  notifTelegramBindCode: () =>
+    request<{ code: string; expires_in_sec: number }>(
+      "/api/v1/dash/me/notifications/telegram/code",
+      { method: "POST" },
+    ),
   integrations: () => request<IntegrationsStatus>("/api/v1/dash/integrations"),
   changePassword: (current_password: string, new_password: string) =>
     request<{ ok: true }>("/api/v1/dash/me/password", {

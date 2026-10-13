@@ -27,6 +27,30 @@ def db_session():
     engine.dispose()
 
 
+@pytest.fixture
+def bound_chat(db_session):
+    """Чат «12345», привязанный к действующему пользователю.
+
+    `/today`, `/alerts` и `/status` бота отвечают только такому чату.
+    """
+    from src import tenants
+    from src._time import utcnow
+    from src.storage import TenantUser
+
+    tenant = tenants.get_or_create_default(db_session)
+    user = TenantUser(
+        tenant_id=tenant.id,
+        email="bound@client.example",
+        role="viewer",
+        is_active=True,
+        created_at=utcnow(),
+        telegram_chat_id="12345",
+    )
+    db_session.add(user)
+    db_session.commit()
+    return user
+
+
 @pytest.fixture(autouse=True)
 def _reset_catalog_search_index():
     """Индекс поиска живёт в памяти процесса — у каждого теста своя БД."""
