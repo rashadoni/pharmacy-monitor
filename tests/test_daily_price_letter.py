@@ -886,20 +886,22 @@ def test_letter_says_when_each_site_was_collected_and_warns_about_an_old_one(
     assert report["overdue_sites"] == ["aloe"]
 
 
-def test_site_data_is_old_only_past_what_its_rhythm_allows(setup, monkeypatch):
-    """Порог — ритм сбора сайта с запасом (`cadence.site_max_age_hours`), не своё число."""
+def test_site_data_is_old_only_past_what_its_rhythm_allows(setup):
+    """Порог возраста — ритм сбора сайта с запасом (`cadence.site_max_age_hours`), не
+    своё число. Час берётся сразу после открытия окна ритма: ночные будильники
+    ещё впереди, и второе правило («в этом окне сайт не собран») молчит."""
     s = setup
     tenants.get_or_create_default(s)
-    monkeypatch.setattr(notifications, "utcnow", lambda: MORNING)
-    _trusted_run(s, sites=("pharmonline",), finished_at=MORNING - _hours("pharmonline"))
+    evening = cadence.cadence_window_start("pharmonline", MORNING) + timedelta(hours=1)
+    _trusted_run(s, sites=("pharmonline",), finished_at=evening - _hours("pharmonline"))
     _trusted_run(
         s,
         sites=("aptekonline",),
-        finished_at=MORNING - _hours("aptekonline") - timedelta(minutes=1),
+        finished_at=evening - _hours("aptekonline") - timedelta(minutes=1),
     )
     s.commit()
 
-    ages = {age.site: age for age in notifications._site_data_ages(s, 1, MORNING)}
+    ages = {age.site: age for age in notifications._site_data_ages(s, 1, evening)}
 
     assert ages["pharmonline"].overdue is False
     assert ages["aptekonline"].overdue is True
@@ -908,16 +910,17 @@ def test_site_data_is_old_only_past_what_its_rhythm_allows(setup, monkeypatch):
 
 
 def test_old_data_warning_follows_the_rhythm_map(setup, reader, monkeypatch):
-    """Ритм сбора меняют в одном месте — `cadence.SITE_SCRAPE_CADENCE_HOURS`. Те же
-    данные двухдневной давности при недельном ритме в порядке, при суточном — старые."""
+    """Ритм сбора меняют в одном месте — `cadence.SITE_SCRAPE_CADENCE_HOURS`. Сбор
+    позапрошлой ночи (утро вторника, собрано в ночь на понедельник): при недельном
+    ритме он в текущем окне и в порядке, при суточном — прошлая ночь пропущена."""
     s = setup
     monkeypatch.setattr(notifications, "utcnow", lambda: MORNING)
-    run = _trusted_run(s, finished_at=MORNING - timedelta(days=2))
+    run = _trusted_run(s, finished_at=MORNING - timedelta(hours=26))
     _pair(s, run, "Товар", {"pharmonline": 10.0, "aptekonline": 8.0})
 
     def warned_sites() -> list[str]:
         _sent, calls = _send_daily(s)
-        return re.findall(r"Данные (\w+) — от 11\.10\.2026", _text(calls[0].kwargs["html_body"]))
+        return re.findall(r"Данные (\w+) — от 12\.10\.2026", _text(calls[0].kwargs["html_body"]))
 
     for site in SITES:
         monkeypatch.setitem(cadence.SITE_SCRAPE_CADENCE_HOURS, site, 168)
@@ -932,11 +935,12 @@ def test_old_data_warning_follows_the_rhythm_map(setup, reader, monkeypatch):
     assert warned_sites() == ["Pharmonline", "Aptekonline", "Aloe"]
 
 
-def test_one_missed_night_of_a_daily_rhythm_is_not_yet_old_data(setup, monkeypatch):
-    """При суточном ритме порог — 30 часов (сутки и запас). Письмо уходит в 05:00
-    UTC, ночной сбор кончается около 01:00: после одной пропущенной ночи данным
-    28 часов — строки-предупреждения ещё нет, дата в письме вчерашняя. После двух
-    ночей — есть."""
+def test_one_missed_night_is_said_in_the_morning_letter(setup, monkeypatch):
+    """При суточном ритме порог возраста — 30 часов, а письмо уходит в 05:00 UTC,
+    через 28 часов после вчерашнего сбора: по одному возрасту утро после
+    пропущенной ночи выглядело бы обычным, только с вчерашней датой. Поэтому
+    «старыми» данные считаются и тогда, когда в текущем окне ритма сайт не
+    собран, а ночные будильники своё время уже отработали."""
     s = setup
     tenants.get_or_create_default(s)
     monkeypatch.setitem(cadence.SITE_SCRAPE_CADENCE_HOURS, "aloe", 24)
@@ -948,8 +952,27 @@ def test_one_missed_night_of_a_daily_rhythm_is_not_yet_old_data(setup, monkeypat
         return {age.site: age for age in notifications._site_data_ages(s, 1, letter_at)}["aloe"]
 
     assert aloe(datetime(2026, 10, 12, 5, 0)).overdue is False  # сбор был этой ночью
-    assert aloe(datetime(2026, 10, 13, 5, 0)).overdue is False  # одну ночь пропустили: 28 ч
-    assert aloe(datetime(2026, 10, 14, 5, 0)).overdue is True  # две ночи: 52 ч
+    # Вечером окно следующей ночи уже открыто (22:00 UTC), но будильники ещё
+    # впереди: вчерашний сбор — не пропуск.
+    assert aloe(datetime(2026, 10, 12, 23, 0)).overdue is False
+    night_is_over = datetime(2026, 10, 12, 22, 0) + timedelta(hours=cadence.CADENCE_GRACE_HOURS)
+    assert aloe(night_is_over - timedelta(minutes=1)).overdue is False
+    assert aloe(night_is_over).overdue is True
+    assert aloe(datetime(2026, 10, 13, 5, 0)).overdue is True  # утреннее письмо: ночь пропущена
+
+
+def test_run_that_started_before_the_window_does_not_count_for_this_night(setup, monkeypatch):
+    """Сбор относится к окну, в котором начался, — как у гварда в `run`: начатый до
+    22:00 UTC и законченный после несёт вчерашние данные, ночной будильник соберёт заново."""
+    s = setup
+    tenants.get_or_create_default(s)
+    monkeypatch.setitem(cadence.SITE_SCRAPE_CADENCE_HOURS, "aloe", 24)
+    _trusted_run(s, sites=("aloe",), finished_at=datetime(2026, 10, 12, 22, 20))  # начат в 21:50
+    s.commit()
+
+    ages = {a.site: a for a in notifications._site_data_ages(s, 1, datetime(2026, 10, 13, 5, 0))}
+
+    assert ages["aloe"].overdue is True
 
 
 def test_site_without_a_trusted_full_run_is_named_in_the_letter(setup, reader):

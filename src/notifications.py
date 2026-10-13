@@ -781,6 +781,15 @@ def _site_data_ages(session: Session, tenant_id: int, now: datetime) -> tuple[_S
     сбора. `product_policy._site_full_run_state` дешевле, но смотрит только на
     последнюю попытку: если она проверку не прошла, он не называет никакого
     сбора — а письму в этот день как раз и нужна дата последних годных данных.
+
+    Данные «старые» (`overdue`) в двух случаях. Первый — порог health: сбор
+    старше, чем позволяет ритм сайта с запасом (`cadence.site_max_age_hours`).
+    Второй строже и нужен письму: в текущем окне ритма сайт не собран, хотя
+    ночные будильники своё время уже отработали (от открытия окна прошёл запас
+    `CADENCE_GRACE_HOURS`). При суточном ритме порог health — 30 часов, письмо
+    уходит через 28 после вчерашнего сбора: без второго правила утро после
+    пропущенной ночи выглядело бы в письме как обычное, только с вчерашней
+    датой. Сбор относится к окну, в котором начался, — как у гварда в `run`.
     """
     run_ids = storage.latest_financial_run_ids_by_site(
         session, comparison_export.SITES, tenant_id=tenant_id
@@ -799,8 +808,12 @@ def _site_data_ages(session: Session, tenant_id: int, now: datetime) -> tuple[_S
     for site in comparison_export.SITES:
         run = runs.get(run_ids.get(site))
         collected_at = (run.finished_at or run.started_at) if run is not None else None
-        overdue = collected_at is None or (
-            now - collected_at > timedelta(hours=cadence.site_max_age_hours(site))
+        window_opened = cadence.cadence_window_start(site, now)
+        night_is_over = now - window_opened >= timedelta(hours=cadence.CADENCE_GRACE_HOURS)
+        overdue = (
+            collected_at is None
+            or now - collected_at > timedelta(hours=cadence.site_max_age_hours(site))
+            or (night_is_over and run.started_at < window_opened)
         )
         ages.append(_SiteDataAge(site=site, collected_at=collected_at, overdue=overdue))
     return tuple(ages)
