@@ -2712,6 +2712,10 @@ def _fail_if_scrape_lock_lost(*, noticed: str) -> None:
 
     `noticed` — когда заметили («before matching»): попадает в причину прогона.
     Без настоящего замка (SQLite, подмена в тестах) проверять нечего.
+
+    Замок находится по контексту click, а он свой у каждого потока: проверка,
+    вызванная из другого потока (колбэк записи, вынесенный в `to_thread`), замка
+    не найдёт и промолчит. Звать её только из потока команды.
     """
     context = click.get_current_context(silent=True)
     held = _SCRAPE_LOCKS_BY_COMMAND.get(context) if context is not None else None
@@ -3757,7 +3761,8 @@ def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, r
 
     Отдельно — сервер, который недоступен (`_database_may_come_back`): в записи
     он не отказывал, поэтому та же попытка повторяется после паузы, с теми же
-    полями, пока не выйдут паузы из `_RUN_OUTCOME_WAITS_FOR_DATABASE`. Без этого
+    полями, пока не выйдут паузы из `_RUN_OUTCOME_WAITS_FOR_DATABASE`; когда они
+    вышли, остаётся та же последняя попытка без перенесённых полей. Без этого
     прогон, остановленный потерей замка сбора, оставался бы `running` как раз
     при перезапуске PostgreSQL: о потере он узнаёт за миллисекунды, и запись
     итога приходилась бы на секунды, пока сервер ещё не принимает соединения.
@@ -3808,17 +3813,19 @@ def _write_failed_run_outcome(session: Session, run: storage.Run, run_id: int, r
                     session.rollback()
                 if _database_may_come_back(write_error):
                     seconds = next(waits, None)
-                    if seconds is None:
-                        raise
-                    with suppress(Exception):
-                        log.warning(
-                            "run_failure_write_waits_for_database",
-                            run_id=run_id,
-                            seconds=seconds,
-                            error=type(write_error).__name__,
-                        )
-                    _wait_for_the_database(seconds)
-                    continue
+                    if seconds is not None:
+                        with suppress(Exception):
+                            log.warning(
+                                "run_failure_write_waits_for_database",
+                                run_id=run_id,
+                                seconds=seconds,
+                                error=type(write_error).__name__,
+                            )
+                        _wait_for_the_database(seconds)
+                        continue
+                    # Паузы вышли. Если дело было не в сервере, а в перенесённом
+                    # поле (отказ, похожий на недоступность), итог один ещё
+                    # можно записать — как после любого отказа в записи.
                 if outcome_alone:
                     raise
                 with suppress(Exception):
@@ -5895,6 +5902,7 @@ def run_cmd(
                 filtered = {s: urls for s, urls in watchlist_urls.items() if s in sites and urls}
                 quality_sites = list(filtered)
                 results = asyncio.run(scrape_watchlist_all(filtered))
+                _fail_if_scrape_lock_lost(noticed="after the scrape")
             elif effective_mode == "public_api":
                 # One synthetic route represents the public global catalog.
                 # The scraper buffers every page and checks its sitemap before
@@ -5920,6 +5928,9 @@ def run_cmd(
                         on_category=None,
                     )
                 )
+                # У этого сбора колбэка по категориям нет: первая проверка —
+                # здесь, раньше любого шага, который пишет по его итогам.
+                _fail_if_scrape_lock_lost(noticed="after the scrape")
             else:
                 # Категории из БД, опционально фильтр по одной category_id
                 slugs_by_site = {
@@ -6118,6 +6129,10 @@ def run_cmd(
                 run.status = quality_status
             session.commit()
 
+            # Финальный проход мог идти минуты. Дальше заявка из очереди получает
+            # итог сбора, а проверка покрытия пишет события в журнал алертов.
+            _fail_if_scrape_lock_lost(noticed="after the final write")
+
             # === Early-complete для UI-triggered bounded scrape (job queue) ===
             # Full-catalog runs stay running until matcher/alerts/analyzer/ROI
             # finish, because publishing ok earlier would expose untrusted money
@@ -6165,10 +6180,6 @@ def run_cmd(
                     run_id=run.id,
                     quality=quality,
                 )
-
-            # Финальный проход мог идти минуты, а проверка покрытия ниже пишет
-            # события в журнал алертов.
-            _fail_if_scrape_lock_lost(noticed="after the final write")
 
             # === Smoke-test: per-site coverage drop ===
             # Если конкретный сайт собрал <50% от среднего за последние 5 ok-runs —

@@ -43,6 +43,7 @@ from uuid import uuid4
 import pytest
 from click.testing import CliRunner
 from sqlalchemy import create_engine, event, select, text
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -859,6 +860,50 @@ def test_carried_field_the_database_refuses_does_not_cost_the_outcome(
             for name, fields in retried
             if name == "run_failure_write_retried"
         ] == [["catalog_verification_reason", "tenant_id"]]
+
+
+def test_outcome_alone_is_still_written_when_waiting_did_not_help(db_session, monkeypatch):
+    """Отказ, который выглядит недоступностью сервера, а вызван полем,
+    выставленным на прогоне перед сбоем: сколько ни жди, запись с этим полем не
+    пройдёт. Когда паузы вышли, итог пишется один — как после любого отказа в
+    записи; без этого прогон оставался бы `running`."""
+    run = storage.Run(status="running", started_at=utcnow())
+    db_session.add(run)
+    db_session.commit()
+    run_id = run.id
+    run.catalog_verification_reason = "a value the server chokes on"
+    engine = db_session.get_bind()
+
+    def chokes_on_the_field(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE") and (
+            "catalog_verification_reason" in statement
+        ):
+            raise sa_exc.OperationalError(statement, {}, Exception("program limit exceeded"))
+
+    waited: list[float] = []
+    monkeypatch.setattr(main_mod, "_wait_for_the_database", waited.append)
+    warned = _record_log(monkeypatch, main_mod, "warning")
+
+    def record_failure():
+        run.status = "failed"
+        run.error_message = "ValueError: boom"
+        run.finished_at = utcnow()
+
+    event.listen(engine, "before_cursor_execute", chokes_on_the_field)
+    try:
+        main_mod._write_failed_run_outcome(db_session, run, run_id, record_failure)
+    finally:
+        event.remove(engine, "before_cursor_execute", chokes_on_the_field)
+
+    db_session.rollback()
+    db_session.expire_all()
+    stored = db_session.get(storage.Run, run_id)
+    assert waited == list(main_mod._RUN_OUTCOME_WAITS_FOR_DATABASE), "сначала ждали сервер"
+    assert (stored.status, stored.error_message) == ("failed", "ValueError: boom")
+    assert stored.catalog_verification_reason is None
+    assert [
+        fields["dropped_fields"] for name, fields in warned if name == "run_failure_write_retried"
+    ] == [["catalog_verification_reason"]]
 
 
 def _half_done_then_broken_in_code(session, run):
