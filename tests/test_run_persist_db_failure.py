@@ -878,10 +878,12 @@ def _half_done_then_broken_in_code(session, run):
 def test_unfinished_work_of_a_failed_step_is_not_saved_with_the_outcome(db_session, monkeypatch):
     """Шаг упал в коде, успев отправить в базу половину своей работы. Раньше
     commit итога сохранял эту половину вместе с `failed`; теперь итог пишется на
-    чистой транзакции."""
+    чистой транзакции. Итог записан — и строки о том, что он не записан, в
+    журнале нет."""
     monkeypatch.setattr(
         storage, "confirm_prices_of_latest_verified_runs", _half_done_then_broken_in_code
     )
+    logged = _record_log(monkeypatch, main_mod, "exception")
     catalog = {"cat-a": [_scraped("a", 5.0, "cat-a")]}
 
     run, _ = _run_catalog(db_session, monkeypatch, catalog, expected_status="failed")
@@ -890,6 +892,7 @@ def test_unfinished_work_of_a_failed_step_is_not_saved_with_the_outcome(db_sessi
     assert run.error_message == "ValueError: step broke halfway"
     assert run.products_scraped == 1, "сохранённое до шага остаётся"
     assert _external_ids(db_session) == ["a"]
+    assert [name for name, _ in logged] == ["run_failed"]
 
 
 @pytest.mark.parametrize("log_stream", ["alive", "dead"])

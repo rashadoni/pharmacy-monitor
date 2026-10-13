@@ -538,7 +538,7 @@ def test_run_is_closed_as_failed_once_the_restarted_server_accepts_connections(
         lock_db.server.accepts_connections_again()
 
     monkeypatch.setattr(main_mod, "_wait_for_the_database", server_comes_back)
-    logged = _record_log(monkeypatch, main_mod, "warning")
+    logged = _record_log(monkeypatch, main_mod, "warning", "exception")
     steps = _Steps(monkeypatch)
     catalog = _three_categories()
 
@@ -559,6 +559,7 @@ def test_run_is_closed_as_failed_once_the_restarted_server_accepts_connections(
         for name, fields in logged
         if name == "run_failure_write_waits_for_database"
     ] == [(waited[0], "OperationalError")]
+    assert "run_failure_not_recorded" not in [name for name, _ in logged], "итог записан"
     assert writes == [("cat-a", "ok"), ("cat-b", "OperationalError")]
     assert run.error_message.startswith(_lost_lock_reason("after a failed category write"))
     assert run.finished_at is not None
