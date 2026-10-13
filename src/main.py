@@ -3063,7 +3063,11 @@ def persist_aloe_country_mappings(
     *,
     tenant_id: int = 1,
 ) -> int:
-    """Upsert detail-verified Aloe country dictionary discoveries."""
+    """Upsert detail-verified Aloe country dictionary discoveries.
+
+    Коммитит сам: словарь проверен по карточкам и от судьбы записи сбора не
+    зависит, а `persist_results`, упав, откатывает всё незакоммиченное.
+    """
     changed = 0
     for result in results:
         if result.site != "aloe":
@@ -3102,7 +3106,7 @@ def persist_aloe_country_mappings(
                 row.verified_at = utcnow()
                 changed += 1
     if changed:
-        session.flush()
+        session.commit()
     return changed
 
 
@@ -3580,6 +3584,47 @@ def mark_scrape_request_terminal(
     return request
 
 
+def _write_failed_run_outcome(session: Session, run_id: int, record) -> bool:
+    """Записать итог упавшего прогона — и тогда, когда упала сама база.
+
+    `record()` выставляет поля итога и коммитит. Шаг, упавший на ошибке базы,
+    оставляет сессию с транзакцией, которую надо откатить, — иначе итог не
+    запишется, и прогон останется `running`, пока его часов через шесть не
+    закроет вотчер очереди: задним числом и без причины.
+
+    Откат — только когда писать иначе нельзя. В рабочей сессии вместе с итогом
+    сохраняются поля прогона, выставленные прямо перед исключением (причина
+    отказа, `run_quality`), а откат их стирает. После отката `record()`
+    выполняется заново, поэтому всё, что обработчик добавляет к итогу, ставится
+    внутри неё.
+
+    False — итог записать не удалось вовсе (база недоступна). Отказ записи
+    остаётся в журнале отдельной строкой, а вызывающий выходит с причиной, по
+    которой упал сам прогон.
+    """
+    try:
+        if not session.is_active:
+            # Упал flush: несохранённое SQLAlchemy уже отменил сам, а запись в
+            # такую транзакцию отбросил бы с предупреждением.
+            session.rollback()
+        try:
+            record()
+        except Exception as write_error:
+            # Упал запрос мимо flush: сессия считает транзакцию рабочей, а
+            # PostgreSQL до отката не выполняет в ней ничего.
+            log.warning(
+                "run_failure_write_retried_after_rollback",
+                run_id=run_id,
+                error=f"{type(write_error).__name__}: {write_error}",
+            )
+            session.rollback()
+            record()
+    except Exception:
+        log.exception("run_failure_not_recorded", run_id=run_id)
+        return False
+    return True
+
+
 def run_tenant_id_for_request(session: Session, request_id: int | None) -> int:
     """Resolve CLI run ownership from an active queue request."""
     if request_id is None:
@@ -3884,6 +3929,32 @@ def _snapshot_payload_changed(last: dict | None, sp: ScrapedProduct) -> bool:
 
 
 def persist_results(
+    session: Session,
+    run: storage.Run,
+    results: list[ScrapeResult],
+    *,
+    aloe_whole_catalog: bool = False,
+) -> int:
+    """Записать сбор пачками; что и как пишется — в `_persist_chunks`.
+
+    Пачки коммитит сама функция, поэтому недописанную она сама и откатывает:
+    после любого исключения сессия остаётся рабочей, закоммиченные пачки — в
+    базе, от недописанной не остаётся ничего. Вместе с ней откатывается и то,
+    что вызывающий не закоммитил до вызова.
+
+    Раньше отката не было. Колбэк `run` зовёт запись на каждую категорию, а
+    сборщик его исключение ловит и идёт дальше: после одного сбоя базы следующие
+    категории и финальный проход падали на той же сессии, обработчик сбоя не мог
+    записать итог, и прогон оставался `running`.
+    """
+    try:
+        return _persist_chunks(session, run, results, aloe_whole_catalog=aloe_whole_catalog)
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _persist_chunks(
     session: Session,
     run: storage.Run,
     results: list[ScrapeResult],
@@ -5218,6 +5289,7 @@ def ai_crawl_cmd(
         )
         session.add(run)
         session.commit()
+        run_id = run.id
         try:
             try:
                 result = asyncio.run(_run())
@@ -5265,10 +5337,15 @@ def ai_crawl_cmd(
         except RunQualityFailure as e:
             raise click.ClickException(str(e))
         except Exception as e:
-            run.status = "failed"
-            run.error_message = f"{type(e).__name__}: {e}"
-            run.finished_at = utcnow()
-            session.commit()
+            failure_message = f"{type(e).__name__}: {e}"
+
+            def record_failure() -> None:
+                run.status = "failed"
+                run.error_message = failure_message
+                run.finished_at = utcnow()
+                session.commit()
+
+            _write_failed_run_outcome(session, run_id, record_failure)
             raise click.ClickException(str(e))
 
 
@@ -6050,19 +6127,30 @@ def run_cmd(
             if trust_context is not None:
                 trust_context.__exit__(*sys.exc_info())
                 trust_context = None
-            run.status = (
+
+            failure_status = (
                 "degraded" if isinstance(e, FullCatalogVerificationError) else "failed"
             )
-            run.error_message = f"{type(e).__name__}: {e}"
-            run.finished_at = utcnow()
-            if request_id is not None:
-                req = session.get(storage.ScrapeRequest, request_id)
-                if req is not None:
-                    req.run_id = run.id
-                    req.status = run.status
-                    req.completed_at = utcnow()
-            session.commit()
+            failure_message = f"{type(e).__name__}: {e}"
+
+            def record_failure() -> None:
+                """Всё, что обработчик добавляет к итогу, ставится здесь: после
+                отката функция выполняется заново."""
+                run.status = failure_status
+                run.error_message = failure_message
+                run.finished_at = utcnow()
+                if request_id is not None:
+                    req = session.get(storage.ScrapeRequest, request_id)
+                    if req is not None:
+                        req.run_id = run_id
+                        req.status = failure_status
+                        req.completed_at = utcnow()
+                session.commit()
+
+            # Причина — в журнал до записи итога: если база недоступна и итог
+            # записать не удастся, строка останется.
             log.exception("run_failed", run_id=run_id)
+            _write_failed_run_outcome(session, run_id, record_failure)
             # click печатает этот текст сам, мимо маски журнала.
             from src.logging_setup import mask_addresses
 
@@ -6112,6 +6200,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
         )
         session.add(run)
         session.commit()
+        run_id = run.id
         try:
             slugs_by_site = {
                 s: watchlist.categories_for_site(session, s, only_category_id=category_id)
@@ -6172,10 +6261,15 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
         except RunQualityFailure as e:
             raise click.ClickException(str(e))
         except Exception as e:
-            run.status = "failed"
-            run.error_message = str(e)
-            run.finished_at = utcnow()
-            session.commit()
+            failure_message = str(e)
+
+            def record_failure() -> None:
+                run.status = "failed"
+                run.error_message = failure_message
+                run.finished_at = utcnow()
+                session.commit()
+
+            _write_failed_run_outcome(session, run_id, record_failure)
             raise click.ClickException(str(e))
 
 
