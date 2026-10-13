@@ -1392,6 +1392,7 @@ _REACH_CASES = [
     ("off", False, False, "700300", "info", None),
     ("off", False, False, "700300", "off", None),
     ("off", True, False, "700300", "off", None),
+    ("off", True, False, "700300", None, None),  # ежедневный дайджест Telegram не отменяет
     # Равные часы — тихо круглые сутки: Telegram не уходит никогда. Окно на
     # часть суток здесь не стоит: исход зависел бы от часа запуска теста.
     ("off", False, False, "700300", None, "5-5"),
@@ -1458,5 +1459,6 @@ def test_quiet_hours_for_part_of_the_day_still_count_as_telegram_delivery(setup,
             tenant_user, daily_digest_on=False, weekly_digest_on=False
         )
 
-    assert [reaches(q) for q in (None, "22-08", "8-22", "23-0", "0-23", "not-hours")] == [True] * 6
+    partial = (None, "22-08", "8-22", "23-0", "0-23", "1-0", "not-hours")
+    assert [reaches(q) for q in partial] == [True] * len(partial)
     assert [reaches(q) for q in ("0-0", "5-5", "23-23")] == [False] * 3

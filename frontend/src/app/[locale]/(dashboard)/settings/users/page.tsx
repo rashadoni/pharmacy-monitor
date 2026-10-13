@@ -33,6 +33,7 @@ export default function UsersPage() {
     onSuccess: () => {
       invalidate();
       qc.invalidateQueries({ queryKey: ["me"] }); // self-edit → освежить роль/имя
+      qc.invalidateQueries({ queryKey: ["notif-prefs"] }); // и баннер о доставке
     },
   });
   const deleteMut = useMutation({

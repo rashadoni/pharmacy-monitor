@@ -381,6 +381,9 @@ function NotificationsSection({ email }: { email?: string }) {
             <div className="text-xs text-muted-foreground mb-2">{t("quiet_hours_hint")}</div>
             <input
               type="text"
+              // Поле неуправляемое: без key оно держало бы значение из кэша,
+              // с которым страница открылась, и по уходу с поля записало бы его.
+              key={prefs.quiet_hours ?? ""}
               defaultValue={prefs.quiet_hours ?? ""}
               placeholder="22-08"
               disabled={readOnly}

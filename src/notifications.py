@@ -7,7 +7,8 @@ Replaces the scattered logic in src/alerts.py:_send_*_alert. New logic respects:
 
 Public API:
   - dispatch_event(session, event)        — for real-time alerts (called by alerts.evaluate_rules)
-  - send_daily_digest(session, tenant_id) — call from systemd timer at 08:00
+  - send_daily_digest(session, tenant_id) — per-user daily digest; no timer
+    calls it (only the dashboard button), see `api._digest_timer_on`
   - send_weekly_digest(session, tenant_id) — call from systemd timer Mondays
   - bind_telegram(session, chat_id, email) — link telegram to user
 

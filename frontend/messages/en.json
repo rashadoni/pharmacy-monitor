@@ -634,7 +634,7 @@
     "weekly_digest": "Weekly digest",
     "daily_digest_schedule": "Daily digest ({time}, Baku)",
     "weekly_digest_schedule": "Weekly digest ({schedule}, Baku)",
-    "daily_digest_disabled": "The global daily timer is disabled on the server. This personal setting does not apply until an administrator enables the timer.",
+    "daily_digest_disabled": "The daily digest is not being sent at the moment.",
     "daily_digest_blocks_instant": "The daily digest is not being sent by the server, and while this box is ticked the e-mails sent right after a scan do not arrive either. Untick it to receive them.",
     "saving": "Saving…",
     "save_error": "Save failed",

@@ -1429,18 +1429,22 @@ def test_only_administrator_roles_change_their_own_notifications(
     assert client.get("/api/v1/dash/me/notifications").json()["can_edit"] is may_edit
 
 
-def test_viewer_can_still_unbind_own_telegram(client, setup_db):
-    """Отвязка только убавляет доставку, и другого выключателя у чата нет:
-    страница «Пользователи» привязкой Telegram не управляет."""
-    viewer = _login_client_staff(client, setup_db)
-    viewer.telegram_chat_id = "700400"
+@pytest.mark.parametrize("role", ["viewer", "admin"])
+def test_anyone_can_unbind_own_telegram(client, setup_db, role):
+    """И viewer тоже: отвязка только убавляет доставку, и другого выключателя у
+    чата нет — страница «Пользователи» привязкой Telegram не управляет."""
+    if not api_module._JWT_AVAILABLE:
+        pytest.skip("JWT unavailable")
+    user = _make_user(setup_db, "someone@x.az", role=role)
+    user.telegram_chat_id = "700400"
     setup_db.commit()
+    assert _verify_login(client, setup_db, user.email).status_code == 200
 
     response = client.delete("/api/v1/dash/me/notifications/telegram")
 
     assert response.status_code == 204, response.text
-    setup_db.refresh(viewer)
-    assert viewer.telegram_chat_id is None
+    setup_db.refresh(user)
+    assert user.telegram_chat_id is None
 
 
 def test_administrator_is_the_one_who_changes_a_viewers_notifications(
@@ -1487,6 +1491,15 @@ def test_administrator_changes_own_notifications_and_learns_when_nothing_arrives
     assert flags_after({"daily_digest": True}) == (True, False)
     monkeypatch.setenv("DAILY_DIGEST_ENABLED", "1")
     assert flags_after({}) == (True, True)
+    # Остальные поля администратор тоже меняет сам — они не теряются по дороге.
+    flags_after({"quiet_hours": "22-08", "telegram_severity_min": "info"})
+    assert _notification_settings(setup_db, tenant_user) == (
+        "warning",
+        True,
+        False,
+        "info",
+        "22-08",
+    )
 
 
 @pytest.mark.asyncio

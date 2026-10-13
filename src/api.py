@@ -1943,8 +1943,10 @@ def dash_digest_send_test(
 # ─── Recipients management (admin only) ──────────────────────────────────────
 # Управление получателями email-digest. Admin может добавить любого получателя
 # (клиента, бухгалтера, партнёра) с настройкой severity_min и opt-in для
-# daily/weekly. Каждый recipient это TenantUser с is_active=true. Digest-cron
-# собирает их через `daily_digest=true` и шлёт каждому отдельное письмо.
+# daily/weekly. Каждый recipient это TenantUser с is_active=true. Недельный
+# дайджест по таймеру получают те, у кого `weekly_digest=true`; ежедневный
+# per-user дайджест по таймеру не шлёт никто (см. `_digest_timer_on`), а
+# `daily_digest=true` при этом отменяет получателю письма сразу.
 
 
 class RecipientOut(BaseModel):
