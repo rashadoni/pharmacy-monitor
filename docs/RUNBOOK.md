@@ -1397,6 +1397,47 @@ Actions по расписанию больше нет — тот workflow ост
 сбор из Actions» в этом разделе читать как его ручной запуск; pharmonline каждую
 ночь собирает таймер сервера.)
 
+⚠️ Уточнение 2026-10-14 к списку ниже: кнопки в дашборде в нём быть не должно.
+Её вотчер (`infra/server/watch-scrape-queue.sh`) зовёт `run --mode category`, а
+в `public_api` маркер переводит только `run --site pharmonline` в режиме `auto`.
+До правки 2026-10-14 кнопка собирала pharmonline сборщиком из env — на сервере
+`PHARMONLINE_USE_DDP=1`, то есть DDP — мимо проверки личностей и автодопуска, и
+её полная попытка решала доверие к каталогу pharmonline. Теперь на хосте с
+маркером (условие то же, по которому ночной сбор уходит в `public_api`) сбор
+каталога pharmonline не берёт никогда (`main._sites_without_pharmonline_catalog_scan`):
+
+- кнопка «все» и кнопка у строки категории (сайты не выбраны), `run --force`
+  или `run --limit N` без `--site` — pharmonline убирается из прогона,
+  остальные сайты собираются как раньше. В заявке, в колонке ошибки на `/runs`,
+  остаётся строка «pharmonline не собирался: …» (у неудачного сбора — после его
+  причины), в выводе команды — она же;
+- категория, у которой маршрут есть только на pharmonline (строки `pharma_*`
+  из `category sync-pharmonline`), — отказ: прогона нет, заявка `failed` с
+  причиной «категория #N есть только у pharmonline…»;
+- pharmonline назван явно (`run --site pharmonline --mode category`, `--site
+  pharmonline --site aloe`, заявка с выбранными сайтами через API — фронтенд
+  таких не шлёт) — отказ: «pharmonline этим запуском не собирается…».
+
+Без маркера (или с испорченным) всё как раньше: тогда и ночной pharmonline идёт
+сбором каталога. Подписи кнопки в дашборде теперь называют aptekonline и aloe.
+Выложено ли — смотреть сервер, а не эту строку:
+`grep -c _sites_without_pharmonline_catalog_scan /opt/pharmacy-monitor/src/main.py`
+(0 — нет; миграций и рестартов не нужно, `run` берёт код при запуске, а подписи
+кнопки доезжают со сборкой фронтенда в той же выкладке). Пока 0 — кнопку с
+pharmonline не нажимать.
+
+**Собрать pharmonline вне расписания** — только командой в режиме `auto`, она
+уходит в `public_api` с автодопуском: от root `systemctl start
+pharmacy-monitor-scrape@pharmonline` (без `--force`: если в эту ночь сбор уже
+удался, гвард ритма запуск пропустит — после неудачного соберёт), или под `pm`
+с загруженным env `run --site pharmonline --force`. `--force` без `--site` и с
+несколькими `--site` в `public_api` не ведёт.
+
+Не тронуто: `--mode watchlist` (`watchlist-tick` откладывает ссылки pharmonline
+только при env `PHARMONLINE_PUBLIC_API`, а не по маркеру; закреплённых ссылок
+на проде на 2026-10-07 не было), `scrape --site pharmonline` и `ai-crawl
+--site pharmonline` — ручные команды, кнопка ими не ходит.
+
 Так ведёт себя любой полный сбор pharmonline в режиме `public_api`: ночной
 таймер, еженедельный сбор из GitHub Actions, `--force`, кнопка в дашборде, шаг
 сбора в workflow ручной сверки. `--dry-run` тоже допускает (он и сбор пишет
