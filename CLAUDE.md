@@ -779,7 +779,9 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 > pharmonline убирается, остальные собираются, в заявке и выводе строка
 > «pharmonline не собирался: …»; категория только с маршрутом pharmonline и
 > явно названный pharmonline — отказ до строки прогона, заявка `failed` с
-> причиной. «Собрать досрочно: кнопка в дашборде» выше — это aptekonline и aloe;
+> причиной; у строки категории, которая есть только у pharmonline, кнопки
+> «Сканировать» в дашборде больше нет. «Собрать досрочно: кнопка в дашборде»
+> выше — это aptekonline и aloe;
 > pharmonline досрочно — RUNBOOK «Сбор pharmonline: новые товары допускаются
 > сами…», уточнение 2026-10-14. Не тронуты `--mode watchlist`, `scrape`,
 > `ai-crawl`. Действует после выкладки: `grep -c

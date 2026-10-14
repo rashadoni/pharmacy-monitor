@@ -29,6 +29,9 @@ from src import storage
 from src._time import utcnow
 from src.scrapers.base import RouteStatus, ScrapedProduct, ScrapeResult
 
+# Настоящий запрос маршрутов — до того, как фикстуры подменят его на время теста.
+_REAL_CATEGORIES_FOR_SITE = main_mod.watchlist.categories_for_site
+
 REPO = Path(__file__).resolve().parents[1]
 WATCHER = REPO / "infra/server/watch-scrape-queue.sh"
 SCRAPE_UNIT = REPO / "infra/systemd/pharmacy-monitor-scrape@.service"
@@ -259,6 +262,67 @@ def test_category_without_pharmonline_route_gets_no_note(
     assert scrape_calls == [["aloe"]]
     assert "pharmonline" not in (_saved_request(db_session, request_id).error_message or "")
     assert "pharmonline не собирался" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("category_id", "refused", "collected"),
+    [
+        pytest.param(7, True, [], id="only-pharmonline"),
+        pytest.param(8, False, [["aloe"]], id="pharmonline-and-aloe"),
+        pytest.param(9, False, [["aloe"]], id="pharmonline-route-inactive"),
+    ],
+)
+def test_category_routes_come_from_the_categories_table(
+    db_session, scrape_calls, marker, monkeypatch, category_id, refused, collected
+):
+    """Маршруты — из настоящей таблицы `categories`, а не из подменённого запроса."""
+    monkeypatch.setattr(main_mod.watchlist, "categories_for_site", _REAL_CATEGORIES_FOR_SITE)
+    db_session.add_all(
+        [
+            storage.Category(id=7, key="pharma_dermo", label_ru="Дерма", pharmonline_slug="dermo"),
+            storage.Category(
+                id=8, key="vitamins", label_ru="Витамины", pharmonline_slug="vit", aloe_slug="vit"
+            ),
+            # Выключенная категория маршрута не даёт ни одному сайту.
+            storage.Category(
+                id=9, key="baby", label_ru="Дети", pharmonline_slug="baby", is_active=False
+            ),
+            storage.Category(id=10, key="baby_aloe", label_ru="Дети", aloe_slug="usaq"),
+        ]
+    )
+    db_session.commit()
+    if category_id == 9:
+        # У выключенной категории маршрутов нет нигде — берём соседнюю, у aloe.
+        category_id = 10
+    request_id = _request(db_session, mode="category", category_id=category_id)
+
+    result = CliRunner().invoke(
+        main_mod.cli, _watcher_run_args(request_id, category_id=category_id)
+    )
+
+    assert scrape_calls == collected
+    saved = _saved_request(db_session, request_id)
+    if refused:
+        assert result.exit_code != 0
+        assert saved.error_message.startswith(f"категория #{category_id} есть только у pharmonline")
+        assert _run_count(db_session) == 0
+
+
+def test_corrupt_marker_does_not_break_runs_without_pharmonline(
+    db_session, scrape_calls, monkeypatch, tmp_path
+):
+    """Маркер читается, только когда в прогоне есть pharmonline.
+
+    Файл не в UTF-8 роняет его чтение (`UnicodeDecodeError` — не `OSError`).
+    Ночным сборам aloe и aptekonline до маркера дела нет, и падать им не с чего.
+    """
+    path = tmp_path / "marker"
+    path.write_bytes(b"\xff\xfe\x00broken")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER", str(path))
+
+    CliRunner().invoke(main_mod.cli, ["run", "--site", "aloe", "--force"])
+
+    assert scrape_calls == [["aloe"]]
 
 
 # ─── Тот же путь руками ─────────────────────────────────────────────────────

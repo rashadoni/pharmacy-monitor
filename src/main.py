@@ -185,7 +185,9 @@ def _pharmonline_public_api_autonomous_marker_path() -> Path:
     written by the guarded activation workflow is therefore the narrow,
     auditable opt-in that redirects *that exact auto-mode, single-site run* to
     the verified public API.  It does not change ordinary multi-site or manual
-    category runs.
+    category runs.  Since 2026-10-14 the same marker keeps pharmonline out of
+    those runs (`_sites_without_pharmonline_catalog_scan`); they still never
+    enter public_api.
     """
     configured = os.environ.get(_PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_ENV, "").strip()
     return Path(configured) if configured else _PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_DEFAULT
@@ -222,12 +224,13 @@ def _pharmonline_public_api_autonomous_marker_present() -> bool:
 
 
 # Пометка в заявке кнопки и строка вывода, когда pharmonline убран из сбора
-# каталога. Заявку видит админ (/runs, плашка на странице категорий).
+# каталога. Заявку видит админ: /runs, а у неудавшегося сбора — и плашка на
+# странице категорий.
 _PHARMONLINE_LEFT_TO_PUBLIC_API_NOTE = (
     "pharmonline не собирался: на этом сервере его каталог собирает только "
-    "`run --site pharmonline` без --mode — проверенным публичным API, с проверкой "
-    "личностей и автодопуском (ночью это делает таймер). Собрать вне расписания — "
-    "RUNBOOK «Сбор pharmonline: новые товары допускаются сами…»."
+    "маршрут public_api — проверенный публичный API с проверкой личностей и "
+    "автодопуском (ночью — таймер, `run --site pharmonline`). Собрать вне "
+    "расписания — RUNBOOK «Сбор pharmonline: новые товары допускаются сами…»."
 )
 
 
@@ -258,9 +261,10 @@ def _sites_without_pharmonline_catalog_scan(
     if "pharmonline" not in sites:
         return sites, None, None
     refusal_tail = (
-        "на этом сервере каталог pharmonline собирает только `run --site pharmonline` "
-        "без --mode — проверенным публичным API, с проверкой личностей и автодопуском. "
-        "Сбор каталога (--mode category, кнопка «Запустить scrape») шёл бы мимо них. "
+        "на этом сервере каталог pharmonline собирает только маршрут public_api — "
+        "проверенный публичный API с проверкой личностей и автодопуском (ночью — "
+        "таймер, `run --site pharmonline`). Сбор каталога (--mode category, кнопка "
+        "«Запустить scrape») шёл бы мимо них. "
         "Собрать pharmonline вне расписания — RUNBOOK «Сбор pharmonline: новые товары "
         "допускаются сами…»."
     )
@@ -278,8 +282,7 @@ def _sites_without_pharmonline_catalog_scan(
     ):
         return (
             sites,
-            f"категория #{category_id} есть только у pharmonline, а "
-            + refusal_tail,
+            f"категория #{category_id} есть только у pharmonline, а " + refusal_tail,
             None,
         )
     return others, None, _PHARMONLINE_LEFT_TO_PUBLIC_API_NOTE
@@ -6076,8 +6079,10 @@ def run_cmd(
         _enable_pharmonline_public_api_autonomous_mode()
         # The root-owned generic systemd unit can only call ``run --site %i``.
         # Its protected marker is thus the sole automatic bridge to the
-        # guarded full-catalog mode; manual category/multi-site commands stay
-        # unchanged because they never satisfy the scope predicate above.
+        # guarded full-catalog mode; manual category/multi-site commands never
+        # enter it because they never satisfy the scope predicate above.  Below,
+        # the same marker drops pharmonline from them
+        # (`_sites_without_pharmonline_catalog_scan`).
         mode = "public_api"
 
     use_legacy_identity_bridge = _pharmonline_legacy_id_bridge_enabled()
@@ -6150,7 +6155,14 @@ def run_cmd(
         # гварда ритма и до строки прогона: полная попытка решает доверие к
         # каталогу сайта, а у pharmonline её делает только public_api.
         request_note: str | None = None
-        if mode == "category" and _pharmonline_public_api_autonomous_marker_present():
+        # Маркер читается, только когда в прогоне есть pharmonline: таймерам
+        # aloe и aptekonline до него дела нет, и испорченный файл не должен
+        # ронять их сбор.
+        if (
+            mode == "category"
+            and "pharmonline" in sites
+            and _pharmonline_public_api_autonomous_marker_present()
+        ):
             sites, refusal, request_note = _sites_without_pharmonline_catalog_scan(
                 session,
                 sites,

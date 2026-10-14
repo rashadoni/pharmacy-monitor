@@ -782,7 +782,10 @@ function CategoryRowDesktop({
       </td>
       <td className="px-3 py-2 text-center">
         <div className="inline-flex items-center gap-2">
-          {cat.is_active && (cat.pharmonline_slug || cat.aptekonline_slug || cat.aloe_slug) && (
+          {/* Кнопка pharmonline не собирает (его — только ночной сбор через
+              публичный API): у категории, которая есть лишь у pharmonline,
+              сервер заявку отклонил бы. */}
+          {cat.is_active && (cat.aptekonline_slug || cat.aloe_slug) && (
             <TriggerScrapeButton categoryId={cat.id} />
           )}
           <button
