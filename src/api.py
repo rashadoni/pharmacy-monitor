@@ -183,6 +183,50 @@ app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 install_metrics_endpoint(app)
 
 
+# ─── Отказ проверки полей (422) ──────────────────────────────────────────────
+#
+# FastAPI по умолчанию кладёт в `detail[].input` присланное значение: на слишком
+# длинный пароль — сам пароль, на тело без обязательного поля — тело целиком. А
+# на одиночном суррогате (`"\ud800"`: в JSON он допустим, в UTF-8 его нет) такой
+# ответ не собирается вовсе — выходил 500, и текст исключения с теми же `input`
+# уходил в Sentry.
+#
+# Здесь в ответе остаётся то, чем запрос можно поправить: какое поле и что с ним
+# не так. Действует на все маршруты, а не на список адресов входа — список
+# отстал бы от кода.
+
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+# Чего в списке нет, в ответ не идёт — и поле, которое FastAPI добавит позже,
+# тоже.
+#
+# Остаётся текст причины (`msg`): его пишет pydantic или наш валидатор, и вырезать
+# из него нечего. Поэтому текст валидатора значение не цитирует — постоянная
+# строка, а не f-строка. Сверяет `tests/test_validation_refusal_echoes_nothing.py`.
+_REFUSAL_FIELDS = ("type", "loc", "msg", "ctx")
+# Из `ctx` — только простые значения: граница длины, код причины для интерфейса.
+# Исключение валидатора pydantic кладёт туда объектом, а в объекте бывает само
+# значение: у JSONDecodeError — разбираемый текст.
+_PLAIN = (str, int, float, bool, type(None))
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_refusal(request: Request, exc: RequestValidationError) -> JSONResponse:
+    problems = []
+    for error in exc.errors():
+        problem = {field: error[field] for field in _REFUSAL_FIELDS if field in error}
+        rule = {
+            name: value
+            for name, value in (problem.pop("ctx", None) or {}).items()
+            if isinstance(value, _PLAIN)
+        }
+        if rule:
+            problem["ctx"] = rule
+        problems.append(problem)
+    return JSONResponse(status_code=422, content={"detail": problems})
+
+
 # ─── Request ID middleware (Phase 0.5, 2026-05-26) ───────────────────────────
 #
 # Каждый запрос получает UUID4 (или принимается клиентский `X-Request-ID`,
@@ -1252,6 +1296,30 @@ def _hash_bcrypt(password: str) -> str:
 _DUMMY_BCRYPT_HASH = _hash_bcrypt("not-a-real-password-timing-equalizer")
 
 
+def _login_bytes(login: str) -> bytes:
+    """Логин для сверки с ADMIN_LOGIN: без регистра, байтами.
+
+    Строки `hmac.compare_digest` берёт только из ASCII и на «админ» бросает
+    TypeError — вход отвечал 500. Байты он сверяет любые. `surrogatepass` — чтобы
+    и одиночный суррогат (в JSON он допустим) кончался отказом, а не исключением.
+    """
+    return login.lower().encode("utf-8", "surrogatepass")
+
+
+def _fits_text_column(value: str) -> bool:
+    """Может ли строка лежать в текстовой колонке PostgreSQL.
+
+    Одиночный суррогат не кодируется в UTF-8, нулевой байт PostgreSQL в тексте не
+    хранит: драйвер бросает исключение, не дойдя до запроса. SQLite нулевой байт
+    принимает — в тестах на ней эту половину правила не видно.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return "\x00" not in value
+
+
 @app.post("/auth/login")
 def auth_login(
     payload: PasswordLoginIn, response: Response, request: Request, db: Session = Depends(get_db)
@@ -1276,7 +1344,7 @@ def auth_login(
     env_pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
     login_raw = payload.login.strip()
 
-    if hmac.compare_digest(login_raw.lower(), expected_login.lower()):
+    if hmac.compare_digest(_login_bytes(login_raw), _login_bytes(expected_login)):
         # Bootstrap-админ: первый активный АДМИН + допускается env-хеш
         user = db.scalar(
             select(storage.TenantUser)
@@ -1294,6 +1362,10 @@ def auth_login(
             user = _tenants.add_user(db, t.id, "admin@local", name="Admin", role="admin")
             db.commit()
         pw_to_check = user.password_hash or env_pw_hash
+    elif not _fits_text_column(login_raw):
+        # В базе PostgreSQL адреса с таким знаком быть не может, а запрос с ним
+        # упал бы. Отказ ниже — тот же, что на любой незнакомый логин.
+        user, pw_to_check = None, ""
     else:
         # Email-based login для конкретного пользователя — без env-fallback
         user = db.scalar(
