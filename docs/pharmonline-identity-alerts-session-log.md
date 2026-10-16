@@ -88,3 +88,11 @@
 - Adjacent comparison projection, match actions/rollback and health tests: 87 passed (one existing datetime.utcnow deprecation warning). Across the sequential targeted gates in this implementation phase: **275 passed, 2 skipped**. Final targeted Ruff and diff whitespace checks pass. Formatting limited to task-owned new model/modified recovery functions; no unrelated whole-file rewrite.
 - NOT RUN: required full GitHub Python/Frontend CI, PostgreSQL concurrency and migration-parity integration gates, browser E2E. No configured isolated PostgreSQL test service here; heavy/full verification belongs to CI, and no publication/deployment was authorized during this implementation phase. Source code, migration and workflow tests are ready for the release route in the recovery document.
 - Production remains unchanged. Live Decodo plan and recovery have NOT RUN: two fresh full source passes and redirect observations still must confirm the current live situation after deployment. Tests establish implementation behavior, not that the production catalog is already recovered.
+
+## 2026-10-16 — Implementation checkpoint and stopping point
+
+- Core implementation, migration, manual workflows, regression tests and release/rollback runbook committed as `fa2b4bee`; downstream exclusion and independent guard tests are checkpoints `0b4e8ec3` and `01b35fbd`. Dedicated branch retained; task worktree clean after checkpoint.
+- Current result/status: audited recovery implementation complete and independently reviewed; 275 targeted tests passed, 2 PostgreSQL tests skipped; production recovery still pending.
+- Last completed action: saved the reviewed implementation and concrete release/recovery procedure in checkpoint commits, checked targeted lint and whitespace.
+- Precise stopping point: no push, PR, merge, deployment, production migration or recovery application. Required full CI/PostgreSQL gates and fresh live Decodo proof remain outstanding.
+- Next action: publish this reviewed branch to active `rashadoni/pharmacy-monitor` as a PR and run required CI with task-specific authorization; then show the owner the concrete visible-change list before merge/deploy, and obtain/review the live read-only recovery plan before applying it. Do not use the stale configured origin, retired server, or selective health-hotfix route.
