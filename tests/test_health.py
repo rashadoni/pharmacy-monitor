@@ -392,23 +392,61 @@ def test_site_silence_critical_when_one_site_stale(db_session):
     assert "aloe" not in silent_sites  # aloe свежий — не должен попасть
 
 
-def test_site_silence_flags_aptekonline_after_daily_slo(db_session):
-    """Daily Aptekonline data older than 30h is an actionable outage."""
+def test_site_silence_respects_daily_cadence(db_session):
+    """Порог «сайт молчит» — ритм сайта с запасом: при ежедневном сборе это 30 часов.
+
+    Данные двадцатичасовой давности — штатная середина суток, не тревога;
+    сорокачасовой — значит, ночной сбор пропущен. Пороги выводятся из карты
+    ритма: пока сайты собирались раз в неделю (2026-10-06…13), порог был 174 ч,
+    а до того суточный порог при недельном сборе красил сайт красным 6 дней из 7.
+    """
     now = utcnow()
-    apt_run = _add_run(db_session, now - timedelta(hours=100))
-    _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=100))
-    aloe_run = _add_run(db_session, now - timedelta(hours=100))
-    _add_snap(db_session, aloe_run, "aloe", 30, last_seen_at=now - timedelta(hours=100))
+    runs = {}
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        runs[site] = _add_run(db_session, now - timedelta(hours=20))
+        _add_snap(db_session, runs[site], site, 30, last_seen_at=now - timedelta(hours=20))
     db_session.commit()
 
     rep = check_health(db_session, max_age_hours=26)
-    silent_sites = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
-    assert "aptekonline" in silent_sites
-    assert "aloe" in silent_sites
+    assert {i.context.get("site") for i in rep.issues if i.code == "site_silent"} == set()
+
+    for product in db_session.query(Product).all():
+        product.last_seen_at = now - timedelta(hours=40)
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+    assert {i.context.get("site") for i in rep.issues if i.code == "site_silent"} == {
+        "pharmonline",
+        "aptekonline",
+        "aloe",
+    }
+
+
+def test_site_thresholds_follow_declared_cadence():
+    """Пороги выводятся из ритма сбора, а не прибиты гвоздями по сайтам."""
+    from src import health as h
+    from src.cadence import site_cadence_hours
+
+    # Суточный ритм у всех трёх сайтов (решение владельца 2026-10-13).
+    for site in ("pharmonline", "aptekonline", "aloe"):
+        assert site_cadence_hours(site) == 24
+        assert h._SITE_MAX_AGE_HOURS[site] == 30
+        assert h._SITE_FRESHNESS_DAYS[site] == 3
+        assert h._SITE_COVERAGE_DAYS[site] == 2
+
+    # Сайт без объявленного ритма получает те же суточные 30ч.
+    from src.cadence import site_max_age_hours
+
+    assert site_max_age_hours("site-without-declared-cadence") == 30
+
+    # Инвариант site_drop: окно покрытия всегда строго уже окна свежести,
+    # иначе частичный тик уронит метрику (см. docstring _check_site_drops).
+    for site in h.SITE_SCRAPE_CADENCE_HOURS:
+        assert h._SITE_COVERAGE_DAYS[site] < h._SITE_FRESHNESS_DAYS[site]
 
 
 def test_site_silence_flags_long_aptekonline_outage(db_session):
-    """A long Aptekonline outage remains critical under the daily SLO."""
+    """Пропущенный недельный сбор (>174ч) — всё ещё critical, тревога не глушится."""
     now = utcnow()
     apt_run = _add_run(db_session, now - timedelta(hours=210))
     _add_snap(db_session, apt_run, "aptekonline", 30, last_seen_at=now - timedelta(hours=210))
@@ -420,11 +458,159 @@ def test_site_silence_flags_long_aptekonline_outage(db_session):
 
 
 def test_stale_run_critical(db_session):
-    _add_run(db_session, utcnow() - timedelta(hours=48))
+    """Прогонов нет дольше недельного ритма с запасом — планировщик умер."""
+    _add_run(db_session, utcnow() - timedelta(hours=200))
     db_session.commit()
     rep = check_health(db_session, max_age_hours=26)
     assert rep.status == "critical"
     assert any(i.code == "stale_run" for i in rep.issues)
+
+
+def test_weekly_cadence_does_not_raise_stale_run_between_collections(db_session, monkeypatch):
+    """Двое суток без прогонов при недельном сборе — штатно, не тревога.
+
+    Плановый запуск в ночи, когда сайт уже собран, выходит без прогона, а
+    частичные тики прогон дают не каждый день: на проде 2026-10-06 он был один,
+    2026-10-07 до полудня — ни одного. Порог 26ч поднимал бы «Проверьте cron»
+    на исправном недельном графике. Сегодня ритм суточный — недельный здесь
+    подставлен: порог обязан следовать карте, если сайты вернут на неделю.
+    """
+    from src import health
+
+    monkeypatch.setattr(
+        health, "_SITE_MAX_AGE_HOURS", {site: 174 for site in health._SITE_MAX_AGE_HOURS}
+    )
+    _add_run(db_session, utcnow() - timedelta(hours=48))
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+
+    assert not any(i.code == "stale_run" for i in rep.issues)
+
+
+def test_daily_cadence_raises_stale_run_after_a_missed_night(db_session):
+    """При ежедневном сборе сутки с запасом без единого прогона — тревога."""
+    run = _add_run(db_session, utcnow() - timedelta(hours=29))
+    db_session.commit()
+    assert not any(i.code == "stale_run" for i in check_health(db_session, max_age_hours=26).issues)
+
+    run.started_at = utcnow() - timedelta(hours=31)
+    db_session.commit()
+    assert any(i.code == "stale_run" for i in check_health(db_session, max_age_hours=26).issues)
+
+
+def test_stale_run_follows_the_most_frequent_site(db_session, monkeypatch):
+    """Вернётся суточный сайт — вернётся и суточный порог «давно не было прогонов»."""
+    from src import health
+
+    monkeypatch.setattr(
+        health,
+        "_SITE_MAX_AGE_HOURS",
+        {"pharmonline": 174, "aptekonline": 174, "aloe": 30},
+    )
+    _add_run(db_session, utcnow() - timedelta(hours=48))
+    db_session.commit()
+
+    rep = check_health(db_session, max_age_hours=26)
+
+    assert any(i.code == "stale_run" for i in rep.issues)
+
+
+def _verified_full_run(db_session, *, hours_ago: float):
+    run = _add_run(db_session, utcnow() - timedelta(hours=hours_ago))
+    run.run_quality = {
+        "baseline_enforced": True,
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {
+            "pharmonline": {"status": "ok"},
+            "aptekonline": {"status": "ok"},
+            "aloe": {"status": "ok"},
+        },
+    }
+    return run
+
+
+def test_overdue_full_collection_is_reported_even_when_partial_ticks_keep_the_site_fresh(
+    db_session,
+):
+    """Недельный сбор перестал происходить, а частичные тики идут.
+
+    Плановый запуск внутри недели выходит молча, поэтому «сбор не случился»
+    нельзя оставлять на `site_silent`: тик освежает `last_seen_at` товаров
+    aloe, и сайт выглядит живым сколько угодно долго.
+    """
+    _verified_full_run(db_session, hours_ago=200)
+    tick = Run(
+        started_at=utcnow() - timedelta(hours=1),
+        finished_at=utcnow() - timedelta(hours=1),
+        status="ok",
+        products_scraped=10,
+        catalog_scope="partial",
+    )
+    db_session.add(tick)
+    db_session.flush()
+    _add_snap(db_session, tick, "aloe", 10)
+    db_session.commit()
+
+    rep = check_health(db_session)
+
+    overdue = {i.context["site"] for i in rep.issues if i.code == "full_catalog_overdue"}
+    silent = {i.context.get("site") for i in rep.issues if i.code == "site_silent"}
+    assert "aloe" in overdue
+    assert "aloe" not in silent
+    assert rep.status == "critical"
+
+
+def test_full_collection_is_overdue_only_past_cadence_plus_grace(db_session):
+    """Порог сторожа — ритм сайта с запасом (30ч), а не сам ритм (24ч).
+
+    Между ночными сборами проходит до 25ч (перевод часов), сайт может оказаться
+    последним в очереди из трёх, и новый сбор ещё должен успеть закончиться.
+    Сторож на 24ч кричал бы каждое утро после сбора, начатого чуть позже
+    вчерашнего.
+    """
+    from src.cadence import site_max_age_hours
+
+    assert site_max_age_hours("aloe") == 30
+    run = _verified_full_run(db_session, hours_ago=29)
+    db_session.commit()
+    assert not any(i.code == "full_catalog_overdue" for i in check_health(db_session).issues)
+
+    run.started_at = utcnow() - timedelta(hours=31)
+    run.finished_at = run.started_at + timedelta(minutes=1)
+    db_session.commit()
+    overdue = {
+        i.context["site"] for i in check_health(db_session).issues if i.code == "full_catalog_overdue"
+    }
+    assert overdue == {"pharmonline", "aptekonline", "aloe"}
+
+
+def test_overdue_is_reported_when_every_retry_since_was_degraded(db_session):
+    """Неделя degraded-повторов оставляет данные такими же старыми, как неделя пропусков."""
+    _verified_full_run(db_session, hours_ago=200)
+    retry = Run(
+        started_at=utcnow() - timedelta(hours=3),
+        finished_at=utcnow() - timedelta(hours=2),
+        status="degraded",
+        products_scraped=10,
+        catalog_scope="full",
+        full_catalog_sites="aloe",
+        catalog_verified=False,
+        run_quality={
+            "full_catalog_verified": False,
+            "financially_eligible": False,
+            "sites": {"aloe": {"status": "degraded"}},
+        },
+    )
+    db_session.add(retry)
+    db_session.commit()
+
+    rep = check_health(db_session)
+
+    overdue = {i.context["site"] for i in rep.issues if i.code == "full_catalog_overdue"}
+    assert "aloe" in overdue
+    assert rep.status == "critical"
 
 
 def test_failed_run_critical(db_session):
@@ -549,7 +735,8 @@ def test_site_drop_warning(db_session):
     base = utcnow()
     cur = _add_run(db_session, base - timedelta(hours=1), products_scraped=30)
     # Живой каталог: 100 товаров, виденных 2.5 дня назад (в окне свежести 3д,
-    # но ВНЕ окна покрытия 2д) — недавние скрейпы их НЕ переснимали.
+    # но ВНЕ окна покрытия 2д) — недавние скрейпы их НЕ переснимали. Возраст
+    # привязан к суточному ритму: окна выводятся из него (src/cadence.py).
     old = _add_run(db_session, base - timedelta(days=2, hours=12), products_scraped=100)
     _add_snap(db_session, old, "pharmonline", 100, last_seen_at=base - timedelta(days=2, hours=12))
     # Недавнее покрытие: только 30 товаров за окно покрытия.

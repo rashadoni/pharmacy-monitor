@@ -23,12 +23,15 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     create_engine,
+    event,
 )
+from sqlalchemy.engine import Engine, ExceptionContext
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -92,7 +95,9 @@ class Run(Base):
         String(300), nullable=True
     )
 
-    snapshots: Mapped[list["PriceSnapshot"]] = relationship(back_populates="run")
+    snapshots: Mapped[list["PriceSnapshot"]] = relationship(
+        back_populates="run", foreign_keys="PriceSnapshot.run_id"
+    )
 
 
 def run_is_financially_eligible(run: Run | None) -> bool:
@@ -122,12 +127,26 @@ def run_is_watchlist_price_alert_eligible(run: Run | None) -> bool:
     this narrow exception separate from :func:`run_is_financially_eligible` so
     a partial run can never accidentally unlock money-facing consumers.
     """
+    return (
+        run_is_partial_price_alert_eligible(run)
+        and (run.run_quality or {}).get("mode") == "watchlist"
+    )
+
+
+def run_is_partial_price_alert_eligible(run: Run | None) -> bool:
+    """Whether a completed partial run may report *local* price changes at all.
+
+    True for any partial producer whose every requested site finished ``ok`` —
+    the watchlist tick above and the diagnostic ``scrape`` behind
+    ``intraday-tick`` alike.  On its own this unlocks nothing in
+    ``alerts.evaluate_rules``: only the watchlist tick may publish to the
+    shared alert journal.  Other partial runs are read through
+    ``alerts.local_price_alerts_for_partial_run``, whose events are never
+    stored and go to administrators only.
+    """
     if run is None or run.status != "ok" or run.catalog_scope != "partial":
         return False
-    quality = run.run_quality or {}
-    if quality.get("mode") != "watchlist":
-        return False
-    sites = quality.get("sites")
+    sites = (run.run_quality or {}).get("sites")
     return bool(sites) and all(
         isinstance(details, dict) and details.get("status") == "ok"
         for details in sites.values()
@@ -311,13 +330,21 @@ class PharmonlinePublicAPIIdentityReconciliation(Base):
             "public_api_external_id",
             name="uq_pharmonline_public_api_reconciliation_public_id",
         ),
+        # Индексы трёх журналов личностей названы так, как их создают миграции
+        # 0019–0021 и как они стоят в боевой базе: без «identity_» в имени.
+        # `index=True` дал бы имя по таблице — второе, которого в базе нет.
+        Index("ix_pharmonline_public_api_reconciliations_tenant_id", "tenant_id"),
+        Index("ix_pharmonline_public_api_reconciliations_product_id", "product_id"),
+        Index(
+            "ix_pharmonline_public_api_reconciliations_public_id",
+            "public_api_external_id",
+        ),
+        Index("ix_pharmonline_public_api_reconciliations_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
-    product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="RESTRICT"), index=True
-    )
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"))
     legacy_external_id: Mapped[str] = mapped_column(String(200))
     public_api_external_id: Mapped[str] = mapped_column(String(200))
     legacy_canonical_url: Mapped[str] = mapped_column(String(500))
@@ -327,7 +354,7 @@ class PharmonlinePublicAPIIdentityReconciliation(Base):
     catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
     source_transport: Mapped[str] = mapped_column(String(40))
     preflight_run_ref: Mapped[str] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class PharmonlinePublicAPIIdentityAdmission(Base):
@@ -339,6 +366,12 @@ class PharmonlinePublicAPIIdentityAdmission(Base):
     created from a fully verified public catalog.  Those two cases must remain
     explicit: a public-source admission is trusted only for the guarded public
     API path and never changes or impersonates DDP provenance.
+
+    Кто написал строку, видно по ``proof_version``: ручная сверка —
+    ``public_api_identity_admission_v1``; плановый сбор —
+    ``public_api_scheduled_admission_v1`` (тогда ``preflight_run_ref`` — номер
+    прогона из ``runs``, а ``source_manifest_sha256`` — хеш применённого плана).
+    Правила каждой версии — в ``main._pharmonline_public_api_admission_invalid_reason``.
     """
 
     __tablename__ = "pharmonline_public_api_identity_admissions"
@@ -353,13 +386,15 @@ class PharmonlinePublicAPIIdentityAdmission(Base):
             "public_api_external_id",
             name="uq_pharmonline_public_api_admission_public_id",
         ),
+        Index("ix_pharmonline_public_api_admissions_tenant_id", "tenant_id"),
+        Index("ix_pharmonline_public_api_admissions_product_id", "product_id"),
+        Index("ix_pharmonline_public_api_admissions_public_id", "public_api_external_id"),
+        Index("ix_pharmonline_public_api_admissions_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
-    product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="RESTRICT"), index=True
-    )
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"))
     # ``existing_native_id`` means the exact native ID and URL were already
     # stored. ``new_public_product`` means no Product with that ID or URL was
     # present in any tenant before the guarded creation.
@@ -371,7 +406,7 @@ class PharmonlinePublicAPIIdentityAdmission(Base):
     catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
     source_transport: Mapped[str] = mapped_column(String(40))
     preflight_run_ref: Mapped[str] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class PharmonlinePublicAPIIdentityQuarantine(Base):
@@ -407,15 +442,21 @@ class PharmonlinePublicAPIIdentityQuarantine(Base):
             "public_api_external_id",
             name="uq_pharmonline_public_api_quarantine_public_id",
         ),
+        Index("ix_pharmonline_public_api_quarantines_tenant_id", "tenant_id"),
+        Index("ix_pharmonline_public_api_quarantines_legacy_product_id", "legacy_product_id"),
+        Index(
+            "ix_pharmonline_public_api_quarantines_replacement_product_id",
+            "replacement_product_id",
+        ),
+        Index("ix_pharmonline_public_api_quarantines_public_id", "public_api_external_id"),
+        Index("ix_pharmonline_public_api_quarantines_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
-    legacy_product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="RESTRICT"), index=True
-    )
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1)
+    legacy_product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"))
     replacement_product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="RESTRICT"), index=True
+        ForeignKey("products.id", ondelete="RESTRICT")
     )
     quarantine_kind: Mapped[str] = mapped_column(String(40))
     legacy_external_id: Mapped[str] = mapped_column(String(200))
@@ -428,7 +469,7 @@ class PharmonlinePublicAPIIdentityQuarantine(Base):
     catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
     source_transport: Mapped[str] = mapped_column(String(40))
     preflight_run_ref: Mapped[str] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class PharmonlinePublicAPICatalogBaseline(Base):
@@ -466,8 +507,14 @@ class PriceSnapshot(Base):
     is_on_sale: Mapped[bool] = mapped_column(Boolean, default=False)
     promo_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Проверенный полный сбор, который увидел товар с этой же ценой и ничего не
+    # записал (diff-only). Строка остаётся «изменением цены» прогона `run_id`, но
+    # денежным выводам она доверена — см. `trusted_snapshot_filter`.
+    confirmed_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
+    )
 
-    run: Mapped[Run] = relationship(back_populates="snapshots")
+    run: Mapped[Run] = relationship(back_populates="snapshots", foreign_keys=[run_id])
     product: Mapped[Product] = relationship(back_populates="snapshots")
 
 
@@ -532,7 +579,12 @@ class TenantUser(Base):
     # Когда пользователь меняет пароль через UI — пишется сюда, и далее auth
     # сначала проверяет DB-hash, фолбэк на env только если DB-hash NULL.
     password_hash: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    magic_token: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # SHA-256 одноразового токена входа, а не сам токен: токен знает только
+    # письмо (`tenants.issue_magic_token` / `verify_magic_token`). Колонка в базе
+    # называется по-старому, `magic_token`: до 2026-10-10 в ней лежал сам токен.
+    # Переименования нет намеренно — новый код на старой схеме уронил бы каждый
+    # запрос к пользователям, включая вход.
+    magic_token_hash: Mapped[str | None] = mapped_column("magic_token", String(100), nullable=True)
     magic_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -1020,16 +1072,127 @@ class Promo(Base):
     tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
 
 
+# ─── Engine: an error does not carry the data of the statement that failed ──
+#
+# An exception raised by a failed statement is rendered far from here: Sentry
+# takes its text as `exception.values[].value`, uvicorn and the CLI print the
+# traceback to the journal (a GitHub Actions step log is public), `run` stores
+# it in `runs.error_message`, which the dashboard shows. By default that text
+# carries the data of the statement twice over:
+#
+#   1. SQLAlchemy appends `[parameters: {...}]` — a login token, an address, a
+#      password hash, whatever the statement was given;
+#   2. PostgreSQL quotes the data itself, and the driver passes it on:
+#      `DETAIL: Key (email)=(...) already exists`, `DETAIL: Failing row
+#      contains (...)` — the whole row, `CONTEXT: ... with parameters: $1 =
+#      '...'`, and for a value that does not fit its type the first line too:
+#      `invalid input syntax for type integer: "..."`.
+#
+# Both are closed here, at the one place every engine comes from, rather than
+# at each place the text ends up. What stays: the exception class, the
+# statement with its parameters by name (`[SQL: ...]`) and the first line of
+# the server's message. The full text of a server error is in the PostgreSQL
+# log on the database host (docs/RUNBOOK.md, «Параметры упавшего запроса»).
+#
+# Not covered, on purpose or by nature — the same list is in CLAUDE.md:
+# the first line outside SQLSTATE class 22 is the server's own and can quote a
+# value the statement passed where the server expects a name or an expression
+# (`to_tsquery(:q)`, `RAISE EXCEPTION` in a trigger); errors written by the
+# driver or by Python, not by the server; a literal written into the SQL text.
+#
+# tests/test_statement_data_stays_out_of_errors.py fails real statements on
+# PostgreSQL and does not let another `create_engine` appear in `src/` or
+# `migrations/`.
+
+_SERVER_DETAILS_HIDDEN = "[details hidden: the full text is in the PostgreSQL log]"
+
+_DRIVER_TEXT_WITHHELD = "[driver error text withheld: it could not be checked for statement data]"
+
+# What the server says after the first line. The position excerpt (`LINE 1:
+# ...`) goes too, without a word: it repeats the statement shown as `[SQL: ...]`.
+_DROPPED_SERVER_FIELDS = ("message_detail", "message_hint", "context")
+
+# SQLSTATE class 22, «data exception»: a value did not fit its type, and the
+# first line is about that value — quoted (`invalid input syntax for type
+# integer: "..."`), unquoted (`date field value out of range: 2026-77-31`),
+# in the quotes of the server's locale. Nothing of it is kept; the exception
+# class (`InvalidTextRepresentation`, `StringDataRightTruncation`) names the
+# failure.
+_DATA_EXCEPTION_CLASS = "22"
+
+
+def _server_error_text(original: BaseException) -> str | None:
+    """What a server error may say, or None for an error the server did not send."""
+    diag = getattr(original, "diag", None)
+    primary = getattr(diag, "message_primary", None)
+    sqlstate = getattr(diag, "sqlstate", None) or getattr(original, "sqlstate", None)
+    if primary is None and not sqlstate:
+        # Neither a first line nor a code: the driver's own error (lost
+        # connection, a value it could not adapt), left as written.
+        return None
+    if primary is None or not isinstance(sqlstate, str) or len(sqlstate) != 5:
+        # The server sends both with every error. One without the other, or a
+        # code that is not five characters, is a driver that changed shape:
+        # the class of the error is unknown, and its text is not passed on.
+        return _DRIVER_TEXT_WITHHELD
+    if sqlstate.startswith(_DATA_EXCEPTION_CLASS):
+        return f"data exception, SQLSTATE {sqlstate} {_SERVER_DETAILS_HIDDEN}"
+    # `RAISE EXCEPTION ''` sends an empty first line; the code stands in for it.
+    words = primary or f"SQLSTATE {sqlstate}"
+    if any(getattr(diag, field, None) for field in _DROPPED_SERVER_FIELDS):
+        return f"{words} {_SERVER_DETAILS_HIDDEN}"
+    return words
+
+
+def _keep_statement_data_out_of_driver_error(context: ExceptionContext) -> None:
+    """`handle_error` listener: a server error keeps its first line and nothing else.
+
+    DETAIL, HINT and CONTEXT are dropped whole rather than searched for
+    values: their wording follows the server's locale, their content follows
+    its settings (`log_parameter_max_length_on_error` puts the parameters
+    into CONTEXT), and a pattern that misses one of them leaks silently.
+
+    The driver's exception is rewritten in place — it is raised as the cause
+    of SQLAlchemy's, and a traceback prints both. Every error goes through
+    here whatever the context: at COMMIT there is no statement, on a lost
+    connection the server may still have sent its text.
+    """
+    original = context.original_exception
+    try:
+        message = _server_error_text(original)
+        unchanged = message is None or message == str(original)
+    except Exception:
+        # A cleanup that failed does not let the text through as it was.
+        message, unchanged = _DRIVER_TEXT_WITHHELD, False
+    if unchanged:
+        return
+    original.args = (message,)
+    wrapped = context.sqlalchemy_exception
+    if wrapped is not None:
+        # SQLAlchemy has already copied the driver's text into its own message.
+        # Rebuilt in SQLAlchemy's format rather than patched by substitution:
+        # a substitution that finds nothing would leave the old text in place.
+        cls = type(original)
+        wrapped.args = (f"({cls.__module__}.{cls.__name__}) {message}", *wrapped.args[1:])
+
+
+def create_engine_hiding_statement_data(url: str, **options) -> Engine:
+    """The only `create_engine` of `src/` and `migrations/` — see the comment above."""
+    engine = create_engine(url, hide_parameters=True, **options)
+    event.listen(engine, "handle_error", _keep_statement_data_out_of_driver_error)
+    return engine
+
+
 def make_engine(database_url: str | None = None):
     url = database_url or os.getenv("DATABASE_URL", "sqlite:///data/db.sqlite")
     if url.startswith("sqlite:///") and not url.startswith("sqlite:////"):
         rel = url.replace("sqlite:///", "", 1)
         Path(rel).parent.mkdir(parents=True, exist_ok=True)
-        return create_engine(url, echo=False, future=True)
+        return create_engine_hiding_statement_data(url, echo=False, future=True)
     if url.startswith("sqlite"):
-        return create_engine(url, echo=False, future=True)
+        return create_engine_hiding_statement_data(url, echo=False, future=True)
 
-    return create_engine(
+    return create_engine_hiding_statement_data(
         url,
         echo=False,
         future=True,
@@ -1178,7 +1341,7 @@ def curr_and_prev_snapshots_for_run(
             session,
             tenant_id=current_run.tenant_id,
         )
-        previous_filters.append(PriceSnapshot.run_id.in_(eligible_ids))
+        previous_filters.append(trusted_snapshot_filter(eligible_ids))
     prev_max_subq = (
         select(
             PriceSnapshot.product_id,
@@ -1195,7 +1358,7 @@ def curr_and_prev_snapshots_for_run(
             & (PriceSnapshot.captured_at == prev_max_subq.c.max_at),
         )
     if eligible_ids is not None:
-        prev_stmt = prev_stmt.where(PriceSnapshot.run_id.in_(eligible_ids))
+        prev_stmt = prev_stmt.where(trusted_snapshot_filter(eligible_ids))
     prev_snaps = session.scalars(
         prev_stmt.order_by(PriceSnapshot.product_id, PriceSnapshot.id.desc())
     ).all()
@@ -1203,6 +1366,141 @@ def curr_and_prev_snapshots_for_run(
     for s in prev_snaps:
         prev_by_product.setdefault(s.product_id, s)
     return curr_snaps, prev_by_product
+
+
+def trusted_snapshot_filter(eligible_run_ids):
+    """Условие «этой записи о цене доверяют денежные выводы».
+
+    Запись доверена, если её сделал проверенный полный сбор ИЛИ такой сбор позже
+    увидел товар с той же ценой (`confirmed_run_id`). Второе нужно из-за
+    diff-only: проверенный сбор, увидевший прежнюю цену, своей строки не пишет.
+    До 2026-10-07 доверие читалось только по `run_id`, и цена, записанная до
+    появления проверки, частичным тиком или сбором, не прошедшим её, оставалась
+    недоверенной, пока не изменится: на проде так выпали 85% товаров.
+
+    Любой запрос, выбирающий snapshot'ы «только проверенные», обязан брать
+    условие отсюда, а не писать `PriceSnapshot.run_id.in_(...)` сам —
+    `tests/test_trusted_prices.py` следит за этим.
+    """
+    from sqlalchemy import or_
+
+    return or_(
+        PriceSnapshot.run_id.in_(eligible_run_ids),
+        PriceSnapshot.confirmed_run_id.in_(eligible_run_ids),
+    )
+
+
+def confirm_prices_observed_by_run(session, run: "Run") -> int:
+    """Проверенный полный сбор подтверждает цены, которые увидел без изменений.
+
+    Для каждого товара, который `run` наблюдал (`offer_observations`) и для
+    которого не записал snapshot, берётся запись, с которой `persist_results`
+    сравнил цену и счёл её прежней, — последняя на момент наблюдения. Если ей
+    ещё не доверяют, в неё ставится `confirmed_run_id = run.id`. Новых строк нет:
+    `price_snapshots` остаётся журналом изменений цены.
+
+    Сбор, не прошедший проверку, ничего не подтверждает. Подтверждение другого
+    проверенного сбора не затирается: если `run` позже упадёт в постобработке,
+    прежнее доверие должно остаться. Повторный вызов ничего не меняет.
+
+    Возвращает число помеченных записей. Коммит — за вызывающим.
+    """
+    from sqlalchemy import func, or_, select, update
+
+    if not run_is_financially_eligible(run):
+        return 0
+    trusted_run_ids = financially_eligible_run_ids(
+        session,
+        tenant_id=run.tenant_id,
+        include_run_id=run.id,
+    )
+    if run.id not in trusted_run_ids:
+        return 0
+
+    observed = (
+        select(
+            OfferObservation.product_id,
+            func.max(OfferObservation.observed_at).label("observed_at"),
+        )
+        .where(OfferObservation.run_id == run.id)
+        .group_by(OfferObservation.product_id)
+        .subquery()
+    )
+    # Товар, цену которого записал сам `run`, в подтверждении не нуждается, а
+    # его предыдущая запись — это как раз НЕ та цена, которую `run` увидел.
+    written_by_run = select(PriceSnapshot.product_id).where(PriceSnapshot.run_id == run.id)
+    compared_at = (
+        select(
+            PriceSnapshot.product_id,
+            func.max(PriceSnapshot.captured_at).label("max_at"),
+        )
+        .join(observed, observed.c.product_id == PriceSnapshot.product_id)
+        .where(
+            PriceSnapshot.captured_at <= observed.c.observed_at,
+            PriceSnapshot.product_id.not_in(written_by_run),
+        )
+        .group_by(PriceSnapshot.product_id)
+        .subquery()
+    )
+    # Несколько записей с одним captured_at (товар дважды в одном чанке):
+    # последней считается запись с большим id — так же решают и
+    # `persist_results`, и читатели (`_latest_snapshot_stmt`).
+    compared = (
+        select(func.max(PriceSnapshot.id).label("id"))
+        .join(
+            compared_at,
+            (PriceSnapshot.product_id == compared_at.c.product_id)
+            & (PriceSnapshot.captured_at == compared_at.c.max_at),
+        )
+        .group_by(PriceSnapshot.product_id)
+        .subquery()
+    )
+    result = session.execute(
+        update(PriceSnapshot)
+        .where(
+            PriceSnapshot.id.in_(select(compared.c.id)),
+            PriceSnapshot.run_id.not_in(trusted_run_ids),
+            or_(
+                PriceSnapshot.confirmed_run_id.is_(None),
+                PriceSnapshot.confirmed_run_id.not_in(trusted_run_ids),
+            ),
+        )
+        .values(confirmed_run_id=run.id)
+        # Пайплайн живёт в одной сессии, и эти же записи в ней уже загружены
+        # (`persist_results`): пометка должна дойти и до них.
+        .execution_options(synchronize_session="fetch")
+    )
+    return int(result.rowcount or 0)
+
+
+def confirm_prices_of_latest_verified_runs(session, current_run: "Run") -> dict[int, int]:
+    """Подтвердить цены `current_run` и последних проверенных сборов каждого сайта.
+
+    Кроме текущего прогона берутся последний проверенный сбор каждого сайта и
+    последний проверенный сбор ДО текущего. Первое даёт алертам и ROI этого
+    прогона доверенные цены чужих сайтов, второе — доверенную ПРЕЖНЮЮ цену
+    своего: без неё первый сбор сайта после 2026-10-07 не с чем сравнить, и
+    падение цены в нём осталось бы без алерта. Проверенные сборы до этой даты
+    цен не подтверждали; подтвердить задним числом можно, потому что
+    `confirm_prices_observed_by_run` смотрит на момент наблюдения.
+
+    Возвращает `{run_id: число помеченных записей}`. Коммит — за вызывающим.
+    """
+    run_ids = {current_run.id}
+    for before_run_id in (None, current_run.id):
+        run_ids.update(
+            latest_financial_run_ids_by_site(
+                session,
+                FULL_CATALOG_SITES,
+                tenant_id=current_run.tenant_id,
+                before_run_id=before_run_id,
+            ).values()
+        )
+    confirmed: dict[int, int] = {}
+    for run_id in sorted(run_ids):
+        run = current_run if run_id == current_run.id else session.get(Run, run_id)
+        confirmed[run_id] = confirm_prices_observed_by_run(session, run)
+    return confirmed
 
 
 def financially_eligible_run_ids(
@@ -1387,6 +1685,131 @@ def latest_financial_run_ids_by_site(
     return out
 
 
+def new_product_cutoffs_by_site(session, current_run: "Run", sites) -> dict[str, datetime]:
+    """С какого момента товар сайта считается «новым» для проверенного прогона.
+
+    «Нет проверенной цены в прошлом» не значит «товар новый»: цену могли записать
+    до появления проверки, частичным тиком или сбором, не прошедшим проверку.
+    2026-10-04 первый за месяц проверенный сбор aptekonline так объявил новыми
+    774 товара, лежавших в каталоге с мая. Новым считается товар, появившийся
+    после начала предыдущего проверенного полного сбора своего сайта; если
+    такого сбора ещё не было — появившийся в текущем прогоне.
+
+    Это только нижняя граница даты появления. Кандидаты по-прежнему — записи
+    текущего прогона, поэтому товар, который первым увидел частичный тик и чья
+    цена к проверенному сбору не изменилась, новым не объявляется: записи в
+    проверенном сборе у него нет. Так было и до этой правки.
+    """
+    from sqlalchemy import select
+
+    wanted = set(sites)
+    cutoffs = {site: current_run.started_at for site in wanted}
+    previous_by_site = latest_financial_run_ids_by_site(
+        session,
+        wanted,
+        tenant_id=current_run.tenant_id,
+        before_run_id=current_run.id,
+    )
+    if previous_by_site:
+        started_at_by_run = dict(
+            session.execute(
+                select(Run.id, Run.started_at).where(Run.id.in_(set(previous_by_site.values())))
+            ).all()
+        )
+        for site, run_id in previous_by_site.items():
+            if run_id in started_at_by_run:
+                cutoffs[site] = started_at_by_run[run_id]
+    return cutoffs
+
+
+def _latest_snapshot_stmt(
+    session,
+    entities,
+    product_ids,
+    *,
+    financially_eligible_only: bool,
+    tenant_id: int,
+    include_run_id: int | None,
+):
+    """SELECT последнего snapshot'а на товар; `None`, если выбирать нечего.
+
+    Общая часть `latest_snapshots_per_product` (ORM-объекты) и
+    `latest_prices_per_product` (только нужные колонки): правило «какой snapshot
+    считать текущим» должно жить в одном месте.
+    """
+    from sqlalchemy import func, select
+
+    product_ids = list(product_ids) if not isinstance(product_ids, list) else product_ids
+    if not product_ids:
+        return None
+
+    eligible_run_ids: list[int] | None = None
+    if financially_eligible_only:
+        eligible_run_ids = financially_eligible_run_ids(
+            session,
+            tenant_id=tenant_id,
+            include_run_id=include_run_id,
+        )
+        if not eligible_run_ids:
+            return None
+
+    filters = [PriceSnapshot.product_id.in_(product_ids)]
+    if eligible_run_ids is not None:
+        filters.append(trusted_snapshot_filter(eligible_run_ids))
+
+    latest_at_subq = (
+        select(
+            PriceSnapshot.product_id,
+            func.max(PriceSnapshot.captured_at).label("max_at"),
+        )
+        .where(*filters)
+        .group_by(PriceSnapshot.product_id)
+        .subquery()
+    )
+    latest_stmt = select(*entities).join(
+        latest_at_subq,
+        (PriceSnapshot.product_id == latest_at_subq.c.product_id)
+        & (PriceSnapshot.captured_at == latest_at_subq.c.max_at),
+    )
+    if eligible_run_ids is not None:
+        latest_stmt = latest_stmt.where(trusted_snapshot_filter(eligible_run_ids))
+    return latest_stmt.order_by(PriceSnapshot.product_id, PriceSnapshot.id.desc())
+
+
+def latest_prices_per_product(
+    session,
+    product_ids,
+    *,
+    financially_eligible_only: bool = False,
+    tenant_id: int = 1,
+) -> dict[int, tuple[float | None, float | None, bool]]:
+    """`product_id → (price, discount_price, is_on_sale)` последнего snapshot'а.
+
+    То же правило выбора, что у `latest_snapshots_per_product`, но без сборки
+    ORM-объектов: страница сравнения читает цены тысяч товаров на каждый запрос,
+    и гидратация `PriceSnapshot` стоила там больше, чем сам SQL.
+    """
+    latest_stmt = _latest_snapshot_stmt(
+        session,
+        (
+            PriceSnapshot.product_id,
+            PriceSnapshot.price,
+            PriceSnapshot.discount_price,
+            PriceSnapshot.is_on_sale,
+        ),
+        product_ids,
+        financially_eligible_only=financially_eligible_only,
+        tenant_id=tenant_id,
+        include_run_id=None,
+    )
+    if latest_stmt is None:
+        return {}
+    out: dict[int, tuple[float | None, float | None, bool]] = {}
+    for product_id, price, discount_price, is_on_sale in session.execute(latest_stmt):
+        out.setdefault(product_id, (price, discount_price, bool(is_on_sale)))
+    return out
+
+
 def latest_snapshots_per_product(
     session,
     product_ids,
@@ -1411,45 +1834,17 @@ def latest_snapshots_per_product(
     Дубли по `(product_id, captured_at)` — крайне маловероятны, но
     разрулятся: возвращается первый встреченный.
     """
-    from sqlalchemy import func, select
-
-    product_ids = list(product_ids) if not isinstance(product_ids, list) else product_ids
-    if not product_ids:
-        return {}
-
-    eligible_run_ids: list[int] | None = None
-    if financially_eligible_only:
-        eligible_run_ids = financially_eligible_run_ids(
-            session,
-            tenant_id=tenant_id,
-            include_run_id=include_run_id,
-        )
-        if not eligible_run_ids:
-            return {}
-
-    filters = [PriceSnapshot.product_id.in_(product_ids)]
-    if eligible_run_ids is not None:
-        filters.append(PriceSnapshot.run_id.in_(eligible_run_ids))
-
-    latest_at_subq = (
-        select(
-            PriceSnapshot.product_id,
-            func.max(PriceSnapshot.captured_at).label("max_at"),
-        )
-        .where(*filters)
-        .group_by(PriceSnapshot.product_id)
-        .subquery()
+    latest_stmt = _latest_snapshot_stmt(
+        session,
+        (PriceSnapshot,),
+        product_ids,
+        financially_eligible_only=financially_eligible_only,
+        tenant_id=tenant_id,
+        include_run_id=include_run_id,
     )
-    latest_stmt = select(PriceSnapshot).join(
-            latest_at_subq,
-            (PriceSnapshot.product_id == latest_at_subq.c.product_id)
-            & (PriceSnapshot.captured_at == latest_at_subq.c.max_at),
-        )
-    if eligible_run_ids is not None:
-        latest_stmt = latest_stmt.where(PriceSnapshot.run_id.in_(eligible_run_ids))
-    snaps = session.scalars(
-        latest_stmt.order_by(PriceSnapshot.product_id, PriceSnapshot.id.desc())
-    ).all()
+    if latest_stmt is None:
+        return {}
+    snaps = session.scalars(latest_stmt).all()
     out: dict[int, PriceSnapshot] = {}
     for s in snaps:
         out.setdefault(s.product_id, s)

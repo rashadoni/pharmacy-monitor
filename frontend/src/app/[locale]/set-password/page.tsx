@@ -1,30 +1,56 @@
 "use client";
 
-import { Suspense, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
+import { forgetLinkToken, storedLinkToken } from "@/lib/link-token";
 import { Lock, KeyRound } from "lucide-react";
+import {
+  passwordProblem,
+  passwordProblemInResponse,
+  type PasswordProblem,
+} from "@/lib/password-rule";
+
+// Причина, по которой пароль задать нельзя, → ключ текста в `set_password`.
+const PROBLEM_TEXT = {
+  password_not_text: "error_unusable",
+  password_too_short: "error_short",
+  password_too_long: "error_long",
+} as const satisfies Record<PasswordProblem, string>;
 
 /**
- * /[locale]/set-password?token=...
+ * /[locale]/set-password
  *
  * Приглашённый пользователь задаёт свой пароль по одноразовому magic-token из
- * письма. POST /auth/set-password → backend ставит password_hash + JWT cookie →
- * redirect на /overview. Дальше юзер входит по email+паролю на /login.
+ * письма. Ссылку открывает страница API `/auth/link/password`: она кладёт токен
+ * в sessionStorage вкладки и приводит сюда — в адресе этой страницы токена нет
+ * (почему — `@/lib/link-token`). Форма шлёт токен телом POST /auth/set-password
+ * → backend ставит password_hash + JWT cookie → redirect на /overview. Дальше
+ * юзер входит по email+паролю на /login.
  *
- * Suspense обязателен для useSearchParams при SSG из [locale]/ сегмента.
+ * Пароль, который сервер не примет (короткий, длиннее 72 байт), сюда же и
+ * возвращается с причиной — до отправки; ссылка при таком отказе остаётся годной.
  */
-function SetPasswordInner() {
+export default function SetPasswordPage() {
   const router = useRouter();
   const t = useTranslations("set_password");
-  const params = useSearchParams();
-  const token = params.get("token");
+  // undefined — хранилище ещё не прочитано (первый кадр), null — токена нет.
+  const [token, setToken] = useState<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    setToken(storedLinkToken());
+  }, []);
 
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [status, setStatus] = useState<"idle" | "loading" | "error">("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Ссылка больше не годится (сервер отказал по ней самой). Отказ по паролю и
+  // сбой её не гасят — новую тогда предлагать незачем: она погасила бы эту.
+  const [linkSpent, setLinkSpent] = useState(false);
+  // Токена нет (письмо старого образца, адрес набран руками) — сказать сразу, а
+  // не после того, как человек придумал пароль.
+  const shownError = errorMsg ?? (token === null ? t("token_missing") : null);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -33,9 +59,10 @@ function SetPasswordInner() {
       setErrorMsg(t("token_missing"));
       return;
     }
-    if (password.length < 6) {
+    const problem = passwordProblem(password);
+    if (problem) {
       setStatus("error");
-      setErrorMsg(t("error_short"));
+      setErrorMsg(t(PROBLEM_TEXT[problem]));
       return;
     }
     if (password !== confirm) {
@@ -53,11 +80,24 @@ function SetPasswordInner() {
         body: JSON.stringify({ token, new_password: password }),
       });
       if (!res.ok) {
+        // 401 — ссылка не годится; 400 — пароль у пользователя уже есть, и ссылка
+        // при этом погашена. Мёртвый токен во вкладке не остаётся: обновлённая
+        // страница скажет о нём сразу, а не после нового пароля.
+        if (res.status === 401 || res.status === 400) {
+          setLinkSpent(true);
+          forgetLinkToken();
+        }
         if (res.status === 401) throw new Error(t("error_invalid"));
         const data = await res.json().catch(() => ({}));
-        throw new Error(data?.detail || t("error_generic"));
+        const refused = passwordProblemInResponse(data);
+        if (refused) throw new Error(t(PROBLEM_TEXT[refused]));
+        // `detail` бывает и списком — тогда это не текст для человека.
+        throw new Error(
+          typeof data?.detail === "string" ? data.detail : t("error_generic"),
+        );
       }
       // Cookie set — logged in. Redirect to dashboard.
+      forgetLinkToken();
       router.replace("/overview");
       router.refresh();
     } catch (err) {
@@ -125,12 +165,12 @@ function SetPasswordInner() {
               </div>
             </div>
 
-            {errorMsg && (
+            {shownError && (
               <div
                 role="alert"
                 className="rounded-lg bg-destructive/10 border border-destructive/30 px-3 py-2 text-sm text-destructive flex items-start gap-2"
               >
-                <span className="leading-tight">{errorMsg}</span>
+                <span className="leading-tight">{shownError}</span>
               </div>
             )}
 
@@ -143,7 +183,7 @@ function SetPasswordInner() {
             </button>
           </form>
 
-          {(status === "error" || !token) && (
+          {(linkSpent || token === null) && (
             <p className="text-center text-xs text-muted-foreground mt-6">
               <a href="/login" className="underline text-primary">
                 {t("request_new")}
@@ -153,19 +193,5 @@ function SetPasswordInner() {
         </div>
       </div>
     </div>
-  );
-}
-
-export default function SetPasswordPage() {
-  return (
-    <Suspense
-      fallback={
-        <div className="min-h-screen flex items-center justify-center">
-          <div className="text-muted-foreground text-sm">…</div>
-        </div>
-      }
-    >
-      <SetPasswordInner />
-    </Suspense>
   );
 }

@@ -29,7 +29,6 @@ src/
       categories/       # 🗂️ (TODO Week 8)
       settings/         # ⚙️ (TODO Week 8)
       layout.tsx        # SideNav + BottomNav + auth check
-    auth/verify/        # magic-link landing
     login/              # request magic-link form
     layout.tsx          # root: html, body, providers
     page.tsx            # → redirect /overview

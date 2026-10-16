@@ -2,6 +2,15 @@
 
 Last updated: 2026-05-28
 
+> ⚠️ Помечено 2026-10-11. Документ написан 2026-05-28 и с тех пор правился
+> местами; «Last updated» выше — дата написания. 2026-10-11 с репозиторием,
+> журналом CI на `main` и чтением сервера сверены и приведены к
+> действительности: «Prod box» в разделе 4, «Production state» в разделе 5,
+> раздел 6 «Test coverage», списки Blocked и Pending в разделе 7. Под схемой
+> раздела 1 и у ночного сбора в разделе 3 стоят пометки о том, что в них
+> устарело. Остальное в этот день не перепроверялось и может описывать май
+> 2026 — в том числе раздел 2 (proxy chain, проверки health) и таблица MCP.
+
 Comprehensive overview за после Phase 6.1 (URL-based i18n) и установки 9 MCP stack. Целевая аудитория: новый разработчик за 30 мин понимает систему до уровня "могу безопасно изменять компоненты".
 
 ---
@@ -18,7 +27,7 @@ Comprehensive overview за после Phase 6.1 (URL-based i18n) и устан�
                   ┌─────────────────────────────┼─────────────────────────────┐
                   │                             │                             │
                   ▼                             ▼                             ▼
-       Hetzner cx33 prod (DE)        Mac dev/diagnostics            User browsers
+       Prod VPS (Contabo)            Mac dev/diagnostics            User browsers
        ┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
        │  pharmonline DDP     │      │  aptekonline httpx   │      │  Chrome / Safari     │
        │  (Meteor WebSocket)  │      │  (no scrape runtime) │      │  (RU / AZ / EN)      │
@@ -80,10 +89,22 @@ Comprehensive overview за после Phase 6.1 (URL-based i18n) и устан�
        │  report.py           │
        │  → reports/*.html    │
        │  → reports/*.xlsx    │
-       │  → SMTP (Resend) ✗   │
-       │     not configured   │
+       │  → SMTP (Resend):    │
+       │     отчёт выключен   │
        └──────────────────────┘
 ```
+
+> ⚠️ Схема нарисована в мае 2026 и правилась 2026-07-03 (помечено 2026-10-11).
+> В этот день в ней поправлены две подписи. Сервер: было «Hetzner cx33 prod
+> (DE)» — тот сервер удалён, прод с 2026-09-03 на Contabo. Почта: было «SMTP
+> (Resend) ✗ not configured» — SMTP настроен, а письмо с отчётом о сборе, о
+> котором этот блок схемы, выключено: `SCRAPE_REPORT_EMAIL=0` в env сервера
+> (drop-in юнита сбора с тем же значением лежит в Git, на сервер он не
+> установлен). Пути и часы сбора на схеме не перепроверялись и с действующими
+> расходятся: полный сбор у всех трёх сайтов недельный, intraday обслуживает
+> только aloe (`intraday.INTRADAY_SITES`), таймер aloe стоит на 01:00, а не на
+> 03:00. Действующее расписание — `src/cadence.py` и блок «РАСПИСАНИЕ СБОРА» в
+> `CLAUDE.md`.
 
 ---
 
@@ -205,7 +226,7 @@ app/
     ├── layout.tsx       ← validate locale + setRequestLocale + NextIntlClientProvider
     ├── page.tsx         ← /<locale> → /<locale>/overview
     ├── login/
-    ├── auth/verify/
+    ├── set-password/
     └── (dashboard)/     ← route group, shared dashboard layout
         ├── layout.tsx
         ├── overview/
@@ -232,6 +253,27 @@ State management: React Query (TanStack). Cache invalidation после mutation
 
 ### Nightly scrape pipeline (01:00-04:00 UTC)
 
+> ⚠️ Блок ниже написан в мае 2026 и правился 2026-07-03 (помечено
+> 2026-10-11). Сверено с `src/cadence.py`, юнитами в `infra/systemd/` и
+> таймерами на сервере; что в нём не так:
+>
+> - Полный сбор не суточный. Каталог каждого сайта собирается раз в неделю, в
+>   ночь на понедельник. Таймеры aloe и pharmonline срабатывают каждую ночь в
+>   01:00, таймер aptekonline — по понедельникам в 02:00; в ночи, когда сайт на
+>   этой неделе уже собран, `run` выходит без сбора
+>   (`run_skipped_within_cadence` в журнале).
+> - Часы в юнитах — по времени сервера (Europe/Berlin), а не UTC; это относится
+>   и к бэкапу в 04:00. «UTC» в заголовке и в блоке неверно.
+> - Юнит зовёт `pharmacy-monitor run --site %i`, без `--mode category`.
+> - Сбор pharmonline по таймеру идёт через публичный API, а не через DDP и
+>   IPRoyal; второй его путь — workflow в GitHub Actions по понедельникам
+>   (блок «РАСПИСАНИЕ СБОРА» в `CLAUDE.md`).
+> - Письмо с отчётом, последняя строка блока pharmonline, выключено:
+>   `SCRAPE_REPORT_EMAIL=0`.
+> - Не перепроверялись: числа в блоке (25k товаров, 272k обращений, 5–15k
+>   записей о цене) и то, каким выходом aptekonline собирается сейчас («via
+>   Decodo AZ residential proxy»).
+
 ```
 01:00 UTC ─ pharmacy-monitor-scrape@pharmonline.timer fires
   ├── pharmacy-monitor run --site pharmonline --mode category
@@ -255,26 +297,34 @@ State management: React Query (TanStack). Cache invalidation после mutation
   └── pg_dump → /var/backups/pharmacy-monitor/*.sql.gz.gpg (GPG encrypted)
 ```
 
-### Intraday rotation (05:00-17:00 UTC, business hours)
+### Intraday rotation (05:00–17:00 по времени хоста)
+
+Часы в `OnCalendar` — местные для сервера. Прод стоит в Europe/Berlin, поэтому
+летом тики идут в 03–15 UTC.
 
 ```
-Every hour 05-17 UTC ─ pharmacy-monitor-intraday.timer fires (Phase 5.1c)
+Every hour 05-17 ─ pharmacy-monitor-intraday.timer fires (Phase 5.1c)
   ├── pharmacy-monitor intraday-tick
-  ├── src/intraday.py:top_volatile_categories
+  ├── src/intraday.py:top_volatile_categories(sites=INTRADAY_SITES)
   │     → SELECT count(snapshots) per category per site за 7d
-  │     → Top-30 categories by volatility
-  ├── Redis INCR "intraday:rotation:idx" → cats[i % 30]
+  │     → только категории с разделом на сайте из INTRADAY_SITES
+  │     → Top-30 by volatility
+  ├── Redis GET "intraday:rotation:idx" → cats[i % len] (чья очередь)
   ├── Intraday site (INTRADAY_SITES = ['aloe']):
   │     - SETNX "intraday:lock:site:aloe" с TTL=2h
   │     - Pharmonline исключён: его Meteor WebSocket через residential proxy
   │       обслуживается только полным недельным прогоном
-  │     - Если locked → skip tick, log "all_sites_locked"
-  └── pharmacy-monitor run --site X --mode category --category-id N --no-alerts
-        (no-alerts чтобы не дублировать с full nightly)
+  │     - Если locked → skip tick, log "intraday_skipped reason=site_rate_limited",
+  │       очередь остаётся у той же категории
+  ├── Прогон взят → Redis INCR "intraday:rotation:idx"
+  ├── pharmacy-monitor scrape --site aloe --category-id N --limit 600
+  │     (только сбор: матчер, журнал алертов и ROI тик не трогает)
+  └── alerts.local_price_alerts_for_partial_run → письмо admin/owner
+        (падения цены, которые тик увидел сам; в базе не хранятся)
 ```
 
-Result: до 7 supplemental Aloe scrapes/day; proxy-зависимые сайты не получают
-лишних intraday-подключений.
+Result: 5–7 supplemental Aloe scrapes/day (13 тиков при лимите один прогон на
+сайт в 2 часа); proxy-зависимые сайты не получают лишних intraday-подключений.
 
 ### User dashboard hit
 
@@ -298,23 +348,31 @@ User GET https://leaddrive.cloud/az/comparison
 
 ## 4. Deployment topology
 
-### Prod box (Hetzner cx33, Falkenstein DE)
+### Prod box (Contabo VPS)
+
+2026-10-11 чтением сервера сверены железо, ОС, часовой пояс, список и
+расписание таймеров, команда запуска API, имена бэкапов. До этой даты здесь был
+описан Hetzner cx33 (Falkenstein, 80 GB SSD, Ubuntu 22.04): тот сервер удалён,
+прод переехал на Contabo 2026-09-03.
 
 ```
-Hardware: 4 vCPU, 8 GB RAM, 80 GB SSD · €7.99/мес · IP 46.225.149.52
-OS: Ubuntu 22.04 LTS
+Hardware: 4 vCPU, 8 GB RAM, 96 GB disk · IP 13.140.186.143 (vmi3552946.contaboserver.net)
+OS: Ubuntu 24.04 LTS · часовой пояс Europe/Berlin
 
 Services (all systemd):
 - pharmacy-monitor-api.service          → FastAPI :8080 (uvicorn, 2 workers)
-- pharmacy-monitor-frontend.service     → Next.js :3000 (standalone)
-- pharmacy-monitor-scrape@<site>.timer  → daily scrape
+- pharmacy-monitor-frontend.service     → Next.js :3000 (standalone); юнит есть только на сервере, в infra/systemd/ его нет
+- pharmacy-monitor-scrape@<site>.timer  → будильник сбора: aloe и pharmonline каждую ночь в 01:00, aptekonline по понедельникам в 02:00 (время хоста). Полный сбор недельный — src/cadence.py
 - pharmacy-monitor-scrape@<site>.service → triggered by timer
-- pharmacy-monitor-intraday.timer       → hourly 05-17 UTC (Phase 5.1c)
+- pharmacy-monitor-intraday.timer       → hourly 05–17 по времени хоста (Phase 5.1c)
 - pharmacy-monitor-intraday.service     → intraday-tick
 - pharmacy-monitor-health.timer         → hourly
-- pharmacy-monitor-backup.timer         → daily 04:00 UTC
-- pharmacy-monitor-rematch.timer        → weekly Monday 05:00 UTC
-- pharmacy-monitor-digest@daily.timer   → daily 05:00 UTC
+- pharmacy-monitor-backup.timer         → daily 04:00 по времени хоста
+- pharmacy-monitor-rematch.timer        → Tuesday and Friday 04:30 по времени хоста; `rematch` без `--reset` (тот же этап, что конец сбора). Так в Git; на сервере — после замены юнита, см. RUNBOOK «Выкладка правок сопоставления». 2026-10-11 юнит на сервере ещё прежний (понедельник 05:00, `rematch --reset`). Последний его запуск был 2026-10-05, до выкладки отказа; код на сервере теперь на `--reset` без второго флага отвечает отказом (RUNBOOK, там же), так что со следующего запуска не должно быть ни сброса, ни планового `rematch`, пока юнит не заменён, — прочитано в коде, в журнале ещё не наблюдалось
+- pharmacy-monitor-digest@daily.timer   → daily 05:00 UTC; на сервере выключен (прежняя команда `digest`)
+- pharmacy-monitor-digest-daily.timer   → daily 05:00 UTC; утреннее письмо с разницей цен (`notify digest daily`). В Git с 2026-10-13; на сервере — после того как root поставит юнит, RUNBOOK «Утреннее письмо с разницей цен»
+- pharmacy-monitor-digest-weekly.timer  → понедельник 06:00 UTC; на сервере включён
+- prometheus, grafana-server            → активны (Grafana за Caddy, /grafana); Alertmanager не установлен
 
 Network:
 - Caddy :80/:443 (auto-HTTPS via Let's Encrypt, HSTS preload)
@@ -322,17 +380,25 @@ Network:
 - Redis 7 :6379 (local-only)
 
 Persistent state:
-- /opt/pharmacy-monitor/ — app code + .venv
+- /opt/pharmacy-monitor/ — app code + .venv; копия без .git, код кладёт deploy.yml
 - /var/lib/postgresql/16/main/ — DB
-- /var/backups/pharmacy-monitor/ — daily backups (~30d retention)
+- /var/backups/pharmacy-monitor/ — daily backups, хранение 14 дней (infra/scripts/backup.sh), файлы .sql.gz.gpg
 - /etc/pharmacy-monitor/env — secrets (DATABASE_URL, API_KEYS, JWT_SECRET)
 ```
+
+Список сервисов — не полный перечень юнитов сервера: 2026-10-11 там включены ещё
+`pharmacy-monitor-watchlist.timer` и `pharmacy-monitor-scrape-watcher.timer`.
+Не перепроверялись в этот день каталог базы и строки Network — кроме того, что
+`caddy`, `postgresql` и `redis-server` активны.
 
 ### Mac developer machine
 
 ```
 - pharmacy-monitor git clone (development)
 - Persistent SSH tunnel Mac:5433 → prod:5432 (launchd, see infra/local/com.pharmacy-monitor.db-tunnel.plist)
+  — устарел с переезда 2026-09-03 (помечено 2026-10-11): туннель смотрел на
+  удалённый сервер, в plist из репозитория вместо адреса стоит заглушка
+  (infra/local/README.md)
 - Mac scrape launchd jobs are retired and should stay unloaded/disabled. Local
   scrape scripts are fail-closed unless `PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1`
   is set for explicit DR.
@@ -365,7 +431,9 @@ Persistent state:
 - **`Run.products_scraped`** = page hits, не unique products. Уникальных по `external_id` будет меньше.
 - **Scrape concurrency** — server watcher skips when any `pharmacy-monitor run`,
   `scrape`, `intraday-tick`, or `rematch` is active; matcher/rematch uses a
-  Postgres advisory lock for `canonical_id` writes.
+  Postgres advisory lock for `canonical_id` writes. `rematch` also try-locks the
+  run lock and exits with "skipped" while a scrape, a tick or another `rematch`
+  holds it.
 
 ### Scraping
 
@@ -383,30 +451,81 @@ Persistent state:
 
 ### Production state
 
-- **`pm` user не имеет passwordless sudo** — для systemctl/sudo используй root через SSH.
+Сверено чтением сервера 2026-10-11; что стояло в каждой строке раньше, названо
+в ней же.
+
+- **`pm` может без пароля ровно две команды** — `systemctl restart` для
+  `pharmacy-monitor-api.service` и для `pharmacy-monitor-frontend.service`
+  (`/etc/sudoers.d/pm-deploy`; без них не работает `deploy.yml`). Всё остальное,
+  что требует root, — root через SSH. Раньше здесь стояло «не имеет
+  passwordless sudo».
 - **`admin off`** в Caddyfile → `systemctl reload caddy` фейлится, use `restart`.
-- **Backup retention** — 30 days в /var/backups/pharmacy-monitor/, не offsite (B2 user declined).
-- **Sentry / Telegram / SMTP не configured** — alerts только в DB. Phase 5.4 заблокирован на alert channel setup.
+  Строка `admin off` в `/etc/caddy/Caddyfile` есть; сам `reload` 2026-10-11 не
+  запускался.
+- **Backup retention** — 14 дней в /var/backups/pharmacy-monitor/
+  (`RETENTION_DAYS` в `infra/scripts/backup.sh`), файлы зашифрованы
+  (`.sql.gz.gpg`). Не offsite: B2 не настроен (B2 user declined), наружу дамп
+  уходит только руками — RUNBOOK, «Копия бэкапа вне сервера». Раньше здесь
+  стояло «30 days».
+- **SMTP и Sentry настроены, Telegram — нет.** В `/etc/pharmacy-monitor/env`
+  заданы `SMTP_HOST`, `SMTP_PASSWORD` и `SENTRY_DSN`; за восемь дней в журнале
+  сервера 35 строк `smtp_sent_ok` и 40 `sentry_initialized`. `TELEGRAM_BOT_TOKEN`
+  пуст, `pharmacy-monitor-telegram-bot.service` выключен. Раньше здесь стояло
+  «Sentry / Telegram / SMTP не configured — alerts только в DB»: по записи в
+  `CLAUDE.md`, SMTP и Sentry работают с 2026-05-29.
+- **Prometheus и Grafana работают, Alertmanager не установлен.** `prometheus`
+  и `grafana-server` активны, в `/etc/prometheus/alerts.yml` семь правил.
+  Юнита и файлов Alertmanager на сервере нет, блок `alertmanagers` в конфиге
+  Prometheus закомментирован: уведомлений по правилам не уходит. Каталога
+  `/var/lib/grafana/dashboards/`, куда RUNBOOK («Observability») кладёт
+  дашборд, на сервере нет; есть ли дашборд в самой Grafana, не проверялось.
 
 ---
 
 ## 6. Test coverage
 
-```
-~280 unit tests passing (pytest):
-- test_persist_results.py (15) — diff-only, URL update bug regression, barcode
-- test_matcher.py — barcode + name normalization clustering
-- test_aloe.py, test_pharmonline_ddp.py, test_aptekonline_api.py — scraper unit
-- test_roi.py (22) — actions, MAP violations, translation
-- test_intraday.py (19) — rotation, Redis state, fail-open
-- test_analytics.py, test_alerts.py, test_health.py — analysis
-- test_api.py — endpoint smoke tests
+Числа — из журнала CI на `main`, а не из локального запуска. Они устаревают с
+каждым мержем: за час с небольшим 2026-10-11 — 2400 passed на `f33cafd5`, 2663
+на `3c09c5df`, 2816 на `6ee3878d`, 2886 на `9f072e9a`. Свежие — в журнале
+последнего прогона:
+`gh run list --workflow=ci-pipeline.yml --branch main`.
 
-Pre-existing failures (not blocking):
-- test_scrapers_snapshot.py (4) — нужны network fixtures для pharmonline/aloe HTTP-snapshots
-```
+Снимок 2026-10-11 — прогон `ci-pipeline.yml` на `main`, коммит `9f072e9a`
+(https://github.com/rashadoni/pharmacy-monitor/actions/runs/38174750694):
 
-E2E coverage: **0 tests** — Phase 6.3 pending. С новым Playwright MCP можно драйвить через AI agent interactively сначала, потом codify как Playwright tests.
+- **Backend, джоба `Test (pytest)`:** `2886 passed, 4 skipped, 1 xfailed`,
+  упавших нет.
+- **Упавших тестов, которые «not blocking», не бывает.** `Test (pytest)` —
+  обязательная проверка, PR с красной не мержится
+  (`DELIVERY-ARCHITECTURE.md`, слой 1). Сам `main` покраснеть при этом может:
+  защита ветки не требует свежей базы, и два PR, зелёных порознь, вместе роняют
+  тест. Так было в тот же день: на `4cf0bfb7` (мерж #84) упал один тест,
+  пришедший с #86, — `1 failed, 2815 passed`. Пока `main` был красным, красной
+  была и `Test (pytest)` у PR, собранного поверх него (прогон 38172561038: в
+  том PR правились только тексты и комментарии); починено в тот же час, на
+  `6ee3878d`.
+- **Сколько тестов в каком файле, журнал не говорит**: pytest идёт с `-q`, имён
+  файлов и тестов в его выводе нет. В `tests/` на этом коммите 90 файлов
+  `test_*.py`.
+- **`1 xfailed`.** Пометка `xfail` в `tests/` одна —
+  `test_pharmonline_snapshot_prices_parseable` в `test_scrapers_snapshot.py`:
+  снимок вёрстки pharmonline устарел. Пометка нестрогая (`strict=False`): по
+  документации pytest такой тест не красит прогон, ни пока падает, ни когда
+  начнёт проходить.
+- **`4 skipped`.** Какие четыре теста пропущены и почему, журнал не называет
+  (нет `-rs`).
+- **Frontend, джоба `Frontend (Next.js)`:** vitest — 10 файлов, 34 теста, все
+  прошли. Что исполняет этот шаг и чем он глушится — `CLAUDE.md`, «Тесты
+  фронтенда исполняет CI».
+
+До 2026-10-11 здесь стояло «~280 unit tests passing», счётчики по файлам и
+«Pre-existing failures (not blocking): test_scrapers_snapshot.py (4)» — запись
+от 2026-05-28. Двух файлов из того списка в `tests/` нет: `test_aloe.py` (есть
+`test_aloe_rsc.py`, `test_aloe_slug.py` и ещё два `test_aloe_*`) и
+`test_pharmonline_ddp.py` (есть `test_pharmonline_ddp_dedup.py` и
+`test_pharmonline_ddp_robustness.py`).
+
+E2E: в `frontend/e2e/` лежит восемь файлов сценариев Playwright (`*.spec.ts`, сверено 2026-10-11). CI их не исполняет: ни один workflow не зовёт `pnpm test:e2e`, сценариям нужен поднятый стенд с базой. Зелёный CI не говорит, проходят ли они: `tsc` в CI эти файлы только типизирует. Как запускать — `frontend/e2e/README.md`.
 
 ---
 
@@ -422,17 +541,36 @@ E2E coverage: **0 tests** — Phase 6.3 pending. С новым Playwright MCP м
 - Phase 5.5: frontend X-Request-ID propagation
 - Phase 5.6: per-site staleness panel
 - Phase 6.1: URL-based i18n (layout-based, no middleware)
+- Phase 6.4: CI integration test — джоба `Test (pytest)` в `ci-pipeline.yml` поднимает Postgres 16 и Redis 7 service-контейнерами, накатывает на Postgres миграции и запускает pytest с `DATABASE_URL` и `REDIS_URL` на них. Общая фикстура `db_session` при этом — SQLite в памяти; на PostgreSQL идут те тесты, что сами читают `DATABASE_URL`
 - Phase 6.5: RUNBOOK updates
 
 ### Blocked
-- Phase 5.4: Prometheus alerting — needs Prometheus install + alert channel (Telegram/SMTP)
-- Phase 5.3: Grafana dashboards — needs Grafana install
-- Phase 3: HA replica — needs 2nd Hetzner cx22 ($8/мес user decision)
+
+Сверено 2026-10-11 с сервером и `CLAUDE.md`; в каждой строке названо, что в ней
+стояло раньше.
+
+- Phase 5.4: Prometheus alerting — Prometheus стоит и работает (по `CLAUDE.md`,
+  впервые поставлен 2026-05-29, ещё на прежнем сервере), семь правил лежат в
+  `infra/prometheus-alerts.yml` и на сервере. Не сделана доставка: Alertmanager
+  не установлен, уведомлений по правилам нет. Раньше: «needs Prometheus install
+  + alert channel (Telegram/SMTP)» — SMTP с тех пор настроен, Telegram нет.
+- Phase 5.3: Grafana dashboards — установка больше не мешает: `grafana-server`
+  на сервере активен (впервые поставлен тогда же, 2026-05-29). Загружен ли
+  дашборд (`infra/grafana/dashboard.json`) на нынешнем сервере, не проверялось
+  — см. «Production state». Раньше: «needs Grafana install».
+- Phase 3: HA replica — не сделана: 2026-10-11 у Postgres на сервере ни одной
+  реплики (`pg_stat_replication` пуст). Раньше: «needs 2nd Hetzner cx22 ($8/мес
+  user decision)» — владелец ушёл с Hetzner в сентябре 2026, прод на Contabo;
+  где ставить реплику и сколько она стоит, в репозитории не записано.
 
 ### Pending
-- Phase 6.3: Playwright E2E (5 scenarios)
-- Phase 6.4: CI integration test (Postgres + Redis в docker)
-- Task #33: Fix aloe scraper URL bug (production user-facing)
+- Phase 6.3: Playwright E2E — сценарии написаны (восемь файлов в `frontend/e2e/`), но CI их не исполняет: им нужен поднятый стенд с базой (сверено 2026-10-11)
+- Task #33: Fix aloe scraper URL bug — не Pending (помечено 2026-10-11): сделано
+  2026-05-28, коммит `93255ac0` («fix(aloe): synth product URL via slugify —
+  Task #33»). «Task #33» — номер задачи тогдашней рабочей сессии, а не issue и
+  не PR: PR #33 в этом репозитории — про `rematch`. Адрес товара aloe с тех пор
+  строится иначе, по номеру товара (миграция 0024; `CLAUDE.md`, «Товар aloe
+  узнаётся по номеру товара на сайте»).
 - Long-term: ERP integration (out of scope per client)
 
 ---

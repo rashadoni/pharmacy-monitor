@@ -10,9 +10,10 @@ Auth моделей две:
        Один shared key через PHARMACY_API_KEY в .env. Используется в legacy
        endpoints `/api/v1/products`, `/api/v1/comparisons`, `/api/v1/inventory/*`.
     2. **JWT cookie** — для frontend dashboard. Magic-link flow:
-       `POST /auth/request` → email с magic_token → `GET /auth/verify?token=...`
-       устанавливает httpOnly cookie с JWT. Endpoints `/api/v1/dash/*` требуют
-       этот cookie и фильтруют по tenant_id.
+       `POST /auth/request` → email со ссылкой, токен в ней после «#» →
+       страница `GET /auth/link` шлёт его телом `POST /auth/verify` → httpOnly
+       cookie с JWT. Endpoints `/api/v1/dash/*` требуют этот cookie и фильтруют
+       по tenant_id.
 
 Endpoints (v1):
     Public:
@@ -20,7 +21,11 @@ Endpoints (v1):
 
     Auth (no auth required, public):
         POST /auth/request                 — request magic-link by email
-        GET  /auth/verify?token=...        — verify token, set JWT cookie
+        GET  /auth/link                    — страница входа по ссылке из письма
+        GET  /auth/link/password           — страница ссылки на создание пароля
+        POST /auth/verify {token}          — verify token, set JWT cookie
+        GET  /auth/verify?token=...        — то же, токен в адресе: письма так
+                                             не ходят, остался для скриптов
         POST /auth/logout                  — clear cookie
 
     Frontend (JWT cookie required):
@@ -53,11 +58,14 @@ Endpoints (v1):
 
 from __future__ import annotations
 
+import json
 import os
+import threading
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Iterator
 from urllib.parse import urlsplit
 
 import structlog
@@ -68,22 +76,36 @@ from fastapi import (
     File,
     HTTPException,
     Header,
+    Query,
     Request,
     Response,
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.orm import Session, aliased, selectinload
 
-from src import analytics
+from src import analytics, catalog_search
 from src import inventory as inv_mod
 from src import storage, tenants
 from src._time import utcnow
-from src.category_taxonomy import classify_source_category, source_category_labels
-from src.normalize import pack_unit_count
+
+# Сборка строк сравнения живёт в src/comparison_rows.py: её зовёт и CLI (утреннее
+# письмо о разнице цен), которому это приложение импортировать незачем. Здесь
+# она под прежними именами.
+from src.comparison_rows import (
+    _COMPARISON_PRODUCT_COLUMNS,  # noqa: F401 — прежнее имя, его читают тесты
+    _COMPARISON_STALE_DAYS,
+    _SITE_ORDER,
+    _comparison_rows,
+    _comparison_spread,  # noqa: F401 — прежнее имя
+    _has_ok_run,
+    _price_age_days,
+    _trusted_snapshot_lineage_available,
+)
 
 log = structlog.get_logger()
 
@@ -100,19 +122,43 @@ except ImportError:
 from src.observability import (
     init_observability,
     install_metrics_endpoint,
+    sentry_is_running,
     sentry_set_request_id,
     sentry_set_tenant,
 )
 
 init_observability(service="api")
 
+# Журнал доступа uvicorn пишет адрес запроса целиком, а в нём — токен входа из
+# письма (`/auth/verify?token=…`). Строка запроса из журнала убирается здесь,
+# при импорте приложения: так фильтр стоит в каждом рабочем процессе раньше
+# первого запроса. Почему не флагом в юните — src/access_log.py.
+from src.access_log import hide_query_strings
+
+hide_query_strings()
+
 
 # ─── App ─────────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    # Индекс поиска по каталогу собирается около секунды. Прогреваем его в фоне
+    # при старте воркера — иначе сборку ждал бы первый поиск после каждого
+    # рестарта API. Старт воркера прогрев не задерживает и уронить не может.
+    threading.Thread(
+        target=catalog_search.warm,
+        args=(storage.make_session(),),
+        name="catalog-search-warm",
+        daemon=True,
+    ).start()
+    yield
+
 
 app = FastAPI(
     title="Pharmacy Monitor API",
     description="REST API for ERP integration and frontend dashboard",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # CORS for frontend (Next.js on :3000 in dev, same-origin in prod via Caddy)
@@ -127,6 +173,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Сжатие ответов. Список сравнения — 4 МБ JSON; без сжатия он ехал к клиенту
+# секундами (Caddy перед API ответы не сжимает). Уровень 5: на этих данных
+# почти тот же размер, что у 9, втрое дешевле по CPU.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 # Prometheus /metrics endpoint
 install_metrics_endpoint(app)
@@ -302,7 +353,12 @@ def require_api_key(
         client_ip = request.client.host if request.client else "unknown"
         _check_rate_limit(f"failed:{client_ip}", limit=10)
         raise HTTPException(status_code=401, detail="Invalid X-API-Key")
-    _check_rate_limit(f"ok:{x_api_key[:8]}")
+    # Имя счётчика — без ключа и без его следа. Имя становится ключом Redis, а
+    # Sentry записывает команды Redis в трассу запроса: раньше здесь стояли
+    # первые восемь знаков ключа. Сюда доходит только один, настроенный ключ,
+    # поэтому счётчик один — хеш ключа дал бы тому, кто читает Sentry или Redis,
+    # способ проверять догадки о ключе.
+    _check_rate_limit("ok:api-key")
 
 
 # ─── Auth: JWT cookie (frontend dashboard) ───────────────────────────────────
@@ -396,15 +452,18 @@ class SiteStaleness(BaseModel):
     """Per-site freshness: when did we last successfully see a product on it?
 
     `hours_since` aggregates the gap between now and the max `last_seen_at`
-    across all products tagged with `site`. `max_age_hours` is the site-specific
-    threshold used by backend health checks.  The production contract is a
-    daily full scan for every monitored site, with a 30-hour retry margin.
+    across all products tagged with `site`. `cadence_hours` is how often that
+    site is scheduled for a full scan, and `max_age_hours` is the staleness
+    threshold derived from it (cadence + retry margin). The cadence is NOT the
+    same for every site by design (see ``src/cadence.py``), so a card must be
+    coloured against its own schedule, not a global one.
     """
 
     site: str
     last_seen_at: datetime | None
     hours_since: float | None
     max_age_hours: int
+    cadence_hours: int = 24
 
 
 class HealthOut(BaseModel):
@@ -591,10 +650,10 @@ class WatchlistCategoryIn(BaseModel):
 # ─── Public endpoints ────────────────────────────────────────────────────────
 
 
-# Default per-site staleness threshold (hours) for daily-cadence sites (>30h = at
-# least one scheduled run skipped). ``health._SITE_MAX_AGE_HOURS`` is the
-# single source for the three monitored sites.
-# Surfaced in `/health.staleness_warning`.
+# Fallback staleness threshold (hours) for a site with no declared cadence
+# (>30h = at least one daily run skipped). ``cadence.SITE_SCRAPE_CADENCE_HOURS``
+# and the ``health._SITE_MAX_AGE_HOURS`` derived from it are the single source
+# for the three monitored sites. Surfaced in `/health.staleness_warning`.
 _HEALTH_STALENESS_HOURS = 30
 
 
@@ -603,6 +662,13 @@ def _site_staleness_threshold(site: str) -> int:
     from src.health import _SITE_MAX_AGE_HOURS
 
     return _SITE_MAX_AGE_HOURS.get(site, _HEALTH_STALENESS_HOURS)
+
+
+def _site_cadence_hours(site: str) -> int:
+    """How often this site is scheduled for a full scan (hours)."""
+    from src.cadence import site_cadence_hours
+
+    return site_cadence_hours(site)
 
 
 def _ping_db(db: Session) -> float | None:
@@ -661,6 +727,7 @@ def _staleness_per_site(db: Session) -> list[SiteStaleness]:
                 last_seen_at=last_seen,
                 hours_since=hours,
                 max_age_hours=_site_staleness_threshold(site),
+                cadence_hours=_site_cadence_hours(site),
             )
         )
     return out
@@ -862,28 +929,6 @@ def _require_financial_policy_ready(db: Session, *, tenant_id: int = 1) -> None:
         )
 
 
-def _trusted_snapshot_lineage_available(
-    db: Session,
-    *,
-    tenant_id: int = 1,
-) -> bool:
-    """Whether every required site has a fresh verified full-catalog Run.
-
-    A single site's first financially eligible Run is not a complete price
-    lineage. With diff-only persistence that Run can legitimately contain no
-    PriceSnapshot rows when prices stayed unchanged. Enabling the eligible-run
-    filter at that point would discard the older effective prices for every
-    site and turn comparison endpoints into an empty 200 response.
-
-    Shadow mode therefore keeps the latest effective snapshots until a full
-    cross-site trusted epoch exists. Enforce mode remains fail-closed in
-    ``_require_financial_policy_ready`` above.
-    """
-    from src.product_policy import trusted_catalog_epoch
-
-    return trusted_catalog_epoch(db, tenant_id=tenant_id) is not None
-
-
 # ─── Auth endpoints (frontend) ───────────────────────────────────────────────
 
 
@@ -906,10 +951,16 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     должно падать из-за временной проблемы с почтой (fail-open).
 
     Цель ссылки выбирается по тому, есть ли у пользователя свой пароль:
-    - нет пароля (`password_hash` пуст) → `/set-password` — юзер задаёт пароль и
-      сразу входит. Дальше логинится по email+паролю в любой момент.
-    - есть пароль → `/auth/verify` — magic-link просто логинит (passwordless вход).
+    - нет пароля (`password_hash` пуст) → `/auth/link/password` — оттуда на форму
+      `/set-password`: юзер задаёт пароль и сразу входит. Дальше логинится по
+      email+паролю в любой момент.
+    - есть пароль → `/auth/link` — magic-link просто логинит.
     `invite=True` — приветственная формулировка письма (новый пользователь).
+
+    Токен стоит в ссылке после «#»: эту часть адреса браузер серверу не
+    отправляет. Обе страницы отдаёт API, а не фронтенд, — почему, сказано в
+    `src/login_link_pages.py`. В строку запроса («?token=…») и в адрес страницы
+    фронтенда токен не ставить: адрес и заголовки запроса пишет журнал прокси.
     """
     email = email.strip().lower()
     user = db.scalar(
@@ -926,7 +977,7 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
     needs_password = not user.password_hash
     public_url = os.environ.get("PHARMACY_PUBLIC_URL", "http://localhost:3000")
     if needs_password:
-        link = f"{public_url}/set-password?token={token}"
+        link = f"{public_url}/auth/link/password#token={token}"
         welcome = (
             "<p>Sizə Pharmacy Monitor monitorinq paneli üçün giriş açıldı.</p>"
             "<p>Вам открыт доступ к панели Pharmacy Monitor.</p>"
@@ -940,7 +991,7 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
             "<p>Задайте пароль для входа (ссылка действует 30 минут):</p>"
         )
     else:
-        link = f"{public_url}/auth/verify?token={token}"
+        link = f"{public_url}/auth/link#token={token}"
         subject = "Pharmacy Monitor — giriş keçidi / ссылка для входа"
         intro = (
             "<p>Daxil olmaq üçün keçid (30 dəqiqə qüvvədədir):</p>"
@@ -960,7 +1011,9 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
             to=[email],
         )
     except Exception as e:
-        log.warning("login_link_email_failed", error=str(e), email=email)
+        from src.notifier import delivery_error_fields
+
+        log.warning("login_link_email_failed", user_id=user.id, **delivery_error_fields(e))
     return True
 
 
@@ -975,22 +1028,91 @@ def auth_request(payload: AuthRequestIn, request: Request, db: Session = Depends
     return AuthRequestOut(sent=True, detail="If the email is registered, a magic-link was sent.")
 
 
-@app.get("/auth/verify")
+from fastapi.responses import HTMLResponse
+
+from src import login_link_pages
+
+
+def _login_link_page(html: str) -> HTMLResponse:
+    # Страница одна на всех и токена не содержит; не кэшировать — чтобы после
+    # выкладки браузер не исполнил прежний сценарий.
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/auth/link", include_in_schema=False)
+def auth_link_sign_in_page() -> HTMLResponse:
+    """Куда ведёт ссылка на вход: страница шлёт токен в `POST /auth/verify`."""
+    return _login_link_page(login_link_pages.SIGN_IN_PAGE)
+
+
+@app.get("/auth/link/password", include_in_schema=False)
+def auth_link_set_password_page() -> HTMLResponse:
+    """Куда ведёт ссылка на создание пароля: дальше — форма `/set-password`."""
+    return _login_link_page(login_link_pages.SET_PASSWORD_PAGE)
+
+
+class LinkTokenIn(BaseModel):
+    """Токен из ссылки в письме — телом запроса, не адресом."""
+
+    token: str
+
+    @field_validator("token")
+    @classmethod
+    def _strip_token(cls, v: str) -> str:
+        v = v.strip()
+        if not v or len(v) > 512:
+            raise ValueError("invalid token")
+        return v
+
+
+@app.post("/auth/verify")
+def auth_verify_posted(
+    payload: LinkTokenIn, request: Request, response: Response, db: Session = Depends(get_db)
+):
+    """Вход по ссылке из письма: токен приходит телом запроса.
+
+    Так ходит страница `/auth/link`: ссылка несёт токен после «#», страница
+    читает его и шлёт сюда. Тело запроса журналы прокси и API не пишут, адрес
+    и заголовки — пишут. Проверка, гашение и cookie — те же, что у GET ниже:
+    правило входа одно, меняется только способ доставки токена.
+    """
+    return auth_verify(payload.token, request, response, db)
+
+
+@app.get("/auth/verify", deprecated=True)
 def auth_verify(token: str, request: Request, response: Response, db: Session = Depends(get_db)):
     """Verify magic token, set JWT cookie.
 
-    Этот эндпоинт кликают прямо из письма, поэтому для браузера (Accept:
-    text/html) после установки cookie делаем 303-redirect на дашборд — иначе
-    пользователь видел бы сырой JSON. Программные/XHR-вызовы (Accept */*)
-    получают прежний JSON-контракт.
+    Токен здесь стоит в адресе запроса, а адрес пишут журналы прокси и API.
+    Письма сюда больше не ведут (см. `_send_login_link` и POST выше); адресом
+    входят тесты, e2e и нагрузочный скрипт. Новой ссылке сюда не место.
+
+    Для браузера (Accept: text/html) после установки cookie делаем 303-redirect
+    на дашборд — иначе пользователь видел бы сырой JSON. Программные/XHR-вызовы
+    (Accept */*) получают JSON-контракт.
     """
     wants_html = _wants_html(request)
-    user = tenants.verify_magic_token(db, token)
+    # Счётчик попыток с адреса — такой же, какой первым стоит у
+    # `/auth/set-password`, — и один на оба способа прислать токен (POST выше
+    # зовёт этот же обработчик). Стоит до проверки: отказ 429 до базы не доходит
+    # и ссылку не трогает. В имени — адрес клиента; токену и его хешу там не
+    # место: имя становится ключом Redis, а команды Redis Sentry пишет в трассу
+    # запроса.
+    #
+    # Второго счётчика — по отказам, как `setpw_fail` и `login_fail`, — здесь нет
+    # намеренно. Он срабатывает уже после запроса к базе и ничего не ограничивает,
+    # а ответ меняет: по ссылке, которая просто не годится, страница входа
+    # просила бы подождать минуту вместо того, чтобы назвать ссылку негодной.
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(f"verify:{client_ip}", limit=10)
+    user = tenants.redeem_magic_token(db, token)
     if not user:
         if wants_html:
             return RedirectResponse(url="/login?error=link", status_code=303)
         raise HTTPException(401, "Invalid or expired token")
     jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
+    # Ссылка гаснет, когда сессия уже готова: сбой до этой строки её не сжигает.
+    db.commit()
     secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")
     if wants_html:
         redirect = RedirectResponse(url="/overview", status_code=303)
@@ -1014,8 +1136,81 @@ def auth_verify(token: str, request: Request, response: Response, db: Session = 
     return {"ok": True, "user_id": user.id}
 
 
+# bcrypt берёт от пароля 72 байта. bcrypt 5 на более длинном бросает ValueError —
+# и на записи, и на сверке; версии до неё молча отбрасывали хвост.
+PASSWORD_MAX_BYTES = 72
+PASSWORD_MIN_CHARS = 6
+
+_PASSWORD_PROBLEMS = {
+    "password_not_text": "В пароле есть знак, который нельзя сохранить — наберите пароль заново",
+    "password_too_short": f"Пароль должен быть минимум {PASSWORD_MIN_CHARS} символов",
+    "password_too_long": (
+        f"Пароль слишком длинный: помещается {PASSWORD_MAX_BYTES} латинских знака, "
+        "кириллические и буквы вроде ə, ö, ş занимают по два"
+    ),
+}
+
+
+def _password_problem(password: str) -> str | None:
+    """Почему строку нельзя задать паролем — код причины; можно — None.
+
+    Длина сверху считается в байтах UTF-8, как её считает bcrypt: 73 латинских
+    знака и 37 кириллических не помещаются одинаково. Снизу — в знаках.
+    """
+    try:
+        size = len(password.encode("utf-8"))
+    except UnicodeEncodeError:
+        # Одиночный суррогат: в JSON такая строка допустима, в UTF-8 — нет.
+        return "password_not_text"
+    if "\x00" in password:
+        # Нулевой байт bcrypt берёт за конец пароля и дальше идёт по кругу:
+        # «abc\0abc» сверился бы с «abc» — в обход нижней границы.
+        return "password_not_text"
+    if len(password) < PASSWORD_MIN_CHARS:
+        return "password_too_short"
+    if size > PASSWORD_MAX_BYTES:
+        return "password_too_long"
+    return None
+
+
+def _usable_new_password(raw: str, *, field: str = "new_password") -> str:
+    """Новый пароль в том виде, в каком его потом сверит вход, — или отказ 422.
+
+    Зовётся до любой записи. Пробелы по краям отбрасываются: вход отбрасывает их
+    тоже (`PasswordLoginIn`), и пароль, сохранённый с ними, не вошёл бы никогда.
+
+    Ответ — как у проверки полей FastAPI (`type`, `loc`, `msg`), по `type`
+    интерфейс подбирает текст на своём языке. Правило не стоит валидатором
+    модели намеренно: тот возвращает в ответе присланное значение — пароль, — а
+    на одиночном суррогате ответ не собирается вовсе, выходит 500.
+    """
+    password = raw.strip()
+    problem = _password_problem(password)
+    if problem:
+        raise HTTPException(
+            422,
+            detail=[{"type": problem, "loc": ["body", field], "msg": _PASSWORD_PROBLEMS[problem]}],
+        )
+    return password
+
+
+def _bcrypt_takes(password: str) -> bool:
+    """Возьмёт ли bcrypt строку вообще: она кодируется и не длиннее 72 байт."""
+    try:
+        return len(password.encode("utf-8")) <= PASSWORD_MAX_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
 def _verify_bcrypt(password: str, hash_str: str) -> bool:
-    """Verify bcrypt password. Used by auth.login и change-password."""
+    """Verify bcrypt password. Used by auth.login и change-password.
+
+    Строка, которую bcrypt не берёт, не совпадает ни с одним хешем: это отказ,
+    а не ошибка сервера. Остальное правило нового пароля сверка не знает — хеш
+    мог прийти из `ADMIN_PASSWORD_HASH`, где его никто не проверял.
+    """
+    if not _bcrypt_takes(password):
+        return False
     try:
         import bcrypt
 
@@ -1024,6 +1219,20 @@ def _verify_bcrypt(password: str, hash_str: str) -> bool:
         from passlib.hash import bcrypt as bcrypt_pl
 
         return bcrypt_pl.verify(password, hash_str)
+
+
+def _is_current_password(typed: str, hash_str: str) -> bool:
+    """Тот ли это пароль, которым пользователь входит.
+
+    Сверяется как набран, а если не сошлось — без пробелов по краям: вход их
+    отбрасывает, и новый пароль с ними не сохраняется. Набранное как есть идёт
+    первым ради пароля, сохранённого с пробелами прежним кодом: войти таким
+    нельзя, сменить можно только так.
+    """
+    if _verify_bcrypt(typed, hash_str):
+        return True
+    stripped = typed.strip()
+    return stripped != typed and _verify_bcrypt(stripped, hash_str)
 
 
 def _hash_bcrypt(password: str) -> str:
@@ -1123,6 +1332,7 @@ class SetPasswordIn(BaseModel):
     """Задать пароль по magic-token из письма-приглашения."""
 
     token: str
+    # Правило пароля проверяет обработчик (`_usable_new_password`), не модель.
     new_password: str
 
     @field_validator("token")
@@ -1131,15 +1341,6 @@ class SetPasswordIn(BaseModel):
         v = v.strip()
         if not v or len(v) > 512:
             raise ValueError("invalid token")
-        return v
-
-    @field_validator("new_password")
-    @classmethod
-    def _check_password(cls, v: str) -> str:
-        if len(v) < 6:
-            raise ValueError("Пароль должен быть минимум 6 символов")
-        if len(v) > 200:
-            raise ValueError("too long")
         return v
 
 
@@ -1152,11 +1353,18 @@ def auth_set_password(
     Проверяет token (одноразовый, TTL 30 мин), сохраняет bcrypt(new_password) в
     user.password_hash и сразу логинит (ставит JWT cookie). Дальше пользователь
     входит по email+паролю через /auth/login. Невалидный/просроченный token → 401.
+    Пароль, который задать нельзя, → 422, и ссылка остаётся годной.
     """
+    # До токена: отказ по паролю ссылку не трогает.
+    new_password = _usable_new_password(payload.new_password)
+
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(f"setpw:{client_ip}", limit=10)
 
-    user = tenants.verify_magic_token(db, payload.token)
+    # Гашение ссылки и запись пароля — одна транзакция. До commit ниже любой
+    # сбой (bcrypt, сессия, база) откатывает и то, и другое: ссылка остаётся
+    # годной, а не сгорает без пароля.
+    user = tenants.redeem_magic_token(db, payload.token)
     if not user:
         _check_rate_limit(f"setpw_fail:{client_ip}", limit=5)
         raise HTTPException(401, "Ссылка недействительна или истекла")
@@ -1165,12 +1373,14 @@ def auth_set_password(
     # У юзера с паролем magic-link ведёт на /auth/verify (вход), а не сюда; иначе
     # перезапись пароля по перехваченной login-ссылке = persistent takeover.
     if user.password_hash:
+        # Это отказ, а не сбой: ссылка предъявлена и гаснет, как и раньше.
+        db.commit()
         raise HTTPException(400, "Пароль уже задан — войдите по email и паролю")
 
-    user.password_hash = _hash_bcrypt(payload.new_password)
+    user.password_hash = _hash_bcrypt(new_password)
+    jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
     db.commit()
 
-    jwt_token = _make_jwt(user.id, user.tenant_id, user.email)
     secure = os.environ.get("PHARMACY_COOKIE_SECURE", "false").lower() in ("1", "true")
     response.set_cookie(
         key=COOKIE_NAME,
@@ -1217,17 +1427,19 @@ def dash_change_password(
     На success — сохраняет bcrypt(new_password) в user.password_hash. С этого
     момента env ADMIN_PASSWORD_HASH перестаёт использоваться для этого user'а.
     """
-    if len(payload.new_password) < 6:
-        raise HTTPException(400, "Пароль должен быть минимум 6 символов")
-    if payload.current_password == payload.new_password:
-        raise HTTPException(400, "Новый пароль не должен совпадать с текущим")
+    new_password = _usable_new_password(payload.new_password)
 
     env_pw_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
     pw_to_check = user.password_hash or env_pw_hash
-    if not pw_to_check or not _verify_bcrypt(payload.current_password, pw_to_check):
+    if not pw_to_check or not _is_current_password(payload.current_password, pw_to_check):
         raise HTTPException(401, "Текущий пароль неверный")
+    # С тем, что хранится, а не с тем, что набрано в поле «текущий»: его могли
+    # набрать с пробелами по краям, а пароль, сохранённый с ними прежним кодом,
+    # меняют на тот же без них — и это уже другой пароль.
+    if _verify_bcrypt(new_password, pw_to_check):
+        raise HTTPException(400, "Новый пароль не должен совпадать с текущим")
 
-    user.password_hash = _hash_bcrypt(payload.new_password)
+    user.password_hash = _hash_bcrypt(new_password)
     db.commit()
     return {"ok": True}
 
@@ -1542,7 +1754,9 @@ def dash_integrations(user: storage.TenantUser = Depends(require_user)):
         "smtp_from": os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER") or None,
         "telegram": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
         "telegram_bot_username": os.environ.get("TELEGRAM_BOT_USERNAME") or None,
-        "sentry": bool(os.environ.get("SENTRY_DSN")),
+        # DSN в окружении ещё не значит, что Sentry работает: инициализация,
+        # которой SDK отказал, API не роняет.
+        "sentry": bool(os.environ.get("SENTRY_DSN")) and sentry_is_running(),
         "scraperapi": bool(os.environ.get("SCRAPER_API_KEY")),
         "scraperapi_sites": (os.environ.get("SCRAPER_API_SITES") or "").split(",")
         if os.environ.get("SCRAPER_API_SITES")
@@ -1651,10 +1865,13 @@ def dash_digest_send_test(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """Отправить test digest всем получателям с `daily_digest=true`.
+    """Тестовый дайджест из меню Quick Actions. Только admin.
 
-    Используется из Quick Actions меню. Тот же код что и cron-таймер,
-    просто on-demand. Только admin.
+    Суточный — утреннее письмо с разницей цен и Excel — уходит ТОЛЬКО тому, кто
+    нажал кнопку, подписан он на суточный дайджест или нет: подписчики
+    (клиент) его не получают, запись сторожа утреннего письма не меняется.
+    Письмо собирает тот же код, что и таймер. Недельный идёт по-прежнему всем
+    подписанным на недельный.
     """
     if user.role != "admin":
         raise HTTPException(403, "Admin role required")
@@ -1664,7 +1881,7 @@ def dash_digest_send_test(
 
     try:
         count = (
-            notifications.send_daily_digest(db, tenant_id=user.tenant_id)
+            notifications.send_daily_digest(db, tenant_id=user.tenant_id, only_user_id=user.id)
             if kind == "daily"
             else notifications.send_weekly_digest(db, tenant_id=user.tenant_id)
         )
@@ -1848,7 +2065,6 @@ def dash_recipients_create(
     log.info(
         "recipient_created",
         id=new_user.id,
-        email=new_user.email,
         by_user_id=user.id,
         invite_sent=invite_sent,
     )
@@ -1985,122 +2201,114 @@ def dash_recipients_send_login_link(
 # ─── Frontend dashboard endpoints (JWT cookie) ───────────────────────────────
 
 
-# Порог свежести цены для comparison (2026-05-29). Считается по
-# Product.last_seen_at (обновляется КАЖДЫЙ прогон под diff-only), НЕ по
-# snapshot.captured_at (пишется только при смене цены — у товара со стабильной
-# ценой captured_at старый, но товар живой). Цена старше порога: показывается
-# с бейджем «N дн. назад», но НЕ участвует в расчёте spread/min/max/cheapest,
-# чтобы устаревшая цена не давала ложный undercut/spread. Строка всё равно
-# отображается (ничего не теряется — клиент видит обе цены + контекст возраста).
-_COMPARISON_STALE_DAYS = 14
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
-def _price_age_days(now: datetime, last_seen: datetime | None) -> int | None:
-    """Возраст цены в днях по last_seen_at. None → None (last_seen_at=NULL).
+def _fast_json(payload: Any) -> Response:
+    """JSON-ответ мимо `jsonable_encoder`.
 
-    tz-defensive: prod-колонка naive (Postgres timestamp without tz), но если
-    прилетит aware datetime — нормализуем (иначе naive-aware вычитание упало бы
-    TypeError'ом). Будущие timestamp'ы (clock skew между scraper runtime и API)
-    клампятся в 0, чтобы age не уходил в минус.
+    Для списка сравнения (тысячи строк с вложенными словарями) рекурсивный
+    энкодер FastAPI занимал около секунды — столько же, сколько вся выборка.
+    Здесь данные уже собраны из простых типов, формат вывода тот же, что у
+    штатного JSONResponse.
     """
-    if last_seen is None:
-        return None
-    if last_seen.tzinfo is not None:
-        last_seen = last_seen.replace(tzinfo=None)
-    return max(0, (now - last_seen).days)
+    return Response(
+        content=json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            default=_json_default,
+        ),
+        media_type="application/json",
+    )
 
 
-def _comparison_spread(
-    prices: dict[str, dict[str, Any]],
-) -> tuple[str, float | None, float | None, str | None, float | None]:
-    """Per-unit-aware spread для comparison-строки (учёт свежести).
+# Сколько «прочих» товаров (без строки в сравнении) отдаём странице. Запрос из
+# двух букв находит тысячи; такой список никто не читает, а ответ раздувает —
+# страница получает первые и общее число. Строки сравнения при этом НЕ режем:
+# их может понадобиться выгрузить в Excel целиком.
+_SEARCH_OTHERS_LIMIT = 100
+# Длина поисковой строки. Название товара — до сотни знаков; длиннее — не поиск.
+_SEARCH_MAX_LENGTH = 100
+# PostgreSQL принимает до 65 535 параметров на запрос — id передаём порциями.
+_ID_CHUNK = 5000
+# Товар, которого нет на сайте дольше этого срока, с сайта снят: показывать его
+# в «найдено на сайтах» с ценой трёхмесячной давности — значит обманывать.
+_SEARCH_OTHERS_MAX_AGE_DAYS = 60
 
-    Мутирует `prices`: (а) добавляет каждому сайту `pack_count` + `unit_price`,
-    (б) УДАЛЯЕТ сайты с явно-битой СВЕЖЕЙ ценой (outlier < 12% медианы — это
-    parse-ошибка/не та единица, не реальный undercut). Возвращает
-    (basis, min, max, cheapest_site, spread_pct) на выбранном basis.
 
-    Свежесть (2026-05-29): записи с `stale=True` (last_seen_at старше
-    _COMPARISON_STALE_DAYS) ОСТАЮТСЯ в `prices` для отображения с бейджем, но в
-    расчёт basis/outlier/stats НЕ входят — устаревшая цена не должна двигать
-    spread/undercut. Если свежих цен < 2 → spread не считается (None), но строка
-    всё равно показывается со stale-ценами.
+def _catalog_index(db: Session, tenant_id: int) -> catalog_search.CatalogIndex:
+    return catalog_search.get_index(
+        db, tenant_id=tenant_id, session_factory=storage.make_session()
+    )
 
-    Логика per-unit (2026-05-29, Perplexity+Codex consensus):
-    - Считаем count штук в упаковке + unit_price = price/count.
-    - Outlier-фильтр работает на UNIT-цене (не raw): для маски поштучно 0.20
-      vs пачки N50 за 10.00 unit price у обоих 0.20 → ни один не выбрасывается
-      (старый raw-фильтр ошибочно дропал 0.20 как «<10% от 10»).
-    - basis="unit" ТОЛЬКО если фасовки реально различаются (max/min count ≥ 2,
-      ≥1 high-confidence) И нормализация УМЕНЬШАЕТ spread. Это снимает риск
-      «один сайт N50, другой не распарсился → ложный 50×»: если нормализация
-      раздувает spread — это parse-артефакт, остаёмся на raw.
+
+def _comparison_search(
+    db: Session, *, tenant_id: int, query: str
+) -> tuple[dict[int, int], list[Any], set[int]]:
+    """Единое правило поиска страницы сравнения.
+
+    Возвращает (место товара в выдаче по id, найденные товары, кластеры). Им
+    пользуются и поиск страницы, и старый параметр `search`, и выгрузка в Excel
+    — иначе один и тот же запрос находил бы на экране одно, а в файле другое.
+
+    Кластер попадает в выборку двумя путями:
+      - запросу отвечает название (или бренд) товара ЛЮБОГО из сайтов — через
+        индекс каталога, со свёрткой написания («creon» находит «Kreon»);
+      - запрос — подстрока названия или бренда самого кластера. Это прежнее
+        правило, и убрать его нельзя: кластер из списка наблюдения носит имя,
+        которое дал ему пользователь, и в названиях товаров его может не быть.
+
+    Индекс знает только названия; всё, что может поменяться между прогонами
+    (пара, ссылка, наличие), читаем из БД свежим.
     """
-    for data in prices.values():
-        cnt, conf = pack_unit_count(data.get("pack_size"), data.get("name"))
-        data["pack_count"] = cnt
-        data["count_conf"] = conf
-        data["unit_price"] = data["price"] / cnt if cnt > 0 else data["price"]
-
-    # Свежие = участвуют в расчёте. Stale остаются в `prices` для показа (бейдж).
-    fresh = {s: d for s, d in prices.items() if not d.get("stale")}
-
-    def _spread_over(key: str) -> float:
-        vs = [d[key] for d in fresh.values()]
-        return (max(vs) - min(vs)) / max(vs) * 100 if vs and max(vs) else 0.0
-
-    # ── Шаг 1: выбрать basis ДО outlier-фильтра (только по свежим) ──
-    # (фильтровать надо по той цене, которой доверяем; иначе при недостоверных
-    #  count'ах unit-цены ложные и дропнут легитимный сайт — risk #4.)
-    basis = "raw"
-    if len(fresh) >= 2:
-        counts = [d["pack_count"] for d in fresh.values()]
-        has_high = any(d["count_conf"] == "high" for d in fresh.values())
-        counts_differ = max(counts) / min(counts) >= 2 if min(counts) > 0 else False
-        # unit только если фасовки различаются И нормализация УМЕНЬШАЕТ spread.
-        if has_high and counts_differ and _spread_over("unit_price") < _spread_over("price"):
-            basis = "unit"
-
-    key = "unit_price" if basis == "unit" else "price"
-
-    # ── Шаг 2: СИММЕТРИЧНЫЙ outlier-фильтр по свежим (parse-ошибки/wrong-match) ──
-    # Низкий выброс (<12% медианы = >8.3× дешевле): почти всегда parse-ошибка /
-    #   не та единица (Thiogamma aloe 8.90 vs pharm 89.00 = 10×).
-    # Высокий выброс (>8.3× медианы): ловится ТОЛЬКО при 3+ сайтах, где медиана —
-    #   реальный консенсус. Напр. wrong-match «Aspirin C» 8.02 при aptek/aloe
-    #   0.30/0.30 → дропаем 8.02, остаётся консенсус 0.30/0.30 (spread 0%).
-    #   При 2 сайтах median == max, высокий порог не срабатывает → поведение
-    #   2-сайтовых строк без изменений. Реальный 2-5× undercut остаётся виден.
-    # Битую ТЕКУЩУЮ цену дропаем из `prices` (не показываем); stale не трогаем.
-    if len(fresh) >= 2:
-        vals = sorted(d[key] for d in fresh.values())
-        median = vals[len(vals) // 2]
-        low_t = median * 0.12
-        high_t = median / 0.12 if median > 0 else float("inf")
-        for site in [s for s, d in fresh.items() if d[key] < low_t or d[key] > high_t]:
-            del prices[site]
-            del fresh[site]
-
-    # <2 свежих цен (все stale или одна осталась после outlier-дропа) —
-    # сравнивать не с чем: возвращаем ВСЁ None. Иначе единственная свежая цена
-    # дала бы spread=None, но min/max/cheapest были бы выставлены, и frontend
-    # ложно подсветил бы её как «дешёвую» (Codex MED, 2026-05-29). Stale-записи
-    # остаются в `prices` для отображения с бейджем.
-    if len(fresh) < 2:
-        return basis, None, None, None, None
-
-    # ── Шаг 3: stats только по свежим ──
-    items = [(s, d[key]) for s, d in fresh.items()]
-    mn = min(v for _, v in items)
-    mx = max(v for _, v in items)
-    cheap = min(items, key=lambda x: x[1])[0]
-    spr = round((mx - mn) / mx * 100, 1) if mx else 0.0
-    return basis, mn, mx, cheap, spr
+    match_ids = set(
+        db.scalars(
+            select(storage.Match.id).where(
+                storage.Match.tenant_id == tenant_id,
+                storage.Match.canonical_name.icontains(query, autoescape=True)
+                | storage.Match.canonical_brand.icontains(query, autoescape=True),
+            )
+        )
+    )
+    hits = _catalog_index(db, tenant_id).search(query)
+    order = {hit.product_id: position for position, hit in enumerate(hits)}
+    ids = list(order)
+    found: list[Any] = []
+    for start in range(0, len(ids), _ID_CHUNK):
+        found.extend(
+            db.execute(
+                select(
+                    storage.Product.id,
+                    storage.Product.canonical_id,
+                    storage.Product.site,
+                    storage.Product.name,
+                    storage.Product.brand,
+                    storage.Product.url,
+                    storage.Product.last_seen_at,
+                    storage.Product.url_dead_at,
+                    storage.Product.manufacturer_country_code,
+                    storage.Product.country_resolution_status,
+                    storage.Product.offer_availability_status,
+                ).where(
+                    storage.Product.id.in_(ids[start : start + _ID_CHUNK]),
+                    storage.Product.tenant_id == tenant_id,
+                )
+            ).all()
+        )
+    match_ids.update(p.canonical_id for p in found if p.canonical_id is not None)
+    return order, found, match_ids
 
 
-@app.get("/api/v1/dash/comparison")
+# response_model — только для /docs: эндпоинт отдаёт готовый Response, и FastAPI
+# его не перевалидирует (на тысячах строк это стоило секунду).
+@app.get("/api/v1/dash/comparison", response_model=list[ComparisonRowOut])
 def dash_comparison(
-    search: str | None = None,
+    search: str | None = Query(None, max_length=_SEARCH_MAX_LENGTH),
     min_sites: int = 2,
     site_filter: str | None = None,
     limit: int = 5000,
@@ -2109,184 +2317,198 @@ def dash_comparison(
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """Cross-site comparison rows. Filtered by tenant_id automatically.
-
-    `min_confidence` (default 0.70): отсекаем низко-достоверные fuzzy-матчи —
-    они почти всегда РАЗНЫЕ товары (Bio Kolik капли ↔ Bio sprey, Vitamin C
-    таблетки ↔ Vitamin C ампула), сматченные по generic-токенам, и дают
-    ложный гигантский spread в топе. is_manual=True матчи (подтверждены
-    человеком) показываются всегда, независимо от confidence.
-    """
+    """Cross-site comparison rows. Filtered by tenant_id automatically."""
     _require_financial_policy_ready(db, tenant_id=user.tenant_id)
-    last_run = db.scalar(
-        select(storage.Run.id)
-        .where(storage.Run.status == "ok", storage.Run.tenant_id == user.tenant_id)
-        .order_by(desc(storage.Run.id))
-        .limit(1)
-    )
-    if not last_run:
+    if not _has_ok_run(db, tenant_id=user.tenant_id):
         return []
 
-    # Bug fix 2026-05-29: раньше `.limit(limit)` стоял на raw matches query —
-    # бралось первые 500 matches по id, ПОТОМ фильтровалось по min_sites +
-    # свежести цен → итог всегда ~497 независимо от объёма скрейпа (при 4824
-    # matches видно только 10%). Теперь fetch ВСЕ matches, фильтруем, сортируем
-    # по spread desc, и limit применяем к ОТФИЛЬТРОВАННОМУ выходу.
-    # `selectinload(products)` грузит products одним доп. запросом — устраняет
-    # N+1 (4824 lazy-load'а превратились бы в 4824 SELECT'а).
-    matches_q = (
-        select(storage.Match)
-        .where(storage.Match.tenant_id == user.tenant_id)
-        .options(selectinload(storage.Match.products))
-    )
-    if search:
-        like = f"%{search.lower()}%"
-        matches_q = matches_q.where(
-            storage.Match.canonical_name.ilike(like) | storage.Match.canonical_brand.ilike(like)
+    match_ids: set[int] | None = None
+    if search and search.strip():
+        _order, _found, match_ids = _comparison_search(
+            db, tenant_id=user.tenant_id, query=search.strip()
         )
-    matches = db.scalars(matches_q).all()
-
-    # Pre-fetch latest snapshots для всех product_id одной агрегатной SELECT'ой.
-    # Раньше делалось N+1 (snapshot per match × per site = ~3 за match), плюс
-    # после diff-only persist'а (2026-05-09) прошлая логика `WHERE run_id ==
-    # last_run` пропускала продукты без price-changes в last_run.
-    all_pids = [p.id for m in matches for p in m.products]
-    # Independent site producers reach their first verified full run at
-    # different times. A single site's eligible diff-only run is not a complete
-    # cross-site snapshot lineage and may contain zero snapshots when no prices
-    # changed. Keep the shadow fallback until every required site contributes a
-    # fresh verified full run; hard product gates below still exclude unsafe
-    # offers, and enforce mode already fails closed above.
-    trusted_lineage_available = _trusted_snapshot_lineage_available(
+    rows = _comparison_rows(
         db,
         tenant_id=user.tenant_id,
+        min_sites=min_sites,
+        site_filter=site_filter,
+        min_confidence=min_confidence,
+        category=category,
+        match_ids=match_ids,
     )
-    snaps_by_pid = storage.latest_snapshots_per_product(
+    return _fast_json(rows[:limit])
+
+
+@app.get("/api/v1/dash/comparison/search")
+def dash_comparison_search(
+    q: str = Query(..., max_length=_SEARCH_MAX_LENGTH),
+    min_sites: int = 2,
+    min_confidence: float = 0.70,
+    category: str | None = None,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Поиск по ВСЕМУ каталогу для страницы сравнения.
+
+    `rows` — строки сравнения по кластерам, отобранным `_comparison_search`.
+    `others` — найденные товары, которых в этих строках
+    нет: без пары на другом сайте либо с парой, не прошедшей фильтры страницы.
+    Без `others` товар, который есть на сайте, для пользователя «не находится».
+    """
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
+    query = q.strip()
+    empty = {"rows": [], "others": [], "others_total": 0}
+    if not query or not _has_ok_run(db, tenant_id=user.tenant_id):
+        return empty
+
+    order, found, match_ids = _comparison_search(db, tenant_id=user.tenant_id, query=query)
+    if not found and not match_ids:
+        return empty
+
+    rows = _comparison_rows(
         db,
-        all_pids,
-        financially_eligible_only=trusted_lineage_available,
+        tenant_id=user.tenant_id,
+        min_sites=min_sites,
+        min_confidence=min_confidence,
+        category=category,
+        match_ids=match_ids,
+    )
+    shown_match_ids = {row["canonical_id"] for row in rows}
+
+    now = utcnow()
+    candidates = []
+    for product in found:
+        if product.url_dead_at is not None:
+            continue
+        if product.canonical_id is not None and product.canonical_id in shown_match_ids:
+            continue
+        age_days = _price_age_days(now, product.last_seen_at)
+        if age_days is not None and age_days > _SEARCH_OTHERS_MAX_AGE_DAYS:
+            continue
+        candidates.append((product, age_days))
+    # Сначала то, что можно купить; внутри — по близости к запросу.
+    candidates.sort(
+        key=lambda item: (
+            item[0].offer_availability_status == "out_of_stock",
+            order[item[0].id],
+            _SITE_ORDER.get(item[0].site, 9),
+        )
+    )
+    page = candidates[:_SEARCH_OTHERS_LIMIT]
+    prices_by_pid = storage.latest_prices_per_product(
+        db,
+        [product.id for product, _age in page],
+        financially_eligible_only=_trusted_snapshot_lineage_available(db, tenant_id=user.tenant_id),
         tenant_id=user.tenant_id,
     )
-
-    now = utcnow()  # naive UTC; last_seen_at тоже naive (src/_time) — вычитание ок
-    # Ярлыки тянем ОДИН раз до цикла: source_category_labels сканирует Category
-    # целиком, внутри цикла это был бы скан на каждый матч.
-    source_labels = source_category_labels(db) if category is not None else {}
-    # И мемоизируем классификацию по категории-источнику: order-independent
-    # классификатор прогоняет ВСЕ ~200 правил (в этом и смысл), поэтому вызов
-    # на каждый матч — это ~200 правил × ~5k матчей регэкспов на запрос вместо
-    # ~200 × ~178 категорий. Тот же приём, что в analytics.category_comparison.
-    _canonical_cache: dict[str, str | None] = {}
-
-    def _canonical_key_for(raw_category: str | None) -> str | None:
-        cache_key = raw_category or ""
-        if cache_key not in _canonical_cache:
-            label_ru, label_az = source_labels.get(("pharmonline", cache_key), (None, None))
-            resolved = classify_source_category(
-                "pharmonline", raw_category, label_ru=label_ru, label_az=label_az
-            )
-            _canonical_cache[cache_key] = resolved.key if resolved else None
-        return _canonical_cache[cache_key]
-    out: list[ComparisonRowOut] = []
-    for m in matches:
-        from src.product_policy import policy_identity_eligibility
-
-        if not policy_identity_eligibility(list(m.products)).eligible:
-            continue
-        # Drill-down из /category-comparison: фильтр по категории товара-клиента
-        # (pharmonline). None → без фильтра (обычный режим страницы сравнения).
-        if category is not None:
-            client_p = next((p for p in m.products if p.site == "pharmonline"), None)
-            if client_p is None:
-                continue
-            # Классифицируем ровно так же, как сводка /category-comparison —
-            # со слагом И ярлыками. Классификация только по слагу расходилась бы
-            # со сводкой: строка есть в сводке, а drill-down пуст.
-            canonical_key = _canonical_key_for(client_p.category)
-            if client_p.category != category and canonical_key != category:
-                continue
-        # Confidence floor: низко-достоверные fuzzy-матчи (Bio Kolik ↔ Bio sprey)
-        # дают ложный spread. Ручные (is_manual) показываем всегда.
-        conf = m.confidence if m.confidence is not None else 1.0
-        if not m.is_manual and conf < min_confidence:
-            continue
-        # Если товар-КЛИЕНТ (pharmonline) мёртв (404) — матч бесполезен (нечего
-        # сравнивать с ценой клиента), дропаем целиком, а не показываем competitor-only
-        # строку (аудит M1; зеркалит analytics._iter_matched_prices).
-        if any(p.site == "pharmonline" and p.url_dead_at is not None for p in m.products):
-            continue
-        raw_prices: dict[str, dict[str, Any]] = {}
-        for p in m.products:
-            # «Фантомные» товары (страница 404, помечены validate-links) — скрываем,
-            # чтобы не показывать матч с мёртвой ссылкой на конкурента.
-            if p.url_dead_at is not None:
-                continue
-            from src.product_policy import policy_offer_eligibility
-
-            if not policy_offer_eligibility(p, now=now).eligible:
-                continue
-            snap = snaps_by_pid.get(p.id)
-            price = (snap.discount_price or snap.price) if snap else None
-            if price is not None and price > 0:
-                # Свежесть по last_seen_at (видели в прогоне), НЕ по captured_at:
-                # под diff-only стабильная цена имеет старый captured_at, но свежий
-                # last_seen_at — товар активен. last_seen_at=NULL → не stale.
-                age_days = _price_age_days(now, p.last_seen_at)
-                raw_prices[p.site] = {
-                    "price": price,
-                    "is_on_sale": snap.is_on_sale if snap else False,
-                    "url": p.url,
-                    "product_id": p.id,
-                    "country_code": p.manufacturer_country_code,
-                    "country_resolution_status": p.country_resolution_status,
-                    "availability_status": p.offer_availability_status,
-                    "availability_observed_at": p.availability_observed_at,
-                    # pack_size + name нужны для per-unit нормализации (ниже)
-                    "pack_size": p.pack_size,
-                    "name": p.name,
-                    "age_days": age_days,
-                    "stale": age_days is not None and age_days > _COMPARISON_STALE_DAYS,
-                }
-
-        # Per-unit-aware spread + outlier-фильтр (2026-05-29). Заменяет прежний
-        # raw-price 10%-median фильтр (он ошибочно дропал легитимную цену-за-
-        # штуку). `_comparison_spread` нормализует цену за штуку когда фасовки
-        # различаются и это уменьшает spread, и дропает parse-ошибки на unit-цене.
-        # Мутирует prices (annotate + drop).
-        prices = dict(raw_prices)
-        basis, min_p, max_p, cheapest, spread = _comparison_spread(prices)
-
-        sites_with_price = len(prices)
-        if sites_with_price < min_sites:
-            continue
-        if site_filter and site_filter not in prices:
-            continue
-        # Убираем служебные поля из payload (оставляем pack_size/count/unit_price).
-        for d in prices.values():
-            d.pop("name", None)
-            d.pop("count_conf", None)
-        out.append(
-            ComparisonRowOut(
-                canonical_id=m.id,
-                name=m.canonical_name,
-                brand=m.canonical_brand,
-                pack_size=m.canonical_pack_size,
-                is_manual=m.is_manual,
-                sites_with_price=sites_with_price,
-                min_price=min_p,
-                max_price=max_p,
-                spread_pct=spread,
-                cheapest_site=cheapest,
-                prices=prices,
-                confidence=m.confidence if m.confidence is not None else 1.0,
-                needs_review=(spread is not None and spread >= 50.0),
-                spread_basis=basis,
-            )
+    others = []
+    for product, age_days in page:
+        latest = prices_by_pid.get(product.id)
+        price = (latest[1] or latest[0]) if latest else None
+        others.append(
+            {
+                "product_id": product.id,
+                "site": product.site,
+                "name": product.name,
+                "brand": product.brand,
+                "url": product.url,
+                "price": price if price is not None and price > 0 else None,
+                "is_on_sale": latest[2] if latest else False,
+                "country_code": product.manufacturer_country_code,
+                "country_resolution_status": product.country_resolution_status,
+                "availability_status": product.offer_availability_status,
+                "age_days": age_days,
+                "stale": age_days is not None and age_days > _COMPARISON_STALE_DAYS,
+            }
         )
-    # Сортируем по |spread| desc (самое полезное для PO — где конкурент бьёт
-    # по цене / где можно поднять) и применяем limit к отфильтрованному выходу.
-    out.sort(key=lambda r: r.spread_pct if r.spread_pct is not None else -1.0, reverse=True)
-    return out[:limit]
+    return _fast_json({"rows": rows, "others": others, "others_total": len(candidates)})
+
+
+@app.get("/api/v1/dash/comparison/export.xlsx")
+def dash_comparison_export(
+    search: str | None = Query(None, max_length=_SEARCH_MAX_LENGTH),
+    min_sites: int = 2,
+    min_confidence: float = 0.70,
+    category: str | None = None,
+    with_aloe: bool = False,
+    diff_only: bool = False,
+    locale: str = "ru",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Excel: товары с разной ценой + вся текущая выборка страницы сравнения.
+
+    Параметры повторяют фильтры страницы, чтобы в файле было ровно то, что
+    пользователь видит (и, первым листом, то, о чём просил клиент: все товары,
+    у которых цены на сайтах различаются).
+    """
+    from src import comparison_export
+
+    _require_financial_policy_ready(db, tenant_id=user.tenant_id)
+    locale = _normalize_locale(locale)
+    query = (search or "").strip()
+    rows: list[dict[str, Any]] = []
+    if _has_ok_run(db, tenant_id=user.tenant_id):
+        match_ids: set[int] | None = None
+        if query:
+            _order, _found, match_ids = _comparison_search(
+                db, tenant_id=user.tenant_id, query=query
+            )
+        rows = _comparison_rows(
+            db,
+            tenant_id=user.tenant_id,
+            min_sites=min_sites,
+            min_confidence=min_confidence,
+            category=category,
+            match_ids=match_ids,
+        )
+    if with_aloe:
+        rows = [row for row in rows if "aloe" in row["prices"]]
+    if diff_only:
+        rows = [row for row in rows if comparison_export.has_price_difference(row)]
+
+    generated_at = utcnow()
+    content = comparison_export.build_workbook(
+        rows,
+        locale=locale,
+        generated_at=generated_at,
+        search=query or None,
+        category=category,
+        min_sites=min_sites,
+        with_aloe=with_aloe,
+        diff_only=diff_only,
+    )
+    log.info(
+        "comparison_export",
+        user_id=user.id,
+        rows=len(rows),
+        bytes=len(content),
+        search=bool(query),
+        category=category,
+    )
+    return Response(
+        content=content,
+        media_type=comparison_export.XLSX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{comparison_export.filename(locale, generated_at)}"'
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/api/v1/dash/comparison/suggest")
+def dash_comparison_suggest(
+    q: str = Query(..., max_length=_SEARCH_MAX_LENGTH),
+    limit: int = 8,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Подсказки при наборе в поиске сравнения: торговые имена из каталога."""
+    limit = max(1, min(limit, 20))
+    suggestions = _catalog_index(db, user.tenant_id).suggest(q, limit=limit)
+    return [{"text": s.text, "count": s.count} for s in suggestions]
 
 
 _VALID_SITES = ("pharmonline", "aptekonline", "aloe")
@@ -4692,10 +4914,35 @@ def _external_id_from_url(url: str) -> str:
     """Последний сегмент пути URL (без query/fragment) = external_id товара.
 
     Совпадает с тем, как скрейперы формируют external_id (pharmonline:
-    `_external_id_from_href`; aptekonline/aloe: url_id = слаг после /product/).
+    `_external_id_from_href`; aptekonline: url_id после /product/; aloe: номер
+    товара в адресе `https://aloe.az/{номер}/`).
     """
     path = (url or "").split("?")[0].split("#")[0].rstrip("/")
     return path.split("/")[-1].strip()
+
+
+def _aloe_product_at_address(db: Session, tenant_id: int, url: str) -> storage.Product | None:
+    """Товар aloe по адресу его страницы; на адрес нескольких товаров — отказ.
+
+    Адрес со слагом (его показывает сам сайт) товар не называет: один слаг
+    сайт даёт нескольким товарам. Какой из них нужен, знает только оператор.
+    """
+    from src import match_actions
+
+    found = match_actions.aloe_products_at_address(db, url, tenant_id=tenant_id)
+    if len(found) > 1:
+        # Строка, которую сбор ещё не перевёл на номер, номера не имеет.
+        numbers = ", ".join(
+            sorted((p.external_id for p in found if p.external_id.isdigit()), key=int)
+        )
+        raise HTTPException(
+            409,
+            "По этому адресу на aloe несколько разных товаров"
+            + (f" (номера {numbers})" if numbers else "")
+            + ". Вставьте адрес с номером нужного: https://aloe.az/<номер>/ — номер написан "
+            "на странице товара («Məhsul kodu»)",
+        )
+    return found[0] if found else None
 
 
 @app.post("/api/v1/dash/matches/{match_id}/relink")
@@ -4731,14 +4978,20 @@ def dash_match_relink(
     if not ext:
         raise HTTPException(400, "Не удалось разобрать ссылку")
 
-    prod = db.scalar(
-        select(storage.Product).where(
-            storage.Product.tenant_id == user.tenant_id,
-            storage.Product.site == site,
-            storage.Product.external_id == ext,
+    if site == "aloe":
+        # По подстроке адреса здесь искать нельзя: номер «1205» нашёлся бы
+        # внутри адреса товара 12058.
+        prod = _aloe_product_at_address(db, user.tenant_id, body.url)
+    else:
+        prod = db.scalar(
+            select(storage.Product).where(
+                storage.Product.tenant_id == user.tenant_id,
+                storage.Product.site == site,
+                storage.Product.external_id == ext,
+            )
         )
-    )
-    if prod is None:  # fallback: по подстроке URL (на случай иной формы external_id)
+    if prod is None and site != "aloe":
+        # fallback: по подстроке URL (на случай иной формы external_id)
         prod = db.scalar(
             select(storage.Product).where(
                 storage.Product.tenant_id == user.tenant_id,

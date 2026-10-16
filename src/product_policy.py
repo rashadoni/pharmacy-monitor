@@ -21,6 +21,7 @@ from typing import Any
 from sqlalchemy import and_, desc, func, or_, select
 
 from src._time import utcnow
+from src.cadence import SITE_SCRAPE_CADENCE_HOURS, site_max_age_hours
 from src.normalize import strip_accents
 
 COUNTRY_RESOLVED = "resolved"
@@ -35,16 +36,19 @@ OFFER_UNKNOWN = "unknown"
 COUNTRY_POLICY_MODES = {"shadow", "enforce"}
 AVAILABILITY_POLICY_MODES = {"shadow", "enforce"}
 
-# Daily full-catalog cadence plus a safety margin.  A stale observation is not
-# a trusted active offer, but it is also not rewritten to out_of_stock.  The
-# systemd schedule is installed by infra/scripts/install_systemd_schedule.sh;
-# keep this business promise in code instead of silently accepting a weekly
-# timer override.
-OFFER_MAX_AGE_HOURS = {
-    "aloe": 30,
-    "aptekonline": 30,
-    "pharmonline": 30,
-}
+# Ритм полного сбора + запас (src/cadence.py): суточный сайт → 30ч, недельный
+# → 174ч. Устаревшее наблюдение не считается достоверным активным оффером, но и
+# не переписывается в out_of_stock. Расписание ставится
+# infra/scripts/install_systemd_schedule.sh.
+#
+# Раньше здесь стояли жёсткие 30ч для всех трёх сайтов — страховка от того, что
+# недельный timer-override проскочит молча. С 2026-10-04 недельный ритм
+# aptekonline — осознанное решение владельца (обход Cloudflare платный:
+# ежедневно ≈$149/мес против $49), и те же 30ч стали означать обратное:
+# собственный успешный недельный сбор объявлялся несвежим через полтора дня,
+# из-за чего полный каталог не подтверждался 6 дней из 7, а на дашборде висело
+# «Tam kataloq: Təsdiqlənməyib — tövsiyələr bağlıdır».
+OFFER_MAX_AGE_HOURS = {site: site_max_age_hours(site) for site in SITE_SCRAPE_CADENCE_HOURS}
 
 REQUIRED_CATALOG_SITES = ("pharmonline", "aptekonline", "aloe")
 _MIN_POLICY_COVERAGE_PCT = 98.0
@@ -95,7 +99,15 @@ def _country_key(raw: str) -> str:
     return " ".join(strip_accents(raw).lower().replace("-", " ").split())
 
 
-_COUNTRY_ALIASES: dict[str, str] = {
+# Написание можно вносить так, как его пишет сайт: в поиск оно попадает только
+# через `_country_key` — см. `_COUNTRY_ALIASES` под словарём. Свёртка снимает
+# диакритику, а заодно превращает «й» в «и» и «ı» в «i»; пока ключи лежали в
+# словаре буквально, «китай», «швейцария», «азербайджан» и «rumıniya» не
+# находились никогда.
+#
+# Двухбуквенных ключей здесь быть не должно: `normalize_country_code` сверяет
+# две буквы только со списком ISO и до словаря не доходит.
+_COUNTRY_SPELLINGS: dict[str, str] = {
     "turkiye": "tr",
     "turkiya": "tr",
     "turkey": "tr",
@@ -184,7 +196,6 @@ _COUNTRY_ALIASES: dict[str, str] = {
     "england": "gb",
     "great britain": "gb",
     "united kingdom": "gb",
-    "uk": "gb",
     "angliya": "gb",
     "англия": "gb",
     "великобритания": "gb",
@@ -286,6 +297,58 @@ _COUNTRY_ALIASES: dict[str, str] = {
     "kolumbiya": "co",
     "meksika": "mx",
     "peru": "pe",
+    # Карточки aloe.az, замер 2026-10-07. Сайт подписывает страну по-русски,
+    # по-азербайджански и по-английски вперемешку, с опечатками, а местами
+    # обрывая строку на десятом знаке. Сюда идёт только то, что читается
+    # однозначно.
+    # Неразрешёнными остаются намеренно: две страны сразу («Türkiyə-Almaniya»,
+    # «Турция-Гер»), город вместо страны («Курган», «Санкт-Пете»), название
+    # фирмы («Специфарма»), сокращение «НВ» и заглушка «Country».
+    "израиль": "il",
+    "британия": "gb",
+    "britain": "gb",
+    "шотландия": "gb",  # часть Соединённого Королевства, как «англия» выше
+    "fransiya": "fr",
+    "юар": "za",
+    "южная корея": "kr",
+    "бангладеш": "bd",
+    "австралия": "au",
+    "niderlandiya": "nl",
+    "голландия": "nl",
+    "пуерто-рико": "pr",
+    "саудовская-арабия": "sa",
+    "иордания": "jo",
+    "канада": "ca",
+    "уругвай": "uy",
+    "малайзия": "my",
+    "словакия": "sk",
+    "кипр": "cy",
+    "оман": "om",
+    "черногория": "me",
+    "босния": "ba",
+    "таиланд": "th",
+    "бразилия": "br",
+    "мальта": "mt",
+    "туркменистан": "tm",
+    "белоруссия": "by",
+    "индонезия": "id",
+    "филлипины": "ph",
+    "мексика": "mx",
+    "перу": "pe",
+    "сингапур": "sg",
+    "колумбия": "co",
+    "агрентина": "ar",
+    # Эти четыре уже лежат в таблице aloe_country_mappings (id 33, 117, 43,
+    # 1531), но словарь их не знал: соответствие считалось негодным, и товары
+    # с такими id в каждом сборе записывались как «страна не разрешена».
+    "argentina": "ar",
+    "аргентина": "ar",
+    "ирландия": "ie",
+    "сан-марино": "sm",
+}
+
+_COUNTRY_ALIASES: dict[str, str] = {
+    _country_key(spelling): code for spelling, code in _COUNTRY_SPELLINGS.items()
 }
 
 # Source catalogs also contain ISO alpha-3 and a handful of established local
@@ -445,6 +508,70 @@ def policy_fingerprint() -> str:
     )
 
 
+@dataclass(frozen=True)
+class _SiteFullRunState:
+    """Which full-catalog Run (if any) currently backs one site's data."""
+
+    latest_attempt: Any
+    relevant_run: Any
+    run_at: datetime | None
+    run_fresh: bool
+    internal_finalization: bool
+
+
+def _site_full_run_state(
+    session: Any,
+    site: str,
+    *,
+    tenant_id: int,
+    current: datetime,
+) -> _SiteFullRunState:
+    """Resolve the Run that is allowed to stand behind a site's catalog.
+
+    Cheap by design (one indexed lookup): callers that only need to know
+    *whether* a trusted lineage exists must not pay for coverage counts.
+    """
+    from src import storage
+
+    cutoff = current - timedelta(hours=OFFER_MAX_AGE_HOURS[site])
+    # The latest *attempt* is authoritative. Falling back to an older
+    # verified run after a newer full scan lost pages would keep financial
+    # output open precisely while the source is known to be degraded.
+    latest_attempt = session.scalar(
+        select(storage.Run)
+        .where(
+            storage.Run.tenant_id == tenant_id,
+            storage.Run.catalog_scope == "full",
+            ("," + storage.Run.full_catalog_sites + ",").like(f"%,{site},%"),
+        )
+        .order_by(desc(storage.Run.id))
+        .limit(1)
+    )
+    finalizing_run_id = _FINALIZING_TRUSTED_RUN_ID.get()
+    published = bool(
+        latest_attempt is not None
+        and latest_attempt.status == "ok"
+        and bool(latest_attempt.catalog_verified)
+    )
+    internal_finalization = bool(
+        latest_attempt is not None
+        and latest_attempt.id == finalizing_run_id
+        and latest_attempt.status == "running"
+        and bool(latest_attempt.catalog_verified)
+    )
+    relevant_run = latest_attempt if published or internal_finalization else None
+    run_at = (
+        (relevant_run.finished_at or relevant_run.started_at) if relevant_run is not None else None
+    )
+    return _SiteFullRunState(
+        latest_attempt=latest_attempt,
+        relevant_run=relevant_run,
+        run_at=run_at,
+        run_fresh=bool(run_at is not None and run_at >= cutoff),
+        internal_finalization=internal_finalization,
+    )
+
+
 def full_catalog_trust_report(
     session: Any,
     *,
@@ -463,40 +590,12 @@ def full_catalog_trust_report(
     current = now or utcnow()
     sites: list[dict[str, Any]] = []
     for site in REQUIRED_CATALOG_SITES:
-        max_age_hours = OFFER_MAX_AGE_HOURS[site]
-        cutoff = current - timedelta(hours=max_age_hours)
-        # The latest *attempt* is authoritative. Falling back to an older
-        # verified run after a newer full scan lost pages would keep financial
-        # output open precisely while the source is known to be degraded.
-        latest_attempt = session.scalar(
-            select(storage.Run)
-            .where(
-                storage.Run.tenant_id == tenant_id,
-                storage.Run.catalog_scope == "full",
-                ("," + storage.Run.full_catalog_sites + ",").like(f"%,{site},%"),
-            )
-            .order_by(desc(storage.Run.id))
-            .limit(1)
-        )
-        finalizing_run_id = _FINALIZING_TRUSTED_RUN_ID.get()
-        published = bool(
-            latest_attempt is not None
-            and latest_attempt.status == "ok"
-            and bool(latest_attempt.catalog_verified)
-        )
-        internal_finalization = bool(
-            latest_attempt is not None
-            and latest_attempt.id == finalizing_run_id
-            and latest_attempt.status == "running"
-            and bool(latest_attempt.catalog_verified)
-        )
-        relevant_run = latest_attempt if published or internal_finalization else None
-        run_at = (
-            (relevant_run.finished_at or relevant_run.started_at)
-            if relevant_run is not None
-            else None
-        )
-        run_fresh = bool(run_at is not None and run_at >= cutoff)
+        state = _site_full_run_state(session, site, tenant_id=tenant_id, current=current)
+        latest_attempt = state.latest_attempt
+        relevant_run = state.relevant_run
+        run_at = state.run_at
+        run_fresh = state.run_fresh
+        internal_finalization = state.internal_finalization
 
         # Trust evidence is immutable and run-scoped.  Mutable Product state
         # can be refreshed by a later partial/watchlist run and must never make
@@ -566,8 +665,11 @@ def full_catalog_trust_report(
                 "latest_full_attempt_verified": bool(
                     latest_attempt and latest_attempt.catalog_verified
                 ),
+                # Предпочитаем необрезанную причину из run_quality: колонка
+                # catalog_verification_reason — varchar(300), и срез съедает
+                # ровно те счётчики, которые объясняют отказ.
                 "latest_full_attempt_reason": (
-                    latest_attempt.catalog_verification_reason if latest_attempt else None
+                    _full_verification_reason(latest_attempt) if latest_attempt else None
                 ),
                 "full_catalog_run_id": relevant_run.id if relevant_run else None,
                 "full_catalog_at": run_at,
@@ -599,6 +701,21 @@ def full_catalog_trust_report(
     }
 
 
+def _full_verification_reason(run: Any) -> str | None:
+    """Полная причина отказа проверки каталога, если она сохранена.
+
+    `Run.catalog_verification_reason` — varchar(300); при длинном отказе хвост
+    со счётчиками теряется, а именно он и объясняет, что пошло не так. Пайплайн
+    дублирует полную строку в `run_quality` (JSON, без лимита) — читаем её, а на
+    колонку падаем только для старых прогонов, записанных до этой правки.
+    """
+    quality = getattr(run, "run_quality", None) or {}
+    full = quality.get("catalog_verification_reason_full")
+    if isinstance(full, str) and full:
+        return full
+    return getattr(run, "catalog_verification_reason", None)
+
+
 def trusted_catalog_epoch(
     session: Any,
     *,
@@ -611,13 +728,18 @@ def trusted_catalog_epoch(
     whenever every required site has a fresh verified full Run; enforce-mode
     callers additionally pass through ``policy_rollout_eligibility``.
     """
-    report = full_catalog_trust_report(session, tenant_id=tenant_id, now=now)
+    # Deliberately NOT full_catalog_trust_report(): the epoch depends only on
+    # which Run backs each site, while the report additionally counts coverage
+    # over offer_observations (nine count(distinct) scans, ~0.4-0.7 s on prod).
+    # Every dashboard read asks for the epoch, so that cost was paid on each
+    # keystroke of the comparison search.
+    current = now or utcnow()
     parts: list[str] = []
-    for row in report["sites"]:
-        run_id = row["full_catalog_run_id"]
-        if run_id is None or not row["full_catalog_fresh"]:
+    for site in REQUIRED_CATALOG_SITES:
+        state = _site_full_run_state(session, site, tenant_id=tenant_id, current=current)
+        if state.relevant_run is None or not state.run_fresh:
             return None
-        parts.append(f"{row['site']}:{run_id}")
+        parts.append(f"{site}:{state.relevant_run.id}")
     return "v1|" + "|".join(parts)
 
 
@@ -636,6 +758,25 @@ def policy_rollout_eligibility(
     return Eligibility(True)
 
 
+# Поля товара, которые читают функции политики ниже (`country_code_of`,
+# `offer_is_fresh`, `current_offer_eligibility` и всё, что на них построено).
+#
+# Функции принимают любой объект и читают поля через getattr с умолчанием —
+# удобно для строк запроса вместо ORM-объектов, но опасно: если политика начнёт
+# читать новое поле, а вызывающий код его не выбрал, она молча получит
+# «неизвестно», и в shadow-режиме это значит «допустимо». Поэтому тот, кто
+# собирает товары колонками, обязан брать список отсюда, а тест следит, чтобы
+# сама политика за его пределы не выходила.
+POLICY_PRODUCT_FIELDS = (
+    "site",
+    "url_dead_at",
+    "manufacturer_country_code",
+    "country_resolution_status",
+    "offer_availability_status",
+    "availability_observed_at",
+)
+
+
 def country_code_of(product: Any) -> str | None:
     if getattr(product, "country_resolution_status", None) == COUNTRY_RESOLVED:
         return getattr(product, "manufacturer_country_code", None)
@@ -647,12 +788,25 @@ def country_conflicts(a: Any, b: Any) -> bool:
     return bool(ca and cb and ca != cb)
 
 
-def offer_is_fresh(product: Any, *, now: datetime | None = None) -> bool:
+def offer_is_fresh(
+    product: Any, *, now: datetime | None = None, max_age_hours: int | None = None
+) -> bool:
+    """Наблюдение о наличии не старше срока сайта (`OFFER_MAX_AGE_HOURS`).
+
+    `max_age_hours` — свой срок вызывающего. Он нужен матчеру: тот выбирает
+    между одноимёнными строками сайта «ту, что сейчас в продаже», и его
+    терпение не должно сжиматься вместе с ритмом сбора (см.
+    `matcher._current_offer`).
+    """
     observed_at = getattr(product, "availability_observed_at", None)
     if observed_at is None:
         return False
     current = now or utcnow()
-    max_age = OFFER_MAX_AGE_HOURS.get(getattr(product, "site", ""), 30)
+    max_age = (
+        max_age_hours
+        if max_age_hours is not None
+        else OFFER_MAX_AGE_HOURS.get(getattr(product, "site", ""), 30)
+    )
     return observed_at >= current - timedelta(hours=max_age)
 
 
@@ -662,7 +816,9 @@ class Eligibility:
     reason: str | None = None
 
 
-def current_offer_eligibility(product: Any, *, now: datetime | None = None) -> Eligibility:
+def current_offer_eligibility(
+    product: Any, *, now: datetime | None = None, max_age_hours: int | None = None
+) -> Eligibility:
     if getattr(product, "url_dead_at", None) is not None:
         return Eligibility(False, "dead_url")
     status = getattr(product, "offer_availability_status", OFFER_UNKNOWN) or OFFER_UNKNOWN
@@ -670,7 +826,7 @@ def current_offer_eligibility(product: Any, *, now: datetime | None = None) -> E
         return Eligibility(False, "out_of_stock")
     if status != OFFER_IN_STOCK:
         return Eligibility(False, "availability_unknown")
-    if not offer_is_fresh(product, now=now):
+    if not offer_is_fresh(product, now=now, max_age_hours=max_age_hours):
         return Eligibility(False, "availability_stale")
     return Eligibility(True)
 

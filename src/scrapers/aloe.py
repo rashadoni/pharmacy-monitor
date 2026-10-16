@@ -3,7 +3,9 @@
 Структура (по результатам live-probe 2026-04-28, обновлено 2026-05-28):
 - Categories:    https://aloe.az/catalog/filters/?product_field=bestseller
                  https://aloe.az/catalog/filters/?category_slug={slug}
-- Product page:  https://aloe.az/{slug}/   ← БЕЗ /product/ префикса!
+- Product page:  https://aloe.az/{номер}/ ← БЕЗ /product/ префикса! Сам сайт
+                 ведёт на https://aloe.az/{slug}/, но слаг товар не называет —
+                 см. «Идентичность товара» ниже.
 - Card:          `[class*="productCardWrapper"]`  (это <button>, не <a>!)
 - Card name:     `[class*="productName"]`
 - Card brand:    `[class*="brand"]`  (внутри карточки <a>)
@@ -22,6 +24,15 @@ URL synth (Task #33 fix, 2026-05-28):
 
 Если product page по synth-slug не существует — будет 404, но это лучше чем
 гарантированно неправильный listing-URL (предыдущее поведение для всех 1809 aloe products).
+
+Идентичность товара (2026-10-08):
+Слаг товар НЕ называет. Сайт сам даёт один слаг нескольким товарам — другой
+завод, страна, цена (в карте сайта так у 581 слага из ~18 200), — а адрес
+https://aloe.az/{slug}/ открывает тот из них, у кого меньше номер, даже когда
+его уже нет в продаже. Товар называет его номер: поле `id` в листинге, на
+странице товара подпись «Məhsul kodu». По адресу https://aloe.az/{номер}/ сайт
+открывает ровно этот товар. Поле `code` (артикул учётной системы) адресом не
+служит и на странице не показано.
 """
 
 from __future__ import annotations
@@ -31,9 +42,17 @@ import json
 import os
 import re
 from typing import AsyncIterator
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from src.normalize import (
     extract_dosage,
@@ -106,6 +125,102 @@ def aloe_slug(name: str) -> str:
     return s
 
 
+# Ширина колонки `products.url`.
+_URL_MAX = 500
+# Столько знаков слага сборщик писал в идентификатор до перехода на номер.
+_LEGACY_ID_CUT = 100
+# Товару без слага сайт пишет в это поле «0» и сам ведёт на адрес с номером.
+_NO_SLUG = ("", "0")
+_DETAIL_NUMBER_RE = re.compile(r'"productId"\s*:\s*(\d+)')
+
+
+def aloe_product_number(value: object) -> str | None:
+    """Номер товара на сайте — его идентификатор у нас; None, если это не номер."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value) if value > 0 else None
+    text = str(value or "").strip()
+    if text.isascii() and text.isdigit() and int(text) > 0:
+        return str(int(text))
+    return None
+
+
+def aloe_product_url(base_url: str, number: str, slug: str = "") -> str:
+    """Адрес, по которому сайт открывает ровно этот товар.
+
+    Слаг дописан после «#»: сайту эта часть адреса не уходит и на то, какой
+    товар откроется, не влияет. Она для человека (по номеру товар не узнать) и
+    для поиска строки по адресу со слагом — такой адрес показывает сам сайт.
+    """
+    url = f"{base_url}/{number}/"
+    if slug not in _NO_SLUG and len(url) + 1 + len(slug) <= _URL_MAX:
+        return f"{url}#{slug}"
+    return url
+
+
+def aloe_slug_from_url(url: str) -> str:
+    """Слаг из адреса товара: нового `/{номер}/#{слаг}` и прежнего `/{слаг}/`.
+
+    Пустая строка, если слага в адресе нет. То, что стоит после «#» в адресе со
+    слагом, — якорь страницы («#reviews»), а не слаг.
+    """
+    parts = urlsplit(url or "")
+    segment = parts.path.rstrip("/").rsplit("/", 1)[-1]
+    if aloe_product_number(segment):
+        return parts.fragment
+    return "" if segment in _NO_SLUG else segment
+
+
+def aloe_slug_address(url: str) -> tuple[str, str] | None:
+    """Идентификатор и адрес, под которыми товар писали до перехода на номер.
+
+    None, если в адресе нет слага: такой товар прежний сборщик не писал.
+    """
+    slug = aloe_slug_from_url(url)
+    if not slug:
+        return None
+    parts = urlsplit(url)
+    return slug[:_LEGACY_ID_CUT], f"{parts.scheme}://{parts.netloc}/{slug}/"
+
+
+def aloe_legacy_external_ids(slug: str) -> tuple[str, ...]:
+    """Идентификаторы, под которыми строку товара писали до перехода на номер.
+
+    Слаг целиком и его первые сто знаков: длинный слаг обрезался.
+    """
+    if slug in _NO_SLUG:
+        return ()
+    return tuple(dict.fromkeys((slug, slug[:_LEGACY_ID_CUT])))
+
+
+def aloe_product_number_from_detail_html(html_text: str) -> str | None:
+    """Номер товара, который показывает страница.
+
+    Его несут кнопки «в корзину» и «в избранное» этого товара. Страница без
+    товара (сайт отвечает 200 и на несуществующий номер) номера не несёт.
+    """
+    decoded = re.sub(r'\\+"', '"', html_text)
+    numbers = {aloe_product_number(found) for found in _DETAIL_NUMBER_RE.findall(decoded)}
+    numbers.discard(None)
+    return numbers.pop() if len(numbers) == 1 else None
+
+
+def aloe_slug_from_detail_html(html_text: str, number: str) -> str:
+    """Слаг товара с его страницы — из адреса в описании этого товара для поисковиков.
+
+    Канонический адрес страницы не годится: на русской версии сайт пишет его с
+    ошибкой («/ru» слитно со слагом).
+    """
+    decoded = re.sub(r'\\+"', '"', html_text)
+    found = re.search(
+        r'"sku"\s*:\s*"%s".{0,600}?"url"\s*:\s*"([^"]+)"' % re.escape(number),
+        decoded,
+        flags=re.DOTALL,
+    )
+    return aloe_slug_from_url(found.group(1)) if found else ""
+
+
 def _decode_next_flight(html_text: str) -> str:
     """Return decoded Next.js flight payload chunks embedded in Aloe listing HTML."""
     chunks: list[str] = []
@@ -126,6 +241,20 @@ def aloe_listing_page_info(html_text: str) -> tuple[int | None, int | None]:
     current = int(current_matches[-1]) if current_matches else None
     last = int(last_matches[-1]) if last_matches else None
     return current, last
+
+
+def _is_transient_fetch_error(exc: BaseException) -> bool:
+    """Сбой, который имеет смысл повторить: обрыв или таймаут сети либо 5xx.
+
+    Любой 4xx — это ответ сайта (блок, нет страницы, 429 «помедленнее»), а не
+    помеха: быстрый повтор ничего не изменит и только утроит запросы. Ошибки
+    прокси и протокола на нашей стороне тоже не повторяем — они не проходят сами.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(
+        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+    )
 
 
 def _media_url(path: str | None) -> str | None:
@@ -194,9 +323,10 @@ def _aloe_product_from_payload(
     obj: dict, *, category_slug: str, base_url: str
 ) -> ScrapedProduct | None:
     name = str(obj.get("name") or "").strip()
-    slug = str(obj.get("slug") or "").strip()
-    if not name or not slug:
+    number = aloe_product_number(obj.get("id"))
+    if not name or number is None:
         return None
+    slug = str(obj.get("slug") or "").strip()
 
     price = parse_price(str(obj.get("price"))) if obj.get("price") is not None else None
     old_price = (
@@ -237,9 +367,10 @@ def _aloe_product_from_payload(
 
     return ScrapedProduct(
         site="aloe",
-        external_id=slug[:100],
-        url=f"{base_url}/{slug}/",
+        external_id=number,
+        url=aloe_product_url(base_url, number, slug),
         name=name,
+        identity_verified=True,
         brand=brand,
         manufacturer=None,
         manufacturer_country_raw=country_raw,
@@ -330,12 +461,26 @@ class AloeScraper(BaseScraper):
         super().__init__(*args, **kwargs)
         self.country_id_map = country_id_map or {}
         self.verified_country_mappings: dict[str, dict[str, object]] = {}
+        # id стран, чьи карточки в ЭТОМ сборе прочитаны, а страна так и не
+        # определилась (две страны в подписи, не страна, подписи нет). Без этой
+        # памяти те же две карточки открывались заново на каждой странице
+        # листинга с таким id. Живёт вместе с экземпляром и в
+        # aloe_country_mappings не уходит: сайт может исправить подпись, и
+        # следующий сбор должен это увидеть.
+        self._unresolvable_country_ids: set[str] = set()
+        # id, про которые aloe_country_id_unresolved с retry=True уже записан.
+        self._country_retry_logged: set[str] = set()
+        self.fetch_retries = 0
 
     async def _enrich_listing_country_ids(
         self, products: list[ScrapedProduct]
     ) -> None:
         """Resolve Aloe numeric country IDs from durable map or detail pages."""
-        from src.product_policy import COUNTRY_RESOLVED, country_resolution
+        from src.product_policy import (
+            COUNTRY_RESOLVED,
+            OFFER_UNKNOWN,
+            country_resolution,
+        )
 
         groups: dict[str, list[ScrapedProduct]] = {}
         for product in products:
@@ -346,21 +491,41 @@ class AloeScraper(BaseScraper):
         for country_id, group in groups.items():
             mapping = self.country_id_map.get(country_id)
             if mapping is None:
+                if country_id in self._unresolvable_country_ids:
+                    continue
                 samples: list[tuple[str, str, str]] = []
+                labels: set[str] = set()
+                unread_details = 0
+                unlabeled_details = 0
                 for product in group[:2]:
+                    error: str | None = None
                     try:
                         html_text = await self._fetch_listing_html(product.url)
-                        raw, _availability = aloe_product_detail_signals(html_text)
+                        raw, availability = aloe_product_detail_signals(html_text)
                     except (httpx.HTTPError, ValueError) as exc:
+                        error = str(exc)
+                    else:
+                        if raw is None and availability == OFFER_UNKNOWN:
+                            # Ответ 200 без подписи страны и без остатка — не
+                            # карточка товара (заглушка, листинг, обрезанная
+                            # страница). Настоящая карточка без страны остаток
+                            # несёт: tests/fixtures/aloe_product_no_country.html.
+                            error = "no country label and no stock marker"
+                    if error is not None:
+                        unread_details += 1
                         log.warning(
                             "aloe_country_detail_failed",
                             country_id=country_id,
                             url=product.url,
-                            error=str(exc),
+                            error=error,
                         )
                         continue
+                    if raw is None:
+                        unlabeled_details += 1
+                        continue
+                    labels.add(raw)
                     code, status = country_resolution(raw)
-                    if code is not None and status == COUNTRY_RESOLVED and raw:
+                    if code is not None and status == COUNTRY_RESOLVED:
                         samples.append((code, raw, product.url))
                 codes = {code for code, _raw, _url in samples}
                 required_samples = min(2, len(group))
@@ -369,6 +534,28 @@ class AloeScraper(BaseScraper):
                     # evidence that listing pagination or card parsing lost
                     # catalog rows. Keep the numeric ID unresolved so policy
                     # checks cannot mistake it for a verified country.
+                    #
+                    # До конца сбора id запоминается, только когда сайт ответил
+                    # отказом: все взятые карточки прочитаны, а страны на них
+                    # нет, подпись не страна или образцы разошлись. Считаем,
+                    # что следующая страница скажет то же самое: подпись на
+                    # карточке выводится из того же id. Во всех прочих случаях
+                    # id перепроверяется на следующей странице: карточку не
+                    # прочитали (сеть, 404, заглушка) либо одна назвала страну,
+                    # а на другой подписи нет вовсе — молчание не возражение.
+                    # Иначе один сбой оставил бы страну без названия на весь
+                    # сбор. Условие точно для двух образцов (group[:2]).
+                    retry = unread_details > 0 or (
+                        len(codes) == 1 and unlabeled_details > 0
+                    )
+                    if not retry:
+                        self._unresolvable_country_ids.add(country_id)
+                    elif country_id in self._country_retry_logged:
+                        # Каждая неудачная карточка уже в логе отдельной
+                        # строкой; итог по id на каждой странице не повторяем.
+                        continue
+                    else:
+                        self._country_retry_logged.add(country_id)
                     log.warning(
                         "aloe_country_id_unresolved",
                         country_id=country_id,
@@ -376,6 +563,10 @@ class AloeScraper(BaseScraper):
                         samples=len(samples),
                         required_samples=required_samples,
                         distinct_codes=len(codes),
+                        labels=sorted(labels),
+                        unlabeled_details=unlabeled_details,
+                        unread_details=unread_details,
+                        retry=retry,
                     )
                     continue
                 code, country_raw, source_url = samples[0]
@@ -429,7 +620,7 @@ class AloeScraper(BaseScraper):
         else:
             base_url = f"{self.base_url}/catalog/filters/?category_slug={category_slug}"
 
-        first_html = await self._fetch_listing_html(base_url)
+        first_html = await self._fetch_listing_page(base_url)
         current_page, last_page = aloe_listing_page_info(first_html)
         if not last_page:
             last_page = 1
@@ -443,7 +634,7 @@ class AloeScraper(BaseScraper):
         parsed_items = 0
         item_failures = 0
         for page_num in range(1, last_page + 1):
-            html_text = first_html if page_num == 1 else await self._fetch_listing_html(
+            html_text = first_html if page_num == 1 else await self._fetch_listing_page(
                 f"{base_url}&page={page_num}"
             )
             products, page_raw, page_parsed, page_failures = (
@@ -511,6 +702,41 @@ class AloeScraper(BaseScraper):
                 item_failures=item_failures,
             )
 
+    async def _fetch_listing_page(self, url: str) -> str:
+        """Страница листинга с ограниченным повтором при сбое сети.
+
+        Один не отданный листинг рушит проверку ВСЕГО каталога (маршрут неполон
+        → catalog_verified=false), а полный сбор — это сотни страниц. За
+        сентябрь–октябрь 2026 три полных сбора из 30 пропали из-за единственного
+        ReadError/ReadTimeout. Страница, не отдавшаяся и с повторами, по-прежнему
+        роняет маршрут.
+
+        Только листинги: сбой карточки товара (определение страны) маршрут и так
+        не роняет, повтор там ничего не даёт проверке и лишь растягивает прогон.
+        """
+        retrying = AsyncRetrying(
+            stop=stop_after_attempt(self.max_retries),
+            wait=wait_exponential(multiplier=2, min=2, max=60),
+            retry=retry_if_exception(_is_transient_fetch_error),
+            before_sleep=self._note_fetch_retry,
+            reraise=True,
+        )
+        return await retrying(self._fetch_listing_html, url)
+
+    def _note_fetch_retry(self, retry_state: RetryCallState) -> None:
+        # Повтор гасит сбой, но прятать его не должен: счётчик повторных
+        # запросов уходит в Run.run_quality, иначе деградация сайта пропадёт из
+        # виду до дня, когда повторов перестанет хватать.
+        self.fetch_retries += 1
+        outcome = retry_state.outcome
+        error = outcome.exception() if outcome is not None else None
+        log.warning(
+            "aloe_fetch_retry",
+            url=retry_state.args[0] if retry_state.args else None,
+            attempt=retry_state.attempt_number,
+            error=f"{type(error).__name__}: {error}"[:200],
+        )
+
     async def _fetch_listing_html(self, url: str) -> str:
         await self._throttle()
         timeout = float(os.getenv("ALOE_HTTP_TIMEOUT_SEC", str(self.timeout_sec)))
@@ -551,62 +777,58 @@ class AloeScraper(BaseScraper):
             page = await self.new_page()
             page_yielded = 0
             page_dropped_dup = 0
-            page_dropped_empty = 0
             try:
                 await self.goto(page, url)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=20000)
                 except Exception:
                     log.debug("aloe_networkidle_timeout", url=url)
-                await self._scroll_until_stable(page, max_iterations=15)
-
-                cards = await page.query_selector_all('[class*="productCardWrapper"]')
-                total_cards_found += len(cards)
-                log.info(
-                    "aloe_cards_found",
-                    category=category_slug,
-                    page=page_num,
-                    count=len(cards),
-                )
-
-                for card in cards:
-                    if limit and yielded >= limit:
-                        self._set_route_status(
-                            category_slug,
-                            complete=False,
-                            abort_reason="requested_limit_reached",
-                            visited_pages=page_num,
-                            raw_items=total_cards_found,
-                            parsed_items=total_cards_parsed,
-                            item_failures=total_card_failures,
-                        )
-                        return
-                    try:
-                        product = await self._parse_card(card, category_slug, url)
-                        if not product:
-                            page_dropped_empty += 1
-                            total_card_failures += 1
-                            continue
-                        total_cards_parsed += 1
-                        if product.external_id in seen_external_ids:
-                            page_dropped_dup += 1
-                            continue
-                        seen_external_ids.add(product.external_id)
-                        page_yielded += 1
-                        yielded += 1
-                        yield product
-                    except Exception as e:
-                        total_card_failures += 1
-                        log.warning("aloe_card_parse_failed", error=str(e))
-                if page_dropped_empty or page_dropped_dup:
-                    log.info(
-                        "aloe_page_drops",
-                        page=page_num,
-                        dropped_empty=page_dropped_empty,
-                        dropped_dup=page_dropped_dup,
+                # Товары берём из потока Next.js в самой странице, как и без
+                # браузера: в вёрстке карточки номера товара нет, а без номера
+                # товар не назвать (см. «Идентичность товара» в шапке модуля).
+                products, page_raw, page_parsed, page_failures = (
+                    _aloe_products_from_listing_html_with_stats(
+                        await page.content(), category_slug=category_slug, base_url=self.base_url
                     )
+                )
             finally:
                 await page.close()
+            total_cards_found += page_raw
+            total_cards_parsed += page_parsed
+            total_card_failures += page_failures
+            log.info(
+                "aloe_cards_found",
+                category=category_slug,
+                page=page_num,
+                count=page_raw,
+            )
+
+            for product in products:
+                if limit and yielded >= limit:
+                    self._set_route_status(
+                        category_slug,
+                        complete=False,
+                        abort_reason="requested_limit_reached",
+                        visited_pages=page_num,
+                        raw_items=total_cards_found,
+                        parsed_items=total_cards_parsed,
+                        item_failures=total_card_failures,
+                    )
+                    return
+                if product.external_id in seen_external_ids:
+                    page_dropped_dup += 1
+                    continue
+                seen_external_ids.add(product.external_id)
+                page_yielded += 1
+                yielded += 1
+                yield product
+            if page_failures or page_dropped_dup:
+                log.info(
+                    "aloe_page_drops",
+                    page=page_num,
+                    dropped_empty=page_failures,
+                    dropped_dup=page_dropped_dup,
+                )
 
             if page_yielded == 0:
                 log.info(
@@ -648,93 +870,14 @@ class AloeScraper(BaseScraper):
                 item_failures=total_card_failures,
             )
 
-    async def _scroll_until_stable(self, page, max_iterations: int = 20) -> None:
-        prev_count = -1
-        same_streak = 0
-        for _ in range(max_iterations):
-            count = await page.evaluate(
-                "document.querySelectorAll('[class*=\"productCardWrapper\"]').length"
-            )
-            if count == prev_count:
-                same_streak += 1
-                if same_streak >= 2:
-                    break
-            else:
-                same_streak = 0
-            prev_count = count
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1200)
-
-    async def _parse_card(self, card, category: str, listing_url: str) -> ScrapedProduct | None:
-        # имя — первое предпочтение productName, затем alt у изображения
-        name_handle = await card.query_selector('[class*="productName"]')
-        name = (await name_handle.inner_text()).strip() if name_handle else ""
-        if not name:
-            img = await card.query_selector("img")
-            if img:
-                name = (await img.get_attribute("alt") or "").strip()
-        if not name:
-            return None
-
-        # бренд — внутри карточки есть <a class="style_brand_*">
-        brand_handle = await card.query_selector('[class*="brand"]')
-        brand = (await brand_handle.inner_text()).strip() if brand_handle else None
-
-        # цена
-        price_handle = await card.query_selector('[class*="priceWrapper"] [class*="style_price"]')
-        if not price_handle:
-            price_handle = await card.query_selector('[class*="price"]:not([class*="old"])')
-        price_text = await price_handle.inner_text() if price_handle else None
-        price = parse_price(price_text)
-
-        old_price_handle = await card.query_selector('[class*="oldPriceText"], [class*="oldPrice"]')
-        old_price_text = await old_price_handle.inner_text() if old_price_handle else None
-        old_price = parse_price(old_price_text)
-
-        is_on_sale = old_price is not None and price is not None and old_price > price
-        discount_percent = None
-        if is_on_sale and old_price:
-            discount_percent = round((1 - price / old_price) * 100, 1)  # type: ignore[operator]
-
-        img_handle = await card.query_selector('[class*="productImg"] img')
-        image_url = await img_handle.get_attribute("src") if img_handle else None
-
-        promo_handle = await card.query_selector(
-            '[class*="properties"], [class*="badge"], [class*="discount"]'
-        )
-        promo_text = (await promo_handle.inner_text()).strip() if promo_handle else None
-        promo_label = promo_text if promo_text and len(promo_text) < 50 else None
-
-        # external_id: aloe не даёт стабильного id в карточке, генерируем из имени.
-        # Task #33 (2026-05-28): используем aloe_slug, идентичен URL slug → стабильность
-        # внешнего id между runs + точное соответствие detail page URL.
-        slug = aloe_slug(name)
-        external_id = slug[:100] if slug else name.lower().replace(" ", "-")[:100]
-
-        # URL synthesis (Task #33 fix): aloe.az/{slug}/ — verified via Playwright MCP
-        # click-navigation. Fallback на listing_url если slugification failed
-        # (empty slug, edge case с не-Azeri/Latin/Cyrillic chars).
-        product_url = f"{self.base_url}/{slug}/" if slug else listing_url
-
-        return ScrapedProduct(
-            site=self.site_name,
-            external_id=external_id,
-            url=product_url,
-            name=name,
-            brand=brand,
-            category=category,
-            dosage=extract_dosage(name),
-            pack_size=extract_pack_size(name),
-            image_url=image_url,
-            price=old_price if is_on_sale else price,
-            discount_price=price if is_on_sale else None,
-            discount_percent=discount_percent,
-            is_on_sale=is_on_sale,
-            promo_label=promo_label,
-        )
-
     async def scrape_product_page(self, url: str) -> ScrapedProduct | None:
-        """Watchlist-режим: страница товара по адресу https://aloe.az/{slug}/."""
+        """Watchlist-режим: страница товара по её адресу.
+
+        Товар называет номер, который показывает сама страница, а не адрес: по
+        адресу со слагом сайт открывает один из нескольких товаров с этим
+        слагом. Страницу без номера (нет товара, сменилась вёрстка) не пишем:
+        товар без номера получил бы свою, отдельную строку.
+        """
         page = await self.new_page()
         try:
             await self.goto(page, url)
@@ -782,7 +925,11 @@ class AloeScraper(BaseScraper):
             )
             image_url = await img_handle.get_attribute("src") if img_handle else None
 
-            external_id = url.rstrip("/").split("/")[-1]
+            page_html = await page.content()
+            number = aloe_product_number_from_detail_html(page_html)
+            if number is None:
+                log.warning("aloe_product_page_without_number", url=url)
+                return None
 
             # Phase 2.2 — try to extract barcode from JSON-LD injected post-
             # hydration. Next.js apps put <script type="application/ld+json">
@@ -794,20 +941,27 @@ class AloeScraper(BaseScraper):
                     parse_jsonld_product,
                 )
 
-                html = await page.content()
-                jsonld = parse_jsonld_product(html)
+                jsonld = parse_jsonld_product(page_html)
                 if jsonld:
                     barcode = _extract_barcode_from_jsonld(jsonld)
             except Exception as exc:
                 log.debug("aloe_barcode_extract_failed", url=url, error=str(exc))
 
-            country_raw, availability_status = aloe_product_detail_signals(html)
+            country_raw, availability_status = aloe_product_detail_signals(page_html)
 
             return ScrapedProduct(
                 site=self.site_name,
-                external_id=external_id,
-                url=url,
+                external_id=number,
+                url=aloe_product_url(
+                    self.base_url,
+                    number,
+                    # Закреплённый адрес с номером слага не несёт: без слага со
+                    # страницы строка потеряла бы его и перестала бы находиться
+                    # по адресу, который показывает сайт.
+                    aloe_slug_from_url(url) or aloe_slug_from_detail_html(page_html, number),
+                ),
                 name=name,
+                identity_verified=True,
                 brand=brand,
                 manufacturer_country_raw=country_raw,
                 country_source="aloe_detail_country_label" if country_raw else None,

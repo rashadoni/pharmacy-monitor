@@ -20,19 +20,35 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 13.140.186.143 >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' \
+            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDVrem8NrMZMjV9cDiB8/8wOwOn1wrfSU7S5vfaLHM+R' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          test "$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')" = \
+            'SHA256:Hx7TYOZC2diIb6ZwI9LRv4bybasYCijb+lKnQQmGk/I'
 
       - name: Run full aptekonline scrape on production
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
             cd /opt/pharmacy-monitor
-            if systemctl is-active --quiet pharmacy-monitor-scrape@aptekonline.service; then
+            # The unit is Type=oneshot: while its scrape runs (or waits for the
+            # scrape lock) it is "activating" and never "active", so is-active
+            # would report it as idle and --force below would pay for a second
+            # collection right behind the scheduled one.
+            unit=pharmacy-monitor-scrape@aptekonline.service
+            scrape_running() {
+              case "$(systemctl show -p ActiveState --value "$unit")" in
+                activating|active) return 0 ;;
+                *) return 1 ;;
+              esac
+            }
+            if scrape_running; then
               echo "an aptekonline systemd scrape is already running; waiting for it"
-              while systemctl is-active --quiet pharmacy-monitor-scrape@aptekonline.service; do
+              while scrape_running; do
                 sleep 30
               done
-              test "$(systemctl show -p Result --value pharmacy-monitor-scrape@aptekonline.service)" = success
+              test "$(systemctl show -p Result --value "$unit")" = success
               exit 0
             fi
             while IFS= read -r line || [ -n "$line" ]; do
@@ -43,10 +59,14 @@ jobs:
               value=${line#*=}
               export "$key=$value"
             done < /etc/pharmacy-monitor/env
+            # --force: ручной запуск — явная просьба. Без него гвард ритма
+            # пропустил бы сбор, если aptekonline в этом окне ритма уже
+            # собран, а шаг проверки ниже прошёл бы по старому прогону.
             .venv/bin/pharmacy-monitor run \
               --site aptekonline \
               --mode category \
-              --no-alerts'
+              --no-alerts \
+              --force'
 
       - name: Verify latest aptekonline catalog attempt
         run: |

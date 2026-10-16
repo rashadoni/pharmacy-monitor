@@ -7,6 +7,11 @@
 # direct/RSC. The script is fail-closed unless explicitly enabled for a one-off
 # disaster-recovery run with PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1.
 #
+# The Hetzner host this script used to tunnel into was deleted in 2026-09.
+# There is deliberately no default target any more: a DR run must name the
+# server in PROD_HOST, and the connection is accepted only for the host key
+# pinned in infra/prod_known_hosts.
+#
 # Historical launchd/manual usage:
 #   bash infra/local/run-scrape.sh                    # все три сайта
 #   bash infra/local/run-scrape.sh --site pharmonline # только pharmonline
@@ -29,8 +34,9 @@ set -euo pipefail
 # ── Config ──────────────────────────────────────────────────────────────────
 PROJECT_DIR="${PROJECT_DIR:-/Users/rashadrahimov/pharmacy-monitor}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
-PROD_HOST="${PROD_HOST:-46.225.149.52}"
+PROD_HOST="${PROD_HOST:-}"
 PROD_USER="${PROD_USER:-root}"
+KNOWN_HOSTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/prod_known_hosts"
 LOCAL_PG_PORT="${LOCAL_PG_PORT:-5433}"
 KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-pharmacy-monitor-db}"
 KEYCHAIN_ACCOUNT="${KEYCHAIN_ACCOUNT:-pm}"
@@ -63,6 +69,12 @@ if [[ "${PHARMACY_MONITOR_ENABLE_MAC_SCRAPE:-0}" != "1" ]]; then
     echo "DISABLED: Mac scraping is retired. Server-side paid services own all scrapes."
     echo "Set PHARMACY_MONITOR_ENABLE_MAC_SCRAPE=1 only for an explicit DR run."
     exit 0
+fi
+
+if [[ -z "$PROD_HOST" ]]; then
+    echo "ERROR: PROD_HOST is not set. The server this script used to target was"
+    echo "decommissioned in 2026-09 and there is no default any more."
+    exit 1
 fi
 
 cd "$PROJECT_DIR"
@@ -122,7 +134,9 @@ for attempt in $(seq 1 $TUNNEL_ATTEMPTS); do
         -o ServerAliveCountMax=20 \
         -o TCPKeepAlive=yes \
         -o ConnectTimeout=15 \
-        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -o StrictHostKeyChecking=yes \
+        -o ControlPath=none \
         "$PROD_USER@$PROD_HOST" &
     TUNNEL_PID=$!
     echo "  tunnel pid=$TUNNEL_PID port=$LOCAL_PG_PORT"

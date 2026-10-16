@@ -1394,3 +1394,128 @@ def test_crawlbase_json_body_accepts_direct_and_pre_rendered_json():
     assert _json_from_rendered_body(payload) == payload
     assert _json_from_rendered_body(json.dumps(payload)) == payload
     assert _json_from_rendered_body(f"<html><pre>{json.dumps(payload)}</pre></html>") == payload
+
+
+# ── direct transport ────────────────────────────────────────────────────────
+# pharmonline.az answers the production host itself, so the catalog does not
+# need a paid intermediary at all. These tests pin the two properties that
+# make that safe: nothing is configured but the origin, and a real block is
+# still a fatal stop rather than a quietly empty catalog.
+
+
+def _direct_scraper(monkeypatch) -> PharmonlinePublicAPIScraper:
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API", "required")
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "direct")
+    for leftover in (
+        "CRAWLBASE_JS_TOKEN",
+        "DECODO_USERNAME",
+        "DECODO_PASSWORD",
+        "FIRECRAWL_API_KEY",
+        "SCRAPER_API_KEY",
+    ):
+        monkeypatch.delenv(leftover, raising=False)
+    return PharmonlinePublicAPIScraper()
+
+
+def _mock_direct_client(scraper, handler) -> None:
+    """Point the already-open direct client at an in-process transport."""
+    scraper._client = httpx.AsyncClient(
+        timeout=5.0,
+        follow_redirects=True,
+        headers=dict(scraper._client.headers),
+        transport=httpx.MockTransport(handler),
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_transport_needs_no_provider_credentials(monkeypatch):
+    scraper = _direct_scraper(monkeypatch)
+    await scraper.__aenter__()
+    try:
+        assert scraper._transport_name() == "direct"
+        assert scraper._client is not None
+        # A default httpx agent is answered with 403, which would look exactly
+        # like a block, so the browser agent is part of the contract.
+        assert "Mozilla/5.0" in scraper._client.headers["user-agent"]
+    finally:
+        await scraper.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_direct_transport_requests_the_origin_itself(monkeypatch):
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    scraper = _direct_scraper(monkeypatch)
+    await scraper.__aenter__()
+    try:
+        _mock_direct_client(scraper, handler)
+        payload = await scraper._source_json("https://pharmonline.az/api/products?page=1")
+        assert payload == {"ok": True}
+    finally:
+        await scraper.__aexit__(None, None, None)
+
+    assert len(seen) == 1
+    # No provider endpoint, no proxy, no credential anywhere in the request.
+    assert seen[0].url.host == "pharmonline.az"
+    assert seen[0].headers["accept"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_direct_transport_treats_an_origin_block_as_fatal(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="Just a moment...")
+
+    scraper = _direct_scraper(monkeypatch)
+    await scraper.__aenter__()
+    try:
+        _mock_direct_client(scraper, handler)
+        with pytest.raises(SiteScrapeFatalError):
+            await scraper._source_json("https://pharmonline.az/api/products?page=1")
+    finally:
+        await scraper.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_direct_transport_retries_a_transient_origin_failure(monkeypatch):
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, text="<urlset/>")
+
+    scraper = _direct_scraper(monkeypatch)
+    await scraper.__aenter__()
+    try:
+        _mock_direct_client(scraper, handler)
+        body = await scraper._source_xml("https://pharmonline.az/sitemap-products-1.xml")
+        assert body == "<urlset/>"
+    finally:
+        await scraper.__aexit__(None, None, None)
+
+    assert len(attempts) == 2
+
+
+@pytest.mark.asyncio
+async def test_direct_transport_gives_up_after_the_retry_budget(monkeypatch):
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(503)
+
+    scraper = _direct_scraper(monkeypatch)
+    await scraper.__aenter__()
+    try:
+        _mock_direct_client(scraper, handler)
+        with pytest.raises(PharmonlinePublicAPIError, match="direct_http_503"):
+            await scraper._source_json("https://pharmonline.az/api/products?page=1")
+    finally:
+        await scraper.__aexit__(None, None, None)
+
+    assert len(attempts) == 3

@@ -149,6 +149,26 @@ def test_new_product_detected(db_session):
     assert report.new_products[0].name == "New SKU"
 
 
+def test_verified_run_does_not_report_old_product_as_new(db_session):
+    """Нет проверенной цены в прошлом ≠ новый товар (см. new_product_cutoffs_by_site)."""
+    month_ago = utcnow() - timedelta(days=30)
+    legacy = _add_run(db_session, month_ago, status="degraded")
+    previous = _add_run(db_session, utcnow() - timedelta(days=7))
+    current = _add_run(db_session, utcnow())
+    _mark_financially_eligible(previous, "aloe")
+    _mark_financially_eligible(current, "aloe")
+    old = _add_product(db_session, "aloe", "On the shelf since spring", "1")
+    old.first_seen_at = month_ago
+    arrived = _add_product(db_session, "aloe", "Arrived this week", "2")
+    _add_snapshot(db_session, legacy, old, 10.0)
+    _add_snapshot(db_session, current, old, 10.0)
+    _add_snapshot(db_session, current, arrived, 5.0)
+    db_session.commit()
+
+    report = analyzer.analyze(db_session, current.id)
+    assert [item.name for item in report.new_products] == ["Arrived this week"]
+
+
 def test_undercut_detected(db_session):
     """Конкурент дешевле клиента → попадает в undercuts."""
     m = storage.Match(canonical_name="Foo", confidence=1.0)

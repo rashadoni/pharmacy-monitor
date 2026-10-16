@@ -317,13 +317,23 @@ def _detect_new_products(
 
     «Новый» = впервые видим. Если в `curr_and_prev_snapshots_for_run` для
     продукта нет prev_snapshot'а, значит до этого прогона его в БД не было.
+    Для проверенного прогона prev — только проверенные snapshot'ы, и их
+    отсутствие само по себе новизны не доказывает — см.
+    `storage.new_product_cutoffs_by_site`.
     """
-    from src.storage import curr_and_prev_snapshots_for_run
+    from src.storage import curr_and_prev_snapshots_for_run, new_product_cutoffs_by_site
 
     curr_snaps, prev_by_product = curr_and_prev_snapshots_for_run(
         session,
         current_run,
         financially_eligible_only=verified_only,
+    )
+    cutoffs = (
+        new_product_cutoffs_by_site(
+            session, current_run, {snap.product.site for snap in curr_snaps}
+        )
+        if verified_only
+        else {}
     )
 
     new_products: list[NewProduct] = []
@@ -331,6 +341,8 @@ def _detect_new_products(
         if snap.product_id in prev_by_product:
             continue  # есть более ранний snapshot → не новый
         product = snap.product
+        if verified_only and product.first_seen_at < cutoffs[product.site]:
+            continue
         new_products.append(
             NewProduct(
                 site=product.site,

@@ -8,7 +8,14 @@ User=pm
 Group=pm
 WorkingDirectory=/opt/pharmacy-monitor
 EnvironmentFile=/etc/pharmacy-monitor/env
-ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor health-check --quiet-on-ok
+# --alert-email обязателен: без него health-check только печатает CRITICAL в journald,
+# и о поломке никто не узнаёт. Так на этом хосте месяц простояли два мёртвых скрейпера.
+# Повторы того же инцидента глушит --alert-cooldown-hours (по умолчанию 24ч).
+ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor health-check --quiet-on-ok --alert-email
+# health-check кодирует статус в exit-code (0=ok, 1=warning, 2=critical). Без этой
+# строки systemd считает «нашлись проблемы» падением юнита и засоряет systemctl --failed,
+# из-за чего настоящий сбой самой проверки (exit 1 от краша) перестаёт быть заметным.
+SuccessExitStatus=1 2
 
 NoNewPrivileges=true
 PrivateTmp=true

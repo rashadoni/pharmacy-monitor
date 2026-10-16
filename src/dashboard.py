@@ -21,7 +21,6 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
 
 from src import auth, storage, watchlist as wl
 from src.url_parser import parse_urls_block
@@ -306,7 +305,7 @@ auth.render_user_badge()
 
 @st.cache_resource
 def get_engine():
-    return create_engine(DATABASE_URL)
+    return storage.create_engine_hiding_statement_data(DATABASE_URL)
 
 
 def get_session():
@@ -456,7 +455,8 @@ def run_pharmacy_monitor(
     mode: str = "auto",
 ) -> tuple[int, str]:
     """Запустить `pharmacy-monitor run` через subprocess. Возвращает (returncode, log)."""
-    args = ["uv", "run", "pharmacy-monitor", "run", "--mode", mode]
+    # Кнопку нажал человек — собираем сейчас, недельный ритм не спорит.
+    args = ["uv", "run", "pharmacy-monitor", "run", "--mode", mode, "--force"]
     if dry_run:
         args.append("--dry-run")
     for s in sites or []:
@@ -502,9 +502,29 @@ def render_run_panel(*, key_prefix: str, default_dry_run: bool = True) -> None:
             key=f"{key_prefix}_btn",
         )
     if clicked:
+        with get_session() as s:
+            pinned_sites = {
+                link.site
+                for tp in wl.list_tracked(s, active_only=True)
+                for link in tp.links
+                if link.url and link.status == "confirmed"
+            }
+        if not pinned_sites & set(sites_chosen or SITES):
+            # Без этого прогон завершился бы ошибкой «no requested scrape work» и
+            # оставил в базе упавший Run.
+            st.info(
+                "В watchlist нет подтверждённых ссылок для выбранных сайтов — "
+                "собирать нечего. Добавь товар с URL ниже."
+            )
+            return
         with st.spinner("🔄 Запускаю scraping... обычно 30-90 сек, не закрывай вкладку"):
             try:
-                rc, log = run_pharmacy_monitor(dry_run=dry, sites=sites_chosen or None, mode="auto")
+                # Панель стоит на вкладке Watchlist и обещает прогон по закреплённым
+                # ссылкам. Режим по умолчанию (`auto`) — сбор каталога, поэтому
+                # watchlist просим явно.
+                rc, log = run_pharmacy_monitor(
+                    dry_run=dry, sites=sites_chosen or None, mode="watchlist"
+                )
             except subprocess.TimeoutExpired:
                 rc, log = -1, "⛔ Превышен timeout 15 мин — прогон убит."
         if rc == 0:
@@ -1156,7 +1176,8 @@ with tab_compare:
             "👉 **Что делать:**\n"
             "1. Открой вкладку **📋 Watchlist**\n"
             "2. Добавь товар с URL'ами на каждом из 3 сайтов\n"
-            "3. Запусти прогон: `uv run pharmacy-monitor run`\n"
+            "3. Запусти прогон по watchlist — кнопкой на той же вкладке или "
+            "`uv run pharmacy-monitor run --mode watchlist`\n"
             "4. Вернись сюда — здесь появится сравнение"
         )
     else:
@@ -2391,7 +2412,8 @@ with tab_watchlist:
     st.subheader("📋 Watchlist — отслеживаемые товары")
     st.caption(
         "Каждый товар можно привязать к конкретной странице на каждом из 3 сайтов. "
-        "Когда URL зафиксирован, ежедневный прогон будет ходить именно по нему."
+        "Когда URL зафиксирован, по нему ходит прогон по watchlist — кнопка ниже "
+        "или команда `pharmacy-monitor watchlist-tick`; ежедневный прогон собирает каталог."
     )
 
     with st.container(border=True):

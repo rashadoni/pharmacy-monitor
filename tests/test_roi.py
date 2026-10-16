@@ -406,27 +406,70 @@ def test_get_cached_actions_returns_none_when_empty(db_session):
 
 
 def test_get_cached_actions_returns_none_when_stale(db_session):
-    """Кэш старше max_age_hours → None (forces fallback на inline compute)."""
+    """Кэш старше срока жизни → None. Срок — ритм сбора с запасом, 30ч."""
     from datetime import timedelta
     from src.storage import RoiActionsCache
 
+    assert roi._CACHE_MAX_AGE_HOURS == 30
     eligible_run = _shared_run(db_session)
+    cache_row = RoiActionsCache(
+        tenant_id=1,
+        client_site="pharmonline",
+        payload=[{"type": "price_raise", "severity": "info", "title": "test"}],
+        computed_at=utcnow() - timedelta(hours=31),
+        run_id=eligible_run.id,
+        policy_fingerprint=policy_fingerprint(),
+        trust_epoch=_trusted_epoch(db_session),
+    )
+    db_session.add(cache_row)
+    db_session.commit()
+
+    assert roi.get_cached_actions(db_session, "pharmonline") is None
+    # Но если повысить порог — возвращается
+    assert roi.get_cached_actions(db_session, "pharmonline", max_age_hours=240) is not None
+
+    cache_row.computed_at = utcnow() - timedelta(hours=29)
+    db_session.commit()
+    assert roi.get_cached_actions(db_session, "pharmonline") is not None
+
+
+def test_cached_actions_survive_until_the_next_nightly_collection(db_session):
+    """Рекомендации видны весь день до следующего ночного сбора и ещё с запасом.
+
+    Кэш пишется только в конце подтверждённого полного сбора, а срок его жизни
+    — ритм сбора с запасом (src/cadence.py). Срок короче ритма скрывал бы
+    рекомендации до следующего сбора: при недельном ритме прежние 26ч прятали
+    их со вторника до понедельника.
+    """
+    from datetime import timedelta
+    from src.storage import RoiActionsCache
+
+    collected_at = utcnow() - timedelta(hours=28)
+    weekly_run = Run(
+        started_at=collected_at,
+        finished_at=collected_at,
+        status="ok",
+        run_quality=_eligible_quality(),
+        catalog_scope="full",
+        full_catalog_sites="pharmonline,aptekonline,aloe",
+        catalog_verified=True,
+    )
+    db_session.add(weekly_run)
+    db_session.flush()
     db_session.add(
         RoiActionsCache(
             tenant_id=1,
             client_site="pharmonline",
             payload=[{"type": "price_raise", "severity": "info", "title": "test"}],
-            computed_at=utcnow() - timedelta(hours=48),
-            run_id=eligible_run.id,
+            computed_at=collected_at,
+            run_id=weekly_run.id,
             policy_fingerprint=policy_fingerprint(),
             trust_epoch=_trusted_epoch(db_session),
         )
     )
     db_session.commit()
 
-    assert roi.get_cached_actions(db_session, "pharmonline") is None
-    # Но если повысить порог — возвращается
-    assert roi.get_cached_actions(db_session, "pharmonline", max_age_hours=72) is not None
+    assert roi.get_cached_actions(db_session, "pharmonline") is not None
 
 
 def test_roi_cache_rejected_after_newer_degraded_full_attempt(db_session):
@@ -856,6 +899,8 @@ def test_roi_cache_waits_until_every_site_has_verified_full_scan(db_session):
 
 
 def test_roi_cache_rejects_stale_verified_site_inputs(db_session):
+    # 31ч — сразу за суточным порогом (ритм 24ч + запас 6ч, см. src/cadence.py);
+    # 29ч — ещё в нём: порог входов рекомендаций следует карте ритма.
     run = Run(
         started_at=utcnow() - timedelta(hours=31),
         status="ok",
@@ -872,6 +917,12 @@ def test_roi_cache_rejects_stale_verified_site_inputs(db_session):
 
     with pytest.raises(ValueError, match="fresh verified"):
         roi.cache_actions(db_session, "pharmonline", [], run_id=run.id)
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is False
+
+    run.started_at = utcnow() - timedelta(hours=29)
+    run.finished_at = run.started_at
+    db_session.commit()
+    assert roi.financial_inputs_are_fresh(db_session, tenant_id=1) is True
 
 
 def test_latest_financial_snapshot_ignores_newer_partial_run(db_session):

@@ -4,10 +4,12 @@
 или встраивается в основной прогон.
 
 Что детектируется:
-1. **Stale**: последний успешный run был >max_age_hours назад
+1. **Stale**: последнего прогона нет дольше ритма самого частого сайта
 2. **Failed**: последний run завершился со status='failed'
 3. **Empty**: последний run ok но < min_products (полностью пустой)
 4. **Site-drop**: сайт покрыл <50% живого каталога за окно покрытия
+5. **Утреннее письмо**: суточное письмо клиенту не рассылалось, не принято
+   почтовым сервером или ушло без отчёта о ценах (`_check_daily_letter`)
 """
 
 from __future__ import annotations
@@ -21,8 +23,14 @@ import structlog
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
+from src import daily_letter_state
 from src._time import utcnow
-from src.storage import PriceSnapshot, Product, Run
+from src.cadence import (
+    SITE_SCRAPE_CADENCE_HOURS,
+    site_cadence_days,
+    site_max_age_hours,
+)
+from src.storage import PriceSnapshot, Product, Run, TenantUser
 
 log = structlog.get_logger()
 
@@ -63,7 +71,7 @@ class HealthAlertDecision:
 def check_health(
     session: Session,
     *,
-    max_age_hours: int = 26,  # с запасом за суточный cron + jitter
+    max_age_hours: int = 26,  # порог для сайта без объявленного ритма (суточный cron + jitter)
     min_products: int = 1,
     site_drop_threshold: float = 0.5,  # порог: доля живого каталога за окно покрытия
 ) -> HealthReport:
@@ -89,15 +97,19 @@ def check_health(
     report.last_run_at = last_run.started_at
     report.last_run_status = last_run.status
 
-    # 1. Stale check — относительно сейчас
+    # 1. Stale check — относительно сейчас. Порог — ритм самого частого сайта:
+    # при недельном сборе плановый запуск в остальные ночи выходит без прогона
+    # (гвард ритма в `run`), а частичные тики прогон дают не каждый день. С
+    # прежними 26ч исправный недельный график сам поднимал бы эту тревогу.
+    stale_after_hours = max(max_age_hours, min(_SITE_MAX_AGE_HOURS.values(), default=0))
     age = utcnow() - last_run.started_at
-    if age > timedelta(hours=max_age_hours):
+    if age > timedelta(hours=stale_after_hours):
         report.issues.append(
             HealthIssue(
                 "critical",
                 "stale_run",
                 f"Последний прогон был {age.total_seconds() / 3600:.1f}ч назад "
-                f"(порог {max_age_hours}ч). Проверьте cron.",
+                f"(порог {stale_after_hours}ч). Проверьте cron.",
                 context={"hours_ago": age.total_seconds() / 3600},
             )
         )
@@ -109,11 +121,39 @@ def check_health(
         storage.FULL_CATALOG_SITES,
         tenant_id=1,
     )
-    fresh_verified_catalogs = _fresh_verified_catalogs_by_site(
-        session,
-        storage,
-        max_age_hours=max_age_hours,
-    )
+    verified_catalogs = _latest_verified_catalogs_by_site(session, storage)
+    fresh_verified_catalogs = {
+        site: run
+        for site, run in verified_catalogs.items()
+        if _run_age_hours(run) <= _SITE_MAX_AGE_HOURS.get(site, max_age_hours)
+    }
+
+    # Сторож ритма. Гвард в `run` пропускает лишние ночи молча (exit 0, без
+    # прогона), а `site_silent` за этим не уследит: частичный тик освежает
+    # `last_seen_at` и без полного сбора. Поэтому возраст последнего
+    # ПОДТВЕРЖДЁННОГО каталога сверяем с ритмом сайта напрямую — и неважно, чем
+    # кончилась самая свежая попытка: неделя degraded-повторов оставляет данные
+    # такими же старыми, как неделя пропусков.
+    for site, run in verified_catalogs.items():
+        if site in fresh_verified_catalogs:
+            continue
+        overdue_after = _SITE_MAX_AGE_HOURS.get(site, max_age_hours)
+        age_hours = _run_age_hours(run)
+        report.issues.append(
+            HealthIssue(
+                "critical",
+                "full_catalog_overdue",
+                f"Подтверждённого полного сбора {site} нет {age_hours:.0f}ч "
+                f"(порог {overdue_after}ч): плановый сбор не сработал, не прошёл "
+                "проверку или ещё идёт.",
+                context={
+                    "site": site,
+                    "run_id": run.id,
+                    "hours_ago": age_hours,
+                    "threshold_hours": overdue_after,
+                },
+            )
+        )
 
     # 2. Failed/degraded check. A bounded/watchlist failure is never a
     # catalog epoch. Equally, a rejected full refresh must stay visible but
@@ -292,11 +332,15 @@ def check_health(
 
     # 8. Полный отказ сайта: последний прогон, включавший сайт, собрал РОВНО 0
     # товаров → немедленный сигнал (critical, если нет свежего подтверждённого
-    # каталога), не дожидаясь суточного порога site_silent. Раньше это терялось:
+    # каталога), не дожидаясь порога site_silent. Раньше это терялось:
     # smoke-test пропускал `current == 0`, а
     # `empty_run` смотрит только на последний прогон в принципе (его маскировал
     # intraday-прогон другого сайта).
     report.issues.extend(_check_site_zero_scrape(session, fresh_verified_catalogs))
+
+    # 9. Утреннее письмо клиенту: рассылалось ли, принял ли его почтовый сервер
+    # и был ли в нём отчёт о ценах. Команда письма сама никого не оповещает.
+    report.issues.extend(_check_daily_letter(session))
 
     # Совокупный статус
     if any(i.severity == "critical" for i in report.issues):
@@ -312,17 +356,13 @@ def _run_age_hours(run: Run) -> float:
     return max(0.0, (utcnow() - observed_at).total_seconds() / 3600)
 
 
-def _fresh_verified_catalogs_by_site(
-    session: Session,
-    storage_module,
-    *,
-    max_age_hours: int,
-) -> dict[str, Run]:
-    """Return site catalogs that are still safe to serve after a failed refresh.
+def _latest_verified_catalogs_by_site(session: Session, storage_module) -> dict[str, Run]:
+    """Return each site's latest verified catalog, however old it is.
 
     This is deliberately based on the financial eligibility lineage, not on
     product `last_seen_at`: a rejected run must never masquerade as a verified
     catalog merely because it reached the scraper before being discarded.
+    Callers decide what "still fresh" means for their purpose.
     """
     run_ids = storage_module.latest_financial_run_ids_by_site(
         session,
@@ -334,13 +374,7 @@ def _fresh_verified_catalogs_by_site(
     runs = {
         run.id: run for run in session.scalars(select(Run).where(Run.id.in_(set(run_ids.values()))))
     }
-    fresh: dict[str, Run] = {}
-    for site, run_id in run_ids.items():
-        run = runs.get(run_id)
-        threshold = _SITE_MAX_AGE_HOURS.get(site, max_age_hours)
-        if run is not None and _run_age_hours(run) <= threshold:
-            fresh[site] = run
-    return fresh
+    return {site: runs[run_id] for site, run_id in run_ids.items() if run_id in runs}
 
 
 def _run_has_fresh_verified_catalogs(run: Run, catalogs_by_site: dict[str, Run]) -> bool:
@@ -590,12 +624,12 @@ def alert_due(
     return elapsed < timedelta(0) or elapsed >= timedelta(hours=cooldown_hours)
 
 
+# Окно СВЕЖЕСТИ для знаменателя site_drop: живым считается каталог, виденный за
+# один цикл сбора + 2 дня запаса (суточный сайт → 3д, недельный → 9д). Раньше
+# тут стояла константа 3 для всех — у недельного сайта она обнуляла знаменатель
+# уже на четвёртый день, и проверка покрытия молча отключалась.
 _SITE_FRESHNESS_DAYS: dict[str, int] = {
-    # A current catalog must be no more than one missed daily run old.  The
-    # larger values used to hide a broken weekly production override for days.
-    "pharmonline": 3,
-    "aptekonline": 3,
-    "aloe": 3,
+    site: site_cadence_days(site) + 2 for site in SITE_SCRAPE_CADENCE_HOURS
 }
 _DEFAULT_FRESHNESS_DAYS = 3
 
@@ -605,13 +639,10 @@ _DEFAULT_FRESHNESS_DAYS = 3
 # (pharmonline run_277 = 127 товаров featured-выборки), тогда seen=127/каталог
 # дал бы ложный site_drop. Окно включает последний ПОЛНЫЙ прогон → одиночный
 # частичный прогон метрику не роняет. Должно быть < _SITE_FRESHNESS_DAYS.
+# Один цикл сбора + 1 день запаса (суточный → 2д, недельный → 8д) — окно всегда
+# захватывает последний ПОЛНЫЙ прогон и всегда уже окна свежести.
 _SITE_COVERAGE_DAYS: dict[str, int] = {
-    # A partial/watchlist tick must not make the latest full daily scan look
-    # like a coverage drop.  Two days include yesterday's verified full pass
-    # while detecting a missed cadence promptly.
-    "pharmonline": 2,
-    "aptekonline": 2,
-    "aloe": 2,
+    site: site_cadence_days(site) + 1 for site in SITE_SCRAPE_CADENCE_HOURS
 }
 _DEFAULT_COVERAGE_DAYS = 2
 
@@ -856,13 +887,11 @@ def _check_brand_coverage_drop(session: Session, run_id: int) -> list[HealthIssu
     return []
 
 
-# Per-site пороги «молчания» (часы). 30ч = ежедневный запуск + разумный запас
-# на jitter/retry.  Values live here rather than in an undocumented systemd
-# override so health fails closed when the promised daily cadence stops.
+# Per-site пороги «молчания» (часы) = ритм сбора + запас (src/cadence.py):
+# суточный сайт → 30ч, недельный → 174ч. Расписание описано в коде, а не только
+# в systemd-override, чтобы health падал закрыто, когда ритм прервался.
 _SITE_MAX_AGE_HOURS: dict[str, int] = {
-    "aptekonline": 30,
-    "pharmonline": 30,
-    "aloe": 30,
+    site: site_max_age_hours(site) for site in SITE_SCRAPE_CADENCE_HOURS
 }
 
 
@@ -970,6 +999,162 @@ def _check_site_zero_scrape(
                     )
         if seen == sites:
             break
+    return issues
+
+
+_DAILY_LETTER_JOURNAL = "journalctl -u pharmacy-monitor-digest-daily --since yesterday"
+# Почему отчёта о ценах в письме не было — словами (причины из `_price_report`).
+_DAILY_LETTER_NO_REPORT = {
+    "full_catalog_trust_not_ready": (
+        "финансовые сравнения приостановлены политикой — полный каталог не подтверждён "
+        "(страница сравнения в это время отвечает 503)"
+    ),
+    "no_successful_run": "успешного сбора ещё не было",
+    "no_comparison_rows": "в сравнении нет ни одной строки",
+}
+
+
+def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthIssue]:
+    """Сторож утреннего письма с разницей цен: ушло ли оно последний раз и каким.
+
+    Письмо клиент ждёт каждое утро, а его команда о своём сбое никого не
+    оповещает. Каждая настоящая рассылка оставляет запись
+    (`daily_letter_state`), и здесь она сверяется:
+
+    - последняя рассылка старше `daily_letter_state.MAX_AGE_HOURS` — письмо не
+      рассылалось: таймер не сработал или команда упала раньше рассылки;
+    - отчёт о ценах в последней рассылке не собрался — письмо ушло без чисел и
+      без файла либо не ушло вовсе (если и событий за сутки не было);
+    - отчёта не было по известной причине (сравнения приостановлены политикой,
+      сравнивать нечего): само по себе не сбой, но клиент ждёт именно отчёт, а
+      такое утро может повторяться днями;
+    - письмо слали, но почтовый сервер не принял его ни у одного получателя —
+      или принял не у всех: админ свою копию получил, а клиент нет.
+
+    Давно не рассылалось — одна проблема, прошлый исход уже не новость. Иначе
+    их бывает две: что с отчётом и что с доставкой.
+
+    Проверки нет, пока нет подписчиков на суточный дайджест или записи о
+    рассылке: сторож начинает работать с первой настоящей рассылки, и включение
+    подписки не поднимает тревогу до первого утра. Чего он не видит — письма,
+    которое сервер принял и не доставил.
+    """
+    subscribers = (
+        session.scalar(
+            select(func.count())
+            .select_from(TenantUser)
+            .where(
+                TenantUser.tenant_id == tenant_id,
+                TenantUser.is_active.is_(True),
+                TenantUser.daily_digest.is_(True),
+            )
+        )
+        or 0
+    )
+    if not subscribers:
+        return []
+    try:
+        mailing = daily_letter_state.last_mailing(tenant_id)
+    except daily_letter_state.StateUnreadable as failure:
+        return [
+            HealthIssue(
+                "warning",
+                "daily_letter_state_unreadable",
+                f"Файл состояния утреннего письма ({daily_letter_state.state_file()}) не "
+                f"читается ({failure}): сторож письма не работает. Удалить файл — сторож "
+                "начнёт заново со следующей рассылки.",
+            )
+        ]
+    if mailing is None:
+        return []
+
+    when = f"{mailing.at:%d.%m %H:%M} UTC"
+    age_hours = (utcnow() - mailing.at).total_seconds() / 3600
+    context = {
+        "hours_ago": round(age_hours, 1),
+        "recipients": mailing.recipients,
+        "accepted": mailing.accepted,
+        "report": mailing.report,
+    }
+    if age_hours > daily_letter_state.MAX_AGE_HOURS:
+        return [
+            HealthIssue(
+                "critical",
+                "daily_letter_overdue",
+                f"Утреннее письмо с разницей цен не рассылалось {age_hours:.0f}ч (порог "
+                f"{daily_letter_state.MAX_AGE_HOURS}ч; последняя рассылка — {when}), а "
+                f"подписчиков на него {subscribers}. Таймер не сработал, команда упала до "
+                "рассылки или не записала её исход: systemctl status "
+                f"pharmacy-monitor-digest-daily.timer; {_DAILY_LETTER_JOURNAL}.",
+                context=context,
+            )
+        ]
+    issues: list[HealthIssue] = []
+    error_type = mailing.failed_report
+    skipped = mailing.skipped_report
+    if error_type is not None:
+        if mailing.accepted:
+            outcome = (
+                f"ушло без отчёта о разнице цен и без файла ({mailing.accepted} из "
+                f"{mailing.recipients} получателей)"
+            )
+        elif mailing.recipients:
+            outcome = "осталось без отчёта о разнице цен, и почтовый сервер его не принял"
+        else:
+            outcome = "не отправлено: отчёта о разнице цен нет, а событий за сутки не было"
+        issues.append(
+            HealthIssue(
+                "warning" if mailing.accepted else "critical",
+                "daily_letter_report_failed",
+                f"Утреннее письмо {when} {outcome}. Сборка отчёта упала ({error_type}); "
+                f"трассировка — событие digest_price_report_failed: {_DAILY_LETTER_JOURNAL}.",
+                context=context,
+            )
+        )
+    elif skipped is not None and mailing.report != daily_letter_state.REPORT_NO_RECIPIENTS:
+        outcome = (
+            "письмо ушло без чисел и без файла"
+            if mailing.recipients
+            else "письма не было вовсе — событий за сутки тоже нет"
+        )
+        issues.append(
+            HealthIssue(
+                "warning",
+                "daily_letter_report_skipped",
+                f"В утреннем письме {when} нет отчёта о разнице цен: "
+                f"{_DAILY_LETTER_NO_REPORT.get(skipped, skipped)}; {outcome}. Пока причина "
+                "не снята, так будет каждое утро. В журнале — событие "
+                f"digest_price_report_skipped: {_DAILY_LETTER_JOURNAL}.",
+                # Причина — в подписи инцидента: сменилась — это новый инцидент.
+                context={**context, "status": skipped},
+            )
+        )
+    if mailing.recipients and not mailing.accepted:
+        # У сломанного отчёта об этом уже сказано в его же строке.
+        if error_type is None:
+            issues.append(
+                HealthIssue(
+                    "critical",
+                    "daily_letter_not_delivered",
+                    f"Утреннее письмо с разницей цен {when} почтовый сервер не принял ни у "
+                    f"одного из {mailing.recipients} получателей. Причина — "
+                    f"digest_email_failed или email_skipped_no_smtp: {_DAILY_LETTER_JOURNAL}.",
+                    context=context,
+                )
+            )
+    elif mailing.accepted < mailing.recipients:
+        issues.append(
+            HealthIssue(
+                "warning",
+                "daily_letter_partly_delivered",
+                f"Утреннее письмо с разницей цен {when} почтовый сервер не принял у "
+                f"{mailing.recipients - mailing.accepted} из {mailing.recipients} получателей. "
+                "Кому не ушло — user_id в событиях digest_email_failed: "
+                f"{_DAILY_LETTER_JOURNAL}; кто это — запрос по tenant_users в RUNBOOK "
+                "«Email не приходит».",
+                context=context,
+            )
+        )
     return issues
 
 

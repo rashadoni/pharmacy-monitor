@@ -5,10 +5,16 @@ name: Autonomous Pharmonline Decodo catalog refresh
 # production host: a scheduled job must never depend on a manually staged
 # recovery directory, nor silently fall back to the legacy DDP scraper.
 
+# Расписания у workflow нет с 2026-10-13 — только ручной запуск. Понедельничный
+# cron (`20 03 * * 1`) появился, когда каталог собирался раз в неделю и этот
+# путь был для pharmonline единственным живым. С 2026-10-04 pharmonline собирает
+# ночной systemd-таймер (транспорт `direct`), а с переходом на ежедневный сбор
+# дубль перестал быть страховкой и остался риском: он идёт мимо гварда ритма
+# (`--mode public_api`), исполняет голову `main`, а не выложенный код, и его
+# упавшая попытка после удачного ночного сбора отнимала бы у каталога
+# pharmonline доверие до следующей ночи. Страховка теперь — второй ночной
+# будильник и следующая ночь (infra/systemd/pharmacy-monitor-scrape@.timer).
 on:
-  schedule:
-    # Staggered well away from the legacy systemd timer.  GitHub Actions uses UTC.
-    - cron: "20 03 * * *"
   workflow_dispatch:
 
 permissions:
@@ -61,11 +67,11 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' \
-            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDiyv64pOCygWfx5xW3BwnwXJeHsUr/dMcTNNi+mLLPg' \
+            '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDVrem8NrMZMjV9cDiB8/8wOwOn1wrfSU7S5vfaLHM+R' \
             > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
           test "$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')" = \
-            'SHA256:K84ezzdCeEVG96tL85e55p87BUjZzV1qnK1Tqfrnfhc'
+            'SHA256:Hx7TYOZC2diIb6ZwI9LRv4bybasYCijb+lKnQQmGk/I'
 
       - name: Verify the legacy timer is safely redirected to public API
         run: |
@@ -230,14 +236,32 @@ jobs:
             esac
           done < /etc/pharmacy-monitor/env
 
-          current=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
+          # This job runs the code of its own checkout against the production
+          # DB, so it refuses unless the DB is exactly at this commit's single
+          # migration head.  A migration merged into main but not yet deployed
+          # stops the weekly refresh right here; say where the DB is, where the
+          # commit is and what to do, as the reconciliation workflow does.  A
+          # bare failed `test` left a red step with no reason in its log, and
+          # let a commit with two migration heads through whenever `current`
+          # and `heads` happened to list them in the same order.
+          if ! current=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python -m alembic \
-              -c "$runtime_dir/alembic.ini" current | awk 'NF {print $1}')
+              -c "$runtime_dir/alembic.ini" current | awk 'NF {print $1}'); then
+            echo "refusing weekly refresh: the production DB revision cannot be read with this commit's migrations (the DB is ahead of this commit, or unreachable: see the alembic error above); if the DB is ahead, merge the deployed migration into main or dispatch this workflow from the deployed commit" >&2
+            exit 1
+          fi
           head=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python -m alembic \
               -c "$runtime_dir/alembic.ini" heads | awk 'NF {print $1}')
-          test -n "$current"
-          test "$current" = "$head"
+          if [ "$(printf '%s\n' "$head" | sed '/^$/d' | wc -l)" -ne 1 ]; then
+            echo "refusing weekly refresh: this commit must have exactly one migration head, found: ${head:-none}" >&2
+            exit 1
+          fi
+          if [ "$current" != "$head" ]; then
+            echo "refusing weekly refresh: production DB is at migration ${current:-none}, this commit's migrations end at $head; deploy this commit with deploy.yml (apply_migrations=true), then dispatch this workflow again; it does not migrate" >&2
+            exit 1
+          fi
+          echo "production DB is at this commit's migration head: $current"
 
           before_run_id=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_dir" \
             /opt/pharmacy-monitor/.venv/bin/python - <<'PY'
@@ -263,8 +287,7 @@ jobs:
           succeeded=0
           echo 'autonomous verified catalog attempt (internally bounded to three fresh snapshots)'
           if PHARMONLINE_PUBLIC_API=required \
-            PHARMONLINE_PUBLIC_API_TRANSPORT=decodo \
-            PHARMONLINE_DECODO_BACKCONNECT_STICKY=1 \
+            PHARMONLINE_PUBLIC_API_TRANSPORT=direct \
             PHARMONLINE_PUBLIC_API_CATALOG_ATTEMPTS=3 \
             PHARMONLINE_PUBLIC_API_CATALOG_RETRY_DELAY_SECONDS=60 \
             PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE=required \

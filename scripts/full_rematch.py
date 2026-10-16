@@ -6,10 +6,12 @@ re-normalizes names, re-clusters via match_products (respects ALL match_rejectio
 + current guards incl. strict commodity brand/country/grade), then revalidate_split
 to apply the conflict guards that primary passes don't. Manual matches untouched.
 
-Heavy + destructive — snapshot the DB first. Run on prod (DATABASE_URL peer). The
-CLI `pharmacy-monitor rematch --reset` can't run as postgres (dotenv perm), hence
-this peer-auth script. Same logic, tested code paths (matcher.match_products /
-revalidate_split).
+Heavy + destructive. NOT for production: it deletes every automatic pair, so
+all pair ids change and a from-scratch build does not reproduce the current
+pairs (measured 2026-10-07, see docs/RUNBOOK.md «Выкладка правок сопоставления»).
+It takes neither the run lock nor the matcher lock. Use it on a copy of the
+database only; like `pharmacy-monitor rematch --reset` it refuses to run
+without the explicit `--i-accept-full-rebuild` argument.
 """
 
 from __future__ import annotations
@@ -27,7 +29,17 @@ from src import matcher, storage  # noqa: E402
 from src.normalize import normalize_name  # noqa: E402
 
 
+CONFIRM_FLAG = "--i-accept-full-rebuild"
+
+
 def main() -> int:
+    if CONFIRM_FLAG not in sys.argv[1:]:
+        print(
+            f"ERROR: this deletes every automatic pair; not for production. "
+            f"On a database copy pass {CONFIRM_FLAG}.",
+            file=sys.stderr,
+        )
+        return 2
     db = os.environ.get("DATABASE_URL")
     if not db:
         print("ERROR: set DATABASE_URL", file=sys.stderr)

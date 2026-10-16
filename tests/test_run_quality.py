@@ -85,6 +85,60 @@ def test_classify_run_quality_matrix(
     assert quality["financially_eligible"] is (expected_status == "ok" and enforce_baseline)
 
 
+def test_fetch_retries_are_recorded_without_degrading_the_run():
+    """Погашенный повтором сбой прогон не портит, но в run_quality остаётся."""
+    result = _result("aloe", 20)
+    result.fetch_retries = 3
+
+    status, quality = classify_run_quality(
+        [result, _result("aptekonline", 20)],
+        ["aloe", "aptekonline"],
+        mode="category",
+        baselines={"aloe": 20, "aptekonline": 20},
+        enforce_baseline=True,
+    )
+
+    assert status == "ok"
+    assert quality["full_catalog_verified"] is True
+    assert quality["sites"]["aloe"]["fetch_retries"] == 3
+    # Скрейпер, который повторы не считает, нуля не получает: ноль читался бы
+    # как «сбоев не было».
+    assert "fetch_retries" not in quality["sites"]["aptekonline"]
+
+
+@pytest.mark.asyncio
+async def test_scrape_site_carries_aloe_fetch_retries_into_the_result(monkeypatch):
+    """Счётчик живёт на скрейпере; без переноса в результат он молча равен нулю."""
+
+    class _RetryingAloe:
+        def __init__(self, country_id_map=None):
+            self.verified_country_mappings = {}
+            self.fetch_retries = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def scrape(self, slugs, **kwargs):
+            self.fetch_retries = 2
+            return ScrapeResult(
+                site="aloe",
+                products=[_product("aloe", "one")],
+                items_expected=1,
+                items_completed=1,
+            )
+
+    monkeypatch.setitem(main_mod.SCRAPER_CLASSES, "aloe", _RetryingAloe)
+
+    result = await main_mod.scrape_site("aloe", ["dermanlar"], None)
+
+    assert result.fetch_retries == 2
+    _status, quality = classify_run_quality([result], ["aloe"], mode="category")
+    assert quality["sites"]["aloe"]["fetch_retries"] == 2
+
+
 def test_intentional_partial_run_is_ok_but_not_financially_eligible():
     status, quality = classify_run_quality(
         [_result("aloe", 2, expected=1, completed=1)],
@@ -180,6 +234,9 @@ def test_autonomous_marker_replaces_legacy_ddp_for_its_process(monkeypatch):
     monkeypatch.setenv("PHARMONLINE_USE_DDP", "1")
     monkeypatch.setenv("AI_FALLBACK_ENABLED", "true")
     monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "1")
+    # Транспорт больше не прошит в функции — его выбирает оператор, поэтому
+    # decodo-случай обязан задать его явно.
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "decodo")
 
     main_mod._enable_pharmonline_public_api_autonomous_mode()
 
@@ -190,6 +247,80 @@ def test_autonomous_marker_replaces_legacy_ddp_for_its_process(monkeypatch):
     assert main_mod.os.environ["PHARMONLINE_USE_DDP"] == "0"
     assert main_mod.os.environ["AI_FALLBACK_ENABLED"] == "0"
     assert main_mod.os.environ["SCRAPE_REPORT_EMAIL"] == "0"
+
+
+# ── выбор транспорта в автономном режиме ────────────────────────────────────
+# Раньше функция прошивала "decodo" поверх EnvironmentFile. Оператор выставил
+# на проде direct, значение молча потерялось, прогон ушёл в decodo-ветку и упал
+# на "Decodo is not configured for Pharmonline". Эти три теста держат новый
+# контракт: значение оператора доезжает, decodo-флаг не остаётся взведённым, а
+# пустое или незнакомое значение останавливает прогон вместо тихого ухода в
+# платный crawlbase (дефолт самого скрейпера).
+
+
+def _blank_autonomous_env(monkeypatch):
+    for name in (
+        "PHARMONLINE_PUBLIC_API",
+        "PHARMONLINE_PUBLIC_API_TRANSPORT",
+        "PHARMONLINE_DECODO_BACKCONNECT_STICKY",
+        "PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE",
+    ):
+        monkeypatch.setenv(name, "")
+    monkeypatch.setenv("PHARMONLINE_USE_DDP", "1")
+    monkeypatch.setenv("AI_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("SCRAPE_REPORT_EMAIL", "1")
+
+
+def test_autonomous_mode_keeps_the_operator_direct_transport(monkeypatch):
+    _blank_autonomous_env(monkeypatch)
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "direct")
+
+    main_mod._enable_pharmonline_public_api_autonomous_mode()
+
+    assert main_mod.os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] == "direct"
+    # Взведённый флаг вернул бы прогон в decodo-ветку к проверке DECODO_SITES.
+    assert main_mod.os.environ["PHARMONLINE_DECODO_BACKCONNECT_STICKY"] == ""
+    # Остальные предохранители режима обязаны устоять и при direct.
+    assert main_mod._pharmonline_public_api_enabled()
+    assert main_mod.os.environ["PHARMONLINE_PUBLIC_API_REQUIRE_CATALOG_BASELINE"] == "required"
+    assert main_mod.os.environ["PHARMONLINE_USE_DDP"] == "0"
+    assert main_mod.os.environ["AI_FALLBACK_ENABLED"] == "0"
+    assert main_mod.os.environ["SCRAPE_REPORT_EMAIL"] == "0"
+
+
+@pytest.mark.parametrize("value", ["", "   ", "crawlbase", "scraperapi", "firecrawl", "dircet"])
+def test_autonomous_mode_refuses_an_unlisted_transport(monkeypatch, value):
+    _blank_autonomous_env(monkeypatch)
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", value)
+
+    with pytest.raises(ClickException):
+        main_mod._enable_pharmonline_public_api_autonomous_mode()
+
+
+def test_autonomous_mode_accepts_padded_and_uppercased_transport(monkeypatch):
+    _blank_autonomous_env(monkeypatch)
+    monkeypatch.setenv("PHARMONLINE_PUBLIC_API_TRANSPORT", "  DIRECT ")
+
+    main_mod._enable_pharmonline_public_api_autonomous_mode()
+
+    assert main_mod.os.environ["PHARMONLINE_PUBLIC_API_TRANSPORT"] == "direct"
+
+
+def test_provenance_guards_still_reject_a_direct_ledger_row():
+    """Разрешив direct скрейпить, мы не разрешали ему писать в реестры ручной сверки.
+
+    Перекодировка, смена адреса, разведение и нижняя граница каталога остаются
+    за ручной сверкой и её транспортами. С 2026-10-08 плановый сбор сам пишет
+    допуск двух простых классов — отдельной версией доказательства, не этой
+    (tests/test_pharmonline_scheduled_admission.py).
+    """
+    with pytest.raises(Exception):
+        main_mod._require_pharmonline_public_api_reconciliation_proof(
+            source_manifest_sha256="0" * 64,
+            catalog_fingerprint_sha256="0" * 64,
+            source_transport="direct",
+            preflight_run_ref="1",
+        )
 
 
 def test_single_category_run_only_requests_sites_with_configured_route():
@@ -745,12 +876,13 @@ def test_ai_crawl_fatal_creates_failed_run_with_sanitized_quality(db_session, mo
     Session = sessionmaker(db_session.get_bind(), expire_on_commit=False)
     monkeypatch.setattr(storage, "init_db", lambda *args, **kwargs: None)
     monkeypatch.setattr(storage, "make_session", lambda *args, **kwargs: Session)
-    monkeypatch.setitem(ai_crawler.AI_CRAWLER_BY_SITE, "aloe", _FatalAICrawler)
+    # Сайт здесь — пример; по aloe команда без --dry-run отказывает сама.
+    monkeypatch.setitem(ai_crawler.AI_CRAWLER_BY_SITE, "aptekonline", _FatalAICrawler)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     result = CliRunner().invoke(
         main_mod.cli,
-        ["ai-crawl", "--site", "aloe", "--max-urls", "3"],
+        ["ai-crawl", "--site", "aptekonline", "--max-urls", "3"],
     )
 
     run = db_session.query(storage.Run).one()
@@ -759,6 +891,6 @@ def test_ai_crawl_fatal_creates_failed_run_with_sanitized_quality(db_session, mo
     assert run.status == "failed"
     assert run.finished_at is not None
     assert run.run_quality["financially_eligible"] is False
-    assert run.run_quality["sites"]["aloe"]["site_fatal"] is True
+    assert run.run_quality["sites"]["aptekonline"]["site_fatal"] is True
     assert "top-secret" not in payload
     assert "az.decodo.com" not in payload

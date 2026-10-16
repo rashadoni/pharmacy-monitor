@@ -203,6 +203,27 @@ def test_categories_for_site_orders_aloe_broad_before_precise(db_session):
     ]
 
 
+def test_categories_for_site_orders_aloe_sections_before_their_subsections(db_session):
+    """Разделы верхнего уровня aloe идут раньше точных подразделов.
+
+    `tibbi-vasitələr` — подраздел `dermanlar`; товар, попавший и в него, и в
+    раздел верхнего уровня, должен остаться с точной категорией, то есть точный
+    маршрут обязан пройти последним — в каком бы порядке ни заводили строки.
+    """
+    wl.add_category(db_session, key="precise", label_ru="P", aloe_slug="tibbi-vasitələr")
+    for slug in ("dermanlar", "bad", "usaq-dunyasi", "kosmetika", "gigiyena"):
+        wl.add_category(db_session, key=f"aloe_{slug}", label_ru=slug, aloe_slug=slug)
+
+    assert wl.categories_for_site(db_session, "aloe") == [
+        "dermanlar",
+        "bad",
+        "usaq-dunyasi",
+        "kosmetika",
+        "gigiyena",
+        "tibbi-vasitələr",
+    ]
+
+
 def test_update_category_modifies_fields(db_session):
     c = wl.add_category(db_session, key="x", label_ru="X")
     updated = wl.update_category(db_session, c.id, label_ru="X-NEW", pharmonline_slug="ph-x")
