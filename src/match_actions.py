@@ -212,6 +212,8 @@ def find_alternatives(
 
     Возвращает список (Product, score) где score 0..100 от rapidfuzz.token_set_ratio.
     """
+    from src.product_policy import identity_not_retired_sql
+
     m = session.get(Match, match_id)
     if not m:
         return []
@@ -221,6 +223,7 @@ def find_alternatives(
             Product.site == site,
             Product.canonical_id.is_(None),
             Product.offer_availability_status != "out_of_stock",
+            identity_not_retired_sql(Product),
         )
     ).all()
     if not candidates:

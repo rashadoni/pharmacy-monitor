@@ -11,6 +11,12 @@ on:
         required: true
         default: ""
 
+      retire_conflicting_identities:
+        description: "Separate previously admitted identities while retaining their history"
+        type: boolean
+        required: true
+        default: false
+
 permissions:
   actions: read
   contents: read
@@ -101,6 +107,8 @@ jobs:
           REMOTE
 
       - name: Stage exact source and calculate the read-only reconciliation plan
+        env:
+          RETIRE_IDENTITIES: ${{ inputs.retire_conflicting_identities }}
         run: |
           set -euo pipefail
           source_manifest=$(mktemp)
@@ -157,10 +165,13 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=120 \
             pm@13.140.186.143 \
-            "bash -s -- '$remote_work_dir' '$source_manifest_sha'" <<'REMOTE'
+            "bash -s -- '$remote_work_dir' '$source_manifest_sha' '$RETIRE_IDENTITIES'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
           source_manifest_sha=$2
+          case "$3" in true|false) ;; *) exit 1 ;; esac
+          retirement_args=()
+          if [ "$3" = true ]; then retirement_args=(--retire-conflicting-identities); fi
           case "$work_dir" in
             /opt/pharmacy-monitor/.codex-decodo-reconciliation-plan.*) ;;
             *)
@@ -222,7 +233,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 \
           PYTHONPATH="$runtime_dir" \
           /opt/pharmacy-monitor/.venv/bin/python \
-            "$runtime_dir/scripts/reconcile_pharmonline_public_api_identities.py"
+            "$runtime_dir/scripts/reconcile_pharmonline_public_api_identities.py" "${retirement_args[@]}"
           REMOTE
 
           scp -i ~/.ssh/id_ed25519 \
@@ -241,6 +252,7 @@ jobs:
           data = json.loads(path.read_text())
           required = {
               "version",
+              "allow_identity_retirement",
               "transport",
               "product_count",
               "catalog_fingerprint_sha256",
@@ -249,7 +261,9 @@ jobs:
           }
           if set(data) != required:
               raise SystemExit("unexpected reconciliation plan evidence shape")
-          if data["version"] != 3 or data["transport"] != "decodo":
+          if type(data["allow_identity_retirement"]) is not bool or data["allow_identity_retirement"] != (os.environ["RETIRE_IDENTITIES"] == "true"):
+              raise SystemExit("identity retirement selection differs from requested plan")
+          if data["version"] != 4 or data["transport"] != "decodo":
               raise SystemExit("reconciliation plan evidence transport/version is invalid")
           if not isinstance(data["product_count"], int) or data["product_count"] < 9000:
               raise SystemExit("reconciliation plan evidence product count is invalid")

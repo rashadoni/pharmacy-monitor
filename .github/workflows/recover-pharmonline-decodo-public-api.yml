@@ -22,6 +22,12 @@ on:
         required: true
         default: ""
 
+      retire_conflicting_identities:
+        description: "Separate previously admitted identities while retaining their history"
+        type: boolean
+        required: true
+        default: false
+
 permissions:
   actions: read
   contents: read
@@ -39,6 +45,7 @@ jobs:
         env:
           CONFIRMATION: ${{ inputs.confirmation }}
           PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+          RETIRE_IDENTITIES: ${{ inputs.retire_conflicting_identities }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -75,6 +82,7 @@ jobs:
       - name: Download and verify the exact plan manifest
         env:
           PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+          RETIRE_IDENTITIES: ${{ inputs.retire_conflicting_identities }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -101,14 +109,17 @@ jobs:
           data = json.loads(Path(os.environ["PLAN_EVIDENCE_FILE"]).read_text())
           required = {
               "version",
+              "allow_identity_retirement",
               "transport",
               "product_count",
               "catalog_fingerprint_sha256",
               "candidate_manifest_sha256",
               "metrics",
           }
-          if set(data) != required or data["version"] != 3 or data["transport"] != "decodo":
+          if set(data) != required or data["version"] != 4 or data["transport"] != "decodo":
               raise SystemExit("approved reconciliation plan evidence is invalid")
+          if type(data["allow_identity_retirement"]) is not bool or data["allow_identity_retirement"] != (os.environ["RETIRE_IDENTITIES"] == "true"):
+              raise SystemExit("identity retirement selection differs from approved plan")
           if not isinstance(data["product_count"], int) or data["product_count"] < 9000:
               raise SystemExit("approved reconciliation plan product count is invalid")
           for key in ("catalog_fingerprint_sha256", "candidate_manifest_sha256"):
@@ -131,6 +142,7 @@ jobs:
                   f"{data['candidate_manifest_sha256']}\n"
               )
               output.write(f"PLAN_PRODUCT_COUNT={data['product_count']}\n")
+              output.write(f"PLAN_RETIRE_IDENTITIES={str(data['allow_identity_retirement']).lower()}\n")
           print(
               "exact aggregate reconciliation plan evidence verified: "
               f"products={data['product_count']}"
@@ -277,7 +289,7 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=120 \
             pm@13.140.186.143 \
-            "bash -s -- '$remote_work_dir' '$source_manifest_sha' '$PLAN_RUN_ID' '$PLAN_CATALOG_FINGERPRINT_SHA256' '$PLAN_CANDIDATE_MANIFEST_SHA256' '$PLAN_PRODUCT_COUNT'" <<'REMOTE'
+            "bash -s -- '$remote_work_dir' '$source_manifest_sha' '$PLAN_RUN_ID' '$PLAN_CATALOG_FINGERPRINT_SHA256' '$PLAN_CANDIDATE_MANIFEST_SHA256' '$PLAN_PRODUCT_COUNT' '$PLAN_RETIRE_IDENTITIES'" <<'REMOTE'
           set -euo pipefail
           work_dir=$1
           source_manifest_sha=$2
@@ -285,6 +297,9 @@ jobs:
           expected_plan_fingerprint=$4
           expected_plan_manifest=$5
           expected_plan_product_count=$6
+          case "$7" in true|false) ;; *) exit 1 ;; esac
+          retirement_args=()
+          if [ "$7" = true ]; then retirement_args=(--retire-conflicting-identities); fi
           case "$work_dir" in
             /opt/pharmacy-monitor/.codex-decodo-reconciliation-apply.*) ;;
             *)
@@ -470,7 +485,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 \
           PYTHONPATH="$runtime_dir" \
           /opt/pharmacy-monitor/.venv/bin/python \
-            "$runtime_dir/scripts/reconcile_pharmonline_public_api_identities.py" --apply
+            "$runtime_dir/scripts/reconcile_pharmonline_public_api_identities.py" --apply "${retirement_args[@]}"
 
           # The guarded apply intentionally reads the full public catalog twice
           # before it writes.  Give the first-party API a complete cooling

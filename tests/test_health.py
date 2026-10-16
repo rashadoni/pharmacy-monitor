@@ -2,6 +2,8 @@
 
 from datetime import timedelta
 
+import pytest
+
 from src import storage
 from src._time import utcnow
 from src.health import alert_signature, check_health
@@ -205,6 +207,118 @@ def test_later_partial_ok_does_not_clear_unverified_full_catalog(db_session):
     assert report.status == "warning"
     issue = next(i for i in report.issues if i.code == "full_catalog_unverified")
     assert issue.context["sites"]["pharmonline"]["run_id"] == full.id
+
+
+@pytest.mark.parametrize(
+    "reason_source", ["error", "full_quality_reason", "catalog_reason", "quality_reason", "missing"]
+)
+def test_failed_identity_proof_remains_explained_after_partial_success(db_session, reason_source):
+    """A complete scrape rejected before persistence must not be advertised as ok."""
+    now = utcnow()
+    verified = _add_run(db_session, now - timedelta(hours=55))
+    verified.run_quality = {
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {site: {"status": "ok"} for site in storage.FULL_CATALOG_SITES},
+    }
+    failed = _add_run(db_session, now - timedelta(hours=2), status="failed")
+    failed.catalog_scope = "full"
+    failed.full_catalog_sites = "pharmonline"
+    failed.catalog_verified = False
+    failed.run_quality = {
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {"pharmonline": {"status": "ok"}},
+    }
+    reason = "PharmonlinePublicAPIIdentityError: native_id_url_rebind_unproven=1"
+    if reason_source == "error":
+        failed.error_message = reason
+        failed.catalog_verification_reason = "shortened diagnostic"
+        failed.run_quality = {
+            **failed.run_quality,
+            "catalog_verification_reason_full": "alternative quality diagnostic",
+        }
+    elif reason_source == "full_quality_reason":
+        failed.catalog_verification_reason = "shortened diagnostic"
+        failed.run_quality = {**failed.run_quality, "catalog_verification_reason_full": reason}
+    elif reason_source == "catalog_reason":
+        failed.catalog_verification_reason = reason
+    elif reason_source == "quality_reason":
+        failed.run_quality = {**failed.run_quality, "catalog_verification_reason": reason}
+
+    partial = _add_run(db_session, now - timedelta(minutes=30))
+    partial.catalog_scope = "partial"
+    partial.full_catalog_sites = None
+    partial.catalog_verified = False
+    db_session.commit()
+
+    report = check_health(db_session)
+    assert report.last_run_id == partial.id
+    assert report.last_run_status == "ok"
+    assert not any(issue.code == "last_run_failed" for issue in report.issues)
+    issue = next(issue for issue in report.issues if issue.code == "full_catalog_unverified")
+    assert issue.severity == "critical"
+    assert f"pharmonline=#{failed.id}:failed" in issue.message
+    assert f"pharmonline=#{failed.id}:ok" not in issue.message
+    assert "сбор: ok" in issue.message
+    site_context = issue.context["sites"]["pharmonline"]
+    assert site_context["status"] == "failed"
+    assert site_context["site_status"] == "ok"
+    assert site_context["error_message"] == failed.error_message
+    assert site_context["catalog_verification_reason_full"] == failed.run_quality.get(
+        "catalog_verification_reason_full"
+    )
+    assert site_context["catalog_verification_reason"] == (
+        failed.catalog_verification_reason or failed.run_quality.get("catalog_verification_reason")
+    )
+    if reason_source != "missing":
+        assert reason in issue.message
+        assert "shortened diagnostic" not in issue.message
+        assert "alternative quality diagnostic" not in issue.message
+    else:
+        assert "None" not in issue.message
+
+    # Only an actually verified full catalog clears the failed full attempt.
+    recovered = _add_run(db_session, now)
+    recovered.full_catalog_sites = "pharmonline"
+    recovered.run_quality = {
+        "full_catalog_verified": True,
+        "financially_eligible": True,
+        "sites": {"pharmonline": {"status": "ok"}},
+    }
+    db_session.commit()
+    recovered_report = check_health(db_session)
+    assert not any(issue.code == "full_catalog_unverified" for issue in recovered_report.issues)
+
+
+def test_unverified_summary_preserves_failed_site_when_full_run_status_is_ok(db_session):
+    now = utcnow()
+    full = _add_run(db_session, now - timedelta(hours=2))
+    full.catalog_verified = False
+    full.run_quality = {
+        "full_catalog_verified": False,
+        "financially_eligible": False,
+        "sites": {
+            "pharmonline": {"status": "ok"},
+            "aptekonline": {"status": "failed"},
+            "aloe": {"status": "ok"},
+        },
+    }
+    partial = _add_run(db_session, now - timedelta(minutes=30))
+    partial.catalog_scope = "partial"
+    partial.full_catalog_sites = None
+    partial.catalog_verified = False
+    db_session.commit()
+
+    report = check_health(db_session)
+
+    issue = next(issue for issue in report.issues if issue.code == "full_catalog_unverified")
+    assert issue.severity == "critical"
+    assert f"aptekonline=#{full.id}:ok (сбор: failed)" in issue.message
+    assert f"pharmonline=#{full.id}:ok" in issue.message
+    assert f"pharmonline=#{full.id}:ok (сбор:" not in issue.message
+    assert issue.context["sites"]["aptekonline"]["status"] == "ok"
+    assert issue.context["sites"]["aptekonline"]["site_status"] == "failed"
 
 
 def test_single_site_success_does_not_mask_other_degraded_full_sites(db_session):
