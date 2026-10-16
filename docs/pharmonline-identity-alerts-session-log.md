@@ -238,3 +238,9 @@
 - Last completed action: reconciled live historical ledgers/run errors, mail and current code; independent review confirmed the prevention gap and acceptance criteria.
 - Precise stopping point: before implementation of per-record conflict isolation/trust and before applying the manual recovery plan; no production changes in this investigation phase.
 - Next action: prepare a focused implementation/PR for conflict isolation and trustworthy propagation of unaffected prices, preserving the existing immutable history and live-source completeness protections. Do not claim durable resolution until the acceptance gates and scheduled-run observation pass.
+
+## 2026-10-16 — Durable conflict-isolation implementation authorized
+
+- User replied “начинай” to the proposed correction that individual identity conflicts must no longer stop the entire Pharmonline catalog. Implement and verify that persistent behavior; preserve history and refuse incomplete/global/cross-tenant/mass-drift cases. This does not authorize applying the pending old recovery plan or deploying unreviewed new behavior.
+- Resume exact saved worktree/branch on Contabo. Active repository main `bf35e70c9e0319d567ae107f30323e05ed031a88` fetched through the explicit current owner URL and merged into the task branch, preserving all append-only journal checkpoints. Shared stale origin/SSH alias remain untouched. Production route remains user-confirmed `13.140.186.143:/opt/pharmacy-monitor`, normal manual GitHub Actions deployment.
+- Root is implementing ingestion/schema/trust integration; independent agent maps downstream trust consumers before a shared contract is finalized. Local resources checked: ~15.5 GiB RAM available, 225 GiB disk available, memory pressure zero. Only small sequential targeted checks on Contabo; full PostgreSQL/CI/frontend build gates belong to GitHub CI.
