@@ -13,7 +13,7 @@ import pytest
 import pandas as pd
 from fastapi import HTTPException
 from openpyxl import load_workbook
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 
 from src import api, comparison_export, comparison_rows, health, inventory
 from src import match_actions, matcher, notifications, product_policy, roi, storage
@@ -227,6 +227,58 @@ def test_isolated_third_member_does_not_close_a_valid_pair(partitioned, monkeypa
     assert len(rows) == 1
     assert set(rows[0]["prices"]) == {"aptekonline", "aloe"}
     assert c.blocked.canonical_id == c.match.id
+
+
+def test_partition_comparison_proves_prices_without_growing_query_count(partitioned):
+    c = partitioned
+    statements = []
+
+    def count_query(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    def read_comparison():
+        statements.clear()
+        engine = c.session.get_bind()
+        event.listen(engine, "before_cursor_execute", count_query)
+        try:
+            response = api.dash_comparison(
+                search=None, user=SimpleNamespace(tenant_id=1), db=c.session
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", count_query)
+        return json.loads(response.body), len(statements)
+
+    rows, few = read_comparison()
+    assert len(rows) == 1
+    fillers = c.session.scalars(
+        select(storage.Product).where(storage.Product.name.like("Padding %")).limit(25)
+    ).all()
+    for index, product in enumerate(fillers):
+        match = storage.Match(tenant_id=1, canonical_name=product.name, confidence=1.0)
+        c.session.add(match)
+        c.session.flush()
+        product.canonical_id = match.id
+        competitor = _product(f"query-count-{index}", site="aloe", match=match.id)
+        c.session.add(competitor)
+        c.session.flush()
+        c.session.add_all(
+            [
+                storage.PriceSnapshot(run_id=c.run.id, product_id=product.id, price=4),
+                storage.PriceSnapshot(run_id=c.legacy.id, product_id=competitor.id, price=5),
+            ]
+        )
+    c.session.commit()
+    rows, many = read_comparison()
+    assert len(rows) == 26
+    assert many == few
+    proof_queries = [statement for statement in statements if "offer_observations" in statement]
+    assert proof_queries
+    assert all(
+        "EXISTS" in statement
+        and "identity_verified" in statement
+        and "count(" not in statement.lower()
+        for statement in proof_queries
+    )
 
 
 def test_partition_health_is_truthful_and_observation_coverage_cannot_be_faked(
