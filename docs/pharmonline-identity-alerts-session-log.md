@@ -147,3 +147,11 @@
 - Last completed action: verified final CI and PR readiness, updated PR validation, and checkpointed the continuity journal.
 - Precise stopping point: before merge, deployment, production migration and recovery application; current authorization covered PR publication/CI only.
 - Next action: present the owner the three visible changes and obtain merge/deploy authorization under docs/DELIVERY-ARCHITECTURE.md lines 140–145. Then merge via PR, wait for green CI on the resulting main SHA, dispatch normal deploy.yml with apply_migrations=true, and produce a fresh read-only Decodo recovery plan on the same SHA. Review and obtain approval of that concrete plan before applying recovery; code deployment alone does not restore the full catalog.
+
+## 2026-10-16 — Fresh recovery plan requested; release prerequisites resumed
+
+- User replied “начинай план восстановления” to the concrete offer to merge PR #107, deploy the reviewed change and prepare a fresh recovery plan. Proceeding with that prerequisite sequence; this does not authorize applying the recovery plan to product records.
+- Saved feature worktree/branch retained. PR head remains `f66e244b900c954b98c7a21b921e46adf59a5b1a`, all three required checks green, MERGEABLE/CLEAN; active main remains `af2ab19b4b5a49649a29f7a416ab6bbb07ca5b1c`. Local journal-only checkpoint `c3a4547c` will not be published as application code.
+- Reconciled routing: active `rashadoni/pharmacy-monitor`, user-confirmed `13.140.186.143:/opt/pharmacy-monitor`, normal manual deploy.yml. Stale shared origin/SSH alias remain unchanged and unused for release.
+- Independent read-only review confirms that a valid v4 retirement plan requires migration 0025. Running it before deployment would spend two full Decodo reads and then refuse with recovery_schema_migrated=0; do not bypass that guard or migrate manually. Supported order: merge tested PR, green CI on resulting main SHA, normal deploy with verified backup/apply_migrations=true, then PLAN on that SHA.
+- The plan uses isolated temporary source, two full Decodo reads and redirect observations under the existing scrape lock; DB transaction is read-only, email disabled. It may use the existing paid proxy allowance. No recovery --apply or full scrape is authorized in this step.
