@@ -2287,6 +2287,7 @@ def _verify_pharmonline_public_api_identities(
     results: list[ScrapeResult],
     *,
     tenant_id: int,
+    isolated_external_ids: frozenset[str] = frozenset(),
 ) -> int:
     """Require every current API ID→URL pair to have immutable lineage.
 
@@ -2298,6 +2299,12 @@ def _verify_pharmonline_public_api_identities(
     current-source defect.
     """
     api_records = _public_api_identity_records(results)
+    if (
+        not isolated_external_ids.issubset(api_records)
+        or len(isolated_external_ids) > 25
+        or len(isolated_external_ids) > len(api_records) * 0.01
+    ):
+        raise PharmonlinePublicAPIIdentityError("identity isolation exceeds bounded source partition")
     api_by_id = {
         external_id: canonical_url for external_id, (canonical_url, _) in api_records.items()
     }
@@ -2361,7 +2368,7 @@ def _verify_pharmonline_public_api_identities(
 
     api_ids = set(api_by_id)
     trusted_ids = set(trusted_by_id)
-    missing_trusted_ids = api_ids - trusted_ids
+    missing_trusted_ids = api_ids - trusted_ids - isolated_external_ids
     retired_trusted_ids = set(ddp_by_id) - api_ids
     trusted_product_ids = {product.id for product in trusted_by_id.values()}
     mismatched_urls = 0
@@ -2369,6 +2376,8 @@ def _verify_pharmonline_public_api_identities(
     url_collisions = 0
     current_identity_matches = 0
     for external_id, canonical_url in api_by_id.items():
+        if external_id in isolated_external_ids:
+            continue
         trusted = trusted_by_id.get(external_id)
         trusted_matches_url = (
             trusted is not None and _canonical_pharmonline_product_url(trusted.url) == canonical_url
@@ -2441,8 +2450,10 @@ def _verify_pharmonline_public_api_identities(
         )
 
     log.info(
-        "pharmonline_public_api_identity_verified",
-        products=len(api_by_id),
+        "pharmonline_public_api_identity_partition_verified"
+        if isolated_external_ids else "pharmonline_public_api_identity_verified",
+        products=len(api_by_id) - len(isolated_external_ids),
+        isolated=len(isolated_external_ids),
         trusted_coverage=round(trusted_coverage, 4),
         trusted_history_products=len(trusted_history_product_ids),
         reconciled_identities=len(reconciled_by_id),
@@ -2452,7 +2463,7 @@ def _verify_pharmonline_public_api_identities(
         catalog_floor=catalog_floor or None,
         tenant_id=tenant_id,
     )
-    return len(api_by_id)
+    return len(api_by_id) - len(isolated_external_ids)
 
 
 def _pharmonline_public_api_scheduled_admission_limit() -> int:
@@ -2476,6 +2487,9 @@ def _admit_pharmonline_public_api_scheduled_identities(
     tenant_id: int,
     run_id: int,
     source_transport: str,
+    own_transaction: bool = True,
+    verification_results: list[ScrapeResult] | None = None,
+    isolated_external_ids: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, object], list[_PharmonlinePublicAPIIdentityAdmissionAction]]:
     """Допустить новые товары планового сбора, если весь план — простые допуски.
 
@@ -2535,9 +2549,7 @@ def _admit_pharmonline_public_api_scheduled_identities(
     summary["new_public_product"] = by_kind.get("new_public_product", 0)
     summary["existing_native_id"] = by_kind.get("existing_native_id", 0)
     unsafe = {
-        key: metrics[key]
-        for key in _PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS
-        if metrics.get(key)
+        key: metrics[key] for key in _PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS if metrics.get(key)
     }
     if not (actions or admissions or quarantines or unsafe):
         return summary, []
@@ -2610,9 +2622,10 @@ def _admit_pharmonline_public_api_scheduled_identities(
     # Решение принято на чтении без блокировок. Закрываем эту транзакцию и
     # применяем в новой: она перечитывает план под блокировкой строк и
     # откажет, если он успел измениться.
-    session.commit()
+    if own_transaction:
+        session.commit()
     try:
-        if session.get_bind().dialect.name == "postgresql":
+        if own_transaction and session.get_bind().dialect.name == "postgresql":
             session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
         _apply_pharmonline_public_api_reconciliation(
             session,
@@ -2625,18 +2638,30 @@ def _admit_pharmonline_public_api_scheduled_identities(
             expected_plan_manifest_sha256=plan_manifest_sha256,
             admission_proof_version=_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION,
         )
-        _verify_pharmonline_public_api_identities(session, results, tenant_id=tenant_id)
-        session.commit()
+        _verify_pharmonline_public_api_identities(
+            session,
+            verification_results if verification_results is not None else results,
+            tenant_id=tenant_id,
+            isolated_external_ids=isolated_external_ids,
+        )
+        if own_transaction:
+            session.commit()
     except PharmonlinePublicAPIIdentityError:
+        if not own_transaction:
+            raise
         # Дело не в новых товарах (нижняя граница каталога, конфликт записей…):
         # допуск ничего бы не исправил. Откатываем его; причину со счётчиками
         # назовёт проверка личностей у вызывающего.
         session.rollback()
         return refused("identity_proof_failed_after_admission")
     except PharmonlinePublicAPIReconciliationError as exc:
+        if not own_transaction:
+            raise
         session.rollback()
         return refused(f"apply_refused:{str(exc)[:120]}")
     except SQLAlchemyError as exc:
+        if not own_transaction:
+            raise
         # Текст ошибки базы в причину не кладём: в нём бывают значения строк.
         session.rollback()
         return refused(f"apply_failed:{type(exc).__name__}")
@@ -3025,6 +3050,8 @@ def _report_email_enabled() -> bool:
 
 
 _SCRAPE_ADVISORY_LOCK_KEY = SCRAPE_ADVISORY_LOCK_KEY
+
+
 def _acquire_matcher_lock(session: Session, *, wait: bool) -> bool:
     """Serialize matcher/rematch writes to products.canonical_id on Postgres."""
     return matcher.acquire_match_mutation_lock(session, wait=wait)
@@ -3194,13 +3221,15 @@ def run_quality_baselines_for_sites(
     recent = session.scalars(
         select(storage.Run)
         .where(
-            storage.Run.status == "ok",
+            storage.Run.status.in_(["ok", "degraded"]),
             storage.Run.tenant_id == tenant_id,
         )
         .order_by(desc(storage.Run.id))
         .limit(history_limit)
     ).all()
     for run in recent:
+        if run.status == "degraded" and not storage.run_is_financially_eligible(run):
+            continue
         quality = run.run_quality or {}
         per_site = run.products_per_site or {}
         for site in sites:
@@ -4431,6 +4460,7 @@ def persist_results(
     results: list[ScrapeResult],
     *,
     aloe_whole_catalog: bool = False,
+    trusted_identity_observations: bool = False,
 ) -> int:
     """Записать сбор пачками; что и как пишется — в `_persist_chunks`.
 
@@ -4445,7 +4475,13 @@ def persist_results(
     записать итог, и прогон оставался `running`.
     """
     try:
-        return _persist_chunks(session, run, results, aloe_whole_catalog=aloe_whole_catalog)
+        return _persist_chunks(
+            session,
+            run,
+            results,
+            aloe_whole_catalog=aloe_whole_catalog,
+            trusted_identity_observations=trusted_identity_observations,
+        )
     except Exception:
         try:
             session.rollback()
@@ -4466,6 +4502,7 @@ def _persist_chunks(
     results: list[ScrapeResult],
     *,
     aloe_whole_catalog: bool = False,
+    trusted_identity_observations: bool = False,
 ) -> int:
     """Сохранить ScrapedProduct/Promo в БД, обновить last_seen_at, добавить snapshots.
 
@@ -4519,6 +4556,10 @@ def _persist_chunks(
             continue
 
         products = result.products
+        if result.site == "pharmonline":
+            from src.pharmonline_identity_isolation import exclude_pending_products
+
+            products = exclude_pending_products(session, products)
         if result.site == "aloe" and any(sp.identity_verified for sp in products):
             if _aloe_number_identity_active(session):
                 waiting = _adopt_aloe_product_numbers(
@@ -4637,6 +4678,9 @@ def _persist_chunks(
                         observed_at=observed_at,
                     )
                 )
+            if trusted_identity_observations:
+                for observation in observations:
+                    observation.identity_verified = True
             session.add_all(observations)
 
             # === Pre-fetch latest snapshots — для diff-only решения ===
@@ -6110,13 +6154,9 @@ def run_cmd(
         )
     if mode == "public_api":
         if not use_public_api:
-            raise click.ClickException(
-                "public_api mode requires PHARMONLINE_PUBLIC_API=required"
-            )
+            raise click.ClickException("public_api mode requires PHARMONLINE_PUBLIC_API=required")
         if set(sites) != {"pharmonline"}:
-            raise click.ClickException(
-                "public_api mode is restricted to --site pharmonline"
-            )
+            raise click.ClickException("public_api mode is restricted to --site pharmonline")
         if limit is not None or category_id is not None or hourly:
             raise click.ClickException(
                 "public_api mode does not allow --limit, --category-id, or --hourly"
@@ -6158,9 +6198,7 @@ def run_cmd(
         total_pinned = sum(len(urls) for urls in watchlist_urls.values())
 
         is_full_catalog = (
-            effective_mode in {"category", "public_api"}
-            and category_id is None
-            and limit is None
+            effective_mode in {"category", "public_api"} and category_id is None and limit is None
         )
 
         if not force and _is_scheduled_full_scan(
@@ -6187,8 +6225,7 @@ def run_cmd(
                     covered_hours_ago={k: round(v, 1) for k, v in covered.items()},
                     next_window_utc={
                         k: (
-                            cadence_window_start(k, now)
-                            + timedelta(hours=site_cadence_hours(k))
+                            cadence_window_start(k, now) + timedelta(hours=site_cadence_hours(k))
                         ).isoformat(timespec="minutes")
                         for k in covered
                     },
@@ -6281,6 +6318,7 @@ def run_cmd(
                 # re-create the historical slug-ID duplicate catalog.
                 on_category = None
                 if not use_legacy_identity_bridge:
+
                     def _persist_category(site_name, slug, cat_products):
                         if site_name == "aloe":
                             # Пишется целиком в конце сбора: кому достаётся
@@ -6314,10 +6352,10 @@ def run_cmd(
             quality_status: str | None = None
             quality: dict | None = None
             guarded_catalog_verified = False
+            identity_partition = None
+            persistence_results = results
             guarded_catalog_reason: str | None = None
-            requires_pre_persist_catalog_guard = (
-                use_legacy_identity_bridge or use_public_api
-            )
+            requires_pre_persist_catalog_guard = use_legacy_identity_bridge or use_public_api
             if requires_pre_persist_catalog_guard:
                 if use_legacy_identity_bridge:
                     _bridge_pharmonline_legacy_ids(
@@ -6337,13 +6375,11 @@ def run_cmd(
                     enforce_baseline=enforce_quality_baseline,
                 )
                 if is_full_catalog:
-                    guarded_catalog_verified, guarded_catalog_reason = (
-                        _verify_full_catalog_results(
-                            results,
-                            sites=sites,
-                            expected_slugs=slugs_by_site,
-                            baselines=baselines,
-                        )
+                    guarded_catalog_verified, guarded_catalog_reason = _verify_full_catalog_results(
+                        results,
+                        sites=sites,
+                        expected_slugs=slugs_by_site,
+                        baselines=baselines,
                     )
                     financial_ok = quality_status == "ok" and guarded_catalog_verified
                     quality["full_catalog_verified"] = financial_ok
@@ -6370,22 +6406,25 @@ def run_cmd(
                     admission: dict[str, object] | None = None
                     admitted: list[_PharmonlinePublicAPIIdentityAdmissionAction] = []
                     try:
-                        # Новые товары на сайте — обычное дело, а не расхождение
-                        # личностей: простые случаи сбор допускает сам, остальное
-                        # отказывает ниже, как и раньше.
-                        admission, admitted = _admit_pharmonline_public_api_scheduled_identities(
-                            session,
-                            results,
-                            tenant_id=run.tenant_id,
-                            run_id=run.id,
-                            source_transport=configured_public_api_transport(),
+                        from src.pharmonline_identity_isolation import prepare_catalog
+
+                        persistence_results, identity_partition, admission, admitted = (
+                            prepare_catalog(
+                                session,
+                                results,
+                                tenant_id=run.tenant_id,
+                                run_id=run.id,
+                                source_transport=configured_public_api_transport(),
+                            )
                         )
                         quality["pharmonline_identity_admission"] = admission
-                        _verify_pharmonline_public_api_identities(
-                            session,
-                            results,
-                            tenant_id=run.tenant_id,
-                        )
+                        if identity_partition is not None:
+                            quality["identity_partition"] = identity_partition
+                            guarded_catalog_verified = False
+                            guarded_catalog_reason = (
+                                "source_complete_with_isolated_identities:"
+                                f"{identity_partition['isolated_count']}"
+                            )
                     except PharmonlinePublicAPIIdentityError as exc:
                         # The API+sitemap catalog itself was complete, but its
                         # identities did not prove lineage to the trusted DDP
@@ -6471,12 +6510,25 @@ def run_cmd(
                     expected_slugs=slugs_by_site,
                     baselines=baselines,
                 )
+            if is_full_catalog and not use_public_api and any(r.site == "pharmonline" for r in results):
+                pending_identity = session.scalar(select(storage.Product.id).where(
+                    storage.Product.site == "pharmonline",
+                    storage.Product.identity_conflicted.is_(True),
+                ).limit(1))
+                if pending_identity is not None:
+                    raise FullCatalogVerificationError("pending identities require complete public API proof")
             count = persist_results(
                 session,
                 run,
-                results,
+                persistence_results,
+                trusted_identity_observations=identity_partition is not None,
                 aloe_whole_catalog=is_full_catalog and quality_status == "ok" and catalog_verified,
             )
+            if identity_partition is not None:
+                if count != identity_partition["trusted_count"]:
+                    raise FullCatalogVerificationError("trusted partition persistence count differs")
+                quality["persisted_trusted_products"] = count
+                count = sum(len(result.products) for result in results)
             run.products_scraped = count
             run.products_per_site = {r.site: len(r.products) for r in results}
             run.products_per_site_category = {r.site: _per_category_breakdown([r]) for r in results}
@@ -6484,13 +6536,24 @@ def run_cmd(
             if is_full_catalog:
                 run.catalog_verified = catalog_verified
                 run.catalog_verification_reason = catalog_verification_reason
-                financial_ok = quality_status == "ok" and run.catalog_verified
-                quality["full_catalog_verified"] = financial_ok
+                financial_ok = quality_status == "ok" and (
+                    run.catalog_verified or identity_partition is not None
+                )
+                quality["full_catalog_verified"] = quality_status == "ok" and run.catalog_verified
                 quality["financially_eligible"] = financial_ok
                 quality["catalog_verification_reason"] = run.catalog_verification_reason
             run.run_quality = quality
             run.error_message = run_quality_message(quality_status, quality)
-            if is_full_catalog and quality_status == "ok" and run.catalog_verified:
+            if identity_partition is not None:
+                run.error_message = (
+                    f"Source catalog complete; {identity_partition['isolated_count']} "
+                    "identities isolated pending review"
+                )
+            if (
+                is_full_catalog
+                and quality_status == "ok"
+                and storage.run_has_publishable_catalog(run)
+            ):
                 run.status = "running"
             else:
                 run.status = quality_status
@@ -6529,7 +6592,7 @@ def run_cmd(
             # not a successful producer.  Stop before matcher, alerts, reports,
             # or ROI publication; the exception handler records ``degraded``
             # (distinct from a crash) and fails the queue request explicitly.
-            if is_full_catalog and not run.catalog_verified:
+            if is_full_catalog and not storage.run_has_publishable_catalog(run):
                 quality_detail = f"; {run.error_message}" if run.error_message else ""
                 raise FullCatalogVerificationError(
                     "full catalog verification failed: "
@@ -6573,7 +6636,7 @@ def run_cmd(
             # Internal consumers must calculate against this exact verified
             # full Run before it is published as ``ok``.  External API calls
             # do not inherit this context and therefore remain fail-closed.
-            if is_full_catalog and run.catalog_verified:
+            if is_full_catalog and storage.run_has_publishable_catalog(run):
                 from src.product_policy import finalizing_trusted_run
 
                 trust_context = finalizing_trusted_run(run.id)
@@ -6677,7 +6740,7 @@ def run_cmd(
             # gate, cache publication is deferred while this producer's own
             # verified status remains truthful.  Partial/watchlist runs never
             # publish a catalog epoch and therefore do not rewrite this cache.
-            if is_full_catalog and run.catalog_verified:
+            if is_full_catalog and storage.run_has_publishable_catalog(run):
                 from src import roi as _roi
 
                 if _roi.financial_inputs_are_fresh(
@@ -6718,8 +6781,8 @@ def run_cmd(
                 trust_context.__exit__(None, None, None)
                 trust_context = None
 
-            if is_full_catalog and run.catalog_verified:
-                run.status = "ok"
+            if is_full_catalog and storage.run_has_publishable_catalog(run):
+                run.status = "degraded" if identity_partition is not None else "ok"
             run.finished_at = utcnow()
             if request_id is not None:
                 req = session.get(storage.ScrapeRequest, request_id)
@@ -6739,9 +6802,7 @@ def run_cmd(
                 trust_context.__exit__(*sys.exc_info())
                 trust_context = None
 
-            failure_status = (
-                "degraded" if isinstance(e, FullCatalogVerificationError) else "failed"
-            )
+            failure_status = "degraded" if isinstance(e, FullCatalogVerificationError) else "failed"
             failure_message = f"{type(e).__name__}: {e}"
 
             def record_failure() -> None:
@@ -7402,12 +7463,13 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
             recent = session.scalars(
                 select(storage.Run)
                 .where(
-                    storage.Run.status == "ok",
+                    storage.Run.status.in_(["ok", "degraded"]),
                     storage.Run.tenant_id == tenant_id,
                 )
                 .order_by(storage.Run.id.desc())
                 .limit(100)
             ).all()
+            recent = [item for item in recent if item.status == "ok" or storage.run_is_financially_eligible(item)]
             run = (
                 next(
                     (item for item in recent if storage.run_is_financially_eligible(item)),
