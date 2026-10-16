@@ -4557,7 +4557,11 @@ def _persist_chunks(
 
         products = result.products
         if result.site == "pharmonline":
-            from src.pharmonline_identity_isolation import exclude_pending_products
+            from src.pharmonline_identity_isolation import (
+                exclude_pending_products,
+                lock_identity_writes,
+                require_native_identity_continuity,
+            )
 
             products = exclude_pending_products(session, products)
         if result.site == "aloe" and any(sp.identity_verified for sp in products):
@@ -4580,6 +4584,18 @@ def _persist_chunks(
         # === Чанкуем продукты внутри одного ScrapeResult ===
         for chunk_start in range(0, len(products), _PERSIST_CHUNK):
             chunk_products = products[chunk_start : chunk_start + _PERSIST_CHUNK]
+            if result.site == "pharmonline":
+                # Re-read pending identities after the same transaction lock
+                # used by isolation. An earlier partial scrape/filter may have
+                # finished before the conflict transaction committed.
+                lock_identity_writes(session)
+                chunk_products = exclude_pending_products(session, chunk_products)
+                if not chunk_products:
+                    session.commit()
+                    continue
+                require_native_identity_continuity(
+                    session, chunk_products, tenant_id=run.tenant_id
+                )
             if not chunk_products:
                 continue
 

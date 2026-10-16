@@ -40,6 +40,70 @@ def _prepare(session, source, run):
     return prepare_catalog(session, source, tenant_id=1, run_id=run.id, source_transport="direct")
 
 
+@pytest.mark.parametrize("kind", ["url_changed", "id_replaced", "foreign_tenant"])
+def test_partial_source_cannot_rewrite_native_identity_before_first_isolation(db_session, kind):
+    original = _stored(1, "old-identity")
+    if kind == "foreign_tenant":
+        original.tenant_id = 2
+    db_session.add(original)
+    db_session.commit()
+    before = (original.external_id, original.url, original.name)
+    run = _run(db_session)
+    run.catalog_scope = "partial"
+    db_session.commit()
+    incoming = _api(
+        2 if kind == "id_replaced" else 1,
+        "new-address" if kind == "url_changed" else "old-identity",
+    )
+    with pytest.raises(main.PharmonlinePublicAPIIdentityError):
+        main.persist_results(db_session, run, _catalog(incoming))
+    assert (original.external_id, original.url, original.name) == before
+    assert db_session.scalar(select(func.count()).select_from(storage.Product)) == 1
+    assert db_session.scalar(select(func.count()).select_from(storage.PriceSnapshot)) == 0
+    assert (
+        db_session.scalar(select(func.count()).select_from(storage.PharmonlineIdentityConflict))
+        == 0
+    )
+
+
+def test_invalid_legacy_url_repair_is_preserved(db_session):
+    product = _stored(1, "old")
+    product.url = "/True"
+    db_session.add(product)
+    db_session.commit()
+    run = _run(db_session)
+    main.persist_results(db_session, run, _catalog(_api(1, "repaired")))
+    assert product.url.endswith("/repaired")
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("shape", ["id_changed_url", "url_changed_id"])
+def test_partial_duplicate_pair_cannot_hide_conflict(db_session, existing, shape):
+    if existing:
+        db_session.add(_stored(1, "original"))
+        db_session.commit()
+    run = _run(db_session)
+    run.catalog_scope = "partial"
+    db_session.commit()
+    first = _api(1, "changed") if shape == "id_changed_url" else _api(2, "original")
+    with pytest.raises(main.PharmonlinePublicAPIIdentityError):
+        main.persist_results(db_session, run, _catalog(first, _api(1, "original")))
+    assert db_session.scalar(select(func.count()).select_from(storage.PriceSnapshot)) == 0
+    assert db_session.scalar(select(func.count()).select_from(storage.Product)) == int(existing)
+
+
+def test_approved_retirement_replacements_can_persist_normally(db_session):
+    from tests.test_pharmonline_identity_retirement import apply, seed
+
+    old, source, proofs = seed(db_session)
+    apply(db_session, source, proofs)
+    archived = [(p.id, p.external_id, p.url, p.name) for p in old]
+    run = _run(db_session)
+    assert main.persist_results(db_session, run, source) == 3
+    assert [(p.id, p.external_id, p.url, p.name) for p in old] == archived
+    assert db_session.scalar(select(func.count()).select_from(storage.Product)) == 6
+
+
 @pytest.mark.parametrize("total", [300, 9430])
 def test_three_conflicts_leave_every_other_identity_publishable(db_session, total):
     original, source = _seed(db_session, total)

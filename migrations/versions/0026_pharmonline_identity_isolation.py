@@ -12,6 +12,12 @@ down_revision = "0025_identity_retirements"
 branch_labels = None
 depends_on = None
 
+PREVIOUS_RELEASE_COMPATIBLE = (
+    "Upgrade only creates new evidence tables and adds boolean columns with false "
+    "server defaults. The previous release neither reads these new fields nor "
+    "writes the new tables; its existing inserts remain valid and old data is unchanged."
+)
+
 
 def _tables():
     metadata = sa.MetaData()

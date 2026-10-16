@@ -19,6 +19,69 @@ MAX_ISOLATED = 25
 MAX_ISOLATED_FRACTION = 0.01
 
 
+def lock_identity_writes(session):
+    """Serialize conflict decisions with every Pharmonline persistence chunk."""
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(721109, 1)"))
+
+
+def require_native_identity_continuity(session, products, *, tenant_id):
+    """A partial producer cannot change a native binding before a full scan.
+
+    It has no completeness evidence to create a conflict case. Refuse the
+    write instead; the next complete public catalog will classify it. Invalid
+    historic /True URLs retain their established repair path.
+    """
+    from src import main as core
+
+    incoming, incoming_urls = {}, {}
+    for product in products:
+        if not core._PHARMONLINE_METEOR_ID_RE.fullmatch(str(product.external_id)):
+            continue
+        canonical = core._canonical_pharmonline_product_url(product.url)
+        if (
+            canonical is None
+            or (product.external_id in incoming and incoming[product.external_id] != canonical)
+            or (canonical in incoming_urls and incoming_urls[canonical] != product.external_id)
+        ):
+            raise core.PharmonlinePublicAPIIdentityError(
+                "ambiguous native identity in persistence chunk"
+            )
+        incoming[product.external_id] = canonical
+        incoming_urls[canonical] = product.external_id
+    if not incoming:
+        return
+    by_id, by_url = {}, {}
+    for external_id, url, owner in session.execute(
+        select(
+            storage.Product.external_id,
+            storage.Product.url,
+            storage.Product.tenant_id,
+        ).where(storage.Product.site == "pharmonline")
+    ):
+        if not core._PHARMONLINE_METEOR_ID_RE.fullmatch(str(external_id)):
+            continue
+        canonical = core._canonical_pharmonline_product_url(url)
+        by_id[external_id] = (canonical, owner)
+        if canonical:
+            by_url.setdefault(canonical, set()).add((external_id, owner))
+    for external_id, url in incoming.items():
+        existing = by_id.get(external_id)
+        if existing and (
+            existing[1] != tenant_id or (existing[0] is not None and existing[0] != url)
+        ):
+            raise core.PharmonlinePublicAPIIdentityError(
+                "native identity change requires a complete public catalog before persistence"
+            )
+        if any(
+            other_id != external_id or owner != tenant_id
+            for other_id, owner in by_url.get(url, set())
+        ):
+            raise core.PharmonlinePublicAPIIdentityError(
+                "native source URL is already bound; complete public catalog required"
+            )
+
+
 def _classify(session, results, tenant_id):
     from src import main as core
 
@@ -157,7 +220,7 @@ def prepare_catalog(session, results, *, tenant_id, run_id, source_transport):
     try:
         if session.get_bind().dialect.name == "postgresql":
             session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
-            session.execute(text("SELECT pg_advisory_xact_lock(721109, 1)"))
+        lock_identity_writes(session)
         trusted, isolated, associations, products, cases = _classify(session, results, tenant_id)
         admission, admitted = core._admit_pharmonline_public_api_scheduled_identities(
             session,

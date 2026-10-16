@@ -191,7 +191,8 @@ def test_public_api_recovery_refuses_persistence_after_identity_proof_failure(
     С 2026-10-08 товар, которого в базе нет вовсе, плановый сбор допускает сам
     (tests/test_pharmonline_scheduled_admission.py). Недоверенной остаётся
     пара, которая противоречит базе: известный идентификатор по другому адресу.
-    Такой каталог по-прежнему не пишется целиком.
+    Один конфликт из одного товара означает 100% дрейф: превышение лимита
+    изоляции по-прежнему запрещает запись целиком.
     """
     from src.normalize import normalize_name
     from src.scrapers.pharmonline_public_api import (
@@ -274,7 +275,7 @@ def test_public_api_recovery_refuses_persistence_after_identity_proof_failure(
     )
 
     assert result.exit_code != 0
-    assert "identity proof refused persistence" in result.output
+    assert "identity drift exceeds isolation limit" in result.output
     assert persisted == []
     verify = Session()
     try:
@@ -286,7 +287,7 @@ def test_public_api_recovery_refuses_persistence_after_identity_proof_failure(
             "public_api_identity_proof_failed:"
         )
         assert "PharmonlinePublicAPIIdentityError" in (run.error_message or "")
-        assert "mismatched_urls=1" in (run.error_message or "")
+        assert "identity drift exceeds isolation limit" in (run.error_message or "")
         (stored,) = verify.scalars(select(storage.Product)).all()
         assert stored.url == "https://pharmonline.az/product/trusted-product"
         assert verify.scalars(select(storage.PharmonlinePublicAPIIdentityAdmission)).all() == []
