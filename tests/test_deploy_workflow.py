@@ -808,6 +808,72 @@ def _assert_production_untouched(sandbox: Sandbox, before: dict[str, str], revis
     assert sandbox.staging_dirs() == [], "каталог .deploy-stage.* остался на сервере"
 
 
+def _run_revision_preflight(sandbox: Sandbox, *, apply_migrations: bool) -> WorkflowResult:
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["deploy"]["steps"]
+    without = tuple(
+        step["name"] for step in steps if "name" in step and step["name"] != PREFLIGHT_REVISION
+    )
+    return run_workflow(sandbox, apply_migrations=apply_migrations, without=without)
+
+
+@pytest.mark.parametrize(
+    ("current", "apply_migrations", "refused"),
+    [
+        ("0024_aloe_product_numbers", True, False),
+        ("0025_identity_retirements", True, False),
+        ("0025_identity_retirements", False, True),
+        ("head", False, False),
+    ],
+)
+def test_revision_preflight_reads_real_annotated_and_unannotated_migrations(
+    pending_migration: Sandbox, current: str, apply_migrations: bool, refused: bool
+) -> None:
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory(str(ROOT / "migrations")).get_current_head()
+    if current == "head":
+        current = head
+    sandbox = pending_migration
+    versions = sandbox.checkout / "migrations" / "versions"
+    for path in versions.glob("*.py"):
+        path.unlink()
+    for path in (ROOT / "migrations" / "versions").glob("*.py"):
+        shutil.copy(path, versions / path.name)
+    with sqlite3.connect(sandbox.database) as connection:
+        connection.execute("UPDATE alembic_version SET version_num = ?", (current,))
+    before = sandbox.live_digest()
+
+    result = _run_revision_preflight(sandbox, apply_migrations=apply_migrations)
+
+    assert bool(result.failed_step) is refused, result.describe()
+    if refused:
+        assert f"checkout is at migration {head}" in result.failed_step.stdout
+        assert "apply_migrations=true" in result.failed_step.stdout
+    _assert_production_untouched(sandbox, before, current)
+
+
+def test_revision_preflight_rejects_dynamic_metadata_without_executing_it(
+    pending_migration: Sandbox,
+) -> None:
+    sandbox = pending_migration
+    marker = sandbox.root / "migration-was-executed"
+    path = sandbox.checkout / "migrations" / "versions" / f"{HEAD}.py"
+    path.write_text(
+        path.read_text().replace(
+            f'revision: str = "{HEAD}"',
+            f"revision = __import__('pathlib').Path({str(marker)!r}).write_text('executed')",
+        )
+    )
+    before = sandbox.live_digest()
+
+    result = _run_revision_preflight(sandbox, apply_migrations=True)
+
+    assert result.failed_step.name == PREFLIGHT_REVISION, result.describe()
+    assert "nonliteral revision" in result.failed_step.stderr
+    assert not marker.exists()
+    _assert_production_untouched(sandbox, before, BASE)
+
+
 def test_migration_runs_while_the_previous_release_is_still_live(
     pending_migration: Sandbox,
 ) -> None:
@@ -1198,7 +1264,7 @@ def test_production_revision_unknown_to_the_release_is_refused(tmp_path: Path) -
     result = run_workflow(sandbox, apply_migrations=True)
 
     assert result.failed_step.name == PREFLIGHT_REVISION, result.describe()
-    assert "is absent from checkout" in result.failed_step.stdout
+    assert "is absent from checkout" in result.failed_step.stdout + result.failed_step.stderr
     assert sandbox.events("rsync") == []
     _assert_production_untouched(sandbox, before, "0009_only_on_prod")
 

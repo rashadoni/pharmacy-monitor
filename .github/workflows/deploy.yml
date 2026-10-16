@@ -139,26 +139,48 @@ jobs:
             exit 1
           fi
           current_revision=$(printf '%s\n' "$current_output" | awk 'NF {print $1}')
-          if ! grep -Rqs --include='*.py' "revision: str = \"$current_revision\"" migrations/versions; then
-            echo "::error::production DB revision $current_revision is absent from checkout; refusing rsync --delete"
-            exit 1
-          fi
           # A pending migration with apply_migrations=false would rsync the new
           # code and restart it on the old schema: a new column in the models
           # fails every query that selects it, for the API and the scrapers.
-          head_revision=$(python3 - <<'PY'
+          head_revision=$(python3 - "$current_revision" <<'PY'
+          import ast
           import pathlib
-          import re
+          import sys
 
           revisions, parents = set(), set()
           for path in pathlib.Path("migrations/versions").glob("*.py"):
-              text = path.read_text(encoding="utf-8")
-              revision = re.search(r'^revision: str = "([^"]+)"', text, re.M)
-              parent = re.search(r'^down_revision: str \| None = "([^"]+)"', text, re.M)
-              if revision:
-                  revisions.add(revision.group(1))
-              if parent:
-                  parents.add(parent.group(1))
+              if path.name == "__init__.py":
+                  continue
+              fields = {}
+              # Inspect literals without importing migration code or requiring
+              # Alembic on the runner. Type annotations are optional Python.
+              for node in ast.parse(path.read_text(encoding="utf-8"), filename=str(path)).body:
+                  targets = node.targets if isinstance(node, ast.Assign) else (
+                      [node.target] if isinstance(node, ast.AnnAssign) else []
+                  )
+                  for target in targets:
+                      if isinstance(target, ast.Name) and target.id in {"revision", "down_revision"}:
+                          if target.id in fields:
+                              raise SystemExit(f"duplicate {target.id} declaration in {path.name}")
+                          try:
+                              fields[target.id] = ast.literal_eval(node.value)
+                          except (ValueError, TypeError):
+                              raise SystemExit(f"nonliteral {target.id} in {path.name}")
+              revision, parent = fields.get("revision"), fields.get("down_revision")
+              if set(fields) != {"revision", "down_revision"} or not isinstance(revision, str) or not revision:
+                  raise SystemExit(f"invalid migration declarations in {path.name}")
+              if parent is not None and (not isinstance(parent, str) or not parent):
+                  raise SystemExit(f"unsupported down_revision in {path.name}")
+              if revision in revisions:
+                  raise SystemExit(f"duplicate migration revision {revision}")
+              revisions.add(revision)
+              if parent is not None:
+                  parents.add(parent)
+          current = sys.argv[1]
+          if current not in revisions:
+              raise SystemExit(f"::error::production DB revision {current} is absent from checkout; refusing rsync --delete")
+          if parents - revisions:
+              raise SystemExit(f"unknown parent revisions in checkout: {sorted(parents - revisions)}")
           heads = sorted(revisions - parents)
           if len(heads) != 1:
               raise SystemExit(f"expected one migration head in checkout, found {heads}")
