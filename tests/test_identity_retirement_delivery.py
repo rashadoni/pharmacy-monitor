@@ -11,7 +11,7 @@ import sys
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import create_engine, inspect
 import yaml
 
 from src import storage
@@ -20,13 +20,52 @@ from tests.test_pharmonline_identity_retirement import apply, seed
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def migration(connection, monkeypatch):
-    path = ROOT / "migrations/versions/0025_pharmonline_identity_retirements.py"
+def migration(connection, monkeypatch, filename="0025_pharmonline_identity_retirements.py"):
+    path = ROOT / "migrations/versions" / filename
     spec = importlib.util.spec_from_file_location("retirement_migration", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "op", Operations(MigrationContext.configure(connection)))
     return module
+
+
+def test_migration_accepts_real_initial_bootstrap_and_repeated_upgrade(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    try:
+        with engine.begin() as connection:
+            assert inspect(connection).get_table_names() == []
+            migration(connection, monkeypatch, "0001_initial.py").upgrade()
+            assert storage.PharmonlinePublicAPIIdentityRetirement.__table__.name in (
+                inspect(connection).get_table_names()
+            )
+            module = migration(connection, monkeypatch)
+            module.upgrade()
+            module.upgrade()
+            assert (
+                connection.exec_driver_sql(
+                    "SELECT count(*) FROM pharmonline_public_api_identity_retirements"
+                ).scalar()
+                == 0
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("damage", ["column", "index"])
+def test_migration_refuses_preexisting_wrong_schema(db_session, monkeypatch, damage):
+    connection = db_session.connection()
+    if damage == "column":
+        connection.exec_driver_sql(
+            "ALTER TABLE pharmonline_public_api_identity_retirements "
+            "RENAME COLUMN source_transport TO wrong_transport"
+        )
+    else:
+        connection.exec_driver_sql(
+            "DROP INDEX ix_pharmonline_public_api_identity_retirements_tenant_id"
+        )
+    module = migration(connection, monkeypatch)
+    with pytest.raises(RuntimeError, match="differs from migration schema"):
+        module.upgrade()
 
 
 def test_migration_creates_evidence_only_and_empty_downgrade_is_reversible(db_session, monkeypatch):
@@ -40,6 +79,7 @@ def test_migration_creates_evidence_only_and_empty_downgrade_is_reversible(db_se
     expected_foreign = inspector.get_foreign_keys(table.name)
     table.drop(connection)
     module = migration(connection, monkeypatch)
+    module.upgrade()
     module.upgrade()
     inspector = inspect(connection)
     assert [
@@ -59,6 +99,7 @@ def test_migration_cannot_drop_used_history_evidence(db_session, monkeypatch):
     _, results, proofs = seed(db_session)
     apply(db_session, results, proofs)
     module = migration(db_session.connection(), monkeypatch)
+    module.upgrade()
     with pytest.raises(RuntimeError, match="cannot remove used"):
         module.downgrade()
     assert db_session.query(storage.PharmonlinePublicAPIIdentityRetirement).count() == 3

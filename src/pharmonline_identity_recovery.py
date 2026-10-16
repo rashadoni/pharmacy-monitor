@@ -22,7 +22,7 @@ PROOF_VERSION = "admitted_identity_retirement_v1"
 AVAILABILITY_SOURCE = "pharmonline_identity_retirement"
 URL_CHANGED = "native_url_changed"
 ID_REPLACED = "native_id_replaced"
-TABLE = storage.PharmonlinePublicAPIIdentityRetirement.__tablename__
+TABLE = storage.PharmonlinePublicAPIIdentityRetirement.__table__.name
 
 
 def available(session) -> bool:
