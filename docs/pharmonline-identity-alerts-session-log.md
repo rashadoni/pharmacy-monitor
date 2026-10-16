@@ -270,3 +270,10 @@
 - A source-wide two-item fixture with one changed URL now fails explicitly on the mass-drift bound instead of the old whole-catalog identity wording. Disabled auto-admission still reports its concrete refusal reason.
 - Pending resolution is deliberately not automatic. The existing one-shot manual retirement cannot close the new pending evidence; added explicit refusal for conflicted Products and a stale-plan regression. The old prepared PLAN is not a pending-case resolution procedure. Runbook records the limits and remaining reviewed-resolver scope.
 - Current stopping point: final targeted checks / independent review, followed by PR and full external CI. No merge or deployment authorized for this new unreviewed behavior.
+
+## 2026-10-16 — PR 108 published for required external gates
+
+- Published task branch head `b2c7b0c6d15d1e3ed4637f082df77b28baaa69e4` through the explicit active repository URL. Created and attached draft PR https://github.com/rashadoni/pharmacy-monitor/pull/108. Active main remained `bf35e70c9e0319d567ae107f30323e05ed031a88`.
+- Required CI https://github.com/rashadoni/pharmacy-monitor/actions/runs/38932038267 started on that exact head: Lint, Test (including PostgreSQL), Frontend. No final outcome yet.
+- Latest root targeted checks: 151 passed / 2 PostgreSQL skips and 61 passed. Agent downstream checkpoint `28b861b9`: 51 + 244 + 6 passed; local skips documented above. Root reviewed downstream diff; independent author is completing final core review at `b2c7b0c6`.
+- Current result: concrete persistent behavior is implemented and reviewable, with original history preserved and no production mutation. Last action: published PR and verified CI head. Stopping point: waiting for mandatory CI and final review, before readiness/owner release approval. Next: fix any findings, complete all required gates, then present the exact release for approval under docs/DELIVERY-ARCHITECTURE.md.
