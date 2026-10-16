@@ -121,3 +121,11 @@
 
 - CI run 38918390712 reached full pytest successfully after PostgreSQL migration bootstrap. Lint found formatting-only differences in `scripts/reconcile_pharmonline_public_api_identities.py` and `src/product_policy.py`; repository formatting policy checks all files introduced since its baseline, including these previously existing files.
 - Applied the pinned Ruff formatter to those two files. ASTs before/after are identical; targeted Ruff, formatting and whitespace checks pass. No behavior or test expectations were changed. Publish the correction to trigger CI for the final PR head.
+
+## 2026-10-16 — Full CI exercised PostgreSQL; delivery harness updated
+
+- First complete Python CI result for 38918390712: 3,596 passed, 5 failed, 10 skipped, 1 expected failure. All five failures were in `test_prod_db_revision_gate.py`: the sandbox emulated the plan-verification step's environment without the new required `PLAN_RETIRE_IDENTITIES` boolean, so the real shell step refused before reaching the intended migration-revision check.
+- Actual workflow already writes this verified boolean from the v4 plan artifact. Preserve that fail-closed production behavior; update only the sandbox's explicit prior-step evidence and exercise both false/true modes, including the actual reconciliation argument.
+- PostgreSQL migration bootstrap, frozen-0023 model/migration parity and existing shared PostgreSQL tests passed in this full run. Current 2a7373c5 run 38918713541 has green lint and frontend; its Python source/test behavior is the same as the first run except formatting, so the harness fix is needed before the final head can pass all gates.
+
+- Harness correction committed as `b1b5d827` and independently reviewed by root: production workflows are unchanged, sandbox records actual reconciliation argv, false/true mode is explicit, and existing no-write/refusal/backup-order checks remain. All 70 tests in `test_prod_db_revision_gate.py` pass; Ruff, formatting and whitespace pass. Publishing this correction and journal checkpoint for final CI.
