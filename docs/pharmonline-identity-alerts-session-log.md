@@ -129,3 +129,21 @@
 - PostgreSQL migration bootstrap, frozen-0023 model/migration parity and existing shared PostgreSQL tests passed in this full run. Current 2a7373c5 run 38918713541 has green lint and frontend; its Python source/test behavior is the same as the first run except formatting, so the harness fix is needed before the final head can pass all gates.
 
 - Harness correction committed as `b1b5d827` and independently reviewed by root: production workflows are unchanged, sandbox records actual reconciliation argv, false/true mode is explicit, and existing no-write/refusal/backup-order checks remain. All 70 tests in `test_prod_db_revision_gate.py` pass; Ruff, formatting and whitespace pass. Publishing this correction and journal checkpoint for final CI.
+
+## 2026-10-16 — Final-head CI in progress
+
+- Published final test-harness/journal head `f66e244b900c954b98c7a21b921e46adf59a5b1a`; required CI run https://github.com/rashadoni/pharmacy-monitor/actions/runs/38919660950. Lint, frontend and migration bootstrap passed; full pytest is running.
+- Cancelled superseded run 38918713541 after the corrected head started. Its lint/frontend were green, but its old harness was already known to fail from completed run 38918390712; this avoids continuing obsolete work without changing any gate.
+- Main protection read-only verification: PR required, admin enforcement enabled, exact required checks Lint (ruff), Test (pytest), Frontend (Next.js). No protection changes made.
+
+## 2026-10-16 — PR #107 ready; all required CI gates passed
+
+- Required CI run https://github.com/rashadoni/pharmacy-monitor/actions/runs/38919660950 completed successfully for published head `f66e244b900c954b98c7a21b921e46adf59a5b1a`. All three protected checks passed: Lint (ruff), Test (pytest), Frontend (Next.js).
+- Exact full pytest result: 3,602 passed, 10 skipped, 1 expected failure, 7 warnings, 522.54 seconds. PostgreSQL migration bootstrap, frozen-0023 model/schema parity and existing shared PostgreSQL tests ran in CI. Frontend typecheck, unit tests and build passed. No full local suite or build was run on Contabo, as required by the host contract.
+- PR https://github.com/rashadoni/pharmacy-monitor/pull/107 remains open; GitHub reports MERGEABLE / CLEAN for that exact head. PR description updated with final CI evidence and the explicit limit that new retirement behavior tests use SQLite, without a new retirement-specific PostgreSQL race test. Older failed/superseded CI runs do not describe the final head.
+- Final independent read-only review by publication_review confirmed the release sequence and accurate validation claims. It made no further changes. No production data, migration, service, deployment, main branch or branch protection was changed in this publication turn.
+- This final journal update is a local-only checkpoint. All application, migration, workflow and test changes match the published/tested PR head; only the append-only session journal is ahead. Do not silently publish the journal checkpoint and then treat the previous head's CI as validation of a new published head.
+- Current result/status: implementation and PR publication complete, independent review complete, all required CI gates green; production catalog recovery remains pending.
+- Last completed action: verified final CI and PR readiness, updated PR validation, and checkpointed the continuity journal.
+- Precise stopping point: before merge, deployment, production migration and recovery application; current authorization covered PR publication/CI only.
+- Next action: present the owner the three visible changes and obtain merge/deploy authorization under docs/DELIVERY-ARCHITECTURE.md lines 140–145. Then merge via PR, wait for green CI on the resulting main SHA, dispatch normal deploy.yml with apply_migrations=true, and produce a fresh read-only Decodo recovery plan on the same SHA. Review and obtain approval of that concrete plan before applying recovery; code deployment alone does not restore the full catalog.
