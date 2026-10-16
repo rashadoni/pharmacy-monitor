@@ -472,6 +472,49 @@ class PharmonlinePublicAPIIdentityQuarantine(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class PharmonlinePublicAPIIdentityRetirement(Base):
+    """Append-only retirement of an admitted identity, without history transfer.
+
+    A replacement is authenticated by this ledger itself. The old admission is
+    retained verbatim, including its unique native ID; it is never repurposed
+    or duplicated to admit the replacement. V1 deliberately forbids chains.
+    """
+
+    __tablename__ = "pharmonline_public_api_identity_retirements"
+    __table_args__ = (
+        CheckConstraint(
+            "legacy_product_id <> replacement_product_id", name="ck_pharmonline_retirement_distinct"
+        ),
+        UniqueConstraint("legacy_product_id", name="uq_pharmonline_retirement_legacy"),
+        UniqueConstraint("replacement_product_id", name="uq_pharmonline_retirement_replacement"),
+        UniqueConstraint("prior_admission_id", name="uq_pharmonline_retirement_admission"),
+        UniqueConstraint("public_api_external_id", name="uq_pharmonline_retirement_public_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    legacy_product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"))
+    replacement_product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="RESTRICT")
+    )
+    prior_admission_id: Mapped[int] = mapped_column(
+        ForeignKey("pharmonline_public_api_identity_admissions.id", ondelete="RESTRICT")
+    )
+    prior_admission_sha256: Mapped[str] = mapped_column(String(64))
+    retirement_kind: Mapped[str] = mapped_column(String(40))
+    legacy_external_id: Mapped[str] = mapped_column(String(200))
+    archived_external_id: Mapped[str] = mapped_column(String(200))
+    legacy_canonical_url: Mapped[str] = mapped_column(String(500))
+    public_api_external_id: Mapped[str] = mapped_column(String(200))
+    public_api_canonical_url: Mapped[str] = mapped_column(String(500))
+    proof_version: Mapped[str] = mapped_column(String(40))
+    source_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
+    source_transport: Mapped[str] = mapped_column(String(40))
+    preflight_run_ref: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class PharmonlinePublicAPICatalogBaseline(Base):
     """Append-only non-ratcheting catalog floor for public-API recovery."""
 

@@ -30,7 +30,6 @@ from src.main import (
     _pharmonline_public_api_catalog_fingerprint,
     _pharmonline_public_api_reconciliation_plan,
     _pharmonline_public_api_reconciliation_plan_manifest_sha256,
-    _pharmonline_public_api_reconciliation_is_safe,
     _pharmonline_public_api_redirect_challenges,
     _verify_pharmonline_public_api_identities,
 )
@@ -221,6 +220,7 @@ def write_plan_evidence(
     catalog_fingerprint_sha256: str,
     candidate_manifest_sha256: str,
     metrics: dict[str, int],
+    allow_identity_retirement: bool = False,
 ) -> None:
     """Persist aggregate-only evidence for the exact gated apply workflow."""
     raw_path = os.environ.get("PHARMONLINE_PUBLIC_API_PLAN_EVIDENCE_PATH", "").strip()
@@ -228,7 +228,8 @@ def write_plan_evidence(
         return
     path = Path(raw_path)
     payload = {
-        "version": 3,
+        "version": 4,
+        "allow_identity_retirement": allow_identity_retirement,
         "transport": transport,
         "product_count": product_count,
         "catalog_fingerprint_sha256": catalog_fingerprint_sha256,
@@ -238,8 +239,10 @@ def write_plan_evidence(
     path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
 
 
-async def main(*, apply: bool) -> None:
+async def main(*, apply: bool, allow_identity_retirement: bool = False) -> None:
     transport = _transport()
+    if allow_identity_retirement and transport != "decodo":
+        fail("identity retirement requires the manual Decodo workflow")
     lock_wait_seconds = _production_lock_wait_seconds()
     source_manifest_sha256 = ""
     preflight_run_ref = ""
@@ -331,6 +334,7 @@ async def main(*, apply: bool) -> None:
                         session,
                         results,
                         tenant_id=1,
+                        allow_identity_retirement=allow_identity_retirement,
                         redirect_proofs=redirect_proofs,
                         legacy_self_redirect_proofs=legacy_self_redirect_proofs,
                     )
@@ -343,6 +347,7 @@ async def main(*, apply: bool) -> None:
                         session,
                         results,
                         tenant_id=1,
+                        allow_identity_retirement=allow_identity_retirement,
                         redirect_proofs=redirect_proofs,
                         legacy_self_redirect_proofs=legacy_self_redirect_proofs,
                     )
@@ -361,6 +366,7 @@ async def main(*, apply: bool) -> None:
                         session,
                         results,
                         tenant_id=1,
+                        allow_identity_retirement=allow_identity_retirement,
                         source_manifest_sha256=source_manifest_sha256,
                         catalog_fingerprint_sha256=fingerprint,
                         source_transport=transport,
@@ -383,6 +389,8 @@ async def main(*, apply: bool) -> None:
                             + metrics["native_id_url_rebind_ready"]
                             + metrics["native_id_url_rebind_redirect_ready"]
                             + metrics["identity_splits_ready"]
+                            + metrics["identity_retirements_ready"]
+                            + metrics["recovered_identities"]
                             + metrics["existing_native_admissions_ready"]
                             + metrics["new_public_product_admissions_ready"]
                         ),
@@ -409,7 +417,7 @@ async def main(*, apply: bool) -> None:
             f"products={len(verified_catalog.products)}, "
             f"catalog_fingerprint_sha256={fingerprint}, {diagnostic_text}"
         )
-        if not _pharmonline_public_api_reconciliation_is_safe(diagnostics):
+        if diagnostics["reconciliation_safe"] != 1:
             fail("one or more legacy identity transitions require manual proof")
         write_plan_evidence(
             transport=transport,
@@ -417,6 +425,7 @@ async def main(*, apply: bool) -> None:
             catalog_fingerprint_sha256=fingerprint,
             candidate_manifest_sha256=plan_manifest_sha256,
             metrics=diagnostics,
+            allow_identity_retirement=allow_identity_retirement,
         )
         return
 
@@ -436,5 +445,9 @@ if __name__ == "__main__":
         action="store_true",
         help="apply only the fully proven batch supplied by the recovery workflow",
     )
+    parser.add_argument(
+        "--retire-conflicting-identities", action="store_true",
+        help="explicitly plan audited separation of previously admitted identities",
+    )
     args = parser.parse_args()
-    asyncio.run(main(apply=args.apply))
+    asyncio.run(main(apply=args.apply, allow_identity_retirement=args.retire_conflicting_identities))
