@@ -185,3 +185,35 @@
 - Fresh scope: 9,430 products, all classified; all 16 unsafe metrics zero; recovery_schema_migrated=1, reconciliation_safe=1. Ready actions: 3 identity retirements, 12 new public-product admissions, 1 existing-native admission. Other ready rekeys/rebinds/splits zero; no prior retirement/recovered identities. Existing baseline count 1/floor 9,000, so this plan does not create a first baseline. This supersedes the earlier direct diagnostic count of 9,431; use the fresh artifact only.
 - To prove named scope, root reviewed and launched the separate read-only `/tmp/pharmacy-readonly-plan-details.py` helper. It verifies deployed source against the plan manifest, runs the exact published planner with apply=False and two fresh Decodo passes, enforces PostgreSQL default read-only + statement timeout, and releases names only when the full evidence exactly matches. No accepted artifact/production source is modified. Bounded runtime 1,800 seconds; active exec session 54742; result destination `/tmp/pharmacy-recovery-plan-38924647083/named-plan.json`.
 - Recovery --apply and the subsequent full persistence scrape have not run. Current stop is waiting for named read-only comparison before showing the owner a concrete application request.
+
+## 2026-10-16 — Named recovery plan verified; awaiting application approval
+
+- Strict read-only named comparison completed successfully (exit 0, status=matched). It re-read two complete Decodo catalogs, repeated actual redirect proofs, verified all deployed source files against the official manifest, and matched the entire aggregate artifact. Publication_review independently confirmed all hashes, metrics, count coverage and the exact named action set.
+- Final database-enforced read-only verification: retirement ledger remains empty; original Product row hashes and price/observation/admission counts for all three cards still equal the pre-deployment baseline. No recovery transaction or full persistence scrape was run.
+- Planned retirement actions:
+  - Product #67123: Fruto Nyanya uşaq  peçenyesi buğdalı 6+ (2889) 120 q — native_id_replaced; preserve the old Product/history and create a separate current Product.
+  - Product #67148: Kalsimiks № 30 ( Kapsulalar) — native_url_changed; preserve the old Product/history and create a separate current Product.
+  - Product #69407: Raxme omeqa 3  150 ml — native_id_replaced; preserve the old Product/history and create a separate current Product.
+
+- New public products to admit:
+  - Boro plus krem dəri üçün (5928) 25 ml ( Krem)
+  - Diş sapı Oral-B Pro-Expert 25 m
+  - Doctor Don Plus 120 ml
+  - Klimbazole kəpək əleyhinə şampun (2921) 150 ml (Rusiya)
+  - Lenirab 20 mq № 28 ( Kapsulalar) ( İspaniya)
+  - Maqnedoz  № 30
+  - Poliparazin 120 ml
+  - Saksenda 6mq/ml 3 ml № 3
+  - Semavik Nekst 1.0 mq 3 ml ( Şpris-qələm) ( Rusiya)
+  - Taylol  100 ml (Şərbət) (Türkiyə)
+  - Uşaq qidası Kabrita-çox taxıllı pudinq 6+ ay 100 q (Estoniya)
+  - Vitamin  C+Sink4 qr  № 20 (Saşe)
+- Existing native identity to admit: Product #57072, Nutri D3 50000 BV 15 ml.
+
+- Exact prospective write effects: archive 3 original identities while preserving their histories; create 15 Product rows (3 replacement cards + 12 newly observed products); create 3 retirement ledger rows and 13 admission rows (12 new-product + 1 existing-native). Existing catalog baseline floor stays 9,000. No additional rekey, URL continuity transfer or legacy quarantine split is planned. The recovery workflow subsequently runs a separate full Pharmonline scrape to persist fresh prices/observations and verify coverage.
+- Official evidence remains PLAN run 38924647083, release bf35e70c9e0319d567ae107f30323e05ed031a88, candidate manifest 9fa199bcc0b6bc30dbbd9a5cbc815c79eef23456ef34a333c643f76625229f90. Before any later application, recheck the successful plan/source SHA and do not bypass fresh-source/plan drift checks. If source changes, generate/review a new plan instead of forcing the old one.
+- Required CI and normal deployment gates: PASSED. Official read-only PLAN, independent artifact review, strict named comparison and no-apply DB verification: PASSED. Recovery application/full persistence scrape: NOT RUN because this turn authorizes plan preparation; docs/pharmonline-identity-recovery.md requires approval of the concrete fresh plan first.
+- Current result/status: recovery code is merged/deployed and healthy; fresh named plan is complete and independently reviewed; production recovery has not been applied.
+- Last completed action: confirmed exact named effects against the official artifact, verified original cards/history unchanged, and saved the final plan/journal checkpoint.
+- Precise stopping point: before recover-pharmonline-decodo-public-api.yml with confirmation=RECONCILE; ledger count remains 0.
+- Next action: obtain owner approval of this concrete plan and the subsequent full scrape; then run the supported recovery workflow on the exact deployed SHA using plan_run_id=38924647083 and retire_conflicting_identities=true, verify backup/fresh proof, and inspect full-catalog verification plus preserved original history afterward.
