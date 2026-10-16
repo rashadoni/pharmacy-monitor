@@ -428,6 +428,7 @@ _sbx.event("sleep")
 # отдаёт настоящему интерпретатору; всё, что идёт после сверки, только
 # записывает в журнал.
 VENV_PYTHON = r"""
+import json
 import os
 import pathlib
 import sys
@@ -451,6 +452,9 @@ elif args == ["-"] and "BACKUP_PATH" in os.environ:
 
 if kind is not None:
     _sbx.event(kind)
+if kind in {"script", "script --apply"}:
+    with (_sbx.SBX / "script-arguments.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(args[1:]) + "\n")
 if kind == "backup":
     pathlib.Path(os.environ["BACKUP_PATH"]).write_bytes(b"sandbox dump\n")
     sys.exit(0)
@@ -564,7 +568,14 @@ def _steps(workflow: str) -> list[dict]:
 
 
 class Sandbox:
-    def __init__(self, root: Path, *, db_state: str, second_head: bool = False):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        db_state: str,
+        second_head: bool = False,
+        retire_identities: bool = False,
+    ):
         self.root = root
         self.db_state = db_state
         db_revisions = [DB_STATES[db_state]] if DB_STATES[db_state] is not None else []
@@ -589,11 +600,16 @@ class Sandbox:
         self.github_output = root / "github-output"
         # Что шагу оставили предыдущие: выражения `${{ … }}` и переменные из
         # $GITHUB_ENV (у сверки их пишет шаг, проверяющий план).
-        self.context = {"inputs.plan_run_id": "4242"}
+        retirement_mode = str(retire_identities).lower()
+        self.context = {
+            "inputs.plan_run_id": "4242",
+            "inputs.retire_conflicting_identities": retirement_mode,
+        }
         self.github_env.write_text(
             f"PLAN_CATALOG_FINGERPRINT_SHA256={'a' * 64}\n"
             f"PLAN_CANDIDATE_MANIFEST_SHA256={'b' * 64}\n"
-            "PLAN_PRODUCT_COUNT=9400\n",
+            "PLAN_PRODUCT_COUNT=9400\n"
+            f"PLAN_RETIRE_IDENTITIES={retirement_mode}\n",
             encoding="utf-8",
         )
         self.github_output.write_text("", encoding="utf-8")
@@ -777,8 +793,11 @@ def test_refuses_a_commit_with_two_migration_heads(tmp_path: Path, workflow: str
     assert sandbox.db_fingerprint() == before
 
 
-@pytest.mark.parametrize("sandbox", ["at head"], indirect=True)
-def test_recovery_at_the_commit_head_backs_up_and_reconciles_without_migrating(sandbox: Sandbox):
+@pytest.mark.parametrize("retire_identities", [False, True])
+def test_recovery_at_the_commit_head_backs_up_and_reconciles_without_migrating(
+    tmp_path: Path, retire_identities: bool
+):
+    sandbox = Sandbox(tmp_path, db_state="at head", retire_identities=retire_identities)
     result = sandbox.run_gated(RECOVER)
 
     events = sandbox.events
@@ -788,6 +807,14 @@ def test_recovery_at_the_commit_head_backs_up_and_reconciles_without_migrating(s
     assert "reconciliation audit schema verified" in result.stdout, _log(result)
     order = [kind for kind in events if kind != "sleep"]
     assert order[:4] == ["alembic current", "alembic heads", "backup", "script --apply"], events
+    script_arguments = [
+        json.loads(line)
+        for line in (sandbox.root / "script-arguments.jsonl").read_text().splitlines()
+    ]
+    expected_arguments = ["--apply"]
+    if retire_identities:
+        expected_arguments.append("--retire-conflicting-identities")
+    assert script_arguments == [expected_arguments]
     # три попытки публикации; на них стенд сценарий и заканчивает
     assert order[4:] == ["cli run"] * 3, events
     assert result.returncode != 0
