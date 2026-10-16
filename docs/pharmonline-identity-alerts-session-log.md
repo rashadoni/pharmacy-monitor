@@ -102,3 +102,10 @@
 - User replied “начинай” to the explicit request to publish the PR and run full CI. This authorizes branch publication, PR creation and CI/fixes needed for those checks; it does not authorize merge, deployment or applying the production recovery plan.
 - Resumed at the saved worktree/branch. Clean status, latest checkpoint `d11fee96`. Active repository `rashadoni/pharmacy-monitor` main remains `af2ab19b4b5a49649a29f7a416ab6bbb07ca5b1c`; no PR exists for this branch. Stale shared `origin` remains untouched; publish with an explicit active-repository URL.
 - Required CI runs automatically on the PR: Ruff plus new-file formatting; full pytest with PostgreSQL 16, Redis and Chromium, including migrations; frontend typecheck, unit tests and build. No production workflow is triggered by this PR publication.
+
+## 2026-10-16 — Publication preflight defects corrected
+
+- Published the authorized branch to active `rashadoni/pharmacy-monitor` at `dd440093`; no production action.
+- Additional independent publication review found two CI blockers before PR creation: new migration 0025 unconditionally created a table already produced by 0001's current-model bootstrap, and a table-name reference violated the existing model-location guard. Both corrected in `b85c7764` and reviewed by root.
+- Migration now accepts an exactly matching pre-existing ledger and refuses an incompatible one; column types/nullability, PK/FK, unique constraints, index and distinct-product check are verified. Repeated upgrade and used-evidence downgrade refusal are covered. Existing model-location rule remains unchanged.
+- Targeted delivery tests plus existing model-location and backward-compatible migration guards: 28 passed; targeted Ruff, new-file formatting and whitespace checks pass. Tests execute the real 0001 bootstrap, repeat 0025 and reject damaged schema. PostgreSQL full-chain and frozen-0023 schema parity remain required CI checks.
