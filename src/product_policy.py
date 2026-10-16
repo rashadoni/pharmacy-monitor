@@ -783,8 +783,7 @@ def identity_is_retired(product: Any) -> bool:
     """An archived source identity cannot become a current offer in shadow mode."""
     return (
         getattr(product, "site", None) == "pharmonline"
-        and getattr(product, "availability_source", None)
-        == PHARMONLINE_IDENTITY_RETIREMENT_SOURCE
+        and getattr(product, "availability_source", None) == PHARMONLINE_IDENTITY_RETIREMENT_SOURCE
     )
 
 

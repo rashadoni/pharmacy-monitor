@@ -109,3 +109,15 @@
 - Additional independent publication review found two CI blockers before PR creation: new migration 0025 unconditionally created a table already produced by 0001's current-model bootstrap, and a table-name reference violated the existing model-location guard. Both corrected in `b85c7764` and reviewed by root.
 - Migration now accepts an exactly matching pre-existing ledger and refuses an incompatible one; column types/nullability, PK/FK, unique constraints, index and distinct-product check are verified. Repeated upgrade and used-evidence downgrade refusal are covered. Existing model-location rule remains unchanged.
 - Targeted delivery tests plus existing model-location and backward-compatible migration guards: 28 passed; targeted Ruff, new-file formatting and whitespace checks pass. Tests execute the real 0001 bootstrap, repeat 0025 and reject damaged schema. PostgreSQL full-chain and frozen-0023 schema parity remain required CI checks.
+
+## 2026-10-16 — PR #107 opened; required CI running
+
+- PR https://github.com/rashadoni/pharmacy-monitor/pull/107 created and attached to this Codex task. Published head `59e9a4dcd816047de6740b7862aec2058236a3de`.
+- Automatic required CI run https://github.com/rashadoni/pharmacy-monitor/actions/runs/38918390712 started for that exact head. All three named gates registered: Lint (ruff), Test (pytest), Frontend (Next.js). No duplicate manual dispatch was needed.
+- PR description records the behavior, validation, independent review and explicit release/rollback limits. No merge/deployment/recovery authorization inferred from the publication request.
+- Precision on PostgreSQL coverage: the new retirement behavior/rollback/stale-state tests use SQLite. Full CI adds real PostgreSQL fresh migrations, frozen-0023 model parity and existing shared locking tests; it does not introduce a new retirement-specific PostgreSQL concurrency race test. Do not conflate those checks in release claims.
+
+## 2026-10-16 — First CI feedback: formatting corrected
+
+- CI run 38918390712 reached full pytest successfully after PostgreSQL migration bootstrap. Lint found formatting-only differences in `scripts/reconcile_pharmonline_public_api_identities.py` and `src/product_policy.py`; repository formatting policy checks all files introduced since its baseline, including these previously existing files.
+- Applied the pinned Ruff formatter to those two files. ASTs before/after are identical; targeted Ruff, formatting and whitespace checks pass. No behavior or test expectations were changed. Publish the correction to trigger CI for the final PR head.

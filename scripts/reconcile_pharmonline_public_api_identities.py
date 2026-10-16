@@ -446,8 +446,11 @@ if __name__ == "__main__":
         help="apply only the fully proven batch supplied by the recovery workflow",
     )
     parser.add_argument(
-        "--retire-conflicting-identities", action="store_true",
+        "--retire-conflicting-identities",
+        action="store_true",
         help="explicitly plan audited separation of previously admitted identities",
     )
     args = parser.parse_args()
-    asyncio.run(main(apply=args.apply, allow_identity_retirement=args.retire_conflicting_identities))
+    asyncio.run(
+        main(apply=args.apply, allow_identity_retirement=args.retire_conflicting_identities)
+    )
