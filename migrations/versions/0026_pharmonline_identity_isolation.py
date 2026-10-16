@@ -145,7 +145,12 @@ def upgrade():
             op.add_column(
                 table, sa.Column(column, sa.Boolean(), nullable=False, server_default=sa.false())
             )
-        elif existing["nullable"] or not isinstance(existing["type"], sa.Boolean):
+        elif (
+            existing["nullable"]
+            or not isinstance(existing["type"], sa.Boolean)
+            or str(existing["default"]).lower().replace("::boolean", "").strip("()'")
+            not in {"false", "0"}
+        ):
             raise RuntimeError("existing identity trust column differs from migration schema")
 
 

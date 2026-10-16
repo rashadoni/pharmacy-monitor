@@ -28,7 +28,10 @@ def test_upgrade_and_replay_preserve_original_product_and_observation(bootstrap,
         monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(conn)))
         migration.upgrade()
         migration.upgrade()
-        assert not inspect(conn).get_columns("products")[-1]["nullable"] if not bootstrap else True
+        column = next(
+            c for c in inspect(conn).get_columns("products") if c["name"] == "identity_conflicted"
+        )
+        assert not column["nullable"]
         if not bootstrap:
             assert conn.execute(text("SELECT name, identity_conflicted FROM products")).one() == (
                 "original",
@@ -37,6 +40,22 @@ def test_upgrade_and_replay_preserve_original_product_and_observation(bootstrap,
             assert conn.scalar(text("SELECT identity_verified FROM offer_observations")) == 0
         migration.downgrade()
         assert not inspect(conn).has_table("pharmonline_identity_conflicts")
+    engine.dispose()
+
+
+def test_existing_true_default_is_not_accepted_as_trust_schema(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE products (id INTEGER PRIMARY KEY, identity_conflicted BOOLEAN NOT NULL DEFAULT 1)"
+            )
+        )
+        conn.execute(text("CREATE TABLE runs (id INTEGER PRIMARY KEY)"))
+        conn.execute(text("CREATE TABLE offer_observations (id INTEGER PRIMARY KEY)"))
+        monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(conn)))
+        with pytest.raises(RuntimeError, match="trust column differs"):
+            migration.upgrade()
     engine.dispose()
 
 

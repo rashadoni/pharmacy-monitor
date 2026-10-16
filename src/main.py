@@ -6810,6 +6810,13 @@ def run_cmd(
                 функция вызывается после отката, на чистой транзакции."""
                 run.status = failure_status
                 run.error_message = failure_message
+                # A degraded partition is publishable only on successful
+                # finalization. A later verification failure must revoke it.
+                run.run_quality = {
+                    **(run.run_quality or {}),
+                    "financially_eligible": False,
+                    "full_catalog_verified": False,
+                }
                 run.finished_at = utcnow()
                 if request_id is not None:
                     req = session.get(storage.ScrapeRequest, request_id)

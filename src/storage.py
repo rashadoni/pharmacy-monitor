@@ -120,7 +120,8 @@ def run_has_identity_partition(run: Run | None) -> bool:
         return False
     total, trusted, isolated, excluded = counts
     return (
-        partition.get("version") == 1
+        type(partition.get("version")) is int
+        and partition["version"] == 1
         and partition.get("site") == "pharmonline"
         and partition.get("source_complete") is True
         and run.full_catalog_sites == "pharmonline"
@@ -149,7 +150,7 @@ def run_is_financially_eligible(run: Run | None) -> bool:
     if (run.run_quality or {}).get("financially_eligible") is not True:
         return False
     if run.status == "ok":
-        return True
+        return bool(run.catalog_verified)
     if run.status == "degraded":
         return run.finished_at is not None and run_has_identity_partition(run)
     if run.status == "running":

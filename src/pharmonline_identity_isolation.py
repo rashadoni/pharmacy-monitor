@@ -169,12 +169,19 @@ def prepare_catalog(session, results, *, tenant_id, run_id, source_transport):
             verification_results=results,
             isolated_external_ids=isolated,
         )
-        core._verify_pharmonline_public_api_identities(
-            session,
-            results,
-            tenant_id=tenant_id,
-            isolated_external_ids=isolated,
-        )
+        try:
+            core._verify_pharmonline_public_api_identities(
+                session,
+                results,
+                tenant_id=tenant_id,
+                isolated_external_ids=isolated,
+            )
+        except core.PharmonlinePublicAPIIdentityError as exc:
+            if admission["status"] == "refused":
+                raise core.PharmonlinePublicAPIIdentityError(
+                    f"{exc}; scheduled_admission=refused({admission['reason']})"
+                ) from exc
+            raise
         fingerprint = core._pharmonline_public_api_catalog_fingerprint(results)
         records = core._public_api_identity_records(results)
         variants = {

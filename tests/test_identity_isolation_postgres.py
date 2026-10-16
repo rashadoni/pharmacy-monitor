@@ -60,10 +60,11 @@ def test_database_failure_rolls_back_admissions_markers_and_evidence(pg_factory,
         def reject_variant(conn, cursor, statement, parameters, context, executemany):
             if statement.startswith("INSERT INTO pharmonline_identity_conflict_variants"):
                 # Actual aborted PostgreSQL transaction after preceding writes.
-                cursor.execute("SELECT 1 / 0")
+                return "SELECT 1 / 0", {}
+            return statement, parameters
 
         engine = session.get_bind()
-        event.listen(engine, "before_cursor_execute", reject_variant)
+        event.listen(engine, "before_cursor_execute", reject_variant, retval=True)
         try:
             with pytest.raises(DBAPIError):
                 _prepare(session, source, run)

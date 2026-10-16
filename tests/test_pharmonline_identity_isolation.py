@@ -9,6 +9,9 @@ from src import main, storage
 from src._time import utcnow
 from src.pharmonline_identity_isolation import prepare_catalog
 from tests.test_pharmonline_scheduled_admission import _api, _catalog, _catalog_result, _stored
+from tests.test_pharmonline_scheduled_admission import scheduled_run as _scheduled_run
+
+scheduled_run = _scheduled_run
 
 
 def _run(session):
@@ -230,6 +233,7 @@ def test_failed_postprocessing_never_publishes_a_partition(db_session):
     for status in ("running", "failed"):
         run.status = status
         assert not storage.run_is_financially_eligible(run)
+
     run.status = "degraded"
     for key, value in (("source_complete", False), ("trusted_count", 299), ("isolated_count", 26)):
         run.run_quality = {
@@ -237,3 +241,59 @@ def test_failed_postprocessing_never_publishes_a_partition(db_session):
             "identity_partition": {**partition, key: value},
         }
         assert not storage.run_is_financially_eligible(run)
+
+
+@pytest.mark.parametrize("postprocessing_failure", [False, True])
+def test_scheduled_cli_finishes_partition_only_after_postprocessing(
+    db_session, scheduled_run, monkeypatch, tmp_path, postprocessing_failure
+):
+    _, source = _seed(db_session)
+    stages = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main, "_acquire_matcher_lock", lambda *a, **kw: None)
+    monkeypatch.setattr(main, "_release_matcher_lock", lambda *a, **kw: None)
+
+    def matching(session):
+        stages.append("matching")
+        run = session.scalar(select(storage.Run).order_by(storage.Run.id.desc()).limit(1))
+        assert run.status == "running" and run.finished_at is None
+        assert not storage.run_is_financially_eligible(run)  # external view is still closed
+
+    monkeypatch.setattr(main, "_run_matching_stage", matching)
+    monkeypatch.setattr(main.reporter, "render_html", lambda report: "<html></html>")
+    monkeypatch.setattr(main.reporter, "render_excel", lambda report: b"report")
+    if postprocessing_failure:
+
+        def fail_report(report):
+            raise main.FullCatalogVerificationError("postprocessing rejected")
+
+        monkeypatch.setattr(main.reporter, "render_html", fail_report)
+    result = scheduled_run(*source[0].products)
+    db_session.expire_all()
+    run = db_session.scalar(select(storage.Run).order_by(storage.Run.id.desc()).limit(1))
+    assert stages == ["matching"]
+    assert run.status == "degraded" and run.finished_at is not None
+    assert run.catalog_verified is False
+    assert run.run_quality["identity_partition"]["isolated_count"] == 3
+    assert run.products_scraped == 300 and run.products_per_site == {"pharmonline": 300}
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(storage.PriceSnapshot)
+            .where(storage.PriceSnapshot.run_id == run.id)
+        )
+        == 297
+    )
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(storage.OfferObservation)
+            .where(
+                storage.OfferObservation.run_id == run.id,
+                storage.OfferObservation.identity_verified.is_(True),
+            )
+        )
+        == 297
+    )
+    assert storage.run_is_financially_eligible(run) is not postprocessing_failure
+    assert (result.exit_code == 0) is not postprocessing_failure, result.output

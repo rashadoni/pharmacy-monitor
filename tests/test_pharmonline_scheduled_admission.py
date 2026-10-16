@@ -982,7 +982,7 @@ def test_scheduled_run_admits_a_new_product_and_persists_the_catalog(db_session,
     assert _url("brand-new") in mail["html_body"]
 
 
-def test_scheduled_run_still_stops_on_a_url_change(db_session, scheduled_run):
+def test_scheduled_run_still_stops_on_mass_identity_drift(db_session, scheduled_run):
     db_session.add(_stored(1, "old-address"))
     db_session.commit()
 
@@ -992,13 +992,13 @@ def test_scheduled_run_still_stops_on_a_url_change(db_session, scheduled_run):
     run = _latest_run(db_session)
     assert run.status == "failed"
     assert run.catalog_verified is False
-    verdict = "scheduled_admission=refused(plan_unsafe:native_id_url_rebind_unproven=1)"
-    # Там, где смотрит админ: health и список прогонов показывают error_message.
-    assert "mismatched_urls=1" in run.error_message
+    # Half the catalog changed identity; bounded isolation must not turn a
+    # source-wide defect into an accepted partition.
+    verdict = "identity drift exceeds isolation limit"
     assert verdict in run.error_message
     assert verdict in run.run_quality["catalog_verification_reason_full"]
     assert run.catalog_verification_reason.startswith("public_api_identity_proof_failed:")
-    assert run.run_quality["pharmonline_identity_admission"]["status"] == "refused"
+    assert "identity_partition" not in run.run_quality
     _assert_nothing_written(db_session, products=1)
     assert db_session.query(storage.PriceSnapshot).count() == 0
     assert scheduled_run.sent == []
