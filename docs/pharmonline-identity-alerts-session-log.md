@@ -96,3 +96,9 @@
 - Last completed action: saved the reviewed implementation and concrete release/recovery procedure in checkpoint commits, checked targeted lint and whitespace.
 - Precise stopping point: no push, PR, merge, deployment, production migration or recovery application. Required full CI/PostgreSQL gates and fresh live Decodo proof remain outstanding.
 - Next action: publish this reviewed branch to active `rashadoni/pharmacy-monitor` as a PR and run required CI with task-specific authorization; then show the owner the concrete visible-change list before merge/deploy, and obtain/review the live read-only recovery plan before applying it. Do not use the stale configured origin, retired server, or selective health-hotfix route.
+
+## 2026-10-16 — PR publication and full CI authorized
+
+- User replied “начинай” to the explicit request to publish the PR and run full CI. This authorizes branch publication, PR creation and CI/fixes needed for those checks; it does not authorize merge, deployment or applying the production recovery plan.
+- Resumed at the saved worktree/branch. Clean status, latest checkpoint `d11fee96`. Active repository `rashadoni/pharmacy-monitor` main remains `af2ab19b4b5a49649a29f7a416ab6bbb07ca5b1c`; no PR exists for this branch. Stale shared `origin` remains untouched; publish with an explicit active-repository URL.
+- Required CI runs automatically on the PR: Ruff plus new-file formatting; full pytest with PostgreSQL 16, Redis and Chromium, including migrations; frontend typecheck, unit tests and build. No production workflow is triggered by this PR publication.
