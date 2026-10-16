@@ -155,3 +155,9 @@
 - Reconciled routing: active `rashadoni/pharmacy-monitor`, user-confirmed `13.140.186.143:/opt/pharmacy-monitor`, normal manual deploy.yml. Stale shared origin/SSH alias remain unchanged and unused for release.
 - Independent read-only review confirms that a valid v4 retirement plan requires migration 0025. Running it before deployment would spend two full Decodo reads and then refuse with recovery_schema_migrated=0; do not bypass that guard or migrate manually. Supported order: merge tested PR, green CI on resulting main SHA, normal deploy with verified backup/apply_migrations=true, then PLAN on that SHA.
 - The plan uses isolated temporary source, two full Decodo reads and redirect observations under the existing scrape lock; DB transaction is read-only, email disabled. It may use the existing paid proxy allowance. No recovery --apply or full scrape is authorized in this step.
+
+## 2026-10-16 — Reviewed PR merged; release SHA awaiting CI
+
+- PR #107 merged through the normal protected PR API with the exact expected head `f66e244b900c954b98c7a21b921e46adf59a5b1a`; no admin bypass or direct main push. Resulting release SHA is `bf35e70c9e0319d567ae107f30323e05ed031a88`.
+- GitHub reports the merged tree `c1475d0bec50d0ef3fb23f4a0abe85abd57e098d`, identical to the previously tested PR tree. Required push CI https://github.com/rashadoni/pharmacy-monitor/actions/runs/38922169355 is running; do not dispatch deploy until it succeeds for this exact SHA.
+- Local branch remains dedicated and only carries additional append-only journal checkpoints. Production release will use the immutable merged SHA through deploy.yml, not the local journal head.
