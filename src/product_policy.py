@@ -32,6 +32,7 @@ COUNTRY_INVALID = "invalid"
 OFFER_IN_STOCK = "in_stock"
 OFFER_OUT_OF_STOCK = "out_of_stock"
 OFFER_UNKNOWN = "unknown"
+PHARMONLINE_IDENTITY_RETIREMENT_SOURCE = "pharmonline_identity_retirement"
 
 COUNTRY_POLICY_MODES = {"shadow", "enforce"}
 AVAILABILITY_POLICY_MODES = {"shadow", "enforce"}
@@ -773,8 +774,27 @@ POLICY_PRODUCT_FIELDS = (
     "manufacturer_country_code",
     "country_resolution_status",
     "offer_availability_status",
+    "availability_source",
     "availability_observed_at",
 )
+
+
+def identity_is_retired(product: Any) -> bool:
+    """An archived source identity cannot become a current offer in shadow mode."""
+    return (
+        getattr(product, "site", None) == "pharmonline"
+        and getattr(product, "availability_source", None)
+        == PHARMONLINE_IDENTITY_RETIREMENT_SOURCE
+    )
+
+
+def identity_not_retired_sql(Product):
+    """Null-safe SQL counterpart of ``not identity_is_retired(product)``."""
+    return or_(
+        Product.site != "pharmonline",
+        Product.availability_source.is_(None),
+        Product.availability_source != PHARMONLINE_IDENTITY_RETIREMENT_SOURCE,
+    )
 
 
 def country_code_of(product: Any) -> str | None:
@@ -819,6 +839,8 @@ class Eligibility:
 def current_offer_eligibility(
     product: Any, *, now: datetime | None = None, max_age_hours: int | None = None
 ) -> Eligibility:
+    if identity_is_retired(product):
+        return Eligibility(False, "identity_retired")
     if getattr(product, "url_dead_at", None) is not None:
         return Eligibility(False, "dead_url")
     status = getattr(product, "offer_availability_status", OFFER_UNKNOWN) or OFFER_UNKNOWN
@@ -871,7 +893,7 @@ def policy_financial_eligibility(
         return identity
     for product in products:
         offer = current_offer_eligibility(product, now=now)
-        if offer.reason in {"dead_url", "out_of_stock"}:
+        if offer.reason in {"dead_url", "out_of_stock", "identity_retired"}:
             return offer
         if availability_policy_enforced() and not offer.eligible:
             return offer
@@ -889,7 +911,7 @@ def policy_identity_eligibility(products: list[Any]) -> Eligibility:
 
 def policy_offer_eligibility(product: Any, *, now: datetime | None = None) -> Eligibility:
     offer = current_offer_eligibility(product, now=now)
-    if offer.reason in {"dead_url", "out_of_stock"}:
+    if offer.reason in {"dead_url", "out_of_stock", "identity_retired"}:
         return offer
     if availability_policy_enforced() and not offer.eligible:
         return offer
@@ -907,6 +929,7 @@ def current_offer_sql(Product, *, now: datetime | None = None):
         for site, max_age in OFFER_MAX_AGE_HOURS.items()
     ]
     return and_(
+        identity_not_retired_sql(Product),
         Product.url_dead_at.is_(None),
         Product.offer_availability_status == OFFER_IN_STOCK,
         Product.availability_observed_at.is_not(None),

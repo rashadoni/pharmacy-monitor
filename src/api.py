@@ -4837,6 +4837,7 @@ def _require_match_policy(products: list[storage.Product]) -> None:
         country_policy_enforced,
         current_offer_eligibility,
         identity_eligibility,
+        identity_is_retired,
     )
 
     identity = identity_eligibility(products)
@@ -4845,6 +4846,8 @@ def _require_match_policy(products: list[storage.Product]) -> None:
     if country_policy_enforced() and not identity.eligible:
         raise HTTPException(409, "Manufacturing country is not verified for every product")
     for product in products:
+        if identity_is_retired(product):
+            raise HTTPException(409, f"Product {product.id} has an archived source identity")
         if product.offer_availability_status == OFFER_OUT_OF_STOCK:
             raise HTTPException(409, f"Product {product.id} is out of stock on {product.site}")
         if availability_policy_enforced() and not current_offer_eligibility(product).eligible:
@@ -5617,6 +5620,7 @@ def dash_match_candidate_analogs(
     from rapidfuzz import fuzz
 
     from src import match_actions, matcher
+    from src.product_policy import identity_not_retired_sql
 
     match = db.scalar(
         select(storage.Match).where(
@@ -5651,6 +5655,7 @@ def dash_match_candidate_analogs(
             storage.Product.canonical_id.is_(None),
             storage.Product.url_dead_at.is_(None),
             storage.Product.offer_availability_status != "out_of_stock",
+            identity_not_retired_sql(storage.Product),
             or_(*conds),
         )
         .limit(500)

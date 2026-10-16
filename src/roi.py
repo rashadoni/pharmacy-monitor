@@ -923,6 +923,7 @@ def _map_violations(
         OFFER_OUT_OF_STOCK,
         availability_policy_enforced,
         current_offer_sql,
+        identity_not_retired_sql,
         policy_offer_eligibility,
     )
     from src.storage import latest_snapshots_per_product
@@ -951,6 +952,7 @@ def _map_violations(
             Product.tenant_id == tenant_id,
             Product.site.in_(competitor_sites),
             Product.brand.is_not(None),
+            identity_not_retired_sql(Product),
             offer_predicate,
             PriceSnapshot.captured_at >= floor_window_start,
             storage.trusted_snapshot_filter(eligible_run_ids),
