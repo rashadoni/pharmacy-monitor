@@ -250,6 +250,9 @@ def check_health(
                     "status": attempt.status,
                     "site_status": site_status,
                     "error_message": attempt.error_message,
+                    "catalog_verification_reason_full": quality.get(
+                        "catalog_verification_reason_full"
+                    ),
                     "catalog_verification_reason": (
                         attempt.catalog_verification_reason
                         or quality.get("catalog_verification_reason")
@@ -278,7 +281,11 @@ def check_health(
             detail = f"{site}=#{row.get('run_id') or '—'}:{row['status']}"
             if row.get("site_status") and row["site_status"] != row["status"]:
                 detail += f" (сбор: {row['site_status']})"
-            reason = row.get("error_message") or row.get("catalog_verification_reason")
+            reason = (
+                row.get("error_message")
+                or row.get("catalog_verification_reason_full")
+                or row.get("catalog_verification_reason")
+            )
             if reason:
                 detail += f": {reason}"
             summary_parts.append(detail)

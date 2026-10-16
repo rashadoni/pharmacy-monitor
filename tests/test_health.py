@@ -209,7 +209,9 @@ def test_later_partial_ok_does_not_clear_unverified_full_catalog(db_session):
     assert issue.context["sites"]["pharmonline"]["run_id"] == full.id
 
 
-@pytest.mark.parametrize("reason_source", ["error", "catalog_reason", "quality_reason", "missing"])
+@pytest.mark.parametrize(
+    "reason_source", ["error", "full_quality_reason", "catalog_reason", "quality_reason", "missing"]
+)
 def test_failed_identity_proof_remains_explained_after_partial_success(db_session, reason_source):
     """A complete scrape rejected before persistence must not be advertised as ok."""
     now = utcnow()
@@ -232,6 +234,13 @@ def test_failed_identity_proof_remains_explained_after_partial_success(db_sessio
     if reason_source == "error":
         failed.error_message = reason
         failed.catalog_verification_reason = "shortened diagnostic"
+        failed.run_quality = {
+            **failed.run_quality,
+            "catalog_verification_reason_full": "alternative quality diagnostic",
+        }
+    elif reason_source == "full_quality_reason":
+        failed.catalog_verification_reason = "shortened diagnostic"
+        failed.run_quality = {**failed.run_quality, "catalog_verification_reason_full": reason}
     elif reason_source == "catalog_reason":
         failed.catalog_verification_reason = reason
     elif reason_source == "quality_reason":
@@ -256,12 +265,16 @@ def test_failed_identity_proof_remains_explained_after_partial_success(db_sessio
     assert site_context["status"] == "failed"
     assert site_context["site_status"] == "ok"
     assert site_context["error_message"] == failed.error_message
+    assert site_context["catalog_verification_reason_full"] == failed.run_quality.get(
+        "catalog_verification_reason_full"
+    )
     assert site_context["catalog_verification_reason"] == (
-        failed.catalog_verification_reason
-        or failed.run_quality.get("catalog_verification_reason")
+        failed.catalog_verification_reason or failed.run_quality.get("catalog_verification_reason")
     )
     if reason_source != "missing":
         assert reason in issue.message
+        assert "shortened diagnostic" not in issue.message
+        assert "alternative quality diagnostic" not in issue.message
     else:
         assert "None" not in issue.message
 
