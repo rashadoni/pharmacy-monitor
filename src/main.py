@@ -186,7 +186,9 @@ def _pharmonline_public_api_autonomous_marker_path() -> Path:
     written by the guarded activation workflow is therefore the narrow,
     auditable opt-in that redirects *that exact auto-mode, single-site run* to
     the verified public API.  It does not change ordinary multi-site or manual
-    category runs.
+    category runs.  Since 2026-10-14 the same marker keeps pharmonline out of
+    those runs (`_sites_without_pharmonline_catalog_scan`); they still never
+    enter public_api.
     """
     configured = os.environ.get(_PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_ENV, "").strip()
     return Path(configured) if configured else _PHARMONLINE_PUBLIC_API_AUTONOMOUS_MARKER_DEFAULT
@@ -203,6 +205,16 @@ def _pharmonline_public_api_autonomous_mode_requested(
     """
     if mode != "auto" or sites != ["pharmonline"]:
         return False
+    return _pharmonline_public_api_autonomous_marker_present()
+
+
+def _pharmonline_public_api_autonomous_marker_present() -> bool:
+    """Стоит ли на хосте маркер автономного режима — ровно с нужным содержимым.
+
+    Одно условие на оба решения: по нему ночной `run --site pharmonline` уходит
+    в public_api, и по нему же сбор каталога pharmonline не берёт
+    (`_sites_without_pharmonline_catalog_scan`). Разойтись они не могут.
+    """
     try:
         return (
             _pharmonline_public_api_autonomous_marker_path().read_text(encoding="utf-8")
@@ -210,6 +222,71 @@ def _pharmonline_public_api_autonomous_mode_requested(
         )
     except OSError:
         return False
+
+
+# Пометка в заявке кнопки и строка вывода, когда pharmonline убран из сбора
+# каталога. Заявку видит админ: /runs, а у неудавшегося сбора — и плашка на
+# странице категорий.
+_PHARMONLINE_LEFT_TO_PUBLIC_API_NOTE = (
+    "pharmonline не собирался: на этом сервере его каталог собирает только "
+    "маршрут public_api — проверенный публичный API с проверкой личностей и "
+    "автодопуском (ночью — таймер, `run --site pharmonline`). Собрать вне "
+    "расписания — RUNBOOK «Сбор pharmonline: новые товары допускаются сами…»."
+)
+
+
+def _sites_without_pharmonline_catalog_scan(
+    session: Session,
+    sites: list[str],
+    *,
+    sites_named: bool,
+    category_id: int | None,
+) -> tuple[list[str], str | None, str | None]:
+    """Сбор каталога на хосте, где pharmonline живёт в public_api, — без pharmonline.
+
+    Сбор каталога (`--mode category`; так зовёт `run` вотчер кнопки «Запустить
+    scrape») берёт pharmonline сборщиком из env — на сервере это DDP — и пишет
+    его каталог по категориям по ходу сбора, мимо проверки личностей и
+    автодопуска. Наблюдения DDP проверка личностей потом считает доверенной
+    историей, а полная попытка решает доверие к каталогу сайта. Поэтому на хосте
+    с маркером сбор каталога pharmonline не собирает никогда:
+
+      * сайты не названы (кнопка «все» или категория, `run --force`) — pharmonline
+        убирается, остальные собираются, вызывающий получает пометку;
+      * у выбранной категории маршрут есть только на pharmonline — отказ;
+      * pharmonline назван явно (`--site pharmonline`, заявка с выбранными
+        сайтами) — отказ: явную просьбу молча не урезаем.
+
+    Возвращает (сайты прогона, причина отказа, пометка).
+    """
+    if "pharmonline" not in sites:
+        return sites, None, None
+    refusal_tail = (
+        "на этом сервере каталог pharmonline собирает только маршрут public_api — "
+        "проверенный публичный API с проверкой личностей и автодопуском (ночью — "
+        "таймер, `run --site pharmonline`). Сбор каталога (--mode category, кнопка "
+        "«Запустить scrape») шёл бы мимо них. "
+        "Собрать pharmonline вне расписания — RUNBOOK «Сбор pharmonline: новые товары "
+        "допускаются сами…»."
+    )
+    if sites_named:
+        return sites, "pharmonline этим запуском не собирается: " + refusal_tail, None
+    others = [s for s in sites if s != "pharmonline"]
+    if category_id is None:
+        return others, None, _PHARMONLINE_LEFT_TO_PUBLIC_API_NOTE
+    if not watchlist.categories_for_site(session, "pharmonline", only_category_id=category_id):
+        # У категории нет маршрута на pharmonline — терять нечего, и пометка
+        # была бы шумом.
+        return others, None, None
+    if not any(
+        watchlist.categories_for_site(session, s, only_category_id=category_id) for s in others
+    ):
+        return (
+            sites,
+            f"категория #{category_id} есть только у pharmonline, а " + refusal_tail,
+            None,
+        )
+    return others, None, _PHARMONLINE_LEFT_TO_PUBLIC_API_NOTE
 
 
 def _enable_pharmonline_public_api_autonomous_mode() -> None:
@@ -4031,15 +4108,22 @@ def mark_scrape_request_terminal(
     session: Session,
     request_id: int,
     run: storage.Run,
+    *,
+    note: str | None = None,
 ) -> storage.ScrapeRequest | None:
-    """Copy the authoritative scrape-phase terminal state to the UI queue."""
+    """Copy the authoritative scrape-phase terminal state to the UI queue.
+
+    `note` — то, что `run` записал в заявку до сбора (pharmonline убран из
+    прогона): причина прогона её не затирает, а встаёт перед ней — первым
+    админ должен видеть, что случилось со сбором.
+    """
     request = session.get(storage.ScrapeRequest, request_id)
     if request is None or request.tenant_id != run.tenant_id:
         return None
     request.run_id = run.id
     request.status = run.status
     request.completed_at = utcnow()
-    request.error_message = run.error_message
+    request.error_message = "; ".join(m for m in (run.error_message, note) if m) or None
     session.commit()
     return request
 
@@ -6082,8 +6166,10 @@ def run_cmd(
         _enable_pharmonline_public_api_autonomous_mode()
         # The root-owned generic systemd unit can only call ``run --site %i``.
         # Its protected marker is thus the sole automatic bridge to the
-        # guarded full-catalog mode; manual category/multi-site commands stay
-        # unchanged because they never satisfy the scope predicate above.
+        # guarded full-catalog mode; manual category/multi-site commands never
+        # enter it because they never satisfy the scope predicate above.  Below,
+        # the same marker drops pharmonline from them
+        # (`_sites_without_pharmonline_catalog_scan`).
         mode = "public_api"
 
     use_legacy_identity_bridge = _pharmonline_legacy_id_bridge_enabled()
@@ -6150,6 +6236,52 @@ def run_cmd(
         # (`watchlist-tick`), он зовёт mode="watchlist" явно.
         if mode == "auto":
             mode = "category"
+
+        # pharmonline на этом хосте собирает только public_api (маркер выше).
+        # Сбор каталога его не берёт — ни кнопкой, ни руками. Обязательно ДО
+        # гварда ритма и до строки прогона: полная попытка решает доверие к
+        # каталогу сайта, а у pharmonline её делает только public_api.
+        request_note: str | None = None
+        # Маркер читается, только когда в прогоне есть pharmonline: таймерам
+        # aloe и aptekonline до него дела нет, и испорченный файл не должен
+        # ронять их сбор.
+        if (
+            mode == "category"
+            and "pharmonline" in sites
+            and _pharmonline_public_api_autonomous_marker_present()
+        ):
+            sites, refusal, request_note = _sites_without_pharmonline_catalog_scan(
+                session,
+                sites,
+                sites_named=bool(site),
+                category_id=category_id,
+            )
+            if refusal is not None:
+                log.warning(
+                    "run_refused_pharmonline_catalog_scan",
+                    sites=sites,
+                    category_id=category_id,
+                    request_id=request_id,
+                )
+                if request_id is not None:
+                    req = session.get(storage.ScrapeRequest, request_id)
+                    req.status = "failed"
+                    req.completed_at = utcnow()
+                    req.error_message = refusal
+                    session.commit()
+                raise click.ClickException(refusal)
+            if request_note is not None:
+                click.echo(f"run: {request_note}")
+                log.info(
+                    "run_pharmonline_left_to_public_api",
+                    sites=sites,
+                    category_id=category_id,
+                    request_id=request_id,
+                )
+                if request_id is not None:
+                    req = session.get(storage.ScrapeRequest, request_id)
+                    req.error_message = request_note
+                    session.commit()
 
         # Определяем режим. Обязательно ДО гварда ритма: он решает по тому, во
         # что прогон разрешился.
@@ -6501,7 +6633,7 @@ def run_cmd(
             # finish, because publishing ok earlier would expose untrusted money
             # output. Bounded/watchlist runs can surface scrape quality now.
             if request_id is not None and not is_full_catalog:
-                req = mark_scrape_request_terminal(session, request_id, run)
+                req = mark_scrape_request_terminal(session, request_id, run, note=request_note)
                 if req is not None:
                     log.info(
                         "scrape_request_marked_complete_early",
@@ -6756,6 +6888,11 @@ def run_cmd(
                         req.run_id = run_id
                         req.status = failure_status
                         req.completed_at = utcnow()
+                        if request_note is not None:
+                            # Пометка о pharmonline стоит в заявке с начала
+                            # сбора; без причины впереди плашка «Сбой» читалась
+                            # бы как сбой из-за pharmonline.
+                            req.error_message = f"{failure_message}; {request_note}"
 
             # Причина — в журнал до записи итога: если база не примет и итог,
             # строка останется. Сбой самой строки (оборванный вывод) запись
