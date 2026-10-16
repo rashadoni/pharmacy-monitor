@@ -171,3 +171,9 @@
 - CI run 38922169355 succeeded for merged SHA `bf35e70c9e0319d567ae107f30323e05ed031a88`: all three required checks green. Full pytest: 3,602 passed, 10 skipped, 1 expected failure, 7 warnings in 432.50 seconds.
 - Started normal deploy.yml with apply_migrations=true: https://github.com/rashadoni/pharmacy-monitor/actions/runs/38924134664. Confirmed its resolved head SHA is exactly the approved/CI-verified merge SHA. GitHub rejected a direct raw-SHA dispatch (422/no ref, no run); re-read/checked main before dispatching that branch and verified the resulting run SHA.
 - Deployment uses its standard preflight, verified backup, migration-before-code sequence and service health checks. No manual migration, direct server deploy or feature-worktree copy. Recovery application remains unauthorized and will not be invoked while preparing the plan.
+
+## 2026-10-16 — Deployment healthy; fresh v4 plan running
+
+- Normal deployment https://github.com/rashadoni/pharmacy-monitor/actions/runs/38924134664 succeeded for release SHA `bf35e70c9e0319d567ae107f30323e05ed031a88`. Standard verified backup, migration-before-code, source sync, frontend build, API/frontend restarts and health/login checks passed.
+- Post-deployment DB-enforced read-only check: revision `0025_identity_retirements`, retirement ledger count 0. All three target Product row hashes exactly match the pre-deployment baseline; prices/observations/admissions remain #67148 1/7/1, #67123 1/7/1, #69407 1/2/1. Deployment did not apply recovery or change these cards.
+- Started fresh read-only workflow https://github.com/rashadoni/pharmacy-monitor/actions/runs/38924647083 with confirmation=PLAN and retire_conflicting_identities=true. Confirmed its resolved head is the exact deployed/green-CI SHA. Await the artifact, independently validate all metrics/source hashes, then reproduce the private named plan read-only against its exact manifest.
