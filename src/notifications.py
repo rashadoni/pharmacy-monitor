@@ -142,6 +142,8 @@ def dispatch_event(session: Session, event: storage.AlertEvent) -> dict[str, str
     if event.channels_sent and len(event.channels_sent) > 0:
         log.debug("dispatch_skipped_already_sent", event_id=event.id)
         return {"skipped": "already_sent"}
+    if not _event_source_identities_eligible(session, event):
+        return {"skipped": "identity_not_eligible"}
 
     tenant_id = getattr(event, "tenant_id", 1)
     users = session.scalars(
@@ -219,7 +221,12 @@ def dispatch_events_batch(session: Session, events: list[storage.AlertEvent]) ->
     Возвращает {'email': писем, 'telegram': сообщений}.
     """
     # Dedup: не трогаем уже отправленные (retry-safe, как dispatch_event).
-    pending = [e for e in events if not (e.channels_sent and len(e.channels_sent) > 0)]
+    pending = [
+        e
+        for e in events
+        if not (e.channels_sent and len(e.channels_sent) > 0)
+        and _event_source_identities_eligible(session, e)
+    ]
     if not pending:
         return {"email": 0, "telegram": 0}
 
@@ -346,6 +353,8 @@ def mail_unstored_events_to_admins(
     counts = {"email": 0, "telegram": 0, "failed": 0}
     by_tenant: dict[int, list[storage.AlertEvent]] = {}
     for e in events:
+        if not _event_source_identities_eligible(session, e):
+            continue
         by_tenant.setdefault(getattr(e, "tenant_id", 1) or 1, []).append(e)
 
     for tenant_id, tevents in by_tenant.items():
@@ -824,6 +833,8 @@ def _event_is_digest_eligible(session: Session, event: storage.AlertEvent) -> bo
     """Fail closed for financial events created before verified run provenance."""
     if event.rule_type not in _FINANCIAL_EVENT_TYPES:
         return True
+    if not _event_source_identities_eligible(session, event):
+        return False
     run_id = _payload(event).get("source_run_id")
     if not isinstance(run_id, int):
         log.warning("digest_event_skipped_unverified", event_id=event.id, reason="no_source_run")
@@ -848,6 +859,25 @@ def _event_is_digest_eligible(session: Session, event: storage.AlertEvent) -> bo
             reason="run_not_financially_eligible",
         )
     return eligible
+
+
+def _event_source_identities_eligible(session: Session, event: storage.AlertEvent) -> bool:
+    """A queued event cannot revive an identity isolated after its creation."""
+    from src.product_policy import source_identity_eligibility
+
+    payload = _payload(event)
+    products = []
+    if isinstance(payload.get("product_id"), int):
+        product = session.get(storage.Product, payload["product_id"])
+        if product is None or product.tenant_id != event.tenant_id:
+            return False
+        products.append(product)
+    if isinstance(payload.get("match_id"), int):
+        match = session.get(storage.Match, payload["match_id"])
+        if match is None or match.tenant_id != event.tenant_id:
+            return False
+        products.extend(match.products)
+    return all(source_identity_eligibility(product).eligible for product in products)
 
 
 # ─── Утреннее письмо: разница цен ────────────────────────────────────────────

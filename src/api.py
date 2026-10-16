@@ -140,6 +140,7 @@ hide_query_strings()
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Индекс поиска по каталогу собирается около секунды. Прогреваем его в фоне
@@ -477,6 +478,9 @@ class HealthOut(BaseModel):
     full_catalog_run_at: datetime | None = None
     full_catalog_status: str | None = None
     full_catalog_verified: bool = False
+    full_catalog_source_complete: bool = False
+    isolated_identity_count: int = 0
+    trusted_identity_count: int = 0
     product_policy: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -743,11 +747,7 @@ def _health_snapshot(db: Session) -> HealthOut:
     db_ms = _ping_db(db)
     redis_ms = _ping_redis()
     sites = _staleness_per_site(db)
-    stale = any(
-        s.hours_since is not None
-        and s.hours_since > s.max_age_hours
-        for s in sites
-    )
+    stale = any(s.hours_since is not None and s.hours_since > s.max_age_hours for s in sites)
     run_unhealthy = last is not None and last.status in {"degraded", "failed"}
     full_verified = bool(
         set(full_attempts) == set(storage.FULL_CATALOG_SITES)
@@ -755,9 +755,7 @@ def _health_snapshot(db: Session) -> HealthOut:
             attempt.status == "ok"
             and (attempt.run_quality or {}).get("full_catalog_verified") is True
             and (attempt.run_quality or {}).get("financially_eligible") is True
-            and (
-                ((attempt.run_quality or {}).get("sites") or {}).get(site) or {}
-            ).get("status")
+            and (((attempt.run_quality or {}).get("sites") or {}).get(site) or {}).get("status")
             == "ok"
             for site, attempt in full_attempts.items()
         )
@@ -794,6 +792,12 @@ def _health_snapshot(db: Session) -> HealthOut:
         full_catalog_run_at=full_completed_at,
         full_catalog_status=full_status,
         full_catalog_verified=full_verified,
+        full_catalog_source_complete=bool(
+            set(full_attempts) == set(storage.FULL_CATALOG_SITES)
+            and all(storage.run_is_financially_eligible(run) for run in full_attempts.values())
+        ),
+        isolated_identity_count=sum(row["isolated_products"] for row in policy_report["sites"]),
+        trusted_identity_count=sum(row["trusted_products"] for row in policy_report["sites"]),
         product_policy=policy_report,
     )
 
@@ -2291,6 +2295,8 @@ def _comparison_search(
                     storage.Product.url,
                     storage.Product.last_seen_at,
                     storage.Product.url_dead_at,
+                    storage.Product.identity_conflicted,
+                    storage.Product.availability_source,
                     storage.Product.manufacturer_country_code,
                     storage.Product.country_resolution_status,
                     storage.Product.offer_availability_status,
@@ -2377,7 +2383,11 @@ def dash_comparison_search(
 
     now = utcnow()
     candidates = []
+    from src.product_policy import source_identity_eligibility
+
     for product in found:
+        if not source_identity_eligibility(product).eligible:
+            continue
         if product.url_dead_at is not None:
             continue
         if product.canonical_id is not None and product.canonical_id in shown_match_ids:
@@ -4837,17 +4847,21 @@ def _require_match_policy(products: list[storage.Product]) -> None:
         country_policy_enforced,
         current_offer_eligibility,
         identity_eligibility,
-        identity_is_retired,
+        source_identity_eligibility,
     )
 
+    for product in products:
+        source_identity = source_identity_eligibility(product)
+        if source_identity.reason == "identity_conflicted":
+            raise HTTPException(409, f"Product {product.id} has a conflicting source identity")
+        if source_identity.reason == "identity_retired":
+            raise HTTPException(409, f"Product {product.id} has an archived source identity")
     identity = identity_eligibility(products)
     if identity.reason == "country_conflict":
         raise HTTPException(409, "Products have different manufacturing countries")
     if country_policy_enforced() and not identity.eligible:
         raise HTTPException(409, "Manufacturing country is not verified for every product")
     for product in products:
-        if identity_is_retired(product):
-            raise HTTPException(409, f"Product {product.id} has an archived source identity")
         if product.offer_availability_status == OFFER_OUT_OF_STOCK:
             raise HTTPException(409, f"Product {product.id} is out of stock on {product.site}")
         if availability_policy_enforced() and not current_offer_eligibility(product).eligible:
@@ -5069,6 +5083,7 @@ def dash_match_alternatives(
 
 
 # ── Phase 4.1+4.3+4.6 (2026-05-27) — Pricing settings + cost CSV import ─────
+
 
 class PricingConfigOut(BaseModel):
     raise_threshold_pct: float
@@ -5620,7 +5635,7 @@ def dash_match_candidate_analogs(
     from rapidfuzz import fuzz
 
     from src import match_actions, matcher
-    from src.product_policy import identity_not_retired_sql
+    from src.product_policy import source_identity_eligible_sql
 
     match = db.scalar(
         select(storage.Match).where(
@@ -5655,7 +5670,7 @@ def dash_match_candidate_analogs(
             storage.Product.canonical_id.is_(None),
             storage.Product.url_dead_at.is_(None),
             storage.Product.offer_availability_status != "out_of_stock",
-            identity_not_retired_sql(storage.Product),
+            source_identity_eligible_sql(storage.Product),
             or_(*conds),
         )
         .limit(500)
@@ -6230,13 +6245,7 @@ def comparisons(db: Session = Depends(get_db)):
         db,
         tenant_id=1,
     )
-    last_run = db.scalar(
-        select(storage.Run.id)
-        .where(storage.Run.status == "ok")
-        .order_by(desc(storage.Run.id))
-        .limit(1)
-    )
-    if not last_run:
+    if not _has_ok_run(db, tenant_id=1):
         return []
     matches = db.scalars(select(storage.Match).where(storage.Match.tenant_id == 1)).all()
     # Diff-only-aware: латест на product_id, не последний run (см. /dash/comparison).

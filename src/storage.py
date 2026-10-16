@@ -30,6 +30,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    false,
 )
 from sqlalchemy.engine import Engine, ExceptionContext
 from sqlalchemy.orm import (
@@ -100,16 +101,58 @@ class Run(Base):
     )
 
 
+def run_has_identity_partition(run: Run | None) -> bool:
+    """Complete source with a bounded, explicitly isolated identity subset.
+
+    This is not full-catalog verification. Consumers must additionally require
+    a trusted observation for each price and exclude conflicted Products.
+    """
+    if run is None or run.catalog_scope != "full" or run.catalog_verified:
+        return False
+    partition = (run.run_quality or {}).get("identity_partition")
+    if not isinstance(partition, dict):
+        return False
+    counts = [
+        partition.get(key)
+        for key in ("total_count", "trusted_count", "isolated_count", "excluded_product_count")
+    ]
+    if any(type(value) is not int for value in counts):
+        return False
+    total, trusted, isolated, excluded = counts
+    return (
+        type(partition.get("version")) is int
+        and partition["version"] == 1
+        and partition.get("site") == "pharmonline"
+        and partition.get("source_complete") is True
+        and run.full_catalog_sites == "pharmonline"
+        and total == trusted + isolated
+        and trusted > 0
+        and 0 < isolated <= 25
+        and isolated <= total * 0.01
+        and 0 < excluded <= 25
+    )
+
+
+def run_has_publishable_catalog(run: Run | None) -> bool:
+    return bool(
+        run is not None
+        and run.catalog_scope == "full"
+        and (run.catalog_verified or run_has_identity_partition(run))
+    )
+
+
 def run_is_financially_eligible(run: Run | None) -> bool:
-    """Only a verified full-catalog run may drive money recommendations."""
+    """Only completed trusted catalogs or their explicitly isolated subsets."""
     if run is None:
         return False
-    if run.catalog_scope != "full" or not bool(run.catalog_verified):
+    if not run_has_publishable_catalog(run):
         return False
     if (run.run_quality or {}).get("financially_eligible") is not True:
         return False
     if run.status == "ok":
-        return True
+        return bool(run.catalog_verified)
+    if run.status == "degraded":
+        return run.finished_at is not None and run_has_identity_partition(run)
     if run.status == "running":
         from src.product_policy import is_finalizing_trusted_run
 
@@ -242,12 +285,8 @@ class Product(Base):
     # changing identity and repartitioning a cluster.
     country_candidate_code: Mapped[str | None] = mapped_column(String(2), nullable=True)
     country_candidate_seen_count: Mapped[int] = mapped_column(Integer, default=0)
-    country_candidate_observed_at: Mapped[datetime | None] = mapped_column(
-        DateTime, nullable=True
-    )
-    country_candidate_run_id: Mapped[int | None] = mapped_column(
-        Integer, nullable=True
-    )
+    country_candidate_observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    country_candidate_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Current website offer state.  This is independent from StockLevel, which
     # represents the client's ERP stock.
     offer_availability_status: Mapped[str] = mapped_column(
@@ -256,15 +295,16 @@ class Product(Base):
     offer_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
     availability_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
     availability_observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    availability_run_id: Mapped[int | None] = mapped_column(
-        Integer, nullable=True, index=True
+    availability_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Independent of scraper-owned fields: partial observations cannot reopen
+    # an identity which awaits explicit resolution.
+    identity_conflicted: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false()
     )
     category: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     # Operator override for the source-independent comparison taxonomy.
     # Kept separate from scraper-owned ``category`` so future runs do not erase it.
-    manual_category_key: Mapped[str | None] = mapped_column(
-        String(100), nullable=True, index=True
-    )
+    manual_category_key: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     dosage: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 500mg, 10ml...
     pack_size: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 30 tab, 100ml...
     image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -561,6 +601,42 @@ class PriceSnapshot(Base):
     product: Mapped[Product] = relationship(back_populates="snapshots")
 
 
+class PharmonlineIdentityConflict(Base):
+    """One unresolved case per historic Product; original identity stays intact."""
+
+    __tablename__ = "pharmonline_identity_conflicts"
+    __table_args__ = (UniqueConstraint("product_id", name="uq_pharmonline_conflict_product"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"))
+    first_run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="RESTRICT"))
+    last_run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class PharmonlineIdentityConflictVariant(Base):
+    """Distinct source pairs observed for a case, deduplicated across retries."""
+
+    __tablename__ = "pharmonline_identity_conflict_variants"
+    __table_args__ = (
+        UniqueConstraint(
+            "conflict_id", "external_id", "canonical_url", name="uq_pharmonline_conflict_variant"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conflict_id: Mapped[int] = mapped_column(
+        ForeignKey("pharmonline_identity_conflicts.id", ondelete="RESTRICT")
+    )
+    external_id: Mapped[str] = mapped_column(String(200), index=True)
+    canonical_url: Mapped[str] = mapped_column(String(500), index=True)
+    first_run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="RESTRICT"))
+    last_run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="RESTRICT"))
+    catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
+
+
 class Match(Base):
     """Канонический товар, объединяющий до 3 SKU с разных сайтов."""
 
@@ -682,9 +758,7 @@ class OfferObservation(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tenant_id: Mapped[int] = mapped_column(Integer, default=1, index=True)
-    run_id: Mapped[int] = mapped_column(
-        ForeignKey("runs.id", ondelete="CASCADE"), index=True
-    )
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
     product_id: Mapped[int] = mapped_column(
         ForeignKey("products.id", ondelete="CASCADE"), index=True
     )
@@ -696,6 +770,9 @@ class OfferObservation(Base):
     quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
     availability_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    # Explicit provenance for partitioned runs. Legacy verified full runs keep
+    # their original trust contract; partial runs never set this automatically.
+    identity_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
 class MatchPolicyAudit(Base):
@@ -815,7 +892,7 @@ class AlertEvent(Base):
 
     # P1.4 (PO Audit 2026-05-17): in-app inbox state. Global (не per-user) пока
     # pilot — multi-user сценарий вынесем в alert_user_state позже.
-    is_read: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     snoozed_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
@@ -1367,7 +1444,7 @@ def curr_and_prev_snapshots_for_run(
         session.scalars(
             select(PriceSnapshot)
             .options(joinedload(PriceSnapshot.product))
-            .where(PriceSnapshot.run_id == current_run.id)
+            .where(PriceSnapshot.run_id == current_run.id, identity_clear_snapshot_filter())
         ).unique()
     )
     if not curr_snaps:
@@ -1385,6 +1462,17 @@ def curr_and_prev_snapshots_for_run(
             tenant_id=current_run.tenant_id,
         )
         previous_filters.append(trusted_snapshot_filter(eligible_ids))
+        if current_run.catalog_scope == "full":
+            curr_snaps = list(
+                session.scalars(
+                    select(PriceSnapshot)
+                    .options(joinedload(PriceSnapshot.product))
+                    .where(
+                        PriceSnapshot.run_id == current_run.id,
+                        trusted_snapshot_filter(eligible_ids),
+                    )
+                ).unique()
+            )
     prev_max_subq = (
         select(
             PriceSnapshot.product_id,
@@ -1396,10 +1484,10 @@ def curr_and_prev_snapshots_for_run(
         .subquery()
     )
     prev_stmt = select(PriceSnapshot).join(
-            prev_max_subq,
-            (PriceSnapshot.product_id == prev_max_subq.c.product_id)
-            & (PriceSnapshot.captured_at == prev_max_subq.c.max_at),
-        )
+        prev_max_subq,
+        (PriceSnapshot.product_id == prev_max_subq.c.product_id)
+        & (PriceSnapshot.captured_at == prev_max_subq.c.max_at),
+    )
     if eligible_ids is not None:
         prev_stmt = prev_stmt.where(trusted_snapshot_filter(eligible_ids))
     prev_snaps = session.scalars(
@@ -1409,6 +1497,14 @@ def curr_and_prev_snapshots_for_run(
     for s in prev_snaps:
         prev_by_product.setdefault(s.product_id, s)
     return curr_snaps, prev_by_product
+
+
+def identity_clear_snapshot_filter():
+    from sqlalchemy import select
+
+    return PriceSnapshot.product_id.in_(
+        select(Product.id).where(Product.identity_conflicted.is_(False)).correlate(None)
+    )
 
 
 def trusted_snapshot_filter(eligible_run_ids):
@@ -1425,11 +1521,30 @@ def trusted_snapshot_filter(eligible_run_ids):
     условие отсюда, а не писать `PriceSnapshot.run_id.in_(...)` сам —
     `tests/test_trusted_prices.py` следит за этим.
     """
-    from sqlalchemy import or_
+    from sqlalchemy import and_, exists, or_, select
 
-    return or_(
-        PriceSnapshot.run_id.in_(eligible_run_ids),
-        PriceSnapshot.confirmed_run_id.in_(eligible_run_ids),
+    def proven(run_column):
+        return and_(
+            run_column.in_(eligible_run_ids),
+            or_(
+                run_column.in_(
+                    select(Run.id).where(Run.catalog_verified.is_(True)).correlate(None)
+                ),
+                exists(
+                    select(OfferObservation.id)
+                    .where(
+                        OfferObservation.run_id == run_column,
+                        OfferObservation.product_id == PriceSnapshot.product_id,
+                        OfferObservation.identity_verified.is_(True),
+                    )
+                    .correlate(PriceSnapshot)
+                ),
+            ),
+        )
+
+    return and_(
+        identity_clear_snapshot_filter(),
+        or_(proven(PriceSnapshot.run_id), proven(PriceSnapshot.confirmed_run_id)),
     )
 
 
@@ -1465,7 +1580,13 @@ def confirm_prices_observed_by_run(session, run: "Run") -> int:
             OfferObservation.product_id,
             func.max(OfferObservation.observed_at).label("observed_at"),
         )
-        .where(OfferObservation.run_id == run.id)
+        .where(
+            OfferObservation.run_id == run.id,
+            OfferObservation.product_id.in_(
+                select(Product.id).where(Product.identity_conflicted.is_(False))
+            ),
+            True if run.catalog_verified else OfferObservation.identity_verified.is_(True),
+        )
         .group_by(OfferObservation.product_id)
         .subquery()
     )
@@ -1578,7 +1699,7 @@ def financially_eligible_run_ids(
     runs = session.scalars(
         select(Run).where(
             Run.tenant_id == tenant_id,
-            Run.status.in_(["ok", "running"]),
+            Run.status.in_(["ok", "running", "degraded"]),
             Run.run_quality.is_not(None),
             completion_filter,
         )
@@ -1796,7 +1917,7 @@ def _latest_snapshot_stmt(
         if not eligible_run_ids:
             return None
 
-    filters = [PriceSnapshot.product_id.in_(product_ids)]
+    filters = [PriceSnapshot.product_id.in_(product_ids), identity_clear_snapshot_filter()]
     if eligible_run_ids is not None:
         filters.append(trusted_snapshot_filter(eligible_run_ids))
 

@@ -18,6 +18,18 @@ def _retirement_count(session):
     return session.query(storage.PharmonlinePublicAPIIdentityRetirement).count()
 
 
+def test_older_manual_recovery_cannot_bypass_pending_identity_review(db_session):
+    old, results, proofs = seed(db_session)
+    approved = manifest(db_session, results, proofs)
+    old[0].identity_conflicted = True
+    db_session.commit()
+    before = [row_values(product) for product in old]
+    with pytest.raises(m.PharmonlinePublicAPIReconciliationError):
+        apply(db_session, results, proofs, expected_plan_manifest_sha256=approved)
+    assert [row_values(product) for product in old] == before
+    assert _retirement_count(db_session) == 0
+
+
 def test_explicit_retirement_requires_new_schema_before_any_write(db_session):
     old, results, proofs = seed(db_session)
     approved = manifest(db_session, results, proofs)

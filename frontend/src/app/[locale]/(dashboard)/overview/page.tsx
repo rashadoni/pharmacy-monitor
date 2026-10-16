@@ -317,7 +317,12 @@ function SystemTruthPanel({ status }: { status: SystemStatus }) {
       label: t("system_catalog"),
       value: status.full_catalog_verified
         ? t("system_catalog_verified")
-        : t("system_catalog_unverified"),
+        : status.full_catalog_source_complete && (status.isolated_identity_count ?? 0) > 0
+          ? t("system_catalog_isolated", {
+              trusted: status.trusted_identity_count ?? 0,
+              isolated: status.isolated_identity_count ?? 0,
+            })
+          : t("system_catalog_unverified"),
       ok: status.full_catalog_verified,
     },
     {

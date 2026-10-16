@@ -212,7 +212,7 @@ def find_alternatives(
 
     Возвращает список (Product, score) где score 0..100 от rapidfuzz.token_set_ratio.
     """
-    from src.product_policy import identity_not_retired_sql
+    from src.product_policy import source_identity_eligible_sql
 
     m = session.get(Match, match_id)
     if not m:
@@ -223,7 +223,7 @@ def find_alternatives(
             Product.site == site,
             Product.canonical_id.is_(None),
             Product.offer_availability_status != "out_of_stock",
-            identity_not_retired_sql(Product),
+            source_identity_eligible_sql(Product),
         )
     ).all()
     if not candidates:
@@ -343,4 +343,3 @@ def aloe_products_at_address(session: Session, url: str, *, tenant_id: int = 1) 
     if number is not None:
         return list(found)
     return [product for product in found if aloe_slug_from_url(product.url) == slug]
-

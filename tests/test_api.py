@@ -6016,9 +6016,13 @@ def test_comparison_query_count_does_not_grow_with_rows(client, tenant_user, set
     many = _queries_for_listing()
 
     assert many == few
-    # И ни одного запроса к журналу наблюдений: покрытие считает только
-    # full_catalog_trust_report, а не каждое чтение дашборда.
-    assert not any("offer_observations" in statement for statement in statements)
+    # Correlated EXISTS proves partition identity without extra round trips.
+    # Coverage aggregation still belongs to full_catalog_trust_report rather
+    # than each ordinary dashboard read.
+    assert not any(
+        "offer_observations" in statement and "count(" in statement.lower()
+        for statement in statements
+    )
 
 
 def test_comparison_large_response_is_compressed(client, tenant_user, setup_db):

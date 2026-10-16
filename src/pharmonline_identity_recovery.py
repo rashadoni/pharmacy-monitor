@@ -91,6 +91,10 @@ def candidate(session, legacy, public, api_records, all_products, *, tenant_id, 
 
     if not available(session) or legacy.tenant_id != tenant_id or legacy.site != "pharmonline":
         return None
+    if legacy.identity_conflicted:
+        # Pending isolation has its own immutable variants. This older manual
+        # retirement protocol cannot close those cases or unblock a successor.
+        return None
     old_id, new_id = str(legacy.external_id), str(public.external_id)
     old_url = m._canonical_pharmonline_product_url(legacy.url)
     new_url = m._canonical_pharmonline_product_url(public.url)

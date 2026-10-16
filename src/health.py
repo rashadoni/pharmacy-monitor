@@ -185,7 +185,7 @@ def check_health(
             )
         )
 
-    if last_run.status == "degraded":
+    if last_run.status == "degraded" and not storage.run_is_financially_eligible(last_run):
         quality = last_run.run_quality or {}
         degraded_severity: Severity = (
             "warning"
@@ -236,7 +236,23 @@ def check_health(
                 continue
             quality = attempt.run_quality or {}
             site_status = ((quality.get("sites") or {}).get(site) or {}).get("status")
-            verified = (
+            isolated_catalog = not attempt.catalog_verified and storage.run_is_financially_eligible(
+                attempt
+            )
+            if isolated_catalog:
+                partition = quality["identity_partition"]
+                report.issues.append(
+                    HealthIssue(
+                        "warning",
+                        "catalog_identity_isolated",
+                        f"Источник {site} собран полностью: "
+                        f"{partition['trusted_count']} товаров проверено, "
+                        f"{partition['isolated_count']} изолировано из-за смены идентичности. "
+                        "Цены изолированных карточек исключены из сравнений и рекомендаций.",
+                        context={"site": site, "run_id": attempt.id, **partition},
+                    )
+                )
+            verified = isolated_catalog or (
                 attempt.status == "ok"
                 and quality.get("full_catalog_verified") is True
                 and quality.get("financially_eligible") is True
@@ -324,7 +340,7 @@ def check_health(
         )
 
     # 4. Site-drop check — доля живого каталога, покрытая за окно (см. _check_site_drops)
-    if last_run.status == "ok":
+    if last_run.status == "ok" or storage.run_is_financially_eligible(last_run):
         report.issues.extend(_check_site_drops(session, last_run.id, site_drop_threshold))
         # 5. Sanity: цены не должны быть все нулевыми / NaN
         report.issues.extend(_check_zero_prices(session, last_run.id))

@@ -89,7 +89,6 @@ def analyze(session: Session, current_run_id: int) -> AnalysisReport:
 
     prev_stmt = select(Run).where(
         Run.id != current_run_id,
-        Run.status == "ok",
         Run.tenant_id == current_run.tenant_id,
     )
     if verified_only:
@@ -98,9 +97,9 @@ def analyze(session: Session, current_run_id: int) -> AnalysisReport:
             tenant_id=current_run.tenant_id,
         )
         prev_stmt = prev_stmt.where(Run.id.in_(eligible_ids))
-    prev_run = session.scalars(
-        prev_stmt.order_by(desc(Run.started_at)).limit(1)
-    ).first()
+    else:
+        prev_stmt = prev_stmt.where(Run.status == "ok")
+    prev_run = session.scalars(prev_stmt.order_by(desc(Run.started_at)).limit(1)).first()
 
     report = AnalysisReport(
         run_id=current_run.id,
