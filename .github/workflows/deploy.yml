@@ -25,7 +25,8 @@ name: Deploy to production
 #   первом запросе к новой колонке. Теперь:
 #     1. релиз (src, migrations, alembic.ini, backup.sh) кладётся в отдельный
 #        каталог .deploy-stage.* — в живом каталоге не меняется ничего;
-#     2. граф миграций проверяется там же;
+#     2. граф миграций проверяется там же; фронтенд собирается там же, отдельно
+#        от работающего standalone-сервера и его изменяемого кэша;
 #     3. бэкап и `alembic upgrade` исполняются из этого каталога, то есть
 #        миграция видит src и env.py своего релиза, а не прошлого;
 #     4. код копируется в живой каталог, только если ревизия базы равна голове
@@ -57,8 +58,8 @@ name: Deploy to production
 #   саму миграцию: долгая миграция держит таблицу, пока не закончит.
 #
 #   ЧЕГО ЭТО ТРЕБУЕТ ОТ МИГРАЦИИ: между миграцией и рестартом на новой схеме
-#   работает ПРОШЛЫЙ релиз — API из памяти (около минуты: копирование кода и
-#   сборка фронтенда), CLI с диска (секунды), сбор, начатый до выкладки, — до
+#   работает ПРОШЛЫЙ релиз — API из памяти (копирование кода и переключение
+#   готового фронтенда), CLI с диска (секунды), сбор, начатый до выкладки, — до
 #   своего конца. Миграция обязана быть с ним совместима: добавлять можно,
 #   удалять и переименовывать то, что он читает или пишет, — только следующим
 #   релизом после кода. Сторож — tests/test_migrations_backward_compatible.py.
@@ -97,6 +98,12 @@ jobs:
             '13.140.186.143 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDVrem8NrMZMjV9cDiB8/8wOwOn1wrfSU7S5vfaLHM+R' \
             > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+          printf '%s\n' \
+            'Host 13.140.186.143' \
+            '  ServerAliveInterval 30' \
+            '  ServerAliveCountMax 6' \
+            '  ConnectTimeout 15' > ~/.ssh/config
+          chmod 600 ~/.ssh/config
           test "$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')" = \
             'SHA256:Hx7TYOZC2diIb6ZwI9LRv4bybasYCijb+lKnQQmGk/I'
 
@@ -250,7 +257,8 @@ jobs:
           set -euo pipefail
           manifest=$(mktemp)
           trap 'rm -f "$manifest"' EXIT
-          git ls-files -z -- src migrations alembic.ini infra/scripts/backup.sh |
+          git ls-files -z -- src migrations alembic.ini infra/scripts/backup.sh frontend \
+            ':!frontend/.env*' |
             xargs -0 sha256sum | LC_ALL=C sort > "$manifest"
           test -s "$manifest"
 
@@ -263,7 +271,8 @@ jobs:
             -mmin +1440 -exec rm -rf -- {} +
           work_dir=$(mktemp -d /opt/pharmacy-monitor/.deploy-stage.XXXXXX)
           mkdir -p "$work_dir/incoming" "$work_dir/runtime/src" \
-            "$work_dir/runtime/migrations" "$work_dir/runtime/infra/scripts"
+            "$work_dir/runtime/migrations" "$work_dir/runtime/infra/scripts" \
+            "$work_dir/runtime/frontend"
           printf '%s' "$work_dir"
           REMOTE
           )
@@ -288,6 +297,11 @@ jobs:
             -e "ssh -i ~/.ssh/id_ed25519" \
             infra/scripts/backup.sh \
             "pm@13.140.186.143:$work_dir/runtime/infra/scripts/backup.sh"
+          rsync -az --checksum --delete --no-perms --no-owner --no-group \
+            --exclude='node_modules/' --exclude='.next/' --exclude='*.tsbuildinfo' \
+            --exclude='test-results/' --exclude='.env*' \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            frontend/ "pm@13.140.186.143:$work_dir/runtime/frontend/"
           rsync -z --checksum --no-perms --no-owner --no-group \
             -e "ssh -i ~/.ssh/id_ed25519" \
             "$manifest" "pm@13.140.186.143:$work_dir/incoming/source-manifest"
@@ -320,6 +334,55 @@ jobs:
           printf '%s\n' "$heads"
           test "$(printf '%s\n' "$heads" | sed '/^[[:space:]]*$/d' | wc -l)" -eq 1
           staged_alembic current
+          REMOTE
+
+      - name: Build frontend in the private release stage
+        env:
+          WORK_DIR: ${{ steps.stage.outputs.work_dir }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WORK_DIR" =~ ^/opt/pharmacy-monitor/\.deploy-stage\.[A-Za-z0-9]{6}$ ]] || \
+             [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::unexpected release identity or staging path"
+            exit 1
+          fi
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 \
+            "timeout --signal=TERM --kill-after=30s 20m bash -s -- '$WORK_DIR' '$RELEASE_SHA'" <<'REMOTE'
+          set -euo pipefail
+          umask 077
+          work_dir=$1
+          release_sha=$2
+          cd "$work_dir/runtime"
+          sha256sum --quiet -c "$work_dir/incoming/source-manifest"
+          cd frontend
+          # Let Next load the same production build settings. These private
+          # files never come from the checkout and are never evaluated by bash.
+          for env_file in .env .env.local .env.production .env.production.local; do
+            if [ -f "/opt/pharmacy-monitor/frontend/$env_file" ]; then
+              cp -- "/opt/pharmacy-monitor/frontend/$env_file" "$env_file"
+              chmod 600 "$env_file"
+            fi
+          done
+          NODE_OPTIONS=--max-old-space-size=4096 pnpm install --frozen-lockfile </dev/null
+          NODE_OPTIONS=--max-old-space-size=4096 pnpm build </dev/null
+          test -s .next/BUILD_ID
+          test -s .next/standalone/server.js
+          test -d .next/static
+          # Next's standalone output omits these assets by default. Publish a
+          # self-contained generation for the existing server.js service.
+          mkdir -p .next/standalone/.next
+          cp -a .next/static .next/standalone/.next/
+          if [ -d public ]; then
+            cp -a public .next/standalone/
+          fi
+          for env_file in .env .env.local .env.production .env.production.local; do
+            if [ -f "$env_file" ]; then
+              cp -- "$env_file" ".next/standalone/$env_file"
+              chmod 600 ".next/standalone/$env_file"
+            fi
+          done
+          printf '%s\n' "$release_sha" > .next/DEPLOYED_SHA
           REMOTE
 
       - name: Verified backup + apply migrations (before any code is replaced)
@@ -452,7 +515,7 @@ jobs:
             --exclude='__pycache__/' --exclude='*.pyc' \
             src/ pm@13.140.186.143:/opt/pharmacy-monitor/src/
           rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
-            --exclude='node_modules/' --exclude='.next/' --exclude='*.tsbuildinfo' --exclude='test-results/' \
+            --exclude='node_modules/' --exclude='.next/' --exclude='*.tsbuildinfo' --exclude='test-results/' --exclude='.env*' \
             frontend/ pm@13.140.186.143:/opt/pharmacy-monitor/frontend/
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             --exclude='__pycache__/' --exclude='*.pyc' \
@@ -466,15 +529,67 @@ jobs:
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             infra/scripts/ pm@13.140.186.143:/opt/pharmacy-monitor/infra/scripts/
 
-      - name: Build frontend + restart services
+      - name: Publish completed frontend + restart services
+        env:
+          WORK_DIR: ${{ steps.stage.outputs.work_dir }}
+          RELEASE_SHA: ${{ github.sha }}
+          DEPLOY_RUN_ID: ${{ github.run_id }}
+          DEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 'set -euo pipefail
-            cd /opt/pharmacy-monitor/frontend
-            NODE_OPTIONS=--max-old-space-size=4096 pnpm install --frozen-lockfile
-            NODE_OPTIONS=--max-old-space-size=4096 pnpm build
-            sudo -n /usr/bin/systemctl restart pharmacy-monitor-api.service
-            sudo -n /usr/bin/systemctl restart pharmacy-monitor-frontend.service'
+          if [[ ! "$WORK_DIR" =~ ^/opt/pharmacy-monitor/\.deploy-stage\.[A-Za-z0-9]{6}$ ]] || \
+             [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || \
+             [[ ! "$DEPLOY_RUN_ID" =~ ^[0-9]+$ ]] || [[ ! "$DEPLOY_RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
+            echo "::error::unexpected release identity or staging path"
+            exit 1
+          fi
+          ssh -i ~/.ssh/id_ed25519 pm@13.140.186.143 \
+            "timeout --signal=TERM --kill-after=30s 5m bash -s -- '$WORK_DIR' '$RELEASE_SHA' '$DEPLOY_RUN_ID' '$DEPLOY_RUN_ATTEMPT'" <<'REMOTE'
+          set -euo pipefail
+          umask 077
+          work_dir=$1
+          release_sha=$2
+          run_id=$3
+          run_attempt=$4
+          staged_next="$work_dir/runtime/frontend/.next"
+          test ! -L "$staged_next"
+          test "$(cat "$staged_next/DEPLOYED_SHA")" = "$release_sha"
+          test -s "$staged_next/BUILD_ID"
+          test -s "$staged_next/standalone/server.js"
+          test -d "$staged_next/standalone/.next/static"
+          releases_dir=/opt/pharmacy-monitor/.frontend-releases
+          test ! -L "$releases_dir"
+          mkdir -p "$releases_dir"
+          chmod 700 "$releases_dir"
+          release_dir="$releases_dir/$release_sha-$run_id-$run_attempt"
+          mkdir "$release_dir"
+          mv -- "$staged_next" "$release_dir/.next"
+          live_next=/opt/pharmacy-monitor/frontend/.next
+          previous_next=''
+          restore_first_transition() {
+            result=$?
+            if [ -n "$previous_next" ] && [ ! -e "$live_next" ] && [ ! -L "$live_next" ]; then
+              mv -T -- "$previous_next" "$live_next"
+            fi
+            return "$result"
+          }
+          trap restore_first_transition EXIT
+          ln -s "$release_dir/.next" "$work_dir/next-link"
+          if [ -e "$live_next" ] && [ ! -L "$live_next" ]; then
+            # One-time conversion from a real directory. Keep all previous
+            # output; never recursively delete a running server's cache.
+            previous_next="$releases_dir/previous-$run_id-$run_attempt"
+            test ! -e "$previous_next"
+            mv -T -- "$live_next" "$previous_next"
+          fi
+          # Later deploys replace only this symlink atomically. Node resolves
+          # server.js to its generation; old requests keep their own cache.
+          mv -Tf -- "$work_dir/next-link" "$live_next"
+          sudo -n /usr/bin/systemctl restart pharmacy-monitor-api.service
+          sudo -n /usr/bin/systemctl restart pharmacy-monitor-frontend.service
+          # Retain generations after health checks too. Cleanup of old live
+          # outputs needs a separate retention policy, not staging cleanup.
+          REMOTE
 
       - name: Health check
         run: |
