@@ -57,10 +57,11 @@ WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
 PREFLIGHT_REVISION = "Preflight production DB revision against checkout"
 STAGE = "Stage release runtime (nothing live changes)"
 VERIFY_GRAPH = "Verify staged migration graph has one head"
+BUILD_FRONTEND = "Build frontend in the private release stage"
 MIGRATE = "Verified backup + apply migrations (before any code is replaced)"
 GATE = "Refuse to replace code unless the DB is at the staged head"
 RSYNC = "Rsync code -> prod (src + frontend + canonical migrations)"
-RESTART = "Build frontend + restart services"
+RESTART = "Publish completed frontend + restart services"
 CLEANUP = "Remove staged release runtime"
 
 REAL_RSYNC = shutil.which("rsync")
@@ -290,11 +291,31 @@ import _sbx
 _sbx.event("sudo", argv=sys.argv[1:])
 """,
     "pnpm": r"""
+import pathlib
+import shutil
 import sys
 
 import _sbx
 
-_sbx.event("pnpm", argv=sys.argv[1:])
+cwd = pathlib.Path.cwd()
+_sbx.event("pnpm", argv=sys.argv[1:], cwd=_sbx.from_sandbox(str(cwd)))
+command = sys.argv[1]
+if (_sbx.SBX / f"frontend-{command}-must-fail").exists():
+    sys.exit(1)
+if command == "build":
+    # Model Next's destructive cleanDistDir. The real frontend must never be
+    # the working directory, even when a previous server is writing its cache.
+    output = cwd / ".next"
+    if output.is_symlink():
+        output = output.resolve()
+    shutil.rmtree(output, ignore_errors=True)
+    (output / "standalone" / "node_modules" / "next").mkdir(parents=True)
+    (output / "standalone" / "server.js").write_text("// completed server\n")
+    (output / "standalone" / "node_modules" / "next" / "package.json").write_text("{}\n")
+    (output / "BUILD_ID").write_text("build-id\n")
+    if not (_sbx.SBX / "frontend-output-incomplete").exists():
+        (output / "static" / "chunks").mkdir(parents=True)
+        (output / "static" / "chunks" / "app.js").write_text("// compiled chunk\n")
 """,
     "curl": r"""
 import re
@@ -477,6 +498,8 @@ def _write_release(target: Path, *, release: str, revisions: list[str], staged: 
     (target / "frontend" / "src").mkdir(parents=True)
     (target / "frontend" / "package.json").write_text("{}\n", encoding="utf-8")
     (target / "frontend" / "src" / "page.tsx").write_text(f"// {release}\n", encoding="utf-8")
+    (target / "frontend" / "public").mkdir()
+    (target / "frontend" / "public" / "logo.svg").write_text("<svg/>\n", encoding="utf-8")
 
 
 @dataclass
@@ -643,7 +666,7 @@ def _value(reference: str, context: dict) -> object:
     reference = reference.strip()
     if reference == "''":
         return ""
-    if match := re.fullmatch(r"(inputs|secrets)\.(\w+)", reference):
+    if match := re.fullmatch(r"(inputs|secrets|github)\.(\w+)", reference):
         return context[match.group(1)][match.group(2)]
     if match := re.fullmatch(r"steps\.(\w+)\.outputs\.(\w+)", reference):
         return context["steps"].get(match.group(1), {}).get(match.group(2), "")
@@ -680,6 +703,7 @@ def run_workflow(
     without: tuple[str, ...] = (),
     before: dict | None = None,
     workflow_file: Path | None = None,
+    run_attempt: int = 1,
 ) -> WorkflowResult:
     """Исполнить шаги deploy.yml так, как их исполняет раннер GitHub.
 
@@ -706,6 +730,7 @@ def run_workflow(
     context = {
         "inputs": {"apply_migrations": apply_migrations},
         "secrets": {"SSH_PRIVATE_KEY": "not-a-real-key"},
+        "github": {"sha": "a" * 40, "run_id": "123456", "run_attempt": str(run_attempt)},
         "steps": {},
     }
     result = WorkflowResult()
@@ -948,6 +973,163 @@ def test_env_py_of_the_release_does_not_import_next_to_an_older_src(
 
     assert mixed.returncode != 0
     assert "cannot import name 'create_engine_hiding_statement_data'" in mixed.stderr
+
+
+def _old_frontend_output(sandbox: Sandbox) -> Path:
+    output = sandbox.live / "frontend" / ".next"
+    cache = output / "standalone" / ".next" / "server"
+    cache.mkdir(parents=True)
+    (cache / "previous-route.html").write_text("old server cache\n", encoding="utf-8")
+    (output / "BUILD_ID").write_text("previous-build\n", encoding="utf-8")
+    return output
+
+
+def test_frontend_build_is_private_and_publishes_a_complete_retained_generation(
+    pending_migration: Sandbox,
+) -> None:
+    sandbox = pending_migration
+    output = _old_frontend_output(sandbox)
+    live_env = sandbox.live / "frontend" / ".env.production.local"
+    setting = "NEXT_PUBLIC_API_URL=https://production.invalid\n"
+    live_env.write_text(setting, encoding="utf-8")
+    checkout_env = sandbox.checkout / "frontend" / ".env.production.local"
+    checkout_env.write_text("NEXT_PUBLIC_API_URL=https://checkout.invalid\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-f", str(checkout_env)], cwd=sandbox.checkout, check=True)
+
+    def old_output_is_intact() -> None:
+        assert not output.is_symlink()
+        assert (output / "BUILD_ID").read_text() == "previous-build\n"
+        # Model a cache entry written by the old server after the staged build.
+        (output / "standalone" / ".next" / "server" / "during-build.html").write_text(
+            "live request\n", encoding="utf-8"
+        )
+
+    result = run_workflow(sandbox, apply_migrations=True, before={MIGRATE: old_output_is_intact})
+
+    assert result.failed_step is None, result.describe()
+    calls = sandbox.events("pnpm")
+    assert [call["argv"] for call in calls] == [["install", "--frozen-lockfile"], ["build"]]
+    assert all(
+        re.fullmatch(r"/opt/pharmacy-monitor/\.deploy-stage\.\w{6}/runtime/frontend", call["cwd"])
+        for call in calls
+    )
+    assert calls[-1]["at"] < sandbox.events("backup")[0]["at"]
+    assert {call["db_revision"] for call in calls} == {BASE}
+    assert {call["live_release"] for call in calls} == {"old"}
+    assert output.is_symlink()
+    generation = output.resolve()
+    assert generation.parent == sandbox.live / ".frontend-releases" / f"{'a' * 40}-123456-1"
+    assert (generation / "DEPLOYED_SHA").read_text().strip() == "a" * 40
+    assert (generation / "standalone" / "server.js").is_file()
+    assert (generation / "standalone" / "node_modules" / "next" / "package.json").is_file()
+    assert (generation / "standalone" / ".next" / "static" / "chunks" / "app.js").is_file()
+    assert (generation / "standalone" / "public" / "logo.svg").read_text() == "<svg/>\n"
+    assert (generation / "standalone" / live_env.name).read_text() == setting
+    assert stat.S_IMODE((generation / "standalone" / live_env.name).stat().st_mode) == 0o600
+    assert live_env.read_text() == setting
+    assert setting.strip() not in result.describe()
+    previous = sandbox.live / ".frontend-releases" / "previous-123456-1"
+    assert (previous / "BUILD_ID").read_text() == "previous-build\n"
+    assert (previous / "standalone" / ".next" / "server" / "during-build.html").is_file()
+    assert not (generation / "standalone" / ".next" / "server" / "during-build.html").exists()
+    assert sandbox.staging_dirs() == []
+    build_ssh = next(event for event in sandbox.events("ssh") if "pnpm build" in event["script"])
+    assert "timeout --signal=TERM --kill-after=30s 20m" in build_ssh["remote"]
+    config = (sandbox.root / "home" / ".ssh" / "config").read_text()
+    assert "ServerAliveInterval 30" in config and "ServerAliveCountMax 6" in config
+
+
+def test_frontend_second_release_switches_symlink_without_cleaning_the_old_generation(
+    pending_migration: Sandbox,
+) -> None:
+    sandbox = pending_migration
+    _old_frontend_output(sandbox)
+    first = run_workflow(sandbox, apply_migrations=True)
+    assert first.failed_step is None, first.describe()
+    output = sandbox.live / "frontend" / ".next"
+    previous = output.resolve()
+    cache = previous / "standalone" / ".next" / "server" / "still-serving.html"
+    cache.parent.mkdir(parents=True)
+    cache.write_text("old generation remains live\n", encoding="utf-8")
+
+    def check_before_switch() -> None:
+        assert output.resolve() == previous
+        assert cache.is_file()
+
+    second = run_workflow(
+        sandbox, apply_migrations=False, run_attempt=2, before={RESTART: check_before_switch}
+    )
+
+    assert second.failed_step is None, second.describe()
+    assert output.is_symlink()
+    assert output.resolve() != previous
+    assert output.resolve().parent.name == f"{'a' * 40}-123456-2"
+    assert cache.read_text() == "old generation remains live\n"
+    assert not (output / "standalone" / ".next" / "server" / cache.name).exists()
+    assert sandbox.staging_dirs() == []
+
+
+@pytest.mark.parametrize("failure", ["install-must-fail", "build-must-fail", "output-incomplete"])
+def test_frontend_build_failure_leaves_schema_and_running_output_untouched(
+    pending_migration: Sandbox, failure: str
+) -> None:
+    sandbox = pending_migration
+    _old_frontend_output(sandbox)
+    before = sandbox.live_digest()
+    (sandbox.root / f"frontend-{failure}").touch()
+
+    result = run_workflow(sandbox, apply_migrations=True)
+
+    assert result.failed_step.name == BUILD_FRONTEND, result.describe()
+    assert sandbox.events("backup") == []
+    assert sandbox.events("alembic", command="upgrade") == []
+    _assert_production_untouched(sandbox, before, BASE)
+
+
+def test_frontend_stage_tampering_is_rejected_before_build_or_migration(
+    pending_migration: Sandbox,
+) -> None:
+    sandbox = pending_migration
+    before = sandbox.live_digest()
+
+    def corrupt_frontend() -> None:
+        (staged,) = sandbox.live.glob(".deploy-stage.*")
+        (staged / "runtime" / "frontend" / "src" / "page.tsx").write_text(
+            "// not the checked-out release\n", encoding="utf-8"
+        )
+
+    result = run_workflow(sandbox, apply_migrations=True, before={BUILD_FRONTEND: corrupt_frontend})
+
+    assert result.failed_step.name == BUILD_FRONTEND, result.describe()
+    assert sandbox.events("pnpm") == []
+    assert sandbox.events("backup") == []
+    _assert_production_untouched(sandbox, before, BASE)
+
+
+def test_failed_first_frontend_link_switch_restores_live_directory_and_retains_artifact(
+    pending_migration: Sandbox,
+) -> None:
+    sandbox = pending_migration
+    output = _old_frontend_output(sandbox)
+    _write_executable(
+        sandbox.bin / "mv",
+        "import os\nimport sys\n\n"
+        "if '-Tf' in sys.argv and any(arg.endswith('/next-link') for arg in sys.argv):\n"
+        "    sys.exit(1)\n"
+        "os.execv('/usr/bin/mv', ['mv', *sys.argv[1:]])\n",
+    )
+
+    result = run_workflow(sandbox, apply_migrations=True)
+
+    assert result.failed_step.name == RESTART, result.describe()
+    assert output.is_dir() and not output.is_symlink()
+    assert (output / "BUILD_ID").read_text() == "previous-build\n"
+    assert (output / "standalone" / ".next" / "server" / "previous-route.html").is_file()
+    assert _restarts(sandbox) == []
+    assert sandbox.staging_dirs() == []
+    generation = sandbox.live / ".frontend-releases" / f"{'a' * 40}-123456-1" / ".next"
+    assert (generation / "standalone" / "server.js").is_file()
+    assert (generation / "DEPLOYED_SHA").read_text().strip() == "a" * 40
 
 
 def _configure_calls(env_py: Path) -> list[str]:
