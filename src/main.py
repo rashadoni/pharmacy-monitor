@@ -6041,8 +6041,9 @@ def _sites_due_for_full_scan(
     в неделю. Фактическое расписание задаётся здесь: реально собирает первый
     запуск в каждом окне ритма (`cadence_window_start`), остальные выходят.
 
-    Сайт собран, если его последняя полная попытка успешна и началась в текущем
-    окне. Упавший сбор окно не закрывает: повтор идёт на следующем же запуске.
+    Сайт собран, если его последняя полная попытка успешна (включая завершённый
+    каталог с изолированными идентичностями) и началась в текущем окне.
+    Упавший сбор окно не закрывает: повтор идёт на следующем же запуске.
 
     Возвращает (пора собирать, {уже собранный сайт: часов с конца сбора}).
     """
@@ -6056,7 +6057,16 @@ def _sites_due_for_full_scan(
     covered: dict[str, float] = {}
     for site_name in sites:
         attempt = attempts.get(site_name)
-        if attempt is None or attempt.status != "ok" or attempt.started_at is None:
+        completed_partition = (
+            attempt is not None
+            and attempt.status == "degraded"
+            and storage.run_is_financially_eligible(attempt)
+        )
+        if (
+            attempt is None
+            or (attempt.status != "ok" and not completed_partition)
+            or attempt.started_at is None
+        ):
             due.append(site_name)
             continue
         if attempt.started_at < cadence_window_start(site_name, current):

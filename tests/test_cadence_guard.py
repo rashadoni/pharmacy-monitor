@@ -272,6 +272,55 @@ def test_second_alarm_of_the_night_skips_a_collected_site(db_session):
     )
 
 
+@pytest.mark.parametrize("incomplete", [None, "failed", "running", "unfinished", "ineligible"])
+def test_identity_partition_closes_only_its_completed_cadence_window(db_session, incomplete):
+    alarms, _ = _timer_alarms(SCRAPE_TIMER)
+    (first_hour, first_minute), (retry_hour, retry_minute) = alarms
+    night = date(2026, 10, 14)
+    run = _full_run(
+        db_session,
+        "pharmonline",
+        started_at=_timer_fire_utc(night, first_hour, first_minute),
+        status="degraded",
+    )
+    run.catalog_verified = False
+    run.run_quality = {
+        "financially_eligible": incomplete != "ineligible",
+        "identity_partition": {
+            "version": 1,
+            "site": "pharmonline",
+            "source_complete": True,
+            "total_count": 9430,
+            "trusted_count": 9427,
+            "isolated_count": 3,
+            "excluded_product_count": 3,
+        },
+    }
+    if incomplete in {"failed", "running"}:
+        run.status = incomplete
+    if incomplete == "unfinished":
+        run.finished_at = None
+    db_session.commit()
+    retry = _timer_fire_utc(night, retry_hour, retry_minute)
+
+    due, covered = main_mod._sites_due_for_full_scan(db_session, ["pharmonline"], now=retry)
+
+    if incomplete is None:
+        assert due == []
+        assert covered["pharmonline"] == pytest.approx(
+            (retry - run.finished_at).total_seconds() / 3600
+        )
+    else:
+        assert due == ["pharmonline"]
+        assert covered == {}
+    # Isolation closes this night's retry, never the next night's normal scan.
+    due, covered = main_mod._sites_due_for_full_scan(
+        db_session, ["pharmonline"], now=retry + timedelta(days=1)
+    )
+    assert due == ["pharmonline"]
+    assert covered == {}
+
+
 @pytest.mark.parametrize("status", ["failed", "degraded"])
 def test_second_alarm_of_the_night_retries_a_site_whose_run_did_not_succeed(db_session, status):
     """Ради этого второй будильник и стоит: неудачный сбор повторяется до утра."""
