@@ -3,11 +3,14 @@
 import ast
 import io
 import json
+from contextlib import nullcontext
 from datetime import timedelta
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import pandas as pd
 from fastapi import HTTPException
 from openpyxl import load_workbook
 from sqlalchemy import select, text
@@ -431,3 +434,47 @@ def test_legacy_dashboard_sql_does_not_read_conflicted_prices(partitioned, funct
         assert all(row["ph_price"] is None for row in rows)
     else:
         assert c.blocked.id not in {row["product_id"] for row in rows}
+
+
+@pytest.mark.parametrize("function", ["load_latest_snapshot", "load_comparison"])
+@pytest.mark.parametrize("transition", ["pending", "partition", "failed", "running", "stale"])
+def test_legacy_current_views_recheck_trust_after_a_previous_read(
+    partitioned, function, transition
+):
+    c = partitioned
+    c.blocked.identity_conflicted = False
+    c.blocked.canonical_id = c.match.id
+    c.run.catalog_scope = "partial"
+    c.session.commit()
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "src/dashboard.py").read_text())
+    functions = {"_legacy_current_prices_blocked", "_blocked_legacy_prices", function}
+    nodes = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in functions
+    ]
+    namespace = {
+        "pd": pd,
+        "storage": storage,
+        "utcnow": utcnow,
+        "SITES": storage.FULL_CATALOG_SITES,
+        "get_session": lambda: nullcontext(c.session),
+        "get_engine": lambda: c.session.connection(),
+        # Execute actual decorators too: reintroducing a cached public reader
+        # would return the first frame and fail the subsequent trust assertion.
+        "st": SimpleNamespace(cache_data=lambda **kwargs: lru_cache(maxsize=None)),
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "legacy_readers", "exec"), namespace)
+    load = namespace[function]
+    assert not load().empty
+
+    if transition == "pending":
+        c.blocked.identity_conflicted = True
+    elif transition == "stale":
+        c.legacy.started_at = c.legacy.finished_at = utcnow() - timedelta(days=30)
+    else:
+        c.run.catalog_scope = "full"
+        if transition != "partition":
+            c.run.status = transition
+    c.session.commit()
+    blocked = load()
+    assert blocked.empty
+    assert blocked.attrs["current_prices_blocked"] is True

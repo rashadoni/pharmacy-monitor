@@ -322,8 +322,45 @@ def load_runs() -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=30)
+def _legacy_current_prices_blocked() -> bool:
+    """Recheck trust before each legacy read; its SQL cannot publish partitions."""
+    from sqlalchemy import select
+    from src.product_policy import _site_full_run_state
+
+    with get_session() as session:
+        if session.scalar(
+            select(storage.Product.id).where(storage.Product.identity_conflicted.is_(True)).limit(1)
+        ) is not None:
+            return True
+        # The old raw readers are global, so a tenant selector must not hide
+        # another tenant's failed attempt from their guard.
+        tenants = session.scalars(
+            select(storage.Run.tenant_id).where(storage.Run.catalog_scope == "full").distinct()
+        )
+        now = utcnow()
+        for tenant_id in tenants:
+            for site in SITES:
+                state = _site_full_run_state(session, site, tenant_id=tenant_id, current=now)
+                run = state.latest_attempt
+                if run is not None and (
+                    not run.catalog_verified
+                    or not storage.run_is_financially_eligible(run)
+                    or not state.run_fresh
+                ):
+                    return True
+    return False
+
+
+def _blocked_legacy_prices() -> pd.DataFrame:
+    frame = pd.DataFrame()
+    frame.attrs["current_prices_blocked"] = True
+    return frame
+
+
 def load_latest_snapshot() -> pd.DataFrame:
+    # No cached wrapper: a newly pending identity must close this view at once.
+    if _legacy_current_prices_blocked():
+        return _blocked_legacy_prices()
     query = """
     SELECT
         p.id AS product_id, p.site, p.name, p.brand, p.category, p.url, p.canonical_id,
@@ -374,12 +411,13 @@ def load_promos() -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=30)
 def load_comparison() -> pd.DataFrame:
     """Cross-site сравнение: для каждого Match — цена на каждом сайте.
 
     Возвращает DataFrame с одной строкой на canonical_id.
     """
+    if _legacy_current_prices_blocked():
+        return _blocked_legacy_prices()
     query = """
     WITH latest AS (
         SELECT MAX(id) AS id FROM runs WHERE status = 'ok'
@@ -1169,7 +1207,13 @@ with tab_compare:
 
     cmp_df = load_comparison()
 
-    if cmp_df.empty:
+    if cmp_df.attrs.get("current_prices_blocked"):
+        st.warning(
+            "Старый интерфейс не показывает текущие цены: есть спорные карточки "
+            "или последний полный сбор не подтверждён либо устарел. "
+            "Откройте основной веб-интерфейс для актуального состояния."
+        )
+    elif cmp_df.empty:
         st.info(
             "**Нет сматченных товаров.**\n\n"
             "Это значит, что система пока не знает какие товары на разных сайтах — "
@@ -1513,6 +1557,12 @@ with tab_overview:
         # Метрики и сравнение (как было)
         # ============================================================
         snapshot = load_latest_snapshot()
+        if snapshot.attrs.get("current_prices_blocked"):
+            st.warning(
+                "Текущие цены скрыты в старом интерфейсе. Есть спорные карточки "
+                "или последний полный сбор не подтверждён либо устарел. "
+                "Актуальное состояние доступно в основном веб-интерфейсе."
+            )
         if not snapshot.empty:
             snapshot = snapshot[snapshot["site"].isin(selected_sites)]
 
