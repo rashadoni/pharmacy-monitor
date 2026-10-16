@@ -298,23 +298,68 @@ def margin_report(session: Session, *, run_id: int | None = None) -> list[Margin
 
     Берём минимум purchase_price среди поставщиков (лучшая margin).
     """
+    from src import storage
+    from src.product_policy import policy_offer_eligibility
+    from sqlalchemy import func
+
+    current_catalog = run_id is None
     if run_id is None:
-        run_id = session.scalar(
-            select(Run.id).where(Run.status == "ok").order_by(Run.id.desc()).limit(1)
+        run_id = storage.latest_financial_run_ids_by_site(session, ("pharmonline",)).get(
+            "pharmonline"
         )
-        if run_id is None:
+    run = session.get(Run, run_id) if run_id is not None else None
+    if not storage.run_is_financially_eligible(run):
+        return []
+    if current_catalog:
+        latest_attempt = storage.latest_full_catalog_attempts_by_site(
+            session, ("pharmonline",), tenant_id=run.tenant_id
+        ).get("pharmonline")
+        if latest_attempt is None or latest_attempt.id != run.id:
             return []
 
     rows: list[MarginRow] = []
+    eligible_run_ids = [
+        candidate
+        for candidate in storage.financially_eligible_run_ids(session, tenant_id=run.tenant_id)
+        if candidate <= run.id
+    ]
     # Берём все клиентские Products со снимком цены
-    products = session.scalars(select(Product).where(Product.site == "pharmonline")).all()
+    products = session.scalars(
+        select(Product).where(Product.site == "pharmonline", Product.tenant_id == run.tenant_id)
+    ).all()
+    # Diff-only runs may confirm an unchanged historical snapshot instead of
+    # writing one. Keep the requested run's trust boundary, including explicit
+    # historical reports: a later confirmed price must not flow backwards.
+    latest_at = (
+        select(
+            PriceSnapshot.product_id,
+            func.max(PriceSnapshot.captured_at).label("captured_at"),
+        )
+        .where(
+            PriceSnapshot.product_id.in_([p.id for p in products]),
+            storage.trusted_snapshot_filter(eligible_run_ids),
+        )
+        .group_by(PriceSnapshot.product_id)
+        .subquery()
+    )
+    snapshots = session.scalars(
+        select(PriceSnapshot)
+        .join(
+            latest_at,
+            (PriceSnapshot.product_id == latest_at.c.product_id)
+            & (PriceSnapshot.captured_at == latest_at.c.captured_at),
+        )
+        .where(storage.trusted_snapshot_filter(eligible_run_ids))
+        .order_by(PriceSnapshot.id.desc())
+    )
+    snapshots_by_product = {}
+    for snapshot in snapshots:
+        snapshots_by_product.setdefault(snapshot.product_id, snapshot)
 
     for p in products:
-        snap = session.scalar(
-            select(PriceSnapshot).where(
-                PriceSnapshot.product_id == p.id, PriceSnapshot.run_id == run_id
-            )
-        )
+        if not policy_offer_eligibility(p).eligible:
+            continue
+        snap = snapshots_by_product.get(p.id)
         if not snap:
             continue
         sale_price = snap.discount_price or snap.price

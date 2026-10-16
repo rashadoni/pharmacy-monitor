@@ -12,6 +12,7 @@ tri-state: a missing signal is ``unknown``, never an implicit out-of-stock.
 from __future__ import annotations
 
 import os
+import hashlib
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -505,7 +506,7 @@ def policy_fingerprint() -> str:
     """Stable cache discriminator for rollout-sensitive financial output."""
     return (
         f"country={policy_mode('COUNTRY_IDENTITY_POLICY')};"
-        f"availability={policy_mode('OFFER_AVAILABILITY_POLICY')}"
+        f"availability={policy_mode('OFFER_AVAILABILITY_POLICY')};identity=partition-v1"
     )
 
 
@@ -549,16 +550,28 @@ def _site_full_run_state(
         .limit(1)
     )
     finalizing_run_id = _FINALIZING_TRUSTED_RUN_ID.get()
+    # Preserve the historical all-identity verification contract. The new
+    # partition path also requires the explicit financial quality envelope.
+    publishable = bool(
+        storage.run_has_publishable_catalog(latest_attempt)
+        and (latest_attempt.catalog_verified or storage.run_is_financially_eligible(latest_attempt))
+    )
     published = bool(
         latest_attempt is not None
-        and latest_attempt.status == "ok"
-        and bool(latest_attempt.catalog_verified)
+        and (
+            latest_attempt.status == "ok"
+            or (
+                latest_attempt.status == "degraded"
+                and storage.run_has_identity_partition(latest_attempt)
+            )
+        )
+        and publishable
     )
     internal_finalization = bool(
         latest_attempt is not None
         and latest_attempt.id == finalizing_run_id
         and latest_attempt.status == "running"
-        and bool(latest_attempt.catalog_verified)
+        and publishable
     )
     relevant_run = latest_attempt if published or internal_finalization else None
     run_at = (
@@ -597,6 +610,11 @@ def full_catalog_trust_report(
         run_at = state.run_at
         run_fresh = state.run_fresh
         internal_finalization = state.internal_finalization
+        partition = (
+            (relevant_run.run_quality or {}).get("identity_partition")
+            if relevant_run is not None and not relevant_run.catalog_verified
+            else None
+        )
 
         # Trust evidence is immutable and run-scoped.  Mutable Product state
         # can be refreshed by a later partial/watchlist run and must never make
@@ -606,6 +624,9 @@ def full_catalog_trust_report(
             storage.OfferObservation.run_id
             == (relevant_run.id if relevant_run is not None else -1),
             storage.Product.site == site,
+            # A partition publishes only explicitly verified observations.
+            # Product state cannot turn a partial observation into evidence.
+            *([storage.OfferObservation.identity_verified.is_(True)] if partition else []),
         )
         total = (
             session.scalar(
@@ -651,12 +672,20 @@ def full_catalog_trust_report(
         )
         country_pct = round(country_resolved / total * 100, 2) if total else 0.0
         availability_pct = round(availability_known / total * 100, 2) if total else 0.0
-        country_ready = total > 0 and country_pct >= _MIN_POLICY_COVERAGE_PCT
-        availability_ready = total > 0 and availability_pct >= _MIN_POLICY_COVERAGE_PCT
+        observed_partition = not partition or total == partition["trusted_count"]
+        country_ready = observed_partition and total > 0 and country_pct >= _MIN_POLICY_COVERAGE_PCT
+        availability_ready = (
+            observed_partition and total > 0 and availability_pct >= _MIN_POLICY_COVERAGE_PCT
+        )
         sites.append(
             {
                 "site": site,
                 "products": total,
+                "source_complete": relevant_run is not None,
+                "source_products": partition["total_count"] if partition else total,
+                "trusted_products": partition["trusted_count"] if partition else total,
+                "isolated_products": partition["isolated_count"] if partition else 0,
+                "excluded_products": partition["excluded_product_count"] if partition else 0,
                 "country_resolved": country_resolved,
                 "country_coverage_pct": country_pct,
                 "availability_known": availability_known,
@@ -741,6 +770,23 @@ def trusted_catalog_epoch(
         if state.relevant_run is None or not state.run_fresh:
             return None
         parts.append(f"{site}:{state.relevant_run.id}")
+    # Existing cached JSON has no reliable Product IDs. Invalidate the whole
+    # cache if a previously usable identity is isolated, even within one epoch.
+    from src import storage
+
+    conflicted_ids = session.scalars(
+        select(storage.Product.id)
+        .where(
+            storage.Product.tenant_id == tenant_id,
+            storage.Product.identity_conflicted.is_(True),
+        )
+        .order_by(storage.Product.id)
+    ).all()
+    if conflicted_ids:
+        identity_digest = hashlib.sha256(
+            ",".join(str(product_id) for product_id in conflicted_ids).encode("ascii")
+        ).hexdigest()
+        parts.append(f"isolated:{identity_digest}")
     return "v1|" + "|".join(parts)
 
 
@@ -770,6 +816,7 @@ def policy_rollout_eligibility(
 # сама политика за его пределы не выходила.
 POLICY_PRODUCT_FIELDS = (
     "site",
+    "identity_conflicted",
     "url_dead_at",
     "manufacturer_country_code",
     "country_resolution_status",
@@ -794,6 +841,20 @@ def identity_not_retired_sql(Product):
         Product.availability_source.is_(None),
         Product.availability_source != PHARMONLINE_IDENTITY_RETIREMENT_SOURCE,
     )
+
+
+def source_identity_eligibility(product: Any) -> Eligibility:
+    """Current financial use requires an unambiguous, non-archived identity."""
+    if bool(getattr(product, "identity_conflicted", False)):
+        return Eligibility(False, "identity_conflicted")
+    if identity_is_retired(product):
+        return Eligibility(False, "identity_retired")
+    return Eligibility(True)
+
+
+def source_identity_eligible_sql(Product):
+    """SQL counterpart of ``source_identity_eligibility`` for candidate queries."""
+    return and_(Product.identity_conflicted.is_(False), identity_not_retired_sql(Product))
 
 
 def country_code_of(product: Any) -> str | None:
@@ -838,8 +899,9 @@ class Eligibility:
 def current_offer_eligibility(
     product: Any, *, now: datetime | None = None, max_age_hours: int | None = None
 ) -> Eligibility:
-    if identity_is_retired(product):
-        return Eligibility(False, "identity_retired")
+    identity = source_identity_eligibility(product)
+    if not identity.eligible:
+        return identity
     if getattr(product, "url_dead_at", None) is not None:
         return Eligibility(False, "dead_url")
     status = getattr(product, "offer_availability_status", OFFER_UNKNOWN) or OFFER_UNKNOWN
@@ -892,7 +954,7 @@ def policy_financial_eligibility(
         return identity
     for product in products:
         offer = current_offer_eligibility(product, now=now)
-        if offer.reason in {"dead_url", "out_of_stock", "identity_retired"}:
+        if offer.reason in {"dead_url", "out_of_stock", "identity_retired", "identity_conflicted"}:
             return offer
         if availability_policy_enforced() and not offer.eligible:
             return offer
@@ -900,7 +962,11 @@ def policy_financial_eligibility(
 
 
 def policy_identity_eligibility(products: list[Any]) -> Eligibility:
-    identity = identity_eligibility(products)
+    # Historical members remain attached to the Match, but an isolated source
+    # cannot contradict the identity of the remaining current offers.
+    identity = identity_eligibility(
+        [product for product in products if source_identity_eligibility(product).eligible]
+    )
     if identity.reason == "country_conflict":
         return identity
     if country_policy_enforced() and not identity.eligible:
@@ -910,7 +976,7 @@ def policy_identity_eligibility(products: list[Any]) -> Eligibility:
 
 def policy_offer_eligibility(product: Any, *, now: datetime | None = None) -> Eligibility:
     offer = current_offer_eligibility(product, now=now)
-    if offer.reason in {"dead_url", "out_of_stock", "identity_retired"}:
+    if offer.reason in {"dead_url", "out_of_stock", "identity_retired", "identity_conflicted"}:
         return offer
     if availability_policy_enforced() and not offer.eligible:
         return offer
@@ -928,7 +994,7 @@ def current_offer_sql(Product, *, now: datetime | None = None):
         for site, max_age in OFFER_MAX_AGE_HOURS.items()
     ]
     return and_(
-        identity_not_retired_sql(Product),
+        source_identity_eligible_sql(Product),
         Product.url_dead_at.is_(None),
         Product.offer_availability_status == OFFER_IN_STOCK,
         Product.availability_observed_at.is_not(None),

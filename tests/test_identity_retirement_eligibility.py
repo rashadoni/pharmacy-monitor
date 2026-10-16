@@ -123,10 +123,15 @@ def test_retired_competitor_history_cannot_lower_brand_price_floor(db_session, m
     current = _product("current")
     archived = _product("archived", retired=True)
     client = _product("client", site="aptekonline")
-    run = storage.Run(status="ok")
+    run = storage.Run(
+        status="ok",
+        catalog_scope="full",
+        catalog_verified=True,
+        finished_at=utcnow(),
+        run_quality={"financially_eligible": True},
+    )
     db_session.add_all([current, archived, client, run])
     db_session.flush()
-    monkeypatch.setattr(storage, "financially_eligible_run_ids", lambda *_a, **_kw: [run.id])
     for product, price in [(current, 10.0)] * 3 + [(archived, 5.0), (client, 7.0)]:
         db_session.add(storage.PriceSnapshot(run_id=run.id, product_id=product.id, price=price))
     db_session.flush()
@@ -143,10 +148,15 @@ def test_retired_client_history_does_not_produce_a_price_raise(db_session, monke
     monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "shadow")
     competitor = _product("competitor", site="aptekonline")
     archived = _product("archived", retired=True)
-    run = storage.Run(status="ok")
+    run = storage.Run(
+        status="ok",
+        catalog_scope="full",
+        catalog_verified=True,
+        finished_at=utcnow(),
+        run_quality={"financially_eligible": True},
+    )
     db_session.add_all([competitor, archived, run])
     db_session.flush()
-    monkeypatch.setattr(storage, "financially_eligible_run_ids", lambda *_a, **_kw: [run.id])
     for product, price in [(competitor, 10.0)] * 3 + [(archived, 7.0)]:
         db_session.add(storage.PriceSnapshot(run_id=run.id, product_id=product.id, price=price))
     db_session.flush()

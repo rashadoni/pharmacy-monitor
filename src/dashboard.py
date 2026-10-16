@@ -333,6 +333,7 @@ def load_latest_snapshot() -> pd.DataFrame:
     JOIN products p ON p.id = ps.product_id
     JOIN runs r ON r.id = ps.run_id
     WHERE r.id = (SELECT MAX(id) FROM runs WHERE status = 'ok')
+      AND p.identity_conflicted = FALSE
     """
     return pd.read_sql(query, get_engine(), parse_dates=["run_started_at"])
 
@@ -347,7 +348,7 @@ def load_price_history() -> pd.DataFrame:
     FROM price_snapshots ps
     JOIN products p ON p.id = ps.product_id
     JOIN runs r ON r.id = ps.run_id
-    WHERE r.status = 'ok'
+    WHERE r.status = 'ok' AND p.identity_conflicted = FALSE
     ORDER BY r.started_at
     """
     return pd.read_sql(query, get_engine(), parse_dates=["run_started_at"])
@@ -391,7 +392,7 @@ def load_comparison() -> pd.DataFrame:
         FROM products p
         LEFT JOIN price_snapshots ps ON ps.product_id = p.id
             AND ps.run_id = (SELECT id FROM latest)
-        WHERE p.canonical_id IS NOT NULL
+        WHERE p.canonical_id IS NOT NULL AND p.identity_conflicted = FALSE
     ),
     matched AS (
         SELECT

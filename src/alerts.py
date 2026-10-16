@@ -481,7 +481,7 @@ def evaluate_rules(
         recent = session.scalars(
             select(Run)
             .where(
-                Run.status == "ok",
+                Run.status.in_(["ok", "degraded"]),
                 Run.finished_at.is_not(None),
                 Run.tenant_id == tenant_id,
             )

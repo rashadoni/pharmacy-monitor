@@ -835,6 +835,15 @@ export interface RunQuality {
   baseline_enforced: boolean;
   full_catalog_verified: boolean;
   financially_eligible: boolean;
+  identity_partition?: {
+    version: number;
+    site: "pharmonline";
+    source_complete: boolean;
+    total_count: number;
+    trusted_count: number;
+    isolated_count: number;
+    excluded_product_count: number;
+  };
   sites: Record<string, RunQualitySite>;
 }
 
@@ -913,6 +922,9 @@ export interface Health {
   full_catalog_run_at: string | null;
   full_catalog_status: string | null;
   full_catalog_verified: boolean;
+  full_catalog_source_complete?: boolean;
+  isolated_identity_count?: number;
+  trusted_identity_count?: number;
   product_policy: {
     country_mode?: string;
     availability_mode?: string;

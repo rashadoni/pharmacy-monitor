@@ -2891,11 +2891,12 @@ def _unmatchable_reason(product) -> str | None:
         availability_policy_enforced,
         country_code_of,
         country_policy_enforced,
-        identity_is_retired,
+        source_identity_eligibility,
     )
 
-    if identity_is_retired(product):
-        return "identity_retired"
+    identity = source_identity_eligibility(product)
+    if not identity.eligible:
+        return identity.reason
     if getattr(product, "offer_availability_status", None) == OFFER_OUT_OF_STOCK:
         return "out_of_stock"
     if availability_policy_enforced() and not _current_offer(product).eligible:

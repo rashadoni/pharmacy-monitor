@@ -169,6 +169,8 @@ _COMPARISON_PRODUCT_COLUMNS = tuple(
 
 
 def _has_ok_run(db: Session, *, tenant_id: int) -> bool:
+    # Shadow-mode compatibility for old data; a validated isolated catalog is
+    # equally a usable starting point even if no all-identity run is yet ok.
     return (
         db.scalar(
             select(storage.Run.id)
@@ -176,7 +178,7 @@ def _has_ok_run(db: Session, *, tenant_id: int) -> bool:
             .limit(1)
         )
         is not None
-    )
+    ) or bool(storage.financially_eligible_run_ids(db, tenant_id=tenant_id))
 
 
 def _trusted_snapshot_lineage_available(
