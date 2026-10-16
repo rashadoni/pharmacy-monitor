@@ -209,6 +209,11 @@ def check_health(
                     "run_id": attempt.id,
                     "status": attempt.status,
                     "site_status": site_status,
+                    "error_message": attempt.error_message,
+                    "catalog_verification_reason": (
+                        attempt.catalog_verification_reason
+                        or quality.get("catalog_verification_reason")
+                    ),
                     "fresh_verified_catalog": fresh_fallback,
                 }
                 if fresh_fallback:
@@ -228,10 +233,16 @@ def check_health(
             )
             else "warning"
         )
-        summary = ", ".join(
-            f"{site}=#{row.get('run_id') or '—'}:{row.get('site_status') or row['status']}"
-            for site, row in unverified_sites.items()
-        )
+        summary_parts = []
+        for site, row in unverified_sites.items():
+            detail = f"{site}=#{row.get('run_id') or '—'}:{row['status']}"
+            if row.get("site_status") and row["site_status"] != row["status"]:
+                detail += f" (сбор: {row['site_status']})"
+            reason = row.get("error_message") or row.get("catalog_verification_reason")
+            if reason:
+                detail += f": {reason}"
+            summary_parts.append(detail)
+        summary = "; ".join(summary_parts)
         has_fresh_fallback = all(
             row.get("fresh_verified_catalog") for row in unverified_sites.values()
         )
