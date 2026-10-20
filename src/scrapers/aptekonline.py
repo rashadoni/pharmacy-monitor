@@ -163,8 +163,9 @@ _DECODO_HOST_DEFAULT = "az.decodo.com"
 # Транзиентно провалившуюся страницу (сеть/5xx/522 после ретраев) ПРОПУСКАЕМ и
 # идём дальше — не обрываем всю категорию (Decodo residential даёт ~38% флайки на
 # отдельный IP; одна сбойная страница не повод терять остальные). Жёсткий блок
-# (403/401/451) ИЛИ исчерпание баланса прокси (402/407) → ретрай бесполезен,
-# обрыв. NB 407 (proxy-auth / у Decodo кончился PAYG-баланс): без него 407 считался
+# завершает текущий проход. Только Decodo 403 допускает ограниченный повтор
+# всей категории на другой sticky-сессии; 401/451 и баланс 402/407 — без повтора.
+# NB 407 (proxy-auth / у Decodo кончился PAYG-баланс): без него 407 считался
 # бы транзиентом → 5 ретраев × портов на каждой странице жгли бы остаток баланса
 # вслепую, а run всё равно вернул бы run_ok с заниженным products. N провалов
 # подряд → реальная проблема (провайдер лёг / систематический блок), тоже обрыв.
@@ -439,6 +440,21 @@ class AptekonlineScraper(BaseScraper):
                 best_products = products
                 best_status = status
 
+            decodo_ports = _decodo_ports("aptekonline")
+            hard_block = bool(
+                status is not None and (status.abort_reason or "").startswith("hard_block_")
+            )
+            retry_decodo_forbidden = bool(
+                status is not None and status.abort_reason == "hard_block_403" and decodo_ports
+            )
+            if retry_decodo_forbidden:
+                # A transient 403 must not discard a category for the whole night.
+                # Restart at page 1 on the next sticky session, retaining the
+                # historical reason and the strict completeness check. This is
+                # the ordinary category budget, never the larger truncated-page
+                # pool or its delayed recovery, even after an earlier truncation.
+                max_attempts = min(configured_attempts, len(decodo_ports))
+
             # A residential exit may return HTTP 200 with a truncated Laravel
             # paginator (most often an empty page before ``last_page``).  Page
             # retries cannot distinguish that response from real data, and the
@@ -456,9 +472,9 @@ class AptekonlineScraper(BaseScraper):
             )
             retry_all_decodo_sessions = bool(
                 status is not None
+                and not hard_block
                 and (
-                    status.abort_reason == "empty_page_before_last"
-                    or paginated_item_count_mismatch
+                    status.abort_reason == "empty_page_before_last" or paginated_item_count_mismatch
                 )
             )
             if retry_all_decodo_sessions:
@@ -481,7 +497,7 @@ class AptekonlineScraper(BaseScraper):
                     "invalid_total",
                     "requested_limit_reached",
                 }
-                or (status.abort_reason or "").startswith("hard_block_")
+                or (hard_block and not retry_decodo_forbidden)
             ):
                 break
 
@@ -625,10 +641,15 @@ class AptekonlineScraper(BaseScraper):
                             raise SiteScrapeFatalError(
                                 f"Decodo proxy access rejected: HTTP {r.status_code}"
                             )
-                        # Жёсткий блок (403/401/451 или баланс 402/407): ретрай по
-                        # ДРУГИМ портам бесполезен (это не флайки IP) — возвращаем
-                        # сразу, не жжём оставшиеся попытки/баланс прокси.
+                        # Не меняем сессию посреди страницы после блока.
+                        # Только 403 можно повторить выше цельной категорией;
+                        # остальные hard-block статусы остаются без повтора.
                         if r.status_code in _HARD_BLOCK_STATUSES:
+                            if r.status_code == 403:
+                                # Network retries may have moved beyond the
+                                # original sticky session. Restart after the
+                                # actual blocked port, not the original one.
+                                self._decodo_port_offset = decodo_ports.index(port) + 1
                             return r
                         delay = _decodo_retry_delay_seconds()
                         if delay:
