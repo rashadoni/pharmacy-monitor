@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import pool
@@ -15,11 +16,14 @@ from sqlalchemy.engine import make_url
 # leave an older src next to it (tests/test_deploy_workflow.py).
 from src.storage import Base, create_engine_hiding_statement_data  # noqa: E402
 
-# Load .env if present so local dev "just works"
+# Load the checkout's own .env if present so local dev "just works".  The path
+# is explicit: without one python-dotenv walks up the directory tree, and a
+# staged copy of the code on the server would pick up a file it never shipped
+# with.  The process environment wins, as in src/main.py.
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 except ImportError:
     pass
 
