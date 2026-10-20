@@ -804,6 +804,25 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 > watchlist. ⚠️ Закреплённые ссылки теперь обновляет ТОЛЬКО `watchlist-tick`, а
 > он отказывается работать, если ссылок больше `WATCHLIST_TICK_MAX_URLS` (100):
 > падает с ошибкой и не собирает ни одной.
+> (⚠️ Уточнение 2026-10-14: «у pharmonline маркер переводит его в `public_api`»
+> верно только для `run --site pharmonline` в режиме `auto`. Кнопка «Запустить
+> scrape» зовёт `run --mode category`, маркер её не видел, и она собирала
+> pharmonline сборщиком из env — на сервере DDP — мимо проверки личностей и
+> автодопуска; то же `run --force` без `--site`. Теперь на хосте с маркером сбор
+> каталога pharmonline не берёт (`main._sites_without_pharmonline_catalog_scan`,
+> условие то же, что у ночного перехода в `public_api`): сайты не названы —
+> pharmonline убирается, остальные собираются, в заявке и выводе строка
+> «pharmonline не собирался: …»; категория только с маршрутом pharmonline и
+> явно названный pharmonline — отказ до строки прогона, заявка `failed` с
+> причиной; у строки категории, которая есть только у pharmonline, кнопки
+> «Сканировать» в дашборде больше нет. «Собрать досрочно: кнопка в дашборде»
+> выше — это aptekonline и aloe;
+> pharmonline досрочно — RUNBOOK «Сбор pharmonline: новые товары допускаются
+> сами…», уточнение 2026-10-14. Не тронуты `--mode watchlist`, `scrape`,
+> `ai-crawl`. Действует после выкладки: `grep -c
+> _sites_without_pharmonline_catalog_scan /opt/pharmacy-monitor/src/main.py`
+> (0 — нет). Тесты — `tests/test_scrape_button_pharmonline.py`, команду кнопки
+> они берут из скрипта вотчера: меняешь его — гони их.)
 >
 > **Кто следит, что сбор случился.** Пропуск внутри недели следа в БД не
 > оставляет, поэтому health сверяет возраст последнего подтверждённого полного
