@@ -325,8 +325,9 @@ async def test_scrape_accepts_api_confirmed_empty_category():
         "next_page_url": None,
     }
     patcher, _ = _mock_httpx_client(payload)
-    with patcher, patch.object(
-        AptekonlineScraper, "scrape_promos", new_callable=AsyncMock, return_value=[]
+    with (
+        patcher,
+        patch.object(AptekonlineScraper, "scrape_promos", new_callable=AsyncMock, return_value=[]),
     ):
         result = await AptekonlineScraper().scrape(["254"])
 
@@ -977,29 +978,245 @@ async def test_scrape_category_decodo_skips_then_aborts_on_persistent_522(monkey
     assert idx["n"] == 15
 
 
+def _mock_decodo_pages(responder):
+    """Record the sticky port and page without using the network."""
+    calls = []
+
+    class PageClient:
+        def __init__(self, *args, **kwargs):
+            self.port = int(kwargs["proxy"].rsplit(":", 1)[-1])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, _url, *, params):
+            page = int(dict(params)["page"])
+            calls.append((self.port, page))
+            return responder(self.port, page)
+
+    return patch("src.scrapers.aptekonline.httpx.AsyncClient", PageClient), calls
+
+
+def _two_page_response(item_id, page):
+    return httpx.Response(
+        200,
+        json={
+            "data": [{"url_id": item_id, "name": f"Product {item_id}", "price": 1}],
+            "total": 2,
+            "current_page": page,
+            "last_page": 2,
+            "next_page_url": "next" if page == 1 else None,
+        },
+    )
+
+
 @pytest.mark.asyncio
-async def test_scrape_category_decodo_aborts_on_403_hard_block(monkeypatch):
-    """403 — жёсткий блок: ретрай по портам исчерпывается, категория обрывается
-    сразу (НЕ skip-continue, в отличие от транзиентного 522)."""
+@pytest.mark.parametrize("blocked_page", [1, 2])
+async def test_decodo_403_restarts_whole_category_before_publishing(monkeypatch, blocked_page):
+    """A recovered route publishes one complete attempt, never a mixed prefix."""
+    from src.main import _verify_full_catalog_results
+
     _enable_decodo(monkeypatch)
+    monkeypatch.delenv("APTEKONLINE_CATEGORY_ATTEMPTS")
+
+    def respond(port, page):
+        if port == 30001:
+            if page == blocked_page:
+                return httpx.Response(403)
+            return _two_page_response("discarded-prefix", page)
+        return _two_page_response(f"accepted-{page}", page)
+
+    patcher, calls = _mock_decodo_pages(respond)
+    published = []
+    with (
+        patcher,
+        patch.object(AptekonlineScraper, "scrape_promos", new_callable=AsyncMock, return_value=[]),
+    ):
+        result = await AptekonlineScraper().scrape(
+            ["233"],
+            on_category=lambda _site, _slug, products: published.append(
+                [p.external_id for p in products]
+            ),
+        )
+
+    assert calls == [(30001, page) for page in range(1, blocked_page + 1)] + [
+        (30002, 1),
+        (30002, 2),
+    ]
+    assert published == [["accepted-1", "accepted-2"]]
+    assert [p.external_id for p in result.products] == published[0]
+    status = result.route_statuses["233"]
+    assert status.complete is True
+    assert status.expected_items == status.raw_items == status.parsed_items == 2
+    assert status.expected_pages == status.visited_pages == 2
+    verified, _ = _verify_full_catalog_results(
+        [result],
+        sites=["aptekonline"],
+        expected_slugs={"aptekonline": ["233"]},
+        baselines={"aptekonline": 2},
+    )
+    assert verified is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_page", [1, 2])
+async def test_decodo_403_restarts_after_actual_session_changed_by_network_retry(
+    monkeypatch, blocked_page
+):
+    _enable_decodo(monkeypatch)
+    monkeypatch.delenv("APTEKONLINE_CATEGORY_ATTEMPTS")
+
+    def respond(port, page):
+        if port == 30001:
+            return httpx.Response(522)
+        if port == 30002:
+            if page == blocked_page:
+                return httpx.Response(403)
+            return _two_page_response("discarded-prefix", page)
+        return _two_page_response(f"accepted-{page}", page)
+
+    patcher, calls = _mock_decodo_pages(respond)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("233")]
+
+    assert calls == [(30001, 1)] + [(30002, page) for page in range(1, blocked_page + 1)] + [
+        (30003, 1),
+        (30003, 2),
+    ]
+    assert [p.external_id for p in products] == ["accepted-1", "accepted-2"]
+    assert scraper._route_statuses["233"].complete is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_page", [1, 2])
+@pytest.mark.parametrize(
+    ("ports", "configured_attempts", "expected_attempts"),
+    [
+        ("30001-30010", None, 3),
+        ("30001-30010", "2", 2),
+        ("30001-30002", "3", 2),
+        ("30001", "3", 1),
+    ],
+)
+async def test_decodo_persistent_403_exhausts_only_category_budget(
+    monkeypatch, blocked_page, ports, configured_attempts, expected_attempts
+):
+    """Persistent 403 never expands to ten sessions or delayed recovery."""
+    from src.main import _verify_full_catalog_results
+
+    _enable_decodo(monkeypatch)
+    monkeypatch.setenv("DECODO_PORTS", ports)
+    if configured_attempts is None:
+        monkeypatch.delenv("APTEKONLINE_CATEGORY_ATTEMPTS")
+    else:
+        monkeypatch.setenv("APTEKONLINE_CATEGORY_ATTEMPTS", configured_attempts)
+
+    def respond(port, page):
+        if page == blocked_page:
+            return httpx.Response(403)
+        return _two_page_response(f"partial-{port}", page)
+
+    patcher, calls = _mock_decodo_pages(respond)
+    with (
+        patcher,
+        patch.object(AptekonlineScraper, "scrape_promos", new_callable=AsyncMock, return_value=[]),
+        patch("src.scrapers.aptekonline.asyncio.sleep", new_callable=AsyncMock) as sleep,
+    ):
+        result = await AptekonlineScraper().scrape(["233"])
+
+    assert calls == [
+        (30001 + attempt, page)
+        for attempt in range(expected_attempts)
+        for page in range(1, blocked_page + 1)
+    ]
+    sleep.assert_not_awaited()
+    status = result.route_statuses["233"]
+    assert status.complete is False
+    assert status.abort_reason == "hard_block_403"
+    assert [p.external_id for p in result.products] == (
+        ["partial-30001"] if blocked_page == 2 else []
+    )
+    verified, reason = _verify_full_catalog_results(
+        [result],
+        sites=["aptekonline"],
+        expected_slugs={"aptekonline": ["233"]},
+        baselines={"aptekonline": 2},
+    )
+    assert verified is False
+    assert "hard_block_403" in reason
+
+
+@pytest.mark.asyncio
+async def test_decodo_403_does_not_inherit_expanded_truncation_budget(monkeypatch):
+    _enable_decodo(monkeypatch)
+    monkeypatch.delenv("APTEKONLINE_CATEGORY_ATTEMPTS")
+
+    def respond(port, page):
+        if port == 30001:
+            if page == 1:
+                return _two_page_response("truncated-prefix", page)
+            return httpx.Response(
+                200,
+                json={"data": [], "total": 2, "last_page": 2, "next_page_url": None},
+            )
+        return httpx.Response(403)
+
+    patcher, calls = _mock_decodo_pages(respond)
+    with patcher, patch("src.scrapers.aptekonline.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("233")]
+
+    assert calls == [(30001, 1), (30001, 2), (30002, 1), (30003, 1)]
+    assert [p.external_id for p in products] == ["truncated-prefix"]
+    assert scraper._route_statuses["233"].complete is False
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("http_status", [401, 451])
+async def test_decodo_other_hard_blocks_do_not_retry(monkeypatch, http_status):
+    _enable_decodo(monkeypatch)
+    monkeypatch.delenv("APTEKONLINE_CATEGORY_ATTEMPTS")
+    patcher, idx = _mock_httpx_status_seq([http_status], None)
+    with patcher:
+        scraper = AptekonlineScraper()
+        products = [p async for p in scraper.scrape_category("233")]
+    assert products == []
+    assert idx["n"] == 1
+    assert scraper._route_statuses["233"].abort_reason == f"hard_block_{http_status}"
+
+
+@pytest.mark.asyncio
+async def test_direct_403_does_not_retry(monkeypatch):
+    _clear_decodo(monkeypatch)
+    _clear_iproyal(monkeypatch)
+    _clear_brightdata(monkeypatch)
+    _clear_scraperapi(monkeypatch)
+    monkeypatch.delenv("CRAWLBASE_NORMAL_TOKEN", raising=False)
+    monkeypatch.delenv("CRAWLBASE_JS_TOKEN", raising=False)
     patcher, idx = _mock_httpx_status_seq([403], None)
     with patcher:
         scraper = AptekonlineScraper()
-        products = [p async for p in scraper.scrape_category("114")]
+        products = [p async for p in scraper.scrape_category("233")]
     assert products == []
-    # _fetch_page short-circuit'ит на hard-block (НЕ перебирает порты) → 1 запрос,
-    # затем обрыв категории
     assert idx["n"] == 1
+    assert scraper._route_statuses["233"].abort_reason == "hard_block_403"
 
 
 @pytest.mark.asyncio
-async def test_scrape_category_decodo_aborts_on_407_balance_exhausted(monkeypatch):
-    """407 is site-fatal: the caller must stop all remaining categories."""
+@pytest.mark.parametrize("http_status", [402, 407])
+async def test_scrape_category_decodo_aborts_on_balance_exhausted(monkeypatch, http_status):
+    """Account failures remain site-fatal, even with category retries enabled."""
     _enable_decodo(monkeypatch)
-    patcher, idx = _mock_httpx_status_seq([407], None)
+    monkeypatch.delenv("APTEKONLINE_CATEGORY_ATTEMPTS")
+    patcher, idx = _mock_httpx_status_seq([http_status], None)
     with patcher:
         scraper = AptekonlineScraper()
-        with pytest.raises(SiteScrapeFatalError, match="HTTP 407"):
+        with pytest.raises(SiteScrapeFatalError, match=f"HTTP {http_status}"):
             _ = [p async for p in scraper.scrape_category("114")]
     # short-circuit на hard-block → 1 запрос (не жжём баланс перебором портов)
     assert idx["n"] == 1
