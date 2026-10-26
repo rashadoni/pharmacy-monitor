@@ -536,7 +536,12 @@ function SetPasswordForm({
  * в `detail`; `friendlyError` показал бы в русском интерфейсе JSON целиком.
  */
 function errorText(error: unknown, locale: string): string {
-  if (error instanceof ApiError && locale === "ru") {
+  // 401, 403, 404 сервер пишет по-английски — их переводит `friendlyError`.
+  if (
+    error instanceof ApiError &&
+    (error.status === 400 || error.status === 409) &&
+    locale === "ru"
+  ) {
     try {
       const detail = JSON.parse(error.detail)?.detail;
       if (typeof detail === "string") return detail;
