@@ -419,7 +419,10 @@ function UserCard({
             {sendLinkMut.isPending ? t("login_link_sending") : t("send_login_link")}
           </button>
         </div>
-        {sendLinkMut.isSuccess && <MailNotice mail={sendLinkMut.data.mail} />}
+        {/* Без `mail` отвечает API старше этой страницы: о письме оно не знает. */}
+        {sendLinkMut.isSuccess && sendLinkMut.data?.mail && (
+          <MailNotice mail={sendLinkMut.data.mail} />
+        )}
         {sendLinkMut.isError && <SendLinkError error={sendLinkMut.error} />}
         {passwordOpen && (
           <SetPasswordForm
@@ -503,7 +506,7 @@ function SetPasswordForm({
       )}
       {mut.isError && !serverProblem && (
         <p role="alert" className="mt-1 text-xs text-destructive">
-          {t("set_password_error", { message: friendlyError(mut.error, locale) })}
+          {t("set_password_error", { message: errorText(mut.error, locale) })}
         </p>
       )}
       <p className="mt-1 text-[11px] text-muted-foreground">
@@ -528,6 +531,22 @@ function SetPasswordForm({
   );
 }
 
+/**
+ * Текст отказа API. Отказы этих ручек (400, 409) сервер пишет по-русски строкой
+ * в `detail`; `friendlyError` показал бы в русском интерфейсе JSON целиком.
+ */
+function errorText(error: unknown, locale: string): string {
+  if (error instanceof ApiError && locale === "ru") {
+    try {
+      const detail = JSON.parse(error.detail)?.detail;
+      if (typeof detail === "string") return detail;
+    } catch {
+      /* не JSON */
+    }
+  }
+  return friendlyError(error, locale);
+}
+
 /** Повторная отправка не удалась: письмо не ушло (424) или запрос не прошёл. */
 function SendLinkError({ error }: { error: unknown }) {
   const t = useTranslations("users");
@@ -536,7 +555,7 @@ function SendLinkError({ error }: { error: unknown }) {
   if (mail) return <MailNotice mail={mail} />;
   return (
     <p role="alert" className="basis-full text-xs text-destructive">
-      {t("login_link_error", { message: friendlyError(error, locale) })}
+      {t("login_link_error", { message: errorText(error, locale) })}
     </p>
   );
 }
