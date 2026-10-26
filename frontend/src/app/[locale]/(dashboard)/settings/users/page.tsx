@@ -5,7 +5,16 @@ import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
 import { useState } from "react";
 import { ArrowLeft, Clock, Send, Trash2, UserPlus } from "lucide-react";
-import { api, type Recipient, type RecipientCreate, type RecipientUpdate } from "@/lib/api";
+import {
+  api,
+  friendlyError,
+  type LoginLinkMail,
+  type Recipient,
+  type RecipientCreate,
+  type RecipientCreated,
+  type RecipientUpdate,
+} from "@/lib/api";
+import { loginLinkMailFromError, loginLinkMailText } from "@/lib/login-link-mail";
 import { formatTime } from "@/lib/utils";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
@@ -77,7 +86,7 @@ export default function UsersPage() {
             error={
               createMut.isError ? ((createMut.error as Error)?.message ?? t("add_error")) : null
             }
-            doneEmail={createMut.isSuccess ? createMut.data?.email : null}
+            created={createMut.isSuccess ? createMut.data : null}
           />
           <div className="space-y-3">
             {listQ.isLoading && (
@@ -139,14 +148,14 @@ function AddUserForm({
   onAdd,
   pending,
   error,
-  doneEmail,
+  created,
 }: {
   dailyEnabled: boolean;
   weeklyEnabled: boolean;
   onAdd: (p: RecipientCreate) => void;
   pending: boolean;
   error: string | null;
-  doneEmail?: string | null;
+  created?: RecipientCreated | null;
 }) {
   const t = useTranslations("users");
   const [email, setEmail] = useState("");
@@ -216,10 +225,39 @@ function AddUserForm({
         >
           {pending ? t("adding") : t("add_btn")}
         </button>
-        {doneEmail && <span className="text-xs text-success">{t("added", { email: doneEmail })}</span>}
+        {created && <span className="text-xs text-success">{t("added", { email: created.email })}</span>}
         {error && <span className="text-xs text-destructive">{error}</span>}
       </div>
+      {created?.invite_mail && <InviteMailNotice mail={created.invite_mail} />}
       <p className="text-xs text-muted-foreground mt-2">{t("add_hint")}</p>
+    </div>
+  );
+}
+
+/** Ушло ли письмо со ссылкой: «принято почтовым сервером» или почему нет. */
+function MailNotice({ mail, retry }: { mail: LoginLinkMail; retry?: string }) {
+  const t = useTranslations("users");
+  if (mail.sent) {
+    return (
+      <p role="status" className="basis-full text-xs text-success">
+        {loginLinkMailText(t, mail)}
+        <span className="block text-muted-foreground">{t("mail_accepted_hint")}</span>
+      </p>
+    );
+  }
+  return (
+    <p role="alert" className="basis-full text-xs text-destructive">
+      {loginLinkMailText(t, mail)}
+      {retry && <span className="block text-muted-foreground">{retry}</span>}
+    </p>
+  );
+}
+
+function InviteMailNotice({ mail }: { mail: LoginLinkMail }) {
+  const t = useTranslations("users");
+  return (
+    <div className="mt-2">
+      <MailNotice mail={mail} retry={t("invite_mail_retry", { button: t("send_login_link") })} />
     </div>
   );
 }
@@ -333,12 +371,6 @@ function UserCard({
           </button>
         )}
         <div className="ml-auto flex items-center gap-2">
-          {sendLinkMut.isSuccess && (
-            <span className="text-[11px] text-success">{t("login_link_sent")}</span>
-          )}
-          {sendLinkMut.isError && (
-            <span className="text-[11px] text-destructive">{t("login_link_error")}</span>
-          )}
           <button
             onClick={() => sendLinkMut.mutate()}
             disabled={!u.is_active || sendLinkMut.isPending}
@@ -349,8 +381,23 @@ function UserCard({
             {sendLinkMut.isPending ? t("login_link_sending") : t("send_login_link")}
           </button>
         </div>
+        {sendLinkMut.isSuccess && <MailNotice mail={sendLinkMut.data.mail} />}
+        {sendLinkMut.isError && <SendLinkError error={sendLinkMut.error} />}
       </div>
     </div>
+  );
+}
+
+/** Повторная отправка не удалась: письмо не ушло (502/503) или запрос не прошёл. */
+function SendLinkError({ error }: { error: unknown }) {
+  const t = useTranslations("users");
+  const locale = useLocale();
+  const mail = loginLinkMailFromError(error);
+  if (mail) return <MailNotice mail={mail} />;
+  return (
+    <p role="alert" className="basis-full text-xs text-destructive">
+      {t("login_link_error", { message: friendlyError(error, locale) })}
+    </p>
   );
 }
 
