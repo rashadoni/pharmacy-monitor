@@ -4,9 +4,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
 import { useState } from "react";
-import { ArrowLeft, Clock, Send, Trash2, UserPlus } from "lucide-react";
+import { ArrowLeft, Clock, KeyRound, Send, Trash2, UserPlus } from "lucide-react";
 import {
   api,
+  ApiError,
   friendlyError,
   type LoginLinkMail,
   type Recipient,
@@ -15,9 +16,20 @@ import {
   type RecipientUpdate,
 } from "@/lib/api";
 import { loginLinkMailFromError, loginLinkMailText } from "@/lib/login-link-mail";
+import {
+  passwordProblem,
+  passwordProblemInResponse,
+  type PasswordProblem,
+} from "@/lib/password-rule";
 import { formatTime } from "@/lib/utils";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
+// Тексты причин — общие со сменой своего пароля (пространство `settings`).
+const PASSWORD_PROBLEM_TEXT = {
+  password_not_text: "password_unusable",
+  password_too_short: "password_too_short",
+  password_too_long: "password_too_long",
+} as const satisfies Record<PasswordProblem, string>;
 type Sev = (typeof SEVERITIES)[number];
 
 export default function UsersPage() {
@@ -284,6 +296,8 @@ function UserCard({
   const sendLinkMut = useMutation({
     mutationFn: () => api.recipientSendLoginLink(u.id),
   });
+  const [passwordOpen, setPasswordOpen] = useState(false);
+  const [passwordDone, setPasswordDone] = useState(false);
   return (
     <div
       className={`rounded-lg border p-4 ${
@@ -370,7 +384,25 @@ function UserCard({
             {t("delete_permanently")}
           </button>
         )}
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+          <button
+            onClick={() => {
+              setPasswordOpen((open) => !open);
+              setPasswordDone(false);
+            }}
+            disabled={isSelf || !u.is_active}
+            title={
+              isSelf
+                ? t("set_password_self")
+                : u.is_active
+                  ? t("set_password_hint")
+                  : t("send_login_link_inactive")
+            }
+            className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed md:min-h-9"
+          >
+            <KeyRound className="h-3.5 w-3.5" />
+            {t("set_password")}
+          </button>
           <button
             onClick={() => sendLinkMut.mutate()}
             disabled={!u.is_active || sendLinkMut.isPending}
@@ -383,6 +415,102 @@ function UserCard({
         </div>
         {sendLinkMut.isSuccess && <MailNotice mail={sendLinkMut.data.mail} />}
         {sendLinkMut.isError && <SendLinkError error={sendLinkMut.error} />}
+        {passwordOpen && (
+          <SetPasswordForm
+            u={u}
+            onCancel={() => setPasswordOpen(false)}
+            onDone={() => {
+              setPasswordOpen(false);
+              setPasswordDone(true);
+            }}
+          />
+        )}
+        {passwordDone && (
+          <p role="status" className="basis-full text-xs text-success">
+            {t("set_password_done")}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Админ набирает пароль и сообщает его пользователю сам: письмом пароль не
+ * уходит. Поле открытое — админ должен видеть, что именно он передаст.
+ */
+function SetPasswordForm({
+  u,
+  onCancel,
+  onDone,
+}: {
+  u: Recipient;
+  onCancel: () => void;
+  onDone: () => void;
+}) {
+  const t = useTranslations("users");
+  const tSettings = useTranslations("settings");
+  const locale = useLocale();
+  const [password, setPassword] = useState("");
+  const mut = useMutation({
+    mutationFn: () => api.recipientSetPassword(u.id, password),
+    onSuccess: () => {
+      setPassword("");
+      onDone();
+    },
+  });
+  // То же правило, что на сервере: кнопка не шлёт пароль, который он не примет.
+  const problem = password ? passwordProblem(password) : null;
+  let serverProblem: PasswordProblem | null = null;
+  if (mut.error instanceof ApiError && mut.error.status === 422) {
+    try {
+      serverProblem = passwordProblemInResponse(JSON.parse(mut.error.detail));
+    } catch {
+      /* не JSON */
+    }
+  }
+  const shownProblem = problem ?? serverProblem;
+
+  return (
+    <div className="basis-full rounded-md border border-border bg-muted/40 p-3">
+      <label className="block">
+        <span className="text-xs font-medium block mb-1">
+          {t("set_password_label", { email: u.email })}
+        </span>
+        <input
+          type="text"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+          className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono md:min-h-9"
+        />
+      </label>
+      {shownProblem && (
+        <p className="mt-1 text-xs text-destructive">
+          {tSettings(PASSWORD_PROBLEM_TEXT[shownProblem])}
+        </p>
+      )}
+      {mut.isError && !serverProblem && (
+        <p role="alert" className="mt-1 text-xs text-destructive">
+          {t("set_password_error", { message: friendlyError(mut.error, locale) })}
+        </p>
+      )}
+      <p className="mt-1 text-[11px] text-muted-foreground">{t("set_password_note")}</p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <button
+          onClick={() => mut.mutate()}
+          disabled={!password.trim() || !!problem || mut.isPending}
+          className="min-h-11 rounded-md bg-primary text-primary-foreground px-3 py-1.5 text-xs font-medium hover:bg-primary/90 disabled:opacity-50 md:min-h-9"
+        >
+          {mut.isPending ? t("set_password_saving") : t("set_password_save")}
+        </button>
+        <button
+          onClick={onCancel}
+          className="min-h-11 rounded-md border border-input bg-background px-3 py-1.5 text-xs font-medium hover:bg-muted md:min-h-9"
+        >
+          {t("set_password_cancel")}
+        </button>
       </div>
     </div>
   );

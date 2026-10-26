@@ -2263,6 +2263,48 @@ def dash_recipients_send_login_link(
     return {"ok": True, "email": r.email, "mail": mail.model_dump()}
 
 
+class AdminSetPasswordIn(BaseModel):
+    new_password: str
+
+
+@app.post("/api/v1/dash/recipients/{recipient_id}/password")
+def dash_recipients_set_password(
+    recipient_id: int,
+    payload: AdminSetPasswordIn,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Задать пользователю пароль, который набрал админ (admin-only).
+
+    Прежний пароль перестаёт действовать сразу; у пользователя без пароля это
+    первый. Пароль админ сообщает пользователю сам: письмом он не уходит, в
+    ответе и в журнале его нет. Правило то же, что у любого нового пароля
+    (`_usable_new_password`, отказ 422 — до любой записи).
+
+    Свой пароль так не меняется — в настройках, где спрашивают текущий
+    (`/api/v1/dash/me/password`). Сессии пользователя, открытые раньше, не
+    закрываются: отзыва сессий в приложении нет, cookie живёт до своего срока.
+    """
+    _require_admin(user)
+    new_password = _usable_new_password(payload.new_password)
+    r = db.scalar(
+        select(storage.TenantUser).where(
+            storage.TenantUser.id == recipient_id,
+            storage.TenantUser.tenant_id == user.tenant_id,
+        )
+    )
+    if not r:
+        raise HTTPException(404, "Recipient not found")
+    if r.id == user.id:
+        raise HTTPException(400, "Свой пароль меняйте в настройках — там нужен текущий")
+    if not r.is_active:
+        raise HTTPException(400, "Пользователь деактивирован — сначала активируйте его")
+    r.password_hash = _hash_bcrypt(new_password)
+    db.commit()
+    log.info("recipient_password_set", id=r.id, by_user_id=user.id)
+    return {"ok": True}
+
+
 # ─── Frontend dashboard endpoints (JWT cookie) ───────────────────────────────
 
 

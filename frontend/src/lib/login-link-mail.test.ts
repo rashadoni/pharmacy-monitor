@@ -21,10 +21,11 @@ function tFrom(messages: Record<string, string>): LoginLinkMailTranslate {
   };
 }
 
-const LOCALES = { ru: ru.users, az: az.users, en: en.users } as Record<
-  string,
-  Record<string, string>
->;
+const LOCALES: Record<string, Record<string, string>> = {
+  ru: ru.users as Record<string, string>,
+  az: az.users as Record<string, string>,
+  en: en.users as Record<string, string>,
+};
 
 function errorWith(status: number, detail: unknown): ApiError {
   return new ApiError(status, JSON.stringify({ detail }));

@@ -1272,6 +1272,12 @@ export const api = {
     request<void>(`/api/v1/dash/recipients/${id}${hard ? "?hard=true" : ""}`, {
       method: "DELETE",
     }),
+  /** Админ задаёт пароль другому пользователю; 422 — правило пароля (`passwordProblemInResponse`). */
+  recipientSetPassword: (id: number, new_password: string) =>
+    request<{ ok: true }>(`/api/v1/dash/recipients/${id}/password`, {
+      method: "POST",
+      body: JSON.stringify({ new_password }),
+    }),
   /** 200 — письмо принято почтовым сервером; 502/503 — не ушло (`loginLinkMailFromError`). */
   recipientSendLoginLink: (id: number) =>
     request<{ ok: boolean; email: string; mail: LoginLinkMail }>(
