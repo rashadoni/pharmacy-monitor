@@ -1042,13 +1042,19 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> LoginL
             to=[email],
         )
     except Exception as e:
-        fields = notifier.delivery_error_fields(e)
         # Отказ — это ответ сервера с кодом. `SMTPServerDisconnected` тоже
         # приходит как `EmailDeliveryError`, но кода у него нет: сервер не ответил.
         answered = isinstance(e, notifier.EmailDeliveryError) and e.smtp_code is not None
         reason = "smtp_refused" if answered else "send_failed"
-        log.warning("login_link_email_failed", user_id=user.id, reason=reason, **fields)
-        return LoginLinkMail(sent=False, reason=reason, **fields)
+        # `delivery_error_fields(e)` прямо в вызове журнала: так его видит
+        # проверка кода в tests/test_log_carries_no_address.py.
+        log.warning(
+            "login_link_email_failed",
+            user_id=user.id,
+            reason=reason,
+            **notifier.delivery_error_fields(e),
+        )
+        return LoginLinkMail(sent=False, reason=reason, **notifier.delivery_error_fields(e))
     if not accepted:
         # `send_email` без `SMTP_HOST` не бросает, а возвращает False.
         log.warning("login_link_email_failed", user_id=user.id, reason="smtp_not_configured")
@@ -2257,6 +2263,9 @@ def dash_recipients_send_login_link(
             409, "Ссылка не выпущена: активный пользователь с этим адресом не найден"
         )
     if not mail.sent:
+        # Кто нажал: журнал аудита пишет только успешные ответы, а токен
+        # пользователя при сбое письма всё равно сменился.
+        log.info("recipient_login_link_not_sent", id=r.id, by_user_id=user.id, reason=mail.reason)
         http_status = 503 if mail.reason == "smtp_not_configured" else 502
         raise HTTPException(http_status, detail=mail.model_dump())
     log.info("recipient_login_link_sent", id=r.id, by_user_id=user.id)

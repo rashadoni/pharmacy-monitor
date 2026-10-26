@@ -40,16 +40,19 @@ export function loginLinkMailCode(mail: LoginLinkMail): string {
 
 /**
  * Что сказать админу о письме. «Принято почтовым сервером», а не «доставлено»:
- * до ящика получателя нам не видно.
+ * до ящика получателя нам не видно. И при сбое разговора с сервером — «приём
+ * не подтверждён», а не «не отправлено»: таймаут после конца письма или отказ
+ * на прощании (QUIT) бывают, когда сервер письмо уже взял.
  */
 export function loginLinkMailText(t: LoginLinkMailTranslate, mail: LoginLinkMail): string {
   if (mail.sent) return t("mail_accepted");
+  if (mail.reason === "smtp_not_configured") {
+    return t("mail_not_sent", { reason: t("mail_reason_smtp_not_configured") });
+  }
   const code = loginLinkMailCode(mail) || "—";
   const reason =
-    mail.reason === "smtp_not_configured"
-      ? t("mail_reason_smtp_not_configured")
-      : mail.reason === "smtp_refused"
-        ? t("mail_reason_smtp_refused", { code })
-        : t("mail_reason_send_failed", { code });
-  return t("mail_not_sent", { reason });
+    mail.reason === "smtp_refused"
+      ? t("mail_reason_smtp_refused", { code })
+      : t("mail_reason_send_failed", { code });
+  return t("mail_not_confirmed", { reason });
 }

@@ -84,12 +84,13 @@ describe("loginLinkMailText", () => {
     expect(loginLinkMailText(t, { sent: false, reason: "smtp_not_configured" })).toBe(
       "Письмо не отправлено: на сервере не настроена почта (нет SMTP_HOST).",
     );
+    // Сбой разговора с сервером — «не подтвердил»: сервер мог письмо и взять.
     expect(loginLinkMailText(t, REFUSED)).toBe(
-      "Письмо не отправлено: почтовый сервер отказал — SMTPRecipientsRefused 550 5.1.1.",
+      "Почтовый сервер не подтвердил приём письма: отказ — SMTPRecipientsRefused 550 5.1.1.",
     );
     expect(
       loginLinkMailText(t, { sent: false, reason: "send_failed", error_type: "KeyError" }),
-    ).toBe("Письмо не отправлено: не удалось передать письмо почтовому серверу — KeyError.");
+    ).toBe("Почтовый сервер не подтвердил приём письма: сбой при передаче — KeyError.");
   });
 
   it.each(Object.keys(LOCALES))("has every text in %s", (locale) => {

@@ -112,6 +112,20 @@ def test_not_for_yourself_the_settings_ask_for_the_current_one(client, db_sessio
     assert admin.password_hash is None
 
 
+def test_another_admin_too_by_design(client, db_session):
+    """Другому админу — тоже: решение владельца, а не недосмотр.
+
+    Запрет здесь ничего бы не защитил: админ и так может понизить другого до
+    viewer, задать пароль и вернуть роль. Кто задал — в журнале
+    (`recipient_password_set by_user_id`).
+    """
+    _sign_in_as_admin(client, db_session)
+    other_admin = _add_user(db_session, role="admin")
+
+    assert _set(client, other_admin.id).status_code == 200
+    assert _signs_in(NEW_PASSWORD)
+
+
 def test_not_for_a_deactivated_user(client, db_session):
     _sign_in_as_admin(client, db_session)
     user = _add_user(db_session, is_active=False)

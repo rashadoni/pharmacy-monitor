@@ -138,7 +138,7 @@ def test_resend_without_smtp_host_is_503_not_a_check_mark(client, db_session, mo
 def test_resend_failure_is_502_with_the_cause_and_no_address(
     client, db_session, monkeypatch, fail, reason, fields
 ):
-    _sign_in_as_admin(client, db_session)
+    admin = _sign_in_as_admin(client, db_session)
     user = _add_user(db_session)
     fail(monkeypatch)
 
@@ -156,6 +156,9 @@ def test_resend_failure_is_502_with_the_cause_and_no_address(
     assert "@" not in repr(logs)
     (failed,) = [e for e in logs if e["event"] == "login_link_email_failed"]
     assert failed["user_id"] == user.id and failed["reason"] == reason
+    # Кто нажал — журнал аудита неудачные ответы не пишет.
+    (pressed,) = [e for e in logs if e["event"] == "recipient_login_link_not_sent"]
+    assert pressed["id"] == user.id and pressed["by_user_id"] == admin.id
     assert "recipient_login_link_sent" not in {e["event"] for e in logs}
 
 
@@ -173,6 +176,23 @@ def test_resend_failure_still_replaces_the_previous_link(client, db_session, mon
 
     db_session.refresh(user)
     assert user.magic_token_hash not in (None, first)
+
+
+def test_resend_says_so_when_no_link_was_issued(client, db_session, monkeypatch):
+    """Строка есть, а активного пользователя по её адресу нет — ссылки нет.
+
+    `_send_login_link` ищет адрес в нижнем регистре; адрес, записанный иначе
+    (так его кладёт не только эта страница), раньше давал «ok» без письма.
+    """
+    _sign_in_as_admin(client, db_session)
+    user = _add_user(db_session, ADDRESS.upper())
+    _accepted(monkeypatch)
+
+    r = client.post(f"/api/v1/dash/recipients/{user.id}/send-login-link")
+
+    assert r.status_code == 409, r.text
+    db_session.refresh(user)
+    assert user.magic_token_hash is None
 
 
 # ─── Создание пользователя ───────────────────────────────────────────────────

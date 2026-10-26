@@ -269,7 +269,13 @@ function InviteMailNotice({ mail }: { mail: LoginLinkMail }) {
   const t = useTranslations("users");
   return (
     <div className="mt-2">
-      <MailNotice mail={mail} retry={t("invite_mail_retry", { button: t("send_login_link") })} />
+      <MailNotice
+        mail={mail}
+        retry={t("invite_mail_retry", {
+          button: t("send_login_link"),
+          password: t("set_password"),
+        })}
+      />
     </div>
   );
 }
@@ -480,7 +486,11 @@ function SetPasswordForm({
         <input
           type="text"
           value={password}
-          onChange={(e) => setPassword(e.target.value)}
+          onChange={(e) => {
+            setPassword(e.target.value);
+            // Отказ сервера был о прежнем наборе — не держать его под новым.
+            if (mut.isError) mut.reset();
+          }}
           autoComplete="off"
           spellCheck={false}
           className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono md:min-h-9"
@@ -496,7 +506,9 @@ function SetPasswordForm({
           {t("set_password_error", { message: friendlyError(mut.error, locale) })}
         </p>
       )}
-      <p className="mt-1 text-[11px] text-muted-foreground">{t("set_password_note")}</p>
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        {t("set_password_note", { active: t("active") })}
+      </p>
       <div className="mt-2 flex flex-wrap gap-2">
         <button
           onClick={() => mut.mutate()}
