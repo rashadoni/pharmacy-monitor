@@ -41,15 +41,16 @@ const REFUSED: LoginLinkMail = {
 };
 
 describe("loginLinkMailFromError", () => {
-  it("reads the mail outcome from the API's 502 and 503", () => {
-    expect(loginLinkMailFromError(errorWith(502, REFUSED))).toEqual(REFUSED);
+  it("reads the mail outcome from the API's 424", () => {
+    expect(loginLinkMailFromError(errorWith(424, REFUSED))).toEqual(REFUSED);
     const notConfigured = { sent: false, reason: "smtp_not_configured" };
-    expect(loginLinkMailFromError(errorWith(503, notConfigured))).toEqual(notConfigured);
+    expect(loginLinkMailFromError(errorWith(424, notConfigured))).toEqual(notConfigured);
   });
 
   it("is not fooled by other errors", () => {
-    // 502 самого прокси — тело не от API.
+    expect(loginLinkMailFromError(new ApiError(424, "not json"))).toBeNull();
     expect(loginLinkMailFromError(new ApiError(502, "Bad Gateway"))).toBeNull();
+    expect(loginLinkMailFromError(errorWith(502, REFUSED))).toBeNull();
     expect(loginLinkMailFromError(errorWith(400, "Пользователь деактивирован"))).toBeNull();
     expect(loginLinkMailFromError(errorWith(503, "Financial comparisons are paused"))).toBeNull();
     expect(loginLinkMailFromError(new ApiError(0, "Сеть недоступна"))).toBeNull();

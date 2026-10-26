@@ -7,14 +7,12 @@ export type LoginLinkMailTranslate = (
 ) => string;
 
 /**
- * Письмо со ссылкой не ушло: повторная отправка ответила 503 (почта не
- * настроена) или 502 (сервер отказал или не ответил), и в теле — исход письма.
- * `null` — ошибка другого рода: 4xx, сеть, 502 самого прокси с пустым телом.
+ * Письмо со ссылкой не ушло или приём не подтверждён: повторная отправка
+ * ответила 424, и в теле — исход письма. `null` — ошибка другого рода: 400, 409,
+ * сеть, 5xx.
  */
 export function loginLinkMailFromError(err: unknown): LoginLinkMail | null {
-  if (!(err instanceof ApiError) || (err.status !== 502 && err.status !== 503)) {
-    return null;
-  }
+  if (!(err instanceof ApiError) || err.status !== 424) return null;
   try {
     const detail = JSON.parse(err.detail)?.detail;
     if (detail?.sent === false && typeof detail.reason === "string") {

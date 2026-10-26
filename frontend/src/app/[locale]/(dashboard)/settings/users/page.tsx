@@ -528,7 +528,7 @@ function SetPasswordForm({
   );
 }
 
-/** Повторная отправка не удалась: письмо не ушло (502/503) или запрос не прошёл. */
+/** Повторная отправка не удалась: письмо не ушло (424) или запрос не прошёл. */
 function SendLinkError({ error }: { error: unknown }) {
   const t = useTranslations("users");
   const locale = useLocale();

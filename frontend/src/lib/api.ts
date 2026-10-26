@@ -1278,7 +1278,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ new_password }),
     }),
-  /** 200 — письмо принято почтовым сервером; 502/503 — не ушло (`loginLinkMailFromError`). */
+  /** 200 — письмо принято почтовым сервером; 424 — не ушло или не подтверждено (`loginLinkMailFromError`). */
   recipientSendLoginLink: (id: number) =>
     request<{ ok: boolean; email: string; mail: LoginLinkMail }>(
       `/api/v1/dash/recipients/${id}/send-login-link`,

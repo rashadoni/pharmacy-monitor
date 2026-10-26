@@ -6,8 +6,9 @@
 сервер отказал, и когда `SMTP_HOST` пуст. Теперь:
 
 - повторная отправка админом отвечает 200, только если почтовый сервер письмо
-  принял; 503 — почта на сервере не настроена; 502 — сервер отказал или не
-  ответил. Причина — классом ошибки и кодами, без адреса;
+  принял; иначе 424 с причиной: почта на сервере не настроена, сервер отказал
+  или не ответил — классом ошибки и кодами, без адреса. Не 5xx: каждый такой
+  ответ Sentry забирал бы событием;
 - создание пользователя проходит при любом исходе письма (fail-open), а исход
   приглашения лежит в ответе;
 - публичный `POST /auth/request` отвечает одинаково при любом исходе — и для
@@ -94,7 +95,7 @@ def test_resend_says_the_mail_server_accepted_the_letter(client, db_session, mon
     assert r.json()["mail"]["reason"] is None
 
 
-def test_resend_without_smtp_host_is_503_not_a_check_mark(client, db_session, monkeypatch):
+def test_resend_without_smtp_host_is_424_not_a_check_mark(client, db_session, monkeypatch):
     _sign_in_as_admin(client, db_session)
     user = _add_user(db_session)
     _no_smtp_host(monkeypatch)
@@ -102,7 +103,7 @@ def test_resend_without_smtp_host_is_503_not_a_check_mark(client, db_session, mo
     with capture_logs() as logs:
         r = client.post(f"/api/v1/dash/recipients/{user.id}/send-login-link")
 
-    assert r.status_code == 503, r.text
+    assert r.status_code == 424, r.text
     assert r.json()["detail"] == {
         "sent": False,
         "reason": "smtp_not_configured",
@@ -135,7 +136,7 @@ def test_resend_without_smtp_host_is_503_not_a_check_mark(client, db_session, mo
         (_disconnected, "send_failed", {"error_type": "SMTPServerDisconnected"}),
     ],
 )
-def test_resend_failure_is_502_with_the_cause_and_no_address(
+def test_resend_failure_is_424_with_the_cause_and_no_address(
     client, db_session, monkeypatch, fail, reason, fields
 ):
     admin = _sign_in_as_admin(client, db_session)
@@ -145,7 +146,7 @@ def test_resend_failure_is_502_with_the_cause_and_no_address(
     with capture_logs() as logs:
         r = client.post(f"/api/v1/dash/recipients/{user.id}/send-login-link")
 
-    assert r.status_code == 502, r.text
+    assert r.status_code == 424, r.text
     detail = r.json()["detail"]
     assert detail["sent"] is False and detail["reason"] == reason
     assert {k: v for k, v in detail.items() if k not in ("sent", "reason") and v is not None} == (
@@ -172,7 +173,7 @@ def test_resend_failure_still_replaces_the_previous_link(client, db_session, mon
     first = user.magic_token_hash
     _refused(monkeypatch)
 
-    assert client.post(f"/api/v1/dash/recipients/{user.id}/send-login-link").status_code == 502
+    assert client.post(f"/api/v1/dash/recipients/{user.id}/send-login-link").status_code == 424
 
     db_session.refresh(user)
     assert user.magic_token_hash not in (None, first)

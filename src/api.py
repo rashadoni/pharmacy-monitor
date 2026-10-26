@@ -2237,9 +2237,12 @@ def dash_recipients_send_login_link(
     email тут нет — и честно сказать, ушло ли письмо:
 
     - 200, `mail.sent=true` — почтовый сервер письмо принял (до ящика — не видно);
-    - 503, `detail.reason="smtp_not_configured"` — почта на сервере не настроена;
-    - 502, `detail.reason="smtp_refused"` / `"send_failed"` — сервер отказал или
-      не ответил; рядом класс ошибки и коды, без адреса.
+    - 424, `detail.reason` — письмо не ушло или приём не подтверждён:
+      `smtp_not_configured`, `smtp_refused`, `send_failed`; рядом класс ошибки и
+      коды, без адреса.
+
+    424, а не 5xx: отказ почты — не сбой API. Ответ 5xx Sentry забирает событием
+    на каждое нажатие, а 502 в журнале прокси не отличить от лежащего API.
 
     Токен при сбое письма всё равно выпущен, и прежняя ссылка погашена.
     """
@@ -2266,8 +2269,7 @@ def dash_recipients_send_login_link(
         # Кто нажал: журнал аудита пишет только успешные ответы, а токен
         # пользователя при сбое письма всё равно сменился.
         log.info("recipient_login_link_not_sent", id=r.id, by_user_id=user.id, reason=mail.reason)
-        http_status = 503 if mail.reason == "smtp_not_configured" else 502
-        raise HTTPException(http_status, detail=mail.model_dump())
+        raise HTTPException(424, detail=mail.model_dump())
     log.info("recipient_login_link_sent", id=r.id, by_user_id=user.id)
     return {"ok": True, "email": r.email, "mail": mail.model_dump()}
 
