@@ -351,11 +351,15 @@ def _detect_price_raise_opportunity(
     конкурентах медиана `sorted(...)[len // 2]` — это дорогой из двух, и алерт
     шёл клиенту, который равен дешёвому конкуренту или стоит между двумя
     (замер 2026-10-30 на копии каталога: «Neo-Rektol» 14.40 при aptekonline
-    14.40 и aloe 15.90 — «+10.4%»). Так же считает совет ROI «подними цену».
+    14.40 и aloe 15.90 — «+10.4%»). Совет ROI «подними цену»
+    (`roi._price_raise_opportunities`) переводится на то же правило в PR #119.
 
     В payload — `cheapest_competitor` и `cheapest_competitor_site`. События,
-    записанные до 2026-10-30, несут `median_competitor`; фронтенд
+    записанные до этой правки, несут `median_competitor`; фронтенд
     (`frontend/src/lib/alert-copy.ts`) читает оба.
+
+    Конкурент с ценой 0 считается самым дешёвым и глушит алерт: с такой
+    ценой «дешевле всех» не проверить. Так же ведёт себя совет ROI в #119.
     """
     min_pct = float(params.get("min_pct", 7.0))
     out: list[CandidateEvent] = []

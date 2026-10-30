@@ -123,7 +123,7 @@ describe("localizedAlertCopy", () => {
     },
   });
 
-  it("names the cheapest competitor for price-raise alerts written since 2026-10-30", () => {
+  it("names the cheapest competitor for price-raise alerts", () => {
     const copy = localizedAlertCopy(cheapestRaise, tFromMessages());
 
     expect(copy.title).toBe("Qiyməti qaldırmaq olar: Test product (+25.0%)");
@@ -140,7 +140,7 @@ describe("localizedAlertCopy", () => {
     );
   });
 
-  it("keeps the median copy for price-raise alerts stored before 2026-10-30", () => {
+  it("keeps the median copy for price-raise alerts stored with a median", () => {
     for (const [locale, expected] of [
       [ru, "Клиент: 10.00 ₼. Медиана конкурентов: 11.23 ₼."],
       [en, "Client: 10.00 ₼. Competitor median: 11.23 ₼."],

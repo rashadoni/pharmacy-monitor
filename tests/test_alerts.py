@@ -895,7 +895,7 @@ def test_price_raise_opportunity_measures_gap_from_cheapest_competitor(db_sessio
 def test_price_raise_opportunity_no_fire_when_client_between_competitors(db_session):
     """Клиент между двумя конкурентами — один уже дешевле, «поднять» нельзя.
 
-    На коде до 2026-10-30 здесь был алерт «+20.0%» от дорогого конкурента.
+    Детектор, считавший от медианы, давал здесь «+20.0%» от дорогого конкурента.
     """
     _m, run = _raise_case(db_session, "Between", 10.0, aptekonline=9.0, aloe=12.0)
 
@@ -919,6 +919,47 @@ def test_price_raise_opportunity_no_fire_when_client_equals_cheapest(db_session)
 def test_price_raise_opportunity_no_fire_when_gap_to_cheapest_below_min_pct(db_session):
     """До дорогого конкурента 20%, до дешёвого 3% при пороге 5% — алерта нет."""
     _m, run = _raise_case(db_session, "Close", 10.0, aptekonline=10.30, aloe=12.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+
+    assert cands == []
+
+
+def test_price_raise_opportunity_zero_threshold_still_needs_client_strictly_cheaper(
+    db_session,
+):
+    """Порог 0 (CLI и Streamlit его разрешают): равная цена — не «можно поднять»."""
+    _m, run = _raise_case(db_session, "Zero threshold", 10.0, aptekonline=10.0, aloe=12.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 0.0})
+
+    assert cands == []
+
+
+def test_price_raise_opportunity_fires_at_exact_threshold(db_session):
+    """Разрыв ровно равен порогу — алерт есть (≥ min_pct)."""
+    _m, run = _raise_case(db_session, "Exact", 8.0, aptekonline=10.0, aloe=12.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 25.0})
+
+    assert [c.payload["gap_pct"] for c in cands] == [25.0]
+
+
+def test_price_raise_opportunity_skips_zero_client_price(db_session):
+    """Цена клиента 0 — процент не посчитать, алерта нет."""
+    _m, run = _raise_case(db_session, "Free", 0.0, aptekonline=10.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+
+    assert cands == []
+
+
+def test_price_raise_opportunity_zero_competitor_price_suppresses(db_session):
+    """Конкурент с ценой 0: «дешевле всех» не проверить — алерта нет.
+
+    Так же ведёт себя совет ROI «подними цену» в #119.
+    """
+    _m, run = _raise_case(db_session, "Zero competitor", 8.0, aptekonline=0.0, aloe=10.0)
 
     cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
 

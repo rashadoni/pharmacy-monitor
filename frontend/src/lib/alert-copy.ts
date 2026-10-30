@@ -117,8 +117,8 @@ export function localizedAlertCopy(
   if (event.rule_type === "price_raise_opportunity") {
     const gapPct = numberPayload(payload, "gap_pct");
     const clientPrice = numberPayload(payload, "client_price");
-    // С 2026-10-30 разрыв считается от самого дешёвого конкурента. События,
-    // записанные раньше, несут медиану — их текст остаётся прежним.
+    // Разрыв считается от самого дешёвого конкурента. События, записанные
+    // до этой правки, несут медиану — их текст остаётся прежним.
     const cheapest = numberPayload(payload, "cheapest_competitor");
     const detail =
       cheapest !== null
