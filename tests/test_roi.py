@@ -997,7 +997,8 @@ def test_other_products_of_the_brand_give_no_price_advice(db_session):
     db_session.commit()
 
     actions = roi.compute_actions(db_session)
-    assert not any(a.type == "map_violation" for a in actions)
+    # Расчёт состоялся: товары конкурентов без пары у клиента — «нет в ассортименте».
+    assert {a.type for a in actions} == {"assortment_gap"}
     assert [a for a in actions if a.product_name == client.name] == []
 
 

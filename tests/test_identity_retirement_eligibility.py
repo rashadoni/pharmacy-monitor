@@ -175,3 +175,24 @@ def test_retired_client_history_does_not_produce_a_price_raise(db_session, monke
         competitor_sites=("aptekonline",),
     )
     assert len(actions) == (0 if retired else 1)
+
+
+def test_retired_cheaper_row_beside_current_row_does_not_lower_competitor_price(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "shadow")
+    client = _product("client", site="aptekonline")
+    current = _product("current")
+    archived = _product("archived", retired=True)
+    _cluster_with_one_offer_per_site(db_session, client, current, (7.0, 10.0))
+    archived.canonical_id = client.canonical_id
+    db_session.add(archived)
+    db_session.flush()
+    run_id = db_session.query(storage.Run.id).scalar()
+    db_session.add(storage.PriceSnapshot(run_id=run_id, product_id=archived.id, price=5.0))
+    db_session.flush()
+
+    kwargs = dict(tenant_id=1, client_site="aptekonline", competitor_sites=("pharmonline",))
+    assert roi._undercut_threats(db_session, 3.0, 90.0, 10, min_margin_pct=10.0, **kwargs) == []
+    raises = roi._price_raise_opportunities(db_session, 5.0, 80.0, 10, **kwargs)
+    assert [a.extra["median_competitor"] for a in raises] == [10.0]

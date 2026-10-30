@@ -539,7 +539,7 @@ E2E: в `frontend/e2e/` лежит восемь файлов сценариев 
 - Phase 1: proxy chain (IPRoyal + Bright Data + ScraperAPI), DDP scraper, AI fallback
 - Phase 1c: pharmonline DDP reverse-engineered + reconnect logic
 - Phase 2: barcode + matcher v2 (limited utility — internal SKUs only)
-- Phase 4: PricingConfig + cost CSV + MAP violations + settings UI
+- Phase 4: PricingConfig + cost CSV + MAP violations (сняты 2026-10-30) + settings UI
 - Phase 5.1c: intraday category rotation (hourly business hours)
 - Phase 5.5: frontend X-Request-ID propagation
 - Phase 5.6: per-site staleness panel
