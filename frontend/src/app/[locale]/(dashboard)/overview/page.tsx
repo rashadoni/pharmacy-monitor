@@ -25,9 +25,13 @@ import { OnboardingTip } from "@/components/onboarding-tip";
 import { QuickActions } from "@/components/quick-actions";
 import { formatNumber, formatRelative, formatPrice } from "@/lib/utils";
 import { categoryDisplayLabel } from "@/lib/category-label";
-import { runStatusToneClass } from "@/lib/run-quality";
 import { runProductCount, siteProductCount } from "@/lib/run-counts";
 import { ProductCountText } from "@/components/product-count";
+import {
+  IsolatedIdentitiesNote,
+  LatestSiteRunStatus,
+  RunStatusBadge as StatusBadge,
+} from "@/components/run-status";
 import { MetricStrip } from "@/components/metric-strip";
 
 export default function OverviewPage() {
@@ -237,12 +241,6 @@ function LatestRunsBySitePanel({
             <tbody>
               {items.map((item) => {
                 const run = item.run;
-                const attempt = item.latest_attempt;
-                const newerProblem = Boolean(
-                  attempt &&
-                  attempt.id !== run?.id &&
-                  (attempt.status === "degraded" || attempt.status === "failed"),
-                );
                 const siteProducts = siteProductCount(run, item.site);
                 return (
                   <tr key={item.site} className="border-t border-border">
@@ -261,14 +259,7 @@ function LatestRunsBySitePanel({
                         : "—"}
                     </td>
                     <td className="px-3 py-2">
-                      <div className="flex flex-col items-start gap-1">
-                        {run ? <StatusBadge status={run.status} /> : <span className="text-muted-foreground">—</span>}
-                        {newerProblem && attempt && (
-                          <span className="text-xs text-warning">
-                            {t("newer_attempt_warning", { id: attempt.id })}
-                          </span>
-                        )}
-                      </div>
+                      <LatestSiteRunStatus item={item} />
                     </td>
                     <td className="px-3 py-2 text-right">
                       <ProductCountText count={siteProducts} />
@@ -393,7 +384,10 @@ function RunRowExpandable({
           {formatDuration(run.started_at, run.finished_at, t)}
         </td>
         <td className="px-3 py-2">
-          <StatusBadge status={run.status} />
+          <div className="flex flex-col items-start gap-1">
+            <StatusBadge status={run.status} />
+            <IsolatedIdentitiesNote isolated={run.isolated_identities} />
+          </div>
         </td>
         <td className="px-3 py-2 text-right">
           <ProductCountText count={runProductCount(run)} />
@@ -620,20 +614,6 @@ function formatDuration(
   const hours = Math.floor(mins / 60);
   const m = mins % 60;
   return t("duration_hour", { h: hours, m });
-}
-
-function StatusBadge({ status }: { status: string }) {
-  const t = useTranslations("overview");
-  const translated = ["ok", "running", "degraded", "failed"].includes(status)
-    ? t(`status_${status}` as "status_ok")
-    : status;
-  return (
-    <span
-      className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${runStatusToneClass(status)}`}
-    >
-      {translated}
-    </span>
-  );
 }
 
 /** Phase 5.6 — Per-site freshness panel using /health staleness data. */

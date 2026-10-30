@@ -65,7 +65,7 @@ import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Iterator, Literal
+from typing import Any, AsyncIterator, Iterable, Iterator, Literal
 from urllib.parse import urlsplit
 
 import structlog
@@ -4294,6 +4294,27 @@ def _products_distinct_per_site(run: storage.Run | None) -> dict[str, int]:
     return out
 
 
+def _isolated_identities(run: storage.Run | None) -> dict | None:
+    """Карточки, которые полный сбор держит вне расчётов, — если сбор годный.
+
+    Полный сбор pharmonline, у которого сайт пересоздал несколько карточек
+    (сменил идентификатор или адрес), кончается `degraded`, хотя источник собран
+    целиком: эти карточки изолированы до ручной сверки, а цены остальных идут в
+    сравнения и рекомендации. Годен ли такой прогон, решает общий предикат
+    денежных расчётов (`storage.run_is_financially_eligible`) — тот же, что у
+    эпохи доверия и у health; своего правила здесь нет. Остальные `degraded`
+    сюда не попадают и остаются проблемой.
+    """
+    if run is None or run.status != "degraded" or not storage.run_is_financially_eligible(run):
+        return None
+    partition = run.run_quality["identity_partition"]
+    return {
+        "site": partition["site"],
+        "trusted_count": partition["trusted_count"],
+        "isolated_count": partition["isolated_count"],
+    }
+
+
 def _run_row_out(r: storage.Run, *, compact_quality: bool = True) -> dict:
     return {
         "id": r.id,
@@ -4303,6 +4324,8 @@ def _run_row_out(r: storage.Run, *, compact_quality: bool = True) -> dict:
         "products_scraped": r.products_scraped,
         "products_per_site": r.products_per_site,
         "products_distinct_per_site": _products_distinct_per_site(r),
+        # Не пусто только у годного прогона с изолированными карточками.
+        "isolated_identities": _isolated_identities(r),
         "run_quality": _compact_run_quality(r.run_quality) if compact_quality else r.run_quality,
         "sites_completed": r.sites_completed,
         "error_message": r.error_message,
@@ -4345,38 +4368,70 @@ def _run_site_was_requested(run: storage.Run, site: str) -> bool:
 def _run_site_succeeded(run: storage.Run, site: str) -> bool:
     count = (run.products_per_site or {}).get(site)
     quality_site = (((run.run_quality or {}).get("sites") or {}).get(site) or {})
-    return bool(
-        run.status == "ok"
-        and isinstance(count, (int, float))
+    if not (
+        isinstance(count, (int, float))
         and count > 0
         and quality_site.get("status", "ok") == "ok"
-    )
+    ):
+        return False
+    if run.status == "ok":
+        return True
+    # Годный полный сбор с изолированными карточками: его цены уже в расчётах,
+    # и обзор не должен показывать вместо него прогон недельной давности.
+    isolated = _isolated_identities(run)
+    return isolated is not None and isolated["site"] == site
+
+
+# Сколько прогонов читать за один запрос, пока ищется последний годный.
+_SITE_RUN_HISTORY_BATCH = 200
+
+
+def _site_run_histories(
+    db: Session,
+    tenant_id: int,
+    sites: Iterable[str],
+) -> dict[str, tuple[storage.Run | None, storage.Run | None]]:
+    """``{site: (latest_attempt, latest_success)}`` за один проход по прогонам.
+
+    Читает прогоны от новых к старым пачками, пока у каждого сайта не найдётся
+    последний годный, — без потолка по числу прогонов. Прежний потолок в 1000
+    прогонов при ежедневном сборе — это около 110 дней: сайт, который столько не
+    собирался, показывался бы так, будто не собирался никогда, а не с датой
+    последнего годного сбора. Дальше годного читать нечего, поэтому обычно
+    хватает первой пачки; до конца таблица читается, только если у сайта годного
+    прогона нет совсем.
+    """
+    sites = tuple(sites)
+    attempts: dict[str, storage.Run | None] = dict.fromkeys(sites)
+    successes: dict[str, storage.Run | None] = dict.fromkeys(sites)
+    pending = set(sites)
+    before_id: int | None = None
+    while pending:
+        stmt = select(storage.Run).where(storage.Run.tenant_id == tenant_id)
+        if before_id is not None:
+            stmt = stmt.where(storage.Run.id < before_id)
+        rows = db.scalars(
+            stmt.order_by(desc(storage.Run.id)).limit(_SITE_RUN_HISTORY_BATCH)
+        ).all()
+        if not rows:
+            break
+        for run in rows:
+            for site in sorted(pending):
+                if not _run_site_was_requested(run, site):
+                    continue
+                attempts[site] = attempts[site] or run
+                if _run_site_succeeded(run, site):
+                    successes[site] = run
+                    pending.discard(site)
+        before_id = rows[-1].id
+    return {site: (attempts[site], successes[site]) for site in sites}
 
 
 def _site_run_history(
-    db: Session,
-    tenant_id: int,
-    site: str,
-    *,
-    limit: int = 1000,
+    db: Session, tenant_id: int, site: str
 ) -> tuple[storage.Run | None, storage.Run | None]:
     """Return ``(latest_attempt, latest_success)`` for one site."""
-    rows = db.scalars(
-        select(storage.Run)
-        .where(storage.Run.tenant_id == tenant_id)
-        .order_by(desc(storage.Run.id))
-        .limit(limit)
-    ).all()
-    latest_attempt: storage.Run | None = None
-    latest_success: storage.Run | None = None
-    for run in rows:
-        if not _run_site_was_requested(run, site):
-            continue
-        latest_attempt = latest_attempt or run
-        if _run_site_succeeded(run, site):
-            latest_success = run
-            break
-    return latest_attempt, latest_success
+    return _site_run_histories(db, tenant_id, (site,))[site]
 
 
 def _latest_successful_site_run(
@@ -4397,8 +4452,9 @@ def dash_runs_latest_by_site(
     and aloe runs, so this endpoint returns one row per site.
     """
     out = []
+    histories = _site_run_histories(db, user.tenant_id, _VALID_SITES)
     for site in _VALID_SITES:
-        latest_attempt, latest_success = _site_run_history(db, user.tenant_id, site)
+        latest_attempt, latest_success = histories[site]
         out.append(
             {
                 "site": site,

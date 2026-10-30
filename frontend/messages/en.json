@@ -184,6 +184,8 @@
     "latest_by_site": "Latest run by site",
     "latest_by_site_desc": "Every site stays visible here even when it is pushed out of the last 5 global runs.",
     "newer_attempt_warning": "new attempt #{id} finished with a problem",
+    "isolated_identities": "{isolated, plural, one {# card isolated} other {# cards isolated}} pending review; the other {trusted, number} are in calculations",
+    "isolated_identities_hint": "The site changed the ID or address of these cards. Until they are reviewed, their prices stay out of comparisons and recommendations. Prices of the other products from this run are in calculations.",
     "system_status_title": "System status",
     "system_status_desc": "API, storage, trusted catalog and scan queue.",
     "system_api": "Application",
