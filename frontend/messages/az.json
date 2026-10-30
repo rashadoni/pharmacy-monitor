@@ -185,7 +185,7 @@
     "latest_by_site_desc": "Hər sayt son 5 ümumi icraya düşməsə də burada həmişə görünür.",
     "newer_attempt_warning": "yeni #{id} cəhdi problemlə bitib",
     "isolated_identities": "{isolated, number} məhsul kartı təcrid edilib, qalan {trusted, number} hesablamalara buraxılıb",
-    "isolated_identities_hint": "Sayt bu və ya onlarla bağlı kartların identifikatorunu və ya ünvanını dəyişib. Kartlar yoxlanılana qədər bu icradakı qiymətləri müqayisə və tövsiyələrə daxil edilmir; qalan məhsulların qiymətlərini icra hesablamalara buraxıb.",
+    "isolated_identities_hint": "Sayt bu və ya onlarla bağlı kartların identifikatorunu və ya ünvanını dəyişib. Bu icrada onların qiymətləri yazılmayıb və hesablamalara düşməyib; yoxlamadan sonra kartlar növbəti toplama ilə qayıdacaq. Qalan məhsulların qiymətlərini icra hesablamalara buraxıb.",
     "system_status_title": "Sistemin vəziyyəti",
     "system_status_desc": "API, yaddaş xidmətləri, etibarlı kataloq və skan növbəsi.",
     "system_api": "Tətbiq",
