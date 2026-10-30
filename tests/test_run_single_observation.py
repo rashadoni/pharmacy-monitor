@@ -218,6 +218,9 @@ def test_full_scan_records_one_observation_per_scraped_entry(db_session, monkeyp
     assert _observations(db_session, run) == {"both": 2, "only-a": 1}
     assert run.products_scraped == 3, "счётчик прогона — записи сбора, как и раньше"
     assert run.products_per_site == {"aptekonline": 3}
+    assert run.run_quality["sites"]["aptekonline"]["distinct_products"] == 2, (
+        "экрану — разные товары: `both` один, хоть и в двух категориях"
+    )
 
     snapshots = db_session.scalars(
         select(storage.PriceSnapshot).where(storage.PriceSnapshot.run_id == run.id)

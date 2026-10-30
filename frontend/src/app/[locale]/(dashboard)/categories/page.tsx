@@ -9,6 +9,7 @@ import { api, friendlyError, type CategoryRow, type CategorySuggestion } from "@
 import { OnboardingTip } from "@/components/onboarding-tip";
 import { formatNumber, formatTime } from "@/lib/utils";
 import { isTerminalRunStatus, scrapeResultTextClass } from "@/lib/run-quality";
+import { runProductCount, siteProductCount } from "@/lib/run-counts";
 import { QueryErrorState } from "@/components/query-error-state";
 import { useRouter } from "@/i18n/navigation";
 import { choiceParam, integerParam, queryWithPatch } from "@/lib/filter-query";
@@ -681,11 +682,13 @@ function ScrapeResultBadge({ req }: { req: import("@/lib/api").ScrapeRequestRow 
     );
   }
   const degraded = req.status === "degraded";
-  const total = req.products_scraped ?? 0;
+  // Разные товары, а не строки листинга: у aptekonline их втрое больше
+  // (`lib/run-counts`). У сбора, записанного раньше, — строки, как и было.
+  const total = runProductCount(req)?.value ?? 0;
   const perSite = req.products_per_site ?? {};
   const siteParts = Object.entries(perSite)
     .filter(([, n]) => n > 0)
-    .map(([site, n]) => `${site}: ${formatNumber(n, locale)}`)
+    .map(([site, n]) => `${site}: ${formatNumber(siteProductCount(req, site)?.value ?? n, locale)}`)
     .join(", ");
   return (
     <div

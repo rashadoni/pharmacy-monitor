@@ -213,7 +213,6 @@
     "status_failed": "Xəta",
     "loading_breakdown": "Breakdown yüklənir…",
     "breakdown_legacy": "Bu icra kateqoriya üzrə breakdown ehtiva etmir — detalı statistika aktiv edilmədən əvvəl icra edilib.",
-    "total_label": "cəmi",
     "quality_title": "İcra keyfiyyəti",
     "quality_mode": "Rejim: {mode}",
     "quality_financial_yes": "maliyyə tövsiyələri üçün təsdiqlənib",
@@ -870,5 +869,11 @@
     "subtitle_prefix": "Bu saytın məhsulunu bağlayın:",
     "subtitle_middle": "mövcud cross-site klasterə və ya müxtəlif saytlardan 2-3 məhsulla sıfırdan yeni klaster yaradın. Manual bağlar",
     "subtitle_suffix": "kimi işarələnir və auto-matcher tərəfindən yenidən hesablanmır."
+  },
+  "run_counts": {
+    "listing_rows": "{count, plural, one {siyahıda # sətir} other {siyahıda # sətir}}",
+    "listing_rows_unit": "siyahı sətri",
+    "hint": "Saytın bir neçə kateqoriyasında olan məhsul siyahıda hər kateqoriyadan ayrıca gəlir. Əsas rəqəm fərqli məhsulların sayıdır.",
+    "hint_legacy": "Bu icra fərqli məhsullar sayılmazdan əvvəl yazılıb: bunlar siyahı sətirləridir və bir neçə kateqoriyada olan məhsul bir neçə dəfə sayılıb."
   }
 }

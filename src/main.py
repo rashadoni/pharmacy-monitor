@@ -3851,6 +3851,7 @@ def classify_run_quality(
             site_details[site] = {
                 "status": "failed",
                 "products": 0,
+                "distinct_products": 0,
                 "items_expected": 0,
                 "items_completed": 0,
                 "items_failed": 0,
@@ -3876,6 +3877,12 @@ def classify_run_quality(
             )
             failed = expected - completed
         products = len(result.products)
+        # `products` — строки листинга: товар, стоящий в нескольких категориях
+        # сайта, приходит из каждой (у aptekonline 96 тыс. строк на 27 тыс.
+        # товаров). На этом числе стоят базы прогона, поэтому оно не меняется;
+        # людям показывается число разных товаров — по ключу, под которым
+        # `persist_results` пишет товар.
+        distinct_products = len({product.external_id for product in result.products})
         baseline = baselines.get(site)
         reasons: list[str] = []
         ordered_items = list(result.item_results.items())
@@ -3944,6 +3951,7 @@ def classify_run_quality(
         site_details[site] = {
             "status": status,
             "products": products,
+            "distinct_products": distinct_products,
             "items_expected": expected,
             "items_completed": completed,
             "items_failed": failed,

@@ -1553,8 +1553,10 @@ def dash_scrape_requests(
     """Последние scrape-запросы tenant'а. UI polls этот endpoint для статуса.
 
     Для terminal request'ов с run_id подмешиваем агрегаты из Run:
-    products_scraped (total) + products_per_site ({site: count}). UI отличает
-    подтверждённый ok от частичного degraded и failed.
+    products_scraped (total) + products_per_site ({site: count}) — строки
+    листинга — и products_distinct_per_site — разные товары
+    (`_products_distinct_per_site`). UI отличает подтверждённый ok от
+    частичного degraded и failed.
     """
     reqs = db.scalars(
         select(storage.ScrapeRequest)
@@ -1592,6 +1594,7 @@ def dash_scrape_requests(
                 "error_message": r.error_message,
                 "products_scraped": run.products_scraped if run else None,
                 "products_per_site": run.products_per_site if run else None,
+                "products_distinct_per_site": _products_distinct_per_site(run) if run else None,
             }
         )
     return out
@@ -1649,6 +1652,7 @@ def dash_scrape_requests_history(
                 "error_message": row.error_message,
                 "products_scraped": run.products_scraped if run else None,
                 "products_per_site": run.products_per_site if run else None,
+                "products_distinct_per_site": _products_distinct_per_site(run) if run else None,
             }
         )
     return {"items": items, "total": total, "limit": limit, "offset": offset}
@@ -4154,6 +4158,28 @@ def _compact_run_quality(run_quality: dict | None) -> dict | None:
     return compact
 
 
+def _products_distinct_per_site(run: storage.Run | None) -> dict[str, int]:
+    """Сколько разных товаров каждого сайта увидел прогон.
+
+    `products_scraped` и `products_per_site` считают строки листинга: товар,
+    стоящий в нескольких категориях сайта, приходит из каждой — у aptekonline
+    96 347 строк на 27 097 товаров (прогон №1141). На этих числах стоят базы
+    прогона, smoke-тест и health, поэтому они остаются как есть, а число разных
+    товаров лежит рядом, в конверте качества (`distinct_products`). У прогонов,
+    записанных до 2026-10-30, его нет — такого сайта в ответе нет, и экран
+    подписывает строки листинга как строки листинга.
+    """
+    sites = ((run.run_quality if run else None) or {}).get("sites")
+    if not isinstance(sites, dict):
+        return {}
+    out: dict[str, int] = {}
+    for site, quality in sites.items():
+        value = quality.get("distinct_products") if isinstance(quality, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[site] = value
+    return out
+
+
 def _run_row_out(r: storage.Run, *, compact_quality: bool = True) -> dict:
     return {
         "id": r.id,
@@ -4162,6 +4188,7 @@ def _run_row_out(r: storage.Run, *, compact_quality: bool = True) -> dict:
         "status": r.status,
         "products_scraped": r.products_scraped,
         "products_per_site": r.products_per_site,
+        "products_distinct_per_site": _products_distinct_per_site(r),
         "run_quality": _compact_run_quality(r.run_quality) if compact_quality else r.run_quality,
         "sites_completed": r.sites_completed,
         "error_message": r.error_message,
@@ -4285,8 +4312,9 @@ def dash_run_breakdown(
 
     Returns: {
       "run_id": int, "started_at": iso, "finished_at": iso, "status": str,
-      "products_scraped": int,
-      "products_per_site": {site: total_count},
+      "products_scraped": int,               # строки листинга
+      "products_per_site": {site: total_count},  # строки листинга
+      "products_distinct_per_site": {site: count},  # разные товары, если известны
       "products_per_site_category": {site: {category: count}},
       "run_quality": {version, mode, financially_eligible, sites}
     }
@@ -4306,6 +4334,7 @@ def dash_run_breakdown(
         "status": run.status,
         "products_scraped": run.products_scraped or 0,
         "products_per_site": run.products_per_site or {},
+        "products_distinct_per_site": _products_distinct_per_site(run),
         "products_per_site_category": run.products_per_site_category or {},
         "run_quality": run.run_quality,
         "sites_completed": run.sites_completed,
