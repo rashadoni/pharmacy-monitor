@@ -656,17 +656,24 @@ def _price_raise_opportunities(
         if not comp_prices:
             continue
 
-        median_comp = sorted(p for _, p in comp_prices)[len(comp_prices) // 2]
-        if median_comp <= client_price:
-            continue  # клиент не дешевле — не наш кейс
-        gap_pct = (median_comp - client_price) / client_price * 100
+        # Меряем от самого дешёвого конкурента, а не от медианы: при двух
+        # конкурентах медиана `sorted(...)[len // 2]` — это дорогой из двух, и
+        # цель «медиана − 2%» ставила клиента дороже дешёвого конкурента, хотя
+        # текст обещает «останешься самым дешёвым» (замер 2026-10-30 на копии
+        # каталога: 85 из 319 советов pharmonline). Клиент между двумя
+        # конкурентами — не «дешевле всех», совета нет.
+        cheapest_site, cheapest_comp = min(comp_prices, key=lambda sp: (sp[1], sp[0]))
+        if cheapest_comp <= client_price:
+            continue  # клиент не дешевле всех — не наш кейс
+        gap_pct = (cheapest_comp - client_price) / client_price * 100
         if gap_pct < threshold_pct:
             continue  # разница слишком мелкая
         if gap_pct >= max_spread_pct:
             continue  # подозрительно — likely bad match (e.g. pack-size mismatch)
 
-        # Целевая цена = медиана конкурентов − 2% буфер (чтоб остаться лучшим)
-        target = round(median_comp * 0.98, 2)
+        target = _price_raise_target(cheapest_comp)
+        if target <= client_price:
+            continue  # с буфером поднимать некуда (порог ниже буфера)
         delta = round(target - client_price, 2)
 
         client_product = _client_product(m, client_site)
@@ -690,12 +697,28 @@ def _price_raise_opportunities(
                 target_value_azn=target,
                 unit_gap_azn=delta,
                 spread_pct=round(gap_pct, 1),
-                extra={"median_competitor": median_comp},
+                extra={
+                    "cheapest_competitor": cheapest_comp,
+                    "cheapest_competitor_site": cheapest_site,
+                },
             )
         )
 
     out.sort(key=lambda a: -(a.spread_pct or 0))
     return out[:max_n]
+
+
+def _price_raise_target(cheapest_comp: float) -> float:
+    """Целевая цена совета «подними»: самый дешёвый конкурент − 2% буфер.
+
+    Округление до копейки у дешёвых товаров (меньше 0,25 ₼) возвращает цену
+    самого конкурента — тогда цель на копейку ниже него: обещание «останешься
+    самым дешёвым» должно быть правдой и после округления.
+    """
+    target = round(cheapest_comp * 0.98, 2)
+    if target >= cheapest_comp:
+        target = round(cheapest_comp - 0.01, 2)
+    return target
 
 
 def _is_in_stock(session: Session, product_id: int) -> bool:
