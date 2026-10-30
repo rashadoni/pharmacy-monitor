@@ -188,6 +188,9 @@ def test_retired_cheaper_row_beside_current_row_does_not_lower_competitor_price(
     archived.canonical_id = client.canonical_id
     db_session.add(archived)
     db_session.flush()
+    # Цена сайта берётся у последней строки кластера: стой архивная раньше живой,
+    # живая перезаписала бы её, и тест ничего бы не проверял.
+    assert archived.id > current.id
     run_id = db_session.query(storage.Run.id).scalar()
     db_session.add(storage.PriceSnapshot(run_id=run_id, product_id=archived.id, price=5.0))
     db_session.flush()
