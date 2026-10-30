@@ -13,7 +13,7 @@ import { ProductCountText } from "./product-count";
 
 function shown(
   locale: string,
-  messages: Record<string, unknown>,
+  messages: React.ComponentProps<typeof NextIntlClientProvider>["messages"],
   count: ProductCount | null,
   inline = false,
 ) {
